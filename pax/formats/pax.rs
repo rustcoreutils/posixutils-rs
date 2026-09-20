@@ -25,6 +25,10 @@
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{is_eof_error, PaxError, PaxResult};
+use crate::formats::ustar::{
+    calculate_checksum, is_zero_block, parse_header as parse_ustar_header, parse_octal,
+    try_split_path, ustar_path_string, verify_checksum,
+};
 use crate::options::FormatOptions;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -42,7 +46,6 @@ const PAX_GHDR: u8 = b'g'; // Global extended header
 
 // Regular ustar typeflags (for reference)
 const REGTYPE: u8 = b'0';
-const AREGTYPE: u8 = b'\0';
 const LNKTYPE: u8 = b'1';
 const SYMTYPE: u8 = b'2';
 const CHRTYPE: u8 = b'3';
@@ -1062,128 +1065,6 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
 // Helper functions (shared with ustar where needed)
 // ============================================================================
 
-/// Check if a block is all zeros
-fn is_zero_block(block: &[u8]) -> bool {
-    block.iter().all(|&b| b == 0)
-}
-
-/// Parse a NUL-terminated or space-padded string
-fn parse_string(bytes: &[u8]) -> String {
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end])
-        .trim_end()
-        .to_string()
-}
-
-/// Parse an octal number from bytes
-fn parse_octal(bytes: &[u8]) -> PaxResult<u64> {
-    let s = parse_string(bytes);
-    if s.is_empty() {
-        return Ok(0);
-    }
-    // Reject if the octal string contains a sign
-    if s.starts_with('+') || s.starts_with('-') {
-        return Err(PaxError::InvalidHeader(format!("invalid octal: {}", s)));
-    }
-    u64::from_str_radix(&s, 8).map_err(|_| PaxError::InvalidHeader(format!("invalid octal: {}", s)))
-}
-
-/// Parse typeflag to EntryType
-fn parse_typeflag(flag: u8) -> PaxResult<EntryType> {
-    match flag {
-        REGTYPE | AREGTYPE => Ok(EntryType::Regular),
-        LNKTYPE => Ok(EntryType::Hardlink),
-        SYMTYPE => Ok(EntryType::Symlink),
-        CHRTYPE => Ok(EntryType::CharDevice),
-        BLKTYPE => Ok(EntryType::BlockDevice),
-        DIRTYPE => Ok(EntryType::Directory),
-        FIFOTYPE => Ok(EntryType::Fifo),
-        _ => Ok(EntryType::Regular),
-    }
-}
-
-/// Build full path from prefix and name
-fn build_path(prefix: &str, name: &str) -> PathBuf {
-    if prefix.is_empty() {
-        PathBuf::from(name)
-    } else {
-        PathBuf::from(format!("{}/{}", prefix, name))
-    }
-}
-
-/// Verify header checksum
-fn verify_checksum(header: &[u8; BLOCK_SIZE]) -> bool {
-    let stored = match parse_octal(&header[CHKSUM_OFF..CHKSUM_OFF + 8]) {
-        Ok(v) => v as u32,
-        Err(_) => return false,
-    };
-
-    let calculated = calculate_checksum(header);
-    stored == calculated
-}
-
-/// Calculate header checksum
-fn calculate_checksum(header: &[u8; BLOCK_SIZE]) -> u32 {
-    let mut sum: u32 = 0;
-    for (i, &byte) in header.iter().enumerate() {
-        if (CHKSUM_OFF..CHKSUM_OFF + 8).contains(&i) {
-            sum += b' ' as u32;
-        } else {
-            sum += byte as u32;
-        }
-    }
-    sum
-}
-
-/// Parse a ustar header into an ArchiveEntry
-fn parse_ustar_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
-    let name = crate::formats::ustar::parse_path_field(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
-    let prefix =
-        crate::formats::ustar::parse_path_field(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
-
-    let path = build_path(&prefix, &name);
-
-    let mode = parse_octal(&header[MODE_OFF..MODE_OFF + 8])? as u32;
-    let uid = parse_octal(&header[UID_OFF..UID_OFF + 8])? as u32;
-    let gid = parse_octal(&header[GID_OFF..GID_OFF + 8])? as u32;
-    let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
-    let mtime = parse_octal(&header[MTIME_OFF..MTIME_OFF + 12])?;
-
-    let typeflag = header[TYPEFLAG_OFF];
-    let entry_type = parse_typeflag(typeflag)?;
-
-    let linkname =
-        crate::formats::ustar::parse_path_field(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
-    let link_target = if !linkname.is_empty() {
-        Some(PathBuf::from(linkname))
-    } else {
-        None
-    };
-
-    let uname = parse_string(&header[UNAME_OFF..UNAME_OFF + UNAME_LEN]);
-    let gname = parse_string(&header[GNAME_OFF..GNAME_OFF + GNAME_LEN]);
-
-    // Parse device major/minor numbers for device files
-    let devmajor = parse_octal(&header[DEVMAJOR_OFF..DEVMAJOR_OFF + 8])? as u32;
-    let devminor = parse_octal(&header[DEVMINOR_OFF..DEVMINOR_OFF + 8])? as u32;
-
-    Ok(ArchiveEntry {
-        path,
-        mode,
-        uid,
-        gid,
-        size,
-        mtime,
-        entry_type,
-        link_target,
-        uname: if uname.is_empty() { None } else { Some(uname) },
-        gname: if gname.is_empty() { None } else { Some(gname) },
-        devmajor,
-        devminor,
-        ..Default::default()
-    })
-}
-
 /// Build a ustar header block from an ArchiveEntry
 fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     let mut header = [0u8; BLOCK_SIZE];
@@ -1250,39 +1131,13 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     Ok(header)
 }
 
-/// The path as it is written to the ustar name/prefix fields: directories
-/// carry a trailing slash. Shared by split_path() and ExtendedHeader so both
-/// judge "does this fit in ustar?" against the identical string.
-fn ustar_path_string(entry: &ArchiveEntry) -> String {
-    let path_str = entry.path.to_string_lossy();
-    if entry.is_dir() && !path_str.ends_with('/') {
-        format!("{}/", path_str)
-    } else {
-        path_str.into_owned()
-    }
-}
-
-/// Split a path into ustar name (max 100) and prefix (max 155) fields.
+/// Split path into the ustar name and prefix fields.
 ///
-/// Returns `None` if the path cannot be represented exactly, in which case the
-/// caller must emit a `path=` extended header record.
-fn try_split_path(path_str: &str) -> Option<(String, String)> {
-    if path_str.len() <= NAME_LEN {
-        return Some((path_str.to_string(), String::new()));
-    }
-
-    // Split at the highest '/' that leaves a name of at most NAME_LEN bytes.
-    // '/' is ASCII, so an index holding it is always a char boundary.
-    for i in (1..=PREFIX_LEN.min(path_str.len().saturating_sub(1))).rev() {
-        if path_str.as_bytes()[i] == b'/' && path_str.len() - (i + 1) <= NAME_LEN {
-            return Some((path_str[i + 1..].to_string(), path_str[..i].to_string()));
-        }
-    }
-
-    None
-}
-
-/// Split path into name (max 100) and prefix (max 155)
+/// Unlike ustar, a path that does not fit is not an error here: the real path
+/// is already recorded in a `path=` extended header record by
+/// `ExtendedHeader::from_entry`, so these fields are only a fallback for a
+/// reader that ignores extended headers. Truncate on a UTF-8 character
+/// boundary so a multi-byte character straddling NAME_LEN does not panic.
 fn split_path(entry: &ArchiveEntry) -> PaxResult<(String, String)> {
     let path_str = ustar_path_string(entry);
 
@@ -1290,10 +1145,6 @@ fn split_path(entry: &ArchiveEntry) -> PaxResult<(String, String)> {
         return Ok(split);
     }
 
-    // The path does not fit; ExtendedHeader::from_entry has recorded the real
-    // path in a `path=` record, so the ustar fields are only a fallback for
-    // readers that ignore extended headers. Truncate on a UTF-8 char boundary
-    // so a multi-byte character straddling NAME_LEN does not panic.
     Ok((
         path_str[..floor_char_boundary(&path_str, NAME_LEN)].to_string(),
         String::new(),

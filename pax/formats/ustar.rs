@@ -218,12 +218,12 @@ impl<W: Write> ArchiveWriter for UstarWriter<W> {
 // ============================================================================
 
 /// Check if a block is all zeros
-fn is_zero_block(block: &[u8]) -> bool {
+pub(crate) fn is_zero_block(block: &[u8]) -> bool {
     block.iter().all(|&b| b == 0)
 }
 
 /// Parse a header block into an ArchiveEntry
-fn parse_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
+pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
     let name = parse_path_field(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
     let prefix = parse_path_field(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
 
@@ -273,7 +273,7 @@ fn parse_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
 ///
 /// Used for the space-padded fields (uname, gname) and as the basis for the
 /// numeric fields, so trailing whitespace is stripped.
-fn parse_string(bytes: &[u8]) -> String {
+pub(crate) fn parse_string(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end])
         .trim_end()
@@ -291,7 +291,7 @@ pub(crate) fn parse_path_field(bytes: &[u8]) -> String {
 }
 
 /// Parse an octal number from bytes
-fn parse_octal(bytes: &[u8]) -> PaxResult<u64> {
+pub(crate) fn parse_octal(bytes: &[u8]) -> PaxResult<u64> {
     let s = parse_string(bytes);
     if s.is_empty() {
         return Ok(0);
@@ -304,7 +304,7 @@ fn parse_octal(bytes: &[u8]) -> PaxResult<u64> {
 }
 
 /// Parse typeflag to EntryType
-fn parse_typeflag(flag: u8) -> PaxResult<EntryType> {
+pub(crate) fn parse_typeflag(flag: u8) -> PaxResult<EntryType> {
     match flag {
         REGTYPE | AREGTYPE => Ok(EntryType::Regular),
         LNKTYPE => Ok(EntryType::Hardlink),
@@ -318,7 +318,7 @@ fn parse_typeflag(flag: u8) -> PaxResult<EntryType> {
 }
 
 /// Build full path from prefix and name
-fn build_path(prefix: &str, name: &str) -> PathBuf {
+pub(crate) fn build_path(prefix: &str, name: &str) -> PathBuf {
     if prefix.is_empty() {
         PathBuf::from(name)
     } else {
@@ -327,7 +327,7 @@ fn build_path(prefix: &str, name: &str) -> PathBuf {
 }
 
 /// Verify header checksum
-fn verify_checksum(header: &[u8; BLOCK_SIZE]) -> bool {
+pub(crate) fn verify_checksum(header: &[u8; BLOCK_SIZE]) -> bool {
     let stored = match parse_octal(&header[CHKSUM_OFF..CHKSUM_OFF + 8]) {
         Ok(v) => v as u32,
         Err(_) => return false,
@@ -338,7 +338,7 @@ fn verify_checksum(header: &[u8; BLOCK_SIZE]) -> bool {
 }
 
 /// Calculate header checksum
-fn calculate_checksum(header: &[u8; BLOCK_SIZE]) -> u32 {
+pub(crate) fn calculate_checksum(header: &[u8; BLOCK_SIZE]) -> u32 {
     let mut sum: u32 = 0;
     for (i, &byte) in header.iter().enumerate() {
         if (CHKSUM_OFF..CHKSUM_OFF + 8).contains(&i) {
@@ -414,37 +414,41 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 
 /// Split path into name (max 100) and prefix (max 155)
 pub(crate) fn split_path(entry: &ArchiveEntry) -> PaxResult<(String, String)> {
-    let path_str = entry.path.to_string_lossy();
+    let path_str = ustar_path_string(entry);
+    try_split_path(&path_str).ok_or(PaxError::PathTooLong(path_str))
+}
 
-    // Add trailing slash for directories
-    let path_str = if entry.is_dir() && !path_str.ends_with('/') {
+/// The member name as ustar spells it: a directory carries a trailing slash.
+pub(crate) fn ustar_path_string(entry: &ArchiveEntry) -> String {
+    let path_str = entry.path.to_string_lossy();
+    if entry.is_dir() && !path_str.ends_with('/') {
         format!("{}/", path_str)
     } else {
-        path_str.to_string()
-    };
+        path_str.into_owned()
+    }
+}
 
+/// Split a path into the ustar name (max 100) and prefix (max 155) fields.
+///
+/// `None` when the path cannot be represented exactly. What to do then is the
+/// caller's to decide and is the one place the two formats differ: ustar has
+/// nowhere else to put the name and fails, while pax writes a `path=` extended
+/// header record and leaves these fields as a fallback for readers that ignore
+/// it.
+pub(crate) fn try_split_path(path_str: &str) -> Option<(String, String)> {
     if path_str.len() <= NAME_LEN {
-        return Ok((path_str, String::new()));
+        return Some((path_str.to_string(), String::new()));
     }
 
-    // Try to split at a '/' within bounds
-    if path_str.len() <= NAME_LEN + PREFIX_LEN + 1 {
-        // Find a split point
-        for i in (1..=PREFIX_LEN).rev() {
-            if i >= path_str.len() {
-                continue;
-            }
-            if path_str.as_bytes()[i] == b'/' {
-                let prefix = &path_str[..i];
-                let name = &path_str[i + 1..];
-                if name.len() <= NAME_LEN {
-                    return Ok((name.to_string(), prefix.to_string()));
-                }
-            }
+    // Split at the highest '/' that leaves a name of at most NAME_LEN bytes.
+    // '/' is ASCII, so an index holding it is always a char boundary.
+    for i in (1..=PREFIX_LEN.min(path_str.len().saturating_sub(1))).rev() {
+        if path_str.as_bytes()[i] == b'/' && path_str.len() - (i + 1) <= NAME_LEN {
+            return Some((path_str[i + 1..].to_string(), path_str[..i].to_string()));
         }
     }
 
-    Err(PaxError::PathTooLong(path_str))
+    None
 }
 
 /// Convert EntryType to typeflag
@@ -462,7 +466,7 @@ fn entry_type_to_flag(entry_type: &EntryType) -> u8 {
 }
 
 /// Write a string to a field, NUL-terminated if space permits
-fn write_string(buf: &mut [u8], s: &str, max_len: usize) {
+pub(crate) fn write_string(buf: &mut [u8], s: &str, max_len: usize) {
     let bytes = s.as_bytes();
     let len = std::cmp::min(bytes.len(), max_len);
     buf[..len].copy_from_slice(&bytes[..len]);

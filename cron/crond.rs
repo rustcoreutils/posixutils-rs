@@ -8,12 +8,12 @@
 //
 
 use chrono::{DateTime, Local, NaiveDateTime};
+use clap::Parser;
 use cron::job::{Database, UserInfo};
 use cron::spool::{at_spool_dir_readonly, parse_at_job_name};
 use cron::trust::{open_trusted, TrustPolicy};
 use cron::{CRON_SPOOL_DIR, PID_FILE, SYSTEM_CRONTAB};
 use gettextrs::gettext;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::cmp::Ordering::{Greater, Less};
 use std::collections::HashMap;
 use std::error::Error;
@@ -198,7 +198,7 @@ fn setup() -> i32 {
     // 1. fork() creates child process; parent exits, child continues
     // 2. setsid() creates new session, detaches from controlling terminal
     // 3. chdir("/") prevents holding directory mounts open
-    // 4. close(STD*_FILENO) closes inherited file descriptors
+    // 4. the standard descriptors are reopened on /dev/null
     // All calls have defined behavior and we check fork() return value.
     unsafe {
         use libc::*;
@@ -211,9 +211,19 @@ fn setup() -> i32 {
         setsid();
         chdir(b"/\0" as *const _ as *const c_char);
 
-        close(STDIN_FILENO);
-        close(STDOUT_FILENO);
-        close(STDERR_FILENO);
+        // Reopened on /dev/null rather than closed, matching talkd. Closing
+        // them leaves 0, 1 and 2 free for the next open() to claim, and a job
+        // that then writes to what it believes is standard output would write
+        // into an unrelated file instead.
+        let nullfd = open(b"/dev/null\0" as *const _ as *const c_char, O_RDWR);
+        if nullfd >= 0 {
+            dup2(nullfd, STDIN_FILENO);
+            dup2(nullfd, STDOUT_FILENO);
+            dup2(nullfd, STDERR_FILENO);
+            if nullfd > STDERR_FILENO {
+                close(nullfd);
+            }
+        }
 
         pid
     }
@@ -472,10 +482,19 @@ fn tick_loop() -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// crond - daemon to execute scheduled commands
+#[derive(Parser)]
+#[command(version, about = gettext("crond - daemon to execute scheduled commands"))]
+struct Args {
+    /// Run in foreground (don't daemonize)
+    #[arg(short, long)]
+    foreground: bool,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("crond");
+
+    let args = Args::parse();
 
     // Install handlers via sigaction (audit #D11) *before* forking, so the
     // daemon has them from its first instruction. Dispositions are inherited
@@ -492,12 +511,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     install_signal(libc::SIGTERM, handle_shutdown, 0);
     install_signal(libc::SIGINT, handle_shutdown, 0);
 
-    let pid = setup();
+    // Detach unless asked to stay in the foreground. Staying keeps the
+    // PID-file diagnostics below visible and makes the exit status the
+    // daemon's own -- which is what a supervisor, systemd or a container,
+    // needs in order to notice that it never started. Detached, the parent
+    // returns 0 before the child has even tried to take the lock.
+    if !args.foreground {
+        let pid = setup();
 
-    match pid.cmp(&0) {
-        Less => return Err(Box::new(CronError::Fork)),
-        Greater => return Ok(()),
-        _ => {}
+        match pid.cmp(&0) {
+            Less => return Err(Box::new(CronError::Fork)),
+            Greater => return Ok(()),
+            _ => {}
+        }
     }
 
     // Acquire PID file lock (keep handle alive for the daemon's lifetime)

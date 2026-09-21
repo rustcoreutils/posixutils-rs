@@ -177,6 +177,12 @@ but no daemon to run them.  Behavior follows Vixie cron:
  * Step syntax `*/N` and `min-max/N` in any field.
  * `NAME=value` environment assignments inside crontab files.
  * A six-field system crontab at `/etc/crontab` carrying a user-name column.
+ * `-f` / `--foreground` — do not fork into the background.  Without it the
+   parent returns as soon as the child is forked, so a supervisor that tracks
+   the process it started — systemd `Type=simple`, a container — sees the
+   daemon exit immediately; and because the fork precedes the PID-file lock,
+   a refusal to start is reported to a standard error that is already closed,
+   behind an exit status of 0.
 
 ### crontab
 

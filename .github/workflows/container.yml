@@ -82,6 +82,15 @@ jobs:
       #
       # This is the step that catches what a green `docker build` cannot: an
       # image that builds cleanly and is missing utilities.
+      # mode=max, not mode=min: min exports only the layers of the resulting
+      # image, and everything expensive here happens in the `builder` stage,
+      # which the runtime stage only COPYs from. With min, nothing restores
+      # `cargo chef cook` or `cargo build`, so every run recompiles the whole
+      # workspace and the cargo-chef structure buys nothing. This does not fit
+      # GitHub's 10 GB per-repository cache budget -- one arch of this
+      # workspace measures ~14.5 GB of buildx cache, and Swatinem/rust-cache is
+      # spending from the same budget -- so entries are evicted and some runs
+      # are cold anyway. A registry-backed cache would fix that properly.
       - name: Build for smoke test
         uses: docker/build-push-action@v6
         with:
@@ -91,7 +100,7 @@ jobs:
           tags: posixutils:ci
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,scope=${{ matrix.arch }},mode=min
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
 
       - name: Smoke test
         run: ./scripts/docker-smoke posixutils:ci
@@ -112,7 +121,7 @@ jobs:
             name-canonical=true,
             push=${{ github.event_name != 'pull_request' }}
           cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,scope=${{ matrix.arch }},mode=min
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
 
       - name: Export digest
         if: github.event_name != 'pull_request'
@@ -163,6 +172,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The sha tag is type=raw, not type=sha. `type=sha` accepts no `value=`
+      # attribute, and metadata-action reads only the workflow's own
+      # context.sha -- which on a workflow_run event is the default branch's
+      # head at dispatch time, not the commit whose tests passed. An unknown
+      # attribute is stored without complaint, so the wrong tag was produced
+      # silently.
+      #
+      # These comments sit outside the `tags:` block on purpose: it is a
+      # literal block scalar, so a `#` line inside it is content and would be
+      # handed to metadata-action as a tag definition.
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -170,7 +189,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=edge,branch=main
-            type=sha,prefix=sha-,value=${{ steps.commit.outputs.sha }}
+            type=raw,value=sha-${{ steps.commit.outputs.sha }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}

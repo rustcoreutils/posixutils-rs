@@ -41,12 +41,13 @@ check() {
 
 echo "== smoke: $IMAGE"
 
-# Every utility the workspace builds must be installed. The count is asserted
-# against the image itself rather than a hardcoded number, which would go stale
-# with every new utility.
+# An empty expectation would match anything -- `case "$out" in *""*)` is true
+# for every string, including the empty one -- so this asserts a floor instead.
+# A hardcoded exact count would go stale with every new utility; 130 is the
+# number the image description already claims.
 check "utilities installed" \
-	'ls /usr/local/bin | wc -l' \
-	''
+	'n=$(ls /usr/local/bin | wc -l); [ "$n" -ge 130 ] && echo "count=$n ok"' \
+	'ok'
 
 for alias in tar cpio ex uncompress zcat; do
 	check "argv[0] front-end: $alias resolves to ours" \
@@ -63,7 +64,7 @@ check "argv[0] front-end: [ is installed" \
 	'test'
 
 # The whole point of /usr/local/bin preceding /usr/bin.
-for util in ls cat sort awk sed grep find diff; do
+for util in sh ls cat sort awk sed grep find diff; do
 	check "ours shadows the distro: $util" \
 		"command -v $util" \
 		"/usr/local/bin/$util"
@@ -81,8 +82,10 @@ check "compress/zcat round-trip" \
 	'echo hello | compress | zcat' \
 	'hello'
 
+# Called by path, not as `[`: every shell has a built-in of that name which
+# would shadow the binary and make this pass whatever the image contains.
 check "[ evaluates an expression" \
-	'if [ 1 -eq 1 ]; then echo yes; fi' \
+	'/usr/local/bin/[ 1 -eq 1 ] && echo yes' \
 	'yes'
 
 # tzdata: with no /usr/share/zoneinfo, date printed the zone name back as its
@@ -119,14 +122,40 @@ else
 fi
 
 # The default command is our own shell, not the distro's.
+#
+# Two separate claims, because neither implies the other. Running the image
+# proves the default command works, but the distro's shell would satisfy that
+# too -- it finds the same PATH -- so which shell CMD names is asserted against
+# the image's own configuration. And `command -v sh` above proves the name that
+# CMD carries resolves to ours.
+#
+# Note the invocation: with no ENTRYPOINT, arguments *replace* CMD rather than
+# append to it, so `docker run "$IMAGE" -c ...` would only prove that `-c` is
+# not an executable. The script goes on stdin instead.
 echo "== default command"
-if docker run --rm "$IMAGE" -c 'exit 0' >/dev/null 2>&1 ||
-	docker run --rm "$IMAGE" sh -c 'exit 0' >/dev/null 2>&1; then
-	echo "ok      CMD starts a usable shell"
-else
-	echo "FAIL    CMD starts a usable shell"
+cmd_config=$(docker image inspect "$IMAGE" --format '{{json .Config.Cmd}}' 2>/dev/null)
+case "$cmd_config" in
+'["sh"]')
+	echo "ok      CMD is [\"sh\"], which PATH resolves to ours"
+	;;
+*)
+	echo "FAIL    CMD is [\"sh\"], which PATH resolves to ours"
+	echo "          got: $cmd_config"
 	fails=$((fails + 1))
-fi
+	;;
+esac
+
+default_out=$(echo 'echo CMD-OK' | docker run --rm -i "$IMAGE" 2>&1)
+case "$default_out" in
+*CMD-OK*)
+	echo "ok      the default command runs a script on stdin"
+	;;
+*)
+	echo "FAIL    the default command runs a script on stdin"
+	echo "          got: $default_out"
+	fails=$((fails + 1))
+	;;
+esac
 
 echo
 if [ "$fails" -eq 0 ]; then

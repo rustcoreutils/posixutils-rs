@@ -32,6 +32,25 @@ pub fn mem2reg(func: &mut Function) {
             for &src in &insn.src {
                 referenced.insert(src);
             }
+            // A `target` can also name a local's storage, not just define a
+            // value. A call returning a struct in registers writes its result
+            // into a `__2reg_N` local and names that local's `Sym` as the
+            // target; the backend then stores RAX/RDX through it. Nothing ever
+            // reads it when the result is discarded -- `one();` on its own
+            // line -- so scanning only `src` concluded the local was dead,
+            // dropped the slot, and left the backend storing through an
+            // uninitialized register.
+            //
+            // Sym targets only. Every other target defines a value, and a
+            // value with no readers is exactly what this pass is for.
+            if let Some(target) = insn.target {
+                if func
+                    .get_pseudo(target)
+                    .is_some_and(|p| matches!(p.kind, crate::ir::PseudoKind::Sym(_)))
+                {
+                    referenced.insert(target);
+                }
+            }
         }
     }
     let mut dropped: HashSet<PseudoId> = HashSet::new();

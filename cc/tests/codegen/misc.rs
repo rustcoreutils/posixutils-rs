@@ -10648,3 +10648,84 @@ int main(void) {
         0
     );
 }
+
+/// A struct returned in registers and then **discarded**.
+///
+/// `mem2reg` decides a local is dead by scanning `insn.src`. But a call
+/// returning a two-register struct writes its result into a `__2reg_N` local
+/// and names that local's `Sym` as the instruction's *target*, not as a
+/// source. When the result is used, a following `symaddr` puts the Sym in a
+/// `src` and it survives; when it is discarded — `one();` on a line by itself
+/// — nothing ever reads it, so the pass concluded the local was dead and
+/// dropped both the slot and the pseudo.
+///
+/// The backend then had a target with no storage behind it. `handle_two_reg_return`
+/// emits `mov %rax, (%reg)` for a `Loc::Reg` destination, so it stored through
+/// whatever that register happened to hold.
+///
+/// **This was wrong at -O0 too.** It only faulted once the inliner had run,
+/// because `should_inline` admits a function this size only at -O2, but the
+/// bad IR was there at every level and -O0 passed on luck about the register's
+/// contents: a slightly different reduction segfaults at -O0 as well.
+///
+/// The boundaries are the ABI's: 8 bytes returns in one register and is fine,
+/// 9-16 returns in two and was not, and 17+ uses a hidden pointer argument —
+/// which lands in `src` and so survived. Both register files are covered,
+/// since the FP path stores XMM0/XMM1 the same way.
+#[test]
+fn codegen_discarded_two_register_struct_return() {
+    let code = r#"
+struct I8  { int a, b; };
+struct I12 { int a, b, c; };
+struct I16 { int a, b, c, d; };
+struct I20 { int a, b, c, d, e; };
+struct F12 { float a, b, c; };
+struct D16 { double a, b; };
+
+static int calls;
+
+static struct I8  i8(void)  { struct I8  s = {1,2};       calls++; return s; }
+static struct I12 i12(void) { struct I12 s = {1,2,3};     calls++; return s; }
+static struct I16 i16(void) { struct I16 s = {1,2,3,4};   calls++; return s; }
+static struct I20 i20(void) { struct I20 s = {1,2,3,4,5}; calls++; return s; }
+static struct F12 f12(void) { struct F12 s = {1,2,3};     calls++; return s; }
+static struct D16 d16(void) { struct D16 s = {1,2};       calls++; return s; }
+
+int main(void) {
+    /* Discarded: the result is never read, which is the case that broke. */
+    i8(); i12(); i16(); i20(); f12(); d16();
+    if (calls != 6) return 1;
+
+    /* Used: this path always worked and must keep working, since the fix
+       changes which pseudos survive. */
+    { struct I12 v = i12(); if (v.a != 1 || v.b != 2 || v.c != 3) return 2; }
+    { struct I16 v = i16(); if (v.a != 1 || v.d != 4) return 3; }
+    { struct D16 v = d16(); if (v.a != 1.0 || v.b != 2.0) return 4; }
+    { struct F12 v = f12(); if (v.a != 1.0f || v.c != 3.0f) return 5; }
+    { struct I20 v = i20(); if (v.a != 1 || v.e != 5) return 6; }
+    { struct I8  v = i8();  if (v.a != 1 || v.b != 2) return 7; }
+    if (calls != 12) return 8;
+
+    /* Discarded again, in a loop, so the slot is reused rather than merely
+       allocated once. */
+    for (int k = 0; k < 3; k++) { i12(); d16(); }
+    if (calls != 18) return 9;
+
+    /* Discarded inside an expression whose value is also discarded. */
+    (void)i16();
+    if (calls != 19) return 10;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2", "-Os"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("codegen_discarded_2reg{}", opt.replace('-', "_")),
+                code,
+                &[opt.to_string()]
+            ),
+            0,
+            "discarded two-register struct return failed at {opt}"
+        );
+    }
+}

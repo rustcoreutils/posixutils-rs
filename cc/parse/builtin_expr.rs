@@ -848,7 +848,7 @@ impl Parser<'_> {
                 // __builtin_prefetch(addr, rw, locality)
                 // Prefetch data at addr into cache - no-op for correctness
                 self.expect_special(b'(')?;
-                let _addr = self.parse_assignment_expr()?;
+                let addr = self.parse_assignment_expr()?;
                 // Optional rw argument (0=read, 1=write)
                 if self.peek_special() == Some(b',' as u32) {
                     self.expect_special(b',')?;
@@ -860,9 +860,22 @@ impl Parser<'_> {
                     }
                 }
                 self.expect_special(b')')?;
-                // Returns void - just return a void expression
+                // The prefetch itself emits nothing, but its address argument
+                // is still an expression and C evaluates it. Discarding it
+                // here lost whatever it did: `__builtin_prefetch((q = p))`
+                // left `q` unassigned, and `&p[j = i]` left `j` unassigned.
+                // gcc documents the address as evaluated and tests for it.
+                //
+                // The `rw` and locality arguments need no such care -- gcc
+                // requires them to be compile-time constants, so there is
+                // nothing in them to evaluate.
+                //
+                // A comma expression carries the address along and yields the
+                // void result, which is what the builtin's type says.
+                let void_id = self.types.void_id;
+                let void_result = Self::typed_expr(ExprKind::IntLit(0), void_id, token_pos);
                 Ok(Self::typed_expr(
-                    ExprKind::IntLit(0),
+                    ExprKind::Comma(vec![addr, void_result]),
                     self.types.void_id,
                     token_pos,
                 ))

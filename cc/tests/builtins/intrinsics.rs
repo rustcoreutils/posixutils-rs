@@ -162,6 +162,35 @@ int main(void) {
         if (arr[0] != 0) return 70;
         if (arr[50] != 50) return 71;
         if (arr[99] != 99) return 72;
+
+        // The prefetch emits nothing, but its address argument is still an
+        // expression and C evaluates it. Parsing it and throwing it away lost
+        // whatever it did. gcc documents the address as evaluated and tests
+        // for it; this is gcc.c-torture's builtin-prefetch-4 in miniature.
+        {
+            int *p = &arr[3];
+            int *q = 0;
+            __builtin_prefetch((q = p), 0, 0);
+            if (q != p) return 73;
+        }
+        {
+            int *p = &arr[0];
+            int i = 5, j = 0;
+            __builtin_prefetch(&p[j = i], 0, 0);
+            if (j != i) return 74;
+        }
+        {
+            int i = 0;
+            __builtin_prefetch(&arr[i++]);
+            if (i != 1) return 75;
+        }
+        {
+            // One evaluation, not two: the argument is an expression, not a
+            // textual substitution.
+            int i = 0;
+            __builtin_prefetch(&arr[(i += 2)], 1, 3);
+            if (i != 2) return 76;
+        }
     }
 
     // ========== STRING LITERAL SIZEOF (returns 80-89) ==========

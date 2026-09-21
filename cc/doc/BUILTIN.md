@@ -65,7 +65,7 @@ differs from gcc, the row says so rather than leaving the reader to find out.
 | `__builtin_memset(dst, c, n)` | Set `n` bytes to `c` |
 | `__builtin_memcpy(dst, src, n)` | Copy `n` bytes |
 | `__builtin_memmove(dst, src, n)` | Copy `n` bytes (overlapping safe) |
-| `__builtin_prefetch(addr, ...)` | Cache prefetch hint (no-op) |
+| `__builtin_prefetch(addr, ...)` | Cache prefetch hint. Emits nothing, but `addr` is still **evaluated** — `__builtin_prefetch((q = p))` assigns `q`. The `rw` and locality arguments must be constants, so they have nothing to evaluate |
 
 ## Control Flow
 

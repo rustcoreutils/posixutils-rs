@@ -85,6 +85,11 @@ Options beyond the POSIX set (`-B -c -D -E -G -g -I -L -l -O -o -R -s -U`):
  * `-S` — emit assembly.
  * `-v` / `--verbose`, `--stats`, `--pedantic`, `-W <warning>`.
  * `--nostdinc`, `--nobuiltininc`, `--fno-builtin`, `--fno-unwind-tables`.
+ * `-fpermissive` — accept two constructs C99 removed, as warnings rather
+   than errors: implicit `int` in a declaration naming no type, and the
+   implicit declaration of a function called before it is declared.  It is
+   not a dialect switch; the language is still C17 and `-std=` stays inert.
+   gcc draws the same line, rejecting both by default.
  * `--target <triple>`, `--shared`, `--rtlib`, `--print-targets`.
  * `--trigraphs` — enable trigraph replacement (off by default, since it
    would alter string literals).

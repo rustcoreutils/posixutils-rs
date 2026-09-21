@@ -1736,6 +1736,45 @@ impl<'a> Parser<'a> {
                     if let Some(symbol_id) = self.symbols.lookup_id(name_id, Namespace::Ordinary) {
                         let typ = self.symbols.get(symbol_id).typ;
                         Ok(Self::typed_expr(ExprKind::Ident(symbol_id), typ, token_pos))
+                    } else if diag::permissive() && self.is_special(b'(') {
+                        // `-fpermissive`: C89 6.3.2.2 let a call to an
+                        // undeclared function declare it implicitly as
+                        // `extern int f();` -- unprototyped, so no argument is
+                        // checked or converted. C99 6.5.1p2 removed the rule.
+                        //
+                        // Only a name followed by `(` gets this. A bare
+                        // undeclared identifier was never implicitly declared
+                        // by any C standard and stays an error, which is what
+                        // keeps a misspelled variable from silently becoming a
+                        // function.
+                        let name_str = self.idents.get_opt(name_id).unwrap_or("").to_string();
+                        diag::warning_args(
+                            token_pos,
+                            "implicit declaration of function '{0}'",
+                            &[&name_str],
+                        );
+                        let int_id = self.types.int_id;
+                        let func_type = self.types.intern(Type {
+                            kind: TypeKind::Function,
+                            base: Some(int_id),
+                            params: None,
+                            ..Default::default()
+                        });
+                        let symbol = crate::symbol::Symbol::function(
+                            name_id,
+                            func_type,
+                            self.symbols.depth(),
+                        );
+                        let symbol_id = self.symbols.declare(symbol).unwrap_or_else(|_| {
+                            self.symbols
+                                .lookup_id(name_id, crate::symbol::Namespace::Ordinary)
+                                .expect("declare failed but no existing symbol")
+                        });
+                        Ok(Self::typed_expr(
+                            ExprKind::Ident(symbol_id),
+                            func_type,
+                            token_pos,
+                        ))
                     } else {
                         // C99 6.5.1: Undeclared identifier is an error
                         // (implicit int was removed in C99)

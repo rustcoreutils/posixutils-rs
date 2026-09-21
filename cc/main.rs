@@ -325,6 +325,13 @@ struct Args {
     #[arg(long = "trigraphs", help = gettext("Enable trigraph replacement (C17 5.2.1.1)"))]
     trigraphs: bool,
 
+    /// Accept implicit `int` and implicit function declarations as warnings.
+    ///
+    /// Both were removed by C99 and are errors here by default. This does not
+    /// select a dialect -- see `diag::set_permissive`.
+    #[arg(long = "fpermissive", help = gettext("Accept pre-C99 implicit int and implicit function declarations"))]
+    fpermissive: bool,
+
     /// Disable builtin function recognition (GCC compatibility)
     /// c17 does not implicitly recognize standard library functions as builtins,
     /// so this flag is accepted for compatibility but has no effect.
@@ -1606,6 +1613,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         } else if arg == "-fverbose-asm" {
             result.push("--fverbose-asm".to_string());
             i += 1;
+        } else if arg == "-fpermissive" {
+            result.push("--fpermissive".to_string());
+            i += 1;
         } else if arg.starts_with("-f") && !arg.starts_with("-fno-builtin") {
             // Catch-all: silently ignore any other -f* flag we don't handle
             i += 1;
@@ -1999,6 +2009,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.no_warnings {
         diag::suppress_warnings();
+    }
+    if args.fpermissive {
+        diag::set_permissive();
     }
     // `-Wno-<name>` reaches the places that emit warnings, which are nowhere
     // near here. Only `-Wno-` entries mean anything today; `-W<name>` turning

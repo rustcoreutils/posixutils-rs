@@ -12,7 +12,7 @@ use std::io::{self, Error, ErrorKind};
 use std::ptr;
 
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 #[cfg(not(target_os = "macos"))]
 use libc::{msgctl, msgget, msqid_ds};
 use libc::{semctl, semget, shmctl, shmget, shmid_ds};
@@ -326,9 +326,7 @@ fn collect(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("ipcrm");
 
     // Parse via clap (for --help/--version/validation) and keep the matches so
     // we can recover the command-line order of the repeated options.

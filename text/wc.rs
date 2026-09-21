@@ -15,7 +15,7 @@ use std::{
 };
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::io::input_stream_dashed;
 use plib::locale::{isspace, MbDecoder};
 use plib::BUFSZ;
@@ -149,9 +149,7 @@ fn wc_count(args: &Args, chars_mode: bool, pathname: &Path) -> io::Result<CountI
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("wc");
 
     let mut args = Args::parse();
 

@@ -22,7 +22,7 @@ use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::process;
 
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 
 use args::{Args, Mode};
 use commands::execute_command;
@@ -34,9 +34,7 @@ fn main() {
     // Honor the environment locale (LC_CTYPE for multibyte text, LC_MESSAGES
     // for diagnostics); diagnostics are routed through gettext for
     // translatability. See the project locale-init convention.
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").ok();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+    plib::diag::init_locale("mailx");
 
     // Install the SIGINT handler so an interrupt aborts the current command or
     // message instead of terminating mailx (ASYNCHRONOUS EVENTS).

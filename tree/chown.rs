@@ -11,7 +11,7 @@ mod common;
 
 use self::common::{chown_traverse, error_string, ChangeOwnershipArgs};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use std::{ffi::CString, io};
 
 /// chown - change the file ownership
@@ -119,9 +119,7 @@ fn parse_owner_group(owner_group: &str) -> Result<ParseOwnerGroupResult, String>
 }
 
 fn main() -> Result<(), io::Error> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("chown");
 
     let mut args = Args::parse();
 

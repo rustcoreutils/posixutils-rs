@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::regex::{Regex as PlibRegex, RegexFlags};
 use std::sync::Mutex;
 use std::{
@@ -2604,12 +2604,7 @@ impl Sed {
 ///     0 - Successful completion.
 ///     >0 - An error occurred.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    let project_name = std::env::var("PROJECT_NAME")
-        .ok()
-        .unwrap_or("posixutil-text".to_string());
-    textdomain(&*project_name)?;
-    bind_textdomain_codeset(&*project_name, "UTF-8")?;
+    plib::diag::init_locale("sed");
 
     let args = Args::parse();
 

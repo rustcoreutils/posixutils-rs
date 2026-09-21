@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::modestr;
 
 /// Match `string` against a shell filename pattern using POSIX `fnmatch(3)`,
@@ -1279,9 +1278,7 @@ fn find(args: Vec<String>) -> Result<i32, String> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("find");
 
     let args: Vec<String> = std::env::args().collect();
 

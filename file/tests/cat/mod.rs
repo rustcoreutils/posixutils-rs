@@ -87,3 +87,15 @@ fn cat_missing_file_sets_exit_and_continues() {
     );
     let _ = fs::remove_file(&good);
 }
+
+/// `cat` of a large file into a closed pipe must die by SIGPIPE.
+/// See `plib::testing::assert_dies_by_sigpipe`.
+#[test]
+fn test_cat_dies_by_sigpipe_on_a_closed_pipe() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let big = dir.path().join("big");
+    let body: String = (0..200_000).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(&big, body).unwrap();
+
+    plib::testing::assert_dies_by_sigpipe("cat", &[big.to_str().unwrap()]);
+}

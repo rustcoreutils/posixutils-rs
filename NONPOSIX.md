@@ -25,9 +25,11 @@ Four binaries have no POSIX.1-2024 specification at all:
  * **talkd** - local-only `talk` daemon (Unix-domain socket, not UDP port 518)
 
 `tar` and `cpio` are installed as symlinks to `pax`, which selects its
-command-line parser from `argv[0]`.  Three further symlinks exist for
+command-line parser from `argv[0]`.  Four further symlinks exist for
 convenience, but name POSIX-specified utilities and are not extensions:
-`ex` -> `vi`, and `zcat` / `uncompress` -> `compress`.
+`ex` -> `vi`, `zcat` / `uncompress` -> `compress`, and `[` -> `test`.
+POSIX gives `test` both names and allows one binary to serve them by reading
+`argv[0]`, which is what we do.
 
 POSIX utilities that have no binary of their own — `cd`, `read`, `umask`,
 `getopts`, `wait` and the rest — are shell built-ins provided by `sh`.
@@ -177,6 +179,12 @@ but no daemon to run them.  Behavior follows Vixie cron:
  * Step syntax `*/N` and `min-max/N` in any field.
  * `NAME=value` environment assignments inside crontab files.
  * A six-field system crontab at `/etc/crontab` carrying a user-name column.
+ * `-f` / `--foreground` — do not fork into the background.  Without it the
+   parent returns as soon as the child is forked, so a supervisor that tracks
+   the process it started — systemd `Type=simple`, a container — sees the
+   daemon exit immediately; and because the fork precedes the PID-file lock,
+   a refusal to start is reported to a standard error that is already closed,
+   behind an exit status of 0.
 
 ### crontab
 

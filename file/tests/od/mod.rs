@@ -1395,3 +1395,14 @@ fn od_names_itself_and_the_file_and_ends_the_line() {
     );
     assert_eq!(stderr.lines().count(), 1, "one line: {stderr:?}");
 }
+
+/// `od` of a large file into a closed pipe must die by SIGPIPE.
+/// See `plib::testing::assert_dies_by_sigpipe`.
+#[test]
+fn test_od_dies_by_sigpipe_on_a_closed_pipe() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let big = dir.path().join("big");
+    std::fs::write(&big, vec![0x41u8; 2_000_000]).unwrap();
+
+    plib::testing::assert_dies_by_sigpipe("od", &[big.to_str().unwrap()]);
+}

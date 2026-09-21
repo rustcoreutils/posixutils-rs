@@ -11,7 +11,7 @@
 //! POSIX-compliant implementation.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use posixutils_uucp::common::{current_login, find_job, is_root, list_jobs, spool_dir};
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -41,9 +41,7 @@ struct Args {
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").ok();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+    plib::diag::init_locale("uustat");
 
     let args = Args::parse();
 

@@ -1145,6 +1145,9 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
                 .spawn()
                 .map_err(|e| e.to_string())?;
 
+            // As the pager above: quitting it closes this pipe.
+            let _sigpipe = plib::io::SigPipeIgnored::new();
+
             if let Some(stdin) = child.stdin.as_mut() {
                 let content = msg.format_display(false, vars);
                 stdin

@@ -91,10 +91,16 @@ pub fn init(utility: &str) {
     reset_counts();
 }
 
-/// One-shot initializer for the locale + gettext + diagnostic surface.
+/// One-shot initializer for the signal, locale, gettext and diagnostic surface.
 ///
-/// This is the canonical locale-init entry point. It calls, in order:
+/// This is the canonical startup entry point. It calls, in order:
 ///
+/// - [`crate::io::restore_sigpipe`] — the Rust runtime ignores `SIGPIPE`, which
+///   turns `ls | head` into a panic and exit 101 instead of the silent death by
+///   signal every historical utility gets. A utility that writes into a pager
+///   or filter it spawned itself needs `EPIPE` for *that* pipe, and holds a
+///   [`crate::io::SigPipeIgnored`] across the write rather than changing the
+///   disposition for its whole run.
 /// - `setlocale(LC_ALL, "")` — inherits the locale from the environment so that
 ///   locale-sensitive libc functions (`<ctype.h>`/`<wctype.h>`, `strcoll`,
 ///   `strftime`, `nl_langinfo`, …) observe `LC_*`. The gettextrs wrapper applies
@@ -109,6 +115,7 @@ pub fn init(utility: &str) {
 /// utility's startup).
 pub fn init_locale(utility: &str) {
     use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+    crate::io::restore_sigpipe();
     setlocale(LocaleCategory::LcAll, "");
     let _ = textdomain("posixutils-rs");
     let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");

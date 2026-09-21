@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 
 #[derive(Parser)]
 #[command(version, about = gettext("od - dump files in octal and other formats"))]
@@ -1403,9 +1403,7 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("od");
 
     let mut args = Args::parse();
 

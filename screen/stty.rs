@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::io::{self, Error};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use osdata::{ParamType, PARG, PNEG};
 #[cfg(target_os = "linux")]
 use termios::os::linux::{TAB0, TAB3, TABDLY};
@@ -895,11 +895,7 @@ fn run(args: &Args) -> io::Result<()> {
 }
 
 fn main() -> std::process::ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    // Non-fatal: a missing gettext catalog must not prevent stty from running
-    // with untranslated strings (matching plib::diag and the other utilities).
-    let _ = textdomain("posixutils-rs");
-    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+    plib::diag::init_locale("stty");
 
     let args = Args::parse();
 

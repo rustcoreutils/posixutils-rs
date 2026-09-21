@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::regex::Regex;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
@@ -766,9 +766,7 @@ fn validate_prefix(prefix: &str, suffix_len: u8) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("csplit");
 
     let args = Args::parse();
 

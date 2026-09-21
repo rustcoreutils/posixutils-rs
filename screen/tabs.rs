@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use terminfo::{capability as cap, Database};
 
 // POSIX: "The maximum number of tab stops allowed is terminal-dependent."
@@ -318,13 +318,7 @@ fn set_hw_tabs(info: &Database, tabstops: &[u16]) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    if let Err(e) = textdomain("posixutils-rs") {
-        eprintln!("textdomain: {}", e);
-    }
-    if let Err(e) = bind_textdomain_codeset("posixutils-rs", "UTF-8") {
-        eprintln!("bind_textdomain_codeset: {}", e);
-    }
+    plib::diag::init_locale("tabs");
 
     let preprocessed_args = preprocess_args();
     let args = match Args::try_parse_from(&preprocessed_args) {

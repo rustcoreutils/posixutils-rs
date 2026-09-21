@@ -63,7 +63,7 @@ implements it.
 | Printing | lp |
 | Process management | env, fuser, kill, nice, nohup, ps, renice, timeout, xargs |
 | SCCS | admin, delta, get, prs, rmdel, sact, sccs, unget, val, what |
-| Shell | echo, false, printf, sh, test, true |
+| Shell | echo, false, printf, sh, test (`[`), true |
 | System and users | getconf, id, ipcrm, ipcs, logger, logname, man, newgrp, pwd, tty, uname, who |
 | Terminal | more, stty, tabs, tput |
 | Text processing | asa, awk, comm, csplit, cut, diff, expand, fold, grep, head, join, nl, paste, patch, pr, sed, sort, tail, tr, tsort, unexpand, uniq, wc |
@@ -80,9 +80,9 @@ Utilities provided beyond those POSIX specifies.
  * talkd - local-only talk daemon, Unix socket rather than UDP port 518 (Users)
 
 `tar` and `cpio` are installed as symlinks to `pax`, which picks its
-command-line parser from `argv[0]`.  Three further symlinks name
-POSIX-specified utilities and are not extensions: `ex` -> vi, and
-`zcat` / `uncompress` -> compress.
+command-line parser from `argv[0]`.  Four further symlinks name
+POSIX-specified utilities and are not extensions: `ex` -> vi,
+`zcat` / `uncompress` -> compress, and `[` -> test.
 
 See [NONPOSIX.md](NONPOSIX.md) for the full inventory of non-POSIX extensions:
 extra options, language and syntax extensions, environment variables and file
@@ -90,11 +90,35 @@ formats, plus the places where we deviate from what POSIX specifies.
 
 ## Installation
 
-These are "core" utilities of any operating system.  Production packaging in the future will be done on a per-distro basis in a distro-specific way.
-
-As such, Dockerfiles, rpm and deb packaging are welcome, but currently considered a secondary priority to finishing, bugfixing and tuning the utilities.  Packaging contributions are welcome...  if done right.
+These are "core" utilities of any operating system.  Production packaging in the future will be done on a per-distro basis in a distro-specific way.  rpm and deb packaging are welcome, but currently considered a secondary priority to finishing, bugfixing and tuning the utilities.  Packaging contributions are welcome...  if done right.
 
 The standard `cargo install` should work, for those interested in testing.  Care should be taken with PATH to point to the correct `cp` or `awk`, when mixing with standard system utilities on an already-shipped operating system.
+
+Note that `cargo install` copies the declared binaries and nothing else, so the six `argv[0]` symlinks above — `tar`, `cpio`, `ex`, `zcat`, `uncompress` and `[` — are *not* installed by it.  They are created in `target/<profile>` by the crates' build scripts, and delivered by the container image.
+
+### Container image
+
+A multi-architecture image is published to the GitHub container registry on
+every green build of `main` and for every release tag:
+
+```sh
+docker run --rm -it ghcr.io/rustcoreutils/posixutils-rs
+```
+
+The utilities are installed into `/usr/local/bin`, which precedes `/usr/bin` in
+the default PATH, so inside the container `ls`, `sort`, `tar` and the rest are
+these implementations rather than the base image's.  The default command is our
+`sh`.
+
+To build and run it from a checkout:
+
+```sh
+docker compose run --rm posixutils
+```
+
+That mounts the working tree read-only at `/workspace`, which is a convenient
+way to try the utilities against real input.  `scripts/docker-smoke <image>`
+checks a built image, and is the same gate CI runs.
 
 ## Testing
 

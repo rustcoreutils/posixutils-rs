@@ -13,9 +13,7 @@
 //! environment, or all available locales, to standard output.
 
 use clap::Parser;
-use gettextrs::{
-    bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory as GettextCategory,
-};
+use gettextrs::gettext;
 use posixutils_i18n::locale_lib::env::LocaleSettings;
 use posixutils_i18n::locale_lib::platform;
 use posixutils_i18n::locale_lib::types::LocaleCategory;
@@ -52,13 +50,9 @@ struct Args {
 }
 
 fn main() {
-    // Set up localization. setlocale switches libc's global locale (read by
+    // init_locale's setlocale switches libc's global locale (read by
     // localeconv/nl_langinfo below) to the environment locale.
-    setlocale(GettextCategory::LcAll, "");
-    if textdomain("posixutils-rs").is_err() {
-        // Ignore error - translation may not be available
-    }
-    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+    plib::diag::init_locale("locale");
 
     let args = Args::parse();
 

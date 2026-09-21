@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::sccsfile::{paths, SccsFile, Sid};
 
 // Exit status bit masks per POSIX
@@ -164,9 +164,7 @@ fn validate_file(args: &Args, file_path: &PathBuf, diags: &mut Vec<String>) -> u
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").ok();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+    plib::diag::init_locale("val");
 
     // Parse the command line manually so that an unknown or duplicate
     // keyletter yields the 0x40 exit bit rather than clap's default exit(2).

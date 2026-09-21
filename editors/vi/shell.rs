@@ -210,6 +210,11 @@ impl ShellExecutor {
         // inline deadlocks as soon as the child's output fills the pipe
         // buffer: each side waits for the other, and `:1,$!cat` on anything
         // past ~64 KB hung the editor outright.
+        // Held until after the join below: a command that exits early (`!head`)
+        // closes this pipe, and the feeder thread must see EPIPE rather than
+        // the process taking the signal and losing the buffer.
+        let _sigpipe = plib::io::SigPipeIgnored::new();
+
         let feeder = child.stdin.take().map(|mut stdin| {
             let data = input.as_bytes().to_vec();
             std::thread::spawn(move || stdin.write_all(&data))

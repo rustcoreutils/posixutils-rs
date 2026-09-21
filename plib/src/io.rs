@@ -134,14 +134,75 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>
 /// exit 101, where the historical utilities die by the signal and the shell
 /// reports 141.
 ///
-/// Call this once at the top of `main`, before any output. It affects only
-/// this process; `exec`ing a child resets ignored signals anyway, and a
-/// default disposition is inherited unchanged.
+/// [`crate::diag::init_locale`] calls this, so a utility gets it by starting up
+/// the usual way; call it directly only before that, or instead of it.
+///
+/// It also settles what a child inherits, which is worth stating because the
+/// rule is the opposite of the one for caught signals: POSIX keeps a `SIG_IGN`
+/// disposition *across* `exec`, so leaving the runtime's `SIG_IGN` in place
+/// would hand it to everything the process runs. Nothing in this tree does:
+/// `std::process::Command` restores the default in the child, and `sh` -- the
+/// one raw `libc::execve` -- resets every disposition itself in
+/// `TrapManager::reset`. A default disposition is inherited unchanged, so with
+/// this called there is nothing left for either of them to undo.
 pub fn restore_sigpipe() {
     // SAFETY: `signal` with SIG_DFL is async-signal-safe and this runs before
     // any other thread exists.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+/// Ignores `SIGPIPE` for as long as the guard is held, then restores whatever
+/// disposition was in force before.
+///
+/// A utility's own standard output wants the default disposition: a closed pipe
+/// there means the reader is gone and the right answer is to die, which is what
+/// [`restore_sigpipe`] arranges. But a utility that spawns a pager or a filter
+/// and writes into *that* pipe owns its far end, and a close there is an event
+/// to observe — the user pressed `q`, the filter read enough — not a reason to
+/// abandon the operation. `w !head -1` in `ed` must report `?` and keep the
+/// buffer, not take the signal and lose it.
+///
+/// One process-wide disposition cannot tell those two pipes apart, so hold this
+/// across the write to the child and no longer:
+///
+/// ```ignore
+/// let _sigpipe = SigPipeIgnored::new();
+/// child_stdin.write_all(&data)?;   // EPIPE here, not death
+/// ```
+///
+/// Bind it to a named local. `let _ = SigPipeIgnored::new();` drops the guard
+/// at once and restores the default before the write, which is the one mistake
+/// that silently does nothing.
+///
+/// When a thread does the writing, the guard has to outlive the join, not just
+/// the spawn.
+#[must_use = "SIGPIPE is only ignored while the guard is alive"]
+pub struct SigPipeIgnored(libc::sighandler_t);
+
+impl SigPipeIgnored {
+    /// Ignore `SIGPIPE`, remembering the disposition being replaced.
+    pub fn new() -> Self {
+        // SAFETY: `signal` is async-signal-safe and returns the previous
+        // handler, which is what Drop puts back.
+        let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        Self(previous)
+    }
+}
+
+impl Default for SigPipeIgnored {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SigPipeIgnored {
+    fn drop(&mut self) {
+        // SAFETY: as `new`; `self.0` came from `signal` and is a valid handler.
+        unsafe {
+            libc::signal(libc::SIGPIPE, self.0);
+        }
     }
 }
 

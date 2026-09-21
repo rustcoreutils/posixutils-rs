@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::io::{input_reader, input_stream};
 use plib::BUFSZ;
 
@@ -335,9 +335,7 @@ fn split_main(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    let _ = textdomain("posixutils-rs");
-    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+    plib::diag::init_locale("split");
 
     // Diagnostics are written here rather than propagated out of `main`: the
     // `Termination` impl prints the `Debug` of a boxed error, which reaches the

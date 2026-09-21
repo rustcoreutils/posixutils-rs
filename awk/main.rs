@@ -11,7 +11,7 @@ use crate::compiler::compile_program;
 use crate::interpreter::interpret;
 use clap::Parser;
 use compiler::SourceFile;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use std::error::Error;
 use std::fmt::Display;
 use std::io::Read;
@@ -55,9 +55,7 @@ fn exit_if_error<T, U: Display>(r: Result<T, U>) -> T {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("awk");
 
     let args = Args::parse();
 

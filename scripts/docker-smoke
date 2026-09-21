@@ -1,0 +1,166 @@
+#!/bin/sh
+#
+# Smoke-test a built posixutils-rs image.
+#
+#   scripts/docker-smoke <image>
+#
+# The image is a toolbox: its value is that `ls`, `tar`, `awk` and the rest
+# resolve to our implementations. A build can succeed and still ship an image
+# that fails at exactly that -- the argv[0] front-ends (`tar`, `cpio`, `ex`,
+# `uncompress`, `zcat`) are symlinks dropped next to their binary by the
+# crates' build scripts, and any staging step that walks only regular files
+# drops them silently. When `tar` is absent, PATH falls through to the distro's
+# GNU tar and nothing reports an error.
+#
+# Every probe below runs through /usr/bin/sh -- the distro shell -- so that a
+# regression in our own `sh` cannot make the whole suite vacuously pass.
+
+set -eu
+
+IMAGE="${1:?usage: docker-smoke <image>}"
+fails=0
+
+run() {
+	docker run --rm --entrypoint /usr/bin/sh "$IMAGE" -c "$1" 2>&1
+}
+
+check() {
+	# check <description> <shell snippet> <expected substring>
+	desc=$1
+	out=$(run "$2" || true)
+	case "$out" in
+	*"$3"*) echo "ok      $desc" ;;
+	*)
+		echo "FAIL    $desc"
+		echo "          expected to contain: $3"
+		echo "          got: $out"
+		fails=$((fails + 1))
+		;;
+	esac
+}
+
+echo "== smoke: $IMAGE"
+
+# An empty expectation would match anything -- `case "$out" in *""*)` is true
+# for every string, including the empty one -- so this asserts a floor instead.
+# A hardcoded exact count would go stale with every new utility; 130 is the
+# number the image description already claims.
+check "utilities installed" \
+	'n=$(ls /usr/local/bin | wc -l); [ "$n" -ge 130 ] && echo "count=$n ok"' \
+	'ok'
+
+for alias in tar cpio ex uncompress zcat; do
+	check "argv[0] front-end: $alias resolves to ours" \
+		"command -v $alias" \
+		"/usr/local/bin/$alias"
+done
+
+# `[` gets a file check rather than `command -v`, which reports the shell's
+# own built-in of that name and never looks at PATH. It is also the alias
+# nothing creates by accident -- `[` is not a portable filename character, so a
+# build that drops it leaves no trace.
+check "argv[0] front-end: [ is installed" \
+	'readlink /usr/local/bin/[' \
+	'test'
+
+# The whole point of /usr/local/bin preceding /usr/bin.
+for util in sh ls cat sort awk sed grep find diff; do
+	check "ours shadows the distro: $util" \
+		"command -v $util" \
+		"/usr/local/bin/$util"
+done
+
+check "tar front-end round-trips" \
+	'cd /tmp && echo hi > a && tar cf x.tar a && tar tf x.tar' \
+	'a'
+
+check "cpio front-end round-trips" \
+	'cd /tmp && echo hi > a && echo a | cpio -o > x.cpio 2>/dev/null && cpio -it < x.cpio' \
+	'a'
+
+check "compress/zcat round-trip" \
+	'echo hello | compress | zcat' \
+	'hello'
+
+# Called by path, not as `[`: every shell has a built-in of that name which
+# would shadow the binary and make this pass whatever the image contains.
+check "[ evaluates an expression" \
+	'/usr/local/bin/[ 1 -eq 1 ] && echo yes' \
+	'yes'
+
+# tzdata: with no /usr/share/zoneinfo, date printed the zone name back as its
+# own abbreviation ("... America 2026").
+check "named timezones resolve" \
+	'TZ=America/New_York date +%Z' \
+	'E'
+
+check "terminfo database present" \
+	'infocmp xterm >/dev/null 2>&1 && echo yes || echo no' \
+	'yes'
+
+check "text pipeline" \
+	'printf "b\na\n" | sort | tr "\n" " "' \
+	'a b'
+
+check "awk" 'awk "BEGIN{print 6*7}"' '42'
+
+# A pinned uid, not merely a non-root one: a bind-mounted host directory has
+# to have predictable ownership, and letting useradd pick gave 1001 on ubuntu
+# (which ships its own uid 1000) and 1000 on debian -- the same image, two
+# different owners.
+check "runs as the pinned uid 1000" 'id -u' '1000'
+
+# The image must work under the posture docker-compose.yml declares.
+echo "== hardened posture"
+if docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+	--tmpfs /tmp:mode=1777 --entrypoint /usr/bin/sh "$IMAGE" \
+	-c 'cd /tmp && echo x > f && cat f' >/dev/null 2>&1; then
+	echo "ok      read-only rootfs, all caps dropped"
+else
+	echo "FAIL    read-only rootfs, all caps dropped"
+	fails=$((fails + 1))
+fi
+
+# The default command is our own shell, not the distro's.
+#
+# Two separate claims, because neither implies the other. Running the image
+# proves the default command works, but the distro's shell would satisfy that
+# too -- it finds the same PATH -- so which shell CMD names is asserted against
+# the image's own configuration. And `command -v sh` above proves the name that
+# CMD carries resolves to ours.
+#
+# Note the invocation: with no ENTRYPOINT, arguments *replace* CMD rather than
+# append to it, so `docker run "$IMAGE" -c ...` would only prove that `-c` is
+# not an executable. The script goes on stdin instead.
+echo "== default command"
+cmd_config=$(docker image inspect "$IMAGE" --format '{{json .Config.Cmd}}' 2>/dev/null)
+case "$cmd_config" in
+'["sh"]')
+	echo "ok      CMD is [\"sh\"], which PATH resolves to ours"
+	;;
+*)
+	echo "FAIL    CMD is [\"sh\"], which PATH resolves to ours"
+	echo "          got: $cmd_config"
+	fails=$((fails + 1))
+	;;
+esac
+
+default_out=$(echo 'echo CMD-OK' | docker run --rm -i "$IMAGE" 2>&1)
+case "$default_out" in
+*CMD-OK*)
+	echo "ok      the default command runs a script on stdin"
+	;;
+*)
+	echo "FAIL    the default command runs a script on stdin"
+	echo "          got: $default_out"
+	fails=$((fails + 1))
+	;;
+esac
+
+echo
+if [ "$fails" -eq 0 ]; then
+	echo "PASS"
+else
+	echo "FAIL: $fails check(s)"
+fi
+exit "$fails"

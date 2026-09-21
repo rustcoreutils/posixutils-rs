@@ -9,7 +9,7 @@
 
 use clap::{ArgAction, Parser};
 use flate2::read::MultiGzDecoder;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use man_util::config::{parse_config_file, ManConfig};
 use man_util::formatter::MdocFormatter;
 use man_util::man7;
@@ -680,6 +680,13 @@ fn display_pager(man_page: Vec<u8>, copy_mode: bool) -> Result<(), ManError> {
 
     let cmd = pager_command(std::env::var("PAGER").ok().as_deref());
 
+    // From here on the page goes into a pipe man owns the far end of, so a
+    // closed pipe is the user quitting the pager rather than a reason to die.
+    // The default disposition is right for the direct-to-stdout path above --
+    // `man foo | head` should die the way every other utility does -- and
+    // wrong for this one.
+    let _sigpipe = plib::io::SigPipeIgnored::new();
+
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&cmd)
@@ -693,8 +700,9 @@ fn display_pager(man_page: Vec<u8>, copy_mode: bool) -> Result<(), ManError> {
         })?;
 
     // The pager exits as soon as the user quits, so writing the page into it
-    // races with that exit. Rust ignores SIGPIPE, so the write returns EPIPE
-    // instead of killing us -- that is the user pressing `q`, not a failure.
+    // races with that exit. SIGPIPE is ignored for exactly this reason (see
+    // above), so the write returns EPIPE instead of killing us -- that is the
+    // user pressing `q`, not a failure.
     if let Some(mut sink) = child.stdin.take() {
         match sink.write_all(&man_page).and_then(|()| sink.flush()) {
             Ok(()) => {}
@@ -1248,9 +1256,7 @@ impl Man {
 //     0 - Successful completion.
 //     >0 - An error occurred.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("man");
 
     // parse command line arguments
     let args = Args::parse();

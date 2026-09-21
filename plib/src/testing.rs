@@ -353,3 +353,68 @@ pub fn locale_matching(candidates: &[&str]) -> Option<String> {
         .find(|name| list.contains(&name.to_lowercase()))
         .map(|name| (*name).to_string())
 }
+
+/// Assert that a utility dies by `SIGPIPE` when the reader of its standard
+/// output goes away, writing nothing to standard error.
+///
+/// The Rust runtime sets `SIGPIPE` to `SIG_IGN` before `main`, so without
+/// [`crate::io::restore_sigpipe`] — which [`crate::diag::init_locale`] now
+/// calls — the write fails with `EPIPE`, libstd panics with "failed printing
+/// to stdout: Broken pipe", and the process exits 101. A shell reports the
+/// correct outcome as 141.
+///
+/// `cmd` is the binary name as [`get_binary_path`] resolves it. The utility
+/// must produce enough output that it is still writing when the pipe closes;
+/// `args` should name something large.
+pub fn assert_dies_by_sigpipe(cmd: &str, args: &[&str]) {
+    use std::io::Read as _;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let mut child = Command::new(get_binary_path(cmd))
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {}: {}", cmd, e));
+
+    // Read a little, then drop the read end while the utility has more to say.
+    //
+    // How much came back matters: a utility whose entire output fits the pipe
+    // buffer finishes before the reader leaves and exits 0, and the assertions
+    // below would then blame SIGPIPE for an operand that was simply too small.
+    // Reading a full buffer says the output is larger than this, which is the
+    // precondition the caller has to meet.
+    let mut stdout = child.stdout.take().expect("child stdout");
+    let mut buf = [0u8; 64];
+    let got = stdout.read(&mut buf).unwrap_or(0);
+    drop(stdout);
+    assert_eq!(
+        got,
+        buf.len(),
+        "{}: only {} bytes of output before the pipe closed -- this operand is \
+         too small to race a reader, so the test cannot say anything about \
+         SIGPIPE. Give it more to write.",
+        cmd,
+        got
+    );
+
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait for {}: {}", cmd, e));
+
+    assert_eq!(
+        out.status.signal(),
+        Some(libc::SIGPIPE),
+        "{}: expected death by SIGPIPE, got {:?} with stderr {:?}",
+        cmd,
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}: a closed pipe is not an error to report: {:?}",
+        cmd,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

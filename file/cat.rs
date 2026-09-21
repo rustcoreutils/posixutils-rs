@@ -11,7 +11,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::io::input_stream;
 use plib::BUFSZ;
 
@@ -78,9 +78,7 @@ fn cat_file(pathname: &Path) -> bool {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("cat");
 
     let mut args = Args::parse();
 

@@ -9,7 +9,7 @@
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, TimeZone};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use std::ffi::CString;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -216,9 +216,7 @@ fn touch_file(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("touch");
 
     let mut args = Args::parse();
 

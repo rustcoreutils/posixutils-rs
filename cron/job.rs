@@ -792,6 +792,12 @@ impl CronJob {
             }
         };
 
+        // A command that ignores its standard input (`date %hello`) can close
+        // this pipe before the write lands. Taking the signal here would kill
+        // the job child before `wait_with_output`, so the job's output would
+        // never be mailed and it would be reported as a signal death.
+        let _sigpipe = plib::io::SigPipeIgnored::new();
+
         // Feed the standard-input text (everything after the first `%`).
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
@@ -965,6 +971,10 @@ pub fn mail_output(recipient: &str, subject: &str, body: &[u8]) {
         Ok(c) => c,
         Err(_) => return,
     };
+
+    // A mailer that rejects the message closes the pipe; losing the
+    // notification is bad enough without losing the daemon's child too.
+    let _sigpipe = plib::io::SigPipeIgnored::new();
 
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;

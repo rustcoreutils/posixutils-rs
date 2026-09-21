@@ -13,7 +13,7 @@ mod common;
 use self::common::{copy_file, error_string};
 use clap::Parser;
 use common::{CopyConfig, DerefMode, InodeMap};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
@@ -392,9 +392,7 @@ fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> 
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("mv");
 
     let args = Args::parse();
 

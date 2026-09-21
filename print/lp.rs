@@ -15,7 +15,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use ipp::prelude::*;
 use num_traits::ToPrimitive;
 
@@ -350,6 +350,11 @@ fn send_mail(recipient: &str, subject: &str, body: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
+    // An MTA that rejects the message closes the pipe. lp reports that by
+    // returning false; it must not die of it, because the print job itself
+    // already succeeded.
+    let _sigpipe = plib::io::SigPipeIgnored::new();
+
     if let Some(mut stdin) = child.stdin.take() {
         let message = format!("To: {recipient}\nSubject: {subject}\n\n{body}\n");
         let _ = stdin.write_all(message.as_bytes());
@@ -452,9 +457,7 @@ fn do_lp(mut args: Args) -> Result<bool, String> {
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").ok();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+    plib::diag::init_locale("lp");
 
     let args = Args::parse();
 

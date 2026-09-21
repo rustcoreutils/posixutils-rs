@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::sccsfile::{
     paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, SccsDateTime, SccsFile, SccsFlag,
     SccsHeader, Sid,
@@ -447,9 +447,7 @@ fn modify_existing_file(
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").ok();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+    plib::diag::init_locale("admin");
 
     zlock::install_cleanup();
 

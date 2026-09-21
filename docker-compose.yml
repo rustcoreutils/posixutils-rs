@@ -1,8 +1,63 @@
+# Interactive toolbox: `docker compose run --rm posixutils`.
+#
+# The image's /usr/local/bin precedes /usr/bin, so inside the container `ls`,
+# `sort`, `tar` and the rest are ours, not the distro's.
+
 services:
   posixutils:
-    build: .
+    build:
+      context: .
+      args:
+        # Stamped into org.opencontainers.image.* so a locally built image does
+        # not inherit the base image's version label.
+        VERSION: "0.9.0"
+    image: posixutils-rs:local
+    init: true
     stdin_open: true
     tty: true
+    # The utilities are the workload; none of them needs a privilege.
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      # /tmp for the utilities' own scratch files, $HOME because a read-only
+      # root would otherwise leave the shell nowhere to write.
+      - /tmp:mode=1777
+      - /home/posixutils:uid=1000,gid=1000,mode=0755
     volumes:
       - .:/workspace:ro
     working_dir: /workspace
+
+  # `docker compose --profile daemon up crond`
+  #
+  # Behind a profile: crond is the only long-running service here, and the
+  # default `run` path should not drag it in. `-f` keeps it in the foreground,
+  # so the container tracks the daemon rather than its exited parent -- without
+  # it the parent returns the moment the child is forked and the container
+  # stops.
+  #
+  # It runs as the image's unprivileged user, so it services that user's jobs
+  # and no one else's. Running the system crontabs needs root.
+  crond:
+    profiles: [daemon]
+    build:
+      context: .
+    image: posixutils-rs:local
+    init: true
+    command: ["crond", "-f"]
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+      - /run:mode=0755,uid=1000,gid=1000
+    volumes:
+      # Without these the jobs live and die with the container.
+      - cron-spool:/var/spool/cron
+      - at-spool:/var/spool/atjobs
+
+volumes:
+  cron-spool:
+  at-spool:

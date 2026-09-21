@@ -18,8 +18,10 @@ use std::process;
 use vi_rs::{run_editor, InvokedAs};
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
     let invoked_as = InvokedAs::detect();
+    plib::diag::init_locale(invoked_as.name());
+
+    let args: Vec<String> = env::args().collect();
     let exit_code = run_editor(invoked_as, &args);
     process::exit(exit_code);
 }

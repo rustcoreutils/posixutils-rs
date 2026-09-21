@@ -561,6 +561,10 @@ fn pipe_through_command(input: &str, cmd: &str, vars: &Variables) -> Result<Stri
     // filter's output deadlocked as soon as that output exceeded one pipe
     // buffer: the child blocked writing to a full stdout while we blocked
     // writing to a full stdin.
+    // Held until after the join below, for the `~| head` case the match on
+    // `writer.join()` already anticipates.
+    let _sigpipe = plib::io::SigPipeIgnored::new();
+
     let mut stdin = child.stdin.take().ok_or("Failed to open stdin")?;
     let body = input.to_string();
     let writer = std::thread::spawn(move || stdin.write_all(body.as_bytes()));

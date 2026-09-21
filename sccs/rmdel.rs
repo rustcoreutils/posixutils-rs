@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::sccsfile::{paths, DeltaType, SccsFile, Sid};
 use posixutils_sccs::{diag, operands, pfile, sfio, zlock};
 
@@ -171,9 +171,7 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").ok();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+    plib::diag::init_locale("rmdel");
 
     zlock::install_cleanup();
 

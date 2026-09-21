@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use libc::{getegid, getgid, getuid, setgid, setuid};
 use plib::regex::{Regex, RegexFlags};
 use std::collections::{HashMap, VecDeque};
@@ -30,7 +30,6 @@ use termion::{clear::*, cursor::*, event::*, input::*, screen::*, style::*, *};
 const LINES_PER_PAGE: u16 = 24;
 const NUM_COLUMNS: u16 = 80;
 const DEFAULT_EDITOR: &str = "vi";
-const PROJECT_NAME: &str = "posixutils-rs";
 
 /// Last acceptable pressed mouse button
 static LAST_MOUSE_BUTTON: Mutex<Option<MouseButton>> = Mutex::new(None);
@@ -4353,12 +4352,7 @@ fn parse_args_with_more_env() -> Args {
 }
 
 fn main() {
-    let _ = setlocale(
-        LocaleCategory::LcAll,
-        std::env::var("LC_ALL").unwrap_or("".to_string()),
-    );
-    let _ = textdomain(PROJECT_NAME);
-    let _ = bind_textdomain_codeset(PROJECT_NAME, "UTF-8");
+    plib::diag::init_locale("more");
 
     let args = parse_args_with_more_env();
     match MoreControl::new(args) {

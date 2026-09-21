@@ -11,7 +11,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.head_ref || github.ref }}
@@ -29,6 +28,10 @@ jobs:
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      # Only the push paths use this; a fork PR gets a read-only token anyway.
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -40,10 +43,21 @@ jobs:
             platform: linux/arm64
             arch: arm64
     steps:
+      # The commit to build. On workflow_run, github.sha is the default
+      # branch's head at dispatch time, which is not necessarily the commit
+      # whose tests passed -- so a tag derived from it can name an image built
+      # from different source.
+      - name: Resolve commit
+        id: commit
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          FALLBACK_SHA: ${{ github.sha }}
+        run: echo "sha=${HEAD_SHA:-$FALLBACK_SHA}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.workflow_run.head_sha || '' }}
+          ref: ${{ steps.commit.outputs.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -62,6 +76,35 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
+      # Build once into the runner's image store and prove the result works
+      # before anything is pushed. Every layer is reused by the push step
+      # below, so this costs a load, not a second build.
+      #
+      # This is the step that catches what a green `docker build` cannot: an
+      # image that builds cleanly and is missing utilities.
+      # mode=max, not mode=min: min exports only the layers of the resulting
+      # image, and everything expensive here happens in the `builder` stage,
+      # which the runtime stage only COPYs from. With min, nothing restores
+      # `cargo chef cook` or `cargo build`, so every run recompiles the whole
+      # workspace and the cargo-chef structure buys nothing. This does not fit
+      # GitHub's 10 GB per-repository cache budget -- one arch of this
+      # workspace measures ~14.5 GB of buildx cache, and Swatinem/rust-cache is
+      # spending from the same budget -- so entries are evicted and some runs
+      # are cold anyway. A registry-backed cache would fix that properly.
+      - name: Build for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: posixutils:ci
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+
+      - name: Smoke test
+        run: ./scripts/docker-smoke posixutils:ci
+
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6
@@ -69,6 +112,8 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
           outputs: >-
             type=image,
             name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},
@@ -99,7 +144,17 @@ jobs:
     timeout-minutes: 10
     if: github.event_name != 'pull_request'
     needs: build
+    permissions:
+      contents: read
+      packages: write
     steps:
+      - name: Resolve commit
+        id: commit
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          FALLBACK_SHA: ${{ github.sha }}
+        run: echo "sha=${HEAD_SHA:-$FALLBACK_SHA}" >> "$GITHUB_OUTPUT"
+
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
@@ -117,6 +172,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The sha tag is type=raw, not type=sha. `type=sha` accepts no `value=`
+      # attribute, and metadata-action reads only the workflow's own
+      # context.sha -- which on a workflow_run event is the default branch's
+      # head at dispatch time, not the commit whose tests passed. An unknown
+      # attribute is stored without complaint, so the wrong tag was produced
+      # silently.
+      #
+      # These comments sit outside the `tags:` block on purpose: it is a
+      # literal block scalar, so a `#` line inside it is content and would be
+      # handed to metadata-action as a tag definition.
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -124,7 +189,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=edge,branch=main
-            type=sha,prefix=sha-
+            type=raw,value=sha-${{ steps.commit.outputs.sha }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}

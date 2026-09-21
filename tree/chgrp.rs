@@ -11,7 +11,7 @@ mod common;
 
 use self::common::{chown_traverse, error_string, ChangeOwnershipArgs};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use std::{ffi::CString, io};
 
 /// chgrp - change file group ownership
@@ -87,9 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // initialize translations
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("chgrp");
 
     let mut exit_code = 0;
 

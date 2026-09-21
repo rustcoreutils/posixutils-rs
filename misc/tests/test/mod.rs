@@ -586,3 +586,72 @@ fn test_newer_older() {
     test_test(&[m, "-ot", n], 0);
     test_test(&[n, "-ot", m], 1);
 }
+
+/// Run the bracket form: the same binary reached through the `[` symlink.
+fn test_bracket(args: &[&str], expected_code: i32) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test(TestPlan {
+        cmd: String::from("["),
+        args: str_args,
+        stdin_data: String::from(""),
+        expected_out: String::from(""),
+        expected_err: String::from(""),
+        expected_exit_code: expected_code,
+    });
+}
+
+/// The `[` form evaluates the same expressions as `test`.
+///
+/// POSIX gives the utility two names and lets one binary serve both by reading
+/// argv[0]; `misc/build.rs` delivers `[` as a symlink to `test`. Without it
+/// the bracket path here is unreachable, which is how it went untested.
+#[test]
+fn test_bracket_form() {
+    test_bracket(&["1", "-eq", "1", "]"], 0);
+    test_bracket(&["1", "-eq", "2", "]"], 1);
+    test_bracket(&["-n", "x", "]"], 0);
+    test_bracket(&["-z", "x", "]"], 1);
+
+    // A bare `[ ]` is the empty expression: false, not an error.
+    test_bracket(&["]"], 1);
+
+    // The final `]` is not an operand: `[ ] ]` is the one-argument string
+    // test on "]", which is non-empty and therefore true.
+    test_bracket(&["]", "]"], 0);
+}
+
+/// The bracket form requires `]` as its final argument.
+#[test]
+fn test_bracket_requires_closing() {
+    // Missing entirely.
+    test_bracket_with_err(&["1", "-eq", "1"], 2);
+    // Present, but not last.
+    test_bracket_with_err(&["]", "-a", "x"], 2);
+}
+
+/// As `test_bracket`, for the cases that write a diagnostic.
+fn test_bracket_with_err(args: &[&str], expected_code: i32) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("["),
+            args: str_args,
+            stdin_data: String::from(""),
+            expected_out: String::from(""),
+            expected_err: String::from(""),
+            expected_exit_code: expected_code,
+        },
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.is_empty(), "expected a diagnostic on stderr");
+            // Attributed to the name it was invoked under, not to `test`.
+            assert!(
+                stderr.starts_with("[: "),
+                "diagnostic should name `[`, got: {}",
+                stderr
+            );
+        },
+    );
+}

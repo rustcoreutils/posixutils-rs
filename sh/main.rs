@@ -16,7 +16,7 @@ use crate::shell::Shell;
 use crate::shstr::{ShStr, ShString};
 use cli::terminal::read_nonblocking_char;
 use cli::vi::{Action, ViEditor};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use os::signals::{
     handle_signal_ignore, handle_signal_write_to_signal_buffer, setup_signal_handling, Signal,
 };
@@ -347,9 +347,7 @@ fn interactive_shell(shell: &mut Shell) {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("sh");
 
     // `args()` panics inside libstd on an argument that is not valid UTF-8;
     // `args_os()` cannot. POSIX argv is a list of byte strings.

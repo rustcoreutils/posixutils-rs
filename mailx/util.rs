@@ -133,6 +133,10 @@ pub fn page_or_print(text: &str, vars: &Variables) {
         return;
     };
 
+    // The user quitting the pager closes this pipe; the message has been
+    // shown, so that is not a reason to kill the mail session.
+    let _sigpipe = plib::io::SigPipeIgnored::new();
+
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(text.as_bytes());
     }

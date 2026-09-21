@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::{env, fs, io, process};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 
 use posixutils_make::{
     config::Config,
@@ -285,9 +285,7 @@ fn read_stdin() -> Result<String, ErrorCode> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("make");
 
     let Args {
         directory,

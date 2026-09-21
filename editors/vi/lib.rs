@@ -54,7 +54,6 @@ pub use ui::{
 };
 pub use undo::{Change, ChangeKind, UndoManager};
 
-use gettextrs::{setlocale, LocaleCategory};
 use std::io::IsTerminal;
 use std::process;
 
@@ -80,6 +79,14 @@ impl InvokedAs {
             InvokedAs::Vi
         }
     }
+
+    /// The name this invocation is known by, for diagnostics and the locale.
+    pub fn name(self) -> &'static str {
+        match self {
+            InvokedAs::Ex => "ex",
+            InvokedAs::Vi => "vi",
+        }
+    }
 }
 
 /// Run the editor with the given invocation mode and command-line arguments.
@@ -87,10 +94,6 @@ impl InvokedAs {
 /// This is the main entry point for both vi and ex binaries.
 /// Returns the exit code.
 pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
-    // Honor the user's locale: LC_CTYPE/LC_COLLATE drive the libc regex engine
-    // and LC_MESSAGES localizes diagnostics.
-    setlocale(LocaleCategory::LcAll, "");
-
     // Preserve the buffer on hangup/termination, and prune old recovery files.
     signals::install_hangup_handlers();
     recover::cleanup_stale(&recover::default_base(), 14 * 24 * 60 * 60);
@@ -98,21 +101,12 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
     let mut opts = match parse_args(invoked_as, args) {
         Ok(o) => o,
         Err(e) => {
-            let name = if invoked_as == InvokedAs::Ex {
-                "ex"
-            } else {
-                "vi"
-            };
-            eprintln!("{}: {}", name, e);
+            eprintln!("{}: {}", invoked_as.name(), e);
             return 1;
         }
     };
 
-    let prog_name = if invoked_as == InvokedAs::Ex {
-        "ex"
-    } else {
-        "vi"
-    };
+    let prog_name = invoked_as.name();
 
     // POSIX: if standard input is not a terminal, behave as if -s was given.
     // That also means assuming a terminal that cannot support visual mode, so

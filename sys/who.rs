@@ -11,7 +11,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::utmpx::Utmpx;
 use plib::{curuser, platform, utmpx};
 
@@ -344,9 +344,7 @@ fn show_utmpx_summary(file: Option<&PathBuf>) -> Result<(), Box<dyn std::error::
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("who");
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let am_i = args.len() == 2 && args[0] == "am" && (args[1] == "i" || args[1] == "I");

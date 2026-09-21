@@ -554,7 +554,28 @@ page.
 
 **Running as of 2026-09-21.** `cc/scripts/c17_torture.sh` drives it against an
 external checkout (the suite is GPLv3 and is not vendored) and diffs a recorded
-baseline, so a regression fails rather than shifting a percentage. The
-libc-alias builtins took `execute/` from 58.5% to 80.0%. What remains, at -O0:
-~102 tests needing `-fpermissive`, 11 nested functions, 8 VLA-as-struct-member,
-12 `va_arg` of a small struct, 10 bitfield promotion/truncation.
+baseline, so a regression fails rather than shifting a percentage.
+
+`execute/` went from **58.5% to 87.3%** (1986 -> 2966 of 3396 test-instances,
+1698 tests at -O0 and -O2) over one series: the libc-alias builtins,
+`-fpermissive`, `__complex__`, bare `alloca`, `va_arg` of a small struct,
+bit-field assignment values and promotion, binary128 variadic arguments,
+`__builtin_classify_type`, `creal`/`cimag`/`conj`, the `*_overflow_p` family,
+`#pragma push_macro`, `__builtin_prefetch`'s argument, and enumeration
+constants' type.
+
+What is left, at -O0 — 35 run failures and 68 compile failures:
+
+| Group | Count | Note |
+|---|---|---|
+| Bit-field arithmetic at the declared width | 5 | `x.b << 32` with `unsigned long long b : 40` is done in 40 bits. Needs the expression type to carry the field width, not just the promotion rule |
+| Complex arithmetic | 5 | `pr104604`, `pr42248`, `pr56837`, `20050121-1`, `complex-4` |
+| `va_arg` with `long double` / `__int128` | 2 | `pr44942`, `pr92904` — the binary128 fixes did not reach these |
+| Pre-C99 implicit `int` not requesting `-fpermissive` | 5 | gcc rejects them too without a flag |
+| Dead-call elimination proofs | 4 | call an undefined `link_error` the optimizer is expected to delete; a -O0 artifact, not a defect |
+| Nested functions, VLA-as-struct-member, `_Decimal64`, `__builtin_apply` | ~5 | out of scope, see the GNU extensions section |
+| Singletons needing their own triage | ~40 | mostly `pr*` |
+
+One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.
+gcc accepts a conditional with one `void` arm as an extension; C17 6.5.15p3
+requires both or neither.

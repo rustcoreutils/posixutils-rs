@@ -1228,7 +1228,15 @@ impl<'a> Preprocessor<'a> {
         }
         iter.next();
         let name = match &iter.peek()?.value {
-            TokenValue::String(s) => crate::token::lexer::literal_payload(s),
+            // `payload_text`, not `literal_payload`. A literal's payload is
+            // already one `char` per source byte; `literal_payload` is the
+            // encoder that produces that form, so applying it here encodes an
+            // encoded payload and doubles every byte of 0x80 or more. The name
+            // is then looked up in the macro table, which is keyed by the
+            // identifier as the lexer interned it -- so a `#pragma
+            // push_macro("café")` saved nothing and the matching pop restored
+            // nothing.
+            TokenValue::String(s) => crate::token::lexer::payload_text(s),
             _ => return None,
         };
         iter.next();

@@ -2080,3 +2080,54 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("preprocessor_push_pop_macro", code, &[]), 0);
 }
+
+/// A `#pragma push_macro` name is a string-literal *payload*, and a payload is
+/// one `char` per source byte — not Rust text.
+///
+/// `literal_payload` is the encoder that produces that form. Applying it to a
+/// payload that is already in it encodes an encoded payload, doubling every
+/// byte of 0x80 or more; the name is then looked up in the macro table, which
+/// is keyed by the identifier as the lexer interned it, so the lookup missed.
+/// `#pragma push_macro("café")` saved nothing and the matching pop restored
+/// nothing. `payload_text` is the decoder and the right call.
+///
+/// The seventh bug of this shape in this crate, and the reason the accessors
+/// carry the names they do.
+///
+/// gcc gets this wrong too — it does not restore `café` either — so this is a
+/// case where c17 is the more correct of the two, and the test says so rather
+/// than pinning c17 to gcc's answer.
+#[test]
+fn preprocessor_push_macro_name_with_non_ascii_bytes() {
+    let code = r#"
+#define café 2
+#define naïve 5
+#pragma push_macro("café")
+#pragma push_macro("naïve")
+#undef café
+#undef naïve
+#define café 1
+#define naïve 9
+#pragma pop_macro("naïve")
+#pragma pop_macro("café")
+
+/* An ASCII name alongside them, so a fix that broke the common case would
+   show here rather than in a later commit. */
+#define PLAIN 3
+#pragma push_macro("PLAIN")
+#undef PLAIN
+#define PLAIN 4
+#pragma pop_macro("PLAIN")
+
+int main(void) {
+    if (café != 2) return 1;
+    if (naïve != 5) return 2;
+    if (PLAIN != 3) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("preprocessor_push_macro_non_ascii", code, &[]),
+        0
+    );
+}

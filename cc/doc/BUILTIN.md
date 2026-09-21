@@ -204,7 +204,14 @@ headers rely on.
 | `__builtin_strcat(d, s)`, `__builtin_strncat(d, s, n)` | |
 | `__builtin_strchr(s, c)`, `__builtin_strrchr(s, c)`, `__builtin_strstr(h, n)` | |
 | `__builtin_printf(fmt, ...)`, `__builtin_sprintf(buf, fmt, ...)`, `__builtin_snprintf(buf, n, fmt, ...)` | Variadic after the format argument |
-| `__builtin_puts(s)` | |
+| `__builtin_puts(s)`, `__builtin_putchar(c)` | |
+| `__builtin_memchr(p, c, n)` | Returns `void *` |
+| `__builtin_index(s, c)`, `__builtin_rindex(s, c)` | The older spellings of `strchr`/`strrchr` |
+| `__builtin_strpbrk(s, set)` | |
+| `__builtin_strspn(s, set)`, `__builtin_strcspn(s, set)` | Return a size, not a pointer |
+| `__builtin_imaxabs(x)` | Absolute value, `intmax_t` |
+| `__builtin_bcopy(src, dst, n)` | Returns `void`, and takes the source **first**, unlike `memcpy` |
+| `__builtin_printf_unlocked`, `__builtin_fprintf_unlocked`, `__builtin_fputs_unlocked` | glibc defines none of these, so a program using one supplies it — which is what gcc.c-torture's `builtins/` tests do |
 
 The return types matter and are modelled: the string family returns `char *`,
 the allocators and `mempcpy` return `void *`. Typing one of them `int` would

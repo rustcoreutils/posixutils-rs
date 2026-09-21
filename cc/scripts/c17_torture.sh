@@ -167,6 +167,17 @@ GCC_ALSO_FAILS=" 980608-1 bcp-1 eeprof-1 pr117432 pr123864 va-arg-7 va-arg-8 "
 run_one() {
     local src="$1" opt="$2" work="$3" cc="$4" mode="$5"
     local base; base=$(basename "$src" .c)
+
+    # `execute/builtins/` is three files, not one: the test, a `-lib.c` giving
+    # the library functions it checks, and a shared `lib/main.c`. Its own
+    # builtins.exp also turns off five gcc passes so the optimizer cannot do
+    # the work the library call is supposed to do. Driving it as a single file
+    # links nothing and proves nothing.
+    local companions="" extra=""
+    if [ -f "${src%.c}-lib.c" ]; then
+        companions="${src%.c}-lib.c $(dirname "$src")/lib/main.c"
+        extra="-fno-tree-dse -fno-tree-loop-distribute-patterns -fno-tracer -fno-ipa-ra -fno-inline-functions"
+    fi
     local tag="$base@${opt// /_}"
     local exe="$work/bin/$tag.$$"
     local log="$exe.log"
@@ -205,7 +216,7 @@ run_one() {
     # against gcc's 0.02, which is how this was found.
     # shellcheck disable=SC2086
     if [ "$mode" = compile ]; then
-        timeout "$ctimeout" "$cc" $opt -w $flags -c "$src" -o "$exe.o" >"$log" 2>&1
+        timeout "$ctimeout" "$cc" $opt -w $extra $flags -c "$src" -o "$exe.o" >"$log" 2>&1
         local crc=$?
         rm -f "$exe.o"
         case $crc in
@@ -218,7 +229,7 @@ run_one() {
     fi
 
     # shellcheck disable=SC2086
-    timeout "$ctimeout" "$cc" $opt -w $flags "$src" -o "$exe" -lm >"$log" 2>&1
+    timeout "$ctimeout" "$cc" $opt -w $extra $flags "$src" $companions -o "$exe" -lm >"$log" 2>&1
     local crc=$?
     if [ $crc -ne 0 ]; then
         if [ $crc -eq 124 ]; then
@@ -257,7 +268,9 @@ collect() {
                        -not -name '*-lib.c' -not -path '*/lib/*';;
         compile)  find "$TORTURE_SUITE/compile" -maxdepth 1 -name '*.c';;
         all)      find "$TORTURE_SUITE/execute" -maxdepth 1 -name '*.c'
-                  find "$TORTURE_SUITE/execute/ieee" -name '*.c';;
+                  find "$TORTURE_SUITE/execute/ieee" -name '*.c'
+                  find "$TORTURE_SUITE/execute/builtins" -name '*.c' \
+                       -not -name '*-lib.c' -not -path '*/lib/*';;
         *) echo "unknown sub-suite: $SUBSUITE" >&2; exit 2;;
     esac | { [ -n "$FILTER" ] && grep -- "$FILTER" || cat; } | sort
 }

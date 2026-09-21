@@ -679,3 +679,73 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("builtins_overflow_p", code, &[]), 0);
 }
+
+/// The libc aliases the `execute/builtins/` sub-suite needs, which running
+/// that sub-suite is what surfaced.
+///
+/// Nine more of the same family as the earlier batch, plus the three stdio
+/// `_unlocked` forms. Every one was checked against gcc before being added:
+/// `__builtin_bcopy` returns `void` and takes three arguments, `index` and
+/// `rindex` are the old spellings of `strchr`/`strrchr` and return `char *`,
+/// `memchr` returns `void *`, `strspn`/`strcspn` return a size.
+///
+/// glibc has no `printf_unlocked`, so gcc's own link of
+/// `__builtin_printf_unlocked` fails against the system library — the torture
+/// tests supply the library side themselves, which is the arrangement this has
+/// to work under, and why the test below defines them.
+#[test]
+fn builtins_libc_aliases_second_batch() {
+    let code = r#"
+#include <stdio.h>
+
+/* The `_unlocked` forms have no glibc definition; supply them, as the
+   gcc.c-torture builtins/ tests do. */
+int printf_unlocked(const char *f, ...) { (void)f; return 11; }
+int fprintf_unlocked(FILE *s, const char *f, ...) { (void)s; (void)f; return 22; }
+int fputs_unlocked(const char *s, FILE *f) { (void)s; (void)f; return 33; }
+
+int main(void) {
+    char buf[32];
+    __builtin_strcpy(buf, "hello world");
+
+    /* void * return: a truncated one would not equal buf + 6. */
+    if (__builtin_memchr(buf, 'w', 12) != buf + 6) return 1;
+    if (__builtin_memchr(buf, 'z', 12) != 0) return 2;
+
+    /* char * returns, under their old names. */
+    if (__builtin_index(buf, 'l') != buf + 2) return 3;
+    if (__builtin_rindex(buf, 'l') != buf + 9) return 4;
+    if (__builtin_strpbrk(buf, "xyzw") != buf + 6) return 5;
+    if (__builtin_strpbrk(buf, "QZ") != 0) return 6;
+
+    /* Sizes, not pointers. */
+    if (__builtin_strspn("aabbcc", "ab") != 4) return 7;
+    if (__builtin_strcspn("aabbcc", "c") != 4) return 8;
+
+    if (__builtin_imaxabs(-42) != 42) return 9;
+    if (__builtin_imaxabs(42) != 42) return 10;
+
+    /* bcopy returns void and takes source first, unlike memcpy. */
+    { char d[8]; __builtin_bcopy("abc", d, 4);
+      if (__builtin_strcmp(d, "abc") != 0) return 11; }
+
+    if (__builtin_putchar('\n') != '\n') return 12;
+
+    /* The unlocked forms reach the definitions above, with the right arity:
+       printf_unlocked is variadic after its format, fprintf_unlocked after
+       its stream and format, fputs_unlocked takes exactly two. */
+    if (__builtin_printf_unlocked("%d %s\n", 1, "x") != 11) return 13;
+    if (__builtin_fprintf_unlocked(stdout, "%d\n", 2) != 22) return 14;
+    if (__builtin_fputs_unlocked("y\n", stdout) != 33) return 15;
+
+#define CK(n) do { if (!__has_builtin(n)) return 40; } while (0)
+    CK(__builtin_memchr); CK(__builtin_index); CK(__builtin_rindex);
+    CK(__builtin_strpbrk); CK(__builtin_strspn); CK(__builtin_strcspn);
+    CK(__builtin_imaxabs); CK(__builtin_bcopy); CK(__builtin_putchar);
+    CK(__builtin_printf_unlocked); CK(__builtin_fprintf_unlocked);
+    CK(__builtin_fputs_unlocked);
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("builtins_libc_second_batch", code, &[]), 0);
+}

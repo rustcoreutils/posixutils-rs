@@ -1729,7 +1729,8 @@ impl Parser<'_> {
             // declare them has not been included.
             "strlen" => Some(self.types.ulong_id),
             "strcmp" | "abs" | "ffs" | "ffsl" | "ffsll" | "memcmp" | "strncmp" | "printf"
-            | "sprintf" | "snprintf" | "puts" => Some(self.types.int_id),
+            | "sprintf" | "snprintf" | "puts" | "putchar" | "printf_unlocked"
+            | "fprintf_unlocked" | "fputs_unlocked" => Some(self.types.int_id),
             "labs" => Some(self.types.long_id),
             "llabs" => Some(self.types.longlong_id),
             "sqrt" | "copysign" => Some(self.types.double_id),
@@ -1738,9 +1739,14 @@ impl Parser<'_> {
             // returns `char *`. Answering `int` here would truncate the
             // returned address to 32 bits, which is the bug the `_chk` cases
             // above are commented for.
-            "malloc" | "calloc" | "realloc" | "mempcpy" => Some(self.types.void_ptr_id),
+            "malloc" | "calloc" | "realloc" | "mempcpy" | "memchr" => Some(self.types.void_ptr_id),
+            // `bcopy` predates `memmove` and returns nothing; `index`/`rindex`
+            // are the old spellings of `strchr`/`strrchr`.
+            "bcopy" => Some(self.types.void_id),
+            "imaxabs" => Some(self.types.long_id),
+            "strcspn" | "strspn" => Some(self.types.ulong_id),
             "strcpy" | "strncpy" | "stpcpy" | "strcat" | "strncat" | "strchr" | "strrchr"
-            | "strstr" => {
+            | "strstr" | "index" | "rindex" | "strpbrk" => {
                 let char_id = self.types.char_id;
                 Some(self.types.intern(Type {
                     kind: TypeKind::Pointer,
@@ -1792,6 +1798,18 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_STRCHR
                 | crate::kw::BUILTIN_STRRCHR
                 | crate::kw::BUILTIN_STRSTR
+                | crate::kw::BUILTIN_IMAXABS
+                | crate::kw::BUILTIN_MEMCHR
+                | crate::kw::BUILTIN_BCOPY
+                | crate::kw::BUILTIN_INDEX
+                | crate::kw::BUILTIN_RINDEX
+                | crate::kw::BUILTIN_PUTCHAR
+                | crate::kw::BUILTIN_STRCSPN
+                | crate::kw::BUILTIN_STRSPN
+                | crate::kw::BUILTIN_STRPBRK
+                | crate::kw::BUILTIN_PRINTF_UNLOCKED
+                | crate::kw::BUILTIN_FPRINTF_UNLOCKED
+                | crate::kw::BUILTIN_FPUTS_UNLOCKED
         )
     }
 
@@ -1898,15 +1916,23 @@ impl Parser<'_> {
             "strlen" | "abs" | "labs" | "llabs" | "ffs" | "ffsl" | "ffsll" | "sqrt" => (1, false),
             "strcmp" | "copysign" => (2, false),
             "abort" => (0, false),
-            "exit" | "puts" | "malloc" | "free" => (1, false),
+            "exit" | "puts" | "malloc" | "free" | "putchar" | "imaxabs" => (1, false),
             "calloc" | "realloc" | "strcpy" | "stpcpy" | "strcat" | "strchr" | "strrchr"
-            | "strstr" => (2, false),
-            "memcmp" | "mempcpy" | "strncpy" | "strncat" | "strncmp" => (3, false),
+            | "strstr" | "index" | "rindex" | "strpbrk" | "strcspn" | "strspn" => (2, false),
+            "memcmp" | "mempcpy" | "strncpy" | "strncat" | "strncmp" | "memchr" | "bcopy" => {
+                (3, false)
+            }
             // The printf family is variadic after its format string. Getting
             // the fixed count right is what keeps the format argument in a
             // register on Apple arm64, where variadic arguments go on the
             // stack -- the same reason the `_chk` forms above are spelled out.
-            "printf" => (1, true),
+            "printf" | "printf_unlocked" => (1, true),
+            // The stdio `_unlocked` forms. gcc has them, and the torture
+            // suite's builtins/ tests supply the library side themselves --
+            // glibc has no `printf_unlocked`, so gcc's own link fails without
+            // that. Only the three a real corpus uses are here.
+            "fprintf_unlocked" => (2, true),
+            "fputs_unlocked" => (2, false),
             "sprintf" => (2, true),
             "snprintf" => (3, true),
             // An entry point this does not know is left as it was: variadic,

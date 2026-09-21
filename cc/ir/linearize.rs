@@ -3776,6 +3776,7 @@ impl<'a> Linearizer<'a> {
 
             // Store back to the lvalue
             let store_size = self.types.size_bits(typ);
+            let mut stored_bitfield: Option<(u32, crate::types::TypeId)> = None;
             match &operand.kind {
                 ExprKind::Ident(symbol_id) => {
                     let name_str = self.symbol_name(*symbol_id);
@@ -3812,6 +3813,7 @@ impl<'a> Linearizer<'a> {
                     let struct_type = self.resolve_struct_type(base_struct_type);
                     if let Some(member_info) = self.types.find_member(struct_type, *member) {
                         self.emit_member_store(base, &member_info, final_result);
+                        stored_bitfield = member_info.bit_width.map(|w| (w, member_info.typ));
                     }
                 }
                 ExprKind::Arrow { expr, member } => {
@@ -3822,6 +3824,7 @@ impl<'a> Linearizer<'a> {
                     let struct_type = self.resolve_struct_type(base_struct_type);
                     if let Some(member_info) = self.types.find_member(struct_type, *member) {
                         self.emit_member_store(ptr, &member_info, final_result);
+                        stored_bitfield = member_info.bit_width.map(|w| (w, member_info.typ));
                     }
                 }
                 ExprKind::Unary {
@@ -3875,7 +3878,17 @@ impl<'a> Linearizer<'a> {
                 }
             }
 
-            return final_result;
+            // `++x.f` is `x.f += 1`, whose value is the value stored in the
+            // field (C17 6.5.16.1p2) -- so `signed int f : 3` at 3 gives -4,
+            // not 4. The postfix forms need no such care: they hand back the
+            // value loaded before the update, which `emit_bitfield_load`
+            // already narrowed.
+            return match stored_bitfield {
+                Some((bit_width, field_typ)) => {
+                    self.narrow_to_bitfield(final_result, bit_width, field_typ)
+                }
+                None => final_result,
+            };
         }
 
         // `!z` on a complex operand is `z == 0`, and a complex value is zero

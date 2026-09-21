@@ -1628,3 +1628,71 @@ int main(void)
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     let _ = code;
 }
+
+/// C17 6.5.16.1p2: the value of an assignment expression is the value *stored
+/// in* the object. For a bit-field that is the truncated, sign-extended field
+/// -- not the value that was written.
+///
+/// The store path always narrowed correctly, so `x.f` read back right; it was
+/// the value handed to the surrounding expression that was wrong, which only
+/// shows when the assignment is used rather than performed for its effect.
+/// Grepping the whole test tree for `if ((s.f = ...) ...)` found nothing, so
+/// nothing exercised it. gcc.c-torture's `921016-1` does, in one line:
+/// `if((l.m=j)==j)abort();` with `signed int m:11` and `j` 1081.
+///
+/// `++x.f` is the same question, since `++E` is `E += 1`. The postfix forms
+/// are not: they yield the value loaded before the update, which the load
+/// path already narrowed.
+#[test]
+fn c99_bitfield_assignment_expression_value() {
+    let code = r#"
+struct s3  { signed int f : 3; };
+struct u3  { unsigned int f : 3; };
+struct s11 { signed int m : 11; };
+struct wide { unsigned long long b : 40; };
+struct mixed { signed int a : 5; unsigned int b : 5; int pad; };
+
+int main(void) {
+    /* Plain assignment: 9 does not fit in 3 signed bits. */
+    { struct s3 x; if ((x.f = 9) != 1) return 1; if (x.f != 1) return 2; }
+    { struct s3 x; if ((x.f = 7) != -1) return 3; if (x.f != -1) return 4; }
+    { struct u3 x; if ((x.f = 9) != 1) return 5; if (x.f != 1) return 6; }
+    { struct s11 l; int j = 1081; if ((l.m = j) == j) return 7; }
+
+    /* Compound assignment. */
+    { struct s3 x; x.f = 0; if ((x.f += 9) != 1) return 8; }
+    { struct u3 x; x.f = 7; if ((x.f += 1) != 0) return 9; }
+    { struct s3 x; x.f = 3; if ((x.f -= 7) != -4) return 10; }
+
+    /* Prefix ++/-- yield the stored value; postfix yield the old one. */
+    { struct s3 x; x.f = 3; if (++x.f != -4) return 11; if (x.f != -4) return 12; }
+    { struct u3 x; x.f = 7; if (++x.f != 0) return 13; if (x.f != 0) return 14; }
+    { struct s3 x; x.f = -4; if (x.f-- != -4) return 15; if (x.f != 3) return 16; }
+    { struct u3 x; x.f = 0; if (x.f-- != 0) return 17; if (x.f != 7) return 18; }
+
+    /* Through a pointer, which is a separate code path. */
+    { struct s3 x; struct s3 *p = &x; if ((p->f = 9) != 1) return 19; }
+    { struct s3 x; struct s3 *p = &x; p->f = 3; if (++p->f != -4) return 20; }
+
+    /* A field that exactly fills its declared type must not be narrowed. */
+    { struct wide w; if ((w.b = 0xFFFFFFFFFFULL) != 0xFFFFFFFFFFULL) return 21; }
+
+    /* Chained assignment carries the narrowed value along. 25 is 11001 in
+       five bits, so a signed :5 field holds -7; 9 would have fit and proved
+       nothing. */
+    { struct mixed m; int r = (m.a = 25); if (r != -7) return 22; if (m.a != -7) return 23; }
+    { struct mixed m; m.pad = (m.b = 33); if (m.pad != 1) return 24; }
+
+    /* Neighbours are untouched by the narrowing. */
+    { struct mixed m; m.a = 0; m.b = 0; m.pad = 77;
+      if ((m.a = 25) != -7) return 25;
+      if (m.b != 0 || m.pad != 77) return 26; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_bitfield_assign_value", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_bitfield_assign_value_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

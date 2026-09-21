@@ -335,6 +335,49 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
+    /// Reduce a value to what a bit-field of `bit_width` would hold.
+    ///
+    /// C17 6.5.16.1p2 makes the value of an assignment expression the value
+    /// *stored in* the object, and for a bit-field that is the truncated,
+    /// sign-extended field -- not the value that was assigned. So
+    /// `(x.f = 9)` with `signed int f : 3` is 1, and `x.f = 7` is -1.
+    /// `++x.f`, `x.f--` and the compound forms are the same question.
+    ///
+    /// The store path already narrows correctly; this is only about the value
+    /// handed back to the surrounding expression, which was the unnarrowed
+    /// one. Mirrors the tail of `emit_bitfield_load`, including its rule that
+    /// the width to extend to is the *declared type's*, not the storage
+    /// unit's.
+    pub(crate) fn narrow_to_bitfield(
+        &mut self,
+        value: PseudoId,
+        bit_width: u32,
+        typ: TypeId,
+    ) -> PseudoId {
+        let value_bits = self.types.size_bits(typ);
+        if bit_width >= value_bits {
+            // The field fills its declared type; nothing to narrow, and the
+            // mask below would be a no-op that only costs an instruction.
+            return value;
+        }
+        let mask = bitfield_value_mask_128(bit_width);
+        let mask_val = self.emit_const(mask as i128, typ);
+        let masked = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::And,
+            masked,
+            value,
+            mask_val,
+            typ,
+            value_bits,
+        ));
+        if self.types.is_unsigned(typ) {
+            masked
+        } else {
+            self.emit_sign_extend_bitfield(masked, bit_width, value_bits)
+        }
+    }
+
     /// Assemble a bit-field from an arbitrary byte range, one byte at a time.
     ///
     /// This is what gcc emits for a packed bit-field on both targets, and it is
@@ -1982,6 +2025,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Store based on target expression type
         let target_size = self.types.size_bits(target_typ);
+        // Set by whichever arm stores through a bit-field, so the value this
+        // returns can be reduced to what the field actually holds.
+        let mut stored_bitfield: Option<(u32, TypeId)> = None;
         match &target.kind {
             ExprKind::Ident(symbol_id) => {
                 let name_str = self.symbol_name(*symbol_id);
@@ -2050,6 +2096,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         storage_size,
                         final_val,
                     );
+                    stored_bitfield = Some((bit_width, member_info.typ));
                 } else {
                     let member_size = self.types.size_bits(member_info.typ);
                     self.emit(Instruction::store(
@@ -2092,6 +2139,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         storage_size,
                         final_val,
                     );
+                    stored_bitfield = Some((bit_width, member_info.typ));
                 } else {
                     let member_size = self.types.size_bits(member_info.typ);
                     self.emit(Instruction::store(
@@ -2192,6 +2240,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         }
 
-        final_val
+        match stored_bitfield {
+            Some((bit_width, typ)) => self.narrow_to_bitfield(final_val, bit_width, typ),
+            None => final_val,
+        }
     }
 }

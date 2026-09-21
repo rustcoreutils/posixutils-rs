@@ -123,7 +123,8 @@ Language and preprocessor additions:
    `__builtin_printf`, `__builtin_strcpy`, ...) that let a translation unit
    call one without having included the header that declares it.
  * `__FUNCTION__`, `__PRETTY_FUNCTION__`.
- * `#include_next`, `#warning`, `#pragma once`.
+ * `#include_next`, `#warning`, `#pragma once`, `#pragma push_macro` and
+   `#pragma pop_macro`.
  * `__has_attribute`, `__has_builtin`, `__has_feature`, `__has_extension`,
    `__has_include`, `__has_include_next`.
  * Named variadic macro parameters (`#define F(args...)`), an empty variadic

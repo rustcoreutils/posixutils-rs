@@ -13,7 +13,7 @@
 // `#if` survived — the defects in this file all hid behind that.
 //
 
-use crate::common::{preprocess_text, run_c17};
+use crate::common::{compile_and_run, preprocess_text, run_c17};
 
 /// Assert the preprocessed text contains `needle`.
 fn assert_has(out: &str, needle: &str, what: &str) {
@@ -2016,4 +2016,67 @@ fn preprocessor_u8_prefix_survives_a_paste() {
         "the prefix was dropped:\n{}",
         r.stdout
     );
+}
+
+/// `#pragma push_macro` / `pop_macro`: MSVC's, adopted by gcc and clang, and
+/// used by real headers to borrow a name and give it back.
+///
+/// The cases that make it more than a one-liner are all here: the pragmas
+/// nest, so each pop restores the most recent push; a name that was *not*
+/// defined must come back undefined, which glibc's headers depend on; an
+/// unmatched pop leaves the current definition alone rather than removing it;
+/// and a function-like macro survives the round trip with its parameters.
+///
+/// Every expectation came from gcc on this source.
+#[test]
+fn preprocessor_push_and_pop_macro() {
+    let code = r#"
+extern void abort(void);
+#define A 2
+#pragma push_macro("A")
+#undef A
+#define A 1
+#pragma pop_macro("A")
+
+/* Nested pushes restore in reverse order. */
+#define B 1
+#pragma push_macro("B")
+#undef B
+#define B 2
+#pragma push_macro("B")
+#undef B
+#define B 3
+
+/* A name that was never defined: pop must restore its absence. */
+#pragma push_macro("C")
+#define C 9
+#pragma pop_macro("C")
+#ifdef C
+#error "C should not be defined after pop"
+#endif
+
+/* An unmatched pop leaves the current definition alone. */
+#define D 7
+#pragma pop_macro("D")
+
+/* A function-like macro survives the round trip. */
+#define F(x) ((x) * 3)
+#pragma push_macro("F")
+#undef F
+#define F(x) ((x) * 5)
+#pragma pop_macro("F")
+
+int main(void) {
+    if (A != 2) return 1;
+    if (B != 3) return 2;
+#pragma pop_macro("B")
+    if (B != 2) return 3;
+#pragma pop_macro("B")
+    if (B != 1) return 4;
+    if (D != 7) return 5;
+    if (F(2) != 6) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("preprocessor_push_pop_macro", code, &[]), 0);
 }

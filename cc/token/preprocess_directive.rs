@@ -1218,6 +1218,27 @@ impl<'a> Preprocessor<'a> {
         diag::warning_args(*pos, "#warning {0}", &[&msg.to_string()]);
     }
 
+    /// The macro name in `#pragma push_macro("FOO")`.
+    ///
+    /// The argument is a string literal, not an identifier, which is what lets
+    /// it name something that is not currently a macro at all.
+    fn pragma_macro_name(iter: &mut TokenCursor) -> Option<String> {
+        if !matches!(iter.peek()?.value, TokenValue::Special(c) if c == b'(' as u32) {
+            return None;
+        }
+        iter.next();
+        let name = match &iter.peek()?.value {
+            TokenValue::String(s) => crate::token::lexer::literal_payload(s),
+            _ => return None,
+        };
+        iter.next();
+        if !matches!(iter.peek()?.value, TokenValue::Special(c) if c == b')' as u32) {
+            return None;
+        }
+        iter.next();
+        Some(name)
+    }
+
     fn handle_pragma(
         &mut self,
         iter: &mut TokenCursor,
@@ -1263,6 +1284,42 @@ impl<'a> Preprocessor<'a> {
                             marker.value = TokenValue::String(action.encode());
                             output.push(marker);
                         }
+                        self.skip_to_eol(iter);
+                        return;
+                    } else if name == "push_macro" || name == "pop_macro" {
+                        // MSVC's, adopted by gcc and clang and relied on by
+                        // real headers: save the current definition of a macro
+                        // and restore it later. The name arrives as a string
+                        // literal, `#pragma push_macro("FOO")`.
+                        let pushing = name == "push_macro";
+                        iter.next(); // consume push_macro / pop_macro
+                        if let Some(macro_name) = Self::pragma_macro_name(iter) {
+                            if pushing {
+                                let saved = self.macros.get(&macro_name).cloned();
+                                self.pushed_macros
+                                    .entry(macro_name)
+                                    .or_default()
+                                    .push(saved);
+                            } else if let Some(stack) = self.pushed_macros.get_mut(&macro_name) {
+                                // An unmatched pop is ignored, as gcc ignores
+                                // it: there is nothing to restore, and the
+                                // current definition is not the pragma's to
+                                // discard.
+                                if let Some(saved) = stack.pop() {
+                                    match saved {
+                                        Some(mac) => {
+                                            self.macros.insert(macro_name, mac);
+                                        }
+                                        None => {
+                                            self.macros.remove(&macro_name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Acted on here, and not reproduced: a `.i` carrying
+                        // it would push and pop a second time against the
+                        // already-resolved text.
                         self.skip_to_eol(iter);
                         return;
                     } else if name == "once" {

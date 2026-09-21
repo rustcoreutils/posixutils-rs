@@ -116,6 +116,11 @@ Language and preprocessor additions:
    `__asm`.
  * `__int128`, `__int128_t`, `__uint128_t`, `_Float16`, `_Float32`, `_Float64`,
    `__builtin_va_list`.
+ * GNU imaginary constants — `1.0i`, `2.2if`, `1.0fi`, `2.2iL`, `1.j`.  The
+   marker may sit on either side of the floating suffix.  C spells this
+   `_Imaginary`, which Annex G makes optional and neither c17 nor gcc
+   provides; both give the constant a complex type with a zero real part.
+   The integer form `2i`, which gcc types `_Complex int`, is not accepted.
  * Clang nullability qualifiers `_Nonnull`, `_Nullable`, `_Null_unspecified`
    and their `__` spellings.
  * Roughly 145 `__builtin_*` and `__c11_atomic_*` intrinsics, including the

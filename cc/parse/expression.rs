@@ -2059,8 +2059,77 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Give a floating literal a zero real part, if it carried an imaginary
+    /// marker.
+    ///
+    /// `__builtin_complex(0, v)` is exactly the value wanted and already
+    /// exists, so no new expression node is needed -- and it is the node
+    /// `<complex.h>` builds `I` and `CMPLX` from, so the constant folds the
+    /// same way theirs do.
+    fn imaginary_if(&self, lit: Expr, is_imaginary: bool, base_typ: TypeId, pos: Position) -> Expr {
+        if !is_imaginary {
+            return lit;
+        }
+        let zero = Self::typed_expr(ExprKind::FloatLit(FloatVal::ZERO), base_typ, pos);
+        Self::typed_expr(
+            ExprKind::BuiltinComplex {
+                real: Box::new(zero),
+                imag: Box::new(lit),
+            },
+            self.types.make_complex(base_typ),
+            pos,
+        )
+    }
+
+    /// Split a GNU imaginary constant's spelling from its marker.
+    ///
+    /// Returns the number without the `i`/`j`, and whether one was there. The
+    /// marker may appear anywhere in the suffix -- `1.0fi`, `2.2if`, `1.0iF`,
+    /// `2.2iL`, `1.0li` are all gcc-accepted -- so it is removed wherever it
+    /// sits rather than only at the end.
+    ///
+    /// A hex literal is left alone: `0x1i` is not a number, and in
+    /// `0x1f` the `f` is a digit, so scanning the tail for a marker there
+    /// would misread the value.
+    fn strip_imaginary_suffix(s: &str) -> (String, bool) {
+        if s.len() < 2 || s.starts_with("0x") || s.starts_with("0X") {
+            return (s.to_string(), false);
+        }
+        // The suffix is the trailing run of letters. Only that run is searched,
+        // so the `i` of a hex digit sequence or an exponent cannot be taken for
+        // a marker.
+        let digits_end = s
+            .rfind(|c: char| c.is_ascii_digit() || c == '.')
+            .map_or(0, |i| i + 1);
+        let (num, suffix) = s.split_at(digits_end);
+        if !suffix.contains(['i', 'I', 'j', 'J']) {
+            return (s.to_string(), false);
+        }
+        let cleaned: String = suffix
+            .chars()
+            .filter(|c| !matches!(c, 'i' | 'I' | 'j' | 'J'))
+            .collect();
+        (format!("{num}{cleaned}"), true)
+    }
+
     /// Parse a number literal string into an expression
     fn parse_number_literal(&self, s: &str, pos: Position) -> ParseResult<Expr> {
+        // A GNU imaginary constant: a number with an `i` or `j` in its suffix.
+        // The marker may sit on either side of the floating suffix -- gcc takes
+        // `1.0fi`, `2.2if`, `1.0iF`, `2.2iL` and `1.0li` alike -- so it is
+        // removed wherever it lands and the rest of the suffix is parsed as it
+        // always was.
+        //
+        // C's own spelling of this is `_Imaginary`, which C17 6.4.1 reserves
+        // and Annex G makes optional; c17 does not provide the type, and gcc
+        // does not either. Both give the constant a *complex* type with a zero
+        // real part, which is what `__builtin_complex(0, v)` already builds.
+        let (s_owned, is_imaginary) = Self::strip_imaginary_suffix(s);
+        // `spelled` keeps what the program actually wrote, for diagnostics;
+        // `s` below is the number with the marker removed, which is what the
+        // ordinary suffix and value parsing expects.
+        let spelled = s;
+        let s = s_owned.as_str();
         let s_lower = s.to_lowercase();
 
         // Check if it's a hex number (must check before suffix trimming)
@@ -2181,7 +2250,8 @@ impl<'a> Parser<'a> {
             } else {
                 self.types.double_id
             };
-            Ok(Self::typed_expr(ExprKind::FloatLit(value), typ, pos))
+            let lit = Self::typed_expr(ExprKind::FloatLit(value), typ, pos);
+            Ok(self.imaginary_if(lit, is_imaginary, typ, pos))
         } else {
             // Integer - determine type from suffix
             // Check for long long first (ll, ull, llu) before checking for long (l, ul, lu)
@@ -2278,6 +2348,16 @@ impl<'a> Parser<'a> {
                     }
                 }
             };
+            if is_imaginary {
+                // `2i` is `_Complex int` in gcc -- a complex *integer*, which
+                // c17 does not yet generate correct code for. Rejected with
+                // the reason rather than silently given a floating type, which
+                // would change what the program computes.
+                return Err(ParseError::new(
+                    format!("imaginary integer constant needs _Complex int: {}", spelled),
+                    pos,
+                ));
+            }
             Ok(Self::typed_expr(ExprKind::IntLit(value), typ, pos))
         }
     }

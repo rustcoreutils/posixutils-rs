@@ -824,3 +824,77 @@ int main(void) {
         0
     );
 }
+
+/// GNU imaginary constants: a number with an `i` or `j` in its suffix.
+///
+/// c17's lexer rejected them outright — `parse error: invalid float literal:
+/// 1.0i` — which accounted for five of the gcc.c-torture complex failures.
+///
+/// The marker may sit on either side of the floating suffix; gcc takes
+/// `1.0fi`, `2.2if`, `1.0iF`, `2.2iL` and `1.0li` alike, so it is removed
+/// wherever it lands and the rest of the suffix is parsed as it always was.
+/// Only the trailing run of letters is searched, so a hex literal's digits and
+/// an exponent cannot be mistaken for a marker.
+///
+/// C spells this `_Imaginary`, which C17 6.4.1 reserves and Annex G makes
+/// optional. Neither c17 nor gcc provides the type; both give the constant a
+/// *complex* type with a zero real part, which `__builtin_complex(0, v)`
+/// already builds — so this needs no new expression node, and the constant
+/// folds exactly as `<complex.h>`'s `I` and `CMPLX` do.
+///
+/// Every value here was diffed against gcc on the same source.
+#[test]
+fn c99_gnu_imaginary_constants() {
+    let code = r#"
+int main(void) {
+    /* Every spelling, and the suffix on both sides of the marker. */
+    { _Complex double z = 1.0i;
+      if (__real__ z != 0.0 || __imag__ z != 1.0) return 1; }
+    { _Complex float z = 1.0fi;
+      if (__real__ z != 0.0f || __imag__ z != 1.0f) return 2; }
+    { _Complex float z = 2.2if;
+      if (__real__ z != 0.0f || __imag__ z != 2.2f) return 3; }
+    { _Complex long double z = 2.2iL;
+      if (__real__ z != 0.0L || __imag__ z != 2.2L) return 4; }
+    { _Complex long double z = 2.2Li;
+      if (__real__ z != 0.0L || __imag__ z != 2.2L) return 5; }
+    { _Complex double z = 1.0iF;   /* iF: float suffix after the marker */
+      if (__imag__ z != 1.0f) return 6; }
+
+    /* `j` is the other accepted marker, and a trailing dot is a valid
+       floating spelling. */
+    { _Complex double z = 1.j;
+      if (__real__ z != 0.0 || __imag__ z != 1.0) return 7; }
+    { _Complex double z = 2.i;
+      if (__imag__ z != 2.0) return 8; }
+    { _Complex float z = 1.fi;
+      if (__imag__ z != 1.0f) return 9; }
+
+    /* The type is complex, at the precision the suffix names. */
+    if (sizeof(1.0i) != sizeof(_Complex double)) return 10;
+    if (sizeof(1.0fi) != sizeof(_Complex float)) return 11;
+    if (sizeof(2.2iL) != sizeof(_Complex long double)) return 12;
+
+    /* They compose like any other complex value. */
+    { _Complex double z = 3.0 + 4.0i;
+      if (__real__ z != 3.0 || __imag__ z != 4.0) return 13; }
+    { _Complex double z = 2.0i * 2.0i;   /* i squared is -1 */
+      if (__real__ z != -4.0 || __imag__ z != 0.0) return 14; }
+    { _Complex double z = (3.0 + 4.0i) + (1.0 - 2.0i);
+      if (__real__ z != 4.0 || __imag__ z != 2.0) return 15; }
+
+    /* An ordinary literal with no marker is untouched, including one whose
+       suffix letters could be mistaken for one. */
+    if (1.0f != 1.0f) return 16;
+    if (0x1f != 31) return 17;
+    if (1.0e5 != 100000.0) return 18;
+    if (0x1p4 != 16.0) return 19;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_gnu_imaginary", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_gnu_imaginary_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

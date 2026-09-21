@@ -393,3 +393,64 @@ int main(void) {
         0
     );
 }
+
+/// `__builtin_memcpy`, `__builtin_memset` and `__builtin_memmove` actually
+/// doing something.
+///
+/// x86-64 lowered all three in its own `features.rs`. aarch64 lowered none of
+/// them: the opcode reached codegen, fell into the arm that skips no-ops, and
+/// produced nothing — so `__builtin_memcpy(b, a, 32)` left `b` untouched,
+/// silently, on every aarch64 build. A comment claimed they reached the
+/// ordinary call path instead; nothing performed that conversion.
+///
+/// This test runs on the host, so on x86-64 it guards against a regression
+/// rather than proving the fix. The fix was verified by building for
+/// aarch64 and running under qemu against cross-gcc, which is the only way to
+/// see it from here.
+#[test]
+fn builtins_memory_ops_actually_copy() {
+    let code = r#"
+int main(void) {
+    char a[40], b[40], c[13];
+    for (int i = 0; i < 40; i++) a[i] = (char)(i + 1);
+
+    /* Aligned, a multiple of eight. */
+    __builtin_memcpy(b, a, 32);
+    for (int i = 0; i < 32; i++) if (b[i] != (char)(i + 1)) return 1;
+
+    /* A size that is not a multiple of eight, so the tail matters. */
+    __builtin_memset(c, 9, 13);
+    for (int i = 0; i < 13; i++) if (c[i] != 9) return 2;
+
+    { char d[13]; __builtin_memcpy(d, c, 13);
+      for (int i = 0; i < 13; i++) if (d[i] != 9) return 3; }
+
+    /* Overlapping, which is the whole reason memmove exists. */
+    for (int i = 0; i < 40; i++) a[i] = (char)i;
+    __builtin_memmove(a + 3, a, 20);
+    for (int i = 0; i < 20; i++) if (a[i + 3] != (char)i) return 4;
+
+    /* Each returns the destination pointer. */
+    if (__builtin_memcpy(b, a, 4) != (void *)b) return 5;
+    if (__builtin_memset(b, 0, 4) != (void *)b) return 6;
+    if (__builtin_memmove(b, a, 4) != (void *)b) return 7;
+
+    /* Zero length must touch nothing. */
+    b[0] = 42;
+    __builtin_memcpy(b, a, 0);
+    if (b[0] != 42) return 8;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("builtins_mem_ops{}", opt.replace('-', "_")),
+                code,
+                &[opt.to_string()]
+            ),
+            0,
+            "memory builtins failed at {opt}"
+        );
+    }
+}

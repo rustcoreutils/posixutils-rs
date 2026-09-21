@@ -1259,9 +1259,11 @@ pub fn lower_instr_constraints_to_constraint_point_aarch64(
 /// - `Signbit32` / `Signbit64` → `__signbitf` / target-specific
 ///   signbit-double libc call (features.rs:853+)
 ///
-/// Unlike x86_64, aarch64's Memset/Memcpy/Memmove are not lowered to
-/// libc calls inside features.rs — they reach the regular `Opcode::Call`
-/// path, which `is_call_like_aarch64` already covers.
+/// `Memset`/`Memcpy`/`Memmove` are here for the same reason: they lower to a
+/// `bl` to the libc function of the same name. The comment that used to sit
+/// here said they reached the regular `Opcode::Call` path instead — nothing
+/// performed that conversion, so they reached codegen's `_ => {}` arm and
+/// emitted nothing at all.
 pub fn is_call_like_aarch64(op: Opcode) -> bool {
     matches!(
         op,
@@ -1272,6 +1274,9 @@ pub fn is_call_like_aarch64(op: Opcode) -> bool {
             | Opcode::Fabs64
             | Opcode::Signbit32
             | Opcode::Signbit64
+            | Opcode::Memcpy
+            | Opcode::Memmove
+            | Opcode::Memset
     )
 }
 
@@ -2390,11 +2395,14 @@ mod tests {
         assert!(is_call_like_aarch64(Opcode::Fabs64));
         assert!(is_call_like_aarch64(Opcode::Signbit32));
         assert!(is_call_like_aarch64(Opcode::Signbit64));
-        // Aarch64 doesn't lower Memset/Memcpy/Memmove inside features.rs
-        // — those reach the regular Opcode::Call path instead.
-        assert!(!is_call_like_aarch64(Opcode::Memset));
-        assert!(!is_call_like_aarch64(Opcode::Memcpy));
-        assert!(!is_call_like_aarch64(Opcode::Memmove));
+        // Aarch64 lowers Memset/Memcpy/Memmove to a libc `bl`, so they are
+        // call-like here exactly as on x86-64. They were excluded before,
+        // on the strength of a comment saying they reached the ordinary
+        // `Opcode::Call` path -- nothing performed that conversion, so they
+        // reached codegen's catch-all arm and emitted nothing at all.
+        assert!(is_call_like_aarch64(Opcode::Memset));
+        assert!(is_call_like_aarch64(Opcode::Memcpy));
+        assert!(is_call_like_aarch64(Opcode::Memmove));
         assert!(!is_call_like_aarch64(Opcode::Add));
         assert!(!is_call_like_aarch64(Opcode::Asm));
     }

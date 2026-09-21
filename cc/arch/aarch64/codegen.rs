@@ -922,6 +922,16 @@ impl Aarch64CodeGen {
             Opcode::SbcC => self.emit_subc(insn, true),
             Opcode::UMulHi => self.emit_umulhi(insn),
 
+            // The memory builtins are a call to the libc function of the same
+            // name. x86-64 lowers these in its own features.rs; aarch64 did
+            // not lower them at all, and the `_ => {}` below meant the
+            // instruction produced nothing rather than failing -- so
+            // `__builtin_memcpy` silently copied nothing on every aarch64
+            // build.
+            Opcode::Memcpy => self.emit_mem_libcall(insn, "memcpy"),
+            Opcode::Memmove => self.emit_mem_libcall(insn, "memmove"),
+            Opcode::Memset => self.emit_mem_libcall(insn, "memset"),
+
             // Skip no-ops and unimplemented
             _ => {}
         }

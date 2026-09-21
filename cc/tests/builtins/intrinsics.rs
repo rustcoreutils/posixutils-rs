@@ -314,6 +314,102 @@ int main(void) {
     );
 }
 
+/// The libc-alias builtins, used with **no header included at all**.
+///
+/// That is the case they exist for: gcc knows them intrinsically, and the
+/// gcc.c-torture suite leans on it heavily -- `__builtin_abort` alone appears
+/// in 438 of its tests, none of which include `<stdlib.h>`.
+///
+/// Without a header there is no declaration to consult, so c17 synthesizes
+/// one, and the synthesized *return* type is load-bearing: answering `int`
+/// for a function that returns a pointer truncates the address to 32 bits.
+/// Every pointer-returning entry below is therefore compared against the
+/// address it should have given back, which a truncated return cannot match.
+/// Checking `__has_builtin` alone would not catch any of this.
+#[test]
+fn builtins_libc_aliases_without_headers() {
+    let code = r#"
+int main(void) {
+    char buf[64];
+    char dst[64];
+
+    /* Pointer returns must survive as 64-bit values. */
+    if (__builtin_strcpy(buf, "hello") != buf) return 1;
+    if (__builtin_strlen(buf) != 5) return 2;
+    if (__builtin_strcat(buf, "!") != buf) return 3;
+    if (__builtin_strlen(buf) != 6) return 4;
+    if (__builtin_strchr(buf, 'e') != buf + 1) return 5;
+    if (__builtin_strrchr(buf, 'l') != buf + 3) return 6;
+    if (__builtin_strstr(buf, "llo") != buf + 2) return 7;
+    if (__builtin_strncpy(dst, "abcdef", 3) != dst) return 8;
+    if (__builtin_stpcpy(dst, "xy") != dst + 2) return 9;
+    if (__builtin_strncat(dst, "zw", 1) != dst) return 10;
+    if (__builtin_strcmp(dst, "xyz") != 0) return 11;
+
+    /* Integer returns. */
+    if (__builtin_memcmp("abc", "abc", 3) != 0) return 12;
+    if (__builtin_memcmp("abc", "abd", 3) >= 0) return 13;
+    if (__builtin_strncmp("abcz", "abcy", 3) != 0) return 14;
+    if (__builtin_strncmp("abcz", "abcy", 4) <= 0) return 15;
+
+    /* mempcpy returns the end of the copied region, not its start. */
+    if (__builtin_mempcpy(dst, "1234", 4) != dst + 4) return 16;
+    if (__builtin_memcmp(dst, "1234", 4) != 0) return 17;
+
+    /* The allocators: a truncated void* would not round-trip 64 bytes. */
+    {
+        char *p = (char *)__builtin_malloc(64);
+        if (!p) return 18;
+        p[0] = 'a'; p[63] = 'z';
+        if (p[0] != 'a' || p[63] != 'z') return 19;
+        __builtin_free(p);
+
+        p = (char *)__builtin_calloc(16, 4);
+        if (!p) return 20;
+        if (p[0] != 0 || p[63] != 0) return 21;
+        p = (char *)__builtin_realloc(p, 128);
+        if (!p) return 22;
+        p[127] = 'q';
+        if (p[127] != 'q') return 23;
+        __builtin_free(p);
+    }
+
+    /* The printf family is variadic after a fixed format argument; each
+       returns the number of characters written. */
+    if (__builtin_sprintf(buf, "%d-%s", 42, "ok") != 5) return 24;
+    if (__builtin_strcmp(buf, "42-ok") != 0) return 25;
+    if (__builtin_snprintf(buf, sizeof buf, "%c%c", 'h', 'i') != 2) return 26;
+    if (__builtin_strcmp(buf, "hi") != 0) return 27;
+    if (__builtin_printf("") != 0) return 28;
+    if (__builtin_puts("") < 0) return 29;
+
+    /* Reachable only if something above already went wrong, but it must
+       still compile and link without <stdlib.h> -- which is the property
+       the torture suite depends on. */
+    if (buf[0] == 1 && buf[1] == 2 && buf[2] == 3) {
+        __builtin_abort();
+        __builtin_exit(1);
+    }
+
+#define CK(n) do { if (!__has_builtin(n)) return 40; } while (0)
+    CK(__builtin_abort); CK(__builtin_exit); CK(__builtin_printf);
+    CK(__builtin_sprintf); CK(__builtin_snprintf); CK(__builtin_puts);
+    CK(__builtin_malloc); CK(__builtin_calloc); CK(__builtin_realloc);
+    CK(__builtin_free); CK(__builtin_memcmp); CK(__builtin_mempcpy);
+    CK(__builtin_strcpy); CK(__builtin_strncpy); CK(__builtin_stpcpy);
+    CK(__builtin_strcat); CK(__builtin_strncat); CK(__builtin_strncmp);
+    CK(__builtin_strchr); CK(__builtin_strrchr); CK(__builtin_strstr);
+    /* Both were implemented but unregistered, so __has_builtin denied them. */
+    CK(__builtin_isinf_sign); CK(__builtin_complex);
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("builtins_libc_aliases_no_headers", code, &[]),
+        0
+    );
+}
+
 /// `__builtin_*_overflow` asks whether the *mathematical* result fits, and a
 /// 128-bit destination is no exception (#C62).
 ///

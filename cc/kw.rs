@@ -284,6 +284,27 @@ define_keywords! {
     (BUILTIN_SQRT,      "__builtin_sqrt",     BUILTIN),
     (BUILTIN_COPYSIGN,  "__builtin_copysign", BUILTIN),
     (BUILTIN_TRAP,      "__builtin_trap",     BUILTIN),
+    (BUILTIN_ABORT,     "__builtin_abort",    BUILTIN),
+    (BUILTIN_EXIT,      "__builtin_exit",     BUILTIN),
+    (BUILTIN_PRINTF,    "__builtin_printf",   BUILTIN),
+    (BUILTIN_SPRINTF,   "__builtin_sprintf",  BUILTIN),
+    (BUILTIN_SNPRINTF,  "__builtin_snprintf", BUILTIN),
+    (BUILTIN_PUTS,      "__builtin_puts",     BUILTIN),
+    (BUILTIN_MALLOC,    "__builtin_malloc",   BUILTIN),
+    (BUILTIN_CALLOC,    "__builtin_calloc",   BUILTIN),
+    (BUILTIN_REALLOC,   "__builtin_realloc",  BUILTIN),
+    (BUILTIN_FREE,      "__builtin_free",     BUILTIN),
+    (BUILTIN_MEMCMP,    "__builtin_memcmp",   BUILTIN),
+    (BUILTIN_MEMPCPY,   "__builtin_mempcpy",  BUILTIN),
+    (BUILTIN_STRCPY,    "__builtin_strcpy",   BUILTIN),
+    (BUILTIN_STRNCPY,   "__builtin_strncpy",  BUILTIN),
+    (BUILTIN_STPCPY,    "__builtin_stpcpy",   BUILTIN),
+    (BUILTIN_STRCAT,    "__builtin_strcat",   BUILTIN),
+    (BUILTIN_STRNCAT,   "__builtin_strncat",  BUILTIN),
+    (BUILTIN_STRNCMP,   "__builtin_strncmp",  BUILTIN),
+    (BUILTIN_STRCHR,    "__builtin_strchr",   BUILTIN),
+    (BUILTIN_STRRCHR,   "__builtin_strrchr",  BUILTIN),
+    (BUILTIN_STRSTR,    "__builtin_strstr",   BUILTIN),
     // ---- Checked arithmetic (C23 spells these ckd_add and friends) ----
     (BUILTIN_ADD_OVERFLOW, "__builtin_add_overflow", BUILTIN),
     (BUILTIN_SUB_OVERFLOW, "__builtin_sub_overflow", BUILTIN),
@@ -420,6 +441,27 @@ define_keywords! {
     (_,                 "sqrt",                 0),
     (_,                 "copysign",             0),
     (_,                 "abort",                0),
+    (_,                 "exit",                 0),
+    (_,                 "printf",               0),
+    (_,                 "sprintf",              0),
+    (_,                 "snprintf",             0),
+    (_,                 "puts",                 0),
+    // `malloc` is not listed here: it is already interned below as the
+    // `__attribute__((malloc))` name, and one spelling is one entry.
+    (_,                 "calloc",               0),
+    (_,                 "realloc",              0),
+    (_,                 "free",                 0),
+    (_,                 "memcmp",               0),
+    (_,                 "mempcpy",              0),
+    (_,                 "strcpy",               0),
+    (_,                 "strncpy",              0),
+    (_,                 "stpcpy",               0),
+    (_,                 "strcat",               0),
+    (_,                 "strncat",              0),
+    (_,                 "strncmp",              0),
+    (_,                 "strchr",               0),
+    (_,                 "strrchr",              0),
+    (_,                 "strstr",               0),
     // The long-double magnitude and sign builtins lower to these rather than
     // to `fabs`/`__signbit`, which take a `double` and so read only the low
     // eight bytes of an x87 value.
@@ -546,6 +588,20 @@ define_keywords! {
 pub fn has_tag(id: StringId, mask: u32) -> bool {
     let idx = id.0 as usize;
     idx > 0 && idx <= KEYWORD_COUNT && KEYWORD_TAGS[idx - 1] & mask != 0
+}
+
+/// Every spelling in the table carrying any of `mask`.
+///
+/// The inverse of `has_tag`, for the checks that have to walk the table rather
+/// than ask about one name -- proving a roster elsewhere in the crate lists
+/// exactly what the table tags, in both directions. Only the registry checks
+/// need it, so it is not compiled into the compiler.
+#[cfg(test)]
+pub fn tagged_spellings(mask: u32) -> Vec<&'static str> {
+    (0..KEYWORD_COUNT)
+        .filter(|&i| KEYWORD_TAGS[i] & mask != 0)
+        .map(|i| KEYWORD_STRINGS[i])
+        .collect()
 }
 
 #[cfg(test)]

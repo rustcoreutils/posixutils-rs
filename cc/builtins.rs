@@ -61,6 +61,27 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_sqrt",
     "__builtin_copysign",
     "__builtin_trap",
+    "__builtin_abort",
+    "__builtin_exit",
+    "__builtin_printf",
+    "__builtin_sprintf",
+    "__builtin_snprintf",
+    "__builtin_puts",
+    "__builtin_malloc",
+    "__builtin_calloc",
+    "__builtin_realloc",
+    "__builtin_free",
+    "__builtin_memcmp",
+    "__builtin_mempcpy",
+    "__builtin_strcpy",
+    "__builtin_strncpy",
+    "__builtin_stpcpy",
+    "__builtin_strcat",
+    "__builtin_strncat",
+    "__builtin_strncmp",
+    "__builtin_strchr",
+    "__builtin_strrchr",
+    "__builtin_strstr",
     // Checked arithmetic
     "__builtin_add_overflow",
     "__builtin_sub_overflow",
@@ -108,12 +129,15 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     // Floating-point sign bit testing
     "__builtin_isnan",
     "__builtin_isinf",
+    "__builtin_isinf_sign",
     "__builtin_isfinite",
     "__builtin_isnormal",
     "__builtin_fpclassify",
     "__builtin_signbit",
     "__builtin_signbitf",
     "__builtin_signbitl",
+    // Complex construction, used by <complex.h> for I and the CMPLX macros
+    "__builtin_complex",
     // NaN constants
     "__builtin_nan",
     "__builtin_nanf",
@@ -203,5 +227,26 @@ mod tests {
                 name
             );
         }
+    }
+
+    /// The other direction, which the check above cannot see.
+    ///
+    /// A name tagged `BUILTIN` in `kw.rs` but absent from `SUPPORTED_BUILTINS`
+    /// is implemented by the parser and denied by `__has_builtin`, so guarded
+    /// code takes the fallback branch for a builtin that works. That is not
+    /// hypothetical: `__builtin_isinf_sign` and `__builtin_complex` were both
+    /// in exactly that state, and documented as supported, until this check
+    /// existed to find them.
+    #[test]
+    fn test_kw_builtin_tags_are_all_registered() {
+        let missing: Vec<&str> = crate::kw::tagged_spellings(crate::kw::BUILTIN)
+            .into_iter()
+            .filter(|name| !SUPPORTED_BUILTINS.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "tagged BUILTIN in kw.rs but missing from SUPPORTED_BUILTINS, \
+             so __has_builtin answers 0 for them: {missing:?}"
+        );
     }
 }

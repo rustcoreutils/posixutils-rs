@@ -5534,3 +5534,98 @@ fn test_switch_bodies_that_need_no_wrapping_are_unchanged() {
         "an unlabelled body gained a wrapper: {body:#?}"
     );
 }
+
+// Libc-alias builtins: the type of the synthesized declaration
+//
+// These lower to an ordinary call to the same-named library function. When no
+// header has declared it -- which is the case the torture suite exercises --
+// c17 synthesizes the declaration, and the return type it picks is what the
+// call expression carries. A pointer-returning entry typed `int` here
+// truncates the returned address to 32 bits at run time.
+
+/// Every pointer-returning libc alias must parse to a pointer-typed call.
+#[test]
+fn test_library_builtin_pointer_returns() {
+    for (call, base) in [
+        ("__builtin_strcpy(0, 0)", TypeKind::Char),
+        ("__builtin_strncpy(0, 0, 0)", TypeKind::Char),
+        ("__builtin_stpcpy(0, 0)", TypeKind::Char),
+        ("__builtin_strcat(0, 0)", TypeKind::Char),
+        ("__builtin_strncat(0, 0, 0)", TypeKind::Char),
+        ("__builtin_strchr(0, 0)", TypeKind::Char),
+        ("__builtin_strrchr(0, 0)", TypeKind::Char),
+        ("__builtin_strstr(0, 0)", TypeKind::Char),
+        ("__builtin_malloc(0)", TypeKind::Void),
+        ("__builtin_calloc(0, 0)", TypeKind::Void),
+        ("__builtin_realloc(0, 0)", TypeKind::Void),
+        ("__builtin_mempcpy(0, 0, 0)", TypeKind::Void),
+    ] {
+        let (expr, types, _, _) = parse_expr(call).unwrap();
+        assert!(
+            matches!(expr.kind, ExprKind::Call { .. }),
+            "{call} did not lower to a call"
+        );
+        let typ = expr.typ.unwrap_or_else(|| panic!("{call} has no type"));
+        assert_eq!(
+            types.kind(typ),
+            TypeKind::Pointer,
+            "{call} returns {:?}, not a pointer -- a 64-bit address would be truncated",
+            types.kind(typ)
+        );
+        assert_eq!(
+            types.kind(types.get(typ).base.unwrap()),
+            base,
+            "{call} points at the wrong type"
+        );
+    }
+}
+
+/// The integer- and void-returning aliases, for the same reason in reverse:
+/// widening `int` to a pointer would be just as wrong.
+#[test]
+fn test_library_builtin_scalar_returns() {
+    for (call, want) in [
+        ("__builtin_memcmp(0, 0, 0)", TypeKind::Int),
+        ("__builtin_strncmp(0, 0, 0)", TypeKind::Int),
+        ("__builtin_printf(0)", TypeKind::Int),
+        ("__builtin_sprintf(0, 0)", TypeKind::Int),
+        ("__builtin_snprintf(0, 0, 0)", TypeKind::Int),
+        ("__builtin_puts(0)", TypeKind::Int),
+        ("__builtin_abort()", TypeKind::Void),
+        ("__builtin_exit(0)", TypeKind::Void),
+        ("__builtin_free(0)", TypeKind::Void),
+    ] {
+        let (expr, types, _, _) = parse_expr(call).unwrap();
+        assert!(
+            matches!(expr.kind, ExprKind::Call { .. }),
+            "{call} did not lower to a call"
+        );
+        let typ = expr.typ.unwrap_or_else(|| panic!("{call} has no type"));
+        assert_eq!(types.kind(typ), want, "{call} has the wrong return type");
+    }
+}
+
+/// The printf family is variadic *after* a fixed format argument. Declaring it
+/// variadic from argument zero misplaces that argument on Apple arm64, where
+/// variadic arguments go on the stack and fixed ones stay in registers.
+#[test]
+fn test_library_builtin_printf_family_fixed_arity() {
+    for (call, fixed) in [
+        ("__builtin_printf(0)", 1usize),
+        ("__builtin_sprintf(0, 0)", 2),
+        ("__builtin_snprintf(0, 0, 0)", 3),
+    ] {
+        let (expr, types, _, _) = parse_expr(call).unwrap();
+        let ExprKind::Call { func, .. } = &expr.kind else {
+            panic!("{call} did not lower to a call");
+        };
+        let ftyp = func.typ.unwrap();
+        let info = types.get(ftyp);
+        assert!(info.variadic, "{call} must be variadic");
+        assert_eq!(
+            info.params.as_ref().map(|p| p.len()),
+            Some(fixed),
+            "{call} has the wrong fixed-argument count"
+        );
+    }
+}

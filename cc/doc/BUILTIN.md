@@ -182,12 +182,28 @@ headers rely on.
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_strlen(s)` | |
-| `__builtin_strcmp(a, b)` | |
+| `__builtin_abort()` | |
+| `__builtin_exit(status)` | |
 | `__builtin_abs(x)` | Absolute value, `int` |
 | `__builtin_labs(x)` | Absolute value, `long` |
 | `__builtin_llabs(x)` | Absolute value, `long long` |
 | `__builtin_trap()` | Abnormal termination; lowered to `abort` |
+| `__builtin_malloc(n)`, `__builtin_calloc(n, sz)`, `__builtin_realloc(p, n)`, `__builtin_free(p)` | The allocators. The three allocating forms return `void *` |
+| `__builtin_memcmp(a, b, n)` | |
+| `__builtin_mempcpy(dst, src, n)` | Returns the **end** of the copied region, unlike `memcpy` |
+| `__builtin_strlen(s)`, `__builtin_strcmp(a, b)`, `__builtin_strncmp(a, b, n)` | |
+| `__builtin_strcpy(d, s)`, `__builtin_strncpy(d, s, n)`, `__builtin_stpcpy(d, s)` | `stpcpy` returns the end of the copy |
+| `__builtin_strcat(d, s)`, `__builtin_strncat(d, s, n)` | |
+| `__builtin_strchr(s, c)`, `__builtin_strrchr(s, c)`, `__builtin_strstr(h, n)` | |
+| `__builtin_printf(fmt, ...)`, `__builtin_sprintf(buf, fmt, ...)`, `__builtin_snprintf(buf, n, fmt, ...)` | Variadic after the format argument |
+| `__builtin_puts(s)` | |
+
+The return types matter and are modelled: the string family returns `char *`,
+the allocators and `mempcpy` return `void *`. Typing one of them `int` would
+truncate the returned address to 32 bits — a silent wrong answer, since the
+call still links and runs. So would getting the printf family's fixed-argument
+count wrong on Apple arm64, where variadic arguments go on the stack while
+fixed ones stay in registers.
 
 ## Object Size and Fortification
 

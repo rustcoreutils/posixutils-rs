@@ -1530,11 +1530,26 @@ impl Parser<'_> {
             // The library builtins, for the case where the header that would
             // declare them has not been included.
             "strlen" => Some(self.types.ulong_id),
-            "strcmp" | "abs" | "ffs" | "ffsl" | "ffsll" => Some(self.types.int_id),
+            "strcmp" | "abs" | "ffs" | "ffsl" | "ffsll" | "memcmp" | "strncmp" | "printf"
+            | "sprintf" | "snprintf" | "puts" => Some(self.types.int_id),
             "labs" => Some(self.types.long_id),
             "llabs" => Some(self.types.longlong_id),
             "sqrt" | "copysign" => Some(self.types.double_id),
-            "abort" => Some(self.types.void_id),
+            "abort" | "exit" | "free" => Some(self.types.void_id),
+            // The allocators and `mempcpy` return `void *`; the string family
+            // returns `char *`. Answering `int` here would truncate the
+            // returned address to 32 bits, which is the bug the `_chk` cases
+            // above are commented for.
+            "malloc" | "calloc" | "realloc" | "mempcpy" => Some(self.types.void_ptr_id),
+            "strcpy" | "strncpy" | "stpcpy" | "strcat" | "strncat" | "strchr" | "strrchr"
+            | "strstr" => {
+                let char_id = self.types.char_id;
+                Some(self.types.intern(Type {
+                    kind: TypeKind::Pointer,
+                    base: Some(char_id),
+                    ..Default::default()
+                }))
+            }
             _ => None,
         }
     }
@@ -1558,6 +1573,27 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_SQRT
                 | crate::kw::BUILTIN_COPYSIGN
                 | crate::kw::BUILTIN_TRAP
+                | crate::kw::BUILTIN_ABORT
+                | crate::kw::BUILTIN_EXIT
+                | crate::kw::BUILTIN_PRINTF
+                | crate::kw::BUILTIN_SPRINTF
+                | crate::kw::BUILTIN_SNPRINTF
+                | crate::kw::BUILTIN_PUTS
+                | crate::kw::BUILTIN_MALLOC
+                | crate::kw::BUILTIN_CALLOC
+                | crate::kw::BUILTIN_REALLOC
+                | crate::kw::BUILTIN_FREE
+                | crate::kw::BUILTIN_MEMCMP
+                | crate::kw::BUILTIN_MEMPCPY
+                | crate::kw::BUILTIN_STRCPY
+                | crate::kw::BUILTIN_STRNCPY
+                | crate::kw::BUILTIN_STPCPY
+                | crate::kw::BUILTIN_STRCAT
+                | crate::kw::BUILTIN_STRNCAT
+                | crate::kw::BUILTIN_STRNCMP
+                | crate::kw::BUILTIN_STRCHR
+                | crate::kw::BUILTIN_STRRCHR
+                | crate::kw::BUILTIN_STRSTR
         )
     }
 
@@ -1664,6 +1700,17 @@ impl Parser<'_> {
             "strlen" | "abs" | "labs" | "llabs" | "ffs" | "ffsl" | "ffsll" | "sqrt" => (1, false),
             "strcmp" | "copysign" => (2, false),
             "abort" => (0, false),
+            "exit" | "puts" | "malloc" | "free" => (1, false),
+            "calloc" | "realloc" | "strcpy" | "stpcpy" | "strcat" | "strchr" | "strrchr"
+            | "strstr" => (2, false),
+            "memcmp" | "mempcpy" | "strncpy" | "strncat" | "strncmp" => (3, false),
+            // The printf family is variadic after its format string. Getting
+            // the fixed count right is what keeps the format argument in a
+            // register on Apple arm64, where variadic arguments go on the
+            // stack -- the same reason the `_chk` forms above are spelled out.
+            "printf" => (1, true),
+            "sprintf" => (2, true),
+            "snprintf" => (3, true),
             // An entry point this does not know is left as it was: variadic,
             // with nothing fixed.
             _ => (0, true),

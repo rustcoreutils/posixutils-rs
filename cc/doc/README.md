@@ -74,6 +74,8 @@ out to be wrong.
   - Control flow (`__builtin_unreachable`)
   - Non-local jumps (`setjmp`, `longjmp`)
   - Complex construction (`__builtin_complex`)
+  - Libc aliases (`__builtin_abort`, `__builtin_printf`, `__builtin_strcpy`, ...),
+    callable without the declaring header
   - Fortification (`__builtin_object_size`, the `__builtin___*_chk` family)
   - and what is **not** implemented, where the absence is observable
 

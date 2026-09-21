@@ -113,8 +113,10 @@ Language and preprocessor additions:
    `__builtin_va_list`.
  * Clang nullability qualifiers `_Nonnull`, `_Nullable`, `_Null_unspecified`
    and their `__` spellings.
- * Roughly 90 `__builtin_*` and `__c11_atomic_*` intrinsics, including the
-   `__builtin___*_chk` FORTIFY family.
+ * Roughly 145 `__builtin_*` and `__c11_atomic_*` intrinsics, including the
+   `__builtin___*_chk` FORTIFY family and the libc aliases (`__builtin_abort`,
+   `__builtin_printf`, `__builtin_strcpy`, ...) that let a translation unit
+   call one without having included the header that declares it.
  * `__FUNCTION__`, `__PRETTY_FUNCTION__`.
  * `#include_next`, `#warning`, `#pragma once`.
  * `__has_attribute`, `__has_builtin`, `__has_feature`, `__has_extension`,

@@ -113,6 +113,18 @@ impl Parser<'_> {
             return false;
         }
 
+        // `-fno-builtin` / `-fno-builtin-NAME` turn the bare spellings off
+        // outright, whether or not anything declares them. gcc's rule is that
+        // the flag disables builtins not beginning with `__builtin_`, and
+        // `shadowable` is exactly that set -- the names that are not reserved
+        // to the implementation, and so are the user's to mean something else
+        // by.
+        if let Some(name) = self.idents.get_opt(name_id) {
+            if crate::builtins::bare_builtin_disabled(name) {
+                return true;
+            }
+        }
+
         let Some(symbol_id) = self.symbols.lookup_id(name_id, Namespace::Ordinary) else {
             return false;
         };

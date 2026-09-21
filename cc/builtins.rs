@@ -14,6 +14,8 @@
 
 /// All supported builtin function names.
 /// This is the single source of truth - add new builtins here.
+use std::sync::atomic::{AtomicBool, Ordering};
+
 pub const SUPPORTED_BUILTINS: &[&str] = &[
     // Variadic function support
     "__builtin_va_list",
@@ -203,6 +205,43 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__c11_atomic_thread_fence",
     "__c11_atomic_signal_fence",
 ];
+
+/// `-fno-builtin` and `-fno-builtin-NAME`.
+///
+/// gcc's rule, which this follows exactly: the flag disables recognition of
+/// builtins **whose name does not begin with `__builtin_`**. The reserved
+/// spellings keep working, and `__has_builtin` keeps answering 1 for them --
+/// verified against gcc, which compiles `__builtin_strcpy` under
+/// `-fno-builtin` and fails to link a bare `alloca`.
+///
+/// So this affects exactly the bare names c17 answers to: `alloca`,
+/// `offsetof`, `alignof`, `setjmp`, `longjmp`. Those are also the only ones a
+/// user declaration may displace, which is the same boundary for the same
+/// reason -- they are not reserved to the implementation.
+static NO_BUILTIN: AtomicBool = AtomicBool::new(false);
+
+/// Names disabled individually by `-fno-builtin-NAME`.
+static NO_BUILTIN_FUNCS: std::sync::OnceLock<std::collections::HashSet<String>> =
+    std::sync::OnceLock::new();
+
+/// Turn off all non-reserved builtins (`-fno-builtin`).
+pub fn set_no_builtin() {
+    NO_BUILTIN.store(true, Ordering::Relaxed);
+}
+
+/// Record the `-fno-builtin-NAME` set. Ignored if called twice.
+pub fn set_no_builtin_funcs(names: std::collections::HashSet<String>) {
+    let _ = NO_BUILTIN_FUNCS.set(names);
+}
+
+/// Is the bare spelling `name` disabled?
+///
+/// Answers only about bare spellings; a `__builtin_*` caller never asks,
+/// because the flag does not reach them.
+pub fn bare_builtin_disabled(name: &str) -> bool {
+    NO_BUILTIN.load(Ordering::Relaxed)
+        || NO_BUILTIN_FUNCS.get().is_some_and(|set| set.contains(name))
+}
 
 /// Check if a name is a supported builtin function.
 /// Used by __has_builtin() in the preprocessor when only a string is available.

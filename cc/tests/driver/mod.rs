@@ -13,7 +13,7 @@
 // drive the binary with a raw argument vector instead.
 //
 
-use crate::common::run_c17;
+use crate::common::{create_c_file, run_c17};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -1965,4 +1965,57 @@ fn driver_deps_allow_one_source_and_stdout() {
         "both rules should reach stdout: {:?}",
         r.stdout
     );
+}
+
+/// An unrecognised `-f` flag says so; a known-ignorable one does not.
+///
+/// The `-f*` arm of `preprocess_args` used to discard every flag it did not
+/// handle, without a word. That is worse than either honouring it or rejecting
+/// it, because a build system cannot tell a flag that took effect from one
+/// that was thrown away — which is how `-fpermissive` appeared not to work
+/// when it had simply never reached the driver, and how `-fno-builtin` sat
+/// parsed-and-unread for as long as it did.
+///
+/// gcc errors on an unknown `-f`. c17 warns instead, because erroring would
+/// break builds that pass flags it has no opinion about; the flags it stays
+/// quiet about are the ones that name an optimisation c17 either does not
+/// perform or performs unconditionally, so honouring and ignoring them are the
+/// same program.
+#[test]
+fn driver_unknown_f_flag_is_reported_not_swallowed() {
+    let src = create_c_file("driver_fflag", "int main(void){return 0;}\n");
+    let path = src.path().to_string_lossy().to_string();
+
+    // Quiet: c17 has a considered answer for each of these.
+    for flag in [
+        "-fno-strict-aliasing", // CPython's configure passes this
+        "-fwrapv",              // the torture suite's dg-options do
+        "-fvisibility=hidden",  // a prefix-matched, value-carrying form
+        "-fno-tree-dse",        // gcc-internal pass c17 has no equivalent of
+        "-fgnu89-inline",
+        "-fomit-frame-pointer",
+    ] {
+        let r = run_c17(&[flag, "-S", "-o", "/dev/null", &path]);
+        assert!(r.success, "{flag} should be accepted:\n{}", r.stderr);
+        assert!(
+            !r.stderr.contains("unrecognized"),
+            "{flag} is known and should not be reported:\n{}",
+            r.stderr
+        );
+    }
+
+    // Reported: c17 has no idea what these are.
+    for flag in ["-fzzznonsense", "-fwibble", "-fno-such-option"] {
+        let r = run_c17(&[flag, "-S", "-o", "/dev/null", &path]);
+        assert!(
+            r.success,
+            "{flag} should still compile — the flag is ignored, not fatal:\n{}",
+            r.stderr
+        );
+        assert!(
+            r.stderr.contains("unrecognized") && r.stderr.contains(flag),
+            "{flag} was swallowed silently:\n{}",
+            r.stderr
+        );
+    }
 }

@@ -304,3 +304,92 @@ int main(void) {
         0
     );
 }
+
+/// `-fno-builtin` and `-fno-builtin-NAME`.
+///
+/// gcc's rule, which this follows exactly: the flag disables builtins **whose
+/// name does not begin with `__builtin_`**. The reserved spellings keep
+/// working and `__has_builtin` keeps answering 1 for them — verified against
+/// gcc, which compiles `__builtin_strcpy` under `-fno-builtin` and fails to
+/// link a bare `alloca`.
+///
+/// So the flag lands on exactly the bare names c17 answers to: `alloca`,
+/// `offsetof`, `setjmp`, `longjmp`. Those are also the only names a user
+/// declaration may displace, which is the same boundary for the same reason —
+/// they are not reserved to the implementation.
+///
+/// Both driver fields were parsed into variables nothing read, so the flag was
+/// accepted and did nothing, which is indistinguishable from it working.
+#[test]
+fn builtins_fno_builtin_disables_bare_spellings_only() {
+    // The reserved spelling is unaffected, with the flag and without.
+    let reserved = r#"
+int main(void) {
+    char b[8];
+    __builtin_strcpy(b, "hi");
+    if (!__has_builtin(__builtin_strcpy)) return 1;
+    if (b[0] != 'h' || b[1] != 'i') return 2;
+    char *p = (char *)__builtin_alloca(16);
+    p[0] = 'z';
+    if (p[0] != 'z') return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("builtins_nb_reserved", reserved, &[]), 0);
+    assert_eq!(
+        compile_and_run(
+            "builtins_nb_reserved_off",
+            reserved,
+            &["-fno-builtin".to_string()]
+        ),
+        0
+    );
+
+    // The bare spelling still works when the flag is absent.
+    let bare = r#"
+int main(void) {
+    char *p = (char *)alloca(16);
+    p[0] = 'q';
+    return p[0] != 'q';
+}
+"#;
+    assert_eq!(compile_and_run("builtins_nb_bare_on", bare, &[]), 0);
+}
+
+/// The other half: under the flag, a bare spelling is an ordinary call, so it
+/// needs a declaration and a definition like any other function.
+#[test]
+fn builtins_fno_builtin_makes_a_bare_name_an_ordinary_call() {
+    // `offsetof` is the clearest case — with the builtin off, the name is the
+    // caller's to define, and the program must use that definition.
+    let code = r#"
+struct S { int a; long b; };
+static unsigned long offsetof(int which) { return which == 0 ? 111 : 222; }
+
+int main(void) {
+    if (offsetof(0) != 111) return 1;
+    if (offsetof(1) != 222) return 2;
+    /* The reserved spelling still reaches the real builtin. */
+    if (__builtin_offsetof(struct S, b) != sizeof(long)) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run(
+            "builtins_nb_bare_is_ordinary",
+            code,
+            &["-fno-builtin".to_string()]
+        ),
+        0
+    );
+
+    // And -fno-builtin-NAME reaches just the one name.
+    assert_eq!(
+        compile_and_run(
+            "builtins_nb_named",
+            code,
+            &["-fno-builtin-offsetof".to_string()]
+        ),
+        0
+    );
+}

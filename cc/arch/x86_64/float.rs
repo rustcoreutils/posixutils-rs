@@ -1156,11 +1156,20 @@ impl X86_64CodeGen {
         let done_label = Label::new("va_fp_done", label_suffix);
 
         let fp_size = types.size_bits(arg_type);
+        // `__float128` occupies a whole XMM register and a sixteen-byte slot.
+        // Moving it as a `Double` copies its low half and leaves the exponent
+        // and the top of the mantissa behind.
         let lir_fp_size = if fp_size <= 32 {
             FpSize::Single
-        } else {
+        } else if fp_size <= 64 {
             FpSize::Double
+        } else {
+            FpSize::Quad
         };
+        // How far the overflow area advances, and how far the register save
+        // area's cursor does. Both are the argument's slot, which is eight
+        // bytes for a float or double and sixteen for a binary128.
+        let slot_bytes: i64 = if fp_size > 64 { 16 } else { 8 };
 
         // Load fp_offset from va_list (at offset 4)
         self.push_lir(X86Inst::Mov {
@@ -1293,7 +1302,7 @@ impl X86_64CodeGen {
         // Advance overflow_arg_area by 8
         self.push_lir(X86Inst::Add {
             size: OperandSize::B64,
-            src: GpOperand::Imm(8),
+            src: GpOperand::Imm(slot_bytes),
             dst: Reg::Rax,
         });
         self.push_lir(X86Inst::Mov {

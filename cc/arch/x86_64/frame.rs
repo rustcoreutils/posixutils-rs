@@ -548,7 +548,16 @@ impl X86_64CodeGen {
             // Each slot is 16 bytes: base_offset = reg_save_area_offset - 48 - (i * 16)
             let offset = self.reg_save_area_offset - 48 - (i as i32 * 16);
             self.push_lir(X86Inst::MovFp {
-                size: FpSize::Double, // movsd - save 64-bit double
+                // The whole register, not its low double. The slot is sixteen
+                // bytes and the ABI says the register is saved into it; an
+                // eight-byte store leaves the upper half of every slot
+                // untouched, which `va_arg` then reads back as whatever the
+                // frame happened to hold. A `double` never noticed, and
+                // neither did a struct of two doubles -- those arrive in two
+                // registers, so each one's low half is all there is. A lone
+                // `__float128` is SSE+SSEUP: one register carrying all sixteen
+                // bytes, and it came back with its top half missing.
+                size: FpSize::Quad,
                 src: XmmOperand::Reg(*xmm),
                 dst: XmmOperand::Mem(MemAddr::BaseOffset {
                     base: Reg::Rbp,

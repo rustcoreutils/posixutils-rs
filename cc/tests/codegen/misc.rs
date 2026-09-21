@@ -10527,3 +10527,124 @@ int main(void) {
         0
     );
 }
+
+/// `va_arg` of an SSE+SSEUP aggregate — one XMM register carrying all sixteen
+/// bytes, rather than two registers of eight.
+///
+/// Two independent defects, each losing the same upper half:
+///
+/// 1. The variadic prologue saved each XMM into the register save area with
+///    `movsd`, eight bytes into a sixteen-byte slot, so the top half of every
+///    slot held whatever the frame did. A `double` never noticed, and neither
+///    did `struct { double a, b; }` -- that arrives in *two* registers, and
+///    each one's low half is all there is to save.
+/// 2. `emit_va_arg_aggregate` walked the ABI classification as one eightbyte
+///    per entry. `classes` counts registers: `sse_struct_regs` documents
+///    SSE+SSEUP as a single entry covering sixteen bytes, so the copy took
+///    eight and left the rest of the destination untouched.
+///
+/// A third, in the same shape, for a bare `__float128` rather than one inside
+/// a struct: `emit_va_arg_float` sized the move from `<= 32 ? Single : Double`,
+/// so a 128-bit type moved eight bytes, and its overflow-area cursor advanced
+/// by eight where the slot is sixteen.
+///
+/// Either defect alone reproduces the loss, so both are checked here with a
+/// value whose upper half is the part that matters.
+///
+/// x86-64 only. All three defects are in `cc/arch/x86_64/`, and `__float128`
+/// is that target's spelling for binary128 -- aarch64 reaches the same type
+/// through `long double`, with its own lowering and its own save area, so this
+/// source does not describe it. `compile_and_run` builds for the host, which
+/// is what makes the guard necessary rather than merely tidy.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_va_arg_sse_up_aggregate() {
+    let code = r#"
+#include <stdarg.h>
+
+struct q  { __float128 v; };
+struct dd { double a, b; };
+
+static int take_q(int n, ...) {
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        struct q x = va_arg(ap, struct q);
+        if (x.v != (__float128)(i + 1)) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+/* Assigned rather than initialized, so the small-aggregate local path runs
+   as well as the sixteen-byte one. */
+static int take_dd(int n, ...) {
+    va_list ap; va_start(ap, n);
+    struct dd x;
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        x = va_arg(ap, struct dd);
+        if (x.a != (double)(i + 1) || x.b != (double)(i + 2)) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+/* A bare __float128 travels the same way, without a struct around it. */
+static int take_f128(int n, ...) {
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        __float128 v = va_arg(ap, __float128);
+        if (v != (__float128)(i + 1)) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+/* Mixed with doubles, which move the SSE save area's cursor along. */
+static int take_mixed(int n, ...) {
+    va_list ap; va_start(ap, n);
+    double d = va_arg(ap, double);
+    struct q x = va_arg(ap, struct q);
+    double e = va_arg(ap, double);
+    va_end(ap);
+    (void)n;
+    return d == 1.0 && x.v == (__float128)1 && e == 3.0;
+}
+
+static int take_q_va(__float128 want, int n, ...) {
+    va_list ap; va_start(ap, n);
+    struct q x = va_arg(ap, struct q);
+    va_end(ap);
+    return x.v == want;
+}
+
+int main(void) {
+    struct q q1, q2;
+    q1.v = (__float128)1;
+    q2.v = (__float128)2;
+    struct dd d1 = {1, 2}, d2 = {2, 3};
+
+    if (!take_q(2, q1, q2)) return 1;
+    if (!take_dd(2, d1, d2)) return 2;
+    if (!take_f128(2, (__float128)1, (__float128)2)) return 3;
+    if (!take_mixed(3, 1.0, q1, 3.0)) return 4;
+
+    /* A value whose mantissa fills the part that was being dropped: an
+       eight-byte save leaves the low half only, and 1/3 differs from
+       anything that could survive that. */
+    {
+        struct q third;
+        third.v = (__float128)1 / (__float128)3;
+        if (!take_q_va((__float128)1 / (__float128)3, 1, third)) return 5;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_va_arg_sse_up", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("codegen_va_arg_sse_up_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

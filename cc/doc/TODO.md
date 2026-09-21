@@ -554,11 +554,12 @@ What is left, at -O0 — 35 run failures and 68 compile failures:
 
 | Group | Count | Note |
 |---|---|---|
-| Bit-field arithmetic at the declared width | 5 | `x.b << 32` with `unsigned long long b : 40` is done in 40 bits. Needs the expression type to carry the field width, not just the promotion rule |
+| Bit-field arithmetic at the declared width | 4 | `x.b << 32` with `unsigned long long b : 40` is done in 40 bits. Needs the expression to carry the field width, not just the promotion rule |
+| `scalar_storage_order` attribute | 2 | `20230630-2`, `20230630-4`. c17 warns that it ignores the attribute and lays out natively, so the tests read 85 where they want 21. Needs reverse-endian load/store lowering |
 | Complex arithmetic | 5 | `pr104604`, `pr42248`, `pr56837`, `20050121-1`, `complex-4` |
 | `va_arg` with `long double` / `__int128` | 2 | `pr44942`, `pr92904` — the binary128 fixes did not reach these |
 | Pre-C99 implicit `int` not requesting `-fpermissive` | 5 | gcc rejects them too without a flag |
-| Dead-call elimination proofs | 4 | call an undefined `link_error` the optimizer is expected to delete; a -O0 artifact, not a defect |
+| Dead-call elimination proofs | 9 | call an undefined `link_error` the optimizer is expected to delete. gcc deletes it, c17 does not — optimizer strength, not a defect |
 | Nested functions, VLA-as-struct-member, `_Decimal64`, `__builtin_apply` | ~5 | out of scope, see the GNU extensions section |
 | Singletons needing their own triage | ~40 | mostly `pr*` |
 

@@ -87,7 +87,7 @@ fi
 # An empty skip-reason means run it.
 dg_scan() {
     awk '
-    BEGIN { skip=""; flags=""; mult=1 }
+    BEGIN { skip=""; flags=""; mult=1; stack="" }
     # Only the leading comment block carries directives; stop at the first
     # line of real code so a string containing "dg-" cannot trip us.
     /^[ \t]*[A-Za-z_#]/ && !/^[ \t]*\/\*/ && !/^[ \t]*\*/ && NR>1 { exit }
@@ -107,10 +107,21 @@ dg_scan() {
                     if (o ~ /-std=(gnu89|c89|gnu90|c90|iso9899:1990)/)
                         o = o " -fpermissive"
                     gsub(/-std=[a-z0-9:]+/, "", o)
+                    # A machine flag is a request about the target, and c17
+                    # rejects the ones it does not implement rather than
+                    # ignoring them. Forwarding one turns "this test tunes for
+                    # i686" into a c17 failure, which it is not: gcc compiles
+                    # these and so does c17 without the flag.
+                    if (o ~ /(^| )-m[a-z]/) skip = "needs a machine flag c17 does not implement"
                     flags = flags " " o
                 }
             }
             else if (d ~ /dg-skip-if/)   { skip = "dg-skip-if" }
+            else if (d ~ /dg-require-stack-size/) {
+                # The test says how much stack it needs. Honour it rather than
+                # letting it die on the default 8 MB.
+                if (match(d, /0x[0-9a-fA-F]+|[0-9]+/)) stack = substr(d, RSTART, RLENGTH)
+            }
             else if (d ~ /dg-require-effective-target/) {
                 # Only the targets we cannot satisfy matter.
                 if (d ~ /(vect_|lto|profile|fpic|tls_|alias|weak|trampolines|indirect_jumps|nonlocal_goto|label_values)/)
@@ -121,7 +132,7 @@ dg_scan() {
             }
         }
     }
-    END { printf "%s|%s|%s", skip, flags, mult }
+    END { printf "%s|%s|%s|%s", skip, flags, mult, stack }
     ' "$1"
 }
 
@@ -132,6 +143,25 @@ has_x_file() { [ -f "${1%.c}.x" ]; }
 # Features c17 does not implement and will not, per the plan. Skipping these
 # with a named reason is honest; letting them count as failures is not.
 UNSUPPORTED_RE='vector_size|__label__|__builtin_apply|__builtin_setjmp|__builtin_longjmp|attribute__ *\(\( *alias'
+
+# Tests gcc on this machine fails exactly as c17 does, verified by running both
+# at -O0 and -O2. Counting them as c17 failures overstates the gap, and they are
+# the kind of thing that gets re-triaged every few months because nothing says
+# otherwise.
+#
+# Each list is deliberately narrow. A test where gcc fails but c17 *passes* is
+# not here -- `20101011-1` is one, and skipping it would have thrown away a
+# case c17 gets right. Nor is one where gcc fails at only one level:
+# `pr124358` passes under gcc at -O0 and fails under c17, so it stays a real
+# failure.
+
+# Calls an undefined function the optimizer is expected to delete. Neither
+# compiler can link it at -O0; gcc's own harness runs these at -O1 and above.
+# They pass at -O2 under both, so skipping them outright would lose that.
+NEEDS_OPTIMIZATION=" 20001121-1 20020107-1 930526-1 961223-1 loop-2c p18298 restrict-1 unroll-1 "
+
+# gcc rejects or fails these at every level here.
+GCC_ALSO_FAILS=" 980608-1 bcp-1 eeprof-1 pr117432 pr123864 va-arg-7 va-arg-8 "
 
 # ------------------------------------------------------------------ one test
 run_one() {
@@ -147,34 +177,66 @@ run_one() {
     if awk "/$UNSUPPORTED_RE/ {found=1} END {exit !found}" "$src" 2>/dev/null; then
         echo "SKIP	$tag	unsupported extension"; return
     fi
+    case "$GCC_ALSO_FAILS" in
+        *" $base "*) echo "SKIP	$tag	gcc fails this too"; return;;
+    esac
+    case "$NEEDS_OPTIMIZATION" in
+        *" $base "*)
+            # Only at -O0, where neither compiler can link it.
+            case "$opt" in
+                *-O0*) echo "SKIP	$tag	needs -O1+ to link; gcc cannot either"; return;;
+            esac;;
+    esac
 
-    local scan skip flags mult
+    local scan skip flags mult stack
     scan=$(dg_scan "$src")
     skip=${scan%%|*}; scan=${scan#*|}
-    flags=${scan%%|*}; mult=${scan##*|}
+    flags=${scan%%|*}; scan=${scan#*|}
+    mult=${scan%%|*}; stack=${scan##*|}
     if [ -n "$skip" ]; then
         echo "SKIP	$tag	$skip"; return
     fi
 
     local ctimeout=$((30 * mult)) rtimeout=$((20 * mult))
 
+    # A compile that runs out of time is not a compile error, and reporting it
+    # as one hides it: the log is empty, so the failure reads as a mystery.
+    # `pr28982b` passes a 256 KB struct by value and takes c17 65 seconds
+    # against gcc's 0.02, which is how this was found.
     # shellcheck disable=SC2086
     if [ "$mode" = compile ]; then
-        if timeout "$ctimeout" "$cc" $opt -w $flags -c "$src" -o "$exe.o" >"$log" 2>&1; then
-            echo "PASS	$tag	"
-        else
-            echo "CFAIL	$tag	$(head -c 160 "$log" | tr '\n' ' ')"
-        fi
-        rm -f "$exe.o" "$log"
+        timeout "$ctimeout" "$cc" $opt -w $flags -c "$src" -o "$exe.o" >"$log" 2>&1
+        local crc=$?
+        rm -f "$exe.o"
+        case $crc in
+            0)   echo "PASS	$tag	";;
+            124) echo "CTIMEOUT	$tag	compile exceeded ${ctimeout}s";;
+            *)   echo "CFAIL	$tag	$(head -c 160 "$log" | tr '\n' ' ')";;
+        esac
+        rm -f "$log"
         return
     fi
 
     # shellcheck disable=SC2086
-    if ! timeout "$ctimeout" "$cc" $opt -w $flags "$src" -o "$exe" -lm >"$log" 2>&1; then
-        echo "CFAIL	$tag	$(head -c 160 "$log" | tr '\n' ' ')"
+    timeout "$ctimeout" "$cc" $opt -w $flags "$src" -o "$exe" -lm >"$log" 2>&1
+    local crc=$?
+    if [ $crc -ne 0 ]; then
+        if [ $crc -eq 124 ]; then
+            echo "CTIMEOUT	$tag	compile exceeded ${ctimeout}s"
+        else
+            echo "CFAIL	$tag	$(head -c 160 "$log" | tr '\n' ' ')"
+        fi
         rm -f "$exe" "$log"; return
     fi
-    timeout "$rtimeout" "$exe" >/dev/null 2>&1
+    # `dg-require-stack-size` states what the test needs; give it that rather
+    # than reporting a stack overflow as a wrong answer.
+    if [ -n "$stack" ]; then
+        local kb=$(( (stack + 1023) / 1024 * 2 ))
+        [ "$kb" -lt 8192 ] && kb=8192
+        ( ulimit -s "$kb" 2>/dev/null; timeout "$rtimeout" "$exe" >/dev/null 2>&1 )
+    else
+        timeout "$rtimeout" "$exe" >/dev/null 2>&1
+    fi
     local rc=$?
     rm -f "$exe" "$log"
     case $rc in
@@ -184,7 +246,7 @@ run_one() {
     esac
 }
 export -f run_one dg_scan has_x_file
-export UNSUPPORTED_RE
+export UNSUPPORTED_RE GCC_ALSO_FAILS NEEDS_OPTIMIZATION
 
 # ------------------------------------------------------------- collect tests
 collect() {
@@ -254,7 +316,15 @@ if [ ! -f "$BASELINE" ]; then
     exit 0
 fi
 
-REGRESSED=$(comm -23 "$BASELINE" "$CUR")
+# Restrict the comparison to what this run attempted. Without this, `-f 931004`
+# reported every other baseline entry as a regression -- a filtered run could
+# never be green, so the filter was unusable for checking a fix.
+ATTEMPTED="$WORK/attempted.txt"
+awk -F'\t' '{print $2}' "$RES" | sort > "$ATTEMPTED"
+RELEVANT="$WORK/relevant.txt"
+comm -12 "$BASELINE" "$ATTEMPTED" > "$RELEVANT"
+
+REGRESSED=$(comm -23 "$RELEVANT" "$CUR")
 FIXED=$(comm -13 "$BASELINE" "$CUR")
 
 echo
@@ -269,4 +339,4 @@ if [ -n "$REGRESSED" ]; then
     echo "FAIL: tests that passed in the baseline no longer pass."
     exit 1
 fi
-echo "OK: no regressions against baseline ($(wc -l < "$BASELINE") -> $(wc -l < "$CUR") passing)."
+echo "OK: no regressions ($(wc -l < "$RELEVANT") of $(wc -l < "$BASELINE") baseline tests attempted; $(wc -l < "$CUR") passing now)."

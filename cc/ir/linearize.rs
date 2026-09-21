@@ -840,49 +840,17 @@ impl<'a> Linearizer<'a> {
                 let addr_pseudo = self.alloc_reg_pseudo();
                 self.emit(Instruction::sym_addr(addr_pseudo, arg_pseudo, ptr_type));
 
-                let struct_size = typ_size / 8;
-                let mut offset = 0i64;
-                while offset < struct_size as i64 {
-                    let temp = self.alloc_reg_pseudo();
-                    self.emit(Instruction::load(
-                        temp,
-                        addr_pseudo,
-                        offset,
-                        self.types.long_id,
-                        64,
-                    ));
-                    self.emit(Instruction::store(
-                        temp,
-                        local_sym,
-                        offset,
-                        self.types.long_id,
-                        64,
-                    ));
-                    offset += 8;
-                }
+                // Through the shared block copy, which knows two things this
+                // loop did not: a copy past 128 bytes becomes a `memcpy` call
+                // rather than an unbounded unroll, and a size that is not a
+                // multiple of eight is copied exactly. Stepping 8 while
+                // `offset < size` rounds *up* -- a 12-byte struct wrote 16
+                // bytes, four of them past the local.
+                self.emit_block_copy(local_sym, addr_pseudo, (typ_size / 8) as i64);
             } else if typ_size > 64 {
                 // Medium struct (9-16 bytes): arg_pseudo is a pointer (current behavior).
                 // Copy each 8-byte chunk through pointer dereference.
-                let struct_size = typ_size / 8;
-                let mut offset = 0i64;
-                while offset < struct_size as i64 {
-                    let temp = self.alloc_reg_pseudo();
-                    self.emit(Instruction::load(
-                        temp,
-                        arg_pseudo,
-                        offset,
-                        self.types.long_id,
-                        64,
-                    ));
-                    self.emit(Instruction::store(
-                        temp,
-                        local_sym,
-                        offset,
-                        self.types.long_id,
-                        64,
-                    ));
-                    offset += 8;
-                }
+                self.emit_block_copy(local_sym, arg_pseudo, (typ_size / 8) as i64);
             } else {
                 // Small struct: arg_pseudo contains the value directly
                 self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
@@ -1395,27 +1363,11 @@ impl<'a> Linearizer<'a> {
         // complex returns take the register path and go through
         // `complex_operand_addr`.
         let src_addr = self.linearize_lvalue(e);
-        let struct_bytes = struct_size as i64 / 8;
-        let mut byte_offset = 0i64;
-
-        while byte_offset < struct_bytes {
-            let temp = self.alloc_reg_pseudo();
-            self.emit(Instruction::load(
-                temp,
-                src_addr,
-                byte_offset,
-                self.types.long_id,
-                64,
-            ));
-            self.emit(Instruction::store(
-                temp,
-                sret_ptr,
-                byte_offset,
-                self.types.long_id,
-                64,
-            ));
-            byte_offset += 8;
-        }
+        // The shared block copy, for the same two reasons the parameter
+        // prologue uses it: a large struct becomes a `memcpy` call instead of
+        // an unbounded unroll, and a size that is not a multiple of eight is
+        // copied exactly rather than rounded up past the caller's object.
+        self.emit_block_copy(sret_ptr, src_addr, struct_size as i64 / 8);
 
         self.emit(Instruction::ret_typed(
             Some(sret_ptr),

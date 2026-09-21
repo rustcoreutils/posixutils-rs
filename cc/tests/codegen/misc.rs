@@ -10729,3 +10729,80 @@ int main(void) {
         );
     }
 }
+
+/// Struct copies across the size at which the compiler stops unrolling.
+///
+/// `emit_block_copy` emitted one load, one store and a fresh pseudo per eight
+/// bytes, with no upper bound. A 256 KB struct passed by value — which
+/// gcc.c-torture's `pr28982b` does — cost 65,536 IR instructions and a
+/// **65-second** compile, against gcc's 0.02. Above 128 bytes it now emits a
+/// `memcpy` call instead; below, it still unrolls, because a call would cost
+/// more than the moves it replaces.
+///
+/// Two bugs came out of that change, and both are pinned here:
+///
+/// - The parameter prologue and the sret return path each had their own copy
+///   of the unrolled loop, written as `while offset < size` stepping 8 — which
+///   rounds *up*. A 12-byte struct copied 16 bytes, four of them past the
+///   object. Routing all three through the one helper fixed it.
+/// - `memcpy` takes addresses, and a `Sym` pseudo names a local's storage
+///   rather than a pointer to it. The inline path could store through it
+///   directly; the call path could not, and every copy over the threshold
+///   segfaulted until it went through `rvalue_addr`.
+///
+/// Sizes straddle 128 deliberately, and none is a multiple of 8, so a
+/// rounded-up copy shows as corruption rather than passing by luck.
+#[test]
+fn codegen_struct_copy_across_the_inline_threshold() {
+    let code = r#"
+#define MK(N)                                                             \
+    struct s##N { unsigned char c[N]; };                                  \
+    static void take##N(struct s##N v) {                                  \
+        for (int i = 0; i < N; i++)                                       \
+            if (v.c[i] != (unsigned char)(i + 1)) __builtin_abort();      \
+    }                                                                     \
+    static struct s##N ret##N(struct s##N v) { return v; }                \
+    static void run##N(void) {                                            \
+        struct s##N a, b, d;                                              \
+        unsigned char guard = 0xAB;                                       \
+        for (int i = 0; i < N; i++) a.c[i] = (unsigned char)(i + 1);      \
+        take##N(a);              /* by value into a parameter */          \
+        b = ret##N(a);           /* returned, then assigned   */          \
+        take##N(b);                                                       \
+        d = a;                   /* plain struct assignment    */         \
+        take##N(d);                                                       \
+        if (guard != 0xAB) __builtin_abort();                             \
+    }
+
+MK(7)     /* under the threshold, not a multiple of 8 */
+MK(12)    /* the over-copy case: 12 rounds up to 16   */
+MK(13)
+MK(127)   /* just under */
+MK(129)   /* just over  */
+MK(200)
+MK(1000)  /* comfortably into call territory */
+
+/* Larger than this is deliberately not here. Three locals of 9001 bytes make a
+   ~27 KB frame, and aarch64 cannot yet assemble a frame that large -- stack
+   offsets past the immediate range are not legalized, which a plain
+   `volatile unsigned char a[9001], b[9001], d[9001];` reproduces with no
+   struct copy anywhere in sight. A separate defect, recorded in doc/TODO.md;
+   this test stays clear of it so it is testing the copy and nothing else. */
+
+int main(void) {
+    run7(); run12(); run13(); run127(); run129(); run200(); run1000();
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("codegen_struct_copy_threshold{}", opt.replace('-', "_")),
+                code,
+                &[opt.to_string()]
+            ),
+            0,
+            "struct copy across the inline threshold failed at {opt}"
+        );
+    }
+}

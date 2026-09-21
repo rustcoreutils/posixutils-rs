@@ -177,6 +177,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit_block_copy_at_offset(dst, 0, src, size_bytes);
     }
 
+    /// Above this many bytes, a block copy becomes a `memcpy` call rather than
+    /// an unrolled load/store sequence.
+    ///
+    /// The unrolled form costs one load, one store and one fresh pseudo per
+    /// eight bytes, with no upper bound: a 256 KB struct passed by value --
+    /// `struct big { int i[0x10000]; }`, which gcc.c-torture's pr28982b does --
+    /// produced 65,536 IR instructions, 131,108 lines of assembly and a
+    /// **65-second** compile, against gcc's 48 lines and one `call memcpy`.
+    ///
+    /// Small copies stay inline, where they belong: a call would cost more than
+    /// the moves it replaces, and `test_linearize.rs` pins two 64-bit loads and
+    /// two 64-bit stores for a 128-bit copy. 128 bytes leaves every realistic
+    /// struct on the inline path and takes only the pathological ones off it.
+    const BLOCK_COPY_INLINE_LIMIT: i64 = 128;
+
     /// Emit a block copy from src to dst using integer chunks.
     /// The destination stores start at dst_base_offset.
     pub(crate) fn emit_block_copy_at_offset(
@@ -186,6 +201,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         src: PseudoId,
         size_bytes: i64,
     ) {
+        if size_bytes > Self::BLOCK_COPY_INLINE_LIMIT {
+            self.emit_block_copy_call(dst, dst_base_offset, src, size_bytes);
+            return;
+        }
         let mut offset: i64 = 0;
         while offset + 8 <= size_bytes {
             let tmp = self.alloc_pseudo();
@@ -241,6 +260,52 @@ impl<'a> super::linearize::Linearizer<'a> {
                 8,
             ));
         }
+    }
+
+    /// The same copy as a `memcpy` call.
+    ///
+    /// `dst_base_offset` is folded into the destination pointer first, since
+    /// `memcpy` takes an address rather than a base and a displacement.
+    fn emit_block_copy_call(
+        &mut self,
+        dst: PseudoId,
+        dst_base_offset: i64,
+        src: PseudoId,
+        size_bytes: i64,
+    ) {
+        // `memcpy` takes addresses. A `Sym` pseudo names a local's *storage*,
+        // not a pointer to it -- the inline path could store through it
+        // directly, this one cannot. Passing the Sym itself handed memcpy a
+        // meaningless value and segfaulted every copy over the threshold.
+        // `rvalue_addr` is the existing answer to this question and returns a
+        // non-Sym pseudo unchanged.
+        let void_ptr = self.types.void_ptr_id;
+        let dst = self.rvalue_addr(dst, void_ptr);
+        let src = self.rvalue_addr(src, void_ptr);
+
+        let dst_ptr = if dst_base_offset == 0 {
+            dst
+        } else {
+            let off = self.emit_const(dst_base_offset as i128, self.types.long_id);
+            let adjusted = self.alloc_reg_pseudo();
+            self.emit(Instruction::binop(
+                Opcode::Add,
+                adjusted,
+                dst,
+                off,
+                self.types.void_ptr_id,
+                64,
+            ));
+            adjusted
+        };
+        let n = self.emit_const(size_bytes as i128, self.types.ulong_id);
+        let result = self.alloc_pseudo();
+        self.emit(
+            Instruction::new(Opcode::Memcpy)
+                .with_target(result)
+                .with_src3(dst_ptr, src, n)
+                .with_type_and_size(self.types.void_ptr_id, 64),
+        );
     }
 
     /// Emit code to load a bitfield value

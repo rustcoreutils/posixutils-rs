@@ -54,6 +54,7 @@ differs from gcc, the row says so rather than leaving the reader to find out.
 |---------|-------------|
 | `__builtin_constant_p(expr)` | Returns 1 if expr is compile-time constant |
 | `__builtin_types_compatible_p(t1, t2)` | Returns 1 if types are compatible (ignores qualifiers) |
+| `__builtin_classify_type(expr)` | A code for the argument's type family: 1 integer, 5 pointer, 8 real floating, 9 complex, 12 struct, 13 union. The usual conversions run first, so a `char`, an enumeration constant and a `_Bool` all answer 1, and an array, a function and a string literal all answer 5. The argument is not evaluated |
 | `__builtin_choose_expr(c, a, b)` | `a` or `b` by the constant `c`; the untaken arm is not evaluated and need not even type-check |
 
 ## Memory
@@ -262,7 +263,6 @@ system header takes.
 
 | Builtin | Consequence |
 |---------|-------------|
-| `__builtin_classify_type` | Needed by the host's `<tgmath.h>`; c17 bundles its own, built on `_Generic`, so this is not a blocker. `__has_builtin` answers 0, so guarded code is already correct |
 | `__builtin_clear_padding` | Would have to walk a type to find its padding |
 | `__builtin_setjmp` | Not implemented; the ordinary `setjmp`/`longjmp` are |
 

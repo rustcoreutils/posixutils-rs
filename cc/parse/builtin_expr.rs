@@ -880,6 +880,44 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
+            crate::kw::BUILTIN_CLASSIFY_TYPE => Some((|| {
+                // __builtin_classify_type(expr) -- a compile-time code for the
+                // argument's type family. Like `sizeof`, the argument is not
+                // evaluated; unlike `sizeof`, gcc takes an expression rather
+                // than a type name.
+                //
+                // The codes are gcc's, and were read off gcc rather than from
+                // its source: the conversions happen first, so a `char`, an
+                // enumeration and a `_Bool` all answer 1, and an array, a
+                // function and a string literal all answer 5 because they
+                // decay. Only the families below are reachable from C.
+                self.expect_special(b'(')?;
+                let arg = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                let typ = arg.typ.unwrap_or(self.types.int_id);
+                let code = if self.types.is_complex(typ) {
+                    9
+                } else {
+                    match self.types.kind(typ) {
+                        TypeKind::Void => 0,
+                        TypeKind::Struct => 12,
+                        TypeKind::Union => 13,
+                        TypeKind::Pointer | TypeKind::Array | TypeKind::Function => 5,
+                        k if self.types.is_float(typ) => {
+                            let _ = k;
+                            8
+                        }
+                        // Every remaining arithmetic type is an integer one by
+                        // the time the conversions are done with it.
+                        _ => 1,
+                    }
+                };
+                Ok(Self::typed_expr(
+                    ExprKind::IntLit(code),
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
             crate::kw::BUILTIN_TYPES_COMPATIBLE_P => Some((|| {
                 // __builtin_types_compatible_p(type1, type2) - returns 1 if types are compatible
                 // This is evaluated at compile time, ignoring top-level qualifiers

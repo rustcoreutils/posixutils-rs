@@ -340,6 +340,7 @@ define_keywords! {
     (BUILTIN_MEMMOVE,   "__builtin_memmove",  BUILTIN),
     (BUILTIN_CONSTANT_P, "__builtin_constant_p", BUILTIN),
     (BUILTIN_TYPES_COMPATIBLE_P, "__builtin_types_compatible_p", BUILTIN),
+    (BUILTIN_CLASSIFY_TYPE, "__builtin_classify_type", BUILTIN),
     (BUILTIN_UNREACHABLE, "__builtin_unreachable", BUILTIN),
     (BUILTIN_OFFSETOF,  "__builtin_offsetof", BUILTIN),
     (OFFSETOF,          "offsetof",           BUILTIN),

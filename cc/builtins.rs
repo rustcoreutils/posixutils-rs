@@ -112,6 +112,7 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     // Compile-time evaluation
     "__builtin_constant_p",
     "__builtin_types_compatible_p",
+    "__builtin_classify_type",
     "__builtin_unreachable",
     "__builtin_offsetof",
     "offsetof",

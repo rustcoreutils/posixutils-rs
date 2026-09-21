@@ -566,3 +566,67 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("builtins_enum_constant_int", code, &[]), 0);
 }
+
+/// `__builtin_classify_type(expr)` — a compile-time code for the argument's
+/// type family.
+///
+/// Listed in `doc/BUILTIN.md` as not implemented, which was observable
+/// wherever a header branched on it. Like `sizeof`, the argument is not
+/// evaluated; unlike `sizeof`, gcc takes an expression rather than a type
+/// name.
+///
+/// The codes were read off gcc rather than taken from its documentation,
+/// because the usual conversions run first and that is where the surprises
+/// are: a `char`, an enumeration constant and a `_Bool` all answer 1, and an
+/// array, a function and a string literal all answer 5, because each decays
+/// to a pointer before the classification sees it. All fifteen families below
+/// were diffed against gcc line by line.
+#[test]
+fn builtins_classify_type() {
+    let code = r#"
+struct S { int a; };
+union U { int a; };
+enum E { e1 };
+void fn(void);
+int arr[4];
+
+int main(void) {
+    /* Integer family: everything that converts to an integer answers 1. */
+    if (__builtin_classify_type(1) != 1) return 1;
+    if (__builtin_classify_type('c') != 1) return 2;
+    if (__builtin_classify_type(e1) != 1) return 3;
+    if (__builtin_classify_type(1L) != 1) return 4;
+    if (__builtin_classify_type(1ULL) != 1) return 5;
+    { char c = 0; if (__builtin_classify_type(c) != 1) return 6; }
+    { _Bool b = 0; if (__builtin_classify_type(b) != 1) return 7; }
+    { short s = 0; if (__builtin_classify_type(s) != 1) return 8; }
+
+    /* Real floating: 8, at every precision. */
+    if (__builtin_classify_type(1.0f) != 8) return 9;
+    if (__builtin_classify_type(1.0) != 8) return 10;
+    if (__builtin_classify_type(1.0L) != 8) return 11;
+
+    /* Complex: 9, distinct from the real it is built from. */
+    { _Complex double z = 0; if (__builtin_classify_type(z) != 9) return 12; }
+    { _Complex float w = 0; if (__builtin_classify_type(w) != 9) return 13; }
+
+    /* Aggregates keep their own codes. */
+    { struct S v; if (__builtin_classify_type(v) != 12) return 14; }
+    { union U v; if (__builtin_classify_type(v) != 13) return 15; }
+
+    /* Anything that decays answers as the pointer it decays to. */
+    if (__builtin_classify_type((void *)0) != 5) return 16;
+    if (__builtin_classify_type(arr) != 5) return 17;
+    if (__builtin_classify_type(&fn) != 5) return 18;
+    if (__builtin_classify_type("x") != 5) return 19;
+
+    /* A constant expression, usable where one is required. */
+    { int a[__builtin_classify_type(1.0) == 8 ? 3 : -1]; if (sizeof(a)/sizeof(a[0]) != 3) return 20; }
+
+    /* And the argument is not evaluated. */
+    { int i = 0; if (__builtin_classify_type(i++) != 1) return 21; if (i != 0) return 22; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("builtins_classify_type", code, &[]), 0);
+}

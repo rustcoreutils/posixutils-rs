@@ -480,3 +480,60 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("checked_arith_128_mixed", code, &[]), 0);
 }
+
+/// An enumeration constant has type `int` (C17 6.4.4.3p2), not the type of the
+/// enumeration it belongs to.
+///
+/// c17 reported the enumeration's type for every constant, which is right only
+/// where it has to be: when a member does not fit in `int` the whole
+/// enumeration widens, and calling the constant `int` would lose the value.
+/// Below that it is simply wrong, and observable --
+/// `__builtin_types_compatible_p (typeof (hot), int)` answered 0 where gcc and
+/// the standard say 1.
+///
+/// Every expectation here was taken from gcc on this source.
+#[test]
+fn builtins_enum_constant_has_type_int() {
+    let code = r#"
+int i;
+double d;
+typedef enum { hot, dog, poo, bear } dingos;
+typedef enum { janette, laura, amanda } cranberry;
+typedef float same1;
+typedef float same2;
+
+/* It must still be a constant expression: this is a file-scope array bound. */
+float rootbeer[__builtin_types_compatible_p (int, typeof(i))];
+
+/* A member past INT_MAX widens the enumeration, and the constant with it. */
+enum big { small = 1, huge = 5000000000LL };
+
+int main(void) {
+    /* Compatible. */
+    if (!__builtin_types_compatible_p(int, const int)) return 1;
+    if (!__builtin_types_compatible_p(typeof(hot), int)) return 2;
+    if (!__builtin_types_compatible_p(typeof(hot), typeof(laura))) return 3;
+    if (!__builtin_types_compatible_p(int[5], int[])) return 4;
+    if (!__builtin_types_compatible_p(same1, same2)) return 5;
+
+    /* Incompatible. */
+    if (__builtin_types_compatible_p(char *, int)) return 6;
+    if (__builtin_types_compatible_p(char *, const char *)) return 7;
+    if (__builtin_types_compatible_p(long double, double)) return 8;
+    if (__builtin_types_compatible_p(typeof(i), typeof(d))) return 9;
+    if (__builtin_types_compatible_p(typeof(dingos), typeof(cranberry))) return 10;
+    if (__builtin_types_compatible_p(char, int)) return 11;
+    if (__builtin_types_compatible_p(char *, char **)) return 12;
+
+    /* The enumeration type itself is still its own type, distinct from int. */
+    if (__builtin_types_compatible_p(dingos, int)) return 13;
+
+    /* The value survives either way, which is what the widening protects. */
+    if (hot != 0 || bear != 3) return 14;
+    if (huge != 5000000000LL) return 15;
+    if (sizeof(rootbeer) != sizeof(float)) return 16;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("builtins_enum_constant_int", code, &[]), 0);
+}

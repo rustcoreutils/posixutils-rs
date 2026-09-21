@@ -103,7 +103,11 @@ impl Parser<'_> {
         let shadowable = shadowed_by_any_decl
             || matches!(
                 name_id,
-                crate::kw::SETJMP | crate::kw::SETJMP2 | crate::kw::LONGJMP | crate::kw::LONGJMP2
+                crate::kw::SETJMP
+                    | crate::kw::SETJMP2
+                    | crate::kw::LONGJMP
+                    | crate::kw::LONGJMP2
+                    | crate::kw::ALLOCA
             );
         if !shadowable {
             return false;
@@ -485,7 +489,7 @@ impl Parser<'_> {
         token_pos: Position,
     ) -> Option<ParseResult<Expr>> {
         match name_id {
-            crate::kw::BUILTIN_ALLOCA => Some((|| {
+            crate::kw::BUILTIN_ALLOCA | crate::kw::ALLOCA => Some((|| {
                 // __builtin_alloca(size) - returns void*
                 self.expect_special(b'(')?;
                 let size = self.parse_assignment_expr()?;

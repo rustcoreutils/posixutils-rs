@@ -252,3 +252,55 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("builtins_chk", code, &[]), 0);
 }
+
+/// gcc predefines bare `alloca` as well as `__builtin_alloca`, and real code
+/// calls it without including `<alloca.h>`.
+///
+/// It is not reserved the way a `__builtin_*` spelling is, so unlike those it
+/// must yield to a user declaration that is not a function -- the same rule
+/// `setjmp`, `longjmp` and `offsetof` already follow in `builtin_is_shadowed`.
+/// A declaration from `<alloca.h>` *is* a function and must not displace it,
+/// which is why the predicate asks what kind of declaration it found rather
+/// than merely whether one exists.
+#[test]
+fn builtins_bare_alloca() {
+    let code = r#"
+int use_alloca(int n) {
+    int *p = (int *)alloca(n * sizeof(int));
+    for (int i = 0; i < n; i++) p[i] = i * 2;
+    int s = 0;
+    for (int i = 0; i < n; i++) s += p[i];
+    return s;
+}
+
+/* A local object named `alloca` is an ordinary variable. */
+int shadowed_by_a_variable(void) {
+    int alloca = 7;
+    return alloca;
+}
+
+int main(void) {
+    if (use_alloca(5) != 0 + 2 + 4 + 6 + 8) return 1;
+    if (use_alloca(1) != 0) return 2;
+    if (shadowed_by_a_variable() != 7) return 3;
+
+    /* The reserved spelling keeps working alongside the bare one, and both
+       give storage that survives to the end of the enclosing function. */
+    char *q = (char *)__builtin_alloca(16);
+    q[0] = 'a';
+    q[15] = 'z';
+    if (q[0] != 'a' || q[15] != 'z') return 4;
+
+    char *r = (char *)alloca(16);
+    r[0] = 'b';
+    if (r[0] != 'b' || q[0] != 'a') return 5;
+    if (r == q) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("builtins_bare_alloca", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("builtins_bare_alloca_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

@@ -61,6 +61,7 @@ differs from gcc, the row says so rather than leaving the reader to find out.
 | Builtin | Description |
 |---------|-------------|
 | `__builtin_alloca(size)` | Allocate `size` bytes on stack (freed on function return) |
+| `alloca(size)` | The same builtin under its bare name, as gcc predefines it. Unlike a `__builtin_*` spelling it is not reserved, so a declaration that is not a function displaces it; the one in `<alloca.h>` is a function and does not |
 | `__builtin_memset(dst, c, n)` | Set `n` bytes to `c` |
 | `__builtin_memcpy(dst, src, n)` | Copy `n` bytes |
 | `__builtin_memmove(dst, src, n)` | Copy `n` bytes (overlapping safe) |

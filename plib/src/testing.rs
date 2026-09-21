@@ -379,10 +379,25 @@ pub fn assert_dies_by_sigpipe(cmd: &str, args: &[&str]) {
         .unwrap_or_else(|e| panic!("spawn {}: {}", cmd, e));
 
     // Read a little, then drop the read end while the utility has more to say.
+    //
+    // How much came back matters: a utility whose entire output fits the pipe
+    // buffer finishes before the reader leaves and exits 0, and the assertions
+    // below would then blame SIGPIPE for an operand that was simply too small.
+    // Reading a full buffer says the output is larger than this, which is the
+    // precondition the caller has to meet.
     let mut stdout = child.stdout.take().expect("child stdout");
     let mut buf = [0u8; 64];
-    let _ = stdout.read(&mut buf);
+    let got = stdout.read(&mut buf).unwrap_or(0);
     drop(stdout);
+    assert_eq!(
+        got,
+        buf.len(),
+        "{}: only {} bytes of output before the pipe closed -- this operand is \
+         too small to race a reader, so the test cannot say anything about \
+         SIGPIPE. Give it more to write.",
+        cmd,
+        got
+    );
 
     let out = child
         .wait_with_output()

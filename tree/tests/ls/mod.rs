@@ -896,12 +896,28 @@ fn ls_reports_a_bad_operand_and_still_lists_the_good_one() {
     );
 }
 
-/// `ls -R /usr | head` must die by SIGPIPE, not panic with exit 101.
+/// `ls dir | head` must die by SIGPIPE, not panic with exit 101.
 ///
 /// Rust ignores SIGPIPE before `main`, so every utility in the tree had this
 /// gap until `plib::diag::init_locale` started restoring the default. `ls` is
 /// the one a user hits first.
+///
+/// The listing is a fixture, not a system directory: `ls -R /usr` writes only
+/// about 29 KB on some hosts -- less than a pipe holds, so nothing races -- and
+/// on this one it also exits 2 with "not listing already-listed directory" on
+/// stderr, which is the opposite of what the helper asserts.
 #[test]
 fn test_ls_dies_by_sigpipe_on_a_closed_pipe() {
-    plib::testing::assert_dies_by_sigpipe("ls", &["-R", "/usr"]);
+    let dir = plib::tmp::tempdir().unwrap();
+    // Long names, so the output exceeds one pipe buffer without needing tens of
+    // thousands of files.
+    for n in 0..4_000 {
+        std::fs::write(
+            dir.path().join(format!("entry-with-a-long-name-{n:06}")),
+            "",
+        )
+        .unwrap();
+    }
+
+    plib::testing::assert_dies_by_sigpipe("ls", &["-1", dir.path().to_str().unwrap()]);
 }

@@ -2219,3 +2219,60 @@ fn test_ed_failed_global_does_not_destroy_the_undo_record() {
         "hello\n",
     );
 }
+
+/// `w !command` where the command stops reading must report `?`, not take the
+/// signal and lose the buffer.
+///
+/// `plib::diag::init_locale` restores the default SIGPIPE disposition, which is
+/// right for ed's own standard output and wrong for a filter ed spawned itself:
+/// `head -1` closes the pipe as soon as it has its line, and with the default
+/// disposition a 20k-line buffer died at 141 with the edits in it.
+/// `Editor::shell_write` holds a `plib::io::SigPipeIgnored` for exactly that
+/// write.
+#[test]
+fn test_ed_shell_write_to_a_command_that_stops_reading() {
+    use std::io::Write as _;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let dir = plib::tmp::tempdir().unwrap();
+    let path = dir.path().join("big");
+    // More than one pipe buffer, so the write is still in progress when the
+    // reader leaves.
+    let body: String = (0..20_000).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(&path, &body).unwrap();
+
+    let mut child = std::process::Command::new(plib::testing::get_binary_path("ed"))
+        .arg(&path)
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn ed");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"1,$w !head -1\n1,$p\nQ\n")
+        .unwrap();
+
+    let out = child.wait_with_output().expect("wait for ed");
+
+    assert_eq!(
+        out.status.signal(),
+        None,
+        "ed was killed by a signal instead of reporting the failed write"
+    );
+    // `?` is ed's diagnostic, and the buffer is still printable afterwards --
+    // which is the part that was lost.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains('?'),
+        "expected ed to report `?`, got: {:?}",
+        &stdout[..stdout.len().min(200)]
+    );
+    assert!(
+        stdout.contains("line 19999"),
+        "the buffer should have survived the failed shell write"
+    );
+}

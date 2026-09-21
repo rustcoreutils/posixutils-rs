@@ -348,6 +348,10 @@ pub fn write_shell_input(
         .stderr(Stdio::piped())
         .spawn()?;
 
+    // The filter may stop reading before we finish writing; that is its
+    // choice, reported as EPIPE, not a reason to take the signal.
+    let _sigpipe = plib::io::SigPipeIgnored::new();
+
     // Write buffer content to stdin
     if let Some(stdin) = child.stdin.as_mut() {
         for line_num in start..=end {

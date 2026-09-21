@@ -351,6 +351,9 @@ fn execute_uux(
             .spawn()
             .map_err(|e| format!("failed to spawn: {}", e))?;
 
+        // As `common::ssh_command`: the remote command may not read its input.
+        let _sigpipe = plib::io::SigPipeIgnored::new();
+
         if let Some(data) = stdin_data {
             use std::io::Write;
             if let Some(ref mut stdin) = child.stdin {

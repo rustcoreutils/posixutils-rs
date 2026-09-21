@@ -408,6 +408,11 @@ pub fn ssh_send_file(
         .stdin(Stdio::piped())
         .spawn()?;
 
+    // `ssh -o BatchMode=yes` exits immediately when it has no usable key, and
+    // content larger than the pipe capacity then hits a closed pipe. The error
+    // below is the diagnostic; the signal would replace it with silence.
+    let _sigpipe = plib::io::SigPipeIgnored::new();
+
     if let Some(ref mut stdin) = child.stdin {
         stdin.write_all(&content)?;
     }
@@ -469,6 +474,9 @@ pub fn ssh_exec(
         .stderr(Stdio::piped())
         .spawn()?;
 
+    // As `ssh_send_file`: report the failure rather than dying of it.
+    let _sigpipe = plib::io::SigPipeIgnored::new();
+
     if let Some(data) = stdin_data {
         if let Some(ref mut stdin) = child.stdin {
             stdin.write_all(data)?;
@@ -489,6 +497,9 @@ pub fn send_mail(to: &str, subject: &str, body: &str) -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
+
+    // A missing or refusing `mail` should cost the notification, nothing more.
+    let _sigpipe = plib::io::SigPipeIgnored::new();
 
     if let Some(ref mut stdin) = child.stdin {
         stdin.write_all(body.as_bytes())?;

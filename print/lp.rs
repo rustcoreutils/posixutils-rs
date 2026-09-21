@@ -350,6 +350,11 @@ fn send_mail(recipient: &str, subject: &str, body: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
+    // An MTA that rejects the message closes the pipe. lp reports that by
+    // returning false; it must not die of it, because the print job itself
+    // already succeeded.
+    let _sigpipe = plib::io::SigPipeIgnored::new();
+
     if let Some(mut stdin) = child.stdin.take() {
         let message = format!("To: {recipient}\nSubject: {subject}\n\n{body}\n");
         let _ = stdin.write_all(message.as_bytes());

@@ -682,10 +682,10 @@ fn display_pager(man_page: Vec<u8>, copy_mode: bool) -> Result<(), ManError> {
 
     // From here on the page goes into a pipe man owns the far end of, so a
     // closed pipe is the user quitting the pager rather than a reason to die.
-    // `init_locale` restored the default disposition, which is right for the
-    // direct-to-stdout path above -- `man foo | head` should die the way every
-    // other utility does -- and wrong for this one.
-    plib::io::ignore_sigpipe();
+    // The default disposition is right for the direct-to-stdout path above --
+    // `man foo | head` should die the way every other utility does -- and
+    // wrong for this one.
+    let _sigpipe = plib::io::SigPipeIgnored::new();
 
     let mut child = Command::new("sh")
         .arg("-c")

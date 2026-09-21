@@ -4353,10 +4353,6 @@ fn parse_args_with_more_env() -> Args {
 
 fn main() {
     plib::diag::init_locale("more");
-    // more is the pager: it writes to the terminal, and when it is itself
-    // piped onward the reader is usually another pager. A closed pipe here is
-    // the reader leaving, which this loop handles, so keep EPIPE.
-    plib::io::ignore_sigpipe();
 
     let args = parse_args_with_more_env();
     match MoreControl::new(args) {

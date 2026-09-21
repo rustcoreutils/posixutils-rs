@@ -219,6 +219,12 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             .stderr(Stdio::inherit())
             .spawn()?;
 
+        // The command may exit without reading it all (`w !head -1`). That
+        // closes the pipe we own the far end of, and the default disposition
+        // would kill ed -- losing the buffer -- instead of letting the write
+        // fail so `?` can be reported.
+        let _sigpipe = plib::io::SigPipeIgnored::new();
+
         let mut bytes = 0;
         if let Some(ref mut stdin) = child.stdin {
             for i in start..=end {

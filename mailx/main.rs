@@ -35,10 +35,6 @@ fn main() {
     // for diagnostics); diagnostics are routed through gettext for
     // translatability. See the project locale-init convention.
     plib::diag::init_locale("mailx");
-    // The `~|` escape and the pager pipe a message into a command mailx
-    // spawned. That command closing its input is its own choice, reported as
-    // EPIPE and ignored, not a reason to kill the mail session.
-    plib::io::ignore_sigpipe();
 
     // Install the SIGINT handler so an interrupt aborts the current command or
     // message instead of terminating mailx (ASYNCHRONOUS EVENTS).

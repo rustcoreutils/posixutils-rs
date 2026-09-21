@@ -223,6 +223,13 @@ fn setup() -> i32 {
             if nullfd > STDERR_FILENO {
                 close(nullfd);
             }
+        } else {
+            // /dev/null should always open, but leaving 0, 1 and 2 attached to
+            // whatever the parent had is the worse of the two failures: the
+            // daemon would hold the controlling terminal open and write to it.
+            close(STDIN_FILENO);
+            close(STDOUT_FILENO);
+            close(STDERR_FILENO);
         }
 
         pid
@@ -366,6 +373,9 @@ fn run_at_job(content: &str, owner: &UserInfo) -> bool {
         Ok(c) => c,
         Err(_) => std::process::exit(1),
     };
+    // As in `job::run_job`: the at-job's shell may never read its input.
+    let _sigpipe = plib::io::SigPipeIgnored::new();
+
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(content.as_bytes());
     }

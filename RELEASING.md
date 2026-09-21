@@ -100,3 +100,18 @@ Then create the GitHub release against that tag and paste in the notes from
 step 3.
 
 Nothing is published to crates.io.
+
+### 5. Confirm the container image
+
+Pushing the tag starts `.github/workflows/container.yml`, which builds
+`linux/amd64` and `linux/arm64` natively, runs `scripts/docker-smoke` against
+each, and pushes a manifest list to the GitHub container registry. Nothing else
+publishes the image, and nothing about it is part of the local gate — so check
+it once the workflow is green:
+
+```sh
+docker buildx imagetools inspect ghcr.io/rustcoreutils/posixutils-rs:X.Y.Z
+```
+
+Both platforms must be present. The tag also moves `X.Y` and `X`, so a user
+pinned to a minor series picks the release up.

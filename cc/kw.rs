@@ -110,6 +110,13 @@ define_keywords! {
     (UNSIGNED,          "unsigned",          TYPE_SPEC | TYPE_KEYWORD),
     (BOOL,              "_Bool",             TYPE_SPEC | TYPE_KEYWORD),
     (COMPLEX,           "_Complex",          TYPE_SPEC | TYPE_KEYWORD),
+    // gcc's spellings of the same specifier, reserved for the same reason the
+    // `__typeof__` forms are: a leading double underscore belongs to the
+    // implementation in every scope (C17 7.1.3). Without them a declaration
+    // like `__complex__ float f(void)` parses as a missing type specifier and
+    // draws the implicit-int diagnostic, which points at the wrong thing.
+    (GNU_COMPLEX,       "__complex__",       TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
+    (GNU_COMPLEX2,      "__complex",         TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
     // C99 6.4.1 reserves `_Imaginary` whether or not imaginary types are
     // provided (Annex G makes the types optional, not the keyword), so the
     // name is reserved here without a type behind it.
@@ -398,6 +405,11 @@ define_keywords! {
     (C11_ATOMIC_SIGNAL_FENCE, "__c11_atomic_signal_fence", BUILTIN),
 
     // ---- setjmp/longjmp (special-cased in parser, not true builtins) ----
+    // gcc predefines bare `alloca` as well as `__builtin_alloca`, and code in
+    // the wild calls it without including <alloca.h>. Tagged 0, not BUILTIN:
+    // `__has_builtin` asks about the reserved spelling, and a user declaration
+    // may still displace this one (see `builtin_is_shadowed`).
+    (ALLOCA,            "alloca",            0),
     (SETJMP,            "setjmp",            0),
     (SETJMP2,           "_setjmp",           0),
     (LONGJMP,           "longjmp",           0),

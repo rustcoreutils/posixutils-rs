@@ -231,7 +231,7 @@ impl Parser<'_> {
                     modifiers |= TypeModifiers::UNSIGNED;
                     parsed_something = true;
                 }
-                crate::kw::COMPLEX => {
+                crate::kw::COMPLEX | crate::kw::GNU_COMPLEX | crate::kw::GNU_COMPLEX2 => {
                     self.advance();
                     modifiers |= TypeModifiers::COMPLEX;
                     parsed_something = true;

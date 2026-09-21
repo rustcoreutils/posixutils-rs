@@ -5629,3 +5629,52 @@ fn test_library_builtin_printf_family_fixed_arity() {
         );
     }
 }
+
+// __complex__ / __complex: gcc's spellings of _Complex
+//
+// Without them, `__complex__ float f(void)` parses as a declaration naming no
+// type and draws the implicit-int diagnostic, which blames the wrong thing.
+
+/// All three spellings produce the same type.
+#[test]
+fn test_gnu_complex_spellings_agree() {
+    let mut seen: Vec<(&str, TypeKind, u32)> = Vec::new();
+    for decl in [
+        "_Complex double v;",
+        "__complex__ double v;",
+        "__complex double v;",
+    ] {
+        let (d, types, _, _) = parse_decl(decl).unwrap_or_else(|e| panic!("{decl}: {e:?}"));
+        let typ = d.declarators[0].typ;
+        seen.push((decl, types.kind(typ), types.size_bits(typ)));
+    }
+    let (first_spelling, first_kind, first_bits) = seen[0];
+    for (spelling, kind, bits) in &seen[1..] {
+        assert_eq!(
+            (*kind, *bits),
+            (first_kind, first_bits),
+            "{spelling} gave a different type than {first_spelling}"
+        );
+    }
+    // And it really is complex, not a bare double that happened to match.
+    assert_eq!(first_bits, 128, "_Complex double should be two doubles");
+}
+
+/// The GNU spellings carry the COMPLEX modifier in a type-name position too
+/// (a cast or a `sizeof`), not only in a declaration.
+#[test]
+fn test_gnu_complex_in_type_name() {
+    for spelling in ["_Complex float", "__complex__ float", "__complex float"] {
+        let src = format!("sizeof({spelling})");
+        let (expr, types, _, _) = parse_expr(&src)
+            .unwrap_or_else(|e| panic!("{spelling} failed to parse as a type name: {e:?}"));
+        let ExprKind::SizeofType(typ, _) = expr.kind else {
+            panic!("sizeof({spelling}) gave {:?}", expr.kind);
+        };
+        assert_eq!(
+            types.size_bits(typ),
+            64,
+            "{spelling} in a type name is not a complex float"
+        );
+    }
+}

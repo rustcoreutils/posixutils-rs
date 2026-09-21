@@ -857,7 +857,7 @@ impl Parser<'_> {
                     self.advance();
                     modifiers |= TypeModifiers::UNSIGNED;
                 }
-                crate::kw::COMPLEX => {
+                crate::kw::COMPLEX | crate::kw::GNU_COMPLEX | crate::kw::GNU_COMPLEX2 => {
                     self.advance();
                     modifiers |= TypeModifiers::COMPLEX;
                 }
@@ -1469,10 +1469,15 @@ impl Parser<'_> {
     /// genuinely required.
     pub(super) fn check_implicit_int(&mut self, pos: Position) {
         if !self.saw_explicit_type {
-            diag::error(
-                pos,
-                &gettext("type specifier missing; implicit 'int' was removed in C99"),
-            );
+            // `-fpermissive` downgrades this to a warning. The recovery below
+            // is the same either way -- the type defaults to `int` -- so the
+            // flag changes only whether the translation unit is rejected.
+            let msg = gettext("type specifier missing; implicit 'int' was removed in C99");
+            if diag::permissive() {
+                diag::warning(pos, &msg);
+            } else {
+                diag::error(pos, &msg);
+            }
             // Keep the defaulted `int` and carry on: the declarator that
             // follows is usually well-formed, and one diagnostic per
             // declaration reads better than a cascade.

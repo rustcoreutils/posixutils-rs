@@ -766,3 +766,61 @@ int main(void) {
         0
     );
 }
+
+/// `__complex__` and `__complex` are gcc's spellings of `_Complex`.
+///
+/// c17 implemented the type, `__real__` and `__imag__` already; only these two
+/// keyword spellings were missing, and their absence was not a quiet one. A
+/// declaration like `__complex__ float foo(void)` parsed as one naming no type
+/// at all, so the diagnostic read "type specifier missing; implicit 'int' was
+/// removed in C99" and pointed at a line whose type was right there. Seven of
+/// the gcc.c-torture tests that looked like pre-C99 code were this instead.
+#[test]
+fn c99_gnu_complex_spellings() {
+    let code = r#"
+extern void abort(void);
+
+__complex__ float cf_id(__complex__ float x) { return x; }
+__complex double cd_add(__complex double a, __complex double b) { return a + b; }
+
+typedef __complex__ float cf;
+struct wrap { char c; cf f; };
+
+int main(void) {
+    __complex__ double z;
+    __real__ z = 3.0;
+    __imag__ z = 4.0;
+    if (__real__ z != 3.0) return 1;
+    if (__imag__ z != 4.0) return 2;
+
+    /* Across a call, in both spellings. */
+    __complex float w = cf_id(z);
+    if (__real__ w != 3.0f || __imag__ w != 4.0f) return 3;
+
+    __complex__ double s = cd_add(z, z);
+    if (__real__ s != 6.0 || __imag__ s != 8.0) return 4;
+
+    /* The GNU spelling names the same type as the standard one. */
+    _Complex double q = z;
+    if (__real__ q != 3.0 || __imag__ q != 4.0) return 5;
+
+    /* Through a typedef and as a struct member. */
+    struct wrap wr;
+    wr.c = 'x';
+    wr.f = w;
+    if (wr.c != 'x') return 6;
+    if (__real__ wr.f != 3.0f || __imag__ wr.f != 4.0f) return 7;
+
+    /* And in a type name, where a cast or sizeof needs it. */
+    if (sizeof(__complex__ float) != 2 * sizeof(float)) return 8;
+    if (sizeof(__complex double) != 2 * sizeof(double)) return 9;
+    if (sizeof(__complex__ float) != sizeof(_Complex float)) return 10;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_gnu_complex_spellings", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_gnu_complex_spellings_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

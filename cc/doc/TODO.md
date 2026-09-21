@@ -7,6 +7,7 @@
 - [Known Divergences](#known-divergences)
 - [GNU extensions not implemented](#gnu-extensions-not-implemented)
 - [Future Features](#future-features)
+- [Stack frames are far larger than gcc's](#stack-frames-are-far-larger-than-gccs)
 - [Optimization Passes](#optimization-passes)
 - [Assembly Peephole Optimizations](#assembly-peephole-optimizations)
 - [External Test Suites](#external-test-suites)
@@ -389,6 +390,51 @@ access as `%fs:(%rax)`.
 
 ---
 
+## Stack frames are far larger than gcc's
+
+Measured 2026-09-21 on CPython's `Python/ceval.c` at -O2, per function:
+
+| | functions with a frame | max | mean | total |
+|---|---|---|---|---|
+| c17 | 134 | **7256 B** (`_PyEval_EvalFrameDefault`) | 100 B | 13488 B |
+| gcc | 44 | **376 B** | 32 B | 1408 B |
+
+This is not cosmetic. It is why six CPython tests fail today — `test_call`,
+`test_descr`, `test_io`, `test_isinstance`, `test_userdict`, `test_venv` — all
+segfaulting in a C recursion loop. `test_call` passes outright under
+`ulimit -s 65536`. CPython guards C recursion with a fixed `Py_C_RECURSION_LIMIT`
+tuned against gcc's frames; at 19x the cost per level, an 8 MB stack holds
+~1,100 levels where gcc holds ~22,000, so the real stack runs out before the
+guard trips.
+
+**Root cause: no named local ever shares a stack slot.** The `PseudoKind::Sym`
+arm of `run_chordal_color` in `cc/arch/x86_64/regalloc.rs` sets
+`reusable = false` outright. Flipping it changes nothing, and neither does the
+gate its comment proposes (`!addr_taken_syms.contains(..)` excludes every array,
+since indexing emits `SymAddr`). The real blocker is upstream: **a Sym pseudo
+has no defining instruction**, so backward liveness finds every use
+upward-exposed and propagates it to function entry. `compute_live_intervals`
+then gives anything live-in `start = block_start_pos`, so every local's interval
+begins at 0. Six `int[16]` locals in six disjoint scopes come out as
+`[0,12] [0,35] [0,58] [0,81] [0,104] [0,127]` — all overlapping at 0, so
+`try_reuse_stack_slot` never finds a free slot and the pool stays empty.
+
+A correct fix needs both ends of the interval:
+
+- **start** at the local's declaration rather than 0. This is what unblocks reuse.
+- **end** extended over every pseudo derived from the Sym (`SymAddr`, and copies
+  or arithmetic on that pointer), with a Sym whose address escapes — stored to
+  memory, passed to a call — staying permanent. This is what makes reuse *safe*;
+  its absence is the slot-reuse corruption fixed in 2026-05, which regressed the
+  CPython baseline at the time.
+
+A second, independent problem shows up in the same measurements: c17 spills
+values gcc keeps in registers. A function whose locals never have their address
+taken and never outlive a call still gets a frame (16 bytes where gcc needs
+none); eight simultaneously-live `int`s cost 72 bytes where gcc uses
+callee-saved registers and none. Slot reuse is the larger multiplier, but this
+is the reason even leaf functions carry a frame.
+
 ## Optimization Passes
 
 The compiler uses SSA-form IR. Already implemented passes (see `cc/ir/`):
@@ -495,7 +541,7 @@ work, and were never a claim about the language.
 
 | Suite | Note |
 |-------|------|
-| GCC torture tests (C99 subset) | Not run against c17 |
+| GCC torture tests (C99 subset) | **Running.** `cc/scripts/c17_torture.sh`, baselined |
 | clang test suite (C99 subset) | Not run against c17 |
 
 **Reclassified 2026-08-21.** These are no longer only test-coverage work. A
@@ -505,3 +551,10 @@ hour (#C155, `&vla`), in a mandated C99 feature that CPython's 40,817 passing
 tests never reach. `gcc.c-torture/execute` is a few thousand self-checking
 programs needing no reference compiler, and is the highest-yield item on this
 page.
+
+**Running as of 2026-09-21.** `cc/scripts/c17_torture.sh` drives it against an
+external checkout (the suite is GPLv3 and is not vendored) and diffs a recorded
+baseline, so a regression fails rather than shifting a percentage. The
+libc-alias builtins took `execute/` from 58.5% to 80.0%. What remains, at -O0:
+~102 tests needing `-fpermissive`, 11 nested functions, 8 VLA-as-struct-member,
+12 `va_arg` of a small struct, 10 bitfield promotion/truncation.

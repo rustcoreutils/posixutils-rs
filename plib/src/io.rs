@@ -134,14 +134,45 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>
 /// exit 101, where the historical utilities die by the signal and the shell
 /// reports 141.
 ///
-/// Call this once at the top of `main`, before any output. It affects only
-/// this process; `exec`ing a child resets ignored signals anyway, and a
-/// default disposition is inherited unchanged.
+/// [`crate::diag::init_locale`] calls this, so a utility gets it by starting up
+/// the usual way; call it directly only before that, or instead of it.
+///
+/// It also settles what a child inherits, which is worth stating because the
+/// rule is the opposite of the one for caught signals: POSIX keeps a `SIG_IGN`
+/// disposition *across* `exec`, so leaving the runtime's `SIG_IGN` in place
+/// would hand it to everything the process runs. Nothing in this tree does:
+/// `std::process::Command` restores the default in the child, and `sh` -- the
+/// one raw `libc::execve` -- resets every disposition itself in
+/// `TrapManager::reset`. A default disposition is inherited unchanged, so with
+/// this called there is nothing left for either of them to undo.
 pub fn restore_sigpipe() {
     // SAFETY: `signal` with SIG_DFL is async-signal-safe and this runs before
     // any other thread exists.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+/// Ignore `SIGPIPE`, so a write to a closed pipe returns `EPIPE` instead of
+/// killing the process.
+///
+/// This is the opt-out from [`restore_sigpipe`], for the utilities that write
+/// into a pipe they own the far end of: a pager or a filter they spawned
+/// themselves. There, a closed pipe is the user quitting the pager or the
+/// filter deciding it has read enough — an event to observe, not a reason to
+/// die. `man` would otherwise be killed by a reader pressing `q`, which it
+/// reports as success.
+///
+/// A single disposition cannot distinguish that pipe from the utility's own
+/// standard output, which does want the default, so every caller says which
+/// pipe it is protecting. Narrow the window where it can: `man` calls this
+/// only on the branch that spawns the pager, leaving `man foo | head` to die
+/// like anything else. Where the two cannot be separated — `more`, `vi`,
+/// `mailx`, `pax` — call it immediately after [`crate::diag::init_locale`].
+pub fn ignore_sigpipe() {
+    // SAFETY: as `restore_sigpipe`; `signal` with SIG_IGN is async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 }
 

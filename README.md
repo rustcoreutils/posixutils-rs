@@ -63,7 +63,7 @@ implements it.
 | Printing | lp |
 | Process management | env, fuser, kill, nice, nohup, ps, renice, timeout, xargs |
 | SCCS | admin, delta, get, prs, rmdel, sact, sccs, unget, val, what |
-| Shell | echo, false, printf, sh, test, true |
+| Shell | echo, false, printf, sh, test (`[`), true |
 | System and users | getconf, id, ipcrm, ipcs, logger, logname, man, newgrp, pwd, tty, uname, who |
 | Terminal | more, stty, tabs, tput |
 | Text processing | asa, awk, comm, csplit, cut, diff, expand, fold, grep, head, join, nl, paste, patch, pr, sed, sort, tail, tr, tsort, unexpand, uniq, wc |
@@ -80,9 +80,9 @@ Utilities provided beyond those POSIX specifies.
  * talkd - local-only talk daemon, Unix socket rather than UDP port 518 (Users)
 
 `tar` and `cpio` are installed as symlinks to `pax`, which picks its
-command-line parser from `argv[0]`.  Three further symlinks name
-POSIX-specified utilities and are not extensions: `ex` -> vi, and
-`zcat` / `uncompress` -> compress.
+command-line parser from `argv[0]`.  Four further symlinks name
+POSIX-specified utilities and are not extensions: `ex` -> vi,
+`zcat` / `uncompress` -> compress, and `[` -> test.
 
 See [NONPOSIX.md](NONPOSIX.md) for the full inventory of non-POSIX extensions:
 extra options, language and syntax extensions, environment variables and file

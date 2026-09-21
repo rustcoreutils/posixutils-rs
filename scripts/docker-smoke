@@ -54,6 +54,14 @@ for alias in tar cpio ex uncompress zcat; do
 		"/usr/local/bin/$alias"
 done
 
+# `[` gets a file check rather than `command -v`, which reports the shell's
+# own built-in of that name and never looks at PATH. It is also the alias
+# nothing creates by accident -- `[` is not a portable filename character, so a
+# build that drops it leaves no trace.
+check "argv[0] front-end: [ is installed" \
+	'readlink /usr/local/bin/[' \
+	'test'
+
 # The whole point of /usr/local/bin preceding /usr/bin.
 for util in ls cat sort awk sed grep find diff; do
 	check "ours shadows the distro: $util" \
@@ -72,6 +80,10 @@ check "cpio front-end round-trips" \
 check "compress/zcat round-trip" \
 	'echo hello | compress | zcat' \
 	'hello'
+
+check "[ evaluates an expression" \
+	'if [ 1 -eq 1 ]; then echo yes; fi' \
+	'yes'
 
 # tzdata: with no /usr/share/zoneinfo, date printed the zone name back as its
 # own abbreviation ("... America 2026").

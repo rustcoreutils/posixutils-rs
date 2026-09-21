@@ -381,9 +381,18 @@ int main(void) {
     if (__builtin_strncmp("abcz", "abcy", 3) != 0) return 14;
     if (__builtin_strncmp("abcz", "abcy", 4) <= 0) return 15;
 
-    /* mempcpy returns the end of the copied region, not its start. */
+    /* mempcpy returns the end of the copied region, not its start. It is a
+       GNU extension: glibc has it, Apple's libc does not, and the builtin
+       lowers to a call like any other -- so on macOS this links against a
+       symbol that is not there, exactly as it would under gcc. Guarded rather
+       than dropped, because the behaviour is worth pinning where it exists. */
+#ifdef __GLIBC__
     if (__builtin_mempcpy(dst, "1234", 4) != dst + 4) return 16;
     if (__builtin_memcmp(dst, "1234", 4) != 0) return 17;
+#else
+    if (__builtin_memcpy(dst, "1234", 4) != dst) return 16;
+    if (__builtin_memcmp(dst, "1234", 4) != 0) return 17;
+#endif
 
     /* The allocators: a truncated void* would not round-trip 64 bytes. */
     {
@@ -424,11 +433,19 @@ int main(void) {
     CK(__builtin_abort); CK(__builtin_exit); CK(__builtin_printf);
     CK(__builtin_sprintf); CK(__builtin_snprintf); CK(__builtin_puts);
     CK(__builtin_malloc); CK(__builtin_calloc); CK(__builtin_realloc);
-    CK(__builtin_free); CK(__builtin_memcmp); CK(__builtin_mempcpy);
+    CK(__builtin_free); CK(__builtin_memcmp);
+    /* c17 knows the builtin on every target; whether the libc has the symbol
+       is a separate question, and the one that bit on macOS. */
+    CK(__builtin_mempcpy);
     CK(__builtin_strcpy); CK(__builtin_strncpy); CK(__builtin_stpcpy);
     CK(__builtin_strcat); CK(__builtin_strncat); CK(__builtin_strncmp);
     CK(__builtin_strchr); CK(__builtin_strrchr); CK(__builtin_strstr);
-    /* Both were implemented but unregistered, so __has_builtin denied them. */
+    /* Both were implemented but unregistered, so __has_builtin denied them.
+       Note this block is not a gcc differential: gcc implements
+       `__builtin_complex` -- <complex.h> uses it for CMPLX -- and still
+       answers 0 to `__has_builtin` for it, because it is handled specially in
+       the front end rather than declared as an ordinary builtin. c17 answers
+       1, which is the honest answer about c17 and the more useful one. */
     CK(__builtin_isinf_sign); CK(__builtin_complex);
     return 0;
 }

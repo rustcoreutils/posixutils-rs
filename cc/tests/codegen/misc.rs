@@ -10380,3 +10380,150 @@ int main(void) {
         0
     );
 }
+
+/// `va_arg` of an aggregate, assigned rather than used to initialize.
+///
+/// `linearize_va_op` gave the result a stack local only when the aggregate was
+/// wider than 64 bits. Below that the result pseudo held the struct's *bytes*,
+/// which is the crate-wide convention -- but `emit_assign`'s struct path does
+/// not read it that way. It calls `linearize_lvalue`, which falls through to
+/// `rvalue_addr`, which returns any non-`Sym` pseudo unchanged on the
+/// assumption that it already holds a pointer. So `emit_block_copy` took four
+/// bytes of struct data and dereferenced them as an address.
+///
+/// The call-return path hit exactly this and was fixed by giving small struct
+/// returns a `__sret1_` local, with a comment naming the hazard. `VaArg` never
+/// got the same treatment.
+///
+/// Every existing aggregate-`va_arg` test initializes a fresh declaration
+/// (`C3 v = va_arg(ap, C3);`), which goes through `linearize_stmt` -- a path
+/// with the opposite convention hard-coded. So `struct tiny v = va_arg(...)`
+/// worked while `v = va_arg(...)` crashed, and nothing noticed.
+///
+/// Sizes straddle the 8-byte boundary deliberately: 4, 8, 12 and 16 bytes,
+/// integer and floating, since the value/address split is at 8 and the
+/// register/memory ABI split is at 16.
+#[test]
+fn codegen_va_arg_small_struct_assigned() {
+    let code = r#"
+#include <stdarg.h>
+
+struct s4  { int a; };
+struct s8  { int a, b; };
+struct s12 { int a, b, c; };
+struct s16 { long a, b; };
+struct f8  { float x, y; };
+struct f16 { double x, y; };
+
+static int take4(int n, ...) {
+    struct s4 v;
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        v = va_arg(ap, struct s4);      /* assignment, not initialization */
+        if (v.a != i + 10) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+static int take8(int n, ...) {
+    struct s8 v;
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        v = va_arg(ap, struct s8);
+        if (v.a != i + 20 || v.b != i + 21) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+static int take12(int n, ...) {
+    struct s12 v;
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        v = va_arg(ap, struct s12);
+        if (v.a != i + 30 || v.b != i + 31 || v.c != i + 32) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+static int take16(int n, ...) {
+    struct s16 v;
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        v = va_arg(ap, struct s16);
+        if (v.a != i + 40 || v.b != i + 41) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+static int takef8(int n, ...) {
+    struct f8 v;
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        v = va_arg(ap, struct f8);
+        if (v.x != (float)(i + 50) || v.y != (float)(i + 51)) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+static int takef16(int n, ...) {
+    struct f16 v;
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        v = va_arg(ap, struct f16);
+        if (v.x != (double)(i + 60) || v.y != (double)(i + 61)) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+/* The declaration-initializer form, which already worked: it must keep
+   working, since the fix changes the shape of the pseudo it consumes. */
+static int take4_init(int n, ...) {
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        struct s4 v = va_arg(ap, struct s4);
+        if (v.a != i + 10) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+int main(void) {
+    struct s4  a0 = {10}, a1 = {11}, a2 = {12};
+    struct s8  b0 = {20,21}, b1 = {21,22};
+    struct s12 c0 = {30,31,32}, c1 = {31,32,33};
+    struct s16 d0 = {40,41}, d1 = {41,42};
+    struct f8  e0 = {50.0f,51.0f}, e1 = {51.0f,52.0f};
+    struct f16 g0 = {60.0,61.0}, g1 = {61.0,62.0};
+
+    if (!take4(3, a0, a1, a2)) return 1;
+    if (!take8(2, b0, b1)) return 2;
+    if (!take12(2, c0, c1)) return 3;
+    if (!take16(2, d0, d1)) return 4;
+    if (!takef8(2, e0, e1)) return 5;
+    if (!takef16(2, g0, g1)) return 6;
+    if (!take4_init(3, a0, a1, a2)) return 7;
+
+    /* Mixed with scalars, which move the register save area along. */
+    if (!take4(1, a0)) return 8;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_va_arg_small_struct", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("codegen_va_arg_small_struct_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

@@ -4676,18 +4676,26 @@ impl<'a> Linearizer<'a> {
                 let ap_addr = self.linearize_lvalue(ap);
                 let arg_size = self.types.size_bits(*arg_type);
 
-                // An aggregate wider than a register has nowhere to live in an
-                // ordinary pseudo, so it gets a local of its own and the
-                // backend writes the argument into it -- the same arrangement
-                // a call returning an aggregate in registers uses. Without it
-                // the backend was handed a register that held no storage, and
-                // whatever it happened to contain was treated as the
-                // destination's address.
+                // Every aggregate gets a local of its own, whatever its size,
+                // and the backend writes the argument into it -- the same
+                // arrangement a call returning an aggregate uses, and for the
+                // same reason.
+                //
+                // The size did once gate this, on the crate-wide convention
+                // that an aggregate pseudo holds its value below eight bytes
+                // and its address at or above. `emit_assign`'s struct path
+                // does not honour that convention: it asks `linearize_lvalue`
+                // for an address, and `rvalue_addr` hands back any non-`Sym`
+                // pseudo unchanged, taking it for a pointer already. So
+                // `x = va_arg(ap, struct tiny)` copied from whatever address
+                // the struct's own four bytes spelled. Giving the result a
+                // `Sym` makes `rvalue_addr` take its address instead, which
+                // is what the small-struct return path does with `__sret1_`.
                 let is_aggregate = matches!(
                     self.types.kind(*arg_type),
                     TypeKind::Struct | TypeKind::Union | TypeKind::Array
                 );
-                let result = if is_aggregate && arg_size > 64 {
+                let result = if is_aggregate {
                     let local_sym = self.alloc_pseudo();
                     let name = format!("__vaarg_{}", local_sym.0);
                     if let Some(func) = &mut self.current_func {

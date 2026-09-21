@@ -382,3 +382,68 @@ int main(void) {
         0
     );
 }
+
+/// `creal`, `cimag` and `conj`, and the suffixed spellings of `isnan` and
+/// `isinf`.
+///
+/// `creal`/`cimag` lower to the `__real__` and `__imag__` c17 already has, and
+/// `conj` to `__builtin_complex(__real__ z, -__imag__ z)` -- every piece
+/// existed, so none of the three needs a libm call or `-lm`. The `isnan`/
+/// `isinf` suffixes carry no information the node needs: `FpTest` dispatches
+/// on the operand's own type.
+///
+/// gcc has **no** `__builtin_isfinitef` or `__builtin_isnormall`, despite
+/// having the unsuffixed pair -- they compile and then fail to link, which is
+/// how the first version of this got it wrong. Claiming a builtin gcc does not
+/// have would make `__has_builtin` a worse answer than none, so the test pins
+/// their absence alongside the others' presence.
+#[test]
+fn builtins_complex_parts_and_suffixed_fp_tests() {
+    let code = r#"
+int main(void) {
+    _Complex double z = __builtin_complex(3.0, 4.0);
+    _Complex float  w = __builtin_complex(1.0f, 2.0f);
+    _Complex long double q = __builtin_complex(5.0L, 6.0L);
+
+    /* creal/cimag name the halves __real__ and __imag__ already reach. */
+    if (__builtin_creal(z) != 3.0 || __builtin_cimag(z) != 4.0) return 1;
+    if (__builtin_crealf(w) != 1.0f || __builtin_cimagf(w) != 2.0f) return 2;
+    if (__builtin_creall(q) != 5.0L || __builtin_cimagl(q) != 6.0L) return 3;
+
+    /* conj flips the sign of the imaginary half, at every precision. */
+    { _Complex double c = __builtin_conj(z);
+      if (__builtin_creal(c) != 3.0 || __builtin_cimag(c) != -4.0) return 4; }
+    { _Complex float c = __builtin_conjf(w);
+      if (__builtin_crealf(c) != 1.0f || __builtin_cimagf(c) != -2.0f) return 5; }
+    { _Complex long double c = __builtin_conjl(q);
+      if (__builtin_creall(c) != 5.0L || __builtin_cimagl(c) != -6.0L) return 6; }
+
+    /* An involution: conj of conj is the original. */
+    { _Complex double c = __builtin_conj(__builtin_conj(z));
+      if (__builtin_creal(c) != 3.0 || __builtin_cimag(c) != 4.0) return 7; }
+
+    /* A zero imaginary part conjugates to negative zero, which is the whole
+       reason conj is not "subtract the imaginary part from zero". */
+    { _Complex double c = __builtin_conj(__builtin_complex(1.0, 0.0));
+      if (!__builtin_signbit(__builtin_cimag(c))) return 8; }
+
+    /* The suffixed isnan/isinf spellings ask the same question as the
+       unsuffixed one, of the operand's own type. */
+    if (!__builtin_isinff(1.0f / 0.0f)) return 9;
+    if (!__builtin_isinfl(1.0L / 0.0L)) return 10;
+    if (!__builtin_isnanf(0.0f / 0.0f)) return 11;
+    if (!__builtin_isnanl(0.0L / 0.0L)) return 12;
+    if (__builtin_isinff(1.0f) || __builtin_isnanf(1.0f)) return 13;
+
+    /* gcc has no suffixed isfinite or isnormal, so neither do we, and
+       __has_builtin must say so rather than over-promise. */
+    if (__has_builtin(__builtin_isfinitef)) return 14;
+    if (__has_builtin(__builtin_isnormall)) return 15;
+    if (!__has_builtin(__builtin_isinff)) return 16;
+    if (!__has_builtin(__builtin_conjf)) return 17;
+    if (!__has_builtin(__builtin_creal)) return 18;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("builtins_complex_parts", code, &[]), 0);
+}

@@ -668,13 +668,29 @@ impl Parser<'_> {
             })()),
             // Signbit builtins - test sign bit of floats
             crate::kw::BUILTIN_ISNAN
+            | crate::kw::BUILTIN_ISNANF
+            | crate::kw::BUILTIN_ISNANL
             | crate::kw::BUILTIN_ISINF
+            | crate::kw::BUILTIN_ISINFF
+            | crate::kw::BUILTIN_ISINFL
             | crate::kw::BUILTIN_ISINF_SIGN
             | crate::kw::BUILTIN_ISFINITE
             | crate::kw::BUILTIN_ISNORMAL => Some((|| {
+                // The `f` and `l` spellings ask the same question of the same
+                // argument: `FpTest` dispatches on the operand's own type, so
+                // the suffix carries no information the node needs. gcc has
+                // both suffixed spellings of `isnan` and `isinf`, and code
+                // that includes <math.h> without c17's own headers reaches for
+                // them. It has no suffixed `isfinite` or `isnormal`, so
+                // neither does this -- claiming a builtin gcc does not have
+                // would make `__has_builtin` a worse answer than none.
                 let test = match name_id {
-                    crate::kw::BUILTIN_ISNAN => FpTest::IsNan,
-                    crate::kw::BUILTIN_ISINF => FpTest::IsInf,
+                    crate::kw::BUILTIN_ISNAN
+                    | crate::kw::BUILTIN_ISNANF
+                    | crate::kw::BUILTIN_ISNANL => FpTest::IsNan,
+                    crate::kw::BUILTIN_ISINF
+                    | crate::kw::BUILTIN_ISINFF
+                    | crate::kw::BUILTIN_ISINFL => FpTest::IsInf,
                     crate::kw::BUILTIN_ISINF_SIGN => FpTest::IsInfSign,
                     crate::kw::BUILTIN_ISFINITE => FpTest::IsFinite,
                     _ => FpTest::IsNormal,
@@ -751,6 +767,86 @@ impl Parser<'_> {
                 let raw = self.libm_call("__signbitl", self.types.int_id, &[ld], arg, token_pos);
                 Ok(self.normalise_predicate(raw, token_pos))
             })()),
+            crate::kw::BUILTIN_CREAL
+            | crate::kw::BUILTIN_CREALF
+            | crate::kw::BUILTIN_CREALL
+            | crate::kw::BUILTIN_CIMAG
+            | crate::kw::BUILTIN_CIMAGF
+            | crate::kw::BUILTIN_CIMAGL => Some((|| {
+                // `creal`/`cimag` name the halves `__real__` and `__imag__`
+                // already reach, so they lower to those rather than to a
+                // library call. The suffix is not consulted: the operand's own
+                // type gives the precision, and a mismatch there would be the
+                // caller's bug, not something the spelling can fix.
+                let op = matches!(
+                    name_id,
+                    crate::kw::BUILTIN_CREAL
+                        | crate::kw::BUILTIN_CREALF
+                        | crate::kw::BUILTIN_CREALL
+                )
+                .then_some(UnaryOp::Real)
+                .unwrap_or(UnaryOp::Imag);
+                self.expect_special(b'(')?;
+                let arg = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                let arg_typ = arg.typ.unwrap_or(self.types.double_id);
+                let base = self.types.complex_base(arg_typ);
+                Ok(Self::typed_expr(
+                    ExprKind::Unary {
+                        op,
+                        operand: Box::new(arg),
+                    },
+                    base,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_CONJ | crate::kw::BUILTIN_CONJF | crate::kw::BUILTIN_CONJL => {
+                Some((|| {
+                    // conj(z) is z with the sign of its imaginary part flipped.
+                    // Built from `__builtin_complex(__real__ z, -__imag__ z)`
+                    // rather than a libm call: every piece already exists, and
+                    // negating the imaginary half is exact at every precision,
+                    // where a call would need -lm for nothing.
+                    self.expect_special(b'(')?;
+                    let arg = self.parse_assignment_expr()?;
+                    self.expect_special(b')')?;
+                    let arg_typ = arg.typ.unwrap_or(self.types.double_id);
+                    let base = self.types.complex_base(arg_typ);
+                    let complex_typ = self.types.make_complex(base);
+                    let real = Self::typed_expr(
+                        ExprKind::Unary {
+                            op: UnaryOp::Real,
+                            operand: Box::new(arg.clone()),
+                        },
+                        base,
+                        token_pos,
+                    );
+                    let imag = Self::typed_expr(
+                        ExprKind::Unary {
+                            op: UnaryOp::Imag,
+                            operand: Box::new(arg),
+                        },
+                        base,
+                        token_pos,
+                    );
+                    let neg_imag = Self::typed_expr(
+                        ExprKind::Unary {
+                            op: UnaryOp::Neg,
+                            operand: Box::new(imag),
+                        },
+                        base,
+                        token_pos,
+                    );
+                    Ok(Self::typed_expr(
+                        ExprKind::BuiltinComplex {
+                            real: Box::new(real),
+                            imag: Box::new(neg_imag),
+                        },
+                        complex_typ,
+                        token_pos,
+                    ))
+                })())
+            }
             crate::kw::BUILTIN_COMPLEX => Some((|| {
                 // __builtin_complex(real, imag) - construct complex value
                 self.expect_special(b'(')?;

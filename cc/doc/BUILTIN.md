@@ -112,9 +112,9 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 | `__builtin_signbit(x)` | Returns non-zero if sign bit set (`double`) |
 | `__builtin_signbitf(x)` | Returns non-zero if sign bit set (`float`) |
 | `__builtin_signbitl(x)` | Returns non-zero if sign bit set (`long double`) |
-| `__builtin_isnan(x)` | 1 if `x` is a NaN, else 0. Any real floating type |
-| `__builtin_isinf(x)` | 1 if `x` is an infinity of either sign |
-| `__builtin_isfinite(x)` | 1 if `x` is neither infinite nor NaN |
+| `__builtin_isnan(x)`, `__builtin_isnanf`, `__builtin_isnanl` | 1 if `x` is a NaN, else 0. Any real floating type; the suffix is accepted but not consulted, since the operand's own type decides |
+| `__builtin_isinf(x)`, `__builtin_isinff`, `__builtin_isinfl` | 1 if `x` is an infinity of either sign |
+| `__builtin_isfinite(x)` | 1 if `x` is neither infinite nor NaN. gcc has no `f`/`l` spelling of this one, or of `isnormal`, so neither does c17 |
 | `__builtin_isnormal(x)` | 1 if `x` is finite, non-zero and not subnormal |
 | `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` | Whichever of the five class codes describes `x` |
 | `__builtin_flt_rounds()` | Current FP rounding mode |
@@ -134,6 +134,9 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 | Builtin | Description |
 |---------|-------------|
 | `__builtin_complex(re, im)` | Build a complex value from two reals of the same type |
+| `__builtin_creal(z)`, `__builtin_crealf`, `__builtin_creall` | The real half. Lowers to `__real__`, not a libm call |
+| `__builtin_cimag(z)`, `__builtin_cimagf`, `__builtin_cimagl` | The imaginary half |
+| `__builtin_conj(z)`, `__builtin_conjf`, `__builtin_conjl` | The complex conjugate. Built from `__builtin_complex(__real__ z, -__imag__ z)`, so a zero imaginary part conjugates to **negative** zero, as it must |
 
 Used by `<complex.h>` for `I` and the `CMPLX`/`CMPLXF`/`CMPLXL` macros, which
 exist precisely so `x + y*I` has an exact alternative that cannot corrupt an

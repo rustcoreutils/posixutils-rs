@@ -1419,6 +1419,17 @@ impl<'a> Parser<'a> {
         self.check_not_void(&left, left.pos);
         self.check_not_void(&right, right.pos);
 
+        // A bit-field operand promotes before anything else looks at it
+        // (C17 6.3.1.1p2), and that promotion is not derivable from the
+        // operand's type alone -- the width lives on the member, not the type.
+        //
+        // Made explicit in the tree rather than only in the result type,
+        // because a comparison takes its signedness from its operands and not
+        // from its own `int` result: with the promotion left implicit,
+        // `b.u7 > -1` still compared unsigned and answered false.
+        let left = self.promote_bitfield_operand(left);
+        let right = self.promote_bitfield_operand(right);
+
         // Compute result type based on operator and operand types
         let left_type = left.typ.unwrap_or(self.types.int_id);
         let right_type = right.typ.unwrap_or(self.types.int_id);
@@ -1548,6 +1559,68 @@ impl<'a> Parser<'a> {
     /// was a second implementation of them, and the two had drifted: the table
     /// compared widths where this one ranked by kind, so they disagreed about
     /// `long` against `long long`. One of them had to go.
+    /// The width and declared type of the bit-field `e` names, if it names one.
+    fn bitfield_of(&mut self, e: &Expr) -> Option<(u32, TypeId)> {
+        let (base_typ, member) = match &e.kind {
+            ExprKind::Member { expr, member } => (expr.typ?, *member),
+            ExprKind::Arrow { expr, member } => (self.types.base_type(expr.typ?)?, *member),
+            _ => return None,
+        };
+        let resolved = self.resolve_struct_type(base_typ);
+        let info = self.types.find_member(resolved, member)?;
+        Some((info.bit_width?, info.typ))
+    }
+
+    /// The type an operand contributes to an arithmetic expression.
+    ///
+    /// For anything but a bit-field this is just its own type. C17 6.3.1.1p2
+    /// promotes a bit-field the way it promotes a narrow integer: to `int` if
+    /// `int` can represent all its values, otherwise to `unsigned int`. What
+    /// makes it a separate question from `integer_promote` is that the width
+    /// is a property of the *member*, not of the type -- an `unsigned int f:7`
+    /// has type `unsigned int`, so asking the type alone answers "no change"
+    /// and `b.f - 2` comes out a huge unsigned value instead of -1.
+    ///
+    /// A field at least as wide as `int` is left alone, which covers both an
+    /// `unsigned int f:32` (which stays unsigned, since `int` cannot hold all
+    /// of it) and a `long long b:40` (whose declared type is already wider).
+    /// Wrap a bit-field operand in the conversion C17 6.3.1.1p2 calls for.
+    ///
+    /// A no-op for anything else, and for a field that does not promote.
+    fn promote_bitfield_operand(&mut self, e: Expr) -> Expr {
+        let declared = e.typ.unwrap_or(self.types.int_id);
+        let promoted = self.bitfield_promoted_type(&e);
+        if promoted == declared {
+            return e;
+        }
+        let pos = e.pos;
+        Self::typed_expr(
+            ExprKind::Cast {
+                cast_type: promoted,
+                expr: Box::new(e),
+            },
+            promoted,
+            pos,
+        )
+    }
+
+    fn bitfield_promoted_type(&mut self, e: &Expr) -> TypeId {
+        let declared = e.typ.unwrap_or(self.types.int_id);
+        let Some((bit_width, field_typ)) = self.bitfield_of(e) else {
+            return declared;
+        };
+        let int_bits = self.types.size_bits(self.types.int_id);
+        if bit_width < int_bits {
+            self.types.int_id
+        } else if bit_width == int_bits && self.types.is_unsigned(field_typ) {
+            self.types.uint_id
+        } else if bit_width == int_bits {
+            self.types.int_id
+        } else {
+            declared
+        }
+    }
+
     fn usual_arithmetic_conversions(&mut self, left: TypeId, right: TypeId) -> TypeId {
         self.types.common_type(left, right)
     }

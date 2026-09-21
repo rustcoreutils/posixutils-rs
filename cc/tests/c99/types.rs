@@ -1696,3 +1696,60 @@ int main(void) {
         0
     );
 }
+
+/// C17 6.3.1.1p2: a bit-field takes the integer promotions like any narrow
+/// integer -- to `int` when `int` can represent all its values, otherwise to
+/// `unsigned int`.
+///
+/// What makes this its own question is that the width is a property of the
+/// *member*, not of the type: an `unsigned int f : 7` has type
+/// `unsigned int`, so asking `integer_promote` about the type alone answers
+/// "no change" and `b.f - 2` comes out a huge unsigned value where C says -1.
+///
+/// The conversion is made explicit in the tree rather than only in the
+/// expression's result type, because a comparison takes its signedness from
+/// its operands and not from its own `int` result: left implicit,
+/// `b.u7 > -1` still compared unsigned and answered false.
+#[test]
+fn c99_bitfield_integer_promotion() {
+    let code = r#"
+struct b { signed int s7 : 7; unsigned int u7 : 7; unsigned int u31 : 31;
+           unsigned int u32 : 32; signed int s32 : 32; };
+struct w { unsigned long long b40 : 40; signed long long s40 : 40; };
+
+int main(void) {
+    struct b v; v.s7 = 1; v.u7 = 1; v.u31 = 1; v.u32 = 1; v.s32 = 1;
+
+    /* A field narrower than int promotes to int, whatever its own sign. */
+    if (v.u7 - 2 >= 0) return 1;
+    if (v.s7 - 2 >= 0) return 2;
+    if (v.u31 - 2 >= 0) return 3;
+    if (sizeof(v.u7 - 2) != sizeof(int)) return 4;
+
+    /* A cast forces the declared type back, so this one wraps. */
+    if ((unsigned)v.u7 - 2 < 0x7fffffffu) return 5;
+
+    /* A field exactly int-wide keeps its own signedness: int cannot hold
+       every value of an unsigned :32, so that one promotes to unsigned. */
+    if (v.u32 - 2 < 0x7fffffffu) return 6;
+    if (v.s32 - 2 >= 0) return 7;
+
+    /* Division and shift see the promoted signedness too. */
+    { struct b n; n.s7 = -8; if (n.s7 / 2 != -4) return 8; if (n.s7 >> 1 != -4) return 9; }
+    { struct b n; n.s7 = -8; if (n.s7 % 3 != -2) return 10; }
+
+    /* Comparison against a negative constant. */
+    { struct b n; n.u7 = 3; if (!(n.u7 > -1)) return 11; }
+
+    /* Wider than int: no promotion, the declared type stands. */
+    { struct w w1; w1.b40 = 1; if (sizeof(w1.b40 + 0) != sizeof(unsigned long long)) return 12; }
+    { struct w w1; w1.s40 = -1; if (w1.s40 >= 0) return 13; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_bitfield_promotion", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_bitfield_promotion_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

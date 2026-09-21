@@ -5,11 +5,23 @@ target/
 .git/
 .gitignore
 
-# Documentation (not needed for build)
-*.md
+# Documentation (not needed for build).
+#
+# The leading `**/` is load-bearing: a bare `*.md` is matched against the whole
+# relative path, so it excludes README.md and misses cc/README.md, m4/docs/*.md
+# and eighteen others -- which then sit in the build context and invalidate
+# `COPY . .` on every documentation-only commit.
+**/*.md
 
 # CI/CD
 .github/
+
+# Container definitions. They are read by the builder, not copied into it;
+# without this, editing the Dockerfile invalidates the build context it
+# describes.
+Dockerfile*
+docker-compose*.yml
+.dockerignore
 
 # IDE
 .idea/

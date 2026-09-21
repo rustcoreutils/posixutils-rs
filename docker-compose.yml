@@ -1,8 +1,30 @@
+# Interactive toolbox: `docker compose run --rm posixutils`.
+#
+# The image's /usr/local/bin precedes /usr/bin, so inside the container `ls`,
+# `sort`, `tar` and the rest are ours, not the distro's.
+
 services:
   posixutils:
-    build: .
+    build:
+      context: .
+      args:
+        # Stamped into org.opencontainers.image.* so a locally built image does
+        # not inherit the base image's version label.
+        VERSION: "0.9.0"
+    image: posixutils-rs:local
+    init: true
     stdin_open: true
     tty: true
+    # The utilities are the workload; none of them needs a privilege.
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      # /tmp for the utilities' own scratch files, $HOME because a read-only
+      # root would otherwise leave the shell nowhere to write.
+      - /tmp:mode=1777
+      - /home/posixutils:uid=1000,gid=1000,mode=0755
     volumes:
       - .:/workspace:ro
     working_dir: /workspace

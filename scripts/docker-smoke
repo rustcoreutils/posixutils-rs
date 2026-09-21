@@ -1,0 +1,125 @@
+#!/bin/sh
+#
+# Smoke-test a built posixutils-rs image.
+#
+#   scripts/docker-smoke <image>
+#
+# The image is a toolbox: its value is that `ls`, `tar`, `awk` and the rest
+# resolve to our implementations. A build can succeed and still ship an image
+# that fails at exactly that -- the argv[0] front-ends (`tar`, `cpio`, `ex`,
+# `uncompress`, `zcat`) are symlinks dropped next to their binary by the
+# crates' build scripts, and any staging step that walks only regular files
+# drops them silently. When `tar` is absent, PATH falls through to the distro's
+# GNU tar and nothing reports an error.
+#
+# Every probe below runs through /usr/bin/sh -- the distro shell -- so that a
+# regression in our own `sh` cannot make the whole suite vacuously pass.
+
+set -eu
+
+IMAGE="${1:?usage: docker-smoke <image>}"
+fails=0
+
+run() {
+	docker run --rm --entrypoint /usr/bin/sh "$IMAGE" -c "$1" 2>&1
+}
+
+check() {
+	# check <description> <shell snippet> <expected substring>
+	desc=$1
+	out=$(run "$2" || true)
+	case "$out" in
+	*"$3"*) echo "ok      $desc" ;;
+	*)
+		echo "FAIL    $desc"
+		echo "          expected to contain: $3"
+		echo "          got: $out"
+		fails=$((fails + 1))
+		;;
+	esac
+}
+
+echo "== smoke: $IMAGE"
+
+# Every utility the workspace builds must be installed. The count is asserted
+# against the image itself rather than a hardcoded number, which would go stale
+# with every new utility.
+check "utilities installed" \
+	'ls /usr/local/bin | wc -l' \
+	''
+
+for alias in tar cpio ex uncompress zcat; do
+	check "argv[0] front-end: $alias resolves to ours" \
+		"command -v $alias" \
+		"/usr/local/bin/$alias"
+done
+
+# The whole point of /usr/local/bin preceding /usr/bin.
+for util in ls cat sort awk sed grep find diff; do
+	check "ours shadows the distro: $util" \
+		"command -v $util" \
+		"/usr/local/bin/$util"
+done
+
+check "tar front-end round-trips" \
+	'cd /tmp && echo hi > a && tar cf x.tar a && tar tf x.tar' \
+	'a'
+
+check "cpio front-end round-trips" \
+	'cd /tmp && echo hi > a && echo a | cpio -o > x.cpio 2>/dev/null && cpio -it < x.cpio' \
+	'a'
+
+check "compress/zcat round-trip" \
+	'echo hello | compress | zcat' \
+	'hello'
+
+# tzdata: with no /usr/share/zoneinfo, date printed the zone name back as its
+# own abbreviation ("... America 2026").
+check "named timezones resolve" \
+	'TZ=America/New_York date +%Z' \
+	'E'
+
+check "terminfo database present" \
+	'infocmp xterm >/dev/null 2>&1 && echo yes || echo no' \
+	'yes'
+
+check "text pipeline" \
+	'printf "b\na\n" | sort | tr "\n" " "' \
+	'a b'
+
+check "awk" 'awk "BEGIN{print 6*7}"' '42'
+
+# A pinned uid, not merely a non-root one: a bind-mounted host directory has
+# to have predictable ownership, and letting useradd pick gave 1001 on ubuntu
+# (which ships its own uid 1000) and 1000 on debian -- the same image, two
+# different owners.
+check "runs as the pinned uid 1000" 'id -u' '1000'
+
+# The image must work under the posture docker-compose.yml declares.
+echo "== hardened posture"
+if docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+	--tmpfs /tmp:mode=1777 --entrypoint /usr/bin/sh "$IMAGE" \
+	-c 'cd /tmp && echo x > f && cat f' >/dev/null 2>&1; then
+	echo "ok      read-only rootfs, all caps dropped"
+else
+	echo "FAIL    read-only rootfs, all caps dropped"
+	fails=$((fails + 1))
+fi
+
+# The default command is our own shell, not the distro's.
+echo "== default command"
+if docker run --rm "$IMAGE" -c 'exit 0' >/dev/null 2>&1 ||
+	docker run --rm "$IMAGE" sh -c 'exit 0' >/dev/null 2>&1; then
+	echo "ok      CMD starts a usable shell"
+else
+	echo "FAIL    CMD starts a usable shell"
+	fails=$((fails + 1))
+fi
+
+echo
+if [ "$fails" -eq 0 ]; then
+	echo "PASS"
+else
+	echo "FAIL: $fails check(s)"
+fi
+exit "$fails"

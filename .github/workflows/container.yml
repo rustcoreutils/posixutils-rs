@@ -11,7 +11,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.head_ref || github.ref }}
@@ -29,6 +28,10 @@ jobs:
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      # Only the push paths use this; a fork PR gets a read-only token anyway.
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -40,10 +43,21 @@ jobs:
             platform: linux/arm64
             arch: arm64
     steps:
+      # The commit to build. On workflow_run, github.sha is the default
+      # branch's head at dispatch time, which is not necessarily the commit
+      # whose tests passed -- so a tag derived from it can name an image built
+      # from different source.
+      - name: Resolve commit
+        id: commit
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          FALLBACK_SHA: ${{ github.sha }}
+        run: echo "sha=${HEAD_SHA:-$FALLBACK_SHA}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.workflow_run.head_sha || '' }}
+          ref: ${{ steps.commit.outputs.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -62,6 +76,26 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
+      # Build once into the runner's image store and prove the result works
+      # before anything is pushed. Every layer is reused by the push step
+      # below, so this costs a load, not a second build.
+      #
+      # This is the step that catches what a green `docker build` cannot: an
+      # image that builds cleanly and is missing utilities.
+      - name: Build for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: posixutils:ci
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=min
+
+      - name: Smoke test
+        run: ./scripts/docker-smoke posixutils:ci
+
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6
@@ -69,6 +103,8 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
           outputs: >-
             type=image,
             name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},
@@ -76,7 +112,7 @@ jobs:
             name-canonical=true,
             push=${{ github.event_name != 'pull_request' }}
           cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=min
 
       - name: Export digest
         if: github.event_name != 'pull_request'
@@ -99,7 +135,17 @@ jobs:
     timeout-minutes: 10
     if: github.event_name != 'pull_request'
     needs: build
+    permissions:
+      contents: read
+      packages: write
     steps:
+      - name: Resolve commit
+        id: commit
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          FALLBACK_SHA: ${{ github.sha }}
+        run: echo "sha=${HEAD_SHA:-$FALLBACK_SHA}" >> "$GITHUB_OUTPUT"
+
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
@@ -124,7 +170,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=edge,branch=main
-            type=sha,prefix=sha-
+            type=sha,prefix=sha-,value=${{ steps.commit.outputs.sha }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}

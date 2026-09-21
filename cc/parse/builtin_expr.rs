@@ -288,6 +288,38 @@ impl Parser<'_> {
 
             // Checked arithmetic: compute exactly, store the wrapped
             // result, and answer whether wrapping lost anything.
+            crate::kw::BUILTIN_ADD_OVERFLOW_P
+            | crate::kw::BUILTIN_SUB_OVERFLOW_P
+            | crate::kw::BUILTIN_MUL_OVERFLOW_P => Some((|| {
+                // `__builtin_<op>_overflow_p(a, b, type_value)` asks the same
+                // question as the storing form and answers it the same way,
+                // but names the destination type with a *value* rather than a
+                // pointer to one, and writes nothing. The argument is still
+                // *evaluated*, as gcc evaluates it: only its value is unused.
+                let op = match name_id {
+                    crate::kw::BUILTIN_ADD_OVERFLOW_P => CheckedOp::Add,
+                    crate::kw::BUILTIN_SUB_OVERFLOW_P => CheckedOp::Sub,
+                    _ => CheckedOp::Mul,
+                };
+                self.expect_special(b'(')?;
+                let a = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let b = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let res = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::CheckedArith {
+                        op,
+                        a: Box::new(a),
+                        b: Box::new(b),
+                        res: Box::new(res),
+                        store: false,
+                    },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
             crate::kw::BUILTIN_ADD_OVERFLOW
             | crate::kw::BUILTIN_SADD_OVERFLOW
             | crate::kw::BUILTIN_SADDL_OVERFLOW
@@ -308,6 +340,7 @@ impl Parser<'_> {
                         a: Box::new(a),
                         b: Box::new(b),
                         res: Box::new(res),
+                        store: true,
                     },
                     self.types.int_id,
                     token_pos,
@@ -333,6 +366,7 @@ impl Parser<'_> {
                         a: Box::new(a),
                         b: Box::new(b),
                         res: Box::new(res),
+                        store: true,
                     },
                     self.types.int_id,
                     token_pos,
@@ -358,6 +392,7 @@ impl Parser<'_> {
                         a: Box::new(a),
                         b: Box::new(b),
                         res: Box::new(res),
+                        store: true,
                     },
                     self.types.int_id,
                     token_pos,

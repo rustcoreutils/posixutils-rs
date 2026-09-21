@@ -482,8 +482,16 @@ pub enum ExprKind {
         op: CheckedOp,
         a: Box<Expr>,
         b: Box<Expr>,
-        /// Pointer to where the wrapped result goes.
+        /// Where the wrapped result goes, and what its type is.
+        ///
+        /// For the `__builtin_*_overflow` forms this is a *pointer* to the
+        /// destination, and the wrapped result is stored through it. For the
+        /// `_p` forms it is a plain value that is never evaluated: gcc takes
+        /// it for its type alone, to say what "fits" is being asked about.
         res: Box<Expr>,
+        /// False for the `_p` forms: `res` is a value, not a pointer, and
+        /// nothing is stored.
+        store: bool,
     },
 
     /// __builtin_ctzll(x)

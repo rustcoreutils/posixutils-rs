@@ -158,6 +158,9 @@ result did not fit, 0 if it did — so the result is written either way.
 | `__builtin_add_overflow(a, b, *r)` | Type-generic; the operands and `*r` may differ in type |
 | `__builtin_sub_overflow(a, b, *r)` | |
 | `__builtin_mul_overflow(a, b, *r)` | |
+| `__builtin_add_overflow_p(a, b, v)` | The same question, answered without storing. `v` names the destination type with a *value* rather than a pointer; it is still evaluated, as gcc evaluates it, but its value is unused |
+| `__builtin_sub_overflow_p(a, b, v)` | |
+| `__builtin_mul_overflow_p(a, b, v)` | |
 | `__builtin_sadd_overflow(a, b, *r)` | Add, `int` |
 | `__builtin_saddl_overflow(a, b, *r)` | Add, `long` |
 | `__builtin_saddll_overflow(a, b, *r)` | Add, `long long` |

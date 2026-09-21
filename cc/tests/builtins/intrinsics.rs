@@ -630,3 +630,52 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("builtins_classify_type", code, &[]), 0);
 }
+
+/// `__builtin_{add,sub,mul}_overflow_p` — the same question as the storing
+/// forms, answered without storing.
+///
+/// The destination type is named by a *value* rather than a pointer to one,
+/// and that value is never evaluated: gcc reads its type and nothing else.
+/// So a side effect in the third argument must not happen, which is the one
+/// thing an implementation built on the storing form would get wrong.
+#[test]
+fn builtins_checked_arith_overflow_p() {
+    let code = r#"
+#include <limits.h>
+
+int main(void) {
+    /* The flag matches the storing form's, with nothing written. */
+    if (!__builtin_add_overflow_p(INT_MAX, 1, (int)0)) return 1;
+    if (__builtin_add_overflow_p(1, 1, (int)0)) return 2;
+    if (!__builtin_sub_overflow_p(0u, 1u, (unsigned)0)) return 3;
+    if (__builtin_sub_overflow_p(5, 1, (int)0)) return 4;
+    if (!__builtin_mul_overflow_p(INT_MAX, 2, (int)0)) return 5;
+    if (__builtin_mul_overflow_p(3, 4, (int)0)) return 6;
+
+    /* It is the *destination* type that decides, not the operands'. */
+    if (!__builtin_add_overflow_p(200, 100, (char)0)) return 7;
+    if (__builtin_add_overflow_p(200, 100, (long)0)) return 8;
+    if (!__builtin_mul_overflow_p(70000, 70000, (int)0)) return 9;
+    if (__builtin_mul_overflow_p(70000, 70000, (long long)0)) return 10;
+
+    /* A negative result is unrepresentable in an unsigned destination. */
+    if (!__builtin_sub_overflow_p(1, 2, (unsigned)0)) return 11;
+    if (__builtin_sub_overflow_p(1, 2, (int)0)) return 12;
+
+    /* The third argument is used for its type, and still evaluated -- gcc
+       increments `i` here, so we must too. */
+    { int i = 0; if (__builtin_add_overflow_p(1, 1, i++)) return 13;
+      if (i != 1) return 14; }
+
+    /* The storing forms still store, which the flag must not have disturbed. */
+    { int r = 99; if (__builtin_add_overflow(1, 2, &r)) return 15;
+      if (r != 3) return 16; }
+
+    if (!__has_builtin(__builtin_add_overflow_p)) return 17;
+    if (!__has_builtin(__builtin_sub_overflow_p)) return 18;
+    if (!__has_builtin(__builtin_mul_overflow_p)) return 19;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("builtins_overflow_p", code, &[]), 0);
+}

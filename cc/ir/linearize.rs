@@ -5373,14 +5373,19 @@ impl<'a> Linearizer<'a> {
         a: &Expr,
         b: &Expr,
         res: &Expr,
+        store: bool,
     ) -> PseudoId {
         let a_typ = self.expr_type(a);
         let b_typ = self.expr_type(b);
-        let res_ptr_typ = self.expr_type(res);
-        let dst_typ = self
-            .types
-            .base_type(res_ptr_typ)
-            .unwrap_or(self.types.int_id);
+        let res_typ = self.expr_type(res);
+        // The `_p` forms name the destination type with a value rather than a
+        // pointer to one, and store nothing -- so the type to ask about is
+        // `res`'s own, not its pointee's.
+        let dst_typ = if store {
+            self.types.base_type(res_typ).unwrap_or(self.types.int_id)
+        } else {
+            res_typ
+        };
 
         let all_unsigned = self.types.is_unsigned(a_typ)
             && self.types.is_unsigned(b_typ)
@@ -5408,6 +5413,12 @@ impl<'a> Linearizer<'a> {
 
         let av = self.linearize_expr(a);
         let bv = self.linearize_expr(b);
+        // Evaluated either way. For the storing forms this is the address to
+        // write through; for the `_p` forms the value is discarded, but gcc
+        // still evaluates the argument -- `__builtin_add_overflow_p(1, 1, i++)`
+        // increments `i` -- and a side effect that happens under gcc and not
+        // here is exactly the kind of difference that goes unnoticed until it
+        // changes a result.
         let addr = self.linearize_expr(res);
 
         let aw = self.emit_convert(av, a_typ, wide);
@@ -5459,7 +5470,9 @@ impl<'a> Linearizer<'a> {
                 let exact = self.emit_binary(bin, aw, bw, wide, wide);
                 let dst_size = self.types.size_bits(dst_typ);
                 let narrowed = self.emit_convert(exact, wide, dst_typ);
-                self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
+                if store {
+                    self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
+                }
                 // `wide` is unsigned only when the destination is too,
                 // so the two agree except when a signed exact value has
                 // to land in an unsigned destination -- where the
@@ -5480,7 +5493,9 @@ impl<'a> Linearizer<'a> {
 
         let narrowed = self.emit_convert(exact, wide, dst_typ);
         let dst_size = self.types.size_bits(dst_typ);
-        self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
+        if store {
+            self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
+        }
 
         let back = self.emit_convert(narrowed, dst_typ, wide);
         self.emit_binary(BinaryOp::Ne, exact, back, self.types.int_id, wide)
@@ -5708,7 +5723,13 @@ impl<'a> Linearizer<'a> {
             // Signedness of the wide type follows the operands: a product of
             // two 64-bit unsigned values can exceed the signed 128-bit range,
             // so all-unsigned operands compute unsigned.
-            ExprKind::CheckedArith { op, a, b, res } => self.linearize_checked_arith(op, a, b, res),
+            ExprKind::CheckedArith {
+                op,
+                a,
+                b,
+                res,
+                store,
+            } => self.linearize_checked_arith(op, a, b, res, *store),
 
             ExprKind::IntLit(val) => {
                 let typ = self.expr_type(expr);

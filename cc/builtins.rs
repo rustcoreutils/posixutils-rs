@@ -84,6 +84,9 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_strstr",
     // Checked arithmetic
     "__builtin_add_overflow",
+    "__builtin_add_overflow_p",
+    "__builtin_sub_overflow_p",
+    "__builtin_mul_overflow_p",
     "__builtin_sub_overflow",
     "__builtin_mul_overflow",
     "__builtin_sadd_overflow",

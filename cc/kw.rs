@@ -314,6 +314,9 @@ define_keywords! {
     (BUILTIN_STRSTR,    "__builtin_strstr",   BUILTIN),
     // ---- Checked arithmetic (C23 spells these ckd_add and friends) ----
     (BUILTIN_ADD_OVERFLOW, "__builtin_add_overflow", BUILTIN),
+    (BUILTIN_ADD_OVERFLOW_P, "__builtin_add_overflow_p", BUILTIN),
+    (BUILTIN_SUB_OVERFLOW_P, "__builtin_sub_overflow_p", BUILTIN),
+    (BUILTIN_MUL_OVERFLOW_P, "__builtin_mul_overflow_p", BUILTIN),
     (BUILTIN_SUB_OVERFLOW, "__builtin_sub_overflow", BUILTIN),
     (BUILTIN_MUL_OVERFLOW, "__builtin_mul_overflow", BUILTIN),
     (BUILTIN_SADD_OVERFLOW, "__builtin_sadd_overflow", BUILTIN),

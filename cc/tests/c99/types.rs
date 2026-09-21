@@ -1753,3 +1753,76 @@ int main(void) {
         0
     );
 }
+
+/// Unary `-` and `~` take the integer promotions too (C17 6.5.3.3p3, p4), and
+/// that includes the bit-field rule.
+///
+/// Both operators open-coded the promotion as a `TypeKind` test for
+/// `_Bool`/`char`/`short`. That is right as far as it goes and cannot see a
+/// bit-field at all, because the width is a property of the member rather than
+/// of the type — so `-v.u7 < 0` was false where C and gcc say true. A gap in
+/// the commit that added bit-field promotion for the *binary* operators: the
+/// rule went in one place and the unary operators kept their own copy.
+///
+/// Both now route through the same helper, which is the point: two copies of a
+/// promotion rule is how this happened.
+#[test]
+fn c99_unary_operators_promote_bitfields() {
+    let code = r#"
+struct B {
+    unsigned u7  : 7;
+    signed   s7  : 7;
+    unsigned u31 : 31;
+    unsigned u32 : 32;   /* int cannot hold all of these: stays unsigned */
+    unsigned long long u40 : 40;  /* wider than int: no promotion */
+};
+
+int main(void) {
+    struct B v;
+    v.u7 = 1; v.s7 = 1; v.u31 = 1; v.u32 = 1; v.u40 = 1;
+
+    /* Narrower than int promotes to int, so the result is signed. */
+    if (!(-v.u7  < 0)) return 1;
+    if (!(~v.u7  < 0)) return 2;
+    if (!(-v.s7  < 0)) return 3;
+    if (!(~v.s7  < 0)) return 4;
+    if (!(-v.u31 < 0)) return 5;
+    if (!(~v.u31 < 0)) return 6;
+
+    /* Exactly int-wide and unsigned: int cannot represent it, so it stays
+       unsigned and the negation wraps instead of going negative. */
+    if (-v.u32 < 0) return 7;
+    if (~v.u32 < 0) return 8;
+
+    /* Wider than int: the declared type stands, and it is unsigned. */
+    if (-v.u40 < 0) return 9;
+
+    /* The promoted type is int, so sizeof says 4 even for a 7-bit field. */
+    if (sizeof(-v.u7) != sizeof(int)) return 10;
+    if (sizeof(~v.u7) != sizeof(int)) return 11;
+
+    /* An explicit cast still forces the declared type back. */
+    if ((unsigned)v.u7 - 2 < 0x7fffffffu) return 12;
+
+    /* Unary + is a no-op but must not undo the promotion either. */
+    if (!(-(+v.u7) < 0)) return 13;
+
+    /* And the ordinary narrow integers still promote as they always did. */
+    { unsigned char c = 1; if (!(-c < 0)) return 14; }
+    { unsigned short h = 1; if (!(~h < 0)) return 15; }
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_unary_bitfield_promotion", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run(
+            "c99_unary_bitfield_promotion_o2",
+            code,
+            &["-O2".to_string()]
+        ),
+        0
+    );
+}

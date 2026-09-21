@@ -719,16 +719,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
-            // C99 6.3.1.1: integer promotion — types smaller than int promote to int
-            let op_typ = operand.typ.unwrap_or(self.types.int_id);
-            let typ = {
-                let kind = self.types.kind(op_typ);
-                if matches!(kind, TypeKind::Bool | TypeKind::Char | TypeKind::Short) {
-                    self.types.int_id
-                } else {
-                    op_typ
-                }
-            };
+            let (operand, typ) = self.promote_unary_operand(operand);
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::Neg,
@@ -743,17 +734,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
-            // BitNot: C99 integer promotion - types smaller than int promote to int
-            let op_typ = operand.typ.unwrap_or(self.types.int_id);
-            // Apply integer promotion: _Bool, char, short -> int
-            let typ = {
-                let kind = self.types.kind(op_typ);
-                if matches!(kind, TypeKind::Bool | TypeKind::Char | TypeKind::Short) {
-                    self.types.int_id
-                } else {
-                    op_typ
-                }
-            };
+            let (operand, typ) = self.promote_unary_operand(operand);
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::BitNot,
@@ -1584,6 +1565,29 @@ impl<'a> Parser<'a> {
     /// A field at least as wide as `int` is left alone, which covers both an
     /// `unsigned int f:32` (which stays unsigned, since `int` cannot hold all
     /// of it) and a `long long b:40` (whose declared type is already wider).
+    /// The integer promotions, for the operand of unary `-` or `~`.
+    ///
+    /// C17 6.5.3.3p3 and p4: both perform the integer promotions on their
+    /// operand, and the result has the promoted type. `-` and `~` had each
+    /// open-coded that as a `TypeKind` test for `_Bool`/`char`/`short`, which
+    /// is right as far as it goes and misses bit-fields entirely -- the width
+    /// is a property of the member, not of the type, so no test on `TypeKind`
+    /// can see it. `-v.u7 < 0` was false where C and gcc say true.
+    ///
+    /// Returns the operand, wrapped in a conversion if it needed one, together
+    /// with the promoted type. Going through `promote_bitfield_operand` keeps
+    /// the one rule in one place: the binary operators already use it, and two
+    /// copies of a promotion rule is how this went wrong to begin with.
+    fn promote_unary_operand(&mut self, operand: Expr) -> (Expr, TypeId) {
+        let operand = self.promote_bitfield_operand(operand);
+        let op_typ = operand.typ.unwrap_or(self.types.int_id);
+        let typ = match self.types.kind(op_typ) {
+            TypeKind::Bool | TypeKind::Char | TypeKind::Short => self.types.int_id,
+            _ => op_typ,
+        };
+        (operand, typ)
+    }
+
     /// Wrap a bit-field operand in the conversion C17 6.3.1.1p2 calls for.
     ///
     /// A no-op for anything else, and for a field that does not promote.

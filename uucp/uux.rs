@@ -11,7 +11,7 @@
 //! POSIX-compliant implementation using SSH for transport.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use posixutils_uucp::common::{
     current_login, expand_remote_path, generate_job_id, is_local_system, parse_path_spec,
     send_mail, shell_escape, ssh_exec, ssh_fetch_file, ssh_send_file,
@@ -41,9 +41,7 @@ struct Args {
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").ok();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+    plib::diag::init_locale("uux");
 
     let args = Args::parse();
 

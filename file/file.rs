@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::{fs, io};
 
 use clap::{CommandFactory, FromArgMatches, Parser};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 
 use crate::magic::{get_type_from_magic_file_dbs, ReadSeek, DEFAULT_MAGIC_FILE};
 
@@ -354,9 +354,7 @@ fn analyze_stdin(args: &Args, magic_files: &[PathBuf]) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("file");
 
     let matches = Args::command().get_matches();
     let args = Args::from_arg_matches(&matches)?;

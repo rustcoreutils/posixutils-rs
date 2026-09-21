@@ -20,7 +20,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use libc::{
     geteuid, getgrgid, getgrnam, getpwnam, getpwuid, isatty, ttyname, STDERR_FILENO, STDIN_FILENO,
     STDOUT_FILENO,
@@ -685,11 +685,7 @@ fn get_field_value(proc: &platform::ProcessInfo, field: &str, ctx: &Context) -> 
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    if let Err(e) = textdomain("posixutils-rs") {
-        eprintln!("Warning: {}", e);
-    }
-    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+    plib::diag::init_locale("ps");
 
     let args = Args::parse();
 

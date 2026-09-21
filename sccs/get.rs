@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::sccsfile::{paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Sid};
 use posixutils_sccs::{cutoff, diag, idkw, operands, pfile, protect, sfio, zlock};
 
@@ -948,9 +948,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").ok();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+    plib::diag::init_locale("get");
 
     // `get -e` takes the z-file lock and registers it for cleanup; without the
     // handler installed the registry is inert and ^C strands z.<name>.

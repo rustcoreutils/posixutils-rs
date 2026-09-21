@@ -15,7 +15,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitCode};
 
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::sccsfile::paths;
 
 fn usage() -> ! {
@@ -335,9 +335,7 @@ fn get_editing_info(
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").ok();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+    plib::diag::init_locale("sccs");
 
     let args: Vec<String> = env::args().collect();
 

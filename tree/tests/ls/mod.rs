@@ -895,3 +895,13 @@ fn ls_reports_a_bad_operand_and_still_lists_the_good_one() {
         "the good operand must still be listed: {stdout:?}"
     );
 }
+
+/// `ls -R /usr | head` must die by SIGPIPE, not panic with exit 101.
+///
+/// Rust ignores SIGPIPE before `main`, so every utility in the tree had this
+/// gap until `plib::diag::init_locale` started restoring the default. `ls` is
+/// the one a user hits first.
+#[test]
+fn test_ls_dies_by_sigpipe_on_a_closed_pipe() {
+    plib::testing::assert_dies_by_sigpipe("ls", &["-R", "/usr"]);
+}

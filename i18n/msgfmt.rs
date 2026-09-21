@@ -13,7 +13,7 @@
 //! into machine object (.mo) files for use by gettext functions.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use posixutils_i18n::gettext_lib::mo_file::MO_MAGIC_LE;
 use posixutils_i18n::gettext_lib::po_file::PoFile;
 use std::collections::HashMap;
@@ -84,12 +84,7 @@ impl std::fmt::Display for Diagnostic {
 }
 
 fn main() {
-    // Set up localization
-    setlocale(LocaleCategory::LcAll, "");
-    if textdomain("posixutils-rs").is_err() {
-        // Ignore error - translation may not be available
-    }
-    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+    plib::diag::init_locale("msgfmt");
 
     let args = Args::parse();
 

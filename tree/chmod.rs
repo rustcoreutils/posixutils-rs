@@ -11,7 +11,7 @@ mod common;
 
 use self::common::error_string;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use modestr::ChmodMode;
 use plib::modestr;
 use std::{cell::RefCell, io, os::unix::fs::MetadataExt};
@@ -127,9 +127,7 @@ fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io:
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("chmod");
 
     let args = Args::parse();
 

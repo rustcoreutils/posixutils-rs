@@ -11,7 +11,7 @@ mod ls_util;
 
 use self::ls_util::{ls_from_utf8_lossy, Entry, LongFormatPadding, MultiColumnPadding};
 use clap::{CommandFactory, FromArgMatches, Parser};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::platform::P_WINSIZE_REQUEST_CODE;
 use std::{
     collections::HashMap,
@@ -1270,9 +1270,7 @@ fn process_single_dir(
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").unwrap();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    plib::diag::init_locale("ls");
     let (config, paths) = Config::new();
 
     match ls(paths, &config) {

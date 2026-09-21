@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use libc::{pathconf, sysconf};
 
 #[derive(Parser)]
@@ -1054,9 +1054,7 @@ fn load_pathconf_mapping() -> HashMap<&'static str, libc::c_int> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("getconf");
 
     let args = Args::parse();
 

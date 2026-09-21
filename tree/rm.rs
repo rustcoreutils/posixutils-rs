@@ -12,7 +12,7 @@ mod common;
 use self::common::error_string;
 use clap::Parser;
 use ftw::{self, traverse_directory};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use std::{
     ffi::{CStr, CString},
     fs,
@@ -578,9 +578,7 @@ fn rm_path(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("rm");
 
     let args = Args::parse();
 

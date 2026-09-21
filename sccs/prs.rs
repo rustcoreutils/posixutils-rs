@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::sccsfile::{paths, DeltaEntry, DeltaType, SccsFile, SccsFlag, Sid};
 use posixutils_sccs::{cutoff, diag, operands};
 
@@ -593,9 +593,7 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").ok();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+    plib::diag::init_locale("prs");
 
     // The -r option-argument is optional and "cannot be presented as a separate
     // argument" (POSIX). Rewrite a bare "-r" to "-r=" so clap treats it as an

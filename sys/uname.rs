@@ -10,7 +10,7 @@
 use std::ffi::CStr;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 
 /// uname - return system name
 //
@@ -98,9 +98,7 @@ fn print_info(args: &Args, info: &UnameInfo) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("uname");
 
     let mut args = Args::parse();
 

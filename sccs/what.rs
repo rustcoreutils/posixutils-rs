@@ -12,7 +12,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 
 #[derive(Parser)]
 #[command(version, about = gettext("what - identify SCCS files"))]
@@ -99,9 +99,7 @@ fn process_file<R: BufRead>(mut reader: R, single: bool, out: &mut impl Write) -
 }
 
 fn main() -> io::Result<()> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("what");
 
     let args = Args::parse();
     let mut any_found = false;

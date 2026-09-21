@@ -32,9 +32,7 @@ mod token;
 mod types;
 
 use clap::Parser;
-use gettextrs::{
-    bind_textdomain_codeset, gettext, gettext_args, setlocale, textdomain, LocaleCategory,
-};
+use gettextrs::{gettext, gettext_args};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -1982,9 +1980,7 @@ fn pie_enabled(args: &Args, target: &Target) -> bool {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("c17");
 
     let argv = preprocess_args();
     // Rescan for the -L/-l/-R order relative to the operands, which clap's

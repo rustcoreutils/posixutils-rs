@@ -19,7 +19,7 @@ use plib::io::input_stream_dashed;
 use plib::locale;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 
 /// sort - sort, merge, or sequence check text files
 #[derive(Parser)]
@@ -763,9 +763,7 @@ fn merge_records(
 }
 
 fn main() {
-    setlocale(LocaleCategory::LcAll, "");
-    let _ = textdomain("posixutils-rs");
-    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+    plib::diag::init_locale("sort");
 
     let args = Args::parse();
 

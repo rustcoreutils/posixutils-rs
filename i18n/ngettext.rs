@@ -14,7 +14,7 @@
 //! choosing the appropriate plural form based on a count value.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use posixutils_i18n::gettext_lib::lookup::{expand_escapes, MessageLookup};
 use std::process::exit;
 
@@ -47,12 +47,7 @@ struct Args {
 }
 
 fn main() {
-    // Set up localization
-    setlocale(LocaleCategory::LcAll, "");
-    if textdomain("posixutils-rs").is_err() {
-        // Ignore error - translation may not be available
-    }
-    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+    plib::diag::init_locale("ngettext");
 
     let args = Args::parse();
 

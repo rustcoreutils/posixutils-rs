@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use modestr::ChmodMode;
 use plib::modestr;
 use std::ffi::CString;
@@ -112,9 +112,7 @@ fn do_mkdir(dirname: &str, mode: &ChmodMode, parents: bool, explicit_mode: bool)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("mkdir");
 
     let args = Args::parse();
 

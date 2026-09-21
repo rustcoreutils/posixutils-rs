@@ -543,9 +543,6 @@ fn write_result(bytes: &[u8]) -> std::io::Result<()> {
 fn main() {
     // Before anything opens a file, including the message catalog.
     plib::io::ensure_std_fds_open();
-    // A closed pipe should kill this process the way it kills the historical
-    // utilities, rather than being reported as a write failure.
-    plib::io::restore_sigpipe();
     diag::init_locale("expr");
 
     // tokenize and evaluate the expression

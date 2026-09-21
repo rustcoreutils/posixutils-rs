@@ -14,7 +14,7 @@
 mod ed;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use std::io::{self, BufReader, BufWriter};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -78,9 +78,7 @@ fn setup_signals() {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").ok();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+    plib::diag::init_locale("ed");
 
     let args = Args::parse();
 

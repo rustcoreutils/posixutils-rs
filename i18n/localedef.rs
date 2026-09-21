@@ -14,7 +14,7 @@
 //! whose operational behavior is determined by locale settings.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use posixutils_i18n::locale_lib::types::{
     LC_MESSAGES_KEYWORDS, LC_MONETARY_KEYWORDS, LC_NUMERIC_KEYWORDS, LC_TIME_KEYWORDS,
 };
@@ -154,12 +154,7 @@ impl Diagnostic {
 }
 
 fn main() {
-    // Set up localization
-    setlocale(LocaleCategory::LcAll, "");
-    if textdomain("posixutils-rs").is_err() {
-        // Ignore error
-    }
-    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+    plib::diag::init_locale("localedef");
 
     let args = Args::parse();
 

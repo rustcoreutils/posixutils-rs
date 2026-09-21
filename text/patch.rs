@@ -14,7 +14,7 @@
 mod patch_util;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use patch_util::{
     applier::PatchApplier,
     file_ops::{
@@ -307,9 +307,7 @@ fn run(args: Args) -> Result<bool, PatchError> {
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").unwrap();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    plib::diag::init_locale("patch");
 
     let args = Args::parse();
 

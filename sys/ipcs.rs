@@ -9,7 +9,7 @@
 
 use chrono::{Local, TimeZone};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use std::ffi::CStr;
 use std::io;
 
@@ -815,9 +815,7 @@ fn display_ipc_status(args: &Args) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("ipcs");
 
     let mut args = Args::parse();
 

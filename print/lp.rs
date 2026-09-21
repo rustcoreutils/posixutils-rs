@@ -15,7 +15,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use ipp::prelude::*;
 use num_traits::ToPrimitive;
 
@@ -452,9 +452,7 @@ fn do_lp(mut args: Args) -> Result<bool, String> {
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").ok();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+    plib::diag::init_locale("lp");
 
     let args = Args::parse();
 

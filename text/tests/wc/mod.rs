@@ -190,3 +190,19 @@ fn wc_double_dash_ends_options() {
     assert_eq!(stdout, format!("1 {}\n", f.display()), "got {stdout:?}");
     let _ = std::fs::remove_file(f);
 }
+
+/// `wc -l` over many operands into a closed pipe must die by SIGPIPE.
+/// See `plib::testing::assert_dies_by_sigpipe`.
+#[test]
+fn test_wc_dies_by_sigpipe_on_a_closed_pipe() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let mut operands = Vec::new();
+    for n in 0..2_000 {
+        let p = dir.path().join(format!("f{n}"));
+        std::fs::write(&p, "x\n").unwrap();
+        operands.push(p.to_str().unwrap().to_string());
+    }
+    let refs: Vec<&str> = operands.iter().map(String::as_str).collect();
+
+    plib::testing::assert_dies_by_sigpipe("wc", &refs);
+}

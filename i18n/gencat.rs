@@ -9,7 +9,7 @@
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian, NativeEndian, WriteBytesExt};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::io::input_stream;
 use plib::locale::mb_char_slices;
 use posixutils_i18n::bytes::{trim, trim_end};
@@ -1053,9 +1053,7 @@ impl MessageCatalog {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    plib::diag::init_locale("gencat");
 
     let args = Args::parse();
 

@@ -12,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use terminfo::{capability as cap, Database};
 
 // POSIX exit codes for tput
@@ -146,13 +146,7 @@ fn process_operand(info: &Database, operand: &str) -> Result<(), u8> {
 }
 
 fn main() -> ExitCode {
-    setlocale(LocaleCategory::LcAll, "");
-    if textdomain("posixutils-rs").is_err() {
-        return ExitCode::from(EXIT_OTHER_ERROR);
-    }
-    if bind_textdomain_codeset("posixutils-rs", "UTF-8").is_err() {
-        return ExitCode::from(EXIT_OTHER_ERROR);
-    }
+    plib::diag::init_locale("tput");
 
     let args = match Args::try_parse() {
         Ok(a) => a,

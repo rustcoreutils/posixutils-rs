@@ -32,7 +32,7 @@ use cli::ProgramMode;
 use compression::{is_gzip, GzipReader, GzipWriter};
 use error::{PaxError, PaxResult};
 use formats::CpioFormat;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use modes::copy::CopyOptions;
 use modes::list::ListOptions;
 use modes::read::ReadOptions;
@@ -210,9 +210,11 @@ fn main() -> ExitCode {
     // Initialize locale so LC_* environment variables affect locale-sensitive
     // libc formatting (e.g. LC_TIME month names in the `-v` listing time, via
     // the strftime time formatter).
-    setlocale(LocaleCategory::LcAll, "");
-    let _ = textdomain("posixutils-rs");
-    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+    plib::diag::init_locale("pax");
+    // `modes::is_fatal` already treats a broken pipe as the signal to stop the
+    // whole operation and report it once, rather than per member. Dying by the
+    // signal instead would skip that, and with it the diagnostic.
+    plib::io::ignore_sigpipe();
     // glibc's localtime_r (used by the strftime time formatter) does not call
     // tzset() itself, so initialize the timezone from $TZ once up front. The
     // symbol is not surfaced by the `libc` crate, so declare it directly.

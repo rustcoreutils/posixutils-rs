@@ -1454,32 +1454,48 @@ impl<'a> super::linearize::Linearizer<'a> {
             None
         };
 
-        // Build switch instruction with case -> block mapping
-        let switch_cases: Vec<(i64, i64, BasicBlockId)> = case_values
-            .iter()
-            .zip(case_bbs.iter())
-            .map(|((lo, hi), bb)| (*lo, *hi, *bb))
-            .collect();
-
         // Default goes to default_bb if present, otherwise exit_bb
         let default_target = default_bb.unwrap_or(exit_bb);
 
-        // Emit switch instruction
-        self.emit(Instruction::switch_insn(
-            switch_val,
-            switch_cases.clone(),
-            Some(default_target),
-            size,
-        ));
+        if size > 64 {
+            // The `Switch` instruction carries its labels as `i64` and both
+            // backends compare in one general register, so a controlling
+            // expression wider than that had its high half ignored:
+            // `switch ((__int128)1 << 64)` matched `case 0:`. A wide switch
+            // is lowered to explicit comparisons instead, which go through
+            // the ordinary 128-bit compare path and are right at any width.
+            self.emit_wide_switch(
+                switch_val,
+                cmp_type,
+                &case_values,
+                &case_bbs,
+                default_target,
+            );
+        } else {
+            // Build switch instruction with case -> block mapping
+            let switch_cases: Vec<(i64, i64, BasicBlockId)> = case_values
+                .iter()
+                .zip(case_bbs.iter())
+                .map(|((lo, hi), bb)| (*lo as i64, *hi as i64, *bb))
+                .collect();
 
-        // Link CFG edges from current block to all case/default/exit blocks
-        if let Some(current) = self.current_bb {
-            for &(_, _, bb) in &switch_cases {
-                self.link_bb(current, bb);
-            }
-            self.link_bb(current, default_target);
-            if default_bb.is_none() {
-                self.link_bb(current, exit_bb);
+            // Emit switch instruction
+            self.emit(Instruction::switch_insn(
+                switch_val,
+                switch_cases.clone(),
+                Some(default_target),
+                size,
+            ));
+
+            // Link CFG edges from current block to all case/default/exit blocks
+            if let Some(current) = self.current_bb {
+                for &(_, _, bb) in &switch_cases {
+                    self.link_bb(current, bb);
+                }
+                self.link_bb(current, default_target);
+                if default_bb.is_none() {
+                    self.link_bb(current, exit_bb);
+                }
             }
         }
 
@@ -1521,7 +1537,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         &self,
         body: &Stmt,
         unsigned: bool,
-    ) -> (Vec<(i64, i64)>, bool) {
+    ) -> (Vec<(i128, i128)>, bool) {
         let mut case_values = Vec::new();
         let mut has_default = false;
 
@@ -1702,7 +1718,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn collect_cases_from_stmt(
         &self,
         stmt: &Stmt,
-        case_values: &mut Vec<(i64, i64)>,
+        case_values: &mut Vec<(i128, i128)>,
         has_default: &mut bool,
         unsigned: bool,
     ) {
@@ -1710,7 +1726,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Case(expr, high) => {
                 // Extract constant value from case expression
                 if let Some(val) = self.eval_const_expr(expr) {
-                    let val = val as i64; // switch cases truncated to i64
+                    // Kept at full width. Truncating to `i64` here was silent
+                    // and wrong for a `switch` on `__int128`: a label outside
+                    // the 64-bit range wrapped into it and could match a value
+                    // it does not equal.
 
                     // A GNU range `case lo ... hi:`. An absent high endpoint
                     // is the ordinary label, held as the degenerate range
@@ -1718,7 +1737,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let hi = match high {
                         None => Some(val),
                         Some(hi_expr) => match self.eval_const_expr(hi_expr) {
-                            Some(h) => Some(h as i64),
+                            Some(h) => Some(h),
                             None => {
                                 self.report_unfoldable_case(hi_expr);
                                 None
@@ -1731,18 +1750,20 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // extends that to overlapping ranges -- an overlap would
                     // otherwise make one arm silently unreachable, since the
                     // body walk resolves a label by finding the first match.
-                    // Order by the switch type's own signedness. The endpoints
-                    // are carried as `i64`, so an unsigned 64-bit bound above
-                    // `i64::MAX` looks negative: `case 0ul ... ULONG_MAX:` read
-                    // as an empty range and never matched.
-                    let below = |a: i64, b: i64| {
+                    // Order by the switch type's own signedness. The
+                    // endpoints are carried as `i128`, and an unsigned 64-bit
+                    // bound above `i64::MAX` is still positive there -- but an
+                    // unsigned *128-bit* one is not, so the reinterpretation
+                    // is still needed: `case 0ul ... ULONG_MAX:` read as an
+                    // empty range and never matched.
+                    let below = |a: i128, b: i128| {
                         if unsigned {
-                            (a as u64) < (b as u64)
+                            (a as u128) < (b as u128)
                         } else {
                             a < b
                         }
                     };
-                    let at_most = |a: i64, b: i64| !below(b, a);
+                    let at_most = |a: i128, b: i128| !below(b, a);
                     if below(hi, val) {
                         // GCC accepts an empty range, warns, and never matches
                         // it. Nothing is recorded, so nothing can overlap it.
@@ -2216,10 +2237,67 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Linearize switch body, switching basic blocks at case/default labels
+    /// Lower a `switch` whose controlling expression is wider than a general
+    /// register into explicit comparisons.
+    ///
+    /// The `Switch` instruction carries its labels as `i64` and both backends
+    /// compare the value in one register, so a `__int128` controlling
+    /// expression had its high half ignored -- `switch ((__int128)1 << 64)`
+    /// matched `case 0:`. Comparing explicitly goes through the ordinary
+    /// 128-bit compare path, which is right at any width, and keeps the case
+    /// constants at full precision too.
+    ///
+    /// Leaves the cursor on a block that falls into `default_target`, and
+    /// links every edge it creates.
+    fn emit_wide_switch(
+        &mut self,
+        switch_val: PseudoId,
+        cmp_type: TypeId,
+        case_values: &[(i128, i128)],
+        case_bbs: &[BasicBlockId],
+        default_target: BasicBlockId,
+    ) {
+        let size = self.types.size_bits(cmp_type);
+        let unsigned = self.types.is_unsigned(cmp_type);
+        // `>=` and `<=` for a range, in the controlling type's own signedness.
+        let (ge, le) = if unsigned {
+            (Opcode::SetAe, Opcode::SetBe)
+        } else {
+            (Opcode::SetGe, Opcode::SetLe)
+        };
+
+        for (&(lo, hi), &case_bb) in case_values.iter().zip(case_bbs.iter()) {
+            let Some(from) = self.current_bb else { return };
+            let next = self.alloc_bb();
+            let cond = if lo == hi {
+                let k = self.emit_const(lo, cmp_type);
+                self.emit_int_binop(Opcode::SetEq, switch_val, k, cmp_type, size)
+            } else {
+                // A GNU `case lo ... hi:` range.
+                let lo_k = self.emit_const(lo, cmp_type);
+                let hi_k = self.emit_const(hi, cmp_type);
+                let at_least = self.emit_int_binop(ge, switch_val, lo_k, cmp_type, size);
+                let at_most = self.emit_int_binop(le, switch_val, hi_k, cmp_type, size);
+                let int_typ = self.types.int_id;
+                let int_bits = self.types.size_bits(int_typ);
+                self.emit_int_binop(Opcode::And, at_least, at_most, int_typ, int_bits)
+            };
+            self.emit(Instruction::cbr(cond, case_bb, next));
+            self.link_bb(from, case_bb);
+            self.link_bb(from, next);
+            self.switch_bb(next);
+        }
+
+        if let Some(from) = self.current_bb {
+            self.emit(Instruction::br(default_target));
+            self.link_bb(from, default_target);
+        }
+    }
+
     pub(crate) fn linearize_switch_body(
         &mut self,
         body: &Stmt,
-        case_values: &[(i64, i64)],
+        case_values: &[(i128, i128)],
         case_bbs: &[BasicBlockId],
         default_bb: Option<BasicBlockId>,
     ) {
@@ -2260,7 +2338,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_switch_stmt(
         &mut self,
         stmt: &Stmt,
-        case_values: &[(i64, i64)],
+        case_values: &[(i128, i128)],
         case_bbs: &[BasicBlockId],
         default_bb: Option<BasicBlockId>,
         case_idx: &mut usize,
@@ -2273,10 +2351,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // rejects that pair anyway, but matching on the low endpoint
                 // alone would have made the two indistinguishable here.
                 if let Some(val) = self.eval_const_expr(expr) {
-                    let lo = val as i64;
+                    // Matched at full width, as the collector records them.
+                    let lo = val;
                     let hi = match high {
                         None => Some(lo),
-                        Some(hi_expr) => self.eval_const_expr(hi_expr).map(|h| h as i64),
+                        Some(hi_expr) => self.eval_const_expr(hi_expr),
                     };
                     let Some(hi) = hi else { return };
                     if let Some(idx) = case_values.iter().position(|r| *r == (lo, hi)) {

@@ -1664,7 +1664,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// One integer binary operation on complex halves, into a fresh pseudo.
-    fn emit_int_binop(
+    pub(crate) fn emit_int_binop(
         &mut self,
         op: Opcode,
         lhs: PseudoId,

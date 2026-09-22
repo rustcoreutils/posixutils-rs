@@ -1425,3 +1425,91 @@ int main(void) {
         0
     );
 }
+
+/// A `switch` on a controlling expression wider than a general register
+/// compares all of it.
+///
+/// The `Switch` instruction carries its case labels as `i64` and both
+/// backends compare the value in one register, so a `__int128` controlling
+/// expression had its high half ignored -- `switch ((__int128)1 << 64)`
+/// matched `case 0:`. A case label outside the 64-bit range was truncated to
+/// fit, and could then match a value it does not equal.
+///
+/// A wide switch is lowered to explicit comparisons, which go through the
+/// ordinary 128-bit compare path. The torture test is `pr122943`.
+#[test]
+fn c99_switch_wider_than_a_register_compares_all_of_it() {
+    let code = r#"
+__attribute__((noipa)) int small(__int128 v) {
+    switch (v) {
+    case 0: return 1;
+    case 1: return 2;
+    case 2: return 3;
+    default: return 0;
+    }
+}
+__attribute__((noipa)) int wide(__int128 v) {
+    switch (v) {
+    case 0: return 1;
+    case -1: return 2;
+    case (__int128)1 << 70: return 3;
+    case -((__int128)1 << 70): return 4;
+    default: return 0;
+    }
+}
+__attribute__((noipa)) int ranges(__int128 v) {
+    switch (v) {
+    case 10 ... 20: return 1;
+    case ((__int128)1 << 80) ... (((__int128)1 << 80) + 5): return 2;
+    default: return 0;
+    }
+}
+__attribute__((noipa)) int uns(unsigned __int128 v) {
+    switch (v) {
+    case 0: return 1;
+    case ~(unsigned __int128)0: return 2;
+    default: return 0;
+    }
+}
+
+int main(void) {
+    /* The reported shape: the high half must not be discarded. */
+    if (small(0) != 1 || small(1) != 2 || small(2) != 3) return 1;
+    if (small(3) != 0 || small(-1) != 0) return 2;
+    if (small((__int128)1 << 64) != 0) return 3;
+    if (small(((__int128)1 << 64) + 1) != 0) return 4;
+
+    /* Case labels that do not fit in 64 bits must keep their value. */
+    if (wide(0) != 1 || wide(-1) != 2) return 5;
+    if (wide((__int128)1 << 70) != 3) return 6;
+    if (wide(-((__int128)1 << 70)) != 4) return 7;
+    if (wide(5) != 0 || wide((__int128)1 << 64) != 0) return 8;
+
+    /* GNU ranges, at both widths. */
+    if (ranges(10) != 1 || ranges(20) != 1 || ranges(15) != 1) return 9;
+    if (ranges(9) != 0 || ranges(21) != 0) return 10;
+    if (ranges((__int128)1 << 80) != 2) return 11;
+    if (ranges(((__int128)1 << 80) + 5) != 2) return 12;
+    if (ranges(((__int128)1 << 80) + 6) != 0) return 13;
+
+    /* Unsigned, where the largest label is negative read as signed. */
+    if (uns(0) != 1) return 14;
+    if (uns(~(unsigned __int128)0) != 2) return 15;
+    if (uns(7) != 0) return 16;
+
+    /* A `long long` switch is still the narrow path and still right. */
+    {
+        long long v = 2;
+        switch (v) { case 2: break; default: return 17; }
+        v = 4294967296LL;
+        switch (v) { case 0: return 18; default: break; }
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_switch_wide", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_switch_wide_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

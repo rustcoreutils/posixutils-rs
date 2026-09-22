@@ -1144,11 +1144,6 @@ impl X86_64CodeGen {
             }
         };
 
-        // For indirect calls, load function pointer into R11
-        if let Some(func_addr) = insn.indirect_target {
-            self.emit_move(func_addr, Reg::R11, 64);
-        }
-
         // Classify arguments into register vs stack
         let info = self.classify_call_args(insn, types);
 
@@ -1164,6 +1159,16 @@ impl X86_64CodeGen {
         // For variadic calls, set AL to number of XMM registers used
         if insn.variadic_arg_start.is_some() {
             self.set_variadic_fp_count(fp_arg_count);
+        }
+
+        // For an indirect call, load the function pointer into R11 *after*
+        // the arguments are in place. R10 and R11 are the argument setup's
+        // own scratch registers -- `save_clobbered_arg_regs` shuttles through
+        // them and the complex-argument path addresses its value through R11 --
+        // so a target parked there before the setup was overwritten, and the
+        // `call *%r11` jumped into whatever the last argument had addressed.
+        if let Some(func_addr) = insn.indirect_target {
+            self.emit_move(func_addr, Reg::R11, 64);
         }
 
         // Emit the call instruction

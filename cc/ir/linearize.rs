@@ -3141,9 +3141,22 @@ impl<'a> Linearizer<'a> {
         // C requires implicit promotion. This is transparent for non-inlined calls
         // (the ABI handles it), but inlining exposes the mismatch since the argument
         // pseudo is used directly without conversion.
+        // C17 6.5.2.2p1 lets the function designator be a function *or* a
+        // pointer to one, and the prototype lives on the function type either
+        // way. Reading `params` off the pointer found nothing, so a call
+        // through a pointer converted no argument at all:
+        //
+        //   void f(double); void (*p)(double) = f; p(1);
+        //
+        // passed the integer 1 where a `double` was expected and the callee
+        // read 0. With a mixed list every later argument moved as well.
         let formal_param_types: Option<Vec<TypeId>> = func_expr.typ.and_then(|ft_id| {
-            let ft = self.types.get(ft_id);
-            ft.params.clone()
+            let resolved = if self.types.kind(ft_id) == TypeKind::Pointer {
+                self.types.base_type(ft_id).unwrap_or(ft_id)
+            } else {
+                ft_id
+            };
+            self.types.get(resolved).params.clone()
         });
 
         // Linearize regular arguments
@@ -3324,7 +3337,14 @@ impl<'a> Linearizer<'a> {
                             // Integer to FP (uint32_t→double, int→float, etc.)
                             || (arg_is_int && param_is_fp)
                             // FP to integer (rare but legal)
-                            || (arg_is_fp && param_is_int);
+                            || (arg_is_fp && param_is_int)
+                            // To `_Bool`, whose conversion is `!= 0` and not
+                            // a truncation (C17 6.3.1.2). Every other
+                            // narrowing can be left to the callee, which
+                            // reads the low bytes of the register -- but
+                            // `f(42)` with a `_Bool` parameter must pass 1,
+                            // and passing 42 was wrong for a direct call too.
+                            || self.types.kind(param_type) == TypeKind::Bool;
 
                         if needs_convert {
                             val = self.emit_convert(val, arg_type, param_type);

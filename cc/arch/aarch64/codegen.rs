@@ -1094,11 +1094,6 @@ impl Aarch64CodeGen {
             }
         };
 
-        // For indirect calls, load function pointer into X16
-        if let Some(func_addr) = insn.indirect_target {
-            self.emit_move(func_addr, Reg::X16, 64);
-        }
-
         // Handle sret (hidden struct return pointer) argument
         let args_start = self.setup_sret_arg(insn);
 
@@ -1112,6 +1107,15 @@ impl Aarch64CodeGen {
         } else {
             self.setup_register_args(insn, args_start, types)
         };
+
+        // For an indirect call, load the function pointer into X16 *after*
+        // the arguments are in place. X16 is AAPCS64's IP0 and this backend's
+        // address-materialization scratch -- the stacked-argument copy
+        // shuttles through it -- so a target parked there before the setup was
+        // overwritten and the call branched into the argument data.
+        if let Some(func_addr) = insn.indirect_target {
+            self.emit_move(func_addr, Reg::X16, 64);
+        }
 
         // Emit the call instruction
         self.emit_call_instruction(insn, &func_name);

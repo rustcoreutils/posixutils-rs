@@ -11122,3 +11122,117 @@ int main(void) {
         0
     );
 }
+
+/// A call through a function pointer converts its arguments to the pointee's
+/// prototype, and the pointer survives the argument setup.
+///
+/// Two defects, both reached by any indirect call.
+///
+/// C17 6.5.2.2p1 lets the function designator be a function *or* a pointer to
+/// one, and the prototype is on the function type either way. c17 read
+/// `params` off the pointer, found none, and converted nothing: `void
+/// (*p)(double) = f; p(1);` passed the integer 1 where a `double` was
+/// expected and the callee read 0. With a mixed argument list every later
+/// argument moved as well.
+///
+/// The pointer was then loaded into R11 *before* the arguments were set up --
+/// and R10/R11 are that setup's own scratch, so the target was overwritten
+/// and `call *%r11` jumped into whatever the last argument had addressed.
+///
+/// `930702-1` is the torture test, through a K&R definition.
+#[test]
+fn c99_call_through_a_pointer_uses_the_pointee_prototype() {
+    let code = r#"
+extern int printf(const char *, ...);
+
+static double seen_d;
+static int seen_i;
+static long seen_l;
+static float seen_f;
+
+static void take_d(double a) { seen_d = a; }
+static void take_di(double a, int b) { seen_d = a; seen_i = b; }
+static void take_l(long a) { seen_l = a; }
+static void take_f(float a) { seen_f = a; }
+static void take_idi(int a, double b, int c) { seen_i = a + c; seen_d = b; }
+static void take_b(_Bool b) { seen_i = b; }
+
+typedef struct { double a, b; } D2;
+typedef struct { long a, b, c, d; } Big;
+static double st_a, st_b;
+static long big_a;
+static void take_st(D2 d, Big b, int i, double z, long l) {
+    st_a = d.a; st_b = d.b; big_a = b.a; seen_i = i; seen_d = z; seen_l = l;
+}
+static double cre, cim;
+static void take_cx(double _Complex z) { cre = __real__ z; cim = __imag__ z; }
+
+static void take_stacked(long a, long b, long c, long d, long e,
+                         long f, long g, long h, Big k, long l) {
+    seen_l = a; big_a = k.a; seen_i = (int)l;
+    (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h;
+}
+
+/* The target reached through an array indexed at run time, and through a
+   call -- the pointer has to survive a full argument list either way. */
+typedef void (*DI)(double, int);
+static DI tbl[2];
+static DI pick(int i) { return tbl[i]; }
+
+int main(void) {
+    /* The conversion the prototype asks for. */
+    { void (*p)(double) = take_d; p(1); if (seen_d != 1.0) return 1; }
+    { void (*p)(double, int) = take_di; p(2, 7);
+      if (seen_d != 2.0 || seen_i != 7) return 2; }
+    { void (*p)(long) = take_l; p(3); if (seen_l != 3) return 3; }
+    { void (*p)(float) = take_f; p(4); if (seen_f != 4.0f) return 4; }
+    { void (*p)(int, double, int) = take_idi; p(5, 6, 8);
+      if (seen_i != 13 || seen_d != 6.0) return 5; }
+
+    /* `_Bool` converts as `!= 0`, not by truncation -- and this was wrong
+       for a direct call too. */
+    { void (*p)(_Bool) = take_b; p(42); if (seen_i != 1) return 6; }
+    take_b(42);
+    if (seen_i != 1) return 7;
+
+    /* Aggregates and a complex parameter, where the argument setup uses the
+       scratch registers the target was parked in. */
+    { void (*p)(D2, Big, int, double, long) = take_st;
+      D2 d = {1.5, 2.5}; Big b = {7, 8, 9, 10};
+      p(d, b, 3, 4.5, 11);
+      if (st_a != 1.5 || st_b != 2.5 || big_a != 7) return 8;
+      if (seen_i != 3 || seen_d != 4.5 || seen_l != 11) return 9; }
+    { void (*p)(double _Complex) = take_cx; p(4);
+      if (cre != 4.0 || cim != 0.0) return 10; }
+
+    /* The target from a table, and from a call. */
+    tbl[0] = take_di;
+    tbl[1] = take_di;
+    { int k = 1; tbl[k](12, 13);
+      if (seen_d != 12.0 || seen_i != 13) return 11; }
+    pick(0)(14, 15);
+    if (seen_d != 14.0 || seen_i != 15) return 12;
+
+    /* A stacked aggregate argument, which both backends copy through the
+       very register the call target sits in -- X16 on aarch64, R11 on
+       x86-64. This is the shape that branched into the argument data. */
+    {
+        void (*p)(long, long, long, long, long, long, long, long, Big, long)
+            = take_stacked;
+        Big b = {77, 88, 99, 100};
+        p(1, 2, 3, 4, 5, 6, 7, 8, b, 9);
+        if (seen_l != 1 || big_a != 77 || seen_i != 9) return 14;
+    }
+
+    /* A direct call must keep working the same way. */
+    take_d(16);
+    if (seen_d != 16.0) return 15;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_call_through_pointer", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_call_through_pointer_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

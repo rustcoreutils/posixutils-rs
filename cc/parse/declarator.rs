@@ -60,10 +60,10 @@ impl Parser<'_> {
                 break;
             };
             match name_id {
-                crate::kw::CONST => modifiers |= TypeModifiers::CONST,
-                crate::kw::VOLATILE => modifiers |= TypeModifiers::VOLATILE,
-                crate::kw::RESTRICT => modifiers |= TypeModifiers::RESTRICT,
                 crate::kw::ATOMIC => modifiers |= TypeModifiers::ATOMIC,
+                // Every spelling of the three CV qualifiers, from the one
+                // shared answer.
+                _ if let Some(m) = super::cv_qualifier_modifier(name_id) => modifiers |= m,
                 _ if super::is_nullability_qualifier(name_id) => {}
                 _ => break,
             }
@@ -154,11 +154,10 @@ impl Parser<'_> {
                         // C17 6.7.6.2: the array declarator of a parameter
                         // takes a type-qualifier list, which includes
                         // `_Atomic`, and optionally `static`.
-                        crate::kw::STATIC
-                        | crate::kw::CONST
-                        | crate::kw::VOLATILE
-                        | crate::kw::RESTRICT
-                        | crate::kw::ATOMIC => {
+                        crate::kw::STATIC | crate::kw::ATOMIC => {
+                            self.advance();
+                        }
+                        _ if super::cv_qualifier_modifier(name_id).is_some() => {
                             self.advance();
                         }
                         _ => break,

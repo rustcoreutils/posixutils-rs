@@ -670,18 +670,52 @@ impl Aarch64CodeGen {
                 });
             }
         } else {
-            // Large frame: use str xzr (8 bytes per instruction)
-            // str unsigned offset range is [0, 32760] for 64-bit — handles all practical frames
+            // Large frame: `str xzr` per qword. Its unsigned offset is twelve
+            // bits scaled by eight, so [0, 32760] -- which the comment here
+            // used to call "all practical frames". It is not: three locals of
+            // 9001 bytes reach 27 KB and a 40 KB array goes past it outright,
+            // and the assembler rejects what it cannot encode
+            // (`Error: immediate offset out of range`).
+            //
+            // Past the range, address through a cursor in X16 -- the
+            // documented scratch for exactly this, AAPCS64 IP0, never in the
+            // allocator's palette -- and advance it as the offsets run out.
+            const MAX_STR_OFFSET: i32 = 32760;
             let mut offset = 0;
+            let mut cursor_base: Option<i32> = None;
             while offset < alloc_size {
-                self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B64,
-                    src: Reg::Xzr,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: base_offset + offset,
-                    },
-                });
+                let absolute = base_offset + offset;
+                if absolute <= MAX_STR_OFFSET {
+                    self.push_lir(Aarch64Inst::Str {
+                        size: OperandSize::B64,
+                        src: Reg::Xzr,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::X29,
+                            offset: absolute,
+                        },
+                    });
+                } else {
+                    // Re-base whenever the remaining displacement would not
+                    // encode, which keeps one `add` per 32 KB rather than one
+                    // per store.
+                    let need_rebase = match cursor_base {
+                        Some(b) => absolute - b > MAX_STR_OFFSET,
+                        None => true,
+                    };
+                    if need_rebase {
+                        self.emit_add_imm_legalized(Reg::X16, Reg::X29, absolute as i64);
+                        cursor_base = Some(absolute);
+                    }
+                    let rel = absolute - cursor_base.unwrap();
+                    self.push_lir(Aarch64Inst::Str {
+                        size: OperandSize::B64,
+                        src: Reg::Xzr,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::X16,
+                            offset: rel,
+                        },
+                    });
+                }
                 offset += 8;
             }
         }
@@ -915,7 +949,7 @@ impl Aarch64CodeGen {
     /// both copied HFAs at twice their stride, reading and writing 8 bytes
     /// past each end.
     fn two_element_fp_info(&self, typ: TypeId, types: &TypeTable) -> (FpSize, i32) {
-        if types.is_complex(typ) {
+        if types.is_complex_float(typ) {
             return complex_fp_info(types, &self.base.target, typ);
         }
         use crate::abi::HfaBase;
@@ -974,6 +1008,39 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// The register holding the address a complex `Ret` carries.
+    ///
+    /// X9 rather than X0: the caller-side helper can use X0 freely, but here
+    /// X0 and X1 are the values being returned, and loading the address into
+    /// X0 first would have the second load read its own result.
+    fn complex_ret_address(&mut self, src: PseudoId) -> Reg {
+        match self.get_location(src) {
+            // Not returned as-is: the address often *is* in X0, and the first
+            // load would then overwrite the base before the second read it.
+            Loc::Reg(r) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(r),
+                    dst: Reg::X9,
+                });
+                Reg::X9
+            }
+            ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
+                let mem = self.loc_mem(l).expect("complex return slot has an address");
+                self.push_lir(Aarch64Inst::Ldr {
+                    size: OperandSize::B64,
+                    dst: Reg::X9,
+                    addr: mem,
+                });
+                Reg::X9
+            }
+            _ => {
+                self.emit_move(src, Reg::X9, 64);
+                Reg::X9
+            }
+        }
+    }
+
     fn store_args_to_stack(&mut self, func: &Function, types: &TypeTable, alloc: &RegAlloc) {
         // AAPCS64: integer args in X0-X7, FP args in D0-D7 (separate counters)
         // Note: sret uses X8, so regular args still start at X0
@@ -995,24 +1062,34 @@ impl Aarch64CodeGen {
         let arg_idx_offset: u32 = if has_sret { 1 } else { 0 };
 
         for (i, (_name, typ)) in func.params.iter().enumerate() {
-            let is_complex = types.is_complex(*typ);
+            let is_complex = types.is_complex_float(*typ);
             let is_fp = types.is_float(*typ);
             // A composite of at most sixteen bytes that is not an HFA arrives
-            // in two consecutive X registers, and the prologue writes them
-            // into the parameter's local -- the same arrangement the HFA arm
-            // below uses.
-            let gp_pair = !is_complex
-                && !is_fp
-                && matches!(types.kind(*typ), TypeKind::Struct | TypeKind::Union)
-                && {
-                    let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
-                    matches!(
-                        abi.classify_param(*typ, types),
-                        ArgClass::Direct { ref classes, .. }
-                            if classes.len() == 2
-                                && classes.iter().all(|c| *c == crate::abi::RegClass::Integer)
-                    )
-                };
+            // in consecutive X registers, and the prologue writes them into
+            // the parameter's local -- the same arrangement the HFA arm below
+            // uses. A GNU complex integer is such a composite, and joins this
+            // path at *one* register as well as two: unlike a struct that
+            // small, a complex value is always addressed rather than held, so
+            // the single-register form needs the store too.
+            let gp_regs: Option<usize> = if is_complex || is_fp {
+                None
+            } else if types.is_complex_integer(*typ)
+                || matches!(types.kind(*typ), TypeKind::Struct | TypeKind::Union)
+            {
+                let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
+                match abi.classify_param(*typ, types) {
+                    ArgClass::Direct { ref classes, .. }
+                        if !classes.is_empty()
+                            && classes.iter().all(|c| *c == crate::abi::RegClass::Integer)
+                            && (classes.len() == 2 || types.is_complex_integer(*typ)) =>
+                    {
+                        Some(classes.len())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
             // How many consecutive V registers this parameter arrives in, if
             // it arrives in V registers at all. A `_Complex` is two by
             // definition; a struct is whatever the ABI's HFA classification
@@ -1039,8 +1116,8 @@ impl Aarch64CodeGen {
                             // Still need to count this arg for register assignment tracking
                             if let Some(count) = fp_reg_count {
                                 fp_arg_idx += count;
-                            } else if gp_pair {
-                                int_arg_idx += 2;
+                            } else if let Some(n) = gp_regs {
+                                int_arg_idx += n;
                             } else if is_fp {
                                 fp_arg_idx += 1;
                             } else if types.kind(*typ) == TypeKind::Int128 {
@@ -1050,7 +1127,7 @@ impl Aarch64CodeGen {
                             }
                             break;
                         }
-                        if gp_pair {
+                        if let Some(gp_n) = gp_regs {
                             let param_name = &func.params[i].0;
                             let local_off = func
                                 .locals
@@ -1061,13 +1138,23 @@ impl Aarch64CodeGen {
                                     _ => None,
                                 });
                             if let Some(local_off) = local_off {
-                                if int_arg_idx + 1 < arg_regs.len() {
-                                    self.emit_stp_legalized(
-                                        OperandSize::B64,
-                                        arg_regs[int_arg_idx],
-                                        arg_regs[int_arg_idx + 1],
-                                        self.stack_mem(local_off),
-                                    );
+                                if int_arg_idx + gp_n <= arg_regs.len() {
+                                    if gp_n == 2 {
+                                        self.emit_stp_legalized(
+                                            OperandSize::B64,
+                                            arg_regs[int_arg_idx],
+                                            arg_regs[int_arg_idx + 1],
+                                            self.stack_mem(local_off),
+                                        );
+                                    } else {
+                                        // One register holding the whole value:
+                                        // `_Complex int` is eight bytes.
+                                        self.push_lir(Aarch64Inst::Str {
+                                            size: OperandSize::B64,
+                                            src: arg_regs[int_arg_idx],
+                                            addr: self.stack_mem(local_off),
+                                        });
+                                    }
                                 } else if let Some(&Loc::IncomingArg(incoming)) =
                                     self.locations.get_ref(pseudo.id)
                                 {
@@ -1099,7 +1186,7 @@ impl Aarch64CodeGen {
                                     }
                                 }
                             }
-                            int_arg_idx += 2;
+                            int_arg_idx += gp_n;
                         } else if let Some(count) = fp_reg_count {
                             // Complex or HFA argument — `count` consecutive V registers
                             if fp_arg_idx + count <= fp_arg_regs.len() {
@@ -1228,7 +1315,7 @@ impl Aarch64CodeGen {
         // Move return value to x0 (integer), v0 (float), v0+v1 (complex/HFA-2) if present
         if let Some(&src) = insn.src.first() {
             let src_loc = self.get_location(src);
-            let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
+            let is_complex = insn.typ.is_some_and(|t| types.is_complex_float(t));
             // Decide by *type* first, not only by where the value happens to
             // sit. A `long double` produced by an rtlib call lands on the
             // stack, so a location-only test sent it out through emit_move and
@@ -1479,6 +1566,33 @@ impl Aarch64CodeGen {
                 self.emit_move(src, Reg::X0, 64);
                 if let Some(&src2) = insn.src.get(1) {
                     self.emit_move(src2, Reg::X1, 64);
+                }
+            } else if let Some(gp_n) =
+                insn.typ
+                    .filter(|t| types.is_complex_integer(*t))
+                    .and_then(|t| {
+                        let abi = get_abi_for_conv(CallingConv::C, &self.base.target);
+                        match abi.classify_return(t, types) {
+                            ArgClass::Direct { classes, .. } => Some(classes.len()),
+                            _ => None,
+                        }
+                    })
+            {
+                // A GNU complex integer comes back in X0, or X0+X1 at sixteen
+                // bytes. The `Ret` carries the value's address, as every
+                // complex return does, so the halves are loaded out of it --
+                // the integer arm below returned the pointer itself.
+                let base = self.complex_ret_address(src);
+                let ret_regs = [Reg::X0, Reg::X1];
+                for (k, reg) in ret_regs.iter().take(gp_n).enumerate() {
+                    self.push_lir(Aarch64Inst::Ldr {
+                        size: OperandSize::B64,
+                        dst: *reg,
+                        addr: MemAddr::BaseOffset {
+                            base,
+                            offset: (k * 8) as i32,
+                        },
+                    });
                 }
             } else if is_complex {
                 let (fp_size, imag_offset) =

@@ -1196,9 +1196,9 @@ impl RegAlloc {
         for block in &func.blocks {
             for insn in &block.insns {
                 // Only match Int128 type, not 16-byte structs or long doubles
-                let is_int128 = insn
-                    .typ
-                    .is_some_and(|t| types.kind(t) == crate::types::TypeKind::Int128);
+                let is_int128 = insn.typ.is_some_and(|t| {
+                    types.kind(t) == crate::types::TypeKind::Int128 && !types.is_complex(t)
+                });
 
                 if is_int128 {
                     // Comparison results are always small integers, not 128-bit.
@@ -1329,10 +1329,10 @@ impl RegAlloc {
             // sixteen-byte branch below rather than the COMPLEX_X87 branch
             // further down that is meant for its thirty-two. Both sibling
             // sites, in `call.rs` and `codegen.rs`, exclude complex too.
-            let is_longdouble =
-                types.kind(*typ) == crate::types::TypeKind::LongDouble && !types.is_complex(*typ);
+            let is_longdouble = types.kind(*typ) == crate::types::TypeKind::LongDouble
+                && !types.is_complex_float(*typ);
             let is_fp = types.is_float(*typ);
-            let is_complex = types.is_complex(*typ);
+            let is_complex = types.is_complex_float(*typ);
             let sse_struct = crate::abi::sse_struct_regs(*typ, types);
 
             // Long double uses x87 FPU and is passed on the stack per System V AMD64 ABI
@@ -1482,7 +1482,8 @@ impl RegAlloc {
                     );
                 }
                 fp_arg_idx += 1;
-            } else if types.kind(*typ) == crate::types::TypeKind::Int128 {
+            } else if types.kind(*typ) == crate::types::TypeKind::Int128 && !types.is_complex(*typ)
+            {
                 // __int128: uses two GP registers when available.
                 // Always allocate a local stack slot — for register params,
                 // store_args_to_stack stores register values; for stack params,
@@ -1599,7 +1600,7 @@ impl RegAlloc {
                 PseudoKind::Arg(idx) => func
                     .params
                     .get(idx as usize)
-                    .filter(|(_, typ)| types.is_complex(*typ))
+                    .filter(|(_, typ)| types.is_complex_float(*typ))
                     .map(|_| p.id),
                 _ => None,
             })

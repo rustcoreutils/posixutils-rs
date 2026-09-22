@@ -550,3 +550,61 @@ int main(void)
         0
     );
 }
+
+/// A *real* argument bound to a complex parameter converts as if by
+/// assignment (C17 6.5.2.2p2), so the imaginary half is a zero.
+///
+/// The argument path keyed on the *argument's* type, not the parameter's, so
+/// this case never reached the complex arm at all: the raw scalar was passed
+/// where the callee expected an address. With a floating parameter that
+/// arrived as garbage -- `f(7)` read `0 + 3.2e-319i` -- and with a
+/// `_Complex int` one the callee dereferenced the number 7 and died.
+#[test]
+fn c99_real_argument_to_a_complex_parameter() {
+    let src = r#"
+        static double re_d(double _Complex c) { return __real__ c; }
+        static double im_d(double _Complex c) { return __imag__ c; }
+        static float re_f(float _Complex c) { return __real__ c; }
+        static float im_f(float _Complex c) { return __imag__ c; }
+        static long double re_l(long double _Complex c) { return __real__ c; }
+        static long double im_l(long double _Complex c) { return __imag__ c; }
+        static int re_i(_Complex int c) { return __real__ c; }
+        static int im_i(_Complex int c) { return __imag__ c; }
+        static long re_cl(_Complex long c) { return __real__ c; }
+        static long im_cl(_Complex long c) { return __imag__ c; }
+        static unsigned re_u(_Complex unsigned c) { return __real__ c; }
+        static unsigned im_u(_Complex unsigned c) { return __imag__ c; }
+
+        int main(void) {
+            /* An integer literal, which needs a conversion as well as a
+               promotion. */
+            if (re_d(7) != 7.0 || im_d(7) != 0.0) return 1;
+            if (re_f(7) != 7.0f || im_f(7) != 0.0f) return 2;
+            if (re_l(7) != 7.0L || im_l(7) != 0.0L) return 3;
+            if (re_i(7) != 7 || im_i(7) != 0) return 4;
+            if (re_cl(7) != 7 || im_cl(7) != 0) return 5;
+            if (re_u(7) != 7u || im_u(7) != 0u) return 6;
+
+            /* A floating value into an integer complex, and the reverse. */
+            if (re_i(9.75) != 9 || im_i(9.75) != 0) return 7;
+            if (re_d(9) != 9.0 || im_d(9) != 0.0) return 8;
+
+            /* A variable rather than a constant, so nothing is folded. */
+            double d = 2.5;
+            if (re_d(d) != 2.5 || im_d(d) != 0.0) return 9;
+            int n = 3;
+            if (re_i(n) != 3 || im_i(n) != 0) return 10;
+            if (re_d(n) != 3.0 || im_d(n) != 0.0) return 11;
+
+            /* Narrowing on the way in: a `long` into a `_Complex int`. */
+            long big = 5;
+            if (re_i(big) != 5 || im_i(big) != 0) return 12;
+            return 0;
+        }
+    "#;
+    assert_eq!(compile_and_run("c99_real_arg_complex_param", src, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_real_arg_complex_param_o2", src, &["-O2".to_string()]),
+        0
+    );
+}

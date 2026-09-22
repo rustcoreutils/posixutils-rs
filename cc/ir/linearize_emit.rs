@@ -15,6 +15,41 @@ use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, UnaryOp};
 use crate::types::{MemberInfo, TypeId, TypeKind};
 
+/// A read-modify-write target whose address has been computed **once**.
+///
+/// C17 evaluates the target of a read-modify-write exactly once -- 6.5.16.2p3
+/// for `E1 op= E2`, 6.5.3.1p2 for `++E`, 6.5.2.4p2 for `E++`. All three used
+/// to read the old value from the *expression* and then re-derive the address
+/// for the store, so every subexpression of the target ran twice:
+/// `b[i++] += 5` incremented `i` twice and updated the wrong element,
+/// `*p++ += 1` advanced `p` by two, and `a[f()] |= 1` called `f` twice.
+///
+/// `base` addresses the object, or its storage unit when `bitfield` is set --
+/// a bit-field has no address of its own, so it carries its placement
+/// instead.
+pub(crate) struct RmwPlace {
+    base: PseudoId,
+    /// `(byte offset, bit offset, bit width, storage bytes, field type)` --
+    /// spelled to match `emit_bitfield_load`/`_store`, which are the only
+    /// consumers.
+    bitfield: Option<(usize, u32, u32, u32, TypeId)>,
+}
+
+/// The per-half opcodes a complex operation uses, chosen once from the base
+/// type rather than at each emit site.
+///
+/// `integral` distinguishes the two families where the opcode alone cannot:
+/// complex multiply and divide call a runtime helper for floating halves and
+/// are open-coded for integer ones.
+struct ComplexHalfOps {
+    add: Opcode,
+    sub: Opcode,
+    neg: Opcode,
+    eq: Opcode,
+    ne: Opcode,
+    integral: bool,
+}
+
 /// The low-`bit_width` mask for a bit-field value.
 ///
 /// Spelled as a shift of `u64::MAX` rather than `(1 << bit_width) - 1` because
@@ -177,6 +212,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit_block_copy_at_offset(dst, 0, src, size_bytes);
     }
 
+    /// Above this many bytes, a block copy becomes a `memcpy` call rather than
+    /// an unrolled load/store sequence.
+    ///
+    /// The unrolled form costs one load, one store and one fresh pseudo per
+    /// eight bytes, with no upper bound: a 256 KB struct passed by value --
+    /// `struct big { int i[0x10000]; }`, which gcc.c-torture's pr28982b does --
+    /// produced 65,536 IR instructions, 131,108 lines of assembly and a
+    /// **65-second** compile, against gcc's 48 lines and one `call memcpy`.
+    ///
+    /// Small copies stay inline, where they belong: a call would cost more than
+    /// the moves it replaces, and `test_linearize.rs` pins two 64-bit loads and
+    /// two 64-bit stores for a 128-bit copy. 128 bytes leaves every realistic
+    /// struct on the inline path and takes only the pathological ones off it.
+    const BLOCK_COPY_INLINE_LIMIT: i64 = 128;
+
     /// Emit a block copy from src to dst using integer chunks.
     /// The destination stores start at dst_base_offset.
     pub(crate) fn emit_block_copy_at_offset(
@@ -186,6 +236,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         src: PseudoId,
         size_bytes: i64,
     ) {
+        if size_bytes > Self::BLOCK_COPY_INLINE_LIMIT {
+            self.emit_block_copy_call(dst, dst_base_offset, src, size_bytes);
+            return;
+        }
         let mut offset: i64 = 0;
         while offset + 8 <= size_bytes {
             let tmp = self.alloc_pseudo();
@@ -241,6 +295,52 @@ impl<'a> super::linearize::Linearizer<'a> {
                 8,
             ));
         }
+    }
+
+    /// The same copy as a `memcpy` call.
+    ///
+    /// `dst_base_offset` is folded into the destination pointer first, since
+    /// `memcpy` takes an address rather than a base and a displacement.
+    fn emit_block_copy_call(
+        &mut self,
+        dst: PseudoId,
+        dst_base_offset: i64,
+        src: PseudoId,
+        size_bytes: i64,
+    ) {
+        // `memcpy` takes addresses. A `Sym` pseudo names a local's *storage*,
+        // not a pointer to it -- the inline path could store through it
+        // directly, this one cannot. Passing the Sym itself handed memcpy a
+        // meaningless value and segfaulted every copy over the threshold.
+        // `rvalue_addr` is the existing answer to this question and returns a
+        // non-Sym pseudo unchanged.
+        let void_ptr = self.types.void_ptr_id;
+        let dst = self.rvalue_addr(dst, void_ptr);
+        let src = self.rvalue_addr(src, void_ptr);
+
+        let dst_ptr = if dst_base_offset == 0 {
+            dst
+        } else {
+            let off = self.emit_const(dst_base_offset as i128, self.types.long_id);
+            let adjusted = self.alloc_reg_pseudo();
+            self.emit(Instruction::binop(
+                Opcode::Add,
+                adjusted,
+                dst,
+                off,
+                self.types.void_ptr_id,
+                64,
+            ));
+            adjusted
+        };
+        let n = self.emit_const(size_bytes as i128, self.types.ulong_id);
+        let result = self.alloc_pseudo();
+        self.emit(
+            Instruction::new(Opcode::Memcpy)
+                .with_target(result)
+                .with_src3(dst_ptr, src, n)
+                .with_type_and_size(self.types.void_ptr_id, 64),
+        );
     }
 
     /// Emit code to load a bitfield value
@@ -332,6 +432,49 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.emit_sign_extend_bitfield(masked, bit_width, value_bits)
         } else {
             masked
+        }
+    }
+
+    /// Reduce a value to what a bit-field of `bit_width` would hold.
+    ///
+    /// C17 6.5.16.1p2 makes the value of an assignment expression the value
+    /// *stored in* the object, and for a bit-field that is the truncated,
+    /// sign-extended field -- not the value that was assigned. So
+    /// `(x.f = 9)` with `signed int f : 3` is 1, and `x.f = 7` is -1.
+    /// `++x.f`, `x.f--` and the compound forms are the same question.
+    ///
+    /// The store path already narrows correctly; this is only about the value
+    /// handed back to the surrounding expression, which was the unnarrowed
+    /// one. Mirrors the tail of `emit_bitfield_load`, including its rule that
+    /// the width to extend to is the *declared type's*, not the storage
+    /// unit's.
+    pub(crate) fn narrow_to_bitfield(
+        &mut self,
+        value: PseudoId,
+        bit_width: u32,
+        typ: TypeId,
+    ) -> PseudoId {
+        let value_bits = self.types.size_bits(typ);
+        if bit_width >= value_bits {
+            // The field fills its declared type; nothing to narrow, and the
+            // mask below would be a no-op that only costs an instruction.
+            return value;
+        }
+        let mask = bitfield_value_mask_128(bit_width);
+        let mask_val = self.emit_const(mask as i128, typ);
+        let masked = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::And,
+            masked,
+            value,
+            mask_val,
+            typ,
+            value_bits,
+        ));
+        if self.types.is_unsigned(typ) {
+            masked
+        } else {
+            self.emit_sign_extend_bitfield(masked, bit_width, value_bits)
         }
     }
 
@@ -494,46 +637,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             op_bits,
         ));
         result
-    }
-
-    /// Store `value` into a struct member at `base`, honouring a bitfield's
-    /// placement within its storage unit.
-    ///
-    /// A plain `Instruction::store` writes the whole storage unit, which for a
-    /// bitfield overwrites every neighbour sharing it -- and, because the value
-    /// is written at bit 0, gets the field itself wrong too. Assignment and
-    /// compound assignment already went through `emit_bitfield_store`; `++` and
-    /// `--` did not, which is the entire bug behind `s.field++` corrupting the
-    /// struct around it.
-    pub(crate) fn emit_member_store(
-        &mut self,
-        base: PseudoId,
-        member_info: &MemberInfo,
-        value: PseudoId,
-    ) {
-        if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
-            member_info.bit_offset,
-            member_info.bit_width,
-            member_info.access_bytes,
-        ) {
-            self.emit_bitfield_store(
-                base,
-                member_info.offset,
-                bit_offset,
-                bit_width,
-                storage_size,
-                value,
-            );
-        } else {
-            let size = self.types.size_bits(member_info.typ);
-            self.emit(Instruction::store(
-                value,
-                base,
-                member_info.offset as i64,
-                member_info.typ,
-                size,
-            ));
-        }
     }
 
     /// Emit code to store a value into a bitfield
@@ -1050,7 +1153,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit(Instruction::store(
             converted, result, 0, base_typ, base_bits,
         ));
-        let zero = self.emit_fconst(FloatVal::ZERO, base_typ);
+        let zero = self.complex_half_zero(base_typ);
         self.emit(Instruction::store(
             zero, result, base_bytes, base_typ, base_bits,
         ));
@@ -1111,6 +1214,46 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
+    /// The opcodes that operate on one half of a complex value of `base_typ`.
+    ///
+    /// `_Complex int` is a GNU extension, and its halves are integers: the
+    /// component arithmetic is `Add`/`Sub`/`Mul`, the comparisons are
+    /// `SetEq`/`SetNe`, and negation is `Neg`. Every complex emitter used to
+    /// hard-code the floating opcode, which handed an integer pair to the SSE
+    /// unit.
+    fn complex_half_ops(&self, base_typ: TypeId) -> ComplexHalfOps {
+        if self.types.is_integer(base_typ) {
+            ComplexHalfOps {
+                add: Opcode::Add,
+                sub: Opcode::Sub,
+                neg: Opcode::Neg,
+                eq: Opcode::SetEq,
+                ne: Opcode::SetNe,
+                integral: true,
+            }
+        } else {
+            ComplexHalfOps {
+                add: Opcode::FAdd,
+                sub: Opcode::FSub,
+                neg: Opcode::FNeg,
+                // The floating predicates are the *ordered* ones, so a NaN
+                // half compares unequal to everything and -0.0 equals 0.0.
+                eq: Opcode::FCmpOEq,
+                ne: Opcode::FCmpONe,
+                integral: false,
+            }
+        }
+    }
+
+    /// Zero of the type one half of a complex value has.
+    pub(crate) fn complex_half_zero(&mut self, base_typ: TypeId) -> PseudoId {
+        if self.types.is_integer(base_typ) {
+            self.emit_const(0, base_typ)
+        } else {
+            self.emit_fconst(FloatVal::ZERO, base_typ)
+        }
+    }
+
     /// `-z` on a complex value: negate both parts (C17 6.5.3.3p3).
     ///
     /// A complex value travels by address, and the scalar unary path did not
@@ -1121,6 +1264,31 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// Returns the address of the result, as every complex-valued expression
     /// does.
     pub(crate) fn emit_complex_negate(&mut self, operand: &Expr, complex_typ: TypeId) -> PseudoId {
+        self.emit_complex_half_negate(operand, complex_typ, true)
+    }
+
+    /// `~z` on a complex value: the complex conjugate (a GNU extension).
+    ///
+    /// gcc gives `~` this meaning for every complex type, floating and
+    /// integer. c17 had no case for it, so the scalar path bit-complemented
+    /// the value's *address* and the result was dereferenced as a pointer:
+    /// `~z` segfaulted on valid code.
+    pub(crate) fn emit_complex_conjugate(
+        &mut self,
+        operand: &Expr,
+        complex_typ: TypeId,
+    ) -> PseudoId {
+        self.emit_complex_half_negate(operand, complex_typ, false)
+    }
+
+    /// The shared body of `-z` and `~z`: negate the imaginary half always, and
+    /// the real half only for negation.
+    fn emit_complex_half_negate(
+        &mut self,
+        operand: &Expr,
+        complex_typ: TypeId,
+        negate_real: bool,
+    ) -> PseudoId {
         let base_typ = self.types.complex_base(complex_typ);
         let base_bits = self.types.size_bits(base_typ);
         let base_bytes = (base_bits / 8) as i64;
@@ -1128,19 +1296,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         let addr = self.complex_operand_at_precision(operand, complex_typ);
         let result = self.alloc_local_temp(complex_typ);
 
-        for offset in [0, base_bytes] {
+        let ops = self.complex_half_ops(base_typ);
+        for (offset, negate) in [(0, negate_real), (base_bytes, true)] {
             let part = self.alloc_pseudo();
             self.emit(Instruction::load(part, addr, offset, base_typ, base_bits));
-            let negated = self.alloc_pseudo();
-            self.emit(Instruction::unop(
-                Opcode::FNeg,
-                negated,
-                part,
-                base_typ,
-                base_bits,
-            ));
+            let stored = if negate {
+                let negated = self.alloc_pseudo();
+                self.emit(Instruction::unop(
+                    ops.neg, negated, part, base_typ, base_bits,
+                ));
+                negated
+            } else {
+                part
+            };
             self.emit(Instruction::store(
-                negated, result, offset, base_typ, base_bits,
+                stored, result, offset, base_typ, base_bits,
             ));
         }
         result
@@ -1202,26 +1372,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         // Perform the operation on the components
+        let ops = self.complex_half_ops(base_typ);
         let (result_real, result_imag) = match op {
             BinaryOp::Add => {
                 // (a + bi) + (c + di) = (a+c) + (b+d)i
                 let real = self.alloc_pseudo();
                 self.emit(Instruction::binop(
-                    Opcode::FAdd,
-                    real,
-                    left_real,
-                    right_real,
-                    base_typ,
-                    base_size,
+                    ops.add, real, left_real, right_real, base_typ, base_size,
                 ));
                 let imag = self.alloc_pseudo();
                 self.emit(Instruction::binop(
-                    Opcode::FAdd,
-                    imag,
-                    left_imag,
-                    right_imag,
-                    base_typ,
-                    base_size,
+                    ops.add, imag, left_imag, right_imag, base_typ, base_size,
                 ));
                 (real, imag)
             }
@@ -1229,23 +1390,34 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // (a + bi) - (c + di) = (a-c) + (b-d)i
                 let real = self.alloc_pseudo();
                 self.emit(Instruction::binop(
-                    Opcode::FSub,
-                    real,
-                    left_real,
-                    right_real,
-                    base_typ,
-                    base_size,
+                    ops.sub, real, left_real, right_real, base_typ, base_size,
                 ));
                 let imag = self.alloc_pseudo();
                 self.emit(Instruction::binop(
-                    Opcode::FSub,
-                    imag,
-                    left_imag,
-                    right_imag,
-                    base_typ,
-                    base_size,
+                    ops.sub, imag, left_imag, right_imag, base_typ, base_size,
                 ));
                 (real, imag)
+            }
+            // The integer forms are open-coded: there is no `__mulic3`, and
+            // the runtime helpers' NaN and infinity fix-ups are meaningless
+            // for integers. gcc emits the textbook formulae inline too.
+            BinaryOp::Mul if ops.integral => self.emit_complex_int_mul(
+                (left_real, left_imag),
+                (right_real, right_imag),
+                base_typ,
+                base_size,
+            ),
+            BinaryOp::Div if ops.integral => {
+                // Smith's method branches, so it writes the result itself
+                // rather than handing back a pair.
+                self.emit_complex_int_div(
+                    (left_real, left_imag),
+                    (right_real, right_imag),
+                    result_addr,
+                    base_typ,
+                    base_size,
+                );
+                return result_addr;
             }
             BinaryOp::Mul => {
                 // Complex multiply via rtlib call (__mulsc3, __muldc3, etc.)
@@ -1322,6 +1494,187 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         result_addr
+    }
+
+    /// `(a + bi) * (c + di)` for integer halves: `(ac - bd) + (ad + bc)i`.
+    ///
+    /// Open-coded rather than routed through `__mul?c3`: those helpers exist
+    /// only for the floating formats, and their infinity recovery has no
+    /// meaning for a type that wraps.
+    fn emit_complex_int_mul(
+        &mut self,
+        left: (PseudoId, PseudoId),
+        right: (PseudoId, PseudoId),
+        base_typ: TypeId,
+        base_size: u32,
+    ) -> (PseudoId, PseudoId) {
+        let (a, b) = left;
+        let (c, d) = right;
+        let ac = self.emit_int_binop(Opcode::Mul, a, c, base_typ, base_size);
+        let bd = self.emit_int_binop(Opcode::Mul, b, d, base_typ, base_size);
+        let ad = self.emit_int_binop(Opcode::Mul, a, d, base_typ, base_size);
+        let bc = self.emit_int_binop(Opcode::Mul, b, c, base_typ, base_size);
+        let real = self.emit_int_binop(Opcode::Sub, ac, bd, base_typ, base_size);
+        let imag = self.emit_int_binop(Opcode::Add, ad, bc, base_typ, base_size);
+        (real, imag)
+    }
+
+    /// `(a + bi) / (c + di)` for integer halves, by Smith's method -- the
+    /// algorithm gcc uses, so the same source computes the same thing.
+    ///
+    /// The textbook formula `((ac + bd) + (bc - ad)i) / (c*c + d*d)` is exact
+    /// but overflows: `4000000000u / 2u` needs `a * c` to hold 8e9, which a
+    /// 32-bit half cannot, and the quotient came out 926258176. Smith's method
+    /// divides through by the larger half first, so the products stay near the
+    /// magnitude of the operands.
+    ///
+    /// The cost is a branch -- the two arms differ in which half scales, and
+    /// the arm not taken would divide by zero if it were evaluated anyway, so
+    /// this cannot be done branch-free. The division truncates toward zero at
+    /// every step, like any integer division, which is why gcc (and c17)
+    /// answer `6 + 1i` for `(-9 + 38i) / (5 + 6i)` where the exact quotient is
+    /// `3 + 4i`. `cc/doc/BUILTIN.md` records that.
+    ///
+    /// Writes both halves to `result_addr` and leaves the cursor on the merge
+    /// block.
+    fn emit_complex_int_div(
+        &mut self,
+        left: (PseudoId, PseudoId),
+        right: (PseudoId, PseudoId),
+        result_addr: PseudoId,
+        base_typ: TypeId,
+        base_size: u32,
+    ) {
+        let (a, b) = left;
+        let (c, d) = right;
+        let unsigned = self.types.is_unsigned(base_typ);
+        let div = if unsigned { Opcode::DivU } else { Opcode::DivS };
+        let base_bytes = (base_size / 8) as i64;
+
+        // `|c| < |d|` decides which half scales. The absolute values are
+        // non-negative, so an unsigned compare would do for both -- but the
+        // signed predicate is used for signed halves so the comparison reads
+        // the same way the values do.
+        let abs_c = self.emit_int_abs(c, base_typ, base_size);
+        let abs_d = self.emit_int_abs(d, base_typ, base_size);
+        let cmp = if unsigned {
+            Opcode::SetB
+        } else {
+            Opcode::SetLt
+        };
+        let cond = self.emit_int_binop(cmp, abs_c, abs_d, base_typ, base_size);
+
+        let small_bb = self.alloc_bb();
+        let big_bb = self.alloc_bb();
+        let done_bb = self.alloc_bb();
+        let entry_bb = self.current_bb.expect("complex divide outside a block");
+        self.emit(Instruction::cbr(cond, small_bb, big_bb));
+        self.link_bb(entry_bb, small_bb);
+        self.link_bb(entry_bb, big_bb);
+
+        // `|c| >= |d|`: r = d/c, denom = c + d*r,
+        //               re = (a + b*r)/denom, im = (b - a*r)/denom.
+        self.switch_bb(big_bb);
+        let r = self.emit_int_binop(div, d, c, base_typ, base_size);
+        let dr = self.emit_int_binop(Opcode::Mul, d, r, base_typ, base_size);
+        let denom = self.emit_int_binop(Opcode::Add, c, dr, base_typ, base_size);
+        let br = self.emit_int_binop(Opcode::Mul, b, r, base_typ, base_size);
+        let num_re = self.emit_int_binop(Opcode::Add, a, br, base_typ, base_size);
+        let ar = self.emit_int_binop(Opcode::Mul, a, r, base_typ, base_size);
+        let num_im = self.emit_int_binop(Opcode::Sub, b, ar, base_typ, base_size);
+        self.store_complex_quotient(
+            result_addr,
+            (num_re, num_im),
+            denom,
+            div,
+            base_typ,
+            base_size,
+            base_bytes,
+        );
+        let big_end = self.current_bb.expect("complex divide lost its block");
+        self.emit(Instruction::br(done_bb));
+        self.link_bb(big_end, done_bb);
+
+        // `|c| < |d|`: r = c/d, denom = d + c*r,
+        //              re = (a*r + b)/denom, im = (b*r - a)/denom.
+        self.switch_bb(small_bb);
+        let r = self.emit_int_binop(div, c, d, base_typ, base_size);
+        let cr = self.emit_int_binop(Opcode::Mul, c, r, base_typ, base_size);
+        let denom = self.emit_int_binop(Opcode::Add, d, cr, base_typ, base_size);
+        let ar = self.emit_int_binop(Opcode::Mul, a, r, base_typ, base_size);
+        let num_re = self.emit_int_binop(Opcode::Add, ar, b, base_typ, base_size);
+        let br = self.emit_int_binop(Opcode::Mul, b, r, base_typ, base_size);
+        let num_im = self.emit_int_binop(Opcode::Sub, br, a, base_typ, base_size);
+        self.store_complex_quotient(
+            result_addr,
+            (num_re, num_im),
+            denom,
+            div,
+            base_typ,
+            base_size,
+            base_bytes,
+        );
+        let small_end = self.current_bb.expect("complex divide lost its block");
+        self.emit(Instruction::br(done_bb));
+        self.link_bb(small_end, done_bb);
+
+        self.switch_bb(done_bb);
+    }
+
+    /// Divide both numerators by the shared denominator and store the halves.
+    ///
+    /// Shared by Smith's two arms, which differ only in how they build the
+    /// numerators.
+    #[allow(clippy::too_many_arguments)]
+    fn store_complex_quotient(
+        &mut self,
+        result_addr: PseudoId,
+        num: (PseudoId, PseudoId),
+        denom: PseudoId,
+        div: Opcode,
+        base_typ: TypeId,
+        base_size: u32,
+        base_bytes: i64,
+    ) {
+        let re = self.emit_int_binop(div, num.0, denom, base_typ, base_size);
+        let im = self.emit_int_binop(div, num.1, denom, base_typ, base_size);
+        self.emit(Instruction::store(re, result_addr, 0, base_typ, base_size));
+        self.emit(Instruction::store(
+            im,
+            result_addr,
+            base_bytes,
+            base_typ,
+            base_size,
+        ));
+    }
+
+    /// `|x|` for an integer, without a branch.
+    ///
+    /// `t = x >> (width - 1)` is all ones for a negative value and zero
+    /// otherwise, so `(x ^ t) - t` is the magnitude either way. An unsigned
+    /// value is already its own magnitude.
+    fn emit_int_abs(&mut self, x: PseudoId, typ: TypeId, size: u32) -> PseudoId {
+        if self.types.is_unsigned(typ) {
+            return x;
+        }
+        let shift = self.emit_const((size - 1) as i128, typ);
+        let sign = self.emit_int_binop(Opcode::Asr, x, shift, typ, size);
+        let flipped = self.emit_int_binop(Opcode::Xor, x, sign, typ, size);
+        self.emit_int_binop(Opcode::Sub, flipped, sign, typ, size)
+    }
+
+    /// One integer binary operation on complex halves, into a fresh pseudo.
+    fn emit_int_binop(
+        &mut self,
+        op: Opcode,
+        lhs: PseudoId,
+        rhs: PseudoId,
+        typ: TypeId,
+        size: u32,
+    ) -> PseudoId {
+        let dst = self.alloc_pseudo();
+        self.emit(Instruction::binop(op, dst, lhs, rhs, typ, size));
+        dst
     }
 
     /// Allocate a local temporary variable for a complex result
@@ -1445,24 +1798,15 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) -> PseudoId {
         let (real, imag, base_typ, base_bits) = self.load_complex_halves(addr, complex_typ);
 
-        let zero = self.emit_fconst(FloatVal::ZERO, base_typ);
+        let ne = self.complex_half_ops(base_typ).ne;
+        let zero = self.complex_half_zero(base_typ);
         let real_nz = self.alloc_pseudo();
         self.emit(Instruction::binop(
-            Opcode::FCmpONe,
-            real_nz,
-            real,
-            zero,
-            base_typ,
-            base_bits,
+            ne, real_nz, real, zero, base_typ, base_bits,
         ));
         let imag_nz = self.alloc_pseudo();
         self.emit(Instruction::binop(
-            Opcode::FCmpONe,
-            imag_nz,
-            imag,
-            zero,
-            base_typ,
-            base_bits,
+            ne, imag_nz, imag, zero, base_typ, base_bits,
         ));
 
         let result = self.alloc_pseudo();
@@ -1495,10 +1839,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         let (lre, lim, base_typ, base_bits) = self.load_complex_halves(left_addr, complex_typ);
         let (rre, rim, _, _) = self.load_complex_halves(right_addr, complex_typ);
 
+        let ops = self.complex_half_ops(base_typ);
         let (half_op, combine) = if op == BinaryOp::Eq {
-            (Opcode::FCmpOEq, Opcode::And)
+            (ops.eq, Opcode::And)
         } else {
-            (Opcode::FCmpONe, Opcode::Or)
+            (ops.ne, Opcode::Or)
         };
 
         let real_cmp = self.alloc_pseudo();
@@ -1702,6 +2047,133 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
+    /// Resolve a read-modify-write target, evaluating its subexpressions once.
+    ///
+    /// `None` for a bare identifier: it has no subexpressions, so nothing can
+    /// be evaluated twice, and the name-based paths handle the shapes that
+    /// have no address at all -- a parameter living in `var_map`, and a static
+    /// local behind its sentinel.
+    pub(crate) fn resolve_rmw_place(&mut self, target: &Expr) -> Option<RmwPlace> {
+        match &target.kind {
+            ExprKind::Ident(_) => None,
+            ExprKind::Member { expr, member } => {
+                let base = self.linearize_lvalue(expr);
+                let struct_type = {
+                    let declared = self.expr_type(expr);
+                    self.resolve_struct_type(declared)
+                };
+                Some(self.member_place(base, struct_type, *member, target))
+            }
+            ExprKind::Arrow { expr, member } => {
+                // The pointer's *value* is the base address.
+                let base = self.linearize_expr(expr);
+                let struct_type = {
+                    let ptr_type = self.expr_type(expr);
+                    let declared = self
+                        .types
+                        .base_type(ptr_type)
+                        .unwrap_or_else(|| self.expr_type(target));
+                    self.resolve_struct_type(declared)
+                };
+                Some(self.member_place(base, struct_type, *member, target))
+            }
+            // Every other lvalue has one address and no bit-field placement.
+            // `linearize_lvalue` is what evaluates the subexpressions, and it
+            // does so once.
+            _ => Some(RmwPlace {
+                base: self.linearize_lvalue(target),
+                bitfield: None,
+            }),
+        }
+    }
+
+    /// The place a struct or union member occupies, relative to `base`.
+    fn member_place(
+        &mut self,
+        base: PseudoId,
+        struct_type: TypeId,
+        member: crate::strings::StringId,
+        target: &Expr,
+    ) -> RmwPlace {
+        let target_typ = self.expr_type(target);
+        let info = self
+            .types
+            .find_member(struct_type, member)
+            .unwrap_or(MemberInfo {
+                offset: 0,
+                typ: target_typ,
+                bit_offset: None,
+                bit_width: None,
+                access_bytes: None,
+            });
+        let bitfield = match (info.bit_offset, info.bit_width, info.access_bytes) {
+            (Some(bit_offset), Some(bit_width), Some(storage)) => {
+                Some((info.offset, bit_offset, bit_width, storage, info.typ))
+            }
+            // Not a bit-field: fold the member offset into the base so the
+            // load and the store share one address.
+            _ => {
+                let base = self.offset_address(base, info.offset as i64);
+                return RmwPlace {
+                    base,
+                    bitfield: None,
+                };
+            }
+        };
+        RmwPlace { base, bitfield }
+    }
+
+    /// `base + offset` as an address, or `base` itself when the offset is zero.
+    fn offset_address(&mut self, base: PseudoId, offset: i64) -> PseudoId {
+        if offset == 0 {
+            return base;
+        }
+        let delta = self.emit_const(offset as i128, self.types.long_id);
+        let addr = self.alloc_reg_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Add,
+            addr,
+            base,
+            delta,
+            self.types.long_id,
+            64,
+        ));
+        addr
+    }
+
+    /// The target's current value, read through an already-resolved place.
+    pub(crate) fn load_rmw_place(&mut self, place: &RmwPlace, typ: TypeId) -> PseudoId {
+        if let Some((offset, bit_offset, bit_width, storage, field_typ)) = place.bitfield {
+            return self.emit_bitfield_load(
+                place.base, offset, bit_offset, bit_width, storage, field_typ,
+            );
+        }
+        let size = self.types.size_bits(typ);
+        let val = self.alloc_reg_pseudo();
+        self.emit(Instruction::load(val, place.base, 0, typ, size));
+        val
+    }
+
+    /// Store back through the same place.
+    ///
+    /// Answers the bit-field's width and type when the store went through one,
+    /// so the caller can reduce the expression's own value to what the field
+    /// now holds (C17 6.5.16.1p2).
+    pub(crate) fn store_rmw_place(
+        &mut self,
+        place: &RmwPlace,
+        val: PseudoId,
+        typ: TypeId,
+    ) -> Option<(u32, TypeId)> {
+        if let Some((offset, bit_offset, bit_width, storage, field_typ)) = place.bitfield {
+            self.emit_bitfield_store(place.base, offset, bit_offset, bit_width, storage, val);
+            return Some((bit_width, field_typ));
+        }
+        let size = self.types.size_bits(typ);
+        self.emit(Instruction::store(val, place.base, 0, typ, size));
+        None
+    }
+
     pub(crate) fn emit_assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) -> PseudoId {
         let target_typ = self.expr_type(target);
         let value_typ = self.expr_type(value);
@@ -1840,7 +2312,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                 dst_size,
             ));
 
-            return real; // Return real part as the result value
+            // The value of the assignment is the object assigned to, and a
+            // complex object travels by *address* -- as the real-to-complex
+            // branch above already returns. Handing back the real part's value
+            // gave every consumer a `double` where a pointer belongs, so
+            // `c = a` was fine as a statement and `if (c = a)` segfaulted.
+            return target_addr;
         }
 
         // For struct/union assignment, do a block copy via addresses.
@@ -1897,21 +2374,59 @@ impl<'a> super::linearize::Linearizer<'a> {
                 64,
             ));
             scaled
-        } else if bool_rhs.is_some() {
+        } else if bool_rhs.is_some() || op != AssignOp::Assign {
+            // A compound assignment leaves its right operand alone here. It is
+            // converted to the *common* type below, not down to the target's:
+            // narrowing `-5` to `unsigned char` first made `x /= y` divide
+            // 50 by 251 and store 0, where C17 6.5.16.2p3 computes `50 / -5`
+            // at `int` and stores `(unsigned char)-10`.
             rhs
         } else {
             self.emit_convert(rhs, value_typ, target_typ)
         };
 
+        // The target is resolved exactly once (C17 6.5.16.2p3) and the same
+        // place serves the load below and the store further down. Reading the
+        // old value from the *expression* and then re-deriving the address ran
+        // every subexpression of the target twice.
+        //
+        // A plain assignment resolves its target here too. It never had the
+        // double-evaluation bug -- there is no load to pair with the store --
+        // but it must share the one store path, and C17 6.5.16p3 leaves the
+        // order of the two operands unsequenced, so computing the address
+        // after the value is allowed.
+        let place = self.resolve_rmw_place(target);
+
         let final_val = match op {
             AssignOp::Assign => rhs,
             _ => {
                 // Compound assignment - get current value and apply operation
-                let lhs = self.linearize_expr(target);
+                let lhs = match &place {
+                    Some(p) => self.load_rmw_place(p, target_typ),
+                    None => self.linearize_expr(target),
+                };
                 let result = self.alloc_reg_pseudo();
 
-                let is_float = self.types.is_float(target_typ);
-                let is_unsigned = self.types.is_unsigned(target_typ);
+                // `E1 op= E2` is `E1 = E1 op E2` (C17 6.5.16.2p3), so the
+                // operation runs at the operands' common type after the
+                // integer promotions -- not at the target's type, which is
+                // only what the *result* converts back to.
+                //
+                // The shifts are the exception: 6.5.7p3 gives the result the
+                // promoted *left* operand's type, and promotes the right one
+                // on its own.
+                let arith_type = if is_ptr_arith {
+                    // Pointer arithmetic already scaled the index; the add
+                    // happens at pointer width.
+                    self.types.long_id
+                } else if matches!(op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
+                    self.types.integer_promote(target_typ)
+                } else {
+                    self.types.common_type(target_typ, value_typ)
+                };
+
+                let is_float = self.types.is_float(arith_type);
+                let is_unsigned = self.types.is_unsigned(arith_type);
                 let opcode = match op {
                     AssignOp::AddAssign => {
                         if is_float {
@@ -1965,233 +2480,92 @@ impl<'a> super::linearize::Linearizer<'a> {
                     AssignOp::Assign => unreachable!(),
                 };
 
-                // For pointer arithmetic, use Long type for the operation
-                let arith_type = if is_ptr_arith {
-                    self.types.long_id
-                } else {
-                    target_typ
-                };
-
                 let arith_size = self.types.size_bits(arith_type);
+                // Both operands into the arithmetic type. The left one is the
+                // object's current value, read at the target's type; the right
+                // one is whatever it was written as.
+                let lhs = if is_ptr_arith {
+                    lhs
+                } else {
+                    self.emit_convert(lhs, target_typ, arith_type)
+                };
+                let rhs = if is_ptr_arith {
+                    rhs
+                } else if matches!(op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
+                    // The shift count is promoted on its own and is not
+                    // brought to the left operand's type.
+                    self.emit_convert(rhs, value_typ, self.types.integer_promote(value_typ))
+                } else {
+                    self.emit_convert(rhs, value_typ, arith_type)
+                };
                 self.emit(Instruction::binop(
                     opcode, result, lhs, rhs, arith_type, arith_size,
                 ));
-                result
+                // And the result back, which is the conversion that makes
+                // `(x /= y)` yield what `x` now holds.
+                if is_ptr_arith {
+                    result
+                } else {
+                    self.emit_convert(result, arith_type, target_typ)
+                }
             }
         };
 
         // Store based on target expression type
         let target_size = self.types.size_bits(target_typ);
-        match &target.kind {
-            ExprKind::Ident(symbol_id) => {
-                let name_str = self.symbol_name(*symbol_id);
-                if let Some(local) = self.locals.get(symbol_id).cloned() {
-                    // Check if this is a static local (sentinel value)
-                    if local.sym.0 == u32::MAX {
-                        self.emit_static_local_store(&name_str, final_val, target_typ, target_size);
-                    } else {
-                        // Regular local variable: emit Store
-                        self.emit(Instruction::store(
-                            final_val,
-                            local.sym,
-                            0,
-                            target_typ,
-                            target_size,
-                        ));
-                    }
-                } else if self.var_map.contains_key(&name_str) {
-                    // Parameter: this is not SSA-correct but parameters
-                    // shouldn't be reassigned. If they are, we'd need to
-                    // demote them to locals. For now, just update the mapping.
-                    self.var_map.insert(name_str.clone(), final_val);
+        if let Some(p) = &place {
+            // The address the load came from, so no subexpression runs twice.
+            let narrowed = self.store_rmw_place(p, final_val, target_typ);
+            return match narrowed {
+                Some((bit_width, typ)) => self.narrow_to_bitfield(final_val, bit_width, typ),
+                None => final_val,
+            };
+        }
+        // Only a bare identifier reaches here: `resolve_rmw_place`
+        // answers `Some` for every other lvalue and the branch above
+        // stores through it. The arms that used to be here re-derived
+        // an address that had already been computed, which is exactly
+        // what ran the target a second time.
+        if let ExprKind::Ident(symbol_id) = &target.kind {
+            let name_str = self.symbol_name(*symbol_id);
+            if let Some(local) = self.locals.get(symbol_id).cloned() {
+                // Check if this is a static local (sentinel value)
+                if local.sym.0 == u32::MAX {
+                    self.emit_static_local_store(&name_str, final_val, target_typ, target_size);
                 } else {
-                    // Global variable - emit store
-                    let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, name_str);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
+                    // Regular local variable: emit Store
                     self.emit(Instruction::store(
                         final_val,
-                        sym_id,
+                        local.sym,
                         0,
                         target_typ,
                         target_size,
                     ));
                 }
-            }
-            ExprKind::Member { expr, member } => {
-                // Struct member: get address and store with offset
-                let base = self.linearize_lvalue(expr);
-                let base_struct_type = self.expr_type(expr);
-                // Resolve if the struct type is incomplete (forward-declared)
-                let struct_type = self.resolve_struct_type(base_struct_type);
-                let member_info =
-                    self.types
-                        .find_member(struct_type, *member)
-                        .unwrap_or(MemberInfo {
-                            offset: 0,
-                            typ: target_typ,
-                            bit_offset: None,
-                            bit_width: None,
-                            access_bytes: None,
-                        });
-                if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
-                    member_info.bit_offset,
-                    member_info.bit_width,
-                    member_info.access_bytes,
-                ) {
-                    // Bitfield store
-                    self.emit_bitfield_store(
-                        base,
-                        member_info.offset,
-                        bit_offset,
-                        bit_width,
-                        storage_size,
-                        final_val,
-                    );
-                } else {
-                    let member_size = self.types.size_bits(member_info.typ);
-                    self.emit(Instruction::store(
-                        final_val,
-                        base,
-                        member_info.offset as i64,
-                        member_info.typ,
-                        member_size,
-                    ));
+            } else if self.var_map.contains_key(&name_str) {
+                // Parameter: this is not SSA-correct but parameters
+                // shouldn't be reassigned. If they are, we'd need to
+                // demote them to locals. For now, just update the mapping.
+                self.var_map.insert(name_str.clone(), final_val);
+            } else {
+                // Global variable - emit store
+                let sym_id = self.alloc_pseudo();
+                let pseudo = Pseudo::sym(sym_id, name_str);
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(pseudo);
                 }
-            }
-            ExprKind::Arrow { expr, member } => {
-                // Pointer member: pointer value is the base address
-                let ptr = self.linearize_expr(expr);
-                let ptr_type = self.expr_type(expr);
-                let base_struct_type = self.types.base_type(ptr_type).unwrap_or(target_typ);
-                // Resolve if the struct type is incomplete (forward-declared)
-                let struct_type = self.resolve_struct_type(base_struct_type);
-                let member_info =
-                    self.types
-                        .find_member(struct_type, *member)
-                        .unwrap_or(MemberInfo {
-                            offset: 0,
-                            typ: target_typ,
-                            bit_offset: None,
-                            bit_width: None,
-                            access_bytes: None,
-                        });
-                if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
-                    member_info.bit_offset,
-                    member_info.bit_width,
-                    member_info.access_bytes,
-                ) {
-                    // Bitfield store
-                    self.emit_bitfield_store(
-                        ptr,
-                        member_info.offset,
-                        bit_offset,
-                        bit_width,
-                        storage_size,
-                        final_val,
-                    );
-                } else {
-                    let member_size = self.types.size_bits(member_info.typ);
-                    self.emit(Instruction::store(
-                        final_val,
-                        ptr,
-                        member_info.offset as i64,
-                        member_info.typ,
-                        member_size,
-                    ));
-                }
-            }
-            ExprKind::Unary {
-                op: UnaryOp::Real | UnaryOp::Imag,
-                ..
-            } => {
-                // `__real__ z = v` and `__imag__ z = v` name one half of the
-                // complex object. `linearize_lvalue` gives the address of that
-                // half, and the target type is already the *base* type, so the
-                // ordinary scalar store is right -- including for the compound
-                // forms, which computed `final_val` above the same way.
-                let addr = self.linearize_lvalue(target);
                 self.emit(Instruction::store(
                     final_val,
-                    addr,
+                    sym_id,
                     0,
                     target_typ,
                     target_size,
                 ));
-            }
-            ExprKind::Unary {
-                op: UnaryOp::Deref,
-                operand,
-            } => {
-                // Dereference: store to the pointer address
-                let ptr = self.linearize_expr(operand);
-                self.emit(Instruction::store(
-                    final_val,
-                    ptr,
-                    0,
-                    target_typ,
-                    target_size,
-                ));
-            }
-            ExprKind::Index { array, index } => {
-                // Array subscript: compute address and store
-                // Handle commutative form: 0[arr] is equivalent to arr[0]
-                let array_type = self.expr_type(array);
-                let index_type = self.expr_type(index);
-
-                let array_kind = self.types.kind(array_type);
-                let (ptr_expr, idx_expr, idx_type) =
-                    if array_kind == TypeKind::Pointer || array_kind == TypeKind::Array {
-                        (array, index, index_type)
-                    } else {
-                        // Swap: index is actually the pointer/array
-                        (index, array, array_type)
-                    };
-
-                let arr = self.linearize_expr(ptr_expr);
-                let idx = self.linearize_expr(idx_expr);
-                let elem_size = target_size / 8;
-                let elem_size_val = self.emit_const(elem_size as i128, self.types.long_id);
-
-                // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
-                let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
-
-                let offset = self.alloc_pseudo();
-                let ptr_typ = self.types.long_id;
-                self.emit(Instruction::binop(
-                    Opcode::Mul,
-                    offset,
-                    idx_extended,
-                    elem_size_val,
-                    ptr_typ,
-                    64,
-                ));
-
-                let addr = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::Add,
-                    addr,
-                    arr,
-                    offset,
-                    ptr_typ,
-                    64,
-                ));
-
-                self.emit(Instruction::store(
-                    final_val,
-                    addr,
-                    0,
-                    target_typ,
-                    target_size,
-                ));
-            }
-            _ => {
-                // Other lvalues - should not happen for valid C code
             }
         }
 
+        // A bare identifier is never a bit-field, so there is nothing to
+        // reduce: the bit-field answer comes from `store_rmw_place` above.
         final_val
     }
 }

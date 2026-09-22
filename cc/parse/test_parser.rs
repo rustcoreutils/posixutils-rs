@@ -5534,3 +5534,258 @@ fn test_switch_bodies_that_need_no_wrapping_are_unchanged() {
         "an unlabelled body gained a wrapper: {body:#?}"
     );
 }
+
+// Libc-alias builtins: the type of the synthesized declaration
+//
+// These lower to an ordinary call to the same-named library function. When no
+// header has declared it -- which is the case the torture suite exercises --
+// c17 synthesizes the declaration, and the return type it picks is what the
+// call expression carries. A pointer-returning entry typed `int` here
+// truncates the returned address to 32 bits at run time.
+
+/// Every pointer-returning libc alias must parse to a pointer-typed call.
+#[test]
+fn test_library_builtin_pointer_returns() {
+    for (call, base) in [
+        ("__builtin_strcpy(0, 0)", TypeKind::Char),
+        ("__builtin_strncpy(0, 0, 0)", TypeKind::Char),
+        ("__builtin_stpcpy(0, 0)", TypeKind::Char),
+        ("__builtin_strcat(0, 0)", TypeKind::Char),
+        ("__builtin_strncat(0, 0, 0)", TypeKind::Char),
+        ("__builtin_strchr(0, 0)", TypeKind::Char),
+        ("__builtin_strrchr(0, 0)", TypeKind::Char),
+        ("__builtin_strstr(0, 0)", TypeKind::Char),
+        ("__builtin_malloc(0)", TypeKind::Void),
+        ("__builtin_calloc(0, 0)", TypeKind::Void),
+        ("__builtin_realloc(0, 0)", TypeKind::Void),
+        ("__builtin_mempcpy(0, 0, 0)", TypeKind::Void),
+    ] {
+        let (expr, types, _, _) = parse_expr(call).unwrap();
+        assert!(
+            matches!(expr.kind, ExprKind::Call { .. }),
+            "{call} did not lower to a call"
+        );
+        let typ = expr.typ.unwrap_or_else(|| panic!("{call} has no type"));
+        assert_eq!(
+            types.kind(typ),
+            TypeKind::Pointer,
+            "{call} returns {:?}, not a pointer -- a 64-bit address would be truncated",
+            types.kind(typ)
+        );
+        assert_eq!(
+            types.kind(types.get(typ).base.unwrap()),
+            base,
+            "{call} points at the wrong type"
+        );
+    }
+}
+
+/// The integer- and void-returning aliases, for the same reason in reverse:
+/// widening `int` to a pointer would be just as wrong.
+#[test]
+fn test_library_builtin_scalar_returns() {
+    for (call, want) in [
+        ("__builtin_memcmp(0, 0, 0)", TypeKind::Int),
+        ("__builtin_strncmp(0, 0, 0)", TypeKind::Int),
+        ("__builtin_printf(0)", TypeKind::Int),
+        ("__builtin_sprintf(0, 0)", TypeKind::Int),
+        ("__builtin_snprintf(0, 0, 0)", TypeKind::Int),
+        ("__builtin_puts(0)", TypeKind::Int),
+        ("__builtin_abort()", TypeKind::Void),
+        ("__builtin_exit(0)", TypeKind::Void),
+        ("__builtin_free(0)", TypeKind::Void),
+    ] {
+        let (expr, types, _, _) = parse_expr(call).unwrap();
+        assert!(
+            matches!(expr.kind, ExprKind::Call { .. }),
+            "{call} did not lower to a call"
+        );
+        let typ = expr.typ.unwrap_or_else(|| panic!("{call} has no type"));
+        assert_eq!(types.kind(typ), want, "{call} has the wrong return type");
+    }
+}
+
+/// The printf family is variadic *after* a fixed format argument. Declaring it
+/// variadic from argument zero misplaces that argument on Apple arm64, where
+/// variadic arguments go on the stack and fixed ones stay in registers.
+#[test]
+fn test_library_builtin_printf_family_fixed_arity() {
+    for (call, fixed) in [
+        ("__builtin_printf(0)", 1usize),
+        ("__builtin_sprintf(0, 0)", 2),
+        ("__builtin_snprintf(0, 0, 0)", 3),
+    ] {
+        let (expr, types, _, _) = parse_expr(call).unwrap();
+        let ExprKind::Call { func, .. } = &expr.kind else {
+            panic!("{call} did not lower to a call");
+        };
+        let ftyp = func.typ.unwrap();
+        let info = types.get(ftyp);
+        assert!(info.variadic, "{call} must be variadic");
+        assert_eq!(
+            info.params.as_ref().map(|p| p.len()),
+            Some(fixed),
+            "{call} has the wrong fixed-argument count"
+        );
+    }
+}
+
+// __complex__ / __complex: gcc's spellings of _Complex
+//
+// Without them, `__complex__ float f(void)` parses as a declaration naming no
+// type and draws the implicit-int diagnostic, which blames the wrong thing.
+
+/// All three spellings produce the same type.
+#[test]
+fn test_gnu_complex_spellings_agree() {
+    let mut seen: Vec<(&str, TypeKind, u32)> = Vec::new();
+    for decl in [
+        "_Complex double v;",
+        "__complex__ double v;",
+        "__complex double v;",
+    ] {
+        let (d, types, _, _) = parse_decl(decl).unwrap_or_else(|e| panic!("{decl}: {e:?}"));
+        let typ = d.declarators[0].typ;
+        seen.push((decl, types.kind(typ), types.size_bits(typ)));
+    }
+    let (first_spelling, first_kind, first_bits) = seen[0];
+    for (spelling, kind, bits) in &seen[1..] {
+        assert_eq!(
+            (*kind, *bits),
+            (first_kind, first_bits),
+            "{spelling} gave a different type than {first_spelling}"
+        );
+    }
+    // And it really is complex, not a bare double that happened to match.
+    assert_eq!(first_bits, 128, "_Complex double should be two doubles");
+}
+
+/// The GNU spellings carry the COMPLEX modifier in a type-name position too
+/// (a cast or a `sizeof`), not only in a declaration.
+#[test]
+fn test_gnu_complex_in_type_name() {
+    for spelling in ["_Complex float", "__complex__ float", "__complex float"] {
+        let src = format!("sizeof({spelling})");
+        let (expr, types, _, _) = parse_expr(&src)
+            .unwrap_or_else(|e| panic!("{spelling} failed to parse as a type name: {e:?}"));
+        let ExprKind::SizeofType(typ, _) = expr.kind else {
+            panic!("sizeof({spelling}) gave {:?}", expr.kind);
+        };
+        assert_eq!(
+            types.size_bits(typ),
+            64,
+            "{spelling} in a type name is not a complex float"
+        );
+    }
+}
+
+/// `_Complex` applies to the integer types too, and doubles their size.
+///
+/// The `COMPLEX` size multiplier reached only the floating kinds, so
+/// `sizeof(_Complex int)` was 4 -- the width of one half -- and every write
+/// of an imaginary part landed one object past the end of the storage.
+#[test]
+fn test_complex_integer_type_sizes() {
+    for (spelling, want_bits) in [
+        ("_Complex signed char", 16),
+        ("_Complex unsigned char", 16),
+        ("_Complex short", 32),
+        ("_Complex unsigned short", 32),
+        ("_Complex int", 64),
+        ("_Complex unsigned", 64),
+        ("_Complex unsigned int", 64),
+        ("_Complex long", 128),
+        ("_Complex unsigned long", 128),
+        ("_Complex long long", 128),
+        // The GNU spellings mean the same thing here as for floating bases.
+        ("__complex__ int", 64),
+        ("__complex int", 64),
+        // And the floating ones are unchanged.
+        ("_Complex float", 64),
+        ("_Complex double", 128),
+    ] {
+        let src = format!("sizeof({spelling})");
+        let (expr, types, _, _) =
+            parse_expr(&src).unwrap_or_else(|e| panic!("{spelling} did not parse: {e:?}"));
+        let ExprKind::SizeofType(typ, _) = expr.kind else {
+            panic!("sizeof({spelling}) gave {:?}", expr.kind);
+        };
+        assert_eq!(
+            types.size_bits(typ),
+            want_bits,
+            "{spelling} is the wrong width"
+        );
+        assert!(types.is_complex(typ), "{spelling} is not complex");
+    }
+}
+
+/// An imaginary constant with an integer value is a `_Complex int`.
+///
+/// These were rejected outright while c17 had no complex integer type --
+/// deliberately, rather than being given a floating type, which would have
+/// changed what the program computes. Both markers are accepted, and the
+/// literal becomes a complex value with a zero real part whose *own* type
+/// matches the base's family: giving an integer's real half a `FloatLit` made
+/// the constant folder carry an integer complex as two floats.
+#[test]
+fn test_imaginary_integer_constants() {
+    for (src, want_bits) in [
+        ("2i", 64),
+        ("2j", 64),
+        ("2I", 64),
+        ("200i", 64),
+        ("2uli", 128),
+        ("2lli", 128),
+    ] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let typ = expr.typ.unwrap_or_else(|| panic!("{src} has no type"));
+        assert!(
+            types.is_complex_integer(typ),
+            "{src} should be a complex *integer*"
+        );
+        assert_eq!(types.size_bits(typ), want_bits, "{src} width");
+        let ExprKind::BuiltinComplex { real, imag } = &expr.kind else {
+            panic!("{src} gave {:?}", expr.kind);
+        };
+        // The real half is an integer zero, not a floating one.
+        assert!(
+            matches!(real.kind, ExprKind::IntLit(0)),
+            "{src}: real half is {:?}",
+            real.kind
+        );
+        assert!(
+            matches!(imag.kind, ExprKind::IntLit(_)),
+            "{src}: imaginary half is {:?}",
+            imag.kind
+        );
+    }
+
+    // The control: the same numbers without a marker stay real.
+    for src in ["2", "200", "2ul", "2ll"] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let typ = expr.typ.unwrap_or_else(|| panic!("{src} has no type"));
+        assert!(!types.is_complex(typ), "{src} should not be complex");
+    }
+
+    // A floating imaginary constant still gets a floating complex type and a
+    // floating zero.
+    for src in ["1.0i", "1.0fi", "1.0li"] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let typ = expr.typ.unwrap_or_else(|| panic!("{src} has no type"));
+        assert!(
+            types.is_complex_float(typ),
+            "{src} should be a complex float"
+        );
+        let ExprKind::BuiltinComplex { real, .. } = &expr.kind else {
+            panic!("{src} gave {:?}", expr.kind);
+        };
+        assert!(
+            matches!(real.kind, ExprKind::FloatLit(_)),
+            "{src}: real half is {:?}",
+            real.kind
+        );
+    }
+}

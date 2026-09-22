@@ -312,6 +312,29 @@ pub fn warnings_suppressed() -> bool {
     SUPPRESS_WARNINGS.load(Ordering::Relaxed)
 }
 
+/// `-fpermissive`: accept two pre-C99 constructs as warnings.
+///
+/// Exactly two, both removed by C99 and both an error here by default:
+/// implicit `int` in a declaration that names no type (6.7.2p2), and the
+/// implicit declaration of a function called before it is declared (6.5.1p2).
+///
+/// This is not a dialect switch and does not make c17 a C89 compiler. The
+/// language it accepts is still C17; `-std=` remains inert. gcc draws the same
+/// line -- it rejects both by default too, and its own testsuite marks the
+/// cases that need them with `-fpermissive` or `-std=gnu89` rather than
+/// expecting them to compile.
+static PERMISSIVE: AtomicBool = AtomicBool::new(false);
+
+/// Turn on `-fpermissive` for the rest of the process.
+pub fn set_permissive() {
+    PERMISSIVE.store(true, Ordering::Relaxed);
+}
+
+/// Is `-fpermissive` in effect?
+pub fn permissive() -> bool {
+    PERMISSIVE.load(Ordering::Relaxed)
+}
+
 pub fn has_error() -> u32 {
     HAS_ERROR.load(Ordering::Relaxed)
 }

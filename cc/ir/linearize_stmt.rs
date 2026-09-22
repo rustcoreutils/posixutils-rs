@@ -1062,7 +1062,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.emit(Instruction::store(
                 converted, base_sym, offset, base_typ, base_bits,
             ));
-            let zero = self.emit_fconst(FloatVal::ZERO, base_typ);
+            let zero = self.complex_half_zero(base_typ);
             self.emit(Instruction::store(
                 zero,
                 base_sym,

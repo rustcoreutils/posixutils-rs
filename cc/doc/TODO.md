@@ -135,6 +135,48 @@ are the place to look next:
   (`arch/*/regalloc.rs`, `size.max(8)` with `reusable = false`), so a 4-byte
   `int` costs 8.
 
+**Why `reusable = false` cannot simply be flipped** (traced 2026-09-21).
+Setting it true changes nothing, and neither does the gate its own comment
+proposes — `!addr_taken_syms.contains(..)` excludes every array, since indexing
+emits `SymAddr`. The blocker is upstream of the flag: **a Sym pseudo has no
+defining instruction**, so backward liveness finds every use upward-exposed and
+propagates it to function entry. `compute_live_intervals` then gives anything
+live-in `start = block_start_pos`, so every local's interval begins at 0. Six
+`int[16]` locals in six disjoint scopes come out as
+`[0,12] [0,35] [0,58] [0,81] [0,104] [0,127]` — all overlapping at 0, so
+`try_reuse_stack_slot` never finds a free slot and the pool stays empty for the
+whole function.
+
+A fix needs both ends of the interval: a **start** at the local's declaration
+rather than 0, which is what unblocks reuse; and an **end** extended over every
+pseudo derived from the Sym (`SymAddr`, and copies or arithmetic on that
+pointer), with a Sym whose address escapes staying permanent — which is what
+makes reuse *safe*, and whose absence was the slot-reuse corruption fixed in
+2026-05.
+
+Scale, measured on `Python/ceval.c` at -O2, per function: c17's largest frame
+is **7256 bytes** against gcc's **376**, and c17 emits a frame for 134
+functions where gcc emits one for 44. `_PyEval_EvalFrameDefault` is the
+outlier, and it is also the function that recurses, which is why the five
+CPython tests above are the ones that fail.
+
+A second, independent contributor: c17 spills values gcc keeps in registers. A
+function whose locals never have their address taken and never outlive a call
+still gets a frame — 16 bytes where gcc needs none — and eight simultaneously
+live `int`s cost 72 bytes where gcc uses callee-saved registers and none. Slot
+reuse is the larger multiplier, but this is why even leaf functions carry a
+frame.
+
+### A by-value struct argument is still copied word by word in the backend
+
+Fixed at the IR level: copies past 128 bytes now become a `memcpy` call, which
+took a 256 KB by-value struct from a 65-second compile to 0.01 s. The backend
+still unrolls the *stacked-argument* copy at instruction-selection time, so the
+same case emits ~65,000 `movq` where gcc emits one `call memcpy`. Compile time
+is no longer the problem; code size is. The fix belongs wherever the stacked
+argument is written, and has to avoid clobbering argument registers already set
+up — which is why it was not folded into the IR-level change.
+
 ### R10 reserved globally for division scratch
 
 **Location**: `arch/x86_64/regalloc.rs` lines 187-208
@@ -152,6 +194,19 @@ are the place to look next:
 ---
 
 ## Known Divergences
+
+### `_Generic` on a wide bit-field expression
+
+`_Generic((x.b + 0), unsigned long long: ...)` with `unsigned long long b : 40`
+matches `unsigned long long` here and matches **nothing** under gcc, which
+treats the 40-bit width as part of the type for selection purposes.
+
+Not worth closing at the price it asks. The width rides beside the type rather
+than in it, precisely so `sizeof` stays 8 and the ABI, DWARF and both backends
+keep seeing `unsigned long long` — putting it in the `TypeId` would make
+`types_compatible`, `common_type` and `emit_convert` all disagree with
+themselves. No torture test depends on it.
+
 
 Behaviours where c17 differs from gcc on the same source. None is a
 translation-limit or a diagnostic gap; each silently changes what the program
@@ -495,7 +550,7 @@ work, and were never a claim about the language.
 
 | Suite | Note |
 |-------|------|
-| GCC torture tests (C99 subset) | Not run against c17 |
+| GCC torture tests (C99 subset) | **Running.** `cc/scripts/c17_torture.sh`, baselined |
 | clang test suite (C99 subset) | Not run against c17 |
 
 **Reclassified 2026-08-21.** These are no longer only test-coverage work. A
@@ -505,3 +560,31 @@ hour (#C155, `&vla`), in a mandated C99 feature that CPython's 40,817 passing
 tests never reach. `gcc.c-torture/execute` is a few thousand self-checking
 programs needing no reference compiler, and is the highest-yield item on this
 page.
+
+**Running as of 2026-09-21.** `cc/scripts/c17_torture.sh` drives it against an
+external checkout (the suite is GPLv3 and is not vendored) and diffs a recorded
+baseline, so a regression fails rather than shifting a percentage.
+
+`execute/` went from **58.5% to 88.5%** (1986 -> 3005 of 3396 test-instances,
+1698 tests at -O0 and -O2) over one series: the libc-alias builtins,
+`-fpermissive`, `__complex__`, bare `alloca`, `va_arg` of a small struct,
+bit-field assignment values and promotion, binary128 variadic arguments,
+`__builtin_classify_type`, `creal`/`cimag`/`conj`, the `*_overflow_p` family,
+`#pragma push_macro`, `__builtin_prefetch`'s argument, enumeration constants'
+type, and GNU complex integers.
+
+What is left, at -O0 — 35 run failures and 68 compile failures:
+
+| Group | Count | Note |
+|---|---|---|
+| `scalar_storage_order` attribute | 2 | `20230630-2`, `20230630-4`. c17 warns that it ignores the attribute and lays out natively, so the tests read 85 where they want 21. Needs reverse-endian load/store lowering |
+| ~~Complex arithmetic~~ | 0 | Closed. `_Complex int` and its relatives are implemented: sizing, `__real__`/`__imag__`, arithmetic (multiply and divide open-coded, since the `__mul?c3` helpers are floating-only), the argument and return ABI on both targets, `~` as the conjugate, and integer imaginary constants. This also fixed a real argument bound to a *floating* complex parameter, which was never promoted |
+| `va_arg` with `long double` / `__int128` | 2 | `pr44942`, `pr92904` — the binary128 fixes did not reach these |
+| Pre-C99 implicit `int` not requesting `-fpermissive` | 5 | gcc rejects them too without a flag |
+| Dead-call elimination proofs | 9 | call an undefined `link_error` the optimizer is expected to delete. gcc deletes it, c17 does not — optimizer strength, not a defect |
+| Nested functions, VLA-as-struct-member, `_Decimal64`, `__builtin_apply` | ~5 | out of scope, see the GNU extensions section |
+| Singletons needing their own triage | ~40 | mostly `pr*` |
+
+One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.
+gcc accepts a conditional with one `void` arm as an extension; C17 6.5.15p3
+requires both or neither.

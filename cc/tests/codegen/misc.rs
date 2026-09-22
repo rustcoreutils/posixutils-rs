@@ -10380,3 +10380,660 @@ int main(void) {
         0
     );
 }
+
+/// `va_arg` of an aggregate, assigned rather than used to initialize.
+///
+/// `linearize_va_op` gave the result a stack local only when the aggregate was
+/// wider than 64 bits. Below that the result pseudo held the struct's *bytes*,
+/// which is the crate-wide convention -- but `emit_assign`'s struct path does
+/// not read it that way. It calls `linearize_lvalue`, which falls through to
+/// `rvalue_addr`, which returns any non-`Sym` pseudo unchanged on the
+/// assumption that it already holds a pointer. So `emit_block_copy` took four
+/// bytes of struct data and dereferenced them as an address.
+///
+/// The call-return path hit exactly this and was fixed by giving small struct
+/// returns a `__sret1_` local, with a comment naming the hazard. `VaArg` never
+/// got the same treatment.
+///
+/// Every existing aggregate-`va_arg` test initializes a fresh declaration
+/// (`C3 v = va_arg(ap, C3);`), which goes through `linearize_stmt` -- a path
+/// with the opposite convention hard-coded. So `struct tiny v = va_arg(...)`
+/// worked while `v = va_arg(...)` crashed, and nothing noticed.
+///
+/// Sizes straddle the 8-byte boundary deliberately: 4, 8, 12 and 16 bytes,
+/// integer and floating, since the value/address split is at 8 and the
+/// register/memory ABI split is at 16.
+#[test]
+fn codegen_va_arg_small_struct_assigned() {
+    let code = r#"
+#include <stdarg.h>
+
+struct s4  { int a; };
+struct s8  { int a, b; };
+struct s12 { int a, b, c; };
+struct s16 { long a, b; };
+struct f8  { float x, y; };
+struct f16 { double x, y; };
+
+static int take4(int n, ...) {
+    struct s4 v;
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        v = va_arg(ap, struct s4);      /* assignment, not initialization */
+        if (v.a != i + 10) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+static int take8(int n, ...) {
+    struct s8 v;
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        v = va_arg(ap, struct s8);
+        if (v.a != i + 20 || v.b != i + 21) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+static int take12(int n, ...) {
+    struct s12 v;
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        v = va_arg(ap, struct s12);
+        if (v.a != i + 30 || v.b != i + 31 || v.c != i + 32) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+static int take16(int n, ...) {
+    struct s16 v;
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        v = va_arg(ap, struct s16);
+        if (v.a != i + 40 || v.b != i + 41) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+static int takef8(int n, ...) {
+    struct f8 v;
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        v = va_arg(ap, struct f8);
+        if (v.x != (float)(i + 50) || v.y != (float)(i + 51)) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+static int takef16(int n, ...) {
+    struct f16 v;
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        v = va_arg(ap, struct f16);
+        if (v.x != (double)(i + 60) || v.y != (double)(i + 61)) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+/* The declaration-initializer form, which already worked: it must keep
+   working, since the fix changes the shape of the pseudo it consumes. */
+static int take4_init(int n, ...) {
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        struct s4 v = va_arg(ap, struct s4);
+        if (v.a != i + 10) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+int main(void) {
+    struct s4  a0 = {10}, a1 = {11}, a2 = {12};
+    struct s8  b0 = {20,21}, b1 = {21,22};
+    struct s12 c0 = {30,31,32}, c1 = {31,32,33};
+    struct s16 d0 = {40,41}, d1 = {41,42};
+    struct f8  e0 = {50.0f,51.0f}, e1 = {51.0f,52.0f};
+    struct f16 g0 = {60.0,61.0}, g1 = {61.0,62.0};
+
+    if (!take4(3, a0, a1, a2)) return 1;
+    if (!take8(2, b0, b1)) return 2;
+    if (!take12(2, c0, c1)) return 3;
+    if (!take16(2, d0, d1)) return 4;
+    if (!takef8(2, e0, e1)) return 5;
+    if (!takef16(2, g0, g1)) return 6;
+    if (!take4_init(3, a0, a1, a2)) return 7;
+
+    /* Mixed with scalars, which move the register save area along. */
+    if (!take4(1, a0)) return 8;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_va_arg_small_struct", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("codegen_va_arg_small_struct_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// `va_arg` of an SSE+SSEUP aggregate — one XMM register carrying all sixteen
+/// bytes, rather than two registers of eight.
+///
+/// Two independent defects, each losing the same upper half:
+///
+/// 1. The variadic prologue saved each XMM into the register save area with
+///    `movsd`, eight bytes into a sixteen-byte slot, so the top half of every
+///    slot held whatever the frame did. A `double` never noticed, and neither
+///    did `struct { double a, b; }` -- that arrives in *two* registers, and
+///    each one's low half is all there is to save.
+/// 2. `emit_va_arg_aggregate` walked the ABI classification as one eightbyte
+///    per entry. `classes` counts registers: `sse_struct_regs` documents
+///    SSE+SSEUP as a single entry covering sixteen bytes, so the copy took
+///    eight and left the rest of the destination untouched.
+///
+/// A third, in the same shape, for a bare `__float128` rather than one inside
+/// a struct: `emit_va_arg_float` sized the move from `<= 32 ? Single : Double`,
+/// so a 128-bit type moved eight bytes, and its overflow-area cursor advanced
+/// by eight where the slot is sixteen.
+///
+/// Either defect alone reproduces the loss, so both are checked here with a
+/// value whose upper half is the part that matters.
+///
+/// x86-64 only. All three defects are in `cc/arch/x86_64/`, and `__float128`
+/// is that target's spelling for binary128 -- aarch64 reaches the same type
+/// through `long double`, with its own lowering and its own save area, so this
+/// source does not describe it. `compile_and_run` builds for the host, which
+/// is what makes the guard necessary rather than merely tidy.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_va_arg_sse_up_aggregate() {
+    let code = r#"
+#include <stdarg.h>
+
+struct q  { __float128 v; };
+struct dd { double a, b; };
+
+static int take_q(int n, ...) {
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        struct q x = va_arg(ap, struct q);
+        if (x.v != (__float128)(i + 1)) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+/* Assigned rather than initialized, so the small-aggregate local path runs
+   as well as the sixteen-byte one. */
+static int take_dd(int n, ...) {
+    va_list ap; va_start(ap, n);
+    struct dd x;
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        x = va_arg(ap, struct dd);
+        if (x.a != (double)(i + 1) || x.b != (double)(i + 2)) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+/* A bare __float128 travels the same way, without a struct around it. */
+static int take_f128(int n, ...) {
+    va_list ap; va_start(ap, n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        __float128 v = va_arg(ap, __float128);
+        if (v != (__float128)(i + 1)) ok = 0;
+    }
+    va_end(ap);
+    return ok;
+}
+
+/* Mixed with doubles, which move the SSE save area's cursor along. */
+static int take_mixed(int n, ...) {
+    va_list ap; va_start(ap, n);
+    double d = va_arg(ap, double);
+    struct q x = va_arg(ap, struct q);
+    double e = va_arg(ap, double);
+    va_end(ap);
+    (void)n;
+    return d == 1.0 && x.v == (__float128)1 && e == 3.0;
+}
+
+static int take_q_va(__float128 want, int n, ...) {
+    va_list ap; va_start(ap, n);
+    struct q x = va_arg(ap, struct q);
+    va_end(ap);
+    return x.v == want;
+}
+
+int main(void) {
+    struct q q1, q2;
+    q1.v = (__float128)1;
+    q2.v = (__float128)2;
+    struct dd d1 = {1, 2}, d2 = {2, 3};
+
+    if (!take_q(2, q1, q2)) return 1;
+    if (!take_dd(2, d1, d2)) return 2;
+    if (!take_f128(2, (__float128)1, (__float128)2)) return 3;
+    if (!take_mixed(3, 1.0, q1, 3.0)) return 4;
+
+    /* A value whose mantissa fills the part that was being dropped: an
+       eight-byte save leaves the low half only, and 1/3 differs from
+       anything that could survive that. */
+    {
+        struct q third;
+        third.v = (__float128)1 / (__float128)3;
+        if (!take_q_va((__float128)1 / (__float128)3, 1, third)) return 5;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_va_arg_sse_up", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("codegen_va_arg_sse_up_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// A struct returned in registers and then **discarded**.
+///
+/// `mem2reg` decides a local is dead by scanning `insn.src`. But a call
+/// returning a two-register struct writes its result into a `__2reg_N` local
+/// and names that local's `Sym` as the instruction's *target*, not as a
+/// source. When the result is used, a following `symaddr` puts the Sym in a
+/// `src` and it survives; when it is discarded — `one();` on a line by itself
+/// — nothing ever reads it, so the pass concluded the local was dead and
+/// dropped both the slot and the pseudo.
+///
+/// The backend then had a target with no storage behind it. `handle_two_reg_return`
+/// emits `mov %rax, (%reg)` for a `Loc::Reg` destination, so it stored through
+/// whatever that register happened to hold.
+///
+/// **This was wrong at -O0 too.** It only faulted once the inliner had run,
+/// because `should_inline` admits a function this size only at -O2, but the
+/// bad IR was there at every level and -O0 passed on luck about the register's
+/// contents: a slightly different reduction segfaults at -O0 as well.
+///
+/// The boundaries are the ABI's: 8 bytes returns in one register and is fine,
+/// 9-16 returns in two and was not, and 17+ uses a hidden pointer argument —
+/// which lands in `src` and so survived. Both register files are covered,
+/// since the FP path stores XMM0/XMM1 the same way.
+#[test]
+fn codegen_discarded_two_register_struct_return() {
+    let code = r#"
+struct I8  { int a, b; };
+struct I12 { int a, b, c; };
+struct I16 { int a, b, c, d; };
+struct I20 { int a, b, c, d, e; };
+struct F12 { float a, b, c; };
+struct D16 { double a, b; };
+
+static int calls;
+
+static struct I8  i8(void)  { struct I8  s = {1,2};       calls++; return s; }
+static struct I12 i12(void) { struct I12 s = {1,2,3};     calls++; return s; }
+static struct I16 i16(void) { struct I16 s = {1,2,3,4};   calls++; return s; }
+static struct I20 i20(void) { struct I20 s = {1,2,3,4,5}; calls++; return s; }
+static struct F12 f12(void) { struct F12 s = {1,2,3};     calls++; return s; }
+static struct D16 d16(void) { struct D16 s = {1,2};       calls++; return s; }
+
+int main(void) {
+    /* Discarded: the result is never read, which is the case that broke. */
+    i8(); i12(); i16(); i20(); f12(); d16();
+    if (calls != 6) return 1;
+
+    /* Used: this path always worked and must keep working, since the fix
+       changes which pseudos survive. */
+    { struct I12 v = i12(); if (v.a != 1 || v.b != 2 || v.c != 3) return 2; }
+    { struct I16 v = i16(); if (v.a != 1 || v.d != 4) return 3; }
+    { struct D16 v = d16(); if (v.a != 1.0 || v.b != 2.0) return 4; }
+    { struct F12 v = f12(); if (v.a != 1.0f || v.c != 3.0f) return 5; }
+    { struct I20 v = i20(); if (v.a != 1 || v.e != 5) return 6; }
+    { struct I8  v = i8();  if (v.a != 1 || v.b != 2) return 7; }
+    if (calls != 12) return 8;
+
+    /* Discarded again, in a loop, so the slot is reused rather than merely
+       allocated once. */
+    for (int k = 0; k < 3; k++) { i12(); d16(); }
+    if (calls != 18) return 9;
+
+    /* Discarded inside an expression whose value is also discarded. */
+    (void)i16();
+    if (calls != 19) return 10;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2", "-Os"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("codegen_discarded_2reg{}", opt.replace('-', "_")),
+                code,
+                &[opt.to_string()]
+            ),
+            0,
+            "discarded two-register struct return failed at {opt}"
+        );
+    }
+}
+
+/// Struct copies across the size at which the compiler stops unrolling.
+///
+/// `emit_block_copy` emitted one load, one store and a fresh pseudo per eight
+/// bytes, with no upper bound. A 256 KB struct passed by value — which
+/// gcc.c-torture's `pr28982b` does — cost 65,536 IR instructions and a
+/// **65-second** compile, against gcc's 0.02. Above 128 bytes it now emits a
+/// `memcpy` call instead; below, it still unrolls, because a call would cost
+/// more than the moves it replaces.
+///
+/// Two bugs came out of that change, and both are pinned here:
+///
+/// - The parameter prologue and the sret return path each had their own copy
+///   of the unrolled loop, written as `while offset < size` stepping 8 — which
+///   rounds *up*. A 12-byte struct copied 16 bytes, four of them past the
+///   object. Routing all three through the one helper fixed it.
+/// - `memcpy` takes addresses, and a `Sym` pseudo names a local's storage
+///   rather than a pointer to it. The inline path could store through it
+///   directly; the call path could not, and every copy over the threshold
+///   segfaulted until it went through `rvalue_addr`.
+///
+/// Sizes straddle 128 deliberately, and none is a multiple of 8, so a
+/// rounded-up copy shows as corruption rather than passing by luck.
+#[test]
+fn codegen_struct_copy_across_the_inline_threshold() {
+    let code = r#"
+#define MK(N)                                                             \
+    struct s##N { unsigned char c[N]; };                                  \
+    static void take##N(struct s##N v) {                                  \
+        for (int i = 0; i < N; i++)                                       \
+            if (v.c[i] != (unsigned char)(i + 1)) __builtin_abort();      \
+    }                                                                     \
+    static struct s##N ret##N(struct s##N v) { return v; }                \
+    static void run##N(void) {                                            \
+        struct s##N a, b, d;                                              \
+        unsigned char guard = 0xAB;                                       \
+        for (int i = 0; i < N; i++) a.c[i] = (unsigned char)(i + 1);      \
+        take##N(a);              /* by value into a parameter */          \
+        b = ret##N(a);           /* returned, then assigned   */          \
+        take##N(b);                                                       \
+        d = a;                   /* plain struct assignment    */         \
+        take##N(d);                                                       \
+        if (guard != 0xAB) __builtin_abort();                             \
+    }
+
+MK(7)     /* under the threshold, not a multiple of 8 */
+MK(12)    /* the over-copy case: 12 rounds up to 16   */
+MK(13)
+MK(127)   /* just under */
+MK(129)   /* just over  */
+MK(200)
+MK(1000)  /* comfortably into call territory */
+
+/* Larger than this is deliberately not here. Three locals of 9001 bytes make a
+   ~27 KB frame, and aarch64 cannot yet assemble a frame that large -- stack
+   offsets past the immediate range are not legalized, which a plain
+   `volatile unsigned char a[9001], b[9001], d[9001];` reproduces with no
+   struct copy anywhere in sight. A separate defect, recorded in doc/TODO.md;
+   this test stays clear of it so it is testing the copy and nothing else. */
+
+int main(void) {
+    run7(); run12(); run13(); run127(); run129(); run200(); run1000();
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("codegen_struct_copy_threshold{}", opt.replace('-', "_")),
+                code,
+                &[opt.to_string()]
+            ),
+            0,
+            "struct copy across the inline threshold failed at {opt}"
+        );
+    }
+}
+
+/// A stack frame past the AArch64 immediate ranges.
+///
+/// AArch64 encodes an `add` immediate in twelve bits, optionally shifted left
+/// by twelve, and a `str`/`ldr` offset in twelve bits scaled by the access
+/// size. Two places emitted one without checking:
+///
+/// - taking a local's address produced `add x1, x29, #18032`, which the
+///   assembler rejects outright (`Error: immediate out of range`);
+/// - the prologue's frame zeroing produced `str xzr, [x29, #32768]`, one past
+///   the 32760 its own comment called "all practical frames".
+///
+/// Neither is a wrong-answer bug: the assembler refuses the output, so the
+/// build fails. It reached CI because the local aarch64 check only ran -O0,
+/// and inlining at -O2 grows a frame that fit before. Three locals of 9001
+/// bytes reproduces the first at -O0; a 40 KB array reaches the second.
+///
+/// x86-64 has no equivalent limit, so on this host the test guards a
+/// regression rather than proving the fix — that was done by building for
+/// aarch64 and assembling with the cross toolchain, at both opt levels.
+#[test]
+fn codegen_large_stack_frame_offsets_are_encodable() {
+    let code = r#"
+/* Past the add-immediate range: locals land beyond 4095. */
+static int three_big_locals(void) {
+    volatile unsigned char a[9001], b[9001], d[9001];
+    a[0] = 1; b[9000] = 2; d[4500] = 3;
+    return a[0] + b[9000] + d[4500];
+}
+
+/* Past the scaled store-offset range: the frame exceeds 32760. */
+static int one_huge_local(void) {
+    volatile unsigned char e[40000];
+    e[0] = 4; e[39999] = 5;
+    return e[0] + e[39999];
+}
+
+/* A frame that needs more than one re-base of the zeroing cursor. */
+static int very_huge_local(void) {
+    volatile unsigned char f[100000];
+    f[0] = 6; f[50000] = 7; f[99999] = 8;
+    return f[0] + f[50000] + f[99999];
+}
+
+/* Addresses taken across the whole span, so the add path is exercised at
+   several magnitudes rather than only the largest. */
+static int addresses_across_the_frame(void) {
+    volatile unsigned char g[20000];
+    unsigned char *p0 = (unsigned char *)&g[0];
+    unsigned char *p1 = (unsigned char *)&g[4000];
+    unsigned char *p2 = (unsigned char *)&g[5000];
+    unsigned char *p3 = (unsigned char *)&g[19999];
+    *p0 = 1; *p1 = 2; *p2 = 3; *p3 = 4;
+    return (p1 - p0 == 4000) && (p2 - p0 == 5000) && (p3 - p0 == 19999)
+        && *p0 == 1 && *p1 == 2 && *p2 == 3 && *p3 == 4;
+}
+
+int main(void) {
+    if (three_big_locals() != 6) return 1;
+    if (one_huge_local() != 9) return 2;
+    if (very_huge_local() != 21) return 3;
+    if (!addresses_across_the_frame()) return 4;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("codegen_large_frame{}", opt.replace('-', "_")),
+                code,
+                &[opt.to_string()]
+            ),
+            0,
+            "large stack frame failed at {opt}"
+        );
+    }
+}
+
+/// A GNU complex integer's argument and return ABI, including every overflow
+/// case.
+///
+/// A complex type carries its *base's* kind, so `_Complex long` satisfied
+/// `is_integer` and was handed a single register for a sixteen-byte value,
+/// while `_Complex signed char` reached the sub-32-bit path and was
+/// sign-extended -- which overwrites the imaginary half with a copy of the
+/// real one's sign. The backends' `is_complex` tests all meant "arrives in
+/// SSE/V registers", which a complex integer does not.
+///
+/// The overflow cases are separate bugs again: a stacked complex value's
+/// address is sometimes spilled to a slot, and the outgoing copy took the
+/// address *of the slot* rather than loading the pointer out of it, so the
+/// callee received a pointer's bytes.
+#[test]
+fn codegen_complex_integer_abi() {
+    let code = r#"
+_Complex signed char cc_id(_Complex signed char x) { return x; }
+_Complex short cs_add(_Complex short a, _Complex short b) { return a + b; }
+
+/* Past the general-register file, one and two registers wide. */
+_Complex int one_reg(long a, long b, long c, long d, long e, long f, long g,
+                     long h, _Complex int p) { return p; }
+_Complex long two_reg(long a, long b, long c, long d, long e, long f, long g,
+                      long h, _Complex long p) { return p; }
+/* Three stacked complex integers in a row: the second's width decides where
+   the third lands, so a wrong slot size shows up only here. */
+_Complex int three(long a, long b, long c, long d, long e, long f, long g,
+                   long h, _Complex int p, _Complex long q, _Complex int r) {
+    return p + (_Complex int)q + r;
+}
+/* Mixed with the floating file, so both register counters advance right. */
+_Complex long mixed(double x, _Complex int a, double y, _Complex long b) {
+    return b + (_Complex long)a + (long)x + (long)y;
+}
+/* A complex integer behind a complex double, which takes V/XMM registers. */
+_Complex int after_cd(_Complex double z, _Complex int a) {
+    return a + (int)__real__ z;
+}
+
+int main(void) {
+    _Complex signed char a;
+    __real__ a = 3; __imag__ a = -4;
+    _Complex signed char b = cc_id(a);
+    if (__real__ b != 3 || __imag__ b != -4) return 1;
+
+    _Complex short p, q;
+    __real__ p = 300; __imag__ p = 400;
+    __real__ q = 1;   __imag__ q = 2;
+    _Complex short s = cs_add(p, q);
+    if (__real__ s != 301 || __imag__ s != 402) return 2;
+
+    _Complex int ci, cr;
+    _Complex long cl;
+    __real__ ci = 1;   __imag__ ci = 2;
+    __real__ cl = 10;  __imag__ cl = 20;
+    __real__ cr = 100; __imag__ cr = 200;
+
+    _Complex int o = one_reg(1, 2, 3, 4, 5, 6, 7, 8, ci);
+    if (__real__ o != 1 || __imag__ o != 2) return 3;
+
+    _Complex long t = two_reg(1, 2, 3, 4, 5, 6, 7, 8, cl);
+    if (__real__ t != 10 || __imag__ t != 20) return 4;
+
+    _Complex int th = three(1, 2, 3, 4, 5, 6, 7, 8, ci, cl, cr);
+    if (__real__ th != 111 || __imag__ th != 222) return 5;
+
+    _Complex long ml = mixed(2.0, ci, 3.0, cl);
+    if (__real__ ml != 10 + 1 + 2 + 3) return 6;
+    if (__imag__ ml != 20 + 2) return 7;
+
+    _Complex double cd;
+    __real__ cd = 7.0; __imag__ cd = 8.0;
+    _Complex int ac = after_cd(cd, ci);
+    if (__real__ ac != 8 || __imag__ ac != 2) return 8;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cg_complex_int_abi", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("cg_complex_int_abi_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// `_Complex __int128` is thirty-two bytes: MEMORY class, returned through
+/// the hidden pointer.
+///
+/// Both predicates that decide this -- `param_is_memory_class` and
+/// `returns_via_hidden_pointer` -- tested the type's *kind* and so excluded
+/// every complex type, and the `kind == Int128` arms then claimed it and gave
+/// a thirty-two-byte value two general registers.
+///
+/// Its arithmetic also uncovered a 128-bit load that had nothing to do with
+/// complex types: the lowering treated any `Loc::Stack` address operand as
+/// though the slot *were* the value, so reading through an `Alloca` result --
+/// a pointer in a slot -- copied the pointer's own bits as the low half.
+#[test]
+fn codegen_complex_int128_memory_class() {
+    let code = r#"
+_Complex __int128 id128(_Complex __int128 x) { return x; }
+/* An sret return together with a stacked argument, at several register
+   pressures: the hidden pointer takes a register the arguments then cannot. */
+_Complex __int128 add0(_Complex __int128 z) { return z; }
+_Complex __int128 add1(long a, _Complex __int128 z) { return z + (__int128)a; }
+_Complex __int128 add5(long a, long b, long c, long d, long e,
+                       _Complex __int128 z) { return z + (__int128)(a + e); }
+_Complex __int128 add8(long a, long b, long c, long d, long e, long f, long g,
+                       long h, _Complex __int128 z) {
+    return z + (__int128)(a + h);
+}
+/* Reading a half of a stacked one, with no complex arithmetic at all. */
+int real_of(long a, long b, long c, long d, long e, long f, long g, long h,
+            _Complex __int128 z) {
+    return (int)(__real__ z >> 70) + (int)(__imag__ z >> 65) + (int)(a + h);
+}
+
+static int check(_Complex __int128 v, __int128 want_re, __int128 want_im) {
+    return __real__ v == want_re && __imag__ v == want_im;
+}
+
+int main(void) {
+    if (sizeof(_Complex __int128) != 32) return 1;
+
+    _Complex __int128 z;
+    __real__ z = (__int128)1 << 90;
+    __imag__ z = (__int128)3 << 80;
+
+    /* Reading the halves of a local, with no call involved. */
+    if (__real__ z != ((__int128)1 << 90)) return 2;
+    if (__imag__ z != ((__int128)3 << 80)) return 3;
+
+    if (!check(id128(z), (__int128)1 << 90, (__int128)3 << 80)) return 4;
+    if (!check(add0(z), (__int128)1 << 90, (__int128)3 << 80)) return 5;
+    if (!check(add1(3, z), ((__int128)1 << 90) + 3, (__int128)3 << 80)) return 6;
+    if (!check(add5(1, 2, 3, 4, 5, z), ((__int128)1 << 90) + 6,
+               (__int128)3 << 80)) return 7;
+    if (!check(add8(1, 2, 3, 4, 5, 6, 7, 8, z), ((__int128)1 << 90) + 9,
+               (__int128)3 << 80)) return 8;
+
+    _Complex __int128 w;
+    __real__ w = (__int128)5 << 70;
+    __imag__ w = (__int128)7 << 65;
+    if (real_of(1, 2, 3, 4, 5, 6, 7, 8, w) != 5 + 7 + 9) return 9;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cg_complex_int128_mem", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("cg_complex_int128_mem_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

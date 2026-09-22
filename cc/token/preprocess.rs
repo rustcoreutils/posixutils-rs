@@ -398,6 +398,15 @@ pub struct Preprocessor<'a> {
 
     /// Macro definitions
     macros: HashMap<String, std::rc::Rc<Macro>>,
+    /// Definitions saved by `#pragma push_macro`, newest last.
+    ///
+    /// A stack per name, because the pragmas nest: each `push_macro` saves
+    /// whatever is defined at that moment and each `pop_macro` restores the
+    /// most recent save. `None` records that the name was *not* defined, which
+    /// `pop_macro` must restore just as faithfully as a definition -- glibc's
+    /// headers push a name, define their own, and pop expecting the original
+    /// absence back.
+    pushed_macros: HashMap<String, Vec<Option<std::rc::Rc<Macro>>>>,
 
     /// Conditional compilation stack
     cond_stack: Vec<Conditional>,
@@ -847,6 +856,7 @@ impl<'a> Preprocessor<'a> {
         let mut pp = Self {
             target,
             macros: HashMap::with_capacity(DEFAULT_MACRO_CAPACITY),
+            pushed_macros: HashMap::new(),
             cond_stack: Vec::with_capacity(DEFAULT_COND_STACK_CAPACITY),
             system_include_paths: Vec::with_capacity(DEFAULT_INCLUDE_PATH_CAPACITY),
             quote_include_paths: Vec::with_capacity(DEFAULT_INCLUDE_PATH_CAPACITY),

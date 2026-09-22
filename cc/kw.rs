@@ -110,6 +110,13 @@ define_keywords! {
     (UNSIGNED,          "unsigned",          TYPE_SPEC | TYPE_KEYWORD),
     (BOOL,              "_Bool",             TYPE_SPEC | TYPE_KEYWORD),
     (COMPLEX,           "_Complex",          TYPE_SPEC | TYPE_KEYWORD),
+    // gcc's spellings of the same specifier, reserved for the same reason the
+    // `__typeof__` forms are: a leading double underscore belongs to the
+    // implementation in every scope (C17 7.1.3). Without them a declaration
+    // like `__complex__ float f(void)` parses as a missing type specifier and
+    // draws the implicit-int diagnostic, which points at the wrong thing.
+    (GNU_COMPLEX,       "__complex__",       TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
+    (GNU_COMPLEX2,      "__complex",         TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
     // C99 6.4.1 reserves `_Imaginary` whether or not imaginary types are
     // provided (Annex G makes the types optional, not the keyword), so the
     // name is reserved here without a type behind it.
@@ -284,8 +291,44 @@ define_keywords! {
     (BUILTIN_SQRT,      "__builtin_sqrt",     BUILTIN),
     (BUILTIN_COPYSIGN,  "__builtin_copysign", BUILTIN),
     (BUILTIN_TRAP,      "__builtin_trap",     BUILTIN),
+    (BUILTIN_ABORT,     "__builtin_abort",    BUILTIN),
+    (BUILTIN_EXIT,      "__builtin_exit",     BUILTIN),
+    (BUILTIN_PRINTF,    "__builtin_printf",   BUILTIN),
+    (BUILTIN_SPRINTF,   "__builtin_sprintf",  BUILTIN),
+    (BUILTIN_SNPRINTF,  "__builtin_snprintf", BUILTIN),
+    (BUILTIN_PUTS,      "__builtin_puts",     BUILTIN),
+    (BUILTIN_MALLOC,    "__builtin_malloc",   BUILTIN),
+    (BUILTIN_CALLOC,    "__builtin_calloc",   BUILTIN),
+    (BUILTIN_REALLOC,   "__builtin_realloc",  BUILTIN),
+    (BUILTIN_FREE,      "__builtin_free",     BUILTIN),
+    (BUILTIN_MEMCMP,    "__builtin_memcmp",   BUILTIN),
+    (BUILTIN_MEMPCPY,   "__builtin_mempcpy",  BUILTIN),
+    (BUILTIN_STRCPY,    "__builtin_strcpy",   BUILTIN),
+    (BUILTIN_STRNCPY,   "__builtin_strncpy",  BUILTIN),
+    (BUILTIN_STPCPY,    "__builtin_stpcpy",   BUILTIN),
+    (BUILTIN_STRCAT,    "__builtin_strcat",   BUILTIN),
+    (BUILTIN_STRNCAT,   "__builtin_strncat",  BUILTIN),
+    (BUILTIN_STRNCMP,   "__builtin_strncmp",  BUILTIN),
+    (BUILTIN_STRCHR,    "__builtin_strchr",   BUILTIN),
+    (BUILTIN_STRRCHR,   "__builtin_strrchr",  BUILTIN),
+    (BUILTIN_STRSTR,    "__builtin_strstr",   BUILTIN),
+    (BUILTIN_IMAXABS,   "__builtin_imaxabs",   BUILTIN),
+    (BUILTIN_MEMCHR,    "__builtin_memchr",    BUILTIN),
+    (BUILTIN_BCOPY,     "__builtin_bcopy",     BUILTIN),
+    (BUILTIN_INDEX,     "__builtin_index",     BUILTIN),
+    (BUILTIN_RINDEX,    "__builtin_rindex",    BUILTIN),
+    (BUILTIN_PUTCHAR,   "__builtin_putchar",   BUILTIN),
+    (BUILTIN_STRCSPN,   "__builtin_strcspn",   BUILTIN),
+    (BUILTIN_STRSPN,    "__builtin_strspn",    BUILTIN),
+    (BUILTIN_STRPBRK,   "__builtin_strpbrk",   BUILTIN),
+    (BUILTIN_PRINTF_UNLOCKED, "__builtin_printf_unlocked", BUILTIN),
+    (BUILTIN_FPRINTF_UNLOCKED, "__builtin_fprintf_unlocked", BUILTIN),
+    (BUILTIN_FPUTS_UNLOCKED, "__builtin_fputs_unlocked", BUILTIN),
     // ---- Checked arithmetic (C23 spells these ckd_add and friends) ----
     (BUILTIN_ADD_OVERFLOW, "__builtin_add_overflow", BUILTIN),
+    (BUILTIN_ADD_OVERFLOW_P, "__builtin_add_overflow_p", BUILTIN),
+    (BUILTIN_SUB_OVERFLOW_P, "__builtin_sub_overflow_p", BUILTIN),
+    (BUILTIN_MUL_OVERFLOW_P, "__builtin_mul_overflow_p", BUILTIN),
     (BUILTIN_SUB_OVERFLOW, "__builtin_sub_overflow", BUILTIN),
     (BUILTIN_MUL_OVERFLOW, "__builtin_mul_overflow", BUILTIN),
     (BUILTIN_SADD_OVERFLOW, "__builtin_sadd_overflow", BUILTIN),
@@ -312,6 +355,7 @@ define_keywords! {
     (BUILTIN_MEMMOVE,   "__builtin_memmove",  BUILTIN),
     (BUILTIN_CONSTANT_P, "__builtin_constant_p", BUILTIN),
     (BUILTIN_TYPES_COMPATIBLE_P, "__builtin_types_compatible_p", BUILTIN),
+    (BUILTIN_CLASSIFY_TYPE, "__builtin_classify_type", BUILTIN),
     (BUILTIN_UNREACHABLE, "__builtin_unreachable", BUILTIN),
     (BUILTIN_OFFSETOF,  "__builtin_offsetof", BUILTIN),
     (OFFSETOF,          "offsetof",           BUILTIN),
@@ -326,6 +370,19 @@ define_keywords! {
     (BUILTIN_FABSL,     "__builtin_fabsl",    BUILTIN),
     (BUILTIN_ISNAN,     "__builtin_isnan",    BUILTIN),
     (BUILTIN_ISINF,     "__builtin_isinf",    BUILTIN),
+    (BUILTIN_ISNANF,    "__builtin_isnanf",   BUILTIN),
+    (BUILTIN_ISNANL,    "__builtin_isnanl",   BUILTIN),
+    (BUILTIN_ISINFF,    "__builtin_isinff",   BUILTIN),
+    (BUILTIN_ISINFL,    "__builtin_isinfl",   BUILTIN),
+    (BUILTIN_CONJ,      "__builtin_conj",     BUILTIN),
+    (BUILTIN_CONJF,     "__builtin_conjf",    BUILTIN),
+    (BUILTIN_CONJL,     "__builtin_conjl",    BUILTIN),
+    (BUILTIN_CREAL,     "__builtin_creal",    BUILTIN),
+    (BUILTIN_CREALF,    "__builtin_crealf",   BUILTIN),
+    (BUILTIN_CREALL,    "__builtin_creall",   BUILTIN),
+    (BUILTIN_CIMAG,     "__builtin_cimag",    BUILTIN),
+    (BUILTIN_CIMAGF,    "__builtin_cimagf",   BUILTIN),
+    (BUILTIN_CIMAGL,    "__builtin_cimagl",   BUILTIN),
     (BUILTIN_ISINF_SIGN, "__builtin_isinf_sign", BUILTIN),
     (BUILTIN_ISFINITE,  "__builtin_isfinite", BUILTIN),
     (BUILTIN_ISNORMAL,  "__builtin_isnormal", BUILTIN),
@@ -377,6 +434,11 @@ define_keywords! {
     (C11_ATOMIC_SIGNAL_FENCE, "__c11_atomic_signal_fence", BUILTIN),
 
     // ---- setjmp/longjmp (special-cased in parser, not true builtins) ----
+    // gcc predefines bare `alloca` as well as `__builtin_alloca`, and code in
+    // the wild calls it without including <alloca.h>. Tagged 0, not BUILTIN:
+    // `__has_builtin` asks about the reserved spelling, and a user declaration
+    // may still displace this one (see `builtin_is_shadowed`).
+    (ALLOCA,            "alloca",            0),
     (SETJMP,            "setjmp",            0),
     (SETJMP2,           "_setjmp",           0),
     (LONGJMP,           "longjmp",           0),
@@ -420,6 +482,39 @@ define_keywords! {
     (_,                 "sqrt",                 0),
     (_,                 "copysign",             0),
     (_,                 "abort",                0),
+    (_,                 "exit",                 0),
+    (_,                 "printf",               0),
+    (_,                 "sprintf",              0),
+    (_,                 "snprintf",             0),
+    (_,                 "puts",                 0),
+    // `malloc` is not listed here: it is already interned below as the
+    // `__attribute__((malloc))` name, and one spelling is one entry.
+    (_,                 "calloc",               0),
+    (_,                 "realloc",              0),
+    (_,                 "free",                 0),
+    (_,                 "memcmp",               0),
+    (_,                 "mempcpy",              0),
+    (_,                 "strcpy",               0),
+    (_,                 "strncpy",              0),
+    (_,                 "stpcpy",               0),
+    (_,                 "strcat",               0),
+    (_,                 "strncat",              0),
+    (_,                 "strncmp",              0),
+    (_,                 "strchr",               0),
+    (_,                 "strrchr",              0),
+    (_,                 "strstr",               0),
+    (_,                 "imaxabs",               0),
+    (_,                 "memchr",                0),
+    (_,                 "bcopy",                 0),
+    (_,                 "index",                 0),
+    (_,                 "rindex",                0),
+    (_,                 "putchar",               0),
+    (_,                 "strcspn",               0),
+    (_,                 "strspn",                0),
+    (_,                 "strpbrk",               0),
+    (_,                 "printf_unlocked",  0),
+    (_,                 "fprintf_unlocked",  0),
+    (_,                 "fputs_unlocked",  0),
     // The long-double magnitude and sign builtins lower to these rather than
     // to `fabs`/`__signbit`, which take a `double` and so read only the low
     // eight bytes of an x87 value.
@@ -546,6 +641,20 @@ define_keywords! {
 pub fn has_tag(id: StringId, mask: u32) -> bool {
     let idx = id.0 as usize;
     idx > 0 && idx <= KEYWORD_COUNT && KEYWORD_TAGS[idx - 1] & mask != 0
+}
+
+/// Every spelling in the table carrying any of `mask`.
+///
+/// The inverse of `has_tag`, for the checks that have to walk the table rather
+/// than ask about one name -- proving a roster elsewhere in the crate lists
+/// exactly what the table tags, in both directions. Only the registry checks
+/// need it, so it is not compiled into the compiler.
+#[cfg(test)]
+pub fn tagged_spellings(mask: u32) -> Vec<&'static str> {
+    (0..KEYWORD_COUNT)
+        .filter(|&i| KEYWORD_TAGS[i] & mask != 0)
+        .map(|i| KEYWORD_STRINGS[i])
+        .collect()
 }
 
 #[cfg(test)]

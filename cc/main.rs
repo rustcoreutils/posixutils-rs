@@ -325,6 +325,13 @@ struct Args {
     #[arg(long = "trigraphs", help = gettext("Enable trigraph replacement (C17 5.2.1.1)"))]
     trigraphs: bool,
 
+    /// Accept implicit `int` and implicit function declarations as warnings.
+    ///
+    /// Both were removed by C99 and are errors here by default. This does not
+    /// select a dialect -- see `diag::set_permissive`.
+    #[arg(long = "fpermissive", help = gettext("Accept pre-C99 implicit int and implicit function declarations"))]
+    fpermissive: bool,
+
     /// Disable builtin function recognition (GCC compatibility)
     /// c17 does not implicitly recognize standard library functions as builtins,
     /// so this flag is accepted for compatibility but has no effect.
@@ -1449,6 +1456,83 @@ fn preprocess_args() -> Vec<String> {
 ///
 /// Takes the raw argument vector rather than reading the environment so the
 /// unit tests exercise this exact function.
+/// `-f` flags c17 accepts and ignores without comment.
+///
+/// Each names an optimisation or code-generation choice that c17 either does
+/// not make at all, or makes unconditionally, so honouring it and ignoring it
+/// are the same program. Everything outside this list draws a warning, because
+/// a flag that is silently dropped is indistinguishable from one that worked.
+fn is_known_ignorable_f_flag(arg: &str) -> bool {
+    // An exact spelling, or a prefix for the `=`-valued ones.
+    const EXACT: &[&str] = &[
+        // Aliasing and overflow assumptions c17 does not exploit.
+        "-fstrict-aliasing",
+        "-fno-strict-aliasing",
+        "-fstrict-overflow",
+        "-fno-strict-overflow",
+        "-fwrapv",
+        "-fno-wrapv",
+        "-ftrapv",
+        "-fno-trapv",
+        // Inlining and frame choices c17 makes on its own.
+        "-fomit-frame-pointer",
+        "-fno-omit-frame-pointer",
+        "-finline-functions",
+        "-fno-inline-functions",
+        "-fno-inline",
+        "-finline-small-functions",
+        // Tree and loop passes c17 has no equivalent of.
+        "-ftree-vectorize",
+        "-fno-tree-vectorize",
+        "-ftree-loop-distribution",
+        "-fno-tree-loop-distribute-patterns",
+        "-fno-tree-dse",
+        "-fno-tracer",
+        "-fno-ipa-ra",
+        "-funroll-loops",
+        "-fno-unroll-loops",
+        "-fpeel-loops",
+        "-fno-peel-loops",
+        "-ftracer",
+        "-fmodulo-sched",
+        "-foptimize-strlen",
+        "-fno-optimize-strlen",
+        "-fno-vect-cost-model",
+        "-fivopts",
+        "-fno-ivopts",
+        "-fschedule-insns",
+        "-fno-schedule-insns",
+        "-fschedule-insns2",
+        "-fno-schedule-insns2",
+        // Floating point c17 already treats strictly.
+        "-ffloat-store",
+        "-fno-float-store",
+        "-fno-trapping-math",
+        "-ftrapping-math",
+        "-fno-math-errno",
+        "-fmath-errno",
+        "-fsigned-zeros",
+        "-fno-signed-zeros",
+        // Linkage and layout.
+        "-fno-common",
+        "-fcommon",
+        "-fno-zero-initialized-in-bss",
+        "-fnon-call-exceptions",
+        "-fno-non-call-exceptions",
+        "-fexceptions",
+        "-fno-exceptions",
+        "-fasynchronous-unwind-tables",
+        "-fno-asynchronous-unwind-tables",
+        "-fno-semantic-interposition",
+        "-fsemantic-interposition",
+        // gnu89 inline semantics: `-std=` is inert here and so is this.
+        "-fgnu89-inline",
+        "-fno-gnu89-inline",
+    ];
+    const PREFIX: &[&str] = &["-fvisibility=", "-fpack-struct=", "-fstack-protector"];
+    EXACT.contains(&arg) || PREFIX.iter().any(|p| arg.starts_with(p))
+}
+
 fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut result = Vec::with_capacity(raw_args.len());
     let mut i = 0;
@@ -1606,8 +1690,29 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         } else if arg == "-fverbose-asm" {
             result.push("--fverbose-asm".to_string());
             i += 1;
+        } else if arg == "-fpermissive" {
+            result.push("--fpermissive".to_string());
+            i += 1;
         } else if arg.starts_with("-f") && !arg.starts_with("-fno-builtin") {
-            // Catch-all: silently ignore any other -f* flag we don't handle
+            // Not a catch-all any more. gcc *errors* on an unrecognised `-f`
+            // flag, and silently discarding one is worse than either answer:
+            // a build system cannot tell a flag that took effect from one that
+            // was thrown away, which is how `-fpermissive` appeared not to
+            // work and how `-fno-builtin` sat inert for as long as it did.
+            //
+            // Erroring outright would break builds that pass flags c17 has no
+            // opinion about, so the middle course is to classify: the flags
+            // below name optimisations and code-generation choices c17 either
+            // does not make or already makes unconditionally, so ignoring them
+            // changes nothing and they stay quiet. Anything else says so.
+            //
+            // The list is drawn from what real builds actually pass -- CPython's
+            // configure and the gcc torture suite's own dg-options -- rather
+            // than from gcc's manual. Add to it when a corpus needs it, not in
+            // anticipation.
+            if !is_known_ignorable_f_flag(arg) {
+                eprintln!("c17: {}: {}", gettext("unrecognized option, ignored"), arg);
+            }
             i += 1;
         } else if arg == "-nostdinc" || arg == "-nobuiltininc" {
             // gcc spells these with one dash; clap declares them long-only.
@@ -1999,6 +2104,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.no_warnings {
         diag::suppress_warnings();
+    }
+    if args.fpermissive {
+        diag::set_permissive();
+    }
+    // Both of these were parsed into fields nothing read, so the flags were
+    // accepted and did nothing. They now mean what they mean to gcc: the
+    // builtins whose names do not begin with `__builtin_` stop being builtins.
+    if args.fno_builtin {
+        builtins::set_no_builtin();
+    }
+    if !args.fno_builtin_funcs.is_empty() {
+        builtins::set_no_builtin_funcs(args.fno_builtin_funcs.iter().cloned().collect());
     }
     // `-Wno-<name>` reaches the places that emit warnings, which are nowhere
     // near here. Only `-Wno-` entries mean anything today; `-W<name>` turning

@@ -363,7 +363,7 @@ impl Aarch64CodeGen {
 
         for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
             let arg_type = insn.arg_types.get(i).copied();
-            let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
+            let is_complex = arg_type.is_some_and(|t| types.is_complex_float(t));
             // Every HFA, one element through four, goes out in V registers.
             // The exception is a single element small enough to sit in one
             // register: that arrives as an ordinary floating-point value and
@@ -455,6 +455,51 @@ impl Aarch64CodeGen {
                     // follows it there. Unlike System V, the registers this
                     // argument did not fit into are *not* left available.
                     fp_arg_idx = fp_arg_regs.len();
+                }
+                continue;
+            }
+            // A GNU complex integer is a composite with no floating
+            // members, so AAPCS64 §5.4.2 C.10 gives it one X register per
+            // eightbyte rather than V registers. It joins at one register as
+            // well as two, and its pseudo holds an *address* whatever its
+            // size, which is why it does not share `gp_pair` below.
+            if let Some(gp_n) = arg_type
+                .filter(|t| types.is_complex_integer(*t))
+                .and_then(|t| {
+                    let abi =
+                        crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+                    match abi.classify_param(t, types) {
+                        ArgClass::Direct { classes, .. } => Some(classes.len()),
+                        _ => None,
+                    }
+                })
+            {
+                if int_arg_idx + gp_n <= int_arg_regs.len() {
+                    let base = self.load_complex_arg_address(arg);
+                    for k in 0..gp_n {
+                        self.push_lir(Aarch64Inst::Ldr {
+                            size: OperandSize::B64,
+                            dst: int_arg_regs[int_arg_idx],
+                            addr: MemAddr::BaseOffset {
+                                base,
+                                offset: (k * 8) as i32,
+                            },
+                        });
+                        int_arg_idx += 1;
+                    }
+                } else {
+                    // C.12: the whole argument goes on the stack, and stage C
+                    // marks the remaining general registers unavailable.
+                    stack_args_info.push(StackArg {
+                        pseudo: arg,
+                        is_fp: false,
+                        size: arg_size,
+                        typ: arg_type,
+                        kind: StackKind::Composite {
+                            bytes: (types.size_bits(arg_type.unwrap()) / 8) as i32,
+                        },
+                    });
+                    int_arg_idx = int_arg_regs.len();
                 }
                 continue;
             }
@@ -680,19 +725,38 @@ impl Aarch64CodeGen {
                 continue;
             }
             if let StackKind::Composite { bytes } = stack_arg.kind {
-                // The pseudo locates the aggregate; its bytes go into the slot.
+                // The pseudo locates the aggregate; its bytes go into the
+                // slot. Whether its slot *is* the aggregate or merely points
+                // at it is the pseudo's kind, not its location: a `Sym` names
+                // storage, and anything else in a slot -- a spilled address,
+                // an `Alloca` result -- holds a pointer. A complex value is
+                // always the latter, so taking the address of the slot copied
+                // the pointer's own bytes into the outgoing argument.
+                let names_storage = self
+                    .pseudos
+                    .iter()
+                    .find(|p| p.id == stack_arg.pseudo)
+                    .is_some_and(|p| matches!(p.kind, crate::ir::PseudoKind::Sym(_)));
                 let src = match self.get_location(stack_arg.pseudo) {
                     Loc::Reg(r) => r,
                     ref loc @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
                         // As above: the aggregate may live in either frame,
                         // and `_ => continue` would silently drop it.
-                        let (base, disp) = self.loc_addr_parts(loc).unwrap();
-                        self.push_lir(Aarch64Inst::Add {
-                            size: OperandSize::B64,
-                            src1: base,
-                            src2: GpOperand::Imm(disp as i64),
-                            dst: Reg::X9,
-                        });
+                        if names_storage {
+                            let (base, disp) = self.loc_addr_parts(loc).unwrap();
+                            self.push_lir(Aarch64Inst::Add {
+                                size: OperandSize::B64,
+                                src1: base,
+                                src2: GpOperand::Imm(disp as i64),
+                                dst: Reg::X9,
+                            });
+                        } else {
+                            self.push_lir(Aarch64Inst::Ldr {
+                                size: OperandSize::B64,
+                                addr: self.loc_mem(loc).unwrap(),
+                                dst: Reg::X9,
+                            });
+                        }
                         Reg::X9
                     }
                     _ => continue,
@@ -997,7 +1061,7 @@ impl Aarch64CodeGen {
                     }
                     // Two SSE registers (could be HFA with 2 doubles)
                     if classes.iter().all(|c| *c == RegClass::Sse) {
-                        let is_complex_result = insn.typ.is_some_and(|t| types.is_complex(t));
+                        let is_complex_result = insn.typ.is_some_and(|t| types.is_complex_float(t));
                         if is_complex_result {
                             self.handle_complex_return(insn, &dst_loc, types);
                         } else {
@@ -1019,7 +1083,7 @@ impl Aarch64CodeGen {
             }
             ArgClass::Hfa { count, base } => {
                 // HFA: values in V0-V3
-                let is_complex_result = insn.typ.is_some_and(|t| types.is_complex(t));
+                let is_complex_result = insn.typ.is_some_and(|t| types.is_complex_float(t));
                 if *count == 2 && is_complex_result {
                     self.handle_complex_return(insn, &dst_loc, types);
                     return;

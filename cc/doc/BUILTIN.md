@@ -54,6 +54,7 @@ differs from gcc, the row says so rather than leaving the reader to find out.
 |---------|-------------|
 | `__builtin_constant_p(expr)` | Returns 1 if expr is compile-time constant |
 | `__builtin_types_compatible_p(t1, t2)` | Returns 1 if types are compatible (ignores qualifiers) |
+| `__builtin_classify_type(expr)` | A code for the argument's type family: 1 integer, 5 pointer, 8 real floating, 9 complex, 12 struct, 13 union. The usual conversions run first, so a `char`, an enumeration constant and a `_Bool` all answer 1, and an array, a function and a string literal all answer 5. The argument is not evaluated |
 | `__builtin_choose_expr(c, a, b)` | `a` or `b` by the constant `c`; the untaken arm is not evaluated and need not even type-check |
 
 ## Memory
@@ -61,10 +62,11 @@ differs from gcc, the row says so rather than leaving the reader to find out.
 | Builtin | Description |
 |---------|-------------|
 | `__builtin_alloca(size)` | Allocate `size` bytes on stack (freed on function return) |
+| `alloca(size)` | The same builtin under its bare name, as gcc predefines it. Unlike a `__builtin_*` spelling it is not reserved, so a declaration that is not a function displaces it; the one in `<alloca.h>` is a function and does not |
 | `__builtin_memset(dst, c, n)` | Set `n` bytes to `c` |
 | `__builtin_memcpy(dst, src, n)` | Copy `n` bytes |
 | `__builtin_memmove(dst, src, n)` | Copy `n` bytes (overlapping safe) |
-| `__builtin_prefetch(addr, ...)` | Cache prefetch hint (no-op) |
+| `__builtin_prefetch(addr, ...)` | Cache prefetch hint. Emits nothing, but `addr` is still **evaluated** — `__builtin_prefetch((q = p))` assigns `q`. The `rw` and locality arguments must be constants, so they have nothing to evaluate |
 
 ## Control Flow
 
@@ -110,9 +112,9 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 | `__builtin_signbit(x)` | Returns non-zero if sign bit set (`double`) |
 | `__builtin_signbitf(x)` | Returns non-zero if sign bit set (`float`) |
 | `__builtin_signbitl(x)` | Returns non-zero if sign bit set (`long double`) |
-| `__builtin_isnan(x)` | 1 if `x` is a NaN, else 0. Any real floating type |
-| `__builtin_isinf(x)` | 1 if `x` is an infinity of either sign |
-| `__builtin_isfinite(x)` | 1 if `x` is neither infinite nor NaN |
+| `__builtin_isnan(x)`, `__builtin_isnanf`, `__builtin_isnanl` | 1 if `x` is a NaN, else 0. Any real floating type; the suffix is accepted but not consulted, since the operand's own type decides |
+| `__builtin_isinf(x)`, `__builtin_isinff`, `__builtin_isinfl` | 1 if `x` is an infinity of either sign |
+| `__builtin_isfinite(x)` | 1 if `x` is neither infinite nor NaN. gcc has no `f`/`l` spelling of this one, or of `isnormal`, so neither does c17 |
 | `__builtin_isnormal(x)` | 1 if `x` is finite, non-zero and not subnormal |
 | `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` | Whichever of the five class codes describes `x` |
 | `__builtin_flt_rounds()` | Current FP rounding mode |
@@ -132,6 +134,9 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 | Builtin | Description |
 |---------|-------------|
 | `__builtin_complex(re, im)` | Build a complex value from two reals of the same type |
+| `__builtin_creal(z)`, `__builtin_crealf`, `__builtin_creall` | The real half. Lowers to `__real__`, not a libm call |
+| `__builtin_cimag(z)`, `__builtin_cimagf`, `__builtin_cimagl` | The imaginary half |
+| `__builtin_conj(z)`, `__builtin_conjf`, `__builtin_conjl` | The complex conjugate. Built from `__builtin_complex(__real__ z, -__imag__ z)`, so a zero imaginary part conjugates to **negative** zero, as it must |
 
 Used by `<complex.h>` for `I` and the `CMPLX`/`CMPLXF`/`CMPLXL` macros, which
 exist precisely so `x + y*I` has an exact alternative that cannot corrupt an
@@ -141,6 +146,33 @@ Usable at file scope and in a static initializer as well as in a function
 body: `double _Complex g = 1.0 + 2.0*I;` and `CMPLX(3.0, 4.0)` both work, at
 every precision. (This entry used to record the opposite as a limit; that was
 fixed by `#C11` and the note outlived it.)
+
+The complex *integer* types are supported as well -- `_Complex int`,
+`_Complex long`, `_Complex unsigned char` and the rest, a GNU extension. They
+behave as two integers laid end to end: `sizeof` is twice the base, the halves
+align to the base, and each half wraps at its own width. Multiply and divide
+are open-coded rather than routed through `__mulsc3`/`__divsc3`, which exist
+only for the floating formats and whose infinity recovery has no meaning for a
+type that wraps. Imaginary constants may be integers too -- `2i` is a
+`_Complex int` -- and `~z` is the conjugate for every complex type, floating
+and integer alike, which is what gcc gives `~` on a complex operand.
+
+`_Complex __int128` is thirty-two bytes and so travels in memory and returns
+through the hidden pointer, on both targets.
+
+Division uses **Smith's method**, matching gcc, rather than the textbook
+formula `((ac + bd) + (bc - ad)i) / (c*c + d*d)`. The textbook form is exact
+but overflows: `(4000000000u + 0i) / (2u + 0i)` needs `a * c` to hold 8e9,
+which a 32-bit half cannot, and the quotient comes out 926258176. Smith's
+method divides through by the larger half first, so the products stay near the
+magnitude of the operands.
+
+The cost is a branch and a truncation. Each step truncates toward zero, as any
+integer division does, so `(-9 + 38i) / (5 + 6i)` is `6 + 1i` where the exact
+quotient is `3 + 4i` -- gcc answers the same, because it is the same
+algorithm. The standard specifies nothing here (the whole type is an
+extension), so gcc's behaviour is the only available definition, and matching
+it is the point.
 
 ## Checked Arithmetic
 
@@ -153,6 +185,9 @@ result did not fit, 0 if it did — so the result is written either way.
 | `__builtin_add_overflow(a, b, *r)` | Type-generic; the operands and `*r` may differ in type |
 | `__builtin_sub_overflow(a, b, *r)` | |
 | `__builtin_mul_overflow(a, b, *r)` | |
+| `__builtin_add_overflow_p(a, b, v)` | The same question, answered without storing. `v` names the destination type with a *value* rather than a pointer; it is still evaluated, as gcc evaluates it, but its value is unused |
+| `__builtin_sub_overflow_p(a, b, v)` | |
+| `__builtin_mul_overflow_p(a, b, v)` | |
 | `__builtin_sadd_overflow(a, b, *r)` | Add, `int` |
 | `__builtin_saddl_overflow(a, b, *r)` | Add, `long` |
 | `__builtin_saddll_overflow(a, b, *r)` | Add, `long long` |
@@ -182,12 +217,35 @@ headers rely on.
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_strlen(s)` | |
-| `__builtin_strcmp(a, b)` | |
+| `__builtin_abort()` | |
+| `__builtin_exit(status)` | |
 | `__builtin_abs(x)` | Absolute value, `int` |
 | `__builtin_labs(x)` | Absolute value, `long` |
 | `__builtin_llabs(x)` | Absolute value, `long long` |
 | `__builtin_trap()` | Abnormal termination; lowered to `abort` |
+| `__builtin_malloc(n)`, `__builtin_calloc(n, sz)`, `__builtin_realloc(p, n)`, `__builtin_free(p)` | The allocators. The three allocating forms return `void *` |
+| `__builtin_memcmp(a, b, n)` | |
+| `__builtin_mempcpy(dst, src, n)` | Returns the **end** of the copied region, unlike `memcpy` |
+| `__builtin_strlen(s)`, `__builtin_strcmp(a, b)`, `__builtin_strncmp(a, b, n)` | |
+| `__builtin_strcpy(d, s)`, `__builtin_strncpy(d, s, n)`, `__builtin_stpcpy(d, s)` | `stpcpy` returns the end of the copy |
+| `__builtin_strcat(d, s)`, `__builtin_strncat(d, s, n)` | |
+| `__builtin_strchr(s, c)`, `__builtin_strrchr(s, c)`, `__builtin_strstr(h, n)` | |
+| `__builtin_printf(fmt, ...)`, `__builtin_sprintf(buf, fmt, ...)`, `__builtin_snprintf(buf, n, fmt, ...)` | Variadic after the format argument |
+| `__builtin_puts(s)`, `__builtin_putchar(c)` | |
+| `__builtin_memchr(p, c, n)` | Returns `void *` |
+| `__builtin_index(s, c)`, `__builtin_rindex(s, c)` | The older spellings of `strchr`/`strrchr` |
+| `__builtin_strpbrk(s, set)` | |
+| `__builtin_strspn(s, set)`, `__builtin_strcspn(s, set)` | Return a size, not a pointer |
+| `__builtin_imaxabs(x)` | Absolute value, `intmax_t` |
+| `__builtin_bcopy(src, dst, n)` | Returns `void`, and takes the source **first**, unlike `memcpy` |
+| `__builtin_printf_unlocked`, `__builtin_fprintf_unlocked`, `__builtin_fputs_unlocked` | glibc defines none of these, so a program using one supplies it — which is what gcc.c-torture's `builtins/` tests do |
+
+The return types matter and are modelled: the string family returns `char *`,
+the allocators and `mempcpy` return `void *`. Typing one of them `int` would
+truncate the returned address to 32 bits — a silent wrong answer, since the
+call still links and runs. So would getting the printf family's fixed-argument
+count wrong on Apple arm64, where variadic arguments go on the stack while
+fixed ones stay in registers.
 
 ## Object Size and Fortification
 
@@ -245,7 +303,6 @@ system header takes.
 
 | Builtin | Consequence |
 |---------|-------------|
-| `__builtin_classify_type` | Needed by the host's `<tgmath.h>`; c17 bundles its own, built on `_Generic`, so this is not a blocker. `__has_builtin` answers 0, so guarded code is already correct |
 | `__builtin_clear_padding` | Would have to walk a type to find its padding |
 | `__builtin_setjmp` | Not implemented; the ordinary `setjmp`/`longjmp` are |
 

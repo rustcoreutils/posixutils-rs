@@ -4834,3 +4834,139 @@ fn diag_complex_type_is_named_in_full() {
         "double _Complex",
     );
 }
+
+// ============================================================================
+// -fpermissive — two pre-C99 constructs, error by default
+// ============================================================================
+
+/// Compile `content` with the given extra flags and hand back the run.
+fn compile_with(name: &str, content: &str, flags: &[&str]) -> crate::common::C17Run {
+    let c_file = create_c_file(name, content);
+    let path = c_file.path().to_string_lossy().to_string();
+    let mut args: Vec<&str> = vec!["-S", "-o", "/dev/null"];
+    args.extend_from_slice(flags);
+    args.push(&path);
+    run_c17(&args)
+}
+
+/// `-fpermissive` turns exactly two errors into warnings, and the default
+/// must keep rejecting both.
+///
+/// The severity alone is not the assertion: a check that only looked at the
+/// exit status would pass if the diagnostic vanished entirely, which is the
+/// opposite of what is wanted. So the message text is asserted in both
+/// directions -- still emitted, and emitted as a warning.
+#[test]
+fn diagnostics_fpermissive_downgrades_implicit_int() {
+    let src = "static counter;\nf(x) int x; { return x; }\n";
+
+    let strict = compile_with("permissive_off_int", src, &[]);
+    assert!(!strict.success, "implicit int must be an error by default");
+    assert!(
+        strict.stderr.contains("error:") && strict.stderr.contains("type specifier missing"),
+        "default build lost the implicit-int error:\n{}",
+        strict.stderr
+    );
+
+    let lax = compile_with("permissive_on_int", src, &["-fpermissive"]);
+    assert!(
+        lax.success,
+        "-fpermissive should accept implicit int:\n{}",
+        lax.stderr
+    );
+    assert!(
+        lax.stderr.contains("warning:") && lax.stderr.contains("type specifier missing"),
+        "-fpermissive should still say something, as a warning:\n{}",
+        lax.stderr
+    );
+    assert!(
+        !lax.stderr.contains("error:"),
+        "-fpermissive left an error behind:\n{}",
+        lax.stderr
+    );
+}
+
+#[test]
+fn diagnostics_fpermissive_allows_implicit_function_declaration() {
+    let src = "int main(void){ return undeclared_fn(1, 2); }\n";
+
+    let strict = compile_with("permissive_off_fn", src, &[]);
+    assert!(
+        !strict.success && strict.stderr.contains("undeclared identifier"),
+        "a call to an undeclared function must be an error by default:\n{}",
+        strict.stderr
+    );
+
+    let lax = compile_with("permissive_on_fn", src, &["-fpermissive"]);
+    assert!(
+        lax.success,
+        "-fpermissive should implicitly declare it:\n{}",
+        lax.stderr
+    );
+    assert!(
+        lax.stderr.contains("warning:")
+            && lax.stderr.contains("implicit declaration of function")
+            && lax.stderr.contains("undeclared_fn"),
+        "-fpermissive should name the function it declared for you:\n{}",
+        lax.stderr
+    );
+}
+
+/// The implicit declaration is for a *call*. A bare undeclared identifier was
+/// never implicitly declared by any C standard, and must stay an error even
+/// under `-fpermissive` -- otherwise a misspelled variable silently becomes a
+/// function and the program links against nothing.
+#[test]
+fn diagnostics_fpermissive_still_rejects_a_bare_undeclared_name() {
+    for (name, src) in [
+        (
+            "perm_bare_name",
+            "int main(void){ return mispelled_var; }\n",
+        ),
+        (
+            "perm_bare_assign",
+            "int main(void){ mispelled_var = 1; return 0; }\n",
+        ),
+        (
+            "perm_bare_addr",
+            "int main(void){ return *&mispelled_var; }\n",
+        ),
+    ] {
+        let run = compile_with(name, src, &["-fpermissive"]);
+        assert!(
+            !run.success && run.stderr.contains("undeclared identifier"),
+            "{name}: -fpermissive must not invent a variable:\n{}",
+            run.stderr
+        );
+    }
+}
+
+/// `-fpermissive` relaxes those two constructs and nothing else: it is not a
+/// dialect switch, and the rest of C17 still applies.
+#[test]
+fn diagnostics_fpermissive_is_not_a_dialect() {
+    for (name, src, expected) in [
+        (
+            "perm_still_checks_args",
+            "int f(int a, int b); int main(void){ return f(1); }\n",
+            "argument",
+        ),
+        (
+            "perm_still_checks_redecl",
+            "int v; char v;\nint main(void){ return 0; }\n",
+            "conflicting",
+        ),
+        (
+            "perm_still_checks_assign_to_array",
+            "int main(void){ int a[4], b[4]; a = b; return 0; }\n",
+            "array type",
+        ),
+    ] {
+        let run = compile_with(name, src, &["-fpermissive"]);
+        assert!(
+            !run.success && run.stderr.contains(expected),
+            "{name}: -fpermissive should not have relaxed this:\n{}",
+            run.stderr
+        );
+    }
+}

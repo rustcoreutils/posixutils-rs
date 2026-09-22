@@ -6362,12 +6362,15 @@ fn test_vm_index_base_counts_a_deref_as_an_index_step() {
         kind: ExprKind::Ident(sym),
         typ: Some(int_t),
         pos: test_pos(),
+
+        bitfield_bits: None,
     };
     let zero = || {
         Box::new(Expr {
             kind: ExprKind::IntLit(0),
             typ: Some(int_t),
             pos: test_pos(),
+            bitfield_bits: None,
         })
     };
     let index = |base: Expr| Expr {
@@ -6377,6 +6380,7 @@ fn test_vm_index_base_counts_a_deref_as_an_index_step() {
         },
         typ: Some(int_t),
         pos: test_pos(),
+        bitfield_bits: None,
     };
     let deref = |base: Expr| Expr {
         kind: ExprKind::Unary {
@@ -6385,6 +6389,7 @@ fn test_vm_index_base_counts_a_deref_as_an_index_step() {
         },
         typ: Some(int_t),
         pos: test_pos(),
+        bitfield_bits: None,
     };
 
     // The object itself is depth 0.
@@ -6412,6 +6417,7 @@ fn test_vm_index_base_counts_a_deref_as_an_index_step() {
         },
         typ: Some(int_t),
         pos: test_pos(),
+        bitfield_bits: None,
     };
     assert_eq!(Linearizer::vm_index_base(&not_an_object), None);
     assert_eq!(Linearizer::vm_index_base(&index(not_an_object)), None);
@@ -6424,6 +6430,7 @@ fn test_vm_index_base_counts_a_deref_as_an_index_step() {
         },
         typ: Some(int_t),
         pos: test_pos(),
+        bitfield_bits: None,
     };
     assert_eq!(Linearizer::vm_index_base(&addr_of), None);
 
@@ -6436,6 +6443,7 @@ fn test_vm_index_base_counts_a_deref_as_an_index_step() {
             kind: ExprKind::IntLit(2),
             typ: Some(int_t),
             pos: test_pos(),
+            bitfield_bits: None,
         })
     };
     let arith = |op, left: Expr, swap: bool| Expr {
@@ -6446,6 +6454,7 @@ fn test_vm_index_base_counts_a_deref_as_an_index_step() {
         },
         typ: Some(int_t),
         pos: test_pos(),
+        bitfield_bits: None,
     };
     assert_eq!(
         Linearizer::vm_index_base(&arith(BinaryOp::Add, ident(), false)),
@@ -6491,22 +6500,26 @@ fn test_va_arg_pack_becomes_a_flag_not_an_argument() {
                 kind: ExprKind::Ident(ctx.var("target", int_t)),
                 typ: Some(int_t),
                 pos: test_pos(),
+                bitfield_bits: None,
             }),
             args: vec![
                 Expr {
                     kind: ExprKind::IntLit(1),
                     typ: Some(int_t),
                     pos: test_pos(),
+                    bitfield_bits: None,
                 },
                 Expr {
                     kind: ExprKind::VaArgPack,
                     typ: Some(ctx.types.void_id),
                     pos: test_pos(),
+                    bitfield_bits: None,
                 },
             ],
         },
         typ: Some(int_t),
         pos: test_pos(),
+        bitfield_bits: None,
     };
     let _ = target;
 

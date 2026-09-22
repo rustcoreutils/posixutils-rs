@@ -85,6 +85,11 @@ Options beyond the POSIX set (`-B -c -D -E -G -g -I -L -l -O -o -R -s -U`):
  * `-S` — emit assembly.
  * `-v` / `--verbose`, `--stats`, `--pedantic`, `-W <warning>`.
  * `--nostdinc`, `--nobuiltininc`, `--fno-builtin`, `--fno-unwind-tables`.
+ * `-fpermissive` — accept two constructs C99 removed, as warnings rather
+   than errors: implicit `int` in a declaration naming no type, and the
+   implicit declaration of a function called before it is declared.  It is
+   not a dialect switch; the language is still C17 and `-std=` stays inert.
+   gcc draws the same line, rejecting both by default.
  * `--target <triple>`, `--shared`, `--rtlib`, `--print-targets`.
  * `--trigraphs` — enable trigraph replacement (off by default, since it
    would alter string literals).
@@ -111,12 +116,20 @@ Language and preprocessor additions:
    `__asm`.
  * `__int128`, `__int128_t`, `__uint128_t`, `_Float16`, `_Float32`, `_Float64`,
    `__builtin_va_list`.
+ * GNU imaginary constants — `1.0i`, `2.2if`, `1.0fi`, `2.2iL`, `1.j`.  The
+   marker may sit on either side of the floating suffix.  C spells this
+   `_Imaginary`, which Annex G makes optional and neither c17 nor gcc
+   provides; both give the constant a complex type with a zero real part.
+   The integer form `2i`, which gcc types `_Complex int`, is not accepted.
  * Clang nullability qualifiers `_Nonnull`, `_Nullable`, `_Null_unspecified`
    and their `__` spellings.
- * Roughly 90 `__builtin_*` and `__c11_atomic_*` intrinsics, including the
-   `__builtin___*_chk` FORTIFY family.
+ * Roughly 145 `__builtin_*` and `__c11_atomic_*` intrinsics, including the
+   `__builtin___*_chk` FORTIFY family and the libc aliases (`__builtin_abort`,
+   `__builtin_printf`, `__builtin_strcpy`, ...) that let a translation unit
+   call one without having included the header that declares it.
  * `__FUNCTION__`, `__PRETTY_FUNCTION__`.
- * `#include_next`, `#warning`, `#pragma once`.
+ * `#include_next`, `#warning`, `#pragma once`, `#pragma push_macro` and
+   `#pragma pop_macro`.
  * `__has_attribute`, `__has_builtin`, `__has_feature`, `__has_extension`,
    `__has_include`, `__has_include_next`.
  * Named variadic macro parameters (`#define F(args...)`), an empty variadic

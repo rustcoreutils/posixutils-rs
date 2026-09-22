@@ -501,8 +501,25 @@ impl X86_64CodeGen {
         }
 
         if guarded {
-            // Register path: one eightbyte at a time, each from its own area.
-            for (i, class) in classes.iter().enumerate() {
+            // How many bytes one SSE entry accounts for.
+            //
+            // `classes` counts *registers*, not eightbytes, and the two differ
+            // for exactly one shape: an SSE+SSEUP pair is a single register
+            // carrying all sixteen bytes, as `sse_struct_regs` documents. A
+            // struct of two doubles is two entries of eight; a struct holding
+            // a `__float128` is one entry of sixteen. Walking both as eight
+            // copied half of the latter and left the rest of the destination
+            // as it was.
+            let sse_bytes = if classes.iter().all(|c| *c == RegClass::Sse)
+                && (classes.len() as i32) * 8 < size_bytes
+            {
+                16
+            } else {
+                8
+            };
+            // Register path: one entry at a time, each from its own area.
+            let mut at = 0i32;
+            for class in classes.iter() {
                 let (field, step) = match class {
                     RegClass::Sse => (4i32, 16i64),
                     _ => (0, 8),
@@ -561,9 +578,13 @@ impl X86_64CodeGen {
                         offset: ap_off + field,
                     }),
                 });
-                let at = i as i32 * 8;
-                let bytes = (size_bytes - at).min(8);
+                let covers = match class {
+                    RegClass::Sse => sse_bytes,
+                    _ => 8,
+                };
+                let bytes = (size_bytes - at).min(covers);
                 self.va_copy_bytes(Reg::Rax, 0, dst, at, bytes);
+                at += covers;
             }
             self.push_lir(X86Inst::Jmp {
                 target: done_label.clone(),

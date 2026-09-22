@@ -154,6 +154,23 @@ pub struct Expr {
     pub typ: Option<TypeId>,
     /// Source position for debug info
     pub pos: Position,
+    /// For an expression whose value is a bit-field wider than `int`: the
+    /// field's declared width in bits.
+    ///
+    /// C17 6.7.2.1p10 says a bit-field "is interpreted as having a signed or
+    /// unsigned integer type consisting of the specified number of bits", so
+    /// arithmetic on `unsigned long long b : 40` is carried out at 40 bits and
+    /// `x.b << 32` with `x.b == 0x100` is zero. 6.2.5p9 then requires the
+    /// unsigned result to be reduced modulo 2^40.
+    ///
+    /// This rides *beside* the type rather than in it, deliberately. `sizeof`
+    /// must stay 8 — gcc agrees — so this is a precision, not a size, and a
+    /// `TypeId` that answered 40 to `size_bits` would be wrong everywhere the
+    /// ABI, DWARF and the backends look at it. A field narrower than `int`
+    /// needs nothing here: it *promotes* to `int`, which the type can express.
+    ///
+    /// `None` for everything that is not one, which is almost everything.
+    pub bitfield_bits: Option<u32>,
 }
 
 impl Expr {
@@ -163,6 +180,7 @@ impl Expr {
             kind,
             typ: None,
             pos,
+            bitfield_bits: None,
         }
     }
 
@@ -172,6 +190,7 @@ impl Expr {
             kind,
             typ: Some(typ),
             pos,
+            bitfield_bits: None,
         }
     }
 
@@ -182,6 +201,7 @@ impl Expr {
             kind,
             typ: None,
             pos: Position::default(),
+            bitfield_bits: None,
         }
     }
 
@@ -192,6 +212,7 @@ impl Expr {
             kind,
             typ: Some(typ),
             pos: Position::default(),
+            bitfield_bits: None,
         }
     }
 }
@@ -482,8 +503,16 @@ pub enum ExprKind {
         op: CheckedOp,
         a: Box<Expr>,
         b: Box<Expr>,
-        /// Pointer to where the wrapped result goes.
+        /// Where the wrapped result goes, and what its type is.
+        ///
+        /// For the `__builtin_*_overflow` forms this is a *pointer* to the
+        /// destination, and the wrapped result is stored through it. For the
+        /// `_p` forms it is a plain value that is never evaluated: gcc takes
+        /// it for its type alone, to say what "fits" is being asked about.
         res: Box<Expr>,
+        /// False for the `_p` forms: `res` is a value, not a pointer, and
+        /// nothing is stored.
+        store: bool,
     },
 
     /// __builtin_ctzll(x)

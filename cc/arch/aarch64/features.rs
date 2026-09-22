@@ -1369,6 +1369,39 @@ impl Aarch64CodeGen {
         self.emit_move_to_loc(Reg::X0, &dst_loc, u32::BITS);
     }
 
+    /// `__builtin_memcpy`/`memset`/`memmove` on aarch64: a call to the libc
+    /// function of the same name.
+    ///
+    /// x86-64 lowers these in its own `features.rs`; aarch64 did not lower them
+    /// at all. The opcode reached codegen, fell into the `_ => {}` arm that
+    /// skips no-ops, and produced nothing -- so `__builtin_memcpy(b, a, 32)`
+    /// left `b` untouched, silently, on every aarch64 build.
+    ///
+    /// AAPCS64 puts the three arguments in x0/x1/x2, and all three functions
+    /// return the destination pointer in x0. `is_call_like_aarch64` lists these
+    /// opcodes so the allocator stops keeping values in caller-saved registers
+    /// across one.
+    pub(super) fn emit_mem_libcall(&mut self, insn: &Instruction, func_name: &str) {
+        if insn.src.len() < 3 {
+            return;
+        }
+        // Into the argument registers in reverse, so a source still sitting in
+        // x0 or x1 is read before it is overwritten.
+        self.emit_move(insn.src[2], Reg::X2, 64);
+        self.emit_move(insn.src[1], Reg::X1, 64);
+        self.emit_move(insn.src[0], Reg::X0, 64);
+
+        self.push_lir(Aarch64Inst::Bl {
+            target: CallTarget::Direct(Symbol::global(func_name)),
+        });
+
+        // All three return the destination pointer.
+        if let Some(target) = insn.target {
+            let dst_loc = self.get_location(target);
+            self.emit_move_to_loc(Reg::X0, &dst_loc, 64);
+        }
+    }
+
     /// Emit __builtin_signbit - test sign bit of double
     pub(super) fn emit_signbit64(&mut self, insn: &Instruction, types: &TypeTable) {
         let arg = match insn.src.first() {

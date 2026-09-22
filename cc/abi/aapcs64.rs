@@ -54,6 +54,30 @@ fn complex_hfa_base(ty: TypeId, types: &TypeTable) -> Option<HfaBase> {
 #[derive(Debug, Clone, Default)]
 pub struct Aapcs64Abi;
 
+/// A GNU complex integer's argument or return class under AAPCS64.
+///
+/// It is a composite type with no floating members, so it is never an HFA:
+/// §5.4.2 stage C.10 puts a composite of sixteen bytes or fewer in one X
+/// register per eightbyte, and anything larger travels by reference. That
+/// makes `_Complex int` X(n), `_Complex long` X(n)+X(n+1), and
+/// `_Complex __int128` -- thirty-two bytes -- indirect.
+///
+/// Asked before every integer path, because a complex type carries its base's
+/// kind: `_Complex long` satisfied `is_integer` and was handed a single X
+/// register for a sixteen-byte value.
+fn classify_complex_integer(types: &TypeTable, ty: TypeId, size_bits: u32) -> ArgClass {
+    if size_bits > MAX_AGGREGATE_BITS {
+        return ArgClass::Indirect {
+            align: types.alignment(ty) as u32,
+            size_bits,
+        };
+    }
+    ArgClass::Direct {
+        classes: vec![RegClass::Integer; size_bits.div_ceil(64) as usize],
+        size_bits,
+    }
+}
+
 impl Aapcs64Abi {
     /// Create a new AAPCS64 ABI classifier.
     pub fn new() -> Self {
@@ -245,6 +269,14 @@ impl Abi for Aapcs64Abi {
             return ArgClass::Ignore;
         }
 
+        // Complex integers, before any integer path: see
+        // `classify_complex_integer`. The sub-32-bit path below would have
+        // sign-extended `_Complex short` as a scalar, overwriting the
+        // imaginary half.
+        if types.is_complex_integer(ty) {
+            return classify_complex_integer(types, ty, size_bits);
+        }
+
         // Integer types smaller than 32 bits need extension
         // AAPCS64: "the size of the argument is rounded up to 4 bytes"
         if is_integer(kind) && size_bits < 32 {
@@ -276,7 +308,7 @@ impl Abi for Aapcs64Abi {
         // scalar V register, so the imaginary half was never passed and every
         // later floating-point argument sat one register too high.
         // `classify_return` already had the order right.
-        if types.is_complex(ty) {
+        if types.is_complex_float(ty) {
             if let Some(base) = complex_hfa_base(ty, types) {
                 return ArgClass::Hfa { base, count: 2 };
             }
@@ -341,6 +373,12 @@ impl Abi for Aapcs64Abi {
             return ArgClass::Ignore;
         }
 
+        // Complex integers, before any integer path: see
+        // `classify_complex_integer`.
+        if types.is_complex_integer(ty) {
+            return classify_complex_integer(types, ty, size_bits);
+        }
+
         // 128-bit integer types: return in X0+X1
         if kind == TypeKind::Int128 {
             return ArgClass::Direct {
@@ -359,7 +397,7 @@ impl Abi for Aapcs64Abi {
 
         // Complex types - return as HFA (must check BEFORE is_float since complex
         // types have TypeKind::Float/Double/LongDouble)
-        if types.is_complex(ty) {
+        if types.is_complex_float(ty) {
             if let Some(base) = complex_hfa_base(ty, types) {
                 return ArgClass::Hfa { base, count: 2 };
             }

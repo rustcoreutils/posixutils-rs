@@ -734,6 +734,17 @@ impl<'a> Linearizer<'a> {
     /// very library calls the arithmetic depends on.
     fn returns_via_hidden_pointer(&self, typ: TypeId) -> bool {
         let kind = self.types.kind(typ);
+        // A GNU complex integer over two eightbytes does: `_Complex __int128`
+        // is thirty-two bytes and comes back through the hidden pointer, the
+        // same as any other MEMORY-class object. Its floating cousins do not,
+        // which is why this asks the classifier rather than the size.
+        if self.types.is_complex_integer(typ) {
+            let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+            return matches!(
+                abi.classify_return(typ, self.types),
+                crate::abi::ArgClass::Indirect { .. }
+            );
+        }
         if kind != TypeKind::Struct && kind != TypeKind::Union {
             // Scalars and `_Complex` never do, which is what keeps the
             // `long double _Complex` guarantee above local and testable.
@@ -840,49 +851,17 @@ impl<'a> Linearizer<'a> {
                 let addr_pseudo = self.alloc_reg_pseudo();
                 self.emit(Instruction::sym_addr(addr_pseudo, arg_pseudo, ptr_type));
 
-                let struct_size = typ_size / 8;
-                let mut offset = 0i64;
-                while offset < struct_size as i64 {
-                    let temp = self.alloc_reg_pseudo();
-                    self.emit(Instruction::load(
-                        temp,
-                        addr_pseudo,
-                        offset,
-                        self.types.long_id,
-                        64,
-                    ));
-                    self.emit(Instruction::store(
-                        temp,
-                        local_sym,
-                        offset,
-                        self.types.long_id,
-                        64,
-                    ));
-                    offset += 8;
-                }
+                // Through the shared block copy, which knows two things this
+                // loop did not: a copy past 128 bytes becomes a `memcpy` call
+                // rather than an unbounded unroll, and a size that is not a
+                // multiple of eight is copied exactly. Stepping 8 while
+                // `offset < size` rounds *up* -- a 12-byte struct wrote 16
+                // bytes, four of them past the local.
+                self.emit_block_copy(local_sym, addr_pseudo, (typ_size / 8) as i64);
             } else if typ_size > 64 {
                 // Medium struct (9-16 bytes): arg_pseudo is a pointer (current behavior).
                 // Copy each 8-byte chunk through pointer dereference.
-                let struct_size = typ_size / 8;
-                let mut offset = 0i64;
-                while offset < struct_size as i64 {
-                    let temp = self.alloc_reg_pseudo();
-                    self.emit(Instruction::load(
-                        temp,
-                        arg_pseudo,
-                        offset,
-                        self.types.long_id,
-                        64,
-                    ));
-                    self.emit(Instruction::store(
-                        temp,
-                        local_sym,
-                        offset,
-                        self.types.long_id,
-                        64,
-                    ));
-                    offset += 8;
-                }
+                self.emit_block_copy(local_sym, arg_pseudo, (typ_size / 8) as i64);
             } else {
                 // Small struct: arg_pseudo contains the value directly
                 self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
@@ -1395,27 +1374,11 @@ impl<'a> Linearizer<'a> {
         // complex returns take the register path and go through
         // `complex_operand_addr`.
         let src_addr = self.linearize_lvalue(e);
-        let struct_bytes = struct_size as i64 / 8;
-        let mut byte_offset = 0i64;
-
-        while byte_offset < struct_bytes {
-            let temp = self.alloc_reg_pseudo();
-            self.emit(Instruction::load(
-                temp,
-                src_addr,
-                byte_offset,
-                self.types.long_id,
-                64,
-            ));
-            self.emit(Instruction::store(
-                temp,
-                sret_ptr,
-                byte_offset,
-                self.types.long_id,
-                64,
-            ));
-            byte_offset += 8;
-        }
+        // The shared block copy, for the same two reasons the parameter
+        // prologue uses it: a large struct becomes a `memcpy` call instead of
+        // an unbounded unroll, and a size that is not a multiple of eight is
+        // copied exactly rather than rounded up past the caller's object.
+        self.emit_block_copy(sret_ptr, src_addr, struct_size as i64 / 8);
 
         self.emit(Instruction::ret_typed(
             Some(sret_ptr),
@@ -2154,6 +2117,59 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Linearize a type cast expression
+    /// A cast to a complex type (C17 6.3.1.7p1).
+    ///
+    /// From a real: the value becomes the real part and the imaginary part is
+    /// zero. From a complex: each half is converted to the new precision,
+    /// which is what makes `(_Complex double)(_Complex float)z` widen both
+    /// halves rather than only one.
+    ///
+    /// Built the same way `__builtin_complex` is -- a local of the target type
+    /// and two stores -- so the result travels by address like every other
+    /// complex value.
+    fn emit_cast_to_complex(
+        &mut self,
+        inner_expr: &Expr,
+        src_type: TypeId,
+        cast_type: TypeId,
+    ) -> PseudoId {
+        let base_typ = self.types.complex_base(cast_type);
+        let base_bits = self.types.size_bits(base_typ);
+        let base_bytes = (base_bits / 8) as i64;
+
+        let (real_val, imag_val) = if self.types.is_complex(src_type) {
+            // Each half, converted to the destination's precision.
+            let src_base = self.types.complex_base(src_type);
+            let addr = self.complex_operand_addr(inner_expr);
+            let src_bits = self.types.size_bits(src_base);
+            let src_bytes = (src_bits / 8) as i64;
+
+            let re = self.alloc_pseudo();
+            self.emit(Instruction::load(re, addr, 0, src_base, src_bits));
+            let im = self.alloc_pseudo();
+            self.emit(Instruction::load(im, addr, src_bytes, src_base, src_bits));
+
+            (
+                self.emit_convert(re, src_base, base_typ),
+                self.emit_convert(im, src_base, base_typ),
+            )
+        } else {
+            // A real source: convert it, and pair it with a zero of the
+            // destination's base type.
+            let v = self.linearize_expr(inner_expr);
+            let re = self.emit_convert(v, src_type, base_typ);
+            let zero = self.emit_fconst(crate::float::FloatVal::ZERO, base_typ);
+            (re, zero)
+        };
+
+        let result = self.alloc_local_temp(cast_type);
+        self.emit(Instruction::store(real_val, result, 0, base_typ, base_bits));
+        self.emit(Instruction::store(
+            imag_val, result, base_bytes, base_typ, base_bits,
+        ));
+        result
+    }
+
     pub(crate) fn linearize_cast(&mut self, inner_expr: &Expr, cast_type: TypeId) -> PseudoId {
         let src_type = self.expr_type(inner_expr);
 
@@ -2172,6 +2188,16 @@ impl<'a> Linearizer<'a> {
 
         if self.types.is_complex(src_type) && !self.types.is_complex(cast_type) {
             return self.emit_complex_to_real(inner_expr, cast_type);
+        }
+
+        // C17 6.3.1.7p1: converting a real to a complex type gives the real
+        // value as the real part and a zero imaginary part; converting complex
+        // to complex converts each part. Neither had a branch here, so a cast
+        // *to* a complex type fell through to the scalar path and returned a
+        // value where a complex address was expected -- `(_Complex double)0.0`
+        // segfaulted at every precision, from a real or from a complex source.
+        if self.types.is_complex(cast_type) {
+            return self.emit_cast_to_complex(inner_expr, src_type, cast_type);
         }
 
         let src = self.linearize_expr(inner_expr);
@@ -3102,6 +3128,23 @@ impl<'a> Linearizer<'a> {
                 let pt = bool_param_for_complex_arg.unwrap();
                 arg_types_vec.push(pt);
                 self.emit_complex_nonzero(a)
+            } else if let Some(pt) = formal_param_types
+                .as_ref()
+                .and_then(|params| params.get(arg_idx).copied())
+                .filter(|pt| self.types.is_complex(*pt) && !self.types.is_complex(arg_type))
+            {
+                // A *real* argument bound to a complex parameter. C17
+                // 6.5.2.2p2 converts it as if by assignment, and 6.3.1.7p1
+                // gives the imaginary half a zero -- so the callee is handed a
+                // complex object, by address, like any other complex argument.
+                //
+                // The arm below keys on the *argument's* type, so this case
+                // reached the ordinary scalar path and the raw value was
+                // passed where an address was expected: `f(7)` with a
+                // `_Complex double` parameter arrived as garbage, and with a
+                // `_Complex int` one the callee dereferenced the number 7.
+                arg_types_vec.push(pt);
+                self.promote_real_to_complex(a, pt)
             } else if self.types.is_complex(arg_type) {
                 // Complex types: pass address, codegen loads real/imag into XMM registers
                 // Type stays as complex (not pointer) so codegen knows it's complex.
@@ -3335,8 +3378,18 @@ impl<'a> Linearizer<'a> {
             return result;
         }
 
-        let val = self.linearize_expr(operand);
+        // `E++` evaluates `E` exactly once (C17 6.5.2.4p2), so the address is
+        // resolved here and serves both the read and the store-back. Reading
+        // from the expression and then re-deriving the address for the store
+        // ran every subexpression twice: `b[i++]++` incremented `i` twice and
+        // updated the wrong element. `None` is a bare identifier, which has
+        // no subexpressions to re-run.
+        let place = self.resolve_rmw_place(operand);
         let typ = self.expr_type(operand);
+        let val = match &place {
+            Some(p) => self.load_rmw_place(p, typ),
+            None => self.linearize_expr(operand),
+        };
         let is_float = self.types.is_float(typ);
         let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
 
@@ -3398,106 +3451,73 @@ impl<'a> Linearizer<'a> {
 
         // Store to local, update parameter mapping, or store through pointer
         let store_size = self.types.size_bits(typ);
-        match &operand.kind {
-            ExprKind::Ident(symbol_id) => {
-                let name_str = self.symbol_name(*symbol_id);
-                if let Some(local) = self.locals.get(symbol_id).cloned() {
-                    // Check if this is a static local (sentinel value)
-                    if local.sym.0 == u32::MAX {
-                        self.emit_static_local_store(&name_str, final_result, typ, store_size);
-                    } else {
-                        // Regular local variable
-                        self.emit(Instruction::store(
-                            final_result,
-                            local.sym,
-                            0,
-                            typ,
-                            store_size,
-                        ));
-                    }
-                } else if self.var_map.contains_key(&name_str) {
-                    self.var_map.insert(name_str.clone(), final_result);
+        if let Some(p) = &place {
+            // Through the address the read came from. The postfix forms hand
+            // back the value from *before* the update, which is already
+            // narrowed for a bit-field because `emit_bitfield_load` produced
+            // it -- so the store's answer is not needed here.
+            self.store_rmw_place(p, final_result, typ);
+            return old_val;
+        }
+        // Only a bare identifier reaches here: `resolve_rmw_place`
+        // answers `Some` for every other lvalue and the branch above
+        // stores through it. The arms that used to be here re-derived
+        // an address that had already been computed, which is exactly
+        // what ran the target a second time.
+        if let ExprKind::Ident(symbol_id) = &operand.kind {
+            let name_str = self.symbol_name(*symbol_id);
+            if let Some(local) = self.locals.get(symbol_id).cloned() {
+                // Check if this is a static local (sentinel value)
+                if local.sym.0 == u32::MAX {
+                    self.emit_static_local_store(&name_str, final_result, typ, store_size);
                 } else {
-                    // Global variable - emit store
-                    let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, name_str.clone());
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
-                    self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
+                    // Regular local variable
+                    self.emit(Instruction::store(
+                        final_result,
+                        local.sym,
+                        0,
+                        typ,
+                        store_size,
+                    ));
                 }
-            }
-            ExprKind::Unary {
-                op: UnaryOp::Deref,
-                operand: ptr_expr,
-            } => {
-                // (*p)++ or (*p)-- - store back through the pointer
-                let addr = self.linearize_expr(ptr_expr);
-                self.emit(Instruction::store(final_result, addr, 0, typ, store_size));
-            }
-            ExprKind::Member { expr, member } => {
-                // Struct member: get address and store with offset
-                let base = self.linearize_lvalue(expr);
-                let base_struct_type = self.expr_type(expr);
-                let struct_type = self.resolve_struct_type(base_struct_type);
-                if let Some(member_info) = self.types.find_member(struct_type, *member) {
-                    self.emit_member_store(base, &member_info, final_result);
+            } else if self.var_map.contains_key(&name_str) {
+                self.var_map.insert(name_str.clone(), final_result);
+            } else {
+                // Global variable - emit store
+                let sym_id = self.alloc_pseudo();
+                let pseudo = Pseudo::sym(sym_id, name_str.clone());
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(pseudo);
                 }
+                self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
             }
-            ExprKind::Arrow { expr, member } => {
-                // Pointer member: pointer value is the base address
-                let ptr = self.linearize_expr(expr);
-                let ptr_type = self.expr_type(expr);
-                let base_struct_type = self.types.base_type(ptr_type).unwrap_or(typ);
-                let struct_type = self.resolve_struct_type(base_struct_type);
-                if let Some(member_info) = self.types.find_member(struct_type, *member) {
-                    self.emit_member_store(ptr, &member_info, final_result);
-                }
-            }
-            ExprKind::Index { array, index } => {
-                // Array subscript: compute address and store
-                let array_type = self.expr_type(array);
-                let index_type = self.expr_type(index);
-                let array_kind = self.types.kind(array_type);
-                let (ptr_expr, idx_expr, idx_type) =
-                    if array_kind == TypeKind::Pointer || array_kind == TypeKind::Array {
-                        (array.as_ref(), index.as_ref(), index_type)
-                    } else {
-                        (index.as_ref(), array.as_ref(), array_type)
-                    };
-                let arr = self.linearize_expr(ptr_expr);
-                let idx = self.linearize_expr(idx_expr);
-                let elem_size = store_size / 8;
-                let elem_size_val = self.emit_const(elem_size as i128, self.types.long_id);
-                let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
-                let offset = self.alloc_pseudo();
-                let ptr_typ = self.types.long_id;
-                self.emit(Instruction::binop(
-                    Opcode::Mul,
-                    offset,
-                    idx_extended,
-                    elem_size_val,
-                    ptr_typ,
-                    64,
-                ));
-                let addr = self.alloc_reg_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::Add,
-                    addr,
-                    arr,
-                    offset,
-                    ptr_typ,
-                    64,
-                ));
-                self.emit(Instruction::store(final_result, addr, 0, typ, store_size));
-            }
-            _ => {}
         }
 
         old_val // Return old value
     }
 
     /// Linearize a binary expression (arithmetic, comparison, logical operators)
+    /// Reduce an operation's result to the bit-field width it was computed at.
+    ///
+    /// C17 6.7.2.1p10 gives a bit-field a type of exactly its declared width,
+    /// and 6.2.5p9 reduces an unsigned result modulo 2^width -- so `x.b << 32`
+    /// with `unsigned long long b : 40` holding 0x100 is zero. The parser works
+    /// out which operations carry a width and records it on the expression;
+    /// this is where it is applied.
+    ///
+    /// `narrow_to_bitfield` already exists and does exactly the masking and
+    /// sign-extension wanted, so this is the whole of the codegen side: no new
+    /// opcode, no new instruction, no backend change.
+    fn narrow_bitfield_result(&mut self, expr: &Expr, value: PseudoId) -> PseudoId {
+        match expr.bitfield_bits {
+            Some(bits) => {
+                let typ = self.expr_type(expr);
+                self.narrow_to_bitfield(value, bits, typ)
+            }
+            None => value,
+        }
+    }
+
     pub(crate) fn linearize_binary(
         &mut self,
         expr: &Expr,
@@ -3699,11 +3719,17 @@ impl<'a> Linearizer<'a> {
         }
 
         // A complex value travels by address, so the scalar path below would
-        // negate the address rather than the number it points at.
-        if op == UnaryOp::Neg {
+        // negate the address rather than the number it points at. `~` is the
+        // GNU spelling of the conjugate, which negates only the imaginary
+        // half; both halves are already in the same place.
+        if op == UnaryOp::Neg || op == UnaryOp::BitNot {
             let typ = self.expr_type(expr);
             if self.types.is_complex(typ) {
-                return self.emit_complex_negate(operand, typ);
+                return if op == UnaryOp::Neg {
+                    self.emit_complex_negate(operand, typ)
+                } else {
+                    self.emit_complex_conjugate(operand, typ)
+                };
             }
         }
 
@@ -3717,28 +3743,19 @@ impl<'a> Linearizer<'a> {
             }
 
             // For deref operands like *s++, compute the lvalue address once
-            // to avoid re-evaluating side effects (PostInc etc.) when storing back.
-            let deref_addr = if let ExprKind::Unary {
-                op: UnaryOp::Deref, ..
-            } = &operand.kind
-            {
-                let addr = self.linearize_lvalue(operand);
-                Some(addr)
-            } else {
-                None
-            };
-            // If we pre-computed the deref address, load from it.
-            // Otherwise, evaluate normally.
-            let val = if let Some(addr) = deref_addr {
-                let deref_typ = self.expr_type(operand);
-                let deref_size = self.types.size_bits(deref_typ);
-                let loaded = self.alloc_reg_pseudo();
-                self.emit(Instruction::load(loaded, addr, 0, deref_typ, deref_size));
-                loaded
-            } else {
-                self.linearize_expr(operand)
-            };
+            // `++E` evaluates `E` exactly once (C17 6.5.3.1p2), so the
+            // address is resolved here and serves both the read and the
+            // store-back. This used to pre-compute the address for a `Deref`
+            // target only -- the one shape someone had hit -- and every other
+            // side-effecting target still ran twice: `++c[j++]` incremented
+            // `j` twice and updated the wrong element. `None` is a bare
+            // identifier, which has no subexpressions to re-run.
+            let place = self.resolve_rmw_place(operand);
             let typ = self.expr_type(operand);
+            let val = match &place {
+                Some(p) => self.load_rmw_place(p, typ),
+                None => self.linearize_expr(operand),
+            };
             let is_float = self.types.is_float(typ);
             let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
 
@@ -3776,105 +3793,60 @@ impl<'a> Linearizer<'a> {
 
             // Store back to the lvalue
             let store_size = self.types.size_bits(typ);
-            match &operand.kind {
-                ExprKind::Ident(symbol_id) => {
-                    let name_str = self.symbol_name(*symbol_id);
-                    if let Some(local) = self.locals.get(symbol_id).cloned() {
-                        // Check if this is a static local (sentinel value)
-                        if local.sym.0 == u32::MAX {
-                            self.emit_static_local_store(&name_str, final_result, typ, store_size);
-                        } else {
-                            // Regular local variable
-                            self.emit(Instruction::store(
-                                final_result,
-                                local.sym,
-                                0,
-                                typ,
-                                store_size,
-                            ));
-                        }
-                    } else if self.var_map.contains_key(&name_str) {
-                        self.var_map.insert(name_str.clone(), final_result);
+            if let Some(p) = &place {
+                // Through the address the read came from.
+                let narrowed = self.store_rmw_place(p, final_result, typ);
+                // `++x.f` is `x.f += 1`, whose value is what the field now
+                // holds (C17 6.5.16.1p2) -- so `signed int f : 3` at 3 gives
+                // -4, not 4.
+                return match narrowed {
+                    Some((bit_width, field_typ)) => {
+                        self.narrow_to_bitfield(final_result, bit_width, field_typ)
+                    }
+                    None => final_result,
+                };
+            }
+            // Only a bare identifier reaches here: `resolve_rmw_place`
+            // answers `Some` for every other lvalue and the branch above
+            // stores through it. The arms that used to be here re-derived
+            // an address that had already been computed, which is exactly
+            // what ran the target a second time.
+            if let ExprKind::Ident(symbol_id) = &operand.kind {
+                let name_str = self.symbol_name(*symbol_id);
+                if let Some(local) = self.locals.get(symbol_id).cloned() {
+                    // Check if this is a static local (sentinel value)
+                    if local.sym.0 == u32::MAX {
+                        self.emit_static_local_store(&name_str, final_result, typ, store_size);
                     } else {
-                        // Global variable - emit store
-                        let sym_id = self.alloc_pseudo();
-                        let pseudo = Pseudo::sym(sym_id, name_str.clone());
-                        if let Some(func) = &mut self.current_func {
-                            func.add_pseudo(pseudo);
-                        }
-                        self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
+                        // Regular local variable
+                        self.emit(Instruction::store(
+                            final_result,
+                            local.sym,
+                            0,
+                            typ,
+                            store_size,
+                        ));
                     }
-                }
-                ExprKind::Member { expr, member } => {
-                    // Struct member: get address and store with offset
-                    let base = self.linearize_lvalue(expr);
-                    let base_struct_type = self.expr_type(expr);
-                    let struct_type = self.resolve_struct_type(base_struct_type);
-                    if let Some(member_info) = self.types.find_member(struct_type, *member) {
-                        self.emit_member_store(base, &member_info, final_result);
+                } else if self.var_map.contains_key(&name_str) {
+                    self.var_map.insert(name_str.clone(), final_result);
+                } else {
+                    // Global variable - emit store
+                    let sym_id = self.alloc_pseudo();
+                    let pseudo = Pseudo::sym(sym_id, name_str.clone());
+                    if let Some(func) = &mut self.current_func {
+                        func.add_pseudo(pseudo);
                     }
-                }
-                ExprKind::Arrow { expr, member } => {
-                    // Pointer member: pointer value is the base address
-                    let ptr = self.linearize_expr(expr);
-                    let ptr_type = self.expr_type(expr);
-                    let base_struct_type = self.types.base_type(ptr_type).unwrap_or(typ);
-                    let struct_type = self.resolve_struct_type(base_struct_type);
-                    if let Some(member_info) = self.types.find_member(struct_type, *member) {
-                        self.emit_member_store(ptr, &member_info, final_result);
-                    }
-                }
-                ExprKind::Unary {
-                    op: UnaryOp::Deref, ..
-                } => {
-                    // Dereference: store to the pointer address.
-                    // Use the pre-computed address to avoid re-evaluating
-                    // side effects (e.g., s++ in ++*s++).
-                    let ptr = deref_addr.expect("deref_addr should be set for Deref operand");
-                    self.emit(Instruction::store(final_result, ptr, 0, typ, store_size));
-                }
-                ExprKind::Index { array, index } => {
-                    // Array subscript: compute address and store
-                    let array_type = self.expr_type(array);
-                    let index_type = self.expr_type(index);
-                    let array_kind = self.types.kind(array_type);
-                    let (ptr_expr, idx_expr, idx_type) =
-                        if array_kind == TypeKind::Pointer || array_kind == TypeKind::Array {
-                            (array.as_ref(), index.as_ref(), index_type)
-                        } else {
-                            (index.as_ref(), array.as_ref(), array_type)
-                        };
-                    let arr = self.linearize_expr(ptr_expr);
-                    let idx = self.linearize_expr(idx_expr);
-                    let elem_size = store_size / 8;
-                    let elem_size_val = self.emit_const(elem_size as i128, self.types.long_id);
-                    let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
-                    let offset = self.alloc_pseudo();
-                    let ptr_typ = self.types.long_id;
-                    self.emit(Instruction::binop(
-                        Opcode::Mul,
-                        offset,
-                        idx_extended,
-                        elem_size_val,
-                        ptr_typ,
-                        64,
-                    ));
-                    let addr = self.alloc_reg_pseudo();
-                    self.emit(Instruction::binop(
-                        Opcode::Add,
-                        addr,
-                        arr,
-                        offset,
-                        ptr_typ,
-                        64,
-                    ));
-                    self.emit(Instruction::store(final_result, addr, 0, typ, store_size));
-                }
-                _ => {
-                    // Fallback: shouldn't happen for valid lvalues
+                    self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
                 }
             }
 
+            // `++x.f` is `x.f += 1`, whose value is the value stored in the
+            // field (C17 6.5.16.1p2) -- so `signed int f : 3` at 3 gives -4,
+            // not 4. The postfix forms need no such care: they hand back the
+            // value loaded before the update, which `emit_bitfield_load`
+            // already narrowed.
+            // A bare identifier is never a bit-field, so there is nothing
+            // to reduce: the bit-field answer comes from `store_rmw_place`.
             return final_result;
         }
 
@@ -4676,18 +4648,26 @@ impl<'a> Linearizer<'a> {
                 let ap_addr = self.linearize_lvalue(ap);
                 let arg_size = self.types.size_bits(*arg_type);
 
-                // An aggregate wider than a register has nowhere to live in an
-                // ordinary pseudo, so it gets a local of its own and the
-                // backend writes the argument into it -- the same arrangement
-                // a call returning an aggregate in registers uses. Without it
-                // the backend was handed a register that held no storage, and
-                // whatever it happened to contain was treated as the
-                // destination's address.
+                // Every aggregate gets a local of its own, whatever its size,
+                // and the backend writes the argument into it -- the same
+                // arrangement a call returning an aggregate uses, and for the
+                // same reason.
+                //
+                // The size did once gate this, on the crate-wide convention
+                // that an aggregate pseudo holds its value below eight bytes
+                // and its address at or above. `emit_assign`'s struct path
+                // does not honour that convention: it asks `linearize_lvalue`
+                // for an address, and `rvalue_addr` hands back any non-`Sym`
+                // pseudo unchanged, taking it for a pointer already. So
+                // `x = va_arg(ap, struct tiny)` copied from whatever address
+                // the struct's own four bytes spelled. Giving the result a
+                // `Sym` makes `rvalue_addr` take its address instead, which
+                // is what the small-struct return path does with `__sret1_`.
                 let is_aggregate = matches!(
                     self.types.kind(*arg_type),
                     TypeKind::Struct | TypeKind::Union | TypeKind::Array
                 );
-                let result = if is_aggregate && arg_size > 64 {
+                let result = if is_aggregate {
                     let local_sym = self.alloc_pseudo();
                     let name = format!("__vaarg_{}", local_sym.0);
                     if let Some(func) = &mut self.current_func {
@@ -5352,14 +5332,19 @@ impl<'a> Linearizer<'a> {
         a: &Expr,
         b: &Expr,
         res: &Expr,
+        store: bool,
     ) -> PseudoId {
         let a_typ = self.expr_type(a);
         let b_typ = self.expr_type(b);
-        let res_ptr_typ = self.expr_type(res);
-        let dst_typ = self
-            .types
-            .base_type(res_ptr_typ)
-            .unwrap_or(self.types.int_id);
+        let res_typ = self.expr_type(res);
+        // The `_p` forms name the destination type with a value rather than a
+        // pointer to one, and store nothing -- so the type to ask about is
+        // `res`'s own, not its pointee's.
+        let dst_typ = if store {
+            self.types.base_type(res_typ).unwrap_or(self.types.int_id)
+        } else {
+            res_typ
+        };
 
         let all_unsigned = self.types.is_unsigned(a_typ)
             && self.types.is_unsigned(b_typ)
@@ -5387,6 +5372,12 @@ impl<'a> Linearizer<'a> {
 
         let av = self.linearize_expr(a);
         let bv = self.linearize_expr(b);
+        // Evaluated either way. For the storing forms this is the address to
+        // write through; for the `_p` forms the value is discarded, but gcc
+        // still evaluates the argument -- `__builtin_add_overflow_p(1, 1, i++)`
+        // increments `i` -- and a side effect that happens under gcc and not
+        // here is exactly the kind of difference that goes unnoticed until it
+        // changes a result.
         let addr = self.linearize_expr(res);
 
         let aw = self.emit_convert(av, a_typ, wide);
@@ -5438,7 +5429,9 @@ impl<'a> Linearizer<'a> {
                 let exact = self.emit_binary(bin, aw, bw, wide, wide);
                 let dst_size = self.types.size_bits(dst_typ);
                 let narrowed = self.emit_convert(exact, wide, dst_typ);
-                self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
+                if store {
+                    self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
+                }
                 // `wide` is unsigned only when the destination is too,
                 // so the two agree except when a signed exact value has
                 // to land in an unsigned destination -- where the
@@ -5459,7 +5452,9 @@ impl<'a> Linearizer<'a> {
 
         let narrowed = self.emit_convert(exact, wide, dst_typ);
         let dst_size = self.types.size_bits(dst_typ);
-        self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
+        if store {
+            self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
+        }
 
         let back = self.emit_convert(narrowed, dst_typ, wide);
         self.emit_binary(BinaryOp::Ne, exact, back, self.types.int_id, wide)
@@ -5687,7 +5682,13 @@ impl<'a> Linearizer<'a> {
             // Signedness of the wide type follows the operands: a product of
             // two 64-bit unsigned values can exceed the signed 128-bit range,
             // so all-unsigned operands compute unsigned.
-            ExprKind::CheckedArith { op, a, b, res } => self.linearize_checked_arith(op, a, b, res),
+            ExprKind::CheckedArith {
+                op,
+                a,
+                b,
+                res,
+                store,
+            } => self.linearize_checked_arith(op, a, b, res, *store),
 
             ExprKind::IntLit(val) => {
                 let typ = self.expr_type(expr);
@@ -5733,9 +5734,15 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::FuncName => self.linearize_func_name(),
 
-            ExprKind::Unary { op, operand } => self.linearize_unary(expr, *op, operand),
+            ExprKind::Unary { op, operand } => {
+                let v = self.linearize_unary(expr, *op, operand);
+                self.narrow_bitfield_result(expr, v)
+            }
 
-            ExprKind::Binary { op, left, right } => self.linearize_binary(expr, *op, left, right),
+            ExprKind::Binary { op, left, right } => {
+                let v = self.linearize_binary(expr, *op, left, right);
+                self.narrow_bitfield_result(expr, v)
+            }
 
             ExprKind::Assign { op, target, value } => self.emit_assign(*op, target, value),
 

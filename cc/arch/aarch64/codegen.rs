@@ -733,12 +733,7 @@ impl Aarch64CodeGen {
                             // have its address taken too, and the `_` arm
                             // below would have emitted nothing at all for it.
                             let (base, adjusted) = self.loc_addr_parts(loc).unwrap();
-                            self.push_lir(Aarch64Inst::Add {
-                                size: OperandSize::B64,
-                                src1: base,
-                                src2: GpOperand::Imm(adjusted as i64),
-                                dst: dst_reg,
-                            });
+                            self.emit_add_imm_legalized(dst_reg, base, adjusted as i64);
                         }
                         _ => {}
                     }
@@ -922,8 +917,64 @@ impl Aarch64CodeGen {
             Opcode::SbcC => self.emit_subc(insn, true),
             Opcode::UMulHi => self.emit_umulhi(insn),
 
+            // The memory builtins are a call to the libc function of the same
+            // name. x86-64 lowers these in its own features.rs; aarch64 did
+            // not lower them at all, and the `_ => {}` below meant the
+            // instruction produced nothing rather than failing -- so
+            // `__builtin_memcpy` silently copied nothing on every aarch64
+            // build.
+            Opcode::Memcpy => self.emit_mem_libcall(insn, "memcpy"),
+            Opcode::Memmove => self.emit_mem_libcall(insn, "memmove"),
+            Opcode::Memset => self.emit_mem_libcall(insn, "memset"),
+
             // Skip no-ops and unimplemented
             _ => {}
+        }
+    }
+
+    /// `add dst, base, #imm`, split when the immediate does not fit.
+    ///
+    /// AArch64's add immediate is twelve bits, optionally shifted left by
+    /// twelve -- so 0..4095, or a multiple of 4096 up to 0xFFF000. A frame
+    /// large enough to put a local past 4095 produced `add x1, x29, #18032`,
+    /// which the assembler rejects outright: `Error: immediate out of range`.
+    /// Three locals of 9001 bytes is enough to reach it, and inlining at -O2
+    /// reaches it with smaller ones.
+    ///
+    /// Split into the shifted part and the remainder, both of which are
+    /// representable, rather than materializing the value into a scratch
+    /// register: there is no free scratch here -- X16 is already this
+    /// function's fallback destination and X17 is in use elsewhere -- and two
+    /// adds need none.
+    pub(super) fn emit_add_imm_legalized(&mut self, dst: Reg, base: Reg, imm: i64) {
+        const MAX12: i64 = 0xFFF;
+        if (0..=MAX12).contains(&imm) {
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: base,
+                src2: GpOperand::Imm(imm),
+                dst,
+            });
+            return;
+        }
+        // The high part is a multiple of 4096 and so fits the shifted form;
+        // the low part is under 4096 and fits the plain one. `dst` is written
+        // before it is read, so `dst == base` is fine.
+        let hi = imm & !MAX12;
+        let lo = imm & MAX12;
+        self.push_lir(Aarch64Inst::Add {
+            size: OperandSize::B64,
+            src1: base,
+            src2: GpOperand::Imm(hi),
+            dst,
+        });
+        if lo != 0 {
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: dst,
+                src2: GpOperand::Imm(lo),
+                dst,
+            });
         }
     }
 

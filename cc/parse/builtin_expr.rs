@@ -103,10 +103,26 @@ impl Parser<'_> {
         let shadowable = shadowed_by_any_decl
             || matches!(
                 name_id,
-                crate::kw::SETJMP | crate::kw::SETJMP2 | crate::kw::LONGJMP | crate::kw::LONGJMP2
+                crate::kw::SETJMP
+                    | crate::kw::SETJMP2
+                    | crate::kw::LONGJMP
+                    | crate::kw::LONGJMP2
+                    | crate::kw::ALLOCA
             );
         if !shadowable {
             return false;
+        }
+
+        // `-fno-builtin` / `-fno-builtin-NAME` turn the bare spellings off
+        // outright, whether or not anything declares them. gcc's rule is that
+        // the flag disables builtins not beginning with `__builtin_`, and
+        // `shadowable` is exactly that set -- the names that are not reserved
+        // to the implementation, and so are the user's to mean something else
+        // by.
+        if let Some(name) = self.idents.get_opt(name_id) {
+            if crate::builtins::bare_builtin_disabled(name) {
+                return true;
+            }
         }
 
         let Some(symbol_id) = self.symbols.lookup_id(name_id, Namespace::Ordinary) else {
@@ -284,6 +300,38 @@ impl Parser<'_> {
 
             // Checked arithmetic: compute exactly, store the wrapped
             // result, and answer whether wrapping lost anything.
+            crate::kw::BUILTIN_ADD_OVERFLOW_P
+            | crate::kw::BUILTIN_SUB_OVERFLOW_P
+            | crate::kw::BUILTIN_MUL_OVERFLOW_P => Some((|| {
+                // `__builtin_<op>_overflow_p(a, b, type_value)` asks the same
+                // question as the storing form and answers it the same way,
+                // but names the destination type with a *value* rather than a
+                // pointer to one, and writes nothing. The argument is still
+                // *evaluated*, as gcc evaluates it: only its value is unused.
+                let op = match name_id {
+                    crate::kw::BUILTIN_ADD_OVERFLOW_P => CheckedOp::Add,
+                    crate::kw::BUILTIN_SUB_OVERFLOW_P => CheckedOp::Sub,
+                    _ => CheckedOp::Mul,
+                };
+                self.expect_special(b'(')?;
+                let a = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let b = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let res = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::CheckedArith {
+                        op,
+                        a: Box::new(a),
+                        b: Box::new(b),
+                        res: Box::new(res),
+                        store: false,
+                    },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
             crate::kw::BUILTIN_ADD_OVERFLOW
             | crate::kw::BUILTIN_SADD_OVERFLOW
             | crate::kw::BUILTIN_SADDL_OVERFLOW
@@ -304,6 +352,7 @@ impl Parser<'_> {
                         a: Box::new(a),
                         b: Box::new(b),
                         res: Box::new(res),
+                        store: true,
                     },
                     self.types.int_id,
                     token_pos,
@@ -329,6 +378,7 @@ impl Parser<'_> {
                         a: Box::new(a),
                         b: Box::new(b),
                         res: Box::new(res),
+                        store: true,
                     },
                     self.types.int_id,
                     token_pos,
@@ -354,6 +404,7 @@ impl Parser<'_> {
                         a: Box::new(a),
                         b: Box::new(b),
                         res: Box::new(res),
+                        store: true,
                     },
                     self.types.int_id,
                     token_pos,
@@ -485,7 +536,7 @@ impl Parser<'_> {
         token_pos: Position,
     ) -> Option<ParseResult<Expr>> {
         match name_id {
-            crate::kw::BUILTIN_ALLOCA => Some((|| {
+            crate::kw::BUILTIN_ALLOCA | crate::kw::ALLOCA => Some((|| {
                 // __builtin_alloca(size) - returns void*
                 self.expect_special(b'(')?;
                 let size = self.parse_assignment_expr()?;
@@ -664,13 +715,29 @@ impl Parser<'_> {
             })()),
             // Signbit builtins - test sign bit of floats
             crate::kw::BUILTIN_ISNAN
+            | crate::kw::BUILTIN_ISNANF
+            | crate::kw::BUILTIN_ISNANL
             | crate::kw::BUILTIN_ISINF
+            | crate::kw::BUILTIN_ISINFF
+            | crate::kw::BUILTIN_ISINFL
             | crate::kw::BUILTIN_ISINF_SIGN
             | crate::kw::BUILTIN_ISFINITE
             | crate::kw::BUILTIN_ISNORMAL => Some((|| {
+                // The `f` and `l` spellings ask the same question of the same
+                // argument: `FpTest` dispatches on the operand's own type, so
+                // the suffix carries no information the node needs. gcc has
+                // both suffixed spellings of `isnan` and `isinf`, and code
+                // that includes <math.h> without c17's own headers reaches for
+                // them. It has no suffixed `isfinite` or `isnormal`, so
+                // neither does this -- claiming a builtin gcc does not have
+                // would make `__has_builtin` a worse answer than none.
                 let test = match name_id {
-                    crate::kw::BUILTIN_ISNAN => FpTest::IsNan,
-                    crate::kw::BUILTIN_ISINF => FpTest::IsInf,
+                    crate::kw::BUILTIN_ISNAN
+                    | crate::kw::BUILTIN_ISNANF
+                    | crate::kw::BUILTIN_ISNANL => FpTest::IsNan,
+                    crate::kw::BUILTIN_ISINF
+                    | crate::kw::BUILTIN_ISINFF
+                    | crate::kw::BUILTIN_ISINFL => FpTest::IsInf,
                     crate::kw::BUILTIN_ISINF_SIGN => FpTest::IsInfSign,
                     crate::kw::BUILTIN_ISFINITE => FpTest::IsFinite,
                     _ => FpTest::IsNormal,
@@ -747,6 +814,86 @@ impl Parser<'_> {
                 let raw = self.libm_call("__signbitl", self.types.int_id, &[ld], arg, token_pos);
                 Ok(self.normalise_predicate(raw, token_pos))
             })()),
+            crate::kw::BUILTIN_CREAL
+            | crate::kw::BUILTIN_CREALF
+            | crate::kw::BUILTIN_CREALL
+            | crate::kw::BUILTIN_CIMAG
+            | crate::kw::BUILTIN_CIMAGF
+            | crate::kw::BUILTIN_CIMAGL => Some((|| {
+                // `creal`/`cimag` name the halves `__real__` and `__imag__`
+                // already reach, so they lower to those rather than to a
+                // library call. The suffix is not consulted: the operand's own
+                // type gives the precision, and a mismatch there would be the
+                // caller's bug, not something the spelling can fix.
+                let op = matches!(
+                    name_id,
+                    crate::kw::BUILTIN_CREAL
+                        | crate::kw::BUILTIN_CREALF
+                        | crate::kw::BUILTIN_CREALL
+                )
+                .then_some(UnaryOp::Real)
+                .unwrap_or(UnaryOp::Imag);
+                self.expect_special(b'(')?;
+                let arg = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                let arg_typ = arg.typ.unwrap_or(self.types.double_id);
+                let base = self.types.complex_base(arg_typ);
+                Ok(Self::typed_expr(
+                    ExprKind::Unary {
+                        op,
+                        operand: Box::new(arg),
+                    },
+                    base,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_CONJ | crate::kw::BUILTIN_CONJF | crate::kw::BUILTIN_CONJL => {
+                Some((|| {
+                    // conj(z) is z with the sign of its imaginary part flipped.
+                    // Built from `__builtin_complex(__real__ z, -__imag__ z)`
+                    // rather than a libm call: every piece already exists, and
+                    // negating the imaginary half is exact at every precision,
+                    // where a call would need -lm for nothing.
+                    self.expect_special(b'(')?;
+                    let arg = self.parse_assignment_expr()?;
+                    self.expect_special(b')')?;
+                    let arg_typ = arg.typ.unwrap_or(self.types.double_id);
+                    let base = self.types.complex_base(arg_typ);
+                    let complex_typ = self.types.make_complex(base);
+                    let real = Self::typed_expr(
+                        ExprKind::Unary {
+                            op: UnaryOp::Real,
+                            operand: Box::new(arg.clone()),
+                        },
+                        base,
+                        token_pos,
+                    );
+                    let imag = Self::typed_expr(
+                        ExprKind::Unary {
+                            op: UnaryOp::Imag,
+                            operand: Box::new(arg),
+                        },
+                        base,
+                        token_pos,
+                    );
+                    let neg_imag = Self::typed_expr(
+                        ExprKind::Unary {
+                            op: UnaryOp::Neg,
+                            operand: Box::new(imag),
+                        },
+                        base,
+                        token_pos,
+                    );
+                    Ok(Self::typed_expr(
+                        ExprKind::BuiltinComplex {
+                            real: Box::new(real),
+                            imag: Box::new(neg_imag),
+                        },
+                        complex_typ,
+                        token_pos,
+                    ))
+                })())
+            }
             crate::kw::BUILTIN_COMPLEX => Some((|| {
                 // __builtin_complex(real, imag) - construct complex value
                 self.expect_special(b'(')?;
@@ -844,7 +991,7 @@ impl Parser<'_> {
                 // __builtin_prefetch(addr, rw, locality)
                 // Prefetch data at addr into cache - no-op for correctness
                 self.expect_special(b'(')?;
-                let _addr = self.parse_assignment_expr()?;
+                let addr = self.parse_assignment_expr()?;
                 // Optional rw argument (0=read, 1=write)
                 if self.peek_special() == Some(b',' as u32) {
                     self.expect_special(b',')?;
@@ -856,10 +1003,61 @@ impl Parser<'_> {
                     }
                 }
                 self.expect_special(b')')?;
-                // Returns void - just return a void expression
+                // The prefetch itself emits nothing, but its address argument
+                // is still an expression and C evaluates it. Discarding it
+                // here lost whatever it did: `__builtin_prefetch((q = p))`
+                // left `q` unassigned, and `&p[j = i]` left `j` unassigned.
+                // gcc documents the address as evaluated and tests for it.
+                //
+                // The `rw` and locality arguments need no such care -- gcc
+                // requires them to be compile-time constants, so there is
+                // nothing in them to evaluate.
+                //
+                // A comma expression carries the address along and yields the
+                // void result, which is what the builtin's type says.
+                let void_id = self.types.void_id;
+                let void_result = Self::typed_expr(ExprKind::IntLit(0), void_id, token_pos);
                 Ok(Self::typed_expr(
-                    ExprKind::IntLit(0),
+                    ExprKind::Comma(vec![addr, void_result]),
                     self.types.void_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_CLASSIFY_TYPE => Some((|| {
+                // __builtin_classify_type(expr) -- a compile-time code for the
+                // argument's type family. Like `sizeof`, the argument is not
+                // evaluated; unlike `sizeof`, gcc takes an expression rather
+                // than a type name.
+                //
+                // The codes are gcc's, and were read off gcc rather than from
+                // its source: the conversions happen first, so a `char`, an
+                // enumeration and a `_Bool` all answer 1, and an array, a
+                // function and a string literal all answer 5 because they
+                // decay. Only the families below are reachable from C.
+                self.expect_special(b'(')?;
+                let arg = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                let typ = arg.typ.unwrap_or(self.types.int_id);
+                let code = if self.types.is_complex(typ) {
+                    9
+                } else {
+                    match self.types.kind(typ) {
+                        TypeKind::Void => 0,
+                        TypeKind::Struct => 12,
+                        TypeKind::Union => 13,
+                        TypeKind::Pointer | TypeKind::Array | TypeKind::Function => 5,
+                        k if self.types.is_float(typ) => {
+                            let _ = k;
+                            8
+                        }
+                        // Every remaining arithmetic type is an integer one by
+                        // the time the conversions are done with it.
+                        _ => 1,
+                    }
+                };
+                Ok(Self::typed_expr(
+                    ExprKind::IntLit(code),
+                    self.types.int_id,
                     token_pos,
                 ))
             })()),
@@ -1530,11 +1728,32 @@ impl Parser<'_> {
             // The library builtins, for the case where the header that would
             // declare them has not been included.
             "strlen" => Some(self.types.ulong_id),
-            "strcmp" | "abs" | "ffs" | "ffsl" | "ffsll" => Some(self.types.int_id),
+            "strcmp" | "abs" | "ffs" | "ffsl" | "ffsll" | "memcmp" | "strncmp" | "printf"
+            | "sprintf" | "snprintf" | "puts" | "putchar" | "printf_unlocked"
+            | "fprintf_unlocked" | "fputs_unlocked" => Some(self.types.int_id),
             "labs" => Some(self.types.long_id),
             "llabs" => Some(self.types.longlong_id),
             "sqrt" | "copysign" => Some(self.types.double_id),
-            "abort" => Some(self.types.void_id),
+            "abort" | "exit" | "free" => Some(self.types.void_id),
+            // The allocators and `mempcpy` return `void *`; the string family
+            // returns `char *`. Answering `int` here would truncate the
+            // returned address to 32 bits, which is the bug the `_chk` cases
+            // above are commented for.
+            "malloc" | "calloc" | "realloc" | "mempcpy" | "memchr" => Some(self.types.void_ptr_id),
+            // `bcopy` predates `memmove` and returns nothing; `index`/`rindex`
+            // are the old spellings of `strchr`/`strrchr`.
+            "bcopy" => Some(self.types.void_id),
+            "imaxabs" => Some(self.types.long_id),
+            "strcspn" | "strspn" => Some(self.types.ulong_id),
+            "strcpy" | "strncpy" | "stpcpy" | "strcat" | "strncat" | "strchr" | "strrchr"
+            | "strstr" | "index" | "rindex" | "strpbrk" => {
+                let char_id = self.types.char_id;
+                Some(self.types.intern(Type {
+                    kind: TypeKind::Pointer,
+                    base: Some(char_id),
+                    ..Default::default()
+                }))
+            }
             _ => None,
         }
     }
@@ -1558,6 +1777,39 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_SQRT
                 | crate::kw::BUILTIN_COPYSIGN
                 | crate::kw::BUILTIN_TRAP
+                | crate::kw::BUILTIN_ABORT
+                | crate::kw::BUILTIN_EXIT
+                | crate::kw::BUILTIN_PRINTF
+                | crate::kw::BUILTIN_SPRINTF
+                | crate::kw::BUILTIN_SNPRINTF
+                | crate::kw::BUILTIN_PUTS
+                | crate::kw::BUILTIN_MALLOC
+                | crate::kw::BUILTIN_CALLOC
+                | crate::kw::BUILTIN_REALLOC
+                | crate::kw::BUILTIN_FREE
+                | crate::kw::BUILTIN_MEMCMP
+                | crate::kw::BUILTIN_MEMPCPY
+                | crate::kw::BUILTIN_STRCPY
+                | crate::kw::BUILTIN_STRNCPY
+                | crate::kw::BUILTIN_STPCPY
+                | crate::kw::BUILTIN_STRCAT
+                | crate::kw::BUILTIN_STRNCAT
+                | crate::kw::BUILTIN_STRNCMP
+                | crate::kw::BUILTIN_STRCHR
+                | crate::kw::BUILTIN_STRRCHR
+                | crate::kw::BUILTIN_STRSTR
+                | crate::kw::BUILTIN_IMAXABS
+                | crate::kw::BUILTIN_MEMCHR
+                | crate::kw::BUILTIN_BCOPY
+                | crate::kw::BUILTIN_INDEX
+                | crate::kw::BUILTIN_RINDEX
+                | crate::kw::BUILTIN_PUTCHAR
+                | crate::kw::BUILTIN_STRCSPN
+                | crate::kw::BUILTIN_STRSPN
+                | crate::kw::BUILTIN_STRPBRK
+                | crate::kw::BUILTIN_PRINTF_UNLOCKED
+                | crate::kw::BUILTIN_FPRINTF_UNLOCKED
+                | crate::kw::BUILTIN_FPUTS_UNLOCKED
         )
     }
 
@@ -1664,6 +1916,25 @@ impl Parser<'_> {
             "strlen" | "abs" | "labs" | "llabs" | "ffs" | "ffsl" | "ffsll" | "sqrt" => (1, false),
             "strcmp" | "copysign" => (2, false),
             "abort" => (0, false),
+            "exit" | "puts" | "malloc" | "free" | "putchar" | "imaxabs" => (1, false),
+            "calloc" | "realloc" | "strcpy" | "stpcpy" | "strcat" | "strchr" | "strrchr"
+            | "strstr" | "index" | "rindex" | "strpbrk" | "strcspn" | "strspn" => (2, false),
+            "memcmp" | "mempcpy" | "strncpy" | "strncat" | "strncmp" | "memchr" | "bcopy" => {
+                (3, false)
+            }
+            // The printf family is variadic after its format string. Getting
+            // the fixed count right is what keeps the format argument in a
+            // register on Apple arm64, where variadic arguments go on the
+            // stack -- the same reason the `_chk` forms above are spelled out.
+            "printf" | "printf_unlocked" => (1, true),
+            // The stdio `_unlocked` forms. gcc has them, and the torture
+            // suite's builtins/ tests supply the library side themselves --
+            // glibc has no `printf_unlocked`, so gcc's own link fails without
+            // that. Only the three a real corpus uses are here.
+            "fprintf_unlocked" => (2, true),
+            "fputs_unlocked" => (2, false),
+            "sprintf" => (2, true),
+            "snprintf" => (3, true),
             // An entry point this does not know is left as it was: variadic,
             // with nothing fixed.
             _ => (0, true),

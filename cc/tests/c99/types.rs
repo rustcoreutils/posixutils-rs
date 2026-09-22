@@ -1628,3 +1628,301 @@ int main(void)
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     let _ = code;
 }
+
+/// C17 6.5.16.1p2: the value of an assignment expression is the value *stored
+/// in* the object. For a bit-field that is the truncated, sign-extended field
+/// -- not the value that was written.
+///
+/// The store path always narrowed correctly, so `x.f` read back right; it was
+/// the value handed to the surrounding expression that was wrong, which only
+/// shows when the assignment is used rather than performed for its effect.
+/// Grepping the whole test tree for `if ((s.f = ...) ...)` found nothing, so
+/// nothing exercised it. gcc.c-torture's `921016-1` does, in one line:
+/// `if((l.m=j)==j)abort();` with `signed int m:11` and `j` 1081.
+///
+/// `++x.f` is the same question, since `++E` is `E += 1`. The postfix forms
+/// are not: they yield the value loaded before the update, which the load
+/// path already narrowed.
+#[test]
+fn c99_bitfield_assignment_expression_value() {
+    let code = r#"
+struct s3  { signed int f : 3; };
+struct u3  { unsigned int f : 3; };
+struct s11 { signed int m : 11; };
+struct wide { unsigned long long b : 40; };
+struct mixed { signed int a : 5; unsigned int b : 5; int pad; };
+
+int main(void) {
+    /* Plain assignment: 9 does not fit in 3 signed bits. */
+    { struct s3 x; if ((x.f = 9) != 1) return 1; if (x.f != 1) return 2; }
+    { struct s3 x; if ((x.f = 7) != -1) return 3; if (x.f != -1) return 4; }
+    { struct u3 x; if ((x.f = 9) != 1) return 5; if (x.f != 1) return 6; }
+    { struct s11 l; int j = 1081; if ((l.m = j) == j) return 7; }
+
+    /* Compound assignment. */
+    { struct s3 x; x.f = 0; if ((x.f += 9) != 1) return 8; }
+    { struct u3 x; x.f = 7; if ((x.f += 1) != 0) return 9; }
+    { struct s3 x; x.f = 3; if ((x.f -= 7) != -4) return 10; }
+
+    /* Prefix ++/-- yield the stored value; postfix yield the old one. */
+    { struct s3 x; x.f = 3; if (++x.f != -4) return 11; if (x.f != -4) return 12; }
+    { struct u3 x; x.f = 7; if (++x.f != 0) return 13; if (x.f != 0) return 14; }
+    { struct s3 x; x.f = -4; if (x.f-- != -4) return 15; if (x.f != 3) return 16; }
+    { struct u3 x; x.f = 0; if (x.f-- != 0) return 17; if (x.f != 7) return 18; }
+
+    /* Through a pointer, which is a separate code path. */
+    { struct s3 x; struct s3 *p = &x; if ((p->f = 9) != 1) return 19; }
+    { struct s3 x; struct s3 *p = &x; p->f = 3; if (++p->f != -4) return 20; }
+
+    /* A field that exactly fills its declared type must not be narrowed. */
+    { struct wide w; if ((w.b = 0xFFFFFFFFFFULL) != 0xFFFFFFFFFFULL) return 21; }
+
+    /* Chained assignment carries the narrowed value along. 25 is 11001 in
+       five bits, so a signed :5 field holds -7; 9 would have fit and proved
+       nothing. */
+    { struct mixed m; int r = (m.a = 25); if (r != -7) return 22; if (m.a != -7) return 23; }
+    { struct mixed m; m.pad = (m.b = 33); if (m.pad != 1) return 24; }
+
+    /* Neighbours are untouched by the narrowing. */
+    { struct mixed m; m.a = 0; m.b = 0; m.pad = 77;
+      if ((m.a = 25) != -7) return 25;
+      if (m.b != 0 || m.pad != 77) return 26; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_bitfield_assign_value", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_bitfield_assign_value_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// C17 6.3.1.1p2: a bit-field takes the integer promotions like any narrow
+/// integer -- to `int` when `int` can represent all its values, otherwise to
+/// `unsigned int`.
+///
+/// What makes this its own question is that the width is a property of the
+/// *member*, not of the type: an `unsigned int f : 7` has type
+/// `unsigned int`, so asking `integer_promote` about the type alone answers
+/// "no change" and `b.f - 2` comes out a huge unsigned value where C says -1.
+///
+/// The conversion is made explicit in the tree rather than only in the
+/// expression's result type, because a comparison takes its signedness from
+/// its operands and not from its own `int` result: left implicit,
+/// `b.u7 > -1` still compared unsigned and answered false.
+#[test]
+fn c99_bitfield_integer_promotion() {
+    let code = r#"
+struct b { signed int s7 : 7; unsigned int u7 : 7; unsigned int u31 : 31;
+           unsigned int u32 : 32; signed int s32 : 32; };
+struct w { unsigned long long b40 : 40; signed long long s40 : 40; };
+
+int main(void) {
+    struct b v; v.s7 = 1; v.u7 = 1; v.u31 = 1; v.u32 = 1; v.s32 = 1;
+
+    /* A field narrower than int promotes to int, whatever its own sign. */
+    if (v.u7 - 2 >= 0) return 1;
+    if (v.s7 - 2 >= 0) return 2;
+    if (v.u31 - 2 >= 0) return 3;
+    if (sizeof(v.u7 - 2) != sizeof(int)) return 4;
+
+    /* A cast forces the declared type back, so this one wraps. */
+    if ((unsigned)v.u7 - 2 < 0x7fffffffu) return 5;
+
+    /* A field exactly int-wide keeps its own signedness: int cannot hold
+       every value of an unsigned :32, so that one promotes to unsigned. */
+    if (v.u32 - 2 < 0x7fffffffu) return 6;
+    if (v.s32 - 2 >= 0) return 7;
+
+    /* Division and shift see the promoted signedness too. */
+    { struct b n; n.s7 = -8; if (n.s7 / 2 != -4) return 8; if (n.s7 >> 1 != -4) return 9; }
+    { struct b n; n.s7 = -8; if (n.s7 % 3 != -2) return 10; }
+
+    /* Comparison against a negative constant. */
+    { struct b n; n.u7 = 3; if (!(n.u7 > -1)) return 11; }
+
+    /* Wider than int: no promotion, the declared type stands. */
+    { struct w w1; w1.b40 = 1; if (sizeof(w1.b40 + 0) != sizeof(unsigned long long)) return 12; }
+    { struct w w1; w1.s40 = -1; if (w1.s40 >= 0) return 13; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_bitfield_promotion", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_bitfield_promotion_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// Unary `-` and `~` take the integer promotions too (C17 6.5.3.3p3, p4), and
+/// that includes the bit-field rule.
+///
+/// Both operators open-coded the promotion as a `TypeKind` test for
+/// `_Bool`/`char`/`short`. That is right as far as it goes and cannot see a
+/// bit-field at all, because the width is a property of the member rather than
+/// of the type — so `-v.u7 < 0` was false where C and gcc say true. A gap in
+/// the commit that added bit-field promotion for the *binary* operators: the
+/// rule went in one place and the unary operators kept their own copy.
+///
+/// Both now route through the same helper, which is the point: two copies of a
+/// promotion rule is how this happened.
+#[test]
+fn c99_unary_operators_promote_bitfields() {
+    let code = r#"
+struct B {
+    unsigned u7  : 7;
+    signed   s7  : 7;
+    unsigned u31 : 31;
+    unsigned u32 : 32;   /* int cannot hold all of these: stays unsigned */
+    unsigned long long u40 : 40;  /* wider than int: no promotion */
+};
+
+int main(void) {
+    struct B v;
+    v.u7 = 1; v.s7 = 1; v.u31 = 1; v.u32 = 1; v.u40 = 1;
+
+    /* Narrower than int promotes to int, so the result is signed. */
+    if (!(-v.u7  < 0)) return 1;
+    if (!(~v.u7  < 0)) return 2;
+    if (!(-v.s7  < 0)) return 3;
+    if (!(~v.s7  < 0)) return 4;
+    if (!(-v.u31 < 0)) return 5;
+    if (!(~v.u31 < 0)) return 6;
+
+    /* Exactly int-wide and unsigned: int cannot represent it, so it stays
+       unsigned and the negation wraps instead of going negative. */
+    if (-v.u32 < 0) return 7;
+    if (~v.u32 < 0) return 8;
+
+    /* Wider than int: the declared type stands, and it is unsigned. */
+    if (-v.u40 < 0) return 9;
+
+    /* The promoted type is int, so sizeof says 4 even for a 7-bit field. */
+    if (sizeof(-v.u7) != sizeof(int)) return 10;
+    if (sizeof(~v.u7) != sizeof(int)) return 11;
+
+    /* An explicit cast still forces the declared type back. */
+    if ((unsigned)v.u7 - 2 < 0x7fffffffu) return 12;
+
+    /* Unary + is a no-op but must not undo the promotion either. */
+    if (!(-(+v.u7) < 0)) return 13;
+
+    /* And the ordinary narrow integers still promote as they always did. */
+    { unsigned char c = 1; if (!(-c < 0)) return 14; }
+    { unsigned short h = 1; if (!(~h < 0)) return 15; }
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_unary_bitfield_promotion", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run(
+            "c99_unary_bitfield_promotion_o2",
+            code,
+            &["-O2".to_string()]
+        ),
+        0
+    );
+}
+
+/// Arithmetic on a bit-field **wider than `int`** is carried out at the
+/// field's declared width.
+///
+/// C17 6.7.2.1p10: a bit-field "is interpreted as having a signed or unsigned
+/// integer type consisting of the specified number of bits". 6.2.5p9 then
+/// reduces an unsigned result modulo 2^width. So with
+/// `unsigned long long b : 40` holding 0x100, `x.b << 32` is **zero** — every
+/// set bit shifts out of the 40-bit type. c17 computed it in 64 bits.
+///
+/// Distinct from the promotion rule: a field *narrower* than `int` promotes to
+/// `int`, which the type can express. A wider one does not promote at all, and
+/// its width is a property of the member rather than of the type — so the
+/// width rides beside the type on the expression instead of in it. That is
+/// deliberate: `sizeof` must stay 8, which gcc agrees with, so this is a
+/// precision and not a size, and a type that answered 40 to `size_bits` would
+/// be wrong everywhere the ABI, DWARF and the backends look at it.
+///
+/// Which operators carry the width, and from where, was read off gcc:
+/// arithmetic and bitwise take the **wider** operand's width, so `u40 * u33`
+/// and `u33 * u40` agree; a shift takes the left operand's alone, per 6.5.7p3;
+/// a comparison yields `int` and carries nothing.
+#[test]
+fn c99_wide_bitfield_arithmetic_at_declared_width() {
+    let code = r#"
+struct s {
+    unsigned long long u33 : 33;
+    unsigned long long u40 : 40;
+    unsigned long long u41 : 41;
+    signed   long long s40 : 40;
+};
+
+int main(void) {
+    struct s a = {0x100000, 0x100000, 0x100000, 0};
+    struct s b = {0x100000000ULL, 0x100000000ULL, 0x100000000ULL, 0};
+    struct s c;
+    c.u33 = 0x100; c.u40 = 0x100; c.s40 = -1;
+
+    /* Multiplication overflows out of the field. */
+    if (a.u33 * a.u33 != 0) return 1;
+    if (a.u40 * a.u40 != 0) return 2;
+
+    /* Mixed widths take the wider, and commute. */
+    if (a.u40 * a.u33 != 0) return 3;
+    if (a.u33 * a.u40 != 0) return 4;
+    if ((a.u33 * a.u41) != (a.u41 * a.u33)) return 5;
+
+    /* Addition and subtraction likewise. */
+    if (b.u33 + b.u33 != 0) return 6;
+    if ((a.u33 - b.u33) != 0x100100000ULL) return 7;
+
+    /* Shifts take the left operand's width only. */
+    if ((a.u33 << 13) != 0) return 8;
+    if ((c.u40 << 32) != 0) return 9;
+    if ((c.u33 << 25) != 0) return 10;
+
+    /* Unary operators too. */
+    if ((unsigned long long)(-a.u33) != 0x1FFF00000ULL) return 11;
+    if ((unsigned long long)(~a.u33) != 0x1FFEFFFFFULL) return 12;
+
+    /* Through a conditional, and nested. */
+    if ((1 ? a.u33 * a.u33 : 0ULL) != 0) return 13;
+    /* 0x100000 is 2^20; cubed is 2^60, which reduces to zero mod 2^33.
+       0x100 would have been too small to overflow and proved nothing. */
+    if (((a.u33 * a.u33) * a.u33) != 0) return 14;
+
+    /* A plain operand contributes no width, so the field's still governs. */
+    if ((c.u40 * 1ULL) != 0x100) return 15;
+
+    /* A signed wide field keeps its sign. */
+    if (!(c.s40 < 0)) return 16;
+    if (c.s40 != -1) return 17;
+
+    /* A comparison yields int and carries nothing. */
+    if ((a.u33 << 13) ? 1 : 0) return 18;
+
+    /* Compound assignment and ++/-- already stored through the field, and
+       must keep agreeing. */
+    { struct s y; y.u40 = 0x100; y.u40 <<= 32; if (y.u40 != 0) return 19; }
+    { struct s y; y.u40 = 0xFFFFFFFFFFULL; y.u40++; if (y.u40 != 0) return 20; }
+
+    /* Narrower-than-int fields are a different rule and must be unaffected:
+       they promote to int. */
+    { struct n { unsigned u7 : 7; } v; v.u7 = 1;
+      if (!(-v.u7 < 0)) return 21;
+      if (v.u7 - 2 >= 0) return 22; }
+
+    /* And a field exactly as wide as its type is not narrowed at all. */
+    { struct w { unsigned long long f : 64; } v; v.f = 0xFFFFFFFFFFFFFFFFULL;
+      if (v.f + 1 != 0) return 23;
+      if (v.f != 0xFFFFFFFFFFFFFFFFULL) return 24; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_wide_bitfield_width", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_wide_bitfield_width_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

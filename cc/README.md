@@ -127,6 +127,9 @@ Supported:
 - Variably modified types everywhere C17 admits them, including a `typedef` of
   one (6.7.7), whose extents are evaluated at the typedef rather than at each use
 - `-fverbose-asm`, annotating each instruction with the source names it came from
+- `-fpermissive`, accepting pre-C99 implicit `int` and implicit function
+  declarations as warnings.  Two constructs, not a dialect: everything else
+  C17 requires is still checked
 - Cross-compilation as far as `-S`: `--sysroot`, `-isystem` and `-idirafter`
   give `--target` the target's headers. `as` and `cc` are still the host's, so
   assembling and linking for another target is not supported

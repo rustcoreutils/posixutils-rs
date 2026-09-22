@@ -929,3 +929,189 @@ int main(void) {
     assert_eq!(compile_and_run("uac_rank_width", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("uac_rank_width_opt", code), 0);
 }
+
+/// `E1 op= E2` evaluates `E1` **exactly once** (C17 6.5.16.2p3), and so do
+/// `++E` and `E++` (6.5.3.1p2, 6.5.2.4p2).
+///
+/// `emit_assign` computed the old value with `linearize_expr(target)` and then
+/// re-derived the target's address in its store arm, so every subexpression of
+/// the target ran twice: `b[i++] += 5` incremented `i` twice *and* updated the
+/// wrong element, `*p++ += 1` advanced `p` by two, and `a[f()] |= 1` called
+/// `f` twice. Ordinary C, wrong at every optimization level -- the torture
+/// tests `920428-1`, `990222-1` and `20060929-1` are the shapes that caught
+/// it, but nothing about it is obscure.
+#[test]
+fn c99_compound_assignment_evaluates_its_target_once() {
+    let code = r#"
+int calls;
+int idx(void) { calls++; return 0; }
+int g[4];
+
+int main(void) {
+    /* An index with a side effect. */
+    {
+        int b[4] = {10, 20, 30, 40};
+        int i = 0;
+        b[i++] += 5;
+        if (i != 1) return 1;
+        if (b[0] != 15) return 2;
+        if (b[1] != 20) return 3;
+    }
+    /* A post-incremented pointer through a dereference. */
+    {
+        int b[4] = {10, 20, 30, 40};
+        int *p = b + 2;
+        *p++ += 1;
+        if (p - b != 3) return 4;
+        if (b[2] != 31) return 5;
+        if (b[3] != 40) return 6;
+    }
+    /* A pre-decremented pointer -- the `990222-1` shape. */
+    {
+        char line[4] = {'1', '9', '9', '\0'};
+        char *ptr = line + 3;
+        while ((*--ptr += 1) > '9') *ptr = '0';
+        if (line[0] != '2' || line[1] != '0' || line[2] != '0') return 7;
+    }
+    /* A call in the index, which is observable even when the value is not. */
+    calls = 0;
+    g[idx()] |= 1;
+    if (calls != 1) return 8;
+    if (g[0] != 1) return 9;
+
+    /* `++` and `--` have the same rule. */
+    {
+        int b[4] = {10, 20, 30, 40};
+        int i = 0;
+        b[i++]++;
+        if (i != 1 || b[0] != 11 || b[1] != 20) return 10;
+    }
+    {
+        int c[4] = {1, 2, 3, 4};
+        int j = 0;
+        ++c[j++];
+        if (j != 1 || c[0] != 2 || c[1] != 2) return 11;
+    }
+    calls = 0;
+    g[idx()]++;
+    if (calls != 1) return 12;
+
+    /* A struct member reached through a side-effecting base. */
+    {
+        struct S { int v; } arr[3] = {{1}, {2}, {3}};
+        int k = 1;
+        arr[k++].v += 10;
+        if (k != 2) return 13;
+        if (arr[1].v != 12) return 14;
+        if (arr[2].v != 3) return 15;
+    }
+    /* And through a post-incremented pointer with `->`. */
+    {
+        struct S { int v; } arr[3] = {{1}, {2}, {3}};
+        struct S *sp = arr;
+        sp++->v += 100;
+        if (sp - arr != 1) return 16;
+        if (arr[0].v != 101) return 17;
+        if (arr[1].v != 2) return 18;
+    }
+    /* Plain assignment always evaluated its target once; keep it that way. */
+    {
+        int b[4] = {0};
+        int i = 0;
+        b[i++] = 7;
+        if (i != 1 || b[0] != 7 || b[1] != 0) return 19;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_compound_assign_once", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_compound_assign_once_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// `E1 op= E2` is `E1 = E1 op E2` (C17 6.5.16.2p3), so the operation runs at
+/// the operands' **common type** after the integer promotions, and only the
+/// result converts back to `E1`'s type.
+///
+/// It was computed at `E1`'s type instead, with `E2` converted down first, so
+/// a narrow unsigned target turned a negative right operand into a huge
+/// positive one and divided unsigned: `unsigned char x = 50; short y = -5;
+/// x /= y;` gave 0 where 50 / -5 is -10 and `(unsigned char)-10` is 246.
+#[test]
+fn c99_compound_assignment_computes_at_the_common_type() {
+    let code = r#"
+volatile short vy = -5;
+
+int main(void) {
+    /* The `20030128-1` shape, with and without the volatile. */
+    {
+        unsigned char x = 50;
+        x /= vy;
+        if (x != (unsigned char)-10) return 1;
+    }
+    {
+        unsigned char x = 50;
+        short y = -5;
+        x /= y;
+        if (x != (unsigned char)-10) return 2;
+    }
+    /* A wider unsigned target, same shape. */
+    {
+        unsigned short u = 10;
+        int v = -1;
+        u /= v;
+        if (u != (unsigned short)-10) return 3;
+    }
+    /* Modulo has the same rule, and its sign follows the signed operand. */
+    {
+        unsigned char x = 50;
+        short y = -7;
+        x %= y;
+        if (x != (unsigned char)(50 % -7)) return 4;
+    }
+    /* Right shift of a narrow signed target: the promotion makes it
+       arithmetic, not logical. */
+    {
+        signed char s = -8;
+        s >>= 1;
+        if (s != -4) return 5;
+    }
+    /* Multiplication wraps at the *target's* width after computing wider. */
+    {
+        unsigned char m = 200;
+        int n = 3;
+        m *= n;
+        if (m != (unsigned char)600) return 6;
+    }
+    /* Signed narrow division, which already worked. */
+    {
+        signed char s = -100;
+        int t = 3;
+        s /= t;
+        if (s != -33) return 7;
+    }
+    /* A comparison of the assignment's own value, which is the stored one. */
+    {
+        unsigned char x = 50;
+        short y = -5;
+        if ((x /= y) != (unsigned char)-10) return 8;
+        if (x != (unsigned char)-10) return 9;
+    }
+    /* Mixing in a wider signed type on the right. */
+    {
+        unsigned int w = 10;
+        long long z = -2;
+        w /= z;
+        if (w != (unsigned int)(10 / -2)) return 10;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_compound_assign_type", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_compound_assign_type_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

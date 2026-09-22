@@ -45,7 +45,7 @@ impl<'a> Parser<'a> {
             let result_typ = right.typ;
 
             // Build comma expression
-            let Expr { kind, typ, pos } = expr;
+            let Expr { kind, typ, pos, .. } = expr;
             expr = match kind {
                 ExprKind::Comma(mut exprs) => {
                     exprs.push(right);
@@ -53,6 +53,7 @@ impl<'a> Parser<'a> {
                         kind: ExprKind::Comma(exprs),
                         typ: result_typ,
                         pos,
+                        bitfield_bits: None,
                     }
                 }
                 other => Expr {
@@ -61,11 +62,13 @@ impl<'a> Parser<'a> {
                             kind: other,
                             typ,
                             pos,
+                            bitfield_bits: None,
                         },
                         right,
                     ]),
                     typ: result_typ,
                     pos,
+                    bitfield_bits: None,
                 },
             };
         }
@@ -719,49 +722,36 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
-            // C99 6.3.1.1: integer promotion — types smaller than int promote to int
-            let op_typ = operand.typ.unwrap_or(self.types.int_id);
-            let typ = {
-                let kind = self.types.kind(op_typ);
-                if matches!(kind, TypeKind::Bool | TypeKind::Char | TypeKind::Short) {
-                    self.types.int_id
-                } else {
-                    op_typ
-                }
-            };
-            return Ok(Self::typed_expr(
+            let (operand, typ) = self.promote_unary_operand(operand);
+            let width = self.unary_bitfield_width(&operand, typ);
+            let mut e = Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::Neg,
                     operand: Box::new(operand),
                 },
                 typ,
                 op_pos,
-            ));
+            );
+            e.bitfield_bits = width;
+            return Ok(e);
         }
 
         if self.is_special(b'~') {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
-            // BitNot: C99 integer promotion - types smaller than int promote to int
-            let op_typ = operand.typ.unwrap_or(self.types.int_id);
-            // Apply integer promotion: _Bool, char, short -> int
-            let typ = {
-                let kind = self.types.kind(op_typ);
-                if matches!(kind, TypeKind::Bool | TypeKind::Char | TypeKind::Short) {
-                    self.types.int_id
-                } else {
-                    op_typ
-                }
-            };
-            return Ok(Self::typed_expr(
+            let (operand, typ) = self.promote_unary_operand(operand);
+            let width = self.unary_bitfield_width(&operand, typ);
+            let mut e = Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::BitNot,
                     operand: Box::new(operand),
                 },
                 typ,
                 op_pos,
-            ));
+            );
+            e.bitfield_bits = width;
+            return Ok(e);
         }
 
         if self.is_special(b'!') {
@@ -1409,6 +1399,7 @@ impl<'a> Parser<'a> {
             kind,
             typ: Some(typ),
             pos,
+            bitfield_bits: None,
         }
     }
 
@@ -1418,6 +1409,17 @@ impl<'a> Parser<'a> {
         // returns void has none.
         self.check_not_void(&left, left.pos);
         self.check_not_void(&right, right.pos);
+
+        // A bit-field operand promotes before anything else looks at it
+        // (C17 6.3.1.1p2), and that promotion is not derivable from the
+        // operand's type alone -- the width lives on the member, not the type.
+        //
+        // Made explicit in the tree rather than only in the result type,
+        // because a comparison takes its signedness from its operands and not
+        // from its own `int` result: with the promotion left implicit,
+        // `b.u7 > -1` still compared unsigned and answered false.
+        let left = self.promote_bitfield_operand(left);
+        let right = self.promote_bitfield_operand(right);
 
         // Compute result type based on operator and operand types
         let left_type = left.typ.unwrap_or(self.types.int_id);
@@ -1497,8 +1499,33 @@ impl<'a> Parser<'a> {
             }
         };
 
+        // C17 6.7.2.1p10: a bit-field has a type of exactly its declared width,
+        // and 6.2.5p9 then reduces an unsigned result modulo 2^width. So
+        // `x.b << 32` with `unsigned long long b : 40` holding 0x100 is zero --
+        // every set bit shifts out of the 40-bit type.
+        //
+        // Which operators carry the width, and from where:
+        //   - the arithmetic and bitwise ones take the wider operand's width;
+        //   - a shift takes the **left** operand's alone (6.5.7p3 -- the right
+        //     operand's type never reaches the result);
+        //   - a comparison or a logical operator yields `int` and carries
+        //     nothing, which falls out of not asking.
+        let width = match op {
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor => self.combined_bitfield_width(&left, &right),
+            BinaryOp::Shl | BinaryOp::Shr => self.effective_bitfield_width(&left),
+            _ => None,
+        }
+        .filter(|bits| *bits < self.types.size_bits(result_type));
+
         let pos = left.pos;
-        Self::typed_expr(
+        let mut e = Self::typed_expr(
             ExprKind::Binary {
                 op,
                 left: Box::new(left),
@@ -1506,7 +1533,9 @@ impl<'a> Parser<'a> {
             },
             result_type,
             pos,
-        )
+        );
+        e.bitfield_bits = width;
+        e
     }
 
     /// Warn when a shift's constant count cannot name a bit of the value
@@ -1548,6 +1577,132 @@ impl<'a> Parser<'a> {
     /// was a second implementation of them, and the two had drifted: the table
     /// compared widths where this one ranked by kind, so they disagreed about
     /// `long` against `long long`. One of them had to go.
+    /// The width and declared type of the bit-field `e` names, if it names one.
+    /// The bit-field width this expression's value is confined to, if any.
+    ///
+    /// Either it names a bit-field member directly, or it is the result of an
+    /// operation on one and carries the width forward. Only widths *wider*
+    /// than `int` matter here: a narrower field promotes to `int`, which the
+    /// type already expresses, and `bitfield_promoted_type` handles it.
+    fn effective_bitfield_width(&mut self, e: &Expr) -> Option<u32> {
+        if let Some(bits) = e.bitfield_bits {
+            return Some(bits);
+        }
+        let (bits, typ) = self.bitfield_of(e)?;
+        (bits < self.types.size_bits(typ) && bits > self.types.size_bits(self.types.int_id))
+            .then_some(bits)
+    }
+
+    /// The width an operation's result is confined to.
+    ///
+    /// gcc takes the **wider** of the two operands -- `u40 * u33` reduces
+    /// modulo 2^40, and so does `u33 * u40` -- which also makes the operation
+    /// commutative, as it has to be. A plain operand contributes nothing, so
+    /// `u33 * 1ULL` stays 33 bits rather than widening to 64.
+    fn combined_bitfield_width(&mut self, left: &Expr, right: &Expr) -> Option<u32> {
+        match (
+            self.effective_bitfield_width(left),
+            self.effective_bitfield_width(right),
+        ) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    fn bitfield_of(&mut self, e: &Expr) -> Option<(u32, TypeId)> {
+        let (base_typ, member) = match &e.kind {
+            ExprKind::Member { expr, member } => (expr.typ?, *member),
+            ExprKind::Arrow { expr, member } => (self.types.base_type(expr.typ?)?, *member),
+            _ => return None,
+        };
+        let resolved = self.resolve_struct_type(base_typ);
+        let info = self.types.find_member(resolved, member)?;
+        Some((info.bit_width?, info.typ))
+    }
+
+    /// The type an operand contributes to an arithmetic expression.
+    ///
+    /// For anything but a bit-field this is just its own type. C17 6.3.1.1p2
+    /// promotes a bit-field the way it promotes a narrow integer: to `int` if
+    /// `int` can represent all its values, otherwise to `unsigned int`. What
+    /// makes it a separate question from `integer_promote` is that the width
+    /// is a property of the *member*, not of the type -- an `unsigned int f:7`
+    /// has type `unsigned int`, so asking the type alone answers "no change"
+    /// and `b.f - 2` comes out a huge unsigned value instead of -1.
+    ///
+    /// A field at least as wide as `int` is left alone, which covers both an
+    /// `unsigned int f:32` (which stays unsigned, since `int` cannot hold all
+    /// of it) and a `long long b:40` (whose declared type is already wider).
+    /// The integer promotions, for the operand of unary `-` or `~`.
+    ///
+    /// C17 6.5.3.3p3 and p4: both perform the integer promotions on their
+    /// operand, and the result has the promoted type. `-` and `~` had each
+    /// open-coded that as a `TypeKind` test for `_Bool`/`char`/`short`, which
+    /// is right as far as it goes and misses bit-fields entirely -- the width
+    /// is a property of the member, not of the type, so no test on `TypeKind`
+    /// can see it. `-v.u7 < 0` was false where C and gcc say true.
+    ///
+    /// Returns the operand, wrapped in a conversion if it needed one, together
+    /// with the promoted type. Going through `promote_bitfield_operand` keeps
+    /// the one rule in one place: the binary operators already use it, and two
+    /// copies of a promotion rule is how this went wrong to begin with.
+    fn promote_unary_operand(&mut self, operand: Expr) -> (Expr, TypeId) {
+        let operand = self.promote_bitfield_operand(operand);
+        let op_typ = operand.typ.unwrap_or(self.types.int_id);
+        let typ = match self.types.kind(op_typ) {
+            TypeKind::Bool | TypeKind::Char | TypeKind::Short => self.types.int_id,
+            _ => op_typ,
+        };
+        (operand, typ)
+    }
+
+    /// The width `-x` or `~x` yields: the operand's own. `-` and `~` on a
+    /// 40-bit field are computed and reduced at 40 bits, exactly as a binary
+    /// operator on it would be.
+    fn unary_bitfield_width(&mut self, operand: &Expr, result_typ: TypeId) -> Option<u32> {
+        self.effective_bitfield_width(operand)
+            .filter(|bits| *bits < self.types.size_bits(result_typ))
+    }
+
+    /// Wrap a bit-field operand in the conversion C17 6.3.1.1p2 calls for.
+    ///
+    /// A no-op for anything else, and for a field that does not promote.
+    fn promote_bitfield_operand(&mut self, e: Expr) -> Expr {
+        let declared = e.typ.unwrap_or(self.types.int_id);
+        let promoted = self.bitfield_promoted_type(&e);
+        if promoted == declared {
+            return e;
+        }
+        let pos = e.pos;
+        Self::typed_expr(
+            ExprKind::Cast {
+                cast_type: promoted,
+                expr: Box::new(e),
+            },
+            promoted,
+            pos,
+        )
+    }
+
+    fn bitfield_promoted_type(&mut self, e: &Expr) -> TypeId {
+        let declared = e.typ.unwrap_or(self.types.int_id);
+        let Some((bit_width, field_typ)) = self.bitfield_of(e) else {
+            return declared;
+        };
+        let int_bits = self.types.size_bits(self.types.int_id);
+        if bit_width < int_bits {
+            self.types.int_id
+        } else if bit_width == int_bits && self.types.is_unsigned(field_typ) {
+            self.types.uint_id
+        } else if bit_width == int_bits {
+            self.types.int_id
+        } else {
+            declared
+        }
+    }
+
     fn usual_arithmetic_conversions(&mut self, left: TypeId, right: TypeId) -> TypeId {
         self.types.common_type(left, right)
     }
@@ -1716,11 +1871,24 @@ impl<'a> Parser<'a> {
                     // Check if this is an enum constant - if so, return IntLit
                     if let Some(sym) = self.symbols.lookup_enum_constant(name_id) {
                         if let Some(value) = sym.enum_value {
-                            // The constant carries its enumeration's type, not
-                            // a fixed `int`: when a member does not fit in
-                            // `int` the whole enumeration widens, and reading
-                            // the constant back as `int` would undo that.
-                            let typ = sym.typ;
+                            // C17 6.4.4.3p2: an enumeration constant has type
+                            // `int`. The enumeration's own type is used only
+                            // where that would lose the value -- when a member
+                            // does not fit in `int` the whole enumeration
+                            // widens, and reading the constant back as `int`
+                            // would undo that.
+                            //
+                            // Reporting the enumeration type unconditionally
+                            // was visible: `__builtin_types_compatible_p
+                            // (typeof (hot), int)` answered 0 where gcc and
+                            // the standard say 1, because `typeof` of an
+                            // enumerator is `int`.
+                            let fits_in_int = i32::try_from(value).is_ok();
+                            let typ = if fits_in_int {
+                                self.types.int_id
+                            } else {
+                                sym.typ
+                            };
                             let kind = match i64::try_from(value) {
                                 Ok(v) => ExprKind::IntLit(v),
                                 // Only an `unsigned long` enumeration above
@@ -1736,6 +1904,45 @@ impl<'a> Parser<'a> {
                     if let Some(symbol_id) = self.symbols.lookup_id(name_id, Namespace::Ordinary) {
                         let typ = self.symbols.get(symbol_id).typ;
                         Ok(Self::typed_expr(ExprKind::Ident(symbol_id), typ, token_pos))
+                    } else if diag::permissive() && self.is_special(b'(') {
+                        // `-fpermissive`: C89 6.3.2.2 let a call to an
+                        // undeclared function declare it implicitly as
+                        // `extern int f();` -- unprototyped, so no argument is
+                        // checked or converted. C99 6.5.1p2 removed the rule.
+                        //
+                        // Only a name followed by `(` gets this. A bare
+                        // undeclared identifier was never implicitly declared
+                        // by any C standard and stays an error, which is what
+                        // keeps a misspelled variable from silently becoming a
+                        // function.
+                        let name_str = self.idents.get_opt(name_id).unwrap_or("").to_string();
+                        diag::warning_args(
+                            token_pos,
+                            "implicit declaration of function '{0}'",
+                            &[&name_str],
+                        );
+                        let int_id = self.types.int_id;
+                        let func_type = self.types.intern(Type {
+                            kind: TypeKind::Function,
+                            base: Some(int_id),
+                            params: None,
+                            ..Default::default()
+                        });
+                        let symbol = crate::symbol::Symbol::function(
+                            name_id,
+                            func_type,
+                            self.symbols.depth(),
+                        );
+                        let symbol_id = self.symbols.declare(symbol).unwrap_or_else(|_| {
+                            self.symbols
+                                .lookup_id(name_id, crate::symbol::Namespace::Ordinary)
+                                .expect("declare failed but no existing symbol")
+                        });
+                        Ok(Self::typed_expr(
+                            ExprKind::Ident(symbol_id),
+                            func_type,
+                            token_pos,
+                        ))
                     } else {
                         // C99 6.5.1: Undeclared identifier is an error
                         // (implicit int was removed in C99)
@@ -1930,8 +2137,83 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Give a floating literal a zero real part, if it carried an imaginary
+    /// marker.
+    ///
+    /// `__builtin_complex(0, v)` is exactly the value wanted and already
+    /// exists, so no new expression node is needed -- and it is the node
+    /// `<complex.h>` builds `I` and `CMPLX` from, so the constant folds the
+    /// same way theirs do.
+    fn imaginary_if(&self, lit: Expr, is_imaginary: bool, base_typ: TypeId, pos: Position) -> Expr {
+        if !is_imaginary {
+            return lit;
+        }
+        // The real part has to be a zero of the *base's* family: `2i` is a
+        // `_Complex int`, and giving its real half a `FloatLit` made the
+        // constant folder carry an integer complex as two `FloatVal`s.
+        let zero_kind = if self.types.is_integer(base_typ) {
+            ExprKind::IntLit(0)
+        } else {
+            ExprKind::FloatLit(FloatVal::ZERO)
+        };
+        let zero = Self::typed_expr(zero_kind, base_typ, pos);
+        Self::typed_expr(
+            ExprKind::BuiltinComplex {
+                real: Box::new(zero),
+                imag: Box::new(lit),
+            },
+            self.types.make_complex(base_typ),
+            pos,
+        )
+    }
+
+    /// Split a GNU imaginary constant's spelling from its marker.
+    ///
+    /// Returns the number without the `i`/`j`, and whether one was there. The
+    /// marker may appear anywhere in the suffix -- `1.0fi`, `2.2if`, `1.0iF`,
+    /// `2.2iL`, `1.0li` are all gcc-accepted -- so it is removed wherever it
+    /// sits rather than only at the end.
+    ///
+    /// A hex literal is left alone: `0x1i` is not a number, and in
+    /// `0x1f` the `f` is a digit, so scanning the tail for a marker there
+    /// would misread the value.
+    fn strip_imaginary_suffix(s: &str) -> (String, bool) {
+        if s.len() < 2 || s.starts_with("0x") || s.starts_with("0X") {
+            return (s.to_string(), false);
+        }
+        // The suffix is the trailing run of letters. Only that run is searched,
+        // so the `i` of a hex digit sequence or an exponent cannot be taken for
+        // a marker.
+        let digits_end = s
+            .rfind(|c: char| c.is_ascii_digit() || c == '.')
+            .map_or(0, |i| i + 1);
+        let (num, suffix) = s.split_at(digits_end);
+        if !suffix.contains(['i', 'I', 'j', 'J']) {
+            return (s.to_string(), false);
+        }
+        let cleaned: String = suffix
+            .chars()
+            .filter(|c| !matches!(c, 'i' | 'I' | 'j' | 'J'))
+            .collect();
+        (format!("{num}{cleaned}"), true)
+    }
+
     /// Parse a number literal string into an expression
     fn parse_number_literal(&self, s: &str, pos: Position) -> ParseResult<Expr> {
+        // A GNU imaginary constant: a number with an `i` or `j` in its suffix.
+        // The marker may sit on either side of the floating suffix -- gcc takes
+        // `1.0fi`, `2.2if`, `1.0iF`, `2.2iL` and `1.0li` alike -- so it is
+        // removed wherever it lands and the rest of the suffix is parsed as it
+        // always was.
+        //
+        // C's own spelling of this is `_Imaginary`, which C17 6.4.1 reserves
+        // and Annex G makes optional; c17 does not provide the type, and gcc
+        // does not either. Both give the constant a *complex* type with a zero
+        // real part, which is what `__builtin_complex(0, v)` already builds.
+        let (s_owned, is_imaginary) = Self::strip_imaginary_suffix(s);
+        // `s` from here on is the number with the marker removed, which is what
+        // the ordinary suffix and value parsing expects.
+        let s = s_owned.as_str();
         let s_lower = s.to_lowercase();
 
         // Check if it's a hex number (must check before suffix trimming)
@@ -2052,7 +2334,8 @@ impl<'a> Parser<'a> {
             } else {
                 self.types.double_id
             };
-            Ok(Self::typed_expr(ExprKind::FloatLit(value), typ, pos))
+            let lit = Self::typed_expr(ExprKind::FloatLit(value), typ, pos);
+            Ok(self.imaginary_if(lit, is_imaginary, typ, pos))
         } else {
             // Integer - determine type from suffix
             // Check for long long first (ll, ull, llu) before checking for long (l, ul, lu)
@@ -2149,7 +2432,10 @@ impl<'a> Parser<'a> {
                     }
                 }
             };
-            Ok(Self::typed_expr(ExprKind::IntLit(value), typ, pos))
+            // `2i` is a `_Complex int` in gcc: an integer imaginary constant,
+            // whose real half is an integer zero.
+            let lit = Self::typed_expr(ExprKind::IntLit(value), typ, pos);
+            Ok(self.imaginary_if(lit, is_imaginary, typ, pos))
         }
     }
 

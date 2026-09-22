@@ -13,7 +13,7 @@
 // `#if` survived — the defects in this file all hid behind that.
 //
 
-use crate::common::{preprocess_text, run_c17};
+use crate::common::{compile_and_run, preprocess_text, run_c17};
 
 /// Assert the preprocessed text contains `needle`.
 fn assert_has(out: &str, needle: &str, what: &str) {
@@ -2015,5 +2015,119 @@ fn preprocessor_u8_prefix_survives_a_paste() {
         r.stdout.contains("u8\"y\""),
         "the prefix was dropped:\n{}",
         r.stdout
+    );
+}
+
+/// `#pragma push_macro` / `pop_macro`: MSVC's, adopted by gcc and clang, and
+/// used by real headers to borrow a name and give it back.
+///
+/// The cases that make it more than a one-liner are all here: the pragmas
+/// nest, so each pop restores the most recent push; a name that was *not*
+/// defined must come back undefined, which glibc's headers depend on; an
+/// unmatched pop leaves the current definition alone rather than removing it;
+/// and a function-like macro survives the round trip with its parameters.
+///
+/// Every expectation came from gcc on this source.
+#[test]
+fn preprocessor_push_and_pop_macro() {
+    let code = r#"
+extern void abort(void);
+#define A 2
+#pragma push_macro("A")
+#undef A
+#define A 1
+#pragma pop_macro("A")
+
+/* Nested pushes restore in reverse order. */
+#define B 1
+#pragma push_macro("B")
+#undef B
+#define B 2
+#pragma push_macro("B")
+#undef B
+#define B 3
+
+/* A name that was never defined: pop must restore its absence. */
+#pragma push_macro("C")
+#define C 9
+#pragma pop_macro("C")
+#ifdef C
+#error "C should not be defined after pop"
+#endif
+
+/* An unmatched pop leaves the current definition alone. */
+#define D 7
+#pragma pop_macro("D")
+
+/* A function-like macro survives the round trip. */
+#define F(x) ((x) * 3)
+#pragma push_macro("F")
+#undef F
+#define F(x) ((x) * 5)
+#pragma pop_macro("F")
+
+int main(void) {
+    if (A != 2) return 1;
+    if (B != 3) return 2;
+#pragma pop_macro("B")
+    if (B != 2) return 3;
+#pragma pop_macro("B")
+    if (B != 1) return 4;
+    if (D != 7) return 5;
+    if (F(2) != 6) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("preprocessor_push_pop_macro", code, &[]), 0);
+}
+
+/// A `#pragma push_macro` name is a string-literal *payload*, and a payload is
+/// one `char` per source byte — not Rust text.
+///
+/// `literal_payload` is the encoder that produces that form. Applying it to a
+/// payload that is already in it encodes an encoded payload, doubling every
+/// byte of 0x80 or more; the name is then looked up in the macro table, which
+/// is keyed by the identifier as the lexer interned it, so the lookup missed.
+/// `#pragma push_macro("café")` saved nothing and the matching pop restored
+/// nothing. `payload_text` is the decoder and the right call.
+///
+/// The seventh bug of this shape in this crate, and the reason the accessors
+/// carry the names they do.
+///
+/// gcc gets this wrong too — it does not restore `café` either — so this is a
+/// case where c17 is the more correct of the two, and the test says so rather
+/// than pinning c17 to gcc's answer.
+#[test]
+fn preprocessor_push_macro_name_with_non_ascii_bytes() {
+    let code = r#"
+#define café 2
+#define naïve 5
+#pragma push_macro("café")
+#pragma push_macro("naïve")
+#undef café
+#undef naïve
+#define café 1
+#define naïve 9
+#pragma pop_macro("naïve")
+#pragma pop_macro("café")
+
+/* An ASCII name alongside them, so a fix that broke the common case would
+   show here rather than in a later commit. */
+#define PLAIN 3
+#pragma push_macro("PLAIN")
+#undef PLAIN
+#define PLAIN 4
+#pragma pop_macro("PLAIN")
+
+int main(void) {
+    if (café != 2) return 1;
+    if (naïve != 5) return 2;
+    if (PLAIN != 3) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("preprocessor_push_macro_non_ascii", code, &[]),
+        0
     );
 }

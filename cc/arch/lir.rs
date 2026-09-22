@@ -333,6 +333,10 @@ pub enum CallTarget<R> {
 ///   one through an XMM is what produced the invalid `movt %xmm0` mnemonic.
 pub fn complex_sse_regs(types: &TypeTable, complex_typ: TypeId) -> usize {
     let base = types.complex_base(complex_typ);
+    // GNU `_Complex int` and friends occupy general registers, not SSE ones.
+    if types.is_integer(base) {
+        return 0;
+    }
     match types.kind(base) {
         TypeKind::LongDouble => 0,
         // Two binary128 halves are 32 bytes, over the two-eightbyte limit that
@@ -361,7 +365,7 @@ pub fn memory_class_bytes(types: &TypeTable, typ: TypeId) -> Option<usize> {
     if crate::abi::param_is_memory_class(typ, types) {
         return Some((bits / 8) as usize);
     }
-    if types.is_complex(typ) && complex_sse_regs(types, typ) == 0 {
+    if types.is_complex_float(typ) && complex_sse_regs(types, typ) == 0 {
         return Some((bits / 8) as usize);
     }
     None

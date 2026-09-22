@@ -774,6 +774,13 @@ pub struct TypeTable {
     pub longdouble_id: TypeId,
     pub float16_id: TypeId,
     pub float128_id: TypeId,
+    /// Every arithmetic base type paired with its `_Complex` counterpart.
+    ///
+    /// [`Self::make_complex`] takes `&self`, so it cannot intern on demand,
+    /// and the named `complex_*_id` fields cover only the five floating bases.
+    /// GNU complex integers need thirteen more, and naming each of them would
+    /// spread the same lookup over eighteen fields.
+    complex_of: std::collections::HashMap<TypeId, TypeId>,
     pub complex_float_id: TypeId,
     pub complex_double_id: TypeId,
     pub complex_longdouble_id: TypeId,
@@ -824,6 +831,7 @@ impl TypeTable {
             longdouble_id: TypeId::INVALID,
             float16_id: TypeId::INVALID,
             float128_id: TypeId::INVALID,
+            complex_of: std::collections::HashMap::new(),
             complex_float_id: TypeId::INVALID,
             complex_double_id: TypeId::INVALID,
             complex_longdouble_id: TypeId::INVALID,
@@ -891,6 +899,42 @@ impl TypeTable {
             TypeKind::Float128,
             TypeModifiers::COMPLEX,
         ));
+
+        // Pre-intern the GNU complex integer types and record every
+        // base/complex pair, so `make_complex` and `complex_base` are exact
+        // inverses for both families.
+        let bases = [
+            table.char_id,
+            table.schar_id,
+            table.uchar_id,
+            table.short_id,
+            table.ushort_id,
+            table.int_id,
+            table.uint_id,
+            table.long_id,
+            table.ulong_id,
+            table.longlong_id,
+            table.ulonglong_id,
+            table.int128_id,
+            table.uint128_id,
+        ];
+        for base in bases {
+            let typ = table.get(base);
+            let cplx = table.intern(Type::with_modifiers(
+                typ.kind,
+                typ.modifiers | TypeModifiers::COMPLEX,
+            ));
+            table.complex_of.insert(base, cplx);
+        }
+        for (real, cplx) in [
+            (table.float_id, table.complex_float_id),
+            (table.double_id, table.complex_double_id),
+            (table.longdouble_id, table.complex_longdouble_id),
+            (table.float16_id, table.complex_float16_id),
+            (table.float128_id, table.complex_float128_id),
+        ] {
+            table.complex_of.insert(real, cplx);
+        }
 
         // Pre-intern common pointer types
         table.void_ptr_id = table.intern(Type::pointer(table.void_id));
@@ -1318,14 +1362,79 @@ impl TypeTable {
         if !self.is_complex(id) {
             return id;
         }
-        match self.get(id).kind {
+        self.canonical_arithmetic_base(id).unwrap_or(id)
+    }
+
+    /// The pre-interned, unqualified type of the same kind and signedness, or
+    /// `None` for a kind that has no such counterpart.
+    ///
+    /// Keyed on the *kind*, not on the id: `const long double` and a
+    /// `long double` reached through a typedef are different `TypeId`s than
+    /// `longdouble_id`, and an exact-id lookup misses both. That is how
+    /// `__builtin_complex(7.0L, 8.0L)` came out `_Complex double` -- the
+    /// lookup missed and took the fallback -- and built a 16-byte value for a
+    /// 32-byte type.
+    fn canonical_arithmetic_base(&self, id: TypeId) -> Option<TypeId> {
+        let unsigned = self.is_unsigned(id);
+        Some(match self.get(id).kind {
             TypeKind::Float => self.float_id,
             TypeKind::Double => self.double_id,
             TypeKind::LongDouble => self.longdouble_id,
             TypeKind::Float16 => self.float16_id,
             TypeKind::Float128 => self.float128_id,
-            _ => id,
-        }
+            // GNU complex integers. Answering `id` here -- the complex type
+            // itself -- made the base twice as wide as the half it describes,
+            // so the two halves were read from the same address and the
+            // imaginary store overran the object.
+            // `char` asks the *modifiers*, not `is_unsigned`: plain `char` is
+            // a third type distinct from both `signed char` and
+            // `unsigned char`, and its signedness is the target's choice. On
+            // a target where it is unsigned, `is_unsigned` would send plain
+            // `char` to `uchar_id` and the round trip would no longer land
+            // back where it started.
+            TypeKind::Char => {
+                let mods = self.get(id).modifiers;
+                if mods.contains(TypeModifiers::UNSIGNED) {
+                    self.uchar_id
+                } else if mods.contains(TypeModifiers::SIGNED) {
+                    self.schar_id
+                } else {
+                    self.char_id
+                }
+            }
+            TypeKind::Short if unsigned => self.ushort_id,
+            TypeKind::Short => self.short_id,
+            TypeKind::Int if unsigned => self.uint_id,
+            TypeKind::Int => self.int_id,
+            TypeKind::Long if unsigned => self.ulong_id,
+            TypeKind::Long => self.long_id,
+            TypeKind::LongLong if unsigned => self.ulonglong_id,
+            TypeKind::LongLong => self.longlong_id,
+            TypeKind::Int128 if unsigned => self.uint128_id,
+            TypeKind::Int128 => self.int128_id,
+            _ => return None,
+        })
+    }
+
+    /// Whether this is a complex type whose halves are floating-point.
+    ///
+    /// The backends want this, not [`Self::is_complex`]: what they mean by
+    /// "complex" is "arrives in SSE registers", and a GNU `_Complex int`
+    /// arrives in general ones. The linearizer wants `is_complex`, because
+    /// what *it* means is "two halves at offsets, addressed rather than held",
+    /// which is true of both families.
+    pub fn is_complex_float(&self, id: TypeId) -> bool {
+        self.is_complex(id) && !self.is_integer(self.complex_base(id))
+    }
+
+    /// Whether a complex type's two halves are integers rather than floats.
+    ///
+    /// The complex emit paths are written once and pick their opcodes from
+    /// this: `_Complex int` addition is `Add`, not `FAdd`. Asking
+    /// `is_complex` alone cannot tell them apart, and asking the base's kind
+    /// at each site invited the two to disagree.
+    pub fn is_complex_integer(&self, id: TypeId) -> bool {
+        self.is_complex(id) && self.is_integer(self.complex_base(id))
     }
 
     /// The binary format a floating type is held and computed in on this
@@ -1356,14 +1465,13 @@ impl TypeTable {
         if self.is_complex(id) {
             return id;
         }
-        match self.get(id).kind {
-            TypeKind::Float => self.complex_float_id,
-            TypeKind::Double => self.complex_double_id,
-            TypeKind::LongDouble => self.complex_longdouble_id,
-            TypeKind::Float16 => self.complex_float16_id,
-            TypeKind::Float128 => self.complex_float128_id,
-            _ => self.complex_double_id, // default to double _Complex
-        }
+        // Through the canonical base, so a qualified or typedef'd type finds
+        // its counterpart: the table is keyed by the pre-interned ids. The
+        // fallback is for the non-arithmetic types that have no complex
+        // counterpart at all and should never be asked.
+        self.canonical_arithmetic_base(id)
+            .and_then(|canon| self.complex_of.get(&canon).copied())
+            .unwrap_or(self.complex_double_id)
     }
 
     /// Check if type is an arithmetic type (integer, float, or complex)
@@ -1636,8 +1744,17 @@ impl TypeTable {
         // at the common type of the two real parts (C17 6.3.1.8p1).
         let complex = self.is_complex(left) || self.is_complex(right);
 
-        let left_float = self.is_float(left) || self.is_complex(left);
-        let right_float = self.is_float(right) || self.is_complex(right);
+        // Ask about the real parts from here on. A complex type carries its
+        // base's kind, so the floating tests below cannot tell `_Complex int`
+        // from `int` -- and calling it floating, which is what asking
+        // `is_complex` did, matched none of the floating kinds and fell
+        // through to the `_Float16` default. `_Complex int * _Complex int`
+        // came out `_Complex _Float16`: both operands were converted to half
+        // precision and multiplied by `__muldc3`.
+        let (left, right) = (self.complex_base(left), self.complex_base(right));
+
+        let left_float = self.is_float(left);
+        let right_float = self.is_float(right);
         if left_float || right_float {
             let (l, r) = (self.kind(left), self.kind(right));
             let either = |k| l == k || r == k;
@@ -1657,8 +1774,12 @@ impl TypeTable {
             };
         }
 
-        // Integers. The promotions run first (C17 6.3.1.8p1) -- without them
-        // two sub-`int` operands match none of the rules below and fall to the
+        // Integers -- including the halves of a GNU complex integer, whose
+        // common type is complex-of-whatever the halves agree on. Every
+        // `return` below goes through `pick_complex` for that reason.
+        //
+        // The promotions run first (C17 6.3.1.8p1) -- without them two
+        // sub-`int` operands match none of the rules below and fall to the
         // unsigned case, so `unsigned char` arithmetic came out unsigned.
         let left = self.integer_promote(left);
         let right = self.integer_promote(right);
@@ -1666,11 +1787,12 @@ impl TypeTable {
 
         // Same signedness: the higher rank, and nothing else to decide.
         if left_unsigned == right_unsigned {
-            return if self.integer_rank(left) >= self.integer_rank(right) {
+            let real = if self.integer_rank(left) >= self.integer_rank(right) {
                 left
             } else {
                 right
             };
+            return self.pick_complex(complex, real, self.make_complex(real));
         }
 
         // Mixed. C17 6.3.1.8 takes three more steps, and they need rank *and*
@@ -1685,18 +1807,19 @@ impl TypeTable {
         if self.integer_rank(unsigned) >= self.integer_rank(signed) {
             // The unsigned type ranks at least as high, so everything converts
             // to it: `unsigned long` against `long` is `unsigned long`.
-            return unsigned;
+            return self.pick_complex(complex, unsigned, self.make_complex(unsigned));
         }
         if self.size_bits(signed) > self.size_bits(unsigned) {
             // The signed type holds every value of the unsigned one, so it
             // survives with its sign: `-1L / 2u` is `long`, not `unsigned
             // long`, and really is negative.
-            return signed;
+            return self.pick_complex(complex, signed, self.make_complex(signed));
         }
         // Lower rank but no room to spare -- `unsigned long` against `long
         // long`, both 64 bits. Neither can represent the other, so the answer
         // is the unsigned counterpart of the signed type.
-        self.unsigned_version(signed)
+        let real = self.unsigned_version(signed);
+        self.pick_complex(complex, real, self.make_complex(real))
     }
 
     /// The integer conversion rank (C17 6.3.1.1p1), as an ordinal.
@@ -1768,12 +1891,17 @@ impl TypeTable {
             // assumes void* arithmetic works like char* (1 byte per unit).
             TypeKind::Void => 8,
             TypeKind::Bool => 8,
-            TypeKind::Char => 8,
-            TypeKind::Short => 16,
-            TypeKind::Int => 32,
-            TypeKind::Long => 64,
-            TypeKind::LongLong => 64,
-            TypeKind::Int128 => 128,
+            // The integer kinds carry the multiplier because `_Complex int` is
+            // a GNU extension c17 accepts: two `int`s, exactly as the floating
+            // ones are two `double`s. Leaving them at their real width made
+            // `sizeof(_Complex int)` 4, and every write of an imaginary part
+            // then landed one object past the end of the storage.
+            TypeKind::Char => 8 * multiplier,
+            TypeKind::Short => 16 * multiplier,
+            TypeKind::Int => 32 * multiplier,
+            TypeKind::Long => 64 * multiplier,
+            TypeKind::LongLong => 64 * multiplier,
+            TypeKind::Int128 => 128 * multiplier,
             TypeKind::Float => 32 * multiplier,
             TypeKind::Double => 64 * multiplier,
             TypeKind::LongDouble => self.longdouble_size_bits() * multiplier,
@@ -2305,6 +2433,152 @@ impl TypeTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `make_complex` and `complex_base` must be exact inverses, for every
+    /// arithmetic base and whatever qualifiers the type carries.
+    ///
+    /// Each half of them had its own bug. `complex_base` answered with the
+    /// complex type *itself* for an integer base, so both halves of a
+    /// `_Complex int` were read from the same address and the imaginary store
+    /// overran the object. `make_complex` looked the base up by exact
+    /// `TypeId`, so a qualified or typedef'd `long double` missed and took the
+    /// `_Complex double` fallback -- `__builtin_complex(7.0L, 8.0L)` built a
+    /// 16-byte value for a 32-byte type.
+    #[test]
+    fn test_complex_base_and_make_complex_are_inverses() {
+        // Both targets, not just the host: plain `char` is signed on x86-64
+        // and unsigned on aarch64, and canonicalizing it by `is_unsigned`
+        // rather than by its modifiers sent plain `char` to `unsigned char`
+        // on one of them -- so the round trip held here and broke on CI.
+        for target in [
+            Target::new(Arch::X86_64, Os::Linux),
+            Target::new(Arch::Aarch64, Os::Linux),
+        ] {
+            check_complex_round_trip(&target);
+        }
+    }
+
+    fn check_complex_round_trip(target: &Target) {
+        let mut types = TypeTable::new(target);
+        let bases = [
+            types.char_id,
+            types.schar_id,
+            types.uchar_id,
+            types.short_id,
+            types.ushort_id,
+            types.int_id,
+            types.uint_id,
+            types.long_id,
+            types.ulong_id,
+            types.longlong_id,
+            types.ulonglong_id,
+            types.int128_id,
+            types.uint128_id,
+            types.float_id,
+            types.double_id,
+            types.longdouble_id,
+            types.float16_id,
+            types.float128_id,
+        ];
+        for base in bases {
+            let cplx = types.make_complex(base);
+            assert!(types.is_complex(cplx), "make_complex gave a real type");
+            assert_eq!(
+                types.complex_base(cplx),
+                base,
+                "round trip failed for kind {:?}",
+                types.kind(base)
+            );
+            // Two halves, never one.
+            assert_eq!(
+                types.size_bits(cplx),
+                2 * types.size_bits(base),
+                "size of complex-of-{:?} is not twice its base",
+                types.kind(base)
+            );
+            // Alignment is the base's, not the pair's.
+            assert_eq!(types.alignment(cplx), types.alignment(base));
+            // And the two families are told apart.
+            assert_eq!(types.is_complex_integer(cplx), types.is_integer(base));
+            assert_eq!(types.is_complex_float(cplx), !types.is_integer(base));
+            // Already complex: idempotent.
+            assert_eq!(types.make_complex(cplx), cplx);
+        }
+
+        // Keyed on the kind, so a qualifier cannot make it miss. This is the
+        // case that produced a `_Complex double` for a `long double`.
+        for base in [types.longdouble_id, types.int_id, types.uint_id] {
+            let mut qualified = types.get(base).clone();
+            qualified.modifiers |= TypeModifiers::CONST;
+            let qualified = types.intern(qualified);
+            assert_ne!(qualified, base, "the qualified type should be distinct");
+            assert_eq!(
+                types.make_complex(qualified),
+                types.make_complex(base),
+                "a qualified {:?} found a different complex type",
+                types.kind(base)
+            );
+        }
+    }
+
+    /// The usual arithmetic conversions run on the *real parts* (C17
+    /// 6.3.1.8p1), and re-complexify the answer.
+    ///
+    /// A complex type carries its base's kind, so calling it floating -- which
+    /// is what asking `is_complex` did -- matched none of the floating kinds
+    /// and fell through to the `_Float16` default. `_Complex int * _Complex
+    /// int` came out `_Complex _Float16`: both operands were rounded to half
+    /// precision and multiplied by `__muldc3`.
+    #[test]
+    fn test_common_type_of_complex_operands() {
+        let types = TypeTable::new(&Target::host());
+        let c = |t| types.make_complex(t);
+        let cases = [
+            // Both complex integers: complex of the common integer type.
+            (c(types.int_id), c(types.int_id), c(types.int_id)),
+            (c(types.int_id), c(types.long_id), c(types.long_id)),
+            (c(types.int_id), c(types.uint_id), c(types.uint_id)),
+            // A complex integer against a real one: still complex.
+            (c(types.int_id), types.int_id, c(types.int_id)),
+            (c(types.int_id), types.long_id, c(types.long_id)),
+            // Sub-`int` halves promote before ranking, as real ones do.
+            (c(types.schar_id), c(types.schar_id), c(types.int_id)),
+            (c(types.short_id), types.int_id, c(types.int_id)),
+            // Complex is contagious across the families, at the wider base.
+            (c(types.int_id), types.double_id, c(types.double_id)),
+            (c(types.int_id), c(types.double_id), c(types.double_id)),
+            (c(types.float_id), c(types.int_id), c(types.float_id)),
+            // And the floating cases are unchanged.
+            (c(types.double_id), c(types.double_id), c(types.double_id)),
+            (
+                c(types.double_id),
+                types.longdouble_id,
+                c(types.longdouble_id),
+            ),
+            (c(types.float_id), types.double_id, c(types.double_id)),
+            // Two real operands stay real.
+            (types.int_id, types.long_id, types.long_id),
+            (types.float_id, types.double_id, types.double_id),
+        ];
+        for (l, r, want) in cases {
+            for (a, b) in [(l, r), (r, l)] {
+                let got = types.common_type(a, b);
+                assert_eq!(
+                    (types.kind(got), types.size_bits(got), types.is_complex(got)),
+                    (
+                        types.kind(want),
+                        types.size_bits(want),
+                        types.is_complex(want)
+                    ),
+                    "common_type({:?}{}, {:?}{})",
+                    types.kind(a),
+                    if types.is_complex(a) { " complex" } else { "" },
+                    types.kind(b),
+                    if types.is_complex(b) { " complex" } else { "" },
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_basic_types() {

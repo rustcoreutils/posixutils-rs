@@ -266,7 +266,9 @@ the project's own filter before earning a verdict:
 | SIMD intrinsic headers | **No — fix the predefines** | See below; the blocking is self-inflicted |
 | `__atomic_*` / `__sync_*` | **Not implemented; macro withdrawn** | Alternate spellings of complete C11 atomics — see below |
 | `__auto_type` | **No** | 6 files across four trees; fails minimalism on its own numbers |
-| nested functions / `__label__` | **Never** | GCC-only, Clang refuses it, needs executable-stack trampolines |
+| nested functions / `__label__` | **Never** | GCC-only, Clang refuses it, needs executable-stack trampolines. 22 torture instances; see the c-torture section |
+| VLA as a struct member | **No** | GCC-only; needs struct layout computed at run time and `offsetof` through it. 16 torture instances |
+| `_Decimal32/64/128` | **No** | IEEE 754 decimal arithmetic, a whole numeric tower for 2 torture instances |
 
 ### SIMD headers — the blocking is ours
 
@@ -565,25 +567,65 @@ page.
 external checkout (the suite is GPLv3 and is not vendored) and diffs a recorded
 baseline, so a regression fails rather than shifting a percentage.
 
-`execute/` went from **58.5% to 88.5%** (1986 -> 3005 of 3396 test-instances,
+`execute/` went from **58.5% to 89.96%** (1986 -> 3055 of 3396 test-instances,
 1698 tests at -O0 and -O2) over one series: the libc-alias builtins,
 `-fpermissive`, `__complex__`, bare `alloca`, `va_arg` of a small struct,
 bit-field assignment values and promotion, binary128 variadic arguments,
 `__builtin_classify_type`, `creal`/`cimag`/`conj`, the `*_overflow_p` family,
 `#pragma push_macro`, `__builtin_prefetch`'s argument, enumeration constants'
-type, and GNU complex integers.
+type, GNU complex integers, read-modify-write evaluating its target once, a
+`switch` promoting its controlling expression and comparing at full width,
+static initializers that wrote past their object, VLA stack reclamation,
+zero-sized parameters, calls through a function pointer, and the GNU
+`__const` / colon-designator / bare-`_Complex` spellings.
 
-What is left, at -O0 — 35 run failures and 68 compile failures:
+One conformance gap found while chasing those and not yet fixed: c17 has no
+C17 6.7.3p2 check, so `restrict int x;` is accepted where gcc errors that
+`restrict` may only qualify a pointer to object type.
 
-| Group | Count | Note |
+**What is left — 16 run failures and 73 compile failures (of 3396
+instances; 3055 pass, 252 are skipped).** The table is by cause, with the
+decision taken for each.
+
+### Declared out of scope
+
+These are GNU-only language features, not conformance gaps. None of them
+appears in CPython, in glibc-style headers, or in any corpus c17 targets, and
+the project takes only widely-used extensions. **They are not open work**, and the
+reachable ceiling is about 3106 rather than 3396.
+
+| Group | Inst | What it would take |
 |---|---|---|
-| `scalar_storage_order` attribute | 2 | `20230630-2`, `20230630-4`. c17 warns that it ignores the attribute and lays out natively, so the tests read 85 where they want 21. Needs reverse-endian load/store lowering |
-| ~~Complex arithmetic~~ | 0 | Closed. `_Complex int` and its relatives are implemented: sizing, `__real__`/`__imag__`, arithmetic (multiply and divide open-coded, since the `__mul?c3` helpers are floating-only), the argument and return ABI on both targets, `~` as the conjugate, and integer imaginary constants. This also fixed a real argument bound to a *floating* complex parameter, which was never promoted |
-| `va_arg` with `long double` / `__int128` | 2 | `pr44942`, `pr92904` — the binary128 fixes did not reach these |
-| Pre-C99 implicit `int` not requesting `-fpermissive` | 5 | gcc rejects them too without a flag |
-| Dead-call elimination proofs | 9 | call an undefined `link_error` the optimizer is expected to delete. gcc deletes it, c17 does not — optimizer strength, not a defect |
-| Nested functions, VLA-as-struct-member, `_Decimal64`, `__builtin_apply` | ~5 | out of scope, see the GNU extensions section |
-| Singletons needing their own triage | ~40 | mostly `pr*` |
+| Nested functions | 22 | A static chain and executable trampolines: `20010209-1`, `20010605-1`, `20030501-1`, `20040520-1`, `20090219-1`, `nest-align-1`, `nestfunc-7`, `nest-stdar-1`, `pr103405`, `pr22061-3`, `pr22061-4` |
+| VLA as a struct member | 16 | Struct layout computed at run time, and `offsetof` through it: `20020412-1`, `20040308-1`, `20040423-1`, `20041218-2`, `20070919-1`, `align-nest`, `pr41935`, `pr82210` |
+| `_Decimal64` | 2 | IEEE 754 decimal arithmetic: `pr80692` |
+
+### Deliberate divergences from gcc
+
+| Test | Inst | Why c17 does not follow |
+|---|---|---|
+| `20021127-1` | 2 | gcc folds `llabs()` and never calls the program's *own* definition of `llabs`. Matching it means a local definition is silently ignored, which is worse than failing the test |
+| `20031003-1` | 2 | `(int)2147483648.0f` is undefined behaviour; gcc's constant folder saturates to `INT_MAX`. aarch64 already agrees by hardware accident, x86-64 does not. Not worth matching folded UB |
+| `991014-1` | 2 | Needs `sizeof` to answer ~9.2 exabytes exactly. `size_bits` returns a `u32`, so nothing wider than `u32::MAX` **bits** has a representable size — `MAX_OBJECT_BYTES` is a consequence of that type, not an arbitrary cap. Widening it is a 288-call-site refactor through the type table, IR instruction sizes, ABI classification and both backends |
+
+Complex integer division is a fourth, recorded in `BUILTIN.md`: c17 uses
+Smith's method because the exact formula overflows, and so answers `6 + 1i`
+for `(-9 + 38i) / (5 + 6i)` exactly as gcc does.
+
+### Still open
+
+| Group | Inst | Note |
+|---|---|---|
+| Dead-call elimination proofs | 13 | Call an undefined `link_error` the optimizer is expected to delete, so they fail to *link* at -O2 only: `20011115-1`, `20020720-1`, `20030216-1`, `20030330-1`, `20041114-1`, `compare-3`, `medce-1`, `pure-1`, `shiftopt-1`, `stdarg-4`. Optimizer strength, not a defect — and building real dead-code and value-range analysis would improve -O2 generally |
+| Missing optimizations behind `__OPTIMIZE__` | 4 | `20030125-1`, `builtin-constant`. Same class: the tests only assert them when the optimizer is on |
+| `va_arg` tail | 6 | `pr44942` (`long double`), `pr92904` (`__int128`), `va-arg-22` (21 struct sizes from 0 to 72 bytes). Real ABI work on both targets |
+| C23 `[[...]]` attributes | 6 | `pr123978`, `pr124358`, `pr125291`. New attribute syntax; c17 is C17-only, so this is a scope decision as much as a feature |
+| `scalar_storage_order` attribute | 4 | `20230630-2`, `20230630-4`. c17 warns that it ignores the attribute and lays out natively, so the tests read 85 where they want 21. Needs reverse-endian load/store lowering |
+| Conditional with one `void` arm | 2 | `pr46309`. gcc accepts it as an extension; C17 6.5.15p3 requires both or neither |
+| Address of a string-literal element as a constant | 2 | `921019-1`: `(void *)&("X"[0])` in a static initializer |
+| Pre-C99 implicit `int` without `-fpermissive` | 2 | `920728-1`. gcc's own harness supplies a flag c17's does not |
+| Tests that include another test file | 6 | `pr71626-2`, `pr109938`, `pr109986`. Need the included file triaged first |
+| Singletons still to triage | ~10 | mostly `pr*` |
 
 One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.
 gcc accepts a conditional with one `void` arm as an extension; C17 6.5.15p3

@@ -22,8 +22,6 @@
 use super::{is_aggregate, is_float, is_integer, is_pointer, Abi, ArgClass, HfaBase, RegClass};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
-/// Maximum aggregate size (in bits) that can be passed in registers.
-/// Structs larger than 128 bits (16 bytes) must use sret (unless HFA).
 /// The alignment AAPCS64 gives an argument of this type.
 ///
 /// **Not `TypeTable::alignment`.** AAPCS64 has no notion of over-alignment: a
@@ -70,6 +68,35 @@ pub fn argument_alignment(types: &TypeTable, ty: TypeId) -> usize {
     raw.clamp(8, 16)
 }
 
+/// Stage C.10: where an argument's run of `n` general registers starts.
+///
+/// An argument whose AAPCS64 alignment is 16 -- see [`argument_alignment`] --
+/// begins at an *even* NGRN, so an odd one skips a register and leaves it
+/// unused. That is the whole of the rule: it is the alignment that decides,
+/// not the type, so a scalar `__int128`, a `struct { __int128 x; }` and a
+/// struct whose first member carries `aligned(16)` all round, while the same
+/// struct carrying `aligned(16)` on *itself* does not.
+///
+/// `None` means the run does not fit. Stage C.11 then sets NGRN to
+/// `num_regs`, so every later argument is on the stack as well -- unlike
+/// System V, which leaves the registers it did not fit in available.
+pub fn gr_run_start(
+    types: &TypeTable,
+    ty: TypeId,
+    ngrn: usize,
+    n: usize,
+    num_regs: usize,
+) -> Option<usize> {
+    let start = if argument_alignment(types, ty) == 16 {
+        (ngrn + 1) & !1
+    } else {
+        ngrn
+    };
+    (start + n <= num_regs).then_some(start)
+}
+
+/// Maximum aggregate size (in bits) that can be passed in registers.
+/// Structs larger than 128 bits (16 bytes) must use sret (unless HFA).
 const MAX_AGGREGATE_BITS: u32 = 128;
 
 /// Maximum number of HFA/HVA elements.

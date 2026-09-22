@@ -400,10 +400,14 @@ impl Aarch64CodeGen {
             VaAggKind::Indirect { .. } => 8,
             _ => align,
         };
-        // Only an integral scalar of sixteen bytes -- `__int128` -- takes the
-        // even-pair rule. A composite goes through `VaAggKind::Gp`, which the
-        // ABI packs into consecutive slots without it.
-        let needs_even_gr_pair = !from_simd && matches!(agg, VaAggKind::Scalar) && type_bits == 128;
+        // Stage C.10 is decided by the argument's alignment, not by whether
+        // it is a scalar: `struct { __int128 x; }` rounds exactly as a bare
+        // `__int128` does, and gcc emits the same `add w1,w1,15; and w1,w1,-16`
+        // for both. Restricting it to `VaAggKind::Scalar` left every 16-aligned
+        // composite reading the odd slot the prologue never filled that way.
+        // An indirect argument is a *pointer*, eight bytes, so it never rounds.
+        let needs_even_gr_pair =
+            !from_simd && !matches!(agg, VaAggKind::Indirect { .. }) && align == 16;
 
         // x9 = offs, x10 = offs + reg_step, committed back immediately.
         self.push_lir(Aarch64Inst::Ldr {

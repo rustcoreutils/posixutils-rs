@@ -534,7 +534,19 @@ impl Aarch64CodeGen {
                 continue;
             }
             if gp_pair {
-                if int_arg_idx + 1 < int_arg_regs.len() {
+                // Stage C.10 through the same helper the `__int128` arm and
+                // both callee sides use: a 16-aligned composite starts at an
+                // even NGRN, so an odd one skips a register. Asking only
+                // whether two were left ignored the rounding, and c17 passed
+                // `struct { __int128 x; }` in the pair gcc had skipped.
+                if let Some(start) = crate::abi::aapcs64::gr_run_start(
+                    types,
+                    arg_type.unwrap(),
+                    int_arg_idx,
+                    2,
+                    int_arg_regs.len(),
+                ) {
+                    int_arg_idx = start;
                     let mem = match self.get_location(arg) {
                         // The slot holds the aggregate's own bytes.
                         ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => self.loc_mem(l).unwrap(),
@@ -562,6 +574,11 @@ impl Aarch64CodeGen {
                             bytes: arg_type.map_or(16, |t| (types.size_bits(t) / 8) as i32),
                         },
                     });
+                    // Stage C.11, as in the `__int128` and complex-integer
+                    // arms: NGRN becomes 8, so the argument after this one is
+                    // on the stack too. Leaving the index alone handed it a
+                    // register the callee was not reading.
+                    int_arg_idx = int_arg_regs.len();
                 }
                 continue;
             }
@@ -605,9 +622,13 @@ impl Aarch64CodeGen {
                 }
             } else if arg_type.is_some_and(|t| types.kind(t) == crate::types::TypeKind::Int128) {
                 // __int128 uses two consecutive *even-aligned* GP registers.
-                if let Some(start) =
-                    crate::arch::aarch64::int128_pair_start(int_arg_idx, int_arg_regs.len())
-                {
+                if let Some(start) = crate::abi::aapcs64::gr_run_start(
+                    types,
+                    arg_type.unwrap(),
+                    int_arg_idx,
+                    2,
+                    int_arg_regs.len(),
+                ) {
                     int_arg_idx = start;
                     let loc = self.get_location(arg);
                     match loc {

@@ -2193,3 +2193,165 @@ fn codegen_aarch64_hfa_returning_function_is_not_inlined() {
         );
     }
 }
+
+/// AAPCS64 stage C.10: an argument whose alignment is 16 starts at an **even**
+/// NGRN, so an odd one skips a general register and leaves it unused; and
+/// stage C.11: one that does not fit sets NGRN to 8, so everything after it is
+/// on the stack too.
+///
+/// c17 applied C.10 only where the type was a scalar `__int128`, and C.11 not
+/// at all for a general-register composite pair. Both mistakes were made by
+/// the caller and the callee alike, so every c17-only program agreed with
+/// itself -- this links against gcc in both directions, which is the only
+/// shape that can see it.
+///
+/// The five shapes are the discriminating ones, and it is the *alignment*
+/// that decides, not the type: `struct { __int128 x; }` and a struct whose
+/// first member carries `aligned(16)` round, while the same struct carrying
+/// `aligned(16)` on *itself* does not, and neither does a packed one. Five
+/// leading `long`s make NGRN odd so the rounding is observable at all.
+#[test]
+fn codegen_aarch64_agrees_with_gcc_on_even_register_pairing() {
+    if !aarch64_cross_available() {
+        eprintln!(
+            "SKIP codegen_aarch64_agrees_with_gcc_on_even_register_pairing: \
+             no aarch64 cross toolchain"
+        );
+        return;
+    }
+
+    let decls = r#"
+#include <stdarg.h>
+typedef struct { __int128 x; } N16;                                    /* natural 16 */
+typedef struct { long long a, b; } N8;                                 /* 8 */
+typedef struct __attribute__((aligned(16))) { long long a, b; } A16;   /* own attribute */
+typedef struct { long long a __attribute__((aligned(16))); long long b; } M16;
+typedef struct __attribute__((packed)) { __int128 x; } P16;
+int t_n16(long, long, long, long, long, N16, long, long);
+int t_n8(long, long, long, long, long, N8, long, long);
+int t_a16(long, long, long, long, long, A16, long, long);
+int t_m16(long, long, long, long, long, M16, long, long);
+int t_p16(long, long, long, long, long, P16, long, long);
+int t_i128(long, long, long, long, long, __int128, long, long);
+int t_ovf(long, long, long, long, long, long, long, N8, long);
+int t_va(int, ...);
+"#;
+
+    let callee_src = format!(
+        "{decls}{}",
+        r#"
+#define CHK(cond) return (cond) ? 0 : __LINE__
+int t_n16(long a, long b, long c, long d, long e, N16 s, long f, long g)
+{ (void)b;(void)c;(void)d; CHK(a==1 && e==5 && (long)s.x==77 && f==8 && g==9); }
+int t_n8(long a, long b, long c, long d, long e, N8 s, long f, long g)
+{ (void)b;(void)c;(void)d; CHK(a==1 && e==5 && s.a==77 && s.b==78 && f==8 && g==9); }
+int t_a16(long a, long b, long c, long d, long e, A16 s, long f, long g)
+{ (void)b;(void)c;(void)d; CHK(a==1 && e==5 && s.a==77 && s.b==78 && f==8 && g==9); }
+int t_m16(long a, long b, long c, long d, long e, M16 s, long f, long g)
+{ (void)b;(void)c;(void)d; CHK(a==1 && e==5 && s.a==77 && s.b==78 && f==8 && g==9); }
+int t_p16(long a, long b, long c, long d, long e, P16 s, long f, long g)
+{ (void)b;(void)c;(void)d; CHK(a==1 && e==5 && (long)s.x==77 && f==8 && g==9); }
+int t_i128(long a, long b, long c, long d, long e, __int128 s, long f, long g)
+{ (void)b;(void)c;(void)d; CHK(a==1 && e==5 && (long)s==77 && f==8 && g==9); }
+
+/* Stage C.11: the pair does not fit, so `h` is on the stack as well. */
+int t_ovf(long a, long b, long c, long d, long e, long f, long g, N8 s, long h)
+{ (void)b;(void)c;(void)d;(void)e;(void)f; CHK(a==1 && g==7 && s.a==77 && s.b==78 && h==9); }
+
+/* `va_arg` walks the same stage-C state, and rounds `__gr_offs` to 16 for a
+   16-aligned argument exactly as gcc does. */
+int t_va(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    for (int i = 0; i < 5; i++)
+        if (va_arg(ap, long) != i + 1) { va_end(ap); return __LINE__; }
+    N16 s = va_arg(ap, N16);
+    long f = va_arg(ap, long);
+    va_end(ap);
+    return ((long)s.x == 77 && f == 8) ? 0 : __LINE__;
+}
+"#
+    );
+
+    let caller_src = format!(
+        "{decls}{}",
+        r#"
+int main(void)
+{
+    N16 n16 = { 77 };
+    N8 n8 = { 77, 78 };
+    A16 a16 = { 77, 78 };
+    M16 m16 = { 77, 78 };
+    P16 p16 = { 77 };
+    __int128 i128 = 77;
+    if (t_n16(1, 2, 3, 4, 5, n16, 8, 9)) return 1;
+    if (t_n8(1, 2, 3, 4, 5, n8, 8, 9)) return 2;
+    if (t_a16(1, 2, 3, 4, 5, a16, 8, 9)) return 3;
+    if (t_m16(1, 2, 3, 4, 5, m16, 8, 9)) return 4;
+    if (t_p16(1, 2, 3, 4, 5, p16, 8, 9)) return 5;
+    if (t_i128(1, 2, 3, 4, 5, i128, 8, 9)) return 6;
+    if (t_ovf(1, 2, 3, 4, 5, 6, 7, n8, 9)) return 7;
+    if (t_va(0, 1L, 2L, 3L, 4L, 5L, n16, 8L)) return 8;
+    return 0;
+}
+"#
+    );
+
+    let callee_c = create_c_file("a64_pair_callee", &callee_src);
+    let caller_c = create_c_file("a64_pair_caller", &caller_src);
+    let callee_path = callee_c.path().to_string_lossy().to_string();
+    let caller_path = caller_c.path().to_string_lossy().to_string();
+
+    for opt in ["-O0", "-O2"] {
+        let mut asm_paths = Vec::new();
+        for (tag, src_path) in [("callee", &callee_path), ("caller", &caller_path)] {
+            let out = plib::tmp::Builder::new()
+                .prefix(&format!("c17_a64_pair_{tag}_"))
+                .suffix(".s")
+                .tempfile()
+                .expect("failed to create temp file");
+            let out_path = out.path().to_string_lossy().to_string();
+            let run = run_c17(&[
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                opt,
+                "-S",
+                "-o",
+                &out_path,
+                src_path,
+            ]);
+            assert!(
+                run.success,
+                "c17 failed on the {tag} at {opt}:\n{}",
+                run.stderr
+            );
+            asm_paths.push((out, out_path));
+        }
+        let callee_asm = asm_paths[0].1.clone();
+        let caller_asm = asm_paths[1].1.clone();
+
+        assert_eq!(
+            cross_link_and_run("a64_pair_ref", &[&caller_path, &callee_path]),
+            0,
+            "the gcc/gcc reference must pass, or this probe is not testing the ABI"
+        );
+        assert_eq!(
+            cross_link_and_run("a64_pair_c17_callee", &[&caller_path, &callee_asm]),
+            0,
+            "{opt}: a gcc caller must reach a c17 callee -- c17 read the \
+             16-aligned aggregate from the odd register gcc skipped"
+        );
+        assert_eq!(
+            cross_link_and_run("a64_pair_c17_caller", &[&caller_asm, &callee_path]),
+            0,
+            "{opt}: a c17 caller must reach a gcc callee -- c17 wrote the \
+             16-aligned aggregate to the odd register gcc does not read"
+        );
+        assert_eq!(
+            cross_link_and_run("a64_pair_c17_both", &[&caller_asm, &callee_asm]),
+            0,
+            "{opt}: c17 must also agree with itself"
+        );
+    }
+}

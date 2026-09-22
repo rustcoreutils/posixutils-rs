@@ -1495,9 +1495,13 @@ impl RegAlloc {
                     // so an odd NGRN skips a register. The caller applies the
                     // same rule through the same helper; disagreeing about
                     // which pair means each side reads a different one.
-                    if let Some(start) =
-                        crate::arch::aarch64::int128_pair_start(int_arg_idx, int_arg_regs.len())
-                    {
+                    if let Some(start) = crate::abi::aapcs64::gr_run_start(
+                        types,
+                        arg.typ,
+                        int_arg_idx,
+                        2,
+                        int_arg_regs.len(),
+                    ) {
                         int_arg_idx = start;
                         self.stack_offset += 16;
                         let slot = -self.stack_offset;
@@ -1529,12 +1533,22 @@ impl RegAlloc {
                 ArgClass::Direct { classes, .. }
                     if classes.len() == 2 && classes.iter().all(|c| *c == RegClass::Integer) =>
                 {
-                    if int_arg_idx + 1 < int_arg_regs.len() {
+                    // Stage C.10: a 16-aligned composite starts at an even
+                    // NGRN, the same helper the `__int128` arm above uses.
+                    if let Some(start) = crate::abi::aapcs64::gr_run_start(
+                        types,
+                        arg.typ,
+                        int_arg_idx,
+                        2,
+                        int_arg_regs.len(),
+                    ) {
+                        int_arg_idx = start;
                         self.locations
                             .insert(pseudo, Loc::Reg(int_arg_regs[int_arg_idx]));
                         self.free_regs.retain(|&r| {
                             r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
                         });
+                        int_arg_idx += 2;
                     } else {
                         let at = IncomingOff::take(
                             &mut next_incoming,
@@ -1542,8 +1556,10 @@ impl RegAlloc {
                             crate::abi::aapcs64::argument_alignment(types, arg.typ) as i32,
                         );
                         self.locations.insert(pseudo, Loc::IncomingArg(at));
+                        // Stage C.11: NGRN becomes 8, so nothing after it
+                        // takes a register either.
+                        int_arg_idx = int_arg_regs.len();
                     }
-                    int_arg_idx += 2;
                 }
                 // A zero-sized parameter is not passed at all -- AAPCS64
                 // gives it no class, which is what `Ignore` records, and the

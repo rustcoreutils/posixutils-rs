@@ -209,9 +209,14 @@ impl X86_64CodeGen {
         // Move arguments from registers to their allocated stack locations
         self.store_args_to_stack(func, types, &alloc);
 
-        // Save number of fixed GP and FP params for va_start
+        // What `va_start` will need. Taken from the allocator, which is the
+        // only place that applies the full psABI argument dispatch; a second
+        // tally here drifted from it and put `overflow_arg_area` inside the
+        // named arguments whenever one of them was X87 or MEMORY class.
         if is_variadic {
-            self.count_fixed_params(func, types);
+            self.named_gp_regs = alloc.named_gp_regs();
+            self.named_fp_regs = alloc.named_fp_regs();
+            self.named_incoming_end = alloc.named_incoming_end();
         }
 
         // Emit basic blocks
@@ -933,74 +938,6 @@ impl X86_64CodeGen {
                 }
             }
         }
-    }
-
-    /// Count and save number of fixed GP and FP params for va_start
-    fn count_fixed_params(&mut self, func: &Function, types: &TypeTable) {
-        let has_sret = func
-            .pseudos
-            .iter()
-            .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
-
-        // A struct that arrives in two registers spends two, not one -- and a
-        // mixed one spends a general register *and* an SSE register. Counting
-        // it as a single GP parameter put `va_start`'s register-save-area index
-        // one slot out, so the first variadic argument was read from the wrong
-        // place.
-        let mut gp = 0usize;
-        let mut fp = 0usize;
-        for (_, typ) in &func.params {
-            let kind = types.kind(*typ);
-            if crate::abi::param_is_ignored(*typ, types) {
-                // Occupies no register, so `va_start`'s save-area index must
-                // not count one for it.
-                continue;
-            }
-            if let Some(classes) = crate::abi::struct_param_classes(*typ, types) {
-                // Nine to sixteen bytes: one register per eightbyte, from
-                // whichever file its class names.
-                for class in &classes {
-                    if *class == crate::abi::RegClass::Sse {
-                        fp += 1;
-                    } else {
-                        gp += 1;
-                    }
-                }
-            } else if let Some(n) = crate::abi::sse_struct_regs(*typ, types) {
-                // An all-SSE aggregate: `n` XMM registers. Both the eight-byte
-                // and smaller shapes and the sixteen-byte SSE+SSEUP one -- a
-                // lone `__float128` -- land here, the latter because it answers
-                // a single class rather than the pair `struct_param_classes`
-                // above looks for.
-                fp += n;
-            } else if crate::abi::param_is_memory_class(*typ, types) {
-                // MEMORY class travels on the stack and spends no register.
-            } else if types.is_complex_float(*typ) {
-                // Two XMMs for `double _Complex`, one for `float _Complex`
-                // (both halves in one eightbyte), none for
-                // `long double _Complex`, which is COMPLEX_X87 and is passed
-                // in memory.
-                fp += complex_sse_regs(types, *typ);
-            } else if kind == TypeKind::Int128 && !types.is_complex(*typ) {
-                gp += 2;
-            } else if types.is_float(*typ) {
-                if kind != TypeKind::LongDouble {
-                    fp += 1;
-                }
-            } else {
-                gp += 1;
-            }
-        }
-        self.num_fixed_gp_params = gp;
-        if has_sret {
-            self.num_fixed_gp_params += 1; // Account for hidden sret pointer
-        }
-        self.num_fixed_fp_params = fp;
-
-        // Count fixed params that overflow to the stack (beyond register capacity)
-        let gp_overflow = self.num_fixed_gp_params.saturating_sub(6);
-        let fp_overflow = self.num_fixed_fp_params.saturating_sub(8);
-        self.num_fixed_stack_params = gp_overflow + fp_overflow;
     }
 
     /// Emit return instruction: move return value to registers and emit epilogue

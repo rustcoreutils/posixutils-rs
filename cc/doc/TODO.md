@@ -558,8 +558,8 @@ work, and were never a claim about the language.
 
 | Suite | Note |
 |-------|------|
-| GCC torture tests (C99 subset) | **Running.** `cc/scripts/c17_torture.sh`, baselined |
-| clang test suite (C99 subset) | Not run against c17 |
+| GCC torture tests | **Running.** `cc/scripts/c17_torture.sh`, baselined. The whole `execute/` directory, in C17 mode -- `dg_scan` strips `-std=` rather than selecting a dialect |
+| clang test suite | Not run against c17 |
 
 **Reclassified 2026-08-21.** These are no longer only test-coverage work. A
 hand-written differential probe of nine ordinary constructs against
@@ -573,7 +573,7 @@ page.
 external checkout (the suite is GPLv3 and is not vendored) and diffs a recorded
 baseline, so a regression fails rather than shifting a percentage.
 
-`execute/` went from **58.5% to 99.12% of what is attempted** (3055 of 3082
+`execute/` went from **58.5% to 99.19% of what is attempted** (3057 of 3082
 instances; 1986 of 3396 at the start, 1698 tests run at -O0 and -O2) over one
 series: the libc-alias builtins,
 `-fpermissive`, `__complex__`, bare `alloca`, `va_arg` of a small struct,
@@ -590,8 +590,8 @@ One conformance gap found while chasing those and not yet fixed: c17 has no
 C17 6.7.3p2 check, so `restrict int x;` is accepted where gcc errors that
 `restrict` may only qualify a pointer to object type.
 
-**What is left — 8 run failures and 19 compile failures.** Of 3396 instances:
-3055 pass, 314 are skipped and 27 fail. **3055 of 3082 attempted, 99.12%.**
+**What is left — 6 run failures and 19 compile failures.** Of 3396 instances:
+3057 pass, 314 are skipped and 25 fail. **3057 of 3082 attempted, 99.19%.**
 
 ### Out of scope, and so skipped rather than counted
 
@@ -641,13 +641,13 @@ for `(-9 + 38i) / (5 + 6i)` exactly as gcc does.
 
 ### Still open
 
-27 instances across 18 tests, and two thirds of them are one thing.
+25 instances across 17 tests, and half of them are one thing.
 
 | Group | Inst | Note |
 |---|---|---|
 | Dead-call elimination proofs | 13 | `20011115-1`, `20020720-1`, `20030216-1`, `20030330-1`, `20041114-1`, `compare-3`, `medce-1`, `pure-1`, `shiftopt-1`, `stdarg-4`. Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link* at -O2 only. Standard C, and optimizer strength rather than a defect -- building real dead-code and value-range analysis would improve -O2 generally, well beyond these tests |
-| Missing optimizations behind `__OPTIMIZE__` | 4 | `20030125-1`, `builtin-constant`. Same class: the tests only assert them when the optimizer is on |
-| `va_arg` tail | 6 | `pr44942` (`long double`), `pr92904` (`__int128`), `va-arg-22` (21 struct sizes from 0 to 72 bytes). Real ABI work on both targets |
+| Missing optimizations behind `__OPTIMIZE__` | 2 | `20030125-1`, `builtin-constant`. Same class: the tests only assert them when the optimizer is on, and each fails at `-O2` only |
+| `va_arg` tail | 4 | `pr92904` (`__int128`), `va-arg-22` (a zero-sized struct among 21 sizes). Real ABI work on both targets |
 | Address of a string-literal element as a constant | 2 | `921019-1`: `(void *)&("X"[0])` in a static initializer |
 | The two divergences above | 4 | `991014-1`, `920728-1` |
 

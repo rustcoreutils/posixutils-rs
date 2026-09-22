@@ -58,11 +58,11 @@ impl X86_64CodeGen {
         // va_list is a 24-byte struct. We initialize:
         // - gp_offset = fixed_gp_params * 8 (offset to first variadic GP arg in save area)
         // - fp_offset = 48 + fixed_fp_params * 16 (offset to first variadic FP arg)
-        // - overflow_arg_area = rbp + 16 (where stack args start, for overflow)
+        // - overflow_arg_area = where the variadic stack arguments begin
         // - reg_save_area = pointer to where we saved the argument registers
 
-        let gp_offset = (self.num_fixed_gp_params * 8) as i32;
-        let fp_offset = 48 + (self.num_fixed_fp_params * 16) as i32;
+        let gp_offset = (self.named_gp_regs * 8) as i32;
+        let fp_offset = 48 + (self.named_fp_regs * 16) as i32;
         let reg_save_base = self.reg_save_area_offset;
 
         match ap_loc {
@@ -82,10 +82,13 @@ impl X86_64CodeGen {
                     src: GpOperand::Imm(fp_offset as i64),
                     dst: GpOperand::Mem(self.stack_field(offset, 4)),
                 });
-                // overflow_arg_area = rbp + 16 + (fixed_stack_params * 8)
-                // Skip past fixed parameters that were passed on the stack
-                // (when there are >6 int or >8 FP fixed params)
-                let overflow_offset = 16 + (self.num_fixed_stack_params * 8) as i32;
+                // Past every named parameter that occupies the incoming
+                // area -- which is not the same as every named parameter that
+                // overflowed a register file. An X87 or MEMORY-class named
+                // parameter takes bytes here and no register at all, and
+                // alignment may pad between them, so the allocator hands us
+                // the displacement rather than a slot count.
+                let overflow_offset = self.named_incoming_end;
                 self.push_lir(X86Inst::Lea {
                     // Not a stack slot: the overflow argument area is a real
                     // `%rbp + 16` address, above the return address, where the
@@ -130,8 +133,9 @@ impl X86_64CodeGen {
                     src: GpOperand::Imm(fp_offset as i64),
                     dst: GpOperand::Mem(MemAddr::BaseOffset { base: r, offset: 4 }),
                 });
-                // overflow_arg_area = rbp + 16 + (fixed_stack_params * 8)
-                let overflow_offset = 16 + (self.num_fixed_stack_params * 8) as i32;
+                // Past every named parameter that occupies the incoming
+                // area; see the sibling arm above.
+                let overflow_offset = self.named_incoming_end;
                 self.push_lir(X86Inst::Lea {
                     // Not a stack slot: the overflow argument area is a real
                     // `%rbp + 16` address, above the return address, where the

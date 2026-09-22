@@ -7400,6 +7400,125 @@ int main(void)
     );
 }
 
+/// `va_start` must point `overflow_arg_area` past the named parameters that
+/// live *there*, not merely past the ones that overflowed a register file.
+///
+/// A named `long double` is X87 class and a named aggregate over sixteen bytes
+/// is MEMORY class: per System V AMD64 psABI 3.2.3 each occupies real bytes in
+/// the incoming argument area while consuming no register at all. The old
+/// tally counted only `max(gp - 6, 0) + max(fp - 8, 0)` eight-byte slots, so
+/// it charged nothing for either, and the first variadic argument was read
+/// from inside the named ones. `IncomingOff::take`'s alignment padding is
+/// invisible to such a tally for the same reason.
+///
+/// The `-O2` run is not redundant: the defect is in the prologue, which the
+/// optimizer does not touch, but the allocator the values now come from does
+/// behave differently once values are folded away.
+#[test]
+fn codegen_va_start_past_named_memory_class_params() {
+    let code = r#"
+#include <stdarg.h>
+
+struct Big { long q[3]; };          /* 24 bytes, MEMORY class */
+
+/* Six named ints fill the GP file, `g` stacks, then a stacked long double. */
+__attribute__((noinline)) static int
+after_ld(int a, int b, int c, int d, int e, int f, int g, long double h, ...)
+{
+    va_list ap; va_start(ap, h);
+    int v = va_arg(ap, int);
+    va_end(ap);
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h;
+    return v;
+}
+
+/* Four long doubles interleaved with ints, all past the register files. */
+__attribute__((noinline)) static int
+interleaved(int a, int b, int c, int d, int e, int f, int g, long double h,
+            int i, long double j, int k, long double l, int m, long double n, ...)
+{
+    va_list ap; va_start(ap, n);
+    int v = va_arg(ap, int);
+    va_end(ap);
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g;
+    (void)h; (void)i; (void)j; (void)k; (void)l; (void)m; (void)n;
+    return v;
+}
+
+/* Seven doubles stay in XMM0-6, so only the long double is stacked. The
+   variadic double comes out of the SSE save area and never consults
+   `overflow_arg_area` -- a control that must keep passing. */
+__attribute__((noinline)) static double
+fp_only(double a, double b, double c, double d, double e, double f, double g,
+        long double h, ...)
+{
+    va_list ap; va_start(ap, h);
+    double v = va_arg(ap, double);
+    va_end(ap);
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h;
+    return v;
+}
+
+/* A MEMORY-class aggregate alone: no register overflowed, yet 24 bytes of the
+   incoming area are occupied.
+   The first six variadic arguments come out of the GP save area and so prove
+   nothing; the seventh is the first to consult `overflow_arg_area`, which is
+   why the list is this long. */
+__attribute__((noinline)) static int
+after_big(struct Big s, ...)
+{
+    va_list ap; va_start(ap, s);
+    int v = 0;
+    for (int n = 0; n < 7; n++) v = va_arg(ap, int);
+    va_end(ap);
+    (void)s;
+    return v;
+}
+
+/* Over-aligned, so `IncomingOff::take` inserts padding the old tally could
+   not express either. Same seven-argument reason. */
+struct __attribute__((aligned(16))) Wide { long q[3]; };
+
+__attribute__((noinline)) static int
+after_wide(int a, struct Wide s, ...)
+{
+    va_list ap; va_start(ap, s);
+    int v = 0;
+    for (int n = 0; n < 7; n++) v = va_arg(ap, int);
+    va_end(ap);
+    (void)a; (void)s;
+    return v;
+}
+
+int main(void)
+{
+    struct Big  bg = { { 1, 2, 3 } };
+    struct Wide wd = { { 1, 2, 3 } };
+
+    if (after_ld(1, 2, 3, 4, 5, 6, 7, 8.0L, 1234) != 1234) return 1;
+    if (interleaved(1, 2, 3, 4, 5, 6, 7, 8.0L, 9, 10.0L, 11, 12.0L, 13, 14.0L,
+                    1234) != 1234) return 2;
+    if (fp_only(1, 2, 3, 4, 5, 6, 7, 8.0L, 1234.0) != 1234.0) return 3;
+    if (after_big(bg, 1, 2, 3, 4, 5, 6, 1234) != 1234) return 4;
+    if (after_wide(1, wd, 1, 2, 3, 4, 5, 6, 1234) != 1234) return 5;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_va_start_named_memory", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run(
+            "codegen_va_start_named_memory_o2",
+            code,
+            &["-O2".to_string()]
+        ),
+        0
+    );
+}
+
 /// A local whose alignment exceeds the stack's own forces the frame to be
 /// addressed through a second base register. That register was still in the
 /// allocatable pool, so the colorer handed it to an ordinary value and the

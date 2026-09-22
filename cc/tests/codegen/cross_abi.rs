@@ -2485,3 +2485,127 @@ int call(struct A32 s)
         "the 32-aligned argument must start at 96, not at the next granule:\n{body}"
     );
 }
+
+/// Darwin's `va_arg` reads a whole argument and advances by its whole slot.
+///
+/// Darwin has its own emitters on both sides of a variadic call, and three
+/// separate fixes in this area reached the AAPCS64 one and not this one --
+/// each time caller and reader stayed wrong together, so every c17-only
+/// program agreed with itself and only macOS CI disagreed. There is no macOS
+/// runner here and qemu cannot run Mach-O, so this is the check that runs
+/// locally.
+///
+/// Two numbers per type, and both have been wrong: the bytes read from the
+/// cursor (an `__int128` had one eightbyte copied and the other left as
+/// whatever the destination held) and the advance, which is the slot
+/// `darwin_va_slot` hands the caller.
+///
+/// `BIG24` is the row that is not its own size either way: a non-homogeneous
+/// aggregate past sixteen bytes travels as a pointer, so one eightbyte is
+/// read from the cursor and the object comes through it.
+#[test]
+fn codegen_darwin_va_arg_reads_a_whole_argument() {
+    let src = r#"
+#include <stdarg.h>
+typedef struct { long long a, b; } G16;
+typedef struct { double a, b, c, d; } H32;
+typedef struct { long long a, b, c; } BIG24;
+#define MK(name, T) T name(int n, ...) \
+    { va_list ap; va_start(ap, n); T v = va_arg(ap, T); va_end(ap); return v; }
+MK(f_long, long)
+MK(f_dbl, double)
+MK(f_i128, __int128)
+MK(f_g16, G16)
+MK(f_h32, H32)
+MK(f_big, BIG24)
+"#;
+    let asm = asm_for("darwin_va_slots", "aarch64-apple-darwin", src);
+
+    for (func, read, advance, why) in [
+        ("f_long", 8, 8, "a long is one granule"),
+        ("f_dbl", 8, 8, "a double is one granule"),
+        (
+            "f_i128",
+            16,
+            16,
+            "an __int128 is two eightbytes and two granules, not one of each",
+        ),
+        ("f_g16", 16, 16, "a sixteen-byte composite is its own size"),
+        ("f_h32", 32, 32, "a thirty-two-byte HFA is its own size"),
+        (
+            "f_big",
+            8,
+            8,
+            "a non-HFA past sixteen bytes travels as a pointer",
+        ),
+    ] {
+        let body = body_of(&asm, func);
+        let lines: Vec<&str> = body.lines().map(str::trim).collect();
+
+        // The cursor is the register that advances into itself; everything
+        // else here computes a frame address into a different one.
+        let mut cursor = None;
+        let mut advances = Vec::new();
+        for l in &lines {
+            let Some(rest) = l.strip_prefix("add ") else {
+                continue;
+            };
+            let Some((dst, rest)) = rest.split_once(", ") else {
+                continue;
+            };
+            let Some((src, imm)) = rest.split_once(", #") else {
+                continue;
+            };
+            if dst == src {
+                if let Ok(n) = imm.parse::<i64>() {
+                    cursor = Some(dst.to_string());
+                    advances.push(n);
+                }
+            }
+        }
+        let cursor =
+            cursor.unwrap_or_else(|| panic!("{func}: va_arg never advances a cursor:\n{body}"));
+        assert!(
+            advances.contains(&advance),
+            "{func}: {why}, so the cursor must advance by {advance}; \
+             found {advances:?}\n{body}"
+        );
+
+        // How far past the cursor the argument is read. `emit_va_arg_bytes`
+        // walks it in descending chunk sizes, so the last offset plus its
+        // width is the whole of what was copied.
+        let mut read_end = 0i64;
+        for l in &lines {
+            let (op, rest) = match (l.strip_prefix("ldr "), l.strip_prefix("ldp ")) {
+                (Some(r), _) => ("ldr", r),
+                (_, Some(r)) => ("ldp", r),
+                _ => continue,
+            };
+            let Some((regs, addr)) = rest.rsplit_once(", [") else {
+                continue;
+            };
+            let addr = addr.trim_end_matches(']');
+            let (base, off) = match addr.split_once(", #") {
+                Some((b, o)) => (b, o.parse::<i64>().unwrap_or(0)),
+                None => (addr, 0),
+            };
+            if base != cursor {
+                continue;
+            }
+            // A `w` destination moves four bytes, an `x` one eight, and `ldp`
+            // moves two of them.
+            let width = if regs.trim_start().starts_with('w') {
+                4
+            } else {
+                8
+            };
+            let width = if op == "ldp" { width * 2 } else { width };
+            read_end = read_end.max(off + width);
+        }
+        assert_eq!(
+            read_end, read,
+            "{func}: {why}, so {read} bytes must be read from the cursor \
+             {cursor}, not {read_end}\n{body}"
+        );
+    }
+}

@@ -7922,7 +7922,19 @@ int main(void)
     struct A32 s = { 1, 2, 3, 4 };
     if (named(7, s, 9)) return 1;
     if (variadic(0, s, 9)) return 2;
+#if !defined(__APPLE__)
+    /* Not against clang: it disagrees with itself here, so no compiler can
+       satisfy this in both directions. Measured twice on macOS CI -- its
+       caller stacks the over-aligned aggregate at the next eight-byte
+       granule (offset 72) and its `va_arg` rounds the cursor up to the
+       type's 32, reading offset 96. A program built entirely with clang
+       has the same defect. Whichever of the two c17 matches, the other
+       direction of this cross-check fails; `cc/doc/TODO.md` records which.
+       The pure-c17 runs above still cover the shape, and the named
+       argument and the no-leading-argument variadic are checked against
+       clang in both directions. */
     if (variadic(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, s, 9)) return 3;
+#endif
     return 0;
 }
 "#;

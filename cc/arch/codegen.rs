@@ -529,46 +529,82 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             Initializer::String(s) => {
                 // Emit string as .ascii (without null terminator)
                 // Then zero-fill the remaining bytes (which includes the null terminator)
-                self.push_directive(Directive::Ascii(escape_string(s)));
-                // Each char in the parsed string represents one C byte (0-255).
-                // Use chars().count() not len() since len() counts UTF-8 bytes.
-                let bytes_emitted = s.chars().count();
+                //
+                // Truncated to the object's own size first. A string literal
+                // longer than the array it initializes is a constraint
+                // violation that gcc accepts with a warning and truncates --
+                // and emitting all of it wrote *past* the object: with
+                // `const char a[2][3] = { "1234", "xyz" };` the excess `4`
+                // landed on the second row, and
+                // `struct { char n[3]; int tag; } s = { "wxyz", 7 };` pushed
+                // `tag` one byte along and read back 1792 instead of 7.
+                //
+                // Each char in the parsed payload represents one C byte
+                // (0-255), so `chars()` counts and truncates in bytes where
+                // `len()` would count UTF-8.
+                //
+                // A size of zero means the object has no bound of its own --
+                // a flexible array member, `struct { char c; char f[]; }`,
+                // whose extent the initializer is what establishes. There is
+                // nothing to truncate to, so the literal is emitted whole.
+                let room = if size == 0 { usize::MAX } else { size };
+                let kept: String = s.chars().take(room).collect();
+                let bytes_emitted = kept.chars().count();
+                self.push_directive(Directive::Ascii(escape_string(&kept)));
                 if size > bytes_emitted {
                     self.push_directive(Directive::Zero(size - bytes_emitted));
                 }
             }
             Initializer::WideString(s) => {
                 // Emit wide string as sequence of 4-byte values (wchar_t = int)
-                let char_count = s.chars().count();
-                for ch in s.chars() {
+                // -- at most as many as fit, for the reason `String` truncates.
+                // A flexible array member has no bound; see `String`.
+                let room = if size == 0 { usize::MAX } else { size / 4 };
+                let mut emitted = 0;
+                for ch in s.chars().take(room) {
                     self.push_directive(Directive::Long(ch as i64));
+                    emitted += 4;
                 }
-                // Null terminator
-                self.push_directive(Directive::Long(0));
-                // Zero-fill remaining bytes if array is larger than string
-                let wide_string_bytes = (char_count + 1) * 4; // +1 for null terminator, 4 bytes each
-                if size > wide_string_bytes {
-                    self.push_directive(Directive::Zero(size - wide_string_bytes));
+                // The null terminator is part of the value only when there is
+                // room for it: `wchar_t w[3] = L"abc"` holds no terminator.
+                if size == 0 || emitted + 4 <= size {
+                    self.push_directive(Directive::Long(0));
+                    emitted += 4;
+                }
+                if size > emitted {
+                    self.push_directive(Directive::Zero(size - emitted));
                 }
             }
             Initializer::Utf16String(units) => {
                 // char16_t: 2 bytes per code unit.
-                for &u in units {
+                // A flexible array member has no bound; see `String`.
+                let room = if size == 0 { usize::MAX } else { size / 2 };
+                let mut emitted = 0;
+                for &u in units.iter().take(room) {
                     self.push_directive(Directive::Short(u as i64));
+                    emitted += 2;
                 }
-                self.push_directive(Directive::Short(0));
-                let emitted = (units.len() + 1) * 2;
+                if size == 0 || emitted + 2 <= size {
+                    self.push_directive(Directive::Short(0));
+                    emitted += 2;
+                }
                 if size > emitted {
                     self.push_directive(Directive::Zero(size - emitted));
                 }
             }
             Initializer::Utf32String(units) => {
                 // char32_t: 4 bytes per code point.
-                for &u in units {
+                // A flexible array member has no bound; see `String`.
+                let room = if size == 0 { usize::MAX } else { size / 4 };
+                let mut emitted = 0;
+                for &u in units.iter().take(room) {
                     self.push_directive(Directive::Long(u as i64));
+                    emitted += 4;
                 }
-                self.push_directive(Directive::Long(0));
-                let emitted = (units.len() + 1) * 4;
+                if size == 0 || emitted + 4 <= size {
+                    self.push_directive(Directive::Long(0));
+                    emitted += 4;
+                }
                 if size > emitted {
                     self.push_directive(Directive::Zero(size - emitted));
                 }

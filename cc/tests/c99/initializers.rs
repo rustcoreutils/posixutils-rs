@@ -2124,3 +2124,165 @@ fn c99_global_initializer_rejects_non_constant_condition() {
         stderr
     );
 }
+
+/// A string literal longer than the object it initializes is truncated, not
+/// written past the end.
+///
+/// gcc accepts the over-long form with a warning and keeps only what fits.
+/// c17 emitted the whole literal, so the excess landed on whatever came
+/// next: with `const char a[2][3] = { "1234", "xyz" };` the stray `4`
+/// overwrote the second row, and `struct { char n[3]; int tag; } s =
+/// { "wxyz", 7 };` pushed `tag` one byte along, reading back 1792 instead
+/// of 7.
+///
+/// The wide variants had the same defect, plus one of their own: the null
+/// terminator is part of the value only when there is room for it, so
+/// `wchar_t w[3] = L"abc"` holds three characters and no terminator.
+///
+/// The torture test is `pr86714`, which only reaches the narrow array case.
+#[test]
+fn c99_over_long_string_initializer_is_truncated() {
+    let code = r#"
+typedef __WCHAR_TYPE__ wch;
+typedef __CHAR16_TYPE__ c16;
+typedef __CHAR32_TYPE__ c32;
+
+struct S { char n[3]; int tag; };
+struct WS { wch n[3]; int tag; };
+struct US { c16 n[2]; int tag; };
+struct TS { c32 n[2]; int tag; };
+
+/* Narrow: an over-long row must not reach the next one. */
+const char rows[2][3] = { "1234", "xyz" };
+const char one[3] = "12345";
+const char tight[3] = "abc";          /* exactly fills, no terminator */
+const char roomy[2][4] = { "abc", "def" };   /* the ordinary case */
+const struct S s = { "wxyz", 7 };
+
+wch w_room[4] = L"abc";
+wch w_tight[3] = L"abc";
+wch w_over[2] = L"abcd";
+const struct WS ws = { L"abcd", 9 };
+
+c16 u16_tight[3] = u"abc";
+c16 u16_over[2] = u"abcd";
+const struct US us = { u"abcd", 5 };
+
+c32 u32_tight[3] = U"abc";
+const struct TS ts = { U"abcd", 6 };
+
+int main(void) {
+    if (rows[0][0] != '1' || rows[0][1] != '2' || rows[0][2] != '3') return 1;
+    if (rows[1][0] != 'x' || rows[1][1] != 'y' || rows[1][2] != 'z') return 2;
+    if (one[0] != '1' || one[1] != '2' || one[2] != '3') return 3;
+    if (tight[0] != 'a' || tight[1] != 'b' || tight[2] != 'c') return 4;
+    if (roomy[0][0] != 'a' || roomy[0][3] != '\0') return 5;
+    if (roomy[1][0] != 'd' || roomy[1][3] != '\0') return 6;
+    if (s.n[0] != 'w' || s.n[1] != 'x' || s.n[2] != 'y') return 7;
+    if (s.tag != 7) return 8;
+
+    /* Wide: the terminator only when it fits. */
+    if (w_room[0] != L'a' || w_room[2] != L'c' || w_room[3] != 0) return 9;
+    if (w_tight[0] != L'a' || w_tight[1] != L'b' || w_tight[2] != L'c') return 10;
+    if (w_over[0] != L'a' || w_over[1] != L'b') return 11;
+    if (ws.n[0] != L'a' || ws.n[2] != L'c' || ws.tag != 9) return 12;
+
+    if (u16_tight[0] != u'a' || u16_tight[2] != u'c') return 13;
+    if (u16_over[0] != u'a' || u16_over[1] != u'b') return 14;
+    if (us.n[0] != u'a' || us.n[1] != u'b' || us.tag != 5) return 15;
+
+    if (u32_tight[0] != U'a' || u32_tight[2] != U'c') return 16;
+    if (ts.n[0] != U'a' || ts.n[1] != U'b' || ts.tag != 6) return 17;
+
+    /* The same shapes as automatic and static-local objects, which take
+       their own emission paths. */
+    {
+        char a[2][3] = { "1234", "xyz" };
+        if (a[0][2] != '3' || a[1][0] != 'x') return 18;
+        struct S ls = { "wxyz", 7 };
+        if (ls.n[2] != 'y' || ls.tag != 7) return 19;
+    }
+    {
+        static char a[2][3] = { "1234", "xyz" };
+        if (a[0][2] != '3' || a[1][0] != 'x') return 20;
+        static struct S ls = { "wxyz", 7 };
+        if (ls.n[2] != 'y' || ls.tag != 7) return 21;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_over_long_string_init", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_over_long_string_init_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// A union's first member for a positional initializer may be an anonymous
+/// aggregate.
+///
+/// C17 6.7.9p17 initializes a union's first member, and 6.7.2.1p13 makes the
+/// members of an anonymous structure members of the union itself -- so the
+/// anonymous structure *is* that first member. c17 searched for the first
+/// member with a *name* and so skipped it:
+///
+///   union { struct { int a, b; }; long q; } u = {{1,2}};
+///
+/// wrote `{1,2}` into `q` and left `b` zero, and a union whose members are
+/// all anonymous found none at all and stayed entirely zero -- which is the
+/// torture test `pr87053`, where two anonymous structures overlay the same
+/// eight bytes.
+#[test]
+fn c99_union_first_member_may_be_anonymous() {
+    let code = r#"
+/* Two anonymous structures over the same bytes: the first one initializes,
+   and the second must read what it wrote. */
+const union {
+    struct { char x[4]; char y[4]; };
+    struct { char z[8]; };
+} overlay = {{"1234", "567"}};
+
+/* An anonymous structure ahead of a named member. */
+union AB { struct { int a; int b; }; long q; } ab = {{1, 2}};
+/* The designated spelling, which already worked, must keep working. */
+union AB ab_desig = {.a = 3, .b = 4};
+union AB ab_other = {.q = 5};
+/* A named first member is unchanged. */
+union NM { struct { int a; int b; } s; long q; } nm = {{6, 7}};
+/* A plain union, and an anonymous union inside a struct. */
+union P { int i; long q; } p = {8};
+struct WithAnon { struct { int a; int b; }; int t; } wa = {{9, 10}, 11};
+/* An unnamed bit-field must still be skipped, not chosen. */
+union BF { unsigned : 3; int v; } bf = {12};
+
+int main(void) {
+    if (sizeof(overlay) != 8) return 1;
+    if (overlay.x[0] != '1' || overlay.x[3] != '4') return 2;
+    if (overlay.y[0] != '5' || overlay.y[2] != '7') return 3;
+    if (overlay.z[0] != '1' || overlay.z[6] != '7' || overlay.z[7] != '\0') return 4;
+    if (__builtin_strlen(overlay.z) != 7) return 5;
+
+    if (ab.a != 1 || ab.b != 2) return 6;
+    if (ab_desig.a != 3 || ab_desig.b != 4) return 7;
+    if (ab_other.q != 5) return 8;
+    if (nm.s.a != 6 || nm.s.b != 7) return 9;
+    if (p.i != 8) return 10;
+    if (wa.a != 9 || wa.b != 10 || wa.t != 11) return 11;
+    if (bf.v != 12) return 12;
+
+    /* The same shapes as automatic and static-local objects. */
+    {
+        union AB l = {{13, 14}};
+        if (l.a != 13 || l.b != 14) return 13;
+        static union AB s = {{15, 16}};
+        if (s.a != 15 || s.b != 16) return 14;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_union_anon_first", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_union_anon_first_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

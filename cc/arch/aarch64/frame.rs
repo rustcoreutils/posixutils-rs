@@ -77,18 +77,32 @@ impl Aarch64CodeGen {
         let callee_saved_fp_pairs = callee_saved_fp.len().div_ceil(2);
         let callee_saved_fp_size = callee_saved_fp_pairs as i32 * 16; // 8 bytes per d-reg, 16 per pair
         let callee_saved_size = callee_saved_gp_size + callee_saved_fp_size;
-        let total_frame = 16 + callee_saved_size + stack_size + reg_save_area_size;
+
+        // Track register save area offset for va_start (offset from FP).
+        // Layout: [fp/lr][GP callee-saved][FP callee-saved][locals][reg_save_area]
+        //
+        // Rounded to 16, which is not cosmetic: the SIMD half is written with
+        // `str q`, and that instruction's immediate is either scaled by 16 or
+        // unscaled within +/-256. An offset that is neither -- which is what
+        // an odd `stack_size` produces -- has no encoding at all, and the
+        // assembler rejects the function outright ("immediate offset out of
+        // range"). `q0` at 223 assembles as the unscaled form and `q5` at 303
+        // does not, so the failure appears only once the frame is large
+        // enough, which is why an over-aligned local is what surfaces it.
+        //
+        // `x29` is 16-aligned at any public interface, so a 16-aligned
+        // displacement from it keeps every slot 16-aligned too.
+        let save_area_base = (16 + callee_saved_size + stack_size + 15) & !15;
+        self.reg_save_area_offset = if is_variadic { save_area_base } else { 0 };
+
+        // The padding the rounding introduces has to be inside the frame.
+        let total_frame = if is_variadic {
+            save_area_base + reg_save_area_size
+        } else {
+            16 + callee_saved_size + stack_size
+        };
         // Ensure 16-byte alignment
         let total_frame = (total_frame + 15) & !15;
-
-        // Track register save area offset for va_start (offset from FP)
-        // Layout: [fp/lr][GP callee-saved][FP callee-saved][locals][reg_save_area]
-        // The save area is at FP + 16 + callee_saved_size + stack_size
-        self.reg_save_area_offset = if is_variadic {
-            16 + callee_saved_size + stack_size
-        } else {
-            0
-        };
 
         // Save function name, frame size, and callee-saved size for label generation and offset calculation
         // Local labels are derived from this and are compiler-internal, so

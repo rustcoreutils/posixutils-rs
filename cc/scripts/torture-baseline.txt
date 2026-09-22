@@ -2910,6 +2910,8 @@ stdarg-2@-O0
 stdarg-2@-O2
 stdarg-3@-O0
 stdarg-3@-O2
+stdarg-4@-O0
+stdarg-4@-O2
 stkalign@-O0
 stkalign@-O2
 strcmp-1@-O0

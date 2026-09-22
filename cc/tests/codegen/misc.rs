@@ -7519,6 +7519,106 @@ int main(void)
     );
 }
 
+/// An `always_inline` helper that consumes a `va_list` must actually be
+/// inlined, and the caller's `ap` must come back advanced.
+///
+/// `analyze_all_functions` set one `uses_varargs` flag for `va_start`,
+/// `va_arg`, `va_end` and `va_copy` alike, and `should_inline` refused such a
+/// callee *above* the `always_inline` check. A C99 inline definition has no
+/// out-of-line copy, so the call was left pointing at a symbol that was never
+/// emitted -- `undefined reference to 'f1i'`.
+///
+/// The two are not the same thing. `va_start` reads the enclosing function's
+/// register save area and named-parameter counts, neither of which survives a
+/// splice; `va_arg` on a `va_list` that arrived as a parameter is a
+/// read-modify-write through a pointer, and C99 requires the caller to see the
+/// advance -- which is what the second and third calls below check.
+#[test]
+fn codegen_always_inline_over_a_va_list() {
+    let code = r#"
+#include <stdarg.h>
+
+long x, y;
+
+inline void __attribute__((always_inline)) f1i(va_list ap)
+{
+    x = va_arg(ap, double);
+    x += va_arg(ap, long);
+    x += va_arg(ap, double);
+}
+
+void f1(int i, ...)
+{
+    va_list ap;
+    va_start(ap, i);
+    f1i(ap);
+    va_end(ap);
+}
+
+/* Two levels: f2i consumes three of its own and then hands the *advanced*
+   `ap` to f1i. If the splice did not share the caller's va_list, f1i would
+   re-read what f2i already took. */
+inline void __attribute__((always_inline)) f2i(va_list ap)
+{
+    y = va_arg(ap, int);
+    y += va_arg(ap, long);
+    y += va_arg(ap, double);
+    f1i(ap);
+}
+
+void f2(int i, ...)
+{
+    va_list ap;
+    va_start(ap, i);
+    f2i(ap);
+    va_end(ap);
+}
+
+/* The enclosing function takes some arguments itself before delegating. */
+void f4(int i, ...)
+{
+    va_list ap;
+    va_start(ap, i);
+    y = va_arg(ap, double);
+    f1i(ap);
+    va_end(ap);
+}
+
+int main(void)
+{
+    f1(3, 16.0, 128L, 32.0);
+    if (x != 176L) return 1;
+
+    f2(6, 5, 7L, 18.0, 19.0, 17L, 64.0);
+    if (x != 100L || y != 30L) return 2;
+
+    f4(4, 6.0, 9.0, 16L, 18.0);
+    if (x != 43L || y != 6L) return 3;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_always_inline_va_list", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run(
+            "codegen_always_inline_va_list_o2",
+            code,
+            &["-O2".to_string()]
+        ),
+        0
+    );
+    for opt in ["-O0", "-O2"] {
+        if let Some(status) =
+            compile_and_run_aarch64("codegen_always_inline_va_list_a64", code, opt)
+        {
+            assert_eq!(status, 0, "aarch64 at {opt}");
+        }
+    }
+}
+
 /// An argument more aligned than the call boundary needs the outgoing area's
 /// *base* aligned, not just its offset within the area.
 ///

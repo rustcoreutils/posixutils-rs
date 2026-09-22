@@ -611,13 +611,9 @@ impl X86_64CodeGen {
                         let base = match arg_loc {
                             Loc::Reg(r) => r,
                             Loc::Stack(offset) => {
-                                let adjusted = offset + self.callee_saved_offset;
                                 self.push_lir(X86Inst::Mov {
                                     size: OperandSize::B64,
-                                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                                        base: Reg::Rbp,
-                                        offset: -adjusted,
-                                    }),
+                                    src: GpOperand::Mem(self.stack_mem(offset)),
                                     dst: GpOperand::Reg(Reg::R11),
                                 });
                                 Reg::R11
@@ -767,7 +763,6 @@ impl X86_64CodeGen {
 
         match arg_loc {
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 // A symbol's slot *is* the complex value; a temp's slot holds
                 // a pointer to it. A call returning complex yields the former
                 // (`__cret_N`), so unconditionally loading the slot as a
@@ -781,18 +776,12 @@ impl X86_64CodeGen {
                 if is_symbol {
                     self.push_lir(X86Inst::Lea {
                         dst: Reg::R11,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        },
+                        addr: self.stack_mem(offset),
                     });
                 } else {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
+                        src: GpOperand::Mem(self.stack_mem(offset)),
                         dst: GpOperand::Reg(Reg::R11),
                     });
                 }
@@ -1002,22 +991,15 @@ impl X86_64CodeGen {
     fn handle_two_reg_return(&mut self, dst_loc: &Loc) {
         match dst_loc {
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    }),
+                    dst: GpOperand::Mem(self.stack_mem(*offset)),
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::Rdx),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted + 8,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(*offset, 8)),
                 });
             }
             Loc::Reg(r) => {
@@ -1060,34 +1042,24 @@ impl X86_64CodeGen {
 
         match dst_loc {
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 if is_float_complex {
                     // Store entire 64-bit value from XMM0 (packed real + imag)
                     self.push_lir(X86Inst::MovFp {
                         size: FpSize::Double, // 64-bit movq
                         src: XmmOperand::Reg(XmmReg::Xmm0),
-                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
+                        dst: XmmOperand::Mem(self.stack_mem(*offset)),
                     });
                 } else {
                     // Store XMM0 (real) and XMM1 (imag) separately
                     self.push_lir(X86Inst::MovFp {
                         size: fp_size,
                         src: XmmOperand::Reg(XmmReg::Xmm0),
-                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
+                        dst: XmmOperand::Mem(self.stack_mem(*offset)),
                     });
                     self.push_lir(X86Inst::MovFp {
                         size: fp_size,
                         src: XmmOperand::Reg(XmmReg::Xmm1),
-                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted + imag_offset,
-                        }),
+                        dst: XmmOperand::Mem(self.stack_field(*offset, imag_offset)),
                     });
                 }
             }
@@ -1132,7 +1104,6 @@ impl X86_64CodeGen {
         // Order of classes determines memory layout
         match dst_loc {
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 let mut xmm_idx = 0;
                 let mut gp_idx = 0;
                 for (i, &class) in classes.iter().enumerate() {
@@ -1147,10 +1118,7 @@ impl X86_64CodeGen {
                             self.push_lir(X86Inst::MovFp {
                                 size: FpSize::Double,
                                 src: XmmOperand::Reg(xmm),
-                                dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: -adjusted + mem_offset,
-                                }),
+                                dst: XmmOperand::Mem(self.stack_field(*offset, mem_offset)),
                             });
                             xmm_idx += 1;
                         }
@@ -1159,10 +1127,7 @@ impl X86_64CodeGen {
                             self.push_lir(X86Inst::Mov {
                                 size: OperandSize::B64,
                                 src: GpOperand::Reg(gp),
-                                dst: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: -adjusted + mem_offset,
-                                }),
+                                dst: GpOperand::Mem(self.stack_field(*offset, mem_offset)),
                             });
                             gp_idx += 1;
                         }
@@ -1216,22 +1181,15 @@ impl X86_64CodeGen {
     fn handle_two_sse_return(&mut self, dst_loc: &Loc) {
         match dst_loc {
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 self.push_lir(X86Inst::MovFp {
                     size: FpSize::Double,
                     src: XmmOperand::Reg(XmmReg::Xmm0),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    }),
+                    dst: XmmOperand::Mem(self.stack_mem(*offset)),
                 });
                 self.push_lir(X86Inst::MovFp {
                     size: FpSize::Double,
                     src: XmmOperand::Reg(XmmReg::Xmm1),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted + 8,
-                    }),
+                    dst: XmmOperand::Mem(self.stack_field(*offset, 8)),
                 });
             }
             Loc::Reg(r) => {

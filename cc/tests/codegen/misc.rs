@@ -7519,6 +7519,110 @@ int main(void)
     );
 }
 
+/// A register-returned aggregate must be stored through the frame's own base
+/// register, not through `%rbp`.
+///
+/// When a local's alignment exceeds the stack's, the prologue realigns `%rsp`
+/// and keeps the frame's base in a second register; `stack_mem` then addresses
+/// every local relative to that. Six sites in the call path spelled
+/// `-(slot + callee_saved_offset)(%rbp)` by hand instead, so under such a
+/// frame the return value was written to an address nothing reads back --
+/// `movq %rax, -112(%rbp)` followed by `movq 32(%rbx), %rax`. Four of the six
+/// were return paths, which is why `struct S { long long a, b; } r = make();`
+/// came back as zeros beside an `_Alignas(32)` local, in ordinary C with no
+/// varargs involved.
+///
+/// Whether it is *visible* depends on what happens to occupy the address that
+/// is written, so the levels are swept rather than trusted: the two-register
+/// integer shape came back wrong at `-O1` and right at `-O0` and `-O2`.
+#[test]
+fn codegen_aggregate_return_into_an_over_aligned_frame() {
+    let code = r#"
+struct TwoInt  { long long a, b; };            /* RAX + RDX   */
+struct TwoSse  { double a, b; };               /* XMM0 + XMM1 */
+struct Mixed   { double a; long long b; };     /* XMM0 + RAX  */
+struct MixedR  { long long a; double b; };     /* RAX + XMM0  */
+struct OneInt  { int a; };                     /* RAX         */
+struct OneSse  { float a, b; };                /* XMM0        */
+
+__attribute__((noinline)) struct TwoInt m_ti(void){ struct TwoInt s={1,2}; return s; }
+__attribute__((noinline)) struct TwoSse m_ts(void){ struct TwoSse s={1.5,2.5}; return s; }
+__attribute__((noinline)) struct Mixed  m_mx(void){ struct Mixed  s={3.5,4}; return s; }
+__attribute__((noinline)) struct MixedR m_mr(void){ struct MixedR s={5,6.5}; return s; }
+__attribute__((noinline)) struct OneInt m_oi(void){ struct OneInt s={7}; return s; }
+__attribute__((noinline)) struct OneSse m_os(void){ struct OneSse s={8.5f,9.5f}; return s; }
+__attribute__((noinline)) double _Complex m_cd(void){ return __builtin_complex(10.5, 11.5); }
+__attribute__((noinline)) float  _Complex m_cf(void){ return __builtin_complex(12.5f, 13.5f); }
+
+int main(void)
+{
+    _Alignas(32) char pad[64];          /* forces the over-aligned frame */
+
+    struct TwoInt ti = m_ti();
+    struct TwoSse ts = m_ts();
+    struct Mixed  mx = m_mx();
+    struct MixedR mr = m_mr();
+    struct OneInt oi = m_oi();
+    struct OneSse os = m_os();
+    double _Complex cd = m_cd();
+    float  _Complex cf = m_cf();
+
+    pad[0] = 1;
+    pad[63] = 2;
+
+    if (ti.a != 1 || ti.b != 2)                       return 1;
+    if (ts.a != 1.5 || ts.b != 2.5)                   return 2;
+    if (mx.a != 3.5 || mx.b != 4)                     return 3;
+    if (mr.a != 5 || mr.b != 6.5)                     return 4;
+    if (oi.a != 7)                                    return 5;
+    if (os.a != 8.5f || os.b != 9.5f)                 return 6;
+    if (__real__ cd != 10.5 || __imag__ cd != 11.5)   return 7;
+    if (__real__ cf != 12.5f || __imag__ cf != 13.5f) return 8;
+    if (pad[0] != 1 || pad[63] != 2)                  return 9;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2", "-Os"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("codegen_agg_ret_over_aligned{opt}"),
+                code,
+                &[opt.to_string()]
+            ),
+            0,
+            "at {opt}"
+        );
+    }
+
+    // The behavioural check above only fails when the address written happens
+    // to matter, so pin the property itself: in a function whose frame is
+    // realigned, no aggregate-return store may name `%rbp`.
+    let probe = r#"
+struct TwoInt { long long a, b; };
+struct TwoInt make(void);
+long realigned(void)
+{
+    _Alignas(32) char pad[64];
+    struct TwoInt r = make();
+    pad[0] = 1;
+    return r.a + r.b + pad[0];
+}
+"#;
+    let asm = asm_for_with("agg_ret_base_reg", X86_64_LINUX, probe, &["-O1"]);
+    let body = body_of(&asm, "realigned");
+    for reg in ["%rax", "%rdx"] {
+        for line in body.lines() {
+            let line = line.trim();
+            if line.starts_with(&format!("movq {reg}, ")) && line.contains("(%rbp)") {
+                panic!(
+                    "the aggregate-return store must go through the realigned \
+                     frame base, not %rbp: `{line}`\n{body}"
+                );
+            }
+        }
+    }
+}
+
 /// A zero-sized argument is not passed, so neither side may charge it a slot.
 ///
 /// System V AMD64 psABI 3.2.3 and AAPCS64 both give such a type no class --

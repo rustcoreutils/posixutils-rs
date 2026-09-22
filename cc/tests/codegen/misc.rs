@@ -13,8 +13,8 @@
 
 use crate::codegen::asm_probe::{asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
 use crate::common::{
-    compile_and_dlopen, compile_and_run, compile_and_run_optimized, compile_and_run_two_units,
-    create_c_file,
+    compile_and_dlopen, compile_and_run, compile_and_run_aarch64, compile_and_run_optimized,
+    compile_and_run_two_units, compile_with_host_cc, create_c_file,
 };
 use plib::testing::run_test_base;
 use std::io::Write;
@@ -7400,6 +7400,832 @@ int main(void)
     );
 }
 
+/// `va_start` must point `overflow_arg_area` past the named parameters that
+/// live *there*, not merely past the ones that overflowed a register file.
+///
+/// A named `long double` is X87 class and a named aggregate over sixteen bytes
+/// is MEMORY class: per System V AMD64 psABI 3.2.3 each occupies real bytes in
+/// the incoming argument area while consuming no register at all. The old
+/// tally counted only `max(gp - 6, 0) + max(fp - 8, 0)` eight-byte slots, so
+/// it charged nothing for either, and the first variadic argument was read
+/// from inside the named ones. `IncomingOff::take`'s alignment padding is
+/// invisible to such a tally for the same reason.
+///
+/// The `-O2` run is not redundant: the defect is in the prologue, which the
+/// optimizer does not touch, but the allocator the values now come from does
+/// behave differently once values are folded away.
+#[test]
+fn codegen_va_start_past_named_memory_class_params() {
+    let code = r#"
+#include <stdarg.h>
+
+struct Big { long q[3]; };          /* 24 bytes, MEMORY class */
+
+/* Six named ints fill the GP file, `g` stacks, then a stacked long double. */
+__attribute__((noinline)) static int
+after_ld(int a, int b, int c, int d, int e, int f, int g, long double h, ...)
+{
+    va_list ap; va_start(ap, h);
+    int v = va_arg(ap, int);
+    va_end(ap);
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h;
+    return v;
+}
+
+/* Four long doubles interleaved with ints, all past the register files. */
+__attribute__((noinline)) static int
+interleaved(int a, int b, int c, int d, int e, int f, int g, long double h,
+            int i, long double j, int k, long double l, int m, long double n, ...)
+{
+    va_list ap; va_start(ap, n);
+    int v = va_arg(ap, int);
+    va_end(ap);
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g;
+    (void)h; (void)i; (void)j; (void)k; (void)l; (void)m; (void)n;
+    return v;
+}
+
+/* Seven doubles stay in XMM0-6, so only the long double is stacked. The
+   variadic double comes out of the SSE save area and never consults
+   `overflow_arg_area` -- a control that must keep passing. */
+__attribute__((noinline)) static double
+fp_only(double a, double b, double c, double d, double e, double f, double g,
+        long double h, ...)
+{
+    va_list ap; va_start(ap, h);
+    double v = va_arg(ap, double);
+    va_end(ap);
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h;
+    return v;
+}
+
+/* A MEMORY-class aggregate alone: no register overflowed, yet 24 bytes of the
+   incoming area are occupied.
+   The first six variadic arguments come out of the GP save area and so prove
+   nothing; the seventh is the first to consult `overflow_arg_area`, which is
+   why the list is this long. */
+__attribute__((noinline)) static int
+after_big(struct Big s, ...)
+{
+    va_list ap; va_start(ap, s);
+    int v = 0;
+    for (int n = 0; n < 7; n++) v = va_arg(ap, int);
+    va_end(ap);
+    (void)s;
+    return v;
+}
+
+/* Over-aligned, so `IncomingOff::take` inserts padding the old tally could
+   not express either. Same seven-argument reason. */
+struct __attribute__((aligned(16))) Wide { long q[3]; };
+
+__attribute__((noinline)) static int
+after_wide(int a, struct Wide s, ...)
+{
+    va_list ap; va_start(ap, s);
+    int v = 0;
+    for (int n = 0; n < 7; n++) v = va_arg(ap, int);
+    va_end(ap);
+    (void)a; (void)s;
+    return v;
+}
+
+int main(void)
+{
+    struct Big  bg = { { 1, 2, 3 } };
+    struct Wide wd = { { 1, 2, 3 } };
+
+    if (after_ld(1, 2, 3, 4, 5, 6, 7, 8.0L, 1234) != 1234) return 1;
+    if (interleaved(1, 2, 3, 4, 5, 6, 7, 8.0L, 9, 10.0L, 11, 12.0L, 13, 14.0L,
+                    1234) != 1234) return 2;
+    if (fp_only(1, 2, 3, 4, 5, 6, 7, 8.0L, 1234.0) != 1234.0) return 3;
+    if (after_big(bg, 1, 2, 3, 4, 5, 6, 1234) != 1234) return 4;
+    if (after_wide(1, wd, 1, 2, 3, 4, 5, 6, 1234) != 1234) return 5;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_va_start_named_memory", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run(
+            "codegen_va_start_named_memory_o2",
+            code,
+            &["-O2".to_string()]
+        ),
+        0
+    );
+}
+
+/// An `always_inline` helper that consumes a `va_list` must actually be
+/// inlined, and the caller's `ap` must come back advanced.
+///
+/// `analyze_all_functions` set one `uses_varargs` flag for `va_start`,
+/// `va_arg`, `va_end` and `va_copy` alike, and `should_inline` refused such a
+/// callee *above* the `always_inline` check. A C99 inline definition has no
+/// out-of-line copy, so the call was left pointing at a symbol that was never
+/// emitted -- `undefined reference to 'f1i'`.
+///
+/// The two are not the same thing. `va_start` reads the enclosing function's
+/// register save area and named-parameter counts, neither of which survives a
+/// splice; `va_arg` on a `va_list` that arrived as a parameter is a
+/// read-modify-write through a pointer, and C99 requires the caller to see the
+/// advance -- which is what the second and third calls below check.
+#[test]
+fn codegen_always_inline_over_a_va_list() {
+    let code = r#"
+#include <stdarg.h>
+
+long x, y;
+
+inline void __attribute__((always_inline)) f1i(va_list ap)
+{
+    x = va_arg(ap, double);
+    x += va_arg(ap, long);
+    x += va_arg(ap, double);
+}
+
+void f1(int i, ...)
+{
+    va_list ap;
+    va_start(ap, i);
+    f1i(ap);
+    va_end(ap);
+}
+
+/* Two levels: f2i consumes three of its own and then hands the *advanced*
+   `ap` to f1i. If the splice did not share the caller's va_list, f1i would
+   re-read what f2i already took. */
+inline void __attribute__((always_inline)) f2i(va_list ap)
+{
+    y = va_arg(ap, int);
+    y += va_arg(ap, long);
+    y += va_arg(ap, double);
+    f1i(ap);
+}
+
+void f2(int i, ...)
+{
+    va_list ap;
+    va_start(ap, i);
+    f2i(ap);
+    va_end(ap);
+}
+
+/* The enclosing function takes some arguments itself before delegating. */
+void f4(int i, ...)
+{
+    va_list ap;
+    va_start(ap, i);
+    y = va_arg(ap, double);
+    f1i(ap);
+    va_end(ap);
+}
+
+int main(void)
+{
+    f1(3, 16.0, 128L, 32.0);
+    if (x != 176L) return 1;
+
+    f2(6, 5, 7L, 18.0, 19.0, 17L, 64.0);
+    if (x != 100L || y != 30L) return 2;
+
+    f4(4, 6.0, 9.0, 16L, 18.0);
+    if (x != 43L || y != 6L) return 3;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_always_inline_va_list", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run(
+            "codegen_always_inline_va_list_o2",
+            code,
+            &["-O2".to_string()]
+        ),
+        0
+    );
+    for opt in ["-O0", "-O2"] {
+        if let Some(status) =
+            compile_and_run_aarch64("codegen_always_inline_va_list_a64", code, opt)
+        {
+            assert_eq!(status, 0, "aarch64 at {opt}");
+        }
+    }
+}
+
+/// A variadic function's register save area must start on a 16-byte boundary.
+///
+/// The SIMD half is written with `str q`, whose immediate is either scaled by
+/// 16 or unscaled within +/-256. An offset that is neither has no encoding,
+/// and the assembler rejects the whole function with "immediate offset out of
+/// range". The save area sat at `16 + callee_saved + stack_size`, so any odd
+/// `stack_size` misaligned it -- but `q0` at 223 still assembles as the
+/// unscaled form and only `q5` at 303 does not, so the failure needs a frame
+/// large enough to push the later registers past 256. An over-aligned local
+/// is the easiest way to get one.
+///
+/// x86-64 has no such encoding limit, so this is an aarch64 regression test
+/// that happens to be written in C; the host run is there to keep it honest.
+#[test]
+fn codegen_aarch64_variadic_save_area_is_16_aligned() {
+    let code = r#"
+#include <stdarg.h>
+
+/* The over-aligned local is what inflates the frame; `pad` keeps it alive. */
+__attribute__((noinline)) static long wide_frame(int n, ...)
+{
+    _Alignas(32) double pad[9];
+    va_list ap;
+    va_start(ap, n);
+    long acc = 0;
+    for (int i = 0; i < n; i++) {
+        pad[i] = va_arg(ap, double);
+        acc += (long) pad[i];
+    }
+    va_end(ap);
+    return acc + (long) pad[0];
+}
+
+int main(void)
+{
+    if (wide_frame(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0) != 46) return 1;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_va_save_area_align", code, &[]), 0);
+    for opt in ["-O0", "-O2"] {
+        if let Some(status) = compile_and_run_aarch64("codegen_va_save_area_align_a64", code, opt) {
+            assert_eq!(status, 0, "aarch64 at {opt}");
+        }
+    }
+}
+
+/// AAPCS64 derives an argument's alignment from the members and ignores the
+/// type's own `__attribute__((aligned(N)))`.
+///
+/// c17 asked `types.alignment()`, which includes that attribute, at three
+/// aarch64 sites that then disagreed with each other: the caller and the
+/// callee both rounded a 32-byte-aligned struct's stack slot to 32, while
+/// `va_arg` capped at 16. Caller and callee agreeing is why a *named* call
+/// worked c17-to-c17 and failed against gcc; `va_arg` differing is why a
+/// *variadic* one failed even c17-to-c17. gcc rounds all three to 8.
+///
+/// The shapes below are the ones that separate the candidate rules. A type's
+/// own attribute must not count; a *member's* must; packing must, floored at
+/// 8; an attributed typedef must not; and a naturally 16-aligned type keeps
+/// its 16. Nine leading doubles or longs put the argument past the register
+/// file so the stack rule is the one under test.
+///
+/// aarch64 only: the rule is AAPCS64's, and x86-64's SysV genuinely honours
+/// over-alignment -- that side is covered by
+/// `codegen_over_aligned_argument_area`.
+#[test]
+fn codegen_aarch64_argument_alignment_follows_the_members() {
+    let code = r#"
+#include <stdarg.h>
+
+struct Plain  { double a, b, c, d; };                                  /* members want 8  */
+struct __attribute__((aligned (32))) Over { double a, b, c, d; };      /* attribute: 32   */
+struct __attribute__((aligned (16))) Over16 { long long a, b; };       /* attribute: 16   */
+struct MemAl  { long long a __attribute__((aligned (16))); long long b; }; /* member: 16   */
+struct Packed { __int128 x; } __attribute__((packed));                 /* packed to 1     */
+struct Nat16  { __int128 x; };                                         /* natural 16      */
+
+#define NAMED(NAME, TY, CHECK)                                            \
+    __attribute__((noinline)) static int NAME(double p0, double p1,       \
+        double p2, double p3, double p4, double p5, double p6, double p7, \
+        double p8, TY s, int tail)                                        \
+    { (void)p0; (void)p8; return ((CHECK) && tail == 7) ? 0 : 1; }
+
+NAMED(n_plain,  struct Plain,  s.a == 1 && s.d == 4)
+NAMED(n_over,   struct Over,   s.a == 1 && s.d == 4)
+NAMED(n_over16, struct Over16, s.a == 1 && s.b == 2)
+NAMED(n_memal,  struct MemAl,  s.a == 1 && s.b == 2)
+NAMED(n_packed, struct Packed, (long long)s.x == 42)
+NAMED(n_nat16,  struct Nat16,  (long long)s.x == 42)
+
+#define VA(NAME, TY, CHECK)                                    \
+    __attribute__((noinline)) static int NAME(int n, ...)      \
+    {                                                          \
+        va_list ap; va_start(ap, n);                           \
+        while (n--) (void)va_arg(ap, double);                  \
+        TY s = va_arg(ap, TY);                                 \
+        int tail = va_arg(ap, int);                            \
+        va_end(ap);                                            \
+        return ((CHECK) && tail == 7) ? 0 : 1;                 \
+    }
+
+VA(v_plain,  struct Plain,  s.a == 1 && s.d == 4)
+VA(v_over,   struct Over,   s.a == 1 && s.d == 4)
+VA(v_over16, struct Over16, s.a == 1 && s.b == 2)
+VA(v_memal,  struct MemAl,  s.a == 1 && s.b == 2)
+VA(v_packed, struct Packed, (long long)s.x == 42)
+VA(v_nat16,  struct Nat16,  (long long)s.x == 42)
+
+#define D9 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0
+
+int main(void)
+{
+    /* The rule under test is AAPCS64's, and the shape that reaches it trips a
+       separate x86-64 defect (see the Rust doc comment). Returning success
+       elsewhere keeps this program honest when it is extracted and run on the
+       host, as the aarch64 sweep script does. */
+#if !defined(__aarch64__)
+    return 0;
+#else
+    struct Plain  pl = { 1, 2, 3, 4 };
+    struct Over   ov = { 1, 2, 3, 4 };
+    struct Over16 o16 = { 1, 2 };
+    struct MemAl  ma = { 1, 2 };
+    struct Packed pk; pk.x = 42;
+    struct Nat16  n16; n16.x = 42;
+
+    if (n_plain(D9, pl, 7))  return 1;
+    if (n_over(D9, ov, 7))   return 2;
+    if (n_over16(D9, o16, 7)) return 3;
+    if (n_memal(D9, ma, 7))  return 4;
+    if (n_packed(D9, pk, 7)) return 5;
+    if (n_nat16(D9, n16, 7)) return 6;
+
+    if (v_plain(9, D9, pl, 7))  return 7;
+    if (v_over(9, D9, ov, 7))   return 8;
+    if (v_over16(9, D9, o16, 7)) return 9;
+    if (v_memal(9, D9, ma, 7))  return 10;
+    if (v_packed(9, D9, pk, 7)) return 11;
+    if (v_nat16(9, D9, n16, 7)) return 12;
+
+    return 0;
+#endif
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        // Native when the host *is* aarch64 (the CI runner), cross-compiled
+        // under qemu otherwise. Never run on an x86-64 host, for the reason in
+        // the doc comment.
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(
+                compile_and_run(
+                    &format!("codegen_arg_align_members{opt}"),
+                    code,
+                    &[opt.to_string()]
+                ),
+                0,
+                "native aarch64 at {opt}"
+            );
+        }
+        if let Some(status) = compile_and_run_aarch64("codegen_arg_align_members_a64", code, opt) {
+            assert_eq!(status, 0, "aarch64 at {opt}");
+        }
+    }
+}
+
+/// An argument more aligned than the call boundary needs the outgoing area's
+/// *base* aligned, not just its offset within the area.
+///
+/// System V AMD64 places such an argument at an offset rounded to its own
+/// alignment, and gcc makes that meaningful by dynamically realigning the
+/// caller's stack so the area starts there too. c17 rounded the offset and
+/// left the base at 16, and `va_arg` rounded the overflow pointer to a fixed
+/// 16 rather than to the argument's alignment -- two errors in the same
+/// direction, so a c17-built program agreed with itself and disagreed with
+/// gcc by sixteen bytes.
+///
+/// That is why the load-bearing half of this test links c17 against the host
+/// compiler in both directions: the behavioural run below passes on the
+/// *unfixed* compiler too.
+#[test]
+fn codegen_over_aligned_argument_area() {
+    let code = r#"
+#include <stdarg.h>
+
+struct __attribute__((aligned (32))) A32 { double a, b, c, d; };
+struct __attribute__((aligned (64))) A64 { long q[4]; };
+struct __attribute__((aligned (16))) A16 { long long a, b; };
+
+__attribute__((noinline)) static int take32(int lead, struct A32 s)
+{
+    return (s.a == 1 && s.b == 2 && s.c == 3 && s.d == 4 && lead == 7) ? 0 : 1;
+}
+
+__attribute__((noinline)) static int take64(int lead, struct A64 s)
+{
+    return (s.q[0] == 5 && s.q[3] == 8 && lead == 7) ? 0 : 1;
+}
+
+/* Seven leading integers push the aggregate past the register file. */
+__attribute__((noinline)) static int spilled32(int a, int b, int c, int d,
+                                               int e, int f, int g,
+                                               struct A32 s, int after)
+{
+    return (s.a == 1 && s.d == 4 && a == 1 && g == 7 && after == 99) ? 0 : 1;
+}
+
+/* `va_arg` rounds the overflow pointer to the argument's own alignment. The
+   leading doubles push it past the SSE file so it really comes off the
+   stack. */
+__attribute__((noinline)) static int va32(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    while (n--) (void)va_arg(ap, double);
+    struct A32 s = va_arg(ap, struct A32);
+    int after = va_arg(ap, int);
+    va_end(ap);
+    return (s.a == 1 && s.b == 2 && s.c == 3 && s.d == 4 && after == 99) ? 0 : 1;
+}
+
+__attribute__((noinline)) static int va64(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    while (n--) (void)va_arg(ap, double);
+    struct A64 s = va_arg(ap, struct A64);
+    int after = va_arg(ap, int);
+    va_end(ap);
+    return (s.q[0] == 5 && s.q[3] == 8 && after == 99) ? 0 : 1;
+}
+
+__attribute__((noinline)) static int mixed(struct A16 p, struct A32 q, int tail)
+{
+    return (p.a == 10 && p.b == 11 && q.a == 1 && q.d == 4 && tail == 55) ? 0 : 1;
+}
+
+int main(void)
+{
+    struct A32 s32 = { 1, 2, 3, 4 };
+    struct A64 s64 = { { 5, 6, 7, 8 } };
+    struct A16 s16 = { 10, 11 };
+
+    if (take32(7, s32)) return 1;
+    if (take64(7, s64)) return 2;
+    if (spilled32(1, 2, 3, 4, 5, 6, 7, s32, 99)) return 3;
+    /* Nine leading doubles is the count that separates rounding to 16 from
+       rounding to the argument's own alignment: with fewer, the two land in
+       the same place and the defect is invisible. */
+    if (va32(0, s32, 99)) return 4;
+    if (va32(1, 1.0, s32, 99)) return 4;
+    if (va32(5, 1.0, 2.0, 3.0, 4.0, 5.0, s32, 99)) return 4;
+    if (va32(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, s32, 99)) return 4;
+    if (va64(0, s64, 99)) return 5;
+    if (va64(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, s64, 99)) return 5;
+    if (mixed(s16, s32, 55)) return 6;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("codegen_over_aligned_arg{opt}"),
+                code,
+                &[opt.to_string()]
+            ),
+            0,
+            "at {opt}"
+        );
+    }
+
+    // The part that actually pins the ABI: one unit from c17, the other from
+    // the host compiler, in both directions.
+    const CALLEE: &str = r#"
+#include <stdarg.h>
+struct __attribute__((aligned (32))) A32 { double a, b, c, d; };
+
+int named(int lead, struct A32 s, int tail)
+{
+    return (lead == 7 && s.a == 1 && s.d == 4 && tail == 9) ? 0 : 1;
+}
+
+int variadic(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    while (n--) (void)va_arg(ap, double);
+    struct A32 s = va_arg(ap, struct A32);
+    int tail = va_arg(ap, int);
+    va_end(ap);
+    return (s.a == 1 && s.d == 4 && tail == 9) ? 0 : 1;
+}
+"#;
+    const CALLER: &str = r#"
+struct __attribute__((aligned (32))) A32 { double a, b, c, d; };
+int named(int lead, struct A32 s, int tail);
+int variadic(int n, ...);
+
+int main(void)
+{
+    struct A32 s = { 1, 2, 3, 4 };
+    if (named(7, s, 9)) return 1;
+    if (variadic(0, s, 9)) return 2;
+#if !defined(__APPLE__)
+    /* Not against clang: it disagrees with itself here, so no compiler can
+       satisfy this in both directions. Measured twice on macOS CI -- its
+       caller stacks the over-aligned aggregate at the next eight-byte
+       granule (offset 72) and its `va_arg` rounds the cursor up to the
+       type's 32, reading offset 96. A program built entirely with clang
+       has the same defect. Whichever of the two c17 matches, the other
+       direction of this cross-check fails; `cc/doc/TODO.md` records which.
+       The pure-c17 runs above still cover the shape, and the named
+       argument and the no-leading-argument variadic are checked against
+       clang in both directions. */
+    if (variadic(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, s, 9)) return 3;
+#endif
+    return 0;
+}
+"#;
+    if let Some(status) = compile_with_host_cc("over_aligned_callee", CALLEE, CALLER) {
+        assert_eq!(status, 0, "a host-compiled caller must reach a c17 callee");
+    }
+    if let Some(status) = compile_with_host_cc("over_aligned_caller", CALLER, CALLEE) {
+        assert_eq!(status, 0, "a c17 caller must reach a host-compiled callee");
+    }
+}
+
+/// `va_arg` of an `__int128` reads **two** eightbytes, and the cursor is
+/// committed before the value is read.
+///
+/// Three defects met here. The type had no arm of its own, so it fell into the
+/// scalar path where `OperandSize::from_bits(128)` saturates at 64: only the
+/// low half moved, the guard was the scalar `gp_offset < 48` rather than "both
+/// eightbytes fit", and the cursor advanced 8 instead of 16 -- so the *next*
+/// `va_arg` re-read this one's high half.
+///
+/// The other two are not `__int128`-specific and had been latent in every
+/// integer `va_arg`. The helper used R11 as its shuttle while `emit_va_arg`
+/// puts the `va_list` pointer in R11 whenever `ap` is a slot holding a pointer
+/// rather than the object, so the base was destroyed before the write-back --
+/// `movl %r10d, (%r11)` faulting through the value it had just loaded. And the
+/// overflow path read the value into the same register that held the area
+/// pointer it then advanced, so with enough leading arguments to exhaust the
+/// register file it stored a *value* back as the cursor. Both are why the
+/// cursor is now committed before the copy, as the aggregate path already did.
+///
+/// The leading-argument counts are chosen to land the `__int128` in the
+/// register save area (0, 1, 5) and in the overflow area (9): with six general
+/// argument registers, nine leading `int`s exhaust them.
+#[test]
+fn codegen_va_arg_int128_reads_both_eightbytes() {
+    let code = r#"
+#include <stdarg.h>
+
+__attribute__((noinline)) static __int128 wide(int x, ...)
+{
+    __int128 r;
+    va_list ap;
+    va_start(ap, x);
+    while (x--) va_arg(ap, int);
+    r = va_arg(ap, __int128);
+    va_end(ap);
+    return r;
+}
+
+/* The argument after the __int128 proves the cursor advanced by sixteen and
+   not by eight -- an eight-byte advance hands this one the high half. */
+__attribute__((noinline)) static long follows(int x, ...)
+{
+    va_list ap;
+    va_start(ap, x);
+    while (x--) va_arg(ap, int);
+    (void)va_arg(ap, __int128);
+    long after = va_arg(ap, long);
+    va_end(ap);
+    return after;
+}
+
+/* Ordinary integers past the register file, which is where the overflow
+   cursor was being overwritten with a value. */
+__attribute__((noinline)) static long many(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    long acc = 0;
+    for (int i = 0; i < 9; i++) acc = acc * 10 + va_arg(ap, long);
+    va_end(ap);
+    (void)n;
+    return acc;
+}
+
+int main(void)
+{
+    __int128 u = ((__int128) 0xaaaaaaaaaaaaaaaaULL << 64) | 0x5555555555555555ULL;
+
+    if (wide(0, u) != u) return 1;
+    if (wide(1, 0, u) != u) return 2;
+    if (wide(5, 0, 0, 0, 0, 0, u) != u) return 3;
+    if (wide(9, 0, 0, 0, 0, 0, 0, 0, 0, 0, u) != u) return 4;
+
+    if (follows(0, u, 1234L) != 1234) return 5;
+    if (follows(9, 0, 0, 0, 0, 0, 0, 0, 0, 0, u, 1234L) != 1234) return 6;
+
+    if (many(0, 1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L) != 123456789L) return 7;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_va_arg_int128", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("codegen_va_arg_int128_o2", code, &["-O2".to_string()]),
+        0
+    );
+
+    // aarch64 had the same saturating move, plus a rule of its own: AAPCS64
+    // stage C.10 starts a 16-byte integral argument at an even general
+    // register, so `__gr_offs` rounds up to a multiple of 16 first.
+    for opt in ["-O0", "-O2"] {
+        if let Some(status) = compile_and_run_aarch64("codegen_va_arg_int128_a64", code, opt) {
+            assert_eq!(status, 0, "aarch64 at {opt}");
+        }
+    }
+}
+
+/// A register-returned aggregate must be stored through the frame's own base
+/// register, not through `%rbp`.
+///
+/// When a local's alignment exceeds the stack's, the prologue realigns `%rsp`
+/// and keeps the frame's base in a second register; `stack_mem` then addresses
+/// every local relative to that. Six sites in the call path spelled
+/// `-(slot + callee_saved_offset)(%rbp)` by hand instead, so under such a
+/// frame the return value was written to an address nothing reads back --
+/// `movq %rax, -112(%rbp)` followed by `movq 32(%rbx), %rax`. Four of the six
+/// were return paths, which is why `struct S { long long a, b; } r = make();`
+/// came back as zeros beside an `_Alignas(32)` local, in ordinary C with no
+/// varargs involved.
+///
+/// Whether it is *visible* depends on what happens to occupy the address that
+/// is written, so the levels are swept rather than trusted: the two-register
+/// integer shape came back wrong at `-O1` and right at `-O0` and `-O2`.
+#[test]
+fn codegen_aggregate_return_into_an_over_aligned_frame() {
+    let code = r#"
+struct TwoInt  { long long a, b; };            /* RAX + RDX   */
+struct TwoSse  { double a, b; };               /* XMM0 + XMM1 */
+struct Mixed   { double a; long long b; };     /* XMM0 + RAX  */
+struct MixedR  { long long a; double b; };     /* RAX + XMM0  */
+struct OneInt  { int a; };                     /* RAX         */
+struct OneSse  { float a, b; };                /* XMM0        */
+
+__attribute__((noinline)) struct TwoInt m_ti(void){ struct TwoInt s={1,2}; return s; }
+__attribute__((noinline)) struct TwoSse m_ts(void){ struct TwoSse s={1.5,2.5}; return s; }
+__attribute__((noinline)) struct Mixed  m_mx(void){ struct Mixed  s={3.5,4}; return s; }
+__attribute__((noinline)) struct MixedR m_mr(void){ struct MixedR s={5,6.5}; return s; }
+__attribute__((noinline)) struct OneInt m_oi(void){ struct OneInt s={7}; return s; }
+__attribute__((noinline)) struct OneSse m_os(void){ struct OneSse s={8.5f,9.5f}; return s; }
+__attribute__((noinline)) double _Complex m_cd(void){ return __builtin_complex(10.5, 11.5); }
+__attribute__((noinline)) float  _Complex m_cf(void){ return __builtin_complex(12.5f, 13.5f); }
+
+int main(void)
+{
+    _Alignas(32) char pad[64];          /* forces the over-aligned frame */
+
+    struct TwoInt ti = m_ti();
+    struct TwoSse ts = m_ts();
+    struct Mixed  mx = m_mx();
+    struct MixedR mr = m_mr();
+    struct OneInt oi = m_oi();
+    struct OneSse os = m_os();
+    double _Complex cd = m_cd();
+    float  _Complex cf = m_cf();
+
+    pad[0] = 1;
+    pad[63] = 2;
+
+    if (ti.a != 1 || ti.b != 2)                       return 1;
+    if (ts.a != 1.5 || ts.b != 2.5)                   return 2;
+    if (mx.a != 3.5 || mx.b != 4)                     return 3;
+    if (mr.a != 5 || mr.b != 6.5)                     return 4;
+    if (oi.a != 7)                                    return 5;
+    if (os.a != 8.5f || os.b != 9.5f)                 return 6;
+    if (__real__ cd != 10.5 || __imag__ cd != 11.5)   return 7;
+    if (__real__ cf != 12.5f || __imag__ cf != 13.5f) return 8;
+    if (pad[0] != 1 || pad[63] != 2)                  return 9;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2", "-Os"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("codegen_agg_ret_over_aligned{opt}"),
+                code,
+                &[opt.to_string()]
+            ),
+            0,
+            "at {opt}"
+        );
+    }
+
+    // The behavioural check above only fails when the address written happens
+    // to matter, so pin the property itself: in a function whose frame is
+    // realigned, no aggregate-return store may name `%rbp`.
+    let probe = r#"
+struct TwoInt { long long a, b; };
+struct TwoInt make(void);
+long realigned(void)
+{
+    _Alignas(32) char pad[64];
+    struct TwoInt r = make();
+    pad[0] = 1;
+    return r.a + r.b + pad[0];
+}
+"#;
+    let asm = asm_for_with("agg_ret_base_reg", X86_64_LINUX, probe, &["-O1"]);
+    let body = body_of(&asm, "realigned");
+    for reg in ["%rax", "%rdx"] {
+        for line in body.lines() {
+            let line = line.trim();
+            if line.starts_with(&format!("movq {reg}, ")) && line.contains("(%rbp)") {
+                panic!(
+                    "the aggregate-return store must go through the realigned \
+                     frame base, not %rbp: `{line}`\n{body}"
+                );
+            }
+        }
+    }
+}
+
+/// A zero-sized argument is not passed, so neither side may charge it a slot.
+///
+/// System V AMD64 psABI 3.2.3 and AAPCS64 both give such a type no class --
+/// `ArgClass::Ignore` -- and the call site already skipped it. `va_arg` did
+/// not: it rounded the size up to one byte, folded `Ignore` into the same
+/// empty class vector as MEMORY, took the overflow path, copied a byte the
+/// object does not own and advanced the cursor by eight, so every later
+/// argument in the list came out eight bytes low.
+///
+/// On aarch64 the *caller* had the mirror of the same bug, in both of its
+/// argument loops, and the two errors cancelled: c17 talking to c17 agreed
+/// with itself while disagreeing with gcc, which is why only a cross-compiler
+/// probe found it. Reading arguments both before and after the zero-sized one
+/// is what makes a one-slot shift visible here.
+#[test]
+fn codegen_zero_sized_variadic_argument_consumes_no_slot() {
+    let code = r#"
+#include <stdarg.h>
+
+struct Z  { char x[0]; };
+struct Z2 { };
+
+__attribute__((noinline)) static long mixed(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    long acc = 0;
+    acc = acc * 10 + va_arg(ap, int);       /* before */
+    (void)va_arg(ap, struct Z);             /* nothing at all */
+    acc = acc * 10 + va_arg(ap, int);       /* after */
+    (void)va_arg(ap, struct Z2);
+    acc = acc * 10 + va_arg(ap, long);
+    va_end(ap);
+    (void)n;
+    return acc;
+}
+
+/* Enough leading arguments that the ones after the zero-sized member are past
+   the register file and read from the overflow area instead. */
+__attribute__((noinline)) static long spilled(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    long acc = 0;
+    for (int i = 0; i < 6; i++) acc = acc * 10 + va_arg(ap, int);
+    (void)va_arg(ap, struct Z);
+    acc = acc * 10 + va_arg(ap, int);
+    va_end(ap);
+    (void)n;
+    return acc;
+}
+
+int main(void)
+{
+    struct Z  z;
+    struct Z2 z2;
+
+    if (mixed(0, 1, z, 2, z2, 3L) != 123) return 1;
+    if (spilled(0, 1, 2, 3, 4, 5, 6, z, 7) != 1234567) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_va_arg_zero_sized", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("codegen_va_arg_zero_sized_o2", code, &["-O2".to_string()]),
+        0
+    );
+
+    // Run the same program on aarch64 under qemu. `compile_and_run` always
+    // targets the host, so without this the aarch64 half of the fix -- which
+    // was two separate sites there -- is asserted by nothing that executes.
+    for opt in ["-O0", "-O2"] {
+        if let Some(status) = compile_and_run_aarch64("codegen_va_arg_zero_sized_a64", code, opt) {
+            assert_eq!(status, 0, "aarch64 at {opt}");
+        }
+    }
+}
+
 /// A local whose alignment exceeds the stack's own forces the frame to be
 /// addressed through a second base register. That register was still in the
 /// allocatable pool, so the colorer handed it to an ordinary value and the
@@ -11036,4 +11862,390 @@ int main(void) {
         compile_and_run("cg_complex_int128_mem_o2", code, &["-O2".to_string()]),
         0
     );
+}
+
+/// A zero-sized parameter occupies neither a register nor a stack slot, and
+/// both sides of the call have to step over it the same way.
+///
+/// They did not. The call site's layout skipped it while the register setup
+/// and the callee's prologue each charged a general register for it, so every
+/// later argument was read from the register before the one it was written
+/// to -- `f(z, 1, 2, ...)` lost its first `int`. With nine arguments past the
+/// zero-sized one the index ran off the end of the six-register file and the
+/// **compiler panicked**: `index out of bounds: the len is 6 but the index is
+/// 6`, which is how `va-arg-22` failed to compile at all.
+///
+/// A zero-sized struct is a GNU extension, and `struct { char x[0]; }` and
+/// `struct { }` are both spellings of it.
+#[test]
+fn codegen_zero_sized_parameter_consumes_no_register() {
+    let code = r#"
+typedef struct { char x[0]; } Z;
+typedef struct { } E;
+Z z;
+E e;
+
+/* The zero-sized argument in every position around a full register file. */
+int first(Z q, int a, int b, int c, int d, int e2, int f, int g, int h) {
+    (void)q; return a + b + c + d + e2 + f + g + h;
+}
+int middle(int a, int b, int c, Z q, int d, int e2, int f, int g, int h) {
+    (void)q; return a + b + c + d + e2 + f + g + h;
+}
+int last(int a, int b, int c, int d, int e2, int f, int g, int h, Z q) {
+    (void)q; return a + b + c + d + e2 + f + g + h;
+}
+int two(Z p, Z q, int a, int b, int c, int d, int e2, int f, int g, int h) {
+    (void)p; (void)q; return a + b + c + d + e2 + f + g + h;
+}
+/* The empty-struct spelling, and a parameter the body actually reads. */
+int empty(E q, int a, int b) { (void)q; return a * 10 + b; }
+int weighted(Z q, int a, int b, int c, int d, int e2, int f, int g) {
+    (void)q; return a * 1 + b * 2 + c * 3 + d * 4 + e2 * 5 + f * 6 + g * 7;
+}
+/* Mixed with a two-register struct, past the file. */
+typedef struct { int a, b; } P;
+int mixed(P p1, P p2, P p3, Z q, int a, int b, int c) {
+    (void)q; return p1.a + p2.a + p3.a + a + b + c;
+}
+/* Variadic, with the zero-sized one among the fixed parameters. */
+int variadic(Z q, int n, ...) { (void)q; return n; }
+/* Returned by value, and passed several times over. */
+Z ret_zero(void) { return z; }
+int chain(Z q1, Z q2, Z q3, int a) { (void)q1; (void)q2; (void)q3; return a; }
+
+/* Sub-`int` arguments spilling to the stack: an argument that did not fit
+   consumes no register either, and counting one made the two sides disagree
+   about every argument after it. */
+char narrow(char a, char b, char c, char d, char e2,
+            char f, char g, char h, char i, char j) {
+    return (char)(a + b + c + d + e2 + f + g + h + i + j);
+}
+
+int main(void) {
+    if (first(z, 1, 2, 3, 4, 5, 6, 7, 8) != 36) return 1;
+    if (middle(1, 2, 3, z, 4, 5, 6, 7, 8) != 36) return 2;
+    if (last(1, 2, 3, 4, 5, 6, 7, 8, z) != 36) return 3;
+    if (two(z, z, 1, 2, 3, 4, 5, 6, 7, 8) != 36) return 4;
+    if (empty(e, 3, 4) != 34) return 5;
+    if (weighted(z, 1, 2, 3, 4, 5, 6, 7) != 140) return 6;
+
+    P a = {1, 0}, b = {2, 0}, c = {3, 0};
+    if (mixed(a, b, c, z, 4, 5, 6) != 21) return 7;
+
+    if (variadic(z, 42, 1, 2, 3) != 42) return 8;
+    Z r = ret_zero();
+    (void)r;
+    if (chain(z, z, z, 99) != 99) return 9;
+    if (narrow(1, 2, 3, 4, 5, 6, 7, 8, 9, 10) != 55) return 10;
+    if (sizeof(Z) != 0 || sizeof(E) != 0) return 11;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cg_zero_sized_param", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("cg_zero_sized_param_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// A call through a function pointer converts its arguments to the pointee's
+/// prototype, and the pointer survives the argument setup.
+///
+/// Two defects, both reached by any indirect call.
+///
+/// C17 6.5.2.2p1 lets the function designator be a function *or* a pointer to
+/// one, and the prototype is on the function type either way. c17 read
+/// `params` off the pointer, found none, and converted nothing: `void
+/// (*p)(double) = f; p(1);` passed the integer 1 where a `double` was
+/// expected and the callee read 0. With a mixed argument list every later
+/// argument moved as well.
+///
+/// The pointer was then loaded into R11 *before* the arguments were set up --
+/// and R10/R11 are that setup's own scratch, so the target was overwritten
+/// and `call *%r11` jumped into whatever the last argument had addressed.
+///
+/// `930702-1` is the torture test, through a K&R definition.
+#[test]
+fn c99_call_through_a_pointer_uses_the_pointee_prototype() {
+    let code = r#"
+extern int printf(const char *, ...);
+
+static double seen_d;
+static int seen_i;
+static long seen_l;
+static float seen_f;
+
+static void take_d(double a) { seen_d = a; }
+static void take_di(double a, int b) { seen_d = a; seen_i = b; }
+static void take_l(long a) { seen_l = a; }
+static void take_f(float a) { seen_f = a; }
+static void take_idi(int a, double b, int c) { seen_i = a + c; seen_d = b; }
+static void take_b(_Bool b) { seen_i = b; }
+
+typedef struct { double a, b; } D2;
+typedef struct { long a, b, c, d; } Big;
+static double st_a, st_b;
+static long big_a;
+static void take_st(D2 d, Big b, int i, double z, long l) {
+    st_a = d.a; st_b = d.b; big_a = b.a; seen_i = i; seen_d = z; seen_l = l;
+}
+static double cre, cim;
+static void take_cx(double _Complex z) { cre = __real__ z; cim = __imag__ z; }
+
+static void take_stacked(long a, long b, long c, long d, long e,
+                         long f, long g, long h, Big k, long l) {
+    seen_l = a; big_a = k.a; seen_i = (int)l;
+    (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h;
+}
+
+/* The target reached through an array indexed at run time, and through a
+   call -- the pointer has to survive a full argument list either way. */
+typedef void (*DI)(double, int);
+static DI tbl[2];
+static DI pick(int i) { return tbl[i]; }
+
+int main(void) {
+    /* The conversion the prototype asks for. */
+    { void (*p)(double) = take_d; p(1); if (seen_d != 1.0) return 1; }
+    { void (*p)(double, int) = take_di; p(2, 7);
+      if (seen_d != 2.0 || seen_i != 7) return 2; }
+    { void (*p)(long) = take_l; p(3); if (seen_l != 3) return 3; }
+    { void (*p)(float) = take_f; p(4); if (seen_f != 4.0f) return 4; }
+    { void (*p)(int, double, int) = take_idi; p(5, 6, 8);
+      if (seen_i != 13 || seen_d != 6.0) return 5; }
+
+    /* `_Bool` converts as `!= 0`, not by truncation -- and this was wrong
+       for a direct call too. */
+    { void (*p)(_Bool) = take_b; p(42); if (seen_i != 1) return 6; }
+    take_b(42);
+    if (seen_i != 1) return 7;
+
+    /* Aggregates and a complex parameter, where the argument setup uses the
+       scratch registers the target was parked in. */
+    { void (*p)(D2, Big, int, double, long) = take_st;
+      D2 d = {1.5, 2.5}; Big b = {7, 8, 9, 10};
+      p(d, b, 3, 4.5, 11);
+      if (st_a != 1.5 || st_b != 2.5 || big_a != 7) return 8;
+      if (seen_i != 3 || seen_d != 4.5 || seen_l != 11) return 9; }
+    { void (*p)(double _Complex) = take_cx; p(4);
+      if (cre != 4.0 || cim != 0.0) return 10; }
+
+    /* The target from a table, and from a call. */
+    tbl[0] = take_di;
+    tbl[1] = take_di;
+    { int k = 1; tbl[k](12, 13);
+      if (seen_d != 12.0 || seen_i != 13) return 11; }
+    pick(0)(14, 15);
+    if (seen_d != 14.0 || seen_i != 15) return 12;
+
+    /* A stacked aggregate argument, which both backends copy through the
+       very register the call target sits in -- X16 on aarch64, R11 on
+       x86-64. This is the shape that branched into the argument data. */
+    {
+        void (*p)(long, long, long, long, long, long, long, long, Big, long)
+            = take_stacked;
+        Big b = {77, 88, 99, 100};
+        p(1, 2, 3, 4, 5, 6, 7, 8, b, 9);
+        if (seen_l != 1 || big_a != 77 || seen_i != 9) return 14;
+    }
+
+    /* A direct call must keep working the same way. */
+    take_d(16);
+    if (seen_d != 16.0) return 15;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_call_through_pointer", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_call_through_pointer_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// System V 3.2.3 step 5 says an argument passed in memory consumes no
+/// register -- so the running tallies of *consumed* registers must not move
+/// for it. The callee-side tallies advanced anyway. One that had run past
+/// its file still answered `used < file_len` correctly, which is why this
+/// survived, but not `used + needed <= file_len` when `needed` is zero:
+/// after nine
+/// `double`s, the ninth of them stacked, the callee asked whether the SSE
+/// file had room for none of a two-general-eightbyte aggregate and was told
+/// no, so it read the struct off the stack while the caller -- which has the
+/// same question written with a guard -- had put it in RDI/RSI.
+#[test]
+fn codegen_register_aggregate_after_a_stacked_argument() {
+    let code = r#"
+typedef struct { long long a, b; } GG;
+typedef struct { double x, y; } DD;
+typedef struct { double x; long long y; } MIX;
+
+#define DP double p1,double p2,double p3,double p4,double p5,double p6, \
+           double p7,double p8,double p9
+#define D9 1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0
+#define LP long p1,long p2,long p3,long p4,long p5,long p6,long p7
+#define L7 1L,2L,3L,4L,5L,6L,7L
+
+/* The SSE file is spent and the ninth double is stacked; the aggregate that
+   follows still belongs in the general registers. */
+__attribute__((noinline)) static int gp_after_stacked_fp(DP, GG s, int tail)
+{ return (p9 == 9.0 && s.a == 1 && s.b == 2 && tail == 7) ? 0 : 1; }
+
+/* The mirror: the general file is spent and the seventh long is stacked; the
+   all-SSE aggregate that follows still belongs in XMM0/XMM1. */
+__attribute__((noinline)) static int fp_after_stacked_gp(LP, DD s, double tail)
+{ return (p7 == 7 && s.x == 1.5 && s.y == 2.5 && tail == 3.5) ? 0 : 2; }
+
+/* A mixed pair after the SSE file is spent has nowhere to put its SSE half,
+   so the whole argument does go to memory -- the tally must not make this
+   one wrong in the other direction. */
+__attribute__((noinline)) static int mix_after_stacked_fp(DP, MIX s, int tail)
+{ return (s.x == 4.5 && s.y == 6 && tail == 7) ? 0 : 3; }
+
+int main(void)
+{
+    GG g = { 1, 2 };
+    DD d = { 1.5, 2.5 };
+    MIX m = { 4.5, 6 };
+    int r;
+    if ((r = gp_after_stacked_fp(D9, g, 7))) return r;
+    if ((r = fp_after_stacked_gp(L7, d, 3.5))) return r;
+    if ((r = mix_after_stacked_fp(D9, m, 7))) return r;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c17_reg_agg_after_stacked", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c17_reg_agg_after_stacked_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+const OVER_ALIGNED_STACKED_AGGREGATE: &str = r#"
+typedef struct { long long a, b, c; } Big;                    /* MEMORY class */
+typedef struct __attribute__((aligned(32))) { double a, b, c, d; } Over;
+
+__attribute__((noinline)) static int take(long p1, long p2, long p3, long p4,
+                                          long p5, long p6, Big s, int tail)
+{ return (s.a == 1 && s.b == 2 && s.c == 3 && tail == 7) ? 0 : 1; }
+
+int main(void)
+{
+    Over o = { 1, 2, 3, 4 };    /* over-aligns main's frame */
+    Big b = { 1, 2, 3 };
+    if (o.a != 1 || o.d != 4) return 2;
+    return take(1, 2, 3, 4, 5, 6, b, 7);
+}
+"#;
+
+/// `stack_mem` picks the frame's base register, and an over-aligned frame
+/// addresses its locals through a second base rather than `%rbp`.
+/// `address_of_pseudo` spelled `-(offset + callee_saved_offset)(%rbp)` by
+/// hand, which in such a frame names a different address entirely -- so the
+/// copy of a stacked aggregate argument loaded its source pointer from
+/// garbage and the caller segfaulted.
+#[test]
+fn codegen_over_aligned_frame_addresses_a_stacked_aggregate_through_its_own_base() {
+    assert_eq!(
+        compile_and_run(
+            "c17_overaligned_stacked_agg",
+            OVER_ALIGNED_STACKED_AGGREGATE,
+            &[]
+        ),
+        0
+    );
+    assert_eq!(
+        compile_and_run(
+            "c17_overaligned_stacked_agg_o2",
+            OVER_ALIGNED_STACKED_AGGREGATE,
+            &["-O2".to_string()]
+        ),
+        0
+    );
+}
+
+/// Every `long double` local took the same hand-spelled `%rbp` displacement,
+/// from the x87 emitter's own copies of it. That one is not a wild pointer
+/// -- the store and the load agree with each other -- so it runs, but it
+/// names an address the aligned base also hands out, and which of the two
+/// survives depends on `%rbp`'s dynamic alignment.
+const OVER_ALIGNED_LONG_DOUBLE: &str = r#"
+typedef struct __attribute__((aligned(32))) { double a, b, c, d; } Over;
+
+__attribute__((noinline)) static int take(long double x, long double y, int t)
+{ return (x == 1.5L && y == 2.5L && t == 7) ? 0 : 1; }
+
+__attribute__((noinline)) static long double sum(long double a, long double b)
+{ return a + b; }
+
+int main(void)
+{
+    Over o = { 1, 2, 3, 4 };    /* over-aligns main's frame */
+    long double x = 1.5L, y = 2.5L;
+    volatile long double z;
+    if (o.a != 1 || o.d != 4) return 2;
+    if (take(x, y, 7)) return 3;
+    z = sum(x, y);
+    if (z != 4.0L) return 4;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_over_aligned_frame_holds_a_long_double() {
+    assert_eq!(
+        compile_and_run("c17_overaligned_x87", OVER_ALIGNED_LONG_DOUBLE, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run(
+            "c17_overaligned_x87_o2",
+            OVER_ALIGNED_LONG_DOUBLE,
+            &["-O2".to_string()]
+        ),
+        0
+    );
+}
+
+/// The behavioural tests above only fail when the bogus `%rbp` displacement
+/// happens to land somewhere that matters, which the exact layout decides;
+/// adding a second call to the stacked-aggregate one was enough to make it
+/// pass while it still generated the wrong address. So assert the invariant
+/// directly: once the prologue has realigned the stack, the only uses of
+/// `%rbp` are establishing it, the epilogue's `lea` back to the callee-saved
+/// area, and restoring it.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_over_aligned_frame_keeps_no_local_at_an_rbp_displacement() {
+    for (what, src) in [
+        ("stacked_agg", OVER_ALIGNED_STACKED_AGGREGATE),
+        ("long_double", OVER_ALIGNED_LONG_DOUBLE),
+    ] {
+        let asm = asm_for(&format!("c17_overaligned_rbp_{what}_"), src);
+        let main = asm
+            .split("\nmain:\n")
+            .nth(1)
+            .and_then(|s| s.split(".cfi_endproc").next())
+            .unwrap_or_else(|| panic!("no main in assembly for {what}"));
+        assert!(
+            main.contains("andq $-32, %rsp"),
+            "{what}: main's frame was not over-aligned, so this proves nothing:\n{main}"
+        );
+        let strays: Vec<&str> = main
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("%rbp"))
+            .filter(|l| {
+                *l != "pushq %rbp"
+                    && *l != "popq %rbp"
+                    && *l != "movq %rsp, %rbp"
+                    && !(l.starts_with("leaq ") && l.ends_with("(%rbp), %rsp"))
+            })
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "{what}: an over-aligned frame addressed something \
+             through %rbp: {strays:?}\n{main}"
+        );
+    }
 }

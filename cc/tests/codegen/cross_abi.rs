@@ -22,6 +22,7 @@
 //
 
 use super::asm_probe::{asm_for, asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
+use crate::common::{aarch64_cross_available, create_c_file, cross_link_and_run, run_c17};
 
 /// AAPCS64 passes a `_Complex` as a two-element HFA, so it occupies **two**
 /// V registers and the next floating-point parameter starts after both.
@@ -1392,6 +1393,244 @@ long v_cx(double _Complex z, ...)
     );
 }
 
+/// c17's aarch64 code must agree with **gcc** about the ABI, not merely with
+/// itself.
+///
+/// This links a c17-compiled translation unit against a gcc-compiled one and
+/// runs the result under qemu, in both directions. It is the only shape of
+/// test in this suite that can see a divergence where c17's caller and callee
+/// are wrong in the same way: a zero-sized argument was charged a register by
+/// both, so every c17-only program agreed with itself and every mixed program
+/// read its arguments one register out. Assembly assertions could not settle
+/// it either, because the wrong register is still a plausible one.
+#[test]
+fn codegen_aarch64_agrees_with_gcc_on_zero_sized_arguments() {
+    if !aarch64_cross_available() {
+        eprintln!(
+            "SKIP codegen_aarch64_agrees_with_gcc_on_zero_sized_arguments: \
+             no aarch64 cross toolchain"
+        );
+        return;
+    }
+
+    // Deliberately in separate translation units, so neither compiler can see
+    // the other's idea of the calling convention.
+    let callee_src = r#"
+#include <stdarg.h>
+struct Z { char x[0]; };
+
+int named(int a, struct Z z, int b, int c)
+{
+    (void)z;
+    return a * 100 + b * 10 + c;
+}
+
+int variadic(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    int a = va_arg(ap, int);
+    (void)va_arg(ap, struct Z);
+    int b = va_arg(ap, int);
+    va_end(ap);
+    (void)n;
+    return a * 10 + b;
+}
+"#;
+    let caller_src = r#"
+struct Z { char x[0]; };
+int named(int a, struct Z z, int b, int c);
+int variadic(int n, ...);
+
+int main(void)
+{
+    struct Z z;
+    if (named(1, z, 2, 3) != 123) return 1;
+    if (variadic(0, 4, z, 5) != 45) return 2;
+    return 0;
+}
+"#;
+
+    let callee_c = create_c_file("a64_abi_callee", callee_src);
+    let caller_c = create_c_file("a64_abi_caller", caller_src);
+    let callee_path = callee_c.path().to_string_lossy().to_string();
+    let caller_path = caller_c.path().to_string_lossy().to_string();
+
+    // Compile each side with c17 for aarch64, keeping the .c files so gcc can
+    // compile the same source for the other side of each pair.
+    let mut asm_paths = Vec::new();
+    for (tag, src_path) in [("callee", &callee_path), ("caller", &caller_path)] {
+        let out = plib::tmp::Builder::new()
+            .prefix(&format!("c17_a64_abi_{tag}_"))
+            .suffix(".s")
+            .tempfile()
+            .expect("failed to create temp file");
+        let out_path = out.path().to_string_lossy().to_string();
+        let run = run_c17(&[
+            "--target",
+            "aarch64-unknown-linux-gnu",
+            "-O0",
+            "-S",
+            "-o",
+            &out_path,
+            src_path,
+        ]);
+        assert!(run.success, "c17 failed on the {tag}:\n{}", run.stderr);
+        asm_paths.push((out, out_path));
+    }
+    let callee_asm = asm_paths[0].1.clone();
+    let caller_asm = asm_paths[1].1.clone();
+
+    // gcc on both sides: the reference. If this fails the probe itself is
+    // wrong, and nothing below means anything.
+    assert_eq!(
+        cross_link_and_run("a64_abi_ref", &[&caller_path, &callee_path]),
+        0,
+        "the gcc/gcc reference must pass, or this probe is not testing the ABI"
+    );
+
+    assert_eq!(
+        cross_link_and_run("a64_abi_c17_callee", &[&caller_path, &callee_asm]),
+        0,
+        "a gcc caller must be able to call a c17 callee: c17 charged the \
+         zero-sized argument a register that gcc does not pass"
+    );
+    assert_eq!(
+        cross_link_and_run("a64_abi_c17_caller", &[&caller_asm, &callee_path]),
+        0,
+        "a c17 caller must be able to call a gcc callee: c17 passed the \
+         zero-sized argument in a register gcc does not read"
+    );
+    assert_eq!(
+        cross_link_and_run("a64_abi_c17_both", &[&caller_asm, &callee_asm]),
+        0,
+        "c17 must also agree with itself"
+    );
+}
+
+/// `va_arg` of an `__int128` copies **both** eightbytes on Darwin too.
+///
+/// Darwin has its own `va_arg` emitter -- every variadic argument is already
+/// on the stack, so there is no register save area to gather from -- and the
+/// fix that gave AAPCS64 a 128-bit arm did not reach it. Its scalar path sizes
+/// the move with `OperandSize::from_bits`, which saturates at 64, so the low
+/// half was copied and the high half was left as whatever the destination slot
+/// held. The *advance* was already 16, which is why the next `va_arg` was
+/// correct and only the value was wrong.
+///
+/// Asserted on assembly because it cannot be executed here: there is no macOS
+/// runner and qemu cannot run Mach-O. Two loads from the argument pointer, at
+/// 0 and at 8, are the property; the linux-aarch64 half of the same rule is
+/// covered behaviourally by `codegen_va_arg_int128_reads_both_eightbytes`.
+#[test]
+fn codegen_darwin_va_arg_int128_copies_both_eightbytes() {
+    let src = r#"
+#include <stdarg.h>
+__int128 wide(int x, ...)
+{
+    __int128 r;
+    va_list ap;
+    va_start(ap, x);
+    while (x--) va_arg(ap, int);
+    r = va_arg(ap, __int128);
+    va_end(ap);
+    return r;
+}
+"#;
+    let asm = asm_for("darwin_va_int128", "aarch64-apple-darwin", src);
+    let body = body_of(&asm, "wide");
+
+    // The pointer is loaded into some register, then read at +0 and +8. Find
+    // the register the second load uses and require a matching first load, so
+    // this cannot pass on a single load plus unrelated traffic.
+    let hi = body
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("ldr x") && l.ends_with(", #8]"))
+        .unwrap_or_else(|| panic!("no high-half load of the __int128:\n{body}"));
+    let base = hi
+        .rsplit_once(", [")
+        .and_then(|(_, rest)| rest.split(',').next())
+        .unwrap_or_else(|| panic!("unparsable load `{hi}`:\n{body}"));
+    assert!(
+        body.lines()
+            .map(str::trim)
+            .any(|l| l.starts_with("ldr x") && l.ends_with(&format!(", [{base}]"))),
+        "the low half must be loaded from {base} as well as the high half \
+         (`{hi}`):\n{body}"
+    );
+}
+
+/// A zero-sized argument takes no register on aarch64, in the caller.
+///
+/// AAPCS64 gives it no class, and `va_arg` skips it. The caller did not, in
+/// *both* of its argument loops, so it charged a general register the callee
+/// never reads and everything after shifted by one. The two errors cancelled
+/// exactly, so c17 agreed with itself and disagreed with gcc -- a divergence
+/// only visible across a translation-unit boundary, which no behavioural test
+/// in this suite can reach. Hence an assembly assertion: the argument after
+/// the zero-sized one must be in `w1`, the register it would have been pushed
+/// out of.
+#[test]
+fn codegen_aarch64_zero_sized_argument_takes_no_register() {
+    let src = r#"
+struct Z { char x[0]; };
+int callee(int n, int a, int b);
+int caller(void)
+{
+    struct Z z;
+    (void)z;
+    return callee(1, 1234, 5678);
+}
+int variadic(int n, ...);
+int caller_va(void)
+{
+    struct Z z;
+    return variadic(1, z, 1234);
+}
+int callee_side(int a, struct Z z, int b)
+{
+    (void)z;
+    return a * 10 + b;
+}
+"#;
+    let asm = asm_for("aarch64_zero_sized_arg", AARCH64_LINUX, src);
+
+    // The control: with no zero-sized argument, 1234 is the second argument
+    // and so lives in w1.
+    let plain = body_of(&asm, "caller");
+    assert!(
+        plain.contains("#1234"),
+        "the control call must materialise 1234:\n{plain}"
+    );
+
+    // With the zero-sized argument first, 1234 is still the *first* argument
+    // that is actually passed after `n`, so it must still be w1 -- not w2.
+    let va = body_of(&asm, "caller_va");
+    let w1 = va.contains("w1, #1234") || va.contains("w1, #1234\n");
+    assert!(
+        w1,
+        "1234 follows a zero-sized argument, which is passed in no register \
+         at all, so it must go in w1:\n{va}"
+    );
+    assert!(
+        !va.contains("w2, #1234"),
+        "the zero-sized argument must not push 1234 into w2:\n{va}"
+    );
+
+    // The callee side of the same rule. `b` follows a zero-sized parameter, so
+    // it arrives in w1; the allocator's catch-all arm charged the zero-sized
+    // one a register and read `b` out of w2 instead. Asserting on which
+    // register a value is *read from* is what distinguishes the two, since w2
+    // is also used as scratch either way.
+    let callee = body_of(&asm, "callee_side");
+    assert!(
+        !callee.contains("mov w1, w2"),
+        "a zero-sized parameter takes no register, so `b` arrives in w1 and \
+         must not be read out of w2:\n{callee}"
+    );
+}
+
 /// A one-element HFA argument goes in a V register on aarch64.
 ///
 /// The caller recognised only the two-element case, so every shape that is an
@@ -1951,6 +2190,422 @@ fn codegen_aarch64_hfa_returning_function_is_not_inlined() {
             "{caller} must still call {callee}: an HFA-returning function hands \
              back an address, and inlining it phis that address as though it \
              were the aggregate:\n{body}"
+        );
+    }
+}
+
+/// AAPCS64 stage C.10: an argument whose alignment is 16 starts at an **even**
+/// NGRN, so an odd one skips a general register and leaves it unused; and
+/// stage C.11: one that does not fit sets NGRN to 8, so everything after it is
+/// on the stack too.
+///
+/// c17 applied C.10 only where the type was a scalar `__int128`, and C.11 not
+/// at all for a general-register composite pair. Both mistakes were made by
+/// the caller and the callee alike, so every c17-only program agreed with
+/// itself -- this links against gcc in both directions, which is the only
+/// shape that can see it.
+///
+/// The five shapes are the discriminating ones, and it is the *alignment*
+/// that decides, not the type: `struct { __int128 x; }` and a struct whose
+/// first member carries `aligned(16)` round, while the same struct carrying
+/// `aligned(16)` on *itself* does not, and neither does a packed one. Five
+/// leading `long`s make NGRN odd so the rounding is observable at all.
+#[test]
+fn codegen_aarch64_agrees_with_gcc_on_even_register_pairing() {
+    if !aarch64_cross_available() {
+        eprintln!(
+            "SKIP codegen_aarch64_agrees_with_gcc_on_even_register_pairing: \
+             no aarch64 cross toolchain"
+        );
+        return;
+    }
+
+    let decls = r#"
+#include <stdarg.h>
+typedef struct { __int128 x; } N16;                                    /* natural 16 */
+typedef struct { long long a, b; } N8;                                 /* 8 */
+typedef struct __attribute__((aligned(16))) { long long a, b; } A16;   /* own attribute */
+typedef struct { long long a __attribute__((aligned(16))); long long b; } M16;
+typedef struct __attribute__((packed)) { __int128 x; } P16;
+int t_n16(long, long, long, long, long, N16, long, long);
+int t_n8(long, long, long, long, long, N8, long, long);
+int t_a16(long, long, long, long, long, A16, long, long);
+int t_m16(long, long, long, long, long, M16, long, long);
+int t_p16(long, long, long, long, long, P16, long, long);
+int t_i128(long, long, long, long, long, __int128, long, long);
+int t_ovf(long, long, long, long, long, long, long, N8, long);
+int t_va(int, ...);
+"#;
+
+    let callee_src = format!(
+        "{decls}{}",
+        r#"
+#define CHK(cond) return (cond) ? 0 : __LINE__
+int t_n16(long a, long b, long c, long d, long e, N16 s, long f, long g)
+{ (void)b;(void)c;(void)d; CHK(a==1 && e==5 && (long)s.x==77 && f==8 && g==9); }
+int t_n8(long a, long b, long c, long d, long e, N8 s, long f, long g)
+{ (void)b;(void)c;(void)d; CHK(a==1 && e==5 && s.a==77 && s.b==78 && f==8 && g==9); }
+int t_a16(long a, long b, long c, long d, long e, A16 s, long f, long g)
+{ (void)b;(void)c;(void)d; CHK(a==1 && e==5 && s.a==77 && s.b==78 && f==8 && g==9); }
+int t_m16(long a, long b, long c, long d, long e, M16 s, long f, long g)
+{ (void)b;(void)c;(void)d; CHK(a==1 && e==5 && s.a==77 && s.b==78 && f==8 && g==9); }
+int t_p16(long a, long b, long c, long d, long e, P16 s, long f, long g)
+{ (void)b;(void)c;(void)d; CHK(a==1 && e==5 && (long)s.x==77 && f==8 && g==9); }
+int t_i128(long a, long b, long c, long d, long e, __int128 s, long f, long g)
+{ (void)b;(void)c;(void)d; CHK(a==1 && e==5 && (long)s==77 && f==8 && g==9); }
+
+/* Stage C.11: the pair does not fit, so `h` is on the stack as well. */
+int t_ovf(long a, long b, long c, long d, long e, long f, long g, N8 s, long h)
+{ (void)b;(void)c;(void)d;(void)e;(void)f; CHK(a==1 && g==7 && s.a==77 && s.b==78 && h==9); }
+
+/* `va_arg` walks the same stage-C state, and rounds `__gr_offs` to 16 for a
+   16-aligned argument exactly as gcc does. */
+int t_va(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    for (int i = 0; i < 5; i++)
+        if (va_arg(ap, long) != i + 1) { va_end(ap); return __LINE__; }
+    N16 s = va_arg(ap, N16);
+    long f = va_arg(ap, long);
+    va_end(ap);
+    return ((long)s.x == 77 && f == 8) ? 0 : __LINE__;
+}
+"#
+    );
+
+    let caller_src = format!(
+        "{decls}{}",
+        r#"
+int main(void)
+{
+    N16 n16 = { 77 };
+    N8 n8 = { 77, 78 };
+    A16 a16 = { 77, 78 };
+    M16 m16 = { 77, 78 };
+    P16 p16 = { 77 };
+    __int128 i128 = 77;
+    if (t_n16(1, 2, 3, 4, 5, n16, 8, 9)) return 1;
+    if (t_n8(1, 2, 3, 4, 5, n8, 8, 9)) return 2;
+    if (t_a16(1, 2, 3, 4, 5, a16, 8, 9)) return 3;
+    if (t_m16(1, 2, 3, 4, 5, m16, 8, 9)) return 4;
+    if (t_p16(1, 2, 3, 4, 5, p16, 8, 9)) return 5;
+    if (t_i128(1, 2, 3, 4, 5, i128, 8, 9)) return 6;
+    if (t_ovf(1, 2, 3, 4, 5, 6, 7, n8, 9)) return 7;
+    if (t_va(0, 1L, 2L, 3L, 4L, 5L, n16, 8L)) return 8;
+    return 0;
+}
+"#
+    );
+
+    let callee_c = create_c_file("a64_pair_callee", &callee_src);
+    let caller_c = create_c_file("a64_pair_caller", &caller_src);
+    let callee_path = callee_c.path().to_string_lossy().to_string();
+    let caller_path = caller_c.path().to_string_lossy().to_string();
+
+    for opt in ["-O0", "-O2"] {
+        let mut asm_paths = Vec::new();
+        for (tag, src_path) in [("callee", &callee_path), ("caller", &caller_path)] {
+            let out = plib::tmp::Builder::new()
+                .prefix(&format!("c17_a64_pair_{tag}_"))
+                .suffix(".s")
+                .tempfile()
+                .expect("failed to create temp file");
+            let out_path = out.path().to_string_lossy().to_string();
+            let run = run_c17(&[
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                opt,
+                "-S",
+                "-o",
+                &out_path,
+                src_path,
+            ]);
+            assert!(
+                run.success,
+                "c17 failed on the {tag} at {opt}:\n{}",
+                run.stderr
+            );
+            asm_paths.push((out, out_path));
+        }
+        let callee_asm = asm_paths[0].1.clone();
+        let caller_asm = asm_paths[1].1.clone();
+
+        assert_eq!(
+            cross_link_and_run("a64_pair_ref", &[&caller_path, &callee_path]),
+            0,
+            "the gcc/gcc reference must pass, or this probe is not testing the ABI"
+        );
+        assert_eq!(
+            cross_link_and_run("a64_pair_c17_callee", &[&caller_path, &callee_asm]),
+            0,
+            "{opt}: a gcc caller must reach a c17 callee -- c17 read the \
+             16-aligned aggregate from the odd register gcc skipped"
+        );
+        assert_eq!(
+            cross_link_and_run("a64_pair_c17_caller", &[&caller_asm, &callee_path]),
+            0,
+            "{opt}: a c17 caller must reach a gcc callee -- c17 wrote the \
+             16-aligned aggregate to the odd register gcc does not read"
+        );
+        assert_eq!(
+            cross_link_and_run("a64_pair_c17_both", &[&caller_asm, &callee_asm]),
+            0,
+            "{opt}: c17 must also agree with itself"
+        );
+    }
+}
+
+/// A Darwin variadic `__int128` argument occupies **sixteen** bytes of the
+/// caller's outgoing area, on a sixteen-byte boundary.
+///
+/// The reading side got its second eightbyte first; the writing side kept
+/// giving every non-aggregate scalar exactly one eight-byte granule and never
+/// aligning a slot, so the caller wrote half the value and the next argument
+/// landed on top of the other half. Both sides were wrong the same way, so no
+/// c17-only program could see it -- only a clang-compiled callee, which is how
+/// it reached macOS CI. LLVM's Darwin vararg convention stacks an `i128` as
+/// sixteen bytes, sixteen-aligned, and clang's `va_arg` rounds the cursor to
+/// match.
+///
+/// Asserted on assembly because it cannot be executed here: there is no macOS
+/// runner and qemu cannot run Mach-O.
+#[test]
+fn codegen_darwin_variadic_int128_takes_two_granules() {
+    let src = r#"
+__int128 wide(int n, ...);
+
+/* One leading `int` leaves the cursor at 8, so a 16-aligned slot has to skip
+   to 16 -- with no leading argument at all, 0 is already aligned and the test
+   would pass without any rounding. */
+__int128 call_odd(__int128 u) { return wide(1, 0, u); }
+__int128 call_even(__int128 u) { return wide(0, u); }
+"#;
+    let asm = asm_for("darwin_variadic_int128", "aarch64-apple-darwin", src);
+
+    for (func, want) in [("call_odd", "[sp, #16]"), ("call_even", "[sp]")] {
+        let body = body_of(&asm, func);
+        let stores: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("stp x") && l.contains("[sp"))
+            .collect();
+        assert!(
+            stores.iter().any(|l| l.ends_with(want)),
+            "{func}: the __int128 must be stored as a pair at {want}, so that \
+             both eightbytes reach the callee and the slot is 16-aligned; \
+             found {stores:?}\n{body}"
+        );
+    }
+
+    // The area has to be big enough for the sixteen-byte slot plus the
+    // rounding, not one granule per argument.
+    let odd = body_of(&asm, "call_odd");
+    let sub = odd
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("sub sp, sp, #"))
+        .unwrap_or_else(|| panic!("call_odd reserves no outgoing area:\n{odd}"));
+    let bytes: i32 = sub
+        .rsplit('#')
+        .next()
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("unparsable reservation `{sub}`"));
+    assert!(
+        bytes >= 32,
+        "call_odd reserved {bytes} bytes: an `int` then a 16-aligned \
+         `__int128` needs 8 + 8 of padding + 16\n{odd}"
+    );
+}
+
+/// A Darwin variadic argument that wants more than sixteen bytes of alignment
+/// makes the caller realign its outgoing area.
+///
+/// clang's `va_arg` rounds the cursor up to the type's own alignment, so the
+/// argument has to be at an address that is actually that aligned -- and
+/// `%sp` is guaranteed only to sixteen, which makes rounding a static offset
+/// meaningless on its own. The caller therefore rounds `%sp` down and stashes
+/// the old value above the arguments, because the amount the rounding
+/// consumed is not known until it runs.
+///
+/// clang's own caller does *not* do this: it stacks an over-aligned aggregate
+/// a legalized element at a time in eight-byte granules, disagreeing with its
+/// own `va_arg`. c17 follows `va_arg`. See the divergence recorded in
+/// `cc/doc/TODO.md`.
+///
+/// Asserted on assembly because it cannot be executed here: there is no macOS
+/// runner and qemu cannot run Mach-O.
+#[test]
+fn codegen_darwin_variadic_over_aligned_realigns_the_outgoing_area() {
+    let src = r#"
+struct __attribute__((aligned (32))) A32 { double a, b, c, d; };
+int variadic(int n, ...);
+
+/* Nine leading doubles leave the cursor at 72, which is neither 16- nor
+   32-aligned, so the rounding is observable. */
+int call(struct A32 s)
+{
+    return variadic(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, s, 9);
+}
+"#;
+    let asm = asm_for("darwin_va_overalign", "aarch64-apple-darwin", src);
+    let body = body_of(&asm, "call");
+    let lines: Vec<&str> = body.lines().map(str::trim).collect();
+
+    assert!(
+        lines.iter().any(|l| l.starts_with("and x17, x17, x")),
+        "the outgoing area's base must be rounded down to the argument's \
+         alignment; %sp only guarantees 16:\n{body}"
+    );
+    // The old %sp is saved and restored, because the rounding consumed an
+    // amount no `add` can undo.
+    let save = lines
+        .iter()
+        .find(|l| l.starts_with("str x16, [sp, #"))
+        .unwrap_or_else(|| panic!("the pre-call %sp is never saved:\n{body}"));
+    let slot = save
+        .rsplit_once("#")
+        .and_then(|(_, rest)| rest.trim_end_matches(']').parse::<i32>().ok())
+        .unwrap_or_else(|| panic!("unparsable save `{save}`"));
+    assert!(
+        lines
+            .iter()
+            .any(|l| *l == format!("ldr x16, [sp, #{slot}]")),
+        "the saved %sp at {slot} is never read back:\n{body}"
+    );
+    assert!(
+        lines.contains(&"add sp, x16, #0"),
+        "%sp is never restored from the saved value:\n{body}"
+    );
+
+    // The struct itself has to land on a 32-byte boundary of that base: nine
+    // eight-byte slots end at 72, so the next multiple of 32 is 96.
+    assert!(
+        lines.iter().any(|l| l.contains("[sp, #96]")),
+        "the 32-aligned argument must start at 96, not at the next granule:\n{body}"
+    );
+}
+
+/// Darwin's `va_arg` reads a whole argument and advances by its whole slot.
+///
+/// Darwin has its own emitters on both sides of a variadic call, and three
+/// separate fixes in this area reached the AAPCS64 one and not this one --
+/// each time caller and reader stayed wrong together, so every c17-only
+/// program agreed with itself and only macOS CI disagreed. There is no macOS
+/// runner here and qemu cannot run Mach-O, so this is the check that runs
+/// locally.
+///
+/// Two numbers per type, and both have been wrong: the bytes read from the
+/// cursor (an `__int128` had one eightbyte copied and the other left as
+/// whatever the destination held) and the advance, which is the slot
+/// `darwin_va_slot` hands the caller.
+///
+/// `BIG24` is the row that is not its own size either way: a non-homogeneous
+/// aggregate past sixteen bytes travels as a pointer, so one eightbyte is
+/// read from the cursor and the object comes through it.
+#[test]
+fn codegen_darwin_va_arg_reads_a_whole_argument() {
+    let src = r#"
+#include <stdarg.h>
+typedef struct { long long a, b; } G16;
+typedef struct { double a, b, c, d; } H32;
+typedef struct { long long a, b, c; } BIG24;
+#define MK(name, T) T name(int n, ...) \
+    { va_list ap; va_start(ap, n); T v = va_arg(ap, T); va_end(ap); return v; }
+MK(f_long, long)
+MK(f_dbl, double)
+MK(f_i128, __int128)
+MK(f_g16, G16)
+MK(f_h32, H32)
+MK(f_big, BIG24)
+"#;
+    let asm = asm_for("darwin_va_slots", "aarch64-apple-darwin", src);
+
+    for (func, read, advance, why) in [
+        ("f_long", 8, 8, "a long is one granule"),
+        ("f_dbl", 8, 8, "a double is one granule"),
+        (
+            "f_i128",
+            16,
+            16,
+            "an __int128 is two eightbytes and two granules, not one of each",
+        ),
+        ("f_g16", 16, 16, "a sixteen-byte composite is its own size"),
+        ("f_h32", 32, 32, "a thirty-two-byte HFA is its own size"),
+        (
+            "f_big",
+            8,
+            8,
+            "a non-HFA past sixteen bytes travels as a pointer",
+        ),
+    ] {
+        let body = body_of(&asm, func);
+        let lines: Vec<&str> = body.lines().map(str::trim).collect();
+
+        // The cursor is the register that advances into itself; everything
+        // else here computes a frame address into a different one.
+        let mut cursor = None;
+        let mut advances = Vec::new();
+        for l in &lines {
+            let Some(rest) = l.strip_prefix("add ") else {
+                continue;
+            };
+            let Some((dst, rest)) = rest.split_once(", ") else {
+                continue;
+            };
+            let Some((src, imm)) = rest.split_once(", #") else {
+                continue;
+            };
+            if dst == src {
+                if let Ok(n) = imm.parse::<i64>() {
+                    cursor = Some(dst.to_string());
+                    advances.push(n);
+                }
+            }
+        }
+        let cursor =
+            cursor.unwrap_or_else(|| panic!("{func}: va_arg never advances a cursor:\n{body}"));
+        assert!(
+            advances.contains(&advance),
+            "{func}: {why}, so the cursor must advance by {advance}; \
+             found {advances:?}\n{body}"
+        );
+
+        // How far past the cursor the argument is read. `emit_va_arg_bytes`
+        // walks it in descending chunk sizes, so the last offset plus its
+        // width is the whole of what was copied.
+        let mut read_end = 0i64;
+        for l in &lines {
+            let (op, rest) = match (l.strip_prefix("ldr "), l.strip_prefix("ldp ")) {
+                (Some(r), _) => ("ldr", r),
+                (_, Some(r)) => ("ldp", r),
+                _ => continue,
+            };
+            let Some((regs, addr)) = rest.rsplit_once(", [") else {
+                continue;
+            };
+            let addr = addr.trim_end_matches(']');
+            let (base, off) = match addr.split_once(", #") {
+                Some((b, o)) => (b, o.parse::<i64>().unwrap_or(0)),
+                None => (addr, 0),
+            };
+            if base != cursor {
+                continue;
+            }
+            // A `w` destination moves four bytes, an `x` one eight, and `ldp`
+            // moves two of them.
+            let width = if regs.trim_start().starts_with('w') {
+                4
+            } else {
+                8
+            };
+            let width = if op == "ldp" { width * 2 } else { width };
+            read_end = read_end.max(off + width);
+        }
+        assert_eq!(
+            read_end, read,
+            "{func}: {why}, so {read} bytes must be read from the cursor \
+             {cursor}, not {read_end}\n{body}"
         );
     }
 }

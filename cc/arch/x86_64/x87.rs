@@ -36,10 +36,7 @@ impl X86_64CodeGen {
     /// register has to go through memory. The region is reserved by
     /// [`X87_SCRATCH_BYTES`]; never address it by hand.
     fn x87_scratch_addr(&self) -> MemAddr {
-        MemAddr::BaseOffset {
-            base: Reg::Rbp,
-            offset: -(self.callee_saved_offset + X87_SCRATCH_BYTES),
-        }
+        self.stack_mem(X87_SCRATCH_BYTES)
     }
 
     /// Check if this instruction operates on long double (80-bit x87)
@@ -90,19 +87,12 @@ impl X86_64CodeGen {
                     .iter()
                     .find(|p| p.id == addr)
                     .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
-                let adjusted = offset + self.callee_saved_offset;
                 if is_symbol {
-                    MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -(adjusted) + insn.offset as i32,
-                    }
+                    self.stack_field(offset, insn.offset as i32)
                 } else {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
+                        src: GpOperand::Mem(self.stack_mem(offset)),
                         dst: GpOperand::Reg(Reg::R11),
                     });
                     MemAddr::BaseOffset {
@@ -217,12 +207,8 @@ impl X86_64CodeGen {
             dst: GpOperand::Mem(overflow),
         });
 
-        let adjusted_offset = -(*dst_offset + self.callee_saved_offset);
         self.push_lir(X86Inst::X87Store {
-            addr: MemAddr::BaseOffset {
-                base: Reg::Rbp,
-                offset: adjusted_offset,
-            },
+            addr: self.stack_mem(*dst_offset),
         });
     }
 
@@ -262,20 +248,13 @@ impl X86_64CodeGen {
                     .iter()
                     .find(|p| p.id == addr)
                     .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
-                let adjusted = offset + self.callee_saved_offset;
                 if is_symbol {
-                    MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -(adjusted) + insn.offset as i32,
-                    }
+                    self.stack_field(offset, insn.offset as i32)
                 } else {
                     // Load the pointer, then address through it.
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
+                        src: GpOperand::Mem(self.stack_mem(offset)),
                         dst: GpOperand::Reg(Reg::R11),
                     });
                     MemAddr::BaseOffset {
@@ -514,7 +493,12 @@ impl X86_64CodeGen {
         match loc {
             Loc::Reg(r) => r,
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
+                // `stack_mem` picks the base register: an over-aligned frame
+                // addresses its locals through a second base, and spelling
+                // `-(offset + callee_saved_offset)(%rbp)` by hand named a
+                // different address entirely. A stacked aggregate argument
+                // passed from such a frame then copied from a garbage pointer.
+                let addr = self.stack_mem(offset);
                 let is_symbol = self
                     .pseudos
                     .iter()
@@ -524,19 +508,13 @@ impl X86_64CodeGen {
                     // The slot *is* the storage: take its address.
                     self.push_lir(X86Inst::Lea {
                         dst: Reg::R11,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        },
+                        addr,
                     });
                 } else {
                     // The slot holds a pointer to the storage.
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
+                        src: GpOperand::Mem(addr),
                         dst: GpOperand::Reg(Reg::R11),
                     });
                 }
@@ -567,13 +545,7 @@ impl X86_64CodeGen {
     pub(super) fn get_x87_mem_addr(&mut self, pseudo: PseudoId) -> MemAddr {
         let loc = self.get_location(pseudo);
         match loc {
-            Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
-                MemAddr::BaseOffset {
-                    base: Reg::Rbp,
-                    offset: -adjusted,
-                }
-            }
+            Loc::Stack(offset) => self.stack_mem(offset),
             Loc::IncomingArg(offset) => MemAddr::BaseOffset {
                 base: Reg::Rbp,
                 offset,
@@ -642,13 +614,7 @@ impl X86_64CodeGen {
         // Helper to get memory address for non-long-double operand
         let get_mem_addr = |loc: &Loc, this: &Self| -> MemAddr {
             match loc {
-                Loc::Stack(offset) => {
-                    let adjusted = offset + this.callee_saved_offset;
-                    MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    }
-                }
+                Loc::Stack(offset) => this.stack_mem(*offset),
                 Loc::IncomingArg(offset) => MemAddr::BaseOffset {
                     base: Reg::Rbp,
                     offset: *offset,
@@ -799,13 +765,7 @@ impl X86_64CodeGen {
 
         // We need the integer in memory for fild. If it's in a register, store it first.
         let src_addr = match &src_loc {
-            Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
-                MemAddr::BaseOffset {
-                    base: Reg::Rbp,
-                    offset: -adjusted,
-                }
-            }
+            Loc::Stack(offset) => self.stack_mem(*offset),
             Loc::IncomingArg(offset) => MemAddr::BaseOffset {
                 base: Reg::Rbp,
                 offset: *offset,
@@ -816,11 +776,7 @@ impl X86_64CodeGen {
                 let dst_loc = self.get_location(target);
                 let temp_addr = if let Loc::Stack(offset) = &dst_loc {
                     // Use the bottom part of the destination (which is 16 bytes)
-                    let adjusted = offset + self.callee_saved_offset;
-                    MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    }
+                    self.stack_mem(*offset)
                 } else {
                     // Use a fixed scratch location after callee-saved area
                     self.x87_scratch_addr()
@@ -905,13 +861,7 @@ impl X86_64CodeGen {
         let needs_load_to_reg = matches!(&dst_loc, Loc::Reg(_) | Loc::Xmm(_));
 
         let store_addr = match &dst_loc {
-            Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
-                MemAddr::BaseOffset {
-                    base: Reg::Rbp,
-                    offset: -adjusted,
-                }
-            }
+            Loc::Stack(offset) => self.stack_mem(*offset),
             Loc::IncomingArg(offset) => MemAddr::BaseOffset {
                 base: Reg::Rbp,
                 offset: *offset,

@@ -23,6 +23,18 @@ use crate::strings::StringId;
 use crate::types::TypeTable;
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 
+/// Which construct a jump leaves, for `unwind_vla_marks`.
+///
+/// `break` leaves the innermost loop *or* switch; `continue` leaves the
+/// innermost loop, which may be several switches out. The two ask different
+/// nesting counters, and conflating them left a VLA unreclaimed on
+/// `continue` from inside a `switch`.
+#[derive(Clone, Copy)]
+enum JumpKind {
+    Break,
+    Continue,
+}
+
 impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_stmt(&mut self, stmt: &Stmt) {
         match stmt {
@@ -34,13 +46,21 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             Stmt::Block(items) => {
                 self.push_scope();
-
+                // A VLA's storage lives until control leaves the scope of its
+                // declaration (C17 6.2.4p7). Capture the stack pointer on the
+                // way in and put it back on the way out, or a loop body's VLA
+                // is allocated afresh every iteration and never released --
+                // `for (...) { int x[n]; }` died of stack exhaustion.
+                let vla_scope = self.open_vla_scope();
                 for item in items {
                     match item {
                         BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
                         BlockItem::Statement(s) => self.linearize_stmt(s),
                     }
                 }
+                // Only on the falling-out path: a `break`, `continue` or
+                // `return` that left already did its own unwinding.
+                self.close_vla_scope(vla_scope);
 
                 self.pop_scope();
             }
@@ -179,6 +199,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Break(_) => {
                 if let Some(&target) = self.break_targets.last() {
                     if let Some(current) = self.current_bb {
+                        self.unwind_vla_marks(JumpKind::Break);
                         self.emit(Instruction::br(target));
                         self.link_bb(current, target);
                     }
@@ -188,6 +209,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Continue(_) => {
                 if let Some(&target) = self.continue_targets.last() {
                     if let Some(current) = self.current_bb {
+                        self.unwind_vla_marks(JumpKind::Continue);
                         self.emit(Instruction::br(target));
                         self.link_bb(current, target);
                     }
@@ -232,6 +254,23 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let label_str = self.str(*label).to_string();
                 let target = self.get_or_create_label(&label_str);
                 if let Some(current) = self.current_bb {
+                    // A backward jump -- the label is already linearized, so
+                    // it has a captured stack pointer -- leaves the scope of
+                    // every VLA declared after it, and that storage has to go
+                    // back. Otherwise `lab: int x[n]; ... goto lab;` grows the
+                    // stack every time round until the program dies.
+                    //
+                    // A *forward* jump has no captured pointer yet, and needs
+                    // none: C17 6.8.6.1p1 forbids jumping into the scope of a
+                    // variably modified declaration, so a forward jump either
+                    // stays ahead of every VLA or leaves the block, and the
+                    // block's own exit does the restoring.
+                    if let Some(&depth) = self.label_vla_depth.get(&label_str) {
+                        if let Some(m) = self.vla_marks.get(depth) {
+                            let mark = m.mark;
+                            self.emit_stack_restore(mark);
+                        }
+                    }
                     self.emit(Instruction::br(target));
                     self.link_bb(current, target);
                 }
@@ -255,6 +294,23 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
 
                 self.switch_bb(label_bb);
+                // Remember how many VLA marks were in force here. A backward
+                // jump to this label leaves the scope of every VLA declared
+                // *after* it, and the first such declaration's mark is the
+                // stack as it stood at the label -- so that mark is what the
+                // jump restores.
+                //
+                // Recorded as an index rather than captured at the label,
+                // because a label can be reachable only by the jump itself:
+                // `if (0) { lab: ; }` never runs a capture placed there, and
+                // restoring from it read an uninitialized register. The mark
+                // this index names is always written first, since the
+                // declaration that creates it lies between the label and the
+                // jump.
+                if self.func_has_vla {
+                    self.label_vla_depth
+                        .insert(name_str.clone(), self.vla_marks.len());
+                }
                 self.linearize_stmt(stmt);
             }
 
@@ -576,6 +632,12 @@ impl<'a> super::linearize::Linearizer<'a> {
             .with_size(64)
             .with_type(self.types.ulong_id);
         self.emit(mul_insn);
+
+        // Capture the stack pointer before this array is allocated, so
+        // whatever later leaves the array's scope can put it back. One mark
+        // per declaration rather than per block: a label between two VLAs
+        // must release only the one that follows it.
+        self.push_vla_mark();
 
         // Emit Alloca instruction to allocate stack space
         let alloca_result = self.alloc_pseudo();
@@ -1367,7 +1429,15 @@ impl<'a> super::linearize::Linearizer<'a> {
                 &[&named],
             );
         }
-        let size = self.types.size_bits(expr_type);
+        // C17 6.8.4.2p5: the integer promotions are performed on the
+        // controlling expression, and each case constant is converted to the
+        // *promoted* type. Comparing at the operand's own narrow width made a
+        // label collide with a value it does not equal: `switch ((signed
+        // char) -1)` matched `case 255:`, because both are 0xFF in eight bits,
+        // where the promoted comparison is -1 against 255.
+        let cmp_type = self.types.integer_promote(expr_type);
+        let switch_val = self.emit_convert(switch_val, expr_type, cmp_type);
+        let size = self.types.size_bits(cmp_type);
 
         let exit_bb = self.alloc_bb();
 
@@ -1375,7 +1445,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.break_targets.push(exit_bb);
 
         // Collect case labels and create basic blocks for each
-        let switch_unsigned = self.types.is_unsigned(expr_type);
+        let switch_unsigned = self.types.is_unsigned(cmp_type);
         let (case_values, has_default) = self.collect_switch_cases(body, switch_unsigned);
         let case_bbs: Vec<BasicBlockId> = case_values.iter().map(|_| self.alloc_bb()).collect();
         let default_bb = if has_default {
@@ -1384,32 +1454,48 @@ impl<'a> super::linearize::Linearizer<'a> {
             None
         };
 
-        // Build switch instruction with case -> block mapping
-        let switch_cases: Vec<(i64, i64, BasicBlockId)> = case_values
-            .iter()
-            .zip(case_bbs.iter())
-            .map(|((lo, hi), bb)| (*lo, *hi, *bb))
-            .collect();
-
         // Default goes to default_bb if present, otherwise exit_bb
         let default_target = default_bb.unwrap_or(exit_bb);
 
-        // Emit switch instruction
-        self.emit(Instruction::switch_insn(
-            switch_val,
-            switch_cases.clone(),
-            Some(default_target),
-            size,
-        ));
+        if size > 64 {
+            // The `Switch` instruction carries its labels as `i64` and both
+            // backends compare in one general register, so a controlling
+            // expression wider than that had its high half ignored:
+            // `switch ((__int128)1 << 64)` matched `case 0:`. A wide switch
+            // is lowered to explicit comparisons instead, which go through
+            // the ordinary 128-bit compare path and are right at any width.
+            self.emit_wide_switch(
+                switch_val,
+                cmp_type,
+                &case_values,
+                &case_bbs,
+                default_target,
+            );
+        } else {
+            // Build switch instruction with case -> block mapping
+            let switch_cases: Vec<(i64, i64, BasicBlockId)> = case_values
+                .iter()
+                .zip(case_bbs.iter())
+                .map(|((lo, hi), bb)| (*lo as i64, *hi as i64, *bb))
+                .collect();
 
-        // Link CFG edges from current block to all case/default/exit blocks
-        if let Some(current) = self.current_bb {
-            for &(_, _, bb) in &switch_cases {
-                self.link_bb(current, bb);
-            }
-            self.link_bb(current, default_target);
-            if default_bb.is_none() {
-                self.link_bb(current, exit_bb);
+            // Emit switch instruction
+            self.emit(Instruction::switch_insn(
+                switch_val,
+                switch_cases.clone(),
+                Some(default_target),
+                size,
+            ));
+
+            // Link CFG edges from current block to all case/default/exit blocks
+            if let Some(current) = self.current_bb {
+                for &(_, _, bb) in &switch_cases {
+                    self.link_bb(current, bb);
+                }
+                self.link_bb(current, default_target);
+                if default_bb.is_none() {
+                    self.link_bb(current, exit_bb);
+                }
             }
         }
 
@@ -1451,7 +1537,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         &self,
         body: &Stmt,
         unsigned: bool,
-    ) -> (Vec<(i64, i64)>, bool) {
+    ) -> (Vec<(i128, i128)>, bool) {
         let mut case_values = Vec::new();
         let mut has_default = false;
 
@@ -1632,7 +1718,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn collect_cases_from_stmt(
         &self,
         stmt: &Stmt,
-        case_values: &mut Vec<(i64, i64)>,
+        case_values: &mut Vec<(i128, i128)>,
         has_default: &mut bool,
         unsigned: bool,
     ) {
@@ -1640,7 +1726,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Case(expr, high) => {
                 // Extract constant value from case expression
                 if let Some(val) = self.eval_const_expr(expr) {
-                    let val = val as i64; // switch cases truncated to i64
+                    // Kept at full width. Truncating to `i64` here was silent
+                    // and wrong for a `switch` on `__int128`: a label outside
+                    // the 64-bit range wrapped into it and could match a value
+                    // it does not equal.
 
                     // A GNU range `case lo ... hi:`. An absent high endpoint
                     // is the ordinary label, held as the degenerate range
@@ -1648,7 +1737,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let hi = match high {
                         None => Some(val),
                         Some(hi_expr) => match self.eval_const_expr(hi_expr) {
-                            Some(h) => Some(h as i64),
+                            Some(h) => Some(h),
                             None => {
                                 self.report_unfoldable_case(hi_expr);
                                 None
@@ -1661,18 +1750,20 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // extends that to overlapping ranges -- an overlap would
                     // otherwise make one arm silently unreachable, since the
                     // body walk resolves a label by finding the first match.
-                    // Order by the switch type's own signedness. The endpoints
-                    // are carried as `i64`, so an unsigned 64-bit bound above
-                    // `i64::MAX` looks negative: `case 0ul ... ULONG_MAX:` read
-                    // as an empty range and never matched.
-                    let below = |a: i64, b: i64| {
+                    // Order by the switch type's own signedness. The
+                    // endpoints are carried as `i128`, and an unsigned 64-bit
+                    // bound above `i64::MAX` is still positive there -- but an
+                    // unsigned *128-bit* one is not, so the reinterpretation
+                    // is still needed: `case 0ul ... ULONG_MAX:` read as an
+                    // empty range and never matched.
+                    let below = |a: i128, b: i128| {
                         if unsigned {
-                            (a as u64) < (b as u64)
+                            (a as u128) < (b as u128)
                         } else {
                             a < b
                         }
                     };
-                    let at_most = |a: i64, b: i64| !below(b, a);
+                    let at_most = |a: i128, b: i128| !below(b, a);
                     if below(hi, val) {
                         // GCC accepts an empty range, warns, and never matches
                         // it. Nothing is recorded, so nothing can overlap it.
@@ -2146,10 +2237,67 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Linearize switch body, switching basic blocks at case/default labels
+    /// Lower a `switch` whose controlling expression is wider than a general
+    /// register into explicit comparisons.
+    ///
+    /// The `Switch` instruction carries its labels as `i64` and both backends
+    /// compare the value in one register, so a `__int128` controlling
+    /// expression had its high half ignored -- `switch ((__int128)1 << 64)`
+    /// matched `case 0:`. Comparing explicitly goes through the ordinary
+    /// 128-bit compare path, which is right at any width, and keeps the case
+    /// constants at full precision too.
+    ///
+    /// Leaves the cursor on a block that falls into `default_target`, and
+    /// links every edge it creates.
+    fn emit_wide_switch(
+        &mut self,
+        switch_val: PseudoId,
+        cmp_type: TypeId,
+        case_values: &[(i128, i128)],
+        case_bbs: &[BasicBlockId],
+        default_target: BasicBlockId,
+    ) {
+        let size = self.types.size_bits(cmp_type);
+        let unsigned = self.types.is_unsigned(cmp_type);
+        // `>=` and `<=` for a range, in the controlling type's own signedness.
+        let (ge, le) = if unsigned {
+            (Opcode::SetAe, Opcode::SetBe)
+        } else {
+            (Opcode::SetGe, Opcode::SetLe)
+        };
+
+        for (&(lo, hi), &case_bb) in case_values.iter().zip(case_bbs.iter()) {
+            let Some(from) = self.current_bb else { return };
+            let next = self.alloc_bb();
+            let cond = if lo == hi {
+                let k = self.emit_const(lo, cmp_type);
+                self.emit_int_binop(Opcode::SetEq, switch_val, k, cmp_type, size)
+            } else {
+                // A GNU `case lo ... hi:` range.
+                let lo_k = self.emit_const(lo, cmp_type);
+                let hi_k = self.emit_const(hi, cmp_type);
+                let at_least = self.emit_int_binop(ge, switch_val, lo_k, cmp_type, size);
+                let at_most = self.emit_int_binop(le, switch_val, hi_k, cmp_type, size);
+                let int_typ = self.types.int_id;
+                let int_bits = self.types.size_bits(int_typ);
+                self.emit_int_binop(Opcode::And, at_least, at_most, int_typ, int_bits)
+            };
+            self.emit(Instruction::cbr(cond, case_bb, next));
+            self.link_bb(from, case_bb);
+            self.link_bb(from, next);
+            self.switch_bb(next);
+        }
+
+        if let Some(from) = self.current_bb {
+            self.emit(Instruction::br(default_target));
+            self.link_bb(from, default_target);
+        }
+    }
+
     pub(crate) fn linearize_switch_body(
         &mut self,
         body: &Stmt,
-        case_values: &[(i64, i64)],
+        case_values: &[(i128, i128)],
         case_bbs: &[BasicBlockId],
         default_bb: Option<BasicBlockId>,
     ) {
@@ -2160,6 +2308,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         // `collect_switch_cases`, which has to agree about this.
         match body {
             Stmt::Block(items) => {
+                // Same VLA reclamation as the ordinary block arm: a switch
+                // body is lowered by its own walk, and leaving the rule out
+                // here let `switch (c) { case 0: { int v[n]; break; } }`
+                // inside a loop grow the stack without bound.
+                let vla_scope = self.open_vla_scope();
                 for item in items {
                     match item {
                         BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
@@ -2174,6 +2327,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         }
                     }
                 }
+                self.close_vla_scope(vla_scope);
             }
             stmt => {
                 self.linearize_switch_stmt(stmt, case_values, case_bbs, default_bb, &mut case_idx)
@@ -2184,7 +2338,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_switch_stmt(
         &mut self,
         stmt: &Stmt,
-        case_values: &[(i64, i64)],
+        case_values: &[(i128, i128)],
         case_bbs: &[BasicBlockId],
         default_bb: Option<BasicBlockId>,
         case_idx: &mut usize,
@@ -2197,10 +2351,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // rejects that pair anyway, but matching on the low endpoint
                 // alone would have made the two indistinguishable here.
                 if let Some(val) = self.eval_const_expr(expr) {
-                    let lo = val as i64;
+                    // Matched at full width, as the collector records them.
+                    let lo = val;
                     let hi = match high {
                         None => Some(lo),
-                        Some(hi_expr) => self.eval_const_expr(hi_expr).map(|h| h as i64),
+                        Some(hi_expr) => self.eval_const_expr(hi_expr),
                     };
                     let Some(hi) = hi else { return };
                     if let Some(idx) = case_values.iter().position(|r| *r == (lo, hi)) {
@@ -2381,6 +2536,8 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             Stmt::Block(items) => {
                 self.push_scope();
+                // See the sibling arm in `linearize_switch_body`.
+                let vla_scope = self.open_vla_scope();
                 for item in items {
                     match item {
                         BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
@@ -2395,6 +2552,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         }
                     }
                 }
+                self.close_vla_scope(vla_scope);
                 self.pop_scope();
             }
 
@@ -2513,10 +2671,19 @@ impl<'a> super::linearize::Linearizer<'a> {
             out_has_tied_input
         };
 
+        // Where each non-parameter output operand lives, resolved **once**.
+        // A `+r` operand is read before the asm and written after it, and both
+        // sides used to call `linearize_lvalue` on the operand expression --
+        // so `asm("" : "+r"(*bar()))` called `bar` twice. Same rule as any
+        // other read-modify-write (see `RmwPlace`).
+        let mut output_places: Vec<Option<super::linearize_emit::RmwPlace>> =
+            Vec::with_capacity(outputs.len());
+
         // Process output operands
         for (output_idx, op) in outputs.iter().enumerate() {
             // Parse constraint to get flags
             let (is_memory, is_readwrite, _matching) = self.parse_asm_constraint(&op.constraint);
+            let place = self.resolve_rmw_place(&op.expr);
 
             // Get symbolic name if present
             let name = op.name.map(|n| self.str(n).to_string());
@@ -2532,7 +2699,14 @@ impl<'a> super::linearize::Linearizer<'a> {
             // level. Just use the lvalue address as the asm operand
             // pseudo directly.
             if is_memory {
-                let addr = self.linearize_lvalue(&op.expr);
+                // A memory operand is the lvalue's address. `None` is a bare
+                // identifier, which has nothing to re-evaluate; a bit-field
+                // has no address at all and keeps the old path's behaviour.
+                let addr = match place.as_ref().and_then(Self::rmw_place_address) {
+                    Some(addr) => addr,
+                    None => self.linearize_lvalue(&op.expr),
+                };
+                output_places.push(place);
 
                 if is_readwrite {
                     // `+m` — also add as matching input so the same
@@ -2583,8 +2757,19 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 .with_type(typ)
                                 .with_size(size),
                         );
+                    } else if let Some(p) = &place {
+                        // Through the resolved place, so the operand
+                        // expression runs once for the read and the write.
+                        let val = self.load_rmw_place(p, typ);
+                        self.emit(
+                            Instruction::new(Opcode::Copy)
+                                .with_target(pseudo)
+                                .with_src(val)
+                                .with_type(typ)
+                                .with_size(size),
+                        );
                     } else {
-                        // Local or global: load from memory address
+                        // A bare identifier: nothing to evaluate twice.
                         let addr = self.linearize_lvalue(&op.expr);
                         self.emit(Instruction::load(pseudo, addr, 0, typ, size));
                     }
@@ -2613,6 +2798,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Track if this is a parameter output
             param_outputs.push(param_info.map(|(name, _)| name));
             skip_post_handling.push(false);
+            output_places.push(place);
         }
 
         // Process input operands
@@ -2727,11 +2913,17 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // Parameter: update var_map with the new SSA value
                 self.var_map.insert(param_name.clone(), out_pseudo);
             } else {
-                // Local or global: store to memory address
-                let addr = self.linearize_lvalue(&op.expr);
                 let typ = self.expr_type(&op.expr);
                 let size = self.types.size_bits(typ);
-                self.emit(Instruction::store(out_pseudo, addr, 0, typ, size));
+                // Back through the place the read came from, so the operand
+                // expression is not evaluated a second time.
+                if let Some(p) = &output_places[i] {
+                    self.store_rmw_place(p, out_pseudo, typ);
+                } else {
+                    // A bare identifier: nothing to evaluate twice.
+                    let addr = self.linearize_lvalue(&op.expr);
+                    self.emit(Instruction::store(out_pseudo, addr, 0, typ, size));
+                }
             }
         }
     }
@@ -2778,6 +2970,96 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
 
         (probe.is_memory(), is_readwrite, matching)
+    }
+
+    /// Capture the stack pointer ahead of a VLA's allocation.
+    ///
+    /// One mark per declaration, not per block: a label sitting between two
+    /// VLAs must release only the one declared after it, and a block-wide
+    /// mark cannot express that.
+    fn push_vla_mark(&mut self) {
+        if self.current_bb.is_none() {
+            return;
+        }
+        let mark = self.alloc_reg_pseudo();
+        self.emit(
+            Instruction::new(Opcode::StackSave)
+                .with_target(mark)
+                .with_type_and_size(self.types.void_ptr_id, 64),
+        );
+        self.vla_marks.push(super::linearize::VlaMark {
+            mark,
+            break_depth: self.break_targets.len(),
+            continue_depth: self.continue_targets.len(),
+        });
+    }
+
+    /// The marks in force on entry to a block, to restore and drop on exit.
+    ///
+    /// Returns the depth of [`Linearizer::vla_marks`] so
+    /// [`Self::close_vla_scope`] knows which of them this block added.
+    fn open_vla_scope(&self) -> usize {
+        self.vla_marks.len()
+    }
+
+    /// Release everything the block allocated and forget its marks.
+    fn close_vla_scope(&mut self, entry: usize) {
+        if self.vla_marks.len() <= entry {
+            return;
+        }
+        // The first mark the block took is the stack as it stood on entry,
+        // so one restore undoes all of them.
+        let mark = self.vla_marks[entry].mark;
+        if !self.is_terminated() && self.current_bb.is_some() {
+            self.emit_stack_restore(mark);
+        }
+        self.vla_marks.truncate(entry);
+    }
+
+    /// Put the stack pointer back to what `mark` captured.
+    fn emit_stack_restore(&mut self, mark: PseudoId) {
+        self.emit(
+            Instruction::new(Opcode::StackRestore)
+                .with_src(mark)
+                .with_type_and_size(self.types.void_ptr_id, 64),
+        );
+    }
+
+    /// Release every VLA allocated inside the loop or switch being left.
+    ///
+    /// A mark taken at a nesting depth at or beyond the current one was taken
+    /// inside the construct being left, so restoring to the **outermost**
+    /// such mark undoes everything it allocated in one move. Without this a
+    /// `continue` past a VLA declaration skipped the block's own restore and
+    /// the loop grew the stack anyway.
+    ///
+    /// The marks stay recorded: the block that owns each one still drops it
+    /// when its own linearization ends.
+    fn unwind_vla_marks(&mut self, leaving: JumpKind) {
+        let found = match leaving {
+            // A `break` leaves the innermost loop *or switch*, so it undoes
+            // what was allocated inside that one.
+            JumpKind::Break => {
+                let depth = self.break_targets.len();
+                self.vla_marks
+                    .iter()
+                    .find(|m| m.break_depth >= depth)
+                    .map(|m| m.mark)
+            }
+            // A `continue` leaves the innermost *loop*, which may be several
+            // switches out -- so it undoes everything allocated since the
+            // loop began, not just since the switch did.
+            JumpKind::Continue => {
+                let depth = self.continue_targets.len();
+                self.vla_marks
+                    .iter()
+                    .find(|m| m.continue_depth >= depth)
+                    .map(|m| m.mark)
+            }
+        };
+        if let Some(mark) = found {
+            self.emit_stack_restore(mark);
+        }
     }
 
     pub(crate) fn get_or_create_label(&mut self, name: &str) -> BasicBlockId {

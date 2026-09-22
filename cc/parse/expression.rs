@@ -185,6 +185,32 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let name = self.expect_identifier()?;
                 designators.push(Designator::Field(name));
+            } else if designators.is_empty()
+                && self.peek() == TokenType::Ident
+                && self.next_token_is_special(b':')
+            {
+                // GNU's obsolete field designator, `fieldname: value`, which
+                // predates C99's `.fieldname = value`. gcc still accepts it
+                // (with `-Wdeprecated`), and glibc-era sources use it:
+                //
+                //     union { double d; int i[2]; } u = { d: -0.25 };
+                //     struct s s = { c: {1, 2, 3} };
+                //
+                // One token of lookahead settles it: inside an initializer
+                // list an identifier followed by `:` cannot be anything else.
+                // A conditional starts `x ?`, not `x :`.
+                //
+                // Only the leading, unchained form -- which is all gcc's own
+                // grammar allows -- and the `:` stands in for the `=`, so the
+                // loop must not go on to demand one.
+                let name = self.expect_identifier()?;
+                self.expect_special(b':')?;
+                designators.push(Designator::Field(name));
+                let value = self.parse_initializer()?;
+                return Ok(InitElement {
+                    designators,
+                    value: Box::new(value),
+                });
             } else if self.is_special(b'[') {
                 // Array index designator: `[constant-expression]`, or the GNU
                 // range `[lo ... hi]`. As with a case range, GCC requires the
@@ -1075,10 +1101,18 @@ impl<'a> Parser<'a> {
                 let index = self.parse_expression()?;
                 self.expect_special(b']')?;
                 self.check_subscript(&expr, &index, base_pos);
-                // Get element type from array/pointer type
+                // C17 6.5.2.1p2 defines `E1[E2]` as `(*((E1)+(E2)))`, so the
+                // two operands are interchangeable: `N[p]` is `p[N]`. The
+                // element type therefore comes from whichever operand is the
+                // pointer, and taking it from the left one alone gave `N[p]`
+                // the type `int` -- it read four bytes at a four-byte stride
+                // from a `char` object, and a store through it landed
+                // somewhere else entirely. The linearizer already swapped the
+                // operands; only the type did not.
                 let elem_type = expr
                     .typ
                     .and_then(|t| self.types.base_type(t))
+                    .or_else(|| index.typ.and_then(|t| self.types.base_type(t)))
                     .unwrap_or(self.types.int_id);
                 expr = Self::typed_expr(
                     ExprKind::Index {
@@ -1921,10 +1955,23 @@ impl<'a> Parser<'a> {
                             "implicit declaration of function '{0}'",
                             &[&name_str],
                         );
-                        let int_id = self.types.int_id;
+                        // A name c17 knows as a library builtin gets that
+                        // builtin's return type, not `int`. gcc does the same,
+                        // and it has to: `x = alloca(n)` or `p = malloc(n)`
+                        // without a declaration truncated the returned address
+                        // to 32 bits and the program died on the first
+                        // dereference -- which is exactly the pre-C99 code
+                        // `-fpermissive` exists to compile.
+                        //
+                        // The declaration stays unprototyped either way, so no
+                        // argument is checked or converted, as C89 6.3.2.2
+                        // says.
+                        let ret_id = self
+                            .chk_builtin_return_type(&name_str)
+                            .unwrap_or(self.types.int_id);
                         let func_type = self.types.intern(Type {
                             kind: TypeKind::Function,
-                            base: Some(int_id),
+                            base: Some(ret_id),
                             params: None,
                             ..Default::default()
                         });

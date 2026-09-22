@@ -42,6 +42,16 @@ pub(super) struct CallArgInfo {
     pub stack_offsets: Vec<i32>,
     /// Total bytes to reserve, rounded to the 16-byte call boundary.
     pub stack_bytes: i32,
+    /// Indices of arguments the ABI ignores entirely -- a zero-sized type,
+    /// which occupies neither a register nor a stack slot.
+    ///
+    /// Recorded rather than recomputed because `setup_register_args` has to
+    /// skip exactly what this classification skipped. It used to give such an
+    /// argument a general register while the layout gave it nothing, and the
+    /// two indices drifted apart: passing a `struct { char x[0]; }` before
+    /// eight other arguments ran the register index off the end of the file
+    /// and the compiler panicked.
+    pub ignored_arg_indices: Vec<usize>,
 }
 
 impl X86_64CodeGen {
@@ -51,6 +61,7 @@ impl X86_64CodeGen {
         let fp_arg_regs = XmmReg::arg_regs();
 
         let mut stack_arg_indices = Vec::with_capacity(insn.src.len());
+        let mut ignored_arg_indices: Vec<usize> = Vec::new();
         let mut temp_int_idx = 0;
         let mut temp_fp_idx = 0;
         // The outgoing area is walked, not summed: each argument begins at
@@ -150,18 +161,27 @@ impl X86_64CodeGen {
                     );
                 }
                 ArgClass::Extend { .. } => {
-                    // Extended small integers use one GP register
+                    // Extended small integers use one GP register -- unless
+                    // there is none left, and then the argument goes to the
+                    // stack and consumes nothing, exactly as §3.2.3 step 5
+                    // says and as the `Direct` arm above already had it.
+                    // Advancing anyway made this side count a register the
+                    // setup side had not.
                     if temp_int_idx >= int_arg_regs.len() {
                         place(i, 8, 8, &mut stack_arg_indices, &mut stack_offsets, &mut at);
+                    } else {
+                        temp_int_idx += 1;
                     }
-                    temp_int_idx += 1;
                 }
                 ArgClass::Hfa { count, .. } => {
                     // HFA uses FP registers (primarily AArch64, but handle for completeness)
                     if temp_fp_idx + (*count as usize) > fp_arg_regs.len() {
+                        // §3.2.3 step 5 again: to memory whole, consuming none
+                        // of the registers it did not fit in.
                         place(i, 8, 8, &mut stack_arg_indices, &mut stack_offsets, &mut at);
+                    } else {
+                        temp_fp_idx += *count as usize;
                     }
-                    temp_fp_idx += *count as usize;
                 }
                 ArgClass::X87 { .. } => {
                     // X87 is only used for return values, not parameters
@@ -169,19 +189,45 @@ impl X86_64CodeGen {
                     unreachable!("X87 classification only applies to return values");
                 }
                 ArgClass::Ignore => {
-                    // Zero-sized type, skip
+                    // A zero-sized type occupies nothing at all. Recorded so
+                    // `setup_register_args` skips it too.
+                    ignored_arg_indices.push(i);
                 }
             }
         }
 
-        // The call boundary is 16-byte aligned.
-        let stack_bytes = (at + 15) & !15;
+        // The call boundary is 16-byte aligned -- but an argument placed at an
+        // offset that assumes a stronger alignment only lands there if the
+        // *base* of the area is that aligned too. `place` already rounds each
+        // offset within the area; rounding the area's size to the same
+        // alignment is what keeps the base in step, given that the prologue
+        // has made `%rsp` a multiple of it (see `FrameBase::of`).
+        //
+        // Without this, gcc and c17 agreed on the offset of an
+        // `__attribute__((aligned (32)))` argument and disagreed on where the
+        // area began, so the callee read it sixteen bytes out.
+        let area_align = Self::outgoing_area_align(insn, types);
+        let stack_bytes = (at + area_align - 1) & !(area_align - 1);
 
         CallArgInfo {
             stack_arg_indices,
+            ignored_arg_indices,
             stack_offsets,
             stack_bytes,
         }
+    }
+
+    /// The alignment the outgoing argument area must start on for this call.
+    ///
+    /// Never less than the 16-byte call boundary. An argument type whose
+    /// alignment exceeds that raises it, because `place` measures that
+    /// argument's offset from the area's base and the two only agree if the
+    /// base itself is aligned.
+    pub(super) fn outgoing_area_align(insn: &Instruction, types: &TypeTable) -> i32 {
+        insn.arg_types
+            .iter()
+            .map(|t| types.alignment(*t) as i32)
+            .fold(16, i32::max)
     }
 
     /// Push stack arguments in reverse order (returns number of args pushed)
@@ -367,7 +413,7 @@ impl X86_64CodeGen {
         let mut regs_to_write: Vec<Reg> = Vec::new();
         let mut temp_int_idx = 0;
         for i in 0..insn.src.len() {
-            if info.stack_arg_indices.contains(&i) {
+            if info.stack_arg_indices.contains(&i) || info.ignored_arg_indices.contains(&i) {
                 continue;
             }
             let arg_type = insn.arg_types.get(i).copied();
@@ -390,7 +436,7 @@ impl X86_64CodeGen {
         // Check which argument sources are in registers that will be clobbered
         temp_int_idx = 0;
         for i in 0..insn.src.len() {
-            if info.stack_arg_indices.contains(&i) {
+            if info.stack_arg_indices.contains(&i) || info.ignored_arg_indices.contains(&i) {
                 continue;
             }
             let arg = insn.src[i];
@@ -471,7 +517,7 @@ impl X86_64CodeGen {
         let mut fp_arg_idx = 0;
 
         for i in 0..insn.src.len() {
-            if info.stack_arg_indices.contains(&i) {
+            if info.stack_arg_indices.contains(&i) || info.ignored_arg_indices.contains(&i) {
                 continue;
             }
             let arg = insn.src[i];
@@ -591,13 +637,9 @@ impl X86_64CodeGen {
                         let base = match arg_loc {
                             Loc::Reg(r) => r,
                             Loc::Stack(offset) => {
-                                let adjusted = offset + self.callee_saved_offset;
                                 self.push_lir(X86Inst::Mov {
                                     size: OperandSize::B64,
-                                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                                        base: Reg::Rbp,
-                                        offset: -adjusted,
-                                    }),
+                                    src: GpOperand::Mem(self.stack_mem(offset)),
                                     dst: GpOperand::Reg(Reg::R11),
                                 });
                                 Reg::R11
@@ -747,7 +789,6 @@ impl X86_64CodeGen {
 
         match arg_loc {
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 // A symbol's slot *is* the complex value; a temp's slot holds
                 // a pointer to it. A call returning complex yields the former
                 // (`__cret_N`), so unconditionally loading the slot as a
@@ -761,18 +802,12 @@ impl X86_64CodeGen {
                 if is_symbol {
                     self.push_lir(X86Inst::Lea {
                         dst: Reg::R11,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        },
+                        addr: self.stack_mem(offset),
                     });
                 } else {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
+                        src: GpOperand::Mem(self.stack_mem(offset)),
                         dst: GpOperand::Reg(Reg::R11),
                     });
                 }
@@ -982,22 +1017,15 @@ impl X86_64CodeGen {
     fn handle_two_reg_return(&mut self, dst_loc: &Loc) {
         match dst_loc {
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    }),
+                    dst: GpOperand::Mem(self.stack_mem(*offset)),
                 });
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::Rdx),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted + 8,
-                    }),
+                    dst: GpOperand::Mem(self.stack_field(*offset, 8)),
                 });
             }
             Loc::Reg(r) => {
@@ -1040,34 +1068,24 @@ impl X86_64CodeGen {
 
         match dst_loc {
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 if is_float_complex {
                     // Store entire 64-bit value from XMM0 (packed real + imag)
                     self.push_lir(X86Inst::MovFp {
                         size: FpSize::Double, // 64-bit movq
                         src: XmmOperand::Reg(XmmReg::Xmm0),
-                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
+                        dst: XmmOperand::Mem(self.stack_mem(*offset)),
                     });
                 } else {
                     // Store XMM0 (real) and XMM1 (imag) separately
                     self.push_lir(X86Inst::MovFp {
                         size: fp_size,
                         src: XmmOperand::Reg(XmmReg::Xmm0),
-                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted,
-                        }),
+                        dst: XmmOperand::Mem(self.stack_mem(*offset)),
                     });
                     self.push_lir(X86Inst::MovFp {
                         size: fp_size,
                         src: XmmOperand::Reg(XmmReg::Xmm1),
-                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: -adjusted + imag_offset,
-                        }),
+                        dst: XmmOperand::Mem(self.stack_field(*offset, imag_offset)),
                     });
                 }
             }
@@ -1112,7 +1130,6 @@ impl X86_64CodeGen {
         // Order of classes determines memory layout
         match dst_loc {
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 let mut xmm_idx = 0;
                 let mut gp_idx = 0;
                 for (i, &class) in classes.iter().enumerate() {
@@ -1127,10 +1144,7 @@ impl X86_64CodeGen {
                             self.push_lir(X86Inst::MovFp {
                                 size: FpSize::Double,
                                 src: XmmOperand::Reg(xmm),
-                                dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: -adjusted + mem_offset,
-                                }),
+                                dst: XmmOperand::Mem(self.stack_field(*offset, mem_offset)),
                             });
                             xmm_idx += 1;
                         }
@@ -1139,10 +1153,7 @@ impl X86_64CodeGen {
                             self.push_lir(X86Inst::Mov {
                                 size: OperandSize::B64,
                                 src: GpOperand::Reg(gp),
-                                dst: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset: -adjusted + mem_offset,
-                                }),
+                                dst: GpOperand::Mem(self.stack_field(*offset, mem_offset)),
                             });
                             gp_idx += 1;
                         }
@@ -1196,22 +1207,15 @@ impl X86_64CodeGen {
     fn handle_two_sse_return(&mut self, dst_loc: &Loc) {
         match dst_loc {
             Loc::Stack(offset) => {
-                let adjusted = offset + self.callee_saved_offset;
                 self.push_lir(X86Inst::MovFp {
                     size: FpSize::Double,
                     src: XmmOperand::Reg(XmmReg::Xmm0),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted,
-                    }),
+                    dst: XmmOperand::Mem(self.stack_mem(*offset)),
                 });
                 self.push_lir(X86Inst::MovFp {
                     size: FpSize::Double,
                     src: XmmOperand::Reg(XmmReg::Xmm1),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: -adjusted + 8,
-                    }),
+                    dst: XmmOperand::Mem(self.stack_field(*offset, 8)),
                 });
             }
             Loc::Reg(r) => {

@@ -144,11 +144,20 @@ fn suppress_forwarding_bodies(module: &mut Module) {
 /// suppressed by then, so what is wrong is the surviving *call site*, and that
 /// is what this looks for. GCC reports the same situation as an error.
 fn check_forwarding_resolved(module: &Module) {
-    let suppressed: std::collections::BTreeSet<&str> = module
+    // Two kinds of function have no out-of-line copy to fall back on. A
+    // `__builtin_va_arg_pack` forwarder is suppressed on the assumption it
+    // always inlines. And a C99 inline definition marked `always_inline` is
+    // one the program has *asked* to be substituted everywhere -- gcc rejects
+    // the translation unit when it cannot be.
+    //
+    // A plain C99 inline definition is deliberately not in this set: its
+    // external definition may live in another translation unit, so an ordinary
+    // call to it is correct and the linker resolves it.
+    let suppressed: std::collections::BTreeMap<&str, bool> = module
         .functions
         .iter()
-        .filter(|f| !f.emit && forwards_caller_arguments(f))
-        .map(|f| f.name.as_str())
+        .filter(|f| !f.emit && (forwards_caller_arguments(f) || f.is_always_inline))
+        .map(|f| (f.name.as_str(), forwards_caller_arguments(f)))
         .collect();
     if suppressed.is_empty() {
         return;
@@ -164,14 +173,25 @@ fn check_forwarding_resolved(module: &Module) {
             let Some(callee) = insn.func_name.as_deref() else {
                 continue;
             };
-            if suppressed.contains(callee) && reported.insert(callee) {
+            let Some(&forwards) = suppressed.get(callee) else {
+                continue;
+            };
+            if reported.insert(callee) {
                 // The call site, not line 0: it is the thing that cannot be
                 // resolved, and the only position either function still has.
-                crate::diag::error_args(
-                    insn.pos.unwrap_or_default(),
-                    "'__builtin_va_arg_pack' in '{0}' could not be forwarded: the function was not inlined",
-                    &[callee],
-                );
+                if forwards {
+                    crate::diag::error_args(
+                        insn.pos.unwrap_or_default(),
+                        "'__builtin_va_arg_pack' in '{0}' could not be forwarded: the function was not inlined",
+                        &[callee],
+                    );
+                } else {
+                    crate::diag::error_args(
+                        insn.pos.unwrap_or_default(),
+                        "inlining failed in call to 'always_inline' '{0}', which has no out-of-line definition",
+                        &[callee],
+                    );
+                }
             }
         }
     }

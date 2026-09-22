@@ -204,6 +204,7 @@ impl Parser<'_> {
                 enum_constants: constants,
                 size,
                 align: size,
+                member_align: size,
                 is_complete: true,
                 transparent: false,
             };
@@ -507,6 +508,12 @@ impl Parser<'_> {
             };
             self.check_wide_bitfields_have_a_carrier(&members);
 
+            // What the members alone require, kept before the attribute below
+            // overwrites it. AAPCS64 derives an argument's alignment from the
+            // members and ignores the type's own attribute, and the pack cap
+            // already folded in here is not recorded anywhere else.
+            let member_align = align;
+
             // Apply struct-level aligned attribute (raises alignment, never lowers)
             if let Some(sa) = struct_align {
                 if sa as usize > align {
@@ -544,6 +551,7 @@ impl Parser<'_> {
                 enum_constants: Vec::new(),
                 size,
                 align,
+                member_align,
                 is_complete: true,
                 transparent: is_transparent && is_union,
             };

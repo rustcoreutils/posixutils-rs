@@ -43,12 +43,20 @@ pub struct X86_64CodeGen {
     pub(super) stack_alloc_size: i32,
     /// Offset from rbp to register save area (for variadic functions)
     pub(super) reg_save_area_offset: i32,
-    /// Number of fixed GP parameters (for variadic functions)
-    pub(super) num_fixed_gp_params: usize,
-    /// Number of fixed FP parameters (for variadic functions)
-    pub(super) num_fixed_fp_params: usize,
-    /// Number of fixed parameters passed on the stack (overflow beyond registers)
-    pub(super) num_fixed_stack_params: usize,
+    /// GP argument registers the named parameters consumed, for `va_start`'s
+    /// `gp_offset` (variadic functions only).
+    pub(super) named_gp_regs: usize,
+    /// The same for SSE registers, for `fp_offset`.
+    pub(super) named_fp_regs: usize,
+    /// The `%rbp` displacement where the variadic arguments begin, which is
+    /// `va_start`'s `overflow_arg_area`.
+    ///
+    /// A displacement and not a slot count: a named `long double` or a named
+    /// MEMORY-class aggregate occupies bytes in the incoming area without
+    /// consuming a register, and `IncomingOff::take` may insert alignment
+    /// padding, so no multiple of eight derived from register overflow can
+    /// express where the area actually ends.
+    pub(super) named_incoming_end: i32,
     /// Counter for generating unique internal labels
     pub(super) unique_label_counter: u32,
     /// External symbols (need GOT access on macOS)
@@ -88,9 +96,9 @@ impl X86_64CodeGen {
             callee_saved_offset: 0,
             stack_alloc_size: 0,
             reg_save_area_offset: 0,
-            num_fixed_gp_params: 0,
-            num_fixed_fp_params: 0,
-            num_fixed_stack_params: 0,
+            named_gp_regs: 0,
+            named_fp_regs: 0,
+            named_incoming_end: 16,
             unique_label_counter: 0,
             extern_symbols: HashSet::new(),
             tls_symbols: HashSet::new(),
@@ -1144,11 +1152,6 @@ impl X86_64CodeGen {
             }
         };
 
-        // For indirect calls, load function pointer into R11
-        if let Some(func_addr) = insn.indirect_target {
-            self.emit_move(func_addr, Reg::R11, 64);
-        }
-
         // Classify arguments into register vs stack
         let info = self.classify_call_args(insn, types);
 
@@ -1164,6 +1167,16 @@ impl X86_64CodeGen {
         // For variadic calls, set AL to number of XMM registers used
         if insn.variadic_arg_start.is_some() {
             self.set_variadic_fp_count(fp_arg_count);
+        }
+
+        // For an indirect call, load the function pointer into R11 *after*
+        // the arguments are in place. R10 and R11 are the argument setup's
+        // own scratch registers -- `save_clobbered_arg_regs` shuttles through
+        // them and the complex-argument path addresses its value through R11 --
+        // so a target parked there before the setup was overwritten, and the
+        // `call *%r11` jumped into whatever the last argument had addressed.
+        if let Some(func_addr) = insn.indirect_target {
+            self.emit_move(func_addr, Reg::R11, 64);
         }
 
         // Emit the call instruction

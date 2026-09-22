@@ -14,11 +14,13 @@
 // - AAPCS64 (AArch64 Linux/macOS)
 //
 
-mod aapcs64;
+pub mod aapcs64;
 mod sysv_amd64;
 
 pub use aapcs64::Aapcs64Abi;
-pub use sysv_amd64::{param_is_memory_class, sse_struct_regs, struct_param_classes, SysVAmd64Abi};
+pub use sysv_amd64::{
+    param_is_ignored, param_is_memory_class, sse_struct_regs, struct_param_classes, SysVAmd64Abi,
+};
 
 use crate::target::{Arch, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};

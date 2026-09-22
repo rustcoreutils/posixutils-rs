@@ -802,13 +802,11 @@ impl Parser<'_> {
                     self.skip_extensions();
                     continue;
                 }
-                crate::kw::CONST => {
+                // Every spelling of `const`, `volatile` and `restrict`,
+                // from the one shared answer.
+                _ if let Some(m) = super::cv_qualifier_modifier(name_id) => {
                     self.advance();
-                    modifiers |= TypeModifiers::CONST;
-                }
-                crate::kw::VOLATILE => {
-                    self.advance();
-                    modifiers |= TypeModifiers::VOLATILE;
+                    modifiers |= m;
                 }
                 crate::kw::STATIC => {
                     tally.note_storage_class("static", self.current_pos());
@@ -1143,8 +1141,9 @@ impl Parser<'_> {
                     tally.note_data_type("struct", self.current_pos());
                     tally.check();
                     let mut struct_type = self.parse_struct_or_union_specifier(false)?;
-                    // Consume trailing qualifiers (e.g., "struct foo const")
-                    let trailing_mods = self.consume_type_qualifiers();
+                    // Trailing specifiers: `struct foo const`, and also
+                    // `struct { ... } static g` -- C17 6.7p1 allows any order.
+                    let trailing_mods = self.consume_trailing_specifiers();
                     struct_type.modifiers |= modifiers | trailing_mods;
                     return Ok((struct_type, true));
                 }
@@ -1152,8 +1151,8 @@ impl Parser<'_> {
                     tally.note_data_type("union", self.current_pos());
                     tally.check();
                     let mut union_type = self.parse_struct_or_union_specifier(true)?;
-                    // Consume trailing qualifiers (e.g., "union foo const")
-                    let trailing_mods = self.consume_type_qualifiers();
+                    // As for `struct` above.
+                    let trailing_mods = self.consume_trailing_specifiers();
                     union_type.modifiers |= modifiers | trailing_mods;
                     return Ok((union_type, true));
                 }
@@ -1199,7 +1198,25 @@ impl Parser<'_> {
         let explicit = base_kind.is_some()
             || modifiers.intersects(TypeModifiers::SIGNED | TypeModifiers::UNSIGNED);
 
-        let kind = base_kind.unwrap_or(TypeKind::Int);
+        // `_Complex` with no base type is `_Complex double`, which is what
+        // gcc gives it -- and it counts as having named a type, so the
+        // "implicit int was removed in C99" diagnostic does not fire. C17
+        // requires a base (6.7.2p2 lists only the three floating spellings),
+        // so this is the GNU reading; and now that c17 has `_Complex int`,
+        // defaulting to `int` like everything else would have made
+        // `_Complex v;` an eight-byte integer pair rather than gcc's
+        // sixteen-byte double one.
+        // A *bare* `_Complex`: no base kind and no signedness modifier, since
+        // `_Complex unsigned` names `_Complex unsigned int` and is eight bytes.
+        let bare_complex = base_kind.is_none()
+            && modifiers.contains(TypeModifiers::COMPLEX)
+            && !modifiers.intersects(TypeModifiers::SIGNED | TypeModifiers::UNSIGNED);
+        let kind = match base_kind {
+            Some(k) => k,
+            None if bare_complex => TypeKind::Double,
+            None => TypeKind::Int,
+        };
+        let explicit = explicit || bare_complex;
         Ok((Type::with_modifiers(kind, modifiers), explicit))
     }
 

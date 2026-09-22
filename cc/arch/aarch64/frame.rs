@@ -77,18 +77,32 @@ impl Aarch64CodeGen {
         let callee_saved_fp_pairs = callee_saved_fp.len().div_ceil(2);
         let callee_saved_fp_size = callee_saved_fp_pairs as i32 * 16; // 8 bytes per d-reg, 16 per pair
         let callee_saved_size = callee_saved_gp_size + callee_saved_fp_size;
-        let total_frame = 16 + callee_saved_size + stack_size + reg_save_area_size;
+
+        // Track register save area offset for va_start (offset from FP).
+        // Layout: [fp/lr][GP callee-saved][FP callee-saved][locals][reg_save_area]
+        //
+        // Rounded to 16, which is not cosmetic: the SIMD half is written with
+        // `str q`, and that instruction's immediate is either scaled by 16 or
+        // unscaled within +/-256. An offset that is neither -- which is what
+        // an odd `stack_size` produces -- has no encoding at all, and the
+        // assembler rejects the function outright ("immediate offset out of
+        // range"). `q0` at 223 assembles as the unscaled form and `q5` at 303
+        // does not, so the failure appears only once the frame is large
+        // enough, which is why an over-aligned local is what surfaces it.
+        //
+        // `x29` is 16-aligned at any public interface, so a 16-aligned
+        // displacement from it keeps every slot 16-aligned too.
+        let save_area_base = (16 + callee_saved_size + stack_size + 15) & !15;
+        self.reg_save_area_offset = if is_variadic { save_area_base } else { 0 };
+
+        // The padding the rounding introduces has to be inside the frame.
+        let total_frame = if is_variadic {
+            save_area_base + reg_save_area_size
+        } else {
+            16 + callee_saved_size + stack_size
+        };
         // Ensure 16-byte alignment
         let total_frame = (total_frame + 15) & !15;
-
-        // Track register save area offset for va_start (offset from FP)
-        // Layout: [fp/lr][GP callee-saved][FP callee-saved][locals][reg_save_area]
-        // The save area is at FP + 16 + callee_saved_size + stack_size
-        self.reg_save_area_offset = if is_variadic {
-            16 + callee_saved_size + stack_size
-        } else {
-            0
-        };
 
         // Save function name, frame size, and callee-saved size for label generation and offset calculation
         // Local labels are derived from this and are compiler-internal, so
@@ -166,14 +180,14 @@ impl Aarch64CodeGen {
                 // number of slots. Asking `is_float` instead counted a
                 // `_Complex` -- two V registers -- as one general one, and an
                 // HFA of any size likewise.
-                let (bank, count) = match abi.classify_param(*typ, types) {
+                let (is_gp, count) = match abi.classify_param(*typ, types) {
                     ArgClass::Direct { ref classes, .. }
                         if classes.len() == 1 && classes[0] == crate::abi::RegClass::Sse =>
                     {
-                        (&mut nsrn, 1)
+                        (false, 1)
                     }
-                    ArgClass::Hfa { count, .. } => (&mut nsrn, count as usize),
-                    _ if types.kind(*typ) == TypeKind::Int128 => (&mut ngrn, 2),
+                    ArgClass::Hfa { count, .. } => (false, count as usize),
+                    _ if types.kind(*typ) == TypeKind::Int128 => (true, 2),
                     // A composite of at most sixteen bytes takes two general
                     // registers. Counting it as one left `va_start` pointing a
                     // slot short, so the first variadic argument of a function
@@ -183,14 +197,27 @@ impl Aarch64CodeGen {
                         if classes.len() == 2
                             && classes.iter().all(|c| *c == crate::abi::RegClass::Integer) =>
                     {
-                        (&mut ngrn, 2)
+                        (true, 2)
                     }
                     // Everything else takes a single general register.
-                    _ => (&mut ngrn, 1),
+                    _ => (true, 1),
                 };
-                if *bank + count <= 8 {
-                    *bank += count;
+                // A run of general registers is subject to stage C.10 -- a
+                // 16-aligned argument starts at an even NGRN -- and both banks
+                // to C.11/§6.4.2, which send everything after an overflow to
+                // the stack. This tally has to reach the same numbers
+                // `allocate_arguments` does, or `va_start` skips the wrong
+                // count of slots.
+                let bank = if is_gp { &mut ngrn } else { &mut nsrn };
+                let start = if is_gp {
+                    crate::abi::aapcs64::gr_run_start(types, *typ, *bank, count, 8)
                 } else {
+                    (*bank + count <= 8).then_some(*bank)
+                };
+                if let Some(start) = start {
+                    *bank = start + count;
+                } else {
+                    *bank = 8;
                     let bytes = types.size_bits(*typ).div_ceil(8).max(1) as i32;
                     named_stack += (bytes + 7) & !7;
                 }
@@ -1113,17 +1140,32 @@ impl Aarch64CodeGen {
                     if arg_idx == (i as u32) + arg_idx_offset {
                         // Skip pseudos already stored via spilled_args
                         if spilled_pseudos.contains(&pseudo.id) {
-                            // Still need to count this arg for register assignment tracking
+                            // Still need to count this arg for register
+                            // assignment tracking -- including stage C.10's
+                            // rounding, which a run of general registers is
+                            // subject to whether or not there is a store to
+                            // emit for it.
                             if let Some(count) = fp_reg_count {
                                 fp_arg_idx += count;
-                            } else if let Some(n) = gp_regs {
-                                int_arg_idx += n;
                             } else if is_fp {
                                 fp_arg_idx += 1;
-                            } else if types.kind(*typ) == TypeKind::Int128 {
-                                int_arg_idx += 2;
                             } else {
-                                int_arg_idx += 1;
+                                let n =
+                                    gp_regs.unwrap_or(if types.kind(*typ) == TypeKind::Int128 {
+                                        2
+                                    } else {
+                                        1
+                                    });
+                                int_arg_idx = match crate::abi::aapcs64::gr_run_start(
+                                    types,
+                                    *typ,
+                                    int_arg_idx,
+                                    n,
+                                    arg_regs.len(),
+                                ) {
+                                    Some(start) => start + n,
+                                    None => arg_regs.len(),
+                                };
                             }
                             break;
                         }
@@ -1137,8 +1179,23 @@ impl Aarch64CodeGen {
                                     Loc::Stack(off) => Some(*off),
                                     _ => None,
                                 });
+                            // Stage C.10 decides where the run starts: a
+                            // 16-aligned composite skips an odd NGRN. Asking
+                            // only whether `gp_n` registers were left made the
+                            // prologue read a different pair than the caller
+                            // wrote.
+                            let run = crate::abi::aapcs64::gr_run_start(
+                                types,
+                                *typ,
+                                int_arg_idx,
+                                gp_n,
+                                arg_regs.len(),
+                            );
+                            if let Some(start) = run {
+                                int_arg_idx = start;
+                            }
                             if let Some(local_off) = local_off {
-                                if int_arg_idx + gp_n <= arg_regs.len() {
+                                if run.is_some() {
                                     if gp_n == 2 {
                                         self.emit_stp_legalized(
                                             OperandSize::B64,
@@ -1186,7 +1243,12 @@ impl Aarch64CodeGen {
                                     }
                                 }
                             }
-                            int_arg_idx += gp_n;
+                            // Stage C.11: an argument that did not fit sets
+                            // NGRN to 8, so nothing after it takes a register.
+                            int_arg_idx = match run {
+                                Some(start) => start + gp_n,
+                                None => arg_regs.len(),
+                            };
                         } else if let Some(count) = fp_reg_count {
                             // Complex or HFA argument — `count` consecutive V registers
                             if fp_arg_idx + count <= fp_arg_regs.len() {
@@ -1264,9 +1326,13 @@ impl Aarch64CodeGen {
                             // Store to the arg pseudo's stack slot (allocated in
                             // allocate_arguments). The IR will Copy from arg
                             // pseudo → local variable.
-                            if let Some(start) =
-                                crate::arch::aarch64::int128_pair_start(int_arg_idx, arg_regs.len())
-                            {
+                            if let Some(start) = crate::abi::aapcs64::gr_run_start(
+                                types,
+                                *typ,
+                                int_arg_idx,
+                                2,
+                                arg_regs.len(),
+                            ) {
                                 int_arg_idx = start;
                                 if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id)
                                 {

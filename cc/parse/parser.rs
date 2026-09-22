@@ -61,6 +61,8 @@ pub(crate) struct RawParam {
     /// Run-time size expressions for a variably-modified element type; see
     /// [`Parameter::vm_dims`](crate::parse::ast::Parameter::vm_dims).
     pub(crate) vm_dims: Vec<Expr>,
+    /// See [`Parameter::discarded_dims`](crate::parse::ast::Parameter::discarded_dims).
+    pub(crate) discarded_dims: Vec<Expr>,
     /// Symbol created while parsing the parameter list. `vm_dims` resolves
     /// against it, so the function scope re-declares this very symbol instead
     /// of a fresh one.
@@ -585,6 +587,18 @@ impl<'a> Parser<'a> {
     pub(super) fn next_token_is_open_paren(&self) -> bool {
         match self.tokens.get(self.pos + 1) {
             Some(t) => matches!(t.value, TokenValue::Special(v) if v == b'(' as u32),
+            None => false,
+        }
+    }
+
+    /// Whether the token *after* the current one is the special `c`.
+    ///
+    /// Used where one token of lookahead settles a form: an identifier
+    /// followed by `:` inside an initializer list is GNU's obsolete field
+    /// designator and cannot be anything else.
+    pub(super) fn next_token_is_special(&self, c: u8) -> bool {
+        match self.tokens.get(self.pos + 1) {
+            Some(t) => matches!(t.value, TokenValue::Special(v) if v == c as u32),
             None => false,
         }
     }

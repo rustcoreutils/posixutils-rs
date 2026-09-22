@@ -1664,7 +1664,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// One integer binary operation on complex halves, into a fresh pseudo.
-    fn emit_int_binop(
+    pub(crate) fn emit_int_binop(
         &mut self,
         op: Opcode,
         lhs: PseudoId,
@@ -2045,6 +2045,14 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit(phi_insn);
 
         result
+    }
+
+    /// The address this place names, or `None` when it is a bit-field.
+    ///
+    /// A bit-field has no address, so a consumer that can only work with one
+    /// -- a memory-class `asm` operand, say -- has to know that.
+    pub(crate) fn rmw_place_address(place: &RmwPlace) -> Option<PseudoId> {
+        place.bitfield.is_none().then_some(place.base)
     }
 
     /// Resolve a read-modify-write target, evaluating its subexpressions once.

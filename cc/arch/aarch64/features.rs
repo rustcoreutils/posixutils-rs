@@ -215,6 +215,17 @@ impl Aarch64CodeGen {
         };
 
         let arg_type = insn.typ.unwrap_or(types.int_id);
+
+        // A zero-sized argument was never passed, so there is nothing to read
+        // and no slot to step over. Asking the same predicate the call site
+        // asks is what keeps the two in step: without this, `VaAggKind::of`'s
+        // `bytes.max(1)` below turned it into `Gp { qwords: 1 }` and it
+        // consumed a whole general slot, putting every later `va_arg` in the
+        // list eight bytes out.
+        if self.arg_is_ignored(Some(arg_type), types) {
+            return;
+        }
+
         let type_bits = types.size_bits(arg_type);
         let is_fp = types.is_float(arg_type);
         // An HFA arrives in the SIMD registers, so it is read out of *their*
@@ -226,7 +237,9 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
 
         if self.base.target.os == crate::target::Os::MacOS {
-            self.emit_va_arg_darwin(&ap_loc, &dst_loc, type_bits, is_fp, agg);
+            let (_, align) =
+                crate::abi::aapcs64::darwin_va_slot(types, arg_type, &self.base.target);
+            self.emit_va_arg_darwin(&ap_loc, &dst_loc, type_bits, is_fp, agg, align);
         } else {
             self.emit_va_arg_aapcs64(
                 &ap_loc,
@@ -234,13 +247,19 @@ impl Aarch64CodeGen {
                 type_bits,
                 is_fp,
                 agg,
-                types.alignment(arg_type) as i32,
+                crate::abi::aapcs64::argument_alignment(types, arg_type) as i32,
             );
         }
     }
 
     /// Darwin: every variadic argument is on the stack, so `ap` is just a
-    /// cursor that walks it 8 bytes at a time.
+    /// cursor that walks it.
+    ///
+    /// `align` is where this argument's slot starts, from
+    /// [`crate::abi::aapcs64::darwin_va_slot`] -- the same rule the caller
+    /// lays the area out with. Walking eight bytes at a time regardless is
+    /// self-consistent, and invisible to any c17-only program, but it is not
+    /// where clang put the argument.
     fn emit_va_arg_darwin(
         &mut self,
         ap_loc: &Loc,
@@ -248,6 +267,7 @@ impl Aarch64CodeGen {
         type_bits: u32,
         is_fp: bool,
         agg: VaAggKind,
+        align: i32,
     ) {
         let (scratch0, scratch1, scratch2) = Reg::scratch_regs();
         let Some(ap) = self.va_list_addr_pinned(ap_loc, scratch2) else {
@@ -259,6 +279,21 @@ impl Aarch64CodeGen {
             addr: MemAddr::Base(ap),
             dst: scratch0,
         });
+        if align > 8 {
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: scratch0,
+                src2: GpOperand::Imm((align - 1) as i64),
+                dst: scratch0,
+            });
+            self.emit_mov_imm(scratch1, -(align as i64), 64);
+            self.push_lir(Aarch64Inst::And {
+                size: OperandSize::B64,
+                src1: scratch0,
+                src2: GpOperand::Reg(scratch1),
+                dst: scratch0,
+            });
+        }
 
         // Darwin lays every variadic argument out on the stack, so an
         // aggregate is simply itself at that address -- there is no save area
@@ -283,6 +318,16 @@ impl Aarch64CodeGen {
                 });
                 self.emit_va_arg_bytes(dst_loc, scratch1, 0, bytes, false);
                 8
+            }
+            // A 128-bit integer is two eightbytes. `emit_va_arg_load` sizes
+            // its move with `OperandSize::from_bits`, which saturates at 64,
+            // so it copied the low half and left the high half whatever the
+            // destination slot happened to hold -- the same saturation the
+            // AAPCS64 path carries its own arm for. Darwin reaches this
+            // emitter instead, and was missed.
+            VaAggKind::Scalar if !is_fp && type_bits == 128 => {
+                self.emit_va_arg_bytes(dst_loc, scratch0, 0, 16, false);
+                16
             }
             VaAggKind::Scalar => {
                 self.emit_va_arg_load(dst_loc, scratch0, type_bits, is_fp);
@@ -364,18 +409,29 @@ impl Aarch64CodeGen {
             VaAggKind::Scalar if is_fp => 16,
             VaAggKind::Scalar => stack_step,
         };
-        // From the type's alignment, not its size: AAPCS64 §6.4.2 stage C
-        // rounds the stacked address up to `max(8, alignof)`, and the two do
-        // not follow one another -- `struct { long a, b; }` is sixteen bytes
-        // and eight-byte aligned, and an HFA of four floats is sixteen bytes
-        // and four-byte aligned. Asking `size > 64` over-aligned both, so
-        // `va_arg` walked the stack differently from the caller that laid it
-        // out. Only the pointer is stacked for an indirect argument, so that
-        // one wants no rounding at all.
-        let stack_align16 = match agg {
-            VaAggKind::Indirect { .. } => false,
-            _ => align >= 16,
+        // From the argument's ABI alignment, not its size: stage C rounds the
+        // stacked address up to it, and the two do not follow one another --
+        // `struct { long a, b; }` is sixteen bytes and eight-byte aligned, and
+        // an HFA of four floats is sixteen bytes and four-byte aligned.
+        //
+        // A *value*, not a boolean. As a boolean this could only ever round to
+        // 16, so an eight-byte-aligned argument was padded to 16 while the
+        // caller placed it at 8 -- the two walked the stack differently. The
+        // value comes from `argument_alignment`, which is what the caller and
+        // the callee's own layout now ask as well. Only the pointer is stacked
+        // for an indirect argument, so that one wants no rounding at all.
+        let stack_align = match agg {
+            VaAggKind::Indirect { .. } => 8,
+            _ => align,
         };
+        // Stage C.10 is decided by the argument's alignment, not by whether
+        // it is a scalar: `struct { __int128 x; }` rounds exactly as a bare
+        // `__int128` does, and gcc emits the same `add w1,w1,15; and w1,w1,-16`
+        // for both. Restricting it to `VaAggKind::Scalar` left every 16-aligned
+        // composite reading the odd slot the prologue never filled that way.
+        // An indirect argument is a *pointer*, eight bytes, so it never rounds.
+        let needs_even_gr_pair =
+            !from_simd && !matches!(agg, VaAggKind::Indirect { .. }) && align == 16;
 
         // x9 = offs, x10 = offs + reg_step, committed back immediately.
         self.push_lir(Aarch64Inst::Ldr {
@@ -390,6 +446,28 @@ impl Aarch64CodeGen {
             src: scratch0,
             dst: scratch0,
         });
+        // AAPCS64 stage C.10: a 16-byte integral argument starts at an *even*
+        // general register, so `__gr_offs` rounds up to a multiple of 16
+        // before it is used -- both to find the save-area slot and as the base
+        // of the advance. On a negative offset `(offs + 15) & -16` rounds
+        // toward zero, which is what gcc emits here too (`add w1, w1, 15;
+        // and w1, w1, -16`). Without it a `__int128` could be read straddling
+        // the odd slot the prologue never filled that way.
+        if needs_even_gr_pair {
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: scratch0,
+                src2: GpOperand::Imm(15),
+                dst: scratch0,
+            });
+            self.emit_mov_imm(scratch1, -16, 64);
+            self.push_lir(Aarch64Inst::And {
+                size: OperandSize::B64,
+                src1: scratch0,
+                src2: GpOperand::Reg(scratch1),
+                dst: scratch0,
+            });
+        }
         self.push_lir(Aarch64Inst::Add {
             size: OperandSize::B64,
             src1: scratch0,
@@ -439,14 +517,14 @@ impl Aarch64CodeGen {
             },
             dst: Reg::X17,
         });
-        if stack_align16 {
+        if stack_align > 8 {
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: Reg::X17,
-                src2: GpOperand::Imm(15),
+                src2: GpOperand::Imm(stack_align as i64 - 1),
                 dst: scratch0,
             });
-            self.emit_mov_imm(scratch1, -16, 64);
+            self.emit_mov_imm(scratch1, -(stack_align as i64), 64);
             self.push_lir(Aarch64Inst::And {
                 size: OperandSize::B64,
                 src1: scratch0,
@@ -508,6 +586,14 @@ impl Aarch64CodeGen {
                     dst: scratch1,
                 });
                 self.emit_va_arg_bytes(dst_loc, scratch1, 0, bytes, false);
+                return;
+            }
+            // A 128-bit integer is two eightbytes, and `emit_va_arg_load`
+            // below sizes its move with `OperandSize::from_bits`, which
+            // saturates at 64 -- so it moved the low half and left the high
+            // half whatever the slot happened to hold.
+            VaAggKind::Scalar if needs_even_gr_pair => {
+                self.emit_va_arg_bytes(dst_loc, scratch0, 0, 16, false);
                 return;
             }
             _ => {}

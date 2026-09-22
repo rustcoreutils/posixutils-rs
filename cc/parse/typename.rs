@@ -18,14 +18,58 @@ use crate::token::lexer::TokenType;
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 
 impl Parser<'_> {
-    /// Check if identifier is a type-starting keyword (for cast/sizeof disambiguation)
+    /// Check if identifier is a type-starting keyword (for cast/sizeof
+    /// disambiguation).
+    ///
+    /// Any type *qualifier* can begin a type name -- C17 6.7.7 makes a
+    /// type-name a specifier-qualifier-list, in either order -- and a
+    /// qualifier at the head of a parenthesised construct cannot be anything
+    /// else, so admitting them here does not make a cast ambiguous with an
+    /// expression. Only `const`, `volatile` and `_Atomic` carried
+    /// `TYPE_KEYWORD` in the table, so `sizeof(__const int)` and
+    /// `(__const int *)p` were rejected while `sizeof(const int)` was fine.
     pub(crate) fn is_type_keyword(id: crate::strings::StringId) -> bool {
         crate::kw::has_tag(id, crate::kw::TYPE_KEYWORD)
+            || crate::kw::has_tag(id, crate::kw::QUALIFIER)
     }
 
     /// Consume type qualifiers (const, volatile, restrict)
     /// Used for qualifiers after '*' in pointers or after struct/union/enum types
     /// Returns the modifiers that were consumed
+    /// Consume trailing declaration specifiers after a struct, union or enum
+    /// specifier: qualifiers *and* storage classes.
+    ///
+    /// C17 6.7p1 makes declaration-specifiers a sequence of storage-class
+    /// specifiers, type specifiers, qualifiers and the rest **in any order**,
+    /// so `struct { int a; } static g = {1};` is well-formed. Only the
+    /// qualifiers were consumed here, and the storage class was then read as
+    /// the declarator's name -- the declaration failed with
+    /// "expected ';', found identifier 'g'".
+    pub(crate) fn consume_trailing_specifiers(&mut self) -> TypeModifiers {
+        let mut mods = self.consume_type_qualifiers();
+        loop {
+            if self.peek() != TokenType::Ident {
+                break;
+            }
+            let Some(name_id) = self.get_ident_id(self.current()) else {
+                break;
+            };
+            let m = match name_id {
+                crate::kw::STATIC => TypeModifiers::STATIC,
+                crate::kw::EXTERN => TypeModifiers::EXTERN,
+                crate::kw::REGISTER => TypeModifiers::REGISTER,
+                crate::kw::AUTO => TypeModifiers::AUTO,
+                crate::kw::TYPEDEF => TypeModifiers::TYPEDEF,
+                _ => break,
+            };
+            self.advance();
+            mods |= m;
+            // A storage class may itself be followed by more qualifiers.
+            mods |= self.consume_type_qualifiers();
+        }
+        mods
+    }
+
     pub(crate) fn consume_type_qualifiers(&mut self) -> TypeModifiers {
         let mut mods = TypeModifiers::empty();
         while self.peek() == TokenType::Ident {
@@ -34,21 +78,14 @@ impl Parser<'_> {
                 None => break,
             };
             match name_id {
-                crate::kw::CONST | crate::kw::GNU_CONST2 | crate::kw::GNU_CONST => {
-                    self.advance();
-                    mods |= TypeModifiers::CONST;
-                }
-                crate::kw::VOLATILE | crate::kw::GNU_VOLATILE2 | crate::kw::GNU_VOLATILE => {
-                    self.advance();
-                    mods |= TypeModifiers::VOLATILE;
-                }
-                crate::kw::RESTRICT | crate::kw::GNU_RESTRICT2 | crate::kw::GNU_RESTRICT => {
-                    self.advance();
-                    mods |= TypeModifiers::RESTRICT;
-                }
                 crate::kw::ATOMIC => {
                     self.advance();
                     mods |= TypeModifiers::ATOMIC;
+                }
+                // Every spelling, from the one shared answer.
+                _ if let Some(m) = super::cv_qualifier_modifier(name_id) => {
+                    self.advance();
+                    mods |= m;
                 }
                 _ if super::is_nullability_qualifier(name_id) => {
                     self.advance();
@@ -211,14 +248,12 @@ impl Parser<'_> {
                 None => break,
             };
             match name_id {
-                crate::kw::CONST => {
+                // Every spelling of `const`, `volatile` and `restrict`, from
+                // the one shared answer. `_Atomic` has its own arm below
+                // because it is also a type specifier.
+                _ if let Some(m) = super::cv_qualifier_modifier(name_id) => {
                     self.advance();
-                    modifiers |= TypeModifiers::CONST;
-                    parsed_something = true;
-                }
-                crate::kw::VOLATILE => {
-                    self.advance();
-                    modifiers |= TypeModifiers::VOLATILE;
+                    modifiers |= m;
                     parsed_something = true;
                 }
                 crate::kw::SIGNED => {
@@ -535,8 +570,24 @@ impl Parser<'_> {
                 typedef_type_id
             }
         } else {
-            // If we only have modifiers like `unsigned` without a base type, default to int
-            let kind = base_kind.unwrap_or(TypeKind::Int);
+            // If we only have modifiers like `unsigned` without a base type,
+            // default to int -- except for a bare `_Complex`, which gcc reads
+            // as `_Complex double`. The declaration parser has the same rule,
+            // and this is the other of the two specifier tallies: without it
+            // `sizeof(_Complex)` answered 8 (a `_Complex int`) where
+            // `_Complex v;` was correctly 16.
+            let kind = match base_kind {
+                Some(k) => k,
+                // Only a *bare* `_Complex`. A signedness modifier names an
+                // integer base of its own -- `_Complex unsigned` is
+                // `_Complex unsigned int`, eight bytes, not sixteen.
+                None if modifiers.contains(TypeModifiers::COMPLEX)
+                    && !modifiers.intersects(TypeModifiers::SIGNED | TypeModifiers::UNSIGNED) =>
+                {
+                    TypeKind::Double
+                }
+                None => TypeKind::Int,
+            };
             let typ = Type::with_modifiers(kind, modifiers);
             self.types.intern(typ)
         };

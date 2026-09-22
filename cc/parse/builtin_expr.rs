@@ -85,6 +85,28 @@ impl ObjectExtent {
 }
 
 impl Parser<'_> {
+    /// Whether an expression is a literal constant, with nothing to evaluate.
+    ///
+    /// Used to decide whether a discarded operand can be dropped outright or
+    /// has to be kept for its side effects. Deliberately conservative: it
+    /// answers `true` only for the shapes that plainly compute nothing, so a
+    /// wrong answer keeps a harmless dead operand rather than losing a side
+    /// effect.
+    fn is_literal_constant(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::IntLit(_)
+            | ExprKind::FloatLit(_)
+            | ExprKind::CharLit(_)
+            | ExprKind::StringLit(_) => true,
+            ExprKind::Cast { expr: inner, .. } => Self::is_literal_constant(inner),
+            ExprKind::Unary { op, operand } => {
+                matches!(op, UnaryOp::Neg | UnaryOp::BitNot | UnaryOp::Not)
+                    && Self::is_literal_constant(operand)
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a declaration in scope displaces the builtin meaning the parser
     /// would otherwise give `name_id`.
     ///
@@ -958,15 +980,33 @@ impl Parser<'_> {
                 ))
             })()),
             crate::kw::BUILTIN_EXPECT => Some((|| {
-                // __builtin_expect(expr, c) - branch prediction hint
-                // Returns expr, the second argument is the expected value (for optimization hints)
-                // We just return expr since we don't do branch prediction optimization
+                // `__builtin_expect(expr, c)` is a branch-prediction hint, and
+                // c17 does not predict branches -- so its value is `expr`.
+                //
+                // The hint is still a function-like call, though, and its
+                // second argument is evaluated: gcc runs the side effects of
+                // `__builtin_expect(cond, z++)`. Dropping it on the floor,
+                // which is what this used to do, silently skipped them.
+                //
+                // A literal -- which is what `likely`/`unlikely` expand to
+                // almost everywhere -- has nothing to evaluate, so it is
+                // dropped as before rather than left as a dead operand in
+                // every hot path.
                 self.expect_special(b'(')?;
                 let expr = self.parse_assignment_expr()?;
                 self.expect_special(b',')?;
-                let _expected = self.parse_assignment_expr()?;
+                let expected = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                Ok(expr)
+                if Self::is_literal_constant(&expected) {
+                    return Ok(expr);
+                }
+                let typ = expr.typ.unwrap_or(self.types.int_id);
+                let pos = expr.pos;
+                Ok(Self::typed_expr(
+                    ExprKind::Comma(vec![expected, expr]),
+                    typ,
+                    pos,
+                ))
             })()),
             crate::kw::BUILTIN_ASSUME_ALIGNED => Some((|| {
                 // __builtin_assume_aligned(ptr, align) or
@@ -1705,7 +1745,7 @@ impl Parser<'_> {
     /// The type matters more than it looks: these mostly return a pointer, and
     /// declaring one of them `int` truncates the returned address to 32 bits.
     /// `None` means "not a known `_chk` function", which stays an error.
-    fn chk_builtin_return_type(&mut self, name: &str) -> Option<TypeId> {
+    pub(crate) fn chk_builtin_return_type(&mut self, name: &str) -> Option<TypeId> {
         // The string family returns `char *`; the memory family returns
         // `void *`; the printf family returns `int`.
         match name {
@@ -1739,7 +1779,9 @@ impl Parser<'_> {
             // returns `char *`. Answering `int` here would truncate the
             // returned address to 32 bits, which is the bug the `_chk` cases
             // above are commented for.
-            "malloc" | "calloc" | "realloc" | "mempcpy" | "memchr" => Some(self.types.void_ptr_id),
+            "malloc" | "calloc" | "realloc" | "mempcpy" | "memchr" | "alloca" => {
+                Some(self.types.void_ptr_id)
+            }
             // `bcopy` predates `memmove` and returns nothing; `index`/`rindex`
             // are the old spellings of `strchr`/`strrchr`.
             "bcopy" => Some(self.types.void_id),

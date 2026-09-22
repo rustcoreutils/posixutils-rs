@@ -1337,7 +1337,21 @@ impl<'a> super::linearize::Linearizer<'a> {
             if *current_field_idx > 0 {
                 return None;
             }
-            let member = members.iter().find(|m| m.name != StringId::EMPTY)?;
+            // C17 6.7.9p17 initializes a union's first member, and 6.7.2.1p13
+            // makes the members of an anonymous structure members of the
+            // union itself -- so an anonymous aggregate *is* that first
+            // member. Requiring a name skipped it and initialized whatever
+            // came after:
+            //
+            //   union { struct { int a, b; }; long q; } u = {{1,2}};
+            //
+            // wrote `{1,2}` into `q` and left `b` zero, and a union whose
+            // members are *all* anonymous found none at all and stayed zero
+            // entirely. Unnamed bit-field padding is not a member and is
+            // still skipped.
+            let member = members
+                .iter()
+                .find(|m| m.name != StringId::EMPTY || m.bit_width.is_none())?;
             *current_field_idx = members.len();
             return Some(MemberInfo {
                 offset: member.offset,

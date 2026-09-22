@@ -249,6 +249,19 @@ impl Reg {
     }
 }
 
+/// Spend `n` argument registers out of a file of `file_len`.
+///
+/// These counters hold the number of registers *consumed* so far, and System
+/// V 3.2.3 step 5 gives an argument that does not fit no registers at all --
+/// so the count can never exceed the file. Adding unconditionally on the
+/// memory path kept the answer right for a `used < file_len` test and wrong
+/// for a `used + needed <= file_len` one when `needed` is zero: a
+/// two-general-eightbyte aggregate arriving after nine stacked `double`s
+/// asked whether the SSE file had room for none of it, and was told no.
+pub(super) fn spend_arg_regs(used: &mut usize, n: usize, file_len: usize) {
+    *used = (*used + n).min(file_len);
+}
+
 // Register Constraints (LLVM-style constraint-aware allocation)
 
 /// Register constraints for an instruction.
@@ -830,6 +843,22 @@ pub struct SpilledXmmArg {
 pub struct RegAlloc {
     /// Mapping from pseudo to location
     locations: HashMap<PseudoId, Loc>,
+    /// How many GP argument registers the **named** parameters consumed, capped
+    /// at the register file size. `va_start` needs this to seed `gp_offset`.
+    named_gp_regs: usize,
+    /// The same for SSE argument registers, seeding `fp_offset`.
+    named_fp_regs: usize,
+    /// The `%rbp` displacement just past the last **named** stacked parameter,
+    /// i.e. where the variadic arguments begin. `va_start` stores this as
+    /// `overflow_arg_area`.
+    ///
+    /// It is taken from `allocate_arguments` rather than recomputed, because
+    /// only that loop applies the full System V AMD64 psABI section 3.2.3
+    /// dispatch -- X87 and MEMORY classes occupy real bytes here while
+    /// consuming no register, and step 5 charges nothing for an argument that
+    /// did not fit. A separate tally of "how many registers overflowed" can
+    /// express neither, nor the alignment padding `IncomingOff::take` inserts.
+    named_incoming_end: i32,
     /// Free general-purpose registers
     free_regs: Vec<Reg>,
     /// Free XMM registers (for floating-point)
@@ -945,7 +974,7 @@ impl FrameBase {
     /// made `asm("..." ::: "rbx")` beside an over-aligned array segfault on
     /// code gcc accepts.
     fn of(func: &Function, types: &TypeTable) -> FrameBase {
-        let align = func
+        let local_align = func
             .locals
             .values()
             .map(|local| {
@@ -956,6 +985,22 @@ impl FrameBase {
             })
             .max()
             .unwrap_or(8);
+        // An outgoing argument more aligned than the call boundary needs the
+        // *area* it sits in to start on that alignment, and the area starts at
+        // `%rsp` less the reserved bytes. Only a realigned frame makes `%rsp`
+        // a known multiple of anything above 16, so a call passing such an
+        // argument realigns this function for the same reason an over-aligned
+        // local does. `classify_call_args` rounds the reservation to match.
+        let call_align = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .filter(|insn| matches!(insn.op, Opcode::Call))
+            .flat_map(|insn| insn.arg_types.iter())
+            .map(|t| types.alignment(*t) as i32)
+            .max()
+            .unwrap_or(8);
+        let align = local_align.max(call_align);
         if align <= 16 {
             return FrameBase::Rbp;
         }
@@ -1054,6 +1099,9 @@ impl RegAlloc {
     pub fn new() -> Self {
         Self {
             locations: HashMap::new(),
+            named_gp_regs: 0,
+            named_fp_regs: 0,
+            named_incoming_end: IncomingOff::FIRST.0,
             free_regs: Reg::allocatable().to_vec(),
             free_xmm_regs: XmmReg::allocatable().to_vec(),
             active: Vec::new(),
@@ -1315,13 +1363,26 @@ impl RegAlloc {
         if let Some(sret_id) = lowering.sret_pseudo {
             self.locations.insert(sret_id, Loc::Reg(int_arg_regs[0]));
             self.free_regs.retain(|&r| r != int_arg_regs[0]);
-            int_arg_idx += 1;
+            spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
         }
 
         for (i, (_name, typ)) in func.params.iter().enumerate() {
             let arg_n = (i as u32) + arg_idx_offset;
             let Some(pseudo_id) = lowering.arg_pseudos.get(arg_n as usize).copied().flatten()
             else {
+                // A declared parameter with no `Arg` pseudo would be skipped
+                // by the whole ABI dispatch below, so it would consume neither
+                // a register nor its bytes of the incoming area -- and since
+                // `va_start` now reads its three answers off the end of this
+                // loop, every later parameter and every variadic argument
+                // would shift. The linearizer creates one per parameter, so
+                // this is a guard against that changing, not a live case.
+                debug_assert!(
+                    false,
+                    "parameter {i} of {} has no Arg pseudo; the incoming-argument \
+                     layout this loop records would be short by its size",
+                    func.name
+                );
                 continue;
             };
             // `kind()` answers the *base* kind for a complex type, so without
@@ -1329,6 +1390,13 @@ impl RegAlloc {
             // sixteen-byte branch below rather than the COMPLEX_X87 branch
             // further down that is meant for its thirty-two. Both sibling
             // sites, in `call.rs` and `codegen.rs`, exclude complex too.
+            // A zero-sized parameter occupies nothing, so it must not take a
+            // register here either -- the call site's layout already skips
+            // it, and charging one made every later parameter read from the
+            // wrong register.
+            if crate::abi::param_is_ignored(*typ, types) {
+                continue;
+            }
             let is_longdouble = types.kind(*typ) == crate::types::TypeKind::LongDouble
                 && !types.is_complex_float(*typ);
             let is_fp = types.is_float(*typ);
@@ -1353,7 +1421,7 @@ impl RegAlloc {
                         .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
                     self.free_xmm_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
                     self.fp_pseudos.insert(pseudo_id);
-                    fp_arg_idx += 1;
+                    spend_arg_regs(&mut fp_arg_idx, 1, fp_arg_regs.len());
                 } else {
                     self.locations.insert(
                         pseudo_id,
@@ -1382,7 +1450,7 @@ impl RegAlloc {
                 // while c17's own *caller* passed it correctly. The two
                 // neighbouring arms below already do this; this one did not.
                 if fp_arg_idx + sse_regs <= fp_arg_regs.len() {
-                    fp_arg_idx += sse_regs;
+                    spend_arg_regs(&mut fp_arg_idx, sse_regs, fp_arg_regs.len());
                 } else {
                     self.locations.insert(
                         pseudo_id,
@@ -1419,8 +1487,8 @@ impl RegAlloc {
                         )),
                     );
                 } else {
-                    int_arg_idx += gp_needed;
-                    fp_arg_idx += sse_needed;
+                    spend_arg_regs(&mut int_arg_idx, gp_needed, int_arg_regs.len());
+                    spend_arg_regs(&mut fp_arg_idx, sse_needed, fp_arg_regs.len());
                 }
             } else if is_complex {
                 // How many XMM registers this complex type actually occupies:
@@ -1446,7 +1514,7 @@ impl RegAlloc {
                     let used = &fp_arg_regs[fp_arg_idx..fp_arg_idx + sse_regs];
                     self.free_xmm_regs.retain(|r| !used.contains(r));
                     self.fp_pseudos.insert(pseudo_id);
-                    fp_arg_idx += sse_regs;
+                    spend_arg_regs(&mut fp_arg_idx, sse_regs, fp_arg_regs.len());
                 } else {
                     // Not enough XMM registers left for every eightbyte, so
                     // §3.2.3 step 5 puts the *whole* argument in memory — and
@@ -1481,7 +1549,7 @@ impl RegAlloc {
                         )),
                     );
                 }
-                fp_arg_idx += 1;
+                spend_arg_regs(&mut fp_arg_idx, 1, fp_arg_regs.len());
             } else if types.kind(*typ) == crate::types::TypeKind::Int128 && !types.is_complex(*typ)
             {
                 // __int128: uses two GP registers when available.
@@ -1497,7 +1565,7 @@ impl RegAlloc {
                     self.free_regs.retain(|&r| {
                         r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
                     });
-                    int_arg_idx += 2;
+                    spend_arg_regs(&mut int_arg_idx, 2, int_arg_regs.len());
                 } else {
                     let at = IncomingOff::take(&mut stack_arg_offset, 16, 16);
                     self.int128_incoming.insert(pseudo_id, at);
@@ -1529,7 +1597,7 @@ impl RegAlloc {
                     self.locations
                         .insert(pseudo_id, Loc::Reg(int_arg_regs[int_arg_idx]));
                     self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
-                    int_arg_idx += 1;
+                    spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
                 } else {
                     // Stack args are placed in parameter order per System V AMD64 ABI
                     self.locations.insert(
@@ -1540,10 +1608,21 @@ impl RegAlloc {
                             types.alignment(*typ) as i32,
                         )),
                     );
-                    int_arg_idx += 1;
+                    spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
                 }
             }
         }
+
+        // What `va_start` needs, recorded by the one loop that knows the ABI.
+        //
+        // The counters are capped rather than used raw: several branches above
+        // advance them even when the argument was stacked, and once a bank is
+        // exhausted it stays exhausted, so the cap is the number actually
+        // consumed. `gp_offset`/`fp_offset` index *into* the save area, so a
+        // value past its end would make every register-path test fail.
+        self.named_gp_regs = int_arg_idx.min(int_arg_regs.len());
+        self.named_fp_regs = fp_arg_idx.min(fp_arg_regs.len());
+        self.named_incoming_end = stack_arg_offset.0;
     }
 
     /// Spill arguments in caller-saved registers if their interval crosses a call
@@ -1641,6 +1720,21 @@ impl RegAlloc {
     /// Where a stack-passed `__int128` parameter arrives, if it did.
     pub fn int128_incoming(&self, pseudo: PseudoId) -> Option<i32> {
         self.int128_incoming.get(&pseudo).copied()
+    }
+
+    /// GP argument registers consumed by the named parameters.
+    pub fn named_gp_regs(&self) -> usize {
+        self.named_gp_regs
+    }
+
+    /// SSE argument registers consumed by the named parameters.
+    pub fn named_fp_regs(&self) -> usize {
+        self.named_fp_regs
+    }
+
+    /// The `%rbp` displacement where the variadic arguments begin.
+    pub fn named_incoming_end(&self) -> i32 {
+        self.named_incoming_end
     }
 
     /// Get arguments that were spilled from caller-saved registers
@@ -2548,19 +2642,69 @@ mod arg_location_tests {
     use super::*;
     use crate::ir::{BasicBlock, BasicBlockId, Function, Pseudo};
     use crate::target::Target;
-    use crate::types::TypeTable;
+    use crate::types::{TypeId, TypeTable};
 
-    /// A function of `n` integer parameters, each with its `Arg(i)` pseudo.
-    fn func_with_int_params(types: &TypeTable, n: u32) -> Function {
+    /// A function whose parameters have the given types, each with its
+    /// `Arg(i)` pseudo.
+    fn func_with_params(types: &TypeTable, params: &[TypeId]) -> Function {
         let mut func = Function::new("f", types.int_id);
         let mut block = BasicBlock::new(BasicBlockId(0));
-        for i in 0..n {
-            func.add_param(format!("p{i}"), types.long_id);
-            func.pseudos.push(Pseudo::arg(PseudoId(i), i));
+        for (i, typ) in params.iter().enumerate() {
+            func.add_param(format!("p{i}"), *typ);
+            func.pseudos.push(Pseudo::arg(PseudoId(i as u32), i as u32));
         }
         block.insns.push(Instruction::new(Opcode::Ret));
         func.add_block(block);
         func
+    }
+
+    /// `named_incoming_end` is where the variadic arguments begin, and it has
+    /// to account for named parameters that occupy the incoming area while
+    /// consuming no register.
+    ///
+    /// A `long double` is X87 class and an aggregate over sixteen bytes is
+    /// MEMORY class: System V AMD64 psABI 3.2.3 places both in memory and
+    /// charges them no register at all. The tally this replaced derived the
+    /// area's end from register *overflow* alone -- `max(gp - 6, 0) +
+    /// max(fp - 8, 0)` eight-byte slots -- so it charged nothing for either,
+    /// and `va_start` pointed `overflow_arg_area` back inside the named
+    /// arguments. The expectations below are gcc's, read off its own output
+    /// for the same signatures.
+    #[test]
+    fn named_incoming_end_covers_memory_class_params() {
+        let types = TypeTable::new(&Target::host());
+        let first = IncomingOff::FIRST.0;
+        let int = types.int_id;
+        let dbl = types.double_id;
+        let ld = types.longdouble_id;
+
+        // Six ints fill the GP file, the seventh stacks (8 bytes), then a
+        // `long double` rounds to 16 and takes 16. End: 8 + 8 + 16 = 32.
+        let func = func_with_params(&types, &[int, int, int, int, int, int, int, ld]);
+        let mut ra = RegAlloc::new();
+        ra.allocate(&func, &types);
+        assert_eq!(ra.named_incoming_end(), first + 32);
+        assert_eq!(ra.named_gp_regs(), 6, "the GP file is full, not over-full");
+        assert_eq!(ra.named_fp_regs(), 0, "a long double takes no SSE register");
+
+        // Seven doubles stay in XMM0-6; only the `long double` is stacked.
+        let func = func_with_params(&types, &[dbl, dbl, dbl, dbl, dbl, dbl, dbl, ld]);
+        let mut ra = RegAlloc::new();
+        ra.allocate(&func, &types);
+        assert_eq!(ra.named_incoming_end(), first + 16);
+        assert_eq!(ra.named_gp_regs(), 0);
+        assert_eq!(ra.named_fp_regs(), 7);
+
+        // Nothing named at all: the area is empty and begins at its base.
+        let func = func_with_params(&types, &[]);
+        let mut ra = RegAlloc::new();
+        ra.allocate(&func, &types);
+        assert_eq!(ra.named_incoming_end(), first);
+    }
+
+    /// A function of `n` `long` parameters, each with its `Arg(i)` pseudo.
+    fn func_with_int_params(types: &TypeTable, n: u32) -> Function {
+        func_with_params(types, &vec![types.long_id; n as usize])
     }
 
     /// Where an `Arg` pseudo lives must be where the ABI actually puts it.

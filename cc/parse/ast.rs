@@ -1299,6 +1299,18 @@ pub struct Parameter {
     /// expressions are what the prologue evaluates to recover a row stride;
     /// without them a variably-modified element type has size 0.
     pub vm_dims: Vec<Expr>,
+    /// The run-time size expressions the array-to-pointer adjustment throws
+    /// away, outermost first; empty for every other parameter.
+    ///
+    /// `int a[i++]` is adjusted to `int *a` (C17 6.7.6.3p7), so the size is no
+    /// longer part of the type -- but the declaration still *has* it, and
+    /// 6.9.1p10 evaluates a parameter's variable size on entry, so its side
+    /// effects happen. Discarding the expression outright made
+    /// `int sub(int i, int array[i++])` leave `i` at its incoming value.
+    ///
+    /// Kept apart from `vm_dims` because nothing reads these for a size --
+    /// there is no size left to read. They exist only to be evaluated.
+    pub discarded_dims: Vec<Expr>,
 }
 
 /// Attributes that change how a function is *emitted* rather than what it

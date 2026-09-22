@@ -15,7 +15,7 @@ use crate::arch::codegen::is_variadic_function;
 use crate::arch::lir::{complex_fp_info, complex_sse_regs, Directive, FpSize, OperandSize, Symbol};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
-use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, RegAlloc, XmmReg};
+use crate::arch::x86_64::regalloc::{spend_arg_regs, FrameBase, Loc, Reg, RegAlloc, XmmReg};
 use crate::ir::{Function, Instruction, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::HashSet;
@@ -65,8 +65,8 @@ impl X86_64CodeGen {
         // floating-point argument read the register this one arrived in.
         let pair_start_int = *int_arg_idx;
         let pair_start_fp = *fp_arg_idx;
-        *int_arg_idx += gp_needed;
-        *fp_arg_idx += sse_needed;
+        spend_arg_regs(int_arg_idx, gp_needed, int_arg_regs.len());
+        spend_arg_regs(fp_arg_idx, sse_needed, fp_arg_regs.len());
 
         let param_name = &func.params[param_idx].0;
         let Some(local) = func.locals.get(param_name) else {
@@ -209,9 +209,14 @@ impl X86_64CodeGen {
         // Move arguments from registers to their allocated stack locations
         self.store_args_to_stack(func, types, &alloc);
 
-        // Save number of fixed GP and FP params for va_start
+        // What `va_start` will need. Taken from the allocator, which is the
+        // only place that applies the full psABI argument dispatch; a second
+        // tally here drifted from it and put `overflow_arg_area` inside the
+        // named arguments whenever one of them was X87 or MEMORY class.
         if is_variadic {
-            self.count_fixed_params(func, types);
+            self.named_gp_regs = alloc.named_gp_regs();
+            self.named_fp_regs = alloc.named_fp_regs();
+            self.named_incoming_end = alloc.named_incoming_end();
         }
 
         // Emit basic blocks
@@ -581,19 +586,24 @@ impl X86_64CodeGen {
         int_arg_idx: &mut usize,
         fp_arg_idx: &mut usize,
         int_arg_reg_count: usize,
+        fp_arg_reg_count: usize,
     ) {
+        // See `param_is_ignored`: nothing to advance for a zero-sized type.
+        if crate::abi::param_is_ignored(typ, types) {
+            return;
+        }
         let is_complex = types.is_complex_float(typ);
         let kind = types.kind(typ);
         let is_aggregate = !is_complex
             && (kind == crate::types::TypeKind::Struct || kind == crate::types::TypeKind::Union);
 
         if is_complex {
-            *fp_arg_idx += complex_sse_regs(types, typ);
+            spend_arg_regs(fp_arg_idx, complex_sse_regs(types, typ), fp_arg_reg_count);
         } else if kind == TypeKind::Int128 && !types.is_complex(typ) {
             // Only when it actually took the pair: 3.2.3 step 5 leaves the
             // registers it did not fit in available to later arguments.
             if *int_arg_idx + 1 < int_arg_reg_count {
-                *int_arg_idx += 2;
+                spend_arg_regs(int_arg_idx, 2, int_arg_reg_count);
             }
         } else if is_aggregate {
             // The class, not the size. Asking whether the aggregate was
@@ -602,23 +612,25 @@ impl X86_64CodeGen {
             let abi = crate::abi::SysVAmd64Abi;
             match abi.classify_param(typ, types) {
                 crate::abi::ArgClass::Direct { ref classes, .. } => {
-                    *fp_arg_idx += classes
+                    let sse = classes
                         .iter()
                         .filter(|c| **c == crate::abi::RegClass::Sse)
                         .count();
-                    *int_arg_idx += classes
+                    let gp = classes
                         .iter()
                         .filter(|c| **c == crate::abi::RegClass::Integer)
                         .count();
+                    spend_arg_regs(fp_arg_idx, sse, fp_arg_reg_count);
+                    spend_arg_regs(int_arg_idx, gp, int_arg_reg_count);
                 }
-                _ => *int_arg_idx += 1,
+                _ => spend_arg_regs(int_arg_idx, 1, int_arg_reg_count),
             }
         } else if kind == crate::types::TypeKind::LongDouble {
             // Passed in memory; spends no XMM register.
         } else if types.is_float(typ) {
-            *fp_arg_idx += 1;
+            spend_arg_regs(fp_arg_idx, 1, fp_arg_reg_count);
         } else {
-            *int_arg_idx += 1;
+            spend_arg_regs(int_arg_idx, 1, int_arg_reg_count);
         }
     }
 
@@ -673,6 +685,7 @@ impl X86_64CodeGen {
                     &mut int_arg_idx,
                     &mut fp_arg_idx,
                     int_arg_regs.len(),
+                    fp_arg_regs.len(),
                 );
                 continue;
             }
@@ -698,6 +711,7 @@ impl X86_64CodeGen {
                                 &mut int_arg_idx,
                                 &mut fp_arg_idx,
                                 int_arg_regs.len(),
+                                fp_arg_regs.len(),
                             );
                             break;
                         }
@@ -815,7 +829,7 @@ impl X86_64CodeGen {
                                     }
                                 }
                             }
-                            fp_arg_idx += sse_regs;
+                            spend_arg_regs(&mut fp_arg_idx, sse_regs, fp_arg_regs.len());
                         } else if types.kind(*typ) == crate::types::TypeKind::LongDouble {
                             // Long double is passed on the stack per System V AMD64 ABI
                             // No XMM register move needed - already at IncomingArg offset
@@ -838,14 +852,14 @@ impl X86_64CodeGen {
                                     });
                                 }
                             }
-                            fp_arg_idx += 1;
+                            spend_arg_regs(&mut fp_arg_idx, 1, fp_arg_regs.len());
                         } else if types.kind(*typ) == TypeKind::Int128 && !types.is_complex(*typ) {
                             // __int128 argument — uses TWO consecutive GP registers
                             // Store to the arg pseudo's stack slot (allocated by regalloc)
                             let int128_in_regs = int_arg_idx + 1 < int_arg_regs.len();
                             let pair_start = int_arg_idx;
                             if int128_in_regs {
-                                int_arg_idx += 2;
+                                spend_arg_regs(&mut int_arg_idx, 2, int_arg_regs.len());
                                 if let Some(loc) = self.locations.get(pseudo.id) {
                                     // Store lo half from first GP register
                                     self.push_lir(X86Inst::Mov {
@@ -922,76 +936,13 @@ impl X86_64CodeGen {
                                     });
                                 }
                             }
-                            int_arg_idx += 1;
+                            spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
                         }
                         break;
                     }
                 }
             }
         }
-    }
-
-    /// Count and save number of fixed GP and FP params for va_start
-    fn count_fixed_params(&mut self, func: &Function, types: &TypeTable) {
-        let has_sret = func
-            .pseudos
-            .iter()
-            .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
-
-        // A struct that arrives in two registers spends two, not one -- and a
-        // mixed one spends a general register *and* an SSE register. Counting
-        // it as a single GP parameter put `va_start`'s register-save-area index
-        // one slot out, so the first variadic argument was read from the wrong
-        // place.
-        let mut gp = 0usize;
-        let mut fp = 0usize;
-        for (_, typ) in &func.params {
-            let kind = types.kind(*typ);
-            if let Some(classes) = crate::abi::struct_param_classes(*typ, types) {
-                // Nine to sixteen bytes: one register per eightbyte, from
-                // whichever file its class names.
-                for class in &classes {
-                    if *class == crate::abi::RegClass::Sse {
-                        fp += 1;
-                    } else {
-                        gp += 1;
-                    }
-                }
-            } else if let Some(n) = crate::abi::sse_struct_regs(*typ, types) {
-                // An all-SSE aggregate: `n` XMM registers. Both the eight-byte
-                // and smaller shapes and the sixteen-byte SSE+SSEUP one -- a
-                // lone `__float128` -- land here, the latter because it answers
-                // a single class rather than the pair `struct_param_classes`
-                // above looks for.
-                fp += n;
-            } else if crate::abi::param_is_memory_class(*typ, types) {
-                // MEMORY class travels on the stack and spends no register.
-            } else if types.is_complex_float(*typ) {
-                // Two XMMs for `double _Complex`, one for `float _Complex`
-                // (both halves in one eightbyte), none for
-                // `long double _Complex`, which is COMPLEX_X87 and is passed
-                // in memory.
-                fp += complex_sse_regs(types, *typ);
-            } else if kind == TypeKind::Int128 && !types.is_complex(*typ) {
-                gp += 2;
-            } else if types.is_float(*typ) {
-                if kind != TypeKind::LongDouble {
-                    fp += 1;
-                }
-            } else {
-                gp += 1;
-            }
-        }
-        self.num_fixed_gp_params = gp;
-        if has_sret {
-            self.num_fixed_gp_params += 1; // Account for hidden sret pointer
-        }
-        self.num_fixed_fp_params = fp;
-
-        // Count fixed params that overflow to the stack (beyond register capacity)
-        let gp_overflow = self.num_fixed_gp_params.saturating_sub(6);
-        let fp_overflow = self.num_fixed_fp_params.saturating_sub(8);
-        self.num_fixed_stack_params = gp_overflow + fp_overflow;
     }
 
     /// Emit return instruction: move return value to registers and emit epilogue

@@ -4970,3 +4970,48 @@ fn diagnostics_fpermissive_is_not_a_dialect() {
         );
     }
 }
+
+/// An `always_inline` function that *cannot* be inlined must be diagnosed, not
+/// left as a call to a symbol that was never emitted.
+///
+/// A C99 inline definition has no out-of-line copy, so refusing the attribute
+/// silently produced `undefined reference` at link time -- a message naming
+/// neither the attribute nor the reason. gcc rejects the same program
+/// ("can never be inlined because it uses variable argument lists").
+///
+/// `va_start` is the refusal being exercised: it reads the enclosing
+/// function's register save area, which no splice carries.
+#[test]
+fn diagnostics_always_inline_that_cannot_be_inlined_is_rejected() {
+    let code = r#"
+#include <stdarg.h>
+long sink;
+inline void __attribute__((always_inline)) bad(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    sink = va_arg(ap, long);
+    va_end(ap);
+}
+int main(void) { bad(1, 42L); return 0; }
+"#;
+    compile_expect_error(
+        "diag_always_inline_refused",
+        code,
+        "inlining failed in call to 'always_inline' 'bad'",
+    );
+}
+
+/// The converse: an ordinary C99 inline definition is **not** an error, even
+/// though it too has no out-of-line copy here. Its external definition may be
+/// in another translation unit, which is exactly the idiom a header uses, so
+/// an unsubstituted call is correct and the linker resolves it.
+#[test]
+fn diagnostics_plain_inline_definition_is_not_an_error() {
+    let code = r#"
+inline int helper(int a) { return a + 1; }
+int use(int a) { return helper(a); }
+int main(void) { return use(1) == 2 ? 0 : 1; }
+"#;
+    assert_eq!(compile_and_run("diag_plain_inline_ok", code, &[]), 0);
+}

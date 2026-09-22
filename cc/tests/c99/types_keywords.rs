@@ -600,3 +600,144 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c99_pragma_pack", code, &[]), 0);
 }
+
+/// The GNU `__const` / `__const__` spellings of `const`, in every position a
+/// qualifier can appear.
+///
+/// Both spellings were already in the keyword table with the qualifier tag,
+/// but the parser wrote the `const` match out at five places and four of them
+/// listed only the standard spelling. So glibc's own `memcpy` prototype --
+/// which spells both `__restrict` and `__const` -- failed to parse:
+/// `expected ')', found identifier 'void'`. The five now ask one shared
+/// answer. The torture test is `20111208-1`.
+#[test]
+fn c99_gnu_const_spellings_are_accepted_everywhere() {
+    let code = r#"
+extern int printf(const char *, ...);
+/* The glibc prototype shape that could not be parsed. */
+extern void *memcpy(void *__restrict __d, __const void *__restrict __s,
+                    unsigned long __n);
+
+__const int g = 7;
+__const__ int g2 = 8;
+typedef __const char *cstr;
+
+static void takes(__const int *p, __volatile int *q, int *__restrict__ r) {
+    (void)p; (void)q; (void)r;
+}
+/* A qualifier list inside a parameter's array declarator (C17 6.7.6.2). */
+static int arr_param(int a[__const 4]) { return a[0]; }
+/* On a pointer, where the qualifier binds to the pointer itself. */
+static int deref(int *__const p) { return *p; }
+
+int main(void) {
+    char b[8];
+    memcpy(b, "hi", 3);
+    if (b[0] != 'h' || b[1] != 'i' || b[2] != '\0') return 1;
+    if (g != 7 || g2 != 8) return 2;
+    if (sizeof(cstr) != sizeof(char *)) return 3;
+
+    int v = 5;
+    takes(&v, &v, &v);
+    int a[4] = {9, 0, 0, 0};
+    if (arr_param(a) != 9) return 4;
+    if (deref(&v) != 5) return 5;
+
+    /* In a cast and a sizeof, which take the type-name path. */
+    if (sizeof(__const int) != sizeof(int)) return 6;
+    if (*(__const int *)&v != 5) return 7;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_gnu_const_spellings", code, &[]), 0);
+}
+
+/// Declaration specifiers may appear in any order (C17 6.7p1), including a
+/// storage class *after* a struct, union or enum specifier.
+///
+/// Only trailing *qualifiers* were consumed after such a specifier, so the
+/// storage class was then read as the declarator's name and
+/// `struct { int a; } static g = {1};` failed with
+/// `expected ';', found identifier 'g'`. The torture test is `20180921-1`.
+#[test]
+fn c99_storage_class_may_follow_a_struct_specifier() {
+    let code = r#"
+extern int printf(const char *, ...);
+struct S { int a; int b; };
+union U { int i; float f; };
+
+struct S static s1 = {1, 2};
+struct S const static s2 = {3, 4};
+struct S static const s3 = {5, 6};
+union U static u1 = {7};
+int static i1 = 8;
+const int static i2 = 9;
+static struct S s4 = {10, 11};   /* the ordinary order still works */
+struct S extern s5;
+struct S s5 = {12, 13};
+struct S typedef T;             /* typedef after the specifier */
+
+static int in_function(void) {
+    struct S static loc = {14, 15};
+    return loc.a;
+}
+
+int main(void) {
+    T t = {0, 0};
+    (void)t;
+    if (s1.a != 1 || s1.b != 2) return 1;
+    if (s2.a != 3 || s3.a != 5) return 2;
+    if (u1.i != 7) return 3;
+    if (i1 != 8 || i2 != 9) return 4;
+    if (s4.a != 10 || s5.a != 12) return 5;
+    if (in_function() != 14) return 6;
+    if (sizeof(T) != sizeof(struct S)) return 7;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_specifier_order", code, &[]), 0);
+}
+
+/// A bare `_Complex` is `_Complex double`, as gcc reads it.
+///
+/// C17 6.7.2p2 lists only the three floating spellings, so a lone `_Complex`
+/// names no type and c17 reported "type specifier missing". gcc accepts it as
+/// `_Complex double`, and since c17 now has `_Complex int`, defaulting it to
+/// `int` like every other bare modifier would have made `_Complex v;` an
+/// eight-byte integer pair rather than gcc's sixteen-byte double one.
+///
+/// A signedness modifier still names an integer base of its own:
+/// `_Complex unsigned` is `_Complex unsigned int`, eight bytes. Both the
+/// declaration parser and the type-name parser have to agree, or `sizeof`
+/// disagrees with a declaration. The torture test is `20070614-1`.
+#[test]
+fn c99_bare_complex_is_complex_double() {
+    let code = r#"
+extern int printf(const char *, ...);
+_Complex v = 3.0 + 1.0iF;
+static _Complex identity(_Complex z) { return z; }
+
+int main(void) {
+    if (sizeof(v) != 2 * sizeof(double)) return 1;
+    if (__real__ v != 3.0 || __imag__ v != 1.0) return 2;
+
+    _Complex w = identity(v);
+    if (__real__ w != 3.0 || __imag__ w != 1.0) return 3;
+
+    /* The type-name path must agree with the declaration path. */
+    if (sizeof(_Complex) != 2 * sizeof(double)) return 4;
+    if (sizeof(_Complex) != sizeof(v)) return 5;
+
+    /* A signedness modifier names an integer base, not a double one. */
+    if (sizeof(_Complex unsigned) != 2 * sizeof(unsigned)) return 6;
+    if (sizeof(_Complex signed) != 2 * sizeof(int)) return 7;
+    /* And the spellings that do name a base are unchanged. */
+    if (sizeof(_Complex long) != 2 * sizeof(long)) return 8;
+    if (sizeof(_Complex short) != 2 * sizeof(short)) return 9;
+    if (sizeof(_Complex float) != 2 * sizeof(float)) return 10;
+    if (sizeof(_Complex double) != 2 * sizeof(double)) return 11;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_bare_complex", code, &[]), 0);
+}

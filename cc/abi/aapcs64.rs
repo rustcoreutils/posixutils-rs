@@ -22,6 +22,107 @@
 use super::{is_aggregate, is_float, is_integer, is_pointer, Abi, ArgClass, HfaBase, RegClass};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
+/// The alignment AAPCS64 gives an argument of this type.
+///
+/// **Not `TypeTable::alignment`.** AAPCS64 has no notion of over-alignment: a
+/// type's own `__attribute__((aligned(N)))` does not change how it is passed,
+/// while alignment contributed by a *field* does. Measured against gcc, which
+/// implements the same rule in `aarch64_function_arg_alignment`:
+///
+/// | type | `_Alignof` | stacked at |
+/// |---|---|---|
+/// | `struct { double a,b,c,d; }` | 8 | 8 |
+/// | the same, `aligned(32)` | 32 | **8** -- own attribute ignored |
+/// | `aligned(16) struct { long long a,b; }` | 16 | **8** -- ignored |
+/// | `struct { long long a __attribute__((aligned(16))); long long b; }` | 16 | **16** -- member honoured |
+/// | `struct { G16 g; }`, `G16` the `aligned(16)` struct above | 16 | **16** -- honoured as a field |
+/// | `struct __attribute__((packed)) { __int128 x; }` | 1 | **8** -- packing honoured, floored at 8 |
+/// | `typedef long long L32 __attribute__((aligned(32)))` | 32 | **8** -- attributed typedef ignored |
+/// | `struct { __int128 x; }`, scalar `__int128` | 16 | 16 |
+///
+/// This governs both the stacked-argument offset (stage C.12-C.14) and the
+/// even-register pairing (stage C.10), so every aarch64 site that lays out an
+/// argument asks *this* and not `alignment()`.
+///
+/// The clamp to 16 is unobservable through natural alignment alone -- gcc
+/// reports `_Alignof <= 16` for every non-attributed type on this target,
+/// including a 32-byte vector -- but it is what gcc's own code does, so it is
+/// written as a clamp rather than left implicit.
+pub fn argument_alignment(types: &TypeTable, ty: TypeId) -> usize {
+    let raw = match types.kind(ty) {
+        // `composite.align` would carry the struct's own attribute; the
+        // member-derived value is recorded separately for exactly this.
+        TypeKind::Struct | TypeKind::Union => {
+            types.composite(ty).map(|c| c.member_align).unwrap_or(1)
+        }
+        // An array is passed as its element type repeated, so it aligns as
+        // one element does.
+        TypeKind::Array => types
+            .base_type(ty)
+            .map(|elem| argument_alignment(types, elem))
+            .unwrap_or(1),
+        // `natural_alignment` already ignores `explicit_align`, which is where
+        // an attributed *typedef* records itself.
+        _ => types.natural_alignment(ty),
+    };
+    raw.clamp(8, 16)
+}
+
+/// Stage C.10: where an argument's run of `n` general registers starts.
+///
+/// An argument whose AAPCS64 alignment is 16 -- see [`argument_alignment`] --
+/// begins at an *even* NGRN, so an odd one skips a register and leaves it
+/// unused. That is the whole of the rule: it is the alignment that decides,
+/// not the type, so a scalar `__int128`, a `struct { __int128 x; }` and a
+/// struct whose first member carries `aligned(16)` all round, while the same
+/// struct carrying `aligned(16)` on *itself* does not.
+///
+/// `None` means the run does not fit. Stage C.11 then sets NGRN to
+/// `num_regs`, so every later argument is on the stack as well -- unlike
+/// System V, which leaves the registers it did not fit in available.
+pub fn gr_run_start(
+    types: &TypeTable,
+    ty: TypeId,
+    ngrn: usize,
+    n: usize,
+    num_regs: usize,
+) -> Option<usize> {
+    let start = if argument_alignment(types, ty) == 16 {
+        (ngrn + 1) & !1
+    } else {
+        ngrn
+    };
+    (start + n <= num_regs).then_some(start)
+}
+
+/// The stack slot a variadic argument of type `ty` occupies on Apple targets.
+///
+/// Returns `(bytes, align)`. Apple's arm64 convention puts *every* variadic
+/// argument on the stack, one eight-byte granule at a time, and a type whose
+/// alignment is 16 starts on a sixteen-byte boundary. The size is rounded up
+/// to the granule, so a `__int128` occupies sixteen bytes rather than the one
+/// slot every scalar used to get -- the caller wrote half of it and the
+/// reader took half of it, which agreed with itself and with nothing else.
+///
+/// An aggregate too large to pass directly travels as a pointer to the
+/// caller's copy, so that slot is eight bytes however aligned the object is.
+///
+/// **The type's full alignment, uncapped.** Above sixteen this is where clang
+/// contradicts itself: its *caller* lowers an over-aligned aggregate through
+/// LLVM's Darwin vararg convention, which stacks it a legalized element at a
+/// time in eight-byte granules and never looks at the attribute, while its
+/// `va_arg` rounds the cursor up to the type's own alignment. c17 follows
+/// `va_arg` -- which means the caller has to realign its outgoing area to
+/// match, since `%sp` is only guaranteed to sixteen.
+pub fn darwin_va_slot(types: &TypeTable, ty: TypeId, target: &crate::target::Target) -> (i32, i32) {
+    let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, target);
+    if matches!(abi.classify_param(ty, types), ArgClass::Indirect { .. }) {
+        return (8, 8);
+    }
+    let bytes = ((types.size_bits(ty).div_ceil(8).max(1) as i32) + 7) & !7;
+    (bytes, (types.alignment(ty) as i32).max(8))
+}
+
 /// Maximum aggregate size (in bits) that can be passed in registers.
 /// Structs larger than 128 bits (16 bytes) must use sret (unless HFA).
 const MAX_AGGREGATE_BITS: u32 = 128;
@@ -467,6 +568,93 @@ mod tests {
     use crate::target::{Arch, Os, Target};
     use crate::types::{CompositeType, StructMember, Type};
 
+    /// `argument_alignment` follows the members, not the type's own attribute.
+    ///
+    /// Every row here was read off gcc's own aarch64 output; the doc comment on
+    /// the function records the offsets. The two that a naive "walk the
+    /// members" implementation gets wrong are the packed struct (whose pack cap
+    /// is not recorded anywhere but `member_align`) and the attributed typedef
+    /// (whose attribute lives in `explicit_align`, not in a composite).
+    #[test]
+    fn argument_alignment_follows_the_members() {
+        fn member(typ: TypeId, explicit_align: Option<u32>) -> StructMember {
+            StructMember {
+                name: crate::strings::StringId::default(),
+                typ,
+                offset: 0,
+                bit_width: None,
+                bit_offset: None,
+                access_bytes: None,
+                explicit_align,
+            }
+        }
+        // `align` is what the type reports to the language; `member_align` is
+        // what the members require. An `aligned(N)` attribute raises only the
+        // first, which is the whole distinction being tested.
+        fn composite(
+            types: &mut TypeTable,
+            members: Vec<StructMember>,
+            size: usize,
+            align: usize,
+            member_align: usize,
+        ) -> TypeId {
+            types.intern(Type::struct_type(CompositeType {
+                tag: None,
+                members,
+                enum_constants: vec![],
+                size,
+                align,
+                member_align,
+                is_complete: true,
+                transparent: false,
+            }))
+        }
+
+        let mut types = TypeTable::new(&Target::new(Arch::Aarch64, Os::Linux));
+        let d = types.double_id;
+        let ll = types.longlong_id;
+        let i128 = types.int128_id;
+
+        // Four doubles: the members want 8, and an `aligned(32)` attribute on
+        // the struct does not change what the ABI passes.
+        let plain = composite(&mut types, vec![member(d, None); 4], 32, 8, 8);
+        let over = composite(&mut types, vec![member(d, None); 4], 32, 32, 8);
+        // A member's own alignment does count.
+        let member_aligned = composite(
+            &mut types,
+            vec![member(ll, Some(16)), member(ll, None)],
+            16,
+            16,
+            16,
+        );
+        // Packed: `member_align` is the only record that the pack cap ever
+        // applied, and the result floors at 8 rather than at 1.
+        let packed = composite(&mut types, vec![member(ll, None)], 8, 1, 1);
+        // Naturally 16-aligned composite.
+        let nat16 = composite(&mut types, vec![member(i128, None)], 16, 16, 16);
+        // An attributed typedef records itself in `explicit_align`, which
+        // `natural_alignment` already ignores.
+        let mut attributed = types.get(ll).clone();
+        attributed.explicit_align = Some(32);
+        let attributed = types.intern(attributed);
+
+        assert_eq!(argument_alignment(&types, plain), 8);
+        assert_eq!(
+            argument_alignment(&types, over),
+            8,
+            "a struct's own aligned(32) must not reach the argument area"
+        );
+        assert_eq!(argument_alignment(&types, member_aligned), 16);
+        assert_eq!(argument_alignment(&types, packed), 8);
+        assert_eq!(argument_alignment(&types, nat16), 16);
+        assert_eq!(argument_alignment(&types, i128), 16);
+        assert_eq!(
+            argument_alignment(&types, attributed),
+            8,
+            "an attributed typedef must not reach the argument area either"
+        );
+    }
+
     /// A union's members overlap, so it is an HFA of its *largest* member, not
     /// of all of them put together.
     ///
@@ -497,6 +685,7 @@ mod tests {
             enum_constants: vec![],
             size: 8,
             align: 8,
+            member_align: 8,
             is_complete: true,
             transparent: false,
         }));
@@ -519,6 +708,7 @@ mod tests {
             enum_constants: vec![],
             size: 16,
             align: 8,
+            member_align: 8,
             is_complete: true,
             transparent: false,
         }));

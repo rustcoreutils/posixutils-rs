@@ -60,10 +60,10 @@ impl Parser<'_> {
                 break;
             };
             match name_id {
-                crate::kw::CONST => modifiers |= TypeModifiers::CONST,
-                crate::kw::VOLATILE => modifiers |= TypeModifiers::VOLATILE,
-                crate::kw::RESTRICT => modifiers |= TypeModifiers::RESTRICT,
                 crate::kw::ATOMIC => modifiers |= TypeModifiers::ATOMIC,
+                // Every spelling of the three CV qualifiers, from the one
+                // shared answer.
+                _ if let Some(m) = super::cv_qualifier_modifier(name_id) => modifiers |= m,
                 _ if super::is_nullability_qualifier(name_id) => {}
                 _ => break,
             }
@@ -154,11 +154,10 @@ impl Parser<'_> {
                         // C17 6.7.6.2: the array declarator of a parameter
                         // takes a type-qualifier list, which includes
                         // `_Atomic`, and optionally `static`.
-                        crate::kw::STATIC
-                        | crate::kw::CONST
-                        | crate::kw::VOLATILE
-                        | crate::kw::RESTRICT
-                        | crate::kw::ATOMIC => {
+                        crate::kw::STATIC | crate::kw::ATOMIC => {
+                            self.advance();
+                        }
+                        _ if super::cv_qualifier_modifier(name_id).is_some() => {
                             self.advance();
                         }
                         _ => break,
@@ -560,13 +559,17 @@ impl Parser<'_> {
             // dimension to be present, so the element type's variable
             // dimensions are exactly the trailing entries.
             let elem_typ = self.types.get(typ_id).base;
-            let vm_dims = match elem_typ {
+            let (vm_dims, discarded_dims) = match elem_typ {
                 Some(elem) => {
                     let want = self.types.unsized_array_levels(elem);
                     let skip = vla_sizes.len().saturating_sub(want);
-                    vla_sizes[skip..].to_vec()
+                    // The leading entries are the dimensions the
+                    // array-to-pointer adjustment removes. They are still
+                    // evaluated on entry, so they are kept for their side
+                    // effects -- see `Parameter::discarded_dims`.
+                    (vla_sizes[skip..].to_vec(), vla_sizes[..skip].to_vec())
                 }
-                None => Vec::new(),
+                None => (Vec::new(), vla_sizes.clone()),
             };
 
             // C17 6.7.6.3p10: `void` may appear as a parameter only as the
@@ -594,6 +597,7 @@ impl Parser<'_> {
                 name: name_opt,
                 typ: typ_id,
                 vm_dims,
+                discarded_dims,
                 symbol: None,
             });
 

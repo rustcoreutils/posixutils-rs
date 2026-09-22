@@ -1115,3 +1115,401 @@ int main(void) {
         0
     );
 }
+
+/// A side effect keeps happening even where its value is thrown away.
+///
+/// Three places dropped one. A parameter's array size is discarded by the
+/// array-to-pointer adjustment (C17 6.7.6.3p7) but is still evaluated on
+/// entry (6.9.1p10), and c17 threw the expression away with the size.
+/// `__builtin_expect`'s second argument is a hint c17 does not use, and it
+/// was parsed and discarded rather than evaluated. And an `asm` read-write
+/// operand took its lvalue twice -- once for the load before the asm, once
+/// for the store after -- so `asm("" : "+r"(*bar()))` called `bar` twice.
+///
+/// The torture tests are `970217-1`, `pr77767`, `pr85156` and `990130-1`.
+#[test]
+fn c99_discarded_operands_still_have_their_side_effects() {
+    let code = r#"
+int calls;
+int dummy;
+int *bar(void) { ++calls; return &dummy; }
+
+/* The size of an adjusted array parameter. */
+int sub(int i, int array[i++]) { return i; }
+int two(int a, int b[a++], int c, int d[c++]) { return a * 10 + c; }
+/* Several dimensions: only the outermost is adjusted away, and the inner
+   ones are still needed for the row stride. */
+int rows(int n, int m, int a[n++][m]) { return n; }
+
+/* __builtin_expect's second argument. */
+int x, y;
+int expect_side(int z) {
+    if (__builtin_expect(x ? y != 0 : 0, z++)) return 7;
+    return z;
+}
+/* A constant hint, which is what likely/unlikely expand to, still works. */
+int expect_const(int v) { return __builtin_expect(v != 0, 1) ? 10 : 20; }
+
+/* An asm read-write operand. */
+static void asm_rw(void) { __asm__("" : "+r"(*bar())); }
+/* And a plain output operand, which is written once. */
+static void asm_out(void) { __asm__("" : "=r"(*bar())); }
+
+int main(void) {
+    int arr[10];
+    if (sub(10, arr) != 11) return 1;
+    if (two(1, arr, 1, arr) != 22) return 2;
+
+    int grid[4][4];
+    if (rows(3, 4, grid) != 4) return 3;
+
+    x = 1;
+    if (expect_side(10) != 11) return 4;
+    if (expect_const(1) != 10) return 5;
+    if (expect_const(0) != 20) return 6;
+
+    calls = 0;
+    asm_rw();
+    if (calls != 1) return 7;
+
+    calls = 0;
+    asm_out();
+    if (calls != 1) return 8;
+
+    /* Mixed operand kinds, in both orders: the resolved places are indexed
+       by operand position, and a memory operand takes an early exit from
+       that loop -- so a missing push would silently shift every later one. */
+    {
+        int mcalls = 0, rcalls = 0;
+        calls = 0;
+        __asm__("" : "=m"(*bar()), "+r"(dummy));
+        mcalls = calls;
+        calls = 0;
+        __asm__("" : "+r"(dummy), "=m"(*bar()));
+        rcalls = calls;
+        if (mcalls != 1 || rcalls != 1) return 11;
+
+        int a = 1, b = 2;
+        calls = 0;
+        __asm__("" : "+r"(a), "=m"(*bar()), "+r"(b));
+        if (calls != 1 || a != 1 || b != 2) return 12;
+    }
+    /* A read-write operand whose lvalue has a side effect in its index. */
+    {
+        int v[4] = {10, 20, 30, 40};
+        int i = 1;
+        __asm__("" : "+r"(v[i++]));
+        if (i != 2 || v[0] != 10 || v[1] != 20) return 13;
+    }
+    /* A bit-field read-write operand: no address of its own, so it takes
+       the placement path rather than an address. */
+    {
+        struct bits { unsigned f : 5; unsigned g : 5; } s = {3, 4};
+        __asm__("" : "+r"(s.f));
+        if (s.f != 3 || s.g != 4) return 14;
+    }
+
+    /* The value of __builtin_expect is still its first argument, and the
+       hint's side effect happens. The two touch different objects, because
+       the order in which a call's arguments are evaluated is unspecified. */
+    int w = 3, hint = 0;
+    if (__builtin_expect(w + 1, hint++) != 4) return 9;
+    if (w != 3 || hint != 1) return 10;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_discarded_side_effects", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_discarded_side_effects_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// The integer promotions run on a `switch`'s controlling expression, and
+/// each case constant converts to the **promoted** type (C17 6.8.4.2p5).
+///
+/// c17 compared at the operand's own narrow width instead, so a label
+/// collided with a value it does not equal: `switch ((signed char) -1)`
+/// matched `case 255:`, because both are 0xFF in eight bits, where the
+/// promoted comparison is -1 against 255. The torture test is `20011223-1`,
+/// but any `switch` on a sub-`int` type could take the wrong arm.
+#[test]
+fn c99_switch_promotes_its_controlling_expression() {
+    let code = r#"
+int main(void) {
+    /* The reported shape: a negative `signed char` against a label that is
+       the same bit pattern only at eight bits. */
+    {
+        signed char sc = -1;
+        switch (sc) { case 255: return 1; default: break; }
+        switch (sc) { case -1: break; default: return 2; }
+    }
+    /* `unsigned char` promotes to `int`, so 200 stays 200 and does not
+       become -56. */
+    {
+        unsigned char uc = 200;
+        switch (uc) { case 200: break; default: return 3; }
+        switch (uc) { case -56: return 4; default: break; }
+    }
+    /* The same one width up. */
+    {
+        short sh = -1;
+        switch (sh) { case 65535: return 5; default: break; }
+        switch (sh) { case -1: break; default: return 6; }
+        unsigned short ush = 60000;
+        switch (ush) { case 60000: break; default: return 7; }
+    }
+    /* Plain `char`, whose signedness is the target's choice -- 65 is
+       positive either way. */
+    {
+        char c = 'A';
+        switch (c) { case 65: break; default: return 8; }
+    }
+    /* At `int` width and wider, nothing is promoted and the comparison is
+       the operand's own -- including the unsigned wrap-around spelling. */
+    {
+        unsigned u = 3000000000u;
+        switch (u) { case 3000000000u: break; default: return 9; }
+        switch (u) { case -1294967296: break; default: return 10; }
+        long l = -1;
+        switch (l) { case -1: break; default: return 11; }
+        unsigned long ul = 18000000000000000000ul;
+        switch (ul) { case 18000000000000000000ul: break; default: return 12; }
+    }
+    /* `_Bool` and an enumeration both promote to `int`. */
+    {
+        _Bool b = 1;
+        switch (b) { case 1: break; default: return 13; }
+        enum E { E0, E1 = 7 } e = E1;
+        switch (e) { case 7: break; default: return 14; }
+    }
+    /* A GNU case range is converted the same way. */
+    {
+        signed char sc = -1;
+        switch (sc) { case -5 ... 5: break; default: return 15; }
+        unsigned char uc = 200;
+        switch (uc) { case 100 ... 255: break; default: return 16; }
+        /* And the narrow-width collision does not reappear through a range. */
+        signed char neg = -1;
+        switch (neg) { case 250 ... 255: return 17; default: break; }
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_switch_promotion", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_switch_promotion_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// `E1[E2]` is `(*((E1)+(E2)))` (C17 6.5.2.1p2), so the operands are
+/// interchangeable: `N[p]` is `p[N]`.
+///
+/// The linearizer already swapped them, but the *type* of the expression came
+/// from the left operand alone -- so `N[p]` was typed `int`. It read four
+/// bytes at a four-byte stride from a `char` object, and a store through it
+/// landed somewhere else entirely. Only the constant-index-on-array spelling,
+/// `1[arr]`, happened to work.
+#[test]
+fn c99_reversed_subscript_takes_its_type_from_the_pointer() {
+    let code = r#"
+int N = 2;
+char buf[8] = {10, 11, 12, 13, 14, 15, 16, 17};
+int iarr[4] = {100, 200, 300, 400};
+long larr[3] = {1000, 2000, 3000};
+void *vp = buf;
+struct S { int a; int b; };
+struct S sarr[3] = {{1, 2}, {3, 4}, {5, 6}};
+
+int main(void) {
+    char *p = buf;
+    /* Reads, through a pointer and through an array. */
+    if (N[p] != 12 || p[N] != 12) return 1;
+    if (N[buf] != 12 || buf[N] != 12) return 2;
+    /* Through a cast, which is what `pr22061-1` uses. */
+    if (N[(char *)vp] != 12) return 3;
+    /* A constant index, and a variable one. */
+    if (2[p] != 12) return 4;
+    { int i = 3; if (i[p] != 13) return 5; }
+    /* Element types wider than the index type must not be confused for it. */
+    if (1[iarr] != 200 || iarr[1] != 200) return 6;
+    if (2[larr] != 3000) return 7;
+    if (1[sarr].b != 4) return 8;
+
+    /* Writes go where the pointer says. */
+    N[p] = 99;
+    if (buf[2] != 99 || buf[3] != 13) return 9;
+    N[(char *)vp] = 77;
+    if (buf[2] != 77) return 10;
+    1[iarr] = 555;
+    if (iarr[1] != 555 || iarr[2] != 300) return 11;
+
+    /* A compound assignment and an increment through the reversed form --
+       both are read-modify-writes, so both have to agree about the type. */
+    3[p] = 20;
+    3[p] += 5;
+    if (buf[3] != 25) return 12;
+    3[p]++;
+    if (buf[3] != 26) return 13;
+
+    /* Taking the address, and sizeof, agree with the ordinary spelling. */
+    if (&2[p] != &p[2]) return 14;
+    if (sizeof(1[iarr]) != sizeof(int)) return 15;
+    if (sizeof(N[p]) != sizeof(char)) return 16;
+
+    /* Two dimensions, reversed at the outer level. */
+    { static int g[2][3] = {{1,2,3},{4,5,6}};
+      if (1[g][2] != 6) return 17; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_reversed_subscript", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_reversed_subscript_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// An implicitly declared function that c17 knows as a library builtin gets
+/// that builtin's return type, not `int`.
+///
+/// `-fpermissive` restores C89 6.3.2.2's implicit declaration, and c17
+/// synthesized `extern int f()` for every name -- so `x = alloca(n)` or
+/// `p = malloc(n)` without a declaration truncated the returned address to 32
+/// bits and the program died on the first dereference. That is exactly the
+/// pre-C99 code the flag exists to compile, and it is how `pr22061-1` failed.
+///
+/// The declaration stays unprototyped either way, so no argument is checked
+/// or converted.
+#[test]
+fn c99_implicit_declaration_of_a_builtin_keeps_its_return_type() {
+    let code = r#"
+int main(void) {
+    /* Pointer-returning allocators: the high half of the address must
+       survive. */
+    void *a = alloca(64);
+    void *m = malloc(64);
+    if (a == 0 || m == 0) return 1;
+
+    /* Round-trip through the memory, which needs the address to be whole. */
+    char *s = strcpy((char *)a, "hello");
+    if (s[0] != 'h' || s[4] != 'o' || s[5] != '\0') return 2;
+    if (strlen((char *)a) != 5) return 3;
+
+    memset(m, 'x', 8);
+    if (((char *)m)[7] != 'x') return 4;
+    memcpy((char *)a, (char *)m, 8);
+    if (((char *)a)[7] != 'x') return 5;
+
+    /* A `char *` returner, used as one. */
+    char *found = strchr((char *)a, 'x');
+    if (found == 0) return 6;
+
+    /* An `int` returner is still `int`. */
+    if (strcmp("ab", "ab") != 0) return 7;
+    if (abs(-3) != 3) return 8;
+
+    free(m);
+    return 0;
+}
+"#;
+    let flags = vec!["-fpermissive".to_string()];
+    assert_eq!(compile_and_run("c99_implicit_builtin_ret", code, &flags), 0);
+    assert_eq!(
+        compile_and_run(
+            "c99_implicit_builtin_ret_o2",
+            code,
+            &["-fpermissive".to_string(), "-O2".to_string()]
+        ),
+        0
+    );
+}
+
+/// A `switch` on a controlling expression wider than a general register
+/// compares all of it.
+///
+/// The `Switch` instruction carries its case labels as `i64` and both
+/// backends compare the value in one register, so a `__int128` controlling
+/// expression had its high half ignored -- `switch ((__int128)1 << 64)`
+/// matched `case 0:`. A case label outside the 64-bit range was truncated to
+/// fit, and could then match a value it does not equal.
+///
+/// A wide switch is lowered to explicit comparisons, which go through the
+/// ordinary 128-bit compare path. The torture test is `pr122943`.
+#[test]
+fn c99_switch_wider_than_a_register_compares_all_of_it() {
+    let code = r#"
+__attribute__((noipa)) int small(__int128 v) {
+    switch (v) {
+    case 0: return 1;
+    case 1: return 2;
+    case 2: return 3;
+    default: return 0;
+    }
+}
+__attribute__((noipa)) int wide(__int128 v) {
+    switch (v) {
+    case 0: return 1;
+    case -1: return 2;
+    case (__int128)1 << 70: return 3;
+    case -((__int128)1 << 70): return 4;
+    default: return 0;
+    }
+}
+__attribute__((noipa)) int ranges(__int128 v) {
+    switch (v) {
+    case 10 ... 20: return 1;
+    case ((__int128)1 << 80) ... (((__int128)1 << 80) + 5): return 2;
+    default: return 0;
+    }
+}
+__attribute__((noipa)) int uns(unsigned __int128 v) {
+    switch (v) {
+    case 0: return 1;
+    case ~(unsigned __int128)0: return 2;
+    default: return 0;
+    }
+}
+
+int main(void) {
+    /* The reported shape: the high half must not be discarded. */
+    if (small(0) != 1 || small(1) != 2 || small(2) != 3) return 1;
+    if (small(3) != 0 || small(-1) != 0) return 2;
+    if (small((__int128)1 << 64) != 0) return 3;
+    if (small(((__int128)1 << 64) + 1) != 0) return 4;
+
+    /* Case labels that do not fit in 64 bits must keep their value. */
+    if (wide(0) != 1 || wide(-1) != 2) return 5;
+    if (wide((__int128)1 << 70) != 3) return 6;
+    if (wide(-((__int128)1 << 70)) != 4) return 7;
+    if (wide(5) != 0 || wide((__int128)1 << 64) != 0) return 8;
+
+    /* GNU ranges, at both widths. */
+    if (ranges(10) != 1 || ranges(20) != 1 || ranges(15) != 1) return 9;
+    if (ranges(9) != 0 || ranges(21) != 0) return 10;
+    if (ranges((__int128)1 << 80) != 2) return 11;
+    if (ranges(((__int128)1 << 80) + 5) != 2) return 12;
+    if (ranges(((__int128)1 << 80) + 6) != 0) return 13;
+
+    /* Unsigned, where the largest label is negative read as signed. */
+    if (uns(0) != 1) return 14;
+    if (uns(~(unsigned __int128)0) != 2) return 15;
+    if (uns(7) != 0) return 16;
+
+    /* A `long long` switch is still the narrow path and still right. */
+    {
+        long long v = 2;
+        switch (v) { case 2: break; default: return 17; }
+        v = 4294967296LL;
+        switch (v) { case 0: return 18; default: break; }
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_switch_wide", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_switch_wide_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

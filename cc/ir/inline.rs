@@ -78,7 +78,21 @@ pub struct InlineCandidate {
     /// Whether function is recursive (calls itself)
     pub is_recursive: bool,
     /// Whether function uses va_args (should not inline)
-    pub uses_varargs: bool,
+    /// The callee builds its own variadic frame (`va_start`), which reads the
+    /// enclosing function's register save area and named-parameter counts.
+    /// Neither survives a splice into a different function, so this is a hard
+    /// disqualifier.
+    pub defines_varargs_frame: bool,
+    /// The callee only *reads* a `va_list` it was handed (`va_arg`, `va_end`,
+    /// `va_copy`). That is a read-modify-write through a pointer -- `va_list`
+    /// decays to one at the call site -- so it splices correctly, and the
+    /// caller's `ap` advances exactly as the C99 semantics require.
+    ///
+    /// Kept separate from the flag above because lumping the two together
+    /// refused an `always_inline` C99 inline definition that merely consumes a
+    /// `va_list`: never inlined, never emitted, and the call left dangling at
+    /// link.
+    pub consumes_va_list: bool,
     /// Whether the function takes a label's address (`&&label`).
     ///
     /// Such a function cannot be inlined: the address is a symbol naming a
@@ -143,8 +157,11 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
 
         for insn in &bb.insns {
             match insn.op {
-                Opcode::VaStart | Opcode::VaArg | Opcode::VaEnd | Opcode::VaCopy => {
-                    candidate.uses_varargs = true;
+                Opcode::VaStart => {
+                    candidate.defines_varargs_frame = true;
+                }
+                Opcode::VaArg | Opcode::VaEnd | Opcode::VaCopy => {
+                    candidate.consumes_va_list = true;
                 }
                 // A label address is a `SymAddr` on a symbol named for a
                 // block of *this* function. An indirect branch is the usual
@@ -191,7 +208,14 @@ fn should_inline(
     // returned. Refusing was silent -- gcc inlines these -- and combined with
     // a `__builtin_va_arg_pack` forwarder, whose body is suppressed on the
     // assumption it always inlines, it left an undefined symbol at link.
-    if candidate.uses_varargs || candidate.is_recursive || candidate.takes_label_addr {
+    if candidate.defines_varargs_frame || candidate.is_recursive || candidate.takes_label_addr {
+        return false;
+    }
+
+    // Consuming a `va_list` is safe to splice, but it is only done on request.
+    // Lifting the restriction generally would make every small `va_list`
+    // helper inlinable at -O2 -- a large new surface for no correctness gain.
+    if candidate.consumes_va_list && !candidate.is_always_inline {
         return false;
     }
 
@@ -1606,7 +1630,8 @@ mod tests {
         let candidate = analyze_function(&module.functions[0], &call_counts);
 
         assert!(candidate.has_inline_hint);
-        assert!(!candidate.uses_varargs);
+        assert!(!candidate.defines_varargs_frame);
+        assert!(!candidate.consumes_va_list);
         assert!(!candidate.is_recursive);
         assert_eq!(candidate.estimated_size, 2); // entry + ret
         assert_eq!(candidate.call_count, 0);
@@ -1618,7 +1643,8 @@ mod tests {
             estimated_size: 5,
             has_inline_hint: false,
             is_recursive: false,
-            uses_varargs: false,
+            defines_varargs_frame: false,
+            consumes_va_list: false,
             takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
@@ -1630,13 +1656,63 @@ mod tests {
         assert!(should_inline(&candidate, opt_at(1), 100, false));
     }
 
+    /// A callee that only *reads* a `va_list` splices correctly; one that
+    /// builds its own variadic frame does not.
+    ///
+    /// Both used to set a single `uses_varargs`, which refused the first as
+    /// well -- so an `always_inline` C99 inline definition taking a `va_list`
+    /// was never inlined, never emitted, and its call left dangling at link.
+    #[test]
+    fn test_consuming_a_va_list_inlines_only_when_forced() {
+        let base = InlineCandidate {
+            estimated_size: 5,
+            has_inline_hint: true,
+            is_recursive: false,
+            defines_varargs_frame: false,
+            consumes_va_list: true,
+            takes_label_addr: false,
+            ret_is_address: false,
+            call_count: 1,
+            is_noinline: false,
+            is_always_inline: false,
+        };
+
+        assert!(
+            !should_inline(&base, opt_at(2), 100, false),
+            "consuming a va_list is not inlined on the size heuristics alone"
+        );
+
+        let forced = InlineCandidate {
+            is_always_inline: true,
+            ..base.clone()
+        };
+        assert!(
+            should_inline(&forced, opt_at(2), 100, false),
+            "`always_inline` over a va_list must be honoured"
+        );
+        assert!(
+            should_inline(&forced, opt_at(0), 100, false),
+            "and at -O0 too, as gcc does"
+        );
+
+        // Defining the frame stays a hard refusal even when forced: `va_start`
+        // reads the enclosing function's save area, which no splice carries.
+        let defines = InlineCandidate {
+            defines_varargs_frame: true,
+            is_always_inline: true,
+            ..base.clone()
+        };
+        assert!(!should_inline(&defines, opt_at(2), 100, false));
+    }
+
     #[test]
     fn test_should_not_inline_varargs() {
         let candidate = InlineCandidate {
             estimated_size: 5,
             has_inline_hint: true,
             is_recursive: false,
-            uses_varargs: true,
+            defines_varargs_frame: true,
+            consumes_va_list: true,
             takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
@@ -1654,7 +1730,8 @@ mod tests {
             estimated_size: 5,
             has_inline_hint: true,
             is_recursive: true,
-            uses_varargs: false,
+            defines_varargs_frame: false,
+            consumes_va_list: false,
             takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
@@ -1672,7 +1749,8 @@ mod tests {
             estimated_size: 5,
             has_inline_hint: true,
             is_recursive: false,
-            uses_varargs: false,
+            defines_varargs_frame: false,
+            consumes_va_list: false,
             takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
@@ -1690,7 +1768,8 @@ mod tests {
             estimated_size: 30,
             has_inline_hint: true,
             is_recursive: false,
-            uses_varargs: false,
+            defines_varargs_frame: false,
+            consumes_va_list: false,
             takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,

@@ -1926,3 +1926,134 @@ int main(void) {
         0
     );
 }
+
+/// A variable-length array's storage is released when control leaves the
+/// scope of its declaration (C17 6.2.4p7).
+///
+/// c17 never released any of it, so every cycle through a VLA declaration
+/// grew the stack until the program died: a VLA in a loop body, a backward
+/// `goto` to a label ahead of the declaration, a `continue` past it, and a
+/// VLA in a `switch` arm all ran out of stack within a few thousand
+/// iterations. The torture tests are `20040811-1` and `pr43220`, which use
+/// the `goto` spelling, but the loop shapes are the common ones.
+///
+/// The counts here are large on purpose: the defect is unbounded growth, so
+/// a handful of iterations proves nothing.
+#[test]
+fn c99_vla_storage_is_released_on_scope_exit() {
+    let code = r#"
+void *volatile p;
+
+int main(void) {
+    /* A VLA in a loop body, at each loop spelling. */
+    for (int i = 0; i < 200000; i++) { int x[i % 500 + 1]; x[0] = i; p = x; }
+    { int j = 0; while (j++ < 200000) { int y[j % 500 + 1]; y[0] = j; p = y; } }
+    { int k = 0; do { int z[k % 500 + 1]; z[0] = k; p = z; } while (++k < 200000); }
+
+    /* A backward goto to a label ahead of the declaration. */
+    {
+        int n = 0;
+    lab:;
+        int g[n % 500 + 1];
+        g[0] = 1;
+        g[n % 500] = 2;
+        p = g;
+        if (++n < 200000) goto lab;
+    }
+    /* The same with the declaration inside a nested block. */
+    {
+        int n = 0;
+    lab2: { int g[n % 500 + 1]; g[0] = 1; p = g; }
+        if (++n < 200000) goto lab2;
+    }
+
+    /* `continue` past a second declaration. */
+    for (int i = 0; i < 200000; i++) {
+        int a[i % 500 + 1]; a[0] = i; p = a;
+        if (i & 1) continue;
+        int b[i % 500 + 1]; b[0] = i; p = b;
+    }
+    /* `break` out of an inner loop that declares one. */
+    for (int i = 0; i < 200000; i++) {
+        int a[i % 500 + 1]; a[0] = 1; p = a;
+        for (int j = 0; j < 2; j++) { int b[j + 1]; b[0] = 2; p = b; if (j) break; }
+    }
+    /* A VLA inside a switch arm, which the switch body's own walk lowers. */
+    for (int i = 0; i < 200000; i++) {
+        switch (i & 1) {
+        case 0: { int c[i % 500 + 1]; c[0] = 3; p = c; break; }
+        default: break;
+        }
+    }
+
+    /* `continue` out of a switch leaves the whole loop body, including a
+       VLA declared before the switch -- a different nesting counter from
+       the one `break` asks. */
+    for (int i = 0; i < 200000; i++) {
+        int a[i % 500 + 1]; a[0] = 1; p = a;
+        switch (i & 1) { case 0: continue; default: break; }
+    }
+    /* `break` out of that switch stays inside the loop body, so the same
+       VLA must survive until the body's own exit releases it. */
+    for (int i = 0; i < 200000; i++) {
+        int b[i % 500 + 1]; b[0] = i; p = b;
+        switch (i & 1) { case 0: break; default: break; }
+        if (b[0] != i) return 4;
+    }
+
+    /* Releasing must not reach an *enclosing* scope's VLA. */
+    {
+        int n = 4;
+        int outer[n];
+        outer[0] = 11;
+        outer[3] = 44;
+        for (int i = 0; i < 100000; i++) { int inner[8]; inner[0] = i; p = inner; }
+        if (outer[0] != 11 || outer[3] != 44) return 1;
+    }
+    /* Nor may it disturb a value read after the restore. */
+    {
+        int n = 6, total = 0;
+        for (int i = 0; i < 1000; i++) {
+            int v[n];
+            v[0] = i;
+            v[n - 1] = i * 2;
+            if (i & 1) { total += v[0]; continue; }
+            total += v[n - 1];
+        }
+        if (total != 749000) return 2;
+    }
+    /* A label reachable only by the jump itself -- the `vla-dealloc-1`
+       shape. Nothing runs at the label on the way past, so the jump's
+       restore target cannot be something captured there. */
+    {
+        int n = 0;
+        if (0) { lab4:; }
+        int v[n % 500 + 1];
+        v[0] = 1;
+        v[n % 500] = 2;
+        p = v;
+        if (++n < 200000) goto lab4;
+    }
+
+    /* Two VLAs with a label between them: the jump releases only the one
+       declared after the label. */
+    {
+        int m = 0;
+        int keep[8];
+        keep[0] = 77;
+    lab3:;
+        int tmp[m % 500 + 1];
+        tmp[0] = 1;
+        p = tmp;
+        if (++m < 200000) goto lab3;
+        if (keep[0] != 77) return 3;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_vla_scope_release", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_vla_scope_release_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

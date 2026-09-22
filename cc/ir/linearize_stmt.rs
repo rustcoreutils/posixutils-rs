@@ -23,6 +23,18 @@ use crate::strings::StringId;
 use crate::types::TypeTable;
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 
+/// Which construct a jump leaves, for `unwind_vla_marks`.
+///
+/// `break` leaves the innermost loop *or* switch; `continue` leaves the
+/// innermost loop, which may be several switches out. The two ask different
+/// nesting counters, and conflating them left a VLA unreclaimed on
+/// `continue` from inside a `switch`.
+#[derive(Clone, Copy)]
+enum JumpKind {
+    Break,
+    Continue,
+}
+
 impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_stmt(&mut self, stmt: &Stmt) {
         match stmt {
@@ -34,13 +46,21 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             Stmt::Block(items) => {
                 self.push_scope();
-
+                // A VLA's storage lives until control leaves the scope of its
+                // declaration (C17 6.2.4p7). Capture the stack pointer on the
+                // way in and put it back on the way out, or a loop body's VLA
+                // is allocated afresh every iteration and never released --
+                // `for (...) { int x[n]; }` died of stack exhaustion.
+                let vla_scope = self.open_vla_scope();
                 for item in items {
                     match item {
                         BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
                         BlockItem::Statement(s) => self.linearize_stmt(s),
                     }
                 }
+                // Only on the falling-out path: a `break`, `continue` or
+                // `return` that left already did its own unwinding.
+                self.close_vla_scope(vla_scope);
 
                 self.pop_scope();
             }
@@ -179,6 +199,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Break(_) => {
                 if let Some(&target) = self.break_targets.last() {
                     if let Some(current) = self.current_bb {
+                        self.unwind_vla_marks(JumpKind::Break);
                         self.emit(Instruction::br(target));
                         self.link_bb(current, target);
                     }
@@ -188,6 +209,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Continue(_) => {
                 if let Some(&target) = self.continue_targets.last() {
                     if let Some(current) = self.current_bb {
+                        self.unwind_vla_marks(JumpKind::Continue);
                         self.emit(Instruction::br(target));
                         self.link_bb(current, target);
                     }
@@ -232,6 +254,23 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let label_str = self.str(*label).to_string();
                 let target = self.get_or_create_label(&label_str);
                 if let Some(current) = self.current_bb {
+                    // A backward jump -- the label is already linearized, so
+                    // it has a captured stack pointer -- leaves the scope of
+                    // every VLA declared after it, and that storage has to go
+                    // back. Otherwise `lab: int x[n]; ... goto lab;` grows the
+                    // stack every time round until the program dies.
+                    //
+                    // A *forward* jump has no captured pointer yet, and needs
+                    // none: C17 6.8.6.1p1 forbids jumping into the scope of a
+                    // variably modified declaration, so a forward jump either
+                    // stays ahead of every VLA or leaves the block, and the
+                    // block's own exit does the restoring.
+                    if let Some(&depth) = self.label_vla_depth.get(&label_str) {
+                        if let Some(m) = self.vla_marks.get(depth) {
+                            let mark = m.mark;
+                            self.emit_stack_restore(mark);
+                        }
+                    }
                     self.emit(Instruction::br(target));
                     self.link_bb(current, target);
                 }
@@ -255,6 +294,23 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
 
                 self.switch_bb(label_bb);
+                // Remember how many VLA marks were in force here. A backward
+                // jump to this label leaves the scope of every VLA declared
+                // *after* it, and the first such declaration's mark is the
+                // stack as it stood at the label -- so that mark is what the
+                // jump restores.
+                //
+                // Recorded as an index rather than captured at the label,
+                // because a label can be reachable only by the jump itself:
+                // `if (0) { lab: ; }` never runs a capture placed there, and
+                // restoring from it read an uninitialized register. The mark
+                // this index names is always written first, since the
+                // declaration that creates it lies between the label and the
+                // jump.
+                if self.func_has_vla {
+                    self.label_vla_depth
+                        .insert(name_str.clone(), self.vla_marks.len());
+                }
                 self.linearize_stmt(stmt);
             }
 
@@ -576,6 +632,12 @@ impl<'a> super::linearize::Linearizer<'a> {
             .with_size(64)
             .with_type(self.types.ulong_id);
         self.emit(mul_insn);
+
+        // Capture the stack pointer before this array is allocated, so
+        // whatever later leaves the array's scope can put it back. One mark
+        // per declaration rather than per block: a label between two VLAs
+        // must release only the one that follows it.
+        self.push_vla_mark();
 
         // Emit Alloca instruction to allocate stack space
         let alloca_result = self.alloc_pseudo();
@@ -2168,6 +2230,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         // `collect_switch_cases`, which has to agree about this.
         match body {
             Stmt::Block(items) => {
+                // Same VLA reclamation as the ordinary block arm: a switch
+                // body is lowered by its own walk, and leaving the rule out
+                // here let `switch (c) { case 0: { int v[n]; break; } }`
+                // inside a loop grow the stack without bound.
+                let vla_scope = self.open_vla_scope();
                 for item in items {
                     match item {
                         BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
@@ -2182,6 +2249,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         }
                     }
                 }
+                self.close_vla_scope(vla_scope);
             }
             stmt => {
                 self.linearize_switch_stmt(stmt, case_values, case_bbs, default_bb, &mut case_idx)
@@ -2389,6 +2457,8 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             Stmt::Block(items) => {
                 self.push_scope();
+                // See the sibling arm in `linearize_switch_body`.
+                let vla_scope = self.open_vla_scope();
                 for item in items {
                     match item {
                         BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
@@ -2403,6 +2473,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         }
                     }
                 }
+                self.close_vla_scope(vla_scope);
                 self.pop_scope();
             }
 
@@ -2820,6 +2891,96 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
 
         (probe.is_memory(), is_readwrite, matching)
+    }
+
+    /// Capture the stack pointer ahead of a VLA's allocation.
+    ///
+    /// One mark per declaration, not per block: a label sitting between two
+    /// VLAs must release only the one declared after it, and a block-wide
+    /// mark cannot express that.
+    fn push_vla_mark(&mut self) {
+        if self.current_bb.is_none() {
+            return;
+        }
+        let mark = self.alloc_reg_pseudo();
+        self.emit(
+            Instruction::new(Opcode::StackSave)
+                .with_target(mark)
+                .with_type_and_size(self.types.void_ptr_id, 64),
+        );
+        self.vla_marks.push(super::linearize::VlaMark {
+            mark,
+            break_depth: self.break_targets.len(),
+            continue_depth: self.continue_targets.len(),
+        });
+    }
+
+    /// The marks in force on entry to a block, to restore and drop on exit.
+    ///
+    /// Returns the depth of [`Linearizer::vla_marks`] so
+    /// [`Self::close_vla_scope`] knows which of them this block added.
+    fn open_vla_scope(&self) -> usize {
+        self.vla_marks.len()
+    }
+
+    /// Release everything the block allocated and forget its marks.
+    fn close_vla_scope(&mut self, entry: usize) {
+        if self.vla_marks.len() <= entry {
+            return;
+        }
+        // The first mark the block took is the stack as it stood on entry,
+        // so one restore undoes all of them.
+        let mark = self.vla_marks[entry].mark;
+        if !self.is_terminated() && self.current_bb.is_some() {
+            self.emit_stack_restore(mark);
+        }
+        self.vla_marks.truncate(entry);
+    }
+
+    /// Put the stack pointer back to what `mark` captured.
+    fn emit_stack_restore(&mut self, mark: PseudoId) {
+        self.emit(
+            Instruction::new(Opcode::StackRestore)
+                .with_src(mark)
+                .with_type_and_size(self.types.void_ptr_id, 64),
+        );
+    }
+
+    /// Release every VLA allocated inside the loop or switch being left.
+    ///
+    /// A mark taken at a nesting depth at or beyond the current one was taken
+    /// inside the construct being left, so restoring to the **outermost**
+    /// such mark undoes everything it allocated in one move. Without this a
+    /// `continue` past a VLA declaration skipped the block's own restore and
+    /// the loop grew the stack anyway.
+    ///
+    /// The marks stay recorded: the block that owns each one still drops it
+    /// when its own linearization ends.
+    fn unwind_vla_marks(&mut self, leaving: JumpKind) {
+        let found = match leaving {
+            // A `break` leaves the innermost loop *or switch*, so it undoes
+            // what was allocated inside that one.
+            JumpKind::Break => {
+                let depth = self.break_targets.len();
+                self.vla_marks
+                    .iter()
+                    .find(|m| m.break_depth >= depth)
+                    .map(|m| m.mark)
+            }
+            // A `continue` leaves the innermost *loop*, which may be several
+            // switches out -- so it undoes everything allocated since the
+            // loop began, not just since the switch did.
+            JumpKind::Continue => {
+                let depth = self.continue_targets.len();
+                self.vla_marks
+                    .iter()
+                    .find(|m| m.continue_depth >= depth)
+                    .map(|m| m.mark)
+            }
+        };
+        if let Some(mark) = found {
+            self.emit_stack_restore(mark);
+        }
     }
 
     pub(crate) fn get_or_create_label(&mut self, name: &str) -> BasicBlockId {

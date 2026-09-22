@@ -198,6 +198,15 @@ pub(crate) struct StaticLocalInfo {
 // Linearizer
 
 /// Linearizer context for converting AST to IR
+/// A captured stack pointer and the loop/switch nesting it was captured at.
+///
+/// See [`Linearizer::vla_marks`].
+pub(crate) struct VlaMark {
+    pub(crate) mark: PseudoId,
+    pub(crate) break_depth: usize,
+    pub(crate) continue_depth: usize,
+}
+
 pub struct Linearizer<'a> {
     /// The module being built
     pub(crate) module: Module,
@@ -260,6 +269,39 @@ pub struct Linearizer<'a> {
 
     /// Labels this function actually defines.
     pub(crate) defined_labels: std::collections::HashSet<String>,
+    /// How many VLA marks were in force at each label already linearized, for
+    /// a function that declares a variable-length array.
+    ///
+    /// A VLA's storage lives until control leaves the scope of its
+    /// declaration (C17 6.2.4p7), and a backward `goto` to a label ahead of
+    /// that declaration leaves it. Without releasing the storage the stack
+    /// grows every time round: `lab: int x[n]; ... goto lab;` died of stack
+    /// exhaustion after a few thousand iterations. The mark at this index is
+    /// the stack as it stood at the label, so the jump restores to it.
+    ///
+    /// Only labels in a function that declares a VLA appear here, so nothing
+    /// is recorded for the ordinary case.
+    pub(crate) label_vla_depth: std::collections::HashMap<String, usize>,
+    /// The stack pointer captured on entry to each open block that declares a
+    /// VLA, with the `break_targets` and `continue_targets` depths at which
+    /// it was captured.
+    ///
+    /// Leaving the block puts the pointer back, so a loop body's VLA is
+    /// reclaimed each time round rather than growing the stack until the
+    /// program dies. The recorded depths are what let `break` and `continue`
+    /// unwind too: a mark taken at a depth at or beyond the current one was
+    /// taken inside the construct being left, so restoring to the outermost
+    /// such mark undoes exactly what that construct allocated -- without
+    /// every loop having to push a parallel stack of its own.
+    ///
+    /// Both depths are needed because a `switch` pushes a break target and
+    /// not a continue target. `continue` out of a switch leaves the whole
+    /// loop body, including a VLA declared before the switch, and asking the
+    /// break depth there found no mark to undo.
+    pub(crate) vla_marks: Vec<VlaMark>,
+    /// Whether this function declares anything variably modified, and so
+    /// needs the bookkeeping above.
+    pub(crate) func_has_vla: bool,
 
     /// The one block every computed `goto` in this function branches through,
     /// and the hidden local carrying the target address to it.
@@ -326,6 +368,9 @@ impl<'a> Linearizer<'a> {
             addr_taken_labels: Vec::new(),
             label_addr_refs: Vec::new(),
             defined_labels: std::collections::HashSet::new(),
+            label_vla_depth: std::collections::HashMap::new(),
+            vla_marks: Vec::new(),
+            func_has_vla: false,
             indirect_dispatch: None,
             static_local_counter: 0,
             compound_literal_counter: 0,
@@ -1006,10 +1051,53 @@ impl<'a> Linearizer<'a> {
         self.addr_taken_labels.clear();
         self.label_addr_refs.clear();
         self.defined_labels.clear();
+        self.label_vla_depth.clear();
+        self.vla_marks.clear();
+        self.func_has_vla = Self::declares_vla(&func.body);
         self.indirect_dispatch = None;
         // Remove from extern_symbols since we're defining this function
         self.module.extern_symbols.remove(&self.current_func_name);
         // Note: static_locals is NOT cleared - it persists across functions
+    }
+
+    /// Whether a function body declares anything variably modified.
+    ///
+    /// `vla_sizes` on a declarator is the marker the jump checker already
+    /// uses: it is non-empty for the array itself and for a pointer to one,
+    /// both of which C17 6.7.6.2 calls variably modified. A pointer allocates
+    /// nothing, so this over-approximates -- and the cost of a false positive
+    /// is one register capture per label in that function, which is why the
+    /// cheap test is the right one.
+    fn declares_vla(stmt: &crate::parse::ast::Stmt) -> bool {
+        match stmt {
+            crate::parse::ast::Stmt::Block(items) => items.iter().any(|item| match item {
+                crate::parse::ast::BlockItem::Declaration(decl) => {
+                    decl.declarators.iter().any(|d| !d.vla_sizes.is_empty())
+                }
+                crate::parse::ast::BlockItem::Statement(s) => Self::declares_vla(s),
+            }),
+            crate::parse::ast::Stmt::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::declares_vla(then_stmt)
+                    || else_stmt.as_ref().is_some_and(|e| Self::declares_vla(e))
+            }
+            crate::parse::ast::Stmt::While { body, .. }
+            | crate::parse::ast::Stmt::DoWhile { body, .. }
+            | crate::parse::ast::Stmt::Switch { body, .. }
+            | crate::parse::ast::Stmt::Label { stmt: body, .. } => Self::declares_vla(body),
+            crate::parse::ast::Stmt::For { init, body, .. } => {
+                init.as_ref().is_some_and(|i| match i {
+                    crate::parse::ast::ForInit::Declaration(decl) => {
+                        decl.declarators.iter().any(|d| !d.vla_sizes.is_empty())
+                    }
+                    crate::parse::ast::ForInit::Expression(_) => false,
+                }) || Self::declares_vla(body)
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn linearize_function(&mut self, func: &FunctionDef) {

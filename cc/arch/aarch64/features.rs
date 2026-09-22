@@ -237,7 +237,9 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
 
         if self.base.target.os == crate::target::Os::MacOS {
-            self.emit_va_arg_darwin(&ap_loc, &dst_loc, type_bits, is_fp, agg);
+            let (_, align) =
+                crate::abi::aapcs64::darwin_va_slot(types, arg_type, &self.base.target);
+            self.emit_va_arg_darwin(&ap_loc, &dst_loc, type_bits, is_fp, agg, align);
         } else {
             self.emit_va_arg_aapcs64(
                 &ap_loc,
@@ -251,7 +253,13 @@ impl Aarch64CodeGen {
     }
 
     /// Darwin: every variadic argument is on the stack, so `ap` is just a
-    /// cursor that walks it 8 bytes at a time.
+    /// cursor that walks it.
+    ///
+    /// `align` is where this argument's slot starts, from
+    /// [`crate::abi::aapcs64::darwin_va_slot`] -- the same rule the caller
+    /// lays the area out with. Walking eight bytes at a time regardless is
+    /// self-consistent, and invisible to any c17-only program, but it is not
+    /// where clang put the argument.
     fn emit_va_arg_darwin(
         &mut self,
         ap_loc: &Loc,
@@ -259,6 +267,7 @@ impl Aarch64CodeGen {
         type_bits: u32,
         is_fp: bool,
         agg: VaAggKind,
+        align: i32,
     ) {
         let (scratch0, scratch1, scratch2) = Reg::scratch_regs();
         let Some(ap) = self.va_list_addr_pinned(ap_loc, scratch2) else {
@@ -270,6 +279,21 @@ impl Aarch64CodeGen {
             addr: MemAddr::Base(ap),
             dst: scratch0,
         });
+        if align > 8 {
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: scratch0,
+                src2: GpOperand::Imm((align - 1) as i64),
+                dst: scratch0,
+            });
+            self.emit_mov_imm(scratch1, -(align as i64), 64);
+            self.push_lir(Aarch64Inst::And {
+                size: OperandSize::B64,
+                src1: scratch0,
+                src2: GpOperand::Reg(scratch1),
+                dst: scratch0,
+            });
+        }
 
         // Darwin lays every variadic argument out on the stack, so an
         // aggregate is simply itself at that address -- there is no save area

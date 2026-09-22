@@ -95,6 +95,34 @@ pub fn gr_run_start(
     (start + n <= num_regs).then_some(start)
 }
 
+/// The stack slot a variadic argument of type `ty` occupies on Apple targets.
+///
+/// Returns `(bytes, align)`. Apple's arm64 convention puts *every* variadic
+/// argument on the stack, one eight-byte granule at a time, and a type whose
+/// alignment is 16 starts on a sixteen-byte boundary. The size is rounded up
+/// to the granule, so a `__int128` occupies sixteen bytes rather than the one
+/// slot every scalar used to get -- the caller wrote half of it and the
+/// reader took half of it, which agreed with itself and with nothing else.
+///
+/// An aggregate too large to pass directly travels as a pointer to the
+/// caller's copy, so that slot is eight bytes however aligned the object is.
+///
+/// **The type's full alignment, uncapped.** Above sixteen this is where clang
+/// contradicts itself: its *caller* lowers an over-aligned aggregate through
+/// LLVM's Darwin vararg convention, which stacks it a legalized element at a
+/// time in eight-byte granules and never looks at the attribute, while its
+/// `va_arg` rounds the cursor up to the type's own alignment. c17 follows
+/// `va_arg` -- which means the caller has to realign its outgoing area to
+/// match, since `%sp` is only guaranteed to sixteen.
+pub fn darwin_va_slot(types: &TypeTable, ty: TypeId, target: &crate::target::Target) -> (i32, i32) {
+    let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, target);
+    if matches!(abi.classify_param(ty, types), ArgClass::Indirect { .. }) {
+        return (8, 8);
+    }
+    let bytes = ((types.size_bits(ty).div_ceil(8).max(1) as i32) + 7) & !7;
+    (bytes, (types.alignment(ty) as i32).max(8))
+}
+
 /// Maximum aggregate size (in bits) that can be passed in registers.
 /// Structs larger than 128 bits (16 bytes) must use sret (unless HFA).
 const MAX_AGGREGATE_BITS: u32 = 128;

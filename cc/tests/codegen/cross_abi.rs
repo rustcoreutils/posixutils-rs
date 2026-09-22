@@ -2355,3 +2355,133 @@ int main(void)
         );
     }
 }
+
+/// A Darwin variadic `__int128` argument occupies **sixteen** bytes of the
+/// caller's outgoing area, on a sixteen-byte boundary.
+///
+/// The reading side got its second eightbyte first; the writing side kept
+/// giving every non-aggregate scalar exactly one eight-byte granule and never
+/// aligning a slot, so the caller wrote half the value and the next argument
+/// landed on top of the other half. Both sides were wrong the same way, so no
+/// c17-only program could see it -- only a clang-compiled callee, which is how
+/// it reached macOS CI. LLVM's Darwin vararg convention stacks an `i128` as
+/// sixteen bytes, sixteen-aligned, and clang's `va_arg` rounds the cursor to
+/// match.
+///
+/// Asserted on assembly because it cannot be executed here: there is no macOS
+/// runner and qemu cannot run Mach-O.
+#[test]
+fn codegen_darwin_variadic_int128_takes_two_granules() {
+    let src = r#"
+__int128 wide(int n, ...);
+
+/* One leading `int` leaves the cursor at 8, so a 16-aligned slot has to skip
+   to 16 -- with no leading argument at all, 0 is already aligned and the test
+   would pass without any rounding. */
+__int128 call_odd(__int128 u) { return wide(1, 0, u); }
+__int128 call_even(__int128 u) { return wide(0, u); }
+"#;
+    let asm = asm_for("darwin_variadic_int128", "aarch64-apple-darwin", src);
+
+    for (func, want) in [("call_odd", "[sp, #16]"), ("call_even", "[sp]")] {
+        let body = body_of(&asm, func);
+        let stores: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("stp x") && l.contains("[sp"))
+            .collect();
+        assert!(
+            stores.iter().any(|l| l.ends_with(want)),
+            "{func}: the __int128 must be stored as a pair at {want}, so that \
+             both eightbytes reach the callee and the slot is 16-aligned; \
+             found {stores:?}\n{body}"
+        );
+    }
+
+    // The area has to be big enough for the sixteen-byte slot plus the
+    // rounding, not one granule per argument.
+    let odd = body_of(&asm, "call_odd");
+    let sub = odd
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("sub sp, sp, #"))
+        .unwrap_or_else(|| panic!("call_odd reserves no outgoing area:\n{odd}"));
+    let bytes: i32 = sub
+        .rsplit('#')
+        .next()
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("unparsable reservation `{sub}`"));
+    assert!(
+        bytes >= 32,
+        "call_odd reserved {bytes} bytes: an `int` then a 16-aligned \
+         `__int128` needs 8 + 8 of padding + 16\n{odd}"
+    );
+}
+
+/// A Darwin variadic argument that wants more than sixteen bytes of alignment
+/// makes the caller realign its outgoing area.
+///
+/// clang's `va_arg` rounds the cursor up to the type's own alignment, so the
+/// argument has to be at an address that is actually that aligned -- and
+/// `%sp` is guaranteed only to sixteen, which makes rounding a static offset
+/// meaningless on its own. The caller therefore rounds `%sp` down and stashes
+/// the old value above the arguments, because the amount the rounding
+/// consumed is not known until it runs.
+///
+/// clang's own caller does *not* do this: it stacks an over-aligned aggregate
+/// a legalized element at a time in eight-byte granules, disagreeing with its
+/// own `va_arg`. c17 follows `va_arg`. See the divergence recorded in
+/// `cc/doc/TODO.md`.
+///
+/// Asserted on assembly because it cannot be executed here: there is no macOS
+/// runner and qemu cannot run Mach-O.
+#[test]
+fn codegen_darwin_variadic_over_aligned_realigns_the_outgoing_area() {
+    let src = r#"
+struct __attribute__((aligned (32))) A32 { double a, b, c, d; };
+int variadic(int n, ...);
+
+/* Nine leading doubles leave the cursor at 72, which is neither 16- nor
+   32-aligned, so the rounding is observable. */
+int call(struct A32 s)
+{
+    return variadic(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, s, 9);
+}
+"#;
+    let asm = asm_for("darwin_va_overalign", "aarch64-apple-darwin", src);
+    let body = body_of(&asm, "call");
+    let lines: Vec<&str> = body.lines().map(str::trim).collect();
+
+    assert!(
+        lines.iter().any(|l| l.starts_with("and x17, x17, x")),
+        "the outgoing area's base must be rounded down to the argument's \
+         alignment; %sp only guarantees 16:\n{body}"
+    );
+    // The old %sp is saved and restored, because the rounding consumed an
+    // amount no `add` can undo.
+    let save = lines
+        .iter()
+        .find(|l| l.starts_with("str x16, [sp, #"))
+        .unwrap_or_else(|| panic!("the pre-call %sp is never saved:\n{body}"));
+    let slot = save
+        .rsplit_once("#")
+        .and_then(|(_, rest)| rest.trim_end_matches(']').parse::<i32>().ok())
+        .unwrap_or_else(|| panic!("unparsable save `{save}`"));
+    assert!(
+        lines
+            .iter()
+            .any(|l| *l == format!("ldr x16, [sp, #{slot}]")),
+        "the saved %sp at {slot} is never read back:\n{body}"
+    );
+    assert!(
+        lines.contains(&"add sp, x16, #0"),
+        "%sp is never restored from the saved value:\n{body}"
+    );
+
+    // The struct itself has to land on a 32-byte boundary of that base: nine
+    // eight-byte slots end at 72, so the next multiple of 32 is 96.
+    assert!(
+        lines.iter().any(|l| l.contains("[sp, #96]")),
+        "the 32-aligned argument must start at 96, not at the next granule:\n{body}"
+    );
+}

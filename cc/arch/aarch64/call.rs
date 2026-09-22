@@ -93,6 +93,23 @@ impl StackArg {
     }
 }
 
+/// One argument of a Darwin variadic call, on its way to the outgoing area.
+///
+/// `agg_bytes` is set when the argument's bytes are copied into the slot as an
+/// object rather than moved as a value: it occupies its own size rounded up to
+/// eight, not one slot holding a pointer to it. `typ` is what says how wide
+/// the slot is and where it starts -- Apple aligns each one to the type's own
+/// alignment, and a `__int128` needs two granules rather than the one every
+/// scalar used to get.
+struct DarwinVaArg {
+    pseudo: PseudoId,
+    is_fp: bool,
+    /// Width in bits, for the register move -- not the slot's size.
+    size: u32,
+    agg_bytes: Option<i32>,
+    typ: Option<TypeId>,
+}
+
 impl Aarch64CodeGen {
     /// Handle sret (hidden struct return pointer) argument
     pub(super) fn setup_sret_arg(&mut self, insn: &Instruction) -> usize {
@@ -119,10 +136,7 @@ impl Aarch64CodeGen {
         let mut fp_arg_idx = 0;
         let mut stack_args = 0;
 
-        // Collect variadic args for stack. The `Option<i32>` is an
-        // aggregate's byte count: it occupies its own size rounded up to
-        // eight, not one slot holding a pointer to it.
-        let mut variadic_args: Vec<(PseudoId, bool, u32, Option<i32>)> = Vec::new();
+        let mut variadic_args: Vec<DarwinVaArg> = Vec::new();
 
         for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
             let arg_type = insn.arg_types.get(i).copied();
@@ -184,7 +198,13 @@ impl Aarch64CodeGen {
             });
 
             if i >= variadic_start {
-                variadic_args.push((arg, is_fp, arg_size, agg_bytes));
+                variadic_args.push(DarwinVaArg {
+                    pseudo: arg,
+                    is_fp,
+                    size: arg_size,
+                    agg_bytes,
+                    typ: arg_type,
+                });
             } else if gp_pair {
                 if int_arg_idx + 1 < int_arg_regs.len() {
                     let mem = match self.get_location(arg) {
@@ -225,21 +245,96 @@ impl Aarch64CodeGen {
         // Store variadic args on stack
         let num_variadic = variadic_args.len();
         if num_variadic > 0 {
-            let variadic_bytes: i32 = variadic_args
-                .iter()
-                .map(|(_, _, _, agg)| agg.map_or(8, |b| (b + 7) & !7))
-                .sum();
-            let aligned_bytes = (variadic_bytes + 15) & !15;
-
-            self.push_lir(Aarch64Inst::Sub {
-                size: OperandSize::B64,
-                src1: Reg::sp(),
-                src2: GpOperand::Imm(aligned_bytes as i64),
-                dst: Reg::sp(),
+            // Walked, not summed: the padding between two slots is part of
+            // the area, and summing the sizes alone under-reserved it.
+            let slot = |typ: Option<TypeId>, this: &Self| -> (i32, i32) {
+                typ.map_or((8, 8), |t| {
+                    crate::abi::aapcs64::darwin_va_slot(types, t, &this.base.target)
+                })
+            };
+            let variadic_bytes: i32 = variadic_args.iter().fold(0, |at, a| {
+                let (bytes, align) = slot(a.typ, self);
+                ((at + align - 1) & !(align - 1)) + bytes
             });
+            let aligned_bytes = (variadic_bytes + 15) & !15;
+            let max_align = variadic_args
+                .iter()
+                .map(|a| slot(a.typ, self).1)
+                .max()
+                .unwrap_or(8)
+                .max(16);
+
+            if max_align > 16 {
+                // `%sp` is guaranteed to sixteen, so a slot that wants more
+                // only lands there if the *area* starts there: the offsets
+                // below are static, and rounding one of them means nothing
+                // when the base underneath it is not aligned. Round `%sp`
+                // down instead, and stash the old value just above the
+                // arguments -- how much the rounding consumed is not known
+                // until it runs, so the matching `add` that releases every
+                // other outgoing area cannot release this one.
+                //
+                // The reservation covers the arguments, the worst-case
+                // rounding and the saved pointer, so the slot at
+                // `aligned_bytes` is always inside it.
+                let reserve = aligned_bytes + max_align + 16;
+                self.push_lir(Aarch64Inst::Add {
+                    size: OperandSize::B64,
+                    src1: Reg::sp(),
+                    src2: GpOperand::Imm(0),
+                    dst: Reg::X16,
+                });
+                self.push_lir(Aarch64Inst::Sub {
+                    size: OperandSize::B64,
+                    src1: Reg::sp(),
+                    src2: GpOperand::Imm(reserve as i64),
+                    dst: Reg::X17,
+                });
+                // A negative mask is not a logical immediate here, so it is
+                // materialized and applied from a register -- which is also
+                // why the result cannot be written straight to `%sp`.
+                self.emit_mov_imm(Reg::X9, -(max_align as i64), 64);
+                self.push_lir(Aarch64Inst::And {
+                    size: OperandSize::B64,
+                    src1: Reg::X17,
+                    src2: GpOperand::Reg(Reg::X9),
+                    dst: Reg::X17,
+                });
+                self.push_lir(Aarch64Inst::Add {
+                    size: OperandSize::B64,
+                    src1: Reg::X17,
+                    src2: GpOperand::Imm(0),
+                    dst: Reg::sp(),
+                });
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B64,
+                    src: Reg::X16,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::SP,
+                        offset: aligned_bytes,
+                    },
+                });
+                self.darwin_va_sp_slot = Some(aligned_bytes);
+            } else {
+                self.push_lir(Aarch64Inst::Sub {
+                    size: OperandSize::B64,
+                    src1: Reg::sp(),
+                    src2: GpOperand::Imm(aligned_bytes as i64),
+                    dst: Reg::sp(),
+                });
+            }
 
             let mut offset = 0i32;
-            for (arg, is_fp, arg_size, agg_bytes) in variadic_args.into_iter() {
+            for DarwinVaArg {
+                pseudo: arg,
+                is_fp,
+                size: arg_size,
+                agg_bytes,
+                typ: arg_type,
+            } in variadic_args.into_iter()
+            {
+                let (slot_bytes, slot_align) = slot(arg_type, self);
+                offset = (offset + slot_align - 1) & !(slot_align - 1);
                 if let Some(bytes) = agg_bytes {
                     // The pseudo locates the aggregate; its bytes go in the
                     // slot. Moving it as a scalar wrote the pointer instead.
@@ -285,7 +380,7 @@ impl Aarch64CodeGen {
                         });
                         done += chunk;
                     }
-                    offset += (bytes + 7) & !7;
+                    offset += slot_bytes;
                     continue;
                 }
                 if is_fp {
@@ -299,6 +394,35 @@ impl Aarch64CodeGen {
                             offset,
                         },
                     });
+                } else if slot_bytes > 8 {
+                    // A wide integral scalar -- `__int128` -- is two granules.
+                    // Moving it as one wrote the low half and left the high
+                    // half whatever the slot held, which no c17-only program
+                    // could see: the reader took eight bytes too.
+                    let loc = self.get_location(arg).clone();
+                    let mem = self.loc_mem(&loc);
+                    match mem {
+                        Some(mem) => {
+                            self.emit_ldp_legalized(OperandSize::B64, mem, Reg::X9, Reg::X10)
+                        }
+                        None => {
+                            self.emit_move(arg, Reg::X9, 64);
+                            self.push_lir(Aarch64Inst::Mov {
+                                size: OperandSize::B64,
+                                src: GpOperand::Reg(Reg::Xzr),
+                                dst: Reg::X10,
+                            });
+                        }
+                    }
+                    self.emit_stp_legalized(
+                        OperandSize::B64,
+                        Reg::X9,
+                        Reg::X10,
+                        MemAddr::BaseOffset {
+                            base: Reg::SP,
+                            offset,
+                        },
+                    );
                 } else {
                     self.emit_move(arg, Reg::X9, arg_size);
                     self.push_lir(Aarch64Inst::Str {
@@ -310,7 +434,7 @@ impl Aarch64CodeGen {
                         },
                     });
                 }
-                offset += 8;
+                offset += slot_bytes;
             }
 
             stack_args = (aligned_bytes + 15) / 16;
@@ -1074,6 +1198,26 @@ impl Aarch64CodeGen {
 
     /// Clean up stack after call
     pub(super) fn cleanup_call_stack(&mut self, stack_args: i32) {
+        // A realigned Darwin variadic area consumed an amount only known at
+        // run time, so the matching `add` below cannot undo it; the pre-call
+        // `%sp` was stored just above the arguments instead.
+        if let Some(slot) = self.darwin_va_sp_slot.take() {
+            self.push_lir(Aarch64Inst::Ldr {
+                size: OperandSize::B64,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::SP,
+                    offset: slot,
+                },
+                dst: Reg::X16,
+            });
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: Reg::X16,
+                src2: GpOperand::Imm(0),
+                dst: Reg::sp(),
+            });
+            return;
+        }
         if stack_args > 0 {
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,

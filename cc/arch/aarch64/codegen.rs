@@ -57,6 +57,13 @@ pub struct Aarch64CodeGen {
     /// Bytes of incoming stack arguments consumed by named parameters
     /// (for variadic functions whose named parameters overflow the registers)
     pub(super) named_stack_param_bytes: i32,
+    /// Where the pre-call `%sp` was saved, for a Darwin variadic call whose
+    /// argument area needs more than the sixteen bytes `%sp` is guaranteed.
+    ///
+    /// Such a call realigns `%sp` by an amount only known at run time, so the
+    /// area cannot be released with the matching `add` every other call uses;
+    /// the old value is read back from this offset instead.
+    pub(super) darwin_va_sp_slot: Option<i32>,
     /// External symbols (need GOT access on macOS)
     pub(super) extern_symbols: HashSet<String>,
     /// Thread-local storage symbols (need TLS access)
@@ -86,6 +93,7 @@ impl Aarch64CodeGen {
             num_fixed_gp_params: 0,
             num_fixed_fp_params: 0,
             named_stack_param_bytes: 0,
+            darwin_va_sp_slot: None,
             extern_symbols: HashSet::new(),
             tls_symbols: HashSet::new(),
             pic_mode: false,

@@ -249,6 +249,19 @@ impl Reg {
     }
 }
 
+/// Spend `n` argument registers out of a file of `file_len`.
+///
+/// These counters hold the number of registers *consumed* so far, and System
+/// V 3.2.3 step 5 gives an argument that does not fit no registers at all --
+/// so the count can never exceed the file. Adding unconditionally on the
+/// memory path kept the answer right for a `used < file_len` test and wrong
+/// for a `used + needed <= file_len` one when `needed` is zero: a
+/// two-general-eightbyte aggregate arriving after nine stacked `double`s
+/// asked whether the SSE file had room for none of it, and was told no.
+pub(super) fn spend_arg_regs(used: &mut usize, n: usize, file_len: usize) {
+    *used = (*used + n).min(file_len);
+}
+
 // Register Constraints (LLVM-style constraint-aware allocation)
 
 /// Register constraints for an instruction.
@@ -1350,7 +1363,7 @@ impl RegAlloc {
         if let Some(sret_id) = lowering.sret_pseudo {
             self.locations.insert(sret_id, Loc::Reg(int_arg_regs[0]));
             self.free_regs.retain(|&r| r != int_arg_regs[0]);
-            int_arg_idx += 1;
+            spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
         }
 
         for (i, (_name, typ)) in func.params.iter().enumerate() {
@@ -1408,7 +1421,7 @@ impl RegAlloc {
                         .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
                     self.free_xmm_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
                     self.fp_pseudos.insert(pseudo_id);
-                    fp_arg_idx += 1;
+                    spend_arg_regs(&mut fp_arg_idx, 1, fp_arg_regs.len());
                 } else {
                     self.locations.insert(
                         pseudo_id,
@@ -1437,7 +1450,7 @@ impl RegAlloc {
                 // while c17's own *caller* passed it correctly. The two
                 // neighbouring arms below already do this; this one did not.
                 if fp_arg_idx + sse_regs <= fp_arg_regs.len() {
-                    fp_arg_idx += sse_regs;
+                    spend_arg_regs(&mut fp_arg_idx, sse_regs, fp_arg_regs.len());
                 } else {
                     self.locations.insert(
                         pseudo_id,
@@ -1474,8 +1487,8 @@ impl RegAlloc {
                         )),
                     );
                 } else {
-                    int_arg_idx += gp_needed;
-                    fp_arg_idx += sse_needed;
+                    spend_arg_regs(&mut int_arg_idx, gp_needed, int_arg_regs.len());
+                    spend_arg_regs(&mut fp_arg_idx, sse_needed, fp_arg_regs.len());
                 }
             } else if is_complex {
                 // How many XMM registers this complex type actually occupies:
@@ -1501,7 +1514,7 @@ impl RegAlloc {
                     let used = &fp_arg_regs[fp_arg_idx..fp_arg_idx + sse_regs];
                     self.free_xmm_regs.retain(|r| !used.contains(r));
                     self.fp_pseudos.insert(pseudo_id);
-                    fp_arg_idx += sse_regs;
+                    spend_arg_regs(&mut fp_arg_idx, sse_regs, fp_arg_regs.len());
                 } else {
                     // Not enough XMM registers left for every eightbyte, so
                     // §3.2.3 step 5 puts the *whole* argument in memory — and
@@ -1536,7 +1549,7 @@ impl RegAlloc {
                         )),
                     );
                 }
-                fp_arg_idx += 1;
+                spend_arg_regs(&mut fp_arg_idx, 1, fp_arg_regs.len());
             } else if types.kind(*typ) == crate::types::TypeKind::Int128 && !types.is_complex(*typ)
             {
                 // __int128: uses two GP registers when available.
@@ -1552,7 +1565,7 @@ impl RegAlloc {
                     self.free_regs.retain(|&r| {
                         r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
                     });
-                    int_arg_idx += 2;
+                    spend_arg_regs(&mut int_arg_idx, 2, int_arg_regs.len());
                 } else {
                     let at = IncomingOff::take(&mut stack_arg_offset, 16, 16);
                     self.int128_incoming.insert(pseudo_id, at);
@@ -1584,7 +1597,7 @@ impl RegAlloc {
                     self.locations
                         .insert(pseudo_id, Loc::Reg(int_arg_regs[int_arg_idx]));
                     self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
-                    int_arg_idx += 1;
+                    spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
                 } else {
                     // Stack args are placed in parameter order per System V AMD64 ABI
                     self.locations.insert(
@@ -1595,7 +1608,7 @@ impl RegAlloc {
                             types.alignment(*typ) as i32,
                         )),
                     );
-                    int_arg_idx += 1;
+                    spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
                 }
             }
         }

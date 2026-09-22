@@ -176,9 +176,12 @@ impl X86_64CodeGen {
                 ArgClass::Hfa { count, .. } => {
                     // HFA uses FP registers (primarily AArch64, but handle for completeness)
                     if temp_fp_idx + (*count as usize) > fp_arg_regs.len() {
+                        // §3.2.3 step 5 again: to memory whole, consuming none
+                        // of the registers it did not fit in.
                         place(i, 8, 8, &mut stack_arg_indices, &mut stack_offsets, &mut at);
+                    } else {
+                        temp_fp_idx += *count as usize;
                     }
-                    temp_fp_idx += *count as usize;
                 }
                 ArgClass::X87 { .. } => {
                     // X87 is only used for return values, not parameters

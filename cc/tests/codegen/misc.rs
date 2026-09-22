@@ -7682,14 +7682,9 @@ int main(void)
 /// its 16. Nine leading doubles or longs put the argument past the register
 /// file so the stack rule is the one under test.
 ///
-/// aarch64 only, in two ways: the rule is AAPCS64's -- x86-64's SysV genuinely
-/// honours over-alignment and is covered by
-/// `codegen_over_aligned_argument_area` -- and the nine-leading-double shape
-/// needed to reach the stack trips a *separate*, pre-existing x86-64 defect,
-/// recorded in `cc/doc/TODO.md`: with the SSE file exhausted and the ninth
-/// double stacked, a following two-eightbyte INTEGER aggregate that still
-/// belongs in general registers is passed wrongly, over-aligned or not. Eight
-/// leading doubles pass; nine do not.
+/// aarch64 only: the rule is AAPCS64's, and x86-64's SysV genuinely honours
+/// over-alignment -- that side is covered by
+/// `codegen_over_aligned_argument_area`.
 #[test]
 fn codegen_aarch64_argument_alignment_follows_the_members() {
     let code = r#"
@@ -12052,6 +12047,64 @@ int main(void) {
     assert_eq!(compile_and_run("c99_call_through_pointer", code, &[]), 0);
     assert_eq!(
         compile_and_run("c99_call_through_pointer_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// System V 3.2.3 step 5 says an argument passed in memory consumes no
+/// register -- so the running tallies of *consumed* registers must not move
+/// for it. The callee-side tallies advanced anyway. One that had run past
+/// its file still answered `used < file_len` correctly, which is why this
+/// survived, but not `used + needed <= file_len` when `needed` is zero:
+/// after nine
+/// `double`s, the ninth of them stacked, the callee asked whether the SSE
+/// file had room for none of a two-general-eightbyte aggregate and was told
+/// no, so it read the struct off the stack while the caller -- which has the
+/// same question written with a guard -- had put it in RDI/RSI.
+#[test]
+fn codegen_register_aggregate_after_a_stacked_argument() {
+    let code = r#"
+typedef struct { long long a, b; } GG;
+typedef struct { double x, y; } DD;
+typedef struct { double x; long long y; } MIX;
+
+#define DP double p1,double p2,double p3,double p4,double p5,double p6, \
+           double p7,double p8,double p9
+#define D9 1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0
+#define LP long p1,long p2,long p3,long p4,long p5,long p6,long p7
+#define L7 1L,2L,3L,4L,5L,6L,7L
+
+/* The SSE file is spent and the ninth double is stacked; the aggregate that
+   follows still belongs in the general registers. */
+__attribute__((noinline)) static int gp_after_stacked_fp(DP, GG s, int tail)
+{ return (p9 == 9.0 && s.a == 1 && s.b == 2 && tail == 7) ? 0 : 1; }
+
+/* The mirror: the general file is spent and the seventh long is stacked; the
+   all-SSE aggregate that follows still belongs in XMM0/XMM1. */
+__attribute__((noinline)) static int fp_after_stacked_gp(LP, DD s, double tail)
+{ return (p7 == 7 && s.x == 1.5 && s.y == 2.5 && tail == 3.5) ? 0 : 2; }
+
+/* A mixed pair after the SSE file is spent has nowhere to put its SSE half,
+   so the whole argument does go to memory -- the tally must not make this
+   one wrong in the other direction. */
+__attribute__((noinline)) static int mix_after_stacked_fp(DP, MIX s, int tail)
+{ return (s.x == 4.5 && s.y == 6 && tail == 7) ? 0 : 3; }
+
+int main(void)
+{
+    GG g = { 1, 2 };
+    DD d = { 1.5, 2.5 };
+    MIX m = { 4.5, 6 };
+    int r;
+    if ((r = gp_after_stacked_fp(D9, g, 7))) return r;
+    if ((r = fp_after_stacked_gp(L7, d, 3.5))) return r;
+    if ((r = mix_after_stacked_fp(D9, m, 7))) return r;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c17_reg_agg_after_stacked", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c17_reg_agg_after_stacked_o2", code, &["-O2".to_string()]),
         0
     );
 }

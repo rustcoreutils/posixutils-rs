@@ -11037,3 +11037,88 @@ int main(void) {
         0
     );
 }
+
+/// A zero-sized parameter occupies neither a register nor a stack slot, and
+/// both sides of the call have to step over it the same way.
+///
+/// They did not. The call site's layout skipped it while the register setup
+/// and the callee's prologue each charged a general register for it, so every
+/// later argument was read from the register before the one it was written
+/// to -- `f(z, 1, 2, ...)` lost its first `int`. With nine arguments past the
+/// zero-sized one the index ran off the end of the six-register file and the
+/// **compiler panicked**: `index out of bounds: the len is 6 but the index is
+/// 6`, which is how `va-arg-22` failed to compile at all.
+///
+/// A zero-sized struct is a GNU extension, and `struct { char x[0]; }` and
+/// `struct { }` are both spellings of it.
+#[test]
+fn codegen_zero_sized_parameter_consumes_no_register() {
+    let code = r#"
+typedef struct { char x[0]; } Z;
+typedef struct { } E;
+Z z;
+E e;
+
+/* The zero-sized argument in every position around a full register file. */
+int first(Z q, int a, int b, int c, int d, int e2, int f, int g, int h) {
+    (void)q; return a + b + c + d + e2 + f + g + h;
+}
+int middle(int a, int b, int c, Z q, int d, int e2, int f, int g, int h) {
+    (void)q; return a + b + c + d + e2 + f + g + h;
+}
+int last(int a, int b, int c, int d, int e2, int f, int g, int h, Z q) {
+    (void)q; return a + b + c + d + e2 + f + g + h;
+}
+int two(Z p, Z q, int a, int b, int c, int d, int e2, int f, int g, int h) {
+    (void)p; (void)q; return a + b + c + d + e2 + f + g + h;
+}
+/* The empty-struct spelling, and a parameter the body actually reads. */
+int empty(E q, int a, int b) { (void)q; return a * 10 + b; }
+int weighted(Z q, int a, int b, int c, int d, int e2, int f, int g) {
+    (void)q; return a * 1 + b * 2 + c * 3 + d * 4 + e2 * 5 + f * 6 + g * 7;
+}
+/* Mixed with a two-register struct, past the file. */
+typedef struct { int a, b; } P;
+int mixed(P p1, P p2, P p3, Z q, int a, int b, int c) {
+    (void)q; return p1.a + p2.a + p3.a + a + b + c;
+}
+/* Variadic, with the zero-sized one among the fixed parameters. */
+int variadic(Z q, int n, ...) { (void)q; return n; }
+/* Returned by value, and passed several times over. */
+Z ret_zero(void) { return z; }
+int chain(Z q1, Z q2, Z q3, int a) { (void)q1; (void)q2; (void)q3; return a; }
+
+/* Sub-`int` arguments spilling to the stack: an argument that did not fit
+   consumes no register either, and counting one made the two sides disagree
+   about every argument after it. */
+char narrow(char a, char b, char c, char d, char e2,
+            char f, char g, char h, char i, char j) {
+    return (char)(a + b + c + d + e2 + f + g + h + i + j);
+}
+
+int main(void) {
+    if (first(z, 1, 2, 3, 4, 5, 6, 7, 8) != 36) return 1;
+    if (middle(1, 2, 3, z, 4, 5, 6, 7, 8) != 36) return 2;
+    if (last(1, 2, 3, 4, 5, 6, 7, 8, z) != 36) return 3;
+    if (two(z, z, 1, 2, 3, 4, 5, 6, 7, 8) != 36) return 4;
+    if (empty(e, 3, 4) != 34) return 5;
+    if (weighted(z, 1, 2, 3, 4, 5, 6, 7) != 140) return 6;
+
+    P a = {1, 0}, b = {2, 0}, c = {3, 0};
+    if (mixed(a, b, c, z, 4, 5, 6) != 21) return 7;
+
+    if (variadic(z, 42, 1, 2, 3) != 42) return 8;
+    Z r = ret_zero();
+    (void)r;
+    if (chain(z, z, z, 99) != 99) return 9;
+    if (narrow(1, 2, 3, 4, 5, 6, 7, 8, 9, 10) != 55) return 10;
+    if (sizeof(Z) != 0 || sizeof(E) != 0) return 11;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cg_zero_sized_param", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("cg_zero_sized_param_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

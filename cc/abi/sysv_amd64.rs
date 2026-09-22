@@ -62,6 +62,22 @@ pub fn param_is_memory_class(typ: TypeId, types: &TypeTable) -> bool {
         )
 }
 
+/// Whether the ABI ignores this parameter entirely.
+///
+/// A zero-sized type -- `struct { char x[0]; }`, a GNU extension -- occupies
+/// neither a register nor a stack slot, so both the caller and the callee must
+/// step over it *without* charging a register. They did not agree: the call
+/// site's layout skipped it while the register setup and the callee's
+/// prologue each gave it one, so every later argument was read from the wrong
+/// register, and nine arguments past a zero-sized one ran the index off the
+/// end of the file and panicked the compiler.
+pub fn param_is_ignored(typ: TypeId, types: &TypeTable) -> bool {
+    matches!(
+        SysVAmd64Abi::new().classify_param(typ, types),
+        ArgClass::Ignore
+    )
+}
+
 /// The register classes a nine-to-sixteen-byte aggregate parameter arrives in,
 /// or `None` if it does not arrive in registers.
 ///

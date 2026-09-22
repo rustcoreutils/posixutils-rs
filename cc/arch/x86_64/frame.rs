@@ -582,6 +582,10 @@ impl X86_64CodeGen {
         fp_arg_idx: &mut usize,
         int_arg_reg_count: usize,
     ) {
+        // See `param_is_ignored`: nothing to advance for a zero-sized type.
+        if crate::abi::param_is_ignored(typ, types) {
+            return;
+        }
         let is_complex = types.is_complex_float(typ);
         let kind = types.kind(typ);
         let is_aggregate = !is_complex
@@ -947,6 +951,11 @@ impl X86_64CodeGen {
         let mut fp = 0usize;
         for (_, typ) in &func.params {
             let kind = types.kind(*typ);
+            if crate::abi::param_is_ignored(*typ, types) {
+                // Occupies no register, so `va_start`'s save-area index must
+                // not count one for it.
+                continue;
+            }
             if let Some(classes) = crate::abi::struct_param_classes(*typ, types) {
                 // Nine to sixteen bytes: one register per eightbyte, from
                 // whichever file its class names.

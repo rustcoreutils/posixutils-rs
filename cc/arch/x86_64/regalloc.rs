@@ -1329,6 +1329,13 @@ impl RegAlloc {
             // sixteen-byte branch below rather than the COMPLEX_X87 branch
             // further down that is meant for its thirty-two. Both sibling
             // sites, in `call.rs` and `codegen.rs`, exclude complex too.
+            // A zero-sized parameter occupies nothing, so it must not take a
+            // register here either -- the call site's layout already skips
+            // it, and charging one made every later parameter read from the
+            // wrong register.
+            if crate::abi::param_is_ignored(*typ, types) {
+                continue;
+            }
             let is_longdouble = types.kind(*typ) == crate::types::TypeKind::LongDouble
                 && !types.is_complex_float(*typ);
             let is_fp = types.is_float(*typ);

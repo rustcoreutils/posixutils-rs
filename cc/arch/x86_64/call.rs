@@ -42,6 +42,16 @@ pub(super) struct CallArgInfo {
     pub stack_offsets: Vec<i32>,
     /// Total bytes to reserve, rounded to the 16-byte call boundary.
     pub stack_bytes: i32,
+    /// Indices of arguments the ABI ignores entirely -- a zero-sized type,
+    /// which occupies neither a register nor a stack slot.
+    ///
+    /// Recorded rather than recomputed because `setup_register_args` has to
+    /// skip exactly what this classification skipped. It used to give such an
+    /// argument a general register while the layout gave it nothing, and the
+    /// two indices drifted apart: passing a `struct { char x[0]; }` before
+    /// eight other arguments ran the register index off the end of the file
+    /// and the compiler panicked.
+    pub ignored_arg_indices: Vec<usize>,
 }
 
 impl X86_64CodeGen {
@@ -51,6 +61,7 @@ impl X86_64CodeGen {
         let fp_arg_regs = XmmReg::arg_regs();
 
         let mut stack_arg_indices = Vec::with_capacity(insn.src.len());
+        let mut ignored_arg_indices: Vec<usize> = Vec::new();
         let mut temp_int_idx = 0;
         let mut temp_fp_idx = 0;
         // The outgoing area is walked, not summed: each argument begins at
@@ -150,11 +161,17 @@ impl X86_64CodeGen {
                     );
                 }
                 ArgClass::Extend { .. } => {
-                    // Extended small integers use one GP register
+                    // Extended small integers use one GP register -- unless
+                    // there is none left, and then the argument goes to the
+                    // stack and consumes nothing, exactly as §3.2.3 step 5
+                    // says and as the `Direct` arm above already had it.
+                    // Advancing anyway made this side count a register the
+                    // setup side had not.
                     if temp_int_idx >= int_arg_regs.len() {
                         place(i, 8, 8, &mut stack_arg_indices, &mut stack_offsets, &mut at);
+                    } else {
+                        temp_int_idx += 1;
                     }
-                    temp_int_idx += 1;
                 }
                 ArgClass::Hfa { count, .. } => {
                     // HFA uses FP registers (primarily AArch64, but handle for completeness)
@@ -169,7 +186,9 @@ impl X86_64CodeGen {
                     unreachable!("X87 classification only applies to return values");
                 }
                 ArgClass::Ignore => {
-                    // Zero-sized type, skip
+                    // A zero-sized type occupies nothing at all. Recorded so
+                    // `setup_register_args` skips it too.
+                    ignored_arg_indices.push(i);
                 }
             }
         }
@@ -179,6 +198,7 @@ impl X86_64CodeGen {
 
         CallArgInfo {
             stack_arg_indices,
+            ignored_arg_indices,
             stack_offsets,
             stack_bytes,
         }
@@ -367,7 +387,7 @@ impl X86_64CodeGen {
         let mut regs_to_write: Vec<Reg> = Vec::new();
         let mut temp_int_idx = 0;
         for i in 0..insn.src.len() {
-            if info.stack_arg_indices.contains(&i) {
+            if info.stack_arg_indices.contains(&i) || info.ignored_arg_indices.contains(&i) {
                 continue;
             }
             let arg_type = insn.arg_types.get(i).copied();
@@ -390,7 +410,7 @@ impl X86_64CodeGen {
         // Check which argument sources are in registers that will be clobbered
         temp_int_idx = 0;
         for i in 0..insn.src.len() {
-            if info.stack_arg_indices.contains(&i) {
+            if info.stack_arg_indices.contains(&i) || info.ignored_arg_indices.contains(&i) {
                 continue;
             }
             let arg = insn.src[i];
@@ -471,7 +491,7 @@ impl X86_64CodeGen {
         let mut fp_arg_idx = 0;
 
         for i in 0..insn.src.len() {
-            if info.stack_arg_indices.contains(&i) {
+            if info.stack_arg_indices.contains(&i) || info.ignored_arg_indices.contains(&i) {
                 continue;
             }
             let arg = insn.src[i];

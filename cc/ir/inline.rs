@@ -121,7 +121,7 @@ impl InlineCandidate {
     /// out-of-line definition, and diagnosing it rejected programs gcc
     /// compiles -- a recursive function of any size calling a glibc
     /// `__fortify_function` was enough.
-    pub fn cannot_be_inlined(&self) -> bool {
+    fn cannot_be_inlined(&self) -> bool {
         self.defines_varargs_frame
             || self.is_recursive
             || self.takes_label_addr
@@ -134,7 +134,7 @@ impl InlineCandidate {
 ///
 /// What `opt::check_forwarding_resolved` reports. Asked of the same analysis
 /// the inliner itself uses, so the two cannot drift apart.
-pub fn impossible_always_inline(module: &Module) -> std::collections::BTreeSet<String> {
+pub(crate) fn impossible_always_inline(module: &Module) -> std::collections::BTreeSet<String> {
     analyze_all_functions(module)
         .into_iter()
         .filter(|(_, c)| c.is_always_inline && c.cannot_be_inlined())

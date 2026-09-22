@@ -14,7 +14,11 @@
 // - AAPCS64 (AArch64 Linux/macOS)
 //
 
-pub mod aapcs64;
+// Crate-visible rather than `pub`: the aarch64 backend reaches this module's
+// layout helpers by path, so it cannot be private like `sysv_amd64` beside it,
+// but nothing outside the crate has any business with them. What leaves the
+// crate is the `pub use` below.
+pub(crate) mod aapcs64;
 mod sysv_amd64;
 
 pub use aapcs64::Aapcs64Abi;

@@ -212,15 +212,15 @@ pub(crate) struct VlaMark {
 /// `marks` is the mark stack as it stood at the jump, so the restore can name
 /// whichever scope the label turns out to sit in: `marks[label_depth]` is the
 /// stack pointer captured on entry to the outermost scope the jump leaves.
-pub struct PendingGotoVla {
+pub(crate) struct PendingGotoVla {
     /// The label jumped to.
-    pub label: String,
+    pub(crate) label: String,
     /// The block the branch was emitted into.
-    pub bb: BasicBlockId,
+    pub(crate) bb: BasicBlockId,
     /// Where in that block the branch sits; the restore goes just before it.
-    pub at: usize,
+    pub(crate) at: usize,
     /// The marks in force at the jump, outermost first.
-    pub marks: Vec<PseudoId>,
+    pub(crate) marks: Vec<PseudoId>,
 }
 
 pub struct Linearizer<'a> {

@@ -18,13 +18,10 @@ and so neither is raised again as a question.
 
 ### `_FORTIFY_SOURCE` compiles but checks nothing
 
-**Not a conformance item, and the sole record of this one.** It was also
-tracked as **#C12** in the conformance audit until 2026-08-21, when it was
-removed from there: `_FORTIFY_SOURCE`, `__builtin_object_size` and the `_chk` family
-appear nowhere in POSIX.1-2024, so an entry in a POSIX conformance audit's
-Open list overstated what it was. The number is kept here so
-`git log --grep '#C12'` still finds the history. **Deferred indefinitely by
-maintainer decision (2026-08-19)** — a decision, not a backlog item.
+**Not a conformance item, and the sole record of this one.**
+`_FORTIFY_SOURCE`, `__builtin_object_size` and the `_chk` family appear nowhere
+in POSIX.1-2024, so this is not a POSIX conformance gap. **Deferred
+indefinitely by maintainer decision** — a decision, not a backlog item.
 
 What *is* required of the compiler already works, and should not be confused
 with what is missing: c17 accepts `-D_FORTIFY_SOURCE=2`, compiles glibc's
@@ -42,56 +39,10 @@ the encoding for "do not check". The program now pays for the wrappers and
 checks nothing.
 
 Anyone who sets the flag expecting hardening does not get it, and gets no
-diagnostic saying so. That is layer 8 below.
+diagnostic saying so.
 
-Peeling this apart one layer at a time has been the only way to see it: each
-fix exposes the next blocker, and most of the layers are invisible until the
-one before it is in place. Seven are done:
-
-1. `__builtin_object_size` computing real sizes rather than "unknown".
-2. Implicit declarations for the `__builtin___*_chk` family.
-3. Asm label renaming, so glibc's `__REDIRECT` aliases resolve.
-4. `always_inline`, so the fortified wrapper reaches the caller at all.
-5. Inline definitions emitting no external definition.
-6. `__builtin_va_arg_pack` / `_len`, so the wrappers' argument forwarding
-   compiles at all — see below.
-7. Predefining `__OPTIMIZE__`, which is what makes glibc compile the wrappers.
-
-~~**Layer 5 — `__gnu_inline__` / `extern inline` must emit no out-of-line
-definition.**~~ Done. It turned out not to be a fortify problem at all: `inline`
-was never recorded on a function definition in the first place, so *every*
-spelling emitted an external definition and an `inline` function in a shared
-header failed to link.
-
-**Layer 6 — `__builtin_va_arg_pack`.** ~~Done.~~ This, not layer 8, was the
-next thing in the way, and this file did not know it. glibc's `bits/stdio2.h`
-forwards `sprintf`/`printf` into the `__*_chk` family with `__va_arg_pack()`,
-and those wrappers are compiled only when `__OPTIMIZE__` is defined — so
-predefining `__OPTIMIZE__` without the builtin failed to compile *any* program
-including `<stdio.h>` with `_FORTIFY_SOURCE`. The claim below that
-`__OPTIMIZE__` and the object-size fold "must land together" was therefore
-wrong twice over: the pairing it named was not the blocking one, and neither
-had to wait for the other.
-
-**Layer 7 — `__OPTIMIZE__`.** Done, with `__OPTIMIZE_SIZE__` and
-`__NO_INLINE__` alongside it. Every row matches gcc; see
-`c17_optimization_macros_match_gcc`.
-
-**Layer 8 — `__builtin_object_size` has to be folded after inlining.** The
-wrapper computes the size of its own `__dest` *parameter*, which is genuinely
-unknown, so the front end folds it to `-1` before the inliner ever runs and the
-`_chk` call is handed `-1` — a value that means "do not check". gcc defers the
-fold until after inlining, when `__dest` is known to be the caller's `buf`.
-Fixing this means carrying the query into the IR and folding it in a
-post-inline pass that can trace a pointer back to its object.
-
-`__OPTIMIZE__` was previously reverted three times, most recently after
-measuring the duplicate-symbol failure that turned out to be layer 5. It is in
-now, and it did not need layer 8 to get there: the fortified wrappers compile,
-link and run, they simply do not check. That is worse than checking and better
-than not compiling, and it is where GCC parity stops.
-
-Layer 8 is the whole remaining job, and it is a real one. There is no IR
+**The remaining job is folding `__builtin_object_size` after inlining**, and it
+is a real one. There is no IR
 representation for an unresolved builtin query — no opcode, no expression node
 that survives linearization, and no post-inline pointer-provenance analysis to
 build one on. `instcombine` refuses to touch `Call` and every memory-touching
@@ -120,11 +71,10 @@ blow the default 8 MB stack under c17 before the counter trips; they pass with
 `ulimit -s 65536`. Not a miscompile, but a real quality gap — and the
 acceptance gate has to raise the stack to measure correctness.
 
-Reduced, not closed. Promoting single-block locals out of memory (`ir/ssa.rs`)
-took the count from the twelve recorded here to five: `test_call`, `test_descr`,
-`test_io`, `test_isinstance`, `test_userdict` (measured 2026-08-23, -O2, default
-8 MB stack; the other 473 files pass). Two things still inflate every frame and
-are the place to look next:
+At `-O2` on the default 8 MB stack, `test_call`, `test_descr`, `test_io`,
+`test_isinstance` and `test_userdict` still run out of stack; the gate works
+around it with `ulimit -s 65536`. Two things inflate every frame and are the
+place to look next:
 
 - `arch/x86_64/frame.rs` `zero_stack_frame` emits a `rep stosq` over the whole
   frame in *every* prologue, plus six register shuffles around it — even for a
@@ -135,7 +85,7 @@ are the place to look next:
   (`arch/*/regalloc.rs`, `size.max(8)` with `reusable = false`), so a 4-byte
   `int` costs 8.
 
-**Why `reusable = false` cannot simply be flipped** (traced 2026-09-21).
+**Why `reusable = false` cannot simply be flipped.**
 Setting it true changes nothing, and neither does the gate its own comment
 proposes — `!addr_taken_syms.contains(..)` excludes every array, since indexing
 emits `SymAddr`. The blocker is upstream of the flag: **a Sym pseudo has no
@@ -212,34 +162,12 @@ Behaviours where c17 differs from gcc on the same source. None is a
 translation-limit or a diagnostic gap; each silently changes what the program
 does or claims.
 
-_The `__int128` and `long double` argument-passing bugs, the universal-character-name
-encoding, and the silently-dropped attributes used to belong here; all are closed, see
-#C42, #C43, #C57, #C58 and #C59 (`git log --grep`). What remains of that family: `used` is
-satisfied only because nothing is pruned -- re-probed 2026-08-20, an unreferenced static
-survives `-O2` whether or not it is marked. `vector_size` is implemented as storage and
-`mode` as of #C85, the latter also binding to a struct member's and a parameter's
-declarator as of #C149; only the vector modes still warn. #C38 -- an inlined stacked
-float HFA on aarch64 -- is fixed, this note having outlived it (re-probed 2026-08-18 at
--O0 and -O2 under qemu)._
-
-_Constraint diagnostics used to belong here. As of 2026-08-15 a 35-case matrix
--- 21 constraint violations and 14 accept-side controls -- agrees with
-`gcc -std=c17` on every row; see #C45-#C49 in git log. Two divergences are
-deliberate and remain: `return` with a value in a `void` function, and a bare
-`return` in a non-`void` one, are errors here and warnings in gcc, both being
-genuine 6.8.6.4 violations. `__attribute__((transparent_union))` used to sit
-here too -- an argument matching any member of *any* union parameter was
-accepted rather than checked -- and is closed, see #C51 in git log._
-
-_The packed-bit-field layout used to be a row in the table below:
-`struct __attribute__((packed)) { unsigned a:20, b:20; }` was 8 bytes here and
-5 under gcc. Closed by #C110 -- under a pack cap the unit rule is switched off
-entirely, and a span that is not one addressable unit is assembled byte by
-byte, as gcc does on both targets._
-
 | Area | Divergence |
-|------|-----------|
-| `_FORTIFY_SOURCE` | Compiles the wrappers and emits `__*_chk` calls, but still checks nothing. Seven of eight layers are done; the one that remains -- folding `__builtin_object_size` after inlining -- is described above, and is an ordinary compiler feature rather than fortify-specific work |
+|---|---|
+| `__attribute__((used))` | Honoured only because nothing is pruned: an unreferenced static survives `-O2` whether or not it is marked. Real pruning would have to start reading the attribute |
+| `mode` on a vector type | `vector_size` gives a type a vector's storage and `mode` binds to a declarator, including a struct member's and a parameter's. The vector modes themselves still warn that they are ignored |
+| `return` with the wrong value-ness | `return expr;` in a `void` function, and a bare `return;` in a non-`void` one, are errors here and warnings in gcc. Both are genuine C17 6.8.6.4p1 constraint violations |
+| `_FORTIFY_SOURCE` | Compiles the wrappers and emits `__*_chk` calls, but still checks nothing. What remains -- folding `__builtin_object_size` after inlining -- is described above, and is an ordinary compiler feature rather than fortify-specific work |
 | `-Ofast`, `-Oz` | Refused by name with a reason, where gcc and clang accept them. `-Ofast` relaxes IEEE arithmetic and c17 has no fast-math mode to relax into; `-Oz` has no smaller-than-`-Os` tier to select. `-Os` and `-Og` are supported |
 | Identifier characters U+FD3E, U+FD3F | Rejected here; GCC's binary accepts them. Ornate parentheses, which ISO C Annex D excludes between its F900-FD3D and FD40-FDCF ranges -- GCC's own `ucnid.tab` does not list them and Clang's table does not either, so the table is followed rather than the binary. See #C158 |
 | Non-NFC identifiers | GCC warns `-Wnormalized=` when an identifier is not in Normalization Form C; c17 is silent. A diagnostic-quality gap, not a conformance one -- both compile the same program |
@@ -262,13 +190,13 @@ the project's own filter before earning a verdict:
 4. Is it a de-facto standard both GCC and Clang accept, or a GCC quirk?
 
 | Extension | Verdict | Why |
-|-----------|---------|-----|
+|---|---|---|
 | SIMD intrinsic headers | **No — fix the predefines** | See below; the blocking is self-inflicted |
 | `__atomic_*` / `__sync_*` | **Not implemented; macro withdrawn** | Alternate spellings of complete C11 atomics — see below |
 | `__auto_type` | **No** | 6 files across four trees; fails minimalism on its own numbers |
-| nested functions / `__label__` | **Never** | GCC-only, Clang refuses it, needs executable-stack trampolines. 22 torture instances; see the c-torture section |
-| VLA as a struct member | **No** | GCC-only; needs struct layout computed at run time and `offsetof` through it. 16 torture instances |
-| `_Decimal32/64/128` | **No** | IEEE 754 decimal arithmetic, a whole numeric tower for 2 torture instances |
+| nested functions / `__label__` | **Never** | GCC-only, Clang refuses it, needs executable-stack trampolines; see the c-torture section |
+| VLA as a struct member | **No** | GCC-only; needs struct layout computed at run time and `offsetof` through it |
+| `_Decimal32/64/128` | **No** | IEEE 754 decimal arithmetic, a whole numeric tower for a single torture test |
 | C23 `[[...]]` attributes | **No** | Newer than C17, which is the language c17 implements |
 
 **The standing rule**: anything GNU-specific, or newer than C17, is out of
@@ -302,7 +230,7 @@ Vector *arithmetic* is the related non-goal. `vector_size` gives a type a
 vector's storage, which is what makes glibc's `<link.h>` compile, and that is
 deliberately where it stops.
 
-### Atomics — the macro went, the builtins did not come
+### `__atomic_*` / `__sync_*` — not implemented, and not claimed
 
 `__atomic_*` and `__sync_*` were the only rows to survive the filter on merit:
 c17's C11 atomics are complete — type system, parser, IR, linearizer, both
@@ -310,11 +238,9 @@ backends, `<stdatomic.h>` — so these builtins would map onto machinery that
 already exists rather than adding a subsystem, and would inherit the same
 lock-free width ceiling (#X1).
 
-They are still not implemented. What changed is that c17 no longer *claims*
-them: it predefined `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_{1,2,4,8}` on both
-targets while `__sync_bool_compare_and_swap` was an undeclared identifier, so a
-guarded `#ifdef` opened a door onto a wall when the `#else` beside it would have
-compiled. The macro is gone, which is what makes the guard tell the truth.
+They are still not implemented, and c17 does not claim them: it predefines no
+`__GCC_HAVE_SYNC_COMPARE_AND_SWAP_{1,2,4,8}`, so a guarded `#ifdef` does not
+open a door onto a wall when the `#else` beside it would have compiled.
 
 ### Which macros may be withdrawn, and which may not
 
@@ -342,15 +268,6 @@ to pick an algorithm rather than to reach for an intrinsic.
 AArch32 spelling, and gcc does not define it there. c17 did, which was simply
 wrong.
 
-Implemented since this list was first measured: case ranges, designated
-initializer ranges, computed goto, and the omitted middle operand `a ?: b`
-(1373 files of the Linux kernel, and five of the six sparse files c17 could not
-parse). All four passed the same filter for a reason worth recording — each is
-a *syntax* over control flow, initializers or an operator c17 already had, none
-added a subsystem, and all four block outright with no fallback path. CPython's
-configure now detects computed gotos, so it builds its indirect-branch
-interpreter rather than the switch fallback.
-
 `a ?: b` is the one that could not simply be rewritten to `a ? a : b`: the
 condition must be evaluated exactly once, so it has its own AST node. The
 missing bit-manipulation builtins went in alongside it — `__builtin_clrsb` and
@@ -365,42 +282,19 @@ The type system, parser, IR, linearizer, both code generators, `<stdatomic.h>`,
 and access through ordinary operators are all done. `_Atomic` on an array or
 function type is rejected.
 
-**Nothing remaining.** An `_Atomic` aggregate of lock-free size used to fall
-through to a non-atomic struct copy; closed by #C116, which admits a struct or
-union *at* a machine width and operates on its bits through an unsigned integer
-surrogate. Anything else -- `long double`, `__int128`, complex, and any width
-that is not a machine integer size, a 3-byte struct included -- still warns and
-falls back to an ordinary access. That ceiling is deliberate and unchanged:
-gcc's `__atomic_*` calls need `-latomic` and c17 links through the host `cc`
-without it (#X1).
+**Nothing remaining.** A struct or union *at* a machine width is operated on
+through an unsigned integer surrogate. Anything else -- `long double`,
+`__int128`, complex, and any width that is not a machine integer size, a 3-byte
+struct included -- warns and falls back to an ordinary access. That ceiling is
+deliberate: gcc's `__atomic_*` calls need `-latomic` and c17 links through the
+host `cc` without it (#X1).
 
-The deferral this section used to record was justified by the
-value-versus-address convention for small aggregates needing to be settled
-first. That turned out not to be a blocker, and not to be one convention --
-see #C116 in git log for what the three sites actually decide. The member-access
-warning that stood here is #C113, closed 2026-08-18; C11 6.5.2.3p5 makes it
-undefined behaviour rather than a constraint violation, so it is a warning
-rather than the rejection an earlier version of this list called for.
+Accessing a member of an atomic struct is a warning, not a rejection: C11
+6.5.2.3p5 makes it undefined behaviour rather than a constraint violation.
 
-Two entries that used to sit here were removed after being probed rather than
-implemented. Rejecting `_Atomic` on a struct or union with a VLA member is
-unreachable: such a type cannot be formed at all, since a VLA member is
-rejected outright and a member reaching one through a typedef is refused by
-6.7.2.1p9. (That second half used to read "the typedef route is rejected at
-the typedef", which stopped being true when #C138 implemented 6.7.7; the
-conclusion survives, the reason changed. Re-probed 2026-08-19, both spellings.)
-And `int *_Atomic p;` now parses -- it was a qualifier-list bug at file scope,
-not a missing feature.
-
-### Variably modified `typedef` — done
-
-C17 6.7.7 is implemented as of #C138. The interesting half is 6.7.7p3's "the
-array size expressions are evaluated each time the declaration of the typedef
-name is reached in the order of execution": at the typedef, once, however many
-objects the name then declares, and again on re-entry. `ExprKind::VmTypedefExtent`
-names an extent the typedef already evaluated, so a use rides the existing VLA
-machinery rather than repeating the size expressions -- copying those to each
-use would re-evaluate them and get all three rules wrong.
+Rejecting `_Atomic` on a struct or union with a VLA member is unreachable: such
+a type cannot be formed at all, since a VLA member is rejected outright and a
+member reaching one through a typedef is refused by 6.7.2.1p9.
 
 ### C11 Thread-Local Storage
 
@@ -421,8 +315,8 @@ AArch64; on x86-64 it is gcc's `-mtls-dialect=gnu2`. Two measured reasons:
   through. `__tls_get_addr` is an ordinary call and clobbers all caller-saved
   registers.
 
-That second point is why the register allocator turned out not to be the
-blocker this file previously described. The sequence is **not** call-like: it
+That second point is why the register allocator is not a blocker here. The
+sequence is **not** call-like: it
 declares a single clobber through `opcode_constraints`, the same mechanism that
 already handles `DivS` clobbering `RAX`/`RDX`. Adding it to `is_call_like_*`
 would be actively wrong — call positions send every live floating-point value
@@ -526,7 +420,7 @@ InstCombine → SCCP → DCE → CFG simplify → Copy prop → Local CSE → In
 ### Priority
 
 | Priority | Pass | Complexity | Impact |
-|----------|------|------------|--------|
+|---|---|---|---|
 | 1 | CFG simplify | Low | Medium |
 | 2 | Copy/φ cleanup | Low | Medium |
 | 3 | Local CSE | Medium | Medium |
@@ -542,7 +436,7 @@ InstCombine → SCCP → DCE → CFG simplify → Copy prop → Local CSE → In
 Post-codegen peephole optimizations on generated assembly.
 
 | Pattern | Optimization |
-|---------|--------------|
+|---|---|
 | `mov %rax, %rax` | Delete (no-op move) |
 | `mov %rax, %rbx; mov %rbx, %rax` | Delete second (useless copy-back) |
 | `add $0, %rax` | Delete (no-op add) |
@@ -557,57 +451,43 @@ conformance boxes. They are not conformance gaps -- they are test-coverage
 work, and were never a claim about the language.
 
 | Suite | Note |
-|-------|------|
+|---|---|
 | GCC torture tests | **Running.** `cc/scripts/c17_torture.sh`, baselined. The whole `execute/` directory, in C17 mode -- `dg_scan` strips `-std=` rather than selecting a dialect |
 | clang test suite | Not run against c17 |
 
-**Reclassified 2026-08-21.** These are no longer only test-coverage work. A
-hand-written differential probe of nine ordinary constructs against
-`gcc -std=c17`, at `-O0` and `-O2`, found a silent miscompile in its first
-hour (#C155, `&vla`), in a mandated C99 feature that CPython's 40,817 passing
-tests never reach. `gcc.c-torture/execute` is a few thousand self-checking
-programs needing no reference compiler, and is the highest-yield item on this
-page.
+These are not only test-coverage work. A differential probe against
+`gcc -std=c17` at `-O0` and `-O2` reaches silent miscompiles in mandated C99
+features that the CPython acceptance gate never touches.
+`gcc.c-torture/execute` is a few thousand self-checking programs needing no
+reference compiler, and is the highest-yield item on this page.
 
-**Running as of 2026-09-21.** `cc/scripts/c17_torture.sh` drives it against an
-external checkout (the suite is GPLv3 and is not vendored) and diffs a recorded
-baseline, so a regression fails rather than shifting a percentage.
+`cc/scripts/c17_torture.sh` drives it against an external checkout (the suite
+is GPLv3 and is not vendored) and diffs a recorded baseline, so a regression
+fails by name rather than shifting a percentage.
 
-`execute/` went from **58.5% to 99.32% of what is attempted** (3061 of 3082
-instances; 1986 of 3396 at the start, 1698 tests run at -O0 and -O2) over one
-series: the libc-alias builtins,
-`-fpermissive`, `__complex__`, bare `alloca`, `va_arg` of a small struct,
-bit-field assignment values and promotion, binary128 variadic arguments,
-`__builtin_classify_type`, `creal`/`cimag`/`conj`, the `*_overflow_p` family,
-`#pragma push_macro`, `__builtin_prefetch`'s argument, enumeration constants'
-type, GNU complex integers, read-modify-write evaluating its target once, a
-`switch` promoting its controlling expression and comparing at full width,
-static initializers that wrote past their object, VLA stack reclamation,
-zero-sized parameters, calls through a function pointer, and the GNU
-`__const` / colon-designator / bare-`_Complex` spellings.
+The suite is run at `-O0` and `-O2`. `c17_torture.sh` prints the totals and
+names every regression against `torture-baseline.txt`; the groups below say
+what each remaining failure needs.
 
-One conformance gap found while chasing those and not yet fixed: c17 has no
-C17 6.7.3p2 check, so `restrict int x;` is accepted where gcc errors that
-`restrict` may only qualify a pointer to object type.
-
-**What is left — 2 run failures and 19 compile failures.** Of 3396 instances:
-3061 pass, 314 are skipped and 21 fail. **3061 of 3082 attempted, 99.32%.**
+One conformance gap found while working through it: c17 has no C17 6.7.3p2
+check, so `restrict int x;` is accepted where gcc errors that `restrict` may
+only qualify a pointer to object type.
 
 ### Out of scope, and so skipped rather than counted
 
 Anything GNU-specific or newer than C17 is **out of scope**: the harness skips
 it with a named reason instead of reporting a failure, because counting it
-measures a decision rather than a defect. 56 instances are skipped this way, on
-top of the 122 the older `UNSUPPORTED_RE` already caught (`vector_size`,
-`__label__`, `__builtin_apply`, `__builtin_setjmp`, `alias`).
+measures a decision rather than a defect. These are skipped on top of what the
+older `UNSUPPORTED_RE` already caught (`vector_size`, `__label__`,
+`__builtin_apply`, `__builtin_setjmp`, `alias`).
 
-| Category | Inst | Tests |
-|---|---|---|
-| Nested functions | 22 | `20010209-1`, `20010605-1`, `20030501-1`, `20040520-1`, `20090219-1`, `nest-align-1`, `nestfunc-7`, `nest-stdar-1`, `pr103405`, `pr22061-3`, `pr22061-4`. Needs a static chain and executable trampolines |
-| VLA as a struct member | 16 | `20020412-1`, `20040308-1`, `20040423-1`, `20041218-2`, `20070919-1`, `align-nest`, `pr41935`, `pr82210`. Needs struct layout computed at run time, and `offsetof` through it |
-| Post-C17 | 8 | `pr80692` (`_Decimal64`, TR 24732), `pr123978`, `pr124358`, `pr125291` (C23 `[[...]]` attributes) |
-| GNU-only attribute | 4 | `20230630-2`, `20230630-4` (`scalar_storage_order`; needs reverse-endian load/store lowering) |
-| gcc-specific *behaviour* | 6 | `20021127-1` (gcc folds `llabs()` and never calls the program's own definition of it), `20031003-1` (gcc's folder saturates undefined behaviour; aarch64 agrees by hardware accident), `pr46309` (a conditional with one `void` arm, which C17 6.5.15p3 forbids) |
+| Category | Tests |
+|---|---|
+| Nested functions | `20010209-1`, `20010605-1`, `20030501-1`, `20040520-1`, `20090219-1`, `nest-align-1`, `nestfunc-7`, `nest-stdar-1`, `pr103405`, `pr22061-3`, `pr22061-4`. Needs a static chain and executable trampolines |
+| VLA as a struct member | `20020412-1`, `20040308-1`, `20040423-1`, `20041218-2`, `20070919-1`, `align-nest`, `pr41935`, `pr82210`. Needs struct layout computed at run time, and `offsetof` through it |
+| Post-C17 | `pr80692` (`_Decimal64`, TR 24732), `pr123978`, `pr124358`, `pr125291` (C23 `[[...]]` attributes) |
+| GNU-only attribute | `20230630-2`, `20230630-4` (`scalar_storage_order`; needs reverse-endian load/store lowering) |
+| gcc-specific *behaviour* | `20021127-1` (gcc folds `llabs()` and never calls the program's own definition of it), `20031003-1` (gcc's folder saturates undefined behaviour; aarch64 agrees by hardware accident), `pr46309` (a conditional with one `void` arm, which C17 6.5.15p3 forbids) |
 
 These are listed **by name** in the harness, never matched against the source.
 Scanning for the feature looked tidier and was wrong: `pr86659-1`, `pr86659-2`
@@ -630,10 +510,10 @@ injecting one into a skip list and watching the gate fail.
 above; the reasoning is in that table. Two more are divergences c17 keeps but
 does **not** skip, because neither is GNU-specific:
 
-| Test | Inst | Why c17 does not follow |
-|---|---|---|
-| `991014-1` | 2 | Needs `sizeof` to answer ~9.2 exabytes exactly. `size_bits` returns a `u32`, so nothing wider than `u32::MAX` **bits** has a representable size -- `MAX_OBJECT_BYTES` is a consequence of that type, not an arbitrary cap. Widening it is a 288-call-site refactor through the type table, IR instruction sizes, ABI classification and both backends |
-| `920728-1` | 2 | `return;` in a function returning non-void. C17 6.8.6.4p1 makes it a constraint violation; gcc issues a warning and compiles. `-fpermissive` arguably ought to downgrade it, as it does for implicit `int` |
+| Test | Why c17 does not follow |
+|---|---|
+| `991014-1` | Needs `sizeof` to answer ~9.2 exabytes exactly. Sizes are carried in **bits**, so that object is 2^66 bits -- not representable in a `u64` either, and `MAX_OBJECT_BYTES` is a consequence of `size_bits`'s return type rather than an arbitrary cap. Reaching it means changing the compiler's canonical size unit from bits to bytes, through the type table, IR instruction sizes, ABI classification and both backends |
+| `920728-1` | `return;` in a function returning non-void. C17 6.8.6.4p1 makes it a constraint violation; gcc issues a warning and compiles. `-fpermissive` arguably ought to downgrade it, as it does for implicit `int` |
 
 Complex integer division is a third, recorded in `BUILTIN.md`: c17 uses
 Smith's method because the exact formula overflows, and so answers `6 + 1i`
@@ -641,15 +521,14 @@ for `(-9 + 38i) / (5 + 6i)` exactly as gcc does.
 
 ### Still open
 
-21 instances across 15 tests, and half of them are one thing.
+Most of what is left is one thing.
 
-| Group | Inst | Note |
-|---|---|---|
-| Dead-call elimination proofs | 11 | `20011115-1`, `20020720-1`, `20030216-1`, `20041114-1`, `compare-3`, `pure-1`, `shiftopt-1` at -O2; `20030330-1` and `medce-1` at **both** levels, because neither has an `#ifndef __OPTIMIZE__` fallback definition and gcc deletes an `if (0)` body in CFG cleanup, which it runs at -O0 too. Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link*. Standard C, and optimizer strength rather than a defect -- building real dead-code and value-range analysis would improve -O2 generally, well beyond these tests |
-| Missing optimizations behind `__OPTIMIZE__` | 2 | `20030125-1`, `builtin-constant`. Same class: the tests only assert them when the optimizer is on, and each fails at `-O2` only |
-| `va_arg` tail | 2 | `stdarg-4` is **not** a `link_error` test, despite living in that group until now: it fails to link with `undefined reference to 'f1i'` because `analyze_all_functions` marks any function containing a `Va*` opcode un-inlinable *above* the `always_inline` check, so a C99 inline definition that merely consumes a `va_list` is never inlined and never emitted |
-| Address of a string-literal element as a constant | 2 | `921019-1`: `(void *)&("X"[0])` in a static initializer |
-| The two divergences above | 4 | `991014-1`, `920728-1` |
+| Group | Note |
+|---|---|
+| Dead-call elimination proofs | `20011115-1`, `20020720-1`, `20030216-1`, `20041114-1`, `compare-3`, `pure-1`, `shiftopt-1` at -O2; `20030330-1` and `medce-1` at **both** levels, because neither has an `#ifndef __OPTIMIZE__` fallback definition and gcc deletes an `if (0)` body in CFG cleanup, which it runs at -O0 too. Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link*. Standard C, and optimizer strength rather than a defect -- building real dead-code and value-range analysis would improve -O2 generally, well beyond these tests |
+| Missing optimizations behind `__OPTIMIZE__` | `20030125-1`, `builtin-constant`. Same class: the tests only assert them when the optimizer is on, and each fails at `-O2` only |
+| Address of a string-literal element as a constant | `921019-1`: `(void *)&("X"[0])` in a static initializer |
+| The two divergences above | `991014-1`, `920728-1` |
 
 One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.
 gcc accepts a conditional with one `void` arm as an extension; C17 6.5.15p3

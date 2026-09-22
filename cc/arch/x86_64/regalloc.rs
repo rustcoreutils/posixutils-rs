@@ -961,7 +961,7 @@ impl FrameBase {
     /// made `asm("..." ::: "rbx")` beside an over-aligned array segfault on
     /// code gcc accepts.
     fn of(func: &Function, types: &TypeTable) -> FrameBase {
-        let align = func
+        let local_align = func
             .locals
             .values()
             .map(|local| {
@@ -972,6 +972,22 @@ impl FrameBase {
             })
             .max()
             .unwrap_or(8);
+        // An outgoing argument more aligned than the call boundary needs the
+        // *area* it sits in to start on that alignment, and the area starts at
+        // `%rsp` less the reserved bytes. Only a realigned frame makes `%rsp`
+        // a known multiple of anything above 16, so a call passing such an
+        // argument realigns this function for the same reason an over-aligned
+        // local does. `classify_call_args` rounds the reservation to match.
+        let call_align = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .filter(|insn| matches!(insn.op, Opcode::Call))
+            .flat_map(|insn| insn.arg_types.iter())
+            .map(|t| types.alignment(*t) as i32)
+            .max()
+            .unwrap_or(8);
+        let align = local_align.max(call_align);
         if align <= 16 {
             return FrameBase::Rbp;
         }

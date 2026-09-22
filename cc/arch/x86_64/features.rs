@@ -760,16 +760,20 @@ impl X86_64CodeGen {
             }),
             dst: GpOperand::Reg(Reg::Rax),
         });
-        // An aggregate needing 16-byte alignment starts at a 16-byte boundary.
-        if types.alignment(arg_type) >= 16 {
+        // An over-aligned aggregate starts on *its own* alignment, not on 16.
+        // Rounding to a fixed 16 left a `__attribute__((aligned (32)))`
+        // argument sixteen bytes low, because the caller had placed it at a
+        // 32-byte boundary within an area whose base is 32-byte aligned.
+        let arg_align = (types.alignment(arg_type) as i64).max(8);
+        if arg_align > 8 {
             self.push_lir(X86Inst::Add {
                 size: OperandSize::B64,
-                src: GpOperand::Imm(15),
+                src: GpOperand::Imm(arg_align - 1),
                 dst: Reg::Rax,
             });
             self.push_lir(X86Inst::And {
                 size: OperandSize::B64,
-                src: GpOperand::Imm(-16),
+                src: GpOperand::Imm(-arg_align),
                 dst: Reg::Rax,
             });
         }

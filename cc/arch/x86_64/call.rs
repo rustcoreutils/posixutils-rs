@@ -193,8 +193,18 @@ impl X86_64CodeGen {
             }
         }
 
-        // The call boundary is 16-byte aligned.
-        let stack_bytes = (at + 15) & !15;
+        // The call boundary is 16-byte aligned -- but an argument placed at an
+        // offset that assumes a stronger alignment only lands there if the
+        // *base* of the area is that aligned too. `place` already rounds each
+        // offset within the area; rounding the area's size to the same
+        // alignment is what keeps the base in step, given that the prologue
+        // has made `%rsp` a multiple of it (see `FrameBase::of`).
+        //
+        // Without this, gcc and c17 agreed on the offset of an
+        // `__attribute__((aligned (32)))` argument and disagreed on where the
+        // area began, so the callee read it sixteen bytes out.
+        let area_align = Self::outgoing_area_align(insn, types);
+        let stack_bytes = (at + area_align - 1) & !(area_align - 1);
 
         CallArgInfo {
             stack_arg_indices,
@@ -202,6 +212,19 @@ impl X86_64CodeGen {
             stack_offsets,
             stack_bytes,
         }
+    }
+
+    /// The alignment the outgoing argument area must start on for this call.
+    ///
+    /// Never less than the 16-byte call boundary. An argument type whose
+    /// alignment exceeds that raises it, because `place` measures that
+    /// argument's offset from the area's base and the two only agree if the
+    /// base itself is aligned.
+    pub(super) fn outgoing_area_align(insn: &Instruction, types: &TypeTable) -> i32 {
+        insn.arg_types
+            .iter()
+            .map(|t| types.alignment(*t) as i32)
+            .fold(16, i32::max)
     }
 
     /// Push stack arguments in reverse order (returns number of args pushed)

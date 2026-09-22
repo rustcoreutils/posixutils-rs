@@ -316,6 +316,87 @@ pub fn run_c17(args: &[&str]) -> C17Run {
     }
 }
 
+/// Compile one translation unit with c17 and the other with the system C
+/// compiler, link them together and run the result. Returns the exit status,
+/// or `None` when no system compiler is available.
+///
+/// This is the only shape of test that can see c17 being wrong in the *same
+/// way* on both sides of a call. Three ABI defects found in one day were
+/// invisible to every c17-only test because the caller and the callee shifted
+/// together: a zero-sized argument charged a register on aarch64, an
+/// over-aligned argument placed in an area whose base was not aligned, and
+/// `va_arg` rounding that argument to 16 rather than to its own alignment.
+/// Each passed a c17-built program and failed against gcc.
+///
+/// `which_unit` says which source c17 compiles, so a single pair of units
+/// gives both directions.
+pub fn compile_with_host_cc(name: &str, c17_unit: &str, host_unit: &str) -> Option<i32> {
+    let host_cc = ["cc", "gcc"].into_iter().find(|tool| {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {tool} >/dev/null 2>&1"))
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false)
+    })?;
+
+    let c17_src = create_c_file(&format!("{name}_c17"), c17_unit);
+    let host_src = create_c_file(&format!("{name}_host"), host_unit);
+    let asm = plib::tmp::Builder::new()
+        .prefix(&format!("c17_hostcc_{name}_"))
+        .suffix(".s")
+        .tempfile()
+        .expect("failed to create temp file");
+    let asm_path = asm.path().to_string_lossy().to_string();
+    // A plain path, not a `NamedTempFile`: the handle a temp file keeps open
+    // makes the linked binary "Text file busy" when it is executed. This is
+    // the same reason `compile_and_run_two_units` builds its path by hand.
+    let thread_id = format!("{:?}", std::thread::current().id());
+    let exe_path = std::env::temp_dir()
+        .join(format!(
+            "c17_hostcc_{name}_{}",
+            thread_id.replace(|c: char| !c.is_alphanumeric(), "_")
+        ))
+        .to_string_lossy()
+        .to_string();
+
+    let run = run_c17(&[
+        "-O0",
+        "-S",
+        "-o",
+        &asm_path,
+        &c17_src.path().to_string_lossy(),
+    ]);
+    assert!(
+        run.success,
+        "c17 failed to compile the {name} unit:\n{}",
+        run.stderr
+    );
+
+    let linked = Command::new(host_cc)
+        .arg("-w")
+        .arg("-o")
+        .arg(&exe_path)
+        .arg(&asm_path)
+        .arg(host_src.path())
+        .output()
+        .expect("failed to run the host C compiler");
+    assert!(
+        linked.status.success(),
+        "linking {name} with {host_cc} failed:\n{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+
+    let status = Command::new(&exe_path)
+        .output()
+        .expect("failed to run the linked program")
+        .status
+        .code()
+        .unwrap_or(-1);
+    let _ = std::fs::remove_file(&exe_path);
+    Some(status)
+}
+
 /// Whether an aarch64 program built here can actually be run.
 ///
 /// Needs a cross assembler/linker and a user-mode emulator. Both are present

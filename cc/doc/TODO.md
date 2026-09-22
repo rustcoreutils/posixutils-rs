@@ -244,7 +244,6 @@ byte, as gcc does on both targets._
 | Identifier characters U+FD3E, U+FD3F | Rejected here; GCC's binary accepts them. Ornate parentheses, which ISO C Annex D excludes between its F900-FD3D and FD40-FDCF ranges -- GCC's own `ucnid.tab` does not list them and Clang's table does not either, so the table is followed rather than the binary. See #C158 |
 | Non-NFC identifiers | GCC warns `-Wnormalized=` when an identifier is not in Normalization Form C; c17 is silent. A diagnostic-quality gap, not a conformance one -- both compile the same program |
 | `#__VA_ARGS__` spacing | `V(a , b)` stringifies as `"a, b"`; gcc gives `"a , b"`. The separating comma's own spacing is discarded by the argument splitter. Pinned by `preprocessor_va_args_loses_space_before_a_separator` |
-| Outgoing argument area alignment | A by-value argument whose alignment exceeds 16 is placed at the right *offset* in the outgoing area, but the area's base is only 16-byte aligned. gcc dynamically realigns the caller's stack (`leaq 8(%rsp),%r10; andq $-32,%rsp; ...`) so its base meets the largest stacked argument's alignment. c17's `place` and `IncomingOff::take` already agree with gcc's offsets, so **capping them at 16 would be the wrong fix**. This is what `pr92904` still fails on: isolating its twelve helpers shows only `f8` and `f10` wrong, both on `struct __attribute__((aligned (32))) V`, and deleting that one attribute makes both pass. Fixing it means caller-side realignment on both targets, and interacts with `alloca` and `FrameBase::Aligned` |
 | `max_align_t` | `long double` here (16 bytes), a struct of `long long` + `long double` under gcc (32). Both meet the alignment requirement; `sizeof` differs. Implementation-defined (C17 7.19) |
 
 ## GNU extensions: what c17 will and will not grow
@@ -574,7 +573,7 @@ page.
 external checkout (the suite is GPLv3 and is not vendored) and diffs a recorded
 baseline, so a regression fails rather than shifting a percentage.
 
-`execute/` went from **58.5% to 99.25% of what is attempted** (3059 of 3082
+`execute/` went from **58.5% to 99.32% of what is attempted** (3061 of 3082
 instances; 1986 of 3396 at the start, 1698 tests run at -O0 and -O2) over one
 series: the libc-alias builtins,
 `-fpermissive`, `__complex__`, bare `alloca`, `va_arg` of a small struct,
@@ -591,8 +590,8 @@ One conformance gap found while chasing those and not yet fixed: c17 has no
 C17 6.7.3p2 check, so `restrict int x;` is accepted where gcc errors that
 `restrict` may only qualify a pointer to object type.
 
-**What is left — 4 run failures and 19 compile failures.** Of 3396 instances:
-3059 pass, 314 are skipped and 23 fail. **3059 of 3082 attempted, 99.25%.**
+**What is left — 2 run failures and 19 compile failures.** Of 3396 instances:
+3061 pass, 314 are skipped and 21 fail. **3061 of 3082 attempted, 99.32%.**
 
 ### Out of scope, and so skipped rather than counted
 
@@ -642,13 +641,13 @@ for `(-9 + 38i) / (5 + 6i)` exactly as gcc does.
 
 ### Still open
 
-23 instances across 16 tests, and half of them are one thing.
+21 instances across 15 tests, and half of them are one thing.
 
 | Group | Inst | Note |
 |---|---|---|
 | Dead-call elimination proofs | 11 | `20011115-1`, `20020720-1`, `20030216-1`, `20041114-1`, `compare-3`, `pure-1`, `shiftopt-1` at -O2; `20030330-1` and `medce-1` at **both** levels, because neither has an `#ifndef __OPTIMIZE__` fallback definition and gcc deletes an `if (0)` body in CFG cleanup, which it runs at -O0 too. Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link*. Standard C, and optimizer strength rather than a defect -- building real dead-code and value-range analysis would improve -O2 generally, well beyond these tests |
 | Missing optimizations behind `__OPTIMIZE__` | 2 | `20030125-1`, `builtin-constant`. Same class: the tests only assert them when the optimizer is on, and each fails at `-O2` only |
-| `va_arg` tail | 4 | `stdarg-4` is **not** a `link_error` test, despite living in that group until now: it fails to link with `undefined reference to 'f1i'` because `analyze_all_functions` marks any function containing a `Va*` opcode un-inlinable *above* the `always_inline` check, so a C99 inline definition that merely consumes a `va_list` is never inlined and never emitted. Separately, `pr92904` needs **two** unrelated things: `va_arg` of an `__int128` (no `Int128` arm on either target, so only the low eightbyte moves), and the outgoing-area over-alignment recorded as a divergence above. The second is out of scope, so this test cannot close on the first alone |
+| `va_arg` tail | 2 | `stdarg-4` is **not** a `link_error` test, despite living in that group until now: it fails to link with `undefined reference to 'f1i'` because `analyze_all_functions` marks any function containing a `Va*` opcode un-inlinable *above* the `always_inline` check, so a C99 inline definition that merely consumes a `va_list` is never inlined and never emitted |
 | Address of a string-literal element as a constant | 2 | `921019-1`: `(void *)&("X"[0])` in a static initializer |
 | The two divergences above | 4 | `991014-1`, `920728-1` |
 

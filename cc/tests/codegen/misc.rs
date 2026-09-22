@@ -14,7 +14,7 @@
 use crate::codegen::asm_probe::{asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
 use crate::common::{
     compile_and_dlopen, compile_and_run, compile_and_run_aarch64, compile_and_run_optimized,
-    compile_and_run_two_units, create_c_file,
+    compile_and_run_two_units, compile_with_host_cc, create_c_file,
 };
 use plib::testing::run_test_base;
 use std::io::Write;
@@ -7517,6 +7517,154 @@ int main(void)
         ),
         0
     );
+}
+
+/// An argument more aligned than the call boundary needs the outgoing area's
+/// *base* aligned, not just its offset within the area.
+///
+/// System V AMD64 places such an argument at an offset rounded to its own
+/// alignment, and gcc makes that meaningful by dynamically realigning the
+/// caller's stack so the area starts there too. c17 rounded the offset and
+/// left the base at 16, and `va_arg` rounded the overflow pointer to a fixed
+/// 16 rather than to the argument's alignment -- two errors in the same
+/// direction, so a c17-built program agreed with itself and disagreed with
+/// gcc by sixteen bytes.
+///
+/// That is why the load-bearing half of this test links c17 against the host
+/// compiler in both directions: the behavioural run below passes on the
+/// *unfixed* compiler too.
+#[test]
+fn codegen_over_aligned_argument_area() {
+    let code = r#"
+#include <stdarg.h>
+
+struct __attribute__((aligned (32))) A32 { double a, b, c, d; };
+struct __attribute__((aligned (64))) A64 { long q[4]; };
+struct __attribute__((aligned (16))) A16 { long long a, b; };
+
+__attribute__((noinline)) static int take32(int lead, struct A32 s)
+{
+    return (s.a == 1 && s.b == 2 && s.c == 3 && s.d == 4 && lead == 7) ? 0 : 1;
+}
+
+__attribute__((noinline)) static int take64(int lead, struct A64 s)
+{
+    return (s.q[0] == 5 && s.q[3] == 8 && lead == 7) ? 0 : 1;
+}
+
+/* Seven leading integers push the aggregate past the register file. */
+__attribute__((noinline)) static int spilled32(int a, int b, int c, int d,
+                                               int e, int f, int g,
+                                               struct A32 s, int after)
+{
+    return (s.a == 1 && s.d == 4 && a == 1 && g == 7 && after == 99) ? 0 : 1;
+}
+
+/* `va_arg` rounds the overflow pointer to the argument's own alignment. The
+   leading doubles push it past the SSE file so it really comes off the stack. */
+__attribute__((noinline)) static int va32(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    while (n--) (void)va_arg(ap, double);
+    struct A32 s = va_arg(ap, struct A32);
+    int after = va_arg(ap, int);
+    va_end(ap);
+    return (s.a == 1 && s.b == 2 && s.c == 3 && s.d == 4 && after == 99) ? 0 : 1;
+}
+
+__attribute__((noinline)) static int va64(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    while (n--) (void)va_arg(ap, double);
+    struct A64 s = va_arg(ap, struct A64);
+    int after = va_arg(ap, int);
+    va_end(ap);
+    return (s.q[0] == 5 && s.q[3] == 8 && after == 99) ? 0 : 1;
+}
+
+__attribute__((noinline)) static int mixed(struct A16 p, struct A32 q, int tail)
+{
+    return (p.a == 10 && p.b == 11 && q.a == 1 && q.d == 4 && tail == 55) ? 0 : 1;
+}
+
+int main(void)
+{
+    struct A32 s32 = { 1, 2, 3, 4 };
+    struct A64 s64 = { { 5, 6, 7, 8 } };
+    struct A16 s16 = { 10, 11 };
+
+    if (take32(7, s32)) return 1;
+    if (take64(7, s64)) return 2;
+    if (spilled32(1, 2, 3, 4, 5, 6, 7, s32, 99)) return 3;
+    /* Nine leading doubles is the count that separates rounding to 16 from
+       rounding to the argument's own alignment: with fewer, the two land in
+       the same place and the defect is invisible. */
+    if (va32(0, s32, 99)) return 4;
+    if (va32(1, 1.0, s32, 99)) return 4;
+    if (va32(5, 1.0, 2.0, 3.0, 4.0, 5.0, s32, 99)) return 4;
+    if (va32(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, s32, 99)) return 4;
+    if (va64(0, s64, 99)) return 5;
+    if (va64(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, s64, 99)) return 5;
+    if (mixed(s16, s32, 55)) return 6;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("codegen_over_aligned_arg{opt}"),
+                code,
+                &[opt.to_string()]
+            ),
+            0,
+            "at {opt}"
+        );
+    }
+
+    // The part that actually pins the ABI: one unit from c17, the other from
+    // the host compiler, in both directions.
+    const CALLEE: &str = r#"
+#include <stdarg.h>
+struct __attribute__((aligned (32))) A32 { double a, b, c, d; };
+
+int named(int lead, struct A32 s, int tail)
+{
+    return (lead == 7 && s.a == 1 && s.d == 4 && tail == 9) ? 0 : 1;
+}
+
+int variadic(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    while (n--) (void)va_arg(ap, double);
+    struct A32 s = va_arg(ap, struct A32);
+    int tail = va_arg(ap, int);
+    va_end(ap);
+    return (s.a == 1 && s.d == 4 && tail == 9) ? 0 : 1;
+}
+"#;
+    const CALLER: &str = r#"
+struct __attribute__((aligned (32))) A32 { double a, b, c, d; };
+int named(int lead, struct A32 s, int tail);
+int variadic(int n, ...);
+
+int main(void)
+{
+    struct A32 s = { 1, 2, 3, 4 };
+    if (named(7, s, 9)) return 1;
+    if (variadic(0, s, 9)) return 2;
+    if (variadic(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, s, 9)) return 3;
+    return 0;
+}
+"#;
+    if let Some(status) = compile_with_host_cc("over_aligned_callee", CALLEE, CALLER) {
+        assert_eq!(status, 0, "a host-compiled caller must reach a c17 callee");
+    }
+    if let Some(status) = compile_with_host_cc("over_aligned_caller", CALLER, CALLEE) {
+        assert_eq!(status, 0, "a c17 caller must reach a host-compiled callee");
+    }
 }
 
 /// `va_arg` of an `__int128` reads **two** eightbytes, and the cursor is

@@ -22,6 +22,7 @@
 //
 
 use super::asm_probe::{asm_for, asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
+use crate::common::{aarch64_cross_available, create_c_file, cross_link_and_run, run_c17};
 
 /// AAPCS64 passes a `_Complex` as a two-element HFA, so it occupies **two**
 /// V registers and the next floating-point parameter starts after both.
@@ -1389,6 +1390,191 @@ long v_cx(double _Complex z, ...)
     assert!(
         body.contains(&format!("#{vr}")),
         "__vr_offs must be -96 (two V registers taken):\n{body}"
+    );
+}
+
+/// c17's aarch64 code must agree with **gcc** about the ABI, not merely with
+/// itself.
+///
+/// This links a c17-compiled translation unit against a gcc-compiled one and
+/// runs the result under qemu, in both directions. It is the only shape of
+/// test in this suite that can see a divergence where c17's caller and callee
+/// are wrong in the same way: a zero-sized argument was charged a register by
+/// both, so every c17-only program agreed with itself and every mixed program
+/// read its arguments one register out. Assembly assertions could not settle
+/// it either, because the wrong register is still a plausible one.
+#[test]
+fn codegen_aarch64_agrees_with_gcc_on_zero_sized_arguments() {
+    if !aarch64_cross_available() {
+        eprintln!(
+            "SKIP codegen_aarch64_agrees_with_gcc_on_zero_sized_arguments: \
+             no aarch64 cross toolchain"
+        );
+        return;
+    }
+
+    // Deliberately in separate translation units, so neither compiler can see
+    // the other's idea of the calling convention.
+    let callee_src = r#"
+#include <stdarg.h>
+struct Z { char x[0]; };
+
+int named(int a, struct Z z, int b, int c)
+{
+    (void)z;
+    return a * 100 + b * 10 + c;
+}
+
+int variadic(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    int a = va_arg(ap, int);
+    (void)va_arg(ap, struct Z);
+    int b = va_arg(ap, int);
+    va_end(ap);
+    (void)n;
+    return a * 10 + b;
+}
+"#;
+    let caller_src = r#"
+struct Z { char x[0]; };
+int named(int a, struct Z z, int b, int c);
+int variadic(int n, ...);
+
+int main(void)
+{
+    struct Z z;
+    if (named(1, z, 2, 3) != 123) return 1;
+    if (variadic(0, 4, z, 5) != 45) return 2;
+    return 0;
+}
+"#;
+
+    let callee_c = create_c_file("a64_abi_callee", callee_src);
+    let caller_c = create_c_file("a64_abi_caller", caller_src);
+    let callee_path = callee_c.path().to_string_lossy().to_string();
+    let caller_path = caller_c.path().to_string_lossy().to_string();
+
+    // Compile each side with c17 for aarch64, keeping the .c files so gcc can
+    // compile the same source for the other side of each pair.
+    let mut asm_paths = Vec::new();
+    for (tag, src_path) in [("callee", &callee_path), ("caller", &caller_path)] {
+        let out = plib::tmp::Builder::new()
+            .prefix(&format!("c17_a64_abi_{tag}_"))
+            .suffix(".s")
+            .tempfile()
+            .expect("failed to create temp file");
+        let out_path = out.path().to_string_lossy().to_string();
+        let run = run_c17(&[
+            "--target",
+            "aarch64-unknown-linux-gnu",
+            "-O0",
+            "-S",
+            "-o",
+            &out_path,
+            src_path,
+        ]);
+        assert!(run.success, "c17 failed on the {tag}:\n{}", run.stderr);
+        asm_paths.push((out, out_path));
+    }
+    let callee_asm = asm_paths[0].1.clone();
+    let caller_asm = asm_paths[1].1.clone();
+
+    // gcc on both sides: the reference. If this fails the probe itself is
+    // wrong, and nothing below means anything.
+    assert_eq!(
+        cross_link_and_run("a64_abi_ref", &[&caller_path, &callee_path]),
+        0,
+        "the gcc/gcc reference must pass, or this probe is not testing the ABI"
+    );
+
+    assert_eq!(
+        cross_link_and_run("a64_abi_c17_callee", &[&caller_path, &callee_asm]),
+        0,
+        "a gcc caller must be able to call a c17 callee: c17 charged the \
+         zero-sized argument a register that gcc does not pass"
+    );
+    assert_eq!(
+        cross_link_and_run("a64_abi_c17_caller", &[&caller_asm, &callee_path]),
+        0,
+        "a c17 caller must be able to call a gcc callee: c17 passed the \
+         zero-sized argument in a register gcc does not read"
+    );
+    assert_eq!(
+        cross_link_and_run("a64_abi_c17_both", &[&caller_asm, &callee_asm]),
+        0,
+        "c17 must also agree with itself"
+    );
+}
+
+/// A zero-sized argument takes no register on aarch64, in the caller.
+///
+/// AAPCS64 gives it no class, and `va_arg` skips it. The caller did not, in
+/// *both* of its argument loops, so it charged a general register the callee
+/// never reads and everything after shifted by one. The two errors cancelled
+/// exactly, so c17 agreed with itself and disagreed with gcc -- a divergence
+/// only visible across a translation-unit boundary, which no behavioural test
+/// in this suite can reach. Hence an assembly assertion: the argument after
+/// the zero-sized one must be in `w1`, the register it would have been pushed
+/// out of.
+#[test]
+fn codegen_aarch64_zero_sized_argument_takes_no_register() {
+    let src = r#"
+struct Z { char x[0]; };
+int callee(int n, int a, int b);
+int caller(void)
+{
+    struct Z z;
+    (void)z;
+    return callee(1, 1234, 5678);
+}
+int variadic(int n, ...);
+int caller_va(void)
+{
+    struct Z z;
+    return variadic(1, z, 1234);
+}
+int callee_side(int a, struct Z z, int b)
+{
+    (void)z;
+    return a * 10 + b;
+}
+"#;
+    let asm = asm_for("aarch64_zero_sized_arg", AARCH64_LINUX, src);
+
+    // The control: with no zero-sized argument, 1234 is the second argument
+    // and so lives in w1.
+    let plain = body_of(&asm, "caller");
+    assert!(
+        plain.contains("#1234"),
+        "the control call must materialise 1234:\n{plain}"
+    );
+
+    // With the zero-sized argument first, 1234 is still the *first* argument
+    // that is actually passed after `n`, so it must still be w1 -- not w2.
+    let va = body_of(&asm, "caller_va");
+    let w1 = va.contains("w1, #1234") || va.contains("w1, #1234\n");
+    assert!(
+        w1,
+        "1234 follows a zero-sized argument, which is passed in no register \
+         at all, so it must go in w1:\n{va}"
+    );
+    assert!(
+        !va.contains("w2, #1234"),
+        "the zero-sized argument must not push 1234 into w2:\n{va}"
+    );
+
+    // The callee side of the same rule. `b` follows a zero-sized parameter, so
+    // it arrives in w1; the allocator's catch-all arm charged the zero-sized
+    // one a register and read `b` out of w2 instead. Asserting on which
+    // register a value is *read from* is what distinguishes the two, since w2
+    // is also used as scratch either way.
+    let callee = body_of(&asm, "callee_side");
+    assert!(
+        !callee.contains("mov w1, w2"),
+        "a zero-sized parameter takes no register, so `b` arrives in w1 and \
+         must not be read out of w2:\n{callee}"
     );
 }
 

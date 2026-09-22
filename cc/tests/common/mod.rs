@@ -316,6 +316,103 @@ pub fn run_c17(args: &[&str]) -> C17Run {
     }
 }
 
+/// Whether an aarch64 program built here can actually be run.
+///
+/// Needs a cross assembler/linker and a user-mode emulator. Both are present
+/// on the development machine; CI may not have them, so every caller skips
+/// rather than fails when this is false -- and says so, because a silent skip
+/// is how an unverified backend looks exactly like a verified one.
+pub fn aarch64_cross_available() -> bool {
+    ["aarch64-linux-gnu-gcc", "qemu-aarch64-static"]
+        .iter()
+        .all(|tool| {
+            Command::new("sh")
+                .arg("-c")
+                .arg(format!("command -v {tool} >/dev/null 2>&1"))
+                .status()
+                .map(|st| st.success())
+                .unwrap_or(false)
+        })
+}
+
+/// Compile `content` for linux-aarch64 with c17, assemble and link it with the
+/// cross toolchain, and run it under qemu. Returns the exit status, or `None`
+/// when the cross toolchain is absent.
+///
+/// This exists because `compile_and_run` always targets the host, so an
+/// aarch64-only defect cannot fail a test here at all -- it fails in CI, or
+/// not at all if CI is x86-64 too. Two ABI bugs were found this way that no
+/// host test and no assembly assertion could have caught: c17's aarch64 caller
+/// and callee both charged a zero-sized argument a register, so they agreed
+/// with each other while disagreeing with gcc. Only running c17 code against
+/// gcc-compiled code shows that, which `cross_link_with` below is for.
+pub fn compile_and_run_aarch64(name: &str, content: &str, opt: &str) -> Option<i32> {
+    if !aarch64_cross_available() {
+        eprintln!(
+            "SKIP {name}: no aarch64 cross toolchain (aarch64-linux-gnu-gcc, qemu-aarch64-static)"
+        );
+        return None;
+    }
+    let c_file = create_c_file(name, content);
+    let asm = plib::tmp::Builder::new()
+        .prefix(&format!("c17_a64_{name}_"))
+        .suffix(".s")
+        .tempfile()
+        .expect("failed to create temp file");
+    let asm_path = asm.path().to_string_lossy().to_string();
+
+    let run = run_c17(&[
+        "--target",
+        "aarch64-unknown-linux-gnu",
+        opt,
+        "-S",
+        "-o",
+        &asm_path,
+        &c_file.path().to_string_lossy(),
+    ]);
+    assert!(
+        run.success,
+        "c17 failed to compile {name} for aarch64 at {opt}:\n{}",
+        run.stderr
+    );
+
+    Some(cross_link_and_run(name, &[&asm_path]))
+}
+
+/// Assemble/link the given aarch64 sources (`.c` or `.s`) with the cross
+/// toolchain and run the result under qemu, returning its exit status.
+///
+/// Mixing a c17-produced `.s` with a gcc-compiled `.c` is the point: that is
+/// the only way to test that c17 agrees with gcc about the ABI rather than
+/// merely with itself.
+pub fn cross_link_and_run(name: &str, inputs: &[&str]) -> i32 {
+    let exe = plib::tmp::Builder::new()
+        .prefix(&format!("c17_a64_{name}_"))
+        .suffix(".bin")
+        .tempfile()
+        .expect("failed to create temp file");
+    let exe_path = exe.path().to_string_lossy().to_string();
+
+    let mut link = Command::new("aarch64-linux-gnu-gcc");
+    link.arg("-static").arg("-w").arg("-o").arg(&exe_path);
+    for input in inputs {
+        link.arg(input);
+    }
+    let linked = link.output().expect("failed to run the cross linker");
+    assert!(
+        linked.status.success(),
+        "cross link of {name} failed:\n{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+
+    let run = Command::new("qemu-aarch64-static")
+        .env("QEMU_LD_PREFIX", "/usr/aarch64-linux-gnu")
+        .arg(&exe_path)
+        .output()
+        .expect("failed to run qemu-aarch64-static");
+    run.status.code().unwrap_or(-1)
+}
+
 /// Compile `content` and require it to be **rejected** with a diagnostic
 /// containing `expected`.
 ///

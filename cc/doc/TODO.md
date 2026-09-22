@@ -244,6 +244,7 @@ byte, as gcc does on both targets._
 | Identifier characters U+FD3E, U+FD3F | Rejected here; GCC's binary accepts them. Ornate parentheses, which ISO C Annex D excludes between its F900-FD3D and FD40-FDCF ranges -- GCC's own `ucnid.tab` does not list them and Clang's table does not either, so the table is followed rather than the binary. See #C158 |
 | Non-NFC identifiers | GCC warns `-Wnormalized=` when an identifier is not in Normalization Form C; c17 is silent. A diagnostic-quality gap, not a conformance one -- both compile the same program |
 | `#__VA_ARGS__` spacing | `V(a , b)` stringifies as `"a, b"`; gcc gives `"a , b"`. The separating comma's own spacing is discarded by the argument splitter. Pinned by `preprocessor_va_args_loses_space_before_a_separator` |
+| Outgoing argument area alignment | A by-value argument whose alignment exceeds 16 is placed at the right *offset* in the outgoing area, but the area's base is only 16-byte aligned. gcc dynamically realigns the caller's stack (`leaq 8(%rsp),%r10; andq $-32,%rsp; ...`) so its base meets the largest stacked argument's alignment. c17's caller and callee agree with each other and with gcc's offsets, so this is invisible within c17 and wrong only for an over-aligned argument crossing a translation-unit boundary. Fixing it means caller-side realignment on both targets, and interacts with `alloca` and `FrameBase::Aligned` |
 | `max_align_t` | `long double` here (16 bytes), a struct of `long long` + `long double` under gcc (32). Both meet the alignment requirement; `sizeof` differs. Implementation-defined (C17 7.19) |
 
 ## GNU extensions: what c17 will and will not grow
@@ -573,7 +574,7 @@ page.
 external checkout (the suite is GPLv3 and is not vendored) and diffs a recorded
 baseline, so a regression fails rather than shifting a percentage.
 
-`execute/` went from **58.5% to 99.19% of what is attempted** (3057 of 3082
+`execute/` went from **58.5% to 99.25% of what is attempted** (3059 of 3082
 instances; 1986 of 3396 at the start, 1698 tests run at -O0 and -O2) over one
 series: the libc-alias builtins,
 `-fpermissive`, `__complex__`, bare `alloca`, `va_arg` of a small struct,
@@ -590,8 +591,8 @@ One conformance gap found while chasing those and not yet fixed: c17 has no
 C17 6.7.3p2 check, so `restrict int x;` is accepted where gcc errors that
 `restrict` may only qualify a pointer to object type.
 
-**What is left — 6 run failures and 19 compile failures.** Of 3396 instances:
-3057 pass, 314 are skipped and 25 fail. **3057 of 3082 attempted, 99.19%.**
+**What is left — 4 run failures and 19 compile failures.** Of 3396 instances:
+3059 pass, 314 are skipped and 23 fail. **3059 of 3082 attempted, 99.25%.**
 
 ### Out of scope, and so skipped rather than counted
 
@@ -641,13 +642,13 @@ for `(-9 + 38i) / (5 + 6i)` exactly as gcc does.
 
 ### Still open
 
-25 instances across 17 tests, and half of them are one thing.
+23 instances across 16 tests, and half of them are one thing.
 
 | Group | Inst | Note |
 |---|---|---|
 | Dead-call elimination proofs | 13 | `20011115-1`, `20020720-1`, `20030216-1`, `20030330-1`, `20041114-1`, `compare-3`, `medce-1`, `pure-1`, `shiftopt-1`, `stdarg-4`. Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link* at -O2 only. Standard C, and optimizer strength rather than a defect -- building real dead-code and value-range analysis would improve -O2 generally, well beyond these tests |
 | Missing optimizations behind `__OPTIMIZE__` | 2 | `20030125-1`, `builtin-constant`. Same class: the tests only assert them when the optimizer is on, and each fails at `-O2` only |
-| `va_arg` tail | 4 | `pr92904` (`__int128`), `va-arg-22` (a zero-sized struct among 21 sizes). Real ABI work on both targets |
+| `va_arg` tail | 2 | `pr92904`. Not `__int128` alone: with the `__int128` halves removed the test still aborts, so a struct shape is wrong too -- reproduced outside the suite as a 16-byte INTEGER+INTEGER `va_arg` that is wrong at `-O0` and right at `-O2` |
 | Address of a string-literal element as a constant | 2 | `921019-1`: `(void *)&("X"[0])` in a static initializer |
 | The two divergences above | 4 | `991014-1`, `920728-1` |
 

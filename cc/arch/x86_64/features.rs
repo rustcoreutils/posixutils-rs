@@ -657,6 +657,22 @@ impl X86_64CodeGen {
         };
 
         let arg_type = insn.typ.unwrap_or(types.int_id);
+        // A zero-sized argument was never passed, so there is nothing to read
+        // and nothing to step over.
+        //
+        // System V AMD64 psABI 3.2.3 gives such a type no class and no
+        // eightbytes, and the call site already agrees -- `param_is_ignored`
+        // is what puts it in `ignored_arg_indices` there. Asking the same
+        // predicate here is what keeps the two sides in step: the aggregate
+        // path below rounds `size_bytes` up to one and folds `ArgClass::Ignore`
+        // into the same empty class vector as MEMORY, so it took the overflow
+        // path, copied a byte the object does not own, and advanced
+        // `overflow_arg_area` by eight -- putting every later `va_arg` in the
+        // list eight bytes out.
+        if crate::abi::param_is_ignored(arg_type, types) {
+            return;
+        }
+
         let arg_size = types.size_bits(arg_type).max(32);
         let arg_bytes = (arg_size / 8).max(8) as i32;
 

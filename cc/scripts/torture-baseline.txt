@@ -3005,6 +3005,8 @@ va-arg-20@-O0
 va-arg-20@-O2
 va-arg-21@-O0
 va-arg-21@-O2
+va-arg-22@-O0
+va-arg-22@-O2
 va-arg-23@-O0
 va-arg-23@-O2
 va-arg-24@-O0

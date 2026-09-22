@@ -1545,6 +1545,14 @@ impl RegAlloc {
                     }
                     int_arg_idx += 2;
                 }
+                // A zero-sized parameter is not passed at all -- AAPCS64
+                // gives it no class, which is what `Ignore` records, and the
+                // call site skips it. Without this arm it fell into the
+                // catch-all below and was charged a general register, so
+                // every later parameter read one register too high. Both
+                // sides were wrong together, so only a gcc-compiled caller
+                // could show it.
+                ArgClass::Ignore => {}
                 // Integer / pointer / extension / mixed aggregate /
                 // HFA-or-Indirect-falling-through: all default to a
                 // single GP register or 8-byte stack slot. This matches

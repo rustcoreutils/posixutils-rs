@@ -120,6 +120,11 @@ impl Aarch64CodeGen {
 
         for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
             let arg_type = insn.arg_types.get(i).copied();
+
+            if self.arg_is_ignored(arg_type, types) {
+                continue;
+            }
+
             let is_fp = if let Some(typ) = arg_type {
                 types.is_float(typ)
             } else {
@@ -347,6 +352,22 @@ impl Aarch64CodeGen {
         (aligned_bytes + 15) / 16
     }
 
+    /// Whether an argument is not passed at all.
+    ///
+    /// AAPCS64 gives a zero-sized type no class, which is what
+    /// `ArgClass::Ignore` records. Every site that walks arguments must ask:
+    /// both loops in this file, `emit_va_arg` in `features.rs`, and the
+    /// callee's own allocator. One of them missing it charges the argument a
+    /// register the other side does not pass, and every later argument shifts
+    /// by one -- invisible within c17, because both sides shifted together,
+    /// and wrong against a gcc-compiled translation unit.
+    pub(super) fn arg_is_ignored(&self, arg_type: Option<TypeId>, types: &TypeTable) -> bool {
+        arg_type.is_some_and(|t| {
+            let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+            matches!(abi.classify_param(t, types), ArgClass::Ignore)
+        })
+    }
+
     /// Assign each argument to its AAPCS64 register, returning the ones that
     /// did not fit and must travel on the stack, in parameter order.
     fn assign_arg_registers(
@@ -363,6 +384,9 @@ impl Aarch64CodeGen {
 
         for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
             let arg_type = insn.arg_types.get(i).copied();
+            if self.arg_is_ignored(arg_type, types) {
+                continue;
+            }
             let is_complex = arg_type.is_some_and(|t| types.is_complex_float(t));
             // Every HFA, one element through four, goes out in V registers.
             // The exception is a single element small enough to sit in one

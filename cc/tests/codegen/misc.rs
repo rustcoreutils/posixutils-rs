@@ -13,8 +13,8 @@
 
 use crate::codegen::asm_probe::{asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
 use crate::common::{
-    compile_and_dlopen, compile_and_run, compile_and_run_optimized, compile_and_run_two_units,
-    create_c_file,
+    compile_and_dlopen, compile_and_run, compile_and_run_aarch64, compile_and_run_optimized,
+    compile_and_run_two_units, create_c_file,
 };
 use plib::testing::run_test_base;
 use std::io::Write;
@@ -7517,6 +7517,85 @@ int main(void)
         ),
         0
     );
+}
+
+/// A zero-sized argument is not passed, so neither side may charge it a slot.
+///
+/// System V AMD64 psABI 3.2.3 and AAPCS64 both give such a type no class --
+/// `ArgClass::Ignore` -- and the call site already skipped it. `va_arg` did
+/// not: it rounded the size up to one byte, folded `Ignore` into the same
+/// empty class vector as MEMORY, took the overflow path, copied a byte the
+/// object does not own and advanced the cursor by eight, so every later
+/// argument in the list came out eight bytes low.
+///
+/// On aarch64 the *caller* had the mirror of the same bug, in both of its
+/// argument loops, and the two errors cancelled: c17 talking to c17 agreed
+/// with itself while disagreeing with gcc, which is why only a cross-compiler
+/// probe found it. Reading arguments both before and after the zero-sized one
+/// is what makes a one-slot shift visible here.
+#[test]
+fn codegen_zero_sized_variadic_argument_consumes_no_slot() {
+    let code = r#"
+#include <stdarg.h>
+
+struct Z  { char x[0]; };
+struct Z2 { };
+
+__attribute__((noinline)) static long mixed(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    long acc = 0;
+    acc = acc * 10 + va_arg(ap, int);       /* before */
+    (void)va_arg(ap, struct Z);             /* nothing at all */
+    acc = acc * 10 + va_arg(ap, int);       /* after */
+    (void)va_arg(ap, struct Z2);
+    acc = acc * 10 + va_arg(ap, long);
+    va_end(ap);
+    (void)n;
+    return acc;
+}
+
+/* Enough leading arguments that the ones after the zero-sized member are past
+   the register file and read from the overflow area instead. */
+__attribute__((noinline)) static long spilled(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    long acc = 0;
+    for (int i = 0; i < 6; i++) acc = acc * 10 + va_arg(ap, int);
+    (void)va_arg(ap, struct Z);
+    acc = acc * 10 + va_arg(ap, int);
+    va_end(ap);
+    (void)n;
+    return acc;
+}
+
+int main(void)
+{
+    struct Z  z;
+    struct Z2 z2;
+
+    if (mixed(0, 1, z, 2, z2, 3L) != 123) return 1;
+    if (spilled(0, 1, 2, 3, 4, 5, 6, z, 7) != 1234567) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_va_arg_zero_sized", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("codegen_va_arg_zero_sized_o2", code, &["-O2".to_string()]),
+        0
+    );
+
+    // Run the same program on aarch64 under qemu. `compile_and_run` always
+    // targets the host, so without this the aarch64 half of the fix -- which
+    // was two separate sites there -- is asserted by nothing that executes.
+    for opt in ["-O0", "-O2"] {
+        if let Some(status) = compile_and_run_aarch64("codegen_va_arg_zero_sized_a64", code, opt) {
+            assert_eq!(status, 0, "aarch64 at {opt}");
+        }
+    }
 }
 
 /// A local whose alignment exceeds the stack's own forces the frame to be

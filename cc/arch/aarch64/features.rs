@@ -215,6 +215,17 @@ impl Aarch64CodeGen {
         };
 
         let arg_type = insn.typ.unwrap_or(types.int_id);
+
+        // A zero-sized argument was never passed, so there is nothing to read
+        // and no slot to step over. Asking the same predicate the call site
+        // asks is what keeps the two in step: without this, `VaAggKind::of`'s
+        // `bytes.max(1)` below turned it into `Gp { qwords: 1 }` and it
+        // consumed a whole general slot, putting every later `va_arg` in the
+        // list eight bytes out.
+        if self.arg_is_ignored(Some(arg_type), types) {
+            return;
+        }
+
         let type_bits = types.size_bits(arg_type);
         let is_fp = types.is_float(arg_type);
         // An HFA arrives in the SIMD registers, so it is read out of *their*

@@ -966,3 +966,63 @@ int main(void) {
         0
     );
 }
+
+/// The **value** of a complex assignment.
+///
+/// `c = a` was fine as a statement and `if (c = a)` segfaulted. C17 6.5.16p3
+/// makes the value of an assignment the value of the left operand after the
+/// store, and a complex object travels by *address* — so the branch returned
+/// the real part's value where every consumer expected a pointer.
+///
+/// The real-to-complex branch a few lines above already returned the address;
+/// only the complex-to-complex one did not, which is why the statement form
+/// worked and no test caught it. A comment said "return real part as the
+/// result value", so it was deliberate and wrong rather than an oversight.
+#[test]
+fn c99_complex_assignment_yields_the_object() {
+    let code = r#"
+int main(void) {
+    _Complex double a = 3.0 + 4.0i;
+    _Complex double b, c;
+
+    /* Used as a condition — the shape that segfaulted. */
+    { _Complex double z = 0.0; _Complex double w;
+      if (w = z) return 1; }
+    { _Complex double z = 1.0; _Complex double w;
+      if (!(w = z)) return 2; }
+    { _Complex double z = 0.0 + 5.0i; _Complex double w;
+      if (!(w = z)) return 3; }   /* a zero real part is still non-zero */
+
+    /* Used as a value. */
+    if (__real__ (c = a) != 3.0) return 4;
+    if (__imag__ (c = a) != 4.0) return 5;
+    if ((c = a) != a) return 6;
+    if (((c = a) ? 1 : 0) != 1) return 7;
+
+    /* Chained, which needs the inner assignment's value to be usable. */
+    b = c = a;
+    if (__real__ b != 3.0 || __imag__ b != 4.0) return 8;
+    if (__real__ c != 3.0 || __imag__ c != 4.0) return 9;
+
+    /* Across precisions, in both directions. */
+    { _Complex float f; _Complex double d = (f = 5.0f + 6.0fi);
+      if (__real__ d != 5.0 || __imag__ d != 6.0) return 10; }
+    { _Complex double d; _Complex float f = (d = 7.0 + 8.0i);
+      if (__real__ f != 7.0f || __imag__ f != 8.0f) return 11; }
+
+    /* Assigning a real still converts, and its value is usable too. */
+    { _Complex double z; if (__real__ (z = 2.0) != 2.0) return 12;
+      if (__imag__ (z = 2.0) != 0.0) return 13; }
+
+    /* And the statement form, which always worked, must keep working. */
+    c = a;
+    if (__real__ c != 3.0 || __imag__ c != 4.0) return 14;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_complex_assign_value", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_complex_assign_value_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

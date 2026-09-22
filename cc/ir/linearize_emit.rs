@@ -1948,7 +1948,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                 dst_size,
             ));
 
-            return real; // Return real part as the result value
+            // The value of the assignment is the object assigned to, and a
+            // complex object travels by *address* -- as the real-to-complex
+            // branch above already returns. Handing back the real part's value
+            // gave every consumer a `double` where a pointer belongs, so
+            // `c = a` was fine as a statement and `if (c = a)` segfaulted.
+            return target_addr;
         }
 
         // For struct/union assignment, do a block copy via addresses.

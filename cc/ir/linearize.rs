@@ -207,6 +207,22 @@ pub(crate) struct VlaMark {
     pub(crate) continue_depth: usize,
 }
 
+/// A forward `goto` whose VLA restore is decided once its label is placed.
+///
+/// `marks` is the mark stack as it stood at the jump, so the restore can name
+/// whichever scope the label turns out to sit in: `marks[label_depth]` is the
+/// stack pointer captured on entry to the outermost scope the jump leaves.
+pub struct PendingGotoVla {
+    /// The label jumped to.
+    pub label: String,
+    /// The block the branch was emitted into.
+    pub bb: BasicBlockId,
+    /// Where in that block the branch sits; the restore goes just before it.
+    pub at: usize,
+    /// The marks in force at the jump, outermost first.
+    pub marks: Vec<PseudoId>,
+}
+
 pub struct Linearizer<'a> {
     /// The module being built
     pub(crate) module: Module,
@@ -282,6 +298,15 @@ pub struct Linearizer<'a> {
     /// Only labels in a function that declares a VLA appear here, so nothing
     /// is recorded for the ordinary case.
     pub(crate) label_vla_depth: std::collections::HashMap<String, usize>,
+    /// Forward `goto`s that may be leaving a VLA's scope, to be resolved once
+    /// every label's depth is known.
+    ///
+    /// A forward jump's target has not been linearized yet, so whether it is
+    /// still inside the scope of the VLAs in force -- which C17 6.8.6.1p1
+    /// allows, `{ char v[n]; if (x) goto done; done: use(v); }` -- or outside
+    /// it cannot be decided at the jump. The two need different code, and one
+    /// of them needs none, so the decision waits.
+    pub(crate) pending_goto_vla: Vec<PendingGotoVla>,
     /// The stack pointer captured on entry to each open block that declares a
     /// VLA, with the `break_targets` and `continue_targets` depths at which
     /// it was captured.
@@ -369,6 +394,7 @@ impl<'a> Linearizer<'a> {
             label_addr_refs: Vec::new(),
             defined_labels: std::collections::HashSet::new(),
             label_vla_depth: std::collections::HashMap::new(),
+            pending_goto_vla: Vec::new(),
             vla_marks: Vec::new(),
             func_has_vla: false,
             indirect_dispatch: None,
@@ -1052,6 +1078,7 @@ impl<'a> Linearizer<'a> {
         self.label_addr_refs.clear();
         self.defined_labels.clear();
         self.label_vla_depth.clear();
+        self.pending_goto_vla.clear();
         self.vla_marks.clear();
         self.func_has_vla = Self::declares_vla(&func.body);
         self.indirect_dispatch = None;
@@ -1430,6 +1457,11 @@ impl<'a> Linearizer<'a> {
         // The address-taken set is complete only now, so the dispatch block's
         // successors are linked here rather than at each computed goto.
         self.finish_indirect_dispatch();
+
+        // Same reason: a label's depth is known only once it has been placed,
+        // so a forward `goto` learns only here whether it left a VLA's scope.
+        // Before SSA, which has to see the restore.
+        self.resolve_forward_goto_vla_restores();
 
         // Ensure function ends with a return
         if !self.is_terminated() {

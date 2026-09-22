@@ -734,6 +734,17 @@ impl<'a> Linearizer<'a> {
     /// very library calls the arithmetic depends on.
     fn returns_via_hidden_pointer(&self, typ: TypeId) -> bool {
         let kind = self.types.kind(typ);
+        // A GNU complex integer over two eightbytes does: `_Complex __int128`
+        // is thirty-two bytes and comes back through the hidden pointer, the
+        // same as any other MEMORY-class object. Its floating cousins do not,
+        // which is why this asks the classifier rather than the size.
+        if self.types.is_complex_integer(typ) {
+            let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+            return matches!(
+                abi.classify_return(typ, self.types),
+                crate::abi::ArgClass::Indirect { .. }
+            );
+        }
         if kind != TypeKind::Struct && kind != TypeKind::Union {
             // Scalars and `_Complex` never do, which is what keeps the
             // `long double _Complex` guarantee above local and testable.
@@ -3117,6 +3128,23 @@ impl<'a> Linearizer<'a> {
                 let pt = bool_param_for_complex_arg.unwrap();
                 arg_types_vec.push(pt);
                 self.emit_complex_nonzero(a)
+            } else if let Some(pt) = formal_param_types
+                .as_ref()
+                .and_then(|params| params.get(arg_idx).copied())
+                .filter(|pt| self.types.is_complex(*pt) && !self.types.is_complex(arg_type))
+            {
+                // A *real* argument bound to a complex parameter. C17
+                // 6.5.2.2p2 converts it as if by assignment, and 6.3.1.7p1
+                // gives the imaginary half a zero -- so the callee is handed a
+                // complex object, by address, like any other complex argument.
+                //
+                // The arm below keys on the *argument's* type, so this case
+                // reached the ordinary scalar path and the raw value was
+                // passed where an address was expected: `f(7)` with a
+                // `_Complex double` parameter arrived as garbage, and with a
+                // `_Complex int` one the callee dereferenced the number 7.
+                arg_types_vec.push(pt);
+                self.promote_real_to_complex(a, pt)
             } else if self.types.is_complex(arg_type) {
                 // Complex types: pass address, codegen loads real/imag into XMM registers
                 // Type stays as complex (not pointer) so codegen knows it's complex.
@@ -3735,11 +3763,17 @@ impl<'a> Linearizer<'a> {
         }
 
         // A complex value travels by address, so the scalar path below would
-        // negate the address rather than the number it points at.
-        if op == UnaryOp::Neg {
+        // negate the address rather than the number it points at. `~` is the
+        // GNU spelling of the conjugate, which negates only the imaginary
+        // half; both halves are already in the same place.
+        if op == UnaryOp::Neg || op == UnaryOp::BitNot {
             let typ = self.expr_type(expr);
             if self.types.is_complex(typ) {
-                return self.emit_complex_negate(operand, typ);
+                return if op == UnaryOp::Neg {
+                    self.emit_complex_negate(operand, typ)
+                } else {
+                    self.emit_complex_conjugate(operand, typ)
+                };
             }
         }
 

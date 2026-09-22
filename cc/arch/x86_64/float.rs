@@ -34,7 +34,7 @@ impl X86_64CodeGen {
     /// else is decided by the type.
     pub(super) fn fp_format(&self, typ: Option<TypeId>, size: u32, types: &TypeTable) -> FpSize {
         let width = Self::size_from_type(typ, size, types);
-        if typ.is_some_and(|t| types.is_complex(t)) {
+        if typ.is_some_and(|t| types.is_complex_float(t)) {
             return FpSize::from_bits(width, &self.base.target);
         }
         FpSize::from_type_or_bits(typ, width, types, &self.base.target)

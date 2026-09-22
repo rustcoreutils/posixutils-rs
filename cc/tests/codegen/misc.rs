@@ -10883,3 +10883,157 @@ int main(void) {
         );
     }
 }
+
+/// A GNU complex integer's argument and return ABI, including every overflow
+/// case.
+///
+/// A complex type carries its *base's* kind, so `_Complex long` satisfied
+/// `is_integer` and was handed a single register for a sixteen-byte value,
+/// while `_Complex signed char` reached the sub-32-bit path and was
+/// sign-extended -- which overwrites the imaginary half with a copy of the
+/// real one's sign. The backends' `is_complex` tests all meant "arrives in
+/// SSE/V registers", which a complex integer does not.
+///
+/// The overflow cases are separate bugs again: a stacked complex value's
+/// address is sometimes spilled to a slot, and the outgoing copy took the
+/// address *of the slot* rather than loading the pointer out of it, so the
+/// callee received a pointer's bytes.
+#[test]
+fn codegen_complex_integer_abi() {
+    let code = r#"
+_Complex signed char cc_id(_Complex signed char x) { return x; }
+_Complex short cs_add(_Complex short a, _Complex short b) { return a + b; }
+
+/* Past the general-register file, one and two registers wide. */
+_Complex int one_reg(long a, long b, long c, long d, long e, long f, long g,
+                     long h, _Complex int p) { return p; }
+_Complex long two_reg(long a, long b, long c, long d, long e, long f, long g,
+                      long h, _Complex long p) { return p; }
+/* Three stacked complex integers in a row: the second's width decides where
+   the third lands, so a wrong slot size shows up only here. */
+_Complex int three(long a, long b, long c, long d, long e, long f, long g,
+                   long h, _Complex int p, _Complex long q, _Complex int r) {
+    return p + (_Complex int)q + r;
+}
+/* Mixed with the floating file, so both register counters advance right. */
+_Complex long mixed(double x, _Complex int a, double y, _Complex long b) {
+    return b + (_Complex long)a + (long)x + (long)y;
+}
+/* A complex integer behind a complex double, which takes V/XMM registers. */
+_Complex int after_cd(_Complex double z, _Complex int a) {
+    return a + (int)__real__ z;
+}
+
+int main(void) {
+    _Complex signed char a;
+    __real__ a = 3; __imag__ a = -4;
+    _Complex signed char b = cc_id(a);
+    if (__real__ b != 3 || __imag__ b != -4) return 1;
+
+    _Complex short p, q;
+    __real__ p = 300; __imag__ p = 400;
+    __real__ q = 1;   __imag__ q = 2;
+    _Complex short s = cs_add(p, q);
+    if (__real__ s != 301 || __imag__ s != 402) return 2;
+
+    _Complex int ci, cr;
+    _Complex long cl;
+    __real__ ci = 1;   __imag__ ci = 2;
+    __real__ cl = 10;  __imag__ cl = 20;
+    __real__ cr = 100; __imag__ cr = 200;
+
+    _Complex int o = one_reg(1, 2, 3, 4, 5, 6, 7, 8, ci);
+    if (__real__ o != 1 || __imag__ o != 2) return 3;
+
+    _Complex long t = two_reg(1, 2, 3, 4, 5, 6, 7, 8, cl);
+    if (__real__ t != 10 || __imag__ t != 20) return 4;
+
+    _Complex int th = three(1, 2, 3, 4, 5, 6, 7, 8, ci, cl, cr);
+    if (__real__ th != 111 || __imag__ th != 222) return 5;
+
+    _Complex long ml = mixed(2.0, ci, 3.0, cl);
+    if (__real__ ml != 10 + 1 + 2 + 3) return 6;
+    if (__imag__ ml != 20 + 2) return 7;
+
+    _Complex double cd;
+    __real__ cd = 7.0; __imag__ cd = 8.0;
+    _Complex int ac = after_cd(cd, ci);
+    if (__real__ ac != 8 || __imag__ ac != 2) return 8;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cg_complex_int_abi", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("cg_complex_int_abi_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// `_Complex __int128` is thirty-two bytes: MEMORY class, returned through
+/// the hidden pointer.
+///
+/// Both predicates that decide this -- `param_is_memory_class` and
+/// `returns_via_hidden_pointer` -- tested the type's *kind* and so excluded
+/// every complex type, and the `kind == Int128` arms then claimed it and gave
+/// a thirty-two-byte value two general registers.
+///
+/// Its arithmetic also uncovered a 128-bit load that had nothing to do with
+/// complex types: the lowering treated any `Loc::Stack` address operand as
+/// though the slot *were* the value, so reading through an `Alloca` result --
+/// a pointer in a slot -- copied the pointer's own bits as the low half.
+#[test]
+fn codegen_complex_int128_memory_class() {
+    let code = r#"
+_Complex __int128 id128(_Complex __int128 x) { return x; }
+/* An sret return together with a stacked argument, at several register
+   pressures: the hidden pointer takes a register the arguments then cannot. */
+_Complex __int128 add0(_Complex __int128 z) { return z; }
+_Complex __int128 add1(long a, _Complex __int128 z) { return z + (__int128)a; }
+_Complex __int128 add5(long a, long b, long c, long d, long e,
+                       _Complex __int128 z) { return z + (__int128)(a + e); }
+_Complex __int128 add8(long a, long b, long c, long d, long e, long f, long g,
+                       long h, _Complex __int128 z) {
+    return z + (__int128)(a + h);
+}
+/* Reading a half of a stacked one, with no complex arithmetic at all. */
+int real_of(long a, long b, long c, long d, long e, long f, long g, long h,
+            _Complex __int128 z) {
+    return (int)(__real__ z >> 70) + (int)(__imag__ z >> 65) + (int)(a + h);
+}
+
+static int check(_Complex __int128 v, __int128 want_re, __int128 want_im) {
+    return __real__ v == want_re && __imag__ v == want_im;
+}
+
+int main(void) {
+    if (sizeof(_Complex __int128) != 32) return 1;
+
+    _Complex __int128 z;
+    __real__ z = (__int128)1 << 90;
+    __imag__ z = (__int128)3 << 80;
+
+    /* Reading the halves of a local, with no call involved. */
+    if (__real__ z != ((__int128)1 << 90)) return 2;
+    if (__imag__ z != ((__int128)3 << 80)) return 3;
+
+    if (!check(id128(z), (__int128)1 << 90, (__int128)3 << 80)) return 4;
+    if (!check(add0(z), (__int128)1 << 90, (__int128)3 << 80)) return 5;
+    if (!check(add1(3, z), ((__int128)1 << 90) + 3, (__int128)3 << 80)) return 6;
+    if (!check(add5(1, 2, 3, 4, 5, z), ((__int128)1 << 90) + 6,
+               (__int128)3 << 80)) return 7;
+    if (!check(add8(1, 2, 3, 4, 5, 6, 7, 8, z), ((__int128)1 << 90) + 9,
+               (__int128)3 << 80)) return 8;
+
+    _Complex __int128 w;
+    __real__ w = (__int128)5 << 70;
+    __imag__ w = (__int128)7 << 65;
+    if (real_of(1, 2, 3, 4, 5, 6, 7, 8, w) != 5 + 7 + 9) return 9;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cg_complex_int128_mem", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("cg_complex_int128_mem_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

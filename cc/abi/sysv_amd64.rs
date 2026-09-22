@@ -44,6 +44,17 @@ pub struct SysVAmd64Abi;
 /// each is what let the small cases pass a pointer where gcc passes bytes.
 pub fn param_is_memory_class(typ: TypeId, types: &TypeTable) -> bool {
     let kind = types.kind(typ);
+    // A GNU complex integer wider than two eightbytes -- `_Complex __int128`
+    // is thirty-two bytes -- is MEMORY class like any other oversized object.
+    // The kind test alone cannot see it, because a complex type carries its
+    // base's kind, and it was then given a general register holding its
+    // address.
+    if types.is_complex_integer(typ) {
+        return matches!(
+            SysVAmd64Abi::new().classify_param(typ, types),
+            ArgClass::Indirect { .. }
+        );
+    }
     (kind == TypeKind::Struct || kind == TypeKind::Union)
         && matches!(
             SysVAmd64Abi::new().classify_param(typ, types),
@@ -65,6 +76,17 @@ pub fn param_is_memory_class(typ: TypeId, types: &TypeTable) -> bool {
 pub fn struct_param_classes(typ: TypeId, types: &TypeTable) -> Option<Vec<RegClass>> {
     let kind = types.kind(typ);
     let bits = types.size_bits(typ);
+    // A GNU complex integer answers here at *every* register-passable size,
+    // including eight bytes and under. A struct that small holds its value in
+    // the argument pseudo and moves with an ordinary register move, but a
+    // complex value is always addressed, so even the one-register form needs
+    // the load-from-address walk this describes.
+    if types.is_complex_integer(typ) {
+        return match SysVAmd64Abi::new().classify_param(typ, types) {
+            ArgClass::Direct { classes, .. } => Some(classes),
+            _ => None,
+        };
+    }
     if (kind != TypeKind::Struct && kind != TypeKind::Union)
         || types.is_complex(typ)
         || bits <= 64
@@ -142,6 +164,33 @@ fn sole_scalar_content(ty: TypeId, types: &TypeTable) -> Option<TypeId> {
     };
     // An over-aligned or padded wrapper is not the scalar; it is bigger.
     (types.size_bits(ty) == types.size_bits(inner)).then_some(inner)
+}
+
+/// A GNU complex integer's argument or return class.
+///
+/// §3.2.3 has no special case for these: the object is classified by its
+/// eightbytes like any other, and every eightbyte of an integer pair is
+/// INTEGER. So `_Complex int` (8 bytes) travels in one general register,
+/// `_Complex long` (16 bytes) in two, and `_Complex __int128` (32 bytes) in
+/// memory.
+///
+/// This has to be asked *before* the plain-integer paths, because a complex
+/// type carries the `Int`/`Long` kind of its base: `_Complex long` reached
+/// `is_integer` and was given a single register for a sixteen-byte value, and
+/// `_Complex char` reached the sub-32-bit path and was sign-extended, which
+/// overwrites the imaginary half with a copy of the real one's sign.
+fn classify_complex_integer(size_bits: u32) -> ArgClass {
+    if size_bits > 128 {
+        return ArgClass::Indirect {
+            align: 16,
+            size_bits,
+        };
+    }
+    let regs = size_bits.div_ceil(64) as usize;
+    ArgClass::Direct {
+        classes: vec![RegClass::Integer; regs],
+        size_bits,
+    }
 }
 
 impl SysVAmd64Abi {
@@ -346,6 +395,12 @@ impl Abi for SysVAmd64Abi {
             return ArgClass::Ignore;
         }
 
+        // Complex integers, before any integer path: see
+        // `classify_complex_integer`.
+        if types.is_complex_integer(ty) {
+            return classify_complex_integer(size_bits);
+        }
+
         // Integer types smaller than 32 bits need extension
         if is_integer(kind) && size_bits < 32 {
             // Check if type is unsigned
@@ -461,6 +516,12 @@ impl Abi for SysVAmd64Abi {
         // Void return
         if kind == TypeKind::Void {
             return ArgClass::Ignore;
+        }
+
+        // Complex integers, before any integer path: see
+        // `classify_complex_integer`.
+        if types.is_complex_integer(ty) {
+            return classify_complex_integer(size_bits);
         }
 
         // 128-bit integer types: return in RAX+RDX

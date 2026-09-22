@@ -147,6 +147,33 @@ body: `double _Complex g = 1.0 + 2.0*I;` and `CMPLX(3.0, 4.0)` both work, at
 every precision. (This entry used to record the opposite as a limit; that was
 fixed by `#C11` and the note outlived it.)
 
+The complex *integer* types are supported as well -- `_Complex int`,
+`_Complex long`, `_Complex unsigned char` and the rest, a GNU extension. They
+behave as two integers laid end to end: `sizeof` is twice the base, the halves
+align to the base, and each half wraps at its own width. Multiply and divide
+are open-coded rather than routed through `__mulsc3`/`__divsc3`, which exist
+only for the floating formats and whose infinity recovery has no meaning for a
+type that wraps. Imaginary constants may be integers too -- `2i` is a
+`_Complex int` -- and `~z` is the conjugate for every complex type, floating
+and integer alike, which is what gcc gives `~` on a complex operand.
+
+`_Complex __int128` is thirty-two bytes and so travels in memory and returns
+through the hidden pointer, on both targets.
+
+Division uses **Smith's method**, matching gcc, rather than the textbook
+formula `((ac + bd) + (bc - ad)i) / (c*c + d*d)`. The textbook form is exact
+but overflows: `(4000000000u + 0i) / (2u + 0i)` needs `a * c` to hold 8e9,
+which a 32-bit half cannot, and the quotient comes out 926258176. Smith's
+method divides through by the larger half first, so the products stay near the
+magnitude of the operands.
+
+The cost is a branch and a truncation. Each step truncates toward zero, as any
+integer division does, so `(-9 + 38i) / (5 + 6i)` is `6 + 1i` where the exact
+quotient is `3 + 4i` -- gcc answers the same, because it is the same
+algorithm. The standard specifies nothing here (the whole type is an
+extension), so gcc's behaviour is the only available definition, and matching
+it is the point.
+
 ## Checked Arithmetic
 
 C23 spells the generic three as `ckd_add`, `ckd_sub` and `ckd_mul`. Each

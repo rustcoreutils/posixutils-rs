@@ -565,20 +565,20 @@ page.
 external checkout (the suite is GPLv3 and is not vendored) and diffs a recorded
 baseline, so a regression fails rather than shifting a percentage.
 
-`execute/` went from **58.5% to 87.3%** (1986 -> 2966 of 3396 test-instances,
+`execute/` went from **58.5% to 88.5%** (1986 -> 3005 of 3396 test-instances,
 1698 tests at -O0 and -O2) over one series: the libc-alias builtins,
 `-fpermissive`, `__complex__`, bare `alloca`, `va_arg` of a small struct,
 bit-field assignment values and promotion, binary128 variadic arguments,
 `__builtin_classify_type`, `creal`/`cimag`/`conj`, the `*_overflow_p` family,
-`#pragma push_macro`, `__builtin_prefetch`'s argument, and enumeration
-constants' type.
+`#pragma push_macro`, `__builtin_prefetch`'s argument, enumeration constants'
+type, and GNU complex integers.
 
 What is left, at -O0 — 35 run failures and 68 compile failures:
 
 | Group | Count | Note |
 |---|---|---|
 | `scalar_storage_order` attribute | 2 | `20230630-2`, `20230630-4`. c17 warns that it ignores the attribute and lays out natively, so the tests read 85 where they want 21. Needs reverse-endian load/store lowering |
-| Complex arithmetic | 5 | `pr104604`, `pr42248`, `pr56837`, `20050121-1`, `complex-4` |
+| ~~Complex arithmetic~~ | 0 | Closed. `_Complex int` and its relatives are implemented: sizing, `__real__`/`__imag__`, arithmetic (multiply and divide open-coded, since the `__mul?c3` helpers are floating-only), the argument and return ABI on both targets, `~` as the conjugate, and integer imaginary constants. This also fixed a real argument bound to a *floating* complex parameter, which was never promoted |
 | `va_arg` with `long double` / `__int128` | 2 | `pr44942`, `pr92904` — the binary128 fixes did not reach these |
 | Pre-C99 implicit `int` not requesting `-fpermissive` | 5 | gcc rejects them too without a flag |
 | Dead-call elimination proofs | 9 | call an undefined `link_error` the optimizer is expected to delete. gcc deletes it, c17 does not — optimizer strength, not a defect |

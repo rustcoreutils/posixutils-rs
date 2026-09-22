@@ -83,10 +83,9 @@ impl X86_64CodeGen {
             // bytes rather than 16 and is classified COMPLEX_X87 (MEMORY), so
             // it must fall through to the Indirect arm below and get its real
             // size counted — not be treated as a 2-qword scalar.
-            let is_longdouble = insn
-                .arg_types
-                .get(i)
-                .is_some_and(|&ty| types.kind(ty) == TypeKind::LongDouble && !types.is_complex(ty));
+            let is_longdouble = insn.arg_types.get(i).is_some_and(|&ty| {
+                types.kind(ty) == TypeKind::LongDouble && !types.is_complex_float(ty)
+            });
 
             if is_longdouble {
                 // Long double is always passed on the stack by value (16 bytes = 2 qwords)
@@ -301,7 +300,8 @@ impl X86_64CodeGen {
                 });
             } else {
                 // Check if this is an __int128 arg (needs 16 bytes = 2 stack slots)
-                let is_int128 = arg_type.is_some_and(|t| types.kind(t) == TypeKind::Int128);
+                let is_int128 = arg_type
+                    .is_some_and(|t| types.kind(t) == TypeKind::Int128 && !types.is_complex(t));
                 if is_int128 {
                     let arg_loc = self.get_location(arg).clone();
                     for (half, off) in [
@@ -377,7 +377,7 @@ impl X86_64CodeGen {
                 let arg_loc = self.get_location(insn.src[i]);
                 matches!(arg_loc, Loc::Xmm(_) | Loc::FImm(..))
             };
-            let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
+            let is_complex = arg_type.is_some_and(|t| types.is_complex_float(t));
 
             if !is_fp && !is_complex {
                 if temp_int_idx < int_arg_regs.len() {
@@ -401,7 +401,7 @@ impl X86_64CodeGen {
                 let arg_loc = self.get_location(arg);
                 matches!(arg_loc, Loc::Xmm(_) | Loc::FImm(..))
             };
-            let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
+            let is_complex = arg_type.is_some_and(|t| types.is_complex_float(t));
 
             if !is_fp && !is_complex && temp_int_idx < int_arg_regs.len() {
                 let arg_loc = self.get_location(arg);
@@ -476,7 +476,7 @@ impl X86_64CodeGen {
             }
             let arg = insn.src[i];
             let arg_type = insn.arg_types.get(i).copied();
-            let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
+            let is_complex = arg_type.is_some_and(|t| types.is_complex_float(t));
             let is_fp = if let Some(typ) = arg_type {
                 types.is_float(typ)
             } else {
@@ -515,6 +515,27 @@ impl X86_64CodeGen {
                     types,
                 );
                 fp_arg_idx += if packed { 1 } else { 2 };
+            } else if let Some(classes) = arg_type
+                .filter(|t| types.is_complex_integer(*t))
+                .and_then(|t| crate::abi::struct_param_classes(t, types))
+            {
+                // A GNU complex integer: one general register per eightbyte,
+                // loaded from the value's address. The generic integer arm
+                // below would have handed the callee the *pointer*, because a
+                // complex arg pseudo always holds an address and that arm
+                // moves the pseudo itself.
+                let base = self.struct_arg_base(arg);
+                for i in 0..classes.len() {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base,
+                            offset: (i * 8) as i32,
+                        }),
+                        dst: GpOperand::Reg(int_arg_regs[int_arg_idx]),
+                    });
+                    int_arg_idx += 1;
+                }
             } else if is_fp {
                 let fp_size = if let Some(typ) = arg_type {
                     types.size_bits(typ)
@@ -675,7 +696,9 @@ impl X86_64CodeGen {
                     self.setup_int_arg(arg, arg_size, int_arg_regs[int_arg_idx], saved_arg_regs);
                     int_arg_idx += 1;
                 }
-            } else if arg_type.is_some_and(|t| types.kind(t) == TypeKind::Int128) {
+            } else if arg_type
+                .is_some_and(|t| types.kind(t) == TypeKind::Int128 && !types.is_complex(t))
+            {
                 // __int128 argument: load lo and hi halves into two consecutive GP registers
                 if int_arg_idx + 1 < int_arg_regs.len() {
                     let arg_loc = self.get_location(arg).clone();
@@ -852,7 +875,8 @@ impl X86_64CodeGen {
                 // Check for complex return (two SSE registers)
                 if classes.len() == 2 && classes.iter().all(|c| *c == RegClass::Sse) {
                     let is_complex_result = insn.typ.is_some_and(|t| {
-                        types.is_complex(t) && crate::arch::lir::complex_sse_regs(types, t) > 0
+                        types.is_complex_float(t)
+                            && crate::arch::lir::complex_sse_regs(types, t) > 0
                     });
                     if is_complex_result {
                         self.handle_complex_return(insn, &dst_loc, types);
@@ -889,7 +913,8 @@ impl X86_64CodeGen {
                 // Complex types are similar - return in XMM0, XMM1
                 if *count == 2 {
                     let is_complex_result = insn.typ.is_some_and(|t| {
-                        types.is_complex(t) && crate::arch::lir::complex_sse_regs(types, t) > 0
+                        types.is_complex_float(t)
+                            && crate::arch::lir::complex_sse_regs(types, t) > 0
                     });
                     if is_complex_result {
                         self.handle_complex_return(insn, &dst_loc, types);
@@ -919,7 +944,7 @@ impl X86_64CodeGen {
             }
             ArgClass::X87 { .. } => {
                 let is_complex_x87 = insn.typ.is_some_and(|t| {
-                    types.is_complex(t) && crate::arch::lir::complex_sse_regs(types, t) == 0
+                    types.is_complex_float(t) && crate::arch::lir::complex_sse_regs(types, t) == 0
                 });
                 if is_complex_x87 {
                     // COMPLEX_X87: st(0) holds the real part and st(1) the

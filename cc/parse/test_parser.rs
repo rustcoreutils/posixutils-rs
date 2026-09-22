@@ -5678,3 +5678,114 @@ fn test_gnu_complex_in_type_name() {
         );
     }
 }
+
+/// `_Complex` applies to the integer types too, and doubles their size.
+///
+/// The `COMPLEX` size multiplier reached only the floating kinds, so
+/// `sizeof(_Complex int)` was 4 -- the width of one half -- and every write
+/// of an imaginary part landed one object past the end of the storage.
+#[test]
+fn test_complex_integer_type_sizes() {
+    for (spelling, want_bits) in [
+        ("_Complex signed char", 16),
+        ("_Complex unsigned char", 16),
+        ("_Complex short", 32),
+        ("_Complex unsigned short", 32),
+        ("_Complex int", 64),
+        ("_Complex unsigned", 64),
+        ("_Complex unsigned int", 64),
+        ("_Complex long", 128),
+        ("_Complex unsigned long", 128),
+        ("_Complex long long", 128),
+        // The GNU spellings mean the same thing here as for floating bases.
+        ("__complex__ int", 64),
+        ("__complex int", 64),
+        // And the floating ones are unchanged.
+        ("_Complex float", 64),
+        ("_Complex double", 128),
+    ] {
+        let src = format!("sizeof({spelling})");
+        let (expr, types, _, _) =
+            parse_expr(&src).unwrap_or_else(|e| panic!("{spelling} did not parse: {e:?}"));
+        let ExprKind::SizeofType(typ, _) = expr.kind else {
+            panic!("sizeof({spelling}) gave {:?}", expr.kind);
+        };
+        assert_eq!(
+            types.size_bits(typ),
+            want_bits,
+            "{spelling} is the wrong width"
+        );
+        assert!(types.is_complex(typ), "{spelling} is not complex");
+    }
+}
+
+/// An imaginary constant with an integer value is a `_Complex int`.
+///
+/// These were rejected outright while c17 had no complex integer type --
+/// deliberately, rather than being given a floating type, which would have
+/// changed what the program computes. Both markers are accepted, and the
+/// literal becomes a complex value with a zero real part whose *own* type
+/// matches the base's family: giving an integer's real half a `FloatLit` made
+/// the constant folder carry an integer complex as two floats.
+#[test]
+fn test_imaginary_integer_constants() {
+    for (src, want_bits) in [
+        ("2i", 64),
+        ("2j", 64),
+        ("2I", 64),
+        ("200i", 64),
+        ("2uli", 128),
+        ("2lli", 128),
+    ] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let typ = expr.typ.unwrap_or_else(|| panic!("{src} has no type"));
+        assert!(
+            types.is_complex_integer(typ),
+            "{src} should be a complex *integer*"
+        );
+        assert_eq!(types.size_bits(typ), want_bits, "{src} width");
+        let ExprKind::BuiltinComplex { real, imag } = &expr.kind else {
+            panic!("{src} gave {:?}", expr.kind);
+        };
+        // The real half is an integer zero, not a floating one.
+        assert!(
+            matches!(real.kind, ExprKind::IntLit(0)),
+            "{src}: real half is {:?}",
+            real.kind
+        );
+        assert!(
+            matches!(imag.kind, ExprKind::IntLit(_)),
+            "{src}: imaginary half is {:?}",
+            imag.kind
+        );
+    }
+
+    // The control: the same numbers without a marker stay real.
+    for src in ["2", "200", "2ul", "2ll"] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let typ = expr.typ.unwrap_or_else(|| panic!("{src} has no type"));
+        assert!(!types.is_complex(typ), "{src} should not be complex");
+    }
+
+    // A floating imaginary constant still gets a floating complex type and a
+    // floating zero.
+    for src in ["1.0i", "1.0fi", "1.0li"] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let typ = expr.typ.unwrap_or_else(|| panic!("{src} has no type"));
+        assert!(
+            types.is_complex_float(typ),
+            "{src} should be a complex float"
+        );
+        let ExprKind::BuiltinComplex { real, .. } = &expr.kind else {
+            panic!("{src} gave {:?}", expr.kind);
+        };
+        assert!(
+            matches!(real.kind, ExprKind::FloatLit(_)),
+            "{src}: real half is {:?}",
+            real.kind
+        );
+    }
+}

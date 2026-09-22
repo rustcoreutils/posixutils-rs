@@ -15,6 +15,21 @@ use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, UnaryOp};
 use crate::types::{MemberInfo, TypeId, TypeKind};
 
+/// The per-half opcodes a complex operation uses, chosen once from the base
+/// type rather than at each emit site.
+///
+/// `integral` distinguishes the two families where the opcode alone cannot:
+/// complex multiply and divide call a runtime helper for floating halves and
+/// are open-coded for integer ones.
+struct ComplexHalfOps {
+    add: Opcode,
+    sub: Opcode,
+    neg: Opcode,
+    eq: Opcode,
+    ne: Opcode,
+    integral: bool,
+}
+
 /// The low-`bit_width` mask for a bit-field value.
 ///
 /// Spelled as a shift of `u64::MAX` rather than `(1 << bit_width) - 1` because
@@ -1158,7 +1173,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit(Instruction::store(
             converted, result, 0, base_typ, base_bits,
         ));
-        let zero = self.emit_fconst(FloatVal::ZERO, base_typ);
+        let zero = self.complex_half_zero(base_typ);
         self.emit(Instruction::store(
             zero, result, base_bytes, base_typ, base_bits,
         ));
@@ -1219,6 +1234,46 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
+    /// The opcodes that operate on one half of a complex value of `base_typ`.
+    ///
+    /// `_Complex int` is a GNU extension, and its halves are integers: the
+    /// component arithmetic is `Add`/`Sub`/`Mul`, the comparisons are
+    /// `SetEq`/`SetNe`, and negation is `Neg`. Every complex emitter used to
+    /// hard-code the floating opcode, which handed an integer pair to the SSE
+    /// unit.
+    fn complex_half_ops(&self, base_typ: TypeId) -> ComplexHalfOps {
+        if self.types.is_integer(base_typ) {
+            ComplexHalfOps {
+                add: Opcode::Add,
+                sub: Opcode::Sub,
+                neg: Opcode::Neg,
+                eq: Opcode::SetEq,
+                ne: Opcode::SetNe,
+                integral: true,
+            }
+        } else {
+            ComplexHalfOps {
+                add: Opcode::FAdd,
+                sub: Opcode::FSub,
+                neg: Opcode::FNeg,
+                // The floating predicates are the *ordered* ones, so a NaN
+                // half compares unequal to everything and -0.0 equals 0.0.
+                eq: Opcode::FCmpOEq,
+                ne: Opcode::FCmpONe,
+                integral: false,
+            }
+        }
+    }
+
+    /// Zero of the type one half of a complex value has.
+    pub(crate) fn complex_half_zero(&mut self, base_typ: TypeId) -> PseudoId {
+        if self.types.is_integer(base_typ) {
+            self.emit_const(0, base_typ)
+        } else {
+            self.emit_fconst(FloatVal::ZERO, base_typ)
+        }
+    }
+
     /// `-z` on a complex value: negate both parts (C17 6.5.3.3p3).
     ///
     /// A complex value travels by address, and the scalar unary path did not
@@ -1229,6 +1284,31 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// Returns the address of the result, as every complex-valued expression
     /// does.
     pub(crate) fn emit_complex_negate(&mut self, operand: &Expr, complex_typ: TypeId) -> PseudoId {
+        self.emit_complex_half_negate(operand, complex_typ, true)
+    }
+
+    /// `~z` on a complex value: the complex conjugate (a GNU extension).
+    ///
+    /// gcc gives `~` this meaning for every complex type, floating and
+    /// integer. c17 had no case for it, so the scalar path bit-complemented
+    /// the value's *address* and the result was dereferenced as a pointer:
+    /// `~z` segfaulted on valid code.
+    pub(crate) fn emit_complex_conjugate(
+        &mut self,
+        operand: &Expr,
+        complex_typ: TypeId,
+    ) -> PseudoId {
+        self.emit_complex_half_negate(operand, complex_typ, false)
+    }
+
+    /// The shared body of `-z` and `~z`: negate the imaginary half always, and
+    /// the real half only for negation.
+    fn emit_complex_half_negate(
+        &mut self,
+        operand: &Expr,
+        complex_typ: TypeId,
+        negate_real: bool,
+    ) -> PseudoId {
         let base_typ = self.types.complex_base(complex_typ);
         let base_bits = self.types.size_bits(base_typ);
         let base_bytes = (base_bits / 8) as i64;
@@ -1236,19 +1316,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         let addr = self.complex_operand_at_precision(operand, complex_typ);
         let result = self.alloc_local_temp(complex_typ);
 
-        for offset in [0, base_bytes] {
+        let ops = self.complex_half_ops(base_typ);
+        for (offset, negate) in [(0, negate_real), (base_bytes, true)] {
             let part = self.alloc_pseudo();
             self.emit(Instruction::load(part, addr, offset, base_typ, base_bits));
-            let negated = self.alloc_pseudo();
-            self.emit(Instruction::unop(
-                Opcode::FNeg,
-                negated,
-                part,
-                base_typ,
-                base_bits,
-            ));
+            let stored = if negate {
+                let negated = self.alloc_pseudo();
+                self.emit(Instruction::unop(
+                    ops.neg, negated, part, base_typ, base_bits,
+                ));
+                negated
+            } else {
+                part
+            };
             self.emit(Instruction::store(
-                negated, result, offset, base_typ, base_bits,
+                stored, result, offset, base_typ, base_bits,
             ));
         }
         result
@@ -1310,26 +1392,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         // Perform the operation on the components
+        let ops = self.complex_half_ops(base_typ);
         let (result_real, result_imag) = match op {
             BinaryOp::Add => {
                 // (a + bi) + (c + di) = (a+c) + (b+d)i
                 let real = self.alloc_pseudo();
                 self.emit(Instruction::binop(
-                    Opcode::FAdd,
-                    real,
-                    left_real,
-                    right_real,
-                    base_typ,
-                    base_size,
+                    ops.add, real, left_real, right_real, base_typ, base_size,
                 ));
                 let imag = self.alloc_pseudo();
                 self.emit(Instruction::binop(
-                    Opcode::FAdd,
-                    imag,
-                    left_imag,
-                    right_imag,
-                    base_typ,
-                    base_size,
+                    ops.add, imag, left_imag, right_imag, base_typ, base_size,
                 ));
                 (real, imag)
             }
@@ -1337,23 +1410,34 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // (a + bi) - (c + di) = (a-c) + (b-d)i
                 let real = self.alloc_pseudo();
                 self.emit(Instruction::binop(
-                    Opcode::FSub,
-                    real,
-                    left_real,
-                    right_real,
-                    base_typ,
-                    base_size,
+                    ops.sub, real, left_real, right_real, base_typ, base_size,
                 ));
                 let imag = self.alloc_pseudo();
                 self.emit(Instruction::binop(
-                    Opcode::FSub,
-                    imag,
-                    left_imag,
-                    right_imag,
-                    base_typ,
-                    base_size,
+                    ops.sub, imag, left_imag, right_imag, base_typ, base_size,
                 ));
                 (real, imag)
+            }
+            // The integer forms are open-coded: there is no `__mulic3`, and
+            // the runtime helpers' NaN and infinity fix-ups are meaningless
+            // for integers. gcc emits the textbook formulae inline too.
+            BinaryOp::Mul if ops.integral => self.emit_complex_int_mul(
+                (left_real, left_imag),
+                (right_real, right_imag),
+                base_typ,
+                base_size,
+            ),
+            BinaryOp::Div if ops.integral => {
+                // Smith's method branches, so it writes the result itself
+                // rather than handing back a pair.
+                self.emit_complex_int_div(
+                    (left_real, left_imag),
+                    (right_real, right_imag),
+                    result_addr,
+                    base_typ,
+                    base_size,
+                );
+                return result_addr;
             }
             BinaryOp::Mul => {
                 // Complex multiply via rtlib call (__mulsc3, __muldc3, etc.)
@@ -1430,6 +1514,187 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         result_addr
+    }
+
+    /// `(a + bi) * (c + di)` for integer halves: `(ac - bd) + (ad + bc)i`.
+    ///
+    /// Open-coded rather than routed through `__mul?c3`: those helpers exist
+    /// only for the floating formats, and their infinity recovery has no
+    /// meaning for a type that wraps.
+    fn emit_complex_int_mul(
+        &mut self,
+        left: (PseudoId, PseudoId),
+        right: (PseudoId, PseudoId),
+        base_typ: TypeId,
+        base_size: u32,
+    ) -> (PseudoId, PseudoId) {
+        let (a, b) = left;
+        let (c, d) = right;
+        let ac = self.emit_int_binop(Opcode::Mul, a, c, base_typ, base_size);
+        let bd = self.emit_int_binop(Opcode::Mul, b, d, base_typ, base_size);
+        let ad = self.emit_int_binop(Opcode::Mul, a, d, base_typ, base_size);
+        let bc = self.emit_int_binop(Opcode::Mul, b, c, base_typ, base_size);
+        let real = self.emit_int_binop(Opcode::Sub, ac, bd, base_typ, base_size);
+        let imag = self.emit_int_binop(Opcode::Add, ad, bc, base_typ, base_size);
+        (real, imag)
+    }
+
+    /// `(a + bi) / (c + di)` for integer halves, by Smith's method -- the
+    /// algorithm gcc uses, so the same source computes the same thing.
+    ///
+    /// The textbook formula `((ac + bd) + (bc - ad)i) / (c*c + d*d)` is exact
+    /// but overflows: `4000000000u / 2u` needs `a * c` to hold 8e9, which a
+    /// 32-bit half cannot, and the quotient came out 926258176. Smith's method
+    /// divides through by the larger half first, so the products stay near the
+    /// magnitude of the operands.
+    ///
+    /// The cost is a branch -- the two arms differ in which half scales, and
+    /// the arm not taken would divide by zero if it were evaluated anyway, so
+    /// this cannot be done branch-free. The division truncates toward zero at
+    /// every step, like any integer division, which is why gcc (and c17)
+    /// answer `6 + 1i` for `(-9 + 38i) / (5 + 6i)` where the exact quotient is
+    /// `3 + 4i`. `cc/doc/BUILTIN.md` records that.
+    ///
+    /// Writes both halves to `result_addr` and leaves the cursor on the merge
+    /// block.
+    fn emit_complex_int_div(
+        &mut self,
+        left: (PseudoId, PseudoId),
+        right: (PseudoId, PseudoId),
+        result_addr: PseudoId,
+        base_typ: TypeId,
+        base_size: u32,
+    ) {
+        let (a, b) = left;
+        let (c, d) = right;
+        let unsigned = self.types.is_unsigned(base_typ);
+        let div = if unsigned { Opcode::DivU } else { Opcode::DivS };
+        let base_bytes = (base_size / 8) as i64;
+
+        // `|c| < |d|` decides which half scales. The absolute values are
+        // non-negative, so an unsigned compare would do for both -- but the
+        // signed predicate is used for signed halves so the comparison reads
+        // the same way the values do.
+        let abs_c = self.emit_int_abs(c, base_typ, base_size);
+        let abs_d = self.emit_int_abs(d, base_typ, base_size);
+        let cmp = if unsigned {
+            Opcode::SetB
+        } else {
+            Opcode::SetLt
+        };
+        let cond = self.emit_int_binop(cmp, abs_c, abs_d, base_typ, base_size);
+
+        let small_bb = self.alloc_bb();
+        let big_bb = self.alloc_bb();
+        let done_bb = self.alloc_bb();
+        let entry_bb = self.current_bb.expect("complex divide outside a block");
+        self.emit(Instruction::cbr(cond, small_bb, big_bb));
+        self.link_bb(entry_bb, small_bb);
+        self.link_bb(entry_bb, big_bb);
+
+        // `|c| >= |d|`: r = d/c, denom = c + d*r,
+        //               re = (a + b*r)/denom, im = (b - a*r)/denom.
+        self.switch_bb(big_bb);
+        let r = self.emit_int_binop(div, d, c, base_typ, base_size);
+        let dr = self.emit_int_binop(Opcode::Mul, d, r, base_typ, base_size);
+        let denom = self.emit_int_binop(Opcode::Add, c, dr, base_typ, base_size);
+        let br = self.emit_int_binop(Opcode::Mul, b, r, base_typ, base_size);
+        let num_re = self.emit_int_binop(Opcode::Add, a, br, base_typ, base_size);
+        let ar = self.emit_int_binop(Opcode::Mul, a, r, base_typ, base_size);
+        let num_im = self.emit_int_binop(Opcode::Sub, b, ar, base_typ, base_size);
+        self.store_complex_quotient(
+            result_addr,
+            (num_re, num_im),
+            denom,
+            div,
+            base_typ,
+            base_size,
+            base_bytes,
+        );
+        let big_end = self.current_bb.expect("complex divide lost its block");
+        self.emit(Instruction::br(done_bb));
+        self.link_bb(big_end, done_bb);
+
+        // `|c| < |d|`: r = c/d, denom = d + c*r,
+        //              re = (a*r + b)/denom, im = (b*r - a)/denom.
+        self.switch_bb(small_bb);
+        let r = self.emit_int_binop(div, c, d, base_typ, base_size);
+        let cr = self.emit_int_binop(Opcode::Mul, c, r, base_typ, base_size);
+        let denom = self.emit_int_binop(Opcode::Add, d, cr, base_typ, base_size);
+        let ar = self.emit_int_binop(Opcode::Mul, a, r, base_typ, base_size);
+        let num_re = self.emit_int_binop(Opcode::Add, ar, b, base_typ, base_size);
+        let br = self.emit_int_binop(Opcode::Mul, b, r, base_typ, base_size);
+        let num_im = self.emit_int_binop(Opcode::Sub, br, a, base_typ, base_size);
+        self.store_complex_quotient(
+            result_addr,
+            (num_re, num_im),
+            denom,
+            div,
+            base_typ,
+            base_size,
+            base_bytes,
+        );
+        let small_end = self.current_bb.expect("complex divide lost its block");
+        self.emit(Instruction::br(done_bb));
+        self.link_bb(small_end, done_bb);
+
+        self.switch_bb(done_bb);
+    }
+
+    /// Divide both numerators by the shared denominator and store the halves.
+    ///
+    /// Shared by Smith's two arms, which differ only in how they build the
+    /// numerators.
+    #[allow(clippy::too_many_arguments)]
+    fn store_complex_quotient(
+        &mut self,
+        result_addr: PseudoId,
+        num: (PseudoId, PseudoId),
+        denom: PseudoId,
+        div: Opcode,
+        base_typ: TypeId,
+        base_size: u32,
+        base_bytes: i64,
+    ) {
+        let re = self.emit_int_binop(div, num.0, denom, base_typ, base_size);
+        let im = self.emit_int_binop(div, num.1, denom, base_typ, base_size);
+        self.emit(Instruction::store(re, result_addr, 0, base_typ, base_size));
+        self.emit(Instruction::store(
+            im,
+            result_addr,
+            base_bytes,
+            base_typ,
+            base_size,
+        ));
+    }
+
+    /// `|x|` for an integer, without a branch.
+    ///
+    /// `t = x >> (width - 1)` is all ones for a negative value and zero
+    /// otherwise, so `(x ^ t) - t` is the magnitude either way. An unsigned
+    /// value is already its own magnitude.
+    fn emit_int_abs(&mut self, x: PseudoId, typ: TypeId, size: u32) -> PseudoId {
+        if self.types.is_unsigned(typ) {
+            return x;
+        }
+        let shift = self.emit_const((size - 1) as i128, typ);
+        let sign = self.emit_int_binop(Opcode::Asr, x, shift, typ, size);
+        let flipped = self.emit_int_binop(Opcode::Xor, x, sign, typ, size);
+        self.emit_int_binop(Opcode::Sub, flipped, sign, typ, size)
+    }
+
+    /// One integer binary operation on complex halves, into a fresh pseudo.
+    fn emit_int_binop(
+        &mut self,
+        op: Opcode,
+        lhs: PseudoId,
+        rhs: PseudoId,
+        typ: TypeId,
+        size: u32,
+    ) -> PseudoId {
+        let dst = self.alloc_pseudo();
+        self.emit(Instruction::binop(op, dst, lhs, rhs, typ, size));
+        dst
     }
 
     /// Allocate a local temporary variable for a complex result
@@ -1553,24 +1818,15 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) -> PseudoId {
         let (real, imag, base_typ, base_bits) = self.load_complex_halves(addr, complex_typ);
 
-        let zero = self.emit_fconst(FloatVal::ZERO, base_typ);
+        let ne = self.complex_half_ops(base_typ).ne;
+        let zero = self.complex_half_zero(base_typ);
         let real_nz = self.alloc_pseudo();
         self.emit(Instruction::binop(
-            Opcode::FCmpONe,
-            real_nz,
-            real,
-            zero,
-            base_typ,
-            base_bits,
+            ne, real_nz, real, zero, base_typ, base_bits,
         ));
         let imag_nz = self.alloc_pseudo();
         self.emit(Instruction::binop(
-            Opcode::FCmpONe,
-            imag_nz,
-            imag,
-            zero,
-            base_typ,
-            base_bits,
+            ne, imag_nz, imag, zero, base_typ, base_bits,
         ));
 
         let result = self.alloc_pseudo();
@@ -1603,10 +1859,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         let (lre, lim, base_typ, base_bits) = self.load_complex_halves(left_addr, complex_typ);
         let (rre, rim, _, _) = self.load_complex_halves(right_addr, complex_typ);
 
+        let ops = self.complex_half_ops(base_typ);
         let (half_op, combine) = if op == BinaryOp::Eq {
-            (Opcode::FCmpOEq, Opcode::And)
+            (ops.eq, Opcode::And)
         } else {
-            (Opcode::FCmpONe, Opcode::Or)
+            (ops.ne, Opcode::Or)
         };
 
         let real_cmp = self.alloc_pseudo();

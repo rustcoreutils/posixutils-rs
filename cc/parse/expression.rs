@@ -2148,7 +2148,15 @@ impl<'a> Parser<'a> {
         if !is_imaginary {
             return lit;
         }
-        let zero = Self::typed_expr(ExprKind::FloatLit(FloatVal::ZERO), base_typ, pos);
+        // The real part has to be a zero of the *base's* family: `2i` is a
+        // `_Complex int`, and giving its real half a `FloatLit` made the
+        // constant folder carry an integer complex as two `FloatVal`s.
+        let zero_kind = if self.types.is_integer(base_typ) {
+            ExprKind::IntLit(0)
+        } else {
+            ExprKind::FloatLit(FloatVal::ZERO)
+        };
+        let zero = Self::typed_expr(zero_kind, base_typ, pos);
         Self::typed_expr(
             ExprKind::BuiltinComplex {
                 real: Box::new(zero),
@@ -2203,10 +2211,8 @@ impl<'a> Parser<'a> {
         // does not either. Both give the constant a *complex* type with a zero
         // real part, which is what `__builtin_complex(0, v)` already builds.
         let (s_owned, is_imaginary) = Self::strip_imaginary_suffix(s);
-        // `spelled` keeps what the program actually wrote, for diagnostics;
-        // `s` below is the number with the marker removed, which is what the
-        // ordinary suffix and value parsing expects.
-        let spelled = s;
+        // `s` from here on is the number with the marker removed, which is what
+        // the ordinary suffix and value parsing expects.
         let s = s_owned.as_str();
         let s_lower = s.to_lowercase();
 
@@ -2426,17 +2432,10 @@ impl<'a> Parser<'a> {
                     }
                 }
             };
-            if is_imaginary {
-                // `2i` is `_Complex int` in gcc -- a complex *integer*, which
-                // c17 does not yet generate correct code for. Rejected with
-                // the reason rather than silently given a floating type, which
-                // would change what the program computes.
-                return Err(ParseError::new(
-                    format!("imaginary integer constant needs _Complex int: {}", spelled),
-                    pos,
-                ));
-            }
-            Ok(Self::typed_expr(ExprKind::IntLit(value), typ, pos))
+            // `2i` is a `_Complex int` in gcc: an integer imaginary constant,
+            // whose real half is an integer zero.
+            let lit = Self::typed_expr(ExprKind::IntLit(value), typ, pos);
+            Ok(self.imaginary_if(lit, is_imaginary, typ, pos))
         }
     }
 

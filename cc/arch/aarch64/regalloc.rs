@@ -1838,7 +1838,7 @@ impl RegAlloc {
                     if insn.op == Opcode::Call && insn.target == Some(interval.pseudo) {
                         if let Some(typ) = insn.typ {
                             let kind = types.kind(typ);
-                            if types.is_complex(typ)
+                            if types.is_complex_float(typ)
                                 || matches!(kind, TypeKind::Struct | TypeKind::Union)
                             {
                                 return Some(typ);

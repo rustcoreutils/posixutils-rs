@@ -675,14 +675,23 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         let base = self.types.complex_base(typ);
         let base_bytes = self.types.size_bytes(base);
-        // Narrowing to the base width happens at emission, which knows the
-        // field size; `FloatVal` just carries the value.
+        // A GNU complex integer's halves are integers. Emitting them as
+        // floats laid an eight-byte floating image over a four-byte half, so
+        // `_Complex int b = 8;` wrote past its own object and zeroed whatever
+        // the frame had put next to it.
+        let (re_init, im_init) = if self.types.is_integer(base) {
+            (
+                Initializer::Int(re.to_f64() as i128),
+                Initializer::Int(im.to_f64() as i128),
+            )
+        } else {
+            // Narrowing to the base width happens at emission, which knows the
+            // field size; `FloatVal` just carries the value.
+            (Initializer::Float(re), Initializer::Float(im))
+        };
         Some(Initializer::Struct {
             total_size: base_bytes * 2,
-            fields: vec![
-                (0, base_bytes, Initializer::Float(re)),
-                (base_bytes, base_bytes, Initializer::Float(im)),
-            ],
+            fields: vec![(0, base_bytes, re_init), (base_bytes, base_bytes, im_init)],
         })
     }
 

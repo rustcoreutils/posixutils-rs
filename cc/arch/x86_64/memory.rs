@@ -302,7 +302,47 @@ impl X86_64CodeGen {
         // ptr is to an int128), addr is a runtime pointer that must be dereferenced.
         if self.int128_pseudos.contains(&target) {
             let addr_loc = self.get_location(addr);
+            // A stack slot holding the value itself, or one holding a pointer
+            // to it? Only the pseudo's *kind* says: a `Sym` names storage,
+            // and anything else in a slot -- an `Alloca` result, a spilled
+            // address -- holds a pointer. Treating every `Loc::Stack` as the
+            // value copied the pointer's own bits as the low half, which is
+            // how `_Complex __int128` arithmetic came back as two stack
+            // addresses.
+            let addr_names_storage = self
+                .pseudos
+                .iter()
+                .find(|p| p.id == addr)
+                .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
             match &addr_loc {
+                Loc::Stack(_) if !addr_names_storage => {
+                    // A pointer in a slot: load it, then read through it.
+                    let dst_lo = self.int128_lo_mem_loc(&dst_loc);
+                    let dst_hi = self.int128_hi_mem_loc(&dst_loc);
+                    self.emit_move(addr, Reg::R10, 64);
+                    if insn.offset != 0 {
+                        self.push_lir(X86Inst::Add {
+                            size: OperandSize::B64,
+                            src: GpOperand::Imm(insn.offset),
+                            dst: Reg::R10,
+                        });
+                    }
+                    for (off, dst) in [(0, dst_lo), (8, dst_hi)] {
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::R10,
+                                offset: off,
+                            }),
+                            dst: GpOperand::Reg(Reg::R11),
+                        });
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Reg(Reg::R11),
+                            dst: GpOperand::Mem(dst),
+                        });
+                    }
+                }
                 Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Imm(_) => {
                     // addr is a local/sym — do stack-to-stack copy
                     self.emit_int128_copy(addr, target);

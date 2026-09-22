@@ -551,7 +551,16 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 let kept: String = s.chars().take(room).collect();
                 let bytes_emitted = kept.chars().count();
                 self.push_directive(Directive::Ascii(escape_string(&kept)));
-                if size > bytes_emitted {
+                if size == 0 {
+                    // Unbounded: the terminator is part of what the
+                    // initializer establishes, so it is emitted rather than
+                    // zero-filled. gcc writes `.string "wx"` here -- four
+                    // bytes for `struct { char c; char f[]; } = { 'o', "wx" }`
+                    // -- and the wide encodings below already did this, so
+                    // leaving it out made the narrow one the odd case and an
+                    // unbounded array came back without its `\0`.
+                    self.push_directive(Directive::Zero(1));
+                } else if size > bytes_emitted {
                     self.push_directive(Directive::Zero(size - bytes_emitted));
                 }
             }

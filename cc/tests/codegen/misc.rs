@@ -12108,3 +12108,132 @@ int main(void)
         0
     );
 }
+
+const OVER_ALIGNED_STACKED_AGGREGATE: &str = r#"
+typedef struct { long long a, b, c; } Big;                    /* MEMORY class */
+typedef struct __attribute__((aligned(32))) { double a, b, c, d; } Over;
+
+__attribute__((noinline)) static int take(long p1, long p2, long p3, long p4,
+                                          long p5, long p6, Big s, int tail)
+{ return (s.a == 1 && s.b == 2 && s.c == 3 && tail == 7) ? 0 : 1; }
+
+int main(void)
+{
+    Over o = { 1, 2, 3, 4 };    /* over-aligns main's frame */
+    Big b = { 1, 2, 3 };
+    if (o.a != 1 || o.d != 4) return 2;
+    return take(1, 2, 3, 4, 5, 6, b, 7);
+}
+"#;
+
+/// `stack_mem` picks the frame's base register, and an over-aligned frame
+/// addresses its locals through a second base rather than `%rbp`.
+/// `address_of_pseudo` spelled `-(offset + callee_saved_offset)(%rbp)` by
+/// hand, which in such a frame names a different address entirely -- so the
+/// copy of a stacked aggregate argument loaded its source pointer from
+/// garbage and the caller segfaulted.
+#[test]
+fn codegen_over_aligned_frame_addresses_a_stacked_aggregate_through_its_own_base() {
+    assert_eq!(
+        compile_and_run(
+            "c17_overaligned_stacked_agg",
+            OVER_ALIGNED_STACKED_AGGREGATE,
+            &[]
+        ),
+        0
+    );
+    assert_eq!(
+        compile_and_run(
+            "c17_overaligned_stacked_agg_o2",
+            OVER_ALIGNED_STACKED_AGGREGATE,
+            &["-O2".to_string()]
+        ),
+        0
+    );
+}
+
+/// Every `long double` local took the same hand-spelled `%rbp` displacement,
+/// from the x87 emitter's own copies of it. That one is not a wild pointer
+/// -- the store and the load agree with each other -- so it runs, but it
+/// names an address the aligned base also hands out, and which of the two
+/// survives depends on `%rbp`'s dynamic alignment.
+const OVER_ALIGNED_LONG_DOUBLE: &str = r#"
+typedef struct __attribute__((aligned(32))) { double a, b, c, d; } Over;
+
+__attribute__((noinline)) static int take(long double x, long double y, int t)
+{ return (x == 1.5L && y == 2.5L && t == 7) ? 0 : 1; }
+
+__attribute__((noinline)) static long double sum(long double a, long double b)
+{ return a + b; }
+
+int main(void)
+{
+    Over o = { 1, 2, 3, 4 };    /* over-aligns main's frame */
+    long double x = 1.5L, y = 2.5L;
+    volatile long double z;
+    if (o.a != 1 || o.d != 4) return 2;
+    if (take(x, y, 7)) return 3;
+    z = sum(x, y);
+    if (z != 4.0L) return 4;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_over_aligned_frame_holds_a_long_double() {
+    assert_eq!(
+        compile_and_run("c17_overaligned_x87", OVER_ALIGNED_LONG_DOUBLE, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run(
+            "c17_overaligned_x87_o2",
+            OVER_ALIGNED_LONG_DOUBLE,
+            &["-O2".to_string()]
+        ),
+        0
+    );
+}
+
+/// The behavioural tests above only fail when the bogus `%rbp` displacement
+/// happens to land somewhere that matters, which the exact layout decides;
+/// adding a second call to the stacked-aggregate one was enough to make it
+/// pass while it still generated the wrong address. So assert the invariant
+/// directly: once the prologue has realigned the stack, the only uses of
+/// `%rbp` are establishing it, the epilogue's `lea` back to the callee-saved
+/// area, and restoring it.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_over_aligned_frame_keeps_no_local_at_an_rbp_displacement() {
+    for (what, src) in [
+        ("stacked_agg", OVER_ALIGNED_STACKED_AGGREGATE),
+        ("long_double", OVER_ALIGNED_LONG_DOUBLE),
+    ] {
+        let asm = asm_for(&format!("c17_overaligned_rbp_{what}_"), src);
+        let main = asm
+            .split("\nmain:\n")
+            .nth(1)
+            .and_then(|s| s.split(".cfi_endproc").next())
+            .unwrap_or_else(|| panic!("no main in assembly for {what}"));
+        assert!(
+            main.contains("andq $-32, %rsp"),
+            "{what}: main's frame was not over-aligned, so this proves nothing:\n{main}"
+        );
+        let strays: Vec<&str> = main
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("%rbp"))
+            .filter(|l| {
+                *l != "pushq %rbp"
+                    && *l != "popq %rbp"
+                    && *l != "movq %rsp, %rbp"
+                    && !(l.starts_with("leaq ") && l.ends_with("(%rbp), %rsp"))
+            })
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "{what}: an over-aligned frame addressed something \
+             through %rbp: {strays:?}\n{main}"
+        );
+    }
+}

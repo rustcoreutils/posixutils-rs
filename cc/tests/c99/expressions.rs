@@ -1302,3 +1302,126 @@ int main(void) {
         0
     );
 }
+
+/// `E1[E2]` is `(*((E1)+(E2)))` (C17 6.5.2.1p2), so the operands are
+/// interchangeable: `N[p]` is `p[N]`.
+///
+/// The linearizer already swapped them, but the *type* of the expression came
+/// from the left operand alone -- so `N[p]` was typed `int`. It read four
+/// bytes at a four-byte stride from a `char` object, and a store through it
+/// landed somewhere else entirely. Only the constant-index-on-array spelling,
+/// `1[arr]`, happened to work.
+#[test]
+fn c99_reversed_subscript_takes_its_type_from_the_pointer() {
+    let code = r#"
+int N = 2;
+char buf[8] = {10, 11, 12, 13, 14, 15, 16, 17};
+int iarr[4] = {100, 200, 300, 400};
+long larr[3] = {1000, 2000, 3000};
+void *vp = buf;
+struct S { int a; int b; };
+struct S sarr[3] = {{1, 2}, {3, 4}, {5, 6}};
+
+int main(void) {
+    char *p = buf;
+    /* Reads, through a pointer and through an array. */
+    if (N[p] != 12 || p[N] != 12) return 1;
+    if (N[buf] != 12 || buf[N] != 12) return 2;
+    /* Through a cast, which is what `pr22061-1` uses. */
+    if (N[(char *)vp] != 12) return 3;
+    /* A constant index, and a variable one. */
+    if (2[p] != 12) return 4;
+    { int i = 3; if (i[p] != 13) return 5; }
+    /* Element types wider than the index type must not be confused for it. */
+    if (1[iarr] != 200 || iarr[1] != 200) return 6;
+    if (2[larr] != 3000) return 7;
+    if (1[sarr].b != 4) return 8;
+
+    /* Writes go where the pointer says. */
+    N[p] = 99;
+    if (buf[2] != 99 || buf[3] != 13) return 9;
+    N[(char *)vp] = 77;
+    if (buf[2] != 77) return 10;
+    1[iarr] = 555;
+    if (iarr[1] != 555 || iarr[2] != 300) return 11;
+
+    /* A compound assignment and an increment through the reversed form --
+       both are read-modify-writes, so both have to agree about the type. */
+    3[p] = 20;
+    3[p] += 5;
+    if (buf[3] != 25) return 12;
+    3[p]++;
+    if (buf[3] != 26) return 13;
+
+    /* Taking the address, and sizeof, agree with the ordinary spelling. */
+    if (&2[p] != &p[2]) return 14;
+    if (sizeof(1[iarr]) != sizeof(int)) return 15;
+    if (sizeof(N[p]) != sizeof(char)) return 16;
+
+    /* Two dimensions, reversed at the outer level. */
+    { static int g[2][3] = {{1,2,3},{4,5,6}};
+      if (1[g][2] != 6) return 17; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_reversed_subscript", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_reversed_subscript_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
+/// An implicitly declared function that c17 knows as a library builtin gets
+/// that builtin's return type, not `int`.
+///
+/// `-fpermissive` restores C89 6.3.2.2's implicit declaration, and c17
+/// synthesized `extern int f()` for every name -- so `x = alloca(n)` or
+/// `p = malloc(n)` without a declaration truncated the returned address to 32
+/// bits and the program died on the first dereference. That is exactly the
+/// pre-C99 code the flag exists to compile, and it is how `pr22061-1` failed.
+///
+/// The declaration stays unprototyped either way, so no argument is checked
+/// or converted.
+#[test]
+fn c99_implicit_declaration_of_a_builtin_keeps_its_return_type() {
+    let code = r#"
+int main(void) {
+    /* Pointer-returning allocators: the high half of the address must
+       survive. */
+    void *a = alloca(64);
+    void *m = malloc(64);
+    if (a == 0 || m == 0) return 1;
+
+    /* Round-trip through the memory, which needs the address to be whole. */
+    char *s = strcpy((char *)a, "hello");
+    if (s[0] != 'h' || s[4] != 'o' || s[5] != '\0') return 2;
+    if (strlen((char *)a) != 5) return 3;
+
+    memset(m, 'x', 8);
+    if (((char *)m)[7] != 'x') return 4;
+    memcpy((char *)a, (char *)m, 8);
+    if (((char *)a)[7] != 'x') return 5;
+
+    /* A `char *` returner, used as one. */
+    char *found = strchr((char *)a, 'x');
+    if (found == 0) return 6;
+
+    /* An `int` returner is still `int`. */
+    if (strcmp("ab", "ab") != 0) return 7;
+    if (abs(-3) != 3) return 8;
+
+    free(m);
+    return 0;
+}
+"#;
+    let flags = vec!["-fpermissive".to_string()];
+    assert_eq!(compile_and_run("c99_implicit_builtin_ret", code, &flags), 0);
+    assert_eq!(
+        compile_and_run(
+            "c99_implicit_builtin_ret_o2",
+            code,
+            &["-fpermissive".to_string(), "-O2".to_string()]
+        ),
+        0
+    );
+}

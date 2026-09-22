@@ -1745,7 +1745,7 @@ impl Parser<'_> {
     /// The type matters more than it looks: these mostly return a pointer, and
     /// declaring one of them `int` truncates the returned address to 32 bits.
     /// `None` means "not a known `_chk` function", which stays an error.
-    fn chk_builtin_return_type(&mut self, name: &str) -> Option<TypeId> {
+    pub(crate) fn chk_builtin_return_type(&mut self, name: &str) -> Option<TypeId> {
         // The string family returns `char *`; the memory family returns
         // `void *`; the printf family returns `int`.
         match name {
@@ -1779,7 +1779,9 @@ impl Parser<'_> {
             // returns `char *`. Answering `int` here would truncate the
             // returned address to 32 bits, which is the bug the `_chk` cases
             // above are commented for.
-            "malloc" | "calloc" | "realloc" | "mempcpy" | "memchr" => Some(self.types.void_ptr_id),
+            "malloc" | "calloc" | "realloc" | "mempcpy" | "memchr" | "alloca" => {
+                Some(self.types.void_ptr_id)
+            }
             // `bcopy` predates `memmove` and returns nothing; `index`/`rindex`
             // are the old spellings of `strchr`/`strrchr`.
             "bcopy" => Some(self.types.void_id),

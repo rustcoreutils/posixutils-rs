@@ -898,3 +898,71 @@ int main(void) {
         0
     );
 }
+
+/// A cast **to** a complex type.
+///
+/// C17 6.3.1.7p1: converting a real to a complex type gives the real value as
+/// the real part and a zero imaginary part; converting complex to complex
+/// converts each part.
+///
+/// `linearize_cast` had branches for complex-to-`_Bool` and complex-to-real
+/// and none for the other direction, so a cast to a complex type fell through
+/// to the scalar path and returned a value where a complex address was
+/// expected. `(_Complex double)0.0` segfaulted — at every precision, from a
+/// real source or a complex one.
+///
+/// Built the way `__builtin_complex` is, a local of the target type and two
+/// stores, so the result travels by address like every other complex value.
+#[test]
+fn c99_cast_to_complex_type() {
+    let code = r#"
+int main(void) {
+    /* From a real, at each precision: real part kept, imaginary part zero. */
+    { _Complex double z = (_Complex double)3.0;
+      if (__real__ z != 3.0 || __imag__ z != 0.0) return 1; }
+    { _Complex float z = (_Complex float)2.5f;
+      if (__real__ z != 2.5f || __imag__ z != 0.0f) return 2; }
+    { _Complex long double z = (_Complex long double)1.5L;
+      if (__real__ z != 1.5L || __imag__ z != 0.0L) return 3; }
+
+    /* From an integer, which converts first. */
+    { _Complex double z = (_Complex double)7;
+      if (__real__ z != 7.0 || __imag__ z != 0.0) return 4; }
+    { _Complex double z = (_Complex double)-2;
+      if (__real__ z != -2.0 || __imag__ z != 0.0) return 5; }
+
+    /* Complex to complex converts **both** halves, not just the real one. */
+    { _Complex float a = 1.0f + 2.0fi;
+      _Complex double w = (_Complex double)a;
+      if (__real__ w != 1.0 || __imag__ w != 2.0) return 6; }
+    { _Complex double a = 3.0 + 4.0i;
+      _Complex float w = (_Complex float)a;
+      if (__real__ w != 3.0f || __imag__ w != 4.0f) return 7; }
+    { _Complex double a = 5.0 + 6.0i;
+      _Complex long double w = (_Complex long double)a;
+      if (__real__ w != 5.0L || __imag__ w != 6.0L) return 8; }
+
+    /* Nested, and used directly in a comparison -- which is what
+       gcc.c-torture's complex-4 does with a negative zero. */
+    { _Complex double z = (_Complex double)(_Complex float)1.0f;
+      if (__real__ z != 1.0 || __imag__ z != 0.0) return 9; }
+    if ((_Complex double)0.0 != (_Complex double)(-0.0)) return 10;
+
+    /* The other direction still works: complex to real keeps the real part,
+       and complex to _Bool consults both halves. */
+    { _Complex double a = 3.0 + 4.0i;
+      if ((double)a != 3.0) return 11;
+      if ((int)a != 3) return 12; }
+    { _Complex double a = 0.0 + 3.0i;
+      if (!(_Bool)a) return 13; }
+    { _Complex double a = 0.0 + 0.0i;
+      if ((_Bool)a) return 14; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_cast_to_complex", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_cast_to_complex_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

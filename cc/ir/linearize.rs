@@ -2106,6 +2106,59 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Linearize a type cast expression
+    /// A cast to a complex type (C17 6.3.1.7p1).
+    ///
+    /// From a real: the value becomes the real part and the imaginary part is
+    /// zero. From a complex: each half is converted to the new precision,
+    /// which is what makes `(_Complex double)(_Complex float)z` widen both
+    /// halves rather than only one.
+    ///
+    /// Built the same way `__builtin_complex` is -- a local of the target type
+    /// and two stores -- so the result travels by address like every other
+    /// complex value.
+    fn emit_cast_to_complex(
+        &mut self,
+        inner_expr: &Expr,
+        src_type: TypeId,
+        cast_type: TypeId,
+    ) -> PseudoId {
+        let base_typ = self.types.complex_base(cast_type);
+        let base_bits = self.types.size_bits(base_typ);
+        let base_bytes = (base_bits / 8) as i64;
+
+        let (real_val, imag_val) = if self.types.is_complex(src_type) {
+            // Each half, converted to the destination's precision.
+            let src_base = self.types.complex_base(src_type);
+            let addr = self.complex_operand_addr(inner_expr);
+            let src_bits = self.types.size_bits(src_base);
+            let src_bytes = (src_bits / 8) as i64;
+
+            let re = self.alloc_pseudo();
+            self.emit(Instruction::load(re, addr, 0, src_base, src_bits));
+            let im = self.alloc_pseudo();
+            self.emit(Instruction::load(im, addr, src_bytes, src_base, src_bits));
+
+            (
+                self.emit_convert(re, src_base, base_typ),
+                self.emit_convert(im, src_base, base_typ),
+            )
+        } else {
+            // A real source: convert it, and pair it with a zero of the
+            // destination's base type.
+            let v = self.linearize_expr(inner_expr);
+            let re = self.emit_convert(v, src_type, base_typ);
+            let zero = self.emit_fconst(crate::float::FloatVal::ZERO, base_typ);
+            (re, zero)
+        };
+
+        let result = self.alloc_local_temp(cast_type);
+        self.emit(Instruction::store(real_val, result, 0, base_typ, base_bits));
+        self.emit(Instruction::store(
+            imag_val, result, base_bytes, base_typ, base_bits,
+        ));
+        result
+    }
+
     pub(crate) fn linearize_cast(&mut self, inner_expr: &Expr, cast_type: TypeId) -> PseudoId {
         let src_type = self.expr_type(inner_expr);
 
@@ -2124,6 +2177,16 @@ impl<'a> Linearizer<'a> {
 
         if self.types.is_complex(src_type) && !self.types.is_complex(cast_type) {
             return self.emit_complex_to_real(inner_expr, cast_type);
+        }
+
+        // C17 6.3.1.7p1: converting a real to a complex type gives the real
+        // value as the real part and a zero imaginary part; converting complex
+        // to complex converts each part. Neither had a branch here, so a cast
+        // *to* a complex type fell through to the scalar path and returned a
+        // value where a complex address was expected -- `(_Complex double)0.0`
+        // segfaulted at every precision, from a real or from a complex source.
+        if self.types.is_complex(cast_type) {
+            return self.emit_cast_to_complex(inner_expr, src_type, cast_type);
         }
 
         let src = self.linearize_expr(inner_expr);

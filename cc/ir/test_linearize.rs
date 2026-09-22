@@ -2883,6 +2883,7 @@ fn test_incomplete_struct_type_resolution() {
         enum_constants: vec![],
         size: 8,  // 2 ints = 8 bytes
         align: 4, // int alignment
+        member_align: 4,
         is_complete: true,
         transparent: false,
     };
@@ -3683,6 +3684,7 @@ fn test_struct_deref_returns_address() {
         enum_constants: vec![],
         size: 4,
         align: 4,
+        member_align: 4,
         is_complete: true,
         transparent: false,
     });
@@ -4347,6 +4349,7 @@ fn test_mixed_designated_positional_struct_init() {
         enum_constants: vec![],
         size: 16,
         align: 4,
+        member_align: 4,
         is_complete: true,
         transparent: false,
     };
@@ -4567,6 +4570,7 @@ fn test_designator_chain_nested_struct_init() {
         enum_constants: vec![],
         size: 8,
         align: 4,
+        member_align: 4,
         is_complete: true,
         transparent: false,
     }));
@@ -4599,6 +4603,7 @@ fn test_designator_chain_nested_struct_init() {
         enum_constants: vec![],
         size: 12,
         align: 4,
+        member_align: 4,
         is_complete: true,
         transparent: false,
     }));
@@ -4687,6 +4692,7 @@ fn test_designator_chain_array_member_init() {
         enum_constants: vec![],
         size: 12,
         align: 4,
+        member_align: 4,
         is_complete: true,
         transparent: false,
     }));
@@ -4849,6 +4855,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         enum_constants: vec![],
         size: 12,
         align: 4,
+        member_align: 4,
         is_complete: true,
         transparent: false,
     }));
@@ -4942,6 +4949,7 @@ fn test_union_first_named_member_positional_init() {
         enum_constants: vec![],
         size: 4,
         align: 4,
+        member_align: 4,
         is_complete: true,
         transparent: false,
     }));
@@ -5253,6 +5261,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             enum_constants: vec![],
             size: 1,
             align: 1,
+            member_align: 1,
             is_complete: true,
             transparent: false,
         })),
@@ -5400,6 +5409,7 @@ fn test_bitfield_designated_init_local_var() {
         enum_constants: vec![],
         size: 2,
         align: 1,
+        member_align: 1,
         is_complete: true,
         transparent: false,
     }));
@@ -5535,6 +5545,7 @@ fn test_large_struct_copy_from_array() {
             enum_constants: vec![],
             size: 16,
             align: 8,
+            member_align: 8,
             is_complete: true,
             transparent: false,
         })),
@@ -5672,6 +5683,7 @@ fn test_compound_literal_zero_init_lvalue() {
             enum_constants: vec![],
             size: 24,
             align: 8,
+            member_align: 8,
             is_complete: true,
             transparent: false,
         })),
@@ -5805,6 +5817,7 @@ fn test_conditional_short_circuit_arrow() {
         enum_constants: vec![],
         size: 4,
         align: 4,
+        member_align: 4,
         is_complete: true,
         transparent: false,
     }));
@@ -6198,6 +6211,7 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
         enum_constants: vec![],
         size: 4,
         align: 4,
+        member_align: 4,
         is_complete: true,
         transparent: false,
     }));
@@ -6304,6 +6318,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
         enum_constants: vec![],
         size: 16,
         align: 8,
+        member_align: 8,
         is_complete: true,
         transparent: false,
     });

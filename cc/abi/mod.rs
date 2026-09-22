@@ -14,7 +14,7 @@
 // - AAPCS64 (AArch64 Linux/macOS)
 //
 
-mod aapcs64;
+pub mod aapcs64;
 mod sysv_amd64;
 
 pub use aapcs64::Aapcs64Abi;

@@ -245,7 +245,7 @@ impl Aarch64CodeGen {
                 type_bits,
                 is_fp,
                 agg,
-                types.alignment(arg_type) as i32,
+                crate::abi::aapcs64::argument_alignment(types, arg_type) as i32,
             );
         }
     }
@@ -385,17 +385,20 @@ impl Aarch64CodeGen {
             VaAggKind::Scalar if is_fp => 16,
             VaAggKind::Scalar => stack_step,
         };
-        // From the type's alignment, not its size: AAPCS64 §6.4.2 stage C
-        // rounds the stacked address up to `max(8, alignof)`, and the two do
-        // not follow one another -- `struct { long a, b; }` is sixteen bytes
-        // and eight-byte aligned, and an HFA of four floats is sixteen bytes
-        // and four-byte aligned. Asking `size > 64` over-aligned both, so
-        // `va_arg` walked the stack differently from the caller that laid it
-        // out. Only the pointer is stacked for an indirect argument, so that
-        // one wants no rounding at all.
-        let stack_align16 = match agg {
-            VaAggKind::Indirect { .. } => false,
-            _ => align >= 16,
+        // From the argument's ABI alignment, not its size: stage C rounds the
+        // stacked address up to it, and the two do not follow one another --
+        // `struct { long a, b; }` is sixteen bytes and eight-byte aligned, and
+        // an HFA of four floats is sixteen bytes and four-byte aligned.
+        //
+        // A *value*, not a boolean. As a boolean this could only ever round to
+        // 16, so an eight-byte-aligned argument was padded to 16 while the
+        // caller placed it at 8 -- the two walked the stack differently. The
+        // value comes from `argument_alignment`, which is what the caller and
+        // the callee's own layout now ask as well. Only the pointer is stacked
+        // for an indirect argument, so that one wants no rounding at all.
+        let stack_align = match agg {
+            VaAggKind::Indirect { .. } => 8,
+            _ => align,
         };
         // Only an integral scalar of sixteen bytes -- `__int128` -- takes the
         // even-pair rule. A composite goes through `VaAggKind::Gp`, which the
@@ -486,14 +489,14 @@ impl Aarch64CodeGen {
             },
             dst: Reg::X17,
         });
-        if stack_align16 {
+        if stack_align > 8 {
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: Reg::X17,
-                src2: GpOperand::Imm(15),
+                src2: GpOperand::Imm(stack_align as i64 - 1),
                 dst: scratch0,
             });
-            self.emit_mov_imm(scratch1, -16, 64);
+            self.emit_mov_imm(scratch1, -(stack_align as i64), 64);
             self.push_lir(Aarch64Inst::And {
                 size: OperandSize::B64,
                 src1: scratch0,

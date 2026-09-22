@@ -7666,6 +7666,130 @@ int main(void)
     }
 }
 
+/// AAPCS64 derives an argument's alignment from the members and ignores the
+/// type's own `__attribute__((aligned(N)))`.
+///
+/// c17 asked `types.alignment()`, which includes that attribute, at three
+/// aarch64 sites that then disagreed with each other: the caller and the
+/// callee both rounded a 32-byte-aligned struct's stack slot to 32, while
+/// `va_arg` capped at 16. Caller and callee agreeing is why a *named* call
+/// worked c17-to-c17 and failed against gcc; `va_arg` differing is why a
+/// *variadic* one failed even c17-to-c17. gcc rounds all three to 8.
+///
+/// The shapes below are the ones that separate the candidate rules. A type's
+/// own attribute must not count; a *member's* must; packing must, floored at
+/// 8; an attributed typedef must not; and a naturally 16-aligned type keeps
+/// its 16. Nine leading doubles or longs put the argument past the register
+/// file so the stack rule is the one under test.
+///
+/// aarch64 only, in two ways: the rule is AAPCS64's -- x86-64's SysV genuinely
+/// honours over-alignment and is covered by
+/// `codegen_over_aligned_argument_area` -- and the nine-leading-double shape
+/// needed to reach the stack trips a *separate*, pre-existing x86-64 defect,
+/// recorded in `cc/doc/TODO.md`: with the SSE file exhausted and the ninth
+/// double stacked, a following two-eightbyte INTEGER aggregate that still
+/// belongs in general registers is passed wrongly, over-aligned or not. Eight
+/// leading doubles pass; nine do not.
+#[test]
+fn codegen_aarch64_argument_alignment_follows_the_members() {
+    let code = r#"
+#include <stdarg.h>
+
+struct Plain  { double a, b, c, d; };                                  /* members want 8  */
+struct __attribute__((aligned (32))) Over { double a, b, c, d; };      /* attribute: 32   */
+struct __attribute__((aligned (16))) Over16 { long long a, b; };       /* attribute: 16   */
+struct MemAl  { long long a __attribute__((aligned (16))); long long b; }; /* member: 16   */
+struct Packed { __int128 x; } __attribute__((packed));                 /* packed to 1     */
+struct Nat16  { __int128 x; };                                         /* natural 16      */
+
+#define NAMED(NAME, TY, CHECK)                                            \
+    __attribute__((noinline)) static int NAME(double p0, double p1,       \
+        double p2, double p3, double p4, double p5, double p6, double p7, \
+        double p8, TY s, int tail)                                        \
+    { (void)p0; (void)p8; return ((CHECK) && tail == 7) ? 0 : 1; }
+
+NAMED(n_plain,  struct Plain,  s.a == 1 && s.d == 4)
+NAMED(n_over,   struct Over,   s.a == 1 && s.d == 4)
+NAMED(n_over16, struct Over16, s.a == 1 && s.b == 2)
+NAMED(n_memal,  struct MemAl,  s.a == 1 && s.b == 2)
+NAMED(n_packed, struct Packed, (long long)s.x == 42)
+NAMED(n_nat16,  struct Nat16,  (long long)s.x == 42)
+
+#define VA(NAME, TY, CHECK)                                    \
+    __attribute__((noinline)) static int NAME(int n, ...)      \
+    {                                                          \
+        va_list ap; va_start(ap, n);                           \
+        while (n--) (void)va_arg(ap, double);                  \
+        TY s = va_arg(ap, TY);                                 \
+        int tail = va_arg(ap, int);                            \
+        va_end(ap);                                            \
+        return ((CHECK) && tail == 7) ? 0 : 1;                 \
+    }
+
+VA(v_plain,  struct Plain,  s.a == 1 && s.d == 4)
+VA(v_over,   struct Over,   s.a == 1 && s.d == 4)
+VA(v_over16, struct Over16, s.a == 1 && s.b == 2)
+VA(v_memal,  struct MemAl,  s.a == 1 && s.b == 2)
+VA(v_packed, struct Packed, (long long)s.x == 42)
+VA(v_nat16,  struct Nat16,  (long long)s.x == 42)
+
+#define D9 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0
+
+int main(void)
+{
+    /* The rule under test is AAPCS64's, and the shape that reaches it trips a
+       separate x86-64 defect (see the Rust doc comment). Returning success
+       elsewhere keeps this program honest when it is extracted and run on the
+       host, as the aarch64 sweep script does. */
+#if !defined(__aarch64__)
+    return 0;
+#else
+    struct Plain  pl = { 1, 2, 3, 4 };
+    struct Over   ov = { 1, 2, 3, 4 };
+    struct Over16 o16 = { 1, 2 };
+    struct MemAl  ma = { 1, 2 };
+    struct Packed pk; pk.x = 42;
+    struct Nat16  n16; n16.x = 42;
+
+    if (n_plain(D9, pl, 7))  return 1;
+    if (n_over(D9, ov, 7))   return 2;
+    if (n_over16(D9, o16, 7)) return 3;
+    if (n_memal(D9, ma, 7))  return 4;
+    if (n_packed(D9, pk, 7)) return 5;
+    if (n_nat16(D9, n16, 7)) return 6;
+
+    if (v_plain(9, D9, pl, 7))  return 7;
+    if (v_over(9, D9, ov, 7))   return 8;
+    if (v_over16(9, D9, o16, 7)) return 9;
+    if (v_memal(9, D9, ma, 7))  return 10;
+    if (v_packed(9, D9, pk, 7)) return 11;
+    if (v_nat16(9, D9, n16, 7)) return 12;
+
+    return 0;
+#endif
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        // Native when the host *is* aarch64 (the CI runner), cross-compiled
+        // under qemu otherwise. Never run on an x86-64 host, for the reason in
+        // the doc comment.
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(
+                compile_and_run(
+                    &format!("codegen_arg_align_members{opt}"),
+                    code,
+                    &[opt.to_string()]
+                ),
+                0,
+                "native aarch64 at {opt}"
+            );
+        }
+        if let Some(status) = compile_and_run_aarch64("codegen_arg_align_members_a64", code, opt) {
+            assert_eq!(status, 0, "aarch64 at {opt}");
+        }
+    }
+}
+
 /// An argument more aligned than the call boundary needs the outgoing area's
 /// *base* aligned, not just its offset within the area.
 ///
@@ -7708,15 +7832,8 @@ __attribute__((noinline)) static int spilled32(int a, int b, int c, int d,
 }
 
 /* `va_arg` rounds the overflow pointer to the argument's own alignment. The
-   leading doubles push it past the SSE file so it really comes off the stack.
-
-   x86-64 only. On aarch64 an over-aligned composite taken from the `__stack`
-   path is read at the wrong offset -- c17 rounds the cursor to 16 where gcc
-   does not round for over-alignment at all -- which is a separate,
-   pre-existing divergence recorded in `cc/doc/TODO.md`. A plain HFA is
-   correct there, so guarding on the architecture rather than deleting the
-   case keeps the x86-64 fix under test. */
-#if defined(__x86_64__)
+   leading doubles push it past the SSE file so it really comes off the
+   stack. */
 __attribute__((noinline)) static int va32(int n, ...)
 {
     va_list ap;
@@ -7738,7 +7855,6 @@ __attribute__((noinline)) static int va64(int n, ...)
     va_end(ap);
     return (s.q[0] == 5 && s.q[3] == 8 && after == 99) ? 0 : 1;
 }
-#endif
 
 __attribute__((noinline)) static int mixed(struct A16 p, struct A32 q, int tail)
 {
@@ -7757,14 +7873,12 @@ int main(void)
     /* Nine leading doubles is the count that separates rounding to 16 from
        rounding to the argument's own alignment: with fewer, the two land in
        the same place and the defect is invisible. */
-#if defined(__x86_64__)
     if (va32(0, s32, 99)) return 4;
     if (va32(1, 1.0, s32, 99)) return 4;
     if (va32(5, 1.0, 2.0, 3.0, 4.0, 5.0, s32, 99)) return 4;
     if (va32(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, s32, 99)) return 4;
     if (va64(0, s64, 99)) return 5;
     if (va64(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, s64, 99)) return 5;
-#endif
     if (mixed(s16, s32, 55)) return 6;
     return 0;
 }
@@ -7794,7 +7908,6 @@ int named(int lead, struct A32 s, int tail)
 
 int variadic(int n, ...)
 {
-#if defined(__x86_64__)
     va_list ap;
     va_start(ap, n);
     while (n--) (void)va_arg(ap, double);
@@ -7802,10 +7915,6 @@ int variadic(int n, ...)
     int tail = va_arg(ap, int);
     va_end(ap);
     return (s.a == 1 && s.d == 4 && tail == 9) ? 0 : 1;
-#else
-    (void)n;
-    return 0;
-#endif
 }
 "#;
     const CALLER: &str = r#"

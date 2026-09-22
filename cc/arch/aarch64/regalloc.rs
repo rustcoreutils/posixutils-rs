@@ -1441,7 +1441,7 @@ impl RegAlloc {
                         let at = IncomingOff::take(
                             &mut next_incoming,
                             (*size_bits / 8) as i32,
-                            types.alignment(arg.typ) as i32,
+                            crate::abi::aapcs64::argument_alignment(types, arg.typ) as i32,
                         );
                         self.locations.insert(pseudo, Loc::IncomingArg(at));
                         self.fp_pseudos.insert(pseudo);
@@ -1476,7 +1476,7 @@ impl RegAlloc {
                         let at = IncomingOff::take(
                             &mut next_incoming,
                             (count * elem_bytes) as i32,
-                            types.alignment(arg.typ) as i32,
+                            crate::abi::aapcs64::argument_alignment(types, arg.typ) as i32,
                         );
                         self.locations.insert(pseudo, Loc::IncomingArg(at));
                         self.fp_pseudos.insert(pseudo);
@@ -1512,7 +1512,7 @@ impl RegAlloc {
                         let at = IncomingOff::take(
                             &mut next_incoming,
                             16,
-                            types.alignment(arg.typ) as i32,
+                            crate::abi::aapcs64::argument_alignment(types, arg.typ) as i32,
                         );
                         self.locations.insert(pseudo, Loc::IncomingArg(at));
                         // Stage C.11: NGRN becomes 8, so nothing after it takes
@@ -1539,7 +1539,7 @@ impl RegAlloc {
                         let at = IncomingOff::take(
                             &mut next_incoming,
                             16,
-                            types.alignment(arg.typ) as i32,
+                            crate::abi::aapcs64::argument_alignment(types, arg.typ) as i32,
                         );
                         self.locations.insert(pseudo, Loc::IncomingArg(at));
                     }
@@ -1568,7 +1568,7 @@ impl RegAlloc {
                         let at = IncomingOff::take(
                             &mut next_incoming,
                             8,
-                            types.alignment(arg.typ) as i32,
+                            crate::abi::aapcs64::argument_alignment(types, arg.typ) as i32,
                         );
                         self.locations.insert(pseudo, Loc::IncomingArg(at));
                     }

@@ -107,6 +107,21 @@ pub struct CompositeType {
     pub size: usize,
     /// Alignment requirement in bytes
     pub align: usize,
+    /// The alignment the **members** require, before a struct-level
+    /// `__attribute__((aligned(N)))` raises `align` above it.
+    ///
+    /// Not "natural alignment": `natural_alignment()` answers `align` for a
+    /// composite and so cannot tell an over-aligned struct from a naturally
+    /// aligned one. This can, and AAPCS64 needs it -- that ABI derives an
+    /// argument's alignment from the members and ignores the type's own
+    /// attribute, so passing a 32-byte-aligned struct must not pad the
+    /// argument area to 32.
+    ///
+    /// Recorded rather than recomputed because `__attribute__((packed))` is
+    /// consumed at parse time as a pack cap and never stored: walking the
+    /// members of a packed struct would answer 16 where the truth is 1.
+    /// `compute_struct_layout` already returns exactly this number.
+    pub member_align: usize,
     /// False for forward declarations
     pub is_complete: bool,
     /// `__attribute__((transparent_union))`: an argument matching **any**
@@ -125,6 +140,7 @@ impl CompositeType {
             enum_constants: Vec::new(),
             size: 0,
             align: 1,
+            member_align: 1,
             is_complete: false,
             transparent: false,
         }
@@ -2612,6 +2628,7 @@ mod tests {
             enum_constants: Vec::new(),
             size: 8,
             align: 8,
+            member_align: 8,
             is_complete: true,
             transparent: false,
         };

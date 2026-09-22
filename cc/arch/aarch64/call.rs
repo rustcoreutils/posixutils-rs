@@ -61,7 +61,13 @@ impl StackArg {
     /// and the callee made the same mistake, so it showed only against
     /// another compiler.
     fn slot_start(&self, at: i32, types: &TypeTable) -> i32 {
-        let align = self.typ.map_or(8, |t| types.alignment(t) as i32).max(8);
+        // `argument_alignment`, not `alignment`: AAPCS64 derives this from the
+        // members and ignores the type's own `aligned` attribute, so an
+        // `aligned(32)` struct is placed where gcc places it rather than
+        // padded to 32. See that function for the measured rule.
+        let align = self.typ.map_or(8, |t| {
+            crate::abi::aapcs64::argument_alignment(types, t) as i32
+        });
         (at + align - 1) & !(align - 1)
     }
 

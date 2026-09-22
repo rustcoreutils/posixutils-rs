@@ -663,6 +663,7 @@ mod tests {
             enum_constants: vec![],
             size,
             align,
+            member_align: align,
             is_complete: true,
             transparent: false,
         }))
@@ -819,6 +820,7 @@ mod tests {
             enum_constants: vec![],
             size: 16,
             align: 16,
+            member_align: 16,
             is_complete: true,
             transparent: false,
         }));

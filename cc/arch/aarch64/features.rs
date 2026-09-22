@@ -295,6 +295,16 @@ impl Aarch64CodeGen {
                 self.emit_va_arg_bytes(dst_loc, scratch1, 0, bytes, false);
                 8
             }
+            // A 128-bit integer is two eightbytes. `emit_va_arg_load` sizes
+            // its move with `OperandSize::from_bits`, which saturates at 64,
+            // so it copied the low half and left the high half whatever the
+            // destination slot happened to hold -- the same saturation the
+            // AAPCS64 path carries its own arm for. Darwin reaches this
+            // emitter instead, and was missed.
+            VaAggKind::Scalar if !is_fp && type_bits == 128 => {
+                self.emit_va_arg_bytes(dst_loc, scratch0, 0, 16, false);
+                16
+            }
             VaAggKind::Scalar => {
                 self.emit_va_arg_load(dst_loc, scratch0, type_bits, is_fp);
                 Self::va_slot_bytes(type_bits).max(8)

@@ -1508,6 +1508,59 @@ int main(void)
     );
 }
 
+/// `va_arg` of an `__int128` copies **both** eightbytes on Darwin too.
+///
+/// Darwin has its own `va_arg` emitter -- every variadic argument is already
+/// on the stack, so there is no register save area to gather from -- and the
+/// fix that gave AAPCS64 a 128-bit arm did not reach it. Its scalar path sizes
+/// the move with `OperandSize::from_bits`, which saturates at 64, so the low
+/// half was copied and the high half was left as whatever the destination slot
+/// held. The *advance* was already 16, which is why the next `va_arg` was
+/// correct and only the value was wrong.
+///
+/// Asserted on assembly because it cannot be executed here: there is no macOS
+/// runner and qemu cannot run Mach-O. Two loads from the argument pointer, at
+/// 0 and at 8, are the property; the linux-aarch64 half of the same rule is
+/// covered behaviourally by `codegen_va_arg_int128_reads_both_eightbytes`.
+#[test]
+fn codegen_darwin_va_arg_int128_copies_both_eightbytes() {
+    let src = r#"
+#include <stdarg.h>
+__int128 wide(int x, ...)
+{
+    __int128 r;
+    va_list ap;
+    va_start(ap, x);
+    while (x--) va_arg(ap, int);
+    r = va_arg(ap, __int128);
+    va_end(ap);
+    return r;
+}
+"#;
+    let asm = asm_for("darwin_va_int128", "aarch64-apple-darwin", src);
+    let body = body_of(&asm, "wide");
+
+    // The pointer is loaded into some register, then read at +0 and +8. Find
+    // the register the second load uses and require a matching first load, so
+    // this cannot pass on a single load plus unrelated traffic.
+    let hi = body
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("ldr x") && l.ends_with(", #8]"))
+        .unwrap_or_else(|| panic!("no high-half load of the __int128:\n{body}"));
+    let base = hi
+        .rsplit_once(", [")
+        .and_then(|(_, rest)| rest.split(',').next())
+        .unwrap_or_else(|| panic!("unparsable load `{hi}`:\n{body}"));
+    assert!(
+        body.lines()
+            .map(str::trim)
+            .any(|l| l.starts_with("ldr x") && l.ends_with(&format!(", [{base}]"))),
+        "the low half must be loaded from {base} as well as the high half \
+         (`{hi}`):\n{body}"
+    );
+}
+
 /// A zero-sized argument takes no register on aarch64, in the caller.
 ///
 /// AAPCS64 gives it no class, and `va_arg` skips it. The caller did not, in

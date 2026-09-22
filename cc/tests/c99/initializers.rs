@@ -2286,3 +2286,73 @@ int main(void) {
         0
     );
 }
+
+/// GNU's obsolete field designator, `fieldname: value`.
+///
+/// It predates C99's `.fieldname = value`; gcc still accepts it under
+/// `-Wdeprecated` and glibc-era sources use it. One token of lookahead
+/// settles the form: inside an initializer list an identifier followed by `:`
+/// cannot be anything else, because a conditional starts `x ?` and a label
+/// cannot appear there.
+///
+/// Four torture tests need it: `20030408-1`, `991228-1`, `compndlit-1` and
+/// `struct-ini-4`.
+#[test]
+fn c99_gnu_colon_field_designator() {
+    let code = r#"
+extern int printf(const char *, ...);
+
+struct s { int a[3]; int c[3]; };
+struct s g1 = { c: {1, 2, 3} };
+
+__extension__ union U { double d; int i[2]; } u = { d: -0.25 };
+
+struct P { int a, b, c; };
+struct P g2 = { b: 5, a: 6, c: 7 };
+/* Mixed with the C99 spelling in one list. */
+struct P g3 = { .b = 5, a: 6, c: 7 };
+/* Nested, at both levels. */
+struct Q { int x; struct P p; };
+struct Q g4 = { x: 1, p: { a: 2, b: 3, c: 4 } };
+/* An array of structs, reached through an index designator. */
+struct P g5[2] = { [1] = { a: 8, c: 9 } };
+
+int main(void) {
+    /* The designated member is set and the others stay zero. */
+    if (g1.c[0] != 1 || g1.c[1] != 2 || g1.c[2] != 3) return 1;
+    if (g1.a[0] != 0 || g1.a[1] != 0 || g1.a[2] != 0) return 2;
+
+    if (u.d != -0.25) return 3;
+
+    if (g2.a != 6 || g2.b != 5 || g2.c != 7) return 4;
+    if (g3.a != 6 || g3.b != 5 || g3.c != 7) return 5;
+    if (g4.x != 1 || g4.p.a != 2 || g4.p.b != 3 || g4.p.c != 4) return 6;
+    if (g5[0].a != 0 || g5[1].a != 8 || g5[1].b != 0 || g5[1].c != 9) return 7;
+
+    /* An automatic object and a compound literal take the same path. */
+    {
+        struct P l = { c: 9, a: 8 };
+        if (l.a != 8 || l.b != 0 || l.c != 9) return 8;
+        struct P cl = (struct P){ b: 1, a: 2, c: 3 };
+        if (cl.a != 2 || cl.b != 1 || cl.c != 3) return 9;
+    }
+    /* A conditional in an initializer must still parse as one. */
+    {
+        int k = 1;
+        struct P q = { k ? 4 : 5, 6, 7 };
+        if (q.a != 4 || q.b != 6 || q.c != 7) return 10;
+    }
+    /* And the C99 spelling on its own is untouched. */
+    {
+        struct P r = { .c = 11, .a = 12 };
+        if (r.a != 12 || r.b != 0 || r.c != 11) return 11;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_gnu_colon_designator", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_gnu_colon_designator_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

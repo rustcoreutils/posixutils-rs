@@ -185,6 +185,32 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let name = self.expect_identifier()?;
                 designators.push(Designator::Field(name));
+            } else if designators.is_empty()
+                && self.peek() == TokenType::Ident
+                && self.next_token_is_special(b':')
+            {
+                // GNU's obsolete field designator, `fieldname: value`, which
+                // predates C99's `.fieldname = value`. gcc still accepts it
+                // (with `-Wdeprecated`), and glibc-era sources use it:
+                //
+                //     union { double d; int i[2]; } u = { d: -0.25 };
+                //     struct s s = { c: {1, 2, 3} };
+                //
+                // One token of lookahead settles it: inside an initializer
+                // list an identifier followed by `:` cannot be anything else.
+                // A conditional starts `x ?`, not `x :`.
+                //
+                // Only the leading, unchained form -- which is all gcc's own
+                // grammar allows -- and the `:` stands in for the `=`, so the
+                // loop must not go on to demand one.
+                let name = self.expect_identifier()?;
+                self.expect_special(b':')?;
+                designators.push(Designator::Field(name));
+                let value = self.parse_initializer()?;
+                return Ok(InitElement {
+                    designators,
+                    value: Box::new(value),
+                });
             } else if self.is_special(b'[') {
                 // Array index designator: `[constant-expression]`, or the GNU
                 // range `[lo ... hi]`. As with a case range, GCC requires the

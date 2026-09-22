@@ -591,6 +591,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Whether the token *after* the current one is the special `c`.
+    ///
+    /// Used where one token of lookahead settles a form: an identifier
+    /// followed by `:` inside an initializer list is GNU's obsolete field
+    /// designator and cannot be anything else.
+    pub(super) fn next_token_is_special(&self, c: u8) -> bool {
+        match self.tokens.get(self.pos + 1) {
+            Some(t) => matches!(t.value, TokenValue::Special(v) if v == c as u32),
+            None => false,
+        }
+    }
+
     pub(crate) fn peek_special(&self) -> Option<u32> {
         let token = self.current();
         if token.typ == TokenType::Special {

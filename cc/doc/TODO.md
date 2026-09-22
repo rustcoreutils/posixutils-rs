@@ -167,22 +167,6 @@ live `int`s cost 72 bytes where gcc uses callee-saved registers and none. Slot
 reuse is the larger multiplier, but this is why even leaf functions carry a
 frame.
 
-### aarch64 cannot assemble a large stack frame
-
-A frame past the AArch64 immediate range produces stack offsets the assembler
-rejects — `Error: immediate offset out of range`. Three 9001-byte locals in one
-function is enough, and no struct copy is involved:
-
-```c
-int main(void){ volatile unsigned char a[9001], b[9001], d[9001];
-                a[0]=1; return a[0]-1; }
-```
-
-Offsets past the range need legalizing — materialize the displacement into a
-scratch register and address through it — in `arch/aarch64/memory.rs`'s
-addressing path. x86-64 has no equivalent limit, so this is aarch64-only and
-invisible to a host-only test run.
-
 ### A by-value struct argument is still copied word by word in the backend
 
 Fixed at the IR level: copies past 128 bytes now become a `memcpy` call, which

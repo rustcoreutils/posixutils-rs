@@ -670,18 +670,52 @@ impl Aarch64CodeGen {
                 });
             }
         } else {
-            // Large frame: use str xzr (8 bytes per instruction)
-            // str unsigned offset range is [0, 32760] for 64-bit — handles all practical frames
+            // Large frame: `str xzr` per qword. Its unsigned offset is twelve
+            // bits scaled by eight, so [0, 32760] -- which the comment here
+            // used to call "all practical frames". It is not: three locals of
+            // 9001 bytes reach 27 KB and a 40 KB array goes past it outright,
+            // and the assembler rejects what it cannot encode
+            // (`Error: immediate offset out of range`).
+            //
+            // Past the range, address through a cursor in X16 -- the
+            // documented scratch for exactly this, AAPCS64 IP0, never in the
+            // allocator's palette -- and advance it as the offsets run out.
+            const MAX_STR_OFFSET: i32 = 32760;
             let mut offset = 0;
+            let mut cursor_base: Option<i32> = None;
             while offset < alloc_size {
-                self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B64,
-                    src: Reg::Xzr,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: base_offset + offset,
-                    },
-                });
+                let absolute = base_offset + offset;
+                if absolute <= MAX_STR_OFFSET {
+                    self.push_lir(Aarch64Inst::Str {
+                        size: OperandSize::B64,
+                        src: Reg::Xzr,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::X29,
+                            offset: absolute,
+                        },
+                    });
+                } else {
+                    // Re-base whenever the remaining displacement would not
+                    // encode, which keeps one `add` per 32 KB rather than one
+                    // per store.
+                    let need_rebase = match cursor_base {
+                        Some(b) => absolute - b > MAX_STR_OFFSET,
+                        None => true,
+                    };
+                    if need_rebase {
+                        self.emit_add_imm_legalized(Reg::X16, Reg::X29, absolute as i64);
+                        cursor_base = Some(absolute);
+                    }
+                    let rel = absolute - cursor_base.unwrap();
+                    self.push_lir(Aarch64Inst::Str {
+                        size: OperandSize::B64,
+                        src: Reg::Xzr,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::X16,
+                            offset: rel,
+                        },
+                    });
+                }
                 offset += 8;
             }
         }

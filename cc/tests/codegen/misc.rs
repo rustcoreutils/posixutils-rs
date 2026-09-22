@@ -10806,3 +10806,80 @@ int main(void) {
         );
     }
 }
+
+/// A stack frame past the AArch64 immediate ranges.
+///
+/// AArch64 encodes an `add` immediate in twelve bits, optionally shifted left
+/// by twelve, and a `str`/`ldr` offset in twelve bits scaled by the access
+/// size. Two places emitted one without checking:
+///
+/// - taking a local's address produced `add x1, x29, #18032`, which the
+///   assembler rejects outright (`Error: immediate out of range`);
+/// - the prologue's frame zeroing produced `str xzr, [x29, #32768]`, one past
+///   the 32760 its own comment called "all practical frames".
+///
+/// Neither is a wrong-answer bug: the assembler refuses the output, so the
+/// build fails. It reached CI because the local aarch64 check only ran -O0,
+/// and inlining at -O2 grows a frame that fit before. Three locals of 9001
+/// bytes reproduces the first at -O0; a 40 KB array reaches the second.
+///
+/// x86-64 has no equivalent limit, so on this host the test guards a
+/// regression rather than proving the fix — that was done by building for
+/// aarch64 and assembling with the cross toolchain, at both opt levels.
+#[test]
+fn codegen_large_stack_frame_offsets_are_encodable() {
+    let code = r#"
+/* Past the add-immediate range: locals land beyond 4095. */
+static int three_big_locals(void) {
+    volatile unsigned char a[9001], b[9001], d[9001];
+    a[0] = 1; b[9000] = 2; d[4500] = 3;
+    return a[0] + b[9000] + d[4500];
+}
+
+/* Past the scaled store-offset range: the frame exceeds 32760. */
+static int one_huge_local(void) {
+    volatile unsigned char e[40000];
+    e[0] = 4; e[39999] = 5;
+    return e[0] + e[39999];
+}
+
+/* A frame that needs more than one re-base of the zeroing cursor. */
+static int very_huge_local(void) {
+    volatile unsigned char f[100000];
+    f[0] = 6; f[50000] = 7; f[99999] = 8;
+    return f[0] + f[50000] + f[99999];
+}
+
+/* Addresses taken across the whole span, so the add path is exercised at
+   several magnitudes rather than only the largest. */
+static int addresses_across_the_frame(void) {
+    volatile unsigned char g[20000];
+    unsigned char *p0 = (unsigned char *)&g[0];
+    unsigned char *p1 = (unsigned char *)&g[4000];
+    unsigned char *p2 = (unsigned char *)&g[5000];
+    unsigned char *p3 = (unsigned char *)&g[19999];
+    *p0 = 1; *p1 = 2; *p2 = 3; *p3 = 4;
+    return (p1 - p0 == 4000) && (p2 - p0 == 5000) && (p3 - p0 == 19999)
+        && *p0 == 1 && *p1 == 2 && *p2 == 3 && *p3 == 4;
+}
+
+int main(void) {
+    if (three_big_locals() != 6) return 1;
+    if (one_huge_local() != 9) return 2;
+    if (very_huge_local() != 21) return 3;
+    if (!addresses_across_the_frame()) return 4;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("codegen_large_frame{}", opt.replace('-', "_")),
+                code,
+                &[opt.to_string()]
+            ),
+            0,
+            "large stack frame failed at {opt}"
+        );
+    }
+}

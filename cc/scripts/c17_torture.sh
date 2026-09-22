@@ -144,6 +144,48 @@ has_x_file() { [ -f "${1%.c}.x" ]; }
 # with a named reason is honest; letting them count as failures is not.
 UNSUPPORTED_RE='vector_size|__label__|__builtin_apply|__builtin_setjmp|__builtin_longjmp|attribute__ *\(\( *alias'
 
+# Features c17 has decided not to implement: GNU-only language extensions, and
+# anything newer than C17. A test that needs one is **out of scope**, not a
+# failure -- counting it as one measures a decision rather than a defect, and
+# invites the same triage every few months.
+#
+# Listed by name, never matched against the source. Scanning for the feature
+# looked tidier and was wrong: `pr86659-1`, `pr86659-2` and `pr87623` all
+# mention `scalar_storage_order` and **pass** anyway, so a content match threw
+# away three cases c17 gets right -- the same trap the note above describes.
+# A name list also means every skip is auditable, and a test added to the suite
+# later shows up as a new failure and gets triaged then, which is the right
+# moment to decide.
+#
+# Post-C17: `_Decimal32/64/128` is TR 24732, folded into C23; `[[...]]` is the
+# C23 attribute syntax.
+OUT_OF_SCOPE_POST_C17=" pr80692 pr123978 pr124358 pr125291 "
+
+# A GNU-only attribute: reverse-endian load/store lowering.
+OUT_OF_SCOPE_GNU_ATTR=" 20230630-2 20230630-4 "
+
+# Two more GNU-only features, each named in cc/doc/TODO.md with what it would
+# take.
+#
+# Nested function definitions: a static chain and executable trampolines.
+OUT_OF_SCOPE_NESTED_FN=" 20010209-1 20010605-1 20030501-1 20040520-1 20090219-1 nest-align-1 nestfunc-7 nest-stdar-1 pr103405 pr22061-3 pr22061-4 "
+
+# A variable-length array as a struct or union member: struct layout computed
+# at run time, and `offsetof` through it.
+OUT_OF_SCOPE_VLA_MEMBER=" 20020412-1 20040308-1 20040423-1 20041218-2 20070919-1 align-nest pr41935 pr82210 "
+
+# gcc-specific *behaviour*, as opposed to a gcc-specific feature. Neither is
+# required by C17 and c17 deliberately does something else; see the
+# "Deliberate divergences" table in cc/doc/TODO.md.
+#
+#   20021127-1  gcc folds llabs() and never calls the program's own definition
+#               of llabs. Matching it means a local definition is ignored.
+#   20031003-1  (int)2147483648.0f is undefined behaviour; gcc's folder
+#               saturates to INT_MAX. aarch64 agrees by hardware accident.
+#   pr46309     a conditional with one `void` arm, which gcc takes as an
+#               extension and C17 6.5.15p3 forbids.
+OUT_OF_SCOPE_GCC_BEHAVIOUR=" 20021127-1 20031003-1 pr46309 "
+
 # Tests gcc on this machine fails exactly as c17 does, verified by running both
 # at -O0 and -O2. Counting them as c17 failures overstates the gap, and they are
 # the kind of thing that gets re-triaged every few months because nothing says
@@ -185,7 +227,20 @@ run_one() {
     if has_x_file "$src"; then
         echo "SKIP	$tag	.x file"; return
     fi
-    if awk "/$UNSUPPORTED_RE/ {found=1} END {exit !found}" "$src" 2>/dev/null; then
+    # Scan the test *and* anything it includes by a relative path. Several
+    # tests are a two-line wrapper around a file elsewhere in the tree --
+    # `pr71626-2` includes `pr71626-1.c`, and `pr109938`/`pr109986` reach into
+    # `gcc.dg/tree-ssa/` -- so the feature that blocks them is not in the file
+    # named on the command line, and scanning only that file called three
+    # `vector_size` tests plain compile failures.
+    local scan_files="$src" inc
+    while read -r inc; do
+        [ -n "$inc" ] || continue
+        [ -f "$(dirname "$src")/$inc" ] && scan_files="$scan_files $(dirname "$src")/$inc"
+    done <<EOF
+$(awk -F'"' '/^[[:space:]]*#[[:space:]]*include[[:space:]]*"/ {print $2}' "$src" 2>/dev/null)
+EOF
+    if awk "/$UNSUPPORTED_RE/ {found=1} END {exit !found}" $scan_files 2>/dev/null; then
         echo "SKIP	$tag	unsupported extension"; return
     fi
     case "$GCC_ALSO_FAILS" in
@@ -199,6 +254,21 @@ run_one() {
             esac;;
     esac
 
+    case "$OUT_OF_SCOPE_POST_C17" in
+        *" $base "*) echo "SKIP	$tag	out of scope: post-C17 feature"; return;;
+    esac
+    case "$OUT_OF_SCOPE_GNU_ATTR" in
+        *" $base "*) echo "SKIP	$tag	out of scope: GNU-only attribute"; return;;
+    esac
+    case "$OUT_OF_SCOPE_NESTED_FN" in
+        *" $base "*) echo "SKIP	$tag	out of scope: nested functions"; return;;
+    esac
+    case "$OUT_OF_SCOPE_VLA_MEMBER" in
+        *" $base "*) echo "SKIP	$tag	out of scope: VLA as a struct member"; return;;
+    esac
+    case "$OUT_OF_SCOPE_GCC_BEHAVIOUR" in
+        *" $base "*) echo "SKIP	$tag	out of scope: gcc-specific behaviour"; return;;
+    esac
     local scan skip flags mult stack
     scan=$(dg_scan "$src")
     skip=${scan%%|*}; scan=${scan#*|}
@@ -258,6 +328,9 @@ run_one() {
 }
 export -f run_one dg_scan has_x_file
 export UNSUPPORTED_RE GCC_ALSO_FAILS NEEDS_OPTIMIZATION
+export OUT_OF_SCOPE_POST_C17 OUT_OF_SCOPE_GNU_ATTR
+export OUT_OF_SCOPE_NESTED_FN OUT_OF_SCOPE_VLA_MEMBER
+export OUT_OF_SCOPE_GCC_BEHAVIOUR
 
 # ------------------------------------------------------------- collect tests
 collect() {

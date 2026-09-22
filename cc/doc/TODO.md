@@ -269,6 +269,12 @@ the project's own filter before earning a verdict:
 | nested functions / `__label__` | **Never** | GCC-only, Clang refuses it, needs executable-stack trampolines. 22 torture instances; see the c-torture section |
 | VLA as a struct member | **No** | GCC-only; needs struct layout computed at run time and `offsetof` through it. 16 torture instances |
 | `_Decimal32/64/128` | **No** | IEEE 754 decimal arithmetic, a whole numeric tower for 2 torture instances |
+| C23 `[[...]]` attributes | **No** | Newer than C17, which is the language c17 implements |
+
+**The standing rule**: anything GNU-specific, or newer than C17, is out of
+scope unless a real corpus forces the question. The c-torture harness skips
+such tests with a named reason rather than counting them as failures -- what
+is left failing is then a list of defects, not a list of decisions.
 
 ### SIMD headers — the blocking is ours
 
@@ -567,8 +573,9 @@ page.
 external checkout (the suite is GPLv3 and is not vendored) and diffs a recorded
 baseline, so a regression fails rather than shifting a percentage.
 
-`execute/` went from **58.5% to 89.96%** (1986 -> 3055 of 3396 test-instances,
-1698 tests at -O0 and -O2) over one series: the libc-alias builtins,
+`execute/` went from **58.5% to 99.12% of what is attempted** (3055 of 3082
+instances; 1986 of 3396 at the start, 1698 tests run at -O0 and -O2) over one
+series: the libc-alias builtins,
 `-fpermissive`, `__complex__`, bare `alloca`, `va_arg` of a small struct,
 bit-field assignment values and promotion, binary128 variadic arguments,
 `__builtin_classify_type`, `creal`/`cimag`/`conj`, the `*_overflow_p` family,
@@ -583,49 +590,66 @@ One conformance gap found while chasing those and not yet fixed: c17 has no
 C17 6.7.3p2 check, so `restrict int x;` is accepted where gcc errors that
 `restrict` may only qualify a pointer to object type.
 
-**What is left — 16 run failures and 73 compile failures (of 3396
-instances; 3055 pass, 252 are skipped).** The table is by cause, with the
-decision taken for each.
+**What is left — 8 run failures and 19 compile failures.** Of 3396 instances:
+3055 pass, 314 are skipped and 27 fail. **3055 of 3082 attempted, 99.12%.**
 
-### Declared out of scope
+### Out of scope, and so skipped rather than counted
 
-These are GNU-only language features, not conformance gaps. None of them
-appears in CPython, in glibc-style headers, or in any corpus c17 targets, and
-the project takes only widely-used extensions. **They are not open work**, and the
-reachable ceiling is about 3106 rather than 3396.
+Anything GNU-specific or newer than C17 is **out of scope**: the harness skips
+it with a named reason instead of reporting a failure, because counting it
+measures a decision rather than a defect. 56 instances are skipped this way, on
+top of the 122 the older `UNSUPPORTED_RE` already caught (`vector_size`,
+`__label__`, `__builtin_apply`, `__builtin_setjmp`, `alias`).
 
-| Group | Inst | What it would take |
+| Category | Inst | Tests |
 |---|---|---|
-| Nested functions | 22 | A static chain and executable trampolines: `20010209-1`, `20010605-1`, `20030501-1`, `20040520-1`, `20090219-1`, `nest-align-1`, `nestfunc-7`, `nest-stdar-1`, `pr103405`, `pr22061-3`, `pr22061-4` |
-| VLA as a struct member | 16 | Struct layout computed at run time, and `offsetof` through it: `20020412-1`, `20040308-1`, `20040423-1`, `20041218-2`, `20070919-1`, `align-nest`, `pr41935`, `pr82210` |
-| `_Decimal64` | 2 | IEEE 754 decimal arithmetic: `pr80692` |
+| Nested functions | 22 | `20010209-1`, `20010605-1`, `20030501-1`, `20040520-1`, `20090219-1`, `nest-align-1`, `nestfunc-7`, `nest-stdar-1`, `pr103405`, `pr22061-3`, `pr22061-4`. Needs a static chain and executable trampolines |
+| VLA as a struct member | 16 | `20020412-1`, `20040308-1`, `20040423-1`, `20041218-2`, `20070919-1`, `align-nest`, `pr41935`, `pr82210`. Needs struct layout computed at run time, and `offsetof` through it |
+| Post-C17 | 8 | `pr80692` (`_Decimal64`, TR 24732), `pr123978`, `pr124358`, `pr125291` (C23 `[[...]]` attributes) |
+| GNU-only attribute | 4 | `20230630-2`, `20230630-4` (`scalar_storage_order`; needs reverse-endian load/store lowering) |
+| gcc-specific *behaviour* | 6 | `20021127-1` (gcc folds `llabs()` and never calls the program's own definition of it), `20031003-1` (gcc's folder saturates undefined behaviour; aarch64 agrees by hardware accident), `pr46309` (a conditional with one `void` arm, which C17 6.5.15p3 forbids) |
+
+These are listed **by name** in the harness, never matched against the source.
+Scanning for the feature looked tidier and was wrong: `pr86659-1`, `pr86659-2`
+and `pr87623` all mention `scalar_storage_order` and **pass** anyway, so a
+content match threw away three cases c17 gets right. A name list also keeps
+every skip auditable, and a test added to the suite later shows up as a new
+failure and gets triaged then -- which is the right moment to decide.
+
+The one thing still matched by content is the older `UNSUPPORTED_RE`, and it
+now follows a relative `#include` too: `pr71626-2`, `pr109938` and `pr109986`
+are thin wrappers around files elsewhere in the tree, so the `vector_size`
+that blocks them is not in the file named on the command line.
+
+Skipping a test that *passes* is reported as a regression, by name -- proved by
+injecting one into a skip list and watching the gate fail.
 
 ### Deliberate divergences from gcc
 
+`20021127-1`, `20031003-1` and `pr46309` are skipped as gcc-specific behaviour
+above; the reasoning is in that table. Two more are divergences c17 keeps but
+does **not** skip, because neither is GNU-specific:
+
 | Test | Inst | Why c17 does not follow |
 |---|---|---|
-| `20021127-1` | 2 | gcc folds `llabs()` and never calls the program's *own* definition of `llabs`. Matching it means a local definition is silently ignored, which is worse than failing the test |
-| `20031003-1` | 2 | `(int)2147483648.0f` is undefined behaviour; gcc's constant folder saturates to `INT_MAX`. aarch64 already agrees by hardware accident, x86-64 does not. Not worth matching folded UB |
-| `991014-1` | 2 | Needs `sizeof` to answer ~9.2 exabytes exactly. `size_bits` returns a `u32`, so nothing wider than `u32::MAX` **bits** has a representable size — `MAX_OBJECT_BYTES` is a consequence of that type, not an arbitrary cap. Widening it is a 288-call-site refactor through the type table, IR instruction sizes, ABI classification and both backends |
+| `991014-1` | 2 | Needs `sizeof` to answer ~9.2 exabytes exactly. `size_bits` returns a `u32`, so nothing wider than `u32::MAX` **bits** has a representable size -- `MAX_OBJECT_BYTES` is a consequence of that type, not an arbitrary cap. Widening it is a 288-call-site refactor through the type table, IR instruction sizes, ABI classification and both backends |
+| `920728-1` | 2 | `return;` in a function returning non-void. C17 6.8.6.4p1 makes it a constraint violation; gcc issues a warning and compiles. `-fpermissive` arguably ought to downgrade it, as it does for implicit `int` |
 
-Complex integer division is a fourth, recorded in `BUILTIN.md`: c17 uses
+Complex integer division is a third, recorded in `BUILTIN.md`: c17 uses
 Smith's method because the exact formula overflows, and so answers `6 + 1i`
 for `(-9 + 38i) / (5 + 6i)` exactly as gcc does.
 
 ### Still open
 
+27 instances across 18 tests, and two thirds of them are one thing.
+
 | Group | Inst | Note |
 |---|---|---|
-| Dead-call elimination proofs | 13 | Call an undefined `link_error` the optimizer is expected to delete, so they fail to *link* at -O2 only: `20011115-1`, `20020720-1`, `20030216-1`, `20030330-1`, `20041114-1`, `compare-3`, `medce-1`, `pure-1`, `shiftopt-1`, `stdarg-4`. Optimizer strength, not a defect — and building real dead-code and value-range analysis would improve -O2 generally |
+| Dead-call elimination proofs | 13 | `20011115-1`, `20020720-1`, `20030216-1`, `20030330-1`, `20041114-1`, `compare-3`, `medce-1`, `pure-1`, `shiftopt-1`, `stdarg-4`. Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link* at -O2 only. Standard C, and optimizer strength rather than a defect -- building real dead-code and value-range analysis would improve -O2 generally, well beyond these tests |
 | Missing optimizations behind `__OPTIMIZE__` | 4 | `20030125-1`, `builtin-constant`. Same class: the tests only assert them when the optimizer is on |
 | `va_arg` tail | 6 | `pr44942` (`long double`), `pr92904` (`__int128`), `va-arg-22` (21 struct sizes from 0 to 72 bytes). Real ABI work on both targets |
-| C23 `[[...]]` attributes | 6 | `pr123978`, `pr124358`, `pr125291`. New attribute syntax; c17 is C17-only, so this is a scope decision as much as a feature |
-| `scalar_storage_order` attribute | 4 | `20230630-2`, `20230630-4`. c17 warns that it ignores the attribute and lays out natively, so the tests read 85 where they want 21. Needs reverse-endian load/store lowering |
-| Conditional with one `void` arm | 2 | `pr46309`. gcc accepts it as an extension; C17 6.5.15p3 requires both or neither |
 | Address of a string-literal element as a constant | 2 | `921019-1`: `(void *)&("X"[0])` in a static initializer |
-| Pre-C99 implicit `int` without `-fpermissive` | 2 | `920728-1`. gcc's own harness supplies a flag c17's does not |
-| Tests that include another test file | 6 | `pr71626-2`, `pr109938`, `pr109986`. Need the included file triaged first |
-| Singletons still to triage | ~10 | mostly `pr*` |
+| The two divergences above | 4 | `991014-1`, `920728-1` |
 
 One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.
 gcc accepts a conditional with one `void` arm as an extension; C17 6.5.15p3

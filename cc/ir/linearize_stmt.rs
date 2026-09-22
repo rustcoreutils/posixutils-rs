@@ -260,16 +260,37 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // back. Otherwise `lab: int x[n]; ... goto lab;` grows the
                     // stack every time round until the program dies.
                     //
-                    // A *forward* jump has no captured pointer yet, and needs
-                    // none: C17 6.8.6.1p1 forbids jumping into the scope of a
-                    // variably modified declaration, so a forward jump either
-                    // stays ahead of every VLA or leaves the block, and the
-                    // block's own exit does the restoring.
+                    // A *forward* jump cannot be decided here: its label has
+                    // no depth recorded yet, and whether it stays inside the
+                    // scope of the VLAs in force or leaves it is exactly what
+                    // decides between no restore and one. It is recorded and
+                    // resolved in `resolve_forward_goto_vla_restores`.
+                    //
+                    // Leaving it to "the block's own exit does the restoring"
+                    // was wrong: the branch *terminates* the block, so
+                    // `close_vla_scope` emits nothing and then drops the
+                    // marks, and the enclosing block has no mark of its own to
+                    // undo them with. A `goto` out of a loop body's inner
+                    // block grew the stack every time round.
                     if let Some(&depth) = self.label_vla_depth.get(&label_str) {
                         if let Some(m) = self.vla_marks.get(depth) {
                             let mark = m.mark;
                             self.emit_stack_restore(mark);
                         }
+                    } else if !self.vla_marks.is_empty() {
+                        let at = self
+                            .current_func
+                            .as_ref()
+                            .and_then(|f| f.get_block(current))
+                            .map_or(0, |b| b.insns.len());
+                        let marks = self.vla_marks.iter().map(|m| m.mark).collect();
+                        self.pending_goto_vla
+                            .push(crate::ir::linearize::PendingGotoVla {
+                                label: label_str.clone(),
+                                bb: current,
+                                at,
+                                marks,
+                            });
                     }
                     self.emit(Instruction::br(target));
                     self.link_bb(current, target);
@@ -3000,6 +3021,47 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// [`Self::close_vla_scope`] knows which of them this block added.
     fn open_vla_scope(&self) -> usize {
         self.vla_marks.len()
+    }
+
+    /// Give every forward `goto` the VLA restore its label turned out to need.
+    ///
+    /// Deferred because a label's depth is known only once it has been placed.
+    /// A jump recorded at depth `G` to a label at depth `L` leaves the scopes
+    /// `L..G`, and the stack as it stood on entry to the first of them is the
+    /// mark at index `L` -- the same rule the backward case applies directly.
+    /// `L == G` means the label is still inside every scope the jump is in,
+    /// which C17 6.8.6.1p1 permits and which must emit nothing: restoring
+    /// there would free a VLA still in scope at the label.
+    ///
+    /// The restore goes *before* the branch, so the insertions into one block
+    /// are applied back to front and the earlier indices stay valid.
+    pub(crate) fn resolve_forward_goto_vla_restores(&mut self) {
+        if self.pending_goto_vla.is_empty() {
+            return;
+        }
+        let mut pending = std::mem::take(&mut self.pending_goto_vla);
+        pending.sort_by_key(|p| (p.bb.0, std::cmp::Reverse(p.at)));
+        let void_ptr = self.types.void_ptr_id;
+        for p in pending {
+            // An undefined label is diagnosed elsewhere; there is no branch
+            // here to put a restore in front of.
+            let Some(&depth) = self.label_vla_depth.get(&p.label) else {
+                continue;
+            };
+            let Some(&mark) = p.marks.get(depth) else {
+                continue;
+            };
+            let insn = Instruction::new(Opcode::StackRestore)
+                .with_src(mark)
+                .with_type_and_size(void_ptr, 64);
+            if let Some(func) = self.current_func.as_mut() {
+                if let Some(bb) = func.get_block_mut(p.bb) {
+                    if p.at <= bb.insns.len() {
+                        bb.insns.insert(p.at, insn);
+                    }
+                }
+            }
+        }
     }
 
     /// Release everything the block allocated and forget its marks.

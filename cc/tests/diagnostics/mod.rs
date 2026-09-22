@@ -19,8 +19,8 @@
 //
 
 use crate::common::{
-    compile_and_run, compile_expect_error, compile_expect_ok, compile_expect_warning,
-    create_c_file, run_c17,
+    compile_and_run, compile_and_run_two_units, compile_expect_error, compile_expect_ok,
+    compile_expect_warning, create_c_file, run_c17,
 };
 
 // ============================================================================
@@ -5014,4 +5014,251 @@ int use(int a) { return helper(a); }
 int main(void) { return use(1) == 2 ? 0 : 1; }
 "#;
     assert_eq!(compile_and_run("diag_plain_inline_ok", code, &[]), 0);
+}
+
+/// An `always_inline` call the inliner merely *declined* is not an error
+/// either.
+///
+/// The caps on caller size and on recursive stack depth are c17's own -- gcc
+/// has no counterpart -- so a refusal by one of them says nothing about
+/// whether an out-of-line definition exists. Reporting it rejected programs
+/// gcc compiles, and this is the shape that reaches it: glibc's
+/// `__fortify_function` is exactly an `extern __inline` `gnu_inline`
+/// `always_inline` definition, and any recursive function over a few hundred
+/// instructions calling one declines the splice.
+///
+/// Two translation units, because that is the arrangement the idiom names: the
+/// header's inline definition promises an out-of-line copy elsewhere, and the
+/// call the inliner left standing is resolved against it.
+#[test]
+fn diagnostics_always_inline_declined_for_stack_depth_is_not_an_error() {
+    let header_user = r#"
+extern __inline __attribute__((__gnu_inline__, __always_inline__))
+int helper(int x) { return x + 1; }
+
+/* Large enough that the recursive-caller stack guard turns the splice down. */
+int rec(int i)
+{
+    int t = 0;
+    if (i <= 0) return 0;
+    t += helper(i + 0);
+    t += helper(i + 1);
+    t += helper(i + 2);
+    t += helper(i + 3);
+    t += helper(i + 4);
+    t += helper(i + 5);
+    t += helper(i + 6);
+    t += helper(i + 7);
+    t += helper(i + 8);
+    t += helper(i + 9);
+    t += helper(i + 10);
+    t += helper(i + 11);
+    t += helper(i + 12);
+    t += helper(i + 13);
+    t += helper(i + 14);
+    t += helper(i + 15);
+    t += helper(i + 16);
+    t += helper(i + 17);
+    t += helper(i + 18);
+    t += helper(i + 19);
+    t += helper(i + 20);
+    t += helper(i + 21);
+    t += helper(i + 22);
+    t += helper(i + 23);
+    t += helper(i + 24);
+    t += helper(i + 25);
+    t += helper(i + 26);
+    t += helper(i + 27);
+    t += helper(i + 28);
+    t += helper(i + 29);
+    t += helper(i + 30);
+    t += helper(i + 31);
+    t += helper(i + 32);
+    t += helper(i + 33);
+    t += helper(i + 34);
+    t += helper(i + 35);
+    t += helper(i + 36);
+    t += helper(i + 37);
+    t += helper(i + 38);
+    t += helper(i + 39);
+    t += helper(i + 40);
+    t += helper(i + 41);
+    t += helper(i + 42);
+    t += helper(i + 43);
+    t += helper(i + 44);
+    t += helper(i + 45);
+    t += helper(i + 46);
+    t += helper(i + 47);
+    t += helper(i + 48);
+    t += helper(i + 49);
+    t += helper(i + 50);
+    t += helper(i + 51);
+    t += helper(i + 52);
+    t += helper(i + 53);
+    t += helper(i + 54);
+    t += helper(i + 55);
+    t += helper(i + 56);
+    t += helper(i + 57);
+    t += helper(i + 58);
+    t += helper(i + 59);
+    t += helper(i + 60);
+    t += helper(i + 61);
+    t += helper(i + 62);
+    t += helper(i + 63);
+    t += helper(i + 64);
+    t += helper(i + 65);
+    t += helper(i + 66);
+    t += helper(i + 67);
+    t += helper(i + 68);
+    t += helper(i + 69);
+    t += helper(i + 70);
+    t += helper(i + 71);
+    t += helper(i + 72);
+    t += helper(i + 73);
+    t += helper(i + 74);
+    t += helper(i + 75);
+    t += helper(i + 76);
+    t += helper(i + 77);
+    t += helper(i + 78);
+    t += helper(i + 79);
+    t += helper(i + 80);
+    t += helper(i + 81);
+    t += helper(i + 82);
+    t += helper(i + 83);
+    t += helper(i + 84);
+    t += helper(i + 85);
+    t += helper(i + 86);
+    t += helper(i + 87);
+    t += helper(i + 88);
+    t += helper(i + 89);
+    t += helper(i + 90);
+    t += helper(i + 91);
+    t += helper(i + 92);
+    t += helper(i + 93);
+    t += helper(i + 94);
+    t += helper(i + 95);
+    t += helper(i + 96);
+    t += helper(i + 97);
+    t += helper(i + 98);
+    t += helper(i + 99);
+    t += helper(i + 100);
+    t += helper(i + 101);
+    t += helper(i + 102);
+    t += helper(i + 103);
+    t += helper(i + 104);
+    t += helper(i + 105);
+    t += helper(i + 106);
+    t += helper(i + 107);
+    t += helper(i + 108);
+    t += helper(i + 109);
+    t += helper(i + 110);
+    t += helper(i + 111);
+    t += helper(i + 112);
+    t += helper(i + 113);
+    t += helper(i + 114);
+    t += helper(i + 115);
+    t += helper(i + 116);
+    t += helper(i + 117);
+    t += helper(i + 118);
+    t += helper(i + 119);
+    t += helper(i + 120);
+    t += helper(i + 121);
+    t += helper(i + 122);
+    t += helper(i + 123);
+    t += helper(i + 124);
+    t += helper(i + 125);
+    t += helper(i + 126);
+    t += helper(i + 127);
+    t += helper(i + 128);
+    t += helper(i + 129);
+    t += helper(i + 130);
+    t += helper(i + 131);
+    t += helper(i + 132);
+    t += helper(i + 133);
+    t += helper(i + 134);
+    t += helper(i + 135);
+    t += helper(i + 136);
+    t += helper(i + 137);
+    t += helper(i + 138);
+    t += helper(i + 139);
+    t += helper(i + 140);
+    t += helper(i + 141);
+    t += helper(i + 142);
+    t += helper(i + 143);
+    t += helper(i + 144);
+    t += helper(i + 145);
+    t += helper(i + 146);
+    t += helper(i + 147);
+    t += helper(i + 148);
+    t += helper(i + 149);
+    t += helper(i + 150);
+    t += helper(i + 151);
+    t += helper(i + 152);
+    t += helper(i + 153);
+    t += helper(i + 154);
+    t += helper(i + 155);
+    t += helper(i + 156);
+    t += helper(i + 157);
+    t += helper(i + 158);
+    t += helper(i + 159);
+    t += helper(i + 160);
+    t += helper(i + 161);
+    t += helper(i + 162);
+    t += helper(i + 163);
+    t += helper(i + 164);
+    t += helper(i + 165);
+    t += helper(i + 166);
+    t += helper(i + 167);
+    t += helper(i + 168);
+    t += helper(i + 169);
+    t += helper(i + 170);
+    t += helper(i + 171);
+    t += helper(i + 172);
+    t += helper(i + 173);
+    t += helper(i + 174);
+    t += helper(i + 175);
+    t += helper(i + 176);
+    t += helper(i + 177);
+    t += helper(i + 178);
+    t += helper(i + 179);
+    t += helper(i + 180);
+    t += helper(i + 181);
+    t += helper(i + 182);
+    t += helper(i + 183);
+    t += helper(i + 184);
+    t += helper(i + 185);
+    t += helper(i + 186);
+    t += helper(i + 187);
+    t += helper(i + 188);
+    t += helper(i + 189);
+    t += helper(i + 190);
+    t += helper(i + 191);
+    t += helper(i + 192);
+    t += helper(i + 193);
+    t += helper(i + 194);
+    t += helper(i + 195);
+    t += helper(i + 196);
+    t += helper(i + 197);
+    t += helper(i + 198);
+    t += helper(i + 199);
+    return t + rec(i - 1);
+}
+
+int main(void) { return rec(1) == 0 ? 1 : 0; }
+"#;
+    let out_of_line = r#"
+int helper(int x) { return x + 1; }
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run_two_units(
+                &format!("diag_always_inline_declined{opt}"),
+                header_user,
+                out_of_line,
+                &[opt.to_string()],
+            ),
+            0,
+            "at {opt}"
+        );
+    }
 }

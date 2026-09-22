@@ -2048,6 +2048,54 @@ int main(void) {
         if (++m < 200000) goto lab3;
         if (keep[0] != 77) return 3;
     }
+
+    /* A *forward* `goto` out of the block that declared the VLA. The branch
+       terminates the block, so the block's own exit emits nothing and drops
+       its mark, and the enclosing block has no mark of its own to undo it
+       with -- the stack grew every time round. */
+    for (int i = 0; i < 200000; i++) {
+        { int v[i % 500 + 1]; v[0] = i; p = v; if (v[0] == i) goto fwd; }
+    fwd: ;
+    }
+    /* Out of two nested blocks at once, and out of a `switch` arm. */
+    for (int i = 0; i < 200000; i++) {
+        {
+            int a[i % 500 + 1]; a[0] = 1; p = a;
+            { int b[i % 500 + 1]; b[0] = 2; p = b; if (a[0] + b[0] == 3) goto fwd2; }
+        }
+    fwd2: ;
+    }
+    for (int i = 0; i < 200000; i++) {
+        switch (i & 1) {
+        case 0: { int c[i % 500 + 1]; c[0] = 3; p = c; goto fwd3; }
+        default: break;
+        }
+    fwd3: ;
+    }
+
+    /* The converse, which must emit *no* restore: C17 6.8.6.1p1 allows a
+       forward jump that stays inside the scope, and the array is still live
+       at the label. Freeing it there is the way to get this backwards. */
+    {
+        int n = 64;
+        char v[n];
+        for (int i = 0; i < 64; i++) v[i] = 7;
+        if (n) goto inscope;
+        for (int i = 0; i < 64; i++) v[i] = 9;
+    inscope:
+        if (v[0] != 7 || v[n - 1] != 7) return 5;
+    }
+    /* And a jump over a *later* declaration in the same block leaves the
+       earlier one alone. */
+    {
+        int n = 8;
+        int early[n];
+        early[0] = 31;
+        if (n) goto after;
+        early[0] = 99;
+    after:
+        if (early[0] != 31) return 6;
+    }
     return 0;
 }
 "#;

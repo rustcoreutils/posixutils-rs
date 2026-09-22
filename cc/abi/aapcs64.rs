@@ -48,7 +48,7 @@ use crate::types::{TypeId, TypeKind, TypeTable};
 /// reports `_Alignof <= 16` for every non-attributed type on this target,
 /// including a 32-byte vector -- but it is what gcc's own code does, so it is
 /// written as a clamp rather than left implicit.
-pub fn argument_alignment(types: &TypeTable, ty: TypeId) -> usize {
+pub(crate) fn argument_alignment(types: &TypeTable, ty: TypeId) -> usize {
     let raw = match types.kind(ty) {
         // `composite.align` would carry the struct's own attribute; the
         // member-derived value is recorded separately for exactly this.
@@ -80,7 +80,7 @@ pub fn argument_alignment(types: &TypeTable, ty: TypeId) -> usize {
 /// `None` means the run does not fit. Stage C.11 then sets NGRN to
 /// `num_regs`, so every later argument is on the stack as well -- unlike
 /// System V, which leaves the registers it did not fit in available.
-pub fn gr_run_start(
+pub(crate) fn gr_run_start(
     types: &TypeTable,
     ty: TypeId,
     ngrn: usize,
@@ -114,7 +114,11 @@ pub fn gr_run_start(
 /// `va_arg` rounds the cursor up to the type's own alignment. c17 follows
 /// `va_arg` -- which means the caller has to realign its outgoing area to
 /// match, since `%sp` is only guaranteed to sixteen.
-pub fn darwin_va_slot(types: &TypeTable, ty: TypeId, target: &crate::target::Target) -> (i32, i32) {
+pub(crate) fn darwin_va_slot(
+    types: &TypeTable,
+    ty: TypeId,
+    target: &crate::target::Target,
+) -> (i32, i32) {
     let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, target);
     if matches!(abi.classify_param(ty, types), ArgClass::Indirect { .. }) {
         return (8, 8);

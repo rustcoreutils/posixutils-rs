@@ -146,17 +146,27 @@ fn suppress_forwarding_bodies(module: &mut Module) {
 fn check_forwarding_resolved(module: &Module) {
     // Two kinds of function have no out-of-line copy to fall back on. A
     // `__builtin_va_arg_pack` forwarder is suppressed on the assumption it
-    // always inlines. And a C99 inline definition marked `always_inline` is
-    // one the program has *asked* to be substituted everywhere -- gcc rejects
-    // the translation unit when it cannot be.
+    // always inlines. And an inline definition marked `always_inline` that no
+    // call site *can* substitute -- it reads its own variadic frame, is
+    // recursive, takes a label's address, returns an address, or is also
+    // marked `noinline` -- is a contradiction gcc rejects too.
     //
     // A plain C99 inline definition is deliberately not in this set: its
     // external definition may live in another translation unit, so an ordinary
     // call to it is correct and the linker resolves it.
+    //
+    // Neither is an `always_inline` function the inliner merely *declined*.
+    // Its caps on caller size and on recursive stack depth are c17's own, and
+    // gcc has no counterpart: treating those refusals as unresolvable rejected
+    // programs gcc compiles, which any recursive function over a few hundred
+    // instructions calling a glibc `__fortify_function` reached. The call is
+    // left standing and the linker resolves it against the out-of-line
+    // definition the inline definition promises.
+    let impossible = crate::ir::inline::impossible_always_inline(module);
     let suppressed: std::collections::BTreeMap<&str, bool> = module
         .functions
         .iter()
-        .filter(|f| !f.emit && (forwards_caller_arguments(f) || f.is_always_inline))
+        .filter(|f| !f.emit && (forwards_caller_arguments(f) || impossible.contains(&f.name)))
         .map(|f| (f.name.as_str(), forwards_caller_arguments(f)))
         .collect();
     if suppressed.is_empty() {

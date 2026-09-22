@@ -107,6 +107,41 @@ pub struct InlineCandidate {
     pub ret_is_address: bool,
 }
 
+impl InlineCandidate {
+    /// Whether no call site can ever substitute this function's body.
+    ///
+    /// Every one of these is a property of the *callee* and a reason the body
+    /// cannot be spliced at all, so `__attribute__((always_inline))` on such a
+    /// function is a contradiction -- gcc rejects the program, and
+    /// `opt::check_forwarding_resolved` does too.
+    ///
+    /// The size and stack-safety caps in [`should_inline`] are a different
+    /// thing entirely: c17's own budget, which gcc has no counterpart for. A
+    /// call refused by one of those is an ordinary call that links against the
+    /// out-of-line definition, and diagnosing it rejected programs gcc
+    /// compiles -- a recursive function of any size calling a glibc
+    /// `__fortify_function` was enough.
+    fn cannot_be_inlined(&self) -> bool {
+        self.defines_varargs_frame
+            || self.is_recursive
+            || self.takes_label_addr
+            || self.ret_is_address
+            || self.is_noinline
+    }
+}
+
+/// The `always_inline` functions no call site can ever substitute.
+///
+/// What `opt::check_forwarding_resolved` reports. Asked of the same analysis
+/// the inliner itself uses, so the two cannot drift apart.
+pub(crate) fn impossible_always_inline(module: &Module) -> std::collections::BTreeSet<String> {
+    analyze_all_functions(module)
+        .into_iter()
+        .filter(|(_, c)| c.is_always_inline && c.cannot_be_inlined())
+        .map(|(name, _)| name)
+        .collect()
+}
+
 /// Build a map of function name -> call count across the entire module in a single pass.
 fn build_call_count_map(module: &Module) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::with_capacity(module.functions.len());
@@ -201,14 +236,22 @@ fn should_inline(
     caller_size: usize,
     caller_is_recursive: bool,
 ) -> bool {
-    // Never inline if disqualifying conditions.
+    // Never inline if disqualifying conditions. These are the ones that make
+    // a splice impossible rather than undesirable, and
+    // `InlineCandidate::cannot_be_inlined` is where they are listed, so the
+    // diagnostic in `opt` and this decision cannot disagree about which is
+    // which. It covers `__attribute__((noinline))` -- a directive, not a hint:
+    // people reach for it to keep a frame on the stack, to keep a symbol
+    // callable, or to work around a miscompile, and size heuristics do not get
+    // a vote -- and a `Ret` that yields an address, which a call's result
+    // pseudo is not.
     //
     // `alloca` is not among them: the splice brackets the body with a stack
     // save and restore, so the allocation dies where the call would have
     // returned. Refusing was silent -- gcc inlines these -- and combined with
     // a `__builtin_va_arg_pack` forwarder, whose body is suppressed on the
     // assumption it always inlines, it left an undefined symbol at link.
-    if candidate.defines_varargs_frame || candidate.is_recursive || candidate.takes_label_addr {
+    if candidate.cannot_be_inlined() {
         return false;
     }
 
@@ -216,23 +259,6 @@ fn should_inline(
     // Lifting the restriction generally would make every small `va_list`
     // helper inlinable at -O2 -- a large new surface for no correctness gain.
     if candidate.consumes_va_list && !candidate.is_always_inline {
-        return false;
-    }
-
-    // `__attribute__((noinline))` is a directive, not a hint: people reach for
-    // it to keep a frame on the stack, to keep a symbol callable, or to work
-    // around a miscompile. Size heuristics do not get a vote.
-    if candidate.is_noinline {
-        return false;
-    }
-
-    // Such a `Ret` yields the address of the value, but a call's result pseudo
-    // is a local whose slot holds the value itself. Splicing the body in hands
-    // the caller an address where it expects the value, and the difference is
-    // invisible — it reads the first eight bytes of the pointer as a float.
-    // Bridging the two needs the base type and stride, which the optimizer has
-    // no `TypeTable` to look up. See `Function::ret_is_address`.
-    if candidate.ret_is_address {
         return false;
     }
 

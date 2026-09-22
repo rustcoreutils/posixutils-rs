@@ -15,6 +15,26 @@ use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, UnaryOp};
 use crate::types::{MemberInfo, TypeId, TypeKind};
 
+/// A read-modify-write target whose address has been computed **once**.
+///
+/// C17 evaluates the target of a read-modify-write exactly once -- 6.5.16.2p3
+/// for `E1 op= E2`, 6.5.3.1p2 for `++E`, 6.5.2.4p2 for `E++`. All three used
+/// to read the old value from the *expression* and then re-derive the address
+/// for the store, so every subexpression of the target ran twice:
+/// `b[i++] += 5` incremented `i` twice and updated the wrong element,
+/// `*p++ += 1` advanced `p` by two, and `a[f()] |= 1` called `f` twice.
+///
+/// `base` addresses the object, or its storage unit when `bitfield` is set --
+/// a bit-field has no address of its own, so it carries its placement
+/// instead.
+pub(crate) struct RmwPlace {
+    base: PseudoId,
+    /// `(byte offset, bit offset, bit width, storage bytes, field type)` --
+    /// spelled to match `emit_bitfield_load`/`_store`, which are the only
+    /// consumers.
+    bitfield: Option<(usize, u32, u32, u32, TypeId)>,
+}
+
 /// The per-half opcodes a complex operation uses, chosen once from the base
 /// type rather than at each emit site.
 ///
@@ -617,46 +637,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             op_bits,
         ));
         result
-    }
-
-    /// Store `value` into a struct member at `base`, honouring a bitfield's
-    /// placement within its storage unit.
-    ///
-    /// A plain `Instruction::store` writes the whole storage unit, which for a
-    /// bitfield overwrites every neighbour sharing it -- and, because the value
-    /// is written at bit 0, gets the field itself wrong too. Assignment and
-    /// compound assignment already went through `emit_bitfield_store`; `++` and
-    /// `--` did not, which is the entire bug behind `s.field++` corrupting the
-    /// struct around it.
-    pub(crate) fn emit_member_store(
-        &mut self,
-        base: PseudoId,
-        member_info: &MemberInfo,
-        value: PseudoId,
-    ) {
-        if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
-            member_info.bit_offset,
-            member_info.bit_width,
-            member_info.access_bytes,
-        ) {
-            self.emit_bitfield_store(
-                base,
-                member_info.offset,
-                bit_offset,
-                bit_width,
-                storage_size,
-                value,
-            );
-        } else {
-            let size = self.types.size_bits(member_info.typ);
-            self.emit(Instruction::store(
-                value,
-                base,
-                member_info.offset as i64,
-                member_info.typ,
-                size,
-            ));
-        }
     }
 
     /// Emit code to store a value into a bitfield
@@ -2067,6 +2047,133 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
+    /// Resolve a read-modify-write target, evaluating its subexpressions once.
+    ///
+    /// `None` for a bare identifier: it has no subexpressions, so nothing can
+    /// be evaluated twice, and the name-based paths handle the shapes that
+    /// have no address at all -- a parameter living in `var_map`, and a static
+    /// local behind its sentinel.
+    pub(crate) fn resolve_rmw_place(&mut self, target: &Expr) -> Option<RmwPlace> {
+        match &target.kind {
+            ExprKind::Ident(_) => None,
+            ExprKind::Member { expr, member } => {
+                let base = self.linearize_lvalue(expr);
+                let struct_type = {
+                    let declared = self.expr_type(expr);
+                    self.resolve_struct_type(declared)
+                };
+                Some(self.member_place(base, struct_type, *member, target))
+            }
+            ExprKind::Arrow { expr, member } => {
+                // The pointer's *value* is the base address.
+                let base = self.linearize_expr(expr);
+                let struct_type = {
+                    let ptr_type = self.expr_type(expr);
+                    let declared = self
+                        .types
+                        .base_type(ptr_type)
+                        .unwrap_or_else(|| self.expr_type(target));
+                    self.resolve_struct_type(declared)
+                };
+                Some(self.member_place(base, struct_type, *member, target))
+            }
+            // Every other lvalue has one address and no bit-field placement.
+            // `linearize_lvalue` is what evaluates the subexpressions, and it
+            // does so once.
+            _ => Some(RmwPlace {
+                base: self.linearize_lvalue(target),
+                bitfield: None,
+            }),
+        }
+    }
+
+    /// The place a struct or union member occupies, relative to `base`.
+    fn member_place(
+        &mut self,
+        base: PseudoId,
+        struct_type: TypeId,
+        member: crate::strings::StringId,
+        target: &Expr,
+    ) -> RmwPlace {
+        let target_typ = self.expr_type(target);
+        let info = self
+            .types
+            .find_member(struct_type, member)
+            .unwrap_or(MemberInfo {
+                offset: 0,
+                typ: target_typ,
+                bit_offset: None,
+                bit_width: None,
+                access_bytes: None,
+            });
+        let bitfield = match (info.bit_offset, info.bit_width, info.access_bytes) {
+            (Some(bit_offset), Some(bit_width), Some(storage)) => {
+                Some((info.offset, bit_offset, bit_width, storage, info.typ))
+            }
+            // Not a bit-field: fold the member offset into the base so the
+            // load and the store share one address.
+            _ => {
+                let base = self.offset_address(base, info.offset as i64);
+                return RmwPlace {
+                    base,
+                    bitfield: None,
+                };
+            }
+        };
+        RmwPlace { base, bitfield }
+    }
+
+    /// `base + offset` as an address, or `base` itself when the offset is zero.
+    fn offset_address(&mut self, base: PseudoId, offset: i64) -> PseudoId {
+        if offset == 0 {
+            return base;
+        }
+        let delta = self.emit_const(offset as i128, self.types.long_id);
+        let addr = self.alloc_reg_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Add,
+            addr,
+            base,
+            delta,
+            self.types.long_id,
+            64,
+        ));
+        addr
+    }
+
+    /// The target's current value, read through an already-resolved place.
+    pub(crate) fn load_rmw_place(&mut self, place: &RmwPlace, typ: TypeId) -> PseudoId {
+        if let Some((offset, bit_offset, bit_width, storage, field_typ)) = place.bitfield {
+            return self.emit_bitfield_load(
+                place.base, offset, bit_offset, bit_width, storage, field_typ,
+            );
+        }
+        let size = self.types.size_bits(typ);
+        let val = self.alloc_reg_pseudo();
+        self.emit(Instruction::load(val, place.base, 0, typ, size));
+        val
+    }
+
+    /// Store back through the same place.
+    ///
+    /// Answers the bit-field's width and type when the store went through one,
+    /// so the caller can reduce the expression's own value to what the field
+    /// now holds (C17 6.5.16.1p2).
+    pub(crate) fn store_rmw_place(
+        &mut self,
+        place: &RmwPlace,
+        val: PseudoId,
+        typ: TypeId,
+    ) -> Option<(u32, TypeId)> {
+        if let Some((offset, bit_offset, bit_width, storage, field_typ)) = place.bitfield {
+            self.emit_bitfield_store(place.base, offset, bit_offset, bit_width, storage, val);
+            return Some((bit_width, field_typ));
+        }
+        let size = self.types.size_bits(typ);
+        self.emit(Instruction::store(val, place.base, 0, typ, size));
+        None
+    }
+
     pub(crate) fn emit_assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) -> PseudoId {
         let target_typ = self.expr_type(target);
         let value_typ = self.expr_type(value);
@@ -2267,21 +2374,59 @@ impl<'a> super::linearize::Linearizer<'a> {
                 64,
             ));
             scaled
-        } else if bool_rhs.is_some() {
+        } else if bool_rhs.is_some() || op != AssignOp::Assign {
+            // A compound assignment leaves its right operand alone here. It is
+            // converted to the *common* type below, not down to the target's:
+            // narrowing `-5` to `unsigned char` first made `x /= y` divide
+            // 50 by 251 and store 0, where C17 6.5.16.2p3 computes `50 / -5`
+            // at `int` and stores `(unsigned char)-10`.
             rhs
         } else {
             self.emit_convert(rhs, value_typ, target_typ)
         };
 
+        // The target is resolved exactly once (C17 6.5.16.2p3) and the same
+        // place serves the load below and the store further down. Reading the
+        // old value from the *expression* and then re-deriving the address ran
+        // every subexpression of the target twice.
+        //
+        // A plain assignment resolves its target here too. It never had the
+        // double-evaluation bug -- there is no load to pair with the store --
+        // but it must share the one store path, and C17 6.5.16p3 leaves the
+        // order of the two operands unsequenced, so computing the address
+        // after the value is allowed.
+        let place = self.resolve_rmw_place(target);
+
         let final_val = match op {
             AssignOp::Assign => rhs,
             _ => {
                 // Compound assignment - get current value and apply operation
-                let lhs = self.linearize_expr(target);
+                let lhs = match &place {
+                    Some(p) => self.load_rmw_place(p, target_typ),
+                    None => self.linearize_expr(target),
+                };
                 let result = self.alloc_reg_pseudo();
 
-                let is_float = self.types.is_float(target_typ);
-                let is_unsigned = self.types.is_unsigned(target_typ);
+                // `E1 op= E2` is `E1 = E1 op E2` (C17 6.5.16.2p3), so the
+                // operation runs at the operands' common type after the
+                // integer promotions -- not at the target's type, which is
+                // only what the *result* converts back to.
+                //
+                // The shifts are the exception: 6.5.7p3 gives the result the
+                // promoted *left* operand's type, and promotes the right one
+                // on its own.
+                let arith_type = if is_ptr_arith {
+                    // Pointer arithmetic already scaled the index; the add
+                    // happens at pointer width.
+                    self.types.long_id
+                } else if matches!(op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
+                    self.types.integer_promote(target_typ)
+                } else {
+                    self.types.common_type(target_typ, value_typ)
+                };
+
+                let is_float = self.types.is_float(arith_type);
+                let is_unsigned = self.types.is_unsigned(arith_type);
                 let opcode = match op {
                     AssignOp::AddAssign => {
                         if is_float {
@@ -2335,241 +2480,92 @@ impl<'a> super::linearize::Linearizer<'a> {
                     AssignOp::Assign => unreachable!(),
                 };
 
-                // For pointer arithmetic, use Long type for the operation
-                let arith_type = if is_ptr_arith {
-                    self.types.long_id
-                } else {
-                    target_typ
-                };
-
                 let arith_size = self.types.size_bits(arith_type);
+                // Both operands into the arithmetic type. The left one is the
+                // object's current value, read at the target's type; the right
+                // one is whatever it was written as.
+                let lhs = if is_ptr_arith {
+                    lhs
+                } else {
+                    self.emit_convert(lhs, target_typ, arith_type)
+                };
+                let rhs = if is_ptr_arith {
+                    rhs
+                } else if matches!(op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
+                    // The shift count is promoted on its own and is not
+                    // brought to the left operand's type.
+                    self.emit_convert(rhs, value_typ, self.types.integer_promote(value_typ))
+                } else {
+                    self.emit_convert(rhs, value_typ, arith_type)
+                };
                 self.emit(Instruction::binop(
                     opcode, result, lhs, rhs, arith_type, arith_size,
                 ));
-                result
+                // And the result back, which is the conversion that makes
+                // `(x /= y)` yield what `x` now holds.
+                if is_ptr_arith {
+                    result
+                } else {
+                    self.emit_convert(result, arith_type, target_typ)
+                }
             }
         };
 
         // Store based on target expression type
         let target_size = self.types.size_bits(target_typ);
-        // Set by whichever arm stores through a bit-field, so the value this
-        // returns can be reduced to what the field actually holds.
-        let mut stored_bitfield: Option<(u32, TypeId)> = None;
-        match &target.kind {
-            ExprKind::Ident(symbol_id) => {
-                let name_str = self.symbol_name(*symbol_id);
-                if let Some(local) = self.locals.get(symbol_id).cloned() {
-                    // Check if this is a static local (sentinel value)
-                    if local.sym.0 == u32::MAX {
-                        self.emit_static_local_store(&name_str, final_val, target_typ, target_size);
-                    } else {
-                        // Regular local variable: emit Store
-                        self.emit(Instruction::store(
-                            final_val,
-                            local.sym,
-                            0,
-                            target_typ,
-                            target_size,
-                        ));
-                    }
-                } else if self.var_map.contains_key(&name_str) {
-                    // Parameter: this is not SSA-correct but parameters
-                    // shouldn't be reassigned. If they are, we'd need to
-                    // demote them to locals. For now, just update the mapping.
-                    self.var_map.insert(name_str.clone(), final_val);
+        if let Some(p) = &place {
+            // The address the load came from, so no subexpression runs twice.
+            let narrowed = self.store_rmw_place(p, final_val, target_typ);
+            return match narrowed {
+                Some((bit_width, typ)) => self.narrow_to_bitfield(final_val, bit_width, typ),
+                None => final_val,
+            };
+        }
+        // Only a bare identifier reaches here: `resolve_rmw_place`
+        // answers `Some` for every other lvalue and the branch above
+        // stores through it. The arms that used to be here re-derived
+        // an address that had already been computed, which is exactly
+        // what ran the target a second time.
+        if let ExprKind::Ident(symbol_id) = &target.kind {
+            let name_str = self.symbol_name(*symbol_id);
+            if let Some(local) = self.locals.get(symbol_id).cloned() {
+                // Check if this is a static local (sentinel value)
+                if local.sym.0 == u32::MAX {
+                    self.emit_static_local_store(&name_str, final_val, target_typ, target_size);
                 } else {
-                    // Global variable - emit store
-                    let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, name_str);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
+                    // Regular local variable: emit Store
                     self.emit(Instruction::store(
                         final_val,
-                        sym_id,
+                        local.sym,
                         0,
                         target_typ,
                         target_size,
                     ));
                 }
-            }
-            ExprKind::Member { expr, member } => {
-                // Struct member: get address and store with offset
-                let base = self.linearize_lvalue(expr);
-                let base_struct_type = self.expr_type(expr);
-                // Resolve if the struct type is incomplete (forward-declared)
-                let struct_type = self.resolve_struct_type(base_struct_type);
-                let member_info =
-                    self.types
-                        .find_member(struct_type, *member)
-                        .unwrap_or(MemberInfo {
-                            offset: 0,
-                            typ: target_typ,
-                            bit_offset: None,
-                            bit_width: None,
-                            access_bytes: None,
-                        });
-                if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
-                    member_info.bit_offset,
-                    member_info.bit_width,
-                    member_info.access_bytes,
-                ) {
-                    // Bitfield store
-                    self.emit_bitfield_store(
-                        base,
-                        member_info.offset,
-                        bit_offset,
-                        bit_width,
-                        storage_size,
-                        final_val,
-                    );
-                    stored_bitfield = Some((bit_width, member_info.typ));
-                } else {
-                    let member_size = self.types.size_bits(member_info.typ);
-                    self.emit(Instruction::store(
-                        final_val,
-                        base,
-                        member_info.offset as i64,
-                        member_info.typ,
-                        member_size,
-                    ));
+            } else if self.var_map.contains_key(&name_str) {
+                // Parameter: this is not SSA-correct but parameters
+                // shouldn't be reassigned. If they are, we'd need to
+                // demote them to locals. For now, just update the mapping.
+                self.var_map.insert(name_str.clone(), final_val);
+            } else {
+                // Global variable - emit store
+                let sym_id = self.alloc_pseudo();
+                let pseudo = Pseudo::sym(sym_id, name_str);
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(pseudo);
                 }
-            }
-            ExprKind::Arrow { expr, member } => {
-                // Pointer member: pointer value is the base address
-                let ptr = self.linearize_expr(expr);
-                let ptr_type = self.expr_type(expr);
-                let base_struct_type = self.types.base_type(ptr_type).unwrap_or(target_typ);
-                // Resolve if the struct type is incomplete (forward-declared)
-                let struct_type = self.resolve_struct_type(base_struct_type);
-                let member_info =
-                    self.types
-                        .find_member(struct_type, *member)
-                        .unwrap_or(MemberInfo {
-                            offset: 0,
-                            typ: target_typ,
-                            bit_offset: None,
-                            bit_width: None,
-                            access_bytes: None,
-                        });
-                if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
-                    member_info.bit_offset,
-                    member_info.bit_width,
-                    member_info.access_bytes,
-                ) {
-                    // Bitfield store
-                    self.emit_bitfield_store(
-                        ptr,
-                        member_info.offset,
-                        bit_offset,
-                        bit_width,
-                        storage_size,
-                        final_val,
-                    );
-                    stored_bitfield = Some((bit_width, member_info.typ));
-                } else {
-                    let member_size = self.types.size_bits(member_info.typ);
-                    self.emit(Instruction::store(
-                        final_val,
-                        ptr,
-                        member_info.offset as i64,
-                        member_info.typ,
-                        member_size,
-                    ));
-                }
-            }
-            ExprKind::Unary {
-                op: UnaryOp::Real | UnaryOp::Imag,
-                ..
-            } => {
-                // `__real__ z = v` and `__imag__ z = v` name one half of the
-                // complex object. `linearize_lvalue` gives the address of that
-                // half, and the target type is already the *base* type, so the
-                // ordinary scalar store is right -- including for the compound
-                // forms, which computed `final_val` above the same way.
-                let addr = self.linearize_lvalue(target);
                 self.emit(Instruction::store(
                     final_val,
-                    addr,
+                    sym_id,
                     0,
                     target_typ,
                     target_size,
                 ));
-            }
-            ExprKind::Unary {
-                op: UnaryOp::Deref,
-                operand,
-            } => {
-                // Dereference: store to the pointer address
-                let ptr = self.linearize_expr(operand);
-                self.emit(Instruction::store(
-                    final_val,
-                    ptr,
-                    0,
-                    target_typ,
-                    target_size,
-                ));
-            }
-            ExprKind::Index { array, index } => {
-                // Array subscript: compute address and store
-                // Handle commutative form: 0[arr] is equivalent to arr[0]
-                let array_type = self.expr_type(array);
-                let index_type = self.expr_type(index);
-
-                let array_kind = self.types.kind(array_type);
-                let (ptr_expr, idx_expr, idx_type) =
-                    if array_kind == TypeKind::Pointer || array_kind == TypeKind::Array {
-                        (array, index, index_type)
-                    } else {
-                        // Swap: index is actually the pointer/array
-                        (index, array, array_type)
-                    };
-
-                let arr = self.linearize_expr(ptr_expr);
-                let idx = self.linearize_expr(idx_expr);
-                let elem_size = target_size / 8;
-                let elem_size_val = self.emit_const(elem_size as i128, self.types.long_id);
-
-                // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
-                let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
-
-                let offset = self.alloc_pseudo();
-                let ptr_typ = self.types.long_id;
-                self.emit(Instruction::binop(
-                    Opcode::Mul,
-                    offset,
-                    idx_extended,
-                    elem_size_val,
-                    ptr_typ,
-                    64,
-                ));
-
-                let addr = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::Add,
-                    addr,
-                    arr,
-                    offset,
-                    ptr_typ,
-                    64,
-                ));
-
-                self.emit(Instruction::store(
-                    final_val,
-                    addr,
-                    0,
-                    target_typ,
-                    target_size,
-                ));
-            }
-            _ => {
-                // Other lvalues - should not happen for valid C code
             }
         }
 
-        match stored_bitfield {
-            Some((bit_width, typ)) => self.narrow_to_bitfield(final_val, bit_width, typ),
-            None => final_val,
-        }
+        // A bare identifier is never a bit-field, so there is nothing to
+        // reduce: the bit-field answer comes from `store_rmw_place` above.
+        final_val
     }
 }

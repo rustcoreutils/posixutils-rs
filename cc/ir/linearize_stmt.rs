@@ -1367,7 +1367,15 @@ impl<'a> super::linearize::Linearizer<'a> {
                 &[&named],
             );
         }
-        let size = self.types.size_bits(expr_type);
+        // C17 6.8.4.2p5: the integer promotions are performed on the
+        // controlling expression, and each case constant is converted to the
+        // *promoted* type. Comparing at the operand's own narrow width made a
+        // label collide with a value it does not equal: `switch ((signed
+        // char) -1)` matched `case 255:`, because both are 0xFF in eight bits,
+        // where the promoted comparison is -1 against 255.
+        let cmp_type = self.types.integer_promote(expr_type);
+        let switch_val = self.emit_convert(switch_val, expr_type, cmp_type);
+        let size = self.types.size_bits(cmp_type);
 
         let exit_bb = self.alloc_bb();
 
@@ -1375,7 +1383,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.break_targets.push(exit_bb);
 
         // Collect case labels and create basic blocks for each
-        let switch_unsigned = self.types.is_unsigned(expr_type);
+        let switch_unsigned = self.types.is_unsigned(cmp_type);
         let (case_values, has_default) = self.collect_switch_cases(body, switch_unsigned);
         let case_bbs: Vec<BasicBlockId> = case_values.iter().map(|_| self.alloc_bb()).collect();
         let default_bb = if has_default {

@@ -1224,3 +1224,81 @@ int main(void) {
         0
     );
 }
+
+/// The integer promotions run on a `switch`'s controlling expression, and
+/// each case constant converts to the **promoted** type (C17 6.8.4.2p5).
+///
+/// c17 compared at the operand's own narrow width instead, so a label
+/// collided with a value it does not equal: `switch ((signed char) -1)`
+/// matched `case 255:`, because both are 0xFF in eight bits, where the
+/// promoted comparison is -1 against 255. The torture test is `20011223-1`,
+/// but any `switch` on a sub-`int` type could take the wrong arm.
+#[test]
+fn c99_switch_promotes_its_controlling_expression() {
+    let code = r#"
+int main(void) {
+    /* The reported shape: a negative `signed char` against a label that is
+       the same bit pattern only at eight bits. */
+    {
+        signed char sc = -1;
+        switch (sc) { case 255: return 1; default: break; }
+        switch (sc) { case -1: break; default: return 2; }
+    }
+    /* `unsigned char` promotes to `int`, so 200 stays 200 and does not
+       become -56. */
+    {
+        unsigned char uc = 200;
+        switch (uc) { case 200: break; default: return 3; }
+        switch (uc) { case -56: return 4; default: break; }
+    }
+    /* The same one width up. */
+    {
+        short sh = -1;
+        switch (sh) { case 65535: return 5; default: break; }
+        switch (sh) { case -1: break; default: return 6; }
+        unsigned short ush = 60000;
+        switch (ush) { case 60000: break; default: return 7; }
+    }
+    /* Plain `char`, whose signedness is the target's choice -- 65 is
+       positive either way. */
+    {
+        char c = 'A';
+        switch (c) { case 65: break; default: return 8; }
+    }
+    /* At `int` width and wider, nothing is promoted and the comparison is
+       the operand's own -- including the unsigned wrap-around spelling. */
+    {
+        unsigned u = 3000000000u;
+        switch (u) { case 3000000000u: break; default: return 9; }
+        switch (u) { case -1294967296: break; default: return 10; }
+        long l = -1;
+        switch (l) { case -1: break; default: return 11; }
+        unsigned long ul = 18000000000000000000ul;
+        switch (ul) { case 18000000000000000000ul: break; default: return 12; }
+    }
+    /* `_Bool` and an enumeration both promote to `int`. */
+    {
+        _Bool b = 1;
+        switch (b) { case 1: break; default: return 13; }
+        enum E { E0, E1 = 7 } e = E1;
+        switch (e) { case 7: break; default: return 14; }
+    }
+    /* A GNU case range is converted the same way. */
+    {
+        signed char sc = -1;
+        switch (sc) { case -5 ... 5: break; default: return 15; }
+        unsigned char uc = 200;
+        switch (uc) { case 100 ... 255: break; default: return 16; }
+        /* And the narrow-width collision does not reappear through a range. */
+        signed char neg = -1;
+        switch (neg) { case 250 ... 255: return 17; default: break; }
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_switch_promotion", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_switch_promotion_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

@@ -1826,3 +1826,103 @@ int main(void) {
         0
     );
 }
+
+/// Arithmetic on a bit-field **wider than `int`** is carried out at the
+/// field's declared width.
+///
+/// C17 6.7.2.1p10: a bit-field "is interpreted as having a signed or unsigned
+/// integer type consisting of the specified number of bits". 6.2.5p9 then
+/// reduces an unsigned result modulo 2^width. So with
+/// `unsigned long long b : 40` holding 0x100, `x.b << 32` is **zero** — every
+/// set bit shifts out of the 40-bit type. c17 computed it in 64 bits.
+///
+/// Distinct from the promotion rule: a field *narrower* than `int` promotes to
+/// `int`, which the type can express. A wider one does not promote at all, and
+/// its width is a property of the member rather than of the type — so the
+/// width rides beside the type on the expression instead of in it. That is
+/// deliberate: `sizeof` must stay 8, which gcc agrees with, so this is a
+/// precision and not a size, and a type that answered 40 to `size_bits` would
+/// be wrong everywhere the ABI, DWARF and the backends look at it.
+///
+/// Which operators carry the width, and from where, was read off gcc:
+/// arithmetic and bitwise take the **wider** operand's width, so `u40 * u33`
+/// and `u33 * u40` agree; a shift takes the left operand's alone, per 6.5.7p3;
+/// a comparison yields `int` and carries nothing.
+#[test]
+fn c99_wide_bitfield_arithmetic_at_declared_width() {
+    let code = r#"
+struct s {
+    unsigned long long u33 : 33;
+    unsigned long long u40 : 40;
+    unsigned long long u41 : 41;
+    signed   long long s40 : 40;
+};
+
+int main(void) {
+    struct s a = {0x100000, 0x100000, 0x100000, 0};
+    struct s b = {0x100000000ULL, 0x100000000ULL, 0x100000000ULL, 0};
+    struct s c;
+    c.u33 = 0x100; c.u40 = 0x100; c.s40 = -1;
+
+    /* Multiplication overflows out of the field. */
+    if (a.u33 * a.u33 != 0) return 1;
+    if (a.u40 * a.u40 != 0) return 2;
+
+    /* Mixed widths take the wider, and commute. */
+    if (a.u40 * a.u33 != 0) return 3;
+    if (a.u33 * a.u40 != 0) return 4;
+    if ((a.u33 * a.u41) != (a.u41 * a.u33)) return 5;
+
+    /* Addition and subtraction likewise. */
+    if (b.u33 + b.u33 != 0) return 6;
+    if ((a.u33 - b.u33) != 0x100100000ULL) return 7;
+
+    /* Shifts take the left operand's width only. */
+    if ((a.u33 << 13) != 0) return 8;
+    if ((c.u40 << 32) != 0) return 9;
+    if ((c.u33 << 25) != 0) return 10;
+
+    /* Unary operators too. */
+    if ((unsigned long long)(-a.u33) != 0x1FFF00000ULL) return 11;
+    if ((unsigned long long)(~a.u33) != 0x1FFEFFFFFULL) return 12;
+
+    /* Through a conditional, and nested. */
+    if ((1 ? a.u33 * a.u33 : 0ULL) != 0) return 13;
+    /* 0x100000 is 2^20; cubed is 2^60, which reduces to zero mod 2^33.
+       0x100 would have been too small to overflow and proved nothing. */
+    if (((a.u33 * a.u33) * a.u33) != 0) return 14;
+
+    /* A plain operand contributes no width, so the field's still governs. */
+    if ((c.u40 * 1ULL) != 0x100) return 15;
+
+    /* A signed wide field keeps its sign. */
+    if (!(c.s40 < 0)) return 16;
+    if (c.s40 != -1) return 17;
+
+    /* A comparison yields int and carries nothing. */
+    if ((a.u33 << 13) ? 1 : 0) return 18;
+
+    /* Compound assignment and ++/-- already stored through the field, and
+       must keep agreeing. */
+    { struct s y; y.u40 = 0x100; y.u40 <<= 32; if (y.u40 != 0) return 19; }
+    { struct s y; y.u40 = 0xFFFFFFFFFFULL; y.u40++; if (y.u40 != 0) return 20; }
+
+    /* Narrower-than-int fields are a different rule and must be unaffected:
+       they promote to int. */
+    { struct n { unsigned u7 : 7; } v; v.u7 = 1;
+      if (!(-v.u7 < 0)) return 21;
+      if (v.u7 - 2 >= 0) return 22; }
+
+    /* And a field exactly as wide as its type is not narrowed at all. */
+    { struct w { unsigned long long f : 64; } v; v.f = 0xFFFFFFFFFFFFFFFFULL;
+      if (v.f + 1 != 0) return 23;
+      if (v.f != 0xFFFFFFFFFFFFFFFFULL) return 24; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_wide_bitfield_width", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_wide_bitfield_width_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

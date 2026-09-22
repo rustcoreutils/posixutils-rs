@@ -3450,6 +3450,27 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Linearize a binary expression (arithmetic, comparison, logical operators)
+    /// Reduce an operation's result to the bit-field width it was computed at.
+    ///
+    /// C17 6.7.2.1p10 gives a bit-field a type of exactly its declared width,
+    /// and 6.2.5p9 reduces an unsigned result modulo 2^width -- so `x.b << 32`
+    /// with `unsigned long long b : 40` holding 0x100 is zero. The parser works
+    /// out which operations carry a width and records it on the expression;
+    /// this is where it is applied.
+    ///
+    /// `narrow_to_bitfield` already exists and does exactly the masking and
+    /// sign-extension wanted, so this is the whole of the codegen side: no new
+    /// opcode, no new instruction, no backend change.
+    fn narrow_bitfield_result(&mut self, expr: &Expr, value: PseudoId) -> PseudoId {
+        match expr.bitfield_bits {
+            Some(bits) => {
+                let typ = self.expr_type(expr);
+                self.narrow_to_bitfield(value, bits, typ)
+            }
+            None => value,
+        }
+    }
+
     pub(crate) fn linearize_binary(
         &mut self,
         expr: &Expr,
@@ -5727,9 +5748,15 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::FuncName => self.linearize_func_name(),
 
-            ExprKind::Unary { op, operand } => self.linearize_unary(expr, *op, operand),
+            ExprKind::Unary { op, operand } => {
+                let v = self.linearize_unary(expr, *op, operand);
+                self.narrow_bitfield_result(expr, v)
+            }
 
-            ExprKind::Binary { op, left, right } => self.linearize_binary(expr, *op, left, right),
+            ExprKind::Binary { op, left, right } => {
+                let v = self.linearize_binary(expr, *op, left, right);
+                self.narrow_bitfield_result(expr, v)
+            }
 
             ExprKind::Assign { op, target, value } => self.emit_assign(*op, target, value),
 

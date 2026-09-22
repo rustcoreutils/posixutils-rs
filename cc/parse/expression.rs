@@ -45,7 +45,7 @@ impl<'a> Parser<'a> {
             let result_typ = right.typ;
 
             // Build comma expression
-            let Expr { kind, typ, pos } = expr;
+            let Expr { kind, typ, pos, .. } = expr;
             expr = match kind {
                 ExprKind::Comma(mut exprs) => {
                     exprs.push(right);
@@ -53,6 +53,7 @@ impl<'a> Parser<'a> {
                         kind: ExprKind::Comma(exprs),
                         typ: result_typ,
                         pos,
+                        bitfield_bits: None,
                     }
                 }
                 other => Expr {
@@ -61,11 +62,13 @@ impl<'a> Parser<'a> {
                             kind: other,
                             typ,
                             pos,
+                            bitfield_bits: None,
                         },
                         right,
                     ]),
                     typ: result_typ,
                     pos,
+                    bitfield_bits: None,
                 },
             };
         }
@@ -720,14 +723,17 @@ impl<'a> Parser<'a> {
             self.advance();
             let operand = self.parse_unary_expr()?;
             let (operand, typ) = self.promote_unary_operand(operand);
-            return Ok(Self::typed_expr(
+            let width = self.unary_bitfield_width(&operand, typ);
+            let mut e = Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::Neg,
                     operand: Box::new(operand),
                 },
                 typ,
                 op_pos,
-            ));
+            );
+            e.bitfield_bits = width;
+            return Ok(e);
         }
 
         if self.is_special(b'~') {
@@ -735,14 +741,17 @@ impl<'a> Parser<'a> {
             self.advance();
             let operand = self.parse_unary_expr()?;
             let (operand, typ) = self.promote_unary_operand(operand);
-            return Ok(Self::typed_expr(
+            let width = self.unary_bitfield_width(&operand, typ);
+            let mut e = Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::BitNot,
                     operand: Box::new(operand),
                 },
                 typ,
                 op_pos,
-            ));
+            );
+            e.bitfield_bits = width;
+            return Ok(e);
         }
 
         if self.is_special(b'!') {
@@ -1390,6 +1399,7 @@ impl<'a> Parser<'a> {
             kind,
             typ: Some(typ),
             pos,
+            bitfield_bits: None,
         }
     }
 
@@ -1489,8 +1499,33 @@ impl<'a> Parser<'a> {
             }
         };
 
+        // C17 6.7.2.1p10: a bit-field has a type of exactly its declared width,
+        // and 6.2.5p9 then reduces an unsigned result modulo 2^width. So
+        // `x.b << 32` with `unsigned long long b : 40` holding 0x100 is zero --
+        // every set bit shifts out of the 40-bit type.
+        //
+        // Which operators carry the width, and from where:
+        //   - the arithmetic and bitwise ones take the wider operand's width;
+        //   - a shift takes the **left** operand's alone (6.5.7p3 -- the right
+        //     operand's type never reaches the result);
+        //   - a comparison or a logical operator yields `int` and carries
+        //     nothing, which falls out of not asking.
+        let width = match op {
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor => self.combined_bitfield_width(&left, &right),
+            BinaryOp::Shl | BinaryOp::Shr => self.effective_bitfield_width(&left),
+            _ => None,
+        }
+        .filter(|bits| *bits < self.types.size_bits(result_type));
+
         let pos = left.pos;
-        Self::typed_expr(
+        let mut e = Self::typed_expr(
             ExprKind::Binary {
                 op,
                 left: Box::new(left),
@@ -1498,7 +1533,9 @@ impl<'a> Parser<'a> {
             },
             result_type,
             pos,
-        )
+        );
+        e.bitfield_bits = width;
+        e
     }
 
     /// Warn when a shift's constant count cannot name a bit of the value
@@ -1541,6 +1578,39 @@ impl<'a> Parser<'a> {
     /// compared widths where this one ranked by kind, so they disagreed about
     /// `long` against `long long`. One of them had to go.
     /// The width and declared type of the bit-field `e` names, if it names one.
+    /// The bit-field width this expression's value is confined to, if any.
+    ///
+    /// Either it names a bit-field member directly, or it is the result of an
+    /// operation on one and carries the width forward. Only widths *wider*
+    /// than `int` matter here: a narrower field promotes to `int`, which the
+    /// type already expresses, and `bitfield_promoted_type` handles it.
+    fn effective_bitfield_width(&mut self, e: &Expr) -> Option<u32> {
+        if let Some(bits) = e.bitfield_bits {
+            return Some(bits);
+        }
+        let (bits, typ) = self.bitfield_of(e)?;
+        (bits < self.types.size_bits(typ) && bits > self.types.size_bits(self.types.int_id))
+            .then_some(bits)
+    }
+
+    /// The width an operation's result is confined to.
+    ///
+    /// gcc takes the **wider** of the two operands -- `u40 * u33` reduces
+    /// modulo 2^40, and so does `u33 * u40` -- which also makes the operation
+    /// commutative, as it has to be. A plain operand contributes nothing, so
+    /// `u33 * 1ULL` stays 33 bits rather than widening to 64.
+    fn combined_bitfield_width(&mut self, left: &Expr, right: &Expr) -> Option<u32> {
+        match (
+            self.effective_bitfield_width(left),
+            self.effective_bitfield_width(right),
+        ) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
     fn bitfield_of(&mut self, e: &Expr) -> Option<(u32, TypeId)> {
         let (base_typ, member) = match &e.kind {
             ExprKind::Member { expr, member } => (expr.typ?, *member),
@@ -1586,6 +1656,14 @@ impl<'a> Parser<'a> {
             _ => op_typ,
         };
         (operand, typ)
+    }
+
+    /// The width `-x` or `~x` yields: the operand's own. `-` and `~` on a
+    /// 40-bit field are computed and reduced at 40 bits, exactly as a binary
+    /// operator on it would be.
+    fn unary_bitfield_width(&mut self, operand: &Expr, result_typ: TypeId) -> Option<u32> {
+        self.effective_bitfield_width(operand)
+            .filter(|bits| *bits < self.types.size_bits(result_typ))
     }
 
     /// Wrap a bit-field operand in the conversion C17 6.3.1.1p2 calls for.

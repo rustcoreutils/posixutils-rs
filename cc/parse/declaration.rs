@@ -1215,6 +1215,7 @@ impl Parser<'_> {
                     kind: ExprKind::VmTypedefExtent(sym, level),
                     typ: Some(self.types.ulong_id),
                     pos: self.current_pos(),
+                    bitfield_bits: None,
                 })
                 .collect(),
         )

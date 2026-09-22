@@ -211,6 +211,19 @@ up — which is why it was not folded into the IR-level change.
 
 ## Known Divergences
 
+### `_Generic` on a wide bit-field expression
+
+`_Generic((x.b + 0), unsigned long long: ...)` with `unsigned long long b : 40`
+matches `unsigned long long` here and matches **nothing** under gcc, which
+treats the 40-bit width as part of the type for selection purposes.
+
+Not worth closing at the price it asks. The width rides beside the type rather
+than in it, precisely so `sizeof` stays 8 and the ABI, DWARF and both backends
+keep seeing `unsigned long long` — putting it in the `TypeId` would make
+`types_compatible`, `common_type` and `emit_convert` all disagree with
+themselves. No torture test depends on it.
+
+
 Behaviours where c17 differs from gcc on the same source. None is a
 translation-limit or a diagnostic gap; each silently changes what the program
 does or claims.
@@ -580,7 +593,6 @@ What is left, at -O0 — 35 run failures and 68 compile failures:
 
 | Group | Count | Note |
 |---|---|---|
-| Bit-field arithmetic at the declared width | 4 | `x.b << 32` with `unsigned long long b : 40` is done in 40 bits. Needs the expression to carry the field width, not just the promotion rule |
 | `scalar_storage_order` attribute | 2 | `20230630-2`, `20230630-4`. c17 warns that it ignores the attribute and lays out natively, so the tests read 85 where they want 21. Needs reverse-endian load/store lowering |
 | Complex arithmetic | 5 | `pr104604`, `pr42248`, `pr56837`, `20050121-1`, `complex-4` |
 | `va_arg` with `long double` / `__int128` | 2 | `pr44942`, `pr92904` — the binary128 fixes did not reach these |

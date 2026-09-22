@@ -2513,10 +2513,19 @@ impl<'a> super::linearize::Linearizer<'a> {
             out_has_tied_input
         };
 
+        // Where each non-parameter output operand lives, resolved **once**.
+        // A `+r` operand is read before the asm and written after it, and both
+        // sides used to call `linearize_lvalue` on the operand expression --
+        // so `asm("" : "+r"(*bar()))` called `bar` twice. Same rule as any
+        // other read-modify-write (see `RmwPlace`).
+        let mut output_places: Vec<Option<super::linearize_emit::RmwPlace>> =
+            Vec::with_capacity(outputs.len());
+
         // Process output operands
         for (output_idx, op) in outputs.iter().enumerate() {
             // Parse constraint to get flags
             let (is_memory, is_readwrite, _matching) = self.parse_asm_constraint(&op.constraint);
+            let place = self.resolve_rmw_place(&op.expr);
 
             // Get symbolic name if present
             let name = op.name.map(|n| self.str(n).to_string());
@@ -2532,7 +2541,14 @@ impl<'a> super::linearize::Linearizer<'a> {
             // level. Just use the lvalue address as the asm operand
             // pseudo directly.
             if is_memory {
-                let addr = self.linearize_lvalue(&op.expr);
+                // A memory operand is the lvalue's address. `None` is a bare
+                // identifier, which has nothing to re-evaluate; a bit-field
+                // has no address at all and keeps the old path's behaviour.
+                let addr = match place.as_ref().and_then(Self::rmw_place_address) {
+                    Some(addr) => addr,
+                    None => self.linearize_lvalue(&op.expr),
+                };
+                output_places.push(place);
 
                 if is_readwrite {
                     // `+m` — also add as matching input so the same
@@ -2583,8 +2599,19 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 .with_type(typ)
                                 .with_size(size),
                         );
+                    } else if let Some(p) = &place {
+                        // Through the resolved place, so the operand
+                        // expression runs once for the read and the write.
+                        let val = self.load_rmw_place(p, typ);
+                        self.emit(
+                            Instruction::new(Opcode::Copy)
+                                .with_target(pseudo)
+                                .with_src(val)
+                                .with_type(typ)
+                                .with_size(size),
+                        );
                     } else {
-                        // Local or global: load from memory address
+                        // A bare identifier: nothing to evaluate twice.
                         let addr = self.linearize_lvalue(&op.expr);
                         self.emit(Instruction::load(pseudo, addr, 0, typ, size));
                     }
@@ -2613,6 +2640,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Track if this is a parameter output
             param_outputs.push(param_info.map(|(name, _)| name));
             skip_post_handling.push(false);
+            output_places.push(place);
         }
 
         // Process input operands
@@ -2727,11 +2755,17 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // Parameter: update var_map with the new SSA value
                 self.var_map.insert(param_name.clone(), out_pseudo);
             } else {
-                // Local or global: store to memory address
-                let addr = self.linearize_lvalue(&op.expr);
                 let typ = self.expr_type(&op.expr);
                 let size = self.types.size_bits(typ);
-                self.emit(Instruction::store(out_pseudo, addr, 0, typ, size));
+                // Back through the place the read came from, so the operand
+                // expression is not evaluated a second time.
+                if let Some(p) = &output_places[i] {
+                    self.store_rmw_place(p, out_pseudo, typ);
+                } else {
+                    // A bare identifier: nothing to evaluate twice.
+                    let addr = self.linearize_lvalue(&op.expr);
+                    self.emit(Instruction::store(out_pseudo, addr, 0, typ, size));
+                }
             }
         }
     }

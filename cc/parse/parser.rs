@@ -61,6 +61,8 @@ pub(crate) struct RawParam {
     /// Run-time size expressions for a variably-modified element type; see
     /// [`Parameter::vm_dims`](crate::parse::ast::Parameter::vm_dims).
     pub(crate) vm_dims: Vec<Expr>,
+    /// See [`Parameter::discarded_dims`](crate::parse::ast::Parameter::discarded_dims).
+    pub(crate) discarded_dims: Vec<Expr>,
     /// Symbol created while parsing the parameter list. `vm_dims` resolves
     /// against it, so the function scope re-declares this very symbol instead
     /// of a fresh one.

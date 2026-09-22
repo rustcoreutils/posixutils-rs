@@ -2047,6 +2047,14 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
+    /// The address this place names, or `None` when it is a bit-field.
+    ///
+    /// A bit-field has no address, so a consumer that can only work with one
+    /// -- a memory-class `asm` operand, say -- has to know that.
+    pub(crate) fn rmw_place_address(place: &RmwPlace) -> Option<PseudoId> {
+        place.bitfield.is_none().then_some(place.base)
+    }
+
     /// Resolve a read-modify-write target, evaluating its subexpressions once.
     ///
     /// `None` for a bare identifier: it has no subexpressions, so nothing can

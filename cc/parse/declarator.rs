@@ -560,13 +560,17 @@ impl Parser<'_> {
             // dimension to be present, so the element type's variable
             // dimensions are exactly the trailing entries.
             let elem_typ = self.types.get(typ_id).base;
-            let vm_dims = match elem_typ {
+            let (vm_dims, discarded_dims) = match elem_typ {
                 Some(elem) => {
                     let want = self.types.unsized_array_levels(elem);
                     let skip = vla_sizes.len().saturating_sub(want);
-                    vla_sizes[skip..].to_vec()
+                    // The leading entries are the dimensions the
+                    // array-to-pointer adjustment removes. They are still
+                    // evaluated on entry, so they are kept for their side
+                    // effects -- see `Parameter::discarded_dims`.
+                    (vla_sizes[skip..].to_vec(), vla_sizes[..skip].to_vec())
                 }
-                None => Vec::new(),
+                None => (Vec::new(), vla_sizes.clone()),
             };
 
             // C17 6.7.6.3p10: `void` may appear as a parameter only as the
@@ -594,6 +598,7 @@ impl Parser<'_> {
                 name: name_opt,
                 typ: typ_id,
                 vm_dims,
+                discarded_dims,
                 symbol: None,
             });
 

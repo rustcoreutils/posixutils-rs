@@ -1115,3 +1115,112 @@ int main(void) {
         0
     );
 }
+
+/// A side effect keeps happening even where its value is thrown away.
+///
+/// Three places dropped one. A parameter's array size is discarded by the
+/// array-to-pointer adjustment (C17 6.7.6.3p7) but is still evaluated on
+/// entry (6.9.1p10), and c17 threw the expression away with the size.
+/// `__builtin_expect`'s second argument is a hint c17 does not use, and it
+/// was parsed and discarded rather than evaluated. And an `asm` read-write
+/// operand took its lvalue twice -- once for the load before the asm, once
+/// for the store after -- so `asm("" : "+r"(*bar()))` called `bar` twice.
+///
+/// The torture tests are `970217-1`, `pr77767`, `pr85156` and `990130-1`.
+#[test]
+fn c99_discarded_operands_still_have_their_side_effects() {
+    let code = r#"
+int calls;
+int dummy;
+int *bar(void) { ++calls; return &dummy; }
+
+/* The size of an adjusted array parameter. */
+int sub(int i, int array[i++]) { return i; }
+int two(int a, int b[a++], int c, int d[c++]) { return a * 10 + c; }
+/* Several dimensions: only the outermost is adjusted away, and the inner
+   ones are still needed for the row stride. */
+int rows(int n, int m, int a[n++][m]) { return n; }
+
+/* __builtin_expect's second argument. */
+int x, y;
+int expect_side(int z) {
+    if (__builtin_expect(x ? y != 0 : 0, z++)) return 7;
+    return z;
+}
+/* A constant hint, which is what likely/unlikely expand to, still works. */
+int expect_const(int v) { return __builtin_expect(v != 0, 1) ? 10 : 20; }
+
+/* An asm read-write operand. */
+static void asm_rw(void) { __asm__("" : "+r"(*bar())); }
+/* And a plain output operand, which is written once. */
+static void asm_out(void) { __asm__("" : "=r"(*bar())); }
+
+int main(void) {
+    int arr[10];
+    if (sub(10, arr) != 11) return 1;
+    if (two(1, arr, 1, arr) != 22) return 2;
+
+    int grid[4][4];
+    if (rows(3, 4, grid) != 4) return 3;
+
+    x = 1;
+    if (expect_side(10) != 11) return 4;
+    if (expect_const(1) != 10) return 5;
+    if (expect_const(0) != 20) return 6;
+
+    calls = 0;
+    asm_rw();
+    if (calls != 1) return 7;
+
+    calls = 0;
+    asm_out();
+    if (calls != 1) return 8;
+
+    /* Mixed operand kinds, in both orders: the resolved places are indexed
+       by operand position, and a memory operand takes an early exit from
+       that loop -- so a missing push would silently shift every later one. */
+    {
+        int mcalls = 0, rcalls = 0;
+        calls = 0;
+        __asm__("" : "=m"(*bar()), "+r"(dummy));
+        mcalls = calls;
+        calls = 0;
+        __asm__("" : "+r"(dummy), "=m"(*bar()));
+        rcalls = calls;
+        if (mcalls != 1 || rcalls != 1) return 11;
+
+        int a = 1, b = 2;
+        calls = 0;
+        __asm__("" : "+r"(a), "=m"(*bar()), "+r"(b));
+        if (calls != 1 || a != 1 || b != 2) return 12;
+    }
+    /* A read-write operand whose lvalue has a side effect in its index. */
+    {
+        int v[4] = {10, 20, 30, 40};
+        int i = 1;
+        __asm__("" : "+r"(v[i++]));
+        if (i != 2 || v[0] != 10 || v[1] != 20) return 13;
+    }
+    /* A bit-field read-write operand: no address of its own, so it takes
+       the placement path rather than an address. */
+    {
+        struct bits { unsigned f : 5; unsigned g : 5; } s = {3, 4};
+        __asm__("" : "+r"(s.f));
+        if (s.f != 3 || s.g != 4) return 14;
+    }
+
+    /* The value of __builtin_expect is still its first argument, and the
+       hint's side effect happens. The two touch different objects, because
+       the order in which a call's arguments are evaluated is unspecified. */
+    int w = 3, hint = 0;
+    if (__builtin_expect(w + 1, hint++) != 4) return 9;
+    if (w != 3 || hint != 1) return 10;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_discarded_side_effects", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_discarded_side_effects_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

@@ -1297,6 +1297,22 @@ impl<'a> Linearizer<'a> {
         // `int a[n][m]` is adjusted to `int (*a)[m]`, so what needs sizing is
         // the pointee. Without this the element type has a compile-time size
         // of 0 and every row stride is 0.
+        // A parameter's discarded array size is evaluated on entry for its
+        // side effects and nothing else: after the array-to-pointer
+        // adjustment there is no size left to record. C17 6.9.1p10 evaluates
+        // it, so `int sub(int i, int array[i++])` must leave `i` at 11.
+        //
+        // Ahead of the extent recording below so the expressions run in the
+        // order they were written, and cloned because the loop needs `self`.
+        let discarded: Vec<Expr> = func
+            .params
+            .iter()
+            .flat_map(|p| p.discarded_dims.iter().cloned())
+            .collect();
+        for dim in &discarded {
+            self.linearize_expr(dim);
+        }
+
         for param in &func.params {
             if param.vm_dims.is_empty() {
                 continue;

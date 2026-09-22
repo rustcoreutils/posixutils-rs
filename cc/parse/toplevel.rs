@@ -259,6 +259,7 @@ impl Parser<'_> {
                             symbol: symbol_id,
                             typ: raw.typ,
                             vm_dims: raw.vm_dims.clone(),
+                            discarded_dims: raw.discarded_dims.clone(),
                         });
                     }
 
@@ -505,6 +506,7 @@ impl Parser<'_> {
                         symbol: symbol_id,
                         typ: raw.typ,
                         vm_dims: raw.vm_dims.clone(),
+                        discarded_dims: raw.discarded_dims.clone(),
                     });
                 }
 

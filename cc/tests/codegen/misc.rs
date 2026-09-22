@@ -7519,6 +7519,103 @@ int main(void)
     );
 }
 
+/// `va_arg` of an `__int128` reads **two** eightbytes, and the cursor is
+/// committed before the value is read.
+///
+/// Three defects met here. The type had no arm of its own, so it fell into the
+/// scalar path where `OperandSize::from_bits(128)` saturates at 64: only the
+/// low half moved, the guard was the scalar `gp_offset < 48` rather than "both
+/// eightbytes fit", and the cursor advanced 8 instead of 16 -- so the *next*
+/// `va_arg` re-read this one's high half.
+///
+/// The other two are not `__int128`-specific and had been latent in every
+/// integer `va_arg`. The helper used R11 as its shuttle while `emit_va_arg`
+/// puts the `va_list` pointer in R11 whenever `ap` is a slot holding a pointer
+/// rather than the object, so the base was destroyed before the write-back --
+/// `movl %r10d, (%r11)` faulting through the value it had just loaded. And the
+/// overflow path read the value into the same register that held the area
+/// pointer it then advanced, so with enough leading arguments to exhaust the
+/// register file it stored a *value* back as the cursor. Both are why the
+/// cursor is now committed before the copy, as the aggregate path already did.
+///
+/// The leading-argument counts are chosen to land the `__int128` in the
+/// register save area (0, 1, 5) and in the overflow area (9): with six general
+/// argument registers, nine leading `int`s exhaust them.
+#[test]
+fn codegen_va_arg_int128_reads_both_eightbytes() {
+    let code = r#"
+#include <stdarg.h>
+
+__attribute__((noinline)) static __int128 wide(int x, ...)
+{
+    __int128 r;
+    va_list ap;
+    va_start(ap, x);
+    while (x--) va_arg(ap, int);
+    r = va_arg(ap, __int128);
+    va_end(ap);
+    return r;
+}
+
+/* The argument after the __int128 proves the cursor advanced by sixteen and
+   not by eight -- an eight-byte advance hands this one the high half. */
+__attribute__((noinline)) static long follows(int x, ...)
+{
+    va_list ap;
+    va_start(ap, x);
+    while (x--) va_arg(ap, int);
+    (void)va_arg(ap, __int128);
+    long after = va_arg(ap, long);
+    va_end(ap);
+    return after;
+}
+
+/* Ordinary integers past the register file, which is where the overflow
+   cursor was being overwritten with a value. */
+__attribute__((noinline)) static long many(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    long acc = 0;
+    for (int i = 0; i < 9; i++) acc = acc * 10 + va_arg(ap, long);
+    va_end(ap);
+    (void)n;
+    return acc;
+}
+
+int main(void)
+{
+    __int128 u = ((__int128) 0xaaaaaaaaaaaaaaaaULL << 64) | 0x5555555555555555ULL;
+
+    if (wide(0, u) != u) return 1;
+    if (wide(1, 0, u) != u) return 2;
+    if (wide(5, 0, 0, 0, 0, 0, u) != u) return 3;
+    if (wide(9, 0, 0, 0, 0, 0, 0, 0, 0, 0, u) != u) return 4;
+
+    if (follows(0, u, 1234L) != 1234) return 5;
+    if (follows(9, 0, 0, 0, 0, 0, 0, 0, 0, 0, u, 1234L) != 1234) return 6;
+
+    if (many(0, 1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L) != 123456789L) return 7;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("codegen_va_arg_int128", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("codegen_va_arg_int128_o2", code, &["-O2".to_string()]),
+        0
+    );
+
+    // aarch64 had the same saturating move, plus a rule of its own: AAPCS64
+    // stage C.10 starts a 16-byte integral argument at an even general
+    // register, so `__gr_offs` rounds up to a multiple of 16 first.
+    for opt in ["-O0", "-O2"] {
+        if let Some(status) = compile_and_run_aarch64("codegen_va_arg_int128_a64", code, opt) {
+            assert_eq!(status, 0, "aarch64 at {opt}");
+        }
+    }
+}
+
 /// A register-returned aggregate must be stored through the frame's own base
 /// register, not through `%rbp`.
 ///

@@ -387,6 +387,10 @@ impl Aarch64CodeGen {
             VaAggKind::Indirect { .. } => false,
             _ => align >= 16,
         };
+        // Only an integral scalar of sixteen bytes -- `__int128` -- takes the
+        // even-pair rule. A composite goes through `VaAggKind::Gp`, which the
+        // ABI packs into consecutive slots without it.
+        let needs_even_gr_pair = !from_simd && matches!(agg, VaAggKind::Scalar) && type_bits == 128;
 
         // x9 = offs, x10 = offs + reg_step, committed back immediately.
         self.push_lir(Aarch64Inst::Ldr {
@@ -401,6 +405,28 @@ impl Aarch64CodeGen {
             src: scratch0,
             dst: scratch0,
         });
+        // AAPCS64 stage C.10: a 16-byte integral argument starts at an *even*
+        // general register, so `__gr_offs` rounds up to a multiple of 16
+        // before it is used -- both to find the save-area slot and as the base
+        // of the advance. On a negative offset `(offs + 15) & -16` rounds
+        // toward zero, which is what gcc emits here too (`add w1, w1, 15;
+        // and w1, w1, -16`). Without it a `__int128` could be read straddling
+        // the odd slot the prologue never filled that way.
+        if needs_even_gr_pair {
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: scratch0,
+                src2: GpOperand::Imm(15),
+                dst: scratch0,
+            });
+            self.emit_mov_imm(scratch1, -16, 64);
+            self.push_lir(Aarch64Inst::And {
+                size: OperandSize::B64,
+                src1: scratch0,
+                src2: GpOperand::Reg(scratch1),
+                dst: scratch0,
+            });
+        }
         self.push_lir(Aarch64Inst::Add {
             size: OperandSize::B64,
             src1: scratch0,
@@ -519,6 +545,14 @@ impl Aarch64CodeGen {
                     dst: scratch1,
                 });
                 self.emit_va_arg_bytes(dst_loc, scratch1, 0, bytes, false);
+                return;
+            }
+            // A 128-bit integer is two eightbytes, and `emit_va_arg_load`
+            // below sizes its move with `OperandSize::from_bits`, which
+            // saturates at 64 -- so it moved the low half and left the high
+            // half whatever the slot happened to hold.
+            VaAggKind::Scalar if needs_even_gr_pair => {
+                self.emit_va_arg_bytes(dst_loc, scratch0, 0, 16, false);
                 return;
             }
             _ => {}

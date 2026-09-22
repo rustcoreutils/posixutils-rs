@@ -182,15 +182,23 @@ impl X86_64CodeGen {
         arg_bytes: i32,
         label_suffix: u32,
     ) {
+        // Registers used here: R10 holds `gp_offset`, RAX the address being
+        // read from, RCX the value in transit.
+        //
+        // **R11 is deliberately not among them.** `emit_va_arg` materializes
+        // the `va_list` pointer into R11 when `ap` is a slot holding a pointer
+        // rather than the object itself, so R11 *is* `ap_base` in that shape.
+        // Using it as a shuttle overwrote the base before the `gp_offset`
+        // write-back, which then stored through the value just loaded -- the
+        // `movl %r10d, (%r11)` that faulted. The overflow path had the same
+        // shape twice over: it loaded `overflow_arg_area` into R11 and then
+        // wrote the advanced pointer back to `8(%r11)`, an address derived
+        // from the pointer it had just destroyed.
         let overflow_label = Label::new("va_overflow", label_suffix);
         let done_label = Label::new("va_done", label_suffix);
         let lir_arg_size = OperandSize::from_bits(arg_size);
 
-        // This function uses Rax for reg_save_area/overflow pointer, Rcx for sign-extended offset.
-        // The constraint-aware register allocator ensures ap_base is never in Rax or Rcx
-        // by declaring VaArg as clobbering those registers in opcode_constraints().
-
-        // Load gp_offset into R10d (using R10 as scratch for gp_offset)
+        // gp_offset -> R10d
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B32,
             src: GpOperand::Mem(MemAddr::BaseOffset {
@@ -199,7 +207,6 @@ impl X86_64CodeGen {
             }),
             dst: GpOperand::Reg(Reg::R10),
         });
-        // Compare with 48
         self.push_lir(X86Inst::Cmp {
             size: OperandSize::B32,
             src: GpOperand::Imm(48),
@@ -210,8 +217,7 @@ impl X86_64CodeGen {
             target: overflow_label.clone(),
         });
 
-        // Register save area path
-        // Load reg_save_area into Rax
+        // Register save area path: RAX = reg_save_area + gp_offset.
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
             src: GpOperand::Mem(MemAddr::BaseOffset {
@@ -220,7 +226,6 @@ impl X86_64CodeGen {
             }),
             dst: GpOperand::Reg(Reg::Rax),
         });
-        // Sign-extend gp_offset (in R10) to 64-bit and add to reg_save_area
         self.push_lir(X86Inst::Movsx {
             src_size: OperandSize::B32,
             dst_size: OperandSize::B64,
@@ -233,41 +238,11 @@ impl X86_64CodeGen {
             dst: Reg::Rax,
         });
 
-        // Store value from [Rax] to destination
-        match dst_loc {
-            Loc::Reg(r) => {
-                self.push_lir(X86Inst::Mov {
-                    size: lir_arg_size,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rax,
-                        offset: 0,
-                    }),
-                    dst: GpOperand::Reg(*r),
-                });
-            }
-            Loc::Stack(dst_offset) => {
-                let adjusted_offset = -(*dst_offset + self.callee_saved_offset);
-                self.push_lir(X86Inst::Mov {
-                    size: lir_arg_size,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rax,
-                        offset: 0,
-                    }),
-                    dst: GpOperand::Reg(Reg::R11),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: lir_arg_size,
-                    src: GpOperand::Reg(Reg::R11),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: adjusted_offset,
-                    }),
-                });
-            }
-            _ => {}
-        }
-
-        // Increment gp_offset by 8 and store back
+        // gp_offset += 8, committed *before* the value is read. The value has
+        // to land somewhere, and its destination may be any register the
+        // allocator picked -- including RAX, which still holds the address, or
+        // R10, which still holds the cursor. Committing first means nothing
+        // the store could overwrite is needed afterwards.
         self.push_lir(X86Inst::Add {
             size: OperandSize::B32,
             src: GpOperand::Imm(8),
@@ -281,13 +256,14 @@ impl X86_64CodeGen {
                 offset: ap_base_offset,
             }),
         });
+
+        self.va_store_scalar(lir_arg_size, Reg::Rax, dst_loc);
+
         self.push_lir(X86Inst::Jmp {
             target: done_label.clone(),
         });
 
-        // Overflow path
-        // Bug fix: Load overflow_arg_area pointer into R11 FIRST, then load value into Rax.
-        // This prevents the pointer from being clobbered when storing to a register destination.
+        // Overflow path: RAX = overflow_arg_area.
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(overflow_label)));
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
@@ -295,60 +271,239 @@ impl X86_64CodeGen {
                 base: ap_base,
                 offset: ap_base_offset + 8,
             }),
-            dst: GpOperand::Reg(Reg::R11),
-        });
-
-        // Load value from [R11] into Rax, then store to destination
-        self.push_lir(X86Inst::Mov {
-            size: lir_arg_size,
-            src: GpOperand::Mem(MemAddr::BaseOffset {
-                base: Reg::R11,
-                offset: 0,
-            }),
             dst: GpOperand::Reg(Reg::Rax),
         });
 
-        // Store value from Rax to destination
-        match dst_loc {
-            Loc::Reg(r) => {
-                if *r != Reg::Rax {
-                    self.push_lir(X86Inst::Mov {
-                        size: lir_arg_size,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: GpOperand::Reg(*r),
-                    });
-                }
-            }
-            Loc::Stack(dst_offset) => {
-                let adjusted_offset = -(*dst_offset + self.callee_saved_offset);
-                self.push_lir(X86Inst::Mov {
-                    size: lir_arg_size,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: adjusted_offset,
-                    }),
-                });
-            }
-            _ => {}
-        }
-
-        // Advance overflow_arg_area (using R11 which still has the original pointer)
-        self.push_lir(X86Inst::Add {
-            size: OperandSize::B64,
-            src: GpOperand::Imm(arg_bytes as i64),
-            dst: Reg::R11,
+        // overflow_arg_area += arg_bytes, again committed before the read:
+        // `va_store_scalar` may load the value straight into RAX when that is
+        // the destination, and RAX is the pointer being advanced.
+        self.push_lir(X86Inst::Lea {
+            addr: MemAddr::BaseOffset {
+                base: Reg::Rax,
+                offset: arg_bytes,
+            },
+            dst: Reg::Rcx,
         });
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::R11),
+            src: GpOperand::Reg(Reg::Rcx),
             dst: GpOperand::Mem(MemAddr::BaseOffset {
                 base: ap_base,
                 offset: ap_base_offset + 8,
             }),
         });
 
+        self.va_store_scalar(lir_arg_size, Reg::Rax, dst_loc);
+
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+    }
+
+    /// `va_arg` of an `__int128`, which occupies **two** INTEGER eightbytes.
+    ///
+    /// System V AMD64 psABI 3.2.3 assigns them to the next two available
+    /// general registers, with no even-pair requirement -- that rule is
+    /// AAPCS64 stage C.10, not this ABI, and gcc confirms it by emitting the
+    /// plain `cmpl $39, %edx; ja` with no mask on `gp_offset`. Both eightbytes
+    /// must fit or the whole argument goes to the overflow area, which is why
+    /// the guard is `gp_offset <= 48 - 16` rather than the scalar `< 48`.
+    ///
+    /// Before this existed, `__int128` fell into the scalar path, where
+    /// `OperandSize::from_bits(128)` saturates at 64: only the low eightbyte
+    /// was ever moved, the guard was the scalar one, and `gp_offset` advanced
+    /// by 8 -- so the next `va_arg` re-read the high half of this one.
+    fn emit_va_arg_int128(
+        &mut self,
+        ap_base: Reg,
+        ap_base_offset: i32,
+        dst_loc: &Loc,
+        label_suffix: u32,
+    ) {
+        let overflow_label = Label::new("va_overflow", label_suffix);
+        let done_label = Label::new("va_done", label_suffix);
+
+        // gp_offset -> R10d; both eightbytes must fit in the save area.
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset,
+            }),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        self.push_lir(X86Inst::Cmp {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(48 - 16 + 1),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Uge,
+            target: overflow_label.clone(),
+        });
+
+        // RAX = reg_save_area + gp_offset.
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset + 16,
+            }),
+            dst: GpOperand::Reg(Reg::Rax),
+        });
+        self.push_lir(X86Inst::Movsx {
+            src_size: OperandSize::B32,
+            dst_size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R10),
+            dst: Reg::Rcx,
+        });
+        self.push_lir(X86Inst::Add {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rcx),
+            dst: Reg::Rax,
+        });
+
+        // The cursor is committed before the copy, for the reason given in
+        // `emit_va_arg_int`.
+        self.push_lir(X86Inst::Add {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(16),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Reg(Reg::R10),
+            dst: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset,
+            }),
+        });
+
+        self.va_store_pair(Reg::Rax, dst_loc);
+
+        self.push_lir(X86Inst::Jmp {
+            target: done_label.clone(),
+        });
+
+        // Overflow path. The type is 16-byte aligned, so the area pointer is
+        // rounded up before the read -- gcc emits the same `addq $15; andq
+        // $-16` here -- and advanced by 16 afterwards.
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(overflow_label)));
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset + 8,
+            }),
+            dst: GpOperand::Reg(Reg::Rax),
+        });
+        self.push_lir(X86Inst::Add {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(15),
+            dst: Reg::Rax,
+        });
+        self.push_lir(X86Inst::And {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(-16),
+            dst: Reg::Rax,
+        });
+
+        self.push_lir(X86Inst::Lea {
+            addr: MemAddr::BaseOffset {
+                base: Reg::Rax,
+                offset: 16,
+            },
+            dst: Reg::Rcx,
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rcx),
+            dst: GpOperand::Mem(MemAddr::BaseOffset {
+                base: ap_base,
+                offset: ap_base_offset + 8,
+            }),
+        });
+
+        self.va_store_pair(Reg::Rax, dst_loc);
+
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+    }
+
+    /// Copy the two eightbytes at `[src_ptr]` into a 16-byte destination slot.
+    ///
+    /// RCX is the shuttle for the same reason as in `va_store_scalar`, and the
+    /// high half goes through `int128_hi_mem_loc`, which is the one place that
+    /// knows where a 128-bit slot's upper eightbyte lives.
+    fn va_store_pair(&mut self, src_ptr: Reg, dst_loc: &Loc) {
+        match dst_loc {
+            Loc::Stack(dst_offset) => {
+                for (byte, dst) in [
+                    (0, self.stack_mem(*dst_offset)),
+                    (8, self.int128_hi_mem_loc(dst_loc)),
+                ] {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: src_ptr,
+                            offset: byte,
+                        }),
+                        dst: GpOperand::Reg(Reg::Rcx),
+                    });
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::Rcx),
+                        dst: GpOperand::Mem(dst),
+                    });
+                }
+            }
+            other => {
+                // A 128-bit result needs sixteen bytes of storage, and the
+                // linearizer gives it a slot. Anything else here means that
+                // stopped being true, and emitting nothing would leave the
+                // value undefined rather than say so.
+                crate::diag::error(
+                    crate::diag::Position::default(),
+                    &format!("internal error: va_arg of __int128 into {other:?}"),
+                );
+            }
+        }
+    }
+
+    /// Copy one scalar `va_arg` result from `[src_ptr]` to its destination.
+    ///
+    /// RCX is the shuttle, because a memory destination needs one and the two
+    /// registers that must survive -- `ap_base` and `src_ptr` -- may be any
+    /// of the others. The destination goes through `stack_mem`, which picks
+    /// the frame's base register; spelling `-(slot + callee_saved_offset)(%rbp)`
+    /// by hand wrote outside the frame whenever a local forced the stack to be
+    /// realigned.
+    fn va_store_scalar(&mut self, size: OperandSize, src_ptr: Reg, dst_loc: &Loc) {
+        match dst_loc {
+            Loc::Reg(r) => {
+                self.push_lir(X86Inst::Mov {
+                    size,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: src_ptr,
+                        offset: 0,
+                    }),
+                    dst: GpOperand::Reg(*r),
+                });
+            }
+            Loc::Stack(dst_offset) => {
+                self.push_lir(X86Inst::Mov {
+                    size,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: src_ptr,
+                        offset: 0,
+                    }),
+                    dst: GpOperand::Reg(Reg::Rcx),
+                });
+                self.push_lir(X86Inst::Mov {
+                    size,
+                    src: GpOperand::Reg(Reg::Rcx),
+                    dst: GpOperand::Mem(self.stack_mem(*dst_offset)),
+                });
+            }
+            _ => {}
+        }
     }
 
     /// Where an aggregate `va_arg` result goes, resolved once so the copy
@@ -734,6 +889,14 @@ impl X86_64CodeGen {
         );
         if types.kind(arg_type) == crate::types::TypeKind::LongDouble {
             self.emit_va_arg_x87(base_reg, base_offset, &dst_loc);
+        } else if types.kind(arg_type) == crate::types::TypeKind::Int128
+            && !types.is_complex(arg_type)
+        {
+            // Two INTEGER eightbytes, not one saturated at 64 bits. The
+            // complex guard is the same one every sibling site carries:
+            // `kind()` answers the *base* kind, so `_Complex __int128` would
+            // otherwise land here rather than in the aggregate path.
+            self.emit_va_arg_int128(base_reg, base_offset, &dst_loc, label_suffix);
         } else if is_aggregate {
             self.emit_va_arg_aggregate(
                 base_reg,

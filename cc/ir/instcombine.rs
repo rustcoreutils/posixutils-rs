@@ -24,6 +24,7 @@
 // `is_memory_barrier()` before crossing.
 //
 
+use super::constfold::{at_width, eval_binop, eval_unop, get_cmp_info, unambiguous_at};
 use super::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeId;
 use std::collections::HashMap;
@@ -242,6 +243,25 @@ fn fold_to_zero() -> Simplification {
     Simplification::FoldToConst(0)
 }
 
+/// Fold `insn` over two known constants, deferring to `constfold` for the
+/// width and signedness rules. `None` there means the operation is undefined
+/// for these operands -- a zero divisor, an out-of-range shift count -- and
+/// the instruction is left alone.
+fn fold_with(insn: &Instruction, a: i128, b: i128) -> Simplification {
+    match eval_binop(insn, a, b) {
+        Some(v) => Simplification::FoldToConst(v),
+        None => Simplification::None,
+    }
+}
+
+/// The unary counterpart of [`fold_with`].
+fn fold_unary_with(insn: &Instruction, a: i128) -> Simplification {
+    match eval_unop(insn, a) {
+        Some(v) => Simplification::FoldToConst(v),
+        None => Simplification::None,
+    }
+}
+
 /// Return FoldToConst for an absorbing/identity constant.
 fn fold_to_const(value: i128) -> Simplification {
     Simplification::FoldToConst(value)
@@ -278,7 +298,7 @@ fn simplify_add(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a + b -> (a + b)
-        (Some(a), Some(b)) => Simplification::FoldToConst(a.wrapping_add(b)),
+        (Some(a), Some(b)) => fold_with(insn, a, b),
 
         // Algebraic: x + 0 -> x
         (None, Some(0)) => Simplification::CopyFrom(src1),
@@ -310,7 +330,7 @@ fn simplify_sub(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a - b -> (a - b)
-        (Some(a), Some(b)) => Simplification::FoldToConst(a.wrapping_sub(b)),
+        (Some(a), Some(b)) => fold_with(insn, a, b),
 
         // Algebraic: x - 0 -> x
         (None, Some(0)) => Simplification::CopyFrom(src1),
@@ -333,7 +353,7 @@ fn simplify_mul(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a * b -> (a * b)
-        (Some(a), Some(b)) => Simplification::FoldToConst(a.wrapping_mul(b)),
+        (Some(a), Some(b)) => fold_with(insn, a, b),
 
         // Algebraic: x * 0 -> 0
         (None, Some(0)) => fold_to_zero(),
@@ -368,14 +388,7 @@ fn simplify_div(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a / b -> (a / b) (avoid div by zero)
-        (Some(a), Some(b)) if b != 0 => {
-            let folded = if signed {
-                a.wrapping_div(b)
-            } else {
-                (a as u128).wrapping_div(b as u128) as i128
-            };
-            Simplification::FoldToConst(at_width(folded, size, signed))
-        }
+        (Some(a), Some(b)) => fold_with(insn, a, b),
 
         // Algebraic: x / 1 -> x
         (None, Some(1)) => Simplification::CopyFrom(src1),
@@ -404,14 +417,7 @@ fn simplify_mod(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a % b -> (a % b) (avoid mod by zero)
-        (Some(a), Some(b)) if b != 0 => {
-            let folded = if signed {
-                a.wrapping_rem(b)
-            } else {
-                (a as u128).wrapping_rem(b as u128) as i128
-            };
-            Simplification::FoldToConst(at_width(folded, size, signed))
-        }
+        (Some(a), Some(b)) => fold_with(insn, a, b),
 
         // Algebraic: 0 % x -> 0
         (Some(0), None) => fold_to_zero(),
@@ -425,48 +431,6 @@ fn simplify_mod(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
 // Shift Simplifications
 
-/// Does `v` mean the same thing at `size` bits whether it is read as signed
-/// or as unsigned?
-///
-/// An `i128` in this IR holds whatever bit pattern its constant was built
-/// from, and nothing on the instruction says how to read it back: the same
-/// 32 bits are -1 or 4294967295 depending on the consumer, and a `Set*`
-/// cannot even ask, because its `size` is the width of its own `_Bool`/`int`
-/// result rather than of its operands (`(_Bool)x` lowers to `setne.8` over
-/// two 32-bit values).
-///
-/// That ambiguity is pre-existing and harmless while a folded constant only
-/// ever reaches codegen, which truncates when it materializes an immediate.
-/// Feeding one back into a *second* fold is what would make it visible --
-/// `1u << 31` compared against `2147483648u`, or `0x40000000 * 4` divided by
-/// two. Rather than guess a signedness this pass does not have the type
-/// information to know, only values that read the same either way are
-/// carried across a fold. The rest simply do not chain, which is exactly the
-/// behaviour before copies were followed.
-fn unambiguous_at(v: i128, size: u32) -> bool {
-    at_width(v, size, true) == v && at_width(v, size, false) == v
-}
-
-/// A constant as it actually is at `size` bits.
-///
-/// `const_val` hands back an `i128` holding whatever bit pattern the constant
-/// was built from, which for a narrower operand may be wider than the operand
-/// itself: `(int)0xFFFFFFFFu` is stored as 4294967295, not -1. Every consumer
-/// that only *emits* the value truncates and so never noticed, but folding
-/// arithmetic on it does notice -- `Asr` on 4294967295 shifts in zeros and
-/// answers 2147483647 where the operand is -1 and the answer is -1.
-fn at_width(v: i128, size: u32, signed: bool) -> i128 {
-    if size == 0 || size >= 128 {
-        return v;
-    }
-    let pad = 128 - size;
-    if signed {
-        (v << pad) >> pad
-    } else {
-        (((v as u128) << pad) >> pad) as i128
-    }
-}
-
 fn simplify_shift(insn: &Instruction, consts: &ConstMap) -> Simplification {
     if insn.src.len() != 2 {
         return Simplification::None;
@@ -477,25 +441,9 @@ fn simplify_shift(insn: &Instruction, consts: &ConstMap) -> Simplification {
     let val1 = consts.get(src1);
     let val2 = consts.get(src2);
 
-    let max_shift = insn.size.max(1) as i128; // use operand width, not hardcoded 128
-
     match (val1, val2) {
         // Constant folding (shift amount must be in [0, type_width))
-        (Some(a), Some(b)) if (0..max_shift).contains(&b) => {
-            // Each shift is folded at the operand's own width, and the
-            // operand is read with the signedness that shift implies: `Asr`
-            // is the arithmetic one by definition, `Lsr` the logical one.
-            let size = insn.size.max(1);
-            let folded = match insn.op {
-                // The result is truncated back, so an overflowing shift wraps
-                // at the operand width rather than growing into the i128.
-                Opcode::Shl => at_width(at_width(a, size, true).wrapping_shl(b as u32), size, true),
-                Opcode::Lsr => at_width(a, size, false).wrapping_shr(b as u32),
-                Opcode::Asr => at_width(a, size, true).wrapping_shr(b as u32),
-                _ => return Simplification::None,
-            };
-            Simplification::FoldToConst(folded)
-        }
+        (Some(a), Some(b)) => fold_with(insn, a, b),
 
         // Algebraic: x op 0 -> x
         (None, Some(0)) => Simplification::CopyFrom(src1),
@@ -526,8 +474,6 @@ struct BitwiseInfo {
     /// Absorbing element: x op absorbing = absorbing (e.g., x & 0 = 0, x | -1 = -1)
     /// None for XOR (no absorbing element)
     absorbing: Option<i128>,
-    /// Constant folding function
-    fold: fn(i128, i128) -> i128,
 }
 
 /// Get bitwise operation info for the given opcode
@@ -537,19 +483,16 @@ fn get_bitwise_info(op: Opcode) -> Option<BitwiseInfo> {
             self_result: SelfOpResult::CopySrc,
             identity: -1,       // x & -1 = x (all bits set)
             absorbing: Some(0), // x & 0 = 0
-            fold: |a, b| a & b,
         }),
         Opcode::Or => Some(BitwiseInfo {
             self_result: SelfOpResult::CopySrc,
             identity: 0,         // x | 0 = x
             absorbing: Some(-1), // x | -1 = -1
-            fold: |a, b| a | b,
         }),
         Opcode::Xor => Some(BitwiseInfo {
             self_result: SelfOpResult::Const(0), // x ^ x = 0
             identity: 0,                         // x ^ 0 = x
             absorbing: None,                     // no absorbing element
-            fold: |a, b| a ^ b,
         }),
         _ => None,
     }
@@ -582,7 +525,7 @@ fn simplify_bitwise(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a op b
-        (Some(a), Some(b)) => Simplification::FoldToConst((info.fold)(a, b)),
+        (Some(a), Some(b)) => fold_with(insn, a, b),
 
         // Algebraic: x op identity -> x
         (None, Some(v)) if v == info.identity => Simplification::CopyFrom(src1),
@@ -597,78 +540,6 @@ fn simplify_bitwise(insn: &Instruction, consts: &ConstMap) -> Simplification {
 }
 
 // Comparison Simplifications
-
-/// Comparison behavior for identity (x op x) and constant folding
-struct CmpInfo {
-    /// Result when comparing x to itself (e.g., x == x -> 1, x < x -> 0)
-    identity_result: i128,
-    /// Constant comparison function
-    compare: fn(i128, i128) -> bool,
-    /// How to read the operands at their own width before comparing.
-    ///
-    /// The opcode is the only thing that carries this: `SetLt`/`Le`/`Gt`/`Ge`
-    /// are the signed forms and `SetB`/`Be`/`A`/`Ae` the unsigned ones.
-    /// `SetEq`/`SetNe` do not care which, as long as both sides are read the
-    /// same way -- but they do care about the width.
-    signed: bool,
-}
-
-/// Get comparison info for the given opcode
-fn get_cmp_info(op: Opcode) -> Option<CmpInfo> {
-    match op {
-        Opcode::SetEq => Some(CmpInfo {
-            identity_result: 1,
-            compare: |a, b| a == b,
-            signed: true,
-        }),
-        Opcode::SetNe => Some(CmpInfo {
-            identity_result: 0,
-            compare: |a, b| a != b,
-            signed: true,
-        }),
-        Opcode::SetLt => Some(CmpInfo {
-            identity_result: 0,
-            compare: |a, b| a < b,
-            signed: true,
-        }),
-        Opcode::SetLe => Some(CmpInfo {
-            identity_result: 1,
-            compare: |a, b| a <= b,
-            signed: true,
-        }),
-        Opcode::SetGt => Some(CmpInfo {
-            identity_result: 0,
-            compare: |a, b| a > b,
-            signed: true,
-        }),
-        Opcode::SetGe => Some(CmpInfo {
-            identity_result: 1,
-            compare: |a, b| a >= b,
-            signed: true,
-        }),
-        Opcode::SetB => Some(CmpInfo {
-            identity_result: 0,
-            compare: |a, b| (a as u128) < (b as u128),
-            signed: false,
-        }),
-        Opcode::SetBe => Some(CmpInfo {
-            identity_result: 1,
-            compare: |a, b| (a as u128) <= (b as u128),
-            signed: false,
-        }),
-        Opcode::SetA => Some(CmpInfo {
-            identity_result: 0,
-            compare: |a, b| (a as u128) > (b as u128),
-            signed: false,
-        }),
-        Opcode::SetAe => Some(CmpInfo {
-            identity_result: 1,
-            compare: |a, b| (a as u128) >= (b as u128),
-            signed: false,
-        }),
-        _ => None,
-    }
-}
 
 /// Unified comparison simplification for all SetXX opcodes
 fn simplify_comparison(insn: &Instruction, consts: &ConstMap) -> Simplification {
@@ -694,19 +565,7 @@ fn simplify_comparison(insn: &Instruction, consts: &ConstMap) -> Simplification 
     let val2 = consts.get(src2);
 
     if let (Some(a), Some(b)) = (val1, val2) {
-        // `insn.size` is the width of the *result* at one of the four Set*
-        // construction sites -- a `_Bool` conversion lowers to `setne.8` over
-        // two 32-bit operands -- and that site is the only one that records
-        // the operand width, in `src_size`. Preferring `src_size` when it is
-        // set is right at all four.
-        let size = if insn.src_size != 0 {
-            insn.src_size
-        } else {
-            insn.size.max(1)
-        };
-        let a = at_width(a, size, info.signed);
-        let b = at_width(b, size, info.signed);
-        return Simplification::FoldToConst(if (info.compare)(a, b) { 1 } else { 0 });
+        return fold_with(insn, a, b);
     }
 
     Simplification::None
@@ -720,10 +579,9 @@ fn simplify_neg(insn: &Instruction, consts: &ConstMap) -> Simplification {
     }
 
     let src = insn.src[0];
-    if let Some(val) = consts.get(src) {
-        Simplification::FoldToConst(val.wrapping_neg())
-    } else {
-        Simplification::None
+    match consts.get(src) {
+        Some(val) => fold_unary_with(insn, val),
+        None => Simplification::None,
     }
 }
 
@@ -733,10 +591,9 @@ fn simplify_not(insn: &Instruction, consts: &ConstMap) -> Simplification {
     }
 
     let src = insn.src[0];
-    if let Some(val) = consts.get(src) {
-        Simplification::FoldToConst(!val)
-    } else {
-        Simplification::None
+    match consts.get(src) {
+        Some(val) => fold_unary_with(insn, val),
+        None => Simplification::None,
     }
 }
 

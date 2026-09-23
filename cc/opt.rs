@@ -16,6 +16,7 @@ use crate::ir::inline;
 use crate::ir::instcombine;
 use crate::ir::sccp;
 use crate::ir::validate;
+use crate::ir::vrp;
 use crate::ir::{Function, Module};
 use crate::types::TypeTable;
 
@@ -275,7 +276,15 @@ fn optimize_function(func: &mut Function, types: &TypeTable) {
         // The order is load-bearing, and each pass hands the next one a
         // shape it could not have seen for itself.
         //
-        // `ifconv` first: it collapses a short-circuit diamond into a
+        // `vrp` first, because it is the only pass that reads a *branch*:
+        // `var <= 0` being false says `var >= 1` on that edge, and `ifconv`
+        // collapses exactly that diamond into a `Select`, speculating the
+        // arm into a predecessor where `var` is unconstrained. Once that has
+        // happened the comparison is genuinely undecidable -- `var == 0`
+        // makes `(unsigned)(var - 1)` equal `UINT_MAX` -- so nothing
+        // downstream recovers it.
+        //
+        // `ifconv` next: it collapses a short-circuit diamond into a
         // `Select` in one block, which is what makes the two relationals
         // inside it comparable at all.
         //
@@ -290,12 +299,13 @@ fn optimize_function(func: &mut Function, types: &TypeTable) {
         //
         // `dce` last: SCCP removes a dead edge but deletes no block, and
         // leaves the `PhiSource` of a folded phi for `dce` to collect.
+        let vrp_changed = vrp::run(func, types);
         let ifc_changed = ifconv::run(func);
         let sccp_changed = sccp::run(func, types);
         let ic_changed = instcombine::run(func, types);
         let dce_changed = dce::run(func);
 
-        if !ifc_changed && !sccp_changed && !ic_changed && !dce_changed {
+        if !vrp_changed && !ifc_changed && !sccp_changed && !ic_changed && !dce_changed {
             break;
         }
     }

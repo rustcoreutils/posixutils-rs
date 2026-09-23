@@ -329,13 +329,17 @@ extern_symbols          - symbols needing GOT
 | `constfold.rs` | Evaluating an operation over constants at the operand's own width and signedness, integer and floating alike. Not a pass -- the one place those rules are written, shared by `instcombine` and `sccp` |
 | `instcombine.rs` | Constant folding, algebraic simplification |
 | `constglobal.rs` | Module pre-pass: a load of a `const` global becomes its initializer. Needs no alias or escape analysis -- modifying a `const`-defined object is undefined behaviour (C17 6.7.3p6) |
+| `range.rs` | A set of W-bit integers as one interval that may wrap, with the transfer functions. Not a pass; no IR types, which is why it is tested exhaustively at four bits |
+| `vrp.rs` | Value-range propagation. The only pass that reads a *branch*: `var <= 0` being false says `var >= 1` on that edge. Runs before `ifconv`, which would otherwise collapse the diamond the fact hangs on |
+| `propagate.rs` | The rewrites an analysis performs once it has proved something -- a value to a constant, a conditional terminator to a `Br`. Shared by `sccp` and `vrp` |
+| `facts.rs` | `ConstMap` and `CmpFacts`: what a pass knows about a pseudo before it rewrites anything. Shared queries, not rewrites |
 | `lower.rs` | φ elimination, and answering any `ConstantP` placeholder `sccp` never reached -- which is all of them at `-O0` |
 | `ifconv.rs` | If-conversion: collapses a short-circuit `&&`/`||` diamond whose arm is safe to speculate into a `Select` |
 | `sccp.rs` | Sparse conditional constant propagation: constants along reachable paths only, and the only thing that folds a branch on a constant condition |
 | `inline.rs` | Function inlining |
 | `lower.rs` | Phi elimination to copies |
 
-The driver in `cc/opt.rs` runs `inline → constglobal → (ifconv + sccp + instcombine + dce)*` to fixed
+The driver in `cc/opt.rs` runs `inline → constglobal → (vrp + ifconv + sccp + instcombine + dce)*` to fixed
 point (up to 10 iterations). The order inside the loop is load-bearing in both
 directions: `instcombine` derives constants `sccp` structurally cannot (`x - x`,
 `x ^ x`), any of which can make a branch condition constant, and `sccp` deletes

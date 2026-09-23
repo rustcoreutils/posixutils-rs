@@ -28,10 +28,12 @@ pub mod lower;
 pub mod mach_o_dtors;
 pub mod mem2reg;
 pub mod propagate;
+pub mod range;
 pub mod sccp;
 pub mod ssa;
 pub mod tls;
 pub mod validate;
+pub mod vrp;
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::diag::Position;

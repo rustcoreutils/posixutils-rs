@@ -80,23 +80,6 @@ is no longer the problem; code size is. The fix belongs wherever the stacked
 argument is written, and has to avoid clobbering argument registers already set
 up — which is why it was not folded into the IR-level change.
 
-### An initialized global is emitted as a common symbol
-
-`int z = 0;` and `const int c = 0;` both reach the object file as
-`.comm`, which is the encoding for a *tentative* definition. Two
-consequences, neither of which a c17-only build shows:
-
-- Two translation units each defining the same object link silently,
-  where C17 6.9p5 allows one external definition and gcc reports
-  `multiple definition`.
-- A `const` object lands in COMMON, which is writable, instead of
-  `.rodata`. gcc puts both the initialized and the tentative `const` there.
-
-An explicitly zero-initialized definition is the case that gets it wrong;
-a non-zero one is emitted normally. `ir/constglobal.rs` declines to fold
-a tentative definition for the first reason above, so fixing this would
-also let `const int c = 0;` propagate.
-
 ### R10 reserved globally for division scratch
 
 **Location**: `arch/x86_64/regalloc.rs` lines 187-208
@@ -290,7 +273,6 @@ Most of what is left is one thing.
 | Group | Note |
 |---|---|
 | Dead-call elimination proofs | `20041114-1`, `pure-1`, at `-O1` and above. Each calls an undefined `link_error` that the optimizer is expected to delete, so they fail to *link*; all pass at `-O0`, where the test's own `#ifndef __OPTIMIZE__` supplies a definition. Standard C, and optimizer strength rather than a defect. Both are large: value-range propagation across an edge (`20041114-1`), or escape analysis with store-to-load forwarding (`pure-1`) -- the first pass that would move memory, which makes `Instruction::is_memory_barrier()` load-bearing for the first time |
-| Address of a string-literal element as a constant | `921019-1`: `(void *)&("X"[0])` in a static initializer |
 | The two divergences above | `991014-1`, `920728-1` |
 
 One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.

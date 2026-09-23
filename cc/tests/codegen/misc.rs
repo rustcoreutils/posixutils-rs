@@ -9302,10 +9302,18 @@ int main(void) { return hidden_zero + weak_zero + hidden_init - 7 + plain_zero; 
         asm.contains(".hidden hidden_init"),
         "initialized hidden variable lost its visibility:\n{asm}"
     );
-    // The unattributed one still gets the fast path it was always entitled to.
+    // The unattributed one still gets the fast path it was always entitled
+    // to -- but as a *definition*. A common symbol merges with another
+    // translation unit's definition of the same object, which C17 6.9p5 does
+    // not allow and gcc reports.
+    assert_eq!(
+        section_of(&asm, "plain_zero"),
+        Some(".bss"),
+        "an unattributed zero-initialized global still belongs in .bss:\n{asm}"
+    );
     assert!(
-        asm.contains(".comm plain_zero"),
-        "an unattributed zero-initialized global should still be common:\n{asm}"
+        !asm.contains(".comm plain_zero"),
+        "it must not be a common symbol:\n{asm}"
     );
 }
 
@@ -13032,6 +13040,163 @@ int main(void)
     for opt in ["-O0", "-O1", "-O2"] {
         assert_eq!(
             compile_and_run("c17_unary_promotion", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// An initialized global is a *definition*, not a common symbol.
+///
+/// `.comm` declares a common symbol, and those merge across translation
+/// units: two definitions of one object linked silently, where C17 6.9p5
+/// allows one external definition and gcc reports `multiple definition`.
+/// gcc has defaulted to `-fno-common` since 10 and emits none at all.
+///
+/// A `const` object is the other half: BSS-class storage is writable, so a
+/// zero-initialized `const` was not read-only. Both the tentative and the
+/// initialized form belong in `.rodata`.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_zero_initialized_globals_are_definitions() {
+    let asm = asm_for_at(
+        "c17_zero_init_def",
+        "int tentative;\n\
+         int explicit_zero = 0;\n\
+         int nonzero = 5;\n\
+         const int c_tentative;\n\
+         const int c_zero = 0;\n\
+         static int s_zero = 0;\n",
+        &[],
+    );
+
+    // Nothing exported is a common symbol any more.
+    for name in ["tentative", "explicit_zero", "c_tentative", "c_zero"] {
+        assert!(
+            !asm.contains(&format!(".comm {name},")),
+            "`{name}` should be a definition, not a common symbol:\n{asm}"
+        );
+    }
+    // A `const` object is read-only, whatever its initializer. Asked as
+    // "which section directive was last before the label", since a file has
+    // several `.rodata` chunks and the labels are spread across them.
+    for name in ["c_tentative", "c_zero"] {
+        assert_eq!(
+            section_of(&asm, name),
+            Some(".section .rodata"),
+            "`{name}` should be in .rodata:\n{asm}"
+        );
+    }
+    for name in ["tentative", "explicit_zero"] {
+        assert_eq!(
+            section_of(&asm, name),
+            Some(".bss"),
+            "`{name}` should be in .bss:\n{asm}"
+        );
+    }
+    assert_eq!(section_of(&asm, "nonzero"), Some(".data"));
+    // An internal-linkage one keeps its `.local`/`.comm` pair, which does not
+    // export anything and so cannot collide.
+    assert!(
+        asm.contains(".local s_zero"),
+        "a static keeps internal linkage:\n{asm}"
+    );
+}
+
+/// The section directive in force where `name:` is defined.
+fn section_of<'a>(asm: &'a str, name: &str) -> Option<&'a str> {
+    let label = format!("{name}:");
+    let mut current = None;
+    for line in asm.lines() {
+        let t = line.trim();
+        if t == ".bss" || t == ".data" || t == ".text" || t.starts_with(".section ") {
+            current = Some(t);
+        } else if t == label {
+            return current;
+        }
+    }
+    None
+}
+
+/// `&*x` is `x`: the pair cancels, and no object is read, so it is a static
+/// address wherever `x` is one.
+///
+/// The `Deref` arm has to go through `static_address_operand` rather than
+/// recurse into the ordinary walk: that walk answers a bare identifier with
+/// the address *of* the object, because every other caller has already seen
+/// an `&`, so `&*p` for a pointer variable would fold to the address of `p`
+/// instead of its value.
+#[test]
+fn codegen_address_of_dereference_is_a_static_address() {
+    let code = r#"
+extern void abort(void);
+
+int a[4] = {10, 11, 12, 13};
+int v = 99;
+struct T { int x, y; } t = {1, 2};
+
+int *p1 = &*(a + 2);
+int *p2 = &*&v;
+int *p3 = &*&t.y;
+char *p4 = (char *)&(*(&"ZYX"[2]));
+int *p5 = &*(a + 1) + 1;
+
+int main(void)
+{
+    if (*p1 != 12) abort();
+    if (*p2 != 99) abort();
+    if (*p3 != 2) abort();
+    if (*p4 != 'X') abort();
+    if (*p5 != 12) abort();
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_addr_of_deref", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// The address of an element of a string literal is a static address, at any
+/// depth and in an aggregate initializer as well as a scalar one.
+///
+/// The literal acquires an address by being interned, which needs `&mut
+/// self` -- so the walk that reaches it has to be the mutable one. There
+/// used to be two walks, and only the outer one could intern, which is why
+/// `"X" + 1` worked and `&("X"[0])` was rejected: the first arrives with the
+/// literal in hand, the second with an `Index` wrapped around it.
+#[test]
+fn codegen_address_of_string_literal_element() {
+    let code = r#"
+extern void abort(void);
+extern int strcmp(const char *, const char *);
+
+void *foo[] = {(void *)&("X"[0])};
+char *bar[] = {"HELLO", "HELLO" + 2, &"HELLO"[3], &("HELLO"[4])};
+struct S { void *p; char *q; } s = {(void *)&("AB"[1]), &"CD"[1]};
+unsigned int *w[] = {(unsigned int *)&(U"AB"[1])};
+char *scalar = &"WXYZ"[1];
+
+int main(void)
+{
+    if (((char *)foo[0])[0] != 'X') abort();
+    if (strcmp(bar[0], "HELLO")) abort();
+    if (strcmp(bar[1], "LLO")) abort();
+    if (strcmp(bar[2], "LO")) abort();
+    if (strcmp(bar[3], "O")) abort();
+    if (((char *)s.p)[0] != 'B') abort();
+    if (strcmp(s.q, "D")) abort();
+    if (*w[0] != 'B') abort();
+    if (strcmp(scalar, "XYZ")) abort();
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_addr_of_string_elem", code, &[opt.to_string()]),
             0,
             "at {opt}"
         );

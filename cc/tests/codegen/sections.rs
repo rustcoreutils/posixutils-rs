@@ -91,11 +91,17 @@ fn has_bss_local(asm: &str, name: &str) -> bool {
 }
 
 /// True if `name` is allocated as a regular (external) `.comm` symbol.
-fn has_comm_external(asm: &str, name: &str) -> bool {
+/// Is `name` an exported object with no initialized bytes?
+///
+/// A *definition*, not a common symbol: `.comm` merges across translation
+/// units, so two definitions of one object would link silently where C17
+/// 6.9p5 allows one. gcc has emitted none since it defaulted to
+/// `-fno-common`.
+fn has_bss_external(asm: &str, name: &str) -> bool {
     if cfg!(target_os = "macos") {
-        asm.contains(&format!(".comm _{},", name))
+        asm.contains(&format!(".zerofill __DATA,__bss,_{},", name))
     } else {
-        asm.contains(&format!(".comm {},", name))
+        asm.contains(&format!("\n{name}:\n.zero "))
     }
 }
 
@@ -262,25 +268,25 @@ fn sections_static_zero_goes_to_bss_local() {
 }
 
 #[test]
-fn sections_extern_zero_goes_to_comm() {
+fn sections_extern_zero_goes_to_bss() {
     let asm = compile_to_asm(
-        "extern_zero_comm",
+        "extern_zero_bss",
         r#"
             int e_zero;
             int e_zero_explicit = 0;
             int main(void) { return e_zero + e_zero_explicit; }
         "#,
     );
-    assert!(
-        has_comm_external(&asm, "e_zero"),
-        "expected e_zero in external `.comm` form:\n{}",
-        asm
-    );
-    assert!(
-        has_comm_external(&asm, "e_zero_explicit"),
-        "expected e_zero_explicit in external `.comm` form:\n{}",
-        asm
-    );
+    for name in ["e_zero", "e_zero_explicit"] {
+        assert!(
+            has_bss_external(&asm, name),
+            "expected {name} as an external BSS definition:\n{asm}"
+        );
+        assert!(
+            !asm.contains(&format!(".comm {name},")),
+            "{name} must not be a common symbol:\n{asm}"
+        );
+    }
 }
 
 #[test]

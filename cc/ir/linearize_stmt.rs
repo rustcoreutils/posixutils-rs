@@ -2143,6 +2143,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
+    /// The byte offset `array[index]` adds to the address of `array`.
+    ///
+    /// Shared by the two static-address walks, which differ only in whether
+    /// they may intern a literal, not in what a subscript means.
+    pub(crate) fn index_byte_offset(&self, array: &Expr, index: &Expr) -> Option<i64> {
+        let idx = self.eval_const_init_expr(index)?;
+        let elem_type = self.types.base_type(array.typ?)?;
+        Some(idx as i64 * self.types.size_bytes(elem_type) as i64)
+    }
+
     /// Evaluate a static address expression (for initializers like `&symbol.field`)
     ///
     /// Reached only from the initializer path, so a subscript folds with
@@ -2151,8 +2161,58 @@ impl<'a> super::linearize::Linearizer<'a> {
     ///
     /// Returns Some((symbol_name, offset)) if the expression is a valid static address,
     /// or None if it can't be computed at compile time.
-    pub(crate) fn eval_static_address(&self, expr: &Expr) -> Option<(String, i64)> {
+    pub(crate) fn eval_static_address(&mut self, expr: &Expr) -> Option<(String, i64)> {
         match &expr.kind {
+            // A literal has a perfectly good static address, but only once it
+            // has been interned and given a label -- which is why this walk
+            // takes `&mut self`. Handling them anywhere but here means
+            // handling the nodes *above* them twice; that split is what made
+            // `"X" + 1` work while `&("X"[0])` was a diagnostic.
+            ExprKind::StringLit(lit) => {
+                let lit = lit.clone();
+                Some((self.module.add_string(lit), 0))
+            }
+            ExprKind::WideStringLit(lit) => {
+                let lit = lit.clone();
+                Some((self.module.add_wide_string(lit), 0))
+            }
+            ExprKind::Utf16StringLit(units) => {
+                let units = units.clone();
+                Some((self.module.add_utf16_string(units), 0))
+            }
+            ExprKind::Utf32StringLit(units) => {
+                let units = units.clone();
+                Some((self.module.add_utf32_string(units), 0))
+            }
+
+            // A compound literal at file scope has static storage duration
+            // (C99 6.5.2.5p5), so it is an object with an address -- but it
+            // only acquires one when it is given a name here.
+            ExprKind::CompoundLiteral { typ, elements } => {
+                let name = format!(".CL{}", self.compound_literal_counter);
+                self.compound_literal_counter += 1;
+                let typ = *typ;
+                let elements = elements.clone();
+                let init = self.ast_init_list_to_ir(&elements, typ);
+                self.module.add_global(&name, typ, init);
+                Some((name, 0))
+            }
+
+            // `&*x` is `x`: the pair cancels and no object is read. The
+            // operand has to be something already *shaped* like an address,
+            // which is what `static_address_operand` decides -- the `Ident`
+            // arm below answers with the address *of* an object, because
+            // every other caller has already seen an `&`, so recursing into
+            // it here would fold `&*p` to the address of `p` rather than to
+            // its value.
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                operand,
+            } => {
+                let operand = operand.clone();
+                self.static_address_operand(&operand)
+            }
+
             // Simple identifier: &symbol
             ExprKind::Ident(symbol_id) => {
                 let name_str = self.symbol_name(*symbol_id);
@@ -2192,18 +2252,8 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             // Array subscript: array[index]
             ExprKind::Index { array, index } => {
-                // Recursively evaluate the base address
                 let (name, base_offset) = self.eval_static_address(array)?;
-
-                // Get the index as a constant
-                let idx = self.eval_const_init_expr(index)?;
-
-                // Get the element size
-                let array_type = array.typ?;
-                let elem_type = self.types.base_type(array_type)?;
-                let elem_size = self.types.size_bytes(elem_type) as i64;
-
-                Some((name, base_offset + idx as i64 * elem_size))
+                Some((name, base_offset + self.index_byte_offset(array, index)?))
             }
 
             // Address-of: &expr → same as evaluating expr as static address

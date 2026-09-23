@@ -109,6 +109,7 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 | `__builtin_fabs(x)` | Absolute value (`double`) |
 | `__builtin_fabsf(x)` | Absolute value (`float`) |
 | `__builtin_fabsl(x)` | Absolute value (`long double`) |
+| `floor(x)`, `ceil(x)`, `trunc(x)`, `round(x)`, `rint(x)`, `nearbyint(x)` | Recognized under their plain names and **narrowed to the `f` form when the argument is a `float`**: `(float)floor((double)x)` is `floorf(x)` exactly, because the result is an integer no greater in magnitude than `x`. The condition is the argument's type, not the result's. Only these six qualify -- `sin` and `log` are not exactly rounding, and narrowing one changes the last bit. Displaced like `fabs` |
 | `fabs(x)`, `fabsf(x)`, `fabsl(x)` | The same three under their bare names, as gcc recognizes them whether or not `<math.h>` was included. Not reserved spellings, so they are displaced the same way `alloca` is: by a declaration that is not a function, or by `-fno-builtin[-fabs]`. The bare name is still an object where it is not being called, so `double (*p)(double) = fabs;` names the library function. The argument is converted to the prototype's type first, which is the whole of what recognition buys at run time -- all three are lowered as calls -- while the optimizer gains the one fact it needs to fold `fabs(x) < 0.0` to 0 |
 | `__builtin_signbit(x)` | Returns non-zero if sign bit set (`double`) |
 | `__builtin_signbitf(x)` | Returns non-zero if sign bit set (`float`) |

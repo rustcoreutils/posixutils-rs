@@ -290,8 +290,6 @@ Most of what is left is one thing.
 | Group | Note |
 |---|---|
 | Dead-call elimination proofs | `20041114-1`, `pure-1`, at `-O1` and above. Each calls an undefined `link_error` that the optimizer is expected to delete, so they fail to *link*; all pass at `-O0`, where the test's own `#ifndef __OPTIMIZE__` supplies a definition. Standard C, and optimizer strength rather than a defect. Both are large: value-range propagation across an edge (`20041114-1`), or escape analysis with store-to-load forwarding (`pure-1`) -- the first pass that would move memory, which makes `Instruction::is_memory_barrier()` load-bearing for the first time |
-| Missing optimizations behind `__OPTIMIZE__` | `20030125-1` needs `(float)floor((double)x)` narrowed to `floorf(x)`, which is exact only for the exactly-rounding functions -- the test's weak `sinf` aborts to catch an over-eager narrower. `builtin-constant` needs `__builtin_constant_p` answered after propagation rather than syntactically at parse time. Both abort at run time rather than failing to link |
-| Inline definition with no out-of-line body | `930526-1`, at `-O1` and `-Og` only. gnu89 `inline` emits no out-of-line body, so the call must be inlined or it cannot link; the callee is over the inliner's size cap and level 1 does not inline aggressively |
 | Address of a string-literal element as a constant | `921019-1`: `(void *)&("X"[0])` in a static initializer |
 | The two divergences above | `991014-1`, `920728-1` |
 

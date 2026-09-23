@@ -11,7 +11,7 @@
 // Consolidates: nan, nans, flt_rounds tests
 //
 
-use crate::common::compile_and_run;
+use crate::common::{asm_for_at, compile_and_run};
 
 // ============================================================================
 // Mega-test: Math builtins
@@ -528,4 +528,116 @@ int main(void)
 }
 "#;
     assert_eq!(compile_and_run("builtins_fabs_object", code, &[]), 0);
+}
+
+/// `(float)floor((double)x)` is `floorf(x)`, and c17 narrows it.
+///
+/// Exact because the result is an integer no greater in magnitude than `x`,
+/// so a value representable as a `float` stays representable. The condition
+/// is on the **argument** type and not the result: a function returning
+/// `double` narrows too, because the narrowing happens before the widening.
+///
+/// The negative half is the point, and the c-torture test that covers this
+/// weaponises it -- only the *exactly-rounding* functions qualify. `sinf(x)`
+/// and `(float)sin((double)x)` differ in the last bit for some `x`, so
+/// narrowing `sin` would be a wrong answer rather than a faster one.
+///
+/// c17 narrows in the parser and so does it at every level, where gcc does
+/// it only with the optimizer on. Both are correct, since the rewrite is
+/// exact; [`builtins_math_narrowing_happens_at_every_level`] pins the
+/// difference down on the assembly, because a run-time test of it would
+/// disagree with gcc at `-O0` for a reason that is not a defect.
+#[test]
+fn builtins_exactly_rounding_math_narrows_to_its_float_form() {
+    let code = r#"
+extern void abort(void);
+double floor(double); double ceil(double); double trunc(double);
+double round(double); double rint(double); double nearbyint(double);
+double sin(double); double log(double);
+
+/* Every weak definition here is the identity except the ones that must not
+   be reached, which abort. The arguments below are all integral, so the
+   true mathematical answer is the identity too -- which is what makes this
+   robust to the compiler expanding the narrowed call as a machine
+   instruction instead of calling it at all. What it catches is the *wide*
+   form being reached with a `float` argument. */
+__attribute__((weak)) double floor(double a) { abort(); }
+__attribute__((weak)) float floorf(float a) { return a; }
+__attribute__((weak)) double ceil(double a) { abort(); }
+__attribute__((weak)) float ceilf(float a) { return a; }
+__attribute__((weak)) double trunc(double a) { abort(); }
+__attribute__((weak)) float truncf(float a) { return a; }
+__attribute__((weak)) double round(double a) { abort(); }
+__attribute__((weak)) float roundf(float a) { return a; }
+__attribute__((weak)) double rint(double a) { abort(); }
+__attribute__((weak)) float rintf(float a) { return a; }
+__attribute__((weak)) double nearbyint(double a) { abort(); }
+__attribute__((weak)) float nearbyintf(float a) { return a; }
+
+/* `sin` and `log` must NOT narrow, so the arrangement is reversed: the wide
+   one is the identity and the narrow one aborts. */
+__attribute__((weak)) double sin(double a) { return a; }
+__attribute__((weak)) float sinf(float a) { abort(); }
+__attribute__((weak)) double log(double a) { return a; }
+__attribute__((weak)) float logf(float a) { abort(); }
+
+__attribute__((noinline)) static float narrow(float x)
+{
+    return floor(x) + ceil(x) + trunc(x) + round(x) + rint(x) + nearbyint(x);
+}
+
+/* A `double` result from a `float` argument narrows just the same: the
+   narrowing happens before the widening. */
+__attribute__((noinline)) static double wide_result(float x) { return floor(x); }
+
+__attribute__((noinline)) static double transcendental(float x)
+{
+    return sin(x) + log(x);
+}
+
+int main(void)
+{
+    /* Guarded because gcc narrows only with the optimizer on, so at `-O0` it
+       reaches the aborting wide form and this program is not a statement
+       about it. c17 narrows at every level, which
+       `builtins_math_narrowing_happens_at_every_level` checks on the
+       assembly instead. */
+#ifdef __OPTIMIZE__
+    /* Six identities at an integral argument. */
+    if (narrow(0.0f) != 0.0f) abort();
+    if (narrow(2.0f) != 12.0f) abort();
+    if (narrow(-3.0f) != -18.0f) abort();
+    if (wide_result(0.0f) != 0.0) abort();
+    if (wide_result(-4.0f) != -4.0) abort();
+    if (transcendental(0.0f) != 0.0) abort();
+    if (transcendental(5.0f) != 10.0) abort();
+#endif
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2", "-Os"] {
+        assert_eq!(
+            compile_and_run("builtins_math_narrowing", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// The narrowing happens in the parser, so it does not wait for `-O`.
+///
+/// gcc performs it as an optimization and leaves the wide call at `-O0`.
+/// Doing it always is a deliberate difference and a safe one -- the rewrite
+/// is exact at every level -- but it is a difference, so it is stated here
+/// rather than left for someone to discover from a disassembly.
+#[test]
+fn builtins_math_narrowing_happens_at_every_level() {
+    let src = "double floor(double);\nfloat q(float a) { return floor(a); }\n";
+    for opt in ["-O0", "-O1", "-O2"] {
+        let asm = asm_for_at("math_narrow_level", src, &[opt]);
+        assert!(
+            asm.contains("floorf"),
+            "at {opt} the call should be narrowed:\n{asm}"
+        );
+    }
 }

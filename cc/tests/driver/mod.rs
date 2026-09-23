@@ -1992,7 +1992,6 @@ fn driver_unknown_f_flag_is_reported_not_swallowed() {
         "-fwrapv",              // the torture suite's dg-options do
         "-fvisibility=hidden",  // a prefix-matched, value-carrying form
         "-fno-tree-dse",        // gcc-internal pass c17 has no equivalent of
-        "-fgnu89-inline",
         "-fomit-frame-pointer",
     ] {
         let r = run_c17(&[flag, "-S", "-o", "/dev/null", &path]);
@@ -2016,6 +2015,53 @@ fn driver_unknown_f_flag_is_reported_not_swallowed() {
             r.stderr.contains("unrecognized") && r.stderr.contains(flag),
             "{flag} was swallowed silently:\n{}",
             r.stderr
+        );
+    }
+}
+
+/// `-fgnu89-inline` selects GNU89 inline semantics, which are the *opposite*
+/// of C99's on the `extern` question.
+///
+/// C99 6.7.4p6: a plain `inline` with no `extern` declaration provides no
+/// external definition, so no out-of-line body is emitted, and it is
+/// `extern inline` that provides one. GNU89 has it the other way round.
+///
+/// The flag used to be accepted and ignored, so a program compiled with it
+/// got C99 semantics and failed to link.
+#[test]
+fn driver_fgnu89_inline_flips_which_inline_emits_a_body() {
+    let src = create_c_file(
+        "driver_gnu89",
+        "inline void f(int x) { (void)x; }\n\
+         extern inline void g(int x) { (void)x; }\n\
+         int main(void){ f(1); g(2); return 0; }\n",
+    );
+    let path = src.path().to_string_lossy().to_string();
+
+    // (flags, the one of `f`/`g` that must have an out-of-line body)
+    let cases: &[(&[&str], &str, &str)] = &[
+        (&[], "g", "f"),
+        (&["-fgnu89-inline"], "f", "g"),
+        (&["-fno-gnu89-inline"], "g", "f"),
+        // The last of the pair on the command line wins, as in gcc.
+        (&["-fgnu89-inline", "-fno-gnu89-inline"], "g", "f"),
+        (&["-fno-gnu89-inline", "-fgnu89-inline"], "f", "g"),
+    ];
+
+    for (flags, emitted, absent) in cases {
+        let mut args: Vec<&str> = flags.to_vec();
+        args.extend(["-S", "-o", "-", &path]);
+        let r = run_c17(&args);
+        assert!(r.success, "{flags:?} should compile:\n{}", r.stderr);
+        assert!(
+            r.stdout.contains(&format!("\n{emitted}:")),
+            "{flags:?}: `{emitted}` should have an out-of-line body:\n{}",
+            r.stdout
+        );
+        assert!(
+            !r.stdout.contains(&format!("\n{absent}:")),
+            "{flags:?}: `{absent}` should have none:\n{}",
+            r.stdout
         );
     }
 }

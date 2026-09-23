@@ -9271,21 +9271,7 @@ fn asm_for(prefix: &str, src: &str) -> String {
 
 /// `asm_for` with explicit options -- an optimizer decision is invisible
 /// without one, since the default here is `-O0`.
-fn asm_for_at(prefix: &str, src: &str, extra: &[&str]) -> String {
-    let dir = plib::tmp::Builder::new()
-        .prefix(prefix)
-        .tempdir()
-        .expect("tempdir");
-    let c = dir.path().join("t.c");
-    let s = dir.path().join("t.s");
-    std::fs::write(&c, src).expect("write source");
-    let mut args = vec!["-S"];
-    args.extend_from_slice(extra);
-    args.extend_from_slice(&[c.to_str().unwrap(), "-o", s.to_str().unwrap()]);
-    let out = crate::common::run_c17(&args);
-    assert!(out.success, "compile failed: {}", out.stderr);
-    std::fs::read_to_string(&s).expect("read asm")
-}
+use crate::common::asm_for_at;
 
 /// A zero-initialized definition took the `.comm`/`.bss` fast path, which
 /// returns before the `.weak` and visibility directives are emitted. A common

@@ -1169,9 +1169,12 @@ impl<'a> Linearizer<'a> {
         // like any other static function.
         let has_extern_decl = is_extern || self.has_extern_decl(func.name);
         let all_decls_inline = !self.has_non_inline_decl(func.name);
+        // `-fgnu89-inline` makes the GNU rule the default for every inline
+        // function, which is what the attribute selects one at a time.
+        let gnu_inline = func.attrs.gnu_inline || crate::builtins::gnu89_inline();
         let is_inline_definition = is_inline
             && !is_static
-            && if func.attrs.gnu_inline {
+            && if gnu_inline {
                 has_extern_decl
             } else {
                 !has_extern_decl && all_decls_inline

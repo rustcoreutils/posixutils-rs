@@ -453,6 +453,25 @@ define_keywords! {
     (FABSF,             "fabsf",             0),
     (FABSL,             "fabsl",             0),
 
+    // The exactly-rounding functions, whose `float` form gives the same
+    // answer as the `double` one applied to a `float` argument. Narrowing
+    // them is what lets `(float)floor((double)x)` become `floorf(x)`;
+    // `sin` and `log` are deliberately absent, since theirs differ in the
+    // last bit. The `f` spellings are interned so the prototype can be
+    // synthesized for a program that never declared one.
+    (FLOOR,             "floor",             0),
+    (CEIL,              "ceil",              0),
+    (TRUNC,             "trunc",             0),
+    (ROUND,             "round",             0),
+    (RINT,              "rint",              0),
+    (NEARBYINT,         "nearbyint",         0),
+    (_,                 "floorf",            0),
+    (_,                 "ceilf",             0),
+    (_,                 "truncf",            0),
+    (_,                 "roundf",            0),
+    (_,                 "rintf",             0),
+    (_,                 "nearbyintf",        0),
+
     // ---- Fortified libc entry points ----
     // Interned but untagged: these are ordinary identifiers, listed only so
     // the parser can name one when it synthesizes the declaration glibc

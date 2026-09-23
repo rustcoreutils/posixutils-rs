@@ -133,6 +133,12 @@ impl Parser<'_> {
                     | crate::kw::FABS
                     | crate::kw::FABSF
                     | crate::kw::FABSL
+                    | crate::kw::FLOOR
+                    | crate::kw::CEIL
+                    | crate::kw::TRUNC
+                    | crate::kw::ROUND
+                    | crate::kw::RINT
+                    | crate::kw::NEARBYINT
             );
         if !shadowable {
             return false;
@@ -203,6 +209,39 @@ impl Parser<'_> {
             )
         };
         Ok(Self::typed_expr(kind(Box::new(arg)), typ, token_pos))
+    }
+
+    /// A libm call that narrows to its `float` form when its argument is one.
+    ///
+    /// `(float)floor((double)x)` is `floorf(x)` exactly: the result is an
+    /// integer no greater in magnitude than `x`, so a value representable as
+    /// a `float` stays representable, and converting it up to `double` and
+    /// back changes nothing. The condition is on the **argument** type and
+    /// not the result -- `double q(float a) { return floor(a); }` narrows
+    /// too, because the narrowing happens before the widening.
+    ///
+    /// Only the exactly-rounding functions qualify, which is why the set is
+    /// enumerated rather than derived. `sin` and `log` are not among them:
+    /// `sinf(x)` and `(float)sin((double)x)` differ in the last bit for some
+    /// `x`, and narrowing one is a wrong answer rather than a faster one.
+    fn narrowing_libm_call(
+        &mut self,
+        wide: &str,
+        narrow: &str,
+        arg: Expr,
+        pos: Position,
+    ) -> ParseResult<Expr> {
+        let is_float = arg
+            .typ
+            .and_then(|t| self.types.fp_format(t))
+            .is_some_and(|fmt| fmt == crate::float::FpFormat::Binary32);
+        Ok(if is_float {
+            let f = self.types.float_id;
+            self.libm_call(narrow, f, &[f], arg, pos)
+        } else {
+            let d = self.types.double_id;
+            self.libm_call(wide, d, &[d], arg, pos)
+        })
     }
 
     /// `fabsl(x)`, lowered as an ordinary call to `fabsl` rather than as an
@@ -790,6 +829,30 @@ impl Parser<'_> {
 
             crate::kw::BUILTIN_FABSL => Some(self.parse_fabsl(token_pos)),
             crate::kw::FABSL if called => Some(self.parse_fabsl(token_pos)),
+
+            crate::kw::FLOOR
+            | crate::kw::CEIL
+            | crate::kw::TRUNC
+            | crate::kw::ROUND
+            | crate::kw::RINT
+            | crate::kw::NEARBYINT
+                if called =>
+            {
+                let (wide, narrow) = match name_id {
+                    crate::kw::FLOOR => ("floor", "floorf"),
+                    crate::kw::CEIL => ("ceil", "ceilf"),
+                    crate::kw::TRUNC => ("trunc", "truncf"),
+                    crate::kw::ROUND => ("round", "roundf"),
+                    crate::kw::RINT => ("rint", "rintf"),
+                    _ => ("nearbyint", "nearbyintf"),
+                };
+                Some((|| {
+                    self.expect_special(b'(')?;
+                    let arg = self.parse_assignment_expr()?;
+                    self.expect_special(b')')?;
+                    self.narrowing_libm_call(wide, narrow, arg, token_pos)
+                })())
+            }
             // Signbit builtins - test sign bit of floats
             crate::kw::BUILTIN_ISNAN
             | crate::kw::BUILTIN_ISNANF

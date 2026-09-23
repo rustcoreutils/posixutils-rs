@@ -343,6 +343,15 @@ struct Args {
     #[arg(long = "c17-fno-builtin-func", action = clap::ArgAction::Append, value_name = "func", hide = true)]
     fno_builtin_funcs: Vec<String>,
 
+    /// GNU89 inline semantics: a plain `inline` emits an out-of-line body and
+    /// `extern inline` does not, which is the opposite of C99's rule.
+    #[arg(long = "fgnu89-inline", help = gettext("Use GNU89 inline semantics"))]
+    fgnu89_inline: bool,
+
+    /// Undo `-fgnu89-inline`. Accepted so the last flag on the line wins.
+    #[arg(long = "fno-gnu89-inline", overrides_with = "fgnu89_inline", help = gettext("Use C99 inline semantics (default)"))]
+    fno_gnu89_inline: bool,
+
     /// Extra flags to pass through to the linker (set by preprocess_args)
     #[arg(long = "c17-linker-flag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
     linker_flags: Vec<String>,
@@ -1525,9 +1534,6 @@ fn is_known_ignorable_f_flag(arg: &str) -> bool {
         "-fno-asynchronous-unwind-tables",
         "-fno-semantic-interposition",
         "-fsemantic-interposition",
-        // gnu89 inline semantics: `-std=` is inert here and so is this.
-        "-fgnu89-inline",
-        "-fno-gnu89-inline",
     ];
     const PREFIX: &[&str] = &["-fvisibility=", "-fpack-struct=", "-fstack-protector"];
     EXACT.contains(&arg) || PREFIX.iter().any(|p| arg.starts_with(p))
@@ -1692,6 +1698,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             i += 1;
         } else if arg == "-fpermissive" {
             result.push("--fpermissive".to_string());
+            i += 1;
+        } else if arg == "-fgnu89-inline" || arg == "-fno-gnu89-inline" {
+            result.push(format!("-{arg}"));
             i += 1;
         } else if arg.starts_with("-f") && !arg.starts_with("-fno-builtin") {
             // Not a catch-all any more. gcc *errors* on an unrecognised `-f`
@@ -2113,6 +2122,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // builtins whose names do not begin with `__builtin_` stop being builtins.
     if args.fno_builtin {
         builtins::set_no_builtin();
+    }
+    // `-fno-gnu89-inline` is the default, and `overrides_with` makes the last
+    // of the pair on the command line the one that survives.
+    if args.fgnu89_inline {
+        builtins::set_gnu89_inline(true);
     }
     if !args.fno_builtin_funcs.is_empty() {
         builtins::set_no_builtin_funcs(args.fno_builtin_funcs.iter().cloned().collect());

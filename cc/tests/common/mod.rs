@@ -691,3 +691,23 @@ fn report_abnormal_exit(name: &str, config_name: &str, out: &std::process::Outpu
         String::from_utf8_lossy(&out.stderr),
     );
 }
+
+/// Compile `src` to assembly with `extra` options and return the text.
+///
+/// The default is `-O0`, so a test about an optimizer decision has to name
+/// the level it is asking about.
+pub fn asm_for_at(prefix: &str, src: &str, extra: &[&str]) -> String {
+    let dir = plib::tmp::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("tempdir");
+    let c = dir.path().join("t.c");
+    let s = dir.path().join("t.s");
+    std::fs::write(&c, src).expect("write source");
+    let mut args = vec!["-S"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&[c.to_str().unwrap(), "-o", s.to_str().unwrap()]);
+    let out = run_c17(&args);
+    assert!(out.success, "compile failed: {}", out.stderr);
+    std::fs::read_to_string(&s).expect("read asm")
+}

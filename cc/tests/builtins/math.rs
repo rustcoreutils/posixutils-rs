@@ -633,11 +633,33 @@ int main(void)
 #[test]
 fn builtins_math_narrowing_happens_at_every_level() {
     let src = "double floor(double);\nfloat q(float a) { return floor(a); }\n";
-    for opt in ["-O0", "-O1", "-O2"] {
-        let asm = asm_for_at("math_narrow_level", src, &[opt]);
-        assert!(
-            asm.contains("floorf"),
-            "at {opt} the call should be narrowed:\n{asm}"
-        );
+    // Both object formats from whatever host runs this: Mach-O calls
+    // `_floorf`, and a check spelled for ELF would keep passing there while
+    // saying nothing.
+    let targets: [&[&str]; 3] = [
+        &[],
+        &["--target=aarch64-apple-darwin"],
+        &["--target=x86_64-apple-darwin"],
+    ];
+    for target in targets {
+        let want = if target.is_empty() {
+            "floorf".to_string()
+        } else {
+            "_floorf".to_string()
+        };
+        for opt in ["-O0", "-O1", "-O2"] {
+            let mut args = vec![opt];
+            args.extend_from_slice(target);
+            let asm = asm_for_at("math_narrow_level", src, &args);
+            assert!(
+                asm.contains(&want),
+                "{target:?} at {opt}: the call should be narrowed to {want}:\n{asm}"
+            );
+            assert!(
+                !asm.contains(&format!("bl {}\n", want.trim_end_matches('f')))
+                    && !asm.contains(&format!("call {}@", want.trim_end_matches('f'))),
+                "{target:?} at {opt}: the wide form must not be called:\n{asm}"
+            );
+        }
     }
 }

@@ -711,3 +711,21 @@ pub fn asm_for_at(prefix: &str, src: &str, extra: &[&str]) -> String {
     assert!(out.success, "compile failed: {}", out.stderr);
     std::fs::read_to_string(&s).expect("read asm")
 }
+
+/// `name` as the assembler spells it on this host.
+///
+/// Mach-O prefixes every C identifier with an underscore, so a test that
+/// looks for a label or a call by its C name finds nothing on macOS -- and
+/// usually finds nothing in the *negative* direction either, so it passes
+/// vacuously and reports a failure only on the platform it was never run on.
+///
+/// Only for a test that compiles for the *host*. One that names its target
+/// should spell the prefix from the target, and is better off naming both
+/// formats so the Mach-O shape is exercised on every run.
+pub fn asm_symbol(name: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("_{name}")
+    } else {
+        name.to_string()
+    }
+}

@@ -82,7 +82,10 @@ fn has_data_rel_ro_section(asm: &str) -> bool {
 /// like `.zerofill __DATA,__bss,_NAME,...`.
 fn has_bss_local(asm: &str, name: &str) -> bool {
     if cfg!(target_os = "macos") {
-        asm.contains(&format!(".zerofill __DATA,__bss,_{}", name))
+        asm.contains(&format!(
+            ".zerofill __DATA,__bss,{}",
+            crate::common::asm_symbol(name)
+        ))
     } else {
         asm.contains(&format!(".local {}\n.comm {}", name, name))
             || asm.contains(&format!(".local {}", name))
@@ -99,7 +102,10 @@ fn has_bss_local(asm: &str, name: &str) -> bool {
 /// `-fno-common`.
 fn has_bss_external(asm: &str, name: &str) -> bool {
     if cfg!(target_os = "macos") {
-        asm.contains(&format!(".zerofill __DATA,__bss,_{},", name))
+        asm.contains(&format!(
+            ".zerofill __DATA,__bss,{},",
+            crate::common::asm_symbol(name)
+        ))
     } else {
         asm.contains(&format!("\n{name}:\n.zero "))
     }

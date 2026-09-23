@@ -80,6 +80,23 @@ is no longer the problem; code size is. The fix belongs wherever the stacked
 argument is written, and has to avoid clobbering argument registers already set
 up — which is why it was not folded into the IR-level change.
 
+### An initialized global is emitted as a common symbol
+
+`int z = 0;` and `const int c = 0;` both reach the object file as
+`.comm`, which is the encoding for a *tentative* definition. Two
+consequences, neither of which a c17-only build shows:
+
+- Two translation units each defining the same object link silently,
+  where C17 6.9p5 allows one external definition and gcc reports
+  `multiple definition`.
+- A `const` object lands in COMMON, which is writable, instead of
+  `.rodata`. gcc puts both the initialized and the tentative `const` there.
+
+An explicitly zero-initialized definition is the case that gets it wrong;
+a non-zero one is emitted normally. `ir/constglobal.rs` declines to fold
+a tentative definition for the first reason above, so fixing this would
+also let `const int c = 0;` propagate.
+
 ### R10 reserved globally for division scratch
 
 **Location**: `arch/x86_64/regalloc.rs` lines 187-208

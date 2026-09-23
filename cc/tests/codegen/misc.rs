@@ -9266,6 +9266,12 @@ int main(void) {
 /// Assemble a source to text and hand it back, for tests that need to see the
 /// directives rather than the program's answer.
 fn asm_for(prefix: &str, src: &str) -> String {
+    asm_for_at(prefix, src, &[])
+}
+
+/// `asm_for` with explicit options -- an optimizer decision is invisible
+/// without one, since the default here is `-O0`.
+fn asm_for_at(prefix: &str, src: &str, extra: &[&str]) -> String {
     let dir = plib::tmp::Builder::new()
         .prefix(prefix)
         .tempdir()
@@ -9273,7 +9279,10 @@ fn asm_for(prefix: &str, src: &str) -> String {
     let c = dir.path().join("t.c");
     let s = dir.path().join("t.s");
     std::fs::write(&c, src).expect("write source");
-    let out = crate::common::run_c17(&["-S", c.to_str().unwrap(), "-o", s.to_str().unwrap()]);
+    let mut args = vec!["-S"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&[c.to_str().unwrap(), "-o", s.to_str().unwrap()]);
+    let out = crate::common::run_c17(&args);
     assert!(out.success, "compile failed: {}", out.stderr);
     std::fs::read_to_string(&s).expect("read asm")
 }
@@ -12387,4 +12396,114 @@ int main(void)
             "at {opt}"
         );
     }
+}
+
+/// A `weak` definition may be replaced at link time, so its body is not
+/// authoritative and must never be spliced into a caller.
+///
+/// The inliner consulted nothing about weakness, so a small weak function was
+/// inlined on the same terms as a strong one and the interposing definition
+/// simply never ran. Asserted on assembly because a single translation unit
+/// cannot exhibit interposition: the property is that the *call* survives.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_weak_definition_is_not_inlined() {
+    let asm = asm_for_at(
+        "c17_weak_noinline_",
+        r#"
+__attribute__((weak)) int impl(void) { return 1; }
+/* Static, so interposition cannot apply and it may still be inlined. */
+__attribute__((weak)) static int local_impl(void) { return 2; }
+int call_weak(void) { return impl(); }
+int call_weak_static(void) { return local_impl(); }
+"#,
+        &["-O2"],
+    );
+    let weak_caller = asm.split("\ncall_weak:").nth(1).unwrap_or_default();
+    assert!(
+        weak_caller.contains("call\timpl") || weak_caller.contains("call impl"),
+        "an interposable definition must still be called:\n{weak_caller}"
+    );
+    // The `static` one has internal linkage, so nothing can replace it and the
+    // attribute does not bar inlining.
+    let static_caller = asm
+        .split("\ncall_weak_static:")
+        .nth(1)
+        .unwrap_or_default()
+        .split("\n\t.size")
+        .next()
+        .unwrap_or_default();
+    assert!(
+        !static_caller.contains("local_impl"),
+        "a weak *static* cannot be interposed, so it may be inlined:\n{static_caller}"
+    );
+}
+
+/// An unreferenced static goes; one marked `used` stays.
+///
+/// Two defects met here. The prune ran only when something had *also* been
+/// inlined, so a translation unit the inliner declined kept its dead statics
+/// at every level. And `__attribute__((used))` was parsed, stored, and read by
+/// nothing -- invisible until the prune started working.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_used_static_survives_and_unused_does_not() {
+    let asm = asm_for_at(
+        "c17_used_static_",
+        r#"
+__attribute__((used)) static int kept(void) { return 7; }
+static int dropped(void) { return 8; }
+int main(void) { return 0; }
+"#,
+        &["-O2"],
+    );
+    assert!(asm.contains("\nkept:"), "`used` must keep it:\n{asm}");
+    assert!(
+        !asm.contains("\ndropped:"),
+        "an unreferenced static must go:\n{asm}"
+    );
+}
+
+/// The prune must reach a fixpoint: a reference held only by a function that
+/// is itself dead is not a reference.
+///
+/// `helper` is called only from `caller`, which nothing calls. One round drops
+/// `caller` and leaves `helper` alive on a count its own removal invalidated --
+/// and `helper` names a symbol that is never defined, so the program fails to
+/// link rather than merely carrying dead code.
+#[test]
+fn codegen_dead_static_chain_is_pruned_to_a_fixpoint() {
+    let code = r#"
+extern int never_defined;
+static int helper(void) { return never_defined; }
+static int caller(void) { return helper(); }
+int main(void) { return 0; }
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_dead_static_chain", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// A name that appears only inside an assembly template still refers to the
+/// function: it reaches the assembler with no IR reference for the prune to
+/// find.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_asm_template_reference_keeps_a_static_alive() {
+    let asm = asm_for_at(
+        "c17_asm_names_static_",
+        r#"
+static int helper(void) { return 7; }
+int main(void) { __asm__ volatile ("call helper" ::: "memory"); return 0; }
+"#,
+        &["-O2"],
+    );
+    assert!(
+        asm.contains("\nhelper:"),
+        "a static named only in an asm template must survive:\n{asm}"
+    );
 }

@@ -36,7 +36,7 @@ missed optimization.
 
 ## Supported Attributes
 
-Attributes fall into three categories based on implementation depth:
+Attributes fall into two categories based on implementation depth:
 
 ### Fully implemented (affects codegen)
 
@@ -52,17 +52,10 @@ Attributes fall into three categories based on implementation depth:
 | `destructor` | Functions | Runs after `main` returns or on `exit`, via `.fini_array` / `__DATA,__mod_term_func`. Priorities as for `constructor` |
 | `noinline` | Functions | The inliner leaves the function alone, whatever its size |
 | `always_inline` | Functions | Inlined at every call site regardless of size, and at `-O0` too. `noinline` outranks it, as in gcc |
-| `weak` | Functions, variables | `.weak` rather than `.globl`: another definition wins, and an unresolved reference is null rather than a link error. Honoured on a *declaration* with no definition too, which is the idiom the attribute exists for |
+| `weak` | Functions, variables | `.weak` rather than `.globl`: another definition wins, and an unresolved reference is null rather than a link error. Honoured on a *declaration* with no definition too, which is the idiom the attribute exists for. A weak *definition* is also never inlined, since the body that runs may be some other one entirely -- `static` is exempt, having internal linkage nothing can interpose, and `always_inline` outranks it as in gcc |
+| `used` | Functions | Kept even when nothing refers to it. Load-bearing now that an unreferenced static is pruned at `-O1` and above: without it such a function is dropped, which is what gcc does |
 | `visibility` | Functions, variables | ELF `.hidden` / `.protected` / `.internal`; "default" is the *absence* of a directive, not a `.default` pseudo-op. Mach-O has only `.private_extern`, used for "hidden" and "internal". A zero-initialized variable leaves the `.comm` fast path rather than lose it |
 | `section` | Functions, variables | Places the symbol in the named section, ahead of every other rule -- including the zero-initialized fast path, since `.comm` would let the linker choose. ELF flags follow the contents: `"ax"` for code, `"aw"` for mutable data, `"a"` for read-only data |
-
-### Accepted but with no effect, and the program can tell
-
-One entry, and it is a technicality rather than a gap:
-
-| Attribute | Why the program cannot currently tell |
-|-----------|---------------------------------------|
-| `used` | c17 never prunes an unreferenced static, so keeping one alive is already what happens. gcc drops it at `-O2` and c17 does not. If dead-global elimination is ever added, `used` has to be consulted then, or this becomes a real divergence. See #C59 in git log |
 
 An attribute the compiler does not recognise is no longer dropped in silence:
 it is a warning, suppressible with `-Wno-attributes`.

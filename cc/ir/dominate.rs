@@ -97,6 +97,46 @@ impl DomTree {
 const DEFAULT_POSTORDER_CAPACITY: usize = 16;
 const DEFAULT_IDF_CAPACITY: usize = 8;
 
+/// The blocks control can reach from `bb`.
+///
+/// `children` plus the targets an `asm goto` names, which live in
+/// `asm_data.goto_labels` and nowhere else -- the same edges `ir/sccp.rs`
+/// has to go and find by hand.
+fn successors(bb: &crate::ir::BasicBlock) -> Vec<BasicBlockId> {
+    let mut out = bb.children.clone();
+    for insn in &bb.insns {
+        if let Some(ref asm) = insn.asm_data {
+            for (t, _) in &asm.goto_labels {
+                if !out.contains(t) {
+                    out.push(*t);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Predecessors, as the exact inverse of [`successors`].
+///
+/// **Not `bb.parents`.** The postorder walk follows `children`, and the
+/// dominator fixed point used to follow `parents`, so the two analyzed
+/// different graphs the moment the two fields disagreed -- which they do:
+/// `dce::fold_branches_to_unreachable` removes an edge from `children` and
+/// leaves it in `parents`. One graph, derived once, cannot drift from
+/// itself.
+fn predecessors(func: &Function) -> HashMap<BasicBlockId, Vec<BasicBlockId>> {
+    let mut preds: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
+    for bb in &func.blocks {
+        for s in successors(bb) {
+            let e = preds.entry(s).or_default();
+            if !e.contains(&bb.id) {
+                e.push(bb.id);
+            }
+        }
+    }
+    preds
+}
+
 // Reverse Postorder Computation
 
 /// Compute reverse postorder numbering for all blocks.
@@ -120,8 +160,8 @@ fn compute_postorder(func: &Function) -> Vec<BasicBlockId> {
         visited.insert(bb_id);
 
         if let Some(bb) = func.get_block(bb_id) {
-            // Visit children in reverse order for consistent numbering
-            for &child in bb.children.iter().rev() {
+            // Visit successors in reverse order for consistent numbering
+            for child in successors(bb).into_iter().rev() {
                 dfs(func, child, visited, postorder);
             }
         }
@@ -204,6 +244,8 @@ pub fn domtree_build(func: &Function) -> DomTree {
         b1
     };
 
+    let preds = predecessors(func);
+
     // Iterate until fixed point
     let mut changed = true;
     while changed {
@@ -216,15 +258,9 @@ pub fn domtree_build(func: &Function) -> DomTree {
 
             let bb_nr = postorder_nr[&bb_id];
 
-            // Get parents of this block
-            let parents: Vec<BasicBlockId> = func
-                .get_block(bb_id)
-                .map(|bb| bb.parents.clone())
-                .unwrap_or_default();
-
             // Find new idom as intersection of all processed predecessors
             let mut new_idom: Option<usize> = None;
-            for parent_id in parents {
+            for &parent_id in preds.get(&bb_id).map(Vec::as_slice).unwrap_or(&[]) {
                 // Skip predecessors that weren't reached during DFS (unreachable blocks)
                 let parent_nr = match postorder_nr.get(&parent_id) {
                     Some(&nr) => nr,
@@ -530,6 +566,52 @@ mod tests {
         func.blocks = vec![entry, bb1, bb2, merge, exit];
         func.rebuild_block_idx();
         func
+    }
+
+    /// The dominator tree follows `children`, never `parents`.
+    ///
+    /// `dce::fold_branches_to_unreachable` removes an edge from `children`
+    /// and leaves it in `parents`, so the two fields disagree in any function
+    /// where a branch was folded. Reading the stale one made the postorder
+    /// walk and the fixed point analyze two different graphs.
+    #[test]
+    fn test_domtree_ignores_stale_parents() {
+        let mut func = make_test_cfg();
+        // The shape `dce` leaves behind: bb2 no longer reaches the merge,
+        // but the merge still lists it as a parent.
+        func.get_block_mut(BasicBlockId(2))
+            .unwrap()
+            .children
+            .clear();
+        let dom = domtree_build(&func);
+        assert_eq!(
+            dom.idom(BasicBlockId(3)),
+            Some(BasicBlockId(1)),
+            "with bb2's edge gone, bb1 is the merge's only predecessor"
+        );
+    }
+
+    /// An `asm goto` target is a CFG edge that lives only in `asm_data`, so
+    /// both halves of the computation have to go and find it.
+    #[test]
+    fn test_domtree_sees_asm_goto_edges() {
+        let mut func = make_test_cfg();
+        let mut asm = Instruction::new(Opcode::Asm);
+        asm.asm_data = Some(Box::new(crate::ir::AsmData {
+            template: String::new(),
+            outputs: vec![],
+            inputs: vec![],
+            clobbers: vec![],
+            goto_labels: vec![(BasicBlockId(4), "l".into())],
+        }));
+        let bb0 = func.get_block_mut(BasicBlockId(0)).unwrap();
+        bb0.insns.insert(0, asm);
+        let dom = domtree_build(&func);
+        assert_eq!(
+            dom.idom(BasicBlockId(4)),
+            Some(BasicBlockId(0)),
+            "the entry can jump straight to the exit, so the merge no longer dominates it"
+        );
     }
 
     #[test]

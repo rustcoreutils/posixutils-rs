@@ -15,6 +15,7 @@ mod constfold;
 pub mod constglobal;
 pub mod dce;
 pub mod dominate;
+pub mod facts;
 pub mod ifconv;
 pub mod inline;
 pub mod instcombine;
@@ -26,6 +27,7 @@ mod linearize_stmt;
 pub mod lower;
 pub mod mach_o_dtors;
 pub mod mem2reg;
+pub mod propagate;
 pub mod sccp;
 pub mod ssa;
 pub mod tls;
@@ -302,6 +304,50 @@ impl Opcode {
 
     /// Check if this opcode has side effects (cannot be deleted even if unused).
     /// These are "root" instructions for dead code elimination.
+    /// Could an instruction with this opcode read or write memory?
+    ///
+    /// The companion to [`Instruction::is_memory_barrier`], which answers
+    /// *ordering*: this answers *extent*. A pass that removes or moves a
+    /// memory operation must consult this to know what lies between two
+    /// points, and `is_memory_barrier` to know what it may cross.
+    ///
+    /// Deliberately an allowlist read the other way round: everything that
+    /// might touch memory is named, so a new opcode is conservative by
+    /// default only if it is *also* added to [`Self::has_side_effects`] --
+    /// which invariant I5 in `ir/validate.rs` enforces mechanically, so the
+    /// two sets cannot drift.
+    pub fn may_access_memory(&self) -> bool {
+        matches!(
+            self,
+            Opcode::Load
+                | Opcode::Store
+                | Opcode::Call
+                | Opcode::Memset
+                | Opcode::Memcpy
+                | Opcode::Memmove
+                | Opcode::VaStart
+                | Opcode::VaArg
+                | Opcode::VaCopy
+                | Opcode::VaEnd
+                | Opcode::Alloca
+                | Opcode::StackSave
+                | Opcode::StackRestore
+                | Opcode::Setjmp
+                | Opcode::Longjmp
+                | Opcode::Asm
+                | Opcode::Fence
+                | Opcode::AtomicLoad
+                | Opcode::AtomicStore
+                | Opcode::AtomicSwap
+                | Opcode::AtomicCas
+                | Opcode::AtomicFetchAdd
+                | Opcode::AtomicFetchSub
+                | Opcode::AtomicFetchAnd
+                | Opcode::AtomicFetchOr
+                | Opcode::AtomicFetchXor
+        )
+    }
+
     pub fn has_side_effects(&self) -> bool {
         matches!(
             self,
@@ -961,6 +1007,15 @@ impl Instruction {
     /// pass that does (GVN, LICM, load-store forwarding, machine
     /// scheduler) MUST query this before crossing.
     ///
+    /// **This predicate answers *ordering*, not *extent*, and it is not the
+    /// list of instructions that touch memory.** `Store`, `Memset`,
+    /// `Memcpy`, `Memmove`, the `Va*` family, `Alloca` and
+    /// `StackSave`/`StackRestore` all access memory and are deliberately
+    /// absent: a `memcpy` is an access, not a fence, and conflating the two
+    /// would over-restrict a scheduler later. The question "which addresses
+    /// does this reach?" is [`Opcode::may_access_memory`] at the opcode
+    /// level. A pass that moves memory must satisfy both.
+    ///
     /// Note on relaxed atomics: a `MemoryOrder::Relaxed` atomic op
     /// has no inter-thread ordering guarantee, but the atomic access
     /// itself is still a side-effecting memory op that a reordering
@@ -1005,6 +1060,30 @@ impl Instruction {
     /// back-pointer to the `Phi` it feeds, not an operand. Counting it as a
     /// use makes the value look live to DCE and makes a def-use graph report
     /// an edge that runs the wrong way.
+    /// Does this instruction mention `id` in any operand position at all?
+    ///
+    /// **The canonical enumeration of every place a `PseudoId` can be written
+    /// down**, and deliberately wider than [`Self::uses`]: it counts the
+    /// target and a `PhiSource`'s back-pointer, which are definitions rather
+    /// than operands. That is what an analysis asking "could this pseudo have
+    /// leaked?" needs, so a symbol reaching an opcode the analysis does not
+    /// model reads as an escape rather than as nothing.
+    ///
+    /// If a field that can hold a `PseudoId` is ever added to `Instruction`,
+    /// it must be added here too, or an address escapes invisibly.
+    pub fn mentions(&self, id: PseudoId) -> bool {
+        self.src.contains(&id)
+            || self.target == Some(id)
+            || self.indirect_target == Some(id)
+            || self.phi_list.iter().any(|&(_, p)| p == id)
+            || self.asm_data.as_ref().is_some_and(|d| {
+                d.inputs
+                    .iter()
+                    .chain(d.outputs.iter())
+                    .any(|c| c.pseudo == id)
+            })
+    }
+
     pub fn uses(&self) -> Vec<PseudoId> {
         let mut uses = Vec::with_capacity(DEFAULT_USE_CAPACITY);
 

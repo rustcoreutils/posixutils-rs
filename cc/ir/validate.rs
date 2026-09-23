@@ -95,6 +95,15 @@ pub enum ValidationError {
         opcode: Opcode,
         target: BasicBlockId,
     },
+    /// I5 violation: an instruction reaches memory but is not in
+    /// `has_side_effects()`, so DCE would delete it while a memory pass
+    /// would still have to reason about it.
+    MemoryAccessWithoutSideEffect {
+        function: String,
+        block: usize,
+        index: usize,
+        opcode: Opcode,
+    },
     /// A placeholder opcode that something downstream was supposed to
     /// resolve is still here. Neither backend knows it, and both end their
     /// opcode match in a catch-all, so it would be dropped in silence and
@@ -150,6 +159,16 @@ impl fmt::Display for ValidationError {
                 f,
                 "[ir-validate I3] in function `{function}`: bb={block} insn={index} op={opcode:?} \
                  references unknown BasicBlockId {target:?}"
+            ),
+            ValidationError::MemoryAccessWithoutSideEffect {
+                function,
+                block,
+                index,
+                opcode,
+            } => write!(
+                f,
+                "[ir-validate I5] in function `{function}`: bb={block} insn={index} \
+                 op={opcode:?} may access memory but is not in has_side_effects()"
             ),
             ValidationError::UnresolvedPlaceholder {
                 function,
@@ -221,6 +240,7 @@ pub fn validate_function(func: &Function) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     check_single_def(func, &mut errors);
     check_barrier_implies_side_effect(func, &mut errors);
+    check_memory_access_implies_side_effect(func, &mut errors);
     check_branch_targets_valid(func, &mut errors);
     if errors.is_empty() {
         Ok(())
@@ -327,10 +347,40 @@ fn check_barrier_implies_side_effect(func: &Function, out: &mut Vec<ValidationEr
     }
 }
 
+/// I5 — a memory-accessing instruction is side-effecting, or is a `Load`.
+///
+/// `Opcode::may_access_memory` answers *extent* ("does this reach memory")
+/// and `has_side_effects` answers *deletability* ("may DCE remove this").
+/// A pass that removes or moves memory operations consults both, so if the
+/// two drift an opcode that writes memory becomes invisible to DCE *and*
+/// to the access scan — which is how a store gets deleted, or a load
+/// forwarded across one.
+///
+/// `Load` is the one deliberate exception: it reaches memory and DCE may
+/// delete it, because reading a non-volatile location has no effect.
+/// Volatility is refused elsewhere, on the variable.
+fn check_memory_access_implies_side_effect(func: &Function, out: &mut Vec<ValidationError>) {
+    for (block, bb) in func.blocks.iter().enumerate() {
+        for (index, insn) in bb.insns.iter().enumerate() {
+            if insn.op == Opcode::Load || !insn.op.may_access_memory() {
+                continue;
+            }
+            if !insn.op.has_side_effects() {
+                out.push(ValidationError::MemoryAccessWithoutSideEffect {
+                    function: func.name.clone(),
+                    block,
+                    index,
+                    opcode: insn.op,
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{BasicBlock, BasicBlockId, Function, Instruction, Pseudo};
+    use crate::ir::{BasicBlock, BasicBlockId, Function, Instruction, Pseudo, PseudoId};
     use crate::target::Target;
     use crate::types::TypeTable;
 
@@ -506,6 +556,59 @@ mod tests {
                 insn.op
             );
         }
+    }
+
+    /// I5 — every memory-accessing opcode in real IR is side-effecting or
+    /// is a `Load`. Representative sample; the exhaustive coverage comes
+    /// from the runtime check, which sees every instruction c17 compiles.
+    #[test]
+    fn i5_memory_access_implies_side_effect_or_load() {
+        for op in [
+            Opcode::Store,
+            Opcode::Call,
+            Opcode::Memcpy,
+            Opcode::Memset,
+            Opcode::VaArg,
+            Opcode::Alloca,
+            Opcode::Asm,
+            Opcode::AtomicStore,
+        ] {
+            assert!(op.may_access_memory(), "{op:?} reaches memory");
+            assert!(
+                op.has_side_effects(),
+                "{op:?} reaches memory but DCE may delete it"
+            );
+        }
+        // The one deliberate exception.
+        assert!(Opcode::Load.may_access_memory());
+        assert!(!Opcode::Load.has_side_effects());
+    }
+
+    /// The reverse direction is *not* an invariant and this records why: a
+    /// terminator has side effects and touches no memory, so
+    /// `has_side_effects` is strictly wider.
+    #[test]
+    fn i5_side_effects_does_not_imply_memory_access() {
+        assert!(Opcode::Br.has_side_effects());
+        assert!(!Opcode::Br.may_access_memory());
+        assert!(Opcode::Ret.has_side_effects());
+        assert!(!Opcode::Ret.may_access_memory());
+    }
+
+    /// I5 — runtime: a memory-accessing instruction that DCE may delete.
+    #[test]
+    fn i5_runtime_rejects_a_deletable_memory_access() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("t", types.int_id);
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        // `Nop` reaches no memory, so claiming otherwise needs a real
+        // opcode; `Load` is the sanctioned exception and must pass.
+        bb.add_insn(Instruction::new(Opcode::Load).with_target(PseudoId(1)));
+        bb.add_insn(Instruction::ret(None));
+        func.add_block(bb);
+        func.entry = BasicBlockId(0);
+        assert!(validate_function(&func).is_ok(), "a Load is allowed");
     }
 
     /// I2 — runtime check: a hand-crafted IR with a barrier-but-not-

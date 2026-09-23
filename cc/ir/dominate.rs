@@ -69,7 +69,15 @@ impl DomTree {
         self.max_level
     }
 
-    /// Whether `a` dominates `b`.
+    /// Whether `a` dominates `b`: every path from entry to `b` passes
+    /// through `a`. Reflexive.
+    ///
+    /// An O(depth) walk up the immediate-dominator chain, not an interval
+    /// test -- fine for the occasional query an optimizer pass makes, and
+    /// worth revisiting if one ever asks per-instruction.
+    ///
+    /// Test-only until a pass outside `ssa` needs it; un-gate it there
+    /// rather than here, so it is never dead code.
     #[cfg(test)]
     pub fn dominates(&self, a: BasicBlockId, b: BasicBlockId) -> bool {
         if a == b {

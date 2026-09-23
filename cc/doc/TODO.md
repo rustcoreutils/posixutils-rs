@@ -173,6 +173,7 @@ does or claims.
 | Non-NFC identifiers | GCC warns `-Wnormalized=` when an identifier is not in Normalization Form C; c17 is silent. A diagnostic-quality gap, not a conformance one -- both compile the same program |
 | `#__VA_ARGS__` spacing | `V(a , b)` stringifies as `"a, b"`; gcc gives `"a , b"`. The separating comma's own spacing is discarded by the argument splitter. Pinned by `preprocessor_va_args_loses_space_before_a_separator` |
 | Darwin: an over-aligned variadic aggregate | clang disagrees with itself, so no compiler satisfies this in both directions. Measured on macOS CI: its caller stacks the aggregate at the next eight-byte granule and its `va_arg` rounds the cursor up to the type's own alignment, reading somewhere else. A program built entirely with clang has the same defect. c17 follows `va_arg` -- its caller realigns the outgoing area so the argument really is that aligned -- which means a c17 caller reaches a clang callee and a clang caller does not reach a c17 callee. `codegen_over_aligned_argument_area` therefore does not put this shape through its host-compiler cross-check on Apple; the pure-c17 runs still cover it at every optimization level |
+| A constant branch at `-O0` | c17 runs no optimizer at `-O0`, so `if (0) { ... }` keeps its arm; gcc folds it in a CFG cleanup it runs at every level. Deliberate: `-O0` output stays a faithful transcription of the source, so a breakpoint in a dead arm still has somewhere to land. The visible cost is that `20030330-1` and `medce-1` link at `-O1` and above and not at `-O0` |
 | `max_align_t` | `long double` here (16 bytes), a struct of `long long` + `long double` under gcc (32). Both meet the alignment requirement; `sizeof` differs. Implementation-defined (C17 7.19) |
 
 ## GNU extensions: what c17 will and will not grow
@@ -351,21 +352,29 @@ access as `%fs:(%rax)`.
 
 The compiler uses SSA-form IR. Already implemented passes (see `cc/ir/`):
 
+- `constfold` — evaluating an operation over constants at the operand's own
+  width and in the signedness the opcode implies. Not a pass: the one place
+  those rules are written, shared by `instcombine` and `sccp`
 - `instcombine` — constant folding, algebraic simplification. Constants are
   resolved through `Copy` chains (`ConstMap`), so folding crosses a promoted
   local rather than stopping at it
+- `sccp` — sparse conditional constant propagation. The only thing that folds a
+  branch on a constant condition: constants propagate along *reachable* paths,
+  so a branch proved not taken makes its arm unreachable and a phi at the merge
+  stops meeting the value from there. Integers only; floats stay overdefined
+  until a folded one can be materialized at the right width
 - `dce` — mark-sweep DCE, fold-cbr-to-trivially-unreachable, unreachable-block removal
 - `inline` — function inlining (module-level)
 
-`cc/opt.rs` runs `inline → (instcombine + dce)*` to fixed point. Promotion of
-locals out of memory is not in that pipeline: `ir/ssa.rs` + `ir/mem2reg.rs`
-run once during linearization, at every `-O` level.
+`cc/opt.rs` runs `inline → (sccp + instcombine + dce)*` to fixed point. The
+order inside the loop is load-bearing: `instcombine` derives constants `sccp`
+structurally cannot (`x - x`, `x ^ x`), any of which can make a condition
+constant, and `sccp` deletes no block — it removes the dead edge and leaves the
+unreachable block and the orphaned `PhiSource` for `dce`. Promotion of locals
+out of memory is not in that pipeline: `ir/ssa.rs` + `ir/mem2reg.rs` run once
+during linearization, at every `-O` level.
 
 ### Future passes (not yet implemented)
-
-#### SCCP — Sparse Conditional Constant Propagation
-
-Propagate constants through CFG along reachable paths only. Lattice: `{UNDEF, CONST(c), UNKNOWN}`.
 
 #### CFG Simplification
 
@@ -414,7 +423,8 @@ Normalize induction variables. Replace multiplications with additions.
 ### Suggested pass pipeline
 
 ```
-InstCombine → SCCP → DCE → CFG simplify → Copy prop → Local CSE → InstCombine
+SCCP → InstCombine → DCE  (today)
+[Next] CFG simplify → Copy prop → Local CSE
 [Later] GVN → DCE → Inlining → re-run above → LICM → Loop opts → final cleanup
 ```
 
@@ -425,10 +435,9 @@ InstCombine → SCCP → DCE → CFG simplify → Copy prop → Local CSE → In
 | 1 | CFG simplify | Low | Medium |
 | 2 | Copy/φ cleanup | Low | Medium |
 | 3 | Local CSE | Medium | Medium |
-| 4 | SCCP | Medium | High |
-| 5 | GVN | High | Medium |
-| 6 | LICM | Medium | Medium |
-| 7 | Loop opts | High | Low |
+| 4 | GVN | High | Medium |
+| 5 | LICM | Medium | Medium |
+| 6 | Loop opts | High | Low |
 
 ---
 
@@ -526,8 +535,9 @@ Most of what is left is one thing.
 
 | Group | Note |
 |---|---|
-| Dead-call elimination proofs | `20011115-1`, `20020720-1`, `20030216-1`, `20041114-1`, `compare-3`, `pure-1`, `shiftopt-1` at -O2; `20030330-1` and `medce-1` at **both** levels, because neither has an `#ifndef __OPTIMIZE__` fallback definition and gcc deletes an `if (0)` body in CFG cleanup, which it runs at -O0 too. Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link*. Standard C, and optimizer strength rather than a defect -- building real dead-code and value-range analysis would improve -O2 generally, well beyond these tests |
-| Missing optimizations behind `__OPTIMIZE__` | `20030125-1`, `builtin-constant`. Same class: the tests only assert them when the optimizer is on, and each fails at `-O2` only |
+| Dead-call elimination proofs | `20011115-1`, `20020720-1`, `20030216-1`, `20041114-1`, `compare-3`, `pure-1`, `shiftopt-1`, at `-O1` and above. Each calls an undefined `link_error` that the optimizer is expected to delete, so they fail to *link*; all pass at `-O0`, where the test's own `#ifndef __OPTIMIZE__` supplies a definition. Standard C, and optimizer strength rather than a defect. What each one needs differs: a copy-chain root for the identity tests (`shiftopt-1`), if-conversion of a short-circuit diamond (`compare-3`), a transitive dead-static prune (`20011115-1`), `fabs` recognized in its plain spelling plus float folding (`20020720-1`), propagation of a load from a `const` global (`20030216-1`), and value-range propagation across an edge (`20041114-1`) or escape analysis with store-to-load forwarding (`pure-1`) for the two large ones |
+| Missing optimizations behind `__OPTIMIZE__` | `20030125-1` needs `(float)floor((double)x)` narrowed to `floorf(x)`, which is exact only for the exactly-rounding functions -- the test's weak `sinf` aborts to catch an over-eager narrower. `builtin-constant` needs `__builtin_constant_p` answered after propagation rather than syntactically at parse time. Both abort at run time rather than failing to link |
+| Inline definition with no out-of-line body | `930526-1`, at `-O1` and `-Og` only. gnu89 `inline` emits no out-of-line body, so the call must be inlined or it cannot link; the callee is over the inliner's size cap and level 1 does not inline aggressively |
 | Address of a string-literal element as a constant | `921019-1`: `(void *)&("X"[0])` in a static initializer |
 | The two divergences above | `991014-1`, `920728-1` |
 

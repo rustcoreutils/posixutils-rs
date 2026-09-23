@@ -13378,3 +13378,68 @@ int main(void)
         );
     }
 }
+
+/// A loop-carried counter compared against a bound the function cannot see.
+///
+/// The first time VRP reaches the inner comparison the counter is still
+/// `{0}`, so `count + 1` is `{1}` and the true edge appears to prove
+/// `maxcount == 1`. That fact is read off the *ranges* of the comparison's
+/// operands, which keep widening as the loop is analyzed -- while the
+/// comparison's own answer settles at "either" immediately and never moves
+/// again. Re-deriving the fact only when the comparison moved therefore
+/// froze the narrowest one, and `return maxcount` came back `1`.
+///
+/// This is CPython's `stringlib` `count_char`, which is why
+/// `"AAA".replace("A", "", 3)` answered `"AA"`.
+#[test]
+fn codegen_vrp_does_not_freeze_an_edge_fact_from_a_loop_counter() {
+    let code = r#"
+extern void abort(void);
+
+static long count_char(const unsigned char *s, long n, unsigned char p0, long maxcount)
+{
+    long i, count = 0;
+    for (i = 0; i < n; i++) {
+        if (s[i] == p0) {
+            count++;
+            if (count == maxcount) {
+                return maxcount;
+            }
+        }
+    }
+    return count;
+}
+
+static long dispatch(const unsigned char *s, long n, const unsigned char *p, long m, long maxcount)
+{
+    if (n < m || maxcount == 0) return 0;
+    if (m == 1) return count_char(s, n, p[0], maxcount);
+    return -2;
+}
+
+int main(void) {
+    const unsigned char s[] = "AAA";
+    const unsigned char p[] = "A";
+
+    /* Every cap from below the count to above it. */
+    if (dispatch(s, 3, p, 1, 1) != 1) abort();
+    if (dispatch(s, 3, p, 1, 2) != 2) abort();
+    if (dispatch(s, 3, p, 1, 3) != 3) abort();
+    if (dispatch(s, 3, p, 1, 4) != 3) abort();
+    if (dispatch(s, 3, p, 1, 0) != 0) abort();
+
+    /* The same loop with no match at all. */
+    const unsigned char t[] = "BBB";
+    if (dispatch(t, 3, p, 1, 3) != 0) abort();
+
+    return 0;
+}
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_vrp_loop_counter_fact", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}

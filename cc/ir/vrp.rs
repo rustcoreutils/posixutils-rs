@@ -429,8 +429,8 @@ impl<'a> Solver<'a> {
                 // nothing, so it proves nothing about its condition.
                 if t != f {
                     if let Some(c) = cond {
-                        self.refine_edge(func, block_id, t, c, true);
-                        self.refine_edge(func, block_id, f, c, false);
+                        self.refine_edge(func, (b, i), block_id, t, c, true);
+                        self.refine_edge(func, (b, i), block_id, f, c, false);
                     }
                 }
                 return;
@@ -492,6 +492,7 @@ impl<'a> Solver<'a> {
     fn refine_edge(
         &mut self,
         func: &Function,
+        site: Site,
         pred: BasicBlockId,
         succ: BasicBlockId,
         cond: PseudoId,
@@ -542,6 +543,16 @@ impl<'a> Solver<'a> {
                     work.push((fact.lhs, w));
                 }
             }
+            // The fact is read off the operands' *ranges*, and a range can
+            // widen without the comparison's own value changing at all: a
+            // loop counter growing from `{0}` never makes `count == bound`
+            // decidable either way. Re-evaluating this branch only when its
+            // condition moves therefore froze the first fact derived -- the
+            // narrowest, and so the strongest -- for the rest of the solve,
+            // and `bound` came out of the loop a constant. Making the branch
+            // a reader of what it reads is what keeps the fact honest.
+            self.watch(fact.lhs, site);
+            self.watch(fact.rhs, site);
             let lhs_r = self.range_or_full(pred, fact.lhs, fact.width);
             let rhs_r = self.range_or_full(pred, fact.rhs, fact.width);
             record_fact(
@@ -567,6 +578,14 @@ impl<'a> Solver<'a> {
             self.edge_facts.insert(key, out);
         }
         self.block_worklist.push_back(succ);
+    }
+
+    /// Re-evaluate `site` whenever `id` moves.
+    fn watch(&mut self, id: PseudoId, site: Site) {
+        let sites = self.uses.entry(id).or_default();
+        if !sites.contains(&site) {
+            sites.push(site);
+        }
     }
 
     /// `id`'s range as seen from `block`, or the whole space.
@@ -1246,6 +1265,206 @@ mod tests {
         run(&mut f, &types);
         let term = f.get_block(BasicBlockId(1)).unwrap().insns.last().unwrap();
         assert_eq!(term.op, Opcode::Cbr, "a data-dependent exit stays a branch");
+    }
+
+    /// A loop-carried counter compared against an unknown bound.
+    ///
+    /// ```text
+    /// .L0: phisrc 0 -> .L1:%count      ; count = 0
+    /// .L1: %count = phi(0, %next)
+    ///      cbr %keep_going, .L2, .L4
+    /// .L2: %next = %count + 1
+    ///      %eq = seteq %next, %bound   ; bound is an argument
+    ///      cbr %eq, .L3, .L5
+    /// .L3: %ret = copy %bound          ; <- must NOT become `copy 1`
+    ///      ret %ret
+    /// .L5: phisrc %next -> .L1:%count
+    ///      br .L1
+    /// .L4: ret %count
+    /// ```
+    ///
+    /// The first time the solver reaches the inner `cbr`, `%count` is still
+    /// `{0}`, so `%next` is `{1}` and the true edge appears to prove
+    /// `%bound == 1`. That fact is derived from the *ranges* of the
+    /// comparison's operands, and those ranges grow as the loop is
+    /// analyzed -- but the comparison's own lattice cell settles at "either
+    /// answer is possible" and never moves again, so nothing re-derived the
+    /// fact. The stale, too-strong fact rewrote the `%bound` read into a
+    /// constant `1`, which is what made `"AAA".replace("A", "", 3)` answer
+    /// `"AA"`.
+    ///
+    /// Whether the stale fact survives depends on the order the solver
+    /// happens to reach things in, so this shape is the behavioural guard
+    /// and [`vrp_a_branch_reads_what_its_fact_is_derived_from`] pins the
+    /// mechanism directly.
+    fn counting_loop() -> (Function, TypeTable) {
+        let types = host_types();
+        let i64t = types.long_id;
+        let mut f = Function::new("f", i64t);
+        f.add_pseudo(Pseudo::arg(PseudoId(0), 0)); // %bound
+        f.add_pseudo(Pseudo::arg(PseudoId(1), 1)); // %keep_going
+        f.add_pseudo(Pseudo::val(PseudoId(2), 0));
+        f.add_pseudo(Pseudo::val(PseudoId(3), 1));
+        f.next_pseudo = 40;
+
+        let mut l0 = BasicBlock::new(BasicBlockId(0));
+        l0.add_insn(Instruction::new(Opcode::Entry));
+        let mut ps0 = Instruction::new(Opcode::PhiSource)
+            .with_target(PseudoId(10))
+            .with_src(PseudoId(2))
+            .with_type_and_size(i64t, 64);
+        ps0.phi_list.push((BasicBlockId(1), PseudoId(12)));
+        l0.add_insn(ps0);
+        let mut br = Instruction::new(Opcode::Br);
+        br.bb_true = Some(BasicBlockId(1));
+        l0.add_insn(br);
+        l0.children = vec![BasicBlockId(1)];
+
+        let mut l1 = BasicBlock::new(BasicBlockId(1));
+        let mut phi = Instruction::new(Opcode::Phi)
+            .with_target(PseudoId(12))
+            .with_type_and_size(i64t, 64);
+        phi.src = vec![PseudoId(10), PseudoId(11)];
+        phi.phi_list = vec![
+            (BasicBlockId(0), PseudoId(10)),
+            (BasicBlockId(5), PseudoId(11)),
+        ];
+        l1.add_insn(phi);
+        let mut cbr = Instruction::new(Opcode::Cbr).with_src(PseudoId(1));
+        cbr.bb_true = Some(BasicBlockId(2));
+        cbr.bb_false = Some(BasicBlockId(4));
+        l1.add_insn(cbr);
+        l1.children = vec![BasicBlockId(2), BasicBlockId(4)];
+
+        let mut l2 = BasicBlock::new(BasicBlockId(2));
+        l2.add_insn(Instruction::binop(
+            Opcode::Add,
+            PseudoId(13),
+            PseudoId(12),
+            PseudoId(3),
+            i64t,
+            64,
+        ));
+        // The `Copy` indirections matter: they are what SSA promotion
+        // leaves around every value that came out of a local, and they are
+        // why the comparison's own lattice cell stops moving long before its
+        // operands' ranges do.
+        l2.add_insn(
+            Instruction::new(Opcode::Copy)
+                .with_target(PseudoId(15))
+                .with_src(PseudoId(13))
+                .with_type_and_size(i64t, 64),
+        );
+        l2.add_insn(
+            Instruction::new(Opcode::Copy)
+                .with_target(PseudoId(16))
+                .with_src(PseudoId(0))
+                .with_type_and_size(i64t, 64),
+        );
+        l2.add_insn(Instruction::binop(
+            Opcode::SetEq,
+            PseudoId(14),
+            PseudoId(15),
+            PseudoId(16),
+            i64t,
+            64,
+        ));
+        l2.add_insn(
+            Instruction::new(Opcode::Copy)
+                .with_target(PseudoId(17))
+                .with_src(PseudoId(14))
+                .with_type_and_size(types.int_id, 32),
+        );
+        let mut cbr2 = Instruction::new(Opcode::Cbr).with_src(PseudoId(17));
+        cbr2.bb_true = Some(BasicBlockId(3));
+        cbr2.bb_false = Some(BasicBlockId(5));
+        l2.add_insn(cbr2);
+        l2.children = vec![BasicBlockId(3), BasicBlockId(5)];
+
+        let mut l3 = BasicBlock::new(BasicBlockId(3));
+        l3.add_insn(
+            Instruction::new(Opcode::Copy)
+                .with_target(PseudoId(20))
+                .with_src(PseudoId(0))
+                .with_type_and_size(i64t, 64),
+        );
+        l3.add_insn(
+            Instruction::new(Opcode::Ret)
+                .with_src(PseudoId(20))
+                .with_type_and_size(i64t, 64),
+        );
+
+        let mut l4 = BasicBlock::new(BasicBlockId(4));
+        l4.add_insn(
+            Instruction::new(Opcode::Ret)
+                .with_src(PseudoId(12))
+                .with_type_and_size(i64t, 64),
+        );
+
+        let mut l5 = BasicBlock::new(BasicBlockId(5));
+        let mut ps1 = Instruction::new(Opcode::PhiSource)
+            .with_target(PseudoId(11))
+            .with_src(PseudoId(13))
+            .with_type_and_size(i64t, 64);
+        ps1.phi_list.push((BasicBlockId(1), PseudoId(12)));
+        l5.add_insn(ps1);
+        let mut back = Instruction::new(Opcode::Br);
+        back.bb_true = Some(BasicBlockId(1));
+        l5.add_insn(back);
+        l5.children = vec![BasicBlockId(1)];
+
+        f.entry = BasicBlockId(0);
+        f.blocks = vec![l0, l1, l2, l3, l4, l5];
+        f.rebuild_block_idx();
+        (f, types)
+    }
+
+    #[test]
+    fn vrp_re_derives_an_edge_fact_when_its_operands_widen() {
+        let (mut f, types) = counting_loop();
+        run(&mut f, &types);
+
+        // `.L3` returns the bound. Nothing in this function says what the
+        // bound is, so the copy must still read the argument.
+        let l3 = f.blocks.iter().find(|b| b.id == BasicBlockId(3)).unwrap();
+        let copy = l3
+            .insns
+            .iter()
+            .find(|i| i.target == Some(PseudoId(20)))
+            .expect("the copy survives");
+        let v = copy.src[0];
+        assert!(
+            f.const_val(v).is_none(),
+            "the bound was replaced by the constant {:?}",
+            f.const_val(v)
+        );
+    }
+
+    /// A branch is a reader of the pseudos its edge facts are derived from.
+    ///
+    /// This is the fix stated as an invariant rather than as an outcome. A
+    /// comparison's own lattice cell reaches "either answer is possible"
+    /// early and stops moving, while the ranges underneath it keep widening
+    /// for the rest of the solve; if the branch is not on those pseudos'
+    /// reader lists, the first and narrowest fact it derived is the one that
+    /// stands.
+    #[test]
+    fn vrp_a_branch_reads_what_its_fact_is_derived_from() {
+        let (f, types) = counting_loop();
+        let mut solver = Solver::new(&f, &types);
+        solver.solve(&f);
+
+        // The inner `cbr` is the last instruction of `.L2`.
+        let b = f.block_index(BasicBlockId(2)).unwrap();
+        let site = (b, f.blocks[b].insns.len() - 1);
+        assert_eq!(f.blocks[b].insns[site.1].op, Opcode::Cbr);
+
+        // `%0` is the bound: the operand whose range the fact is about.
+        let readers = solver.uses.get(&PseudoId(0)).cloned().unwrap_or_default();
+        assert!(
+            readers.contains(&site),
+            "the branch must be re-evaluated when the bound's range moves"
+        );
     }
 
     /// Undefined behaviour is not assumed away: a divisor that could be

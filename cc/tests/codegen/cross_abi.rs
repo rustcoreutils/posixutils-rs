@@ -2431,7 +2431,7 @@ __int128 call_even(__int128 u) { return wide(0, u); }
 /// clang's own caller does *not* do this: it stacks an over-aligned aggregate
 /// a legalized element at a time in eight-byte granules, disagreeing with its
 /// own `va_arg`. c17 follows `va_arg`. See the divergence recorded in
-/// `cc/doc/TODO.md`.
+/// `cc/DECISIONS.md`.
 ///
 /// Asserted on assembly because it cannot be executed here: there is no macOS
 /// runner and qemu cannot run Mach-O.

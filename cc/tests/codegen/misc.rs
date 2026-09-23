@@ -6645,7 +6645,7 @@ int main(void) { return via_ptr(14) == 42 ? 0 : 1; }
 ///
 /// gcc goes further and uses General Dynamic here; Initial Exec is the
 /// strongest model c17 has, and is correct for a shared object loaded at
-/// startup. See `cc/doc/TODO.md` for what General Dynamic still needs.
+/// startup. See `cc/TODO.md` for what General Dynamic still needs.
 #[test]
 fn codegen_fpic_selects_a_position_independent_tls_model() {
     let src = r#"
@@ -7929,7 +7929,7 @@ int main(void)
        granule (offset 72) and its `va_arg` rounds the cursor up to the
        type's 32, reading offset 96. A program built entirely with clang
        has the same defect. Whichever of the two c17 matches, the other
-       direction of this cross-check fails; `cc/doc/TODO.md` records which.
+       direction of this cross-check fails; `cc/DECISIONS.md` records which.
        The pure-c17 runs above still cover the shape, and the named
        argument and the no-leading-argument variadic are checked against
        clang in both directions. */
@@ -8949,7 +8949,7 @@ int main(void) {
 
 /// `weak`, `visibility`, `section` and `used` were parsed and thrown away
 /// while `__has_attribute` answered 1 for each — so a program could ask, be
-/// told yes, and get none of the behaviour. `doc/ATTR.md` claimed every
+/// told yes, and get none of the behaviour. `cc/ATTR.md` claimed every
 /// attribute whose absence a program could observe was implemented, and these
 /// four are exactly the counterexample.
 ///
@@ -11617,12 +11617,9 @@ MK(129)   /* just over  */
 MK(200)
 MK(1000)  /* comfortably into call territory */
 
-/* Larger than this is deliberately not here. Three locals of 9001 bytes make a
-   ~27 KB frame, and aarch64 cannot yet assemble a frame that large -- stack
-   offsets past the immediate range are not legalized, which a plain
-   `volatile unsigned char a[9001], b[9001], d[9001];` reproduces with no
-   struct copy anywhere in sight. A separate defect, recorded in doc/TODO.md;
-   this test stays clear of it so it is testing the copy and nothing else. */
+/* Larger than this is deliberately not here: it would be testing the
+   aarch64 frame-offset legalization rather than the copy. That is covered
+   on its own by `codegen_large_stack_frame_offsets_are_encodable`. */
 
 int main(void) {
     run7(); run12(); run13(); run127(); run129(); run200(); run1000();

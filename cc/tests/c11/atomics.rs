@@ -787,7 +787,7 @@ int main(void) {
     /* `_Atomic double _Complex` is deliberately absent: assigning to a
        complex *global* segfaults with or without _Atomic, on this branch and
        on main alike. That is a separate pre-existing defect, recorded in
-       doc/TODO.md, and folding it in here would make this test fail for a
+       cc/TODO.md, and folding it in here would make this test fail for a
        reason it is not about. */
 
     return 0;

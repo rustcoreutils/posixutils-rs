@@ -1533,7 +1533,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// this cannot be done branch-free. The division truncates toward zero at
     /// every step, like any integer division, which is why gcc (and c17)
     /// answer `6 + 1i` for `(-9 + 38i) / (5 + 6i)` where the exact quotient is
-    /// `3 + 4i`. `cc/doc/BUILTIN.md` records that.
+    /// `3 + 4i`. `cc/BUILTIN.md` records that.
     ///
     /// Writes both halves to `result_addr` and leaves the cursor on the merge
     /// block.

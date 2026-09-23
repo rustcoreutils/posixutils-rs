@@ -288,7 +288,7 @@ place c17 or its tools knowingly diverged from the standard. Its file had one
 other row, `#C55` (trigraphs off by default), and that is a maintainer
 decision rather than a gap; by the rule the next paragraph ends on, a decision
 is not a punch-list item, so it was never what kept the file alive. The
-trigraph reasoning is in `cc/doc/TODO.md` under "Settled — do not re-open".
+trigraph reasoning is in `cc/DECISIONS.md` under "Settled — do not re-open".
 
 Three of those closures were decisions rather than code, and each is recorded
 in the commit that closed it so it is not re-raised: `make`'s `#86` (GNU `::`

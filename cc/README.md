@@ -6,7 +6,40 @@ c17 implements **C17 (ISO/IEC 9899:2018) only**, plus selected GNU extensions, t
 
 References:
 - [ISO/IEC 9899:2011 (C11)](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf) — C17 is this plus defect reports; the published C17 text is not free
-- Conformance findings and known divergences: git history; see [doc/README.md](doc/README.md)
+- Conformance findings and known divergences: git history; see [Conformance](#conformance) below
+
+## Documents
+
+| Document | Description |
+|----------|-------------|
+| [ATTR.md](ATTR.md) | Function attributes (`__attribute__`, `_Noreturn`, `__has_attribute`) |
+| [BUILTIN.md](BUILTIN.md) | Compiler builtins (`__builtin_*`), and what is deliberately absent |
+| [TODO.md](TODO.md) | Outstanding work only -- technical debt, optimization passes, torture-suite status |
+| [DECISIONS.md](DECISIONS.md) | Settled choices and deliberate divergences from gcc. Not a backlog |
+| [ir/README.md](ir/README.md) | IR structure and the pass pipeline |
+
+## Conformance
+
+There is no open conformance punch list: `cc/audit.md` was retired when its
+last gap closed, under the rule in the repository's `audits.md` that a crate
+keeps an audit file only while it still has an open item. Every finding, every
+CONFORMS row and every probe is in git history — `git log --follow -- cc/audit.md`
+recovers the file, and `git log --grep '#C116'` finds one finding by number, in
+the commit that fixed it.
+
+Two things that file established are worth keeping in front of you:
+
+**Scope.** Conformance means POSIX.1-2024 and the ISO C standard it
+incorporates, and nothing else. Engineering debt that is *not* a conformance
+question belongs in [TODO.md](TODO.md) or [DECISIONS.md](DECISIONS.md) — `_FORTIFY_SOURCE` is in the latter because
+it, `__builtin_object_size` and the `_chk` family appear nowhere in
+POSIX.1-2024, and filing it as a conformance gap overstated what it was.
+
+**How a conformance claim is established.** By probing the built binary against
+the spec slice — not by reading the source, and not by trusting an earlier
+write-up. Several findings were originally written from a premise that a probe
+then disproved, and every unprobed ISO C row that got re-probed turned out to
+be wrong.
 
 ## Quick start
 
@@ -56,7 +89,7 @@ Key source files:
 | `tools.rs` | Shared exit-status handling for `cflow`/`ctags`/`cxref` |
 | `os/` | OS-specific knobs (linux, macos, freebsd) |
 | `abi/` | Per-ABI classification: `sysv_amd64.rs`, `aapcs64.rs` |
-| `ir/mod.rs` | IR definitions (opcodes, pseudos, instructions, functions). See `ir/README.md`. |
+| `ir/mod.rs` | IR definitions (opcodes, pseudos, instructions, functions). See [ir/README.md](ir/README.md) |
 | `ir/linearize.rs` (+ `_init.rs`, `_stmt.rs`, `_emit.rs`, `_atomic.rs`) | AST → IR conversion, SSA construction |
 | `ir/mem2reg.rs` | Promotion of address-free locals to registers |
 | `ir/tls.rs` | Thread-local access expansion (dynamic model) |
@@ -121,7 +154,7 @@ Supported:
   designated-initializer ranges (`[0 ... 3] = v`), computed goto (`&&label`
   and `goto *p`), the omitted middle operand (`a ?: b`, with `a` evaluated
   once), statement expressions, `typeof`, `__attribute__` including `mode` and
-  `vector_size`, `__builtin_*` (see `doc/BUILTIN.md`), and case-range-style
+  `vector_size`, `__builtin_*` (see [BUILTIN.md](BUILTIN.md)), and case-range-style
   `...` spacing matching gcc's (`case 1...9:` is one pp-number and is rejected
   there too)
 - Variably modified types everywhere C17 admits them, including a `typedef` of
@@ -151,7 +184,7 @@ Will not implement:
 - SIMD intrinsic headers (`immintrin.h` and friends). Code guarded on
   `#ifdef __SSE2__` reaches for one and fails. The macro is not the fault:
   SSE2 is architectural baseline for x86-64 and gcc defines it unconditionally,
-  as c17 does — it describes the target, not the header set. See `doc/TODO.md`
+  as c17 does — it describes the target, not the header set. See [DECISIONS.md](DECISIONS.md)
 - `__auto_type`; nested functions and `__label__`. Clang refuses nested
   functions too, and they need executable-stack trampolines
 - `_Imaginary` types. Optional in C99, C11 and C17 alike -- never removed,

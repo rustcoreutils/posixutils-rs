@@ -587,7 +587,7 @@ int main(void) {
 /// `__builtin_classify_type(expr)` — a compile-time code for the argument's
 /// type family.
 ///
-/// Listed in `doc/BUILTIN.md` as not implemented, which was observable
+/// Listed in `cc/BUILTIN.md` as not implemented, which was observable
 /// wherever a header branched on it. Like `sizeof`, the argument is not
 /// evaluated; unlike `sizeof`, gcc takes an expression rather than a type
 /// name.

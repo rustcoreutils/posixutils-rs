@@ -11,6 +11,7 @@
 // once so that dataflow analysis and the optimization passes stay simple.
 //
 
+mod constfold;
 pub mod dce;
 pub mod dominate;
 pub mod inline;
@@ -23,6 +24,7 @@ mod linearize_stmt;
 pub mod lower;
 pub mod mach_o_dtors;
 pub mod mem2reg;
+pub mod sccp;
 pub mod ssa;
 pub mod tls;
 pub mod validate;
@@ -38,6 +40,8 @@ use std::fmt;
 const DEFAULT_INSN_CAPACITY: usize = 32;
 const DEFAULT_CFG_EDGE_CAPACITY: usize = 4;
 const DEFAULT_SRC_CAPACITY: usize = 4;
+/// Operands a typical instruction reads; see [`Instruction::uses`].
+const DEFAULT_USE_CAPACITY: usize = 4;
 const DEFAULT_PHI_CAPACITY: usize = 4;
 const DEFAULT_PARAM_CAPACITY: usize = 8;
 const DEFAULT_BLOCK_CAPACITY: usize = 512;
@@ -978,6 +982,49 @@ impl Instruction {
         }
     }
 
+    /// Every pseudo this instruction reads.
+    ///
+    /// The canonical enumeration, because uses are not all in `src`: a `Phi`
+    /// reads the pseudos named in `phi_list`, an indirect call reads
+    /// `indirect_target`, and inline assembly reads its `inputs` -- plus a
+    /// *memory* output, whose pseudo is the address the assembly writes
+    /// through rather than the value written. Omitting those let DCE delete
+    /// the address computation, so every `"=m"` operand became a store
+    /// through a garbage register.
+    ///
+    /// The exception that bites: a `PhiSource`'s own `phi_list` is a
+    /// back-pointer to the `Phi` it feeds, not an operand. Counting it as a
+    /// use makes the value look live to DCE and makes a def-use graph report
+    /// an edge that runs the wrong way.
+    pub fn uses(&self) -> Vec<PseudoId> {
+        let mut uses = Vec::with_capacity(DEFAULT_USE_CAPACITY);
+
+        uses.extend(self.src.iter().copied());
+
+        if self.op != Opcode::PhiSource {
+            for (_, pseudo) in &self.phi_list {
+                uses.push(*pseudo);
+            }
+        }
+
+        if let Some(indirect) = self.indirect_target {
+            uses.push(indirect);
+        }
+
+        if let Some(ref asm_data) = self.asm_data {
+            for input in &asm_data.inputs {
+                uses.push(input.pseudo);
+            }
+            for output in &asm_data.outputs {
+                if output.is_memory() {
+                    uses.push(output.pseudo);
+                }
+            }
+        }
+
+        uses
+    }
+
     /// Create a return instruction
     pub fn ret(src: Option<PseudoId>) -> Self {
         let mut insn = Self::new(Opcode::Ret);
@@ -1748,6 +1795,16 @@ impl Function {
     }
 
     /// Get a block by ID
+    /// Where `id` sits in `blocks`.
+    ///
+    /// For a pass that needs the *index* rather than the block -- to index
+    /// `blocks` again later, or to avoid re-borrowing. Answered from the same
+    /// map `get_block` uses, so a linear scan is never the right way to find
+    /// one: a pass that scans per edge is quadratic on a large function.
+    pub fn block_index(&self, id: BasicBlockId) -> Option<usize> {
+        self.block_idx.get(&id).copied()
+    }
+
     pub fn get_block(&self, id: BasicBlockId) -> Option<&BasicBlock> {
         self.block_idx
             .get(&id)

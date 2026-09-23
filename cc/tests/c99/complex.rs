@@ -1254,7 +1254,7 @@ int main(void) {
 /// The price is truncation at each step, so `(-9 + 38i) / (5 + 6i)` is
 /// `6 + 1i` where the exact quotient is `3 + 4i`. gcc answers the same, and
 /// nothing specifies otherwise -- the type is an extension, so gcc is the
-/// definition. `cc/doc/BUILTIN.md` records the trade.
+/// definition. `cc/BUILTIN.md` records the trade.
 #[test]
 fn c99_complex_integer_division_matches_gcc() {
     let code = r#"

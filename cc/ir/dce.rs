@@ -21,10 +21,9 @@
 // reordering must consult `is_memory_barrier()` before crossing.
 //
 
-use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
+use super::{BasicBlockId, Function, Opcode, PseudoId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
-const DEFAULT_USE_CAPACITY: usize = 4;
 const DEFAULT_LIVE_CAPACITY: usize = 64;
 const DEFAULT_REACHABLE_CAPACITY: usize = 16;
 
@@ -56,44 +55,6 @@ fn is_root(op: Opcode) -> bool {
     op.has_side_effects()
 }
 
-/// Get all pseudo IDs used by an instruction (operands).
-fn get_uses(insn: &Instruction) -> Vec<PseudoId> {
-    let mut uses = Vec::with_capacity(DEFAULT_USE_CAPACITY);
-
-    // Source operands
-    uses.extend(insn.src.iter().copied());
-
-    // Phi sources (PhiSource.phi_list is a back-pointer, not an operand)
-    if insn.op != Opcode::PhiSource {
-        for (_, pseudo) in &insn.phi_list {
-            uses.push(*pseudo);
-        }
-    }
-
-    // Indirect call target (function pointer)
-    if let Some(indirect) = insn.indirect_target {
-        uses.push(indirect);
-    }
-
-    // Inline assembly inputs (the pseudos that the asm reads)
-    if let Some(ref asm_data) = insn.asm_data {
-        for input in &asm_data.inputs {
-            uses.push(input.pseudo);
-        }
-        // A memory *output* reads its pseudo too: the pseudo is the address
-        // the assembly writes through, not the written value. Omitting these
-        // let DCE delete the address computation at -O and above, so every
-        // `"=m"` operand became a store through a garbage register.
-        for output in &asm_data.outputs {
-            if output.is_memory() {
-                uses.push(output.pseudo);
-            }
-        }
-    }
-
-    uses
-}
-
 /// Build a map from each pseudo to the instructions that define it.
 fn build_def_map(func: &Function) -> HashMap<PseudoId, Vec<(usize, usize)>> {
     let mut defs: HashMap<PseudoId, Vec<(usize, usize)>> = HashMap::new();
@@ -118,7 +79,7 @@ fn eliminate_dead_code(func: &mut Function) -> bool {
         for insn in &bb.insns {
             if is_root(insn.op) {
                 // Mark all operands of root instructions as live
-                for id in get_uses(insn) {
+                for id in insn.uses() {
                     if live.insert(id) {
                         worklist.push_back(id);
                     }
@@ -135,7 +96,7 @@ fn eliminate_dead_code(func: &mut Function) -> bool {
                 let insn = &func.blocks[bb_idx].insns[insn_idx];
 
                 // Mark all operands of the defining instruction as live
-                for use_id in get_uses(insn) {
+                for use_id in insn.uses() {
                     if live.insert(use_id) {
                         worklist.push_back(use_id);
                     }
@@ -699,7 +660,7 @@ mod tests {
         let mut phisrc = Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, 32);
         phisrc.phi_list = vec![(BasicBlockId(1), PseudoId(2))];
 
-        let uses = get_uses(&phisrc);
+        let uses = phisrc.uses();
 
         // Should contain src (%0) but NOT the back-pointer pseudo (%2)
         assert!(uses.contains(&PseudoId(0)), "src should be a use");
@@ -717,7 +678,7 @@ mod tests {
         let mut phi = Instruction::phi(PseudoId(2), types.int_id, 32);
         phi.phi_list = vec![(BasicBlockId(0), PseudoId(1))];
 
-        let uses = get_uses(&phi);
+        let uses = phi.uses();
 
         // Phi should report %1 as a use
         assert!(
@@ -728,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_indirect_call_target_is_use() {
-        // Test that get_uses() includes indirect_target for function pointer calls.
+        // Test that uses() includes indirect_target for function pointer calls.
         // This prevents DCE from eliminating the instruction that computes
         // the function pointer before an indirect call.
         let types = TypeTable::new(&Target::host());
@@ -741,12 +702,12 @@ mod tests {
             32,
         );
 
-        let uses = get_uses(&call_insn);
+        let uses = call_insn.uses();
 
         // Verify indirect_target is in the uses list
         assert!(
             uses.contains(&PseudoId(5)),
-            "get_uses should include indirect_target"
+            "uses() should include indirect_target"
         );
         // Also verify call arguments are in uses
         assert!(uses.contains(&PseudoId(1)));

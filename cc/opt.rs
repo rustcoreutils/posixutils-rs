@@ -12,6 +12,7 @@
 use crate::ir::dce;
 use crate::ir::inline;
 use crate::ir::instcombine;
+use crate::ir::sccp;
 use crate::ir::validate;
 use crate::ir::{Function, Module};
 
@@ -263,10 +264,21 @@ pub fn optimize_module(module: &mut Module, opt: Optimization) {
 /// Optimize a single function by running passes until fixed point.
 fn optimize_function(func: &mut Function) {
     for _ in 0..MAX_ITERATIONS {
+        // SCCP first: it proves branches dead, which `instcombine` cannot,
+        // and it leaves behind `Copy` from a constant -- exactly the shape
+        // `instcombine`'s `ConstMap` follows. It runs *inside* the loop
+        // rather than once before it because `instcombine` derives constants
+        // SCCP structurally cannot (`x - x`, `x ^ x`), any of which can make
+        // a branch condition constant.
+        //
+        // `dce` last, and this ordering is load-bearing: SCCP removes the
+        // dead edge but deletes no block, and leaves the `PhiSource` of a
+        // folded phi for `dce` to collect.
+        let sccp_changed = sccp::run(func);
         let ic_changed = instcombine::run(func);
         let dce_changed = dce::run(func);
 
-        if !ic_changed && !dce_changed {
+        if !sccp_changed && !ic_changed && !dce_changed {
             break;
         }
     }

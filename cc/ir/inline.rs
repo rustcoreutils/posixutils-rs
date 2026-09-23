@@ -93,6 +93,15 @@ pub struct InlineCandidate {
     /// `va_list`: never inlined, never emitted, and the call left dangling at
     /// link.
     pub consumes_va_list: bool,
+    /// Whether another translation unit may replace this definition at link
+    /// time -- a `weak` definition with external linkage.
+    ///
+    /// Its body is therefore not authoritative: what runs may be some other
+    /// definition entirely, so splicing this one in is a miscompile whenever
+    /// the two differ. gcc never inlines one. `static` is excluded because a
+    /// symbol with internal linkage cannot be interposed even if someone
+    /// writes `weak` on it.
+    pub is_interposable: bool,
     /// Whether the function takes a label's address (`&&label`).
     ///
     /// Such a function cannot be inlined: the address is a symbol naming a
@@ -181,6 +190,7 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
         takes_label_addr: func.takes_label_addr,
         is_noinline: func.is_noinline,
         is_always_inline: func.is_always_inline,
+        is_interposable: func.symbol_attrs.weak && !func.is_static,
         has_inline_hint: func.is_inline,
         ret_is_address: func.ret_is_address,
         ..Default::default()
@@ -277,6 +287,19 @@ fn should_inline(
     // inlining takes its per-call stack from 6 KB to 15 KB -- and its
     // `test_isinstance` segfaults when this check is skipped.
     let forced = candidate.is_always_inline;
+
+    // A `weak` definition is interposable: the linker may bind the call to a
+    // different definition entirely, so this body is not authoritative and
+    // splicing it in is a miscompile whenever the two differ.
+    //
+    // After `forced`, deliberately. `always_inline` on a weak function is a
+    // contradiction the program has asked for explicitly, and gcc resolves it
+    // in favour of the attribute; putting interposability in
+    // `cannot_be_inlined` instead would turn that into a hard error from
+    // `opt::check_forwarding_resolved`.
+    if candidate.is_interposable && !forced {
+        return false;
+    }
 
     // At -O0, inline nothing but the forced functions.
     if !opt.inlines_generally() && !forced {
@@ -1502,13 +1525,16 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
         }
     }
 
-    // Remove dead static functions that were fully inlined.
+    // Remove dead static functions.
     //
     // Only above -O0: dropping an unreferenced static function is an
-    // optimization in its own right, and at -O0 gcc still emits one. Running
-    // it here just because an `always_inline` callee brought us into this pass
-    // would delete unrelated functions the user asked to keep.
-    if any_changed && opt.optimizes() {
+    // optimization in its own right, and at -O0 gcc still emits one.
+    //
+    // Not gated on anything having been inlined. It was, and that meant a
+    // translation unit where the inliner declined every call kept its
+    // unreferenced statics at every level -- including the one whose body
+    // referenced an undefined symbol.
+    if opt.optimizes() {
         remove_dead_functions(module);
     }
 
@@ -1553,57 +1579,105 @@ fn collect_func_refs_from_initializer(
 
 /// Remove functions that are static and have no callers
 fn remove_dead_functions(module: &mut Module) {
-    // Collect all function names for lookup
+    // To a fixpoint: a reference held only by a function that is itself about
+    // to go is not a reference. One round leaves exactly that behind -- an
+    // unreferenced `bar` calling `foo` keeps `foo` alive on a count that its
+    // own removal has already invalidated.
+    loop {
+        let referenced = collect_referenced_functions(module);
+        let before = module.functions.len();
+        module.functions.retain(|f| {
+            f.name == "main"
+                || !f.is_static
+                // `__attribute__((used))` means exactly "keep this even
+                // though nothing refers to it".
+                || f.symbol_attrs.used
+                || referenced.contains(&f.name)
+                // A constructor or destructor is called by neither: its only
+                // reference is the `.init_array` / `.fini_array` entry the
+                // backend emits, which is created after this pass runs.
+                || f.constructor.is_some()
+                || f.destructor.is_some()
+        });
+        if module.functions.len() == before {
+            return;
+        }
+    }
+}
+
+/// Every function name something in the module still refers to.
+///
+/// Missing a kind of reference here deletes a live function, so this errs
+/// toward keeping: an identifier that merely *looks* like a function name in
+/// an assembly template counts.
+fn collect_referenced_functions(module: &Module) -> HashSet<String> {
     let func_names: HashSet<String> = module.functions.iter().map(|f| f.name.clone()).collect();
+    let mut referenced: HashSet<String> = HashSet::with_capacity(DEFAULT_CANDIDATE_CAPACITY);
 
-    // Count calls to each function and track address-taken functions
-    let mut call_counts: HashMap<String, usize> = HashMap::with_capacity(module.functions.len());
-    let mut address_taken: HashSet<String> = HashSet::with_capacity(DEFAULT_CANDIDATE_CAPACITY);
-
-    // Check function code for calls and address-taken via SymAddr instructions
     for func in &module.functions {
         for bb in &func.blocks {
             for insn in &bb.insns {
-                if insn.op == Opcode::Call {
-                    if let Some(name) = &insn.func_name {
-                        *call_counts.entry(name.clone()).or_insert(0) += 1;
+                match insn.op {
+                    // A direct call. An indirect one is named `<indirect>`,
+                    // so it cannot collide with a real function.
+                    Opcode::Call => {
+                        if let Some(name) = &insn.func_name {
+                            if func_names.contains(name) {
+                                referenced.insert(name.clone());
+                            }
+                        }
                     }
-                } else if insn.op == Opcode::SymAddr {
-                    // Check if this takes the address of a function
-                    if !insn.src.is_empty() {
-                        let src_id = insn.src[0];
-                        if let Some(pseudo) = func.get_pseudo(src_id) {
-                            if let PseudoKind::Sym(ref name) = pseudo.kind {
-                                // Check if this symbol is a function name
+                    // The single funnel for every way an address is taken:
+                    // `&f`, `f` as an argument, `f == f`, an `"i"`/`"s"` asm
+                    // operand, a function-pointer assignment.
+                    Opcode::SymAddr => {
+                        if let Some(src) = insn.src.first() {
+                            if let Some(name) = func.sym_name_of(*src) {
                                 if func_names.contains(name) {
-                                    address_taken.insert(name.clone());
+                                    referenced.insert(name.to_string());
                                 }
                             }
                         }
                     }
+                    _ => {}
+                }
+                // A name written into the assembly text itself -- `asm("call
+                // foo")` -- reaches the assembler with no IR reference at all.
+                if let Some(ref asm) = insn.asm_data {
+                    collect_names_in_asm(&asm.template, &func_names, &mut referenced);
                 }
             }
         }
     }
 
-    // Check global variable initializers for function pointer references
-    // (e.g., static const struct { func_ptr fn; } table[] = { {my_func}, ... })
+    // A function pointer in a global's initializer, e.g.
+    // `static const struct { fn_t f; } table[] = { { my_func }, ... }`.
     for global in &module.globals {
-        collect_func_refs_from_initializer(&global.init, &func_names, &mut address_taken);
+        collect_func_refs_from_initializer(&global.init, &func_names, &mut referenced);
     }
 
-    // Remove static functions with no callers and no address taken (except
-    // main). A constructor or destructor is called by neither: its only
-    // reference is the `.init_array` / `.fini_array` entry the backend emits,
-    // which is created after this pass runs.
-    module.functions.retain(|f| {
-        f.name == "main"
-            || !f.is_static
-            || call_counts.get(&f.name).copied().unwrap_or(0) > 0
-            || address_taken.contains(&f.name)
-            || f.constructor.is_some()
-            || f.destructor.is_some()
-    });
+    referenced
+}
+
+/// Identifier-shaped words in an assembly template that name a function.
+fn collect_names_in_asm(
+    template: &str,
+    func_names: &HashSet<String>,
+    referenced: &mut HashSet<String>,
+) {
+    let mut word = String::new();
+    for ch in template.chars().chain(std::iter::once(' ')) {
+        if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+            word.push(ch);
+            continue;
+        }
+        if !word.is_empty() {
+            if func_names.contains(&word) {
+                referenced.insert(word.clone());
+            }
+            word.clear();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1673,6 +1747,7 @@ mod tests {
             consumes_va_list: false,
             takes_label_addr: false,
             ret_is_address: false,
+            is_interposable: false,
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
@@ -1698,6 +1773,7 @@ mod tests {
             consumes_va_list: true,
             takes_label_addr: false,
             ret_is_address: false,
+            is_interposable: false,
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
@@ -1741,6 +1817,7 @@ mod tests {
             consumes_va_list: true,
             takes_label_addr: false,
             ret_is_address: false,
+            is_interposable: false,
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
@@ -1760,6 +1837,7 @@ mod tests {
             consumes_va_list: false,
             takes_label_addr: false,
             ret_is_address: false,
+            is_interposable: false,
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
@@ -1779,6 +1857,7 @@ mod tests {
             consumes_va_list: false,
             takes_label_addr: false,
             ret_is_address: false,
+            is_interposable: false,
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
@@ -1798,6 +1877,7 @@ mod tests {
             consumes_va_list: false,
             takes_label_addr: false,
             ret_is_address: false,
+            is_interposable: false,
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
@@ -1876,6 +1956,126 @@ mod tests {
             module.functions.iter().any(|f| f.name == "handler"),
             "handler function should be preserved because its address is taken"
         );
+    }
+
+    /// Build a static function `name` whose body calls `callee`, if given.
+    fn static_fn(types: &TypeTable, name: &str, callee: Option<&str>) -> Function {
+        let mut f = Function::new(name, types.int_id);
+        f.is_static = true;
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        if let Some(callee) = callee {
+            bb.add_insn(Instruction::call(
+                None,
+                callee,
+                vec![],
+                vec![],
+                types.int_id,
+                32,
+            ));
+        }
+        bb.add_insn(Instruction::ret(None));
+        f.add_block(bb);
+        f.entry = BasicBlockId(0);
+        f
+    }
+
+    /// A reference held only by a function that is itself dead is not a
+    /// reference. One round of pruning leaves exactly that behind, and the
+    /// surviving callee then reaches the linker with whatever undefined
+    /// symbol its body named.
+    #[test]
+    fn test_dead_static_chain_is_pruned_to_a_fixpoint() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        // `foo` is called only by `bar`; `bar` is called by nobody.
+        module.functions.push(static_fn(&types, "foo", None));
+        module.functions.push(static_fn(&types, "bar", Some("foo")));
+        module.functions.push(Function::new("main", types.int_id));
+
+        remove_dead_functions(&mut module);
+
+        assert!(
+            !module.functions.iter().any(|f| f.name == "bar"),
+            "an uncalled static must go"
+        );
+        assert!(
+            !module.functions.iter().any(|f| f.name == "foo"),
+            "and so must one whose only caller went with it"
+        );
+        assert!(module.functions.iter().any(|f| f.name == "main"));
+    }
+
+    /// `__attribute__((used))` means exactly "keep this even though nothing
+    /// refers to it".
+    #[test]
+    fn test_used_static_survives_the_prune() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        let mut kept = static_fn(&types, "kept", None);
+        kept.symbol_attrs.used = true;
+        module.functions.push(kept);
+        module.functions.push(static_fn(&types, "dropped", None));
+        module.functions.push(Function::new("main", types.int_id));
+
+        remove_dead_functions(&mut module);
+
+        assert!(module.functions.iter().any(|f| f.name == "kept"));
+        assert!(!module.functions.iter().any(|f| f.name == "dropped"));
+    }
+
+    /// A name written into the assembly text reaches the assembler with no IR
+    /// reference at all, so nothing else in this pass can see it.
+    #[test]
+    fn test_asm_template_reference_keeps_a_static_alive() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        module.functions.push(static_fn(&types, "helper", None));
+
+        let mut main_func = Function::new("main", types.int_id);
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        let mut asm = Instruction::new(Opcode::Asm);
+        asm.asm_data = Some(Box::new(AsmData {
+            template: "call helper".to_string(),
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+            clobbers: Vec::new(),
+            goto_labels: Vec::new(),
+        }));
+        bb.add_insn(asm);
+        bb.add_insn(Instruction::ret(None));
+        main_func.add_block(bb);
+        main_func.entry = BasicBlockId(0);
+        module.functions.push(main_func);
+
+        remove_dead_functions(&mut module);
+
+        assert!(
+            module.functions.iter().any(|f| f.name == "helper"),
+            "a static named only in an asm template must survive"
+        );
+    }
+
+    /// A `weak` definition may be replaced at link time, so its body is not
+    /// authoritative and must never be spliced into a caller.
+    #[test]
+    fn test_weak_definition_is_not_inlined() {
+        let types = TypeTable::new(&Target::host());
+        let mut weak = Function::new("impl", types.int_id);
+        weak.symbol_attrs.weak = true;
+        let candidate = analyze_function(&weak, &HashMap::new());
+        assert!(candidate.is_interposable);
+        assert!(
+            !should_inline(&candidate, opt_at(2), 10, false),
+            "an interposable definition must not be inlined"
+        );
+
+        // `static` cannot be interposed, whatever the attribute says.
+        let mut weak_static = Function::new("impl", types.int_id);
+        weak_static.symbol_attrs.weak = true;
+        weak_static.is_static = true;
+        assert!(!analyze_function(&weak_static, &HashMap::new()).is_interposable);
     }
 
     #[test]

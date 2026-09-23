@@ -269,7 +269,7 @@ emits `__*_chk` calls -- `__OPTIMIZE__` is predefined, and
 `__builtin_va_arg_pack` makes their argument forwarding compile. It still does
 not *check*: `__builtin_object_size` is folded at parse time, where a wrapper
 measuring its own parameter can only answer "unknown", and folding it after
-inlining is the remaining work. See the `_FORTIFY_SOURCE` entry in `TODO.md`,
+inlining is the remaining work. See the `_FORTIFY_SOURCE` entry in `DECISIONS.md`,
 which is where this is tracked; it was also `#C12` in the conformance audit until that
 file was narrowed to conformance findings alone.
 

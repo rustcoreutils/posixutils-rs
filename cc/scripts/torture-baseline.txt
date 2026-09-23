@@ -244,6 +244,7 @@
 20011114-1@-O0
 20011114-1@-O2
 20011115-1@-O0
+20011115-1@-O2
 20011121-1@-O0
 20011121-1@-O2
 20011126-1@-O0
@@ -422,6 +423,7 @@
 20030316-1@-O2
 20030323-1@-O0
 20030323-1@-O2
+20030330-1@-O2
 20030401-1@-O0
 20030401-1@-O2
 20030403-1@-O0
@@ -1638,6 +1640,7 @@ mayalias-2@-O0
 mayalias-2@-O2
 mayalias-3@-O0
 mayalias-3@-O2
+medce-1@-O2
 memchr-1@-O0
 memchr-1@-O2
 memcpy-1@-O0
@@ -2898,6 +2901,7 @@ shiftdi-2@-O2
 shiftdi@-O0
 shiftdi@-O2
 shiftopt-1@-O0
+shiftopt-1@-O2
 signed1bitfield-1@-O0
 signed1bitfield-1@-O2
 split-path-1@-O0

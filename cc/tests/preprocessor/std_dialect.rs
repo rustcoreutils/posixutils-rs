@@ -497,7 +497,7 @@ fn c17_keeps_the_capability_macros_it_can_back() {
     // __SSE2__ is knowingly still advertised without intrinsic headers -- the
     // drop is deferred because it is the one change that could flip a
     // configure decision. Pinned so a later sweep cannot take it silently;
-    // see "GNU extensions" in cc/doc/TODO.md.
+    // see "GNU extensions" in cc/DECISIONS.md.
     #[cfg(target_arch = "x86_64")]
     for macro_name in ["__SSE__", "__SSE2__", "__MMX__"] {
         assert_eq!(

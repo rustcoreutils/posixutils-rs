@@ -6645,7 +6645,7 @@ int main(void) { return via_ptr(14) == 42 ? 0 : 1; }
 ///
 /// gcc goes further and uses General Dynamic here; Initial Exec is the
 /// strongest model c17 has, and is correct for a shared object loaded at
-/// startup. See `cc/doc/TODO.md` for what General Dynamic still needs.
+/// startup. See `cc/TODO.md` for what General Dynamic still needs.
 #[test]
 fn codegen_fpic_selects_a_position_independent_tls_model() {
     let src = r#"
@@ -7929,7 +7929,7 @@ int main(void)
        granule (offset 72) and its `va_arg` rounds the cursor up to the
        type's 32, reading offset 96. A program built entirely with clang
        has the same defect. Whichever of the two c17 matches, the other
-       direction of this cross-check fails; `cc/doc/TODO.md` records which.
+       direction of this cross-check fails; `cc/DECISIONS.md` records which.
        The pure-c17 runs above still cover the shape, and the named
        argument and the no-leading-argument variadic are checked against
        clang in both directions. */
@@ -8949,7 +8949,7 @@ int main(void) {
 
 /// `weak`, `visibility`, `section` and `used` were parsed and thrown away
 /// while `__has_attribute` answered 1 for each — so a program could ask, be
-/// told yes, and get none of the behaviour. `doc/ATTR.md` claimed every
+/// told yes, and get none of the behaviour. `cc/ATTR.md` claimed every
 /// attribute whose absence a program could observe was implemented, and these
 /// four are exactly the counterexample.
 ///
@@ -9266,6 +9266,12 @@ int main(void) {
 /// Assemble a source to text and hand it back, for tests that need to see the
 /// directives rather than the program's answer.
 fn asm_for(prefix: &str, src: &str) -> String {
+    asm_for_at(prefix, src, &[])
+}
+
+/// `asm_for` with explicit options -- an optimizer decision is invisible
+/// without one, since the default here is `-O0`.
+fn asm_for_at(prefix: &str, src: &str, extra: &[&str]) -> String {
     let dir = plib::tmp::Builder::new()
         .prefix(prefix)
         .tempdir()
@@ -9273,7 +9279,10 @@ fn asm_for(prefix: &str, src: &str) -> String {
     let c = dir.path().join("t.c");
     let s = dir.path().join("t.s");
     std::fs::write(&c, src).expect("write source");
-    let out = crate::common::run_c17(&["-S", c.to_str().unwrap(), "-o", s.to_str().unwrap()]);
+    let mut args = vec!["-S"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&[c.to_str().unwrap(), "-o", s.to_str().unwrap()]);
+    let out = crate::common::run_c17(&args);
     assert!(out.success, "compile failed: {}", out.stderr);
     std::fs::read_to_string(&s).expect("read asm")
 }
@@ -11608,12 +11617,9 @@ MK(129)   /* just over  */
 MK(200)
 MK(1000)  /* comfortably into call territory */
 
-/* Larger than this is deliberately not here. Three locals of 9001 bytes make a
-   ~27 KB frame, and aarch64 cannot yet assemble a frame that large -- stack
-   offsets past the immediate range are not legalized, which a plain
-   `volatile unsigned char a[9001], b[9001], d[9001];` reproduces with no
-   struct copy anywhere in sight. A separate defect, recorded in doc/TODO.md;
-   this test stays clear of it so it is testing the copy and nothing else. */
+/* Larger than this is deliberately not here: it would be testing the
+   aarch64 frame-offset legalization rather than the copy. That is covered
+   on its own by `codegen_large_stack_frame_offsets_are_encodable`. */
 
 int main(void) {
     run7(); run12(); run13(); run127(); run129(); run200(); run1000();
@@ -12246,6 +12252,322 @@ fn codegen_over_aligned_frame_keeps_no_local_at_an_rbp_displacement() {
             strays.is_empty(),
             "{what}: an over-aligned frame addressed something \
              through %rbp: {strays:?}\n{main}"
+        );
+    }
+}
+
+/// Sparse conditional constant propagation: constants follow the *reachable*
+/// paths, so a branch proved not taken takes its whole arm with it.
+///
+/// The half that matters is the negative half. A pass that folds a branch it
+/// has not proved dead deletes side effects, which is how a DCE change once
+/// broke every `subprocess.run` in CPython -- so the loop counter, the
+/// `volatile` read, the opaque guard on a `_exit`, and the computed goto are
+/// the point of this test, not the folds above them.
+#[test]
+fn codegen_sccp_folds_only_what_it_proves() {
+    let code = r#"
+#include <unistd.h>
+extern void link_error(void);
+
+int seen;
+__attribute__((noinline)) static void note(int v) { seen += v; }
+
+int main(int argc, char **argv)
+{
+    /* A constant condition takes its dead arm with it, including the call
+       to a function that is never defined -- so this fails to *link* rather
+       than to run if the fold does not happen. */
+    if (0) link_error();
+
+    /* A value that is constant only once the branch above it has folded. */
+    int x; if (1) x = 3; else x = 4;
+    if (x != 3) link_error();
+
+    /* A switch on a constant, with a GNU range arm and a default. */
+    switch (2) {
+    case 1: link_error(); break;
+    case 3 ... 9: link_error(); break;
+    case 2: break;
+    default: link_error();
+    }
+    switch (40) {
+    case 1: link_error(); break;
+    case 30 ... 50: break;
+    default: link_error();
+    }
+    switch (99) {
+    case 1: link_error(); break;
+    default: break;
+    }
+
+    /* `?:` on a constant condition. */
+    if ((1 ? 11 : 22) != 11) return 1;
+    if ((0 ? 11 : 22) != 22) return 2;
+
+    /* --- and now the things that must NOT fold --- */
+
+    /* A loop counter is not its initial value. */
+    int s = 0; for (int i = 0; i < 5; i++) s += i;
+    if (s != 10) return 3;
+
+    /* A volatile read is not a constant however it was stored. */
+    volatile int z = 0; z = 1;
+    if (!z) return 4;
+
+    /* An opaque guard on a noreturn call: the arm does real work before
+       `_exit`, and folding past it is the shape that broke CPython. */
+    if (argc > 99) { note(1); _exit(77); }
+
+    /* A computed goto reaches a block with no CFG edge into it. */
+    void *tbl[2] = { &&a, &&b };
+    goto *tbl[argc > 1 ? 1 : 0];
+a:  note(2); goto done;
+b:  note(4); goto done;
+done:
+    if (seen != 2) return 5;
+
+    /* A phi whose arms genuinely differ. */
+    int q; if (argc > 1) q = 7; else q = 9;
+    if (q != 9) return 6;
+
+    /* Signed shift identities must keep their sign. */
+    if ((-1 >> 1) != -1) return 7;
+    /* Unsigned wraparound is not undefined and must fold to the wrapped
+       value, not to the mathematical one. */
+    { unsigned u = 0u - 1u; if (u != 4294967295u) return 8; }
+
+    (void)argv;
+    return 0;
+}
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("codegen_sccp_folds", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// The dead arm goes even when it is the *only* thing that would have made
+/// the program link, and the program still runs correctly.
+///
+/// Separate from the test above because it must also pass at `-O0`, where
+/// SCCP does not run at all: `link_error` is defined here, so nothing depends
+/// on the fold happening, only on the answer being right either way.
+#[test]
+fn codegen_sccp_agrees_with_the_unoptimized_answer() {
+    let code = r#"
+int calls;
+static int side(int v) { calls++; return v; }
+
+int main(void)
+{
+    int total = 0;
+
+    /* Every arm here is decided at compile time, but the *answers* must be
+       the same as running it. */
+    if (2 + 2 == 4) total += 1; else total += 100;
+    if (3 > 7) total += 100; else total += 2;
+    total += (5 & 3) == 1 ? 4 : 100;
+    total += (1 << 3) == 8 ? 8 : 100;
+    total += (7 % 3) == 1 ? 16 : 100;
+    total += (-8 / 2) == -4 ? 32 : 100;
+
+    /* A call in a dead arm must not run. */
+    if (0) side(1);
+    if (calls != 0) return 1;
+
+    /* A call in a live arm must. */
+    if (1) side(1);
+    if (calls != 1) return 2;
+
+    return total == 63 ? 0 : 3;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("codegen_sccp_answers", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// A `weak` definition may be replaced at link time, so its body is not
+/// authoritative and must never be spliced into a caller.
+///
+/// The inliner consulted nothing about weakness, so a small weak function was
+/// inlined on the same terms as a strong one and the interposing definition
+/// simply never ran. Asserted on assembly because a single translation unit
+/// cannot exhibit interposition: the property is that the *call* survives.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_weak_definition_is_not_inlined() {
+    let asm = asm_for_at(
+        "c17_weak_noinline_",
+        r#"
+__attribute__((weak)) int impl(void) { return 1; }
+/* Static, so interposition cannot apply and it may still be inlined. */
+__attribute__((weak)) static int local_impl(void) { return 2; }
+int call_weak(void) { return impl(); }
+int call_weak_static(void) { return local_impl(); }
+"#,
+        &["-O2"],
+    );
+    let weak_caller = asm.split("\ncall_weak:").nth(1).unwrap_or_default();
+    assert!(
+        weak_caller.contains("call\timpl") || weak_caller.contains("call impl"),
+        "an interposable definition must still be called:\n{weak_caller}"
+    );
+    // The `static` one has internal linkage, so nothing can replace it and the
+    // attribute does not bar inlining.
+    let static_caller = asm
+        .split("\ncall_weak_static:")
+        .nth(1)
+        .unwrap_or_default()
+        .split("\n\t.size")
+        .next()
+        .unwrap_or_default();
+    assert!(
+        !static_caller.contains("local_impl"),
+        "a weak *static* cannot be interposed, so it may be inlined:\n{static_caller}"
+    );
+}
+
+/// An unreferenced static goes; one marked `used` stays.
+///
+/// Two defects met here. The prune ran only when something had *also* been
+/// inlined, so a translation unit the inliner declined kept its dead statics
+/// at every level. And `__attribute__((used))` was parsed, stored, and read by
+/// nothing -- invisible until the prune started working.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_used_static_survives_and_unused_does_not() {
+    let asm = asm_for_at(
+        "c17_used_static_",
+        r#"
+__attribute__((used)) static int kept(void) { return 7; }
+static int dropped(void) { return 8; }
+int main(void) { return 0; }
+"#,
+        &["-O2"],
+    );
+    assert!(asm.contains("\nkept:"), "`used` must keep it:\n{asm}");
+    assert!(
+        !asm.contains("\ndropped:"),
+        "an unreferenced static must go:\n{asm}"
+    );
+}
+
+/// The prune must reach a fixpoint: a reference held only by a function that
+/// is itself dead is not a reference.
+///
+/// `helper` is called only from `caller`, which nothing calls. One round drops
+/// `caller` and leaves `helper` alive on a count its own removal invalidated --
+/// and `helper` names a symbol that is never defined, so the program fails to
+/// link rather than merely carrying dead code.
+#[test]
+fn codegen_dead_static_chain_is_pruned_to_a_fixpoint() {
+    let code = r#"
+extern int never_defined;
+static int helper(void) { return never_defined; }
+static int caller(void) { return helper(); }
+int main(void) { return 0; }
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_dead_static_chain", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// A name that appears only inside an assembly template still refers to the
+/// function: it reaches the assembler with no IR reference for the prune to
+/// find.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_asm_template_reference_keeps_a_static_alive() {
+    let asm = asm_for_at(
+        "c17_asm_names_static_",
+        r#"
+static int helper(void) { return 7; }
+int main(void) { __asm__ volatile ("call helper" ::: "memory"); return 0; }
+"#,
+        &["-O2"],
+    );
+    assert!(
+        asm.contains("\nhelper:"),
+        "a static named only in an asm template must survive:\n{asm}"
+    );
+}
+
+/// Shift identities that hold for *every* shift count, and the comparisons
+/// that prove them.
+///
+/// Two things were needed and neither was the shift. `x >> 0 != x` folds the
+/// shift to a `Copy` already, but the comparison did not: promotion out of
+/// memory gives each use of `x` its own copy, so the two sides arrive as
+/// distinct pseudos naming one value, and the identity test compared raw ids.
+/// And `-1 >> x` is only recognizable when the operand is read *signed* at its
+/// own width -- read either way, as the folder must when nothing tells it
+/// which, `-1` at 32 bits is ambiguous and was refused.
+///
+/// The negative half is the point: a *logical* shift of all-ones shifts in
+/// zeros, so `0xFFFFFFFFu >> x` is all-ones only when `x` is zero.
+#[test]
+fn codegen_shift_identities_hold_for_any_count() {
+    let code = r#"
+extern void link_error(void);
+
+__attribute__((noinline)) static void utest(unsigned int x)
+{
+    if (x >> 0 != x) link_error();
+    if (x << 0 != x) link_error();
+    if (0 << x != 0) link_error();
+    if (0 >> x != 0) link_error();
+    if (-1 >> x != -1) link_error();
+    if (~0 >> x != ~0) link_error();
+}
+
+__attribute__((noinline)) static void stest(int x)
+{
+    if (x >> 0 != x) link_error();
+    if (x << 0 != x) link_error();
+    if (0 << x != 0) link_error();
+    if (0 >> x != 0) link_error();
+}
+
+/* The identity must not be claimed where it does not hold. A logical shift
+   of all-ones is all-ones only for a zero count, so these must still be
+   evaluated rather than folded away. */
+__attribute__((noinline)) static int lsr_is_not_asr(unsigned int x)
+{
+    unsigned int all = 0xFFFFFFFFu;
+    return (all >> x) == all;
+}
+
+int main(void)
+{
+    utest(9); utest(0); stest(9); stest(0);
+    if (!lsr_is_not_asr(0)) return 1;
+    if (lsr_is_not_asr(1)) return 2;
+    if (lsr_is_not_asr(31)) return 3;
+    return 0;
+}
+"#;
+    // `link_error` is deliberately never defined, so a surviving call is a
+    // *link* failure -- which is the whole proof. `-O0` is therefore not in
+    // the list: nothing folds there, exactly as the torture test's own
+    // `#ifndef __OPTIMIZE__` fallback definition concedes.
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_shift_identities", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
         );
     }
 }

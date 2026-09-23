@@ -164,7 +164,7 @@ OUT_OF_SCOPE_POST_C17=" pr80692 pr123978 pr124358 pr125291 "
 # A GNU-only attribute: reverse-endian load/store lowering.
 OUT_OF_SCOPE_GNU_ATTR=" 20230630-2 20230630-4 "
 
-# Two more GNU-only features, each named in cc/doc/TODO.md with what it would
+# Two more GNU-only features, each named in cc/DECISIONS.md with what it would
 # take.
 #
 # Nested function definitions: a static chain and executable trampolines.
@@ -176,7 +176,7 @@ OUT_OF_SCOPE_VLA_MEMBER=" 20020412-1 20040308-1 20040423-1 20041218-2 20070919-1
 
 # gcc-specific *behaviour*, as opposed to a gcc-specific feature. Neither is
 # required by C17 and c17 deliberately does something else; see the
-# "Deliberate divergences" table in cc/doc/TODO.md.
+# "Deliberate divergences" table in cc/DECISIONS.md.
 #
 #   20021127-1  gcc folds llabs() and never calls the program's own definition
 #               of llabs. Matching it means a local definition is ignored.

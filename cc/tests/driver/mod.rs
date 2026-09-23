@@ -2048,20 +2048,15 @@ fn driver_fgnu89_inline_flips_which_inline_emits_a_body() {
         (&["-fno-gnu89-inline", "-fgnu89-inline"], "f", "g"),
     ];
 
-    // Both object formats, on whatever host is running this. Mach-O spells
-    // these `_f` and `_g`, so a check written for ELF finds nothing there --
-    // and finds nothing in the negative direction either, so it passes
-    // vacuously. That is exactly how an earlier version of this test passed
-    // on Linux and failed on macOS CI, and cross-compiling means the macOS
-    // shape is exercised before it gets there.
-    let targets: &[(&str, &str)] = &[
-        ("", ""),
-        ("Mach-O", "--target=aarch64-apple-darwin"),
-        ("Mach-O", "--target=x86_64-apple-darwin"),
+    // The host's own format, plus both Darwin triples so the Mach-O spelling
+    // is exercised wherever this runs.
+    let targets = [
+        "",
+        "--target=aarch64-apple-darwin",
+        "--target=x86_64-apple-darwin",
     ];
 
-    for (what, target) in targets {
-        let prefix = if target.is_empty() { "" } else { "_" };
+    for target in targets {
         for (flags, emitted, absent) in cases {
             let mut args: Vec<&str> = flags.to_vec();
             if !target.is_empty() {
@@ -2069,21 +2064,35 @@ fn driver_fgnu89_inline_flips_which_inline_emits_a_body() {
             }
             args.extend(["-S", "-o", "-", &path]);
             let r = run_c17(&args);
-            assert!(r.success, "{what} {flags:?} should compile:\n{}", r.stderr);
-            let defines = |name: &str| {
-                let label = format!("{prefix}{name}:");
-                r.stdout.lines().any(|line| line.trim_start() == label)
-            };
+            assert!(
+                r.success,
+                "{target} {flags:?} should compile:\n{}",
+                r.stderr
+            );
+            let defines = |name: &str| defines_label(&r.stdout, name);
             assert!(
                 defines(emitted),
-                "{what} {flags:?}: `{emitted}` should have an out-of-line body:\n{}",
+                "{target} {flags:?}: `{emitted}` should have an out-of-line body:\n{}",
                 r.stdout
             );
             assert!(
                 !defines(absent),
-                "{what} {flags:?}: `{absent}` should have none:\n{}",
+                "{target} {flags:?}: `{absent}` should have none:\n{}",
                 r.stdout
             );
         }
     }
+}
+
+/// Is `name` defined as a label in this assembly?
+///
+/// The symbol prefix is read off the output rather than assumed: Mach-O
+/// spells every C identifier with a leading underscore, and `main` is in
+/// every program this asks about, so it calibrates the answer. Deciding
+/// from `cfg!(target_os)` is wrong the moment the test names a `--target`,
+/// and deciding it is empty is wrong on a macOS host -- this test has now
+/// been wrong both ways.
+fn defines_label(asm: &str, name: &str) -> bool {
+    let label = format!("{}{name}:", crate::common::asm_prefix(asm, "main"));
+    asm.lines().any(|line| line.trim_start() == label)
 }

@@ -712,6 +712,23 @@ pub fn asm_for_at(prefix: &str, src: &str, extra: &[&str]) -> String {
     std::fs::read_to_string(&s).expect("read asm")
 }
 
+/// The symbol prefix `asm` uses, read off a symbol it is known to define.
+///
+/// Mach-O spells every C identifier with a leading underscore. Reading the
+/// prefix off the output is right both for a test that names a `--target`
+/// and for one compiled for the host; `cfg!(target_os)` is wrong for the
+/// first and a hardcoded `""` is wrong for the second. The
+/// `-fgnu89-inline` test has now been wrong in both directions, each time
+/// passing on Linux and failing only on macOS CI.
+pub fn asm_prefix(asm: &str, defined: &str) -> &'static str {
+    let mangled = format!("_{defined}:");
+    if asm.lines().any(|l| l.trim_start() == mangled) {
+        "_"
+    } else {
+        ""
+    }
+}
+
 /// `name` as the assembler spells it on this host.
 ///
 /// Mach-O prefixes every C identifier with an underscore, so a test that

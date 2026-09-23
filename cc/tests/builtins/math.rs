@@ -633,31 +633,45 @@ int main(void)
 #[test]
 fn builtins_math_narrowing_happens_at_every_level() {
     let src = "double floor(double);\nfloat q(float a) { return floor(a); }\n";
-    // Both object formats from whatever host runs this: Mach-O calls
-    // `_floorf`, and a check spelled for ELF would keep passing there while
-    // saying nothing.
+    // The host's own format, plus both Darwin triples so the Mach-O spelling
+    // is exercised wherever this runs. The prefix is read off each output
+    // rather than assumed -- Mach-O calls `_floorf`, and "floorf" is a
+    // substring of that, so a check spelled for ELF keeps passing there
+    // while its negative half matches nothing at all.
     let targets: [&[&str]; 3] = [
         &[],
         &["--target=aarch64-apple-darwin"],
         &["--target=x86_64-apple-darwin"],
     ];
     for target in targets {
-        let want = if target.is_empty() {
-            "floorf".to_string()
-        } else {
-            "_floorf".to_string()
-        };
         for opt in ["-O0", "-O1", "-O2"] {
             let mut args = vec![opt];
             args.extend_from_slice(target);
             let asm = asm_for_at("math_narrow_level", src, &args);
+            // `q` is the function this source defines, so it calibrates.
+            let p = crate::common::asm_prefix(&asm, "q");
+            // Matched exactly, across all four spellings a call takes here:
+            // `call f@PLT` and `bl f` on ELF, `call _f` and `bl _f` on
+            // Mach-O, which has no PLT syntax. Exactness is also what stops
+            // `floor` matching the `floorf` the narrowing produces.
+            let calls = |name: &str| {
+                let want = format!("{p}{name}");
+                asm.lines().any(|line| {
+                    let t = line.trim_start();
+                    t.strip_prefix("call ")
+                        .or_else(|| t.strip_prefix("bl "))
+                        .is_some_and(|dst| {
+                            dst == want
+                                || dst.strip_prefix(&want).is_some_and(|s| s.starts_with('@'))
+                        })
+                })
+            };
             assert!(
-                asm.contains(&want),
-                "{target:?} at {opt}: the call should be narrowed to {want}:\n{asm}"
+                calls("floorf"),
+                "{target:?} at {opt}: the call should be narrowed to {p}floorf:\n{asm}"
             );
             assert!(
-                !asm.contains(&format!("bl {}\n", want.trim_end_matches('f')))
-                    && !asm.contains(&format!("call {}@", want.trim_end_matches('f'))),
+                !calls("floor"),
                 "{target:?} at {opt}: the wide form must not be called:\n{asm}"
             );
         }

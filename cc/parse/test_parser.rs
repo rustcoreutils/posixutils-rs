@@ -708,6 +708,55 @@ fn test_unary_neg() {
     }
 }
 
+/// Unary `-` and `~` perform the integer promotions on their operand
+/// (C17 6.5.3.3p3, p4), and the conversion has to be in the tree.
+///
+/// Recording only the promoted *result* type left the operand narrow, and
+/// nothing downstream then says how it is widened: `-(signed char)200` was
+/// negated as an eight-bit value moved without a sign, giving -200 where C
+/// says 56.
+#[test]
+fn unary_minus_and_bitnot_convert_their_operand() {
+    for src in [
+        "-(signed char)200",
+        "~(signed char)200",
+        "-(short)9",
+        "-(_Bool)1",
+    ] {
+        let (expr, types, _strings, _symbols) = parse_expr(src).unwrap();
+        match expr.kind {
+            ExprKind::Unary { operand, .. } => {
+                assert_eq!(operand.typ, Some(types.int_id), "{src}: operand type");
+                assert!(
+                    matches!(operand.kind, ExprKind::Cast { cast_type, .. } if cast_type == types.int_id),
+                    "{src}: the promotion must be a conversion in the tree"
+                );
+            }
+            _ => panic!("Expected Unary for {src}"),
+        }
+    }
+}
+
+/// An operand that already has its promoted type gains nothing: the
+/// conversion is the promotion, not a wrapper on every unary operator.
+///
+/// Spelled with literal suffixes rather than casts, because a cast the
+/// source wrote is the same node kind as one the promotion adds -- the
+/// difference this is checking would be invisible.
+#[test]
+fn unary_minus_does_not_convert_what_is_already_promoted() {
+    for src in ["-1", "-1L", "-1u", "-1.5", "~1", "~1UL"] {
+        let (expr, _types, _strings, _symbols) = parse_expr(src).unwrap();
+        match expr.kind {
+            ExprKind::Unary { operand, .. } => assert!(
+                !matches!(operand.kind, ExprKind::Cast { .. }),
+                "{src}: no conversion should be added"
+            ),
+            _ => panic!("Expected Unary for {src}"),
+        }
+    }
+}
+
 #[test]
 fn test_unary_not() {
     let (expr, _types, _strings, _symbols) = parse_expr("!x").unwrap();

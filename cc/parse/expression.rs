@@ -1685,11 +1685,31 @@ impl<'a> Parser<'a> {
     fn promote_unary_operand(&mut self, operand: Expr) -> (Expr, TypeId) {
         let operand = self.promote_bitfield_operand(operand);
         let op_typ = operand.typ.unwrap_or(self.types.int_id);
-        let typ = match self.types.kind(op_typ) {
-            TypeKind::Bool | TypeKind::Char | TypeKind::Short => self.types.int_id,
-            _ => op_typ,
-        };
+        let typ = self.types.integer_promote(op_typ);
+        // The *value* is promoted, not just the type it is computed at. The
+        // conversion used to be left out, on the reasoning that the operand
+        // is already in a wider register -- but nothing in the IR then says
+        // how the narrow value is widened, and the move that does it has no
+        // sign. `-(signed char)200` came out -200 where C says 56, while a
+        // variable operand was right, because loading one knows its type.
+        let operand = self.convert_operand(operand, typ);
         (operand, typ)
+    }
+
+    /// `e` converted to `typ`, or `e` unchanged when it is already that type.
+    fn convert_operand(&mut self, e: Expr, typ: TypeId) -> Expr {
+        if e.typ == Some(typ) {
+            return e;
+        }
+        let pos = e.pos;
+        Self::typed_expr(
+            ExprKind::Cast {
+                cast_type: typ,
+                expr: Box::new(e),
+            },
+            typ,
+            pos,
+        )
     }
 
     /// The width `-x` or `~x` yields: the operand's own. `-` and `~` on a

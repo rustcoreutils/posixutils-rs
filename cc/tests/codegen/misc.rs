@@ -12974,3 +12974,80 @@ int main(void)
         );
     }
 }
+
+/// Unary `-` and `~` perform the integer promotions on their operand
+/// (C17 6.5.3.3p3, p4), and the *value* has to be converted, not just the
+/// result type.
+///
+/// `promote_unary_operand` computed the promoted type and handed the operand
+/// back untouched, so `-(signed char)200` reached the IR as `neg.32` over an
+/// eight-bit value with no extension between them. The backend's move
+/// widens without a sign, which is right for `unsigned char` and silently
+/// wrong for a signed one: the answer was -200 where C says 56.
+///
+/// A variable operand hid it, because loading one already knows the type --
+/// only a narrowing cast applied directly to the operand reaches the shape.
+#[test]
+fn codegen_unary_operators_promote_their_operand() {
+    let code = r#"
+extern void abort(void);
+
+volatile int sink;
+
+int main(void)
+{
+    /* The shape that was wrong: a narrowing cast straight under the
+       operator, with nothing in between to carry the sign. */
+    if (-(signed char) 200 != 56) abort();
+    if (~(signed char) 200 != 55) abort();
+    if (-(signed char) -56 != 56) abort();
+    if (-(short) 40000 != 25536) abort();
+    if (~(short) 40000 != 25535) abort();
+
+    /* The unsigned forms, which were already right and must stay so. */
+    if (-(unsigned char) 200 != -200) abort();
+    if (~(unsigned char) 200 != -201) abort();
+    if (-(unsigned short) 40000 != -40000) abort();
+
+    /* Through a variable, and through a value the optimizer cannot know:
+       all three spellings must agree. */
+    {
+        signed char v = (signed char) 200;
+        sink = 200;
+        signed char r = (signed char) sink;
+        if (-v != 56) abort();
+        if (-r != 56) abort();
+        if (-v != -(signed char) 200) abort();
+        if (~v != ~(signed char) 200) abort();
+    }
+    {
+        short v = (short) 40000;
+        sink = 40000;
+        short r = (short) sink;
+        if (-v != 25536) abort();
+        if (-r != 25536) abort();
+        if (-v != -(short) 40000) abort();
+    }
+
+    /* `_Bool` and plain `char` promote too. Plain `char`'s signedness is the
+       target's business, so this asserts the agreement rather than a number. */
+    if (-(_Bool) 1 != -1) abort();
+    if (~(_Bool) 1 != -2) abort();
+    {
+        sink = 0xEF;
+        char v = (char) sink;
+        if (-(char) 0xEF != -v) abort();
+        if (~(char) 0xEF != ~v) abort();
+    }
+
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_unary_promotion", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}

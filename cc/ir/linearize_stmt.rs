@@ -3315,6 +3315,13 @@ impl VmScopeWalk {
 /// the `const`-object folding gcc performs in a static initializer, and that a
 /// floating subexpression folds in its own format rather than through `f64`.
 impl crate::constexpr::ConstEnv for Linearizer<'_> {
+    /// A static initializer needs an answer; the linearizer's other folds --
+    /// a constant `?:` condition, chiefly -- are optimizations, and one of
+    /// those is exactly the shape `__builtin_constant_p` is written in.
+    fn deferred_constant_p(&self, scope: ConstScope) -> Option<i128> {
+        matches!(scope, ConstScope::StaticInitializer).then_some(0)
+    }
+
     fn types(&self) -> &TypeTable {
         self.types
     }

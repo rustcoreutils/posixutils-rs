@@ -199,6 +199,12 @@ pub enum Opcode {
     /// passed. Replaced with a constant when the enclosing `always_inline`
     /// function is inlined; a survivor is diagnosed, never emitted.
     VaArgPackLen, // Copy va_list
+    /// `__builtin_constant_p`, deferred until propagation has run.
+    ///
+    /// Resolved by `sccp` when it proves the operand constant, and by
+    /// `ir::lower` to 0 otherwise -- which is every case at `-O0`, where
+    /// the optimizer does not run at all.
+    ConstantP,
 
     // Byte-swapping builtins
     Bswap16, // Byte-swap 16-bit value
@@ -423,6 +429,7 @@ impl Opcode {
             Opcode::VaEnd => "va_end",
             Opcode::VaCopy => "va_copy",
             Opcode::VaArgPackLen => "va_arg_pack_len",
+            Opcode::ConstantP => "constant_p",
             Opcode::Bswap16 => "bswap16",
             Opcode::Bswap32 => "bswap32",
             Opcode::Bswap64 => "bswap64",

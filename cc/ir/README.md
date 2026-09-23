@@ -325,6 +325,7 @@ extern_symbols          - symbols needing GOT
 | `constfold.rs` | Evaluating an operation over constants at the operand's own width and signedness, integer and floating alike. Not a pass -- the one place those rules are written, shared by `instcombine` and `sccp` |
 | `instcombine.rs` | Constant folding, algebraic simplification |
 | `constglobal.rs` | Module pre-pass: a load of a `const` global becomes its initializer. Needs no alias or escape analysis -- modifying a `const`-defined object is undefined behaviour (C17 6.7.3p6) |
+| `lower.rs` | φ elimination, and answering any `ConstantP` placeholder `sccp` never reached -- which is all of them at `-O0` |
 | `ifconv.rs` | If-conversion: collapses a short-circuit `&&`/`||` diamond whose arm is safe to speculate into a `Select` |
 | `sccp.rs` | Sparse conditional constant propagation: constants along reachable paths only, and the only thing that folds a branch on a constant condition |
 | `inline.rs` | Function inlining |

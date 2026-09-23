@@ -45,6 +45,22 @@ pub(crate) trait ConstEnv {
     /// answers only in [`ConstScope::StaticInitializer`].
     fn ident_value(&self, sym: SymbolId, scope: ConstScope) -> Option<i128>;
 
+    /// The value of a deferred `__builtin_constant_p`, or `None` where the
+    /// question is better left to the optimizer.
+    ///
+    /// The parser builds that node only for an operand it could not fold, so
+    /// 0 is its honest answer -- and where C *requires* a constant
+    /// expression there has to be one: `__builtin_choose_expr`'s condition,
+    /// an array bound, a `case` label, a static initializer. gcc answers 0 in
+    /// every one of them.
+    ///
+    /// Where a fold is merely an optimization the answer must be withheld,
+    /// or the builtin is resolved before propagation has run and gives the
+    /// wrong one. `linearize_ternary` is the case that matters:
+    /// `__builtin_constant_p(x) ? a : b` is the idiom the builtin exists for,
+    /// and folding its condition here decides it as 0 forever.
+    fn deferred_constant_p(&self, scope: ConstScope) -> Option<i128>;
+
     /// The struct or union a `.`/`->` member lookup should start from, with
     /// typedefs and qualifiers stripped.
     fn struct_of(&self, typ: TypeId) -> TypeId;
@@ -130,6 +146,10 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
         ExprKind::CharLit(c) => Some(*c as i128),
 
         ExprKind::Ident(symbol_id) => env.ident_value(*symbol_id, scope),
+
+        // A deferred `__builtin_constant_p`. Whether it answers at all is
+        // the asker's business: see [`ConstEnv::deferred_constant_p`].
+        ExprKind::ConstantP(_) => env.deferred_constant_p(scope),
 
         // The address of a member of a pointer constant is itself an integer
         // constant; see [`eval_pointer`].

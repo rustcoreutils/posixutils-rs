@@ -233,9 +233,51 @@ pub fn lower_module(module: &mut Module) {
 /// Lower a single function.
 ///
 /// Runs:
-/// 1. Phi elimination
+/// 1. `__builtin_constant_p` placeholders resolved to 0
+/// 2. Phi elimination
 pub fn lower_function(func: &mut Function) {
+    resolve_constant_p(func);
     eliminate_phi_nodes(func);
+    debug_assert!(
+        crate::ir::validate::check_no_placeholders(func).is_ok(),
+        "a deferred placeholder survived lowering, and both backends would \
+         drop it silently: {:?}",
+        crate::ir::validate::check_no_placeholders(func).err()
+    );
+}
+
+/// Answer every `ConstantP` this far down the pipeline with 0.
+///
+/// `sccp` resolves the ones it can prove, and answers 0 itself for an
+/// operand it proves *not* constant. What reaches here is everything it
+/// never looked at -- which is every one of them at `-O0`, where
+/// `opt::optimize_module` returns before the per-function passes run.
+///
+/// This runs unconditionally, and it has to: both backends end their opcode
+/// match in a catch-all that emits nothing, so a survivor would leave its
+/// target undefined rather than fail.
+fn resolve_constant_p(func: &mut Function) {
+    let sites: Vec<(usize, usize)> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(b, bb)| {
+            bb.insns
+                .iter()
+                .enumerate()
+                .filter(|(_, insn)| insn.op == Opcode::ConstantP)
+                .map(move |(i, _)| (b, i))
+        })
+        .collect();
+    if sites.is_empty() {
+        return;
+    }
+    let zero = func.create_const_pseudo(0);
+    for (b, i) in sites {
+        let insn = &mut func.blocks[b].insns[i];
+        insn.op = Opcode::Copy;
+        insn.src = vec![zero];
+    }
 }
 
 #[cfg(test)]
@@ -779,5 +821,38 @@ mod tests {
         let copy_targets: Vec<_> = body_copies.iter().filter_map(|c| c.target).collect();
         assert!(copy_targets.contains(&PseudoId(3)), "Must write to %3");
         assert!(copy_targets.contains(&PseudoId(4)), "Must write to %4");
+    }
+
+    /// Whatever `sccp` never looked at has to be answered here -- which is
+    /// every placeholder at `-O0`, where the optimizer does not run. Both
+    /// backends end their opcode match in a catch-all that emits nothing,
+    /// so a survivor would leave its target undefined rather than fail.
+    #[test]
+    fn lowering_answers_a_leftover_constant_p_with_zero() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("t", types.int_id);
+        func.add_pseudo(Pseudo::arg(PseudoId(0), 0));
+        func.add_pseudo(Pseudo::reg(PseudoId(1), 1));
+        func.next_pseudo = 8;
+
+        let mut b0 = BasicBlock::new(BasicBlockId(0));
+        b0.add_insn(Instruction::new(Opcode::Entry));
+        b0.add_insn(
+            Instruction::new(Opcode::ConstantP)
+                .with_target(PseudoId(1))
+                .with_src(PseudoId(0))
+                .with_type_and_size(types.int_id, 32),
+        );
+        b0.add_insn(Instruction::ret(Some(PseudoId(1))));
+        func.add_block(b0);
+        func.entry = BasicBlockId(0);
+
+        assert!(crate::ir::validate::check_no_placeholders(&func).is_err());
+        lower_function(&mut func);
+
+        let insn = &func.blocks[0].insns[1];
+        assert_eq!(insn.op, Opcode::Copy);
+        assert_eq!(func.const_val(insn.src[0]), Some(0));
+        assert!(crate::ir::validate::check_no_placeholders(&func).is_ok());
     }
 }

@@ -1474,6 +1474,7 @@ bswap-3@-O2
 builtin-bitops-1@-O0
 builtin-bitops-1@-O2
 builtin-constant@-O0
+builtin-constant@-O2
 builtin-prefetch-1@-O0
 builtin-prefetch-1@-O2
 builtin-prefetch-2@-O0

@@ -1028,11 +1028,17 @@ impl Parser<'_> {
                     || self
                         .eval_const_f64(crate::constexpr::ConstScope::Standard, &arg)
                         .is_some();
-                Ok(Self::typed_expr(
-                    ExprKind::IntLit(if is_constant { 1 } else { 0 }),
-                    self.types.int_id,
-                    token_pos,
-                ))
+                // Answering 1 here is final -- nothing later makes a constant
+                // unconstant. Answering 0 is not: gcc decides this *after*
+                // optimization, so `int x = 42; __builtin_constant_p(x)` is 1
+                // at `-O1` and above, and only propagation knows. What the
+                // parser cannot fold is deferred rather than refused.
+                let kind = if is_constant {
+                    ExprKind::IntLit(1)
+                } else {
+                    ExprKind::ConstantP(Box::new(arg))
+                };
+                Ok(Self::typed_expr(kind, self.types.int_id, token_pos))
             })()),
             crate::kw::BUILTIN_EXPECT => Some((|| {
                 // `__builtin_expect(expr, c)` is a branch-prediction hint, and

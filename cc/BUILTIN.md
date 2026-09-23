@@ -52,7 +52,7 @@ differs from gcc, the row says so rather than leaving the reader to find out.
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_constant_p(expr)` | Returns 1 if expr is compile-time constant |
+| `__builtin_constant_p(expr)` | 1 if `expr` is a compile-time constant. **Level-dependent, as in gcc**: answered after propagation has run, so a local holding a constant is one at `-O1` and above and is not with the optimizer off. A literal is 1 at every level. The argument is never evaluated, whatever the answer |
 | `__builtin_types_compatible_p(t1, t2)` | Returns 1 if types are compatible (ignores qualifiers) |
 | `__builtin_classify_type(expr)` | A code for the argument's type family: 1 integer, 5 pointer, 8 real floating, 9 complex, 12 struct, 13 union. The usual conversions run first, so a `char`, an enumeration constant and a `_Bool` all answer 1, and an array, a function and a string literal all answer 5. The argument is not evaluated |
 | `__builtin_choose_expr(c, a, b)` | `a` or `b` by the constant `c`; the untaken arm is not evaluated and need not even type-check |

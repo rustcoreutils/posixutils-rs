@@ -1624,6 +1624,9 @@ impl<'a> Linearizer<'a> {
             // nothing. `VaArgPack` is not a value at all -- the call it sits
             // in carries it -- but it is no less pure for that.
             ExprKind::VaArgPack | ExprKind::VaArgPackLen => true,
+            // Answers a question *about* its operand without evaluating it:
+            // an impure one is never linearized at all (see below).
+            ExprKind::ConstantP(_) => true,
             // Literals are always pure
             ExprKind::IntLit(_)
             | ExprKind::Int128Lit(_)
@@ -5798,6 +5801,29 @@ impl<'a> Linearizer<'a> {
                     "'__builtin_va_arg_pack' may only appear as the last argument of a call",
                 );
                 self.emit_const(0, self.types.int_id)
+            }
+            // `__builtin_constant_p`, for an operand the parser could not
+            // fold. gcc answers it after optimization, so it is deferred to
+            // `sccp` -- and to `ir::lower`, which answers 0 for whatever is
+            // left, including everything at `-O0`.
+            //
+            // The builtin does not evaluate its argument, so an operand with
+            // side effects is answered 0 outright rather than linearized. A
+            // pure one costs nothing: its computation is dead once the
+            // placeholder folds, and `dce` collects it.
+            ExprKind::ConstantP(inner) => {
+                if !self.is_pure_expr(inner) {
+                    return self.emit_const(0, self.types.int_id);
+                }
+                let operand = self.linearize_expr(inner);
+                let result = self.alloc_reg_pseudo();
+                self.emit(
+                    Instruction::new(Opcode::ConstantP)
+                        .with_target(result)
+                        .with_src(operand)
+                        .with_type_and_size(self.types.int_id, 32),
+                );
+                result
             }
             // Resolved when the enclosing function is inlined, since it counts
             // the *caller's* arguments. A leftover is diagnosed after the

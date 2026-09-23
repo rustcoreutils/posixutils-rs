@@ -413,6 +413,17 @@ impl Solver {
                 }
             }
 
+            // `__builtin_constant_p`, which asks this pass its own question:
+            // is the operand a constant once propagation has run? `Top` is
+            // not yet an answer -- a value still `Top` at fixpoint is in
+            // unreachable code, and `ir::lower` answers 0 for whatever is
+            // left over.
+            Opcode::ConstantP => match insn.src.first().map(|s| self.get(*s)) {
+                Some(Val::Const(_)) => Val::Const(1),
+                Some(Val::Top) => Val::Top,
+                _ => Val::Const(0),
+            },
+
             Opcode::Neg | Opcode::Not | Opcode::Sext | Opcode::Zext | Opcode::Trunc => {
                 match insn.src.first().map(|s| self.get(*s)) {
                     Some(Val::Const(a)) => match eval_unop(insn, a) {
@@ -1183,5 +1194,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    // __builtin_constant_p
+    //
+    // The one opcode that asks this pass its own question, so its answer is
+    // the lattice value of its operand rather than a computation over it.
+
+    /// A function with `ConstantP` over a pseudo of the given kind; returns
+    /// the constant it folded to, or `None` if it did not fold.
+    fn constant_p_over(operand: Pseudo) -> Option<i128> {
+        let types = host_types();
+        let mut func = Function::new("t", types.int_id);
+        let operand_id = operand.id;
+        func.add_pseudo(operand);
+        func.add_pseudo(Pseudo::reg(PseudoId(2), 2));
+        func.next_pseudo = 8;
+
+        let mut b0 = BasicBlock::new(BasicBlockId(0));
+        b0.add_insn(Instruction::new(Opcode::Entry));
+        b0.add_insn(
+            Instruction::new(Opcode::ConstantP)
+                .with_target(PseudoId(2))
+                .with_src(operand_id)
+                .with_type_and_size(types.int_id, 32),
+        );
+        b0.add_insn(Instruction::ret(Some(PseudoId(2))));
+        func.add_block(b0);
+        func.entry = BasicBlockId(0);
+
+        run(&mut func, &types);
+        let insn = &func.blocks[0].insns[1];
+        if insn.op != Opcode::Copy {
+            return None;
+        }
+        func.const_val(insn.src[0])
+    }
+
+    #[test]
+    fn constant_p_answers_one_for_a_proved_constant() {
+        assert_eq!(constant_p_over(Pseudo::val(PseudoId(1), 42)), Some(1));
+    }
+
+    /// An argument is never a constant, and saying so is the whole point:
+    /// `__builtin_constant_p` guards the branch a program takes when the
+    /// value is *not* known.
+    #[test]
+    fn constant_p_answers_zero_for_an_unknown_value() {
+        assert_eq!(constant_p_over(Pseudo::arg(PseudoId(1), 0)), Some(0));
     }
 }

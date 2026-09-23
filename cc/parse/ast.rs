@@ -442,6 +442,15 @@ pub enum ExprKind {
     /// stands for. Constant at the call site, but not before inlining.
     VaArgPackLen,
 
+    /// `__builtin_constant_p(expr)` that the parser could not answer 1.
+    ///
+    /// gcc answers this *after* optimization, not on the expression as
+    /// written: a local holding a constant is one, and only propagation
+    /// knows. The parser still answers 1 for anything it can fold itself,
+    /// so this carries only the cases that might yet become constant. It
+    /// resolves to 0 if nothing proves otherwise, which is what `-O0` gets.
+    ConstantP(Box<Expr>),
+
     /// __builtin_va_copy(dest, src)
     /// Copies a va_list
     VaCopy {

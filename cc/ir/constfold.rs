@@ -140,6 +140,40 @@ pub(crate) fn get_cmp_info(op: Opcode) -> Option<CmpInfo> {
     }
 }
 
+/// Which orderings of its two operands make a comparison true.
+///
+/// Every integer comparison is a subset of `{less, equal, greater}`, and the
+/// opcode names which subset. Two comparisons over the *same* operand pair can
+/// then be answered without knowing the operands at all: `a && b` is never
+/// true when their subsets are disjoint, and `a || b` is always true when
+/// together they cover all three.
+pub(crate) const CMP_LT: u8 = 1;
+pub(crate) const CMP_EQ: u8 = 2;
+pub(crate) const CMP_GT: u8 = 4;
+/// Every ordering: a comparison that is always true.
+pub(crate) const CMP_ALL: u8 = CMP_LT | CMP_EQ | CMP_GT;
+
+/// The orderings `op` is true for, or `None` if it is not a comparison.
+pub(crate) fn cmp_mask(op: Opcode) -> Option<u8> {
+    Some(match op {
+        Opcode::SetEq => CMP_EQ,
+        Opcode::SetNe => CMP_LT | CMP_GT,
+        Opcode::SetLt | Opcode::SetB => CMP_LT,
+        Opcode::SetLe | Opcode::SetBe => CMP_LT | CMP_EQ,
+        Opcode::SetGt | Opcode::SetA => CMP_GT,
+        Opcode::SetGe | Opcode::SetAe => CMP_GT | CMP_EQ,
+        _ => return None,
+    })
+}
+
+/// The same mask read with the operands the other way round: `a < b` and
+/// `b < a` are the same comparison with `less` and `greater` exchanged.
+pub(crate) fn mirror_mask(mask: u8) -> u8 {
+    (mask & CMP_EQ)
+        | if mask & CMP_LT != 0 { CMP_GT } else { 0 }
+        | if mask & CMP_GT != 0 { CMP_LT } else { 0 }
+}
+
 /// The width a `Set*` reads its operands at.
 ///
 /// `insn.size` is the width of the *result* at one of the four `Set*`

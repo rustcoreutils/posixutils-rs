@@ -14,6 +14,7 @@
 mod constfold;
 pub mod dce;
 pub mod dominate;
+pub mod ifconv;
 pub mod inline;
 pub mod instcombine;
 pub mod linearize;

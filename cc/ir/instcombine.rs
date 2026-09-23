@@ -25,7 +25,8 @@
 //
 
 use super::constfold::{
-    at_width, cmp_operand_width, eval_binop, eval_unop, get_cmp_info, unambiguous_at,
+    at_width, cmp_mask, cmp_operand_width, eval_binop, eval_unop, get_cmp_info, mirror_mask,
+    unambiguous_at, CMP_ALL,
 };
 use super::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeId;
@@ -192,6 +193,86 @@ impl ConstMap {
     }
 }
 
+/// What is known about a pseudo that holds a comparison's result.
+///
+/// Built once per run, like `ConstMap`, and sound for the same reason: SSA
+/// single-def makes "the comparison that defines %n" a fact about the whole
+/// function rather than about a program point.
+#[derive(Clone, Copy)]
+struct CmpFact {
+    /// Which of less/equal/greater make it true.
+    mask: u8,
+    lhs: PseudoId,
+    rhs: PseudoId,
+    /// A signed and an unsigned comparison over one pair are *not*
+    /// comparable: `x < y` and `x > y` read signed are not complementary with
+    /// the unsigned forms.
+    signed: bool,
+    width: u32,
+}
+
+/// Every pseudo defined by an integer comparison.
+struct CmpFacts {
+    facts: HashMap<PseudoId, CmpFact>,
+}
+
+impl CmpFacts {
+    fn new(func: &Function, consts: &ConstMap) -> Self {
+        let mut facts = HashMap::new();
+        for bb in &func.blocks {
+            for insn in &bb.insns {
+                let (Some(target), Some(mask)) = (insn.target, cmp_mask(insn.op)) else {
+                    continue;
+                };
+                if insn.src.len() != 2 {
+                    continue;
+                }
+                let width = cmp_operand_width(insn);
+                let signed = get_cmp_info(insn.op).map(|i| i.signed).unwrap_or(true);
+                facts.insert(
+                    target,
+                    CmpFact {
+                        mask,
+                        lhs: consts.root(insn.src[0], width),
+                        rhs: consts.root(insn.src[1], width),
+                        signed,
+                        width,
+                    },
+                );
+            }
+        }
+        Self { facts }
+    }
+
+    fn get(&self, id: PseudoId) -> Option<CmpFact> {
+        self.facts.get(&id).copied()
+    }
+
+    /// The fact for whatever `id` ultimately copies from.
+    ///
+    /// Needed because stripping the boolification leaves a `Copy` of the
+    /// comparison in its place, and a later rule asking about that copy would
+    /// otherwise learn nothing.
+    fn get_through(&self, consts: &ConstMap, id: PseudoId, width: u32) -> Option<CmpFact> {
+        self.get(consts.root(id, width))
+    }
+
+    /// `other`'s mask expressed over `base`'s operand order, or `None` when
+    /// the two are not comparisons of the same pair in the same signedness.
+    fn aligned_mask(&self, base: CmpFact, other: CmpFact) -> Option<u8> {
+        if base.signed != other.signed || base.width != other.width {
+            return None;
+        }
+        if base.lhs == other.lhs && base.rhs == other.rhs {
+            return Some(other.mask);
+        }
+        if base.lhs == other.rhs && base.rhs == other.lhs {
+            return Some(mirror_mask(other.mask));
+        }
+        None
+    }
+}
+
 // Simplification Result
 
 /// Result of trying to simplify an instruction
@@ -214,10 +295,11 @@ pub fn run(func: &mut Function) -> bool {
     // Collect all simplifications first (to avoid borrow conflicts)
     let mut simplifications: Vec<(usize, usize, Simplification)> = Vec::new();
     let mut consts = ConstMap::new(func);
+    let facts = CmpFacts::new(func, &consts);
 
     for (bb_idx, bb) in func.blocks.iter().enumerate() {
         for (insn_idx, insn) in bb.insns.iter().enumerate() {
-            let result = try_simplify(insn, &consts);
+            let result = try_simplify(insn, &consts, &facts);
             if let Some(target) = insn.target {
                 consts.record(target, insn.size, &result);
             }
@@ -254,7 +336,7 @@ pub fn run(func: &mut Function) -> bool {
 // Simplification Dispatch
 
 /// Try to simplify an instruction. Returns the simplification to apply.
-fn try_simplify(insn: &Instruction, consts: &ConstMap) -> Simplification {
+fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &CmpFacts) -> Simplification {
     match insn.op {
         // Integer arithmetic
         Opcode::Add => simplify_add(insn, consts),
@@ -279,7 +361,10 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap) -> Simplification {
         | Opcode::SetB
         | Opcode::SetBe
         | Opcode::SetA
-        | Opcode::SetAe => simplify_comparison(insn, consts),
+        | Opcode::SetAe => simplify_comparison(insn, consts, facts),
+
+        // A short-circuit `&&`/`||` after if-conversion.
+        Opcode::Select => simplify_select(insn, consts, facts),
 
         // Unary
         Opcode::Neg => simplify_neg(insn, consts),
@@ -604,7 +689,7 @@ fn simplify_bitwise(insn: &Instruction, consts: &ConstMap) -> Simplification {
 // Comparison Simplifications
 
 /// Unified comparison simplification for all SetXX opcodes
-fn simplify_comparison(insn: &Instruction, consts: &ConstMap) -> Simplification {
+fn simplify_comparison(insn: &Instruction, consts: &ConstMap, facts: &CmpFacts) -> Simplification {
     let info = match get_cmp_info(insn.op) {
         Some(i) => i,
         None => return Simplification::None,
@@ -617,6 +702,21 @@ fn simplify_comparison(insn: &Instruction, consts: &ConstMap) -> Simplification 
     let src1 = insn.src[0];
     let src2 = insn.src[1];
     let width = cmp_operand_width(insn);
+
+    // `(a < b) != 0` is `a < b`. A comparison already yields 0 or 1, so the
+    // boolification the front end wraps around every `&&`/`||` operand is a
+    // no-op -- and an opaque one: it leaves the result of a comparison
+    // *against zero*, which hides the operand pair the comparison was
+    // actually about.
+    if insn.op == Opcode::SetNe {
+        for (bool_side, zero_side) in [(src1, src2), (src2, src1)] {
+            if consts.get(zero_side) == Some(0)
+                && facts.get_through(consts, bool_side, width).is_some()
+            {
+                return Simplification::CopyFrom(bool_side);
+            }
+        }
+    }
 
     // Identity: x op x -> identity_result (comparison result is always i32/i64, never i128)
     //
@@ -636,6 +736,60 @@ fn simplify_comparison(insn: &Instruction, consts: &ConstMap) -> Simplification 
         return fold_with(insn, a, b);
     }
 
+    Simplification::None
+}
+
+/// `select(c, t, f)` where the arms make it a short-circuit `&&` or `||`.
+///
+/// If-conversion turns `a && b` into `select(a, b, 0)` and `a || b` into
+/// `select(a, 1, b)`. When both `a` and `b` compare the *same* operand pair,
+/// the answer needs nothing about the operands: `&&` is never true when their
+/// orderings are disjoint, and `||` is always true when together they cover
+/// less, equal and greater.
+///
+/// `(x == y) && (x != y)` is the first; `(x >= y) || (x < y)` the second. The
+/// operands may be written either way round -- `(x < y) && (y < x)` is also
+/// never true -- which `aligned_mask` handles by mirroring.
+fn simplify_select(insn: &Instruction, consts: &ConstMap, facts: &CmpFacts) -> Simplification {
+    if insn.src.len() != 3 {
+        return Simplification::None;
+    }
+    let (cond, t, f) = (insn.src[0], insn.src[1], insn.src[2]);
+
+    // A constant condition needs no facts at all.
+    if let Some(c) = consts.get(cond) {
+        return Simplification::CopyFrom(if c != 0 { t } else { f });
+    }
+    // Both arms the same value, whatever the condition.
+    let width = insn.size.max(1);
+    if consts.root(t, width) == consts.root(f, width) {
+        return Simplification::CopyFrom(t);
+    }
+
+    let Some(c_fact) = facts.get_through(consts, cond, width) else {
+        return Simplification::None;
+    };
+
+    // `a && b`: false on the `a`-false edge.
+    if consts.get(f) == Some(0) {
+        if let Some(other) = facts.get_through(consts, t, width) {
+            if let Some(mask) = facts.aligned_mask(c_fact, other) {
+                if c_fact.mask & mask == 0 {
+                    return fold_to_zero();
+                }
+            }
+        }
+    }
+    // `a || b`: true on the `a`-true edge.
+    if consts.get(t) == Some(1) {
+        if let Some(other) = facts.get_through(consts, f, width) {
+            if let Some(mask) = facts.aligned_mask(c_fact, other) {
+                if c_fact.mask | mask == CMP_ALL {
+                    return fold_to_const(1);
+                }
+            }
+        }
+    }
     Simplification::None
 }
 
@@ -1968,5 +2122,137 @@ mod tests {
             None,
             "the chain narrowed to 32; 64 was never carried"
         );
+    }
+    /// Two comparisons of one operand pair answer each other without knowing
+    /// the operands: disjoint orderings can never both hold, and exhaustive
+    /// ones always leave at least one holding.
+    #[test]
+    fn test_disjoint_relational_pair_folds_to_zero() {
+        // select(x == y, x != y, 0)  ->  0
+        assert_eq!(select_over_pair(Opcode::SetEq, Opcode::SetNe, 0), Some(0));
+        // select(x < y, x > y, 0)    ->  0
+        assert_eq!(select_over_pair(Opcode::SetLt, Opcode::SetGt, 0), Some(0));
+    }
+
+    #[test]
+    fn test_exhaustive_relational_pair_folds_to_one() {
+        // select(x == y, 1, x != y)  ->  1
+        assert_eq!(select_over_pair(Opcode::SetEq, Opcode::SetNe, 1), Some(1));
+        // select(x >= y, 1, x < y)   ->  1
+        assert_eq!(select_over_pair(Opcode::SetGe, Opcode::SetLt, 1), Some(1));
+    }
+
+    /// Overlapping but not exhaustive: nothing is decided.
+    #[test]
+    fn test_overlapping_relational_pair_does_not_fold() {
+        // select(x <= y, x >= y, 0): both hold when x == y.
+        assert_eq!(select_over_pair(Opcode::SetLe, Opcode::SetGe, 0), None);
+        // select(x < y, 1, x > y): neither holds when x == y.
+        assert_eq!(select_over_pair(Opcode::SetLt, Opcode::SetGt, 1), None);
+    }
+
+    /// A signed and an unsigned comparison of one pair are not each other's
+    /// complements, so their orderings must not be combined.
+    #[test]
+    fn test_signed_and_unsigned_are_not_combined() {
+        // `x < y` signed with `x >= y` unsigned would look exhaustive.
+        assert_eq!(select_over_pair(Opcode::SetLt, Opcode::SetAe, 1), None);
+    }
+
+    /// `(x < y) && (y < x)`: the same disjointness with the operands the
+    /// other way round.
+    #[test]
+    fn test_mirrored_operands_are_recognized() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_test_func_with_insns(
+            vec![
+                Instruction::binop(
+                    Opcode::SetLt,
+                    PseudoId(2),
+                    PseudoId(0),
+                    PseudoId(1),
+                    types.int_id,
+                    32,
+                ),
+                // operands swapped
+                Instruction::binop(
+                    Opcode::SetLt,
+                    PseudoId(3),
+                    PseudoId(1),
+                    PseudoId(0),
+                    types.int_id,
+                    32,
+                ),
+                Instruction::select(
+                    PseudoId(5),
+                    PseudoId(2),
+                    PseudoId(3),
+                    PseudoId(4),
+                    types.int_id,
+                    32,
+                ),
+            ],
+            vec![
+                Pseudo::arg(PseudoId(0), 0),
+                Pseudo::arg(PseudoId(1), 1),
+                Pseudo::reg(PseudoId(2), 2),
+                Pseudo::reg(PseudoId(3), 3),
+                Pseudo::val(PseudoId(4), 0),
+                Pseudo::reg(PseudoId(5), 5),
+            ],
+        );
+        assert!(run(&mut func));
+        let sel = &func.blocks[0].insns[3];
+        assert_eq!(sel.op, Opcode::Copy);
+        assert_eq!(func.const_val(sel.src[0]), Some(0));
+    }
+
+    /// `select(c, t, f)` with `c` and one arm comparing `%0` against `%1`,
+    /// and the other arm the constant `other`. Returns the folded constant,
+    /// or `None` when it did not fold.
+    fn select_over_pair(cond_op: Opcode, arm_op: Opcode, other: i128) -> Option<i128> {
+        let types = TypeTable::new(&Target::host());
+        // `other == 0` is `a && b`, so the comparison is the *true* arm;
+        // `other == 1` is `a || b`, so it is the false arm.
+        let (t, f) = if other == 0 {
+            (PseudoId(3), PseudoId(4))
+        } else {
+            (PseudoId(4), PseudoId(3))
+        };
+        let mut func = make_test_func_with_insns(
+            vec![
+                Instruction::binop(
+                    cond_op,
+                    PseudoId(2),
+                    PseudoId(0),
+                    PseudoId(1),
+                    types.int_id,
+                    32,
+                ),
+                Instruction::binop(
+                    arm_op,
+                    PseudoId(3),
+                    PseudoId(0),
+                    PseudoId(1),
+                    types.int_id,
+                    32,
+                ),
+                Instruction::select(PseudoId(5), PseudoId(2), t, f, types.int_id, 32),
+            ],
+            vec![
+                Pseudo::arg(PseudoId(0), 0),
+                Pseudo::arg(PseudoId(1), 1),
+                Pseudo::reg(PseudoId(2), 2),
+                Pseudo::reg(PseudoId(3), 3),
+                Pseudo::val(PseudoId(4), other),
+                Pseudo::reg(PseudoId(5), 5),
+            ],
+        );
+        run(&mut func);
+        let sel = &func.blocks[0].insns[3];
+        if sel.op != Opcode::Copy {
+            return None;
+        }
+        func.const_val(sel.src[0])
     }
 }

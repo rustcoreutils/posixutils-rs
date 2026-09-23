@@ -12571,3 +12571,124 @@ int main(void)
         );
     }
 }
+
+/// Two comparisons of the same operand pair answer each other.
+///
+/// `&&` and `||` lower to a diamond because C forbids evaluating the right
+/// operand once the left has decided. When evaluating it anyway cannot be
+/// observed, if-conversion collapses the diamond into a `select`, and the two
+/// relationals end up side by side where a peephole can compare their
+/// orderings: `&&` is never true when they are disjoint, `||` always true when
+/// together they cover less, equal and greater.
+///
+/// Operands written the other way round count: `(x < y) && (y < x)` is the
+/// same disjointness with the mask mirrored.
+#[test]
+fn codegen_relational_pairs_over_one_operand_pair_fold() {
+    let code = r#"
+extern void link_error0(void);
+extern void link_error1(void);
+
+__attribute__((noinline)) static void never(int x, int y)
+{
+    if ((x == y) && (x != y)) link_error0();
+    if ((x < y) && (x > y)) link_error0();
+    if ((x < y) && (y < x)) link_error0();
+    if ((x <= y) && (y < x)) link_error0();
+}
+
+__attribute__((noinline)) static void always(int x, int y)
+{
+    if ((x == y) || (x != y)) { } else link_error1();
+    if ((x >= y) || (x < y)) { } else link_error1();
+    if ((x <= y) || (y < x)) { } else link_error1();
+}
+
+/* Signed and unsigned comparisons of one pair are not each other's
+   complements. Read without regard to signedness these two orderings would
+   be exhaustive -- less, together with greater-or-equal -- and the whole
+   thing would fold to 1. It must not. */
+__attribute__((noinline)) static int mixed(int x, int y)
+{
+    return ((x < y) || ((unsigned)x >= (unsigned)y)) ? 1 : 0;
+}
+
+int main(void)
+{
+    never(0, 0); never(1, 2); never(4, 3);
+    always(0, 0); always(1, 2); always(4, 3);
+    /* Signed says -1 < 1, so the first arm carries it. */
+    if (!mixed(-1, 1)) return 1;
+    /* The case that proves it did not fold: signed says 1 < -1 is false, and
+       unsigned says 1 >= 0xFFFFFFFF is false too, so the answer is 0. A fold
+       that ignored signedness would have answered 1. */
+    if (mixed(1, -1)) return 2;
+    return 0;
+}
+"#;
+    // `link_error0`/`link_error1` are never defined, so a surviving call is a
+    // link failure. `-O0` folds nothing, exactly as the torture test's own
+    // `#ifndef __OPTIMIZE__` fallback concedes.
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_relational_pairs", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// If-conversion must not make the right operand of `&&` run when the left
+/// already decided.
+///
+/// This is the guarantee C makes and the reason the diamond exists at all.
+/// Collapsing one whose arm calls a function, touches memory, or can trap
+/// would be a miscompile that only shows up when the guard was load-bearing --
+/// which is the usual reason the guard was written.
+#[test]
+fn codegen_short_circuit_still_short_circuits() {
+    let code = r#"
+#include <stdlib.h>
+
+int calls;
+__attribute__((noinline)) static int bump(void) { calls++; return 1; }
+
+volatile int zero = 0;
+volatile int one = 1;
+
+int main(void)
+{
+    /* A call on the right of && must not run when the left is false. */
+    if (zero && bump()) return 1;
+    if (calls != 0) return 2;
+    /* ...and must when it is true. */
+    if (!(one && bump())) return 3;
+    if (calls != 1) return 4;
+
+    /* The || mirror. */
+    if (!(one || bump())) return 5;
+    if (calls != 1) return 6;
+    if (!(zero || bump())) return 7;
+    if (calls != 2) return 8;
+
+    /* A division guarded by its own divisor must not be speculated: if the
+       right operand ran unconditionally this traps. */
+    { int d = zero; if (d != 0 && (100 / d) == 1) return 9; }
+
+    /* A load guarded by a null check, likewise. */
+    { int *p = (int *)0; if (p != 0 && *p == 0) return 10; }
+
+    /* Side effects in the right operand happen exactly once. */
+    { int n = 0; int r = (one && (n++, 1)); if (!r || n != 1) return 11; }
+
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_short_circuit_guard", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}

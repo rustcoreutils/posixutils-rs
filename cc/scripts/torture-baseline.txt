@@ -1503,6 +1503,7 @@ compare-1@-O2
 compare-2@-O0
 compare-2@-O2
 compare-3@-O0
+compare-3@-O2
 complex-1@-O0
 complex-1@-O2
 complex-2@-O0

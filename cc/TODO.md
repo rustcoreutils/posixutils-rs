@@ -124,7 +124,10 @@ What exists today, and why the pass order is what it is, is in
 
 #### CFG Simplification
 
-Convert constant branches to unconditional jumps. Merge simple blocks. Remove jumps-to-jumps.
+Merge simple blocks. Remove jumps-to-jumps. Converting a constant branch to an
+unconditional jump is done, by `sccp`; collapsing a short-circuit diamond is
+done, by `ifconv`. What is left is the block-level tidying neither of those
+does, which is what keeps a collapsed diamond's now-empty predecessor around.
 
 #### Copy Propagation & SSA Cleanup
 

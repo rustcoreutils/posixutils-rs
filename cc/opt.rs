@@ -10,6 +10,7 @@
 //
 
 use crate::ir::dce;
+use crate::ir::ifconv;
 use crate::ir::inline;
 use crate::ir::instcombine;
 use crate::ir::sccp;
@@ -274,11 +275,15 @@ fn optimize_function(func: &mut Function) {
         // `dce` last, and this ordering is load-bearing: SCCP removes the
         // dead edge but deletes no block, and leaves the `PhiSource` of a
         // folded phi for `dce` to collect.
+        // If-conversion first: it turns a short-circuit diamond into a
+        // `Select` in one block, which is what makes the two relationals
+        // inside it comparable at all.
+        let ifc_changed = ifconv::run(func);
         let sccp_changed = sccp::run(func);
         let ic_changed = instcombine::run(func);
         let dce_changed = dce::run(func);
 
-        if !sccp_changed && !ic_changed && !dce_changed {
+        if !ifc_changed && !sccp_changed && !ic_changed && !dce_changed {
             break;
         }
     }

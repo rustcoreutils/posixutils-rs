@@ -12249,3 +12249,142 @@ fn codegen_over_aligned_frame_keeps_no_local_at_an_rbp_displacement() {
         );
     }
 }
+
+/// Sparse conditional constant propagation: constants follow the *reachable*
+/// paths, so a branch proved not taken takes its whole arm with it.
+///
+/// The half that matters is the negative half. A pass that folds a branch it
+/// has not proved dead deletes side effects, which is how a DCE change once
+/// broke every `subprocess.run` in CPython -- so the loop counter, the
+/// `volatile` read, the opaque guard on a `_exit`, and the computed goto are
+/// the point of this test, not the folds above them.
+#[test]
+fn codegen_sccp_folds_only_what_it_proves() {
+    let code = r#"
+#include <unistd.h>
+extern void link_error(void);
+
+int seen;
+__attribute__((noinline)) static void note(int v) { seen += v; }
+
+int main(int argc, char **argv)
+{
+    /* A constant condition takes its dead arm with it, including the call
+       to a function that is never defined -- so this fails to *link* rather
+       than to run if the fold does not happen. */
+    if (0) link_error();
+
+    /* A value that is constant only once the branch above it has folded. */
+    int x; if (1) x = 3; else x = 4;
+    if (x != 3) link_error();
+
+    /* A switch on a constant, with a GNU range arm and a default. */
+    switch (2) {
+    case 1: link_error(); break;
+    case 3 ... 9: link_error(); break;
+    case 2: break;
+    default: link_error();
+    }
+    switch (40) {
+    case 1: link_error(); break;
+    case 30 ... 50: break;
+    default: link_error();
+    }
+    switch (99) {
+    case 1: link_error(); break;
+    default: break;
+    }
+
+    /* `?:` on a constant condition. */
+    if ((1 ? 11 : 22) != 11) return 1;
+    if ((0 ? 11 : 22) != 22) return 2;
+
+    /* --- and now the things that must NOT fold --- */
+
+    /* A loop counter is not its initial value. */
+    int s = 0; for (int i = 0; i < 5; i++) s += i;
+    if (s != 10) return 3;
+
+    /* A volatile read is not a constant however it was stored. */
+    volatile int z = 0; z = 1;
+    if (!z) return 4;
+
+    /* An opaque guard on a noreturn call: the arm does real work before
+       `_exit`, and folding past it is the shape that broke CPython. */
+    if (argc > 99) { note(1); _exit(77); }
+
+    /* A computed goto reaches a block with no CFG edge into it. */
+    void *tbl[2] = { &&a, &&b };
+    goto *tbl[argc > 1 ? 1 : 0];
+a:  note(2); goto done;
+b:  note(4); goto done;
+done:
+    if (seen != 2) return 5;
+
+    /* A phi whose arms genuinely differ. */
+    int q; if (argc > 1) q = 7; else q = 9;
+    if (q != 9) return 6;
+
+    /* Signed shift identities must keep their sign. */
+    if ((-1 >> 1) != -1) return 7;
+    /* Unsigned wraparound is not undefined and must fold to the wrapped
+       value, not to the mathematical one. */
+    { unsigned u = 0u - 1u; if (u != 4294967295u) return 8; }
+
+    (void)argv;
+    return 0;
+}
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("codegen_sccp_folds", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// The dead arm goes even when it is the *only* thing that would have made
+/// the program link, and the program still runs correctly.
+///
+/// Separate from the test above because it must also pass at `-O0`, where
+/// SCCP does not run at all: `link_error` is defined here, so nothing depends
+/// on the fold happening, only on the answer being right either way.
+#[test]
+fn codegen_sccp_agrees_with_the_unoptimized_answer() {
+    let code = r#"
+int calls;
+static int side(int v) { calls++; return v; }
+
+int main(void)
+{
+    int total = 0;
+
+    /* Every arm here is decided at compile time, but the *answers* must be
+       the same as running it. */
+    if (2 + 2 == 4) total += 1; else total += 100;
+    if (3 > 7) total += 100; else total += 2;
+    total += (5 & 3) == 1 ? 4 : 100;
+    total += (1 << 3) == 8 ? 8 : 100;
+    total += (7 % 3) == 1 ? 16 : 100;
+    total += (-8 / 2) == -4 ? 32 : 100;
+
+    /* A call in a dead arm must not run. */
+    if (0) side(1);
+    if (calls != 0) return 1;
+
+    /* A call in a live arm must. */
+    if (1) side(1);
+    if (calls != 1) return 2;
+
+    return total == 63 ? 0 : 3;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("codegen_sccp_answers", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}

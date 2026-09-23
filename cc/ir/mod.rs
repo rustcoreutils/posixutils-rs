@@ -1795,6 +1795,16 @@ impl Function {
     }
 
     /// Get a block by ID
+    /// Where `id` sits in `blocks`.
+    ///
+    /// For a pass that needs the *index* rather than the block -- to index
+    /// `blocks` again later, or to avoid re-borrowing. Answered from the same
+    /// map `get_block` uses, so a linear scan is never the right way to find
+    /// one: a pass that scans per edge is quadratic on a large function.
+    pub fn block_index(&self, id: BasicBlockId) -> Option<usize> {
+        self.block_idx.get(&id).copied()
+    }
+
     pub fn get_block(&self, id: BasicBlockId) -> Option<&BasicBlock> {
         self.block_idx
             .get(&id)

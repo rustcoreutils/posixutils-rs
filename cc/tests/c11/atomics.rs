@@ -769,6 +769,7 @@ struct Odd { char a, b, c; };  /*  3 bytes: under it, but not a machine width */
 _Atomic struct Big gb;
 _Atomic struct Odd go;
 _Atomic long double ld;
+_Atomic double _Complex gc;
 
 int main(void) {
     struct Big vb = { 1, 2, 3 };
@@ -784,11 +785,11 @@ int main(void) {
     ld = 2.5L;
     if ((double)ld != 2.5) return 3;
 
-    /* `_Atomic double _Complex` is deliberately absent: assigning to a
-       complex *global* segfaults with or without _Atomic, on this branch and
-       on main alike. That is a separate pre-existing defect, recorded in
-       cc/TODO.md, and folding it in here would make this test fail for a
-       reason it is not about. */
+    /* Complex, which is neither a machine width nor lock-free. gcc cannot
+       link this at all without `-latomic`. */
+    gc = 1.5 + 2.5i;
+    double _Complex rc = gc;
+    if (__real__ rc != 1.5 || __imag__ rc != 2.5) return 4;
 
     return 0;
 }

@@ -224,7 +224,7 @@ impl Solver {
         if !self.executable_block.insert(id) {
             return;
         }
-        let Some(idx) = func.blocks.iter().position(|b| b.id == id) else {
+        let Some(idx) = func.block_index(id) else {
             return;
         };
         // Re-evaluate everything in the newly reachable block.
@@ -276,7 +276,7 @@ impl Solver {
                 // A newly executable edge changes what the target's phis meet
                 // over, even when no value moved.
                 self.mark_block(func, to);
-                if let Some(idx) = func.blocks.iter().position(|b| b.id == to) {
+                if let Some(idx) = func.block_index(to) {
                     for i in 0..func.blocks[idx].insns.len() {
                         if func.blocks[idx].insns[i].op == Opcode::Phi {
                             self.eval_site(func, (idx, i));
@@ -365,7 +365,7 @@ impl Solver {
 
     fn mark_all_successors(&mut self, func: &Function, b: usize) {
         let block_id = func.blocks[b].id;
-        for succ in func.blocks[b].children.clone() {
+        for &succ in &func.blocks[b].children {
             self.mark_edge(block_id, succ);
         }
     }

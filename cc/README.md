@@ -184,7 +184,7 @@ Will not implement:
 - SIMD intrinsic headers (`immintrin.h` and friends). Code guarded on
   `#ifdef __SSE2__` reaches for one and fails. The macro is not the fault:
   SSE2 is architectural baseline for x86-64 and gcc defines it unconditionally,
-  as c17 does — it describes the target, not the header set. See [TODO.md](TODO.md)
+  as c17 does — it describes the target, not the header set. See [DECISIONS.md](DECISIONS.md)
 - `__auto_type`; nested functions and `__label__`. Clang refuses nested
   functions too, and they need executable-stack trampolines
 - `_Imaginary` types. Optional in C99, C11 and C17 alike -- never removed,

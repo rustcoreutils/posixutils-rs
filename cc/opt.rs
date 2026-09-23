@@ -14,6 +14,8 @@ use crate::ir::dce;
 use crate::ir::ifconv;
 use crate::ir::inline;
 use crate::ir::instcombine;
+use crate::ir::loadfwd;
+use crate::ir::memloc;
 use crate::ir::sccp;
 use crate::ir::validate;
 use crate::ir::vrp;
@@ -245,12 +247,16 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
     // below then treat as the constant it is.
     constglobal::run(module, types);
 
-    // Phase 3: Per-function optimization
+    // Phase 3: module-wide facts the memory passes need. Built after
+    // inlining, so the call graph and the set of globals are final.
+    let mi = memloc::ModuleInfo::build(module, types);
+
+    // Phase 4: Per-function optimization
     for func in &mut module.functions {
-        optimize_function(func, types);
+        optimize_function(func, types, &mi);
     }
 
-    // Phase 4 (debug builds only): structural IR validation.
+    // Phase 5 (debug builds only): structural IR validation.
     // Runs at the end of optimization, BEFORE `ir::lower::lower_module`
     // which intentionally introduces multi-def Copies as part of φ-
     // elimination. Any invariant we want to enforce on optimizer-stage
@@ -271,7 +277,7 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
 }
 
 /// Optimize a single function by running passes until fixed point.
-fn optimize_function(func: &mut Function, types: &TypeTable) {
+fn optimize_function(func: &mut Function, types: &TypeTable, mi: &memloc::ModuleInfo) {
     for _ in 0..MAX_ITERATIONS {
         // The order is load-bearing, and each pass hands the next one a
         // shape it could not have seen for itself.
@@ -299,13 +305,27 @@ fn optimize_function(func: &mut Function, types: &TypeTable) {
         //
         // `dce` last: SCCP removes a dead edge but deletes no block, and
         // leaves the `PhiSource` of a folded phi for `dce` to collect.
+        // `loadfwd` first: turning a load into a copy of a stored value is
+        // what gives every pass below it something to fold, and a value that
+        // came out of memory is otherwise opaque to all of them. It does
+        // *gain* from a second iteration -- an index expression reaches it as
+        // `add %sym, (mul (sext 1) 4)` and only becomes a constant
+        // displacement once `instcombine` has folded the multiply -- which is
+        // why it sits inside the loop rather than ahead of it.
+        let lf_changed = loadfwd::run(func, types, mi);
         let vrp_changed = vrp::run(func, types);
         let ifc_changed = ifconv::run(func);
         let sccp_changed = sccp::run(func, types);
         let ic_changed = instcombine::run(func, types);
         let dce_changed = dce::run(func);
 
-        if !vrp_changed && !ifc_changed && !sccp_changed && !ic_changed && !dce_changed {
+        if !lf_changed
+            && !vrp_changed
+            && !ifc_changed
+            && !sccp_changed
+            && !ic_changed
+            && !dce_changed
+        {
             break;
         }
     }

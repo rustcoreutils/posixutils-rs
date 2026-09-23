@@ -574,6 +574,7 @@
 20041113-1@-O0
 20041113-1@-O2
 20041114-1@-O0
+20041114-1@-O2
 20041124-1@-O0
 20041124-1@-O2
 20041126-1@-O0
@@ -2894,6 +2895,7 @@ pta-field-2@-O2
 ptr-arith-1@-O0
 ptr-arith-1@-O2
 pure-1@-O0
+pure-1@-O2
 pushpop_macro@-O0
 pushpop_macro@-O2
 regstack-1@-O0

@@ -431,8 +431,38 @@ impl<'a> super::linearize::Linearizer<'a> {
         if !self.types.is_unsigned(typ) && bit_width < value_bits {
             self.emit_sign_extend_bitfield(masked, bit_width, value_bits)
         } else {
-            masked
+            self.widen_bitfield_to_declared(masked, storage_type, storage_bits, typ, value_bits)
         }
+    }
+
+    /// Give the extracted field the width its declared type claims.
+    ///
+    /// Everything above runs at the *storage unit's* width, and a packed
+    /// field's unit can be narrower than the type it was declared with:
+    /// `unsigned short k : 8` sitting alone in one byte is masked by an
+    /// eight-bit `and`, and the caller then converts it *from sixteen bits*,
+    /// because sixteen is what its type says. The value is right in a
+    /// register -- the unit's own load zero-extended it -- so nothing failed
+    /// while it stayed in one. It fails the moment it becomes a constant:
+    /// `0xFF` canonicalized at eight bits is `-1`, and the sixteen-bit
+    /// zero-extension the caller emits then reads that as `0xFFFF`. So the
+    /// answer is not to teach the folder about the discrepancy but to not
+    /// have one -- the value a bit-field load hands back is readable at the
+    /// width its type names.
+    fn widen_bitfield_to_declared(
+        &mut self,
+        value: PseudoId,
+        storage_type: TypeId,
+        storage_bits: u32,
+        typ: TypeId,
+        value_bits: u32,
+    ) -> PseudoId {
+        if storage_bits >= value_bits {
+            // Already at least as wide, and masked to the field, so reading
+            // it at the declared width gives the same value.
+            return value;
+        }
+        self.emit_convert(value, storage_type, typ)
     }
 
     /// Reduce a value to what a bit-field of `bit_width` would hold.
@@ -586,7 +616,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         if !self.types.is_unsigned(typ) && bit_width < value_bits {
             self.emit_sign_extend_bitfield(masked, bit_width, value_bits)
         } else {
-            masked
+            self.widen_bitfield_to_declared(masked, carrier, carrier_bits, typ, value_bits)
         }
     }
 

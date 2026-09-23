@@ -12,7 +12,10 @@
 
 use crate::abi::{get_abi, Abi, ArgClass, RegClass};
 use crate::arch::codegen::is_variadic_function;
-use crate::arch::lir::{complex_fp_info, complex_sse_regs, Directive, FpSize, OperandSize, Symbol};
+use crate::arch::lir::{
+    complex_fp_info, complex_sse_regs, plan_pair_move, Directive, FpSize, OperandSize, PairMove,
+    Symbol,
+};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{spend_arg_regs, FrameBase, Loc, Reg, RegAlloc, XmmReg};
@@ -946,6 +949,38 @@ impl X86_64CodeGen {
     }
 
     /// Emit return instruction: move return value to registers and emit epilogue
+    /// Write two values into two distinct general registers at once.
+    ///
+    /// See `arch::lir::plan_pair_move` for the three cases. The exchange goes
+    /// through R10 rather than `xchg`, which on x86-64 carries an implicit
+    /// LOCK prefix against memory and is the atomic instruction, not a move;
+    /// R10 is caller-saved and already this back end's scratch at a return.
+    fn emit_gp_pair_move(&mut self, (s0, d0): (PseudoId, Reg), (s1, d1): (PseudoId, Reg)) {
+        let plan = plan_pair_move(
+            self.get_location(s1) == Loc::Reg(d0),
+            self.get_location(s0) == Loc::Reg(d1),
+        );
+        match plan {
+            PairMove::InOrder => {
+                self.emit_move(s0, d0, 64);
+                self.emit_move(s1, d1, 64);
+            }
+            PairMove::Reversed => {
+                self.emit_move(s1, d1, 64);
+                self.emit_move(s0, d0, 64);
+            }
+            PairMove::Swap => {
+                self.emit_move(s0, Reg::R10, 64);
+                self.emit_move(s1, d1, 64);
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: GpOperand::Reg(d0),
+                });
+            }
+        }
+    }
+
     pub(super) fn emit_ret(&mut self, insn: &Instruction, types: &TypeTable) {
         // Move return value to appropriate register if present
         // System V AMD64 ABI: integers in RAX, floats in XMM0, complex in XMM0+XMM1
@@ -1039,19 +1074,8 @@ impl X86_64CodeGen {
                                 }
                             }
 
-                            // Emit GP moves, handling clobber: if src[1] lives in Rax,
-                            // move it to Rdx FIRST, then src[0] to Rax.
                             if gp_moves.len() == 2 {
-                                let src1_in_rax =
-                                    matches!(self.get_location(gp_moves[1].0), Loc::Reg(Reg::Rax));
-                                if src1_in_rax {
-                                    // Move second (Rdx) first to avoid clobbering
-                                    self.emit_move(gp_moves[1].0, gp_moves[1].1, 64);
-                                    self.emit_move(gp_moves[0].0, gp_moves[0].1, 64);
-                                } else {
-                                    self.emit_move(gp_moves[0].0, gp_moves[0].1, 64);
-                                    self.emit_move(gp_moves[1].0, gp_moves[1].1, 64);
-                                }
+                                self.emit_gp_pair_move(gp_moves[0], gp_moves[1]);
                             } else {
                                 for (s, gp) in &gp_moves {
                                     self.emit_move(*s, *gp, 64);

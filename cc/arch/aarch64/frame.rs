@@ -17,7 +17,9 @@ use crate::arch::aarch64::features::{VA_GR_SAVE_BYTES, VA_VR_SAVE_BYTES};
 use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{FrameBase, Loc, Reg, RegAlloc, VReg};
 use crate::arch::codegen::is_variadic_function;
-use crate::arch::lir::{complex_fp_info, Directive, FpSize, OperandSize, Symbol};
+use crate::arch::lir::{
+    complex_fp_info, plan_pair_move, Directive, FpSize, OperandSize, PairMove, Symbol,
+};
 use crate::ir::{Function, Instruction, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::HashSet;
@@ -1371,6 +1373,37 @@ impl Aarch64CodeGen {
     }
 
     /// Emit return instruction: move return value and emit epilogue
+    /// Write two values into two distinct general registers at once.
+    ///
+    /// See `arch::lir::plan_pair_move` for the three cases. X9 is the
+    /// scratch: it is caller-saved and the rest of this file already uses it
+    /// to stage a return value.
+    fn emit_gp_pair_move(&mut self, (s0, d0): (PseudoId, Reg), (s1, d1): (PseudoId, Reg)) {
+        let plan = plan_pair_move(
+            self.get_location(s1) == Loc::Reg(d0),
+            self.get_location(s0) == Loc::Reg(d1),
+        );
+        match plan {
+            PairMove::InOrder => {
+                self.emit_move(s0, d0, 64);
+                self.emit_move(s1, d1, 64);
+            }
+            PairMove::Reversed => {
+                self.emit_move(s1, d1, 64);
+                self.emit_move(s0, d0, 64);
+            }
+            PairMove::Swap => {
+                self.emit_move(s0, Reg::X9, 64);
+                self.emit_move(s1, d1, 64);
+                self.push_lir(Aarch64Inst::Mov {
+                    size: OperandSize::B64,
+                    dst: d0,
+                    src: GpOperand::Reg(Reg::X9),
+                });
+            }
+        }
+    }
+
     pub(super) fn emit_ret(
         &mut self,
         insn: &Instruction,
@@ -1629,9 +1662,9 @@ impl Aarch64CodeGen {
                     }
                 }
             } else if insn.returns_two_regs() {
-                self.emit_move(src, Reg::X0, 64);
-                if let Some(&src2) = insn.src.get(1) {
-                    self.emit_move(src2, Reg::X1, 64);
+                match insn.src.get(1).copied() {
+                    Some(src2) => self.emit_gp_pair_move((src, Reg::X0), (src2, Reg::X1)),
+                    None => self.emit_move(src, Reg::X0, 64),
                 }
             } else if let Some(gp_n) =
                 insn.typ

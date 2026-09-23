@@ -323,6 +323,40 @@ pub enum CallTarget<R> {
 /// How many SSE registers a complex argument occupies under System V AMD64.
 ///
 /// §3.2.3 classifies the three complex types differently, and only
+/// How to sequence a two-element parallel move into two *distinct*
+/// registers.
+///
+/// Both halves of a two-register return are live at the same instant, so the
+/// destinations have to be written as though simultaneously. There are three
+/// cases and it is tempting to notice only one of them: writing the first
+/// destination may destroy the second's source, writing the second may
+/// destroy the first's, and when **both** hold there is no order at all --
+/// the two values have to be exchanged. The third case is unreachable while
+/// both halves are loaded out of memory, which is why it stayed hidden until
+/// a value could reach a return already in a register.
+///
+/// The decision is about locations only, so it is stated once here and each
+/// back end supplies its own moves and its own scratch register.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PairMove {
+    /// Write the first destination, then the second.
+    InOrder,
+    /// Write the second destination first.
+    Reversed,
+    /// Neither order preserves both values; exchange them.
+    Swap,
+}
+
+/// `first_clobbers_second`: the second move's source lives in the first
+/// move's destination. `second_clobbers_first`: the mirror image.
+pub fn plan_pair_move(first_clobbers_second: bool, second_clobbers_first: bool) -> PairMove {
+    match (first_clobbers_second, second_clobbers_first) {
+        (true, true) => PairMove::Swap,
+        (true, false) => PairMove::Reversed,
+        (false, _) => PairMove::InOrder,
+    }
+}
+
 /// `double _Complex` is the familiar register pair:
 ///
 /// - `float _Complex` is 8 bytes: **one** eightbyte, so one XMM holds both

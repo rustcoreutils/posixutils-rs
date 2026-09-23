@@ -117,8 +117,29 @@ impl ConstMap {
                 }
             }
         }
+        // An inline-asm output is a second definition of its pseudo that
+        // invariant I1 deliberately exempts, so nothing else notices the
+        // pseudo has two defs. A tied operand (`"0"(x)`) is written as a
+        // `Copy` into the output pseudo *before* the asm, so following that
+        // copy answers with the asm's input where the question was about its
+        // result. `sccp::seed` already refuses these for the same reason; the
+        // two must agree, because a pass that folds what `sccp` would not is
+        // the one that miscompiles.
+        for bb in &func.blocks {
+            for insn in &bb.insns {
+                let Some(ref asm) = insn.asm_data else {
+                    continue;
+                };
+                for out in &asm.outputs {
+                    poisoned.push(out.pseudo);
+                }
+            }
+        }
+
         for id in poisoned {
             copies.remove(&id);
+            vals.remove(&id);
+            fvals.remove(&id);
         }
 
         Self {

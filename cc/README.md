@@ -89,7 +89,7 @@ Key source files:
 | `tools.rs` | Shared exit-status handling for `cflow`/`ctags`/`cxref` |
 | `os/` | OS-specific knobs (linux, macos, freebsd) |
 | `abi/` | Per-ABI classification: `sysv_amd64.rs`, `aapcs64.rs` |
-| `ir/mod.rs` | IR definitions (opcodes, pseudos, instructions, functions). See `ir/README.md`. |
+| `ir/mod.rs` | IR definitions (opcodes, pseudos, instructions, functions). See [ir/README.md](ir/README.md) |
 | `ir/linearize.rs` (+ `_init.rs`, `_stmt.rs`, `_emit.rs`, `_atomic.rs`) | AST → IR conversion, SSA construction |
 | `ir/mem2reg.rs` | Promotion of address-free locals to registers |
 | `ir/tls.rs` | Thread-local access expansion (dynamic model) |

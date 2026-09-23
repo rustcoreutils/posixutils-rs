@@ -52,7 +52,7 @@ differs from gcc, the row says so rather than leaving the reader to find out.
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_constant_p(expr)` | Returns 1 if expr is compile-time constant |
+| `__builtin_constant_p(expr)` | 1 if `expr` is a compile-time constant. **Level-dependent, as in gcc**: answered after propagation has run, so a local holding a constant is one at `-O1` and above and is not with the optimizer off. A literal is 1 at every level. The argument is never evaluated, whatever the answer |
 | `__builtin_types_compatible_p(t1, t2)` | Returns 1 if types are compatible (ignores qualifiers) |
 | `__builtin_classify_type(expr)` | A code for the argument's type family: 1 integer, 5 pointer, 8 real floating, 9 complex, 12 struct, 13 union. The usual conversions run first, so a `char`, an enumeration constant and a `_Bool` all answer 1, and an array, a function and a string literal all answer 5. The argument is not evaluated |
 | `__builtin_choose_expr(c, a, b)` | `a` or `b` by the constant `c`; the untaken arm is not evaluated and need not even type-check |
@@ -109,6 +109,8 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 | `__builtin_fabs(x)` | Absolute value (`double`) |
 | `__builtin_fabsf(x)` | Absolute value (`float`) |
 | `__builtin_fabsl(x)` | Absolute value (`long double`) |
+| `floor(x)`, `ceil(x)`, `trunc(x)`, `round(x)`, `rint(x)`, `nearbyint(x)` | Recognized under their plain names and **narrowed to the `f` form when the argument is a `float`**: `(float)floor((double)x)` is `floorf(x)` exactly, because the result is an integer no greater in magnitude than `x`. The condition is the argument's type, not the result's. Only these six qualify -- `sin` and `log` are not exactly rounding, and narrowing one changes the last bit. Displaced like `fabs` |
+| `fabs(x)`, `fabsf(x)`, `fabsl(x)` | The same three under their bare names, as gcc recognizes them whether or not `<math.h>` was included. Not reserved spellings, so they are displaced the same way `alloca` is: by a declaration that is not a function, or by `-fno-builtin[-fabs]`. The bare name is still an object where it is not being called, so `double (*p)(double) = fabs;` names the library function. The argument is converted to the prototype's type first, which is the whole of what recognition buys at run time -- all three are lowered as calls -- while the optimizer gains the one fact it needs to fold `fabs(x) < 0.0` to 0 |
 | `__builtin_signbit(x)` | Returns non-zero if sign bit set (`double`) |
 | `__builtin_signbitf(x)` | Returns non-zero if sign bit set (`float`) |
 | `__builtin_signbitl(x)` | Returns non-zero if sign bit set (`long double`) |

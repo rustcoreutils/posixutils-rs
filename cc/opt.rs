@@ -9,12 +9,15 @@
 // Optimization pass runner and the utilities its passes share.
 //
 
+use crate::ir::constglobal;
 use crate::ir::dce;
+use crate::ir::ifconv;
 use crate::ir::inline;
 use crate::ir::instcombine;
 use crate::ir::sccp;
 use crate::ir::validate;
 use crate::ir::{Function, Module};
+use crate::types::TypeTable;
 
 // What optimization was asked for
 
@@ -211,8 +214,8 @@ fn check_forwarding_resolved(module: &Module) {
 /// Optimize a module as `opt` asks.
 ///
 /// Level 0: nothing but `__attribute__((always_inline))` inlining
-/// Level 1+: Run inlining, InstCombine, and DCE passes
-pub fn optimize_module(module: &mut Module, opt: Optimization) {
+/// Level 1+: inlining, then the per-function passes below to fixed point
+pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization) {
     // Phase 1: Function inlining (module-level pass)
     // This inlines small functions at their call sites and removes
     // dead static functions that were fully inlined.
@@ -236,12 +239,17 @@ pub fn optimize_module(module: &mut Module, opt: Optimization) {
         return;
     }
 
-    // Phase 2: Per-function optimization (InstCombine + DCE)
+    // Phase 2: a module pre-pass, before anything looks at a value: every
+    // load of a `const` global becomes its initializer, which the passes
+    // below then treat as the constant it is.
+    constglobal::run(module, types);
+
+    // Phase 3: Per-function optimization
     for func in &mut module.functions {
-        optimize_function(func);
+        optimize_function(func, types);
     }
 
-    // Phase 3 (debug builds only): structural IR validation.
+    // Phase 4 (debug builds only): structural IR validation.
     // Runs at the end of optimization, BEFORE `ir::lower::lower_module`
     // which intentionally introduces multi-def Copies as part of φ-
     // elimination. Any invariant we want to enforce on optimizer-stage
@@ -262,23 +270,32 @@ pub fn optimize_module(module: &mut Module, opt: Optimization) {
 }
 
 /// Optimize a single function by running passes until fixed point.
-fn optimize_function(func: &mut Function) {
+fn optimize_function(func: &mut Function, types: &TypeTable) {
     for _ in 0..MAX_ITERATIONS {
-        // SCCP first: it proves branches dead, which `instcombine` cannot,
-        // and it leaves behind `Copy` from a constant -- exactly the shape
-        // `instcombine`'s `ConstMap` follows. It runs *inside* the loop
-        // rather than once before it because `instcombine` derives constants
-        // SCCP structurally cannot (`x - x`, `x ^ x`), any of which can make
-        // a branch condition constant.
+        // The order is load-bearing, and each pass hands the next one a
+        // shape it could not have seen for itself.
         //
-        // `dce` last, and this ordering is load-bearing: SCCP removes the
-        // dead edge but deletes no block, and leaves the `PhiSource` of a
-        // folded phi for `dce` to collect.
-        let sccp_changed = sccp::run(func);
-        let ic_changed = instcombine::run(func);
+        // `ifconv` first: it collapses a short-circuit diamond into a
+        // `Select` in one block, which is what makes the two relationals
+        // inside it comparable at all.
+        //
+        // `sccp` next: it proves branches dead, which `instcombine` cannot,
+        // and leaves behind `Copy` from a constant -- exactly the shape
+        // `instcombine`'s `ConstMap` follows.
+        //
+        // `instcombine` after it, and inside the loop rather than once
+        // before it, because it derives constants SCCP structurally cannot
+        // (`x - x`, `x ^ x`), any of which can make a branch condition
+        // constant and send SCCP round again.
+        //
+        // `dce` last: SCCP removes a dead edge but deletes no block, and
+        // leaves the `PhiSource` of a folded phi for `dce` to collect.
+        let ifc_changed = ifconv::run(func);
+        let sccp_changed = sccp::run(func, types);
+        let ic_changed = instcombine::run(func, types);
         let dce_changed = dce::run(func);
 
-        if !sccp_changed && !ic_changed && !dce_changed {
+        if !ifc_changed && !sccp_changed && !ic_changed && !dce_changed {
             break;
         }
     }

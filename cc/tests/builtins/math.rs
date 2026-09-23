@@ -11,7 +11,7 @@
 // Consolidates: nan, nans, flt_rounds tests
 //
 
-use crate::common::compile_and_run;
+use crate::common::{asm_for_at, compile_and_run};
 
 // ============================================================================
 // Mega-test: Math builtins
@@ -446,4 +446,234 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("builtins_complex_parts", code, &[]), 0);
+}
+
+// ============================================================================
+// The plain spellings
+// ============================================================================
+
+/// gcc recognizes `fabs` and friends as builtins whether or not `<math.h>`
+/// was included, and a program that only writes `extern double fabs(double);`
+/// still gets the intrinsic. Recognizing the plain spelling is what lets
+/// `fabs(x) < 0.0` fold.
+///
+/// The three negative halves are the point. The bare name is an object as
+/// well as a call -- `double (*p)(double) = fabs;` names the library function
+/// and must not be parsed as a builtin invocation. A declaration of something
+/// *other* than a function displaces it. And the argument has to be converted
+/// to the prototype's type before it reaches an opcode that masks a sign bit:
+/// `fabs(-3)` passing an `int` straight through read the integer as a double
+/// bit pattern.
+#[test]
+fn builtins_plain_fabs_spellings_are_recognized() {
+    let code = r#"
+extern double fabs(double);
+extern float fabsf(float);
+extern long double fabsl(long double);
+extern void abort(void);
+
+static double (*as_value)(double) = fabs;
+
+int main(void)
+{
+    int i = -3;
+
+    if (fabs(-3.5) != 3.5) abort();
+    if (fabsf(-2.25f) != 2.25f) abort();
+    if (fabsl(-1.5L) != 1.5L) abort();
+
+    /* The name used as a value, not a call. */
+    if (as_value(-7.0) != 7.0) abort();
+
+    /* The argument converts to the prototype's type first. */
+    if (fabs(-3) != 3.0) abort();
+    if (fabs(i) != 3.0) abort();
+    if (fabsf(-2) != 2.0f) abort();
+    if (fabs(-1.5L) != 1.5) abort();
+
+    /* fabs of a NaN is a NaN with the sign cleared. */
+    {
+        double n = -__builtin_nan("");
+        double a = fabs(n);
+        if (a == a) abort();
+        if (__builtin_signbit(a)) abort();
+    }
+
+    return 0;
+}
+"#;
+    for extra in [
+        vec!["-lm".to_string()],
+        vec!["-lm".to_string(), "-fno-builtin".to_string()],
+    ] {
+        assert_eq!(
+            compile_and_run("builtins_plain_fabs", code, &extra),
+            0,
+            "with {extra:?}"
+        );
+    }
+}
+
+/// A declaration of something that is not a function takes the name back.
+#[test]
+fn builtins_a_plain_fabs_object_displaces_the_builtin() {
+    let code = r#"
+extern void abort(void);
+static double fabs = 2.5;
+
+int main(void)
+{
+    if (fabs != 2.5) abort();
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("builtins_fabs_object", code, &[]), 0);
+}
+
+/// `(float)floor((double)x)` is `floorf(x)`, and c17 narrows it.
+///
+/// Exact because the result is an integer no greater in magnitude than `x`,
+/// so a value representable as a `float` stays representable. The condition
+/// is on the **argument** type and not the result: a function returning
+/// `double` narrows too, because the narrowing happens before the widening.
+///
+/// The negative half is the point, and the c-torture test that covers this
+/// weaponises it -- only the *exactly-rounding* functions qualify. `sinf(x)`
+/// and `(float)sin((double)x)` differ in the last bit for some `x`, so
+/// narrowing `sin` would be a wrong answer rather than a faster one.
+///
+/// c17 narrows in the parser and so does it at every level, where gcc does
+/// it only with the optimizer on. Both are correct, since the rewrite is
+/// exact; [`builtins_math_narrowing_happens_at_every_level`] pins the
+/// difference down on the assembly, because a run-time test of it would
+/// disagree with gcc at `-O0` for a reason that is not a defect.
+#[test]
+fn builtins_exactly_rounding_math_narrows_to_its_float_form() {
+    let code = r#"
+extern void abort(void);
+double floor(double); double ceil(double); double trunc(double);
+double round(double); double rint(double); double nearbyint(double);
+double sin(double); double log(double);
+
+/* Every weak definition here is the identity except the ones that must not
+   be reached, which abort. The arguments below are all integral, so the
+   true mathematical answer is the identity too -- which is what makes this
+   robust to the compiler expanding the narrowed call as a machine
+   instruction instead of calling it at all. What it catches is the *wide*
+   form being reached with a `float` argument. */
+__attribute__((weak)) double floor(double a) { abort(); }
+__attribute__((weak)) float floorf(float a) { return a; }
+__attribute__((weak)) double ceil(double a) { abort(); }
+__attribute__((weak)) float ceilf(float a) { return a; }
+__attribute__((weak)) double trunc(double a) { abort(); }
+__attribute__((weak)) float truncf(float a) { return a; }
+__attribute__((weak)) double round(double a) { abort(); }
+__attribute__((weak)) float roundf(float a) { return a; }
+__attribute__((weak)) double rint(double a) { abort(); }
+__attribute__((weak)) float rintf(float a) { return a; }
+__attribute__((weak)) double nearbyint(double a) { abort(); }
+__attribute__((weak)) float nearbyintf(float a) { return a; }
+
+/* `sin` and `log` must NOT narrow, so the arrangement is reversed: the wide
+   one is the identity and the narrow one aborts. */
+__attribute__((weak)) double sin(double a) { return a; }
+__attribute__((weak)) float sinf(float a) { abort(); }
+__attribute__((weak)) double log(double a) { return a; }
+__attribute__((weak)) float logf(float a) { abort(); }
+
+__attribute__((noinline)) static float narrow(float x)
+{
+    return floor(x) + ceil(x) + trunc(x) + round(x) + rint(x) + nearbyint(x);
+}
+
+/* A `double` result from a `float` argument narrows just the same: the
+   narrowing happens before the widening. */
+__attribute__((noinline)) static double wide_result(float x) { return floor(x); }
+
+__attribute__((noinline)) static double transcendental(float x)
+{
+    return sin(x) + log(x);
+}
+
+int main(void)
+{
+    /* Guarded because gcc narrows only with the optimizer on, so at `-O0` it
+       reaches the aborting wide form and this program is not a statement
+       about it. c17 narrows at every level, which
+       `builtins_math_narrowing_happens_at_every_level` checks on the
+       assembly instead. */
+#ifdef __OPTIMIZE__
+    /* Six identities at an integral argument. */
+    if (narrow(0.0f) != 0.0f) abort();
+    if (narrow(2.0f) != 12.0f) abort();
+    if (narrow(-3.0f) != -18.0f) abort();
+    if (wide_result(0.0f) != 0.0) abort();
+    if (wide_result(-4.0f) != -4.0) abort();
+    if (transcendental(0.0f) != 0.0) abort();
+    if (transcendental(5.0f) != 10.0) abort();
+#endif
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2", "-Os"] {
+        assert_eq!(
+            compile_and_run("builtins_math_narrowing", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// The narrowing happens in the parser, so it does not wait for `-O`.
+///
+/// gcc performs it as an optimization and leaves the wide call at `-O0`.
+/// Doing it always is a deliberate difference and a safe one -- the rewrite
+/// is exact at every level -- but it is a difference, so it is stated here
+/// rather than left for someone to discover from a disassembly.
+#[test]
+fn builtins_math_narrowing_happens_at_every_level() {
+    let src = "double floor(double);\nfloat q(float a) { return floor(a); }\n";
+    // The host's own format, plus both Darwin triples so the Mach-O spelling
+    // is exercised wherever this runs. The prefix is read off each output
+    // rather than assumed -- Mach-O calls `_floorf`, and "floorf" is a
+    // substring of that, so a check spelled for ELF keeps passing there
+    // while its negative half matches nothing at all.
+    let targets: [&[&str]; 3] = [
+        &[],
+        &["--target=aarch64-apple-darwin"],
+        &["--target=x86_64-apple-darwin"],
+    ];
+    for target in targets {
+        for opt in ["-O0", "-O1", "-O2"] {
+            let mut args = vec![opt];
+            args.extend_from_slice(target);
+            let asm = asm_for_at("math_narrow_level", src, &args);
+            // `q` is the function this source defines, so it calibrates.
+            let p = crate::common::asm_prefix(&asm, "q");
+            // Matched exactly, across all four spellings a call takes here:
+            // `call f@PLT` and `bl f` on ELF, `call _f` and `bl _f` on
+            // Mach-O, which has no PLT syntax. Exactness is also what stops
+            // `floor` matching the `floorf` the narrowing produces.
+            let calls = |name: &str| {
+                let want = format!("{p}{name}");
+                asm.lines().any(|line| {
+                    let t = line.trim_start();
+                    t.strip_prefix("call ")
+                        .or_else(|| t.strip_prefix("bl "))
+                        .is_some_and(|dst| {
+                            dst == want
+                                || dst.strip_prefix(&want).is_some_and(|s| s.starts_with('@'))
+                        })
+                })
+            };
+            assert!(
+                calls("floorf"),
+                "{target:?} at {opt}: the call should be narrowed to {p}floorf:\n{asm}"
+            );
+            assert!(
+                !calls("floor"),
+                "{target:?} at {opt}: the wide form must not be called:\n{asm}"
+            );
+        }
+    }
 }

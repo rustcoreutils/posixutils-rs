@@ -25,11 +25,14 @@
 //
 
 use super::constfold::{
-    at_width, cmp_operand_width, eval_binop, eval_unop, get_cmp_info, unambiguous_at,
+    at_width, cmp_mask, cmp_operand_width, eval_binop, eval_fbinop, eval_fcmp, eval_fcvt,
+    eval_fcvtf, eval_funop, eval_unop, get_cmp_info, mirror_mask, result_type_of, unambiguous_at,
+    CMP_ALL,
 };
-use super::{Function, Instruction, Opcode, PseudoId, PseudoKind};
-use crate::types::TypeId;
-use std::collections::HashMap;
+use super::{ConstValue, Function, Instruction, Opcode, PseudoId, PseudoKind};
+use crate::float::FloatVal;
+use crate::types::{TypeId, TypeTable};
+use std::collections::{HashMap, HashSet};
 
 // Constant Resolution
 
@@ -53,23 +56,50 @@ use std::collections::HashMap;
 struct ConstMap {
     /// Every `PseudoKind::Val` pseudo's value.
     vals: HashMap<PseudoId, i128>,
-    /// Copy target -> (source, the copy's operand width in bits).
+    /// Every `PseudoKind::FVal` pseudo's value, kept apart from `vals`
+    /// because the two never mix: no rule reads a float as an integer
+    /// without going through a conversion opcode that says so.
+    fvals: HashMap<PseudoId, FloatVal>,
+    /// Target -> (source, the width at which the two are the same value).
+    ///
+    /// A `Copy` records its own operand width. A `Trunc` belongs here too
+    /// and records the width it truncates *to*: a truncation is its operand
+    /// read at that width, which is precisely what this field means, and
+    /// recording it is what lets `(int)(signed char)200` fold. The value in
+    /// the middle means two things, and only the extension that consumes it
+    /// says which -- so it is reachable through [`Self::get_at`], which is
+    /// told the signedness, and not through [`Self::get`], which is not.
     copies: HashMap<PseudoId, (PseudoId, u32)>,
 }
 
 impl ConstMap {
     fn new(func: &Function) -> Self {
         let mut vals = HashMap::new();
+        let mut fvals = HashMap::new();
         for p in &func.pseudos {
-            if let PseudoKind::Val(v) = &p.kind {
-                // I1 should make this unique. If it is not, a release build
-                // has no validator to say so, and folding the wrong one
-                // silently is worse than not folding: poison the entry.
-                if let Some(prev) = vals.insert(p.id, *v) {
-                    if prev != *v {
-                        vals.remove(&p.id);
+            match &p.kind {
+                PseudoKind::Val(v) => {
+                    // I1 should make this unique. If it is not, a release
+                    // build has no validator to say so, and folding the wrong
+                    // one silently is worse than not folding: poison the
+                    // entry.
+                    if let Some(prev) = vals.insert(p.id, *v) {
+                        if prev != *v {
+                            vals.remove(&p.id);
+                        }
                     }
                 }
+                PseudoKind::FVal(v) => {
+                    // Poisoned the same way, and on the *encoding*: two
+                    // constants that compare equal but are not the same
+                    // value (the signed zeros) must not silently merge.
+                    if let Some(prev) = fvals.insert(p.id, *v) {
+                        if prev.key() != v.key() {
+                            fvals.remove(&p.id);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -77,11 +107,11 @@ impl ConstMap {
         let mut poisoned: Vec<PseudoId> = Vec::new();
         for bb in &func.blocks {
             for insn in &bb.insns {
-                if insn.op != Opcode::Copy || insn.src.len() != 1 {
+                if !matches!(insn.op, Opcode::Copy | Opcode::Trunc) || insn.src.len() != 1 {
                     continue;
                 }
                 if let Some(target) = insn.target {
-                    let entry = (insn.src[0], insn.size);
+                    let entry = (insn.src[0], insn.size.max(1));
                     if let Some(prev) = copies.insert(target, entry) {
                         if prev != entry {
                             poisoned.push(target);
@@ -94,7 +124,11 @@ impl ConstMap {
             copies.remove(&id);
         }
 
-        Self { vals, copies }
+        Self {
+            vals,
+            fvals,
+            copies,
+        }
     }
 
     /// Record a simplification this run is about to apply.
@@ -110,6 +144,9 @@ impl ConstMap {
             }
             Simplification::CopyFrom(src) => {
                 self.copies.insert(target, (*src, size));
+            }
+            Simplification::FoldToFloat(v) => {
+                self.fvals.insert(target, *v);
             }
             _ => {}
         }
@@ -164,6 +201,18 @@ impl ConstMap {
         None
     }
 
+    /// The float constant at `id`, following `Copy` chains to their source.
+    ///
+    /// No width guard beyond the one [`Self::root`] applies: unlike an
+    /// integer, a float is never narrowed by a `Copy` -- a change of format
+    /// is an `FCvtF`, a separate instruction -- so the value at the root is
+    /// the value here. What the caller still owes is rounding it to the
+    /// format of the instruction consuming it, which a `FloatVal` has not
+    /// been subjected to.
+    fn fget(&self, id: PseudoId, width: u32) -> Option<FloatVal> {
+        self.fvals.get(&self.root(id, width)).copied()
+    }
+
     /// The constant at `id`, following `Copy` chains to their source.
     ///
     /// `None` for anything that is not a compile-time integer constant: a
@@ -192,6 +241,128 @@ impl ConstMap {
     }
 }
 
+/// What is known about a pseudo that holds a comparison's result.
+///
+/// Built once per run, like `ConstMap`, and sound for the same reason: SSA
+/// single-def makes "the comparison that defines %n" a fact about the whole
+/// function rather than about a program point.
+#[derive(Clone, Copy)]
+struct CmpFact {
+    /// Which of less/equal/greater make it true.
+    mask: u8,
+    lhs: PseudoId,
+    rhs: PseudoId,
+    /// A signed and an unsigned comparison over one pair are *not*
+    /// comparable: `x < y` and `x > y` read signed are not complementary with
+    /// the unsigned forms.
+    signed: bool,
+    width: u32,
+}
+
+/// Every pseudo defined by an integer comparison.
+struct CmpFacts {
+    facts: HashMap<PseudoId, CmpFact>,
+}
+
+impl CmpFacts {
+    fn new(func: &Function, consts: &ConstMap) -> Self {
+        let mut facts = HashMap::new();
+        for bb in &func.blocks {
+            for insn in &bb.insns {
+                let (Some(target), Some(mask)) = (insn.target, cmp_mask(insn.op)) else {
+                    continue;
+                };
+                if insn.src.len() != 2 {
+                    continue;
+                }
+                let width = cmp_operand_width(insn);
+                let signed = get_cmp_info(insn.op).map(|i| i.signed).unwrap_or(true);
+                facts.insert(
+                    target,
+                    CmpFact {
+                        mask,
+                        lhs: consts.root(insn.src[0], width),
+                        rhs: consts.root(insn.src[1], width),
+                        signed,
+                        width,
+                    },
+                );
+            }
+        }
+        Self { facts }
+    }
+
+    fn get(&self, id: PseudoId) -> Option<CmpFact> {
+        self.facts.get(&id).copied()
+    }
+
+    /// The fact for whatever `id` ultimately copies from.
+    ///
+    /// Needed because stripping the boolification leaves a `Copy` of the
+    /// comparison in its place, and a later rule asking about that copy would
+    /// otherwise learn nothing.
+    fn get_through(&self, consts: &ConstMap, id: PseudoId, width: u32) -> Option<CmpFact> {
+        self.get(consts.root(id, width))
+    }
+
+    /// `other`'s mask expressed over `base`'s operand order, or `None` when
+    /// the two are not comparisons of the same pair in the same signedness.
+    fn aligned_mask(&self, base: CmpFact, other: CmpFact) -> Option<u8> {
+        if base.signed != other.signed || base.width != other.width {
+            return None;
+        }
+        if base.lhs == other.lhs && base.rhs == other.rhs {
+            return Some(other.mask);
+        }
+        if base.lhs == other.rhs && base.rhs == other.lhs {
+            return Some(mirror_mask(other.mask));
+        }
+        None
+    }
+}
+
+/// Everything one run of this pass knows that is fixed for the whole
+/// function, gathered so the dispatch keeps a stable arity as rules are
+/// added.
+struct Facts<'a> {
+    cmps: CmpFacts,
+    /// Pseudos whose value is never *less than* zero -- which is not the
+    /// same as non-negative, and is deliberately the weaker fact: `fabs` of
+    /// a NaN is a NaN, and a NaN is not less than zero either, because an
+    /// unordered comparison is false. Stating it this way is what makes the
+    /// rule below correct without a NaN test.
+    never_lt_zero: HashSet<PseudoId>,
+    types: &'a TypeTable,
+}
+
+impl<'a> Facts<'a> {
+    fn new(func: &Function, consts: &ConstMap, types: &'a TypeTable) -> Self {
+        let mut never_lt_zero = HashSet::new();
+        for bb in &func.blocks {
+            for insn in &bb.insns {
+                if matches!(insn.op, Opcode::Fabs32 | Opcode::Fabs64) {
+                    if let Some(target) = insn.target {
+                        never_lt_zero.insert(target);
+                    }
+                }
+            }
+        }
+        Self {
+            cmps: CmpFacts::new(func, consts),
+            never_lt_zero,
+            types,
+        }
+    }
+
+    /// The format `insn`'s float operands are in, or `None` when the
+    /// instruction does not say -- a complex type, or no type at all. Folding
+    /// at the wrong format is a wrong answer rather than an imprecise one, so
+    /// not knowing means not folding.
+    fn fp_format(&self, typ: Option<TypeId>) -> Option<crate::float::FpFormat> {
+        typ.and_then(|t| self.types.fp_format(t))
+    }
+}
+
 // Simplification Result
 
 /// Result of trying to simplify an instruction
@@ -202,22 +373,39 @@ enum Simplification {
     CopyFrom(PseudoId),
     /// Create a new constant with this value and copy from it
     FoldToConst(i128),
+    /// Become this float constant.
+    ///
+    /// Not "copy from one": a float constant is a pseudo kind, so the fold
+    /// converts the target itself and rewrites the instruction to the
+    /// `SetVal` that gives it a width. See `Function::make_float_const`.
+    FoldToFloat(FloatVal),
 }
 
 // Main Entry Point
 
 /// Run the InstCombine pass on a function.
 /// Returns true if any changes were made.
-pub fn run(func: &mut Function) -> bool {
+pub fn run(func: &mut Function, types: &TypeTable) -> bool {
     let mut changed = false;
 
     // Collect all simplifications first (to avoid borrow conflicts)
     let mut simplifications: Vec<(usize, usize, Simplification)> = Vec::new();
     let mut consts = ConstMap::new(func);
+    let facts = Facts::new(func, &consts, types);
 
     for (bb_idx, bb) in func.blocks.iter().enumerate() {
         for (insn_idx, insn) in bb.insns.iter().enumerate() {
-            let result = try_simplify(insn, &consts);
+            let mut result = try_simplify(insn, &consts, &facts);
+            // A float fold converts the target pseudo itself, and only a
+            // `Reg` may be converted. Deciding that here rather than when
+            // the fold is applied is what keeps `record` honest: a recorded
+            // constant the apply loop then declines would be read by every
+            // later instruction in this same pass.
+            if matches!(result, Simplification::FoldToFloat(_))
+                && !insn.target.is_some_and(|t| func.is_plain_temp(t))
+            {
+                result = Simplification::None;
+            }
             if let Some(target) = insn.target {
                 consts.record(target, insn.size, &result);
             }
@@ -232,7 +420,8 @@ pub fn run(func: &mut Function) -> bool {
         // Extract necessary data from the instruction before any mutation
         let (target, typ, size) = {
             let insn = &func.blocks[bb_idx].insns[insn_idx];
-            (insn.target, insn.typ, insn.size)
+            let (typ, size) = result_type_of(insn, types);
+            (insn.target, typ, size)
         };
 
         let new_insn = match simplification {
@@ -242,6 +431,24 @@ pub fn run(func: &mut Function) -> bool {
                 // Create a new constant pseudo
                 let const_id = func.create_const_pseudo(value);
                 make_copy_from_parts(target, typ, size, const_id)
+            }
+            Simplification::FoldToFloat(value) => {
+                // The target becomes the constant, and the instruction
+                // becomes the `SetVal` that carries its width -- which is
+                // the shape a float literal is linearized into, and the
+                // only one both allocators resolve.
+                let Some(target_id) = target else { continue };
+                if !func.make_const(target_id, ConstValue::Float(value)) {
+                    continue;
+                }
+                Instruction {
+                    op: Opcode::SetVal,
+                    target,
+                    src: Vec::new(),
+                    typ,
+                    size,
+                    ..Default::default()
+                }
             }
         };
         func.blocks[bb_idx].insns[insn_idx] = new_insn;
@@ -254,7 +461,7 @@ pub fn run(func: &mut Function) -> bool {
 // Simplification Dispatch
 
 /// Try to simplify an instruction. Returns the simplification to apply.
-fn try_simplify(insn: &Instruction, consts: &ConstMap) -> Simplification {
+fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
     match insn.op {
         // Integer arithmetic
         Opcode::Add => simplify_add(insn, consts),
@@ -279,11 +486,29 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap) -> Simplification {
         | Opcode::SetB
         | Opcode::SetBe
         | Opcode::SetA
-        | Opcode::SetAe => simplify_comparison(insn, consts),
+        | Opcode::SetAe => simplify_comparison(insn, consts, facts),
+
+        // A short-circuit `&&`/`||` after if-conversion.
+        Opcode::Select => simplify_select(insn, consts, facts),
+
+        // Floating point
+        Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv => {
+            simplify_fbinop(insn, consts, facts)
+        }
+        Opcode::FNeg => simplify_funop(insn, consts, facts),
+        Opcode::FCvtF => simplify_fcvtf(insn, consts, facts),
+        Opcode::FCmpOEq
+        | Opcode::FCmpONe
+        | Opcode::FCmpOLt
+        | Opcode::FCmpOLe
+        | Opcode::FCmpOGt
+        | Opcode::FCmpOGe => simplify_fcmp(insn, consts, facts),
+        Opcode::FCvtS | Opcode::FCvtU => simplify_fcvt(insn, consts, facts),
 
         // Unary
         Opcode::Neg => simplify_neg(insn, consts),
         Opcode::Not => simplify_not(insn, consts),
+        Opcode::Sext | Opcode::Zext | Opcode::Trunc => simplify_convert(insn, consts),
 
         _ => Simplification::None,
     }
@@ -604,7 +829,7 @@ fn simplify_bitwise(insn: &Instruction, consts: &ConstMap) -> Simplification {
 // Comparison Simplifications
 
 /// Unified comparison simplification for all SetXX opcodes
-fn simplify_comparison(insn: &Instruction, consts: &ConstMap) -> Simplification {
+fn simplify_comparison(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
     let info = match get_cmp_info(insn.op) {
         Some(i) => i,
         None => return Simplification::None,
@@ -617,6 +842,21 @@ fn simplify_comparison(insn: &Instruction, consts: &ConstMap) -> Simplification 
     let src1 = insn.src[0];
     let src2 = insn.src[1];
     let width = cmp_operand_width(insn);
+
+    // `(a < b) != 0` is `a < b`. A comparison already yields 0 or 1, so the
+    // boolification the front end wraps around every `&&`/`||` operand is a
+    // no-op -- and an opaque one: it leaves the result of a comparison
+    // *against zero*, which hides the operand pair the comparison was
+    // actually about.
+    if insn.op == Opcode::SetNe {
+        for (bool_side, zero_side) in [(src1, src2), (src2, src1)] {
+            if consts.get(zero_side) == Some(0)
+                && facts.cmps.get_through(consts, bool_side, width).is_some()
+            {
+                return Simplification::CopyFrom(bool_side);
+            }
+        }
+    }
 
     // Identity: x op x -> identity_result (comparison result is always i32/i64, never i128)
     //
@@ -639,7 +879,209 @@ fn simplify_comparison(insn: &Instruction, consts: &ConstMap) -> Simplification 
     Simplification::None
 }
 
+/// `select(c, t, f)` where the arms make it a short-circuit `&&` or `||`.
+///
+/// If-conversion turns `a && b` into `select(a, b, 0)` and `a || b` into
+/// `select(a, 1, b)`. When both `a` and `b` compare the *same* operand pair,
+/// the answer needs nothing about the operands: `&&` is never true when their
+/// orderings are disjoint, and `||` is always true when together they cover
+/// less, equal and greater.
+///
+/// `(x == y) && (x != y)` is the first; `(x >= y) || (x < y)` the second. The
+/// operands may be written either way round -- `(x < y) && (y < x)` is also
+/// never true -- which `aligned_mask` handles by mirroring.
+fn simplify_select(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+    if insn.src.len() != 3 {
+        return Simplification::None;
+    }
+    let (cond, t, f) = (insn.src[0], insn.src[1], insn.src[2]);
+
+    // A constant condition needs no facts at all.
+    if let Some(c) = consts.get(cond) {
+        return Simplification::CopyFrom(if c != 0 { t } else { f });
+    }
+    // Both arms the same value, whatever the condition.
+    let width = insn.size.max(1);
+    if consts.root(t, width) == consts.root(f, width) {
+        return Simplification::CopyFrom(t);
+    }
+
+    let Some(c_fact) = facts.cmps.get_through(consts, cond, width) else {
+        return Simplification::None;
+    };
+
+    // `a && b`: false on the `a`-false edge.
+    if consts.get(f) == Some(0) {
+        if let Some(other) = facts.cmps.get_through(consts, t, width) {
+            if let Some(mask) = facts.cmps.aligned_mask(c_fact, other) {
+                if c_fact.mask & mask == 0 {
+                    return fold_to_zero();
+                }
+            }
+        }
+    }
+    // `a || b`: true on the `a`-true edge.
+    if consts.get(t) == Some(1) {
+        if let Some(other) = facts.cmps.get_through(consts, f, width) {
+            if let Some(mask) = facts.cmps.aligned_mask(c_fact, other) {
+                if c_fact.mask | mask == CMP_ALL {
+                    return fold_to_const(1);
+                }
+            }
+        }
+    }
+    Simplification::None
+}
+
 // Unary Simplifications
+
+/// Fold an integer width conversion of a constant.
+///
+/// The operand is read at the width the conversion says it was stored in,
+/// which is not `insn.size` -- that is the destination. `get_at` is the
+/// accessor that takes both, and it is right here for the same reason it is
+/// right for a comparison: the opcode carries the signedness.
+fn simplify_convert(insn: &Instruction, consts: &ConstMap) -> Simplification {
+    if insn.src.len() != 1 {
+        return Simplification::None;
+    }
+    let (width, signed) = match insn.op {
+        Opcode::Trunc => (insn.size.max(1), true),
+        _ if insn.src_size != 0 => (insn.src_size, insn.op == Opcode::Sext),
+        // Without a source width an extension cannot be read at all.
+        _ => return Simplification::None,
+    };
+    match consts.get_at(insn.src[0], width, signed) {
+        Some(a) => fold_unary_with(insn, a),
+        None => Simplification::None,
+    }
+}
+
+// Floating-Point Simplification
+
+/// Fold a float comparison, either over two constants or over `fabs`.
+///
+/// The `fabs` half is gcc's `fabs(x) < 0.0` rule: no absolute value is ever
+/// less than zero, and a NaN argument does not spoil it, since an unordered
+/// `<` is false as well. Only the strict form folds -- `fabs(x) <= 0.0` is
+/// true for a zero argument, and `fabs(x) >= 0.0` is false for a NaN one.
+fn simplify_fcmp(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+    if insn.src.len() != 2 {
+        return Simplification::None;
+    }
+    let (lhs, rhs) = (insn.src[0], insn.src[1]);
+    let width = insn.size.max(1);
+
+    // `x < 0.0` and its mirror `0.0 > x`, for an `x` that is never below zero.
+    let zero_at = |id: PseudoId| consts.fget(id, width).is_some_and(|v| v.is_zero());
+    let never_below = |id: PseudoId| facts.never_lt_zero.contains(&consts.root(id, width));
+    match insn.op {
+        Opcode::FCmpOLt if never_below(lhs) && zero_at(rhs) => return fold_to_zero(),
+        Opcode::FCmpOGt if zero_at(lhs) && never_below(rhs) => return fold_to_zero(),
+        _ => {}
+    }
+
+    let (Some(a), Some(b)) = (consts.fget(lhs, width), consts.fget(rhs, width)) else {
+        return Simplification::None;
+    };
+    let Some(fmt) = facts.fp_format(insn.typ) else {
+        return Simplification::None;
+    };
+    match eval_fcmp(insn.op, fmt, a, b) {
+        Some(v) => Simplification::FoldToConst(v),
+        None => Simplification::None,
+    }
+}
+
+/// Fold float arithmetic over two constants.
+fn simplify_fbinop(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+    if insn.src.len() != 2 {
+        return Simplification::None;
+    }
+    let width = insn.size.max(1);
+    let (Some(a), Some(b)) = (
+        consts.fget(insn.src[0], width),
+        consts.fget(insn.src[1], width),
+    ) else {
+        return Simplification::None;
+    };
+    let Some(fmt) = facts.fp_format(insn.typ) else {
+        return Simplification::None;
+    };
+    match eval_fbinop(insn.op, fmt, a, b) {
+        Some(v) => Simplification::FoldToFloat(v),
+        None => Simplification::None,
+    }
+}
+
+/// Fold `FNeg` of a constant.
+///
+/// This is what makes a negative float literal a constant at all: `-1.5` is
+/// parsed as a negation of `1.5`, exactly as `-1` is of `1`, and the integer
+/// half has always folded here.
+fn simplify_funop(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+    if insn.src.len() != 1 {
+        return Simplification::None;
+    }
+    let Some(a) = consts.fget(insn.src[0], insn.size.max(1)) else {
+        return Simplification::None;
+    };
+    let Some(fmt) = facts.fp_format(insn.typ) else {
+        return Simplification::None;
+    };
+    match eval_funop(insn.op, fmt, a) {
+        Some(v) => Simplification::FoldToFloat(v),
+        None => Simplification::None,
+    }
+}
+
+/// Fold a float-to-float conversion of a constant, to `typ`'s format.
+fn simplify_fcvtf(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+    if insn.src.len() != 1 {
+        return Simplification::None;
+    }
+    let src_width = if insn.src_size != 0 {
+        insn.src_size
+    } else {
+        insn.size.max(1)
+    };
+    let Some(a) = consts.fget(insn.src[0], src_width) else {
+        return Simplification::None;
+    };
+    let (Some(src_fmt), Some(dst_fmt)) = (facts.fp_format(insn.src_typ), facts.fp_format(insn.typ))
+    else {
+        return Simplification::None;
+    };
+    match eval_fcvtf(insn.op, src_fmt, dst_fmt, a) {
+        Some(v) => Simplification::FoldToFloat(v),
+        None => Simplification::None,
+    }
+}
+
+/// Fold a float-to-integer conversion of a constant.
+///
+/// The source format comes from `src_typ`, not `typ`: a conversion's `typ` is
+/// the integer it produces, and the width it reads is the separate `src_size`.
+fn simplify_fcvt(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+    if insn.src.len() != 1 {
+        return Simplification::None;
+    }
+    let src_width = if insn.src_size != 0 {
+        insn.src_size
+    } else {
+        insn.size.max(1)
+    };
+    let Some(a) = consts.fget(insn.src[0], src_width) else {
+        return Simplification::None;
+    };
+    let Some(fmt) = facts.fp_format(insn.src_typ) else {
+        return Simplification::None;
+    };
+    match eval_fcvt(insn.op, insn.size.max(1), fmt, a) {
+        Some(v) => Simplification::FoldToConst(v),
+        None => Simplification::None,
+    }
+}
 
 fn simplify_neg(insn: &Instruction, consts: &ConstMap) -> Simplification {
     if insn.src.len() != 1 {
@@ -715,7 +1157,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -742,7 +1184,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -769,7 +1211,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -792,7 +1234,7 @@ mod tests {
         let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -815,7 +1257,7 @@ mod tests {
         let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -842,7 +1284,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -865,7 +1307,7 @@ mod tests {
         let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -893,7 +1335,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(!changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -921,7 +1363,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -951,7 +1393,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -976,7 +1418,7 @@ mod tests {
         let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -1005,7 +1447,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -1034,7 +1476,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -1063,7 +1505,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -1092,7 +1534,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -1121,7 +1563,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -1150,7 +1592,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -1181,7 +1623,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -1210,7 +1652,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -1239,7 +1681,7 @@ mod tests {
         ];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -1264,7 +1706,7 @@ mod tests {
         let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -1289,7 +1731,7 @@ mod tests {
         let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -1309,7 +1751,7 @@ mod tests {
         let pseudos = vec![Pseudo::val(PseudoId(0), 42), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -1327,7 +1769,7 @@ mod tests {
         let pseudos = vec![Pseudo::val(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
-        let changed = run(&mut func);
+        let changed = run(&mut func, &host_types());
         assert!(changed);
 
         let result_insn = &func.blocks[0].insns[1];
@@ -1369,6 +1811,11 @@ mod tests {
         TypeTable::new(&Target::host()).int_id
     }
 
+    /// The type table every test drives the pass with.
+    fn host_types() -> TypeTable {
+        TypeTable::new(&Target::host())
+    }
+
     // Constant folding through Copy
     //
     // `const_val` answers from the pseudo's kind, and a Copy target is an
@@ -1401,7 +1848,7 @@ mod tests {
             Pseudo::reg(PseudoId(3), 1),
         ];
         let mut func = make_test_func_with_insns(insns, pseudos);
-        assert!(run(&mut func));
+        assert!(run(&mut func, &host_types()));
 
         let add = insn_at(&func, 1);
         assert_eq!(add.op, Opcode::Copy, "the add should have folded");
@@ -1440,7 +1887,7 @@ mod tests {
         pseudos.push(Pseudo::reg(PseudoId(5), 5));
 
         let mut func = make_test_func_with_insns(insns, pseudos);
-        assert!(run(&mut func));
+        assert!(run(&mut func, &host_types()));
         let mul = insn_at(&func, 3);
         assert_eq!(mul.op, Opcode::Copy);
         assert_eq!(func.const_val(mul.src[0]), Some(20));
@@ -1489,7 +1936,10 @@ mod tests {
             Pseudo::reg(PseudoId(6), 2),
         ];
         let mut func = make_test_func_with_insns(insns, pseudos);
-        assert!(run(&mut func), "one pass must fold the whole chain");
+        assert!(
+            run(&mut func, &host_types()),
+            "one pass must fold the whole chain"
+        );
 
         let last = insn_at(&func, 2);
         assert_eq!(last.op, Opcode::Copy);
@@ -1536,7 +1986,7 @@ mod tests {
             Pseudo::reg(PseudoId(4), 1),
         ];
         let mut func = make_test_func_with_insns(insns, pseudos);
-        run(&mut func);
+        run(&mut func, &host_types());
 
         assert_eq!(insn_at(&func, 0).op, Opcode::Copy, "the mul still folds");
         assert_eq!(
@@ -1570,7 +2020,7 @@ mod tests {
             Pseudo::reg(PseudoId(12), 1),
         ];
         let mut func = make_test_func_with_insns(insns, pseudos);
-        run(&mut func);
+        run(&mut func, &host_types());
         assert_eq!(insn_at(&func, 1).op, Opcode::Add, "{why}");
     }
 
@@ -1628,7 +2078,7 @@ mod tests {
             Pseudo::reg(PseudoId(3), 2),
         ];
         let mut func = make_test_func_with_insns(insns, pseudos);
-        run(&mut func);
+        run(&mut func, &host_types());
         assert_eq!(
             insn_at(&func, 2).op,
             Opcode::Add,
@@ -1662,7 +2112,7 @@ mod tests {
             Pseudo::reg(PseudoId(3), 2),
         ];
         let mut func = make_test_func_with_insns(insns, pseudos);
-        assert!(run(&mut func));
+        assert!(run(&mut func, &host_types()));
         let add = insn_at(&func, 1);
         assert_eq!(add.op, Opcode::Copy);
         assert_eq!(add.src, vec![PseudoId(2)], "x + 0 is x");
@@ -1694,7 +2144,7 @@ mod tests {
             Pseudo::reg(PseudoId(3), 1),
         ];
         let mut func = make_test_func_with_insns(insns, pseudos);
-        run(&mut func);
+        run(&mut func, &host_types());
         assert!(crate::ir::validate::validate_function(&func).is_ok());
     }
 
@@ -1719,7 +2169,7 @@ mod tests {
             Pseudo::reg(PseudoId(2), 0),
         ];
         let mut func = make_test_func_with_insns(insns, pseudos);
-        assert!(run(&mut func));
+        assert!(run(&mut func, &host_types()));
         let d = insn_at(&func, 0);
         assert_eq!(d.op, Opcode::Copy);
         assert_eq!(func.const_val(d.src[0]), Some(0), "-1 / 2 is 0");
@@ -1742,7 +2192,7 @@ mod tests {
             Pseudo::reg(PseudoId(2), 0),
         ];
         let mut func = make_test_func_with_insns(insns, pseudos);
-        assert!(run(&mut func));
+        assert!(run(&mut func, &host_types()));
         let m = insn_at(&func, 0);
         assert_eq!(func.const_val(m.src[0]), Some(-1), "-1 % 3 is -1");
     }
@@ -1765,7 +2215,7 @@ mod tests {
             Pseudo::reg(PseudoId(2), 0),
         ];
         let mut func = make_test_func_with_insns(insns, pseudos);
-        assert!(run(&mut func));
+        assert!(run(&mut func, &host_types()));
         let d = insn_at(&func, 0);
         assert_eq!(
             func.const_val(d.src[0]),
@@ -1792,7 +2242,7 @@ mod tests {
             Pseudo::reg(PseudoId(2), 0),
         ];
         let mut func = make_test_func_with_insns(insns, pseudos);
-        assert!(run(&mut func));
+        assert!(run(&mut func, &host_types()));
         let c = insn_at(&func, 0);
         assert_eq!(func.const_val(c.src[0]), Some(1), "-1 < 0 is true");
     }
@@ -1822,7 +2272,7 @@ mod tests {
             Pseudo::reg(PseudoId(2), 0),
         ];
         let mut func = make_test_func_with_insns(vec![insn], pseudos);
-        assert!(run(&mut func));
+        assert!(run(&mut func, &host_types()));
         let c = insn_at(&func, 0);
         assert_eq!(
             func.const_val(c.src[0]),
@@ -1857,7 +2307,7 @@ mod tests {
                 Pseudo::reg(PseudoId(3), 3),
             ],
         );
-        assert!(run(&mut func));
+        assert!(run(&mut func, &host_types()));
         let cmp = &func.blocks[0].insns[3];
         assert_eq!(cmp.op, Opcode::Copy);
         assert_eq!(func.const_val(cmp.src[0]), Some(0), "x != x is 0");
@@ -1914,7 +2364,7 @@ mod tests {
                 Pseudo::reg(PseudoId(2), 2),
             ],
         );
-        assert!(run(&mut func));
+        assert!(run(&mut func, &host_types()));
         let insn = &func.blocks[0].insns[1];
         assert_eq!(insn.op, Opcode::Copy);
         assert_eq!(func.const_val(insn.src[0]), Some(-1));
@@ -1940,7 +2390,7 @@ mod tests {
                 Pseudo::reg(PseudoId(2), 2),
             ],
         );
-        run(&mut func);
+        run(&mut func, &host_types());
         assert_eq!(func.blocks[0].insns[1].op, Opcode::Lsr);
     }
 
@@ -1968,5 +2418,585 @@ mod tests {
             None,
             "the chain narrowed to 32; 64 was never carried"
         );
+    }
+    /// Two comparisons of one operand pair answer each other without knowing
+    /// the operands: disjoint orderings can never both hold, and exhaustive
+    /// ones always leave at least one holding.
+    #[test]
+    fn test_disjoint_relational_pair_folds_to_zero() {
+        // select(x == y, x != y, 0)  ->  0
+        assert_eq!(select_over_pair(Opcode::SetEq, Opcode::SetNe, 0), Some(0));
+        // select(x < y, x > y, 0)    ->  0
+        assert_eq!(select_over_pair(Opcode::SetLt, Opcode::SetGt, 0), Some(0));
+    }
+
+    #[test]
+    fn test_exhaustive_relational_pair_folds_to_one() {
+        // select(x == y, 1, x != y)  ->  1
+        assert_eq!(select_over_pair(Opcode::SetEq, Opcode::SetNe, 1), Some(1));
+        // select(x >= y, 1, x < y)   ->  1
+        assert_eq!(select_over_pair(Opcode::SetGe, Opcode::SetLt, 1), Some(1));
+    }
+
+    /// Overlapping but not exhaustive: nothing is decided.
+    #[test]
+    fn test_overlapping_relational_pair_does_not_fold() {
+        // select(x <= y, x >= y, 0): both hold when x == y.
+        assert_eq!(select_over_pair(Opcode::SetLe, Opcode::SetGe, 0), None);
+        // select(x < y, 1, x > y): neither holds when x == y.
+        assert_eq!(select_over_pair(Opcode::SetLt, Opcode::SetGt, 1), None);
+    }
+
+    /// A signed and an unsigned comparison of one pair are not each other's
+    /// complements, so their orderings must not be combined.
+    #[test]
+    fn test_signed_and_unsigned_are_not_combined() {
+        // `x < y` signed with `x >= y` unsigned would look exhaustive.
+        assert_eq!(select_over_pair(Opcode::SetLt, Opcode::SetAe, 1), None);
+    }
+
+    /// `(x < y) && (y < x)`: the same disjointness with the operands the
+    /// other way round.
+    #[test]
+    fn test_mirrored_operands_are_recognized() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_test_func_with_insns(
+            vec![
+                Instruction::binop(
+                    Opcode::SetLt,
+                    PseudoId(2),
+                    PseudoId(0),
+                    PseudoId(1),
+                    types.int_id,
+                    32,
+                ),
+                // operands swapped
+                Instruction::binop(
+                    Opcode::SetLt,
+                    PseudoId(3),
+                    PseudoId(1),
+                    PseudoId(0),
+                    types.int_id,
+                    32,
+                ),
+                Instruction::select(
+                    PseudoId(5),
+                    PseudoId(2),
+                    PseudoId(3),
+                    PseudoId(4),
+                    types.int_id,
+                    32,
+                ),
+            ],
+            vec![
+                Pseudo::arg(PseudoId(0), 0),
+                Pseudo::arg(PseudoId(1), 1),
+                Pseudo::reg(PseudoId(2), 2),
+                Pseudo::reg(PseudoId(3), 3),
+                Pseudo::val(PseudoId(4), 0),
+                Pseudo::reg(PseudoId(5), 5),
+            ],
+        );
+        assert!(run(&mut func, &host_types()));
+        let sel = &func.blocks[0].insns[3];
+        assert_eq!(sel.op, Opcode::Copy);
+        assert_eq!(func.const_val(sel.src[0]), Some(0));
+    }
+
+    /// `select(c, t, f)` with `c` and one arm comparing `%0` against `%1`,
+    /// and the other arm the constant `other`. Returns the folded constant,
+    /// or `None` when it did not fold.
+    fn select_over_pair(cond_op: Opcode, arm_op: Opcode, other: i128) -> Option<i128> {
+        let types = TypeTable::new(&Target::host());
+        // `other == 0` is `a && b`, so the comparison is the *true* arm;
+        // `other == 1` is `a || b`, so it is the false arm.
+        let (t, f) = if other == 0 {
+            (PseudoId(3), PseudoId(4))
+        } else {
+            (PseudoId(4), PseudoId(3))
+        };
+        let mut func = make_test_func_with_insns(
+            vec![
+                Instruction::binop(
+                    cond_op,
+                    PseudoId(2),
+                    PseudoId(0),
+                    PseudoId(1),
+                    types.int_id,
+                    32,
+                ),
+                Instruction::binop(
+                    arm_op,
+                    PseudoId(3),
+                    PseudoId(0),
+                    PseudoId(1),
+                    types.int_id,
+                    32,
+                ),
+                Instruction::select(PseudoId(5), PseudoId(2), t, f, types.int_id, 32),
+            ],
+            vec![
+                Pseudo::arg(PseudoId(0), 0),
+                Pseudo::arg(PseudoId(1), 1),
+                Pseudo::reg(PseudoId(2), 2),
+                Pseudo::reg(PseudoId(3), 3),
+                Pseudo::val(PseudoId(4), other),
+                Pseudo::reg(PseudoId(5), 5),
+            ],
+        );
+        run(&mut func, &host_types());
+        let sel = &func.blocks[0].insns[3];
+        if sel.op != Opcode::Copy {
+            return None;
+        }
+        func.const_val(sel.src[0])
+    }
+
+    // Floating point
+    //
+    // Two things here would be silent if they went wrong. A float comparison
+    // carries its *operand* type, so a folded one that keeps it puts an
+    // integer result in an SSE register; and `FloatVal` holds more bits than
+    // any target format, so an unrounded fold answers a question the program
+    // did not ask.
+
+    fn fval(id: u32, v: f64) -> Pseudo {
+        Pseudo::fval(PseudoId(id), FloatVal::from_f64(v))
+    }
+
+    /// One `FCmp` over two float constants, folded; returns the constant.
+    fn fold_fcmp(op: Opcode, a: f64, b: f64) -> Option<i128> {
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_test_func_with_insns(
+            vec![Instruction::binop(
+                op,
+                PseudoId(2),
+                PseudoId(0),
+                PseudoId(1),
+                types.double_id,
+                64,
+            )],
+            vec![fval(0, a), fval(1, b), Pseudo::reg(PseudoId(2), 2)],
+        );
+        run(&mut func, &host_types());
+        let insn = insn_at(&func, 0);
+        if insn.op != Opcode::Copy {
+            return None;
+        }
+        func.const_val(insn.src[0])
+    }
+
+    #[test]
+    fn float_comparisons_fold_over_constants() {
+        for (op, a, b, want) in [
+            (Opcode::FCmpOEq, 1.0, 1.0, 1),
+            (Opcode::FCmpOEq, 1.0, 2.0, 0),
+            (Opcode::FCmpONe, 1.0, 2.0, 1),
+            (Opcode::FCmpOLt, 1.0, 2.0, 1),
+            (Opcode::FCmpOLt, 2.0, 1.0, 0),
+            (Opcode::FCmpOLe, 2.0, 2.0, 1),
+            (Opcode::FCmpOGt, 2.0, 1.0, 1),
+            (Opcode::FCmpOGe, 1.0, 2.0, 0),
+            // C has one zero.
+            (Opcode::FCmpOEq, 0.0, -0.0, 1),
+        ] {
+            assert_eq!(fold_fcmp(op, a, b), Some(want), "{op:?} {a} {b}");
+        }
+    }
+
+    /// `FCmpONe` is the *unordered* form -- C's `!=`, true when either side
+    /// is a NaN -- and every other arm is ordered. The opcode names do not
+    /// say so, and both backends emit it this way.
+    #[test]
+    fn nan_is_unequal_to_itself_and_unordered_with_everything_else() {
+        let nan = f64::NAN;
+        assert_eq!(fold_fcmp(Opcode::FCmpONe, nan, nan), Some(1));
+        assert_eq!(fold_fcmp(Opcode::FCmpONe, nan, 1.0), Some(1));
+        for op in [
+            Opcode::FCmpOEq,
+            Opcode::FCmpOLt,
+            Opcode::FCmpOLe,
+            Opcode::FCmpOGt,
+            Opcode::FCmpOGe,
+        ] {
+            assert_eq!(fold_fcmp(op, nan, 1.0), Some(0), "{op:?}");
+            assert_eq!(fold_fcmp(op, 1.0, nan), Some(0), "{op:?}");
+        }
+    }
+
+    /// The folded copy must carry the comparison's *result* type. Keeping the
+    /// operand type made the backend return the constant in `%xmm0` for a
+    /// function returning `int`.
+    #[test]
+    fn a_folded_float_comparison_is_typed_int_not_double() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_test_func_with_insns(
+            vec![Instruction::binop(
+                Opcode::FCmpOLt,
+                PseudoId(2),
+                PseudoId(0),
+                PseudoId(1),
+                types.double_id,
+                64,
+            )],
+            vec![fval(0, 1.0), fval(1, 2.0), Pseudo::reg(PseudoId(2), 2)],
+        );
+        assert!(run(&mut func, &host_types()));
+        let insn = insn_at(&func, 0);
+        assert_eq!(insn.op, Opcode::Copy);
+        assert_eq!(insn.typ, Some(types.int_id));
+        assert_eq!(insn.size, types.size_bits(types.int_id));
+    }
+
+    /// `fabs(x) < 0.0` is false for every `x`, a NaN included, because an
+    /// unordered `<` is false as well. The value itself is unknown.
+    #[test]
+    fn fabs_is_never_below_zero() {
+        for (op, fabs_first) in [(Opcode::FCmpOLt, true), (Opcode::FCmpOGt, false)] {
+            let types = TypeTable::new(&Target::host());
+            let (l, r) = if fabs_first {
+                (PseudoId(1), PseudoId(2))
+            } else {
+                (PseudoId(2), PseudoId(1))
+            };
+            let mut func = make_test_func_with_insns(
+                vec![
+                    Instruction::new(Opcode::Fabs64)
+                        .with_target(PseudoId(1))
+                        .with_src(PseudoId(0))
+                        .with_type_and_size(types.double_id, 64),
+                    Instruction::binop(op, PseudoId(3), l, r, types.double_id, 64),
+                ],
+                vec![
+                    Pseudo::arg(PseudoId(0), 0),
+                    Pseudo::reg(PseudoId(1), 1),
+                    fval(2, 0.0),
+                    Pseudo::reg(PseudoId(3), 3),
+                ],
+            );
+            assert!(run(&mut func, &host_types()), "{op:?}");
+            let insn = insn_at(&func, 1);
+            assert_eq!(insn.op, Opcode::Copy, "{op:?}");
+            assert_eq!(func.const_val(insn.src[0]), Some(0), "{op:?}");
+        }
+    }
+
+    /// The weaker neighbours must not fold: `fabs(x) <= 0.0` is true for a
+    /// zero argument, and `fabs(x) >= 0.0` is false for a NaN one.
+    #[test]
+    fn the_non_strict_fabs_comparisons_do_not_fold() {
+        for op in [Opcode::FCmpOLe, Opcode::FCmpOGe, Opcode::FCmpOEq] {
+            let types = TypeTable::new(&Target::host());
+            let mut func = make_test_func_with_insns(
+                vec![
+                    Instruction::new(Opcode::Fabs64)
+                        .with_target(PseudoId(1))
+                        .with_src(PseudoId(0))
+                        .with_type_and_size(types.double_id, 64),
+                    Instruction::binop(
+                        op,
+                        PseudoId(3),
+                        PseudoId(1),
+                        PseudoId(2),
+                        types.double_id,
+                        64,
+                    ),
+                ],
+                vec![
+                    Pseudo::arg(PseudoId(0), 0),
+                    Pseudo::reg(PseudoId(1), 1),
+                    fval(2, 0.0),
+                    Pseudo::reg(PseudoId(3), 3),
+                ],
+            );
+            run(&mut func, &host_types());
+            assert_eq!(insn_at(&func, 1).op, op, "{op:?} must survive");
+        }
+    }
+
+    /// One `FCvtS`/`FCvtU` of a float constant, folded.
+    fn fold_fcvt(op: Opcode, v: f64, dst_size: u32) -> Option<i128> {
+        let types = TypeTable::new(&Target::host());
+        let mut insn = Instruction::new(op)
+            .with_target(PseudoId(1))
+            .with_src(PseudoId(0))
+            .with_type_and_size(types.int_id, dst_size);
+        insn.src_typ = Some(types.double_id);
+        insn.src_size = 64;
+        let mut func =
+            make_test_func_with_insns(vec![insn], vec![fval(0, v), Pseudo::reg(PseudoId(1), 1)]);
+        run(&mut func, &host_types());
+        let got = insn_at(&func, 0);
+        if got.op != Opcode::Copy {
+            return None;
+        }
+        func.const_val(got.src[0])
+    }
+
+    #[test]
+    fn float_to_integer_conversions_fold() {
+        assert_eq!(fold_fcvt(Opcode::FCvtS, 1.0, 32), Some(1));
+        assert_eq!(fold_fcvt(Opcode::FCvtS, 1.9, 32), Some(1));
+        assert_eq!(fold_fcvt(Opcode::FCvtS, -1.9, 32), Some(-1));
+        assert_eq!(fold_fcvt(Opcode::FCvtU, 3.5, 32), Some(3));
+    }
+
+    /// Out of the destination's range the conversion is undefined, and the
+    /// hardware's answer is the target's business, not this pass's.
+    #[test]
+    fn an_out_of_range_conversion_is_left_alone() {
+        assert_eq!(fold_fcvt(Opcode::FCvtS, 3e9, 32), None);
+        assert_eq!(fold_fcvt(Opcode::FCvtS, -3e9, 32), None);
+        assert_eq!(fold_fcvt(Opcode::FCvtU, -1.0, 32), None);
+        assert_eq!(fold_fcvt(Opcode::FCvtS, f64::NAN, 32), None);
+        assert_eq!(fold_fcvt(Opcode::FCvtS, f64::INFINITY, 64), None);
+        // The same value the 32-bit case refused does fit 64 bits.
+        assert_eq!(fold_fcvt(Opcode::FCvtS, 3e9, 64), Some(3_000_000_000));
+    }
+
+    /// One float binary/unary op over constants; returns the folded value
+    /// and the `SetVal` the instruction became.
+    fn fold_float(op: Opcode, typ: TypeId, size: u32, args: &[f64]) -> Option<(FloatVal, u32)> {
+        let target = PseudoId(args.len() as u32);
+        let mut pseudos: Vec<Pseudo> = args
+            .iter()
+            .enumerate()
+            .map(|(i, v)| fval(i as u32, *v))
+            .collect();
+        pseudos.push(Pseudo::reg(target, target.0));
+        let insn = match args.len() {
+            1 => Instruction::new(op)
+                .with_target(target)
+                .with_src(PseudoId(0))
+                .with_type_and_size(typ, size),
+            _ => Instruction::binop(op, target, PseudoId(0), PseudoId(1), typ, size),
+        };
+        let mut func = make_test_func_with_insns(vec![insn], pseudos);
+        run(&mut func, &host_types());
+        let got = insn_at(&func, 0);
+        if got.op != Opcode::SetVal {
+            return None;
+        }
+        let size = got.size;
+        match func.get_pseudo(target).map(|p| p.kind.clone()) {
+            Some(PseudoKind::FVal(v)) => Some((v, size)),
+            _ => None,
+        }
+    }
+
+    /// The fold works the other way round from the integer one: the target
+    /// pseudo *becomes* the constant, and its instruction becomes the
+    /// `SetVal` that gives it a width.
+    #[test]
+    fn float_arithmetic_folds_into_a_sized_setval() {
+        let types = TypeTable::new(&Target::host());
+        let cases: &[(Opcode, &[f64], f64)] = &[
+            (Opcode::FNeg, &[1.5], -1.5),
+            (Opcode::FAdd, &[1.5, 2.25], 3.75),
+            (Opcode::FSub, &[1.5, 0.5], 1.0),
+            (Opcode::FMul, &[1.5, 2.0], 3.0),
+            (Opcode::FDiv, &[3.0, 2.0], 1.5),
+        ];
+        for (op, args, want) in cases {
+            let got = fold_float(*op, types.double_id, 64, args);
+            assert_eq!(
+                got.map(|(v, sz)| (v.to_f64(), sz)),
+                Some((*want, 64)),
+                "{op:?}"
+            );
+        }
+    }
+
+    /// The width comes from the instruction, not from a default. An `FVal`
+    /// with no `SetVal` is resolved at 64 bits, so a folded `float` emitted
+    /// without one is read out of the wrong number of bytes.
+    #[test]
+    fn a_folded_float_keeps_its_own_width() {
+        let types = TypeTable::new(&Target::host());
+        let got = fold_float(Opcode::FAdd, types.float_id, 32, &[1.5, 2.25]);
+        assert_eq!(got.map(|(v, sz)| (v.to_f64(), sz)), Some((3.75, 32)));
+    }
+
+    /// Rounded at the format the program computes in, not at the 128 bits a
+    /// literal is carried in: `0.1 + 0.2` is a `double` sum of two `double`s.
+    #[test]
+    fn float_arithmetic_rounds_at_the_operand_format() {
+        let types = TypeTable::new(&Target::host());
+        let wide = fold_float(Opcode::FAdd, types.double_id, 64, &[0.1, 0.2]);
+        assert_eq!(wide.map(|(v, _)| v.to_f64()), Some(0.1f64 + 0.2f64));
+        assert_ne!(wide.map(|(v, _)| v.to_f64()), Some(0.3f64));
+
+        // The same sum in `float` is a different number again.
+        let narrow = fold_float(Opcode::FAdd, types.float_id, 32, &[0.1, 0.2]);
+        assert_eq!(
+            narrow.map(|(v, _)| v.to_f64() as f32),
+            Some(0.1f32 + 0.2f32)
+        );
+    }
+
+    /// Anything that raises a floating-point exception is left to run time:
+    /// C lets a program read the flag, and folding would take it away.
+    #[test]
+    fn arithmetic_that_raises_is_not_folded() {
+        let types = TypeTable::new(&Target::host());
+        let d = types.double_id;
+        assert_eq!(fold_float(Opcode::FDiv, d, 64, &[1.0, 0.0]), None);
+        assert_eq!(fold_float(Opcode::FAdd, d, 64, &[f64::NAN, 1.0]), None);
+        assert_eq!(fold_float(Opcode::FMul, d, 64, &[f64::INFINITY, 2.0]), None);
+        // Overflow to infinity raises too, so the sum must survive.
+        assert_eq!(fold_float(Opcode::FMul, d, 64, &[1e300, 1e300]), None);
+        // A sign flip computes nothing and raises nothing, so it folds for
+        // every operand.
+        assert!(fold_float(Opcode::FNeg, d, 64, &[f64::INFINITY]).is_some());
+    }
+
+    /// One `FCvtF` from `src` to `dst`, folded.
+    fn fold_fcvtf(v: f64, src: (TypeId, u32), dst: (TypeId, u32)) -> Option<f64> {
+        let mut insn = Instruction::new(Opcode::FCvtF)
+            .with_target(PseudoId(1))
+            .with_src(PseudoId(0))
+            .with_type_and_size(dst.0, dst.1);
+        insn.src_typ = Some(src.0);
+        insn.src_size = src.1;
+        let mut func =
+            make_test_func_with_insns(vec![insn], vec![fval(0, v), Pseudo::reg(PseudoId(1), 1)]);
+        run(&mut func, &host_types());
+        match func.get_pseudo(PseudoId(1)).map(|p| p.kind.clone()) {
+            Some(PseudoKind::FVal(f)) => Some(f.to_f64()),
+            _ => None,
+        }
+    }
+
+    /// A conversion between float formats folds, rounding to the
+    /// destination -- and refuses when the narrowing overflows.
+    #[test]
+    fn float_to_float_conversions_fold() {
+        let types = TypeTable::new(&Target::host());
+        let (d, f) = ((types.double_id, 64), (types.float_id, 32));
+        assert_eq!(fold_fcvtf(1.5, d, f), Some(1.5));
+        // Rounded to `float`, which cannot hold this exactly.
+        assert_eq!(fold_fcvtf(0.1, d, f), Some(0.1f32 as f64));
+        // Overflows on the way to `float`.
+        assert_eq!(fold_fcvtf(1e300, d, f), None);
+    }
+
+    /// A conversion rounds at its *source* format before its destination.
+    ///
+    /// The operand is a literal carried at 128 significand bits, so it is
+    /// not yet the value its own type holds. Going straight to the
+    /// destination skips a rounding the program performs:
+    /// `(float)(_Float16)0.3f16` is the nearest `float` to the nearest
+    /// `_Float16` to `0.3`, which is not the nearest `float` to `0.3`.
+    ///
+    /// A unit test rather than an e2e one on purpose: x86-64 re-rounds
+    /// through the half-precision bits when it emits the constant, so the
+    /// host masks this entirely and only an aarch64 run showed it.
+    #[test]
+    fn a_conversion_rounds_at_its_source_format_first() {
+        let types = TypeTable::new(&Target::host());
+        let h = (types.float16_id, 16);
+        let f = (types.float_id, 32);
+        let want = f64::from(half_of(0.3));
+        assert_eq!(fold_fcvtf(0.3, h, f), Some(want));
+        assert_ne!(fold_fcvtf(0.3, h, f), Some(f64::from(0.3f32)));
+    }
+
+    /// `v` rounded to IEEE binary16 and back, computed independently of the
+    /// code under test.
+    fn half_of(v: f64) -> f32 {
+        let bits = crate::float::f64_to_f16_bits(v);
+        let sign = u32::from(bits >> 15) << 31;
+        let exp = i32::from((bits >> 10) & 0x1F);
+        let frac = u32::from(bits & 0x3FF);
+        if exp == 0 {
+            // Subnormal or zero; 0.3 is neither, so this is for completeness.
+            return f32::from_bits(sign) + (frac as f32) * 2f32.powi(-24);
+        }
+        f32::from_bits(sign | (((exp - 15 + 127) as u32) << 23) | (frac << 13))
+    }
+
+    /// A pseudo that means something beyond its value must not be converted.
+    #[test]
+    fn only_a_plain_temporary_becomes_a_constant() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_test_func_with_insns(
+            vec![Instruction::new(Opcode::FNeg)
+                .with_target(PseudoId(1))
+                .with_src(PseudoId(0))
+                .with_type_and_size(types.double_id, 64)],
+            vec![fval(0, 1.5), Pseudo::arg(PseudoId(1), 0)],
+        );
+        run(&mut func, &host_types());
+        assert_eq!(insn_at(&func, 0).op, Opcode::FNeg, "an Arg is not a temp");
+        assert!(!func.is_plain_temp(PseudoId(1)));
+        // An id nothing has registered is a plain register, which is how
+        // most temporaries arrive: the linearizer records only the pseudos
+        // that are something else.
+        assert!(func.is_plain_temp(PseudoId(97)));
+    }
+
+    // Integer width conversions
+    //
+    // Unary in the IR, carrying the *source* width in `src_size`. Reading the
+    // operand at `size` instead is the identity for an extension, which is
+    // how a negative `char` comes back positive.
+
+    /// One `Sext`/`Zext`/`Trunc` of a constant, folded.
+    fn fold_convert(op: Opcode, v: i128, src_size: u32, dst_size: u32) -> Option<i128> {
+        let types = TypeTable::new(&Target::host());
+        let mut insn = Instruction::new(op)
+            .with_target(PseudoId(1))
+            .with_src(PseudoId(0))
+            .with_type_and_size(types.int_id, dst_size);
+        insn.src_size = src_size;
+        let mut func = make_test_func_with_insns(
+            vec![insn],
+            vec![Pseudo::val(PseudoId(0), v), Pseudo::reg(PseudoId(1), 1)],
+        );
+        run(&mut func, &host_types());
+        let got = insn_at(&func, 0);
+        if got.op != Opcode::Copy {
+            return None;
+        }
+        func.const_val(got.src[0])
+    }
+
+    #[test]
+    fn integer_conversions_fold_at_the_source_width() {
+        // Sign extension reads the operand signed at its own width.
+        assert_eq!(fold_convert(Opcode::Sext, 200, 8, 32), Some(-56));
+        assert_eq!(fold_convert(Opcode::Sext, -56, 8, 32), Some(-56));
+        assert_eq!(fold_convert(Opcode::Sext, 70000, 16, 32), Some(4464));
+        // Zero extension reads it unsigned.
+        assert_eq!(fold_convert(Opcode::Zext, 200, 8, 32), Some(200));
+        assert_eq!(fold_convert(Opcode::Zext, -56, 8, 32), Some(200));
+        assert_eq!(fold_convert(Opcode::Zext, -1, 32, 64), Some(0xFFFF_FFFF));
+        // Truncation keeps the low bits, but only where they mean one
+        // thing: see below.
+        assert_eq!(fold_convert(Opcode::Trunc, 0x1234, 32, 8), Some(0x34));
+    }
+
+    /// A truncation's result is read at a *wider* width by whatever consumes
+    /// it, and nothing in the IR says how it is widened: `-(unsigned char)200`
+    /// is `trunc.32to8` feeding `neg.32` with no extension between them.
+    /// Leaving the `Trunc` in place is what lets the backend's move decide,
+    /// so a value that reads two ways must not be folded away.
+    #[test]
+    fn an_ambiguous_truncation_is_left_alone() {
+        // 200 at eight bits is 200 unsigned and -56 signed.
+        assert_eq!(fold_convert(Opcode::Trunc, 200, 32, 8), None);
+        assert_eq!(fold_convert(Opcode::Trunc, -1, 32, 8), None);
+        assert_eq!(fold_convert(Opcode::Trunc, 0xFF, 32, 8), None);
+        // These read the same either way, so they fold.
+        assert_eq!(fold_convert(Opcode::Trunc, 0x1200, 32, 8), Some(0));
+        assert_eq!(fold_convert(Opcode::Trunc, 100, 32, 8), Some(100));
+    }
+
+    /// Without a source width an extension cannot be read at all, and
+    /// falling back on `size` would make it the identity.
+    #[test]
+    fn an_extension_with_no_source_width_is_left_alone() {
+        assert_eq!(fold_convert(Opcode::Sext, 200, 0, 32), None);
+        assert_eq!(fold_convert(Opcode::Zext, 200, 0, 32), None);
     }
 }

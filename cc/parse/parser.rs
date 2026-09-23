@@ -2231,6 +2231,12 @@ impl Parser<'_> {
 /// [`crate::constexpr`] owns the walk; what differs between the two hosts is
 /// only what an identifier means and how a floating subexpression folds.
 impl crate::constexpr::ConstEnv for Parser<'_> {
+    /// Every constant expression the parser folds is one C requires, so it
+    /// always answers.
+    fn deferred_constant_p(&self, _scope: ConstScope) -> Option<i128> {
+        Some(0)
+    }
+
     fn types(&self) -> &TypeTable {
         self.types
     }

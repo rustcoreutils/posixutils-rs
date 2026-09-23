@@ -717,15 +717,21 @@ pub enum Directive {
     /// .size symbol, size (ELF only)
     Size { sym: Symbol, size: u32 },
 
-    /// .comm symbol, size, align - allocate common (BSS) storage
-    Comm { sym: Symbol, size: u32, align: u32 },
-
     /// Allocate file-scope, internal-linkage BSS storage for a single symbol.
     /// Emitted as `.local sym` + `.comm sym, size, align` on ELF (which routes
     /// the symbol to `.bss` with local visibility) and as
     /// `.zerofill __DATA,__bss,sym,size,log2(align)` on Mach-O. The alignment
     /// is expressed in bytes; the emitter converts to log2 on Mach-O.
     BssLocal { sym: Symbol, size: u32, align: u32 },
+
+    /// An exported object with no initialized bytes, as a *definition*.
+    ///
+    /// Distinct from `Comm`, which declares a **common symbol**: those merge
+    /// across translation units, so two definitions of one object link
+    /// silently where C17 6.9p5 allows one and gcc reports
+    /// `multiple definition`. gcc has defaulted to `-fno-common` since 10,
+    /// and emits no common symbols at all.
+    BssGlobal { sym: Symbol, size: u32, align: u32 },
 
     // ========================================================================
     // Alignment
@@ -926,17 +932,16 @@ impl Directive {
         }
     }
 
-    pub fn comm(name: impl Into<String>, size: u32, align: u32) -> Self {
-        Directive::Comm {
+    pub fn bss_local(name: impl Into<String>, size: u32, align: u32) -> Self {
+        Directive::BssLocal {
             sym: Symbol::global(name),
             size,
             align,
         }
     }
 
-    /// Allocate a local-linkage zero-filled symbol in BSS-class storage.
-    pub fn bss_local(name: impl Into<String>, size: u32, align: u32) -> Self {
-        Directive::BssLocal {
+    pub fn bss_global(name: impl Into<String>, size: u32, align: u32) -> Self {
+        Directive::BssGlobal {
             sym: Symbol::global(name),
             size,
             align,
@@ -1139,26 +1144,35 @@ impl EmitAsm for Directive {
                     let _ = writeln!(out, ".size {}, .-{}", name, name);
                 }
             }
-            Directive::Comm { sym, size, align } => {
-                // macOS uses log2(alignment) for .comm, Linux uses byte alignment
-                let align_value = match target.os {
+            Directive::BssGlobal { sym, size, align } => {
+                let name = sym.format_for_target(target);
+                let _ = writeln!(out, ".globl {name}");
+                match target.os {
                     Os::MacOS => {
-                        // Convert byte alignment to log2
-                        if *align == 0 {
+                        // `.zerofill` names the symbol itself, so there is no
+                        // label-then-data shape to follow here.
+                        let align_log2 = if *align == 0 {
                             0
                         } else {
                             align.trailing_zeros()
-                        }
+                        };
+                        let _ = writeln!(out, ".zerofill __DATA,__bss,{name},{size},{align_log2}");
                     }
-                    Os::Linux | Os::FreeBSD => *align,
-                };
-                let _ = writeln!(
-                    out,
-                    ".comm {},{},{}",
-                    sym.format_for_target(target),
-                    size,
-                    align_value
-                );
+                    Os::Linux | Os::FreeBSD => {
+                        let _ = writeln!(out, ".bss");
+                        if *align > 1 {
+                            // `.p2align`, as everything else here spells it:
+                            // GAS reads a bare `.align` on x86 ELF as a byte
+                            // count, so the log2 would be a different and
+                            // often invalid alignment.
+                            let _ = writeln!(out, ".p2align {}", align.trailing_zeros());
+                        }
+                        let _ = writeln!(out, ".type {name},@object");
+                        let _ = writeln!(out, ".size {name},{size}");
+                        let _ = writeln!(out, "{name}:");
+                        let _ = writeln!(out, ".zero {size}");
+                    }
+                }
             }
             Directive::BssLocal { sym, size, align } => match target.os {
                 Os::MacOS => {
@@ -1604,63 +1618,35 @@ mod tests {
         assert_eq!(out, "    .cfi_offset %rbp, -16\n");
     }
 
+    /// `.bss` storage as a *definition*, which is the whole point: a common
+    /// symbol would merge with another translation unit's definition of the
+    /// same object, and gcc emits none.
     #[test]
-    fn test_directive_comm() {
+    fn test_directive_bss_global() {
         let linux = Target::new(Arch::X86_64, Os::Linux);
         let macos = Target::new(Arch::X86_64, Os::MacOS);
-        let freebsd = Target::new(Arch::X86_64, Os::FreeBSD);
-
-        // Linux uses byte alignment directly
-        let mut out = String::new();
-        Directive::comm("my_var", 8, 8).emit(&linux, &mut out);
-        assert_eq!(out, ".comm my_var,8,8\n");
-
-        // macOS uses log2(alignment): 8 bytes = 2^3, so log2(8) = 3
-        let mut out = String::new();
-        Directive::comm("my_var", 8, 8).emit(&macos, &mut out);
-        assert_eq!(out, ".comm _my_var,8,3\n");
-
-        // FreeBSD uses byte alignment like Linux
-        let mut out = String::new();
-        Directive::comm("my_var", 8, 8).emit(&freebsd, &mut out);
-        assert_eq!(out, ".comm my_var,8,8\n");
-
-        // Test alignment=1: macOS log2(1)=0, Linux/FreeBSD=1
-        let mut out = String::new();
-        Directive::comm("byte_var", 1, 1).emit(&linux, &mut out);
-        assert_eq!(out, ".comm byte_var,1,1\n");
 
         let mut out = String::new();
-        Directive::comm("byte_var", 1, 1).emit(&macos, &mut out);
-        assert_eq!(out, ".comm _byte_var,1,0\n");
+        Directive::bss_global("my_var", 8, 8).emit(&linux, &mut out);
+        assert_eq!(
+            out,
+            ".globl my_var\n.bss\n.p2align 3\n.type my_var,@object\n.size my_var,8\nmy_var:\n.zero 8\n"
+        );
+        assert!(
+            !out.contains(".comm"),
+            "a definition, not a common symbol: {out}"
+        );
 
-        // Test alignment=2: macOS log2(2)=1, Linux=2
+        // Mach-O has no label-then-data shape here: `.zerofill` names the
+        // symbol, and takes log2 of the alignment.
         let mut out = String::new();
-        Directive::comm("short_var", 2, 2).emit(&linux, &mut out);
-        assert_eq!(out, ".comm short_var,2,2\n");
+        Directive::bss_global("my_var", 8, 8).emit(&macos, &mut out);
+        assert_eq!(out, ".globl _my_var\n.zerofill __DATA,__bss,_my_var,8,3\n");
 
+        // Alignment 1 emits no directive at all.
         let mut out = String::new();
-        Directive::comm("short_var", 2, 2).emit(&macos, &mut out);
-        assert_eq!(out, ".comm _short_var,2,1\n");
-
-        // Test alignment=4: macOS log2(4)=2, Linux=4
-        let mut out = String::new();
-        Directive::comm("int_var", 4, 4).emit(&linux, &mut out);
-        assert_eq!(out, ".comm int_var,4,4\n");
-
-        let mut out = String::new();
-        Directive::comm("int_var", 4, 4).emit(&macos, &mut out);
-        assert_eq!(out, ".comm _int_var,4,2\n");
-
-        // Test alignment=16: macOS log2(16)=4, Linux=16
-        // (used for large arrays per clang's LargeArrayMinWidth)
-        let mut out = String::new();
-        Directive::comm("big_array", 64, 16).emit(&linux, &mut out);
-        assert_eq!(out, ".comm big_array,64,16\n");
-
-        let mut out = String::new();
-        Directive::comm("big_array", 64, 16).emit(&macos, &mut out);
-        assert_eq!(out, ".comm _big_array,64,4\n");
+        Directive::bss_global("byte_var", 1, 1).emit(&linux, &mut out);
+        assert!(!out.contains("p2align"), "{out}");
     }
 
     #[test]

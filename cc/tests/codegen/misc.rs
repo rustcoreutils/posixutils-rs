@@ -9271,21 +9271,7 @@ fn asm_for(prefix: &str, src: &str) -> String {
 
 /// `asm_for` with explicit options -- an optimizer decision is invisible
 /// without one, since the default here is `-O0`.
-fn asm_for_at(prefix: &str, src: &str, extra: &[&str]) -> String {
-    let dir = plib::tmp::Builder::new()
-        .prefix(prefix)
-        .tempdir()
-        .expect("tempdir");
-    let c = dir.path().join("t.c");
-    let s = dir.path().join("t.s");
-    std::fs::write(&c, src).expect("write source");
-    let mut args = vec!["-S"];
-    args.extend_from_slice(extra);
-    args.extend_from_slice(&[c.to_str().unwrap(), "-o", s.to_str().unwrap()]);
-    let out = crate::common::run_c17(&args);
-    assert!(out.success, "compile failed: {}", out.stderr);
-    std::fs::read_to_string(&s).expect("read asm")
-}
+use crate::common::asm_for_at;
 
 /// A zero-initialized definition took the `.comm`/`.bss` fast path, which
 /// returns before the `.weak` and visibility directives are emitted. A common
@@ -9316,10 +9302,18 @@ int main(void) { return hidden_zero + weak_zero + hidden_init - 7 + plain_zero; 
         asm.contains(".hidden hidden_init"),
         "initialized hidden variable lost its visibility:\n{asm}"
     );
-    // The unattributed one still gets the fast path it was always entitled to.
+    // The unattributed one still gets the fast path it was always entitled
+    // to -- but as a *definition*. A common symbol merges with another
+    // translation unit's definition of the same object, which C17 6.9p5 does
+    // not allow and gcc reports.
+    assert_eq!(
+        section_of(&asm, "plain_zero"),
+        Some(".bss"),
+        "an unattributed zero-initialized global still belongs in .bss:\n{asm}"
+    );
     assert!(
-        asm.contains(".comm plain_zero"),
-        "an unattributed zero-initialized global should still be common:\n{asm}"
+        !asm.contains(".comm plain_zero"),
+        "it must not be a common symbol:\n{asm}"
     );
 }
 
@@ -12566,6 +12560,643 @@ int main(void)
     for opt in ["-O1", "-O2"] {
         assert_eq!(
             compile_and_run("c17_shift_identities", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// Two comparisons of the same operand pair answer each other.
+///
+/// `&&` and `||` lower to a diamond because C forbids evaluating the right
+/// operand once the left has decided. When evaluating it anyway cannot be
+/// observed, if-conversion collapses the diamond into a `select`, and the two
+/// relationals end up side by side where a peephole can compare their
+/// orderings: `&&` is never true when they are disjoint, `||` always true when
+/// together they cover less, equal and greater.
+///
+/// Operands written the other way round count: `(x < y) && (y < x)` is the
+/// same disjointness with the mask mirrored.
+#[test]
+fn codegen_relational_pairs_over_one_operand_pair_fold() {
+    let code = r#"
+extern void link_error0(void);
+extern void link_error1(void);
+
+__attribute__((noinline)) static void never(int x, int y)
+{
+    if ((x == y) && (x != y)) link_error0();
+    if ((x < y) && (x > y)) link_error0();
+    if ((x < y) && (y < x)) link_error0();
+    if ((x <= y) && (y < x)) link_error0();
+}
+
+__attribute__((noinline)) static void always(int x, int y)
+{
+    if ((x == y) || (x != y)) { } else link_error1();
+    if ((x >= y) || (x < y)) { } else link_error1();
+    if ((x <= y) || (y < x)) { } else link_error1();
+}
+
+/* Signed and unsigned comparisons of one pair are not each other's
+   complements. Read without regard to signedness these two orderings would
+   be exhaustive -- less, together with greater-or-equal -- and the whole
+   thing would fold to 1. It must not. */
+__attribute__((noinline)) static int mixed(int x, int y)
+{
+    return ((x < y) || ((unsigned)x >= (unsigned)y)) ? 1 : 0;
+}
+
+int main(void)
+{
+    never(0, 0); never(1, 2); never(4, 3);
+    always(0, 0); always(1, 2); always(4, 3);
+    /* Signed says -1 < 1, so the first arm carries it. */
+    if (!mixed(-1, 1)) return 1;
+    /* The case that proves it did not fold: signed says 1 < -1 is false, and
+       unsigned says 1 >= 0xFFFFFFFF is false too, so the answer is 0. A fold
+       that ignored signedness would have answered 1. */
+    if (mixed(1, -1)) return 2;
+    return 0;
+}
+"#;
+    // `link_error0`/`link_error1` are never defined, so a surviving call is a
+    // link failure. `-O0` folds nothing, exactly as the torture test's own
+    // `#ifndef __OPTIMIZE__` fallback concedes.
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_relational_pairs", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// If-conversion must not make the right operand of `&&` run when the left
+/// already decided.
+///
+/// This is the guarantee C makes and the reason the diamond exists at all.
+/// Collapsing one whose arm calls a function, touches memory, or can trap
+/// would be a miscompile that only shows up when the guard was load-bearing --
+/// which is the usual reason the guard was written.
+#[test]
+fn codegen_short_circuit_still_short_circuits() {
+    let code = r#"
+#include <stdlib.h>
+
+int calls;
+__attribute__((noinline)) static int bump(void) { calls++; return 1; }
+
+volatile int zero = 0;
+volatile int one = 1;
+
+int main(void)
+{
+    /* A call on the right of && must not run when the left is false. */
+    if (zero && bump()) return 1;
+    if (calls != 0) return 2;
+    /* ...and must when it is true. */
+    if (!(one && bump())) return 3;
+    if (calls != 1) return 4;
+
+    /* The || mirror. */
+    if (!(one || bump())) return 5;
+    if (calls != 1) return 6;
+    if (!(zero || bump())) return 7;
+    if (calls != 2) return 8;
+
+    /* A division guarded by its own divisor must not be speculated: if the
+       right operand ran unconditionally this traps. */
+    { int d = zero; if (d != 0 && (100 / d) == 1) return 9; }
+
+    /* A load guarded by a null check, likewise. */
+    { int *p = (int *)0; if (p != 0 && *p == 0) return 10; }
+
+    /* Side effects in the right operand happen exactly once. */
+    { int n = 0; int r = (one && (n++, 1)); if (!r || n != 1) return 11; }
+
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_short_circuit_guard", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// Float constants reach the optimizer: arithmetic over two of them folds,
+/// so does a comparison and a conversion, and `fabs(x) < 0.0` folds without
+/// knowing `x` at all.
+///
+/// Three things here answer differently from the integer rules underneath
+/// them, and each has its own arm below. NaN makes a comparison *false*
+/// rather than reversing it, so only `!=` is true of one -- which is why the
+/// `fabs` rule is stated as "never less than zero" rather than "non-negative"
+/// and covers only the strict form. A conversion whose value does not fit is
+/// undefined, so it must still be computed at run time. And a comparison
+/// carries its *operand* type, so a folded one had to be re-typed: left as a
+/// `double`, the constant came back in an SSE register from a function
+/// returning `int`.
+#[test]
+fn codegen_float_constants_fold() {
+    let code = r#"
+extern double fabs(double);
+extern void link_error(void);
+extern void abort(void);
+
+volatile double opaque = 1.0;
+
+__attribute__((noinline)) static void folds(double x)
+{
+    /* No absolute value is below zero, a NaN argument included: an
+       unordered `<` is false as well. */
+    if (fabs(x) < 0.0) link_error();
+    if (0.0 > fabs(x)) link_error();
+
+    /* Both constants known. A negative literal is a negation of a positive
+       one, exactly as in the integer case, so `-0.0` folding at all is the
+       `FNeg` rule. */
+    if (1.0 > 2.0) link_error();
+    if (2.0 != 2.0) link_error();
+    if (-0.0 != 0.0) link_error();
+    if ((int) 1.9 != 1) link_error();
+    if ((int) -1.9 != -1) link_error();
+    if ((unsigned) 3.5 != 3u) link_error();
+
+    /* Arithmetic, rounded at the format the program computes in rather than
+       at the width the literals are carried in: at 128 significand bits
+       these three would come out equal. */
+    if (1.5 * 2.0 - 0.5 != 2.5) link_error();
+    if (0.1 + 0.2 == 0.3) link_error();
+    if ((float) (0.1f + 0.2f) != 0.3f) link_error();
+    if ((double) 1.5f != 1.5) link_error();
+}
+
+/* The neighbours of the fabs rule that do NOT hold. Each is true or false
+   depending on the argument, so each must still be evaluated. */
+__attribute__((noinline)) static int le_zero(double x) { return fabs(x) <= 0.0; }
+__attribute__((noinline)) static int ge_zero(double x) { return fabs(x) >= 0.0; }
+
+/* A folded comparison returns an `int`, in an integer register. */
+__attribute__((noinline)) static int always_false(void) { return 1.0 > 2.0; }
+
+/* Out of `int` range, so undefined and not foldable: this must still be the
+   hardware's answer rather than one invented here. */
+__attribute__((noinline)) static long big(void) { return (long) 3e9; }
+
+/* Neither is foldable either, because each raises: one overflows to
+   infinity on the way to `float`, the other divides by zero. */
+__attribute__((noinline)) static float overflows(void) { return (float) 1e300; }
+__attribute__((noinline)) static double by_zero(double z) { return 1.0 / z; }
+
+/* A negative zero is a *constant* once the negation folds, and it has to
+   survive being materialized: an XMM register zeroed with `xorpd` holds
+   `+0.0`, which compares equal under `==` and is a different value under
+   `signbit` and `copysign`. */
+__attribute__((noinline)) static int neg_zero_keeps_its_sign(void)
+{
+    double d = -0.0;
+    float  f = -0.0f;
+    return __builtin_signbit(d) && __builtin_signbit(f)
+        && !__builtin_signbit(0.0) && !__builtin_signbit(0.0f);
+}
+
+int main(void)
+{
+    double nan = __builtin_nan("");
+
+    folds(opaque);
+    folds(-opaque);
+    folds(nan);
+
+    if (!le_zero(0.0)) return 1;
+    if (le_zero(1.0)) return 2;
+    if (le_zero(nan)) return 3;
+
+    if (!ge_zero(0.0)) return 4;
+    if (!ge_zero(-1.0)) return 5;
+    if (ge_zero(nan)) return 6;
+
+    if (always_false()) return 7;
+    if (big() != 3000000000L) return 8;
+    if (overflows() != __builtin_inff()) return 9;
+    if (by_zero(0.0) != __builtin_inf()) return 10;
+    if (!neg_zero_keeps_its_sign()) return 11;
+
+    return 0;
+}
+"#;
+    // `link_error` is deliberately never defined, so a fold that does not
+    // happen is a link failure. It has to happen for that to link at all,
+    // which is why `-O0` is not in this list -- constant branches survive
+    // there by decision.
+    // `-lm` because `Fabs64` is lowered as a call to `fabs`, not as an
+    // instruction: recognizing the name buys the optimizer visibility, not a
+    // different code sequence.
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                "c17_float_constant_fold",
+                code,
+                &[opt.to_string(), "-lm".to_string()]
+            ),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// A `const` global's initializer is its value for the whole run, so a load
+/// of one becomes that constant.
+///
+/// No alias information and no escape analysis are needed for this, and the
+/// escaping pointer below is the point: modifying an object defined with a
+/// `const`-qualified type is undefined behaviour (C17 6.7.3p6), so a pointer
+/// to one may go anywhere at all and the value still cannot change.
+///
+/// The refusals are the other half, and each names something that *can*
+/// change underneath the fold: `volatile` says so outright, a weak
+/// definition exists to be replaced at link time, a tentative definition may
+/// be merged with a real one in another translation unit, an `extern`
+/// declaration has its definition there already, and a type-punned read is
+/// asking for different bits than the initializer describes.
+#[test]
+fn codegen_const_globals_propagate() {
+    let code = r#"
+extern void link_error(void);
+extern void abort(void);
+
+const double one = 1.0;
+const int two = 2;
+const float half = 0.5f;
+const long double big = 1.5L;
+const char letter = 'A';
+static const int internal = 9;
+
+volatile const int watched = 5;
+const int replaceable __attribute__((weak)) = 7;
+const int tentative;
+extern const int elsewhere_defined;
+int mutable_global = 3;
+
+/* Reading a `const` object through a pointer that escaped this function
+   still reads the initializer -- storing through it would be undefined. */
+__attribute__((noinline)) static int through(const int *p) { return *p; }
+
+int main(void)
+{
+    if ((int) one != 1) link_error();
+    if (two != 2) link_error();
+    if (half != 0.5f) link_error();
+    if (letter != 'A') link_error();
+    if (internal != 9) link_error();
+    /* Arithmetic on folded constants folds too. */
+    if (one * 2.0 != 2.0) link_error();
+    if (two + internal != 11) link_error();
+
+    /* The `long double` load folds on every target -- but comparing two of
+       them is a libcall where the type is soft-float (binary128 on Linux
+       aarch64), and a call is not something the optimizer folds. Checked by
+       value, so the fold is still exercised without assuming the host's
+       `long double`. */
+    if (big != 1.5L) abort();
+
+    if (through(&two) != 2) abort();
+
+    /* These must still be read from memory; each is checked by value so the
+       test fails loudly if one were folded to the wrong thing. */
+    if (watched != 5) abort();
+    if (replaceable != 7) abort();
+    if (tentative != 0) abort();
+    if (mutable_global != 3) abort();
+    mutable_global = 4;
+    if (mutable_global != 4) abort();
+
+    /* A read of the same bytes as a different kind of value is not the
+       initializer, and must not be answered with it. */
+    if (*(const long *)&one != 0x3FF0000000000000L) abort();
+
+    return 0;
+}
+
+/* Defined after use, so `elsewhere_defined` is a declaration at the point
+   the optimizer would fold it. */
+const int elsewhere_defined = 11;
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_const_global_propagate", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// Integer width conversions fold over a constant, at the width the operand
+/// was stored in rather than the one it is being widened to.
+///
+/// The source width is the whole of it: read at the destination instead, a
+/// sign extension is the identity, so `(int)(signed char)200` answers 200
+/// where C says -56. Every `char` and `short` read is widened before
+/// anything is done with it, so a fold that stops here stops one instruction
+/// after it started.
+#[test]
+fn codegen_integer_conversions_fold() {
+    let code = r#"
+extern void link_error(void);
+extern void abort(void);
+
+volatile int sink;
+
+int main(void)
+{
+    /* Sign extension reads the operand signed at its own width. */
+    if ((int)(signed char) 200 != -56) link_error();
+    if ((int)(signed char) -56 != -56) link_error();
+    if ((int)(short) 70000 != 4464) link_error();
+    if ((long)(int) -1 != -1L) link_error();
+
+    /* Zero extension reads it unsigned. */
+    if ((int)(unsigned char) 200 != 200) link_error();
+    if ((int)(unsigned short) 70000 != 4464) link_error();
+    if ((unsigned long)(unsigned) -1 != 0xFFFFFFFFUL) link_error();
+
+    /* Truncation keeps the low bits, and what it means then depends on the
+       type it is read back as. These are checked by value rather than for
+       folding: a truncated constant that reads two ways must NOT be folded,
+       because nothing in the IR says how its consumer widens it. */
+    if ((unsigned char) 200 != 200) abort();
+    if ((signed char) 200 != -56) abort();
+    if ((unsigned char) -1 != 255) abort();
+    if ((signed char) -1 != -1) abort();
+    /* Plain `char` is signed on x86-64 and unsigned on aarch64, so this
+       asserts the agreement rather than a number: the folded conversion must
+       give what the same conversion gives at run time. */
+    sink = 0xEF;
+    {
+        int v = sink;
+        if ((int)(char) 0x123456789ABCDEFLL != (int)(char) v) abort();
+    }
+
+    /* A narrow value promoted by a unary operator, with no extension in
+       the IR between the two: the truncated constant must not be folded to
+       one of its two readings. */
+    if (-(unsigned char) 200 != -200) abort();
+    if (-(unsigned short) 60000 != -60000) abort();
+    if (~(unsigned char) 200 != ~200) abort();
+
+    /* The same conversions over values the optimizer cannot know must still
+       give the same answers. */
+    sink = 200;
+    { int v = sink; if ((int)(signed char) v != -56) abort(); }
+    sink = 70000;
+    { int v = sink; if ((int)(short) v != 4464) abort(); }
+    sink = -1;
+    { int v = sink; if ((int)(unsigned char) v != 255) abort(); }
+
+    return 0;
+}
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_integer_conversion_fold", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// Unary `-` and `~` perform the integer promotions on their operand
+/// (C17 6.5.3.3p3, p4), and the *value* has to be converted, not just the
+/// result type.
+///
+/// `promote_unary_operand` computed the promoted type and handed the operand
+/// back untouched, so `-(signed char)200` reached the IR as `neg.32` over an
+/// eight-bit value with no extension between them. The backend's move
+/// widens without a sign, which is right for `unsigned char` and silently
+/// wrong for a signed one: the answer was -200 where C says 56.
+///
+/// A variable operand hid it, because loading one already knows the type --
+/// only a narrowing cast applied directly to the operand reaches the shape.
+#[test]
+fn codegen_unary_operators_promote_their_operand() {
+    let code = r#"
+extern void abort(void);
+
+volatile int sink;
+
+int main(void)
+{
+    /* The shape that was wrong: a narrowing cast straight under the
+       operator, with nothing in between to carry the sign. */
+    if (-(signed char) 200 != 56) abort();
+    if (~(signed char) 200 != 55) abort();
+    if (-(signed char) -56 != 56) abort();
+    if (-(short) 40000 != 25536) abort();
+    if (~(short) 40000 != 25535) abort();
+
+    /* The unsigned forms, which were already right and must stay so. */
+    if (-(unsigned char) 200 != -200) abort();
+    if (~(unsigned char) 200 != -201) abort();
+    if (-(unsigned short) 40000 != -40000) abort();
+
+    /* Through a variable, and through a value the optimizer cannot know:
+       all three spellings must agree. */
+    {
+        signed char v = (signed char) 200;
+        sink = 200;
+        signed char r = (signed char) sink;
+        if (-v != 56) abort();
+        if (-r != 56) abort();
+        if (-v != -(signed char) 200) abort();
+        if (~v != ~(signed char) 200) abort();
+    }
+    {
+        short v = (short) 40000;
+        sink = 40000;
+        short r = (short) sink;
+        if (-v != 25536) abort();
+        if (-r != 25536) abort();
+        if (-v != -(short) 40000) abort();
+    }
+
+    /* `_Bool` and plain `char` promote too. Plain `char`'s signedness is the
+       target's business, so this asserts the agreement rather than a number. */
+    if (-(_Bool) 1 != -1) abort();
+    if (~(_Bool) 1 != -2) abort();
+    {
+        sink = 0xEF;
+        char v = (char) sink;
+        if (-(char) 0xEF != -v) abort();
+        if (~(char) 0xEF != ~v) abort();
+    }
+
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_unary_promotion", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// An initialized global is a *definition*, not a common symbol.
+///
+/// `.comm` declares a common symbol, and those merge across translation
+/// units: two definitions of one object linked silently, where C17 6.9p5
+/// allows one external definition and gcc reports `multiple definition`.
+/// gcc has defaulted to `-fno-common` since 10 and emits none at all.
+///
+/// A `const` object is the other half: BSS-class storage is writable, so a
+/// zero-initialized `const` was not read-only. Both the tentative and the
+/// initialized form belong in `.rodata`.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_zero_initialized_globals_are_definitions() {
+    let asm = asm_for_at(
+        "c17_zero_init_def",
+        "int tentative;\n\
+         int explicit_zero = 0;\n\
+         int nonzero = 5;\n\
+         const int c_tentative;\n\
+         const int c_zero = 0;\n\
+         static int s_zero = 0;\n",
+        &[],
+    );
+
+    // Nothing exported is a common symbol any more.
+    for name in ["tentative", "explicit_zero", "c_tentative", "c_zero"] {
+        assert!(
+            !asm.contains(&format!(".comm {name},")),
+            "`{name}` should be a definition, not a common symbol:\n{asm}"
+        );
+    }
+    // A `const` object is read-only, whatever its initializer. Asked as
+    // "which section directive was last before the label", since a file has
+    // several `.rodata` chunks and the labels are spread across them.
+    for name in ["c_tentative", "c_zero"] {
+        assert_eq!(
+            section_of(&asm, name),
+            Some(".section .rodata"),
+            "`{name}` should be in .rodata:\n{asm}"
+        );
+    }
+    for name in ["tentative", "explicit_zero"] {
+        assert_eq!(
+            section_of(&asm, name),
+            Some(".bss"),
+            "`{name}` should be in .bss:\n{asm}"
+        );
+    }
+    assert_eq!(section_of(&asm, "nonzero"), Some(".data"));
+    // An internal-linkage one keeps its `.local`/`.comm` pair, which does not
+    // export anything and so cannot collide.
+    assert!(
+        asm.contains(".local s_zero"),
+        "a static keeps internal linkage:\n{asm}"
+    );
+}
+
+/// The section directive in force where `name:` is defined.
+fn section_of<'a>(asm: &'a str, name: &str) -> Option<&'a str> {
+    let label = format!("{name}:");
+    let mut current = None;
+    for line in asm.lines() {
+        let t = line.trim();
+        if t == ".bss" || t == ".data" || t == ".text" || t.starts_with(".section ") {
+            current = Some(t);
+        } else if t == label {
+            return current;
+        }
+    }
+    None
+}
+
+/// `&*x` is `x`: the pair cancels, and no object is read, so it is a static
+/// address wherever `x` is one.
+///
+/// The `Deref` arm has to go through `static_address_operand` rather than
+/// recurse into the ordinary walk: that walk answers a bare identifier with
+/// the address *of* the object, because every other caller has already seen
+/// an `&`, so `&*p` for a pointer variable would fold to the address of `p`
+/// instead of its value.
+#[test]
+fn codegen_address_of_dereference_is_a_static_address() {
+    let code = r#"
+extern void abort(void);
+
+int a[4] = {10, 11, 12, 13};
+int v = 99;
+struct T { int x, y; } t = {1, 2};
+
+int *p1 = &*(a + 2);
+int *p2 = &*&v;
+int *p3 = &*&t.y;
+char *p4 = (char *)&(*(&"ZYX"[2]));
+int *p5 = &*(a + 1) + 1;
+
+int main(void)
+{
+    if (*p1 != 12) abort();
+    if (*p2 != 99) abort();
+    if (*p3 != 2) abort();
+    if (*p4 != 'X') abort();
+    if (*p5 != 12) abort();
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_addr_of_deref", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// The address of an element of a string literal is a static address, at any
+/// depth and in an aggregate initializer as well as a scalar one.
+///
+/// The literal acquires an address by being interned, which needs `&mut
+/// self` -- so the walk that reaches it has to be the mutable one. There
+/// used to be two walks, and only the outer one could intern, which is why
+/// `"X" + 1` worked and `&("X"[0])` was rejected: the first arrives with the
+/// literal in hand, the second with an `Index` wrapped around it.
+#[test]
+fn codegen_address_of_string_literal_element() {
+    let code = r#"
+extern void abort(void);
+extern int strcmp(const char *, const char *);
+
+void *foo[] = {(void *)&("X"[0])};
+char *bar[] = {"HELLO", "HELLO" + 2, &"HELLO"[3], &("HELLO"[4])};
+struct S { void *p; char *q; } s = {(void *)&("AB"[1]), &"CD"[1]};
+unsigned int *w[] = {(unsigned int *)&(U"AB"[1])};
+char *scalar = &"WXYZ"[1];
+
+int main(void)
+{
+    if (((char *)foo[0])[0] != 'X') abort();
+    if (strcmp(bar[0], "HELLO")) abort();
+    if (strcmp(bar[1], "LLO")) abort();
+    if (strcmp(bar[2], "LO")) abort();
+    if (strcmp(bar[3], "O")) abort();
+    if (((char *)s.p)[0] != 'B') abort();
+    if (strcmp(s.q, "D")) abort();
+    if (*w[0] != 'B') abort();
+    if (strcmp(scalar, "XYZ")) abort();
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_addr_of_string_elem", code, &[opt.to_string()]),
             0,
             "at {opt}"
         );

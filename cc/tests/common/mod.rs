@@ -691,3 +691,58 @@ fn report_abnormal_exit(name: &str, config_name: &str, out: &std::process::Outpu
         String::from_utf8_lossy(&out.stderr),
     );
 }
+
+/// Compile `src` to assembly with `extra` options and return the text.
+///
+/// The default is `-O0`, so a test about an optimizer decision has to name
+/// the level it is asking about.
+pub fn asm_for_at(prefix: &str, src: &str, extra: &[&str]) -> String {
+    let dir = plib::tmp::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("tempdir");
+    let c = dir.path().join("t.c");
+    let s = dir.path().join("t.s");
+    std::fs::write(&c, src).expect("write source");
+    let mut args = vec!["-S"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&[c.to_str().unwrap(), "-o", s.to_str().unwrap()]);
+    let out = run_c17(&args);
+    assert!(out.success, "compile failed: {}", out.stderr);
+    std::fs::read_to_string(&s).expect("read asm")
+}
+
+/// The symbol prefix `asm` uses, read off a symbol it is known to define.
+///
+/// Mach-O spells every C identifier with a leading underscore. Reading the
+/// prefix off the output is right both for a test that names a `--target`
+/// and for one compiled for the host; `cfg!(target_os)` is wrong for the
+/// first and a hardcoded `""` is wrong for the second. The
+/// `-fgnu89-inline` test has now been wrong in both directions, each time
+/// passing on Linux and failing only on macOS CI.
+pub fn asm_prefix(asm: &str, defined: &str) -> &'static str {
+    let mangled = format!("_{defined}:");
+    if asm.lines().any(|l| l.trim_start() == mangled) {
+        "_"
+    } else {
+        ""
+    }
+}
+
+/// `name` as the assembler spells it on this host.
+///
+/// Mach-O prefixes every C identifier with an underscore, so a test that
+/// looks for a label or a call by its C name finds nothing on macOS -- and
+/// usually finds nothing in the *negative* direction either, so it passes
+/// vacuously and reports a failure only on the platform it was never run on.
+///
+/// Only for a test that compiles for the *host*. One that names its target
+/// should spell the prefix from the target, and is better off naming both
+/// formats so the Mach-O shape is exercised on every run.
+pub fn asm_symbol(name: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("_{name}")
+    } else {
+        name.to_string()
+    }
+}

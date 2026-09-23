@@ -236,6 +236,27 @@ static NO_BUILTIN: AtomicBool = AtomicBool::new(false);
 static NO_BUILTIN_FUNCS: std::sync::OnceLock<std::collections::HashSet<String>> =
     std::sync::OnceLock::new();
 
+/// `-fgnu89-inline`: every `inline` function takes GNU89 semantics.
+///
+/// The two rules are opposites on the `extern` question. C99 says a plain
+/// `inline` with no `extern` declaration provides *no* external definition;
+/// GNU89 says it is `extern inline` that provides none, and a plain `inline`
+/// emits an out-of-line body like any other function.
+///
+/// The per-function `__attribute__((__gnu_inline__))` already selects the
+/// GNU rule, and this makes it the default for the whole translation unit.
+static GNU89_INLINE: AtomicBool = AtomicBool::new(false);
+
+/// Select GNU89 inline semantics for every `inline` function.
+pub fn set_gnu89_inline(on: bool) {
+    GNU89_INLINE.store(on, Ordering::Relaxed);
+}
+
+/// Does an `inline` function without the attribute take the GNU89 rule?
+pub fn gnu89_inline() -> bool {
+    GNU89_INLINE.load(Ordering::Relaxed)
+}
+
 /// Turn off all non-reserved builtins (`-fno-builtin`).
 pub fn set_no_builtin() {
     NO_BUILTIN.store(true, Ordering::Relaxed);

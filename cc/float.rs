@@ -515,6 +515,11 @@ impl FloatVal {
         self.exp == EXP_SPECIAL && self.sig & !INTEGER_BIT != 0
     }
 
+    /// True for a finite value: neither an infinity nor a NaN.
+    pub fn is_finite(self) -> bool {
+        self.exp != EXP_SPECIAL
+    }
+
     /// True for either signed zero.
     pub fn is_zero(self) -> bool {
         self.exp == 0 && self.sig == 0
@@ -532,6 +537,68 @@ impl FloatVal {
             neg: !self.neg,
             ..self
         }
+    }
+
+    /// This value's ordering against `other`, or `None` when the two are
+    /// unordered because either is a NaN.
+    ///
+    /// C's ordering, which neither of the two comparisons already here gives:
+    /// [`PartialEq`] compares *encodings*, so it separates the signed zeros
+    /// that C's `==` equates, and `to_f64` rounds, so two `long double`
+    /// values differing only below the 53rd significand bit come back equal.
+    ///
+    /// Exact because the encoding is canonical sign-magnitude: within one
+    /// sign, `(exp, sig)` orders magnitude outright, infinity being the one
+    /// value at the largest exponent once NaN has been taken out.
+    pub fn cmp_value(self, other: Self) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        if self.is_nan() || other.is_nan() {
+            return None;
+        }
+        // C has one zero.
+        if self.is_zero() && other.is_zero() {
+            return Some(Ordering::Equal);
+        }
+        if self.neg != other.neg {
+            return Some(if self.neg {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            });
+        }
+        let ord = (self.exp, self.sig).cmp(&(other.exp, other.sig));
+        Some(if self.neg { ord.reverse() } else { ord })
+    }
+
+    /// The integer part, truncated toward zero -- C's floating-to-integer
+    /// conversion (6.3.1.4).
+    ///
+    /// `None` when there is no integer to convert to: a NaN, an infinity, or
+    /// a magnitude of 2^127 or more. Those are the cases C leaves undefined,
+    /// and a caller folding a conversion must leave them to run time rather
+    /// than invent an answer.
+    ///
+    /// Not `to_f64() as i128`: rounding to `f64` first moves the value before
+    /// the fractional part is discarded, so a `long double` just below an
+    /// integer can round up to it and truncate one too high.
+    pub fn trunc_to_i128(self) -> Option<i128> {
+        if self.exp == EXP_SPECIAL {
+            return None;
+        }
+        if self.sig == 0 {
+            return Some(0);
+        }
+        // The significand's top bit is worth 2^(exp - BIAS).
+        let top = self.exp as i32 - BIAS;
+        if top < 0 {
+            // Magnitude below 1, which includes every subnormal.
+            return Some(0);
+        }
+        if top >= 127 {
+            return None;
+        }
+        let mag = (self.sig >> (127 - top as u32)) as i128;
+        Some(if self.neg { -mag } else { mag })
     }
 
     /// The encoding as an opaque key, for constant pooling.
@@ -556,7 +623,7 @@ impl FloatVal {
 impl PartialEq for FloatVal {
     /// Bitwise equality, deliberately: this compares *encodings*, not
     /// arithmetic values, so it is reflexive on NaN and distinguishes the
-    /// signed zeros. Callers wanting C's `==` should compare `to_f64`.
+    /// signed zeros. Callers wanting C's `==` want [`FloatVal::cmp_value`].
     fn eq(&self, other: &Self) -> bool {
         self.key() == other.key()
     }
@@ -1333,6 +1400,100 @@ impl FloatVal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Value comparison and truncation
+    //
+    // Both exist because the two comparisons already on this type answer a
+    // different question: `PartialEq` compares encodings and `to_f64` rounds.
+
+    #[test]
+    fn cmp_value_is_c_equality_not_bitwise() {
+        use std::cmp::Ordering;
+        let pos = FloatVal::from_f64(0.0);
+        let neg = FloatVal::from_f64(-0.0);
+        assert_ne!(pos.key(), neg.key(), "the encodings differ");
+        assert_eq!(pos.cmp_value(neg), Some(Ordering::Equal), "C has one zero");
+    }
+
+    #[test]
+    fn cmp_value_is_unordered_on_nan() {
+        let nan = FloatVal::nan();
+        for other in [
+            FloatVal::from_f64(1.0),
+            FloatVal::from_f64(-1.0),
+            FloatVal::ZERO,
+            FloatVal::infinity(false),
+            nan,
+        ] {
+            assert_eq!(nan.cmp_value(other), None, "NaN against {other}");
+            assert_eq!(other.cmp_value(nan), None, "{other} against NaN");
+        }
+    }
+
+    #[test]
+    fn cmp_value_orders_across_signs_and_infinities() {
+        use std::cmp::Ordering;
+        let cases = [
+            (-1.0, 1.0, Ordering::Less),
+            (-0.0, 1.0, Ordering::Less),
+            (-1.0, -0.0, Ordering::Less),
+            (-5.0, -1.0, Ordering::Less),
+            (1.0, 2.0, Ordering::Less),
+            (2.0, 2.0, Ordering::Equal),
+            (f64::NEG_INFINITY, -1e308, Ordering::Less),
+            (1e308, f64::INFINITY, Ordering::Less),
+            (f64::INFINITY, f64::INFINITY, Ordering::Equal),
+        ];
+        for (a, b, want) in cases {
+            let (fa, fb) = (FloatVal::from_f64(a), FloatVal::from_f64(b));
+            assert_eq!(fa.cmp_value(fb), Some(want), "{a} vs {b}");
+            assert_eq!(fb.cmp_value(fa), Some(want.reverse()), "{b} vs {a}");
+        }
+    }
+
+    /// The reason this is not `to_f64().partial_cmp(..)`: two values that
+    /// differ only below the 53rd significand bit are one `f64`.
+    #[test]
+    fn cmp_value_separates_values_f64_cannot() {
+        use std::cmp::Ordering;
+        let one = FloatVal::from_parts(false, 1u128 << 64, 0);
+        let barely_more = FloatVal::from_parts(false, (1u128 << 64) | 1, 0);
+        assert_eq!(one.to_f64().to_bits(), barely_more.to_f64().to_bits());
+        assert_eq!(one.cmp_value(barely_more), Some(Ordering::Less));
+    }
+
+    #[test]
+    fn trunc_to_i128_discards_the_fraction_toward_zero() {
+        for (v, want) in [
+            (0.0, 0),
+            (-0.0, 0),
+            (0.9, 0),
+            (-0.9, 0),
+            (1.0, 1),
+            (1.9, 1),
+            (-1.9, -1),
+            (-2.0, -2),
+            (1e18, 1_000_000_000_000_000_000i128),
+            (-1e18, -1_000_000_000_000_000_000i128),
+        ] {
+            assert_eq!(FloatVal::from_f64(v).trunc_to_i128(), Some(want), "{v}");
+        }
+    }
+
+    /// Where C leaves the conversion undefined, this must refuse rather than
+    /// invent an answer: a fold that guesses disagrees with the hardware.
+    #[test]
+    fn trunc_to_i128_refuses_what_it_cannot_represent() {
+        assert_eq!(FloatVal::nan().trunc_to_i128(), None);
+        assert_eq!(FloatVal::infinity(false).trunc_to_i128(), None);
+        assert_eq!(FloatVal::infinity(true).trunc_to_i128(), None);
+        // 2^127 is one past the largest `i128`.
+        let too_big = FloatVal::from_parts(false, 1, 127);
+        assert_eq!(too_big.trunc_to_i128(), None);
+        // 2^126 is not.
+        let fits = FloatVal::from_parts(false, 1, 126);
+        assert_eq!(fits.trunc_to_i128(), Some(1i128 << 126));
+    }
 
     #[test]
     fn f64_round_trips_exactly() {

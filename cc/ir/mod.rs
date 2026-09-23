@@ -12,8 +12,10 @@
 //
 
 mod constfold;
+pub mod constglobal;
 pub mod dce;
 pub mod dominate;
+pub mod ifconv;
 pub mod inline;
 pub mod instcombine;
 pub mod linearize;
@@ -197,6 +199,12 @@ pub enum Opcode {
     /// passed. Replaced with a constant when the enclosing `always_inline`
     /// function is inlined; a survivor is diagnosed, never emitted.
     VaArgPackLen, // Copy va_list
+    /// `__builtin_constant_p`, deferred until propagation has run.
+    ///
+    /// Resolved by `sccp` when it proves the operand constant, and by
+    /// `ir::lower` to 0 otherwise -- which is every case at `-O0`, where
+    /// the optimizer does not run at all.
+    ConstantP,
 
     // Byte-swapping builtins
     Bswap16, // Byte-swap 16-bit value
@@ -421,6 +429,7 @@ impl Opcode {
             Opcode::VaEnd => "va_end",
             Opcode::VaCopy => "va_copy",
             Opcode::VaArgPackLen => "va_arg_pack_len",
+            Opcode::ConstantP => "constant_p",
             Opcode::Bswap16 => "bswap16",
             Opcode::Bswap32 => "bswap32",
             Opcode::Bswap64 => "bswap64",
@@ -1910,6 +1919,56 @@ impl Function {
         id
     }
 
+    /// Is `id` an ordinary SSA temporary -- a value and nothing more?
+    ///
+    /// True for an id that is not in `pseudos` at all, which is most of them:
+    /// `Linearizer::alloc_pseudo` records nothing, so a plain register is
+    /// exactly what an absent id means. False for an `Arg`, a `Phi`, a `Sym`
+    /// or an existing constant, each of which carries a meaning beyond its
+    /// value that a rewrite must not take away.
+    pub fn is_plain_temp(&self, id: PseudoId) -> bool {
+        match self.get_pseudo(id) {
+            Some(p) => matches!(p.kind, PseudoKind::Reg(_)),
+            None => true,
+        }
+    }
+
+    /// Make `id` a constant pseudo holding `value`.
+    ///
+    /// A constant is a pseudo *kind*, so folding a value into one works the
+    /// other way round from rewriting an instruction: the target is
+    /// converted in place, keeping its identity so that every use already
+    /// names it, and its defining instruction becomes the `SetVal` that
+    /// gives it a width.
+    ///
+    /// `false`, and nothing done, for an id [`Self::is_plain_temp`] rejects.
+    ///
+    /// The caller owes that `SetVal`. It is not optional for a float: an
+    /// `FVal` without one is resolved at a default width of 64 bits, so a
+    /// folded `float` would be read out of eight bytes. For an integer it
+    /// decides the stack slot in x86-64's sixteen-byte case.
+    pub fn make_const(&mut self, id: PseudoId, value: ConstValue) -> bool {
+        if !self.is_plain_temp(id) {
+            return false;
+        }
+        let kind = match value {
+            ConstValue::Int(v) => PseudoKind::Val(v),
+            ConstValue::Float(v) => PseudoKind::FVal(v),
+        };
+        match self.pseudo_idx.get(&id).copied() {
+            Some(idx) => match self.pseudos.get_mut(idx) {
+                Some(p) => p.kind = kind,
+                None => return false,
+            },
+            None => self.add_pseudo(Pseudo {
+                id,
+                kind,
+                name: None,
+            }),
+        }
+        true
+    }
+
     /// Create a new constant integer pseudo and return its ID.
     /// The pseudo is added to self.pseudos.
     pub fn create_const_pseudo(&mut self, value: i128) -> PseudoId {
@@ -1941,6 +2000,16 @@ impl Function {
             _ => None,
         })
     }
+}
+
+/// A scalar constant a pseudo can be turned into.
+///
+/// The two cases are not interchangeable and never inferred from a width:
+/// which one a value is decides the register file it lives in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ConstValue {
+    Int(i128),
+    Float(FloatVal),
 }
 
 /// A `Function` paired with the type table.

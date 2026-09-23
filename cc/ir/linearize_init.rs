@@ -297,7 +297,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 operand,
             } => {
                 // Try to compute the address as symbol + offset
-                if let Some((name, offset)) = self.static_address_of(operand) {
+                if let Some((name, offset)) = self.eval_static_address(operand) {
                     if offset == 0 {
                         Initializer::SymAddr(name)
                     } else {
@@ -424,7 +424,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 };
 
                 // Evaluate the pointer side as a static address
-                if let Some((name, base_off)) = self.static_address_of(ptr_expr) {
+                if let Some((name, base_off)) = self.eval_static_address(ptr_expr) {
                     // Evaluate the integer side as a constant
                     if let Some(int_val) = self.eval_const_init_expr(int_expr) {
                         // Get the pointee size for pointer arithmetic scaling
@@ -510,13 +510,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// The static address of `expr`, as a symbol name and byte offset.
-    ///
-    /// Wraps `eval_static_address` to also cover a string literal, which has a
-    /// perfectly good static address but only once it has been interned and
-    /// given a label -- and interning needs `&mut self`, which the `&self`
-    /// evaluator cannot do. Without this `const char *p = "hello" + 1;` was
-    /// rejected, while `arr + 1` on a static array was accepted.
     /// The constant difference of two addresses into one object, in whatever
     /// units the subtraction is written in.
     ///
@@ -524,7 +517,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// size; a subtraction of two addresses already cast to an integer type
     /// counts bytes and does not. Both sides must resolve to the *same* symbol,
     /// which is what keeps the cross-object form a diagnostic.
-    fn static_address_difference(&self, left: &Expr, right: &Expr) -> Option<i128> {
+    fn static_address_difference(&mut self, left: &Expr, right: &Expr) -> Option<i128> {
         let (lname, loff) = self.static_address_operand(left)?;
         let (rname, roff) = self.static_address_operand(right)?;
         if lname != rname {
@@ -558,7 +551,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// expression that is *shaped* like an address qualifies: an `&`, an array
     /// designator decaying to its first element, pointer arithmetic over one of
     /// those, or any of them behind casts.
-    fn static_address_operand(&self, expr: &Expr) -> Option<(String, i64)> {
+    pub(crate) fn static_address_operand(&mut self, expr: &Expr) -> Option<(String, i64)> {
         let is_ptr_or_array = expr
             .typ
             .is_some_and(|t| matches!(self.types.kind(t), TypeKind::Pointer | TypeKind::Array));
@@ -578,24 +571,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             ExprKind::Binary { .. } if is_ptr_or_array => self.eval_static_address(expr),
             _ => None,
         }
-    }
-
-    fn static_address_of(&mut self, expr: &Expr) -> Option<(String, i64)> {
-        // A compound literal at file scope has static storage duration
-        // (C99 6.5.2.5p5), so it is an object with an address -- but it only
-        // acquires one when it is given a name here.
-        if let ExprKind::CompoundLiteral { typ, elements } = &expr.kind {
-            let name = format!(".CL{}", self.compound_literal_counter);
-            self.compound_literal_counter += 1;
-            let typ = *typ;
-            let init = self.ast_init_list_to_ir(elements, typ);
-            self.module.add_global(&name, typ, init);
-            return Some((name, 0));
-        }
-        if let ExprKind::StringLit(lit) = &expr.kind {
-            return Some((self.module.add_string(lit.clone()), 0));
-        }
-        self.eval_static_address(expr)
     }
 
     /// Fold a constant expression of complex type into its two halves.

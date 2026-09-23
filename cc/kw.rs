@@ -444,6 +444,34 @@ define_keywords! {
     (LONGJMP,           "longjmp",           0),
     (LONGJMP2,          "_longjmp",          0),
 
+    // ---- Plain spellings of libm entry points ----
+    // gcc recognizes the standard names whether or not <math.h> was included,
+    // which is what lets `fabs(x) < 0.0` fold to 0 in a program that only
+    // declares `extern double fabs(double);`. Tagged 0 for the same reason
+    // `alloca` is, and displaceable the same way (see `builtin_is_shadowed`).
+    (FABS,              "fabs",              0),
+    (FABSF,             "fabsf",             0),
+    (FABSL,             "fabsl",             0),
+
+    // The exactly-rounding functions, whose `float` form gives the same
+    // answer as the `double` one applied to a `float` argument. Narrowing
+    // them is what lets `(float)floor((double)x)` become `floorf(x)`;
+    // `sin` and `log` are deliberately absent, since theirs differ in the
+    // last bit. The `f` spellings are interned so the prototype can be
+    // synthesized for a program that never declared one.
+    (FLOOR,             "floor",             0),
+    (CEIL,              "ceil",              0),
+    (TRUNC,             "trunc",             0),
+    (ROUND,             "round",             0),
+    (RINT,              "rint",              0),
+    (NEARBYINT,         "nearbyint",         0),
+    (_,                 "floorf",            0),
+    (_,                 "ceilf",             0),
+    (_,                 "truncf",            0),
+    (_,                 "roundf",            0),
+    (_,                 "rintf",             0),
+    (_,                 "nearbyintf",        0),
+
     // ---- Fortified libc entry points ----
     // Interned but untagged: these are ordinary identifiers, listed only so
     // the parser can name one when it synthesizes the declaration glibc
@@ -517,8 +545,9 @@ define_keywords! {
     (_,                 "fputs_unlocked",  0),
     // The long-double magnitude and sign builtins lower to these rather than
     // to `fabs`/`__signbit`, which take a `double` and so read only the low
-    // eight bytes of an x87 value.
-    (_,                 "fabsl",                0),
+    // eight bytes of an x87 value. `fabsl` is named above, as a plain
+    // spelling the parser recognizes; it is still looked up here by string,
+    // to synthesize the prototype the call needs.
     (_,                 "__signbitl",           0),
 
     // ---- Supported attribute names (SUPPORTED_ATTR) ----

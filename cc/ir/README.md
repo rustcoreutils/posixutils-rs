@@ -322,13 +322,16 @@ extern_symbols          - symbols needing GOT
 | `ssa.rs` | Memory to SSA; inserts phi nodes |
 | `dominate.rs` | Dominator tree (Cooper algorithm) |
 | `dce.rs` | Dead code elimination (mark-sweep on SSA roots, fold-branches-to-unreachable, unreachable-block removal) |
-| `constfold.rs` | Evaluating an operation over constants at the operand's own width and signedness. Not a pass -- the one place those rules are written, shared by `instcombine` and `sccp` |
+| `constfold.rs` | Evaluating an operation over constants at the operand's own width and signedness, integer and floating alike. Not a pass -- the one place those rules are written, shared by `instcombine` and `sccp` |
 | `instcombine.rs` | Constant folding, algebraic simplification |
+| `constglobal.rs` | Module pre-pass: a load of a `const` global becomes its initializer. Needs no alias or escape analysis -- modifying a `const`-defined object is undefined behaviour (C17 6.7.3p6) |
+| `lower.rs` | φ elimination, and answering any `ConstantP` placeholder `sccp` never reached -- which is all of them at `-O0` |
+| `ifconv.rs` | If-conversion: collapses a short-circuit `&&`/`||` diamond whose arm is safe to speculate into a `Select` |
 | `sccp.rs` | Sparse conditional constant propagation: constants along reachable paths only, and the only thing that folds a branch on a constant condition |
 | `inline.rs` | Function inlining |
 | `lower.rs` | Phi elimination to copies |
 
-The driver in `cc/opt.rs` runs `inline → (sccp + instcombine + dce)*` to fixed
+The driver in `cc/opt.rs` runs `inline → constglobal → (ifconv + sccp + instcombine + dce)*` to fixed
 point (up to 10 iterations). The order inside the loop is load-bearing in both
 directions: `instcombine` derives constants `sccp` structurally cannot (`x - x`,
 `x ^ x`), any of which can make a branch condition constant, and `sccp` deletes

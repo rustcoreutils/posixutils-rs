@@ -95,6 +95,16 @@ pub enum ValidationError {
         opcode: Opcode,
         target: BasicBlockId,
     },
+    /// A placeholder opcode that something downstream was supposed to
+    /// resolve is still here. Neither backend knows it, and both end their
+    /// opcode match in a catch-all, so it would be dropped in silence and
+    /// its target left undefined.
+    UnresolvedPlaceholder {
+        function: String,
+        block: usize,
+        index: usize,
+        opcode: Opcode,
+    },
 }
 
 impl fmt::Display for ValidationError {
@@ -141,6 +151,16 @@ impl fmt::Display for ValidationError {
                 "[ir-validate I3] in function `{function}`: bb={block} insn={index} op={opcode:?} \
                  references unknown BasicBlockId {target:?}"
             ),
+            ValidationError::UnresolvedPlaceholder {
+                function,
+                block,
+                index,
+                opcode,
+            } => write!(
+                f,
+                "[ir-validate I4] in function `{function}`: bb={block} insn={index} op={opcode:?} \
+                 is a placeholder that should have been resolved before codegen"
+            ),
         }
     }
 }
@@ -159,6 +179,33 @@ pub fn validate_module(module: &Module) -> Result<(), Vec<ValidationError>> {
     for func in &module.functions {
         if let Err(mut errs) = validate_function(func) {
             errors.append(&mut errs);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// I4 -- no placeholder opcode survives to codegen.
+///
+/// Separate from [`validate_function`] because it is the one check that
+/// holds on *lowered* IR: phi elimination deliberately creates multi-def
+/// copies, so I1 does not, and calling the whole validator after lowering
+/// would report those instead.
+pub fn check_no_placeholders(func: &Function) -> Result<(), Vec<ValidationError>> {
+    let mut errors = Vec::new();
+    for (block, bb) in func.blocks.iter().enumerate() {
+        for (index, insn) in bb.insns.iter().enumerate() {
+            if matches!(insn.op, Opcode::ConstantP | Opcode::VaArgPackLen) {
+                errors.push(ValidationError::UnresolvedPlaceholder {
+                    function: func.name.clone(),
+                    block,
+                    index,
+                    opcode: insn.op,
+                });
+            }
         }
     }
     if errors.is_empty() {

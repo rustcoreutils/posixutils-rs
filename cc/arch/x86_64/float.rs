@@ -947,9 +947,13 @@ impl X86_64CodeGen {
     /// XMM holds only `float` and `double`; an x87 80-bit constant never
     /// reaches here, so narrowing to `f64` up front loses nothing.
     pub(super) fn emit_fp_imm_to_xmm(&mut self, value: FloatVal, xmm: XmmReg, size: u32) {
-        let is_zero = value.is_zero();
+        // `is_positive_zero`, not `is_zero`: the shortcut below produces
+        // `+0.0`, and `-0.0` is a different value with the same magnitude.
+        // C equates the two under `==` but not under `signbit`, and
+        // `copysign(1.0, -0.0)` is `-1.0`.
+        let is_positive_zero = value.is_positive_zero();
         let value = value.to_f64();
-        if is_zero {
+        if is_positive_zero {
             // Use xorps/xorpd to zero the register (faster)
             let fp_size = FpSize::from_bits(size, &self.base.target);
             self.push_lir(X86Inst::XorFp {

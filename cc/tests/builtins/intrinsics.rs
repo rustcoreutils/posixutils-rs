@@ -20,7 +20,13 @@ use crate::common::compile_and_run;
 #[test]
 fn builtins_intrinsics_mega() {
     let code = r#"
+volatile int opaque = 7;
+
 int main(void) {
+    // Values the optimizer cannot know, for the `constant_p` section below.
+    int volatile_read = opaque;
+    int argc_like = opaque + 1;
+
     // ========== __BUILTIN_TYPES_COMPATIBLE_P (returns 1-19) ==========
     {
         // Same types
@@ -66,14 +72,21 @@ int main(void) {
         if (!__builtin_constant_p(10 * 5)) return 24;
         if (!__builtin_constant_p(1 << 4)) return 25;
 
-        // Variables are not constant
+        // A variable is answered after optimization, not on the expression
+        // as written: one holding a constant IS constant once propagation
+        // has run, which is what gcc reports and why this is guarded.
         int x = 42;
+#ifdef __OPTIMIZE__
+        if (!__builtin_constant_p(x)) return 26;
+        if (!__builtin_constant_p(x + 1)) return 30;
+        { const int cx = 100; if (!__builtin_constant_p(cx)) return 31; }
+#else
         if (__builtin_constant_p(x)) return 26;
+#endif
 
-        // const variable (typically not constant for this builtin)
-        const int cx = 100;
-        // Note: const vars may or may not be considered constant
-        // depending on compiler, so we don't test that
+        // A value the optimizer cannot know is 0 at every level.
+        if (__builtin_constant_p(argc_like)) return 32;
+        if (__builtin_constant_p(volatile_read)) return 33;
 
         // Null pointer constant
         if (!__builtin_constant_p(0)) return 27;
@@ -765,4 +778,83 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("builtins_libc_second_batch", code, &[]), 0);
+}
+
+/// `__builtin_constant_p` is answered after optimization, not on the
+/// expression as written.
+///
+/// A local holding a constant is one by the time the question is asked, so
+/// gcc reports 1 at `-O1` and above and 0 with the optimizer off. Answering
+/// it at parse time gave 0 everywhere, which is what the `__OPTIMIZE__`
+/// guards below pin down.
+///
+/// The negative halves are the point. A value the optimizer cannot know must
+/// answer 0 at every level, or a program takes the constant-folded branch
+/// for a value it does not have. And the builtin must not *evaluate* its
+/// argument -- an operand with a side effect is answered without running it,
+/// which is why `calls` stays zero.
+#[test]
+fn builtins_constant_p_is_answered_after_optimization() {
+    let code = r#"
+extern void abort(void);
+
+volatile int opaque = 7;
+int calls;
+int y;
+
+static int bump(void) { calls++; return 1; }
+
+/* Where C requires a constant expression there has to be one, and 0 is the
+   honest answer for an operand the front end could not fold. gcc answers 0
+   in every one of these. A deferred form here would be an error instead. */
+int in_static_init = __builtin_constant_p(y);
+int chosen = __builtin_choose_expr(!__builtin_constant_p(y), 3, 4);
+int sized[__builtin_constant_p(y) + 1];
+
+int main(void)
+{
+    if (in_static_init != 0) abort();
+    if (chosen != 3) abort();
+    if (sizeof sized / sizeof sized[0] != 1) abort();
+    switch (__builtin_constant_p(y)) { case 0: break; default: abort(); }
+
+    int known = 42;
+    int unknown = opaque;
+
+    /* A literal is constant at every level -- the parser answers this one
+       and nothing later can unmake it. */
+    if (!__builtin_constant_p(42)) abort();
+    if (!__builtin_constant_p(1 + 2)) abort();
+    if (!__builtin_constant_p(sizeof(int))) abort();
+
+    /* A value the optimizer cannot know is 0 at every level. */
+    if (__builtin_constant_p(unknown)) abort();
+    if (__builtin_constant_p(opaque)) abort();
+    if (__builtin_constant_p(unknown * 2)) abort();
+
+#ifdef __OPTIMIZE__
+    /* Constant once propagation has run. */
+    if (!__builtin_constant_p(known)) abort();
+    if (!__builtin_constant_p(known + 1)) abort();
+    { const int c = 100; if (!__builtin_constant_p(c)) abort(); }
+#else
+    /* Nothing has run, so nothing is known. */
+    if (__builtin_constant_p(known)) abort();
+#endif
+
+    /* The argument is not evaluated, whatever the answer turns out to be. */
+    if (__builtin_constant_p(bump())) abort();
+    if (calls != 0) abort();
+    { int n = 0; (void) __builtin_constant_p(n++); if (n != 0) abort(); }
+
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2", "-Os"] {
+        assert_eq!(
+            compile_and_run("builtins_constant_p_deferred", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
 }

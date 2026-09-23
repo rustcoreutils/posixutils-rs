@@ -363,7 +363,12 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         // returns before the directives that would. A hidden variable escaping
         // as default-visibility is an ABI change, not a cosmetic one, so these
         // go the long way round into `.bss` -- which is what gcc emits too.
+        //
+        // `const` is excluded outright: a read-only object belongs in
+        // `.rodata`, and BSS-class storage is writable. gcc puts both the
+        // tentative and the initialized `const` there.
         let zero_init = !global.is_thread_local
+            && !global.is_const
             && size > 0
             && global.init.is_all_zero()
             && named_section.is_none()
@@ -373,7 +378,11 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             if global.is_static {
                 self.push_directive(Directive::bss_local(&global.name, size, align));
             } else {
-                self.push_directive(Directive::comm(&global.name, size, align));
+                // A *definition*, not a common symbol. `.comm` merges across
+                // translation units, so two definitions of one object linked
+                // silently where C17 6.9p5 allows one -- and gcc, which has
+                // defaulted to `-fno-common` since 10, reports it.
+                self.push_directive(Directive::bss_global(&global.name, size, align));
             }
             return;
         }

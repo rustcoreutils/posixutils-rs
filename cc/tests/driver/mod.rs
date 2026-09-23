@@ -1992,7 +1992,6 @@ fn driver_unknown_f_flag_is_reported_not_swallowed() {
         "-fwrapv",              // the torture suite's dg-options do
         "-fvisibility=hidden",  // a prefix-matched, value-carrying form
         "-fno-tree-dse",        // gcc-internal pass c17 has no equivalent of
-        "-fgnu89-inline",
         "-fomit-frame-pointer",
     ] {
         let r = run_c17(&[flag, "-S", "-o", "/dev/null", &path]);
@@ -2018,4 +2017,82 @@ fn driver_unknown_f_flag_is_reported_not_swallowed() {
             r.stderr
         );
     }
+}
+
+/// `-fgnu89-inline` selects GNU89 inline semantics, which are the *opposite*
+/// of C99's on the `extern` question.
+///
+/// C99 6.7.4p6: a plain `inline` with no `extern` declaration provides no
+/// external definition, so no out-of-line body is emitted, and it is
+/// `extern inline` that provides one. GNU89 has it the other way round.
+///
+/// The flag used to be accepted and ignored, so a program compiled with it
+/// got C99 semantics and failed to link.
+#[test]
+fn driver_fgnu89_inline_flips_which_inline_emits_a_body() {
+    let src = create_c_file(
+        "driver_gnu89",
+        "inline void f(int x) { (void)x; }\n\
+         extern inline void g(int x) { (void)x; }\n\
+         int main(void){ f(1); g(2); return 0; }\n",
+    );
+    let path = src.path().to_string_lossy().to_string();
+
+    // (flags, the one of `f`/`g` that must have an out-of-line body)
+    let cases: &[(&[&str], &str, &str)] = &[
+        (&[], "g", "f"),
+        (&["-fgnu89-inline"], "f", "g"),
+        (&["-fno-gnu89-inline"], "g", "f"),
+        // The last of the pair on the command line wins, as in gcc.
+        (&["-fgnu89-inline", "-fno-gnu89-inline"], "g", "f"),
+        (&["-fno-gnu89-inline", "-fgnu89-inline"], "f", "g"),
+    ];
+
+    // The host's own format, plus both Darwin triples so the Mach-O spelling
+    // is exercised wherever this runs.
+    let targets = [
+        "",
+        "--target=aarch64-apple-darwin",
+        "--target=x86_64-apple-darwin",
+    ];
+
+    for target in targets {
+        for (flags, emitted, absent) in cases {
+            let mut args: Vec<&str> = flags.to_vec();
+            if !target.is_empty() {
+                args.push(target);
+            }
+            args.extend(["-S", "-o", "-", &path]);
+            let r = run_c17(&args);
+            assert!(
+                r.success,
+                "{target} {flags:?} should compile:\n{}",
+                r.stderr
+            );
+            let defines = |name: &str| defines_label(&r.stdout, name);
+            assert!(
+                defines(emitted),
+                "{target} {flags:?}: `{emitted}` should have an out-of-line body:\n{}",
+                r.stdout
+            );
+            assert!(
+                !defines(absent),
+                "{target} {flags:?}: `{absent}` should have none:\n{}",
+                r.stdout
+            );
+        }
+    }
+}
+
+/// Is `name` defined as a label in this assembly?
+///
+/// The symbol prefix is read off the output rather than assumed: Mach-O
+/// spells every C identifier with a leading underscore, and `main` is in
+/// every program this asks about, so it calibrates the answer. Deciding
+/// from `cfg!(target_os)` is wrong the moment the test names a `--target`,
+/// and deciding it is empty is wrong on a macOS host -- this test has now
+/// been wrong both ways.
+fn defines_label(asm: &str, name: &str) -> bool {
+    let label = format!("{}{name}:", crate::common::asm_prefix(asm, "main"));
+    asm.lines().any(|line| line.trim_start() == label)
 }

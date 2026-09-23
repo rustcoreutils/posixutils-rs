@@ -331,6 +331,7 @@ impl Parser<'_> {
                 return Ok(Some(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
                         symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
+                        fn_effect: self.pending_fn_attrs.effect,
                         symbol,
                         typ,
                         storage_class: specs.storage_class,
@@ -571,6 +572,7 @@ impl Parser<'_> {
                 self.settle_declaration_facts(name, specs.storage_class);
                 let mut first_declarator = vec![InitDeclarator {
                     symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
+                    fn_effect: all_fn_attrs.effect,
                     symbol,
                     typ: func_type_id,
                     storage_class: specs.storage_class,
@@ -966,6 +968,7 @@ impl Parser<'_> {
         self.settle_declaration_facts(name, storage_class);
         declarators.push(InitDeclarator {
             symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
+            fn_effect: self.pending_fn_attrs.effect,
             symbol,
             typ: var_type_id,
             storage_class,
@@ -1113,6 +1116,7 @@ impl Parser<'_> {
             self.settle_declaration_facts(decl_name, storage_class);
             declarators.push(InitDeclarator {
                 symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
+                fn_effect: self.pending_fn_attrs.effect,
                 symbol: decl_symbol.expect("symbol should be bound"),
                 typ: decl_type,
                 storage_class,

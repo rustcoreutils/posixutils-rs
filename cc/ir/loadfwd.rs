@@ -345,8 +345,16 @@ fn writes(
         }
 
         // **The rule that closes `pure-1`**: a callee cannot write a local
-        // whose address never left this function, whatever it does.
-        Opcode::Call => esc.is_captured(&loc.base),
+        // whose address never left this function, whatever it does. That
+        // needs nothing at all from the callee.
+        //
+        // What the callee's effect adds is the *global* case, which escape
+        // analysis can say nothing about: a `pure` or `const` function
+        // writes no memory the caller can observe, so a global survives
+        // across it too.
+        Opcode::Call => {
+            mi.call_effect(insn.func_name.as_deref()).may_write() && esc.is_captured(&loc.base)
+        }
 
         _ if !insn.op.may_access_memory() => false,
 

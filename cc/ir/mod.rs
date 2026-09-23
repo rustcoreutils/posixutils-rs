@@ -15,6 +15,7 @@ mod constfold;
 pub mod constglobal;
 pub mod dce;
 pub mod dominate;
+pub mod effects;
 pub mod escape;
 pub mod facts;
 pub mod ifconv;
@@ -1790,6 +1791,14 @@ pub struct Function {
     /// `__attribute__((noinline))`: the inliner must leave this function
     /// alone, whatever its size says.
     pub is_noinline: bool,
+    /// `__attribute__((pure))` / `((const))`, as written.
+    ///
+    /// The programmer's promise, kept separate from anything `ir/effects.rs`
+    /// derives: the inference seeds this *fixed* and never lowers it,
+    /// because an attribute that in-TU analysis could overrule would buy
+    /// nothing where it is most often written -- on a prototype for a
+    /// function this translation unit cannot see.
+    pub declared_effect: crate::parse::ast::MemEffect,
     /// Whether this function takes the address of one of its own labels.
     ///
     /// Such a function cannot be inlined: the address is a symbol naming a
@@ -1854,6 +1863,7 @@ impl Default for Function {
             emit: true,
             is_noreturn: false,
             is_noinline: false,
+            declared_effect: crate::parse::ast::MemEffect::Unknown,
             is_always_inline: false,
             constructor: None,
             destructor: None,
@@ -2388,6 +2398,13 @@ pub struct Module {
     ///
     /// Ordered, because it is iterated to emit directives.
     pub declared_symbol_attrs: std::collections::BTreeMap<String, crate::parse::ast::SymbolAttrs>,
+    /// `__attribute__((pure))` / `((const))` on a function this translation
+    /// unit declares but does not define.
+    ///
+    /// For most of what a program calls, the prototype is all there is:
+    /// glibc's `__pure__ strlen` is the only thing that says `strlen` writes
+    /// nothing, and without it every call to it is a full memory barrier.
+    pub declared_fn_effects: std::collections::BTreeMap<String, crate::parse::ast::MemEffect>,
     /// External thread-local symbols (declared extern _Thread_local but not defined)
     /// These need TLS access pattern instead of GOT
     pub extern_tls_symbols: HashSet<String>,

@@ -262,6 +262,7 @@ impl GlobalFacts {
 /// Module-wide facts the per-function memory passes need.
 pub(crate) struct ModuleInfo {
     globals: HashMap<String, GlobalFacts>,
+    effects: super::effects::EffectTable,
 }
 
 impl ModuleInfo {
@@ -279,7 +280,10 @@ impl ModuleInfo {
                 },
             );
         }
-        ModuleInfo { globals }
+        ModuleInfo {
+            globals,
+            effects: super::effects::EffectTable::build(module),
+        }
     }
 
     pub(crate) fn global(&self, name: &str) -> GlobalFacts {
@@ -287,6 +291,15 @@ impl ModuleInfo {
             .get(name)
             .copied()
             .unwrap_or_else(GlobalFacts::unknown)
+    }
+
+    /// What a call to `name` may do to memory the caller can observe.
+    pub(crate) fn call_effect(&self, name: Option<&str>) -> crate::parse::ast::MemEffect {
+        match name {
+            Some(n) => self.effects.of(n),
+            // An indirect call names no callee.
+            None => crate::parse::ast::MemEffect::Unknown,
+        }
     }
 }
 
@@ -404,9 +417,7 @@ mod tests {
     }
 
     fn empty_module_info() -> ModuleInfo {
-        ModuleInfo {
-            globals: HashMap::new(),
-        }
+        ModuleInfo::build(&super::super::Module::default(), &host_types())
     }
 
     /// `symaddr s` and `s` name one address, and the constant `Add` under it
@@ -493,7 +504,10 @@ mod tests {
         globals.insert("g".to_string(), strong);
         globals.insert("h".to_string(), strong);
         globals.insert("w".to_string(), weak);
-        let mi = ModuleInfo { globals };
+        let mi = ModuleInfo {
+            globals,
+            effects: super::super::effects::EffectTable::build(&super::super::Module::default()),
+        };
 
         let at = |n: &str| MemLoc {
             base: MemBase::Global(n.into()),

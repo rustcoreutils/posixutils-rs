@@ -225,6 +225,23 @@ impl AttributeList {
         self.has_attr("noinline")
     }
 
+    /// The memory effect `__attribute__((pure))` or `((const))` promises.
+    ///
+    /// `const` is a keyword, so only the `__const__` spelling can appear
+    /// bare; gcc accepts `__attribute__((const))` because an attribute name
+    /// is matched as a token rather than as an identifier, and `has_attr`
+    /// compares the text either way.
+    pub fn mem_effect(&self) -> crate::parse::ast::MemEffect {
+        use crate::parse::ast::MemEffect;
+        if self.has_attr("const") {
+            MemEffect::Const
+        } else if self.has_attr("pure") {
+            MemEffect::Pure
+        } else {
+            MemEffect::Unknown
+        }
+    }
+
     /// Whether `__attribute__((always_inline))` is present.
     pub fn has_always_inline(&self) -> bool {
         self.has_attr("always_inline")
@@ -278,6 +295,7 @@ impl AttributeList {
             destructor: self.destructor_priority(),
             gnu_inline: self.has_attr("gnu_inline"),
             artificial: self.has_attr("artificial"),
+            effect: self.mem_effect(),
         }
     }
 

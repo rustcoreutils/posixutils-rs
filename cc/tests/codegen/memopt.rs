@@ -378,3 +378,148 @@ int main(void) {
     assert_eq!(at_o2_no_inline("memopt_two_reg_return_swap", code), 0);
     assert_eq!(at_o2("memopt_two_reg_return_swap_inl", code), 0);
 }
+
+/// `__attribute__((pure))` and `((const))` are promises about memory, and
+/// they buy what escape analysis cannot: a *global* survives across a call
+/// to a function that writes nothing.
+#[test]
+fn memopt_a_pure_callee_does_not_disturb_a_global() {
+    let code = r#"
+extern void abort(void);
+int g;
+__attribute__((pure)) extern int peek(int);
+__attribute__((const)) extern int square(int);
+extern int poke(int);
+
+int main(void) {
+    g = 5;
+    if (peek(0) != 5) abort();
+    if (g != 5) abort();
+    if (square(3) != 9) abort();
+    if (g != 5) abort();
+    if (poke(0) != 0) abort();
+    if (g != 6) abort();
+    return 0;
+}
+
+int peek(int x) { return x + g; }
+int square(int x) { return x * x; }
+int poke(int x) { g++; return x; }
+"#;
+    assert_eq!(at_o2("memopt_pure_callee", code), 0);
+    assert_eq!(at_o2_no_inline("memopt_pure_callee_ni", code), 0);
+}
+
+/// The same promise inferred rather than written. A `static` function that
+/// only reads is clean, and one that writes is not -- and the difference has
+/// to survive the stack traffic every body has before promotion.
+#[test]
+fn memopt_an_inferred_clean_callee_does_not_disturb_a_global() {
+    let code = r#"
+extern void abort(void);
+int g;
+
+/* Reads a global and its own arguments: clean, despite the frame slots. */
+static int reads(int a, int b) { int t = a + b; return t + g; }
+
+/* Writes one: not. */
+static int writes(int a) { g += a; return g; }
+
+int main(void) {
+    g = 5;
+    if (reads(1, 2) != 8) abort();
+    if (g != 5) abort();
+    if (writes(3) != 8) abort();
+    if (g != 8) abort();
+    return 0;
+}
+"#;
+    assert_eq!(at_o2("memopt_inferred_clean", code), 0);
+    assert_eq!(at_o2_no_inline("memopt_inferred_clean_ni", code), 0);
+}
+
+/// A callee that writes a global through a *third* function must not come
+/// out clean: the effect has to travel the call graph.
+#[test]
+fn memopt_an_effect_travels_the_call_graph() {
+    let code = r#"
+extern void abort(void);
+int g;
+static int inner(int a) { g += a; return g; }
+static int middle(int a) { return inner(a) + 1; }
+static int outer(int a) { return middle(a) + 1; }
+
+int main(void) {
+    g = 1;
+    if (outer(2) != 5) abort();
+    if (g != 3) abort();
+    return 0;
+}
+"#;
+    assert_eq!(at_o2("memopt_effect_transitive", code), 0);
+    assert_eq!(at_o2_no_inline("memopt_effect_transitive_ni", code), 0);
+}
+
+/// A definition another object can replace is not evidence about what will
+/// run, so a `weak` one is never trusted however clean its body looks.
+#[test]
+fn memopt_a_weak_definition_is_not_trusted() {
+    let code = r#"
+extern void abort(void);
+int g;
+__attribute__((weak)) int maybe_replaced(int a);
+__attribute__((weak)) int maybe_replaced(int a) { return a; }
+
+int main(void) {
+    g = 4;
+    if (maybe_replaced(1) != 1) abort();
+    if (g != 4) abort();
+    return 0;
+}
+"#;
+    assert_eq!(at_o2("memopt_weak_callee", code), 0);
+    assert_eq!(at_o2_no_inline("memopt_weak_callee_ni", code), 0);
+}
+
+/// An indirect call names no callee, so nothing may be assumed about it.
+#[test]
+fn memopt_an_indirect_call_is_opaque() {
+    let code = r#"
+extern void abort(void);
+int g;
+static int bump(int a) { g += a; return g; }
+
+int main(void) {
+    int (*fp)(int) = bump;
+    g = 1;
+    if (fp(2) != 3) abort();
+    if (g != 3) abort();
+    return 0;
+}
+"#;
+    assert_eq!(at_o2("memopt_indirect_call", code), 0);
+    assert_eq!(at_o2_no_inline("memopt_indirect_call_ni", code), 0);
+}
+
+/// A `pure` callee still writes nothing, but it may *read* -- so a store
+/// before it must still have happened by the time it runs.
+#[test]
+fn memopt_a_pure_callee_still_sees_earlier_stores() {
+    let code = r#"
+extern void abort(void);
+int g;
+__attribute__((pure)) extern int peek(void);
+
+int main(void) {
+    g = 1;
+    if (peek() != 1) abort();
+    g = 2;
+    if (peek() != 2) abort();
+    return 0;
+}
+
+int peek(void) { return g; }
+"#;
+    assert_eq!(at_o2("memopt_pure_reads", code), 0);
+    assert_eq!(at_o2_no_inline("memopt_pure_reads_ni", code), 0);
+}

@@ -523,3 +523,171 @@ int peek(void) { return g; }
     assert_eq!(at_o2("memopt_pure_reads", code), 0);
     assert_eq!(at_o2_no_inline("memopt_pure_reads_ni", code), 0);
 }
+
+/// A store nothing can observe is deleted -- and the value of the pass is
+/// entirely in what it *keeps*.
+#[test]
+fn memopt_a_dead_store_is_deleted_and_a_live_one_is_not() {
+    let code = r#"
+extern void abort(void);
+extern int opaque(int);
+
+int main(void) {
+    int a[4];
+    a[0] = 1;
+    a[0] = 2;               /* the first is overwritten before any read */
+    if (a[0] != 2) abort();
+
+    /* A read between two stores keeps the first. */
+    a[1] = 10;
+    int seen = a[1];
+    a[1] = 20;
+    if (seen != 10 || a[1] != 20) abort();
+
+    /* A partial overwrite leaves the rest live. */
+    unsigned int u = 0x11223344u;
+    unsigned char *p = (unsigned char *)&u;
+    p[0] = 0xFF;
+    if (u != 0x112233FFu && u != 0xFF223344u) abort();
+
+    return opaque(0);
+}
+int opaque(int x) { return x; }
+"#;
+    assert_eq!(at_o2("memopt_dse_basic", code), 0);
+    assert_eq!(at_o2_no_inline("memopt_dse_basic_ni", code), 0);
+}
+
+/// A read-modify-write is a load of the storage unit, a mask, and a store
+/// back. Killing the *first* store of such a pair because the second covers
+/// it would lose every field it did not name.
+#[test]
+fn memopt_dse_does_not_break_a_read_modify_write() {
+    let code = r#"
+extern void abort(void);
+struct S { unsigned int a : 5, b : 11, c : 16; };
+
+int main(void) {
+    struct S s;
+    s.a = 1; s.b = 2; s.c = 3;
+    s.b = 7;                      /* rewrites the unit; a and c must survive */
+    if (s.a != 1 || s.b != 7 || s.c != 3) abort();
+    s.a += 2;
+    if (s.a != 3 || s.b != 7 || s.c != 3) abort();
+    return 0;
+}
+"#;
+    assert_eq!(at_o2("memopt_dse_rmw", code), 0);
+    assert_eq!(at_o2_no_inline("memopt_dse_rmw_ni", code), 0);
+}
+
+/// A store live only on one path out, or only through a back edge, is not
+/// dead at exit.
+#[test]
+fn memopt_dse_respects_every_path_to_the_exit() {
+    let code = r#"
+extern void abort(void);
+extern int pick(void);
+
+int main(void) {
+    int a[1];
+    int total = 0;
+
+    /* Read on one arm of a diamond only. */
+    a[0] = 5;
+    if (pick()) total += a[0];
+    if (total != 5) abort();
+
+    /* Read at the top of a loop body, written at the bottom: the store is
+       observed through the back edge. */
+    a[0] = 1;
+    for (int i = 0; i < 4; i++) {
+        total += a[0];
+        a[0] = a[0] + 1;
+    }
+    /* 5 + (1+2+3+4) */
+    if (total != 15) abort();
+    return 0;
+}
+int pick(void) { return 1; }
+"#;
+    assert_eq!(at_o2("memopt_dse_paths", code), 0);
+    assert_eq!(at_o2_no_inline("memopt_dse_paths_ni", code), 0);
+}
+
+/// A global outlives the frame and a `volatile` object is written as many
+/// times as the program says, so neither is ever dead at exit.
+#[test]
+fn memopt_dse_keeps_globals_and_volatiles() {
+    let code = r#"
+extern void abort(void);
+int g;
+static int s;
+volatile int v;
+
+static int report(void) { return g + s; }
+
+int main(void) {
+    g = 1;
+    s = 2;
+    v = 3;      /* observable even though nothing reads it back */
+    v = 4;
+    if (report() != 3) abort();
+    if (v != 4) abort();
+    return 0;
+}
+"#;
+    assert_eq!(at_o2("memopt_dse_globals", code), 0);
+    assert_eq!(at_o2_no_inline("memopt_dse_globals_ni", code), 0);
+}
+
+/// A local whose address left the function is observable after the frame
+/// goes, so a store to it is never dead at exit.
+#[test]
+fn memopt_dse_keeps_a_store_to_an_escaped_local() {
+    let code = r#"
+extern void abort(void);
+extern void keep(int *);
+static int *saved;
+
+int main(void) {
+    int a = 1;
+    keep(&a);
+    a = 42;         /* `keep` stashed the address; this is observable */
+    if (*saved != 42) abort();
+    return 0;
+}
+void keep(int *p) { saved = p; }
+"#;
+    assert_eq!(at_o2("memopt_dse_escaped", code), 0);
+    assert_eq!(at_o2_no_inline("memopt_dse_escaped_ni", code), 0);
+}
+
+/// `setjmp` resumes at a point the CFG does not model, so nothing may be
+/// called dead at exit in a frame it can return into.
+#[test]
+fn memopt_dse_declines_a_frame_setjmp_can_reenter() {
+    let code = r#"
+#include <setjmp.h>
+extern void abort(void);
+static jmp_buf jb;
+static int *watch;
+extern void jump(void);
+
+int main(void) {
+    volatile int n = 0;
+    int a = 1;
+    watch = &a;
+    if (setjmp(jb) == 0) {
+        a = 7;
+        n = 1;
+        jump();
+    }
+    if (n != 1 || *watch != 7) abort();
+    return 0;
+}
+void jump(void) { longjmp(jb, 1); }
+"#;
+    assert_eq!(at_o2("memopt_dse_setjmp", code), 0);
+    assert_eq!(at_o2_no_inline("memopt_dse_setjmp_ni", code), 0);
+}

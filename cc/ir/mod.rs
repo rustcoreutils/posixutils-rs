@@ -15,6 +15,7 @@ mod constfold;
 pub mod constglobal;
 pub mod dce;
 pub mod dominate;
+pub mod dse;
 pub mod effects;
 pub mod escape;
 pub mod facts;

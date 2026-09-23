@@ -11,6 +11,7 @@
 
 use crate::ir::constglobal;
 use crate::ir::dce;
+use crate::ir::dse;
 use crate::ir::ifconv;
 use crate::ir::inline;
 use crate::ir::instcombine;
@@ -317,6 +318,9 @@ fn optimize_function(func: &mut Function, types: &TypeTable, mi: &memloc::Module
         let ifc_changed = ifconv::run(func);
         let sccp_changed = sccp::run(func, types);
         let ic_changed = instcombine::run(func, types);
+        // `dse` before `dce`, so the value chain feeding a killed store is
+        // swept in the same iteration rather than surviving to the next one.
+        let dse_changed = dse::run(func, types, mi);
         let dce_changed = dce::run(func);
 
         if !lf_changed
@@ -324,6 +328,7 @@ fn optimize_function(func: &mut Function, types: &TypeTable, mi: &memloc::Module
             && !ifc_changed
             && !sccp_changed
             && !ic_changed
+            && !dse_changed
             && !dce_changed
         {
             break;

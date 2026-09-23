@@ -429,10 +429,49 @@ pub(crate) fn eval_fcvt(op: Opcode, dst_size: u32, src_fmt: FpFormat, a: FloatVa
 }
 
 /// `insn`'s unary operation applied to a constant.
+///
+/// Includes the integer width conversions, which are unary in the IR and
+/// carry the source width in `src_size` -- `sext.8to32` being the shape.
+/// The extensions are the whole reason a sub-`int` constant chains at all:
+/// every `char` or `short` read is widened before anything is done with it,
+/// so a fold that stops at the conversion stops one instruction after it
+/// started.
 pub(crate) fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
     match insn.op {
         Opcode::Neg => Some(a.wrapping_neg()),
         Opcode::Not => Some(!a),
+
+        // Read the operand at the width it was stored in, in the signedness
+        // the opcode names, and leave it there: the destination is wider.
+        Opcode::Sext | Opcode::Zext => {
+            let src = conversion_src_width(insn)?;
+            Some(at_width(a, src, insn.op == Opcode::Sext))
+        }
+        // Truncation keeps the low `size` bits -- but *which value* those
+        // bits are is decided by the consumer, not here, and the IR does not
+        // record it: `-(unsigned char)200` reaches the negation as
+        // `trunc.32to8` feeding `neg.32`, with no extension in between and
+        // nothing saying the widening is unsigned. Leaving the `Trunc` in
+        // place is what lets the backend's move decide, so only a value that
+        // reads the same either way may be folded away. That is a narrower
+        // rule than `unambiguous_at` enforces on *chaining* elsewhere in this
+        // file, and deliberately so: this one governs the rewrite itself.
+        Opcode::Trunc => {
+            let size = insn.size.max(1);
+            let v = at_width(a, size, true);
+            unambiguous_at(v, size).then_some(v)
+        }
+
         _ => None,
     }
+}
+
+/// The width a conversion reads its operand at, or `None` when the
+/// instruction does not say.
+///
+/// Refusing is right rather than guessing from `size`: that is the
+/// *destination* width, so an extension read at it is the identity and a
+/// negative `char` would come back positive.
+fn conversion_src_width(insn: &Instruction) -> Option<u32> {
+    (insn.src_size != 0).then_some(insn.src_size)
 }

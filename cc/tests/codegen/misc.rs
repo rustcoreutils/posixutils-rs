@@ -12814,3 +12814,163 @@ int main(void)
         );
     }
 }
+
+/// A `const` global's initializer is its value for the whole run, so a load
+/// of one becomes that constant.
+///
+/// No alias information and no escape analysis are needed for this, and the
+/// escaping pointer below is the point: modifying an object defined with a
+/// `const`-qualified type is undefined behaviour (C17 6.7.3p6), so a pointer
+/// to one may go anywhere at all and the value still cannot change.
+///
+/// The refusals are the other half, and each names something that *can*
+/// change underneath the fold: `volatile` says so outright, a weak
+/// definition exists to be replaced at link time, a tentative definition may
+/// be merged with a real one in another translation unit, an `extern`
+/// declaration has its definition there already, and a type-punned read is
+/// asking for different bits than the initializer describes.
+#[test]
+fn codegen_const_globals_propagate() {
+    let code = r#"
+extern void link_error(void);
+extern void abort(void);
+
+const double one = 1.0;
+const int two = 2;
+const float half = 0.5f;
+const long double big = 1.5L;
+const char letter = 'A';
+static const int internal = 9;
+
+volatile const int watched = 5;
+const int replaceable __attribute__((weak)) = 7;
+const int tentative;
+extern const int elsewhere_defined;
+int mutable_global = 3;
+
+/* Reading a `const` object through a pointer that escaped this function
+   still reads the initializer -- storing through it would be undefined. */
+__attribute__((noinline)) static int through(const int *p) { return *p; }
+
+int main(void)
+{
+    if ((int) one != 1) link_error();
+    if (two != 2) link_error();
+    if (half != 0.5f) link_error();
+    if (letter != 'A') link_error();
+    if (internal != 9) link_error();
+    /* Arithmetic on folded constants folds too. */
+    if (one * 2.0 != 2.0) link_error();
+    if (two + internal != 11) link_error();
+
+    /* The `long double` load folds on every target -- but comparing two of
+       them is a libcall where the type is soft-float (binary128 on Linux
+       aarch64), and a call is not something the optimizer folds. Checked by
+       value, so the fold is still exercised without assuming the host's
+       `long double`. */
+    if (big != 1.5L) abort();
+
+    if (through(&two) != 2) abort();
+
+    /* These must still be read from memory; each is checked by value so the
+       test fails loudly if one were folded to the wrong thing. */
+    if (watched != 5) abort();
+    if (replaceable != 7) abort();
+    if (tentative != 0) abort();
+    if (mutable_global != 3) abort();
+    mutable_global = 4;
+    if (mutable_global != 4) abort();
+
+    /* A read of the same bytes as a different kind of value is not the
+       initializer, and must not be answered with it. */
+    if (*(const long *)&one != 0x3FF0000000000000L) abort();
+
+    return 0;
+}
+
+/* Defined after use, so `elsewhere_defined` is a declaration at the point
+   the optimizer would fold it. */
+const int elsewhere_defined = 11;
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_const_global_propagate", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// Integer width conversions fold over a constant, at the width the operand
+/// was stored in rather than the one it is being widened to.
+///
+/// The source width is the whole of it: read at the destination instead, a
+/// sign extension is the identity, so `(int)(signed char)200` answers 200
+/// where C says -56. Every `char` and `short` read is widened before
+/// anything is done with it, so a fold that stops here stops one instruction
+/// after it started.
+#[test]
+fn codegen_integer_conversions_fold() {
+    let code = r#"
+extern void link_error(void);
+extern void abort(void);
+
+volatile int sink;
+
+int main(void)
+{
+    /* Sign extension reads the operand signed at its own width. */
+    if ((int)(signed char) 200 != -56) link_error();
+    if ((int)(signed char) -56 != -56) link_error();
+    if ((int)(short) 70000 != 4464) link_error();
+    if ((long)(int) -1 != -1L) link_error();
+
+    /* Zero extension reads it unsigned. */
+    if ((int)(unsigned char) 200 != 200) link_error();
+    if ((int)(unsigned short) 70000 != 4464) link_error();
+    if ((unsigned long)(unsigned) -1 != 0xFFFFFFFFUL) link_error();
+
+    /* Truncation keeps the low bits, and what it means then depends on the
+       type it is read back as. These are checked by value rather than for
+       folding: a truncated constant that reads two ways must NOT be folded,
+       because nothing in the IR says how its consumer widens it. */
+    if ((unsigned char) 200 != 200) abort();
+    if ((signed char) 200 != -56) abort();
+    if ((unsigned char) -1 != 255) abort();
+    if ((signed char) -1 != -1) abort();
+    /* Plain `char` is signed on x86-64 and unsigned on aarch64, so this
+       asserts the agreement rather than a number: the folded conversion must
+       give what the same conversion gives at run time. */
+    sink = 0xEF;
+    {
+        int v = sink;
+        if ((int)(char) 0x123456789ABCDEFLL != (int)(char) v) abort();
+    }
+
+    /* A narrow value promoted by a unary operator, with no extension in
+       the IR between the two: the truncated constant must not be folded to
+       one of its two readings. */
+    if (-(unsigned char) 200 != -200) abort();
+    if (-(unsigned short) 60000 != -60000) abort();
+    if (~(unsigned char) 200 != ~200) abort();
+
+    /* The same conversions over values the optimizer cannot know must still
+       give the same answers. */
+    sink = 200;
+    { int v = sink; if ((int)(signed char) v != -56) abort(); }
+    sink = 70000;
+    { int v = sink; if ((int)(short) v != 4464) abort(); }
+    sink = -1;
+    { int v = sink; if ((int)(unsigned char) v != 255) abort(); }
+
+    return 0;
+}
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_integer_conversion_fold", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}

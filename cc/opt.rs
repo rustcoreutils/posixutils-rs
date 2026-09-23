@@ -9,6 +9,7 @@
 // Optimization pass runner and the utilities its passes share.
 //
 
+use crate::ir::constglobal;
 use crate::ir::dce;
 use crate::ir::ifconv;
 use crate::ir::inline;
@@ -238,12 +239,17 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
         return;
     }
 
-    // Phase 2: Per-function optimization (InstCombine + DCE)
+    // Phase 2: a module pre-pass, before anything looks at a value: every
+    // load of a `const` global becomes its initializer, which the passes
+    // below then treat as the constant it is.
+    constglobal::run(module, types);
+
+    // Phase 3: Per-function optimization
     for func in &mut module.functions {
         optimize_function(func, types);
     }
 
-    // Phase 3 (debug builds only): structural IR validation.
+    // Phase 4 (debug builds only): structural IR validation.
     // Runs at the end of optimization, BEFORE `ir::lower::lower_module`
     // which intentionally introduces multi-def Copies as part of φ-
     // elimination. Any invariant we want to enforce on optimizer-stage

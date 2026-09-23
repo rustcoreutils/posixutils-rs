@@ -29,7 +29,7 @@ use super::constfold::{
     eval_fcvtf, eval_funop, eval_unop, get_cmp_info, mirror_mask, result_type_of, unambiguous_at,
     CMP_ALL,
 };
-use super::{Function, Instruction, Opcode, PseudoId, PseudoKind};
+use super::{ConstValue, Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::float::FloatVal;
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
@@ -60,7 +60,15 @@ struct ConstMap {
     /// because the two never mix: no rule reads a float as an integer
     /// without going through a conversion opcode that says so.
     fvals: HashMap<PseudoId, FloatVal>,
-    /// Copy target -> (source, the copy's operand width in bits).
+    /// Target -> (source, the width at which the two are the same value).
+    ///
+    /// A `Copy` records its own operand width. A `Trunc` belongs here too
+    /// and records the width it truncates *to*: a truncation is its operand
+    /// read at that width, which is precisely what this field means, and
+    /// recording it is what lets `(int)(signed char)200` fold. The value in
+    /// the middle means two things, and only the extension that consumes it
+    /// says which -- so it is reachable through [`Self::get_at`], which is
+    /// told the signedness, and not through [`Self::get`], which is not.
     copies: HashMap<PseudoId, (PseudoId, u32)>,
 }
 
@@ -99,11 +107,11 @@ impl ConstMap {
         let mut poisoned: Vec<PseudoId> = Vec::new();
         for bb in &func.blocks {
             for insn in &bb.insns {
-                if insn.op != Opcode::Copy || insn.src.len() != 1 {
+                if !matches!(insn.op, Opcode::Copy | Opcode::Trunc) || insn.src.len() != 1 {
                     continue;
                 }
                 if let Some(target) = insn.target {
-                    let entry = (insn.src[0], insn.size);
+                    let entry = (insn.src[0], insn.size.max(1));
                     if let Some(prev) = copies.insert(target, entry) {
                         if prev != entry {
                             poisoned.push(target);
@@ -430,7 +438,7 @@ pub fn run(func: &mut Function, types: &TypeTable) -> bool {
                 // the shape a float literal is linearized into, and the
                 // only one both allocators resolve.
                 let Some(target_id) = target else { continue };
-                if !func.make_float_const(target_id, value) {
+                if !func.make_const(target_id, ConstValue::Float(value)) {
                     continue;
                 }
                 Instruction {
@@ -500,6 +508,7 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
         // Unary
         Opcode::Neg => simplify_neg(insn, consts),
         Opcode::Not => simplify_not(insn, consts),
+        Opcode::Sext | Opcode::Zext | Opcode::Trunc => simplify_convert(insn, consts),
 
         _ => Simplification::None,
     }
@@ -925,6 +934,28 @@ fn simplify_select(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simp
 }
 
 // Unary Simplifications
+
+/// Fold an integer width conversion of a constant.
+///
+/// The operand is read at the width the conversion says it was stored in,
+/// which is not `insn.size` -- that is the destination. `get_at` is the
+/// accessor that takes both, and it is right here for the same reason it is
+/// right for a comparison: the opcode carries the signedness.
+fn simplify_convert(insn: &Instruction, consts: &ConstMap) -> Simplification {
+    if insn.src.len() != 1 {
+        return Simplification::None;
+    }
+    let (width, signed) = match insn.op {
+        Opcode::Trunc => (insn.size.max(1), true),
+        _ if insn.src_size != 0 => (insn.src_size, insn.op == Opcode::Sext),
+        // Without a source width an extension cannot be read at all.
+        _ => return Simplification::None,
+    };
+    match consts.get_at(insn.src[0], width, signed) {
+        Some(a) => fold_unary_with(insn, a),
+        None => Simplification::None,
+    }
+}
 
 // Floating-Point Simplification
 
@@ -2902,5 +2933,70 @@ mod tests {
         // most temporaries arrive: the linearizer records only the pseudos
         // that are something else.
         assert!(func.is_plain_temp(PseudoId(97)));
+    }
+
+    // Integer width conversions
+    //
+    // Unary in the IR, carrying the *source* width in `src_size`. Reading the
+    // operand at `size` instead is the identity for an extension, which is
+    // how a negative `char` comes back positive.
+
+    /// One `Sext`/`Zext`/`Trunc` of a constant, folded.
+    fn fold_convert(op: Opcode, v: i128, src_size: u32, dst_size: u32) -> Option<i128> {
+        let types = TypeTable::new(&Target::host());
+        let mut insn = Instruction::new(op)
+            .with_target(PseudoId(1))
+            .with_src(PseudoId(0))
+            .with_type_and_size(types.int_id, dst_size);
+        insn.src_size = src_size;
+        let mut func = make_test_func_with_insns(
+            vec![insn],
+            vec![Pseudo::val(PseudoId(0), v), Pseudo::reg(PseudoId(1), 1)],
+        );
+        run(&mut func, &host_types());
+        let got = insn_at(&func, 0);
+        if got.op != Opcode::Copy {
+            return None;
+        }
+        func.const_val(got.src[0])
+    }
+
+    #[test]
+    fn integer_conversions_fold_at_the_source_width() {
+        // Sign extension reads the operand signed at its own width.
+        assert_eq!(fold_convert(Opcode::Sext, 200, 8, 32), Some(-56));
+        assert_eq!(fold_convert(Opcode::Sext, -56, 8, 32), Some(-56));
+        assert_eq!(fold_convert(Opcode::Sext, 70000, 16, 32), Some(4464));
+        // Zero extension reads it unsigned.
+        assert_eq!(fold_convert(Opcode::Zext, 200, 8, 32), Some(200));
+        assert_eq!(fold_convert(Opcode::Zext, -56, 8, 32), Some(200));
+        assert_eq!(fold_convert(Opcode::Zext, -1, 32, 64), Some(0xFFFF_FFFF));
+        // Truncation keeps the low bits, but only where they mean one
+        // thing: see below.
+        assert_eq!(fold_convert(Opcode::Trunc, 0x1234, 32, 8), Some(0x34));
+    }
+
+    /// A truncation's result is read at a *wider* width by whatever consumes
+    /// it, and nothing in the IR says how it is widened: `-(unsigned char)200`
+    /// is `trunc.32to8` feeding `neg.32` with no extension between them.
+    /// Leaving the `Trunc` in place is what lets the backend's move decide,
+    /// so a value that reads two ways must not be folded away.
+    #[test]
+    fn an_ambiguous_truncation_is_left_alone() {
+        // 200 at eight bits is 200 unsigned and -56 signed.
+        assert_eq!(fold_convert(Opcode::Trunc, 200, 32, 8), None);
+        assert_eq!(fold_convert(Opcode::Trunc, -1, 32, 8), None);
+        assert_eq!(fold_convert(Opcode::Trunc, 0xFF, 32, 8), None);
+        // These read the same either way, so they fold.
+        assert_eq!(fold_convert(Opcode::Trunc, 0x1200, 32, 8), Some(0));
+        assert_eq!(fold_convert(Opcode::Trunc, 100, 32, 8), Some(100));
+    }
+
+    /// Without a source width an extension cannot be read at all, and
+    /// falling back on `size` would make it the identity.
+    #[test]
+    fn an_extension_with_no_source_width_is_left_alone() {
+        assert_eq!(fold_convert(Opcode::Sext, 200, 0, 32), None);
+        assert_eq!(fold_convert(Opcode::Zext, 200, 0, 32), None);
     }
 }

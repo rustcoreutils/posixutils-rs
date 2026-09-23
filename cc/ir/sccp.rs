@@ -413,14 +413,16 @@ impl Solver {
                 }
             }
 
-            Opcode::Neg | Opcode::Not => match insn.src.first().map(|s| self.get(*s)) {
-                Some(Val::Const(a)) => match eval_unop(insn, a) {
-                    Some(v) => Val::Const(v),
-                    None => Val::Bottom,
-                },
-                Some(Val::Top) => Val::Top,
-                _ => Val::Bottom,
-            },
+            Opcode::Neg | Opcode::Not | Opcode::Sext | Opcode::Zext | Opcode::Trunc => {
+                match insn.src.first().map(|s| self.get(*s)) {
+                    Some(Val::Const(a)) => match eval_unop(insn, a) {
+                        Some(v) => Val::Const(v),
+                        None => Val::Bottom,
+                    },
+                    Some(Val::Top) => Val::Top,
+                    _ => Val::Bottom,
+                }
+            }
 
             _ if is_modelled_binop(insn.op) => {
                 if insn.src.len() != 2 {

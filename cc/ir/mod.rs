@@ -12,6 +12,7 @@
 //
 
 mod constfold;
+pub mod constglobal;
 pub mod dce;
 pub mod dominate;
 pub mod ifconv;
@@ -1925,29 +1926,38 @@ impl Function {
         }
     }
 
-    /// Make `id` a constant float pseudo, holding `value`.
+    /// Make `id` a constant pseudo holding `value`.
     ///
-    /// A float constant is a pseudo *kind*, so folding one works the other
-    /// way round from folding an integer: there is no way to write the value
-    /// into an instruction, and both allocators read it off the pseudo. The
-    /// target is converted in place, keeping its identity so that every use
-    /// already names it.
+    /// A constant is a pseudo *kind*, so folding a value into one works the
+    /// other way round from rewriting an instruction: the target is
+    /// converted in place, keeping its identity so that every use already
+    /// names it, and its defining instruction becomes the `SetVal` that
+    /// gives it a width.
     ///
     /// `false`, and nothing done, for an id [`Self::is_plain_temp`] rejects.
     ///
-    /// The caller owes the defining `SetVal`: an `FVal` with none is resolved
-    /// at a default width of 64 bits, so a folded `float` would be read out
-    /// of eight bytes.
-    pub fn make_float_const(&mut self, id: PseudoId, value: FloatVal) -> bool {
+    /// The caller owes that `SetVal`. It is not optional for a float: an
+    /// `FVal` without one is resolved at a default width of 64 bits, so a
+    /// folded `float` would be read out of eight bytes. For an integer it
+    /// decides the stack slot in x86-64's sixteen-byte case.
+    pub fn make_const(&mut self, id: PseudoId, value: ConstValue) -> bool {
         if !self.is_plain_temp(id) {
             return false;
         }
+        let kind = match value {
+            ConstValue::Int(v) => PseudoKind::Val(v),
+            ConstValue::Float(v) => PseudoKind::FVal(v),
+        };
         match self.pseudo_idx.get(&id).copied() {
             Some(idx) => match self.pseudos.get_mut(idx) {
-                Some(p) => p.kind = PseudoKind::FVal(value),
+                Some(p) => p.kind = kind,
                 None => return false,
             },
-            None => self.add_pseudo(Pseudo::fval(id, value)),
+            None => self.add_pseudo(Pseudo {
+                id,
+                kind,
+                name: None,
+            }),
         }
         true
     }
@@ -1983,6 +1993,16 @@ impl Function {
             _ => None,
         })
     }
+}
+
+/// A scalar constant a pseudo can be turned into.
+///
+/// The two cases are not interchangeable and never inferred from a width:
+/// which one a value is decides the register file it lives in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ConstValue {
+    Int(i128),
+    Float(FloatVal),
 }
 
 /// A `Function` paired with the type table.

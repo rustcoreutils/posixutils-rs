@@ -1186,7 +1186,7 @@ fn process_file(
     // Optimize IR. Called even at -O0, where the only pass that does anything
     // is inlining of `__attribute__((always_inline))` functions, which gcc
     // honours with optimization off.
-    opt::optimize_module(&mut module, args.optimization());
+    opt::optimize_module(&mut module, &types, args.optimization());
 
     dump_ir(args, &module, &types, "post-opt");
 

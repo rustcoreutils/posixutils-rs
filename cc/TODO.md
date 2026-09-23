@@ -162,6 +162,20 @@ what would make the distinction *exhaustively* checked rather than centralized
 in three accessors — see #C34 in git log for why adding the variant
 naively would be a step backwards.
 
+#### Float Constants: What Is Not Folded
+
+Arithmetic, comparison, negation and both directions of conversion fold over
+float constants, at the format the program computes in rather than at the 128
+significand bits a literal is carried in.
+
+What is deliberately left alone is everything that *raises*: a NaN or infinite
+operand, a division by zero, a narrowing that overflows. C lets a program read
+those flags through `<fenv.h>`, and folding the operation takes the flag with
+it. Reinstating them would mean modelling the exception, not just the value.
+
+`sccp` has no float lattice, so a float constant that is only constant along
+one reachable path is not propagated -- only `instcombine` sees these.
+
 #### Local CSE / Value Numbering
 
 Inside a block, deduplicate `t1 = a + b; t2 = a + b;` → `t2 = t1`.
@@ -247,7 +261,7 @@ Most of what is left is one thing.
 
 | Group | Note |
 |---|---|
-| Dead-call elimination proofs | `20011115-1`, `20020720-1`, `20030216-1`, `20041114-1`, `compare-3`, `pure-1`, `shiftopt-1`, at `-O1` and above. Each calls an undefined `link_error` that the optimizer is expected to delete, so they fail to *link*; all pass at `-O0`, where the test's own `#ifndef __OPTIMIZE__` supplies a definition. Standard C, and optimizer strength rather than a defect. What each one needs differs: a copy-chain root for the identity tests (`shiftopt-1`), if-conversion of a short-circuit diamond (`compare-3`), a transitive dead-static prune (`20011115-1`), `fabs` recognized in its plain spelling plus float folding (`20020720-1`), propagation of a load from a `const` global (`20030216-1`), and value-range propagation across an edge (`20041114-1`) or escape analysis with store-to-load forwarding (`pure-1`) for the two large ones |
+| Dead-call elimination proofs | `20030216-1`, `20041114-1`, `pure-1`, at `-O1` and above. Each calls an undefined `link_error` that the optimizer is expected to delete, so they fail to *link*; all pass at `-O0`, where the test's own `#ifndef __OPTIMIZE__` supplies a definition. Standard C, and optimizer strength rather than a defect. What each one needs differs: propagation of a load from a `const` global (`20030216-1`), and, for the two large ones, value-range propagation across an edge (`20041114-1`) or escape analysis with store-to-load forwarding (`pure-1`) -- the first pass that would move memory, which makes `Instruction::is_memory_barrier()` load-bearing for the first time |
 | Missing optimizations behind `__OPTIMIZE__` | `20030125-1` needs `(float)floor((double)x)` narrowed to `floorf(x)`, which is exact only for the exactly-rounding functions -- the test's weak `sinf` aborts to catch an over-eager narrower. `builtin-constant` needs `__builtin_constant_p` answered after propagation rather than syntactically at parse time. Both abort at run time rather than failing to link |
 | Inline definition with no out-of-line body | `930526-1`, at `-O1` and `-Og` only. gnu89 `inline` emits no out-of-line body, so the call must be inlined or it cannot link; the callee is over the inliner's size cap and level 1 does not inline aggressively |
 | Address of a string-literal element as a constant | `921019-1`: `(void *)&("X"[0])` in a static initializer |

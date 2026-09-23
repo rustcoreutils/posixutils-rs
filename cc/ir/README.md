@@ -322,7 +322,7 @@ extern_symbols          - symbols needing GOT
 | `ssa.rs` | Memory to SSA; inserts phi nodes |
 | `dominate.rs` | Dominator tree (Cooper algorithm) |
 | `dce.rs` | Dead code elimination (mark-sweep on SSA roots, fold-branches-to-unreachable, unreachable-block removal) |
-| `constfold.rs` | Evaluating an operation over constants at the operand's own width and signedness. Not a pass -- the one place those rules are written, shared by `instcombine` and `sccp` |
+| `constfold.rs` | Evaluating an operation over constants at the operand's own width and signedness, integer and floating alike. Not a pass -- the one place those rules are written, shared by `instcombine` and `sccp` |
 | `instcombine.rs` | Constant folding, algebraic simplification |
 | `ifconv.rs` | If-conversion: collapses a short-circuit `&&`/`||` diamond whose arm is safe to speculate into a `Select` |
 | `sccp.rs` | Sparse conditional constant propagation: constants along reachable paths only, and the only thing that folds a branch on a constant condition |

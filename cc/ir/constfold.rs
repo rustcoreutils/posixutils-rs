@@ -24,6 +24,10 @@
 // shift count).
 //
 
+use crate::float::{FloatVal, FpFormat};
+use crate::types::{TypeId, TypeTable};
+use std::cmp::Ordering;
+
 use super::{Instruction, Opcode};
 
 /// Does `v` mean the same thing at `size` bits whether it is read as signed
@@ -189,6 +193,46 @@ pub(crate) fn cmp_operand_width(insn: &Instruction) -> u32 {
     }
 }
 
+/// True for the opcodes that record their *operands* in `typ`/`size` and
+/// produce an `int`.
+///
+/// Integer and floating comparisons both, which is the whole set: no other
+/// opcode describes anything but its own result there.
+pub(crate) fn is_comparison(op: Opcode) -> bool {
+    cmp_mask(op).is_some()
+        || matches!(
+            op,
+            Opcode::FCmpOEq
+                | Opcode::FCmpONe
+                | Opcode::FCmpOLt
+                | Opcode::FCmpOLe
+                | Opcode::FCmpOGt
+                | Opcode::FCmpOGe
+        )
+}
+
+/// The type and width `insn` leaves in its target.
+///
+/// A rewrite that replaces an instruction with a `Copy` of its value has to
+/// give that copy the type of the *value*, and for all but one family of
+/// opcodes `insn.typ`/`insn.size` are exactly that. The exception is the
+/// comparisons, which describe their operands there (see
+/// [`cmp_operand_width`]) and produce an `int`.
+///
+/// Carrying the operand type across is invisible for an integer comparison --
+/// an integer of the wrong width still lands in a general register -- and a
+/// miscompile for a float one: the folded constant is typed `double`, so the
+/// backend puts it in an SSE register and the caller reads the return value
+/// out of the wrong one.
+pub(crate) fn result_type_of(insn: &Instruction, types: &TypeTable) -> (Option<TypeId>, u32) {
+    if is_comparison(insn.op) {
+        let int_id = types.int_id;
+        (Some(int_id), types.size_bits(int_id))
+    } else {
+        (insn.typ, insn.size)
+    }
+}
+
 /// `insn`'s operation applied to two constants, or `None` if the opcode is
 /// not one this folds or the operation is undefined for these operands.
 ///
@@ -260,6 +304,128 @@ fn eval_shift(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
         Opcode::Asr => at_width(a, size, true).wrapping_shr(b as u32),
         _ => return None,
     })
+}
+
+/// A float comparison over two constants, at the format its operands are in.
+///
+/// Two things here are not guessable from the opcode name, and both change
+/// the answer rather than its precision.
+///
+/// **`FCmpONe` is the unordered form.** It is C's `!=`, which is *true* when
+/// either operand is a NaN, and both backends emit it that way -- on x86-64
+/// as `setne` OR'd with `setp`, where every other arm AND's in `setnp` or
+/// relies on `ucomisd` setting CF for unordered. Folding it as the ordered
+/// comparison its name suggests would make a folded program disagree with
+/// the same program unfolded.
+///
+/// **The operands must be rounded first.** A [`FloatVal`] carries the literal
+/// at 128 significand bits, wider than any target format, and rounds to the
+/// target once on the way out -- so the constant in a `double` expression is
+/// not yet the `double` the program computes with. Comparing unrounded makes
+/// `0.1 + 0.2 == 0.3` true, which in `double` it is not.
+pub(crate) fn eval_fcmp(op: Opcode, fmt: FpFormat, a: FloatVal, b: FloatVal) -> Option<i128> {
+    let ord = a.round_to_format(fmt).cmp_value(b.round_to_format(fmt));
+    let r = match op {
+        Opcode::FCmpOEq => ord == Some(Ordering::Equal),
+        Opcode::FCmpONe => ord != Some(Ordering::Equal),
+        Opcode::FCmpOLt => ord == Some(Ordering::Less),
+        Opcode::FCmpOLe => matches!(ord, Some(Ordering::Less | Ordering::Equal)),
+        Opcode::FCmpOGt => ord == Some(Ordering::Greater),
+        Opcode::FCmpOGe => matches!(ord, Some(Ordering::Greater | Ordering::Equal)),
+        _ => return None,
+    };
+    Some(i128::from(r))
+}
+
+/// A float arithmetic operation over two constants, at the format of its
+/// operands, or `None` if `op` is not one this folds.
+///
+/// Rounded exactly once, on the result, after rounding each operand to the
+/// format the program computes in -- which is what makes `0.1 + 0.2` unequal
+/// to `0.3` here as it is at run time.
+///
+/// Nothing involving a NaN or an infinity is folded, on either side. Those
+/// are the operands whose evaluation raises a floating-point exception, and
+/// C lets a program observe one (`<fenv.h>`); folding the operation away
+/// would quietly take that flag with it. Ordinary finite arithmetic raises
+/// only *inexact*, which is not separable from the fold in the first place.
+pub(crate) fn eval_fbinop(op: Opcode, fmt: FpFormat, a: FloatVal, b: FloatVal) -> Option<FloatVal> {
+    let (a, b) = (a.round_to_format(fmt), b.round_to_format(fmt));
+    if !a.is_finite() || !b.is_finite() {
+        return None;
+    }
+    let r = match op {
+        Opcode::FAdd => a.add(b, fmt),
+        Opcode::FSub => a.sub(b, fmt),
+        Opcode::FMul => a.mul(b, fmt),
+        // A zero divisor gives infinity and raises `FE_DIVBYZERO`, so it
+        // falls to the same rule as the operands above.
+        Opcode::FDiv if !b.is_zero() => a.div(b, fmt),
+        _ => return None,
+    };
+    r.is_finite().then_some(r)
+}
+
+/// A float unary operation over a constant.
+///
+/// `FNeg` alone, and unlike the arithmetic above it folds for every operand
+/// including the infinities and NaN: flipping a sign bit computes nothing
+/// and raises nothing. It is also exact, so the result needs no rounding
+/// that the operand has not already had.
+pub(crate) fn eval_funop(op: Opcode, fmt: FpFormat, a: FloatVal) -> Option<FloatVal> {
+    match op {
+        Opcode::FNeg => Some(a.round_to_format(fmt).negated()),
+        _ => None,
+    }
+}
+
+/// A float-to-float conversion of a constant, from one format to another.
+///
+/// **Rounded twice, and both roundings are load-bearing.** The operand is a
+/// literal at 128 significand bits, not yet the value its own type holds, so
+/// rounding straight to the destination skips a step the program does not:
+/// `(float)(_Float16)0.3f16` is `0.30004883`, the nearest `float` to the
+/// nearest `_Float16` to `0.3`, and converting in one go gives `0.3f`
+/// instead. Widening looks harmless and is not -- that is the direction
+/// this got wrong.
+///
+/// Held to the same rule as the arithmetic above otherwise: a non-finite
+/// operand is left alone, and so is a narrowing that overflows to infinity,
+/// because both are where the conversion raises.
+pub(crate) fn eval_fcvtf(
+    op: Opcode,
+    src_fmt: FpFormat,
+    dst_fmt: FpFormat,
+    a: FloatVal,
+) -> Option<FloatVal> {
+    if op != Opcode::FCvtF {
+        return None;
+    }
+    let a = a.round_to_format(src_fmt);
+    if !a.is_finite() {
+        return None;
+    }
+    let r = a.round_to_format(dst_fmt);
+    r.is_finite().then_some(r)
+}
+
+/// A float-to-integer conversion of a constant, to `dst_size` bits.
+///
+/// `None` when the value does not fit, which is exactly where C leaves the
+/// conversion undefined (6.3.1.4): a folded answer there would be this
+/// compiler's invention rather than the target's, and the two differ.
+pub(crate) fn eval_fcvt(op: Opcode, dst_size: u32, src_fmt: FpFormat, a: FloatVal) -> Option<i128> {
+    let signed = match op {
+        Opcode::FCvtS => true,
+        Opcode::FCvtU => false,
+        _ => return None,
+    };
+    let v = a.round_to_format(src_fmt).trunc_to_i128()?;
+    let size = dst_size.max(1);
+    if !signed && v < 0 {
+        return None;
+    }
+    (at_width(v, size, signed) == v).then_some(v)
 }
 
 /// `insn`'s unary operation applied to a constant.

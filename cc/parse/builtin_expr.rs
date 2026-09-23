@@ -130,6 +130,9 @@ impl Parser<'_> {
                     | crate::kw::LONGJMP
                     | crate::kw::LONGJMP2
                     | crate::kw::ALLOCA
+                    | crate::kw::FABS
+                    | crate::kw::FABSF
+                    | crate::kw::FABSL
             );
         if !shadowable {
             return false;
@@ -168,6 +171,51 @@ impl Parser<'_> {
         let arg = self.parse_assignment_expr()?;
         self.expect_special(b')')?;
         Ok(Self::typed_expr(kind(Box::new(arg)), typ, token_pos))
+    }
+
+    /// `fabs(x)` / `fabsf(x)`, whose opcode reads its operand at a fixed
+    /// width, so the argument has to arrive already converted.
+    ///
+    /// `fabs(-3)` is a well-formed call under the prototype the standard
+    /// gives it -- and under the `extern double fabs(double);` a program
+    /// writes for itself -- but the opcode is an SSE instruction that masks
+    /// the sign bit, so an unconverted `int` operand is read as a `double`
+    /// bit pattern and the answer is nonsense.
+    fn parse_fabs(
+        &mut self,
+        token_pos: Position,
+        typ: TypeId,
+        kind: fn(Box<Expr>) -> ExprKind,
+    ) -> ParseResult<Expr> {
+        self.expect_special(b'(')?;
+        let arg = self.parse_assignment_expr()?;
+        self.expect_special(b')')?;
+        let arg = if arg.typ == Some(typ) {
+            arg
+        } else {
+            Self::typed_expr(
+                ExprKind::Cast {
+                    cast_type: typ,
+                    expr: Box::new(arg),
+                },
+                typ,
+                token_pos,
+            )
+        };
+        Ok(Self::typed_expr(kind(Box::new(arg)), typ, token_pos))
+    }
+
+    /// `fabsl(x)`, lowered as an ordinary call to `fabsl` rather than as an
+    /// opcode: the `Fabs64` opcode moves its argument as a `double`, so on
+    /// x86-64 it would read only the low eight bytes of an 80-bit x87 value.
+    /// A real call gets the long-double ABI from the call path, which already
+    /// carries one for `__mulxc3`.
+    fn parse_fabsl(&mut self, token_pos: Position) -> ParseResult<Expr> {
+        self.expect_special(b'(')?;
+        let arg = self.parse_assignment_expr()?;
+        self.expect_special(b')')?;
+        let ld = self.types.longdouble_id;
+        Ok(self.libm_call("fabsl", ld, &[ld], arg, token_pos))
     }
 
     /// `__builtin_va_*`: the variadic-argument builtins, plus `_Generic`.
@@ -640,6 +688,13 @@ impl Parser<'_> {
         name_id: StringId,
         token_pos: Position,
     ) -> Option<ParseResult<Expr>> {
+        // A plain spelling is recognized only where it is being *called*.
+        // `double (*p)(double) = fabs;` names the library function, and an
+        // arm that ran here would report a missing `(` rather than letting
+        // the identifier reach the ordinary path. The `__builtin_` spellings
+        // need no such guard: they are not objects, so demanding the `(` is
+        // the right diagnostic for them.
+        let called = self.is_special(b'(');
         match name_id {
             crate::kw::BUILTIN_INF | crate::kw::BUILTIN_HUGE_VAL => Some((|| {
                 self.expect_special(b'(')?;
@@ -711,30 +766,30 @@ impl Parser<'_> {
                 ))
             })()),
             // Fabs builtins - absolute value for floats
-            crate::kw::BUILTIN_FABS => Some(self.parse_unary_builtin(
+            crate::kw::BUILTIN_FABS => Some(self.parse_fabs(
+                token_pos,
+                self.types.double_id,
+                |arg| ExprKind::Fabs { arg },
+            )),
+            crate::kw::FABS if called => Some(self.parse_fabs(
                 token_pos,
                 self.types.double_id,
                 |arg| ExprKind::Fabs { arg },
             )),
 
-            crate::kw::BUILTIN_FABSF => Some(self.parse_unary_builtin(
+            crate::kw::BUILTIN_FABSF => Some(self.parse_fabs(
+                token_pos,
+                self.types.float_id,
+                |arg| ExprKind::Fabsf { arg },
+            )),
+            crate::kw::FABSF if called => Some(self.parse_fabs(
                 token_pos,
                 self.types.float_id,
                 |arg| ExprKind::Fabsf { arg },
             )),
 
-            crate::kw::BUILTIN_FABSL => Some((|| {
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                // Lowered as an ordinary call to `fabsl`, not as an opcode:
-                // the `Fabs64` opcode moves its argument as a `double`, so on
-                // x86-64 it would read only the low eight bytes of an 80-bit
-                // x87 value. A real call gets the long-double ABI from the
-                // call path, which already carries one for `__mulxc3`.
-                let ld = self.types.longdouble_id;
-                Ok(self.libm_call("fabsl", ld, &[ld], arg, token_pos))
-            })()),
+            crate::kw::BUILTIN_FABSL => Some(self.parse_fabsl(token_pos)),
+            crate::kw::FABSL if called => Some(self.parse_fabsl(token_pos)),
             // Signbit builtins - test sign bit of floats
             crate::kw::BUILTIN_ISNAN
             | crate::kw::BUILTIN_ISNANF

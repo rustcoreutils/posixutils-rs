@@ -1911,6 +1911,47 @@ impl Function {
         id
     }
 
+    /// Is `id` an ordinary SSA temporary -- a value and nothing more?
+    ///
+    /// True for an id that is not in `pseudos` at all, which is most of them:
+    /// `Linearizer::alloc_pseudo` records nothing, so a plain register is
+    /// exactly what an absent id means. False for an `Arg`, a `Phi`, a `Sym`
+    /// or an existing constant, each of which carries a meaning beyond its
+    /// value that a rewrite must not take away.
+    pub fn is_plain_temp(&self, id: PseudoId) -> bool {
+        match self.get_pseudo(id) {
+            Some(p) => matches!(p.kind, PseudoKind::Reg(_)),
+            None => true,
+        }
+    }
+
+    /// Make `id` a constant float pseudo, holding `value`.
+    ///
+    /// A float constant is a pseudo *kind*, so folding one works the other
+    /// way round from folding an integer: there is no way to write the value
+    /// into an instruction, and both allocators read it off the pseudo. The
+    /// target is converted in place, keeping its identity so that every use
+    /// already names it.
+    ///
+    /// `false`, and nothing done, for an id [`Self::is_plain_temp`] rejects.
+    ///
+    /// The caller owes the defining `SetVal`: an `FVal` with none is resolved
+    /// at a default width of 64 bits, so a folded `float` would be read out
+    /// of eight bytes.
+    pub fn make_float_const(&mut self, id: PseudoId, value: FloatVal) -> bool {
+        if !self.is_plain_temp(id) {
+            return false;
+        }
+        match self.pseudo_idx.get(&id).copied() {
+            Some(idx) => match self.pseudos.get_mut(idx) {
+                Some(p) => p.kind = PseudoKind::FVal(value),
+                None => return false,
+            },
+            None => self.add_pseudo(Pseudo::fval(id, value)),
+        }
+        true
+    }
+
     /// Create a new constant integer pseudo and return its ID.
     /// The pseudo is added to self.pseudos.
     pub fn create_const_pseudo(&mut self, value: i128) -> PseudoId {

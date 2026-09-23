@@ -12692,3 +12692,125 @@ int main(void)
         );
     }
 }
+
+/// Float constants reach the optimizer: arithmetic over two of them folds,
+/// so does a comparison and a conversion, and `fabs(x) < 0.0` folds without
+/// knowing `x` at all.
+///
+/// Three things here answer differently from the integer rules underneath
+/// them, and each has its own arm below. NaN makes a comparison *false*
+/// rather than reversing it, so only `!=` is true of one -- which is why the
+/// `fabs` rule is stated as "never less than zero" rather than "non-negative"
+/// and covers only the strict form. A conversion whose value does not fit is
+/// undefined, so it must still be computed at run time. And a comparison
+/// carries its *operand* type, so a folded one had to be re-typed: left as a
+/// `double`, the constant came back in an SSE register from a function
+/// returning `int`.
+#[test]
+fn codegen_float_constants_fold() {
+    let code = r#"
+extern double fabs(double);
+extern void link_error(void);
+extern void abort(void);
+
+volatile double opaque = 1.0;
+
+__attribute__((noinline)) static void folds(double x)
+{
+    /* No absolute value is below zero, a NaN argument included: an
+       unordered `<` is false as well. */
+    if (fabs(x) < 0.0) link_error();
+    if (0.0 > fabs(x)) link_error();
+
+    /* Both constants known. A negative literal is a negation of a positive
+       one, exactly as in the integer case, so `-0.0` folding at all is the
+       `FNeg` rule. */
+    if (1.0 > 2.0) link_error();
+    if (2.0 != 2.0) link_error();
+    if (-0.0 != 0.0) link_error();
+    if ((int) 1.9 != 1) link_error();
+    if ((int) -1.9 != -1) link_error();
+    if ((unsigned) 3.5 != 3u) link_error();
+
+    /* Arithmetic, rounded at the format the program computes in rather than
+       at the width the literals are carried in: at 128 significand bits
+       these three would come out equal. */
+    if (1.5 * 2.0 - 0.5 != 2.5) link_error();
+    if (0.1 + 0.2 == 0.3) link_error();
+    if ((float) (0.1f + 0.2f) != 0.3f) link_error();
+    if ((double) 1.5f != 1.5) link_error();
+}
+
+/* The neighbours of the fabs rule that do NOT hold. Each is true or false
+   depending on the argument, so each must still be evaluated. */
+__attribute__((noinline)) static int le_zero(double x) { return fabs(x) <= 0.0; }
+__attribute__((noinline)) static int ge_zero(double x) { return fabs(x) >= 0.0; }
+
+/* A folded comparison returns an `int`, in an integer register. */
+__attribute__((noinline)) static int always_false(void) { return 1.0 > 2.0; }
+
+/* Out of `int` range, so undefined and not foldable: this must still be the
+   hardware's answer rather than one invented here. */
+__attribute__((noinline)) static long big(void) { return (long) 3e9; }
+
+/* Neither is foldable either, because each raises: one overflows to
+   infinity on the way to `float`, the other divides by zero. */
+__attribute__((noinline)) static float overflows(void) { return (float) 1e300; }
+__attribute__((noinline)) static double by_zero(double z) { return 1.0 / z; }
+
+/* A negative zero is a *constant* once the negation folds, and it has to
+   survive being materialized: an XMM register zeroed with `xorpd` holds
+   `+0.0`, which compares equal under `==` and is a different value under
+   `signbit` and `copysign`. */
+__attribute__((noinline)) static int neg_zero_keeps_its_sign(void)
+{
+    double d = -0.0;
+    float  f = -0.0f;
+    return __builtin_signbit(d) && __builtin_signbit(f)
+        && !__builtin_signbit(0.0) && !__builtin_signbit(0.0f);
+}
+
+int main(void)
+{
+    double nan = __builtin_nan("");
+
+    folds(opaque);
+    folds(-opaque);
+    folds(nan);
+
+    if (!le_zero(0.0)) return 1;
+    if (le_zero(1.0)) return 2;
+    if (le_zero(nan)) return 3;
+
+    if (!ge_zero(0.0)) return 4;
+    if (!ge_zero(-1.0)) return 5;
+    if (ge_zero(nan)) return 6;
+
+    if (always_false()) return 7;
+    if (big() != 3000000000L) return 8;
+    if (overflows() != __builtin_inff()) return 9;
+    if (by_zero(0.0) != __builtin_inf()) return 10;
+    if (!neg_zero_keeps_its_sign()) return 11;
+
+    return 0;
+}
+"#;
+    // `link_error` is deliberately never defined, so a fold that does not
+    // happen is a link failure. It has to happen for that to link at all,
+    // which is why `-O0` is not in this list -- constant branches survive
+    // there by decision.
+    // `-lm` because `Fabs64` is lowered as a call to `fabs`, not as an
+    // instruction: recognizing the name buys the optimizer visibility, not a
+    // different code sequence.
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                "c17_float_constant_fold",
+                code,
+                &[opt.to_string(), "-lm".to_string()]
+            ),
+            0,
+            "at {opt}"
+        );
+    }
+}

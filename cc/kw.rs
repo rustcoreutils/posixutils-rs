@@ -444,6 +444,15 @@ define_keywords! {
     (LONGJMP,           "longjmp",           0),
     (LONGJMP2,          "_longjmp",          0),
 
+    // ---- Plain spellings of libm entry points ----
+    // gcc recognizes the standard names whether or not <math.h> was included,
+    // which is what lets `fabs(x) < 0.0` fold to 0 in a program that only
+    // declares `extern double fabs(double);`. Tagged 0 for the same reason
+    // `alloca` is, and displaceable the same way (see `builtin_is_shadowed`).
+    (FABS,              "fabs",              0),
+    (FABSF,             "fabsf",             0),
+    (FABSL,             "fabsl",             0),
+
     // ---- Fortified libc entry points ----
     // Interned but untagged: these are ordinary identifiers, listed only so
     // the parser can name one when it synthesizes the declaration glibc
@@ -517,8 +526,9 @@ define_keywords! {
     (_,                 "fputs_unlocked",  0),
     // The long-double magnitude and sign builtins lower to these rather than
     // to `fabs`/`__signbit`, which take a `double` and so read only the low
-    // eight bytes of an x87 value.
-    (_,                 "fabsl",                0),
+    // eight bytes of an x87 value. `fabsl` is named above, as a plain
+    // spelling the parser recognizes; it is still looked up here by string,
+    // to synthesize the prototype the call needs.
     (_,                 "__signbitl",           0),
 
     // ---- Supported attribute names (SUPPORTED_ATTR) ----

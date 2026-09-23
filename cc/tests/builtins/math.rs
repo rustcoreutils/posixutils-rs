@@ -447,3 +447,85 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("builtins_complex_parts", code, &[]), 0);
 }
+
+// ============================================================================
+// The plain spellings
+// ============================================================================
+
+/// gcc recognizes `fabs` and friends as builtins whether or not `<math.h>`
+/// was included, and a program that only writes `extern double fabs(double);`
+/// still gets the intrinsic. Recognizing the plain spelling is what lets
+/// `fabs(x) < 0.0` fold.
+///
+/// The three negative halves are the point. The bare name is an object as
+/// well as a call -- `double (*p)(double) = fabs;` names the library function
+/// and must not be parsed as a builtin invocation. A declaration of something
+/// *other* than a function displaces it. And the argument has to be converted
+/// to the prototype's type before it reaches an opcode that masks a sign bit:
+/// `fabs(-3)` passing an `int` straight through read the integer as a double
+/// bit pattern.
+#[test]
+fn builtins_plain_fabs_spellings_are_recognized() {
+    let code = r#"
+extern double fabs(double);
+extern float fabsf(float);
+extern long double fabsl(long double);
+extern void abort(void);
+
+static double (*as_value)(double) = fabs;
+
+int main(void)
+{
+    int i = -3;
+
+    if (fabs(-3.5) != 3.5) abort();
+    if (fabsf(-2.25f) != 2.25f) abort();
+    if (fabsl(-1.5L) != 1.5L) abort();
+
+    /* The name used as a value, not a call. */
+    if (as_value(-7.0) != 7.0) abort();
+
+    /* The argument converts to the prototype's type first. */
+    if (fabs(-3) != 3.0) abort();
+    if (fabs(i) != 3.0) abort();
+    if (fabsf(-2) != 2.0f) abort();
+    if (fabs(-1.5L) != 1.5) abort();
+
+    /* fabs of a NaN is a NaN with the sign cleared. */
+    {
+        double n = -__builtin_nan("");
+        double a = fabs(n);
+        if (a == a) abort();
+        if (__builtin_signbit(a)) abort();
+    }
+
+    return 0;
+}
+"#;
+    for extra in [
+        vec!["-lm".to_string()],
+        vec!["-lm".to_string(), "-fno-builtin".to_string()],
+    ] {
+        assert_eq!(
+            compile_and_run("builtins_plain_fabs", code, &extra),
+            0,
+            "with {extra:?}"
+        );
+    }
+}
+
+/// A declaration of something that is not a function takes the name back.
+#[test]
+fn builtins_a_plain_fabs_object_displaces_the_builtin() {
+    let code = r#"
+extern void abort(void);
+static double fabs = 2.5;
+
+int main(void)
+{
+    if (fabs != 2.5) abort();
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("builtins_fabs_object", code, &[]), 0);
+}

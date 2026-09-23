@@ -147,7 +147,7 @@ pub(crate) fn get_cmp_info(op: Opcode) -> Option<CmpInfo> {
 /// 32-bit operands -- and that site is the only one that records the operand
 /// width, in `src_size`. Preferring `src_size` when it is set is right at all
 /// four.
-fn cmp_operand_width(insn: &Instruction) -> u32 {
+pub(crate) fn cmp_operand_width(insn: &Instruction) -> u32 {
     if insn.src_size != 0 {
         insn.src_size
     } else {

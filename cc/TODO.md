@@ -130,6 +130,15 @@ Convert constant branches to unconditional jumps. Merge simple blocks. Remove ju
 
 `t1 = x; y = t1;` → `y = x`. Simplify φ-nodes where all incoming operands are same.
 
+**Partly delivered, in read-only form.** `instcombine`'s `ConstMap` answers
+what a pseudo ultimately copies from (`root`) and what constant reaches it at
+a stated width and signedness (`get_at`), which is what the identity rules --
+`x - x`, `x & x`, `x == x` -- actually need: promotion out of memory gives
+every use of a local its own `Copy`, so the two sides of `x >> 0 != x` arrive
+as distinct pseudos naming one value. That is a query, not a rewrite: the
+copies are still there for `dce` to collect, and no pseudo is merged. A real
+pass would rewrite the uses and delete them.
+
 **Unblocked on x86-64.** The defect was thirty-odd emitters in
 `arch/x86_64/features.rs` that hand-rolled an `%rbp` displacement from a stack
 slot index, which is the caller's incoming-argument area rather than the

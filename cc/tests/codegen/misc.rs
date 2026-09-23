@@ -12504,3 +12504,70 @@ int main(void) { __asm__ volatile ("call helper" ::: "memory"); return 0; }
         "a static named only in an asm template must survive:\n{asm}"
     );
 }
+
+/// Shift identities that hold for *every* shift count, and the comparisons
+/// that prove them.
+///
+/// Two things were needed and neither was the shift. `x >> 0 != x` folds the
+/// shift to a `Copy` already, but the comparison did not: promotion out of
+/// memory gives each use of `x` its own copy, so the two sides arrive as
+/// distinct pseudos naming one value, and the identity test compared raw ids.
+/// And `-1 >> x` is only recognizable when the operand is read *signed* at its
+/// own width -- read either way, as the folder must when nothing tells it
+/// which, `-1` at 32 bits is ambiguous and was refused.
+///
+/// The negative half is the point: a *logical* shift of all-ones shifts in
+/// zeros, so `0xFFFFFFFFu >> x` is all-ones only when `x` is zero.
+#[test]
+fn codegen_shift_identities_hold_for_any_count() {
+    let code = r#"
+extern void link_error(void);
+
+__attribute__((noinline)) static void utest(unsigned int x)
+{
+    if (x >> 0 != x) link_error();
+    if (x << 0 != x) link_error();
+    if (0 << x != 0) link_error();
+    if (0 >> x != 0) link_error();
+    if (-1 >> x != -1) link_error();
+    if (~0 >> x != ~0) link_error();
+}
+
+__attribute__((noinline)) static void stest(int x)
+{
+    if (x >> 0 != x) link_error();
+    if (x << 0 != x) link_error();
+    if (0 << x != 0) link_error();
+    if (0 >> x != 0) link_error();
+}
+
+/* The identity must not be claimed where it does not hold. A logical shift
+   of all-ones is all-ones only for a zero count, so these must still be
+   evaluated rather than folded away. */
+__attribute__((noinline)) static int lsr_is_not_asr(unsigned int x)
+{
+    unsigned int all = 0xFFFFFFFFu;
+    return (all >> x) == all;
+}
+
+int main(void)
+{
+    utest(9); utest(0); stest(9); stest(0);
+    if (!lsr_is_not_asr(0)) return 1;
+    if (lsr_is_not_asr(1)) return 2;
+    if (lsr_is_not_asr(31)) return 3;
+    return 0;
+}
+"#;
+    // `link_error` is deliberately never defined, so a surviving call is a
+    // *link* failure -- which is the whole proof. `-O0` is therefore not in
+    // the list: nothing folds there, exactly as the torture test's own
+    // `#ifndef __OPTIMIZE__` fallback definition concedes.
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_shift_identities", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}

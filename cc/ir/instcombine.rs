@@ -24,7 +24,9 @@
 // `is_memory_barrier()` before crossing.
 //
 
-use super::constfold::{at_width, eval_binop, eval_unop, get_cmp_info, unambiguous_at};
+use super::constfold::{
+    at_width, cmp_operand_width, eval_binop, eval_unop, get_cmp_info, unambiguous_at,
+};
 use super::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeId;
 use std::collections::HashMap;
@@ -111,6 +113,55 @@ impl ConstMap {
             }
             _ => {}
         }
+    }
+
+    /// The pseudo `id` ultimately copies from, reading it at `width` bits.
+    ///
+    /// Two values are the same value when they share a root, which is what
+    /// the identity rules (`x - x`, `x & x`, `x == x`) actually need: after
+    /// promotion out of memory every use of a local is its own `Copy`, so
+    /// `x >> 0 != x` reaches the comparison as two distinct pseudos that are
+    /// the same value. Comparing raw ids missed all of them.
+    ///
+    /// A copy *narrower* than `width` is not followed: it only carries its own
+    /// width of the value, so treating it as value-preserving would equate two
+    /// pseudos that differ above it.
+    fn root(&self, id: PseudoId, width: u32) -> PseudoId {
+        let mut cur = id;
+        for _ in 0..=self.copies.len() {
+            match self.copies.get(&cur) {
+                Some(&(src, w)) if w >= width => cur = src,
+                _ => return cur,
+            }
+        }
+        cur
+    }
+
+    /// The constant at `id`, read at `size` bits in the given signedness.
+    ///
+    /// For a consumer that *knows* how to read its operands -- a comparison
+    /// and a shift take their width and signedness from the opcode -- which
+    /// is exactly the information [`Self::get`] refuses to guess. `get` is
+    /// still right for everything else, and the two must not be merged: its
+    /// guard is what stops an ambiguous value chaining into a second fold.
+    ///
+    /// Still `None` when the chain narrows *below* `size`, since the value
+    /// was truncated before it got here.
+    fn get_at(&self, id: PseudoId, size: u32, signed: bool) -> Option<i128> {
+        let mut cur = id;
+        let mut narrowest: Option<u32> = None;
+        for _ in 0..=self.copies.len() {
+            if let Some(&v) = self.vals.get(&cur) {
+                return match narrowest {
+                    Some(w) if w < size => None,
+                    _ => Some(at_width(v, size, signed)),
+                };
+            }
+            let &(src, width) = self.copies.get(&cur)?;
+            narrowest = Some(narrowest.map_or(width, |w: u32| w.min(width)));
+            cur = src;
+        }
+        None
     }
 
     /// The constant at `id`, following `Copy` chains to their source.
@@ -320,8 +371,9 @@ fn simplify_sub(insn: &Instruction, consts: &ConstMap) -> Simplification {
     let src1 = insn.src[0];
     let src2 = insn.src[1];
 
-    // Identity: x - x -> 0
-    if src1 == src2 {
+    // Identity: x - x -> 0, by root: the two sides are usually distinct
+    // copies of one value.
+    if consts.root(src1, insn.size.max(1)) == consts.root(src2, insn.size.max(1)) {
         return fold_to_zero();
     }
 
@@ -441,6 +493,16 @@ fn simplify_shift(insn: &Instruction, consts: &ConstMap) -> Simplification {
     let val1 = consts.get(src1);
     let val2 = consts.get(src2);
 
+    // All-ones shifted arithmetically right is all-ones, whatever the count:
+    // the sign bit fills every vacated position. `Lsr` is not this -- it
+    // shifts in zeros -- and the operand has to be read *signed* at its own
+    // width to be recognized at all, which is what `get` deliberately refuses
+    // to guess.
+    let size = insn.size.max(1);
+    if insn.op == Opcode::Asr && consts.get_at(src1, size, true) == Some(-1) {
+        return Simplification::FoldToConst(at_width(-1, size, true));
+    }
+
     match (val1, val2) {
         // Constant folding (shift amount must be in [0, type_width))
         (Some(a), Some(b)) => fold_with(insn, a, b),
@@ -512,8 +574,8 @@ fn simplify_bitwise(insn: &Instruction, consts: &ConstMap) -> Simplification {
     let src1 = insn.src[0];
     let src2 = insn.src[1];
 
-    // x op x -> self_result
-    if src1 == src2 {
+    // x op x -> self_result, by root as above.
+    if consts.root(src1, insn.size.max(1)) == consts.root(src2, insn.size.max(1)) {
         return match info.self_result {
             SelfOpResult::CopySrc => Simplification::CopyFrom(src1),
             SelfOpResult::Const(c) => fold_to_const(c),
@@ -554,15 +616,21 @@ fn simplify_comparison(insn: &Instruction, consts: &ConstMap) -> Simplification 
 
     let src1 = insn.src[0];
     let src2 = insn.src[1];
+    let width = cmp_operand_width(insn);
 
     // Identity: x op x -> identity_result (comparison result is always i32/i64, never i128)
-    if src1 == src2 {
+    //
+    // By root rather than by pseudo id: promotion out of memory gives every
+    // use of a local its own `Copy`, so `x >> 0 != x` arrives as two distinct
+    // pseudos naming one value.
+    if consts.root(src1, width) == consts.root(src2, width) {
         return Simplification::FoldToConst(info.identity_result);
     }
 
-    // Constant folding
-    let val1 = consts.get(src1);
-    let val2 = consts.get(src2);
+    // Constant folding. A comparison knows its operand width and signedness
+    // from the opcode, so it can read a value `get` would refuse to guess at.
+    let val1 = consts.get_at(src1, width, info.signed);
+    let val2 = consts.get_at(src2, width, info.signed);
 
     if let (Some(a), Some(b)) = (val1, val2) {
         return fold_with(insn, a, b);
@@ -1760,6 +1828,145 @@ mod tests {
             func.const_val(c.src[0]),
             Some(1),
             "256 != 0 is true; reading only the low 8 bits would say false"
+        );
+    }
+    /// Promotion out of memory gives every use of a local its own `Copy`, so
+    /// `x >> 0 != x` reaches the comparison as two distinct pseudos naming one
+    /// value. Comparing raw ids missed it; comparing roots does not.
+    #[test]
+    fn test_identity_holds_across_copies_of_one_value() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_test_func_with_insns(
+            vec![
+                // %1 = copy %0 ; %2 = copy %0 ; %3 = setne %1, %2
+                Instruction::unop(Opcode::Copy, PseudoId(1), PseudoId(0), types.int_id, 32),
+                Instruction::unop(Opcode::Copy, PseudoId(2), PseudoId(0), types.int_id, 32),
+                Instruction::binop(
+                    Opcode::SetNe,
+                    PseudoId(3),
+                    PseudoId(1),
+                    PseudoId(2),
+                    types.int_id,
+                    32,
+                ),
+            ],
+            vec![
+                Pseudo::arg(PseudoId(0), 0),
+                Pseudo::reg(PseudoId(1), 1),
+                Pseudo::reg(PseudoId(2), 2),
+                Pseudo::reg(PseudoId(3), 3),
+            ],
+        );
+        assert!(run(&mut func));
+        let cmp = &func.blocks[0].insns[3];
+        assert_eq!(cmp.op, Opcode::Copy);
+        assert_eq!(func.const_val(cmp.src[0]), Some(0), "x != x is 0");
+    }
+
+    /// A copy narrower than the width being read carries only its own width,
+    /// so it must not make two pseudos look like one value.
+    #[test]
+    fn test_root_does_not_follow_a_narrowing_copy() {
+        let types = TypeTable::new(&Target::host());
+        let func = make_test_func_with_insns(
+            vec![
+                // %1 = copy.8 %0 -- truncates; %2 = copy.32 %0 -- does not
+                Instruction::unop(Opcode::Copy, PseudoId(1), PseudoId(0), types.int_id, 8),
+                Instruction::unop(Opcode::Copy, PseudoId(2), PseudoId(0), types.int_id, 32),
+            ],
+            vec![
+                Pseudo::arg(PseudoId(0), 0),
+                Pseudo::reg(PseudoId(1), 1),
+                Pseudo::reg(PseudoId(2), 2),
+            ],
+        );
+        let consts = ConstMap::new(&func);
+        assert_ne!(
+            consts.root(PseudoId(1), 32),
+            consts.root(PseudoId(2), 32),
+            "an 8-bit copy is not the 32-bit value"
+        );
+        assert_eq!(
+            consts.root(PseudoId(1), 8),
+            consts.root(PseudoId(2), 8),
+            "at 8 bits they agree"
+        );
+    }
+
+    /// All-ones shifted arithmetically right is all-ones for every count. The
+    /// operand only reads as `-1` when read *signed* at its own width, which
+    /// is what `get` refuses to guess and `get_at` is told.
+    #[test]
+    fn test_arithmetic_shift_of_all_ones_folds() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_test_func_with_insns(
+            vec![Instruction::binop(
+                Opcode::Asr,
+                PseudoId(2),
+                PseudoId(0),
+                PseudoId(1),
+                types.int_id,
+                32,
+            )],
+            vec![
+                Pseudo::val(PseudoId(0), -1),
+                Pseudo::arg(PseudoId(1), 0),
+                Pseudo::reg(PseudoId(2), 2),
+            ],
+        );
+        assert!(run(&mut func));
+        let insn = &func.blocks[0].insns[1];
+        assert_eq!(insn.op, Opcode::Copy);
+        assert_eq!(func.const_val(insn.src[0]), Some(-1));
+    }
+
+    /// And a *logical* shift of all-ones is not: it shifts in zeros, so
+    /// `0xFFFFFFFFu >> x` is only all-ones when `x` is zero.
+    #[test]
+    fn test_logical_shift_of_all_ones_does_not_fold() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_test_func_with_insns(
+            vec![Instruction::binop(
+                Opcode::Lsr,
+                PseudoId(2),
+                PseudoId(0),
+                PseudoId(1),
+                types.int_id,
+                32,
+            )],
+            vec![
+                Pseudo::val(PseudoId(0), -1),
+                Pseudo::arg(PseudoId(1), 0),
+                Pseudo::reg(PseudoId(2), 2),
+            ],
+        );
+        run(&mut func);
+        assert_eq!(func.blocks[0].insns[1].op, Opcode::Lsr);
+    }
+
+    /// `get_at` reads what `get` refuses to guess at, and still declines when
+    /// the chain narrowed below the width asked for.
+    #[test]
+    fn test_get_at_reads_an_ambiguous_constant_at_a_stated_width() {
+        let types = TypeTable::new(&Target::host());
+        let func = make_test_func_with_insns(
+            vec![Instruction::unop(
+                Opcode::Copy,
+                PseudoId(1),
+                PseudoId(0),
+                types.int_id,
+                32,
+            )],
+            vec![Pseudo::val(PseudoId(0), -1), Pseudo::reg(PseudoId(1), 1)],
+        );
+        let consts = ConstMap::new(&func);
+        assert_eq!(consts.get(PseudoId(1)), None, "ambiguous at 32 bits");
+        assert_eq!(consts.get_at(PseudoId(1), 32, true), Some(-1));
+        assert_eq!(consts.get_at(PseudoId(1), 32, false), Some(4294967295));
+        assert_eq!(
+            consts.get_at(PseudoId(1), 64, true),
+            None,
+            "the chain narrowed to 32; 64 was never carried"
         );
     }
 }

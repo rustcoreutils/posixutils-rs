@@ -2901,6 +2901,7 @@ shiftdi-2@-O2
 shiftdi@-O0
 shiftdi@-O2
 shiftopt-1@-O0
+shiftopt-1@-O2
 signed1bitfield-1@-O0
 signed1bitfield-1@-O2
 split-path-1@-O0

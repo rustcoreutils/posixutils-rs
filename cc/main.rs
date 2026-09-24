@@ -73,7 +73,18 @@ impl RuntimeLib {
 // CLI
 
 #[derive(Parser)]
-#[command(version, about = gettext("c17 - compile standard C programs"))]
+// `args_override_self`: a flag given twice is the last one winning, not an
+// error. cc is driven by build systems that concatenate flag lists, so a
+// command line carrying `-w` or `-g` twice is ordinary -- gcc and clang both
+// take it -- and refusing it fails the build for a reason the user cannot see
+// in their own makefile. Setting it on the command covers every argument at
+// once, rather than repeating `overrides_with` on each of the thirty-odd
+// flags and being wrong about the thirty-first.
+#[command(
+    version,
+    args_override_self = true,
+    about = gettext("c17 - compile standard C programs")
+)]
 struct Args {
     #[arg(required_unless_present = "print_targets", help = gettext("Input files"))]
     files: Vec<String>,
@@ -1721,6 +1732,18 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // anticipation.
             if !is_known_ignorable_f_flag(arg) {
                 eprintln!("c17: {}: {}", gettext("unrecognized option, ignored"), arg);
+            }
+            i += 1;
+        } else if arg == "--param" || arg.starts_with("--param=") {
+            // `--param name=value` tunes a gcc heuristic -- inlining limits,
+            // GC thresholds, unrolling budgets. Every one of them names an
+            // internal gcc parameter, so there is nothing for c17 to honour
+            // and nothing it could get wrong by ignoring. It still has to be
+            // *consumed*: the separated spelling puts the setting in the next
+            // argument, and leaving that behind made clap read `ggc-min-expand=1`
+            // as a source file.
+            if arg == "--param" {
+                i += 1; // the setting travels separately
             }
             i += 1;
         } else if arg == "-nostdinc" || arg == "-nobuiltininc" {

@@ -9,6 +9,8 @@
 // Optimization pass runner and the utilities its passes share.
 //
 
+use gettextrs::gettext;
+
 use crate::ir::constglobal;
 use crate::ir::dce;
 use crate::ir::dse;
@@ -49,10 +51,9 @@ pub struct Optimization {
 impl Optimization {
     /// Parse the argument of `-O`, as clap's `value_parser`.
     ///
-    /// Deliberately narrower than [`is_valid_opt_level`], which recognises
-    /// every spelling GCC and Clang accept so that `-Ofast` is still routed
-    /// here and can be turned down by name, rather than being mistaken for a
-    /// source file operand.
+    /// Every spelling GCC and Clang accept is recognised, so that `-Ofast`
+    /// reaches this function rather than being mistaken for a source file
+    /// operand. See [`is_valid_opt_level`].
     pub fn from_flag(spelling: &str) -> Result<Self, String> {
         let (level, for_size) = match spelling {
             "0" => (0, false),
@@ -67,14 +68,35 @@ impl Optimization {
             // size-vs-speed choice yet, so the flag records the intent and
             // sets `__OPTIMIZE_SIZE__` for the headers that read it.
             "s" => (2, true),
+            // `-Ofast` is `-O3` plus permission to relax IEEE arithmetic, and
+            // `-Oz` is `-Os` pushed further. c17 has neither extra, so it
+            // takes the level it does have and says what it did not do.
+            //
+            // Refusing them outright was the older answer and was the wrong
+            // one twice over. It failed builds for a flag whose only effect
+            // here would have been *more* speed, never a different answer --
+            // stricter floating-point semantics cannot make a correct program
+            // wrong. And it disagreed with c17's own treatment of
+            // `-ffast-math`, which is accepted and ignored with a note, so
+            // `-O3 -ffast-math` built and the single flag that means the same
+            // thing did not.
             "fast" => {
-                return Err(
-                    "-Ofast is not supported: it relaxes IEEE arithmetic, and c17 has no \
-                     fast-math mode to relax it into. Use -O3."
-                        .to_string(),
-                )
+                eprintln!(
+                    "c17: {}",
+                    gettext(
+                        "-Ofast: compiling at -O3; IEEE arithmetic is not relaxed, \
+                         c17 has no fast-math mode"
+                    )
+                );
+                (3, false)
             }
-            "z" => return Err("-Oz is not supported. Use -Os.".to_string()),
+            "z" => {
+                eprintln!(
+                    "c17: {}",
+                    gettext("-Oz: compiling at -Os; c17 has no smaller tier")
+                );
+                (2, true)
+            }
             other => return Err(format!("invalid optimization level '{other}'")),
         };
         Ok(Self {
@@ -364,15 +386,17 @@ mod tests {
             );
         }
 
-        // Not supported, and turned down by name rather than by clap's
-        // "invalid digit found in string".
-        for (flag, expect) in [("fast", "-Ofast"), ("z", "-Oz")] {
-            let err = Optimization::from_flag(flag).expect_err("-O{flag} must be refused");
-            assert!(
-                err.contains(expect),
-                "{flag}: message should name the flag, got {err}"
-            );
-        }
+        // `-Ofast` and `-Oz` name an extra c17 does not have, not a level it
+        // cannot reach. Each takes the nearest level it does have and says so
+        // on stderr; refusing them failed builds over a flag that could only
+        // ever have bought speed.
+        let fast = Optimization::from_flag("fast").expect("-Ofast must be accepted");
+        assert_eq!(fast, Optimization::from_flag("3").unwrap());
+        let oz = Optimization::from_flag("z").expect("-Oz must be accepted");
+        assert_eq!(oz, Optimization::from_flag("s").unwrap());
+
+        // A level that names nothing is still refused, by name rather than by
+        // clap's "invalid digit found in string".
         assert!(Optimization::from_flag("9").is_err());
         assert!(Optimization::from_flag("").is_err());
 

@@ -89,7 +89,6 @@ does or claims.
 | `mode` on a vector type | `vector_size` gives a type a vector's storage and `mode` binds to a declarator, including a struct member's and a parameter's. The vector modes themselves still warn that they are ignored |
 | `return` with the wrong value-ness | `return expr;` in a `void` function, and a bare `return;` in a non-`void` one, are errors here and warnings in gcc. Both are genuine C17 6.8.6.4p1 constraint violations |
 | `_FORTIFY_SOURCE` | Compiles the wrappers and emits `__*_chk` calls, but still checks nothing. What remains -- folding `__builtin_object_size` after inlining -- is described above, and is an ordinary compiler feature rather than fortify-specific work |
-| `-Ofast`, `-Oz` | Refused by name with a reason, where gcc and clang accept them. `-Ofast` relaxes IEEE arithmetic and c17 has no fast-math mode to relax into; `-Oz` has no smaller-than-`-Os` tier to select. `-Os` and `-Og` are supported |
 | Identifier characters U+FD3E, U+FD3F | Rejected here; GCC's binary accepts them. Ornate parentheses, which ISO C Annex D excludes between its F900-FD3D and FD40-FDCF ranges -- GCC's own `ucnid.tab` does not list them and Clang's table does not either, so the table is followed rather than the binary. See #C158 |
 | Non-NFC identifiers | GCC warns `-Wnormalized=` when an identifier is not in Normalization Form C; c17 is silent. A diagnostic-quality gap, not a conformance one -- both compile the same program |
 | `#__VA_ARGS__` spacing | `V(a , b)` stringifies as `"a, b"`; gcc gives `"a , b"`. The separating comma's own spacing is discarded by the argument splitter. Pinned by `preprocessor_va_args_loses_space_before_a_separator` |
@@ -239,12 +238,21 @@ measures a decision rather than a defect. These are skipped on top of what the
 older `UNSUPPORTED_RE` already caught (`vector_size`, `__label__`,
 `__builtin_apply`, `__builtin_setjmp`, `alias`).
 
+Each entry is `<sub-suite>/<name>`, because a test name is not unique across
+them: `20021204-1`, `20031011-1` and `20050119-1` name a nested-function test
+in `compile/` **and** a different test in `execute/` that passes. A bare-name
+list silenced all six.
+
 | Category | Tests |
 |---|---|
-| Nested functions | `20010209-1`, `20010605-1`, `20030501-1`, `20040520-1`, `20090219-1`, `nest-align-1`, `nestfunc-7`, `nest-stdar-1`, `pr103405`, `pr22061-3`, `pr22061-4`. Needs a static chain and executable trampolines |
-| VLA as a struct member | `20020412-1`, `20040308-1`, `20040423-1`, `20041218-2`, `20070919-1`, `align-nest`, `pr41935`, `pr82210`. Needs struct layout computed at run time, and `offsetof` through it |
-| Post-C17 | `pr80692` (`_Decimal64`, TR 24732), `pr123978`, `pr124358`, `pr125291` (C23 `[[...]]` attributes) |
+| Nested functions | `execute/`: `20010209-1`, `20010605-1`, `20030501-1`, `20040520-1`, `20090219-1`, `nest-align-1`, `nestfunc-7`, `nest-stdar-1`, `pr103405`, `pr22061-3`, `pr22061-4`. `compile/`: `20010903-2`, `20011023-1`, `20020309-1`, `20021204-1`, `20030418-1`, `20030716-1`, `20031011-1`, `20040310-1`, `20040317-3`, `20050119-1`, `951116-1`, `nested-2`, `nested-3`, `pr35006`, `pr99324`. Needs a static chain and executable trampolines |
+| VLA as a struct member | `execute/`: `20020412-1`, `20040308-1`, `20040423-1`, `20041218-2`, `20070919-1`, `align-nest`, `pr41935`, `pr82210`. `compile/`: `20020210-1`, `20030224-1`, `20050801-2`, `920428-4`, `920501-16`, `pr42956`, `pr77754-6`, `pr82564`. Needs struct layout computed at run time, and `offsetof` through it |
+| Post-C17 | `pr80692` (`_Decimal64`, TR 24732), `pr123978`, `pr124358`, `pr125291` (C23 `[[...]]` attributes), and `compile/pr111059-7`..`-12` and `compile/pr111911-2` (C23 `enum E : bool`) |
 | GNU-only attribute | `20230630-2`, `20230630-4` (`scalar_storage_order`; needs reverse-endian load/store lowering) |
+| gcc's own front ends | `compile/pr115143-2`, `compile/pr115143-3` (`-fgimple`, which parses gcc's internal representation rather than C; gcc rejects them without the flag too) |
+| `-fgnu89-inline` semantics | `compile/20021120-1`, `compile/20021120-2`. c17 honours the flag; these also want a redefinition *rejected* without it, which c17 does not diagnose |
+| Another target's backend | `compile/mipscop-1`..`-4` |
+| Pre-C99 implicit `int` with no dialect request | `compile/pr29201`. C17 6.7.2p2 requires a type specifier and gcc made it an error too; a test that asks, with `-std=gnu89` or `-fpermissive`, is honoured and passes |
 | gcc-specific *behaviour* | `20021127-1` (gcc folds `llabs()` and never calls the program's own definition of it), `20031003-1` (gcc's folder saturates undefined behaviour; aarch64 agrees by hardware accident), `pr46309` (a conditional with one `void` arm, which C17 6.5.15p3 forbids) |
 
 These are listed **by name** in the harness, never matched against the source.

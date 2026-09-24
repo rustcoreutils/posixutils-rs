@@ -460,13 +460,17 @@ fn driver_accepts_the_optimization_levels_it_claims() {
         assert!(r.success, "{flag} should be accepted:\n{}", r.stderr);
     }
 
-    // Turned down by name, so the message says which flag and why.
-    for (flag, needle) in [("-Ofast", "-Ofast"), ("-Oz", "-Oz")] {
+    // `-Ofast` and `-Oz` name an extra c17 does not have, not a level it
+    // cannot reach, so each compiles at the nearest level it does have and
+    // says on stderr what it did not do. Refusing them failed builds over a
+    // flag that could only ever have bought speed -- and disagreed with c17's
+    // own handling of `-ffast-math`, which is accepted and ignored.
+    for (flag, needle) in [("-Ofast", "-O3"), ("-Oz", "-Os")] {
         let r = run_c17(&[flag, "-c", &s(&src), "-o", &s(&w.join("t.o"))]);
-        assert!(!r.success, "{flag} should be refused");
+        assert!(r.success, "{flag} should be accepted:\n{}", r.stderr);
         assert!(
-            r.stderr.contains(needle),
-            "{flag}: the message should name the flag, got:\n{}",
+            r.stderr.contains(flag) && r.stderr.contains(needle),
+            "{flag}: the note should name the flag and the level used, got:\n{}",
             r.stderr
         );
     }
@@ -2095,4 +2099,76 @@ fn driver_fgnu89_inline_flips_which_inline_emits_a_body() {
 fn defines_label(asm: &str, name: &str) -> bool {
     let label = format!("{}{name}:", crate::common::asm_prefix(asm, "main"));
     asm.lines().any(|line| line.trim_start() == label)
+}
+
+// ============================================================================
+// A flag given twice is the last one winning, not an error
+// ============================================================================
+
+/// Build systems concatenate flag lists, so a command line carrying `-w` or
+/// `-g` twice is ordinary. gcc and clang both accept it; c17 answered
+/// `error: the argument '-w' cannot be used multiple times` and failed the
+/// build for a reason nothing in the user's own makefile shows.
+///
+/// The repeats below are deliberately mixed -- a bare switch, an
+/// interleaving, a `-std=` that the driver rewrites before clap sees it --
+/// because `args_override_self` is a property of the whole command rather
+/// than of any one argument.
+#[test]
+fn driver_repeated_flags_are_accepted() {
+    let work = WorkDir::new("repeated_flags");
+    let src = work.write("a.c", "int main(void){return 0;}\n");
+    let out = work.join("a.out");
+
+    for flags in [
+        vec!["-w", "-w"],
+        vec!["-g", "-g"],
+        vec!["-w", "-g", "-w"],
+        vec!["-std=c17", "-std=c17"],
+        vec!["-fpermissive", "-fpermissive"],
+    ] {
+        let mut args: Vec<&str> = flags.clone();
+        let src_s = s(&src);
+        let out_s = s(&out);
+        args.extend(["-o", &out_s, &src_s]);
+        let run = run_c17(&args);
+        assert!(
+            run.success,
+            "c17 rejected repeated flags {flags:?}:\n{}",
+            run.stderr
+        );
+    }
+}
+
+/// The last occurrence is the one that takes effect, as it does for gcc.
+/// `-O0` after `-O2` must really turn the optimizer off, rather than leaving
+/// the first setting in place.
+#[test]
+fn driver_repeated_flag_last_one_wins() {
+    let work = WorkDir::new("last_wins");
+    // A constant branch survives at -O0 and is folded from -O1 up, so the
+    // assembly says which level actually ran.
+    let src = work.write(
+        "a.c",
+        "extern int missing(void);\nint f(void){ if (0) return missing(); return 1; }\n",
+    );
+    let asm = work.join("a.s");
+
+    let asm_s = s(&asm);
+    let src_s = s(&src);
+    let run = run_c17(&["-O2", "-O0", "-S", "-o", &asm_s, &src_s]);
+    assert!(run.success, "compile failed:\n{}", run.stderr);
+    let text = std::fs::read_to_string(&asm).expect("no assembly");
+    assert!(
+        text.contains("missing"),
+        "-O0 after -O2 did not disable the optimizer:\n{text}"
+    );
+
+    let run = run_c17(&["-O0", "-O2", "-S", "-o", &asm_s, &src_s]);
+    assert!(run.success, "compile failed:\n{}", run.stderr);
+    let text = std::fs::read_to_string(&asm).expect("no assembly");
+    assert!(
+        !text.contains("missing"),
+        "-O2 after -O0 did not enable the optimizer:\n{text}"
+    );
 }

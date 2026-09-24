@@ -245,7 +245,7 @@ work, and were never a claim about the language.
 
 | Suite | Note |
 |---|---|
-| GCC torture tests | **Running.** `cc/scripts/c17_torture.sh`, baselined. The whole `execute/` directory, in C17 mode -- `dg_scan` strips `-std=` rather than selecting a dialect |
+| GCC torture tests | **Running.** `cc/scripts/c17_torture.sh`, baselined. Every sub-suite -- `execute/`, `execute/ieee/`, `execute/builtins/` and `compile/` -- in C17 mode; `dg_scan` strips `-std=` rather than selecting a dialect |
 | clang test suite | Not run against c17 |
 
 These are not only test-coverage work. A differential probe against
@@ -272,7 +272,7 @@ Most of what is left is one thing.
 
 | Group | Note |
 |---|---|
-| Dead-call elimination proofs | `20041114-1`, `pure-1`, at `-O1` and above. Each calls an undefined `link_error` that the optimizer is expected to delete, so they fail to *link*; all pass at `-O0`, where the test's own `#ifndef __OPTIMIZE__` supplies a definition. Standard C, and optimizer strength rather than a defect. Both are large: value-range propagation across an edge (`20041114-1`), or escape analysis with store-to-load forwarding (`pure-1`) -- the first pass that would move memory, which makes `Instruction::is_memory_barrier()` load-bearing for the first time |
+| Builtin folding | The whole of `execute/builtins/`. Each test defines its own `strlen`, `memcpy` or `printf` that calls `abort()` when `__OPTIMIZE__` is set, so a run-time failure there means c17 emitted a real call where gcc folded the builtin or expanded it inline. Nothing fails to *compile*, so no build is blocked; it is gcc-parity and code quality. Deferred by decision |
 | The two divergences above | `991014-1`, `920728-1` |
 
 One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.

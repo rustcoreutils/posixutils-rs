@@ -1261,6 +1261,14 @@ pub struct InitDeclarator {
     pub explicit_align: Option<u32>,
     /// `weak`, `used`, `section(...)`, `visibility(...)`.
     pub symbol_attrs: SymbolAttrs,
+    /// For a function declarator, the effect its attributes promise.
+    ///
+    /// Carried on the declarator rather than read from the definition,
+    /// because for most of the functions a translation unit calls the
+    /// prototype is all there is: `extern size_t strlen(const char *)
+    /// __attribute__((__pure__));` is the only thing that says `strlen`
+    /// writes nothing.
+    pub fn_effect: MemEffect,
     /// Source position of the declarator itself.
     ///
     /// Recorded independently of `init` so that a declaration with no
@@ -1277,6 +1285,7 @@ impl Declaration {
         Declaration {
             declarators: vec![InitDeclarator {
                 symbol_attrs: Default::default(),
+                fn_effect: Default::default(),
                 pos: Position::default(),
                 symbol,
                 typ,
@@ -1322,6 +1331,45 @@ pub struct Parameter {
     pub discarded_dims: Vec<Expr>,
 }
 
+/// What a function may do to memory the caller can observe.
+///
+/// A three-point lattice ordered `Const < Pure < Unknown`, joined by taking
+/// the larger -- so a function is only as clean as the dirtiest thing it
+/// does. The two clean points are gcc's:
+///
+/// - `__attribute__((const))` reads nothing outside its arguments and writes
+///   nothing at all, so two calls with the same arguments are one call.
+/// - `__attribute__((pure))` may *read* memory the program can change, so
+///   two calls are one only if nothing wrote in between. It still writes
+///   nothing.
+///
+/// Both clean points therefore answer the only question a memory pass asks
+/// here -- *could this call have written that location?* -- the same way.
+/// The difference between them matters to a pass that wants to delete or
+/// merge calls, which is deliberately not what this is used for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum MemEffect {
+    /// Neither reads nor writes observable memory.
+    Const,
+    /// May read observable memory; writes none.
+    Pure,
+    /// Anything at all.
+    #[default]
+    Unknown,
+}
+
+impl MemEffect {
+    /// The effect of doing both, which is the dirtier of the two.
+    pub fn join(self, other: MemEffect) -> MemEffect {
+        self.max(other)
+    }
+
+    /// Can a call with this effect have written memory the caller can see?
+    pub fn may_write(self) -> bool {
+        self == MemEffect::Unknown
+    }
+}
+
 /// Attributes that change how a function is *emitted* rather than what it
 /// computes, and so have to survive from the parser into code generation.
 #[derive(Debug, Clone, Default)]
@@ -1356,6 +1404,13 @@ pub struct FunctionAttrs {
     /// function rather than into it. Recorded so `__has_attribute` can answer
     /// for it; c17 emits no such debug annotation.
     pub artificial: bool,
+    /// `__attribute__((pure))` or `((const))`, as the programmer's promise.
+    ///
+    /// A promise, not a derivation: it is seeded *fixed* into the inference
+    /// in `ir/effects.rs` and never lowered, because a declaration is often
+    /// the only thing this translation unit can see about a function, and an
+    /// attribute that in-TU analysis could overrule would buy nothing.
+    pub effect: MemEffect,
 }
 
 impl FunctionAttrs {
@@ -1378,6 +1433,9 @@ impl FunctionAttrs {
         self.always_inline |= other.always_inline;
         self.gnu_inline |= other.gnu_inline;
         self.artificial |= other.artificial;
+        // The cleanest claim wins: the attribute may be on the prototype,
+        // the definition, or both, and each spelling is a promise.
+        self.effect = self.effect.min(other.effect);
         if let Some(prio) = other.constructor {
             self.constructor = Some(prio);
         }

@@ -16,6 +16,7 @@ mod atomics_asm;
 mod cross_abi;
 mod debug_info;
 mod inline_asm;
+mod memopt;
 mod misc;
 mod pic;
 mod promotion;

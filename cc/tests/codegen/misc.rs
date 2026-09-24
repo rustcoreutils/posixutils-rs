@@ -13202,3 +13202,244 @@ int main(void)
         );
     }
 }
+
+/// Value-range propagation: on the edge where a condition is false, its
+/// operands are constrained, and that constraint carries through arithmetic
+/// and widening to decide a later comparison.
+///
+/// `var <= 0` being false means `var >= 1`, so `var - 1` is non-negative, so
+/// `(unsigned)(var - 1)` is not `UINT_MAX`, so the `||` is exhaustive. No
+/// other pass here can reach that: `sccp` has no notion of a fact attached
+/// to an edge, and `instcombine` can only relate two comparisons over the
+/// same operand pair.
+///
+/// The negative half is most of the test, and `f(0)` is the boundary that
+/// breaks a careless analysis: there `var - 1` is `-1`, `(unsigned)(var-1)`
+/// *is* `UINT_MAX`, and the second disjunct is genuinely false.
+#[test]
+fn codegen_vrp_folds_a_guard_proved_by_a_range() {
+    let code = r#"
+#include <limits.h>
+extern void link_error(void);
+extern void abort(void);
+
+volatile int opaque;
+
+__attribute__((noinline)) static void proved(int var)
+{
+    /* The c-torture shape: always true, so `link_error` must go. */
+    if (!(var <= 0 || ((long unsigned)(unsigned)(var - 1) < UINT_MAX)))
+        link_error();
+
+    /* A mask bounds a value however unknown it was. */
+    if ((var & 0xff) > 255) link_error();
+    if ((unsigned)(var & 7) >= 8u) link_error();
+
+    /* Both halves of an exhaustive pair. */
+    if (!(var < 5 || var >= 5)) link_error();
+}
+
+/* A compound condition makes a nested diamond, and the inner block has two
+   predecessors, so the edge fact does not govern it. Checked by value: this
+   records a limit of the analysis rather than asserting a fold. */
+__attribute__((noinline)) static int bounded(int var)
+{
+    if (var > 0 && var < 100)
+        return (unsigned)(var - 1) <= 98u;
+    return 1;
+}
+
+/* Each of these is genuinely undecidable, and must survive. */
+__attribute__((noinline)) static int boundary(int var)
+{
+    return (long unsigned)(unsigned)(var - 1) < UINT_MAX;
+}
+__attribute__((noinline)) static int unknown_divisor(int a, int b) { return a / b; }
+__attribute__((noinline)) static int shifted(int x, int n) { return (x >> n) == 0; }
+
+int main(void)
+{
+    proved(opaque);
+    proved(0);
+    proved(1);
+    proved(-1);
+    proved(INT_MAX);
+    proved(INT_MIN);
+
+    /* `var == 0` is exactly where the second disjunct is false. */
+    if (boundary(0) != 0) abort();
+    if (boundary(1) != 1) abort();
+    if (boundary(INT_MAX) != 1) abort();
+    if (boundary(INT_MIN) != 1) abort();
+
+    if (!bounded(1) || !bounded(99) || !bounded(50)) abort();
+    if (!bounded(0) || !bounded(-1) || !bounded(100)) abort();
+
+    if (unknown_divisor(6, 3) != 2) abort();
+    if (shifted(0, 3) != 1) abort();
+    if (shifted(16, 3) != 0) abort();
+
+    /* Unsigned wrap is not undefined, and must not be range-reasoned away. */
+    { unsigned u = 0; if (u - 1u != UINT_MAX) abort(); }
+    { unsigned char c = 0; if ((unsigned char)(c - 1) != 255) abort(); }
+
+    /* Narrow types through the promotions. */
+    { signed char s = -1; if ((int)s != -1) abort(); }
+    { short h = -1; if ((unsigned)(unsigned short)h != 65535u) abort(); }
+
+    return 0;
+}
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_vrp_range_guard", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// The ranges must not change what a program computes, only what the
+/// optimizer can prove. Every arm here is checked by value at every level,
+/// including the shapes where a range analysis is most tempted to overreach:
+/// a loop counter, a volatile read, an opaque call, a computed goto and an
+/// inline-asm output.
+#[test]
+fn codegen_vrp_agrees_with_the_unoptimized_answer() {
+    let code = r#"
+#include <limits.h>
+extern void abort(void);
+
+volatile int v;
+
+__attribute__((noinline)) static int opaque(int x) { return x; }
+
+int main(void)
+{
+    /* A loop counter: widening must not conclude a bound it cannot prove. */
+    { int n = 0; for (int i = 0; i < 10; i++) n += i; if (n != 45) abort(); }
+    { int i = 0; while (v == 0 && i < 3) i++; if (i > 3) abort(); }
+
+    /* A nested loop with a guard inside. */
+    {
+        int c = 0;
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                if (i + j >= 3) c++;
+        if (c != 10) abort();
+    }
+
+    /* Signed overflow boundaries, computed rather than assumed. */
+    if (opaque(INT_MAX) + 0 != INT_MAX) abort();
+    if (opaque(INT_MIN) + 0 != INT_MIN) abort();
+    /* `INT_MIN / -1` is left out deliberately: it overflows, and on x86-64
+       it raises SIGFPE in hardware rather than producing a value. A test
+       that ran it would be asserting something C does not define. */
+    { int x = opaque(INT_MIN); if (x / 2 != INT_MIN / 2) abort(); }
+
+    /* A volatile read is a different value each time. */
+    v = 1;
+    { int a = v; v = 2; int b = v; if (a == b) abort(); }
+
+    /* A computed goto: the CFG has an edge the terminator does not name. */
+    {
+        static void *targets[] = {&&one, &&two};
+        int k = (int)(v & 1);
+        goto *targets[k];
+    one:
+        if (v != 2) abort();
+        goto done;
+    two:
+        abort();
+    done:;
+    }
+
+    /* An inline-asm output must not be folded past. */
+    {
+        int out = 7;
+        __asm__ volatile("" : "+r"(out));
+        if (out != 7) abort();
+    }
+
+    /* A switch on a value the optimizer cannot know. */
+    switch (v) {
+    case 2: break;
+    default: abort();
+    }
+
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2", "-Os"] {
+        assert_eq!(
+            compile_and_run("c17_vrp_conservative", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// A loop-carried counter compared against a bound the function cannot see.
+///
+/// The first time VRP reaches the inner comparison the counter is still
+/// `{0}`, so `count + 1` is `{1}` and the true edge appears to prove
+/// `maxcount == 1`. That fact is read off the *ranges* of the comparison's
+/// operands, which keep widening as the loop is analyzed -- while the
+/// comparison's own answer settles at "either" immediately and never moves
+/// again. Re-deriving the fact only when the comparison moved therefore
+/// froze the narrowest one, and `return maxcount` came back `1`.
+///
+/// This is CPython's `stringlib` `count_char`, which is why
+/// `"AAA".replace("A", "", 3)` answered `"AA"`.
+#[test]
+fn codegen_vrp_does_not_freeze_an_edge_fact_from_a_loop_counter() {
+    let code = r#"
+extern void abort(void);
+
+static long count_char(const unsigned char *s, long n, unsigned char p0, long maxcount)
+{
+    long i, count = 0;
+    for (i = 0; i < n; i++) {
+        if (s[i] == p0) {
+            count++;
+            if (count == maxcount) {
+                return maxcount;
+            }
+        }
+    }
+    return count;
+}
+
+static long dispatch(const unsigned char *s, long n, const unsigned char *p, long m, long maxcount)
+{
+    if (n < m || maxcount == 0) return 0;
+    if (m == 1) return count_char(s, n, p[0], maxcount);
+    return -2;
+}
+
+int main(void) {
+    const unsigned char s[] = "AAA";
+    const unsigned char p[] = "A";
+
+    /* Every cap from below the count to above it. */
+    if (dispatch(s, 3, p, 1, 1) != 1) abort();
+    if (dispatch(s, 3, p, 1, 2) != 2) abort();
+    if (dispatch(s, 3, p, 1, 3) != 3) abort();
+    if (dispatch(s, 3, p, 1, 4) != 3) abort();
+    if (dispatch(s, 3, p, 1, 0) != 0) abort();
+
+    /* The same loop with no match at all. */
+    const unsigned char t[] = "BBB";
+    if (dispatch(t, 3, p, 1, 3) != 0) abort();
+
+    return 0;
+}
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_vrp_loop_counter_fact", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}

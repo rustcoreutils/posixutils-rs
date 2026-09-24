@@ -729,6 +729,7 @@ impl Parser<'_> {
                     let storage_class = base_type.modifiers & storage_class_mask;
                     declarators.push(InitDeclarator {
                         symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
+                        fn_effect: self.take_pending_fn_effect(),
                         symbol,
                         typ,
                         storage_class,

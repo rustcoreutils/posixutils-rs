@@ -141,23 +141,6 @@ struct VarInfo {
     addr_taken: bool,
 }
 
-/// Does `insn` mention `id` in any operand position at all?
-///
-/// Every place a `PseudoId` can be written down, so that a symbol reaching an
-/// opcode this pass does not model reads as an escape rather than as nothing.
-fn references_pseudo(insn: &Instruction, id: PseudoId) -> bool {
-    insn.src.contains(&id)
-        || insn.target == Some(id)
-        || insn.indirect_target == Some(id)
-        || insn.phi_list.iter().any(|&(_, p)| p == id)
-        || insn.asm_data.as_ref().is_some_and(|d| {
-            d.inputs
-                .iter()
-                .chain(d.outputs.iter())
-                .any(|c| c.pseudo == id)
-        })
-}
-
 /// Analyze a variable to determine if it can be promoted to SSA.
 fn analyze_variable(func: &Function, types: &TypeTable, var_name: &str) -> Option<VarInfo> {
     let local = func.get_local(var_name)?;
@@ -193,7 +176,7 @@ fn analyze_variable(func: &Function, types: &TypeTable, var_name: &str) -> Optio
                 // `Call` returning a complex value into `__cret_N`, an asm
                 // operand -- was neither counted as a use nor treated as an
                 // escape, so its store could be deleted out from under it.
-                if references_pseudo(insn, sym_id) {
+                if insn.mentions(sym_id) {
                     info.addr_taken = true;
                 }
                 continue;

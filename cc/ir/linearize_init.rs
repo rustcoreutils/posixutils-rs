@@ -92,6 +92,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                 if !self.module.functions.iter().any(|f| f.name == name) {
                     self.module
                         .set_declared_symbol_attrs(&name, declarator.symbol_attrs.clone());
+                    if declarator.fn_effect != crate::parse::ast::MemEffect::Unknown {
+                        self.module
+                            .declared_fn_effects
+                            .insert(name.clone(), declarator.fn_effect);
+                    }
                     self.module.extern_symbols.insert(name);
                 }
                 continue;

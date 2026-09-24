@@ -225,6 +225,23 @@ impl AttributeList {
         self.has_attr("noinline")
     }
 
+    /// The memory effect `__attribute__((pure))` or `((const))` promises.
+    ///
+    /// `const` is a keyword, so only the `__const__` spelling can appear
+    /// bare; gcc accepts `__attribute__((const))` because an attribute name
+    /// is matched as a token rather than as an identifier, and `has_attr`
+    /// compares the text either way.
+    pub fn mem_effect(&self) -> crate::parse::ast::MemEffect {
+        use crate::parse::ast::MemEffect;
+        if self.has_attr("const") {
+            MemEffect::Const
+        } else if self.has_attr("pure") {
+            MemEffect::Pure
+        } else {
+            MemEffect::Unknown
+        }
+    }
+
     /// Whether `__attribute__((always_inline))` is present.
     pub fn has_always_inline(&self) -> bool {
         self.has_attr("always_inline")
@@ -278,6 +295,7 @@ impl AttributeList {
             destructor: self.destructor_priority(),
             gnu_inline: self.has_attr("gnu_inline"),
             artificial: self.has_attr("artificial"),
+            effect: self.mem_effect(),
         }
     }
 
@@ -1385,6 +1403,22 @@ impl<'a> Parser<'a> {
         }
 
         Ok(labels)
+    }
+
+    /// The memory effect pending for the declarator being built, consumed.
+    ///
+    /// Consumed, exactly as `pending_symbol_attrs` is taken, and for the same
+    /// reason: `extern int p(void) __attribute__((pure)), q(void);` writes
+    /// the attribute on `p`, and leaving it pending gave it to `q` as well.
+    /// A callee wrongly believed to write nothing is a miscompile at the
+    /// *call site*, so this fails safe -- a later declarator gets `Unknown`
+    /// even where gcc would spread a declaration-level attribute across all
+    /// of them, which costs precision and nothing else.
+    pub(super) fn take_pending_fn_effect(&mut self) -> crate::parse::ast::MemEffect {
+        std::mem::replace(
+            &mut self.pending_fn_attrs.effect,
+            crate::parse::ast::MemEffect::Unknown,
+        )
     }
 
     /// Accumulate the symbol-emission attributes from one attribute list.

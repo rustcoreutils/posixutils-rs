@@ -11,11 +11,15 @@
 
 use crate::ir::constglobal;
 use crate::ir::dce;
+use crate::ir::dse;
 use crate::ir::ifconv;
 use crate::ir::inline;
 use crate::ir::instcombine;
+use crate::ir::loadfwd;
+use crate::ir::memloc;
 use crate::ir::sccp;
 use crate::ir::validate;
+use crate::ir::vrp;
 use crate::ir::{Function, Module};
 use crate::types::TypeTable;
 
@@ -244,12 +248,16 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
     // below then treat as the constant it is.
     constglobal::run(module, types);
 
-    // Phase 3: Per-function optimization
+    // Phase 3: module-wide facts the memory passes need. Built after
+    // inlining, so the call graph and the set of globals are final.
+    let mi = memloc::ModuleInfo::build(module, types);
+
+    // Phase 4: Per-function optimization
     for func in &mut module.functions {
-        optimize_function(func, types);
+        optimize_function(func, types, &mi);
     }
 
-    // Phase 4 (debug builds only): structural IR validation.
+    // Phase 5 (debug builds only): structural IR validation.
     // Runs at the end of optimization, BEFORE `ir::lower::lower_module`
     // which intentionally introduces multi-def Copies as part of φ-
     // elimination. Any invariant we want to enforce on optimizer-stage
@@ -270,12 +278,20 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
 }
 
 /// Optimize a single function by running passes until fixed point.
-fn optimize_function(func: &mut Function, types: &TypeTable) {
+fn optimize_function(func: &mut Function, types: &TypeTable, mi: &memloc::ModuleInfo) {
     for _ in 0..MAX_ITERATIONS {
         // The order is load-bearing, and each pass hands the next one a
         // shape it could not have seen for itself.
         //
-        // `ifconv` first: it collapses a short-circuit diamond into a
+        // `vrp` first, because it is the only pass that reads a *branch*:
+        // `var <= 0` being false says `var >= 1` on that edge, and `ifconv`
+        // collapses exactly that diamond into a `Select`, speculating the
+        // arm into a predecessor where `var` is unconstrained. Once that has
+        // happened the comparison is genuinely undecidable -- `var == 0`
+        // makes `(unsigned)(var - 1)` equal `UINT_MAX` -- so nothing
+        // downstream recovers it.
+        //
+        // `ifconv` next: it collapses a short-circuit diamond into a
         // `Select` in one block, which is what makes the two relationals
         // inside it comparable at all.
         //
@@ -290,12 +306,31 @@ fn optimize_function(func: &mut Function, types: &TypeTable) {
         //
         // `dce` last: SCCP removes a dead edge but deletes no block, and
         // leaves the `PhiSource` of a folded phi for `dce` to collect.
+        // `loadfwd` first: turning a load into a copy of a stored value is
+        // what gives every pass below it something to fold, and a value that
+        // came out of memory is otherwise opaque to all of them. It does
+        // *gain* from a second iteration -- an index expression reaches it as
+        // `add %sym, (mul (sext 1) 4)` and only becomes a constant
+        // displacement once `instcombine` has folded the multiply -- which is
+        // why it sits inside the loop rather than ahead of it.
+        let lf_changed = loadfwd::run(func, types, mi);
+        let vrp_changed = vrp::run(func, types);
         let ifc_changed = ifconv::run(func);
         let sccp_changed = sccp::run(func, types);
         let ic_changed = instcombine::run(func, types);
+        // `dse` before `dce`, so the value chain feeding a killed store is
+        // swept in the same iteration rather than surviving to the next one.
+        let dse_changed = dse::run(func, types, mi);
         let dce_changed = dce::run(func);
 
-        if !ifc_changed && !sccp_changed && !ic_changed && !dce_changed {
+        if !lf_changed
+            && !vrp_changed
+            && !ifc_changed
+            && !sccp_changed
+            && !ic_changed
+            && !dse_changed
+            && !dce_changed
+        {
             break;
         }
     }

@@ -115,6 +115,23 @@ Complete on Linux, on both architectures. What is left:
 
 ---
 
+### An `__atomic_*` read-modify-write ignores its memory order
+
+`__atomic_fetch_add` and its eleven siblings lower through `emit_atomic_rmw`,
+which an `_Atomic` compound assignment also uses and which is sequentially
+consistent by C17 6.5.16.2p3. The `order` argument is evaluated and then
+dropped, so `__atomic_fetch_add(p, v, __ATOMIC_RELAXED)` gets a seq-cst
+operation -- correct, never wrong, and slower than asked for. The load, store,
+exchange and compare-exchange forms *do* carry their order into the
+instruction, so the family is inconsistent with itself.
+
+What it needs is for `emit_atomic_rmw` and its CAS loop to take an order
+rather than assuming one, and for the `_Atomic`-operator callers to keep
+passing seq-cst. The aarch64 LL/SC loop then has to pick its acquire/release
+variants from it.
+
+---
+
 ## Optimization Passes
 
 What exists today, and why the pass order is what it is, is in

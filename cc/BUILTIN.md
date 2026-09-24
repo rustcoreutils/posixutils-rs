@@ -371,8 +371,16 @@ with one more instruction inside it.
 
 The `__sync_*` family predates the C11 orders and is sequentially consistent;
 each also accepts the trailing list of variables gcc documents and ignores.
-The `order` argument of an `__atomic_*` builtin is evaluated and then answered
-with sequential consistency, which is stronger than any order it could name.
+
+An `__atomic_*` builtin's `order` argument is honoured by the load, store,
+exchange and compare-exchange forms, which carry it into the instruction. The
+**read-modify-write forms discard it** and are sequentially consistent
+whatever it says: they go through `emit_atomic_rmw`, which an `_Atomic`
+compound assignment also uses, and that is seq-cst by C17 6.5.16.2p3. A
+stronger order than the one asked for is always correct and never wrong, so
+this costs speed and not meaning -- but it does mean
+`__atomic_fetch_add(p, v, __ATOMIC_RELAXED)` is not relaxed while
+`__atomic_load_n(p, __ATOMIC_RELAXED)` is. Recorded in TODO.md.
 
 `*_and_fetch` re-applies the operation to the value the exchange returned. That
 is arithmetic on a value already in hand rather than a second access to the

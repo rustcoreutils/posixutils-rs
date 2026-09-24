@@ -2116,7 +2116,47 @@ fn pie_enabled(args: &Args, target: &Target) -> bool {
     target.os == Os::Linux
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// The stack the compiler runs on.
+///
+/// The front end descends recursively through the source: about fifteen Rust
+/// frames for every `(` of an expression, one per nested `struct`, and one per
+/// `case` label, since a labeled statement holds the statement it labels. C17
+/// 5.2.4.1 asks for 63 levels of parenthesised expression and 63 of nested
+/// structure, and real generated source goes far past that -- the torture
+/// suite alone has a `switch` with a thousand consecutive labels.
+///
+/// The default 8 MB is not enough for those, and running out of it is a Rust
+/// panic about a stack overflow rather than a diagnostic naming a translation
+/// limit. Running the compile on a thread of our own makes the size ours to
+/// choose rather than the shell's.
+const COMPILER_STACK_BYTES: usize = 256 * 1024 * 1024;
+
+fn main() -> ! {
+    // `RUST_MIN_STACK` is honoured, so a build that needs still more has a way
+    // to say so without a rebuild.
+    let stack = std::env::var("RUST_MIN_STACK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(COMPILER_STACK_BYTES);
+    // The error is reported on the compiler thread and turned into a status
+    // there: `Box<dyn Error>` is not `Send`, and there is nothing useful to
+    // carry back across the join anyway.
+    std::thread::Builder::new()
+        .stack_size(stack)
+        .spawn(|| match compile_main() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("c17: {e}");
+                1
+            }
+        })
+        .expect("failed to start the compiler thread")
+        .join()
+        .map(std::process::exit)
+        .unwrap_or_else(|_| std::process::exit(1))
+}
+
+fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("c17");
 
     let argv = preprocess_args();

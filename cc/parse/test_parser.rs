@@ -5517,8 +5517,10 @@ fn test_switch_with_non_compound_body_keeps_its_labelled_statement() {
     let Stmt::Block(items) = &func.body else {
         panic!("function body is not a block");
     };
-    // The switch and the trailing `return 0;` -- and nothing else. Before the
-    // fix there were three items, the middle one being the escaped `return 2;`.
+    // The switch and the trailing `return 0;` -- and nothing else. The
+    // labelled statement must not escape the switch, which is what this has
+    // always been about; it now stays because the label *holds* it rather
+    // than because a synthetic block was wrapped around the pair.
     assert_eq!(
         items.len(),
         2,
@@ -5531,16 +5533,9 @@ fn test_switch_with_non_compound_body_keeps_its_labelled_statement() {
     let Stmt::Switch { body, .. } = &**first else {
         panic!("first item is not a switch: {first:#?}");
     };
-    let Stmt::Block(inner) = &**body else {
-        panic!("switch body was not wrapped into a block: {body:#?}");
-    };
-    assert_eq!(inner.len(), 2, "expected the label and its statement");
-    let BlockItem::Statement(label) = &inner[0] else {
-        panic!("expected the case label")
-    };
-    assert!(matches!(**label, Stmt::Case(..)), "{label:#?}");
-    let BlockItem::Statement(labelled) = &inner[1] else {
-        panic!("expected the labelled statement")
+    // One statement, as C17 6.8.4 says: the label, carrying its own.
+    let Stmt::Case(_, _, labelled) = &**body else {
+        panic!("switch body is not the case label: {body:#?}");
     };
     assert!(matches!(**labelled, Stmt::Return(Some(_))), "{labelled:#?}");
 }
@@ -5564,7 +5559,9 @@ fn test_switch_bodies_that_need_no_wrapping_are_unchanged() {
     let Stmt::Block(inner) = &**body else {
         panic!("a braced body should stay a block")
     };
-    assert_eq!(inner.len(), 2);
+    // One item now -- the label and the statement it carries -- where the
+    // label used to be a marker with the statement beside it.
+    assert_eq!(inner.len(), 1, "{inner:#?}");
 
     // No label at all: the single statement is returned verbatim, not wrapped.
     let (func, _types, _strings, _symbols) =

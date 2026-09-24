@@ -978,3 +978,217 @@ int main(void) {
         "pointer arithmetic on a variably-modified pointee"
     );
 }
+
+// ============================================================================
+// A compound literal is a postfix expression (C99 6.5.2.5)
+// ============================================================================
+
+/// `sizeof (struct s){1, 2}` is `sizeof` of a *literal*, not of the type.
+///
+/// `parse_sizeof` and `parse_alignof` each consumed the `(`, committed to the
+/// type name, and never looked for the `{` -- so the braces were left for
+/// whatever was parsing the enclosing construct, and the error named that
+/// instead. Recognition now lives in one place that every production reaches.
+#[test]
+fn c99_compound_literal_is_a_postfix_expression() {
+    let code = r#"
+struct s { int a; int b; };
+char x[((sizeof (struct s){ 1, 2 }) == sizeof (struct s)) ? 1 : -1];
+char y[(_Alignof (struct s){ 1, 2 }) == _Alignof (struct s) ? 1 : -1];
+char z[sizeof (int[3]){ 1, 2, 3 } == 3 * sizeof (int) ? 1 : -1];
+
+int main(void) {
+    /* The postfix suffixes apply to the literal, as to any postfix
+       expression. */
+    if ((int[3]){ 7, 8, 9 }[1] != 8) return 1;
+    if (sizeof (int[3]){ 1, 2, 3 }[0] != sizeof(int)) return 2;
+    if ((struct s){ 4, 5 }.b != 5) return 3;
+    (void)x; (void)y; (void)z;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("compound_literal_postfix", code, &[]), 0);
+}
+
+/// An array may be initialized from a compound literal of its own type. The
+/// lowering already handled it; only the initializer check stood in the way,
+/// having been written when a string literal was the one non-braced
+/// initializer an array could take.
+#[test]
+fn c99_array_initialized_from_a_compound_literal() {
+    let code = r#"
+static const unsigned short array[] = (const unsigned short []){ 0x0D2B, 0x0D2C };
+
+int main(void) {
+    if (array[0] != 0x0D2B || array[1] != 0x0D2C) return 1;
+    if (sizeof array != 2 * sizeof(unsigned short)) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("array_from_compound_literal", code, &[]), 0);
+}
+
+// ============================================================================
+// A labeled statement is one statement (C17 6.8.1)
+// ============================================================================
+
+/// `case` and `default` carry the statement they label.
+///
+/// Held as flat sibling markers they worked inside a compound statement and
+/// nowhere else: in `switch (c) case 1: if (d) case 2: case 3: f();` the `if`
+/// took the bare `case 2:` as its whole then-branch, and `case 3: f();` fell
+/// out of the switch entirely -- reported as "case label not within a switch
+/// statement".
+#[test]
+fn c99_case_labels_inside_a_nested_statement() {
+    let code = r#"
+int duff(int c, int d) {
+    int t = 0;
+    switch (c)
+        case 1:
+            if (d)
+                case 2:
+                case 3:
+                    t = 10;
+    return t;
+}
+
+/* Duff's device: labels inside a loop inside the switch. */
+int copy(int *dst, const int *src, int n) {
+    int moved = 0;
+    int count = (n + 3) / 4;
+    switch (n % 4) {
+    case 0: do { *dst++ = *src++; moved++;
+    case 3:      *dst++ = *src++; moved++;
+    case 2:      *dst++ = *src++; moved++;
+    case 1:      *dst++ = *src++; moved++;
+            } while (--count > 0);
+    }
+    return moved;
+}
+
+int main(void) {
+    if (duff(1, 1) != 10) return 1;
+    if (duff(1, 0) != 0) return 2;
+    if (duff(2, 0) != 10) return 3;
+    if (duff(3, 0) != 10) return 4;
+    if (duff(9, 0) != 0) return 5;
+
+    {
+        int src[7] = { 1, 2, 3, 4, 5, 6, 7 }, dst[8] = { 0 };
+        if (copy(dst, src, 7) != 7) return 6;
+        if (dst[0] != 1 || dst[6] != 7) return 7;
+    }
+
+    /* Ordinary fall-through must be unchanged. */
+    {
+        int t = 0, c = 1;
+        switch (c) { case 1: t = 1; case 2: t += 2; break; default: t = 99; }
+        if (t != 3) return 8;
+    }
+    /* A declaration after a label still belongs to the enclosing block. */
+    {
+        int c = 1;
+        switch (c) { case 1: ; int v = 5; if (v != 5) return 9; v++; if (v != 6) return 10; }
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("nested_case_labels", code, &[]), 0);
+}
+
+/// A label at the end of a compound statement. C17 requires a statement after
+/// it; gcc and clang accept it without, and C23 made it legal, so c17 accepts
+/// it with a warning rather than failing on the `}`.
+#[test]
+fn c99_label_at_the_end_of_a_block() {
+    let code = r#"
+int g;
+int f(int n) { if (n) goto done; g = 1; done: }
+int h(int n) { switch (n) { case 1: g = 2; break; default: } return g; }
+
+int main(void) {
+    f(0);
+    if (g != 1) return 1;
+    f(1);
+    if (g != 1) return 2;
+    if (h(1) != 2) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("label_at_block_end", code, &[]), 0);
+}
+
+// ============================================================================
+// Address constants in a static initializer (C17 6.6p9)
+// ============================================================================
+
+/// A relocation with an addend is a constant expression even where the type
+/// system sees plain integer arithmetic.
+///
+/// The initializer folder asked which operand had a *pointer type* rather than
+/// which named a symbol, so `(unsigned long)&_text - 0x10000000L - 1` -- how a
+/// kernel or a linker script's C half is written -- was "not a constant
+/// expression". Two smaller holes went with it: identical string literals were
+/// two objects, so their difference was a difference between different
+/// symbols; and a `void *` difference was discarded for having no element
+/// size, although C counts it in bytes.
+#[test]
+fn c99_address_constants_in_static_initializers() {
+    let code = r#"
+int literal_diff = (&"Foobar"[1] - &"Foobar"[0]);
+struct s { char p[2]; };
+static struct s v;
+const int o0 = (int)((void *)&v.p[0] - (void *)&v) + 0U;
+const int o1 = (int)((void *)&v.p[1] - (void *)&v) + 1U;
+int x[60];
+char *y = ((char *)&(x[2 * 8 + 2]) - 8);
+static unsigned long addend = (unsigned long)&x - 0x1000L - 1;
+
+int main(void) {
+    if (literal_diff != 1) return 1;
+    if (o0 != 0) return 2;
+    if (o1 != 2) return 3;
+    if (y != (char *)&x[18] - 8) return 4;
+    if (addend != (unsigned long)&x - 0x1001L) return 5;
+    /* Two spellings of one literal are one object. */
+    if ("Foobar" != "Foobar") return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("static_address_constants", code, &[]), 0);
+}
+
+// ============================================================================
+// Translation limits
+// ============================================================================
+
+/// The front end descends recursively through the source, so a deeply nested
+/// expression or a long run of `case` labels costs stack. Running out of it
+/// was a Rust panic about a stack overflow rather than anything a user could
+/// act on; the compile now runs on a thread whose stack is ours to choose.
+///
+/// C17 5.2.4.1 asks for 63 levels of each. These go well past that, because
+/// generated source does.
+#[test]
+fn c99_deeply_nested_constructs_compile() {
+    let mut code = String::from("int deep(void) { return ");
+    let depth = 400;
+    for _ in 0..depth {
+        code.push('(');
+    }
+    code.push('1');
+    for _ in 0..depth {
+        code.push(')');
+    }
+    code.push_str("; }\n");
+
+    code.push_str("int labels(int c) { int t = 0; switch (c) {\n");
+    for i in 0..600 {
+        code.push_str(&format!("case {i}:\n"));
+    }
+    code.push_str("t = 1; break; default: t = 2; }\nreturn t; }\n");
+
+    code.push_str("int main(void) { return deep() == 1 && labels(3) == 1 ? 0 : 1; }\n");
+    assert_eq!(compile_and_run("deep_nesting", &code, &[]), 0);
+}

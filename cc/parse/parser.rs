@@ -1748,7 +1748,14 @@ impl Parser<'_> {
             let name = self.expect_identifier()?;
             if self.is_special(b':') {
                 self.advance();
-                let stmt = self.parse_statement()?;
+                // C17 6.8.1 requires a statement after the label, and a label
+                // at the end of a block therefore needs the empty one written
+                // out. gcc and clang both accept it without, C23 made it
+                // legal, and the idiom is common enough in code that jumps to
+                // a cleanup label at the end of a function -- `asm goto`'s own
+                // torture test is written that way. Accepted with a warning
+                // rather than invented silently.
+                let stmt = self.parse_labeled_statement()?;
                 return Ok(Stmt::Label {
                     name,
                     stmt: Box::new(stmt),
@@ -1926,31 +1933,12 @@ impl Parser<'_> {
     /// non-compound body gains the block that flattening assumes; a compound
     /// or unlabeled body is returned unchanged.
     fn parse_switch_body(&mut self) -> ParseResult<Stmt> {
-        if self.is_special(b'{') {
-            return self.parse_statement();
-        }
-
-        let mut items = Vec::new();
-        loop {
-            let stmt = self.parse_statement()?;
-            let is_label = matches!(stmt, Stmt::Case(..) | Stmt::Default(_));
-            items.push(BlockItem::Statement(Box::new(stmt)));
-            // A label prefixes a statement, so one more must follow it. Anything
-            // else ends the body. The `}`/EOF guard keeps a body that is nothing
-            // but a label -- which no conforming program contains -- from
-            // running past the end of its enclosing block.
-            if !is_label || self.is_special(b'}') || self.is_eof() {
-                break;
-            }
-        }
-
-        if items.len() == 1 {
-            let BlockItem::Statement(only) = items.remove(0) else {
-                unreachable!("parse_switch_body pushes only statements")
-            };
-            return Ok(*only);
-        }
-        Ok(Stmt::Block(items))
+        // One statement, as C17 6.8.4 says. This used to re-block a run of
+        // labels into a synthetic compound statement, because a label was a
+        // flat sibling marker and the statement it prefixed was not part of
+        // it. It only ever reached the labels at the top of the body, which
+        // is why a `case` nested inside an unbraced `if` escaped the switch.
+        self.parse_statement()
     }
 
     /// Parse a case label, including the GNU range form `case lo ... hi:`.
@@ -1968,14 +1956,32 @@ impl Parser<'_> {
             None
         };
         self.expect_special(b':')?;
-        Ok(Stmt::Case(expr, high))
+        let stmt = self.parse_labeled_statement()?;
+        Ok(Stmt::Case(expr, high, Box::new(stmt)))
+    }
+
+    /// The statement a `case`, `default` or goto label prefixes.
+    ///
+    /// C17 6.8.1 requires one. A label at the end of a compound statement is
+    /// accepted with a warning -- gcc and clang both take it, and C23 made it
+    /// legal -- rather than failing on the `}`.
+    fn parse_labeled_statement(&mut self) -> ParseResult<Stmt> {
+        if self.is_special(b'}') {
+            diag::warning(
+                self.current_pos(),
+                &gettext("a label at the end of a compound statement needs a statement in C17"),
+            );
+            return Ok(Stmt::Empty);
+        }
+        self.parse_statement()
     }
 
     fn parse_default_label(&mut self) -> ParseResult<Stmt> {
         let pos = self.current_pos();
         self.advance(); // consume 'default'
         self.expect_special(b':')?;
-        Ok(Stmt::Default(pos))
+        let stmt = self.parse_labeled_statement()?;
+        Ok(Stmt::Default(pos, Box::new(stmt)))
     }
 
     /// Parse block items (declarations and statements) until closing brace
@@ -2162,6 +2168,48 @@ impl Parser<'_> {
     /// symbol's *kind* rather than its type, so a function bound as a variable
     /// would be assignable. `_Alignas` does not apply to a function, so an
     /// alignment is dropped here rather than recorded against one.
+    /// The composite type of this declaration and a visible prior one of the
+    /// same object (C17 6.2.7p4).
+    ///
+    /// Two declarations of an identifier *with linkage* describe one object,
+    /// so an inner `extern char i[];` under an outer `extern char i[10];` is
+    /// the same complete array -- `sizeof i` is 10, and gcc answers so. c17
+    /// took the inner declaration's own incomplete type and refused the
+    /// `sizeof` outright.
+    ///
+    /// Only the array-extent half of the composite is formed here, which is
+    /// the half that changes an answer: a prototype against an unprototyped
+    /// declarator is already handled by `redeclaration_compatible`.
+    pub(super) fn composite_with_prior_declaration(
+        &self,
+        name: StringId,
+        typ: TypeId,
+        modifiers: TypeModifiers,
+    ) -> TypeId {
+        // Only a declaration with linkage names an object another declaration
+        // could also name. A plain block-scope object is a different object.
+        if !modifiers.contains(TypeModifiers::EXTERN) {
+            return typ;
+        }
+        if self.types.kind(typ) != TypeKind::Array || self.types.get(typ).array_size.is_some() {
+            return typ;
+        }
+        let Some(prior_id) = self.symbols.lookup_id(name, Namespace::Ordinary) else {
+            return typ;
+        };
+        let prior = self.symbols.get(prior_id).typ;
+        if self.types.kind(prior) != TypeKind::Array || self.types.get(prior).array_size.is_none() {
+            return typ;
+        }
+        // The element types still have to agree, or these are not two
+        // declarations of one object and the conflict belongs to
+        // `check_redeclaration`.
+        match (self.types.base_type(typ), self.types.base_type(prior)) {
+            (Some(a), Some(b)) if self.types.types_compatible(a, b) => prior,
+            _ => typ,
+        }
+    }
+
     pub(super) fn declared_symbol(
         &self,
         name: StringId,

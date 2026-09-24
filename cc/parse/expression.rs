@@ -41,8 +41,12 @@ impl<'a> Parser<'a> {
         while self.is_special(b',') {
             self.advance();
             let right = self.parse_assignment_expr()?;
-            // Comma expression type is the type of the rightmost expression
-            let result_typ = right.typ;
+            // C17 6.5.17p2: the result is the *value* of the right operand,
+            // so the lvalue conversion runs -- an array or a function
+            // designator becomes a pointer. Taking `right.typ` raw made
+            // `sizeof (1, foo)` answer for the function rather than for a
+            // pointer to it, and `sizeof (1, arr)` for the whole array.
+            let result_typ = right.typ.map(|t| self.lvalue_converted_type(t));
 
             // Build comma expression
             let Expr { kind, typ, pos, .. } = expr;
@@ -897,6 +901,56 @@ impl<'a> Parser<'a> {
         Ok(Some(expr))
     }
 
+    /// The `{ ... }` of a compound literal, with `typ` already parsed.
+    ///
+    /// Its own function because C99 6.5.2.5 makes a compound literal a
+    /// *postfix* expression, so more than one production reaches it: a cast
+    /// is not the only thing that can follow a parenthesised type name, and
+    /// `sizeof (struct s){1, 2}` and `_Alignof` each committed to the type
+    /// alone and left the braces behind.
+    pub(crate) fn parse_compound_literal_tail(
+        &mut self,
+        typ: TypeId,
+        paren_pos: Position,
+    ) -> ParseResult<Expr> {
+        let init_list = self.parse_initializer_list()?;
+        let elements = match init_list.kind {
+            ExprKind::InitList { elements } => elements,
+            _ => unreachable!("parse_initializer_list returns an InitList"),
+        };
+
+        // An incomplete array type takes its size from the initializer.
+        // `parse_declarator` spells "no size given" as `None`, which is what
+        // `int a[]` means; the type-name parser this replaced spelled it
+        // `Some(0)`, conflating it with the GNU zero-length array. Accept
+        // both, since the declaration path (`infer_array_size_from_init`)
+        // also does.
+        let final_typ = if self.types.kind(typ) == TypeKind::Array
+            && matches!(self.types.get(typ).array_size, None | Some(0))
+        {
+            let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+            // `(char[]){"hi"}` is the string in braces (C17 6.7.9p14), three
+            // characters, not an array of one element.
+            let array_size = match self.braced_string_initializer(elem_type, &elements) {
+                Some(lit) => self.string_initializer_len(lit),
+                None => Some(self.array_size_from_elements(&elements, elem_type)),
+            }
+            .unwrap_or_else(|| self.array_size_from_elements(&elements, elem_type));
+            self.types.intern(Type::array(elem_type, array_size))
+        } else {
+            typ
+        };
+
+        Ok(Self::typed_expr(
+            ExprKind::CompoundLiteral {
+                typ: final_typ,
+                elements,
+            },
+            final_typ,
+            paren_pos,
+        ))
+    }
+
     fn parse_sizeof(&mut self) -> ParseResult<Expr> {
         let sizeof_pos = self.current_pos();
         // sizeof returns size_t, which is unsigned long in our implementation
@@ -932,6 +986,21 @@ impl<'a> Parser<'a> {
             // exemption for it.
             if let Some((typ, dims)) = self.try_parse_type_name_vm() {
                 self.expect_special(b')')?;
+                // `sizeof (struct s){1, 2}` is `sizeof` of a *compound
+                // literal*, not of the type: C99 6.5.2.5 makes the literal a
+                // postfix expression, and `sizeof` binds to the whole of one.
+                // Committing to the type left the braces for whatever was
+                // parsing the enclosing construct.
+                if self.is_special(b'{') {
+                    let literal = self.parse_compound_literal_tail(typ, sizeof_pos)?;
+                    let expr = self.parse_postfix_suffixes(literal)?;
+                    self.check_sizeof_expr_operand(&expr, sizeof_pos);
+                    return Ok(Expr::typed(
+                        ExprKind::SizeofExpr(Box::new(expr)),
+                        size_t,
+                        sizeof_pos,
+                    ));
+                }
                 self.check_sizeof_operand_is_complete(typ, &dims, sizeof_pos);
                 return Ok(Expr::typed(
                     ExprKind::SizeofType(typ, dims),
@@ -1035,6 +1104,13 @@ impl<'a> Parser<'a> {
             // forbids.
             if let Some(typ) = self.try_parse_type_name() {
                 self.expect_special(b')')?;
+                // As in `sizeof`: a `{` here means the operand was a compound
+                // literal, which is a postfix expression and not the type.
+                if self.is_special(b'{') {
+                    let literal = self.parse_compound_literal_tail(typ, alignof_pos)?;
+                    let expr = self.parse_postfix_suffixes(literal)?;
+                    return Ok(self.alignof_expr(expr, size_t, alignof_pos));
+                }
                 return Ok(Expr::typed(ExprKind::AlignofType(typ), size_t, alignof_pos));
             }
 
@@ -1071,7 +1147,18 @@ impl<'a> Parser<'a> {
 
     /// Parse postfix expression: x++, x--, x[i], x.member, x->member, x(args)
     fn parse_postfix_expr(&mut self) -> ParseResult<Expr> {
-        let mut expr = self.parse_primary_expr()?;
+        let expr = self.parse_primary_expr()?;
+        self.parse_postfix_suffixes(expr)
+    }
+
+    /// The `[...]`, `.`, `->`, `(...)`, `++` and `--` that may follow a
+    /// postfix expression, applied to one already parsed.
+    ///
+    /// Split out so a compound literal reached from somewhere other than
+    /// `parse_primary_expr` -- `sizeof (int[2]){1, 2}[0]` -- takes the same
+    /// suffixes as one reached the usual way.
+    pub(crate) fn parse_postfix_suffixes(&mut self, expr: Expr) -> ParseResult<Expr> {
+        let mut expr = expr;
 
         loop {
             // Preserve the position of the base expression for all postfix ops
@@ -2115,50 +2202,7 @@ impl<'a> Parser<'a> {
 
                         // Check for compound literal: (type){ ... }
                         if self.is_special(b'{') {
-                            let init_list = self.parse_initializer_list()?;
-                            let elements = match init_list.kind {
-                                ExprKind::InitList { elements } => elements,
-                                _ => unreachable!(),
-                            };
-
-                            // An incomplete array type takes its size from the
-                            // initializer. `parse_declarator` spells "no size
-                            // given" as `None`, which is what `int a[]` means;
-                            // the type-name parser this replaced spelled it
-                            // `Some(0)`, conflating it with the GNU zero-length
-                            // array. Accept both, since the declaration path
-                            // (`infer_array_size_from_init`) also does.
-                            let final_typ = if self.types.kind(typ) == TypeKind::Array
-                                && matches!(self.types.get(typ).array_size, None | Some(0))
-                            {
-                                let elem_type =
-                                    self.types.base_type(typ).unwrap_or(self.types.int_id);
-                                // `(char[]){"hi"}` is the string in braces
-                                // (C17 6.7.9p14), three characters, not an
-                                // array of one element.
-                                let array_size =
-                                    match self.braced_string_initializer(elem_type, &elements) {
-                                        Some(lit) => self.string_initializer_len(lit),
-                                        None => Some(
-                                            self.array_size_from_elements(&elements, elem_type),
-                                        ),
-                                    }
-                                    .unwrap_or_else(|| {
-                                        self.array_size_from_elements(&elements, elem_type)
-                                    });
-                                self.types.intern(Type::array(elem_type, array_size))
-                            } else {
-                                typ
-                            };
-
-                            return Ok(Self::typed_expr(
-                                ExprKind::CompoundLiteral {
-                                    typ: final_typ,
-                                    elements,
-                                },
-                                final_typ,
-                                paren_pos,
-                            ));
+                            return self.parse_compound_literal_tail(typ, paren_pos);
                         }
 
                         // Regular cast expression

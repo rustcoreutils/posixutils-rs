@@ -362,6 +362,11 @@ impl Parser<'_> {
             ExprKind::InitList { elements } => {
                 Some(self.array_size_from_elements(elements, elem_type))
             }
+            // A compound literal of array type already has its size, worked
+            // out from its own braces. Without this the declared array stayed
+            // incomplete and `sizeof` on it failed, although the initializer
+            // said exactly how long it was.
+            ExprKind::CompoundLiteral { typ: lit_typ, .. } => self.types.get(*lit_typ).array_size,
             _ => self.string_initializer_len(init),
         };
 
@@ -620,6 +625,9 @@ impl Parser<'_> {
                 // after the completion of its declarator."
                 let mut symbol_id: Option<SymbolId> = None;
                 if has_name && !is_typedef {
+                    // C17 6.2.7p4: two declarations of one object with linkage
+                    // describe it by their composite type.
+                    typ = self.composite_with_prior_declaration(name, typ, base_type.modifiers);
                     self.check_redeclaration(name, typ, decl_pos);
                     let sym = self
                         .declared_symbol(name, typ, validated_align)

@@ -364,12 +364,16 @@ fn extract_refs_from_stmt(
         Stmt::GotoIndirect { target, .. } => {
             extract_refs_from_expr(target, strings, symbols, xref);
         }
-        Stmt::Case(expr, high) => {
+        Stmt::Case(expr, high, body) => {
             extract_refs_from_expr(expr, strings, symbols, xref);
             // Both endpoints of a range label can reference identifiers.
             if let Some(high) = high {
                 extract_refs_from_expr(high, strings, symbols, xref);
             }
+            extract_refs_from_stmt(body, strings, symbols, xref);
+        }
+        Stmt::Default(_, body) => {
+            extract_refs_from_stmt(body, strings, symbols, xref);
         }
         Stmt::Label { stmt, .. } => {
             extract_refs_from_stmt(stmt, strings, symbols, xref);

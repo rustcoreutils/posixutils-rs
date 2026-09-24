@@ -412,16 +412,24 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // Try pointer/array + int or int + pointer/array → symbol address with offset
                 let is_ptr_or_array =
                     |t: TypeId| matches!(self.types.kind(t), TypeKind::Pointer | TypeKind::Array);
-                let (ptr_expr, int_expr, is_sub) = if left.typ.is_some_and(is_ptr_or_array) {
+                // Which side is an *address*, not which side has a pointer
+                // type: `(unsigned long)&_text - 0x10000000L` is a relocation
+                // at an integer type, and asking the type alone rejected every
+                // one of them. The scale below still comes from the type, so
+                // an integer-typed address counts bytes and a pointer counts
+                // elements, which is what each means.
+                let _ = is_ptr_or_array;
+                let (ptr_expr, int_expr, is_sub) = if self.is_address_valued(left) {
                     (left.as_ref(), right.as_ref(), *op == BinaryOp::Sub)
-                } else if right.typ.is_some_and(is_ptr_or_array) && *op == BinaryOp::Add {
+                } else if self.is_address_valued(right) && *op == BinaryOp::Add {
                     (right.as_ref(), left.as_ref(), false)
                 } else {
-                    // Neither operand is a pointer, so this is ordinary
-                    // arithmetic that happens to use `+` or `-`. An arithmetic
-                    // object folded above at its own type; anything else that
-                    // reaches here can only be an integer constant.
-                    if let Some(val) = self.eval_const_init_expr(expr) {
+                    // Neither operand names a symbol, so this is ordinary
+                    // arithmetic that happens to use `+` or `-` -- except that
+                    // one of its leaves may still be the difference of two
+                    // addresses into one object, which is a constant although
+                    // neither address is.
+                    if let Some(val) = self.eval_const_with_address_difference(expr) {
                         return Initializer::Int(val);
                     }
                     self.reject_initializer(expr);
@@ -522,6 +530,40 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// size; a subtraction of two addresses already cast to an integer type
     /// counts bytes and does not. Both sides must resolve to the *same* symbol,
     /// which is what keeps the cross-object form a diagnostic.
+    /// A constant whose leaves may include the difference of two addresses
+    /// into the same object.
+    ///
+    /// `(int)((void *)&v.p[1] - (void *)&v) + 1U` is an address constant by
+    /// C17 6.6p9, and its value is known at translation time although neither
+    /// address is. The ordinary constant evaluator stops at the subtraction,
+    /// because an address is not a constant to it; this walks the arithmetic
+    /// around one so the whole expression folds.
+    pub(crate) fn eval_const_with_address_difference(&mut self, expr: &Expr) -> Option<i128> {
+        if let Some(v) = self.eval_const_init_expr(expr) {
+            return Some(v);
+        }
+        match &expr.kind {
+            ExprKind::Cast { expr: inner, .. } => self.eval_const_with_address_difference(inner),
+            ExprKind::Binary { op, left, right } => {
+                if *op == BinaryOp::Sub {
+                    if let Some(diff) = self.static_address_difference(left, right) {
+                        return Some(diff);
+                    }
+                }
+                let l = self.eval_const_with_address_difference(left)?;
+                let r = self.eval_const_with_address_difference(right)?;
+                match op {
+                    BinaryOp::Add => l.checked_add(r),
+                    BinaryOp::Sub => l.checked_sub(r),
+                    BinaryOp::Mul => l.checked_mul(r),
+                    BinaryOp::Div if r != 0 => l.checked_div(r),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn static_address_difference(&mut self, left: &Expr, right: &Expr) -> Option<i128> {
         let (lname, loff) = self.static_address_operand(left)?;
         let (rname, roff) = self.static_address_operand(right)?;
@@ -538,11 +580,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         if !is_ptr(left.typ) || !is_ptr(right.typ) {
             return Some(bytes as i128);
         }
+        // `void *` has no element size, and C makes the difference of two
+        // `void *` a byte count -- which gcc accepts and glibc relies on.
+        // Filtering a zero size out and giving up left
+        // `(void *)&v.p[0] - (void *)&v` unfoldable.
         let elem = left
             .typ
             .and_then(|t| self.types.base_type(t))
             .map(|t| self.types.size_bytes(t) as i64)
-            .filter(|n| *n > 0)?;
+            .unwrap_or(1)
+            .max(1);
         Some((bytes / elem) as i128)
     }
 

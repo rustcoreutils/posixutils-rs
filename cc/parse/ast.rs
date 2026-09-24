@@ -1257,10 +1257,21 @@ pub enum Stmt {
     /// The second endpoint is `None` for an ordinary label. A range is *not*
     /// expanded into individual labels: `case 0 ... 1000000:` is legal and
     /// compiles in GCC, and each label costs a basic block and a compare here.
-    Case(Expr, Option<Expr>),
+    /// `case <expr>:` (or the GNU range `case lo ... hi:`) and the statement
+    /// it labels.
+    ///
+    /// The label carries its statement, as `Label` does, because C17 6.8.1
+    /// makes a labeled statement *one* statement. Holding the label as a flat
+    /// sibling marker worked inside a compound statement and nowhere else:
+    /// in `switch (c) case 1: if (d) case 2: case 3: f();` the `if` took the
+    /// bare `case 2:` as its whole then-branch, and `case 3: f();` fell out of
+    /// the switch entirely -- reported as "case label not within a switch
+    /// statement", and as duplicate labels where two switches were involved.
+    Case(Expr, Option<Expr>, Box<Stmt>),
 
     /// Default label (within switch body)
-    Default(Position),
+    /// `default:` and the statement it labels. See [`Stmt::Case`].
+    Default(Position, Box<Stmt>),
 
     /// Inline assembly statement (GCC extended asm)
     /// Format: asm [volatile] [goto] ( "template" : outputs : inputs : clobbers [: goto_labels] );

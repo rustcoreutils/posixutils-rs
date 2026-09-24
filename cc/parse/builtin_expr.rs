@@ -1392,6 +1392,17 @@ impl Parser<'_> {
                 // setjmp(env) - saves execution context, returns int
                 // Returns 0 on direct call, non-zero when returning via longjmp
                 self.expect_special(b'(')?;
+                // `setjmp()` with no argument is a call to an unprototyped
+                // function, which old code writes and gcc accepts. Reaching
+                // for the argument unconditionally turned it into "unexpected
+                // token in expression", a parse error where an arity
+                // diagnostic belonged -- and there is nothing to save, so the
+                // builtin cannot handle it either: hand it back as an
+                // ordinary call.
+                if self.is_special(b')') {
+                    self.advance();
+                    return self.unprototyped_call(name_id, token_pos);
+                }
                 let env = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
@@ -1999,6 +2010,40 @@ impl Parser<'_> {
             )),
             _ => None,
         }
+    }
+
+    /// A call to `name` with no arguments, when a builtin cannot take it.
+    ///
+    /// The name is declared as the unprototyped `int name()` if nothing has
+    /// declared it, which is what an implicit declaration gives and what
+    /// `check_call_arity` then declines to check.
+    fn unprototyped_call(&mut self, name_id: StringId, pos: Position) -> ParseResult<Expr> {
+        let sym = match self.symbols.lookup_id(name_id, Namespace::Ordinary) {
+            Some(sym) => sym,
+            None => {
+                let int_id = self.types.int_id;
+                let func_type = self.types.intern(Type {
+                    kind: TypeKind::Function,
+                    base: Some(int_id),
+                    params: None,
+                    ..Default::default()
+                });
+                let symbol = Symbol::function(name_id, func_type, self.symbols.depth());
+                self.symbols
+                    .declare(symbol)
+                    .map_err(|_| ParseError::new("cannot declare an implicit function", pos))?
+            }
+        };
+        let sym_typ = self.symbols.get(sym).typ;
+        let ret = self.types.base_type(sym_typ).unwrap_or(self.types.int_id);
+        Ok(Self::typed_expr(
+            ExprKind::Call {
+                func: Box::new(Self::typed_expr(ExprKind::Ident(sym), ret, pos)),
+                args: Vec::new(),
+            },
+            ret,
+            pos,
+        ))
     }
 
     /// The pointee type of `ptr`, or `int` when it is not a pointer. The

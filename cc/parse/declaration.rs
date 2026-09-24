@@ -24,7 +24,7 @@ use gettextrs::gettext;
 /// `short`/`long`/`signed`/`unsigned` are counted; they qualify a
 /// data type rather than naming one.
 #[derive(Default)]
-struct SpecifierTally {
+pub(crate) struct SpecifierTally {
     /// Data-type specifiers, in source order, under their canonical spelling.
     /// More than one is always a constraint violation.
     data_types: Vec<(&'static str, Position)>,
@@ -70,7 +70,7 @@ impl SpecifierTally {
     /// `_Thread_local` is deliberately not recorded: 6.7.1p2 lets it appear
     /// with `static` or `extern`, and gcc accepts both orders, so counting it
     /// would reject `static _Thread_local int x;`.
-    fn note_storage_class(&mut self, name: &'static str, pos: Position) {
+    pub(crate) fn note_storage_class(&mut self, name: &'static str, pos: Position) {
         self.storage_classes.push((name, pos));
     }
 
@@ -88,7 +88,7 @@ impl SpecifierTally {
     /// Reporting rather than returning an error: a constraint violation needs a
     /// diagnostic (C17 5.1.1.3), and the parser recovers with the type it had
     /// already built, so one bad declaration does not cascade.
-    fn check(&self) {
+    pub(crate) fn check(&self) {
         if let Some((second, pos)) = self.storage_classes.get(1) {
             let first = self.storage_classes[0].0;
             if first == *second {
@@ -742,6 +742,10 @@ impl Parser<'_> {
 
                 if self.is_special(b',') {
                     self.advance();
+                    // An attribute may come before the next declarator, where
+                    // it belongs to that declarator. See the same call in
+                    // `parse_remaining_declarators`.
+                    self.skip_extensions_after_declarator();
                 } else {
                     break;
                 }
@@ -1144,7 +1148,7 @@ impl Parser<'_> {
                     let mut struct_type = self.parse_struct_or_union_specifier(false)?;
                     // Trailing specifiers: `struct foo const`, and also
                     // `struct { ... } static g` -- C17 6.7p1 allows any order.
-                    let trailing_mods = self.consume_trailing_specifiers();
+                    let trailing_mods = self.consume_trailing_specifiers(&mut tally)?;
                     struct_type.modifiers |= modifiers | trailing_mods;
                     return Ok((struct_type, true));
                 }
@@ -1153,7 +1157,7 @@ impl Parser<'_> {
                     tally.check();
                     let mut union_type = self.parse_struct_or_union_specifier(true)?;
                     // As for `struct` above.
-                    let trailing_mods = self.consume_trailing_specifiers();
+                    let trailing_mods = self.consume_trailing_specifiers(&mut tally)?;
                     union_type.modifiers |= modifiers | trailing_mods;
                     return Ok((union_type, true));
                 }
@@ -1240,6 +1244,46 @@ impl Parser<'_> {
     }
 
     /// Parse a type specifier and record whether one was present.
+    /// `_Alignas(type-name)` or `_Alignas(constant-expression)`, folded into
+    /// the pending alignment slot.
+    ///
+    /// Its own function because a declaration may reach it from two places --
+    /// the specifier loop, and the trailing specifiers after a `struct`,
+    /// `union` or `enum` -- and C17 6.7p1 lets a specifier appear in any
+    /// order, so both have to accept it.
+    pub(crate) fn parse_alignas_specifier(&mut self) -> ParseResult<()> {
+        let alignas_pos = self.current_pos();
+        self.advance();
+        self.expect_special(b'(')?;
+        let align = if let Some(type_id) = self.try_parse_type_name() {
+            self.types.alignment(type_id) as u32
+        } else {
+            let expr = self.parse_expression()?;
+            self.eval_const_expr(&expr).unwrap_or(0) as u32
+        };
+        self.expect_special(b')')?;
+
+        // C11 6.7.5p6: `_Alignas(0)` has no effect.
+        if align == 0 {
+            return Ok(());
+        }
+        if !align.is_power_of_two() {
+            return Err(ParseError::new(
+                format!("_Alignas({}) must be a power of 2", align),
+                alignas_pos,
+            ));
+        }
+        // Several may appear; the strictest wins (C11 6.7.5).
+        self.pending_alignas = Some(match self.pending_alignas {
+            Some(existing) => existing.max(align),
+            None => align,
+        });
+        // Record the spelling: 6.7.5p5 constrains the keyword, not the
+        // `aligned` attribute that shares the slot.
+        self.pending_alignas_kw.get_or_insert(alignas_pos);
+        Ok(())
+    }
+
     pub(super) fn parse_type_specifier(&mut self) -> ParseResult<Type> {
         let pos = self.current_pos();
         let (typ, explicit) = self.parse_type_specifier_inner()?;

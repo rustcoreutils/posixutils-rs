@@ -189,6 +189,7 @@ impl Parser<'_> {
         &mut self,
         specs: &DeclSpecs,
         base: TypeId,
+        list_base: &Type,
     ) -> ParseResult<Option<ExternalDecl>> {
         if self.is_special(b'(') {
             let saved_pos = self.pos;
@@ -297,7 +298,6 @@ impl Parser<'_> {
                 };
 
                 self.skip_extensions();
-                self.expect_special(b';')?;
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
                 typ = self.apply_pending_type_attrs(typ);
@@ -328,19 +328,34 @@ impl Parser<'_> {
 
                 let symbol = symbol_id.expect("declaration must have symbol");
                 self.settle_declaration_facts(name, specs.storage_class);
-                return Ok(Some(ExternalDecl::Declaration(Declaration {
-                    declarators: vec![InitDeclarator {
-                        symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
-                        fn_effect: self.take_pending_fn_effect(),
-                        symbol,
-                        typ,
-                        storage_class: specs.storage_class,
-                        init,
-                        vla_sizes: vec![],
-                        explicit_align: validated_align,
-                        pos: specs.pos,
-                    }],
-                })));
+                let mut declarators = vec![InitDeclarator {
+                    symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
+                    fn_effect: self.take_pending_fn_effect(),
+                    symbol,
+                    typ,
+                    storage_class: specs.storage_class,
+                    init,
+                    vla_sizes: vec![],
+                    explicit_align: validated_align,
+                    pos: specs.pos,
+                }];
+                // A grouped declarator is one *declarator*, not one
+                // declaration: `int (*b)(), (*c)();` is two of them. This
+                // path parsed exactly one and then demanded the semicolon, so
+                // the comma was a syntax error -- although the identical line
+                // inside a function has always worked, because block scope
+                // runs one list walker for every declarator it sees.
+                let list_base_id = self.types.intern(list_base.clone());
+                self.parse_remaining_declarators(
+                    list_base,
+                    list_base_id,
+                    specs.is_typedef,
+                    specs.storage_class,
+                    specs.pos,
+                    &mut declarators,
+                )?;
+                self.expect_special(b';')?;
+                return Ok(Some(ExternalDecl::Declaration(Declaration { declarators })));
             }
             // Not a grouped declarator, restore position
             self.pos = saved_pos;
@@ -688,7 +703,7 @@ impl Parser<'_> {
         }
 
         // Check for grouped declarator: void (*fp)(int), int (*arr)[10], or typedef int (name)(params)
-        if let Some(decl) = self.parse_grouped_declarator_decl(&specs, base_type_id)? {
+        if let Some(decl) = self.parse_grouped_declarator_decl(&specs, base_type_id, &base_type)? {
             return Ok(decl);
         }
 
@@ -736,7 +751,10 @@ impl Parser<'_> {
 
         // Check again for grouped declarator after pointer modifiers: char *(*fp)(int)
         // Also handles: char *(name)(params) for function type
-        if let Some(decl) = self.parse_grouped_declarator_decl(&specs, typ_id)? {
+        // The list's base type is the one *before* the pointer run: in
+        // `int *(*a)(), (*b)();` the `*` belongs to the first declarator
+        // alone, and `b` is declared from `int`.
+        if let Some(decl) = self.parse_grouped_declarator_decl(&specs, typ_id, &base_type)? {
             return Ok(decl);
         }
 
@@ -1029,6 +1047,12 @@ impl Parser<'_> {
     ) -> ParseResult<()> {
         while self.is_special(b',') {
             self.advance();
+            // An attribute may also come *before* a declarator in the list --
+            // `int a, __attribute__((unused)) b;` -- where it belongs to that
+            // declarator. Both loops skipped extensions only after
+            // `parse_declarator`, so the attribute was left for the declarator
+            // parser and became a syntax error.
+            self.skip_extensions_after_declarator();
             let next_decl_pos = self.current_pos();
             let (decl_name, mut decl_type, vla_sizes, _decl_func_params) =
                 self.parse_declarator(base_type_id, DeclaratorName::Required)?;

@@ -11,6 +11,7 @@
 //
 
 use super::ast::Expr;
+use super::declaration::SpecifierTally;
 use super::parser::{DeclaratorName, ParseError, ParseResult, Parser};
 use crate::strings::StringId;
 use crate::symbol::Symbol;
@@ -45,7 +46,10 @@ impl Parser<'_> {
     /// qualifiers were consumed here, and the storage class was then read as
     /// the declarator's name -- the declaration failed with
     /// "expected ';', found identifier 'g'".
-    pub(crate) fn consume_trailing_specifiers(&mut self) -> TypeModifiers {
+    pub(crate) fn consume_trailing_specifiers(
+        &mut self,
+        tally: &mut SpecifierTally,
+    ) -> ParseResult<TypeModifiers> {
         let mut mods = self.consume_type_qualifiers();
         loop {
             if self.peek() != TokenType::Ident {
@@ -54,12 +58,43 @@ impl Parser<'_> {
             let Some(name_id) = self.get_ident_id(self.current()) else {
                 break;
             };
+            // Everything C17 6.7p1 lets follow a completed type specifier. The
+            // list was five storage classes long, which made
+            // `struct S { int x; } extern __thread a;` stop at `__thread` and
+            // read it as the declarator's name -- a silent misparse, not a
+            // diagnostic. It also bypassed the tally, so two storage classes
+            // here went unreported where two before the `struct` did not.
             let m = match name_id {
-                crate::kw::STATIC => TypeModifiers::STATIC,
-                crate::kw::EXTERN => TypeModifiers::EXTERN,
-                crate::kw::REGISTER => TypeModifiers::REGISTER,
-                crate::kw::AUTO => TypeModifiers::AUTO,
-                crate::kw::TYPEDEF => TypeModifiers::TYPEDEF,
+                crate::kw::STATIC => {
+                    tally.note_storage_class("static", self.current_pos());
+                    TypeModifiers::STATIC
+                }
+                crate::kw::EXTERN => {
+                    tally.note_storage_class("extern", self.current_pos());
+                    TypeModifiers::EXTERN
+                }
+                crate::kw::REGISTER => {
+                    tally.note_storage_class("register", self.current_pos());
+                    TypeModifiers::REGISTER
+                }
+                crate::kw::AUTO => {
+                    tally.note_storage_class("auto", self.current_pos());
+                    TypeModifiers::AUTO
+                }
+                crate::kw::TYPEDEF => {
+                    tally.note_storage_class("typedef", self.current_pos());
+                    TypeModifiers::TYPEDEF
+                }
+                crate::kw::THREAD_LOCAL | crate::kw::GNU_THREAD => TypeModifiers::THREAD_LOCAL,
+                crate::kw::INLINE | crate::kw::GNU_INLINE | crate::kw::GNU_INLINE2 => {
+                    TypeModifiers::INLINE
+                }
+                crate::kw::NORETURN | crate::kw::GNU_NORETURN => TypeModifiers::NORETURN,
+                crate::kw::ALIGNAS => {
+                    self.parse_alignas_specifier()?;
+                    mods |= self.consume_type_qualifiers();
+                    continue;
+                }
                 _ => break,
             };
             self.advance();
@@ -67,7 +102,8 @@ impl Parser<'_> {
             // A storage class may itself be followed by more qualifiers.
             mods |= self.consume_type_qualifiers();
         }
-        mods
+        tally.check();
+        Ok(mods)
     }
 
     pub(crate) fn consume_type_qualifiers(&mut self) -> TypeModifiers {

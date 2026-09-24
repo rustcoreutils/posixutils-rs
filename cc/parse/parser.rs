@@ -755,12 +755,12 @@ impl<'a> Parser<'a> {
         //   (name(...)) - parenthesized function declarator
         // Following sparse's is_nested() logic: if identifier is not a type, it's grouped
         if self.peek() == TokenType::Ident {
-            if let Some(name_id) = self.get_ident_id(self.current()) {
-                let is_type = self.symbols.lookup_typedef(name_id).is_some()
-                    || crate::kw::has_tag(name_id, crate::kw::TYPE_KEYWORD);
-                // If not a type, this is a grouped declarator
-                return !is_type;
-            }
+            // "Does a declaration start here?" has one answer, and this asked
+            // a narrower question than `is_declaration_start` did: it tested
+            // `TYPE_KEYWORD` alone, so a parameter list beginning with an
+            // attribute -- `void bar (int (__attribute__((mode(SI))) int f));`
+            // -- was read as a parenthesized declarator instead.
+            return !self.is_declaration_start();
         }
 
         false
@@ -2239,10 +2239,16 @@ impl Parser<'_> {
         match effective {
             None => Ok(None),
             Some(explicit) => {
-                // For C11 _Alignas validation, don't reject typedef alignment that
-                // exceeds the natural alignment of the underlying type (that's the point).
-                // Only reject explicit _Alignas that reduces below natural.
-                if declaration_align.is_some() {
+                // C11 6.7.5p5 forbids the *keyword* from reducing alignment.
+                // The GNU `aligned` attribute shares this slot and is not
+                // constrained -- gcc accepts `__attribute__((aligned(2))) int`
+                // on a typedef, a variable and a struct alike, and rejects
+                // `_Alignas(2) int` -- so the check has to ask which one was
+                // written. `pending_alignas_kw` records that and was simply
+                // never consulted, which made every reduced `aligned` an
+                // error under a message naming a keyword the source did not
+                // contain.
+                if self.pending_alignas_kw.is_some() {
                     let natural = self.types.natural_alignment(typ) as u32;
                     if explicit < natural {
                         return Err(ParseError::new(

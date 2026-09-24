@@ -112,6 +112,23 @@ pub enum FpTest {
     IsNormal,
 }
 
+/// Which read-modify-write a [`ExprKind::GnuAtomicRmw`] performs.
+///
+/// These are the operations gcc's `__atomic_*` and `__sync_*` families share.
+/// `Nand` has no native instruction on any target c17 has and no C11
+/// counterpart, which is why the set is written out here rather than reusing
+/// the C11 node list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GnuAtomicOp {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+    /// `~(old & val)`.
+    Nand,
+}
+
 /// Which relation an [`ExprKind::FpCompare`] asks about.
 ///
 /// C99 7.12.14 gives these their own macros because the ordinary relational
@@ -771,6 +788,46 @@ pub enum ExprKind {
     // =========================================================================
     // Atomic builtins (Clang __c11_atomic_* for C11 stdatomic.h)
     // =========================================================================
+    /// gcc's `__atomic_*` and `__sync_*` read-modify-write builtins.
+    ///
+    /// One node for both families and for both answers, because they differ
+    /// only in what they return and in whether the ordering is written down:
+    /// `__sync_fetch_and_add` is `__atomic_fetch_add` at sequential
+    /// consistency, and `__sync_add_and_fetch` is the same operation reporting
+    /// the value afterwards.
+    ///
+    /// `returns_new` is resolved in the linearizer by re-applying the
+    /// operation to the value the exchange returned -- not by a second access
+    /// to the object, and not by evaluating `val` twice.
+    GnuAtomicRmw {
+        op: GnuAtomicOp,
+        ptr: Box<Expr>,
+        val: Box<Expr>,
+        /// The memory order. `__sync_*` has none and passes the constant for
+        /// sequential consistency.
+        order: Box<Expr>,
+        /// `*_and_fetch` wants the value after the operation; `fetch_*` wants
+        /// the value before it.
+        returns_new: bool,
+    },
+
+    /// `__sync_bool_compare_and_swap` and `__sync_val_compare_and_swap`.
+    ///
+    /// Distinct from the C11 node because the expected value arrives *by
+    /// value* here, not through a pointer the callee may write back to. The
+    /// linearizer stages it in a temporary, which is then exactly the old
+    /// value the `val` form has to return: on success the object held the
+    /// expected value, and on failure the compare-exchange wrote the observed
+    /// one back.
+    GnuAtomicCas {
+        ptr: Box<Expr>,
+        expected: Box<Expr>,
+        desired: Box<Expr>,
+        /// `val_compare_and_swap` returns the old value; `bool_` form returns
+        /// whether the exchange happened.
+        returns_old: bool,
+    },
+
     /// __c11_atomic_init(ptr, val)
     /// Initialize an atomic variable (no memory ordering)
     C11AtomicInit {

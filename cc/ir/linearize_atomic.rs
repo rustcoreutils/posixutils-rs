@@ -259,11 +259,27 @@ impl Linearizer<'_> {
                 return self.emit_atomic_op(atomic_op, lv, Some(value));
             }
         }
-        self.emit_atomic_cas_loop(lv, op, value)
+        self.emit_atomic_cas_loop(lv, op, value, false)
+    }
+
+    /// `__atomic_fetch_nand` / `__sync_fetch_and_nand`: store `~(old & value)`
+    /// and return the old value.
+    ///
+    /// No target has an atomic NAND, so this is always the CAS loop -- the
+    /// same loop, with one more instruction inside it. Writing a second loop
+    /// would mean two places to get the LL/SC rules right.
+    pub(crate) fn emit_atomic_nand(&mut self, lv: &AtomicLvalue, value: PseudoId) -> PseudoId {
+        self.emit_atomic_cas_loop(lv, Opcode::And, value, true)
     }
 
     /// The CAS retry loop described on `emit_atomic_rmw`.
-    fn emit_atomic_cas_loop(&mut self, lv: &AtomicLvalue, op: Opcode, value: PseudoId) -> PseudoId {
+    fn emit_atomic_cas_loop(
+        &mut self,
+        lv: &AtomicLvalue,
+        op: Opcode,
+        value: PseudoId,
+        invert: bool,
+    ) -> PseudoId {
         let elem_typ = lv.elem_typ;
         let bits = lv.size_bits;
 
@@ -289,6 +305,21 @@ impl Linearizer<'_> {
         self.emit(Instruction::load(old, exp_addr, 0, elem_typ, bits));
         let new = self.alloc_reg_pseudo();
         self.emit(Instruction::binop(op, new, old, value, elem_typ, bits));
+        // `nand` is `and` with the result complemented, which is the only
+        // reason this loop takes a flag rather than an opcode alone.
+        let new = if invert {
+            let inverted = self.alloc_reg_pseudo();
+            self.emit(Instruction::unop(
+                Opcode::Not,
+                inverted,
+                new,
+                elem_typ,
+                bits,
+            ));
+            inverted
+        } else {
+            new
+        };
         // C17 6.3.1.2: converting to _Bool yields 0 or 1, and a compound
         // assignment stores the converted result. Without this the raw sum
         // reaches memory and an _Atomic _Bool holds 2 or 255.

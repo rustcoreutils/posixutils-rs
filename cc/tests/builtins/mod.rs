@@ -17,6 +17,7 @@
 //
 
 mod bit_ops;
+mod gnu_atomics;
 mod has_feature;
 mod intrinsics;
 mod math;

@@ -18,9 +18,10 @@ use super::{
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{error, get_all_stream_names, Position};
 use crate::float::FloatVal;
+use crate::ir::linearize_atomic::AtomicLvalue;
 use crate::parse::ast::{
-    BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef, InitElement,
-    OffsetOfPath, TranslationUnit, UnaryOp,
+    BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef, GnuAtomicOp,
+    InitElement, OffsetOfPath, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
@@ -1797,7 +1798,9 @@ impl<'a> Linearizer<'a> {
             ExprKind::Setjmp { .. } | ExprKind::Longjmp { .. } => false,
 
             // Atomic operations have side effects (memory ordering)
-            ExprKind::C11AtomicInit { .. }
+            ExprKind::GnuAtomicRmw { .. }
+            | ExprKind::GnuAtomicCas { .. }
+            | ExprKind::C11AtomicInit { .. }
             | ExprKind::C11AtomicLoad { .. }
             | ExprKind::C11AtomicStore { .. }
             | ExprKind::C11AtomicExchange { .. }
@@ -5276,6 +5279,134 @@ impl<'a> Linearizer<'a> {
     /// and emit `op [ptr, value?, order]`. Eleven hand-written copies of that
     /// is how the operand convention drifted out of the linearizer's reach in
     /// the first place -- `AsmConstraint::is_memory` had the same problem.
+    /// gcc's `__atomic_*` / `__sync_*` read-modify-write.
+    ///
+    /// The operation itself goes through the same `emit_atomic_rmw` the
+    /// compound assignment on an `_Atomic` object uses, so a native
+    /// fetch-and-op is taken where the target has one and the CAS loop
+    /// elsewhere -- one implementation of the LL/SC rules, not two.
+    ///
+    /// `*_and_fetch` re-applies the operation to the value the exchange
+    /// returned. That is arithmetic on a value already in hand, not a second
+    /// access to the object, and it reuses the operand *pseudo* -- so
+    /// `__sync_add_and_fetch(p, f())` calls `f` exactly once.
+    fn linearize_gnu_atomic_rmw(
+        &mut self,
+        op: GnuAtomicOp,
+        ptr: &Expr,
+        val: &Expr,
+        order: &Expr,
+        returns_new: bool,
+    ) -> PseudoId {
+        let ptr_type = self.expr_type(ptr);
+        let elem_typ = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+        let bits = self.types.size_bits(elem_typ);
+
+        let addr = self.linearize_expr(ptr);
+        let value_typ = self.expr_type(val);
+        let raw = self.linearize_expr(val);
+        // Pointer arithmetic scales by the element size, as it does for `+=`.
+        let operand = if self.types.kind(elem_typ) == TypeKind::Pointer
+            && self.types.is_integer(value_typ)
+            && matches!(op, GnuAtomicOp::Add | GnuAtomicOp::Sub)
+        {
+            self.scale_pointer_addend(elem_typ, value_typ, raw)
+        } else {
+            self.emit_convert(raw, value_typ, elem_typ)
+        };
+        // The order argument is accepted and evaluated, as gcc evaluates it,
+        // but every lowering here is sequentially consistent: `emit_atomic_rmw`
+        // and its CAS loop are, and answering a weaker order with a stronger
+        // one is always correct.
+        let _ = self.linearize_expr(order);
+
+        let lv = AtomicLvalue {
+            addr,
+            elem_typ,
+            size_bits: bits,
+        };
+
+        let (old, binop) = match op {
+            GnuAtomicOp::Nand => (self.emit_atomic_nand(&lv, operand), Opcode::And),
+            _ => {
+                let binop = match op {
+                    GnuAtomicOp::Add => Opcode::Add,
+                    GnuAtomicOp::Sub => Opcode::Sub,
+                    GnuAtomicOp::And => Opcode::And,
+                    GnuAtomicOp::Or => Opcode::Or,
+                    GnuAtomicOp::Xor => Opcode::Xor,
+                    GnuAtomicOp::Nand => unreachable!("handled above"),
+                };
+                (self.emit_atomic_rmw(&lv, binop, operand), binop)
+            }
+        };
+
+        if !returns_new {
+            return old;
+        }
+
+        let new = self.alloc_reg_pseudo();
+        self.emit(Instruction::binop(binop, new, old, operand, elem_typ, bits));
+        if op != GnuAtomicOp::Nand {
+            return new;
+        }
+        let inverted = self.alloc_reg_pseudo();
+        self.emit(Instruction::unop(
+            Opcode::Not,
+            inverted,
+            new,
+            elem_typ,
+            bits,
+        ));
+        inverted
+    }
+
+    /// `__sync_bool_compare_and_swap` and `__sync_val_compare_and_swap`.
+    ///
+    /// The expected value arrives by value, so it is staged in a temporary
+    /// whose address the compare-exchange takes. Afterwards that temporary
+    /// holds the object's old value either way: on success the object held
+    /// what was expected, and on failure both backends write the observed
+    /// value back through the pointer.
+    fn linearize_gnu_atomic_cas(
+        &mut self,
+        ptr: &Expr,
+        expected: &Expr,
+        desired: &Expr,
+        returns_old: bool,
+    ) -> PseudoId {
+        let ptr_type = self.expr_type(ptr);
+        let elem_typ = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+        let bits = self.types.size_bits(elem_typ);
+
+        let addr = self.linearize_expr(ptr);
+        let exp_typ = self.expr_type(expected);
+        let exp_raw = self.linearize_expr(expected);
+        let exp_val = self.emit_convert(exp_raw, exp_typ, elem_typ);
+        let des_typ = self.expr_type(desired);
+        let des_raw = self.linearize_expr(desired);
+        let des_val = self.emit_convert(des_raw, des_typ, elem_typ);
+
+        let exp_addr = self.alloc_local_temp(elem_typ);
+        self.emit(Instruction::store(exp_val, exp_addr, 0, elem_typ, bits));
+
+        let ok = self.alloc_reg_pseudo();
+        let order = self.emit_const(MemoryOrder::SeqCst as i128, self.types.int_id);
+        let mut cas = Instruction::new(Opcode::AtomicCas).with_target(ok);
+        cas.src = vec![addr, exp_addr, des_val, order];
+        cas.typ = Some(self.types.bool_id);
+        cas.size = bits;
+        cas.memory_order = MemoryOrder::SeqCst;
+        self.emit(cas);
+
+        if !returns_old {
+            return ok;
+        }
+        let old = self.alloc_reg_pseudo();
+        self.emit(Instruction::load(old, exp_addr, 0, elem_typ, bits));
+        old
+    }
+
     fn emit_c11_atomic_builtin(
         &mut self,
         op: Opcode,
@@ -5368,6 +5499,21 @@ impl<'a> Linearizer<'a> {
                 self.emit(insn);
                 result
             }
+
+            ExprKind::GnuAtomicRmw {
+                op,
+                ptr,
+                val,
+                order,
+                returns_new,
+            } => self.linearize_gnu_atomic_rmw(*op, ptr, val, order, *returns_new),
+
+            ExprKind::GnuAtomicCas {
+                ptr,
+                expected,
+                desired,
+                returns_old,
+            } => self.linearize_gnu_atomic_cas(ptr, expected, desired, *returns_old),
 
             ExprKind::C11AtomicFetchAdd { ptr, val, order } => {
                 self.emit_c11_atomic_builtin(Opcode::AtomicFetchAdd, ptr, Some(val), Some(order))
@@ -6104,6 +6250,8 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::C11AtomicInit { .. }
             | ExprKind::C11AtomicLoad { .. }
+            | ExprKind::GnuAtomicRmw { .. }
+            | ExprKind::GnuAtomicCas { .. }
             | ExprKind::C11AtomicStore { .. }
             | ExprKind::C11AtomicExchange { .. }
             | ExprKind::C11AtomicCompareExchangeStrong { .. }

@@ -329,6 +329,48 @@ file was narrowed to conformance findings alone.
 | `__c11_atomic_thread_fence(order)` | Thread memory fence |
 | `__c11_atomic_signal_fence(order)` | Compiler barrier (signal fence) |
 
+## GNU Atomic Builtins
+
+gcc's own spellings, which real C reaches for directly: `pycore_atomic.h`,
+`valgrind/config.h` and `pyconfig.h` all use them, so a translation unit that
+includes one of those did not compile without them.
+
+| Builtin | Description |
+|---------|-------------|
+| `__atomic_load_n(p, order)`, `__atomic_store_n(p, v, order)` | |
+| `__atomic_exchange_n(p, v, order)` | Swap, returning the old value |
+| `__atomic_compare_exchange_n(p, expected, desired, weak, succ, fail)` | `expected` is a pointer, and the observed value is written back through it on failure |
+| `__atomic_fetch_add/sub/and/or/xor/nand(p, v, order)` | Returns the value **before** |
+| `__atomic_add/sub/and/or/xor/nand_fetch(p, v, order)` | Returns the value **after** |
+| `__atomic_test_and_set(p, order)`, `__atomic_clear(p, order)` | |
+| `__atomic_thread_fence(order)`, `__atomic_signal_fence(order)` | |
+| `__atomic_always_lock_free(size, p)`, `__atomic_is_lock_free(size, p)` | Answered from the size: 1, 2, 4 and 8 are lock-free |
+| `__sync_fetch_and_add/sub/and/or/xor/nand(p, v, ...)` | Sequentially consistent, returning the value before |
+| `__sync_add/sub/and/or/xor/nand_and_fetch(p, v, ...)` | The same, returning the value after |
+| `__sync_bool_compare_and_swap(p, old, new)` | Whether the exchange happened. `old` arrives **by value**, unlike the C11 and `__atomic_` forms |
+| `__sync_val_compare_and_swap(p, old, new)` | The object's previous value |
+| `__sync_lock_test_and_set(p, v)`, `__sync_lock_release(p)` | An exchange and a store of zero |
+| `__sync_synchronize()` | A full fence |
+
+`nand` is `~(old & val)` and has no instruction on any target, so it is always
+the compare-exchange loop -- the same loop the other operations fall back to,
+with one more instruction inside it.
+
+The `__sync_*` family predates the C11 orders and is sequentially consistent;
+each also accepts the trailing list of variables gcc documents and ignores.
+The `order` argument of an `__atomic_*` builtin is evaluated and then answered
+with sequential consistency, which is stronger than any order it could name.
+
+`*_and_fetch` re-applies the operation to the value the exchange returned. That
+is arithmetic on a value already in hand rather than a second access to the
+object, and it reuses the operand *pseudo*, so `__sync_add_and_fetch(p, f())`
+calls `f` exactly once.
+
+`__GCC_HAVE_SYNC_COMPARE_AND_SWAP_{1,2,4,8}` is predefined, because it is now
+a true statement about this compiler. It was withdrawn while the family was
+unimplemented: a guarded `#ifdef` otherwise opened a branch that failed on an
+undeclared identifier when the `#else` beside it would have compiled.
+
 The `<stdatomic.h>` header maps the standard C11 names (`atomic_load`, `atomic_store`, etc.) to these builtins. `_Atomic` objects accessed through
 ordinary operators — assignment, compound assignment, `++`/`--`, and plain
 reads — are lowered to the same atomic instructions, so the builtins are not

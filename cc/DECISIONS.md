@@ -114,7 +114,6 @@ the project's own filter before earning a verdict:
 | Extension | Verdict | Why |
 |---|---|---|
 | SIMD intrinsic headers | **No — fix the predefines** | See below; the blocking is self-inflicted |
-| `__atomic_*` / `__sync_*` | **Not implemented; macro withdrawn** | Alternate spellings of complete C11 atomics — see below |
 | `__auto_type` | **No** | 6 files across four trees; fails minimalism on its own numbers |
 | nested functions / `__label__` | **Never** | GCC-only, Clang refuses it, needs executable-stack trampolines; see the c-torture section |
 | VLA as a struct member | **No** | GCC-only; needs struct layout computed at run time and `offsetof` through it |
@@ -184,17 +183,6 @@ Both architectures return an *offset* from the thread pointer, which the
 sequence then adds — gcc hides this on x86-64 by folding the addition into the
 access as `%fs:(%rax)`.
 
-### `__atomic_*` / `__sync_*` — not implemented, and not claimed
-
-`__atomic_*` and `__sync_*` were the only rows to survive the filter on merit:
-c17's C11 atomics are complete — type system, parser, IR, linearizer, both
-backends, `<stdatomic.h>` — so these builtins would map onto machinery that
-already exists rather than adding a subsystem, and would inherit the same
-lock-free width ceiling (#X1).
-
-They are still not implemented, and c17 does not claim them: it predefines no
-`__GCC_HAVE_SYNC_COMPARE_AND_SWAP_{1,2,4,8}`, so a guarded `#ifdef` does not
-open a door onto a wall when the `#else` beside it would have compiled.
 
 ### Which macros may be withdrawn, and which may not
 
@@ -202,8 +190,9 @@ The distinction is what the macro is a statement *about*, and getting it wrong
 once cost a correct macro:
 
 - **Compiler capability** — `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_N` means "I
-  provide the `__sync_*` builtins". c17 does not, so the macro was false and
-  withdrawing it is the fix.
+  provide the `__sync_*` builtins". While c17 did not, the macro was false and
+  withdrawing it was the fix; the family is implemented now and the macro is
+  back. The rule is the same in both directions.
 - **Target capability** — `__SSE2__` means "this target has SSE2". That is
   architectural baseline for x86-64 (32-bit x86 does *not* define it, which is
   the proof it describes the target rather than the compiler), and gcc defines

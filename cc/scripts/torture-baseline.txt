@@ -635,6 +635,8 @@ compile/20060826-1@-O0
 compile/20060826-1@-O2
 compile/20060904-1@-O0
 compile/20060904-1@-O2
+compile/20061005-1@-O0
+compile/20061005-1@-O2
 compile/20061214-1@-O0
 compile/20061214-1@-O2
 compile/20070121@-O0
@@ -1880,6 +1882,8 @@ compile/pr103376@-O0
 compile/pr103376@-O2
 compile/pr103513@-O0
 compile/pr103513@-O2
+compile/pr103682@-O0
+compile/pr103682@-O2
 compile/pr104327@-O0
 compile/pr104327@-O2
 compile/pr105192@-O0
@@ -3061,6 +3065,8 @@ compile/pr66168@-O0
 compile/pr66168@-O2
 compile/pr67106@-O0
 compile/pr67106@-O2
+compile/pr67143@-O0
+compile/pr67143@-O2
 compile/pr67485@-O0
 compile/pr67485@-O2
 compile/pr67506@-O0
@@ -3189,6 +3195,8 @@ compile/pr81595@-O0
 compile/pr81595@-O2
 compile/pr82052@-O0
 compile/pr82052@-O2
+compile/pr82096@-O0
+compile/pr82096@-O2
 compile/pr82381@-O0
 compile/pr82381@-O2
 compile/pr82389@-O0
@@ -3543,6 +3551,12 @@ compile/symconst@-O0
 compile/symconst@-O2
 compile/sym@-O0
 compile/sym@-O2
+compile/sync-1@-O0
+compile/sync-1@-O2
+compile/sync-2@-O0
+compile/sync-2@-O2
+compile/sync-3@-O0
+compile/sync-3@-O2
 compile/test-flow@-O0
 compile/test-flow@-O2
 compile/test-loop@-O0

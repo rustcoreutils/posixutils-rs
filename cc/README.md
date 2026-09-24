@@ -169,11 +169,6 @@ Supported:
 
 Not yet implemented:
 - assembly peephole optimizations
-- the GCC atomic builtins `__sync_*` and `__atomic_*`. C11 `<stdatomic.h>` is
-  complete; these are the older spellings of machinery c17 already has, which
-  is why they are on this list rather than the one below. c17 no longer
-  predefines `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_*`, so code guarded on it takes
-  its portable branch instead of failing on an undeclared identifier
 
 Will not implement:
 - vector *arithmetic*. `vector_size` gives a type a vector's storage — the size

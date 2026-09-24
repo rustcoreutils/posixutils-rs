@@ -10,7 +10,9 @@
 // support they need
 //
 
-use super::ast::{BinaryOp, CheckedOp, Expr, ExprKind, FpCompare, FpTest, OffsetOfPath, UnaryOp};
+use super::ast::{
+    BinaryOp, CheckedOp, Expr, ExprKind, FpCompare, FpTest, GnuAtomicOp, OffsetOfPath, UnaryOp,
+};
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::float::FloatVal;
@@ -1674,8 +1676,430 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
+            crate::kw::SYNC_FETCH_AND_ADD => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Add, false, false))
+            }
+            crate::kw::SYNC_ADD_AND_FETCH => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Add, true, false))
+            }
+            crate::kw::ATOMIC_FETCH_ADD => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Add, false, true))
+            }
+            crate::kw::ATOMIC_ADD_FETCH => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Add, true, true))
+            }
+            crate::kw::SYNC_FETCH_AND_SUB => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Sub, false, false))
+            }
+            crate::kw::SYNC_SUB_AND_FETCH => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Sub, true, false))
+            }
+            crate::kw::ATOMIC_FETCH_SUB => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Sub, false, true))
+            }
+            crate::kw::ATOMIC_SUB_FETCH => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Sub, true, true))
+            }
+            crate::kw::SYNC_FETCH_AND_AND => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::And, false, false))
+            }
+            crate::kw::SYNC_AND_AND_FETCH => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::And, true, false))
+            }
+            crate::kw::ATOMIC_FETCH_AND => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::And, false, true))
+            }
+            crate::kw::ATOMIC_AND_FETCH => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::And, true, true))
+            }
+            crate::kw::SYNC_FETCH_AND_OR => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Or, false, false))
+            }
+            crate::kw::SYNC_OR_AND_FETCH => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Or, true, false))
+            }
+            crate::kw::ATOMIC_FETCH_OR => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Or, false, true))
+            }
+            crate::kw::ATOMIC_OR_FETCH => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Or, true, true))
+            }
+            crate::kw::SYNC_FETCH_AND_XOR => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Xor, false, false))
+            }
+            crate::kw::SYNC_XOR_AND_FETCH => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Xor, true, false))
+            }
+            crate::kw::ATOMIC_FETCH_XOR => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Xor, false, true))
+            }
+            crate::kw::ATOMIC_XOR_FETCH => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Xor, true, true))
+            }
+            crate::kw::SYNC_FETCH_AND_NAND => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Nand, false, false))
+            }
+            crate::kw::SYNC_NAND_AND_FETCH => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Nand, true, false))
+            }
+            crate::kw::ATOMIC_FETCH_NAND => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Nand, false, true))
+            }
+            crate::kw::ATOMIC_NAND_FETCH => {
+                Some(self.parse_gnu_atomic_rmw(token_pos, GnuAtomicOp::Nand, true, true))
+            }
+            crate::kw::SYNC_BOOL_COMPARE_AND_SWAP => {
+                Some(self.parse_gnu_atomic_cas(token_pos, false))
+            }
+            crate::kw::SYNC_VAL_COMPARE_AND_SWAP => {
+                Some(self.parse_gnu_atomic_cas(token_pos, true))
+            }
+            crate::kw::SYNC_LOCK_TEST_AND_SET => Some((|| {
+                // An acquire exchange. `__sync_*` predates the C11 orders and
+                // this one is documented as acquire rather than sequentially
+                // consistent; c17's exchange is sequentially consistent, which
+                // is stronger and therefore correct.
+                self.expect_special(b'(')?;
+                let ptr = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let val = self.parse_assignment_expr()?;
+                self.skip_trailing_sync_args()?;
+                let result_type = self.pointee_or_int(&ptr);
+                let order = self.seq_cst_literal(token_pos);
+                Ok(Self::typed_expr(
+                    ExprKind::C11AtomicExchange {
+                        ptr: Box::new(ptr),
+                        val: Box::new(val),
+                        order: Box::new(order),
+                    },
+                    result_type,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::SYNC_LOCK_RELEASE => Some((|| {
+                // A release store of zero.
+                self.expect_special(b'(')?;
+                let ptr = self.parse_assignment_expr()?;
+                self.skip_trailing_sync_args()?;
+                let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, token_pos);
+                let order = self.seq_cst_literal(token_pos);
+                Ok(Self::typed_expr(
+                    ExprKind::C11AtomicStore {
+                        ptr: Box::new(ptr),
+                        val: Box::new(zero),
+                        order: Box::new(order),
+                    },
+                    self.types.void_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::SYNC_SYNCHRONIZE => Some((|| {
+                self.expect_special(b'(')?;
+                self.expect_special(b')')?;
+                let order = self.seq_cst_literal(token_pos);
+                Ok(Self::typed_expr(
+                    ExprKind::C11AtomicThreadFence {
+                        order: Box::new(order),
+                    },
+                    self.types.void_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::ATOMIC_LOAD_N => Some((|| {
+                self.expect_special(b'(')?;
+                let ptr = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let order = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                let result_type = self.pointee_or_int(&ptr);
+                Ok(Self::typed_expr(
+                    ExprKind::C11AtomicLoad {
+                        ptr: Box::new(ptr),
+                        order: Box::new(order),
+                    },
+                    result_type,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::ATOMIC_STORE_N => Some((|| {
+                self.expect_special(b'(')?;
+                let ptr = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let val = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let order = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::C11AtomicStore {
+                        ptr: Box::new(ptr),
+                        val: Box::new(val),
+                        order: Box::new(order),
+                    },
+                    self.types.void_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::ATOMIC_EXCHANGE_N => Some((|| {
+                self.expect_special(b'(')?;
+                let ptr = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let val = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let order = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                let result_type = self.pointee_or_int(&ptr);
+                Ok(Self::typed_expr(
+                    ExprKind::C11AtomicExchange {
+                        ptr: Box::new(ptr),
+                        val: Box::new(val),
+                        order: Box::new(order),
+                    },
+                    result_type,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::ATOMIC_COMPARE_EXCHANGE_N => Some((|| {
+                // (ptr, expected, desired, weak, success_order, failure_order)
+                // `expected` is a pointer here, exactly as in the C11 builtin,
+                // so the node is the same one.
+                self.expect_special(b'(')?;
+                let ptr = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let expected = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let desired = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let weak = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let succ_order = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let _fail_order = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                // c17 implements both as strong, so the flag chooses only
+                // which node is built; a weak exchange that never fails
+                // spuriously is a conforming weak exchange.
+                let is_weak = self.eval_const_expr(&weak).is_some_and(|v| v != 0);
+                let (ptr, expected, desired, succ_order) = (
+                    Box::new(ptr),
+                    Box::new(expected),
+                    Box::new(desired),
+                    Box::new(succ_order),
+                );
+                let kind = if is_weak {
+                    ExprKind::C11AtomicCompareExchangeWeak {
+                        ptr,
+                        expected,
+                        desired,
+                        succ_order,
+                    }
+                } else {
+                    ExprKind::C11AtomicCompareExchangeStrong {
+                        ptr,
+                        expected,
+                        desired,
+                        succ_order,
+                    }
+                };
+                Ok(Self::typed_expr(kind, self.types.int_id, token_pos))
+            })()),
+            crate::kw::ATOMIC_TEST_AND_SET => Some((|| {
+                // Exchange 1 into the byte and report whether it was already
+                // set. gcc documents the object as being set to "some
+                // non-zero value"; 1 is the one every target uses.
+                self.expect_special(b'(')?;
+                let ptr = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let order = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                let result_type = self.pointee_or_int(&ptr);
+                let one = Self::typed_expr(ExprKind::IntLit(1), self.types.int_id, token_pos);
+                let swapped = Self::typed_expr(
+                    ExprKind::C11AtomicExchange {
+                        ptr: Box::new(ptr),
+                        val: Box::new(one),
+                        order: Box::new(order),
+                    },
+                    result_type,
+                    token_pos,
+                );
+                let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, token_pos);
+                Ok(Self::typed_expr(
+                    ExprKind::Binary {
+                        op: BinaryOp::Ne,
+                        left: Box::new(swapped),
+                        right: Box::new(zero),
+                    },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::ATOMIC_CLEAR => Some((|| {
+                self.expect_special(b'(')?;
+                let ptr = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let order = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, token_pos);
+                Ok(Self::typed_expr(
+                    ExprKind::C11AtomicStore {
+                        ptr: Box::new(ptr),
+                        val: Box::new(zero),
+                        order: Box::new(order),
+                    },
+                    self.types.void_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::ATOMIC_THREAD_FENCE => Some((|| {
+                self.expect_special(b'(')?;
+                let order = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::C11AtomicThreadFence {
+                        order: Box::new(order),
+                    },
+                    self.types.void_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::ATOMIC_SIGNAL_FENCE => Some((|| {
+                self.expect_special(b'(')?;
+                let order = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::C11AtomicSignalFence {
+                        order: Box::new(order),
+                    },
+                    self.types.void_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::ATOMIC_ALWAYS_LOCK_FREE | crate::kw::ATOMIC_IS_LOCK_FREE => Some((|| {
+                // (size, ptr). Answered at parse time from the size alone,
+                // which is what both spellings reduce to here: c17's atomics
+                // are lock-free exactly at the machine integer widths, and an
+                // over-aligned pointer cannot make a 16-byte object lock-free
+                // when the target has no 16-byte atomic.
+                self.expect_special(b'(')?;
+                let size = self.parse_assignment_expr()?;
+                if self.is_special(b',') {
+                    self.advance();
+                    let _ptr = self.parse_assignment_expr()?;
+                }
+                self.expect_special(b')')?;
+                let lock_free = self
+                    .eval_const_expr(&size)
+                    .is_some_and(|n| matches!(n, 1 | 2 | 4 | 8));
+                Ok(Self::typed_expr(
+                    ExprKind::IntLit(i64::from(lock_free)),
+                    self.types.bool_id,
+                    token_pos,
+                ))
+            })(
+            )),
             _ => None,
         }
+    }
+
+    /// The pointee type of `ptr`, or `int` when it is not a pointer. The
+    /// diagnostic for the non-pointer case comes from the argument check.
+    fn pointee_or_int(&self, ptr: &Expr) -> TypeId {
+        let ptr_type = ptr.typ.unwrap_or(self.types.void_ptr_id);
+        self.types.base_type(ptr_type).unwrap_or(self.types.int_id)
+    }
+
+    /// The `memory_order_seq_cst` constant, for the `__sync_*` builtins, which
+    /// predate the C11 orders and are all sequentially consistent.
+    fn seq_cst_literal(&self, pos: Position) -> Expr {
+        Self::typed_expr(
+            ExprKind::IntLit(crate::ir::MemoryOrder::SeqCst as i64),
+            self.types.int_id,
+            pos,
+        )
+    }
+
+    /// Consume the optional trailing arguments a `__sync_*` builtin accepts.
+    ///
+    /// gcc documents every one of them as taking "an optional list of
+    /// variables protected by the memory barrier", which it then ignores. A
+    /// call that passes them must still parse.
+    fn skip_trailing_sync_args(&mut self) -> ParseResult<()> {
+        while self.is_special(b',') {
+            self.advance();
+            let _ = self.parse_assignment_expr()?;
+        }
+        self.expect_special(b')')?;
+        Ok(())
+    }
+
+    /// `__sync_fetch_and_op` / `__sync_op_and_fetch` and their `__atomic_`
+    /// counterparts.
+    ///
+    /// The `__atomic_` forms carry an explicit memory order; the `__sync_`
+    /// ones are sequentially consistent and instead accept the trailing
+    /// variable list gcc ignores.
+    fn parse_gnu_atomic_rmw(
+        &mut self,
+        token_pos: Position,
+        op: GnuAtomicOp,
+        returns_new: bool,
+        has_order: bool,
+    ) -> ParseResult<Expr> {
+        self.expect_special(b'(')?;
+        let ptr = self.parse_assignment_expr()?;
+        self.expect_special(b',')?;
+        let val = self.parse_assignment_expr()?;
+        let order = if has_order {
+            self.expect_special(b',')?;
+            let o = self.parse_assignment_expr()?;
+            self.expect_special(b')')?;
+            o
+        } else {
+            self.skip_trailing_sync_args()?;
+            self.seq_cst_literal(token_pos)
+        };
+        let result_type = self.pointee_or_int(&ptr);
+        Ok(Self::typed_expr(
+            ExprKind::GnuAtomicRmw {
+                op,
+                ptr: Box::new(ptr),
+                val: Box::new(val),
+                order: Box::new(order),
+                returns_new,
+            },
+            result_type,
+            token_pos,
+        ))
+    }
+
+    /// `__sync_bool_compare_and_swap` and `__sync_val_compare_and_swap`.
+    fn parse_gnu_atomic_cas(
+        &mut self,
+        token_pos: Position,
+        returns_old: bool,
+    ) -> ParseResult<Expr> {
+        self.expect_special(b'(')?;
+        let ptr = self.parse_assignment_expr()?;
+        self.expect_special(b',')?;
+        let expected = self.parse_assignment_expr()?;
+        self.expect_special(b',')?;
+        let desired = self.parse_assignment_expr()?;
+        self.skip_trailing_sync_args()?;
+        let result_type = if returns_old {
+            self.pointee_or_int(&ptr)
+        } else {
+            self.types.int_id
+        };
+        Ok(Self::typed_expr(
+            ExprKind::GnuAtomicCas {
+                ptr: Box::new(ptr),
+                expected: Box::new(expected),
+                desired: Box::new(desired),
+                returns_old,
+            },
+            result_type,
+            token_pos,
+        ))
     }
 
     /// `__builtin_object_size`, the _FORTIFY_SOURCE size query.

@@ -10,7 +10,7 @@
 // support they need
 //
 
-use super::ast::{BinaryOp, CheckedOp, Expr, ExprKind, FpTest, OffsetOfPath, UnaryOp};
+use super::ast::{BinaryOp, CheckedOp, Expr, ExprKind, FpCompare, FpTest, OffsetOfPath, UnaryOp};
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::float::FloatVal;
@@ -209,6 +209,66 @@ impl Parser<'_> {
             )
         };
         Ok(Self::typed_expr(kind(Box::new(arg)), typ, token_pos))
+    }
+
+    /// One of the C99 7.12.14 relations: `__builtin_isgreater` and its five
+    /// siblings.
+    ///
+    /// The operands go through the usual arithmetic conversions, as the
+    /// relational operators they stand for do, so `isless(1, 2.0)` compares
+    /// two `double`s rather than reading an `int` as one. The result is `int`,
+    /// 0 or 1.
+    ///
+    /// The comparison itself is desugared in the linearizer: writing it out as
+    /// `a < b` here would duplicate the operand expressions, and
+    /// `isunordered(f(), g())` must call each function once.
+    fn parse_fp_compare(&mut self, token_pos: Position, cmp: FpCompare) -> ParseResult<Expr> {
+        self.expect_special(b'(')?;
+        let lhs = self.parse_assignment_expr()?;
+        self.expect_special(b',')?;
+        let rhs = self.parse_assignment_expr()?;
+        self.expect_special(b')')?;
+
+        let common = match (lhs.typ, rhs.typ) {
+            (Some(l), Some(r)) => self.types.common_type(l, r),
+            (Some(t), None) | (None, Some(t)) => t,
+            (None, None) => self.types.double_id,
+        };
+        // A relation between two integers is not what these are for, but gcc
+        // accepts it and answers the ordinary comparison; converting to a real
+        // floating type keeps one lowering path rather than two.
+        let common = if self.types.is_float(common) {
+            common
+        } else {
+            self.types.double_id
+        };
+
+        let lhs = self.converted_to(lhs, common, token_pos);
+        let rhs = self.converted_to(rhs, common, token_pos);
+        Ok(Self::typed_expr(
+            ExprKind::FpCompare {
+                cmp,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+            self.types.int_id,
+            token_pos,
+        ))
+    }
+
+    /// `expr` as `typ`, adding a cast only when one is needed.
+    fn converted_to(&mut self, expr: Expr, typ: TypeId, pos: Position) -> Expr {
+        if expr.typ == Some(typ) {
+            return expr;
+        }
+        Self::typed_expr(
+            ExprKind::Cast {
+                cast_type: typ,
+                expr: Box::new(expr),
+            },
+            typ,
+            pos,
+        )
     }
 
     /// A libm call that narrows to its `float` form when its argument is one.
@@ -894,6 +954,22 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
+            crate::kw::BUILTIN_ISGREATER
+            | crate::kw::BUILTIN_ISGREATEREQUAL
+            | crate::kw::BUILTIN_ISLESS
+            | crate::kw::BUILTIN_ISLESSEQUAL
+            | crate::kw::BUILTIN_ISLESSGREATER
+            | crate::kw::BUILTIN_ISUNORDERED => {
+                let cmp = match name_id {
+                    crate::kw::BUILTIN_ISGREATER => FpCompare::Greater,
+                    crate::kw::BUILTIN_ISGREATEREQUAL => FpCompare::GreaterEqual,
+                    crate::kw::BUILTIN_ISLESS => FpCompare::Less,
+                    crate::kw::BUILTIN_ISLESSEQUAL => FpCompare::LessEqual,
+                    crate::kw::BUILTIN_ISLESSGREATER => FpCompare::LessGreater,
+                    _ => FpCompare::Unordered,
+                };
+                Some(self.parse_fp_compare(token_pos, cmp))
+            }
             crate::kw::BUILTIN_FPCLASSIFY => Some((|| {
                 // __builtin_fpclassify(nan, inf, normal, subnormal, zero, x)
                 self.expect_special(b'(')?;
@@ -1148,6 +1224,45 @@ impl Parser<'_> {
                 }
                 self.expect_special(b')')?;
                 Ok(ptr)
+            })()),
+            crate::kw::BUILTIN_EXTRACT_RETURN_ADDR => Some((|| {
+                // Identity on both targets c17 has. The builtin exists for
+                // architectures that encode a flag in the return address --
+                // ARM Thumb sets bit 0 -- and there is nothing to strip on
+                // x86-64 or AArch64, which is exactly what gcc does there.
+                // Returning the argument keeps it evaluated exactly once.
+                self.expect_special(b'(')?;
+                let addr = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(addr)
+            })()),
+            crate::kw::BUILTIN_CLEAR_CACHE => Some((|| {
+                // `__builtin___clear_cache(begin, end)` -- make instructions
+                // written as data visible to the fetcher. A JIT is wrong
+                // without it on AArch64, where the caches are not coherent;
+                // on x86-64 they are, and gcc expands it to nothing.
+                //
+                // Lowered to libgcc's `__clear_cache`, which every target
+                // provides and which is the no-op on x86-64. One spelling,
+                // both targets, and correct on the one where it matters.
+                self.expect_special(b'(')?;
+                let begin = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let end = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                let void_id = self.types.void_id;
+                let void_ptr = self.types.void_ptr_id;
+                let sym = self
+                    .declare_libm_function("__clear_cache", void_id, &[void_ptr, void_ptr])
+                    .ok_or_else(|| ParseError::new("cannot declare __clear_cache", token_pos))?;
+                Ok(Self::typed_expr(
+                    ExprKind::Call {
+                        func: Box::new(Self::typed_expr(ExprKind::Ident(sym), void_id, token_pos)),
+                        args: vec![begin, end],
+                    },
+                    void_id,
+                    token_pos,
+                ))
             })()),
             crate::kw::BUILTIN_PREFETCH => Some((|| {
                 // __builtin_prefetch(addr) or
@@ -1897,22 +2012,37 @@ impl Parser<'_> {
             | "fprintf_unlocked" | "fputs_unlocked" => Some(self.types.int_id),
             "labs" => Some(self.types.long_id),
             "llabs" => Some(self.types.longlong_id),
-            "sqrt" | "copysign" => Some(self.types.double_id),
+            "sqrt" | "copysign" | "fmax" | "fmin" | "pow" | "fma" => Some(self.types.double_id),
+            "sqrtf" | "copysignf" | "fmaxf" | "fminf" | "powf" | "fmaf" => {
+                Some(self.types.float_id)
+            }
+            "sqrtl" | "copysignl" | "fmaxl" | "fminl" | "powl" | "fmal" => {
+                Some(self.types.longdouble_id)
+            }
+            "bcmp" => Some(self.types.int_id),
             "abort" | "exit" | "free" => Some(self.types.void_id),
             // The allocators and `mempcpy` return `void *`; the string family
             // returns `char *`. Answering `int` here would truncate the
             // returned address to 32 bits, which is the bug the `_chk` cases
             // above are commented for.
+            "strdup" => {
+                let char_id = self.types.char_id;
+                Some(self.types.intern(Type {
+                    kind: TypeKind::Pointer,
+                    base: Some(char_id),
+                    ..Default::default()
+                }))
+            }
             "malloc" | "calloc" | "realloc" | "mempcpy" | "memchr" | "alloca" => {
                 Some(self.types.void_ptr_id)
             }
             // `bcopy` predates `memmove` and returns nothing; `index`/`rindex`
             // are the old spellings of `strchr`/`strrchr`.
-            "bcopy" => Some(self.types.void_id),
+            "bcopy" | "bzero" => Some(self.types.void_id),
             "imaxabs" => Some(self.types.long_id),
             "strcspn" | "strspn" => Some(self.types.ulong_id),
-            "strcpy" | "strncpy" | "stpcpy" | "strcat" | "strncat" | "strchr" | "strrchr"
-            | "strstr" | "index" | "rindex" | "strpbrk" => {
+            "strcpy" | "strncpy" | "stpcpy" | "stpncpy" | "strcat" | "strncat" | "strchr"
+            | "strrchr" | "strstr" | "index" | "rindex" | "strpbrk" => {
                 let char_id = self.types.char_id;
                 Some(self.types.intern(Type {
                     kind: TypeKind::Pointer,
@@ -1942,6 +2072,26 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_FFSLL
                 | crate::kw::BUILTIN_SQRT
                 | crate::kw::BUILTIN_COPYSIGN
+                | crate::kw::BUILTIN_COPYSIGNF
+                | crate::kw::BUILTIN_COPYSIGNL
+                | crate::kw::BUILTIN_SQRTF
+                | crate::kw::BUILTIN_SQRTL
+                | crate::kw::BUILTIN_FMAX
+                | crate::kw::BUILTIN_FMAXF
+                | crate::kw::BUILTIN_FMAXL
+                | crate::kw::BUILTIN_FMIN
+                | crate::kw::BUILTIN_FMINF
+                | crate::kw::BUILTIN_FMINL
+                | crate::kw::BUILTIN_POW
+                | crate::kw::BUILTIN_POWF
+                | crate::kw::BUILTIN_POWL
+                | crate::kw::BUILTIN_FMA
+                | crate::kw::BUILTIN_FMAF
+                | crate::kw::BUILTIN_FMAL
+                | crate::kw::BUILTIN_BCMP
+                | crate::kw::BUILTIN_BZERO
+                | crate::kw::BUILTIN_STPNCPY
+                | crate::kw::BUILTIN_STRDUP
                 | crate::kw::BUILTIN_TRAP
                 | crate::kw::BUILTIN_ABORT
                 | crate::kw::BUILTIN_EXIT
@@ -2079,10 +2229,13 @@ impl Parser<'_> {
             "__memset_chk" | "__strcpy_chk" | "__stpcpy_chk" | "__strcat_chk" => (3, false),
             "__memcpy_chk" | "__memmove_chk" | "__mempcpy_chk" | "__strncpy_chk"
             | "__stpncpy_chk" | "__strncat_chk" => (4, false),
-            "strlen" | "abs" | "labs" | "llabs" | "ffs" | "ffsl" | "ffsll" | "sqrt" => (1, false),
-            "strcmp" | "copysign" => (2, false),
+            "strlen" | "abs" | "labs" | "llabs" | "ffs" | "ffsl" | "ffsll" | "sqrt" | "sqrtf"
+            | "sqrtl" => (1, false),
+            "strcmp" | "copysign" | "copysignf" | "copysignl" | "fmax" | "fmaxf" | "fmaxl"
+            | "fmin" | "fminf" | "fminl" | "pow" | "powf" | "powl" | "bzero" => (2, false),
+            "fma" | "fmaf" | "fmal" | "bcmp" | "stpncpy" => (3, false),
             "abort" => (0, false),
-            "exit" | "puts" | "malloc" | "free" | "putchar" | "imaxabs" => (1, false),
+            "exit" | "puts" | "malloc" | "free" | "putchar" | "imaxabs" | "strdup" => (1, false),
             "calloc" | "realloc" | "strcpy" | "stpcpy" | "strcat" | "strchr" | "strrchr"
             | "strstr" | "index" | "rindex" | "strpbrk" | "strcspn" | "strspn" => (2, false),
             "memcmp" | "mempcpy" | "strncpy" | "strncat" | "strncmp" | "memchr" | "bcopy" => {
@@ -2118,7 +2271,9 @@ impl Parser<'_> {
         // same names are unaffected; this path is only taken when the header
         // that would declare them was not included.
         let param_typ = match name {
-            "sqrt" | "copysign" => self.types.double_id,
+            "sqrt" | "copysign" | "fmax" | "fmin" | "pow" | "fma" => self.types.double_id,
+            "sqrtf" | "copysignf" | "fmaxf" | "fminf" | "powf" | "fmaf" => self.types.float_id,
+            "sqrtl" | "copysignl" | "fmaxl" | "fminl" | "powl" | "fmal" => self.types.longdouble_id,
             _ => self.types.ulong_id,
         };
         let params = vec![param_typ; fixed];

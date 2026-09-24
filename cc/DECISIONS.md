@@ -252,6 +252,7 @@ list silenced all six.
 | gcc's own front ends | `compile/pr115143-2`, `compile/pr115143-3` (`-fgimple`, which parses gcc's internal representation rather than C; gcc rejects them without the flag too) |
 | `-fgnu89-inline` semantics | `compile/20021120-1`, `compile/20021120-2`. c17 honours the flag; these also want a redefinition *rejected* without it, which c17 does not diagnose |
 | Another target's backend | `compile/mipscop-1`..`-4` |
+| `__builtin_issignaling` | `ieee/builtin-issignaling-1` and its eight format-specific siblings. No system header uses the builtin, and seven of the nine need a format c17 does not have (`_Float128`, `_Float64x`, `bfloat16`) |
 | Pre-C99 implicit `int` with no dialect request | `compile/pr29201`. C17 6.7.2p2 requires a type specifier and gcc made it an error too; a test that asks, with `-std=gnu89` or `-fpermissive`, is honoured and passes |
 | gcc-specific *behaviour* | `20021127-1` (gcc folds `llabs()` and never calls the program's own definition of it), `20031003-1` (gcc's folder saturates undefined behaviour; aarch64 agrees by hardware accident), `pr46309` (a conditional with one `void` arm, which C17 6.5.15p3 forbids) |
 

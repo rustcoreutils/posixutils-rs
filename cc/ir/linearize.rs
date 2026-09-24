@@ -19,7 +19,7 @@ use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{error, get_all_stream_names, Position};
 use crate::float::FloatVal;
 use crate::parse::ast::{
-    BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpTest, FunctionDef, InitElement,
+    BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef, InitElement,
     OffsetOfPath, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
@@ -1769,6 +1769,12 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Signbitf { arg }
             | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
 
+            // Pure iff both operands are: the relation itself reads nothing
+            // else and raises nothing, which is the point of the family.
+            ExprKind::FpCompare { lhs, rhs, .. } => {
+                self.is_pure_expr(lhs) && self.is_pure_expr(rhs)
+            }
+
             // Pure iff everything it reads is: the class codes are ordinary
             // expressions, not constants, so they count too.
             ExprKind::FpClassify { classes, arg } => {
@@ -2776,6 +2782,44 @@ impl<'a> Linearizer<'a> {
                 let finite = self.emit_is_finite(val, typ, size);
                 let magnitude = self.emit_at_least_normal(val, typ, size);
                 self.emit_bool_combine(Opcode::And, finite, magnitude)
+            }
+        }
+    }
+
+    /// The C99 7.12.14 relations, each yielding 0 or 1.
+    ///
+    /// Every one of them is a comparison c17 already emits. The family exists
+    /// in C because the ordinary relational operators are specified to raise
+    /// `FE_INVALID` on an unordered pair and these are not -- and c17 emits
+    /// the quiet compare (`ucomis*`, `fucomip`) for both, so the two agree
+    /// here and there is nothing further to arrange.
+    ///
+    /// Both operands are linearized before any comparison is emitted, so
+    /// `isgreater(f(), g())` calls each function exactly once.
+    fn linearize_fp_compare(&mut self, cmp: FpCompare, lhs: &Expr, rhs: &Expr) -> PseudoId {
+        let typ = self.expr_type(lhs);
+        let size = self.types.size_bits(typ);
+        let a = self.linearize_expr(lhs);
+        let b = self.linearize_expr(rhs);
+
+        match cmp {
+            FpCompare::Greater => self.emit_fcmp(Opcode::FCmpOGt, a, b, typ, size),
+            FpCompare::GreaterEqual => self.emit_fcmp(Opcode::FCmpOGe, a, b, typ, size),
+            FpCompare::Less => self.emit_fcmp(Opcode::FCmpOLt, a, b, typ, size),
+            FpCompare::LessEqual => self.emit_fcmp(Opcode::FCmpOLe, a, b, typ, size),
+            // Ordered and unequal. `!=` will not do: it is *true* for an
+            // unordered pair, and this must be false for one.
+            FpCompare::LessGreater => {
+                let below = self.emit_fcmp(Opcode::FCmpOLt, a, b, typ, size);
+                let above = self.emit_fcmp(Opcode::FCmpOGt, a, b, typ, size);
+                self.emit_bool_combine(Opcode::Or, below, above)
+            }
+            // `isnan(a) || isnan(b)`, spelled as the self-comparison
+            // `linearize_fp_test` uses for `isnan`.
+            FpCompare::Unordered => {
+                let a_nan = self.emit_fcmp(Opcode::FCmpONe, a, a, typ, size);
+                let b_nan = self.emit_fcmp(Opcode::FCmpONe, b, b, typ, size);
+                self.emit_bool_combine(Opcode::Or, a_nan, b_nan)
             }
         }
     }
@@ -5131,6 +5175,7 @@ impl<'a> Linearizer<'a> {
             }
 
             ExprKind::FpTest { test, arg } => self.linearize_fp_test(*test, arg),
+            ExprKind::FpCompare { cmp, lhs, rhs } => self.linearize_fp_compare(*cmp, lhs, rhs),
 
             ExprKind::FpClassify { classes, arg } => self.linearize_fp_classify(classes, arg),
 
@@ -6047,6 +6092,7 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Signbit { .. }
             | ExprKind::Signbitf { .. }
             | ExprKind::FpTest { .. }
+            | ExprKind::FpCompare { .. }
             | ExprKind::FpClassify { .. }
             | ExprKind::Unreachable
             | ExprKind::FrameAddress { .. }

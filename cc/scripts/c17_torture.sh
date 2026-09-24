@@ -379,6 +379,17 @@ NEEDS_OPTIMIZATION=" execute/20001121-1 compile/20001121-1 execute/20020107-1 \
 # pass, which is why this list is two names rather than a hundred.
 NEEDS_PRE_C99_DIALECT=" compile/pr29201 "
 
+# `__builtin_issignaling`, which distinguishes a signalling NaN from a quiet
+# one. No system header uses it -- `<math.h>` has `issignaling` as its own
+# macro and does not reach for a builtin -- so nothing fails to build without
+# it, and seven of the nine tests need a format c17 does not have at all
+# (`_Float128`, `_Float64x`, `bfloat16`).
+OUT_OF_SCOPE_ISSIGNALING=" ieee/builtin-issignaling-1 \
+ ieee/bfloat16-builtin-issignaling-1 ieee/float128-builtin-issignaling-1 \
+ ieee/float128x-builtin-issignaling-1 ieee/float16-builtin-issignaling-1 \
+ ieee/float32-builtin-issignaling-1 ieee/float32x-builtin-issignaling-1 \
+ ieee/float64-builtin-issignaling-1 ieee/float64x-builtin-issignaling-1 "
+
 # gcc rejects or fails these at every level here.
 GCC_ALSO_FAILS=" execute/980608-1 execute/bcp-1 execute/eeprof-1 execute/pr117432 \
  execute/pr123864 execute/va-arg-7 execute/va-arg-8 compile/dll "
@@ -468,6 +479,9 @@ EOF
     case "$NEEDS_PRE_C99_DIALECT" in
         *" $key "*) echo "SKIP	$tag	implicit int without a dialect request"; return;;
     esac
+    case "$OUT_OF_SCOPE_ISSIGNALING" in
+        *" $key "*) echo "SKIP	$tag	out of scope: __builtin_issignaling"; return;;
+    esac
     local scan skip flags mult stack dgdo
     scan=$(dg_scan "$src" "$opt")
     skip=${scan%%|*}; scan=${scan#*|}
@@ -554,7 +568,7 @@ export OUT_OF_SCOPE_POST_C17 OUT_OF_SCOPE_GNU_ATTR
 export OUT_OF_SCOPE_NESTED_FN OUT_OF_SCOPE_VLA_MEMBER
 export OUT_OF_SCOPE_GCC_BEHAVIOUR OUT_OF_SCOPE_GCC_INTERNAL
 export OUT_OF_SCOPE_GNU89_INLINE OUT_OF_SCOPE_OTHER_TARGET
-export NEEDS_PRE_C99_DIALECT
+export NEEDS_PRE_C99_DIALECT OUT_OF_SCOPE_ISSIGNALING
 
 # ------------------------------------------------------------- collect tests
 # Each line is `<sub-suite>:<path>`, so a worker knows which sub-suite it is in

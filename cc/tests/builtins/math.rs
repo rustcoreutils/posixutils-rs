@@ -677,3 +677,203 @@ fn builtins_math_narrowing_happens_at_every_level() {
         }
     }
 }
+
+// ============================================================================
+// C99 7.12.14 — the unordered-safe relations
+// ============================================================================
+
+/// glibc's `<math.h>` *defines* `isgreater`, `isless`, `isunordered` and their
+/// siblings as these builtins, so a translation unit that includes the header
+/// and uses one did not compile at all before they existed.
+///
+/// Every relation is checked against an ordered pair in both directions and
+/// against a NaN on each side, because the NaN answer is the whole reason C99
+/// has this family: the ordinary relational operators may raise `FE_INVALID`
+/// on an unordered pair and these may not. `islessgreater` is the one that
+/// cannot be spelled as `!=` -- `!=` is *true* for an unordered pair and this
+/// must be false for one.
+const FP_RELATIONS: &str = r#"
+extern void abort(void);
+#define CHECK(n, e) do { if (!(e)) return n; } while (0)
+
+int main(void) {
+    volatile double one = 1.0, two = 2.0, nan = 0.0, zero = 0.0;
+    nan = nan / zero;                    /* a NaN the optimizer cannot fold */
+
+    CHECK(1, __builtin_isgreater(two, one) == 1);
+    CHECK(2, __builtin_isgreater(one, two) == 0);
+    CHECK(3, __builtin_isgreater(one, one) == 0);
+    CHECK(4, __builtin_isgreaterequal(one, one) == 1);
+    CHECK(5, __builtin_isgreaterequal(one, two) == 0);
+    CHECK(6, __builtin_isless(one, two) == 1);
+    CHECK(7, __builtin_isless(two, one) == 0);
+    CHECK(8, __builtin_islessequal(one, one) == 1);
+    CHECK(9, __builtin_islessequal(two, one) == 0);
+    CHECK(10, __builtin_islessgreater(one, two) == 1);
+    CHECK(11, __builtin_islessgreater(one, one) == 0);
+    CHECK(12, __builtin_isunordered(one, two) == 0);
+
+    /* Every relation is false for an unordered pair, on either side... */
+    CHECK(13, __builtin_isgreater(nan, one) == 0);
+    CHECK(14, __builtin_isgreater(one, nan) == 0);
+    CHECK(15, __builtin_isgreaterequal(nan, one) == 0);
+    CHECK(16, __builtin_isless(nan, one) == 0);
+    CHECK(17, __builtin_islessequal(nan, one) == 0);
+    CHECK(18, __builtin_islessgreater(nan, one) == 0);
+    CHECK(19, __builtin_islessgreater(nan, nan) == 0);
+    /* ...and `isunordered` is the one that is true for it. */
+    CHECK(20, __builtin_isunordered(nan, one) == 1);
+    CHECK(21, __builtin_isunordered(one, nan) == 1);
+    CHECK(22, __builtin_isunordered(nan, nan) == 1);
+
+    /* Infinities are ordered, so the relations answer normally. */
+    {
+        volatile double inf = __builtin_inf();
+        CHECK(23, __builtin_isgreater(inf, one) == 1);
+        CHECK(24, __builtin_isless(-inf, one) == 1);
+        CHECK(25, __builtin_isunordered(inf, one) == 0);
+    }
+
+    /* float and long double reach the same lowering through a conversion. */
+    {
+        volatile float f1 = 1.0f, f2 = 2.0f;
+        volatile long double l1 = 1.0L, l2 = 2.0L;
+        CHECK(26, __builtin_isless(f1, f2) == 1);
+        CHECK(27, __builtin_isgreater(l2, l1) == 1);
+        CHECK(28, __builtin_isunordered(f1, f2) == 0);
+    }
+
+    /* The usual arithmetic conversions run first, as they do for `<`. */
+    CHECK(29, __builtin_isless(1, 2.0) == 1);
+    CHECK(30, __builtin_isgreater(3.0f, 2) == 1);
+    return 0;
+}
+"#;
+
+#[test]
+fn builtins_fp_relations() {
+    assert_eq!(
+        compile_and_run("fp_relations", FP_RELATIONS, &["-lm".into()]),
+        0
+    );
+}
+
+/// Each operand is evaluated exactly once. The relation is desugared in the
+/// linearizer rather than written out as `a < b` in the parser precisely so
+/// that `isunordered(f(), g())` does not call either function twice.
+#[test]
+fn builtins_fp_relations_evaluate_each_operand_once() {
+    let code = r#"
+int lhs, rhs;
+double f(void) { lhs++; return 1.0; }
+double g(void) { rhs++; return 2.0; }
+
+int main(void) {
+    if (__builtin_isless(f(), g()) != 1) return 1;
+    if (lhs != 1 || rhs != 1) return 2;
+    /* `isunordered` and `islessgreater` each read both operands twice in the
+       lowering, which is where a duplicated *expression* would show up. */
+    lhs = rhs = 0;
+    if (__builtin_isunordered(f(), g()) != 0) return 3;
+    if (lhs != 1 || rhs != 1) return 4;
+    lhs = rhs = 0;
+    if (__builtin_islessgreater(f(), g()) != 1) return 5;
+    if (lhs != 1 || rhs != 1) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("fp_relations_once", code, &[]), 0);
+}
+
+/// `<math.h>`'s own macros, which are what real code writes. This is the
+/// case that failed to compile: the header expands `isgreater(x, y)` straight
+/// to `__builtin_isgreater(x, y)`.
+#[test]
+fn builtins_math_h_relation_macros() {
+    let code = r#"
+#include <math.h>
+int main(void) {
+    volatile double one = 1.0, two = 2.0, zero = 0.0;
+    volatile double nan = zero / zero;
+    if (!isgreater(two, one)) return 1;
+    if (!isgreaterequal(one, one)) return 2;
+    if (!isless(one, two)) return 3;
+    if (!islessequal(one, one)) return 4;
+    if (!islessgreater(one, two)) return 5;
+    if (!isunordered(nan, one)) return 6;
+    if (isunordered(one, two)) return 7;
+    if (isgreater(nan, one)) return 8;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("math_h_relations", code, &["-lm".into()]),
+        0
+    );
+}
+
+/// The suffixed spellings of the libm aliases, and the memory ones gcc has
+/// under a `__builtin_` name. `bits/floatn.h` reaches for
+/// `__builtin_copysignf`, so its absence broke any file including `<math.h>`
+/// on a target with `_Float128` support advertised.
+#[test]
+fn builtins_libm_and_memory_aliases() {
+    let code = r#"
+int main(void) {
+    if (__builtin_copysign(2.0, -1.0) != -2.0) return 1;
+    if (__builtin_copysignf(2.0f, -1.0f) != -2.0f) return 2;
+    if (__builtin_copysignl(2.0L, -1.0L) != -2.0L) return 3;
+    if (__builtin_sqrtf(16.0f) != 4.0f) return 4;
+    if (__builtin_sqrtl(16.0L) != 4.0L) return 5;
+    if (__builtin_fmax(3.0, 4.0) != 4.0) return 6;
+    if (__builtin_fmaxf(3.0f, 4.0f) != 4.0f) return 7;
+    if (__builtin_fmaxl(3.0L, 4.0L) != 4.0L) return 8;
+    if (__builtin_fmin(3.0, 4.0) != 3.0) return 9;
+    if (__builtin_fminf(3.0f, 4.0f) != 3.0f) return 10;
+    if (__builtin_fminl(3.0L, 4.0L) != 3.0L) return 11;
+    if (__builtin_pow(2.0, 10.0) != 1024.0) return 12;
+    if (__builtin_powf(2.0f, 10.0f) != 1024.0f) return 13;
+    if (__builtin_fma(2.0, 3.0, 4.0) != 10.0) return 14;
+
+    {
+        char d[8] = "abcdefg";
+        __builtin_bzero(d, 8);
+        if (d[0] != 0 || d[7] != 0) return 15;
+    }
+    if (__builtin_bcmp("ab", "ab", 2) != 0) return 16;
+    if (__builtin_bcmp("ab", "ac", 2) == 0) return 17;
+    {
+        char dst[8];
+        if (__builtin_stpncpy(dst, "ab", 3) != dst + 2) return 18;
+        if (dst[0] != 'a' || dst[1] != 'b' || dst[2] != 0) return 19;
+    }
+    if (__builtin_strdup("hi") == 0) return 20;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("libm_memory_aliases", code, &["-lm".into()]),
+        0
+    );
+}
+
+/// `__builtin_extract_return_addr` is the identity on both targets c17 has,
+/// and `__builtin___clear_cache` has to reach libgcc on AArch64, where the
+/// caches are not coherent and a JIT is wrong without it.
+#[test]
+fn builtins_return_address_and_cache() {
+    let code = r#"
+int calls;
+void *bump(void) { calls++; return (void *)0x1234; }
+
+int main(void) {
+    char code[16];
+    __builtin___clear_cache(code, code + 16);
+    if (__builtin_extract_return_addr(bump()) != (void *)0x1234) return 1;
+    if (calls != 1) return 2;
+    if (__builtin_extract_return_addr(__builtin_return_address(0)) == 0) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("return_addr_clear_cache", code, &[]), 0);
+}

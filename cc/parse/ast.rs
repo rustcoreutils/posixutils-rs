@@ -112,6 +112,30 @@ pub enum FpTest {
     IsNormal,
 }
 
+/// Which relation an [`ExprKind::FpCompare`] asks about.
+///
+/// C99 7.12.14 gives these their own macros because the ordinary relational
+/// operators are specified to raise `FE_INVALID` on an unordered pair and
+/// these are not. The distinction is the whole reason they exist, and it is
+/// why they cannot be spelled as a plain `>` in the parser: a program that
+/// tests `isgreater(x, y)` with a NaN in hand is asking not to be trapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpCompare {
+    /// `__builtin_isgreater`
+    Greater,
+    /// `__builtin_isgreaterequal`
+    GreaterEqual,
+    /// `__builtin_isless`
+    Less,
+    /// `__builtin_islessequal`
+    LessEqual,
+    /// `__builtin_islessgreater` -- ordered and unequal, so false for a NaN
+    /// and, unlike `!=`, false for nothing else.
+    LessGreater,
+    /// `__builtin_isunordered` -- at least one operand is a NaN.
+    Unordered,
+}
+
 /// Assignment operators
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignOp {
@@ -662,6 +686,15 @@ pub enum ExprKind {
     FpTest {
         test: FpTest,
         arg: Box<Expr>,
+    },
+
+    /// `__builtin_isgreater` and its five siblings -- the C99 7.12.14
+    /// unordered-safe relations. Desugared in the linearizer, for the same
+    /// reason as [`ExprKind::FpTest`]: each operand is evaluated once.
+    FpCompare {
+        cmp: FpCompare,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
     },
 
     /// `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` -- yields

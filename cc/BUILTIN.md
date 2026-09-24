@@ -122,7 +122,37 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 | `__builtin_flt_rounds()` | Current FP rounding mode |
 | `__builtin_isinf_sign(x)` | +1 for +inf, -1 for -inf, 0 otherwise |
 | `__builtin_sqrt(x)` | Square root. Calls the library `sqrt`, so it needs `-lm`; gcc folds a constant argument and does not |
-| `__builtin_copysign(x, y)` | Magnitude of `x` with the sign of `y`. Calls the library `copysign` |
+| `__builtin_copysign(x, y)`, `copysignf`, `copysignl` | Magnitude of `x` with the sign of `y`. Calls the library function. `bits/floatn.h` reaches for the `f` spelling, so all three are load-bearing |
+| `__builtin_sqrt(x)`, `sqrtf`, `sqrtl` | Square root |
+| `__builtin_fmax(x, y)`, `fmaxf`, `fmaxl`, `__builtin_fmin(x, y)`, `fminf`, `fminl` | Larger and smaller of two values |
+| `__builtin_pow(x, y)`, `powf`, `powl` | `x` raised to `y` |
+| `__builtin_fma(x, y, z)`, `fmaf`, `fmal` | `x * y + z`, rounded once |
+
+### The unordered-safe relations (C99 7.12.14)
+
+| Builtin | Description |
+|---------|-------------|
+| `__builtin_isgreater(x, y)` | `x > y` |
+| `__builtin_isgreaterequal(x, y)` | `x >= y` |
+| `__builtin_isless(x, y)` | `x < y` |
+| `__builtin_islessequal(x, y)` | `x <= y` |
+| `__builtin_islessgreater(x, y)` | Ordered and unequal -- **not** `x != y`, which is *true* for an unordered pair |
+| `__builtin_isunordered(x, y)` | At least one operand is a NaN |
+
+Every one of these is false for an unordered pair except `isunordered`, which
+is the only one true for it. They exist in C because the ordinary relational
+operators are specified to raise `FE_INVALID` on an unordered pair and these
+are not; c17 emits the quiet compare (`ucomis*`, `fucomip`) for both, so the
+two agree and there is nothing further to arrange.
+
+glibc's `<math.h>` **defines** `isgreater`, `isless`, `isunordered` and the
+rest as these builtins, so a translation unit that includes the header and
+uses one did not compile at all without them.
+
+The operands go through the usual arithmetic conversions, as the operators
+they stand for do. Each is evaluated exactly once: the relation is desugared
+in the linearizer, not written out as `a < b` in the parser.
+
 
 ## Stack Introspection
 
@@ -130,6 +160,8 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 |---------|-------------|
 | `__builtin_frame_address(level)` | Frame pointer at `level` (0 = current) |
 | `__builtin_return_address(level)` | Return address at `level` (0 = current) |
+| `__builtin_extract_return_addr(addr)` | The identity on both targets c17 has. It exists for architectures that encode a flag in the return address -- ARM Thumb sets bit 0 -- and there is nothing to strip on x86-64 or AArch64, which is what gcc does there too |
+| `__builtin___clear_cache(begin, end)` | Make instructions written as data visible to the fetcher. Lowered to libgcc's `__clear_cache`, which is the no-op on x86-64, where the caches are coherent, and does the work on AArch64, where a JIT is wrong without it |
 
 ## Complex Numbers
 
@@ -237,6 +269,10 @@ headers rely on.
 | `__builtin_memchr(p, c, n)` | Returns `void *` |
 | `__builtin_index(s, c)`, `__builtin_rindex(s, c)` | The older spellings of `strchr`/`strrchr` |
 | `__builtin_strpbrk(s, set)` | |
+| `__builtin_stpncpy(d, s, n)` | Like `strncpy`, returning the end of what it wrote |
+| `__builtin_strdup(s)` | |
+| `__builtin_bcmp(a, b, n)` | The older spelling of `memcmp` |
+| `__builtin_bzero(p, n)` | The older spelling of `memset(p, 0, n)`; returns `void` |
 | `__builtin_strspn(s, set)`, `__builtin_strcspn(s, set)` | Return a size, not a pointer |
 | `__builtin_imaxabs(x)` | Absolute value, `intmax_t` |
 | `__builtin_bcopy(src, dst, n)` | Returns `void`, and takes the source **first**, unlike `memcpy` |
@@ -307,6 +343,9 @@ system header takes.
 |---------|-------------|
 | `__builtin_clear_padding` | Would have to walk a type to find its padding |
 | `__builtin_setjmp` | Not implemented; the ordinary `setjmp`/`longjmp` are |
+| `__builtin_issignaling` | Distinguishes a signalling NaN from a quiet one. No system header uses it -- `<math.h>` has `issignaling` as its own macro -- so nothing fails to build without it |
+| `__builtin_stack_save`, `__builtin_stack_restore` | The marks gcc puts around a VLA's lifetime. c17 frees a VLA at the end of its block without them |
+| `__builtin_cexpi`, `__builtin_cpow` | Complex libm entry points gcc synthesizes; neither is declared by any header |
 
 `__real__` and `__imag__` used to be listed here and are **implemented** — see
 `#C29` in git log.

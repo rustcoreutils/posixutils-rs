@@ -35,6 +35,19 @@ use super::constfold::at_width;
 use std::cmp::Ordering;
 
 /// The low `width` bits set.
+/// The signed range a `width`-bit value spans.
+///
+/// Not `-(1i128 << (w - 1))`: at `w == 128` that shift yields `i128::MIN`
+/// and negating it overflows, which panics a debug build -- and CI runs the
+/// tests in debug.
+const fn signed_bounds(width: u32) -> (i128, i128) {
+    if width >= 128 {
+        (i128::MIN, i128::MAX)
+    } else {
+        (-(1i128 << (width - 1)), (1i128 << (width - 1)) - 1)
+    }
+}
+
 const fn mask(width: u32) -> u128 {
     if width >= 128 {
         u128::MAX
@@ -340,23 +353,24 @@ impl Range {
                     for (bl, bh) in &b {
                         let lo = (*al).max(*bl);
                         let hi = (*ah).min(*bh);
-                        if lo < hi {
+                        if lo <= hi {
                             hits.push((lo, hi));
                         }
                     }
                 }
                 match hits.len() {
                     0 => Some(Range::empty(self.width)),
-                    1 => Some(Range::half_open(self.width, hits[0].0, hits[0].1)),
-                    // Two pieces that happen to abut are still one interval.
+                    1 => Some(Range::inclusive(self.width, hits[0].0, hits[0].1)),
+                    // Two pieces that meet at the wrap point are still one
+                    // interval, written the way round the circle.
                     2 => {
                         let (mut p, mut q) = (hits[0], hits[1]);
                         if q.0 < p.0 {
                             std::mem::swap(&mut p, &mut q);
                         }
-                        let top = mask(self.width).wrapping_add(1);
+                        let top = mask(self.width);
                         if p.0 == 0 && q.1 == top {
-                            Some(Range::half_open(self.width, q.0, p.1))
+                            Some(Range::inclusive(self.width, q.0, p.1))
                         } else {
                             None
                         }
@@ -367,19 +381,26 @@ impl Range {
         }
     }
 
-    /// The set as one or two non-wrapping half-open `[lo, hi)` pieces over
-    /// `0..=2^width`, for the routines that are easier to write on a line
-    /// than on a circle.
+    /// The set as one or two non-wrapping **inclusive** `[lo, hi]` pieces,
+    /// for the routines that are easier to write on a line than on a circle.
+    ///
+    /// Inclusive rather than half-open because the exclusive end of the
+    /// whole space is `2^width`, which a `u128` cannot hold at width 128:
+    /// `mask(128).wrapping_add(1)` is `0`, so `Full` came back as the empty
+    /// piece `[0, 0)` and a wrapped set produced the inverted `(lo, 0)`.
+    /// `intersect_exact` then silently dropped every piece touching the top
+    /// of the space, turning its "exact or refuse" contract into "too
+    /// small" -- and a caller that narrows to a wrong singleton folds.
     fn pieces(&self) -> Vec<(u128, u128)> {
-        let top = mask(self.width).wrapping_add(1);
+        let top = mask(self.width);
         match self.kind {
             Kind::Empty => Vec::new(),
             Kind::Full => vec![(0, top)],
-            Kind::Half { lo, hi } if lo < hi => vec![(lo, hi)],
+            Kind::Half { lo, hi } if lo < hi => vec![(lo, hi - 1)],
             Kind::Half { lo, hi } => {
                 let mut v = vec![(lo, top)];
                 if hi > 0 {
-                    v.push((0, hi));
+                    v.push((0, hi - 1));
                 }
                 v
             }
@@ -522,8 +543,7 @@ impl Range {
             if corners.iter().all(|c| c.is_some()) {
                 let vals: Vec<i128> = corners.into_iter().map(|c| c.unwrap()).collect();
                 let (lo, hi) = (*vals.iter().min().unwrap(), *vals.iter().max().unwrap());
-                let smin = -(1i128 << (w - 1));
-                let smax = (1i128 << (w - 1)) - 1;
+                let (smin, smax) = signed_bounds(w);
                 if lo >= smin && hi <= smax {
                     return Range::inclusive(
                         w,
@@ -711,10 +731,7 @@ impl Range {
                 let (lo, hi) = if self.signed_view().pieces().len() == 1 && !self.is_full() {
                     (self.signed_min(), self.signed_max())
                 } else {
-                    (
-                        -(1i128 << (self.width - 1)),
-                        (1i128 << (self.width - 1)) - 1,
-                    )
+                    signed_bounds(self.width)
                 };
                 Range::inclusive(
                     to,
@@ -789,25 +806,34 @@ fn allowed_unsigned(mask: u8, other: &Range) -> Range {
 /// gap may report an ordering it cannot actually achieve. That direction
 /// only ever prevents a fold.
 pub(crate) fn possible_orderings(a: &Range, b: &Range, signed: bool) -> u8 {
-    use super::constfold::{CMP_EQ, CMP_GT, CMP_LT};
     if a.is_empty() || b.is_empty() || a.width != b.width {
         return 0;
     }
-    let (amin, amax, bmin, bmax) = if signed {
-        (
+    // Each question is answered in its own domain. Casting the unsigned
+    // hulls to `i128` to share one body is wrong at width 128, where a value
+    // at or above 2^127 casts negative and an achievable ordering is
+    // *missed* -- the unsafe direction, since a caller folds when an
+    // ordering is reported impossible.
+    if signed {
+        hull_orderings(
             a.signed_min(),
             a.signed_max(),
             b.signed_min(),
             b.signed_max(),
         )
     } else {
-        (
-            a.unsigned_min() as i128,
-            a.unsigned_max() as i128,
-            b.unsigned_min() as i128,
-            b.unsigned_max() as i128,
+        hull_orderings(
+            a.unsigned_min(),
+            a.unsigned_max(),
+            b.unsigned_min(),
+            b.unsigned_max(),
         )
-    };
+    }
+}
+
+/// The orderings two min/max hulls admit, over any totally ordered domain.
+fn hull_orderings<T: Ord>(amin: T, amax: T, bmin: T, bmax: T) -> u8 {
+    use super::constfold::{CMP_EQ, CMP_GT, CMP_LT};
     let mut m = 0;
     if amin < bmax {
         m |= CMP_LT;
@@ -1126,7 +1152,7 @@ mod tests {
             assert_eq!(s.single_value(), Some(1));
             assert_eq!(s.union(&f), f);
             assert_eq!(s.intersect_exact(&f), Some(s));
-            assert_eq!(f.signed_min(), -(1i128 << (w - 1)));
+            assert_eq!(f.signed_min(), signed_bounds(w).0);
             let _ = Range::from_const(w, -1);
         }
         assert_eq!(Range::at(0), None);
@@ -1134,8 +1160,6 @@ mod tests {
         assert_eq!(Range::at(32), Some(32));
     }
 
-    /// The IR stores `(int)0xFFFFFFFFu` as `4294967295`, not `-1`, so the one
-    /// bridge from a raw `i128` must normalize rather than truncate.
     /// The most dangerous property in this file, checked by construction:
     /// the result must contain every `x` for which the predicate holds
     /// against *some* member of `other`. A result that is too small proves
@@ -1280,6 +1304,8 @@ mod tests {
         assert_eq!(CMP_GT, !le & CMP_ALL);
     }
 
+    /// The IR stores `(int)0xFFFFFFFFu` as `4294967295`, not `-1`, so the one
+    /// bridge from a raw `i128` must normalize rather than truncate.
     #[test]
     fn from_const_reads_at_the_stated_width() {
         assert_eq!(Range::from_const(32, -1).single_value(), Some(0xFFFF_FFFF));
@@ -1290,5 +1316,109 @@ mod tests {
         assert_eq!(Range::from_const(8, 200).single_value(), Some(200));
         assert_eq!(Range::from_const(8, -56).single_value(), Some(200));
         assert_eq!(Range::from_const(64, -1).signed_min(), -1);
+    }
+
+    /// Width 128 is where every "one past the end" arithmetic breaks: the
+    /// exclusive end of the space is `2^128`, which a `u128` cannot hold,
+    /// and `1i128 << 127` is `i128::MIN` rather than a positive bound. The
+    /// brute-force suite runs at four bits and cannot see any of it.
+    const TOP: u128 = u128::MAX;
+    const SIGN: u128 = 1u128 << 127;
+
+    /// `pieces` must cover the whole space, including its top value.
+    #[test]
+    fn range_pieces_reach_the_top_of_a_128_bit_space() {
+        let full = Range::full(128);
+        assert!(full.contains(TOP));
+        assert!(full.contains(0));
+
+        // A wrapped set whose upper piece runs to the very top.
+        let wrapped = Range::inclusive(128, TOP - 4, 2);
+        assert!(wrapped.contains(TOP));
+        assert!(wrapped.contains(TOP - 4));
+        assert!(wrapped.contains(0));
+        assert!(wrapped.contains(2));
+        assert!(!wrapped.contains(3));
+        assert!(!wrapped.contains(TOP - 5));
+    }
+
+    /// `intersect_exact` is "exact or refuse". Before `pieces` became
+    /// inclusive it silently dropped everything touching the top of the
+    /// space, and a caller that narrows to a wrong singleton folds.
+    #[test]
+    fn range_intersect_exact_is_exact_at_the_top_of_a_128_bit_space() {
+        // Both wrap; the true intersection is the run at the top plus
+        // `{0, 1, 2}`, which meets at the wrap point and so is one interval.
+        let a = Range::inclusive(128, SIGN, 4);
+        let b = Range::inclusive(128, TOP - 15, 2);
+        let got = a.intersect_exact(&b).expect("one interval");
+        for v in [TOP, TOP - 15, 0u128, 1, 2] {
+            assert!(
+                got.contains(v),
+                "{v:#x} is in both arguments and must survive"
+            );
+        }
+        assert!(!got.contains(3), "3 is only in `a`");
+        assert!(!got.contains(TOP - 16), "just below `b` starts");
+
+        // An intersection that really is two disjoint pieces is refused,
+        // not narrowed: a superset is sound but need not be a subset of
+        // either argument, which is what the caller relies on.
+        let c = Range::inclusive(128, TOP - 5, 5);
+        let d = Range::inclusive(128, 3, TOP - 3);
+        assert_eq!(
+            c.intersect_exact(&d),
+            None,
+            "{{3,4,5}} and {{TOP-5..TOP-3}} are two intervals, not one"
+        );
+
+        // Intersecting with the whole space gives the other argument back.
+        assert_eq!(Range::full(128).intersect_exact(&a), Some(a));
+        assert_eq!(a.intersect_exact(&Range::full(128)), Some(a));
+    }
+
+    /// `possible_orderings` is a *superset* of the truth, so a missed
+    /// ordering is the unsafe direction -- a caller folds when an ordering
+    /// is reported impossible. Casting the unsigned hulls through `i128`
+    /// made everything at or above `2^127` look negative.
+    #[test]
+    fn range_possible_orderings_are_unsigned_at_128_bits() {
+        use crate::ir::constfold::{CMP_EQ, CMP_GT, CMP_LT};
+        let full = Range::full(128);
+        let high = Range::singleton(128, SIGN);
+
+        let m = possible_orderings(&full, &high, false);
+        assert!(m & CMP_LT != 0, "0 < 2^127");
+        assert!(m & CMP_EQ != 0, "2^127 is in the full set");
+        assert!(m & CMP_GT != 0, "u128::MAX > 2^127");
+
+        // The signed reading of the same pair is a different question and
+        // must still be answered in its own domain.
+        let ms = possible_orderings(&full, &high, true);
+        assert!(ms & CMP_LT != 0 || ms & CMP_EQ != 0 || ms & CMP_GT != 0);
+
+        // Two disjoint unsigned runs, both above the sign bit.
+        let lo = Range::inclusive(128, SIGN, SIGN + 3);
+        let hi = Range::inclusive(128, SIGN + 10, SIGN + 20);
+        let m = possible_orderings(&lo, &hi, false);
+        assert_eq!(
+            m, CMP_LT,
+            "every member of `lo` is below every member of `hi`"
+        );
+    }
+
+    /// The signed bounds of a 128-bit value, which `-(1i128 << 127)`
+    /// computes by overflowing -- a debug build panics, and CI is debug.
+    #[test]
+    fn range_signed_bounds_do_not_overflow_at_128_bits() {
+        assert_eq!(signed_bounds(128), (i128::MIN, i128::MAX));
+        assert_eq!(signed_bounds(32), (i32::MIN as i128, i32::MAX as i128));
+        assert_eq!(signed_bounds(1), (-1, 0));
+
+        // The two routines that used to spell it inline.
+        let wide = Range::full(128);
+        let _ = wide.mul(&Range::singleton(128, 3));
+        let _ = Range::full(64).sext(128);
+        let _ = Range::inclusive(64, 1, 5).sext(128);
     }
 }

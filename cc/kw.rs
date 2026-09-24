@@ -1092,6 +1092,33 @@ mod tests {
     }
 
     #[test]
+    /// Every id names the string it was defined from, for the whole table.
+    ///
+    /// The ids used to be counted by a macro that recursed once per entry;
+    /// they are looked up by spelling now, and this is the invariant that
+    /// swap has to preserve. `id_of` panics at compile time for a spelling
+    /// that is absent, and `test_no_duplicate_strings` rules out a spelling
+    /// that appears twice -- so the remaining way to get this wrong is for an
+    /// id to be off by one against the interned table, which this catches for
+    /// every entry rather than the dozen `test_keyword_ids_deterministic`
+    /// samples.
+    #[test]
+    fn test_every_id_matches_its_string() {
+        let table = StringTable::new();
+        for (i, &s) in KEYWORD_STRINGS.iter().enumerate() {
+            let id = id_of(s);
+            assert_eq!(
+                id,
+                StringId(i as u32 + 1),
+                "'{s}' is at index {i} but id_of answered {id:?}"
+            );
+            assert_eq!(table.get(id), s, "interned table disagrees for '{s}'");
+        }
+        assert_eq!(KEYWORD_STRINGS.len(), KEYWORD_COUNT);
+        assert_eq!(KEYWORD_TAGS.len(), KEYWORD_COUNT);
+    }
+
+    #[test]
     fn test_no_duplicate_strings() {
         let mut seen = HashSet::new();
         for (i, &s) in KEYWORD_STRINGS.iter().enumerate() {

@@ -1950,22 +1950,28 @@ impl TypeTable {
 
     /// The largest object c17 can describe, in bytes.
     ///
-    /// An object is addressed by pointer arithmetic, and C17 6.5.6p9 makes the
-    /// difference of two pointers into one object a `ptrdiff_t` -- so an object
-    /// whose size does not fit a signed 64-bit value cannot be indexed from
-    /// end to end whatever else is true of it. That, and not an accident of the
-    /// implementation, is the limit.
+    /// Two bounds apply and this is the tighter of them, which is the one a
+    /// diagnostic should name:
     ///
-    /// It used to be `u32::MAX / 8`, which is 512 MB and had nothing to do with
-    /// C: it was the largest object whose size in *bits* fitted the `u32` that
-    /// [`Self::size_bits`] answers in. Object sizes are counted in bytes now,
-    /// by [`Self::size_bytes`], and that ceiling went with the unit.
+    /// - **C's own**, `i64::MAX`: an object is addressed by pointer
+    ///   arithmetic, and C17 6.5.6p9 makes the difference of two pointers into
+    ///   one object a `ptrdiff_t`, so an object larger than that cannot be
+    ///   indexed from end to end whatever else is true of it.
+    /// - **c17's**, `u64::MAX / 8`, which is a quarter of it and therefore the
+    ///   operative one: struct layout accumulates in *bits*, because a
+    ///   bit-field's position is only expressible there, so a member list
+    ///   whose total passes `u64::MAX` bits has no layout to compute. The
+    ///   accumulation saturates into this rather than wrapping past it.
     ///
-    /// What remains is `u64::MAX / 8`: struct layout runs in bits, because a
-    /// bit-field's position is only expressible there, so a member list whose
-    /// total passes that has no layout to compute. It is two thousand times
-    /// the old bound and a real one -- the accumulation saturates into it
-    /// rather than wrapping past it.
+    /// The tighter bound is applied to arrays as well as aggregates, although
+    /// an array alone is sized in bytes and could go further, so that one
+    /// number appears in one message.
+    ///
+    /// It used to be `u32::MAX / 8` -- 512 MB, two thousand times smaller, and
+    /// nothing to do with C: it was the largest object whose size in *bits*
+    /// fitted the `u32` that [`Self::size_bits`] answers in. Object sizes are
+    /// counted in bytes now, by [`Self::size_bytes`], and that ceiling went
+    /// with the unit.
     pub const MAX_OBJECT_BYTES: usize = (u64::MAX / 8) as usize;
 
     /// Get the size of a type in bytes

@@ -3689,21 +3689,31 @@ fn diagnostics_largest_describable_object_is_accepted() {
         compile_expect_ok(name, src);
     }
 
-    // And the sizes are the ones gcc reports. These all sit under the bound,
-    // so they were right before the diagnostic existed too; the assertion is
-    // here so that moving the bound cannot quietly move an answer with it.
+    // And the sizes are the ones gcc reports, so that moving the bound cannot
+    // quietly move an answer with it.
+    //
+    // Everything past the old cap is asked of a *type*, not of an object.
+    // `sizeof` needs no storage, and defining the objects instead made the
+    // program ask its loader for gigabytes of zero-fill: a `char b[2000000000]`
+    // here is `.zerofill` of 2 GB in the Mach-O, and macOS refuses to map it
+    // ("dyld cache not loaded: syscall to map cache into shared region
+    // failed") where Linux's overcommit had hidden the cost. The one object
+    // that is defined is the size the old bound allowed, which is what pins
+    // that the bound moved without the answers moving.
     assert_eq!(
         compile_and_run(
             "object_sizes_are_exact",
             "char a[536870911];\n\
-             char b[2000000000L];\n\
-             typedef char Huge[2000000000000000000L];\n\
              struct S { char x[100000000]; char y[100000000]; } s;\n\
+             typedef char PastOldCap[2000000000L];\n\
+             typedef char Huge[2000000000000000000L];\n\
+             typedef struct { char x[4000000000L]; char y[4000000000L]; } BigSum;\n\
              int main(void) {\n\
              if (sizeof a != 536870911UL) return 1;\n\
              if (sizeof s != 200000000UL) return 2;\n\
-             if (sizeof b != 2000000000UL) return 3;\n\
+             if (sizeof (PastOldCap) != 2000000000UL) return 3;\n\
              if (sizeof (Huge) != 2000000000000000000UL) return 4;\n\
+             if (sizeof (BigSum) != 8000000000UL) return 5;\n\
              return 0;\n\
              }\n",
             &[],

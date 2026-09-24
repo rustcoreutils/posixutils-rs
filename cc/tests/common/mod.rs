@@ -575,8 +575,6 @@ pub fn compile_expect_ok(name: &str, content: &str) {
 /// `compile_expect_error` nor `compile_expect_ok` can express that: the first
 /// demands a non-zero exit, the second says nothing about stderr.
 pub fn compile_expect_warning(name: &str, content: &str, expected: &str) {
-    compile_expect_warning_with(name, content, &[]);
-    let _ = expected;
     compile_expect_warning_named(name, content, expected, &[]);
 }
 

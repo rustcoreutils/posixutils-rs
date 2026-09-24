@@ -52,19 +52,43 @@ pub const DECL_START: u32 =
 
 // Keyword definition macros
 
-/// Helper macro: recursive counter that assigns sequential StringId values starting from 1.
-/// Entries named `_` are anonymous — they get interned and tagged but no `pub const` is emitted.
-macro_rules! define_ids {
-    // Base case: no more entries
-    ($counter:expr; ) => {};
-    // Anonymous entry (name is `_`): skip const, just recurse
-    ($counter:expr; (_, $str:literal, $tags:expr) $(, ($name_rest:tt, $str_rest:literal, $tags_rest:expr))* $(,)? ) => {
-        define_ids!($counter + 1; $(($name_rest, $str_rest, $tags_rest)),*);
-    };
-    // Named entry: emit pub const, then recurse
-    ($counter:expr; ($name:ident, $str:literal, $tags:expr) $(, ($name_rest:tt, $str_rest:literal, $tags_rest:expr))* $(,)? ) => {
-        pub const $name: StringId = StringId($counter);
-        define_ids!($counter + 1; $(($name_rest, $str_rest, $tags_rest)),*);
+/// Are these two strings equal? A `const fn`, so [`id_of`] can run at compile
+/// time; `str` has no `const` comparison of its own.
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The `StringId` of a keyword, found by its spelling at compile time.
+///
+/// Ids are one-based: zero is reserved, so a `StringId` is never the default.
+const fn id_of(s: &str) -> StringId {
+    let mut i = 0;
+    while i < KEYWORD_STRINGS.len() {
+        if str_eq(KEYWORD_STRINGS[i], s) {
+            return StringId(i as u32 + 1);
+        }
+        i += 1;
+    }
+    panic!("keyword has no entry in KEYWORD_STRINGS")
+}
+
+/// Helper macro: one `pub const` per named entry. `_` is anonymous — it is
+/// interned and tagged, but names nothing.
+macro_rules! define_id {
+    (_, $str:literal) => {};
+    ($name:ident, $str:literal) => {
+        pub const $name: StringId = id_of($str);
     };
 }
 
@@ -73,12 +97,21 @@ macro_rules! define_ids {
 /// - One `pub const NAME: StringId` per named keyword (entries with `_` are anonymous)
 /// - KEYWORD_STRINGS: array of string literals (all entries)
 /// - KEYWORD_TAGS: array of tag bitmasks (all entries)
+///
+/// Each id is looked up by spelling rather than counted by a macro that
+/// recurses once per entry. The counting version built the *n*th id as the
+/// expression `((((1u32 + 1) + 1) + 1) ...)`, nested once per preceding
+/// keyword, because a substituted `$counter:expr` is one opaque node rather
+/// than a flat token run. At around seven hundred keywords that made **rustc
+/// itself** overflow its stack parsing this file -- a SIGSEGV in
+/// `parse_expr_assoc_with` on aarch64, where the frames are wider, while
+/// x86-64 still fit. The table has to be free to grow.
 macro_rules! define_keywords {
     ( $( ($name:tt, $str:literal, $tags:expr) ),* $(,)? ) => {
         pub const KEYWORD_COUNT: usize = [ $( $str ),* ].len();
-        define_ids!(1u32; $( ($name, $str, $tags) ),* );
         pub(crate) const KEYWORD_STRINGS: [&str; KEYWORD_COUNT] = [ $( $str ),* ];
         pub(crate) const KEYWORD_TAGS: [u32; KEYWORD_COUNT] = [ $( $tags ),* ];
+        $( define_id!($name, $str); )*
     };
 }
 

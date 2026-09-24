@@ -9,7 +9,7 @@
 // c17 - A POSIX C17 compiler
 //
 
-#![recursion_limit = "1024"]
+#![recursion_limit = "512"]
 
 mod abi;
 mod arch;

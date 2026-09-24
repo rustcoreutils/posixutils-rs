@@ -331,7 +331,7 @@ impl Parser<'_> {
                 return Ok(Some(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
                         symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
-                        fn_effect: self.pending_fn_attrs.effect,
+                        fn_effect: self.take_pending_fn_effect(),
                         symbol,
                         typ,
                         storage_class: specs.storage_class,
@@ -570,6 +570,11 @@ impl Parser<'_> {
                 };
                 let symbol = symbol_id.expect("function declaration must have symbol");
                 self.settle_declaration_facts(name, specs.storage_class);
+                // Consumed even though the value used is the per-name
+                // accumulation: what matters is that it stops being pending,
+                // or the declarators `parse_remaining_declarators` builds
+                // after this one inherit this one's attribute.
+                self.take_pending_fn_effect();
                 let mut first_declarator = vec![InitDeclarator {
                     symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                     fn_effect: all_fn_attrs.effect,
@@ -968,7 +973,7 @@ impl Parser<'_> {
         self.settle_declaration_facts(name, storage_class);
         declarators.push(InitDeclarator {
             symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
-            fn_effect: self.pending_fn_attrs.effect,
+            fn_effect: self.take_pending_fn_effect(),
             symbol,
             typ: var_type_id,
             storage_class,
@@ -1116,7 +1121,7 @@ impl Parser<'_> {
             self.settle_declaration_facts(decl_name, storage_class);
             declarators.push(InitDeclarator {
                 symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
-                fn_effect: self.pending_fn_attrs.effect,
+                fn_effect: self.take_pending_fn_effect(),
                 symbol: decl_symbol.expect("symbol should be bound"),
                 typ: decl_type,
                 storage_class,

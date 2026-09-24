@@ -36,14 +36,7 @@ use super::escape::EscapeInfo;
 use super::memloc::{AddrMap, MemBase};
 use super::{Function, Module, Opcode};
 use crate::parse::ast::MemEffect;
-use std::collections::HashMap;
-
-/// How many times the call-graph fixed point may sweep the module.
-///
-/// Each sweep can only move a function *up* the three-point lattice, so two
-/// full sweeps past the last change would do; the bound is against a
-/// pathological module rather than against the algorithm.
-const MAX_SWEEPS: usize = 16;
+use std::collections::{HashMap, VecDeque};
 
 /// Every function's effect, by name.
 pub(crate) struct EffectTable {
@@ -72,7 +65,7 @@ impl EffectTable {
 
         // Which functions the fixed point is allowed to move, and where each
         // one starts.
-        let mut inferable: Vec<&Function> = Vec::new();
+        let mut inferable: Vec<Summary> = Vec::new();
         for f in &module.functions {
             if f.declared_effect != MemEffect::Unknown {
                 // A promise outranks anything a body could show, and pins
@@ -87,26 +80,122 @@ impl EffectTable {
             // Optimistic, which is what makes recursion converge: a cycle
             // with nothing dirty in it stays clean.
             effects.insert(f.name.clone(), MemEffect::Const);
-            inferable.push(f);
+            inferable.push(summarize(f));
         }
 
-        for _ in 0..MAX_SWEEPS {
-            let mut moved = false;
-            for f in &inferable {
-                let e = body_effect(f, &effects);
-                let cur = effects.get(&f.name).copied().unwrap_or(MemEffect::Unknown);
-                let next = cur.join(e);
-                if next != cur {
-                    effects.insert(f.name.clone(), next);
-                    moved = true;
+        solve(&inferable, &mut effects);
+
+        if std::env::var_os("C17_DBG_EFFECTS").is_some() {
+            let mut v: Vec<_> = effects.iter().collect();
+            v.sort();
+            eprintln!("DBG effects {:?}", v);
+        }
+        EffectTable { effects }
+    }
+}
+
+/// What one function's body says, with its calls left as names.
+///
+/// Summarized once. The body scan is the expensive part -- it rebuilds the
+/// escape and address maps -- and nothing in it depends on what the fixed
+/// point currently believes, so re-running it per sweep was both slow and
+/// the reason the sweep count had to be capped at all.
+struct Summary {
+    name: String,
+    /// Everything the body does that is not a call.
+    local: MemEffect,
+    /// Every name it calls directly.
+    callees: Vec<String>,
+}
+
+fn summarize(f: &Function) -> Summary {
+    let esc = EscapeInfo::analyze(f);
+    if esc.gave_up() {
+        return Summary {
+            name: f.name.clone(),
+            local: MemEffect::Unknown,
+            callees: Vec::new(),
+        };
+    }
+    let am = AddrMap::build(f);
+    let mut local = MemEffect::Const;
+    let mut callees: Vec<String> = Vec::new();
+
+    for bb in &f.blocks {
+        for insn in &bb.insns {
+            if insn.op == Opcode::Call {
+                match insn.func_name.as_deref() {
+                    Some(n) => {
+                        if !callees.iter().any(|c| c == n) {
+                            callees.push(n.to_string());
+                        }
+                    }
+                    // An indirect call names no callee at all.
+                    None => local = MemEffect::Unknown,
                 }
+                continue;
             }
-            if !moved {
+            local = local.join(insn_effect(f, &esc, &am, insn));
+        }
+    }
+    Summary {
+        name: f.name.clone(),
+        local,
+        callees,
+    }
+}
+
+/// Raise each function to the join of its own body and its callees, to a
+/// fixed point.
+///
+/// A worklist rather than a sweep, and the difference is not only speed. A
+/// sweep in `module.functions` order propagates dirtiness one caller per
+/// pass, so a capped sweep count silently *kept the optimistic seed* for
+/// anything deeper than the cap -- a chain of seventeen static functions
+/// whose last one wrote a global came out `Const` at the top, and a store
+/// across a call to it was forwarded. This needs no cap: each cell can rise
+/// at most twice, over a three-point lattice, so the queue drains.
+fn solve(inferable: &[Summary], effects: &mut HashMap<String, MemEffect>) {
+    // Who has to be re-examined when a name gets dirtier.
+    let mut callers: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, s) in inferable.iter().enumerate() {
+        for c in &s.callees {
+            let e = callers.entry(c.as_str()).or_default();
+            if !e.contains(&i) {
+                e.push(i);
+            }
+        }
+    }
+
+    let mut work: VecDeque<usize> = (0..inferable.len()).collect();
+    let mut queued: Vec<bool> = vec![true; inferable.len()];
+    while let Some(i) = work.pop_front() {
+        queued[i] = false;
+        let s = &inferable[i];
+        let mut e = s.local;
+        for c in &s.callees {
+            e = e.join(
+                effects
+                    .get(c.as_str())
+                    .copied()
+                    .unwrap_or(MemEffect::Unknown),
+            );
+            if e == MemEffect::Unknown {
                 break;
             }
         }
-
-        EffectTable { effects }
+        let cur = effects.get(&s.name).copied().unwrap_or(MemEffect::Unknown);
+        let next = cur.join(e);
+        if next == cur {
+            continue;
+        }
+        effects.insert(s.name.clone(), next);
+        for &c in callers.get(s.name.as_str()).into_iter().flatten() {
+            if !queued[c] {
+                queued[c] = true;
+                work.push_back(c);
+            }
+        }
     }
 }
 
@@ -122,32 +211,12 @@ fn is_inferable(f: &Function) -> bool {
     f.is_static && !f.symbol_attrs.weak && !f.blocks.is_empty()
 }
 
-/// The effect of `f`'s body, given what is currently believed of its callees.
-fn body_effect(f: &Function, effects: &HashMap<String, MemEffect>) -> MemEffect {
-    let esc = EscapeInfo::analyze(f);
-    if esc.gave_up() {
-        return MemEffect::Unknown;
-    }
-    let am = AddrMap::build(f);
-    let mut out = MemEffect::Const;
-
-    for bb in &f.blocks {
-        for insn in &bb.insns {
-            out = out.join(insn_effect(f, &esc, &am, insn, effects));
-            if out == MemEffect::Unknown {
-                return out;
-            }
-        }
-    }
-    out
-}
-
+/// What one instruction that is not a call does to observable memory.
 fn insn_effect(
     f: &Function,
     esc: &EscapeInfo,
     am: &AddrMap,
     insn: &super::Instruction,
-    effects: &HashMap<String, MemEffect>,
 ) -> MemEffect {
     match insn.op {
         // Touching a local this function never let out is invisible to the
@@ -163,13 +232,8 @@ fn insn_effect(
             }
         }
 
-        // A direct call is as dirty as its callee; an indirect one names no
-        // callee at all.
-        Opcode::Call => match insn.func_name.as_deref() {
-            Some(name) => effects.get(name).copied().unwrap_or(MemEffect::Unknown),
-            // An indirect call names no callee at all.
-            None => MemEffect::Unknown,
-        },
+        // Calls are `Summary::callees`, resolved by the fixed point.
+        Opcode::Call => MemEffect::Const,
 
         _ if !insn.op.may_access_memory() => MemEffect::Const,
 

@@ -45,7 +45,13 @@ use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 use crate::types::{TypeModifiers, TypeTable};
 use std::collections::{HashMap, HashSet};
 
-/// How many sweeps the dead-at-exit fixed point may take.
+/// How many sweeps the dead-at-exit fixed point may take before it gives up.
+///
+/// Exhausting this is *not* a licence to use what it has: the analysis
+/// starts with everything dead and only removes, so an unfinished run is an
+/// over-approximation of "dead", and acting on one deletes stores that are
+/// read. Running out means answering "nothing is dead at exit", which is
+/// what `dead_locals_at_block_end` does.
 const MAX_SWEEPS: usize = 64;
 
 /// Delete stores nothing can observe. Returns whether anything changed.
@@ -347,6 +353,7 @@ fn dead_locals_at_block_end(
         dead_in.insert(bb.id, candidates.clone());
     }
 
+    let mut converged = false;
     for _ in 0..MAX_SWEEPS {
         let mut moved = false;
         for bb in func.blocks.iter().rev() {
@@ -370,7 +377,15 @@ fn dead_locals_at_block_end(
             }
         }
         if !moved {
+            converged = true;
             break;
+        }
+    }
+    if !converged {
+        // An unfinished greatest fixed point still says "dead" for things
+        // that are read. Answer nothing rather than something wrong.
+        for bb in &func.blocks {
+            out.insert(bb.id, HashSet::new());
         }
     }
     out

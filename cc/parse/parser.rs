@@ -1405,6 +1405,22 @@ impl<'a> Parser<'a> {
         Ok(labels)
     }
 
+    /// The memory effect pending for the declarator being built, consumed.
+    ///
+    /// Consumed, exactly as `pending_symbol_attrs` is taken, and for the same
+    /// reason: `extern int p(void) __attribute__((pure)), q(void);` writes
+    /// the attribute on `p`, and leaving it pending gave it to `q` as well.
+    /// A callee wrongly believed to write nothing is a miscompile at the
+    /// *call site*, so this fails safe -- a later declarator gets `Unknown`
+    /// even where gcc would spread a declaration-level attribute across all
+    /// of them, which costs precision and nothing else.
+    pub(super) fn take_pending_fn_effect(&mut self) -> crate::parse::ast::MemEffect {
+        std::mem::replace(
+            &mut self.pending_fn_attrs.effect,
+            crate::parse::ast::MemEffect::Unknown,
+        )
+    }
+
     /// Accumulate the symbol-emission attributes from one attribute list.
     pub(super) fn merge_symbol_attrs(&mut self, attrs: &AttributeList) {
         let found = attrs.symbol_attrs();

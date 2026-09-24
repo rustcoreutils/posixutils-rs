@@ -15,7 +15,7 @@
 // if the pass forwards one byte it should not have.
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_two_units};
 
 fn at_o2(name: &str, code: &str) -> i32 {
     compile_and_run(name, code, &["-O2".to_string()])
@@ -690,4 +690,86 @@ void jump(void) { longjmp(jb, 1); }
 "#;
     assert_eq!(at_o2("memopt_dse_setjmp", code), 0);
     assert_eq!(at_o2_no_inline("memopt_dse_setjmp_ni", code), 0);
+}
+
+/// An attribute belongs to the declarator it is written on. `extern int
+/// p(void) __attribute__((pure)), q(void);` promises nothing about `q`, and
+/// a callee wrongly believed to write nothing is a miscompile at the *call
+/// site* rather than anywhere near the declaration.
+///
+/// Two units, because that is the only shape where the promise is
+/// load-bearing: a function *defined* in the same unit is judged by its
+/// body, so the leak is overwritten before anything can act on it.
+#[test]
+fn memopt_a_purity_attribute_does_not_leak_to_the_next_declarator() {
+    let caller = r#"
+int g;
+extern int pure_fn(void) __attribute__((pure)), dirty_fn(void);
+extern int a_fn(void), b_fn(void) __attribute__((pure));
+
+int probe_dirty(void) { g = 1; dirty_fn(); return g; }
+int probe_a(void)     { g = 1; a_fn();     return g; }
+int probe_pure(void)  { g = 7; pure_fn();  return g; }
+int probe_b(void)     { g = 9; b_fn();     return g; }
+"#;
+    let callee = r#"
+extern void abort(void);
+extern int g;
+extern int probe_dirty(void), probe_a(void), probe_pure(void), probe_b(void);
+
+int pure_fn(void)  { return g; }
+int b_fn(void)     { return g; }
+int dirty_fn(void) { g = 42; return 0; }
+int a_fn(void)     { g = 43; return 0; }
+
+int main(void) {
+    if (probe_dirty() != 42) abort();   /* `pure` was on pure_fn, not on this */
+    if (probe_a() != 43) abort();       /* nor on a_fn, which precedes it */
+    if (probe_pure() != 7) abort();
+    if (probe_b() != 9) abort();
+    return 0;
+}
+"#;
+    for opt in ["-O2", "-O1"] {
+        assert_eq!(
+            compile_and_run_two_units("memopt_attr_leak", caller, callee, &[opt.to_string()],),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// The call-graph fixed point starts every inferable function optimistically
+/// at `Const`, so stopping before it converges *keeps the optimistic seed* --
+/// a function that transitively writes a global comes out clean and a store
+/// across a call to it is forwarded. A capped sweep count propagated
+/// dirtiness one caller per pass, so the cap was exactly the chain depth at
+/// which the answer went wrong.
+#[test]
+fn memopt_a_deep_call_chain_still_reaches_its_callee() {
+    // Declared first, defined caller-before-callee: the order in which a
+    // sweep makes the least progress per pass.
+    let mut code = String::from("extern void abort(void);\nint g;\n");
+    const DEPTH: usize = 40;
+    for i in 1..=DEPTH {
+        code.push_str(&format!(
+            "__attribute__((noinline)) static int f{i}(void);\n"
+        ));
+    }
+    for i in 1..=DEPTH {
+        if i == DEPTH {
+            code.push_str(&format!(
+                "__attribute__((noinline)) static int f{i}(void) {{ g = 42; return 0; }}\n"
+            ));
+        } else {
+            let n = i + 1;
+            code.push_str(&format!(
+                "__attribute__((noinline)) static int f{i}(void) {{ return f{n}(); }}\n"
+            ));
+        }
+    }
+    code.push_str("int main(void) { g = 1; f1(); if (g != 42) abort(); return 0; }\n");
+
+    assert_eq!(at_o2("memopt_deep_chain", &code), 0);
+    assert_eq!(at_o2_no_inline("memopt_deep_chain_ni", &code), 0);
 }

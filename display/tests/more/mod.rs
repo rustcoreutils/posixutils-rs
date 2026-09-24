@@ -1308,6 +1308,31 @@ fn test_audit_next_file_error_affects_exit_status() {
 // test cannot be added here because `more --test` blocks in its interactive
 // loop whenever a command lands mid-list rather than running past the end.
 
+/// Run `path` until it is not `ETXTBSY`, so the caller can hand it to `exec`.
+///
+/// `execve` refuses a file any process holds open for writing. This test
+/// writes its own editor and has `more` exec it moments later, and every
+/// other test in this binary is forking the whole time -- a `fork` during
+/// the write copies the descriptor into the child, where `O_CLOEXEC` only
+/// closes it at `exec`, not at `fork`. Competing load stretches that gap.
+///
+/// `more` reports such a failure honestly and exits 1, which is correct of
+/// it and useless to a test that wanted to ask about argument order. So the
+/// wait is here rather than a retry there.
+fn wait_until_executable(path: &std::path::Path) {
+    for attempt in 0..10 {
+        match std::process::Command::new(path).arg("--probe").status() {
+            Ok(_) => return,
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(10 << attempt.min(4)));
+            }
+            // Anything else is this test's own setup being wrong, and the
+            // assertions below will say so far more clearly than here.
+            Err(_) => return,
+        }
+    }
+}
+
 /// Audit #10/#11 / POSIX 107617-107620: the editor is chosen by the *last
 /// pathname component* of EDITOR, and vi/ex are invoked with `-c linenumber`.
 #[test]
@@ -1315,9 +1340,12 @@ fn test_audit_invoke_editor_arguments() {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
 
-    let dir = std::env::temp_dir().join("posixutils_more_audit_editor");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    // A *unique* directory, not a fixed path under the system temporary
+    // directory: two concurrent runs of this suite otherwise share it, and
+    // whichever starts second removes the first one's recording between the
+    // editor writing it and this test reading it back.
+    let dir = plib::tmp::tempdir().unwrap();
+    let dir = dir.path();
 
     let record = dir.join("args");
     // Named `vi`, but reached through a full path: the basename is what
@@ -1325,9 +1353,14 @@ fn test_audit_invoke_editor_arguments() {
     let editor = dir.join("vi");
     let mut script = std::fs::File::create(&editor).unwrap();
     writeln!(script, "#!/bin/sh").unwrap();
+    // `wait_until_executable` runs this, so the probe has to be inert: a
+    // probe that recorded its own arguments would leave them behind for the
+    // assertions to read if `more` never ran at all.
+    writeln!(script, "[ \"$1\" = --probe ] && exit 0").unwrap();
     writeln!(script, "printf '%s\\n' \"$@\" > {}", record.display()).unwrap();
     drop(script);
     std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    wait_until_executable(&editor);
 
     run_test_more_with_env(
         &["--test", "-p", "vq", "test_files/plain1.txt"],
@@ -1338,7 +1371,14 @@ fn test_audit_invoke_editor_arguments() {
         &[("EDITOR", editor.to_str().unwrap())],
     );
 
-    let args = std::fs::read_to_string(&record).unwrap();
+    let args = std::fs::read_to_string(&record).unwrap_or_else(|e| {
+        panic!(
+            "the editor left no record at {}: {e}. `more` reports a failed \
+             editor on stderr and exits 1, so if the run above passed its \
+             checks the editor ran and something removed the file.",
+            record.display()
+        )
+    });
     let args: Vec<&str> = args.lines().collect();
     assert_eq!(
         args.first().copied(),
@@ -1350,8 +1390,7 @@ fn test_audit_invoke_editor_arguments() {
         "-c must be followed by a line number, got {args:?}"
     );
     assert_eq!(args.get(2).copied(), Some("--"), "got {args:?}");
-
-    let _ = std::fs::remove_dir_all(&dir);
+    // The directory goes with the `TempDir` at end of scope.
 }
 
 // ---------------------------------------------------------------------------

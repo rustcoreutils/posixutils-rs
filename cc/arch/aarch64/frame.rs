@@ -1372,7 +1372,6 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Emit return instruction: move return value and emit epilogue
     /// Write two values into two distinct general registers at once.
     ///
     /// See `arch::lir::plan_pair_move` for the three cases. X9 is the
@@ -1404,6 +1403,7 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// Emit return instruction: move return value and emit epilogue
     pub(super) fn emit_ret(
         &mut self,
         insn: &Instruction,

@@ -136,6 +136,12 @@ impl AddrMap {
     }
 
     /// The constant an address-arithmetic operand carries, if any.
+    ///
+    /// Only `Copy` is followed. A `SetVal` needs no arm of its own: its
+    /// constant lives in its *target pseudo*, so `func.const_val` above has
+    /// already answered for it, and an arm that asked `const_val` a second
+    /// time about the same pseudo could only repeat the `None` that got it
+    /// there.
     fn const_operand(&self, func: &Function, id: PseudoId) -> Option<i128> {
         let mut cur = id;
         for _ in 0..MAX_ADDR_DEPTH {
@@ -144,7 +150,6 @@ impl AddrMap {
             }
             match self.def(func, cur) {
                 Some(d) if d.op == Opcode::Copy && d.src.len() == 1 => cur = d.src[0],
-                Some(d) if d.op == Opcode::SetVal => return func.const_val(d.target?),
                 _ => return None,
             }
         }

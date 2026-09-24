@@ -102,11 +102,12 @@ SSA-form intermediate representation for the c17 C17 compiler. Inspired by Linus
 |--------|-------------|
 | `load` | Load from address `src[0]` + `offset` into `target` |
 | `store` | Store `src[1]` to address `src[0]` + `offset` |
-
-For both, `offset` is a **byte** displacement and `size` is the access width
-in **bits**. Neither carries a volatile or atomic marker: volatility lives on
-the `LocalVar` or the `GlobalDef`, and an atomic access has its own opcode.
 | `symaddr` | Get address of symbol |
+
+For `load` and `store`, `offset` is a **byte** displacement and `size` is the
+access width in **bits**. Neither carries a volatile or atomic marker:
+volatility lives on the `LocalVar` or the `GlobalDef`, and an atomic access
+has its own opcode.
 
 ### SSA Operations
 

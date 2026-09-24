@@ -826,6 +826,15 @@ impl<'a> Solver<'a> {
                     continue;
                 };
                 let Some(v) = r.single_value() else { continue };
+                // A range holds a raw bit pattern; a minted constant is read
+                // as the signed value at its width, which is what the
+                // backend can emit there.
+                //
+                // Not a lost opportunity to chain: the two readings differ
+                // only when the top bit is set, and there *neither* is
+                // `unambiguous_at`, so `ConstMap::get` refuses the chain
+                // whichever is minted. Where an unambiguous form exists the
+                // two readings are the same number.
                 let v = super::constfold::at_width(v as i128, w, true);
                 changed |= propagate::fold_target_to_const(func, types, (b, i), v, &mut minted);
             }

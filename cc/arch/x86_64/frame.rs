@@ -948,7 +948,6 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit return instruction: move return value to registers and emit epilogue
     /// Write two values into two distinct general registers at once.
     ///
     /// See `arch::lir::plan_pair_move` for the three cases. The exchange goes
@@ -981,6 +980,7 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Emit return instruction: move return value to registers and emit epilogue
     pub(super) fn emit_ret(&mut self, insn: &Instruction, types: &TypeTable) {
         // Move return value to appropriate register if present
         // System V AMD64 ABI: integers in RAX, floats in XMM0, complex in XMM0+XMM1

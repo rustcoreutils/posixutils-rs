@@ -309,8 +309,6 @@ impl Opcode {
         )
     }
 
-    /// Check if this opcode has side effects (cannot be deleted even if unused).
-    /// These are "root" instructions for dead code elimination.
     /// Could an instruction with this opcode read or write memory?
     ///
     /// The companion to [`Instruction::is_memory_barrier`], which answers
@@ -355,6 +353,8 @@ impl Opcode {
         )
     }
 
+    /// Check if this opcode has side effects (cannot be deleted even if unused).
+    /// These are "root" instructions for dead code elimination.
     pub fn has_side_effects(&self) -> bool {
         matches!(
             self,
@@ -1053,20 +1053,6 @@ impl Instruction {
         }
     }
 
-    /// Every pseudo this instruction reads.
-    ///
-    /// The canonical enumeration, because uses are not all in `src`: a `Phi`
-    /// reads the pseudos named in `phi_list`, an indirect call reads
-    /// `indirect_target`, and inline assembly reads its `inputs` -- plus a
-    /// *memory* output, whose pseudo is the address the assembly writes
-    /// through rather than the value written. Omitting those let DCE delete
-    /// the address computation, so every `"=m"` operand became a store
-    /// through a garbage register.
-    ///
-    /// The exception that bites: a `PhiSource`'s own `phi_list` is a
-    /// back-pointer to the `Phi` it feeds, not an operand. Counting it as a
-    /// use makes the value look live to DCE and makes a def-use graph report
-    /// an edge that runs the wrong way.
     /// Does this instruction mention `id` in any operand position at all?
     ///
     /// **The canonical enumeration of every place a `PseudoId` can be written
@@ -1091,6 +1077,20 @@ impl Instruction {
             })
     }
 
+    /// Every pseudo this instruction reads.
+    ///
+    /// The canonical enumeration, because uses are not all in `src`: a `Phi`
+    /// reads the pseudos named in `phi_list`, an indirect call reads
+    /// `indirect_target`, and inline assembly reads its `inputs` -- plus a
+    /// *memory* output, whose pseudo is the address the assembly writes
+    /// through rather than the value written. Omitting those let DCE delete
+    /// the address computation, so every `"=m"` operand became a store
+    /// through a garbage register.
+    ///
+    /// The exception that bites: a `PhiSource`'s own `phi_list` is a
+    /// back-pointer to the `Phi` it feeds, not an operand. Counting it as a
+    /// use makes the value look live to DCE and makes a def-use graph report
+    /// an edge that runs the wrong way.
     pub fn uses(&self) -> Vec<PseudoId> {
         let mut uses = Vec::with_capacity(DEFAULT_USE_CAPACITY);
 

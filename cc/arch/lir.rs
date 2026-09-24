@@ -318,11 +318,8 @@ pub enum CallTarget<R> {
     Indirect(R),
 }
 
-// Complex Type Helpers
+// Parallel Moves
 
-/// How many SSE registers a complex argument occupies under System V AMD64.
-///
-/// §3.2.3 classifies the three complex types differently, and only
 /// How to sequence a two-element parallel move into two *distinct*
 /// registers.
 ///
@@ -357,6 +354,11 @@ pub fn plan_pair_move(first_clobbers_second: bool, second_clobbers_first: bool) 
     }
 }
 
+// Complex Type Helpers
+
+/// How many SSE registers a complex argument occupies under System V AMD64.
+///
+/// §3.2.3 classifies the three complex types differently, and only
 /// `double _Complex` is the familiar register pair:
 ///
 /// - `float _Complex` is 8 bytes: **one** eightbyte, so one XMM holds both

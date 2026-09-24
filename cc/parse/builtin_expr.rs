@@ -86,6 +86,14 @@ impl ObjectExtent {
     }
 }
 
+/// Which real floating type a libm entry point computes in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibmReal {
+    Float,
+    Double,
+    LongDouble,
+}
+
 impl Parser<'_> {
     /// Whether an expression is a literal constant, with nothing to evaluate.
     ///
@@ -2046,6 +2054,107 @@ impl Parser<'_> {
         ))
     }
 
+    /// A pointer to `typ`.
+    fn pointer_to(&mut self, typ: TypeId) -> TypeId {
+        self.types.intern(Type {
+            kind: TypeKind::Pointer,
+            base: Some(typ),
+            ..Default::default()
+        })
+    }
+
+    /// How many arguments a libm entry point takes.
+    fn libm_arity(name: &str) -> usize {
+        let stem = name
+            .strip_suffix('f')
+            .or_else(|| name.strip_suffix('l'))
+            .unwrap_or(name);
+        match stem {
+            "fma" => 3,
+            "copysign" | "fmax" | "fmin" | "pow" | "fmod" | "atan2" | "hypot" | "fdim"
+            | "remainder" | "nextafter" | "modf" | "frexp" | "ldexp" => 2,
+            _ => 1,
+        }
+    }
+
+    /// The real floating type a libm alias computes in, from its suffix.
+    ///
+    /// One table rather than a suffix test at each site: a `float` entry point
+    /// takes and returns `float`, and getting that wrong does not fail to
+    /// link -- it sends the argument at the wrong width and answers with
+    /// whatever was in the register.
+    fn libm_real_kind(name: &str) -> Option<LibmReal> {
+        const UNARY: &[&str] = &[
+            "sqrt",
+            "cbrt",
+            "ceil",
+            "floor",
+            "trunc",
+            "round",
+            "rint",
+            "nearbyint",
+            "sin",
+            "cos",
+            "tan",
+            "asin",
+            "acos",
+            "atan",
+            "sinh",
+            "cosh",
+            "tanh",
+            "asinh",
+            "acosh",
+            "atanh",
+            "exp",
+            "exp2",
+            "expm1",
+            "log",
+            "log2",
+            "log10",
+            "log1p",
+            "logb",
+            "tgamma",
+            "lgamma",
+            "erf",
+            "erfc",
+        ];
+        const BINARY: &[&str] = &[
+            "copysign",
+            "fmax",
+            "fmin",
+            "pow",
+            "fmod",
+            "atan2",
+            "hypot",
+            "fdim",
+            "remainder",
+            "nextafter",
+            "modf",
+            "frexp",
+            "ldexp",
+        ];
+        const TERNARY: &[&str] = &["fma"];
+
+        let (stem, kind) = match name.strip_suffix('f') {
+            Some(stem) => (stem, LibmReal::Float),
+            None => match name.strip_suffix('l') {
+                Some(stem) => (stem, LibmReal::LongDouble),
+                None => (name, LibmReal::Double),
+            },
+        };
+        // `lgamma` ends in `a`, but `logb`/`log` do not collide: the strip
+        // above only fires on a real suffix because the stem is then checked
+        // against the table.
+        let known = |n: &str| UNARY.contains(&n) || BINARY.contains(&n) || TERNARY.contains(&n);
+        if known(stem) {
+            Some(kind)
+        } else if known(name) {
+            Some(LibmReal::Double)
+        } else {
+            None
+        }
+    }
+
     /// The pointee type of `ptr`, or `int` when it is not a pointer. The
     /// diagnostic for the non-pointer case comes from the argument check.
     fn pointee_or_int(&self, ptr: &Expr) -> TypeId {
@@ -2221,6 +2330,10 @@ impl Parser<'_> {
                 // is `abort`. Everything else keeps its own name.
                 let real_name = match name_str {
                     "__builtin_trap" => "abort",
+                    // gcc's own equality-only spelling of `memcmp`. There is
+                    // no library entry point of that name; answering the
+                    // ordering as well is a correct implementation of it.
+                    "__builtin_memcmp_eq" => "memcmp",
                     _ => &name_str["__builtin_".len()..],
                 };
                 // Parse arguments first (must consume tokens regardless)
@@ -2481,20 +2594,18 @@ impl Parser<'_> {
             | "fprintf_unlocked" | "fputs_unlocked" => Some(self.types.int_id),
             "labs" => Some(self.types.long_id),
             "llabs" => Some(self.types.longlong_id),
-            "sqrt" | "copysign" | "fmax" | "fmin" | "pow" | "fma" => Some(self.types.double_id),
-            "sqrtf" | "copysignf" | "fmaxf" | "fminf" | "powf" | "fmaf" => {
-                Some(self.types.float_id)
-            }
-            "sqrtl" | "copysignl" | "fmaxl" | "fminl" | "powl" | "fmal" => {
-                Some(self.types.longdouble_id)
-            }
-            "bcmp" => Some(self.types.int_id),
+            _ if Self::libm_real_kind(name).is_some() => Some(match Self::libm_real_kind(name) {
+                Some(LibmReal::Float) => self.types.float_id,
+                Some(LibmReal::LongDouble) => self.types.longdouble_id,
+                _ => self.types.double_id,
+            }),
+            "bcmp" | "strcasecmp" | "strncasecmp" => Some(self.types.int_id),
             "abort" | "exit" | "free" => Some(self.types.void_id),
             // The allocators and `mempcpy` return `void *`; the string family
             // returns `char *`. Answering `int` here would truncate the
             // returned address to 32 bits, which is the bug the `_chk` cases
             // above are commented for.
-            "strdup" => {
+            "strndup" | "strdup" => {
                 let char_id = self.types.char_id;
                 Some(self.types.intern(Type {
                     kind: TypeKind::Pointer,
@@ -2560,7 +2671,131 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_BCMP
                 | crate::kw::BUILTIN_BZERO
                 | crate::kw::BUILTIN_STPNCPY
+                | crate::kw::BUILTIN_CBRT
+                | crate::kw::BUILTIN_CBRTF
+                | crate::kw::BUILTIN_CBRTL
+                | crate::kw::BUILTIN_CEIL
+                | crate::kw::BUILTIN_CEILF
+                | crate::kw::BUILTIN_CEILL
+                | crate::kw::BUILTIN_FLOOR
+                | crate::kw::BUILTIN_FLOORF
+                | crate::kw::BUILTIN_FLOORL
+                | crate::kw::BUILTIN_TRUNC
+                | crate::kw::BUILTIN_TRUNCF
+                | crate::kw::BUILTIN_TRUNCL
+                | crate::kw::BUILTIN_ROUND
+                | crate::kw::BUILTIN_ROUNDF
+                | crate::kw::BUILTIN_ROUNDL
+                | crate::kw::BUILTIN_RINT
+                | crate::kw::BUILTIN_RINTF
+                | crate::kw::BUILTIN_RINTL
+                | crate::kw::BUILTIN_NEARBYINT
+                | crate::kw::BUILTIN_NEARBYINTF
+                | crate::kw::BUILTIN_NEARBYINTL
+                | crate::kw::BUILTIN_SIN
+                | crate::kw::BUILTIN_SINF
+                | crate::kw::BUILTIN_SINL
+                | crate::kw::BUILTIN_COS
+                | crate::kw::BUILTIN_COSF
+                | crate::kw::BUILTIN_COSL
+                | crate::kw::BUILTIN_TAN
+                | crate::kw::BUILTIN_TANF
+                | crate::kw::BUILTIN_TANL
+                | crate::kw::BUILTIN_ASIN
+                | crate::kw::BUILTIN_ASINF
+                | crate::kw::BUILTIN_ASINL
+                | crate::kw::BUILTIN_ACOS
+                | crate::kw::BUILTIN_ACOSF
+                | crate::kw::BUILTIN_ACOSL
+                | crate::kw::BUILTIN_ATAN
+                | crate::kw::BUILTIN_ATANF
+                | crate::kw::BUILTIN_ATANL
+                | crate::kw::BUILTIN_SINH
+                | crate::kw::BUILTIN_SINHF
+                | crate::kw::BUILTIN_SINHL
+                | crate::kw::BUILTIN_COSH
+                | crate::kw::BUILTIN_COSHF
+                | crate::kw::BUILTIN_COSHL
+                | crate::kw::BUILTIN_TANH
+                | crate::kw::BUILTIN_TANHF
+                | crate::kw::BUILTIN_TANHL
+                | crate::kw::BUILTIN_ASINH
+                | crate::kw::BUILTIN_ASINHF
+                | crate::kw::BUILTIN_ASINHL
+                | crate::kw::BUILTIN_ACOSH
+                | crate::kw::BUILTIN_ACOSHF
+                | crate::kw::BUILTIN_ACOSHL
+                | crate::kw::BUILTIN_ATANH
+                | crate::kw::BUILTIN_ATANHF
+                | crate::kw::BUILTIN_ATANHL
+                | crate::kw::BUILTIN_EXP
+                | crate::kw::BUILTIN_EXPF
+                | crate::kw::BUILTIN_EXPL
+                | crate::kw::BUILTIN_EXP2
+                | crate::kw::BUILTIN_EXP2F
+                | crate::kw::BUILTIN_EXP2L
+                | crate::kw::BUILTIN_EXPM1
+                | crate::kw::BUILTIN_EXPM1F
+                | crate::kw::BUILTIN_EXPM1L
+                | crate::kw::BUILTIN_LOG
+                | crate::kw::BUILTIN_LOGF
+                | crate::kw::BUILTIN_LOGL
+                | crate::kw::BUILTIN_LOG2
+                | crate::kw::BUILTIN_LOG2F
+                | crate::kw::BUILTIN_LOG2L
+                | crate::kw::BUILTIN_LOG10
+                | crate::kw::BUILTIN_LOG10F
+                | crate::kw::BUILTIN_LOG10L
+                | crate::kw::BUILTIN_LOG1P
+                | crate::kw::BUILTIN_LOG1PF
+                | crate::kw::BUILTIN_LOG1PL
+                | crate::kw::BUILTIN_LOGB
+                | crate::kw::BUILTIN_LOGBF
+                | crate::kw::BUILTIN_LOGBL
+                | crate::kw::BUILTIN_TGAMMA
+                | crate::kw::BUILTIN_TGAMMAF
+                | crate::kw::BUILTIN_TGAMMAL
+                | crate::kw::BUILTIN_LGAMMA
+                | crate::kw::BUILTIN_LGAMMAF
+                | crate::kw::BUILTIN_LGAMMAL
+                | crate::kw::BUILTIN_ERF
+                | crate::kw::BUILTIN_ERFF
+                | crate::kw::BUILTIN_ERFL
+                | crate::kw::BUILTIN_ERFC
+                | crate::kw::BUILTIN_ERFCF
+                | crate::kw::BUILTIN_ERFCL
+                | crate::kw::BUILTIN_FMOD
+                | crate::kw::BUILTIN_FMODF
+                | crate::kw::BUILTIN_FMODL
+                | crate::kw::BUILTIN_ATAN2
+                | crate::kw::BUILTIN_ATAN2F
+                | crate::kw::BUILTIN_ATAN2L
+                | crate::kw::BUILTIN_HYPOT
+                | crate::kw::BUILTIN_HYPOTF
+                | crate::kw::BUILTIN_HYPOTL
+                | crate::kw::BUILTIN_FDIM
+                | crate::kw::BUILTIN_FDIMF
+                | crate::kw::BUILTIN_FDIML
+                | crate::kw::BUILTIN_REMAINDER
+                | crate::kw::BUILTIN_REMAINDERF
+                | crate::kw::BUILTIN_REMAINDERL
+                | crate::kw::BUILTIN_NEXTAFTER
+                | crate::kw::BUILTIN_NEXTAFTERF
+                | crate::kw::BUILTIN_NEXTAFTERL
+                | crate::kw::BUILTIN_MODF
+                | crate::kw::BUILTIN_MODFF
+                | crate::kw::BUILTIN_MODFL
+                | crate::kw::BUILTIN_FREXP
+                | crate::kw::BUILTIN_FREXPF
+                | crate::kw::BUILTIN_FREXPL
+                | crate::kw::BUILTIN_LDEXP
+                | crate::kw::BUILTIN_LDEXPF
+                | crate::kw::BUILTIN_LDEXPL
+                | crate::kw::BUILTIN_STRCASECMP
+                | crate::kw::BUILTIN_STRNCASECMP
                 | crate::kw::BUILTIN_STRDUP
+                | crate::kw::BUILTIN_STRNDUP
+                | crate::kw::BUILTIN_MEMCMP_EQ
                 | crate::kw::BUILTIN_TRAP
                 | crate::kw::BUILTIN_ABORT
                 | crate::kw::BUILTIN_EXIT
@@ -2698,13 +2933,14 @@ impl Parser<'_> {
             "__memset_chk" | "__strcpy_chk" | "__stpcpy_chk" | "__strcat_chk" => (3, false),
             "__memcpy_chk" | "__memmove_chk" | "__mempcpy_chk" | "__strncpy_chk"
             | "__stpncpy_chk" | "__strncat_chk" => (4, false),
-            "strlen" | "abs" | "labs" | "llabs" | "ffs" | "ffsl" | "ffsll" | "sqrt" | "sqrtf"
-            | "sqrtl" => (1, false),
-            "strcmp" | "copysign" | "copysignf" | "copysignl" | "fmax" | "fmaxf" | "fmaxl"
-            | "fmin" | "fminf" | "fminl" | "pow" | "powf" | "powl" | "bzero" => (2, false),
-            "fma" | "fmaf" | "fmal" | "bcmp" | "stpncpy" => (3, false),
+            "strlen" | "abs" | "labs" | "llabs" | "ffs" | "ffsl" | "ffsll" => (1, false),
+            "strcmp" | "bzero" | "strcasecmp" => (2, false),
+            "bcmp" | "stpncpy" | "strncasecmp" => (3, false),
+            // The libm entry points, from the one table that knows them.
+            _ if Self::libm_real_kind(name).is_some() => (Self::libm_arity(name), false),
             "abort" => (0, false),
             "exit" | "puts" | "malloc" | "free" | "putchar" | "imaxabs" | "strdup" => (1, false),
+            "strndup" => (2, false),
             "calloc" | "realloc" | "strcpy" | "stpcpy" | "strcat" | "strchr" | "strrchr"
             | "strstr" | "index" | "rindex" | "strpbrk" | "strcspn" | "strspn" => (2, false),
             "memcmp" | "mempcpy" | "strncpy" | "strncat" | "strncmp" | "memchr" | "bcopy" => {
@@ -2739,13 +2975,24 @@ impl Parser<'_> {
         // answers -- the call links and runs. The library functions of the
         // same names are unaffected; this path is only taken when the header
         // that would declare them was not included.
-        let param_typ = match name {
-            "sqrt" | "copysign" | "fmax" | "fmin" | "pow" | "fma" => self.types.double_id,
-            "sqrtf" | "copysignf" | "fmaxf" | "fminf" | "powf" | "fmaf" => self.types.float_id,
-            "sqrtl" | "copysignl" | "fmaxl" | "fminl" | "powl" | "fmal" => self.types.longdouble_id,
-            _ => self.types.ulong_id,
+        let param_typ = match Self::libm_real_kind(name) {
+            Some(LibmReal::Float) => self.types.float_id,
+            Some(LibmReal::Double) => self.types.double_id,
+            Some(LibmReal::LongDouble) => self.types.longdouble_id,
+            None => self.types.ulong_id,
         };
-        let params = vec![param_typ; fixed];
+        let params = match name {
+            // `modf`, `frexp` and `ldexp` do not take a list of one type: the
+            // second parameter is a pointer or an `int`. Declaring one of
+            // them uniformly sent that argument to the wrong register file,
+            // which is the silent wrong answer the note above describes.
+            "modf" | "modff" | "modfl" => vec![param_typ, self.pointer_to(param_typ)],
+            "frexp" | "frexpf" | "frexpl" => {
+                vec![param_typ, self.pointer_to(self.types.int_id)]
+            }
+            "ldexp" | "ldexpf" | "ldexpl" => vec![param_typ, self.types.int_id],
+            _ => vec![param_typ; fixed],
+        };
 
         let func_type = self.types.intern(Type {
             kind: TypeKind::Function,

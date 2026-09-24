@@ -21,6 +21,23 @@ use crate::parse::ast::{
 };
 use crate::strings::StringId;
 use crate::types::TypeTable;
+
+/// A `return` whose value-ness does not match the function's type.
+///
+/// C17 6.8.6.4p1 makes both a constraint violation, and c17 reports them as
+/// errors. gcc warns and compiles, and code that does this is old rather than
+/// clever -- so `-fpermissive`, which already relaxes implicit `int` and
+/// implicit function declarations for exactly that reason, relaxes these too.
+/// The value is discarded either way, and a missing one leaves the returned
+/// value indeterminate, which is what gcc's program does as well.
+fn return_value_ness_violation(pos: Position, msg: &str) {
+    if crate::diag::permissive() {
+        crate::diag::warning(pos, msg);
+    } else {
+        error(pos, msg);
+    }
+}
+
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 
 /// Which construct a jump leaves, for `unwind_vla_marks`.
@@ -106,9 +123,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                             if returns_void
                                 && self.types.kind(self.expr_type(e)) != TypeKind::Void =>
                         {
-                            error(e.pos, "'return' with a value in a function returning void")
+                            return_value_ness_violation(
+                                e.pos,
+                                "'return' with a value in a function returning void",
+                            )
                         }
-                        None if !returns_void => error(
+                        None if !returns_void => return_value_ness_violation(
                             // `Stmt` carries no position, so fall back to the
                             // last expression lowered in this function.
                             self.current_pos.unwrap_or_default(),

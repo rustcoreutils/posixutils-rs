@@ -127,6 +127,16 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 | `__builtin_fmax(x, y)`, `fmaxf`, `fmaxl`, `__builtin_fmin(x, y)`, `fminf`, `fminl` | Larger and smaller of two values |
 | `__builtin_pow(x, y)`, `powf`, `powl` | `x` raised to `y` |
 | `__builtin_fma(x, y, z)`, `fmaf`, `fmal` | `x * y + z`, rounded once |
+| `__builtin_ceil`, `floor`, `trunc`, `round`, `rint`, `nearbyint`, `cbrt` | And their `f` and `l` spellings |
+| `__builtin_sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` | And their `f` and `l` spellings |
+| `__builtin_exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `logb`, `tgamma`, `lgamma`, `erf`, `erfc` | And their `f` and `l` spellings |
+| `__builtin_fmod`, `atan2`, `hypot`, `fdim`, `remainder`, `nextafter` | Two arguments; and their `f` and `l` spellings |
+| `__builtin_modf(x, *ip)`, `__builtin_frexp(x, *e)`, `__builtin_ldexp(x, e)` | These three do **not** take a list of one type -- the second parameter is a pointer or an `int`. Declaring one uniformly sends that argument to the wrong register file, which is a silent wrong answer rather than a link error |
+
+Every one of these is a call to the library function of the same name, so the
+usual library rules apply. Their signatures come from **one table**, keyed by
+the suffix: a `float` entry point takes and returns `float`, and getting that
+wrong does not fail to link.
 
 ### The unordered-safe relations (C99 7.12.14)
 
@@ -269,6 +279,9 @@ headers rely on.
 | `__builtin_memchr(p, c, n)` | Returns `void *` |
 | `__builtin_index(s, c)`, `__builtin_rindex(s, c)` | The older spellings of `strchr`/`strrchr` |
 | `__builtin_strpbrk(s, set)` | |
+| `__builtin_strcasecmp(a, b)`, `__builtin_strncasecmp(a, b, n)` | The POSIX case-insensitive comparisons |
+| `__builtin_strndup(s, n)` | |
+| `__builtin_memcmp_eq(a, b, n)` | gcc's equality-only `memcmp`: it answers zero or non-zero rather than an ordering, which lets it use a wider compare. Answering the ordering as well implements it |
 | `__builtin_stpncpy(d, s, n)` | Like `strncpy`, returning the end of what it wrote |
 | `__builtin_strdup(s)` | |
 | `__builtin_bcmp(a, b, n)` | The older spelling of `memcmp` |

@@ -5272,3 +5272,52 @@ int helper(int x) { return x + 1; }
         );
     }
 }
+
+// ============================================================================
+// What `-fpermissive` relaxes
+// ============================================================================
+
+/// The constraints gcc lets through, and c17 relaxes only when asked.
+///
+/// Each is a genuine C17 constraint violation, and each appears in source old
+/// enough that gcc chose to warn rather than refuse. `-fpermissive` is where
+/// c17 keeps that leniency: it already covers implicit `int` and implicit
+/// function declarations, and these join them rather than becoming warnings
+/// for everybody.
+#[test]
+fn diagnostics_permissive_relaxes_the_constraints_gcc_warns_about() {
+    const CASES: &[(&str, &str, &str)] = &[
+        (
+            "return_without_value",
+            "double g(void) { return; }\n",
+            "'return' with no value",
+        ),
+        (
+            "return_with_value",
+            "void h(int v) { return v; }\n",
+            "'return' with a value",
+        ),
+        (
+            "struct_member_missing_semicolon",
+            "struct S { int a; int b };\nint main(void){ return 0; }\n",
+            "needs a ';'",
+        ),
+        (
+            "inline_reads_a_file_scope_static",
+            "static const int k = 3;\ninline int f(void) { return k; }\nint main(void){ return f() - 3; }\n",
+            "cannot reference file-scope static",
+        ),
+    ];
+
+    for (name, src, needle) in CASES {
+        // An error by default...
+        compile_expect_error(name, src, "");
+        // ...and a warning naming the same thing under -fpermissive.
+        let warned =
+            crate::common::compile_expect_warning_with(name, src, &["-fpermissive".to_string()]);
+        assert!(
+            warned.contains(needle),
+            "{name}: -fpermissive should warn about {needle}, got:\n{warned}"
+        );
+    }
+}

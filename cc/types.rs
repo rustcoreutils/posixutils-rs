@@ -2226,9 +2226,32 @@ impl TypeTable {
             (Some(a), Some(b)) => a
                 .iter()
                 .zip(b.iter())
-                .all(|(&x, &y)| self.compatible(x, y, TopLevelQualifiers::Ignored)),
+                .all(|(&x, &y)| self.parameters_compatible(x, y)),
             _ => true,
         }
+    }
+
+    /// Are these two parameter types compatible?
+    ///
+    /// Ordinary compatibility, plus gcc's `transparent_union` rule: a
+    /// parameter of a transparent union is passed as its first member, so a
+    /// declaration using the union and one using that member describe the same
+    /// function. glibc's own socket calls are written that way -- `sendto` is
+    /// declared with `__CONST_SOCKADDR_ARG` and defined with
+    /// `const struct sockaddr *` -- and refusing the pair reported
+    /// "conflicting types" for a header and a source file that agree.
+    fn parameters_compatible(&self, a: TypeId, b: TypeId) -> bool {
+        if self.compatible(a, b, TopLevelQualifiers::Ignored) {
+            return true;
+        }
+        for (union_side, other) in [(a, b), (b, a)] {
+            if let Some(member) = self.transparent_union_first_member(union_side) {
+                if self.compatible(member, other, TopLevelQualifiers::Ignored) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Check if two types are compatible *and* identically qualified.

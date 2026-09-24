@@ -273,7 +273,13 @@ Most of what is left is one thing.
 | Group | Note |
 |---|---|
 | Builtin folding | The whole of `execute/builtins/`. Each test defines its own `strlen`, `memcpy` or `printf` that calls `abort()` when `__OPTIMIZE__` is set, so a run-time failure there means c17 emitted a real call where gcc folded the builtin or expanded it inline. Nothing fails to *compile*, so no build is blocked; it is gcc-parity and code quality. Deferred by decision |
-| The two divergences above | `991014-1`, `920728-1` |
+| Dead-call elimination proofs | `20030330-1` and `medce-1` at `-O0` (a constant branch keeps its arm there, which is recorded in DECISIONS.md), and `ieee/compare-fp-3` and `ieee/fp-cmp-6`/`-7`/`-9` at every level. Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link*. Standard C, and optimizer strength rather than a defect: what is missing is folding a comparison whose operands are known to relate |
+| `always_inline` on a library builtin | `pr46360`. `__attribute__((always_inline))` on a declaration of `strncpy` -- c17 refuses because it has no body to substitute, where gcc inlines its own expansion |
+| An `extern inline` reading a file-scope static | `pr38857`. A C17 6.7.4p3 constraint gcc does not enforce. Relaxed by `-fpermissive`; the test does not pass it |
+| Inline asm | `pr34966` -- an x87 output constraint on an operand with no home, at `-O2` only. `pr39394` -- an anonymous struct with a variably-modified member as an `"=m"` operand |
+| An array subscript in a statement expression | `split-path-5`. `({ __typeof__(pat[i]) __x = (pat[i]); ... })` is rejected as a non-constant initializer for an object with static storage duration, which it is not |
+| `__builtin_iseqsig` | `pr122588-1`. The IEEE signalling equality predicate; no system header uses it |
+| The remaining divergence | `991014-1` |
 
 One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.
 gcc accepts a conditional with one `void` arm as an extension; C17 6.5.15p3

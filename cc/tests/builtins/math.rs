@@ -877,3 +877,55 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("return_addr_clear_cache", code, &[]), 0);
 }
+
+/// The libm entry points under their `__builtin_` spellings, at each of the
+/// three real widths.
+///
+/// `__builtin_ceilf` and `__builtin_modf` are ordinary functions any program
+/// may name; c17 recognised the bare `ceil`/`floor` family and not these.
+/// Signatures come from one table, because a `float` entry point that is
+/// declared as taking a `double` does not fail to link -- it sends the
+/// argument at the wrong width and answers with whatever was in the register.
+#[test]
+fn builtins_libm_entry_points() {
+    let code = r#"
+int main(void) {
+    if (__builtin_ceilf(1.2f) != 2.0f) return 1;
+    if (__builtin_ceil(1.2) != 2.0) return 2;
+    if (__builtin_ceill(1.2L) != 2.0L) return 3;
+    if (__builtin_floor(1.8) != 1.0) return 4;
+    if (__builtin_floorf(1.8f) != 1.0f) return 5;
+    if (__builtin_trunc(-1.8) != -1.0) return 6;
+    if (__builtin_fmod(7.0, 4.0) != 3.0) return 7;
+    if (__builtin_atan2(0.0, 1.0) != 0.0) return 8;
+    if (__builtin_hypot(3.0, 4.0) != 5.0) return 9;
+    if (__builtin_exp(0.0) != 1.0) return 10;
+    if (__builtin_log(1.0) != 0.0) return 11;
+
+    /* These three do not take a list of one type: the second parameter is a
+       pointer or an `int`, and declaring them uniformly sends it to the wrong
+       register file. */
+    {
+        double ip;
+        if (__builtin_modf(3.25, &ip) != 0.25 || ip != 3.0) return 12;
+    }
+    {
+        int e;
+        if (__builtin_frexp(8.0, &e) != 0.5 || e != 4) return 13;
+    }
+    if (__builtin_ldexp(0.5, 4) != 8.0) return 14;
+
+    /* The POSIX case-insensitive comparisons. */
+    if (__builtin_strncasecmp("AbC", "abc", 3) != 0) return 15;
+    if (__builtin_strcasecmp("AbC", "abd") == 0) return 16;
+    if (__builtin_strndup("abcd", 2) == 0) return 17;
+    if (__builtin_memcmp_eq("ab", "ab", 2) != 0) return 18;
+    if (__builtin_memcmp_eq("ab", "ac", 2) == 0) return 19;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("libm_entry_points", code, &["-lm".into()]),
+        0
+    );
+}

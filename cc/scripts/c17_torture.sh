@@ -332,7 +332,7 @@ OUT_OF_SCOPE_NESTED_FN=" execute/20010209-1 compile/20010209-1 execute/20010605-
  compile/20030418-1 compile/20030716-1 \
  compile/20031011-1 compile/20040310-1 compile/20040317-3 \
  compile/20050119-1 compile/951116-1 compile/nested-2 \
- compile/nested-3 compile/pr35006 compile/pr99324 "
+ compile/nested-3 compile/pr35006 compile/pr99324 execute/20061220-1 "
 
 # A variable-length array as a struct or union member: struct layout computed
 # at run time, and `offsetof` through it.
@@ -352,7 +352,9 @@ OUT_OF_SCOPE_VLA_MEMBER=" execute/20020412-1 execute/20040308-1 execute/20040423
 #               saturates to INT_MAX. aarch64 agrees by hardware accident.
 #   pr46309     a conditional with one `void` arm, which gcc takes as an
 #               extension and C17 6.5.15p3 forbids.
-OUT_OF_SCOPE_GCC_BEHAVIOUR=" execute/20021127-1 execute/20031003-1 execute/pr46309 "
+OUT_OF_SCOPE_GCC_BEHAVIOUR=" execute/20021127-1 execute/20031003-1 execute/pr46309 \
+ compile/pr26725 compile/20000211-1 \
+ compile/950919-1 "
 
 # Tests gcc on this machine fails exactly as c17 does, verified by running both
 # at -O0 and -O2. Counting them as c17 failures overstates the gap, and they are
@@ -378,6 +380,15 @@ NEEDS_OPTIMIZATION=" execute/20001121-1 compile/20001121-1 execute/20020107-1 \
 # `dg-additional-options "-std=gnu89"` or `"-fpermissive"` -- are honoured and
 # pass, which is why this list is two names rather than a hundred.
 NEEDS_PRE_C99_DIALECT=" compile/pr29201 "
+
+# Builtins gcc synthesizes for its own use and no header declares:
+# `__builtin_stack_save`/`stack_restore` are the marks gcc puts around a VLA's
+# lifetime, and c17 frees a VLA at the end of its block without them;
+# `__builtin_clear_padding` would have to walk a type to find its padding; and
+# `__builtin_cexpi`/`cpow` are complex libm entry points. See BUILTIN.md's
+# "Not implemented" table, which is where these are recorded.
+OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN=" compile/20071117-1 compile/pr98087 \
+ compile/pr110266 compile/pr54428 "
 
 # `__builtin_issignaling`, which distinguishes a signalling NaN from a quiet
 # one. No system header uses it -- `<math.h>` has `issignaling` as its own
@@ -482,6 +493,9 @@ EOF
     case "$OUT_OF_SCOPE_ISSIGNALING" in
         *" $key "*) echo "SKIP	$tag	out of scope: __builtin_issignaling"; return;;
     esac
+    case "$OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN" in
+        *" $key "*) echo "SKIP	$tag	out of scope: a gcc-internal builtin"; return;;
+    esac
     local scan skip flags mult stack dgdo
     scan=$(dg_scan "$src" "$opt")
     skip=${scan%%|*}; scan=${scan#*|}
@@ -569,6 +583,7 @@ export OUT_OF_SCOPE_NESTED_FN OUT_OF_SCOPE_VLA_MEMBER
 export OUT_OF_SCOPE_GCC_BEHAVIOUR OUT_OF_SCOPE_GCC_INTERNAL
 export OUT_OF_SCOPE_GNU89_INLINE OUT_OF_SCOPE_OTHER_TARGET
 export NEEDS_PRE_C99_DIALECT OUT_OF_SCOPE_ISSIGNALING
+export OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN
 
 # ------------------------------------------------------------- collect tests
 # Each line is `<sub-suite>:<path>`, so a worker knows which sub-suite it is in

@@ -4211,13 +4211,20 @@ impl<'a> Linearizer<'a> {
             if self.current_func_is_inline_definition && self.file_scope_statics.contains(&name_str)
             {
                 if let Some(pos) = self.current_pos {
-                    error(
-                        pos,
-                        &format!(
-                            "inline definition of '{}' cannot reference file-scope static variable '{}'",
-                            self.current_func_name, name_str
-                        ),
+                    let msg = format!(
+                        "inline definition of '{}' cannot reference file-scope static variable '{}'",
+                        self.current_func_name, name_str
                     );
+                    // gcc does not enforce this one, so real source contains
+                    // it -- ffmpeg's `dv_guess_qnos` reads a file-scope
+                    // `static const int` from an inline definition. It is
+                    // relaxed by `-fpermissive`, which is where c17 keeps the
+                    // constraints gcc lets through.
+                    if crate::diag::permissive() {
+                        crate::diag::warning(pos, &msg);
+                    } else {
+                        error(pos, &msg);
+                    }
                 }
             }
 

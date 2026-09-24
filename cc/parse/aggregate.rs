@@ -473,7 +473,19 @@ impl Parser<'_> {
                     }
                 }
 
-                self.expect_special(b';')?;
+                // C17 6.7.2.1 requires the `;`. gcc accepts a member list
+                // whose last declaration lacks one and warns, and
+                // `-fpermissive` is where c17 keeps that kind of leniency --
+                // there is nothing ambiguous about `struct S { int a; int b }`,
+                // the `}` says the list ended.
+                if self.is_special(b'}') && diag::permissive() {
+                    diag::warning(
+                        self.current_pos(),
+                        &gettext("the last member of a struct or union needs a ';'"),
+                    );
+                } else {
+                    self.expect_special(b';')?;
+                }
             }
 
             self.expect_special(b'}')?;

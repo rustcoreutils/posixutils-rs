@@ -366,8 +366,26 @@ pub fn locale_matching(candidates: &[&str]) -> Option<String> {
 /// `cmd` is the binary name as [`get_binary_path`] resolves it. The utility
 /// must produce enough output that it is still writing when the pipe closes;
 /// `args` should name something large.
+/// Fill `buf`, looping until it is full or the stream ends.
+///
+/// Returns how many bytes arrived, so a caller can tell "the stream really is
+/// this short" -- the answer `read_exact` throws away -- from "one `read`
+/// happened to come back early", which is not an answer about the stream at
+/// all.
+fn read_until_full(r: &mut impl std::io::Read, buf: &mut [u8]) -> usize {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    n
+}
+
 pub fn assert_dies_by_sigpipe(cmd: &str, args: &[&str]) {
-    use std::io::Read as _;
     use std::os::unix::process::ExitStatusExt as _;
 
     let mut child = Command::new(get_binary_path(cmd))
@@ -385,23 +403,42 @@ pub fn assert_dies_by_sigpipe(cmd: &str, args: &[&str]) {
     // below would then blame SIGPIPE for an operand that was simply too small.
     // Reading a full buffer says the output is larger than this, which is the
     // precondition the caller has to meet.
+    //
+    // Which is why this loops rather than calling `read` once. A single `read`
+    // returns whatever is in the pipe at that instant, and is explicitly
+    // allowed to come back short with more on the way -- so its count measures
+    // when the reader was scheduled, not how much the utility has to say. Every
+    // caller here names an operand far larger than this buffer, and `ls` still
+    // failed the assertion with exactly 30 bytes: one `println!`, which is one
+    // line, which is one write. Looping asks the question the assertion means.
     let mut stdout = child.stdout.take().expect("child stdout");
     let mut buf = [0u8; 64];
-    let got = stdout.read(&mut buf).unwrap_or(0);
+    let got = read_until_full(&mut stdout, &mut buf);
     drop(stdout);
-    assert_eq!(
-        got,
-        buf.len(),
-        "{}: only {} bytes of output before the pipe closed -- this operand is \
-         too small to race a reader, so the test cannot say anything about \
-         SIGPIPE. Give it more to write.",
-        cmd,
-        got
-    );
 
     let out = child
         .wait_with_output()
         .unwrap_or_else(|e| panic!("wait for {}: {}", cmd, e));
+
+    // Reaped *before* this is judged, so a short answer arrives with the
+    // reason attached. The utility reaching end of output early and the
+    // utility dying early look identical in a byte count, and the first
+    // version asserted here with the child still running -- so the one
+    // question a failure raises was the one thing the message could not
+    // answer.
+    assert_eq!(
+        got,
+        buf.len(),
+        "{}: only {} bytes of output before the pipe closed -- too small to \
+         race a reader, so this says nothing about SIGPIPE. The utility \
+         exited {:?} (signal {:?}) with stderr {:?}. Either the operand needs \
+         to be larger, or it stopped early for the reason shown.",
+        cmd,
+        got,
+        out.status.code(),
+        out.status.signal(),
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     assert_eq!(
         out.status.signal(),
@@ -417,4 +454,69 @@ pub fn assert_dies_by_sigpipe(cmd: &str, args: &[&str]) {
         cmd,
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_until_full;
+    use std::io::Read;
+
+    /// A stream that hands back exactly the chunks it was given, one per
+    /// `read`, however much room the caller offers.
+    ///
+    /// Which is what a pipe does: a `read` returns what is in it now. Writing
+    /// the chunks down makes the question "does the helper loop?" answerable
+    /// without a second process, a scheduler or a platform.
+    struct Chunks(Vec<Vec<u8>>);
+
+    impl Read for Chunks {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Ok(0);
+            }
+            let chunk = self.0.remove(0);
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            Ok(n)
+        }
+    }
+
+    fn line(n: usize) -> Vec<u8> {
+        vec![b'x'; n]
+    }
+
+    /// The regression: a stream with plenty to say, delivered in pieces
+    /// smaller than the buffer. One `read` answers 30 and the caller concludes
+    /// the operand was too small; the loop answers 64, which is the truth.
+    #[test]
+    fn read_until_full_keeps_reading_past_a_short_chunk() {
+        // 30 bytes is one `entry-with-a-long-name-NNNNNN\n`, which is what
+        // `ls` writes per `println!` and what macOS CI reported.
+        let mut src = Chunks(vec![line(30), line(30), line(30), line(30)]);
+        let mut buf = [0u8; 64];
+        assert_eq!(read_until_full(&mut src, &mut buf), 64);
+    }
+
+    /// A single chunk that already fills the buffer is unchanged.
+    #[test]
+    fn read_until_full_stops_once_the_buffer_is_full() {
+        let mut src = Chunks(vec![line(200)]);
+        let mut buf = [0u8; 64];
+        assert_eq!(read_until_full(&mut src, &mut buf), 64);
+        // Nothing was consumed beyond the one chunk the buffer could hold.
+        assert!(src.0.is_empty());
+    }
+
+    /// The case the assertion exists to catch still reports short: a stream
+    /// that really does end before the buffer fills. Without this the fix
+    /// would have removed the check rather than corrected it.
+    #[test]
+    fn read_until_full_reports_a_stream_that_truly_ends_early() {
+        let mut src = Chunks(vec![line(30)]);
+        let mut buf = [0u8; 64];
+        assert_eq!(read_until_full(&mut src, &mut buf), 30);
+
+        let mut empty = Chunks(vec![]);
+        assert_eq!(read_until_full(&mut empty, &mut buf), 0);
+    }
 }

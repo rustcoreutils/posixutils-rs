@@ -1011,7 +1011,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     elem_idx += 1;
                     continue;
                 };
-                let field_size = (self.types.size_bits(member.typ) / 8) as usize;
+                let field_size = self.types.size_bytes(member.typ);
 
                 // Brace elision: scalar for aggregate member
                 let kind = if self.is_brace_elision_candidate(element, member.typ) {
@@ -1061,7 +1061,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 }
             }
-            let field_size = (self.types.size_bits(field_type) / 8) as usize;
+            let field_size = self.types.size_bytes(field_type);
             visits.push(StructFieldVisit {
                 offset,
                 typ: field_type,

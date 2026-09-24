@@ -3613,39 +3613,37 @@ fn diagnostics_representable_enumerators_are_accepted() {
     }
 }
 
-/// An object too large for the compiler to describe is diagnosed, not capped.
+/// An object too large to describe is diagnosed, not capped.
 ///
-/// `TypeTable::size_bits` answers in a `u32`, and an extent past that used to
-/// saturate in silence: `char big[5000000000];` compiled and reported `sizeof`
-/// 536870911. gcc accepts these — its own limit is far higher — so this is an
-/// implementation limit rather than a constraint violation, and the message
-/// says so. Recorded at #C122.
+/// The bound is what C makes it: an object is addressed by pointer
+/// arithmetic, and 6.5.6p9 makes the difference of two pointers into one
+/// object a `ptrdiff_t`, so an object whose size does not fit a signed 64-bit
+/// value cannot be indexed from end to end. It used to be 512 MB, which was
+/// an accident of `size_bits` answering in a `u32`, and an extent past it
+/// saturated in silence: `char big[5000000000];` compiled and reported
+/// `sizeof` 536870911. Recorded at #C122.
 #[test]
 fn diagnostics_object_larger_than_the_compiler_can_describe() {
     for (name, src) in [
         (
-            "array_five_billion",
-            "char big[5000000000L];\nint main(void){ return 0; }\n",
+            "array_past_ptrdiff",
+            "char big[9300000000000000000UL];\nint main(void){ return 0; }\n",
         ),
         (
-            "array_just_over",
-            "char big[536870912];\nint main(void){ return 0; }\n",
-        ),
-        (
-            "array_of_int",
-            "int big[2000000000L];\nint main(void){ return 0; }\n",
+            "array_of_int_past_ptrdiff",
+            "int big[4000000000000000000L];\nint main(void){ return 0; }\n",
         ),
         (
             "array_two_dimensions",
-            "char big[16385][32768];\nint main(void){ return 0; }\n",
+            "char big[4000000000L][4000000000L];\nint main(void){ return 0; }\n",
         ),
         (
             "array_block_scope",
-            "int main(void){ static char big[5000000000L]; return big[0]; }\n",
+            "int main(void){ static char big[9300000000000000000UL]; return big[0]; }\n",
         ),
         (
             "array_typedef",
-            "typedef char T[5000000000L];\nint main(void){ return 0; }\n",
+            "typedef char T[9300000000000000000UL];\nint main(void){ return 0; }\n",
         ),
     ] {
         compile_expect_error(name, src, "exceeds the maximum object size");
@@ -3654,7 +3652,8 @@ fn diagnostics_object_larger_than_the_compiler_can_describe() {
     // A member list can reach the bound even when no single member does.
     compile_expect_error(
         "struct_sum_of_members",
-        "struct S { char a[400000000]; char b[400000000]; } s;\nint main(void){ return 0; }\n",
+        "struct S { char a[2000000000000000000L]; char b[2000000000000000000L]; } s;\n\
+         int main(void){ return 0; }\n",
         "size of struct exceeds the maximum object size",
     );
 }
@@ -3665,21 +3664,26 @@ fn diagnostics_object_larger_than_the_compiler_can_describe() {
 #[test]
 fn diagnostics_largest_describable_object_is_accepted() {
     for (name, src) in [
+        // Past the old 512 MB cap, and well within what C allows.
         (
-            "array_at_the_bound",
-            "char big[536870911];\nint main(void){ return 0; }\n",
+            "array_past_the_old_cap",
+            "char big[2000000000L];\nint main(void){ return 0; }\n",
         ),
         (
-            "array_of_int_at_the_bound",
-            "int big[134217727];\nint main(void){ return 0; }\n",
+            "array_of_int_past_the_old_cap",
+            "int big[2000000000L];\nint main(void){ return 0; }\n",
         ),
         (
             "array_two_dimensions",
-            "char big[16384][16384];\nint main(void){ return 0; }\n",
+            "char big[16385][32768];\nint main(void){ return 0; }\n",
         ),
         (
-            "struct_under_the_bound",
-            "struct S { char a[100000000]; char b[100000000]; } s;\nint main(void){ return 0; }\n",
+            "struct_sum_past_the_old_cap",
+            "struct S { char a[400000000]; char b[400000000]; } s;\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_near_ptrdiff_max",
+            "typedef char T[2000000000000000000L];\nint main(void){ return 0; }\n",
         ),
     ] {
         compile_expect_ok(name, src);
@@ -3692,10 +3696,14 @@ fn diagnostics_largest_describable_object_is_accepted() {
         compile_and_run(
             "object_sizes_are_exact",
             "char a[536870911];\n\
+             char b[2000000000L];\n\
+             typedef char Huge[2000000000000000000L];\n\
              struct S { char x[100000000]; char y[100000000]; } s;\n\
              int main(void) {\n\
              if (sizeof a != 536870911UL) return 1;\n\
              if (sizeof s != 200000000UL) return 2;\n\
+             if (sizeof b != 2000000000UL) return 3;\n\
+             if (sizeof (Huge) != 2000000000000000000UL) return 4;\n\
              return 0;\n\
              }\n",
             &[],
@@ -4417,14 +4425,16 @@ fn diagnostics_one_x87_asm_output() {
 /// A `vector_size` beyond the maximum object size is refused.
 ///
 /// This interns an array type directly, so nothing else would catch an absurd
-/// width: `vector_size(4294967296)` quietly produced a four-gigabyte type, and
-/// a width near `u64::MAX` overflowed `next_power_of_two` -- a panic in a
-/// debug build.
+/// width: `vector_size` once quietly produced a four-gigabyte type, and a
+/// width near `u64::MAX` overflowed `next_power_of_two` -- a panic in a debug
+/// build. The bound moved with the object-size limit; what this pins is that
+/// the check is still reached.
 #[test]
 fn diagnostics_vector_size_is_bounded() {
     compile_expect_error(
         "vector_size_too_big",
-        "typedef float V __attribute__((vector_size(4294967296)));\nint main(void){ return 0; }\n",
+        "typedef float V __attribute__((vector_size(4000000000000000000)));\n\
+         int main(void){ return 0; }\n",
         "maximum object size",
     );
     compile_expect_error(

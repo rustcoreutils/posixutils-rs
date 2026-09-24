@@ -199,6 +199,8 @@ compile/20010510-1@-O0
 compile/20010510-1@-O2
 compile/20010518-1@-O0
 compile/20010518-1@-O2
+compile/20010518-2@-O0
+compile/20010518-2@-O2
 compile/20010525-1@-O0
 compile/20010525-1@-O2
 compile/20010605-2@-O0
@@ -455,6 +457,14 @@ compile/20031010-1@-O0
 compile/20031010-1@-O2
 compile/20031011-2@-O0
 compile/20031011-2@-O2
+compile/20031023-1@-O0
+compile/20031023-1@-O2
+compile/20031023-2@-O0
+compile/20031023-2@-O2
+compile/20031023-3@-O0
+compile/20031023-3@-O2
+compile/20031023-4@-O0
+compile/20031023-4@-O2
 compile/20031031-1@-O0
 compile/20031031-1@-O2
 compile/20031031-2@-O0
@@ -1261,6 +1271,8 @@ compile/961031-1@-O0
 compile/961031-1@-O2
 compile/961126-1@-O0
 compile/961126-1@-O2
+compile/961203-1@-O0
+compile/961203-1@-O2
 compile/970206-1@-O0
 compile/970206-1@-O2
 compile/970214-1@-O0
@@ -1910,6 +1922,8 @@ compile/pr103513@-O0
 compile/pr103513@-O2
 compile/pr103682@-O0
 compile/pr103682@-O2
+compile/pr103813@-O0
+compile/pr103813@-O2
 compile/pr104327@-O0
 compile/pr104327@-O2
 compile/pr105192@-O0
@@ -3089,6 +3103,8 @@ compile/pr65593@-O0
 compile/pr65593@-O2
 compile/pr65595@-O0
 compile/pr65595@-O2
+compile/pr65680@-O0
+compile/pr65680@-O2
 compile/pr65735@-O0
 compile/pr65735@-O2
 compile/pr65803@-O0
@@ -3553,6 +3569,8 @@ compile/ssa-pre-1@-O0
 compile/ssa-pre-1@-O2
 compile/ssa-unused-1@-O0
 compile/ssa-unused-1@-O2
+compile/stack-check-1@-O0
+compile/stack-check-1@-O2
 compile/statement-expression-1@-O0
 compile/statement-expression-1@-O2
 compile/store0@-O0

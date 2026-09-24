@@ -5853,7 +5853,7 @@ impl<'a> Linearizer<'a> {
 
         // Non-VLA: compute size at compile time
         let inner_typ = self.expr_type(inner_expr);
-        let size = self.types.size_bits(inner_typ) / 8;
+        let size = self.types.size_bytes(inner_typ);
         // sizeof returns size_t, which is unsigned long in our implementation
         let result_typ = self.types.ulong_id;
         self.emit_const(size as i128, result_typ)
@@ -6172,7 +6172,7 @@ impl<'a> Linearizer<'a> {
                     }
                 }
 
-                let size = self.types.size_bits(*typ) / 8;
+                let size = self.types.size_bytes(*typ);
                 self.emit_const(size as i128, result_typ)
             }
 

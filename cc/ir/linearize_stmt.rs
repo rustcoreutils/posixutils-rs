@@ -953,7 +953,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 ));
                             }
                             // Null terminator + zero fill
-                            let arr_bytes = (self.types.size_bits(elem_type) / 8) as usize;
+                            let arr_bytes = self.types.size_bytes(elem_type);
                             let str_len = s.chars().count();
                             for i in str_len..arr_bytes {
                                 let zero = self.emit_const(0, self.types.int_id);
@@ -1005,7 +1005,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         && self.types.size_bits(expr_type) == self.types.size_bits(typ)
                     {
                         let src_addr = self.linearize_lvalue(&elements[0].value);
-                        let target_size_bytes = self.types.size_bits(typ) / 8;
+                        let target_size_bytes = self.types.size_bytes(typ);
                         self.emit_block_copy_at_offset(
                             base_sym,
                             base_offset,

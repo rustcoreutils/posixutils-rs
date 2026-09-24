@@ -1924,13 +1924,15 @@ impl TypeTable {
             TypeKind::Float16 => 16 * multiplier,
             TypeKind::Float128 => 128 * multiplier,
             TypeKind::Pointer => self.pointer_width,
+            // An aggregate larger than `u32::MAX` bits -- 512 MB -- has no
+            // *value* width, and this answers value widths: it is what the IR
+            // records on an instruction and what the ABI classifies. An object
+            // that large is only ever copied, and by a byte count, so ask
+            // `size_bytes` for its size. Saturating here rather than wrapping
+            // keeps a too-wide type from looking small.
             TypeKind::Array => {
                 let elem_size = typ.base.map(|b| self.size_bits(b)).unwrap_or(0) as u64;
                 let count = typ.array_size.unwrap_or(0) as u64;
-                // The parser refuses an extent whose product exceeds
-                // `MAX_OBJECT_BYTES`, so the saturation below is unreachable
-                // for a type that came from source. It stays as a floor
-                // rather than an overflow.
                 elem_size.saturating_mul(count).min(u32::MAX as u64) as u32
             }
             TypeKind::Struct | TypeKind::Union => {
@@ -1948,12 +1950,30 @@ impl TypeTable {
 
     /// The largest object c17 can describe, in bytes.
     ///
-    /// `size_bits` answers in a `u32`, so nothing wider than `u32::MAX` bits
-    /// has a representable size. The parser diagnoses a type that exceeds this
-    /// bound rather than letting `sizeof` saturate and answer wrongly.
-    pub const MAX_OBJECT_BYTES: usize = (u32::MAX / 8) as usize;
+    /// An object is addressed by pointer arithmetic, and C17 6.5.6p9 makes the
+    /// difference of two pointers into one object a `ptrdiff_t` -- so an object
+    /// whose size does not fit a signed 64-bit value cannot be indexed from
+    /// end to end whatever else is true of it. That, and not an accident of the
+    /// implementation, is the limit.
+    ///
+    /// It used to be `u32::MAX / 8`, which is 512 MB and had nothing to do with
+    /// C: it was the largest object whose size in *bits* fitted the `u32` that
+    /// [`Self::size_bits`] answers in. Object sizes are counted in bytes now,
+    /// by [`Self::size_bytes`], and that ceiling went with the unit.
+    ///
+    /// What remains is `u64::MAX / 8`: struct layout runs in bits, because a
+    /// bit-field's position is only expressible there, so a member list whose
+    /// total passes that has no layout to compute. It is two thousand times
+    /// the old bound and a real one -- the accumulation saturates into it
+    /// rather than wrapping past it.
+    pub const MAX_OBJECT_BYTES: usize = (u64::MAX / 8) as usize;
 
     /// Get the size of a type in bytes
+    /// The size of a type in bytes -- the answer `sizeof` gives.
+    ///
+    /// Counted in bytes throughout, not derived from [`Self::size_bits`]:
+    /// a bit count caps at 512 MB in a `u32`, and going through one made
+    /// `sizeof` of a larger object answer that cap rather than its size.
     pub fn size_bytes(&self, id: TypeId) -> usize {
         let typ = self.get(id);
         match typ.kind {
@@ -1961,6 +1981,11 @@ impl TypeTable {
                 typ.composite.as_ref().map(|c| c.size).unwrap_or(0)
             }
             TypeKind::Enum => typ.composite.as_ref().map(|c| c.size).unwrap_or(4),
+            TypeKind::Array => {
+                let elem = typ.base.map(|b| self.size_bytes(b)).unwrap_or(0);
+                let count = typ.array_size.unwrap_or(0);
+                elem.saturating_mul(count)
+            }
             _ => (self.size_bits(id) / 8) as usize,
         }
     }
@@ -1984,7 +2009,7 @@ impl TypeTable {
         // aligns to its own size, anything else keeps its natural alignment.
         // The odd sizes are the ones with no lock-free access to align for.
         if typ.modifiers.contains(TypeModifiers::ATOMIC) {
-            let size = self.size_bits(id) as usize / 8;
+            let size = self.size_bytes(id);
             if size.is_power_of_two() && size <= 16 {
                 return size.max(self.natural_alignment(id));
             }
@@ -2269,7 +2294,12 @@ impl TypeTable {
                 member.bit_offset = None;
                 member.access_bytes = None;
 
-                bit_offset += self.size_bytes(member.typ) * 8;
+                // Saturating: the layout runs in bits, so a member list whose
+                // total passes `u64::MAX` bits has no layout. Wrapping made
+                // two 5-exabyte members come out *small*, and the size check
+                // that follows then had nothing to object to.
+                bit_offset =
+                    bit_offset.saturating_add(self.size_bytes(member.typ).saturating_mul(8));
                 continue;
             };
 

@@ -268,7 +268,7 @@ does **not** skip, because neither is GNU-specific:
 
 | Test | Why c17 does not follow |
 |---|---|
-| `991014-1` | Needs `sizeof` to answer ~9.2 exabytes exactly. Sizes are carried in **bits**, so that object is 2^66 bits -- not representable in a `u64` either, and `MAX_OBJECT_BYTES` is a consequence of `size_bits`'s return type rather than an arbitrary cap. Reaching it means changing the compiler's canonical size unit from bits to bytes, through the type table, IR instruction sizes, ABI classification and both backends |
+| `991014-1` | Needs an object of ~9.2 exabytes. `MAX_OBJECT_BYTES` is `u64::MAX / 8`, a quarter of that: struct layout runs in **bits**, because a bit-field's position is only expressible there, so a member list whose total passes `u64::MAX` bits has no layout to compute. It is no longer the old 512 MB -- that bound was an accident of `size_bits` answering in a `u32`, and object sizes are counted in bytes now |
 | `920728-1` | `return;` in a function returning non-void. C17 6.8.6.4p1 makes it a constraint violation; gcc issues a warning and compiles. `-fpermissive` arguably ought to downgrade it, as it does for implicit `int` |
 
 Complex integer division is a third, recorded in `BUILTIN.md`: c17 uses

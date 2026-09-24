@@ -148,7 +148,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// Emit stores to zero-initialize an aggregate (struct, union, or array)
     /// This handles C99 6.7.8p19: uninitialized members must be zero-initialized
     pub(crate) fn emit_aggregate_zero(&mut self, base_sym: PseudoId, typ: TypeId) {
-        let total_bytes = self.types.size_bits(typ) / 8;
+        let total_bytes = self.types.size_bytes(typ);
         let mut offset: i64 = 0;
 
         // Create a zero constant for 64-bit stores

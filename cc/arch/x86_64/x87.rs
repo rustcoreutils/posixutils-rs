@@ -24,10 +24,17 @@
 use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, X86Inst, X87BinOp};
 use super::regalloc::{Loc, Reg, X87_SCRATCH_BYTES};
-use crate::arch::lir::{CondCode, OperandSize};
+use crate::arch::lir::{CondCode, Directive, Label, OperandSize};
 use crate::ir::PseudoKind;
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeKind, TypeTable};
+
+/// 2^63 as the bit pattern of a `double`.
+///
+/// The split that converts a float to a 64-bit unsigned integer needs this
+/// value in the FPU, and `fld` has no immediate form, so it is staged through
+/// a general register and the x87 scratch.
+const TWO_POW_63_BITS: i64 = 0x43e0_0000_0000_0000u64 as i64;
 
 impl X86_64CodeGen {
     /// The reserved scratch address used to stage a value into the FPU.
@@ -840,6 +847,9 @@ impl X86_64CodeGen {
     /// Pattern:
     ///   fldt   src(%rbp)          ; load long double to ST(0)
     ///   fisttpl dst(%rbp)         ; convert with truncation and store
+    ///
+    /// `fisttp` stores a *signed* integer at every width, so an unsigned
+    /// destination needs help: see [`Self::emit_x87_float_to_unsigned`].
     pub(super) fn emit_x87_float_to_int(&mut self, insn: &Instruction) {
         let src = match insn.src.first() {
             Some(&s) => s,
@@ -856,6 +866,11 @@ impl X86_64CodeGen {
         // Load long double to x87 stack
         let src_addr = self.get_x87_mem_addr(src);
         self.push_lir(X86Inst::X87Load { addr: src_addr });
+
+        if insn.op == Opcode::FCvtU {
+            self.emit_x87_float_to_unsigned(dst_size, &dst_loc);
+            return;
+        }
 
         // Determine where to store the result
         let needs_load_to_reg = matches!(&dst_loc, Loc::Reg(_) | Loc::Xmm(_));
@@ -899,5 +914,120 @@ impl X86_64CodeGen {
                 });
             }
         }
+    }
+
+    /// Convert the long double in ST(0) to an *unsigned* integer in `dst_loc`.
+    ///
+    /// `fisttp` has no unsigned form: it stores a signed integer of the named
+    /// width, so `fisttpl` answers 0x80000000 for any value at or above 2^31
+    /// and `fisttpq` answers 0x8000000000000000 for any value at or above
+    /// 2^63 -- both well inside the unsigned range.
+    ///
+    /// A 32-bit destination is fixed by converting at 64 bits and keeping the
+    /// low half; the whole of `unsigned int` fits a signed 64-bit result.
+    /// A 64-bit destination needs the range split, exactly as the SSE path
+    /// does in `emit_float_to_u64`:
+    ///
+    /// ```text
+    ///     movabs $0x43e0000000000000, %r11   # 2^63 as a double
+    ///     mov    %r11, 8+scratch
+    ///     fldl   8+scratch                   # ST0 = 2^63, ST1 = x
+    ///     fucomip %st(1), %st                # compare, pop; ST0 = x
+    ///     jbe    .big                        # 2^63 <= x
+    ///     fisttpq scratch
+    ///     mov    scratch, %r10
+    ///     jmp    .done
+    ///   .big:
+    ///     fldl   8+scratch
+    ///     fsubrp                             # ST0 = x - 2^63
+    ///     fisttpq scratch
+    ///     mov    scratch, %r10
+    ///     movabs $1<<63, %r11
+    ///     xor    %r11, %r10                  # put the bit back
+    ///   .done:
+    /// ```
+    ///
+    /// The subtraction is exact -- 2^63 is a power of two and x87's 64-bit
+    /// significand covers the whole of `unsigned long long`.
+    fn emit_x87_float_to_unsigned(&mut self, dst_size: u32, dst_loc: &Loc) {
+        // Two disjoint halves of the 16-byte x87 scratch: the result goes in
+        // the first, the 2^63 constant in byte 8 of the same object.
+        let result_addr = self.x87_scratch_addr();
+        let const_addr = self.stack_field(X87_SCRATCH_BYTES, 8);
+
+        if dst_size > 32 {
+            let uid = self.unique_label_counter;
+            self.unique_label_counter += 1;
+            let big_label = Label::new(&self.base.current_fn, 10000 + uid * 2);
+            let done_label = Label::new(&self.base.current_fn, 10000 + uid * 2 + 1);
+
+            self.push_lir(X86Inst::MovAbs {
+                imm: TWO_POW_63_BITS,
+                dst: Reg::R11,
+            });
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::R11),
+                dst: GpOperand::Mem(const_addr.clone()),
+            });
+            self.push_lir(X86Inst::X87LoadDouble {
+                addr: const_addr.clone(),
+            });
+            self.push_lir(X86Inst::X87CmpPop);
+            self.push_lir(X86Inst::Jcc {
+                cc: CondCode::Ule,
+                target: big_label.clone(),
+            });
+
+            self.push_lir(X86Inst::X87StoreInt64 {
+                addr: result_addr.clone(),
+            });
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(result_addr.clone()),
+                dst: GpOperand::Reg(Reg::R10),
+            });
+            self.push_lir(X86Inst::Jmp {
+                target: done_label.clone(),
+            });
+
+            self.push_lir(X86Inst::Directive(Directive::BlockLabel(big_label)));
+            self.push_lir(X86Inst::X87LoadDouble { addr: const_addr });
+            self.push_lir(X86Inst::X87BinOp { op: X87BinOp::Sub });
+            self.push_lir(X86Inst::X87StoreInt64 {
+                addr: result_addr.clone(),
+            });
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(result_addr),
+                dst: GpOperand::Reg(Reg::R10),
+            });
+            // Put back the bit the subtraction removed. It is known clear in
+            // the converted result, so `xor` and `add` agree here.
+            self.push_lir(X86Inst::MovAbs {
+                imm: i64::MIN,
+                dst: Reg::R11,
+            });
+            self.push_lir(X86Inst::Xor {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::R11),
+                dst: Reg::R10,
+            });
+            self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+            self.emit_move_to_loc(Reg::R10, dst_loc, dst_size);
+            return;
+        }
+
+        // 32-bit destination: convert at 64 bits and keep the low half. Every
+        // `unsigned int` fits a signed 64-bit result, so no split is needed.
+        self.push_lir(X86Inst::X87StoreInt64 {
+            addr: result_addr.clone(),
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Mem(result_addr),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        self.emit_move_to_loc(Reg::R10, dst_loc, dst_size);
     }
 }

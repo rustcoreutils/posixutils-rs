@@ -791,27 +791,136 @@ impl X86_64CodeGen {
             _ => Reg::R10, // Use scratch register R10
         };
 
-        // Convert using cvttss2si/cvttsd2si (truncate toward zero).
-        // For unsigned 32-bit targets, use 64-bit conversion to avoid
-        // overflow for values >= 2^31 that fit in uint32_t but not int32_t.
-        // Ask the predicate, not the modifier bit: the bit is silent for the
-        // types whose signedness does not live there.
-        let is_unsigned = types.is_unsigned(dst_typ);
-        let int_size = if is_unsigned && dst_size == 32 {
-            OperandSize::B64 // cvttsd2siq then truncate
+        // Signedness is the opcode's. `linearize_cast` and `emit_convert` both
+        // choose `FCvtU` from `is_unsigned(dst_typ)`, so asking the opcode asks
+        // the same question one step closer to the answer, and it is the
+        // question `emit_int_to_float` already asks for the other direction.
+        let is_unsigned = insn.op == Opcode::FCvtU;
+
+        if is_unsigned && dst_size == 64 && matches!(fp_size, FpSize::Single | FpSize::Double) {
+            // cvttss2si/cvttsd2si are *signed*: every value at or above 2^63
+            // overflows and yields the "integer indefinite" 0x8000000000000000,
+            // so the whole upper half of the unsigned range came back wrong.
+            // Split the range, mirroring emit_int_to_float's unsigned path.
+            self.emit_float_to_u64(fp_size, dst_reg);
         } else {
-            OperandSize::from_bits(dst_size)
-        };
-        self.push_lir(X86Inst::CvtFpToInt {
-            fp_size,
-            int_size,
-            src: XmmOperand::Reg(XmmReg::Xmm15),
-            dst: dst_reg,
-        });
+            // Convert using cvttss2si/cvttsd2si (truncate toward zero).
+            // For unsigned 32-bit targets, use 64-bit conversion to avoid
+            // overflow for values >= 2^31 that fit in uint32_t but not int32_t.
+            // A Half source cannot reach 2^63 at all, so it needs no split.
+            let int_size = if is_unsigned && dst_size == 32 {
+                OperandSize::B64 // cvttsd2siq then truncate
+            } else {
+                OperandSize::from_bits(dst_size)
+            };
+            self.push_lir(X86Inst::CvtFpToInt {
+                fp_size,
+                int_size,
+                src: XmmOperand::Reg(XmmReg::Xmm15),
+                dst: dst_reg,
+            });
+        }
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
             self.emit_move_to_loc(dst_reg, &dst_loc, dst_size);
         }
+    }
+
+    /// Convert the float in XMM15 to a 64-bit *unsigned* integer in `dst`.
+    ///
+    /// x86-64 has no unsigned float-to-integer instruction: `cvttsd2si` reads
+    /// its result as signed, so anything at or above 2^63 overflows and gives
+    /// the "integer indefinite" 0x8000000000000000. The range has to be split:
+    ///
+    /// ```text
+    ///     movsd  $2^63, %xmm14
+    ///     ucomisd %xmm14, %xmm15
+    ///     jae    .big
+    ///     cvttsd2si %xmm15, dst        # value < 2^63, or negative, or NaN
+    ///     jmp    .done
+    ///   .big:
+    ///     subsd  %xmm14, %xmm15        # bring it into the signed range
+    ///     cvttsd2si %xmm15, dst
+    ///     movabs $1<<63, %r11
+    ///     xor    %r11, dst             # put the bit back
+    ///   .done:
+    /// ```
+    ///
+    /// The subtraction is exact: 2^63 is a power of two, and every value in
+    /// [2^63, 2^64) has an exponent at least that of 2^63, so no bit of the
+    /// significand is lost. A NaN compares unordered, which sets CF and so
+    /// takes the `jae`-not-taken path — the conversion is undefined there and
+    /// yields the same indefinite gcc produces.
+    ///
+    /// This mirrors `emit_int_to_float`'s unsigned path, which is the same
+    /// problem in the other direction.
+    fn emit_float_to_u64(&mut self, fp_size: FpSize, dst: Reg) {
+        debug_assert_ne!(
+            dst,
+            Reg::R11,
+            "R11 is codegen scratch and is clobbered here"
+        );
+
+        let uid = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        // High block_id values, as emit_int_to_float does, so these cannot
+        // collide with a basic block's own label.
+        let big_label = Label::new(&self.base.current_fn, 10000 + uid * 2);
+        let done_label = Label::new(&self.base.current_fn, 10000 + uid * 2 + 1);
+
+        // 2^63 is exactly representable in both float and double.
+        const TWO_POW_63: f64 = 9223372036854775808.0;
+        self.emit_fp_imm_to_xmm(
+            FloatVal::from_f64(TWO_POW_63),
+            XmmReg::Xmm14,
+            fp_size.bits(),
+        );
+
+        self.push_lir(X86Inst::UComiFp {
+            size: fp_size,
+            src: XmmOperand::Reg(XmmReg::Xmm14),
+            dst: XmmReg::Xmm15,
+        });
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Uge,
+            target: big_label.clone(),
+        });
+
+        // Below 2^63: the signed conversion is already the right answer.
+        self.push_lir(X86Inst::CvtFpToInt {
+            fp_size,
+            int_size: OperandSize::B64,
+            src: XmmOperand::Reg(XmmReg::Xmm15),
+            dst,
+        });
+        self.push_lir(X86Inst::Jmp {
+            target: done_label.clone(),
+        });
+
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(big_label)));
+        self.push_lir(X86Inst::SubFp {
+            size: fp_size,
+            src: XmmOperand::Reg(XmmReg::Xmm14),
+            dst: XmmReg::Xmm15,
+        });
+        self.push_lir(X86Inst::CvtFpToInt {
+            fp_size,
+            int_size: OperandSize::B64,
+            src: XmmOperand::Reg(XmmReg::Xmm15),
+            dst,
+        });
+        // `xor` rather than `add`: the ALU immediate is 32 bits, and the bit
+        // is known to be clear after subtracting 2^63.
+        self.push_lir(X86Inst::MovAbs {
+            imm: i64::MIN,
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Xor {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R11),
+            dst,
+        });
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
     }
 
     /// Emit float to float conversion (e.g., float to double)

@@ -399,7 +399,7 @@ fn extract_calls_from_stmt(
         Stmt::GotoIndirect { target, .. } => {
             extract_calls_from_expr(target, strings, symbols, calls);
         }
-        Stmt::Case(expr, high) => {
+        Stmt::Case(expr, high, body) => {
             extract_calls_from_expr(expr, strings, symbols, calls);
             // A range label has a second endpoint, and a call can appear in
             // either -- `case f() ... g():` is invalid C, but a constant
@@ -407,6 +407,10 @@ fn extract_calls_from_stmt(
             if let Some(high) = high {
                 extract_calls_from_expr(high, strings, symbols, calls);
             }
+            extract_calls_from_stmt(body, strings, symbols, calls);
+        }
+        Stmt::Default(_, body) => {
+            extract_calls_from_stmt(body, strings, symbols, calls);
         }
         Stmt::Label { stmt, .. } => {
             extract_calls_from_stmt(stmt, strings, symbols, calls);
@@ -572,12 +576,14 @@ fn visit_stmt_exprs(stmt: &Stmt, f: &mut dyn FnMut(&posixutils_cc::parse::ast::E
             f(expr);
             visit_stmt_exprs(body, f);
         }
-        Stmt::Case(e, high) => {
+        Stmt::Case(e, high, body) => {
             f(e);
             if let Some(high) = high {
                 f(high);
             }
+            visit_stmt_exprs(body, f);
         }
+        Stmt::Default(_, body) => visit_stmt_exprs(body, f),
         Stmt::Label { stmt, .. } => visit_stmt_exprs(stmt, f),
         _ => {}
     }

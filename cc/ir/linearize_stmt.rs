@@ -21,6 +21,23 @@ use crate::parse::ast::{
 };
 use crate::strings::StringId;
 use crate::types::TypeTable;
+
+/// A `return` whose value-ness does not match the function's type.
+///
+/// C17 6.8.6.4p1 makes both a constraint violation, and c17 reports them as
+/// errors. gcc warns and compiles, and code that does this is old rather than
+/// clever -- so `-fpermissive`, which already relaxes implicit `int` and
+/// implicit function declarations for exactly that reason, relaxes these too.
+/// The value is discarded either way, and a missing one leaves the returned
+/// value indeterminate, which is what gcc's program does as well.
+fn return_value_ness_violation(pos: Position, msg: &str) {
+    if crate::diag::permissive() {
+        crate::diag::warning(pos, msg);
+    } else {
+        error(pos, msg);
+    }
+}
+
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 
 /// Which construct a jump leaves, for `unwind_vla_marks`.
@@ -106,9 +123,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                             if returns_void
                                 && self.types.kind(self.expr_type(e)) != TypeKind::Void =>
                         {
-                            error(e.pos, "'return' with a value in a function returning void")
+                            return_value_ness_violation(
+                                e.pos,
+                                "'return' with a value in a function returning void",
+                            )
                         }
-                        None if !returns_void => error(
+                        None if !returns_void => return_value_ness_violation(
                             // `Stmt` carries no position, so fall back to the
                             // last expression lowered in this function.
                             self.current_pos.unwrap_or_default(),
@@ -339,9 +359,14 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.linearize_switch(expr, body);
             }
 
-            Stmt::Case(..) | Stmt::Default(_) => {
-                // Case/Default labels are handled by linearize_switch
-                // If we encounter them outside a switch, ignore them
+            Stmt::Case(_, _, body) | Stmt::Default(_, body) => {
+                // The label itself is placed by `linearize_switch`; reaching
+                // one here means it is outside a switch, which
+                // `check_jumps_into_variably_modified_scopes` has already
+                // diagnosed. The statement it labels is still ordinary code
+                // and is lowered, so the rest of the function is not lost
+                // behind one bad label.
+                self.linearize_stmt(body);
             }
 
             Stmt::Asm {
@@ -948,7 +973,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 ));
                             }
                             // Null terminator + zero fill
-                            let arr_bytes = (self.types.size_bits(elem_type) / 8) as usize;
+                            let arr_bytes = self.types.size_bytes(elem_type);
                             let str_len = s.chars().count();
                             for i in str_len..arr_bytes {
                                 let zero = self.emit_const(0, self.types.int_id);
@@ -1000,7 +1025,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         && self.types.size_bits(expr_type) == self.types.size_bits(typ)
                     {
                         let src_addr = self.linearize_lvalue(&elements[0].value);
-                        let target_size_bytes = self.types.size_bits(typ) / 8;
+                        let target_size_bytes = self.types.size_bytes(typ);
                         self.emit_block_copy_at_offset(
                             base_sym,
                             base_offset,
@@ -1744,7 +1769,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         unsigned: bool,
     ) {
         match stmt {
-            Stmt::Case(expr, high) => {
+            Stmt::Case(expr, high, body) => {
+                self.collect_cases_from_stmt(body, case_values, has_default, unsigned);
                 // Extract constant value from case expression
                 if let Some(val) = self.eval_const_expr(expr) {
                     // Kept at full width. Truncating to `i64` here was silent
@@ -1823,7 +1849,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                     );
                 }
             }
-            Stmt::Default(_) => {
+            Stmt::Default(_, body) => {
+                self.collect_cases_from_stmt(body, case_values, has_default, unsigned);
                 // C99 6.8.4.2p3: at most one default label per switch.
                 if *has_default {
                     error(
@@ -2161,6 +2188,45 @@ impl<'a> super::linearize::Linearizer<'a> {
     ///
     /// Returns Some((symbol_name, offset)) if the expression is a valid static address,
     /// or None if it can't be computed at compile time.
+    /// Is this expression an *address*, whatever its type says?
+    ///
+    /// A pointer or an array is one. So is a cast of one: `(unsigned long)&x`
+    /// has integer type and is still a relocation, which is how a kernel or a
+    /// linker script's C half writes an address constant.
+    ///
+    /// An object *read* is not one, however freely its address could be
+    /// taken. `int v = 5; int w = v + 1;` is not a constant expression, and
+    /// asking `eval_static_address` alone would have answered that it was --
+    /// that walk takes the address of any named object it is handed.
+    pub(crate) fn is_address_valued(&self, expr: &Expr) -> bool {
+        if expr
+            .typ
+            .is_some_and(|t| matches!(self.types.kind(t), TypeKind::Pointer | TypeKind::Array))
+        {
+            return true;
+        }
+        match &expr.kind {
+            ExprKind::Cast { expr: inner, .. } => self.is_address_valued(inner),
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                ..
+            } => true,
+            // An address plus or minus an integer is an address. An address
+            // *minus an address* is an integer -- a byte or element count --
+            // so the difference of two members of one object must not be read
+            // as a relocation.
+            ExprKind::Binary { op, left, right } => {
+                let (l, r) = (self.is_address_valued(left), self.is_address_valued(right));
+                match op {
+                    BinaryOp::Add => l != r,
+                    BinaryOp::Sub => l && !r,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn eval_static_address(&mut self, expr: &Expr) -> Option<(String, i64)> {
         match &expr.kind {
             // A literal has a perfectly good static address, but only once it
@@ -2271,15 +2337,16 @@ impl<'a> super::linearize::Linearizer<'a> {
                 left,
                 right,
             } => {
-                // Determine which side is the pointer and which is the integer
-                let (ptr_expr, int_expr, is_sub) = if left.typ.is_some_and(|t| {
-                    self.types.kind(t) == TypeKind::Pointer || self.types.kind(t) == TypeKind::Array
-                }) {
+                // Which side names a symbol, not which side has a pointer
+                // type. A cast to an integer makes `(unsigned long)&_text - 1`
+                // ordinary arithmetic to the type system and a relocation with
+                // an addend to the linker, and asking the type alone answered
+                // "not a constant expression" for every such initializer --
+                // which is how a kernel or a linker script's C half is
+                // written.
+                let (ptr_expr, int_expr, is_sub) = if self.is_address_valued(left) {
                     (left.as_ref(), right.as_ref(), *op == BinaryOp::Sub)
-                } else if right.typ.is_some_and(|t| {
-                    self.types.kind(t) == TypeKind::Pointer || self.types.kind(t) == TypeKind::Array
-                }) && *op == BinaryOp::Add
-                {
+                } else if self.is_address_valued(right) && *op == BinaryOp::Add {
                     (right.as_ref(), left.as_ref(), false)
                 } else {
                     return None;
@@ -2415,7 +2482,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         case_idx: &mut usize,
     ) {
         match stmt {
-            Stmt::Case(expr, high) => {
+            Stmt::Case(expr, high, body) => {
                 // Find the matching case block. A label is identified by its
                 // whole range, so that `case 1 ... 3:` and a later `case 1:`
                 // could not resolve to the same block -- the overlap check
@@ -2444,8 +2511,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                         *case_idx = idx + 1;
                     }
                 }
+                // Then the statement the label prefixes, which is where its
+                // code actually is.
+                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
             }
-            Stmt::Default(_) => {
+            Stmt::Default(_, body) => {
                 if let Some(def_bb) = default_bb {
                     // Fall through from previous case if not terminated
                     if !self.is_terminated() {
@@ -2457,6 +2527,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
                     self.switch_bb(def_bb);
                 }
+                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
             }
 
             // Duff's device: case labels can appear inside loops/blocks
@@ -3276,12 +3347,12 @@ impl VmScopeWalk {
                 }
             }
 
-            Stmt::Case(..) | Stmt::Default(_) => {
+            Stmt::Case(..) | Stmt::Default(..) => {
                 // 6.8.1p2: a `case` or `default` belongs to a `switch`.
                 if self.switch_depth == 0 {
                     let (pos, what) = match stmt {
-                        Stmt::Case(expr, _) => (expr.pos, "case"),
-                        Stmt::Default(pos) => (*pos, "default"),
+                        Stmt::Case(expr, _, _) => (expr.pos, "case"),
+                        Stmt::Default(pos, _) => (*pos, "default"),
                         _ => unreachable!(),
                     };
                     self.stray_jumps.push((pos, what));
@@ -3292,8 +3363,8 @@ impl VmScopeWalk {
                 // its declaration running.
                 if let Some(outer) = switch_scopes {
                     let label_pos = match stmt {
-                        Stmt::Case(expr, _) => expr.pos,
-                        Stmt::Default(pos) => *pos,
+                        Stmt::Case(expr, _, _) => expr.pos,
+                        Stmt::Default(pos, _) => *pos,
                         _ => unreachable!("only a case or default reaches this arm"),
                     };
                     for id in &self.open {
@@ -3302,6 +3373,14 @@ impl VmScopeWalk {
                         }
                     }
                 }
+
+                // The label carries the statement it prefixes, so the walk
+                // continues through it.
+                let labeled = match stmt {
+                    Stmt::Case(_, _, body) | Stmt::Default(_, body) => body,
+                    _ => unreachable!("only a case or default reaches this arm"),
+                };
+                self.walk(labeled, switch_scopes);
             }
 
             // A `switch` becomes the reference point for the labels inside it.

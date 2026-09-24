@@ -3613,39 +3613,37 @@ fn diagnostics_representable_enumerators_are_accepted() {
     }
 }
 
-/// An object too large for the compiler to describe is diagnosed, not capped.
+/// An object too large to describe is diagnosed, not capped.
 ///
-/// `TypeTable::size_bits` answers in a `u32`, and an extent past that used to
-/// saturate in silence: `char big[5000000000];` compiled and reported `sizeof`
-/// 536870911. gcc accepts these — its own limit is far higher — so this is an
-/// implementation limit rather than a constraint violation, and the message
-/// says so. Recorded at #C122.
+/// The bound is what C makes it: an object is addressed by pointer
+/// arithmetic, and 6.5.6p9 makes the difference of two pointers into one
+/// object a `ptrdiff_t`, so an object whose size does not fit a signed 64-bit
+/// value cannot be indexed from end to end. It used to be 512 MB, which was
+/// an accident of `size_bits` answering in a `u32`, and an extent past it
+/// saturated in silence: `char big[5000000000];` compiled and reported
+/// `sizeof` 536870911. Recorded at #C122.
 #[test]
 fn diagnostics_object_larger_than_the_compiler_can_describe() {
     for (name, src) in [
         (
-            "array_five_billion",
-            "char big[5000000000L];\nint main(void){ return 0; }\n",
+            "array_past_ptrdiff",
+            "char big[9300000000000000000UL];\nint main(void){ return 0; }\n",
         ),
         (
-            "array_just_over",
-            "char big[536870912];\nint main(void){ return 0; }\n",
-        ),
-        (
-            "array_of_int",
-            "int big[2000000000L];\nint main(void){ return 0; }\n",
+            "array_of_int_past_ptrdiff",
+            "int big[4000000000000000000L];\nint main(void){ return 0; }\n",
         ),
         (
             "array_two_dimensions",
-            "char big[16385][32768];\nint main(void){ return 0; }\n",
+            "char big[4000000000L][4000000000L];\nint main(void){ return 0; }\n",
         ),
         (
             "array_block_scope",
-            "int main(void){ static char big[5000000000L]; return big[0]; }\n",
+            "int main(void){ static char big[9300000000000000000UL]; return big[0]; }\n",
         ),
         (
             "array_typedef",
-            "typedef char T[5000000000L];\nint main(void){ return 0; }\n",
+            "typedef char T[9300000000000000000UL];\nint main(void){ return 0; }\n",
         ),
     ] {
         compile_expect_error(name, src, "exceeds the maximum object size");
@@ -3654,7 +3652,8 @@ fn diagnostics_object_larger_than_the_compiler_can_describe() {
     // A member list can reach the bound even when no single member does.
     compile_expect_error(
         "struct_sum_of_members",
-        "struct S { char a[400000000]; char b[400000000]; } s;\nint main(void){ return 0; }\n",
+        "struct S { char a[2000000000000000000L]; char b[2000000000000000000L]; } s;\n\
+         int main(void){ return 0; }\n",
         "size of struct exceeds the maximum object size",
     );
 }
@@ -3665,37 +3664,56 @@ fn diagnostics_object_larger_than_the_compiler_can_describe() {
 #[test]
 fn diagnostics_largest_describable_object_is_accepted() {
     for (name, src) in [
+        // Past the old 512 MB cap, and well within what C allows.
         (
-            "array_at_the_bound",
-            "char big[536870911];\nint main(void){ return 0; }\n",
+            "array_past_the_old_cap",
+            "char big[2000000000L];\nint main(void){ return 0; }\n",
         ),
         (
-            "array_of_int_at_the_bound",
-            "int big[134217727];\nint main(void){ return 0; }\n",
+            "array_of_int_past_the_old_cap",
+            "int big[2000000000L];\nint main(void){ return 0; }\n",
         ),
         (
             "array_two_dimensions",
-            "char big[16384][16384];\nint main(void){ return 0; }\n",
+            "char big[16385][32768];\nint main(void){ return 0; }\n",
         ),
         (
-            "struct_under_the_bound",
-            "struct S { char a[100000000]; char b[100000000]; } s;\nint main(void){ return 0; }\n",
+            "struct_sum_past_the_old_cap",
+            "struct S { char a[400000000]; char b[400000000]; } s;\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_near_ptrdiff_max",
+            "typedef char T[2000000000000000000L];\nint main(void){ return 0; }\n",
         ),
     ] {
         compile_expect_ok(name, src);
     }
 
-    // And the sizes are the ones gcc reports. These all sit under the bound,
-    // so they were right before the diagnostic existed too; the assertion is
-    // here so that moving the bound cannot quietly move an answer with it.
+    // And the sizes are the ones gcc reports, so that moving the bound cannot
+    // quietly move an answer with it.
+    //
+    // Everything past the old cap is asked of a *type*, not of an object.
+    // `sizeof` needs no storage, and defining the objects instead made the
+    // program ask its loader for gigabytes of zero-fill: a `char b[2000000000]`
+    // here is `.zerofill` of 2 GB in the Mach-O, and macOS refuses to map it
+    // ("dyld cache not loaded: syscall to map cache into shared region
+    // failed") where Linux's overcommit had hidden the cost. The one object
+    // that is defined is the size the old bound allowed, which is what pins
+    // that the bound moved without the answers moving.
     assert_eq!(
         compile_and_run(
             "object_sizes_are_exact",
             "char a[536870911];\n\
              struct S { char x[100000000]; char y[100000000]; } s;\n\
+             typedef char PastOldCap[2000000000L];\n\
+             typedef char Huge[2000000000000000000L];\n\
+             typedef struct { char x[4000000000L]; char y[4000000000L]; } BigSum;\n\
              int main(void) {\n\
              if (sizeof a != 536870911UL) return 1;\n\
              if (sizeof s != 200000000UL) return 2;\n\
+             if (sizeof (PastOldCap) != 2000000000UL) return 3;\n\
+             if (sizeof (Huge) != 2000000000000000000UL) return 4;\n\
+             if (sizeof (BigSum) != 8000000000UL) return 5;\n\
              return 0;\n\
              }\n",
             &[],
@@ -4417,14 +4435,16 @@ fn diagnostics_one_x87_asm_output() {
 /// A `vector_size` beyond the maximum object size is refused.
 ///
 /// This interns an array type directly, so nothing else would catch an absurd
-/// width: `vector_size(4294967296)` quietly produced a four-gigabyte type, and
-/// a width near `u64::MAX` overflowed `next_power_of_two` -- a panic in a
-/// debug build.
+/// width: `vector_size` once quietly produced a four-gigabyte type, and a
+/// width near `u64::MAX` overflowed `next_power_of_two` -- a panic in a debug
+/// build. The bound moved with the object-size limit; what this pins is that
+/// the check is still reached.
 #[test]
 fn diagnostics_vector_size_is_bounded() {
     compile_expect_error(
         "vector_size_too_big",
-        "typedef float V __attribute__((vector_size(4294967296)));\nint main(void){ return 0; }\n",
+        "typedef float V __attribute__((vector_size(4000000000000000000)));\n\
+         int main(void){ return 0; }\n",
         "maximum object size",
     );
     compile_expect_error(
@@ -5259,6 +5279,55 @@ int helper(int x) { return x + 1; }
             ),
             0,
             "at {opt}"
+        );
+    }
+}
+
+// ============================================================================
+// What `-fpermissive` relaxes
+// ============================================================================
+
+/// The constraints gcc lets through, and c17 relaxes only when asked.
+///
+/// Each is a genuine C17 constraint violation, and each appears in source old
+/// enough that gcc chose to warn rather than refuse. `-fpermissive` is where
+/// c17 keeps that leniency: it already covers implicit `int` and implicit
+/// function declarations, and these join them rather than becoming warnings
+/// for everybody.
+#[test]
+fn diagnostics_permissive_relaxes_the_constraints_gcc_warns_about() {
+    const CASES: &[(&str, &str, &str)] = &[
+        (
+            "return_without_value",
+            "double g(void) { return; }\n",
+            "'return' with no value",
+        ),
+        (
+            "return_with_value",
+            "void h(int v) { return v; }\n",
+            "'return' with a value",
+        ),
+        (
+            "struct_member_missing_semicolon",
+            "struct S { int a; int b };\nint main(void){ return 0; }\n",
+            "needs a ';'",
+        ),
+        (
+            "inline_reads_a_file_scope_static",
+            "static const int k = 3;\ninline int f(void) { return k; }\nint main(void){ return f() - 3; }\n",
+            "cannot reference file-scope static",
+        ),
+    ];
+
+    for (name, src, needle) in CASES {
+        // An error by default...
+        compile_expect_error(name, src, "");
+        // ...and a warning naming the same thing under -fpermissive.
+        let warned =
+            crate::common::compile_expect_warning_with(name, src, &["-fpermissive".to_string()]);
+        assert!(
+            warned.contains(needle),
+            "{name}: -fpermissive should warn about {needle}, got:\n{warned}"
         );
     }
 }

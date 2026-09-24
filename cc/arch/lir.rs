@@ -751,14 +751,14 @@ pub enum Directive {
     Type { sym: Symbol, kind: SymbolType },
 
     /// .size symbol, size (ELF only)
-    Size { sym: Symbol, size: u32 },
+    Size { sym: Symbol, size: u64 },
 
     /// Allocate file-scope, internal-linkage BSS storage for a single symbol.
     /// Emitted as `.local sym` + `.comm sym, size, align` on ELF (which routes
     /// the symbol to `.bss` with local visibility) and as
     /// `.zerofill __DATA,__bss,sym,size,log2(align)` on Mach-O. The alignment
     /// is expressed in bytes; the emitter converts to log2 on Mach-O.
-    BssLocal { sym: Symbol, size: u32, align: u32 },
+    BssLocal { sym: Symbol, size: u64, align: u32 },
 
     /// An exported object with no initialized bytes, as a *definition*.
     ///
@@ -767,7 +767,7 @@ pub enum Directive {
     /// silently where C17 6.9p5 allows one and gcc reports
     /// `multiple definition`. gcc has defaulted to `-fno-common` since 10,
     /// and emits no common symbols at all.
-    BssGlobal { sym: Symbol, size: u32, align: u32 },
+    BssGlobal { sym: Symbol, size: u64, align: u32 },
 
     // ========================================================================
     // Alignment
@@ -949,7 +949,7 @@ impl Directive {
         }
     }
 
-    pub fn size(name: impl Into<String>, size: u32) -> Self {
+    pub fn size(name: impl Into<String>, size: u64) -> Self {
         Directive::Size {
             sym: Symbol::global(name),
             size,
@@ -968,7 +968,7 @@ impl Directive {
         }
     }
 
-    pub fn bss_local(name: impl Into<String>, size: u32, align: u32) -> Self {
+    pub fn bss_local(name: impl Into<String>, size: u64, align: u32) -> Self {
         Directive::BssLocal {
             sym: Symbol::global(name),
             size,
@@ -976,7 +976,7 @@ impl Directive {
         }
     }
 
-    pub fn bss_global(name: impl Into<String>, size: u32, align: u32) -> Self {
+    pub fn bss_global(name: impl Into<String>, size: u64, align: u32) -> Self {
         Directive::BssGlobal {
             sym: Symbol::global(name),
             size,

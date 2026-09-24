@@ -862,3 +862,160 @@ int main(void) {
         "a function declarator must be usable anywhere in an init-declarator list"
     );
 }
+
+// ============================================================================
+// One init-declarator list, whatever the declarators look like
+// ============================================================================
+
+/// `int (*b)(), (*c)();` is two declarators, not two declarations.
+///
+/// At file scope the parenthesized form went down a path of its own that
+/// parsed exactly one declarator and then demanded the semicolon, so the comma
+/// was a syntax error -- although the identical line inside a function has
+/// always worked, because block scope runs one list walker for every
+/// declarator it sees. The two paths now share that walker.
+#[test]
+fn declarations_grouped_declarators_may_be_listed() {
+    let code = r#"
+int one(void) { return 1; }
+int two(void) { return 2; }
+
+int (*b)(void), (*c)(void);
+int (*arr1)[4], (*arr2)[8];
+int plain, (*mixed)(void), tail;
+typedef int (fa)(void), (fb)(int);
+static fa *sp = one;
+
+int main(void) {
+    int (*p)(void), (*q)(void);           /* the block-scope spelling */
+    b = one; c = two;
+    if (b() != 1 || c() != 2) return 1;
+    p = two; q = one;
+    if (p() != 2 || q() != 1) return 2;
+    if (sizeof(*arr1) != 4 * sizeof(int)) return 3;
+    if (sizeof(*arr2) != 8 * sizeof(int)) return 4;
+    plain = 5; tail = 6; mixed = two;
+    if (plain + tail != 11 || mixed() != 2) return 5;
+    if (sp() != 1) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("grouped_declarator_list", code, &[]), 0);
+}
+
+/// The `*` written before a parenthesized declarator belongs to that
+/// declarator alone: in `int *(*d)(void), (*e)(void);` the second declarator
+/// is built from `int`, not from `int *`.
+#[test]
+fn declarations_pointer_run_belongs_to_its_own_declarator() {
+    let code = r#"
+int one(void) { return 1; }
+static int value = 7;
+int *ptr(void) { return &value; }
+
+int *(*d)(void), (*e)(void);
+
+int main(void) {
+    d = ptr;
+    e = one;
+    if (*d() != 7) return 1;
+    if (e() != 1) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("pointer_run_per_declarator", code, &[]), 0);
+}
+
+/// C17 6.7p1 lets the specifiers of a declaration appear in any order, so a
+/// storage class or a function specifier may follow a `struct` definition.
+///
+/// The list that accepted them there was five storage classes long, which made
+/// `struct S { int x; } extern __thread a;` stop at `__thread` and read it as
+/// the declarator's name -- a silent misparse rather than a diagnostic.
+#[test]
+fn declarations_specifiers_may_follow_a_struct_definition() {
+    let code = r#"
+struct A { int x; };
+__thread struct A ta;                  /* the definition `extern` refers to */
+struct A extern __thread ta;           /* specifiers in any order, C17 6.7p1 */
+struct B { int x; } static sb;
+union C { int x; } static const uc;
+struct D { int x; } _Alignas(16) da;
+
+int main(void) {
+    if (_Alignof(da) != 16) return 1;
+    sb.x = 3;
+    if (sb.x != 3) return 2;
+    ta.x = 4;
+    if (ta.x != 4) return 3;
+    (void)uc;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("specifiers_after_struct", code, &[]), 0);
+}
+
+// ============================================================================
+// Where a GNU attribute may be written
+// ============================================================================
+
+/// An attribute may sit between two `*`s, at the head of a parameter
+/// declaration, and after a comma in a declarator list.
+///
+/// The first was worse than a parse error at block scope:
+/// `expect_declarator_name` does not treat `__attribute__` as reserved, so it
+/// became the declared object's *name*. The second came of two predicates
+/// disagreeing about whether a declaration starts here -- one asked
+/// `TYPE_KEYWORD`, the other `DECL_START`, which includes the attribute
+/// keyword.
+#[test]
+fn declarations_attribute_placements_gcc_accepts() {
+    let code = r#"
+int *__attribute__((__aligned__(16))) *pp;
+void bar(int (__attribute__((__mode__(__SI__))) int foo));
+int a, __attribute__((unused)) bb;
+__attribute__((noreturn)) void d0(void), d1(void);
+
+int main(void) {
+    int *__attribute__((aligned(16))) *q;
+    int local, __attribute__((unused)) other;
+    q = pp;
+    (void)q;
+    local = 1;
+    other = 2;
+    return local + other == 3 ? 0 : 1;
+}
+
+void d0(void) { for (;;) {} }
+void d1(void) { for (;;) {} }
+"#;
+    assert_eq!(compile_and_run("attribute_placements", code, &[]), 0);
+}
+
+/// C11 6.7.5p5 forbids the `_Alignas` **keyword** from reducing alignment.
+/// The GNU `aligned` attribute shares the same slot and is not constrained:
+/// gcc accepts `__attribute__((aligned(2))) int` on a typedef, a variable and
+/// a struct alike, and rejects `_Alignas(2) int`. The check knew which was
+/// written and never asked.
+#[test]
+fn declarations_aligned_attribute_may_reduce_alignment() {
+    let code = r#"
+typedef __attribute__((aligned(2))) int small_int;
+__attribute__((aligned(2))) int reduced;
+struct raised { int x; } __attribute__((aligned(16)));
+
+int main(void) {
+    if (_Alignof(small_int) != 2) return 1;
+    if (_Alignof(reduced) != 2) return 2;
+    /* On a struct, `aligned` only raises: reducing one needs `packed`, and
+       gcc answers 4 here too. Raising is the usual case and still works. */
+    if (_Alignof(struct raised) != 16) return 3;
+    {
+        typedef __attribute__((aligned(32))) int wide_int;
+        if (_Alignof(wide_int) != 32) return 4;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("aligned_attr_reduces", code, &[]), 0);
+}

@@ -46,9 +46,15 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__ARM_FP", Some("14")), // VFPv3 compatible
         ("__ARM_FP16_FORMAT_IEEE", Some("1")),
         ("__ARM_FEATURE_FMA", Some("1")),
-        // __GCC_HAVE_SYNC_COMPARE_AND_SWAP_{1,2,4,8} is deliberately absent;
-        // see the note on the x86-64 list. c17 implements no `__sync_*`
-        // builtin, so advertising them only sent guarded code into a wall.
+        // The `__sync_*` family is implemented, so the macro that guards it is
+        // a true statement about this compiler and is defined. It says the
+        // compare-and-swap builtins exist at 1, 2, 4 and 8 bytes, which is
+        // exactly c17's lock-free ceiling; 16 is absent because there is no
+        // 16-byte atomic here, as there is none in gcc's own default.
+        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1", Some("1")),
+        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2", Some("1")),
+        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4", Some("1")),
+        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8", Some("1")),
         // Lock-free atomics
         ("__GCC_ATOMIC_BOOL_LOCK_FREE", Some("2")),
         ("__GCC_ATOMIC_CHAR_LOCK_FREE", Some("2")),

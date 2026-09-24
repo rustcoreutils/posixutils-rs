@@ -2951,6 +2951,105 @@ int main(void) {
 }
 
 // ============================================================================
+// Regression: float to unsigned long long must not use signed cvttsd2si
+// ============================================================================
+
+/// The other direction of `codegen_unsigned_long_to_double`, and the same
+/// trap: `cvttsd2si`/`cvttss2si`/`fisttp` all answer as though the destination
+/// were signed, so every value at or above 2^63 came back as the "integer
+/// indefinite" 0x8000000000000000 -- silently, at every optimization level.
+///
+/// The cases below straddle 2^63 in both directions and cover all three source
+/// formats, because each has its own emitter: SSE for `float` and `double`,
+/// x87 for `long double`. The `unsigned int` rows are here because the x87
+/// path got its 32-bit answer from a signed 32-bit store, so any value at or
+/// above 2^31 was wrong there too.
+const FLOAT_TO_UNSIGNED: &str = r#"
+int main(void) {
+    volatile double d;
+    volatile float f;
+    volatile long double ld;
+
+    /* Below 2^63: the signed conversion was always right, and must stay. */
+    d = 9223372036854774784.0;              /* the double just below 2^63 */
+    if ((unsigned long long)d != 9223372036854774784ULL) return 1;
+    d = 1.0e10;
+    if ((unsigned long long)d != 10000000000ULL) return 2;
+    d = 0.5;
+    if ((unsigned long long)d != 0ULL) return 3;
+
+    /* At and above 2^63: this is what was broken. */
+    d = 9223372036854775808.0;              /* exactly 2^63 */
+    if ((unsigned long long)d != 9223372036854775808ULL) return 4;
+    d = 9700000000000000000.0;
+    if ((unsigned long long)d != 9700000000000000000ULL) return 5;
+    d = 18446744073709549568.0;             /* the double just below 2^64 */
+    if ((unsigned long long)d != 18446744073709549568ULL) return 6;
+
+    /* float has its own emitter path. */
+    f = 9223372036854775808.0f;
+    if ((unsigned long long)f != 9223372036854775808ULL) return 7;
+    f = 18446742974197923840.0f;            /* the float just below 2^64 */
+    if ((unsigned long long)f != 18446742974197923840ULL) return 8;
+    f = 100.5f;
+    if ((unsigned long long)f != 100ULL) return 9;
+
+    /* long double goes through x87 on x86-64. */
+    ld = 9223372036854775808.0L;
+    if ((unsigned long long)ld != 9223372036854775808ULL) return 10;
+    ld = 9700000000000000000.0L;
+    if ((unsigned long long)ld != 9700000000000000000ULL) return 11;
+    ld = 1.0e10L;
+    if ((unsigned long long)ld != 10000000000ULL) return 12;
+
+    /* unsigned int at and above 2^31, from each source format. */
+    d = 4294967295.0;
+    if ((unsigned int)d != 4294967295U) return 13;
+    f = 2147483648.0f;
+    if ((unsigned int)f != 2147483648U) return 14;
+    ld = 4294967295.0L;
+    if ((unsigned int)ld != 4294967295U) return 15;
+
+    /* Deliberately no out-of-range case: a value the destination cannot hold
+       is undefined, and the two targets disagree -- x86 keeps the low bits,
+       aarch64 saturates. Both are allowed, so asserting either would pin a
+       platform rather than the rule. */
+
+    /* The signed destinations must not have moved. */
+    d = -1.5;
+    if ((long long)d != -1LL) return 16;
+    ld = -1.5L;
+    if ((long long)ld != -1LL) return 17;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_float_to_unsigned_long_long() {
+    assert_eq!(
+        compile_and_run("float_to_unsigned", FLOAT_TO_UNSIGNED, &[]),
+        0
+    );
+}
+
+#[test]
+fn codegen_float_to_unsigned_long_long_optimized() {
+    assert_eq!(
+        compile_and_run_optimized("float_to_unsigned_opt", FLOAT_TO_UNSIGNED),
+        0
+    );
+}
+
+#[test]
+fn codegen_float_to_unsigned_long_long_aarch64() {
+    // aarch64 has `fcvtzu` and was never wrong here; the test pins that, and
+    // catches a "fix" applied to the wrong target.
+    if let Some(code) = compile_and_run_aarch64("float_to_unsigned_a64", FLOAT_TO_UNSIGNED, "-O2") {
+        assert_eq!(code, 0);
+    }
+}
+
+// ============================================================================
 // Regression: ternary result type must be common type of both branches
 // ============================================================================
 

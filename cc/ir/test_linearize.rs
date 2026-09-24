@@ -543,13 +543,23 @@ fn test_switch_basic() {
     let x_sym = ctx.var("x", int_type);
 
     // Build switch body: { case 1: return 10; case 2: return 20; default: return 0; }
+    // A label carries the statement it prefixes (C17 6.8.1), so each arm is
+    // one `BlockItem` rather than a marker followed by a sibling.
     let switch_body = Stmt::Block(vec![
-        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(1, &ctx.types), None))),
-        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(10, &ctx.types))))),
-        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(2, &ctx.types), None))),
-        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(20, &ctx.types))))),
-        BlockItem::Statement(Box::new(Stmt::Default(test_pos()))),
-        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
+        BlockItem::Statement(Box::new(Stmt::Case(
+            Expr::int(1, &ctx.types),
+            None,
+            Box::new(Stmt::Return(Some(Expr::int(10, &ctx.types)))),
+        ))),
+        BlockItem::Statement(Box::new(Stmt::Case(
+            Expr::int(2, &ctx.types),
+            None,
+            Box::new(Stmt::Return(Some(Expr::int(20, &ctx.types)))),
+        ))),
+        BlockItem::Statement(Box::new(Stmt::Default(
+            test_pos(),
+            Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+        ))),
     ]);
 
     let switch_stmt = Stmt::Switch {
@@ -609,17 +619,20 @@ fn test_switch_with_break() {
     let x_sym = ctx.var("x", int_type);
 
     let switch_body = Stmt::Block(vec![
-        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(1, &ctx.types), None))),
-        BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
-            ExprKind::Assign {
-                op: AssignOp::Assign,
-                target: Box::new(Expr::var_typed(x_sym, int_type)),
-                value: Box::new(Expr::int(10, &ctx.types)),
-            },
-            int_type,
-        )))),
+        BlockItem::Statement(Box::new(Stmt::Case(
+            Expr::int(1, &ctx.types),
+            None,
+            Box::new(Stmt::Expr(Expr::typed_unpositioned(
+                ExprKind::Assign {
+                    op: AssignOp::Assign,
+                    target: Box::new(Expr::var_typed(x_sym, int_type)),
+                    value: Box::new(Expr::int(10, &ctx.types)),
+                },
+                int_type,
+            ))),
+        ))),
         BlockItem::Statement(Box::new(Stmt::Break(test_pos()))),
-        BlockItem::Statement(Box::new(Stmt::Default(test_pos()))),
+        BlockItem::Statement(Box::new(Stmt::Default(test_pos(), Box::new(Stmt::Empty)))),
         BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
             ExprKind::Assign {
                 op: AssignOp::Assign,

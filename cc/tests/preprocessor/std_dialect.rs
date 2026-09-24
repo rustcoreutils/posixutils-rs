@@ -387,12 +387,11 @@ fn c17_suppression_does_not_hide_an_unknown_std() {
 // without the builtin does not make the feature available -- it makes the
 // fallback unreachable, so the file fails where it would otherwise have built.
 //
-// These tests pin the *relationship*, not the absence: if the builtins are
-// ever implemented, the sync assertions below are meant to fail so the macro
-// gets restored along with them.
+// These tests pin the *relationship*, not the presence or the absence: the
+// macro and the builtin have to arrive together and leave together.
 // ---------------------------------------------------------------------------
 
-/// The `__sync_*` family c17 does not implement, and the macros that guard it.
+/// The `__sync_*` compare-and-swap widths, and the macros that guard them.
 const SYNC_CAS_MACROS: &[&str] = &[
     "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1",
     "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2",
@@ -400,45 +399,58 @@ const SYNC_CAS_MACROS: &[&str] = &[
     "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8",
 ];
 
+/// The macro is defined because the builtin exists. It was withdrawn while
+/// `__sync_*` was unimplemented, because a guarded `#ifdef` then opened a
+/// branch that failed on an undeclared identifier when the `#else` beside it
+/// would have compiled.
 #[test]
-fn c17_does_not_advertise_the_sync_builtins_it_lacks() {
+fn c17_advertises_the_sync_builtins_it_has() {
     for macro_name in SYNC_CAS_MACROS {
         let got = expand_under("sync_cas", None, macro_name);
         assert!(
-            is_undefined(&got, macro_name),
-            "{macro_name} must not be defined while `__sync_*` is unimplemented, got {got}"
+            !is_undefined(&got, macro_name) && got.contains('1'),
+            "{macro_name} must be defined now that `__sync_*` is implemented, got {got}"
         );
     }
 }
 
-/// The other half of the promise: the builtin really is absent. If this starts
-/// failing, implement-and-restore is the fix -- not deleting the test.
+/// The other half of the promise: each width the macro claims really does
+/// compile and run. A macro that outruns the capability is the defect these
+/// tests exist for, in either direction.
 #[test]
-fn c17_sync_builtins_are_genuinely_absent() {
-    // If this stops failing to compile, the feature arrived: restore
-    // __GCC_HAVE_SYNC_COMPARE_AND_SWAP_* alongside it rather than deleting
-    // this test.
-    crate::common::compile_expect_error(
-        "sync_absent",
-        "int main(void){ int x = 1;\n\
-         return __sync_bool_compare_and_swap(&x, 1, 2) ? 0 : 1; }\n",
-        "__sync_bool_compare_and_swap",
+fn c17_sync_cas_works_at_every_advertised_width() {
+    let code = r#"
+int main(void) {
+    { char v = 1; if (!__sync_bool_compare_and_swap(&v, 1, 2) || v != 2) return 1; }
+    { short v = 1; if (!__sync_bool_compare_and_swap(&v, 1, 2) || v != 2) return 2; }
+    { int v = 1; if (!__sync_bool_compare_and_swap(&v, 1, 2) || v != 2) return 3; }
+    { long long v = 1; if (!__sync_bool_compare_and_swap(&v, 1, 2) || v != 2) return 4; }
+    return 0;
+}
+"#;
+    assert_eq!(
+        crate::common::compile_and_run("sync_cas_widths", code, &[]),
+        0
     );
 }
 
-/// A program guarded on the macro must reach its portable `#else` and run.
+/// A program guarded on the macro must take the guarded branch and run it.
+///
+/// This is the same test it was while the family was unimplemented, with the
+/// branch that now has to work swapped for the one that did: the macro decides
+/// which arm compiles, so it is the arm that must run.
 #[test]
-fn c17_sync_guarded_code_takes_the_portable_branch() {
+fn c17_sync_guarded_code_takes_the_guarded_branch() {
     let src = "#ifdef __GCC_HAVE_SYNC_COMPARE_AND_SWAP_4\n\
                int main(void){ int x = 1;\n\
-               return __sync_bool_compare_and_swap(&x, 1, 2) ? 0 : 1; }\n\
+               return __sync_bool_compare_and_swap(&x, 1, 2) && x == 2 ? 0 : 1; }\n\
                #else\n\
-               int main(void){ return 0; }\n\
+               int main(void){ return 1; }\n\
                #endif\n";
     assert_eq!(
         crate::common::compile_and_run("sync_guarded", src, &[]),
         0,
-        "guarded code must fall through to the portable branch and run"
+        "the guarded branch must compile and run now that the builtin exists"
     );
 }
 
@@ -472,13 +484,14 @@ fn c17_aarch64_simd_macros_match_gcc() {
         "__ARM_NEON__ is the AArch32 spelling; gcc does not define it here, got {legacy}"
     );
 
-    // The sync builtins are a *compiler* capability, and that one really is
-    // absent, so its macro must be too -- on this target as on the host.
+    // The sync builtins are a *compiler* capability and c17 has them, so the
+    // macro is defined on this target as on the host. A target list that
+    // disagreed with the host one would be the defect here.
     for macro_name in SYNC_CAS_MACROS {
         let got = expand_under("neon_sync", Some("--target=aarch64-linux-gnu"), macro_name);
         assert!(
-            is_undefined(&got, macro_name),
-            "{macro_name} must not be defined on aarch64 either, got {got}"
+            !is_undefined(&got, macro_name) && got.contains('1'),
+            "{macro_name} must be defined on aarch64 too, got {got}"
         );
     }
 }

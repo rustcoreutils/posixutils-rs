@@ -2551,6 +2551,14 @@ impl Module {
 
     /// Add a string literal and return its label
     pub fn add_string(&mut self, content: String) -> String {
+        // One label per distinct contents. Minting a fresh one per occurrence
+        // made two identical literals two objects, which C17 6.4.5p7 permits
+        // but which no compiler does -- and it made `&"Foobar"[1] -
+        // &"Foobar"[0]` a difference between *different* symbols, so the
+        // static initializer could not be folded at all.
+        if let Some((label, _)) = self.strings.iter().find(|(_, c)| *c == content) {
+            return label.clone();
+        }
         let label = format!(".LC{}", self.strings.len());
         self.strings.push((label.clone(), content));
         label

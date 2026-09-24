@@ -331,7 +331,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     }
 
     pub fn emit_global(&mut self, global: &crate::ir::GlobalDef, types: &TypeTable) {
-        let size = types.size_bits(global.typ) / 8;
+        let size = types.size_bytes(global.typ) as u64;
         let size = if size == 0 { 8 } else { size }; // Default to 8 bytes
 
         // Get alignment: explicit _Alignas takes precedence over natural alignment

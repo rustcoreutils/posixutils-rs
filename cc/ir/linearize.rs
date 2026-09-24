@@ -18,9 +18,10 @@ use super::{
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{error, get_all_stream_names, Position};
 use crate::float::FloatVal;
+use crate::ir::linearize_atomic::AtomicLvalue;
 use crate::parse::ast::{
-    BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpTest, FunctionDef, InitElement,
-    OffsetOfPath, TranslationUnit, UnaryOp,
+    BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef, GnuAtomicOp,
+    InitElement, OffsetOfPath, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
@@ -1769,6 +1770,12 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Signbitf { arg }
             | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
 
+            // Pure iff both operands are: the relation itself reads nothing
+            // else and raises nothing, which is the point of the family.
+            ExprKind::FpCompare { lhs, rhs, .. } => {
+                self.is_pure_expr(lhs) && self.is_pure_expr(rhs)
+            }
+
             // Pure iff everything it reads is: the class codes are ordinary
             // expressions, not constants, so they count too.
             ExprKind::FpClassify { classes, arg } => {
@@ -1791,7 +1798,9 @@ impl<'a> Linearizer<'a> {
             ExprKind::Setjmp { .. } | ExprKind::Longjmp { .. } => false,
 
             // Atomic operations have side effects (memory ordering)
-            ExprKind::C11AtomicInit { .. }
+            ExprKind::GnuAtomicRmw { .. }
+            | ExprKind::GnuAtomicCas { .. }
+            | ExprKind::C11AtomicInit { .. }
             | ExprKind::C11AtomicLoad { .. }
             | ExprKind::C11AtomicStore { .. }
             | ExprKind::C11AtomicExchange { .. }
@@ -2776,6 +2785,44 @@ impl<'a> Linearizer<'a> {
                 let finite = self.emit_is_finite(val, typ, size);
                 let magnitude = self.emit_at_least_normal(val, typ, size);
                 self.emit_bool_combine(Opcode::And, finite, magnitude)
+            }
+        }
+    }
+
+    /// The C99 7.12.14 relations, each yielding 0 or 1.
+    ///
+    /// Every one of them is a comparison c17 already emits. The family exists
+    /// in C because the ordinary relational operators are specified to raise
+    /// `FE_INVALID` on an unordered pair and these are not -- and c17 emits
+    /// the quiet compare (`ucomis*`, `fucomip`) for both, so the two agree
+    /// here and there is nothing further to arrange.
+    ///
+    /// Both operands are linearized before any comparison is emitted, so
+    /// `isgreater(f(), g())` calls each function exactly once.
+    fn linearize_fp_compare(&mut self, cmp: FpCompare, lhs: &Expr, rhs: &Expr) -> PseudoId {
+        let typ = self.expr_type(lhs);
+        let size = self.types.size_bits(typ);
+        let a = self.linearize_expr(lhs);
+        let b = self.linearize_expr(rhs);
+
+        match cmp {
+            FpCompare::Greater => self.emit_fcmp(Opcode::FCmpOGt, a, b, typ, size),
+            FpCompare::GreaterEqual => self.emit_fcmp(Opcode::FCmpOGe, a, b, typ, size),
+            FpCompare::Less => self.emit_fcmp(Opcode::FCmpOLt, a, b, typ, size),
+            FpCompare::LessEqual => self.emit_fcmp(Opcode::FCmpOLe, a, b, typ, size),
+            // Ordered and unequal. `!=` will not do: it is *true* for an
+            // unordered pair, and this must be false for one.
+            FpCompare::LessGreater => {
+                let below = self.emit_fcmp(Opcode::FCmpOLt, a, b, typ, size);
+                let above = self.emit_fcmp(Opcode::FCmpOGt, a, b, typ, size);
+                self.emit_bool_combine(Opcode::Or, below, above)
+            }
+            // `isnan(a) || isnan(b)`, spelled as the self-comparison
+            // `linearize_fp_test` uses for `isnan`.
+            FpCompare::Unordered => {
+                let a_nan = self.emit_fcmp(Opcode::FCmpONe, a, a, typ, size);
+                let b_nan = self.emit_fcmp(Opcode::FCmpONe, b, b, typ, size);
+                self.emit_bool_combine(Opcode::Or, a_nan, b_nan)
             }
         }
     }
@@ -4164,13 +4211,20 @@ impl<'a> Linearizer<'a> {
             if self.current_func_is_inline_definition && self.file_scope_statics.contains(&name_str)
             {
                 if let Some(pos) = self.current_pos {
-                    error(
-                        pos,
-                        &format!(
-                            "inline definition of '{}' cannot reference file-scope static variable '{}'",
-                            self.current_func_name, name_str
-                        ),
+                    let msg = format!(
+                        "inline definition of '{}' cannot reference file-scope static variable '{}'",
+                        self.current_func_name, name_str
                     );
+                    // gcc does not enforce this one, so real source contains
+                    // it -- ffmpeg's `dv_guess_qnos` reads a file-scope
+                    // `static const int` from an inline definition. It is
+                    // relaxed by `-fpermissive`, which is where c17 keeps the
+                    // constraints gcc lets through.
+                    if crate::diag::permissive() {
+                        crate::diag::warning(pos, &msg);
+                    } else {
+                        error(pos, &msg);
+                    }
                 }
             }
 
@@ -5131,6 +5185,7 @@ impl<'a> Linearizer<'a> {
             }
 
             ExprKind::FpTest { test, arg } => self.linearize_fp_test(*test, arg),
+            ExprKind::FpCompare { cmp, lhs, rhs } => self.linearize_fp_compare(*cmp, lhs, rhs),
 
             ExprKind::FpClassify { classes, arg } => self.linearize_fp_classify(classes, arg),
 
@@ -5231,6 +5286,134 @@ impl<'a> Linearizer<'a> {
     /// and emit `op [ptr, value?, order]`. Eleven hand-written copies of that
     /// is how the operand convention drifted out of the linearizer's reach in
     /// the first place -- `AsmConstraint::is_memory` had the same problem.
+    /// gcc's `__atomic_*` / `__sync_*` read-modify-write.
+    ///
+    /// The operation itself goes through the same `emit_atomic_rmw` the
+    /// compound assignment on an `_Atomic` object uses, so a native
+    /// fetch-and-op is taken where the target has one and the CAS loop
+    /// elsewhere -- one implementation of the LL/SC rules, not two.
+    ///
+    /// `*_and_fetch` re-applies the operation to the value the exchange
+    /// returned. That is arithmetic on a value already in hand, not a second
+    /// access to the object, and it reuses the operand *pseudo* -- so
+    /// `__sync_add_and_fetch(p, f())` calls `f` exactly once.
+    fn linearize_gnu_atomic_rmw(
+        &mut self,
+        op: GnuAtomicOp,
+        ptr: &Expr,
+        val: &Expr,
+        order: &Expr,
+        returns_new: bool,
+    ) -> PseudoId {
+        let ptr_type = self.expr_type(ptr);
+        let elem_typ = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+        let bits = self.types.size_bits(elem_typ);
+
+        let addr = self.linearize_expr(ptr);
+        let value_typ = self.expr_type(val);
+        let raw = self.linearize_expr(val);
+        // Pointer arithmetic scales by the element size, as it does for `+=`.
+        let operand = if self.types.kind(elem_typ) == TypeKind::Pointer
+            && self.types.is_integer(value_typ)
+            && matches!(op, GnuAtomicOp::Add | GnuAtomicOp::Sub)
+        {
+            self.scale_pointer_addend(elem_typ, value_typ, raw)
+        } else {
+            self.emit_convert(raw, value_typ, elem_typ)
+        };
+        // The order argument is accepted and evaluated, as gcc evaluates it,
+        // but every lowering here is sequentially consistent: `emit_atomic_rmw`
+        // and its CAS loop are, and answering a weaker order with a stronger
+        // one is always correct.
+        let _ = self.linearize_expr(order);
+
+        let lv = AtomicLvalue {
+            addr,
+            elem_typ,
+            size_bits: bits,
+        };
+
+        let (old, binop) = match op {
+            GnuAtomicOp::Nand => (self.emit_atomic_nand(&lv, operand), Opcode::And),
+            _ => {
+                let binop = match op {
+                    GnuAtomicOp::Add => Opcode::Add,
+                    GnuAtomicOp::Sub => Opcode::Sub,
+                    GnuAtomicOp::And => Opcode::And,
+                    GnuAtomicOp::Or => Opcode::Or,
+                    GnuAtomicOp::Xor => Opcode::Xor,
+                    GnuAtomicOp::Nand => unreachable!("handled above"),
+                };
+                (self.emit_atomic_rmw(&lv, binop, operand), binop)
+            }
+        };
+
+        if !returns_new {
+            return old;
+        }
+
+        let new = self.alloc_reg_pseudo();
+        self.emit(Instruction::binop(binop, new, old, operand, elem_typ, bits));
+        if op != GnuAtomicOp::Nand {
+            return new;
+        }
+        let inverted = self.alloc_reg_pseudo();
+        self.emit(Instruction::unop(
+            Opcode::Not,
+            inverted,
+            new,
+            elem_typ,
+            bits,
+        ));
+        inverted
+    }
+
+    /// `__sync_bool_compare_and_swap` and `__sync_val_compare_and_swap`.
+    ///
+    /// The expected value arrives by value, so it is staged in a temporary
+    /// whose address the compare-exchange takes. Afterwards that temporary
+    /// holds the object's old value either way: on success the object held
+    /// what was expected, and on failure both backends write the observed
+    /// value back through the pointer.
+    fn linearize_gnu_atomic_cas(
+        &mut self,
+        ptr: &Expr,
+        expected: &Expr,
+        desired: &Expr,
+        returns_old: bool,
+    ) -> PseudoId {
+        let ptr_type = self.expr_type(ptr);
+        let elem_typ = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+        let bits = self.types.size_bits(elem_typ);
+
+        let addr = self.linearize_expr(ptr);
+        let exp_typ = self.expr_type(expected);
+        let exp_raw = self.linearize_expr(expected);
+        let exp_val = self.emit_convert(exp_raw, exp_typ, elem_typ);
+        let des_typ = self.expr_type(desired);
+        let des_raw = self.linearize_expr(desired);
+        let des_val = self.emit_convert(des_raw, des_typ, elem_typ);
+
+        let exp_addr = self.alloc_local_temp(elem_typ);
+        self.emit(Instruction::store(exp_val, exp_addr, 0, elem_typ, bits));
+
+        let ok = self.alloc_reg_pseudo();
+        let order = self.emit_const(MemoryOrder::SeqCst as i128, self.types.int_id);
+        let mut cas = Instruction::new(Opcode::AtomicCas).with_target(ok);
+        cas.src = vec![addr, exp_addr, des_val, order];
+        cas.typ = Some(self.types.bool_id);
+        cas.size = bits;
+        cas.memory_order = MemoryOrder::SeqCst;
+        self.emit(cas);
+
+        if !returns_old {
+            return ok;
+        }
+        let old = self.alloc_reg_pseudo();
+        self.emit(Instruction::load(old, exp_addr, 0, elem_typ, bits));
+        old
+    }
+
     fn emit_c11_atomic_builtin(
         &mut self,
         op: Opcode,
@@ -5323,6 +5506,21 @@ impl<'a> Linearizer<'a> {
                 self.emit(insn);
                 result
             }
+
+            ExprKind::GnuAtomicRmw {
+                op,
+                ptr,
+                val,
+                order,
+                returns_new,
+            } => self.linearize_gnu_atomic_rmw(*op, ptr, val, order, *returns_new),
+
+            ExprKind::GnuAtomicCas {
+                ptr,
+                expected,
+                desired,
+                returns_old,
+            } => self.linearize_gnu_atomic_cas(ptr, expected, desired, *returns_old),
 
             ExprKind::C11AtomicFetchAdd { ptr, val, order } => {
                 self.emit_c11_atomic_builtin(Opcode::AtomicFetchAdd, ptr, Some(val), Some(order))
@@ -5662,7 +5860,7 @@ impl<'a> Linearizer<'a> {
 
         // Non-VLA: compute size at compile time
         let inner_typ = self.expr_type(inner_expr);
-        let size = self.types.size_bits(inner_typ) / 8;
+        let size = self.types.size_bytes(inner_typ);
         // sizeof returns size_t, which is unsigned long in our implementation
         let result_typ = self.types.ulong_id;
         self.emit_const(size as i128, result_typ)
@@ -5981,7 +6179,7 @@ impl<'a> Linearizer<'a> {
                     }
                 }
 
-                let size = self.types.size_bits(*typ) / 8;
+                let size = self.types.size_bytes(*typ);
                 self.emit_const(size as i128, result_typ)
             }
 
@@ -6047,6 +6245,7 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Signbit { .. }
             | ExprKind::Signbitf { .. }
             | ExprKind::FpTest { .. }
+            | ExprKind::FpCompare { .. }
             | ExprKind::FpClassify { .. }
             | ExprKind::Unreachable
             | ExprKind::FrameAddress { .. }
@@ -6058,6 +6257,8 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::C11AtomicInit { .. }
             | ExprKind::C11AtomicLoad { .. }
+            | ExprKind::GnuAtomicRmw { .. }
+            | ExprKind::GnuAtomicCas { .. }
             | ExprKind::C11AtomicStore { .. }
             | ExprKind::C11AtomicExchange { .. }
             | ExprKind::C11AtomicCompareExchangeStrong { .. }

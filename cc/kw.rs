@@ -52,19 +52,43 @@ pub const DECL_START: u32 =
 
 // Keyword definition macros
 
-/// Helper macro: recursive counter that assigns sequential StringId values starting from 1.
-/// Entries named `_` are anonymous — they get interned and tagged but no `pub const` is emitted.
-macro_rules! define_ids {
-    // Base case: no more entries
-    ($counter:expr; ) => {};
-    // Anonymous entry (name is `_`): skip const, just recurse
-    ($counter:expr; (_, $str:literal, $tags:expr) $(, ($name_rest:tt, $str_rest:literal, $tags_rest:expr))* $(,)? ) => {
-        define_ids!($counter + 1; $(($name_rest, $str_rest, $tags_rest)),*);
-    };
-    // Named entry: emit pub const, then recurse
-    ($counter:expr; ($name:ident, $str:literal, $tags:expr) $(, ($name_rest:tt, $str_rest:literal, $tags_rest:expr))* $(,)? ) => {
-        pub const $name: StringId = StringId($counter);
-        define_ids!($counter + 1; $(($name_rest, $str_rest, $tags_rest)),*);
+/// Are these two strings equal? A `const fn`, so [`id_of`] can run at compile
+/// time; `str` has no `const` comparison of its own.
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The `StringId` of a keyword, found by its spelling at compile time.
+///
+/// Ids are one-based: zero is reserved, so a `StringId` is never the default.
+const fn id_of(s: &str) -> StringId {
+    let mut i = 0;
+    while i < KEYWORD_STRINGS.len() {
+        if str_eq(KEYWORD_STRINGS[i], s) {
+            return StringId(i as u32 + 1);
+        }
+        i += 1;
+    }
+    panic!("keyword has no entry in KEYWORD_STRINGS")
+}
+
+/// Helper macro: one `pub const` per named entry. `_` is anonymous — it is
+/// interned and tagged, but names nothing.
+macro_rules! define_id {
+    (_, $str:literal) => {};
+    ($name:ident, $str:literal) => {
+        pub const $name: StringId = id_of($str);
     };
 }
 
@@ -73,12 +97,21 @@ macro_rules! define_ids {
 /// - One `pub const NAME: StringId` per named keyword (entries with `_` are anonymous)
 /// - KEYWORD_STRINGS: array of string literals (all entries)
 /// - KEYWORD_TAGS: array of tag bitmasks (all entries)
+///
+/// Each id is looked up by spelling rather than counted by a macro that
+/// recurses once per entry. The counting version built the *n*th id as the
+/// expression `((((1u32 + 1) + 1) + 1) ...)`, nested once per preceding
+/// keyword, because a substituted `$counter:expr` is one opaque node rather
+/// than a flat token run. At around seven hundred keywords that made **rustc
+/// itself** overflow its stack parsing this file -- a SIGSEGV in
+/// `parse_expr_assoc_with` on aarch64, where the frames are wider, while
+/// x86-64 still fit. The table has to be free to grow.
 macro_rules! define_keywords {
     ( $( ($name:tt, $str:literal, $tags:expr) ),* $(,)? ) => {
         pub const KEYWORD_COUNT: usize = [ $( $str ),* ].len();
-        define_ids!(1u32; $( ($name, $str, $tags) ),* );
         pub(crate) const KEYWORD_STRINGS: [&str; KEYWORD_COUNT] = [ $( $str ),* ];
         pub(crate) const KEYWORD_TAGS: [u32; KEYWORD_COUNT] = [ $( $tags ),* ];
+        $( define_id!($name, $str); )*
     };
 }
 
@@ -290,6 +323,163 @@ define_keywords! {
     (BUILTIN_FFSLL,     "__builtin_ffsll",    BUILTIN),
     (BUILTIN_SQRT,      "__builtin_sqrt",     BUILTIN),
     (BUILTIN_COPYSIGN,  "__builtin_copysign", BUILTIN),
+    // `bits/floatn.h` reaches for `__builtin_copysignf`, so the suffixed
+    // spellings are as load-bearing as the plain one.
+    (BUILTIN_COPYSIGNF, "__builtin_copysignf", BUILTIN),
+    (BUILTIN_COPYSIGNL, "__builtin_copysignl", BUILTIN),
+    (BUILTIN_SQRTF,     "__builtin_sqrtf",    BUILTIN),
+    (BUILTIN_SQRTL,     "__builtin_sqrtl",    BUILTIN),
+    (BUILTIN_FMAX,      "__builtin_fmax",     BUILTIN),
+    (BUILTIN_FMAXF,     "__builtin_fmaxf",    BUILTIN),
+    (BUILTIN_FMAXL,     "__builtin_fmaxl",    BUILTIN),
+    (BUILTIN_FMIN,      "__builtin_fmin",     BUILTIN),
+    (BUILTIN_FMINF,     "__builtin_fminf",    BUILTIN),
+    (BUILTIN_FMINL,     "__builtin_fminl",    BUILTIN),
+    (BUILTIN_POW,       "__builtin_pow",      BUILTIN),
+    (BUILTIN_POWF,      "__builtin_powf",     BUILTIN),
+    (BUILTIN_POWL,      "__builtin_powl",     BUILTIN),
+    (BUILTIN_FMA,       "__builtin_fma",      BUILTIN),
+    (BUILTIN_FMAF,      "__builtin_fmaf",     BUILTIN),
+    (BUILTIN_FMAL,      "__builtin_fmal",     BUILTIN),
+    (BUILTIN_BCMP,      "__builtin_bcmp",     BUILTIN),
+    (BUILTIN_BZERO,     "__builtin_bzero",    BUILTIN),
+    (BUILTIN_STPNCPY,   "__builtin_stpncpy",  BUILTIN),
+    // The libm entry points, at each of their three real widths, and the
+    // two POSIX case-insensitive comparisons. Signatures come from one
+    // table in `builtin_expr.rs`, not from a suffix test at each site.
+    (BUILTIN_CBRT,        "__builtin_cbrt", BUILTIN),
+    (BUILTIN_CBRTF,       "__builtin_cbrtf", BUILTIN),
+    (BUILTIN_CBRTL,       "__builtin_cbrtl", BUILTIN),
+    (BUILTIN_CEIL,        "__builtin_ceil", BUILTIN),
+    (BUILTIN_CEILF,       "__builtin_ceilf", BUILTIN),
+    (BUILTIN_CEILL,       "__builtin_ceill", BUILTIN),
+    (BUILTIN_FLOOR,       "__builtin_floor", BUILTIN),
+    (BUILTIN_FLOORF,      "__builtin_floorf", BUILTIN),
+    (BUILTIN_FLOORL,      "__builtin_floorl", BUILTIN),
+    (BUILTIN_TRUNC,       "__builtin_trunc", BUILTIN),
+    (BUILTIN_TRUNCF,      "__builtin_truncf", BUILTIN),
+    (BUILTIN_TRUNCL,      "__builtin_truncl", BUILTIN),
+    (BUILTIN_ROUND,       "__builtin_round", BUILTIN),
+    (BUILTIN_ROUNDF,      "__builtin_roundf", BUILTIN),
+    (BUILTIN_ROUNDL,      "__builtin_roundl", BUILTIN),
+    (BUILTIN_RINT,        "__builtin_rint", BUILTIN),
+    (BUILTIN_RINTF,       "__builtin_rintf", BUILTIN),
+    (BUILTIN_RINTL,       "__builtin_rintl", BUILTIN),
+    (BUILTIN_NEARBYINT,   "__builtin_nearbyint", BUILTIN),
+    (BUILTIN_NEARBYINTF,  "__builtin_nearbyintf", BUILTIN),
+    (BUILTIN_NEARBYINTL,  "__builtin_nearbyintl", BUILTIN),
+    (BUILTIN_SIN,         "__builtin_sin", BUILTIN),
+    (BUILTIN_SINF,        "__builtin_sinf", BUILTIN),
+    (BUILTIN_SINL,        "__builtin_sinl", BUILTIN),
+    (BUILTIN_COS,         "__builtin_cos", BUILTIN),
+    (BUILTIN_COSF,        "__builtin_cosf", BUILTIN),
+    (BUILTIN_COSL,        "__builtin_cosl", BUILTIN),
+    (BUILTIN_TAN,         "__builtin_tan", BUILTIN),
+    (BUILTIN_TANF,        "__builtin_tanf", BUILTIN),
+    (BUILTIN_TANL,        "__builtin_tanl", BUILTIN),
+    (BUILTIN_ASIN,        "__builtin_asin", BUILTIN),
+    (BUILTIN_ASINF,       "__builtin_asinf", BUILTIN),
+    (BUILTIN_ASINL,       "__builtin_asinl", BUILTIN),
+    (BUILTIN_ACOS,        "__builtin_acos", BUILTIN),
+    (BUILTIN_ACOSF,       "__builtin_acosf", BUILTIN),
+    (BUILTIN_ACOSL,       "__builtin_acosl", BUILTIN),
+    (BUILTIN_ATAN,        "__builtin_atan", BUILTIN),
+    (BUILTIN_ATANF,       "__builtin_atanf", BUILTIN),
+    (BUILTIN_ATANL,       "__builtin_atanl", BUILTIN),
+    (BUILTIN_SINH,        "__builtin_sinh", BUILTIN),
+    (BUILTIN_SINHF,       "__builtin_sinhf", BUILTIN),
+    (BUILTIN_SINHL,       "__builtin_sinhl", BUILTIN),
+    (BUILTIN_COSH,        "__builtin_cosh", BUILTIN),
+    (BUILTIN_COSHF,       "__builtin_coshf", BUILTIN),
+    (BUILTIN_COSHL,       "__builtin_coshl", BUILTIN),
+    (BUILTIN_TANH,        "__builtin_tanh", BUILTIN),
+    (BUILTIN_TANHF,       "__builtin_tanhf", BUILTIN),
+    (BUILTIN_TANHL,       "__builtin_tanhl", BUILTIN),
+    (BUILTIN_ASINH,       "__builtin_asinh", BUILTIN),
+    (BUILTIN_ASINHF,      "__builtin_asinhf", BUILTIN),
+    (BUILTIN_ASINHL,      "__builtin_asinhl", BUILTIN),
+    (BUILTIN_ACOSH,       "__builtin_acosh", BUILTIN),
+    (BUILTIN_ACOSHF,      "__builtin_acoshf", BUILTIN),
+    (BUILTIN_ACOSHL,      "__builtin_acoshl", BUILTIN),
+    (BUILTIN_ATANH,       "__builtin_atanh", BUILTIN),
+    (BUILTIN_ATANHF,      "__builtin_atanhf", BUILTIN),
+    (BUILTIN_ATANHL,      "__builtin_atanhl", BUILTIN),
+    (BUILTIN_EXP,         "__builtin_exp", BUILTIN),
+    (BUILTIN_EXPF,        "__builtin_expf", BUILTIN),
+    (BUILTIN_EXPL,        "__builtin_expl", BUILTIN),
+    (BUILTIN_EXP2,        "__builtin_exp2", BUILTIN),
+    (BUILTIN_EXP2F,       "__builtin_exp2f", BUILTIN),
+    (BUILTIN_EXP2L,       "__builtin_exp2l", BUILTIN),
+    (BUILTIN_EXPM1,       "__builtin_expm1", BUILTIN),
+    (BUILTIN_EXPM1F,      "__builtin_expm1f", BUILTIN),
+    (BUILTIN_EXPM1L,      "__builtin_expm1l", BUILTIN),
+    (BUILTIN_LOG,         "__builtin_log", BUILTIN),
+    (BUILTIN_LOGF,        "__builtin_logf", BUILTIN),
+    (BUILTIN_LOGL,        "__builtin_logl", BUILTIN),
+    (BUILTIN_LOG2,        "__builtin_log2", BUILTIN),
+    (BUILTIN_LOG2F,       "__builtin_log2f", BUILTIN),
+    (BUILTIN_LOG2L,       "__builtin_log2l", BUILTIN),
+    (BUILTIN_LOG10,       "__builtin_log10", BUILTIN),
+    (BUILTIN_LOG10F,      "__builtin_log10f", BUILTIN),
+    (BUILTIN_LOG10L,      "__builtin_log10l", BUILTIN),
+    (BUILTIN_LOG1P,       "__builtin_log1p", BUILTIN),
+    (BUILTIN_LOG1PF,      "__builtin_log1pf", BUILTIN),
+    (BUILTIN_LOG1PL,      "__builtin_log1pl", BUILTIN),
+    (BUILTIN_LOGB,        "__builtin_logb", BUILTIN),
+    (BUILTIN_LOGBF,       "__builtin_logbf", BUILTIN),
+    (BUILTIN_LOGBL,       "__builtin_logbl", BUILTIN),
+    (BUILTIN_TGAMMA,      "__builtin_tgamma", BUILTIN),
+    (BUILTIN_TGAMMAF,     "__builtin_tgammaf", BUILTIN),
+    (BUILTIN_TGAMMAL,     "__builtin_tgammal", BUILTIN),
+    (BUILTIN_LGAMMA,      "__builtin_lgamma", BUILTIN),
+    (BUILTIN_LGAMMAF,     "__builtin_lgammaf", BUILTIN),
+    (BUILTIN_LGAMMAL,     "__builtin_lgammal", BUILTIN),
+    (BUILTIN_ERF,         "__builtin_erf", BUILTIN),
+    (BUILTIN_ERFF,        "__builtin_erff", BUILTIN),
+    (BUILTIN_ERFL,        "__builtin_erfl", BUILTIN),
+    (BUILTIN_ERFC,        "__builtin_erfc", BUILTIN),
+    (BUILTIN_ERFCF,       "__builtin_erfcf", BUILTIN),
+    (BUILTIN_ERFCL,       "__builtin_erfcl", BUILTIN),
+    (BUILTIN_FMOD,        "__builtin_fmod", BUILTIN),
+    (BUILTIN_FMODF,       "__builtin_fmodf", BUILTIN),
+    (BUILTIN_FMODL,       "__builtin_fmodl", BUILTIN),
+    (BUILTIN_ATAN2,       "__builtin_atan2", BUILTIN),
+    (BUILTIN_ATAN2F,      "__builtin_atan2f", BUILTIN),
+    (BUILTIN_ATAN2L,      "__builtin_atan2l", BUILTIN),
+    (BUILTIN_HYPOT,       "__builtin_hypot", BUILTIN),
+    (BUILTIN_HYPOTF,      "__builtin_hypotf", BUILTIN),
+    (BUILTIN_HYPOTL,      "__builtin_hypotl", BUILTIN),
+    (BUILTIN_FDIM,        "__builtin_fdim", BUILTIN),
+    (BUILTIN_FDIMF,       "__builtin_fdimf", BUILTIN),
+    (BUILTIN_FDIML,       "__builtin_fdiml", BUILTIN),
+    (BUILTIN_REMAINDER,   "__builtin_remainder", BUILTIN),
+    (BUILTIN_REMAINDERF,  "__builtin_remainderf", BUILTIN),
+    (BUILTIN_REMAINDERL,  "__builtin_remainderl", BUILTIN),
+    (BUILTIN_NEXTAFTER,   "__builtin_nextafter", BUILTIN),
+    (BUILTIN_NEXTAFTERF,  "__builtin_nextafterf", BUILTIN),
+    (BUILTIN_NEXTAFTERL,  "__builtin_nextafterl", BUILTIN),
+    (BUILTIN_MODF,        "__builtin_modf", BUILTIN),
+    (BUILTIN_MODFF,       "__builtin_modff", BUILTIN),
+    (BUILTIN_MODFL,       "__builtin_modfl", BUILTIN),
+    (BUILTIN_FREXP,       "__builtin_frexp", BUILTIN),
+    (BUILTIN_FREXPF,      "__builtin_frexpf", BUILTIN),
+    (BUILTIN_FREXPL,      "__builtin_frexpl", BUILTIN),
+    (BUILTIN_LDEXP,       "__builtin_ldexp", BUILTIN),
+    (BUILTIN_LDEXPF,      "__builtin_ldexpf", BUILTIN),
+    (BUILTIN_LDEXPL,      "__builtin_ldexpl", BUILTIN),
+    (BUILTIN_STRCASECMP,  "__builtin_strcasecmp", BUILTIN),
+    (BUILTIN_STRNCASECMP, "__builtin_strncasecmp", BUILTIN),
+    (BUILTIN_STRDUP,    "__builtin_strdup",   BUILTIN),
+    (BUILTIN_STRNDUP,   "__builtin_strndup",  BUILTIN),
+    // gcc's equality-only `memcmp`: it answers zero or non-zero rather than
+    // an ordering, which lets it use a wider compare. Answering the ordering
+    // too is a correct implementation of it.
+    (BUILTIN_MEMCMP_EQ, "__builtin_memcmp_eq", BUILTIN),
+    // Identity on both targets c17 has. It exists for architectures that
+    // encode a flag in the return address -- ARM Thumb sets bit 0 -- and glibc
+    // and libgcc unwinders call it unconditionally.
+    (BUILTIN_EXTRACT_RETURN_ADDR, "__builtin_extract_return_addr", BUILTIN),
+    (BUILTIN_CLEAR_CACHE, "__builtin___clear_cache", BUILTIN),
     (BUILTIN_TRAP,      "__builtin_trap",     BUILTIN),
     (BUILTIN_ABORT,     "__builtin_abort",    BUILTIN),
     (BUILTIN_EXIT,      "__builtin_exit",     BUILTIN),
@@ -387,6 +577,58 @@ define_keywords! {
     (BUILTIN_ISFINITE,  "__builtin_isfinite", BUILTIN),
     (BUILTIN_ISNORMAL,  "__builtin_isnormal", BUILTIN),
     (BUILTIN_FPCLASSIFY,"__builtin_fpclassify", BUILTIN),
+    // gcc's atomic builtins. These are not `__builtin_`-prefixed, and they
+    // are reserved spellings all the same: `__sync_` and `__atomic_` both
+    // start with two underscores, so no conforming program defines one.
+    (SYNC_FETCH_AND_ADD,  "__sync_fetch_and_add", BUILTIN),
+    (SYNC_ADD_AND_FETCH,  "__sync_add_and_fetch", BUILTIN),
+    (ATOMIC_FETCH_ADD,    "__atomic_fetch_add", BUILTIN),
+    (ATOMIC_ADD_FETCH,    "__atomic_add_fetch", BUILTIN),
+    (SYNC_FETCH_AND_SUB,  "__sync_fetch_and_sub", BUILTIN),
+    (SYNC_SUB_AND_FETCH,  "__sync_sub_and_fetch", BUILTIN),
+    (ATOMIC_FETCH_SUB,    "__atomic_fetch_sub", BUILTIN),
+    (ATOMIC_SUB_FETCH,    "__atomic_sub_fetch", BUILTIN),
+    (SYNC_FETCH_AND_AND,  "__sync_fetch_and_and", BUILTIN),
+    (SYNC_AND_AND_FETCH,  "__sync_and_and_fetch", BUILTIN),
+    (ATOMIC_FETCH_AND,    "__atomic_fetch_and", BUILTIN),
+    (ATOMIC_AND_FETCH,    "__atomic_and_fetch", BUILTIN),
+    (SYNC_FETCH_AND_OR,   "__sync_fetch_and_or", BUILTIN),
+    (SYNC_OR_AND_FETCH,   "__sync_or_and_fetch", BUILTIN),
+    (ATOMIC_FETCH_OR,     "__atomic_fetch_or", BUILTIN),
+    (ATOMIC_OR_FETCH,     "__atomic_or_fetch", BUILTIN),
+    (SYNC_FETCH_AND_XOR,  "__sync_fetch_and_xor", BUILTIN),
+    (SYNC_XOR_AND_FETCH,  "__sync_xor_and_fetch", BUILTIN),
+    (ATOMIC_FETCH_XOR,    "__atomic_fetch_xor", BUILTIN),
+    (ATOMIC_XOR_FETCH,    "__atomic_xor_fetch", BUILTIN),
+    (SYNC_FETCH_AND_NAND, "__sync_fetch_and_nand", BUILTIN),
+    (SYNC_NAND_AND_FETCH, "__sync_nand_and_fetch", BUILTIN),
+    (ATOMIC_FETCH_NAND,   "__atomic_fetch_nand", BUILTIN),
+    (ATOMIC_NAND_FETCH,   "__atomic_nand_fetch", BUILTIN),
+    (SYNC_BOOL_COMPARE_AND_SWAP, "__sync_bool_compare_and_swap", BUILTIN),
+    (SYNC_VAL_COMPARE_AND_SWAP, "__sync_val_compare_and_swap", BUILTIN),
+    (SYNC_LOCK_TEST_AND_SET, "__sync_lock_test_and_set", BUILTIN),
+    (SYNC_LOCK_RELEASE,   "__sync_lock_release", BUILTIN),
+    (SYNC_SYNCHRONIZE,    "__sync_synchronize", BUILTIN),
+    (ATOMIC_LOAD_N,       "__atomic_load_n", BUILTIN),
+    (ATOMIC_STORE_N,      "__atomic_store_n", BUILTIN),
+    (ATOMIC_EXCHANGE_N,   "__atomic_exchange_n", BUILTIN),
+    (ATOMIC_COMPARE_EXCHANGE_N, "__atomic_compare_exchange_n", BUILTIN),
+    (ATOMIC_TEST_AND_SET, "__atomic_test_and_set", BUILTIN),
+    (ATOMIC_CLEAR,        "__atomic_clear", BUILTIN),
+    (ATOMIC_THREAD_FENCE, "__atomic_thread_fence", BUILTIN),
+    (ATOMIC_SIGNAL_FENCE, "__atomic_signal_fence", BUILTIN),
+    (ATOMIC_ALWAYS_LOCK_FREE, "__atomic_always_lock_free", BUILTIN),
+    (ATOMIC_IS_LOCK_FREE, "__atomic_is_lock_free", BUILTIN),
+
+    // C99 7.12.14, the unordered-safe relations. glibc's <math.h> *defines*
+    // `isgreater` and its siblings as these, so a translation unit that
+    // includes <math.h> and uses one does not compile without them.
+    (BUILTIN_ISGREATER, "__builtin_isgreater", BUILTIN),
+    (BUILTIN_ISGREATEREQUAL, "__builtin_isgreaterequal", BUILTIN),
+    (BUILTIN_ISLESS,    "__builtin_isless",   BUILTIN),
+    (BUILTIN_ISLESSEQUAL, "__builtin_islessequal", BUILTIN),
+    (BUILTIN_ISLESSGREATER, "__builtin_islessgreater", BUILTIN),
+    (BUILTIN_ISUNORDERED, "__builtin_isunordered", BUILTIN),
     (BUILTIN_SIGNBIT,   "__builtin_signbit",  BUILTIN),
     (BUILTIN_SIGNBITF,  "__builtin_signbitf", BUILTIN),
     (BUILTIN_SIGNBITL,  "__builtin_signbitl", BUILTIN),
@@ -508,7 +750,139 @@ define_keywords! {
     (_,                 "ffsl",                 0),
     (_,                 "ffsll",                0),
     (_,                 "sqrt",                 0),
+    (_,                 "sqrtf",                0),
+    (_,                 "sqrtl",                0),
     (_,                 "copysign",             0),
+    (_,                 "copysignf",            0),
+    (_,                 "copysignl",            0),
+    (_,                 "fmax",                 0),
+    (_,                 "fmaxf",                0),
+    (_,                 "fmaxl",                0),
+    (_,                 "fmin",                 0),
+    (_,                 "fminf",                0),
+    (_,                 "fminl",                0),
+    (_,                 "pow",                  0),
+    (_,                 "powf",                 0),
+    (_,                 "powl",                 0),
+    (_,                 "fma",                  0),
+    (_,                 "fmaf",                 0),
+    (_,                 "fmal",                 0),
+    (_,                 "bcmp",                 0),
+    (_,                 "bzero",                0),
+    (_,                 "stpncpy",              0),
+    (_,                 "strdup",               0),
+    (_,                 "strndup",              0),
+    (_,                 "cbrt",                   0),
+    (_,                 "cbrtf",                  0),
+    (_,                 "cbrtl",                  0),
+    (_,                 "ceill",                  0),
+    (_,                 "floorl",                 0),
+    (_,                 "truncl",                 0),
+    (_,                 "roundl",                 0),
+    (_,                 "rintl",                  0),
+    (_,                 "nearbyintl",             0),
+    (_,                 "sin",                    0),
+    (_,                 "sinf",                   0),
+    (_,                 "sinl",                   0),
+    (_,                 "cos",                    0),
+    (_,                 "cosf",                   0),
+    (_,                 "cosl",                   0),
+    (_,                 "tan",                    0),
+    (_,                 "tanf",                   0),
+    (_,                 "tanl",                   0),
+    (_,                 "asin",                   0),
+    (_,                 "asinf",                  0),
+    (_,                 "asinl",                  0),
+    (_,                 "acos",                   0),
+    (_,                 "acosf",                  0),
+    (_,                 "acosl",                  0),
+    (_,                 "atan",                   0),
+    (_,                 "atanf",                  0),
+    (_,                 "atanl",                  0),
+    (_,                 "sinh",                   0),
+    (_,                 "sinhf",                  0),
+    (_,                 "sinhl",                  0),
+    (_,                 "cosh",                   0),
+    (_,                 "coshf",                  0),
+    (_,                 "coshl",                  0),
+    (_,                 "tanh",                   0),
+    (_,                 "tanhf",                  0),
+    (_,                 "tanhl",                  0),
+    (_,                 "asinh",                  0),
+    (_,                 "asinhf",                 0),
+    (_,                 "asinhl",                 0),
+    (_,                 "acosh",                  0),
+    (_,                 "acoshf",                 0),
+    (_,                 "acoshl",                 0),
+    (_,                 "atanh",                  0),
+    (_,                 "atanhf",                 0),
+    (_,                 "atanhl",                 0),
+    (_,                 "exp",                    0),
+    (_,                 "expf",                   0),
+    (_,                 "expl",                   0),
+    (_,                 "exp2",                   0),
+    (_,                 "exp2f",                  0),
+    (_,                 "exp2l",                  0),
+    (_,                 "expm1",                  0),
+    (_,                 "expm1f",                 0),
+    (_,                 "expm1l",                 0),
+    (_,                 "log",                    0),
+    (_,                 "logf",                   0),
+    (_,                 "logl",                   0),
+    (_,                 "log2",                   0),
+    (_,                 "log2f",                  0),
+    (_,                 "log2l",                  0),
+    (_,                 "log10",                  0),
+    (_,                 "log10f",                 0),
+    (_,                 "log10l",                 0),
+    (_,                 "log1p",                  0),
+    (_,                 "log1pf",                 0),
+    (_,                 "log1pl",                 0),
+    (_,                 "logb",                   0),
+    (_,                 "logbf",                  0),
+    (_,                 "logbl",                  0),
+    (_,                 "tgamma",                 0),
+    (_,                 "tgammaf",                0),
+    (_,                 "tgammal",                0),
+    (_,                 "lgamma",                 0),
+    (_,                 "lgammaf",                0),
+    (_,                 "lgammal",                0),
+    (_,                 "erf",                    0),
+    (_,                 "erff",                   0),
+    (_,                 "erfl",                   0),
+    (_,                 "erfc",                   0),
+    (_,                 "erfcf",                  0),
+    (_,                 "erfcl",                  0),
+    (_,                 "fmod",                   0),
+    (_,                 "fmodf",                  0),
+    (_,                 "fmodl",                  0),
+    (_,                 "atan2",                  0),
+    (_,                 "atan2f",                 0),
+    (_,                 "atan2l",                 0),
+    (_,                 "hypot",                  0),
+    (_,                 "hypotf",                 0),
+    (_,                 "hypotl",                 0),
+    (_,                 "fdim",                   0),
+    (_,                 "fdimf",                  0),
+    (_,                 "fdiml",                  0),
+    (_,                 "remainder",              0),
+    (_,                 "remainderf",             0),
+    (_,                 "remainderl",             0),
+    (_,                 "nextafter",              0),
+    (_,                 "nextafterf",             0),
+    (_,                 "nextafterl",             0),
+    (_,                 "modf",                   0),
+    (_,                 "modff",                  0),
+    (_,                 "modfl",                  0),
+    (_,                 "frexp",                  0),
+    (_,                 "frexpf",                 0),
+    (_,                 "frexpl",                 0),
+    (_,                 "ldexp",                  0),
+    (_,                 "ldexpf",                 0),
+    (_,                 "ldexpl",                 0),
+    (_,                 "strcasecmp",             0),
+    (_,                 "strncasecmp",            0),
+    (_,                 "__clear_cache",        0),
     (_,                 "abort",                0),
     (_,                 "exit",                 0),
     (_,                 "printf",               0),
@@ -715,6 +1089,32 @@ mod tests {
         // Anonymous entries verified via lookup
         assert!(table.lookup("noreturn").is_some());
         assert!(table.lookup("__packed__").is_some());
+    }
+
+    /// Every id names the string it was defined from, for the whole table.
+    ///
+    /// The ids used to be counted by a macro that recursed once per entry;
+    /// they are looked up by spelling now, and this is the invariant that
+    /// swap has to preserve. `id_of` panics at compile time for a spelling
+    /// that is absent, and `test_no_duplicate_strings` rules out a spelling
+    /// that appears twice -- so the remaining way to get this wrong is for an
+    /// id to be off by one against the interned table, which this catches for
+    /// every entry rather than the dozen `test_keyword_ids_deterministic`
+    /// samples.
+    #[test]
+    fn test_every_id_matches_its_string() {
+        let table = StringTable::new();
+        for (i, &s) in KEYWORD_STRINGS.iter().enumerate() {
+            let id = id_of(s);
+            assert_eq!(
+                id,
+                StringId(i as u32 + 1),
+                "'{s}' is at index {i} but id_of answered {id:?}"
+            );
+            assert_eq!(table.get(id), s, "interned table disagrees for '{s}'");
+        }
+        assert_eq!(KEYWORD_STRINGS.len(), KEYWORD_COUNT);
+        assert_eq!(KEYWORD_TAGS.len(), KEYWORD_COUNT);
     }
 
     #[test]

@@ -203,7 +203,7 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             if crate::parse::ast::sizeof_type_is_runtime(env.types(), *type_id, dims) {
                 return None;
             }
-            Some((env.types().size_bits(*type_id) / 8) as i128)
+            Some(env.types().size_bytes(*type_id) as i128)
         }
 
         ExprKind::SizeofExpr(inner) => {
@@ -216,7 +216,7 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             if env.types().unsized_array_levels(typ) > 0 {
                 return None;
             }
-            Some((env.types().size_bits(typ) / 8) as i128)
+            Some(env.types().size_bytes(typ) as i128)
         }
 
         ExprKind::AlignofType(type_id) => Some(env.types().alignment(*type_id) as i128),

@@ -73,7 +73,18 @@ impl RuntimeLib {
 // CLI
 
 #[derive(Parser)]
-#[command(version, about = gettext("c17 - compile standard C programs"))]
+// `args_override_self`: a flag given twice is the last one winning, not an
+// error. cc is driven by build systems that concatenate flag lists, so a
+// command line carrying `-w` or `-g` twice is ordinary -- gcc and clang both
+// take it -- and refusing it fails the build for a reason the user cannot see
+// in their own makefile. Setting it on the command covers every argument at
+// once, rather than repeating `overrides_with` on each of the thirty-odd
+// flags and being wrong about the thirty-first.
+#[command(
+    version,
+    args_override_self = true,
+    about = gettext("c17 - compile standard C programs")
+)]
 struct Args {
     #[arg(required_unless_present = "print_targets", help = gettext("Input files"))]
     files: Vec<String>,
@@ -1723,6 +1734,18 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
                 eprintln!("c17: {}: {}", gettext("unrecognized option, ignored"), arg);
             }
             i += 1;
+        } else if arg == "--param" || arg.starts_with("--param=") {
+            // `--param name=value` tunes a gcc heuristic -- inlining limits,
+            // GC thresholds, unrolling budgets. Every one of them names an
+            // internal gcc parameter, so there is nothing for c17 to honour
+            // and nothing it could get wrong by ignoring. It still has to be
+            // *consumed*: the separated spelling puts the setting in the next
+            // argument, and leaving that behind made clap read `ggc-min-expand=1`
+            // as a source file.
+            if arg == "--param" {
+                i += 1; // the setting travels separately
+            }
+            i += 1;
         } else if arg == "-nostdinc" || arg == "-nobuiltininc" {
             // gcc spells these with one dash; clap declares them long-only.
             result.push(format!("-{}", arg));
@@ -2093,7 +2116,47 @@ fn pie_enabled(args: &Args, target: &Target) -> bool {
     target.os == Os::Linux
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// The stack the compiler runs on.
+///
+/// The front end descends recursively through the source: about fifteen Rust
+/// frames for every `(` of an expression, one per nested `struct`, and one per
+/// `case` label, since a labeled statement holds the statement it labels. C17
+/// 5.2.4.1 asks for 63 levels of parenthesised expression and 63 of nested
+/// structure, and real generated source goes far past that -- the torture
+/// suite alone has a `switch` with a thousand consecutive labels.
+///
+/// The default 8 MB is not enough for those, and running out of it is a Rust
+/// panic about a stack overflow rather than a diagnostic naming a translation
+/// limit. Running the compile on a thread of our own makes the size ours to
+/// choose rather than the shell's.
+const COMPILER_STACK_BYTES: usize = 256 * 1024 * 1024;
+
+fn main() -> ! {
+    // `RUST_MIN_STACK` is honoured, so a build that needs still more has a way
+    // to say so without a rebuild.
+    let stack = std::env::var("RUST_MIN_STACK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(COMPILER_STACK_BYTES);
+    // The error is reported on the compiler thread and turned into a status
+    // there: `Box<dyn Error>` is not `Send`, and there is nothing useful to
+    // carry back across the join anyway.
+    std::thread::Builder::new()
+        .stack_size(stack)
+        .spawn(|| match compile_main() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("c17: {e}");
+                1
+            }
+        })
+        .expect("failed to start the compiler thread")
+        .join()
+        .map(std::process::exit)
+        .unwrap_or_else(|_| std::process::exit(1))
+}
+
+fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("c17");
 
     let argv = preprocess_args();

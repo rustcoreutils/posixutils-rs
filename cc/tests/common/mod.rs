@@ -575,6 +575,21 @@ pub fn compile_expect_ok(name: &str, content: &str) {
 /// `compile_expect_error` nor `compile_expect_ok` can express that: the first
 /// demands a non-zero exit, the second says nothing about stderr.
 pub fn compile_expect_warning(name: &str, content: &str, expected: &str) {
+    compile_expect_warning_named(name, content, expected, &[]);
+}
+
+/// [`compile_expect_warning`] with extra driver flags, returning what was
+/// written to stderr so the caller can look for more than one thing.
+pub fn compile_expect_warning_with(name: &str, content: &str, extra: &[String]) -> String {
+    compile_expect_warning_named(name, content, "", extra)
+}
+
+fn compile_expect_warning_named(
+    name: &str,
+    content: &str,
+    expected: &str,
+    extra: &[String],
+) -> String {
     let c_file = create_c_file(name, content);
     let asm = plib::tmp::Builder::new()
         .prefix(&format!("c17_warn_{}_", name))
@@ -582,14 +597,15 @@ pub fn compile_expect_warning(name: &str, content: &str, expected: &str) {
         .tempfile()
         .expect("failed to create temp file");
 
-    let args = vec![
+    let mut args = extra.to_vec();
+    args.extend([
         "-S".to_string(),
         "-o".to_string(),
         asm.path().to_string_lossy().to_string(),
         c_file.path().to_string_lossy().to_string(),
-    ];
+    ]);
     let output = run_test_base("c17", &args, &[]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         output.status.success(),
         "'{}' should have compiled with a warning, but was rejected.\nSource:\n{}\nstderr:\n{}",
@@ -604,6 +620,7 @@ pub fn compile_expect_warning(name: &str, content: &str, expected: &str) {
         expected,
         stderr
     );
+    stderr
 }
 
 /// Compile `content` and require it to be accepted **without** a diagnostic

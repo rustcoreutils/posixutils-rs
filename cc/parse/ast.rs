@@ -112,6 +112,47 @@ pub enum FpTest {
     IsNormal,
 }
 
+/// Which read-modify-write a [`ExprKind::GnuAtomicRmw`] performs.
+///
+/// These are the operations gcc's `__atomic_*` and `__sync_*` families share.
+/// `Nand` has no native instruction on any target c17 has and no C11
+/// counterpart, which is why the set is written out here rather than reusing
+/// the C11 node list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GnuAtomicOp {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+    /// `~(old & val)`.
+    Nand,
+}
+
+/// Which relation an [`ExprKind::FpCompare`] asks about.
+///
+/// C99 7.12.14 gives these their own macros because the ordinary relational
+/// operators are specified to raise `FE_INVALID` on an unordered pair and
+/// these are not. The distinction is the whole reason they exist, and it is
+/// why they cannot be spelled as a plain `>` in the parser: a program that
+/// tests `isgreater(x, y)` with a NaN in hand is asking not to be trapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpCompare {
+    /// `__builtin_isgreater`
+    Greater,
+    /// `__builtin_isgreaterequal`
+    GreaterEqual,
+    /// `__builtin_isless`
+    Less,
+    /// `__builtin_islessequal`
+    LessEqual,
+    /// `__builtin_islessgreater` -- ordered and unequal, so false for a NaN
+    /// and, unlike `!=`, false for nothing else.
+    LessGreater,
+    /// `__builtin_isunordered` -- at least one operand is a NaN.
+    Unordered,
+}
+
 /// Assignment operators
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignOp {
@@ -664,6 +705,15 @@ pub enum ExprKind {
         arg: Box<Expr>,
     },
 
+    /// `__builtin_isgreater` and its five siblings -- the C99 7.12.14
+    /// unordered-safe relations. Desugared in the linearizer, for the same
+    /// reason as [`ExprKind::FpTest`]: each operand is evaluated once.
+    FpCompare {
+        cmp: FpCompare,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+
     /// `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` -- yields
     /// whichever of the five class codes describes `x`.
     FpClassify {
@@ -738,6 +788,46 @@ pub enum ExprKind {
     // =========================================================================
     // Atomic builtins (Clang __c11_atomic_* for C11 stdatomic.h)
     // =========================================================================
+    /// gcc's `__atomic_*` and `__sync_*` read-modify-write builtins.
+    ///
+    /// One node for both families and for both answers, because they differ
+    /// only in what they return and in whether the ordering is written down:
+    /// `__sync_fetch_and_add` is `__atomic_fetch_add` at sequential
+    /// consistency, and `__sync_add_and_fetch` is the same operation reporting
+    /// the value afterwards.
+    ///
+    /// `returns_new` is resolved in the linearizer by re-applying the
+    /// operation to the value the exchange returned -- not by a second access
+    /// to the object, and not by evaluating `val` twice.
+    GnuAtomicRmw {
+        op: GnuAtomicOp,
+        ptr: Box<Expr>,
+        val: Box<Expr>,
+        /// The memory order. `__sync_*` has none and passes the constant for
+        /// sequential consistency.
+        order: Box<Expr>,
+        /// `*_and_fetch` wants the value after the operation; `fetch_*` wants
+        /// the value before it.
+        returns_new: bool,
+    },
+
+    /// `__sync_bool_compare_and_swap` and `__sync_val_compare_and_swap`.
+    ///
+    /// Distinct from the C11 node because the expected value arrives *by
+    /// value* here, not through a pointer the callee may write back to. The
+    /// linearizer stages it in a temporary, which is then exactly the old
+    /// value the `val` form has to return: on success the object held the
+    /// expected value, and on failure the compare-exchange wrote the observed
+    /// one back.
+    GnuAtomicCas {
+        ptr: Box<Expr>,
+        expected: Box<Expr>,
+        desired: Box<Expr>,
+        /// `val_compare_and_swap` returns the old value; `bool_` form returns
+        /// whether the exchange happened.
+        returns_old: bool,
+    },
+
     /// __c11_atomic_init(ptr, val)
     /// Initialize an atomic variable (no memory ordering)
     C11AtomicInit {
@@ -1167,10 +1257,21 @@ pub enum Stmt {
     /// The second endpoint is `None` for an ordinary label. A range is *not*
     /// expanded into individual labels: `case 0 ... 1000000:` is legal and
     /// compiles in GCC, and each label costs a basic block and a compare here.
-    Case(Expr, Option<Expr>),
+    /// `case <expr>:` (or the GNU range `case lo ... hi:`) and the statement
+    /// it labels.
+    ///
+    /// The label carries its statement, as `Label` does, because C17 6.8.1
+    /// makes a labeled statement *one* statement. Holding the label as a flat
+    /// sibling marker worked inside a compound statement and nowhere else:
+    /// in `switch (c) case 1: if (d) case 2: case 3: f();` the `if` took the
+    /// bare `case 2:` as its whole then-branch, and `case 3: f();` fell out of
+    /// the switch entirely -- reported as "case label not within a switch
+    /// statement", and as duplicate labels where two switches were involved.
+    Case(Expr, Option<Expr>, Box<Stmt>),
 
     /// Default label (within switch body)
-    Default(Position),
+    /// `default:` and the statement it labels. See [`Stmt::Case`].
+    Default(Position, Box<Stmt>),
 
     /// Inline assembly statement (GCC extended asm)
     /// Format: asm [volatile] [goto] ( "template" : outputs : inputs : clobbers [: goto_labels] );

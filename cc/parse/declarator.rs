@@ -65,6 +65,17 @@ impl Parser<'_> {
                 // shared answer.
                 _ if let Some(m) = super::cv_qualifier_modifier(name_id) => modifiers |= m,
                 _ if super::is_nullability_qualifier(name_id) => {}
+                // An attribute may sit between two `*`s -- `int *
+                // __attribute__((aligned(16))) *p;` -- where it qualifies the
+                // pointer being declared. Breaking out here left it for the
+                // declarator, which at file scope was a parse error and at
+                // block scope was worse: `expect_declarator_name` does not
+                // treat `__attribute__` as reserved, so it became the
+                // declared object's *name*.
+                _ if self.is_attribute_keyword() => {
+                    self.skip_extensions();
+                    continue;
+                }
                 _ => break,
             }
             self.advance();

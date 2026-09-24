@@ -331,6 +331,17 @@ impl Parser<'_> {
         // or without braces, but only one whose element type it matches. Any
         // other array needs a list.
         if self.types.kind(target) == TypeKind::Array {
+            // A compound literal of the same array type initializes an array,
+            // which gcc accepts and `ast_init_to_ir` already lowers -- only
+            // this check stood in the way, having been written when a string
+            // literal was the one non-braced initializer an array could take.
+            if matches!(init.kind, ExprKind::CompoundLiteral { .. })
+                && init
+                    .typ
+                    .is_some_and(|t| self.types.types_compatible(t, target))
+            {
+                return;
+            }
             if !self.string_literal_suits_array(target, init) {
                 diag::error(init.pos, &gettext("invalid initializer"));
             }

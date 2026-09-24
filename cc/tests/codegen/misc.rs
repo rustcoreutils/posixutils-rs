@@ -13542,3 +13542,54 @@ int main(void) {
         );
     }
 }
+
+// ============================================================================
+// Regression: pointer scaling by a type past the old 512 MB bound
+// ============================================================================
+
+/// Indexing scales by the element's **byte size**, at every size the compiler
+/// accepts.
+///
+/// `size_bits` answers a *value* width in a `u32` and saturates for an
+/// aggregate past `u32::MAX` bits. While the object-size bound was that same
+/// number the saturation was unreachable -- the parser refused any type that
+/// could reach it. Raising the bound made it reachable, and every site still
+/// deriving a byte count as `size_bits / 8` began answering 536870911 for any
+/// larger type: `&a[1][0] - &a[0][0]` on a `char[3][600000000]`, the stride of
+/// an array of a 600 MB struct, and `p + 1` on a pointer to one. `sizeof` was
+/// right throughout, so the sizes agreed with gcc while the addresses did not.
+///
+/// Asserted on the assembly rather than by running: the scale factor is what
+/// was wrong, and no test should ask its machine for gigabytes to see it. The
+/// objects are `extern` for the same reason -- nothing is defined, allocated
+/// or dereferenced.
+#[test]
+fn codegen_pointer_scaling_past_the_old_object_bound() {
+    const SRC: &str = r#"
+extern char rows[3][600000000L];
+struct Big { char x[600000000L]; };
+extern struct Big bigs[2];
+
+char *row(int i) { return rows[i]; }
+struct Big *elem(int i) { return &bigs[i]; }
+long stride(struct Big *p, int i) { return (char *)&p[i] - (char *)p; }
+"#;
+
+    // One target is enough, and x86-64 is the one that materialises the scale
+    // as a literal: the element size is computed in `ir/linearize.rs`, before
+    // any backend runs, so the defect was target-independent. aarch64 builds
+    // the same constant with `movz`/`movk`, which would make this assertion
+    // about instruction encoding rather than about the size.
+    let asm = asm_for_with("pointer_scale", X86_64_LINUX, SRC, &["-O2"]);
+    for func in ["row", "elem", "stride"] {
+        let body = body_of(&asm, func);
+        assert!(
+            body.contains("600000000"),
+            "{func} does not scale by the element size:\n{body}"
+        );
+        assert!(
+            !body.contains("536870911"),
+            "{func} scales by the saturated size_bits:\n{body}"
+        );
+    }
+}

@@ -179,7 +179,7 @@ fn sole_scalar_content(ty: TypeId, types: &TypeTable) -> Option<TypeId> {
         _ => return Some(ty),
     };
     // An over-aligned or padded wrapper is not the scalar; it is bigger.
-    (types.size_bits(ty) == types.size_bits(inner)).then_some(inner)
+    (types.size_bytes(ty) == types.size_bytes(inner)).then_some(inner)
 }
 
 /// A GNU complex integer's argument or return class.
@@ -647,7 +647,7 @@ mod tests {
 
     /// A one-member struct wrapping `member`.
     fn wrap(types: &mut TypeTable, member: TypeId) -> TypeId {
-        let size = (types.size_bits(member) / 8) as usize;
+        let size = types.size_bytes(member);
         let align = types.alignment(member);
         types.intern(Type::struct_type(CompositeType {
             tag: None,

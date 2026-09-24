@@ -123,7 +123,7 @@ pub(crate) fn darwin_va_slot(
     if matches!(abi.classify_param(ty, types), ArgClass::Indirect { .. }) {
         return (8, 8);
     }
-    let bytes = ((types.size_bits(ty).div_ceil(8).max(1) as i32) + 7) & !7;
+    let bytes = ((types.size_bytes(ty).max(1) as i32) + 7) & !7;
     (bytes, (types.alignment(ty) as i32).max(8))
 }
 

@@ -548,7 +548,10 @@ impl<'a> Linearizer<'a> {
     /// the pseudos to 16-byte stack slots in the register allocator -- a
     /// 128-bit value the allocator hands a single GP register instead panics
     /// the backend in `int128_lo_mem_loc`.
-    pub(crate) fn bitfield_storage_type(&self, storage_size: u32) -> TypeId {
+    /// `storage_size` is a byte count, so it takes the type an object size is
+    /// counted in. Only 1, 2, 4, 8 and 16 name a storage unit; anything else
+    /// -- including a size no integer type could hold -- takes the default.
+    pub(crate) fn bitfield_storage_type(&self, storage_size: usize) -> TypeId {
         match storage_size {
             1 => self.types.uchar_id,
             2 => self.types.ushort_id,
@@ -972,7 +975,7 @@ impl<'a> Linearizer<'a> {
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
             let sym = Pseudo::sym(local_sym, name.clone());
-            let typ_size_bytes = (self.types.size_bits(typ) / 8) as usize;
+            let typ_size_bytes = self.types.size_bytes(typ);
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
                 let mods = self.types.modifiers(typ);
@@ -2158,7 +2161,7 @@ impl<'a> Linearizer<'a> {
                 // element type has no usable compile-time size, and this is
                 // the path that `a[i][j] = v` and `&a[i][j]` take.
                 let elem_size_val = self.vm_index_stride(ptr_expr).unwrap_or_else(|| {
-                    let elem_size = self.types.size_bits(elem_type) / 8;
+                    let elem_size = self.types.size_bytes(elem_type);
                     self.emit_const(elem_size as i128, self.types.long_id)
                 });
 
@@ -2236,8 +2239,7 @@ impl<'a> Linearizer<'a> {
                 if *op == UnaryOp::Real || !self.types.is_complex(op_typ) {
                     return addr;
                 }
-                let base_bytes =
-                    (self.types.size_bits(self.types.complex_base(op_typ)) / 8) as i128;
+                let base_bytes = (self.types.size_bytes(self.types.complex_base(op_typ))) as i128;
                 let off = self.emit_const(base_bytes, self.types.long_id);
                 let out = self.alloc_reg_pseudo();
                 let ptr_type = self.types.pointer_to(self.types.complex_base(op_typ));
@@ -2607,7 +2609,7 @@ impl<'a> Linearizer<'a> {
             return stride;
         }
         let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
-        let elem_size = self.types.size_bits(elem_type) / 8;
+        let elem_size = self.types.size_bytes(elem_type);
         self.emit_const(elem_size as i128, self.types.long_id)
     }
 
@@ -2988,7 +2990,7 @@ impl<'a> Linearizer<'a> {
         // covers every depth -- `b[i]`, `b[i][j]`, ... -- and locals and
         // parameters alike, because both record their element type's extents.
         let elem_size_val = self.vm_index_stride(ptr_expr).unwrap_or_else(|| {
-            let elem_size = self.types.size_bits(elem_type) / 8;
+            let elem_size = self.types.size_bytes(elem_type);
             self.emit_const(elem_size as i128, self.types.long_id)
         });
 

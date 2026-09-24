@@ -611,7 +611,7 @@ impl X86_64CodeGen {
         label_suffix: u32,
     ) {
         use crate::abi::{ArgClass, RegClass};
-        let size_bytes = (types.size_bits(arg_type) / 8).max(1) as i32;
+        let size_bytes = (types.size_bytes(arg_type)).max(1) as i32;
         // Resolved before anything is clobbered: `%rax` carries the save-area
         // pointer here and the result pseudo can be allocated to it.
         let Some(dst) = self.va_agg_dst(dst_loc, size_bytes > 8) else {

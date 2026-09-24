@@ -262,19 +262,14 @@ impl X86_64CodeGen {
             // 16-byte scalar long double and only half of it copied.
             if let Some(bytes) = arg_type.and_then(|t| {
                 crate::arch::lir::memory_class_bytes(types, t)
-                    .or_else(|| {
-                        types
-                            .is_complex(t)
-                            .then(|| (types.size_bits(t) / 8) as usize)
-                    })
+                    .or_else(|| types.is_complex(t).then(|| types.size_bytes(t)))
                     // A register-pair struct that ran out of registers goes on
                     // the stack *whole*. Without this it fell through to the
                     // scalar path below and pushed eight bytes of a sixteen-byte
                     // value -- the callee then read half of it plus whatever
                     // followed.
                     .or_else(|| {
-                        crate::abi::struct_param_classes(t, types)
-                            .map(|_| (types.size_bits(t) / 8) as usize)
+                        crate::abi::struct_param_classes(t, types).map(|_| types.size_bytes(t))
                     })
             }) {
                 let num_qwords = bytes.div_ceil(8);
@@ -987,7 +982,7 @@ impl X86_64CodeGen {
                     // imaginary part to the top for the second store. Both
                     // must be popped or the x87 stack leaks across the call.
                     let base = types.complex_base(insn.typ.unwrap());
-                    let imag_off = (types.size_bits(base) / 8) as i32;
+                    let imag_off = (types.size_bytes(base)) as i32;
                     let base_addr = self.address_of_pseudo(target);
                     self.push_lir(X86Inst::X87Store {
                         addr: MemAddr::BaseOffset {

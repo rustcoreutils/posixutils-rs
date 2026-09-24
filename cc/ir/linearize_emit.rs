@@ -376,7 +376,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
 
         // Determine storage type based on storage unit size
-        let storage_type = self.bitfield_storage_type(storage_size);
+        let storage_type = self.bitfield_storage_type(storage_size as usize);
         let storage_bits = storage_size * 8;
 
         // 1. Load the entire storage unit
@@ -691,7 +691,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
 
         // Determine storage type based on storage unit size
-        let storage_type = self.bitfield_storage_type(storage_size);
+        let storage_type = self.bitfield_storage_type(storage_size as usize);
         let storage_bits = storage_size * 8;
 
         // 1. Load current storage unit value

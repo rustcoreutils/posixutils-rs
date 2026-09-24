@@ -75,7 +75,7 @@ impl VaAggKind {
         ) {
             return VaAggKind::Scalar;
         }
-        let bytes = (types.size_bits(typ) / 8).max(1) as i32;
+        let bytes = (types.size_bytes(typ)).max(1) as i32;
         let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, target);
         match abi.classify_param(typ, types) {
             crate::abi::ArgClass::Hfa { base, count } => VaAggKind::Hfa(HfaElem::of(base), count),

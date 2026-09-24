@@ -220,7 +220,7 @@ impl Aarch64CodeGen {
                     *bank = start + count;
                 } else {
                     *bank = 8;
-                    let bytes = types.size_bits(*typ).div_ceil(8).max(1) as i32;
+                    let bytes = types.size_bytes(*typ).max(1) as i32;
                     named_stack += (bytes + 7) & !7;
                 }
             }
@@ -1223,7 +1223,7 @@ impl Aarch64CodeGen {
                                     // body reads, exactly as the spilled-HFA
                                     // case does; without this the parameter was
                                     // left uninitialized.
-                                    let bytes = (types.size_bits(*typ) / 8) as i32;
+                                    let bytes = (types.size_bytes(*typ)) as i32;
                                     let mut done = 0;
                                     while done < bytes {
                                         let chunk = [8, 4, 2, 1]

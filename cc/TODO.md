@@ -115,6 +115,40 @@ Complete on Linux, on both architectures. What is left:
 
 ---
 
+### Object size and value width are the same `u32`
+
+`size_bits` answers a *value* width -- what an instruction operand holds,
+bounded at 128 bits -- and `size_bytes` answers an *object* size, which is
+not bounded. They are both plain integers, so nothing stops one being used
+where the other is meant, and the unit (bits or bytes) is a naming convention
+rather than a type.
+
+That cost a silent miscompile once already. While `MAX_OBJECT_BYTES` was
+`u32::MAX / 8`, `size_bits` could not saturate -- the parser refused any type
+that would reach it -- so deriving a byte count as `size_bits / 8` was safe by
+accident. Raising the bound made saturation reachable and every such site
+began answering 536870911 for a larger type: array indexing, the stride of an
+array of a large struct, and `p + 1` on a pointer to one, all while `sizeof`
+stayed right.
+
+All thirty-five of those sites now ask `size_bytes`, and a `grep` finds no
+`size_bits(..) / 8` outside `size_bytes` itself. That is a fix, not a
+guarantee: measurement showed **seventy** call sites are handed an aggregate,
+and the other thirty-five are safe only because they compare against a small
+threshold, where a saturated value happens to answer correctly. Nothing
+enforces that, and two of the sites found were spelled `div_ceil(8)` rather
+than `/ 8`, so the audit itself does not generalise.
+
+What would settle it is making the distinction a *type* -- a `Bits` newtype
+for value widths that deliberately implements no division, and a `ByteSize`
+for object sizes -- so that every conversion is a compile error the compiler
+finds rather than a spelling a reader has to notice. Widening `size_bits` to
+`u64` is **not** that fix and was measured: of the 401 resulting type errors,
+364 want a `u32` because they are value widths, and silencing them with `as
+u32` reintroduces the same truncation at the seventy aggregate-fed sites.
+
+---
+
 ### An `__atomic_*` read-modify-write ignores its memory order
 
 `__atomic_fetch_add` and its eleven siblings lower through `emit_atomic_rmw`,

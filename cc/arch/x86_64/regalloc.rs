@@ -1456,7 +1456,7 @@ impl RegAlloc {
                         pseudo_id,
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
-                            (types.size_bits(*typ) / 8) as i32,
+                            (types.size_bytes(*typ)) as i32,
                             types.alignment(*typ) as i32,
                         )),
                     );
@@ -1482,7 +1482,7 @@ impl RegAlloc {
                         pseudo_id,
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
-                            (types.size_bits(*typ) / 8) as i32,
+                            (types.size_bytes(*typ)) as i32,
                             types.alignment(*typ) as i32,
                         )),
                     );
@@ -1504,7 +1504,7 @@ impl RegAlloc {
                         pseudo_id,
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
-                            (types.size_bits(*typ) / 8) as i32,
+                            (types.size_bytes(*typ)) as i32,
                             types.alignment(*typ) as i32,
                         )),
                     );
@@ -1525,7 +1525,7 @@ impl RegAlloc {
                         pseudo_id,
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
-                            (types.size_bits(*typ) / 8) as i32,
+                            (types.size_bytes(*typ)) as i32,
                             types.alignment(*typ) as i32,
                         )),
                     );
@@ -1544,7 +1544,7 @@ impl RegAlloc {
                         pseudo_id,
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
-                            (types.size_bits(*typ) / 8) as i32,
+                            (types.size_bytes(*typ)) as i32,
                             types.alignment(*typ) as i32,
                         )),
                     );
@@ -1969,7 +1969,7 @@ impl RegAlloc {
                         // parameter, and answering by name gave the global the
                         // parameter's slot instead of `Loc::Global`.
                         if let Some(local_var) = func.local_of(interval.pseudo) {
-                            let size = (types.size_bits(local_var.typ) / 8) as i32;
+                            let size = (types.size_bytes(local_var.typ)) as i32;
                             let size = size.max(8);
                             let natural_align = types.alignment(local_var.typ) as i32;
                             let alignment = if let Some(explicit) = local_var.explicit_align {

@@ -927,7 +927,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 }
 
-                let elem_size = self.types.size_bits(elem_type) / 8;
+                let elem_size = self.types.size_bytes(elem_type);
                 let elem_is_aggregate = matches!(
                     self.types.kind(elem_type),
                     TypeKind::Array | TypeKind::Struct | TypeKind::Union

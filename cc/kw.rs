@@ -1091,7 +1091,6 @@ mod tests {
         assert!(table.lookup("__packed__").is_some());
     }
 
-    #[test]
     /// Every id names the string it was defined from, for the whole table.
     ///
     /// The ids used to be counted by a macro that recursed once per entry;

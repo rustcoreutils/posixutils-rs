@@ -941,6 +941,14 @@ impl<'a> Parser<'a> {
             typ
         };
 
+        // A compound literal inside a function has automatic storage duration
+        // (C17 6.5.2.5p5), so it gets a frame slot and the same bound applies.
+        // It is not a declaration, so the declarator check above never sees it;
+        // at file scope the literal is static and is left alone.
+        if self.symbols.depth() > 0 {
+            self.check_stack_object_size(final_typ, paren_pos, "a compound literal")?;
+        }
+
         Ok(Self::typed_expr(
             ExprKind::CompoundLiteral {
                 typ: final_typ,

@@ -147,6 +147,7 @@ impl X86_64CodeGen {
         // they take the plain name: a verbatim asm-label marker belongs only
         // on the symbol the assembler is asked for.
         self.base.current_fn = crate::arch::lir::undecorated(&func.name).to_string();
+        self.base.func_pos = crate::arch::func_pos(func);
 
         // Check if this function uses varargs
         let is_variadic = is_variadic_function(func);
@@ -1286,7 +1287,7 @@ impl X86_64CodeGen {
                 // a stack, so push the imaginary part first and the real part
                 // second to leave them in that order.
                 let base = types.complex_base(insn.typ.unwrap());
-                let imag_off = (types.size_bits(base) / 8) as i32;
+                let imag_off = (types.size_bytes(base)) as i32;
                 let base_addr = self.address_of_pseudo(*src);
                 self.push_lir(X86Inst::X87Load {
                     addr: MemAddr::BaseOffset {

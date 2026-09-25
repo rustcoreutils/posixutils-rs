@@ -15,6 +15,44 @@ use crate::types::{TypeKind, TypeTable};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
+/// Grow a frame's locals area by one slot, refusing a total no `i32`
+/// displacement can reach.
+///
+/// [`TypeTable::MAX_STACK_OBJECT_BYTES`] bounds one object and
+/// [`crate::abi::slot_bytes`] enforces that. Neither bounds their *sum*, and
+/// `+=` on an `i32` wraps: a frame past two gigabytes came out negative and the
+/// prologue subtracted nothing. Both backends' `alloc_stack_slot` is the one
+/// place their locals area grows, so this is the one place the total can be
+/// checked -- including for the VLA and `alloca` extents the front end cannot
+/// measure statically.
+///
+/// The rounding happens inside, in `i64`, because at a legal
+/// `MAX_STACK_OBJECT_BYTES` with an over-aligned local the
+/// `(offset + align - 1)` that used to precede the `+=` overflowed on its own.
+pub fn grow_frame(offset: &mut i32, size: i32, alignment: i32, pos: crate::diag::Position) -> i32 {
+    let mut want = i64::from(*offset);
+    if alignment > 8 {
+        want = (want + i64::from(alignment) - 1) & !(i64::from(alignment) - 1);
+    }
+    want += i64::from(size.max(0));
+    match i32::try_from(want) {
+        Ok(n) if (n as usize) <= TypeTable::MAX_STACK_OBJECT_BYTES => *offset = n,
+        _ => {
+            crate::diag::error_args(
+                pos,
+                "this function's stack frame needs {0} bytes, \
+                 past the {1} bytes a frame can address",
+                &[
+                    &want.to_string(),
+                    &TypeTable::MAX_STACK_OBJECT_BYTES.to_string(),
+                ],
+            );
+            *offset = offset.saturating_add(8);
+        }
+    }
+    *offset
+}
+
 // ============================================================================
 // LocationMap — single owner for PseudoId → Loc bindings
 // ============================================================================

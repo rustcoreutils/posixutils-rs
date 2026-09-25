@@ -13542,3 +13542,123 @@ int main(void) {
         );
     }
 }
+
+// ============================================================================
+// Regression: pointer scaling by a type past the old 512 MB bound
+// ============================================================================
+
+/// Indexing scales by the element's **byte size**, at every size the compiler
+/// accepts.
+///
+/// `size_bits` answers a *value* width in a `u32` and saturates for an
+/// aggregate past `u32::MAX` bits. While the object-size bound was that same
+/// number the saturation was unreachable -- the parser refused any type that
+/// could reach it. Raising the bound made it reachable, and every site still
+/// deriving a byte count as `size_bits / 8` began answering 536870911 for any
+/// larger type: `&a[1][0] - &a[0][0]` on a `char[3][600000000]`, the stride of
+/// an array of a 600 MB struct, and `p + 1` on a pointer to one. `sizeof` was
+/// right throughout, so the sizes agreed with gcc while the addresses did not.
+///
+/// Asserted on the assembly rather than by running: the scale factor is what
+/// was wrong, and no test should ask its machine for gigabytes to see it. The
+/// objects are `extern` for the same reason -- nothing is defined, allocated
+/// or dereferenced.
+#[test]
+fn codegen_pointer_scaling_past_the_old_object_bound() {
+    const SRC: &str = r#"
+extern char rows[3][600000000L];
+struct Big { char x[600000000L]; };
+extern struct Big bigs[2];
+
+char *row(int i) { return rows[i]; }
+struct Big *elem(int i) { return &bigs[i]; }
+long stride(struct Big *p, int i) { return (char *)&p[i] - (char *)p; }
+"#;
+
+    // One target is enough, and x86-64 is the one that materialises the scale
+    // as a literal: the element size is computed in `ir/linearize.rs`, before
+    // any backend runs, so the defect was target-independent. aarch64 builds
+    // the same constant with `movz`/`movk`, which would make this assertion
+    // about instruction encoding rather than about the size.
+    let asm = asm_for_with("pointer_scale", X86_64_LINUX, SRC, &["-O2"]);
+    for func in ["row", "elem", "stride"] {
+        let body = body_of(&asm, func);
+        assert!(
+            body.contains("600000000"),
+            "{func} does not scale by the element size:\n{body}"
+        );
+        assert!(
+            !body.contains("536870911"),
+            "{func} scales by the saturated size_bits:\n{body}"
+        );
+    }
+}
+
+/// An aggregate is copied by its **byte size**, at every size the compiler
+/// accepts.
+///
+/// The companion to `codegen_pointer_scaling_past_the_old_object_bound`, and
+/// the same root cause: `size_bits` saturates at `u32::MAX` bits, and raising
+/// the object-size bound made the saturation reachable. The sites that survived
+/// that commit's audit were the ones that launder the bit count through a local
+/// variable -- two of them spell it `let target_size_bytes = target_size / 8;`,
+/// which no grep for `size_bits(..) / 8` can find -- through a `u32` field
+/// (`struct_return_size`), or through `ArgClass::Indirect`'s payload.
+///
+/// Every shape below copied 536870911 bytes of a 600000000-byte object, on both
+/// targets, at every optimization level. `a = b` is the one that matters most:
+/// it is the plainest aggregate copy in the language.
+///
+/// Asserted on x86-64 alone, and the source is shaped to stay cheap. Both are
+/// load-bearing, not stylistic -- each one avoids a different pre-existing
+/// backend blowup that this test walked straight into and that took both Linux
+/// CI runners down with SIGTERM:
+///
+/// - **x86-64 only.** Nothing to do with coverage: the length is computed in
+///   `ir/` before any backend runs, so one target proves it, and x86-64 is the
+///   one that materialises the constant as a literal rather than as
+///   `movz`/`movk`. Adding an `AARCH64_LINUX` assertion would cost **12.5
+///   seconds and 16 GB** resident, because `initialize`'s 600 MB local goes
+///   through `zero_stack_frame`, which unrolls one store per qword on aarch64
+///   where x86-64 emits `rep stosq`.
+/// - **`by_value_param` does not pass its argument on.** The prologue copy is
+///   the site under test; *sending* a 600 MB aggregate costs **16 seconds and
+///   21.9 GB**, because the outgoing stacked-argument copy has no `memcpy`
+///   fallback and unrolls one load/store pair per eight bytes.
+///
+/// Both are recorded in cc/TODO.md. Until they are fixed, do not raise the
+/// target list and do not add a call that passes one of these by value.
+/// Everything here is `extern`; nothing is defined or run.
+#[test]
+fn codegen_aggregate_copy_length_past_the_old_object_bound() {
+    const SRC: &str = r#"
+struct Big { char x[600000000L]; };
+extern struct Big src, dst;
+void sink(struct Big *);
+
+void assign(void) { dst = src; }
+void initialize(void) { struct Big loc = src; sink(&loc); }
+void by_value_param(struct Big p) { sink(&p); }
+struct Big returns_it(void) { return src; }
+unsigned long extent(void) { return __builtin_object_size(src.x, 0); }
+"#;
+
+    let asm = asm_for_with("aggregate_copy_length", X86_64_LINUX, SRC, &["-O2"]);
+    for func in [
+        "assign",
+        "initialize",
+        "by_value_param",
+        "returns_it",
+        "extent",
+    ] {
+        let body = body_of(&asm, func);
+        assert!(
+            body.contains("600000000"),
+            "{func} does not use the aggregate's byte size:\n{body}"
+        );
+        assert!(
+            !body.contains("536870911"),
+            "{func} uses the saturated size_bits:\n{body}"
+        );
+    }
+}

@@ -3130,7 +3130,7 @@ mod tests {
             vec![],
             ArgClass::Indirect {
                 align: 8,
-                size_bits: 256,
+                size_bytes: 32,
             },
         )));
         assert!(insn.returns_via_sret());

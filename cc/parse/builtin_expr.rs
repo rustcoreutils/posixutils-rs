@@ -2546,11 +2546,11 @@ impl Parser<'_> {
 
     /// Size in bytes of a type whose size is known and non-zero.
     fn byte_size(&self, typ: TypeId) -> Option<u64> {
-        let bits = self.types.size_bits(typ);
-        if bits == 0 {
+        let bytes = self.types.size_bytes(typ);
+        if bytes == 0 {
             return None;
         }
-        Some(u64::from(bits) / 8)
+        Some(bytes as u64)
     }
 
     /// Size of what `expr` points at, for scaling pointer arithmetic.

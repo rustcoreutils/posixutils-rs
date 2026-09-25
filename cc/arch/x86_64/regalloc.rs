@@ -869,6 +869,10 @@ pub struct RegAlloc {
     active_xmm: Vec<(LiveInterval, XmmReg)>,
     /// Next stack slot offset
     stack_offset: i32,
+    /// A source position for this function, for the frame diagnostics
+    /// `grow_frame` and [`crate::abi::slot_bytes`] emit. `alloc_stack_slot` and
+    /// `IncomingOff::take` have no `&Function` to recover one from.
+    func_pos: crate::diag::Position,
     /// Callee-saved registers that were used
     used_callee_saved: Vec<Reg>,
     /// Track which pseudos need FP registers (based on type)
@@ -1107,6 +1111,7 @@ impl RegAlloc {
             active: Vec::new(),
             active_xmm: Vec::new(),
             stack_offset: X87_SCRATCH_BYTES,
+            func_pos: crate::diag::Position::default(),
             used_callee_saved: Vec::new(),
             fp_pseudos: HashSet::new(),
             ld_pseudos: HashSet::new(),
@@ -1132,6 +1137,7 @@ impl RegAlloc {
         types: &TypeTable,
     ) -> crate::arch::regalloc::LocationMap<Loc> {
         self.reset_state();
+        self.func_pos = crate::arch::func_pos(func);
         // Before anything is coloured: the frame base claims a register, and
         // every palette below has to be built without it.
         self.frame_base = FrameBase::of(func, types);
@@ -1456,7 +1462,11 @@ impl RegAlloc {
                         pseudo_id,
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
-                            (types.size_bits(*typ) / 8) as i32,
+                            crate::abi::slot_bytes(
+                                types.size_bytes(*typ),
+                                self.func_pos,
+                                "a stacked parameter",
+                            ),
                             types.alignment(*typ) as i32,
                         )),
                     );
@@ -1482,7 +1492,11 @@ impl RegAlloc {
                         pseudo_id,
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
-                            (types.size_bits(*typ) / 8) as i32,
+                            crate::abi::slot_bytes(
+                                types.size_bytes(*typ),
+                                self.func_pos,
+                                "a stacked parameter",
+                            ),
                             types.alignment(*typ) as i32,
                         )),
                     );
@@ -1504,7 +1518,11 @@ impl RegAlloc {
                         pseudo_id,
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
-                            (types.size_bits(*typ) / 8) as i32,
+                            crate::abi::slot_bytes(
+                                types.size_bytes(*typ),
+                                self.func_pos,
+                                "a stacked parameter",
+                            ),
                             types.alignment(*typ) as i32,
                         )),
                     );
@@ -1525,7 +1543,11 @@ impl RegAlloc {
                         pseudo_id,
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
-                            (types.size_bits(*typ) / 8) as i32,
+                            crate::abi::slot_bytes(
+                                types.size_bytes(*typ),
+                                self.func_pos,
+                                "a stacked parameter",
+                            ),
                             types.alignment(*typ) as i32,
                         )),
                     );
@@ -1544,7 +1566,11 @@ impl RegAlloc {
                         pseudo_id,
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
-                            (types.size_bits(*typ) / 8) as i32,
+                            crate::abi::slot_bytes(
+                                types.size_bytes(*typ),
+                                self.func_pos,
+                                "a stacked parameter",
+                            ),
                             types.alignment(*typ) as i32,
                         )),
                     );
@@ -1579,7 +1605,6 @@ impl RegAlloc {
                     // overflowing argument does exhaust the file.
                 }
             } else {
-                let type_size = types.size_bits(*typ);
                 let is_large_struct = crate::abi::param_is_memory_class(*typ, types);
                 if is_large_struct {
                     // MEMORY class: passed on the stack by value. Advance by
@@ -1588,7 +1613,11 @@ impl RegAlloc {
                         pseudo_id,
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
-                            (type_size / 8) as i32,
+                            crate::abi::slot_bytes(
+                                types.size_bytes(*typ),
+                                self.func_pos,
+                                "a stacked parameter",
+                            ),
                             types.alignment(*typ) as i32,
                         )),
                     );
@@ -1852,11 +1881,12 @@ impl RegAlloc {
                 return;
             }
         }
-        if alignment > 8 {
-            self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
-        }
-        self.stack_offset += size;
-        let offset = self.stack_offset;
+        let offset = crate::arch::regalloc::grow_frame(
+            &mut self.stack_offset,
+            size,
+            alignment,
+            self.func_pos,
+        );
         self.locations.insert(interval.pseudo, Loc::Stack(offset));
         if reusable {
             self.active_stack.push(crate::arch::regalloc::ActiveSlot {
@@ -1969,7 +1999,11 @@ impl RegAlloc {
                         // parameter, and answering by name gave the global the
                         // parameter's slot instead of `Loc::Global`.
                         if let Some(local_var) = func.local_of(interval.pseudo) {
-                            let size = (types.size_bits(local_var.typ) / 8) as i32;
+                            let size = crate::abi::slot_bytes(
+                                types.size_bytes(local_var.typ),
+                                self.func_pos,
+                                "an automatic object",
+                            );
                             let size = size.max(8);
                             let natural_align = types.alignment(local_var.typ) as i32;
                             let alignment = if let Some(explicit) = local_var.explicit_align {

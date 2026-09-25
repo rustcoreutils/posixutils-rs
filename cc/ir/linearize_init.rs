@@ -1084,7 +1084,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         typ: TypeId,
     ) -> Initializer {
         let type_kind = self.types.kind(typ);
-        let total_size = (self.types.size_bits(typ) / 8) as usize;
+        let total_size = self.types.size_bytes(typ);
 
         match type_kind {
             TypeKind::Array => {
@@ -1113,7 +1113,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 }
 
-                let elem_size = (self.types.size_bits(elem_type) / 8) as usize;
+                let elem_size = self.types.size_bytes(elem_type);
                 let elem_is_aggregate = matches!(
                     self.types.kind(elem_type),
                     TypeKind::Array | TypeKind::Struct | TypeKind::Union
@@ -1164,7 +1164,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             TypeKind::Struct | TypeKind::Union => {
                 let resolved_typ = self.resolve_struct_type(typ);
-                let resolved_size = (self.types.size_bits(resolved_typ) / 8) as usize;
+                let resolved_size = self.types.size_bytes(resolved_typ);
                 if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
                     let members: Vec<_> = composite.members.clone();
                     let is_union = self.types.kind(resolved_typ) == TypeKind::Union;
@@ -1335,8 +1335,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                         return None;
                     }
                     let elem_type = self.types.base_type(typ)?;
-                    let elem_size = self.types.size_bits(elem_type) / 8;
-                    offset += (*index as usize) * (elem_size as usize);
+                    let elem_size = self.types.size_bytes(elem_type);
+                    offset += (*index as usize) * elem_size;
                     typ = elem_type;
                     bit_offset = None;
                     bit_width = None;

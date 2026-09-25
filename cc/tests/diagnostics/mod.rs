@@ -5331,3 +5331,161 @@ fn diagnostics_permissive_relaxes_the_constraints_gcc_warns_about() {
         );
     }
 }
+
+/// An object the *backend* cannot give a stack slot is diagnosed, not
+/// miscompiled.
+///
+/// This bound is not C's. Both backends address a local and a stacked argument
+/// by a signed 32-bit displacement from the frame register, so `i32::MAX`
+/// rounded down to an eightbyte is the ceiling -- a billion times under the
+/// `MAX_OBJECT_BYTES` the type table allows, which is why the two are separate
+/// constants and separate messages. gcc compiles the same local with
+/// `movabsq`-based 64-bit frame addressing; c17 says so instead, and refuses the
+/// argument case exactly as gcc does ("sorry, unimplemented: passing too large
+/// argument on stack").
+///
+/// There was no diagnostic at all before. `char a[3000000000];` in a function
+/// emitted `subq $32, %rsp` with the array at `leaq -40(%rbp)` on x86-64 and a
+/// 48-byte frame with it at `x29 + #40` on aarch64, because
+/// `types.size_bytes(t) as i32` wrapped to -1294967296 and the `size.max(8)`
+/// that follows gave it eight bytes.
+///
+/// The last three cases are not declarations, so `check_stack_object_size` is
+/// asked of them somewhere other than the declarator loop: a compound literal
+/// has automatic storage duration by C17 6.5.2.5p5, a K&R parameter's real type
+/// arrives after the identifier list, and an aggregate *return* type is not an
+/// object at all -- that one reaches `abi::slot_bytes` in the backend, which is
+/// why its message differs.
+#[test]
+fn diagnostics_stack_object_larger_than_a_frame_slot_is_rejected() {
+    for (name, src, expected) in [
+        (
+            "automatic_array",
+            "extern void sink(char *);\n\
+             int f(void){ char a[3000000000]; a[0]=1; sink(a); return a[0]; }\n",
+            "maximum stack object size",
+        ),
+        (
+            "automatic_array_of_int",
+            "int f(void){ int a[600000000]; a[0]=1; return a[0]; }\n",
+            "maximum stack object size",
+        ),
+        (
+            "automatic_struct",
+            "struct S { char x[3000000000]; };\n\
+             int f(void){ struct S s; s.x[0]=1; return s.x[0]; }\n",
+            "maximum stack object size",
+        ),
+        (
+            "automatic_register",
+            "int f(void){ register char a[3000000000]; return a[0]; }\n",
+            "maximum stack object size",
+        ),
+        (
+            "automatic_nested_block",
+            "int f(int c){ if (c) { char a[3000000000]; return a[0]; } return 0; }\n",
+            "maximum stack object size",
+        ),
+        (
+            "parameter_prototype",
+            "struct S { char x[3000000000]; };\nint f(struct S s);\n",
+            "maximum stack object size",
+        ),
+        (
+            "parameter_unnamed",
+            "struct S { char x[3000000000]; };\nvoid f(struct S);\n",
+            "maximum stack object size",
+        ),
+        (
+            "parameter_definition",
+            "struct S { char x[3000000000]; };\n\
+             int f(struct S s){ return s.x[0]; }\n",
+            "maximum stack object size",
+        ),
+        (
+            "compound_literal",
+            "struct S { char x[3000000000]; };\nvoid sink(struct S *);\n\
+             void f(void){ sink(&(struct S){0}); }\n",
+            "maximum stack object size",
+        ),
+        (
+            "parameter_knr",
+            "struct S { char x[3000000000]; };\n\
+             int f(a) struct S a; { return a.x[0]; }\n",
+            "maximum stack object size",
+        ),
+        (
+            "aggregate_return_temporary",
+            "struct S { char x[3000000000]; };\nextern struct S g(void);\n\
+             int f(void){ return g().x[0]; }\n",
+            "a stack frame slot can address",
+        ),
+    ] {
+        compile_expect_error(name, src, expected);
+    }
+}
+
+/// The same size at static storage duration, or behind a pointer, keeps
+/// working.
+///
+/// The companion to the test above, and the guard that the new ceiling did not
+/// become a second, tighter `MAX_OBJECT_BYTES`: a static object is addressed
+/// symbolically rather than from the frame, and `char g[3000000000];` emits
+/// `.zero 3000000000` on both targets today.
+///
+/// `array_parameter_decays` and `pointer_to_a_large_struct` are the two cases
+/// that break if the parameter check is moved *before* the C17 6.7.5.3
+/// adjustment: that parameter is a `char *`, not an array. `vla_is_not_measured`
+/// is the case the rule must decline to answer -- a variable length array's
+/// extent is a run-time value, and `arch::regalloc::grow_frame` is what catches
+/// the frame it can still overflow.
+#[test]
+fn diagnostics_static_object_larger_than_a_frame_slot_is_accepted() {
+    for (name, src) in [
+        (
+            "file_scope_definition",
+            "char big[3000000000];\nint main(void){ return big[0]; }\n",
+        ),
+        (
+            "block_scope_static",
+            "int f(void){ static char big[3000000000]; return big[0]; }\n",
+        ),
+        (
+            "block_scope_extern",
+            "int f(void){ extern char big[3000000000]; return big[0]; }\n",
+        ),
+        (
+            "array_parameter_decays",
+            "int f(char a[3000000000]){ return a[0]; }\n",
+        ),
+        (
+            "pointer_to_a_large_struct",
+            "struct S { char x[3000000000]; };\nint f(struct S *p){ return p->x[0]; }\n",
+        ),
+        (
+            "sizeof_of_a_type_only",
+            "struct S { char x[3000000000]; };\n\
+             unsigned long f(void){ return sizeof(struct S); }\n",
+        ),
+        (
+            "vla_is_not_measured",
+            "int f(int n){ char a[n]; a[0]=1; return a[0]; }\n",
+        ),
+        // Deliberately modest, and it must stay that way. This case only has
+        // to show the check does not fire on an ordinary automatic object;
+        // proving the *edge* of the bound is `test_parser.rs`'s job, where it
+        // parses and never reaches a backend. `compile_expect_ok` compiles for
+        // the **host**, and a gigabyte-sized local costs 11 seconds and 13.4 GB
+        // on aarch64, because `zero_stack_frame` there emits one store per
+        // qword with no loop where x86-64 emits `rep stosq`. That took the
+        // aarch64 CI runner down. See "Zeroing a large frame is unrolled on
+        // aarch64" in cc/TODO.md.
+        (
+            "automatic_object_of_an_ordinary_size",
+            "extern void sink(char *);\n\
+             int f(void){ char a[65536]; a[0]=1; sink(a); return a[0]; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}

@@ -115,6 +115,109 @@ Complete on Linux, on both architectures. What is left:
 
 ---
 
+### Object size and value width are the same `u32`
+
+`size_bits` answers a *value* width -- what an instruction operand holds,
+bounded at 128 bits -- and `size_bytes` answers an *object* size, which is
+not bounded. They are both plain integers, so nothing stops one being used
+where the other is meant, and the unit (bits or bytes) is a naming convention
+rather than a type.
+
+That cost a silent miscompile once already. While `MAX_OBJECT_BYTES` was
+`u32::MAX / 8`, `size_bits` could not saturate -- the parser refused any type
+that would reach it -- so deriving a byte count as `size_bits / 8` was safe by
+accident. Raising the bound made saturation reachable and every such site
+began answering 536870911 for a larger type: array indexing, the stride of an
+array of a large struct, and `p + 1` on a pointer to one, all while `sizeof`
+stayed right.
+
+A `grep` for `size_bits(..) / 8` finds nothing outside `size_bytes` itself, and
+that is worth *less* than it appears: the class survived that grep at nine more
+sites, because the bit count reaches the division through something a grep
+cannot follow. Through a **local variable**, twice spelled `let
+target_size_bytes = target_size / 8;` -- a name that says bytes over an
+expression that computes them from bits. Through a **`u32` field** --
+`Linearizer::struct_return_size`, `ArgClass::Indirect`'s payload, and
+`Instruction::size`. And through an **equality** rather than a length, where two
+distinct aggregates past the cap compare equal and a guard that meant "the same
+type" stopped meaning it.
+
+Those nine are fixed, and the remaining conversions are safe for reasons nothing
+enforces: a `complex_base` is a scalar, a bit-field width is bounded by its
+storage unit, and a threshold comparison against 64 or 128 answers correctly even
+when saturated. That is three different arguments a reader has to reconstruct per
+site, which is the problem.
+
+What would settle it is making the distinction a *type* -- a `Bits` newtype
+for value widths that deliberately implements no division, and a `ByteSize`
+for object sizes -- so that every conversion is a compile error the compiler
+finds rather than a spelling a reader has to notice. Widening `size_bits` to
+`u64` is **not** that fix and was measured: of the 401 resulting type errors,
+364 want a `u32` because they are value widths, and silencing them with `as
+u32` reintroduces the same truncation at the seventy aggregate-fed sites.
+
+A second unit lives in the same area and is settled: `TypeTable::MAX_OBJECT_BYTES`
+bounds what a size can be *described* as, while
+`TypeTable::MAX_STACK_OBJECT_BYTES` bounds what the backends can give a *slot*,
+because a frame displacement is an `i32`. `crate::abi::slot_bytes` is the only
+place an object size becomes that `i32`, and `arch::regalloc::grow_frame` the
+only place a frame total grows. Lifting the second bound means widening both
+backends' offsets to `i64`; nothing needs it, and gcc refuses the argument case
+too.
+
+---
+
+### The backend's stacked-argument copy has no `memcpy` fallback
+
+`emit_block_copy` becomes a `memcpy` call past `BLOCK_COPY_INLINE_LIMIT`, 128
+bytes, because an unbounded unroll made a 256 KB struct passed by value cost
+65,536 IR instructions and a 65-second compile. The backend's *outgoing*
+stacked-argument copy has no such limit: `push_stack_args` emits one
+load/store pair per eight bytes for the whole argument, whatever its size.
+
+A 3 GB by-value argument produced **67 million instructions and a 4.1 GB `.s`
+file**, or an out-of-memory kill depending on what else the machine was doing.
+That particular size is a diagnostic now -- it is past
+`MAX_STACK_OBJECT_BYTES` -- but a 600 MB one is legal and still unrolls 75
+million instructions. Measured: **16 seconds and 21.9 GB resident** for one
+`callee(src)`, which is enough to take a CI runner down, and did. The same
+`memcpy` fallback applies, and the callee-side prologue copies in both
+`frame.rs` files have the same shape.
+
+Until it is fixed, a test must not pass a multi-hundred-megabyte aggregate by
+value -- `codegen_aggregate_copy_length_past_the_old_object_bound` says so where
+its source would tempt someone to.
+
+This is a compile-time blowup, not a wrong answer.
+
+---
+
+### Zeroing a large frame is unrolled on aarch64
+
+Every aarch64 prologue calls `zero_stack_frame`, so that a narrow write leaves
+zero in the bytes above it. It emits one `stp xzr, xzr` per sixteen bytes, or
+one `str xzr` per eight once the offsets stop encoding -- with no loop. x86-64's
+`zero_stack_frame` sets up `rep stosq` instead, four instructions whatever the
+size.
+
+So the cost is one instruction per eight bytes of frame, on one target only: a
+100 KB local is 12,500 stores, and `char a[1000000000];` is 125 million, which
+measured **11 seconds and 13.4 GB resident** against 0.007 seconds on x86-64.
+That took a CI runner down.
+
+`MAX_STACK_OBJECT_BYTES` bounds this at 2 GiB, which is not a bound at all here.
+The fix is the same shape as the `memcpy` fallback above: past some size, a
+counted loop rather than an unroll. X16 is already the cursor `zero_stack_frame`
+uses for out-of-range offsets, and AAPCS64 IP0 is never in the allocator's
+palette, so the register is available.
+
+Until it is fixed, `compile_expect_ok` compiles for the *host*, so an integration
+test must not declare a large automatic object -- the acceptance case in
+`diagnostics_static_object_larger_than_a_frame_slot_is_accepted` says so where
+its size would tempt someone to raise it.
+
+---
+
 ### An `__atomic_*` read-modify-write ignores its memory order
 
 `__atomic_fetch_add` and its eleven siblings lower through `emit_atomic_rmw`,

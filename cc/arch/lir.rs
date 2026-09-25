@@ -397,12 +397,10 @@ pub fn complex_sse_regs(types: &TypeTable, complex_typ: TypeId) -> usize {
 /// Only the x86-64 backend calls this, which is why it may ask System V
 /// directly.
 pub fn memory_class_bytes(types: &TypeTable, typ: TypeId) -> Option<usize> {
-    let bits = types.size_bits(typ);
-    if crate::abi::param_is_memory_class(typ, types) {
-        return Some((bits / 8) as usize);
-    }
-    if types.is_complex_float(typ) && complex_sse_regs(types, typ) == 0 {
-        return Some((bits / 8) as usize);
+    if crate::abi::param_is_memory_class(typ, types)
+        || (types.is_complex_float(typ) && complex_sse_regs(types, typ) == 0)
+    {
+        return Some(types.size_bytes(typ));
     }
     None
 }

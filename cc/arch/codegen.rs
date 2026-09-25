@@ -115,6 +115,11 @@ pub struct CodeGenBase<I: LirInst> {
     pub current_fn: String,
     /// Whether to emit basic unwind tables (cfi_startproc/cfi_endproc)
     pub emit_unwind_tables: bool,
+    /// A source position for the function being emitted, for a backend
+    /// diagnostic that has no nearer one -- `crate::abi::slot_bytes` and
+    /// `crate::arch::regalloc::grow_frame` report against it. Set from
+    /// `crate::arch::func_pos` at the top of each `emit_function`.
+    pub func_pos: crate::diag::Position,
     /// Last emitted source line (for avoiding duplicate .loc directives)
     pub last_debug_line: u32,
     /// Last emitted source file index
@@ -154,6 +159,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             lir_buffer: Vec::with_capacity(DEFAULT_LIR_BUFFER_CAPACITY),
             current_fn: String::new(),
             emit_unwind_tables: true,
+            func_pos: crate::diag::Position::default(),
             last_debug_line: 0,
             last_debug_file: 0,
             emit_debug: false,

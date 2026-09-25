@@ -5835,3 +5835,79 @@ fn test_imaginary_integer_constants() {
         );
     }
 }
+
+/// An object no `i32` frame displacement can reach is refused where it is
+/// declared.
+///
+/// C17 sets no limit here; `TypeTable::MAX_STACK_OBJECT_BYTES` is c17's, because
+/// both backends address a local and a stacked argument by a signed 32-bit
+/// displacement. Before this check every conversion in `arch/` and `abi/` was a
+/// bare `as i32` and wrapped: `char a[3000000000];` in a function got an
+/// eight-byte slot and a `subq $32, %rsp` frame, with no diagnostic.
+///
+/// One rule, asked from four places, because an automatic object, a prototyped
+/// parameter, a K&R parameter and a compound literal are four different
+/// productions bound by four different functions. The three convergence points
+/// below them (`Function::add_local`, `Linearizer::insert_local`,
+/// `SymbolTable::declare`) all lack a `Position`, and the first two also see
+/// compiler temporaries that have no declaration to point at.
+#[test]
+fn test_stack_object_larger_than_a_frame_slot_is_rejected() {
+    for src in [
+        // An automatic object, in each of the scopes that can declare one.
+        "int f(void){ char a[3000000000]; return a[0]; }",
+        "int f(void){ int a[600000000]; return a[0]; }",
+        "int f(void){ struct S { char x[3000000000]; } s; return s.x[0]; }",
+        "int f(void){ register char a[3000000000]; return a[0]; }",
+        "int f(void){ { { char a[3000000000]; return a[0]; } } }",
+        "int f(void){ for (char a[3000000000];;) return a[0]; }",
+        // A by-value parameter, prototyped and unnamed and nested.
+        "struct S { char x[3000000000]; }; int f(struct S s);",
+        "struct S { char x[3000000000]; }; void f(struct S);",
+        "struct S { char x[3000000000]; }; int f(struct S s){ return s.x[0]; }",
+        "struct S { char x[3000000000]; }; int (*fp)(struct S);",
+        "struct S { char x[3000000000]; }; int f(int, struct S, int);",
+        // A K&R parameter, whose real type arrives after the identifier list.
+        "struct S { char x[3000000000]; }; int f(a) struct S a; { return a.x[0]; }",
+        // A compound literal inside a function: automatic storage duration by
+        // C17 6.5.2.5p5, and not a declaration.
+        "struct S { char x[3000000000]; };\n\
+         void sink(struct S *); void f(void){ sink(&(struct S){0}); }",
+    ] {
+        match parse_tu(src) {
+            Err(e) => assert!(
+                e.to_string().contains("maximum stack object size"),
+                "{src}\nwas rejected, but not for its size: {e}"
+            ),
+            Ok(_) => panic!("{src}\nshould have been rejected"),
+        }
+    }
+}
+
+/// Static storage duration is not the frame's problem.
+///
+/// The guard that keeps the new ceiling from becoming a second, tighter
+/// `MAX_OBJECT_BYTES`. `array_parameter_decays` and the pointer case are the two
+/// that break if the parameter check is moved before the C17 6.7.5.3 adjustment:
+/// that parameter is a `char *`. A variable length array has no static extent to
+/// measure, so the rule declines to answer and
+/// `arch::regalloc::grow_frame` catches the frame instead.
+#[test]
+fn test_static_object_larger_than_a_frame_slot_is_accepted() {
+    for src in [
+        "char big[3000000000];",
+        "int f(void){ static char big[3000000000]; return big[0]; }",
+        "int f(void){ extern char big[3000000000]; return big[0]; }",
+        "_Thread_local char big[3000000000];",
+        "int f(char a[3000000000]){ return a[0]; }",
+        "struct S { char x[3000000000]; }; int f(struct S *p){ return p->x[0]; }",
+        "typedef char T[3000000000]; unsigned long f(void){ return sizeof(T); }",
+        "int f(int n){ char a[n]; return a[0]; }",
+        "int f(int n){ char a[n][3000000000]; return a[0][0]; }",
+        "int f(void){ char a[1000000000]; return a[0]; }",
+    ] {
+        if let Err(e) = parse_tu(src) {
+            panic!("{src}\nshould have parsed: {e}");
+        }
+    }
+}

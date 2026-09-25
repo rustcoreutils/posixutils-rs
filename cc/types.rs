@@ -1974,6 +1974,37 @@ impl TypeTable {
     /// with the unit.
     pub const MAX_OBJECT_BYTES: usize = (u64::MAX / 8) as usize;
 
+    /// The largest object the backend can give a *stack* slot.
+    ///
+    /// Two bounds again, and this time the operative one is not C's:
+    ///
+    /// - **The object's own**, [`Self::MAX_OBJECT_BYTES`]: what a size can be
+    ///   described as at all, and what `sizeof` answers.
+    /// - **The frame's**, `i32::MAX` rounded down to an eightbyte, and
+    ///   therefore the operative one here: both backends address a local and a
+    ///   stacked argument by a signed 32-bit displacement from the frame
+    ///   register, so an object past this has no slot to be given. Rounded down
+    ///   to eight because every consumer rounds a size *up* to eight before
+    ///   using it, and at `i32::MAX` that addition is itself the overflow.
+    ///
+    /// This is a c17 backend limit and not a C one -- C17 says nothing about
+    /// where an object with automatic storage duration lives, and gcc compiles
+    /// the same declaration with `movabsq`-based 64-bit frame addressing.
+    /// Widening both backends' offsets to `i64` is the change that would lift
+    /// the bound; until then a diagnostic is the honest answer.
+    ///
+    /// It does **not** apply to an object with static storage duration, which
+    /// is addressed symbolically and works at any size
+    /// [`Self::MAX_OBJECT_BYTES`] allows: `char g[3000000000];` emits
+    /// `.zero 3000000000` on both targets.
+    ///
+    /// Until this existed every size conversion in `arch/` and `abi/` was a
+    /// bare `as i32` and wrapped. `char a[3000000000];` in a function came out
+    /// as -1294967296, the `size.max(8)` that follows gave it an eight-byte
+    /// slot, and the whole frame was `subq $32, %rsp` with the array laid
+    /// across it -- with no diagnostic at all.
+    pub const MAX_STACK_OBJECT_BYTES: usize = (i32::MAX as usize) & !7;
+
     /// Get the size of a type in bytes
     /// The size of a type in bytes -- the answer `sizeof` gives.
     ///

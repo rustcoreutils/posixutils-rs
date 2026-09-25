@@ -553,6 +553,20 @@ impl Parser<'_> {
                 typ_id = self.types.intern(ptr_type);
             }
 
+            // A by-value parameter that runs out of registers gets a
+            // stacked-argument slot, addressed exactly as a local is, so the
+            // same bound applies. Asked *after* the 6.7.5.3 adjustment above,
+            // which is what keeps `int f(char a[3000000000])` legal: that
+            // parameter is a `char *`.
+            //
+            // Asked of a prototype as well as a definition, because neither
+            // backend can call or define such a function, so the declaration is
+            // the earliest honest place to say so -- and it is the one place
+            // every prototyped parameter list, named or not, at any scope,
+            // passes through. gcc reaches the same conclusion later, as
+            // "sorry, unimplemented: passing too large argument on stack".
+            self.check_stack_object_size(typ_id, self.current_pos(), "a by-value parameter")?;
+
             let name_opt = if param_name == StringId::EMPTY {
                 None
             } else {

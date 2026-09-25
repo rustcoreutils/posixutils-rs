@@ -267,7 +267,7 @@ pub struct Linearizer<'a> {
     /// Hidden struct return pointer (for functions returning large structs via sret)
     pub(crate) struct_return_ptr: Option<PseudoId>,
     /// Size of struct being returned (for functions returning large structs via sret)
-    pub(crate) struct_return_size: u32,
+    pub(crate) struct_return_bytes: usize,
     /// Type of struct being returned via two registers (9-16 bytes, per ABI)
     pub(crate) two_reg_return_type: Option<TypeId>,
     /// Current function name (for generating unique static local names)
@@ -388,7 +388,7 @@ impl<'a> Linearizer<'a> {
             types,
             strings,
             struct_return_ptr: None,
-            struct_return_size: 0,
+            struct_return_bytes: 0,
             two_reg_return_type: None,
             current_func_name: String::new(),
             addr_taken_labels: Vec::new(),
@@ -548,7 +548,10 @@ impl<'a> Linearizer<'a> {
     /// the pseudos to 16-byte stack slots in the register allocator -- a
     /// 128-bit value the allocator hands a single GP register instead panics
     /// the backend in `int128_lo_mem_loc`.
-    pub(crate) fn bitfield_storage_type(&self, storage_size: u32) -> TypeId {
+    /// `storage_size` is a byte count, so it takes the type an object size is
+    /// counted in. Only 1, 2, 4, 8 and 16 name a storage unit; anything else
+    /// -- including a size no integer type could hold -- takes the default.
+    pub(crate) fn bitfield_storage_type(&self, storage_size: usize) -> TypeId {
         match storage_size {
             1 => self.types.uchar_id,
             2 => self.types.ushort_id,
@@ -901,6 +904,10 @@ impl<'a> Linearizer<'a> {
             }
 
             let typ_size = self.types.size_bits(typ);
+            // The copy length is an object size, so it is counted in bytes.
+            // `typ_size` saturates for an aggregate past `u32::MAX` bits and is
+            // good only for the class tests below, which compare against 64.
+            let typ_bytes = self.types.size_bytes(typ) as i64;
             let is_aarch64 = self.target.arch == crate::target::Arch::Aarch64;
             // MEMORY class: the caller left the bytes in the incoming argument
             // area, so `arg_pseudo` names storage rather than pointing at it.
@@ -929,11 +936,11 @@ impl<'a> Linearizer<'a> {
                 // multiple of eight is copied exactly. Stepping 8 while
                 // `offset < size` rounds *up* -- a 12-byte struct wrote 16
                 // bytes, four of them past the local.
-                self.emit_block_copy(local_sym, addr_pseudo, (typ_size / 8) as i64);
+                self.emit_block_copy(local_sym, addr_pseudo, typ_bytes);
             } else if typ_size > 64 {
                 // Medium struct (9-16 bytes): arg_pseudo is a pointer (current behavior).
                 // Copy each 8-byte chunk through pointer dereference.
-                self.emit_block_copy(local_sym, arg_pseudo, (typ_size / 8) as i64);
+                self.emit_block_copy(local_sym, arg_pseudo, typ_bytes);
             } else {
                 // Small struct: arg_pseudo contains the value directly
                 self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
@@ -972,7 +979,7 @@ impl<'a> Linearizer<'a> {
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
             let sym = Pseudo::sym(local_sym, name.clone());
-            let typ_size_bytes = (self.types.size_bits(typ) / 8) as usize;
+            let typ_size_bytes = self.types.size_bytes(typ);
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
                 let mods = self.types.modifiers(typ);
@@ -1072,7 +1079,7 @@ impl<'a> Linearizer<'a> {
         self.break_targets.clear();
         self.continue_targets.clear();
         self.struct_return_ptr = None;
-        self.struct_return_size = 0;
+        self.struct_return_bytes = 0;
         self.two_reg_return_type = None;
         self.current_func_name = self.emitted_name(func.name);
         self.addr_taken_labels.clear();
@@ -1216,7 +1223,7 @@ impl<'a> Linearizer<'a> {
             let sret_pseudo = Pseudo::arg(sret_id, 0).with_name("__sret");
             ir_func.add_pseudo(sret_pseudo);
             self.struct_return_ptr = Some(sret_id);
-            self.struct_return_size = self.types.size_bits(func.return_type);
+            self.struct_return_bytes = self.types.size_bytes(func.return_type);
         }
 
         // Check if function returns a medium struct (9-16 bytes) via two registers
@@ -1509,7 +1516,7 @@ impl<'a> Linearizer<'a> {
     // Statement linearization
 
     /// Emit large struct return via hidden pointer (sret)
-    pub(crate) fn emit_sret_return(&mut self, e: &Expr, sret_ptr: PseudoId, struct_size: u32) {
+    pub(crate) fn emit_sret_return(&mut self, e: &Expr, sret_ptr: PseudoId, struct_bytes: usize) {
         // Only structs and unions return through a hidden pointer
         // (`returns_via_hidden_pointer`), so `e` is always an aggregate here —
         // complex returns take the register path and go through
@@ -1519,7 +1526,7 @@ impl<'a> Linearizer<'a> {
         // prologue uses it: a large struct becomes a `memcpy` call instead of
         // an unbounded unroll, and a size that is not a multiple of eight is
         // copied exactly rather than rounded up past the caller's object.
-        self.emit_block_copy(sret_ptr, src_addr, struct_size as i64 / 8);
+        self.emit_block_copy(sret_ptr, src_addr, struct_bytes as i64);
 
         self.emit(Instruction::ret_typed(
             Some(sret_ptr),
@@ -2158,7 +2165,7 @@ impl<'a> Linearizer<'a> {
                 // element type has no usable compile-time size, and this is
                 // the path that `a[i][j] = v` and `&a[i][j]` take.
                 let elem_size_val = self.vm_index_stride(ptr_expr).unwrap_or_else(|| {
-                    let elem_size = self.types.size_bits(elem_type) / 8;
+                    let elem_size = self.types.size_bytes(elem_type);
                     self.emit_const(elem_size as i128, self.types.long_id)
                 });
 
@@ -2236,8 +2243,7 @@ impl<'a> Linearizer<'a> {
                 if *op == UnaryOp::Real || !self.types.is_complex(op_typ) {
                     return addr;
                 }
-                let base_bytes =
-                    (self.types.size_bits(self.types.complex_base(op_typ)) / 8) as i128;
+                let base_bytes = (self.types.size_bytes(self.types.complex_base(op_typ))) as i128;
                 let off = self.emit_const(base_bytes, self.types.long_id);
                 let out = self.alloc_reg_pseudo();
                 let ptr_type = self.types.pointer_to(self.types.complex_base(op_typ));
@@ -2607,7 +2613,7 @@ impl<'a> Linearizer<'a> {
             return stride;
         }
         let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
-        let elem_size = self.types.size_bits(elem_type) / 8;
+        let elem_size = self.types.size_bytes(elem_type);
         self.emit_const(elem_size as i128, self.types.long_id)
     }
 
@@ -2988,7 +2994,7 @@ impl<'a> Linearizer<'a> {
         // covers every depth -- `b[i]`, `b[i][j]`, ... -- and locals and
         // parameters alike, because both record their element type's extents.
         let elem_size_val = self.vm_index_stride(ptr_expr).unwrap_or_else(|| {
-            let elem_size = self.types.size_bits(elem_type) / 8;
+            let elem_size = self.types.size_bytes(elem_type);
             self.emit_const(elem_size as i128, self.types.long_id)
         });
 

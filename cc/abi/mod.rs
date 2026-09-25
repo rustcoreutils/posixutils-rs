@@ -29,6 +29,50 @@ pub use sysv_amd64::{
 use crate::target::{Arch, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
+/// An object's byte count as the backends' frame arithmetic needs it.
+///
+/// Every stack slot and every stacked-argument slot in both backends is
+/// addressed by a signed 32-bit displacement, so a size has to become an `i32`
+/// before that arithmetic runs. Fifteen sites used to spell that `as i32`,
+/// which wraps: 3000000000 came out as -1294967296, the `size.max(8)` that
+/// follows gave the object an eight-byte slot, and the function's whole frame
+/// was `subq $32, %rsp` with the array laid over it.
+///
+/// [`TypeTable::MAX_STACK_OBJECT_BYTES`] is the bound, and
+/// `Parser::check_stack_object_size` refuses a *declaration* that passes it.
+/// This is the backstop for the objects that check cannot see, and each one is
+/// reachable from C source:
+///
+/// - the `__sret` local a call to a function returning a large aggregate
+///   allocates -- a by-value *return* type is not a declared object;
+/// - a compound literal's anonymous local.
+///
+/// Reachable is why the message is the user's and carries no `internal error:`
+/// prefix: a programmer can write either, and a bug report is not what either
+/// one wants. A diagnostic and not `.expect()`, because an ICE is not a
+/// diagnostic. No function in `arch/` or `abi/` returns `Result`, so
+/// [`crate::diag::error_args`] is the channel -- the same shape `FrameBase::of`
+/// uses in both backends.
+///
+/// The placeholder is one eightbyte: non-zero, so the `& !(align - 1)`
+/// roundings and the `while done < bytes` copy loops that consume it still
+/// terminate, and small enough that nothing it feeds overflows in turn.
+pub fn slot_bytes(bytes: usize, pos: crate::diag::Position, what: &str) -> i32 {
+    if bytes > TypeTable::MAX_STACK_OBJECT_BYTES {
+        crate::diag::error_args(
+            pos,
+            "size of {0} is {1} bytes, past the {2} bytes a stack frame slot can address",
+            &[
+                what,
+                &bytes.to_string(),
+                &TypeTable::MAX_STACK_OBJECT_BYTES.to_string(),
+            ],
+        );
+        return 8;
+    }
+    bytes as i32
+}
+
 // Register Classification
 
 /// Classification of a single eightbyte (x86-64) or register slot.
@@ -105,13 +149,19 @@ pub enum ArgClass {
         /// Size in bits of the value
         size_bits: u32,
     },
-    /// Pass by reference (caller allocates, passes pointer).
-    /// Used for large structs that don't fit in registers.
+    /// The argument travels in memory rather than in registers.
+    ///
+    /// Used for large structs that don't fit in registers. On SysV amd64 the
+    /// MEMORY class means the caller pushes the object *by value*, so the
+    /// payload below is the object's own size.
     Indirect {
         /// Alignment requirement in bytes
         align: u32,
-        /// Size in bits
-        size_bits: u32,
+        /// Size in **bytes**: an object size, not a value width. Deriving it
+        /// from [`crate::types::TypeTable::size_bits`] answered 536870911 for
+        /// any aggregate past `u32::MAX` bits, which sized the stacked
+        /// argument short.
+        size_bytes: usize,
     },
     /// Homogeneous Floating-Point Aggregate (AAPCS64 specific).
     /// Struct with 1-4 identical float/double members passed in FP registers.

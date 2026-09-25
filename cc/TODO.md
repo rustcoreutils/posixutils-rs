@@ -70,6 +70,56 @@ live `int`s cost 72 bytes where gcc uses callee-saved registers and none. Slot
 reuse is the larger multiplier, but this is why even leaf functions carry a
 frame.
 
+### aarch64 emits frame offsets no instruction can encode
+
+A frame-relative `ldr`/`str` is printed as `[x29, #off]` whatever `off` is, and
+the scaled 12-bit immediate only reaches 4095 elements of the access size:
+4 KB for a byte, 16 KB for a word, 32 KB for a doubleword. So an ordinary
+function with a 40 KB local array and one `int` fails to *assemble* ("immediate
+offset out of range"), at every optimization level, on Linux and Darwin alike.
+Spills, incoming stacked arguments and the variadic register save area sit
+above the locals and hit the same wall. A packed struct member at a misaligned
+offset past 255 fails through any pointer, with no large frame at all.
+
+Related sites with the same shape:
+
+- `emit_add_imm_legalized` splits an immediate into a shifted and an unshifted
+  12-bit half, so it reaches 16 MiB and no further. `zero_stack_frame` runs in
+  every prologue and uses it, so *every* frame past 16 MiB fails to assemble,
+  and so does taking the address of a local that far up.
+- The over-aligned frame base (`add x19, x29, #...`) is emitted raw, so
+  `_Alignas(4096)` on a local fails.
+- `emit_struct_store`/`emit_struct_zero` add a raw offset to their cursor, and
+  the outgoing-argument `sub sp`/`add sp` and `[sp, #off]` stores are raw past
+  about 4 KB of stacked arguments.
+
+The fix is one legalizer: an address whose displacement does not encode for its
+access size is rebuilt through X16 with `emit_add_offset`, which already handles
+any offset, and `emit_add_imm_legalized` falls back to `emit_mov_imm` plus a
+register add. The pair forms already have `legalize_pair_addr`; the single forms
+have nothing.
+
+---
+
+### `i32` frame arithmetic can still wrap near the ceiling
+
+`grow_frame` accepts a locals area up to `MAX_STACK_OBJECT_BYTES`, but several
+sums after it still run unchecked in `i32` and wrap silently in a release
+build: `stack_size`'s rounding, the prologue's total (callee-saved area,
+variadic register save area, over-alignment), `stack_mem`'s `-(offset +
+callee_saved_offset)`, a Sym local's `(size + alignment - 1)` rounding, which
+runs *before* `grow_frame`, `IncomingOff::take`, and x86-64
+`classify_call_args`, which takes an `ArgClass::Indirect` size with a bare
+`as i32` rather than through `slot_bytes`. A wrap there means the prologue
+allocates nothing, or an object gets zero bytes -- a miscompile with no
+diagnostic, within about a hundred bytes of the limit.
+
+Closing it without the 64-bit feature means giving `grow_frame` headroom for
+everything added after it, and routing the remaining sums through checked
+arithmetic.
+
+---
+
 ### A by-value struct argument is still copied word by word in the backend
 
 Fixed at the IR level: copies past 128 bytes now become a `memcpy` call, which
@@ -161,9 +211,8 @@ bounds what a size can be *described* as, while
 `TypeTable::MAX_STACK_OBJECT_BYTES` bounds what the backends can give a *slot*,
 because a frame displacement is an `i32`. `crate::abi::slot_bytes` is the only
 place an object size becomes that `i32`, and `arch::regalloc::grow_frame` the
-only place a frame total grows. Lifting the second bound means widening both
-backends' offsets to `i64`; nothing needs it, and gcc refuses the argument case
-too.
+only place a frame total grows. Lifting the second bound is its own feature --
+see [64-bit stack frames](#64-bit-stack-frames).
 
 ---
 
@@ -206,6 +255,9 @@ measured **11 seconds and 13.4 GB resident** against 0.007 seconds on x86-64.
 That took a CI runner down.
 
 `MAX_STACK_OBJECT_BYTES` bounds this at 2 GiB, which is not a bound at all here.
+Past 16 MiB the unroll is moot today, because the cursor adds it emits stop
+encoding and the output fails to assemble -- see
+[the unencodable-offset bug](#aarch64-emits-frame-offsets-no-instruction-can-encode).
 The fix is the same shape as the `memcpy` fallback above: past some size, a
 counted loop rather than an unroll. X16 is already the cursor `zero_stack_frame`
 uses for out-of-range offsets, and AAPCS64 IP0 is never in the allocator's
@@ -215,6 +267,44 @@ Until it is fixed, `compile_expect_ok` compiles for the *host*, so an integratio
 test must not declare a large automatic object -- the acceptance case in
 `diagnostics_static_object_larger_than_a_frame_slot_is_accepted` says so where
 its size would tempt someone to raise it.
+
+---
+
+### 64-bit stack frames
+
+An automatic object past `MAX_STACK_OBJECT_BYTES` (just under 2 GiB) is refused
+with a diagnostic, and so is a frame whose total passes it. gcc compiles both:
+x86-64 reaches the frame through `movabsq`-materialised displacements, and
+aarch64 through `movz`/`movk` into a scratch register. This is a gap, not a
+decision -- the diagnostic exists so that c17 never emits a wrapped frame, and
+it is the placeholder for this feature.
+
+The torture harness skips the tests that need it by name,
+`NEEDS_64BIT_FRAMES` in `cc/scripts/c17_torture.sh` (`compile/20031023-1..4`,
+`compile/stack-check-1`), so that they are neither counted as failures nor
+forgotten. Deleting that list is part of finishing this.
+
+What it takes:
+
+- Widen every frame quantity to `i64`: `MemAddr` displacements on both targets,
+  `Loc::Stack`/`Loc::IncomingArg`, `RegAlloc::stack_offset`, the shared
+  `ActiveSlot`/`FreeSlot`, `callee_saved_offset`, `stack_alloc_size`,
+  `reg_save_area_offset`, the outgoing-argument layout, `IncomingOff`, and the
+  CFI directive offsets. `grow_frame` and `slot_bytes` then bound at
+  `MAX_OBJECT_BYTES` instead.
+- A displacement outside the target's encodable range goes through a scratch
+  register: `movabsq` plus an indexed or `addq` form on x86-64, the existing
+  `emit_mov_imm`/`emit_add_offset` on aarch64 (both already take the full
+  `i64`). On aarch64 this is the same legalizer the
+  [unencodable-offset bug](#aarch64-emits-frame-offsets-no-instruction-can-encode)
+  needs, so that comes first.
+- The prologue's `subq $N, %rsp` becomes `movabsq $N, %r11; subq %r11, %rsp`;
+  aarch64's `emit_sub_sp_imm`/`emit_add_sp_imm` already materialise any size.
+- `insn.offset as i32` in both backends' load/store paths truncates a constant
+  member or element offset past `i32::MAX` -- through *any* pointer, not only
+  the frame -- so those casts go too.
+- Stack probing. No target probes today; a frame larger than the guard gap
+  should touch each page on the way down, as gcc and clang do.
 
 ---
 
@@ -392,7 +482,10 @@ Most of what is left is one thing.
 
 | Group | Note |
 |---|---|
-| Builtin folding | The whole of `execute/builtins/`. Each test defines its own `strlen`, `memcpy` or `printf` that calls `abort()` when `__OPTIMIZE__` is set, so a run-time failure there means c17 emitted a real call where gcc folded the builtin or expanded it inline. Nothing fails to *compile*, so no build is blocked; it is gcc-parity and code quality. Deferred by decision |
+| Builtin folding | The whole of `execute/builtins/`. Each test defines its own `strlen`, `memcpy` or `printf` that calls `abort()` when `__OPTIMIZE__` is set, so a run-time failure there means c17 emitted a real call where gcc folded the builtin or expanded it inline. Nothing fails to *compile*, so no build is blocked; it is gcc-parity and code quality. Deferred by decision. The same group: `execute/printf-chk-1`, `fprintf-chk-1`, `vprintf-chk-1` and `vfprintf-chk-1` at `-O2`, which expect `__printf_chk` with a constant format to become `puts`/`putchar`; `builtins/abs-2`, `abs-3`, `complex-1` and `memcmp` at `-O2`, which expect a constant call folded so that a `link_error` reference disappears; and `builtins/strncmp` at `-O0`, whose own `strncmp` returns an uninitialised value for `n == 0`, so it passes only when the call is folded to 0 -- which gcc does at every level |
+| `__builtin_return_address(n)` | `execute/20010122-1`. The level is ignored on both targets, so `n > 0` answers level 0; and aarch64 answers level 0 from `x30`, which any call clobbers |
+| `aligned` on a function | `execute/align-3`. `__alignof__` of a function declared `__attribute__((aligned(256)))` answers 1, and no alignment directive is emitted for it |
+| Compile time | `compile/20001226-1`, 8192 `if ... goto` pairs in one function: over 300 seconds in the x86-64 register allocator's coloring, against gcc's 0.4. `compile/limits-fndefn`, a function of 100,000 parameters: about 110 seconds in `ssa_convert`, against 0.14 |
 | Dead-call elimination proofs | `20030330-1` and `medce-1` at `-O0` (a constant branch keeps its arm there, which is recorded in DECISIONS.md), and `ieee/compare-fp-3` and `ieee/fp-cmp-6`/`-7`/`-9` at every level. Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link*. Standard C, and optimizer strength rather than a defect: what is missing is folding a comparison whose operands are known to relate |
 | `always_inline` on a library builtin | `pr46360`. `__attribute__((always_inline))` on a declaration of `strncpy` -- c17 refuses because it has no body to substitute, where gcc inlines its own expansion |
 | An `extern inline` reading a file-scope static | `pr38857`. A C17 6.7.4p3 constraint gcc does not enforce. Relaxed by `-fpermissive`; the test does not pass it |

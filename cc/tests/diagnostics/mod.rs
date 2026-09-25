@@ -5437,8 +5437,8 @@ fn diagnostics_stack_object_larger_than_a_frame_slot_is_rejected() {
 /// that break if the parameter check is moved *before* the C17 6.7.5.3
 /// adjustment: that parameter is a `char *`, not an array. `vla_is_not_measured`
 /// is the case the rule must decline to answer -- a variable length array's
-/// extent is a run-time value, and `arch::regalloc::grow_frame` is what catches
-/// the frame it can still overflow.
+/// extent is a run-time value, subtracted from the stack pointer in a 64-bit
+/// register, and the frame holds only a pointer to it.
 #[test]
 fn diagnostics_static_object_larger_than_a_frame_slot_is_accepted() {
     for (name, src) in [

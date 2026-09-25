@@ -23,8 +23,9 @@ use std::hash::Hash;
 /// `+=` on an `i32` wraps: a frame past two gigabytes came out negative and the
 /// prologue subtracted nothing. Both backends' `alloc_stack_slot` is the one
 /// place their locals area grows, so this is the one place the total can be
-/// checked -- including for the VLA and `alloca` extents the front end cannot
-/// measure statically.
+/// checked. A VLA or `alloca` extent never reaches it: the frame holds only an
+/// eight-byte pointer for one, and the extent is subtracted from the stack
+/// pointer at run time in a 64-bit register.
 ///
 /// The rounding happens inside, in `i64`, because at a legal
 /// `MAX_STACK_OBJECT_BYTES` with an over-aligned local the

@@ -461,14 +461,6 @@ compile/20031010-1@-O0
 compile/20031010-1@-O2
 compile/20031011-2@-O0
 compile/20031011-2@-O2
-compile/20031023-1@-O0
-compile/20031023-1@-O2
-compile/20031023-2@-O0
-compile/20031023-2@-O2
-compile/20031023-3@-O0
-compile/20031023-3@-O2
-compile/20031023-4@-O0
-compile/20031023-4@-O2
 compile/20031031-1@-O0
 compile/20031031-1@-O2
 compile/20031031-2@-O0
@@ -3587,8 +3579,6 @@ compile/ssa-pre-1@-O0
 compile/ssa-pre-1@-O2
 compile/ssa-unused-1@-O0
 compile/ssa-unused-1@-O2
-compile/stack-check-1@-O0
-compile/stack-check-1@-O2
 compile/statement-expression-1@-O0
 compile/statement-expression-1@-O2
 compile/store0@-O0

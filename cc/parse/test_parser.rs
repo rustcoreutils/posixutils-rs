@@ -5890,8 +5890,8 @@ fn test_stack_object_larger_than_a_frame_slot_is_rejected() {
 /// `MAX_OBJECT_BYTES`. `array_parameter_decays` and the pointer case are the two
 /// that break if the parameter check is moved before the C17 6.7.5.3 adjustment:
 /// that parameter is a `char *`. A variable length array has no static extent to
-/// measure, so the rule declines to answer and
-/// `arch::regalloc::grow_frame` catches the frame instead.
+/// measure, so the rule declines to answer: its extent is subtracted from the
+/// stack pointer at run time, and the frame holds only a pointer to it.
 #[test]
 fn test_static_object_larger_than_a_frame_slot_is_accepted() {
     for src in [

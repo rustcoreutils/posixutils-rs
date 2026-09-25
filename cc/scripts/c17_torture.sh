@@ -401,6 +401,15 @@ OUT_OF_SCOPE_ISSIGNALING=" ieee/builtin-issignaling-1 \
  ieee/float32-builtin-issignaling-1 ieee/float32x-builtin-issignaling-1 \
  ieee/float64-builtin-issignaling-1 ieee/float64x-builtin-issignaling-1 "
 
+# A local array of 2 GiB to 1 TiB. This is a gap in c17, not a decision: an
+# automatic object past `MAX_STACK_OBJECT_BYTES` is refused with a diagnostic,
+# because both backends address the frame through a signed 32-bit
+# displacement, and gcc handles the same object with 64-bit frame addressing.
+# cc/TODO.md's "64-bit stack frames" says what supporting it takes. Delete this
+# list when that lands, so these become ordinary tests again.
+NEEDS_64BIT_FRAMES=" compile/20031023-1 compile/20031023-2 compile/20031023-3 \
+ compile/20031023-4 compile/stack-check-1 "
+
 # gcc rejects or fails these at every level here.
 GCC_ALSO_FAILS=" execute/980608-1 execute/bcp-1 execute/eeprof-1 execute/pr117432 \
  execute/pr123864 execute/va-arg-7 execute/va-arg-8 compile/dll "
@@ -496,6 +505,9 @@ EOF
     case "$OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN" in
         *" $key "*) echo "SKIP	$tag	out of scope: a gcc-internal builtin"; return;;
     esac
+    case "$NEEDS_64BIT_FRAMES" in
+        *" $key "*) echo "SKIP	$tag	needs 64-bit frames"; return;;
+    esac
     local scan skip flags mult stack dgdo
     scan=$(dg_scan "$src" "$opt")
     skip=${scan%%|*}; scan=${scan#*|}
@@ -583,7 +595,7 @@ export OUT_OF_SCOPE_NESTED_FN OUT_OF_SCOPE_VLA_MEMBER
 export OUT_OF_SCOPE_GCC_BEHAVIOUR OUT_OF_SCOPE_GCC_INTERNAL
 export OUT_OF_SCOPE_GNU89_INLINE OUT_OF_SCOPE_OTHER_TARGET
 export NEEDS_PRE_C99_DIALECT OUT_OF_SCOPE_ISSIGNALING
-export OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN
+export OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN NEEDS_64BIT_FRAMES
 
 # ------------------------------------------------------------- collect tests
 # Each line is `<sub-suite>:<path>`, so a worker knows which sub-suite it is in

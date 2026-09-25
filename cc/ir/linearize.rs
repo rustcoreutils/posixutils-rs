@@ -267,7 +267,7 @@ pub struct Linearizer<'a> {
     /// Hidden struct return pointer (for functions returning large structs via sret)
     pub(crate) struct_return_ptr: Option<PseudoId>,
     /// Size of struct being returned (for functions returning large structs via sret)
-    pub(crate) struct_return_size: u32,
+    pub(crate) struct_return_bytes: usize,
     /// Type of struct being returned via two registers (9-16 bytes, per ABI)
     pub(crate) two_reg_return_type: Option<TypeId>,
     /// Current function name (for generating unique static local names)
@@ -388,7 +388,7 @@ impl<'a> Linearizer<'a> {
             types,
             strings,
             struct_return_ptr: None,
-            struct_return_size: 0,
+            struct_return_bytes: 0,
             two_reg_return_type: None,
             current_func_name: String::new(),
             addr_taken_labels: Vec::new(),
@@ -904,6 +904,10 @@ impl<'a> Linearizer<'a> {
             }
 
             let typ_size = self.types.size_bits(typ);
+            // The copy length is an object size, so it is counted in bytes.
+            // `typ_size` saturates for an aggregate past `u32::MAX` bits and is
+            // good only for the class tests below, which compare against 64.
+            let typ_bytes = self.types.size_bytes(typ) as i64;
             let is_aarch64 = self.target.arch == crate::target::Arch::Aarch64;
             // MEMORY class: the caller left the bytes in the incoming argument
             // area, so `arg_pseudo` names storage rather than pointing at it.
@@ -932,11 +936,11 @@ impl<'a> Linearizer<'a> {
                 // multiple of eight is copied exactly. Stepping 8 while
                 // `offset < size` rounds *up* -- a 12-byte struct wrote 16
                 // bytes, four of them past the local.
-                self.emit_block_copy(local_sym, addr_pseudo, (typ_size / 8) as i64);
+                self.emit_block_copy(local_sym, addr_pseudo, typ_bytes);
             } else if typ_size > 64 {
                 // Medium struct (9-16 bytes): arg_pseudo is a pointer (current behavior).
                 // Copy each 8-byte chunk through pointer dereference.
-                self.emit_block_copy(local_sym, arg_pseudo, (typ_size / 8) as i64);
+                self.emit_block_copy(local_sym, arg_pseudo, typ_bytes);
             } else {
                 // Small struct: arg_pseudo contains the value directly
                 self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
@@ -1075,7 +1079,7 @@ impl<'a> Linearizer<'a> {
         self.break_targets.clear();
         self.continue_targets.clear();
         self.struct_return_ptr = None;
-        self.struct_return_size = 0;
+        self.struct_return_bytes = 0;
         self.two_reg_return_type = None;
         self.current_func_name = self.emitted_name(func.name);
         self.addr_taken_labels.clear();
@@ -1219,7 +1223,7 @@ impl<'a> Linearizer<'a> {
             let sret_pseudo = Pseudo::arg(sret_id, 0).with_name("__sret");
             ir_func.add_pseudo(sret_pseudo);
             self.struct_return_ptr = Some(sret_id);
-            self.struct_return_size = self.types.size_bits(func.return_type);
+            self.struct_return_bytes = self.types.size_bytes(func.return_type);
         }
 
         // Check if function returns a medium struct (9-16 bytes) via two registers
@@ -1512,7 +1516,7 @@ impl<'a> Linearizer<'a> {
     // Statement linearization
 
     /// Emit large struct return via hidden pointer (sret)
-    pub(crate) fn emit_sret_return(&mut self, e: &Expr, sret_ptr: PseudoId, struct_size: u32) {
+    pub(crate) fn emit_sret_return(&mut self, e: &Expr, sret_ptr: PseudoId, struct_bytes: usize) {
         // Only structs and unions return through a hidden pointer
         // (`returns_via_hidden_pointer`), so `e` is always an aggregate here —
         // complex returns take the register path and go through
@@ -1522,7 +1526,7 @@ impl<'a> Linearizer<'a> {
         // prologue uses it: a large struct becomes a `memcpy` call instead of
         // an unbounded unroll, and a size that is not a multiple of eight is
         // copied exactly rather than rounded up past the caller's object.
-        self.emit_block_copy(sret_ptr, src_addr, struct_size as i64 / 8);
+        self.emit_block_copy(sret_ptr, src_addr, struct_bytes as i64);
 
         self.emit(Instruction::ret_typed(
             Some(sret_ptr),

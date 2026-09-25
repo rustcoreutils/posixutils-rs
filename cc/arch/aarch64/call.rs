@@ -182,7 +182,13 @@ impl Aarch64CodeGen {
                     TypeKind::Struct | TypeKind::Union | TypeKind::Array
                 ) && types.size_bits(t) > 64
                     && !matches!(abi.classify_param(t, types), ArgClass::Indirect { .. }))
-                .then(|| (types.size_bytes(t)).max(1) as i32)
+                .then(|| {
+                    crate::abi::slot_bytes(
+                        types.size_bytes(t).max(1),
+                        insn.pos.unwrap_or_default(),
+                        "a variadic argument",
+                    )
+                })
             });
             let gp_pair = agg_bytes.is_some_and(|_| {
                 let abi =
@@ -249,7 +255,12 @@ impl Aarch64CodeGen {
             // the area, and summing the sizes alone under-reserved it.
             let slot = |typ: Option<TypeId>, this: &Self| -> (i32, i32) {
                 typ.map_or((8, 8), |t| {
-                    crate::abi::aapcs64::darwin_va_slot(types, t, &this.base.target)
+                    crate::abi::aapcs64::darwin_va_slot(
+                        insn.pos.unwrap_or_default(),
+                        types,
+                        t,
+                        &this.base.target,
+                    )
                 })
             };
             let variadic_bytes: i32 = variadic_args.iter().fold(0, |at, a| {
@@ -650,7 +661,11 @@ impl Aarch64CodeGen {
                         size: arg_size,
                         typ: arg_type,
                         kind: StackKind::Composite {
-                            bytes: (types.size_bytes(arg_type.unwrap())) as i32,
+                            bytes: crate::abi::slot_bytes(
+                                types.size_bytes(arg_type.unwrap()),
+                                insn.pos.unwrap_or_default(),
+                                "a by-value argument",
+                            ),
                         },
                     });
                     int_arg_idx = int_arg_regs.len();
@@ -695,7 +710,13 @@ impl Aarch64CodeGen {
                         size: arg_size,
                         typ: arg_type,
                         kind: StackKind::Composite {
-                            bytes: arg_type.map_or(16, |t| (types.size_bytes(t)) as i32),
+                            bytes: arg_type.map_or(16, |t| {
+                                crate::abi::slot_bytes(
+                                    types.size_bytes(t),
+                                    insn.pos.unwrap_or_default(),
+                                    "a by-value argument",
+                                )
+                            }),
                         },
                     });
                     // Stage C.11, as in the `__int128` and complex-integer

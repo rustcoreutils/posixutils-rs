@@ -195,11 +195,11 @@ fn sole_scalar_content(ty: TypeId, types: &TypeTable) -> Option<TypeId> {
 /// `is_integer` and was given a single register for a sixteen-byte value, and
 /// `_Complex char` reached the sub-32-bit path and was sign-extended, which
 /// overwrites the imaginary half with a copy of the real one's sign.
-fn classify_complex_integer(size_bits: u32) -> ArgClass {
+fn classify_complex_integer(size_bits: u32, size_bytes: usize) -> ArgClass {
     if size_bits > 128 {
         return ArgClass::Indirect {
             align: 16,
-            size_bits,
+            size_bytes,
         };
     }
     let regs = size_bits.div_ceil(64) as usize;
@@ -327,12 +327,13 @@ impl SysVAmd64Abi {
     /// Classify a complete aggregate type into ArgClass.
     fn classify_aggregate(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         let size_bits = types.size_bits(ty);
+        let size_bytes = types.size_bytes(ty);
 
         // Rule: Aggregates larger than 2 eightbytes (16 bytes) go to MEMORY
         if size_bits > MAX_AGGREGATE_BITS {
             return ArgClass::Indirect {
                 align: types.alignment(ty) as u32,
-                size_bits,
+                size_bytes,
             };
         }
 
@@ -374,7 +375,7 @@ impl SysVAmd64Abi {
         if classes.contains(&RegClass::Memory) {
             return ArgClass::Indirect {
                 align: types.alignment(ty) as u32,
-                size_bits,
+                size_bytes,
             };
         }
 
@@ -395,6 +396,7 @@ impl Abi for SysVAmd64Abi {
     fn classify_param(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);
+        let size_bytes = types.size_bytes(ty);
 
         // `__attribute__((transparent_union))` passes the union exactly as its
         // first member would be passed. Substituted here rather than on the
@@ -414,7 +416,7 @@ impl Abi for SysVAmd64Abi {
         // Complex integers, before any integer path: see
         // `classify_complex_integer`.
         if types.is_complex_integer(ty) {
-            return classify_complex_integer(size_bits);
+            return classify_complex_integer(size_bits, size_bytes);
         }
 
         // Integer types smaller than 32 bits need extension
@@ -459,7 +461,7 @@ impl Abi for SysVAmd64Abi {
             if types.kind(base_ty) == TypeKind::LongDouble {
                 return ArgClass::Indirect {
                     align: 16,
-                    size_bits,
+                    size_bytes,
                 };
             }
             let base_bits = types.size_bits(base_ty);
@@ -481,7 +483,7 @@ impl Abi for SysVAmd64Abi {
                 // Long double uses x87, passed on stack
                 return ArgClass::Indirect {
                     align: 16,
-                    size_bits,
+                    size_bytes,
                 };
             }
             return ArgClass::Direct {
@@ -520,7 +522,7 @@ impl Abi for SysVAmd64Abi {
         } else {
             ArgClass::Indirect {
                 align: types.alignment(ty) as u32,
-                size_bits,
+                size_bytes,
             }
         }
     }
@@ -528,6 +530,7 @@ impl Abi for SysVAmd64Abi {
     fn classify_return(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);
+        let size_bytes = types.size_bytes(ty);
 
         // Void return
         if kind == TypeKind::Void {
@@ -537,7 +540,7 @@ impl Abi for SysVAmd64Abi {
         // Complex integers, before any integer path: see
         // `classify_complex_integer`.
         if types.is_complex_integer(ty) {
-            return classify_complex_integer(size_bits);
+            return classify_complex_integer(size_bits, size_bytes);
         }
 
         // 128-bit integer types: return in RAX+RDX
@@ -620,7 +623,7 @@ impl Abi for SysVAmd64Abi {
         } else {
             ArgClass::Indirect {
                 align: types.alignment(ty) as u32,
-                size_bits,
+                size_bytes,
             }
         }
     }

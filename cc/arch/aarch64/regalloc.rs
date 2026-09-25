@@ -1291,6 +1291,10 @@ pub struct RegAlloc {
     free_fp_regs: Vec<VReg>,
     /// Next stack slot offset
     stack_offset: i32,
+    /// A source position for this function, for the frame diagnostics
+    /// `grow_frame` and [`crate::abi::slot_bytes`] emit. `alloc_stack_slot` and
+    /// `IncomingOff::take` have no `&Function` to recover one from.
+    func_pos: crate::diag::Position,
     /// Callee-saved registers that were used
     used_callee_saved: Vec<Reg>,
     /// Callee-saved FP registers that were used
@@ -1321,6 +1325,7 @@ impl RegAlloc {
             free_regs: Reg::allocatable().to_vec(),
             free_fp_regs: VReg::allocatable().to_vec(),
             stack_offset: 0,
+            func_pos: crate::diag::Position::default(),
             used_callee_saved: Vec::new(),
             used_callee_saved_fp: Vec::new(),
             fp_pseudos: HashSet::new(),
@@ -1341,6 +1346,7 @@ impl RegAlloc {
         types: &TypeTable,
     ) -> crate::arch::regalloc::LocationMap<Loc> {
         self.reset_state();
+        self.func_pos = crate::arch::func_pos(func);
         // Before the pool is seeded with anything: an over-aligned frame
         // claims a register for its base, and the prologue overwrites it
         // unconditionally, so it must never be handed to a pseudo.
@@ -1724,11 +1730,12 @@ impl RegAlloc {
                 return;
             }
         }
-        if alignment > 8 {
-            self.stack_offset = (self.stack_offset + alignment - 1) & !(alignment - 1);
-        }
-        self.stack_offset += size;
-        let offset = -self.stack_offset;
+        let offset = -crate::arch::regalloc::grow_frame(
+            &mut self.stack_offset,
+            size,
+            alignment,
+            self.func_pos,
+        );
         self.locations.insert(
             interval.pseudo,
             Loc::Stack(LocalSlot::from_displacement(offset)),
@@ -1814,7 +1821,11 @@ impl RegAlloc {
                     PseudoKind::Sym(name) => {
                         // By identity, not by name -- see the x86_64 mirror.
                         if let Some(local) = func.local_of(interval.pseudo) {
-                            let size = (types.size_bytes(local.typ)) as i32;
+                            let size = crate::abi::slot_bytes(
+                                types.size_bytes(local.typ),
+                                self.func_pos,
+                                "an automatic object",
+                            );
                             let size = size.max(8);
                             let natural_align = types.alignment(local.typ) as i32;
                             let alignment = local
@@ -1875,7 +1886,11 @@ impl RegAlloc {
                 })
             });
             if let Some(typ) = multi_reg_return_typ {
-                let size = (types.size_bytes(typ)) as i32;
+                let size = crate::abi::slot_bytes(
+                    types.size_bytes(typ),
+                    self.func_pos,
+                    "an aggregate returned by a call",
+                );
                 let size = size.max(8);
                 let alignment = types.alignment(typ) as i32;
                 let aligned_size = (size + (alignment - 1)) & !(alignment - 1);

@@ -26,6 +26,7 @@ use std::collections::HashSet;
 
 impl Aarch64CodeGen {
     pub(super) fn emit_function(&mut self, func: &Function, types: &TypeTable) {
+        self.base.func_pos = crate::arch::func_pos(func);
         // Check if this function uses varargs
         let is_variadic = is_variadic_function(func);
 
@@ -174,7 +175,10 @@ impl Aarch64CodeGen {
             // `__stack` has to start past those too.
             let mut ngrn = 0usize;
             let mut nsrn = 0usize;
-            let mut named_stack = 0i32;
+            // Summed in `i64`: two stacked parameters each inside
+            // `MAX_STACK_OBJECT_BYTES` still overflow their total, and the
+            // one conversion after the loop is where that is caught.
+            let mut named_stack = 0i64;
             let abi = crate::abi::get_abi_for_conv(CallingConv::C, &self.base.target);
             for (_, typ) in &func.params {
                 // Mirror `allocate_arguments`: it dispatches on the ABI class,
@@ -220,13 +224,24 @@ impl Aarch64CodeGen {
                     *bank = start + count;
                 } else {
                     *bank = 8;
-                    let bytes = types.size_bytes(*typ).max(1) as i32;
-                    named_stack += (bytes + 7) & !7;
+                    let bytes = crate::abi::slot_bytes(
+                        types.size_bytes(*typ).max(1),
+                        crate::arch::func_pos(func),
+                        "a stacked parameter",
+                    );
+                    // Summed in `i64`: two parameters each inside the bound
+                    // overflow their total, and the one conversion below is
+                    // where that is caught.
+                    named_stack += i64::from((bytes + 7) & !7);
                 }
             }
             self.num_fixed_gp_params = ngrn;
             self.num_fixed_fp_params = nsrn;
-            self.named_stack_param_bytes = named_stack;
+            self.named_stack_param_bytes = crate::abi::slot_bytes(
+                named_stack as usize,
+                crate::arch::func_pos(func),
+                "this function's stacked parameters",
+            );
         }
 
         // Store spilled arguments before any calls can clobber them
@@ -1223,7 +1238,11 @@ impl Aarch64CodeGen {
                                     // body reads, exactly as the spilled-HFA
                                     // case does; without this the parameter was
                                     // left uninitialized.
-                                    let bytes = (types.size_bytes(*typ)) as i32;
+                                    let bytes = crate::abi::slot_bytes(
+                                        types.size_bytes(*typ),
+                                        crate::arch::func_pos(func),
+                                        "a stacked parameter",
+                                    );
                                     let mut done = 0;
                                     while done < bytes {
                                         let chunk = [8, 4, 2, 1]

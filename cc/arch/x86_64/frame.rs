@@ -147,6 +147,7 @@ impl X86_64CodeGen {
         // they take the plain name: a verbatim asm-label marker belongs only
         // on the symbol the assembler is asked for.
         self.base.current_fn = crate::arch::lir::undecorated(&func.name).to_string();
+        self.base.func_pos = crate::arch::func_pos(func);
 
         // Check if this function uses varargs
         let is_variadic = is_variadic_function(func);

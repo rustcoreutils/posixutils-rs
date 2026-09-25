@@ -131,13 +131,22 @@ began answering 536870911 for a larger type: array indexing, the stride of an
 array of a large struct, and `p + 1` on a pointer to one, all while `sizeof`
 stayed right.
 
-All thirty-five of those sites now ask `size_bytes`, and a `grep` finds no
-`size_bits(..) / 8` outside `size_bytes` itself. That is a fix, not a
-guarantee: measurement showed **seventy** call sites are handed an aggregate,
-and the other thirty-five are safe only because they compare against a small
-threshold, where a saturated value happens to answer correctly. Nothing
-enforces that, and two of the sites found were spelled `div_ceil(8)` rather
-than `/ 8`, so the audit itself does not generalise.
+A `grep` for `size_bits(..) / 8` finds nothing outside `size_bytes` itself, and
+that is worth *less* than it appears: the class survived that grep at nine more
+sites, because the bit count reaches the division through something a grep
+cannot follow. Through a **local variable**, twice spelled `let
+target_size_bytes = target_size / 8;` -- a name that says bytes over an
+expression that computes them from bits. Through a **`u32` field** --
+`Linearizer::struct_return_size`, `ArgClass::Indirect`'s payload, and
+`Instruction::size`. And through an **equality** rather than a length, where two
+distinct aggregates past the cap compare equal and a guard that meant "the same
+type" stopped meaning it.
+
+Those nine are fixed, and the remaining conversions are safe for reasons nothing
+enforces: a `complex_base` is a scalar, a bit-field width is bounded by its
+storage unit, and a threshold comparison against 64 or 128 answers correctly even
+when saturated. That is three different arguments a reader has to reconstruct per
+site, which is the problem.
 
 What would settle it is making the distinction a *type* -- a `Bits` newtype
 for value widths that deliberately implements no division, and a `ByteSize`
@@ -146,6 +155,34 @@ finds rather than a spelling a reader has to notice. Widening `size_bits` to
 `u64` is **not** that fix and was measured: of the 401 resulting type errors,
 364 want a `u32` because they are value widths, and silencing them with `as
 u32` reintroduces the same truncation at the seventy aggregate-fed sites.
+
+A second unit lives in the same area and is settled: `TypeTable::MAX_OBJECT_BYTES`
+bounds what a size can be *described* as, while
+`TypeTable::MAX_STACK_OBJECT_BYTES` bounds what the backends can give a *slot*,
+because a frame displacement is an `i32`. `crate::abi::slot_bytes` is the only
+place an object size becomes that `i32`, and `arch::regalloc::grow_frame` the
+only place a frame total grows. Lifting the second bound means widening both
+backends' offsets to `i64`; nothing needs it, and gcc refuses the argument case
+too.
+
+---
+
+### The backend's stacked-argument copy has no `memcpy` fallback
+
+`emit_block_copy` becomes a `memcpy` call past `BLOCK_COPY_INLINE_LIMIT`, 128
+bytes, because an unbounded unroll made a 256 KB struct passed by value cost
+65,536 IR instructions and a 65-second compile. The backend's *outgoing*
+stacked-argument copy has no such limit: `push_stack_args` emits one
+load/store pair per eight bytes for the whole argument, whatever its size.
+
+A 3 GB by-value argument produced **67 million instructions and a 4.1 GB `.s`
+file**, or an out-of-memory kill depending on what else the machine was doing.
+That particular size is a diagnostic now -- it is past
+`MAX_STACK_OBJECT_BYTES` -- but a 600 MB one is legal and still unrolls 75
+million instructions. The same `memcpy` fallback applies, and the callee-side
+prologue copies in both `frame.rs` files have the same shape.
+
+This is a compile-time blowup, not a wrong answer.
 
 ---
 

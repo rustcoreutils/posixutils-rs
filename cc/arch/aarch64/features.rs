@@ -67,7 +67,12 @@ enum VaAggKind {
 }
 
 impl VaAggKind {
-    fn of(typ: crate::types::TypeId, types: &TypeTable, target: &crate::target::Target) -> Self {
+    fn of(
+        pos: crate::diag::Position,
+        typ: crate::types::TypeId,
+        types: &TypeTable,
+        target: &crate::target::Target,
+    ) -> Self {
         use crate::types::TypeKind;
         if !matches!(
             types.kind(typ),
@@ -75,7 +80,8 @@ impl VaAggKind {
         ) {
             return VaAggKind::Scalar;
         }
-        let bytes = (types.size_bytes(typ)).max(1) as i32;
+        let bytes =
+            crate::abi::slot_bytes(types.size_bytes(typ).max(1), pos, "a variadic argument");
         let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, target);
         match abi.classify_param(typ, types) {
             crate::abi::ArgClass::Hfa { base, count } => VaAggKind::Hfa(HfaElem::of(base), count),
@@ -215,6 +221,7 @@ impl Aarch64CodeGen {
         };
 
         let arg_type = insn.typ.unwrap_or(types.int_id);
+        let pos = insn.pos.unwrap_or_default();
 
         // A zero-sized argument was never passed, so there is nothing to read
         // and no slot to step over. Asking the same predicate the call site
@@ -231,14 +238,14 @@ impl Aarch64CodeGen {
         // An HFA arrives in the SIMD registers, so it is read out of *their*
         // save area, one element per 16-byte slot, matching the caller's
         // AAPCS64 §5.4.2 layout.
-        let agg = VaAggKind::of(arg_type, types, &self.base.target);
+        let agg = VaAggKind::of(pos, arg_type, types, &self.base.target);
 
         let ap_loc = self.get_location(ap_addr);
         let dst_loc = self.get_location(target);
 
         if self.base.target.os == crate::target::Os::MacOS {
             let (_, align) =
-                crate::abi::aapcs64::darwin_va_slot(types, arg_type, &self.base.target);
+                crate::abi::aapcs64::darwin_va_slot(pos, types, arg_type, &self.base.target);
             self.emit_va_arg_darwin(&ap_loc, &dst_loc, type_bits, is_fp, agg, align);
         } else {
             self.emit_va_arg_aapcs64(

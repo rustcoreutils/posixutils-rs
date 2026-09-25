@@ -146,14 +146,14 @@ impl X86_64CodeGen {
                     temp_int_idx += gp_needed;
                     temp_fp_idx += fp_needed;
                 }
-                ArgClass::Indirect { size_bits, .. } => {
+                ArgClass::Indirect { size_bytes, .. } => {
                     // Large struct parameters (> 16 bytes): passed by value on the stack
                     // per SysV AMD64 ABI MEMORY class. Always a stack arg — never in
                     // a register. Don't consume a GP register.
                     let align = arg_align(insn, types, i);
                     place(
                         i,
-                        (*size_bits as usize).div_ceil(8),
+                        *size_bytes,
                         align,
                         &mut stack_arg_indices,
                         &mut stack_offsets,

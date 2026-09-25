@@ -152,7 +152,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         .unwrap_or(expr_typ);
 
                     if let Some(sret_ptr) = self.struct_return_ptr {
-                        self.emit_sret_return(e, sret_ptr, self.struct_return_size);
+                        self.emit_sret_return(e, sret_ptr, self.struct_return_bytes);
                     } else if let Some(ret_type) = self.two_reg_return_type {
                         self.emit_two_reg_return(e, ret_type);
                     } else if let Some(b) = self.complex_to_bool(e, func_ret_type) {
@@ -587,7 +587,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     {
                         // Large struct/union init - source is an address, do block copy
                         let value_addr = self.linearize_expr(init);
-                        let type_size_bytes = type_size / 8;
+                        let type_size_bytes = self.types.size_bytes(typ);
 
                         self.emit_block_copy(sym_id, value_addr, type_size_bytes as i64);
                     } else {
@@ -1022,7 +1022,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let expr_type = self.expr_type(&elements[0].value);
                     let expr_kind = self.types.kind(expr_type);
                     if (expr_kind == TypeKind::Struct || expr_kind == TypeKind::Union)
-                        && self.types.size_bits(expr_type) == self.types.size_bits(typ)
+                        && self.types.size_bytes(expr_type) == self.types.size_bytes(typ)
                     {
                         let src_addr = self.linearize_lvalue(&elements[0].value);
                         let target_size_bytes = self.types.size_bytes(typ);

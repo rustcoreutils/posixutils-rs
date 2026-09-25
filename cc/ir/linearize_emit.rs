@@ -2362,14 +2362,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Structs are not loaded into registers by linearize_expr — they return
         // an address. So we must handle ALL struct sizes here, not just large ones.
         let target_kind = self.types.kind(target_typ);
-        let target_size = self.types.size_bits(target_typ);
+        let target_size_bytes = self.types.size_bytes(target_typ);
         if (target_kind == TypeKind::Struct || target_kind == TypeKind::Union)
-            && target_size > 0
+            && target_size_bytes > 0
             && op == AssignOp::Assign
         {
             let target_addr = self.linearize_lvalue(target);
             let value_addr = self.linearize_lvalue(value);
-            let target_size_bytes = target_size / 8;
 
             self.emit_block_copy(target_addr, value_addr, target_size_bytes as i64);
 

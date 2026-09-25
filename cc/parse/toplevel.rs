@@ -471,6 +471,15 @@ impl Parser<'_> {
                                 ..Default::default()
                             });
                         }
+                        // The identifier list gave this name an implicit
+                        // `int`; its real type arrives here, so this is the only
+                        // place the stack-slot bound can be asked of it.
+                        // `parse_parameter_list_inner` never saw it.
+                        self.check_stack_object_size(
+                            decl_typ,
+                            self.current_pos(),
+                            "a by-value parameter",
+                        )?;
                         // Update matching parameter type
                         if decl_name != StringId::EMPTY {
                             for param in &mut params {

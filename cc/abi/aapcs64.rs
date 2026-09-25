@@ -115,6 +115,7 @@ pub(crate) fn gr_run_start(
 /// `va_arg` -- which means the caller has to realign its outgoing area to
 /// match, since `%sp` is only guaranteed to sixteen.
 pub(crate) fn darwin_va_slot(
+    pos: crate::diag::Position,
     types: &TypeTable,
     ty: TypeId,
     target: &crate::target::Target,
@@ -123,7 +124,8 @@ pub(crate) fn darwin_va_slot(
     if matches!(abi.classify_param(ty, types), ArgClass::Indirect { .. }) {
         return (8, 8);
     }
-    let bytes = ((types.size_bytes(ty).max(1) as i32) + 7) & !7;
+    let bytes =
+        (crate::abi::slot_bytes(types.size_bytes(ty).max(1), pos, "a variadic argument") + 7) & !7;
     (bytes, (types.alignment(ty) as i32).max(8))
 }
 
@@ -171,10 +173,11 @@ pub struct Aapcs64Abi;
 /// kind: `_Complex long` satisfied `is_integer` and was handed a single X
 /// register for a sixteen-byte value.
 fn classify_complex_integer(types: &TypeTable, ty: TypeId, size_bits: u32) -> ArgClass {
+    let size_bytes = types.size_bytes(ty);
     if size_bits > MAX_AGGREGATE_BITS {
         return ArgClass::Indirect {
             align: types.alignment(ty) as u32,
-            size_bits,
+            size_bytes,
         };
     }
     ArgClass::Direct {
@@ -318,6 +321,7 @@ impl Aapcs64Abi {
     /// Classify an aggregate type.
     fn classify_aggregate(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         let size_bits = types.size_bits(ty);
+        let size_bytes = types.size_bytes(ty);
 
         // Empty struct
         if size_bits == 0 {
@@ -334,7 +338,7 @@ impl Aapcs64Abi {
             // Large aggregate - pass by reference
             return ArgClass::Indirect {
                 align: types.alignment(ty) as u32,
-                size_bits,
+                size_bytes,
             };
         }
 
@@ -358,6 +362,7 @@ impl Abi for Aapcs64Abi {
     fn classify_param(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);
+        let size_bytes = types.size_bytes(ty);
 
         // `__attribute__((transparent_union))` passes the union exactly as its
         // first member would be passed. Substituted here rather than on the
@@ -419,7 +424,7 @@ impl Abi for Aapcs64Abi {
             }
             return ArgClass::Indirect {
                 align: 16,
-                size_bits,
+                size_bytes,
             };
         }
 
@@ -464,7 +469,7 @@ impl Abi for Aapcs64Abi {
         } else {
             ArgClass::Indirect {
                 align: types.alignment(ty) as u32,
-                size_bits,
+                size_bytes,
             }
         }
     }
@@ -472,6 +477,7 @@ impl Abi for Aapcs64Abi {
     fn classify_return(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);
+        let size_bytes = types.size_bytes(ty);
 
         // Void return
         if kind == TypeKind::Void {
@@ -508,7 +514,7 @@ impl Abi for Aapcs64Abi {
             }
             return ArgClass::Indirect {
                 align: 16,
-                size_bits,
+                size_bytes,
             };
         }
 
@@ -532,7 +538,7 @@ impl Abi for Aapcs64Abi {
                 // Large aggregate - return via X8 (sret)
                 return ArgClass::Indirect {
                     align: types.alignment(ty) as u32,
-                    size_bits,
+                    size_bytes,
                 };
             }
 
@@ -560,7 +566,7 @@ impl Abi for Aapcs64Abi {
         } else {
             ArgClass::Indirect {
                 align: types.alignment(ty) as u32,
-                size_bits,
+                size_bytes,
             }
         }
     }

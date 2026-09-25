@@ -13593,3 +13593,58 @@ long stride(struct Big *p, int i) { return (char *)&p[i] - (char *)p; }
         );
     }
 }
+
+/// An aggregate is copied by its **byte size**, at every size the compiler
+/// accepts.
+///
+/// The companion to `codegen_pointer_scaling_past_the_old_object_bound`, and
+/// the same root cause: `size_bits` saturates at `u32::MAX` bits, and raising
+/// the object-size bound made the saturation reachable. The sites that survived
+/// that commit's audit were the ones that launder the bit count through a local
+/// variable -- two of them spell it `let target_size_bytes = target_size / 8;`,
+/// which no grep for `size_bits(..) / 8` can find -- through a `u32` field
+/// (`struct_return_size`), or through `ArgClass::Indirect`'s payload.
+///
+/// Every shape below copied 536870911 bytes of a 600000000-byte object, on both
+/// targets, at every optimization level. `a = b` is the one that matters most:
+/// it is the plainest aggregate copy in the language.
+///
+/// Asserted on x86-64 alone, for the reason the companion test gives: the
+/// length is computed in `ir/` before any backend runs, and x86-64 is the
+/// target that materialises it as a literal rather than as `movz`/`movk`.
+/// Nothing is defined or run -- a test must not ask its machine for gigabytes
+/// to observe a constant.
+#[test]
+fn codegen_aggregate_copy_length_past_the_old_object_bound() {
+    const SRC: &str = r#"
+struct Big { char x[600000000L]; };
+extern struct Big src, dst;
+void sink(struct Big *);
+void callee(struct Big);
+
+void assign(void) { dst = src; }
+void initialize(void) { struct Big loc = src; sink(&loc); }
+void by_value_param(struct Big p) { callee(p); }
+struct Big returns_it(void) { return src; }
+unsigned long extent(void) { return __builtin_object_size(src.x, 0); }
+"#;
+
+    let asm = asm_for_with("aggregate_copy_length", X86_64_LINUX, SRC, &["-O2"]);
+    for func in [
+        "assign",
+        "initialize",
+        "by_value_param",
+        "returns_it",
+        "extent",
+    ] {
+        let body = body_of(&asm, func);
+        assert!(
+            body.contains("600000000"),
+            "{func} does not use the aggregate's byte size:\n{body}"
+        );
+        assert!(
+            !body.contains("536870911"),
+            "{func} uses the saturated size_bits:\n{body}"
+        );
+    }
+}

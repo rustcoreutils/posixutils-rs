@@ -426,6 +426,48 @@ impl Parser<'_> {
         }))
     }
 
+    /// Refuse an object the backend cannot give a stack slot.
+    ///
+    /// C17 puts no limit here; this one is c17's. Both backends address a local
+    /// and a stacked argument by a signed 32-bit displacement from the frame
+    /// register, so an object past [`TypeTable::MAX_STACK_OBJECT_BYTES`] has no
+    /// slot to be given -- and every size conversion in `arch/` and `abi/` was
+    /// a bare `as i32` that wrapped, so `char a[3000000000];` in a function got
+    /// an eight-byte slot and a `subq $32, %rsp` frame with no diagnostic.
+    ///
+    /// Asked only of an object with *automatic* storage duration and of a
+    /// by-value parameter type. A static or file-scope object of the same size
+    /// is addressed symbolically and works, so widening this to every
+    /// declaration would make it a second, tighter `MAX_OBJECT_BYTES` and would
+    /// reject what `diagnostics_largest_describable_object_is_accepted`
+    /// requires.
+    ///
+    /// A variable length array is not asked: its extent is a run-time value and
+    /// there is nothing to compare. Neither is `alloca`, for the same reason.
+    /// `crate::abi::slot_bytes` is the backstop for what this cannot see --
+    /// those two, a compound literal's anonymous local, and the `__sret` local
+    /// a call to a function returning a large aggregate allocates.
+    pub(super) fn check_stack_object_size(
+        &self,
+        typ: TypeId,
+        pos: Position,
+        what: &str,
+    ) -> Result<(), ParseError> {
+        let bytes = self.types.size_bytes(typ);
+        if bytes <= TypeTable::MAX_STACK_OBJECT_BYTES {
+            return Ok(());
+        }
+        Err(ParseError::new(
+            format!(
+                "size of {what} of type '{}' is {bytes} bytes, which exceeds \
+                 the maximum stack object size of {} bytes",
+                self.types.format_type(typ, Some(self.idents)),
+                TypeTable::MAX_STACK_OBJECT_BYTES,
+            ),
+            pos,
+        ))
+    }
+
     pub(crate) fn array_size_from_elements(
         &self,
         elements: &[InitElement],
@@ -735,6 +777,27 @@ impl Parser<'_> {
                         | TypeModifiers::AUTO
                         | TypeModifiers::REGISTER;
                     let storage_class = base_type.modifiers & storage_class_mask;
+                    // Everything declared here has automatic storage duration
+                    // unless a storage class says otherwise: this function is
+                    // only ever reached from `parse_block_items` and a
+                    // `for`-init, both of which are inside a scope. Checked
+                    // after the initializer, because that is what can still
+                    // infer the extent of `char a[] = { .. }`.
+                    //
+                    // `register` is deliberately not excluded -- a `register`
+                    // array still has automatic storage duration. A VLA has no
+                    // static extent to measure, and a function is not an
+                    // object.
+                    const NO_AUTO_DURATION: TypeModifiers = TypeModifiers::STATIC
+                        .union(TypeModifiers::EXTERN)
+                        .union(TypeModifiers::THREAD_LOCAL)
+                        .union(TypeModifiers::TYPEDEF);
+                    if !storage_class.intersects(NO_AUTO_DURATION)
+                        && vla_sizes.is_empty()
+                        && self.types.kind(typ) != TypeKind::Function
+                    {
+                        self.check_stack_object_size(typ, decl_pos, "an automatic object")?;
+                    }
                     declarators.push(InitDeclarator {
                         symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                         fn_effect: self.take_pending_fn_effect(),

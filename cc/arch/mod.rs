@@ -25,6 +25,22 @@ pub use codegen::{substitute_asm_operands, AsmOperandFormatter, AsmOperandSlot};
 
 use crate::target::{Arch, Os, Target};
 
+/// The first source position this function's instructions carry, for a backend
+/// diagnostic that has no better one.
+///
+/// `ir::Function` records no position of its own. This is the recovery
+/// `CodeGenBase::emit_function_entry_loc` already performs for the entry `.loc`,
+/// and a widening of the `Opcode::Asm`-only scan both `FrameBase::of`s do: any
+/// instruction carrying a position is nearer the object than
+/// `Position::default()`, which names no file at all.
+pub(crate) fn func_pos(func: &crate::ir::Function) -> crate::diag::Position {
+    func.blocks
+        .iter()
+        .flat_map(|b| b.insns.iter())
+        .find_map(|i| i.pos)
+        .unwrap_or_default()
+}
+
 /// Get architecture-specific predefined macros as (name, value) pairs
 pub fn get_arch_macros(target: &Target) -> Vec<(&'static str, Option<&'static str>)> {
     // long is 64-bit on LP64 (Unix), 32-bit on LLP64 (Windows)

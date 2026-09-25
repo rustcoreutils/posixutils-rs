@@ -14,7 +14,7 @@ use crate::arch::aarch64::codegen::Aarch64CodeGen;
 use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{Loc, LocalSlot, Reg, VReg};
 use crate::arch::lir::{FpSize, OperandSize, Symbol};
-use crate::ir::{Instruction, PseudoId, PseudoKind};
+use crate::ir::{Instruction, PseudoId};
 use crate::target::Os;
 use crate::types::{TypeId, TypeTable};
 
@@ -326,11 +326,7 @@ impl Aarch64CodeGen {
             }),
             Loc::Stack(offset) => {
                 // Check if the address operand is a symbol (local variable) or a temp (spilled address)
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(addr);
 
                 if is_symbol {
                     // Local variable - access directly from stack slot (FP-relative for alloca safety)
@@ -619,11 +615,7 @@ impl Aarch64CodeGen {
             Loc::Stack(offset) => {
                 // Distinguish symbol (local variable — use direct address) vs
                 // temp/spilled pointer (load the pointer value from the slot).
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(addr);
 
                 if is_symbol {
                     let (base, base_off) = self.loc_addr_parts(&addr_loc).unwrap();

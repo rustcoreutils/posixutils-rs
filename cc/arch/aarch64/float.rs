@@ -13,7 +13,7 @@ use super::codegen::Aarch64CodeGen;
 use super::lir::{Aarch64Inst, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::arch::lir::{CondCode, FpSize, OperandSize, Symbol};
-use crate::ir::{Instruction, Opcode, PseudoId, PseudoKind};
+use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
 impl Aarch64CodeGen {
@@ -83,11 +83,7 @@ impl Aarch64CodeGen {
             }
             Loc::Stack(offset) => {
                 // Check if the address operand is a symbol (local variable) or a temp (spilled address)
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(addr);
 
                 if is_symbol {
                     self.push_lir(Aarch64Inst::LdrFp {
@@ -697,11 +693,7 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(addr);
 
                 if is_symbol {
                     self.push_lir(Aarch64Inst::StrFp {

@@ -789,11 +789,7 @@ impl X86_64CodeGen {
                 // (`__cret_N`), so unconditionally loading the slot as a
                 // pointer read the value's bytes as an address — `f(g())`
                 // faulted in the callee.
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == arg)
-                    .is_some_and(|p| matches!(p.kind, crate::ir::PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(arg);
                 if is_symbol {
                     self.push_lir(X86Inst::Lea {
                         dst: Reg::R11,

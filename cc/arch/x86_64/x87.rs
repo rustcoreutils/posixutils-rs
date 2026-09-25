@@ -25,7 +25,6 @@ use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, X86Inst, X87BinOp};
 use super::regalloc::{Loc, Reg, X87_SCRATCH_BYTES};
 use crate::arch::lir::{CondCode, Directive, Label, OperandSize};
-use crate::ir::PseudoKind;
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeKind, TypeTable};
 
@@ -89,11 +88,7 @@ impl X86_64CodeGen {
                 // in the second case read the pointer bits as a float — which
                 // is where the NaNs came from — and at a non-zero offset read
                 // past the frame entirely.
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(addr);
                 if is_symbol {
                     self.stack_field(offset, insn.offset as i32)
                 } else {
@@ -250,11 +245,7 @@ impl X86_64CodeGen {
                 // and, at a non-zero offset, past the end of the frame into
                 // the caller's. That is what made a `long double _Complex`
                 // return corrupt the stack.
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(addr);
                 if is_symbol {
                     self.stack_field(offset, insn.offset as i32)
                 } else {
@@ -506,11 +497,7 @@ impl X86_64CodeGen {
                 // different address entirely. A stacked aggregate argument
                 // passed from such a frame then copied from a garbage pointer.
                 let addr = self.stack_mem(offset);
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == pseudo)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(pseudo);
                 if is_symbol {
                     // The slot *is* the storage: take its address.
                     self.push_lir(X86Inst::Lea {

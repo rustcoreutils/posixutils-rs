@@ -1776,6 +1776,27 @@ impl RegAlloc {
         constraint_points: &[ConstraintPoint<Reg>],
     ) {
         // -------- Phase 1: pre-pass --------
+        // What the pre-pass asks about each interval, indexed once: asking by
+        // scanning the function per interval made it quadratic.
+        let setval_sizes = crate::arch::regalloc::setval_sizes(func);
+        let mut int128_pseudos: HashSet<PseudoId> = HashSet::new();
+        let mut multi_reg_returns: HashMap<PseudoId, TypeId> = HashMap::new();
+        for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+            let Some(typ) = insn.typ else { continue };
+            if types.kind(typ) == TypeKind::Int128 {
+                int128_pseudos.extend(insn.target);
+                int128_pseudos.extend(insn.src.iter().copied());
+            }
+            // A multi-register call return: complex, struct or union.
+            if insn.op == Opcode::Call
+                && (types.is_complex_float(typ)
+                    || matches!(types.kind(typ), TypeKind::Struct | TypeKind::Union))
+            {
+                if let Some(target) = insn.target {
+                    multi_reg_returns.entry(target).or_insert(typ);
+                }
+            }
+        }
         let mut gp_candidates: std::collections::BTreeSet<PseudoId> =
             std::collections::BTreeSet::new();
         let mut vreg_candidates: std::collections::BTreeSet<PseudoId> =
@@ -1805,15 +1826,7 @@ impl RegAlloc {
                         continue;
                     }
                     PseudoKind::FVal(v) => {
-                        let size = func
-                            .blocks
-                            .iter()
-                            .flat_map(|b| &b.insns)
-                            .find(|insn| {
-                                insn.op == Opcode::SetVal && insn.target == Some(interval.pseudo)
-                            })
-                            .map(|insn| insn.size)
-                            .unwrap_or(64);
+                        let size = setval_sizes.get(&interval.pseudo).copied().unwrap_or(64);
                         self.locations.insert(interval.pseudo, Loc::FImm(*v, size));
                         self.fp_pseudos.insert(interval.pseudo);
                         continue;
@@ -1852,14 +1865,7 @@ impl RegAlloc {
             }
 
             // __int128 → 16-byte stack slot, never in registers.
-            let is_int128 = func.blocks.iter().any(|b| {
-                b.insns.iter().any(|insn| {
-                    insn.typ
-                        .is_some_and(|t| types.kind(t) == crate::types::TypeKind::Int128)
-                        && (insn.target == Some(interval.pseudo)
-                            || insn.src.contains(&interval.pseudo))
-                })
-            });
+            let is_int128 = int128_pseudos.contains(&interval.pseudo);
             if is_int128 {
                 self.alloc_stack_slot(interval, 16, 16, true);
                 continue;
@@ -1868,23 +1874,7 @@ impl RegAlloc {
             // Multi-register call returns (complex, struct, union) →
             // stack. These span V0+V1 or X0+X1 and can't live in a
             // single allocator vertex.
-            let multi_reg_return_typ: Option<TypeId> = func.blocks.iter().find_map(|b| {
-                b.insns.iter().find_map(|insn| {
-                    if insn.op == Opcode::Call && insn.target == Some(interval.pseudo) {
-                        if let Some(typ) = insn.typ {
-                            let kind = types.kind(typ);
-                            if types.is_complex_float(typ)
-                                || matches!(kind, TypeKind::Struct | TypeKind::Union)
-                            {
-                                return Some(typ);
-                            }
-                        }
-                        None
-                    } else {
-                        None
-                    }
-                })
-            });
+            let multi_reg_return_typ = multi_reg_returns.get(&interval.pseudo).copied();
             if let Some(typ) = multi_reg_return_typ {
                 let size = crate::abi::slot_bytes(
                     types.size_bytes(typ),
@@ -1988,24 +1978,12 @@ impl RegAlloc {
             .copied()
             .filter(|r| !r.is_callee_saved())
             .collect();
-        let mut forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<Reg>> = BTreeMap::new();
-        for cp in constraint_points {
-            for interval in intervals {
-                if !gp_candidates.contains(&interval.pseudo) {
-                    continue;
-                }
-                if interval.start > cp.position || cp.position > interval.end {
-                    continue;
-                }
-                if cp.involved_pseudos.contains(&interval.pseudo) {
-                    continue;
-                }
-                let entry = forbidden.entry(interval.pseudo).or_default();
-                for &c in &cp.clobbers {
-                    entry.insert(c);
-                }
-            }
-        }
+        let mut forbidden = crate::arch::regalloc::constraint_clobbers(
+            constraint_points,
+            intervals,
+            gp_candidates,
+            |cp, interval| cp.involved_pseudos.contains(&interval.pseudo),
+        );
         let mut in_loop_set: std::collections::BTreeSet<PseudoId> =
             std::collections::BTreeSet::new();
         for interval in intervals {

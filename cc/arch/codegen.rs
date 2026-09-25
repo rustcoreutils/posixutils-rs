@@ -1114,15 +1114,46 @@ pub trait CodeGenerator {
     fn set_verbose_asm(&mut self, verbose: bool);
 }
 
+/// The current function's pseudos, looked up by id.
+///
+/// A pseudo's id is not its position in `Function::pseudos`, so a lookup
+/// needs the index; finding one by scanning made every constant the backends
+/// emitted cost a pass over all of them.
+#[derive(Default)]
+pub struct PseudoTable {
+    by_id: std::collections::HashMap<PseudoId, Pseudo>,
+}
+
+impl PseudoTable {
+    pub fn new(pseudos: &[Pseudo]) -> Self {
+        let mut by_id = std::collections::HashMap::with_capacity(pseudos.len());
+        for p in pseudos {
+            // The first, as a scan would have found.
+            by_id.entry(p.id).or_insert_with(|| p.clone());
+        }
+        Self { by_id }
+    }
+
+    pub fn get(&self, id: PseudoId) -> Option<&Pseudo> {
+        self.by_id.get(&id)
+    }
+
+    /// Does `id` name a symbol -- an object's storage -- rather than a value?
+    pub fn is_sym(&self, id: PseudoId) -> bool {
+        self.get(id)
+            .is_some_and(|p| matches!(p.kind, crate::ir::PseudoKind::Sym(_)))
+    }
+}
+
 /// The `-fverbose-asm` annotation for one IR instruction: what it came from.
 ///
 /// gcc writes the operands' source-level names, and the source line beside the
 /// instructions it produced. `Pseudo::name` carries the variable a pseudo came
 /// from, when it came from one, which is the same information.
-pub fn verbose_annotation(insn: &Instruction, pseudos: &[Pseudo]) -> Option<String> {
+pub fn verbose_annotation(insn: &Instruction, pseudos: &PseudoTable) -> Option<String> {
     let name_of = |id: PseudoId| -> Option<&str> {
         pseudos
-            .get(id.0 as usize)
+            .get(id)
             .and_then(|p| p.name.as_deref())
             .filter(|n| !n.is_empty())
     };

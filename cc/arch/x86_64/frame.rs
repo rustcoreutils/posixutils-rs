@@ -156,7 +156,7 @@ impl X86_64CodeGen {
         let mut alloc = RegAlloc::new();
         self.locations = alloc.allocate(func, types);
         self.int128_pseudos = alloc.int128_pseudos().clone();
-        self.pseudos = func.pseudos.clone();
+        self.pseudos = crate::arch::codegen::PseudoTable::new(&func.pseudos);
 
         // Build sym type size map for emit_store to distinguish struct fields from scalars
         self.sym_type_sizes.clear();

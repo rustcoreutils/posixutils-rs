@@ -16,7 +16,7 @@ use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, XmmReg};
-use crate::ir::{Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
+use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::{TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
@@ -34,7 +34,7 @@ pub struct X86_64CodeGen {
     /// allocate writers and remain visible as `.set` calls.
     pub(super) locations: crate::arch::regalloc::LocationMap<Loc>,
     /// Current function's pseudos (for looking up values)
-    pub(super) pseudos: Vec<Pseudo>,
+    pub(super) pseudos: crate::arch::codegen::PseudoTable,
     /// Callee-saved registers used in current function (for epilogue)
     pub(super) callee_saved_regs: Vec<Reg>,
     /// Offset to add to stack locations to account for callee-saved registers
@@ -91,7 +91,7 @@ impl X86_64CodeGen {
         Self {
             base: CodeGenBase::new(target),
             locations: crate::arch::regalloc::LocationMap::new(),
-            pseudos: Vec::new(),
+            pseudos: Default::default(),
             callee_saved_regs: Vec::new(),
             callee_saved_offset: 0,
             stack_alloc_size: 0,
@@ -680,7 +680,7 @@ impl X86_64CodeGen {
 
     fn emit_set_val(&mut self, insn: &Instruction, types: &TypeTable) {
         if let Some(target) = insn.target {
-            if let Some(pseudo) = self.pseudos.iter().find(|p| p.id == target) {
+            if let Some(pseudo) = self.pseudos.get(target) {
                 let target_loc = self.locations.get(target);
                 match &pseudo.kind {
                     PseudoKind::Val(v) => match target_loc {

@@ -33,7 +33,7 @@ impl Aarch64CodeGen {
         // Register allocation
         let mut alloc = RegAlloc::new();
         self.locations = alloc.allocate(func, types);
-        self.pseudos = func.pseudos.clone();
+        self.pseudos = crate::arch::codegen::PseudoTable::new(&func.pseudos);
 
         // Build sym type size map for emit_store to distinguish struct fields from scalars
         self.sym_type_sizes.clear();

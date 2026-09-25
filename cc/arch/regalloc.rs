@@ -197,6 +197,69 @@ impl<R> ConstraintPoint<R> {
     }
 }
 
+/// The registers each candidate may not take because a constraint point
+/// inside its live range clobbers them -- unless `exempt` says the interval
+/// is one the point may clobber, which is where the backends differ.
+///
+/// A sweep over both lists in position order, so each point visits only the
+/// intervals live across it. Pairing every point with every interval made a
+/// function of a few thousand branches (`compile/20001226-1`) spend minutes
+/// here on both targets.
+pub fn constraint_clobbers<R: Copy + Ord>(
+    constraint_points: &[ConstraintPoint<R>],
+    intervals: &[LiveInterval],
+    candidates: &std::collections::BTreeSet<PseudoId>,
+    exempt: impl Fn(&ConstraintPoint<R>, &LiveInterval) -> bool,
+) -> BTreeMap<PseudoId, std::collections::BTreeSet<R>> {
+    let mut points: Vec<&ConstraintPoint<R>> = constraint_points.iter().collect();
+    points.sort_by_key(|cp| cp.position);
+    let mut pending: Vec<&LiveInterval> = intervals
+        .iter()
+        .filter(|i| candidates.contains(&i.pseudo))
+        .collect();
+    pending.sort_by_key(|i| i.start);
+
+    let mut forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<R>> = BTreeMap::new();
+    let mut next = 0;
+    let mut live: Vec<&LiveInterval> = Vec::new();
+    for cp in points {
+        // Intervals are live across the point when start <= position <= end.
+        while next < pending.len() && pending[next].start <= cp.position {
+            live.push(pending[next]);
+            next += 1;
+        }
+        live.retain(|i| i.end >= cp.position);
+        for interval in &live {
+            if exempt(cp, interval) {
+                continue;
+            }
+            forbidden
+                .entry(interval.pseudo)
+                .or_default()
+                .extend(cp.clobbers.iter().copied());
+        }
+    }
+    forbidden
+}
+
+/// The width each constant pseudo is defined at, from its `SetVal` -- the
+/// first, if there are several.
+///
+/// Built once for the chordal pre-pass, which asked it per interval by
+/// scanning the whole function; that made the pre-pass intervals x
+/// instructions.
+pub fn setval_sizes(func: &Function) -> HashMap<PseudoId, u32> {
+    let mut sizes = HashMap::new();
+    for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+        if insn.op == Opcode::SetVal {
+            if let Some(target) = insn.target {
+                sizes.entry(target).or_insert(insn.size);
+            }
+        }
+    }
+    sizes
+}
+
 // Common Functions
 
 /// Release stack slots whose owning interval ended before `point` back
@@ -1051,28 +1114,27 @@ pub fn find_copy_coalesce_candidates(func: &Function) -> Vec<(PseudoId, PseudoId
 /// unprocessed vertex with maximum weight (ties broken by smallest
 /// pseudo id for determinism), add it to the ordering, increment
 /// weight of each unprocessed neighbor.
+///
+/// The unprocessed vertices are kept ordered by `(weight, Reverse(id))`, so
+/// the pick is the last entry rather than a scan of all of them: the scan made
+/// ordering quadratic in the vertex count, minutes for a function of a few
+/// thousand branches.
 pub fn mcs_ordering(graph: &InterferenceGraph) -> Vec<PseudoId> {
-    let mut weight: BTreeMap<PseudoId, usize> = BTreeMap::new();
-    for &v in &graph.vertices {
-        weight.insert(v, 0);
-    }
+    use std::cmp::Reverse;
+    // Weight of each vertex not yet ordered; absent once it is.
+    let mut weight: HashMap<PseudoId, usize> = graph.vertices.iter().map(|&v| (v, 0)).collect();
+    let mut queue: std::collections::BTreeSet<(usize, Reverse<PseudoId>)> =
+        graph.vertices.iter().map(|&v| (0, Reverse(v))).collect();
     let mut order: Vec<PseudoId> = Vec::with_capacity(graph.vertices.len());
-    let mut remaining: std::collections::BTreeSet<PseudoId> = graph.vertices.clone();
-    while !remaining.is_empty() {
-        // Pick max-weight (tie-break: smaller PseudoId wins).
-        let pick = *remaining
-            .iter()
-            .max_by(|a, b| {
-                let wa = weight.get(*a).copied().unwrap_or(0);
-                let wb = weight.get(*b).copied().unwrap_or(0);
-                wa.cmp(&wb).then(b.0.cmp(&a.0))
-            })
-            .unwrap();
-        remaining.remove(&pick);
+    // Max weight; among equals the greatest `Reverse`, i.e. the smallest id.
+    while let Some((_, Reverse(pick))) = queue.pop_last() {
+        weight.remove(&pick);
         order.push(pick);
         for n in graph.neighbors(pick) {
-            if remaining.contains(&n) {
-                *weight.entry(n).or_insert(0) += 1;
+            if let Some(w) = weight.get_mut(&n) {
+                queue.remove(&(*w, Reverse(n)));
+                *w += 1;
+                queue.insert((*w, Reverse(n)));
             }
         }
     }
@@ -1374,5 +1436,71 @@ impl<'a> AbiLowering<'a> {
                     is_int128: kind == TypeKind::Int128,
                 })
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Maximum weight first, and the smallest id among equals: `4` is picked
+    /// before `3` because ordering `2` gave it a neighbour, though `3` has the
+    /// smaller id. The order is what greedy coloring depends on, so the
+    /// ordered-set pick has to reproduce the scan it replaced exactly.
+    #[test]
+    fn test_mcs_ordering_weight_then_smallest_id() {
+        let mut graph = InterferenceGraph::new();
+        for v in 1..=4 {
+            graph.add_vertex(PseudoId(v));
+        }
+        graph.add_edge(PseudoId(2), PseudoId(4));
+        graph.add_edge(PseudoId(3), PseudoId(4));
+        assert_eq!(
+            mcs_ordering(&graph),
+            [PseudoId(1), PseudoId(2), PseudoId(4), PseudoId(3)]
+        );
+    }
+
+    fn interval(p: u32, start: usize, end: usize) -> LiveInterval {
+        LiveInterval {
+            pseudo: PseudoId(p),
+            start,
+            end,
+            in_loop: false,
+        }
+    }
+
+    /// A point clobbers every candidate live across it, ends inclusive, and
+    /// nothing else: not an interval that ended before it, not one that
+    /// starts after it, not a non-candidate, and not one `exempt` excuses.
+    #[test]
+    fn test_constraint_clobbers_sweep() {
+        let intervals = [
+            interval(1, 0, 10),
+            interval(2, 5, 5),
+            interval(3, 6, 30),
+            interval(4, 0, 40),
+            interval(5, 26, 40),
+        ];
+        let points = [
+            ConstraintPoint {
+                position: 25,
+                clobbers: vec![2u8],
+                involved_pseudos: vec![PseudoId(3)],
+            },
+            ConstraintPoint {
+                position: 5,
+                clobbers: vec![1u8],
+                involved_pseudos: vec![],
+            },
+        ];
+        let candidates: std::collections::BTreeSet<PseudoId> =
+            [1, 2, 3, 5].into_iter().map(PseudoId).collect();
+        let forbidden = constraint_clobbers(&points, &intervals, &candidates, |cp, i| {
+            cp.involved_pseudos.contains(&i.pseudo)
+        });
+        let expect: BTreeMap<PseudoId, std::collections::BTreeSet<u8>> =
+            [(PseudoId(1), [1u8].into()), (PseudoId(2), [1u8].into())].into();
+        assert_eq!(forbidden, expect);
     }
 }

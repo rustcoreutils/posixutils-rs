@@ -1931,6 +1931,7 @@ impl RegAlloc {
         constraint_points: &[ConstraintPoint<Reg>],
     ) {
         // -------- Phase 1: pre-pass --------
+        let setval_sizes = crate::arch::regalloc::setval_sizes(func);
         let mut gp_candidates: std::collections::BTreeSet<PseudoId> =
             std::collections::BTreeSet::new();
         let mut xmm_candidates: std::collections::BTreeSet<PseudoId> =
@@ -1964,14 +1965,7 @@ impl RegAlloc {
                         // constants that merely *feed* a 128-bit instruction,
                         // and those are still ordinary immediates that get
                         // widened at the use site.
-                        let defined_128 = func
-                            .blocks
-                            .iter()
-                            .flat_map(|b| &b.insns)
-                            .find(|insn| {
-                                insn.op == Opcode::SetVal && insn.target == Some(interval.pseudo)
-                            })
-                            .is_some_and(|insn| insn.size == 128);
+                        let defined_128 = setval_sizes.get(&interval.pseudo) == Some(&128);
                         if defined_128 {
                             self.alloc_stack_slot(interval, 16, 16, true);
                             continue;
@@ -1980,15 +1974,7 @@ impl RegAlloc {
                         continue;
                     }
                     PseudoKind::FVal(v) => {
-                        let size = func
-                            .blocks
-                            .iter()
-                            .flat_map(|b| &b.insns)
-                            .find(|insn| {
-                                insn.op == Opcode::SetVal && insn.target == Some(interval.pseudo)
-                            })
-                            .map(|insn| insn.size)
-                            .unwrap_or(64);
+                        let size = setval_sizes.get(&interval.pseudo).copied().unwrap_or(64);
                         self.locations.insert(interval.pseudo, Loc::FImm(*v, size));
                         self.fp_pseudos.insert(interval.pseudo);
                         continue;
@@ -2161,24 +2147,12 @@ impl RegAlloc {
             .copied()
             .filter(|r| !r.is_callee_saved())
             .collect();
-        let mut forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<Reg>> = BTreeMap::new();
-        for cp in constraint_points {
-            for interval in intervals {
-                if !gp_candidates.contains(&interval.pseudo) {
-                    continue;
-                }
-                if interval.start > cp.position || cp.position > interval.end {
-                    continue;
-                }
-                if cp.operand_survives(interval.pseudo, interval.start, interval.end) {
-                    continue;
-                }
-                let entry = forbidden.entry(interval.pseudo).or_default();
-                for &c in &cp.clobbers {
-                    entry.insert(c);
-                }
-            }
-        }
+        let mut forbidden = crate::arch::regalloc::constraint_clobbers(
+            constraint_points,
+            intervals,
+            gp_candidates,
+            |cp, interval| cp.operand_survives(interval.pseudo, interval.start, interval.end),
+        );
         let mut in_loop_set: std::collections::BTreeSet<PseudoId> =
             std::collections::BTreeSet::new();
         for interval in intervals {

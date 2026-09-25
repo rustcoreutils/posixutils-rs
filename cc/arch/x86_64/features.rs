@@ -862,10 +862,7 @@ impl X86_64CodeGen {
         //
         // Shape (2) is detected explicitly: the pointer is materialized
         // into R11 (reserved scratch) before delegating to the helpers.
-        let is_sym = self
-            .pseudos
-            .iter()
-            .any(|p| p.id == ap_addr && matches!(&p.kind, crate::ir::PseudoKind::Sym(_)));
+        let is_sym = self.pseudos.is_sym(ap_addr);
 
         let (base_reg, base_offset) = match &ap_loc {
             // The slot *is* the va_list, so its own address is the base.

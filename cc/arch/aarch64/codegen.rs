@@ -22,7 +22,7 @@ use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{FrameBase, IncomingOff, Loc, LocalSlot, Reg, VReg};
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
-use crate::ir::{Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
+use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
@@ -40,7 +40,7 @@ pub struct Aarch64CodeGen {
     /// and remain visible as `.set` calls.
     pub(super) locations: crate::arch::regalloc::LocationMap<Loc>,
     /// Current function's pseudos (for looking up values)
-    pub(super) pseudos: Vec<Pseudo>,
+    pub(super) pseudos: crate::arch::codegen::PseudoTable,
     /// Total frame size for current function
     pub(super) frame_size: i32,
     /// Size of callee-saved register area (for computing local variable offsets)
@@ -85,7 +85,7 @@ impl Aarch64CodeGen {
         Self {
             base: CodeGenBase::new(target),
             locations: crate::arch::regalloc::LocationMap::new(),
-            pseudos: Vec::new(),
+            pseudos: Default::default(),
             frame_size: 0,
             callee_saved_size: 0,
             reg_save_area_offset: 0,
@@ -657,7 +657,7 @@ impl Aarch64CodeGen {
 
             Opcode::SetVal => {
                 if let Some(target) = insn.target {
-                    if let Some(pseudo) = self.pseudos.iter().find(|p| p.id == target) {
+                    if let Some(pseudo) = self.pseudos.get(target) {
                         match self.locations.get(target) {
                             Some(Loc::Reg(r)) => {
                                 if let PseudoKind::Val(v) = &pseudo.kind {

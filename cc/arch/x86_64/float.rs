@@ -14,7 +14,7 @@ use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::float::{f64_to_f16_bits, FloatVal};
-use crate::ir::{Instruction, Opcode, PseudoId, PseudoKind};
+use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
 impl X86_64CodeGen {
@@ -73,11 +73,7 @@ impl X86_64CodeGen {
             }
             Loc::Stack(offset) => {
                 // Check if the address operand is a symbol (local variable) or a temp (spilled address)
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(addr);
 
                 if is_symbol {
                     // Local variable - load directly from stack slot
@@ -204,11 +200,7 @@ impl X86_64CodeGen {
             }
             Loc::Stack(offset) => {
                 // Check if the address operand is a symbol (local variable) or a temp (spilled address)
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(addr);
 
                 if is_symbol {
                     // Local variable - store directly to stack slot

@@ -928,11 +928,7 @@ impl Aarch64CodeGen {
                 // an `Alloca` result -- holds a pointer. A complex value is
                 // always the latter, so taking the address of the slot copied
                 // the pointer's own bytes into the outgoing argument.
-                let names_storage = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == stack_arg.pseudo)
-                    .is_some_and(|p| matches!(p.kind, crate::ir::PseudoKind::Sym(_)));
+                let names_storage = self.pseudos.is_sym(stack_arg.pseudo);
                 let src = match self.get_location(stack_arg.pseudo) {
                     Loc::Reg(r) => r,
                     ref loc @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {

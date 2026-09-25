@@ -120,6 +120,19 @@ arithmetic.
 
 ---
 
+### Dominator construction is quadratic on a wide join
+
+`domtree_build` is Cooper-Harvey-Kennedy, whose `intersect` walks the
+dominator chain once per predecessor. A block with thousands of predecessors
+under a deep chain -- the two labels every `if ... goto` in
+`compile/20001226-1` jumps to -- makes that predecessors x depth. It is what
+is left of that test's compile time (about a second for 8192 pairs, still
+growing a little faster than linearly), and it runs once per `ssa_convert`
+and again per `loadfwd`. Lengauer-Tarjan, which gcc uses, is near-linear on
+any shape.
+
+---
+
 ### A by-value struct argument is still copied word by word in the backend
 
 Fixed at the IR level: copies past 128 bytes now become a `memcpy` call, which
@@ -483,7 +496,6 @@ Most of what is left is one thing.
 | Group | Note |
 |---|---|
 | Builtin folding | The whole of `execute/builtins/`. Each test defines its own `strlen`, `memcpy` or `printf` that calls `abort()` when `__OPTIMIZE__` is set, so a run-time failure there means c17 emitted a real call where gcc folded the builtin or expanded it inline. Nothing fails to *compile*, so no build is blocked; it is gcc-parity and code quality. Deferred by decision. The same group: `execute/printf-chk-1`, `fprintf-chk-1`, `vprintf-chk-1` and `vfprintf-chk-1` at `-O2`, which expect `__printf_chk` with a constant format to become `puts`/`putchar`; `builtins/abs-2`, `abs-3`, `complex-1` and `memcmp` at `-O2`, which expect a constant call folded so that a `link_error` reference disappears; and `builtins/strncmp` at `-O0`, whose own `strncmp` returns an uninitialised value for `n == 0`, so it passes only when the call is folded to 0 -- which gcc does at every level |
-| Compile time | `compile/20001226-1`, 8192 `if ... goto` pairs in one function: over 300 seconds, against gcc's 0.4, and quadratic in the branch count on both targets |
 | Dead-call elimination proofs | `20030330-1` and `medce-1` at `-O0` (a constant branch keeps its arm there, which is recorded in DECISIONS.md), and `ieee/compare-fp-3` and `ieee/fp-cmp-6`/`-7`/`-9` at every level. Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link*. Standard C, and optimizer strength rather than a defect: what is missing is folding a comparison whose operands are known to relate |
 | `always_inline` on a library builtin | `pr46360`. `__attribute__((always_inline))` on a declaration of `strncpy` -- c17 refuses because it has no body to substitute, where gcc inlines its own expansion |
 | An `extern inline` reading a file-scope static | `pr38857`. A C17 6.7.4p3 constraint gcc does not enforce. Relaxed by `-fpermissive`; the test does not pass it |

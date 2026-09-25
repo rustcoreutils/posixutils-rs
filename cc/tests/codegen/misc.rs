@@ -13725,3 +13725,40 @@ fn codegen_many_mixed_params_arrive_in_place() {
         }
     }
 }
+
+/// Thousands of branches in one function -- the shape of the gcc torture test
+/// `compile/20001226-1`, which spent minutes in register allocation on both
+/// targets: pairing every constraint point with every live interval, an
+/// ordering that rescanned every vertex per pick, and per-interval and
+/// per-constant scans of the whole function. This pins that the function
+/// still computes the right answer after those became indexed.
+#[test]
+fn codegen_many_branches_one_function() {
+    let mut src = String::from("__attribute__((noinline)) int cmp(int x[64], int y[64]) {\n");
+    for i in 0..1500 {
+        let a = i % 64;
+        src.push_str(&format!(
+            "if (x[{a}] > y[{a}]) goto gt; if (x[{a}] < y[{a}]) goto lt;\n"
+        ));
+    }
+    src.push_str(
+        "return 0; gt: return 1; lt: return 2; }\n\
+         int main(void) {\n\
+         int x[64], y[64];\n\
+         for (int i = 0; i < 64; i++) x[i] = y[i] = i;\n\
+         if (cmp(x, y) != 0) return 10;\n\
+         x[20] = 100;\n\
+         if (cmp(x, y) != 1) return 11;\n\
+         x[20] = 20; y[23] = 100;\n\
+         if (cmp(x, y) != 2) return 12;\n\
+         return 0; }\n",
+    );
+    assert_eq!(compile_and_run("many_branches", &src, &[]), 0);
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run("many_branches_o2", &src, &opts), 0);
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64("many_branches_a64", &src, opt) {
+            assert_eq!(code, 0, "aarch64 at {opt}");
+        }
+    }
+}

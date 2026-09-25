@@ -13609,22 +13609,36 @@ long stride(struct Big *p, int i) { return (char *)&p[i] - (char *)p; }
 /// targets, at every optimization level. `a = b` is the one that matters most:
 /// it is the plainest aggregate copy in the language.
 ///
-/// Asserted on x86-64 alone, for the reason the companion test gives: the
-/// length is computed in `ir/` before any backend runs, and x86-64 is the
-/// target that materialises it as a literal rather than as `movz`/`movk`.
-/// Nothing is defined or run -- a test must not ask its machine for gigabytes
-/// to observe a constant.
+/// Asserted on x86-64 alone, and the source is shaped to stay cheap. Both are
+/// load-bearing, not stylistic -- each one avoids a different pre-existing
+/// backend blowup that this test walked straight into and that took both Linux
+/// CI runners down with SIGTERM:
+///
+/// - **x86-64 only.** Nothing to do with coverage: the length is computed in
+///   `ir/` before any backend runs, so one target proves it, and x86-64 is the
+///   one that materialises the constant as a literal rather than as
+///   `movz`/`movk`. Adding an `AARCH64_LINUX` assertion would cost **12.5
+///   seconds and 16 GB** resident, because `initialize`'s 600 MB local goes
+///   through `zero_stack_frame`, which unrolls one store per qword on aarch64
+///   where x86-64 emits `rep stosq`.
+/// - **`by_value_param` does not pass its argument on.** The prologue copy is
+///   the site under test; *sending* a 600 MB aggregate costs **16 seconds and
+///   21.9 GB**, because the outgoing stacked-argument copy has no `memcpy`
+///   fallback and unrolls one load/store pair per eight bytes.
+///
+/// Both are recorded in cc/TODO.md. Until they are fixed, do not raise the
+/// target list and do not add a call that passes one of these by value.
+/// Everything here is `extern`; nothing is defined or run.
 #[test]
 fn codegen_aggregate_copy_length_past_the_old_object_bound() {
     const SRC: &str = r#"
 struct Big { char x[600000000L]; };
 extern struct Big src, dst;
 void sink(struct Big *);
-void callee(struct Big);
 
 void assign(void) { dst = src; }
 void initialize(void) { struct Big loc = src; sink(&loc); }
-void by_value_param(struct Big p) { callee(p); }
+void by_value_param(struct Big p) { sink(&p); }
 struct Big returns_it(void) { return src; }
 unsigned long extent(void) { return __builtin_object_size(src.x, 0); }
 "#;

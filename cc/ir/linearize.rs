@@ -1202,6 +1202,7 @@ impl<'a> Linearizer<'a> {
         ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
         ir_func.symbol_attrs = func.attrs.symbol.clone();
+        ir_func.align = func.attrs.align;
         ir_func.is_noinline = func.attrs.noinline;
         ir_func.declared_effect = func.attrs.effect;
         ir_func.is_always_inline = func.attrs.always_inline;

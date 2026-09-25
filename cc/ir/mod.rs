@@ -1783,6 +1783,9 @@ pub struct Function {
     pub name: String,
     /// `weak`, `used`, `section(...)`, `visibility(...)`.
     pub symbol_attrs: crate::parse::ast::SymbolAttrs,
+    /// `__attribute__((aligned(N)))`: the byte alignment the function's code
+    /// must start at, or `None` for the target's own.
+    pub align: Option<u32>,
     /// Return type (interned TypeId)
     pub return_type: TypeId,
     /// Parameter names and types (interned TypeIds)
@@ -1875,6 +1878,7 @@ impl Default for Function {
         Self {
             name: String::new(),
             symbol_attrs: Default::default(),
+            align: None,
             takes_label_addr: false,
             return_type: TypeId::INVALID,
             params: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),

@@ -339,6 +339,11 @@ impl X86_64CodeGen {
         // ELF-only type (handled by Directive::emit which skips on macOS)
         self.push_lir(X86Inst::Directive(Directive::type_func(name)));
 
+        // x86-64 code has no alignment of its own; `aligned(N)` asks for one.
+        if let Some(align) = func.align {
+            self.push_lir(X86Inst::Directive(Directive::Align(align.trailing_zeros())));
+        }
+
         // Function label
         self.push_lir(X86Inst::Directive(Directive::global_label(name)));
 

@@ -172,6 +172,15 @@ impl Parser<'_> {
     }
 
     fn accumulate_fn_attrs(&mut self, name: StringId) -> crate::parse::ast::FunctionAttrs {
+        // An `aligned` written before the declaration specifiers or after the
+        // declarator arrives on the object channels, since the parser cannot
+        // yet tell it is declaring a function; the `_Alignas` keyword on the
+        // same channel has already been refused by `reject_alignas_in`. Fold
+        // both in here, where it is known to be one.
+        let declared_align = self
+            .pending_alignas
+            .max(self.pending_declarator_align.take());
+        self.pending_fn_attrs.align = self.pending_fn_attrs.align.max(declared_align);
         let pending = self.pending_fn_attrs.clone();
         let seen = self.declared_fn_attrs.entry(name).or_default();
         seen.merge(&pending);

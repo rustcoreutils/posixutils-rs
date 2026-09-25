@@ -367,8 +367,12 @@ impl Aarch64CodeGen {
         // ELF-only type (handled by Directive::emit which skips on macOS)
         self.push_lir(Aarch64Inst::Directive(Directive::type_func(name)));
 
-        // Alignment
-        self.push_lir(Aarch64Inst::Directive(Directive::Align(2)));
+        // An instruction is four bytes, so that is the least; `aligned(N)`
+        // raises it.
+        let align = func.align.unwrap_or(4).max(4);
+        self.push_lir(Aarch64Inst::Directive(Directive::Align(
+            align.trailing_zeros(),
+        )));
 
         // Function label
         self.push_lir(Aarch64Inst::Directive(Directive::global_label(name)));

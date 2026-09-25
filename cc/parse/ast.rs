@@ -1515,6 +1515,9 @@ pub struct FunctionAttrs {
     /// the only thing this translation unit can see about a function, and an
     /// attribute that in-TU analysis could overrule would buy nothing.
     pub effect: MemEffect,
+    /// `__attribute__((aligned(N)))` -- align the function's code to N bytes,
+    /// which is also what `__alignof__` of the function answers.
+    pub align: Option<u32>,
 }
 
 impl FunctionAttrs {
@@ -1546,6 +1549,9 @@ impl FunctionAttrs {
         if let Some(prio) = other.destructor {
             self.destructor = Some(prio);
         }
+        // Several `aligned` attributes across the declarations: the strictest
+        // wins, as it does for an object.
+        self.align = self.align.max(other.align);
     }
 }
 

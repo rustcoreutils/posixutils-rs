@@ -6893,3 +6893,21 @@ fn test_complex_equality_compares_both_halves() {
         module.display(&ctx.types)
     );
 }
+
+/// A function's `aligned` attribute reaches the IR function the backends emit.
+#[test]
+fn test_function_alignment_reaches_the_ir() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let mut func = make_simple_func(
+        test_id,
+        Stmt::Return(Some(Expr::int(0, &ctx.types))),
+        &ctx.types,
+    );
+    func.attrs.align = Some(64);
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    assert_eq!(module.functions[0].align, Some(64));
+}

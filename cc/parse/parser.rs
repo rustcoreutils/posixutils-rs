@@ -296,6 +296,7 @@ impl AttributeList {
             gnu_inline: self.has_attr("gnu_inline"),
             artificial: self.has_attr("artificial"),
             effect: self.mem_effect(),
+            align: self.get_alignment().filter(|n| n.is_power_of_two()),
         }
     }
 
@@ -417,7 +418,7 @@ pub struct Parser<'a> {
     /// to the whole declaration and reach every declarator, while
     /// `int a, b __attribute__((aligned(64)));` aligns only `b`. Sharing one
     /// slot over-aligned every declarator that followed an attributed one.
-    pending_declarator_align: Option<u32>,
+    pub(super) pending_declarator_align: Option<u32>,
     /// `weak`, `used`, `section(...)`, `visibility(...)` seen on the
     /// declaration being parsed. Accumulated like `pending_alignas`, because
     /// an attribute may appear before the declarator, after it, or on the

@@ -1146,8 +1146,17 @@ impl<'a> Parser<'a> {
     /// this from `expr.typ` alone and so disagreed with gcc identically.
     fn alignof_expr(&mut self, expr: Expr, size_t: TypeId, pos: Position) -> Expr {
         if let ExprKind::Ident(symbol_id) = &expr.kind {
-            if let Some(align) = self.symbols.get(*symbol_id).explicit_align {
+            let symbol = self.symbols.get(*symbol_id);
+            if let Some(align) = symbol.explicit_align {
                 return Expr::typed(ExprKind::IntLit(align as i64), size_t, pos);
+            }
+            // A function's `aligned` is a function attribute, gathered across
+            // every declaration of the name rather than held on one symbol.
+            if self.types.kind(symbol.typ) == TypeKind::Function {
+                let declared = self.declared_fn_attrs.get(&symbol.name);
+                if let Some(align) = declared.and_then(|attrs| attrs.align) {
+                    return Expr::typed(ExprKind::IntLit(align as i64), size_t, pos);
+                }
             }
         }
         Expr::typed(ExprKind::AlignofExpr(Box::new(expr)), size_t, pos)

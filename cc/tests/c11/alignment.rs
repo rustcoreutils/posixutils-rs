@@ -11,7 +11,7 @@
 // Tests _Alignas, __attribute__((aligned(N))), and stdalign.h
 //
 
-use crate::common::{compile_and_run, compile_and_run_optimized};
+use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_optimized};
 
 #[test]
 fn c11_alignment_mega() {
@@ -529,4 +529,61 @@ int main(void) {
         compile_and_run("c11_alignment_typedef_at_block_scope", code, &[]),
         0
     );
+}
+
+/// `__attribute__((aligned(N)))` on a function aligns its code, and
+/// `__alignof__` of the function answers N.
+///
+/// The attribute can reach a function by every route a declaration has: on a
+/// prototype after the declarator (the gcc torture test `execute/align-3`,
+/// whose definition then says nothing), before the declaration specifiers, and
+/// on the definition itself. The largest wins when there are several. c17
+/// answered 1 and emitted no alignment directive at all.
+const FUNCTION_ALIGNMENT: &str = r#"
+#include <stdint.h>
+
+void on_prototype(void) __attribute__((aligned(256)));
+void on_prototype(void) {}
+
+__attribute__((aligned(64))) void before_specifiers(void) {}
+
+void on_definition(void) __attribute__((aligned(128)));
+void on_definition(void) __attribute__((aligned(512)));
+void on_definition(void) {}
+
+static __attribute__((aligned(1024))) int internal(int x) { return x + 1; }
+
+int main(void)
+{
+    if (__alignof__(on_prototype) != 256) return 1;
+    if (__alignof__(before_specifiers) != 64) return 2;
+    if (__alignof__(on_definition) != 512) return 3;
+    if (__alignof__(internal) != 1024) return 4;
+
+    if ((uintptr_t)on_prototype % 256) return 11;
+    if ((uintptr_t)before_specifiers % 64) return 12;
+    if ((uintptr_t)on_definition % 512) return 13;
+    if ((uintptr_t)internal % 1024) return 14;
+
+    on_prototype();
+    before_specifiers();
+    on_definition();
+    return internal(-1);
+}
+"#;
+
+#[test]
+fn c11_alignment_of_a_function() {
+    assert_eq!(compile_and_run("fn_align", FUNCTION_ALIGNMENT, &[]), 0);
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run("fn_align_o2", FUNCTION_ALIGNMENT, &opts), 0);
+}
+
+#[test]
+fn c11_alignment_of_a_function_aarch64() {
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64("fn_align_a64", FUNCTION_ALIGNMENT, opt) {
+            assert_eq!(code, 0, "at {opt}");
+        }
+    }
 }

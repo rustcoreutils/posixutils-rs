@@ -5941,3 +5941,52 @@ fn test_frame_builtin_level_must_be_constant() {
         }
     }
 }
+
+/// `aligned` on a function reaches the definition's attributes from every
+/// place it can be written -- a prototype's trailing attribute, the position
+/// before the specifiers, the definition -- and the largest wins.
+#[test]
+fn test_function_aligned_attribute_is_gathered() {
+    let src = "void a(void) __attribute__((aligned(256)));\n\
+               void a(void) {}\n\
+               __attribute__((aligned(64))) void b(void) {}\n\
+               void c(void) __attribute__((aligned(128)));\n\
+               __attribute__((aligned(32))) void c(void) {}\n\
+               void d(void) {}\n";
+    let (tu, _types, strings, _symbols) = parse_tu(src).unwrap();
+    let aligns: Vec<(String, Option<u32>)> = tu
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ExternalDecl::FunctionDef(f) => Some((strings.get(f.name).to_string(), f.attrs.align)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        aligns,
+        [
+            ("a".to_string(), Some(256)),
+            ("b".to_string(), Some(64)),
+            ("c".to_string(), Some(128)),
+            ("d".to_string(), None),
+        ]
+    );
+}
+
+/// `__alignof__` of an aligned function is a constant the parser folds.
+#[test]
+fn test_alignof_of_an_aligned_function() {
+    let src = "void f(void) __attribute__((aligned(512)));\n\
+               unsigned long n = __alignof__(f);\n";
+    let (tu, ..) = parse_tu(src).unwrap();
+    let init = tu.items.iter().find_map(|item| match item {
+        ExternalDecl::Declaration(d) => d.declarators.first()?.init.clone(),
+        _ => None,
+    });
+    let init = init.expect("n has an initializer");
+    assert!(
+        matches!(init.kind, ExprKind::IntLit(512)),
+        "{:?}",
+        init.kind
+    );
+}

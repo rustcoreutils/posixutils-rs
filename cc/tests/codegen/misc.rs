@@ -13662,3 +13662,66 @@ unsigned long extent(void) { return __builtin_object_size(src.x, 0); }
         );
     }
 }
+
+/// A C source whose function takes `n` parameters of mixed classes -- `int`,
+/// `double`, and a two-eightbyte struct -- and checks every one arrived. A
+/// second function returns a large struct, so its parameters sit one `Arg`
+/// index after the hidden return pointer.
+fn many_params_source(n: usize) -> String {
+    let param = |i: usize| match i % 3 {
+        0 => format!("int p{i}"),
+        1 => format!("double p{i}"),
+        _ => format!("struct pair p{i}"),
+    };
+    let check = |i: usize| match i % 3 {
+        0 => format!("if (p{i} != {i}) return {};\n", i + 1),
+        1 => format!("if (p{i} != {i}.5) return {};\n", i + 1),
+        _ => format!("if (p{i}.a != {i} || p{i}.b != -{i}) return {};\n", i + 1),
+    };
+    let arg = |i: usize| match i % 3 {
+        0 => format!("{i}"),
+        1 => format!("{i}.5"),
+        _ => format!("(struct pair){{{i}, -{i}}}"),
+    };
+    let params: Vec<String> = (0..n).map(param).collect();
+    let args: Vec<String> = (0..n).map(arg).collect();
+    let checks: String = (0..n).map(check).collect();
+    format!(
+        "struct pair {{ long a, b; }};\n\
+         struct big {{ long v[8]; }};\n\
+         __attribute__((noinline)) int f({params}) {{\n{checks}return 0; }}\n\
+         __attribute__((noinline)) struct big g({params}) {{\n\
+         struct big r = {{{{0}}}};\n\
+         r.v[0] = f({names});\n\
+         return r; }}\n\
+         int main(void) {{\n\
+         int rc = f({args});\n\
+         if (rc) return rc;\n\
+         return (int)g({args}).v[0]; }}\n",
+        params = params.join(", "),
+        names = (0..n)
+            .map(|i| format!("p{i}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        args = args.join(", "),
+    )
+}
+
+/// Each parameter's pseudo is found by one index lookup, not by scanning the
+/// function's pseudos per parameter -- which made a function of 100,000
+/// parameters (the gcc torture test `compile/limits-fndefn`) take minutes in
+/// both backends. This pins that every parameter still reaches its own
+/// register or stack slot across the mix of classes, with and without a
+/// hidden return pointer.
+#[test]
+fn codegen_many_mixed_params_arrive_in_place() {
+    let src = many_params_source(300);
+    assert_eq!(compile_and_run("many_mixed_params", &src, &[]), 0);
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run("many_mixed_params_o2", &src, &opts), 0);
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64("many_mixed_params_a64", &src, opt) {
+            assert_eq!(code, 0, "aarch64 at {opt}");
+        }
+    }
+}

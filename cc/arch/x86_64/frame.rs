@@ -669,6 +669,7 @@ impl X86_64CodeGen {
             .iter()
             .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
         let arg_idx_offset: u32 = if has_sret { 1 } else { 0 };
+        let arg_pseudos = func.arg_pseudos();
 
         // If there's a hidden return pointer, it takes RDI, so params start from RSI
         if has_sret {
@@ -683,11 +684,7 @@ impl X86_64CodeGen {
             if crate::abi::param_is_memory_class(*typ, types) {
                 continue;
             }
-            let has_pseudo = func
-                .pseudos
-                .iter()
-                .any(|p| matches!(p.kind, PseudoKind::Arg(a) if a == (i as u32) + arg_idx_offset));
-            if !has_pseudo {
+            if !arg_pseudos.contains_key(&((i as u32) + arg_idx_offset)) {
                 Self::advance_arg_regs(
                     *typ,
                     types,
@@ -698,257 +695,248 @@ impl X86_64CodeGen {
                 );
                 continue;
             }
-            // Find the pseudo for this argument
-            for pseudo in &func.pseudos {
-                if let PseudoKind::Arg(arg_idx) = pseudo.kind {
-                    if arg_idx == (i as u32) + arg_idx_offset {
-                        // A MEMORY-class struct arrives on the stack by
-                        // value and uses no GP register — skip it entirely.
-                        let type_size_bits = types.size_bits(*typ);
-                        let is_large_struct_param = crate::abi::param_is_memory_class(*typ, types);
-                        if is_large_struct_param {
-                            break;
-                        }
+            // The pseudo for this argument; each early exit leaves the block.
+            'arg: {
+                let Some(pseudo) = arg_pseudos.get(&((i as u32) + arg_idx_offset)) else {
+                    break 'arg;
+                };
+                // A MEMORY-class struct arrives on the stack by
+                // value and uses no GP register — skip it entirely.
+                let type_size_bits = types.size_bits(*typ);
+                let is_large_struct_param = crate::abi::param_is_memory_class(*typ, types);
+                if is_large_struct_param {
+                    break 'arg;
+                }
 
-                        // Skip pseudos already stored via spilled_args
-                        if spilled_pseudos.contains(&pseudo.id) {
-                            // Still need to count this arg for register
-                            // assignment tracking.
-                            Self::advance_arg_regs(
-                                *typ,
-                                types,
-                                &mut int_arg_idx,
-                                &mut fp_arg_idx,
-                                int_arg_regs.len(),
-                                fp_arg_regs.len(),
-                            );
-                            break;
-                        }
-                        let is_fp = types.is_float(*typ);
-                        let is_complex = types.is_complex_float(*typ);
-                        // An all-SSE struct, and the number of registers it
-                        // takes: two doubles take two, a lone binary128 takes
-                        // one whole register for all sixteen bytes.
-                        let sse_struct = crate::abi::sse_struct_regs(*typ, types);
-                        let is_two_sse_struct = sse_struct.is_some();
-                        // How many SSE registers this argument actually occupies.
-                        // A complex type depends on its base (see
-                        // `complex_sse_regs`).
-                        let sse_regs = if let Some(n) = sse_struct {
-                            n
-                        } else if is_complex {
-                            complex_sse_regs(types, *typ)
-                        } else {
-                            0
-                        };
+                // Skip pseudos already stored via spilled_args
+                if spilled_pseudos.contains(&pseudo.id) {
+                    // Still need to count this arg for register
+                    // assignment tracking.
+                    Self::advance_arg_regs(
+                        *typ,
+                        types,
+                        &mut int_arg_idx,
+                        &mut fp_arg_idx,
+                        int_arg_regs.len(),
+                        fp_arg_regs.len(),
+                    );
+                    break 'arg;
+                }
+                let is_fp = types.is_float(*typ);
+                let is_complex = types.is_complex_float(*typ);
+                // An all-SSE struct, and the number of registers it
+                // takes: two doubles take two, a lone binary128 takes
+                // one whole register for all sixteen bytes.
+                let sse_struct = crate::abi::sse_struct_regs(*typ, types);
+                let is_two_sse_struct = sse_struct.is_some();
+                // How many SSE registers this argument actually occupies.
+                // A complex type depends on its base (see
+                // `complex_sse_regs`).
+                let sse_regs = if let Some(n) = sse_struct {
+                    n
+                } else if is_complex {
+                    complex_sse_regs(types, *typ)
+                } else {
+                    0
+                };
 
-                        // Two eightbytes in two registers, at least one of
-                        // them general. The all-SSE shapes are handled by the
-                        // block below; this is the integer and mixed remainder.
-                        if let Some(classes) = crate::abi::struct_param_classes(*typ, types) {
-                            if !is_two_sse_struct {
-                                self.store_reg_pair_param_to_local(
-                                    func,
-                                    i,
-                                    pseudo.id,
-                                    &classes,
-                                    &mut int_arg_idx,
-                                    &mut fp_arg_idx,
-                                    int_arg_regs,
-                                    fp_arg_regs,
-                                    type_size_bits,
-                                );
-                                break;
-                            }
-                        }
+                // Two eightbytes in two registers, at least one of
+                // them general. The all-SSE shapes are handled by the
+                // block below; this is the integer and mixed remainder.
+                if let Some(classes) = crate::abi::struct_param_classes(*typ, types) {
+                    if !is_two_sse_struct {
+                        self.store_reg_pair_param_to_local(
+                            func,
+                            i,
+                            pseudo.id,
+                            &classes,
+                            &mut int_arg_idx,
+                            &mut fp_arg_idx,
+                            int_arg_regs,
+                            fp_arg_regs,
+                            type_size_bits,
+                        );
+                        break 'arg;
+                    }
+                }
 
-                        if (is_complex || is_two_sse_struct) && sse_regs > 0 {
-                            // Look up the local variable (same name as param) for stack location
-                            if fp_arg_idx + sse_regs > fp_arg_regs.len() {
-                                // Spilled: the caller wrote the value into the
-                                // incoming argument area, so copy it into the
-                                // local rather than reading registers that hold
-                                // something else.
-                                self.copy_incoming_arg_to_local(
-                                    func,
-                                    &func.params[i].0,
-                                    pseudo.id,
-                                    (type_size_bits / 8) as i32,
-                                );
-                                // A memory-class argument consumes no XMM
-                                // registers; the ones it did not fit in stay
-                                // available to the arguments that follow.
-                                break;
-                            }
-                            {
-                                // Find the local for this parameter by name
-                                let param_name = &func.params[i].0;
-                                if let Some(local) = func.locals.get(param_name) {
-                                    if let Some(Loc::Stack(offset)) =
-                                        self.locations.get_ref(local.sym)
-                                    {
-                                        let offset = *offset;
-                                        let (fp_size, imag_offset) = if let Some(n) = sse_struct {
-                                            // Two doubles are eight bytes each;
-                                            // a lone binary128 is one register
-                                            // holding all sixteen.
-                                            if n == 1 {
-                                                (FpSize::for_sse_aggregate(type_size_bits), 0)
-                                            } else {
-                                                (FpSize::Double, 8)
-                                            }
-                                        } else {
-                                            complex_fp_info(types, &self.base.target, *typ)
-                                        };
-                                        if sse_regs == 1 {
-                                            // One register holding the whole
-                                            // value. For `float _Complex` that
-                                            // is one eightbyte with both
-                                            // halves in it, so a 64-bit store
-                                            // writes all of it; for an
-                                            // aggregate it is whatever the
-                                            // class's size says, which is
-                                            // sixteen bytes for a binary128.
-                                            let whole = if sse_struct.is_some() {
-                                                fp_size
-                                            } else {
-                                                FpSize::Double
-                                            };
-                                            self.push_lir(X86Inst::MovFp {
-                                                size: whole,
-                                                src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
-                                                dst: XmmOperand::Mem(self.stack_mem(offset)),
-                                            });
-                                        } else {
-                                            // Store real part from first XMM register
-                                            self.push_lir(X86Inst::MovFp {
-                                                size: fp_size,
-                                                src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
-                                                dst: XmmOperand::Mem(self.stack_mem(offset)),
-                                            });
-                                            // Store imag part from second XMM register
-                                            self.push_lir(X86Inst::MovFp {
-                                                size: fp_size,
-                                                src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
-                                                dst: XmmOperand::Mem(
-                                                    self.stack_mem(offset - imag_offset),
-                                                ),
-                                            });
-                                        }
+                if (is_complex || is_two_sse_struct) && sse_regs > 0 {
+                    // Look up the local variable (same name as param) for stack location
+                    if fp_arg_idx + sse_regs > fp_arg_regs.len() {
+                        // Spilled: the caller wrote the value into the
+                        // incoming argument area, so copy it into the
+                        // local rather than reading registers that hold
+                        // something else.
+                        self.copy_incoming_arg_to_local(
+                            func,
+                            &func.params[i].0,
+                            pseudo.id,
+                            (type_size_bits / 8) as i32,
+                        );
+                        // A memory-class argument consumes no XMM
+                        // registers; the ones it did not fit in stay
+                        // available to the arguments that follow.
+                        break 'arg;
+                    }
+                    {
+                        // Find the local for this parameter by name
+                        let param_name = &func.params[i].0;
+                        if let Some(local) = func.locals.get(param_name) {
+                            if let Some(Loc::Stack(offset)) = self.locations.get_ref(local.sym) {
+                                let offset = *offset;
+                                let (fp_size, imag_offset) = if let Some(n) = sse_struct {
+                                    // Two doubles are eight bytes each;
+                                    // a lone binary128 is one register
+                                    // holding all sixteen.
+                                    if n == 1 {
+                                        (FpSize::for_sse_aggregate(type_size_bits), 0)
+                                    } else {
+                                        (FpSize::Double, 8)
                                     }
-                                }
-                            }
-                            spend_arg_regs(&mut fp_arg_idx, sse_regs, fp_arg_regs.len());
-                        } else if types.kind(*typ) == crate::types::TypeKind::LongDouble {
-                            // Long double is passed on the stack per System V AMD64 ABI
-                            // No XMM register move needed - already at IncomingArg offset
-                            // Don't increment fp_arg_idx - long double doesn't use XMM
-                        } else if is_fp {
-                            // FP argument (float/double)
-                            if fp_arg_idx < fp_arg_regs.len() {
-                                if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id)
-                                {
-                                    // Move from FP arg register to stack
-                                    // From the type: a `__float128` argument
-                                    // arrives as a whole XMM, and storing it
-                                    // as a `double` dropped its top half.
-                                    let fp_size =
-                                        self.fp_format(Some(*typ), types.size_bits(*typ), types);
+                                } else {
+                                    complex_fp_info(types, &self.base.target, *typ)
+                                };
+                                if sse_regs == 1 {
+                                    // One register holding the whole
+                                    // value. For `float _Complex` that
+                                    // is one eightbyte with both
+                                    // halves in it, so a 64-bit store
+                                    // writes all of it; for an
+                                    // aggregate it is whatever the
+                                    // class's size says, which is
+                                    // sixteen bytes for a binary128.
+                                    let whole = if sse_struct.is_some() {
+                                        fp_size
+                                    } else {
+                                        FpSize::Double
+                                    };
+                                    self.push_lir(X86Inst::MovFp {
+                                        size: whole,
+                                        src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
+                                        dst: XmmOperand::Mem(self.stack_mem(offset)),
+                                    });
+                                } else {
+                                    // Store real part from first XMM register
                                     self.push_lir(X86Inst::MovFp {
                                         size: fp_size,
                                         src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
-                                        dst: XmmOperand::Mem(self.stack_mem(*offset)),
+                                        dst: XmmOperand::Mem(self.stack_mem(offset)),
+                                    });
+                                    // Store imag part from second XMM register
+                                    self.push_lir(X86Inst::MovFp {
+                                        size: fp_size,
+                                        src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
+                                        dst: XmmOperand::Mem(self.stack_mem(offset - imag_offset)),
                                     });
                                 }
                             }
-                            spend_arg_regs(&mut fp_arg_idx, 1, fp_arg_regs.len());
-                        } else if types.kind(*typ) == TypeKind::Int128 && !types.is_complex(*typ) {
-                            // __int128 argument — uses TWO consecutive GP registers
-                            // Store to the arg pseudo's stack slot (allocated by regalloc)
-                            let int128_in_regs = int_arg_idx + 1 < int_arg_regs.len();
-                            let pair_start = int_arg_idx;
-                            if int128_in_regs {
-                                spend_arg_regs(&mut int_arg_idx, 2, int_arg_regs.len());
-                                if let Some(loc) = self.locations.get(pseudo.id) {
-                                    // Store lo half from first GP register
-                                    self.push_lir(X86Inst::Mov {
-                                        size: OperandSize::B64,
-                                        src: GpOperand::Reg(int_arg_regs[pair_start]),
-                                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&loc)),
-                                    });
-                                    // Store hi half from second GP register
-                                    self.push_lir(X86Inst::Mov {
-                                        size: OperandSize::B64,
-                                        src: GpOperand::Reg(int_arg_regs[pair_start + 1]),
-                                        dst: GpOperand::Mem(self.int128_hi_mem_loc(&loc)),
-                                    });
-                                }
-                            } else {
-                                // Stack-passed int128: copy from incoming arg area
-                                // to the local stack slot. The allocator laid the
-                                // incoming area out and recorded where this one
-                                // landed; recomputing it here with a second
-                                // counter -- which only this arm advanced -- read
-                                // the preceding argument as soon as anything else
-                                // was stacked.
-                                let incoming_stack_offset = alloc
-                                    .int128_incoming(pseudo.id)
-                                    .expect("stack-passed __int128 has an incoming offset");
-                                if let Some(loc) = self.locations.get(pseudo.id) {
-                                    // Load lo from incoming, store to local
-                                    self.push_lir(X86Inst::Mov {
-                                        size: OperandSize::B64,
-                                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                                            base: Reg::Rbp,
-                                            offset: incoming_stack_offset,
-                                        }),
-                                        dst: GpOperand::Reg(Reg::R10),
-                                    });
-                                    self.push_lir(X86Inst::Mov {
-                                        size: OperandSize::B64,
-                                        src: GpOperand::Reg(Reg::R10),
-                                        dst: GpOperand::Mem(self.int128_lo_mem_loc(&loc)),
-                                    });
-                                    // Load hi from incoming, store to local
-                                    self.push_lir(X86Inst::Mov {
-                                        size: OperandSize::B64,
-                                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                                            base: Reg::Rbp,
-                                            offset: incoming_stack_offset + 8,
-                                        }),
-                                        dst: GpOperand::Reg(Reg::R10),
-                                    });
-                                    self.push_lir(X86Inst::Mov {
-                                        size: OperandSize::B64,
-                                        src: GpOperand::Reg(Reg::R10),
-                                        dst: GpOperand::Mem(self.int128_hi_mem_loc(&loc)),
-                                    });
-                                }
-                                // No advance here: 3.2.3 step 5 sends an
-                                // argument that does not fit to memory *whole*,
-                                // consuming no registers, so the ones it did
-                                // not fit in remain for later arguments. The
-                                // allocator applies the same rule, and the two
-                                // have to agree on which register a following
-                                // argument arrives in.
-                            }
-                        } else {
-                            // Integer argument
-                            if int_arg_idx < int_arg_regs.len() {
-                                if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id)
-                                {
-                                    // Move from arg register to stack
-                                    self.push_lir(X86Inst::Mov {
-                                        size: OperandSize::B64,
-                                        src: GpOperand::Reg(int_arg_regs[int_arg_idx]),
-                                        dst: GpOperand::Mem(self.stack_mem(*offset)),
-                                    });
-                                }
-                            }
-                            spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
                         }
-                        break;
                     }
+                    spend_arg_regs(&mut fp_arg_idx, sse_regs, fp_arg_regs.len());
+                } else if types.kind(*typ) == crate::types::TypeKind::LongDouble {
+                    // Long double is passed on the stack per System V AMD64 ABI
+                    // No XMM register move needed - already at IncomingArg offset
+                    // Don't increment fp_arg_idx - long double doesn't use XMM
+                } else if is_fp {
+                    // FP argument (float/double)
+                    if fp_arg_idx < fp_arg_regs.len() {
+                        if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id) {
+                            // Move from FP arg register to stack
+                            // From the type: a `__float128` argument
+                            // arrives as a whole XMM, and storing it
+                            // as a `double` dropped its top half.
+                            let fp_size = self.fp_format(Some(*typ), types.size_bits(*typ), types);
+                            self.push_lir(X86Inst::MovFp {
+                                size: fp_size,
+                                src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
+                                dst: XmmOperand::Mem(self.stack_mem(*offset)),
+                            });
+                        }
+                    }
+                    spend_arg_regs(&mut fp_arg_idx, 1, fp_arg_regs.len());
+                } else if types.kind(*typ) == TypeKind::Int128 && !types.is_complex(*typ) {
+                    // __int128 argument — uses TWO consecutive GP registers
+                    // Store to the arg pseudo's stack slot (allocated by regalloc)
+                    let int128_in_regs = int_arg_idx + 1 < int_arg_regs.len();
+                    let pair_start = int_arg_idx;
+                    if int128_in_regs {
+                        spend_arg_regs(&mut int_arg_idx, 2, int_arg_regs.len());
+                        if let Some(loc) = self.locations.get(pseudo.id) {
+                            // Store lo half from first GP register
+                            self.push_lir(X86Inst::Mov {
+                                size: OperandSize::B64,
+                                src: GpOperand::Reg(int_arg_regs[pair_start]),
+                                dst: GpOperand::Mem(self.int128_lo_mem_loc(&loc)),
+                            });
+                            // Store hi half from second GP register
+                            self.push_lir(X86Inst::Mov {
+                                size: OperandSize::B64,
+                                src: GpOperand::Reg(int_arg_regs[pair_start + 1]),
+                                dst: GpOperand::Mem(self.int128_hi_mem_loc(&loc)),
+                            });
+                        }
+                    } else {
+                        // Stack-passed int128: copy from incoming arg area
+                        // to the local stack slot. The allocator laid the
+                        // incoming area out and recorded where this one
+                        // landed; recomputing it here with a second
+                        // counter -- which only this arm advanced -- read
+                        // the preceding argument as soon as anything else
+                        // was stacked.
+                        let incoming_stack_offset = alloc
+                            .int128_incoming(pseudo.id)
+                            .expect("stack-passed __int128 has an incoming offset");
+                        if let Some(loc) = self.locations.get(pseudo.id) {
+                            // Load lo from incoming, store to local
+                            self.push_lir(X86Inst::Mov {
+                                size: OperandSize::B64,
+                                src: GpOperand::Mem(MemAddr::BaseOffset {
+                                    base: Reg::Rbp,
+                                    offset: incoming_stack_offset,
+                                }),
+                                dst: GpOperand::Reg(Reg::R10),
+                            });
+                            self.push_lir(X86Inst::Mov {
+                                size: OperandSize::B64,
+                                src: GpOperand::Reg(Reg::R10),
+                                dst: GpOperand::Mem(self.int128_lo_mem_loc(&loc)),
+                            });
+                            // Load hi from incoming, store to local
+                            self.push_lir(X86Inst::Mov {
+                                size: OperandSize::B64,
+                                src: GpOperand::Mem(MemAddr::BaseOffset {
+                                    base: Reg::Rbp,
+                                    offset: incoming_stack_offset + 8,
+                                }),
+                                dst: GpOperand::Reg(Reg::R10),
+                            });
+                            self.push_lir(X86Inst::Mov {
+                                size: OperandSize::B64,
+                                src: GpOperand::Reg(Reg::R10),
+                                dst: GpOperand::Mem(self.int128_hi_mem_loc(&loc)),
+                            });
+                        }
+                        // No advance here: 3.2.3 step 5 sends an
+                        // argument that does not fit to memory *whole*,
+                        // consuming no registers, so the ones it did
+                        // not fit in remain for later arguments. The
+                        // allocator applies the same rule, and the two
+                        // have to agree on which register a following
+                        // argument arrives in.
+                    }
+                } else {
+                    // Integer argument
+                    if int_arg_idx < int_arg_regs.len() {
+                        if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id) {
+                            // Move from arg register to stack
+                            self.push_lir(X86Inst::Mov {
+                                size: OperandSize::B64,
+                                src: GpOperand::Reg(int_arg_regs[int_arg_idx]),
+                                dst: GpOperand::Mem(self.stack_mem(*offset)),
+                            });
+                        }
+                    }
+                    spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
                 }
             }
         }

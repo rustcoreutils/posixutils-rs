@@ -1066,16 +1066,26 @@ impl Instruction {
     /// If a field that can hold a `PseudoId` is ever added to `Instruction`,
     /// it must be added here too, or an address escapes invisibly.
     pub fn mentions(&self, id: PseudoId) -> bool {
-        self.src.contains(&id)
-            || self.target == Some(id)
-            || self.indirect_target == Some(id)
-            || self.phi_list.iter().any(|&(_, p)| p == id)
-            || self.asm_data.as_ref().is_some_and(|d| {
-                d.inputs
-                    .iter()
-                    .chain(d.outputs.iter())
-                    .any(|c| c.pseudo == id)
-            })
+        self.mentioned().any(|p| p == id)
+    }
+
+    /// Every pseudo this instruction names, in any role, possibly repeated --
+    /// the enumeration [`Instruction::mentions`] asks about one pseudo at a
+    /// time. For a pass that needs the answer for every symbol at once, which
+    /// asking `mentions` per symbol per instruction makes quadratic.
+    pub fn mentioned(&self) -> impl Iterator<Item = PseudoId> + '_ {
+        let asm = self
+            .asm_data
+            .iter()
+            .flat_map(|d| d.inputs.iter().chain(d.outputs.iter()))
+            .map(|c| c.pseudo);
+        self.src
+            .iter()
+            .copied()
+            .chain(self.target)
+            .chain(self.indirect_target)
+            .chain(self.phi_list.iter().map(|&(_, p)| p))
+            .chain(asm)
     }
 
     /// Every pseudo this instruction reads.
@@ -2023,6 +2033,21 @@ impl Function {
                 _ => None,
             })
             .filter(|local| local.sym == sym)
+    }
+
+    /// The pseudo standing for each incoming argument, by `Arg` index -- the
+    /// first, if several claim one.
+    ///
+    /// Built once for a walk over the parameters: finding each parameter's
+    /// pseudo by scanning `pseudos` made that walk parameters x pseudos.
+    pub fn arg_pseudos(&self) -> HashMap<u32, &Pseudo> {
+        let mut by_arg = HashMap::new();
+        for pseudo in &self.pseudos {
+            if let PseudoKind::Arg(idx) = pseudo.kind {
+                by_arg.entry(idx).or_insert(pseudo);
+            }
+        }
+        by_arg
     }
 
     /// Allocate a new pseudo ID

@@ -1321,22 +1321,36 @@ impl Aarch64CodeGen {
         self.push_lir(Aarch64Inst::Brk { imm: 1 });
     }
 
+    /// Leave the frame pointer `levels` frames up in X9.
+    ///
+    /// Every c17 prologue stores the frame record `{x29, x30}` and points x29
+    /// at it, so `[x29]` is the caller's x29 and `[x29, #8]` the saved link
+    /// register: a chain that each step follows once.
+    fn emit_frame_walk(&mut self, levels: u32) {
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::X29),
+            dst: Reg::X9,
+        });
+        for _ in 0..levels {
+            self.push_lir(Aarch64Inst::Ldr {
+                size: OperandSize::B64,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::X9,
+                    offset: 0,
+                },
+                dst: Reg::X9,
+            });
+        }
+    }
+
     /// Emit __builtin_frame_address(level) - return frame pointer at given level
     pub(super) fn emit_frame_address(&mut self, insn: &Instruction) {
         let target = match insn.target {
             Some(t) => t,
             None => return,
         };
-
-        // For level 0, return the current frame pointer (x29)
-        // Use x9 as scratch register to hold the frame pointer
-        self.push_lir(Aarch64Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::X29),
-            dst: Reg::X9,
-        });
-
-        // Store result
+        self.emit_frame_walk(insn.frame_level());
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::X9, &dst_loc, 64);
     }
@@ -1347,16 +1361,17 @@ impl Aarch64CodeGen {
             Some(t) => t,
             None => return,
         };
-
-        // For level 0, return the link register (x30)
-        // Use x9 as scratch register to hold the return address
-        self.push_lir(Aarch64Inst::Mov {
+        // From the saved frame record, even at level 0: x30 itself is
+        // overwritten by any call the function has made before this point.
+        self.emit_frame_walk(insn.frame_level());
+        self.push_lir(Aarch64Inst::Ldr {
             size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::X30),
+            addr: MemAddr::BaseOffset {
+                base: Reg::X9,
+                offset: 8,
+            },
             dst: Reg::X9,
         });
-
-        // Store result
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::X9, &dst_loc, 64);
     }

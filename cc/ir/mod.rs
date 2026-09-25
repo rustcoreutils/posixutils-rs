@@ -261,8 +261,8 @@ pub enum Opcode {
     Unreachable, // Code path is never reached (undefined behavior if reached)
 
     // Stack introspection
-    FrameAddress,  // __builtin_frame_address(level) - returns frame pointer at level
-    ReturnAddress, // __builtin_return_address(level) - returns return address at level
+    FrameAddress, // __builtin_frame_address(level) - frame pointer `frame_level()` frames up
+    ReturnAddress, // __builtin_return_address(level) - return address `frame_level()` frames up
 
     // Non-local jumps (setjmp/longjmp)
     Setjmp,  // Save execution context, returns 0 or value from longjmp
@@ -820,7 +820,8 @@ pub struct Instruction {
     pub bb_true: Option<BasicBlockId>,
     /// For conditional branches: false target
     pub bb_false: Option<BasicBlockId>,
-    /// For memory ops: offset
+    /// For memory ops: offset. For `FrameAddress`/`ReturnAddress`: the level,
+    /// read through [`Instruction::frame_level`].
     pub offset: i64,
     /// For phi nodes: list of (bb, pseudo) pairs
     pub phi_list: Vec<(BasicBlockId, PseudoId)>,
@@ -1190,6 +1191,28 @@ impl Instruction {
             .with_target(target)
             .with_src(src)
             .with_type_and_size(typ, size)
+    }
+
+    /// `FrameAddress` or `ReturnAddress` for `level` frames up. The level is a
+    /// constant the parser has already evaluated, so it travels as an
+    /// immediate rather than a pseudo: the backend walks that many frame
+    /// records, which it cannot do for a run-time value.
+    pub fn frame_walk(op: Opcode, target: PseudoId, level: u32, void_ptr: TypeId) -> Self {
+        debug_assert!(matches!(op, Opcode::FrameAddress | Opcode::ReturnAddress));
+        Self::new(op)
+            .with_target(target)
+            .with_offset(i64::from(level))
+            .with_type_and_size(void_ptr, 64)
+    }
+
+    /// The level of a `FrameAddress`/`ReturnAddress` built by
+    /// [`Instruction::frame_walk`].
+    pub fn frame_level(&self) -> u32 {
+        debug_assert!(matches!(
+            self.op,
+            Opcode::FrameAddress | Opcode::ReturnAddress
+        ));
+        self.offset as u32
     }
 
     pub fn load(target: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: u32) -> Self {

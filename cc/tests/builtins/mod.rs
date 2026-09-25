@@ -17,6 +17,7 @@
 //
 
 mod bit_ops;
+mod frame_address;
 mod gnu_atomics;
 mod has_feature;
 mod intrinsics;

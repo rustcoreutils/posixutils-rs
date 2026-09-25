@@ -189,6 +189,29 @@ impl Parser<'_> {
         Ok(Self::typed_expr(kind(Box::new(arg)), typ, token_pos))
     }
 
+    /// The parenthesised level of `__builtin_frame_address` or
+    /// `__builtin_return_address`.
+    ///
+    /// It must be a non-negative integer constant: the backend walks that
+    /// many frame records, and there is no loop for a run-time count. gcc
+    /// rejects anything else with the same "invalid argument" wording.
+    fn parse_frame_level(&mut self, builtin: &str) -> ParseResult<u32> {
+        self.expect_special(b'(')?;
+        let level = self.parse_assignment_expr()?;
+        self.expect_special(b')')?;
+        self.eval_const_expr(&level)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                ParseError::new(
+                    format!(
+                        "invalid argument to '{builtin}': \
+                         the level must be a non-negative integer constant"
+                    ),
+                    level.pos,
+                )
+            })
+    }
+
     /// `fabs(x)` / `fabsf(x)`, whose opcode reads its operand at a fixed
     /// width, so the argument has to arrive already converted.
     ///
@@ -1369,14 +1392,9 @@ impl Parser<'_> {
             crate::kw::BUILTIN_FRAME_ADDRESS => Some((|| {
                 // __builtin_frame_address(level) - returns void*, address of frame at level
                 // Level 0 is the current frame, 1 is the caller's frame, etc.
-                // Returns NULL for invalid levels (beyond stack bounds)
-                self.expect_special(b'(')?;
-                let level = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
+                let level = self.parse_frame_level("__builtin_frame_address")?;
                 Ok(Self::typed_expr(
-                    ExprKind::FrameAddress {
-                        level: Box::new(level),
-                    },
+                    ExprKind::FrameAddress { level },
                     self.types.void_ptr_id,
                     token_pos,
                 ))
@@ -1384,14 +1402,9 @@ impl Parser<'_> {
             crate::kw::BUILTIN_RETURN_ADDRESS => Some((|| {
                 // __builtin_return_address(level) - returns void*, return address at level
                 // Level 0 is the current function's return address
-                // Returns NULL for invalid levels (beyond stack bounds)
-                self.expect_special(b'(')?;
-                let level = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
+                let level = self.parse_frame_level("__builtin_return_address")?;
                 Ok(Self::typed_expr(
-                    ExprKind::ReturnAddress {
-                        level: Box::new(level),
-                    },
+                    ExprKind::ReturnAddress { level },
                     self.types.void_ptr_id,
                     token_pos,
                 ))

@@ -1769,23 +1769,36 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Leave the frame pointer `levels` frames up in R10.
+    ///
+    /// Every c17 function pushes `%rbp` and points `%rbp` at it, so `(%rbp)`
+    /// is the caller's `%rbp` and `8(%rbp)` the return address: a chain of
+    /// frame records that each step follows once.
+    fn emit_frame_walk(&mut self, levels: u32) {
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rbp),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        for _ in 0..levels {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::R10,
+                    offset: 0,
+                }),
+                dst: GpOperand::Reg(Reg::R10),
+            });
+        }
+    }
+
     /// Emit __builtin_frame_address(level) - return frame pointer at given level
     pub(super) fn emit_frame_address(&mut self, insn: &Instruction) {
         let target = match insn.target {
             Some(t) => t,
             None => return,
         };
-
-        // For level 0, return the current frame pointer (rbp)
-        // For other levels, we'd need to walk the frame chain, but we simplify
-        // by always returning the current frame pointer
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::Rbp),
-            dst: GpOperand::Reg(Reg::R10),
-        });
-
-        // Store result
+        self.emit_frame_walk(insn.frame_level());
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
     }
@@ -1796,19 +1809,16 @@ impl X86_64CodeGen {
             Some(t) => t,
             None => return,
         };
-
-        // For level 0, return [rbp+8] (the saved return address)
-        // For other levels, we'd need to walk the frame chain
+        // The return address sits just above the saved frame pointer.
+        self.emit_frame_walk(insn.frame_level());
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
             src: GpOperand::Mem(MemAddr::BaseOffset {
-                base: Reg::Rbp,
+                base: Reg::R10,
                 offset: 8,
             }),
             dst: GpOperand::Reg(Reg::R10),
         });
-
-        // Store result
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
     }

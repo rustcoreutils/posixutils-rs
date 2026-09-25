@@ -4229,19 +4229,13 @@ fn test_alignof_expr_emits_setval() {
 
 #[test]
 fn test_frame_address_emits_opcode() {
-    // Test: return __builtin_frame_address(0);
+    // Test: return __builtin_frame_address(2);
     // Should emit FrameAddress opcode
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
     let void_ptr = ctx.types.void_ptr_id;
 
-    let level_expr = Expr::typed_unpositioned(ExprKind::IntLit(0), ctx.types.int_id);
-    let frame_addr_expr = Expr::typed_unpositioned(
-        ExprKind::FrameAddress {
-            level: Box::new(level_expr),
-        },
-        void_ptr,
-    );
+    let frame_addr_expr = Expr::typed_unpositioned(ExprKind::FrameAddress { level: 2 }, void_ptr);
 
     let func = FunctionDef {
         attrs: Default::default(),
@@ -4260,31 +4254,26 @@ fn test_frame_address_emits_opcode() {
     let module = ctx.linearize(&tu);
 
     let func = &module.functions[0];
-    let has_frame_addr = func
+    // The level travels as an immediate, not as a source pseudo.
+    let insn = func
         .blocks
         .iter()
-        .any(|bb| bb.insns.iter().any(|insn| insn.op == Opcode::FrameAddress));
-    assert!(
-        has_frame_addr,
-        "__builtin_frame_address should emit FrameAddress opcode"
-    );
+        .flat_map(|bb| bb.insns.iter())
+        .find(|insn| insn.op == Opcode::FrameAddress)
+        .expect("__builtin_frame_address should emit FrameAddress opcode");
+    assert_eq!(insn.frame_level(), 2);
+    assert!(insn.src.is_empty());
 }
 
 #[test]
 fn test_return_address_emits_opcode() {
-    // Test: return __builtin_return_address(0);
+    // Test: return __builtin_return_address(2);
     // Should emit ReturnAddress opcode
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
     let void_ptr = ctx.types.void_ptr_id;
 
-    let level_expr = Expr::typed_unpositioned(ExprKind::IntLit(0), ctx.types.int_id);
-    let return_addr_expr = Expr::typed_unpositioned(
-        ExprKind::ReturnAddress {
-            level: Box::new(level_expr),
-        },
-        void_ptr,
-    );
+    let return_addr_expr = Expr::typed_unpositioned(ExprKind::ReturnAddress { level: 2 }, void_ptr);
 
     let func = FunctionDef {
         attrs: Default::default(),
@@ -4303,14 +4292,14 @@ fn test_return_address_emits_opcode() {
     let module = ctx.linearize(&tu);
 
     let func = &module.functions[0];
-    let has_return_addr = func
+    let insn = func
         .blocks
         .iter()
-        .any(|bb| bb.insns.iter().any(|insn| insn.op == Opcode::ReturnAddress));
-    assert!(
-        has_return_addr,
-        "__builtin_return_address should emit ReturnAddress opcode"
-    );
+        .flat_map(|bb| bb.insns.iter())
+        .find(|insn| insn.op == Opcode::ReturnAddress)
+        .expect("__builtin_return_address should emit ReturnAddress opcode");
+    assert_eq!(insn.frame_level(), 2);
+    assert!(insn.src.is_empty());
 }
 
 // Mixed designated + positional initializer field tracking

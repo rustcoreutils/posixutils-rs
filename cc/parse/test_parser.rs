@@ -5911,3 +5911,33 @@ fn test_static_object_larger_than_a_frame_slot_is_accepted() {
         }
     }
 }
+
+/// The level of `__builtin_frame_address`/`__builtin_return_address` is folded
+/// at parse time, so the AST carries the number of frames to walk rather than
+/// an expression the backend would have to evaluate.
+#[test]
+fn test_frame_builtin_level_is_a_parsed_constant() {
+    let (expr, ..) = parse_expr("__builtin_return_address(1 + 1)").unwrap();
+    assert!(matches!(expr.kind, ExprKind::ReturnAddress { level: 2 }));
+    let (expr, ..) = parse_expr("__builtin_frame_address(0)").unwrap();
+    assert!(matches!(expr.kind, ExprKind::FrameAddress { level: 0 }));
+}
+
+/// gcc rejects a level that is not a non-negative integer constant.
+#[test]
+fn test_frame_builtin_level_must_be_constant() {
+    for src in [
+        "__builtin_return_address(n)",
+        "__builtin_frame_address(n)",
+        "__builtin_return_address(-1)",
+    ] {
+        match parse_expr_with_vars(src, &["n"]) {
+            Err(err) => assert!(
+                err.message.contains("invalid argument"),
+                "{src}: {}",
+                err.message
+            ),
+            Ok(_) => panic!("{src} should be rejected"),
+        }
+    }
+}

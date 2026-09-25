@@ -5230,27 +5230,25 @@ impl<'a> Linearizer<'a> {
             }
 
             ExprKind::FrameAddress { level } => {
-                // __builtin_frame_address(level) - returns frame pointer at given level
-                let level_val = self.linearize_expr(level);
                 let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::FrameAddress)
-                    .with_target(result)
-                    .with_src(level_val)
-                    .with_type_and_size(self.types.void_ptr_id, 64);
+                let insn = Instruction::frame_walk(
+                    Opcode::FrameAddress,
+                    result,
+                    *level,
+                    self.types.void_ptr_id,
+                );
                 self.emit(insn);
                 result
             }
 
             ExprKind::ReturnAddress { level } => {
-                // __builtin_return_address(level) - returns return address at given level
-                let level_val = self.linearize_expr(level);
                 let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::ReturnAddress)
-                    .with_target(result)
-                    .with_src(level_val)
-                    .with_type_and_size(self.types.void_ptr_id, 64);
+                let insn = Instruction::frame_walk(
+                    Opcode::ReturnAddress,
+                    result,
+                    *level,
+                    self.types.void_ptr_id,
+                );
                 self.emit(insn);
                 result
             }

@@ -738,16 +738,19 @@ pub enum ExprKind {
 
     /// __builtin_frame_address(level)
     /// Returns the frame pointer address at the given level.
-    /// Level 0 is the current frame, 1 is the caller's frame, etc.
+    /// Level 0 is the current frame, 1 is the caller's frame, etc. The level
+    /// is an integer constant, as gcc requires; it is how many frame records
+    /// the backend walks.
     FrameAddress {
-        level: Box<Expr>,
+        level: u32,
     },
 
     /// __builtin_return_address(level)
     /// Returns the return address at the given level.
-    /// Level 0 is the current function's return address.
+    /// Level 0 is the current function's return address. An integer constant,
+    /// as for `FrameAddress`.
     ReturnAddress {
-        level: Box<Expr>,
+        level: u32,
     },
 
     // =========================================================================

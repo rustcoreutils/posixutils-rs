@@ -1728,6 +1728,18 @@ impl BasicBlock {
         }
     }
 
+    /// Add successors, each once, in order: `add_child` for each, without its
+    /// scan of the existing edges per addition.
+    pub fn add_children(&mut self, children: impl IntoIterator<Item = BasicBlockId>) {
+        let mut seen: std::collections::HashSet<BasicBlockId> =
+            self.children.iter().copied().collect();
+        for child in children {
+            if seen.insert(child) {
+                self.children.push(child);
+            }
+        }
+    }
+
     /// Remove edges to/from blocks not in the keep set
     pub fn retain_edges(&mut self, keep: &std::collections::HashSet<BasicBlockId>) {
         self.parents.retain(|p| keep.contains(p));
@@ -2741,6 +2753,19 @@ mod tests {
     use crate::abi::{ArgClass, RegClass};
     use crate::target::Target;
     use crate::types::{Type, TypeTable};
+
+    /// `add_children` adds each successor once, in order, as `add_child` does.
+    #[test]
+    fn test_add_children_matches_add_child() {
+        let mut bulk = BasicBlock::new(BasicBlockId(0));
+        bulk.add_child(BasicBlockId(3));
+        bulk.add_children([3, 1, 2, 1, 4].map(BasicBlockId));
+        let mut single = BasicBlock::new(BasicBlockId(0));
+        for id in [3, 3, 1, 2, 1, 4] {
+            single.add_child(BasicBlockId(id));
+        }
+        assert_eq!(bulk.children, single.children);
+    }
 
     #[test]
     fn test_opcode_is_terminator() {

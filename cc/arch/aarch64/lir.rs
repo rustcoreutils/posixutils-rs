@@ -492,6 +492,21 @@ pub enum Aarch64Inst {
         target: Label,
     },
 
+    /// A `BCond` whose target is past the +-1 MiB `b.cond` reaches: the
+    /// inverse condition skips an unconditional `b`, which reaches +-128 MiB.
+    /// Only `relax.rs` builds it, in place of the `BCond` it replaces.
+    BCondFar {
+        cond: CondCode,
+        target: Label,
+    },
+
+    /// A `Cbnz` past its +-1 MiB range, relaxed the same way: `cbz` over `b`.
+    CbnzFar {
+        size: OperandSize,
+        src: Reg,
+        target: Label,
+    },
+
     /// BL - Branch with link (function call)
     Bl {
         target: CallTarget<Reg>,
@@ -1105,6 +1120,20 @@ impl EmitAsm for Aarch64Inst {
             Aarch64Inst::Cbnz { size, src, target } => {
                 let sz = size.bits().max(32);
                 let _ = writeln!(out, "    cbnz {}, {}", src.name_for_size(sz), target.name());
+            }
+
+            // `.+8` is the instruction after the `b`: the skip needs no label
+            // of its own, and both GNU as and Apple's assembler accept it.
+            Aarch64Inst::BCondFar { cond, target: lbl } => {
+                let inverse = cond.inverse().aarch64_suffix();
+                let _ = writeln!(out, "    b.{} .+8", inverse);
+                let _ = writeln!(out, "    b {}", lbl.name());
+            }
+
+            Aarch64Inst::CbnzFar { size, src, target } => {
+                let sz = size.bits().max(32);
+                let _ = writeln!(out, "    cbz {}, .+8", src.name_for_size(sz));
+                let _ = writeln!(out, "    b {}", target.name());
             }
 
             Aarch64Inst::Bl {

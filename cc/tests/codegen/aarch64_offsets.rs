@@ -10,7 +10,7 @@
 // add/sub immediates past what one instruction can hold.
 //
 
-use crate::common::compile_and_run_aarch64;
+use crate::common::{compile_and_run, compile_and_run_aarch64};
 
 /// Every class of access the aarch64 backend emitted with an immediate no
 /// instruction encodes. A load or store reaches 4095 elements of its own
@@ -385,4 +385,123 @@ fn aarch64_spilled_inline_asm_memory_operand_shape() {
     assert!(asm.contains("str xzr, [x29, #"), "{asm}");
     assert!(!asm.contains("ldrb w9, [x29"), "{asm}");
     assert!(asm.contains("ldrb w9, [x"), "{asm}");
+}
+
+/// A switch of contiguous cases lowered as a compare chain: the first
+/// `b.eq`s are more than 1 MiB from the blocks they reach, past the +-1 MiB a
+/// conditional branch encodes, and GNU as rejected the output ("conditional
+/// branch out of range"), as it did gcc's `compile/limits-caselabels`.
+/// Relaxation turns each far one into the inverse condition over a `b`. The
+/// values start past 65535 so every compare needs `movz`+`movk`, which is
+/// what makes the chain long enough. It also runs on the host, where the
+/// same switch used to take five seconds to compile.
+fn contiguous_switch_source() -> String {
+    const LO: u64 = 100_000;
+    const N: u64 = 70_000;
+    let cases: Vec<String> = (LO..LO + N).map(|v| format!("    case {v}:")).collect();
+    format!(
+        "__attribute__((noinline)) int in_range(long i)
+{{
+    switch (i) {{
+{}
+                 return 1;
+    }}
+    return 0;
+}}
+         int main(void)
+{{
+         if (in_range({}) != 0) return 1;
+         if (in_range({}) != 1) return 2;
+         if (in_range({}) != 1) return 3;
+         if (in_range({}) != 1) return 4;
+         if (in_range({}) != 0) return 5;
+         return 0;
+}}
+",
+        cases.join(
+            "
+"
+        ),
+        LO - 1,
+        LO,
+        LO + N / 2,
+        LO + N - 1,
+        LO + N,
+    )
+}
+
+#[test]
+fn aarch64_far_conditional_branches_are_relaxed() {
+    let src = contiguous_switch_source();
+    assert_eq!(compile_and_run("contiguous_switch", &src, &[]), 0);
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64("a64_contiguous_switch", &src, opt) {
+            assert_eq!(code, 0, "at {opt}");
+        }
+    }
+}
+
+/// Conditional branches across 1.2 MB of code, forwards and backwards.
+///
+/// c17 lays an `if` or a loop out as a short conditional branch to the
+/// adjacent block plus an unconditional `b`, so today none of these is far;
+/// this guards that property against a block-layout change, and the padding
+/// arrives as inline-assembly text, which relaxation has to size. gcc cannot
+/// build it -- it sizes an asm statement by counting its lines, so the
+/// `.skip` defeats it -- and was checked with the padding made small.
+const FAR_BRANCHES: &str = r#"
+#define NI __attribute__((noinline))
+/* 1.2 MB of code the program jumps over, so the conditional branches around
+   and back across it are out of b.cond / cbnz range. */
+#define FAR __asm__ volatile("b 1f\n\t.skip 1200000\n1:")
+volatile long sink;
+NI long forward(long x)
+{
+    long r = 0;
+    if (x > 3) {
+        FAR;
+        r = x * 2;
+    }
+    return r + 1;
+}
+NI long backward(long n)
+{
+    long s = 0;
+    for (long i = 0; i < n; i++) {
+        s += i;
+        FAR;
+        sink = s;
+    }
+    return s;
+}
+NI long both(long n)
+{
+    long s = 0;
+    while (n > 0) {
+        if (n & 1) {
+            FAR;
+            s += n;
+        }
+        n--;
+        FAR;
+    }
+    return s;
+}
+int main(void)
+{
+    if (forward(1) != 1) return 1;
+    if (forward(5) != 11) return 2;
+    if (backward(4) != 6) return 3;
+    if (both(5) != 9) return 4;
+    return 0;
+}
+"#;
+
+#[test]
+fn aarch64_branches_across_a_megabyte_of_code() {
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64("a64_far_branches", FAR_BRANCHES, opt) {
+            assert_eq!(code, 0, "at {opt}");
+        }
+    }
 }

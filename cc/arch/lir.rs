@@ -249,6 +249,29 @@ pub enum CondCode {
 }
 
 impl CondCode {
+    /// The condition that holds exactly when this one does not.
+    ///
+    /// Each pair tests complementary flag states on both targets -- `lt` is
+    /// N!=V and `ge` is N==V, `vs` is V set and `vc` V clear -- so the
+    /// inverse is correct after a floating compare too, where an unordered
+    /// result satisfies one of each pair and never both.
+    pub fn inverse(self) -> CondCode {
+        match self {
+            CondCode::Eq => CondCode::Ne,
+            CondCode::Ne => CondCode::Eq,
+            CondCode::Slt => CondCode::Sge,
+            CondCode::Sge => CondCode::Slt,
+            CondCode::Sle => CondCode::Sgt,
+            CondCode::Sgt => CondCode::Sle,
+            CondCode::Ult => CondCode::Uge,
+            CondCode::Uge => CondCode::Ult,
+            CondCode::Ule => CondCode::Ugt,
+            CondCode::Ugt => CondCode::Ule,
+            CondCode::Np => CondCode::P,
+            CondCode::P => CondCode::Np,
+        }
+    }
+
     /// x86-64 condition suffix (e, ne, l, le, g, ge, b, be, a, ae)
     pub fn x86_suffix(&self) -> &'static str {
         match self {

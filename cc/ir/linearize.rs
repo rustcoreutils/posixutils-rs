@@ -772,6 +772,30 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Link `from` to each of `targets`, as `link_bb` does one at a time.
+    ///
+    /// For a block with very many successors -- a switch's dispatch -- where
+    /// adding them singly checked each against every edge already there.
+    pub(crate) fn link_bb_many(
+        &mut self,
+        from: BasicBlockId,
+        targets: impl IntoIterator<Item = BasicBlockId>,
+    ) {
+        let targets: Vec<BasicBlockId> = targets.into_iter().collect();
+        let func = self.current_func.as_mut().unwrap();
+        if let Some(from_bb) = func.get_block_mut(from) {
+            from_bb.add_children(targets.iter().copied());
+        }
+        for to in targets {
+            if func.get_block(to).is_none() {
+                func.add_block(BasicBlock::new(to));
+            }
+            if let Some(to_bb) = func.get_block_mut(to) {
+                to_bb.add_parent(from);
+            }
+        }
+    }
+
     /// Link two basic blocks (parent -> child)
     pub(crate) fn link_bb(&mut self, from: BasicBlockId, to: BasicBlockId) {
         let func = self.current_func.as_mut().unwrap();

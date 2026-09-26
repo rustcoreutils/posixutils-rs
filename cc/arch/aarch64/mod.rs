@@ -23,6 +23,7 @@ pub mod macros;
 pub(crate) mod mapping;
 mod memory;
 pub mod regalloc;
+mod relax;
 
 pub use macros::get_macros;
 

@@ -1535,9 +1535,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             // Link CFG edges from current block to all case/default/exit blocks
             if let Some(current) = self.current_bb {
-                for &(_, _, bb) in &switch_cases {
-                    self.link_bb(current, bb);
-                }
+                self.link_bb_many(current, switch_cases.iter().map(|&(_, _, bb)| bb));
                 self.link_bb(current, default_target);
                 if default_bb.is_none() {
                     self.link_bb(current, exit_bb);
@@ -1555,7 +1553,14 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.current_bb = None;
 
         // Linearize body with case block switching
-        self.linearize_switch_body(body, &case_values, &case_bbs, default_bb);
+        // Each label's position among the cases, by its range. The first wins,
+        // as a scan in source order would find it; a duplicate has already
+        // been reported.
+        let mut case_index = CaseIndex::new();
+        for (idx, range) in case_values.iter().enumerate() {
+            case_index.entry(*range).or_insert(idx);
+        }
+        self.linearize_switch_body(body, &case_index, &case_bbs, default_bb);
 
         // If not terminated after body, jump to exit
         if !self.is_terminated() {
@@ -1584,7 +1589,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         body: &Stmt,
         unsigned: bool,
     ) -> (Vec<(i128, i128)>, bool) {
-        let mut case_values = Vec::new();
+        let mut case_values = CaseSet::new(unsigned);
         let mut has_default = false;
 
         match body {
@@ -1605,7 +1610,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         }
 
-        (case_values, has_default)
+        (case_values.ranges, has_default)
     }
 
     /// The block every computed `goto` in this function branches through,
@@ -1764,7 +1769,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn collect_cases_from_stmt(
         &self,
         stmt: &Stmt,
-        case_values: &mut Vec<(i128, i128)>,
+        case_values: &mut CaseSet,
         has_default: &mut bool,
         unsigned: bool,
     ) {
@@ -1810,18 +1815,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                             a < b
                         }
                     };
-                    let at_most = |a: i128, b: i128| !below(b, a);
                     if below(hi, val) {
                         // GCC accepts an empty range, warns, and never matches
                         // it. Nothing is recorded, so nothing can overlap it.
                         crate::diag::warning(expr.pos, "empty range specified");
                         return;
                     }
-                    if let Some((lo2, hi2)) = case_values
-                        .iter()
-                        .find(|(lo2, hi2)| at_most(val, *hi2) && at_most(*lo2, hi))
-                        .copied()
-                    {
+                    if let Some((lo2, hi2)) = case_values.overlap(val, hi) {
                         let what = if val == hi && lo2 == hi2 {
                             format!("duplicate case value '{}' in switch", val)
                         } else {
@@ -1832,7 +1832,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         };
                         error(expr.pos, &what);
                     }
-                    case_values.push((val, hi));
+                    case_values.insert(val, hi);
                 } else if self.expr_is_runtime(expr) {
                     // A non-constant label can never match.
                     error(expr.pos, "case label is not an integer constant expression");
@@ -2435,7 +2435,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_switch_body(
         &mut self,
         body: &Stmt,
-        case_values: &[(i128, i128)],
+        case_values: &CaseIndex,
         case_bbs: &[BasicBlockId],
         default_bb: Option<BasicBlockId>,
     ) {
@@ -2476,7 +2476,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_switch_stmt(
         &mut self,
         stmt: &Stmt,
-        case_values: &[(i128, i128)],
+        case_values: &CaseIndex,
         case_bbs: &[BasicBlockId],
         default_bb: Option<BasicBlockId>,
         case_idx: &mut usize,
@@ -2496,7 +2496,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         Some(hi_expr) => self.eval_const_expr(hi_expr),
                     };
                     let Some(hi) = hi else { return };
-                    if let Some(idx) = case_values.iter().position(|r| *r == (lo, hi)) {
+                    if let Some(&idx) = case_values.get(&(lo, hi)) {
                         let case_bb = case_bbs[idx];
 
                         // Fall through from previous case if not terminated
@@ -3703,5 +3703,93 @@ impl AddrWalk<'_> {
             .typ
             .and_then(|t| self.types.base_type(t))
             .is_some_and(|t| self.types.kind(t) != TypeKind::Function)
+    }
+}
+
+/// Each case range's position among a switch's labels.
+pub(crate) type CaseIndex = std::collections::HashMap<(i128, i128), usize>;
+
+/// A switch's case ranges, in source order, with an index that finds an
+/// overlap in logarithmic time.
+///
+/// Checking each new label against every earlier one made a switch
+/// quadratic in its case count: 70,000 labels took five seconds to compile
+/// and gcc's `limits-caselabels` eleven.
+pub(crate) struct CaseSet {
+    /// The ranges `(lo, hi)`, in the order the labels were written.
+    ranges: Vec<(i128, i128)>,
+    /// Each range by its low end, as an order-preserving key, to its high end.
+    by_lo: std::collections::BTreeMap<i128, (i128, i128, i128)>,
+    unsigned: bool,
+}
+
+impl CaseSet {
+    fn new(unsigned: bool) -> Self {
+        Self {
+            ranges: Vec::new(),
+            by_lo: std::collections::BTreeMap::new(),
+            unsigned,
+        }
+    }
+
+    /// `v` as a signed key ordered the way the switch's type orders it: an
+    /// unsigned value has its top bit flipped, which maps unsigned order onto
+    /// signed order.
+    fn key(&self, v: i128) -> i128 {
+        if self.unsigned {
+            v ^ i128::MIN
+        } else {
+            v
+        }
+    }
+
+    /// An earlier range sharing a value with `lo..=hi`, if any.
+    ///
+    /// The ranges recorded are disjoint -- an overlap is an error -- so the
+    /// only candidate is the one starting last at or before `hi`.
+    fn overlap(&self, lo: i128, hi: i128) -> Option<(i128, i128)> {
+        let (_, &(hi_key, lo2, hi2)) = self.by_lo.range(..=self.key(hi)).next_back()?;
+        (hi_key >= self.key(lo)).then_some((lo2, hi2))
+    }
+
+    fn insert(&mut self, lo: i128, hi: i128) {
+        self.ranges.push((lo, hi));
+        let (lo_key, hi_key) = (self.key(lo), self.key(hi));
+        self.by_lo.insert(lo_key, (hi_key, lo, hi));
+    }
+}
+
+#[cfg(test)]
+mod case_set_tests {
+    use super::CaseSet;
+
+    #[test]
+    fn overlap_finds_the_range_sharing_a_value() {
+        let mut set = CaseSet::new(false);
+        set.insert(-10, -5);
+        set.insert(0, 0);
+        set.insert(10, 20);
+        assert_eq!(set.overlap(-7, -7), Some((-10, -5)));
+        assert_eq!(set.overlap(-4, -1), None);
+        assert_eq!(set.overlap(-1, 1), Some((0, 0)));
+        assert_eq!(set.overlap(5, 9), None);
+        assert_eq!(set.overlap(5, 10), Some((10, 20)));
+        assert_eq!(set.overlap(20, 30), Some((10, 20)));
+        assert_eq!(set.overlap(21, 30), None);
+        assert_eq!(set.ranges, [(-10, -5), (0, 0), (10, 20)]);
+    }
+
+    /// Unsigned order: a value above `i64::MAX`, carried in an `i128` as a
+    /// negative 128-bit pattern for `unsigned __int128`, still sorts above
+    /// every small one.
+    #[test]
+    fn overlap_orders_by_the_switch_type_signedness() {
+        let big = u128::MAX as i128; // -1 as i128, the largest unsigned value
+        let mut set = CaseSet::new(true);
+        set.insert(1, 5);
+        set.insert(big - 10, big);
+        assert_eq!(set.overlap(big - 3, big - 3), Some((big - 10, big)));
+        assert_eq!(set.overlap(6, 100), None);
+        assert_eq!(set.overlap(0, 1), Some((1, 5)));
     }
 }

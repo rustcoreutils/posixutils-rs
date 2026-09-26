@@ -119,6 +119,9 @@ impl Aarch64CodeGen {
 
         // Emit function header (directives, label, CFI start)
         self.emit_function_header(func);
+        // The function's code begins here, after the header's section and
+        // symbol directives; branch relaxation measures from this point.
+        let first_inst = self.base.lir_buffer.len();
 
         // Emit prologue (save fp/lr, callee-saved regs, allocate stack)
         self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
@@ -274,6 +277,10 @@ impl Aarch64CodeGen {
         // `.size f, .-f`: without it the symbol records st_size = 0 and a
         // debugger cannot tell which function owns an address inside it.
         self.push_lir(Aarch64Inst::Directive(Directive::size_to_here(&func.name)));
+
+        // Only now is every branch and label of the function in place.
+        let base = &mut self.base;
+        super::relax::relax_branches(&mut base.lir_buffer[first_inst..], &base.target);
     }
 
     /// Record what `-g` has to say about this function.

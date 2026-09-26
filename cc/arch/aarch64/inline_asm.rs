@@ -17,35 +17,41 @@ use crate::arch::aarch64::regalloc::{parse_gp_clobber_name, Loc, Reg, VReg};
 use crate::arch::lir::{Directive, FpSize, OperandSize};
 use crate::ir::{Instruction, PseudoId};
 
-/// How a memory operand's address reaches the register it is named by.
-enum AddrSetup {
+/// What goes in a scratch register before the template: a memory operand's
+/// address, or the value of a register operand the allocator gave no register.
+enum OperandSetup {
     /// `reg = base + offset`: the operand *is* this stack object.
     Object { base: Reg, offset: i32 },
     /// `reg = [slot]`: the operand's address was spilled there.
     Spilled(MemAddr),
     /// `reg = &name`.
     Global(String),
+    /// `reg = value of pseudo`, wherever it lives.
+    Value { pseudo: PseudoId, size: u32 },
+    /// `reg = constant`, for a register-only operand whose value is one.
+    Imm(i64),
 }
 
-/// The registers a memory operand's address can be put in, and what goes in
-/// each, for one asm statement.
+/// The scratch registers an asm statement can hand an operand that needs one,
+/// and what goes in each.
 ///
 /// X16 and X17 first -- AAPCS64 intra-procedure scratch -- then whichever of
 /// the codegen scratches X9-X11 the statement has not already spent, then
-/// X15, the legalization register. None is ever allocated, so none holds an
-/// operand. X15 goes last and its setup is emitted last, because the
-/// legalizer writes it while expanding any earlier setup. A register the
-/// statement names as a clobber is not used: the template would destroy the
-/// address it reads.
-struct AddrRegs {
+/// X15, the legalization register. None is ever allocated, so none holds a
+/// live value or another operand. X15 goes last and its setup is emitted
+/// last, because the legalizer writes it while expanding any earlier setup;
+/// for the same reason an output never gets it, since its store back after the
+/// template may itself need legalizing. A register the statement names as a
+/// clobber is not used: the template would destroy what it holds.
+struct OperandRegs {
     clobbered: Vec<Reg>,
     ip: Vec<Reg>,
     legalize_reg_free: bool,
     given: Vec<(PseudoId, Reg)>,
-    setups: Vec<(Reg, AddrSetup)>,
+    setups: Vec<(Reg, OperandSetup)>,
 }
 
-impl AddrRegs {
+impl OperandRegs {
     fn new(clobbers: &[String]) -> Self {
         let clobbered: Vec<Reg> = clobbers
             .iter()
@@ -65,9 +71,10 @@ impl AddrRegs {
         }
     }
 
-    /// The next register to hold an address, spending `gp_scratch` -- the
-    /// statement's shared codegen-scratch budget -- only after X16/X17.
-    fn take(&mut self, gp_scratch: &mut Vec<Reg>) -> Option<Reg> {
+    /// The next free scratch register, spending `gp_scratch` -- the
+    /// statement's shared codegen-scratch budget -- only after X16/X17, and
+    /// X15 last and only when `legalize_reg_ok`.
+    fn take(&mut self, gp_scratch: &mut Vec<Reg>, legalize_reg_ok: bool) -> Option<Reg> {
         if let Some(r) = self.ip.pop() {
             return Some(r);
         }
@@ -76,7 +83,10 @@ impl AddrRegs {
                 return Some(r);
             }
         }
-        std::mem::take(&mut self.legalize_reg_free).then_some(LEGALIZE_REG)
+        if legalize_reg_ok {
+            return std::mem::take(&mut self.legalize_reg_free).then_some(LEGALIZE_REG);
+        }
+        None
     }
 }
 
@@ -184,8 +194,11 @@ impl Aarch64CodeGen {
         let mut vec_output_moves: Vec<(VReg, Loc, u32)> = Vec::new();
         // Vector operands copied into their scratch before it.
         let mut vec_input_moves: Vec<(VReg, Loc, u32)> = Vec::new();
-        // Memory operands whose address has to be put in a register first.
-        let mut addr_regs = AddrRegs::new(&asm_data.clobbers);
+        // Operands that have to be put in a scratch register first.
+        let mut addr_regs = OperandRegs::new(&asm_data.clobbers);
+        // Register outputs the allocator gave no register: written by the
+        // template into a scratch, stored back after it.
+        let mut gp_output_moves: Vec<(Reg, Loc, u32)> = Vec::new();
 
         // Process output operands (they go first: %0, %1, etc.)
         for output in &asm_data.outputs {
@@ -235,6 +248,34 @@ impl Aarch64CodeGen {
                 Loc::Reg(r) => {
                     slots.push(mk(Some(r), None));
                 }
+                // A register output the allocator gave no register: the
+                // template writes a scratch, stored back once it has run.
+                // Rendering the slot instead named memory where the template
+                // wants a register (`mov [x29, #104], #0`).
+                Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Global(_)
+                    if !requires_mem && Self::constraint_requires_reg_class(&output.constraint) =>
+                {
+                    let Some(reg) = addr_regs.take(&mut gp_scratch, false) else {
+                        crate::diag::error(
+                            insn.pos.unwrap_or_default(),
+                            "too many register operands in one asm statement; \
+                             c17 has no register left to give one",
+                        );
+                        slots.push(mk(Some(Reg::X9), None));
+                        continue;
+                    };
+                    slots.push(mk(Some(reg), None));
+                    gp_output_moves.push((reg, loc.clone(), op_size));
+                    if output.constraint.contains('+') {
+                        addr_regs.setups.push((
+                            reg,
+                            OperandSetup::Value {
+                                pseudo: output.pseudo,
+                                size: op_size,
+                            },
+                        ));
+                    }
+                }
                 _ if requires_mem => {
                     let mem_str = self.memory_operand(
                         output.pseudo,
@@ -259,8 +300,41 @@ impl Aarch64CodeGen {
         // Whether V16 has already been spent materializing a floating
         // constant for a vector-class constraint. There is only the one.
 
+        // The hidden inputs of `"+"` outputs, numbered after every explicit
+        // input -- see `AsmConstraint::is_hidden_readwrite_input`. Numbering
+        // one in place made `%1` in `"add %0, %0, %1" : "+r"(t) : "r"(b)`
+        // name `t` again rather than `b`. It needs no setup of its own: its
+        // output's slot already holds the value, the address, or the vector
+        // move.
+        let mut hidden: Vec<usize> = Vec::new();
+
         // Process input operands
         for input in &asm_data.inputs {
+            if let Some(match_idx) = input.matching_output {
+                if match_idx < num_outputs && input.is_hidden_readwrite_input() {
+                    hidden.push(match_idx);
+                    continue;
+                }
+                // An explicit tied input (`"0"`) names its output's operand:
+                // the same register, holding the input's value -- which the
+                // linearizer put in the output's own pseudo. When that output
+                // was given a scratch, the value has to be loaded into it.
+                if match_idx < num_outputs && slots[match_idx].reg.is_some() {
+                    let mut slot = slots[match_idx].clone();
+                    slot.name = input.name.clone();
+                    if let Some(&(reg, _, size)) = gp_output_moves
+                        .iter()
+                        .find(|(r, _, _)| Some(*r) == slots[match_idx].reg)
+                    {
+                        let pseudo = asm_data.outputs[match_idx].pseudo;
+                        addr_regs
+                            .setups
+                            .push((reg, OperandSetup::Value { pseudo, size }));
+                    }
+                    slots.push(slot);
+                    continue;
+                }
+            }
             // Handle matching constraints - use the matched output's location
             let loc = if let Some(match_idx) = input.matching_output {
                 if match_idx < num_outputs {
@@ -288,6 +362,22 @@ impl Aarch64CodeGen {
                 }
                 Loc::Reg(r) => {
                     slots.push(mk(Some(r), None));
+                }
+                // A constant under a register-only constraint still goes in a
+                // register: the template may use it where no immediate
+                // encodes (`add x0, #100, #100`).
+                Loc::Imm(v) if !Self::constraint_allows_immediate(&input.constraint) => {
+                    let Some(reg) = addr_regs.take(&mut gp_scratch, true) else {
+                        crate::diag::error(
+                            insn.pos.unwrap_or_default(),
+                            "too many register operands in one asm statement; \
+                             c17 has no register left to give one",
+                        );
+                        slots.push(mk(Some(Reg::X9), None));
+                        continue;
+                    };
+                    addr_regs.setups.push((reg, OperandSetup::Imm(v as i64)));
+                    slots.push(mk(Some(reg), None));
                 }
                 Loc::Imm(v) => {
                     // Immediate value
@@ -402,6 +492,29 @@ impl Aarch64CodeGen {
                     });
                     slots.push(mk(Some(scratch), None));
                 }
+                // A register input the allocator gave no register: loaded into
+                // a scratch before the template.
+                Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Global(_)
+                    if !requires_mem && Self::constraint_requires_reg_class(&input.constraint) =>
+                {
+                    let Some(reg) = addr_regs.take(&mut gp_scratch, true) else {
+                        crate::diag::error(
+                            insn.pos.unwrap_or_default(),
+                            "too many register operands in one asm statement; \
+                             c17 has no register left to give one",
+                        );
+                        slots.push(mk(Some(Reg::X9), None));
+                        continue;
+                    };
+                    addr_regs.setups.push((
+                        reg,
+                        OperandSetup::Value {
+                            pseudo: input.pseudo,
+                            size: op_size,
+                        },
+                    ));
+                    slots.push(mk(Some(reg), None));
+                }
                 _ if requires_mem => {
                     // A `+m` input shares its output's pseudo, and so its
                     // address register.
@@ -427,6 +540,11 @@ impl Aarch64CodeGen {
             }
         }
 
+        for idx in hidden {
+            let slot = slots[idx].clone();
+            slots.push(slot);
+        }
+
         // Convert goto_labels from (BasicBlockId, String) to (label_string, label_name)
         let goto_labels_formatted: Vec<(String, String)> = asm_data
             .goto_labels
@@ -444,12 +562,12 @@ impl Aarch64CodeGen {
             self.emit_vec_load_from_loc(*vreg, loc, *size, insn.pos);
         }
 
-        // Memory operands' addresses, last: nothing may run between these and
-        // the template, since the legalizer writes X15 expanding anything.
+        // Scratch operands, last: nothing may run between these and the
+        // template, since the legalizer writes X15 expanding anything.
         let mut setups = std::mem::take(&mut addr_regs.setups);
         setups.sort_by_key(|(reg, _)| *reg == LEGALIZE_REG);
         for (reg, setup) in setups {
-            self.emit_addr_setup(reg, setup);
+            self.emit_operand_setup(reg, setup);
         }
 
         // Substitute %0, %1, %[name], %l0, %l[name], etc. in the template with actual operands
@@ -463,6 +581,20 @@ impl Aarch64CodeGen {
             if !trimmed.is_empty() {
                 self.push_lir(Aarch64Inst::Directive(Directive::Raw(trimmed.to_string())));
             }
+        }
+
+        // Register outputs held in a scratch go back where they live. Only on
+        // the fall-through: a jump to an `asm goto` label skips these, so
+        // such a statement must not need any.
+        if !gp_output_moves.is_empty() && !asm_data.goto_labels.is_empty() {
+            crate::diag::error(
+                insn.pos.unwrap_or_default(),
+                "an asm goto output needs a register of its own, and this statement \
+                 has more register operands than c17 can give them",
+            );
+        }
+        for (reg, loc, size) in &gp_output_moves {
+            self.emit_move_to_loc(*reg, loc, *size);
         }
 
         // Copy vector outputs out of their scratch into where the operand
@@ -507,7 +639,7 @@ impl Aarch64CodeGen {
         pseudo: PseudoId,
         loc: &Loc,
         size_bits: u32,
-        regs: &mut AddrRegs,
+        regs: &mut OperandRegs,
         gp_scratch: &mut Vec<Reg>,
         insn: &Instruction,
     ) -> String {
@@ -526,13 +658,15 @@ impl Aarch64CodeGen {
                 if fits {
                     return self.loc_to_asm_string(loc, size_bits);
                 }
-                AddrSetup::Object { base, offset }
+                OperandSetup::Object { base, offset }
             }
-            Loc::Stack(_) | Loc::IncomingArg(_) => AddrSetup::Spilled(self.loc_mem(loc).unwrap()),
-            Loc::Global(name) => AddrSetup::Global(name.clone()),
+            Loc::Stack(_) | Loc::IncomingArg(_) => {
+                OperandSetup::Spilled(self.loc_mem(loc).unwrap())
+            }
+            Loc::Global(name) => OperandSetup::Global(name.clone()),
             other => return self.loc_to_asm_string(other, size_bits),
         };
-        let Some(reg) = regs.take(gp_scratch) else {
+        let Some(reg) = regs.take(gp_scratch, true) else {
             crate::diag::error(
                 insn.pos.unwrap_or_default(),
                 "too many memory operands in one asm statement need their address \
@@ -546,21 +680,23 @@ impl Aarch64CodeGen {
         format!("[{}]", asm_reg_name_64(reg))
     }
 
-    /// Put a memory operand's address in `reg`.
-    fn emit_addr_setup(&mut self, reg: Reg, setup: AddrSetup) {
+    /// Put an operand's address or value in `reg`.
+    fn emit_operand_setup(&mut self, reg: Reg, setup: OperandSetup) {
         match setup {
-            AddrSetup::Object { base, offset } => self.push_lir(Aarch64Inst::Add {
+            OperandSetup::Object { base, offset } => self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: base,
                 src2: GpOperand::Imm(offset.into()),
                 dst: reg,
             }),
-            AddrSetup::Spilled(addr) => self.push_lir(Aarch64Inst::Ldr {
+            OperandSetup::Spilled(addr) => self.push_lir(Aarch64Inst::Ldr {
                 size: OperandSize::B64,
                 addr,
                 dst: reg,
             }),
-            AddrSetup::Global(name) => self.emit_load_addr(&name, reg),
+            OperandSetup::Global(name) => self.emit_load_addr(&name, reg),
+            OperandSetup::Value { pseudo, size } => self.emit_move(pseudo, reg, size.max(32)),
+            OperandSetup::Imm(v) => self.emit_mov_imm(reg, v, 64),
         }
     }
 
@@ -679,6 +815,16 @@ impl Aarch64CodeGen {
 
     /// Whether the constraint asks for the operand in a register at all,
     /// general or vector — as opposed to an immediate or memory class.
+    /// Whether the constraint offers an immediate alternative.
+    fn constraint_allows_immediate(constraint: &str) -> bool {
+        constraint.chars().any(|c| {
+            matches!(
+                c,
+                'i' | 'n' | 'g' | 'X' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'S' | 'Y' | 'Z'
+            )
+        }) || !Self::constraint_requires_reg_class(constraint)
+    }
+
     fn constraint_requires_reg_class(constraint: &str) -> bool {
         constraint
             .chars()

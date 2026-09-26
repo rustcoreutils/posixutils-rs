@@ -742,10 +742,9 @@ pub struct AsmConstraint {
     pub name: Option<String>,
     /// Matching output operand index (for constraints like "0")
     pub matching_output: Option<usize>,
-    /// The constraint string (e.g., "r", "a", "=r", "+m")
-    /// Used by codegen to determine specific register requirements
-    /// Note: Early clobber (&) is parsed but not explicitly handled since our
-    /// simple register allocator doesn't share registers between inputs/outputs
+    /// The constraint string (e.g., "r", "a", "=r", "+m", "=&r").
+    /// Used by codegen to determine specific register requirements; an
+    /// early-clobber `&` is read through [`AsmConstraint::is_early_clobber`].
     pub constraint: String,
     /// Size of the operand in bits (8, 16, 32, 64), derived from the C type
     pub size: u32,
@@ -784,6 +783,37 @@ impl AsmConstraint {
         }
 
         has_memory_class && !has_non_memory_class
+    }
+
+    /// True for an early-clobber output (`"=&r"`, `"+&r"`, `"&=r"`): the
+    /// template writes it before it has read every input, so it may not share
+    /// a register with any input, even one whose value dies at the asm.
+    pub fn is_early_clobber(&self) -> bool {
+        self.constraint.contains('&')
+    }
+
+    /// True when the operand may be given a register: a register class
+    /// (`r`, a named register letter, `g`, ...) rather than only memory or
+    /// only an immediate (`i`, `n`).
+    pub fn wants_register(&self) -> bool {
+        self.constraint.chars().any(|c| {
+            matches!(
+                c,
+                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'l' | 'g' | 'x' | 'w' | 'y'
+            ) || c.is_ascii_digit()
+        })
+    }
+
+    /// True for the input a `"+"` output implies: it carries the output's
+    /// constraint (`"+r"`) rather than a matching digit (`"0"`).
+    ///
+    /// gcc numbers operands as outputs, then the inputs the source wrote --
+    /// an explicit `"0"` among them -- and only then these hidden inputs, in
+    /// output order; `asm goto` labels come after all of them. So a hidden
+    /// input takes the *last* operand numbers, never one between the explicit
+    /// ones.
+    pub fn is_hidden_readwrite_input(&self) -> bool {
+        self.matching_output.is_some() && self.constraint.contains('+')
     }
 }
 
@@ -3379,6 +3409,48 @@ mod tests {
         // setjmp/longjmp save/restore arbitrary execution context.
         assert!(Instruction::new(Opcode::Setjmp).is_memory_barrier());
         assert!(Instruction::new(Opcode::Longjmp).is_memory_barrier());
+    }
+
+    fn constraint(c: &str, matching_output: Option<usize>) -> AsmConstraint {
+        AsmConstraint {
+            pseudo: PseudoId(0),
+            name: None,
+            matching_output,
+            constraint: c.to_string(),
+            size: 64,
+        }
+    }
+
+    /// `&` anywhere in the constraint makes an output early-clobber.
+    #[test]
+    fn test_asm_constraint_early_clobber() {
+        for c in ["=&r", "&=r", "+&r", "=&a"] {
+            assert!(constraint(c, None).is_early_clobber(), "{c}");
+        }
+        for c in ["=r", "+r", "r", "=m", "0"] {
+            assert!(!constraint(c, None).is_early_clobber(), "{c}");
+        }
+    }
+
+    /// The input a `"+"` output implies is hidden; an explicit `"0"` is not.
+    #[test]
+    fn test_asm_constraint_hidden_readwrite_input() {
+        assert!(constraint("+r", Some(0)).is_hidden_readwrite_input());
+        assert!(constraint("+m", Some(1)).is_hidden_readwrite_input());
+        assert!(!constraint("0", Some(0)).is_hidden_readwrite_input());
+        assert!(!constraint("r", None).is_hidden_readwrite_input());
+    }
+
+    /// A register class, or a matching digit, wants a register; memory-only
+    /// and immediate-only constraints do not.
+    #[test]
+    fn test_asm_constraint_wants_register() {
+        for c in ["r", "=r", "+r", "=&r", "a", "0", "rm", "g", "ri"] {
+            assert!(constraint(c, None).wants_register(), "{c}");
+        }
+        for c in ["m", "=m", "i", "n", "I"] {
+            assert!(!constraint(c, None).wants_register(), "{c}");
+        }
     }
 
     #[test]

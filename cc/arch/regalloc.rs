@@ -1027,6 +1027,17 @@ pub fn build_interference_graph(
                     }
                 }
             }
+            // An early-clobber asm output is written before the template
+            // has read its inputs, so it interferes with every one of them
+            // -- a register input, and the address of a memory operand, which
+            // the template also reads -- even an input that dies here, whose
+            // register a plain output may take. A tied input names the
+            // output's own pseudo and so shares with it by construction.
+            if insn.op == Opcode::Asm {
+                if let Some(asm) = &insn.asm_data {
+                    add_early_clobber_edges(&mut graph, asm, candidates);
+                }
+            }
             // Each def interferes with everything currently live AND
             // with the instruction's other defs AND with each src
             // (for the lowering-correctness reason described above).
@@ -1085,6 +1096,32 @@ pub fn build_interference_graph(
     graph
 }
 
+/// Edges from each early-clobber register output of one asm statement to
+/// every pseudo the statement reads: its inputs, and the addresses of its
+/// memory outputs.
+fn add_early_clobber_edges(
+    graph: &mut InterferenceGraph,
+    asm: &crate::ir::AsmData,
+    candidates: &std::collections::BTreeSet<PseudoId>,
+) {
+    let read = asm
+        .inputs
+        .iter()
+        .chain(asm.outputs.iter().filter(|o| o.is_memory()))
+        .map(|c| c.pseudo)
+        .filter(|p| candidates.contains(p));
+    let read: Vec<PseudoId> = read.collect();
+    for out in &asm.outputs {
+        if !out.is_early_clobber() || out.is_memory() || !candidates.contains(&out.pseudo) {
+            continue;
+        }
+        for &p in &read {
+            // `add_edge` ignores a self-edge: a tied input is the output.
+            graph.add_edge(out.pseudo, p);
+        }
+    }
+}
+
 /// Walk `func` and collect every `Opcode::Copy` instruction's
 /// `(target, src)` pair as a coalescing candidate. Skips Copies
 /// without a target or with `src.len() != 1` (degenerate cases).
@@ -1104,6 +1141,41 @@ pub fn find_copy_coalesce_candidates(func: &Function) -> Vec<(PseudoId, PseudoId
         }
     }
     out
+}
+
+/// The pseudos an inline-asm template names as register operands: inputs
+/// and outputs that are neither memory nor immediate-only.
+///
+/// gcc guarantees each such operand a register at the asm, spilling other
+/// values to make room. Colored in ordinary order, an operand could be the
+/// value the allocator chose to spill, and then codegen had to find it a
+/// register at the last moment -- on x86-64 by borrowing one that held another
+/// operand or a live value.
+pub fn asm_register_operands(func: &Function) -> std::collections::BTreeSet<PseudoId> {
+    let mut out = std::collections::BTreeSet::new();
+    for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+        let Some(asm) = insn.asm_data.as_ref().filter(|_| insn.op == Opcode::Asm) else {
+            continue;
+        };
+        for c in asm.outputs.iter().chain(asm.inputs.iter()) {
+            if !c.is_memory() && c.wants_register() {
+                out.insert(c.pseudo);
+            }
+        }
+    }
+    out
+}
+
+/// `order` with the asm register operands moved to the front, each group
+/// keeping its relative order, so greedy coloring places them first.
+pub fn asm_operands_first(
+    order: Vec<PseudoId>,
+    asm_ops: &std::collections::BTreeSet<PseudoId>,
+) -> Vec<PseudoId> {
+    let (mut first, rest): (Vec<PseudoId>, Vec<PseudoId>) =
+        order.into_iter().partition(|p| asm_ops.contains(p));
+    first.extend(rest);
+    first
 }
 
 /// Maximum Cardinality Search (MCS) ordering. The reverse of this

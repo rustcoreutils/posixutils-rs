@@ -484,7 +484,7 @@ pub fn parse_x86_64_class_letter(letter: char) -> Option<OperandConstraint<Reg>>
 /// `r10w`, `r10b`), and the GCC-style "%rax" with leading `%`.
 /// Returns `None` for names the GP table doesn't know about
 /// (XMM registers, `memory`, `cc`, x87 stack, ...).
-fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
+pub(super) fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
     let s = raw.trim_start_matches('%').to_ascii_lowercase();
     Some(match s.as_str() {
         "rax" | "eax" | "ax" | "al" | "ah" => Reg::Rax,
@@ -2195,7 +2195,10 @@ impl RegAlloc {
         let caller_first_c = caller_first.clone();
         let callee_first_c = callee_first.clone();
 
-        let order = mcs_ordering(&graph);
+        // Asm register operands are colored first: gcc guarantees each
+        // one a register, so it is the other values that spill.
+        let asm_ops = crate::arch::regalloc::asm_register_operands(func);
+        let order = crate::arch::regalloc::asm_operands_first(mcs_ordering(&graph), &asm_ops);
         let result = greedy_color(
             &graph,
             &order,
@@ -2245,8 +2248,9 @@ impl RegAlloc {
             let neighbors: Vec<PseudoId> = graph.neighbors(spilled).collect();
             let mut best_evict: Option<(PseudoId, Reg, usize)> = None;
             for &n in &neighbors {
-                if pre_colored.contains_key(&n) {
-                    // Don't evict ABI-pinned args.
+                // Don't evict ABI-pinned args, or an asm register operand:
+                // the template needs it in a register.
+                if pre_colored.contains_key(&n) || asm_ops.contains(&n) {
                     continue;
                 }
                 let Some(&color) = colors.get(&n) else {

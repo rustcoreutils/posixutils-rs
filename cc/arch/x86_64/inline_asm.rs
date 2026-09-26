@@ -76,7 +76,18 @@ impl AsmOperandBuild {
             remap_setup: Vec::with_capacity(operand_count),
             remap_restore: Vec::with_capacity(operand_count),
             pseudo_to_temp: std::collections::HashMap::new(),
-            used_regs: reserved_regs.clone(),
+            // A register the statement clobbers is no temp: the template
+            // would destroy what it holds.
+            used_regs: reserved_regs
+                .iter()
+                .copied()
+                .chain(
+                    asm_data
+                        .clobbers
+                        .iter()
+                        .filter_map(|c| crate::arch::x86_64::regalloc::parse_gp_clobber_name(c)),
+                )
+                .collect(),
             // Xmm15 is the primary scratch and Xmm14 the secondary, the same
             // pair `float.rs` uses for its own scratch needs.
             sse_scratch: vec![XmmReg::Xmm14, XmmReg::Xmm15],
@@ -90,18 +101,29 @@ impl AsmOperandBuild {
     }
 }
 
-/// A temp register that is neither reserved by a constraint nor already spent.
-/// R10 and R11 come first: caller-saved, and rarely used for arguments.
+/// A temp register for an operand the allocator gave no register of its own,
+/// neither named by the statement nor already spent.
+///
+/// Only R10 and R11: they are never allocated, so nothing lives in them. The
+/// list used to go on to R8, R9, RSI and RDI, which are, so a third temp
+/// landed on another operand or a value live across the asm -- an input read
+/// twice, or a result overwritten. Running out is an error, not a guess.
 fn find_temp_reg(
     reserved: &std::collections::HashSet<Reg>,
     used: &std::collections::HashSet<Reg>,
+    pos: Option<crate::diag::Position>,
 ) -> Reg {
-    for r in [Reg::R10, Reg::R11, Reg::R8, Reg::R9, Reg::Rsi, Reg::Rdi] {
+    for r in [Reg::R10, Reg::R11] {
         if !reserved.contains(&r) && !used.contains(&r) {
             return r;
         }
     }
-    Reg::R10 // Fallback
+    crate::diag::error(
+        pos.unwrap_or_default(),
+        "too many register operands in one asm statement; c17 has no register \
+         left to give one",
+    );
+    Reg::R10
 }
 
 impl X86_64CodeGen {
@@ -268,7 +290,7 @@ impl X86_64CodeGen {
                         // Check if allocated reg conflicts with reserved
                         if reserved_regs.contains(&r) {
                             // Use a temp register instead
-                            let temp = find_temp_reg(reserved_regs, used_regs);
+                            let temp = find_temp_reg(reserved_regs, used_regs, insn.pos);
                             used_regs.insert(temp);
                             slots.push(mk(Some(temp), None));
                             // For outputs, move from temp to actual loc after asm
@@ -284,7 +306,7 @@ impl X86_64CodeGen {
                         // Constant-propagated value used as asm output.
                         // Allocate temp register; after asm, the register holds the
                         // modified value — update the location map directly.
-                        let temp = find_temp_reg(reserved_regs, used_regs);
+                        let temp = find_temp_reg(reserved_regs, used_regs, insn.pos);
                         used_regs.insert(temp);
                         slots.push(mk(Some(temp), None));
                         // Don't add to output_moves (can't store to Imm).
@@ -295,7 +317,7 @@ impl X86_64CodeGen {
                     _ if requires_reg => {
                         // Constraint requires register but value is on stack/memory.
                         // Allocate a temp register; move from temp to actual loc after asm.
-                        let temp = find_temp_reg(reserved_regs, used_regs);
+                        let temp = find_temp_reg(reserved_regs, used_regs, insn.pos);
                         used_regs.insert(temp);
                         slots.push(mk(Some(temp), None));
                         output_moves.push((idx, temp, loc.clone(), op_size));
@@ -334,6 +356,9 @@ impl X86_64CodeGen {
             ..
         } = build;
         let num_outputs = asm_data.outputs.len();
+        // The hidden inputs of `"+"` outputs, numbered after every explicit
+        // input -- see `AsmConstraint::is_hidden_readwrite_input`.
+        let mut hidden: Vec<usize> = Vec::new();
         // Process input operands
         for input in &asm_data.inputs {
             let op_size = input.size;
@@ -353,10 +378,12 @@ impl X86_64CodeGen {
                 (self.get_location(input.pseudo), &input.constraint)
             };
 
-            // Matching inputs from '+' constraints share the output's operand number
-            // (GCC: "+r" counts as two operands but uses one %N number).
-            // We DON'T push a new operand slot — the output's slot is reused.
-            // But we DO need to load the initial value into the output's register.
+            // A tied input names the output's register, so its value is
+            // loaded there before the template. An explicit `"0"` is an
+            // operand of its own, `%N` in input order; the hidden input of a
+            // `"+"` output is numbered after all of them. Skipping every tied
+            // input numbered the ones after an explicit `"0"` one short, so
+            // `addq %2, %0` with `"0"(a), "r"(b)` named nothing.
             if let Some(match_idx) = input.matching_output {
                 if match_idx < num_outputs {
                     if let Some(reg) = slots[match_idx].reg {
@@ -371,7 +398,14 @@ impl X86_64CodeGen {
                         // `addsd %xmm15, %xmm15` ran on whatever was there.
                         sse_input_moves.push((xmm, asm_data.outputs[match_idx].pseudo, op_size));
                     }
-                    continue; // Skip — don't add a new operand slot
+                    if input.is_hidden_readwrite_input() {
+                        hidden.push(match_idx);
+                    } else {
+                        let mut slot = slots[match_idx].clone();
+                        slot.name = input.name.clone();
+                        slots.push(slot);
+                    }
+                    continue;
                 }
             }
 
@@ -465,7 +499,7 @@ impl X86_64CodeGen {
                             // Memory constraint with constant address (may be dead code
                             // from unoptimized switch on constant ORDER in atomic macros).
                             // Load address into temp reg and emit as indirect memory ref.
-                            let temp = find_temp_reg(reserved_regs, used_regs);
+                            let temp = find_temp_reg(reserved_regs, used_regs, insn.pos);
                             used_regs.insert(temp);
                             input_moves.push((temp, loc.clone(), op_size));
                             let mem_str = format!("(%{})", self.reg_name_64(temp));
@@ -480,7 +514,7 @@ impl X86_64CodeGen {
                             // Check if allocated reg conflicts with reserved
                             if reserved_regs.contains(&r) {
                                 // Use a temp register instead
-                                let temp = find_temp_reg(reserved_regs, used_regs);
+                                let temp = find_temp_reg(reserved_regs, used_regs, insn.pos);
                                 used_regs.insert(temp);
                                 slots.push(mk(Some(temp), None));
                                 // For inputs, move from actual loc to temp before asm
@@ -490,6 +524,18 @@ impl X86_64CodeGen {
                                 used_regs.insert(r);
                             }
                         }
+                        // A constant under a register-only constraint still goes
+                        // in a register: the template may use it where no
+                        // immediate is allowed (`leaq 8($100), %rax`).
+                        Loc::Imm(_)
+                            if requires_reg
+                                && !Self::constraint_allows_immediate(constraint_for_reg) =>
+                        {
+                            let temp = find_temp_reg(reserved_regs, used_regs, insn.pos);
+                            used_regs.insert(temp);
+                            slots.push(mk(Some(temp), None));
+                            input_moves.push((temp, loc.clone(), op_size));
+                        }
                         Loc::Imm(v) => {
                             // Immediate value
                             slots.push(mk(None, Some(format!("${}", v as i64))));
@@ -497,7 +543,7 @@ impl X86_64CodeGen {
                         _ if requires_reg => {
                             // Constraint requires register but value is on stack/memory.
                             // Allocate a temp register and load value before asm.
-                            let temp = find_temp_reg(reserved_regs, used_regs);
+                            let temp = find_temp_reg(reserved_regs, used_regs, insn.pos);
                             used_regs.insert(temp);
                             slots.push(mk(Some(temp), None));
                             input_moves.push((temp, loc.clone(), op_size));
@@ -510,6 +556,10 @@ impl X86_64CodeGen {
                     }
                 }
             }
+        }
+        for idx in hidden {
+            let slot = slots[idx].clone();
+            slots.push(slot);
         }
     }
 
@@ -628,6 +678,23 @@ impl X86_64CodeGen {
             }
             let fp_size = FpSize::from_bits(*size, &self.base.target);
             self.emit_fp_move_from_xmm(*xmm, actual_loc, fp_size);
+        }
+
+        // These run only on the fall-through: a jump to an `asm goto` label
+        // skips them, and the output would reach the label unwritten. Such a
+        // statement has to have every output in its own register.
+        let moved = output_moves
+            .iter()
+            .any(|(_, r, loc, _)| *loc != Loc::Reg(*r))
+            || !remap_restore.is_empty()
+            || !sse_output_moves.is_empty()
+            || x87_store.is_some();
+        if moved && !asm_data.goto_labels.is_empty() {
+            crate::diag::error(
+                insn.pos.unwrap_or_default(),
+                "an asm goto output needs a register of its own, and this statement \
+                 has more register operands than c17 can give them",
+            );
         }
 
         // Emit moves from specific registers to actual locations (for outputs)
@@ -949,6 +1016,16 @@ impl X86_64CodeGen {
 
     fn constraint_requires_x87(constraint: &str) -> bool {
         constraint.chars().any(|c| matches!(c, 'f' | 't' | 'u'))
+    }
+
+    /// Whether the constraint offers an immediate alternative.
+    fn constraint_allows_immediate(constraint: &str) -> bool {
+        constraint.chars().any(|c| {
+            matches!(
+                c,
+                'i' | 'n' | 'g' | 'X' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'e' | 'Z' | 's'
+            )
+        })
     }
 
     fn constraint_requires_register(constraint: &str) -> bool {

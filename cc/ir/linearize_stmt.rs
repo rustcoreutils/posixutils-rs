@@ -3000,13 +3000,35 @@ impl<'a> super::linearize::Linearizer<'a> {
             })
             .collect();
 
+        // An `asm goto` with outputs leaves them valid on every path, the
+        // label edges as well as the fall-through (gcc's documented rule, and
+        // what the Linux kernel's user-access helpers rely on). The write-back
+        // below ran only on the fall-through, so a jump reached its label
+        // with every output unstored. Each label edge now gets a block of its
+        // own that writes the outputs back and then jumps to the label.
+        let writes_back = skip_post_handling.iter().any(|skip| !skip);
+        let label_edges: Vec<(BasicBlockId, BasicBlockId, String)> = ir_goto_labels
+            .iter()
+            .map(|(target, name)| {
+                let edge = if writes_back {
+                    self.alloc_bb()
+                } else {
+                    *target
+                };
+                (edge, *target, name.clone())
+            })
+            .collect();
+
         // Create the asm data
         let asm_data = AsmData {
             template: template.to_string(),
             outputs: ir_outputs.clone(),
             inputs: ir_inputs,
             clobbers: clobbers.to_vec(),
-            goto_labels: ir_goto_labels.clone(),
+            goto_labels: label_edges
+                .iter()
+                .map(|(edge, _, name)| (*edge, name.clone()))
+                .collect(),
         };
 
         // Emit the asm instruction
@@ -3014,15 +3036,15 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // For asm goto: add edges to all possible label targets
         // The asm may jump to any of these labels, so control flow can go there
-        if !ir_goto_labels.is_empty() {
+        if !label_edges.is_empty() {
             if let Some(current) = self.current_bb {
                 // After the asm instruction, we need a basic block for fall-through
                 // and edges to all goto targets
                 let fall_through = self.alloc_bb();
 
                 // Add edges to all goto label targets
-                for (target_bb, _) in &ir_goto_labels {
-                    self.link_bb(current, *target_bb);
+                for (edge, _, _) in &label_edges {
+                    self.link_bb(current, *edge);
                 }
 
                 // Add edge to fall-through (normal case when asm doesn't jump)
@@ -3033,12 +3055,44 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // Without this, code would fall through to whatever block comes next in layout
                 self.emit(Instruction::br(fall_through));
 
+                if writes_back {
+                    for (edge, target, _) in &label_edges {
+                        self.switch_bb(*edge);
+                        self.emit_asm_output_writeback(
+                            outputs,
+                            &ir_outputs,
+                            &skip_post_handling,
+                            &param_outputs,
+                            &output_places,
+                        );
+                        self.emit(Instruction::br(*target));
+                        self.link_bb(*edge, *target);
+                    }
+                }
+
                 // Switch to fall-through block for subsequent instructions
                 self.current_bb = Some(fall_through);
             }
         }
 
-        // Store outputs back to their destinations
+        self.emit_asm_output_writeback(
+            outputs,
+            &ir_outputs,
+            &skip_post_handling,
+            &param_outputs,
+            &output_places,
+        );
+    }
+
+    /// Store an asm statement's register outputs back to their destinations.
+    fn emit_asm_output_writeback(
+        &mut self,
+        outputs: &[AsmOperand],
+        ir_outputs: &[AsmConstraint],
+        skip_post_handling: &[bool],
+        param_outputs: &[Option<String>],
+        output_places: &[Option<super::linearize_emit::RmwPlace>],
+    ) {
         // store(value, addr, ...) - value first, then address
         for (i, op) in outputs.iter().enumerate() {
             // Memory-class outputs (`=m`/`+m`/...) need no post-asm

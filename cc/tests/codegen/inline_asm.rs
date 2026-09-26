@@ -13,7 +13,7 @@
 // Tests are architecture-conditional since inline assembly is platform-specific.
 //
 
-use crate::common::{compile_and_run, compile_and_run_optimized};
+use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_optimized};
 
 // ============================================================================
 // Architecture-Independent Inline Assembly Test
@@ -1786,4 +1786,409 @@ int main(void) {{
     );
     assert_eq!(compile_and_run("inlined_asm_goto", &code, &[]), 0);
     assert_eq!(compile_and_run_optimized("inlined_asm_goto_opt", &code), 0);
+}
+
+/// Early-clobber outputs (`"=&r"`, `"+&r"`) on x86-64.
+///
+/// An early-clobber output is written before the template has read all of its
+/// inputs, so it may not share a register with any input -- including one
+/// whose value dies at the asm, which is exactly the sharing the allocator
+/// offers a plain output. The `&` was parsed and then dropped: `early` got
+/// its output and `b` in one register and returned 1 + 10 + 1. The address of
+/// a `"+m"` operand is an input too.
+///
+/// Also here: an explicit tied input `"0"(a)` is operand `%1`, so the next
+/// input is `%2`. Only the implicit input a `"+"` output creates goes
+/// unnumbered, but every tied input was skipped, so `%2` named nothing and
+/// the output failed to assemble. And six early-clobber outputs with six
+/// inputs, which needs twelve distinct registers.
+const EARLY_CLOBBER_X86_64: &str = r#"
+#define NI __attribute__((noinline))
+/* Each "=&r" output is written before any input is read, so no output may
+   share a register with an input, even one whose value dies at the asm. */
+NI long early(long a, long b)
+{
+    long t;
+    __asm__("movq $1, %0\n\taddq %1, %0\n\taddq %2, %0" : "=&r"(t) : "r"(a), "r"(b));
+    return t;
+}
+NI long early2(long a, long b)
+{
+    long t, u;
+    __asm__("movq $1, %0\n\tmovq $2, %1\n\taddq %2, %0\n\taddq %3, %1"
+            : "=&r"(t), "=&r"(u) : "r"(a), "r"(b));
+    return t * 1000 + u;
+}
+/* The address of a "+m" operand is an input too. */
+NI long early_mem(long *p)
+{
+    long t;
+    __asm__("movq $5, %0\n\taddq %1, %0\n\tmovq %0, %1" : "=&r"(t), "+m"(*p));
+    return t;
+}
+/* "+&r": read-write, and still apart from the other input. */
+NI long plus_early(long t, long b)
+{
+    __asm__("addq %1, %0\n\taddq %1, %0" : "+&r"(t) : "r"(b));
+    return t;
+}
+/* No "&": the output may take a dying input's register, and must still be
+   right when it does. */
+NI long plain(long a)
+{
+    long t;
+    __asm__("leaq 1(%1), %0" : "=r"(t) : "r"(a));
+    return t;
+}
+/* An explicit tied input "0" is operand %1; the next input is %2. */
+NI long tied(long a, long b)
+{
+    long t;
+    __asm__("addq %2, %0" : "=r"(t) : "0"(a), "r"(b));
+    return t;
+}
+NI long tied3(long a, long b, long c)
+{
+    long t;
+    __asm__("addq %2, %0\n\taddq %3, %0" : "=r"(t) : "0"(a), "r"(b), "r"(c));
+    return t;
+}
+/* 6 early-clobber outputs and 6 inputs: 12 distinct registers. */
+NI long pressure(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+    long o0, o1, o2, o3, o4, o5;
+    __asm__("movq $1, %0\n\tmovq $2, %1\n\tmovq $3, %2\n\tmovq $4, %3\n\tmovq $5, %4\n\tmovq $6, %5\n\taddq %6, %0\n\taddq %7, %1\n\taddq %8, %2\n\taddq %9, %3\n\taddq %10, %4\n\taddq %11, %5" : "=&r"(o0), "=&r"(o1), "=&r"(o2), "=&r"(o3), "=&r"(o4), "=&r"(o5) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5));
+    return o0 * 1 + o1 * 10 + o2 * 100 + o3 * 1000 + o4 * 10000 + o5 * 100000;
+}
+int main(void)
+{
+    long v = 100;
+    if (early(10, 20) != 31) return 1;
+    if (early2(10, 20) != 11 * 1000 + 22) return 2;
+    if (early_mem(&v) != 105 || v != 105) return 3;
+    if (plus_early(1, 10) != 21) return 4;
+    if (plain(41) != 42) return 5;
+    if (tied(10, 20) != 30 || tied(20, 10) != 30) return 6;
+    if (tied3(1, 2, 3) != 6) return 7;
+    if (pressure(1, 1, 1, 1, 1, 1) != 765432) return 8;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_inline_asm_early_clobber_x86_64() {
+    if !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    assert_eq!(
+        compile_and_run("asm_early_x86", EARLY_CLOBBER_X86_64, &[]),
+        0
+    );
+    let o2 = vec!["-O2".to_string()];
+    assert_eq!(
+        compile_and_run("asm_early_x86_o2", EARLY_CLOBBER_X86_64, &o2),
+        0
+    );
+}
+
+/// The aarch64 counterpart, under qemu. Ten early-clobber outputs and ten
+/// inputs take twenty distinct registers.
+const EARLY_CLOBBER_AARCH64: &str = r#"
+#define NI __attribute__((noinline))
+/* Each "=&r" output is written before any input is read, so no output may
+   share a register with an input, even one whose value dies at the asm. */
+NI long early(long a, long b)
+{
+    long t;
+    __asm__("mov %0, #1\n\tadd %0, %0, %1\n\tadd %0, %0, %2" : "=&r"(t) : "r"(a), "r"(b));
+    return t;
+}
+NI long early2(long a, long b)
+{
+    long t, u;
+    __asm__("mov %0, #1\n\tmov %1, #2\n\tadd %0, %0, %2\n\tadd %1, %1, %3"
+            : "=&r"(t), "=&r"(u) : "r"(a), "r"(b));
+    return t * 1000 + u;
+}
+/* The address of a "+m" operand is an input too. */
+NI long early_mem(long *p)
+{
+    long t;
+    __asm__("mov %0, #5\n\tldr x9, %1\n\tadd %0, %0, x9\n\tstr %0, %1" : "=&r"(t), "+m"(*p) : : "x9");
+    return t;
+}
+/* "+&r": read-write, and still apart from the other input. */
+NI long plus_early(long t, long b)
+{
+    __asm__("add %0, %0, %1\n\tadd %0, %0, %1" : "+&r"(t) : "r"(b));
+    return t;
+}
+/* No "&": the output may take a dying input's register, and must still be
+   right when it does. */
+NI long plain(long a)
+{
+    long t;
+    __asm__("add %0, %1, #1" : "=r"(t) : "r"(a));
+    return t;
+}
+NI long tied(long a, long b)
+{
+    long t;
+    __asm__("add %0, %0, %2" : "=r"(t) : "0"(a), "r"(b));
+    return t;
+}
+/* 10 early-clobber outputs and 10 inputs: 20 distinct registers. */
+NI long pressure(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7, long a8, long a9)
+{
+    long o0, o1, o2, o3, o4, o5, o6, o7, o8, o9;
+    __asm__("mov %0, #1\n\tmov %1, #2\n\tmov %2, #3\n\tmov %3, #4\n\tmov %4, #5\n\tmov %5, #6\n\tmov %6, #7\n\tmov %7, #8\n\tmov %8, #9\n\tmov %9, #10\n\tadd %0, %0, %10\n\tadd %1, %1, %11\n\tadd %2, %2, %12\n\tadd %3, %3, %13\n\tadd %4, %4, %14\n\tadd %5, %5, %15\n\tadd %6, %6, %16\n\tadd %7, %7, %17\n\tadd %8, %8, %18\n\tadd %9, %9, %19" : "=&r"(o0), "=&r"(o1), "=&r"(o2), "=&r"(o3), "=&r"(o4), "=&r"(o5), "=&r"(o6), "=&r"(o7), "=&r"(o8), "=&r"(o9) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7), "r"(a8), "r"(a9));
+    return o0 * 1 + o1 * 2 + o2 * 3 + o3 * 4 + o4 * 5 + o5 * 6 + o6 * 7 + o7 * 8 + o8 * 9 + o9 * 10;
+}
+int main(void)
+{
+    long v = 100;
+    if (early(10, 20) != 31) return 1;
+    if (early2(10, 20) != 11 * 1000 + 22) return 2;
+    if (early_mem(&v) != 105 || v != 105) return 3;
+    if (plus_early(1, 10) != 21) return 4;
+    if (plain(41) != 42) return 5;
+    if (tied(10, 20) != 30 || tied(20, 10) != 30) return 6;
+    if (pressure(100, 200, 300, 400, 500, 600, 700, 800, 900, 1000) != 38885) return 8;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_inline_asm_early_clobber_aarch64() {
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64("asm_early_a64", EARLY_CLOBBER_AARCH64, opt) {
+            assert_eq!(code, 0, "at {opt}");
+        }
+    }
+}
+
+/// Operand and label numbering, gcc's way, on x86-64.
+///
+/// gcc numbers operands as outputs, then the inputs the source wrote, then the
+/// hidden input each `"+"` output implies; `asm goto` labels come after all
+/// of them, so with one `"+r"` output and one input the first label is
+/// `%l3`. c17 counted labels from zero and read one digit, so `%l3` named
+/// nothing and `%l10` named `%l1`. The outputs of an `asm goto` are valid on
+/// every path out of it; c17 wrote them back only on the fall-through.
+const NUMBERING_X86_64: &str = r#"
+#define NI __attribute__((noinline))
+/* gcc numbers operands as outputs, the inputs written, then the hidden input
+   of each "+" output; asm goto labels come after all of them. */
+NI long plus_then_input(long t, long b)
+{
+    __asm__("addq %1, %0" : "+r"(t) : "r"(b));
+    return t;
+}
+NI long two_plus(long t, long u, long b)
+{
+    __asm__("addq %2, %0\n\taddq %2, %1" : "+r"(t), "+r"(u) : "r"(b));
+    return t * 100 + u;
+}
+/* One output, one input, one hidden input: the label is %l3. */
+NI int goto_after_hidden(long t, long b)
+{
+    __asm__ goto("addq %1, %0\n\tjmp %l3" : "+r"(t) : "r"(b) : : out);
+    return 0;
+out:
+    return (int)t;
+}
+/* Ten inputs: the label is %l10, two digits. */
+NI int goto_two_digits(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7, long a8, long a9)
+{
+    __asm__ goto("jmp %l10" : : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7), "r"(a8), "r"(a9) : : out);
+    return 0;
+out:
+    return 1;
+}
+/* The output is valid on every path out of an asm goto, not only the
+   fall-through. */
+NI long goto_output(long x)
+{
+    long r;
+    __asm__ goto("leaq 1(%1), %0\n\tcmpq $10, %1\n\tjg %l[big]\n\tjmp %l[small]" : "=r"(r) : "r"(x) : "cc" : big, small);
+    return -1;
+big:
+    return r * 10;
+small:
+    return r;
+}
+int main(void)
+{
+    if (plus_then_input(1, 10) != 11) return 1;
+    if (two_plus(1, 2, 10) != 1112) return 2;
+    if (goto_after_hidden(1, 10) != 11) return 3;
+    if (goto_two_digits(0,1,2,3,4,5,6,7,8,9) != 1) return 4;
+    if (goto_output(20) != 210 || goto_output(3) != 4) return 5;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_inline_asm_numbering_x86_64() {
+    if !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    assert_eq!(compile_and_run("asm_num_x86", NUMBERING_X86_64, &[]), 0);
+    let o2 = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run("asm_num_x86_o2", NUMBERING_X86_64, &o2), 0);
+}
+
+/// The aarch64 counterpart. aarch64 numbered the hidden input of a `"+r"` in
+/// place, so `%1` in `"add %0, %0, %1" : "+r"(t) : "r"(b)` named `t` again.
+const NUMBERING_AARCH64: &str = r#"
+#define NI __attribute__((noinline))
+/* gcc numbers operands as outputs, the inputs written, then the hidden input
+   of each "+" output; asm goto labels come after all of them. */
+NI long plus_then_input(long t, long b)
+{
+    __asm__("add %0, %0, %1" : "+r"(t) : "r"(b));
+    return t;
+}
+NI long two_plus(long t, long u, long b)
+{
+    __asm__("add %0, %0, %2\n\tadd %1, %1, %2" : "+r"(t), "+r"(u) : "r"(b));
+    return t * 100 + u;
+}
+/* One output, one input, one hidden input: the label is %l3. */
+NI int goto_after_hidden(long t, long b)
+{
+    __asm__ goto("add %0, %0, %1\n\tb %l3" : "+r"(t) : "r"(b) : : out);
+    return 0;
+out:
+    return (int)t;
+}
+/* Ten inputs: the label is %l10, two digits. */
+NI int goto_two_digits(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7, long a8, long a9)
+{
+    __asm__ goto("b %l10" : : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7), "r"(a8), "r"(a9) : : out);
+    return 0;
+out:
+    return 1;
+}
+/* The output is valid on every path out of an asm goto, not only the
+   fall-through. */
+NI long goto_output(long x)
+{
+    long r;
+    __asm__ goto("add %0, %1, #1\n\tcmp %1, #10\n\tb.gt %l[big]\n\tb %l[small]" : "=r"(r) : "r"(x) : "cc" : big, small);
+    return -1;
+big:
+    return r * 10;
+small:
+    return r;
+}
+int main(void)
+{
+    if (plus_then_input(1, 10) != 11) return 1;
+    if (two_plus(1, 2, 10) != 1112) return 2;
+    if (goto_after_hidden(1, 10) != 11) return 3;
+    if (goto_two_digits(0,1,2,3,4,5,6,7,8,9) != 1) return 4;
+    if (goto_output(20) != 210 || goto_output(3) != 4) return 5;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_inline_asm_numbering_aarch64() {
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64("asm_num_a64", NUMBERING_AARCH64, opt) {
+            assert_eq!(code, 0, "at {opt}");
+        }
+    }
+}
+
+/// A register-class operand gets a register, whatever its value or wherever
+/// the allocator put it.
+///
+/// A constant under `"r"` was substituted as an immediate on both targets
+/// (`leaq 8($100)`, `add x0, #100, #100`). And an operand the allocator
+/// spilled was either rendered as its stack slot on aarch64 (`add x0, x0,
+/// [x29, #240]`) or, on x86-64, handed a temp from R8/R9/RSI/RDI -- which the
+/// allocator also uses, so it landed on another operand and read it twice.
+/// Asm register operands are now colored before other values, and what still
+/// spills goes in a scratch that holds nothing.
+const REGISTER_OPERANDS_X86_64: &str = r#"
+#define NI __attribute__((noinline))
+/* A register-class input whose value is a constant still goes in a register:
+   the template may use it where no immediate is allowed. */
+NI long k(void) { long t; __asm__("leaq 8(%1), %0" : "=r"(t) : "r"(100L)); return t; }
+
+volatile long vseed = 1;
+/* 12 register inputs in one statement while other values stay live across
+   it: an operand without a register of its own must not be put in one that
+   holds something else. */
+NI long wide(long *a)
+{
+    long k0 = vseed * 100;
+    long k1 = vseed * 101;
+    long k2 = vseed * 102;
+    long k3 = vseed * 103;
+    long k4 = vseed * 104;
+    long k5 = vseed * 105;
+    long r;
+    __asm__("movq $0, %0\n\taddq %1, %0\n\taddq %2, %0\n\taddq %3, %0\n\taddq %4, %0\n\taddq %5, %0\n\taddq %6, %0\n\taddq %7, %0\n\taddq %8, %0\n\taddq %9, %0\n\taddq %10, %0\n\taddq %11, %0\n\taddq %12, %0" : "=&r"(r) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]), "r"(a[8]), "r"(a[9]), "r"(a[10]), "r"(a[11]));
+    return r + k0 + k1 + k2 + k3 + k4 + k5;
+}
+int main(void)
+{
+    if (k() != 108) return 2;
+    long a[12];
+    for (int i = 0; i < 12; i++) a[i] = i + 1;
+    return wide(a) == 693 ? 0 : 1;
+}
+"#;
+
+#[test]
+fn codegen_inline_asm_register_operands_x86_64() {
+    if !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    assert_eq!(
+        compile_and_run("asm_regops_x86", REGISTER_OPERANDS_X86_64, &[]),
+        0
+    );
+    let o2 = vec!["-O2".to_string()];
+    assert_eq!(
+        compile_and_run("asm_regops_x86_o2", REGISTER_OPERANDS_X86_64, &o2),
+        0
+    );
+}
+
+/// The aarch64 counterpart: twenty-six register inputs and an early-clobber
+/// output, more operands than the allocator has registers.
+const REGISTER_OPERANDS_AARCH64: &str = r#"
+#define NI __attribute__((noinline))
+/* A register-class input whose value is a constant still goes in a register:
+   the template may use it where no immediate is allowed. */
+NI long k(void) { long t; __asm__("add %0, %1, %1" : "=r"(t) : "r"(100L)); return t; }
+
+NI long wide(long *a)
+{
+    long r;
+    __asm__("mov %0, #0\n\tadd %0, %0, %1\n\tadd %0, %0, %2\n\tadd %0, %0, %3\n\tadd %0, %0, %4\n\tadd %0, %0, %5\n\tadd %0, %0, %6\n\tadd %0, %0, %7\n\tadd %0, %0, %8\n\tadd %0, %0, %9\n\tadd %0, %0, %10\n\tadd %0, %0, %11\n\tadd %0, %0, %12\n\tadd %0, %0, %13\n\tadd %0, %0, %14\n\tadd %0, %0, %15\n\tadd %0, %0, %16\n\tadd %0, %0, %17\n\tadd %0, %0, %18\n\tadd %0, %0, %19\n\tadd %0, %0, %20\n\tadd %0, %0, %21\n\tadd %0, %0, %22\n\tadd %0, %0, %23\n\tadd %0, %0, %24\n\tadd %0, %0, %25\n\tadd %0, %0, %26" : "=&r"(r) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]), "r"(a[8]), "r"(a[9]), "r"(a[10]), "r"(a[11]), "r"(a[12]), "r"(a[13]), "r"(a[14]), "r"(a[15]), "r"(a[16]), "r"(a[17]), "r"(a[18]), "r"(a[19]), "r"(a[20]), "r"(a[21]), "r"(a[22]), "r"(a[23]), "r"(a[24]), "r"(a[25]));
+    return r;
+}
+int main(void)
+{
+    if (k() != 200) return 2;
+    long a[26];
+    for (int i = 0; i < 26; i++) a[i] = i + 1;
+    return wide(a) == 351 ? 0 : 1;
+}
+"#;
+
+#[test]
+fn codegen_inline_asm_register_operands_aarch64() {
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) =
+            compile_and_run_aarch64("asm_regops_a64", REGISTER_OPERANDS_AARCH64, opt)
+        {
+            assert_eq!(code, 0, "at {opt}");
+        }
+    }
 }

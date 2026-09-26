@@ -994,16 +994,31 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
                                 result.push(']');
                             }
                         } else if next_ch.is_ascii_digit() {
-                            // %l0, %l1, etc. - numeric label reference
-                            chars.next();
-                            let idx = (next_ch as usize) - ('0' as usize);
-                            if idx < goto_labels.len() {
-                                let (label_str, _) = &goto_labels[idx];
+                            // `%lN`: gcc numbers labels after every operand,
+                            // the hidden inputs of `"+"` outputs included, so
+                            // the first label of a statement with three
+                            // operands is `%l3`. Counting from zero, and one
+                            // digit at a time, named the wrong label or none.
+                            let mut num = String::new();
+                            while let Some(&d) = chars.peek() {
+                                if !d.is_ascii_digit() {
+                                    break;
+                                }
+                                num.push(d);
+                                chars.next();
+                            }
+                            let label = num
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|n| n.checked_sub(slots.len()))
+                                .and_then(|i| goto_labels.get(i));
+                            if let Some((label_str, _)) = label {
                                 result.push_str(label_str);
                             } else {
-                                // Unknown label index, pass through
+                                // Not a label: pass through for the assembler
+                                // to reject, as gcc does.
                                 result.push_str("%l");
-                                result.push(next_ch);
+                                result.push_str(&num);
                             }
                         } else {
                             // Just %l without number or name, pass through

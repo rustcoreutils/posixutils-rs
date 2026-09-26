@@ -2028,7 +2028,10 @@ impl RegAlloc {
         let caller_first_c = caller_first.clone();
         let callee_first_c = callee_first.clone();
 
-        let order = mcs_ordering(&graph);
+        // Asm register operands are colored first: gcc guarantees each
+        // one a register, so it is the other values that spill.
+        let asm_ops = crate::arch::regalloc::asm_register_operands(func);
+        let order = crate::arch::regalloc::asm_operands_first(mcs_ordering(&graph), &asm_ops);
         let result = greedy_color(
             &graph,
             &order,
@@ -2067,7 +2070,9 @@ impl RegAlloc {
             let neighbors: Vec<PseudoId> = graph.neighbors(spilled).collect();
             let mut best_evict: Option<(PseudoId, Reg, usize)> = None;
             for &n in &neighbors {
-                if pre_colored.contains_key(&n) {
+                // Don't evict ABI-pinned args, or an asm register operand:
+                // the template needs it in a register.
+                if pre_colored.contains_key(&n) || asm_ops.contains(&n) {
                     continue;
                 }
                 let Some(&color) = colors.get(&n) else {

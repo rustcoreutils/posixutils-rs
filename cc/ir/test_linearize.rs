@@ -14,8 +14,8 @@
 
 use super::*;
 use crate::parse::ast::{
-    AssignOp, BinaryOp, BlockItem, Declaration, Designator, ExprKind, ExternalDecl, ForInit,
-    FunctionDef, InitDeclarator, InitElement, Parameter, Stmt, UnaryOp,
+    AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, ExprKind, ExternalDecl,
+    ForInit, FunctionDef, InitDeclarator, InitElement, Parameter, Stmt, UnaryOp,
 };
 use crate::strings::StringTable;
 use crate::symbol::Symbol;
@@ -6910,4 +6910,82 @@ fn test_function_alignment_reaches_the_ir() {
     };
     let module = ctx.linearize(&tu);
     assert_eq!(module.functions[0].align, Some(64));
+}
+
+/// An `asm goto` output is written back on every path out of the statement.
+///
+/// The label edge gets a block of its own that stores the output and then
+/// branches to the label; the asm names that block, not the label. Before,
+/// the store sat only on the fall-through, so a jump reached the label with
+/// the output never written.
+#[test]
+fn test_asm_goto_output_written_back_on_the_label_edge() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let out_id = ctx.str("out");
+    let int_type = ctx.int_type();
+    let x_sym = ctx.var("x", int_type);
+
+    // { asm goto("" : "=r"(x) : : : out); return 0; out: return x; }
+    let body = Stmt::Block(vec![
+        BlockItem::Statement(Box::new(Stmt::Asm {
+            template: String::new(),
+            outputs: vec![AsmOperand {
+                name: None,
+                constraint: "=r".to_string(),
+                expr: Expr::var_typed(x_sym, int_type),
+            }],
+            inputs: vec![],
+            clobbers: vec![],
+            goto_labels: vec![out_id],
+        })),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
+        BlockItem::Statement(Box::new(Stmt::Label {
+            name: out_id,
+            stmt: Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
+            pos: test_pos(),
+        })),
+    ]);
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: int_type,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(x_sym),
+            typ: int_type,
+            vm_dims: vec![],
+            discarded_dims: vec![],
+        }],
+        body,
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let func = &module.functions[0];
+
+    let asm = func
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .find(|insn| insn.op == Opcode::Asm)
+        .expect("an asm instruction");
+    let out_pseudo = asm.asm_data.as_ref().unwrap().outputs[0].pseudo;
+    let (edge, _) = asm.asm_data.as_ref().unwrap().goto_labels[0];
+    let edge = func.get_block(edge).expect("the label edge block");
+    assert!(
+        edge.insns
+            .iter()
+            .any(|i| i.op == Opcode::Store && i.src.contains(&out_pseudo)),
+        "the label edge must store the output: {:?}",
+        edge.insns
+    );
+    assert!(
+        matches!(edge.insns.last().map(|i| i.op), Some(Opcode::Br)),
+        "the label edge must end by branching to the label"
+    );
 }

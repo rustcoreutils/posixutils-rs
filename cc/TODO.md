@@ -95,10 +95,6 @@ Found by building the torture suite for aarch64 and assembling it with GNU
 as, then running `execute/` under qemu. Neither gate exists in-tree; both
 belong in `cc/scripts` alongside `c17_torture.sh`.
 
-- **Initial-exec TLS uses x86's relocation names.** The aarch64 sequence is
-  printed as `adrp x, :gottpoff:sym` / `:gottpoff_lo12:`, which GNU as rejects;
-  aarch64 spells them `:gottprel:` / `:gottprel_lo12:`. Every initial-exec
-  access to an `extern _Thread_local` fails to assemble (`compile/pr78694`).
 - **No branch relaxation.** A conditional branch reaches +-1 MiB; a function
   past that fails to assemble (`compile/limits-caselabels`). The fix is the
   usual one: invert the condition around an unconditional `b`.

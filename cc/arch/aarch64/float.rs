@@ -108,35 +108,14 @@ impl Aarch64CodeGen {
                 }
             }
             Loc::Global(name) => {
-                // Load FP value from global using ADRP + LDR
-                let sym = if name.starts_with('.') {
-                    Symbol::local(&name)
-                } else {
-                    Symbol::global(&name)
-                };
                 let (scratch0, _, _) = Reg::scratch_regs();
-                if self.needs_got_access(&name) {
-                    // External symbols on macOS: load address from GOT, then load FP value
-                    let extern_sym = Symbol::extern_sym(&name);
-                    self.push_lir(Aarch64Inst::AdrpGotPage {
-                        sym: extern_sym.clone(),
-                        dst: scratch0,
-                    });
-                    self.push_lir(Aarch64Inst::LdrSymGotPageOff {
-                        sym: extern_sym,
-                        base: scratch0,
-                        dst: scratch0,
-                    });
-                    // Now scratch0 has the address, load the FP value
-                    self.push_lir(Aarch64Inst::LdrFp {
-                        size: fp_size,
-                        addr: MemAddr::BaseOffset {
-                            base: scratch0,
-                            offset: insn.offset as i32,
-                        },
-                        dst: dst_vreg,
-                    });
-                } else {
+                if insn.offset == 0 && !self.is_elf_tls(&name) && !self.needs_got_access(&name) {
+                    // A global defined here, at its own address: ADRP + LDR.
+                    let sym = if name.starts_with('.') {
+                        Symbol::local(&name)
+                    } else {
+                        Symbol::global(&name)
+                    };
                     self.push_lir(Aarch64Inst::Adrp {
                         sym: sym.clone(),
                         dst: scratch0,
@@ -145,6 +124,24 @@ impl Aarch64CodeGen {
                         size: fp_size,
                         sym,
                         base: scratch0,
+                        dst: dst_vreg,
+                    });
+                } else {
+                    // Everything else takes its address from `emit_load_addr`,
+                    // the one place that knows every way to reach a global. This
+                    // arm used to build its own ADRP sequences and knew two of
+                    // them: a thread-local came out as `adrp x9, td; ldr d0,
+                    // [x9, :lo12:td]`, which reads the initialization image
+                    // rather than this thread's copy -- every `double` or
+                    // `float` thread-local read the same, never-updated value --
+                    // and `insn.offset` was dropped outside the GOT case.
+                    self.emit_load_addr(&name, scratch0);
+                    self.push_lir(Aarch64Inst::LdrFp {
+                        size: fp_size,
+                        addr: MemAddr::BaseOffset {
+                            base: scratch0,
+                            offset: insn.offset as i32,
+                        },
                         dst: dst_vreg,
                     });
                 }

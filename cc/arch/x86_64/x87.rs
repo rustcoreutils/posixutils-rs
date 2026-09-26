@@ -103,28 +103,7 @@ impl X86_64CodeGen {
                     }
                 }
             }
-            Loc::Global(name) => {
-                // For globals, use RIP-relative addressing
-                if self.needs_got_access(&name) {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::GotPcrel(
-                            crate::arch::lir::Symbol::extern_sym(name.clone()),
-                        )),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    MemAddr::BaseOffset {
-                        base: Reg::R11,
-                        offset: insn.offset as i32,
-                    }
-                } else {
-                    MemAddr::RipRelative(crate::arch::lir::Symbol {
-                        name,
-                        is_local: false,
-                        is_extern: false,
-                    })
-                }
-            }
+            Loc::Global(name) => self.global_mem(&name, insn.offset as i32, Reg::R11),
             _ => {
                 // Load address into R11
                 self.emit_move(addr, Reg::R11, 64);
@@ -261,27 +240,7 @@ impl X86_64CodeGen {
                     }
                 }
             }
-            Loc::Global(name) => {
-                if self.needs_got_access(&name) {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::GotPcrel(
-                            crate::arch::lir::Symbol::extern_sym(name.clone()),
-                        )),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    MemAddr::BaseOffset {
-                        base: Reg::R11,
-                        offset: insn.offset as i32,
-                    }
-                } else {
-                    MemAddr::RipRelative(crate::arch::lir::Symbol {
-                        name,
-                        is_local: false,
-                        is_extern: false,
-                    })
-                }
-            }
+            Loc::Global(name) => self.global_mem(&name, insn.offset as i32, Reg::R11),
             _ => {
                 self.emit_move(addr, Reg::R11, 64);
                 MemAddr::BaseOffset {

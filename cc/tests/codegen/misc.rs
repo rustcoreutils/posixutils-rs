@@ -6771,7 +6771,7 @@ int *addr_tls(void) { return &tv; }
             "aarch64 {flags:?}: expected the dynamic model:\n{asm}"
         );
         assert!(
-            !asm.contains("tprel") && !asm.contains("gottpoff"),
+            !asm.contains("tprel") && !asm.contains("gottprel"),
             "aarch64 {flags:?}: a static model cannot serve a dlopened library:\n{asm}"
         );
     }
@@ -6845,7 +6845,7 @@ int *addr_tls(void) { return &tv; }
 
         let asm = asm_for_with("tls_le", AARCH64_LINUX, src, flags);
         assert!(
-            asm.contains("tprel") && !asm.contains("gottpoff"),
+            asm.contains(":tprel_hi12:") && !asm.contains("gottprel"),
             "aarch64 {flags:?}: an executable should use Local Exec:\n{asm}"
         );
     }
@@ -6863,6 +6863,13 @@ int read_ev(int x) { return x + ev; }
     assert!(
         asm.contains("@GOTTPOFF"),
         "x86_64: extern TLS needs Initial Exec even in an executable:\n{asm}"
+    );
+    // aarch64 spells the same relocations `:gottprel:`/`:gottprel_lo12:`;
+    // x86-64's `gottpoff` there is rejected by the assembler.
+    let asm = asm_for_with("tls_extern", AARCH64_LINUX, src, &["-O"]);
+    assert!(
+        asm.contains(":gottprel:") && asm.contains(":gottprel_lo12:") && !asm.contains("gottpoff"),
+        "aarch64: extern TLS needs Initial Exec even in an executable:\n{asm}"
     );
 }
 

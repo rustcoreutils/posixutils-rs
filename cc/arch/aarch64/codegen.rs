@@ -985,16 +985,25 @@ impl Aarch64CodeGen {
         }
         if self.use_tls_ie(name) {
             // Initial Exec model (extern TLS or shared library):
-            //   adrp  dst, :gottpoff:sym
-            //   ldr   dst, [dst, :gottpoff_lo12:sym]
+            //   adrp  dst, :gottprel:sym
+            //   ldr   dst, [dst, #:gottprel_lo12:sym]
             //   mrs   tmp, tpidr_el0
             //   add   dst, tmp, dst
-            let tmp = Reg::X16; // scratch register
-            self.push_lir(Aarch64Inst::AdrpGottpoff {
+            //
+            // The thread pointer needs a register of its own, and no scratch
+            // the callers use is free: a store passes X16 as `dst` with the
+            // value in X9, and a struct copy computes one address into X17
+            // while its other cursor is live in X16. Borrowing X16, as this
+            // did, turned a store into `mrs x16, ...; add x16, x16, x16` --
+            // twice the thread pointer, a wild write. X15 is free by
+            // construction: the legalizer cannot touch it between the `mrs`
+            // and the `add`, since neither is ever expanded.
+            let tmp = super::legalize::LEGALIZE_REG;
+            self.push_lir(Aarch64Inst::AdrpGottprel {
                 sym: sym.clone(),
                 dst,
             });
-            self.push_lir(Aarch64Inst::LdrGottpoffLo12 {
+            self.push_lir(Aarch64Inst::LdrGottprelLo12 {
                 sym,
                 base: dst,
                 dst,

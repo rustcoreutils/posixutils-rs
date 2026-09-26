@@ -31,10 +31,18 @@ enum ComputedAddr {
 }
 
 impl Aarch64CodeGen {
+    /// Whether `name` is a thread-local reached through the thread pointer,
+    /// so that its address has to come from [`Self::emit_tls_addr`] and never
+    /// from `adrp`/`:lo12:`, which would name the variable's initialization
+    /// image rather than this thread's copy. (Linux ELF only.)
+    pub(super) fn is_elf_tls(&self, name: &str) -> bool {
+        self.tls_symbols.contains(name) && self.base.target.os == Os::Linux
+    }
+
     /// Load address of a global symbol into a register
     pub(super) fn emit_load_addr(&mut self, name: &str, dst: Reg) {
         // Thread-local storage: compute TLS address directly (Linux ELF only)
-        if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
+        if self.is_elf_tls(name) {
             self.emit_tls_addr(name, dst);
             return;
         }
@@ -76,7 +84,7 @@ impl Aarch64CodeGen {
     /// Load value of a global symbol into a register with specified size
     pub(super) fn emit_load_global(&mut self, name: &str, dst: Reg, size: OperandSize) {
         // Thread-local storage: compute TLS address, then load value (Linux ELF only)
-        if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
+        if self.is_elf_tls(name) {
             self.emit_tls_addr(name, dst);
             // dst now holds the address of the TLS variable; load from it
             self.push_lir(Aarch64Inst::Ldr {

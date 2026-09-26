@@ -15,10 +15,10 @@
 //
 // Scratch registers (NEVER allocated to pseudos):
 //   X9, X10, X11 - Reserved for codegen temporaries
-//   X15          - Immediate legalization (see `legalize.rs`). Written only by
-//                  the legalizer, only inside the one instruction it expands,
-//                  and never named by codegen -- so it holds nothing from one
-//                  instruction to the next.
+//   X15          - Immediate legalization (see `legalize.rs`). Never carries a
+//                  value across an instruction the legalizer could expand;
+//                  `legalize.rs` names the two codegen sequences that borrow
+//                  it within that rule.
 //   X16, X17     - Linker scratch (IP0/IP1 per AAPCS64)
 //
 // Codegen MUST use only scratch registers (X9, X10, X11, X16, X17) for

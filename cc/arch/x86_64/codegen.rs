@@ -295,6 +295,65 @@ impl X86_64CodeGen {
         false
     }
 
+    /// The memory operand for byte `offset` of the global `name`, for an access
+    /// emitted immediately after. Any setup it needs is emitted now, through
+    /// `scratch`, which must stay untouched until that access.
+    ///
+    /// One implementation of "how to reach a global" for the floating-point
+    /// and x87 load and store paths, which each used to build their own
+    /// operand and knew only RIP-relative and GOT access. A thread-local came
+    /// out as `movsd tv(%rip)`: the variable's initialization image rather
+    /// than this thread's copy, and for an `extern` one a non-TLS reference
+    /// the linker rejects. And the RIP-relative form dropped `offset`.
+    pub(super) fn global_mem(&mut self, name: &str, offset: i32, scratch: Reg) -> MemAddr {
+        if self.is_tls_symbol(name) {
+            let symbol = Symbol::global(name.to_string());
+            if offset == 0 {
+                if !self.use_tls_ie(name) {
+                    return MemAddr::TlsLocalExec(symbol);
+                }
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(MemAddr::TlsGottpoff(symbol)),
+                    dst: GpOperand::Reg(scratch),
+                });
+                return MemAddr::FsBase(scratch);
+            }
+            self.emit_tls_addr(name, scratch);
+            return MemAddr::BaseOffset {
+                base: scratch,
+                offset,
+            };
+        }
+        if self.needs_got_access(name) {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.to_string()))),
+                dst: GpOperand::Reg(scratch),
+            });
+            return MemAddr::BaseOffset {
+                base: scratch,
+                offset,
+            };
+        }
+        let symbol = if name.starts_with('.') {
+            Symbol::local(name.to_string())
+        } else {
+            Symbol::global(name.to_string())
+        };
+        if offset == 0 {
+            return MemAddr::RipRelative(symbol);
+        }
+        self.push_lir(X86Inst::Lea {
+            addr: MemAddr::RipRelative(symbol),
+            dst: scratch,
+        });
+        MemAddr::BaseOffset {
+            base: scratch,
+            offset,
+        }
+    }
+
     /// Emit .loc directive for source line tracking (delegates to base)
     fn emit_loc(&mut self, insn: &Instruction) {
         self.base.emit_loc(insn);

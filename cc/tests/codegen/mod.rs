@@ -23,3 +23,4 @@ mod pic;
 mod promotion;
 mod regalloc;
 mod sections;
+mod tls_models;

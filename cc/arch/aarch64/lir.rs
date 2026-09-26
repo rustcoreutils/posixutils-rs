@@ -244,14 +244,17 @@ pub enum Aarch64Inst {
         reg: Reg,
     },
 
-    /// TLS Initial Exec: adrp dst, :gottpoff:sym
-    AdrpGottpoff {
+    /// TLS Initial Exec: `adrp dst, :gottprel:sym` -- the page of the GOT entry
+    /// holding `sym`'s offset from the thread pointer. (`gottpoff` is x86-64's
+    /// name for the same thing; GNU as rejects it here.)
+    AdrpGottprel {
         sym: Symbol,
         dst: Reg,
     },
 
-    /// TLS Initial Exec: ldr dst, [base, :gottpoff_lo12:sym]
-    LdrGottpoffLo12 {
+    /// TLS Initial Exec: `ldr dst, [base, #:gottprel_lo12:sym]` -- the offset
+    /// itself, from that GOT entry.
+    LdrGottprelLo12 {
         sym: Symbol,
         base: Reg,
         dst: Reg,
@@ -958,16 +961,16 @@ impl EmitAsm for Aarch64Inst {
             }
             Aarch64Inst::Blr { reg } => Self::emit_branch_reg("blr", reg, out),
             Aarch64Inst::BrReg { reg } => Self::emit_branch_reg("br", reg, out),
-            Aarch64Inst::AdrpGottpoff { sym, dst } => {
+            Aarch64Inst::AdrpGottprel { sym, dst } => {
                 let sym_name = sym.format_for_target(target);
-                let _ = writeln!(out, "    adrp {}, :gottpoff:{}", dst.name64(), sym_name);
+                let _ = writeln!(out, "    adrp {}, :gottprel:{}", dst.name64(), sym_name);
             }
 
-            Aarch64Inst::LdrGottpoffLo12 { sym, base, dst } => {
+            Aarch64Inst::LdrGottprelLo12 { sym, base, dst } => {
                 let sym_name = sym.format_for_target(target);
                 let _ = writeln!(
                     out,
-                    "    ldr {}, [{}, :gottpoff_lo12:{}]",
+                    "    ldr {}, [{}, #:gottprel_lo12:{}]",
                     dst.name64(),
                     base.name64(),
                     sym_name

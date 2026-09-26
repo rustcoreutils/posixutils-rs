@@ -5363,6 +5363,21 @@ fn test_attr_aligned_enumerator() {
     assert_eq!(decl.declarators[0].explicit_align, Some(32));
 }
 
+/// A `vector_size` past 2^31 bytes still aligns to 16, as gcc's does.
+///
+/// The width was rounded to a power of two and then cast to `u32` before the
+/// cap was applied, so 2^32 bytes and more came out with alignment 0.
+#[test]
+fn test_attr_vector_size_wide_alignment() {
+    if let Err(e) = parse_tu(
+        "typedef long V __attribute__((vector_size(8589934592L)));\n\
+         _Static_assert(_Alignof(V) == 16, \"align\");\n\
+         _Static_assert(sizeof(V) == 8589934592UL, \"size\");",
+    ) {
+        panic!("should have parsed: {e}");
+    }
+}
+
 /// `vector_size` folds its argument the same way.
 #[test]
 fn test_attr_vector_size_constant_expression() {
@@ -5932,7 +5947,7 @@ fn test_stack_object_larger_than_a_frame_slot_is_rejected() {
 /// Static storage duration is not the frame's problem.
 ///
 /// The guard that keeps the new ceiling from becoming a second, tighter
-/// `MAX_OBJECT_BYTES`. `array_parameter_decays` and the pointer case are the two
+/// `max_object_bytes`. `array_parameter_decays` and the pointer case are the two
 /// that break if the parameter check is moved before the C17 6.7.5.3 adjustment:
 /// that parameter is a `char *`. A variable length array has no static extent to
 /// measure, so the rule declines to answer: its extent is subtracted from the
@@ -5953,6 +5968,87 @@ fn test_static_object_larger_than_a_frame_slot_is_accepted() {
     ] {
         if let Err(e) = parse_tu(src) {
             panic!("{src}\nshould have parsed: {e}");
+        }
+    }
+}
+
+/// An object may be as large as `PTRDIFF_MAX`, gcc's bound, and `sizeof` and
+/// every spelling of a member offset fold exactly up to it.
+///
+/// The bound was `u64::MAX / 8` because struct layout accumulated its bits in
+/// a `usize`, so gcc.c-torture `991014-1` -- a struct of 2^63 - 496 bytes --
+/// was refused. Each `_Static_assert` below is gcc's answer.
+#[test]
+fn test_object_up_to_ptrdiff_max_is_accepted() {
+    let src = "\
+        struct H { short buf[(1L << 62) - 256]; int a, b, c, d; };\n\
+        union U { int a; char buf[(1L << 62) - 256]; };\n\
+        struct B { char pad[5000000000L]; int x; unsigned f : 3, g : 5; long y; };\n\
+        struct E { char buf[9223372036854775807L]; };\n\
+        _Static_assert(sizeof(struct H) == 9223372036854775312UL, \"H\");\n\
+        _Static_assert(sizeof(union U) == 4611686018427387648UL, \"U\");\n\
+        _Static_assert(sizeof(struct E) == 9223372036854775807UL, \"E\");\n\
+        _Static_assert(__builtin_offsetof(struct H, d) == 9223372036854775308UL, \"d\");\n\
+        _Static_assert((unsigned long)&((struct H *)0)->b == 9223372036854775300UL, \"b\");\n\
+        _Static_assert(__builtin_offsetof(struct B, y) == 5000000008UL, \"y\");\n\
+        _Static_assert(sizeof(struct B) == 5000000016UL, \"B\");\n\
+        _Static_assert(sizeof(struct B[3]) == 15000000048UL, \"B[3]\");\n\
+        _Static_assert(sizeof(char[9223372036854775807L]) == 9223372036854775807UL, \"max\");\n";
+    if let Err(e) = parse_tu(src) {
+        panic!("should have parsed: {e}");
+    }
+}
+
+/// One byte past `PTRDIFF_MAX` is refused, in each of the shapes that can
+/// reach it, and the message names the bound.
+#[test]
+fn test_object_past_ptrdiff_max_is_rejected() {
+    for (src, needle) in [
+        (
+            "char a[9223372036854775808UL];",
+            "size of array is too large",
+        ),
+        ("int a[2305843009213693952L];", "size of array is too large"),
+        (
+            "char a[4000000000L][4000000000L];",
+            "size of array is too large",
+        ),
+        (
+            "struct H { short buf[(1L << 62) - 256]; int a; }; struct H h[2];",
+            "size of array is too large",
+        ),
+        (
+            "struct S { char a[9223372036854775807L]; int b; };",
+            "type 'struct S' is too large",
+        ),
+        (
+            "struct S { char a[9223372036854775807L]; char b; };",
+            "type 'struct S' is too large",
+        ),
+        (
+            "struct S { char a[9223372036854775807L]; char b[9223372036854775807L]; \
+             char c[9223372036854775807L]; };",
+            "type 'struct S' is too large",
+        ),
+        (
+            "union U { char a[9223372036854775807L]; int b; };",
+            "type 'union U' is too large",
+        ),
+        (
+            "struct { char a[9223372036854775807L]; int b; } s;",
+            "type 'struct <anonymous>' is too large",
+        ),
+    ] {
+        match parse_tu(src) {
+            Err(e) => {
+                let e = e.to_string();
+                assert!(e.contains(needle), "{src}\nwrong message: {e}");
+                assert!(
+                    e.contains("maximum object size of 9223372036854775807 bytes"),
+                    "{src}\nmessage does not name the bound: {e}"
+                );
+            }
+            Ok(_) => panic!("{src}\nshould have been rejected"),
         }
     }
 }
@@ -6269,6 +6365,29 @@ fn test_stmt_expr_labeled_last_statement_has_its_value() {
             panic!("expected a statement");
         };
         assert!(matches!(&**stmt, Stmt::Label { stmt, .. } if matches!(**stmt, Stmt::Empty)));
+    }
+}
+
+/// A `case` or `default` label in front of the last statement is a label like
+/// any other: the statement expression keeps its value, so the one error such
+/// a program earns is "switch jumps into statement expression", not a second
+/// one about a `void` value.
+#[test]
+fn test_stmt_expr_case_labeled_last_statement_has_its_value() {
+    for src in ["({ case 1: 5; })", "({ default: 5; })"] {
+        let (expr, types, _, _) = parse_expr(src).unwrap();
+        let ExprKind::StmtExpr { stmts, result } = &expr.kind else {
+            panic!("expected StmtExpr");
+        };
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int, "{src}");
+        assert!(matches!(result.kind, ExprKind::IntLit(5)), "{src}");
+        let [BlockItem::Statement(label)] = stmts.as_slice() else {
+            panic!("{src}: expected one label");
+        };
+        assert!(
+            matches!(&**label, Stmt::Case(_, _, s) | Stmt::Default(_, s) if matches!(**s, Stmt::Empty)),
+            "{src}"
+        );
     }
 }
 

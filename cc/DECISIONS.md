@@ -270,14 +270,13 @@ injecting one into a skip list and watching the gate fail.
 ### Deliberate divergences from gcc
 
 `20021127-1`, `20031003-1` and `pr46309` are skipped as gcc-specific behaviour
-above; the reasoning is in that table. Two more are divergences c17 keeps but
-does **not** skip, because neither is GNU-specific:
+above; the reasoning is in that table. One more is a divergence c17 keeps but
+does **not** skip, because it is not GNU-specific:
 
 | Test | Why c17 does not follow |
 |---|---|
-| `991014-1` | Needs an object of ~9.2 exabytes. `MAX_OBJECT_BYTES` is `u64::MAX / 8`, a quarter of that: struct layout runs in **bits**, because a bit-field's position is only expressible there, so a member list whose total passes `u64::MAX` bits has no layout to compute. It is no longer the old 512 MB -- that bound was an accident of `size_bits` answering in a `u32`, and object sizes are counted in bytes now |
 | `920728-1` | `return;` in a function returning non-void. C17 6.8.6.4p1 makes it a constraint violation; gcc issues a warning and compiles. `-fpermissive` arguably ought to downgrade it, as it does for implicit `int` |
 
-Complex integer division is a third, recorded in `BUILTIN.md`: c17 uses
+Complex integer division is a second, recorded in `BUILTIN.md`: c17 uses
 Smith's method because the exact formula overflows, and so answers `6 + 1i`
 for `(-9 + 38i) / (5 + 6i)` exactly as gcc does.

@@ -395,11 +395,10 @@ impl Parser<'_> {
         }
     }
 
-    /// Derive an array type, refusing an extent the compiler cannot describe:
-    /// `TypeTable::size_bits` answers in a `u32`, so an object wider than
-    /// `u32::MAX` bits has no representable size. Enforced here, where the
-    /// element type is known, so an outer dimension is measured against an
-    /// inner one already within the bound.
+    /// Derive an array type, refusing an extent past
+    /// [`TypeTable::max_object_bytes`] (`PTRDIFF_MAX`), gcc's bound too.
+    /// Enforced here, where the element type is known, so an outer dimension
+    /// is measured against an inner one already within the bound.
     pub(super) fn derive_array_type(
         &mut self,
         elem: TypeId,
@@ -408,11 +407,12 @@ impl Parser<'_> {
     ) -> Result<TypeId, ParseError> {
         if let Some(count) = size {
             let total = (count as u128) * (self.types.size_bytes(elem) as u128);
-            if total > TypeTable::MAX_OBJECT_BYTES as u128 {
+            let max = self.types.max_object_bytes();
+            if total > max as u128 {
                 return Err(ParseError::new(
                     format!(
-                        "size of array exceeds the maximum object size of {} bytes",
-                        TypeTable::MAX_OBJECT_BYTES
+                        "size of array is too large: it exceeds the maximum \
+                         object size of {max} bytes"
                     ),
                     pos,
                 ));
@@ -438,7 +438,7 @@ impl Parser<'_> {
     /// Asked only of an object with *automatic* storage duration and of a
     /// by-value parameter type. A static or file-scope object of the same size
     /// is addressed symbolically and works, so widening this to every
-    /// declaration would make it a second, tighter `MAX_OBJECT_BYTES` and would
+    /// declaration would make it a second, tighter `max_object_bytes` and would
     /// reject what `diagnostics_largest_describable_object_is_accepted`
     /// requires.
     ///

@@ -517,7 +517,9 @@ impl Label {
         if self.internal {
             return internal_label(&self.func_name, self.block_id);
         }
-        quote_symbol_if_needed(&format!(".L{}_{}", self.func_name, self.block_id))
+        quote_symbol_if_needed(
+            &crate::ir::BasicBlockId(self.block_id).label_symbol(&self.func_name),
+        )
     }
 }
 

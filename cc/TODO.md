@@ -115,7 +115,7 @@ not bounded. They are both plain integers, so nothing stops one being used
 where the other is meant, and the unit (bits or bytes) is a naming convention
 rather than a type.
 
-That cost a silent miscompile once already. While `MAX_OBJECT_BYTES` was
+That cost a silent miscompile once already. While `max_object_bytes` was
 `u32::MAX / 8`, `size_bits` could not saturate -- the parser refused any type
 that would reach it -- so deriving a byte count as `size_bits / 8` was safe by
 accident. Raising the bound made saturation reachable and every such site
@@ -148,7 +148,7 @@ finds rather than a spelling a reader has to notice. Widening `size_bits` to
 364 want a `u32` because they are value widths, and silencing them with `as
 u32` reintroduces the same truncation at the seventy aggregate-fed sites.
 
-A second unit lives in the same area and is settled: `TypeTable::MAX_OBJECT_BYTES`
+A second unit lives in the same area and is settled: `TypeTable::max_object_bytes`
 bounds what a size can be *described* as, while
 `TypeTable::MAX_STACK_OBJECT_BYTES` bounds what the backends can give a *slot*,
 because a frame displacement is an `i32`. `crate::abi::slot_bytes` is the only
@@ -179,7 +179,7 @@ What it takes:
   `ActiveSlot`/`FreeSlot`, `callee_saved_offset`, `stack_alloc_size`,
   `reg_save_area_offset`, the outgoing-argument layout, `IncomingOff`, and the
   CFI directive offsets. `grow_frame` and `slot_bytes` then bound at
-  `MAX_OBJECT_BYTES` instead, less the prologue headroom
+  `max_object_bytes` instead, less the prologue headroom
   (`FRAME_HEADROOM_BYTES`) and the frame's final alignment rounding, which
   `grow_frame` reserves today for the same reason.
 - A displacement outside the target's encodable range goes through a scratch
@@ -374,7 +374,6 @@ Most of what is left is one thing.
 |---|---|
 | Builtin folding | The whole of `execute/builtins/`. Each test defines its own `strlen`, `memcpy` or `printf` that calls `abort()` when `__OPTIMIZE__` is set, so a run-time failure there means c17 emitted a real call where gcc folded the builtin or expanded it inline. Nothing fails to *compile*, so no build is blocked; it is gcc-parity and code quality. Deferred by decision. The same group: `execute/printf-chk-1`, `fprintf-chk-1`, `vprintf-chk-1` and `vfprintf-chk-1` at `-O2`, which expect `__printf_chk` with a constant format to become `puts`/`putchar`; `builtins/abs-2`, `abs-3`, `complex-1` and `memcmp` at `-O2`, which expect a constant call folded so that a `link_error` reference disappears; `builtins/strncmp` at `-O0`, whose own `strncmp` returns an uninitialised value for `n == 0`, so it passes only when the call is folded to 0 -- which gcc does at every level; `builtins/abs-1`, which expects `labs` expanded inline at every level; and `builtins/strnlen`, `strstr-asm`, `fprintf` and `fputs` at `-O1` and above |
 | Dead-call elimination proofs | `20030330-1`, `medce-1` and `ieee/fp-cmp-7` at `-O0`, where a constant branch keeps its arm (recorded in DECISIONS.md). Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link* |
-| The remaining divergence | `991014-1` |
 
 One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.
 gcc accepts a conditional with one `void` arm as an extension; C17 6.5.15p3

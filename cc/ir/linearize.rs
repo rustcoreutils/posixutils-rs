@@ -1213,8 +1213,9 @@ impl<'a> Linearizer<'a> {
 
         // C17 6.8.6.1p1, before anything is lowered: entering the scope of a
         // variably modified identifier without executing its declaration
-        // leaves the object's size never computed.
-        self.check_jumps_into_variably_modified_scopes(&func.body);
+        // leaves the object's size never computed. gcc holds a statement
+        // expression to the same rule.
+        self.check_jumps_into_protected_scopes(&func.body);
 
         self.reset_for_function(func);
 

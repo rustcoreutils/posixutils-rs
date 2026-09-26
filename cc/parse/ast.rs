@@ -1358,7 +1358,7 @@ impl Expr {
 
     /// Every expression this one directly contains, apart from the statements
     /// of a statement expression, which are not expressions.
-    fn operands(&self) -> Vec<&Expr> {
+    pub(crate) fn operands(&self) -> Vec<&Expr> {
         use ExprKind as K;
         match &self.kind {
             K::IntLit(_)

@@ -724,6 +724,19 @@ impl fmt::Display for BasicBlockId {
     }
 }
 
+impl BasicBlockId {
+    /// The assembler symbol that names this block of function `func_name`,
+    /// unquoted: what `&&label` evaluates to, and what the backends define at
+    /// the head of the block.
+    ///
+    /// One spelling for both, because a reference and a definition that
+    /// disagree link against nothing -- and the inliner has to rebuild the
+    /// name when it moves a block into another function.
+    pub fn label_symbol(self, func_name: &str) -> String {
+        format!(".L{}_{}", func_name, self.0)
+    }
+}
+
 // Inline Assembly Support
 
 /// Constraint information for an inline asm operand
@@ -1907,13 +1920,22 @@ pub struct Function {
     pub declared_effect: crate::parse::ast::MemEffect,
     /// Whether this function takes the address of one of its own labels.
     ///
-    /// Such a function cannot be inlined: the address is a symbol naming a
-    /// block of *this* function, and inlining renumbers blocks into the
-    /// caller, leaving a reference nothing defines. Recorded here rather than
-    /// recovered from symbol names, because a string literal's symbol is also
-    /// spelled `.L...` and matching on the prefix silently stopped every
-    /// function containing a string literal from being inlined.
+    /// The address is a symbol naming a block of *this* function, so memory
+    /// analysis gives up on it, and the inliner renames the symbol for every
+    /// block it moves into a caller -- which then takes a label address of
+    /// its own. Recorded here rather than recovered from symbol names,
+    /// because a string literal's symbol is also spelled `.L...` and matching
+    /// on the prefix silently stopped every function containing a string
+    /// literal from being inlined.
     pub takes_label_addr: bool,
+    /// Whether a label address of this function initializes an object of
+    /// static storage duration -- `static void *tbl[] = {&&a, &&b};`.
+    ///
+    /// The table is one object however many copies of the body exist, and it
+    /// names *this* function's blocks, so no copy of the body could use it.
+    /// gcc never copies such a function ("saves address of local label in a
+    /// static variable"), and neither does the inliner.
+    pub saves_label_in_static: bool,
     /// `__attribute__((always_inline))`: inline at every call site regardless
     /// of size, and at `-O0` too. `is_noinline` wins if both are present.
     pub is_always_inline: bool,
@@ -1959,6 +1981,7 @@ impl Default for Function {
             symbol_attrs: Default::default(),
             align: None,
             takes_label_addr: false,
+            saves_label_in_static: false,
             return_type: TypeId::INVALID,
             params: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
             blocks: Vec::new(),

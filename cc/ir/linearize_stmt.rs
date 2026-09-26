@@ -333,7 +333,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Case(_, _, body) | Stmt::Default(_, body) => {
                 // The label itself is placed by `linearize_switch`; reaching
                 // one here means it is outside a switch, which
-                // `check_jumps_into_variably_modified_scopes` has already
+                // `check_jumps_into_protected_scopes` has already
                 // diagnosed. The statement it labels is still ordinary code
                 // and is lowered, so the rest of the function is not lost
                 // behind one bad label.
@@ -1641,47 +1641,43 @@ impl<'a> super::linearize::Linearizer<'a> {
     ///
     /// Called once the function body is walked, because `&&label` may appear
     /// after the `goto *` that can reach it.
+    ///
+    /// Every such block is also marked `addr_taken`, dispatch or not. Without
+    /// a `goto *` the address was stored for someone else, or only compared,
+    /// and no edge reaches the block at all: it still has to survive DCE, or
+    /// the symbol the address refers to is never emitted and the link fails
+    /// on an undefined `.L` label. With one, the edges can disappear with the
+    /// dispatch while the address lives on; and the mark is what tells the
+    /// inliner which symbols name blocks it has to rename.
     pub(crate) fn finish_indirect_dispatch(&mut self) {
-        let Some((dispatch_bb, _)) = self.indirect_dispatch else {
-            // The address was taken but this function never branches on it --
-            // it was stored for someone else, or only compared. The blocks
-            // still have to survive DCE, or the symbol the address refers to
-            // is never emitted and the link fails on an undefined `.L` label.
-            for bb in self.addr_taken_labels.clone() {
-                self.get_or_create_bb(bb).addr_taken = true;
-            }
-            return;
-        };
         for bb in self.addr_taken_labels.clone() {
-            self.link_bb(dispatch_bb, bb);
+            self.get_or_create_bb(bb).addr_taken = true;
+            if let Some((dispatch_bb, _)) = self.indirect_dispatch {
+                self.link_bb(dispatch_bb, bb);
+            }
         }
     }
 
+    /// The jumps whose target a function body may not reach from where they
+    /// are written.
+    ///
     /// C17 6.8.6.1p1: a `goto` shall not jump from outside the scope of an
-    /// identifier having a variably modified type to inside it; 6.8.4.2p... the
-    /// same for a `switch` reaching a `case` inside such a scope.
+    /// identifier having a variably modified type to inside it, and 6.8.4.2p2
+    /// the same for a `switch` reaching a `case` inside such a scope. Entering
+    /// the scope without executing the declaration leaves the object's size
+    /// never computed: the array is whatever the stack held.
     ///
-    /// The rule exists because entering the scope without executing the
-    /// declaration leaves the object's size never computed: the array is
-    /// whatever the stack held. Jumping *out* of the scope, within it, or to a
-    /// label that precedes the declaration are all fine, and all are exercised
-    /// by the accept-side tests.
+    /// gcc holds a statement expression to the same rule, since a jump into
+    /// one arrives in the middle of evaluating the expression around it.
     ///
-    /// Reported at the jump, where gcc points, and naming the declaration that
-    /// could not be entered, which gcc does not -- the position says where to
-    /// look and the name says what the problem is.
-    pub(crate) fn check_jumps_into_variably_modified_scopes(&self, body: &Stmt) {
-        let mut w = VmScopeWalk {
-            open: Vec::new(),
-            declared: Vec::new(),
-            labels: Vec::new(),
-            gotos: Vec::new(),
-            bad_case_ids: Vec::new(),
-            loop_depth: 0,
-            switch_depth: 0,
-            stray_jumps: Vec::new(),
-        };
-        w.walk(body, None);
+    /// Jumping *out* of either, within one, or to a label that precedes the
+    /// declaration are all fine, and all are exercised by the accept-side
+    /// tests. Reported at the jump, where gcc points; a variably modified
+    /// scope also names the declaration that could not be entered, which gcc
+    /// does not -- the position says where to look and the name says what the
+    /// problem is.
+    pub(crate) fn check_jumps_into_protected_scopes(&self, body: &Stmt) {
+        let w = JumpScopeWalk::of(body);
 
         // 6.8.1p3: a label name is unique within the function it appears in.
         // Two labels of one name were silently merged into one basic block, so
@@ -1695,19 +1691,20 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // A `goto` is illegal exactly when its label sits inside a scope the
         // `goto` itself is not already in.
-        for (name, from, goto_pos) in &w.gotos {
-            // A label this walk does not see is either missing, which
-            // `check_label_references` reports once the body is lowered, or
-            // inside a statement expression, which this walk does not enter.
-            let Some((_, to, _)) = w.labels.iter().find(|(n, _, _)| n == name) else {
+        for jump in &w.gotos {
+            // A missing label is reported by `check_label_references` once
+            // the body is lowered.
+            let Some((_, to, label_pos)) = w.labels.iter().find(|(n, _, _)| *n == jump.label)
+            else {
                 continue;
             };
-            if let Some(id) = to.iter().find(|id| !from.contains(id)) {
-                self.report_vm_jump(&w.declared[*id], "jump", *goto_pos);
+            let pos = jump.pos.unwrap_or(*label_pos);
+            for id in w.entered(&jump.from, to) {
+                self.report_protected_jump(&w.scopes[id], false, pos);
             }
         }
         for (id, pos) in w.bad_cases() {
-            self.report_vm_jump(&w.declared[id], "switch jump", pos);
+            self.report_protected_jump(&w.scopes[id], true, pos);
         }
 
         for (pos, what) in &w.stray_jumps {
@@ -1721,13 +1718,29 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Name the declaration a jump would have entered without executing.
-    fn report_vm_jump(&self, decl: &VmDecl, what: &str, pos: Position) {
-        let name = self.strings.get(self.symbols.get(decl.symbol).name);
-        error(
-            pos,
-            &format!("{what} into the scope of '{name}', which has a variably modified type",),
-        );
+    /// Report a jump into `scope`, by a `switch` reaching a label inside it
+    /// or by a `goto`.
+    fn report_protected_jump(&self, scope: &JumpScope, by_switch: bool, pos: Position) {
+        match scope {
+            JumpScope::VariablyModified(symbol) => {
+                let what = if by_switch { "switch jump" } else { "jump" };
+                let name = self.strings.get(self.symbols.get(*symbol).name);
+                error(
+                    pos,
+                    &format!(
+                        "{what} into the scope of '{name}', which has a variably modified type",
+                    ),
+                );
+            }
+            JumpScope::StmtExpr => {
+                let message = if by_switch {
+                    "switch jumps into statement expression"
+                } else {
+                    "jump into statement expression"
+                };
+                error(pos, &gettextrs::gettext(message));
+            }
+        }
     }
 
     /// Report a case endpoint the constant folder could not reduce.
@@ -3390,7 +3403,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         if let Some(func) = &mut self.current_func {
             func.takes_label_addr = true;
         }
-        Some(format!(".L{}_{}", self.current_func_name, bb.0))
+        Some(bb.label_symbol(&self.current_func_name))
     }
 
     pub(crate) fn get_or_create_label(&mut self, name: &str) -> BasicBlockId {
@@ -3407,28 +3420,47 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 }
 
-/// A declaration whose type is variably modified, and so whose scope may not
-/// be entered by a jump (C17 6.8.6.1p1).
-pub(crate) struct VmDecl {
-    pub(crate) symbol: crate::symbol::SymbolId,
+/// A scope that no jump may enter from outside it.
+enum JumpScope {
+    /// The scope of an identifier with a variably modified type, from its
+    /// declarator to the end of its block (C17 6.8.6.1p1).
+    VariablyModified(crate::symbol::SymbolId),
+    /// A GNU statement expression. gcc forbids entering one by `goto`, by
+    /// `asm goto` or by a `switch` reaching a `case` inside it: control would
+    /// arrive in the middle of evaluating the expression around it. Leaving
+    /// one is allowed, and so is a computed `goto`, which gcc documents as
+    /// undefined rather than diagnosing.
+    StmtExpr,
+}
+
+/// A `goto`, or one label of an `asm goto`, as the walk found it.
+struct JumpRecord {
+    label: StringId,
+    /// The scopes enclosing the jump.
+    from: Vec<usize>,
+    /// Where the jump was written. An `asm goto` records none for its
+    /// labels, and is reported at the label it names instead.
+    pos: Option<Position>,
 }
 
 /// Walks a function body recording, for every label and every jump, which
-/// variably modified scopes enclose it.
+/// [`JumpScope`]s enclose it.
 ///
-/// A scope opens at the declaration and runs to the end of its block, so the
-/// walk is order-sensitive within a block: a label *before* the declaration is
-/// outside the scope and may be jumped to, which is why the scopes are pushed
-/// as the items are visited rather than collected up front.
-struct VmScopeWalk {
+/// A variably modified scope opens at the declarator and runs to the end of
+/// its block, so the walk is order-sensitive within a block: a label *before*
+/// the declaration is outside the scope and may be jumped to, which is why the
+/// scopes are pushed as the items are visited rather than collected up front.
+/// Expressions are walked too, because a statement expression inside one holds
+/// statements -- and labels, and jumps -- of its own.
+struct JumpScopeWalk {
     /// Ids of the scopes currently open, innermost last.
     open: Vec<usize>,
-    /// Every variably modified declaration seen, indexed by scope id.
-    declared: Vec<VmDecl>,
+    /// Every scope seen, indexed by scope id.
+    scopes: Vec<JumpScope>,
     /// Label name, the scopes enclosing it, and where it was written.
     labels: Vec<(StringId, Vec<usize>, Position)>,
-    /// Each `goto`, the scopes enclosing it, and where it was written.
-    gotos: Vec<(StringId, Vec<usize>, Position)>,
+    /// Each `goto` and `asm goto` label.
+    gotos: Vec<JumpRecord>,
     /// Scope ids a `case`/`default` was found inside but its `switch` was not,
     /// each with the position of the label that reached it.
     bad_case_ids: Vec<(usize, Position)>,
@@ -3442,40 +3474,82 @@ struct VmScopeWalk {
     stray_jumps: Vec<(Position, &'static str)>,
 }
 
-impl VmScopeWalk {
-    /// The offending scopes, each reported once however many `case` labels
-    /// sit inside it.
+impl JumpScopeWalk {
+    /// The walk of one function body.
+    fn of(body: &Stmt) -> Self {
+        let mut w = JumpScopeWalk {
+            open: Vec::new(),
+            scopes: Vec::new(),
+            labels: Vec::new(),
+            gotos: Vec::new(),
+            bad_case_ids: Vec::new(),
+            loop_depth: 0,
+            switch_depth: 0,
+            stray_jumps: Vec::new(),
+        };
+        w.walk(body, None);
+        w
+    }
+
+    /// The offending scopes. A variably modified scope is reported once
+    /// however many `case` labels sit inside it; a statement expression once
+    /// per label, as gcc does.
     fn bad_cases(&self) -> Vec<(usize, Position)> {
         let mut out: Vec<(usize, Position)> = Vec::new();
         for (id, pos) in &self.bad_case_ids {
-            if !out.iter().any(|(seen, _)| seen == id) {
+            let once_per_scope = matches!(self.scopes[*id], JumpScope::VariablyModified(_));
+            if !once_per_scope || !out.iter().any(|(seen, _)| seen == id) {
                 out.push((*id, *pos));
             }
         }
         out
     }
 
+    /// The scopes a jump from `from` into `to` would enter, keeping only the
+    /// outermost of each kind: one jump earns at most one diagnostic of each.
+    fn entered(&self, from: &[usize], to: &[usize]) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        for &id in to.iter().filter(|id| !from.contains(id)) {
+            let same_kind = |other: &usize| {
+                std::mem::discriminant(&self.scopes[*other])
+                    == std::mem::discriminant(&self.scopes[id])
+            };
+            if !out.iter().any(same_kind) {
+                out.push(id);
+            }
+        }
+        // gcc names the variably modified scope first.
+        out.sort_by_key(|id| matches!(self.scopes[*id], JumpScope::StmtExpr));
+        out
+    }
+
+    /// A block's items, closing on the way out every scope they opened.
+    fn walk_items(&mut self, items: &[BlockItem], switch_scopes: Option<&[usize]>) {
+        let depth = self.open.len();
+        for item in items {
+            match item {
+                BlockItem::Declaration(decl) => self.walk_decl(decl, switch_scopes),
+                BlockItem::Statement(s) => self.walk(s, switch_scopes),
+            }
+        }
+        self.open.truncate(depth);
+    }
+
     /// `switch_scopes` is the scope list in force at the innermost enclosing
     /// `switch`, against which a `case` label is judged.
     fn walk(&mut self, stmt: &Stmt, switch_scopes: Option<&[usize]>) {
         match stmt {
-            Stmt::Block(items) => {
-                let depth = self.open.len();
-                for item in items {
-                    match item {
-                        BlockItem::Declaration(decl) => self.open_scopes(decl),
-                        BlockItem::Statement(s) => self.walk(s, switch_scopes),
-                    }
-                }
-                // Leaving the block closes every scope it opened.
-                self.open.truncate(depth);
-            }
+            Stmt::Block(items) => self.walk_items(items, switch_scopes),
 
             Stmt::Label { name, stmt, pos } => {
                 self.labels.push((*name, self.open.clone(), *pos));
                 self.walk(stmt, switch_scopes);
             }
-            Stmt::Goto { name, pos } => self.gotos.push((*name, self.open.clone(), *pos)),
+            Stmt::Goto { name, pos } => self.gotos.push(JumpRecord {
+                label: *name,
+                from: self.open.clone(),
+                pos: Some(*pos),
+            }),
 
             // 6.8.6.3p1 and 6.8.6.2p1: a `break` needs an enclosing loop or
             // switch and a `continue` an enclosing loop. Checked here rather
@@ -3495,45 +3569,13 @@ impl VmScopeWalk {
                 }
             }
 
-            Stmt::Case(..) | Stmt::Default(..) => {
-                // 6.8.1p2: a `case` or `default` belongs to a `switch`.
-                if self.switch_depth == 0 {
-                    let (pos, what) = match stmt {
-                        Stmt::Case(expr, _, _) => (expr.pos, "case"),
-                        Stmt::Default(pos, _) => (*pos, "default"),
-                        _ => unreachable!(),
-                    };
-                    self.stray_jumps.push((pos, what));
-                }
-
-                // Reaching a `case` transfers control from the `switch`, so
-                // any scope open here but not there would be entered without
-                // its declaration running.
-                if let Some(outer) = switch_scopes {
-                    let label_pos = match stmt {
-                        Stmt::Case(expr, _, _) => expr.pos,
-                        Stmt::Default(pos, _) => *pos,
-                        _ => unreachable!("only a case or default reaches this arm"),
-                    };
-                    for id in &self.open {
-                        if !outer.contains(id) {
-                            self.bad_case_ids.push((*id, label_pos));
-                        }
-                    }
-                }
-
-                // The label carries the statement it prefixes, so the walk
-                // continues through it.
-                let labeled = match stmt {
-                    Stmt::Case(_, _, body) | Stmt::Default(_, body) => body,
-                    _ => unreachable!("only a case or default reaches this arm"),
-                };
-                self.walk(labeled, switch_scopes);
-            }
+            Stmt::Case(..) | Stmt::Default(..) => self.walk_case(stmt, switch_scopes),
 
             // A `switch` becomes the reference point for the labels inside it.
-            // Its own scopes are captured before the body is walked.
-            Stmt::Switch { body, .. } => {
+            // Its own scopes are captured before the body is walked, and its
+            // controlling expression is outside it.
+            Stmt::Switch { expr, body } => {
+                self.walk_expr(expr, switch_scopes);
                 let outer = self.open.clone();
                 self.switch_depth += 1;
                 self.walk(body, Some(&outer));
@@ -3541,25 +3583,39 @@ impl VmScopeWalk {
             }
 
             Stmt::If {
+                cond,
                 then_stmt,
                 else_stmt,
-                ..
             } => {
+                self.walk_expr(cond, switch_scopes);
                 self.walk(then_stmt, switch_scopes);
                 if let Some(e) = else_stmt {
                     self.walk(e, switch_scopes);
                 }
             }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            // A loop's controlling expressions are not inside the loop: gcc
+            // rejects a `break` in a statement expression there.
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+                self.walk_expr(cond, switch_scopes);
                 self.loop_depth += 1;
                 self.walk(body, switch_scopes);
                 self.loop_depth -= 1;
             }
-            Stmt::For { init, body, .. } => {
+            Stmt::For {
+                init,
+                cond,
+                post,
+                body,
+            } => {
                 // A declaration in the init clause scopes over the body.
                 let depth = self.open.len();
-                if let Some(ForInit::Declaration(decl)) = init {
-                    self.open_scopes(decl);
+                match init {
+                    Some(ForInit::Declaration(decl)) => self.walk_decl(decl, switch_scopes),
+                    Some(ForInit::Expression(e)) => self.walk_expr(e, switch_scopes),
+                    None => {}
+                }
+                for e in cond.iter().chain(post) {
+                    self.walk_expr(e, switch_scopes);
                 }
                 self.loop_depth += 1;
                 self.walk(body, switch_scopes);
@@ -3567,20 +3623,108 @@ impl VmScopeWalk {
                 self.open.truncate(depth);
             }
 
-            _ => {}
+            Stmt::Expr(e) | Stmt::Return(Some(e)) | Stmt::GotoIndirect { target: e, .. } => {
+                self.walk_expr(e, switch_scopes)
+            }
+            Stmt::Asm {
+                outputs,
+                inputs,
+                goto_labels,
+                ..
+            } => {
+                for operand in outputs.iter().chain(inputs) {
+                    self.walk_expr(&operand.expr, switch_scopes);
+                }
+                // An `asm goto` may branch to each label it names, and gcc
+                // holds each to the rule a `goto` is held to.
+                for name in goto_labels {
+                    self.gotos.push(JumpRecord {
+                        label: *name,
+                        from: self.open.clone(),
+                        pos: None,
+                    });
+                }
+            }
+
+            Stmt::Empty | Stmt::Return(None) => {}
         }
     }
 
-    fn open_scopes(&mut self, decl: &Declaration) {
+    fn walk_case(&mut self, stmt: &Stmt, switch_scopes: Option<&[usize]>) {
+        let (label_pos, what, bounds, labeled) = match stmt {
+            Stmt::Case(low, high, body) => (low.pos, "case", Some((low, high)), body),
+            Stmt::Default(pos, body) => (*pos, "default", None, body),
+            _ => unreachable!("only a case or default reaches walk_case"),
+        };
+        // 6.8.1p2: a `case` or `default` belongs to a `switch`.
+        if self.switch_depth == 0 {
+            self.stray_jumps.push((label_pos, what));
+        }
+
+        // Reaching a `case` transfers control from the `switch`, so any scope
+        // open here but not there would be entered without its declaration
+        // running, or in the middle of evaluating an expression.
+        // Every variably modified scope is recorded, since each names a
+        // different declaration; only the outermost statement expression is,
+        // since they all say the same thing.
+        if let Some(outer) = switch_scopes {
+            let mut stmt_expr_seen = false;
+            for &id in self.open.iter().filter(|id| !outer.contains(id)) {
+                if matches!(self.scopes[id], JumpScope::StmtExpr) {
+                    if stmt_expr_seen {
+                        continue;
+                    }
+                    stmt_expr_seen = true;
+                }
+                self.bad_case_ids.push((id, label_pos));
+            }
+        }
+
+        if let Some((low, high)) = bounds {
+            self.walk_expr(low, switch_scopes);
+            if let Some(high) = high {
+                self.walk_expr(high, switch_scopes);
+            }
+        }
+        // The label carries the statement it prefixes, so the walk continues
+        // through it.
+        self.walk(labeled, switch_scopes);
+    }
+
+    /// Walk the statement expressions inside `expr`, each a scope of its own.
+    fn walk_expr(&mut self, expr: &Expr, switch_scopes: Option<&[usize]>) {
+        match &expr.kind {
+            ExprKind::StmtExpr { stmts, result } => {
+                let depth = self.open.len();
+                self.open.push(self.scopes.len());
+                self.scopes.push(JumpScope::StmtExpr);
+                self.walk_items(stmts, switch_scopes);
+                self.walk_expr(result, switch_scopes);
+                self.open.truncate(depth);
+            }
+            _ => {
+                for operand in expr.operands() {
+                    self.walk_expr(operand, switch_scopes);
+                }
+            }
+        }
+    }
+
+    fn walk_decl(&mut self, decl: &Declaration, switch_scopes: Option<&[usize]>) {
         for d in &decl.declarators {
+            for e in &d.vla_sizes {
+                self.walk_expr(e, switch_scopes);
+            }
             // A declarator with size expressions is variably modified --
             // whether it is the array itself or a pointer to one, both of
             // which C17 6.7.6.2 calls variably modified and gcc refuses to
-            // let a jump enter.
+            // let a jump enter. Its scope begins before its initializer.
             if !d.vla_sizes.is_empty() {
-                let id = self.declared.len();
-                self.declared.push(VmDecl { symbol: d.symbol });
-                self.open.push(id);
+                self.open.push(self.scopes.len());
+                self.scopes.push(JumpScope::VariablyModified(d.symbol));
+            }
+            if let Some(init) = &d.init {
+                self.walk_expr(init, switch_scopes);
             }
         }
     }
@@ -3802,5 +3946,99 @@ mod case_set_tests {
         assert_eq!(set.overlap(big - 3, big - 3), Some((big - 10, big)));
         assert_eq!(set.overlap(6, 100), None);
         assert_eq!(set.overlap(0, 1), Some((1, 5)));
+    }
+}
+
+#[cfg(test)]
+mod jump_scope_tests {
+    use super::{JumpScope, JumpScopeWalk};
+    use crate::parse::ast::ExternalDecl;
+    use crate::parse::parser::Parser;
+    use crate::strings::StringTable;
+    use crate::symbol::SymbolTable;
+    use crate::target::Target;
+    use crate::token::lexer::Tokenizer;
+    use crate::types::TypeTable;
+
+    /// The walk of the one function `src` defines.
+    fn walk_of(src: &str) -> JumpScopeWalk {
+        let mut strings = StringTable::new();
+        let tokens = Tokenizer::new(src.as_bytes(), 0, &mut strings).tokenize();
+        let mut symbols = SymbolTable::new();
+        let mut types = TypeTable::new(&Target::host());
+        let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+        let tu = parser.parse_translation_unit().expect("parses");
+        let func = tu
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ExternalDecl::FunctionDef(f) => Some(f),
+                _ => None,
+            })
+            .expect("one function");
+        JumpScopeWalk::of(&func.body)
+    }
+
+    /// Whether any `goto` in `src` enters a statement expression.
+    fn goto_enters_stmt_expr(src: &str) -> bool {
+        let w = walk_of(src);
+        w.gotos.iter().any(|jump| {
+            let (_, to, _) = w.labels.iter().find(|l| l.0 == jump.label).unwrap();
+            w.entered(&jump.from, to)
+                .iter()
+                .any(|id| matches!(w.scopes[*id], JumpScope::StmtExpr))
+        })
+    }
+
+    #[test]
+    fn a_goto_into_a_statement_expression_enters_it() {
+        for src in [
+            "int f(int x) { goto L; return ({ L: x; }); }",
+            "int f(int x) { int a = ({ goto N; 1; }); int b = ({ N: 2; }); return a + b; }",
+            "int f(int x) { return ({ goto L; ({ L: 1; }); }); }",
+            "int f(int x) { goto L; return ({ { L: x; } 1; }); }",
+            "int f(int x) { asm goto (\"\" :::: R); return ({ R: x; }); }",
+        ] {
+            assert!(goto_enters_stmt_expr(src), "{src}");
+        }
+    }
+
+    #[test]
+    fn a_goto_out_of_or_within_a_statement_expression_enters_nothing() {
+        for src in [
+            "int f(int x) { int y = ({ if (x) goto out; x; }); return y; out: return -1; }",
+            "int f(int x) { return ({ int r = 0; goto M; r = 5; M: r; }); }",
+            "int f(int x) { return ({ int r = ({ if (x) goto P; 1; }); P: r; }); }",
+            "int f(int x) { L: x = ({ if (x) goto L; x; }); return x; }",
+        ] {
+            assert!(!goto_enters_stmt_expr(src), "{src}");
+        }
+    }
+
+    #[test]
+    fn a_case_inside_a_statement_expression_is_reached_by_its_switch() {
+        let w = walk_of(
+            "int f(int x) { switch (x) { case 0: x = ({ case 1: x; case 2: x; }); } return x; }",
+        );
+        let bad = w.bad_cases();
+        // Once per label, as gcc reports it.
+        assert_eq!(bad.len(), 2);
+        assert!(bad
+            .iter()
+            .all(|(id, _)| matches!(w.scopes[*id], JumpScope::StmtExpr)));
+
+        // A switch wholly inside one statement expression is fine.
+        let w = walk_of(
+            "int f(int x) { return ({ int r = 0; switch (x) { case 1: r = 1; break; default: r = 2; } r; }); }",
+        );
+        assert!(w.bad_cases().is_empty());
+    }
+
+    #[test]
+    fn a_loop_condition_is_outside_its_loop() {
+        let w = walk_of("int f(int x) { while (({ if (x) break; 1; })) x--; return x; }");
+        assert_eq!(w.stray_jumps.len(), 1);
+        let w = walk_of("int f(int x) { for (;;) { x = ({ if (x) break; x; }); } return x; }");
+        assert!(w.stray_jumps.is_empty());
     }
 }

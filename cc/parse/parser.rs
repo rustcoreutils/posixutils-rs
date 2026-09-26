@@ -1708,11 +1708,12 @@ impl<'a> Parser<'a> {
         // an absurd width. Without it `vector_size(4294967296)` quietly
         // produced a four-gigabyte type, and a width near `u64::MAX` made
         // `next_power_of_two` overflow -- a panic in a debug build.
-        if bytes > TypeTable::MAX_OBJECT_BYTES as u64 {
+        let max = self.types.max_object_bytes();
+        if bytes > max as u64 {
             diag::error_args(
                 pos,
-                "'vector_size' of {0} exceeds the maximum object size of {1} bytes",
-                &[&bytes.to_string(), &TypeTable::MAX_OBJECT_BYTES.to_string()],
+                "'vector_size' attribute argument value '{0}' exceeds {1}, the maximum object size",
+                &[&bytes.to_string(), &max.to_string()],
             );
             return typ;
         }
@@ -1747,7 +1748,7 @@ impl<'a> Parser<'a> {
         const MAX_VECTOR_ALIGN: u32 = 16;
         vector.explicit_align = Some(match self.pending_attr_align.take() {
             Some(written) => written,
-            None => (bytes.next_power_of_two() as u32).min(MAX_VECTOR_ALIGN),
+            None => bytes.next_power_of_two().min(u64::from(MAX_VECTOR_ALIGN)) as u32,
         });
         self.types.intern(vector)
     }
@@ -2416,14 +2417,18 @@ impl Parser<'_> {
     }
 
     /// Whether a statement expression's final statement gives it a value: an
-    /// expression statement, or one under any number of named labels. GCC
-    /// takes `({ a: 1; })` as 1 (compile/pr17913). A `case` or `default`
-    /// label cannot end a statement expression in a valid program -- its
-    /// switch would jump into the statement expression -- so those stay void.
+    /// expression statement, or one under any number of labels. GCC takes
+    /// `({ a: 1; })` as 1 (compile/pr17913). A `case` or `default` label
+    /// cannot end a statement expression in a valid program -- its switch
+    /// would jump into the statement expression -- but it is still a label,
+    /// and giving the expression a value leaves "switch jumps into statement
+    /// expression" as the one error, where calling it `void` added another.
     fn ends_in_expr_stmt(stmt: &Stmt) -> bool {
         match stmt {
             Stmt::Expr(_) => true,
-            Stmt::Label { stmt, .. } => Self::ends_in_expr_stmt(stmt),
+            Stmt::Label { stmt, .. } | Stmt::Case(_, _, stmt) | Stmt::Default(_, stmt) => {
+                Self::ends_in_expr_stmt(stmt)
+            }
             _ => false,
         }
     }
@@ -2441,6 +2446,16 @@ impl Parser<'_> {
                     stmt: Box::new(Stmt::Empty),
                     pos,
                 })));
+                Self::split_labeled_expr_stmt(*stmt, items)
+            }
+            Stmt::Case(low, high, stmt) => {
+                let label = Stmt::Case(low, high, Box::new(Stmt::Empty));
+                items.push(BlockItem::Statement(Box::new(label)));
+                Self::split_labeled_expr_stmt(*stmt, items)
+            }
+            Stmt::Default(pos, stmt) => {
+                let label = Stmt::Default(pos, Box::new(Stmt::Empty));
+                items.push(BlockItem::Statement(Box::new(label)));
                 Self::split_labeled_expr_stmt(*stmt, items)
             }
             _ => unreachable!("checked by ends_in_expr_stmt"),

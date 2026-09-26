@@ -15196,3 +15196,318 @@ int main(void) {
 "#;
     run_everywhere("iseqsig", src);
 }
+
+/// A function that takes a label's address is inlined like any other, and
+/// each copy has its own label: gcc.c-torture's 990208-1, where two callers
+/// storing `&&here` from one `static inline` body must see different
+/// addresses. c17 refused to inline any such function, so both stored the
+/// out-of-line body's one address.
+///
+/// Inlining it renames the label symbol for every copy, including a copy of a
+/// copy. What gcc refuses to copy stays out of line: a computed `goto`, which
+/// may jump to an address saved by an earlier call (here, in another copy it
+/// would name a block of a different function), and a label address in a
+/// static table, which names the out-of-line body's blocks.
+#[test]
+fn codegen_inlined_label_address_is_per_copy() {
+    let src = r#"
+/* Label addresses in inlined functions. */
+void exit(int);
+#define FAIL() exit(__LINE__)
+
+static void *ptr1, *ptr2;
+static int one = 1;
+
+/* No computed goto: gcc inlines this, and each copy has its own label. */
+static inline void mark(void **pptr, int cond)
+{
+    if (cond) {
+    here:
+        *pptr = &&here;
+    }
+}
+__attribute__((noinline)) static void f(int c) { mark(&ptr1, c); }
+__attribute__((noinline)) static void g(int c) { mark(&ptr2, c); }
+
+/* The address is taken and compared inside the same copy. */
+static inline int self_equal(int c)
+{
+    void *p = &&top;
+top:
+    if (c-- > 0)
+        return p == &&top;
+    return 2;
+}
+__attribute__((noinline)) static int h1(int c) { return self_equal(c) + 1; }
+__attribute__((noinline)) static int h2(int c) { return self_equal(c) * 3; }
+
+/* Inlined twice over: the label is renamed at each step. */
+static inline void *where(int c)
+{
+    if (c) {
+    lab:
+        return &&lab;
+    }
+    return (void *)0;
+}
+static inline void *twice(int c) { return where(c); }
+__attribute__((noinline)) static void *w1(int c) { return twice(c); }
+__attribute__((noinline)) static void *w2(int c) { return twice(c); }
+
+/* always_inline is honoured at -O0 too, so the copies differ there. */
+static inline __attribute__((always_inline)) void *ai(int c)
+{
+    if (c) {
+    lab:
+        return &&lab;
+    }
+    return (void *)0;
+}
+__attribute__((noinline)) static void *a1(int c) { return ai(c); }
+__attribute__((noinline)) static void *a2(int c) { return ai(c); }
+
+/* A computed goto: gcc never inlines this, because a label address saved
+   on one call must stay valid on the next. */
+static void *saved;
+static inline int step(int x)
+{
+    if (!saved)
+        saved = &&later;
+    goto *saved;
+later:
+    return x + 1;
+}
+__attribute__((noinline)) static int s1(int x) { return step(x); }
+__attribute__((noinline)) static int s2(int x) { return step(x) * 2; }
+
+/* A small threaded interpreter called from two callers. */
+static inline int run(const unsigned char *code, int acc)
+{
+    void *ops[] = { &&op_inc, &&op_dbl, &&op_halt };
+    goto *ops[*code++];
+op_inc:
+    acc++;
+    goto *ops[*code++];
+op_dbl:
+    acc *= 2;
+    goto *ops[*code++];
+op_halt:
+    return acc;
+}
+static const unsigned char prog1[] = { 0, 1, 1, 0, 2 };
+static const unsigned char prog2[] = { 1, 0, 0, 1, 2 };
+__attribute__((noinline)) static int r1(int a) { return run(prog1, a); }
+__attribute__((noinline)) static int r2(int a) { return run(prog2, a) + 100; }
+
+/* A label address in a static table: gcc never copies this function, so
+   both callers see the one table. */
+static inline void *pick(int i)
+{
+    static void *const tbl[] = { &&a, &&b };
+    if (i < 0) {
+    a:
+        return (void *)0;
+    b:
+        return (void *)1;
+    }
+    return tbl[i];
+}
+__attribute__((noinline)) static void *p1(int i) { return pick(i); }
+__attribute__((noinline)) static void *p2(int i) { return pick(i); }
+
+int main(void)
+{
+    f(one);
+    g(one);
+    if (!ptr1 || !ptr2)
+        FAIL();
+#ifdef __OPTIMIZE__
+    if (ptr1 == ptr2)
+        FAIL();
+#endif
+    if (h1(1) != 2 || h2(1) != 3 || h1(0) != 3 || h2(0) != 6)
+        FAIL();
+    if (!w1(one) || !w2(one) || w1(0))
+        FAIL();
+#ifdef __OPTIMIZE__
+    if (w1(one) == w2(one))
+        FAIL();
+#endif
+    if (!a1(one) || !a2(one) || a1(one) == a2(one) || a1(0))
+        FAIL();
+    if (s1(1) != 2 || s2(1) != 4 || s1(5) != 6 || s2(5) != 12)
+        FAIL();
+    if (r1(1) != 9 || r2(1) != 108)
+        FAIL();
+    if (p1(0) != p2(0) || p1(1) != p2(1) || !p1(0))
+        FAIL();
+    return 0;
+}
+"#;
+    run_everywhere("inlined_label_address", src);
+}
+
+/// Objects up to `PTRDIFF_MAX`: sizes, member offsets and pointer scaling.
+///
+/// gcc.c-torture `991014-1` declares a struct of 2^63 - 496 bytes, and c17
+/// refused it because struct layout accumulated its bits in a `usize` and so
+/// capped every object at `u64::MAX / 8` bytes. Every figure here is gcc's.
+///
+/// No object this large is ever defined -- a test program that asks its loader
+/// for gigabytes fails on macOS. The member accesses go through a pointer
+/// placed so that the member lands on a small real buffer, which is what puts
+/// a displacement in [2^31, 2^32) and past 2^32 on each target's load and
+/// store. The accesses are `volatile` so that neither compiler may reason
+/// from the pointee's size that it cannot overlap the buffer.
+#[test]
+fn codegen_objects_up_to_ptrdiff_max() {
+    let src = r#"
+typedef unsigned long UL;
+typedef __UINTPTR_TYPE__ UP;
+
+struct Mid { char pad[3000000000L]; int x; long y; };
+struct Big { char pad[5000000000L]; int x; long y; char tail[3]; };
+struct Bits { char pad[5000000000L]; unsigned f : 3, g : 5; long z; };
+struct Nest { char p[7]; struct Big b; };
+struct Huge { short buf[(1L << 62) - 256]; int a, b, c, d; };
+union HU { int a; char buf[(1L << 62) - 256]; };
+struct Edge { char buf[9223372036854775807L - 7]; };
+typedef struct Big BigArr[3];
+
+_Static_assert(sizeof(struct Mid) == 3000000016UL, "mid size");
+_Static_assert(__builtin_offsetof(struct Mid, y) == 3000000008UL, "mid y");
+_Static_assert(sizeof(struct Big) == 5000000024UL, "big size");
+_Static_assert(__builtin_offsetof(struct Big, tail[2]) == 5000000018UL, "big tail");
+_Static_assert(sizeof(struct Bits) == 5000000016UL, "bits size");
+_Static_assert(__builtin_offsetof(struct Bits, z) == 5000000008UL, "bits z");
+_Static_assert(__builtin_offsetof(struct Nest, b.y) == 5000000016UL, "nest b.y");
+_Static_assert(sizeof(struct Huge) == 9223372036854775312UL, "huge size");
+_Static_assert(__builtin_offsetof(struct Huge, d) == 9223372036854775308UL, "huge d");
+_Static_assert(sizeof(union HU) == 4611686018427387648UL, "union size");
+_Static_assert(sizeof(struct Edge) == 9223372036854775800UL, "edge size");
+_Static_assert(sizeof(BigArr) == 15000000072UL, "array of big");
+
+static const UL off_huge_c = (UL) & ((struct Huge *)0)->c;
+static const UL off_big_y = (UL) & ((struct Big *)0)->y;
+static char chk[(UL) & ((struct Huge *)0)->b == 9223372036854775300UL ? 1 : -1];
+
+UP volatile base_addr;
+long volatile one = 1;
+
+static UP off_huge_d(void) { return (UP) & ((struct Huge *)0)->d; }
+
+int main(void)
+{
+    struct R { int x; int pad; long y; char t[8]; } store;
+    volatile struct R *vb = &store;
+    UP a = (UP)&store;
+
+    if (off_huge_c != 9223372036854775304UL) return 1;
+    if (off_big_y != 5000000008UL) return 2;
+    if (off_huge_d() != 9223372036854775308UL) return 3;
+    if (sizeof chk != 1) return 4;
+
+    base_addr = a - 3000000000UL;
+    volatile struct Mid *m = (volatile struct Mid *)base_addr;
+    m->x = 41;
+    m->y = 0x1122334455667788L;
+    if (vb->x != 41) return 5;
+    if (vb->y != 0x1122334455667788L) return 6;
+    if (m->x + 1 != 42 || m->y != 0x1122334455667788L) return 7;
+
+    base_addr = a - 5000000000UL;
+    volatile struct Big *p = (volatile struct Big *)base_addr;
+    p->x = 7;
+    p->y = -3;
+    p->tail[2] = 'z';
+    if (vb->x != 7 || vb->y != -3 || vb->t[2] != 'z') return 8;
+    if ((UP)&p->tail[1] != a + 17) return 9;
+    volatile long *py = &p->y;
+    if (*py != -3) return 10;
+
+    base_addr = a - 5000000000UL;
+    volatile struct Bits *bp = (volatile struct Bits *)base_addr;
+    vb->x = 0;
+    bp->f = 5;
+    bp->g = 17;
+    bp->z = 99;
+    if (bp->f != 5 || bp->g != 17 || vb->y != 99) return 11;
+
+    base_addr = a - 5000000008UL;
+    volatile struct Nest *np = (volatile struct Nest *)base_addr;
+    np->b.x = 1234;
+    if (vb->x != 1234 || np->b.x != 1234) return 12;
+
+    /* Pointer arithmetic scales by the element size; nothing is dereferenced. */
+    base_addr = 0x10000;
+    struct Big *q = (struct Big *)base_addr;
+    if ((UP)(q + one) - (UP)q != 5000000024UL) return 13;
+    if ((UP)&q[one].y != 0x10000 + 5000000024UL + 5000000008UL) return 14;
+    struct Big *q3 = (struct Big *)(base_addr + 3 * 5000000024UL);
+    if (q3 - q != 3) return 15;
+    q3 -= one;
+    if ((UP)q3 != 0x10000 + 2 * 5000000024UL) return 16;
+
+    struct Huge *h = (struct Huge *)base_addr;
+    if ((UP)(h + one) - (UP)h != 9223372036854775312UL) return 17;
+    struct Huge *h1 = (struct Huge *)(base_addr + 9223372036854775312UL);
+    if (h1 - h != 1) return 18;
+    if ((UP)&h->c != 0x10000 + 9223372036854775304UL) return 19;
+    if ((UP)&h->buf[(1L << 62) - 257] != 0x10000 + 9223372036854775294UL) return 20;
+
+    BigArr *pa = (BigArr *)base_addr;
+    if ((UP)(pa + one) - (UP)pa != 15000000072UL) return 21;
+    if ((UP)&(*pa)[2].y != 0x10000 + 2 * 5000000024UL + 5000000008UL) return 22;
+
+    return 0;
+}
+"#;
+    run_everywhere("objects_up_to_ptrdiff_max", src);
+}
+
+/// A member of a *static* object past `i32` is reached through a
+/// materialised displacement, and its address constant keeps the whole offset.
+///
+/// Such an object cannot be run -- no loader maps it, and past 2 GB the
+/// default code model cannot link it either -- so the assembly is what is
+/// asserted. The expected spellings are gcc's for the same source.
+#[test]
+fn codegen_static_member_offset_past_i32() {
+    let src = "\
+struct Big { char pad[5000000000L]; int x; long y; };
+struct Huge { short buf[(1L << 62) - 256]; int a, b, c, d; };
+struct Big gb;
+struct Huge gh;
+long *gy = &gb.y;
+int *gd = &gh.d;
+void set(long v) { gb.y = v; }
+";
+    for opt in ["-O0", "-O2"] {
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            let asm = asm_for_with("static_member_offset_past_i32", triple, src, &[opt]);
+            for needle in [
+                "gb+5000000008",
+                "gh+9223372036854775308",
+                ".zero 9223372036854775312",
+            ] {
+                assert!(
+                    asm.contains(needle),
+                    "{triple} {opt}: no `{needle}` in:\n{asm}"
+                );
+            }
+            // 5000000008 is 0x1_2A05_F208: all three pieces must be emitted.
+            let set = body_of(&asm, "set");
+            let pieces: &[&str] = if triple == X86_64_LINUX {
+                &["$5000000008"]
+            } else {
+                &["#61960", "#10757, lsl #16", "#1, lsl #32"]
+            };
+            for piece in pieces {
+                assert!(
+                    set.contains(piece),
+                    "{triple} {opt}: `set` lacks `{piece}`:\n{set}"
+                );
+            }
+        }
+    }
+}

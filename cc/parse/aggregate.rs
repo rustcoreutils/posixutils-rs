@@ -15,7 +15,7 @@ use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
 use crate::token::lexer::{Position, TokenType};
 use crate::types::{
-    CompositeType, EnumConstant, StructMember, Type, TypeId, TypeKind, TypeModifiers, TypeTable,
+    CompositeType, EnumConstant, StructMember, Type, TypeId, TypeKind, TypeModifiers,
 };
 use gettextrs::gettext;
 
@@ -364,21 +364,23 @@ impl Parser<'_> {
                 }
             }
 
-            // Re-pad size to new alignment
-            let size = if align > 1 {
-                (size + align - 1) & !(align - 1)
-            } else {
-                size
-            };
+            // Re-pad size to new alignment. Saturating: the layout answers
+            // `usize::MAX` for a member list too large to describe, and
+            // rounding that must not wrap it small before the check below.
+            let size = size.checked_next_multiple_of(align).unwrap_or(usize::MAX);
 
             // The same bound `derive_array_type` enforces: a member list can
             // reach it even when no single member does.
-            if size > TypeTable::MAX_OBJECT_BYTES {
+            let max = self.types.max_object_bytes();
+            if size > max {
+                let keyword = if is_union { "union" } else { "struct" };
+                let name = tag
+                    .and_then(|t| self.idents.get_opt(t))
+                    .unwrap_or("<anonymous>");
                 return Err(ParseError::new(
                     format!(
-                        "size of {} exceeds the maximum object size of {} bytes",
-                        if is_union { "union" } else { "struct" },
-                        TypeTable::MAX_OBJECT_BYTES
+                        "type '{keyword} {name}' is too large: its size exceeds \
+                         the maximum object size of {max} bytes"
                     ),
                     specifier_pos,
                 ));

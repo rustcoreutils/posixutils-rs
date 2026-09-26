@@ -244,8 +244,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             // {&&a, &&b};`, which is how an interpreter builds its dispatch
             // table. The label is a real assembler symbol, so this is the same
             // shape as a string-literal reference.
+            //
+            // Every initializer that reaches here has static storage duration,
+            // so the function can no longer be copied: see
+            // `Function::saves_label_in_static`.
             ExprKind::LabelAddr(name) => match self.take_label_address(*name, expr.pos) {
-                Some(sym) => Initializer::SymAddr(sym),
+                Some(sym) => {
+                    if let Some(func) = &mut self.current_func {
+                        func.saves_label_in_static = true;
+                    }
+                    Initializer::SymAddr(sym)
+                }
                 None => Initializer::Int(0),
             },
 

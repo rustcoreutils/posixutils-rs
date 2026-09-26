@@ -2040,6 +2040,269 @@ fn diagnostics_legal_jumps_around_variably_modified_scopes_are_accepted() {
 }
 
 // ============================================================================
+// Jumping into a GNU statement expression
+// ============================================================================
+
+/// The `error:` lines c17 prints for `src`, which must fail to compile.
+fn compile_errors(name: &str, src: &str) -> Vec<String> {
+    let c_file = create_c_file(name, src);
+    let path = c_file.path().to_string_lossy().to_string();
+    let run = run_c17(&["-S", "-o", "/dev/null", &path]);
+    assert!(!run.success, "{name}: expected a compile error");
+    run.stderr
+        .lines()
+        .filter(|l| l.contains("error:"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// gcc forbids entering a statement expression by `goto`, by `asm goto` or by
+/// a `switch` reaching a `case` or `default` inside one: control would arrive
+/// in the middle of evaluating the expression around it. c17 accepted every
+/// form and generated the jump. Each is one error, in gcc's words, as many
+/// times as gcc gives it.
+#[test]
+fn diagnostics_jump_into_statement_expression_is_rejected() {
+    for (name, src, count) in [
+        ("se_goto", "int f(int x) { goto L; return ({ L: x; }); }", 1),
+        (
+            "se_goto_sibling",
+            "int f(void) { int a = ({ goto N; 1; }); int b = ({ N: 2; }); return a + b; }",
+            1,
+        ),
+        (
+            "se_goto_nested",
+            "int f(void) { return ({ goto L; ({ L: 1; }); }); }",
+            1,
+        ),
+        (
+            "se_goto_inner_block",
+            "int f(int x) { goto L; return ({ { L: x; } 1; }); }",
+            1,
+        ),
+        (
+            "se_goto_twice",
+            "int f(int x) { goto L; ({ L: x; }); ({ M: x; }); goto M; return 0; }",
+            2,
+        ),
+        (
+            "se_asm_goto",
+            "int f(int x) { asm goto (\"\" :::: R); return ({ R: x; }); }",
+            1,
+        ),
+    ] {
+        let errors = compile_errors(name, &format!("{src}\n"));
+        assert_eq!(errors.len(), count, "{name}: {errors:?}");
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.ends_with("error: jump into statement expression")),
+            "{name}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn diagnostics_switch_into_statement_expression_is_rejected() {
+    for (name, src, count) in [
+        (
+            "se_case",
+            "int f(int x) { switch (x) { case 0: return ({ case 1: x; }); } return 0; }",
+            1,
+        ),
+        (
+            "se_default",
+            "int f(int x) { switch (x) { case 0: return ({ default: x; }); } return 0; }",
+            1,
+        ),
+        // At the top level of the switch body.
+        (
+            "se_case_top",
+            "int f(int x) { switch (x) { ({ case 1: x++; }); } return x; }",
+            1,
+        ),
+        // In a condition, and in an initializer inside a block.
+        (
+            "se_case_in_if",
+            "int f(int x) { switch (x) { case 1: if (({ default: x; })) return 1; } return x; }",
+            1,
+        ),
+        (
+            "se_case_in_init",
+            "int f(int x) { switch (x) { case 1: { int y = ({ case 3: x; }); return y; } } return x; }",
+            1,
+        ),
+        // Past a switch nested inside the statement expression.
+        (
+            "se_case_past_inner_switch",
+            "int f(int x) { switch (x) { case 0: x = ({ switch (x) { case 1: x; } case 2: 5; }); } return x; }",
+            1,
+        ),
+        // Once per label.
+        (
+            "se_two_cases",
+            "int f(int x) { switch (x) { case 0: x = ({ case 1: x; case 2: x; }); } return x; }",
+            2,
+        ),
+    ] {
+        let errors = compile_errors(name, &format!("{src}\n"));
+        assert_eq!(errors.len(), count, "{name}: {errors:?}");
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.ends_with("error: switch jumps into statement expression")),
+            "{name}: {errors:?}"
+        );
+    }
+}
+
+/// Now that the check sees inside statement expressions, the rules it already
+/// enforced reach there too: a label name is unique in its function, and a
+/// loop's controlling expressions are not inside the loop.
+#[test]
+fn diagnostics_jump_rules_reach_inside_statement_expressions() {
+    compile_expect_error(
+        "se_duplicate_label",
+        "int f(int x) { ({ L: x; }); ({ L: x; }); return 0; }\n",
+        "duplicate label 'L'",
+    );
+    compile_expect_error(
+        "se_break_in_while_cond",
+        "int f(int x) { while (({ if (x) break; 1; })) x--; return x; }\n",
+        "break statement not within loop or switch",
+    );
+    compile_expect_error(
+        "se_continue_in_do_cond",
+        "int f(int x) { do x--; while (({ if (x) continue; 1; })); return x; }\n",
+        "continue statement not within a loop",
+    );
+    compile_expect_error(
+        "se_break_in_for_step",
+        "int f(int x) { for (;; ({ if (x) break; 1; })) x--; return x; }\n",
+        "break statement not within loop or switch",
+    );
+    compile_expect_error(
+        "se_case_in_switch_expr",
+        "int f(int x) { switch (({ case 1: x; })) { case 2: ; } return x; }\n",
+        "case label not within a switch statement",
+    );
+    // A variably modified scope inside a statement expression is both.
+    let errors = compile_errors(
+        "se_vla",
+        "int f(int n) { goto L; ({ int a[n]; L: a[0]; }); return 0; }\n",
+    );
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(
+        errors[0].contains("jump into the scope of 'a'"),
+        "{errors:?}"
+    );
+    assert!(
+        errors[1].ends_with("jump into statement expression"),
+        "{errors:?}"
+    );
+}
+
+/// Leaving a statement expression is allowed, as are jumps and switches wholly
+/// inside one and a computed `goto`, which gcc leaves undiagnosed. These run,
+/// so the jumps are shown to land where they should.
+#[test]
+fn diagnostics_legal_jumps_around_statement_expressions_are_accepted() {
+    let src = r#"
+int out(int x) { int y = ({ if (x) goto bail; x + 1; }); return y; bail: return -1; }
+int within(void) { return ({ int r = 1; goto M; r = 5; M: r; }); }
+int nested_out(int x) { return ({ int r = ({ if (x) goto P; 10; }); P: r; }); }
+int back(int x) { L: x = ({ if (x > 3) goto L2; x + 1; }); if (x < 3) goto L; L2: return x; }
+int sw(int x) { return ({ int r = 0; switch (x) { case 1: r = 7; break; default: r = 9; } r; }); }
+int brk(int x) { for (;;) { x = ({ if (x > 5) break; x + 2; }); } return x; }
+int main(void) {
+    if (out(0) != 1 || out(2) != -1) return 1;
+    if (within() != 1) return 2;
+    if (nested_out(0) != 10) return 3;
+    if (back(0) != 3) return 4;
+    if (sw(1) != 7 || sw(4) != 9) return 5;
+    if (brk(0) != 6) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("se_legal_jumps", src, &[]), 0);
+    // gcc documents a computed `goto` into a statement expression as
+    // undefined rather than diagnosing it, so it compiles; running it would
+    // prove nothing.
+    compile_expect_ok(
+        "se_computed_goto",
+        "int f(int x) { void *p = &&Q; goto *p; return ({ Q: x; }); }\n",
+    );
+}
+
+// ============================================================================
+// C17 7.12.14 — the comparison macros take real floating arguments
+// ============================================================================
+
+/// C17 7.12.14p1 requires real floating arguments. gcc relaxes that to "both
+/// real, at least one floating", and rejects the rest -- two integers, a
+/// pointer, a complex value, a structure -- with this message. c17 accepted
+/// two integers, citing gcc wrongly, and anything else was converted blindly.
+#[test]
+fn diagnostics_fp_compare_needs_a_floating_argument() {
+    let builtins = [
+        "__builtin_isgreater",
+        "__builtin_isgreaterequal",
+        "__builtin_isless",
+        "__builtin_islessequal",
+        "__builtin_islessgreater",
+        "__builtin_isunordered",
+        "__builtin_iseqsig",
+    ];
+    let bad = [
+        ("int", "int"),
+        ("char", "long"),
+        ("_Bool", "_Bool"),
+        ("enum E", "enum E"),
+        ("int *", "double"),
+        ("double", "void *"),
+        ("_Complex double", "double"),
+        ("_Complex int", "double"),
+        ("struct S", "double"),
+    ];
+    for (i, b) in builtins.iter().enumerate() {
+        for (j, (l, r)) in bad.iter().enumerate() {
+            compile_expect_error(
+                &format!("fpcmp_bad_{i}_{j}"),
+                &format!("enum E {{ X }}; struct S {{ int a; }};\nint f({l} a, {r} b) {{ return {b}(a, b); }}\n"),
+                &format!("non-floating-point arguments in call to function '{b}'"),
+            );
+        }
+    }
+}
+
+#[test]
+fn diagnostics_fp_compare_mixed_real_arguments_are_accepted() {
+    let ok = [
+        ("double", "double"),
+        ("float", "long double"),
+        ("int", "double"),
+        ("double", "int"),
+        ("float", "long"),
+        ("_Bool", "double"),
+        ("enum E", "float"),
+        ("__int128", "double"),
+    ];
+    for (j, (l, r)) in ok.iter().enumerate() {
+        compile_expect_ok(
+            &format!("fpcmp_ok_{j}"),
+            &format!(
+                "enum E {{ X }};\nint f({l} a, {r} b) {{ return __builtin_isgreater(a, b) + __builtin_isunordered(b, a); }}\n"
+            ),
+        );
+    }
+    // Through <math.h>, whose macros expand to the builtins.
+    compile_expect_ok(
+        "fpcmp_math_h",
+        "#include <math.h>\nint f(double d, float g, int i) { return isgreater(d, g) + isless(i, d) + isunordered(g, 1); }\n",
+    );
+}
+
+// ============================================================================
 // #C53 — a trailing comma in a parameter list (C17 6.7.6.3)
 // ============================================================================
 
@@ -3615,13 +3878,15 @@ fn diagnostics_representable_enumerators_are_accepted() {
 
 /// An object too large to describe is diagnosed, not capped.
 ///
-/// The bound is what C makes it: an object is addressed by pointer
+/// The bound is what C makes it, and gcc's: an object is addressed by pointer
 /// arithmetic, and 6.5.6p9 makes the difference of two pointers into one
 /// object a `ptrdiff_t`, so an object whose size does not fit a signed 64-bit
-/// value cannot be indexed from end to end. It used to be 512 MB, which was
-/// an accident of `size_bits` answering in a `u32`, and an extent past it
-/// saturated in silence: `char big[5000000000];` compiled and reported
-/// `sizeof` 536870911. Recorded at #C122.
+/// value cannot be indexed from end to end. `PTRDIFF_MAX` itself is allowed
+/// and one byte more is not. It used to be 512 MB, an accident of `size_bits`
+/// answering in a `u32`, and an extent past it saturated in silence:
+/// `char big[5000000000];` compiled and reported `sizeof` 536870911. Then it
+/// was `u64::MAX / 8`, because struct layout accumulated its bits in a
+/// `usize`, which refused gcc.c-torture `991014-1`.
 #[test]
 fn diagnostics_object_larger_than_the_compiler_can_describe() {
     for (name, src) in [
@@ -3645,17 +3910,43 @@ fn diagnostics_object_larger_than_the_compiler_can_describe() {
             "array_typedef",
             "typedef char T[9300000000000000000UL];\nint main(void){ return 0; }\n",
         ),
+        (
+            "array_one_past_ptrdiff_max",
+            "typedef char T[9223372036854775808UL];\nint main(void){ return 0; }\n",
+        ),
     ] {
-        compile_expect_error(name, src, "exceeds the maximum object size");
+        compile_expect_error(
+            name,
+            src,
+            "size of array is too large: it exceeds the maximum object size of \
+             9223372036854775807 bytes",
+        );
     }
 
-    // A member list can reach the bound even when no single member does.
-    compile_expect_error(
-        "struct_sum_of_members",
-        "struct S { char a[2000000000000000000L]; char b[2000000000000000000L]; } s;\n\
-         int main(void){ return 0; }\n",
-        "size of struct exceeds the maximum object size",
-    );
+    // A member list can reach the bound even when no single member does, and
+    // a sum past `u64::MAX` bits is measured, not wrapped.
+    for (name, src, needle) in [
+        (
+            "struct_sum_of_members",
+            "struct S { char a[5000000000000000000L]; char b[5000000000000000000L]; } s;\n\
+             int main(void){ return 0; }\n",
+            "type 'struct S' is too large",
+        ),
+        (
+            "struct_trailing_member",
+            "struct S { char a[9223372036854775807L]; int b; };\n\
+             int main(void){ return 0; }\n",
+            "type 'struct S' is too large",
+        ),
+        (
+            "union_rounded_past",
+            "union U { char a[9223372036854775807L]; int b; };\n\
+             int main(void){ return 0; }\n",
+            "type 'union U' is too large",
+        ),
+    ] {
+        compile_expect_error(name, src, needle);
+    }
 }
 
 /// The largest object that *is* describable keeps working, and `sizeof` agrees
@@ -3684,6 +3975,15 @@ fn diagnostics_largest_describable_object_is_accepted() {
         (
             "array_near_ptrdiff_max",
             "typedef char T[2000000000000000000L];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_at_ptrdiff_max",
+            "typedef char T[9223372036854775807L];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "struct_past_u64_bits",
+            "struct S { short buf[(1L << 62) - 256]; int a, b, c, d; };\n\
+             int main(void){ return sizeof(struct S) != 9223372036854775312UL; }\n",
         ),
     ] {
         compile_expect_ok(name, src);
@@ -4422,9 +4722,10 @@ fn diagnostics_one_x87_asm_output() {
 fn diagnostics_vector_size_is_bounded() {
     compile_expect_error(
         "vector_size_too_big",
-        "typedef float V __attribute__((vector_size(4000000000000000000)));\n\
+        "typedef float V __attribute__((vector_size(9223372036854775808UL)));\n\
          int main(void){ return 0; }\n",
-        "maximum object size",
+        "'vector_size' attribute argument value '9223372036854775808' exceeds \
+         9223372036854775807",
     );
     compile_expect_error(
         "vector_size_negative",
@@ -5438,8 +5739,8 @@ fn diagnostics_permissive_relaxes_the_constraints_gcc_warns_about() {
 /// This bound is not C's. Both backends address a local and a stacked argument
 /// by a signed 32-bit displacement from the frame register, so `i32::MAX`, less
 /// the headroom the prologue adds, is the ceiling -- a billion times under the
-/// `MAX_OBJECT_BYTES` the type table allows, which is why the two are separate
-/// constants and separate messages. gcc compiles the same local with
+/// `max_object_bytes` the type table allows, which is why the two are separate
+/// bounds and separate messages. gcc compiles the same local with
 /// `movabsq`-based 64-bit frame addressing; c17 says so instead, and refuses the
 /// argument case exactly as gcc does ("sorry, unimplemented: passing too large
 /// argument on stack").
@@ -5529,7 +5830,7 @@ fn diagnostics_stack_object_larger_than_a_frame_slot_is_rejected() {
 /// working.
 ///
 /// The companion to the test above, and the guard that the new ceiling did not
-/// become a second, tighter `MAX_OBJECT_BYTES`: a static object is addressed
+/// become a second, tighter `max_object_bytes`: a static object is addressed
 /// symbolically rather than from the frame, and `char g[3000000000];` emits
 /// `.zero 3000000000` on both targets today.
 ///

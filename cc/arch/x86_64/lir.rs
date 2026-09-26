@@ -418,6 +418,10 @@ pub enum X86Inst {
     /// Used for zero-initializing stack frames
     RepStosq,
 
+    /// REP MOVSQ - Copy RCX qwords from [RSI] to [RDI], advancing both
+    /// Used for large stacked aggregate arguments
+    RepMovsq,
+
     /// UD2 - Undefined instruction (trap)
     /// Used for __builtin_unreachable() to signal unreachable code
     Ud2,
@@ -829,6 +833,10 @@ impl EmitAsm for X86Inst {
 
             X86Inst::RepStosq => {
                 let _ = writeln!(out, "    rep stosq");
+            }
+
+            X86Inst::RepMovsq => {
+                let _ = writeln!(out, "    rep movsq");
             }
 
             X86Inst::Ud2 => {

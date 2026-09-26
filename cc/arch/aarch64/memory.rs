@@ -343,14 +343,14 @@ impl Aarch64CodeGen {
     fn compute_mem_addr(
         &mut self,
         addr: PseudoId,
-        insn_offset: i64,
+        insn_offset: i32,
         temp_reg: Reg,
     ) -> ComputedAddr {
         let addr_loc = self.get_location(addr);
         match addr_loc {
             Loc::Reg(r) => ComputedAddr::Direct(MemAddr::BaseOffset {
                 base: r,
-                offset: insn_offset as i32,
+                offset: insn_offset,
             }),
             Loc::Stack(offset) => {
                 // Check if the address operand is a symbol (local variable) or a temp (spilled address)
@@ -358,7 +358,7 @@ impl Aarch64CodeGen {
 
                 if is_symbol {
                     // Local variable - access directly from stack slot (FP-relative for alloca safety)
-                    ComputedAddr::Direct(self.stack_mem_plus(offset, insn_offset as i32))
+                    ComputedAddr::Direct(self.stack_mem_plus(offset, insn_offset))
                 } else {
                     // Spilled address - load address first (FP-relative for alloca safety)
                     self.push_lir(Aarch64Inst::Ldr {
@@ -368,7 +368,7 @@ impl Aarch64CodeGen {
                     });
                     ComputedAddr::WithSetup(MemAddr::BaseOffset {
                         base: temp_reg,
-                        offset: insn_offset as i32,
+                        offset: insn_offset,
                     })
                 }
             }
@@ -378,7 +378,7 @@ impl Aarch64CodeGen {
                 self.emit_move(addr, temp_reg, 64);
                 ComputedAddr::WithSetup(MemAddr::BaseOffset {
                     base: temp_reg,
-                    offset: insn_offset as i32,
+                    offset: insn_offset,
                 })
             }
         }
@@ -408,7 +408,7 @@ impl Aarch64CodeGen {
         // 128-bit integer load: load both halves to destination stack slot
         if mem_size == 128 {
             if let Loc::Stack(dst_offset) = dst_loc {
-                match self.compute_mem_addr(addr, insn.offset, Reg::X16) {
+                match self.compute_mem_addr(addr, insn.displacement(), Reg::X16) {
                     ComputedAddr::Direct(mem_addr) | ComputedAddr::WithSetup(mem_addr) => {
                         self.push_lir(Aarch64Inst::Ldp {
                             size: OperandSize::B64,
@@ -494,7 +494,7 @@ impl Aarch64CodeGen {
             }
         };
 
-        match self.compute_mem_addr(addr, insn.offset, Reg::X16) {
+        match self.compute_mem_addr(addr, insn.displacement(), Reg::X16) {
             ComputedAddr::Direct(mem_addr) | ComputedAddr::WithSetup(mem_addr) => {
                 emit_load_lir(self, mem_addr);
             }
@@ -588,7 +588,7 @@ impl Aarch64CodeGen {
             });
         };
 
-        match self.compute_mem_addr(addr, insn.offset, Reg::X16) {
+        match self.compute_mem_addr(addr, insn.displacement(), Reg::X16) {
             ComputedAddr::Direct(mem_addr) | ComputedAddr::WithSetup(mem_addr) => {
                 emit_store_lir(self, mem_addr);
             }
@@ -652,7 +652,7 @@ impl Aarch64CodeGen {
 
                 if is_symbol {
                     let (base, base_off) = self.loc_addr_parts(&addr_loc).unwrap();
-                    let total_offset = base_off + insn.offset as i32;
+                    let total_offset = base_off + insn.displacement();
                     self.push_lir(Aarch64Inst::Add {
                         size: OperandSize::B64,
                         src1: base,
@@ -670,7 +670,7 @@ impl Aarch64CodeGen {
                         self.push_lir(Aarch64Inst::Add {
                             size: OperandSize::B64,
                             src1: Reg::X17,
-                            src2: GpOperand::Imm(insn.offset),
+                            src2: GpOperand::Imm(insn.displacement().into()),
                             dst: Reg::X17,
                         });
                     }
@@ -681,7 +681,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::Add {
                         size: OperandSize::B64,
                         src1: r,
-                        src2: GpOperand::Imm(insn.offset),
+                        src2: GpOperand::Imm(insn.displacement().into()),
                         dst: Reg::X17,
                     });
                 } else if r != Reg::X17 {
@@ -728,7 +728,7 @@ impl Aarch64CodeGen {
         match addr_loc {
             ref loc @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
                 let (base, base_off) = self.loc_addr_parts(loc).unwrap();
-                let total_offset = base_off + insn.offset as i32;
+                let total_offset = base_off + insn.displacement();
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
                     src1: base,
@@ -741,7 +741,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::Add {
                         size: OperandSize::B64,
                         src1: r,
-                        src2: GpOperand::Imm(insn.offset),
+                        src2: GpOperand::Imm(insn.displacement().into()),
                         dst: Reg::X17,
                     });
                 } else if r != Reg::X17 {
@@ -758,7 +758,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::Add {
                         size: OperandSize::B64,
                         src1: Reg::X17,
-                        src2: GpOperand::Imm(insn.offset),
+                        src2: GpOperand::Imm(insn.displacement().into()),
                         dst: Reg::X17,
                     });
                 }
@@ -787,7 +787,7 @@ impl Aarch64CodeGen {
         self.emit_mov_imm(Reg::X9, lo, 64);
         self.emit_mov_imm(Reg::X10, hi, 64);
 
-        match self.compute_mem_addr(addr, insn.offset, Reg::X16) {
+        match self.compute_mem_addr(addr, insn.displacement(), Reg::X16) {
             ComputedAddr::Direct(mem_addr) | ComputedAddr::WithSetup(mem_addr) => {
                 self.push_lir(Aarch64Inst::Stp {
                     size: OperandSize::B64,

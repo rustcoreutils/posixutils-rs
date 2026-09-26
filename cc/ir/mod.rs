@@ -861,8 +861,9 @@ pub struct Instruction {
     pub bb_true: Option<BasicBlockId>,
     /// For conditional branches: false target
     pub bb_false: Option<BasicBlockId>,
-    /// For memory ops: offset. For `FrameAddress`/`ReturnAddress`: the level,
-    /// read through [`Instruction::frame_level`].
+    /// For memory ops: offset, read by a backend through
+    /// [`Instruction::displacement`]. For `FrameAddress`/`ReturnAddress`: the
+    /// level, read through [`Instruction::frame_level`].
     pub offset: i64,
     /// For phi nodes: list of (bb, pseudo) pairs
     pub phi_list: Vec<(BasicBlockId, PseudoId)>,
@@ -1264,6 +1265,19 @@ impl Instruction {
             Opcode::FrameAddress | Opcode::ReturnAddress
         ));
         self.offset as u32
+    }
+
+    /// A load's or store's offset as the machine displacement it becomes.
+    ///
+    /// Always in range: `Linearizer::emit` folds any offset past `i32` into
+    /// the address before the instruction enters the IR, and no pass rewrites
+    /// an offset afterwards (`validate.rs` I6). The backends used to narrow
+    /// with `as i32`, which wrapped a member more than 2 GiB into a struct to
+    /// a displacement gigabytes away.
+    pub fn displacement(&self) -> i32 {
+        debug_assert!(matches!(self.op, Opcode::Load | Opcode::Store));
+        i32::try_from(self.offset)
+            .expect("a load or store offset past i32 reached a backend; Linearizer::emit folds it")
     }
 
     pub fn load(target: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: u32) -> Self {

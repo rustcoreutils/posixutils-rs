@@ -70,25 +70,6 @@ live `int`s cost 72 bytes where gcc uses callee-saved registers and none. Slot
 reuse is the larger multiplier, but this is why even leaf functions carry a
 frame.
 
-### `i32` frame arithmetic can still wrap near the ceiling
-
-`grow_frame` accepts a locals area up to `MAX_STACK_OBJECT_BYTES`, but several
-sums after it still run unchecked in `i32` and wrap silently in a release
-build: `stack_size`'s rounding, the prologue's total (callee-saved area,
-variadic register save area, over-alignment), `stack_mem`'s `-(offset +
-callee_saved_offset)`, a Sym local's `(size + alignment - 1)` rounding, which
-runs *before* `grow_frame`, `IncomingOff::take`, and x86-64
-`classify_call_args`, which takes an `ArgClass::Indirect` size with a bare
-`as i32` rather than through `slot_bytes`. A wrap there means the prologue
-allocates nothing, or an object gets zero bytes -- a miscompile with no
-diagnostic, within about a hundred bytes of the limit.
-
-Closing it without the 64-bit feature means giving `grow_frame` headroom for
-everything added after it, and routing the remaining sums through checked
-arithmetic.
-
----
-
 ### Dominator construction is quadratic on a wide join
 
 `domtree_build` is Cooper-Harvey-Kennedy, whose `intersect` walks the
@@ -101,16 +82,6 @@ and again per `loadfwd`. Lengauer-Tarjan, which gcc uses, is near-linear on
 any shape.
 
 ---
-
-### A by-value struct argument is still copied word by word in the backend
-
-Fixed at the IR level: copies past 128 bytes now become a `memcpy` call, which
-took a 256 KB by-value struct from a 65-second compile to 0.01 s. The backend
-still unrolls the *stacked-argument* copy at instruction-selection time, so the
-same case emits ~65,000 `movq` where gcc emits one `call memcpy`. Compile time
-is no longer the problem; code size is. The fix belongs wherever the stacked
-argument is written, and has to avoid clobbering argument registers already set
-up — which is why it was not folded into the IR-level change.
 
 ### R10 reserved globally for division scratch
 
@@ -198,31 +169,6 @@ see [64-bit stack frames](#64-bit-stack-frames).
 
 ---
 
-### The backend's stacked-argument copy has no `memcpy` fallback
-
-`emit_block_copy` becomes a `memcpy` call past `BLOCK_COPY_INLINE_LIMIT`, 128
-bytes, because an unbounded unroll made a 256 KB struct passed by value cost
-65,536 IR instructions and a 65-second compile. The backend's *outgoing*
-stacked-argument copy has no such limit: `push_stack_args` emits one
-load/store pair per eight bytes for the whole argument, whatever its size.
-
-A 3 GB by-value argument produced **67 million instructions and a 4.1 GB `.s`
-file**, or an out-of-memory kill depending on what else the machine was doing.
-That particular size is a diagnostic now -- it is past
-`MAX_STACK_OBJECT_BYTES` -- but a 600 MB one is legal and still unrolls 75
-million instructions. Measured: **16 seconds and 21.9 GB resident** for one
-`callee(src)`, which is enough to take a CI runner down, and did. The same
-`memcpy` fallback applies, and the callee-side prologue copies in both
-`frame.rs` files have the same shape.
-
-Until it is fixed, a test must not pass a multi-hundred-megabyte aggregate by
-value -- `codegen_aggregate_copy_length_past_the_old_object_bound` says so where
-its source would tempt someone to.
-
-This is a compile-time blowup, not a wrong answer.
-
----
-
 ### 64-bit stack frames
 
 An automatic object past `MAX_STACK_OBJECT_BYTES` (just under 2 GiB) is refused
@@ -244,15 +190,14 @@ What it takes:
   `ActiveSlot`/`FreeSlot`, `callee_saved_offset`, `stack_alloc_size`,
   `reg_save_area_offset`, the outgoing-argument layout, `IncomingOff`, and the
   CFI directive offsets. `grow_frame` and `slot_bytes` then bound at
-  `MAX_OBJECT_BYTES` instead.
+  `MAX_OBJECT_BYTES` instead, less the prologue headroom
+  (`FRAME_HEADROOM_BYTES`) and the frame's final alignment rounding, which
+  `grow_frame` reserves today for the same reason.
 - A displacement outside the target's encodable range goes through a scratch
   register: `movabsq` plus an indexed or `addq` form on x86-64. On aarch64
   `legalize.rs` already expands any offset through X15; what changes is only
   the width of the offsets it is given.
 - The prologue's `subq $N, %rsp` becomes `movabsq $N, %r11; subq %r11, %rsp`.
-- `insn.offset as i32` in both backends' load/store paths truncates a constant
-  member or element offset past `i32::MAX` -- through *any* pointer, not only
-  the frame -- so those casts go too.
 - Stack probing. No target probes today; a frame larger than the guard gap
   should touch each page on the way down, as gcc and clang do.
 

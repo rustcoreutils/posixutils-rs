@@ -66,7 +66,7 @@ impl X86_64CodeGen {
                     size: fp_size,
                     src: XmmOperand::Mem(MemAddr::BaseOffset {
                         base: r,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     }),
                     dst: XmmOperand::Reg(dst_xmm),
                 });
@@ -79,7 +79,7 @@ impl X86_64CodeGen {
                     // Local variable - load directly from stack slot
                     self.push_lir(X86Inst::MovFp {
                         size: fp_size,
-                        src: XmmOperand::Mem(self.stack_mem(offset - insn.offset as i32)),
+                        src: XmmOperand::Mem(self.stack_mem(offset - insn.displacement())),
                         dst: XmmOperand::Reg(dst_xmm),
                     });
                 } else {
@@ -93,14 +93,14 @@ impl X86_64CodeGen {
                         size: fp_size,
                         src: XmmOperand::Mem(MemAddr::BaseOffset {
                             base: Reg::R11,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         }),
                         dst: XmmOperand::Reg(dst_xmm),
                     });
                 }
             }
             Loc::Global(name) => {
-                let src = self.global_mem(&name, insn.offset as i32, Reg::R11);
+                let src = self.global_mem(&name, insn.displacement(), Reg::R11);
                 self.push_lir(X86Inst::MovFp {
                     size: fp_size,
                     src: XmmOperand::Mem(src),
@@ -114,7 +114,7 @@ impl X86_64CodeGen {
                     size: fp_size,
                     src: XmmOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::R11,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     }),
                     dst: XmmOperand::Reg(dst_xmm),
                 });
@@ -174,7 +174,7 @@ impl X86_64CodeGen {
                     src: XmmOperand::Reg(XmmReg::Xmm15),
                     dst: XmmOperand::Mem(MemAddr::BaseOffset {
                         base: r,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     }),
                 });
             }
@@ -187,7 +187,7 @@ impl X86_64CodeGen {
                     self.push_lir(X86Inst::MovFp {
                         size: fp_size,
                         src: XmmOperand::Reg(XmmReg::Xmm15),
-                        dst: XmmOperand::Mem(self.stack_mem(offset - insn.offset as i32)),
+                        dst: XmmOperand::Mem(self.stack_mem(offset - insn.displacement())),
                     });
                 } else {
                     // Spilled address - load address first, then store through it
@@ -201,13 +201,13 @@ impl X86_64CodeGen {
                         src: XmmOperand::Reg(XmmReg::Xmm15),
                         dst: XmmOperand::Mem(MemAddr::BaseOffset {
                             base: Reg::R11,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         }),
                     });
                 }
             }
             Loc::Global(name) => {
-                let dst = self.global_mem(&name, insn.offset as i32, Reg::R11);
+                let dst = self.global_mem(&name, insn.displacement(), Reg::R11);
                 self.push_lir(X86Inst::MovFp {
                     size: fp_size,
                     src: XmmOperand::Reg(XmmReg::Xmm15),
@@ -222,7 +222,7 @@ impl X86_64CodeGen {
                     src: XmmOperand::Reg(XmmReg::Xmm15),
                     dst: XmmOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::R11,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     }),
                 });
             }

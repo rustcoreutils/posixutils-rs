@@ -1005,13 +1005,17 @@ impl IncomingOff {
     /// It went unnoticed because it is invisible below 32-byte alignment: 16 is
     /// already a multiple of 8 and of 16, so only an argument wanting more than
     /// the area's own alignment can tell the two bases apart.
+    ///
+    /// Summed in `i64` and saturated: two stacked arguments each inside the
+    /// frame ceiling can still overflow their total. The caller checks the
+    /// end once, with [`crate::arch::regalloc::check_incoming_area`].
     fn take(next: &mut IncomingOff, bytes: i32, align: i32) -> i32 {
-        let align = align.max(8);
-        let base = IncomingOff::FIRST.0;
-        next.0 = base + (((next.0 - base) + align - 1) & !(align - 1));
-        let here = next.0;
-        next.0 += (bytes + 7) & !7;
-        here
+        let align = i64::from(align.max(8));
+        let base = i64::from(IncomingOff::FIRST.0);
+        let at = base + ((i64::from(next.0) - base + align - 1) & !(align - 1));
+        let end = at + ((i64::from(bytes) + 7) & !7);
+        next.0 = i32::try_from(end).unwrap_or(i32::MAX);
+        i32::try_from(at).unwrap_or(i32::MAX)
     }
 }
 
@@ -1568,6 +1572,7 @@ impl RegAlloc {
         self.named_gp_regs = int_arg_idx.min(int_arg_regs.len());
         self.named_fp_regs = fp_arg_idx.min(fp_arg_regs.len());
         self.named_incoming_end = stack_arg_offset.0;
+        crate::arch::regalloc::check_incoming_area(stack_arg_offset.0, self.func_pos);
     }
 
     /// Spill arguments in caller-saved registers if their interval crosses a call
@@ -1797,10 +1802,12 @@ impl RegAlloc {
                 return;
             }
         }
+        let frame_align = self.frame_align();
         let offset = crate::arch::regalloc::grow_frame(
             &mut self.stack_offset,
             size,
             alignment,
+            frame_align,
             self.func_pos,
         );
         self.locations.insert(interval.pseudo, Loc::Stack(offset));
@@ -1913,7 +1920,6 @@ impl RegAlloc {
                             } else {
                                 natural_align.max(8)
                             };
-                            let aligned_size = (size + alignment - 1) & !(alignment - 1);
                             // Sym slot reuse disabled. The IR-level
                             // interval of a Sym pseudo only captures
                             // its direct Store/Load/SymAddr uses,
@@ -1928,7 +1934,7 @@ impl RegAlloc {
                             // reuse is re-enabled.
                             let _ = self.addr_taken_syms.contains(&interval.pseudo);
                             let reusable = false;
-                            self.alloc_stack_slot(interval, aligned_size, alignment, reusable);
+                            self.alloc_stack_slot(interval, size, alignment, reusable);
                             if types.is_float(local_var.typ) {
                                 self.fp_pseudos.insert(interval.pseudo);
                             }
@@ -2362,6 +2368,16 @@ impl RegAlloc {
     }
 
     /// Get stack size needed (aligned to max local alignment, minimum 16)
+    /// The alignment the locals area is rounded to at the end, as far as it
+    /// is known: the frame base's, when over-aligned, and every slot's so far.
+    fn frame_align(&self) -> i32 {
+        let base = match self.frame_base {
+            FrameBase::Aligned { align, .. } => align,
+            FrameBase::Rbp => 16,
+        };
+        base.max(self.max_local_align).max(16)
+    }
+
     pub fn stack_size(&self) -> i32 {
         let align = self.max_local_align.max(16);
         (self.stack_offset + align - 1) & !(align - 1)

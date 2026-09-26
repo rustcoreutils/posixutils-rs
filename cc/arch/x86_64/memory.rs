@@ -319,7 +319,7 @@ impl X86_64CodeGen {
                     if insn.offset != 0 {
                         self.push_lir(X86Inst::Add {
                             size: OperandSize::B64,
-                            src: GpOperand::Imm(insn.offset),
+                            src: GpOperand::Imm(insn.displacement().into()),
                             dst: Reg::R10,
                         });
                     }
@@ -373,7 +373,7 @@ impl X86_64CodeGen {
                     if insn.offset != 0 {
                         self.push_lir(X86Inst::Add {
                             size: OperandSize::B64,
-                            src: GpOperand::Imm(insn.offset),
+                            src: GpOperand::Imm(insn.displacement().into()),
                             dst: Reg::R10,
                         });
                     }
@@ -413,7 +413,7 @@ impl X86_64CodeGen {
                     if insn.offset != 0 {
                         self.push_lir(X86Inst::Add {
                             size: OperandSize::B64,
-                            src: GpOperand::Imm(insn.offset),
+                            src: GpOperand::Imm(insn.displacement().into()),
                             dst: Reg::R10,
                         });
                     }
@@ -485,7 +485,7 @@ impl X86_64CodeGen {
                             dst_size: OperandSize::B32,
                             src: GpOperand::Mem(MemAddr::BaseOffset {
                                 base: r,
-                                offset: insn.offset as i32,
+                                offset: insn.displacement(),
                             }),
                             dst: dst_reg,
                         });
@@ -495,7 +495,7 @@ impl X86_64CodeGen {
                             dst_size: OperandSize::B32,
                             src: GpOperand::Mem(MemAddr::BaseOffset {
                                 base: r,
-                                offset: insn.offset as i32,
+                                offset: insn.displacement(),
                             }),
                             dst: dst_reg,
                         });
@@ -508,7 +508,7 @@ impl X86_64CodeGen {
                         size: op_size,
                         src: GpOperand::Mem(MemAddr::BaseOffset {
                             base: r,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         }),
                         dst: GpOperand::Reg(dst_reg),
                     });
@@ -520,7 +520,7 @@ impl X86_64CodeGen {
 
                 if is_symbol {
                     // Local variable - load directly from stack slot
-                    let stack_addr = self.stack_mem(offset - insn.offset as i32);
+                    let stack_addr = self.stack_mem(offset - insn.displacement());
                     if mem_size <= 16 {
                         // LIR: sign/zero extending load from stack
                         let src_size = OperandSize::from_bits(mem_size);
@@ -565,7 +565,7 @@ impl X86_64CodeGen {
                                 dst_size: OperandSize::B32,
                                 src: GpOperand::Mem(MemAddr::BaseOffset {
                                     base: Reg::R11,
-                                    offset: insn.offset as i32,
+                                    offset: insn.displacement(),
                                 }),
                                 dst: dst_reg,
                             });
@@ -575,7 +575,7 @@ impl X86_64CodeGen {
                                 dst_size: OperandSize::B32,
                                 src: GpOperand::Mem(MemAddr::BaseOffset {
                                     base: Reg::R11,
-                                    offset: insn.offset as i32,
+                                    offset: insn.displacement(),
                                 }),
                                 dst: dst_reg,
                             });
@@ -587,7 +587,7 @@ impl X86_64CodeGen {
                             size: op_size,
                             src: GpOperand::Mem(MemAddr::BaseOffset {
                                 base: Reg::R11,
-                                offset: insn.offset as i32,
+                                offset: insn.displacement(),
                             }),
                             dst: GpOperand::Reg(dst_reg),
                         });
@@ -689,7 +689,7 @@ impl X86_64CodeGen {
                                 dst_size: OperandSize::B32,
                                 src: GpOperand::Mem(MemAddr::BaseOffset {
                                     base: Reg::R11,
-                                    offset: insn.offset as i32,
+                                    offset: insn.displacement(),
                                 }),
                                 dst: dst_reg,
                             });
@@ -699,7 +699,7 @@ impl X86_64CodeGen {
                                 dst_size: OperandSize::B32,
                                 src: GpOperand::Mem(MemAddr::BaseOffset {
                                     base: Reg::R11,
-                                    offset: insn.offset as i32,
+                                    offset: insn.displacement(),
                                 }),
                                 dst: dst_reg,
                             });
@@ -710,7 +710,7 @@ impl X86_64CodeGen {
                             size: op_size,
                             src: GpOperand::Mem(MemAddr::BaseOffset {
                                 base: Reg::R11,
-                                offset: insn.offset as i32,
+                                offset: insn.displacement(),
                             }),
                             dst: GpOperand::Reg(dst_reg),
                         });
@@ -758,7 +758,7 @@ impl X86_64CodeGen {
                             dst_size: OperandSize::B32,
                             src: GpOperand::Mem(MemAddr::BaseOffset {
                                 base: Reg::R11,
-                                offset: insn.offset as i32,
+                                offset: insn.displacement(),
                             }),
                             dst: dst_reg,
                         });
@@ -768,7 +768,7 @@ impl X86_64CodeGen {
                             dst_size: OperandSize::B32,
                             src: GpOperand::Mem(MemAddr::BaseOffset {
                                 base: Reg::R11,
-                                offset: insn.offset as i32,
+                                offset: insn.displacement(),
                             }),
                             dst: dst_reg,
                         });
@@ -780,7 +780,7 @@ impl X86_64CodeGen {
                         size: op_size,
                         src: GpOperand::Mem(MemAddr::BaseOffset {
                             base: Reg::R11,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         }),
                         dst: GpOperand::Reg(dst_reg),
                     });
@@ -846,7 +846,7 @@ impl X86_64CodeGen {
                     src: GpOperand::Reg(value_reg),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: r,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     }),
                 });
             }
@@ -883,7 +883,7 @@ impl X86_64CodeGen {
                     self.push_lir(X86Inst::Mov {
                         size: store_size,
                         src: GpOperand::Reg(value_reg),
-                        dst: GpOperand::Mem(self.stack_mem(offset - insn.offset as i32)),
+                        dst: GpOperand::Mem(self.stack_mem(offset - insn.displacement())),
                     });
                 } else {
                     // Spilled address - load address first, then store through it
@@ -899,7 +899,7 @@ impl X86_64CodeGen {
                         src: GpOperand::Reg(value_reg),
                         dst: GpOperand::Mem(MemAddr::BaseOffset {
                             base: Reg::R11,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         }),
                     });
                 }
@@ -954,7 +954,7 @@ impl X86_64CodeGen {
                         src: GpOperand::Reg(value_reg),
                         dst: GpOperand::Mem(MemAddr::BaseOffset {
                             base: Reg::R11,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         }),
                     });
                 } else {
@@ -975,7 +975,7 @@ impl X86_64CodeGen {
                     src: GpOperand::Reg(value_reg),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::R11,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     }),
                 });
             }
@@ -1050,7 +1050,7 @@ impl X86_64CodeGen {
                 if is_symbol {
                     // Local variable — LEA to get direct stack address
                     self.push_lir(X86Inst::Lea {
-                        addr: self.stack_mem(offset - insn.offset as i32),
+                        addr: self.stack_mem(offset - insn.displacement()),
                         dst: Reg::R11,
                     });
                 } else {
@@ -1063,7 +1063,7 @@ impl X86_64CodeGen {
                     if insn.offset != 0 {
                         self.push_lir(X86Inst::Add {
                             size: OperandSize::B64,
-                            src: GpOperand::Imm(insn.offset),
+                            src: GpOperand::Imm(insn.displacement().into()),
                             dst: Reg::R11,
                         });
                     }
@@ -1075,7 +1075,7 @@ impl X86_64CodeGen {
                     self.push_lir(X86Inst::Lea {
                         addr: MemAddr::BaseOffset {
                             base: r,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         },
                         dst: Reg::R11,
                     });
@@ -1251,7 +1251,7 @@ impl X86_64CodeGen {
         match addr_loc {
             Loc::Stack(offset) => {
                 self.push_lir(X86Inst::Lea {
-                    addr: self.stack_mem(offset - insn.offset as i32),
+                    addr: self.stack_mem(offset - insn.displacement()),
                     dst: Reg::R11,
                 });
             }
@@ -1260,7 +1260,7 @@ impl X86_64CodeGen {
                     self.push_lir(X86Inst::Lea {
                         addr: MemAddr::BaseOffset {
                             base: r,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         },
                         dst: Reg::R11,
                     });
@@ -1293,7 +1293,7 @@ impl X86_64CodeGen {
                 if insn.offset != 0 {
                     self.push_lir(X86Inst::Add {
                         size: OperandSize::B64,
-                        src: GpOperand::Imm(insn.offset),
+                        src: GpOperand::Imm(insn.displacement().into()),
                         dst: Reg::R11,
                     });
                 }

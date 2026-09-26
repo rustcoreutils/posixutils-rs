@@ -861,13 +861,17 @@ impl IncomingOff {
     /// apart, which is why this survived: below that the base is already a
     /// multiple of the alignment. x86-64's `IncomingOff::take` is the same
     /// shape and had the same defect.
+    ///
+    /// Summed in `i64` and saturated: two stacked arguments each inside the
+    /// frame ceiling can still overflow their total. The caller checks the
+    /// end once, with [`crate::arch::regalloc::check_incoming_area`].
     pub fn take(next: &mut IncomingOff, bytes: i32, align: i32) -> Self {
-        let align = align.max(8);
-        let base = IncomingOff::FIRST.0;
-        next.0 = base + (((next.0 - base) + align - 1) & !(align - 1));
-        let here = *next;
-        next.0 += (bytes + 7) & !7;
-        here
+        let align = i64::from(align.max(8));
+        let base = i64::from(IncomingOff::FIRST.0);
+        let at = base + ((i64::from(next.0) - base + align - 1) & !(align - 1));
+        let end = at + ((i64::from(bytes) + 7) & !7);
+        next.0 = i32::try_from(end).unwrap_or(i32::MAX);
+        IncomingOff(i32::try_from(at).unwrap_or(i32::MAX))
     }
 
     /// The displacement the addressing helpers work in.
@@ -1538,6 +1542,7 @@ impl RegAlloc {
                 }
             }
         }
+        crate::arch::regalloc::check_incoming_area(next_incoming.displacement(), self.func_pos);
     }
 
     /// Force alloca results to stack to avoid clobbering issues
@@ -1684,6 +1689,7 @@ impl RegAlloc {
             &mut self.stack_offset,
             size,
             alignment,
+            self.frame_base.align(),
             self.func_pos,
         );
         self.locations.insert(
@@ -1795,12 +1801,11 @@ impl RegAlloc {
                                 .explicit_align
                                 .map(|a| a as i32)
                                 .unwrap_or(natural_align.max(8));
-                            let aligned_size = (size + alignment - 1) & !(alignment - 1);
                             // Sym slot reuse disabled — see x86_64
                             // mirror for the rationale.
                             let _ = self.addr_taken_syms.contains(&interval.pseudo);
                             let reusable = false;
-                            self.alloc_stack_slot(interval, aligned_size, alignment, reusable);
+                            self.alloc_stack_slot(interval, size, alignment, reusable);
                             if types.is_float(local.typ) {
                                 self.fp_pseudos.insert(interval.pseudo);
                             }
@@ -1833,8 +1838,7 @@ impl RegAlloc {
                 );
                 let size = size.max(8);
                 let alignment = types.alignment(typ) as i32;
-                let aligned_size = (size + (alignment - 1)) & !(alignment - 1);
-                self.alloc_stack_slot(interval, aligned_size, alignment, false);
+                self.alloc_stack_slot(interval, size, alignment, false);
                 continue;
             }
 

@@ -78,7 +78,7 @@ impl X86_64CodeGen {
                 // addr is a pointer in a register
                 MemAddr::BaseOffset {
                     base: r,
-                    offset: insn.offset as i32,
+                    offset: insn.displacement(),
                 }
             }
             Loc::Stack(offset) => {
@@ -90,7 +90,7 @@ impl X86_64CodeGen {
                 // past the frame entirely.
                 let is_symbol = self.pseudos.is_sym(addr);
                 if is_symbol {
-                    self.stack_field(offset, insn.offset as i32)
+                    self.stack_field(offset, insn.displacement())
                 } else {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
@@ -99,17 +99,17 @@ impl X86_64CodeGen {
                     });
                     MemAddr::BaseOffset {
                         base: Reg::R11,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     }
                 }
             }
-            Loc::Global(name) => self.global_mem(&name, insn.offset as i32, Reg::R11),
+            Loc::Global(name) => self.global_mem(&name, insn.displacement(), Reg::R11),
             _ => {
                 // Load address into R11
                 self.emit_move(addr, Reg::R11, 64);
                 MemAddr::BaseOffset {
                     base: Reg::R11,
-                    offset: insn.offset as i32,
+                    offset: insn.displacement(),
                 }
             }
         };
@@ -212,7 +212,7 @@ impl X86_64CodeGen {
                 // addr is a pointer in a register
                 MemAddr::BaseOffset {
                     base: r,
-                    offset: insn.offset as i32,
+                    offset: insn.displacement(),
                 }
             }
             Loc::Stack(offset) => {
@@ -226,7 +226,7 @@ impl X86_64CodeGen {
                 // return corrupt the stack.
                 let is_symbol = self.pseudos.is_sym(addr);
                 if is_symbol {
-                    self.stack_field(offset, insn.offset as i32)
+                    self.stack_field(offset, insn.displacement())
                 } else {
                     // Load the pointer, then address through it.
                     self.push_lir(X86Inst::Mov {
@@ -236,16 +236,16 @@ impl X86_64CodeGen {
                     });
                     MemAddr::BaseOffset {
                         base: Reg::R11,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     }
                 }
             }
-            Loc::Global(name) => self.global_mem(&name, insn.offset as i32, Reg::R11),
+            Loc::Global(name) => self.global_mem(&name, insn.displacement(), Reg::R11),
             _ => {
                 self.emit_move(addr, Reg::R11, 64);
                 MemAddr::BaseOffset {
                     base: Reg::R11,
-                    offset: insn.offset as i32,
+                    offset: insn.displacement(),
                 }
             }
         };

@@ -612,6 +612,7 @@ impl<'a> Linearizer<'a> {
 
     /// Add an instruction to the current basic block
     pub(crate) fn emit(&mut self, insn: Instruction) {
+        let insn = self.displacement_in_range(insn);
         if let Some(bb_id) = self.current_bb {
             // Attach current source position for debug info
             let insn = if let Some(pos) = self.current_pos {
@@ -623,6 +624,34 @@ impl<'a> Linearizer<'a> {
             bb.add_insn(insn);
         }
     }
+    /// Keep a load's or store's constant offset inside a machine displacement.
+    ///
+    /// Both backends address `src[0] + offset` with a signed 32-bit
+    /// displacement, so an offset past `i32` -- a member more than 2 GiB into a
+    /// struct, reached through a pointer -- used to be truncated with `as i32`
+    /// and the access landed gigabytes away. This is the one place such an
+    /// offset can enter the IR: no pass rewrites an offset afterwards. The far
+    /// part is folded into the address with an ordinary `Add`, so the register
+    /// allocator supplies the register it needs, and
+    /// [`Instruction::displacement`] can rely on the result
+    /// (`validate.rs` I6 checks it).
+    fn displacement_in_range(&mut self, mut insn: Instruction) -> Instruction {
+        if !matches!(insn.op, Opcode::Load | Opcode::Store) || i32::try_from(insn.offset).is_ok() {
+            return insn;
+        }
+        let Some(&base) = insn.src.first() else {
+            return insn;
+        };
+        let ptr = self.types.pointer_to(self.types.char_id);
+        let base = self.rvalue_addr(base, self.types.char_id);
+        let delta = self.emit_const(insn.offset as i128, self.types.long_id);
+        let addr = self.alloc_reg_pseudo();
+        self.emit(Instruction::binop(Opcode::Add, addr, base, delta, ptr, 64));
+        insn.src[0] = addr;
+        insn.offset = 0;
+        insn
+    }
+
     /// Emit a type conversion if needed
     /// Returns the (possibly converted) pseudo ID
     pub(crate) fn emit_convert(

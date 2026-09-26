@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
 /// Grow a frame's locals area by one slot, refusing a total no `i32`
-/// displacement can reach.
+/// displacement can reach -- counting what the prologue will add to it.
 ///
 /// [`TypeTable::MAX_STACK_OBJECT_BYTES`] bounds one object and
 /// [`crate::abi::slot_bytes`] enforces that. Neither bounds their *sum*, and
@@ -27,31 +27,68 @@ use std::hash::Hash;
 /// eight-byte pointer for one, and the extent is subtracted from the stack
 /// pointer at run time in a 64-bit register.
 ///
-/// The rounding happens inside, in `i64`, because at a legal
-/// `MAX_STACK_OBJECT_BYTES` with an over-aligned local the
-/// `(offset + align - 1)` that used to precede the `+=` overflowed on its own.
-pub fn grow_frame(offset: &mut i32, size: i32, alignment: i32, pos: crate::diag::Position) -> i32 {
+/// Admitting a frame here is a promise to everything downstream, so the check
+/// is against what the frame *becomes*, not what it is so far:
+///
+/// - The slot's own rounding happens inside, in `i64`: the offset up to the
+///   slot's alignment, and the size up to a multiple of it. Callers used to
+///   round the size first, in `i32`, so `_Alignas(16) char a[2147483640]`
+///   wrapped to a zero-byte slot before this check ever saw it.
+/// - `frame_align` is the alignment the whole locals area is rounded to at
+///   the end -- sixteen, or the over-aligned frame base's -- and that rounding
+///   can add almost twice it (`stack_size`). It is reserved here.
+/// - Everything else the prologue adds -- saved registers, the variadic save
+///   area -- is inside [`TypeTable::FRAME_HEADROOM_BYTES`], which
+///   `MAX_STACK_OBJECT_BYTES` already leaves below `i32::MAX`.
+///
+/// So every frame quantity computed later, in `i32`, stays in range without a
+/// check of its own. Before this, an accepted frame near the limit wrapped in
+/// `stack_size`, in the prologue total and in aarch64's frame zeroing -- which
+/// then looped forever, pushing instructions until the compiler ran out of
+/// memory.
+pub fn grow_frame(
+    offset: &mut i32,
+    size: i32,
+    alignment: i32,
+    frame_align: i32,
+    pos: crate::diag::Position,
+) -> i32 {
+    let align = i64::from(alignment.max(1));
     let mut want = i64::from(*offset);
     if alignment > 8 {
-        want = (want + i64::from(alignment) - 1) & !(i64::from(alignment) - 1);
+        want = (want + align - 1) & !(align - 1);
     }
-    want += i64::from(size.max(0));
+    want += (i64::from(size.max(0)) + align - 1) & !(align - 1);
+    let limit = TypeTable::MAX_STACK_OBJECT_BYTES as i64 - 2 * i64::from(frame_align.max(16));
     match i32::try_from(want) {
-        Ok(n) if (n as usize) <= TypeTable::MAX_STACK_OBJECT_BYTES => *offset = n,
+        Ok(n) if i64::from(n) <= limit => *offset = n,
         _ => {
             crate::diag::error_args(
                 pos,
                 "this function's stack frame needs {0} bytes, \
                  past the {1} bytes a frame can address",
-                &[
-                    &want.to_string(),
-                    &TypeTable::MAX_STACK_OBJECT_BYTES.to_string(),
-                ],
+                &[&want.to_string(), &limit.max(0).to_string()],
             );
             *offset = offset.saturating_add(8);
         }
     }
     *offset
+}
+
+/// Refuse an incoming stacked-argument area no `i32` displacement reaches.
+///
+/// Each parameter is inside the frame ceiling on its own; their sum is not,
+/// and `IncomingOff::take` saturates rather than wrapping so this one check
+/// at the end of a function's parameter layout sees it.
+pub fn check_incoming_area(end: i32, pos: crate::diag::Position) {
+    if end as usize > TypeTable::MAX_STACK_OBJECT_BYTES {
+        crate::diag::error_args(
+            pos,
+            "this function's stacked parameters need more than the {0} bytes \
+             a stack frame can address",
+            &[&TypeTable::MAX_STACK_OBJECT_BYTES.to_string()],
+        );
+    }
 }
 
 // ============================================================================
@@ -1535,6 +1572,27 @@ impl<'a> AbiLowering<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A slot's size is rounded up to its alignment inside the check, and the
+    /// frame's final rounding is reserved: the largest admitted locals area
+    /// leaves room for both, and one byte more is refused rather than wrapped.
+    #[test]
+    fn test_grow_frame_reserves_what_follows() {
+        let pos = crate::diag::Position::default();
+        let limit = TypeTable::MAX_STACK_OBJECT_BYTES as i32 - 2 * 16;
+        let mut offset = 0;
+        assert_eq!(grow_frame(&mut offset, limit, 8, 16, pos), limit);
+
+        // An `_Alignas(16)` object whose size is not a multiple of 16 takes
+        // the rounded size.
+        let mut offset = 0;
+        assert_eq!(grow_frame(&mut offset, 24, 16, 16, pos), 32);
+
+        // Past the limit: refused, and the offset does not wrap.
+        let mut offset = limit;
+        let after = grow_frame(&mut offset, 16, 8, 16, pos);
+        assert!(after > 0, "offset wrapped to {after}");
+    }
 
     /// Maximum weight first, and the smallest id among equals: `4` is picked
     /// before `3` because ordering `2` gave it a neighbour, though `3` has the

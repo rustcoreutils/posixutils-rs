@@ -207,6 +207,7 @@ impl Parser<'_> {
                 member_align: size,
                 is_complete: true,
                 transparent: false,
+                anon_id: tag.is_none().then(|| self.types.fresh_anon_id()),
             };
 
             let mut enum_type = Type::enum_type(composite);
@@ -566,6 +567,7 @@ impl Parser<'_> {
                 member_align,
                 is_complete: true,
                 transparent: is_transparent && is_union,
+                anon_id: tag.is_none().then(|| self.types.fresh_anon_id()),
             };
 
             // Check if there's an existing forward declaration that we should complete

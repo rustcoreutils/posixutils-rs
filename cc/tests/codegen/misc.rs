@@ -13629,12 +13629,10 @@ long stride(struct Big *p, int i) { return (char *)&p[i] - (char *)p; }
 ///   unrolled `zero_stack_frame`. That is a loop now; nobody has re-measured
 ///   the rest of the aarch64 path at this size, so keep the list as it is.
 /// - **`by_value_param` does not pass its argument on.** The prologue copy is
-///   the site under test; *sending* a 600 MB aggregate costs **16 seconds and
-///   21.9 GB**, because the outgoing stacked-argument copy has no `memcpy`
-///   fallback and unrolls one load/store pair per eight bytes.
+///   the site under test. Sending a 600 MB aggregate used to cost 16 seconds
+///   and 21.9 GB of compiler memory, one load/store pair per eightbyte; the
+///   outgoing copy is a `rep movsq` now, but it is not what this test is about.
 ///
-/// The second is recorded in cc/TODO.md. Until it is fixed, do not add a call
-/// that passes one of these by value.
 /// Everything here is `extern`; nothing is defined or run.
 #[test]
 fn codegen_aggregate_copy_length_past_the_old_object_bound() {
@@ -13858,5 +13856,203 @@ fn codegen_aarch64_frame_zeroing_shape() {
     assert!(
         !small.contains("[x16], #16"),
         "a small frame is unrolled:\n{small}"
+    );
+}
+
+/// Members more than 2 GiB into a struct, read and written through a pointer.
+///
+/// Both backends narrowed a load's or store's IR offset with `as i32`, so
+/// `p->y` at offset 3,000,000,000 became a displacement of -1,294,967,296 and
+/// the access landed gigabytes away: a segfault on both targets at every
+/// level, where gcc builds and runs this. `Linearizer::emit` now folds such an
+/// offset into the address. The pointer is formed 3 GB below a real buffer, so
+/// only the far members are ever touched and nothing large is allocated.
+const FAR_MEMBERS: &str = r#"
+/* Members past 2 GiB, reached through a pointer that is never dereferenced
+   below its real storage: `base` points 3 GB before `storage`, so only the
+   far members are ever touched. */
+#define NI __attribute__((noinline))
+typedef unsigned long size_t;
+struct pair { long a, b; };
+
+struct far {
+    char pad[3000000000UL];
+    int y;
+    long z;
+    double w;
+    float f;
+    short s;
+    unsigned char c;
+    struct pair pair;
+    unsigned bits : 5;
+    long double ld;
+};
+
+#define OFF(m) ((size_t)&((struct far *)0)->m)
+
+static struct {
+    int y; long z; double w; float f; short s; unsigned char c;
+    struct pair pair; unsigned bits; long double ld; long pad[8];
+} storage_shadow;
+static char storage[256] __attribute__((aligned(16)));
+
+NI struct far *base(void) { return (struct far *)(storage - OFF(y)); }
+
+NI int get_y(struct far *p) { return p->y; }
+NI long get_z(struct far *p) { return p->z; }
+NI double get_w(struct far *p) { return p->w; }
+NI float get_f(struct far *p) { return p->f; }
+NI short get_s(struct far *p) { return p->s; }
+NI unsigned char get_c(struct far *p) { return p->c; }
+NI long double get_ld(struct far *p) { return p->ld; }
+NI void set_all(struct far *p)
+{
+    p->y = 11; p->z = 22; p->w = 3.5; p->f = 4.5f; p->s = -6; p->c = 7;
+    p->pair.a = 8; p->pair.b = 9; p->bits = 13; p->ld = 10.25L;
+}
+NI int *addr_y(struct far *p) { return &p->y; }
+NI long pair_sum(struct far *p)
+{
+    struct pair q = p->pair;
+    return q.a + q.b;
+}
+NI unsigned get_bits(struct far *p) { return p->bits; }
+
+int main(void)
+{
+    struct far *p = base();
+    (void)storage_shadow;
+    set_all(p);
+    if (get_y(p) != 11) return 1;
+    if (get_z(p) != 22) return 2;
+    if (get_w(p) != 3.5) return 3;
+    if (get_f(p) != 4.5f) return 4;
+    if (get_s(p) != -6) return 5;
+    if (get_c(p) != 7) return 6;
+    if (pair_sum(p) != 17) return 7;
+    if (get_bits(p) != 13) return 8;
+    if (get_ld(p) != 10.25L) return 9;
+    if ((char *)addr_y(p) != storage) return 10;
+    if (*(int *)storage != 11) return 11;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_member_past_two_gigabytes_through_a_pointer() {
+    for opt in ["-O0", "-O2"] {
+        let opts = vec![opt.to_string()];
+        assert_eq!(
+            compile_and_run("far_members", FAR_MEMBERS, &opts),
+            0,
+            "x86-64 {opt}"
+        );
+        if let Some(code) = compile_and_run_aarch64("far_members_a64", FAR_MEMBERS, opt) {
+            assert_eq!(code, 0, "aarch64 {opt}");
+        }
+    }
+}
+
+/// The largest frame c17 admits is allocated whole, on both targets.
+///
+/// The companion to `diagnostics_frame_at_the_ceiling_is_refused_not_wrapped`:
+/// refusing the frames that used to wrap must not refuse -- or shrink -- the
+/// ones that fit. An over-aligned local, a variadic save area and a scalar
+/// beside it are everything the prologue adds on top of the locals. The
+/// allocation is read off the assembly rather than run: a two-gigabyte frame
+/// is not a test's to ask for, and c17 now zeroes it with a loop, so compiling
+/// it costs nothing.
+#[test]
+fn codegen_largest_admitted_frame_is_allocated_whole() {
+    use crate::common::asm_for_at;
+    const OBJECT: i64 = 2_147_479_000;
+    let src = "extern void sink(void *);\n\
+               void f(int n, ...){ _Alignas(64) char a[2147479000]; long x = n; sink(a); sink(&x); }\n";
+    // x86-64: one `subq $N, %rsp`.
+    let asm = asm_for_at(
+        "frame_edge_x86",
+        src,
+        &["--target", "x86_64-unknown-linux-gnu"],
+    );
+    let alloc: i64 = asm
+        .lines()
+        .find_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("subq $")?
+                .strip_suffix(", %rsp")?
+                .parse()
+                .ok()
+        })
+        .expect("x86-64 prologue allocation");
+    assert!(alloc >= OBJECT + 8, "x86-64 allocated {alloc}:\n{asm}");
+    // aarch64: `movz x15, #lo` / `movk x15, #hi, lsl #16` / `sub sp, sp, x15`.
+    let asm = asm_for_at(
+        "frame_edge_a64",
+        src,
+        &["--target", "aarch64-unknown-linux-gnu"],
+    );
+    let lines: Vec<&str> = asm.lines().map(str::trim).collect();
+    let sub = lines
+        .iter()
+        .position(|l| *l == "sub sp, sp, x15")
+        .expect("aarch64 prologue allocation");
+    let lo: i64 = lines[sub - 2]
+        .strip_prefix("movz x15, #")
+        .and_then(|v| v.parse().ok())
+        .expect("movz");
+    let hi: i64 = lines[sub - 1]
+        .strip_prefix("movk x15, #")
+        .and_then(|v| v.strip_suffix(", lsl #16"))
+        .and_then(|v| v.parse().ok())
+        .expect("movk");
+    let alloc = lo + (hi << 16);
+    assert!(alloc >= OBJECT + 8, "aarch64 allocated {alloc}:\n{asm}");
+}
+
+/// Stacked aggregate arguments past the unroll threshold are copied with
+/// `rep movsq`, and arrive intact at a callee another compiler built.
+///
+/// One load/store pair per eightbyte made a 600 MB argument 75 million
+/// instructions and tens of gigabytes of compiler memory. The copy runs after
+/// the outgoing area is reserved and before the register arguments are set up,
+/// so RDI, RSI and RCX -- which `rep movsq` needs -- can still hold arguments;
+/// here they hold `a`, `c` and `e`, and must survive it.
+#[test]
+fn codegen_large_stacked_argument_block_copy() {
+    let caller = r#"
+struct big { long v[8192]; };
+long take(int a, struct big b, int c, struct big d, int e);
+static struct big x, y;
+__attribute__((noinline)) long go(int a, int c, int e) { return take(a, x, c, y, e); }
+int main(void)
+{
+    for (int i = 0; i < 8192; i++) { x.v[i] = i * 3; y.v[i] = i; }
+    long want = 1 + 2 + 3;
+    for (int i = 0; i < 8192; i++) want += x.v[i] - y.v[i];
+    want += x.v[0] * 1000 + y.v[8191];
+    return go(1, 2, 3) == want ? 0 : 1;
+}
+"#;
+    let callee = r#"
+struct big { long v[8192]; };
+long take(int a, struct big b, int c, struct big d, int e)
+{
+    long s = a + c + e;
+    for (int i = 0; i < 8192; i++) s += b.v[i] - d.v[i];
+    return s + b.v[0] * 1000 + d.v[8191];
+}
+"#;
+    if let Some(code) = compile_with_host_cc("big_stacked_args", caller, callee) {
+        assert_eq!(code, 0);
+    }
+    let asm = crate::common::asm_for_at(
+        "big_stacked_args",
+        caller,
+        &["--target", "x86_64-unknown-linux-gnu"],
+    );
+    assert!(
+        asm.contains("rep movsq"),
+        "expected a block copy:
+{asm}"
     );
 }

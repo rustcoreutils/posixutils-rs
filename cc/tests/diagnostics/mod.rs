@@ -5336,8 +5336,8 @@ fn diagnostics_permissive_relaxes_the_constraints_gcc_warns_about() {
 /// miscompiled.
 ///
 /// This bound is not C's. Both backends address a local and a stacked argument
-/// by a signed 32-bit displacement from the frame register, so `i32::MAX`
-/// rounded down to an eightbyte is the ceiling -- a billion times under the
+/// by a signed 32-bit displacement from the frame register, so `i32::MAX`, less
+/// the headroom the prologue adds, is the ceiling -- a billion times under the
 /// `MAX_OBJECT_BYTES` the type table allows, which is why the two are separate
 /// constants and separate messages. gcc compiles the same local with
 /// `movabsq`-based 64-bit frame addressing; c17 says so instead, and refuses the
@@ -5574,5 +5574,106 @@ int main(void)
         "signbit_int",
         "int t(int x) { return __builtin_signbit(x); }\n",
         "non-floating-point argument",
+    );
+}
+
+/// Frames at the edge of the ceiling, on both targets: diagnosed, never
+/// wrapped.
+///
+/// Each of these was accepted before and came out wrong, because the ceiling
+/// was `i32::MAX` and the arithmetic after it -- a slot's alignment rounding,
+/// the prologue's saved registers and variadic save area, the final frame
+/// rounding -- ran past it in `i32`:
+///
+/// - `_Alignas(16) char a[2147483640]`: the slot size was rounded up to its
+///   alignment before the frame check, wrapped, and the array got zero bytes
+///   inside a 16-byte frame on x86-64.
+/// - a variadic function near the limit: the prologue total wrapped negative,
+///   so x86-64 allocated no frame at all and addressed `2147483640(%rbp)`.
+/// - a plain `char a[2147483632]` on aarch64: frame zeroing computed its last
+///   store's offset in `i32`, wrapped into the unrolled path, and its loop never
+///   ended -- the compiler pushed instructions until it ran out of memory.
+/// - two by-value arguments of 1.5 GB each: the outgoing area's sum wrapped,
+///   and x86-64 unrolled the copy into seven gigabytes of compiler memory.
+#[test]
+fn diagnostics_frame_at_the_ceiling_is_refused_not_wrapped() {
+    let cases = [
+        (
+            "aligned_local",
+            "extern void sink(void *);\n\
+             void f(void){ _Alignas(16) char a[2147483640]; sink(a); }\n",
+        ),
+        (
+            "variadic",
+            "extern void sink(void *);\n\
+             void f(int n, ...){ char a[2147483624]; sink(a); }\n",
+        ),
+        (
+            "plain_local",
+            "extern void sink(void *);\n\
+             void f(void){ char a[2147483632]; sink(a); }\n",
+        ),
+        (
+            "local_one_rounding_past",
+            "extern void sink(void *);\n\
+             void f(void){ _Alignas(64) char a[2147479480]; sink(a); }\n",
+        ),
+        (
+            "stacked_arguments",
+            "struct big { char b[1500000000]; };\n\
+             extern void take(struct big, struct big);\n\
+             void f(struct big *p){ take(*p, *p); }\n",
+        ),
+    ];
+    for (name, src) in cases {
+        for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            let c = create_c_file(name, src);
+            let out = c.path().with_extension("s");
+            let run = run_c17(&[
+                "--target",
+                target,
+                "-S",
+                "-o",
+                &out.to_string_lossy(),
+                &c.path().to_string_lossy(),
+            ]);
+            let _ = std::fs::remove_file(&out);
+            assert!(!run.success, "{name} on {target} compiled:\n{}", run.stderr);
+            assert!(
+                run.stderr.contains("stack object size")
+                    || run.stderr.contains("stack frame")
+                    || run.stderr.contains("stacked arguments"),
+                "{name} on {target}: expected a frame diagnostic, got:\n{}",
+                run.stderr
+            );
+        }
+    }
+}
+
+/// Two tagless struct definitions are two types, even with the same members.
+///
+/// C17 6.7.2.3p5: each struct-or-union specifier with a member list declares a
+/// distinct type. c17 compared tagless composites by their members alone, so
+/// assigning one to the other -- or initializing one from the other -- was
+/// accepted where gcc rejects it. Uses of *one* tagless type stay legal,
+/// including through a typedef and a qualified variant of it.
+#[test]
+fn diagnostics_distinct_tagless_structs_are_incompatible() {
+    compile_expect_error(
+        "tagless_assign",
+        "struct { long a, b; } x;\nstruct { long a, b; } y;\nvoid f(void){ x = y; }\n",
+        "incompatible",
+    );
+    compile_expect_error(
+        "tagless_init",
+        "struct S { struct { long a, b; } pair; } *p;\n\
+         long f(void){ struct { long a, b; } q = p->pair; return q.a; }\n",
+        "",
+    );
+    compile_expect_ok(
+        "tagless_same_type",
+        "typedef struct { int x; } T;\nT t1;\nconst T t2;\nstruct { int x; } s1, s2;\n\
+         struct o { struct { int y; } in; } a, b;\n\
+         void f(void){ t1 = t2; s1 = s2; a.in = b.in; }\n",
     );
 }

@@ -76,7 +76,7 @@ impl Aarch64CodeGen {
                     size: fp_size,
                     addr: MemAddr::BaseOffset {
                         base: r,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     },
                     dst: dst_vreg,
                 });
@@ -88,7 +88,7 @@ impl Aarch64CodeGen {
                 if is_symbol {
                     self.push_lir(Aarch64Inst::LdrFp {
                         size: fp_size,
-                        addr: self.stack_mem_plus(offset, insn.offset as i32),
+                        addr: self.stack_mem_plus(offset, insn.displacement()),
                         dst: dst_vreg,
                     });
                 } else {
@@ -101,7 +101,7 @@ impl Aarch64CodeGen {
                         size: fp_size,
                         addr: MemAddr::BaseOffset {
                             base: Reg::X16,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         },
                         dst: dst_vreg,
                     });
@@ -140,7 +140,7 @@ impl Aarch64CodeGen {
                         size: fp_size,
                         addr: MemAddr::BaseOffset {
                             base: scratch0,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         },
                         dst: dst_vreg,
                     });
@@ -152,7 +152,7 @@ impl Aarch64CodeGen {
                     size: fp_size,
                     addr: MemAddr::BaseOffset {
                         base: Reg::X16,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     },
                     dst: dst_vreg,
                 });
@@ -685,7 +685,7 @@ impl Aarch64CodeGen {
                     src: src_vreg,
                     addr: MemAddr::BaseOffset {
                         base: r,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     },
                 });
             }
@@ -696,7 +696,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::StrFp {
                         size: fp_size,
                         src: src_vreg,
-                        addr: self.stack_mem_plus(offset, insn.offset as i32),
+                        addr: self.stack_mem_plus(offset, insn.displacement()),
                     });
                 } else {
                     // The slot holds the address, so load it and store through.
@@ -711,7 +711,7 @@ impl Aarch64CodeGen {
                         src: src_vreg,
                         addr: MemAddr::BaseOffset {
                             base: scratch0,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         },
                     });
                 }
@@ -724,7 +724,7 @@ impl Aarch64CodeGen {
                     src: src_vreg,
                     addr: MemAddr::BaseOffset {
                         base: scratch0,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     },
                 });
             }
@@ -736,7 +736,7 @@ impl Aarch64CodeGen {
                     src: src_vreg,
                     addr: MemAddr::BaseOffset {
                         base: scratch0,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     },
                 });
             }

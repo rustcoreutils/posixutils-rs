@@ -2905,6 +2905,7 @@ fn test_incomplete_struct_type_resolution() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     };
     let complete_struct_type = ctx.types.intern(Type::struct_type(complete_composite));
 
@@ -3714,6 +3715,7 @@ fn test_struct_deref_returns_address() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     });
     let struct_type_id = ctx.types.intern(struct_type);
     let struct_ptr_type_id = ctx.types.intern(Type::pointer(struct_type_id));
@@ -4368,6 +4370,7 @@ fn test_mixed_designated_positional_struct_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     };
     let struct_type = ctx.types.intern(Type::struct_type(struct_composite));
     let s_sym = ctx.var("s", struct_type);
@@ -4591,6 +4594,7 @@ fn test_designator_chain_nested_struct_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
 
     let pt_id = ctx.str("pt");
@@ -4624,6 +4628,7 @@ fn test_designator_chain_nested_struct_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
     let outer_sym = ctx.var("s", outer_type);
 
@@ -4714,6 +4719,7 @@ fn test_designator_chain_array_member_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
     let s_sym = ctx.var("s", struct_type);
 
@@ -4879,6 +4885,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
     let s_sym = ctx.var("s", struct_type);
 
@@ -4974,6 +4981,7 @@ fn test_union_first_named_member_positional_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
     let u_sym = ctx.var("u", union_type);
 
@@ -5289,6 +5297,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             member_align: 1,
             is_complete: true,
             transparent: false,
+            anon_id: None,
         })),
         ..Default::default()
     });
@@ -5438,6 +5447,7 @@ fn test_bitfield_designated_init_local_var() {
         member_align: 1,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
 
     let s_sym = ctx.var("s", struct_type);
@@ -5575,6 +5585,7 @@ fn test_large_struct_copy_from_array() {
             member_align: 8,
             is_complete: true,
             transparent: false,
+            anon_id: None,
         })),
         ..Default::default()
     });
@@ -5714,6 +5725,7 @@ fn test_compound_literal_zero_init_lvalue() {
             member_align: 8,
             is_complete: true,
             transparent: false,
+            anon_id: None,
         })),
         ..Default::default()
     });
@@ -5848,6 +5860,7 @@ fn test_conditional_short_circuit_arrow() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
     let struct_ptr_type = ctx.types.intern(Type::pointer(struct_type));
 
@@ -6242,6 +6255,7 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
     let atomic_struct = {
         let mut t = ctx.types.get(struct_type).clone();
@@ -6349,6 +6363,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
         member_align: 8,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     });
     let struct_type_id = ctx.types.intern(struct_type);
     let s_sym = ctx.var("s", struct_type_id);
@@ -7108,4 +7123,34 @@ fn test_large_composite_argument_copied_only_where_the_abi_passes_a_reference() 
     assert!(has_copy(Target::new(Arch::Aarch64, Os::Linux)));
     assert!(has_copy(Target::new(Arch::Aarch64, Os::MacOS)));
     assert!(!has_copy(Target::new(Arch::X86_64, Os::Linux)));
+}
+
+/// A member more than 2 GiB into a struct is folded into the address, so no
+/// load or store leaves the linearizer with an offset a 32-bit displacement
+/// cannot hold -- through a pointer, and through a global.
+#[test]
+fn test_far_member_offset_is_folded_into_the_address() {
+    let src = "struct far { char pad[3000000000UL]; int y; long z; };\n\
+               int get(struct far *p) { return p->y; }\n\
+               void put(struct far *p, long v) { p->z = v; }\n";
+    let module = linearize_source(src, &Target::host());
+    for name in ["get", "put"] {
+        let func = module.functions.iter().find(|f| f.name == name).unwrap();
+        let accesses: Vec<&Instruction> = func
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
+            .collect();
+        assert!(!accesses.is_empty());
+        for insn in accesses {
+            assert!(
+                i32::try_from(insn.offset).is_ok(),
+                "{name}: {:?} kept offset {}",
+                insn.op,
+                insn.offset
+            );
+        }
+        assert!(crate::ir::validate::validate_function(func).is_ok());
+    }
 }

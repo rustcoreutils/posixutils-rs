@@ -674,6 +674,7 @@ mod tests {
             member_align: align,
             is_complete: true,
             transparent: false,
+            anon_id: None,
         }))
     }
 
@@ -831,6 +832,7 @@ mod tests {
             member_align: 16,
             is_complete: true,
             transparent: false,
+            anon_id: None,
         }));
         assert!(
             matches!(abi.classify_param(mixed, &types),

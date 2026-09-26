@@ -6056,3 +6056,27 @@ fn test_vector_size_type_is_marked() {
     let (decl, types, _strings, symbols) = parse_decl("int y[2];").unwrap();
     assert!(!types.is_vector(symbols.get(decl.declarators[0].symbol).typ));
 }
+
+/// Two tagless definitions with the same members are distinct types, while a
+/// qualified variant of one stays compatible with it (C17 6.7.2.3p5).
+#[test]
+fn test_tagless_composites_have_identity() {
+    let (tu, types, _strings, symbols) =
+        parse_tu("struct { int x; } a;\nstruct { int x; } b;\ntypedef struct { int x; } T;\nconst T c;\nT d;\n")
+            .unwrap();
+    let typ = |i: usize| match &tu.items[i] {
+        ExternalDecl::Declaration(decl) => symbols.get(decl.declarators[0].symbol).typ,
+        _ => panic!("item {i} is not a declaration"),
+    };
+    let (a, b) = (typ(0), typ(1));
+    assert!(
+        !types.types_compatible(a, b),
+        "two tagless definitions must be distinct"
+    );
+    // `types_compatible` ignores top-level qualifiers.
+    let (c, d) = (typ(3), typ(4));
+    assert!(
+        types.types_compatible(c, d),
+        "const T and T share a definition"
+    );
+}

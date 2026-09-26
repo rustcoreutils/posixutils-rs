@@ -49,6 +49,13 @@
 //        immediately rather than waiting for a memory-reordering pass to
 //        miscompile a real program.
 //
+//   I6 — A LOAD OR STORE OFFSET IS A MACHINE DISPLACEMENT
+//        Both backends address `src[0] + offset` with a signed 32-bit
+//        displacement and read it through `Instruction::displacement`.
+//        `Linearizer::emit` folds a larger offset into the address; a pass
+//        that later produced one would reintroduce the truncation that sent
+//        a member past 2 GiB gigabytes away.
+//
 // The validator is intended to run only in debug builds — production
 // builds skip it for zero overhead. Call via:
 //
@@ -103,6 +110,14 @@ pub enum ValidationError {
         block: usize,
         index: usize,
         opcode: Opcode,
+    },
+    /// I6 violation: a load or store carries an offset no signed 32-bit
+    /// displacement holds.
+    DisplacementOutOfRange {
+        function: String,
+        block: usize,
+        index: usize,
+        offset: i64,
     },
     /// A placeholder opcode that something downstream was supposed to
     /// resolve is still here. Neither backend knows it, and both end their
@@ -169,6 +184,16 @@ impl fmt::Display for ValidationError {
                 f,
                 "[ir-validate I5] in function `{function}`: bb={block} insn={index} \
                  op={opcode:?} may access memory but is not in has_side_effects()"
+            ),
+            ValidationError::DisplacementOutOfRange {
+                function,
+                block,
+                index,
+                offset,
+            } => write!(
+                f,
+                "[ir-validate I6] in function `{function}`: bb={block} insn={index} \
+                 load/store offset {offset} does not fit a 32-bit displacement"
             ),
             ValidationError::UnresolvedPlaceholder {
                 function,
@@ -242,6 +267,7 @@ pub fn validate_function(func: &Function) -> Result<(), Vec<ValidationError>> {
     check_barrier_implies_side_effect(func, &mut errors);
     check_memory_access_implies_side_effect(func, &mut errors);
     check_branch_targets_valid(func, &mut errors);
+    check_displacements_in_range(func, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -280,6 +306,24 @@ fn check_single_def(func: &Function, out: &mut Vec<ValidationError>) {
                 pseudo,
                 sites,
             });
+        }
+    }
+}
+
+/// I6 — every load and store offset fits a signed 32-bit displacement.
+fn check_displacements_in_range(func: &Function, out: &mut Vec<ValidationError>) {
+    for (bb_idx, bb) in func.blocks.iter().enumerate() {
+        for (insn_idx, insn) in bb.insns.iter().enumerate() {
+            if matches!(insn.op, Opcode::Load | Opcode::Store)
+                && i32::try_from(insn.offset).is_err()
+            {
+                out.push(ValidationError::DisplacementOutOfRange {
+                    function: func.name.clone(),
+                    block: bb_idx,
+                    index: insn_idx,
+                    offset: insn.offset,
+                });
+            }
         }
     }
 }
@@ -403,6 +447,34 @@ mod tests {
         i.target = Some(PseudoId(dst));
         i.src = vec![PseudoId(src)];
         i
+    }
+
+    /// I6: a load whose offset no 32-bit displacement holds is flagged, and
+    /// the largest one that fits is not.
+    #[test]
+    fn validate_flags_a_displacement_past_i32() {
+        let types = TypeTable::new(&Target::host());
+        for (offset, ok) in [
+            (i64::from(i32::MAX), true),
+            (i64::from(i32::MAX) + 1, false),
+        ] {
+            let mut func = fresh_func("t");
+            for i in 0..=1 {
+                func.add_pseudo(Pseudo::reg(PseudoId(i), i));
+            }
+            push(
+                &mut func,
+                Instruction::load(PseudoId(1), PseudoId(0), offset, types.int_id, 32),
+            );
+            let result = validate_function(&func);
+            assert_eq!(result.is_ok(), ok, "offset {offset}: {result:?}");
+            if !ok {
+                assert!(matches!(
+                    result.unwrap_err()[0],
+                    ValidationError::DisplacementOutOfRange { .. }
+                ));
+            }
+        }
     }
 
     /// Baseline: well-formed single-def IR passes.

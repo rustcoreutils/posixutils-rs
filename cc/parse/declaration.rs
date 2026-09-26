@@ -1179,28 +1179,21 @@ impl Parser<'_> {
                     self.advance(); // consume typeof
                     self.expect_special(b'(')?;
 
-                    // typeof can take either a type name or an expression
-                    // Try type name first
-                    if let Some(typ) = self.try_parse_type_name() {
-                        self.expect_special(b')')?;
-                        // Return the type with any modifiers
-                        let result_type = self.types.get(typ).clone();
-                        return Ok((
-                            Type {
-                                modifiers: modifiers | result_type.modifiers,
-                                ..result_type
-                            },
-                            true,
-                        ));
-                    }
-
-                    // Not a type name, try expression
-                    let expr = self.parse_expression()?;
+                    // typeof can take either a type name or an expression;
+                    // try the type name first.
+                    let typ = if let Some(typ) = self.try_parse_type_name() {
+                        typ
+                    } else {
+                        let expr = self.parse_expression()?;
+                        expr.typ.unwrap_or(self.types.int_id)
+                    };
                     self.expect_special(b')')?;
 
-                    // Get the type of the expression
-                    let expr_type_id = expr.typ.unwrap_or(self.types.int_id);
-                    let result_type = self.types.get(expr_type_id).clone();
+                    // The operand's declaration contributes its type and
+                    // qualifiers, never its storage class: `static int g;
+                    // typeof(g) c;` declares an automatic `c`.
+                    let typ = self.types.without_decl_specifiers(typ);
+                    let result_type = self.types.get(typ).clone();
                     return Ok((
                         Type {
                             modifiers: modifiers | result_type.modifiers,
@@ -1389,53 +1382,6 @@ impl Parser<'_> {
         Ok(typ)
     }
 
-    /// Drop the storage-class bits from a type, leaving only what it denotes.
-    ///
-    /// These describe the *declaration*, not the type, so two names for the
-    /// same type can differ in them and still be compatible.
-    fn strip_declaration_modifiers(&mut self, id: TypeId) -> TypeId {
-        const DECL_ONLY: TypeModifiers = TypeModifiers::TYPEDEF
-            .union(TypeModifiers::EXTERN)
-            .union(TypeModifiers::STATIC)
-            .union(TypeModifiers::AUTO)
-            .union(TypeModifiers::REGISTER)
-            .union(TypeModifiers::THREAD_LOCAL)
-            .union(TypeModifiers::INLINE);
-
-        let t = self.types.get(id);
-        if !t.modifiers.intersects(DECL_ONLY) {
-            return id;
-        }
-        let mut stripped = t.clone();
-        stripped.modifiers = stripped.modifiers.difference(DECL_ONLY);
-        self.types.intern(stripped)
-    }
-
-    /// `strip_declaration_modifiers`, reaching a function type's return type
-    /// as well.
-    ///
-    /// `static`, `extern` and `inline` are recorded on the declaration's base
-    /// type, which for a function declarator *is* the return type -- so
-    /// `inline int hdr(int)` and `extern int hdr(int)` build function types
-    /// whose returns are two different `int`s, and compatibility comparing
-    /// bases by id calls them different, though they print identically.
-    fn strip_declaration_modifiers_deep(&mut self, id: TypeId) -> TypeId {
-        let id = self.strip_declaration_modifiers(id);
-        if self.types.kind(id) != TypeKind::Function {
-            return id;
-        }
-        let Some(ret) = self.types.base_type(id) else {
-            return id;
-        };
-        let stripped_ret = self.strip_declaration_modifiers_deep(ret);
-        if stripped_ret == ret {
-            return id;
-        }
-        let mut func = self.types.get(id).clone();
-        func.base = Some(stripped_ret);
-        self.types.intern(func)
-    }
-
     /// Diagnose a redeclaration whose type conflicts with the one already in
     /// scope (C17 6.7p4: all declarations of the same object or function shall
     /// specify compatible types). Two guards keep legal code legal: only a
@@ -1474,8 +1420,8 @@ impl Parser<'_> {
         }
         let old_kind = existing.kind;
         let old_type = existing.typ;
-        let old_type = self.strip_declaration_modifiers_deep(old_type);
-        let new_type = self.strip_declaration_modifiers_deep(new_type);
+        let old_type = self.types.without_decl_specifiers(old_type);
+        let new_type = self.types.without_decl_specifiers(new_type);
         if self.redeclaration_compatible(old_type, new_type) {
             return;
         }
@@ -1586,8 +1532,8 @@ impl Parser<'_> {
         // storage class from its declaration, and glibc reaches most of these
         // names through a second typedef (`typedef __int16_t int16_t;`), so
         // comparing raw modifiers reports two identical `short`s as different.
-        let old_type = self.strip_declaration_modifiers(old_type);
-        let new_type = self.strip_declaration_modifiers(new_type);
+        let old_type = self.types.without_decl_specifiers(old_type);
+        let new_type = self.types.without_decl_specifiers(new_type);
         if self.types.types_compatible(old_type, new_type) {
             return;
         }

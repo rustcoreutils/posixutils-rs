@@ -4580,6 +4580,41 @@ fn diagnostics_label_address_must_name_a_label() {
     );
 }
 
+/// Every way of naming a label -- `goto`, `&&label`, `asm goto` -- is checked
+/// by one rule, wherever the reference sits. A `goto` inside a statement
+/// expression escaped the check, which walked statements only, and ran off the
+/// end of the function; one between case labels must still be caught.
+#[test]
+fn diagnostics_every_label_reference_must_name_a_label() {
+    compile_expect_error(
+        "goto_undefined_in_stmt_expr",
+        "int f(void){ return ({ goto nowhere; 1; }); }\n",
+        "label 'nowhere' used but not defined",
+    );
+    compile_expect_error(
+        "goto_undefined_in_switch",
+        "int f(int a){ switch (a) { case 0: goto nowhere; } return 0; }\n",
+        "label 'nowhere' used but not defined",
+    );
+    compile_expect_error(
+        "asm_goto_undefined",
+        "int f(void){ asm goto(\"\" :::: nowhere); return 0; }\n",
+        "label 'nowhere' used but not defined",
+    );
+    compile_expect_error(
+        "label_addr_undefined_in_switch",
+        "void *p;\nvoid f(int a){ switch (a) { case 0: p = &&nowhere; c1: a = 2; } }\n",
+        "label 'nowhere' used but not defined",
+    );
+    // Labels in a switch body and in a statement expression are found by
+    // both kinds of reference.
+    compile_expect_ok(
+        "labels_in_switch_and_stmt_expr",
+        "void *p;\nint f(int a){\n  switch (a) { case 0: p = &&c1; goto c1; c1: a = 2; a1: case 1: a = 3; }\n  \
+         return ({ p = &&se; goto se; se: ; a; });\n}\nint main(void){ return f(0) == 3 ? 0 : 1; }\n",
+    );
+}
+
 /// `&&label` outside any function is an error, not a compiler crash.
 #[test]
 fn diagnostics_label_address_outside_a_function() {

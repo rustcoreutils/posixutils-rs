@@ -270,9 +270,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.current_bb = None;
             }
 
-            Stmt::Goto { name: label, .. } => {
+            Stmt::Goto { name: label, pos } => {
                 let label_str = self.str(*label).to_string();
-                let target = self.get_or_create_label(&label_str);
+                let target = self.refer_to_label(&label_str, *pos);
                 if let Some(current) = self.current_bb {
                     // A backward jump -- the label is already linearized, so
                     // it has a captured stack pointer -- leaves the scope of
@@ -322,36 +322,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             Stmt::Label { name, stmt, .. } => {
-                let name_str = self.str(*name).to_string();
-                self.defined_labels.insert(name_str.clone());
-                let label_bb = self.get_or_create_label(&name_str);
-
-                // If current block is not terminated, branch to label
-                if !self.is_terminated() {
-                    if let Some(current) = self.current_bb {
-                        self.emit(Instruction::br(label_bb));
-                        self.link_bb(current, label_bb);
-                    }
-                }
-
-                self.switch_bb(label_bb);
-                // Remember how many VLA marks were in force here. A backward
-                // jump to this label leaves the scope of every VLA declared
-                // *after* it, and the first such declaration's mark is the
-                // stack as it stood at the label -- so that mark is what the
-                // jump restores.
-                //
-                // Recorded as an index rather than captured at the label,
-                // because a label can be reachable only by the jump itself:
-                // `if (0) { lab: ; }` never runs a capture placed there, and
-                // restoring from it read an uninitialized register. The mark
-                // this index names is always written first, since the
-                // declaration that creates it lies between the label and the
-                // jump.
-                if self.func_has_vla {
-                    self.label_vla_depth
-                        .insert(name_str.clone(), self.vla_marks.len());
-                }
+                self.place_label(*name);
                 self.linearize_stmt(stmt);
             }
 
@@ -1650,21 +1621,27 @@ impl<'a> super::linearize::Linearizer<'a> {
         (dispatch_bb, slot)
     }
 
+    /// 6.8.6.1p1: every label a `goto`, `&&label` or `asm goto` names has to
+    /// be defined in the function.
+    ///
+    /// The block `get_or_create_label` minted for a missing one stays empty
+    /// and unterminated, so control fell out of the function through whatever
+    /// followed in layout order -- the program built, linked, and segfaulted
+    /// or hung. Checked once the body is walked, because a forward reference
+    /// is legal.
+    pub(crate) fn check_label_references(&mut self) {
+        for (name, pos) in std::mem::take(&mut self.label_refs) {
+            if !self.defined_labels.contains(&name) {
+                crate::diag::error_args(pos, "label '{0}' used but not defined", &[&name]);
+            }
+        }
+    }
+
     /// Link the dispatch block to every label whose address was taken.
     ///
     /// Called once the function body is walked, because `&&label` may appear
     /// after the `goto *` that can reach it.
     pub(crate) fn finish_indirect_dispatch(&mut self) {
-        // `&&label` naming a label the function never defines. The block
-        // `get_or_create_label` minted stays empty and unterminated, so
-        // branching to it ran off the end of the function -- the program hung.
-        // Checked here because a forward reference is legal.
-        for (name, pos) in std::mem::take(&mut self.label_addr_refs) {
-            if !self.defined_labels.contains(&name) {
-                crate::diag::error_args(pos, "label '{0}' used but not defined", &[&name]);
-            }
-        }
-
         let Some((dispatch_bb, _)) = self.indirect_dispatch else {
             // The address was taken but this function never branches on it --
             // it was stored for someone else, or only compared. The blocks
@@ -1719,13 +1696,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         // A `goto` is illegal exactly when its label sits inside a scope the
         // `goto` itself is not already in.
         for (name, from, goto_pos) in &w.gotos {
+            // A label this walk does not see is either missing, which
+            // `check_label_references` reports once the body is lowered, or
+            // inside a statement expression, which this walk does not enter.
             let Some((_, to, _)) = w.labels.iter().find(|(n, _, _)| n == name) else {
-                // 6.8.6.1p1: the label has to exist. Minting a block for it
-                // left that block unterminated, and control fell out of the
-                // function through whatever followed in layout order -- so the
-                // program built, linked, and segfaulted.
-                let spelled = self.strings.get(*name).to_string();
-                crate::diag::error_args(*goto_pos, "label '{0}' used but not defined", &[&spelled]);
                 continue;
             };
             if let Some(id) = to.iter().find(|id| !from.contains(id)) {
@@ -2738,17 +2712,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             Stmt::Label { name, stmt, .. } => {
-                let name_str = self.str(*name).to_string();
-                let label_bb = self.get_or_create_label(&name_str);
-
-                if !self.is_terminated() {
-                    if let Some(current) = self.current_bb {
-                        self.emit(Instruction::br(label_bb));
-                        self.link_bb(current, label_bb);
-                    }
-                }
-
-                self.switch_bb(label_bb);
+                self.place_label(*name);
                 self.linearize_switch_stmt(stmt, case_values, case_bbs, default_bb, case_idx);
             }
 
@@ -3007,12 +2971,15 @@ impl<'a> super::linearize::Linearizer<'a> {
             });
         }
 
-        // Process goto labels - map label names to BasicBlockIds
+        // Process goto labels - map label names to BasicBlockIds. The AST
+        // keeps no position per label, so a missing one is reported at the
+        // statement.
+        let pos = self.current_pos.unwrap_or_default();
         let ir_goto_labels: Vec<(BasicBlockId, String)> = goto_labels
             .iter()
             .map(|label_id| {
                 let label_name = self.str(*label_id).to_string();
-                let bb = self.get_or_create_label(&label_name);
+                let bb = self.refer_to_label(&label_name, pos);
                 (bb, label_name)
             })
             .collect();
@@ -3352,6 +3319,78 @@ impl<'a> super::linearize::Linearizer<'a> {
         if let Some(mark) = found {
             self.emit_stack_restore(mark);
         }
+    }
+
+    /// Define label `name` here: fall into its block and continue there.
+    ///
+    /// Every labeled statement is placed through this, whichever lowering
+    /// walks it. The switch-body walk had a copy of its own that never
+    /// recorded the label as defined, so `&&lbl` naming a label between the
+    /// case labels of a `switch` was rejected as undefined.
+    fn place_label(&mut self, name: StringId) {
+        let name_str = self.str(name).to_string();
+        self.defined_labels.insert(name_str.clone());
+        let label_bb = self.get_or_create_label(&name_str);
+
+        // If current block is not terminated, branch to label
+        if !self.is_terminated() {
+            if let Some(current) = self.current_bb {
+                self.emit(Instruction::br(label_bb));
+                self.link_bb(current, label_bb);
+            }
+        }
+
+        self.switch_bb(label_bb);
+        // Remember how many VLA marks were in force here. A backward
+        // jump to this label leaves the scope of every VLA declared
+        // *after* it, and the first such declaration's mark is the
+        // stack as it stood at the label -- so that mark is what the
+        // jump restores.
+        //
+        // Recorded as an index rather than captured at the label,
+        // because a label can be reachable only by the jump itself:
+        // `if (0) { lab: ; }` never runs a capture placed there, and
+        // restoring from it read an uninitialized register. The mark
+        // this index names is always written first, since the
+        // declaration that creates it lies between the label and the
+        // jump.
+        if self.func_has_vla {
+            self.label_vla_depth.insert(name_str, self.vla_marks.len());
+        }
+    }
+
+    /// The block for label `name`, named by a `goto`, `&&label` or `asm goto`
+    /// at `pos`. Recorded so `check_label_references` can insist the label
+    /// exists.
+    fn refer_to_label(&mut self, name: &str, pos: Position) -> BasicBlockId {
+        self.label_refs.push((name.to_string(), pos));
+        self.get_or_create_label(name)
+    }
+
+    /// The assembler symbol for `&&name` at `pos`, or `None` outside a
+    /// function, which is diagnosed here.
+    ///
+    /// The label becomes a branch target for every computed `goto` in the
+    /// function, and the CFG has to say so or DCE deletes the block.
+    pub(crate) fn take_label_address(&mut self, name: StringId, pos: Position) -> Option<String> {
+        let label = self.str(name).to_string();
+        // Outside a function there is no block to name, and
+        // `get_or_create_label` would unwrap a `None` current function -- an
+        // ICE on `void *g = &&L;` at file scope.
+        if self.current_func.is_none() {
+            crate::diag::error_args(
+                pos,
+                "label '{0}' referenced outside of any function",
+                &[&label],
+            );
+            return None;
+        }
+        let bb = self.refer_to_label(&label, pos);
+        self.addr_taken_labels.push(bb);
+        if let Some(func) = &mut self.current_func {
+            func.takes_label_addr = true;
+        }
+        Some(format!(".L{}_{}", self.current_func_name, bb.0))
     }
 
     pub(crate) fn get_or_create_label(&mut self, name: &str) -> BasicBlockId {

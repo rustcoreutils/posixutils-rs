@@ -1179,7 +1179,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         let converted = self.emit_convert(val, val_typ, base_typ);
 
-        let result = self.alloc_local_temp(complex_typ);
+        let result = self.frame_temp_addr("__ctmp", complex_typ);
         self.emit(Instruction::store(
             converted, result, 0, base_typ, base_bits,
         ));
@@ -1232,7 +1232,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let dst_bits = self.types.size_bits(dst_base);
         let dst_bytes = (dst_bits / 8) as i64;
 
-        let result = self.alloc_local_temp(complex_typ);
+        let result = self.frame_temp_addr("__ctmp", complex_typ);
         for (src_off, dst_off) in [(0, 0), (src_bytes, dst_bytes)] {
             let part = self.alloc_pseudo();
             self.emit(Instruction::load(part, addr, src_off, src_base, src_bits));
@@ -1324,7 +1324,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let base_bytes = (base_bits / 8) as i64;
 
         let addr = self.complex_operand_at_precision(operand, complex_typ);
-        let result = self.alloc_local_temp(complex_typ);
+        let result = self.frame_temp_addr("__ctmp", complex_typ);
 
         let ops = self.complex_half_ops(base_typ);
         for (offset, negate) in [(0, negate_real), (base_bytes, true)] {
@@ -1377,7 +1377,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let base_bytes = (base_size / 8) as i64;
 
         // Allocate result temporary (stack space for the complex result)
-        let result_addr = self.alloc_local_temp(complex_typ);
+        let result_addr = self.frame_temp_addr("__ctmp", complex_typ);
 
         // Load real and imaginary parts of left operand
         let left_real = self.alloc_pseudo();
@@ -1712,9 +1712,8 @@ impl<'a> super::linearize::Linearizer<'a> {
     ///
     /// The one way the linearizer makes a compiler temporary with a fixed stack
     /// slot -- a call's result buffer, a `va_arg` aggregate, an argument copy.
-    /// Unlike [`Self::alloc_local_temp`], which is an `alloca` and grows the
-    /// stack every time it runs, this is a slot in the frame, so it costs
-    /// nothing in a loop.
+    /// A slot in the frame costs nothing in a loop, where an `alloca` would
+    /// grow the stack on every evaluation until the function returned.
     pub(crate) fn frame_temp(&mut self, prefix: &str, typ: TypeId) -> PseudoId {
         let sym = self.alloc_pseudo();
         let name = format!("{prefix}_{}", sym.0);
@@ -1725,16 +1724,18 @@ impl<'a> super::linearize::Linearizer<'a> {
         sym
     }
 
-    /// Allocate a local temporary variable for a complex result
-    pub(crate) fn alloc_local_temp(&mut self, typ: TypeId) -> PseudoId {
-        let size = self.types.size_bytes(typ);
-        let size_const = self.emit_const(size as i128, self.types.ulong_id);
-        let addr = self.alloc_pseudo();
-        let alloca_insn = Instruction::new(Opcode::Alloca)
-            .with_target(addr)
-            .with_src(size_const)
-            .with_type_and_size(self.types.void_ptr_id, 64);
-        self.emit(alloca_insn);
+    /// The address of a fresh [`Self::frame_temp`], in a register.
+    ///
+    /// For a temporary whose consumers take a plain pointer: a complex value,
+    /// which travels by address and may be phi-merged or passed on, and a CAS
+    /// expected-value slot, which `AtomicCas` writes back through. A `Sym`
+    /// names the storage itself, so handing one of those the `Sym` would have
+    /// them read the slot's contents where they expect its address.
+    pub(crate) fn frame_temp_addr(&mut self, prefix: &str, typ: TypeId) -> PseudoId {
+        let sym = self.frame_temp(prefix, typ);
+        let addr = self.alloc_reg_pseudo();
+        let ptr_type = self.types.pointer_to(typ);
+        self.emit(Instruction::sym_addr(addr, sym, ptr_type));
         addr
     }
 

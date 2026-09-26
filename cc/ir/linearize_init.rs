@@ -214,27 +214,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             // {&&a, &&b};`, which is how an interpreter builds its dispatch
             // table. The label is a real assembler symbol, so this is the same
             // shape as a string-literal reference.
-            ExprKind::LabelAddr(name) => {
-                let label = self.str(*name).to_string();
-                // A label belongs to a function. At file scope there is no
-                // block to name, and asking for one unwrapped a `None`
-                // current function -- an ICE rather than a diagnostic.
-                if self.current_func.is_none() {
-                    crate::diag::error_args(
-                        expr.pos,
-                        "label '{0}' referenced outside of any function",
-                        &[&label],
-                    );
-                    return Initializer::Int(0);
-                }
-                let bb = self.get_or_create_label(&label);
-                self.addr_taken_labels.push(bb);
-                self.label_addr_refs.push((label.clone(), expr.pos));
-                if let Some(func) = &mut self.current_func {
-                    func.takes_label_addr = true;
-                }
-                Initializer::SymAddr(format!(".L{}_{}", self.current_func_name, bb.0))
-            }
+            ExprKind::LabelAddr(name) => match self.take_label_address(*name, expr.pos) {
+                Some(sym) => Initializer::SymAddr(sym),
+                None => Initializer::Int(0),
+            },
 
             // String literal - for arrays, store as String; for pointers, create label reference
             ExprKind::StringLit(s) => {

@@ -14270,3 +14270,219 @@ fn codegen_function_named_like_an_internal_label() {
         }
     }
 }
+
+/// Run `src` at -O0 and -O2 on the host, and on aarch64 under qemu when the
+/// cross toolchain is present; every run must exit 0.
+fn run_everywhere(name: &str, src: &str) {
+    let o2 = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run(name, src, &[]), 0, "{name} at -O0");
+    assert_eq!(compile_and_run(name, src, &o2), 0, "{name} at -O2");
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64(name, src, opt) {
+            assert_eq!(code, 0, "{name} on aarch64 at {opt}");
+        }
+    }
+}
+
+/// `__typeof__` names a type, never a storage class. The declaration-specifier
+/// parser carried the operand's `static`/`extern`/`_Thread_local` into the
+/// new declaration, so `__typeof__(g) c = 0;` inside a function silently made
+/// `c` a static local: it kept its value across calls and was shared between
+/// recursive frames. gcc.c-torture's `split-path-5` is the same shape through
+/// a subscript, where the static initializer check then rejected it.
+#[test]
+fn codegen_typeof_does_not_copy_storage_class() {
+    let src = r#"
+static int g;
+static unsigned char pat[4] = {1, 2, 3, 4};
+extern int e;
+int e = 5;
+_Thread_local int t;
+
+int counter(void)
+{
+    __typeof__(g) c = 0;         /* must be automatic: a fresh 0 every call */
+    __typeof__(e) d = 0;
+    __typeof__(t) u = 0;
+    static int sl;
+    __typeof__(sl) w = 0;
+    return ++c + ++d + ++u + ++w;
+}
+
+int depth(int n)
+{
+    static int s;
+    __typeof__(s) mine = n;       /* each frame has its own */
+    if (n > 0 && depth(n - 1) != n - 1) return -1;
+    return mine;
+}
+
+int subscript(int i)
+{
+    __typeof__(pat[i]) x = pat[i];
+    return x;
+}
+
+int main(void)
+{
+    if (counter() != 4) return 1;
+    if (counter() != 4) return 2;
+    if (depth(5) != 5) return 3;
+    if (subscript(2) != 3) return 4;
+    return 0;
+}
+"#;
+    run_everywhere("typeof_storage_class", src);
+}
+
+/// A complex value, a complex cast, `__builtin_complex`, a `__sync` CAS and an
+/// atomic floating-point read-modify-write each need a temporary in memory.
+/// They were `alloca`s, which grow the stack on every evaluation and are
+/// released only at return, so the same expression in a loop exhausted the
+/// stack: two million iterations is far past 8 MB.
+///
+/// The halves are read through the array representation C17 6.2.5p13
+/// guarantees rather than `creal`/`conj`, which live in libm and would need a
+/// `-lm` this harness does not pass.
+#[test]
+fn codegen_expression_temporaries_do_not_grow_the_stack() {
+    let src = r#"
+#include <complex.h>
+
+volatile double v = 1.0;
+volatile long word;
+_Atomic double ad;
+
+static double re(double complex c) { return ((double *)&c)[0]; }
+static double im(double complex c) { return ((double *)&c)[1]; }
+
+int main(void)
+{
+    double complex z = 0;
+    double acc = 0;
+    long n = 2000000;
+    for (long i = 0; i < n; i++) {
+        double complex a = v + v * I;
+        z += a * a + (re(a) - im(a) * I);
+        z -= (double complex)v;
+        z += __builtin_complex(v, v);
+        acc += re(a / (a + 1.0));
+        acc += re(-a) + re(~a);
+        __sync_val_compare_and_swap(&word, i, i + 1);
+        ad += 1.0;
+    }
+    if (re(z) != (double)n) return 1;
+    if (im(z) != 2.0 * n) return 2;
+    if (word != n) return 3;
+    if (ad != (double)n) return 4;
+    if (acc < 0) return 5;
+    return 0;
+}
+"#;
+    run_everywhere("expression_temporaries", src);
+}
+
+/// `&&label` finds a label wherever it is in the function, including one that
+/// sits between the case labels of a `switch` body; `goto` always did.
+/// gcc.c-torture's `pr21356`.
+#[test]
+fn codegen_label_address_inside_switch() {
+    let src = r#"
+int a;
+void *p;
+int trail;
+
+void step(void)
+{
+    switch (a) {
+    a0: case 0: p = &&a1; trail = trail * 10 + 1; break;
+    a1: case 1: p = &&a2; trail = trail * 10 + 2; break;
+    a2: default: p = &&a0; trail = trail * 10 + 3; break;
+    }
+}
+
+int walk(int start)
+{
+    int hops = 0;
+    void *next;
+    switch (start) {
+    case 0:
+    x: next = &&y; hops++; goto *next;
+    case 1:
+    y: hops++; if (hops < 4) { next = &&x; goto *next; }
+    }
+    return hops;
+}
+
+int main(void)
+{
+    step();
+    if (p == 0) return 1;
+    a = 1; step();
+    a = 2; step();
+    if (trail != 123) return 2;
+    if (walk(0) != 4) return 3;
+    return 0;
+}
+"#;
+    run_everywhere("label_address_in_switch", src);
+}
+
+/// `&&label` finds labels in every other statement context too: after
+/// `default:`, in an `if`/`else` arm after a case label, in loops, nested
+/// blocks and statement expressions, from code and from a static initializer.
+#[test]
+fn codegen_label_address_in_every_statement_context() {
+    let src = r#"
+int a;
+
+int main(void)
+{
+    int n = 0, r = 0;
+    void *p = 0;
+    switch (a) {
+    default: d1: r += 1; p = &&d1;
+    case 5: if (a) { t1: r += 10; } else e1: r += 100;
+    }
+    for (int i = 0; i < 2; i++) { l1: n++; }
+    { { b1: n++; } }
+    while (n < 4) { w1: n++; }
+    int s = ({ int q = 0; se: q = 7; q; });
+    void *t[] = { p, &&t1, &&e1, &&l1, &&b1, &&w1, &&se };
+    static void *st[] = { &&d1, &&e1 };
+    for (int i = 0; i < 7; i++)
+        if (!t[i]) return 1;
+    if (st[0] != p || st[1] != t[2]) return 2;
+    if (r != 101 || s != 7 || n != 4) return 3;
+    return 0;
+}
+"#;
+    run_everywhere("label_address_every_context", src);
+}
+
+/// A backward `goto` to a label inside a `switch` body releases the VLA
+/// declared after the label. A VLA under a case label did not count as the
+/// function declaring one, and the switch-body walk never recorded the
+/// label's stack depth, so every trip round grew the stack until the program
+/// died.
+#[test]
+fn codegen_backward_goto_in_switch_releases_vla() {
+    let src = r#"
+int main(int argc, char **argv)
+{
+    int n = 4096, c = 0;
+    (void)argv;
+    switch (argc) {
+    case 1:
+    L: {
+        volatile char v[n];
+        v[0] = 1;
+        c++;
+        if (c < 100000) goto L;
+    }
+    }
+    return c == 100000 ? 0 : 1;
+}
+"#;
+    run_everywhere("backward_goto_in_switch_vla", src);
+}

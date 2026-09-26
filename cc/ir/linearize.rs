@@ -285,10 +285,11 @@ pub struct Linearizer<'a> {
     /// without the edges DCE would delete blocks nothing appears to reach.
     pub(crate) addr_taken_labels: Vec<BasicBlockId>,
 
-    /// `&&label` references in this function, with where each was written.
-    /// Checked against `defined_labels` once the body is walked, because a
-    /// forward reference is legal and only the end of the function settles it.
-    pub(crate) label_addr_refs: Vec<(String, crate::diag::Position)>,
+    /// Every label this function names -- by `goto`, `&&label` or
+    /// `asm goto` -- with where each was written. Checked against
+    /// `defined_labels` once the body is walked, because a forward reference
+    /// is legal and only the end of the function settles it.
+    pub(crate) label_refs: Vec<(String, crate::diag::Position)>,
 
     /// Labels this function actually defines.
     pub(crate) defined_labels: std::collections::HashSet<String>,
@@ -399,7 +400,7 @@ impl<'a> Linearizer<'a> {
             two_reg_return_type: None,
             current_func_name: String::new(),
             addr_taken_labels: Vec::new(),
-            label_addr_refs: Vec::new(),
+            label_refs: Vec::new(),
             defined_labels: std::collections::HashSet::new(),
             label_vla_depth: std::collections::HashMap::new(),
             pending_goto_vla: Vec::new(),
@@ -1130,7 +1131,7 @@ impl<'a> Linearizer<'a> {
         self.two_reg_return_type = None;
         self.current_func_name = self.emitted_name(func.name);
         self.addr_taken_labels.clear();
-        self.label_addr_refs.clear();
+        self.label_refs.clear();
         self.defined_labels.clear();
         self.label_vla_depth.clear();
         self.pending_goto_vla.clear();
@@ -1169,7 +1170,9 @@ impl<'a> Linearizer<'a> {
             crate::parse::ast::Stmt::While { body, .. }
             | crate::parse::ast::Stmt::DoWhile { body, .. }
             | crate::parse::ast::Stmt::Switch { body, .. }
-            | crate::parse::ast::Stmt::Label { stmt: body, .. } => Self::declares_vla(body),
+            | crate::parse::ast::Stmt::Label { stmt: body, .. }
+            | crate::parse::ast::Stmt::Case(_, _, body)
+            | crate::parse::ast::Stmt::Default(_, body) => Self::declares_vla(body),
             crate::parse::ast::Stmt::For { init, body, .. } => {
                 init.as_ref().is_some_and(|i| match i {
                     crate::parse::ast::ForInit::Declaration(decl) => {
@@ -1514,6 +1517,7 @@ impl<'a> Linearizer<'a> {
 
         // Linearize body
         self.linearize_stmt(&func.body);
+        self.check_label_references();
 
         // The address-taken set is complete only now, so the dispatch block's
         // successors are linked here rather than at each computed goto.
@@ -2388,7 +2392,7 @@ impl<'a> Linearizer<'a> {
             (re, zero)
         };
 
-        let result = self.alloc_local_temp(cast_type);
+        let result = self.frame_temp_addr("__ctmp", cast_type);
         self.emit(Instruction::store(real_val, result, 0, base_typ, base_bits));
         self.emit(Instruction::store(
             imag_val, result, base_bytes, base_typ, base_bits,
@@ -5238,28 +5242,6 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::FpClassify { classes, arg } => self.linearize_fp_classify(classes, arg),
 
-            ExprKind::BuiltinComplex { real, imag } => {
-                // __builtin_complex(real, imag) - construct complex value
-                let complex_typ = self.expr_type(expr);
-                let base_typ = self.types.complex_base(complex_typ);
-                let base_bits = self.types.size_bits(base_typ);
-                let base_bytes = (base_bits / 8) as i64;
-
-                let real_val = self.linearize_expr(real);
-                let imag_val = self.linearize_expr(imag);
-
-                // Allocate local to hold the complex value
-                let result = self.alloc_local_temp(complex_typ);
-
-                // Store real and imag parts
-                self.emit(Instruction::store(real_val, result, 0, base_typ, base_bits));
-                self.emit(Instruction::store(
-                    imag_val, result, base_bytes, base_typ, base_bits,
-                ));
-
-                result
-            }
-
             ExprKind::Unreachable => {
                 // __builtin_unreachable() - marks code path as never reached
                 // Emits an instruction that will trap if actually executed
@@ -5441,7 +5423,7 @@ impl<'a> Linearizer<'a> {
         let des_raw = self.linearize_expr(desired);
         let des_val = self.emit_convert(des_raw, des_typ, elem_typ);
 
-        let exp_addr = self.alloc_local_temp(elem_typ);
+        let exp_addr = self.frame_temp_addr("__casexp", elem_typ);
         self.emit(Instruction::store(exp_val, exp_addr, 0, elem_typ, bits));
 
         let ok = self.alloc_reg_pseudo();
@@ -5915,30 +5897,12 @@ impl<'a> Linearizer<'a> {
 
     /// GNU `&&label`: the address of a label, for a computed goto.
     fn linearize_label_addr(&mut self, name: &StringId, expr: &Expr) -> PseudoId {
-        let label = self.str(*name).to_string();
-        // Outside a function there is no block to name, and
-        // `get_or_create_label` would unwrap a `None` current
-        // function -- an ICE on `void *g = &&L;` at file scope.
-        if self.current_func.is_none() {
-            crate::diag::error_args(
-                expr.pos,
-                "label '{0}' referenced outside of any function",
-                &[&label],
-            );
+        let Some(sym) = self.take_label_address(*name, expr.pos) else {
             return self.emit_const(0, self.types.void_ptr_id);
-        }
-        let bb = self.get_or_create_label(&label);
-        let sym = format!(".L{}_{}", self.current_func_name, bb.0);
+        };
         let sym_pseudo = self.alloc_pseudo();
         if let Some(func) = &mut self.current_func {
             func.add_pseudo(Pseudo::sym(sym_pseudo, sym));
-        }
-        // The label is a branch target for every indirect goto in this
-        // function, and the CFG has to say so or DCE deletes the block.
-        self.addr_taken_labels.push(bb);
-        self.label_addr_refs.push((label.clone(), expr.pos));
-        if let Some(func) = &mut self.current_func {
-            func.takes_label_addr = true;
         }
         let dst = self.alloc_pseudo();
         let void_ptr = self.types.void_ptr_id;
@@ -6017,7 +5981,7 @@ impl<'a> Linearizer<'a> {
         let imag_val = self.linearize_expr(imag);
 
         // Allocate local to hold the complex value, return its address
-        let result = self.alloc_local_temp(complex_typ);
+        let result = self.frame_temp_addr("__ctmp", complex_typ);
         self.emit(Instruction::store(real_val, result, 0, base_typ, base_bits));
         self.emit(Instruction::store(
             imag_val, result, base_bytes, base_typ, base_bits,

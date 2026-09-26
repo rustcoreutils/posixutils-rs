@@ -318,6 +318,21 @@ impl Aarch64CodeGen {
                     addr: self.stack_mem(*offset),
                 });
             }
+            // A floating-point pseudo takes the value as its bit pattern.
+            // Dropping it here left an `_Atomic double` load's result in X9
+            // while its consumers read whatever the V register last held, so
+            // `ad != n` compared against a stale value.
+            Loc::VReg(v) => {
+                self.push_lir(Aarch64Inst::FmovFromGp {
+                    size: if size <= 32 {
+                        FpSize::Single
+                    } else {
+                        FpSize::Double
+                    },
+                    src,
+                    dst: *v,
+                });
+            }
             _ => {}
         }
     }

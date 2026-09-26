@@ -1071,6 +1071,40 @@ impl TypeTable {
         self.get(id).base
     }
 
+    /// The type `id` denotes, without the [`Type::DECL_SPECIFIERS`] of the
+    /// declaration it was read from.
+    ///
+    /// The parser records a declaration's storage class on its base type and
+    /// copies it onto the declarator's derived type, so `static int *p` is a
+    /// `static` pointer to a `static int`, and the bits sit at every level a
+    /// later derivation can reach: an element (`a[i]`), a pointee (`*p`), a
+    /// return type. Anything that takes the type of an existing declaration
+    /// -- `typeof`, a redeclaration check -- must come through here, or it
+    /// inherits the other declaration's storage class along with its type.
+    pub fn without_decl_specifiers(&mut self, id: TypeId) -> TypeId {
+        let t = self.get(id);
+        let base = t.base;
+        let params = t.params.clone();
+        let new_base = base.map(|b| self.without_decl_specifiers(b));
+        let new_params = params.as_ref().map(|ps| {
+            ps.iter()
+                .map(|&p| self.without_decl_specifiers(p))
+                .collect::<Vec<_>>()
+        });
+        let t = self.get(id);
+        if !t.modifiers.intersects(Type::DECL_SPECIFIERS)
+            && new_base == base
+            && new_params == params
+        {
+            return id;
+        }
+        let mut stripped = t.clone();
+        stripped.modifiers.remove(Type::DECL_SPECIFIERS);
+        stripped.base = new_base;
+        stripped.params = new_params;
+        self.intern(stripped)
+    }
+
     /// Look up an existing pointer type to the given base type
     /// Returns void_ptr_id if not found (since all pointers are same size)
     pub fn pointer_to(&self, base: TypeId) -> TypeId {

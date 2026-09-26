@@ -7391,3 +7391,156 @@ fn test_register_sized_struct_through_conditional_is_not_dereferenced() {
         );
     }
 }
+
+/// Linearize `src`, returning the module and the labels the last function
+/// defined, as the linearizer recorded them.
+fn linearize_source_labels(src: &str) -> (Module, std::collections::HashSet<String>) {
+    let target = Target::host();
+    let mut strings = StringTable::new();
+    let mut tokenizer = crate::token::lexer::Tokenizer::new(src.as_bytes(), 0, &mut strings);
+    let tokens = tokenizer.tokenize();
+    let mut symbols = crate::symbol::SymbolTable::new();
+    let mut types = TypeTable::new(&target);
+    let tu = {
+        let mut parser =
+            crate::parse::Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+        parser.parse_translation_unit().expect("parse")
+    };
+    let mut linearizer = Linearizer::new(&symbols, &types, &strings, &target);
+    let module = linearizer.linearize(&tu);
+    (module, linearizer.defined_labels.clone())
+}
+
+/// A label is defined wherever it sits in a `switch` body -- before a case
+/// label, after `default:`, in an arm of an `if` after a case label. The
+/// switch-body walk placed labels through a copy of its own that never
+/// recorded them, so `&&lbl` naming one was reported as undefined.
+#[test]
+fn test_labels_inside_switch_body_are_defined() {
+    let src = "void *p;\n\
+               void f(int a) {\n\
+                 switch (a) {\n\
+                 a0: case 0: p = &&a1; break;\n\
+                 case 1: a1: p = &&dflt; break;\n\
+                 default: dflt: if (a) { arm: p = &&a0; } else other: p = &&arm;\n\
+                 }\n\
+               }\n";
+    let (_, defined) = linearize_source_labels(src);
+    for name in ["a0", "a1", "dflt", "arm", "other"] {
+        assert!(
+            defined.contains(name),
+            "label '{name}' not recorded as defined"
+        );
+    }
+}
+
+/// A backward `goto` to a label inside a `switch` body leaves the scope of a
+/// VLA declared after the label, so it restores the stack. Neither half was
+/// seen: a VLA under a case label did not make the function a VLA function,
+/// and the switch-body walk never recorded the label's depth -- so the loop
+/// grew the stack every time round.
+#[test]
+fn test_backward_goto_to_switch_label_restores_vla_stack() {
+    let src = "void g(volatile char *);\n\
+               void f(int k, int n) {\n\
+                 switch (k) {\n\
+                 case 1: L: { char v[n]; g(v); if (k++ < 9) goto L; }\n\
+                 }\n\
+               }\n";
+    let module = linearize_source(src, &Target::host());
+    let func = module.functions.iter().find(|f| f.name == "f").expect("f");
+    let label = func
+        .blocks
+        .iter()
+        .find(|bb| bb.label.as_deref() == Some("L"))
+        .expect("block for L")
+        .id;
+    // Two edges reach `L`: the fall-in from `case 1:`, before the VLA, and
+    // the `goto`, which has to release it on the way.
+    let restoring_jump = func.blocks.iter().any(|bb| {
+        bb.insns
+            .iter()
+            .any(|i| i.op == Opcode::Br && i.bb_true == Some(label))
+            && bb.insns.iter().any(|i| i.op == Opcode::StackRestore)
+    });
+    assert!(restoring_jump, "the backward goto restores no stack");
+}
+
+/// A complex result lives in a fixed frame slot, never an `alloca`.
+///
+/// Each complex operation needs its result in memory, and that memory was an
+/// `alloca`: it grew the stack on every evaluation and was released only at
+/// return, so a complex expression in a loop exhausted the stack.
+#[test]
+fn test_complex_temporaries_are_frame_slots() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let complex_double = ctx.types.complex_double_id;
+    let a_sym = ctx.var("a", complex_double);
+    let b_sym = ctx.var("b", complex_double);
+
+    // double _Complex test(double _Complex a, double _Complex b)
+    // { return -(a * b + a); }
+    let a = || Box::new(Expr::var_typed(a_sym, complex_double));
+    let mul = Expr::typed_unpositioned(
+        ExprKind::Binary {
+            op: BinaryOp::Mul,
+            left: a(),
+            right: Box::new(Expr::var_typed(b_sym, complex_double)),
+        },
+        complex_double,
+    );
+    let add = Expr::typed_unpositioned(
+        ExprKind::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(mul),
+            right: a(),
+        },
+        complex_double,
+    );
+    let neg = Expr::typed_unpositioned(
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand: Box::new(add),
+        },
+        complex_double,
+    );
+    let param = |symbol| Parameter {
+        symbol: Some(symbol),
+        typ: complex_double,
+        vm_dims: vec![],
+        discarded_dims: vec![],
+    };
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: complex_double,
+        name: test_id,
+        params: vec![param(a_sym), param(b_sym)],
+        body: Stmt::Return(Some(neg)),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
+    let f = &module.functions[0];
+
+    assert!(
+        f.blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .all(|i| i.op != Opcode::Alloca),
+        "a complex temporary must not be an alloca:\n{}",
+        module.display(&ctx.types)
+    );
+    // The multiply, the add and the negation each own a slot.
+    assert_eq!(
+        f.locals.keys().filter(|n| n.starts_with("__ctmp_")).count(),
+        3,
+        "each complex result needs its own frame slot:\n{}",
+        module.display(&ctx.types)
+    );
+}

@@ -467,7 +467,7 @@ impl Parser<'_> {
                             return None;
                         }
                         self.advance(); // consume ')'
-                        return Some((typ, dims));
+                        return Some((self.types.without_decl_specifiers(typ), dims));
                     }
 
                     // Not a type name, try expression
@@ -480,8 +480,10 @@ impl Parser<'_> {
                     }
                     self.advance(); // consume ')'
 
+                    // As in a declaration's specifiers: the operand's type,
+                    // not its storage class.
                     let expr_type = expr.typ.unwrap_or(self.types.int_id);
-                    return Some((expr_type, Vec::new()));
+                    return Some((self.types.without_decl_specifiers(expr_type), Vec::new()));
                 }
                 crate::kw::STRUCT => {
                     self.advance(); // consume 'struct'

@@ -106,24 +106,6 @@ belong in `cc/scripts` alongside `c17_torture.sh`.
 
 ---
 
-### Inline assembly: early-clobber and spilled memory operands
-
-- **aarch64 ignores `&`.** An early-clobber output is parsed, but the
-  aarch64 lowering never adds the interference that keeps it out of an
-  input's register, so `"=&r"` can share a register with a `"+m"` address and
-  the template overwrites the address before using it.
-- **x86-64 renders a spilled memory operand as its spill slot.** A memory
-  operand's pseudo is the lvalue's address; when a statement has more
-  operands than registers and that address is spilled, x86-64 prints the slot
-  (`-392(%rbp)`), so the template reads the saved pointer rather than the
-  object. aarch64 had the same defect and now loads the address into a
-  register first; x86-64 needs the same.
-- **aarch64 has six registers for such addresses.** A statement needing more
-  spilled memory-operand addresses than that is an error where gcc compiles
-  it.
-
----
-
 ### Dominator construction is quadratic on a wide join
 
 `domtree_build` is Cooper-Harvey-Kennedy, whose `intersect` walks the

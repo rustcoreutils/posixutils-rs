@@ -205,13 +205,20 @@ fn aarch64_far_offsets_assemble_and_run() {
 }
 
 /// One asm statement with more memory operands than there are allocatable
-/// registers, so some operands' addresses are spilled.
+/// registers, written two ways.
 ///
-/// A memory operand's pseudo is the lvalue's *address*. c17 rendered a
-/// spilled one as its spill slot, `[x29, #N]`, which is the saved pointer
-/// rather than the object: the template read and wrote the wrong memory with
-/// nothing to say so. The addresses are loaded into X16, X17, the unspent
-/// codegen scratches and X15, in that order, before the template runs.
+/// Over the locals themselves (`through_pointers` false), each operand is a
+/// named object at a constant offset and is addressed where it lives,
+/// `[x29, #N]`, with no register spent -- as gcc does. That is what lets the
+/// statement have more memory operands than the six scratch registers c17
+/// has for addresses; routed through an address each, it was an error.
+///
+/// Through opaque pointers (`through_pointers` true), each operand's address
+/// is a run-time value, and with this many some are spilled. c17 once
+/// rendered a spilled one as its spill slot, `[x29, #N]`, which is the saved
+/// pointer rather than the object: the template read and wrote the wrong
+/// memory with nothing to say so. Those addresses are loaded into X16, X17,
+/// the unspent codegen scratches and X15, in that order, before the template.
 ///
 /// Every kind is present -- `"+m"`, `"=m"`, `"m"`, and a `char` accessed by
 /// `ldrb`/`strb` -- and x9/x10 are the template's clobbered temporaries,
@@ -219,21 +226,32 @@ fn aarch64_far_offsets_assemble_and_run() {
 /// scaled load range, so a spill slot far from `x29` is legalized as well.
 /// gcc builds and runs it, within its 30-operand limit; before the fix c17
 /// returned 100 (the sum of the `"m"` inputs read pointers).
-fn spilled_memory_operands_source() -> String {
+fn spilled_memory_operands_source(through_pointers: bool, extra_inputs: usize) -> String {
     let mut plan = vec!["rw", "ch"];
     plan.extend(std::iter::repeat_n("wo", 10));
     plan.extend(std::iter::repeat_n("ro", 10));
     plan.extend(["rw", "ch"]);
+    plan.extend(std::iter::repeat_n("ro", extra_inputs));
 
     let (mut decls, mut outs, mut ins, mut checks) = (vec![], vec![], vec![], vec![]);
     outs.push(r#"[sum] "=m"(sum)"#.to_string());
     let mut body = String::from(r"str xzr, %[sum]\n\t");
     let mut sum = 0;
+    let mut pointers = vec![];
     for (i, kind) in plan.iter().enumerate() {
+        // The operand expression: the object, or the object through a
+        // pointer the compiler cannot see through.
+        let e = if through_pointers {
+            let t = if *kind == "ch" { "char" } else { "long" };
+            pointers.push(format!("    {t} *p{i} = opaque(&m{i});"));
+            format!("*p{i}")
+        } else {
+            format!("m{i}")
+        };
         match *kind {
             "ch" => {
                 decls.push(format!("    char m{i} = {i};"));
-                outs.push(format!(r#"[m{i}] "+m"(m{i})"#));
+                outs.push(format!(r#"[m{i}] "+m"({e})"#));
                 body.push_str(&format!(
                     r"ldrb w9, %[m{i}]\n\tadd w9, w9, #1\n\tstrb w9, %[m{i}]\n\t"
                 ));
@@ -241,7 +259,7 @@ fn spilled_memory_operands_source() -> String {
             }
             "rw" => {
                 decls.push(format!("    long m{i} = {i} * 1000;"));
-                outs.push(format!(r#"[m{i}] "+m"(m{i})"#));
+                outs.push(format!(r#"[m{i}] "+m"({e})"#));
                 body.push_str(&format!(
                     r"ldr x9, %[m{i}]\n\tadd x9, x9, #1\n\tstr x9, %[m{i}]\n\t"
                 ));
@@ -249,13 +267,13 @@ fn spilled_memory_operands_source() -> String {
             }
             "wo" => {
                 decls.push(format!("    long m{i} = {i} * 1000;"));
-                outs.push(format!(r#"[m{i}] "=m"(m{i})"#));
+                outs.push(format!(r#"[m{i}] "=m"({e})"#));
                 body.push_str(&format!(r"mov x9, #{}\n\tstr x9, %[m{i}]\n\t", i + 7));
                 checks.push(format!("    if (m{i} != {}) return {};", i + 7, i + 1));
             }
             _ => {
                 decls.push(format!("    long m{i} = {i} * 1000;"));
-                ins.push(format!(r#"[m{i}] "m"(m{i})"#));
+                ins.push(format!(r#"[m{i}] "m"({e})"#));
                 body.push_str(&format!(
                     r"ldr x9, %[m{i}]\n\tldr x10, %[sum]\n\tadd x10, x10, x9\n\tstr x10, %[sum]\n\t"
                 ));
@@ -267,11 +285,13 @@ fn spilled_memory_operands_source() -> String {
         r#"#define NI __attribute__((noinline))
 volatile long sink;
 NI void touch(void *p) {{ sink += *(volatile char *)p; }}
+NI void *opaque(void *p) {{ return p; }}
 
 NI int many_memory_operands(void)
 {{
     volatile char lo[40000];
 {decls}
+{pointers}
     long sum;
     touch((void *)lo);
     __asm__ volatile(
@@ -287,6 +307,7 @@ NI int many_memory_operands(void)
 int main(void) {{ return many_memory_operands(); }}
 "#,
         decls = decls.join("\n"),
+        pointers = pointers.join("\n"),
         outs = outs.join(", "),
         ins = ins.join(", "),
         checks = checks.join("\n"),
@@ -295,22 +316,54 @@ int main(void) {{ return many_memory_operands(); }}
 
 #[test]
 fn aarch64_spilled_inline_asm_memory_operands() {
-    let src = spilled_memory_operands_source();
-    for opt in ["-O0", "-O2"] {
-        if let Some(code) = compile_and_run_aarch64("a64_asm_spilled_mem", &src, opt) {
-            assert_eq!(code, 0, "at {opt}");
+    for (through_pointers, extra) in [(false, 0), (true, 0), (true, 1)] {
+        let src = spilled_memory_operands_source(through_pointers, extra);
+        for opt in ["-O0", "-O2"] {
+            if let Some(code) = compile_and_run_aarch64("a64_asm_spilled_mem", &src, opt) {
+                assert_eq!(
+                    code, 0,
+                    "at {opt}, through pointers: {through_pointers}+{extra}"
+                );
+            }
         }
     }
 }
 
-/// The shape: a spilled operand's address is loaded before the template and
-/// the operand names the register, X15 last; an operand whose address is
-/// already in a register still names that register.
+/// Over the locals: every operand is addressed in place and no register is
+/// loaded with an address for the template.
+#[test]
+fn aarch64_local_inline_asm_memory_operands_are_addressed_in_place() {
+    let asm = crate::common::asm_for_at(
+        "a64_asm_mem_in_place",
+        &spilled_memory_operands_source(false, 0),
+        &["--target", "aarch64-unknown-linux-gnu"],
+    );
+    let start = asm.find("many_memory_operands:").expect("the function");
+    let body = &asm[start
+        ..asm[start..]
+            .find(".cfi_endproc")
+            .map_or(asm.len(), |e| start + e)];
+    assert!(body.contains("ldrb w9, [x29, #"), "{body}");
+    assert!(body.contains("str xzr, [x29, #"), "{body}");
+    // No operand is named through an address register. The zeroing loop's
+    // post-indexed `[x16], #16` is not an operand, hence the line end.
+    for reg in ["x16", "x17", "x11", "x15"] {
+        assert!(!body.contains(&format!(", [{reg}]\n")), "{reg}:\n{body}");
+    }
+}
+
+/// Through pointers: a spilled operand's address is loaded before the
+/// template and the operand names the register, X15 last; an operand whose
+/// address is already in a register still names that register. Each address
+/// is a register demand of the statement and is colored first, so it takes
+/// one more address than the allocator has registers -- 25 against 21, with
+/// x9/x10 clobbered -- to reach all four scratch registers. That is gcc's
+/// 30-operand limit exactly.
 #[test]
 fn aarch64_spilled_inline_asm_memory_operand_shape() {
     let asm = crate::common::asm_for_at(
         "a64_asm_mem_shape",
-        &spilled_memory_operands_source(),
+        &spilled_memory_operands_source(true, 1),
         &["--target", "aarch64-unknown-linux-gnu"],
     );
     for reg in ["x16", "x17", "x11", "x15"] {
@@ -327,7 +380,9 @@ fn aarch64_spilled_inline_asm_memory_operand_shape() {
         asm[x15..].lines().nth(1).unwrap().contains("str xzr, ["),
         "{asm}"
     );
-    // No operand is a stack slot.
-    assert!(!asm.contains("str xzr, [x29"), "{asm}");
+    // `sum` is a local, so it is addressed in place even here; the operands
+    // through pointers never are.
+    assert!(asm.contains("str xzr, [x29, #"), "{asm}");
+    assert!(!asm.contains("ldrb w9, [x29"), "{asm}");
     assert!(asm.contains("ldrb w9, [x"), "{asm}");
 }

@@ -24,8 +24,8 @@ enum OperandSetup {
     Object { base: Reg, offset: i32 },
     /// `reg = [slot]`: the operand's address was spilled there.
     Spilled(MemAddr),
-    /// `reg = &name`.
-    Global(String),
+    /// `reg = &name + offset`.
+    Global { name: String, offset: i64 },
     /// `reg = value of pseudo`, wherever it lives.
     Value { pseudo: PseudoId, size: u32 },
     /// `reg = constant`, for a register-only operand whose value is one.
@@ -47,7 +47,7 @@ struct OperandRegs {
     clobbered: Vec<Reg>,
     ip: Vec<Reg>,
     legalize_reg_free: bool,
-    given: Vec<(PseudoId, Reg)>,
+    given: Vec<((PseudoId, i32), Reg)>,
     setups: Vec<(Reg, OperandSetup)>,
 }
 
@@ -279,6 +279,7 @@ impl Aarch64CodeGen {
                 _ if requires_mem => {
                     let mem_str = self.memory_operand(
                         output.pseudo,
+                        output.offset,
                         &loc,
                         op_size,
                         &mut addr_regs,
@@ -518,12 +519,15 @@ impl Aarch64CodeGen {
                 _ if requires_mem => {
                     // A `+m` input shares its output's pseudo, and so its
                     // address register.
-                    let pseudo = match input.matching_output {
-                        Some(i) if i < num_outputs => asm_data.outputs[i].pseudo,
-                        _ => input.pseudo,
+                    let (pseudo, offset) = match input.matching_output {
+                        Some(i) if i < num_outputs => {
+                            (asm_data.outputs[i].pseudo, asm_data.outputs[i].offset)
+                        }
+                        _ => (input.pseudo, input.offset),
                     };
                     let mem_str = self.memory_operand(
                         pseudo,
+                        offset,
                         &loc,
                         op_size,
                         &mut addr_regs,
@@ -634,21 +638,34 @@ impl Aarch64CodeGen {
     /// the operand's own size decides the scaled range, and an operand of no
     /// natural access size gets only the unscaled one. Otherwise the object's
     /// address goes in a register.
+    #[allow(clippy::too_many_arguments)]
     fn memory_operand(
         &mut self,
         pseudo: PseudoId,
+        object_offset: i64,
         loc: &Loc,
         size_bits: u32,
         regs: &mut OperandRegs,
         gp_scratch: &mut Vec<Reg>,
         insn: &Instruction,
     ) -> String {
-        if let Some(&(_, reg)) = regs.given.iter().find(|(p, _)| *p == pseudo) {
+        let Ok(object_offset) = i32::try_from(object_offset) else {
+            crate::diag::error(
+                insn.pos.unwrap_or_default(),
+                "an asm memory operand lies past the displacement an instruction can hold",
+            );
+            return "[sp]".to_string();
+        };
+        // Two members of one object share its `Sym` and differ in offset, so
+        // an address register is reused only for the same pseudo *and* offset.
+        let key = (pseudo, object_offset);
+        if let Some(&(_, reg)) = regs.given.iter().find(|(k, _)| *k == key) {
             return format!("[{}]", asm_reg_name_64(reg));
         }
         let setup = match loc {
             Loc::Stack(_) | Loc::IncomingArg(_) if self.pseudos.is_sym(pseudo) => {
                 let (base, offset) = self.loc_addr_parts(loc).unwrap();
+                let offset = offset + object_offset;
                 let bytes = i64::from(size_bits / 8);
                 let fits = if matches!(bytes, 1 | 2 | 4 | 8 | 16) {
                     single_offset_fits(offset.into(), bytes)
@@ -656,14 +673,21 @@ impl Aarch64CodeGen {
                     (-256..=255).contains(&offset)
                 };
                 if fits {
-                    return self.loc_to_asm_string(loc, size_bits);
+                    return if offset == 0 {
+                        format!("[{}]", asm_reg_name_64(base))
+                    } else {
+                        format!("[{}, #{}]", asm_reg_name_64(base), offset)
+                    };
                 }
                 OperandSetup::Object { base, offset }
             }
             Loc::Stack(_) | Loc::IncomingArg(_) => {
                 OperandSetup::Spilled(self.loc_mem(loc).unwrap())
             }
-            Loc::Global(name) => OperandSetup::Global(name.clone()),
+            Loc::Global(name) => OperandSetup::Global {
+                name: name.clone(),
+                offset: object_offset.into(),
+            },
             other => return self.loc_to_asm_string(other, size_bits),
         };
         let Some(reg) = regs.take(gp_scratch, true) else {
@@ -675,7 +699,7 @@ impl Aarch64CodeGen {
             );
             return "[sp]".to_string();
         };
-        regs.given.push((pseudo, reg));
+        regs.given.push((key, reg));
         regs.setups.push((reg, setup));
         format!("[{}]", asm_reg_name_64(reg))
     }
@@ -694,7 +718,17 @@ impl Aarch64CodeGen {
                 addr,
                 dst: reg,
             }),
-            OperandSetup::Global(name) => self.emit_load_addr(&name, reg),
+            OperandSetup::Global { name, offset } => {
+                self.emit_load_addr(&name, reg);
+                if offset != 0 {
+                    self.push_lir(Aarch64Inst::Add {
+                        size: OperandSize::B64,
+                        src1: reg,
+                        src2: GpOperand::Imm(offset),
+                        dst: reg,
+                    });
+                }
+            }
             OperandSetup::Value { pseudo, size } => self.emit_move(pseudo, reg, size.max(32)),
             OperandSetup::Imm(v) => self.emit_mov_imm(reg, v, 64),
         }

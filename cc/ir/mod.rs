@@ -748,6 +748,17 @@ pub struct AsmConstraint {
     pub constraint: String,
     /// Size of the operand in bits (8, 16, 32, 64), derived from the C type
     pub size: u32,
+    /// For a memory operand whose `pseudo` is a `Sym` -- the object itself,
+    /// not an address held in a value -- the byte offset into that object.
+    /// Zero otherwise.
+    ///
+    /// A named object at a constant offset needs no register: the backend
+    /// addresses it where it lives (`-N(%rbp)`, `[x29, #N]`, `sym(%rip)`), as
+    /// gcc does. Passed as an address value instead, it competed for a
+    /// register like any other operand and, once a statement had more
+    /// operands than registers, was spilled -- and the slot holding the
+    /// address was then substituted as if it were the object.
+    pub offset: i64,
 }
 
 impl AsmConstraint {
@@ -3418,6 +3429,7 @@ mod tests {
             matching_output,
             constraint: c.to_string(),
             size: 64,
+            offset: 0,
         }
     }
 

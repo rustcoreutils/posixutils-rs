@@ -1036,8 +1036,7 @@ pub fn get_constraint_info_aarch64(insn: &Instruction) -> Option<(Vec<Reg>, Vec<
     // of clobbers.
     if insn.op == Opcode::Asm {
         let ic = build_asm_instr_constraints_aarch64(insn)?;
-        let (mut clobbers, involved) =
-            lower_instr_constraints_to_constraint_point_aarch64(&ic, insn);
+        let (mut clobbers, involved) = ic.to_constraint_point();
         if opcode_clobbers_aarch64_scratches(insn.op) {
             clobbers.extend(AARCH64_SCRATCH_REGS);
             clobbers.sort();
@@ -1154,38 +1153,12 @@ fn opcode_clobbers_aarch64_scratches(op: Opcode) -> bool {
 pub fn build_asm_instr_constraints_aarch64(
     insn: &Instruction,
 ) -> Option<crate::arch::asm_constraints::InstrConstraints<Reg>> {
-    use crate::arch::asm_constraints::{
-        parse_constraint_with_classes, InstrConstraints, OperandSpec,
-    };
-
-    let asm_data = insn.asm_data.as_ref()?;
-    let mut operands = Vec::new();
-    for ac in asm_data.outputs.iter().chain(asm_data.inputs.iter()) {
-        if let Ok((kind, constraint)) = parse_constraint_with_classes(
-            &ac.constraint,
-            parse_aarch64_fixed_letter,
-            parse_aarch64_class_letter,
-        ) {
-            operands.push(OperandSpec {
-                pseudo: ac.pseudo,
-                kind,
-                constraint,
-            });
-        }
-    }
-    let mut clobbers: Vec<Reg> = asm_data
-        .clobbers
-        .iter()
-        .filter_map(|name| parse_gp_clobber_name(name))
-        .collect();
-    clobbers.sort();
-    clobbers.dedup();
-    let memory_barrier = asm_data.clobbers.iter().any(|c| c == "memory");
-    Some(InstrConstraints {
-        operands,
-        clobbers,
-        memory_barrier,
-    })
+    Some(crate::arch::asm_constraints::InstrConstraints::of_asm(
+        insn.asm_data.as_ref()?,
+        parse_aarch64_fixed_letter,
+        parse_aarch64_class_letter,
+        parse_gp_clobber_name,
+    ))
 }
 
 /// Walk a function's inline-asm instructions and collect
@@ -1214,44 +1187,6 @@ pub fn collect_asm_fixed_precolors_aarch64(func: &Function) -> BTreeMap<PseudoId
         }
     }
     out
-}
-
-/// Mirror of `lower_instr_constraints_to_constraint_point` for aarch64.
-pub fn lower_instr_constraints_to_constraint_point_aarch64(
-    ic: &crate::arch::asm_constraints::InstrConstraints<Reg>,
-    insn: &Instruction,
-) -> (Vec<Reg>, Vec<PseudoId>) {
-    use crate::arch::asm_constraints::{OperandConstraint, OperandKind};
-
-    let mut clobbers = ic.clobbers.clone();
-    for op in &ic.operands {
-        // See `lower_instr_constraints_to_constraint_point` in
-        // the x86_64 mirror for the per-variant rationale.
-        match &op.constraint {
-            OperandConstraint::Fixed(r) => clobbers.push(*r),
-            OperandConstraint::Match(_idx) => { /* C3: coalescing edge */ }
-            OperandConstraint::Any | OperandConstraint::Mem | OperandConstraint::Imm => {}
-            // Multi-alternative — see the x86_64 mirror.
-            OperandConstraint::Alternatives(_) => {}
-        }
-        if matches!(op.kind, OperandKind::EarlyClobber) { /* C3: extra interference */ }
-    }
-    let _ = ic.memory_barrier;
-    clobbers.sort();
-    clobbers.dedup();
-
-    let mut involved = Vec::new();
-    if let Some(t) = insn.target {
-        involved.push(t);
-    }
-    involved.extend(insn.src.iter().copied());
-    for op in &ic.operands {
-        if !involved.contains(&op.pseudo) {
-            involved.push(op.pseudo);
-        }
-    }
-
-    (clobbers, involved)
 }
 
 /// Opcodes whose aarch64 codegen lowering invokes an external function
@@ -2442,38 +2377,43 @@ mod tests {
         assert!(!is_call_like_aarch64(Opcode::Asm));
     }
 
-    fn make_asm_insn(clobbers: &[&str]) -> Instruction {
-        use crate::ir::AsmData;
+    fn make_asm_insn(clobbers: &[&str], operands: &[(&str, PseudoId)]) -> Instruction {
+        use crate::ir::{AsmConstraint, AsmData};
+        let (outputs, inputs): (Vec<_>, Vec<_>) = operands
+            .iter()
+            .map(|&(c, pseudo)| AsmConstraint {
+                pseudo,
+                name: None,
+                matching_output: None,
+                constraint: c.to_string(),
+                size: 64,
+                offset: 0,
+            })
+            .partition(|c| c.constraint.starts_with('=') || c.constraint.starts_with('+'));
         let mut insn = Instruction::new(Opcode::Asm);
         insn.asm_data = Some(Box::new(AsmData {
             template: String::new(),
-            outputs: Vec::new(),
-            inputs: Vec::new(),
+            outputs,
+            inputs,
             clobbers: clobbers.iter().map(|s| s.to_string()).collect(),
             goto_labels: Vec::new(),
         }));
         insn
     }
 
+    /// No operand of an asm statement may live in a register it clobbers:
+    /// the template may write that register before reading its operands.
+    /// So an asm's declared clobbers exempt none of its operands, register
+    /// or memory -- unlike an instruction such as `idivq`, which reads its
+    /// operands before touching the registers it claims.
     #[test]
-    fn build_asm_instr_constraints_aarch64_propagates_memory_barrier() {
-        // Mirror of the x86_64 test. `asm volatile("dmb ish" ::: "memory")`
-        // is a heavily-used aarch64 idiom for `__sync_synchronize`-style
-        // barriers — the `"memory"` clobber must drive
-        // `memory_barrier = true` on the lowered constraint.
-        let with_mem = make_asm_insn(&["x0", "memory"]);
-        let ic = build_asm_instr_constraints_aarch64(&with_mem).expect("has asm_data");
-        assert!(ic.memory_barrier, "\"memory\" clobber must set the flag");
-
-        let no_mem = make_asm_insn(&["x0", "cc"]);
-        let ic = build_asm_instr_constraints_aarch64(&no_mem).expect("has asm_data");
-        assert!(
-            !ic.memory_barrier,
-            "asm without \"memory\" clobber must not be a barrier"
+    fn asm_operands_are_not_exempt_from_the_statements_clobbers() {
+        let insn = make_asm_insn(
+            &["x0", "memory"],
+            &[("=r", PseudoId(1)), ("r", PseudoId(2)), ("m", PseudoId(5))],
         );
-
-        let bare = make_asm_insn(&[]);
-        let ic = build_asm_instr_constraints_aarch64(&bare).expect("has asm_data");
-        assert!(!ic.memory_barrier);
+        let (clobbers, exempt) = get_constraint_info_aarch64(&insn).expect("a register is claimed");
+        assert!(clobbers.contains(&Reg::X0));
+        assert!(exempt.is_empty(), "{exempt:?}");
     }
 }

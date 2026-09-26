@@ -2848,6 +2848,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     Some(addr) => addr,
                     None => self.linearize_lvalue(&op.expr),
                 };
+                let (addr, offset) = self.asm_memory_operand(addr);
                 output_places.push(place);
 
                 if is_readwrite {
@@ -2859,6 +2860,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         matching_output: Some(ir_outputs.len()),
                         constraint: op.constraint.clone(),
                         size,
+                        offset,
                     });
                 }
 
@@ -2868,6 +2870,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     matching_output: None,
                     constraint: op.constraint.clone(),
                     size,
+                    offset,
                 });
 
                 param_outputs.push(None);
@@ -2926,6 +2929,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     matching_output: Some(ir_outputs.len()), // matches the output about to be pushed
                     constraint: op.constraint.clone(),
                     size,
+                    offset: 0,
                 });
             }
 
@@ -2935,6 +2939,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 matching_output: None,
                 constraint: op.constraint.clone(),
                 size,
+                offset: 0,
             });
 
             // Track if this is a parameter output
@@ -2955,6 +2960,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             // For matching constraints (like "0"), we need to load the input value
             // into the matched output's pseudo so they use the same register
+            let mut memory_offset = 0;
             let pseudo = if let Some(match_idx) = matching {
                 if match_idx < ir_outputs.len() {
                     // Use the matched output's pseudo
@@ -2974,8 +2980,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                     self.linearize_expr(&op.expr)
                 }
             } else if is_memory {
-                // For memory operands, get the address
-                self.linearize_lvalue(&op.expr)
+                // For memory operands, get the address -- or the object
+                // itself, when the address is a constant one.
+                let addr = self.linearize_lvalue(&op.expr);
+                let (pseudo, offset) = self.asm_memory_operand(addr);
+                memory_offset = offset;
+                pseudo
             } else {
                 // For register operands, evaluate the expression
                 self.linearize_expr(&op.expr)
@@ -2987,6 +2997,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 matching_output: matching,
                 constraint: op.constraint.clone(),
                 size,
+                offset: memory_offset,
             });
         }
 
@@ -3124,6 +3135,46 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
+    /// A memory operand's address as the object it names and a constant byte
+    /// offset into it, when it is one: a local, a parameter, a static or a
+    /// global, reached through members and constant subscripts.
+    ///
+    /// The address arithmetic `linearize_lvalue` just emitted for it is
+    /// dropped and the operand names the object's `Sym` instead, so the
+    /// backend addresses the object where it lives and no register is spent
+    /// on it -- see [`AsmConstraint::offset`]. Anything else keeps its address
+    /// pseudo: a pointer computed at run time, a VLA's storage, a function.
+    fn asm_memory_operand(&mut self, addr: PseudoId) -> (PseudoId, i64) {
+        let Some(bb_id) = self.current_bb else {
+            return (addr, 0);
+        };
+        let func = self.current_func.as_ref().expect("inside a function");
+        let Some(bb) = func.get_block(bb_id) else {
+            return (addr, 0);
+        };
+        let defs: std::collections::HashMap<PseudoId, usize> = bb
+            .insns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, insn)| insn.target.map(|t| (t, i)))
+            .collect();
+        let walk = AddrWalk {
+            func,
+            insns: &bb.insns,
+            defs: &defs,
+            types: self.types,
+        };
+        let mut chain = Vec::new();
+        let Some((sym, offset)) = walk.object(addr, &mut chain) else {
+            return (addr, 0);
+        };
+        let bb = self.get_or_create_bb(bb_id);
+        for i in chain {
+            bb.insns[i].kill();
+        }
+        (sym, offset)
+    }
+
     /// Parse an asm constraint string to extract flags.
     /// Returns `(is_memory, is_readwrite, matching_output)`.
     ///
@@ -3163,6 +3214,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             matching_output: None,
             constraint: constraint.to_string(),
             size: 0,
+            offset: 0,
         };
 
         (probe.is_memory(), is_readwrite, matching)
@@ -3531,5 +3583,125 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
     fn float_value(&self, scope: ConstScope, expr: &Expr) -> Option<f64> {
         self.eval_const_float_expr_scoped(scope, expr)
             .map(|v| v.to_f64())
+    }
+}
+
+/// Follows the address arithmetic of one memory operand back to the object
+/// it names. Only within the block being built, where `linearize_lvalue` has
+/// just emitted it; every instruction it follows is recorded in `chain` so
+/// the caller can drop the arithmetic it no longer needs.
+struct AddrWalk<'w> {
+    func: &'w super::Function,
+    insns: &'w [Instruction],
+    defs: &'w std::collections::HashMap<PseudoId, usize>,
+    types: &'w TypeTable,
+}
+
+impl AddrWalk<'_> {
+    /// `p` as (object `Sym`, constant byte offset). On failure `chain` is left
+    /// as it was, so a branch that did not pan out drops nothing.
+    fn object(&self, p: PseudoId, chain: &mut Vec<usize>) -> Option<(PseudoId, i64)> {
+        let mark = chain.len();
+        let found = self.object_at(p, chain);
+        if found.is_none() {
+            chain.truncate(mark);
+        }
+        found
+    }
+
+    fn object_at(&self, p: PseudoId, chain: &mut Vec<usize>) -> Option<(PseudoId, i64)> {
+        let i = *self.defs.get(&p)?;
+        let insn = &self.insns[i];
+        let found = match insn.op {
+            Opcode::SymAddr => {
+                let sym = *insn.src.first()?;
+                if !self.names_data_object(sym, insn) {
+                    return None;
+                }
+                (sym, 0)
+            }
+            Opcode::Copy => self.object(*insn.src.first()?, chain)?,
+            Opcode::Add => {
+                let (a, b) = (*insn.src.first()?, *insn.src.get(1)?);
+                match self.object(a, chain) {
+                    Some((sym, off)) => (sym, off.checked_add(self.constant(b, chain)?)?),
+                    None => {
+                        let (sym, off) = self.object(b, chain)?;
+                        (sym, off.checked_add(self.constant(a, chain)?)?)
+                    }
+                }
+            }
+            Opcode::Sub => {
+                let (sym, off) = self.object(*insn.src.first()?, chain)?;
+                (
+                    sym,
+                    off.checked_sub(self.constant(*insn.src.get(1)?, chain)?)?,
+                )
+            }
+            _ => return None,
+        };
+        chain.push(i);
+        Some(found)
+    }
+
+    /// `p` as a constant, folding the widening and scaling a subscript is
+    /// linearized into. On failure `chain` is left as it was.
+    fn constant(&self, p: PseudoId, chain: &mut Vec<usize>) -> Option<i64> {
+        let mark = chain.len();
+        let found = self.constant_at(p, chain);
+        if found.is_none() {
+            chain.truncate(mark);
+        }
+        found
+    }
+
+    fn constant_at(&self, p: PseudoId, chain: &mut Vec<usize>) -> Option<i64> {
+        if let Some(super::PseudoKind::Val(v)) = self.func.get_pseudo(p).map(|x| &x.kind) {
+            if let Some(&i) = self.defs.get(&p) {
+                chain.push(i);
+            }
+            return i64::try_from(*v).ok();
+        }
+        let i = *self.defs.get(&p)?;
+        let insn = &self.insns[i];
+        let value = match insn.op {
+            Opcode::Sext | Opcode::Zext => {
+                let v = self.constant(*insn.src.first()?, chain)?;
+                let bits = insn.src_size;
+                if bits == 0 || bits >= 64 {
+                    v
+                } else if insn.op == Opcode::Sext {
+                    (v << (64 - bits)) >> (64 - bits)
+                } else {
+                    v & ((1i64 << bits) - 1)
+                }
+            }
+            Opcode::Mul => {
+                let a = self.constant(*insn.src.first()?, chain)?;
+                a.checked_mul(self.constant(*insn.src.get(1)?, chain)?)?
+            }
+            Opcode::Copy => self.constant(*insn.src.first()?, chain)?,
+            _ => return None,
+        };
+        chain.push(i);
+        Some(value)
+    }
+
+    /// Whether `sym` is storage an operand can be addressed in: a local, or
+    /// a global that is not a function.
+    fn names_data_object(&self, sym: PseudoId, symaddr: &Instruction) -> bool {
+        if !matches!(
+            self.func.get_pseudo(sym).map(|x| &x.kind),
+            Some(super::PseudoKind::Sym(_))
+        ) {
+            return false;
+        }
+        if self.func.local_of(sym).is_some() {
+            return true;
+        }
+        symaddr
+            .typ
+            .and_then(|t| self.types.base_type(t))
+            .is_some_and(|t| self.types.kind(t) != TypeKind::Function)
     }
 }

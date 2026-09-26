@@ -172,6 +172,7 @@ impl X86_64CodeGen {
         let AsmOperandBuild {
             slots,
             output_moves,
+            input_moves,
             remap_restore,
             pseudo_to_temp,
             used_regs,
@@ -211,17 +212,20 @@ impl X86_64CodeGen {
                 let requires_mem = Self::constraint_requires_memory(&output.constraint);
                 // No specific register - use allocated location
                 match loc {
-                    Loc::Reg(r) if requires_mem => {
-                        // Memory-class output (e.g. `"=m"(*p)`/`"+m"(*p)`):
-                        // the pseudo holds the ADDRESS of the lvalue
-                        // (set up by the linearizer's `is_memory`
-                        // branch). Render as indirect `(%rN)` so the
-                        // asm modifies the memory directly. Without
-                        // this guard the template substitutes `%eax`
-                        // and `addl $1, %0` becomes `addl $1, %eax`,
-                        // incrementing the address bits instead of
-                        // the value at that address.
-                        let mem_str = format!("(%{})", self.reg_name_64(r));
+                    // Memory-class output (`"=m"(x)`/`"+m"(*p)`). Without
+                    // this arm the template substitutes `%eax` for an address
+                    // held in a register, and `addl $1, %0` increments the
+                    // address bits instead of the value at that address.
+                    _ if requires_mem => {
+                        let mem_str = self.asm_memory_slot(
+                            output.pseudo,
+                            output.offset,
+                            &loc,
+                            reserved_regs,
+                            used_regs,
+                            input_moves,
+                            insn.pos,
+                        );
                         slots.push(mk(None, Some(mem_str)));
                     }
                     // An x87-class output. Written back off the FP stack once
@@ -505,9 +509,16 @@ impl X86_64CodeGen {
                             let mem_str = format!("(%{})", self.reg_name_64(temp));
                             slots.push(mk(None, Some(mem_str)));
                         }
-                        Loc::Reg(r) if requires_mem => {
-                            // Memory constraint with value in register — emit as indirect
-                            let mem_str = format!("(%{})", self.reg_name_64(r));
+                        _ if requires_mem => {
+                            let mem_str = self.asm_memory_slot(
+                                input.pseudo,
+                                input.offset,
+                                &loc,
+                                reserved_regs,
+                                used_regs,
+                                input_moves,
+                                insn.pos,
+                            );
                             slots.push(mk(None, Some(mem_str)));
                         }
                         Loc::Reg(r) => {
@@ -887,6 +898,67 @@ impl X86_64CodeGen {
                     mov, src_name, loc_str
                 ))));
             }
+        }
+    }
+
+    /// The text of a memory-class operand.
+    ///
+    /// The linearizer hands over one of two things. A named object at a
+    /// constant offset arrives as its own `Sym`, and is addressed where it
+    /// lives -- frame slot, incoming-argument slot or symbol -- with no
+    /// register spent on it. Anything else is an address *value*: in a
+    /// register it is used as the base; spilled, it is loaded into a scratch
+    /// register first. Substituting the spill slot itself, as this used to,
+    /// handed the template the saved pointer rather than the object -- a
+    /// statement with more operands than registers read and wrote the wrong
+    /// memory.
+    #[allow(clippy::too_many_arguments)]
+    fn asm_memory_slot(
+        &mut self,
+        pseudo: PseudoId,
+        offset: i64,
+        loc: &Loc,
+        reserved: &std::collections::HashSet<Reg>,
+        used: &mut std::collections::HashSet<Reg>,
+        input_moves: &mut Vec<(Reg, Loc, u32)>,
+        pos: Option<crate::diag::Position>,
+    ) -> String {
+        let target = self.base.target.clone();
+        if self.pseudos.is_sym(pseudo) {
+            let Ok(offset) = i32::try_from(offset) else {
+                crate::diag::error(
+                    pos.unwrap_or_default(),
+                    "an asm memory operand lies past the displacement an instruction can hold",
+                );
+                return "0".to_string();
+            };
+            return match loc {
+                Loc::Stack(slot) => self.stack_field(*slot, offset).format(&target),
+                Loc::IncomingArg(off) => format!("{}(%rbp)", off + offset),
+                Loc::Global(name) => {
+                    if self.is_tls_symbol(name) || self.needs_got_access(name) {
+                        let temp = find_temp_reg(reserved, used, pos);
+                        used.insert(temp);
+                        let name = name.clone();
+                        self.global_mem(&name, offset, temp).format(&target)
+                    } else if offset == 0 {
+                        format!("{}(%rip)", self.format_symbol_name(name))
+                    } else {
+                        format!("{}{:+}(%rip)", self.format_symbol_name(name), offset)
+                    }
+                }
+                other => self.loc_to_asm_string(other),
+            };
+        }
+        match loc {
+            Loc::Reg(r) => format!("(%{})", self.reg_name_64(*r)),
+            Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Global(_) => {
+                let temp = find_temp_reg(reserved, used, pos);
+                used.insert(temp);
+                input_moves.push((temp, loc.clone(), 64));
+                format!("(%{})", self.reg_name_64(temp))
+            }
+            other => self.loc_to_asm_string(other),
         }
     }
 

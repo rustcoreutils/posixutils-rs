@@ -6989,3 +6989,87 @@ fn test_asm_goto_output_written_back_on_the_label_edge() {
         "the label edge must end by branching to the label"
     );
 }
+
+/// A memory operand naming an object is handed over as the object's `Sym`,
+/// not as an address computed into a pseudo.
+///
+/// Addressed in place it needs no register; as an address value it
+/// competed for one and, once spilled, the backend substituted the spill
+/// slot as the operand. The address arithmetic the lvalue produced is
+/// dropped, so nothing is left to keep the dead address alive.
+#[test]
+fn test_asm_memory_operand_names_its_object() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let x_sym = ctx.var("x", int_type);
+
+    // { asm("" : "=m"(x) : "m"(x)); return x; }
+    let body = Stmt::Block(vec![
+        BlockItem::Statement(Box::new(Stmt::Asm {
+            template: String::new(),
+            outputs: vec![AsmOperand {
+                name: None,
+                constraint: "=m".to_string(),
+                expr: Expr::var_typed(x_sym, int_type),
+            }],
+            inputs: vec![AsmOperand {
+                name: None,
+                constraint: "m".to_string(),
+                expr: Expr::var_typed(x_sym, int_type),
+            }],
+            clobbers: vec![],
+            goto_labels: vec![],
+        })),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
+            x_sym, int_type,
+        ))))),
+    ]);
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: int_type,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(x_sym),
+            typ: int_type,
+            vm_dims: vec![],
+            discarded_dims: vec![],
+        }],
+        body,
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let func = &module.functions[0];
+
+    let asm = func
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .find(|insn| insn.op == Opcode::Asm)
+        .expect("an asm instruction");
+    let data = asm.asm_data.as_ref().unwrap();
+    for c in data.outputs.iter().chain(data.inputs.iter()) {
+        assert!(
+            matches!(
+                func.get_pseudo(c.pseudo).map(|p| &p.kind),
+                Some(crate::ir::PseudoKind::Sym(_))
+            ),
+            "{c:?} should name the object"
+        );
+        assert_eq!(c.offset, 0);
+    }
+    assert!(
+        !func
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .any(|i| i.op == Opcode::SymAddr),
+        "the operand's address arithmetic should be gone"
+    );
+}

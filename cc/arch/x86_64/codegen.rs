@@ -189,7 +189,7 @@ impl X86_64CodeGen {
     /// Whether `name` is a thread-local this backend must access through the
     /// FS segment. TLS lowering here is Linux-only; the other targets fall
     /// through to ordinary global access.
-    fn is_tls_symbol(&self, name: &str) -> bool {
+    pub(super) fn is_tls_symbol(&self, name: &str) -> bool {
         self.tls_symbols.contains(name) && self.base.target.os == Os::Linux
     }
 

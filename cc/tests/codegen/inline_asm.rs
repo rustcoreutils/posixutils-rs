@@ -2192,3 +2192,352 @@ fn codegen_inline_asm_register_operands_aarch64() {
         }
     }
 }
+
+// ============================================================================
+// Memory operands addressed in place, and clobbered registers
+// ============================================================================
+
+/// One asm statement over 16 locals with 25 operands: `"+m"` chars and
+/// longs, `"=m"` and `"m"`, in the gcc torture shape.
+///
+/// A memory operand naming an object at a constant offset needs no register:
+/// it is addressed where it lives, `-N(%rbp)`, as gcc does. c17 routed it
+/// through an address pseudo instead, and with more operands than registers
+/// that address was spilled -- and x86-64 then substituted the *spill slot*
+/// as the operand, so the template read and wrote the saved pointer rather
+/// than the object. gcc returns 0; c17 returned 15.
+fn many_local_memory_operands_x86_64() -> String {
+    let plan = ["ch", "rw", "wo", "in"].repeat(4);
+    let (mut decls, mut outs, mut ins, mut checks) = (vec![], vec![], vec![], vec![]);
+    outs.push(r#"[sum] "=m"(sum)"#.to_string());
+    let mut body = String::from(r"movq $0, %[sum]\n\t");
+    let mut sum = 0;
+    for (i, kind) in plan.iter().enumerate() {
+        match *kind {
+            "ch" => {
+                decls.push(format!("    char m{i} = {i};"));
+                outs.push(format!(r#"[m{i}] "+m"(m{i})"#));
+                body.push_str(&format!(
+                    r"movb %[m{i}], %%al\n\taddb $1, %%al\n\tmovb %%al, %[m{i}]\n\t"
+                ));
+                checks.push(format!("    if (m{i} != {i} + 1) return {};", i + 1));
+            }
+            "rw" => {
+                decls.push(format!("    long m{i} = {i} * 1000;"));
+                outs.push(format!(r#"[m{i}] "+m"(m{i})"#));
+                body.push_str(&format!(
+                    r"movq %[m{i}], %%rax\n\taddq $1, %%rax\n\tmovq %%rax, %[m{i}]\n\t"
+                ));
+                checks.push(format!("    if (m{i} != {i} * 1000 + 1) return {};", i + 1));
+            }
+            "wo" => {
+                decls.push(format!("    long m{i} = {i} * 1000;"));
+                outs.push(format!(r#"[m{i}] "=m"(m{i})"#));
+                body.push_str(&format!(r"movq ${}, %[m{i}]\n\t", i + 7));
+                checks.push(format!("    if (m{i} != {}) return {};", i + 7, i + 1));
+            }
+            _ => {
+                decls.push(format!("    long m{i} = {i} * 1000;"));
+                ins.push(format!(r#"[m{i}] "m"(m{i})"#));
+                body.push_str(&format!(r"movq %[m{i}], %%rax\n\taddq %%rax, %[sum]\n\t"));
+                sum += i * 1000;
+            }
+        }
+    }
+    format!(
+        r#"#define NI __attribute__((noinline))
+volatile long sink;
+NI void touch(void *p) {{ sink += *(volatile char *)p; }}
+
+NI int many_memory_operands(void)
+{{
+    volatile char lo[4000];
+{decls}
+    long sum;
+    touch((void *)lo);
+    __asm__ volatile(
+        "{body}"
+        : {outs}
+        : {ins}
+        : "rax", "memory");
+{checks}
+    if (sum != {sum}) return 100;
+    return 0;
+}}
+
+int main(void) {{ return many_memory_operands(); }}
+"#,
+        decls = decls.join("\n"),
+        outs = outs.join(", "),
+        ins = ins.join(", "),
+        checks = checks.join("\n"),
+    )
+}
+
+#[test]
+fn codegen_inline_asm_local_memory_operands_x86_64() {
+    let src = many_local_memory_operands_x86_64();
+    assert_eq!(compile_and_run("asm_mem_locals", &src, &[]), 0);
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run("asm_mem_locals_o2", &src, &opts), 0);
+}
+
+/// Every operand is a frame slot in the template, and no register is loaded
+/// with an address for it.
+#[test]
+fn codegen_inline_asm_local_memory_operands_are_frame_slots_x86_64() {
+    let asm = crate::common::asm_for_at(
+        "asm_mem_locals_shape",
+        &many_local_memory_operands_x86_64(),
+        &["--target", "x86_64-unknown-linux-gnu", "-O2"],
+    );
+    let start = asm.find("many_memory_operands:").expect("the function");
+    let body = &asm[start
+        ..asm[start..]
+            .find(".cfi_endproc")
+            .map_or(asm.len(), |e| start + e)];
+    assert!(body.contains("movb %al, -"), "{body}");
+    assert!(body.contains("(%rbp), %al\n    addb $1, %al"), "{body}");
+    assert!(
+        !body.contains("(%r10)") && !body.contains("(%r11)"),
+        "{body}"
+    );
+}
+
+/// Every kind of object a memory operand can name: a struct member, a
+/// constant array element, a global, a static, a parameter, a plain local,
+/// and one reached through a pointer.
+const MIXED_MEMORY_OPERANDS_X86_64: &str = r#"
+#define NI __attribute__((noinline))
+struct P { long a; int b[4]; };
+long g = 5;
+static long sg = 6;
+NI long mix(long param, long *ptr)
+{
+    struct P s = { 1, { 2, 3, 4, 5 } };
+    long arr[6] = { 10, 11, 12, 13, 14, 15 };
+    long local = 7;
+    __asm__ volatile(
+        "addq $1, %0\n\taddl $1, %1\n\taddq $1, %2\n\taddq $1, %3\n\t"
+        "addq $1, %4\n\taddq $1, %5\n\taddq $1, %6\n\taddq $1, %7"
+        : "+m"(s.a), "+m"(s.b[2]), "+m"(arr[4]), "+m"(g), "+m"(sg), "+m"(param),
+          "+m"(*ptr), "+m"(local));
+    return s.a + s.b[2] + arr[4] + g + sg + param + *ptr + local
+         + s.b[1] + s.b[3] + arr[3] + arr[5];
+}
+int main(void)
+{
+    long x = 100;
+    if (mix(20, &x) != 2 + 5 + 15 + 6 + 7 + 21 + 101 + 8 + 3 + 5 + 13 + 15) return 1;
+    if (x != 101 || g != 6 || sg != 7) return 2;
+    return 0;
+}
+"#;
+
+const MIXED_MEMORY_OPERANDS_AARCH64: &str = r#"
+#define NI __attribute__((noinline))
+struct P { long a; int b[4]; };
+long g = 5;
+static long sg = 6;
+NI long mix(long param, long *ptr)
+{
+    struct P s = { 1, { 2, 3, 4, 5 } };
+    long arr[6] = { 10, 11, 12, 13, 14, 15 };
+    long local = 7;
+    __asm__ volatile(
+        "ldr x9, %0\n\tadd x9, x9, #1\n\tstr x9, %0\n\t"
+        "ldr w9, %1\n\tadd w9, w9, #1\n\tstr w9, %1\n\t"
+        "ldr x9, %2\n\tadd x9, x9, #1\n\tstr x9, %2\n\t"
+        "ldr x9, %3\n\tadd x9, x9, #1\n\tstr x9, %3\n\t"
+        "ldr x9, %4\n\tadd x9, x9, #1\n\tstr x9, %4\n\t"
+        "ldr x9, %5\n\tadd x9, x9, #1\n\tstr x9, %5\n\t"
+        "ldr x9, %6\n\tadd x9, x9, #1\n\tstr x9, %6\n\t"
+        "ldr x9, %7\n\tadd x9, x9, #1\n\tstr x9, %7"
+        : "+m"(s.a), "+m"(s.b[2]), "+m"(arr[4]), "+m"(g), "+m"(sg), "+m"(param),
+          "+m"(*ptr), "+m"(local)
+        : : "x9");
+    return s.a + s.b[2] + arr[4] + g + sg + param + *ptr + local
+         + s.b[1] + s.b[3] + arr[3] + arr[5];
+}
+int main(void)
+{
+    long x = 100;
+    if (mix(20, &x) != 2 + 5 + 15 + 6 + 7 + 21 + 101 + 8 + 3 + 5 + 13 + 15) return 1;
+    if (x != 101 || g != 6 || sg != 7) return 2;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_inline_asm_mixed_memory_operands() {
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(
+        compile_and_run("asm_mem_mix", MIXED_MEMORY_OPERANDS_X86_64, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run("asm_mem_mix_o2", MIXED_MEMORY_OPERANDS_X86_64, &opts),
+        0
+    );
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) =
+            compile_and_run_aarch64("asm_mem_mix_a64", MIXED_MEMORY_OPERANDS_AARCH64, opt)
+        {
+            assert_eq!(code, 0, "aarch64 at {opt}");
+        }
+    }
+}
+
+/// Twelve operands reached through pointers, whose addresses are run-time
+/// values: each needs a base register, and with `%rax` clobbered there are
+/// fewer allocatable registers than addresses. Those addresses are register
+/// demands of the statement, colored first; the one left over is loaded into
+/// R10. gcc builds this at -O2 and reports impossible constraints at -O0.
+const POINTER_MEMORY_OPERANDS_X86_64: &str = r#"
+#define NI __attribute__((noinline))
+NI void *opaque(void *p) { return p; }
+NI int pointers(void)
+{
+    long m0 = 0 * 10;
+    long m1 = 1 * 10;
+    long m2 = 2 * 10;
+    long m3 = 3 * 10;
+    long m4 = 4 * 10;
+    long m5 = 5 * 10;
+    long m6 = 6 * 10;
+    long m7 = 7 * 10;
+    long m8 = 8 * 10;
+    long m9 = 9 * 10;
+    long m10 = 10 * 10;
+    long m11 = 11 * 10;
+    long *p0 = opaque(&m0);
+    long *p1 = opaque(&m1);
+    long *p2 = opaque(&m2);
+    long *p3 = opaque(&m3);
+    long *p4 = opaque(&m4);
+    long *p5 = opaque(&m5);
+    long *p6 = opaque(&m6);
+    long *p7 = opaque(&m7);
+    long *p8 = opaque(&m8);
+    long *p9 = opaque(&m9);
+    long *p10 = opaque(&m10);
+    long *p11 = opaque(&m11);
+    __asm__ volatile("addq $1, %0\n\taddq $1, %1\n\taddq $1, %2\n\taddq $1, %3\n\taddq $1, %4\n\taddq $1, %5\n\taddq $1, %6\n\taddq $1, %7\n\taddq $1, %8\n\taddq $1, %9\n\taddq $1, %10\n\taddq $1, %11\n\t" : "+m"(*p0), "+m"(*p1), "+m"(*p2), "+m"(*p3), "+m"(*p4), "+m"(*p5), "+m"(*p6), "+m"(*p7), "+m"(*p8), "+m"(*p9), "+m"(*p10), "+m"(*p11) : : "rax", "memory");
+    if (m0 != 0 * 10 + 1) return 1;
+    if (m1 != 1 * 10 + 1) return 2;
+    if (m2 != 2 * 10 + 1) return 3;
+    if (m3 != 3 * 10 + 1) return 4;
+    if (m4 != 4 * 10 + 1) return 5;
+    if (m5 != 5 * 10 + 1) return 6;
+    if (m6 != 6 * 10 + 1) return 7;
+    if (m7 != 7 * 10 + 1) return 8;
+    if (m8 != 8 * 10 + 1) return 9;
+    if (m9 != 9 * 10 + 1) return 10;
+    if (m10 != 10 * 10 + 1) return 11;
+    if (m11 != 11 * 10 + 1) return 12;
+    return 0;
+}
+int main(void) { return pointers(); }
+"#;
+
+#[test]
+fn codegen_inline_asm_pointer_memory_operands_under_pressure_x86_64() {
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(
+        compile_and_run("asm_mem_ptrs", POINTER_MEMORY_OPERANDS_X86_64, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run("asm_mem_ptrs_o2", POINTER_MEMORY_OPERANDS_X86_64, &opts),
+        0
+    );
+}
+
+/// No operand -- register input, output, or a memory operand's address --
+/// may live in a register the statement clobbers: the template writes it
+/// before reading them. Both backends exempted every operand from the
+/// statement's clobbers, so `a` could be given `%rax` and the template's
+/// first instruction destroyed it.
+const CLOBBERED_REGISTERS_X86_64: &str = r#"
+#define NI __attribute__((noinline))
+/* The template writes %rax before reading its operands, and says so: no
+   operand may live in a clobbered register. */
+NI long reg_in(long a, long b)
+{
+    long t;
+    __asm__("movq $1000, %%rax\n\tmovq %1, %0\n\taddq %2, %0" : "=r"(t) : "r"(a), "r"(b) : "rax");
+    return t;
+}
+NI long mem_in(long *p, long *q)
+{
+    long t;
+    __asm__("movq $0, %%rax\n\tmovq %1, %0\n\taddq %2, %0" : "=r"(t) : "m"(*p), "m"(*q) : "rax");
+    return t;
+}
+NI long out_clob(long a)
+{
+    long t;
+    __asm__("movq %1, %0\n\tmovq $0, %%rax" : "=r"(t) : "r"(a) : "rax");
+    return t;
+}
+int main(void)
+{
+    long x = 3, y = 4;
+    if (reg_in(10, 20) != 30) return 1;
+    if (mem_in(&x, &y) != 7) return 2;
+    if (out_clob(5) != 5) return 3;
+    return 0;
+}
+"#;
+
+const CLOBBERED_REGISTERS_AARCH64: &str = r#"
+#define NI __attribute__((noinline))
+/* The template writes x0 before reading its operands, and says so: no
+   operand may live in a clobbered register. */
+NI long reg_in(long a, long b)
+{
+    long t;
+    __asm__("mov x0, #1000\n\tmov %0, %1\n\tadd %0, %0, %2" : "=r"(t) : "r"(a), "r"(b) : "x0");
+    return t;
+}
+NI long mem_in(long *p, long *q)
+{
+    long t;
+    __asm__("mov x0, #0\n\tldr %0, %1\n\tldr x1, %2\n\tadd %0, %0, x1" : "=r"(t) : "m"(*p), "m"(*q) : "x0", "x1");
+    return t;
+}
+NI long out_clob(long a)
+{
+    long t;
+    __asm__("mov %0, %1\n\tmov x0, #0" : "=r"(t) : "r"(a) : "x0");
+    return t;
+}
+int main(void)
+{
+    long x = 3, y = 4;
+    if (reg_in(10, 20) != 30) return 1;
+    if (mem_in(&x, &y) != 7) return 2;
+    if (out_clob(5) != 5) return 3;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_inline_asm_operands_avoid_clobbered_registers() {
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(
+        compile_and_run("asm_clobbered", CLOBBERED_REGISTERS_X86_64, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run("asm_clobbered_o2", CLOBBERED_REGISTERS_X86_64, &opts),
+        0
+    );
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) =
+            compile_and_run_aarch64("asm_clobbered_a64", CLOBBERED_REGISTERS_AARCH64, opt)
+        {
+            assert_eq!(code, 0, "aarch64 at {opt}");
+        }
+    }
+}

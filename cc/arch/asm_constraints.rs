@@ -39,10 +39,10 @@ pub enum OperandConstraint<R> {
     /// must be this exact physical register. Per-arch parsers
     /// supply the letter→register mapping.
     Fixed(R),
-    /// `"0"` / `"1"` / ... — the operand at this index in the
-    /// inline-asm operand list must share its physical location
-    /// with this operand.
-    Match(usize),
+    /// `"0"` / `"1"` / ... — the operand shares its physical location
+    /// with the output at that index. Which output is carried by
+    /// `AsmConstraint::matching_output`, the one place it is read.
+    Match,
     /// `"m"` / `"Q"` — must be a memory operand. The allocator
     /// places the value in a stack slot (or any base-reg+offset
     /// addressing mode) and substitutes the memory operand into
@@ -91,19 +91,79 @@ pub struct InstrConstraints<R> {
     /// in the inline-asm operand list (outputs first, then inputs).
     pub operands: Vec<OperandSpec<R>>,
     /// Hard clobbers in addition to whatever the operands imply.
+    /// A `"memory"` clobber is not one of these: it orders memory rather
+    /// than claiming a register, and is answered by
+    /// `Instruction::is_memory_barrier`.
     pub clobbers: Vec<R>,
-    /// True iff the inline asm declared a `"memory"` clobber.
-    /// Under its strict semantics every memory-promoted value's live
-    /// range crosses the barrier, so stores are flushed before the asm
-    /// and reloads issued after.
-    pub memory_barrier: bool,
+}
+
+impl<R: Copy + Ord> InstrConstraints<R> {
+    /// The constraints of one inline-asm statement, given the target's
+    /// fixed-register letters, class letters and clobber names. One
+    /// implementation for both backends, which differ only in those three.
+    pub fn of_asm(
+        asm_data: &crate::ir::AsmData,
+        fixed_letter: impl Fn(char) -> Option<R> + Copy,
+        class_letter: impl Fn(char) -> Option<OperandConstraint<R>> + Copy,
+        clobber_name: impl Fn(&str) -> Option<R>,
+    ) -> Self {
+        let operands = asm_data
+            .outputs
+            .iter()
+            .chain(asm_data.inputs.iter())
+            .filter_map(|ac| {
+                let (_, constraint) =
+                    parse_constraint_with_classes(&ac.constraint, fixed_letter, class_letter)
+                        .ok()?;
+                Some(OperandSpec {
+                    pseudo: ac.pseudo,
+                    constraint,
+                })
+            })
+            .collect();
+        let mut clobbers: Vec<R> = asm_data
+            .clobbers
+            .iter()
+            .filter_map(|name| clobber_name(name))
+            .collect();
+        clobbers.sort();
+        clobbers.dedup();
+        Self { operands, clobbers }
+    }
+
+    /// The statement as the allocator's `ConstraintPoint`: the registers it
+    /// claims, and the operands exempt from that claim.
+    ///
+    /// It claims its declared clobbers and every register a `Fixed`
+    /// constraint pins. gcc's rule is that no operand may live in a
+    /// clobbered register -- the template may write it before reading them --
+    /// nor in a register another operand is pinned to. So only the pinned
+    /// operands themselves are exempt: each is precolored to its own register
+    /// and must not be forbidden it. Exempting every operand, as both
+    /// backends did, let an input or a memory operand's address land in a
+    /// declared clobber, and a template that wrote it first destroyed the
+    /// operand.
+    pub fn to_constraint_point(&self) -> (Vec<R>, Vec<PseudoId>) {
+        let mut clobbers = self.clobbers.clone();
+        let mut pinned = Vec::new();
+        for op in &self.operands {
+            if let OperandConstraint::Fixed(r) = op.constraint {
+                clobbers.push(r);
+                if !pinned.contains(&op.pseudo) {
+                    pinned.push(op.pseudo);
+                }
+            }
+        }
+        clobbers.sort();
+        clobbers.dedup();
+        (clobbers, pinned)
+    }
 }
 
 /// One operand's constraint description.
 #[derive(Debug, Clone)]
 pub struct OperandSpec<R> {
     pub pseudo: PseudoId,
-    pub kind: OperandKind,
     pub constraint: OperandConstraint<R>,
 }
 
@@ -204,7 +264,7 @@ pub fn parse_constraint_with_classes<R: Copy>(
                     push_dedup(&mut alts, a);
                 }
             }
-            OperandConstraint::Fixed(_) | OperandConstraint::Match(_) => {
+            OperandConstraint::Fixed(_) | OperandConstraint::Match => {
                 return Err(ConstraintParseError::AlternativeWithFixed(c, s.to_string()));
             }
         }
@@ -249,7 +309,7 @@ fn parse_single_letter<R: Copy>(
             OperandConstraint::Mem,
             OperandConstraint::Imm,
         ]),
-        '0'..='9' => OperandConstraint::Match((letter as u8 - b'0') as usize),
+        '0'..='9' => OperandConstraint::Match,
         _ => {
             // Try arch-specific class letters before Fixed-register
             // letters. The two letter sets don't overlap on any
@@ -393,10 +453,10 @@ mod tests {
     fn parse_match_operand() {
         let (k, c) = parse_constraint_with_classes::<Fake>("0", fake_map, |_| None).unwrap();
         assert_eq!(k, OperandKind::Use);
-        assert!(matches!(c, OperandConstraint::Match(0)));
+        assert!(matches!(c, OperandConstraint::Match));
         let (k, c) = parse_constraint_with_classes::<Fake>("3", fake_map, |_| None).unwrap();
         assert_eq!(k, OperandKind::Use);
-        assert!(matches!(c, OperandConstraint::Match(3)));
+        assert!(matches!(c, OperandConstraint::Match));
     }
 
     #[test]
@@ -449,7 +509,7 @@ mod tests {
                     OperandConstraint::Mem => "mem",
                     OperandConstraint::Imm => "imm",
                     OperandConstraint::Fixed(_) => "fixed",
-                    OperandConstraint::Match(_) => "match",
+                    OperandConstraint::Match => "match",
                     OperandConstraint::Alternatives(_) => "nested",
                 })
                 .collect(),
@@ -551,7 +611,7 @@ mod tests {
     #[test]
     fn single_char_match_still_works() {
         let (_, c) = parse_constraint_with_classes::<Fake>("0", fake_map, |_| None).unwrap();
-        assert!(matches!(c, OperandConstraint::Match(0)));
+        assert!(matches!(c, OperandConstraint::Match));
     }
 
     // Per-arch class letters

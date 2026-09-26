@@ -714,7 +714,9 @@ where
     }
 }
 
-/// Identify Sym pseudos whose address is taken (SymAddr opcode).
+/// Identify Sym pseudos whose address is taken: by a `SymAddr`, or by an
+/// inline-asm memory operand that addresses the object in place, which hands
+/// the template its storage just the same.
 /// These must have stable stack addresses and cannot participate in slot reuse.
 pub fn identify_addr_taken_syms(func: &Function) -> HashSet<PseudoId> {
     let mut addr_taken = HashSet::new();
@@ -723,6 +725,13 @@ pub fn identify_addr_taken_syms(func: &Function) -> HashSet<PseudoId> {
             if insn.op == Opcode::SymAddr {
                 for &src in &insn.src {
                     addr_taken.insert(src);
+                }
+            }
+            if let Some(asm) = insn.asm_data.as_ref().filter(|_| insn.op == Opcode::Asm) {
+                for c in asm.outputs.iter().chain(asm.inputs.iter()) {
+                    if c.is_memory() {
+                        addr_taken.insert(c.pseudo);
+                    }
                 }
             }
         }
@@ -1143,8 +1152,9 @@ pub fn find_copy_coalesce_candidates(func: &Function) -> Vec<(PseudoId, PseudoId
     out
 }
 
-/// The pseudos an inline-asm template names as register operands: inputs
-/// and outputs that are neither memory nor immediate-only.
+/// The pseudos an inline-asm template needs in registers: register-class
+/// inputs and outputs, and the address of a memory operand that is a
+/// run-time value rather than a named object.
 ///
 /// gcc guarantees each such operand a register at the asm, spilling other
 /// values to make room. Colored in ordinary order, an operand could be the
@@ -1158,7 +1168,18 @@ pub fn asm_register_operands(func: &Function) -> std::collections::BTreeSet<Pseu
             continue;
         };
         for c in asm.outputs.iter().chain(asm.inputs.iter()) {
-            if !c.is_memory() && c.wants_register() {
+            // A memory operand whose address is a run-time value needs that
+            // address in a base register just as much, which is how gcc
+            // treats it. One that names its object's `Sym` is addressed in
+            // place and needs none.
+            let wants = if c.is_memory() {
+                !func
+                    .get_pseudo(c.pseudo)
+                    .is_some_and(|p| matches!(p.kind, crate::ir::PseudoKind::Sym(_)))
+            } else {
+                c.wants_register()
+            };
+            if wants {
                 out.insert(c.pseudo);
             }
         }

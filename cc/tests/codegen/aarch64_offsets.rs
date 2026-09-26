@@ -204,36 +204,130 @@ fn aarch64_far_offsets_assemble_and_run() {
     }
 }
 
-/// An inline-asm memory operand far from the frame pointer. The operand is
-/// substituted into the template as text, so it has to be an address the
-/// template's own `ldr`/`str` can encode; c17 rendered `[x29, #40016]`.
-const ASM_FAR_MEMORY: &str = r#"
-#define NI __attribute__((noinline))
-volatile long sink;
-NI void touch(void *p) { sink += *(volatile char *)p; }
+/// One asm statement with more memory operands than there are allocatable
+/// registers, so some operands' addresses are spilled.
+///
+/// A memory operand's pseudo is the lvalue's *address*. c17 rendered a
+/// spilled one as its spill slot, `[x29, #N]`, which is the saved pointer
+/// rather than the object: the template read and wrote the wrong memory with
+/// nothing to say so. The addresses are loaded into X16, X17, the unspent
+/// codegen scratches and X15, in that order, before the template runs.
+///
+/// Every kind is present -- `"+m"`, `"=m"`, `"m"`, and a `char` accessed by
+/// `ldrb`/`strb` -- and x9/x10 are the template's clobbered temporaries,
+/// which also keeps them out of the address pool. The frame is past the
+/// scaled load range, so a spill slot far from `x29` is legalized as well.
+/// gcc builds and runs it, within its 30-operand limit; before the fix c17
+/// returned 100 (the sum of the `"m"` inputs read pointers).
+fn spilled_memory_operands_source() -> String {
+    let mut plan = vec!["rw", "ch"];
+    plan.extend(std::iter::repeat_n("wo", 10));
+    plan.extend(std::iter::repeat_n("ro", 10));
+    plan.extend(["rw", "ch"]);
 
-/* A memory operand far from the frame pointer: the template's ldr/str
-   must be handed an address it can encode. */
-NI long asm_far_memory(long seed)
-{
+    let (mut decls, mut outs, mut ins, mut checks) = (vec![], vec![], vec![], vec![]);
+    outs.push(r#"[sum] "=m"(sum)"#.to_string());
+    let mut body = String::from(r"str xzr, %[sum]\n\t");
+    let mut sum = 0;
+    for (i, kind) in plan.iter().enumerate() {
+        match *kind {
+            "ch" => {
+                decls.push(format!("    char m{i} = {i};"));
+                outs.push(format!(r#"[m{i}] "+m"(m{i})"#));
+                body.push_str(&format!(
+                    r"ldrb w9, %[m{i}]\n\tadd w9, w9, #1\n\tstrb w9, %[m{i}]\n\t"
+                ));
+                checks.push(format!("    if (m{i} != {i} + 1) return {};", i + 1));
+            }
+            "rw" => {
+                decls.push(format!("    long m{i} = {i} * 1000;"));
+                outs.push(format!(r#"[m{i}] "+m"(m{i})"#));
+                body.push_str(&format!(
+                    r"ldr x9, %[m{i}]\n\tadd x9, x9, #1\n\tstr x9, %[m{i}]\n\t"
+                ));
+                checks.push(format!("    if (m{i} != {i} * 1000 + 1) return {};", i + 1));
+            }
+            "wo" => {
+                decls.push(format!("    long m{i} = {i} * 1000;"));
+                outs.push(format!(r#"[m{i}] "=m"(m{i})"#));
+                body.push_str(&format!(r"mov x9, #{}\n\tstr x9, %[m{i}]\n\t", i + 7));
+                checks.push(format!("    if (m{i} != {}) return {};", i + 7, i + 1));
+            }
+            _ => {
+                decls.push(format!("    long m{i} = {i} * 1000;"));
+                ins.push(format!(r#"[m{i}] "m"(m{i})"#));
+                body.push_str(&format!(
+                    r"ldr x9, %[m{i}]\n\tldr x10, %[sum]\n\tadd x10, x10, x9\n\tstr x10, %[sum]\n\t"
+                ));
+                sum += i * 1000;
+            }
+        }
+    }
+    format!(
+        r#"#define NI __attribute__((noinline))
+volatile long sink;
+NI void touch(void *p) {{ sink += *(volatile char *)p; }}
+
+NI int many_memory_operands(void)
+{{
     volatile char lo[40000];
-    long x = seed;
-    volatile char hi[40000];
-    long out;
-    touch((void *)lo); touch((void *)hi); touch(&x);
-    __asm__ volatile("ldr %0, %1" : "=r"(out) : "m"(x));
-    __asm__ volatile("str %1, %0" : "=m"(x) : "r"(out + 1));
-    return x + out;
+{decls}
+    long sum;
+    touch((void *)lo);
+    __asm__ volatile(
+        "{body}"
+        : {outs}
+        : {ins}
+        : "x9", "x10", "memory");
+{checks}
+    if (sum != {sum}) return 100;
+    return 0;
+}}
+
+int main(void) {{ return many_memory_operands(); }}
+"#,
+        decls = decls.join("\n"),
+        outs = outs.join(", "),
+        ins = ins.join(", "),
+        checks = checks.join("\n"),
+    )
 }
 
-int main(void) { return asm_far_memory(20) == 41 ? 0 : 1; }
-"#;
-
 #[test]
-fn aarch64_far_inline_asm_memory_operand() {
+fn aarch64_spilled_inline_asm_memory_operands() {
+    let src = spilled_memory_operands_source();
     for opt in ["-O0", "-O2"] {
-        if let Some(code) = compile_and_run_aarch64("a64_far_asm_mem", ASM_FAR_MEMORY, opt) {
+        if let Some(code) = compile_and_run_aarch64("a64_asm_spilled_mem", &src, opt) {
             assert_eq!(code, 0, "at {opt}");
         }
     }
+}
+
+/// The shape: a spilled operand's address is loaded before the template and
+/// the operand names the register, X15 last; an operand whose address is
+/// already in a register still names that register.
+#[test]
+fn aarch64_spilled_inline_asm_memory_operand_shape() {
+    let asm = crate::common::asm_for_at(
+        "a64_asm_mem_shape",
+        &spilled_memory_operands_source(),
+        &["--target", "aarch64-unknown-linux-gnu"],
+    );
+    for reg in ["x16", "x17", "x11", "x15"] {
+        assert!(
+            asm.contains(&format!("    ldr {reg}, [x29, #")),
+            "{reg}:\n{asm}"
+        );
+        assert!(asm.contains(&format!(", [{reg}]")), "{reg}:\n{asm}");
+    }
+    // The legalizer writes X15 while expanding anything, so its load is the
+    // last instruction before the template.
+    let x15 = asm.find("    ldr x15, [x29, #").unwrap();
+    assert!(
+        asm[x15..].lines().nth(1).unwrap().contains("str xzr, ["),
+        "{asm}"
+    );
+    // No operand is a stack slot.
+    assert!(!asm.contains("str xzr, [x29"), "{asm}");
+    assert!(asm.contains("ldrb w9, [x"), "{asm}");
 }

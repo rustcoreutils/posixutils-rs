@@ -980,7 +980,7 @@ pub fn parse_aarch64_class_letter(letter: char) -> Option<OperandConstraint<Reg>
 /// ...), the 32-bit alias (`w0`, `w29`, ...), and special names
 /// (`sp`, `xzr`, `wzr`, `fp`, `lr`). Returns `None` for names the GP
 /// table doesn't know about (V registers, `memory`, `cc`, ...).
-fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
+pub(super) fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
     let s = raw.trim_start_matches('%').to_ascii_lowercase();
     Some(match s.as_str() {
         "x0" | "w0" => Reg::X0,

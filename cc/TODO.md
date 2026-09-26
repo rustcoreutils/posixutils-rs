@@ -70,18 +70,6 @@ live `int`s cost 72 bytes where gcc uses callee-saved registers and none. Slot
 reuse is the larger multiplier, but this is why even leaf functions carry a
 frame.
 
-### aarch64 inline-asm memory operands are printed unlegalized
-
-Every instruction the aarch64 backend builds goes through
-`arch/aarch64/legalize.rs`, which rewrites an offset or immediate no encoding
-holds. An inline-asm memory operand does not: `loc_to_asm_string` substitutes
-a stack slot into the template as the text `[x29, #off]`, and the template's
-own `ldr`/`str` cannot encode that once the slot is far enough from the frame
-pointer. It needs the address in a register, as a memory operand whose
-address already lives in one gets.
-
----
-
 ### `i32` frame arithmetic can still wrap near the ceiling
 
 `grow_frame` accepts a locals area up to `MAX_STACK_OBJECT_BYTES`, but several

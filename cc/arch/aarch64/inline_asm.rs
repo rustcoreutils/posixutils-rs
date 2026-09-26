@@ -11,10 +11,74 @@
 //
 
 use crate::arch::aarch64::codegen::Aarch64CodeGen;
-use crate::arch::aarch64::lir::Aarch64Inst;
-use crate::arch::aarch64::regalloc::{Loc, Reg, VReg};
-use crate::arch::lir::{Directive, FpSize};
-use crate::ir::Instruction;
+use crate::arch::aarch64::legalize::{single_offset_fits, LEGALIZE_REG};
+use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
+use crate::arch::aarch64::regalloc::{parse_gp_clobber_name, Loc, Reg, VReg};
+use crate::arch::lir::{Directive, FpSize, OperandSize};
+use crate::ir::{Instruction, PseudoId};
+
+/// How a memory operand's address reaches the register it is named by.
+enum AddrSetup {
+    /// `reg = base + offset`: the operand *is* this stack object.
+    Object { base: Reg, offset: i32 },
+    /// `reg = [slot]`: the operand's address was spilled there.
+    Spilled(MemAddr),
+    /// `reg = &name`.
+    Global(String),
+}
+
+/// The registers a memory operand's address can be put in, and what goes in
+/// each, for one asm statement.
+///
+/// X16 and X17 first -- AAPCS64 intra-procedure scratch -- then whichever of
+/// the codegen scratches X9-X11 the statement has not already spent, then
+/// X15, the legalization register. None is ever allocated, so none holds an
+/// operand. X15 goes last and its setup is emitted last, because the
+/// legalizer writes it while expanding any earlier setup. A register the
+/// statement names as a clobber is not used: the template would destroy the
+/// address it reads.
+struct AddrRegs {
+    clobbered: Vec<Reg>,
+    ip: Vec<Reg>,
+    legalize_reg_free: bool,
+    given: Vec<(PseudoId, Reg)>,
+    setups: Vec<(Reg, AddrSetup)>,
+}
+
+impl AddrRegs {
+    fn new(clobbers: &[String]) -> Self {
+        let clobbered: Vec<Reg> = clobbers
+            .iter()
+            .filter_map(|c| parse_gp_clobber_name(c))
+            .collect();
+        let ip = [Reg::X17, Reg::X16]
+            .into_iter()
+            .filter(|r| !clobbered.contains(r))
+            .collect();
+        let legalize_reg_free = !clobbered.contains(&LEGALIZE_REG);
+        Self {
+            clobbered,
+            ip,
+            legalize_reg_free,
+            given: Vec::new(),
+            setups: Vec::new(),
+        }
+    }
+
+    /// The next register to hold an address, spending `gp_scratch` -- the
+    /// statement's shared codegen-scratch budget -- only after X16/X17.
+    fn take(&mut self, gp_scratch: &mut Vec<Reg>) -> Option<Reg> {
+        if let Some(r) = self.ip.pop() {
+            return Some(r);
+        }
+        while let Some(r) = gp_scratch.pop() {
+            if !self.clobbered.contains(&r) {
+                return Some(r);
+            }
+        }
+        std::mem::take(&mut self.legalize_reg_free).then_some(LEGALIZE_REG)
+    }
+}
 
 // Inline Assembly Helper Functions
 
@@ -120,6 +184,8 @@ impl Aarch64CodeGen {
         let mut vec_output_moves: Vec<(VReg, Loc, u32)> = Vec::new();
         // Vector operands copied into their scratch before it.
         let mut vec_input_moves: Vec<(VReg, Loc, u32)> = Vec::new();
+        // Memory operands whose address has to be put in a register first.
+        let mut addr_regs = AddrRegs::new(&asm_data.clobbers);
 
         // Process output operands (they go first: %0, %1, etc.)
         for output in &asm_data.outputs {
@@ -168,6 +234,17 @@ impl Aarch64CodeGen {
                 }
                 Loc::Reg(r) => {
                     slots.push(mk(Some(r), None));
+                }
+                _ if requires_mem => {
+                    let mem_str = self.memory_operand(
+                        output.pseudo,
+                        &loc,
+                        op_size,
+                        &mut addr_regs,
+                        &mut gp_scratch,
+                        insn,
+                    );
+                    slots.push(mk(None, Some(mem_str)));
                 }
                 _ => {
                     // Memory or other location - emit as memory operand
@@ -325,6 +402,23 @@ impl Aarch64CodeGen {
                     });
                     slots.push(mk(Some(scratch), None));
                 }
+                _ if requires_mem => {
+                    // A `+m` input shares its output's pseudo, and so its
+                    // address register.
+                    let pseudo = match input.matching_output {
+                        Some(i) if i < num_outputs => asm_data.outputs[i].pseudo,
+                        _ => input.pseudo,
+                    };
+                    let mem_str = self.memory_operand(
+                        pseudo,
+                        &loc,
+                        op_size,
+                        &mut addr_regs,
+                        &mut gp_scratch,
+                        insn,
+                    );
+                    slots.push(mk(None, Some(mem_str)));
+                }
                 _ => {
                     // Memory or other location
                     let mem_str = self.loc_to_asm_string(&loc, op_size);
@@ -348,6 +442,14 @@ impl Aarch64CodeGen {
         // Load vector operands into their scratch before the template runs.
         for (vreg, loc, size) in &vec_input_moves {
             self.emit_vec_load_from_loc(*vreg, loc, *size, insn.pos);
+        }
+
+        // Memory operands' addresses, last: nothing may run between these and
+        // the template, since the legalizer writes X15 expanding anything.
+        let mut setups = std::mem::take(&mut addr_regs.setups);
+        setups.sort_by_key(|(reg, _)| *reg == LEGALIZE_REG);
+        for (reg, setup) in setups {
+            self.emit_addr_setup(reg, setup);
         }
 
         // Substitute %0, %1, %[name], %l0, %l[name], etc. in the template with actual operands
@@ -385,6 +487,80 @@ impl Aarch64CodeGen {
                     // For now, trust that the register allocator has handled this
                 }
             }
+        }
+    }
+
+    /// The text of a memory-class operand whose address is not already in a
+    /// register.
+    ///
+    /// The operand's pseudo is the lvalue's *address*. When the allocator
+    /// spilled it, the slot holds that address, so rendering the slot as
+    /// `[x29, #N]` handed the template the spilled pointer rather than the
+    /// object -- a silent wrong answer. It is loaded into a register instead.
+    /// When the pseudo is a stack object itself, its slot is the operand, and
+    /// is rendered in place if the template's access can encode the offset:
+    /// the operand's own size decides the scaled range, and an operand of no
+    /// natural access size gets only the unscaled one. Otherwise the object's
+    /// address goes in a register.
+    fn memory_operand(
+        &mut self,
+        pseudo: PseudoId,
+        loc: &Loc,
+        size_bits: u32,
+        regs: &mut AddrRegs,
+        gp_scratch: &mut Vec<Reg>,
+        insn: &Instruction,
+    ) -> String {
+        if let Some(&(_, reg)) = regs.given.iter().find(|(p, _)| *p == pseudo) {
+            return format!("[{}]", asm_reg_name_64(reg));
+        }
+        let setup = match loc {
+            Loc::Stack(_) | Loc::IncomingArg(_) if self.pseudos.is_sym(pseudo) => {
+                let (base, offset) = self.loc_addr_parts(loc).unwrap();
+                let bytes = i64::from(size_bits / 8);
+                let fits = if matches!(bytes, 1 | 2 | 4 | 8 | 16) {
+                    single_offset_fits(offset.into(), bytes)
+                } else {
+                    (-256..=255).contains(&offset)
+                };
+                if fits {
+                    return self.loc_to_asm_string(loc, size_bits);
+                }
+                AddrSetup::Object { base, offset }
+            }
+            Loc::Stack(_) | Loc::IncomingArg(_) => AddrSetup::Spilled(self.loc_mem(loc).unwrap()),
+            Loc::Global(name) => AddrSetup::Global(name.clone()),
+            other => return self.loc_to_asm_string(other, size_bits),
+        };
+        let Some(reg) = regs.take(gp_scratch) else {
+            crate::diag::error(
+                insn.pos.unwrap_or_default(),
+                "too many memory operands in one asm statement need their address \
+                 in a register; c17 has six scratch registers to give, fewer if \
+                 the statement uses or clobbers them",
+            );
+            return "[sp]".to_string();
+        };
+        regs.given.push((pseudo, reg));
+        regs.setups.push((reg, setup));
+        format!("[{}]", asm_reg_name_64(reg))
+    }
+
+    /// Put a memory operand's address in `reg`.
+    fn emit_addr_setup(&mut self, reg: Reg, setup: AddrSetup) {
+        match setup {
+            AddrSetup::Object { base, offset } => self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: base,
+                src2: GpOperand::Imm(offset.into()),
+                dst: reg,
+            }),
+            AddrSetup::Spilled(addr) => self.push_lir(Aarch64Inst::Ldr {
+                size: OperandSize::B64,
+                addr,
+                dst: reg,
+            }),
+            AddrSetup::Global(name) => self.emit_load_addr(&name, reg),
         }
     }
 

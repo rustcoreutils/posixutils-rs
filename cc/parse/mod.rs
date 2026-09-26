@@ -10,13 +10,16 @@
 //
 
 mod aggregate;
+mod asm;
 pub mod ast;
+mod attribute;
 mod builtin_expr;
 mod declaration;
 mod declarator;
 mod expr_check;
 mod expression;
 pub mod parser;
+mod statement;
 mod toplevel;
 mod typename;
 

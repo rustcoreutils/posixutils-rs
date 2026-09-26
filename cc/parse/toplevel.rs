@@ -31,7 +31,7 @@ struct DeclSpecs {
     storage_class: TypeModifiers,
     is_typedef: bool,
     /// The attributes the specifiers carry, which every declarator gets.
-    attrs: super::parser::SpecifierAttrs,
+    attrs: super::attribute::SpecifierAttrs,
 }
 
 impl Parser<'_> {

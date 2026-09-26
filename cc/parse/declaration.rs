@@ -556,6 +556,7 @@ impl Parser<'_> {
         &mut self,
         forbid_storage_class: bool,
     ) -> ParseResult<Declaration> {
+        self.reset_pending_declaration_state();
         // Check for _Static_assert first (C11)
         if self.is_static_assert() {
             self.parse_static_assert()?;
@@ -625,6 +626,7 @@ impl Parser<'_> {
         }
         // For struct/union types with tags, use existing TypeId to preserve forward declarations
         let base_type_id = self.intern_type_with_tag(&base_type);
+        let spec_attrs = self.specifier_attrs();
 
         // Parse declarators
         let mut declarators = Vec::new();
@@ -659,6 +661,9 @@ impl Parser<'_> {
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
                 typ = self.apply_pending_type_attrs(typ);
+                if has_name && !is_typedef && self.types.kind(typ) == TypeKind::Function {
+                    self.accumulate_fn_attrs(name);
+                }
                 let validated_align = self.validated_explicit_align(typ)?;
 
                 // Bind variable to symbol table BEFORE parsing initializer.
@@ -813,6 +818,7 @@ impl Parser<'_> {
 
                 if self.is_special(b',') {
                     self.advance();
+                    self.begin_declarator(&spec_attrs);
                     // An attribute may come before the next declarator, where
                     // it belongs to that declarator. See the same call in
                     // `parse_remaining_declarators`.

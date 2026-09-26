@@ -1949,10 +1949,14 @@ impl<'a> Linearizer<'a> {
 
     /// The address of a value that has just been materialized.
     ///
-    /// A `Sym`'s slot holds the value itself; anything else already holds a
-    /// pointer to it. Deciding here, where the pseudo's kind is known, is what
-    /// lets every consumer treat the result as a plain address -- handing one
-    /// the value's own bits instead gets them dereferenced as an address.
+    /// A `Sym`'s slot holds the value itself. Any other pseudo of a struct or
+    /// union that fits in a register holds the aggregate's *value* -- the IR's
+    /// convention, which `linearize_ident` and friends follow -- so it is
+    /// stored to a temporary whose address is returned. Anything else already
+    /// holds a pointer. Deciding here, where the pseudo's kind is known, is
+    /// what lets every consumer treat the result as a plain address; handing
+    /// one a small struct's bits instead got them dereferenced as an address,
+    /// which is how `t = c ? u : v` on an eight-byte struct segfaulted.
     pub(crate) fn rvalue_addr(&mut self, val: PseudoId, typ: TypeId) -> PseudoId {
         let slot_is_the_value = self
             .current_func
@@ -1960,12 +1964,27 @@ impl<'a> Linearizer<'a> {
             .and_then(|f| f.get_pseudo(val))
             .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
         if !slot_is_the_value {
-            return val;
+            if !self.aggregate_travels_by_value(typ) {
+                return val;
+            }
+            let size = self.types.size_bits(typ);
+            let tmp = self.frame_temp("__rvalue", typ);
+            self.emit(Instruction::store(val, tmp, 0, typ, size));
+            return self.rvalue_addr(tmp, typ);
         }
         let addr = self.alloc_reg_pseudo();
         let ptr_type = self.types.pointer_to(typ);
         self.emit(Instruction::sym_addr(addr, val, ptr_type));
         addr
+    }
+
+    /// Whether a struct or union of this type travels in the IR as its value
+    /// rather than its address: it does when it fits in one register, the
+    /// threshold `linearize_ident` applies. A complex value always travels by
+    /// address, and is not asked about here.
+    pub(crate) fn aggregate_travels_by_value(&self, typ: TypeId) -> bool {
+        matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union)
+            && (1..=64).contains(&self.types.size_bits(typ))
     }
 
     /// Linearize an expression as an lvalue (get its address)
@@ -4307,6 +4326,22 @@ impl<'a> Linearizer<'a> {
     /// thing left to exclude is a type there is nothing to convert between --
     /// `void`, a struct, a pointer. Complex is excluded deliberately: widening
     /// it is a separate question from this one.
+    /// One arm of a non-complex conditional, ready to merge: an aggregate's
+    /// address, or a scalar converted to the result type.
+    fn conditional_arm(
+        &mut self,
+        val: crate::ir::PseudoId,
+        arm: &Expr,
+        result_typ: crate::types::TypeId,
+        aggregate: bool,
+    ) -> crate::ir::PseudoId {
+        if aggregate {
+            return self.rvalue_addr(val, result_typ);
+        }
+        let arm_typ = self.expr_type(arm);
+        self.convert_conditional_arm(val, arm_typ, result_typ)
+    }
+
     fn convert_conditional_arm(
         &mut self,
         val: crate::ir::PseudoId,
@@ -4433,26 +4468,34 @@ impl<'a> Linearizer<'a> {
             return self.linearize_complex_ternary(cond, then_expr, else_expr, result_typ);
         }
 
-        let size = if self.types.kind(result_typ) == TypeKind::Function {
-            64
+        // A struct or union too big for a register travels by address, so
+        // its arms are merged as addresses: a pointer-sized select or phi of
+        // `rvalue_addr`s. It was merged at the aggregate's own size -- a phi
+        // of 128 bits or more over pointers. One that fits in a register
+        // travels by value and is merged as one, below.
+        let aggregate = matches!(
+            self.types.kind(result_typ),
+            TypeKind::Struct | TypeKind::Union
+        ) && !self.aggregate_travels_by_value(result_typ);
+        let (merge_typ, size) = if aggregate {
+            (self.types.pointer_to(result_typ), self.target.pointer_width)
+        } else if self.types.kind(result_typ) == TypeKind::Function {
+            (result_typ, 64)
         } else {
-            self.types.size_bits(result_typ)
+            (result_typ, self.types.size_bits(result_typ))
         };
 
         if self.is_pure_expr(then_expr) && self.is_pure_expr(else_expr) && size <= 64 {
             // Pure: use Select instruction (enables cmov/csel)
             let cond_bool = self.linearize_condition(cond);
-            let mut then_val = self.linearize_expr(then_expr);
-            let mut else_val = self.linearize_expr(else_expr);
-
-            let then_typ = self.expr_type(then_expr);
-            let else_typ = self.expr_type(else_expr);
-            then_val = self.convert_conditional_arm(then_val, then_typ, result_typ);
-            else_val = self.convert_conditional_arm(else_val, else_typ, result_typ);
+            let then_val = self.linearize_expr(then_expr);
+            let else_val = self.linearize_expr(else_expr);
+            let then_val = self.conditional_arm(then_val, then_expr, result_typ, aggregate);
+            let else_val = self.conditional_arm(else_val, else_expr, result_typ, aggregate);
 
             let result = self.alloc_pseudo();
             self.emit(Instruction::select(
-                result, cond_bool, then_val, else_val, result_typ, size,
+                result, cond_bool, then_val, else_val, merge_typ, size,
             ));
             result
         } else {
@@ -4469,17 +4512,15 @@ impl<'a> Linearizer<'a> {
             self.link_bb(cond_end_bb, else_bb);
 
             self.switch_bb(then_bb);
-            let mut then_val = self.linearize_expr(then_expr);
-            let then_typ = self.expr_type(then_expr);
-            then_val = self.convert_conditional_arm(then_val, then_typ, result_typ);
+            let then_val = self.linearize_expr(then_expr);
+            let then_val = self.conditional_arm(then_val, then_expr, result_typ, aggregate);
             let then_end_bb = self.current_bb.unwrap();
             self.emit(Instruction::br(merge_bb));
             self.link_bb(then_end_bb, merge_bb);
 
             self.switch_bb(else_bb);
-            let mut else_val = self.linearize_expr(else_expr);
-            let else_typ = self.expr_type(else_expr);
-            else_val = self.convert_conditional_arm(else_val, else_typ, result_typ);
+            let else_val = self.linearize_expr(else_expr);
+            let else_val = self.conditional_arm(else_val, else_expr, result_typ, aggregate);
             let else_end_bb = self.current_bb.unwrap();
             self.emit(Instruction::br(merge_bb));
             self.link_bb(else_end_bb, merge_bb);
@@ -4490,12 +4531,12 @@ impl<'a> Linearizer<'a> {
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(phi_pseudo);
             }
-            let mut phi_insn = Instruction::phi(result, result_typ, size);
+            let mut phi_insn = Instruction::phi(result, merge_typ, size);
             let phisrc1 =
-                self.emit_phi_source(then_end_bb, then_val, result, merge_bb, result_typ, size);
+                self.emit_phi_source(then_end_bb, then_val, result, merge_bb, merge_typ, size);
             phi_insn.phi_list.push((then_end_bb, phisrc1));
             let phisrc2 =
-                self.emit_phi_source(else_end_bb, else_val, result, merge_bb, result_typ, size);
+                self.emit_phi_source(else_end_bb, else_val, result, merge_bb, merge_typ, size);
             phi_insn.phi_list.push((else_end_bb, phisrc2));
             self.emit(phi_insn);
 

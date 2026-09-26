@@ -30,6 +30,8 @@ struct DeclSpecs {
     modifiers: TypeModifiers,
     storage_class: TypeModifiers,
     is_typedef: bool,
+    /// The attributes the specifiers carry, which every declarator gets.
+    attrs: super::parser::SpecifierAttrs,
 }
 
 impl Parser<'_> {
@@ -171,7 +173,18 @@ impl Parser<'_> {
         body
     }
 
-    fn accumulate_fn_attrs(&mut self, name: StringId) -> crate::parse::ast::FunctionAttrs {
+    /// Record the attributes pending for a function declarator under its name.
+    ///
+    /// Every path that declares a function calls this -- the first declarator,
+    /// a grouped one, a later one in the list, one at block scope -- because a
+    /// function's attributes are gathered across all of its declarations and
+    /// read back by name, by its definition and by `__alignof__`. A path that
+    /// skipped it dropped them: `void f(void), g(void)
+    /// __attribute__((aligned(32)));` left `g` unaligned.
+    pub(super) fn accumulate_fn_attrs(
+        &mut self,
+        name: StringId,
+    ) -> crate::parse::ast::FunctionAttrs {
         // An `aligned` written before the declaration specifiers or after the
         // declarator arrives on the object channels, since the parser cannot
         // yet tell it is declaring a function; the `_Alignas` keyword on the
@@ -355,14 +368,7 @@ impl Parser<'_> {
                 // inside a function has always worked, because block scope
                 // runs one list walker for every declarator it sees.
                 let list_base_id = self.types.intern(list_base.clone());
-                self.parse_remaining_declarators(
-                    list_base,
-                    list_base_id,
-                    specs.is_typedef,
-                    specs.storage_class,
-                    specs.pos,
-                    &mut declarators,
-                )?;
+                self.parse_remaining_declarators(list_base, list_base_id, specs, &mut declarators)?;
                 self.expect_special(b';')?;
                 return Ok(Some(ExternalDecl::Declaration(Declaration { declarators })));
             }
@@ -385,7 +391,11 @@ impl Parser<'_> {
     /// after a `section(...)` function was emitted into that function's
     /// section, and the conflicting "ax"/"aw" flags made the assembler reject
     /// the file outright.
-    fn reset_pending_declaration_state(&mut self) {
+    /// Clear what a previous declaration left pending. Shared with block
+    /// scope: a declaration inside a function body otherwise started from the
+    /// enclosing definition's attributes, so a local `void m(void);` inherited
+    /// its `noinline` or `aligned`.
+    pub(super) fn reset_pending_declaration_state(&mut self) {
         // Clear pending alignment from previous declaration
         self.pending_alignas = None;
         self.pending_alignas_kw = None;
@@ -411,8 +421,6 @@ impl Parser<'_> {
         // function's section, and the conflicting "ax"/"aw" flags made the
         // assembler reject the file outright.
         self.pending_symbol_attrs = Default::default();
-
-        // Check for _Static_assert first (C11)
     }
 
     /// A file-scope function declarator: `int f(int)` as a declaration, a
@@ -624,9 +632,7 @@ impl Parser<'_> {
                     self.parse_remaining_declarators(
                         base_type,
                         base_type_id,
-                        specs.is_typedef,
-                        specs.storage_class,
-                        specs.pos,
+                        specs,
                         &mut first_declarator,
                     )?;
                     self.expect_special(b';')?;
@@ -708,6 +714,7 @@ impl Parser<'_> {
             modifiers: base_type.modifiers,
             storage_class,
             is_typedef,
+            attrs: self.specifier_attrs(),
         };
 
         // Check for standalone type definition (e.g., "enum Color { ... };")
@@ -1021,14 +1028,7 @@ impl Parser<'_> {
         });
 
         // Handle additional declarators
-        self.parse_remaining_declarators(
-            &base_type,
-            base_type_id,
-            is_typedef,
-            storage_class,
-            decl_pos,
-            &mut declarators,
-        )?;
+        self.parse_remaining_declarators(&base_type, base_type_id, &specs, &mut declarators)?;
 
         self.expect_special(b';')?;
 
@@ -1059,13 +1059,14 @@ impl Parser<'_> {
         &mut self,
         base_type: &Type,
         base_type_id: TypeId,
-        is_typedef: bool,
-        storage_class: TypeModifiers,
-        decl_pos: Position,
+        specs: &DeclSpecs,
         declarators: &mut Vec<InitDeclarator>,
     ) -> ParseResult<()> {
+        let (is_typedef, storage_class, decl_pos) =
+            (specs.is_typedef, specs.storage_class, specs.pos);
         while self.is_special(b',') {
             self.advance();
+            self.begin_declarator(&specs.attrs);
             // An attribute may also come *before* a declarator in the list --
             // `int a, __attribute__((unused)) b;` -- where it belongs to that
             // declarator. Both loops skipped extensions only after
@@ -1093,6 +1094,10 @@ impl Parser<'_> {
 
             // Validate explicit alignment for this declarator's type (C11 6.7.5)
             decl_type = self.apply_pending_type_attrs(decl_type);
+            if !is_typedef && self.types.kind(decl_type) == TypeKind::Function {
+                self.reject_alignas_in("a function");
+                self.accumulate_fn_attrs(decl_name);
+            }
             let decl_validated_align = self.validated_explicit_align(decl_type)?;
 
             // Bind variable to symbol table BEFORE parsing initializer (C99 6.2.1p7)

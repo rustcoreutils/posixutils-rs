@@ -7017,8 +7017,8 @@ fn test_asm_goto_output_written_back_on_the_label_edge() {
 ///
 /// Addressed in place it needs no register; as an address value it
 /// competed for one and, once spilled, the backend substituted the spill
-/// slot as the operand. The address arithmetic the lvalue produced is
-/// dropped, so nothing is left to keep the dead address alive.
+/// slot as the operand. The address arithmetic the lvalue produced is left
+/// for DCE, which removes it once nothing reads it.
 #[test]
 fn test_asm_memory_operand_names_its_object() {
     let mut ctx = TestContext::new();
@@ -7086,14 +7086,55 @@ fn test_asm_memory_operand_names_its_object() {
         );
         assert_eq!(c.offset, 0);
     }
+    let mut func = func.clone();
+    crate::ir::dce::run(&mut func);
     assert!(
         !func
             .blocks
             .iter()
             .flat_map(|bb| bb.insns.iter())
             .any(|i| i.op == Opcode::SymAddr),
-        "the operand's address arithmetic should be gone"
+        "nothing reads the operand's address arithmetic, so DCE removes it"
     );
+}
+
+/// The address arithmetic behind a memory operand that names an object is
+/// not the linearizer's to delete: `"=m"(*(q = &arr[2]))` also stores that
+/// address into `q`, before the asm. Deleting it left the store reading an
+/// undefined register, so `q == &arr[2]` was false.
+#[test]
+fn test_asm_memory_operand_keeps_an_address_something_else_reads() {
+    let src = "int arr[4]; int *q;\n\
+               void f(void) { __asm__ volatile(\"\" : \"=m\"(*(q = &arr[2]))); }\n";
+    let module = linearize_source(src, &Target::host());
+    let func = module.functions.iter().find(|f| f.name == "f").expect("f");
+    let insns: Vec<&Instruction> = func.blocks.iter().flat_map(|bb| bb.insns.iter()).collect();
+    // Every pseudo a live instruction reads must be defined by a live one.
+    let defined: std::collections::HashSet<PseudoId> = insns
+        .iter()
+        .filter(|i| i.op != Opcode::Nop)
+        .filter_map(|i| i.target)
+        .chain(
+            func.pseudos
+                .iter()
+                .filter(|p| {
+                    !matches!(
+                        p.kind,
+                        crate::ir::PseudoKind::Reg(_) | crate::ir::PseudoKind::Phi(_)
+                    )
+                })
+                .map(|p| p.id),
+        )
+        .collect();
+    for insn in insns.iter().filter(|i| i.op == Opcode::Store) {
+        for s in &insn.src {
+            assert!(
+                defined.contains(s),
+                "{:?} reads {s:?}, which nothing defines",
+                insn.op
+            );
+        }
+    }
 }
 
 /// Parse `src` and linearize it for `target`.
@@ -7321,4 +7362,32 @@ fn test_ifconv_collapses_nested_and_sequential_diamonds() {
         .collect();
     let src = format!("int g(int x) {{\n  int s = 0;\n{many}  return s;\n}}\n");
     assert_eq!(chain(&src, "g"), 0);
+}
+
+/// A register-sized struct travels through the IR as its value, so a `?:`
+/// between two of them selects values, and the assignment consuming the
+/// result must not read through it as though it were an address. It did:
+/// `rvalue_addr` passed any non-`Sym` pseudo through as a pointer, and `t = c
+/// ? u : v` on an eight-byte struct dereferenced the struct's own bits.
+#[test]
+fn test_register_sized_struct_through_conditional_is_not_dereferenced() {
+    let src = "struct S { int a, b; };\n\
+               struct S t, u, v; int c;\n\
+               void f(void) { t = c ? u : v; }\n";
+    let module = linearize_source(src, &Target::host());
+    let func = module.functions.iter().find(|f| f.name == "f").expect("f");
+    let insns: Vec<&Instruction> = func.blocks.iter().flat_map(|bb| bb.insns.iter()).collect();
+    let merged: std::collections::HashSet<PseudoId> = insns
+        .iter()
+        .filter(|i| matches!(i.op, Opcode::Select | Opcode::Phi))
+        .filter_map(|i| i.target)
+        .collect();
+    assert!(!merged.is_empty(), "expected the arms to be merged");
+    for insn in insns.iter().filter(|i| i.op == Opcode::Load) {
+        assert!(
+            !merged.contains(&insn.src[0]),
+            "a load reads through the merged struct value {:?}",
+            insn.src[0]
+        );
+    }
 }

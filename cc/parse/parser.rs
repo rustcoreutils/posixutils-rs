@@ -1415,6 +1415,23 @@ impl<'a> Parser<'a> {
     /// *call site*, so this fails safe -- a later declarator gets `Unknown`
     /// even where gcc would spread a declaration-level attribute across all
     /// of them, which costs precision and nothing else.
+    /// The attributes a declaration's specifiers carry, to hand to each of its
+    /// declarators in turn. See [`SpecifierAttrs`].
+    pub(super) fn specifier_attrs(&self) -> SpecifierAttrs {
+        SpecifierAttrs {
+            fn_attrs: self.pending_fn_attrs.clone(),
+            symbol_attrs: self.pending_symbol_attrs.clone(),
+        }
+    }
+
+    /// Start the next declarator of a list: it has the specifiers' attributes
+    /// and none of the previous declarator's.
+    pub(super) fn begin_declarator(&mut self, spec: &SpecifierAttrs) {
+        self.pending_fn_attrs = spec.fn_attrs.clone();
+        self.pending_symbol_attrs = spec.symbol_attrs.clone();
+        self.pending_declarator_align = None;
+    }
+
     pub(super) fn take_pending_fn_effect(&mut self) -> crate::parse::ast::MemEffect {
         std::mem::replace(
             &mut self.pending_fn_attrs.effect,
@@ -1678,6 +1695,23 @@ impl<'a> Parser<'a> {
             }
         }
     }
+}
+
+/// The attributes written among a declaration's specifiers.
+///
+/// gcc applies those to every declarator in the list -- in
+/// `__attribute__((aligned(32))) void f(void), g(void);` both functions are
+/// aligned, and in `__attribute__((weak)) int a, b;` both objects are weak --
+/// while an attribute written after a declarator belongs to that declarator
+/// alone. The parser collects both kinds into the same pending slots, so the
+/// specifiers' share is snapshotted before the first declarator and restored
+/// for each one after it ([`Parser::begin_declarator`]). Without it a later
+/// declarator either lost the specifiers' attributes or inherited the
+/// previous declarator's.
+#[derive(Clone, Default)]
+pub(super) struct SpecifierAttrs {
+    fn_attrs: crate::parse::ast::FunctionAttrs,
+    symbol_attrs: crate::parse::ast::SymbolAttrs,
 }
 
 // Statement Parsing

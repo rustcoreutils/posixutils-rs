@@ -587,3 +587,45 @@ fn c11_alignment_of_a_function_aarch64() {
         }
     }
 }
+
+/// `aligned` on a function declared after the first declarator of a list, or
+/// at block scope, is recorded like any other. Only the first declarator and a
+/// grouped one folded a function's attributes in, so `void f(void), g(void)
+/// __attribute__((aligned(32)));` left `g` unaligned with `__alignof__` 1.
+/// The attribute written after a declarator belongs to it alone, which `f`
+/// and `h` check by staying unaligned.
+const FUNCTION_ALIGNMENT_LATER_DECLARATOR: &str = r#"
+void f(void), g(void) __attribute__((aligned(32)));
+void f(void) {}
+void g(void) {}
+static void h(void), k(void) __attribute__((aligned(64)));
+static void h(void) {}
+static void k(void) {}
+int main(void)
+{
+    void m(void) __attribute__((aligned(16))), n(void) __attribute__((aligned(128)));
+    if (__alignof__(g) != 32) return 1;
+    if ((unsigned long)g % 32) return 2;
+    if (__alignof__(k) != 64) return 3;
+    if ((unsigned long)k % 64) return 4;
+    if (__alignof__(n) != 128) return 5;
+    if ((unsigned long)n % 128) return 6;
+    f(); h();
+    return 0;
+}
+void m(void) {}
+void n(void) {}
+"#;
+
+#[test]
+fn c11_alignment_of_a_function_in_a_declarator_list() {
+    let src = FUNCTION_ALIGNMENT_LATER_DECLARATOR;
+    assert_eq!(compile_and_run("fn_align_list", src, &[]), 0);
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run("fn_align_list_o2", src, &opts), 0);
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64("fn_align_list_a64", src, opt) {
+            assert_eq!(code, 0, "aarch64 at {opt}");
+        }
+    }
+}

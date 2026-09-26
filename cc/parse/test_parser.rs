@@ -6080,3 +6080,60 @@ fn test_tagless_composites_have_identity() {
         "const T and T share a definition"
     );
 }
+
+/// Every declarator of a list gets the attributes written among the
+/// specifiers, and only its own trailing ones -- gcc's rule. A function
+/// declarator after the first, or at block scope, has its attributes
+/// recorded like the first one's: `g` and `k` below lost their `aligned`,
+/// `a2` lost the specifiers' one, and `wb` its `weak`.
+#[test]
+fn test_attributes_follow_their_declarator_in_a_list() {
+    let src = "void f(void), g(void) __attribute__((aligned(32)));\n\
+               __attribute__((aligned(16))) void a1(void), a2(void);\n\
+               void b1(void) __attribute__((aligned(64))), b2(void);\n\
+               __attribute__((weak)) int wa, wb;\n\
+               void f(void) {} void g(void) {} void a1(void) {} void a2(void) {}\n\
+               void b1(void) {} void b2(void) {}\n\
+               void outer(void) { void k(void) __attribute__((aligned(128))), m(void); }\n\
+               void k(void) {} void m(void) {}\n";
+    let (tu, _types, strings, symbols) = parse_tu(src).unwrap();
+    let aligns: std::collections::BTreeMap<String, Option<u32>> = tu
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ExternalDecl::FunctionDef(f) => Some((strings.get(f.name).to_string(), f.attrs.align)),
+            _ => None,
+        })
+        .collect();
+    let expect: std::collections::BTreeMap<String, Option<u32>> = [
+        ("f", None),
+        ("g", Some(32)),
+        ("a1", Some(16)),
+        ("a2", Some(16)),
+        ("b1", Some(64)),
+        ("b2", None),
+        ("outer", None),
+        ("k", Some(128)),
+        ("m", None),
+    ]
+    .into_iter()
+    .map(|(n, a)| (n.to_string(), a))
+    .collect();
+    assert_eq!(aligns, expect);
+
+    let weak: Vec<(String, bool)> = tu
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ExternalDecl::Declaration(d) => Some(d.declarators.iter()),
+            _ => None,
+        })
+        .flatten()
+        .map(|d| {
+            let name = strings.get(symbols.get(d.symbol).name).to_string();
+            (name, d.symbol_attrs.weak)
+        })
+        .filter(|(n, _)| n.starts_with('w'))
+        .collect();
+    assert_eq!(weak, [("wa".to_string(), true), ("wb".to_string(), true)]);
+}

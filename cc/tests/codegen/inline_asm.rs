@@ -2541,3 +2541,51 @@ fn codegen_inline_asm_operands_avoid_clobbered_registers() {
         }
     }
 }
+
+/// A memory operand's address arithmetic can have readers besides the asm:
+/// `"=m"(*(q = &arr[2]))` stores the address into `q` before the statement.
+/// The linearizer deleted that arithmetic once the operand named the object
+/// directly, so the store wrote an undefined register and `q != &arr[2]`
+/// afterwards -- for a global, a local and a struct member alike. It is left
+/// for DCE now, which knows its readers.
+const ASM_OPERAND_ADDRESS_SHARED: &str = r#"
+int garr[4];
+int *gq;
+struct S { int x; int y[3]; } gs;
+int main(void)
+{
+    int larr[4];
+    int *q, *r, *s;
+    __asm__ volatile("" : "=m"(*(gq = &garr[2])));
+    if (gq != &garr[2]) return 1;
+    __asm__ volatile("" : "=m"(*(q = &larr[1])));
+    if (q != &larr[1]) return 2;
+    __asm__ volatile("" : "=m"(*(r = &gs.y[1])));
+    if (r != &gs.y[1]) return 3;
+    s = &larr[3];
+    __asm__ volatile("" : "+m"(*s));
+    *s = 7;
+    if (larr[3] != 7) return 4;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_inline_asm_operand_address_used_elsewhere() {
+    assert_eq!(
+        compile_and_run("asm_addr_shared", ASM_OPERAND_ADDRESS_SHARED, &[]),
+        0
+    );
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(
+        compile_and_run("asm_addr_shared_o2", ASM_OPERAND_ADDRESS_SHARED, &opts),
+        0
+    );
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) =
+            compile_and_run_aarch64("asm_addr_shared_a64", ASM_OPERAND_ADDRESS_SHARED, opt)
+        {
+            assert_eq!(code, 0, "aarch64 at {opt}");
+        }
+    }
+}

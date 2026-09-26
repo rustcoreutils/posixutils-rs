@@ -14056,3 +14056,71 @@ long take(int a, struct big b, int c, struct big d, int e)
 {asm}"
     );
 }
+
+/// A struct or union through `?:`, and every other expression that yields one,
+/// on both sides of the eight-byte line where the IR stops carrying an
+/// aggregate's value and starts carrying its address.
+///
+/// `t = c ? v : u` on an eight-byte struct segfaulted on both targets: the
+/// arms were loaded as values (the convention for a register-sized aggregate)
+/// and the assignment then dereferenced the selected value as an address,
+/// because `rvalue_addr` passed any non-`Sym` pseudo through as a pointer. It
+/// now spills a register-sized aggregate value to a temporary. A larger `?:`
+/// merged its arms' addresses at the aggregate's own width, and a struct
+/// assignment expression yielded an address at every size; both follow the
+/// convention now. Covered: assignment expressions, the comma operator,
+/// statement expressions, nested and impure (call) arms, `?:` as an argument,
+/// a return value, a member's base and an initializer, and unions.
+const AGGREGATE_VALUE_SHAPES: &str = r#"
+#define NI __attribute__((noinline))
+#define T(N) \
+struct s##N { unsigned char c[N]; }; \
+union u##N { unsigned char c[N]; long pad; }; \
+static int calls##N; \
+NI struct s##N mk##N(int base) { struct s##N r; int i; calls##N++; for (i = 0; i < N; i++) r.c[i] = (unsigned char)(base + i); return r; } \
+NI int sum##N(struct s##N s) { int i, t = 0; for (i = 0; i < N; i++) t += s.c[i]; return t; } \
+NI struct s##N ret##N(int k, struct s##N a, struct s##N b) { return k ? a : b; } \
+NI int test##N(void) { \
+    struct s##N t, u = mk##N(1), v = mk##N(101), w; int i, k = 1; \
+    w = (t = u); \
+    for (i = 0; i < N; i++) if (w.c[i] != i + 1 || t.c[i] != i + 1) return 1; \
+    t = (k, v); \
+    for (i = 0; i < N; i++) if (t.c[i] != i + 101) return 2; \
+    t = ({ struct s##N z = u; z; }); \
+    for (i = 0; i < N; i++) if (t.c[i] != i + 1) return 3; \
+    t = k ? (k > 5 ? u : v) : u; \
+    for (i = 0; i < N; i++) if (t.c[i] != i + 101) return 4; \
+    calls##N = 0; \
+    t = k ? mk##N(50) : mk##N(60); \
+    if (calls##N != 1) return 5; \
+    for (i = 0; i < N; i++) if (t.c[i] != i + 50) return 6; \
+    if (sum##N(k ? u : v) != sum##N(u)) return 7; \
+    t = ret##N(0, u, v); \
+    for (i = 0; i < N; i++) if (t.c[i] != i + 101) return 8; \
+    if ((k ? u : v).c[N - 1] != N) return 9; \
+    struct s##N x = k ? v : u; \
+    for (i = 0; i < N; i++) if (x.c[i] != i + 101) return 10; \
+    union u##N p, q, r; p.c[0] = 7; q.c[0] = 9; r = k ? q : p; if (r.c[0] != 9) return 11; \
+    return 0; }
+T(1) T(2) T(4) T(7) T(8) T(9) T(12) T(16) T(17) T(24) T(40)
+int main(void)
+{
+    int r;
+#define C(N) if ((r = test##N())) return N * 20 + r;
+    C(1) C(2) C(4) C(7) C(8) C(9) C(12) C(16) C(17) C(24) C(40)
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_aggregate_through_conditional_and_other_rvalues() {
+    let src = AGGREGATE_VALUE_SHAPES;
+    assert_eq!(compile_and_run("aggregate_rvalues", src, &[]), 0);
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run("aggregate_rvalues_o2", src, &opts), 0);
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64("aggregate_rvalues_a64", src, opt) {
+            assert_eq!(code, 0, "aarch64 at {opt}");
+        }
+    }
+}

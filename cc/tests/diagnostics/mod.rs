@@ -5551,6 +5551,33 @@ int main(void)
     assert_eq!(compile_and_run("vector_storage", src, &[]), 0);
 }
 
+/// Naming a vector where its value is discarded is not a value use. `(void)v`
+/// is how an unused variable is marked used, and it was refused: the cast
+/// check did not tell a cast to `void` from a conversion. An expression
+/// statement, the left operand of a comma, and the operands of `sizeof`,
+/// `__alignof__` and `__typeof__` read nothing either.
+#[test]
+fn diagnostics_vector_discarded_value_is_accepted() {
+    let src = r#"
+typedef int V __attribute__((vector_size(8)));
+int main(void)
+{
+    V v, w;
+    (void)v;
+    v;
+    (v, 1);
+    (void)sizeof v;
+    (void)__alignof__(v);
+    __typeof__(v) u;
+    (void)u;
+    v[0] = 3;
+    w[1] = v[0];
+    return w[1] == 3 ? 0 : 1;
+}
+"#;
+    assert_eq!(compile_and_run("vector_discarded", src, &[]), 0);
+}
+
 /// `__builtin_signbit` takes any real floating type, as gcc's does, and
 /// refuses anything else as gcc does. A `long double` used to reach the
 /// `double` emitter unconverted.

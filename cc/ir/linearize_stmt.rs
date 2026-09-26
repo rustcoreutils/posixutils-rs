@@ -3145,12 +3145,17 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// offset into it, when it is one: a local, a parameter, a static or a
     /// global, reached through members and constant subscripts.
     ///
-    /// The address arithmetic `linearize_lvalue` just emitted for it is
-    /// dropped and the operand names the object's `Sym` instead, so the
-    /// backend addresses the object where it lives and no register is spent
-    /// on it -- see [`AsmConstraint::offset`]. Anything else keeps its address
-    /// pseudo: a pointer computed at run time, a VLA's storage, a function.
-    fn asm_memory_operand(&mut self, addr: PseudoId) -> (PseudoId, i64) {
+    /// The operand then names the object's `Sym`, so the backend addresses the
+    /// object where it lives and no register is spent on it -- see
+    /// [`AsmConstraint::offset`]. Anything else keeps its address pseudo: a
+    /// pointer computed at run time, a VLA's storage, a function.
+    ///
+    /// The address arithmetic `linearize_lvalue` emitted is left alone. It
+    /// may have readers besides the operand -- `"=m"(*(q = &arr[2]))` stores
+    /// it into `q` before the asm -- and this cannot see every reader, so
+    /// dropping it wrote an undefined register into `q`. Once the operand no
+    /// longer names it, DCE removes whatever nothing else reads.
+    fn asm_memory_operand(&self, addr: PseudoId) -> (PseudoId, i64) {
         let Some(bb_id) = self.current_bb else {
             return (addr, 0);
         };
@@ -3170,15 +3175,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             defs: &defs,
             types: self.types,
         };
-        let mut chain = Vec::new();
-        let Some((sym, offset)) = walk.object(addr, &mut chain) else {
-            return (addr, 0);
-        };
-        let bb = self.get_or_create_bb(bb_id);
-        for i in chain {
-            bb.insns[i].kill();
-        }
-        (sym, offset)
+        walk.object(addr).unwrap_or((addr, 0))
     }
 
     /// Parse an asm constraint string to extract flags.
@@ -3594,8 +3591,8 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
 
 /// Follows the address arithmetic of one memory operand back to the object
 /// it names. Only within the block being built, where `linearize_lvalue` has
-/// just emitted it; every instruction it follows is recorded in `chain` so
-/// the caller can drop the arithmetic it no longer needs.
+/// just emitted it. It only reads: the arithmetic stays for whatever else
+/// uses it, and DCE removes the rest.
 struct AddrWalk<'w> {
     func: &'w super::Function,
     insns: &'w [Instruction],
@@ -3604,93 +3601,62 @@ struct AddrWalk<'w> {
 }
 
 impl AddrWalk<'_> {
-    /// `p` as (object `Sym`, constant byte offset). On failure `chain` is left
-    /// as it was, so a branch that did not pan out drops nothing.
-    fn object(&self, p: PseudoId, chain: &mut Vec<usize>) -> Option<(PseudoId, i64)> {
-        let mark = chain.len();
-        let found = self.object_at(p, chain);
-        if found.is_none() {
-            chain.truncate(mark);
-        }
-        found
-    }
-
-    fn object_at(&self, p: PseudoId, chain: &mut Vec<usize>) -> Option<(PseudoId, i64)> {
-        let i = *self.defs.get(&p)?;
-        let insn = &self.insns[i];
-        let found = match insn.op {
+    /// `p` as (object `Sym`, constant byte offset).
+    fn object(&self, p: PseudoId) -> Option<(PseudoId, i64)> {
+        let insn = &self.insns[*self.defs.get(&p)?];
+        match insn.op {
             Opcode::SymAddr => {
                 let sym = *insn.src.first()?;
                 if !self.names_data_object(sym, insn) {
                     return None;
                 }
-                (sym, 0)
+                Some((sym, 0))
             }
-            Opcode::Copy => self.object(*insn.src.first()?, chain)?,
+            Opcode::Copy => self.object(*insn.src.first()?),
             Opcode::Add => {
                 let (a, b) = (*insn.src.first()?, *insn.src.get(1)?);
-                match self.object(a, chain) {
-                    Some((sym, off)) => (sym, off.checked_add(self.constant(b, chain)?)?),
+                match self.object(a) {
+                    Some((sym, off)) => Some((sym, off.checked_add(self.constant(b)?)?)),
                     None => {
-                        let (sym, off) = self.object(b, chain)?;
-                        (sym, off.checked_add(self.constant(a, chain)?)?)
+                        let (sym, off) = self.object(b)?;
+                        Some((sym, off.checked_add(self.constant(a)?)?))
                     }
                 }
             }
             Opcode::Sub => {
-                let (sym, off) = self.object(*insn.src.first()?, chain)?;
-                (
-                    sym,
-                    off.checked_sub(self.constant(*insn.src.get(1)?, chain)?)?,
-                )
+                let (sym, off) = self.object(*insn.src.first()?)?;
+                Some((sym, off.checked_sub(self.constant(*insn.src.get(1)?)?)?))
             }
-            _ => return None,
-        };
-        chain.push(i);
-        Some(found)
+            _ => None,
+        }
     }
 
     /// `p` as a constant, folding the widening and scaling a subscript is
-    /// linearized into. On failure `chain` is left as it was.
-    fn constant(&self, p: PseudoId, chain: &mut Vec<usize>) -> Option<i64> {
-        let mark = chain.len();
-        let found = self.constant_at(p, chain);
-        if found.is_none() {
-            chain.truncate(mark);
-        }
-        found
-    }
-
-    fn constant_at(&self, p: PseudoId, chain: &mut Vec<usize>) -> Option<i64> {
+    /// linearized into.
+    fn constant(&self, p: PseudoId) -> Option<i64> {
         if let Some(super::PseudoKind::Val(v)) = self.func.get_pseudo(p).map(|x| &x.kind) {
-            if let Some(&i) = self.defs.get(&p) {
-                chain.push(i);
-            }
             return i64::try_from(*v).ok();
         }
-        let i = *self.defs.get(&p)?;
-        let insn = &self.insns[i];
-        let value = match insn.op {
+        let insn = &self.insns[*self.defs.get(&p)?];
+        match insn.op {
             Opcode::Sext | Opcode::Zext => {
-                let v = self.constant(*insn.src.first()?, chain)?;
+                let v = self.constant(*insn.src.first()?)?;
                 let bits = insn.src_size;
-                if bits == 0 || bits >= 64 {
+                Some(if bits == 0 || bits >= 64 {
                     v
                 } else if insn.op == Opcode::Sext {
                     (v << (64 - bits)) >> (64 - bits)
                 } else {
                     v & ((1i64 << bits) - 1)
-                }
+                })
             }
             Opcode::Mul => {
-                let a = self.constant(*insn.src.first()?, chain)?;
-                a.checked_mul(self.constant(*insn.src.get(1)?, chain)?)?
+                let a = self.constant(*insn.src.first()?)?;
+                a.checked_mul(self.constant(*insn.src.get(1)?)?)
             }
-            Opcode::Copy => self.constant(*insn.src.first()?, chain)?,
-            _ => return None,
-        };
-        chain.push(i);
-        Some(value)
+            Opcode::Copy => self.constant(*insn.src.first()?),
+            _ => None,
+        }
     }
 
     /// Whether `sym` is storage an operand can be addressed in: a local, or

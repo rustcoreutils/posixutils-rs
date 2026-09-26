@@ -2235,8 +2235,12 @@ impl<'a> Parser<'a> {
                         let expr = self.parse_unary_expr()?;
                         // gcc reinterprets the bits between a vector and a
                         // same-sized scalar or vector; the array model would
-                        // convert an address instead.
-                        if !self.check_not_vector_value(expr.typ, expr.pos) {
+                        // convert an address instead. A cast to `void` reads
+                        // nothing -- `(void)v;` is how an unused vector is
+                        // marked used -- so it is not a value use.
+                        if self.types.kind(typ) != TypeKind::Void
+                            && !self.check_not_vector_value(expr.typ, expr.pos)
+                        {
                             self.check_not_vector_value(Some(typ), paren_pos);
                         }
 

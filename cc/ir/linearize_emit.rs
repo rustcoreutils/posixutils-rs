@@ -2362,9 +2362,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             return target_addr;
         }
 
-        // For struct/union assignment, do a block copy via addresses.
-        // Structs are not loaded into registers by linearize_expr — they return
-        // an address. So we must handle ALL struct sizes here, not just large ones.
+        // For struct/union assignment, do a block copy via addresses, at every
+        // size: `linearize_lvalue` gives the source's address whether the
+        // expression yields a small aggregate's value or a large one's
+        // address.
         let target_kind = self.types.kind(target_typ);
         let target_size_bytes = self.types.size_bytes(target_typ);
         if (target_kind == TypeKind::Struct || target_kind == TypeKind::Union)
@@ -2376,7 +2377,17 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             self.emit_block_copy(target_addr, value_addr, target_size_bytes as i64);
 
-            // Return the target address as the result
+            // The assignment's value is the target's new value, in the IR's
+            // convention for an aggregate: its value when it fits in a
+            // register, its address otherwise. Returning the address at every
+            // size handed `x = (t = u)` a pointer where a small struct's bits
+            // belong.
+            if self.aggregate_travels_by_value(target_typ) {
+                let size = self.types.size_bits(target_typ);
+                let value = self.alloc_pseudo();
+                self.emit(Instruction::load(value, target_addr, 0, target_typ, size));
+                return value;
+            }
             return target_addr;
         }
 

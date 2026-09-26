@@ -13,7 +13,7 @@ use super::codegen::Aarch64CodeGen;
 use super::lir::{Aarch64Inst, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::arch::lir::{CondCode, FpSize, OperandSize, Symbol};
-use crate::ir::{Instruction, Opcode, PseudoId, PseudoKind};
+use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
 impl Aarch64CodeGen {
@@ -76,23 +76,19 @@ impl Aarch64CodeGen {
                     size: fp_size,
                     addr: MemAddr::BaseOffset {
                         base: r,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     },
                     dst: dst_vreg,
                 });
             }
             Loc::Stack(offset) => {
                 // Check if the address operand is a symbol (local variable) or a temp (spilled address)
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(addr);
 
                 if is_symbol {
                     self.push_lir(Aarch64Inst::LdrFp {
                         size: fp_size,
-                        addr: self.stack_mem_plus(offset, insn.offset as i32),
+                        addr: self.stack_mem_plus(offset, insn.displacement()),
                         dst: dst_vreg,
                     });
                 } else {
@@ -105,42 +101,31 @@ impl Aarch64CodeGen {
                         size: fp_size,
                         addr: MemAddr::BaseOffset {
                             base: Reg::X16,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         },
                         dst: dst_vreg,
                     });
                 }
             }
             Loc::Global(name) => {
-                // Load FP value from global using ADRP + LDR
-                let sym = if name.starts_with('.') {
-                    Symbol::local(&name)
-                } else {
-                    Symbol::global(&name)
-                };
                 let (scratch0, _, _) = Reg::scratch_regs();
-                if self.needs_got_access(&name) {
-                    // External symbols on macOS: load address from GOT, then load FP value
-                    let extern_sym = Symbol::extern_sym(&name);
-                    self.push_lir(Aarch64Inst::AdrpGotPage {
-                        sym: extern_sym.clone(),
-                        dst: scratch0,
-                    });
-                    self.push_lir(Aarch64Inst::LdrSymGotPageOff {
-                        sym: extern_sym,
-                        base: scratch0,
-                        dst: scratch0,
-                    });
-                    // Now scratch0 has the address, load the FP value
-                    self.push_lir(Aarch64Inst::LdrFp {
-                        size: fp_size,
-                        addr: MemAddr::BaseOffset {
-                            base: scratch0,
-                            offset: insn.offset as i32,
-                        },
-                        dst: dst_vreg,
-                    });
-                } else {
+                let bytes = match fp_size {
+                    FpSize::Half => 2,
+                    FpSize::Single => 4,
+                    FpSize::Double => 8,
+                    FpSize::Quad | FpSize::Extended => 16,
+                };
+                if insn.offset == 0
+                    && !self.is_elf_tls(&name)
+                    && !self.needs_got_access(&name)
+                    && self.lo12_folds(&name, bytes)
+                {
+                    // A global defined here, at its own address: ADRP + LDR.
+                    let sym = if name.starts_with('.') {
+                        Symbol::local(&name)
+                    } else {
+                        Symbol::global(&name)
+                    };
                     self.push_lir(Aarch64Inst::Adrp {
                         sym: sym.clone(),
                         dst: scratch0,
@@ -151,6 +136,24 @@ impl Aarch64CodeGen {
                         base: scratch0,
                         dst: dst_vreg,
                     });
+                } else {
+                    // Everything else takes its address from `emit_load_addr`,
+                    // the one place that knows every way to reach a global. This
+                    // arm used to build its own ADRP sequences and knew two of
+                    // them: a thread-local came out as `adrp x9, td; ldr d0,
+                    // [x9, :lo12:td]`, which reads the initialization image
+                    // rather than this thread's copy -- every `double` or
+                    // `float` thread-local read the same, never-updated value --
+                    // and `insn.offset` was dropped outside the GOT case.
+                    self.emit_load_addr(&name, scratch0);
+                    self.push_lir(Aarch64Inst::LdrFp {
+                        size: fp_size,
+                        addr: MemAddr::BaseOffset {
+                            base: scratch0,
+                            offset: insn.displacement(),
+                        },
+                        dst: dst_vreg,
+                    });
                 }
             }
             _ => {
@@ -159,7 +162,7 @@ impl Aarch64CodeGen {
                     size: fp_size,
                     addr: MemAddr::BaseOffset {
                         base: Reg::X16,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     },
                     dst: dst_vreg,
                 });
@@ -169,6 +172,39 @@ impl Aarch64CodeGen {
         // Move to final destination if needed
         if !matches!(&dst_loc, Loc::VReg(v) if *v == dst_vreg) {
             self.emit_fp_move_to_loc(dst_vreg, &dst_loc, insn.typ, size, types);
+        }
+    }
+
+    /// Put a floating-point bit pattern in `dst` at `fp_size`: `lo` alone for
+    /// the narrower sizes, `hi:lo` for binary128.
+    ///
+    /// One implementation for every constant that reaches a V register. A
+    /// binary128 does not fit a general register, so it is built in halves:
+    /// `fmov d` writes the low 64 bits and clears the rest, and the high half,
+    /// when it is not zero, is inserted into lane 1.
+    pub(super) fn emit_fp_bits(&mut self, lo: u64, hi: u64, fp_size: FpSize, dst: VReg) {
+        let (scratch0, scratch1, _) = Reg::scratch_regs();
+        self.emit_mov_imm(scratch0, lo as i64, 64);
+        if fp_size != FpSize::Quad {
+            self.push_lir(Aarch64Inst::FmovFromGp {
+                size: fp_size,
+                src: scratch0,
+                dst,
+            });
+            return;
+        }
+        self.push_lir(Aarch64Inst::FmovFromGp {
+            size: FpSize::Double,
+            src: scratch0,
+            dst,
+        });
+        if hi != 0 {
+            self.emit_mov_imm(scratch1, hi as i64, 64);
+            self.push_lir(Aarch64Inst::InsGpToVecD {
+                lane: 1,
+                src: scratch1,
+                dst,
+            });
         }
     }
 
@@ -204,42 +240,16 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::FImm(f, imm_size) => {
-                // A binary128 constant does not fit a general-purpose
-                // register, so it is assembled from two halves: the low 64
-                // bits via `fmov`, the high 64 inserted into lane 1.
-                if fp_size == FpSize::Quad {
-                    let (lo, hi) = f.to_f128_bits();
-                    let (scratch0, scratch1, _) = Reg::scratch_regs();
-                    self.emit_mov_imm(scratch0, lo as i64, 64);
-                    self.push_lir(Aarch64Inst::FmovFromGp {
-                        size: FpSize::Double,
-                        src: scratch0,
-                        dst,
-                    });
-                    self.emit_mov_imm(scratch1, hi as i64, 64);
-                    self.push_lir(Aarch64Inst::InsGpToVecD {
-                        lane: 1,
-                        src: scratch1,
-                        dst,
-                    });
-                    return;
-                }
-                // Load FP constant using integer register
-                // Use the size from the FImm for correct constant representation
-                let (scratch0, _, _) = Reg::scratch_regs();
-                let bits = if imm_size == 16 {
-                    super::f64_to_f16_bits(f.to_f64()) as i64
-                } else if imm_size == 32 {
-                    (f.to_f64() as f32).to_bits() as i64
-                } else {
-                    f.to_f64().to_bits() as i64
+                // The constant's own width, unless the value is headed for a
+                // binary128 register, which takes it at that precision.
+                let const_size = match (fp_size, imm_size) {
+                    (FpSize::Quad, _) => FpSize::Quad,
+                    (_, 16) => FpSize::Half,
+                    (_, 32) => FpSize::Single,
+                    _ => FpSize::Double,
                 };
-                self.emit_mov_imm(scratch0, bits, 64);
-                self.push_lir(Aarch64Inst::FmovFromGp {
-                    size: fp_size,
-                    src: scratch0,
-                    dst,
-                });
+                let (lo, hi) = fp_const_bits(f, const_size);
+                self.emit_fp_bits(lo, hi, fp_size, dst);
             }
             Loc::Reg(r) => {
                 // Move from integer register to FP register
@@ -250,14 +260,11 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Imm(v) => {
-                // Load integer immediate and move to FP
-                let (scratch0, _, _) = Reg::scratch_regs();
-                self.emit_mov_imm(scratch0, v as i64, 64);
-                self.push_lir(Aarch64Inst::FmovFromGp {
-                    size: fp_size,
-                    src: scratch0,
-                    dst,
-                });
+                // An integer immediate is a bit pattern here. The implicit
+                // `return 0` of a function that can fall off its end is one,
+                // and for a `long double` result it used to reach a GP-to-Q
+                // `fmov`, which does not exist: the printer panicked.
+                self.emit_fp_bits(v as u64, (v >> 64) as u64, fp_size, dst);
             }
             Loc::Global(name) => {
                 // A binary128 does not fit a general-purpose register, so it
@@ -692,22 +699,18 @@ impl Aarch64CodeGen {
                     src: src_vreg,
                     addr: MemAddr::BaseOffset {
                         base: r,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     },
                 });
             }
             Loc::Stack(offset) => {
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(addr);
 
                 if is_symbol {
                     self.push_lir(Aarch64Inst::StrFp {
                         size: fp_size,
                         src: src_vreg,
-                        addr: self.stack_mem_plus(offset, insn.offset as i32),
+                        addr: self.stack_mem_plus(offset, insn.displacement()),
                     });
                 } else {
                     // The slot holds the address, so load it and store through.
@@ -722,7 +725,7 @@ impl Aarch64CodeGen {
                         src: src_vreg,
                         addr: MemAddr::BaseOffset {
                             base: scratch0,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         },
                     });
                 }
@@ -735,7 +738,7 @@ impl Aarch64CodeGen {
                     src: src_vreg,
                     addr: MemAddr::BaseOffset {
                         base: scratch0,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     },
                 });
             }
@@ -747,10 +750,21 @@ impl Aarch64CodeGen {
                     src: src_vreg,
                     addr: MemAddr::BaseOffset {
                         base: scratch0,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     },
                 });
             }
         }
+    }
+}
+
+/// The bit pattern of the floating constant `f` at `size`, as `(lo, hi)`;
+/// `hi` is zero for everything narrower than binary128.
+pub(super) fn fp_const_bits(f: crate::float::FloatVal, size: FpSize) -> (u64, u64) {
+    match size {
+        FpSize::Half => (u64::from(super::f64_to_f16_bits(f.to_f64())), 0),
+        FpSize::Single => (u64::from((f.to_f64() as f32).to_bits()), 0),
+        FpSize::Quad => f.to_f128_bits(),
+        FpSize::Double | FpSize::Extended => (f.to_f64().to_bits(), 0),
     }
 }

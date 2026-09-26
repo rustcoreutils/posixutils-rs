@@ -54,7 +54,55 @@ pub(super) struct CallArgInfo {
     pub ignored_arg_indices: Vec<usize>,
 }
 
+/// The largest stacked aggregate argument copied with unrolled moves; past
+/// it, `rep movsq`. The IR stops unrolling a block copy at 128 bytes
+/// (`BLOCK_COPY_INLINE_LIMIT`) for the same reason: one load/store pair per
+/// eightbyte made a 600 MB argument 75 million instructions and tens of
+/// gigabytes of compiler memory.
+const STACK_ARG_UNROLL_QWORDS: usize = 16;
+
 impl X86_64CodeGen {
+    /// Copy `qwords` eightbytes from `[src]` to the outgoing argument area at
+    /// `dst_off(%rsp)`, with `rep movsq`.
+    ///
+    /// The register arguments are set up *after* the stacked ones, so RDI,
+    /// RSI and RCX -- which `rep movsq` needs -- may still hold values that
+    /// are about to become arguments. They are saved around the copy with
+    /// `push`/`pop`, which touch no flags; the destination is addressed past
+    /// the three pushes. `src` is read into RSI before RDI or RCX is written,
+    /// so it may be any of the three.
+    fn emit_stack_arg_block_copy(&mut self, src: Reg, dst_off: i32, qwords: usize) {
+        let saved = [Reg::Rdi, Reg::Rsi, Reg::Rcx];
+        for r in saved {
+            self.push_lir(X86Inst::Push {
+                src: GpOperand::Reg(r),
+            });
+        }
+        if src != Reg::Rsi {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(src),
+                dst: GpOperand::Reg(Reg::Rsi),
+            });
+        }
+        self.push_lir(X86Inst::Lea {
+            addr: MemAddr::BaseOffset {
+                base: Reg::Rsp,
+                offset: dst_off + 8 * saved.len() as i32,
+            },
+            dst: Reg::Rdi,
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(qwords as i64),
+            dst: GpOperand::Reg(Reg::Rcx),
+        });
+        self.push_lir(X86Inst::RepMovsq);
+        for r in saved.into_iter().rev() {
+            self.push_lir(X86Inst::Pop { dst: r });
+        }
+    }
+
     /// Classify call arguments into register vs stack arguments using ABI info.
     pub(super) fn classify_call_args(&self, insn: &Instruction, types: &TypeTable) -> CallArgInfo {
         let int_arg_regs = Reg::arg_regs();
@@ -66,20 +114,24 @@ impl X86_64CodeGen {
         let mut temp_fp_idx = 0;
         // The outgoing area is walked, not summed: each argument begins at
         // its own alignment. `at` is the running byte offset.
-        let mut stack_offsets = Vec::with_capacity(insn.src.len());
-        let mut at: i32 = 0;
+        //
+        // Walked in `i64` and converted once, at the end, against the same
+        // ceiling a frame has: two arguments each inside it can still overflow
+        // their sum, and `bytes as i32` wrapped a single large one outright.
+        let mut stack_offsets: Vec<i64> = Vec::with_capacity(insn.src.len());
+        let mut at: i64 = 0;
         // Reserve `bytes` for the argument at `i`, starting it on `align`.
         let place = |i: usize,
                      bytes: usize,
                      align: i32,
                      indices: &mut Vec<usize>,
-                     offsets: &mut Vec<i32>,
-                     at: &mut i32| {
-            let align = align.max(8);
+                     offsets: &mut Vec<i64>,
+                     at: &mut i64| {
+            let align = i64::from(align.max(8));
             *at = (*at + align - 1) & !(align - 1);
             indices.push(i);
             offsets.push(*at);
-            *at += ((bytes as i32) + 7) & !7;
+            *at += (bytes as i64 + 7) & !7;
         };
 
         let abi_info = insn
@@ -206,8 +258,23 @@ impl X86_64CodeGen {
         // Without this, gcc and c17 agreed on the offset of an
         // `__attribute__((aligned (32)))` argument and disagreed on where the
         // area began, so the callee read it sixteen bytes out.
-        let area_align = Self::outgoing_area_align(insn, types);
+        let area_align = i64::from(Self::outgoing_area_align(insn, types));
         let stack_bytes = (at + area_align - 1) & !(area_align - 1);
+        let limit = crate::types::TypeTable::MAX_STACK_OBJECT_BYTES as i64;
+        let (stack_offsets, stack_bytes) = if stack_bytes <= limit {
+            (
+                stack_offsets.into_iter().map(|o| o as i32).collect(),
+                stack_bytes as i32,
+            )
+        } else {
+            crate::diag::error_args(
+                insn.pos.unwrap_or(self.base.func_pos),
+                "this call's stacked arguments need {0} bytes, past the {1} bytes \
+                 a stack frame can address",
+                &[&stack_bytes.to_string(), &limit.to_string()],
+            );
+            (vec![0; stack_offsets.len()], 0)
+        };
 
         CallArgInfo {
             stack_arg_indices,
@@ -274,6 +341,10 @@ impl X86_64CodeGen {
             }) {
                 let num_qwords = bytes.div_ceil(8);
                 let base = self.address_of_pseudo(arg);
+                if num_qwords > STACK_ARG_UNROLL_QWORDS {
+                    self.emit_stack_arg_block_copy(base, base_off, num_qwords);
+                    continue;
+                }
                 for q in 0..num_qwords {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
@@ -789,11 +860,7 @@ impl X86_64CodeGen {
                 // (`__cret_N`), so unconditionally loading the slot as a
                 // pointer read the value's bytes as an address — `f(g())`
                 // faulted in the callee.
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == arg)
-                    .is_some_and(|p| matches!(p.kind, crate::ir::PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(arg);
                 if is_symbol {
                     self.push_lir(X86Inst::Lea {
                         dst: Reg::R11,

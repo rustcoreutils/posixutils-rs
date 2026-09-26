@@ -129,6 +129,16 @@ pub struct CompositeType {
     /// union is passed as its first member would be. Unions only; gcc's
     /// attribute governs calls, so assignment and `return` stay strict.
     pub transparent: bool,
+    /// Which definition a tagless struct, union or enum came from; `None` for
+    /// a tagged or synthesized one.
+    ///
+    /// C17 6.7.2.3p5: each struct-or-union specifier with a member list
+    /// declares a *distinct* type, so two tagless definitions with the same
+    /// members are still two incompatible types. With nothing but the members
+    /// to compare, `struct { long a, b; } x; struct { long a, b; } y; x = y;`
+    /// was accepted, where gcc rejects it. A qualified variant of the type
+    /// clones the composite, and so keeps the identity.
+    pub anon_id: Option<u32>,
 }
 
 impl CompositeType {
@@ -143,6 +153,7 @@ impl CompositeType {
             member_align: 1,
             is_complete: false,
             transparent: false,
+            anon_id: None,
         }
     }
 
@@ -191,6 +202,11 @@ bitflags::bitflags! {
 
         // C11 thread-local storage specifier
         const THREAD_LOCAL = 1 << 17;
+
+        // A GNU `vector_size` type. c17 lays one out as an array of its
+        // elements -- storage only, see DECISIONS.md -- and this is what tells
+        // it apart from a real array, which decays where a vector would not.
+        const VECTOR = 1 << 18;
     }
 }
 
@@ -754,6 +770,8 @@ pub struct TypeTable {
     types: Vec<Type>,
     /// Lookup map for deduplication
     lookup: HashMap<TypeKey, TypeId>,
+    /// The last identity [`TypeTable::fresh_anon_id`] handed out.
+    next_anon_id: u32,
     /// Pointer size in bits (target-dependent, defaults to 64 for LP64)
     pointer_width: u32,
     /// Target architecture for runtime type size calculations
@@ -823,6 +841,7 @@ impl TypeTable {
         let mut table = Self {
             types: Vec::with_capacity(DEFAULT_TYPE_TABLE_CAPACITY),
             lookup: HashMap::with_capacity(DEFAULT_TYPE_TABLE_CAPACITY),
+            next_anon_id: 0,
             pointer_width: target.pointer_width,
             target_arch: target.arch,
             target_os: target.os,
@@ -959,8 +978,15 @@ impl TypeTable {
         table
     }
 
-    /// Intern a type, returning its unique ID
-    /// Deduplicates equivalent types (same ID for equivalent types)
+    /// A fresh identity for a tagless composite definition; see
+    /// [`CompositeType::anon_id`].
+    pub fn fresh_anon_id(&mut self) -> u32 {
+        self.next_anon_id += 1;
+        self.next_anon_id
+    }
+
+    /// Intern a type, returning its unique ID.
+    /// Deduplicates equivalent types (same ID for equivalent types).
     pub fn intern(&mut self, typ: Type) -> TypeId {
         // Try to create a key for deduplication
         if let Some(key) = self.make_key(&typ) {
@@ -1365,6 +1391,11 @@ impl TypeTable {
                 | TypeKind::Float16
                 | TypeKind::Float128
         ) && !typ.modifiers.contains(TypeModifiers::COMPLEX)
+    }
+
+    /// Is this a GNU `vector_size` type?
+    pub fn is_vector(&self, id: TypeId) -> bool {
+        self.get(id).modifiers.contains(TypeModifiers::VECTOR)
     }
 
     /// Check if type is a complex floating point type
@@ -1980,12 +2011,13 @@ impl TypeTable {
     ///
     /// - **The object's own**, [`Self::MAX_OBJECT_BYTES`]: what a size can be
     ///   described as at all, and what `sizeof` answers.
-    /// - **The frame's**, `i32::MAX` rounded down to an eightbyte, and
-    ///   therefore the operative one here: both backends address a local and a
-    ///   stacked argument by a signed 32-bit displacement from the frame
-    ///   register, so an object past this has no slot to be given. Rounded down
-    ///   to eight because every consumer rounds a size *up* to eight before
-    ///   using it, and at `i32::MAX` that addition is itself the overflow.
+    /// - **The frame's**, `i32::MAX` less [`Self::FRAME_HEADROOM_BYTES`] and
+    ///   rounded down to an eightbyte, and therefore the operative one here:
+    ///   both backends address a local and a stacked argument by a signed
+    ///   32-bit displacement from the frame register, so an object past this
+    ///   has no slot to be given. The headroom is what the prologue adds after
+    ///   the locals are laid out; without it an accepted frame wrapped in that
+    ///   arithmetic and the prologue allocated nothing.
     ///
     /// This is a c17 backend limit and not a C one -- C17 says nothing about
     /// where an object with automatic storage duration lives, and gcc compiles
@@ -2003,7 +2035,19 @@ impl TypeTable {
     /// as -1294967296, the `size.max(8)` that follows gave it an eight-byte
     /// slot, and the whole frame was `subq $32, %rsp` with the array laid
     /// across it -- with no diagnostic at all.
-    pub const MAX_STACK_OBJECT_BYTES: usize = (i32::MAX as usize) & !7;
+    pub const MAX_STACK_OBJECT_BYTES: usize = (i32::MAX as usize - Self::FRAME_HEADROOM_BYTES) & !7;
+
+    /// What a prologue adds to a frame beyond its locals, bounded generously:
+    /// the saved frame pointer and link register, every callee-saved general
+    /// and floating-point register (at most 160 bytes on aarch64, 48 on
+    /// x86-64), the variadic register save area (192 and 176), and the
+    /// sixteen-byte roundings between them. The frame's over-alignment is not
+    /// in here: it depends on the frame, and `arch::regalloc::grow_frame`
+    /// reserves it separately.
+    ///
+    /// Reserving it once, where a frame is admitted, is what lets every sum
+    /// after that stay in `i32` without a check of its own.
+    pub const FRAME_HEADROOM_BYTES: usize = 4096;
 
     /// Get the size of a type in bytes
     /// The size of a type in bytes -- the answer `sizeof` gives.
@@ -2721,6 +2765,7 @@ mod tests {
             member_align: 8,
             is_complete: true,
             transparent: false,
+            anon_id: None,
         };
 
         // An ordinary union answers None even though it has members.

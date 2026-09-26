@@ -704,7 +704,7 @@ impl X86_64CodeGen {
     fn int128_label(&mut self, prefix: &str) -> Label {
         let suffix = self.unique_label_counter;
         self.unique_label_counter += 1;
-        Label::new(prefix, suffix)
+        Label::internal(prefix, suffix)
     }
 
     /// Emit 128-bit shift operations (Shl, Lsr, Asr).

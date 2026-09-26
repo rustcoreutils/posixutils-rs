@@ -393,6 +393,11 @@ impl SysVAmd64Abi {
 }
 
 impl Abi for SysVAmd64Abi {
+    /// MEMORY class: the bytes themselves go in the argument area.
+    fn indirect_param_is_reference(&self) -> bool {
+        false
+    }
+
     fn classify_param(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);
@@ -669,6 +674,7 @@ mod tests {
             member_align: align,
             is_complete: true,
             transparent: false,
+            anon_id: None,
         }))
     }
 
@@ -826,6 +832,7 @@ mod tests {
             member_align: 16,
             is_complete: true,
             transparent: false,
+            anon_id: None,
         }));
         assert!(
             matches!(abi.classify_param(mixed, &types),

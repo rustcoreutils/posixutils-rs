@@ -5890,8 +5890,8 @@ fn test_stack_object_larger_than_a_frame_slot_is_rejected() {
 /// `MAX_OBJECT_BYTES`. `array_parameter_decays` and the pointer case are the two
 /// that break if the parameter check is moved before the C17 6.7.5.3 adjustment:
 /// that parameter is a `char *`. A variable length array has no static extent to
-/// measure, so the rule declines to answer and
-/// `arch::regalloc::grow_frame` catches the frame instead.
+/// measure, so the rule declines to answer: its extent is subtracted from the
+/// stack pointer at run time, and the frame holds only a pointer to it.
 #[test]
 fn test_static_object_larger_than_a_frame_slot_is_accepted() {
     for src in [
@@ -5910,4 +5910,230 @@ fn test_static_object_larger_than_a_frame_slot_is_accepted() {
             panic!("{src}\nshould have parsed: {e}");
         }
     }
+}
+
+/// The level of `__builtin_frame_address`/`__builtin_return_address` is folded
+/// at parse time, so the AST carries the number of frames to walk rather than
+/// an expression the backend would have to evaluate.
+#[test]
+fn test_frame_builtin_level_is_a_parsed_constant() {
+    let (expr, ..) = parse_expr("__builtin_return_address(1 + 1)").unwrap();
+    assert!(matches!(expr.kind, ExprKind::ReturnAddress { level: 2 }));
+    let (expr, ..) = parse_expr("__builtin_frame_address(0)").unwrap();
+    assert!(matches!(expr.kind, ExprKind::FrameAddress { level: 0 }));
+}
+
+/// gcc rejects a level that is not a non-negative integer constant.
+#[test]
+fn test_frame_builtin_level_must_be_constant() {
+    for src in [
+        "__builtin_return_address(n)",
+        "__builtin_frame_address(n)",
+        "__builtin_return_address(-1)",
+    ] {
+        match parse_expr_with_vars(src, &["n"]) {
+            Err(err) => assert!(
+                err.message.contains("invalid argument"),
+                "{src}: {}",
+                err.message
+            ),
+            Ok(_) => panic!("{src} should be rejected"),
+        }
+    }
+}
+
+/// `aligned` on a function reaches the definition's attributes from every
+/// place it can be written -- a prototype's trailing attribute, the position
+/// before the specifiers, the definition -- and the largest wins.
+#[test]
+fn test_function_aligned_attribute_is_gathered() {
+    let src = "void a(void) __attribute__((aligned(256)));\n\
+               void a(void) {}\n\
+               __attribute__((aligned(64))) void b(void) {}\n\
+               void c(void) __attribute__((aligned(128)));\n\
+               __attribute__((aligned(32))) void c(void) {}\n\
+               void d(void) {}\n";
+    let (tu, _types, strings, _symbols) = parse_tu(src).unwrap();
+    let aligns: Vec<(String, Option<u32>)> = tu
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ExternalDecl::FunctionDef(f) => Some((strings.get(f.name).to_string(), f.attrs.align)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        aligns,
+        [
+            ("a".to_string(), Some(256)),
+            ("b".to_string(), Some(64)),
+            ("c".to_string(), Some(128)),
+            ("d".to_string(), None),
+        ]
+    );
+}
+
+/// `__alignof__` of an aligned function is a constant the parser folds.
+#[test]
+fn test_alignof_of_an_aligned_function() {
+    let src = "void f(void) __attribute__((aligned(512)));\n\
+               unsigned long n = __alignof__(f);\n";
+    let (tu, ..) = parse_tu(src).unwrap();
+    let init = tu.items.iter().find_map(|item| match item {
+        ExternalDecl::Declaration(d) => d.declarators.first()?.init.clone(),
+        _ => None,
+    });
+    let init = init.expect("n has an initializer");
+    assert!(
+        matches!(init.kind, ExprKind::IntLit(512)),
+        "{:?}",
+        init.kind
+    );
+}
+
+/// `__builtin_signbit` dispatches on its argument's type: a `float` to the
+/// single-precision form, a `long double` to `__signbitl`, a `double` to the
+/// double form. Each result is normalised to 0/1 by a `!= 0`.
+#[test]
+fn test_signbit_is_type_generic() {
+    fn inner(e: &Expr) -> &ExprKind {
+        match &e.kind {
+            ExprKind::Binary { left, .. } => &left.kind,
+            other => other,
+        }
+    }
+    let (tu, _types, strings, symbols) = parse_tu(
+        "float f; double d; long double l;\n\
+         int a = 0; void t(void) { a = __builtin_signbit(f); a = __builtin_signbit(d); \
+         a = __builtin_signbit(l); }\n",
+    )
+    .unwrap();
+    let body = tu
+        .items
+        .iter()
+        .find_map(|i| match i {
+            ExternalDecl::FunctionDef(f) => Some(&f.body),
+            _ => None,
+        })
+        .unwrap();
+    let Stmt::Block(items) = body else {
+        panic!("expected a block")
+    };
+    let rhs: Vec<&Expr> = items
+        .iter()
+        .filter_map(|i| match i {
+            BlockItem::Statement(s) => match s.as_ref() {
+                Stmt::Expr(e) => match &e.kind {
+                    ExprKind::Assign { value, .. } => Some(value.as_ref()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rhs.len(), 3);
+    assert!(matches!(inner(rhs[0]), ExprKind::Signbitf { .. }), "float");
+    assert!(matches!(inner(rhs[1]), ExprKind::Signbit { .. }), "double");
+    match inner(rhs[2]) {
+        ExprKind::Call { func, .. } => match &func.kind {
+            ExprKind::Ident(id) => check_name(&strings, symbols.get(*id).name, "__signbitl"),
+            other => panic!("long double: expected a call to __signbitl, got {other:?}"),
+        },
+        other => panic!("long double: expected a call, got {other:?}"),
+    }
+}
+
+/// `vector_size` marks its type, so a vector is not the same type as a plain
+/// array of its elements -- which is what lets a value use of one be told
+/// apart and refused.
+#[test]
+fn test_vector_size_type_is_marked() {
+    let (decl, types, _strings, symbols) =
+        parse_decl("int __attribute__((vector_size(8))) x;").unwrap();
+    let typ = symbols.get(decl.declarators[0].symbol).typ;
+    assert!(types.is_vector(typ));
+    let (decl, types, _strings, symbols) = parse_decl("int y[2];").unwrap();
+    assert!(!types.is_vector(symbols.get(decl.declarators[0].symbol).typ));
+}
+
+/// Two tagless definitions with the same members are distinct types, while a
+/// qualified variant of one stays compatible with it (C17 6.7.2.3p5).
+#[test]
+fn test_tagless_composites_have_identity() {
+    let (tu, types, _strings, symbols) =
+        parse_tu("struct { int x; } a;\nstruct { int x; } b;\ntypedef struct { int x; } T;\nconst T c;\nT d;\n")
+            .unwrap();
+    let typ = |i: usize| match &tu.items[i] {
+        ExternalDecl::Declaration(decl) => symbols.get(decl.declarators[0].symbol).typ,
+        _ => panic!("item {i} is not a declaration"),
+    };
+    let (a, b) = (typ(0), typ(1));
+    assert!(
+        !types.types_compatible(a, b),
+        "two tagless definitions must be distinct"
+    );
+    // `types_compatible` ignores top-level qualifiers.
+    let (c, d) = (typ(3), typ(4));
+    assert!(
+        types.types_compatible(c, d),
+        "const T and T share a definition"
+    );
+}
+
+/// Every declarator of a list gets the attributes written among the
+/// specifiers, and only its own trailing ones -- gcc's rule. A function
+/// declarator after the first, or at block scope, has its attributes
+/// recorded like the first one's: `g` and `k` below lost their `aligned`,
+/// `a2` lost the specifiers' one, and `wb` its `weak`.
+#[test]
+fn test_attributes_follow_their_declarator_in_a_list() {
+    let src = "void f(void), g(void) __attribute__((aligned(32)));\n\
+               __attribute__((aligned(16))) void a1(void), a2(void);\n\
+               void b1(void) __attribute__((aligned(64))), b2(void);\n\
+               __attribute__((weak)) int wa, wb;\n\
+               void f(void) {} void g(void) {} void a1(void) {} void a2(void) {}\n\
+               void b1(void) {} void b2(void) {}\n\
+               void outer(void) { void k(void) __attribute__((aligned(128))), m(void); }\n\
+               void k(void) {} void m(void) {}\n";
+    let (tu, _types, strings, symbols) = parse_tu(src).unwrap();
+    let aligns: std::collections::BTreeMap<String, Option<u32>> = tu
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ExternalDecl::FunctionDef(f) => Some((strings.get(f.name).to_string(), f.attrs.align)),
+            _ => None,
+        })
+        .collect();
+    let expect: std::collections::BTreeMap<String, Option<u32>> = [
+        ("f", None),
+        ("g", Some(32)),
+        ("a1", Some(16)),
+        ("a2", Some(16)),
+        ("b1", Some(64)),
+        ("b2", None),
+        ("outer", None),
+        ("k", Some(128)),
+        ("m", None),
+    ]
+    .into_iter()
+    .map(|(n, a)| (n.to_string(), a))
+    .collect();
+    assert_eq!(aligns, expect);
+
+    let weak: Vec<(String, bool)> = tu
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ExternalDecl::Declaration(d) => Some(d.declarators.iter()),
+            _ => None,
+        })
+        .flatten()
+        .map(|d| {
+            let name = strings.get(symbols.get(d.symbol).name).to_string();
+            (name, d.symbol_attrs.weak)
+        })
+        .filter(|(n, _)| n.starts_with('w'))
+        .collect();
+    assert_eq!(weak, [("wa".to_string(), true), ("wb".to_string(), true)]);
 }

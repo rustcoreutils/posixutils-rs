@@ -455,6 +455,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let name = self.symbol_name(declarator.symbol).to_string();
                 if !is_block_scope_function && !self.module.globals.iter().any(|g| g.name == name) {
                     self.module.extern_symbols.insert(name.clone());
+                    self.module.extern_object_align.insert(
+                        name.clone(),
+                        declarator
+                            .explicit_align
+                            .unwrap_or(self.types.alignment(typ) as u32),
+                    );
                     if declarator
                         .storage_class
                         .contains(TypeModifiers::THREAD_LOCAL)
@@ -1535,9 +1541,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             // Link CFG edges from current block to all case/default/exit blocks
             if let Some(current) = self.current_bb {
-                for &(_, _, bb) in &switch_cases {
-                    self.link_bb(current, bb);
-                }
+                self.link_bb_many(current, switch_cases.iter().map(|&(_, _, bb)| bb));
                 self.link_bb(current, default_target);
                 if default_bb.is_none() {
                     self.link_bb(current, exit_bb);
@@ -1555,7 +1559,14 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.current_bb = None;
 
         // Linearize body with case block switching
-        self.linearize_switch_body(body, &case_values, &case_bbs, default_bb);
+        // Each label's position among the cases, by its range. The first wins,
+        // as a scan in source order would find it; a duplicate has already
+        // been reported.
+        let mut case_index = CaseIndex::new();
+        for (idx, range) in case_values.iter().enumerate() {
+            case_index.entry(*range).or_insert(idx);
+        }
+        self.linearize_switch_body(body, &case_index, &case_bbs, default_bb);
 
         // If not terminated after body, jump to exit
         if !self.is_terminated() {
@@ -1584,7 +1595,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         body: &Stmt,
         unsigned: bool,
     ) -> (Vec<(i128, i128)>, bool) {
-        let mut case_values = Vec::new();
+        let mut case_values = CaseSet::new(unsigned);
         let mut has_default = false;
 
         match body {
@@ -1605,7 +1616,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         }
 
-        (case_values, has_default)
+        (case_values.ranges, has_default)
     }
 
     /// The block every computed `goto` in this function branches through,
@@ -1764,7 +1775,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn collect_cases_from_stmt(
         &self,
         stmt: &Stmt,
-        case_values: &mut Vec<(i128, i128)>,
+        case_values: &mut CaseSet,
         has_default: &mut bool,
         unsigned: bool,
     ) {
@@ -1810,18 +1821,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                             a < b
                         }
                     };
-                    let at_most = |a: i128, b: i128| !below(b, a);
                     if below(hi, val) {
                         // GCC accepts an empty range, warns, and never matches
                         // it. Nothing is recorded, so nothing can overlap it.
                         crate::diag::warning(expr.pos, "empty range specified");
                         return;
                     }
-                    if let Some((lo2, hi2)) = case_values
-                        .iter()
-                        .find(|(lo2, hi2)| at_most(val, *hi2) && at_most(*lo2, hi))
-                        .copied()
-                    {
+                    if let Some((lo2, hi2)) = case_values.overlap(val, hi) {
                         let what = if val == hi && lo2 == hi2 {
                             format!("duplicate case value '{}' in switch", val)
                         } else {
@@ -1832,7 +1838,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         };
                         error(expr.pos, &what);
                     }
-                    case_values.push((val, hi));
+                    case_values.insert(val, hi);
                 } else if self.expr_is_runtime(expr) {
                     // A non-constant label can never match.
                     error(expr.pos, "case label is not an integer constant expression");
@@ -2435,7 +2441,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_switch_body(
         &mut self,
         body: &Stmt,
-        case_values: &[(i128, i128)],
+        case_values: &CaseIndex,
         case_bbs: &[BasicBlockId],
         default_bb: Option<BasicBlockId>,
     ) {
@@ -2476,7 +2482,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_switch_stmt(
         &mut self,
         stmt: &Stmt,
-        case_values: &[(i128, i128)],
+        case_values: &CaseIndex,
         case_bbs: &[BasicBlockId],
         default_bb: Option<BasicBlockId>,
         case_idx: &mut usize,
@@ -2496,7 +2502,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         Some(hi_expr) => self.eval_const_expr(hi_expr),
                     };
                     let Some(hi) = hi else { return };
-                    if let Some(idx) = case_values.iter().position(|r| *r == (lo, hi)) {
+                    if let Some(&idx) = case_values.get(&(lo, hi)) {
                         let case_bb = case_bbs[idx];
 
                         // Fall through from previous case if not terminated
@@ -2848,6 +2854,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     Some(addr) => addr,
                     None => self.linearize_lvalue(&op.expr),
                 };
+                let (addr, offset) = self.asm_memory_operand(addr);
                 output_places.push(place);
 
                 if is_readwrite {
@@ -2859,6 +2866,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         matching_output: Some(ir_outputs.len()),
                         constraint: op.constraint.clone(),
                         size,
+                        offset,
                     });
                 }
 
@@ -2868,6 +2876,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     matching_output: None,
                     constraint: op.constraint.clone(),
                     size,
+                    offset,
                 });
 
                 param_outputs.push(None);
@@ -2926,6 +2935,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     matching_output: Some(ir_outputs.len()), // matches the output about to be pushed
                     constraint: op.constraint.clone(),
                     size,
+                    offset: 0,
                 });
             }
 
@@ -2935,6 +2945,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 matching_output: None,
                 constraint: op.constraint.clone(),
                 size,
+                offset: 0,
             });
 
             // Track if this is a parameter output
@@ -2955,6 +2966,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             // For matching constraints (like "0"), we need to load the input value
             // into the matched output's pseudo so they use the same register
+            let mut memory_offset = 0;
             let pseudo = if let Some(match_idx) = matching {
                 if match_idx < ir_outputs.len() {
                     // Use the matched output's pseudo
@@ -2974,8 +2986,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                     self.linearize_expr(&op.expr)
                 }
             } else if is_memory {
-                // For memory operands, get the address
-                self.linearize_lvalue(&op.expr)
+                // For memory operands, get the address -- or the object
+                // itself, when the address is a constant one.
+                let addr = self.linearize_lvalue(&op.expr);
+                let (pseudo, offset) = self.asm_memory_operand(addr);
+                memory_offset = offset;
+                pseudo
             } else {
                 // For register operands, evaluate the expression
                 self.linearize_expr(&op.expr)
@@ -2987,6 +3003,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 matching_output: matching,
                 constraint: op.constraint.clone(),
                 size,
+                offset: memory_offset,
             });
         }
 
@@ -3000,13 +3017,35 @@ impl<'a> super::linearize::Linearizer<'a> {
             })
             .collect();
 
+        // An `asm goto` with outputs leaves them valid on every path, the
+        // label edges as well as the fall-through (gcc's documented rule, and
+        // what the Linux kernel's user-access helpers rely on). The write-back
+        // below ran only on the fall-through, so a jump reached its label
+        // with every output unstored. Each label edge now gets a block of its
+        // own that writes the outputs back and then jumps to the label.
+        let writes_back = skip_post_handling.iter().any(|skip| !skip);
+        let label_edges: Vec<(BasicBlockId, BasicBlockId, String)> = ir_goto_labels
+            .iter()
+            .map(|(target, name)| {
+                let edge = if writes_back {
+                    self.alloc_bb()
+                } else {
+                    *target
+                };
+                (edge, *target, name.clone())
+            })
+            .collect();
+
         // Create the asm data
         let asm_data = AsmData {
             template: template.to_string(),
             outputs: ir_outputs.clone(),
             inputs: ir_inputs,
             clobbers: clobbers.to_vec(),
-            goto_labels: ir_goto_labels.clone(),
+            goto_labels: label_edges
+                .iter()
+                .map(|(edge, _, name)| (*edge, name.clone()))
+                .collect(),
         };
 
         // Emit the asm instruction
@@ -3014,15 +3053,15 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // For asm goto: add edges to all possible label targets
         // The asm may jump to any of these labels, so control flow can go there
-        if !ir_goto_labels.is_empty() {
+        if !label_edges.is_empty() {
             if let Some(current) = self.current_bb {
                 // After the asm instruction, we need a basic block for fall-through
                 // and edges to all goto targets
                 let fall_through = self.alloc_bb();
 
                 // Add edges to all goto label targets
-                for (target_bb, _) in &ir_goto_labels {
-                    self.link_bb(current, *target_bb);
+                for (edge, _, _) in &label_edges {
+                    self.link_bb(current, *edge);
                 }
 
                 // Add edge to fall-through (normal case when asm doesn't jump)
@@ -3033,12 +3072,44 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // Without this, code would fall through to whatever block comes next in layout
                 self.emit(Instruction::br(fall_through));
 
+                if writes_back {
+                    for (edge, target, _) in &label_edges {
+                        self.switch_bb(*edge);
+                        self.emit_asm_output_writeback(
+                            outputs,
+                            &ir_outputs,
+                            &skip_post_handling,
+                            &param_outputs,
+                            &output_places,
+                        );
+                        self.emit(Instruction::br(*target));
+                        self.link_bb(*edge, *target);
+                    }
+                }
+
                 // Switch to fall-through block for subsequent instructions
                 self.current_bb = Some(fall_through);
             }
         }
 
-        // Store outputs back to their destinations
+        self.emit_asm_output_writeback(
+            outputs,
+            &ir_outputs,
+            &skip_post_handling,
+            &param_outputs,
+            &output_places,
+        );
+    }
+
+    /// Store an asm statement's register outputs back to their destinations.
+    fn emit_asm_output_writeback(
+        &mut self,
+        outputs: &[AsmOperand],
+        ir_outputs: &[AsmConstraint],
+        skip_post_handling: &[bool],
+        param_outputs: &[Option<String>],
+        output_places: &[Option<super::linearize_emit::RmwPlace>],
+    ) {
         // store(value, addr, ...) - value first, then address
         for (i, op) in outputs.iter().enumerate() {
             // Memory-class outputs (`=m`/`+m`/...) need no post-asm
@@ -3068,6 +3139,43 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
         }
+    }
+
+    /// A memory operand's address as the object it names and a constant byte
+    /// offset into it, when it is one: a local, a parameter, a static or a
+    /// global, reached through members and constant subscripts.
+    ///
+    /// The operand then names the object's `Sym`, so the backend addresses the
+    /// object where it lives and no register is spent on it -- see
+    /// [`AsmConstraint::offset`]. Anything else keeps its address pseudo: a
+    /// pointer computed at run time, a VLA's storage, a function.
+    ///
+    /// The address arithmetic `linearize_lvalue` emitted is left alone. It
+    /// may have readers besides the operand -- `"=m"(*(q = &arr[2]))` stores
+    /// it into `q` before the asm -- and this cannot see every reader, so
+    /// dropping it wrote an undefined register into `q`. Once the operand no
+    /// longer names it, DCE removes whatever nothing else reads.
+    fn asm_memory_operand(&self, addr: PseudoId) -> (PseudoId, i64) {
+        let Some(bb_id) = self.current_bb else {
+            return (addr, 0);
+        };
+        let func = self.current_func.as_ref().expect("inside a function");
+        let Some(bb) = func.get_block(bb_id) else {
+            return (addr, 0);
+        };
+        let defs: std::collections::HashMap<PseudoId, usize> = bb
+            .insns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, insn)| insn.target.map(|t| (t, i)))
+            .collect();
+        let walk = AddrWalk {
+            func,
+            insns: &bb.insns,
+            defs: &defs,
+            types: self.types,
+        };
+        walk.object(addr).unwrap_or((addr, 0))
     }
 
     /// Parse an asm constraint string to extract flags.
@@ -3109,6 +3217,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             matching_output: None,
             constraint: constraint.to_string(),
             size: 0,
+            offset: 0,
         };
 
         (probe.is_memory(), is_readwrite, matching)
@@ -3477,5 +3586,182 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
     fn float_value(&self, scope: ConstScope, expr: &Expr) -> Option<f64> {
         self.eval_const_float_expr_scoped(scope, expr)
             .map(|v| v.to_f64())
+    }
+}
+
+/// Follows the address arithmetic of one memory operand back to the object
+/// it names. Only within the block being built, where `linearize_lvalue` has
+/// just emitted it. It only reads: the arithmetic stays for whatever else
+/// uses it, and DCE removes the rest.
+struct AddrWalk<'w> {
+    func: &'w super::Function,
+    insns: &'w [Instruction],
+    defs: &'w std::collections::HashMap<PseudoId, usize>,
+    types: &'w TypeTable,
+}
+
+impl AddrWalk<'_> {
+    /// `p` as (object `Sym`, constant byte offset).
+    fn object(&self, p: PseudoId) -> Option<(PseudoId, i64)> {
+        let insn = &self.insns[*self.defs.get(&p)?];
+        match insn.op {
+            Opcode::SymAddr => {
+                let sym = *insn.src.first()?;
+                if !self.names_data_object(sym, insn) {
+                    return None;
+                }
+                Some((sym, 0))
+            }
+            Opcode::Copy => self.object(*insn.src.first()?),
+            Opcode::Add => {
+                let (a, b) = (*insn.src.first()?, *insn.src.get(1)?);
+                match self.object(a) {
+                    Some((sym, off)) => Some((sym, off.checked_add(self.constant(b)?)?)),
+                    None => {
+                        let (sym, off) = self.object(b)?;
+                        Some((sym, off.checked_add(self.constant(a)?)?))
+                    }
+                }
+            }
+            Opcode::Sub => {
+                let (sym, off) = self.object(*insn.src.first()?)?;
+                Some((sym, off.checked_sub(self.constant(*insn.src.get(1)?)?)?))
+            }
+            _ => None,
+        }
+    }
+
+    /// `p` as a constant, folding the widening and scaling a subscript is
+    /// linearized into.
+    fn constant(&self, p: PseudoId) -> Option<i64> {
+        if let Some(super::PseudoKind::Val(v)) = self.func.get_pseudo(p).map(|x| &x.kind) {
+            return i64::try_from(*v).ok();
+        }
+        let insn = &self.insns[*self.defs.get(&p)?];
+        match insn.op {
+            Opcode::Sext | Opcode::Zext => {
+                let v = self.constant(*insn.src.first()?)?;
+                let bits = insn.src_size;
+                Some(if bits == 0 || bits >= 64 {
+                    v
+                } else if insn.op == Opcode::Sext {
+                    (v << (64 - bits)) >> (64 - bits)
+                } else {
+                    v & ((1i64 << bits) - 1)
+                })
+            }
+            Opcode::Mul => {
+                let a = self.constant(*insn.src.first()?)?;
+                a.checked_mul(self.constant(*insn.src.get(1)?)?)
+            }
+            Opcode::Copy => self.constant(*insn.src.first()?),
+            _ => None,
+        }
+    }
+
+    /// Whether `sym` is storage an operand can be addressed in: a local, or
+    /// a global that is not a function.
+    fn names_data_object(&self, sym: PseudoId, symaddr: &Instruction) -> bool {
+        if !matches!(
+            self.func.get_pseudo(sym).map(|x| &x.kind),
+            Some(super::PseudoKind::Sym(_))
+        ) {
+            return false;
+        }
+        if self.func.local_of(sym).is_some() {
+            return true;
+        }
+        symaddr
+            .typ
+            .and_then(|t| self.types.base_type(t))
+            .is_some_and(|t| self.types.kind(t) != TypeKind::Function)
+    }
+}
+
+/// Each case range's position among a switch's labels.
+pub(crate) type CaseIndex = std::collections::HashMap<(i128, i128), usize>;
+
+/// A switch's case ranges, in source order, with an index that finds an
+/// overlap in logarithmic time.
+///
+/// Checking each new label against every earlier one made a switch
+/// quadratic in its case count: 70,000 labels took five seconds to compile
+/// and gcc's `limits-caselabels` eleven.
+pub(crate) struct CaseSet {
+    /// The ranges `(lo, hi)`, in the order the labels were written.
+    ranges: Vec<(i128, i128)>,
+    /// Each range by its low end, as an order-preserving key, to its high end.
+    by_lo: std::collections::BTreeMap<i128, (i128, i128, i128)>,
+    unsigned: bool,
+}
+
+impl CaseSet {
+    fn new(unsigned: bool) -> Self {
+        Self {
+            ranges: Vec::new(),
+            by_lo: std::collections::BTreeMap::new(),
+            unsigned,
+        }
+    }
+
+    /// `v` as a signed key ordered the way the switch's type orders it: an
+    /// unsigned value has its top bit flipped, which maps unsigned order onto
+    /// signed order.
+    fn key(&self, v: i128) -> i128 {
+        if self.unsigned {
+            v ^ i128::MIN
+        } else {
+            v
+        }
+    }
+
+    /// An earlier range sharing a value with `lo..=hi`, if any.
+    ///
+    /// The ranges recorded are disjoint -- an overlap is an error -- so the
+    /// only candidate is the one starting last at or before `hi`.
+    fn overlap(&self, lo: i128, hi: i128) -> Option<(i128, i128)> {
+        let (_, &(hi_key, lo2, hi2)) = self.by_lo.range(..=self.key(hi)).next_back()?;
+        (hi_key >= self.key(lo)).then_some((lo2, hi2))
+    }
+
+    fn insert(&mut self, lo: i128, hi: i128) {
+        self.ranges.push((lo, hi));
+        let (lo_key, hi_key) = (self.key(lo), self.key(hi));
+        self.by_lo.insert(lo_key, (hi_key, lo, hi));
+    }
+}
+
+#[cfg(test)]
+mod case_set_tests {
+    use super::CaseSet;
+
+    #[test]
+    fn overlap_finds_the_range_sharing_a_value() {
+        let mut set = CaseSet::new(false);
+        set.insert(-10, -5);
+        set.insert(0, 0);
+        set.insert(10, 20);
+        assert_eq!(set.overlap(-7, -7), Some((-10, -5)));
+        assert_eq!(set.overlap(-4, -1), None);
+        assert_eq!(set.overlap(-1, 1), Some((0, 0)));
+        assert_eq!(set.overlap(5, 9), None);
+        assert_eq!(set.overlap(5, 10), Some((10, 20)));
+        assert_eq!(set.overlap(20, 30), Some((10, 20)));
+        assert_eq!(set.overlap(21, 30), None);
+        assert_eq!(set.ranges, [(-10, -5), (0, 0), (10, 20)]);
+    }
+
+    /// Unsigned order: a value above `i64::MAX`, carried in an `i128` as a
+    /// negative 128-bit pattern for `unsigned __int128`, still sorts above
+    /// every small one.
+    #[test]
+    fn overlap_orders_by_the_switch_type_signedness() {
+        let big = u128::MAX as i128; // -1 as i128, the largest unsigned value
+        let mut set = CaseSet::new(true);
+        set.insert(1, 5);
+        set.insert(big - 10, big);
+        assert_eq!(set.overlap(big - 3, big - 3), Some((big - 10, big)));
+        assert_eq!(set.overlap(6, 100), None);
+        assert_eq!(set.overlap(0, 1), Some((1, 5)));
     }
 }

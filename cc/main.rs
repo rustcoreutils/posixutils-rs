@@ -1197,7 +1197,7 @@ fn process_file(
     let shared_mode = producing_shared(args) || args.fpic;
     ir::tls::expand_dynamic_tls(
         &mut module,
-        shared_mode && target.os == target::Os::Linux,
+        target.tls_access(shared_mode).is_call(),
         types.void_ptr_id,
     );
 

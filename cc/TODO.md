@@ -70,16 +70,6 @@ live `int`s cost 72 bytes where gcc uses callee-saved registers and none. Slot
 reuse is the larger multiplier, but this is why even leaf functions carry a
 frame.
 
-### A by-value struct argument is still copied word by word in the backend
-
-Fixed at the IR level: copies past 128 bytes now become a `memcpy` call, which
-took a 256 KB by-value struct from a 65-second compile to 0.01 s. The backend
-still unrolls the *stacked-argument* copy at instruction-selection time, so the
-same case emits ~65,000 `movq` where gcc emits one `call memcpy`. Compile time
-is no longer the problem; code size is. The fix belongs wherever the stacked
-argument is written, and has to avoid clobbering argument registers already set
-up — which is why it was not folded into the IR-level change.
-
 ### R10 reserved globally for division scratch
 
 **Location**: `arch/x86_64/regalloc.rs` lines 187-208
@@ -100,10 +90,12 @@ up — which is why it was not folded into the IR-level change.
 
 ### C11 Thread-Local Storage
 
-Complete on Linux, on both architectures. What is left:
+Complete on Linux and macOS, on both architectures. What is left:
 
-- Not implemented on FreeBSD, whose rtld may lack x86-64 descriptor support;
-  TLS is gated on Linux, as it already was.
+- FreeBSD gets the ELF Local and Initial Exec models, but not the descriptor
+  model: its rtld may lack x86-64 descriptor support, so `-fPIC`/`-shared`
+  code uses Initial Exec there, which cannot be `dlopen`ed with a thread-local
+  block larger than the static-TLS surplus.
 - The older `gnu` dialect is not implemented. If a target needs it, it belongs
   behind `-mtls-dialect=gnu`.
 - Four latent Local-Exec sites remain in the x86-64 backend
@@ -161,60 +153,42 @@ bounds what a size can be *described* as, while
 `TypeTable::MAX_STACK_OBJECT_BYTES` bounds what the backends can give a *slot*,
 because a frame displacement is an `i32`. `crate::abi::slot_bytes` is the only
 place an object size becomes that `i32`, and `arch::regalloc::grow_frame` the
-only place a frame total grows. Lifting the second bound means widening both
-backends' offsets to `i64`; nothing needs it, and gcc refuses the argument case
-too.
+only place a frame total grows. Lifting the second bound is its own feature --
+see [64-bit stack frames](#64-bit-stack-frames).
 
 ---
 
-### The backend's stacked-argument copy has no `memcpy` fallback
+### 64-bit stack frames
 
-`emit_block_copy` becomes a `memcpy` call past `BLOCK_COPY_INLINE_LIMIT`, 128
-bytes, because an unbounded unroll made a 256 KB struct passed by value cost
-65,536 IR instructions and a 65-second compile. The backend's *outgoing*
-stacked-argument copy has no such limit: `push_stack_args` emits one
-load/store pair per eight bytes for the whole argument, whatever its size.
+An automatic object past `MAX_STACK_OBJECT_BYTES` (just under 2 GiB) is refused
+with a diagnostic, and so is a frame whose total passes it. gcc compiles both:
+x86-64 reaches the frame through `movabsq`-materialised displacements, and
+aarch64 through `movz`/`movk` into a scratch register. This is a gap, not a
+decision -- the diagnostic exists so that c17 never emits a wrapped frame, and
+it is the placeholder for this feature.
 
-A 3 GB by-value argument produced **67 million instructions and a 4.1 GB `.s`
-file**, or an out-of-memory kill depending on what else the machine was doing.
-That particular size is a diagnostic now -- it is past
-`MAX_STACK_OBJECT_BYTES` -- but a 600 MB one is legal and still unrolls 75
-million instructions. Measured: **16 seconds and 21.9 GB resident** for one
-`callee(src)`, which is enough to take a CI runner down, and did. The same
-`memcpy` fallback applies, and the callee-side prologue copies in both
-`frame.rs` files have the same shape.
+The torture harness skips the tests that need it by name,
+`NEEDS_64BIT_FRAMES` in `cc/scripts/c17_torture.sh` (`compile/20031023-1..4`,
+`compile/stack-check-1`), so that they are neither counted as failures nor
+forgotten. Deleting that list is part of finishing this.
 
-Until it is fixed, a test must not pass a multi-hundred-megabyte aggregate by
-value -- `codegen_aggregate_copy_length_past_the_old_object_bound` says so where
-its source would tempt someone to.
+What it takes:
 
-This is a compile-time blowup, not a wrong answer.
-
----
-
-### Zeroing a large frame is unrolled on aarch64
-
-Every aarch64 prologue calls `zero_stack_frame`, so that a narrow write leaves
-zero in the bytes above it. It emits one `stp xzr, xzr` per sixteen bytes, or
-one `str xzr` per eight once the offsets stop encoding -- with no loop. x86-64's
-`zero_stack_frame` sets up `rep stosq` instead, four instructions whatever the
-size.
-
-So the cost is one instruction per eight bytes of frame, on one target only: a
-100 KB local is 12,500 stores, and `char a[1000000000];` is 125 million, which
-measured **11 seconds and 13.4 GB resident** against 0.007 seconds on x86-64.
-That took a CI runner down.
-
-`MAX_STACK_OBJECT_BYTES` bounds this at 2 GiB, which is not a bound at all here.
-The fix is the same shape as the `memcpy` fallback above: past some size, a
-counted loop rather than an unroll. X16 is already the cursor `zero_stack_frame`
-uses for out-of-range offsets, and AAPCS64 IP0 is never in the allocator's
-palette, so the register is available.
-
-Until it is fixed, `compile_expect_ok` compiles for the *host*, so an integration
-test must not declare a large automatic object -- the acceptance case in
-`diagnostics_static_object_larger_than_a_frame_slot_is_accepted` says so where
-its size would tempt someone to raise it.
+- Widen every frame quantity to `i64`: `MemAddr` displacements on both targets,
+  `Loc::Stack`/`Loc::IncomingArg`, `RegAlloc::stack_offset`, the shared
+  `ActiveSlot`/`FreeSlot`, `callee_saved_offset`, `stack_alloc_size`,
+  `reg_save_area_offset`, the outgoing-argument layout, `IncomingOff`, and the
+  CFI directive offsets. `grow_frame` and `slot_bytes` then bound at
+  `MAX_OBJECT_BYTES` instead, less the prologue headroom
+  (`FRAME_HEADROOM_BYTES`) and the frame's final alignment rounding, which
+  `grow_frame` reserves today for the same reason.
+- A displacement outside the target's encodable range goes through a scratch
+  register: `movabsq` plus an indexed or `addq` form on x86-64. On aarch64
+  `legalize.rs` already expands any offset through X15; what changes is only
+  the width of the offsets it is given.
+- The prologue's `subq $N, %rsp` becomes `movabsq $N, %r11; subq %r11, %rsp`.
+- Stack probing. No target probes today; a frame larger than the guard gap
+  should touch each page on the way down, as gcc and clang do.
 
 ---
 
@@ -365,7 +339,7 @@ work, and were never a claim about the language.
 
 | Suite | Note |
 |---|---|
-| GCC torture tests | **Running.** `cc/scripts/c17_torture.sh`, baselined. Every sub-suite -- `execute/`, `execute/ieee/`, `execute/builtins/` and `compile/` -- in C17 mode; `dg_scan` strips `-std=` rather than selecting a dialect |
+| GCC torture tests | **Running.** `cc/scripts/c17_torture.sh`, baselined. Every sub-suite -- `execute/`, `execute/ieee/`, `execute/builtins/` and `compile/` -- in C17 mode; `dg_scan` strips `-std=` rather than selecting a dialect. `-t aarch64` builds the same suite for linux-aarch64, assembles every `compile/` output with the cross assembler and runs the executables under qemu, against `torture-baseline-aarch64.txt`: the only gate aarch64 code generation has |
 | clang test suite | Not run against c17 |
 
 These are not only test-coverage work. A differential probe against
@@ -392,7 +366,7 @@ Most of what is left is one thing.
 
 | Group | Note |
 |---|---|
-| Builtin folding | The whole of `execute/builtins/`. Each test defines its own `strlen`, `memcpy` or `printf` that calls `abort()` when `__OPTIMIZE__` is set, so a run-time failure there means c17 emitted a real call where gcc folded the builtin or expanded it inline. Nothing fails to *compile*, so no build is blocked; it is gcc-parity and code quality. Deferred by decision |
+| Builtin folding | The whole of `execute/builtins/`. Each test defines its own `strlen`, `memcpy` or `printf` that calls `abort()` when `__OPTIMIZE__` is set, so a run-time failure there means c17 emitted a real call where gcc folded the builtin or expanded it inline. Nothing fails to *compile*, so no build is blocked; it is gcc-parity and code quality. Deferred by decision. The same group: `execute/printf-chk-1`, `fprintf-chk-1`, `vprintf-chk-1` and `vfprintf-chk-1` at `-O2`, which expect `__printf_chk` with a constant format to become `puts`/`putchar`; `builtins/abs-2`, `abs-3`, `complex-1` and `memcmp` at `-O2`, which expect a constant call folded so that a `link_error` reference disappears; and `builtins/strncmp` at `-O0`, whose own `strncmp` returns an uninitialised value for `n == 0`, so it passes only when the call is folded to 0 -- which gcc does at every level |
 | Dead-call elimination proofs | `20030330-1` and `medce-1` at `-O0` (a constant branch keeps its arm there, which is recorded in DECISIONS.md), and `ieee/compare-fp-3` and `ieee/fp-cmp-6`/`-7`/`-9` at every level. Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link*. Standard C, and optimizer strength rather than a defect: what is missing is folding a comparison whose operands are known to relate |
 | `always_inline` on a library builtin | `pr46360`. `__attribute__((always_inline))` on a declaration of `strncpy` -- c17 refuses because it has no body to substitute, where gcc inlines its own expansion |
 | An `extern inline` reading a file-scope static | `pr38857`. A C17 6.7.4p3 constraint gcc does not enforce. Relaxed by `-fpermissive`; the test does not pass it |

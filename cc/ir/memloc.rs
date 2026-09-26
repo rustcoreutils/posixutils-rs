@@ -604,6 +604,7 @@ mod tests {
                 matching_output: None,
                 constraint: "=r".into(),
                 size: 64,
+                offset: 0,
             }],
             inputs: vec![],
             clobbers: vec![],

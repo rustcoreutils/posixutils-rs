@@ -189,6 +189,29 @@ impl Parser<'_> {
         Ok(Self::typed_expr(kind(Box::new(arg)), typ, token_pos))
     }
 
+    /// The parenthesised level of `__builtin_frame_address` or
+    /// `__builtin_return_address`.
+    ///
+    /// It must be a non-negative integer constant: the backend walks that
+    /// many frame records, and there is no loop for a run-time count. gcc
+    /// rejects anything else with the same "invalid argument" wording.
+    fn parse_frame_level(&mut self, builtin: &str) -> ParseResult<u32> {
+        self.expect_special(b'(')?;
+        let level = self.parse_assignment_expr()?;
+        self.expect_special(b')')?;
+        self.eval_const_expr(&level)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                ParseError::new(
+                    format!(
+                        "invalid argument to '{builtin}': \
+                         the level must be a non-negative integer constant"
+                    ),
+                    level.pos,
+                )
+            })
+    }
+
     /// `fabs(x)` / `fabsf(x)`, whose opcode reads its operand at a fixed
     /// width, so the argument has to arrive already converted.
     ///
@@ -1010,12 +1033,7 @@ impl Parser<'_> {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                let raw = Self::typed_expr(
-                    ExprKind::Signbit { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                );
-                Ok(self.normalise_predicate(raw, token_pos))
+                Ok(self.type_generic_signbit(arg, token_pos))
             })()),
             crate::kw::BUILTIN_SIGNBITF => Some((|| {
                 self.expect_special(b'(')?;
@@ -1032,13 +1050,7 @@ impl Parser<'_> {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                // Same reason as `__builtin_fabsl`: the `Signbit64` emitter
-                // calls `__signbit`, which takes a `double`, so it tested bit 63
-                // of an x87 mantissa -- the explicit integer bit, set for every
-                // normal value -- and answered "negative" for positive numbers.
-                let ld = self.types.longdouble_id;
-                let raw = self.libm_call("__signbitl", self.types.int_id, &[ld], arg, token_pos);
-                Ok(self.normalise_predicate(raw, token_pos))
+                Ok(self.signbit_long_double(arg, token_pos))
             })()),
             crate::kw::BUILTIN_CREAL
             | crate::kw::BUILTIN_CREALF
@@ -1369,14 +1381,9 @@ impl Parser<'_> {
             crate::kw::BUILTIN_FRAME_ADDRESS => Some((|| {
                 // __builtin_frame_address(level) - returns void*, address of frame at level
                 // Level 0 is the current frame, 1 is the caller's frame, etc.
-                // Returns NULL for invalid levels (beyond stack bounds)
-                self.expect_special(b'(')?;
-                let level = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
+                let level = self.parse_frame_level("__builtin_frame_address")?;
                 Ok(Self::typed_expr(
-                    ExprKind::FrameAddress {
-                        level: Box::new(level),
-                    },
+                    ExprKind::FrameAddress { level },
                     self.types.void_ptr_id,
                     token_pos,
                 ))
@@ -1384,14 +1391,9 @@ impl Parser<'_> {
             crate::kw::BUILTIN_RETURN_ADDRESS => Some((|| {
                 // __builtin_return_address(level) - returns void*, return address at level
                 // Level 0 is the current function's return address
-                // Returns NULL for invalid levels (beyond stack bounds)
-                self.expect_special(b'(')?;
-                let level = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
+                let level = self.parse_frame_level("__builtin_return_address")?;
                 Ok(Self::typed_expr(
-                    ExprKind::ReturnAddress {
-                        level: Box::new(level),
-                    },
+                    ExprKind::ReturnAddress { level },
                     self.types.void_ptr_id,
                     token_pos,
                 ))
@@ -2831,6 +2833,62 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_FPRINTF_UNLOCKED
                 | crate::kw::BUILTIN_FPUTS_UNLOCKED
         )
+    }
+
+    /// `__builtin_signbit`, which gcc makes type-generic: glibc's `signbit`
+    /// macro hands it every floating type, not only `double`.
+    ///
+    /// Treated as double-only, a `long double` argument reached the
+    /// `Signbit64` emitter unconverted, which reads the low 64 bits. On aarch64
+    /// that is the bottom of a binary128 significand, so `signbit(-1.0L)` was
+    /// 0. Each type goes where its sign bit is read correctly, and a
+    /// conversion on the way only ever widens or keeps the sign.
+    fn type_generic_signbit(&mut self, arg: Expr, pos: Position) -> Expr {
+        // gcc rejects anything but a real floating type, and so does c17:
+        // converting an integer to `double` would answer for a value the
+        // program never had.
+        if arg.typ.is_some_and(|t| !self.types.is_float(t)) {
+            crate::diag::error(
+                arg.pos,
+                "non-floating-point argument in call to function '__builtin_signbit'",
+            );
+        }
+        let kind = arg.typ.map(|t| self.types.kind(t));
+        match kind {
+            Some(TypeKind::LongDouble | TypeKind::Float128) => self.signbit_long_double(arg, pos),
+            Some(TypeKind::Float | TypeKind::Float16) => {
+                let arg = self.converted_to(arg, self.types.float_id, pos);
+                let raw = Self::typed_expr(
+                    ExprKind::Signbitf { arg: Box::new(arg) },
+                    self.types.int_id,
+                    pos,
+                );
+                self.normalise_predicate(raw, pos)
+            }
+            _ => {
+                let arg = self.converted_to(arg, self.types.double_id, pos);
+                let raw = Self::typed_expr(
+                    ExprKind::Signbit { arg: Box::new(arg) },
+                    self.types.int_id,
+                    pos,
+                );
+                self.normalise_predicate(raw, pos)
+            }
+        }
+    }
+
+    /// The sign of a `long double` (or `__float128`, converted to it without
+    /// losing the sign), through `__signbitl`.
+    ///
+    /// Same reason as `__builtin_fabsl`: the `Signbit64` emitter calls
+    /// `__signbit`, which takes a `double`, so it tested bit 63 of an x87
+    /// mantissa -- the explicit integer bit, set for every normal value -- and
+    /// answered "negative" for positive numbers.
+    fn signbit_long_double(&mut self, arg: Expr, pos: Position) -> Expr {
+        let ld = self.types.longdouble_id;
+        let arg = self.converted_to(arg, ld, pos);
+        let raw = self.libm_call("__signbitl", self.types.int_id, &[ld], arg, pos);
+        self.normalise_predicate(raw, pos)
     }
 
     /// Reduce a predicate to 0 or 1.

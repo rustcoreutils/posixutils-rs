@@ -9,48 +9,85 @@
 // Common register allocator utilities shared between architectures
 //
 
-use crate::abi::{Abi, ArgClass};
 use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
-use crate::types::{TypeKind, TypeTable};
+use crate::types::TypeTable;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
 /// Grow a frame's locals area by one slot, refusing a total no `i32`
-/// displacement can reach.
+/// displacement can reach -- counting what the prologue will add to it.
 ///
 /// [`TypeTable::MAX_STACK_OBJECT_BYTES`] bounds one object and
 /// [`crate::abi::slot_bytes`] enforces that. Neither bounds their *sum*, and
 /// `+=` on an `i32` wraps: a frame past two gigabytes came out negative and the
 /// prologue subtracted nothing. Both backends' `alloc_stack_slot` is the one
 /// place their locals area grows, so this is the one place the total can be
-/// checked -- including for the VLA and `alloca` extents the front end cannot
-/// measure statically.
+/// checked. A VLA or `alloca` extent never reaches it: the frame holds only an
+/// eight-byte pointer for one, and the extent is subtracted from the stack
+/// pointer at run time in a 64-bit register.
 ///
-/// The rounding happens inside, in `i64`, because at a legal
-/// `MAX_STACK_OBJECT_BYTES` with an over-aligned local the
-/// `(offset + align - 1)` that used to precede the `+=` overflowed on its own.
-pub fn grow_frame(offset: &mut i32, size: i32, alignment: i32, pos: crate::diag::Position) -> i32 {
+/// Admitting a frame here is a promise to everything downstream, so the check
+/// is against what the frame *becomes*, not what it is so far:
+///
+/// - The slot's own rounding happens inside, in `i64`: the offset up to the
+///   slot's alignment, and the size up to a multiple of it. Callers used to
+///   round the size first, in `i32`, so `_Alignas(16) char a[2147483640]`
+///   wrapped to a zero-byte slot before this check ever saw it.
+/// - `frame_align` is the alignment the whole locals area is rounded to at
+///   the end -- sixteen, or the over-aligned frame base's -- and that rounding
+///   can add almost twice it (`stack_size`). It is reserved here.
+/// - Everything else the prologue adds -- saved registers, the variadic save
+///   area -- is inside [`TypeTable::FRAME_HEADROOM_BYTES`], which
+///   `MAX_STACK_OBJECT_BYTES` already leaves below `i32::MAX`.
+///
+/// So every frame quantity computed later, in `i32`, stays in range without a
+/// check of its own. Before this, an accepted frame near the limit wrapped in
+/// `stack_size`, in the prologue total and in aarch64's frame zeroing -- which
+/// then looped forever, pushing instructions until the compiler ran out of
+/// memory.
+pub fn grow_frame(
+    offset: &mut i32,
+    size: i32,
+    alignment: i32,
+    frame_align: i32,
+    pos: crate::diag::Position,
+) -> i32 {
+    let align = i64::from(alignment.max(1));
     let mut want = i64::from(*offset);
     if alignment > 8 {
-        want = (want + i64::from(alignment) - 1) & !(i64::from(alignment) - 1);
+        want = (want + align - 1) & !(align - 1);
     }
-    want += i64::from(size.max(0));
+    want += (i64::from(size.max(0)) + align - 1) & !(align - 1);
+    let limit = TypeTable::MAX_STACK_OBJECT_BYTES as i64 - 2 * i64::from(frame_align.max(16));
     match i32::try_from(want) {
-        Ok(n) if (n as usize) <= TypeTable::MAX_STACK_OBJECT_BYTES => *offset = n,
+        Ok(n) if i64::from(n) <= limit => *offset = n,
         _ => {
             crate::diag::error_args(
                 pos,
                 "this function's stack frame needs {0} bytes, \
                  past the {1} bytes a frame can address",
-                &[
-                    &want.to_string(),
-                    &TypeTable::MAX_STACK_OBJECT_BYTES.to_string(),
-                ],
+                &[&want.to_string(), &limit.max(0).to_string()],
             );
             *offset = offset.saturating_add(8);
         }
     }
     *offset
+}
+
+/// Refuse an incoming stacked-argument area no `i32` displacement reaches.
+///
+/// Each parameter is inside the frame ceiling on its own; their sum is not,
+/// and `IncomingOff::take` saturates rather than wrapping so this one check
+/// at the end of a function's parameter layout sees it.
+pub fn check_incoming_area(end: i32, pos: crate::diag::Position) {
+    if end as usize > TypeTable::MAX_STACK_OBJECT_BYTES {
+        crate::diag::error_args(
+            pos,
+            "this function's stacked parameters need more than the {0} bytes \
+             a stack frame can address",
+            &[&TypeTable::MAX_STACK_OBJECT_BYTES.to_string()],
+        );
+    }
 }
 
 // ============================================================================
@@ -194,6 +231,69 @@ impl<R> ConstraintPoint<R> {
     pub fn operand_survives(&self, pseudo: PseudoId, start: usize, end: usize) -> bool {
         self.involved_pseudos.contains(&pseudo) && (start >= self.position || end <= self.position)
     }
+}
+
+/// The registers each candidate may not take because a constraint point
+/// inside its live range clobbers them -- unless `exempt` says the interval
+/// is one the point may clobber, which is where the backends differ.
+///
+/// A sweep over both lists in position order, so each point visits only the
+/// intervals live across it. Pairing every point with every interval made a
+/// function of a few thousand branches (`compile/20001226-1`) spend minutes
+/// here on both targets.
+pub fn constraint_clobbers<R: Copy + Ord>(
+    constraint_points: &[ConstraintPoint<R>],
+    intervals: &[LiveInterval],
+    candidates: &std::collections::BTreeSet<PseudoId>,
+    exempt: impl Fn(&ConstraintPoint<R>, &LiveInterval) -> bool,
+) -> BTreeMap<PseudoId, std::collections::BTreeSet<R>> {
+    let mut points: Vec<&ConstraintPoint<R>> = constraint_points.iter().collect();
+    points.sort_by_key(|cp| cp.position);
+    let mut pending: Vec<&LiveInterval> = intervals
+        .iter()
+        .filter(|i| candidates.contains(&i.pseudo))
+        .collect();
+    pending.sort_by_key(|i| i.start);
+
+    let mut forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<R>> = BTreeMap::new();
+    let mut next = 0;
+    let mut live: Vec<&LiveInterval> = Vec::new();
+    for cp in points {
+        // Intervals are live across the point when start <= position <= end.
+        while next < pending.len() && pending[next].start <= cp.position {
+            live.push(pending[next]);
+            next += 1;
+        }
+        live.retain(|i| i.end >= cp.position);
+        for interval in &live {
+            if exempt(cp, interval) {
+                continue;
+            }
+            forbidden
+                .entry(interval.pseudo)
+                .or_default()
+                .extend(cp.clobbers.iter().copied());
+        }
+    }
+    forbidden
+}
+
+/// The width each constant pseudo is defined at, from its `SetVal` -- the
+/// first, if there are several.
+///
+/// Built once for the chordal pre-pass, which asked it per interval by
+/// scanning the whole function; that made the pre-pass intervals x
+/// instructions.
+pub fn setval_sizes(func: &Function) -> HashMap<PseudoId, u32> {
+    let mut sizes = HashMap::new();
+    for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+        if insn.op == Opcode::SetVal {
+            if let Some(target) = insn.target {
+                sizes.entry(target).or_insert(insn.size);
+            }
+        }
+    }
+    sizes
 }
 
 // Common Functions
@@ -442,11 +542,33 @@ where
     let mut live_out: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
     let mut worklist: Vec<usize> = Vec::with_capacity(num_blocks);
 
+    // A constant, or a global's symbol, is never held in a register across
+    // blocks: both backends' pre-passes give it an immediate or a global
+    // location whatever its interval. With no def it would otherwise be
+    // propagated from every use back to the entry block -- one pseudo live
+    // across every block before its use -- and a function of n `if (x > i)`
+    // statements, one constant each, held n^2 set entries: gigabytes, and
+    // minutes, for n in the tens of thousands. Such a pseudo gets an interval
+    // spanning its uses and no liveness. One with a def (a 128-bit constant's
+    // `SetVal`, whose stack slot must survive to its last use) is tracked
+    // like any value.
+    let needs_no_liveness = |p: PseudoId| -> bool {
+        !def_blocks.contains_key(&p)
+            && func.get_pseudo(p).is_some_and(|ps| match &ps.kind {
+                PseudoKind::Val(_) | PseudoKind::FVal(_) => true,
+                PseudoKind::Sym(_) => func.local_of(p).is_none(),
+                _ => false,
+            })
+    };
+
     let propagate_use = |use_block: usize,
                          pseudo: PseudoId,
                          live_in: &mut [HashSet<PseudoId>],
                          live_out: &mut [HashSet<PseudoId>],
                          worklist: &mut Vec<usize>| {
+        if needs_no_liveness(pseudo) {
+            return;
+        }
         let defs = def_blocks.get(&pseudo);
         worklist.clear();
         // Seed the use block unconditionally — we are AT a use site,
@@ -612,6 +734,24 @@ where
         }
     }
 
+    // Phase D.1: the pseudos Phase C left without liveness span their uses.
+    for idx in 0..num_blocks {
+        for (&p, &first) in &first_pos_map[idx] {
+            if !needs_no_liveness(p) {
+                continue;
+            }
+            let last = last_pos_map[idx].get(&p).copied().unwrap_or(first);
+            interval_start
+                .entry(p)
+                .and_modify(|s| *s = (*s).min(first))
+                .or_insert(first);
+            interval_end
+                .entry(p)
+                .and_modify(|e| *e = (*e).max(last))
+                .or_insert(last);
+        }
+    }
+
     // Phase E: Detect loop back-edges and mark loop-carried pseudos
     let mut loop_pseudos: HashSet<PseudoId> = HashSet::new();
     for (idx, block) in func.blocks.iter().enumerate() {
@@ -650,7 +790,31 @@ where
     }
 }
 
-/// Identify Sym pseudos whose address is taken (SymAddr opcode).
+/// Each pseudo's live interval, by pseudo -- the first, if several.
+///
+/// Built once per coloring pass. Finding one by scanning every interval,
+/// once per spilled pseudo, made spilling intervals x spills: a function of
+/// tens of thousands of locals spent its time there.
+pub fn intervals_by_pseudo(intervals: &[LiveInterval]) -> HashMap<PseudoId, &LiveInterval> {
+    let mut by_pseudo = HashMap::with_capacity(intervals.len());
+    for interval in intervals {
+        by_pseudo.entry(interval.pseudo).or_insert(interval);
+    }
+    by_pseudo
+}
+
+/// Every pseudo live out of some block: one whose value crosses a block
+/// boundary.
+///
+/// Built once per function. Asking it per interval by scanning every block's
+/// live-out set made the chordal pre-pass intervals x blocks.
+pub fn live_out_anywhere(live_out: &[HashSet<PseudoId>]) -> HashSet<PseudoId> {
+    live_out.iter().flatten().copied().collect()
+}
+
+/// Identify Sym pseudos whose address is taken: by a `SymAddr`, or by an
+/// inline-asm memory operand that addresses the object in place, which hands
+/// the template its storage just the same.
 /// These must have stable stack addresses and cannot participate in slot reuse.
 pub fn identify_addr_taken_syms(func: &Function) -> HashSet<PseudoId> {
     let mut addr_taken = HashSet::new();
@@ -659,6 +823,13 @@ pub fn identify_addr_taken_syms(func: &Function) -> HashSet<PseudoId> {
             if insn.op == Opcode::SymAddr {
                 for &src in &insn.src {
                     addr_taken.insert(src);
+                }
+            }
+            if let Some(asm) = insn.asm_data.as_ref().filter(|_| insn.op == Opcode::Asm) {
+                for c in asm.outputs.iter().chain(asm.inputs.iter()) {
+                    if c.is_memory() {
+                        addr_taken.insert(c.pseudo);
+                    }
                 }
             }
         }
@@ -792,20 +963,51 @@ pub fn assign_alloca_slots<L, F>(
     }
 }
 
-/// Spill GP arguments that live in caller-saved registers and cross a
-/// call instruction.
+/// Does anything overwrite `reg` while `interval` is live -- a constraint
+/// point that clobbers it and does not exempt the interval's pseudo?
 ///
-/// The GP path is identical between backends modulo the per-arch
-/// callbacks: the caller supplies which registers are arg-passing,
-/// how to extract a register from a `Loc`, how to construct the new
-/// `Loc::Stack` for the spilled value, and how to record the spill
-/// metadata for the prologue. The stack-offset sign convention is
-/// folded into `mk_stack_loc` and `record_spill` so this helper
-/// itself is sign-agnostic.
+/// The coloring pass asks the same question of the pseudos it places, through
+/// [`constraint_clobbers`], which is where each backend's `exempt` rule comes
+/// from; an ABI-pinned argument never reaches that pass, so
+/// [`spill_gp_args_across`] asks it here.
+pub fn clobbered_while_live<R: PartialEq>(
+    interval: &LiveInterval,
+    reg: R,
+    constraint_points: &[ConstraintPoint<R>],
+    exempt: impl Fn(&ConstraintPoint<R>, &LiveInterval) -> bool,
+) -> bool {
+    constraint_points.iter().any(|cp| {
+        interval.start <= cp.position
+            && cp.position <= interval.end
+            && cp.clobbers.contains(&reg)
+            && !exempt(cp, interval)
+    })
+}
+
+/// Move an ABI-pinned GP argument out of its register when something
+/// overwrites that register while the argument is live.
+///
+/// An argument arrives pre-colored in its ABI register and never goes through
+/// coloring, so the forbidden-color machinery that keeps an ordinary value out
+/// of a clobbered register does not apply to it. `overwritten` says whether its
+/// register is destroyed within its interval: a call (every argument register
+/// is caller-saved), or a constraint point that clobbers it
+/// ([`clobbered_while_live`]) -- inline asm, an atomic's fixed scratch, a
+/// thread-local sequence that calls a resolver or getter. One rule for both
+/// backends: aarch64 once asked only about calls, so a thread-local access
+/// under the descriptor or Mach-O TLV model, which returns its result in x0,
+/// left every later use of an argument that arrived in x0 reading the
+/// thread-local's address.
+///
+/// The caller supplies which registers are argument registers, how to extract
+/// a register from a `Loc`, how to construct the spilled `Loc`, and how to
+/// record the spill for the prologue. The stack-offset sign convention is
+/// folded into `mk_stack_loc` and `record_spill`, so this helper is
+/// sign-agnostic.
 #[allow(clippy::too_many_arguments)]
-pub fn spill_gp_args_across_calls<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpill, PushFree>(
+pub fn spill_gp_args_across<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpill, PushFree>(
     intervals: &[LiveInterval],
-    call_positions: &[usize],
+    overwritten: impl Fn(&LiveInterval, R) -> bool,
     locations: &mut HashMap<PseudoId, L>,
     stack_offset: &mut i32,
     is_arg_reg: IsArg,
@@ -832,7 +1034,7 @@ pub fn spill_gp_args_across_calls<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpi
         if !is_arg_reg(reg) {
             continue;
         }
-        if !interval_crosses_call(interval, call_positions) {
+        if !overwritten(interval, reg) {
             continue;
         }
         *stack_offset += 8;
@@ -963,6 +1165,17 @@ pub fn build_interference_graph(
                     }
                 }
             }
+            // An early-clobber asm output is written before the template
+            // has read its inputs, so it interferes with every one of them
+            // -- a register input, and the address of a memory operand, which
+            // the template also reads -- even an input that dies here, whose
+            // register a plain output may take. A tied input names the
+            // output's own pseudo and so shares with it by construction.
+            if insn.op == Opcode::Asm {
+                if let Some(asm) = &insn.asm_data {
+                    add_early_clobber_edges(&mut graph, asm, candidates);
+                }
+            }
             // Each def interferes with everything currently live AND
             // with the instruction's other defs AND with each src
             // (for the lowering-correctness reason described above).
@@ -1021,6 +1234,32 @@ pub fn build_interference_graph(
     graph
 }
 
+/// Edges from each early-clobber register output of one asm statement to
+/// every pseudo the statement reads: its inputs, and the addresses of its
+/// memory outputs.
+fn add_early_clobber_edges(
+    graph: &mut InterferenceGraph,
+    asm: &crate::ir::AsmData,
+    candidates: &std::collections::BTreeSet<PseudoId>,
+) {
+    let read = asm
+        .inputs
+        .iter()
+        .chain(asm.outputs.iter().filter(|o| o.is_memory()))
+        .map(|c| c.pseudo)
+        .filter(|p| candidates.contains(p));
+    let read: Vec<PseudoId> = read.collect();
+    for out in &asm.outputs {
+        if !out.is_early_clobber() || out.is_memory() || !candidates.contains(&out.pseudo) {
+            continue;
+        }
+        for &p in &read {
+            // `add_edge` ignores a self-edge: a tied input is the output.
+            graph.add_edge(out.pseudo, p);
+        }
+    }
+}
+
 /// Walk `func` and collect every `Opcode::Copy` instruction's
 /// `(target, src)` pair as a coalescing candidate. Skips Copies
 /// without a target or with `src.len() != 1` (degenerate cases).
@@ -1042,6 +1281,53 @@ pub fn find_copy_coalesce_candidates(func: &Function) -> Vec<(PseudoId, PseudoId
     out
 }
 
+/// The pseudos an inline-asm template needs in registers: register-class
+/// inputs and outputs, and the address of a memory operand that is a
+/// run-time value rather than a named object.
+///
+/// gcc guarantees each such operand a register at the asm, spilling other
+/// values to make room. Colored in ordinary order, an operand could be the
+/// value the allocator chose to spill, and then codegen had to find it a
+/// register at the last moment -- on x86-64 by borrowing one that held another
+/// operand or a live value.
+pub fn asm_register_operands(func: &Function) -> std::collections::BTreeSet<PseudoId> {
+    let mut out = std::collections::BTreeSet::new();
+    for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+        let Some(asm) = insn.asm_data.as_ref().filter(|_| insn.op == Opcode::Asm) else {
+            continue;
+        };
+        for c in asm.outputs.iter().chain(asm.inputs.iter()) {
+            // A memory operand whose address is a run-time value needs that
+            // address in a base register just as much, which is how gcc
+            // treats it. One that names its object's `Sym` is addressed in
+            // place and needs none.
+            let wants = if c.is_memory() {
+                !func
+                    .get_pseudo(c.pseudo)
+                    .is_some_and(|p| matches!(p.kind, crate::ir::PseudoKind::Sym(_)))
+            } else {
+                c.wants_register()
+            };
+            if wants {
+                out.insert(c.pseudo);
+            }
+        }
+    }
+    out
+}
+
+/// `order` with the asm register operands moved to the front, each group
+/// keeping its relative order, so greedy coloring places them first.
+pub fn asm_operands_first(
+    order: Vec<PseudoId>,
+    asm_ops: &std::collections::BTreeSet<PseudoId>,
+) -> Vec<PseudoId> {
+    let (mut first, rest): (Vec<PseudoId>, Vec<PseudoId>) =
+        order.into_iter().partition(|p| asm_ops.contains(p));
+    first.extend(rest);
+    first
+}
+
 /// Maximum Cardinality Search (MCS) ordering. The reverse of this
 /// ordering is a perfect elimination ordering when the graph is
 /// chordal; greedy coloring in MCS order yields an optimal coloring.
@@ -1050,28 +1336,27 @@ pub fn find_copy_coalesce_candidates(func: &Function) -> Vec<(PseudoId, PseudoId
 /// unprocessed vertex with maximum weight (ties broken by smallest
 /// pseudo id for determinism), add it to the ordering, increment
 /// weight of each unprocessed neighbor.
+///
+/// The unprocessed vertices are kept ordered by `(weight, Reverse(id))`, so
+/// the pick is the last entry rather than a scan of all of them: the scan made
+/// ordering quadratic in the vertex count, minutes for a function of a few
+/// thousand branches.
 pub fn mcs_ordering(graph: &InterferenceGraph) -> Vec<PseudoId> {
-    let mut weight: BTreeMap<PseudoId, usize> = BTreeMap::new();
-    for &v in &graph.vertices {
-        weight.insert(v, 0);
-    }
+    use std::cmp::Reverse;
+    // Weight of each vertex not yet ordered; absent once it is.
+    let mut weight: HashMap<PseudoId, usize> = graph.vertices.iter().map(|&v| (v, 0)).collect();
+    let mut queue: std::collections::BTreeSet<(usize, Reverse<PseudoId>)> =
+        graph.vertices.iter().map(|&v| (0, Reverse(v))).collect();
     let mut order: Vec<PseudoId> = Vec::with_capacity(graph.vertices.len());
-    let mut remaining: std::collections::BTreeSet<PseudoId> = graph.vertices.clone();
-    while !remaining.is_empty() {
-        // Pick max-weight (tie-break: smaller PseudoId wins).
-        let pick = *remaining
-            .iter()
-            .max_by(|a, b| {
-                let wa = weight.get(*a).copied().unwrap_or(0);
-                let wb = weight.get(*b).copied().unwrap_or(0);
-                wa.cmp(&wb).then(b.0.cmp(&a.0))
-            })
-            .unwrap();
-        remaining.remove(&pick);
+    // Max weight; among equals the greatest `Reverse`, i.e. the smallest id.
+    while let Some((_, Reverse(pick))) = queue.pop_last() {
+        weight.remove(&pick);
         order.push(pick);
         for n in graph.neighbors(pick) {
-            if remaining.contains(&n) {
-                *weight.entry(n).or_insert(0) += 1;
+            if let Some(w) = weight.get_mut(&n) {
+                queue.remove(&(*w, Reverse(n)));
+                *w += 1;
+                queue.insert((*w, Reverse(n)));
             }
         }
     }
@@ -1247,54 +1532,13 @@ pub fn try_reuse_stack_slot(
     None
 }
 
-// `AbiLowering` is the single place the allocator asks the ABI how an
-// argument is passed:
-//
-//   * Build it once per function with the `Function` + `TypeTable`. It
-//     pre-indexes the function's pseudos by `Arg(n)` for O(1) lookup
-//     and detects the hidden sret pointer.
-//
-//   * For each parameter, `iter_args(abi)` yields an `AbiArg` carrying
-//     the `ArgClass` from `abi.classify_param` plus a handful of type
-//     tiebreakers (`is_complex`, `is_long_double`, `is_int128`) that
-//     `ArgClass` alone cannot disambiguate — most notably, x86_64
-//     `_Complex float`/`_Complex double` and a 2-eightbyte all-SSE
-//     struct both classify as `Direct { classes: [Sse, Sse] }` but the
-//     backend routes them differently.
-//
-// Backends still own the actual `Loc` decision because `Loc` is per-arch
-// (each has its own `Reg`/`XmmReg`/`VReg`). They dispatch on `arg.class`
-// and the `is_*` flags.
-
-/// Per-argument context yielded by `AbiLowering::iter_args`.
+/// A function's incoming-argument pseudos, indexed for the allocators.
 ///
-/// Carries the ABI classification together with the type tiebreakers a
-/// backend may need beyond `ArgClass` alone.
-#[derive(Debug, Clone)]
-pub struct AbiArg {
-    /// The pseudo representing this argument in the function's IR.
-    pub pseudo: PseudoId,
-    /// Classification produced by `abi.classify_param(typ, types)`.
-    pub class: ArgClass,
-    /// The parameter's type. `ArgClass` carries a size but not an alignment,
-    /// and the two do not follow one another: `struct { long a, b; }` is
-    /// sixteen bytes and eight-byte aligned, while `__int128` is sixteen of
-    /// each. A stacked argument's address depends on the alignment.
-    pub typ: crate::types::TypeId,
-    /// True iff the type is `__int128` / `unsigned __int128`. Backends
-    /// always allocate an aligned local stack slot for int128 even when
-    /// the value arrives in a register pair.
-    pub is_int128: bool,
-}
-
-/// Allocator-side adapter over `cc/abi/*::classify_param`.
-///
-/// Construct once per function being lowered, then iterate the function's
-/// parameters with `iter_args(abi)`. The struct caches the sret detection
-/// and a per-`Arg(n)` pseudo index so per-arg work is O(1).
-pub struct AbiLowering<'a> {
-    func: &'a Function,
-    types: &'a TypeTable,
+/// Built once per function: it indexes the pseudos by `Arg(n)` for O(1)
+/// lookup and detects the hidden sret pointer. How each argument is *passed*
+/// is the backend's own layout -- on aarch64 `param_layout`, the one rule
+/// `va_start` reads as well.
+pub struct AbiLowering {
     /// PseudoId for each `Arg(n)`. `n` indexes the vector; absent
     /// positions are `None`. Vector length covers `0..=max_arg_index`.
     pub arg_pseudos: Vec<Option<PseudoId>>,
@@ -1307,12 +1551,9 @@ pub struct AbiLowering<'a> {
     pub arg_idx_offset: u32,
 }
 
-impl<'a> AbiLowering<'a> {
-    /// Build an `AbiLowering` for `func`. Does not consult any `Abi`
-    /// yet — the per-arg classification is produced lazily by
-    /// `iter_args` so the same `AbiLowering` can be reused across
-    /// alternative calling-convention overrides if ever needed.
-    pub fn new(func: &'a Function, types: &'a TypeTable) -> Self {
+impl AbiLowering {
+    /// Build an `AbiLowering` for `func`.
+    pub fn new(func: &Function) -> Self {
         // Detect the hidden return pointer for large struct returns.
         // The linearizer emits it as `Arg(0)` with the literal name
         // `__sret`, shifting all normal-parameter `Arg(n)` indices by 1.
@@ -1345,33 +1586,96 @@ impl<'a> AbiLowering<'a> {
         }
 
         Self {
-            func,
-            types,
             arg_pseudos,
             sret_pseudo,
             arg_idx_offset,
         }
     }
+}
 
-    /// Iterate the function's parameters in declaration order, yielding
-    /// the per-arg context backends need. The sret pseudo (if any) is
-    /// not yielded — callers handle it explicitly via `self.sret_pseudo`.
-    pub fn iter_args<'b>(&'b self, abi: &'b dyn Abi) -> impl Iterator<Item = AbiArg> + 'b {
-        self.func
-            .params
-            .iter()
-            .enumerate()
-            .filter_map(move |(i, (_name, typ))| {
-                let arg_idx = (i as u32) + self.arg_idx_offset;
-                let pseudo = self.arg_pseudos.get(arg_idx as usize).copied().flatten()?;
-                let class = abi.classify_param(*typ, self.types);
-                let kind = self.types.kind(*typ);
-                Some(AbiArg {
-                    pseudo,
-                    class,
-                    typ: *typ,
-                    is_int128: kind == TypeKind::Int128,
-                })
-            })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A slot's size is rounded up to its alignment inside the check, and the
+    /// frame's final rounding is reserved: the largest admitted locals area
+    /// leaves room for both, and one byte more is refused rather than wrapped.
+    #[test]
+    fn test_grow_frame_reserves_what_follows() {
+        let pos = crate::diag::Position::default();
+        let limit = TypeTable::MAX_STACK_OBJECT_BYTES as i32 - 2 * 16;
+        let mut offset = 0;
+        assert_eq!(grow_frame(&mut offset, limit, 8, 16, pos), limit);
+
+        // An `_Alignas(16)` object whose size is not a multiple of 16 takes
+        // the rounded size.
+        let mut offset = 0;
+        assert_eq!(grow_frame(&mut offset, 24, 16, 16, pos), 32);
+
+        // Past the limit: refused, and the offset does not wrap.
+        let mut offset = limit;
+        let after = grow_frame(&mut offset, 16, 8, 16, pos);
+        assert!(after > 0, "offset wrapped to {after}");
+    }
+
+    /// Maximum weight first, and the smallest id among equals: `4` is picked
+    /// before `3` because ordering `2` gave it a neighbour, though `3` has the
+    /// smaller id. The order is what greedy coloring depends on, so the
+    /// ordered-set pick has to reproduce the scan it replaced exactly.
+    #[test]
+    fn test_mcs_ordering_weight_then_smallest_id() {
+        let mut graph = InterferenceGraph::new();
+        for v in 1..=4 {
+            graph.add_vertex(PseudoId(v));
+        }
+        graph.add_edge(PseudoId(2), PseudoId(4));
+        graph.add_edge(PseudoId(3), PseudoId(4));
+        assert_eq!(
+            mcs_ordering(&graph),
+            [PseudoId(1), PseudoId(2), PseudoId(4), PseudoId(3)]
+        );
+    }
+
+    fn interval(p: u32, start: usize, end: usize) -> LiveInterval {
+        LiveInterval {
+            pseudo: PseudoId(p),
+            start,
+            end,
+            in_loop: false,
+        }
+    }
+
+    /// A point clobbers every candidate live across it, ends inclusive, and
+    /// nothing else: not an interval that ended before it, not one that
+    /// starts after it, not a non-candidate, and not one `exempt` excuses.
+    #[test]
+    fn test_constraint_clobbers_sweep() {
+        let intervals = [
+            interval(1, 0, 10),
+            interval(2, 5, 5),
+            interval(3, 6, 30),
+            interval(4, 0, 40),
+            interval(5, 26, 40),
+        ];
+        let points = [
+            ConstraintPoint {
+                position: 25,
+                clobbers: vec![2u8],
+                involved_pseudos: vec![PseudoId(3)],
+            },
+            ConstraintPoint {
+                position: 5,
+                clobbers: vec![1u8],
+                involved_pseudos: vec![],
+            },
+        ];
+        let candidates: std::collections::BTreeSet<PseudoId> =
+            [1, 2, 3, 5].into_iter().map(PseudoId).collect();
+        let forbidden = constraint_clobbers(&points, &intervals, &candidates, |cp, i| {
+            cp.involved_pseudos.contains(&i.pseudo)
+        });
+        let expect: BTreeMap<PseudoId, std::collections::BTreeSet<u8>> =
+            [(PseudoId(1), [1u8].into()), (PseudoId(2), [1u8].into())].into();
+        assert_eq!(forbidden, expect);
     }
 }

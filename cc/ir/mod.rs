@@ -48,16 +48,9 @@ use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-const DEFAULT_INSN_CAPACITY: usize = 32;
-const DEFAULT_CFG_EDGE_CAPACITY: usize = 4;
-const DEFAULT_SRC_CAPACITY: usize = 4;
 /// Operands a typical instruction reads; see [`Instruction::uses`].
 const DEFAULT_USE_CAPACITY: usize = 4;
-const DEFAULT_PHI_CAPACITY: usize = 4;
 const DEFAULT_PARAM_CAPACITY: usize = 8;
-const DEFAULT_BLOCK_CAPACITY: usize = 512;
-const DEFAULT_PSEUDO_CAPACITY: usize = 2048;
-const DEFAULT_LOCAL_CAPACITY: usize = 64;
 
 // Call ABI Information
 
@@ -261,8 +254,8 @@ pub enum Opcode {
     Unreachable, // Code path is never reached (undefined behavior if reached)
 
     // Stack introspection
-    FrameAddress,  // __builtin_frame_address(level) - returns frame pointer at level
-    ReturnAddress, // __builtin_return_address(level) - returns return address at level
+    FrameAddress, // __builtin_frame_address(level) - frame pointer `frame_level()` frames up
+    ReturnAddress, // __builtin_return_address(level) - return address `frame_level()` frames up
 
     // Non-local jumps (setjmp/longjmp)
     Setjmp,  // Save execution context, returns 0 or value from longjmp
@@ -742,13 +735,23 @@ pub struct AsmConstraint {
     pub name: Option<String>,
     /// Matching output operand index (for constraints like "0")
     pub matching_output: Option<usize>,
-    /// The constraint string (e.g., "r", "a", "=r", "+m")
-    /// Used by codegen to determine specific register requirements
-    /// Note: Early clobber (&) is parsed but not explicitly handled since our
-    /// simple register allocator doesn't share registers between inputs/outputs
+    /// The constraint string (e.g., "r", "a", "=r", "+m", "=&r").
+    /// Used by codegen to determine specific register requirements; an
+    /// early-clobber `&` is read through [`AsmConstraint::is_early_clobber`].
     pub constraint: String,
     /// Size of the operand in bits (8, 16, 32, 64), derived from the C type
     pub size: u32,
+    /// For a memory operand whose `pseudo` is a `Sym` -- the object itself,
+    /// not an address held in a value -- the byte offset into that object.
+    /// Zero otherwise.
+    ///
+    /// A named object at a constant offset needs no register: the backend
+    /// addresses it where it lives (`-N(%rbp)`, `[x29, #N]`, `sym(%rip)`), as
+    /// gcc does. Passed as an address value instead, it competed for a
+    /// register like any other operand and, once a statement had more
+    /// operands than registers, was spilled -- and the slot holding the
+    /// address was then substituted as if it were the object.
+    pub offset: i64,
 }
 
 impl AsmConstraint {
@@ -785,6 +788,37 @@ impl AsmConstraint {
 
         has_memory_class && !has_non_memory_class
     }
+
+    /// True for an early-clobber output (`"=&r"`, `"+&r"`, `"&=r"`): the
+    /// template writes it before it has read every input, so it may not share
+    /// a register with any input, even one whose value dies at the asm.
+    pub fn is_early_clobber(&self) -> bool {
+        self.constraint.contains('&')
+    }
+
+    /// True when the operand may be given a register: a register class
+    /// (`r`, a named register letter, `g`, ...) rather than only memory or
+    /// only an immediate (`i`, `n`).
+    pub fn wants_register(&self) -> bool {
+        self.constraint.chars().any(|c| {
+            matches!(
+                c,
+                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'l' | 'g' | 'x' | 'w' | 'y'
+            ) || c.is_ascii_digit()
+        })
+    }
+
+    /// True for the input a `"+"` output implies: it carries the output's
+    /// constraint (`"+r"`) rather than a matching digit (`"0"`).
+    ///
+    /// gcc numbers operands as outputs, then the inputs the source wrote --
+    /// an explicit `"0"` among them -- and only then these hidden inputs, in
+    /// output order; `asm goto` labels come after all of them. So a hidden
+    /// input takes the *last* operand numbers, never one between the explicit
+    /// ones.
+    pub fn is_hidden_readwrite_input(&self) -> bool {
+        self.matching_output.is_some() && self.constraint.contains('+')
+    }
 }
 
 /// Data for an inline assembly instruction
@@ -820,7 +854,9 @@ pub struct Instruction {
     pub bb_true: Option<BasicBlockId>,
     /// For conditional branches: false target
     pub bb_false: Option<BasicBlockId>,
-    /// For memory ops: offset
+    /// For memory ops: offset, read by a backend through
+    /// [`Instruction::displacement`]. For `FrameAddress`/`ReturnAddress`: the
+    /// level, read through [`Instruction::frame_level`].
     pub offset: i64,
     /// For phi nodes: list of (bb, pseudo) pairs
     pub phi_list: Vec<(BasicBlockId, PseudoId)>,
@@ -875,19 +911,19 @@ impl Default for Instruction {
         Self {
             op: Opcode::Nop,
             target: None,
-            src: Vec::with_capacity(DEFAULT_SRC_CAPACITY),
+            src: Vec::new(),
             typ: None,
             bb_true: None,
             bb_false: None,
             offset: 0,
-            phi_list: Vec::with_capacity(DEFAULT_PHI_CAPACITY),
+            phi_list: Vec::new(),
             func_name: None,
             size: 0,
             src_size: 0,
             src_typ: None,
             switch_cases: Vec::new(),
             switch_default: None,
-            arg_types: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
+            arg_types: Vec::new(),
             variadic_arg_start: None,
             ends_with_va_arg_pack: false,
             is_noreturn_call: false,
@@ -1065,16 +1101,26 @@ impl Instruction {
     /// If a field that can hold a `PseudoId` is ever added to `Instruction`,
     /// it must be added here too, or an address escapes invisibly.
     pub fn mentions(&self, id: PseudoId) -> bool {
-        self.src.contains(&id)
-            || self.target == Some(id)
-            || self.indirect_target == Some(id)
-            || self.phi_list.iter().any(|&(_, p)| p == id)
-            || self.asm_data.as_ref().is_some_and(|d| {
-                d.inputs
-                    .iter()
-                    .chain(d.outputs.iter())
-                    .any(|c| c.pseudo == id)
-            })
+        self.mentioned().any(|p| p == id)
+    }
+
+    /// Every pseudo this instruction names, in any role, possibly repeated --
+    /// the enumeration [`Instruction::mentions`] asks about one pseudo at a
+    /// time. For a pass that needs the answer for every symbol at once, which
+    /// asking `mentions` per symbol per instruction makes quadratic.
+    pub fn mentioned(&self) -> impl Iterator<Item = PseudoId> + '_ {
+        let asm = self
+            .asm_data
+            .iter()
+            .flat_map(|d| d.inputs.iter().chain(d.outputs.iter()))
+            .map(|c| c.pseudo);
+        self.src
+            .iter()
+            .copied()
+            .chain(self.target)
+            .chain(self.indirect_target)
+            .chain(self.phi_list.iter().map(|&(_, p)| p))
+            .chain(asm)
     }
 
     /// Every pseudo this instruction reads.
@@ -1190,6 +1236,41 @@ impl Instruction {
             .with_target(target)
             .with_src(src)
             .with_type_and_size(typ, size)
+    }
+
+    /// `FrameAddress` or `ReturnAddress` for `level` frames up. The level is a
+    /// constant the parser has already evaluated, so it travels as an
+    /// immediate rather than a pseudo: the backend walks that many frame
+    /// records, which it cannot do for a run-time value.
+    pub fn frame_walk(op: Opcode, target: PseudoId, level: u32, void_ptr: TypeId) -> Self {
+        debug_assert!(matches!(op, Opcode::FrameAddress | Opcode::ReturnAddress));
+        Self::new(op)
+            .with_target(target)
+            .with_offset(i64::from(level))
+            .with_type_and_size(void_ptr, 64)
+    }
+
+    /// The level of a `FrameAddress`/`ReturnAddress` built by
+    /// [`Instruction::frame_walk`].
+    pub fn frame_level(&self) -> u32 {
+        debug_assert!(matches!(
+            self.op,
+            Opcode::FrameAddress | Opcode::ReturnAddress
+        ));
+        self.offset as u32
+    }
+
+    /// A load's or store's offset as the machine displacement it becomes.
+    ///
+    /// Always in range: `Linearizer::emit` folds any offset past `i32` into
+    /// the address before the instruction enters the IR, and no pass rewrites
+    /// an offset afterwards (`validate.rs` I6). The backends used to narrow
+    /// with `as i32`, which wrapped a member more than 2 GiB into a struct to
+    /// a displacement gigabytes away.
+    pub fn displacement(&self) -> i32 {
+        debug_assert!(matches!(self.op, Opcode::Load | Opcode::Store));
+        i32::try_from(self.offset)
+            .expect("a load or store offset past i32 reached a backend; Linearizer::emit folds it")
     }
 
     pub fn load(target: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: u32) -> Self {
@@ -1600,12 +1681,12 @@ impl Default for BasicBlock {
     fn default() -> Self {
         Self {
             id: BasicBlockId(0),
-            insns: Vec::with_capacity(DEFAULT_INSN_CAPACITY),
-            parents: Vec::with_capacity(DEFAULT_CFG_EDGE_CAPACITY),
-            children: Vec::with_capacity(DEFAULT_CFG_EDGE_CAPACITY),
+            insns: Vec::new(),
+            parents: Vec::new(),
+            children: Vec::new(),
             label: None,
             addr_taken: false,
-            phi_map: HashMap::with_capacity(DEFAULT_PHI_CAPACITY),
+            phi_map: HashMap::new(),
         }
     }
 }
@@ -1638,20 +1719,6 @@ impl BasicBlock {
             .last()
             .map(|i| i.op.is_terminator())
             .unwrap_or(false)
-    }
-
-    /// Add a predecessor
-    pub fn add_parent(&mut self, parent: BasicBlockId) {
-        if !self.parents.contains(&parent) {
-            self.parents.push(parent);
-        }
-    }
-
-    /// Add a successor
-    pub fn add_child(&mut self, child: BasicBlockId) {
-        if !self.children.contains(&child) {
-            self.children.push(child);
-        }
     }
 
     /// Remove edges to/from blocks not in the keep set
@@ -1760,6 +1827,9 @@ pub struct Function {
     pub name: String,
     /// `weak`, `used`, `section(...)`, `visibility(...)`.
     pub symbol_attrs: crate::parse::ast::SymbolAttrs,
+    /// `__attribute__((aligned(N)))`: the byte alignment the function's code
+    /// must start at, or `None` for the target's own.
+    pub align: Option<u32>,
     /// Return type (interned TypeId)
     pub return_type: TypeId,
     /// Parameter names and types (interned TypeIds)
@@ -1852,14 +1922,15 @@ impl Default for Function {
         Self {
             name: String::new(),
             symbol_attrs: Default::default(),
+            align: None,
             takes_label_addr: false,
             return_type: TypeId::INVALID,
             params: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
-            blocks: Vec::with_capacity(DEFAULT_BLOCK_CAPACITY),
+            blocks: Vec::new(),
             entry: BasicBlockId(0),
-            pseudos: Vec::with_capacity(DEFAULT_PSEUDO_CAPACITY),
+            pseudos: Vec::new(),
             next_pseudo: 0,
-            locals: HashMap::with_capacity(DEFAULT_LOCAL_CAPACITY),
+            locals: HashMap::new(),
             is_static: false,
             emit: true,
             is_noreturn: false,
@@ -1871,8 +1942,8 @@ impl Default for Function {
             is_inline: false,
             implicit_param_copies: Vec::new(),
             ret_is_address: false,
-            block_idx: HashMap::with_capacity(DEFAULT_BLOCK_CAPACITY),
-            pseudo_idx: HashMap::with_capacity(DEFAULT_PSEUDO_CAPACITY),
+            block_idx: HashMap::new(),
+            pseudo_idx: HashMap::new(),
         }
     }
 }
@@ -1927,6 +1998,23 @@ impl Function {
         let idx = self.pseudos.len();
         self.pseudo_idx.insert(pseudo.id, idx);
         self.pseudos.push(pseudo);
+    }
+
+    /// Is a pseudo with this id registered?
+    pub fn has_pseudo(&self, id: PseudoId) -> bool {
+        self.pseudo_idx.contains_key(&id)
+    }
+
+    /// Register `pseudo`, overwriting any pseudo with the same id where it
+    /// stands, so no other pseudo moves and `pseudo_idx` stays right.
+    ///
+    /// Removing the old one and appending the new one shifted every later
+    /// pseudo down a position under an index nobody rebuilt.
+    pub fn replace_pseudo(&mut self, pseudo: Pseudo) {
+        match self.pseudo_idx.get(&pseudo.id) {
+            Some(&idx) => self.pseudos[idx] = pseudo,
+            None => self.add_pseudo(pseudo),
+        }
     }
 
     /// Rebuild block index after bulk mutation of `self.blocks`
@@ -1996,6 +2084,21 @@ impl Function {
                 _ => None,
             })
             .filter(|local| local.sym == sym)
+    }
+
+    /// The pseudo standing for each incoming argument, by `Arg` index -- the
+    /// first, if several claim one.
+    ///
+    /// Built once for a walk over the parameters: finding each parameter's
+    /// pseudo by scanning `pseudos` made that walk parameters x pseudos.
+    pub fn arg_pseudos(&self) -> HashMap<u32, &Pseudo> {
+        let mut by_arg = HashMap::new();
+        for pseudo in &self.pseudos {
+            if let PseudoKind::Arg(idx) = pseudo.kind {
+                by_arg.entry(idx).or_insert(pseudo);
+            }
+        }
+        by_arg
     }
 
     /// Allocate a new pseudo ID
@@ -2409,6 +2512,12 @@ pub struct Module {
     /// External thread-local symbols (declared extern _Thread_local but not defined)
     /// These need TLS access pattern instead of GOT
     pub extern_tls_symbols: HashSet<String>,
+    /// The alignment, in bytes, of each data object declared `extern` here and
+    /// not defined: at least its declared type's, which is all an object
+    /// defined elsewhere is known to have. A backend that folds a symbol's low
+    /// bits into a scaled load or store (aarch64 `:lo12:`) needs it; a
+    /// definition's alignment is on its `GlobalDef`.
+    pub extern_object_align: HashMap<String, u32>,
     /// Compilation directory (for DW_AT_comp_dir in DWARF)
     pub comp_dir: Option<String>,
     /// Primary source filename (for DW_AT_name in DWARF)
@@ -3327,6 +3436,49 @@ mod tests {
         // setjmp/longjmp save/restore arbitrary execution context.
         assert!(Instruction::new(Opcode::Setjmp).is_memory_barrier());
         assert!(Instruction::new(Opcode::Longjmp).is_memory_barrier());
+    }
+
+    fn constraint(c: &str, matching_output: Option<usize>) -> AsmConstraint {
+        AsmConstraint {
+            pseudo: PseudoId(0),
+            name: None,
+            matching_output,
+            constraint: c.to_string(),
+            size: 64,
+            offset: 0,
+        }
+    }
+
+    /// `&` anywhere in the constraint makes an output early-clobber.
+    #[test]
+    fn test_asm_constraint_early_clobber() {
+        for c in ["=&r", "&=r", "+&r", "=&a"] {
+            assert!(constraint(c, None).is_early_clobber(), "{c}");
+        }
+        for c in ["=r", "+r", "r", "=m", "0"] {
+            assert!(!constraint(c, None).is_early_clobber(), "{c}");
+        }
+    }
+
+    /// The input a `"+"` output implies is hidden; an explicit `"0"` is not.
+    #[test]
+    fn test_asm_constraint_hidden_readwrite_input() {
+        assert!(constraint("+r", Some(0)).is_hidden_readwrite_input());
+        assert!(constraint("+m", Some(1)).is_hidden_readwrite_input());
+        assert!(!constraint("0", Some(0)).is_hidden_readwrite_input());
+        assert!(!constraint("r", None).is_hidden_readwrite_input());
+    }
+
+    /// A register class, or a matching digit, wants a register; memory-only
+    /// and immediate-only constraints do not.
+    #[test]
+    fn test_asm_constraint_wants_register() {
+        for c in ["r", "=r", "+r", "=&r", "a", "0", "rm", "g", "ri"] {
+            assert!(constraint(c, None).wants_register(), "{c}");
+        }
+        for c in ["m", "=m", "i", "n", "I"] {
+            assert!(!constraint(c, None).wants_register(), "{c}");
+        }
     }
 
     #[test]

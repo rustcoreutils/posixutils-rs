@@ -249,6 +249,29 @@ pub enum CondCode {
 }
 
 impl CondCode {
+    /// The condition that holds exactly when this one does not.
+    ///
+    /// Each pair tests complementary flag states on both targets -- `lt` is
+    /// N!=V and `ge` is N==V, `vs` is V set and `vc` V clear -- so the
+    /// inverse is correct after a floating compare too, where an unordered
+    /// result satisfies one of each pair and never both.
+    pub fn inverse(self) -> CondCode {
+        match self {
+            CondCode::Eq => CondCode::Ne,
+            CondCode::Ne => CondCode::Eq,
+            CondCode::Slt => CondCode::Sge,
+            CondCode::Sge => CondCode::Slt,
+            CondCode::Sle => CondCode::Sgt,
+            CondCode::Sgt => CondCode::Sle,
+            CondCode::Ult => CondCode::Uge,
+            CondCode::Uge => CondCode::Ult,
+            CondCode::Ule => CondCode::Ugt,
+            CondCode::Ugt => CondCode::Ule,
+            CondCode::Np => CondCode::P,
+            CondCode::P => CondCode::Np,
+        }
+    }
+
     /// x86-64 condition suffix (e, ne, l, le, g, ge, b, be, a, ae)
     pub fn x86_suffix(&self) -> &'static str {
         match self {
@@ -443,17 +466,40 @@ pub fn complex_fp_info(types: &TypeTable, target: &Target, complex_typ: TypeId) 
 /// Label for local jumps (basic block targets within a function)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Label {
-    /// Function name (for unique label generation)
+    /// The function's name for a block label, the sequence's prefix for an
+    /// internal one.
     pub func_name: String,
-    /// Basic block ID within the function
+    /// The basic block's ID, or the internal label's unique number.
     pub block_id: u32,
+    /// A label the backend made for its own branch sequence rather than for
+    /// a basic block. See [`Label::internal`].
+    pub internal: bool,
 }
 
 impl Label {
-    pub fn new(func_name: impl Into<String>, block_id: u32) -> Self {
+    /// The label of basic block `block_id` of function `func_name`.
+    pub fn block(func_name: impl Into<String>, block_id: u32) -> Self {
         Self {
             func_name: func_name.into(),
             block_id,
+            internal: false,
+        }
+    }
+
+    /// A label a backend emits inside its own instruction sequence -- an
+    /// int128 shift's branches, a `va_arg` overflow path, a CAS loop.
+    ///
+    /// Spelled `.L.<prefix>.<n>`, which no block label can equal: a block
+    /// label is `.L<function>_<n>` and a C identifier cannot contain a dot.
+    /// Both used to share `.L<name>_<n>`, so a function named after a
+    /// prefix -- `i128`, `sel_then`, `va_done` -- defined its block 0 under
+    /// the same name as the backend's first such label, and the assembler
+    /// rejected the output ("symbol `.Li128_0' is already defined").
+    pub fn internal(prefix: impl Into<String>, id: u32) -> Self {
+        Self {
+            func_name: prefix.into(),
+            block_id: id,
+            internal: true,
         }
     }
 
@@ -468,6 +514,9 @@ impl Label {
     /// Mach-O's assembler rejects the raw bytes, which is what the quoting is
     /// for.
     pub fn name(&self) -> String {
+        if self.internal {
+            return internal_label(&self.func_name, self.block_id);
+        }
         quote_symbol_if_needed(&format!(".L{}_{}", self.func_name, self.block_id))
     }
 }
@@ -476,6 +525,17 @@ impl fmt::Display for Label {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.name())
     }
+}
+
+/// The spelling of a label a backend makes for itself -- a branch target
+/// inside its own sequence ([`Label::internal`]), a constant-pool entry.
+///
+/// `.L.<prefix>.<key>`: a C identifier cannot contain a dot, so this can never
+/// equal a block label, `.L<function>_<n>`. The constant pools used
+/// `.Ldbl_const_<bits>`, which a function named `dbl_const` defines as its
+/// block 0 whenever the constant is `0.0`.
+pub fn internal_label(prefix: &str, key: impl fmt::Display) -> String {
+    format!(".L.{prefix}.{key}")
 }
 
 /// Global symbol reference (function, global variable, string literal)
@@ -725,6 +785,18 @@ pub enum Directive {
 
     /// Switch to thread-local BSS section (.section .tbss or __DATA,__thread_bss)
     Tbss,
+
+    /// Mach-O only: switch to `__DATA,__thread_vars`, which holds the
+    /// thread-local variable descriptors a program's references name.
+    ThreadVars,
+
+    /// Mach-O only: `.tbss sym, size, log2(align)` -- zero-fill in
+    /// `__DATA,__thread_bss` for a thread-local's initial image.
+    ThreadZerofill {
+        sym: Symbol,
+        size: u64,
+        align_log2: u32,
+    },
 
     /// Switch to the section holding pointers to `constructor` functions
     /// (`.init_array` on ELF, `__DATA,__mod_init_func` on Mach-O).
@@ -1135,6 +1207,22 @@ impl EmitAsm for Directive {
                     let _ = writeln!(out, ".section .tdata,\"awT\",@progbits");
                 }
             },
+            Directive::ThreadVars => {
+                let _ = writeln!(out, ".section __DATA,__thread_vars,thread_local_variables");
+            }
+            Directive::ThreadZerofill {
+                sym,
+                size,
+                align_log2,
+            } => {
+                let _ = writeln!(
+                    out,
+                    ".tbss {}, {}, {}",
+                    sym.format_for_target(target),
+                    size,
+                    align_log2
+                );
+            }
             Directive::Tbss => match target.os {
                 Os::MacOS => {
                     let _ = writeln!(out, ".section __DATA,__thread_bss,thread_local_zerofill");
@@ -1506,7 +1594,7 @@ mod tests {
 
     #[test]
     fn test_label() {
-        let label = Label::new("main", 5);
+        let label = Label::block("main", 5);
         assert_eq!(label.name(), ".Lmain_5");
     }
 

@@ -141,46 +141,59 @@ struct VarInfo {
     addr_taken: bool,
 }
 
-/// Analyze a variable to determine if it can be promoted to SSA.
-fn analyze_variable(func: &Function, types: &TypeTable, var_name: &str) -> Option<VarInfo> {
-    let local = func.get_local(var_name)?;
-    let sym_id = local.sym;
-    let typ = local.typ;
+/// Analyze every local at once, answering which can be promoted to SSA.
+///
+/// One pass over the instructions for all of them. Asking per variable made
+/// the pass variables x instructions: a function of 100,000 parameters, each
+/// stored to its local, took minutes here and nowhere else.
+fn analyze_variables(func: &Function, types: &TypeTable) -> HashMap<String, VarInfo> {
+    // Candidates by their symbol pseudo, which is what an instruction names.
+    // `None` once something has ruled the variable out.
+    let mut by_sym: HashMap<PseudoId, (&str, Option<VarInfo>)> = func
+        .locals
+        .iter()
+        .map(|(name, local)| {
+            // Only scalars can be promoted, and a volatile or atomic variable
+            // must go through memory.
+            let promotable = !local.is_volatile && !local.is_atomic && types.is_scalar(local.typ);
+            let info = promotable.then(|| VarInfo {
+                typ: local.typ,
+                size: types.size_bits(local.typ),
+                ..Default::default()
+            });
+            (local.sym, (name.as_str(), info))
+        })
+        .collect();
 
-    // Check basic promotability - only scalar types can be promoted
-    // Volatile and atomic variables must go through memory
-    if local.is_volatile || local.is_atomic || !types.is_scalar(typ) {
-        return None;
-    }
-
-    let mut info = VarInfo {
-        typ,
-        size: types.size_bits(typ),
-        ..Default::default()
-    };
-
-    // Scan all instructions looking for uses of this variable
     for bb in &func.blocks {
         for insn in &bb.insns {
             // A Load or Store naming the variable as its *address* is an
             // access to it; anywhere else the pseudo appears, it is the
             // address itself being handed to something that will keep it.
-            let accesses = matches!(insn.op, Opcode::Store | Opcode::Load)
-                && !insn.src.is_empty()
-                && insn.src[0] == sym_id;
+            let accessed = (matches!(insn.op, Opcode::Store | Opcode::Load)
+                && !insn.src.is_empty())
+            .then(|| insn.src[0]);
 
-            if !accesses {
-                // Fail closed. This arm used to recognize only `SymAddr` and
-                // ignore every other opcode, which made promotability a
-                // whitelist: an opcode that took the symbol directly -- a
-                // `Call` returning a complex value into `__cret_N`, an asm
-                // operand -- was neither counted as a use nor treated as an
-                // escape, so its store could be deleted out from under it.
-                if insn.mentions(sym_id) {
+            // Fail closed. This used to recognize only `SymAddr` and ignore
+            // every other opcode, which made promotability a whitelist: an
+            // opcode that took the symbol directly -- a `Call` returning a
+            // complex value into `__cret_N`, an asm operand -- was neither
+            // counted as a use nor treated as an escape, so its store could
+            // be deleted out from under it.
+            for p in insn.mentioned() {
+                if Some(p) == accessed {
+                    continue;
+                }
+                if let Some((_, Some(info))) = by_sym.get_mut(&p) {
                     info.addr_taken = true;
                 }
-                continue;
             }
+
+            let Some((_, slot @ Some(_))) = accessed.and_then(|sym| by_sym.get_mut(&sym)) else {
+                continue;
+            };
+            let sym = insn.src[0];
+            let info = slot.as_mut().unwrap();
 
             // Promotion replaces the whole variable with one SSA value, so
             // every access has to be the whole variable. A `_Complex` local
@@ -188,12 +201,13 @@ fn analyze_variable(func: &Function, types: &TypeTable, var_name: &str) -> Optio
             // single 128-bit load at offset 0; forwarding the last store into
             // that load hands over the imaginary half alone.
             if insn.offset != 0 || insn.size != info.size {
-                return None;
+                *slot = None;
+                continue;
             }
 
             // The address may not also appear as a value operand -- that
             // stores the variable's own address somewhere.
-            if insn.src[1..].contains(&sym_id) {
+            if insn.src[1..].contains(&sym) {
                 info.addr_taken = true;
                 continue;
             }
@@ -202,19 +216,22 @@ fn analyze_variable(func: &Function, types: &TypeTable, var_name: &str) -> Optio
 
             if insn.op == Opcode::Store {
                 info.store_count += 1;
-
-                if !info.def_blocks.contains(&bb.id) {
+                // Blocks are visited in order, so one block's stores are
+                // consecutive and only the last entry can repeat.
+                if info.def_blocks.last() != Some(&bb.id) {
                     info.def_blocks.push(bb.id);
                 }
             }
         }
     }
 
-    if info.addr_taken {
-        return None;
-    }
-
-    Some(info)
+    by_sym
+        .into_values()
+        .filter_map(|(name, info)| {
+            let info = info.filter(|info| !info.addr_taken)?;
+            Some((name.to_string(), info))
+        })
+        .collect()
 }
 
 /// Insert phi nodes for a variable at its iterated dominance frontier.
@@ -260,34 +277,42 @@ fn insert_phi_nodes(converter: &mut SsaConverter, var_name: &str, var_info: &Var
 
 /// Definition stack for variable renaming
 struct DefStack {
-    /// Variable name -> stack of (defining block, defining pseudo)
-    stacks: HashMap<String, Vec<(BasicBlockId, PseudoId)>>,
+    /// Variable name -> stack of defining pseudos
+    stacks: HashMap<String, Vec<PseudoId>>,
+    /// Every push, in order, so a block's definitions are undone by
+    /// unwinding to where the block began rather than by visiting every
+    /// variable's stack once per block.
+    pushed: Vec<String>,
 }
 
 impl DefStack {
     fn new() -> Self {
         Self {
             stacks: HashMap::with_capacity(DEFAULT_SSA_RENAME_CAPACITY),
+            pushed: Vec::new(),
         }
     }
 
     /// Push a new definition
-    fn push(&mut self, var: &str, bb: BasicBlockId, val: PseudoId) {
-        self.stacks
-            .entry(var.to_string())
-            .or_default()
-            .push((bb, val));
+    fn push(&mut self, var: &str, val: PseudoId) {
+        self.stacks.entry(var.to_string()).or_default().push(val);
+        self.pushed.push(var.to_string());
     }
 
     /// Get current definition (from top of stack)
     fn current(&self, var: &str) -> Option<PseudoId> {
-        self.stacks.get(var).and_then(|s| s.last().map(|(_, v)| *v))
+        self.stacks.get(var).and_then(|s| s.last().copied())
     }
 
-    /// Pop definitions made in a specific block
-    fn pop_block(&mut self, bb: BasicBlockId) {
-        for stack in self.stacks.values_mut() {
-            while stack.last().map(|(b, _)| *b == bb).unwrap_or(false) {
+    /// Where a block's definitions begin, for [`DefStack::unwind`].
+    fn mark(&self) -> usize {
+        self.pushed.len()
+    }
+
+    /// Pop every definition pushed since `mark`.
+    fn unwind(&mut self, mark: usize) {
+        for var in self.pushed.drain(mark..).rev() {
+            if let Some(stack) = self.stacks.get_mut(&var) {
                 stack.pop();
             }
         }
@@ -361,7 +386,7 @@ fn rename_insn(
                         let val = insn.src[1];
 
                         // Push as new definition
-                        def_stack.push(name, bb_id, val);
+                        def_stack.push(name, val);
 
                         // Mark store for removal
                         converter.dead_stores.push(InsnRef::new(bb_id, insn_idx));
@@ -406,7 +431,7 @@ fn rename_insn(
                 if let Some(bb) = converter.func.get_block(bb_id) {
                     for (name, &idx) in &bb.phi_map {
                         if idx == insn_idx {
-                            def_stack.push(name, bb_id, target);
+                            def_stack.push(name, target);
                             break;
                         }
                     }
@@ -419,29 +444,51 @@ fn rename_insn(
 }
 
 /// Rename variables in a block and its dominated children.
-fn rename_block(converter: &mut SsaConverter, bb_id: BasicBlockId, def_stack: &mut DefStack) {
-    // Get instruction count first
-    let insn_count = converter
-        .func
-        .get_block(bb_id)
-        .map(|bb| bb.insns.len())
-        .unwrap_or(0);
-
-    // Process all instructions in this block
-    for i in 0..insn_count {
-        rename_insn(converter, bb_id, i, def_stack);
+///
+/// The walk is a pre-order over the dominator tree -- a block's instructions,
+/// then each dominated child's subtree in order, then the block's definitions
+/// are unwound -- kept on an explicit stack rather than the call stack. A
+/// function of n sequential `if` statements has a dominator tree n levels
+/// deep, and recursing once per level put the compiler's stack, not the
+/// program, in charge of how long a function may be.
+fn rename_block(converter: &mut SsaConverter, entry: BasicBlockId, def_stack: &mut DefStack) {
+    /// A block whose instructions are renamed and whose children are being
+    /// visited.
+    struct Frame {
+        mark: usize,
+        children: Vec<BasicBlockId>,
+        next: usize,
     }
 
-    // Get dominated children
-    let dom_children: Vec<BasicBlockId> = converter.dom.children(bb_id).to_vec();
-
-    // Recurse into dominated children
-    for child in dom_children {
-        rename_block(converter, child, def_stack);
+    fn enter(converter: &mut SsaConverter, bb_id: BasicBlockId, def_stack: &mut DefStack) -> Frame {
+        let mark = def_stack.mark();
+        let insn_count = converter
+            .func
+            .get_block(bb_id)
+            .map(|bb| bb.insns.len())
+            .unwrap_or(0);
+        for i in 0..insn_count {
+            rename_insn(converter, bb_id, i, def_stack);
+        }
+        Frame {
+            mark,
+            children: converter.dom.children(bb_id).to_vec(),
+            next: 0,
+        }
     }
 
-    // Pop definitions made in this block
-    def_stack.pop_block(bb_id);
+    let mut stack = vec![enter(converter, entry, def_stack)];
+    while let Some(top) = stack.last_mut() {
+        if let Some(&child) = top.children.get(top.next) {
+            top.next += 1;
+            let frame = enter(converter, child, def_stack);
+            stack.push(frame);
+        } else {
+            // Pop definitions made in this block
+            let done = stack.pop().expect("the loop saw a frame");
+            def_stack.unwind(done.mark);
+        }
+    }
 }
 
 /// Fill in phi operands from predecessor blocks.
@@ -625,11 +672,12 @@ pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
     // names in sorted order so phi pseudo IDs are stable across runs
     // (HashMap iteration order is randomized by RandomState and would
     // otherwise produce non-deterministic IR).
-    let mut local_names: Vec<String> = converter.func.locals.keys().cloned().collect();
+    let mut analyzed = analyze_variables(converter.func, types);
+    let mut local_names: Vec<String> = analyzed.keys().cloned().collect();
     local_names.sort();
 
     for var_name in &local_names {
-        if let Some(var_info) = analyze_variable(converter.func, types, var_name) {
+        if let Some(var_info) = analyzed.remove(var_name) {
             // Skip if no stores
             if var_info.store_count == 0 {
                 continue;
@@ -754,7 +802,7 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let func = make_simple_if_cfg(&types);
 
-        let info = analyze_variable(&func, &types, "x").unwrap();
+        let info = analyze_variables(&func, &types).remove("x").unwrap();
         assert_eq!(info.store_count, 2); // One in entry, one in then
         assert_eq!(info.def_blocks.len(), 2);
         assert!(!info.addr_taken);
@@ -1282,7 +1330,7 @@ mod tests {
         func.rebuild_block_idx();
 
         assert!(
-            analyze_variable(&func, &types, "z").is_none(),
+            !analyze_variables(&func, &types).contains_key("z"),
             "a variable accessed at a width other than its own must not promote"
         );
 
@@ -1339,9 +1387,54 @@ mod tests {
         func.rebuild_block_idx();
 
         assert!(
-            analyze_variable(&func, &types, "x").is_none(),
+            !analyze_variables(&func, &types).contains_key("x"),
             "a symbol reaching an unmodelled opcode must count as address-taken"
         );
+    }
+
+    /// All locals are judged in one pass, and one variable's escape or
+    /// partial access must not leak into another's verdict: `a` escapes into
+    /// a call that also stores `b`'s value, `c` has its address stored into
+    /// `b`, and only `b` is promotable. Its two stores in one block count as
+    /// one defining block.
+    #[test]
+    fn test_locals_are_judged_independently_in_one_pass() {
+        let types = TypeTable::new(&Target::host());
+        let int_id = types.int_id;
+        let ptr_id = types.void_ptr_id;
+        let mut func = Function::new("test", int_id);
+
+        let (a, b, c) = (PseudoId(0), PseudoId(1), PseudoId(2));
+        for (id, name, typ) in [(a, "a", int_id), (b, "b", ptr_id), (c, "c", int_id)] {
+            func.add_pseudo(Pseudo::sym(id, name.to_string()));
+            func.add_local(name, id, typ, false, false, Some(BasicBlockId(0)), None);
+        }
+        let one = PseudoId(3);
+        func.add_pseudo(Pseudo::val(one, 1));
+        let ret = PseudoId(4);
+        func.add_pseudo(Pseudo::reg(ret, 0));
+
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::store(one, a, 0, int_id, 32));
+        entry.add_insn(Instruction::store(c, b, 0, ptr_id, 64));
+        entry.add_insn(Instruction::store(one, b, 0, ptr_id, 64));
+        let mut call = Instruction::new(Opcode::Call);
+        call.target = Some(ret);
+        call.src = vec![a];
+        call.func_name = Some("g".to_string());
+        entry.add_insn(call);
+        entry.add_insn(Instruction::ret(Some(ret)));
+        func.entry = BasicBlockId(0);
+        func.blocks = vec![entry];
+        func.rebuild_block_idx();
+
+        let analyzed = analyze_variables(&func, &types);
+        assert!(!analyzed.contains_key("a"), "a escapes into the call");
+        assert!(!analyzed.contains_key("c"), "c's address is stored into b");
+        let b_info = analyzed.get("b").expect("b is promotable");
+        assert_eq!(b_info.store_count, 2);
+        assert_eq!(b_info.def_blocks, vec![BasicBlockId(0)]);
     }
 
     /// A parameter is registered under its bare name; a global reached

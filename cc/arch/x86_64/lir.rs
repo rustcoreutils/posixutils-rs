@@ -53,6 +53,11 @@ pub enum MemAddr {
     /// contrast, is a hard link error.
     TlsDesc(Symbol),
 
+    /// `symbol@TLVP(%rip)` - the Mach-O pointer to `symbol`'s thread-local
+    /// variable descriptor. `movq` it into %rdi, then call through the
+    /// descriptor's first word with [`X86Inst::TlvCall`].
+    Tlvp(Symbol),
+
     /// symbol@GOTTPOFF(%rip) - Thread-local storage Initial Exec model (Linux x86-64)
     /// For external TLS variables: load offset from GOT, then access %fs:(offset)
     TlsGottpoff(Symbol),
@@ -95,6 +100,9 @@ impl MemAddr {
             }
             MemAddr::TlsDesc(sym) => {
                 format!("{}@TLSDESC(%rip)", sym.format_for_target(target))
+            }
+            MemAddr::Tlvp(sym) => {
+                format!("{}@TLVP(%rip)", sym.format_for_target(target))
             }
             MemAddr::TlsGottpoff(sym) => {
                 // Thread-local storage Initial Exec model: symbol@GOTTPOFF(%rip)
@@ -411,12 +419,23 @@ pub enum X86Inst {
     /// floating-point values and argument registers for nothing.
     TlsDescCall { sym: Symbol },
 
+    /// `call *(%rdi)` -- the Mach-O thread-local variable getter, called
+    /// through the first word of the descriptor %rdi holds; it returns the
+    /// variable's address in %rax. Its own instruction for the same reason as
+    /// `TlsDescCall`: it is not a `Call` for register allocation, since the
+    /// getter preserves every general register but %rax and %rdi.
+    TlvCall,
+
     /// RET - Return from function
     Ret,
 
     /// REP STOSQ - Store RAX to [RDI], repeat RCX times, advancing RDI
     /// Used for zero-initializing stack frames
     RepStosq,
+
+    /// REP MOVSQ - Copy RCX qwords from [RSI] to [RDI], advancing both
+    /// Used for large stacked aggregate arguments
+    RepMovsq,
 
     /// UD2 - Undefined instruction (trap)
     /// Used for __builtin_unreachable() to signal unreachable code
@@ -794,6 +813,9 @@ impl EmitAsm for X86Inst {
                 let _ = writeln!(out, "    j{} {}", cc.x86_suffix(), lbl.name());
             }
 
+            X86Inst::TlvCall => {
+                let _ = writeln!(out, "    call *(%rdi)");
+            }
             X86Inst::TlsDescCall { sym } => {
                 let _ = writeln!(
                     out,
@@ -829,6 +851,10 @@ impl EmitAsm for X86Inst {
 
             X86Inst::RepStosq => {
                 let _ = writeln!(out, "    rep stosq");
+            }
+
+            X86Inst::RepMovsq => {
+                let _ = writeln!(out, "    rep movsq");
             }
 
             X86Inst::Ud2 => {
@@ -1388,7 +1414,7 @@ mod tests {
             let mut out = String::new();
             let inst = X86Inst::Jcc {
                 cc,
-                target: Label::new("test", 1),
+                target: Label::block("test", 1),
             };
             inst.emit(&target, &mut out);
             assert!(

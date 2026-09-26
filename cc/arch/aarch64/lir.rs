@@ -95,22 +95,6 @@ pub enum Aarch64Inst {
         dst: Reg,
     },
 
-    /// MOVZ - Move wide with zero (clear other bits)
-    Movz {
-        size: OperandSize,
-        imm: u16,
-        shift: u8, // 0, 16, 32, or 48
-        dst: Reg,
-    },
-
-    /// MOVK - Move wide with keep (keep other bits)
-    Movk {
-        size: OperandSize,
-        imm: u16,
-        shift: u8, // 0, 16, 32, or 48
-        dst: Reg,
-    },
-
     /// LDR - Load register
     Ldr {
         size: OperandSize,
@@ -244,14 +228,32 @@ pub enum Aarch64Inst {
         reg: Reg,
     },
 
-    /// TLS Initial Exec: adrp dst, :gottpoff:sym
-    AdrpGottpoff {
+    /// TLS Initial Exec: `adrp dst, :gottprel:sym` -- the page of the GOT entry
+    /// holding `sym`'s offset from the thread pointer. (`gottpoff` is x86-64's
+    /// name for the same thing; GNU as rejects it here.)
+    AdrpGottprel {
         sym: Symbol,
         dst: Reg,
     },
 
-    /// TLS Initial Exec: ldr dst, [base, :gottpoff_lo12:sym]
-    LdrGottpoffLo12 {
+    /// TLS Initial Exec: `ldr dst, [base, #:gottprel_lo12:sym]` -- the offset
+    /// itself, from that GOT entry.
+    LdrGottprelLo12 {
+        sym: Symbol,
+        base: Reg,
+        dst: Reg,
+    },
+
+    /// Mach-O thread-local variable: `adrp dst, sym@TLVPPAGE` -- the page of
+    /// the pointer to `sym`'s TLV descriptor.
+    AdrpTlvpPage {
+        sym: Symbol,
+        dst: Reg,
+    },
+
+    /// Mach-O thread-local variable: `ldr dst, [base, sym@TLVPPAGEOFF]` --
+    /// the descriptor's address, which the getter takes in x0.
+    LdrTlvpPageOff {
         sym: Symbol,
         base: Reg,
         dst: Reg,
@@ -484,6 +486,21 @@ pub enum Aarch64Inst {
     /// CBNZ - Compare and Branch if Not Zero
     /// Used for atomic LL/SC retry loops
     Cbnz {
+        size: OperandSize,
+        src: Reg,
+        target: Label,
+    },
+
+    /// A `BCond` whose target is past the +-1 MiB `b.cond` reaches: the
+    /// inverse condition skips an unconditional `b`, which reaches +-128 MiB.
+    /// Only `relax.rs` builds it, in place of the `BCond` it replaces.
+    BCondFar {
+        cond: CondCode,
+        target: Label,
+    },
+
+    /// A `Cbnz` past its +-1 MiB range, relaxed the same way: `cbz` over `b`.
+    CbnzFar {
         size: OperandSize,
         src: Reg,
         target: Label,
@@ -809,27 +826,6 @@ impl EmitAsm for Aarch64Inst {
         match self {
             // Data Movement
             Aarch64Inst::Mov { size, src, dst } => Self::emit_mov(size, src, dst, out),
-            Aarch64Inst::Movz {
-                size,
-                imm,
-                shift,
-                dst,
-            } => Self::emit_movz(size, imm, shift, dst, out),
-            Aarch64Inst::Movk {
-                size,
-                imm,
-                shift,
-                dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    movk {}, #{}, lsl #{}",
-                    dst.name_for_size(sz),
-                    imm,
-                    shift
-                );
-            }
 
             Aarch64Inst::Ldr { size, addr, dst } => {
                 let insn = match size {
@@ -958,16 +954,33 @@ impl EmitAsm for Aarch64Inst {
             }
             Aarch64Inst::Blr { reg } => Self::emit_branch_reg("blr", reg, out),
             Aarch64Inst::BrReg { reg } => Self::emit_branch_reg("br", reg, out),
-            Aarch64Inst::AdrpGottpoff { sym, dst } => {
+            Aarch64Inst::AdrpGottprel { sym, dst } => {
                 let sym_name = sym.format_for_target(target);
-                let _ = writeln!(out, "    adrp {}, :gottpoff:{}", dst.name64(), sym_name);
+                let _ = writeln!(out, "    adrp {}, :gottprel:{}", dst.name64(), sym_name);
             }
 
-            Aarch64Inst::LdrGottpoffLo12 { sym, base, dst } => {
+            Aarch64Inst::AdrpTlvpPage { sym, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    adrp {}, {}@TLVPPAGE",
+                    dst.name64(),
+                    sym.format_for_target(target)
+                );
+            }
+            Aarch64Inst::LdrTlvpPageOff { sym, base, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    ldr {}, [{}, {}@TLVPPAGEOFF]",
+                    dst.name64(),
+                    base.name64(),
+                    sym.format_for_target(target)
+                );
+            }
+            Aarch64Inst::LdrGottprelLo12 { sym, base, dst } => {
                 let sym_name = sym.format_for_target(target);
                 let _ = writeln!(
                     out,
-                    "    ldr {}, [{}, :gottpoff_lo12:{}]",
+                    "    ldr {}, [{}, #:gottprel_lo12:{}]",
                     dst.name64(),
                     base.name64(),
                     sym_name
@@ -1102,6 +1115,20 @@ impl EmitAsm for Aarch64Inst {
             Aarch64Inst::Cbnz { size, src, target } => {
                 let sz = size.bits().max(32);
                 let _ = writeln!(out, "    cbnz {}, {}", src.name_for_size(sz), target.name());
+            }
+
+            // `.+8` is the instruction after the `b`: the skip needs no label
+            // of its own, and both GNU as and Apple's assembler accept it.
+            Aarch64Inst::BCondFar { cond, target: lbl } => {
+                let inverse = cond.inverse().aarch64_suffix();
+                let _ = writeln!(out, "    b.{} .+8", inverse);
+                let _ = writeln!(out, "    b {}", lbl.name());
+            }
+
+            Aarch64Inst::CbnzFar { size, src, target } => {
+                let sz = size.bits().max(32);
+                let _ = writeln!(out, "    cbz {}, .+8", src.name_for_size(sz));
+                let _ = writeln!(out, "    b {}", target.name());
             }
 
             Aarch64Inst::Bl {
@@ -1562,21 +1589,6 @@ impl Aarch64Inst {
         }
         if first {
             let _ = writeln!(out, "    movz {}, #0", dst.name_for_size(64));
-        }
-    }
-
-    fn emit_movz(size: &OperandSize, imm: &u16, shift: &u8, dst: &Reg, out: &mut String) {
-        let sz = size.bits().max(32);
-        if *shift == 0 {
-            let _ = writeln!(out, "    movz {}, #{}", dst.name_for_size(sz), imm);
-        } else {
-            let _ = writeln!(
-                out,
-                "    movz {}, #{}, lsl #{}",
-                dst.name_for_size(sz),
-                imm,
-                shift
-            );
         }
     }
 
@@ -2088,7 +2100,7 @@ mod tests {
 
         let mut out = String::new();
         let inst = Aarch64Inst::B {
-            target: Label::new("main", 1),
+            target: Label::block("main", 1),
         };
         inst.emit(&target, &mut out);
         assert_eq!(out.trim(), "b .Lmain_1");
@@ -2096,7 +2108,7 @@ mod tests {
         let mut out = String::new();
         let inst = Aarch64Inst::BCond {
             cond: CondCode::Ne,
-            target: Label::new("main", 2),
+            target: Label::block("main", 2),
         };
         inst.emit(&target, &mut out);
         assert_eq!(out.trim(), "b.ne .Lmain_2");

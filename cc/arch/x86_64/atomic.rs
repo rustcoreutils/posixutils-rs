@@ -309,7 +309,7 @@ impl X86_64CodeGen {
         // On failure, store RAX (actual value) to *expected (R9 has expected_ptr)
         let label_suffix = self.unique_label_counter;
         self.unique_label_counter += 1;
-        let skip_label = Label::new("cas_done", label_suffix);
+        let skip_label = Label::internal("cas_done", label_suffix);
         self.push_lir(X86Inst::Jcc {
             cc: CondCode::Eq, // Jump if equal (success)
             target: skip_label.clone(),
@@ -506,7 +506,7 @@ impl X86_64CodeGen {
         // Loop label
         let label_suffix = self.unique_label_counter;
         self.unique_label_counter += 1;
-        let loop_label = Label::new("atomic_bitop", label_suffix);
+        let loop_label = Label::internal("atomic_bitop", label_suffix);
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(
             loop_label.clone(),
         )));

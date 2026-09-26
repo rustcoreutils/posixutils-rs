@@ -16,7 +16,7 @@ use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, XmmReg};
-use crate::ir::{Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
+use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::{TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
@@ -34,7 +34,7 @@ pub struct X86_64CodeGen {
     /// allocate writers and remain visible as `.set` calls.
     pub(super) locations: crate::arch::regalloc::LocationMap<Loc>,
     /// Current function's pseudos (for looking up values)
-    pub(super) pseudos: Vec<Pseudo>,
+    pub(super) pseudos: crate::arch::codegen::PseudoTable,
     /// Callee-saved registers used in current function (for epilogue)
     pub(super) callee_saved_regs: Vec<Reg>,
     /// Offset to add to stack locations to account for callee-saved registers
@@ -91,7 +91,7 @@ impl X86_64CodeGen {
         Self {
             base: CodeGenBase::new(target),
             locations: crate::arch::regalloc::LocationMap::new(),
-            pseudos: Vec::new(),
+            pseudos: Default::default(),
             callee_saved_regs: Vec::new(),
             callee_saved_offset: 0,
             stack_alloc_size: 0,
@@ -174,7 +174,7 @@ impl X86_64CodeGen {
                     Symbol::global(name.clone())
                 };
                 // Use TLS addressing for thread-local variables (Linux only)
-                if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
+                if self.is_tls_symbol(name) {
                     GpOperand::Mem(MemAddr::TlsLocalExec(symbol))
                 } else {
                     // Note: For GOT access (PIC mode/external symbols), special handling
@@ -187,10 +187,14 @@ impl X86_64CodeGen {
     }
 
     /// Whether `name` is a thread-local this backend must access through the
-    /// FS segment. TLS lowering here is Linux-only; the other targets fall
-    /// through to ordinary global access.
-    fn is_tls_symbol(&self, name: &str) -> bool {
-        self.tls_symbols.contains(name) && self.base.target.os == Os::Linux
+    /// FS segment: an ELF thread-local, on Linux or FreeBSD alike. On Darwin a
+    /// thread-local never reaches here as a symbol -- `ir::tls` turns every
+    /// reference into a `TlsAddr` -- so it is not one of these.
+    ///
+    /// This used to ask for Linux alone, which sent every FreeBSD
+    /// thread-local through ordinary global access: one copy for all threads.
+    pub(super) fn is_tls_symbol(&self, name: &str) -> bool {
+        self.tls_symbols.contains(name) && self.base.target.os != Os::MacOS
     }
 
     /// Whether accessing the thread-local `name` needs the Initial Exec model
@@ -209,6 +213,36 @@ impl X86_64CodeGen {
     /// segfaults on a write.
     fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let symbol = Symbol::global(name.to_string());
+        if self.base.tls_access() == crate::target::TlsAccess::MachOTlv {
+            // Mach-O thread-local variable descriptor (clang's sequence):
+            //   movq _v@TLVP(%rip), %rdi    ; the descriptor
+            //   call *(%rdi)                ; its getter: the ADDRESS in %rax
+            //
+            // The getter preserves the callee-saved registers plus %rcx,
+            // %rdx, %rsi and %r8-%r11 (LLVM's `CSR_64_TLS_Darwin`), so %rax
+            // and %rdi are the general registers it clobbers, which
+            // `get_constraint_info` declares -- and no XMM register, which
+            // `RegAlloc::fp_call_positions` accounts for. ld64 relaxes the
+            // `movq` to a `leaq` of the descriptor when it is local, so it
+            // has to stay a `movq` from `@TLVP`.
+            //
+            // Reached only through a `TlsAddr`: `ir::tls` rewrites every
+            // Darwin thread-local reference into one.
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::Tlvp(symbol)),
+                dst: GpOperand::Reg(Reg::Rdi),
+            });
+            self.push_lir(X86Inst::TlvCall);
+            if dst != Reg::Rax {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(dst),
+                });
+            }
+            return;
+        }
         if self.base.use_tls_dynamic() {
             // TLS descriptor, the dynamic model:
             //   leaq sym@TLSDESC(%rip), %rax
@@ -295,6 +329,65 @@ impl X86_64CodeGen {
         false
     }
 
+    /// The memory operand for byte `offset` of the global `name`, for an access
+    /// emitted immediately after. Any setup it needs is emitted now, through
+    /// `scratch`, which must stay untouched until that access.
+    ///
+    /// One implementation of "how to reach a global" for the floating-point
+    /// and x87 load and store paths, which each used to build their own
+    /// operand and knew only RIP-relative and GOT access. A thread-local came
+    /// out as `movsd tv(%rip)`: the variable's initialization image rather
+    /// than this thread's copy, and for an `extern` one a non-TLS reference
+    /// the linker rejects. And the RIP-relative form dropped `offset`.
+    pub(super) fn global_mem(&mut self, name: &str, offset: i32, scratch: Reg) -> MemAddr {
+        if self.is_tls_symbol(name) {
+            let symbol = Symbol::global(name.to_string());
+            if offset == 0 {
+                if !self.use_tls_ie(name) {
+                    return MemAddr::TlsLocalExec(symbol);
+                }
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(MemAddr::TlsGottpoff(symbol)),
+                    dst: GpOperand::Reg(scratch),
+                });
+                return MemAddr::FsBase(scratch);
+            }
+            self.emit_tls_addr(name, scratch);
+            return MemAddr::BaseOffset {
+                base: scratch,
+                offset,
+            };
+        }
+        if self.needs_got_access(name) {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.to_string()))),
+                dst: GpOperand::Reg(scratch),
+            });
+            return MemAddr::BaseOffset {
+                base: scratch,
+                offset,
+            };
+        }
+        let symbol = if name.starts_with('.') {
+            Symbol::local(name.to_string())
+        } else {
+            Symbol::global(name.to_string())
+        };
+        if offset == 0 {
+            return MemAddr::RipRelative(symbol);
+        }
+        self.push_lir(X86Inst::Lea {
+            addr: MemAddr::RipRelative(symbol),
+            dst: scratch,
+        });
+        MemAddr::BaseOffset {
+            base: scratch,
+            offset,
+        }
+    }
+
     /// Emit .loc directive for source line tracking (delegates to base)
     fn emit_loc(&mut self, insn: &Instruction) {
         self.base.emit_loc(insn);
@@ -325,7 +418,7 @@ impl X86_64CodeGen {
 
         // Emit each constant
         for (label_bits, bytes) in &self.ld_constants {
-            let label = format!(".Lld_const_{}", label_bits);
+            let label = crate::arch::lir::internal_label("ld_const", label_bits);
             // Align to 16 bytes (power of 2: 4 means 2^4 = 16)
             self.base.push_directive(Directive::Align(4));
             self.base.push_directive(Directive::local_label(&label));
@@ -352,7 +445,7 @@ impl X86_64CodeGen {
         }
         self.base.push_directive(Directive::Rodata);
         for (key, bytes) in &self.quad_constants {
-            let label = format!(".Lquad_const_{}", key);
+            let label = crate::arch::lir::internal_label("quad_const", key);
             self.base.push_directive(Directive::Align(4));
             self.base.push_directive(Directive::local_label(&label));
             let mut byte_str = String::from(".byte ");
@@ -378,7 +471,7 @@ impl X86_64CodeGen {
 
         // Emit each constant
         for (label_bits, value) in &self.double_constants {
-            let label = format!(".Ldbl_const_{}", label_bits);
+            let label = crate::arch::lir::internal_label("dbl_const", label_bits);
             // Align to 8 bytes (power of 2: 3 means 2^3 = 8)
             self.base.push_directive(Directive::Align(3));
             self.base.push_directive(Directive::local_label(&label));
@@ -393,7 +486,7 @@ impl X86_64CodeGen {
     pub(super) fn emit_block(&mut self, block: &crate::ir::BasicBlock, types: &TypeTable) {
         // Always emit block ID label for consistency with jumps
         // (jumps reference blocks by ID, not by C label name)
-        self.push_lir(X86Inst::Directive(Directive::BlockLabel(Label::new(
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(Label::block(
             &self.base.current_fn,
             block.id.0,
         ))));
@@ -442,12 +535,12 @@ impl X86_64CodeGen {
                 if let Some(target) = insn.bb_true {
                     self.push_lir(X86Inst::Jcc {
                         cc: CondCode::Ne,
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
                 if let Some(target) = insn.bb_false {
                     self.push_lir(X86Inst::Jmp {
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
                 return false;
@@ -485,7 +578,7 @@ impl X86_64CodeGen {
                 let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
                 if let Some(target) = target {
                     self.push_lir(X86Inst::Jmp {
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
                 return true;
@@ -519,7 +612,7 @@ impl X86_64CodeGen {
                 };
                 if let Some(target) = target {
                     self.push_lir(X86Inst::Jmp {
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
                 return true;
@@ -529,12 +622,12 @@ impl X86_64CodeGen {
         if let Some(target) = insn.bb_true {
             self.push_lir(X86Inst::Jcc {
                 cc: CondCode::Ne,
-                target: Label::new(&self.base.current_fn, target.0),
+                target: Label::block(&self.base.current_fn, target.0),
             });
         }
         if let Some(target) = insn.bb_false {
             self.push_lir(X86Inst::Jmp {
-                target: Label::new(&self.base.current_fn, target.0),
+                target: Label::block(&self.base.current_fn, target.0),
             });
         }
         false
@@ -561,7 +654,7 @@ impl X86_64CodeGen {
         };
 
         for (lo, hi, target_bb) in insn.switch_cases.clone() {
-            let target = Label::new(&self.base.current_fn, target_bb.0);
+            let target = Label::block(&self.base.current_fn, target_bb.0);
             if lo == hi {
                 self.emit_switch_cmp(op_size, lo);
                 self.push_lir(X86Inst::Jcc {
@@ -577,7 +670,7 @@ impl X86_64CodeGen {
         if let Some(default_bb) = insn.switch_default {
             // LIR: unconditional jump to default
             self.push_lir(X86Inst::Jmp {
-                target: Label::new(&self.base.current_fn, default_bb.0),
+                target: Label::block(&self.base.current_fn, default_bb.0),
             });
         }
     }
@@ -680,7 +773,7 @@ impl X86_64CodeGen {
 
     fn emit_set_val(&mut self, insn: &Instruction, types: &TypeTable) {
         if let Some(target) = insn.target {
-            if let Some(pseudo) = self.pseudos.iter().find(|p| p.id == target) {
+            if let Some(pseudo) = self.pseudos.get(target) {
                 let target_loc = self.locations.get(target);
                 match &pseudo.kind {
                     PseudoKind::Val(v) => match target_loc {
@@ -822,7 +915,7 @@ impl X86_64CodeGen {
             Opcode::Br => {
                 if let Some(target) = insn.bb_true {
                     self.push_lir(X86Inst::Jmp {
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
             }
@@ -1275,8 +1368,8 @@ impl X86_64CodeGen {
         self.unique_label_counter += 1;
         let done_suffix = self.unique_label_counter;
         self.unique_label_counter += 1;
-        let then_label = Label::new("sel_then", then_suffix);
-        let done_label = Label::new("sel_done", done_suffix);
+        let then_label = Label::internal("sel_then", then_suffix);
+        let done_label = Label::internal("sel_done", done_suffix);
         self.push_lir(X86Inst::Jcc {
             cc: CondCode::Ne,
             target: then_label.clone(),

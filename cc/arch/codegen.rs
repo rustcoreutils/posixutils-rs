@@ -195,7 +195,13 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// since that pass is what puts the address computation where the register
     /// allocator can see it.
     pub fn use_tls_dynamic(&self) -> bool {
-        self.shared_mode && self.target.os == Os::Linux
+        self.tls_access() == crate::target::TlsAccess::ElfDescriptor
+    }
+
+    /// How this target obtains a thread-local's address; see
+    /// [`crate::target::Target::tls_access`], which `ir::tls` asks too.
+    pub fn tls_access(&self) -> crate::target::TlsAccess {
+        self.target.tls_access(self.shared_mode)
     }
 
     /// Whether a thread-local access must use the Initial Exec model rather
@@ -203,11 +209,14 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     ///
     /// Local Exec fixes the offset from the thread pointer at link time, which
     /// only holds for the main executable and for a thread-local defined in
-    /// this object. Anything position-independent, and any symbol defined
-    /// elsewhere -- which is what `is_extern` reports -- needs the offset
-    /// loaded from the GOT instead.
+    /// this object. Code for a shared object (`shared_mode`), and any symbol
+    /// defined elsewhere -- which is what `is_extern` reports -- needs the
+    /// offset loaded from the GOT instead. On Linux shared code takes the
+    /// descriptor model before it gets here; on FreeBSD, which stays with the
+    /// static models, leaving `shared_mode` out put Local Exec in a shared
+    /// object -- `%fs:t@TPOFF`, a relocation `ld -shared` refuses.
     pub fn use_tls_ie(&self, is_extern: bool) -> bool {
-        self.use_tls_dynamic() || is_extern
+        self.use_tls_dynamic() || is_extern || self.shared_mode
     }
 
     pub fn push_lir(&mut self, inst: I) {
@@ -339,14 +348,11 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     pub fn emit_global(&mut self, global: &crate::ir::GlobalDef, types: &TypeTable) {
         let size = types.size_bytes(global.typ) as u64;
         let size = if size == 0 { 8 } else { size }; // Default to 8 bytes
+        let align = global_alignment(global, types);
 
-        // Get alignment: explicit _Alignas takes precedence over natural alignment
-        let mut align = global
-            .explicit_align
-            .unwrap_or_else(|| types.alignment(global.typ) as u32);
-        // Use 16-byte alignment for arrays >= 16 bytes (matches clang behavior for optimization)
-        if matches!(types.get(global.typ).kind, crate::types::TypeKind::Array) && size >= 16 {
-            align = align.max(16);
+        if global.is_thread_local && self.target.os == Os::MacOS {
+            self.emit_macho_thread_local(global, size, align);
+            return;
         }
 
         // Anonymous compound-literal globals (name starts with '.') are addressed
@@ -466,6 +472,72 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
         // Emit initializer
         self.emit_initializer_data(&global.init, size as usize);
+    }
+
+    /// A Mach-O thread-local variable: its initial image, and the descriptor
+    /// that names it.
+    ///
+    /// On Darwin the symbol a program refers to is not the storage. `_v`
+    /// labels a three-word *descriptor* in `__DATA,__thread_vars` --
+    /// `{ __tlv_bootstrap, 0, _v$tlv$init }`: the getter to call, a key dyld
+    /// fills in, and the initial image -- and every access calls through it
+    /// (see each backend's `emit_tls_addr`). The image itself is
+    /// `_v$tlv$init`: initialized data in `__thread_data`, or `.tbss` for a
+    /// zero-initialized one, which reserves zero-fill in `__thread_bss`.
+    /// This is the layout clang emits, and the one dyld's TLV support and
+    /// ld64 expect: ld64 builds each thread's block from the images and
+    /// rewrites `@TLVP` references to the descriptors.
+    ///
+    /// Emitting the variable as plain data, as this used to, gave every
+    /// thread the one shared copy -- and an `extern` one, reached through
+    /// `@GOTPAGE`, a reference to a thread-local that ld64 rejects.
+    ///
+    /// Linkage belongs to the descriptor: `.globl`/weak/visibility go on `_v`,
+    /// and the image is always a local symbol.
+    fn emit_macho_thread_local(&mut self, global: &crate::ir::GlobalDef, size: u64, align: u32) {
+        let image = Symbol::global(format!("{}$tlv$init", global.name));
+        let zero_fill = global.init.is_all_zero() && global.symbol_attrs.section.is_none();
+        if zero_fill {
+            // `.tbss symbol, size, log2(align)` -- the Mach-O zero-fill form
+            // for a thread-local image; it places the symbol in
+            // `__DATA,__thread_bss` itself.
+            self.push_directive(Directive::ThreadZerofill {
+                sym: image.clone(),
+                size,
+                align_log2: align.max(1).trailing_zeros(),
+            });
+        } else {
+            self.push_directive(Directive::Tdata);
+            if align > 1 {
+                self.push_directive(Directive::Align(align.trailing_zeros()));
+            }
+            self.push_directive(Directive::global_label(image.name.clone()));
+            self.emit_initializer_data(&global.init, size as usize);
+        }
+
+        self.push_directive(Directive::ThreadVars);
+        if !global.is_static {
+            if global.symbol_attrs.weak {
+                self.push_directive(Directive::Weak(
+                    Symbol::global(&global.name),
+                    crate::arch::lir::WeakKind::Definition,
+                ));
+            } else {
+                self.push_directive(Directive::global(&global.name));
+            }
+        }
+        if let Some(how) = &global.symbol_attrs.visibility {
+            self.push_directive(Directive::Visibility(
+                Symbol::global(&global.name),
+                how.clone(),
+            ));
+        }
+        // Three pointers; keep them pointer-aligned whatever precedes them.
+        self.push_directive(Directive::Align(3));
+        self.push_directive(Directive::global_label(&global.name));
+        self.push_directive(Directive::QuadSym(Symbol::global("_tlv_bootstrap")));
+        self.push_directive(Directive::Quad(0));
+        self.push_directive(Directive::QuadSym(image));
     }
 
     /// Emit a floating constant as `size` bytes in the target's format.
@@ -994,16 +1066,31 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
                                 result.push(']');
                             }
                         } else if next_ch.is_ascii_digit() {
-                            // %l0, %l1, etc. - numeric label reference
-                            chars.next();
-                            let idx = (next_ch as usize) - ('0' as usize);
-                            if idx < goto_labels.len() {
-                                let (label_str, _) = &goto_labels[idx];
+                            // `%lN`: gcc numbers labels after every operand,
+                            // the hidden inputs of `"+"` outputs included, so
+                            // the first label of a statement with three
+                            // operands is `%l3`. Counting from zero, and one
+                            // digit at a time, named the wrong label or none.
+                            let mut num = String::new();
+                            while let Some(&d) = chars.peek() {
+                                if !d.is_ascii_digit() {
+                                    break;
+                                }
+                                num.push(d);
+                                chars.next();
+                            }
+                            let label = num
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|n| n.checked_sub(slots.len()))
+                                .and_then(|i| goto_labels.get(i));
+                            if let Some((label_str, _)) = label {
                                 result.push_str(label_str);
                             } else {
-                                // Unknown label index, pass through
+                                // Not a label: pass through for the assembler
+                                // to reject, as gcc does.
                                 result.push_str("%l");
-                                result.push(next_ch);
+                                result.push_str(&num);
                             }
                         } else {
                             // Just %l without number or name, pass through
@@ -1114,15 +1201,104 @@ pub trait CodeGenerator {
     fn set_verbose_asm(&mut self, verbose: bool);
 }
 
+/// The alignment, in bytes, a global definition is emitted at: an explicit
+/// `_Alignas`/`aligned` if it has one, else its type's, and at least 16 for an
+/// array of 16 bytes or more (clang's choice, which vector code relies on).
+///
+/// The one rule, read both where the definition is emitted and where a
+/// backend decides whether an access can assume that alignment.
+pub fn global_alignment(global: &crate::ir::GlobalDef, types: &TypeTable) -> u32 {
+    let size = types.size_bytes(global.typ) as u64;
+    let size = if size == 0 { 8 } else { size };
+    let mut align = global
+        .explicit_align
+        .unwrap_or_else(|| types.alignment(global.typ) as u32);
+    if matches!(types.get(global.typ).kind, crate::types::TypeKind::Array) && size >= 16 {
+        align = align.max(16);
+    }
+    align
+}
+
+/// Report a thread-local that reaches the backend as a plain symbol when the
+/// target's model is a call.
+///
+/// Under the ELF descriptor model and on Mach-O, `ir::tls` gives every
+/// thread-local reference an explicit `TlsAddr`, which is what lets the
+/// register allocator see the call. A thread-local named anywhere else --
+/// in `src` or in an inline-asm operand -- would be reached by a backend path
+/// that either emits the call invisibly to the allocator, which destroys
+/// whatever it had placed in the clobbered registers, or, on Darwin, a plain
+/// non-thread-local reference. An inline-asm memory operand did exactly the
+/// first on Linux `-fPIC`. So the contract is checked, and a breach is an
+/// internal error rather than wrong code.
+pub fn check_tls_reached_only_by_address(
+    func: &Function,
+    tls_symbols: &std::collections::HashSet<String>,
+    pos: crate::diag::Position,
+) {
+    for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+        if insn.op == Opcode::TlsAddr {
+            continue;
+        }
+        for id in insn.mentioned() {
+            let Some(crate::ir::PseudoKind::Sym(name)) = func.get_pseudo(id).map(|p| &p.kind)
+            else {
+                continue;
+            };
+            // A local whose name collides with a thread-local is a stack slot.
+            if tls_symbols.contains(name) && !func.locals.contains_key(name) {
+                crate::diag::error_args(
+                    pos,
+                    "internal error: the thread-local '{0}' reached code generation \
+                     without its address being computed",
+                    &[name],
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// The current function's pseudos, looked up by id.
+///
+/// A pseudo's id is not its position in `Function::pseudos`, so a lookup
+/// needs the index; finding one by scanning made every constant the backends
+/// emitted cost a pass over all of them.
+#[derive(Default)]
+pub struct PseudoTable {
+    by_id: std::collections::HashMap<PseudoId, Pseudo>,
+}
+
+impl PseudoTable {
+    pub fn new(pseudos: &[Pseudo]) -> Self {
+        let mut by_id = std::collections::HashMap::with_capacity(pseudos.len());
+        for p in pseudos {
+            // The first, as a scan would have found.
+            by_id.entry(p.id).or_insert_with(|| p.clone());
+        }
+        Self { by_id }
+    }
+
+    pub fn get(&self, id: PseudoId) -> Option<&Pseudo> {
+        self.by_id.get(&id)
+    }
+
+    /// Does `id` name a symbol -- an object's storage -- rather than a value?
+    pub fn is_sym(&self, id: PseudoId) -> bool {
+        self.get(id)
+            .is_some_and(|p| matches!(p.kind, crate::ir::PseudoKind::Sym(_)))
+    }
+}
+
 /// The `-fverbose-asm` annotation for one IR instruction: what it came from.
 ///
 /// gcc writes the operands' source-level names, and the source line beside the
 /// instructions it produced. `Pseudo::name` carries the variable a pseudo came
 /// from, when it came from one, which is the same information.
-pub fn verbose_annotation(insn: &Instruction, pseudos: &[Pseudo]) -> Option<String> {
+pub fn verbose_annotation(insn: &Instruction, pseudos: &PseudoTable) -> Option<String> {
     let name_of = |id: PseudoId| -> Option<&str> {
         pseudos
-            .get(id.0 as usize)
+            .get(id)
             .and_then(|p| p.name.as_deref())
             .filter(|n| !n.is_empty())
     };

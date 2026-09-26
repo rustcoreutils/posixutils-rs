@@ -27,7 +27,7 @@ use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::target::Target;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const DEFAULT_VAR_MAP_CAPACITY: usize = 64;
 const DEFAULT_LABEL_MAP_CAPACITY: usize = 16;
@@ -229,6 +229,12 @@ pub struct Linearizer<'a> {
     pub(crate) module: Module,
     /// Current function being linearized
     pub(crate) current_func: Option<Function>,
+    /// Every CFG edge `link_bb`/`link_bb_many` have added to the current
+    /// function. They are the only writers of `children` and `parents`
+    /// during linearization, so this answers "is the edge already there?" in
+    /// O(1) for both lists -- scanning `parents` instead made a label that
+    /// thousands of `goto`s jump to quadratic in them.
+    cfg_edges: HashSet<(BasicBlockId, BasicBlockId)>,
     /// Current basic block being built
     pub(crate) current_bb: Option<BasicBlockId>,
     /// Next pseudo ID
@@ -374,6 +380,7 @@ impl<'a> Linearizer<'a> {
         Self {
             module: Module::default(),
             current_func: None,
+            cfg_edges: HashSet::new(),
             current_bb: None,
             next_pseudo: 0,
             next_bb: 0,
@@ -612,6 +619,7 @@ impl<'a> Linearizer<'a> {
 
     /// Add an instruction to the current basic block
     pub(crate) fn emit(&mut self, insn: Instruction) {
+        let insn = self.displacement_in_range(insn);
         if let Some(bb_id) = self.current_bb {
             // Attach current source position for debug info
             let insn = if let Some(pos) = self.current_pos {
@@ -623,6 +631,34 @@ impl<'a> Linearizer<'a> {
             bb.add_insn(insn);
         }
     }
+    /// Keep a load's or store's constant offset inside a machine displacement.
+    ///
+    /// Both backends address `src[0] + offset` with a signed 32-bit
+    /// displacement, so an offset past `i32` -- a member more than 2 GiB into a
+    /// struct, reached through a pointer -- used to be truncated with `as i32`
+    /// and the access landed gigabytes away. This is the one place such an
+    /// offset can enter the IR: no pass rewrites an offset afterwards. The far
+    /// part is folded into the address with an ordinary `Add`, so the register
+    /// allocator supplies the register it needs, and
+    /// [`Instruction::displacement`] can rely on the result
+    /// (`validate.rs` I6 checks it).
+    fn displacement_in_range(&mut self, mut insn: Instruction) -> Instruction {
+        if !matches!(insn.op, Opcode::Load | Opcode::Store) || i32::try_from(insn.offset).is_ok() {
+            return insn;
+        }
+        let Some(&base) = insn.src.first() else {
+            return insn;
+        };
+        let ptr = self.types.pointer_to(self.types.char_id);
+        let base = self.rvalue_addr(base, self.types.char_id);
+        let delta = self.emit_const(insn.offset as i128, self.types.long_id);
+        let addr = self.alloc_reg_pseudo();
+        self.emit(Instruction::binop(Opcode::Add, addr, base, delta, ptr, 64));
+        insn.src[0] = addr;
+        insn.offset = 0;
+        insn
+    }
+
     /// Emit a type conversion if needed
     /// Returns the (possibly converted) pseudo ID
     pub(crate) fn emit_convert(
@@ -772,22 +808,33 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// Link two basic blocks (parent -> child)
-    pub(crate) fn link_bb(&mut self, from: BasicBlockId, to: BasicBlockId) {
-        let func = self.current_func.as_mut().unwrap();
-
-        // Add child to parent
-        if let Some(from_bb) = func.get_block_mut(from) {
-            from_bb.add_child(to);
+    /// Link `from` to each of `targets`, in order, as `link_bb` would one at
+    /// a time.
+    pub(crate) fn link_bb_many(
+        &mut self,
+        from: BasicBlockId,
+        targets: impl IntoIterator<Item = BasicBlockId>,
+    ) {
+        for to in targets {
+            self.link_bb(from, to);
         }
+    }
 
-        // Add parent to child - need to get it separately
-        // First ensure it exists
+    /// Link two basic blocks (parent -> child), once: a second link of the
+    /// same edge adds nothing.
+    pub(crate) fn link_bb(&mut self, from: BasicBlockId, to: BasicBlockId) {
+        if !self.cfg_edges.insert((from, to)) {
+            return;
+        }
+        let func = self.current_func.as_mut().unwrap();
+        if let Some(from_bb) = func.get_block_mut(from) {
+            from_bb.children.push(to);
+        }
         if func.get_block(to).is_none() {
             func.add_block(BasicBlock::new(to));
         }
         if let Some(to_bb) = func.get_block_mut(to) {
-            to_bb.add_parent(from);
+            to_bb.parents.push(from);
         }
     }
 
@@ -1202,6 +1249,7 @@ impl<'a> Linearizer<'a> {
         ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
         ir_func.symbol_attrs = func.attrs.symbol.clone();
+        ir_func.align = func.attrs.align;
         ir_func.is_noinline = func.attrs.noinline;
         ir_func.declared_effect = func.attrs.effect;
         ir_func.is_always_inline = func.attrs.always_inline;
@@ -1401,6 +1449,7 @@ impl<'a> Linearizer<'a> {
         }
 
         self.current_func = Some(ir_func);
+        self.cfg_edges.clear();
 
         // Create entry block
         let entry_bb = self.alloc_bb();
@@ -1900,10 +1949,14 @@ impl<'a> Linearizer<'a> {
 
     /// The address of a value that has just been materialized.
     ///
-    /// A `Sym`'s slot holds the value itself; anything else already holds a
-    /// pointer to it. Deciding here, where the pseudo's kind is known, is what
-    /// lets every consumer treat the result as a plain address -- handing one
-    /// the value's own bits instead gets them dereferenced as an address.
+    /// A `Sym`'s slot holds the value itself. Any other pseudo of a struct or
+    /// union that fits in a register holds the aggregate's *value* -- the IR's
+    /// convention, which `linearize_ident` and friends follow -- so it is
+    /// stored to a temporary whose address is returned. Anything else already
+    /// holds a pointer. Deciding here, where the pseudo's kind is known, is
+    /// what lets every consumer treat the result as a plain address; handing
+    /// one a small struct's bits instead got them dereferenced as an address,
+    /// which is how `t = c ? u : v` on an eight-byte struct segfaulted.
     pub(crate) fn rvalue_addr(&mut self, val: PseudoId, typ: TypeId) -> PseudoId {
         let slot_is_the_value = self
             .current_func
@@ -1911,12 +1964,27 @@ impl<'a> Linearizer<'a> {
             .and_then(|f| f.get_pseudo(val))
             .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
         if !slot_is_the_value {
-            return val;
+            if !self.aggregate_travels_by_value(typ) {
+                return val;
+            }
+            let size = self.types.size_bits(typ);
+            let tmp = self.frame_temp("__rvalue", typ);
+            self.emit(Instruction::store(val, tmp, 0, typ, size));
+            return self.rvalue_addr(tmp, typ);
         }
         let addr = self.alloc_reg_pseudo();
         let ptr_type = self.types.pointer_to(typ);
         self.emit(Instruction::sym_addr(addr, val, ptr_type));
         addr
+    }
+
+    /// Whether a struct or union of this type travels in the IR as its value
+    /// rather than its address: it does when it fits in one register, the
+    /// threshold `linearize_ident` applies. A complex value always travels by
+    /// address, and is not asked about here.
+    pub(crate) fn aggregate_travels_by_value(&self, typ: TypeId) -> bool {
+        matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union)
+            && (1..=64).contains(&self.types.size_bits(typ))
     }
 
     /// Linearize an expression as an lvalue (get its address)
@@ -3134,21 +3202,7 @@ impl<'a> Linearizer<'a> {
 
         let (result_sym, mut arg_vals, mut arg_types_vec) = if returns_large_struct {
             // Allocate local storage for the return value
-            let sret_sym = self.alloc_pseudo();
-            let sret_pseudo = Pseudo::sym(sret_sym, format!("__sret_{}", sret_sym.0));
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sret_pseudo);
-                // Internal sret storage is never volatile or atomic
-                func.add_local(
-                    format!("__sret_{}", sret_sym.0),
-                    sret_sym,
-                    typ,
-                    false, // not volatile
-                    false, // not atomic
-                    self.current_bb,
-                    None, // no explicit alignment
-                );
-            }
+            let sret_sym = self.frame_temp("__sret", typ);
 
             // Get address of the allocated space
             let sret_addr = self.alloc_reg_pseudo();
@@ -3163,40 +3217,12 @@ impl<'a> Linearizer<'a> {
         } else if returns_reg_aggregate {
             // Two-register struct returns: allocate local storage for the result
             // Codegen will store RAX+RDX (x86-64) or X0+X1 (AArch64) to this location
-            let local_sym = self.alloc_pseudo();
-            let unique_name = format!("__2reg_{}", local_sym.0);
-            let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(local_pseudo);
-                func.add_local(
-                    &unique_name,
-                    local_sym,
-                    typ,
-                    false,
-                    false,
-                    self.current_bb,
-                    None,
-                );
-            }
+            let local_sym = self.frame_temp("__2reg", typ);
             (local_sym, Vec::new(), Vec::new())
         } else if ret_is_address {
             // Complex returns: allocate local storage for the result
             // Complex values are 16 bytes and need stack storage
-            let local_sym = self.alloc_pseudo();
-            let unique_name = format!("__cret_{}", local_sym.0);
-            let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(local_pseudo);
-                func.add_local(
-                    &unique_name,
-                    local_sym,
-                    typ,
-                    false,
-                    false,
-                    self.current_bb,
-                    None,
-                );
-            }
+            let local_sym = self.frame_temp("__cret", typ);
             (local_sym, Vec::new(), Vec::new())
         } else if (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
             && struct_size_bits > 0
@@ -3207,21 +3233,7 @@ impl<'a> Linearizer<'a> {
             // The codegen stores RAX (or XMM0) to this location.
             // Without this, the result pseudo holds a raw value which
             // emit_assign's block_copy would incorrectly dereference as a pointer.
-            let local_sym = self.alloc_pseudo();
-            let unique_name = format!("__sret1_{}", local_sym.0);
-            let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(local_pseudo);
-                func.add_local(
-                    &unique_name,
-                    local_sym,
-                    typ,
-                    false,
-                    false,
-                    self.current_bb,
-                    None,
-                );
-            }
+            let local_sym = self.frame_temp("__sret1", typ);
             (local_sym, Vec::new(), Vec::new())
         } else {
             let result = self.alloc_pseudo();
@@ -3286,15 +3298,16 @@ impl<'a> Linearizer<'a> {
                 && self.types.size_bits(arg_type) > 64
             {
                 let size_bits = self.types.size_bits(arg_type);
+                let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+                let class = abi.classify_param(arg_type, self.types);
                 if size_bits > 128 {
                     // Large struct (> 16 bytes): keep struct type so ABI classifies as
-                    // Indirect/MEMORY. The pseudo is still the struct's address;
-                    // codegen will copy bytes to the stack.
+                    // Indirect/MEMORY. The pseudo is the struct's address: System V
+                    // copies its bytes to the stack there, and AAPCS64 is handed a
+                    // copy of it below.
                     arg_types_vec.push(arg_type);
                 } else {
-                    // Medium struct (9-16 bytes): check ABI classification
-                    let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-                    let class = abi.classify_param(arg_type, self.types);
+                    // Medium struct (9-16 bytes): the ABI classification decides
                     let is_two_fp_regs = matches!(
                         class,
                         crate::abi::ArgClass::Direct { ref classes, .. }
@@ -3329,7 +3342,29 @@ impl<'a> Linearizer<'a> {
                 // materializes an rvalue -- a call returning a struct -- and
                 // hands back the temporary's address, so both cases are the
                 // same call.
-                self.linearize_lvalue(a)
+                let addr = self.linearize_lvalue(a);
+                if matches!(class, crate::abi::ArgClass::Indirect { .. })
+                    && abi.indirect_param_is_reference()
+                {
+                    // AAPCS64 B.4: the callee owns the memory it is pointed at
+                    // and may write it, so it must be a copy. Passing the
+                    // original's address was invisible c17-to-c17 -- a c17
+                    // callee copies out of it first -- but a gcc callee that
+                    // assigned to its parameter wrote through into the
+                    // caller's object.
+                    let copy = self.frame_temp("__argcopy", arg_type);
+                    let copy_addr = self.alloc_reg_pseudo();
+                    self.emit(Instruction::sym_addr(
+                        copy_addr,
+                        copy,
+                        self.types.pointer_to(arg_type),
+                    ));
+                    let bytes = self.types.size_bytes(arg_type) as i64;
+                    self.emit_block_copy(copy_addr, addr, bytes);
+                    copy_addr
+                } else {
+                    addr
+                }
             } else if bool_param_for_complex_arg.is_some() {
                 // A complex argument bound to a `_Bool` parameter converts by
                 // comparing against zero, so it must not take the
@@ -4291,6 +4326,22 @@ impl<'a> Linearizer<'a> {
     /// thing left to exclude is a type there is nothing to convert between --
     /// `void`, a struct, a pointer. Complex is excluded deliberately: widening
     /// it is a separate question from this one.
+    /// One arm of a non-complex conditional, ready to merge: an aggregate's
+    /// address, or a scalar converted to the result type.
+    fn conditional_arm(
+        &mut self,
+        val: crate::ir::PseudoId,
+        arm: &Expr,
+        result_typ: crate::types::TypeId,
+        aggregate: bool,
+    ) -> crate::ir::PseudoId {
+        if aggregate {
+            return self.rvalue_addr(val, result_typ);
+        }
+        let arm_typ = self.expr_type(arm);
+        self.convert_conditional_arm(val, arm_typ, result_typ)
+    }
+
     fn convert_conditional_arm(
         &mut self,
         val: crate::ir::PseudoId,
@@ -4417,26 +4468,34 @@ impl<'a> Linearizer<'a> {
             return self.linearize_complex_ternary(cond, then_expr, else_expr, result_typ);
         }
 
-        let size = if self.types.kind(result_typ) == TypeKind::Function {
-            64
+        // A struct or union too big for a register travels by address, so
+        // its arms are merged as addresses: a pointer-sized select or phi of
+        // `rvalue_addr`s. It was merged at the aggregate's own size -- a phi
+        // of 128 bits or more over pointers. One that fits in a register
+        // travels by value and is merged as one, below.
+        let aggregate = matches!(
+            self.types.kind(result_typ),
+            TypeKind::Struct | TypeKind::Union
+        ) && !self.aggregate_travels_by_value(result_typ);
+        let (merge_typ, size) = if aggregate {
+            (self.types.pointer_to(result_typ), self.target.pointer_width)
+        } else if self.types.kind(result_typ) == TypeKind::Function {
+            (result_typ, 64)
         } else {
-            self.types.size_bits(result_typ)
+            (result_typ, self.types.size_bits(result_typ))
         };
 
         if self.is_pure_expr(then_expr) && self.is_pure_expr(else_expr) && size <= 64 {
             // Pure: use Select instruction (enables cmov/csel)
             let cond_bool = self.linearize_condition(cond);
-            let mut then_val = self.linearize_expr(then_expr);
-            let mut else_val = self.linearize_expr(else_expr);
-
-            let then_typ = self.expr_type(then_expr);
-            let else_typ = self.expr_type(else_expr);
-            then_val = self.convert_conditional_arm(then_val, then_typ, result_typ);
-            else_val = self.convert_conditional_arm(else_val, else_typ, result_typ);
+            let then_val = self.linearize_expr(then_expr);
+            let else_val = self.linearize_expr(else_expr);
+            let then_val = self.conditional_arm(then_val, then_expr, result_typ, aggregate);
+            let else_val = self.conditional_arm(else_val, else_expr, result_typ, aggregate);
 
             let result = self.alloc_pseudo();
             self.emit(Instruction::select(
-                result, cond_bool, then_val, else_val, result_typ, size,
+                result, cond_bool, then_val, else_val, merge_typ, size,
             ));
             result
         } else {
@@ -4453,17 +4512,15 @@ impl<'a> Linearizer<'a> {
             self.link_bb(cond_end_bb, else_bb);
 
             self.switch_bb(then_bb);
-            let mut then_val = self.linearize_expr(then_expr);
-            let then_typ = self.expr_type(then_expr);
-            then_val = self.convert_conditional_arm(then_val, then_typ, result_typ);
+            let then_val = self.linearize_expr(then_expr);
+            let then_val = self.conditional_arm(then_val, then_expr, result_typ, aggregate);
             let then_end_bb = self.current_bb.unwrap();
             self.emit(Instruction::br(merge_bb));
             self.link_bb(then_end_bb, merge_bb);
 
             self.switch_bb(else_bb);
-            let mut else_val = self.linearize_expr(else_expr);
-            let else_typ = self.expr_type(else_expr);
-            else_val = self.convert_conditional_arm(else_val, else_typ, result_typ);
+            let else_val = self.linearize_expr(else_expr);
+            let else_val = self.conditional_arm(else_val, else_expr, result_typ, aggregate);
             let else_end_bb = self.current_bb.unwrap();
             self.emit(Instruction::br(merge_bb));
             self.link_bb(else_end_bb, merge_bb);
@@ -4474,12 +4531,12 @@ impl<'a> Linearizer<'a> {
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(phi_pseudo);
             }
-            let mut phi_insn = Instruction::phi(result, result_typ, size);
+            let mut phi_insn = Instruction::phi(result, merge_typ, size);
             let phisrc1 =
-                self.emit_phi_source(then_end_bb, then_val, result, merge_bb, result_typ, size);
+                self.emit_phi_source(then_end_bb, then_val, result, merge_bb, merge_typ, size);
             phi_insn.phi_list.push((then_end_bb, phisrc1));
             let phisrc2 =
-                self.emit_phi_source(else_end_bb, else_val, result, merge_bb, result_typ, size);
+                self.emit_phi_source(else_end_bb, else_val, result, merge_bb, merge_typ, size);
             phi_insn.phi_list.push((else_end_bb, phisrc2));
             self.emit(phi_insn);
 
@@ -4891,21 +4948,7 @@ impl<'a> Linearizer<'a> {
                     TypeKind::Struct | TypeKind::Union | TypeKind::Array
                 );
                 let result = if is_aggregate {
-                    let local_sym = self.alloc_pseudo();
-                    let name = format!("__vaarg_{}", local_sym.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(Pseudo::sym(local_sym, name.clone()));
-                        func.add_local(
-                            &name,
-                            local_sym,
-                            *arg_type,
-                            false,
-                            false,
-                            self.current_bb,
-                            None,
-                        );
-                    }
-                    local_sym
+                    self.frame_temp("__vaarg", *arg_type)
                 } else {
                     self.alloc_pseudo()
                 };
@@ -5230,27 +5273,25 @@ impl<'a> Linearizer<'a> {
             }
 
             ExprKind::FrameAddress { level } => {
-                // __builtin_frame_address(level) - returns frame pointer at given level
-                let level_val = self.linearize_expr(level);
                 let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::FrameAddress)
-                    .with_target(result)
-                    .with_src(level_val)
-                    .with_type_and_size(self.types.void_ptr_id, 64);
+                let insn = Instruction::frame_walk(
+                    Opcode::FrameAddress,
+                    result,
+                    *level,
+                    self.types.void_ptr_id,
+                );
                 self.emit(insn);
                 result
             }
 
             ExprKind::ReturnAddress { level } => {
-                // __builtin_return_address(level) - returns return address at given level
-                let level_val = self.linearize_expr(level);
                 let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::ReturnAddress)
-                    .with_target(result)
-                    .with_src(level_val)
-                    .with_type_and_size(self.types.void_ptr_id, 64);
+                let insn = Instruction::frame_walk(
+                    Opcode::ReturnAddress,
+                    result,
+                    *level,
+                    self.types.void_ptr_id,
+                );
                 self.emit(insn);
                 result
             }

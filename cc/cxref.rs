@@ -262,9 +262,7 @@ fn extract_refs_from_expr(
         | ExprKind::Popcount { arg }
         | ExprKind::Popcountl { arg }
         | ExprKind::Popcountll { arg }
-        | ExprKind::Alloca { size: arg }
-        | ExprKind::FrameAddress { level: arg }
-        | ExprKind::ReturnAddress { level: arg } => {
+        | ExprKind::Alloca { size: arg } => {
             extract_refs_from_expr(arg, strings, symbols, xref);
         }
         _ => {}

@@ -6771,7 +6771,7 @@ int *addr_tls(void) { return &tv; }
             "aarch64 {flags:?}: expected the dynamic model:\n{asm}"
         );
         assert!(
-            !asm.contains("tprel") && !asm.contains("gottpoff"),
+            !asm.contains("tprel") && !asm.contains("gottprel"),
             "aarch64 {flags:?}: a static model cannot serve a dlopened library:\n{asm}"
         );
     }
@@ -6845,7 +6845,7 @@ int *addr_tls(void) { return &tv; }
 
         let asm = asm_for_with("tls_le", AARCH64_LINUX, src, flags);
         assert!(
-            asm.contains("tprel") && !asm.contains("gottpoff"),
+            asm.contains(":tprel_hi12:") && !asm.contains("gottprel"),
             "aarch64 {flags:?}: an executable should use Local Exec:\n{asm}"
         );
     }
@@ -6863,6 +6863,13 @@ int read_ev(int x) { return x + ev; }
     assert!(
         asm.contains("@GOTTPOFF"),
         "x86_64: extern TLS needs Initial Exec even in an executable:\n{asm}"
+    );
+    // aarch64 spells the same relocations `:gottprel:`/`:gottprel_lo12:`;
+    // x86-64's `gottpoff` there is rejected by the assembler.
+    let asm = asm_for_with("tls_extern", AARCH64_LINUX, src, &["-O"]);
+    assert!(
+        asm.contains(":gottprel:") && asm.contains(":gottprel_lo12:") && !asm.contains("gottpoff"),
+        "aarch64: extern TLS needs Initial Exec even in an executable:\n{asm}"
     );
 }
 
@@ -11768,7 +11775,7 @@ static int one_huge_local(void) {
     return e[0] + e[39999];
 }
 
-/* A frame that needs more than one re-base of the zeroing cursor. */
+/* A frame the prologue zeroes with its loop rather than unrolled stores. */
 static int very_huge_local(void) {
     volatile unsigned char f[100000];
     f[0] = 6; f[50000] = 7; f[99999] = 8;
@@ -13202,7 +13209,9 @@ fn codegen_zero_initialized_globals_are_definitions() {
     );
 }
 
-/// The section directive in force where `name:` is defined.
+/// The section directive in force where `name:` is defined. Only the ELF
+/// section tests use it, and they run on an x86-64 Linux host.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn section_of<'a>(asm: &'a str, name: &str) -> Option<&'a str> {
     let label = format!("{name}:");
     let mut current = None;
@@ -13617,17 +13626,15 @@ long stride(struct Big *p, int i) { return (char *)&p[i] - (char *)p; }
 /// - **x86-64 only.** Nothing to do with coverage: the length is computed in
 ///   `ir/` before any backend runs, so one target proves it, and x86-64 is the
 ///   one that materialises the constant as a literal rather than as
-///   `movz`/`movk`. Adding an `AARCH64_LINUX` assertion would cost **12.5
-///   seconds and 16 GB** resident, because `initialize`'s 600 MB local goes
-///   through `zero_stack_frame`, which unrolls one store per qword on aarch64
-///   where x86-64 emits `rep stosq`.
+///   `movz`/`movk`. An `AARCH64_LINUX` assertion once cost **12.5 seconds and
+///   16 GB** resident, because `initialize`'s 600 MB local went through an
+///   unrolled `zero_stack_frame`. That is a loop now; nobody has re-measured
+///   the rest of the aarch64 path at this size, so keep the list as it is.
 /// - **`by_value_param` does not pass its argument on.** The prologue copy is
-///   the site under test; *sending* a 600 MB aggregate costs **16 seconds and
-///   21.9 GB**, because the outgoing stacked-argument copy has no `memcpy`
-///   fallback and unrolls one load/store pair per eight bytes.
+///   the site under test. Sending a 600 MB aggregate used to cost 16 seconds
+///   and 21.9 GB of compiler memory, one load/store pair per eightbyte; the
+///   outgoing copy is a `rep movsq` now, but it is not what this test is about.
 ///
-/// Both are recorded in cc/TODO.md. Until they are fixed, do not raise the
-/// target list and do not add a call that passes one of these by value.
 /// Everything here is `extern`; nothing is defined or run.
 #[test]
 fn codegen_aggregate_copy_length_past_the_old_object_bound() {
@@ -13660,5 +13667,606 @@ unsigned long extent(void) { return __builtin_object_size(src.x, 0); }
             !body.contains("536870911"),
             "{func} uses the saturated size_bits:\n{body}"
         );
+    }
+}
+
+/// A C source whose function takes `n` parameters of mixed classes -- `int`,
+/// `double`, and a two-eightbyte struct -- and checks every one arrived. A
+/// second function returns a large struct, so its parameters sit one `Arg`
+/// index after the hidden return pointer.
+fn many_params_source(n: usize) -> String {
+    let param = |i: usize| match i % 3 {
+        0 => format!("int p{i}"),
+        1 => format!("double p{i}"),
+        _ => format!("struct pair p{i}"),
+    };
+    let check = |i: usize| match i % 3 {
+        0 => format!("if (p{i} != {i}) return {};\n", i + 1),
+        1 => format!("if (p{i} != {i}.5) return {};\n", i + 1),
+        _ => format!("if (p{i}.a != {i} || p{i}.b != -{i}) return {};\n", i + 1),
+    };
+    let arg = |i: usize| match i % 3 {
+        0 => format!("{i}"),
+        1 => format!("{i}.5"),
+        _ => format!("(struct pair){{{i}, -{i}}}"),
+    };
+    let params: Vec<String> = (0..n).map(param).collect();
+    let args: Vec<String> = (0..n).map(arg).collect();
+    let checks: String = (0..n).map(check).collect();
+    format!(
+        "struct pair {{ long a, b; }};\n\
+         struct big {{ long v[8]; }};\n\
+         __attribute__((noinline)) int f({params}) {{\n{checks}return 0; }}\n\
+         __attribute__((noinline)) struct big g({params}) {{\n\
+         struct big r = {{{{0}}}};\n\
+         r.v[0] = f({names});\n\
+         return r; }}\n\
+         int main(void) {{\n\
+         int rc = f({args});\n\
+         if (rc) return rc;\n\
+         return (int)g({args}).v[0]; }}\n",
+        params = params.join(", "),
+        names = (0..n)
+            .map(|i| format!("p{i}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        args = args.join(", "),
+    )
+}
+
+/// Each parameter's pseudo is found by one index lookup, not by scanning the
+/// function's pseudos per parameter -- which made a function of 100,000
+/// parameters (the gcc torture test `compile/limits-fndefn`) take minutes in
+/// both backends. This pins that every parameter still reaches its own
+/// register or stack slot across the mix of classes, with and without a
+/// hidden return pointer.
+#[test]
+fn codegen_many_mixed_params_arrive_in_place() {
+    let src = many_params_source(300);
+    assert_eq!(compile_and_run("many_mixed_params", &src, &[]), 0);
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run("many_mixed_params_o2", &src, &opts), 0);
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64("many_mixed_params_a64", &src, opt) {
+            assert_eq!(code, 0, "aarch64 at {opt}");
+        }
+    }
+}
+
+/// Thousands of branches in one function -- the shape of the gcc torture test
+/// `compile/20001226-1`, which spent minutes in register allocation on both
+/// targets: pairing every constraint point with every live interval, an
+/// ordering that rescanned every vertex per pick, and per-interval and
+/// per-constant scans of the whole function. This pins that the function
+/// still computes the right answer after those became indexed.
+#[test]
+fn codegen_many_branches_one_function() {
+    let mut src = String::from("__attribute__((noinline)) int cmp(int x[64], int y[64]) {\n");
+    for i in 0..1500 {
+        let a = i % 64;
+        src.push_str(&format!(
+            "if (x[{a}] > y[{a}]) goto gt; if (x[{a}] < y[{a}]) goto lt;\n"
+        ));
+    }
+    src.push_str(
+        "return 0; gt: return 1; lt: return 2; }\n\
+         int main(void) {\n\
+         int x[64], y[64];\n\
+         for (int i = 0; i < 64; i++) x[i] = y[i] = i;\n\
+         if (cmp(x, y) != 0) return 10;\n\
+         x[20] = 100;\n\
+         if (cmp(x, y) != 1) return 11;\n\
+         x[20] = 20; y[23] = 100;\n\
+         if (cmp(x, y) != 2) return 12;\n\
+         return 0; }\n",
+    );
+    assert_eq!(compile_and_run("many_branches", &src, &[]), 0);
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run("many_branches_o2", &src, &opts), 0);
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64("many_branches_a64", &src, opt) {
+            assert_eq!(code, 0, "aarch64 at {opt}");
+        }
+    }
+}
+
+/// A large frame's zeroing on aarch64 is a loop, not one store per eightbyte.
+///
+/// Every aarch64 prologue zeroes the locals area so that a narrow write leaves
+/// zeros above it. It was unrolled: a 1 MB local came to about 125,000 lines
+/// of assembly, a gigabyte one to 125 million stores, and past 16 MiB the
+/// cursor's re-basing `add` did not encode at all. `clean` relies on that
+/// zeroing -- it reads a frame `dirty` just filled at the same depth -- which
+/// is c17's guarantee, not gcc's, so gcc is checked on the first two only.
+const AARCH64_BIG_FRAME_ZEROED: &str = r#"
+#define NI __attribute__((noinline))
+volatile long sink;
+NI void touch(void *p) { sink += *(volatile char *)p; }
+
+NI long big_frame(long seed)
+{
+    volatile char a[1000000];
+    long x = seed;
+    a[0] = 1; a[sizeof a - 1] = 2;
+    touch((void *)a); touch(&x);
+    return x + a[0] + a[sizeof a - 1];
+}
+
+NI long dirty(void)
+{
+    volatile char a[100000];
+    for (int i = 0; i < 100000; i += 997) a[i] = 0x55;
+    touch((void *)a);
+    return a[997];
+}
+
+NI long clean(void)
+{
+    volatile char a[100000];
+    touch((void *)a);
+    long bad = 0;
+    for (int i = 0; i < 100000; i += 997) bad += a[i] != 0;
+    return bad;
+}
+
+int main(void)
+{
+    if (big_frame(5) != 8) return 1;
+    if (dirty() != 0x55) return 2;
+    if (clean() != 0) return 3;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_aarch64_big_frame_is_zeroed_by_a_loop() {
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) =
+            compile_and_run_aarch64("a64_big_frame_zeroed", AARCH64_BIG_FRAME_ZEROED, opt)
+        {
+            assert_eq!(code, 0, "at {opt}");
+        }
+    }
+}
+
+/// The shape of the zeroing: a loop past the `stp` range, whose size does
+/// not grow with the frame, and the unrolled pair stores below it.
+#[test]
+fn codegen_aarch64_frame_zeroing_shape() {
+    let target = ["--target", "aarch64-unknown-linux-gnu"];
+    let big = asm_for_at(
+        "a64_zero_big",
+        "long f(void) { volatile char a[1000000]; a[0] = 1; return a[0]; }\n",
+        &target,
+    );
+    assert!(
+        big.contains("stp xzr, xzr, [x16], #16"),
+        "no zeroing loop:\n{big}"
+    );
+    assert!(
+        big.lines().count() < 200,
+        "a 1 MB frame's prologue should not grow with the frame: {} lines",
+        big.lines().count()
+    );
+
+    let small = asm_for_at(
+        "a64_zero_small",
+        "long f(void) { volatile char a[64]; a[0] = 1; return a[0]; }\n",
+        &target,
+    );
+    assert!(small.contains("stp xzr, xzr, [x29, #"), "{small}");
+    assert!(
+        !small.contains("[x16], #16"),
+        "a small frame is unrolled:\n{small}"
+    );
+}
+
+/// Members more than 2 GiB into a struct, read and written through a pointer.
+///
+/// Both backends narrowed a load's or store's IR offset with `as i32`, so
+/// `p->y` at offset 3,000,000,000 became a displacement of -1,294,967,296 and
+/// the access landed gigabytes away: a segfault on both targets at every
+/// level, where gcc builds and runs this. `Linearizer::emit` now folds such an
+/// offset into the address. The pointer is formed 3 GB below a real buffer, so
+/// only the far members are ever touched and nothing large is allocated.
+const FAR_MEMBERS: &str = r#"
+/* Members past 2 GiB, reached through a pointer that is never dereferenced
+   below its real storage: `base` points 3 GB before `storage`, so only the
+   far members are ever touched. */
+#define NI __attribute__((noinline))
+typedef unsigned long size_t;
+struct pair { long a, b; };
+
+struct far {
+    char pad[3000000000UL];
+    int y;
+    long z;
+    double w;
+    float f;
+    short s;
+    unsigned char c;
+    struct pair pair;
+    unsigned bits : 5;
+    long double ld;
+};
+
+#define OFF(m) ((size_t)&((struct far *)0)->m)
+
+static struct {
+    int y; long z; double w; float f; short s; unsigned char c;
+    struct pair pair; unsigned bits; long double ld; long pad[8];
+} storage_shadow;
+static char storage[256] __attribute__((aligned(16)));
+
+NI struct far *base(void) { return (struct far *)(storage - OFF(y)); }
+
+NI int get_y(struct far *p) { return p->y; }
+NI long get_z(struct far *p) { return p->z; }
+NI double get_w(struct far *p) { return p->w; }
+NI float get_f(struct far *p) { return p->f; }
+NI short get_s(struct far *p) { return p->s; }
+NI unsigned char get_c(struct far *p) { return p->c; }
+NI long double get_ld(struct far *p) { return p->ld; }
+NI void set_all(struct far *p)
+{
+    p->y = 11; p->z = 22; p->w = 3.5; p->f = 4.5f; p->s = -6; p->c = 7;
+    p->pair.a = 8; p->pair.b = 9; p->bits = 13; p->ld = 10.25L;
+}
+NI int *addr_y(struct far *p) { return &p->y; }
+NI long pair_sum(struct far *p)
+{
+    struct pair q = p->pair;
+    return q.a + q.b;
+}
+NI unsigned get_bits(struct far *p) { return p->bits; }
+
+int main(void)
+{
+    struct far *p = base();
+    (void)storage_shadow;
+    set_all(p);
+    if (get_y(p) != 11) return 1;
+    if (get_z(p) != 22) return 2;
+    if (get_w(p) != 3.5) return 3;
+    if (get_f(p) != 4.5f) return 4;
+    if (get_s(p) != -6) return 5;
+    if (get_c(p) != 7) return 6;
+    if (pair_sum(p) != 17) return 7;
+    if (get_bits(p) != 13) return 8;
+    if (get_ld(p) != 10.25L) return 9;
+    if ((char *)addr_y(p) != storage) return 10;
+    if (*(int *)storage != 11) return 11;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_member_past_two_gigabytes_through_a_pointer() {
+    for opt in ["-O0", "-O2"] {
+        let opts = vec![opt.to_string()];
+        assert_eq!(
+            compile_and_run("far_members", FAR_MEMBERS, &opts),
+            0,
+            "x86-64 {opt}"
+        );
+        if let Some(code) = compile_and_run_aarch64("far_members_a64", FAR_MEMBERS, opt) {
+            assert_eq!(code, 0, "aarch64 {opt}");
+        }
+    }
+}
+
+/// The largest frame c17 admits is allocated whole, on both targets.
+///
+/// The companion to `diagnostics_frame_at_the_ceiling_is_refused_not_wrapped`:
+/// refusing the frames that used to wrap must not refuse -- or shrink -- the
+/// ones that fit. An over-aligned local, a variadic save area and a scalar
+/// beside it are everything the prologue adds on top of the locals. The
+/// allocation is read off the assembly rather than run: a two-gigabyte frame
+/// is not a test's to ask for, and c17 now zeroes it with a loop, so compiling
+/// it costs nothing.
+#[test]
+fn codegen_largest_admitted_frame_is_allocated_whole() {
+    use crate::common::asm_for_at;
+    const OBJECT: i64 = 2_147_479_000;
+    let src = "extern void sink(void *);\n\
+               void f(int n, ...){ _Alignas(64) char a[2147479000]; long x = n; sink(a); sink(&x); }\n";
+    // x86-64: one `subq $N, %rsp`.
+    let asm = asm_for_at(
+        "frame_edge_x86",
+        src,
+        &["--target", "x86_64-unknown-linux-gnu"],
+    );
+    let alloc: i64 = asm
+        .lines()
+        .find_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("subq $")?
+                .strip_suffix(", %rsp")?
+                .parse()
+                .ok()
+        })
+        .expect("x86-64 prologue allocation");
+    assert!(alloc >= OBJECT + 8, "x86-64 allocated {alloc}:\n{asm}");
+    // aarch64: `movz x15, #lo` / `movk x15, #hi, lsl #16` / `sub sp, sp, x15`.
+    let asm = asm_for_at(
+        "frame_edge_a64",
+        src,
+        &["--target", "aarch64-unknown-linux-gnu"],
+    );
+    let lines: Vec<&str> = asm.lines().map(str::trim).collect();
+    let sub = lines
+        .iter()
+        .position(|l| *l == "sub sp, sp, x15")
+        .expect("aarch64 prologue allocation");
+    let lo: i64 = lines[sub - 2]
+        .strip_prefix("movz x15, #")
+        .and_then(|v| v.parse().ok())
+        .expect("movz");
+    let hi: i64 = lines[sub - 1]
+        .strip_prefix("movk x15, #")
+        .and_then(|v| v.strip_suffix(", lsl #16"))
+        .and_then(|v| v.parse().ok())
+        .expect("movk");
+    let alloc = lo + (hi << 16);
+    assert!(alloc >= OBJECT + 8, "aarch64 allocated {alloc}:\n{asm}");
+}
+
+/// Stacked aggregate arguments past the unroll threshold are copied with
+/// `rep movsq`, and arrive intact at a callee another compiler built.
+///
+/// One load/store pair per eightbyte made a 600 MB argument 75 million
+/// instructions and tens of gigabytes of compiler memory. The copy runs after
+/// the outgoing area is reserved and before the register arguments are set up,
+/// so RDI, RSI and RCX -- which `rep movsq` needs -- can still hold arguments;
+/// here they hold `a`, `c` and `e`, and must survive it.
+#[test]
+fn codegen_large_stacked_argument_block_copy() {
+    let caller = r#"
+struct big { long v[8192]; };
+long take(int a, struct big b, int c, struct big d, int e);
+static struct big x, y;
+__attribute__((noinline)) long go(int a, int c, int e) { return take(a, x, c, y, e); }
+int main(void)
+{
+    for (int i = 0; i < 8192; i++) { x.v[i] = i * 3; y.v[i] = i; }
+    long want = 1 + 2 + 3;
+    for (int i = 0; i < 8192; i++) want += x.v[i] - y.v[i];
+    want += x.v[0] * 1000 + y.v[8191];
+    return go(1, 2, 3) == want ? 0 : 1;
+}
+"#;
+    let callee = r#"
+struct big { long v[8192]; };
+long take(int a, struct big b, int c, struct big d, int e)
+{
+    long s = a + c + e;
+    for (int i = 0; i < 8192; i++) s += b.v[i] - d.v[i];
+    return s + b.v[0] * 1000 + d.v[8191];
+}
+"#;
+    if let Some(code) = compile_with_host_cc("big_stacked_args", caller, callee) {
+        assert_eq!(code, 0);
+    }
+    let asm = crate::common::asm_for_at(
+        "big_stacked_args",
+        caller,
+        &["--target", "x86_64-unknown-linux-gnu"],
+    );
+    assert!(
+        asm.contains("rep movsq"),
+        "expected a block copy:
+{asm}"
+    );
+}
+
+/// A struct or union through `?:`, and every other expression that yields one,
+/// on both sides of the eight-byte line where the IR stops carrying an
+/// aggregate's value and starts carrying its address.
+///
+/// `t = c ? v : u` on an eight-byte struct segfaulted on both targets: the
+/// arms were loaded as values (the convention for a register-sized aggregate)
+/// and the assignment then dereferenced the selected value as an address,
+/// because `rvalue_addr` passed any non-`Sym` pseudo through as a pointer. It
+/// now spills a register-sized aggregate value to a temporary. A larger `?:`
+/// merged its arms' addresses at the aggregate's own width, and a struct
+/// assignment expression yielded an address at every size; both follow the
+/// convention now. Covered: assignment expressions, the comma operator,
+/// statement expressions, nested and impure (call) arms, `?:` as an argument,
+/// a return value, a member's base and an initializer, and unions.
+const AGGREGATE_VALUE_SHAPES: &str = r#"
+#define NI __attribute__((noinline))
+#define T(N) \
+struct s##N { unsigned char c[N]; }; \
+union u##N { unsigned char c[N]; long pad; }; \
+static int calls##N; \
+NI struct s##N mk##N(int base) { struct s##N r; int i; calls##N++; for (i = 0; i < N; i++) r.c[i] = (unsigned char)(base + i); return r; } \
+NI int sum##N(struct s##N s) { int i, t = 0; for (i = 0; i < N; i++) t += s.c[i]; return t; } \
+NI struct s##N ret##N(int k, struct s##N a, struct s##N b) { return k ? a : b; } \
+NI int test##N(void) { \
+    struct s##N t, u = mk##N(1), v = mk##N(101), w; int i, k = 1; \
+    w = (t = u); \
+    for (i = 0; i < N; i++) if (w.c[i] != i + 1 || t.c[i] != i + 1) return 1; \
+    t = (k, v); \
+    for (i = 0; i < N; i++) if (t.c[i] != i + 101) return 2; \
+    t = ({ struct s##N z = u; z; }); \
+    for (i = 0; i < N; i++) if (t.c[i] != i + 1) return 3; \
+    t = k ? (k > 5 ? u : v) : u; \
+    for (i = 0; i < N; i++) if (t.c[i] != i + 101) return 4; \
+    calls##N = 0; \
+    t = k ? mk##N(50) : mk##N(60); \
+    if (calls##N != 1) return 5; \
+    for (i = 0; i < N; i++) if (t.c[i] != i + 50) return 6; \
+    if (sum##N(k ? u : v) != sum##N(u)) return 7; \
+    t = ret##N(0, u, v); \
+    for (i = 0; i < N; i++) if (t.c[i] != i + 101) return 8; \
+    if ((k ? u : v).c[N - 1] != N) return 9; \
+    struct s##N x = k ? v : u; \
+    for (i = 0; i < N; i++) if (x.c[i] != i + 101) return 10; \
+    union u##N p, q, r; p.c[0] = 7; q.c[0] = 9; r = k ? q : p; if (r.c[0] != 9) return 11; \
+    return 0; }
+T(1) T(2) T(4) T(7) T(8) T(9) T(12) T(16) T(17) T(24) T(40)
+int main(void)
+{
+    int r;
+#define C(N) if ((r = test##N())) return N * 20 + r;
+    C(1) C(2) C(4) C(7) C(8) C(9) C(12) C(16) C(17) C(24) C(40)
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_aggregate_through_conditional_and_other_rvalues() {
+    let src = AGGREGATE_VALUE_SHAPES;
+    assert_eq!(compile_and_run("aggregate_rvalues", src, &[]), 0);
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run("aggregate_rvalues_o2", src, &opts), 0);
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64("aggregate_rvalues_a64", src, opt) {
+            assert_eq!(code, 0, "aarch64 at {opt}");
+        }
+    }
+}
+
+/// A function named like one of the backends' own labels.
+///
+/// Block labels are `.L<function>_<n>`, and the backends' internal labels --
+/// an int128 shift's branches, a `va_arg` overflow path, a CAS loop, the
+/// constant pools -- were `.L<prefix>_<n>` in the same namespace. So a
+/// function named `i128`, `va_done` or `cas_loop` defined one of its blocks
+/// under the name of a label the backend had also made, and the assembler
+/// rejected the output ("symbol `.Li128_0' is already defined"). Internal
+/// labels are `.L.<prefix>.<n>` now, which no C identifier can spell. The
+/// function body has enough blocks for a low-numbered internal label to meet
+/// one, and every construct that makes internal labels on either target; the
+/// expected value is gcc's.
+const INTERNAL_LABEL_NAMED: &str = r#"
+#include <stdarg.h>
+#define NI __attribute__((noinline))
+struct P { long a, b; };
+_Atomic double ad;
+static int word = 1;
+/* A function named like one of the backend's own labels, with enough blocks
+   that a low-numbered internal label meets one of its block labels, and every
+   construct that emits such labels on either target. */
+NI long fname(long a, int s, int n, ...)
+{
+    long acc = 0;
+    if (a > 0) acc += 0;
+    if (a > 1) acc += 1;
+    if (a > 2) acc += 2;
+    if (a > 3) acc += 3;
+    if (a > 4) acc += 4;
+    if (a > 5) acc += 0;
+    if (a > 6) acc += 1;
+    if (a > 7) acc += 2;
+    if (a > 8) acc += 3;
+    if (a > 9) acc += 4;
+    if (a > 10) acc += 0;
+    if (a > 11) acc += 1;
+    if (a > 12) acc += 2;
+    if (a > 13) acc += 3;
+    if (a > 14) acc += 4;
+    if (a > 15) acc += 0;
+    if (a > 16) acc += 1;
+    if (a > 17) acc += 2;
+    if (a > 18) acc += 3;
+    if (a > 19) acc += 4;
+    if (a > 20) acc += 0;
+    if (a > 21) acc += 1;
+    if (a > 22) acc += 2;
+    if (a > 23) acc += 3;
+    if (a > 24) acc += 4;
+    if (a > 25) acc += 0;
+    if (a > 26) acc += 1;
+    if (a > 27) acc += 2;
+    if (a > 28) acc += 3;
+    if (a > 29) acc += 4;
+    if (a > 30) acc += 0;
+    if (a > 31) acc += 1;
+    if (a > 32) acc += 2;
+    if (a > 33) acc += 3;
+    if (a > 34) acc += 4;
+    if (a > 35) acc += 0;
+    if (a > 36) acc += 1;
+    if (a > 37) acc += 2;
+    if (a > 38) acc += 3;
+    if (a > 39) acc += 4;
+    __int128 x = (__int128)a << s;
+    __int128 y = x >> (s + 1);
+    unsigned __int128 z = (unsigned __int128)x >> s;
+    acc += (long)(x >> 64) + (long)(y >> 64) + (long)(z >> 64) + (long)z;
+    va_list ap;
+    va_start(ap, n);
+    for (int i = 0; i < n; i++)
+        acc += va_arg(ap, long);
+    acc += (long)va_arg(ap, double);
+    struct P p = va_arg(ap, struct P);
+    acc += p.a + p.b;
+    va_end(ap);
+    acc += __sync_val_compare_and_swap(&word, 1, 2);
+    acc += __atomic_fetch_and(&word, 3, __ATOMIC_SEQ_CST);
+    acc += __atomic_exchange_n(&word, 7, __ATOMIC_SEQ_CST);
+    ad += 1.5;
+    ad -= 0.5;
+    acc += (long)ad;
+    double d = a > 3 ? 0.0 : 2.5;
+    acc += (long)(d * 2);
+    long double ld = 0.0L + (long double)a;
+    acc += (long)ld;
+    volatile char big[4096];
+    big[0] = 1;
+    acc += big[0];
+    return acc;
+}
+
+int main(void)
+{
+    struct P p = {3, 4};
+    long r = fname(5, 70, 2, 10L, 20L, 6.0, p);
+    __builtin_printf("%ld\n", r);
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_function_named_like_an_internal_label() {
+    let prefixes = [
+        "i128",
+        "zero_frame",
+        "cas_loop",
+        "cas_fail",
+        "swap_loop",
+        "fadd_loop",
+        "fsub_loop",
+        "va_overflow",
+        "va_done",
+        "va_fp_overflow",
+        "va_fp_done",
+        "va_agg_overflow",
+        "va_agg_done",
+        "sel_then",
+        "sel_done",
+        "cas_done",
+        "atomic_bitop",
+        "i128shl_ge64",
+        "i128shl_done",
+        "i128lsr_ge64",
+        "i128lsr_done",
+        "i128asr_ge64",
+        "i128asr_done",
+        "dbl_const",
+        "quad_const",
+        "ld_const",
+    ];
+    for name in prefixes {
+        let src = INTERNAL_LABEL_NAMED.replace("fname", name);
+        let o2 = vec!["-O2".to_string()];
+        assert_eq!(compile_and_run(name, &src, &[]), 0, "{name} at -O0");
+        assert_eq!(compile_and_run(name, &src, &o2), 0, "{name} at -O2");
+        for opt in ["-O0", "-O2"] {
+            if let Some(code) = compile_and_run_aarch64(name, &src, opt) {
+                assert_eq!(code, 0, "{name} on aarch64 at {opt}");
+            }
+        }
     }
 }

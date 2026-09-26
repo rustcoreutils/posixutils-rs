@@ -12,9 +12,9 @@
 use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
-use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
 use crate::float::{f64_to_f16_bits, FloatVal};
-use crate::ir::{Instruction, Opcode, PseudoId, PseudoKind};
+use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
 impl X86_64CodeGen {
@@ -66,24 +66,20 @@ impl X86_64CodeGen {
                     size: fp_size,
                     src: XmmOperand::Mem(MemAddr::BaseOffset {
                         base: r,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     }),
                     dst: XmmOperand::Reg(dst_xmm),
                 });
             }
             Loc::Stack(offset) => {
                 // Check if the address operand is a symbol (local variable) or a temp (spilled address)
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(addr);
 
                 if is_symbol {
                     // Local variable - load directly from stack slot
                     self.push_lir(X86Inst::MovFp {
                         size: fp_size,
-                        src: XmmOperand::Mem(self.stack_mem(offset - insn.offset as i32)),
+                        src: XmmOperand::Mem(self.stack_mem(offset - insn.displacement())),
                         dst: XmmOperand::Reg(dst_xmm),
                     });
                 } else {
@@ -97,39 +93,19 @@ impl X86_64CodeGen {
                         size: fp_size,
                         src: XmmOperand::Mem(MemAddr::BaseOffset {
                             base: Reg::R11,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         }),
                         dst: XmmOperand::Reg(dst_xmm),
                     });
                 }
             }
             Loc::Global(name) => {
-                if self.needs_got_access(&name) {
-                    // External symbols on macOS: load address from GOT, then load FP value
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    self.push_lir(X86Inst::MovFp {
-                        size: fp_size,
-                        src: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::R11,
-                            offset: insn.offset as i32,
-                        }),
-                        dst: XmmOperand::Reg(dst_xmm),
-                    });
-                } else {
-                    self.push_lir(X86Inst::MovFp {
-                        size: fp_size,
-                        src: XmmOperand::Mem(MemAddr::RipRelative(Symbol {
-                            name: name.to_string(),
-                            is_local: false,
-                            is_extern: false,
-                        })),
-                        dst: XmmOperand::Reg(dst_xmm),
-                    });
-                }
+                let src = self.global_mem(&name, insn.displacement(), Reg::R11);
+                self.push_lir(X86Inst::MovFp {
+                    size: fp_size,
+                    src: XmmOperand::Mem(src),
+                    dst: XmmOperand::Reg(dst_xmm),
+                });
             }
             _ => {
                 // Load address into R11, then load from that address
@@ -138,7 +114,7 @@ impl X86_64CodeGen {
                     size: fp_size,
                     src: XmmOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::R11,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     }),
                     dst: XmmOperand::Reg(dst_xmm),
                 });
@@ -198,24 +174,20 @@ impl X86_64CodeGen {
                     src: XmmOperand::Reg(XmmReg::Xmm15),
                     dst: XmmOperand::Mem(MemAddr::BaseOffset {
                         base: r,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     }),
                 });
             }
             Loc::Stack(offset) => {
                 // Check if the address operand is a symbol (local variable) or a temp (spilled address)
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(addr);
 
                 if is_symbol {
                     // Local variable - store directly to stack slot
                     self.push_lir(X86Inst::MovFp {
                         size: fp_size,
                         src: XmmOperand::Reg(XmmReg::Xmm15),
-                        dst: XmmOperand::Mem(self.stack_mem(offset - insn.offset as i32)),
+                        dst: XmmOperand::Mem(self.stack_mem(offset - insn.displacement())),
                     });
                 } else {
                     // Spilled address - load address first, then store through it
@@ -229,38 +201,18 @@ impl X86_64CodeGen {
                         src: XmmOperand::Reg(XmmReg::Xmm15),
                         dst: XmmOperand::Mem(MemAddr::BaseOffset {
                             base: Reg::R11,
-                            offset: insn.offset as i32,
+                            offset: insn.displacement(),
                         }),
                     });
                 }
             }
             Loc::Global(name) => {
-                if self.needs_got_access(&name) {
-                    // External symbols on macOS: load address from GOT, then store FP value
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    self.push_lir(X86Inst::MovFp {
-                        size: fp_size,
-                        src: XmmOperand::Reg(XmmReg::Xmm15),
-                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::R11,
-                            offset: insn.offset as i32,
-                        }),
-                    });
-                } else {
-                    self.push_lir(X86Inst::MovFp {
-                        size: fp_size,
-                        src: XmmOperand::Reg(XmmReg::Xmm15),
-                        dst: XmmOperand::Mem(MemAddr::RipRelative(Symbol {
-                            name: name.to_string(),
-                            is_local: false,
-                            is_extern: false,
-                        })),
-                    });
-                }
+                let dst = self.global_mem(&name, insn.displacement(), Reg::R11);
+                self.push_lir(X86Inst::MovFp {
+                    size: fp_size,
+                    src: XmmOperand::Reg(XmmReg::Xmm15),
+                    dst: XmmOperand::Mem(dst),
+                });
             }
             _ => {
                 // Load address into R11, then store
@@ -270,7 +222,7 @@ impl X86_64CodeGen {
                     src: XmmOperand::Reg(XmmReg::Xmm15),
                     dst: XmmOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::R11,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     }),
                 });
             }
@@ -672,8 +624,8 @@ impl X86_64CodeGen {
             let uid = self.unique_label_counter;
             self.unique_label_counter += 1;
             // Use high block_id values (10000+) to avoid colliding with basic block IDs
-            let unsigned_label = Label::new(&self.base.current_fn, 10000 + uid * 2);
-            let done_label = Label::new(&self.base.current_fn, 10000 + uid * 2 + 1);
+            let unsigned_label = Label::block(&self.base.current_fn, 10000 + uid * 2);
+            let done_label = Label::block(&self.base.current_fn, 10000 + uid * 2 + 1);
 
             // test r10, r10 — check sign bit
             self.push_lir(X86Inst::Test {
@@ -865,8 +817,8 @@ impl X86_64CodeGen {
         self.unique_label_counter += 1;
         // High block_id values, as emit_int_to_float does, so these cannot
         // collide with a basic block's own label.
-        let big_label = Label::new(&self.base.current_fn, 10000 + uid * 2);
-        let done_label = Label::new(&self.base.current_fn, 10000 + uid * 2 + 1);
+        let big_label = Label::block(&self.base.current_fn, 10000 + uid * 2);
+        let done_label = Label::block(&self.base.current_fn, 10000 + uid * 2 + 1);
 
         // 2^63 is exactly representable in both float and double.
         const TWO_POW_63: f64 = 9223372036854775808.0;
@@ -1039,7 +991,7 @@ impl X86_64CodeGen {
         // `0.0q` shared one entry, and whichever was interned last won.
         let key = ((hi as u128) << 64) | lo as u128;
         self.quad_constants.insert(key, bytes);
-        let label = format!(".Lquad_const_{}", key);
+        let label = crate::arch::lir::internal_label("quad_const", key);
         self.push_lir(X86Inst::MovFp {
             size: FpSize::Quad,
             src: XmmOperand::Mem(MemAddr::RipRelative(crate::arch::lir::Symbol {
@@ -1195,28 +1147,12 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Global(name) => {
-                if self.needs_got_access(&name) {
-                    // External symbols on macOS: load address from GOT, then load FP value
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    self.push_lir(X86Inst::MovFp {
-                        size: fp_size,
-                        src: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::R11,
-                            offset: 0,
-                        }),
-                        dst: XmmOperand::Reg(dst),
-                    });
-                } else {
-                    self.push_lir(X86Inst::MovFp {
-                        size: fp_size,
-                        src: XmmOperand::Mem(MemAddr::RipRelative(Symbol::global(name.clone()))),
-                        dst: XmmOperand::Reg(dst),
-                    });
-                }
+                let src = self.global_mem(&name, 0, Reg::R11);
+                self.push_lir(X86Inst::MovFp {
+                    size: fp_size,
+                    src: XmmOperand::Mem(src),
+                    dst: XmmOperand::Reg(dst),
+                });
             }
         }
     }
@@ -1265,8 +1201,8 @@ impl X86_64CodeGen {
         label_suffix: u32,
         types: &TypeTable,
     ) {
-        let overflow_label = Label::new("va_fp_overflow", label_suffix);
-        let done_label = Label::new("va_fp_done", label_suffix);
+        let overflow_label = Label::internal("va_fp_overflow", label_suffix);
+        let done_label = Label::internal("va_fp_done", label_suffix);
 
         let fp_size = types.size_bits(arg_type);
         // `__float128` occupies a whole XMM register and a sixteen-byte slot.

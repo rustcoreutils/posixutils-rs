@@ -14,8 +14,8 @@
 
 use super::*;
 use crate::parse::ast::{
-    AssignOp, BinaryOp, BlockItem, Declaration, Designator, ExprKind, ExternalDecl, ForInit,
-    FunctionDef, InitDeclarator, InitElement, Parameter, Stmt, UnaryOp,
+    AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, ExprKind, ExternalDecl,
+    ForInit, FunctionDef, InitDeclarator, InitElement, Parameter, Stmt, UnaryOp,
 };
 use crate::strings::StringTable;
 use crate::symbol::Symbol;
@@ -2905,6 +2905,7 @@ fn test_incomplete_struct_type_resolution() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     };
     let complete_struct_type = ctx.types.intern(Type::struct_type(complete_composite));
 
@@ -3714,6 +3715,7 @@ fn test_struct_deref_returns_address() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     });
     let struct_type_id = ctx.types.intern(struct_type);
     let struct_ptr_type_id = ctx.types.intern(Type::pointer(struct_type_id));
@@ -4229,19 +4231,13 @@ fn test_alignof_expr_emits_setval() {
 
 #[test]
 fn test_frame_address_emits_opcode() {
-    // Test: return __builtin_frame_address(0);
+    // Test: return __builtin_frame_address(2);
     // Should emit FrameAddress opcode
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
     let void_ptr = ctx.types.void_ptr_id;
 
-    let level_expr = Expr::typed_unpositioned(ExprKind::IntLit(0), ctx.types.int_id);
-    let frame_addr_expr = Expr::typed_unpositioned(
-        ExprKind::FrameAddress {
-            level: Box::new(level_expr),
-        },
-        void_ptr,
-    );
+    let frame_addr_expr = Expr::typed_unpositioned(ExprKind::FrameAddress { level: 2 }, void_ptr);
 
     let func = FunctionDef {
         attrs: Default::default(),
@@ -4260,31 +4256,26 @@ fn test_frame_address_emits_opcode() {
     let module = ctx.linearize(&tu);
 
     let func = &module.functions[0];
-    let has_frame_addr = func
+    // The level travels as an immediate, not as a source pseudo.
+    let insn = func
         .blocks
         .iter()
-        .any(|bb| bb.insns.iter().any(|insn| insn.op == Opcode::FrameAddress));
-    assert!(
-        has_frame_addr,
-        "__builtin_frame_address should emit FrameAddress opcode"
-    );
+        .flat_map(|bb| bb.insns.iter())
+        .find(|insn| insn.op == Opcode::FrameAddress)
+        .expect("__builtin_frame_address should emit FrameAddress opcode");
+    assert_eq!(insn.frame_level(), 2);
+    assert!(insn.src.is_empty());
 }
 
 #[test]
 fn test_return_address_emits_opcode() {
-    // Test: return __builtin_return_address(0);
+    // Test: return __builtin_return_address(2);
     // Should emit ReturnAddress opcode
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
     let void_ptr = ctx.types.void_ptr_id;
 
-    let level_expr = Expr::typed_unpositioned(ExprKind::IntLit(0), ctx.types.int_id);
-    let return_addr_expr = Expr::typed_unpositioned(
-        ExprKind::ReturnAddress {
-            level: Box::new(level_expr),
-        },
-        void_ptr,
-    );
+    let return_addr_expr = Expr::typed_unpositioned(ExprKind::ReturnAddress { level: 2 }, void_ptr);
 
     let func = FunctionDef {
         attrs: Default::default(),
@@ -4303,14 +4294,14 @@ fn test_return_address_emits_opcode() {
     let module = ctx.linearize(&tu);
 
     let func = &module.functions[0];
-    let has_return_addr = func
+    let insn = func
         .blocks
         .iter()
-        .any(|bb| bb.insns.iter().any(|insn| insn.op == Opcode::ReturnAddress));
-    assert!(
-        has_return_addr,
-        "__builtin_return_address should emit ReturnAddress opcode"
-    );
+        .flat_map(|bb| bb.insns.iter())
+        .find(|insn| insn.op == Opcode::ReturnAddress)
+        .expect("__builtin_return_address should emit ReturnAddress opcode");
+    assert_eq!(insn.frame_level(), 2);
+    assert!(insn.src.is_empty());
 }
 
 // Mixed designated + positional initializer field tracking
@@ -4379,6 +4370,7 @@ fn test_mixed_designated_positional_struct_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     };
     let struct_type = ctx.types.intern(Type::struct_type(struct_composite));
     let s_sym = ctx.var("s", struct_type);
@@ -4602,6 +4594,7 @@ fn test_designator_chain_nested_struct_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
 
     let pt_id = ctx.str("pt");
@@ -4635,6 +4628,7 @@ fn test_designator_chain_nested_struct_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
     let outer_sym = ctx.var("s", outer_type);
 
@@ -4725,6 +4719,7 @@ fn test_designator_chain_array_member_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
     let s_sym = ctx.var("s", struct_type);
 
@@ -4890,6 +4885,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
     let s_sym = ctx.var("s", struct_type);
 
@@ -4985,6 +4981,7 @@ fn test_union_first_named_member_positional_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
     let u_sym = ctx.var("u", union_type);
 
@@ -5300,6 +5297,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             member_align: 1,
             is_complete: true,
             transparent: false,
+            anon_id: None,
         })),
         ..Default::default()
     });
@@ -5449,6 +5447,7 @@ fn test_bitfield_designated_init_local_var() {
         member_align: 1,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
 
     let s_sym = ctx.var("s", struct_type);
@@ -5586,6 +5585,7 @@ fn test_large_struct_copy_from_array() {
             member_align: 8,
             is_complete: true,
             transparent: false,
+            anon_id: None,
         })),
         ..Default::default()
     });
@@ -5725,6 +5725,7 @@ fn test_compound_literal_zero_init_lvalue() {
             member_align: 8,
             is_complete: true,
             transparent: false,
+            anon_id: None,
         })),
         ..Default::default()
     });
@@ -5859,6 +5860,7 @@ fn test_conditional_short_circuit_arrow() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
     let struct_ptr_type = ctx.types.intern(Type::pointer(struct_type));
 
@@ -6253,6 +6255,7 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     }));
     let atomic_struct = {
         let mut t = ctx.types.get(struct_type).clone();
@@ -6360,6 +6363,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
         member_align: 8,
         is_complete: true,
         transparent: false,
+        anon_id: None,
     });
     let struct_type_id = ctx.types.intern(struct_type);
     let s_sym = ctx.var("s", struct_type_id);
@@ -6751,6 +6755,13 @@ fn test_block_scope_extern_declares_no_local() {
         "the name must be recorded as external so codegen reaches it through \
          the GOT on macOS, got {:?}",
         module.extern_symbols
+    ); // And its alignment, which is all a backend knows about an object
+       // defined elsewhere -- aarch64 folds `:lo12:` into an access only when it
+       // covers the access size.
+    assert_eq!(
+        module.extern_object_align.get("g"),
+        Some(&4),
+        "an extern object's declared alignment must be recorded"
     );
 }
 
@@ -6903,4 +6914,480 @@ fn test_complex_equality_compares_both_halves() {
         "a complex comparison must not become an integer compare:\n{}",
         module.display(&ctx.types)
     );
+}
+
+/// A function's `aligned` attribute reaches the IR function the backends emit.
+#[test]
+fn test_function_alignment_reaches_the_ir() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let mut func = make_simple_func(
+        test_id,
+        Stmt::Return(Some(Expr::int(0, &ctx.types))),
+        &ctx.types,
+    );
+    func.attrs.align = Some(64);
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    assert_eq!(module.functions[0].align, Some(64));
+}
+
+/// An `asm goto` output is written back on every path out of the statement.
+///
+/// The label edge gets a block of its own that stores the output and then
+/// branches to the label; the asm names that block, not the label. Before,
+/// the store sat only on the fall-through, so a jump reached the label with
+/// the output never written.
+#[test]
+fn test_asm_goto_output_written_back_on_the_label_edge() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let out_id = ctx.str("out");
+    let int_type = ctx.int_type();
+    let x_sym = ctx.var("x", int_type);
+
+    // { asm goto("" : "=r"(x) : : : out); return 0; out: return x; }
+    let body = Stmt::Block(vec![
+        BlockItem::Statement(Box::new(Stmt::Asm {
+            template: String::new(),
+            outputs: vec![AsmOperand {
+                name: None,
+                constraint: "=r".to_string(),
+                expr: Expr::var_typed(x_sym, int_type),
+            }],
+            inputs: vec![],
+            clobbers: vec![],
+            goto_labels: vec![out_id],
+        })),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
+        BlockItem::Statement(Box::new(Stmt::Label {
+            name: out_id,
+            stmt: Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
+            pos: test_pos(),
+        })),
+    ]);
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: int_type,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(x_sym),
+            typ: int_type,
+            vm_dims: vec![],
+            discarded_dims: vec![],
+        }],
+        body,
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let func = &module.functions[0];
+
+    let asm = func
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .find(|insn| insn.op == Opcode::Asm)
+        .expect("an asm instruction");
+    let out_pseudo = asm.asm_data.as_ref().unwrap().outputs[0].pseudo;
+    let (edge, _) = asm.asm_data.as_ref().unwrap().goto_labels[0];
+    let edge = func.get_block(edge).expect("the label edge block");
+    assert!(
+        edge.insns
+            .iter()
+            .any(|i| i.op == Opcode::Store && i.src.contains(&out_pseudo)),
+        "the label edge must store the output: {:?}",
+        edge.insns
+    );
+    assert!(
+        matches!(edge.insns.last().map(|i| i.op), Some(Opcode::Br)),
+        "the label edge must end by branching to the label"
+    );
+}
+
+/// A memory operand naming an object is handed over as the object's `Sym`,
+/// not as an address computed into a pseudo.
+///
+/// Addressed in place it needs no register; as an address value it
+/// competed for one and, once spilled, the backend substituted the spill
+/// slot as the operand. The address arithmetic the lvalue produced is left
+/// for DCE, which removes it once nothing reads it.
+#[test]
+fn test_asm_memory_operand_names_its_object() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let x_sym = ctx.var("x", int_type);
+
+    // { asm("" : "=m"(x) : "m"(x)); return x; }
+    let body = Stmt::Block(vec![
+        BlockItem::Statement(Box::new(Stmt::Asm {
+            template: String::new(),
+            outputs: vec![AsmOperand {
+                name: None,
+                constraint: "=m".to_string(),
+                expr: Expr::var_typed(x_sym, int_type),
+            }],
+            inputs: vec![AsmOperand {
+                name: None,
+                constraint: "m".to_string(),
+                expr: Expr::var_typed(x_sym, int_type),
+            }],
+            clobbers: vec![],
+            goto_labels: vec![],
+        })),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
+            x_sym, int_type,
+        ))))),
+    ]);
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: int_type,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(x_sym),
+            typ: int_type,
+            vm_dims: vec![],
+            discarded_dims: vec![],
+        }],
+        body,
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let func = &module.functions[0];
+
+    let asm = func
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .find(|insn| insn.op == Opcode::Asm)
+        .expect("an asm instruction");
+    let data = asm.asm_data.as_ref().unwrap();
+    for c in data.outputs.iter().chain(data.inputs.iter()) {
+        assert!(
+            matches!(
+                func.get_pseudo(c.pseudo).map(|p| &p.kind),
+                Some(crate::ir::PseudoKind::Sym(_))
+            ),
+            "{c:?} should name the object"
+        );
+        assert_eq!(c.offset, 0);
+    }
+    let mut func = func.clone();
+    crate::ir::dce::run(&mut func);
+    assert!(
+        !func
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .any(|i| i.op == Opcode::SymAddr),
+        "nothing reads the operand's address arithmetic, so DCE removes it"
+    );
+}
+
+/// The address arithmetic behind a memory operand that names an object is
+/// not the linearizer's to delete: `"=m"(*(q = &arr[2]))` also stores that
+/// address into `q`, before the asm. Deleting it left the store reading an
+/// undefined register, so `q == &arr[2]` was false.
+#[test]
+fn test_asm_memory_operand_keeps_an_address_something_else_reads() {
+    let src = "int arr[4]; int *q;\n\
+               void f(void) { __asm__ volatile(\"\" : \"=m\"(*(q = &arr[2]))); }\n";
+    let module = linearize_source(src, &Target::host());
+    let func = module.functions.iter().find(|f| f.name == "f").expect("f");
+    let insns: Vec<&Instruction> = func.blocks.iter().flat_map(|bb| bb.insns.iter()).collect();
+    // Every pseudo a live instruction reads must be defined by a live one.
+    let defined: std::collections::HashSet<PseudoId> = insns
+        .iter()
+        .filter(|i| i.op != Opcode::Nop)
+        .filter_map(|i| i.target)
+        .chain(
+            func.pseudos
+                .iter()
+                .filter(|p| {
+                    !matches!(
+                        p.kind,
+                        crate::ir::PseudoKind::Reg(_) | crate::ir::PseudoKind::Phi(_)
+                    )
+                })
+                .map(|p| p.id),
+        )
+        .collect();
+    for insn in insns.iter().filter(|i| i.op == Opcode::Store) {
+        for s in &insn.src {
+            assert!(
+                defined.contains(s),
+                "{:?} reads {s:?}, which nothing defines",
+                insn.op
+            );
+        }
+    }
+}
+
+/// Parse `src` and linearize it for `target`.
+fn linearize_source(src: &str, target: &Target) -> Module {
+    let mut strings = StringTable::new();
+    let mut tokenizer = crate::token::lexer::Tokenizer::new(src.as_bytes(), 0, &mut strings);
+    let tokens = tokenizer.tokenize();
+    let mut symbols = crate::symbol::SymbolTable::new();
+    let mut types = TypeTable::new(target);
+    let tu = {
+        let mut parser =
+            crate::parse::Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+        parser.parse_translation_unit().expect("parse")
+    };
+    linearize(&tu, &symbols, &types, &strings, target, false)
+}
+
+/// AAPCS64 B.4 passes a composite over sixteen bytes as a pointer to a copy
+/// the caller makes; System V puts the bytes themselves in the argument area.
+/// So only the aarch64 lowering copies the argument into a frame temporary
+/// before the call -- and passes that temporary's address, not the global's.
+#[test]
+fn test_large_composite_argument_copied_only_where_the_abi_passes_a_reference() {
+    use crate::target::{Arch, Os};
+    let src = "struct big { long a, b, c; };\n\
+               struct big g;\n\
+               long f(struct big s);\n\
+               long t(void) { return f(g); }\n";
+    let has_copy = |target: Target| {
+        let module = linearize_source(src, &target);
+        let t = module.functions.iter().find(|f| f.name == "t").unwrap();
+        t.locals.keys().any(|name| name.starts_with("__argcopy_"))
+    };
+    assert!(has_copy(Target::new(Arch::Aarch64, Os::Linux)));
+    assert!(has_copy(Target::new(Arch::Aarch64, Os::MacOS)));
+    assert!(!has_copy(Target::new(Arch::X86_64, Os::Linux)));
+}
+
+/// A member more than 2 GiB into a struct is folded into the address, so no
+/// load or store leaves the linearizer with an offset a 32-bit displacement
+/// cannot hold -- through a pointer, and through a global.
+#[test]
+fn test_far_member_offset_is_folded_into_the_address() {
+    let src = "struct far { char pad[3000000000UL]; int y; long z; };\n\
+               int get(struct far *p) { return p->y; }\n\
+               void put(struct far *p, long v) { p->z = v; }\n";
+    let module = linearize_source(src, &Target::host());
+    for name in ["get", "put"] {
+        let func = module.functions.iter().find(|f| f.name == name).unwrap();
+        let accesses: Vec<&Instruction> = func
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
+            .collect();
+        assert!(!accesses.is_empty());
+        for insn in accesses {
+            assert!(
+                i32::try_from(insn.offset).is_ok(),
+                "{name}: {:?} kept offset {}",
+                insn.op,
+                insn.offset
+            );
+        }
+        assert!(crate::ir::validate::validate_function(func).is_ok());
+    }
+}
+
+/// Every CFG edge the linearizer builds is recorded once, in both lists.
+///
+/// Fifty `if (x) goto end;` all reach one label, so the label collects fifty
+/// predecessors. Whether an edge is already present is answered by a set of
+/// the edges linked so far rather than by scanning the label's `parents` --
+/// the scan made a label thousands of `goto`s jump to quadratic in them. The
+/// lists must still hold each edge exactly once, and `parents` and `children`
+/// must describe the same edges.
+#[test]
+fn test_cfg_edges_are_recorded_once_in_both_lists() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let end_id = ctx.str("end");
+    let int_type = ctx.int_type();
+    let x_sym = ctx.var("x", int_type);
+
+    let mut items: Vec<BlockItem> = (0..50)
+        .map(|_| {
+            BlockItem::Statement(Box::new(Stmt::If {
+                cond: Expr::var_typed(x_sym, int_type),
+                then_stmt: Box::new(Stmt::Goto {
+                    name: end_id,
+                    pos: test_pos(),
+                }),
+                else_stmt: None,
+            }))
+        })
+        .collect();
+    items.push(BlockItem::Statement(Box::new(Stmt::Label {
+        name: end_id,
+        stmt: Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
+        pos: test_pos(),
+    })));
+    let mut func = make_simple_func(test_id, Stmt::Block(items), &ctx.types);
+    func.params = vec![Parameter {
+        symbol: Some(x_sym),
+        typ: int_type,
+        vm_dims: vec![],
+        discarded_dims: vec![],
+    }];
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let func = &module.functions[0];
+
+    let mut widest = 0;
+    for bb in &func.blocks {
+        let mut parents = bb.parents.clone();
+        parents.sort();
+        parents.dedup();
+        assert_eq!(
+            parents.len(),
+            bb.parents.len(),
+            "{:?} repeats a parent",
+            bb.id
+        );
+        let mut children = bb.children.clone();
+        children.sort();
+        children.dedup();
+        assert_eq!(
+            children.len(),
+            bb.children.len(),
+            "{:?} repeats a child",
+            bb.id
+        );
+        for p in &bb.parents {
+            let pb = func.get_block(*p).expect("a parent is a block");
+            assert!(
+                pb.children.contains(&bb.id),
+                "{:?} -> {:?} missing a child edge",
+                p,
+                bb.id
+            );
+        }
+        for c in &bb.children {
+            let cb = func.get_block(*c).expect("a child is a block");
+            assert!(
+                cb.parents.contains(&bb.id),
+                "{:?} -> {:?} missing a parent edge",
+                bb.id,
+                c
+            );
+        }
+        widest = widest.max(bb.parents.len());
+    }
+    assert!(
+        widest >= 50,
+        "the label should collect every goto, widest was {widest}"
+    );
+}
+
+/// Inlining `__builtin_va_arg_pack_len()` replaces the pseudo standing for
+/// it with a constant. The inliner did that with `pseudos.retain` and never
+/// rebuilt `pseudo_idx`, so every caller pseudo after the removed placeholder
+/// was looked up at its neighbour's position -- `get_pseudo` answered a
+/// different pseudo's kind until `mem2reg` happened to rebuild the index.
+#[test]
+fn test_inlining_va_arg_pack_len_keeps_the_pseudo_index() {
+    let src = "extern inline __attribute__((always_inline, gnu_inline))\n\
+               int count(int a, ...) { int k = a * 3; return __builtin_va_arg_pack_len() + k; }\n\
+               int caller(int x) { int y = x + 1; return count(y, 1, 2, 3) + count(x) * 7 + y; }\n";
+    let mut module = linearize_source(src, &Target::host());
+    let opt = crate::opt::Optimization::from_flag("2").unwrap();
+    crate::ir::inline::run(&mut module, opt);
+    let caller = module
+        .functions
+        .iter()
+        .find(|f| f.name == "caller")
+        .expect("caller");
+    assert!(
+        caller
+            .blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .all(|i| i.op != Opcode::Call),
+        "count should have been inlined"
+    );
+    let mut errors = Vec::new();
+    crate::ir::validate::check_pseudo_index(caller, &mut errors);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// Collapsing the inner diamond of `a && b && c` is what makes the outer one
+/// recognizable, so `ifconv` has to revisit the blocks that branch to a
+/// collapsed predecessor. It does so from a worklist now, not by rescanning
+/// the function after every collapse; this pins that the whole chain still
+/// folds to straight-line code, and that many sequential diamonds all do.
+#[test]
+fn test_ifconv_collapses_nested_and_sequential_diamonds() {
+    let chain = |src: &str, name: &str| -> usize {
+        let mut module = linearize_source(src, &Target::host());
+        let func = module
+            .functions
+            .iter_mut()
+            .find(|f| f.name == name)
+            .expect("function");
+        assert!(crate::ir::ifconv::run(func));
+        let mut errors = Vec::new();
+        crate::ir::validate::check_pseudo_index(func, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        func.blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .filter(|i| i.op == Opcode::Cbr)
+            .count()
+    };
+    assert_eq!(
+        chain(
+            "int f(int a, int b, int c, int d) { return a > 0 && b > 0 && c > 0 && d > 0; }",
+            "f"
+        ),
+        0
+    );
+    let many: String = (0..200)
+        .map(|i| format!("  if (x > {i}) s += {};\n", i % 7))
+        .collect();
+    let src = format!("int g(int x) {{\n  int s = 0;\n{many}  return s;\n}}\n");
+    assert_eq!(chain(&src, "g"), 0);
+}
+
+/// A register-sized struct travels through the IR as its value, so a `?:`
+/// between two of them selects values, and the assignment consuming the
+/// result must not read through it as though it were an address. It did:
+/// `rvalue_addr` passed any non-`Sym` pseudo through as a pointer, and `t = c
+/// ? u : v` on an eight-byte struct dereferenced the struct's own bits.
+#[test]
+fn test_register_sized_struct_through_conditional_is_not_dereferenced() {
+    let src = "struct S { int a, b; };\n\
+               struct S t, u, v; int c;\n\
+               void f(void) { t = c ? u : v; }\n";
+    let module = linearize_source(src, &Target::host());
+    let func = module.functions.iter().find(|f| f.name == "f").expect("f");
+    let insns: Vec<&Instruction> = func.blocks.iter().flat_map(|bb| bb.insns.iter()).collect();
+    let merged: std::collections::HashSet<PseudoId> = insns
+        .iter()
+        .filter(|i| matches!(i.op, Opcode::Select | Opcode::Phi))
+        .filter_map(|i| i.target)
+        .collect();
+    assert!(!merged.is_empty(), "expected the arms to be merged");
+    for insn in insns.iter().filter(|i| i.op == Opcode::Load) {
+        assert!(
+            !merged.contains(&insn.src[0]),
+            "a load reads through the merged struct value {:?}",
+            insn.src[0]
+        );
+    }
 }

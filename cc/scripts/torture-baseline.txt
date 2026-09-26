@@ -145,6 +145,8 @@ compile/20001221-1@-O0
 compile/20001221-1@-O2
 compile/20001222-1@-O0
 compile/20001222-1@-O2
+compile/20001226-1@-O0
+compile/20001226-1@-O2
 compile/200031109-1@-O0
 compile/200031109-1@-O2
 compile/20010102-1@-O0
@@ -461,14 +463,6 @@ compile/20031010-1@-O0
 compile/20031010-1@-O2
 compile/20031011-2@-O0
 compile/20031011-2@-O2
-compile/20031023-1@-O0
-compile/20031023-1@-O2
-compile/20031023-2@-O0
-compile/20031023-2@-O2
-compile/20031023-3@-O0
-compile/20031023-3@-O2
-compile/20031023-4@-O0
-compile/20031023-4@-O2
 compile/20031031-1@-O0
 compile/20031031-1@-O2
 compile/20031031-2@-O0
@@ -1769,6 +1763,7 @@ compile/limits-externdecl@-O0
 compile/limits-externdecl@-O2
 compile/limits-fnargs@-O0
 compile/limits-fnargs@-O2
+compile/limits-fndefn@-O0
 compile/limits-fndefn@-O2
 compile/limits-idexternal@-O0
 compile/limits-idexternal@-O2
@@ -3587,8 +3582,6 @@ compile/ssa-pre-1@-O0
 compile/ssa-pre-1@-O2
 compile/ssa-unused-1@-O0
 compile/ssa-unused-1@-O2
-compile/stack-check-1@-O0
-compile/stack-check-1@-O2
 compile/statement-expression-1@-O0
 compile/statement-expression-1@-O2
 compile/store0@-O0
@@ -3922,6 +3915,8 @@ execute/20010118-1@-O0
 execute/20010118-1@-O2
 execute/20010119-1@-O0
 execute/20010119-1@-O2
+execute/20010122-1@-O0
+execute/20010122-1@-O2
 execute/20010123-1@-O0
 execute/20010123-1@-O2
 execute/20010129-1@-O0
@@ -5170,6 +5165,8 @@ execute/align-1@-O0
 execute/align-1@-O2
 execute/align-2@-O0
 execute/align-2@-O2
+execute/align-3@-O0
+execute/align-3@-O2
 execute/alloca-1@-O0
 execute/alloca-1@-O2
 execute/anon-1@-O0

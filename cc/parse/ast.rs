@@ -738,16 +738,19 @@ pub enum ExprKind {
 
     /// __builtin_frame_address(level)
     /// Returns the frame pointer address at the given level.
-    /// Level 0 is the current frame, 1 is the caller's frame, etc.
+    /// Level 0 is the current frame, 1 is the caller's frame, etc. The level
+    /// is an integer constant, as gcc requires; it is how many frame records
+    /// the backend walks.
     FrameAddress {
-        level: Box<Expr>,
+        level: u32,
     },
 
     /// __builtin_return_address(level)
     /// Returns the return address at the given level.
-    /// Level 0 is the current function's return address.
+    /// Level 0 is the current function's return address. An integer constant,
+    /// as for `FrameAddress`.
     ReturnAddress {
-        level: Box<Expr>,
+        level: u32,
     },
 
     // =========================================================================
@@ -1512,6 +1515,9 @@ pub struct FunctionAttrs {
     /// the only thing this translation unit can see about a function, and an
     /// attribute that in-TU analysis could overrule would buy nothing.
     pub effect: MemEffect,
+    /// `__attribute__((aligned(N)))` -- align the function's code to N bytes,
+    /// which is also what `__alignof__` of the function answers.
+    pub align: Option<u32>,
 }
 
 impl FunctionAttrs {
@@ -1543,6 +1549,9 @@ impl FunctionAttrs {
         if let Some(prio) = other.destructor {
             self.destructor = Some(prio);
         }
+        // Several `aligned` attributes across the declarations: the strictest
+        // wins, as it does for an object.
+        self.align = self.align.max(other.align);
     }
 }
 

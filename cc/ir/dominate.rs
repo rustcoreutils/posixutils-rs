@@ -94,7 +94,6 @@ impl DomTree {
     }
 }
 
-const DEFAULT_POSTORDER_CAPACITY: usize = 16;
 const DEFAULT_IDF_CAPACITY: usize = 8;
 
 /// The blocks control can reach from `bb`.
@@ -116,71 +115,81 @@ fn successors(bb: &crate::ir::BasicBlock) -> Vec<BasicBlockId> {
     out
 }
 
-/// Predecessors, as the exact inverse of [`successors`].
+// Dominator Tree Construction (Lengauer-Tarjan)
+
+/// A DFS index with no node behind it: the root's parent and ancestor.
+const NONE: usize = usize::MAX;
+
+/// The depth-first spanning tree from the entry.
+struct Numbering {
+    /// Each reached block's DFS number.
+    number: HashMap<BasicBlockId, usize>,
+    /// The block numbered `n`.
+    vertex: Vec<BasicBlockId>,
+    /// The node `n` was first reached from; `NONE` for the entry.
+    parent: Vec<usize>,
+    /// The successors of node `n`, as [`successors`] gives them.
+    succs: Vec<Vec<BasicBlockId>>,
+}
+
+/// Number the blocks reachable from the entry in depth-first preorder.
 ///
-/// **Not `bb.parents`.** The postorder walk follows `children`, and the
-/// dominator fixed point used to follow `parents`, so the two analyzed
-/// different graphs the moment the two fields disagreed -- which they do:
-/// `dce::fold_branches_to_unreachable` removes an edge from `children` and
-/// leaves it in `parents`. One graph, derived once, cannot drift from
-/// itself.
-fn predecessors(func: &Function) -> HashMap<BasicBlockId, Vec<BasicBlockId>> {
-    let mut preds: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
-    for bb in &func.blocks {
-        for s in successors(bb) {
-            let e = preds.entry(s).or_default();
-            if !e.contains(&bb.id) {
-                e.push(bb.id);
+/// Iterative, because a function of a few hundred thousand blocks in a chain
+/// is a legal input, and recursion would spend one host stack frame per block.
+fn dfs_numbering(func: &Function) -> Numbering {
+    let cap = func.blocks.len();
+    let mut t = Numbering {
+        number: HashMap::with_capacity(cap),
+        vertex: Vec::with_capacity(cap),
+        parent: Vec::with_capacity(cap),
+        succs: Vec::with_capacity(cap),
+    };
+    // (node, index of the next successor to try)
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let visit = |t: &mut Numbering, id: BasicBlockId, from: usize| {
+        let n = t.vertex.len();
+        t.number.insert(id, n);
+        t.vertex.push(id);
+        t.parent.push(from);
+        t.succs
+            .push(func.get_block(id).map(successors).unwrap_or_default());
+        n
+    };
+    stack.push((visit(&mut t, func.entry, NONE), 0));
+    while let Some(&(n, next)) = stack.last() {
+        match t.succs[n].get(next).copied() {
+            Some(s) => {
+                stack.last_mut().unwrap().1 += 1;
+                if !t.number.contains_key(&s) {
+                    stack.push((visit(&mut t, s, n), 0));
+                }
+            }
+            None => {
+                stack.pop();
             }
         }
     }
-    preds
+    t
 }
-
-// Reverse Postorder Computation
-
-/// Compute reverse postorder numbering for all blocks.
-///
-/// Returns the block IDs in reverse postorder. It used to also stash each
-/// block's postorder number in `dom_level` "temporarily"; nothing ever read
-/// that, and the level computation below overwrote it.
-fn compute_postorder(func: &Function) -> Vec<BasicBlockId> {
-    let mut visited = HashSet::with_capacity(DEFAULT_POSTORDER_CAPACITY);
-    let mut postorder = Vec::with_capacity(DEFAULT_POSTORDER_CAPACITY);
-
-    fn dfs(
-        func: &Function,
-        bb_id: BasicBlockId,
-        visited: &mut HashSet<BasicBlockId>,
-        postorder: &mut Vec<BasicBlockId>,
-    ) {
-        if visited.contains(&bb_id) {
-            return;
-        }
-        visited.insert(bb_id);
-
-        if let Some(bb) = func.get_block(bb_id) {
-            // Visit successors in reverse order for consistent numbering
-            for child in successors(bb).into_iter().rev() {
-                dfs(func, child, visited, postorder);
-            }
-        }
-        postorder.push(bb_id);
-    }
-
-    dfs(func, func.entry, &mut visited, &mut postorder);
-
-    // Reverse to get reverse postorder
-    postorder.reverse();
-    postorder
-}
-
-// Dominator Tree Construction (Cooper et al.)
 
 /// Build the dominator tree for a function.
 ///
-/// Uses the algorithm from:
-/// "A simple, fast dominance algorithm" by K. D. Cooper, T. J. Harvey, and K. Kennedy
+/// Lengauer and Tarjan, "A Fast Algorithm for Finding Dominators in a
+/// Flowgraph" (1979), in its simple form: semidominators computed over a
+/// depth-first spanning tree with a path-compressing `eval`, then immediate
+/// dominators from the semidominator buckets. O(E log V), whatever the shape.
+///
+/// It replaced Cooper, Harvey and Kennedy's iterative algorithm, whose
+/// `intersect` walks the dominator chain once per predecessor: a join with
+/// thousands of predecessors under a deep chain -- the two labels every
+/// `if ... goto` in `compile/20001226-1` jumps to, or the end of a big
+/// `switch` -- cost predecessors x depth on every build, and a function is
+/// built for twice per optimization run (`ssa_convert`, `loadfwd`).
+///
+/// The graph is the one [`successors`] describes, and nothing else: a block
+/// the walk from the entry never reaches has no immediate dominator. The
+/// result depends only on the graph, so the tree is the one any correct
+/// algorithm computes; `children` are listed in `func.blocks` order.
 ///
 /// The result is returned rather than written into the blocks, so it cannot
 /// outlive the CFG it describes -- see [`DomTree`].
@@ -201,138 +210,103 @@ pub fn domtree_build(func: &Function) -> DomTree {
         return dom;
     }
 
-    // Step 1: Compute reverse postorder
-    let rpo = compute_postorder(func);
-    let size = rpo.len();
-    if size == 0 {
-        return dom;
-    }
+    let Numbering {
+        number,
+        vertex,
+        parent,
+        succs,
+    } = dfs_numbering(func);
+    let size = vertex.len();
 
-    // Create postorder number lookup
-    let mut postorder_nr: HashMap<BasicBlockId, usize> = HashMap::with_capacity(size);
-    for (i, &bb_id) in rpo.iter().rev().enumerate() {
-        postorder_nr.insert(bb_id, i);
-    }
-
-    // Entry block has highest postorder number
-    let entry = func.entry;
-    let entry_nr = size - 1;
-
-    // Initialize dominators array
-    // doms[postorder_nr] = immediate dominator's postorder_nr
-    let mut doms: Vec<Option<usize>> = vec![None; size];
-    doms[entry_nr] = Some(entry_nr); // Entry dominates itself
-
-    // Helper: intersect two dominators using postorder numbers
-    let intersect = |doms: &[Option<usize>], mut b1: usize, mut b2: usize| -> usize {
-        while b1 != b2 {
-            while b1 < b2 {
-                if let Some(d) = doms[b1] {
-                    b1 = d;
-                } else {
-                    break;
-                }
-            }
-            while b2 < b1 {
-                if let Some(d) = doms[b2] {
-                    b2 = d;
-                } else {
-                    break;
-                }
-            }
+    // Predecessors, by DFS number, of every reached node. An edge from a block
+    // the walk never reached is not in the graph.
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); size];
+    for (v, out) in succs.iter().enumerate() {
+        for s in out {
+            preds[number[s]].push(v);
         }
-        b1
+    }
+
+    // `semi[w]` is w's semidominator's number; `label`/`ancestor` are the
+    // link-eval forest, compressed as it is walked.
+    let mut semi: Vec<usize> = (0..size).collect();
+    let mut label: Vec<usize> = (0..size).collect();
+    let mut ancestor: Vec<usize> = vec![NONE; size];
+    let mut idom: Vec<usize> = vec![NONE; size];
+    let mut bucket: Vec<Vec<usize>> = vec![Vec::new(); size];
+    let mut path: Vec<usize> = Vec::new();
+
+    // The node with the least semidominator on the forest path above `v`.
+    let eval = |v: usize,
+                semi: &[usize],
+                label: &mut [usize],
+                ancestor: &mut [usize],
+                path: &mut Vec<usize>|
+     -> usize {
+        if ancestor[v] == NONE {
+            return v;
+        }
+        // Compress the path, root end first, as the recursive form would.
+        let mut x = v;
+        while ancestor[ancestor[x]] != NONE {
+            path.push(x);
+            x = ancestor[x];
+        }
+        while let Some(y) = path.pop() {
+            let a = ancestor[y];
+            if semi[label[a]] < semi[label[y]] {
+                label[y] = label[a];
+            }
+            ancestor[y] = ancestor[a];
+        }
+        label[v]
     };
 
-    let preds = predecessors(func);
-
-    // Iterate until fixed point
-    let mut changed = true;
-    while changed {
-        changed = false;
-
-        for &bb_id in &rpo {
-            if bb_id == entry {
-                continue;
+    for w in (1..size).rev() {
+        for &v in &preds[w] {
+            let u = eval(v, &semi, &mut label, &mut ancestor, &mut path);
+            if semi[u] < semi[w] {
+                semi[w] = semi[u];
             }
-
-            let bb_nr = postorder_nr[&bb_id];
-
-            // Find new idom as intersection of all processed predecessors
-            let mut new_idom: Option<usize> = None;
-            for &parent_id in preds.get(&bb_id).map(Vec::as_slice).unwrap_or(&[]) {
-                // Skip predecessors that weren't reached during DFS (unreachable blocks)
-                let parent_nr = match postorder_nr.get(&parent_id) {
-                    Some(&nr) => nr,
-                    None => continue,
-                };
-                if doms[parent_nr].is_none() {
-                    continue;
-                }
-                new_idom = Some(match new_idom {
-                    None => parent_nr,
-                    Some(current) => intersect(&doms, parent_nr, current),
-                });
-            }
-
-            if let Some(idom) = new_idom {
-                if doms[bb_nr] != Some(idom) {
-                    doms[bb_nr] = Some(idom);
-                    changed = true;
-                }
-            }
+        }
+        bucket[semi[w]].push(w);
+        let p = parent[w];
+        ancestor[w] = p;
+        for v in std::mem::take(&mut bucket[p]) {
+            let u = eval(v, &semi, &mut label, &mut ancestor, &mut path);
+            idom[v] = if semi[u] < semi[v] { u } else { p };
+        }
+    }
+    for w in 1..size {
+        if idom[w] != semi[w] {
+            idom[w] = idom[idom[w]];
         }
     }
 
-    // Create reverse mapping: postorder_nr -> BasicBlockId
-    let mut nr_to_bb: HashMap<usize, BasicBlockId> = HashMap::with_capacity(size);
-    for (&bb_id, &nr) in &postorder_nr {
-        nr_to_bb.insert(nr, bb_id);
-    }
-
-    // Set idom links
-    for (i, bb) in func.blocks.iter().enumerate() {
-        if bb.id == entry {
-            continue;
-        }
-        // Skip unreachable blocks (not in postorder)
-        let bb_nr = match postorder_nr.get(&bb.id) {
-            Some(&nr) => nr,
-            None => continue, // Unreachable block
-        };
-        if let Some(idom_nr) = doms[bb_nr] {
-            if idom_nr != bb_nr {
-                // Map back to BasicBlockId
-                if let Some(&idom_id) = nr_to_bb.get(&idom_nr) {
-                    dom.idom[i] = Some(idom_id);
-                }
+    // Record, and level by DFS number: a node's immediate dominator is a DFS
+    // ancestor, so it is numbered, and levelled, first.
+    // A successor id with no block behind it is a node of the graph -- the
+    // walk reaches it -- but has no slot to record; it counts at level 1, as
+    // it always has.
+    let mut level: Vec<u32> = vec![0; size];
+    for w in 1..size {
+        level[w] = level[idom[w]] + 1;
+        match dom.index.get(&vertex[w]) {
+            Some(&slot) => {
+                dom.idom[slot] = Some(vertex[idom[w]]);
+                dom.level[slot] = level[w];
+                dom.max_level = dom.max_level.max(level[w]);
             }
+            None => dom.max_level = dom.max_level.max(1),
         }
     }
 
-    // Build dom_children lists
+    // Children in `func.blocks` order.
     for (i, bb) in func.blocks.iter().enumerate() {
         if let Some(idom_id) = dom.idom[i] {
             if let Some(&slot) = dom.index.get(&idom_id) {
                 dom.children[slot].push(bb.id);
             }
-        }
-    }
-
-    // Compute dominator tree levels.
-    // Entry is level 0, children are level+1. Walking in reverse postorder
-    // means a block's idom already has its final level.
-    for &bb_id in &rpo {
-        let level = if bb_id == entry {
-            0
-        } else {
-            dom.idom(bb_id).map(|i| dom.level(i)).unwrap_or(0) + 1
-        };
-        if let Some(&slot) = dom.index.get(&bb_id) {
-            dom.level[slot] = level;
-        }
-        if level > dom.max_level {
-            dom.max_level = level;
         }
     }
 
@@ -467,11 +441,19 @@ pub fn idf_compute(func: &Function, dom: &DomTree, alpha: &[BasicBlockId]) -> Ve
     idf
 }
 
+/// Visit the dominator subtree under `root` in pre-order -- a block, then
+/// each dominated child's subtree in order -- recording the J-edges that
+/// leave it at or above `curr_level`.
+///
+/// On an explicit stack rather than the call stack: a function of n
+/// sequential `if` statements has a dominator tree n levels deep, and a
+/// recursion per level overflowed the compiler's stack. Children are pushed
+/// in reverse so they are popped, and so visited, in order.
 #[allow(clippy::too_many_arguments)]
 fn visit_domtree(
     func: &Function,
     dom: &DomTree,
-    bb_id: BasicBlockId,
+    root: BasicBlockId,
     curr_level: u32,
     visited: &mut HashSet<BasicBlockId>,
     in_idf: &mut HashSet<BasicBlockId>,
@@ -479,45 +461,45 @@ fn visit_domtree(
     idf: &mut Vec<BasicBlockId>,
     queue: &mut LevelQueue,
 ) {
-    visited.insert(bb_id);
-
-    // Check successors
-    let children: Vec<BasicBlockId> = func
-        .get_block(bb_id)
-        .map(|bb| bb.children.clone())
-        .unwrap_or_default();
-
-    for y in children {
-        // Skip if y is dominated by bb_id (not a J-edge)
-        if dom.idom(y) == Some(bb_id) {
+    let mut stack = vec![root];
+    while let Some(bb_id) = stack.pop() {
+        if !visited.insert(bb_id) {
             continue;
         }
 
-        // y must be at same or lower level
-        let y_level = dom.level(y);
-        if y_level > curr_level {
-            continue;
-        }
+        // Check successors
+        let children: &[BasicBlockId] = func
+            .get_block(bb_id)
+            .map(|bb| bb.children.as_slice())
+            .unwrap_or(&[]);
 
-        if !in_idf.contains(&y) {
-            in_idf.insert(y);
-            idf.push(y);
+        for &y in children {
+            // Skip if y is dominated by bb_id (not a J-edge)
+            if dom.idom(y) == Some(bb_id) {
+                continue;
+            }
 
-            if !in_alpha.contains(&y) {
-                queue.push(y, y_level);
+            // y must be at same or lower level
+            let y_level = dom.level(y);
+            if y_level > curr_level {
+                continue;
+            }
+
+            if in_idf.insert(y) {
+                idf.push(y);
+                if !in_alpha.contains(&y) {
+                    queue.push(y, y_level);
+                }
             }
         }
-    }
 
-    // Recurse into dominator tree children
-    let dom_children: Vec<BasicBlockId> = dom.children(bb_id).to_vec();
-
-    for child in dom_children {
-        if !visited.contains(&child) {
-            visit_domtree(
-                func, dom, child, curr_level, visited, in_idf, in_alpha, idf, queue,
-            );
-        }
+        stack.extend(
+            dom.children(bb_id)
+                .iter()
+                .rev()
+                .copied()
+                .filter(|c| !visited.contains(c)),
+        );
     }
 }
 
@@ -673,6 +655,215 @@ mod tests {
         // merge dominates exit
         assert!(dom.dominates(BasicBlockId(3), BasicBlockId(4)));
         assert!(!dom.dominates(BasicBlockId(3), BasicBlockId(1)));
+    }
+
+    // ------------------------------------------------------------------
+    // Oracle: dominators by their definition -- the iterative dataflow
+    // `Dom(n) = {n} U intersection of Dom(p)` over the same graph -- with
+    // the immediate dominator read off as the strict dominator whose own
+    // set is largest. Obviously correct, cubic, and independent of both the
+    // builder and the algorithm it replaced.
+    // ------------------------------------------------------------------
+
+    fn oracle(func: &Function) -> DomTree {
+        use std::collections::BTreeSet;
+        // Nodes: everything the walk from the entry reaches, including a
+        // successor id with no block behind it.
+        let mut nodes: Vec<BasicBlockId> = vec![func.entry];
+        let mut seen: HashSet<BasicBlockId> = [func.entry].into();
+        let mut i = 0;
+        while i < nodes.len() {
+            if let Some(bb) = func.get_block(nodes[i]) {
+                for s in successors(bb) {
+                    if seen.insert(s) {
+                        nodes.push(s);
+                    }
+                }
+            }
+            i += 1;
+        }
+        let mut preds: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
+        for &n in &nodes {
+            if let Some(bb) = func.get_block(n) {
+                for s in successors(bb) {
+                    preds.entry(s).or_default().push(n);
+                }
+            }
+        }
+        let all: BTreeSet<BasicBlockId> = nodes.iter().copied().collect();
+        let mut dom: HashMap<BasicBlockId, BTreeSet<BasicBlockId>> =
+            nodes.iter().map(|&n| (n, all.clone())).collect();
+        dom.insert(func.entry, [func.entry].into());
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &n in nodes.iter().skip(1) {
+                let mut new: Option<BTreeSet<BasicBlockId>> = None;
+                for p in preds.get(&n).into_iter().flatten() {
+                    let d = &dom[p];
+                    new = Some(match new {
+                        None => d.clone(),
+                        Some(acc) => acc.intersection(d).copied().collect(),
+                    });
+                }
+                let mut new = new.unwrap_or_default();
+                new.insert(n);
+                if new != dom[&n] {
+                    dom.insert(n, new);
+                    changed = true;
+                }
+            }
+        }
+
+        let mut tree = DomTree {
+            index: func
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(i, bb)| (bb.id, i))
+                .collect(),
+            idom: vec![None; func.blocks.len()],
+            level: vec![0; func.blocks.len()],
+            children: vec![Vec::new(); func.blocks.len()],
+            max_level: 0,
+        };
+        for &n in nodes.iter().skip(1) {
+            let d = &dom[&n];
+            let idom = d
+                .iter()
+                .filter(|&&x| x != n)
+                .max_by_key(|x| dom[*x].len())
+                .copied();
+            let level = (d.len() - 1) as u32;
+            match tree.index.get(&n) {
+                Some(&slot) => {
+                    tree.idom[slot] = idom;
+                    tree.level[slot] = level;
+                    tree.max_level = tree.max_level.max(level);
+                }
+                None => tree.max_level = tree.max_level.max(1),
+            }
+        }
+        for (i, bb) in func.blocks.iter().enumerate() {
+            if let Some(p) = tree.idom[i] {
+                if let Some(&slot) = tree.index.get(&p) {
+                    tree.children[slot].push(bb.id);
+                }
+            }
+        }
+        tree
+    }
+
+    /// The builder's tree, compared with the oracle's field by field.
+    fn assert_matches_oracle(func: &Function, what: &str) {
+        let got = domtree_build(func);
+        let want = oracle(func);
+        for bb in &func.blocks {
+            assert_eq!(
+                got.idom(bb.id),
+                want.idom(bb.id),
+                "{what}: idom of {:?}",
+                bb.id
+            );
+            assert_eq!(
+                got.level(bb.id),
+                want.level(bb.id),
+                "{what}: level of {:?}",
+                bb.id
+            );
+            assert_eq!(
+                got.children(bb.id),
+                want.children(bb.id),
+                "{what}: children of {:?}",
+                bb.id
+            );
+        }
+        assert_eq!(got.max_level(), want.max_level(), "{what}: max level");
+    }
+
+    /// A function whose blocks `0..n` have the given successor lists; block 0
+    /// is the entry. A successor id past `n` names no block.
+    fn cfg(edges: &[&[u32]]) -> Function {
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("t", types.void_id);
+        func.blocks = edges
+            .iter()
+            .enumerate()
+            .map(|(i, out)| {
+                let mut bb = BasicBlock::new(BasicBlockId(i as u32));
+                bb.children = out.iter().map(|&c| BasicBlockId(c)).collect();
+                bb
+            })
+            .collect();
+        func.entry = BasicBlockId(0);
+        func.rebuild_block_idx();
+        func
+    }
+
+    #[test]
+    fn test_domtree_matches_oracle_on_shapes() {
+        let wide: Vec<Vec<u32>> = {
+            // A deep chain every link of which also jumps to one join -- the
+            // shape that made the old algorithm quadratic.
+            let n = 300u32;
+            let mut e: Vec<Vec<u32>> = (0..n).map(|i| vec![i + 1, n + 1]).collect();
+            e.push(vec![n + 1]);
+            e.push(vec![]);
+            e
+        };
+        let wide: Vec<&[u32]> = wide.iter().map(Vec::as_slice).collect();
+        let shapes: &[(&str, &[&[u32]])] = &[
+            ("single block", &[&[]]),
+            ("diamond", &[&[1, 2], &[3], &[3], &[]]),
+            ("loop", &[&[1], &[2, 3], &[1], &[]]),
+            ("self loop", &[&[1], &[1, 2], &[]]),
+            ("nested loops", &[&[1], &[2, 5], &[3], &[2, 4], &[1], &[]]),
+            // Irreducible: two entries into the 2<->3 cycle.
+            ("irreducible", &[&[1, 2], &[3], &[3, 4], &[2, 4], &[]]),
+            ("unreachable block", &[&[1], &[], &[1]]),
+            ("unreachable cycle", &[&[1], &[], &[3], &[2, 1]]),
+            ("edge to no block", &[&[1, 9], &[]]),
+            ("duplicate edge", &[&[1, 1], &[]]),
+            ("wide join", &wide),
+        ];
+        for (what, edges) in shapes {
+            assert_matches_oracle(&cfg(edges), what);
+        }
+    }
+
+    /// Many random graphs, from a fixed seed: reducible or not, with
+    /// unreachable blocks, self loops and repeated edges.
+    #[test]
+    fn test_domtree_matches_oracle_on_random_graphs() {
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = |bound: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(bound)) as u32
+        };
+        for case in 0..2000 {
+            let n = 1 + next(24);
+            let edges: Vec<Vec<u32>> = (0..n)
+                .map(|_| (0..next(4)).map(|_| next(n)).collect())
+                .collect();
+            let edges: Vec<&[u32]> = edges.iter().map(Vec::as_slice).collect();
+            assert_matches_oracle(&cfg(&edges), &format!("random graph {case}: {edges:?}"));
+        }
+    }
+
+    /// A chain far deeper than any recursion could walk on a host stack.
+    #[test]
+    fn test_domtree_handles_a_deep_chain() {
+        let n = 200_000u32;
+        let edges: Vec<Vec<u32>> = (0..n)
+            .map(|i| if i + 1 < n { vec![i + 1] } else { vec![] })
+            .collect();
+        let edges: Vec<&[u32]> = edges.iter().map(Vec::as_slice).collect();
+        let dom = domtree_build(&cfg(&edges));
+        assert_eq!(dom.idom(BasicBlockId(n - 1)), Some(BasicBlockId(n - 2)));
+        assert_eq!(dom.level(BasicBlockId(n - 1)), n - 1);
+        assert_eq!(dom.max_level(), n - 1);
     }
 
     /// A tree is a snapshot: it describes the CFG it was built from.

@@ -194,8 +194,8 @@ impl X86_64CodeGen {
         // shape twice over: it loaded `overflow_arg_area` into R11 and then
         // wrote the advanced pointer back to `8(%r11)`, an address derived
         // from the pointer it had just destroyed.
-        let overflow_label = Label::new("va_overflow", label_suffix);
-        let done_label = Label::new("va_done", label_suffix);
+        let overflow_label = Label::internal("va_overflow", label_suffix);
+        let done_label = Label::internal("va_done", label_suffix);
         let lir_arg_size = OperandSize::from_bits(arg_size);
 
         // gp_offset -> R10d
@@ -318,8 +318,8 @@ impl X86_64CodeGen {
         dst_loc: &Loc,
         label_suffix: u32,
     ) {
-        let overflow_label = Label::new("va_overflow", label_suffix);
-        let done_label = Label::new("va_done", label_suffix);
+        let overflow_label = Label::internal("va_overflow", label_suffix);
+        let done_label = Label::internal("va_done", label_suffix);
 
         // gp_offset -> R10d; both eightbytes must fit in the save area.
         self.push_lir(X86Inst::Mov {
@@ -632,8 +632,8 @@ impl X86_64CodeGen {
         let num_gp = classes.iter().filter(|c| **c == RegClass::Integer).count() as i32;
         let num_sse = classes.iter().filter(|c| **c == RegClass::Sse).count() as i32;
 
-        let overflow_label = Label::new("va_agg_overflow", label_suffix);
-        let done_label = Label::new("va_agg_done", label_suffix);
+        let overflow_label = Label::internal("va_agg_overflow", label_suffix);
+        let done_label = Label::internal("va_agg_done", label_suffix);
 
         // GP_OFFSET_MAX is 48 (six general registers), FP_OFFSET_MAX 176
         // (48 plus eight SSE registers of 16 bytes). An aggregate needs all of
@@ -862,10 +862,7 @@ impl X86_64CodeGen {
         //
         // Shape (2) is detected explicitly: the pointer is materialized
         // into R11 (reserved scratch) before delegating to the helpers.
-        let is_sym = self
-            .pseudos
-            .iter()
-            .any(|p| p.id == ap_addr && matches!(&p.kind, crate::ir::PseudoKind::Sym(_)));
+        let is_sym = self.pseudos.is_sym(ap_addr);
 
         let (base_reg, base_offset) = match &ap_loc {
             // The slot *is* the va_list, so its own address is the base.
@@ -1769,23 +1766,36 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Leave the frame pointer `levels` frames up in R10.
+    ///
+    /// Every c17 function pushes `%rbp` and points `%rbp` at it, so `(%rbp)`
+    /// is the caller's `%rbp` and `8(%rbp)` the return address: a chain of
+    /// frame records that each step follows once.
+    fn emit_frame_walk(&mut self, levels: u32) {
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rbp),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        for _ in 0..levels {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::R10,
+                    offset: 0,
+                }),
+                dst: GpOperand::Reg(Reg::R10),
+            });
+        }
+    }
+
     /// Emit __builtin_frame_address(level) - return frame pointer at given level
     pub(super) fn emit_frame_address(&mut self, insn: &Instruction) {
         let target = match insn.target {
             Some(t) => t,
             None => return,
         };
-
-        // For level 0, return the current frame pointer (rbp)
-        // For other levels, we'd need to walk the frame chain, but we simplify
-        // by always returning the current frame pointer
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::Rbp),
-            dst: GpOperand::Reg(Reg::R10),
-        });
-
-        // Store result
+        self.emit_frame_walk(insn.frame_level());
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
     }
@@ -1796,19 +1806,16 @@ impl X86_64CodeGen {
             Some(t) => t,
             None => return,
         };
-
-        // For level 0, return [rbp+8] (the saved return address)
-        // For other levels, we'd need to walk the frame chain
+        // The return address sits just above the saved frame pointer.
+        self.emit_frame_walk(insn.frame_level());
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
             src: GpOperand::Mem(MemAddr::BaseOffset {
-                base: Reg::Rbp,
+                base: Reg::R10,
                 offset: 8,
             }),
             dst: GpOperand::Reg(Reg::R10),
         });
-
-        // Store result
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
     }

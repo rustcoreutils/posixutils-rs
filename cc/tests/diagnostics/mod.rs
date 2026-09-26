@@ -5336,8 +5336,8 @@ fn diagnostics_permissive_relaxes_the_constraints_gcc_warns_about() {
 /// miscompiled.
 ///
 /// This bound is not C's. Both backends address a local and a stacked argument
-/// by a signed 32-bit displacement from the frame register, so `i32::MAX`
-/// rounded down to an eightbyte is the ceiling -- a billion times under the
+/// by a signed 32-bit displacement from the frame register, so `i32::MAX`, less
+/// the headroom the prologue adds, is the ceiling -- a billion times under the
 /// `MAX_OBJECT_BYTES` the type table allows, which is why the two are separate
 /// constants and separate messages. gcc compiles the same local with
 /// `movabsq`-based 64-bit frame addressing; c17 says so instead, and refuses the
@@ -5437,8 +5437,8 @@ fn diagnostics_stack_object_larger_than_a_frame_slot_is_rejected() {
 /// that break if the parameter check is moved *before* the C17 6.7.5.3
 /// adjustment: that parameter is a `char *`, not an array. `vla_is_not_measured`
 /// is the case the rule must decline to answer -- a variable length array's
-/// extent is a run-time value, and `arch::regalloc::grow_frame` is what catches
-/// the frame it can still overflow.
+/// extent is a run-time value, subtracted from the stack pointer in a 64-bit
+/// register, and the frame holds only a pointer to it.
 #[test]
 fn diagnostics_static_object_larger_than_a_frame_slot_is_accepted() {
     for (name, src) in [
@@ -5471,15 +5471,12 @@ fn diagnostics_static_object_larger_than_a_frame_slot_is_accepted() {
             "vla_is_not_measured",
             "int f(int n){ char a[n]; a[0]=1; return a[0]; }\n",
         ),
-        // Deliberately modest, and it must stay that way. This case only has
-        // to show the check does not fire on an ordinary automatic object;
-        // proving the *edge* of the bound is `test_parser.rs`'s job, where it
-        // parses and never reaches a backend. `compile_expect_ok` compiles for
-        // the **host**, and a gigabyte-sized local costs 11 seconds and 13.4 GB
-        // on aarch64, because `zero_stack_frame` there emits one store per
-        // qword with no loop where x86-64 emits `rep stosq`. That took the
-        // aarch64 CI runner down. See "Zeroing a large frame is unrolled on
-        // aarch64" in cc/TODO.md.
+        // Deliberately modest. This case only has to show the check does not
+        // fire on an ordinary automatic object; proving the *edge* of the
+        // bound is `test_parser.rs`'s job, where it parses and never reaches a
+        // backend. `compile_expect_ok` compiles for the **host**, whichever
+        // backend that is, so an edge-sized local here tests nothing the
+        // parser test does not and asks CI's machine for its size.
         (
             "automatic_object_of_an_ordinary_size",
             "extern void sink(char *);\n\
@@ -5488,4 +5485,222 @@ fn diagnostics_static_object_larger_than_a_frame_slot_is_accepted() {
     ] {
         compile_expect_ok(name, src);
     }
+}
+
+/// A `vector_size` value where gcc gives it vector semantics is refused.
+///
+/// c17 implements a vector as storage only -- an array of its elements -- and
+/// an array used as a value decays to its address. So each of these used to
+/// compile to something other than what gcc means: `(long long)v` answered
+/// the vector's address rather than its bits, `v + 1` did pointer
+/// arithmetic, a vector argument or parameter went as a pointer. gcc's torture
+/// tests `20050316-2`, `20050607-1` and `simd-4` all returned wrong answers.
+#[test]
+fn diagnostics_vector_value_is_refused() {
+    let prelude = "typedef int V2SI __attribute__((vector_size(8)));\n\
+                   long f(); long l; int c;\n";
+    for (name, body) in [
+        (
+            "cast_from",
+            "long t(void) { V2SI v = {1, 2}; return (long long)v; }",
+        ),
+        ("cast_to", "void t(void) { V2SI v = (V2SI)l; (void)&v; }"),
+        (
+            "binary",
+            "void t(void) { V2SI v = {1, 2}; l = (long)(v + 1 == 0); }",
+        ),
+        ("unary", "void t(void) { V2SI v = {1, 2}; c = !v; }"),
+        ("deref", "int t(void) { V2SI v = {1, 2}; return *v; }"),
+        ("argument", "void t(void) { V2SI v = {1, 2}; f(v); }"),
+        (
+            "conditional",
+            "void t(void) { V2SI v = {1, 2}; (void)(c ? v : v); }",
+        ),
+        ("parameter", "long t(V2SI v) { return 0; }"),
+    ] {
+        compile_expect_error(
+            &format!("vector_value_{name}"),
+            &format!("{prelude}{body}\n"),
+            "'vector_size' types as storage only",
+        );
+    }
+}
+
+/// What the storage model gets right is still accepted: declaring a vector,
+/// `sizeof`, `&v`, `v[i]`, a vector member, an initializer, and copying a
+/// struct that holds one -- what glibc's `<link.h>` needs.
+#[test]
+fn diagnostics_vector_storage_is_accepted() {
+    let src = r#"
+typedef int V2SI __attribute__((vector_size(8)));
+typedef float V4SF __attribute__((vector_size(16), aligned(16)));
+struct regs { V4SF x[4]; long l; };
+struct regs g;
+int main(void)
+{
+    V2SI v = { 1, 2 };
+    V2SI *p = &v;
+    struct regs r = { 0 };
+    r.x[1][2] = 3.0f;
+    if (sizeof v != 8 || sizeof(struct regs) != 80) return 1;
+    if (v[0] + (*p)[1] != 3) return 2;
+    g = r;
+    return g.x[1][2] == 3.0f ? 0 : 3;
+}
+"#;
+    assert_eq!(compile_and_run("vector_storage", src, &[]), 0);
+}
+
+/// Naming a vector where its value is discarded is not a value use. `(void)v`
+/// is how an unused variable is marked used, and it was refused: the cast
+/// check did not tell a cast to `void` from a conversion. An expression
+/// statement, the left operand of a comma, and the operands of `sizeof`,
+/// `__alignof__` and `__typeof__` read nothing either.
+#[test]
+fn diagnostics_vector_discarded_value_is_accepted() {
+    let src = r#"
+typedef int V __attribute__((vector_size(8)));
+int main(void)
+{
+    V v, w;
+    (void)v;
+    v;
+    (v, 1);
+    (void)sizeof v;
+    (void)__alignof__(v);
+    __typeof__(v) u;
+    (void)u;
+    v[0] = 3;
+    w[1] = v[0];
+    return w[1] == 3 ? 0 : 1;
+}
+"#;
+    assert_eq!(compile_and_run("vector_discarded", src, &[]), 0);
+}
+
+/// `__builtin_signbit` takes any real floating type, as gcc's does, and
+/// refuses anything else as gcc does. A `long double` used to reach the
+/// `double` emitter unconverted.
+#[test]
+fn diagnostics_signbit_is_type_generic() {
+    let src = r#"
+int main(void)
+{
+    volatile long double neg = -1.0L, pos = 1.0L, nz = -0.0L;
+    volatile float f = -2.0f;
+    volatile double d = -0.0;
+    if (!__builtin_signbit(neg) || __builtin_signbit(pos) || !__builtin_signbit(nz)) return 1;
+    if (!__builtin_signbit(f) || !__builtin_signbit(d)) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("signbit_generic", src, &[]), 0);
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run("signbit_generic_o2", src, &opts), 0);
+    compile_expect_error(
+        "signbit_int",
+        "int t(int x) { return __builtin_signbit(x); }\n",
+        "non-floating-point argument",
+    );
+}
+
+/// Frames at the edge of the ceiling, on both targets: diagnosed, never
+/// wrapped.
+///
+/// Each of these was accepted before and came out wrong, because the ceiling
+/// was `i32::MAX` and the arithmetic after it -- a slot's alignment rounding,
+/// the prologue's saved registers and variadic save area, the final frame
+/// rounding -- ran past it in `i32`:
+///
+/// - `_Alignas(16) char a[2147483640]`: the slot size was rounded up to its
+///   alignment before the frame check, wrapped, and the array got zero bytes
+///   inside a 16-byte frame on x86-64.
+/// - a variadic function near the limit: the prologue total wrapped negative,
+///   so x86-64 allocated no frame at all and addressed `2147483640(%rbp)`.
+/// - a plain `char a[2147483632]` on aarch64: frame zeroing computed its last
+///   store's offset in `i32`, wrapped into the unrolled path, and its loop never
+///   ended -- the compiler pushed instructions until it ran out of memory.
+/// - two by-value arguments of 1.5 GB each: the outgoing area's sum wrapped,
+///   and x86-64 unrolled the copy into seven gigabytes of compiler memory.
+#[test]
+fn diagnostics_frame_at_the_ceiling_is_refused_not_wrapped() {
+    let cases = [
+        (
+            "aligned_local",
+            "extern void sink(void *);\n\
+             void f(void){ _Alignas(16) char a[2147483640]; sink(a); }\n",
+        ),
+        (
+            "variadic",
+            "extern void sink(void *);\n\
+             void f(int n, ...){ char a[2147483624]; sink(a); }\n",
+        ),
+        (
+            "plain_local",
+            "extern void sink(void *);\n\
+             void f(void){ char a[2147483632]; sink(a); }\n",
+        ),
+        (
+            "local_one_rounding_past",
+            "extern void sink(void *);\n\
+             void f(void){ _Alignas(64) char a[2147479480]; sink(a); }\n",
+        ),
+        (
+            "stacked_arguments",
+            "struct big { char b[1500000000]; };\n\
+             extern void take(struct big, struct big);\n\
+             void f(struct big *p){ take(*p, *p); }\n",
+        ),
+    ];
+    for (name, src) in cases {
+        for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            let c = create_c_file(name, src);
+            let out = c.path().with_extension("s");
+            let run = run_c17(&[
+                "--target",
+                target,
+                "-S",
+                "-o",
+                &out.to_string_lossy(),
+                &c.path().to_string_lossy(),
+            ]);
+            let _ = std::fs::remove_file(&out);
+            assert!(!run.success, "{name} on {target} compiled:\n{}", run.stderr);
+            assert!(
+                run.stderr.contains("stack object size")
+                    || run.stderr.contains("stack frame")
+                    || run.stderr.contains("stacked arguments"),
+                "{name} on {target}: expected a frame diagnostic, got:\n{}",
+                run.stderr
+            );
+        }
+    }
+}
+
+/// Two tagless struct definitions are two types, even with the same members.
+///
+/// C17 6.7.2.3p5: each struct-or-union specifier with a member list declares a
+/// distinct type. c17 compared tagless composites by their members alone, so
+/// assigning one to the other -- or initializing one from the other -- was
+/// accepted where gcc rejects it. Uses of *one* tagless type stay legal,
+/// including through a typedef and a qualified variant of it.
+#[test]
+fn diagnostics_distinct_tagless_structs_are_incompatible() {
+    compile_expect_error(
+        "tagless_assign",
+        "struct { long a, b; } x;\nstruct { long a, b; } y;\nvoid f(void){ x = y; }\n",
+        "incompatible",
+    );
+    compile_expect_error(
+        "tagless_init",
+        "struct S { struct { long a, b; } pair; } *p;\n\
+         long f(void){ struct { long a, b; } q = p->pair; return q.a; }\n",
+        "",
+    );
+    compile_expect_ok(
+        "tagless_same_type",
+        "typedef struct { int x; } T;\nT t1;\nconst T t2;\nstruct { int x; } s1, s2;\n\
+         struct o { struct { int y; } in; } a, b;\n\
+         void f(void){ t1 = t2; s1 = s2; a.in = b.in; }\n",
+    );
 }

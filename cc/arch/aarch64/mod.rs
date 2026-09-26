@@ -17,11 +17,13 @@ mod features;
 mod float;
 mod frame;
 mod inline_asm;
+mod legalize;
 pub mod lir;
 pub mod macros;
 pub(crate) mod mapping;
 mod memory;
 pub mod regalloc;
+mod relax;
 
 pub use macros::get_macros;
 

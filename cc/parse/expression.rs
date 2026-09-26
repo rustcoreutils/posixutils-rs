@@ -427,6 +427,9 @@ impl<'a> Parser<'a> {
                 self.check_not_void(culprit, culprit.pos);
             }
 
+            self.check_not_vector_value(then_expr.typ, then_expr.pos);
+            self.check_not_vector_value(else_expr.typ, else_expr.pos);
+
             // Decay arrays to pointers, functions to pointer-to-function
             let then_decayed = self.decayed_type(then_typ);
             let else_decayed = self.decayed_type(else_typ);
@@ -731,7 +734,9 @@ impl<'a> Parser<'a> {
                     }
                 })
                 .unwrap_or(self.types.int_id);
-            self.check_dereferenceable(&operand, op_pos);
+            if !self.check_not_vector_value(operand.typ, operand.pos) {
+                self.check_dereferenceable(&operand, op_pos);
+            }
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::Deref,
@@ -788,6 +793,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_not_vector_value(operand.typ, operand.pos);
             // Logical not always produces int (0 or 1)
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
@@ -1146,8 +1152,17 @@ impl<'a> Parser<'a> {
     /// this from `expr.typ` alone and so disagreed with gcc identically.
     fn alignof_expr(&mut self, expr: Expr, size_t: TypeId, pos: Position) -> Expr {
         if let ExprKind::Ident(symbol_id) = &expr.kind {
-            if let Some(align) = self.symbols.get(*symbol_id).explicit_align {
+            let symbol = self.symbols.get(*symbol_id);
+            if let Some(align) = symbol.explicit_align {
                 return Expr::typed(ExprKind::IntLit(align as i64), size_t, pos);
+            }
+            // A function's `aligned` is a function attribute, gathered across
+            // every declaration of the name rather than held on one symbol.
+            if self.types.kind(symbol.typ) == TypeKind::Function {
+                let declared = self.declared_fn_attrs.get(&symbol.name);
+                if let Some(align) = declared.and_then(|attrs| attrs.align) {
+                    return Expr::typed(ExprKind::IntLit(align as i64), size_t, pos);
+                }
             }
         }
         Expr::typed(ExprKind::AlignofExpr(Box::new(expr)), size_t, pos)
@@ -1538,6 +1553,8 @@ impl<'a> Parser<'a> {
         // returns void has none.
         self.check_not_void(&left, left.pos);
         self.check_not_void(&right, right.pos);
+        self.check_not_vector_value(left.typ, left.pos);
+        self.check_not_vector_value(right.typ, right.pos);
 
         // A bit-field operand promotes before anything else looks at it
         // (C17 6.3.1.1p2), and that promotion is not derivable from the
@@ -1778,6 +1795,7 @@ impl<'a> Parser<'a> {
     /// the one rule in one place: the binary operators already use it, and two
     /// copies of a promotion rule is how this went wrong to begin with.
     fn promote_unary_operand(&mut self, operand: Expr) -> (Expr, TypeId) {
+        self.check_not_vector_value(operand.typ, operand.pos);
         let operand = self.promote_bitfield_operand(operand);
         let op_typ = operand.typ.unwrap_or(self.types.int_id);
         let typ = self.types.integer_promote(op_typ);
@@ -2215,6 +2233,16 @@ impl<'a> Parser<'a> {
 
                         // Regular cast expression
                         let expr = self.parse_unary_expr()?;
+                        // gcc reinterprets the bits between a vector and a
+                        // same-sized scalar or vector; the array model would
+                        // convert an address instead. A cast to `void` reads
+                        // nothing -- `(void)v;` is how an unused vector is
+                        // marked used -- so it is not a value use.
+                        if self.types.kind(typ) != TypeKind::Void
+                            && !self.check_not_vector_value(expr.typ, expr.pos)
+                        {
+                            self.check_not_vector_value(Some(typ), paren_pos);
+                        }
 
                         // Fold cast-to-Int128 of constant expressions into Int128Lit
                         if self.types.kind(typ) == TypeKind::Int128 {

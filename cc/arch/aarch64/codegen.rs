@@ -22,9 +22,9 @@ use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{FrameBase, IncomingOff, Loc, LocalSlot, Reg, VReg};
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
-use crate::ir::{Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
+use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
-use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 
 // AArch64 Code Generator
@@ -40,7 +40,7 @@ pub struct Aarch64CodeGen {
     /// and remain visible as `.set` calls.
     pub(super) locations: crate::arch::regalloc::LocationMap<Loc>,
     /// Current function's pseudos (for looking up values)
-    pub(super) pseudos: Vec<Pseudo>,
+    pub(super) pseudos: crate::arch::codegen::PseudoTable,
     /// Total frame size for current function
     pub(super) frame_size: i32,
     /// Size of callee-saved register area (for computing local variable offsets)
@@ -68,6 +68,9 @@ pub struct Aarch64CodeGen {
     pub(super) extern_symbols: HashSet<String>,
     /// Thread-local storage symbols (need TLS access)
     pub(super) tls_symbols: HashSet<String>,
+    /// Every data symbol's known alignment in bytes -- definitions here and
+    /// `extern` declarations -- for [`Self::lo12_folds`].
+    pub(super) sym_align: HashMap<String, u32>,
     /// Position-independent code mode (for shared libraries)
     pic_mode: bool,
     /// Counter for generating unique labels (atomic loops, etc.)
@@ -85,7 +88,7 @@ impl Aarch64CodeGen {
         Self {
             base: CodeGenBase::new(target),
             locations: crate::arch::regalloc::LocationMap::new(),
-            pseudos: Vec::new(),
+            pseudos: Default::default(),
             frame_size: 0,
             callee_saved_size: 0,
             reg_save_area_offset: 0,
@@ -96,6 +99,7 @@ impl Aarch64CodeGen {
             darwin_va_sp_slot: None,
             extern_symbols: HashSet::new(),
             tls_symbols: HashSet::new(),
+            sym_align: HashMap::new(),
             pic_mode: false,
             unique_label_counter: 0,
             stack_alloc_size: 0,
@@ -226,9 +230,23 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Push a LIR instruction to the buffer (deferred emission)
+    /// Push a LIR instruction to the buffer (deferred emission).
+    ///
+    /// Every instruction passes through [`super::legalize::legalize`], so an
+    /// offset or immediate no encoding can hold is expanded here, once, rather
+    /// than by each site that builds one.
     pub(super) fn push_lir(&mut self, inst: Aarch64Inst) {
-        self.base.push_lir(inst);
+        let mut out = Vec::with_capacity(1);
+        if let Err(super::legalize::Unencodable(what)) = super::legalize::legalize(inst, &mut out) {
+            crate::diag::error_args(
+                self.base.func_pos,
+                "internal error: c17 built {0}, which no aarch64 instruction encodes",
+                &[what],
+            );
+        }
+        for inst in out {
+            self.base.push_lir(inst);
+        }
     }
 
     /// Emit .loc directive for source line tracking (delegates to base)
@@ -264,44 +282,6 @@ impl Aarch64CodeGen {
         self.base.emit_global(global, types);
     }
 
-    // ========================================================================
-    // Pair-addressing legalization (stp / ldp / stpfp / ldpfp)
-    // ========================================================================
-    //
-    // stp/ldp accept signed 7-bit immediate offsets scaled by element
-    // size:
-    //   B64 / Double : [-512,  504] step 8
-    //   B32 / Single : [-256,  252] step 4
-    //   Quad (128b)  : [-1024, 1008] step 16
-    //
-    // A deep stack frame (large alloca, int128-heavy locals, many
-    // spills) routinely overflows these, and the assembler rejects an
-    // out-of-range offset ("index must be a multiple of 8 in range
-    // [-512, 504]").
-    //
-    // Every body-emitted pair instruction that takes a `BaseOffset`
-    // routes through `emit_{stp,ldp,stp_fp,ldp_fp}_legalized`. The
-    // legalizer:
-    //   * leaves in-range offsets untouched (zero overhead);
-    //   * materializes out-of-range addresses into the `X16` scratch
-    //     register and rewrites the addr to `[X16]`.
-    //
-    // `X16` is AAPCS64 IP0 — linker scratch, never in the allocator
-    // palette, and never used by other codegen helpers as a *data*
-    // shuttle (they use x9–x11). Reserving it specifically for
-    // address materialization keeps the scratch convention clean.
-    //
-    // `PreIndex` / `PostIndex` addresses are NOT legalized here. They
-    // appear only in the prologue/epilogue, which already handles its
-    // own large-frame split (see `emit_prologue` / `emit_epilogue`).
-
-    // FP pair legalization helpers (emit_{stp,ldp}_fp_legalized) are
-    // intentionally absent — every current StpFp/LdpFp site emits
-    // either callee-saved save/restore (offset bounded by the small
-    // callee-saved set: ≤288 bytes) or prologue PreIndex (handled by
-    // its own large-frame split). Add them the moment an FP pair
-    // instruction needs body-emission with a possibly-large offset.
-
     pub(super) fn emit_block(
         &mut self,
         block: &crate::ir::BasicBlock,
@@ -310,7 +290,7 @@ impl Aarch64CodeGen {
     ) {
         // Always emit block ID label for consistency with jumps
         // (jumps reference blocks by ID, not by C label name)
-        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(Label::new(
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(Label::block(
             &self.base.current_fn,
             block.id.0,
         ))));
@@ -346,7 +326,12 @@ impl Aarch64CodeGen {
                 if insn.size >= 128 {
                     // 128-bit: load both halves and ORR them to check for non-zero
                     let (_, scratch1, _) = Reg::scratch_regs();
-                    self.emit_ldp_legalized(OperandSize::B64, mem, scratch0, scratch1);
+                    self.push_lir(Aarch64Inst::Ldp {
+                        size: OperandSize::B64,
+                        addr: mem,
+                        dst1: scratch0,
+                        dst2: scratch1,
+                    });
                     self.push_lir(Aarch64Inst::Orr {
                         size: OperandSize::B64,
                         src1: scratch0,
@@ -375,7 +360,7 @@ impl Aarch64CodeGen {
                 let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
                 if let Some(target) = target {
                     self.push_lir(Aarch64Inst::B {
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
                 return true;
@@ -408,7 +393,7 @@ impl Aarch64CodeGen {
                 };
                 if let Some(target) = target {
                     self.push_lir(Aarch64Inst::B {
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
                 return true;
@@ -418,12 +403,12 @@ impl Aarch64CodeGen {
         if let Some(target) = insn.bb_true {
             self.push_lir(Aarch64Inst::BCond {
                 cond: CondCode::Ne,
-                target: Label::new(&self.base.current_fn, target.0),
+                target: Label::block(&self.base.current_fn, target.0),
             });
         }
         if let Some(target) = insn.bb_false {
             self.push_lir(Aarch64Inst::B {
-                target: Label::new(&self.base.current_fn, target.0),
+                target: Label::block(&self.base.current_fn, target.0),
             });
         }
         false
@@ -497,7 +482,7 @@ impl Aarch64CodeGen {
 
         // Generate comparisons for each case
         for (lo, hi, target_bb) in insn.switch_cases.clone() {
-            let target = Label::new(&self.base.current_fn, target_bb.0);
+            let target = Label::block(&self.base.current_fn, target_bb.0);
             if lo == hi {
                 cmp_const(self, scratch0, lo);
                 self.push_lir(Aarch64Inst::BCond {
@@ -546,7 +531,7 @@ impl Aarch64CodeGen {
 
         if let Some(default_bb) = insn.switch_default {
             self.push_lir(Aarch64Inst::B {
-                target: Label::new(&self.base.current_fn, default_bb.0),
+                target: Label::block(&self.base.current_fn, default_bb.0),
             });
         }
     }
@@ -582,7 +567,7 @@ impl Aarch64CodeGen {
             Opcode::Br => {
                 if let Some(target) = insn.bb_true {
                     self.push_lir(Aarch64Inst::B {
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
             }
@@ -657,7 +642,7 @@ impl Aarch64CodeGen {
 
             Opcode::SetVal => {
                 if let Some(target) = insn.target {
-                    if let Some(pseudo) = self.pseudos.iter().find(|p| p.id == target) {
+                    if let Some(pseudo) = self.pseudos.get(target) {
                         match self.locations.get(target) {
                             Some(Loc::Reg(r)) => {
                                 if let PseudoKind::Val(v) = &pseudo.kind {
@@ -666,28 +651,14 @@ impl Aarch64CodeGen {
                             }
                             Some(Loc::VReg(v)) => {
                                 if let PseudoKind::FVal(f) = &pseudo.kind {
-                                    // Load FP constant using integer register
-                                    // Use type to determine float16 vs float vs double
-                                    let typ = insn.typ.expect("FP constant must have type");
-                                    let type_kind = types.kind(typ);
-                                    let (scratch0, _, _) = Reg::scratch_regs();
-                                    let (bits, fp_size) = match type_kind {
-                                        TypeKind::Float16 => {
-                                            // Convert f64 to IEEE 754 half-precision bits
-                                            (f64_to_f16_bits(f.to_f64()) as i64, FpSize::Half)
-                                        }
-                                        TypeKind::Float => {
-                                            ((f.to_f64() as f32).to_bits() as i64, FpSize::Single)
-                                        }
-                                        _ => (f.to_f64().to_bits() as i64, FpSize::Double),
-                                    };
-                                    self.emit_mov_imm(scratch0, bits, 64);
-                                    // LIR: fmov from GP to FP register
-                                    self.push_lir(Aarch64Inst::FmovFromGp {
-                                        size: fp_size,
-                                        src: scratch0,
-                                        dst: v,
-                                    });
+                                    // The constant at its type's precision. A
+                                    // `long double` fell through to `double`
+                                    // here and was loaded as a double's bits
+                                    // into a binary128 register.
+                                    let fp_size =
+                                        self.fp_size_from_type(insn.typ, insn.size, types);
+                                    let (lo, hi) = super::float::fp_const_bits(*f, fp_size);
+                                    self.emit_fp_bits(lo, hi, fp_size, v);
                                 }
                             }
                             _ => {}
@@ -741,7 +712,12 @@ impl Aarch64CodeGen {
                             // have its address taken too, and the `_` arm
                             // below would have emitted nothing at all for it.
                             let (base, adjusted) = self.loc_addr_parts(loc).unwrap();
-                            self.emit_add_imm_legalized(dst_reg, base, adjusted as i64);
+                            self.push_lir(Aarch64Inst::Add {
+                                size: OperandSize::B64,
+                                src1: base,
+                                src2: GpOperand::Imm(adjusted.into()),
+                                dst: dst_reg,
+                            });
                         }
                         _ => {}
                     }
@@ -940,59 +916,13 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// `add dst, base, #imm`, split when the immediate does not fit.
-    ///
-    /// AArch64's add immediate is twelve bits, optionally shifted left by
-    /// twelve -- so 0..4095, or a multiple of 4096 up to 0xFFF000. A frame
-    /// large enough to put a local past 4095 produced `add x1, x29, #18032`,
-    /// which the assembler rejects outright: `Error: immediate out of range`.
-    /// Three locals of 9001 bytes is enough to reach it, and inlining at -O2
-    /// reaches it with smaller ones.
-    ///
-    /// Split into the shifted part and the remainder, both of which are
-    /// representable, rather than materializing the value into a scratch
-    /// register: there is no free scratch here -- X16 is already this
-    /// function's fallback destination and X17 is in use elsewhere -- and two
-    /// adds need none.
-    pub(super) fn emit_add_imm_legalized(&mut self, dst: Reg, base: Reg, imm: i64) {
-        const MAX12: i64 = 0xFFF;
-        if (0..=MAX12).contains(&imm) {
-            self.push_lir(Aarch64Inst::Add {
-                size: OperandSize::B64,
-                src1: base,
-                src2: GpOperand::Imm(imm),
-                dst,
-            });
-            return;
-        }
-        // The high part is a multiple of 4096 and so fits the shifted form;
-        // the low part is under 4096 and fits the plain one. `dst` is written
-        // before it is read, so `dst == base` is fine.
-        let hi = imm & !MAX12;
-        let lo = imm & MAX12;
-        self.push_lir(Aarch64Inst::Add {
-            size: OperandSize::B64,
-            src1: base,
-            src2: GpOperand::Imm(hi),
-            dst,
-        });
-        if lo != 0 {
-            self.push_lir(Aarch64Inst::Add {
-                size: OperandSize::B64,
-                src1: dst,
-                src2: GpOperand::Imm(lo),
-                dst,
-            });
-        }
-    }
-
     pub(super) fn get_location(&self, pseudo: PseudoId) -> Loc {
         self.locations.get(pseudo).unwrap_or(Loc::Imm(0))
     }
 
     /// Whether accessing the thread-local `name` needs the Initial Exec model
     /// rather than Local Exec. See [`CodeGenBase::use_tls_ie`].
-    fn use_tls_ie(&self, name: &str) -> bool {
+    pub(super) fn use_tls_ie(&self, name: &str) -> bool {
         self.base.use_tls_ie(self.extern_symbols.contains(name))
     }
 
@@ -1000,6 +930,46 @@ impl Aarch64CodeGen {
     /// After this call, dst holds the address of the TLS variable.
     pub(super) fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let sym = Symbol::global(name);
+        if self.base.tls_access() == crate::target::TlsAccess::MachOTlv {
+            // Mach-O thread-local variable descriptor (clang's sequence):
+            //   adrp  x0, _v@TLVPPAGE
+            //   ldr   x0, [x0, _v@TLVPPAGEOFF]    ; the descriptor
+            //   ldr   x16, [x0]                   ; its getter
+            //   blr   x16                         ; returns the ADDRESS in x0
+            //
+            // The getter preserves every register but x0, x16, x17 and the
+            // link register -- LLVM's `CSR_Darwin_AArch64_TLS` keeps x1-x28
+            // and q0-q31 -- so x0 is the one allocatable register it
+            // clobbers, which `get_constraint_info_aarch64` declares.
+            // X16/X17 are never allocated and LR is saved by every prologue.
+            //
+            // Reached only through a `TlsAddr`: `ir::tls` rewrites every
+            // Darwin thread-local reference into one, so the allocator sees
+            // the call.
+            self.push_lir(Aarch64Inst::AdrpTlvpPage {
+                sym: sym.clone(),
+                dst: Reg::X0,
+            });
+            self.push_lir(Aarch64Inst::LdrTlvpPageOff {
+                sym,
+                base: Reg::X0,
+                dst: Reg::X0,
+            });
+            self.push_lir(Aarch64Inst::Ldr {
+                size: OperandSize::B64,
+                addr: MemAddr::Base(Reg::X0),
+                dst: Reg::X16,
+            });
+            self.push_lir(Aarch64Inst::Blr { reg: Reg::X16 });
+            if dst != Reg::X0 {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::X0),
+                    dst,
+                });
+            }
+            return;
+        }
         if self.base.use_tls_dynamic() {
             // TLS descriptor, the dynamic model:
             //   adrp  x0, :tlsdesc:sym
@@ -1045,16 +1015,32 @@ impl Aarch64CodeGen {
         }
         if self.use_tls_ie(name) {
             // Initial Exec model (extern TLS or shared library):
-            //   adrp  dst, :gottpoff:sym
-            //   ldr   dst, [dst, :gottpoff_lo12:sym]
+            //   adrp  dst, :gottprel:sym
+            //   ldr   dst, [dst, #:gottprel_lo12:sym]
             //   mrs   tmp, tpidr_el0
             //   add   dst, tmp, dst
-            let tmp = Reg::X16; // scratch register
-            self.push_lir(Aarch64Inst::AdrpGottpoff {
+            //
+            // The thread pointer needs a register of its own, and no scratch
+            // the callers use is free: a store passes X16 as `dst` with the
+            // value in X9, and a struct copy computes one address into X17
+            // while its other cursor is live in X16. Borrowing X16, as this
+            // did, turned a store into `mrs x16, ...; add x16, x16, x16` --
+            // twice the thread pointer, a wild write. X15 is free by
+            // construction: the legalizer cannot touch it between the `mrs`
+            // and the `add`, since neither is ever expanded.
+            let tmp = super::legalize::LEGALIZE_REG;
+            // The one caller that holds X15 across instructions, inline asm,
+            // never asks this sequence for an address in X15; see
+            // `OperandRegs` in inline_asm.rs.
+            debug_assert_ne!(
+                dst, tmp,
+                "the Initial Exec sequence needs X15 as its temporary"
+            );
+            self.push_lir(Aarch64Inst::AdrpGottprel {
                 sym: sym.clone(),
                 dst,
             });
-            self.push_lir(Aarch64Inst::LdrGottpoffLo12 {
+            self.push_lir(Aarch64Inst::LdrGottprelLo12 {
                 sym,
                 base: dst,
                 dst,
@@ -1236,17 +1222,11 @@ impl Aarch64CodeGen {
             _ => Reg::X16,
         };
 
-        // Pick non-conflicting temp registers for cond/then/else values
-        // If dst_reg is one of our default temps, shift allocation to avoid conflicts
-        let (cond_reg, then_reg, else_reg) = if dst_reg == Reg::X10 {
-            (Reg::X11, Reg::X12, Reg::X13)
-        } else if dst_reg == Reg::X11 {
-            (Reg::X10, Reg::X12, Reg::X13)
-        } else if dst_reg == Reg::X12 {
-            (Reg::X10, Reg::X11, Reg::X13)
-        } else {
-            (Reg::X10, Reg::X11, Reg::X12) // Original allocation
-        };
+        // The three codegen scratches, which the allocator never hands out,
+        // so none can be `dst_reg` or hold anything live. This used X12 and
+        // X13, which are allocatable: a value the allocator had put there was
+        // overwritten by the select's operand, and read back wrong after it.
+        let (cond_reg, then_reg, else_reg) = Reg::scratch_regs();
 
         // Load condition, then and else values
         self.emit_move(cond, cond_reg, 64);
@@ -1284,12 +1264,9 @@ impl Aarch64CodeGen {
     pub(super) fn next_unique_label(&mut self, prefix: &str) -> Label {
         let id = self.unique_label_counter;
         self.unique_label_counter += 1;
-        Label::new(prefix, id)
+        Label::internal(prefix, id)
     }
 }
-
-// Import shared helper from parent module
-use super::f64_to_f16_bits;
 
 impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
     type Reg = Reg;
@@ -1344,6 +1321,23 @@ impl CodeGenerator for Aarch64CodeGen {
             .filter(|g| g.is_thread_local)
             .map(|g| g.name.clone())
             .chain(module.extern_tls_symbols.iter().cloned())
+            .collect();
+
+        self.sym_align = module
+            .globals
+            .iter()
+            .map(|g| {
+                (
+                    g.name.clone(),
+                    crate::arch::codegen::global_alignment(g, types),
+                )
+            })
+            .chain(
+                module
+                    .extern_object_align
+                    .iter()
+                    .map(|(n, a)| (n.clone(), *a)),
+            )
             .collect();
 
         // Emit file header

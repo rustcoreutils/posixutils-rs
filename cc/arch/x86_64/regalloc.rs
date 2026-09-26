@@ -484,7 +484,7 @@ pub fn parse_x86_64_class_letter(letter: char) -> Option<OperandConstraint<Reg>>
 /// `r10w`, `r10b`), and the GCC-style "%rax" with leading `%`.
 /// Returns `None` for names the GP table doesn't know about
 /// (XMM registers, `memory`, `cc`, x87 stack, ...).
-fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
+pub(super) fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
     let s = raw.trim_start_matches('%').to_ascii_lowercase();
     Some(match s.as_str() {
         "rax" | "eax" | "ax" | "al" | "ah" => Reg::Rax,
@@ -521,96 +521,12 @@ fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
 pub fn build_asm_instr_constraints_x86_64(
     insn: &Instruction,
 ) -> Option<crate::arch::asm_constraints::InstrConstraints<Reg>> {
-    use crate::arch::asm_constraints::{
-        parse_constraint_with_classes, InstrConstraints, OperandSpec,
-    };
-
-    let asm_data = insn.asm_data.as_ref()?;
-    let mut operands = Vec::new();
-    for ac in asm_data.outputs.iter().chain(asm_data.inputs.iter()) {
-        if let Ok((kind, constraint)) = parse_constraint_with_classes(
-            &ac.constraint,
-            parse_x86_64_fixed_letter,
-            parse_x86_64_class_letter,
-        ) {
-            // Default-kind from the parser is correct for inputs and
-            // matches GCC for outputs (`=` and `+` modifiers come
-            // through the string).
-            operands.push(OperandSpec {
-                pseudo: ac.pseudo,
-                kind,
-                constraint,
-            });
-        }
-    }
-    let mut clobbers: Vec<Reg> = asm_data
-        .clobbers
-        .iter()
-        .filter_map(|name| parse_gp_clobber_name(name))
-        .collect();
-    clobbers.sort();
-    clobbers.dedup();
-    let memory_barrier = asm_data.clobbers.iter().any(|c| c == "memory");
-    Some(InstrConstraints {
-        operands,
-        clobbers,
-        memory_barrier,
-    })
-}
-
-/// Lower a richer `InstrConstraints` down to the
-/// `(clobbers, involved_pseudos)` shape the current `ConstraintPoint`
-/// mechanism understands. `InstrConstraints` is a pass-through; the
-/// chordal allocator drives entirely off the lowered
-/// `ConstraintPoint`.
-pub fn lower_instr_constraints_to_constraint_point(
-    ic: &crate::arch::asm_constraints::InstrConstraints<Reg>,
-    insn: &Instruction,
-) -> (Vec<Reg>, Vec<PseudoId>) {
-    use crate::arch::asm_constraints::{OperandConstraint, OperandKind};
-
-    let mut clobbers = ic.clobbers.clone();
-    for op in &ic.operands {
-        // The lowering only uses Fixed (-> implicit clobber) and
-        // EarlyClobber kind (-> implicit clobber). The other variants
-        // are recognised here for completeness.
-        match &op.constraint {
-            OperandConstraint::Fixed(r) => clobbers.push(*r),
-            OperandConstraint::Match(_idx) => { /* C3: coalescing edge */ }
-            OperandConstraint::Any | OperandConstraint::Mem | OperandConstraint::Imm => {}
-            // Multi-alternative — by construction the alternatives
-            // are restricted to Any/Mem/Imm (no Fixed or Match), so
-            // none impose an allocator clobber. The allocator picks
-            // the most flexible interpretation (register class) and
-            // the codegen later observes the operand's actual
-            // location to choose register vs memory vs immediate.
-            OperandConstraint::Alternatives(_) => {}
-        }
-        // Early-clobber outputs are written before all inputs are
-        // read, so the allocator must keep them disjoint from every
-        // input.
-        if matches!(op.kind, OperandKind::EarlyClobber) { /* C3: extra interference */ }
-    }
-    // `memory_barrier` is parsed and stored on `InstrConstraints`.
-    // An inline-asm memory clobber is a clobber list entry the
-    // allocator otherwise ignores (`parse_gp_clobber_name` returns
-    // None for the string `"memory"`).
-    let _ = ic.memory_barrier;
-    clobbers.sort();
-    clobbers.dedup();
-
-    let mut involved = Vec::new();
-    if let Some(t) = insn.target {
-        involved.push(t);
-    }
-    involved.extend(insn.src.iter().copied());
-    for op in &ic.operands {
-        if !involved.contains(&op.pseudo) {
-            involved.push(op.pseudo);
-        }
-    }
-
-    (clobbers, involved)
+    Some(crate::arch::asm_constraints::InstrConstraints::of_asm(
+        insn.asm_data.as_ref()?,
+        parse_x86_64_fixed_letter,
+        parse_x86_64_class_letter,
+        parse_gp_clobber_name,
+    ))
 }
 
 /// Walk a function's inline-asm instructions and collect
@@ -647,13 +563,19 @@ pub fn collect_asm_fixed_precolors_x86_64(func: &Function) -> BTreeMap<PseudoId,
     out
 }
 
-pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId>)> {
+/// `tls` is how this target obtains a thread-local's address, which decides
+/// what a `TlsAddr` clobbers: the ELF descriptor call hard-uses only %rax,
+/// while the Mach-O TLV getter is also passed its descriptor in %rdi.
+pub fn get_constraint_info(
+    insn: &Instruction,
+    tls: crate::target::TlsAccess,
+) -> Option<(Vec<Reg>, Vec<PseudoId>)> {
     // Inline asm: route through the per-operand constraint vocabulary
     // and lower the result back to ConstraintPoint for the chordal
     // allocator.
     if insn.op == Opcode::Asm {
         let ic = build_asm_instr_constraints_x86_64(insn)?;
-        let (mut clobbers, involved) = lower_instr_constraints_to_constraint_point(&ic, insn);
+        let (mut clobbers, involved) = ic.to_constraint_point();
         // The R10/R11 scratch clobbers apply to the inline-asm path
         // too: `emit_inline_asm` in `cc/arch/x86_64/codegen.rs` uses
         // R10/R11 to shuffle operands into Fixed-letter registers,
@@ -684,6 +606,14 @@ pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId
     if needs_r10_r11 {
         clobbers.push(Reg::R10);
         clobbers.push(Reg::R11);
+    }
+    // The Mach-O TLV getter preserves every general register but %rax, which
+    // returns the address, and %rdi, which carries the descriptor in --
+    // LLVM's `CSR_64_TLS_Darwin` keeps the callee-saved set plus %rcx, %rdx,
+    // %rsi and %r8-%r11. It keeps no XMM register; see
+    // `RegAlloc::fp_call_positions`.
+    if insn.op == Opcode::TlsAddr && tls == crate::target::TlsAccess::MachOTlv {
+        clobbers.push(Reg::Rdi);
     }
     clobbers.sort();
     clobbers.dedup();
@@ -843,6 +773,9 @@ pub struct SpilledXmmArg {
 pub struct RegAlloc {
     /// Mapping from pseudo to location
     locations: HashMap<PseudoId, Loc>,
+    /// How the target obtains a thread-local's address, which decides what a
+    /// `TlsAddr` clobbers. Set with [`RegAlloc::with_tls_access`].
+    tls_access: crate::target::TlsAccess,
     /// How many GP argument registers the **named** parameters consumed, capped
     /// at the register file size. `va_start` needs this to seed `gp_offset`.
     named_gp_regs: usize,
@@ -1046,6 +979,15 @@ impl FrameBase {
     }
 }
 
+/// Whether a constraint point may leave `interval`'s pseudo in a register
+/// it clobbers: only an operand of the instruction, and only at the ends of
+/// its live range (see [`ConstraintPoint::operand_survives`]). The one rule
+/// for x86-64, asked both when coloring and when deciding whether an
+/// ABI-pinned argument must leave its register.
+fn exempt_from_clobber(cp: &ConstraintPoint<Reg>, interval: &LiveInterval) -> bool {
+    cp.operand_survives(interval.pseudo, interval.start, interval.end)
+}
+
 /// Bytes reserved at the bottom of the locals area for the x87 scratch.
 ///
 /// `x87.rs` needs a fixed address to stage an immediate or a general register
@@ -1089,17 +1031,28 @@ impl IncomingOff {
     /// It went unnoticed because it is invisible below 32-byte alignment: 16 is
     /// already a multiple of 8 and of 16, so only an argument wanting more than
     /// the area's own alignment can tell the two bases apart.
+    ///
+    /// Summed in `i64` and saturated: two stacked arguments each inside the
+    /// frame ceiling can still overflow their total. The caller checks the
+    /// end once, with [`crate::arch::regalloc::check_incoming_area`].
     fn take(next: &mut IncomingOff, bytes: i32, align: i32) -> i32 {
-        let align = align.max(8);
-        let base = IncomingOff::FIRST.0;
-        next.0 = base + (((next.0 - base) + align - 1) & !(align - 1));
-        let here = next.0;
-        next.0 += (bytes + 7) & !7;
-        here
+        let align = i64::from(align.max(8));
+        let base = i64::from(IncomingOff::FIRST.0);
+        let at = base + ((i64::from(next.0) - base + align - 1) & !(align - 1));
+        let end = at + ((i64::from(bytes) + 7) & !7);
+        next.0 = i32::try_from(end).unwrap_or(i32::MAX);
+        i32::try_from(at).unwrap_or(i32::MAX)
     }
 }
 
 impl RegAlloc {
+    /// The allocator for a target whose thread-locals are reached by
+    /// `access`; see [`crate::target::Target::tls_access`].
+    pub fn with_tls_access(mut self, access: crate::target::TlsAccess) -> Self {
+        self.tls_access = access;
+        self
+    }
+
     pub fn new() -> Self {
         Self {
             locations: HashMap::new(),
@@ -1127,6 +1080,7 @@ impl RegAlloc {
             live_out: Vec::new(),
             max_local_align: 8,
             frame_base: FrameBase::Rbp,
+            tls_access: crate::target::TlsAccess::ElfStatic,
         }
     }
 
@@ -1162,13 +1116,44 @@ impl RegAlloc {
         let intervals = result.intervals;
         let constraint_points = result.constraint_points;
         let call_positions = find_call_positions(func, is_call_like_x86_64);
+        let fp_call_positions = self.fp_call_positions(func, &call_positions);
 
         self.spill_args_across_calls(func, types, &intervals, &call_positions);
-        self.spill_args_across_constraints(func, &intervals, &constraint_points);
+        self.spill_gp_args(&intervals, |interval, reg| {
+            crate::arch::regalloc::clobbered_while_live(
+                interval,
+                reg,
+                &constraint_points,
+                exempt_from_clobber,
+            )
+        });
         self.allocate_alloca_to_stack(func);
-        self.run_chordal_color(func, types, intervals, &call_positions, &constraint_points);
+        self.run_chordal_color(
+            func,
+            types,
+            intervals,
+            &call_positions,
+            &fp_call_positions,
+            &constraint_points,
+        );
 
         crate::arch::regalloc::LocationMap::from(self.locations.clone())
+    }
+
+    /// The positions that destroy every XMM register: the calls, and on
+    /// Darwin also each `TlsAddr`.
+    ///
+    /// The Mach-O TLV getter preserves most general registers, which
+    /// `get_constraint_info` models as a narrow clobber, but no XMM register
+    /// (LLVM's `CSR_64_TLS_Darwin` lists none). A floating-point value live
+    /// across it has to be where one is live across a call: on the stack.
+    /// The ELF descriptor resolver preserves them all, so there it adds
+    /// nothing.
+    fn fp_call_positions(&self, func: &Function, call_positions: &[usize]) -> Vec<usize> {
+        if self.tls_access != crate::target::TlsAccess::MachOTlv {
+            return call_positions.to_vec();
+        }
+        find_call_positions(func, |op| is_call_like_x86_64(op) || op == Opcode::TlsAddr)
     }
 
     /// Reset allocator state for a new function
@@ -1362,7 +1347,7 @@ impl RegAlloc {
         // The shared AbiLowering helper does sret detection and O(1)
         // Arg(n) → pseudo lookup; the classification dispatch below keeps
         // its own inline type-kind checks.
-        let lowering = AbiLowering::new(func, types);
+        let lowering = AbiLowering::new(func);
         let arg_idx_offset = lowering.arg_idx_offset;
 
         // Allocate RDI for hidden return pointer if present
@@ -1652,6 +1637,7 @@ impl RegAlloc {
         self.named_gp_regs = int_arg_idx.min(int_arg_regs.len());
         self.named_fp_regs = fp_arg_idx.min(fp_arg_regs.len());
         self.named_incoming_end = stack_arg_offset.0;
+        crate::arch::regalloc::check_incoming_area(stack_arg_offset.0, self.func_pos);
     }
 
     /// Spill arguments in caller-saved registers if their interval crosses a call
@@ -1662,32 +1648,9 @@ impl RegAlloc {
         intervals: &[LiveInterval],
         call_positions: &[usize],
     ) {
-        let int_arg_regs_set: &[Reg] = Reg::arg_regs();
-        let spilled_args = &mut self.spilled_args;
-        let free_regs = &mut self.free_regs;
-        crate::arch::regalloc::spill_gp_args_across_calls(
-            intervals,
-            call_positions,
-            &mut self.locations,
-            &mut self.stack_offset,
-            |reg| int_arg_regs_set.contains(&reg),
-            |loc| {
-                if let Loc::Reg(reg) = loc {
-                    Some(*reg)
-                } else {
-                    None
-                }
-            },
-            Loc::Stack,
-            |pseudo, from_reg, to_stack_offset| {
-                spilled_args.push(SpilledArg {
-                    pseudo,
-                    from_reg,
-                    to_stack_offset,
-                });
-            },
-            |reg| free_regs.push(reg),
-        );
+        self.spill_gp_args(intervals, |interval, _| {
+            interval_crosses_call(interval, call_positions)
+        });
 
         // Always spill XMM function parameter arguments to stack.
         // All XMM registers are caller-saved on x86-64 SysV ABI, and any float
@@ -1781,51 +1744,42 @@ impl RegAlloc {
         &self.int128_pseudos
     }
 
-    /// Spill arguments in registers that would be clobbered by constraint points (e.g., shifts)
-    ///
-    /// For example, if the 4th parameter is in Rcx and the function contains variable shifts,
-    /// Rcx will be clobbered when the shift count is loaded. We must spill such arguments
-    /// to the stack before they get clobbered.
-    fn spill_args_across_constraints(
+    /// Spill a GP argument out of its ABI register when `overwritten` says
+    /// something destroys that register while the argument is live: a call,
+    /// or a constraint point such as a variable shift loading its count into
+    /// RCX while the fourth parameter still lives there. See
+    /// [`crate::arch::regalloc::spill_gp_args_across`].
+    fn spill_gp_args(
         &mut self,
-        _func: &Function,
         intervals: &[LiveInterval],
-        constraint_points: &[ConstraintPoint<Reg>],
+        overwritten: impl Fn(&LiveInterval, Reg) -> bool,
     ) {
-        // For each argument in a register, check if its interval is live across
-        // any constraint point that clobbers that register
-        let int_arg_regs_set = Reg::arg_regs();
-        for interval in intervals {
-            if let Some(Loc::Reg(reg)) = self.locations.get(&interval.pseudo) {
-                if int_arg_regs_set.contains(reg) {
-                    // Check if this register is clobbered by any constraint point
-                    // while the interval is live (and the pseudo is not involved)
-                    let needs_spill = constraint_points.iter().any(|cp| {
-                        interval.start <= cp.position
-                            && cp.position <= interval.end
-                            && !cp.operand_survives(interval.pseudo, interval.start, interval.end)
-                            && cp.clobbers.contains(reg)
-                    });
-
-                    if needs_spill {
-                        let from_reg = *reg;
-                        self.stack_offset += 8;
-                        let to_stack_offset = self.stack_offset;
-
-                        // Record the spill for codegen to emit stores in prologue
-                        self.spilled_args.push(SpilledArg {
-                            pseudo: interval.pseudo,
-                            from_reg,
-                            to_stack_offset,
-                        });
-
-                        self.locations
-                            .insert(interval.pseudo, Loc::Stack(to_stack_offset));
-                        self.free_regs.push(from_reg);
-                    }
+        let int_arg_regs_set: &[Reg] = Reg::arg_regs();
+        let spilled_args = &mut self.spilled_args;
+        let free_regs = &mut self.free_regs;
+        crate::arch::regalloc::spill_gp_args_across(
+            intervals,
+            overwritten,
+            &mut self.locations,
+            &mut self.stack_offset,
+            |reg| int_arg_regs_set.contains(&reg),
+            |loc| {
+                if let Loc::Reg(reg) = loc {
+                    Some(*reg)
+                } else {
+                    None
                 }
-            }
-        }
+            },
+            Loc::Stack,
+            |pseudo, from_reg, to_stack_offset| {
+                spilled_args.push(SpilledArg {
+                    pseudo,
+                    from_reg,
+                    to_stack_offset,
+                });
+            },
+            |reg| free_regs.push(reg),
+        );
     }
 
     /// Force alloca results to stack to avoid clobbering issues
@@ -1881,10 +1835,12 @@ impl RegAlloc {
                 return;
             }
         }
+        let frame_align = self.frame_align();
         let offset = crate::arch::regalloc::grow_frame(
             &mut self.stack_offset,
             size,
             alignment,
+            frame_align,
             self.func_pos,
         );
         self.locations.insert(interval.pseudo, Loc::Stack(offset));
@@ -1896,13 +1852,6 @@ impl RegAlloc {
                 size,
             });
         }
-    }
-
-    /// Look up an interval by pseudo id (linear scan over the small
-    /// intervals vector; vec is sorted by start position, not pseudo,
-    /// so a linear find is fine).
-    fn interval_by_pseudo(intervals: &[LiveInterval], p: PseudoId) -> Option<&LiveInterval> {
-        intervals.iter().find(|i| i.pseudo == p)
     }
 
     /// Chordal coloring, with spill-on-fail for uncolorable vertices.
@@ -1928,9 +1877,12 @@ impl RegAlloc {
         types: &TypeTable,
         intervals: Vec<LiveInterval>,
         call_positions: &[usize],
+        fp_call_positions: &[usize],
         constraint_points: &[ConstraintPoint<Reg>],
     ) {
         // -------- Phase 1: pre-pass --------
+        let crosses_blocks = crate::arch::regalloc::live_out_anywhere(&self.live_out);
+        let setval_sizes = crate::arch::regalloc::setval_sizes(func);
         let mut gp_candidates: std::collections::BTreeSet<PseudoId> =
             std::collections::BTreeSet::new();
         let mut xmm_candidates: std::collections::BTreeSet<PseudoId> =
@@ -1964,14 +1916,7 @@ impl RegAlloc {
                         // constants that merely *feed* a 128-bit instruction,
                         // and those are still ordinary immediates that get
                         // widened at the use site.
-                        let defined_128 = func
-                            .blocks
-                            .iter()
-                            .flat_map(|b| &b.insns)
-                            .find(|insn| {
-                                insn.op == Opcode::SetVal && insn.target == Some(interval.pseudo)
-                            })
-                            .is_some_and(|insn| insn.size == 128);
+                        let defined_128 = setval_sizes.get(&interval.pseudo) == Some(&128);
                         if defined_128 {
                             self.alloc_stack_slot(interval, 16, 16, true);
                             continue;
@@ -1980,15 +1925,7 @@ impl RegAlloc {
                         continue;
                     }
                     PseudoKind::FVal(v) => {
-                        let size = func
-                            .blocks
-                            .iter()
-                            .flat_map(|b| &b.insns)
-                            .find(|insn| {
-                                insn.op == Opcode::SetVal && insn.target == Some(interval.pseudo)
-                            })
-                            .map(|insn| insn.size)
-                            .unwrap_or(64);
+                        let size = setval_sizes.get(&interval.pseudo).copied().unwrap_or(64);
                         self.locations.insert(interval.pseudo, Loc::FImm(*v, size));
                         self.fp_pseudos.insert(interval.pseudo);
                         continue;
@@ -2011,7 +1948,6 @@ impl RegAlloc {
                             } else {
                                 natural_align.max(8)
                             };
-                            let aligned_size = (size + alignment - 1) & !(alignment - 1);
                             // Sym slot reuse disabled. The IR-level
                             // interval of a Sym pseudo only captures
                             // its direct Store/Load/SymAddr uses,
@@ -2026,7 +1962,7 @@ impl RegAlloc {
                             // reuse is re-enabled.
                             let _ = self.addr_taken_syms.contains(&interval.pseudo);
                             let reusable = false;
-                            self.alloc_stack_slot(interval, aligned_size, alignment, reusable);
+                            self.alloc_stack_slot(interval, size, alignment, reusable);
                             if types.is_float(local_var.typ) {
                                 self.fp_pseudos.insert(interval.pseudo);
                             }
@@ -2047,8 +1983,8 @@ impl RegAlloc {
             if needs_fp {
                 let is_longdouble = self.ld_pseudos.contains(&interval.pseudo);
                 let is_quad = self.quad_pseudos.contains(&interval.pseudo);
-                let crosses_call = interval_crosses_call(interval, call_positions);
-                let crosses_block = self.live_out.iter().any(|lo| lo.contains(&interval.pseudo));
+                let crosses_call = interval_crosses_call(interval, fp_call_positions);
+                let crosses_block = crosses_blocks.contains(&interval.pseudo);
                 if is_longdouble {
                     self.alloc_stack_slot(interval, 16, 16, false);
                     continue;
@@ -2089,6 +2025,7 @@ impl RegAlloc {
         constraint_points: &[ConstraintPoint<Reg>],
         gp_candidates: &std::collections::BTreeSet<PseudoId>,
     ) {
+        let by_pseudo = crate::arch::regalloc::intervals_by_pseudo(intervals);
         use crate::arch::regalloc::{build_interference_graph, greedy_color, mcs_ordering};
         if gp_candidates.is_empty() {
             return;
@@ -2161,24 +2098,12 @@ impl RegAlloc {
             .copied()
             .filter(|r| !r.is_callee_saved())
             .collect();
-        let mut forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<Reg>> = BTreeMap::new();
-        for cp in constraint_points {
-            for interval in intervals {
-                if !gp_candidates.contains(&interval.pseudo) {
-                    continue;
-                }
-                if interval.start > cp.position || cp.position > interval.end {
-                    continue;
-                }
-                if cp.operand_survives(interval.pseudo, interval.start, interval.end) {
-                    continue;
-                }
-                let entry = forbidden.entry(interval.pseudo).or_default();
-                for &c in &cp.clobbers {
-                    entry.insert(c);
-                }
-            }
-        }
+        let mut forbidden = crate::arch::regalloc::constraint_clobbers(
+            constraint_points,
+            intervals,
+            gp_candidates,
+            exempt_from_clobber,
+        );
         let mut in_loop_set: std::collections::BTreeSet<PseudoId> =
             std::collections::BTreeSet::new();
         for interval in intervals {
@@ -2221,7 +2146,10 @@ impl RegAlloc {
         let caller_first_c = caller_first.clone();
         let callee_first_c = callee_first.clone();
 
-        let order = mcs_ordering(&graph);
+        // Asm register operands are colored first: gcc guarantees each
+        // one a register, so it is the other values that spill.
+        let asm_ops = crate::arch::regalloc::asm_register_operands(func);
+        let order = crate::arch::regalloc::asm_operands_first(mcs_ordering(&graph), &asm_ops);
         let result = greedy_color(
             &graph,
             &order,
@@ -2254,7 +2182,7 @@ impl RegAlloc {
             if colors.contains_key(&spilled) {
                 continue;
             }
-            let interval = match Self::interval_by_pseudo(intervals, spilled) {
+            let interval = match by_pseudo.get(&spilled).copied() {
                 Some(i) => i,
                 None => {
                     final_spilled.insert(spilled);
@@ -2271,8 +2199,9 @@ impl RegAlloc {
             let neighbors: Vec<PseudoId> = graph.neighbors(spilled).collect();
             let mut best_evict: Option<(PseudoId, Reg, usize)> = None;
             for &n in &neighbors {
-                if pre_colored.contains_key(&n) {
-                    // Don't evict ABI-pinned args.
+                // Don't evict ABI-pinned args, or an asm register operand:
+                // the template needs it in a register.
+                if pre_colored.contains_key(&n) || asm_ops.contains(&n) {
                     continue;
                 }
                 let Some(&color) = colors.get(&n) else {
@@ -2377,7 +2306,7 @@ impl RegAlloc {
         // end, so they cannot interfere within a block.
         let mut ordered_spilled: Vec<(usize, PseudoId)> = final_spilled
             .iter()
-            .filter_map(|&p| Self::interval_by_pseudo(intervals, p).map(|i| (i.start, p)))
+            .filter_map(|&p| by_pseudo.get(&p).copied().map(|i| (i.start, p)))
             .collect();
         ordered_spilled.sort_by_key(|&(start, _)| start);
         for (start, spilled) in ordered_spilled {
@@ -2389,7 +2318,7 @@ impl RegAlloc {
                 &mut self.free_stack_slots,
                 start,
             );
-            if let Some(interval) = Self::interval_by_pseudo(intervals, spilled) {
+            if let Some(interval) = by_pseudo.get(&spilled).copied() {
                 self.alloc_stack_slot(interval, 8, 8, true);
             }
         }
@@ -2401,6 +2330,7 @@ impl RegAlloc {
         intervals: &[LiveInterval],
         xmm_candidates: &std::collections::BTreeSet<PseudoId>,
     ) {
+        let by_pseudo = crate::arch::regalloc::intervals_by_pseudo(intervals);
         use crate::arch::regalloc::{build_interference_graph, greedy_color, mcs_ordering};
         if xmm_candidates.is_empty() {
             return;
@@ -2444,7 +2374,7 @@ impl RegAlloc {
         let mut ordered_spilled: Vec<(usize, PseudoId)> = result
             .spilled
             .iter()
-            .filter_map(|&p| Self::interval_by_pseudo(intervals, p).map(|i| (i.start, p)))
+            .filter_map(|&p| by_pseudo.get(&p).copied().map(|i| (i.start, p)))
             .collect();
         ordered_spilled.sort_by_key(|&(start, _)| start);
         for (start, spilled) in ordered_spilled {
@@ -2456,7 +2386,7 @@ impl RegAlloc {
                 &mut self.free_stack_slots,
                 start,
             );
-            if let Some(interval) = Self::interval_by_pseudo(intervals, spilled) {
+            if let Some(interval) = by_pseudo.get(&spilled).copied() {
                 self.alloc_stack_slot(interval, 8, 8, true);
             }
         }
@@ -2464,10 +2394,21 @@ impl RegAlloc {
 
     /// Compute live intervals, constraint points, and per-block liveness sets.
     fn compute_live_intervals(&self, func: &Function) -> LivenessResult<Reg> {
-        compute_live_intervals(func, get_constraint_info)
+        let tls = self.tls_access;
+        compute_live_intervals(func, |insn| get_constraint_info(insn, tls))
     }
 
     /// Get stack size needed (aligned to max local alignment, minimum 16)
+    /// The alignment the locals area is rounded to at the end, as far as it
+    /// is known: the frame base's, when over-aligned, and every slot's so far.
+    fn frame_align(&self) -> i32 {
+        let base = match self.frame_base {
+            FrameBase::Aligned { align, .. } => align,
+            FrameBase::Rbp => 16,
+        };
+        base.max(self.max_local_align).max(16)
+    }
+
     pub fn stack_size(&self) -> i32 {
         let align = self.max_local_align.max(16);
         (self.stack_offset + align - 1) & !(align - 1)
@@ -2633,41 +2574,82 @@ mod tests {
         assert!(!is_call_like_x86_64(Opcode::Asm));
     }
 
-    fn make_asm_insn(clobbers: &[&str]) -> Instruction {
-        use crate::ir::AsmData;
+    fn make_asm_insn(clobbers: &[&str], operands: &[(&str, PseudoId)]) -> Instruction {
+        use crate::ir::{AsmConstraint, AsmData};
+        let (outputs, inputs): (Vec<_>, Vec<_>) = operands
+            .iter()
+            .map(|&(c, pseudo)| AsmConstraint {
+                pseudo,
+                name: None,
+                matching_output: None,
+                constraint: c.to_string(),
+                size: 64,
+                offset: 0,
+            })
+            .partition(|c| c.constraint.starts_with('=') || c.constraint.starts_with('+'));
         let mut insn = Instruction::new(Opcode::Asm);
         insn.asm_data = Some(Box::new(AsmData {
             template: String::new(),
-            outputs: Vec::new(),
-            inputs: Vec::new(),
+            outputs,
+            inputs,
             clobbers: clobbers.iter().map(|s| s.to_string()).collect(),
             goto_labels: Vec::new(),
         }));
         insn
     }
 
+    /// What a `TlsAddr` clobbers follows the model: the ELF descriptor call
+    /// hard-uses %rax alone; the Mach-O TLV getter also takes its descriptor
+    /// in %rdi. Every other general register survives either.
     #[test]
-    fn build_asm_instr_constraints_x86_64_propagates_memory_barrier() {
-        // C6a contract: a `"memory"` clobber on an `Opcode::Asm` must
-        // flip `InstrConstraints.memory_barrier`. This is the load-
-        // bearing flag that future memory-reordering passes (GVN,
-        // LICM, machine scheduler) will consult before crossing.
-        let with_mem = make_asm_insn(&["rax", "memory", "cc"]);
-        let ic = build_asm_instr_constraints_x86_64(&with_mem).expect("has asm_data");
-        assert!(ic.memory_barrier, "\"memory\" clobber must set the flag");
+    fn tls_addr_clobbers_follow_the_model() {
+        use crate::target::TlsAccess;
+        let insn = Instruction::tls_addr(PseudoId(1), PseudoId(2), crate::types::TypeId::INVALID);
+        let (elf, _) = get_constraint_info(&insn, TlsAccess::ElfDescriptor).unwrap();
+        let (macho, _) = get_constraint_info(&insn, TlsAccess::MachOTlv).unwrap();
+        assert!(elf.contains(&Reg::Rax) && !elf.contains(&Reg::Rdi));
+        assert!(macho.contains(&Reg::Rax) && macho.contains(&Reg::Rdi));
+        for kept in [Reg::Rcx, Reg::Rdx, Reg::Rsi, Reg::R8, Reg::R9, Reg::Rbx] {
+            assert!(
+                !macho.contains(&kept),
+                "{kept:?} is preserved by the getter"
+            );
+        }
+    }
 
-        // Conversely, non-memory clobbers leave the flag clear.
-        let no_mem = make_asm_insn(&["rax", "cc"]);
-        let ic = build_asm_instr_constraints_x86_64(&no_mem).expect("has asm_data");
-        assert!(
-            !ic.memory_barrier,
-            "asm without \"memory\" clobber must not be a barrier"
+    /// No operand of an asm statement may live in a register it clobbers:
+    /// the template may write that register before reading its operands.
+    /// So an asm's declared clobbers exempt none of its operands, register
+    /// or memory -- unlike an instruction such as `idivq`, which reads its
+    /// operands before touching the registers it claims.
+    #[test]
+    fn asm_operands_are_not_exempt_from_the_statements_clobbers() {
+        let insn = make_asm_insn(
+            &["rax", "memory"],
+            &[("=r", PseudoId(1)), ("r", PseudoId(2)), ("m", PseudoId(5))],
         );
+        let (clobbers, exempt) = get_constraint_info(&insn, crate::target::TlsAccess::ElfStatic)
+            .expect("a register is claimed");
+        assert!(clobbers.contains(&Reg::Rax));
+        assert!(exempt.is_empty(), "{exempt:?}");
 
-        // Empty clobber list: also not a barrier.
-        let bare = make_asm_insn(&[]);
-        let ic = build_asm_instr_constraints_x86_64(&bare).expect("has asm_data");
-        assert!(!ic.memory_barrier);
+        // A pinned operand is the one exemption: it is precolored to its own
+        // register and must not be forbidden it. Another operand still may
+        // not take that register.
+        let mut pinned = make_asm_insn(&[], &[("=a", PseudoId(3)), ("r", PseudoId(4))]);
+        let (clobbers, exempt) = get_constraint_info(&pinned, crate::target::TlsAccess::ElfStatic)
+            .expect("rax is claimed");
+        assert!(clobbers.contains(&Reg::Rax));
+        assert_eq!(exempt, vec![PseudoId(3)]);
+        pinned
+            .asm_data
+            .as_mut()
+            .unwrap()
+            .clobbers
+            .push("rcx".into());
+        let (clobbers, _) =
+            get_constraint_info(&pinned, crate::target::TlsAccess::ElfStatic).unwrap();
+        assert!(clobbers.contains(&Reg::Rcx));
     }
 }
 

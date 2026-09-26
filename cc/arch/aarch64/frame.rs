@@ -15,10 +15,10 @@ use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::arch::aarch64::codegen::Aarch64CodeGen;
 use crate::arch::aarch64::features::{VA_GR_SAVE_BYTES, VA_VR_SAVE_BYTES};
 use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
-use crate::arch::aarch64::regalloc::{FrameBase, Loc, Reg, RegAlloc, VReg};
+use crate::arch::aarch64::regalloc::{FrameBase, IncomingOff, Loc, Reg, RegAlloc, VReg};
 use crate::arch::codegen::is_variadic_function;
 use crate::arch::lir::{
-    complex_fp_info, plan_pair_move, Directive, FpSize, OperandSize, PairMove, Symbol,
+    complex_fp_info, plan_pair_move, CondCode, Directive, FpSize, OperandSize, PairMove, Symbol,
 };
 use crate::ir::{Function, Instruction, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeKind, TypeTable};
@@ -30,10 +30,18 @@ impl Aarch64CodeGen {
         // Check if this function uses varargs
         let is_variadic = is_variadic_function(func);
 
+        if self.base.tls_access().is_call() {
+            crate::arch::codegen::check_tls_reached_only_by_address(
+                func,
+                &self.tls_symbols,
+                self.base.func_pos,
+            );
+        }
+
         // Register allocation
-        let mut alloc = RegAlloc::new();
+        let mut alloc = RegAlloc::new().with_tls_access(self.base.tls_access());
         self.locations = alloc.allocate(func, types);
-        self.pseudos = func.pseudos.clone();
+        self.pseudos = crate::arch::codegen::PseudoTable::new(&func.pseudos);
 
         // Build sym type size map for emit_store to distinguish struct fields from scalars
         self.sym_type_sizes.clear();
@@ -119,6 +127,9 @@ impl Aarch64CodeGen {
 
         // Emit function header (directives, label, CFI start)
         self.emit_function_header(func);
+        // The function's code begins here, after the header's section and
+        // symbol directives; branch relaxation measures from this point.
+        let first_inst = self.base.lir_buffer.len();
 
         // Emit prologue (save fp/lr, callee-saved regs, allocate stack)
         self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
@@ -152,96 +163,19 @@ impl Aarch64CodeGen {
             });
         }
 
-        // Detect sret and store X8 to stack if needed
-        let has_sret = func
-            .pseudos
-            .iter()
-            .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
-        if has_sret {
-            self.store_sret_if_needed(func);
-        }
-
         // For variadic functions on Linux/FreeBSD, save argument registers
         if is_variadic && !is_darwin {
             self.emit_variadic_save_area();
         }
 
-        // Measure what the named parameters consumed, for va_start
+        // Measure what the named parameters consumed, for va_start: the same
+        // layout `allocate_arguments` bound them by.
         if is_variadic {
-            // AAPCS64 assigns named parameters to the two register banks
-            // independently, and `va_start` has to skip exactly what they
-            // consumed in each. Both saturate at 8; a named parameter that
-            // arrives after its bank is full lands on the stack instead, and
-            // `__stack` has to start past those too.
-            let mut ngrn = 0usize;
-            let mut nsrn = 0usize;
-            // Summed in `i64`: two stacked parameters each inside
-            // `MAX_STACK_OBJECT_BYTES` still overflow their total, and the
-            // one conversion after the loop is where that is caught.
-            let mut named_stack = 0i64;
-            let abi = crate::abi::get_abi_for_conv(CallingConv::C, &self.base.target);
-            for (_, typ) in &func.params {
-                // Mirror `allocate_arguments`: it dispatches on the ABI class,
-                // and this has to agree with it or `va_start` skips the wrong
-                // number of slots. Asking `is_float` instead counted a
-                // `_Complex` -- two V registers -- as one general one, and an
-                // HFA of any size likewise.
-                let (is_gp, count) = match abi.classify_param(*typ, types) {
-                    ArgClass::Direct { ref classes, .. }
-                        if classes.len() == 1 && classes[0] == crate::abi::RegClass::Sse =>
-                    {
-                        (false, 1)
-                    }
-                    ArgClass::Hfa { count, .. } => (false, count as usize),
-                    _ if types.kind(*typ) == TypeKind::Int128 => (true, 2),
-                    // A composite of at most sixteen bytes takes two general
-                    // registers. Counting it as one left `va_start` pointing a
-                    // slot short, so the first variadic argument of a function
-                    // whose named parameter was such a composite came back as
-                    // the composite's own upper half.
-                    ArgClass::Direct { ref classes, .. }
-                        if classes.len() == 2
-                            && classes.iter().all(|c| *c == crate::abi::RegClass::Integer) =>
-                    {
-                        (true, 2)
-                    }
-                    // Everything else takes a single general register.
-                    _ => (true, 1),
-                };
-                // A run of general registers is subject to stage C.10 -- a
-                // 16-aligned argument starts at an even NGRN -- and both banks
-                // to C.11/§6.4.2, which send everything after an overflow to
-                // the stack. This tally has to reach the same numbers
-                // `allocate_arguments` does, or `va_start` skips the wrong
-                // count of slots.
-                let bank = if is_gp { &mut ngrn } else { &mut nsrn };
-                let start = if is_gp {
-                    crate::abi::aapcs64::gr_run_start(types, *typ, *bank, count, 8)
-                } else {
-                    (*bank + count <= 8).then_some(*bank)
-                };
-                if let Some(start) = start {
-                    *bank = start + count;
-                } else {
-                    *bank = 8;
-                    let bytes = crate::abi::slot_bytes(
-                        types.size_bytes(*typ).max(1),
-                        crate::arch::func_pos(func),
-                        "a stacked parameter",
-                    );
-                    // Summed in `i64`: two parameters each inside the bound
-                    // overflow their total, and the one conversion below is
-                    // where that is caught.
-                    named_stack += i64::from((bytes + 7) & !7);
-                }
-            }
-            self.num_fixed_gp_params = ngrn;
-            self.num_fixed_fp_params = nsrn;
-            self.named_stack_param_bytes = crate::abi::slot_bytes(
-                named_stack as usize,
-                crate::arch::func_pos(func),
-                "this function's stacked parameters",
-            );
+            let layout = crate::arch::aarch64::regalloc::param_layout(&func.params, types);
+            self.num_fixed_gp_params = layout.ngrn;
+            self.num_fixed_fp_params = layout.nsrn;
+            self.named_stack_param_bytes =
+                layout.stack_end.displacement() - IncomingOff::FIRST.displacement();
         }
 
         // Store spilled arguments before any calls can clobber them
@@ -274,6 +208,10 @@ impl Aarch64CodeGen {
         // `.size f, .-f`: without it the symbol records st_size = 0 and a
         // debugger cannot tell which function owns an address inside it.
         self.push_lir(Aarch64Inst::Directive(Directive::size_to_here(&func.name)));
+
+        // Only now is every branch and label of the function in place.
+        let base = &mut self.base;
+        super::relax::relax_branches(&mut base.lir_buffer[first_inst..], &base.target);
     }
 
     /// Record what `-g` has to say about this function.
@@ -367,8 +305,12 @@ impl Aarch64CodeGen {
         // ELF-only type (handled by Directive::emit which skips on macOS)
         self.push_lir(Aarch64Inst::Directive(Directive::type_func(name)));
 
-        // Alignment
-        self.push_lir(Aarch64Inst::Directive(Directive::Align(2)));
+        // An instruction is four bytes, so that is the least; `aligned(N)`
+        // raises it.
+        let align = func.align.unwrap_or(4).max(4);
+        self.push_lir(Aarch64Inst::Directive(Directive::Align(
+            align.trailing_zeros(),
+        )));
 
         // Function label
         self.push_lir(Aarch64Inst::Directive(Directive::global_label(name)));
@@ -407,8 +349,12 @@ impl Aarch64CodeGen {
                 });
             } else {
                 // Large frame: separate sub and stp
-                // sub sp, sp, #total_frame
-                self.emit_sub_sp_imm(total_frame);
+                self.push_lir(Aarch64Inst::Sub {
+                    size: OperandSize::B64,
+                    src1: Reg::SP,
+                    src2: GpOperand::Imm(total_frame.into()),
+                    dst: Reg::SP,
+                });
                 // stp x29, x30, [sp]
                 self.push_lir(Aarch64Inst::Stp {
                     size: OperandSize::B64,
@@ -482,203 +428,16 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Emit sub sp, sp, #imm handling large immediates
-    fn emit_sub_sp_imm(&mut self, imm: i32) {
-        // AArch64 add/sub immediate can encode values up to 4095 (12 bits)
-        // For larger values, we need multiple instructions or use a register
-        const MAX_IMM12: i32 = 4095;
-
-        if imm <= MAX_IMM12 {
-            self.push_lir(Aarch64Inst::Sub {
-                size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Imm(imm as i64),
-                dst: Reg::SP,
-            });
-        } else if imm <= MAX_IMM12 * 2 {
-            // Two sub instructions for values up to 8190
-            self.push_lir(Aarch64Inst::Sub {
-                size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Imm(MAX_IMM12 as i64),
-                dst: Reg::SP,
-            });
-            self.push_lir(Aarch64Inst::Sub {
-                size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Imm((imm - MAX_IMM12) as i64),
-                dst: Reg::SP,
-            });
-        } else {
-            // For very large values, load into scratch register
-            let scratch = Reg::X9;
-            self.emit_mov_imm(scratch, imm as i64, 64);
-            self.push_lir(Aarch64Inst::Sub {
-                size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Reg(scratch),
-                dst: Reg::SP,
-            });
-        }
-    }
-
-    /// stp/ldp signed-7-bit-scaled immediate range for `size`.
-    /// Returns `(min, max, step)` in bytes.
-    fn pair_offset_range(size: OperandSize) -> (i32, i32, i32) {
-        match size {
-            OperandSize::B32 => (-256, 252, 4),
-            _ => (-512, 504, 8),
-        }
-    }
-
-    /// True if `offset` fits the stp/ldp encoding for `size`.
-    fn pair_offset_fits(offset: i32, size: OperandSize) -> bool {
-        let (min, max, step) = Self::pair_offset_range(size);
-        offset >= min && offset <= max && offset % step == 0
-    }
-
-    /// Emit `dst = base + offset`, picking the cheapest encoding:
-    ///   * add/sub with 12-bit immediate (single instruction);
-    ///   * two add/sub when the offset fits within 2 × 12-bit;
-    ///   * fall back to `mov dst, imm; add dst, base, dst` for the
-    ///     extreme tail.
-    ///
-    /// `dst` must be a register the caller is free to clobber — the
-    /// pair-legalization path passes X16.
-    fn emit_add_offset(&mut self, dst: Reg, base: Reg, offset: i32) {
-        const MAX_IMM12: i32 = 4095;
-        if offset == 0 {
-            self.push_lir(Aarch64Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Reg(base),
-                dst,
-            });
-            return;
-        }
-        let positive = offset >= 0;
-        let abs = offset.unsigned_abs() as i64;
-        if abs <= MAX_IMM12 as i64 {
-            self.push_lir(if positive {
-                Aarch64Inst::Add {
-                    size: OperandSize::B64,
-                    src1: base,
-                    src2: GpOperand::Imm(abs),
-                    dst,
-                }
-            } else {
-                Aarch64Inst::Sub {
-                    size: OperandSize::B64,
-                    src1: base,
-                    src2: GpOperand::Imm(abs),
-                    dst,
-                }
-            });
-        } else if abs <= 2 * MAX_IMM12 as i64 {
-            // Two-step: first to `dst`, then chain to `dst`.
-            self.push_lir(if positive {
-                Aarch64Inst::Add {
-                    size: OperandSize::B64,
-                    src1: base,
-                    src2: GpOperand::Imm(MAX_IMM12 as i64),
-                    dst,
-                }
-            } else {
-                Aarch64Inst::Sub {
-                    size: OperandSize::B64,
-                    src1: base,
-                    src2: GpOperand::Imm(MAX_IMM12 as i64),
-                    dst,
-                }
-            });
-            self.push_lir(if positive {
-                Aarch64Inst::Add {
-                    size: OperandSize::B64,
-                    src1: dst,
-                    src2: GpOperand::Imm(abs - MAX_IMM12 as i64),
-                    dst,
-                }
-            } else {
-                Aarch64Inst::Sub {
-                    size: OperandSize::B64,
-                    src1: dst,
-                    src2: GpOperand::Imm(abs - MAX_IMM12 as i64),
-                    dst,
-                }
-            });
-        } else {
-            self.emit_mov_imm(dst, offset as i64, 64);
-            self.push_lir(Aarch64Inst::Add {
-                size: OperandSize::B64,
-                src1: base,
-                src2: GpOperand::Reg(dst),
-                dst,
-            });
-        }
-    }
-
-    /// If `addr` is a `BaseOffset` with an out-of-range offset,
-    /// materialize `base + offset` into X16 and rewrite the address
-    /// to `[X16]`. Otherwise returns `addr` unchanged.
-    ///
-    /// Convention: X16 is clobbered iff legalization fires. Callers
-    /// must not rely on X16 being alive past the emit_*_legalized
-    /// call. In practice this is fine — the pattern is always
-    /// "compute source addr (may use X16) → load into X9/X10 →
-    /// legalize destination addr (may reuse X16) → store" — the
-    /// source's use of X16 is dead by the time the destination's
-    /// legalization runs.
-    fn legalize_pair_addr(&mut self, size: OperandSize, addr: MemAddr) -> MemAddr {
-        if let MemAddr::BaseOffset { base, offset } = addr {
-            if !Self::pair_offset_fits(offset, size) {
-                self.emit_add_offset(Reg::X16, base, offset);
-                return MemAddr::Base(Reg::X16);
-            }
-        }
-        addr
-    }
-
-    /// Emit `stp src1, src2, addr` with pair-address legalization.
-    pub(super) fn emit_stp_legalized(
-        &mut self,
-        size: OperandSize,
-        src1: Reg,
-        src2: Reg,
-        addr: MemAddr,
-    ) {
-        let addr = self.legalize_pair_addr(size, addr);
-        self.push_lir(Aarch64Inst::Stp {
-            size,
-            src1,
-            src2,
-            addr,
-        });
-    }
-
-    /// Emit `ldp dst1, dst2, addr` with pair-address legalization.
-    pub(super) fn emit_ldp_legalized(
-        &mut self,
-        size: OperandSize,
-        addr: MemAddr,
-        dst1: Reg,
-        dst2: Reg,
-    ) {
-        let addr = self.legalize_pair_addr(size, addr);
-        self.push_lir(Aarch64Inst::Ldp {
-            size,
-            addr,
-            dst1,
-            dst2,
-        });
-    }
-
     /// Zero-initialize the local variable area of the stack frame.
     /// This ensures all stack slots start as zero, so narrow writes (8/16/32-bit)
     /// leave zero in the unwritten upper bytes.
     ///
-    /// For small frames (max offset ≤ 504): uses `stp xzr, xzr, [x29, #offset]`
-    /// (16 bytes per instruction, but signed 7-bit offset limited to [-512, 504]).
-    /// For large frames: uses `str xzr, [x29, #offset]` per qword
-    /// (unsigned 12-bit offset scaled by 8, range [0, 32760]).
+    /// A small area -- one whose last pair store still reaches `x29` with the
+    /// `stp` immediate, [-512, 504] -- is zeroed by unrolled `stp xzr, xzr`.
+    /// Anything larger is a counted loop, so the prologue stays the same size
+    /// whatever the frame is, as x86-64's `rep stosq` does. Unrolling it cost
+    /// one instruction per eight bytes: a gigabyte local was 125 million
+    /// stores, and past 16 MiB the cursor's re-basing `add` did not encode.
     fn zero_stack_frame(&mut self) {
         let alloc_size = self.stack_alloc_size;
         if alloc_size <= 0 {
@@ -714,89 +473,61 @@ impl Aarch64CodeGen {
                 });
             }
         } else {
-            // Large frame: `str xzr` per qword. Its unsigned offset is twelve
-            // bits scaled by eight, so [0, 32760] -- which the comment here
-            // used to call "all practical frames". It is not: three locals of
-            // 9001 bytes reach 27 KB and a 40 KB array goes past it outright,
-            // and the assembler rejects what it cannot encode
-            // (`Error: immediate offset out of range`).
-            //
-            // Past the range, address through a cursor in X16 -- the
-            // documented scratch for exactly this, AAPCS64 IP0, never in the
-            // allocator's palette -- and advance it as the offsets run out.
-            const MAX_STR_OFFSET: i32 = 32760;
-            let mut offset = 0;
-            let mut cursor_base: Option<i32> = None;
-            while offset < alloc_size {
-                let absolute = base_offset + offset;
-                if absolute <= MAX_STR_OFFSET {
-                    self.push_lir(Aarch64Inst::Str {
-                        size: OperandSize::B64,
-                        src: Reg::Xzr,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X29,
-                            offset: absolute,
-                        },
-                    });
-                } else {
-                    // Re-base whenever the remaining displacement would not
-                    // encode, which keeps one `add` per 32 KB rather than one
-                    // per store.
-                    let need_rebase = match cursor_base {
-                        Some(b) => absolute - b > MAX_STR_OFFSET,
-                        None => true,
-                    };
-                    if need_rebase {
-                        self.emit_add_imm_legalized(Reg::X16, Reg::X29, absolute as i64);
-                        cursor_base = Some(absolute);
-                    }
-                    let rel = absolute - cursor_base.unwrap();
-                    self.push_lir(Aarch64Inst::Str {
-                        size: OperandSize::B64,
-                        src: Reg::Xzr,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X16,
-                            offset: rel,
-                        },
-                    });
-                }
-                offset += 8;
-            }
+            self.emit_zero_loop(base_offset, alloc_size);
         }
     }
 
-    /// Emit add sp, sp, #imm handling large immediates
-    fn emit_add_sp_imm(&mut self, imm: i32) {
-        const MAX_IMM12: i32 = 4095;
-
-        if imm <= MAX_IMM12 {
+    /// Zero `[x29 + base_offset, x29 + base_offset + bytes)`, rounded up to a
+    /// whole eightbyte, with a loop.
+    ///
+    /// X16 is the cursor and X17 the end of the paired part. Both are AAPCS64
+    /// intra-procedure scratch and nothing is live in them this early in the
+    /// prologue: the arguments are still in x0-x7 and v0-v7, and x8 holds the
+    /// indirect-result pointer.
+    fn emit_zero_loop(&mut self, base_offset: i32, bytes: i32) {
+        let bytes = (bytes + 7) & !7;
+        let pairs = bytes & !15;
+        self.push_lir(Aarch64Inst::Add {
+            size: OperandSize::B64,
+            src1: Reg::X29,
+            src2: GpOperand::Imm(base_offset.into()),
+            dst: Reg::X16,
+        });
+        if pairs > 0 {
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Imm(imm as i64),
-                dst: Reg::SP,
+                src1: Reg::X16,
+                src2: GpOperand::Imm(pairs.into()),
+                dst: Reg::X17,
             });
-        } else if imm <= MAX_IMM12 * 2 {
-            self.push_lir(Aarch64Inst::Add {
+            let top = self.next_unique_label("zero_frame");
+            self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(top.clone())));
+            self.push_lir(Aarch64Inst::Stp {
                 size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Imm(MAX_IMM12 as i64),
-                dst: Reg::SP,
+                src1: Reg::Xzr,
+                src2: Reg::Xzr,
+                addr: MemAddr::PostIndex {
+                    base: Reg::X16,
+                    offset: 16,
+                },
             });
-            self.push_lir(Aarch64Inst::Add {
+            self.push_lir(Aarch64Inst::Cmp {
                 size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Imm((imm - MAX_IMM12) as i64),
-                dst: Reg::SP,
+                src1: Reg::X16,
+                src2: GpOperand::Reg(Reg::X17),
             });
-        } else {
-            let scratch = Reg::X9;
-            self.emit_mov_imm(scratch, imm as i64, 64);
-            self.push_lir(Aarch64Inst::Add {
+            self.push_lir(Aarch64Inst::BCond {
+                cond: CondCode::Ult,
+                target: top,
+            });
+        }
+        // The eightbyte left over when the area is not a multiple of sixteen;
+        // the cursor already points at it.
+        if bytes > pairs {
+            self.push_lir(Aarch64Inst::Str {
                 size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Reg(scratch),
-                dst: Reg::SP,
+                src: Reg::Xzr,
+                addr: MemAddr::Base(Reg::X16),
             });
         }
     }
@@ -903,23 +634,6 @@ impl Aarch64CodeGen {
                 i += 1;
             }
             offset += 16;
-        }
-    }
-
-    /// Store sret pointer to stack if needed (for large struct returns via X8)
-    fn store_sret_if_needed(&mut self, func: &Function) {
-        if let Some(sret) = func
-            .pseudos
-            .iter()
-            .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"))
-        {
-            if let Some(Loc::Stack(offset)) = self.locations.get_ref(sret.id) {
-                self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B64,
-                    src: Reg::X8,
-                    addr: self.stack_mem(*offset),
-                });
-            }
         }
     }
 
@@ -1104,6 +818,7 @@ impl Aarch64CodeGen {
             .iter()
             .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
         let arg_idx_offset: u32 = if has_sret { 1 } else { 0 };
+        let arg_pseudos = func.arg_pseudos();
 
         for (i, (_name, typ)) in func.params.iter().enumerate() {
             let is_complex = types.is_complex_float(*typ);
@@ -1150,242 +865,230 @@ impl Aarch64CodeGen {
                 None
             };
 
-            // Find the pseudo for this argument
-            for pseudo in &func.pseudos {
-                if let PseudoKind::Arg(arg_idx) = pseudo.kind {
-                    // With sret, params have arg_idx = i + 1, but still use arg_regs[i]
-                    if arg_idx == (i as u32) + arg_idx_offset {
-                        // Skip pseudos already stored via spilled_args
-                        if spilled_pseudos.contains(&pseudo.id) {
-                            // Still need to count this arg for register
-                            // assignment tracking -- including stage C.10's
-                            // rounding, which a run of general registers is
-                            // subject to whether or not there is a store to
-                            // emit for it.
-                            if let Some(count) = fp_reg_count {
-                                fp_arg_idx += count;
-                            } else if is_fp {
-                                fp_arg_idx += 1;
-                            } else {
-                                let n =
-                                    gp_regs.unwrap_or(if types.kind(*typ) == TypeKind::Int128 {
-                                        2
-                                    } else {
-                                        1
-                                    });
-                                int_arg_idx = match crate::abi::aapcs64::gr_run_start(
-                                    types,
-                                    *typ,
-                                    int_arg_idx,
-                                    n,
-                                    arg_regs.len(),
-                                ) {
-                                    Some(start) => start + n,
-                                    None => arg_regs.len(),
-                                };
-                            }
-                            break;
-                        }
-                        if let Some(gp_n) = gp_regs {
-                            let param_name = &func.params[i].0;
-                            let local_off = func
-                                .locals
-                                .get(param_name)
-                                .and_then(|local| self.locations.get_ref(local.sym))
-                                .and_then(|loc| match loc {
-                                    Loc::Stack(off) => Some(*off),
-                                    _ => None,
+            // The pseudo for this argument; each early exit leaves the block.
+            // With sret, params have arg_idx = i + 1, but still use arg_regs[i].
+            'arg: {
+                let Some(pseudo) = arg_pseudos.get(&((i as u32) + arg_idx_offset)) else {
+                    break 'arg;
+                };
+                // Skip pseudos already stored via spilled_args
+                if spilled_pseudos.contains(&pseudo.id) {
+                    // Still need to count this arg for register
+                    // assignment tracking -- including stage C.10's
+                    // rounding, which a run of general registers is
+                    // subject to whether or not there is a store to
+                    // emit for it.
+                    if let Some(count) = fp_reg_count {
+                        fp_arg_idx += count;
+                    } else if is_fp {
+                        fp_arg_idx += 1;
+                    } else {
+                        let n = gp_regs.unwrap_or(if types.kind(*typ) == TypeKind::Int128 {
+                            2
+                        } else {
+                            1
+                        });
+                        int_arg_idx = match crate::abi::aapcs64::gr_run_start(
+                            types,
+                            *typ,
+                            int_arg_idx,
+                            n,
+                            arg_regs.len(),
+                        ) {
+                            Some(start) => start + n,
+                            None => arg_regs.len(),
+                        };
+                    }
+                    break 'arg;
+                }
+                if let Some(gp_n) = gp_regs {
+                    let param_name = &func.params[i].0;
+                    let local_off = func
+                        .locals
+                        .get(param_name)
+                        .and_then(|local| self.locations.get_ref(local.sym))
+                        .and_then(|loc| match loc {
+                            Loc::Stack(off) => Some(*off),
+                            _ => None,
+                        });
+                    // Stage C.10 decides where the run starts: a
+                    // 16-aligned composite skips an odd NGRN. Asking
+                    // only whether `gp_n` registers were left made the
+                    // prologue read a different pair than the caller
+                    // wrote.
+                    let run = crate::abi::aapcs64::gr_run_start(
+                        types,
+                        *typ,
+                        int_arg_idx,
+                        gp_n,
+                        arg_regs.len(),
+                    );
+                    if let Some(start) = run {
+                        int_arg_idx = start;
+                    }
+                    if let Some(local_off) = local_off {
+                        if run.is_some() {
+                            if gp_n == 2 {
+                                self.push_lir(Aarch64Inst::Stp {
+                                    size: OperandSize::B64,
+                                    src1: arg_regs[int_arg_idx],
+                                    src2: arg_regs[int_arg_idx + 1],
+                                    addr: self.stack_mem(local_off),
                                 });
-                            // Stage C.10 decides where the run starts: a
-                            // 16-aligned composite skips an odd NGRN. Asking
-                            // only whether `gp_n` registers were left made the
-                            // prologue read a different pair than the caller
-                            // wrote.
-                            let run = crate::abi::aapcs64::gr_run_start(
-                                types,
-                                *typ,
-                                int_arg_idx,
-                                gp_n,
-                                arg_regs.len(),
-                            );
-                            if let Some(start) = run {
-                                int_arg_idx = start;
-                            }
-                            if let Some(local_off) = local_off {
-                                if run.is_some() {
-                                    if gp_n == 2 {
-                                        self.emit_stp_legalized(
-                                            OperandSize::B64,
-                                            arg_regs[int_arg_idx],
-                                            arg_regs[int_arg_idx + 1],
-                                            self.stack_mem(local_off),
-                                        );
-                                    } else {
-                                        // One register holding the whole value:
-                                        // `_Complex int` is eight bytes.
-                                        self.push_lir(Aarch64Inst::Str {
-                                            size: OperandSize::B64,
-                                            src: arg_regs[int_arg_idx],
-                                            addr: self.stack_mem(local_off),
-                                        });
-                                    }
-                                } else if let Some(&Loc::IncomingArg(incoming)) =
-                                    self.locations.get_ref(pseudo.id)
-                                {
-                                    // Out of registers, so the caller laid the
-                                    // composite in its own frame. The prologue
-                                    // still has to copy it into the local the
-                                    // body reads, exactly as the spilled-HFA
-                                    // case does; without this the parameter was
-                                    // left uninitialized.
-                                    let bytes = crate::abi::slot_bytes(
-                                        types.size_bytes(*typ),
-                                        crate::arch::func_pos(func),
-                                        "a stacked parameter",
-                                    );
-                                    let mut done = 0;
-                                    while done < bytes {
-                                        let chunk = [8, 4, 2, 1]
-                                            .into_iter()
-                                            .find(|c| *c <= bytes - done)
-                                            .unwrap_or(1);
-                                        let size = OperandSize::from_bits(chunk as u32 * 8);
-                                        self.push_lir(Aarch64Inst::Ldr {
-                                            size,
-                                            addr: self.incoming_mem_plus(incoming, done),
-                                            dst: Reg::X16,
-                                        });
-                                        self.push_lir(Aarch64Inst::Str {
-                                            size,
-                                            src: Reg::X16,
-                                            addr: self.stack_mem_plus(local_off, done),
-                                        });
-                                        done += chunk;
-                                    }
-                                }
-                            }
-                            // Stage C.11: an argument that did not fit sets
-                            // NGRN to 8, so nothing after it takes a register.
-                            int_arg_idx = match run {
-                                Some(start) => start + gp_n,
-                                None => arg_regs.len(),
-                            };
-                        } else if let Some(count) = fp_reg_count {
-                            // Complex or HFA argument — `count` consecutive V registers
-                            if fp_arg_idx + count <= fp_arg_regs.len() {
-                                let param_name = &func.params[i].0;
-                                if let Some(local) = func.locals.get(param_name) {
-                                    if let Some(&Loc::Stack(offset)) =
-                                        self.locations.get_ref(local.sym)
-                                    {
-                                        let (fp_size, elem_bytes) =
-                                            self.two_element_fp_info(*typ, types);
-                                        for elem in 0..count {
-                                            self.push_lir(Aarch64Inst::StrFp {
-                                                size: fp_size,
-                                                src: fp_arg_regs[fp_arg_idx + elem],
-                                                addr: self.stack_mem_plus(
-                                                    offset,
-                                                    elem as i32 * elem_bytes,
-                                                ),
-                                            });
-                                        }
-                                    }
-                                }
                             } else {
-                                // AAPCS64 §6.4.2: the argument did not fit in
-                                // the V registers, so the caller laid it on the
-                                // stack. The prologue still has to copy it into
-                                // the parameter's local, which is what the body
-                                // reads. regalloc has already assigned the
-                                // incoming slot; find it and shuttle both
-                                // elements through V16.
-                                self.copy_stacked_fp_elems_to_local(
-                                    func,
-                                    i,
-                                    *typ,
-                                    types,
-                                    pseudo.id,
-                                    count as i32,
-                                );
+                                // One register holding the whole value:
+                                // `_Complex int` is eight bytes.
+                                self.push_lir(Aarch64Inst::Str {
+                                    size: OperandSize::B64,
+                                    src: arg_regs[int_arg_idx],
+                                    addr: self.stack_mem(local_off),
+                                });
                             }
-                            fp_arg_idx += count;
-                        } else if is_fp {
-                            // FP argument
-                            if fp_arg_idx < fp_arg_regs.len() {
-                                if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id)
-                                {
-                                    // From the type, not a `32 or else`
-                                    // guess: `long double` is binary128
-                                    // here, and storing it as a double
-                                    // dropped its top eight bytes, so the
-                                    // *second* such parameter came back
-                                    // truncated while the first, stored
-                                    // elsewhere, was whole.
-                                    let fp_size = FpSize::from_type_or_bits(
-                                        Some(*typ),
-                                        types.size_bits(*typ),
-                                        types,
-                                        &self.base.target,
-                                    );
+                        } else if let Some(&Loc::IncomingArg(incoming)) =
+                            self.locations.get_ref(pseudo.id)
+                        {
+                            // Out of registers, so the caller laid the
+                            // composite in its own frame. The prologue
+                            // still has to copy it into the local the
+                            // body reads, exactly as the spilled-HFA
+                            // case does; without this the parameter was
+                            // left uninitialized.
+                            let bytes = crate::abi::slot_bytes(
+                                types.size_bytes(*typ),
+                                crate::arch::func_pos(func),
+                                "a stacked parameter",
+                            );
+                            let mut done = 0;
+                            while done < bytes {
+                                let chunk = [8, 4, 2, 1]
+                                    .into_iter()
+                                    .find(|c| *c <= bytes - done)
+                                    .unwrap_or(1);
+                                let size = OperandSize::from_bits(chunk as u32 * 8);
+                                self.push_lir(Aarch64Inst::Ldr {
+                                    size,
+                                    addr: self.incoming_mem_plus(incoming, done),
+                                    dst: Reg::X16,
+                                });
+                                self.push_lir(Aarch64Inst::Str {
+                                    size,
+                                    src: Reg::X16,
+                                    addr: self.stack_mem_plus(local_off, done),
+                                });
+                                done += chunk;
+                            }
+                        }
+                    }
+                    // Stage C.11: an argument that did not fit sets
+                    // NGRN to 8, so nothing after it takes a register.
+                    int_arg_idx = match run {
+                        Some(start) => start + gp_n,
+                        None => arg_regs.len(),
+                    };
+                } else if let Some(count) = fp_reg_count {
+                    // Complex or HFA argument — `count` consecutive V registers
+                    if fp_arg_idx + count <= fp_arg_regs.len() {
+                        let param_name = &func.params[i].0;
+                        if let Some(local) = func.locals.get(param_name) {
+                            if let Some(&Loc::Stack(offset)) = self.locations.get_ref(local.sym) {
+                                let (fp_size, elem_bytes) = self.two_element_fp_info(*typ, types);
+                                for elem in 0..count {
                                     self.push_lir(Aarch64Inst::StrFp {
                                         size: fp_size,
-                                        src: fp_arg_regs[fp_arg_idx],
-                                        addr: self.stack_mem(*offset),
+                                        src: fp_arg_regs[fp_arg_idx + elem],
+                                        addr: self.stack_mem_plus(offset, elem as i32 * elem_bytes),
                                     });
                                 }
                             }
-                            fp_arg_idx += 1;
-                        } else if types.kind(*typ) == TypeKind::Int128 {
-                            // __int128 argument — uses TWO consecutive GP registers,
-                            // even-aligned per AAPCS64 stage C.10, so an odd NGRN
-                            // skips one. Asked through the same helper the caller
-                            // and the allocator use: computing the pair here
-                            // independently is how the prologue came to read a
-                            // different pair than the caller wrote.
-                            //
-                            // Store to the arg pseudo's stack slot (allocated in
-                            // allocate_arguments). The IR will Copy from arg
-                            // pseudo → local variable.
-                            if let Some(start) = crate::abi::aapcs64::gr_run_start(
-                                types,
-                                *typ,
-                                int_arg_idx,
-                                2,
-                                arg_regs.len(),
-                            ) {
-                                int_arg_idx = start;
-                                if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id)
-                                {
-                                    self.emit_stp_legalized(
-                                        OperandSize::B64,
-                                        arg_regs[int_arg_idx],
-                                        arg_regs[int_arg_idx + 1],
-                                        self.stack_mem(*offset),
-                                    );
-                                }
-                                int_arg_idx += 2;
-                            } else {
-                                // Stage C.11: NGRN becomes 8.
-                                int_arg_idx = arg_regs.len();
-                            }
-                        } else {
-                            // GP argument
-                            if int_arg_idx < arg_regs.len() {
-                                if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id)
-                                {
-                                    // Move from arg register to stack
-                                    self.push_lir(Aarch64Inst::Str {
-                                        size: OperandSize::B64,
-                                        src: arg_regs[int_arg_idx],
-                                        addr: self.stack_mem(*offset),
-                                    });
-                                }
-                            }
-                            int_arg_idx += 1;
                         }
-                        break;
+                    } else {
+                        // AAPCS64 §6.4.2: the argument did not fit in
+                        // the V registers, so the caller laid it on the
+                        // stack. The prologue still has to copy it into
+                        // the parameter's local, which is what the body
+                        // reads. regalloc has already assigned the
+                        // incoming slot; find it and shuttle both
+                        // elements through V16.
+                        self.copy_stacked_fp_elems_to_local(
+                            func,
+                            i,
+                            *typ,
+                            types,
+                            pseudo.id,
+                            count as i32,
+                        );
                     }
+                    fp_arg_idx += count;
+                } else if is_fp {
+                    // FP argument
+                    if fp_arg_idx < fp_arg_regs.len() {
+                        if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id) {
+                            // From the type, not a `32 or else`
+                            // guess: `long double` is binary128
+                            // here, and storing it as a double
+                            // dropped its top eight bytes, so the
+                            // *second* such parameter came back
+                            // truncated while the first, stored
+                            // elsewhere, was whole.
+                            let fp_size = FpSize::from_type_or_bits(
+                                Some(*typ),
+                                types.size_bits(*typ),
+                                types,
+                                &self.base.target,
+                            );
+                            self.push_lir(Aarch64Inst::StrFp {
+                                size: fp_size,
+                                src: fp_arg_regs[fp_arg_idx],
+                                addr: self.stack_mem(*offset),
+                            });
+                        }
+                    }
+                    fp_arg_idx += 1;
+                } else if types.kind(*typ) == TypeKind::Int128 {
+                    // __int128 argument — uses TWO consecutive GP registers,
+                    // even-aligned per AAPCS64 stage C.10, so an odd NGRN
+                    // skips one. Asked through the same helper the caller
+                    // and the allocator use: computing the pair here
+                    // independently is how the prologue came to read a
+                    // different pair than the caller wrote.
+                    //
+                    // Store to the arg pseudo's stack slot (allocated in
+                    // allocate_arguments). The IR will Copy from arg
+                    // pseudo → local variable.
+                    if let Some(start) = crate::abi::aapcs64::gr_run_start(
+                        types,
+                        *typ,
+                        int_arg_idx,
+                        2,
+                        arg_regs.len(),
+                    ) {
+                        int_arg_idx = start;
+                        if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id) {
+                            self.push_lir(Aarch64Inst::Stp {
+                                size: OperandSize::B64,
+                                src1: arg_regs[int_arg_idx],
+                                src2: arg_regs[int_arg_idx + 1],
+                                addr: self.stack_mem(*offset),
+                            });
+                        }
+                        int_arg_idx += 2;
+                    } else {
+                        // Stage C.11: NGRN becomes 8.
+                        int_arg_idx = arg_regs.len();
+                    }
+                } else {
+                    // GP argument
+                    if int_arg_idx < arg_regs.len() {
+                        if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id) {
+                            // Move from arg register to stack
+                            self.push_lir(Aarch64Inst::Str {
+                                size: OperandSize::B64,
+                                src: arg_regs[int_arg_idx],
+                                addr: self.stack_mem(*offset),
+                            });
+                        }
+                    }
+                    int_arg_idx += 1;
                 }
             }
         }
@@ -1761,7 +1464,12 @@ impl Aarch64CodeGen {
                 let loc = self.get_location(src);
                 if let Loc::Stack(offset) = loc {
                     let mem = self.stack_mem(offset);
-                    self.emit_ldp_legalized(OperandSize::B64, mem, Reg::X0, Reg::X1);
+                    self.push_lir(Aarch64Inst::Ldp {
+                        size: OperandSize::B64,
+                        addr: mem,
+                        dst1: Reg::X0,
+                        dst2: Reg::X1,
+                    });
                 } else {
                     // Fallback: load lo half to X0, zero X1
                     self.emit_move(src, Reg::X0, 64);
@@ -1874,7 +1582,12 @@ impl Aarch64CodeGen {
                 dst2: Reg::lr(),
             });
             // add sp, sp, #dealloc
-            self.emit_add_sp_imm(dealloc);
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: Reg::SP,
+                src2: GpOperand::Imm(dealloc.into()),
+                dst: Reg::SP,
+            });
         }
         self.push_lir(Aarch64Inst::Ret);
     }

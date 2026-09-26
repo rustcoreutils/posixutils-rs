@@ -25,7 +25,6 @@ use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, X86Inst, X87BinOp};
 use super::regalloc::{Loc, Reg, X87_SCRATCH_BYTES};
 use crate::arch::lir::{CondCode, Directive, Label, OperandSize};
-use crate::ir::PseudoKind;
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeKind, TypeTable};
 
@@ -79,7 +78,7 @@ impl X86_64CodeGen {
                 // addr is a pointer in a register
                 MemAddr::BaseOffset {
                     base: r,
-                    offset: insn.offset as i32,
+                    offset: insn.displacement(),
                 }
             }
             Loc::Stack(offset) => {
@@ -89,13 +88,9 @@ impl X86_64CodeGen {
                 // in the second case read the pointer bits as a float — which
                 // is where the NaNs came from — and at a non-zero offset read
                 // past the frame entirely.
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(addr);
                 if is_symbol {
-                    self.stack_field(offset, insn.offset as i32)
+                    self.stack_field(offset, insn.displacement())
                 } else {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
@@ -104,38 +99,17 @@ impl X86_64CodeGen {
                     });
                     MemAddr::BaseOffset {
                         base: Reg::R11,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     }
                 }
             }
-            Loc::Global(name) => {
-                // For globals, use RIP-relative addressing
-                if self.needs_got_access(&name) {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::GotPcrel(
-                            crate::arch::lir::Symbol::extern_sym(name.clone()),
-                        )),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    MemAddr::BaseOffset {
-                        base: Reg::R11,
-                        offset: insn.offset as i32,
-                    }
-                } else {
-                    MemAddr::RipRelative(crate::arch::lir::Symbol {
-                        name,
-                        is_local: false,
-                        is_extern: false,
-                    })
-                }
-            }
+            Loc::Global(name) => self.global_mem(&name, insn.displacement(), Reg::R11),
             _ => {
                 // Load address into R11
                 self.emit_move(addr, Reg::R11, 64);
                 MemAddr::BaseOffset {
                     base: Reg::R11,
-                    offset: insn.offset as i32,
+                    offset: insn.displacement(),
                 }
             }
         };
@@ -238,7 +212,7 @@ impl X86_64CodeGen {
                 // addr is a pointer in a register
                 MemAddr::BaseOffset {
                     base: r,
-                    offset: insn.offset as i32,
+                    offset: insn.displacement(),
                 }
             }
             Loc::Stack(offset) => {
@@ -250,13 +224,9 @@ impl X86_64CodeGen {
                 // and, at a non-zero offset, past the end of the frame into
                 // the caller's. That is what made a `long double _Complex`
                 // return corrupt the stack.
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == addr)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(addr);
                 if is_symbol {
-                    self.stack_field(offset, insn.offset as i32)
+                    self.stack_field(offset, insn.displacement())
                 } else {
                     // Load the pointer, then address through it.
                     self.push_lir(X86Inst::Mov {
@@ -266,36 +236,16 @@ impl X86_64CodeGen {
                     });
                     MemAddr::BaseOffset {
                         base: Reg::R11,
-                        offset: insn.offset as i32,
+                        offset: insn.displacement(),
                     }
                 }
             }
-            Loc::Global(name) => {
-                if self.needs_got_access(&name) {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::GotPcrel(
-                            crate::arch::lir::Symbol::extern_sym(name.clone()),
-                        )),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    MemAddr::BaseOffset {
-                        base: Reg::R11,
-                        offset: insn.offset as i32,
-                    }
-                } else {
-                    MemAddr::RipRelative(crate::arch::lir::Symbol {
-                        name,
-                        is_local: false,
-                        is_extern: false,
-                    })
-                }
-            }
+            Loc::Global(name) => self.global_mem(&name, insn.displacement(), Reg::R11),
             _ => {
                 self.emit_move(addr, Reg::R11, 64);
                 MemAddr::BaseOffset {
                     base: Reg::R11,
-                    offset: insn.offset as i32,
+                    offset: insn.displacement(),
                 }
             }
         };
@@ -506,11 +456,7 @@ impl X86_64CodeGen {
                 // different address entirely. A stacked aggregate argument
                 // passed from such a frame then copied from a garbage pointer.
                 let addr = self.stack_mem(offset);
-                let is_symbol = self
-                    .pseudos
-                    .iter()
-                    .find(|p| p.id == pseudo)
-                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+                let is_symbol = self.pseudos.is_sym(pseudo);
                 if is_symbol {
                     // The slot *is* the storage: take its address.
                     self.push_lir(X86Inst::Lea {
@@ -578,7 +524,7 @@ impl X86_64CodeGen {
                 // the 53rd significand bit are different constants, and an
                 // f64-derived key silently merged them into one.
                 let label_bits = v.pool_key();
-                let temp_label = format!(".Lld_const_{}", label_bits);
+                let temp_label = crate::arch::lir::internal_label("ld_const", label_bits);
 
                 let ld_bytes = v.to_x87_bytes();
                 self.ld_constants.insert(label_bits, ld_bytes);
@@ -723,7 +669,7 @@ impl X86_64CodeGen {
                     // double is both correct and lossless.
                     let val = val.to_f64();
                     let bits = val.to_bits();
-                    let label = format!(".Ldbl_const_{}", bits);
+                    let label = crate::arch::lir::internal_label("dbl_const", bits);
                     self.double_constants.insert(bits, val);
                     load_as_float = false;
                     MemAddr::RipRelative(crate::arch::lir::Symbol::local(label))
@@ -958,8 +904,8 @@ impl X86_64CodeGen {
         if dst_size > 32 {
             let uid = self.unique_label_counter;
             self.unique_label_counter += 1;
-            let big_label = Label::new(&self.base.current_fn, 10000 + uid * 2);
-            let done_label = Label::new(&self.base.current_fn, 10000 + uid * 2 + 1);
+            let big_label = Label::block(&self.base.current_fn, 10000 + uid * 2);
+            let done_label = Label::block(&self.base.current_fn, 10000 + uid * 2 + 1);
 
             self.push_lir(X86Inst::MovAbs {
                 imm: TWO_POW_63_BITS,

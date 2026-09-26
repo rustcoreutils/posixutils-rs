@@ -15,7 +15,6 @@ use super::ast::Expr;
 use super::declaration::SpecContext;
 use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::strings::StringId;
-use crate::token::lexer::TokenType;
 use crate::types::TypeId;
 
 impl Parser<'_> {
@@ -90,10 +89,7 @@ impl Parser<'_> {
     /// `typeof` needs its `(`, since gcc lets a C17 program use the word as an
     /// ordinary identifier.
     pub(crate) fn starts_type_name(&self) -> bool {
-        if self.peek() != TokenType::Ident {
-            return false;
-        }
-        let Some(id) = self.get_ident_id(self.current()) else {
+        let Some(id) = self.current_ident() else {
             return false;
         };
         if matches!(

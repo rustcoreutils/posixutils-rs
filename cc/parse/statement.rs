@@ -18,49 +18,47 @@ use gettextrs::gettext;
 impl Parser<'_> {
     pub fn parse_statement(&mut self) -> ParseResult<Stmt> {
         // Check for keywords
-        if self.peek() == TokenType::Ident {
-            if let Some(name_id) = self.get_ident_id(self.current()) {
-                match name_id {
-                    crate::kw::IF => return self.parse_if_stmt(),
-                    crate::kw::WHILE => return self.parse_while_stmt(),
-                    crate::kw::DO => return self.parse_do_while_stmt(),
-                    crate::kw::FOR => return self.parse_for_stmt(),
-                    crate::kw::RETURN => return self.parse_return_stmt(),
-                    crate::kw::BREAK => {
-                        let pos = self.current_pos();
-                        self.advance();
-                        self.expect_special(b';')?;
-                        return Ok(Stmt::Break(pos));
-                    }
-                    crate::kw::CONTINUE => {
-                        let pos = self.current_pos();
-                        self.advance();
-                        self.expect_special(b';')?;
-                        return Ok(Stmt::Continue(pos));
-                    }
-                    crate::kw::GOTO => {
-                        let pos = self.current_pos();
-                        self.advance();
-                        // GNU computed goto: `goto *expr;`
-                        if self.is_special(b'*') {
-                            self.advance();
-                            let target = self.parse_expression()?;
-                            self.expect_special(b';')?;
-                            return Ok(Stmt::GotoIndirect { target, pos });
-                        }
-                        let name = self.expect_identifier()?;
-                        self.expect_special(b';')?;
-                        return Ok(Stmt::Goto { name, pos });
-                    }
-                    crate::kw::SWITCH => return self.parse_switch_stmt(),
-                    crate::kw::CASE => return self.parse_case_label(),
-                    crate::kw::DEFAULT => return self.parse_default_label(),
-                    // GCC extended inline assembly
-                    crate::kw::ASM | crate::kw::GNU_ASM | crate::kw::GNU_ASM2 => {
-                        return self.parse_asm_statement();
-                    }
-                    _ => {}
+        if let Some(name_id) = self.current_ident() {
+            match name_id {
+                crate::kw::IF => return self.parse_if_stmt(),
+                crate::kw::WHILE => return self.parse_while_stmt(),
+                crate::kw::DO => return self.parse_do_while_stmt(),
+                crate::kw::FOR => return self.parse_for_stmt(),
+                crate::kw::RETURN => return self.parse_return_stmt(),
+                crate::kw::BREAK => {
+                    let pos = self.current_pos();
+                    self.advance();
+                    self.expect_special(b';')?;
+                    return Ok(Stmt::Break(pos));
                 }
+                crate::kw::CONTINUE => {
+                    let pos = self.current_pos();
+                    self.advance();
+                    self.expect_special(b';')?;
+                    return Ok(Stmt::Continue(pos));
+                }
+                crate::kw::GOTO => {
+                    let pos = self.current_pos();
+                    self.advance();
+                    // GNU computed goto: `goto *expr;`
+                    if self.is_special(b'*') {
+                        self.advance();
+                        let target = self.parse_expression()?;
+                        self.expect_special(b';')?;
+                        return Ok(Stmt::GotoIndirect { target, pos });
+                    }
+                    let name = self.expect_identifier()?;
+                    self.expect_special(b';')?;
+                    return Ok(Stmt::Goto { name, pos });
+                }
+                crate::kw::SWITCH => return self.parse_switch_stmt(),
+                crate::kw::CASE => return self.parse_case_label(),
+                crate::kw::DEFAULT => return self.parse_default_label(),
+                // GCC extended inline assembly
+                crate::kw::ASM | crate::kw::GNU_ASM | crate::kw::GNU_ASM2 => {
+                    return self.parse_asm_statement();
+                }
+                _ => {}
             }
         }
 
@@ -142,17 +140,9 @@ impl Parser<'_> {
         self.expect_special(b')')?;
         let then_stmt = self.parse_substatement()?;
 
-        let else_stmt = if self.peek() == TokenType::Ident {
-            if let Some(name_id) = self.get_ident_id(self.current()) {
-                if name_id == crate::kw::ELSE {
-                    self.advance();
-                    Some(Box::new(self.parse_substatement()?))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+        let else_stmt = if self.is_keyword(crate::kw::ELSE) {
+            self.advance();
+            Some(Box::new(self.parse_substatement()?))
         } else {
             None
         };
@@ -190,13 +180,8 @@ impl Parser<'_> {
         let body = self.parse_substatement()?;
 
         // Expect 'while'
-        if self.peek() != TokenType::Ident {
+        if !self.is_keyword(crate::kw::WHILE) {
             return Err(ParseError::new("expected 'while'", self.current_pos()));
-        }
-        if let Some(name) = self.get_ident_name(self.current()) {
-            if name != "while" {
-                return Err(ParseError::new("expected 'while'", self.current_pos()));
-            }
         }
         self.advance();
 

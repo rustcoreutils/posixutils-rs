@@ -397,14 +397,8 @@ impl fmt::Display for AttributeList {
 impl Parser<'_> {
     /// Check if current token is __attribute__ or __attribute
     pub(super) fn is_attribute_keyword(&self) -> bool {
-        if self.peek() != TokenType::Ident {
-            return false;
-        }
-        if let Some(id) = self.get_ident_id(self.current()) {
-            crate::kw::has_tag(id, crate::kw::ATTR_KW)
-        } else {
-            false
-        }
+        self.current_ident()
+            .is_some_and(|id| crate::kw::has_tag(id, crate::kw::ATTR_KW))
     }
 
     /// Skip to the `,` or `)` that ends the attribute argument at hand,
@@ -462,7 +456,7 @@ impl Parser<'_> {
         // complaint -- "requested alignment '0'" for `aligned(foo)`.
         let undeclared = self.at_bare_attribute_name()
             && self
-                .get_ident_id(self.current())
+                .current_ident()
                 .is_some_and(|id| self.symbols.lookup_id(id, Namespace::Ordinary).is_none());
         let expr = match self.parse_assignment_expr() {
             Ok(expr) => expr,
@@ -587,7 +581,7 @@ impl Parser<'_> {
         }
 
         let pos = self.current_pos();
-        let id = self.get_ident_id(self.current());
+        let id = self.current_ident();
         let name = self.get_ident_name(self.current())?;
         self.advance();
 
@@ -693,10 +687,8 @@ impl Parser<'_> {
 
     /// Check if current token is a C11 nullability qualifier
     fn is_nullability_qualifier(&self) -> bool {
-        self.peek() == TokenType::Ident
-            && self
-                .get_ident_id(self.current())
-                .is_some_and(super::is_nullability_qualifier)
+        self.current_ident()
+            .is_some_and(super::is_nullability_qualifier)
     }
     /// The memory effect pending for the declarator being built, consumed.
     ///

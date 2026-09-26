@@ -372,6 +372,20 @@ impl<'a> Parser<'a> {
         self.current().typ
     }
 
+    /// The interned name of the current token when it is an identifier.
+    ///
+    /// Keywords, typedef names and ordinary names are all identifiers to the
+    /// lexer, so this answers for every one of them; the caller decides which
+    /// ids it is looking for.
+    pub(super) fn current_ident(&self) -> Option<StringId> {
+        self.get_ident_id(self.current())
+    }
+
+    /// Whether the current token is the identifier `kw`.
+    pub(super) fn is_keyword(&self, kw: StringId) -> bool {
+        self.current_ident() == Some(kw)
+    }
+
     /// Whether the token *after* the current one is `(`.
     ///
     /// Used to tell a keyword being applied from the same word being used as
@@ -481,18 +495,16 @@ impl<'a> Parser<'a> {
     /// spelled with a word that is reserved here. Only a *declarator* name is
     /// constrained, so only the declarator sites use this.
     pub(super) fn expect_declarator_name(&mut self) -> ParseResult<StringId> {
-        if self.peek() == TokenType::Ident {
-            if let Some(id) = self.get_ident_id(self.current()) {
-                if crate::kw::has_tag(id, crate::kw::RESERVED_NAME) {
-                    let pos = self.current_pos();
-                    return Err(ParseError::new(
-                        format!(
-                            "'{}' is a keyword and cannot be used as a name",
-                            self.str(id)
-                        ),
-                        pos,
-                    ));
-                }
+        if let Some(id) = self.current_ident() {
+            if crate::kw::has_tag(id, crate::kw::RESERVED_NAME) {
+                let pos = self.current_pos();
+                return Err(ParseError::new(
+                    format!(
+                        "'{}' is a keyword and cannot be used as a name",
+                        self.str(id)
+                    ),
+                    pos,
+                ));
             }
         }
         self.expect_identifier()
@@ -628,19 +640,14 @@ impl<'a> Parser<'a> {
 
 impl Parser<'_> {
     pub(super) fn is_declaration_start(&self) -> bool {
-        if self.peek() != TokenType::Ident {
+        let Some(name_id) = self.current_ident() else {
             return false;
+        };
+        if crate::kw::has_tag(name_id, crate::kw::DECL_START) {
+            return true;
         }
-
-        if let Some(name_id) = self.get_ident_id(self.current()) {
-            if crate::kw::has_tag(name_id, crate::kw::DECL_START) {
-                return true;
-            }
-            // Also check for typedef names
-            self.symbols.lookup_typedef(name_id).is_some()
-        } else {
-            false
-        }
+        // Also check for typedef names
+        self.symbols.lookup_typedef(name_id).is_some()
     }
 
     /// The `f64` value of a constant floating subexpression.

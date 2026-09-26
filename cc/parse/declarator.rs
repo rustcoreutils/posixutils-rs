@@ -54,10 +54,7 @@ impl Parser<'_> {
     /// as the identifier.
     pub(super) fn parse_pointer_qualifiers(&mut self) -> TypeModifiers {
         let mut modifiers = TypeModifiers::empty();
-        while self.peek() == TokenType::Ident {
-            let Some(name_id) = self.get_ident_id(self.current()) else {
-                break;
-            };
+        while let Some(name_id) = self.current_ident() {
             match name_id {
                 crate::kw::ATOMIC => modifiers |= TypeModifiers::ATOMIC,
                 // Every spelling of the three CV qualifiers, from the one
@@ -273,10 +270,7 @@ impl Parser<'_> {
         // C17 6.7.6.2p1: the optional type qualifiers and `static` belong to
         // the declaration of a function parameter -- `_Atomic` among them.
         let mut qualified = false;
-        while self.peek() == TokenType::Ident {
-            let Some(name_id) = self.get_ident_id(self.current()) else {
-                break;
-            };
+        while let Some(name_id) = self.current_ident() {
             match name_id {
                 crate::kw::STATIC | crate::kw::ATOMIC => {}
                 _ if super::cv_qualifier_modifier(name_id).is_some() => {}
@@ -469,22 +463,18 @@ impl Parser<'_> {
         }
 
         // Check for (void)
-        if self.peek() == TokenType::Ident {
-            if let Some(name_id) = self.get_ident_id(self.current()) {
-                if name_id == crate::kw::VOID {
-                    let saved_pos = self.pos;
-                    self.advance();
-                    if self.is_special(b')') {
-                        return Ok(ParameterList {
-                            params,
-                            variadic,
-                            prototyped: true,
-                        });
-                    }
-                    // Not just void, backtrack
-                    self.pos = saved_pos;
-                }
+        if self.is_keyword(crate::kw::VOID) {
+            let saved_pos = self.pos;
+            self.advance();
+            if self.is_special(b')') {
+                return Ok(ParameterList {
+                    params,
+                    variadic,
+                    prototyped: true,
+                });
             }
+            // Not just void, backtrack
+            self.pos = saved_pos;
         }
 
         loop {

@@ -19,14 +19,8 @@ use crate::types::TypeModifiers;
 impl Parser<'_> {
     /// Check if current token is __asm or __asm__
     pub(super) fn is_asm_keyword(&self) -> bool {
-        if self.peek() != TokenType::Ident {
-            return false;
-        }
-        if let Some(id) = self.get_ident_id(self.current()) {
-            crate::kw::has_tag(id, crate::kw::ASM_KW)
-        } else {
-            false
-        }
+        self.current_ident()
+            .is_some_and(|id| crate::kw::has_tag(id, crate::kw::ASM_KW))
     }
 
     /// Parse `__asm("name")` / `__asm__("name")` on a declaration: a GCC asm
@@ -148,24 +142,20 @@ impl Parser<'_> {
         // Parse optional qualifiers: 'volatile', '__volatile__', 'inline', '__inline__', 'goto'
         let mut is_volatile = false;
         let mut _is_goto = false;
-        while self.peek() == TokenType::Ident {
-            if let Some(name_id) = self.get_ident_id(self.current()) {
-                match name_id {
-                    crate::kw::VOLATILE | crate::kw::GNU_VOLATILE => {
-                        is_volatile = true;
-                        self.advance();
-                    }
-                    crate::kw::INLINE | crate::kw::GNU_INLINE => {
-                        self.advance();
-                    }
-                    crate::kw::GOTO => {
-                        _is_goto = true;
-                        self.advance();
-                    }
-                    _ => break,
+        while let Some(name_id) = self.current_ident() {
+            match name_id {
+                crate::kw::VOLATILE | crate::kw::GNU_VOLATILE => {
+                    is_volatile = true;
+                    self.advance();
                 }
-            } else {
-                break;
+                crate::kw::INLINE | crate::kw::GNU_INLINE => {
+                    self.advance();
+                }
+                crate::kw::GOTO => {
+                    _is_goto = true;
+                    self.advance();
+                }
+                _ => break,
             }
         }
 

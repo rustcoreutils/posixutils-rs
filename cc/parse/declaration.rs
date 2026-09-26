@@ -18,7 +18,7 @@ use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind};
-use crate::token::lexer::{Position, TokenType};
+use crate::token::lexer::Position;
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use gettextrs::gettext;
 
@@ -675,15 +675,7 @@ impl<'a> Parser<'a> {
         // Skip any leading __attribute__
         self.skip_extensions();
 
-        loop {
-            if self.peek() != TokenType::Ident {
-                break;
-            }
-
-            let name_id = match self.get_ident_id(self.current()) {
-                Some(id) => id,
-                None => break,
-            };
+        while let Some(name_id) = self.current_ident() {
             let pos = self.current_pos();
             match name_id {
                 // An attribute can sit anywhere among the specifiers and goes
@@ -1104,9 +1096,7 @@ impl<'a> Parser<'a> {
         if ctx == SpecContext::Declaration {
             return false;
         }
-        let spelled = self
-            .get_ident_id(self.current())
-            .map_or("", |id| self.idents.get(id));
+        let spelled = self.current_ident().map_or("", |id| self.idents.get(id));
         diag::error_args(
             self.current_pos(),
             "expected specifier-qualifier-list before '{0}'",

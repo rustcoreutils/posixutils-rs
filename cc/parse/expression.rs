@@ -806,57 +806,55 @@ impl<'a> Parser<'a> {
         }
 
         // sizeof and _Alignof
-        if self.peek() == TokenType::Ident {
-            if let Some(name_id) = self.get_ident_id(self.current()) {
-                if name_id == crate::kw::SIZEOF {
-                    self.advance();
-                    return self.parse_sizeof();
-                }
-                if matches!(
-                    name_id,
-                    crate::kw::ALIGNOF
-                        | crate::kw::GNU_ALIGNOF
-                        | crate::kw::GNU_ALIGNOF2
-                        | crate::kw::ALIGNOF_C23
-                ) && !self.builtin_is_shadowed(name_id)
-                {
-                    self.advance();
-                    return self.parse_alignof();
-                }
-                // GCC's `__real__` / `__imag__`. The result type is the
-                // operand's base type when it is complex, and the operand's own
-                // type otherwise -- gcc accepts both, and `__real__` of a real
-                // value is that value.
-                if matches!(
-                    name_id,
-                    crate::kw::REAL_KW
-                        | crate::kw::REAL_KW_SHORT
-                        | crate::kw::IMAG_KW
-                        | crate::kw::IMAG_KW_SHORT
-                ) {
-                    let is_real = matches!(name_id, crate::kw::REAL_KW | crate::kw::REAL_KW_SHORT);
-                    let op_pos = self.current_pos();
-                    self.advance();
-                    let operand = self.parse_unary_expr()?;
-                    let op_typ = operand.typ.unwrap_or(self.types.double_id);
-                    let result_typ = if self.types.is_complex(op_typ) {
-                        self.types.complex_base(op_typ)
-                    } else {
-                        op_typ
-                    };
-                    return Ok(Expr::typed(
-                        ExprKind::Unary {
-                            op: if is_real {
-                                UnaryOp::Real
-                            } else {
-                                UnaryOp::Imag
-                            },
-                            operand: Box::new(operand),
+        if let Some(name_id) = self.current_ident() {
+            if name_id == crate::kw::SIZEOF {
+                self.advance();
+                return self.parse_sizeof();
+            }
+            if matches!(
+                name_id,
+                crate::kw::ALIGNOF
+                    | crate::kw::GNU_ALIGNOF
+                    | crate::kw::GNU_ALIGNOF2
+                    | crate::kw::ALIGNOF_C23
+            ) && !self.builtin_is_shadowed(name_id)
+            {
+                self.advance();
+                return self.parse_alignof();
+            }
+            // GCC's `__real__` / `__imag__`. The result type is the
+            // operand's base type when it is complex, and the operand's own
+            // type otherwise -- gcc accepts both, and `__real__` of a real
+            // value is that value.
+            if matches!(
+                name_id,
+                crate::kw::REAL_KW
+                    | crate::kw::REAL_KW_SHORT
+                    | crate::kw::IMAG_KW
+                    | crate::kw::IMAG_KW_SHORT
+            ) {
+                let is_real = matches!(name_id, crate::kw::REAL_KW | crate::kw::REAL_KW_SHORT);
+                let op_pos = self.current_pos();
+                self.advance();
+                let operand = self.parse_unary_expr()?;
+                let op_typ = operand.typ.unwrap_or(self.types.double_id);
+                let result_typ = if self.types.is_complex(op_typ) {
+                    self.types.complex_base(op_typ)
+                } else {
+                    op_typ
+                };
+                return Ok(Expr::typed(
+                    ExprKind::Unary {
+                        op: if is_real {
+                            UnaryOp::Real
+                        } else {
+                            UnaryOp::Imag
                         },
-                        result_typ,
-                        op_pos,
-                    ));
-                }
+                        operand: Box::new(operand),
+                    },
+                    result_typ,
+                    op_pos,
+                ));
             }
         }
 
@@ -873,7 +871,7 @@ impl<'a> Parser<'a> {
     /// The caller has already consumed `sizeof`'s own `(`.
     fn try_parse_sizeof_typeof_operand(&mut self) -> ParseResult<Option<Expr>> {
         let saved = self.pos;
-        let is_typeof = self.get_ident_id(self.current()).is_some_and(|id| {
+        let is_typeof = self.current_ident().is_some_and(|id| {
             matches!(
                 id,
                 crate::kw::TYPEOF | crate::kw::GNU_TYPEOF | crate::kw::GNU_TYPEOF2
@@ -1533,7 +1531,7 @@ impl<'a> Parser<'a> {
         }
 
         let id = self
-            .get_ident_id(self.current())
+            .current_ident()
             .ok_or_else(|| ParseError::new("invalid identifier", self.current_pos()))?;
 
         self.advance();
@@ -1924,10 +1922,7 @@ impl<'a> Parser<'a> {
         loop {
             let assoc_pos = self.current_pos();
 
-            let is_default = self.peek() == TokenType::Ident
-                && self.get_ident_id(self.current()) == Some(crate::kw::DEFAULT);
-
-            if is_default {
+            if self.is_keyword(crate::kw::DEFAULT) {
                 self.advance();
                 self.expect_special(b':')?;
                 let expr = self.parse_assignment_expr()?;

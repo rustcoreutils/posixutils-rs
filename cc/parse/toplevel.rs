@@ -72,14 +72,8 @@ impl Parser<'_> {
 
     /// Check if current token is _Static_assert or static_assert
     pub(super) fn is_static_assert(&self) -> bool {
-        if self.peek() != TokenType::Ident {
-            return false;
-        }
-        if let Some(id) = self.get_ident_id(self.current()) {
-            crate::kw::has_tag(id, crate::kw::ASSERT_KW)
-        } else {
-            false
-        }
+        self.current_ident()
+            .is_some_and(|id| crate::kw::has_tag(id, crate::kw::ASSERT_KW))
     }
 
     /// Parse _Static_assert(constant-expression, string-literal);

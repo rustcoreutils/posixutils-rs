@@ -7601,7 +7601,10 @@ fn test_alias_declarations_become_symbol_aliases() {
                int g(void) __attribute__((alias(\"f\"), visibility(\"hidden\")));\n\
                int h(void) __attribute__((alias(\"g\")));\n\
                int use(void) { return b[0] + g(); }\n";
-    let module = linearize_source(src, &Target::host());
+    // An ELF target: Mach-O has no aliases, and a Darwin host would reject
+    // every one of these before recording it.
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let module = linearize_source(src, &target);
     let alias = |name: &str, target: &str, is_static: bool, weak: bool, vis: Option<&str>| {
         crate::ir::SymbolAlias {
             name: name.to_string(),

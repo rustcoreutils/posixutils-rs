@@ -6146,6 +6146,9 @@ fn diagnostics_include_note_names_its_own_translation_unit() {
 /// unit, of the same kind, and the alias must not also be defined normally.
 /// Each is a program gcc rejects; emitting it anyway gives an assembler error
 /// at best and, for a second definition, silently drops one of the two.
+// Mach-O has no symbol aliases, so c17 rejects `alias` on a Darwin host
+// (`diagnostics_alias_attribute_unsupported_on_darwin` covers that side).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn diagnostics_alias_attribute() {
     compile_expect_error(

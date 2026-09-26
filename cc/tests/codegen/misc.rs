@@ -14543,9 +14543,14 @@ fn codegen_asm_renamed_library_function_is_honoured() {
 typedef __SIZE_TYPE__ size_t;
 /* The copies below are byte-wise through volatile, or an optimizer turns the
    loop back into a memcpy call -- which the rename makes a call to itself. */
-extern void *memcpy(void *, const void *, size_t) __asm("my_memcpy");
-extern void *memset(void *, int, size_t) __asm("my_memset");
-extern void *memmove(void *, const void *, size_t) __asm("my_memmove");
+/* An asm label is the assembler name itself: spell the target's C prefix,
+   empty on ELF and "_" on Mach-O, as the torture test does. */
+#define XSTR(s) #s
+#define STR(s) XSTR(s)
+#define ASMNAME(cname) __asm(STR(__USER_LABEL_PREFIX__) cname)
+extern void *memcpy(void *, const void *, size_t) ASMNAME("my_memcpy");
+extern void *memset(void *, int, size_t) ASMNAME("my_memset");
+extern void *memmove(void *, const void *, size_t) ASMNAME("my_memmove");
 
 int calls;
 
@@ -14595,6 +14600,9 @@ int main(void)
 /// functions, a static target reached only through its alias, a static alias,
 /// a weak alias, an alias of an alias, and -- the part an optimizer can get
 /// wrong -- a store through one name read back through the other.
+// Mach-O has no symbol aliases, so c17 rejects `alias` on a Darwin host
+// (`diagnostics_alias_attribute_unsupported_on_darwin` covers that side).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn codegen_alias_attribute() {
     let src = r#"
@@ -14658,6 +14666,9 @@ int main(void)
 /// a call through a function alias reaches the target, and a *weak* alias
 /// gives way to a strong definition elsewhere while the target keeps its own
 /// name.
+// Mach-O has no symbol aliases, so c17 rejects `alias` on a Darwin host
+// (`diagnostics_alias_attribute_unsupported_on_darwin` covers that side).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn codegen_alias_attribute_across_units() {
     let unit_a = r#"
@@ -14705,6 +14716,9 @@ int main(void)
 /// alias: the body is there to inline, and the alias is what an out-of-line
 /// call or the function's address reaches. gcc.c-torture `compile/20011119-1`
 /// and `-2` are this shape, which c17 first rejected as a name defined twice.
+// Mach-O has no symbol aliases, so c17 rejects `alias` on a Darwin host
+// (`diagnostics_alias_attribute_unsupported_on_darwin` covers that side).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn codegen_alias_beside_inline_definition() {
     let src = r#"

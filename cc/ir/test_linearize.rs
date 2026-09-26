@@ -7073,3 +7073,39 @@ fn test_asm_memory_operand_names_its_object() {
         "the operand's address arithmetic should be gone"
     );
 }
+
+/// Parse `src` and linearize it for `target`.
+fn linearize_source(src: &str, target: &Target) -> Module {
+    let mut strings = StringTable::new();
+    let mut tokenizer = crate::token::lexer::Tokenizer::new(src.as_bytes(), 0, &mut strings);
+    let tokens = tokenizer.tokenize();
+    let mut symbols = crate::symbol::SymbolTable::new();
+    let mut types = TypeTable::new(target);
+    let tu = {
+        let mut parser =
+            crate::parse::Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+        parser.parse_translation_unit().expect("parse")
+    };
+    linearize(&tu, &symbols, &types, &strings, target, false)
+}
+
+/// AAPCS64 B.4 passes a composite over sixteen bytes as a pointer to a copy
+/// the caller makes; System V puts the bytes themselves in the argument area.
+/// So only the aarch64 lowering copies the argument into a frame temporary
+/// before the call -- and passes that temporary's address, not the global's.
+#[test]
+fn test_large_composite_argument_copied_only_where_the_abi_passes_a_reference() {
+    use crate::target::{Arch, Os};
+    let src = "struct big { long a, b, c; };\n\
+               struct big g;\n\
+               long f(struct big s);\n\
+               long t(void) { return f(g); }\n";
+    let has_copy = |target: Target| {
+        let module = linearize_source(src, &target);
+        let t = module.functions.iter().find(|f| f.name == "t").unwrap();
+        t.locals.keys().any(|name| name.starts_with("__argcopy_"))
+    };
+    assert!(has_copy(Target::new(Arch::Aarch64, Os::Linux)));
+    assert!(has_copy(Target::new(Arch::Aarch64, Os::MacOS)));
+    assert!(!has_copy(Target::new(Arch::X86_64, Os::Linux)));
+}

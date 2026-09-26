@@ -393,6 +393,11 @@ impl SysVAmd64Abi {
 }
 
 impl Abi for SysVAmd64Abi {
+    /// MEMORY class: the bytes themselves go in the argument area.
+    fn indirect_param_is_reference(&self) -> bool {
+        false
+    }
+
     fn classify_param(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);

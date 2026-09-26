@@ -3159,21 +3159,7 @@ impl<'a> Linearizer<'a> {
 
         let (result_sym, mut arg_vals, mut arg_types_vec) = if returns_large_struct {
             // Allocate local storage for the return value
-            let sret_sym = self.alloc_pseudo();
-            let sret_pseudo = Pseudo::sym(sret_sym, format!("__sret_{}", sret_sym.0));
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sret_pseudo);
-                // Internal sret storage is never volatile or atomic
-                func.add_local(
-                    format!("__sret_{}", sret_sym.0),
-                    sret_sym,
-                    typ,
-                    false, // not volatile
-                    false, // not atomic
-                    self.current_bb,
-                    None, // no explicit alignment
-                );
-            }
+            let sret_sym = self.frame_temp("__sret", typ);
 
             // Get address of the allocated space
             let sret_addr = self.alloc_reg_pseudo();
@@ -3188,40 +3174,12 @@ impl<'a> Linearizer<'a> {
         } else if returns_reg_aggregate {
             // Two-register struct returns: allocate local storage for the result
             // Codegen will store RAX+RDX (x86-64) or X0+X1 (AArch64) to this location
-            let local_sym = self.alloc_pseudo();
-            let unique_name = format!("__2reg_{}", local_sym.0);
-            let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(local_pseudo);
-                func.add_local(
-                    &unique_name,
-                    local_sym,
-                    typ,
-                    false,
-                    false,
-                    self.current_bb,
-                    None,
-                );
-            }
+            let local_sym = self.frame_temp("__2reg", typ);
             (local_sym, Vec::new(), Vec::new())
         } else if ret_is_address {
             // Complex returns: allocate local storage for the result
             // Complex values are 16 bytes and need stack storage
-            let local_sym = self.alloc_pseudo();
-            let unique_name = format!("__cret_{}", local_sym.0);
-            let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(local_pseudo);
-                func.add_local(
-                    &unique_name,
-                    local_sym,
-                    typ,
-                    false,
-                    false,
-                    self.current_bb,
-                    None,
-                );
-            }
+            let local_sym = self.frame_temp("__cret", typ);
             (local_sym, Vec::new(), Vec::new())
         } else if (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
             && struct_size_bits > 0
@@ -3232,21 +3190,7 @@ impl<'a> Linearizer<'a> {
             // The codegen stores RAX (or XMM0) to this location.
             // Without this, the result pseudo holds a raw value which
             // emit_assign's block_copy would incorrectly dereference as a pointer.
-            let local_sym = self.alloc_pseudo();
-            let unique_name = format!("__sret1_{}", local_sym.0);
-            let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(local_pseudo);
-                func.add_local(
-                    &unique_name,
-                    local_sym,
-                    typ,
-                    false,
-                    false,
-                    self.current_bb,
-                    None,
-                );
-            }
+            let local_sym = self.frame_temp("__sret1", typ);
             (local_sym, Vec::new(), Vec::new())
         } else {
             let result = self.alloc_pseudo();
@@ -3311,15 +3255,16 @@ impl<'a> Linearizer<'a> {
                 && self.types.size_bits(arg_type) > 64
             {
                 let size_bits = self.types.size_bits(arg_type);
+                let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+                let class = abi.classify_param(arg_type, self.types);
                 if size_bits > 128 {
                     // Large struct (> 16 bytes): keep struct type so ABI classifies as
-                    // Indirect/MEMORY. The pseudo is still the struct's address;
-                    // codegen will copy bytes to the stack.
+                    // Indirect/MEMORY. The pseudo is the struct's address: System V
+                    // copies its bytes to the stack there, and AAPCS64 is handed a
+                    // copy of it below.
                     arg_types_vec.push(arg_type);
                 } else {
-                    // Medium struct (9-16 bytes): check ABI classification
-                    let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-                    let class = abi.classify_param(arg_type, self.types);
+                    // Medium struct (9-16 bytes): the ABI classification decides
                     let is_two_fp_regs = matches!(
                         class,
                         crate::abi::ArgClass::Direct { ref classes, .. }
@@ -3354,7 +3299,29 @@ impl<'a> Linearizer<'a> {
                 // materializes an rvalue -- a call returning a struct -- and
                 // hands back the temporary's address, so both cases are the
                 // same call.
-                self.linearize_lvalue(a)
+                let addr = self.linearize_lvalue(a);
+                if matches!(class, crate::abi::ArgClass::Indirect { .. })
+                    && abi.indirect_param_is_reference()
+                {
+                    // AAPCS64 B.4: the callee owns the memory it is pointed at
+                    // and may write it, so it must be a copy. Passing the
+                    // original's address was invisible c17-to-c17 -- a c17
+                    // callee copies out of it first -- but a gcc callee that
+                    // assigned to its parameter wrote through into the
+                    // caller's object.
+                    let copy = self.frame_temp("__argcopy", arg_type);
+                    let copy_addr = self.alloc_reg_pseudo();
+                    self.emit(Instruction::sym_addr(
+                        copy_addr,
+                        copy,
+                        self.types.pointer_to(arg_type),
+                    ));
+                    let bytes = self.types.size_bytes(arg_type) as i64;
+                    self.emit_block_copy(copy_addr, addr, bytes);
+                    copy_addr
+                } else {
+                    addr
+                }
             } else if bool_param_for_complex_arg.is_some() {
                 // A complex argument bound to a `_Bool` parameter converts by
                 // comparing against zero, so it must not take the
@@ -4916,21 +4883,7 @@ impl<'a> Linearizer<'a> {
                     TypeKind::Struct | TypeKind::Union | TypeKind::Array
                 );
                 let result = if is_aggregate {
-                    let local_sym = self.alloc_pseudo();
-                    let name = format!("__vaarg_{}", local_sym.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(Pseudo::sym(local_sym, name.clone()));
-                        func.add_local(
-                            &name,
-                            local_sym,
-                            *arg_type,
-                            false,
-                            false,
-                            self.current_bb,
-                            None,
-                        );
-                    }
-                    local_sym
+                    self.frame_temp("__vaarg", *arg_type)
                 } else {
                     self.alloc_pseudo()
                 };

@@ -191,6 +191,11 @@ bitflags::bitflags! {
 
         // C11 thread-local storage specifier
         const THREAD_LOCAL = 1 << 17;
+
+        // A GNU `vector_size` type. c17 lays one out as an array of its
+        // elements -- storage only, see DECISIONS.md -- and this is what tells
+        // it apart from a real array, which decays where a vector would not.
+        const VECTOR = 1 << 18;
     }
 }
 
@@ -1365,6 +1370,11 @@ impl TypeTable {
                 | TypeKind::Float16
                 | TypeKind::Float128
         ) && !typ.modifiers.contains(TypeModifiers::COMPLEX)
+    }
+
+    /// Is this a GNU `vector_size` type?
+    pub fn is_vector(&self, id: TypeId) -> bool {
+        self.get(id).modifiers.contains(TypeModifiers::VECTOR)
     }
 
     /// Check if type is a complex floating point type

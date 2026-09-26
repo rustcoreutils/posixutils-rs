@@ -464,6 +464,7 @@ impl Parser<'_> {
                     loop {
                         let (decl_name, mut decl_typ, _vla, _fparams) =
                             self.parse_declarator(knr_base_id, DeclaratorName::Required)?;
+                        self.check_not_vector_value(Some(decl_typ), self.current_pos());
                         // C99 6.7.5.3: array/function params adjusted to pointers
                         let typ = self.types.get(decl_typ);
                         if typ.kind == TypeKind::Array {

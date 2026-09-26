@@ -80,6 +80,12 @@ impl Parser<'_> {
     /// promotions instead (p7), and an unprototyped callee has nothing to
     /// check against, so both are skipped.
     pub(super) fn check_argument_types(&mut self, callee: &Expr, args: &[Expr]) {
+        // A vector argument goes by value under gcc, in vector registers; the
+        // array model would pass its address. Checked for every argument,
+        // prototyped or not.
+        for arg in args {
+            self.check_not_vector_value(arg.typ, arg.pos);
+        }
         let Some(func_type) = self.resolved_function_type(callee) else {
             return;
         };
@@ -225,6 +231,30 @@ impl Parser<'_> {
             diag::error(pos, &gettext("void value not ignored as it ought to be"));
         }
         is_void
+    }
+
+    /// Refuse to use a `vector_size` value where gcc gives it vector semantics.
+    ///
+    /// c17 gives a vector type storage and nothing more (DECISIONS.md): it is
+    /// laid out as an array of its elements, which is what `<link.h>` needs.
+    /// An array used as a value decays to its address, though, and a vector
+    /// does not -- so `(long long)(V2SI){2, 2}` answered the compound
+    /// literal's address, `v + 1` did pointer arithmetic, and a vector passed
+    /// by value went as a pointer, each silently. What the array model gets
+    /// right -- declaring, `sizeof`, `&v`, `v[i]`, a member, an initializer --
+    /// is untouched; the operations it would get wrong are diagnosed here.
+    pub(super) fn check_not_vector_value(&self, typ: Option<TypeId>, pos: Position) -> bool {
+        let is_vector = typ.is_some_and(|t| self.types.is_vector(t));
+        if is_vector {
+            diag::error(
+                pos,
+                &gettext(
+                    "c17 implements 'vector_size' types as storage only; \
+                     a vector cannot be used as a value here",
+                ),
+            );
+        }
+        is_vector
     }
 
     /// Does this argument's type match some member of a

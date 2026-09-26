@@ -89,20 +89,6 @@ arithmetic.
 
 ---
 
-### aarch64: defects the host gates cannot see
-
-Found by building the torture suite for aarch64 and assembling it with GNU
-as, then running `execute/` under qemu. Neither gate exists in-tree; both
-belong in `cc/scripts` alongside `c17_torture.sh`.
-
-- **Run-time failures under qemu** that gcc's own build passes:
-  `20020615-1`, `20021127-1`, `20050316-2`, `20050607-1`, `20080502-1`,
-  `20230630-2`, `20230630-4`, `990208-1`, `pr108498-1`, `pr19606`,
-  `pr42544`, `pr44942`, `pr95731`, `simd-4`. Not triaged; some may need the
-  test's own `dg` options.
-
----
-
 ### Dominator construction is quadratic on a wide join
 
 `domtree_build` is Cooper-Harvey-Kennedy, whose `intersect` walks the

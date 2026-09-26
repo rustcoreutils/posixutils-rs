@@ -15,7 +15,7 @@ use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::arch::aarch64::codegen::Aarch64CodeGen;
 use crate::arch::aarch64::features::{VA_GR_SAVE_BYTES, VA_VR_SAVE_BYTES};
 use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
-use crate::arch::aarch64::regalloc::{FrameBase, Loc, Reg, RegAlloc, VReg};
+use crate::arch::aarch64::regalloc::{FrameBase, IncomingOff, Loc, Reg, RegAlloc, VReg};
 use crate::arch::codegen::is_variadic_function;
 use crate::arch::lir::{
     complex_fp_info, plan_pair_move, CondCode, Directive, FpSize, OperandSize, PairMove, Symbol,
@@ -155,15 +155,6 @@ impl Aarch64CodeGen {
             });
         }
 
-        // Detect sret and store X8 to stack if needed
-        let has_sret = func
-            .pseudos
-            .iter()
-            .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
-        if has_sret {
-            self.store_sret_if_needed(func);
-        }
-
         // For variadic functions on Linux/FreeBSD, save argument registers
         if is_variadic && !is_darwin {
             self.emit_variadic_save_area();
@@ -181,7 +172,10 @@ impl Aarch64CodeGen {
             // Summed in `i64`: two stacked parameters each inside
             // `MAX_STACK_OBJECT_BYTES` still overflow their total, and the
             // one conversion after the loop is where that is caught.
-            let mut named_stack = 0i64;
+            // The named parameters' stacked area, laid out by the very rule
+            // `allocate_arguments` uses, so the two cannot disagree about where
+            // the variadic arguments begin.
+            let mut next_incoming = IncomingOff::FIRST;
             let abi = crate::abi::get_abi_for_conv(CallingConv::C, &self.base.target);
             for (_, typ) in &func.params {
                 // Mirror `allocate_arguments`: it dispatches on the ABI class,
@@ -232,19 +226,22 @@ impl Aarch64CodeGen {
                         crate::arch::func_pos(func),
                         "a stacked parameter",
                     );
-                    // Summed in `i64`: two parameters each inside the bound
-                    // overflow their total, and the one conversion below is
-                    // where that is caught.
-                    named_stack += i64::from((bytes + 7) & !7);
+                    // Aligned before it is placed, as AAPCS64 stage C.16
+                    // requires and `IncomingOff::take` does. Summing
+                    // eight-byte-rounded sizes put a `long double` after an odd
+                    // number of eightbytes eight bytes low, so `va_start`
+                    // pointed one slot short of the first variadic argument.
+                    IncomingOff::take(
+                        &mut next_incoming,
+                        bytes,
+                        crate::abi::aapcs64::argument_alignment(types, *typ) as i32,
+                    );
                 }
             }
             self.num_fixed_gp_params = ngrn;
             self.num_fixed_fp_params = nsrn;
-            self.named_stack_param_bytes = crate::abi::slot_bytes(
-                named_stack as usize,
-                crate::arch::func_pos(func),
-                "this function's stacked parameters",
-            );
+            self.named_stack_param_bytes =
+                next_incoming.displacement() - IncomingOff::FIRST.displacement();
         }
 
         // Store spilled arguments before any calls can clobber them
@@ -703,23 +700,6 @@ impl Aarch64CodeGen {
                 i += 1;
             }
             offset += 16;
-        }
-    }
-
-    /// Store sret pointer to stack if needed (for large struct returns via X8)
-    fn store_sret_if_needed(&mut self, func: &Function) {
-        if let Some(sret) = func
-            .pseudos
-            .iter()
-            .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"))
-        {
-            if let Some(Loc::Stack(offset)) = self.locations.get_ref(sret.id) {
-                self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B64,
-                    src: Reg::X8,
-                    addr: self.stack_mem(*offset),
-                });
-            }
         }
     }
 

@@ -1519,6 +1519,7 @@ impl<'a> Parser<'a> {
             kind: TypeKind::Array,
             base: Some(typ),
             array_size: Some(count as usize),
+            modifiers: TypeModifiers::VECTOR,
             ..Default::default()
         };
         // A vector aligns to its width rounded up to a power of two, capped
@@ -1909,6 +1910,7 @@ impl Parser<'_> {
         }
 
         let expr = self.parse_expression()?;
+        self.check_not_vector_value(expr.typ, expr.pos);
         self.expect_special(b';')?;
         Ok(Stmt::Return(Some(expr)))
     }

@@ -5990,3 +5990,69 @@ fn test_alignof_of_an_aligned_function() {
         init.kind
     );
 }
+
+/// `__builtin_signbit` dispatches on its argument's type: a `float` to the
+/// single-precision form, a `long double` to `__signbitl`, a `double` to the
+/// double form. Each result is normalised to 0/1 by a `!= 0`.
+#[test]
+fn test_signbit_is_type_generic() {
+    fn inner(e: &Expr) -> &ExprKind {
+        match &e.kind {
+            ExprKind::Binary { left, .. } => &left.kind,
+            other => other,
+        }
+    }
+    let (tu, _types, strings, symbols) = parse_tu(
+        "float f; double d; long double l;\n\
+         int a = 0; void t(void) { a = __builtin_signbit(f); a = __builtin_signbit(d); \
+         a = __builtin_signbit(l); }\n",
+    )
+    .unwrap();
+    let body = tu
+        .items
+        .iter()
+        .find_map(|i| match i {
+            ExternalDecl::FunctionDef(f) => Some(&f.body),
+            _ => None,
+        })
+        .unwrap();
+    let Stmt::Block(items) = body else {
+        panic!("expected a block")
+    };
+    let rhs: Vec<&Expr> = items
+        .iter()
+        .filter_map(|i| match i {
+            BlockItem::Statement(s) => match s.as_ref() {
+                Stmt::Expr(e) => match &e.kind {
+                    ExprKind::Assign { value, .. } => Some(value.as_ref()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rhs.len(), 3);
+    assert!(matches!(inner(rhs[0]), ExprKind::Signbitf { .. }), "float");
+    assert!(matches!(inner(rhs[1]), ExprKind::Signbit { .. }), "double");
+    match inner(rhs[2]) {
+        ExprKind::Call { func, .. } => match &func.kind {
+            ExprKind::Ident(id) => check_name(&strings, symbols.get(*id).name, "__signbitl"),
+            other => panic!("long double: expected a call to __signbitl, got {other:?}"),
+        },
+        other => panic!("long double: expected a call, got {other:?}"),
+    }
+}
+
+/// `vector_size` marks its type, so a vector is not the same type as a plain
+/// array of its elements -- which is what lets a value use of one be told
+/// apart and refused.
+#[test]
+fn test_vector_size_type_is_marked() {
+    let (decl, types, _strings, symbols) =
+        parse_decl("int __attribute__((vector_size(8))) x;").unwrap();
+    let typ = symbols.get(decl.declarators[0].symbol).typ;
+    assert!(types.is_vector(typ));
+    let (decl, types, _strings, symbols) = parse_decl("int y[2];").unwrap();
+    assert!(!types.is_vector(symbols.get(decl.declarators[0].symbol).typ));
+}

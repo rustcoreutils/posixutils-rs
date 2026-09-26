@@ -1561,12 +1561,17 @@ impl RegAlloc {
         let int_arg_regs_set: &[Reg] = Reg::arg_regs();
         let spilled_args = &mut self.spilled_args;
         let free_regs = &mut self.free_regs;
+        // X8 carries the sret pointer, which a call overwrites -- the callee
+        // may use X8 freely, and a call that itself returns a large aggregate
+        // loads X8 with *its* buffer. Left out of this set, a function
+        // returning a large struct that called anything stored its result
+        // through the last callee's buffer: the caller received zeros.
         crate::arch::regalloc::spill_gp_args_across_calls(
             intervals,
             call_positions,
             &mut self.locations,
             &mut self.stack_offset,
-            |reg| int_arg_regs_set.contains(&reg),
+            |reg| int_arg_regs_set.contains(&reg) || reg == Reg::X8,
             |loc| {
                 if let Loc::Reg(reg) = loc {
                     Some(*reg)
@@ -1587,7 +1592,12 @@ impl RegAlloc {
                     bytes: 8,
                 });
             },
-            |reg| free_regs.push(reg),
+            // X8 is not allocatable, so it is never handed back as free.
+            |reg| {
+                if reg != Reg::X8 {
+                    free_regs.push(reg)
+                }
+            },
         );
 
         // Check FP arguments in caller-saved registers (v0-v7)

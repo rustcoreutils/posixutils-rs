@@ -1185,17 +1185,11 @@ impl Aarch64CodeGen {
             _ => Reg::X16,
         };
 
-        // Pick non-conflicting temp registers for cond/then/else values
-        // If dst_reg is one of our default temps, shift allocation to avoid conflicts
-        let (cond_reg, then_reg, else_reg) = if dst_reg == Reg::X10 {
-            (Reg::X11, Reg::X12, Reg::X13)
-        } else if dst_reg == Reg::X11 {
-            (Reg::X10, Reg::X12, Reg::X13)
-        } else if dst_reg == Reg::X12 {
-            (Reg::X10, Reg::X11, Reg::X13)
-        } else {
-            (Reg::X10, Reg::X11, Reg::X12) // Original allocation
-        };
+        // The three codegen scratches, which the allocator never hands out,
+        // so none can be `dst_reg` or hold anything live. This used X12 and
+        // X13, which are allocatable: a value the allocator had put there was
+        // overwritten by the select's operand, and read back wrong after it.
+        let (cond_reg, then_reg, else_reg) = Reg::scratch_regs();
 
         // Load condition, then and else values
         self.emit_move(cond, cond_reg, 64);

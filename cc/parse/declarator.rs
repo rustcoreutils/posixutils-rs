@@ -529,6 +529,10 @@ impl Parser<'_> {
             // silently an `int`.
             typ_id = self.apply_pending_type_attrs(typ_id);
 
+            // A vector parameter is passed by value, which the array model
+            // cannot do: the adjustment below would make it a pointer.
+            self.check_not_vector_value(Some(typ_id), self.current_pos());
+
             // C99 6.7.5.3: Array and function parameters are adjusted to pointers
             // - Array T[] becomes pointer to T
             // - Function type becomes pointer to function type

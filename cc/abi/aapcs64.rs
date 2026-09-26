@@ -359,6 +359,12 @@ impl Aapcs64Abi {
 }
 
 impl Abi for Aapcs64Abi {
+    /// Stage B.4: a composite over sixteen bytes is replaced by a pointer to
+    /// a caller-made copy.
+    fn indirect_param_is_reference(&self) -> bool {
+        true
+    }
+
     fn classify_param(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);

@@ -369,7 +369,18 @@ impl Aarch64CodeGen {
                         });
                     }
                     32 => {
-                        // 32-bit ops automatically zero-extend on AArch64
+                        // Writing a W register zeroes the upper half, but the
+                        // move above is 64 bits wide and carries whatever the
+                        // source register holds there. A 32-bit value is not
+                        // kept zero-extended -- a `Sext` to 32 bits writes the
+                        // whole X register -- so `(unsigned long long)(unsigned
+                        // int)(short)-1` came out 0xffffffffffffffff. The
+                        // self-move is what makes the upper half zero.
+                        self.push_lir(Aarch64Inst::Mov {
+                            size: OperandSize::B32,
+                            src: GpOperand::Reg(dst_reg),
+                            dst: dst_reg,
+                        });
                     }
                     _ => {}
                 }

@@ -218,6 +218,16 @@ pub trait Abi {
 
     /// Classify a return type.
     fn classify_return(&self, ty: TypeId, types: &TypeTable) -> ArgClass;
+
+    /// What an `ArgClass::Indirect` *parameter* travels as.
+    ///
+    /// The class means "not in registers", and the two ABIs mean different
+    /// things by it. System V AMD64 MEMORY class puts the argument's bytes in
+    /// the outgoing argument area, so the callee's parameter is the caller's
+    /// copy by construction. AAPCS64 stage B.4 instead passes a *pointer*,
+    /// and the memory it points to must be a copy the caller made: the callee
+    /// owns it and may write to it.
+    fn indirect_param_is_reference(&self) -> bool;
 }
 
 // ABI Factory

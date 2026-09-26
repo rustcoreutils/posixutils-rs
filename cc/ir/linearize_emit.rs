@@ -1707,6 +1707,24 @@ impl<'a> super::linearize::Linearizer<'a> {
         dst
     }
 
+    /// A fresh frame-resident local of `typ`, named `{prefix}_{id}`, and its
+    /// `Sym` pseudo.
+    ///
+    /// The one way the linearizer makes a compiler temporary with a fixed stack
+    /// slot -- a call's result buffer, a `va_arg` aggregate, an argument copy.
+    /// Unlike [`Self::alloc_local_temp`], which is an `alloca` and grows the
+    /// stack every time it runs, this is a slot in the frame, so it costs
+    /// nothing in a loop.
+    pub(crate) fn frame_temp(&mut self, prefix: &str, typ: TypeId) -> PseudoId {
+        let sym = self.alloc_pseudo();
+        let name = format!("{prefix}_{}", sym.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(Pseudo::sym(sym, name.clone()));
+            func.add_local(&name, sym, typ, false, false, self.current_bb, None);
+        }
+        sym
+    }
+
     /// Allocate a local temporary variable for a complex result
     pub(crate) fn alloc_local_temp(&mut self, typ: TypeId) -> PseudoId {
         let size = self.types.size_bytes(typ);
@@ -1737,21 +1755,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let (left_real, left_imag) = left;
         let (right_real, right_imag) = right;
         // Allocate local storage for the complex result
-        let result_sym = self.alloc_pseudo();
-        let unique_name = format!("__cret_{}", result_sym.0);
-        let result_pseudo = Pseudo::sym(result_sym, unique_name.clone());
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(result_pseudo);
-            func.add_local(
-                &unique_name,
-                result_sym,
-                complex_typ,
-                false, // not volatile
-                false, // not atomic
-                self.current_bb,
-                None, // no explicit alignment
-            );
-        }
+        let result_sym = self.frame_temp("__cret", complex_typ);
 
         // Build argument list: 4 scalar FP values
         let arg_vals = vec![left_real, left_imag, right_real, right_imag];

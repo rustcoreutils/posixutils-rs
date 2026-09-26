@@ -5486,3 +5486,93 @@ fn diagnostics_static_object_larger_than_a_frame_slot_is_accepted() {
         compile_expect_ok(name, src);
     }
 }
+
+/// A `vector_size` value where gcc gives it vector semantics is refused.
+///
+/// c17 implements a vector as storage only -- an array of its elements -- and
+/// an array used as a value decays to its address. So each of these used to
+/// compile to something other than what gcc means: `(long long)v` answered
+/// the vector's address rather than its bits, `v + 1` did pointer
+/// arithmetic, a vector argument or parameter went as a pointer. gcc's torture
+/// tests `20050316-2`, `20050607-1` and `simd-4` all returned wrong answers.
+#[test]
+fn diagnostics_vector_value_is_refused() {
+    let prelude = "typedef int V2SI __attribute__((vector_size(8)));\n\
+                   long f(); long l; int c;\n";
+    for (name, body) in [
+        (
+            "cast_from",
+            "long t(void) { V2SI v = {1, 2}; return (long long)v; }",
+        ),
+        ("cast_to", "void t(void) { V2SI v = (V2SI)l; (void)&v; }"),
+        (
+            "binary",
+            "void t(void) { V2SI v = {1, 2}; l = (long)(v + 1 == 0); }",
+        ),
+        ("unary", "void t(void) { V2SI v = {1, 2}; c = !v; }"),
+        ("deref", "int t(void) { V2SI v = {1, 2}; return *v; }"),
+        ("argument", "void t(void) { V2SI v = {1, 2}; f(v); }"),
+        (
+            "conditional",
+            "void t(void) { V2SI v = {1, 2}; (void)(c ? v : v); }",
+        ),
+        ("parameter", "long t(V2SI v) { return 0; }"),
+    ] {
+        compile_expect_error(
+            &format!("vector_value_{name}"),
+            &format!("{prelude}{body}\n"),
+            "'vector_size' types as storage only",
+        );
+    }
+}
+
+/// What the storage model gets right is still accepted: declaring a vector,
+/// `sizeof`, `&v`, `v[i]`, a vector member, an initializer, and copying a
+/// struct that holds one -- what glibc's `<link.h>` needs.
+#[test]
+fn diagnostics_vector_storage_is_accepted() {
+    let src = r#"
+typedef int V2SI __attribute__((vector_size(8)));
+typedef float V4SF __attribute__((vector_size(16), aligned(16)));
+struct regs { V4SF x[4]; long l; };
+struct regs g;
+int main(void)
+{
+    V2SI v = { 1, 2 };
+    V2SI *p = &v;
+    struct regs r = { 0 };
+    r.x[1][2] = 3.0f;
+    if (sizeof v != 8 || sizeof(struct regs) != 80) return 1;
+    if (v[0] + (*p)[1] != 3) return 2;
+    g = r;
+    return g.x[1][2] == 3.0f ? 0 : 3;
+}
+"#;
+    assert_eq!(compile_and_run("vector_storage", src, &[]), 0);
+}
+
+/// `__builtin_signbit` takes any real floating type, as gcc's does, and
+/// refuses anything else as gcc does. A `long double` used to reach the
+/// `double` emitter unconverted.
+#[test]
+fn diagnostics_signbit_is_type_generic() {
+    let src = r#"
+int main(void)
+{
+    volatile long double neg = -1.0L, pos = 1.0L, nz = -0.0L;
+    volatile float f = -2.0f;
+    volatile double d = -0.0;
+    if (!__builtin_signbit(neg) || __builtin_signbit(pos) || !__builtin_signbit(nz)) return 1;
+    if (!__builtin_signbit(f) || !__builtin_signbit(d)) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("signbit_generic", src, &[]), 0);
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run("signbit_generic_o2", src, &opts), 0);
+    compile_expect_error(
+        "signbit_int",
+        "int t(int x) { return __builtin_signbit(x); }\n",
+        "non-floating-point argument",
+    );
+}

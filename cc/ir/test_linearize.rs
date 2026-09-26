@@ -7161,3 +7161,95 @@ fn test_far_member_offset_is_folded_into_the_address() {
         assert!(crate::ir::validate::validate_function(func).is_ok());
     }
 }
+
+/// Every CFG edge the linearizer builds is recorded once, in both lists.
+///
+/// Fifty `if (x) goto end;` all reach one label, so the label collects fifty
+/// predecessors. Whether an edge is already present is answered by a set of
+/// the edges linked so far rather than by scanning the label's `parents` --
+/// the scan made a label thousands of `goto`s jump to quadratic in them. The
+/// lists must still hold each edge exactly once, and `parents` and `children`
+/// must describe the same edges.
+#[test]
+fn test_cfg_edges_are_recorded_once_in_both_lists() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let end_id = ctx.str("end");
+    let int_type = ctx.int_type();
+    let x_sym = ctx.var("x", int_type);
+
+    let mut items: Vec<BlockItem> = (0..50)
+        .map(|_| {
+            BlockItem::Statement(Box::new(Stmt::If {
+                cond: Expr::var_typed(x_sym, int_type),
+                then_stmt: Box::new(Stmt::Goto {
+                    name: end_id,
+                    pos: test_pos(),
+                }),
+                else_stmt: None,
+            }))
+        })
+        .collect();
+    items.push(BlockItem::Statement(Box::new(Stmt::Label {
+        name: end_id,
+        stmt: Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
+        pos: test_pos(),
+    })));
+    let mut func = make_simple_func(test_id, Stmt::Block(items), &ctx.types);
+    func.params = vec![Parameter {
+        symbol: Some(x_sym),
+        typ: int_type,
+        vm_dims: vec![],
+        discarded_dims: vec![],
+    }];
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = ctx.linearize(&tu);
+    let func = &module.functions[0];
+
+    let mut widest = 0;
+    for bb in &func.blocks {
+        let mut parents = bb.parents.clone();
+        parents.sort();
+        parents.dedup();
+        assert_eq!(
+            parents.len(),
+            bb.parents.len(),
+            "{:?} repeats a parent",
+            bb.id
+        );
+        let mut children = bb.children.clone();
+        children.sort();
+        children.dedup();
+        assert_eq!(
+            children.len(),
+            bb.children.len(),
+            "{:?} repeats a child",
+            bb.id
+        );
+        for p in &bb.parents {
+            let pb = func.get_block(*p).expect("a parent is a block");
+            assert!(
+                pb.children.contains(&bb.id),
+                "{:?} -> {:?} missing a child edge",
+                p,
+                bb.id
+            );
+        }
+        for c in &bb.children {
+            let cb = func.get_block(*c).expect("a child is a block");
+            assert!(
+                cb.parents.contains(&bb.id),
+                "{:?} -> {:?} missing a parent edge",
+                bb.id,
+                c
+            );
+        }
+        widest = widest.max(bb.parents.len());
+    }
+    assert!(
+        widest >= 50,
+        "the label should collect every goto, widest was {widest}"
+    );
+}

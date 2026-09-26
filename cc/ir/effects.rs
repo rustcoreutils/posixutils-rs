@@ -157,11 +157,13 @@ fn summarize(f: &Function) -> Summary {
 /// at most twice, over a three-point lattice, so the queue drains.
 fn solve(inferable: &[Summary], effects: &mut HashMap<String, MemEffect>) {
     // Who has to be re-examined when a name gets dirtier.
+    // Callers are visited in order, so a repeat can only be the entry this
+    // caller pushed last.
     let mut callers: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, s) in inferable.iter().enumerate() {
         for c in &s.callees {
             let e = callers.entry(c.as_str()).or_default();
-            if !e.contains(&i) {
+            if e.last() != Some(&i) {
                 e.push(i);
             }
         }

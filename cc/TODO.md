@@ -70,19 +70,6 @@ live `int`s cost 72 bytes where gcc uses callee-saved registers and none. Slot
 reuse is the larger multiplier, but this is why even leaf functions carry a
 frame.
 
-### Dominator construction is quadratic on a wide join
-
-`domtree_build` is Cooper-Harvey-Kennedy, whose `intersect` walks the
-dominator chain once per predecessor. A block with thousands of predecessors
-under a deep chain -- the two labels every `if ... goto` in
-`compile/20001226-1` jumps to -- makes that predecessors x depth. It is what
-is left of that test's compile time (about a second for 8192 pairs, still
-growing a little faster than linearly), and it runs once per `ssa_convert`
-and again per `loadfwd`. Lengauer-Tarjan, which gcc uses, is near-linear on
-any shape.
-
----
-
 ### R10 reserved globally for division scratch
 
 **Location**: `arch/x86_64/regalloc.rs` lines 187-208

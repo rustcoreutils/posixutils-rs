@@ -487,13 +487,14 @@ fn no_clobber_between(
 fn invert(
     preds: &HashMap<BasicBlockId, Vec<BasicBlockId>>,
 ) -> HashMap<BasicBlockId, Vec<BasicBlockId>> {
+    // Each predecessor list is duplicate-free and each block has one, so a
+    // (p, b) pair arrives once: no duplicate can form. The search that used to
+    // guard against one made a block of many successors -- a big `switch` --
+    // quadratic in them.
     let mut succs: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
     for (b, ps) in preds {
         for p in ps {
-            let e = succs.entry(*p).or_default();
-            if !e.contains(b) {
-                e.push(*b);
-            }
+            succs.entry(*p).or_default().push(*b);
         }
     }
     succs
@@ -526,22 +527,28 @@ fn reachable(
 
 /// Predecessors from `children`, which `dce` maintains, rather than from
 /// `parents`, which it does not.
+///
+/// Blocks are visited one at a time, so a repeated edge from `bb` -- a
+/// conditional branch whose arms meet, an `asm goto` label that is also a
+/// successor -- can only duplicate the entry `bb` itself pushed last. Checking
+/// that one entry keeps the lists duplicate-free in the same order; searching
+/// the whole list made a join of many predecessors quadratic in them.
 fn build_preds(func: &Function) -> HashMap<BasicBlockId, Vec<BasicBlockId>> {
     let mut preds: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
+    let mut add = |to: BasicBlockId, from: BasicBlockId| {
+        let e = preds.entry(to).or_default();
+        if e.last() != Some(&from) {
+            e.push(from);
+        }
+    };
     for bb in &func.blocks {
         for c in &bb.children {
-            let e = preds.entry(*c).or_default();
-            if !e.contains(&bb.id) {
-                e.push(bb.id);
-            }
+            add(*c, bb.id);
         }
         for insn in &bb.insns {
             if let Some(ref asm) = insn.asm_data {
                 for (t, _) in &asm.goto_labels {
-                    let e = preds.entry(*t).or_default();
-                    if !e.contains(&bb.id) {
-                        e.push(bb.id);
-                    }
+                    add(*t, bb.id);
                 }
             }
         }

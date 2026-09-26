@@ -27,7 +27,7 @@ use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::target::Target;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const DEFAULT_VAR_MAP_CAPACITY: usize = 64;
 const DEFAULT_LABEL_MAP_CAPACITY: usize = 16;
@@ -229,6 +229,12 @@ pub struct Linearizer<'a> {
     pub(crate) module: Module,
     /// Current function being linearized
     pub(crate) current_func: Option<Function>,
+    /// Every CFG edge `link_bb`/`link_bb_many` have added to the current
+    /// function. They are the only writers of `children` and `parents`
+    /// during linearization, so this answers "is the edge already there?" in
+    /// O(1) for both lists -- scanning `parents` instead made a label that
+    /// thousands of `goto`s jump to quadratic in them.
+    cfg_edges: HashSet<(BasicBlockId, BasicBlockId)>,
     /// Current basic block being built
     pub(crate) current_bb: Option<BasicBlockId>,
     /// Next pseudo ID
@@ -374,6 +380,7 @@ impl<'a> Linearizer<'a> {
         Self {
             module: Module::default(),
             current_func: None,
+            cfg_edges: HashSet::new(),
             current_bb: None,
             next_pseudo: 0,
             next_bb: 0,
@@ -801,46 +808,33 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// Link `from` to each of `targets`, as `link_bb` does one at a time.
-    ///
-    /// For a block with very many successors -- a switch's dispatch -- where
-    /// adding them singly checked each against every edge already there.
+    /// Link `from` to each of `targets`, in order, as `link_bb` would one at
+    /// a time.
     pub(crate) fn link_bb_many(
         &mut self,
         from: BasicBlockId,
         targets: impl IntoIterator<Item = BasicBlockId>,
     ) {
-        let targets: Vec<BasicBlockId> = targets.into_iter().collect();
-        let func = self.current_func.as_mut().unwrap();
-        if let Some(from_bb) = func.get_block_mut(from) {
-            from_bb.add_children(targets.iter().copied());
-        }
         for to in targets {
-            if func.get_block(to).is_none() {
-                func.add_block(BasicBlock::new(to));
-            }
-            if let Some(to_bb) = func.get_block_mut(to) {
-                to_bb.add_parent(from);
-            }
+            self.link_bb(from, to);
         }
     }
 
-    /// Link two basic blocks (parent -> child)
+    /// Link two basic blocks (parent -> child), once: a second link of the
+    /// same edge adds nothing.
     pub(crate) fn link_bb(&mut self, from: BasicBlockId, to: BasicBlockId) {
-        let func = self.current_func.as_mut().unwrap();
-
-        // Add child to parent
-        if let Some(from_bb) = func.get_block_mut(from) {
-            from_bb.add_child(to);
+        if !self.cfg_edges.insert((from, to)) {
+            return;
         }
-
-        // Add parent to child - need to get it separately
-        // First ensure it exists
+        let func = self.current_func.as_mut().unwrap();
+        if let Some(from_bb) = func.get_block_mut(from) {
+            from_bb.children.push(to);
+        }
         if func.get_block(to).is_none() {
             func.add_block(BasicBlock::new(to));
         }
         if let Some(to_bb) = func.get_block_mut(to) {
-            to_bb.add_parent(from);
+            to_bb.parents.push(from);
         }
     }
 
@@ -1455,6 +1449,7 @@ impl<'a> Linearizer<'a> {
         }
 
         self.current_func = Some(ir_func);
+        self.cfg_edges.clear();
 
         // Create entry block
         let entry_bb = self.alloc_bb();

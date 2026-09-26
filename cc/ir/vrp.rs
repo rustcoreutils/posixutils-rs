@@ -908,9 +908,12 @@ fn record_fact(out: &mut BTreeMap<PseudoId, Range>, id: PseudoId, r: Range) {
 /// trust bookkeeping that `dce` does not maintain.
 fn build_preds(func: &Function) -> HashMap<BasicBlockId, Vec<BasicBlockId>> {
     let mut preds: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
+    // Blocks are visited one at a time, so a repeated edge can only duplicate
+    // the entry the same block pushed last; searching the whole list made a
+    // join of many predecessors quadratic in them.
     let add = |from: BasicBlockId, to: BasicBlockId, m: &mut HashMap<_, Vec<_>>| {
         let e: &mut Vec<BasicBlockId> = m.entry(to).or_default();
-        if !e.contains(&from) {
+        if e.last() != Some(&from) {
             e.push(from);
         }
     };

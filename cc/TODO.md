@@ -84,9 +84,8 @@ offset past 255 fails through any pointer, with no large frame at all.
 Related sites with the same shape:
 
 - `emit_add_imm_legalized` splits an immediate into a shifted and an unshifted
-  12-bit half, so it reaches 16 MiB and no further. `zero_stack_frame` runs in
-  every prologue and uses it, so *every* frame past 16 MiB fails to assemble,
-  and so does taking the address of a local that far up.
+  12-bit half, so it reaches 16 MiB and no further: taking the address of a
+  local that far up fails to assemble.
 - The over-aligned frame base (`add x19, x29, #...`) is emitted raw, so
   `_Alignas(4096)` on a local fails.
 - `emit_struct_store`/`emit_struct_zero` add a raw offset to their cursor, and
@@ -251,35 +250,6 @@ value -- `codegen_aggregate_copy_length_past_the_old_object_bound` says so where
 its source would tempt someone to.
 
 This is a compile-time blowup, not a wrong answer.
-
----
-
-### Zeroing a large frame is unrolled on aarch64
-
-Every aarch64 prologue calls `zero_stack_frame`, so that a narrow write leaves
-zero in the bytes above it. It emits one `stp xzr, xzr` per sixteen bytes, or
-one `str xzr` per eight once the offsets stop encoding -- with no loop. x86-64's
-`zero_stack_frame` sets up `rep stosq` instead, four instructions whatever the
-size.
-
-So the cost is one instruction per eight bytes of frame, on one target only: a
-100 KB local is 12,500 stores, and `char a[1000000000];` is 125 million, which
-measured **11 seconds and 13.4 GB resident** against 0.007 seconds on x86-64.
-That took a CI runner down.
-
-`MAX_STACK_OBJECT_BYTES` bounds this at 2 GiB, which is not a bound at all here.
-Past 16 MiB the unroll is moot today, because the cursor adds it emits stop
-encoding and the output fails to assemble -- see
-[the unencodable-offset bug](#aarch64-emits-frame-offsets-no-instruction-can-encode).
-The fix is the same shape as the `memcpy` fallback above: past some size, a
-counted loop rather than an unroll. X16 is already the cursor `zero_stack_frame`
-uses for out-of-range offsets, and AAPCS64 IP0 is never in the allocator's
-palette, so the register is available.
-
-Until it is fixed, `compile_expect_ok` compiles for the *host*, so an integration
-test must not declare a large automatic object -- the acceptance case in
-`diagnostics_static_object_larger_than_a_frame_slot_is_accepted` says so where
-its size would tempt someone to raise it.
 
 ---
 

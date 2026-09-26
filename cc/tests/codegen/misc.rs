@@ -11768,7 +11768,7 @@ static int one_huge_local(void) {
     return e[0] + e[39999];
 }
 
-/* A frame that needs more than one re-base of the zeroing cursor. */
+/* A frame the prologue zeroes with its loop rather than unrolled stores. */
 static int very_huge_local(void) {
     volatile unsigned char f[100000];
     f[0] = 6; f[50000] = 7; f[99999] = 8;
@@ -13617,17 +13617,17 @@ long stride(struct Big *p, int i) { return (char *)&p[i] - (char *)p; }
 /// - **x86-64 only.** Nothing to do with coverage: the length is computed in
 ///   `ir/` before any backend runs, so one target proves it, and x86-64 is the
 ///   one that materialises the constant as a literal rather than as
-///   `movz`/`movk`. Adding an `AARCH64_LINUX` assertion would cost **12.5
-///   seconds and 16 GB** resident, because `initialize`'s 600 MB local goes
-///   through `zero_stack_frame`, which unrolls one store per qword on aarch64
-///   where x86-64 emits `rep stosq`.
+///   `movz`/`movk`. An `AARCH64_LINUX` assertion once cost **12.5 seconds and
+///   16 GB** resident, because `initialize`'s 600 MB local went through an
+///   unrolled `zero_stack_frame`. That is a loop now; nobody has re-measured
+///   the rest of the aarch64 path at this size, so keep the list as it is.
 /// - **`by_value_param` does not pass its argument on.** The prologue copy is
 ///   the site under test; *sending* a 600 MB aggregate costs **16 seconds and
 ///   21.9 GB**, because the outgoing stacked-argument copy has no `memcpy`
 ///   fallback and unrolls one load/store pair per eight bytes.
 ///
-/// Both are recorded in cc/TODO.md. Until they are fixed, do not raise the
-/// target list and do not add a call that passes one of these by value.
+/// The second is recorded in cc/TODO.md. Until it is fixed, do not add a call
+/// that passes one of these by value.
 /// Everything here is `extern`; nothing is defined or run.
 #[test]
 fn codegen_aggregate_copy_length_past_the_old_object_bound() {
@@ -13761,4 +13761,95 @@ fn codegen_many_branches_one_function() {
             assert_eq!(code, 0, "aarch64 at {opt}");
         }
     }
+}
+
+/// A large frame's zeroing on aarch64 is a loop, not one store per eightbyte.
+///
+/// Every aarch64 prologue zeroes the locals area so that a narrow write leaves
+/// zeros above it. It was unrolled: a 1 MB local came to about 125,000 lines
+/// of assembly, a gigabyte one to 125 million stores, and past 16 MiB the
+/// cursor's re-basing `add` did not encode at all. `clean` relies on that
+/// zeroing -- it reads a frame `dirty` just filled at the same depth -- which
+/// is c17's guarantee, not gcc's, so gcc is checked on the first two only.
+const AARCH64_BIG_FRAME_ZEROED: &str = r#"
+#define NI __attribute__((noinline))
+volatile long sink;
+NI void touch(void *p) { sink += *(volatile char *)p; }
+
+NI long big_frame(long seed)
+{
+    volatile char a[1000000];
+    long x = seed;
+    a[0] = 1; a[sizeof a - 1] = 2;
+    touch((void *)a); touch(&x);
+    return x + a[0] + a[sizeof a - 1];
+}
+
+NI long dirty(void)
+{
+    volatile char a[100000];
+    for (int i = 0; i < 100000; i += 997) a[i] = 0x55;
+    touch((void *)a);
+    return a[997];
+}
+
+NI long clean(void)
+{
+    volatile char a[100000];
+    touch((void *)a);
+    long bad = 0;
+    for (int i = 0; i < 100000; i += 997) bad += a[i] != 0;
+    return bad;
+}
+
+int main(void)
+{
+    if (big_frame(5) != 8) return 1;
+    if (dirty() != 0x55) return 2;
+    if (clean() != 0) return 3;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_aarch64_big_frame_is_zeroed_by_a_loop() {
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) =
+            compile_and_run_aarch64("a64_big_frame_zeroed", AARCH64_BIG_FRAME_ZEROED, opt)
+        {
+            assert_eq!(code, 0, "at {opt}");
+        }
+    }
+}
+
+/// The shape of the zeroing: a loop past the `stp` range, whose size does
+/// not grow with the frame, and the unrolled pair stores below it.
+#[test]
+fn codegen_aarch64_frame_zeroing_shape() {
+    let target = ["--target", "aarch64-unknown-linux-gnu"];
+    let big = asm_for_at(
+        "a64_zero_big",
+        "long f(void) { volatile char a[1000000]; a[0] = 1; return a[0]; }\n",
+        &target,
+    );
+    assert!(
+        big.contains("stp xzr, xzr, [x16], #16"),
+        "no zeroing loop:\n{big}"
+    );
+    assert!(
+        big.lines().count() < 200,
+        "a 1 MB frame's prologue should not grow with the frame: {} lines",
+        big.lines().count()
+    );
+
+    let small = asm_for_at(
+        "a64_zero_small",
+        "long f(void) { volatile char a[64]; a[0] = 1; return a[0]; }\n",
+        &target,
+    );
+    assert!(small.contains("stp xzr, xzr, [x29, #"), "{small}");
+    assert!(
+        !small.contains("[x16], #16"),
+        "a small frame is unrolled:\n{small}"
+    );
 }

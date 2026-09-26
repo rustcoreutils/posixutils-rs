@@ -18,7 +18,7 @@ use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{FrameBase, Loc, Reg, RegAlloc, VReg};
 use crate::arch::codegen::is_variadic_function;
 use crate::arch::lir::{
-    complex_fp_info, plan_pair_move, Directive, FpSize, OperandSize, PairMove, Symbol,
+    complex_fp_info, plan_pair_move, CondCode, Directive, FpSize, OperandSize, PairMove, Symbol,
 };
 use crate::ir::{Function, Instruction, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeKind, TypeTable};
@@ -679,10 +679,12 @@ impl Aarch64CodeGen {
     /// This ensures all stack slots start as zero, so narrow writes (8/16/32-bit)
     /// leave zero in the unwritten upper bytes.
     ///
-    /// For small frames (max offset ≤ 504): uses `stp xzr, xzr, [x29, #offset]`
-    /// (16 bytes per instruction, but signed 7-bit offset limited to [-512, 504]).
-    /// For large frames: uses `str xzr, [x29, #offset]` per qword
-    /// (unsigned 12-bit offset scaled by 8, range [0, 32760]).
+    /// A small area -- one whose last pair store still reaches `x29` with the
+    /// `stp` immediate, [-512, 504] -- is zeroed by unrolled `stp xzr, xzr`.
+    /// Anything larger is a counted loop, so the prologue stays the same size
+    /// whatever the frame is, as x86-64's `rep stosq` does. Unrolling it cost
+    /// one instruction per eight bytes: a gigabyte local was 125 million
+    /// stores, and past 16 MiB the cursor's re-basing `add` did not encode.
     fn zero_stack_frame(&mut self) {
         let alloc_size = self.stack_alloc_size;
         if alloc_size <= 0 {
@@ -718,54 +720,65 @@ impl Aarch64CodeGen {
                 });
             }
         } else {
-            // Large frame: `str xzr` per qword. Its unsigned offset is twelve
-            // bits scaled by eight, so [0, 32760] -- which the comment here
-            // used to call "all practical frames". It is not: three locals of
-            // 9001 bytes reach 27 KB and a 40 KB array goes past it outright,
-            // and the assembler rejects what it cannot encode
-            // (`Error: immediate offset out of range`).
-            //
-            // Past the range, address through a cursor in X16 -- the
-            // documented scratch for exactly this, AAPCS64 IP0, never in the
-            // allocator's palette -- and advance it as the offsets run out.
-            const MAX_STR_OFFSET: i32 = 32760;
-            let mut offset = 0;
-            let mut cursor_base: Option<i32> = None;
-            while offset < alloc_size {
-                let absolute = base_offset + offset;
-                if absolute <= MAX_STR_OFFSET {
-                    self.push_lir(Aarch64Inst::Str {
-                        size: OperandSize::B64,
-                        src: Reg::Xzr,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X29,
-                            offset: absolute,
-                        },
-                    });
-                } else {
-                    // Re-base whenever the remaining displacement would not
-                    // encode, which keeps one `add` per 32 KB rather than one
-                    // per store.
-                    let need_rebase = match cursor_base {
-                        Some(b) => absolute - b > MAX_STR_OFFSET,
-                        None => true,
-                    };
-                    if need_rebase {
-                        self.emit_add_imm_legalized(Reg::X16, Reg::X29, absolute as i64);
-                        cursor_base = Some(absolute);
-                    }
-                    let rel = absolute - cursor_base.unwrap();
-                    self.push_lir(Aarch64Inst::Str {
-                        size: OperandSize::B64,
-                        src: Reg::Xzr,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::X16,
-                            offset: rel,
-                        },
-                    });
-                }
-                offset += 8;
-            }
+            self.emit_zero_loop(base_offset, alloc_size);
+        }
+    }
+
+    /// Zero `[x29 + base_offset, x29 + base_offset + bytes)`, rounded up to a
+    /// whole eightbyte, with a loop.
+    ///
+    /// X16 is the cursor and X17 the end of the paired part. Both are AAPCS64
+    /// intra-procedure scratch and nothing is live in them this early in the
+    /// prologue: the arguments are still in x0-x7 and v0-v7, and x8 holds the
+    /// indirect-result pointer. Both displacements are materialized with
+    /// `emit_mov_imm` and applied in register form, which encodes at any size.
+    fn emit_zero_loop(&mut self, base_offset: i32, bytes: i32) {
+        let bytes = (bytes + 7) & !7;
+        let pairs = bytes & !15;
+        self.emit_mov_imm(Reg::X16, base_offset as i64, 64);
+        self.push_lir(Aarch64Inst::Add {
+            size: OperandSize::B64,
+            src1: Reg::X29,
+            src2: GpOperand::Reg(Reg::X16),
+            dst: Reg::X16,
+        });
+        if pairs > 0 {
+            self.emit_mov_imm(Reg::X17, pairs as i64, 64);
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: Reg::X16,
+                src2: GpOperand::Reg(Reg::X17),
+                dst: Reg::X17,
+            });
+            let top = self.next_unique_label("zero_frame");
+            self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(top.clone())));
+            self.push_lir(Aarch64Inst::Stp {
+                size: OperandSize::B64,
+                src1: Reg::Xzr,
+                src2: Reg::Xzr,
+                addr: MemAddr::PostIndex {
+                    base: Reg::X16,
+                    offset: 16,
+                },
+            });
+            self.push_lir(Aarch64Inst::Cmp {
+                size: OperandSize::B64,
+                src1: Reg::X16,
+                src2: GpOperand::Reg(Reg::X17),
+            });
+            self.push_lir(Aarch64Inst::BCond {
+                cond: CondCode::Ult,
+                target: top,
+            });
+        }
+        // The eightbyte left over when the area is not a multiple of sixteen;
+        // the cursor already points at it.
+        if bytes > pairs {
+            self.push_lir(Aarch64Inst::Str {
+                size: OperandSize::B64,
+                src: Reg::Xzr,
+                addr: MemAddr::Base(Reg::X16),
+            });
         }
     }
 

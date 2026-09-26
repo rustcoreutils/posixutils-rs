@@ -13209,7 +13209,9 @@ fn codegen_zero_initialized_globals_are_definitions() {
     );
 }
 
-/// The section directive in force where `name:` is defined.
+/// The section directive in force where `name:` is defined. Only the ELF
+/// section tests use it, and they run on an x86-64 Linux host.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn section_of<'a>(asm: &'a str, name: &str) -> Option<&'a str> {
     let label = format!("{name}:");
     let mut current = None;
@@ -14121,6 +14123,150 @@ fn codegen_aggregate_through_conditional_and_other_rvalues() {
     for opt in ["-O0", "-O2"] {
         if let Some(code) = compile_and_run_aarch64("aggregate_rvalues_a64", src, opt) {
             assert_eq!(code, 0, "aarch64 at {opt}");
+        }
+    }
+}
+
+/// A function named like one of the backends' own labels.
+///
+/// Block labels are `.L<function>_<n>`, and the backends' internal labels --
+/// an int128 shift's branches, a `va_arg` overflow path, a CAS loop, the
+/// constant pools -- were `.L<prefix>_<n>` in the same namespace. So a
+/// function named `i128`, `va_done` or `cas_loop` defined one of its blocks
+/// under the name of a label the backend had also made, and the assembler
+/// rejected the output ("symbol `.Li128_0' is already defined"). Internal
+/// labels are `.L.<prefix>.<n>` now, which no C identifier can spell. The
+/// function body has enough blocks for a low-numbered internal label to meet
+/// one, and every construct that makes internal labels on either target; the
+/// expected value is gcc's.
+const INTERNAL_LABEL_NAMED: &str = r#"
+#include <stdarg.h>
+#define NI __attribute__((noinline))
+struct P { long a, b; };
+_Atomic double ad;
+static int word = 1;
+/* A function named like one of the backend's own labels, with enough blocks
+   that a low-numbered internal label meets one of its block labels, and every
+   construct that emits such labels on either target. */
+NI long fname(long a, int s, int n, ...)
+{
+    long acc = 0;
+    if (a > 0) acc += 0;
+    if (a > 1) acc += 1;
+    if (a > 2) acc += 2;
+    if (a > 3) acc += 3;
+    if (a > 4) acc += 4;
+    if (a > 5) acc += 0;
+    if (a > 6) acc += 1;
+    if (a > 7) acc += 2;
+    if (a > 8) acc += 3;
+    if (a > 9) acc += 4;
+    if (a > 10) acc += 0;
+    if (a > 11) acc += 1;
+    if (a > 12) acc += 2;
+    if (a > 13) acc += 3;
+    if (a > 14) acc += 4;
+    if (a > 15) acc += 0;
+    if (a > 16) acc += 1;
+    if (a > 17) acc += 2;
+    if (a > 18) acc += 3;
+    if (a > 19) acc += 4;
+    if (a > 20) acc += 0;
+    if (a > 21) acc += 1;
+    if (a > 22) acc += 2;
+    if (a > 23) acc += 3;
+    if (a > 24) acc += 4;
+    if (a > 25) acc += 0;
+    if (a > 26) acc += 1;
+    if (a > 27) acc += 2;
+    if (a > 28) acc += 3;
+    if (a > 29) acc += 4;
+    if (a > 30) acc += 0;
+    if (a > 31) acc += 1;
+    if (a > 32) acc += 2;
+    if (a > 33) acc += 3;
+    if (a > 34) acc += 4;
+    if (a > 35) acc += 0;
+    if (a > 36) acc += 1;
+    if (a > 37) acc += 2;
+    if (a > 38) acc += 3;
+    if (a > 39) acc += 4;
+    __int128 x = (__int128)a << s;
+    __int128 y = x >> (s + 1);
+    unsigned __int128 z = (unsigned __int128)x >> s;
+    acc += (long)(x >> 64) + (long)(y >> 64) + (long)(z >> 64) + (long)z;
+    va_list ap;
+    va_start(ap, n);
+    for (int i = 0; i < n; i++)
+        acc += va_arg(ap, long);
+    acc += (long)va_arg(ap, double);
+    struct P p = va_arg(ap, struct P);
+    acc += p.a + p.b;
+    va_end(ap);
+    acc += __sync_val_compare_and_swap(&word, 1, 2);
+    acc += __atomic_fetch_and(&word, 3, __ATOMIC_SEQ_CST);
+    acc += __atomic_exchange_n(&word, 7, __ATOMIC_SEQ_CST);
+    ad += 1.5;
+    ad -= 0.5;
+    acc += (long)ad;
+    double d = a > 3 ? 0.0 : 2.5;
+    acc += (long)(d * 2);
+    long double ld = 0.0L + (long double)a;
+    acc += (long)ld;
+    volatile char big[4096];
+    big[0] = 1;
+    acc += big[0];
+    return acc;
+}
+
+int main(void)
+{
+    struct P p = {3, 4};
+    long r = fname(5, 70, 2, 10L, 20L, 6.0, p);
+    __builtin_printf("%ld\n", r);
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_function_named_like_an_internal_label() {
+    let prefixes = [
+        "i128",
+        "zero_frame",
+        "cas_loop",
+        "cas_fail",
+        "swap_loop",
+        "fadd_loop",
+        "fsub_loop",
+        "va_overflow",
+        "va_done",
+        "va_fp_overflow",
+        "va_fp_done",
+        "va_agg_overflow",
+        "va_agg_done",
+        "sel_then",
+        "sel_done",
+        "cas_done",
+        "atomic_bitop",
+        "i128shl_ge64",
+        "i128shl_done",
+        "i128lsr_ge64",
+        "i128lsr_done",
+        "i128asr_ge64",
+        "i128asr_done",
+        "dbl_const",
+        "quad_const",
+        "ld_const",
+    ];
+    for name in prefixes {
+        let src = INTERNAL_LABEL_NAMED.replace("fname", name);
+        let o2 = vec!["-O2".to_string()];
+        assert_eq!(compile_and_run(name, &src, &[]), 0, "{name} at -O0");
+        assert_eq!(compile_and_run(name, &src, &o2), 0, "{name} at -O2");
+        for opt in ["-O0", "-O2"] {
+            if let Some(code) = compile_and_run_aarch64(name, &src, opt) {
+                assert_eq!(code, 0, "{name} on aarch64 at {opt}");
+            }
         }
     }
 }

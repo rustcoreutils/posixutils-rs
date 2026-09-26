@@ -18,7 +18,7 @@
 //   X15          - Immediate legalization (see `legalize.rs`). Never carries a
 //                  value across an instruction the legalizer could expand;
 //                  `legalize.rs` names the two codegen sequences that borrow
-//                  it within that rule.
+//                  it within that rule, and why they must never overlap.
 //   X16, X17     - Linker scratch (IP0/IP1 per AAPCS64)
 //
 // Codegen MUST use only scratch registers (X9, X10, X11, X16, X17) for
@@ -831,6 +831,145 @@ impl LocalSlot {
     }
 }
 
+/// Where AAPCS64 places one named parameter.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ParamPlace {
+    /// Not passed at all: a zero-sized parameter, which AAPCS64 gives no
+    /// class (`ArgClass::Ignore`) and the call site skips.
+    Absent,
+    /// `count` consecutive general registers from X`first`.
+    Gp { first: usize, count: usize },
+    /// `count` consecutive V registers from V`first`.
+    Fp { first: usize, count: usize },
+    /// On the caller's stack at `at`; `fp` when it is a floating-point value
+    /// or an HFA.
+    Stack { at: IncomingOff, fp: bool },
+}
+
+/// Every named parameter's place, and what they consumed in total.
+pub struct ParamLayout {
+    /// One entry per `Function::params`, in order.
+    pub places: Vec<ParamPlace>,
+    /// General registers the named parameters used up (NGRN, at most 8).
+    pub ngrn: usize,
+    /// V registers the named parameters used up (NSRN, at most 8).
+    pub nsrn: usize,
+    /// Just past the last stacked named parameter.
+    pub stack_end: IncomingOff,
+}
+
+/// Lay out a function's named parameters by AAPCS64 §6.4.2 stage C.
+///
+/// The one implementation of the rule: `allocate_arguments` binds each
+/// parameter's pseudo to its place, and `va_start` reads the totals to know
+/// where the variadic arguments begin. It used to be two walks that each
+/// classified for themselves, and they disagreed twice -- a composite over
+/// sixteen bytes travels as a pointer (one register, or one eight-byte stack
+/// slot) where the tally charged its whole size, and a zero-sized parameter
+/// takes nothing where the tally charged a register -- so `va_arg` read the
+/// wrong slot.
+pub fn param_layout(params: &[(String, TypeId)], types: &TypeTable) -> ParamLayout {
+    use crate::abi::{Aapcs64Abi, Abi, ArgClass, HfaBase, RegClass};
+    const REGS: usize = 8;
+    let abi = Aapcs64Abi::new();
+    let mut ngrn = 0usize;
+    let mut nsrn = 0usize;
+    let mut next = IncomingOff::FIRST;
+    let mut places = Vec::with_capacity(params.len());
+    for (_, typ) in params {
+        let typ = *typ;
+        let stack = |next: &mut IncomingOff, bytes: usize, fp: bool| ParamPlace::Stack {
+            at: IncomingOff::take(
+                next,
+                bytes as i32,
+                crate::abi::aapcs64::stacked_argument_alignment(types, typ) as i32,
+            ),
+            fp,
+        };
+        let place = match abi.classify_param(typ, types) {
+            // Float / double / _Float16 / long double: one V register.
+            ArgClass::Direct { classes, size_bits }
+                if classes.len() == 1 && classes[0] == RegClass::Sse =>
+            {
+                let place = if nsrn < REGS {
+                    ParamPlace::Fp {
+                        first: nsrn,
+                        count: 1,
+                    }
+                } else {
+                    stack(&mut next, (size_bits / 8) as usize, true)
+                };
+                nsrn += 1;
+                place
+            }
+            // An HFA -- a `_Complex`, or a small homogeneous struct -- in
+            // `count` consecutive V registers. Once one is stacked, NSRN
+            // becomes 8 and every later floating-point argument follows it
+            // there (§6.4.2), unlike System V.
+            ArgClass::Hfa { base, count } => {
+                let count = count as usize;
+                let elem = match base {
+                    HfaBase::Float16 => 2,
+                    HfaBase::Float32 => 4,
+                    HfaBase::Float64 => 8,
+                    HfaBase::Float128 => 16,
+                };
+                if nsrn + count <= REGS {
+                    let place = ParamPlace::Fp { first: nsrn, count };
+                    nsrn += count;
+                    place
+                } else {
+                    nsrn = REGS;
+                    stack(&mut next, count * elem, true)
+                }
+            }
+            // A 128-bit integer, or a composite of at most sixteen bytes that
+            // is not an HFA: two consecutive X registers, starting at an even
+            // NGRN when the type is 16-aligned (stage C.10). Not fitting sends
+            // it, and everything after it, to the stack (C.11).
+            class
+                if types.kind(typ) == TypeKind::Int128
+                    || matches!(&class, ArgClass::Direct { classes, .. }
+                        if classes.len() == 2
+                            && classes.iter().all(|c| *c == RegClass::Integer)) =>
+            {
+                match crate::abi::aapcs64::gr_run_start(types, typ, ngrn, 2, REGS) {
+                    Some(first) => {
+                        ngrn = first + 2;
+                        ParamPlace::Gp { first, count: 2 }
+                    }
+                    None => {
+                        ngrn = REGS;
+                        stack(&mut next, 16, false)
+                    }
+                }
+            }
+            ArgClass::Ignore => ParamPlace::Absent,
+            // Integer, pointer and everything else -- including a composite
+            // over sixteen bytes, which travels as a pointer to a copy (stage
+            // C.4) -- takes one X register or one eight-byte slot.
+            _ => {
+                if ngrn < REGS {
+                    ngrn += 1;
+                    ParamPlace::Gp {
+                        first: ngrn - 1,
+                        count: 1,
+                    }
+                } else {
+                    stack(&mut next, 8, false)
+                }
+            }
+        };
+        places.push(place);
+    }
+    ParamLayout {
+        places,
+        ngrn: ngrn.min(REGS),
+        nsrn: nsrn.min(REGS),
+        stack_end: next,
+    }
+}
+
 /// An offset into the **caller's** frame: an argument passed on the stack.
 ///
 /// Starts at 16 -- past the saved frame pointer and return address -- and grows
@@ -1107,6 +1246,14 @@ pub fn get_constraint_info_aarch64(
     Some((clobbers, involved))
 }
 
+/// Whether a constraint point may leave `interval`'s pseudo in a register
+/// it clobbers: only when the pseudo is one of the point's own operands. The
+/// one rule for aarch64, asked both when coloring and when deciding whether
+/// an ABI-pinned argument must leave its register.
+fn exempt_from_clobber(cp: &ConstraintPoint<Reg>, interval: &LiveInterval) -> bool {
+    cp.involved_pseudos.contains(&interval.pseudo)
+}
+
 /// Bytes a spilled floating-point pseudo needs on the stack.
 ///
 /// Every FP spill used a hardcoded 8. That is right for a float or a double and
@@ -1335,6 +1482,14 @@ impl RegAlloc {
         let call_positions = find_call_positions(func, is_call_like_aarch64);
 
         self.spill_args_across_calls(func, types, &intervals, &call_positions);
+        self.spill_gp_args(&intervals, |interval, reg| {
+            crate::arch::regalloc::clobbered_while_live(
+                interval,
+                reg,
+                &constraint_points,
+                exempt_from_clobber,
+            )
+        });
         self.allocate_alloca_to_stack(func);
         self.run_chordal_color(func, types, intervals, &call_positions, &constraint_points);
 
@@ -1359,35 +1514,18 @@ impl RegAlloc {
         self.frame_base = FrameBase::Fp;
     }
 
-    /// Pre-allocate argument registers per AAPCS64
+    /// Pre-allocate argument registers per AAPCS64.
     ///
-    /// AAPCS64 passes arguments as follows:
-    /// - First 8 integer/pointer args in X0-X7
-    /// - First 8 FP args in V0-V7 (D0-D7 for doubles, S0-S7 for floats)
-    /// - Remaining args go on the stack in parameter order (not separated by type)
+    /// Where each parameter arrives is [`param_layout`]'s answer; this only
+    /// binds the parameters' pseudos to it. `va_start` reads the same layout's
+    /// totals, so the two cannot disagree about where the variadic arguments
+    /// begin.
     fn allocate_arguments(&mut self, func: &Function, types: &TypeTable) {
-        use crate::abi::{Aapcs64Abi, ArgClass, HfaBase, RegClass};
         use crate::arch::regalloc::AbiLowering;
 
         let int_arg_regs = Reg::arg_regs();
         let fp_arg_regs = VReg::arg_regs();
-        let mut int_arg_idx = 0usize;
-        let mut fp_arg_idx = 0usize;
-        // Stack offset for overflow args — shared across all types because
-        // AAPCS64 places stack args in parameter order.
-        // The caller's frame, typed so it cannot be confused with a local
-        // slot: it grows upwards from just past the saved FP and LR, where a
-        // `LocalSlot` grows downwards.
-        let mut next_incoming = IncomingOff::FIRST;
-
-        // Consume the ABI contract through the shared AbiLowering helper.
-        // AAPCS64 is simpler than SysV AMD64: no `_Complex`-vs-two-SSE-
-        // struct distinction, no x87 long-double special case. The
-        // existing backend dispatched only on `is_float` and `Int128`,
-        // and we preserve those two specialized arms; everything else
-        // goes through the single-GP-register path.
-        let abi = Aapcs64Abi::new();
-        let lowering = AbiLowering::new(func, types);
+        let lowering = AbiLowering::new(func);
 
         // Allocate X8 for the hidden sret return pointer if present.
         // (Unlike x86_64, X8 is a dedicated indirect-result register, not
@@ -1397,176 +1535,49 @@ impl RegAlloc {
             self.locations.insert(sret_id, Loc::Reg(Reg::X8));
         }
 
-        for arg in lowering.iter_args(&abi) {
-            let pseudo = arg.pseudo;
-
-            match &arg.class {
-                // Float / double / Float16 / long double — single V register
-                // (or stack slot when V0–V7 are exhausted).
-                ArgClass::Direct { classes, size_bits }
-                    if classes.len() == 1 && classes[0] == RegClass::Sse =>
-                {
-                    if fp_arg_idx < fp_arg_regs.len() {
-                        self.locations
-                            .insert(pseudo, Loc::VReg(fp_arg_regs[fp_arg_idx]));
-                        self.free_fp_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
-                        self.fp_pseudos.insert(pseudo);
-                    } else {
-                        let at = IncomingOff::take(
-                            &mut next_incoming,
-                            (*size_bits / 8) as i32,
-                            crate::abi::aapcs64::argument_alignment(types, arg.typ) as i32,
-                        );
-                        self.locations.insert(pseudo, Loc::IncomingArg(at));
-                        self.fp_pseudos.insert(pseudo);
-                    }
-                    fp_arg_idx += 1;
+        let layout = param_layout(&func.params, types);
+        for (i, place) in layout.places.iter().enumerate() {
+            let arg_idx = i + lowering.arg_idx_offset as usize;
+            let Some(pseudo) = lowering.arg_pseudos.get(arg_idx).copied().flatten() else {
+                continue;
+            };
+            let typ = func.params[i].1;
+            match *place {
+                ParamPlace::Absent => {}
+                ParamPlace::Fp { first, count } => {
+                    self.locations.insert(pseudo, Loc::VReg(fp_arg_regs[first]));
+                    let used = &fp_arg_regs[first..first + count];
+                    self.free_fp_regs.retain(|r| !used.contains(r));
+                    self.fp_pseudos.insert(pseudo);
                 }
-                // HFA — a `_Complex`, or a small homogeneous struct: `count`
-                // consecutive V registers. The prologue writes them into the
-                // parameter's local; what has to be right here is the *count*,
-                // so later arguments look in the right place.
-                //
-                // Falling through to the catch-all below took a GP register
-                // and never touched `fp_arg_idx`, so a `float` following a
-                // `float _Complex` was read from V0 — the register holding
-                // the complex value's real part.
-                ArgClass::Hfa { base, count } => {
-                    let count = *count as usize;
-                    let elem_bytes = match base {
-                        HfaBase::Float16 => 2,
-                        HfaBase::Float32 => 4,
-                        HfaBase::Float64 => 8,
-                        HfaBase::Float128 => 16,
-                    };
-                    if fp_arg_idx + count <= fp_arg_regs.len() {
-                        self.locations
-                            .insert(pseudo, Loc::VReg(fp_arg_regs[fp_arg_idx]));
-                        let used = &fp_arg_regs[fp_arg_idx..fp_arg_idx + count];
-                        self.free_fp_regs.retain(|r| !used.contains(r));
+                // __int128 arrives in an even-aligned register pair, but
+                // always lives in a 16-byte local slot; the prologue spills
+                // the pair into it.
+                ParamPlace::Gp { first, count } if types.kind(typ) == TypeKind::Int128 => {
+                    self.stack_offset += 16;
+                    let slot = -self.stack_offset;
+                    self.locations
+                        .insert(pseudo, Loc::Stack(LocalSlot::from_displacement(slot)));
+                    let used = &int_arg_regs[first..first + count];
+                    self.free_regs.retain(|r| !used.contains(r));
+                }
+                // A scalar, or a composite of at most sixteen bytes in
+                // consecutive X registers: the prologue writes those into the
+                // parameter's local, so what matters here is the reservation.
+                ParamPlace::Gp { first, count } => {
+                    self.locations.insert(pseudo, Loc::Reg(int_arg_regs[first]));
+                    let used = &int_arg_regs[first..first + count];
+                    self.free_regs.retain(|r| !used.contains(r));
+                }
+                ParamPlace::Stack { at, fp } => {
+                    self.locations.insert(pseudo, Loc::IncomingArg(at));
+                    if fp {
                         self.fp_pseudos.insert(pseudo);
-                        fp_arg_idx += count;
-                    } else {
-                        let at = IncomingOff::take(
-                            &mut next_incoming,
-                            (count * elem_bytes) as i32,
-                            crate::abi::aapcs64::argument_alignment(types, arg.typ) as i32,
-                        );
-                        self.locations.insert(pseudo, Loc::IncomingArg(at));
-                        self.fp_pseudos.insert(pseudo);
-                        // AAPCS64 §6.4.2: once an argument is laid out on the
-                        // stack, NSRN is set to 8 and every later
-                        // floating-point argument follows it there — unlike
-                        // System V, which leaves the unused registers free.
-                        fp_arg_idx = fp_arg_regs.len();
                     }
-                }
-                // __int128: two consecutive GP registers when available.
-                // The value always lives in a 16-byte aligned local stack
-                // slot; the prologue spills the register pair into it.
-                _ if arg.is_int128 => {
-                    // Stage C.10 puts a 128-bit value in an even-aligned pair,
-                    // so an odd NGRN skips a register. The caller applies the
-                    // same rule through the same helper; disagreeing about
-                    // which pair means each side reads a different one.
-                    if let Some(start) = crate::abi::aapcs64::gr_run_start(
-                        types,
-                        arg.typ,
-                        int_arg_idx,
-                        2,
-                        int_arg_regs.len(),
-                    ) {
-                        int_arg_idx = start;
-                        self.stack_offset += 16;
-                        let slot = -self.stack_offset;
-                        self.locations
-                            .insert(pseudo, Loc::Stack(LocalSlot::from_displacement(slot)));
-                        self.free_regs.retain(|&r| {
-                            r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
-                        });
-                        int_arg_idx += 2;
-                    } else {
-                        // Overflow: 16 bytes on caller stack.
-                        let at = IncomingOff::take(
-                            &mut next_incoming,
-                            16,
-                            crate::abi::aapcs64::argument_alignment(types, arg.typ) as i32,
-                        );
-                        self.locations.insert(pseudo, Loc::IncomingArg(at));
-                        // Stage C.11: NGRN becomes 8, so nothing after it takes
-                        // a register either.
-                        int_arg_idx = int_arg_regs.len();
-                    }
-                }
-                // A composite of at most sixteen bytes that is not an HFA:
-                // AAPCS64 §5.4.2 C.10 puts it in consecutive X registers. The
-                // prologue writes them into the parameter's local, so what has
-                // to be right here is the *count* and the reservation. Falling
-                // through to the catch-all took one register and advanced by
-                // one, which is how every later argument moved as well.
-                ArgClass::Direct { classes, .. }
-                    if classes.len() == 2 && classes.iter().all(|c| *c == RegClass::Integer) =>
-                {
-                    // Stage C.10: a 16-aligned composite starts at an even
-                    // NGRN, the same helper the `__int128` arm above uses.
-                    if let Some(start) = crate::abi::aapcs64::gr_run_start(
-                        types,
-                        arg.typ,
-                        int_arg_idx,
-                        2,
-                        int_arg_regs.len(),
-                    ) {
-                        int_arg_idx = start;
-                        self.locations
-                            .insert(pseudo, Loc::Reg(int_arg_regs[int_arg_idx]));
-                        self.free_regs.retain(|&r| {
-                            r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
-                        });
-                        int_arg_idx += 2;
-                    } else {
-                        let at = IncomingOff::take(
-                            &mut next_incoming,
-                            16,
-                            crate::abi::aapcs64::argument_alignment(types, arg.typ) as i32,
-                        );
-                        self.locations.insert(pseudo, Loc::IncomingArg(at));
-                        // Stage C.11: NGRN becomes 8, so nothing after it
-                        // takes a register either.
-                        int_arg_idx = int_arg_regs.len();
-                    }
-                }
-                // A zero-sized parameter is not passed at all -- AAPCS64
-                // gives it no class, which is what `Ignore` records, and the
-                // call site skips it. Without this arm it fell into the
-                // catch-all below and was charged a general register, so
-                // every later parameter read one register too high. Both
-                // sides were wrong together, so only a gcc-compiled caller
-                // could show it.
-                ArgClass::Ignore => {}
-                // Integer / pointer / extension / mixed aggregate /
-                // HFA-or-Indirect-falling-through: all default to a
-                // single GP register or 8-byte stack slot. This matches
-                // the existing (admittedly limited) AAPCS64 handling
-                // that does not yet differentiate HFAs or large
-                // aggregates from ordinary integers.
-                _ => {
-                    if int_arg_idx < int_arg_regs.len() {
-                        self.locations
-                            .insert(pseudo, Loc::Reg(int_arg_regs[int_arg_idx]));
-                        self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
-                    } else {
-                        let at = IncomingOff::take(
-                            &mut next_incoming,
-                            8,
-                            crate::abi::aapcs64::argument_alignment(types, arg.typ) as i32,
-                        );
-                        self.locations.insert(pseudo, Loc::IncomingArg(at));
-                    }
-                    int_arg_idx += 1;
                 }
             }
         }
-        crate::arch::regalloc::check_incoming_area(next_incoming.displacement(), self.func_pos);
+        crate::arch::regalloc::check_incoming_area(layout.stack_end.displacement(), self.func_pos);
     }
 
     /// Force alloca results to stack to avoid clobbering issues
@@ -1587,6 +1598,48 @@ impl RegAlloc {
         intervals: &[LiveInterval],
         call_positions: &[usize],
     ) {
+        self.spill_gp_args(intervals, |interval, _| {
+            interval_crosses_call(interval, call_positions)
+        });
+
+        // Check FP arguments in caller-saved registers (v0-v7)
+        let fp_arg_regs_set = VReg::arg_regs();
+        for interval in intervals {
+            if let Some(Loc::VReg(reg)) = self.locations.get(&interval.pseudo) {
+                if fp_arg_regs_set.contains(reg) && interval_crosses_call(interval, call_positions)
+                {
+                    let from_reg = *reg;
+                    // Reserve what the value actually needs: a binary128
+                    // argument is sixteen bytes, and eight left half of it
+                    // overlapping whatever came next.
+                    let bytes = fp_arg_bytes(func, interval.pseudo, types);
+                    let slot = LocalSlot::alloc(&mut self.stack_offset, bytes);
+
+                    // Record the spill for codegen to emit stores in prologue
+                    self.spilled_args.push(SpilledArg {
+                        pseudo: interval.pseudo,
+                        from_gp_reg: None,
+                        from_fp_reg: Some(from_reg),
+                        to_stack_offset: slot,
+                        bytes,
+                    });
+
+                    self.locations.insert(interval.pseudo, Loc::Stack(slot));
+                    self.free_fp_regs.push(from_reg);
+                }
+            }
+        }
+    }
+
+    /// Spill a GP argument -- including the sret pointer in X8 -- out of its
+    /// ABI register when `overwritten` says something destroys that register
+    /// while the argument is live. See
+    /// [`crate::arch::regalloc::spill_gp_args_across`].
+    fn spill_gp_args(
+        &mut self,
+        intervals: &[LiveInterval],
+        overwritten: impl Fn(&LiveInterval, Reg) -> bool,
+    ) {
         let int_arg_regs_set: &[Reg] = Reg::arg_regs();
         let spilled_args = &mut self.spilled_args;
         let free_regs = &mut self.free_regs;
@@ -1594,10 +1647,11 @@ impl RegAlloc {
         // may use X8 freely, and a call that itself returns a large aggregate
         // loads X8 with *its* buffer. Left out of this set, a function
         // returning a large struct that called anything stored its result
-        // through the last callee's buffer: the caller received zeros.
-        crate::arch::regalloc::spill_gp_args_across_calls(
+        // through the last callee's buffer: the caller received zeros. An
+        // atomic's fixed scratch clobbers X8 too.
+        crate::arch::regalloc::spill_gp_args_across(
             intervals,
-            call_positions,
+            overwritten,
             &mut self.locations,
             &mut self.stack_offset,
             |reg| int_arg_regs_set.contains(&reg) || reg == Reg::X8,
@@ -1628,34 +1682,6 @@ impl RegAlloc {
                 }
             },
         );
-
-        // Check FP arguments in caller-saved registers (v0-v7)
-        let fp_arg_regs_set = VReg::arg_regs();
-        for interval in intervals {
-            if let Some(Loc::VReg(reg)) = self.locations.get(&interval.pseudo) {
-                if fp_arg_regs_set.contains(reg) && interval_crosses_call(interval, call_positions)
-                {
-                    let from_reg = *reg;
-                    // Reserve what the value actually needs: a binary128
-                    // argument is sixteen bytes, and eight left half of it
-                    // overlapping whatever came next.
-                    let bytes = fp_arg_bytes(func, interval.pseudo, types);
-                    let slot = LocalSlot::alloc(&mut self.stack_offset, bytes);
-
-                    // Record the spill for codegen to emit stores in prologue
-                    self.spilled_args.push(SpilledArg {
-                        pseudo: interval.pseudo,
-                        from_gp_reg: None,
-                        from_fp_reg: Some(from_reg),
-                        to_stack_offset: slot,
-                        bytes,
-                    });
-
-                    self.locations.insert(interval.pseudo, Loc::Stack(slot));
-                    self.free_fp_regs.push(from_reg);
-                }
-            }
-        }
     }
 
     /// Get arguments that were spilled from caller-saved registers
@@ -1962,7 +1988,7 @@ impl RegAlloc {
             constraint_points,
             intervals,
             gp_candidates,
-            |cp, interval| cp.involved_pseudos.contains(&interval.pseudo),
+            exempt_from_clobber,
         );
         let mut in_loop_set: std::collections::BTreeSet<PseudoId> =
             std::collections::BTreeSet::new();

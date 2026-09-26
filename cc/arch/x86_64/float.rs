@@ -624,8 +624,8 @@ impl X86_64CodeGen {
             let uid = self.unique_label_counter;
             self.unique_label_counter += 1;
             // Use high block_id values (10000+) to avoid colliding with basic block IDs
-            let unsigned_label = Label::new(&self.base.current_fn, 10000 + uid * 2);
-            let done_label = Label::new(&self.base.current_fn, 10000 + uid * 2 + 1);
+            let unsigned_label = Label::block(&self.base.current_fn, 10000 + uid * 2);
+            let done_label = Label::block(&self.base.current_fn, 10000 + uid * 2 + 1);
 
             // test r10, r10 — check sign bit
             self.push_lir(X86Inst::Test {
@@ -817,8 +817,8 @@ impl X86_64CodeGen {
         self.unique_label_counter += 1;
         // High block_id values, as emit_int_to_float does, so these cannot
         // collide with a basic block's own label.
-        let big_label = Label::new(&self.base.current_fn, 10000 + uid * 2);
-        let done_label = Label::new(&self.base.current_fn, 10000 + uid * 2 + 1);
+        let big_label = Label::block(&self.base.current_fn, 10000 + uid * 2);
+        let done_label = Label::block(&self.base.current_fn, 10000 + uid * 2 + 1);
 
         // 2^63 is exactly representable in both float and double.
         const TWO_POW_63: f64 = 9223372036854775808.0;
@@ -991,7 +991,7 @@ impl X86_64CodeGen {
         // `0.0q` shared one entry, and whichever was interned last won.
         let key = ((hi as u128) << 64) | lo as u128;
         self.quad_constants.insert(key, bytes);
-        let label = format!(".Lquad_const_{}", key);
+        let label = crate::arch::lir::internal_label("quad_const", key);
         self.push_lir(X86Inst::MovFp {
             size: FpSize::Quad,
             src: XmmOperand::Mem(MemAddr::RipRelative(crate::arch::lir::Symbol {
@@ -1201,8 +1201,8 @@ impl X86_64CodeGen {
         label_suffix: u32,
         types: &TypeTable,
     ) {
-        let overflow_label = Label::new("va_fp_overflow", label_suffix);
-        let done_label = Label::new("va_fp_done", label_suffix);
+        let overflow_label = Label::internal("va_fp_overflow", label_suffix);
+        let done_label = Label::internal("va_fp_done", label_suffix);
 
         let fp_size = types.size_bits(arg_type);
         // `__float128` occupies a whole XMM register and a sixteen-byte slot.

@@ -38,21 +38,35 @@ enum OperandSetup {
 /// X16 and X17 first -- AAPCS64 intra-procedure scratch -- then whichever of
 /// the codegen scratches X9-X11 the statement has not already spent, then
 /// X15, the legalization register. None is ever allocated, so none holds a
-/// live value or another operand. X15 goes last and its setup is emitted
-/// last, because the legalizer writes it while expanding any earlier setup;
-/// for the same reason an output never gets it, since its store back after the
-/// template may itself need legalizing. A register the statement names as a
+/// live value or another operand. A register the statement names as a
 /// clobber is not used: the template would destroy what it holds.
+///
+/// X15 is lent here under the one rule `legalize.rs` states for it: it is held
+/// only from its own setup, emitted last, to the template, and only by an
+/// operand whose setup never needs X15 as a temporary of its own. The
+/// legalizer's expansions all accept X15 as their destination, so an object's
+/// address, a spill-slot load, a plain global's address or a constant is
+/// fine. An Initial Exec thread-local's address is not -- it is `mrs x15,
+/// tpidr_el0; add dst, x15, dst`, which with the operand in X15 became `add
+/// x15, x15, x15` -- so such an operand is never offered X15
+/// (`setup_borrows_legalize_reg`). When a statement has one, X15 is offered
+/// *first*, to the first operand that may take it, so the one that may not
+/// still finds a register among the others; the setup stays last either way.
+/// An output never gets it, since its store back after the template may
+/// itself need legalizing.
 struct OperandRegs {
     clobbered: Vec<Reg>,
     ip: Vec<Reg>,
     legalize_reg_free: bool,
+    /// Offer X15 before the others: the statement has an operand that may
+    /// not take it, which must be left one that it may.
+    legalize_reg_first: bool,
     given: Vec<((PseudoId, i32), Reg)>,
     setups: Vec<(Reg, OperandSetup)>,
 }
 
 impl OperandRegs {
-    fn new(clobbers: &[String]) -> Self {
+    fn new(clobbers: &[String], legalize_reg_first: bool) -> Self {
         let clobbered: Vec<Reg> = clobbers
             .iter()
             .filter_map(|c| parse_gp_clobber_name(c))
@@ -66,6 +80,7 @@ impl OperandRegs {
             clobbered,
             ip,
             legalize_reg_free,
+            legalize_reg_first,
             given: Vec::new(),
             setups: Vec::new(),
         }
@@ -75,6 +90,10 @@ impl OperandRegs {
     /// statement's shared codegen-scratch budget -- only after X16/X17, and
     /// X15 last and only when `legalize_reg_ok`.
     fn take(&mut self, gp_scratch: &mut Vec<Reg>, legalize_reg_ok: bool) -> Option<Reg> {
+        if legalize_reg_ok && self.legalize_reg_first && self.legalize_reg_free {
+            self.legalize_reg_free = false;
+            return Some(LEGALIZE_REG);
+        }
         if let Some(r) = self.ip.pop() {
             return Some(r);
         }
@@ -195,7 +214,14 @@ impl Aarch64CodeGen {
         // Vector operands copied into their scratch before it.
         let mut vec_input_moves: Vec<(VReg, Loc, u32)> = Vec::new();
         // Operands that have to be put in a scratch register first.
-        let mut addr_regs = OperandRegs::new(&asm_data.clobbers);
+        let mut addr_regs = OperandRegs::new(
+            &asm_data.clobbers,
+            asm_data
+                .outputs
+                .iter()
+                .chain(&asm_data.inputs)
+                .any(|c| self.names_ie_thread_local(c.pseudo)),
+        );
         // Register outputs the allocator gave no register: written by the
         // template into a scratch, stored back after it.
         let mut gp_output_moves: Vec<(Reg, Loc, u32)> = Vec::new();
@@ -498,7 +524,12 @@ impl Aarch64CodeGen {
                 Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Global(_)
                     if !requires_mem && Self::constraint_requires_reg_class(&input.constraint) =>
                 {
-                    let Some(reg) = addr_regs.take(&mut gp_scratch, true) else {
+                    let setup = OperandSetup::Value {
+                        pseudo: input.pseudo,
+                        size: op_size,
+                    };
+                    let x15_ok = !self.setup_borrows_legalize_reg(&setup);
+                    let Some(reg) = addr_regs.take(&mut gp_scratch, x15_ok) else {
                         crate::diag::error(
                             insn.pos.unwrap_or_default(),
                             "too many register operands in one asm statement; \
@@ -507,13 +538,7 @@ impl Aarch64CodeGen {
                         slots.push(mk(Some(Reg::X9), None));
                         continue;
                     };
-                    addr_regs.setups.push((
-                        reg,
-                        OperandSetup::Value {
-                            pseudo: input.pseudo,
-                            size: op_size,
-                        },
-                    ));
+                    addr_regs.setups.push((reg, setup));
                     slots.push(mk(Some(reg), None));
                 }
                 _ if requires_mem => {
@@ -556,7 +581,8 @@ impl Aarch64CodeGen {
             .map(|(bb_id, name)| {
                 // Through `Label` rather than a second spelling of the same
                 // format, so the quoting cannot be missed here.
-                let label_str = crate::arch::lir::Label::new(&self.base.current_fn, bb_id.0).name();
+                let label_str =
+                    crate::arch::lir::Label::block(&self.base.current_fn, bb_id.0).name();
                 (label_str, name.clone())
             })
             .collect();
@@ -690,7 +716,8 @@ impl Aarch64CodeGen {
             },
             other => return self.loc_to_asm_string(other, size_bits),
         };
-        let Some(reg) = regs.take(gp_scratch, true) else {
+        let x15_ok = !self.setup_borrows_legalize_reg(&setup);
+        let Some(reg) = regs.take(gp_scratch, x15_ok) else {
             crate::diag::error(
                 insn.pos.unwrap_or_default(),
                 "too many memory operands in one asm statement need their address \
@@ -702,6 +729,28 @@ impl Aarch64CodeGen {
         regs.given.push((key, reg));
         regs.setups.push((reg, setup));
         format!("[{}]", asm_reg_name_64(reg))
+    }
+
+    /// Whether putting `setup` in a register would also need X15 as a
+    /// temporary: the Initial Exec sequence for a thread-local's address,
+    /// whether the operand is that address or the thread-local's value. See
+    /// [`OperandRegs`].
+    fn setup_borrows_legalize_reg(&self, setup: &OperandSetup) -> bool {
+        match setup {
+            OperandSetup::Global { name, .. } => self.is_ie_thread_local(name),
+            OperandSetup::Value { pseudo, .. } => self.names_ie_thread_local(*pseudo),
+            _ => false,
+        }
+    }
+
+    /// Whether `pseudo` lives in an Initial Exec thread-local, whose address
+    /// takes X15 as a temporary to compute.
+    fn names_ie_thread_local(&self, pseudo: PseudoId) -> bool {
+        matches!(self.get_location(pseudo), Loc::Global(name) if self.is_ie_thread_local(&name))
+    }
+
+    fn is_ie_thread_local(&self, name: &str) -> bool {
+        self.is_elf_tls(name) && self.use_tls_ie(name)
     }
 
     /// Put an operand's address or value in `reg`.

@@ -194,8 +194,8 @@ impl X86_64CodeGen {
         // shape twice over: it loaded `overflow_arg_area` into R11 and then
         // wrote the advanced pointer back to `8(%r11)`, an address derived
         // from the pointer it had just destroyed.
-        let overflow_label = Label::new("va_overflow", label_suffix);
-        let done_label = Label::new("va_done", label_suffix);
+        let overflow_label = Label::internal("va_overflow", label_suffix);
+        let done_label = Label::internal("va_done", label_suffix);
         let lir_arg_size = OperandSize::from_bits(arg_size);
 
         // gp_offset -> R10d
@@ -318,8 +318,8 @@ impl X86_64CodeGen {
         dst_loc: &Loc,
         label_suffix: u32,
     ) {
-        let overflow_label = Label::new("va_overflow", label_suffix);
-        let done_label = Label::new("va_done", label_suffix);
+        let overflow_label = Label::internal("va_overflow", label_suffix);
+        let done_label = Label::internal("va_done", label_suffix);
 
         // gp_offset -> R10d; both eightbytes must fit in the save area.
         self.push_lir(X86Inst::Mov {
@@ -632,8 +632,8 @@ impl X86_64CodeGen {
         let num_gp = classes.iter().filter(|c| **c == RegClass::Integer).count() as i32;
         let num_sse = classes.iter().filter(|c| **c == RegClass::Sse).count() as i32;
 
-        let overflow_label = Label::new("va_agg_overflow", label_suffix);
-        let done_label = Label::new("va_agg_done", label_suffix);
+        let overflow_label = Label::internal("va_agg_overflow", label_suffix);
+        let done_label = Label::internal("va_agg_done", label_suffix);
 
         // GP_OFFSET_MAX is 48 (six general registers), FP_OFFSET_MAX 176
         // (48 plus eight SSE registers of 16 bytes). An aggregate needs all of

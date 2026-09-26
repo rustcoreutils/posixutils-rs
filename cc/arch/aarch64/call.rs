@@ -66,7 +66,7 @@ impl StackArg {
         // `aligned(32)` struct is placed where gcc places it rather than
         // padded to 32. See that function for the measured rule.
         let align = self.typ.map_or(8, |t| {
-            crate::abi::aapcs64::argument_alignment(types, t) as i32
+            crate::abi::aapcs64::stacked_argument_alignment(types, t) as i32
         });
         (at + align - 1) & !(align - 1)
     }

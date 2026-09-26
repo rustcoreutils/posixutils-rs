@@ -9,9 +9,8 @@
 // Common register allocator utilities shared between architectures
 //
 
-use crate::abi::{Abi, ArgClass};
 use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
-use crate::types::{TypeKind, TypeTable};
+use crate::types::TypeTable;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
@@ -964,20 +963,51 @@ pub fn assign_alloca_slots<L, F>(
     }
 }
 
-/// Spill GP arguments that live in caller-saved registers and cross a
-/// call instruction.
+/// Does anything overwrite `reg` while `interval` is live -- a constraint
+/// point that clobbers it and does not exempt the interval's pseudo?
 ///
-/// The GP path is identical between backends modulo the per-arch
-/// callbacks: the caller supplies which registers are arg-passing,
-/// how to extract a register from a `Loc`, how to construct the new
-/// `Loc::Stack` for the spilled value, and how to record the spill
-/// metadata for the prologue. The stack-offset sign convention is
-/// folded into `mk_stack_loc` and `record_spill` so this helper
-/// itself is sign-agnostic.
+/// The coloring pass asks the same question of the pseudos it places, through
+/// [`constraint_clobbers`], which is where each backend's `exempt` rule comes
+/// from; an ABI-pinned argument never reaches that pass, so
+/// [`spill_gp_args_across`] asks it here.
+pub fn clobbered_while_live<R: PartialEq>(
+    interval: &LiveInterval,
+    reg: R,
+    constraint_points: &[ConstraintPoint<R>],
+    exempt: impl Fn(&ConstraintPoint<R>, &LiveInterval) -> bool,
+) -> bool {
+    constraint_points.iter().any(|cp| {
+        interval.start <= cp.position
+            && cp.position <= interval.end
+            && cp.clobbers.contains(&reg)
+            && !exempt(cp, interval)
+    })
+}
+
+/// Move an ABI-pinned GP argument out of its register when something
+/// overwrites that register while the argument is live.
+///
+/// An argument arrives pre-colored in its ABI register and never goes through
+/// coloring, so the forbidden-color machinery that keeps an ordinary value out
+/// of a clobbered register does not apply to it. `overwritten` says whether its
+/// register is destroyed within its interval: a call (every argument register
+/// is caller-saved), or a constraint point that clobbers it
+/// ([`clobbered_while_live`]) -- inline asm, an atomic's fixed scratch, a
+/// thread-local sequence that calls a resolver or getter. One rule for both
+/// backends: aarch64 once asked only about calls, so a thread-local access
+/// under the descriptor or Mach-O TLV model, which returns its result in x0,
+/// left every later use of an argument that arrived in x0 reading the
+/// thread-local's address.
+///
+/// The caller supplies which registers are argument registers, how to extract
+/// a register from a `Loc`, how to construct the spilled `Loc`, and how to
+/// record the spill for the prologue. The stack-offset sign convention is
+/// folded into `mk_stack_loc` and `record_spill`, so this helper is
+/// sign-agnostic.
 #[allow(clippy::too_many_arguments)]
-pub fn spill_gp_args_across_calls<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpill, PushFree>(
+pub fn spill_gp_args_across<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpill, PushFree>(
     intervals: &[LiveInterval],
-    call_positions: &[usize],
+    overwritten: impl Fn(&LiveInterval, R) -> bool,
     locations: &mut HashMap<PseudoId, L>,
     stack_offset: &mut i32,
     is_arg_reg: IsArg,
@@ -1004,7 +1034,7 @@ pub fn spill_gp_args_across_calls<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpi
         if !is_arg_reg(reg) {
             continue;
         }
-        if !interval_crosses_call(interval, call_positions) {
+        if !overwritten(interval, reg) {
             continue;
         }
         *stack_offset += 8;
@@ -1502,54 +1532,13 @@ pub fn try_reuse_stack_slot(
     None
 }
 
-// `AbiLowering` is the single place the allocator asks the ABI how an
-// argument is passed:
-//
-//   * Build it once per function with the `Function` + `TypeTable`. It
-//     pre-indexes the function's pseudos by `Arg(n)` for O(1) lookup
-//     and detects the hidden sret pointer.
-//
-//   * For each parameter, `iter_args(abi)` yields an `AbiArg` carrying
-//     the `ArgClass` from `abi.classify_param` plus a handful of type
-//     tiebreakers (`is_complex`, `is_long_double`, `is_int128`) that
-//     `ArgClass` alone cannot disambiguate — most notably, x86_64
-//     `_Complex float`/`_Complex double` and a 2-eightbyte all-SSE
-//     struct both classify as `Direct { classes: [Sse, Sse] }` but the
-//     backend routes them differently.
-//
-// Backends still own the actual `Loc` decision because `Loc` is per-arch
-// (each has its own `Reg`/`XmmReg`/`VReg`). They dispatch on `arg.class`
-// and the `is_*` flags.
-
-/// Per-argument context yielded by `AbiLowering::iter_args`.
+/// A function's incoming-argument pseudos, indexed for the allocators.
 ///
-/// Carries the ABI classification together with the type tiebreakers a
-/// backend may need beyond `ArgClass` alone.
-#[derive(Debug, Clone)]
-pub struct AbiArg {
-    /// The pseudo representing this argument in the function's IR.
-    pub pseudo: PseudoId,
-    /// Classification produced by `abi.classify_param(typ, types)`.
-    pub class: ArgClass,
-    /// The parameter's type. `ArgClass` carries a size but not an alignment,
-    /// and the two do not follow one another: `struct { long a, b; }` is
-    /// sixteen bytes and eight-byte aligned, while `__int128` is sixteen of
-    /// each. A stacked argument's address depends on the alignment.
-    pub typ: crate::types::TypeId,
-    /// True iff the type is `__int128` / `unsigned __int128`. Backends
-    /// always allocate an aligned local stack slot for int128 even when
-    /// the value arrives in a register pair.
-    pub is_int128: bool,
-}
-
-/// Allocator-side adapter over `cc/abi/*::classify_param`.
-///
-/// Construct once per function being lowered, then iterate the function's
-/// parameters with `iter_args(abi)`. The struct caches the sret detection
-/// and a per-`Arg(n)` pseudo index so per-arg work is O(1).
-pub struct AbiLowering<'a> {
-    func: &'a Function,
-    types: &'a TypeTable,
+/// Built once per function: it indexes the pseudos by `Arg(n)` for O(1)
+/// lookup and detects the hidden sret pointer. How each argument is *passed*
+/// is the backend's own layout -- on aarch64 `param_layout`, the one rule
+/// `va_start` reads as well.
+pub struct AbiLowering {
     /// PseudoId for each `Arg(n)`. `n` indexes the vector; absent
     /// positions are `None`. Vector length covers `0..=max_arg_index`.
     pub arg_pseudos: Vec<Option<PseudoId>>,
@@ -1562,12 +1551,9 @@ pub struct AbiLowering<'a> {
     pub arg_idx_offset: u32,
 }
 
-impl<'a> AbiLowering<'a> {
-    /// Build an `AbiLowering` for `func`. Does not consult any `Abi`
-    /// yet — the per-arg classification is produced lazily by
-    /// `iter_args` so the same `AbiLowering` can be reused across
-    /// alternative calling-convention overrides if ever needed.
-    pub fn new(func: &'a Function, types: &'a TypeTable) -> Self {
+impl AbiLowering {
+    /// Build an `AbiLowering` for `func`.
+    pub fn new(func: &Function) -> Self {
         // Detect the hidden return pointer for large struct returns.
         // The linearizer emits it as `Arg(0)` with the literal name
         // `__sret`, shifting all normal-parameter `Arg(n)` indices by 1.
@@ -1600,34 +1586,10 @@ impl<'a> AbiLowering<'a> {
         }
 
         Self {
-            func,
-            types,
             arg_pseudos,
             sret_pseudo,
             arg_idx_offset,
         }
-    }
-
-    /// Iterate the function's parameters in declaration order, yielding
-    /// the per-arg context backends need. The sret pseudo (if any) is
-    /// not yielded — callers handle it explicitly via `self.sret_pseudo`.
-    pub fn iter_args<'b>(&'b self, abi: &'b dyn Abi) -> impl Iterator<Item = AbiArg> + 'b {
-        self.func
-            .params
-            .iter()
-            .enumerate()
-            .filter_map(move |(i, (_name, typ))| {
-                let arg_idx = (i as u32) + self.arg_idx_offset;
-                let pseudo = self.arg_pseudos.get(arg_idx as usize).copied().flatten()?;
-                let class = abi.classify_param(*typ, self.types);
-                let kind = self.types.kind(*typ);
-                Some(AbiArg {
-                    pseudo,
-                    class,
-                    typ: *typ,
-                    is_int128: kind == TypeKind::Int128,
-                })
-            })
     }
 }
 

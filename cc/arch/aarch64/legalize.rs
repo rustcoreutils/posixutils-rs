@@ -18,10 +18,16 @@
 //! unchanged -- that is the invariant the tests below pin -- and one that
 //! does not is expanded through X15, which the register allocator never
 //! hands out. X15 never carries a value across an instruction the legalizer
-//! could expand. Two other users keep to that rule: an inline-asm memory
-//! operand's address, set up last, immediately before the template; and the
-//! Initial Exec TLS sequence, which holds the thread pointer in it from the
-//! `mrs` to the `add` that follows, neither of which is ever expanded.
+//! could expand. Two other users keep to that rule, and must not overlap:
+//!
+//! - the Initial Exec TLS sequence holds the thread pointer in it from the
+//!   `mrs` to the `add` that follows, neither of which is ever expanded -- so
+//!   it can never be asked for its *result* in X15 (a debug assertion says
+//!   so);
+//! - an inline-asm operand may be put in X15, set up last, immediately before
+//!   the template -- but only an operand whose own setup never borrows X15,
+//!   which rules out an Initial Exec thread-local's address or value
+//!   (`OperandRegs` in inline_asm.rs).
 //!
 //! The ranges, in bytes:
 //!

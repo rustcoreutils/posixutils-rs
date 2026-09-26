@@ -2274,6 +2274,8 @@ int main(void) {{ return many_memory_operands(); }}
     )
 }
 
+/// The template is x86-64 assembly, run on the host: an x86-64 host only.
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn codegen_inline_asm_local_memory_operands_x86_64() {
     let src = many_local_memory_operands_x86_64();
@@ -2370,15 +2372,21 @@ int main(void)
 
 #[test]
 fn codegen_inline_asm_mixed_memory_operands() {
-    let opts = vec!["-O2".to_string()];
-    assert_eq!(
-        compile_and_run("asm_mem_mix", MIXED_MEMORY_OPERANDS_X86_64, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run("asm_mem_mix_o2", MIXED_MEMORY_OPERANDS_X86_64, &opts),
-        0
-    );
+    // The x86-64 half is x86-64 assembly run on the host; the aarch64 half
+    // runs under qemu on any host that has the cross toolchain.
+    if cfg!(target_arch = "x86_64") {
+        let opts = vec!["-O2".to_string()];
+        assert_eq!(
+            compile_and_run("asm_mem_mix", MIXED_MEMORY_OPERANDS_X86_64, &[]),
+            0
+        );
+        assert_eq!(
+            compile_and_run("asm_mem_mix_o2", MIXED_MEMORY_OPERANDS_X86_64, &opts),
+            0
+        );
+    } else {
+        eprintln!("SKIP asm_mem_mix x86-64 half: not an x86-64 host");
+    }
     for opt in ["-O0", "-O2"] {
         if let Some(code) =
             compile_and_run_aarch64("asm_mem_mix_a64", MIXED_MEMORY_OPERANDS_AARCH64, opt)
@@ -2393,6 +2401,7 @@ fn codegen_inline_asm_mixed_memory_operands() {
 /// fewer allocatable registers than addresses. Those addresses are register
 /// demands of the statement, colored first; the one left over is loaded into
 /// R10. gcc builds this at -O2 and reports impossible constraints at -O0.
+#[cfg(target_arch = "x86_64")]
 const POINTER_MEMORY_OPERANDS_X86_64: &str = r#"
 #define NI __attribute__((noinline))
 NI void *opaque(void *p) { return p; }
@@ -2440,6 +2449,8 @@ NI int pointers(void)
 int main(void) { return pointers(); }
 "#;
 
+/// The template is x86-64 assembly, run on the host: an x86-64 host only.
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn codegen_inline_asm_pointer_memory_operands_under_pressure_x86_64() {
     let opts = vec!["-O2".to_string()];
@@ -2524,15 +2535,21 @@ int main(void)
 
 #[test]
 fn codegen_inline_asm_operands_avoid_clobbered_registers() {
-    let opts = vec!["-O2".to_string()];
-    assert_eq!(
-        compile_and_run("asm_clobbered", CLOBBERED_REGISTERS_X86_64, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run("asm_clobbered_o2", CLOBBERED_REGISTERS_X86_64, &opts),
-        0
-    );
+    // The x86-64 half is x86-64 assembly run on the host; the aarch64 half
+    // runs under qemu on any host that has the cross toolchain.
+    if cfg!(target_arch = "x86_64") {
+        let opts = vec!["-O2".to_string()];
+        assert_eq!(
+            compile_and_run("asm_clobbered", CLOBBERED_REGISTERS_X86_64, &[]),
+            0
+        );
+        assert_eq!(
+            compile_and_run("asm_clobbered_o2", CLOBBERED_REGISTERS_X86_64, &opts),
+            0
+        );
+    } else {
+        eprintln!("SKIP asm_clobbered x86-64 half: not an x86-64 host");
+    }
     for opt in ["-O0", "-O2"] {
         if let Some(code) =
             compile_and_run_aarch64("asm_clobbered_a64", CLOBBERED_REGISTERS_AARCH64, opt)

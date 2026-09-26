@@ -978,8 +978,6 @@ impl TypeTable {
         table
     }
 
-    /// Intern a type, returning its unique ID
-    /// Deduplicates equivalent types (same ID for equivalent types)
     /// A fresh identity for a tagless composite definition; see
     /// [`CompositeType::anon_id`].
     pub fn fresh_anon_id(&mut self) -> u32 {
@@ -987,6 +985,8 @@ impl TypeTable {
         self.next_anon_id
     }
 
+    /// Intern a type, returning its unique ID.
+    /// Deduplicates equivalent types (same ID for equivalent types).
     pub fn intern(&mut self, typ: Type) -> TypeId {
         // Try to create a key for deduplication
         if let Some(key) = self.make_key(&typ) {

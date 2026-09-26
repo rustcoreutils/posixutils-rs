@@ -261,7 +261,9 @@ impl Target {
     ///
     /// ELF (Linux, FreeBSD) folds Local and Initial Exec into the access and
     /// needs a descriptor call only for shared code, and only Linux takes the
-    /// descriptor model here. Mach-O always calls the TLV getter.
+    /// descriptor model here: FreeBSD's shared code uses Initial Exec, never
+    /// Local Exec (see `CodeGenBase::use_tls_ie`). Mach-O always calls the TLV
+    /// getter.
     pub fn tls_access(&self, shared_mode: bool) -> TlsAccess {
         match self.os {
             Os::MacOS => TlsAccess::MachOTlv,

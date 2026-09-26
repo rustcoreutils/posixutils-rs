@@ -209,11 +209,14 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     ///
     /// Local Exec fixes the offset from the thread pointer at link time, which
     /// only holds for the main executable and for a thread-local defined in
-    /// this object. Anything position-independent, and any symbol defined
-    /// elsewhere -- which is what `is_extern` reports -- needs the offset
-    /// loaded from the GOT instead.
+    /// this object. Code for a shared object (`shared_mode`), and any symbol
+    /// defined elsewhere -- which is what `is_extern` reports -- needs the
+    /// offset loaded from the GOT instead. On Linux shared code takes the
+    /// descriptor model before it gets here; on FreeBSD, which stays with the
+    /// static models, leaving `shared_mode` out put Local Exec in a shared
+    /// object -- `%fs:t@TPOFF`, a relocation `ld -shared` refuses.
     pub fn use_tls_ie(&self, is_extern: bool) -> bool {
-        self.use_tls_dynamic() || is_extern
+        self.use_tls_dynamic() || is_extern || self.shared_mode
     }
 
     pub fn push_lir(&mut self, inst: I) {

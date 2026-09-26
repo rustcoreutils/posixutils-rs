@@ -2100,7 +2100,7 @@ mod tests {
 
         let mut out = String::new();
         let inst = Aarch64Inst::B {
-            target: Label::new("main", 1),
+            target: Label::block("main", 1),
         };
         inst.emit(&target, &mut out);
         assert_eq!(out.trim(), "b .Lmain_1");
@@ -2108,7 +2108,7 @@ mod tests {
         let mut out = String::new();
         let inst = Aarch64Inst::BCond {
             cond: CondCode::Ne,
-            target: Label::new("main", 2),
+            target: Label::block("main", 2),
         };
         inst.emit(&target, &mut out);
         assert_eq!(out.trim(), "b.ne .Lmain_2");

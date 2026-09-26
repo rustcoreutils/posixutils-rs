@@ -290,7 +290,7 @@ impl Aarch64CodeGen {
     ) {
         // Always emit block ID label for consistency with jumps
         // (jumps reference blocks by ID, not by C label name)
-        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(Label::new(
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(Label::block(
             &self.base.current_fn,
             block.id.0,
         ))));
@@ -360,7 +360,7 @@ impl Aarch64CodeGen {
                 let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
                 if let Some(target) = target {
                     self.push_lir(Aarch64Inst::B {
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
                 return true;
@@ -393,7 +393,7 @@ impl Aarch64CodeGen {
                 };
                 if let Some(target) = target {
                     self.push_lir(Aarch64Inst::B {
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
                 return true;
@@ -403,12 +403,12 @@ impl Aarch64CodeGen {
         if let Some(target) = insn.bb_true {
             self.push_lir(Aarch64Inst::BCond {
                 cond: CondCode::Ne,
-                target: Label::new(&self.base.current_fn, target.0),
+                target: Label::block(&self.base.current_fn, target.0),
             });
         }
         if let Some(target) = insn.bb_false {
             self.push_lir(Aarch64Inst::B {
-                target: Label::new(&self.base.current_fn, target.0),
+                target: Label::block(&self.base.current_fn, target.0),
             });
         }
         false
@@ -482,7 +482,7 @@ impl Aarch64CodeGen {
 
         // Generate comparisons for each case
         for (lo, hi, target_bb) in insn.switch_cases.clone() {
-            let target = Label::new(&self.base.current_fn, target_bb.0);
+            let target = Label::block(&self.base.current_fn, target_bb.0);
             if lo == hi {
                 cmp_const(self, scratch0, lo);
                 self.push_lir(Aarch64Inst::BCond {
@@ -531,7 +531,7 @@ impl Aarch64CodeGen {
 
         if let Some(default_bb) = insn.switch_default {
             self.push_lir(Aarch64Inst::B {
-                target: Label::new(&self.base.current_fn, default_bb.0),
+                target: Label::block(&self.base.current_fn, default_bb.0),
             });
         }
     }
@@ -567,7 +567,7 @@ impl Aarch64CodeGen {
             Opcode::Br => {
                 if let Some(target) = insn.bb_true {
                     self.push_lir(Aarch64Inst::B {
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
             }
@@ -922,7 +922,7 @@ impl Aarch64CodeGen {
 
     /// Whether accessing the thread-local `name` needs the Initial Exec model
     /// rather than Local Exec. See [`CodeGenBase::use_tls_ie`].
-    fn use_tls_ie(&self, name: &str) -> bool {
+    pub(super) fn use_tls_ie(&self, name: &str) -> bool {
         self.base.use_tls_ie(self.extern_symbols.contains(name))
     }
 
@@ -1029,6 +1029,13 @@ impl Aarch64CodeGen {
             // construction: the legalizer cannot touch it between the `mrs`
             // and the `add`, since neither is ever expanded.
             let tmp = super::legalize::LEGALIZE_REG;
+            // The one caller that holds X15 across instructions, inline asm,
+            // never asks this sequence for an address in X15; see
+            // `OperandRegs` in inline_asm.rs.
+            debug_assert_ne!(
+                dst, tmp,
+                "the Initial Exec sequence needs X15 as its temporary"
+            );
             self.push_lir(Aarch64Inst::AdrpGottprel {
                 sym: sym.clone(),
                 dst,
@@ -1257,7 +1264,7 @@ impl Aarch64CodeGen {
     pub(super) fn next_unique_label(&mut self, prefix: &str) -> Label {
         let id = self.unique_label_counter;
         self.unique_label_counter += 1;
-        Label::new(prefix, id)
+        Label::internal(prefix, id)
     }
 }
 

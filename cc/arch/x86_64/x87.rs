@@ -524,7 +524,7 @@ impl X86_64CodeGen {
                 // the 53rd significand bit are different constants, and an
                 // f64-derived key silently merged them into one.
                 let label_bits = v.pool_key();
-                let temp_label = format!(".Lld_const_{}", label_bits);
+                let temp_label = crate::arch::lir::internal_label("ld_const", label_bits);
 
                 let ld_bytes = v.to_x87_bytes();
                 self.ld_constants.insert(label_bits, ld_bytes);
@@ -669,7 +669,7 @@ impl X86_64CodeGen {
                     // double is both correct and lossless.
                     let val = val.to_f64();
                     let bits = val.to_bits();
-                    let label = format!(".Ldbl_const_{}", bits);
+                    let label = crate::arch::lir::internal_label("dbl_const", bits);
                     self.double_constants.insert(bits, val);
                     load_as_float = false;
                     MemAddr::RipRelative(crate::arch::lir::Symbol::local(label))
@@ -904,8 +904,8 @@ impl X86_64CodeGen {
         if dst_size > 32 {
             let uid = self.unique_label_counter;
             self.unique_label_counter += 1;
-            let big_label = Label::new(&self.base.current_fn, 10000 + uid * 2);
-            let done_label = Label::new(&self.base.current_fn, 10000 + uid * 2 + 1);
+            let big_label = Label::block(&self.base.current_fn, 10000 + uid * 2);
+            let done_label = Label::block(&self.base.current_fn, 10000 + uid * 2 + 1);
 
             self.push_lir(X86Inst::MovAbs {
                 imm: TWO_POW_63_BITS,

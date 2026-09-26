@@ -168,88 +168,14 @@ impl Aarch64CodeGen {
             self.emit_variadic_save_area();
         }
 
-        // Measure what the named parameters consumed, for va_start
+        // Measure what the named parameters consumed, for va_start: the same
+        // layout `allocate_arguments` bound them by.
         if is_variadic {
-            // AAPCS64 assigns named parameters to the two register banks
-            // independently, and `va_start` has to skip exactly what they
-            // consumed in each. Both saturate at 8; a named parameter that
-            // arrives after its bank is full lands on the stack instead, and
-            // `__stack` has to start past those too.
-            let mut ngrn = 0usize;
-            let mut nsrn = 0usize;
-            // Summed in `i64`: two stacked parameters each inside
-            // `MAX_STACK_OBJECT_BYTES` still overflow their total, and the
-            // one conversion after the loop is where that is caught.
-            // The named parameters' stacked area, laid out by the very rule
-            // `allocate_arguments` uses, so the two cannot disagree about where
-            // the variadic arguments begin.
-            let mut next_incoming = IncomingOff::FIRST;
-            let abi = crate::abi::get_abi_for_conv(CallingConv::C, &self.base.target);
-            for (_, typ) in &func.params {
-                // Mirror `allocate_arguments`: it dispatches on the ABI class,
-                // and this has to agree with it or `va_start` skips the wrong
-                // number of slots. Asking `is_float` instead counted a
-                // `_Complex` -- two V registers -- as one general one, and an
-                // HFA of any size likewise.
-                let (is_gp, count) = match abi.classify_param(*typ, types) {
-                    ArgClass::Direct { ref classes, .. }
-                        if classes.len() == 1 && classes[0] == crate::abi::RegClass::Sse =>
-                    {
-                        (false, 1)
-                    }
-                    ArgClass::Hfa { count, .. } => (false, count as usize),
-                    _ if types.kind(*typ) == TypeKind::Int128 => (true, 2),
-                    // A composite of at most sixteen bytes takes two general
-                    // registers. Counting it as one left `va_start` pointing a
-                    // slot short, so the first variadic argument of a function
-                    // whose named parameter was such a composite came back as
-                    // the composite's own upper half.
-                    ArgClass::Direct { ref classes, .. }
-                        if classes.len() == 2
-                            && classes.iter().all(|c| *c == crate::abi::RegClass::Integer) =>
-                    {
-                        (true, 2)
-                    }
-                    // Everything else takes a single general register.
-                    _ => (true, 1),
-                };
-                // A run of general registers is subject to stage C.10 -- a
-                // 16-aligned argument starts at an even NGRN -- and both banks
-                // to C.11/§6.4.2, which send everything after an overflow to
-                // the stack. This tally has to reach the same numbers
-                // `allocate_arguments` does, or `va_start` skips the wrong
-                // count of slots.
-                let bank = if is_gp { &mut ngrn } else { &mut nsrn };
-                let start = if is_gp {
-                    crate::abi::aapcs64::gr_run_start(types, *typ, *bank, count, 8)
-                } else {
-                    (*bank + count <= 8).then_some(*bank)
-                };
-                if let Some(start) = start {
-                    *bank = start + count;
-                } else {
-                    *bank = 8;
-                    let bytes = crate::abi::slot_bytes(
-                        types.size_bytes(*typ).max(1),
-                        crate::arch::func_pos(func),
-                        "a stacked parameter",
-                    );
-                    // Aligned before it is placed, as AAPCS64 stage C.16
-                    // requires and `IncomingOff::take` does. Summing
-                    // eight-byte-rounded sizes put a `long double` after an odd
-                    // number of eightbytes eight bytes low, so `va_start`
-                    // pointed one slot short of the first variadic argument.
-                    IncomingOff::take(
-                        &mut next_incoming,
-                        bytes,
-                        crate::abi::aapcs64::argument_alignment(types, *typ) as i32,
-                    );
-                }
-            }
-            self.num_fixed_gp_params = ngrn;
-            self.num_fixed_fp_params = nsrn;
+            let layout = crate::arch::aarch64::regalloc::param_layout(&func.params, types);
+            self.num_fixed_gp_params = layout.ngrn;
+            self.num_fixed_fp_params = layout.nsrn;
             self.named_stack_param_bytes =
-                next_incoming.displacement() - IncomingOff::FIRST.displacement();
+                layout.stack_end.displacement() - IncomingOff::FIRST.displacement();
         }
 
         // Store spilled arguments before any calls can clobber them

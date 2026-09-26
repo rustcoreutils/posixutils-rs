@@ -2680,3 +2680,74 @@ int main(void)
         );
     }
 }
+
+/// A stacked composite passed by reference takes an eight-aligned slot.
+///
+/// A composite over sixteen bytes travels as a pointer to a copy (AAPCS64
+/// C.4), so its stacked slot is a pointer's: eight bytes, eight-aligned,
+/// whatever the composite's own members want. Both c17's caller and callee
+/// aligned the slot to the composite's sixteen-byte member alignment, so
+/// against gcc a c17 callee read the wrong slot and crashed, and a gcc callee
+/// read a c17 caller's `after` from the wrong place.
+#[test]
+fn codegen_aarch64_stacked_by_reference_argument_slot() {
+    if !aarch64_cross_available() {
+        eprintln!("SKIP: no aarch64 cross toolchain");
+        return;
+    }
+    let callee_src = r#"
+struct L { long a; long double b; };
+long callee(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7,
+            long s0, struct L big, long after)
+{
+    return s0 + big.a + (long)big.b + after;
+}
+"#;
+    let caller_src = r#"
+struct L { long a; long double b; };
+long callee(long, long, long, long, long, long, long, long, long, struct L, long);
+int main(void)
+{
+    struct L l = { 10, 20.0L };
+    return callee(0, 0, 0, 0, 0, 0, 0, 0, 1, l, 300) == 331 ? 0 : 1;
+}
+"#;
+    let callee_c = create_c_file("a64_byref_callee", callee_src);
+    let caller_c = create_c_file("a64_byref_caller", caller_src);
+    let callee_path = callee_c.path().to_string_lossy().to_string();
+    let caller_path = caller_c.path().to_string_lossy().to_string();
+    assert_eq!(
+        cross_link_and_run("a64_byref_ref", &[&caller_path, &callee_path]),
+        0,
+        "the gcc/gcc reference must pass"
+    );
+    for opt in ["-O0", "-O2"] {
+        // c17 on one side, gcc on the other, each way round.
+        for (c17_side, gcc_side, what) in [
+            (&callee_path, &caller_path, "c17 callee"),
+            (&caller_path, &callee_path, "c17 caller"),
+        ] {
+            let out = plib::tmp::Builder::new()
+                .prefix("c17_a64_byref_")
+                .suffix(".s")
+                .tempfile()
+                .expect("failed to create temp file");
+            let out_path = out.path().to_string_lossy().to_string();
+            let run = run_c17(&[
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                opt,
+                "-S",
+                "-o",
+                &out_path,
+                c17_side,
+            ]);
+            assert!(run.success, "c17 failed at {opt}:\n{}", run.stderr);
+            assert_eq!(
+                cross_link_and_run("a64_byref", &[&out_path, gcc_side]),
+                0,
+                "{what} at {opt}"
+            );
+        }
+    }
+}

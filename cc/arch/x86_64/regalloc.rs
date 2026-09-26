@@ -979,6 +979,15 @@ impl FrameBase {
     }
 }
 
+/// Whether a constraint point may leave `interval`'s pseudo in a register
+/// it clobbers: only an operand of the instruction, and only at the ends of
+/// its live range (see [`ConstraintPoint::operand_survives`]). The one rule
+/// for x86-64, asked both when coloring and when deciding whether an
+/// ABI-pinned argument must leave its register.
+fn exempt_from_clobber(cp: &ConstraintPoint<Reg>, interval: &LiveInterval) -> bool {
+    cp.operand_survives(interval.pseudo, interval.start, interval.end)
+}
+
 /// Bytes reserved at the bottom of the locals area for the x87 scratch.
 ///
 /// `x87.rs` needs a fixed address to stage an immediate or a general register
@@ -1110,7 +1119,14 @@ impl RegAlloc {
         let fp_call_positions = self.fp_call_positions(func, &call_positions);
 
         self.spill_args_across_calls(func, types, &intervals, &call_positions);
-        self.spill_args_across_constraints(func, &intervals, &constraint_points);
+        self.spill_gp_args(&intervals, |interval, reg| {
+            crate::arch::regalloc::clobbered_while_live(
+                interval,
+                reg,
+                &constraint_points,
+                exempt_from_clobber,
+            )
+        });
         self.allocate_alloca_to_stack(func);
         self.run_chordal_color(
             func,
@@ -1331,7 +1347,7 @@ impl RegAlloc {
         // The shared AbiLowering helper does sret detection and O(1)
         // Arg(n) → pseudo lookup; the classification dispatch below keeps
         // its own inline type-kind checks.
-        let lowering = AbiLowering::new(func, types);
+        let lowering = AbiLowering::new(func);
         let arg_idx_offset = lowering.arg_idx_offset;
 
         // Allocate RDI for hidden return pointer if present
@@ -1632,32 +1648,9 @@ impl RegAlloc {
         intervals: &[LiveInterval],
         call_positions: &[usize],
     ) {
-        let int_arg_regs_set: &[Reg] = Reg::arg_regs();
-        let spilled_args = &mut self.spilled_args;
-        let free_regs = &mut self.free_regs;
-        crate::arch::regalloc::spill_gp_args_across_calls(
-            intervals,
-            call_positions,
-            &mut self.locations,
-            &mut self.stack_offset,
-            |reg| int_arg_regs_set.contains(&reg),
-            |loc| {
-                if let Loc::Reg(reg) = loc {
-                    Some(*reg)
-                } else {
-                    None
-                }
-            },
-            Loc::Stack,
-            |pseudo, from_reg, to_stack_offset| {
-                spilled_args.push(SpilledArg {
-                    pseudo,
-                    from_reg,
-                    to_stack_offset,
-                });
-            },
-            |reg| free_regs.push(reg),
-        );
+        self.spill_gp_args(intervals, |interval, _| {
+            interval_crosses_call(interval, call_positions)
+        });
 
         // Always spill XMM function parameter arguments to stack.
         // All XMM registers are caller-saved on x86-64 SysV ABI, and any float
@@ -1751,51 +1744,42 @@ impl RegAlloc {
         &self.int128_pseudos
     }
 
-    /// Spill arguments in registers that would be clobbered by constraint points (e.g., shifts)
-    ///
-    /// For example, if the 4th parameter is in Rcx and the function contains variable shifts,
-    /// Rcx will be clobbered when the shift count is loaded. We must spill such arguments
-    /// to the stack before they get clobbered.
-    fn spill_args_across_constraints(
+    /// Spill a GP argument out of its ABI register when `overwritten` says
+    /// something destroys that register while the argument is live: a call,
+    /// or a constraint point such as a variable shift loading its count into
+    /// RCX while the fourth parameter still lives there. See
+    /// [`crate::arch::regalloc::spill_gp_args_across`].
+    fn spill_gp_args(
         &mut self,
-        _func: &Function,
         intervals: &[LiveInterval],
-        constraint_points: &[ConstraintPoint<Reg>],
+        overwritten: impl Fn(&LiveInterval, Reg) -> bool,
     ) {
-        // For each argument in a register, check if its interval is live across
-        // any constraint point that clobbers that register
-        let int_arg_regs_set = Reg::arg_regs();
-        for interval in intervals {
-            if let Some(Loc::Reg(reg)) = self.locations.get(&interval.pseudo) {
-                if int_arg_regs_set.contains(reg) {
-                    // Check if this register is clobbered by any constraint point
-                    // while the interval is live (and the pseudo is not involved)
-                    let needs_spill = constraint_points.iter().any(|cp| {
-                        interval.start <= cp.position
-                            && cp.position <= interval.end
-                            && !cp.operand_survives(interval.pseudo, interval.start, interval.end)
-                            && cp.clobbers.contains(reg)
-                    });
-
-                    if needs_spill {
-                        let from_reg = *reg;
-                        self.stack_offset += 8;
-                        let to_stack_offset = self.stack_offset;
-
-                        // Record the spill for codegen to emit stores in prologue
-                        self.spilled_args.push(SpilledArg {
-                            pseudo: interval.pseudo,
-                            from_reg,
-                            to_stack_offset,
-                        });
-
-                        self.locations
-                            .insert(interval.pseudo, Loc::Stack(to_stack_offset));
-                        self.free_regs.push(from_reg);
-                    }
+        let int_arg_regs_set: &[Reg] = Reg::arg_regs();
+        let spilled_args = &mut self.spilled_args;
+        let free_regs = &mut self.free_regs;
+        crate::arch::regalloc::spill_gp_args_across(
+            intervals,
+            overwritten,
+            &mut self.locations,
+            &mut self.stack_offset,
+            |reg| int_arg_regs_set.contains(&reg),
+            |loc| {
+                if let Loc::Reg(reg) = loc {
+                    Some(*reg)
+                } else {
+                    None
                 }
-            }
-        }
+            },
+            Loc::Stack,
+            |pseudo, from_reg, to_stack_offset| {
+                spilled_args.push(SpilledArg {
+                    pseudo,
+                    from_reg,
+                    to_stack_offset,
+                });
+            },
+            |reg| free_regs.push(reg),
+        );
     }
 
     /// Force alloca results to stack to avoid clobbering issues
@@ -2118,7 +2102,7 @@ impl RegAlloc {
             constraint_points,
             intervals,
             gp_candidates,
-            |cp, interval| cp.operand_survives(interval.pseudo, interval.start, interval.end),
+            exempt_from_clobber,
         );
         let mut in_loop_set: std::collections::BTreeSet<PseudoId> =
             std::collections::BTreeSet::new();

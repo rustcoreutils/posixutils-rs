@@ -1414,7 +1414,7 @@ mod tests {
             let mut out = String::new();
             let inst = X86Inst::Jcc {
                 cc,
-                target: Label::new("test", 1),
+                target: Label::block("test", 1),
             };
             inst.emit(&target, &mut out);
             assert!(

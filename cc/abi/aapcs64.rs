@@ -68,6 +68,22 @@ pub(crate) fn argument_alignment(types: &TypeTable, ty: TypeId) -> usize {
     raw.clamp(8, 16)
 }
 
+/// The alignment of the stack slot an argument of type `ty` occupies.
+///
+/// [`argument_alignment`] for an argument passed by value; eight for a
+/// composite over sixteen bytes, which stage C.4 replaces by a pointer to a
+/// copy -- the slot holds that pointer, however aligned the composite's
+/// members are. Both sides asked `argument_alignment` of the composite
+/// instead, so a `struct { long a; long double b; }` argument's pointer was
+/// placed on a sixteen-byte boundary where gcc puts it on eight: a gcc caller
+/// crashed a c17 callee, and a gcc callee read a c17 caller's wrong slot.
+pub(crate) fn stacked_argument_alignment(types: &TypeTable, ty: TypeId) -> usize {
+    match Aapcs64Abi::new().classify_param(ty, types) {
+        ArgClass::Indirect { .. } => 8,
+        _ => argument_alignment(types, ty),
+    }
+}
+
 /// Stage C.10: where an argument's run of `n` general registers starts.
 ///
 /// An argument whose AAPCS64 alignment is 16 -- see [`argument_alignment`] --

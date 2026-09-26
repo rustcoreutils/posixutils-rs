@@ -418,7 +418,7 @@ impl X86_64CodeGen {
 
         // Emit each constant
         for (label_bits, bytes) in &self.ld_constants {
-            let label = format!(".Lld_const_{}", label_bits);
+            let label = crate::arch::lir::internal_label("ld_const", label_bits);
             // Align to 16 bytes (power of 2: 4 means 2^4 = 16)
             self.base.push_directive(Directive::Align(4));
             self.base.push_directive(Directive::local_label(&label));
@@ -445,7 +445,7 @@ impl X86_64CodeGen {
         }
         self.base.push_directive(Directive::Rodata);
         for (key, bytes) in &self.quad_constants {
-            let label = format!(".Lquad_const_{}", key);
+            let label = crate::arch::lir::internal_label("quad_const", key);
             self.base.push_directive(Directive::Align(4));
             self.base.push_directive(Directive::local_label(&label));
             let mut byte_str = String::from(".byte ");
@@ -471,7 +471,7 @@ impl X86_64CodeGen {
 
         // Emit each constant
         for (label_bits, value) in &self.double_constants {
-            let label = format!(".Ldbl_const_{}", label_bits);
+            let label = crate::arch::lir::internal_label("dbl_const", label_bits);
             // Align to 8 bytes (power of 2: 3 means 2^3 = 8)
             self.base.push_directive(Directive::Align(3));
             self.base.push_directive(Directive::local_label(&label));
@@ -486,7 +486,7 @@ impl X86_64CodeGen {
     pub(super) fn emit_block(&mut self, block: &crate::ir::BasicBlock, types: &TypeTable) {
         // Always emit block ID label for consistency with jumps
         // (jumps reference blocks by ID, not by C label name)
-        self.push_lir(X86Inst::Directive(Directive::BlockLabel(Label::new(
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(Label::block(
             &self.base.current_fn,
             block.id.0,
         ))));
@@ -535,12 +535,12 @@ impl X86_64CodeGen {
                 if let Some(target) = insn.bb_true {
                     self.push_lir(X86Inst::Jcc {
                         cc: CondCode::Ne,
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
                 if let Some(target) = insn.bb_false {
                     self.push_lir(X86Inst::Jmp {
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
                 return false;
@@ -578,7 +578,7 @@ impl X86_64CodeGen {
                 let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
                 if let Some(target) = target {
                     self.push_lir(X86Inst::Jmp {
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
                 return true;
@@ -612,7 +612,7 @@ impl X86_64CodeGen {
                 };
                 if let Some(target) = target {
                     self.push_lir(X86Inst::Jmp {
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
                 return true;
@@ -622,12 +622,12 @@ impl X86_64CodeGen {
         if let Some(target) = insn.bb_true {
             self.push_lir(X86Inst::Jcc {
                 cc: CondCode::Ne,
-                target: Label::new(&self.base.current_fn, target.0),
+                target: Label::block(&self.base.current_fn, target.0),
             });
         }
         if let Some(target) = insn.bb_false {
             self.push_lir(X86Inst::Jmp {
-                target: Label::new(&self.base.current_fn, target.0),
+                target: Label::block(&self.base.current_fn, target.0),
             });
         }
         false
@@ -654,7 +654,7 @@ impl X86_64CodeGen {
         };
 
         for (lo, hi, target_bb) in insn.switch_cases.clone() {
-            let target = Label::new(&self.base.current_fn, target_bb.0);
+            let target = Label::block(&self.base.current_fn, target_bb.0);
             if lo == hi {
                 self.emit_switch_cmp(op_size, lo);
                 self.push_lir(X86Inst::Jcc {
@@ -670,7 +670,7 @@ impl X86_64CodeGen {
         if let Some(default_bb) = insn.switch_default {
             // LIR: unconditional jump to default
             self.push_lir(X86Inst::Jmp {
-                target: Label::new(&self.base.current_fn, default_bb.0),
+                target: Label::block(&self.base.current_fn, default_bb.0),
             });
         }
     }
@@ -915,7 +915,7 @@ impl X86_64CodeGen {
             Opcode::Br => {
                 if let Some(target) = insn.bb_true {
                     self.push_lir(X86Inst::Jmp {
-                        target: Label::new(&self.base.current_fn, target.0),
+                        target: Label::block(&self.base.current_fn, target.0),
                     });
                 }
             }
@@ -1368,8 +1368,8 @@ impl X86_64CodeGen {
         self.unique_label_counter += 1;
         let done_suffix = self.unique_label_counter;
         self.unique_label_counter += 1;
-        let then_label = Label::new("sel_then", then_suffix);
-        let done_label = Label::new("sel_done", done_suffix);
+        let then_label = Label::internal("sel_then", then_suffix);
+        let done_label = Label::internal("sel_done", done_suffix);
         self.push_lir(X86Inst::Jcc {
             cc: CondCode::Ne,
             target: then_label.clone(),

@@ -625,7 +625,8 @@ impl X86_64CodeGen {
             .map(|(bb_id, name)| {
                 // Through `Label` rather than a second spelling of the same
                 // format, so the quoting cannot be missed here.
-                let label_str = crate::arch::lir::Label::new(&self.base.current_fn, bb_id.0).name();
+                let label_str =
+                    crate::arch::lir::Label::block(&self.base.current_fn, bb_id.0).name();
                 (label_str, name.clone())
             })
             .collect();

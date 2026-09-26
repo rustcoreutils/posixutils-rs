@@ -348,3 +348,95 @@ int main(void)
 "#,
     );
 }
+
+/// Where `va_start` finds the first variadic argument after every class of
+/// named parameter.
+///
+/// `va_start`'s tally of the named parameters was its own walk, separate from
+/// the one `allocate_arguments` used, and the two disagreed: a composite over
+/// sixteen bytes travels as a pointer -- one register or one eight-byte slot --
+/// where the tally charged its whole size, so `__stack` started sixteen bytes
+/// late; and a zero-sized parameter takes nothing where the tally charged a
+/// register. Both are one layout now, `param_layout`. Also covered: an HFA
+/// forcing the floating-point bank onto the stack, a 16-aligned `__int128`
+/// and `long double`, and a stacked by-reference composite with 16-aligned
+/// members, whose pointer slot is eight-aligned.
+#[test]
+fn aarch64_va_start_after_every_named_parameter_class() {
+    run_both_levels("a64_va_named", VA_NAMED);
+}
+
+const VA_NAMED: &str = r#"
+#include <stdarg.h>
+#define NI __attribute__((noinline))
+struct Big { long a, b, c; };          /* over 16 bytes: passed as a pointer */
+struct E { };                          /* zero-sized (GNU): not passed at all */
+struct H { double a, b; };             /* HFA: two V registers */
+struct L { long a; long double b; };   /* by reference, 16-aligned members */
+
+NI long big_stacked(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7,
+                    struct Big big, ...)
+{
+    va_list ap; va_start(ap, big);
+    long x = va_arg(ap, long);
+    va_end(ap);
+    return x + big.c;
+}
+NI long big_in_reg(long a0, struct Big big, ...)
+{
+    va_list ap; va_start(ap, big);
+    long x = va_arg(ap, long), y = va_arg(ap, long);
+    va_end(ap);
+    return x + y + big.b;
+}
+NI int empty(int a, struct E e, ...)
+{
+    va_list ap; va_start(ap, e);
+    int x = va_arg(ap, int);
+    va_end(ap);
+    return a + x;
+}
+NI double hfa(double d0, double d1, double d2, double d3, double d4, double d5, double d6,
+              struct H h, ...)
+{
+    va_list ap; va_start(ap, h);
+    double x = va_arg(ap, double);
+    va_end(ap);
+    return x + h.b;
+}
+NI long i128(long a0, long a1, long a2, long a3, long a4, long a5, long a6, __int128 q, ...)
+{
+    va_list ap; va_start(ap, q);
+    long x = va_arg(ap, long);
+    va_end(ap);
+    return x + (long)(q >> 64);
+}
+NI double ldbl(double d0, double d1, double d2, double d3, double d4, double d5, double d6,
+               double d7, long double x, ...)
+{
+    va_list ap; va_start(ap, x);
+    double y = va_arg(ap, double);
+    va_end(ap);
+    return y + (double)x;
+}
+NI long by_ref_stacked(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7,
+                       long s0, struct L l, long after)
+{
+    return s0 + l.a + (long)l.b + after;
+}
+int main(void)
+{
+    struct Big b = {1, 2, 3};
+    struct E e;
+    struct H h = {0.5, 1.5};
+    struct L l = {10, 20.0L};
+    if (big_stacked(0, 0, 0, 0, 0, 0, 0, 0, b, 42L) != 45) return 1;
+    if (big_in_reg(0, b, 40L, 50L) != 92) return 2;
+    if (empty(1, e, 41) != 42) return 3;
+    if (hfa(0, 0, 0, 0, 0, 0, 0, h, 2.5) != 4.0) return 4;
+    if (i128(0, 0, 0, 0, 0, 0, 0, (__int128)7 << 64, 35L) != 42) return 5;
+    if (ldbl(0, 0, 0, 0, 0, 0, 0, 0, 2.0L, 40.0) != 42.0) return 6;
+    if (by_ref_stacked(0, 0, 0, 0, 0, 0, 0, 0, 1, l, 300) != 331) return 7;
+    return 0;
+}
+"#;

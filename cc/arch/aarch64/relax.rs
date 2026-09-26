@@ -235,7 +235,7 @@ mod tests {
     }
 
     fn label(id: u32) -> Label {
-        Label::new("f", id)
+        Label::block("f", id)
     }
 
     fn at(id: u32) -> Aarch64Inst {

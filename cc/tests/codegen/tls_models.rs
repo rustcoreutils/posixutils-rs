@@ -157,6 +157,37 @@ int main(void)
 }
 "#;
 
+/// Parameters live across a thread-local access that *calls* something: the
+/// descriptor resolver on ELF shared objects, the TLV getter on Darwin. Both
+/// take their argument and return their result in the first argument
+/// register (x0 on aarch64), and the Darwin x86-64 getter also destroys %rdi.
+/// aarch64 never moved an incoming argument out of a register such a sequence
+/// overwrites, so `ti = a` stored the argument and then every later use of `a`
+/// read the thread-local's *address*: `store_params(77, ...)` left `ti` at
+/// 77 + (address), and a macOS thread worker's `k` became a pointer.
+const PARAM_LIB: &str = r#"
+_Thread_local int ti = 3;
+_Thread_local char tc = 1;
+_Thread_local long tl = 5;
+void store_params(int a, int b, long c) { ti = a; tc = (char)b; tl = c; ti += a; }
+int get_ti(void) { return ti; }
+int get_tc(void) { return tc; }
+long get_tl(void) { return tl; }
+"#;
+
+const PARAM_MAIN: &str = r#"
+void store_params(int, int, long);
+int get_ti(void); int get_tc(void); long get_tl(void);
+int main(void)
+{
+    store_params(77, 66, 55);
+    if (get_ti() != 154) return 1;
+    if (get_tc() != 66) return 2;
+    if (get_tl() != 55) return 3;
+    return 0;
+}
+"#;
+
 /// c17's aarch64 assembly for a source, removed when dropped along with the
 /// source it was compiled from.
 struct Aarch64Asm {
@@ -188,8 +219,10 @@ impl Drop for Aarch64Asm {
     }
 }
 
+/// A host executable: Local Exec for its own thread-locals and Initial Exec for
+/// another unit's on ELF hosts, the TLV getter on a macOS host.
 #[test]
-fn tls_models_x86_64_executable() {
+fn tls_models_host_executable() {
     for opts in [&["-O0"][..], &["-O2"], &["-O2", "-fPIE"]] {
         let opts: Vec<String> = opts.iter().map(|s| s.to_string()).collect();
         assert_eq!(
@@ -219,6 +252,12 @@ fn tls_models_aarch64_executable() {
 /// loader.
 #[test]
 fn tls_models_aarch64_shared_library() {
+    for (lib_src, main_src) in [(LIB, LIB_MAIN), (PARAM_LIB, PARAM_MAIN)] {
+        run_aarch64_shared_library(lib_src, main_src);
+    }
+}
+
+fn run_aarch64_shared_library(lib_src: &str, main_src: &str) {
     if !aarch64_cross_available() {
         eprintln!("SKIP tls_models_aarch64_shared_library: no aarch64 cross toolchain");
         return;
@@ -229,7 +268,7 @@ fn tls_models_aarch64_shared_library() {
         .expect("tempdir");
     let d = dir.path();
     for opt in ["-O0", "-O2"] {
-        let lib = Aarch64Asm::new("tls_lib", LIB, &[opt, "-fPIC"]);
+        let lib = Aarch64Asm::new("tls_lib", lib_src, &[opt, "-fPIC"]);
         let so = d.join("libtlsc17.so");
         let built = Command::new("aarch64-linux-gnu-gcc")
             .args(["-shared", "-o"])
@@ -242,7 +281,7 @@ fn tls_models_aarch64_shared_library() {
             "linking the library failed at {opt}:\n{}",
             String::from_utf8_lossy(&built.stderr)
         );
-        let main = create_c_file("tls_lib_main", LIB_MAIN);
+        let main = create_c_file("tls_lib_main", main_src);
         let exe = d.join("tls_main");
         let linked = Command::new("aarch64-linux-gnu-gcc")
             .arg(main.path())
@@ -271,6 +310,104 @@ fn tls_models_aarch64_shared_library() {
             "at {opt}: {}",
             String::from_utf8_lossy(&run.stderr)
         );
+    }
+}
+
+/// The x86-64 descriptor model, native: c17 builds the library `-fPIC`, the
+/// host compiler links it and the executable, and the result runs here.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn tls_models_x86_64_shared_library() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_tls_so_x86_")
+        .tempdir()
+        .expect("tempdir");
+    let d = dir.path();
+    // `LIB` carries aarch64 inline assembly, so only the parameter program.
+    for (lib_src, main_src) in [(PARAM_LIB, PARAM_MAIN)] {
+        for opt in ["-O0", "-O2"] {
+            let c = create_c_file("tls_lib_x86", lib_src);
+            let s = d.join("lib.s");
+            let run = run_c17(&[
+                opt,
+                "-fPIC",
+                "-S",
+                "-o",
+                &s.to_string_lossy(),
+                &c.path().to_string_lossy(),
+            ]);
+            assert!(run.success, "c17 failed at {opt}:\n{}", run.stderr);
+            let so = d.join("libtlsc17x.so");
+            let built = Command::new("cc")
+                .args(["-shared", "-o"])
+                .arg(&so)
+                .arg(&s)
+                .output()
+                .expect("cc");
+            assert!(
+                built.status.success(),
+                "linking the library failed at {opt}:\n{}",
+                String::from_utf8_lossy(&built.stderr)
+            );
+            let main = create_c_file("tls_lib_main_x86", main_src);
+            let exe = d.join("tls_main_x86");
+            let linked = Command::new("cc")
+                .arg(main.path())
+                .arg("-L")
+                .arg(d)
+                .arg("-ltlsc17x")
+                .arg("-o")
+                .arg(&exe)
+                .output()
+                .expect("cc");
+            assert!(
+                linked.status.success(),
+                "linking the executable failed at {opt}:\n{}",
+                String::from_utf8_lossy(&linked.stderr)
+            );
+            let ran = Command::new(&exe)
+                .env("LD_LIBRARY_PATH", d)
+                .output()
+                .expect("run");
+            assert_eq!(ran.status.code(), Some(0), "at {opt}");
+        }
+    }
+}
+
+/// An inline-asm memory operand naming an Initial Exec thread-local, when
+/// every other scratch register is already spent.
+///
+/// The operand's address is computed before the template into a scratch
+/// register, and X15 is the last one offered. The Initial Exec sequence uses
+/// X15 as its thread-pointer temporary, so with the operand also in X15 it
+/// became `mrs x15, tpidr_el0; add x15, x15, x15` -- twice the thread pointer
+/// -- and the template loaded through a wild address. Such an operand is never
+/// given X15 now; the statement offers X15 first to an operand that may take
+/// it (here the constant `1`).
+#[test]
+fn tls_ie_asm_operand_with_the_scratch_registers_spent() {
+    if !aarch64_cross_available() {
+        eprintln!("SKIP: no aarch64 cross toolchain");
+        return;
+    }
+    let user = r#"
+extern __thread int t;
+__attribute__((noinline)) int f(void)
+{
+    int out;
+    __asm__ volatile("ldr %w0, %6\n\tadd %w0, %w0, %w1\n\tadd %w0, %w0, %w2\n\t"
+                     "add %w0, %w0, %w3\n\tadd %w0, %w0, %w4\n\tadd %w0, %w0, %w5"
+                     : "=&r"(out)
+                     : "r"(1), "r"(2), "r"(3), "r"(4), "r"(5), "m"(t));
+    return out;
+}
+int main(void) { return f() == 42 + 15 ? 0 : 1; }
+"#;
+    let def = create_c_file("tls_ie_asm_def", "__thread int t = 42;\n");
+    for opt in ["-O0", "-O2"] {
+        let asm = Aarch64Asm::new("tls_ie_asm", user, &[opt]);
+        let code = cross_link_and_run("tls_ie_asm", &[&asm.path, &def.path().to_string_lossy()]);
+        assert_eq!(code, 0, "at {opt}");
     }
 }
 
@@ -443,6 +580,78 @@ fn tls_macho_x86_64_getter_destroys_xmm_registers() {
     }
 }
 
+/// No incoming argument may be read from a register the TLV getter destroys.
+///
+/// The getter takes its descriptor in, and returns the address in, x0 on
+/// aarch64; on x86-64 it takes %rdi and returns %rax. So after the call an
+/// `int` parameter can no longer be in w0, or in %edi/%rdi: reading one there
+/// before rewriting it reads the thread-local's address or garbage. This is
+/// exactly what the macOS CI runner hit (`store_local(77)` stored an address,
+/// a thread worker's `k` became a pointer and faulted).
+#[test]
+fn tls_macho_arguments_survive_the_getter() {
+    let src = r#"
+_Thread_local int ti;
+_Thread_local char tc;
+_Thread_local long tl;
+void st(int a, int b, long c) { ti = a; tc = (char)b; tl = c; ti += a; }
+"#;
+    // `clobbered` is what an int or long argument would be read as; `names`
+    // is every spelling of the register, any of which rewrites it.
+    for (triple, call, clobbered, names) in [
+        (
+            DARWIN_AARCH64,
+            "    blr x16\n",
+            &["w0"][..],
+            &["w0", "x0"][..],
+        ),
+        (
+            DARWIN_X86_64,
+            "    call *(%rdi)\n",
+            &["%edi", "%rdi"][..],
+            &["%dil", "%di", "%edi", "%rdi"][..],
+        ),
+    ] {
+        for opt in ["-O0", "-O2"] {
+            let asm = asm_for_with("tls_macho_args", triple, src, &[opt]);
+            let body = body_of(&asm, "st");
+            for after in body.split(call).skip(1) {
+                for line in after.lines() {
+                    let line = line.trim();
+                    let Some((mnemonic, operands)) = line.split_once(' ') else {
+                        continue;
+                    };
+                    let ops: Vec<&str> = operands.split(", ").collect();
+                    // x86-64 writes its last operand, and every instruction
+                    // but a move also reads it. aarch64 writes its first --
+                    // except a store, where every register operand is read.
+                    let (dest, srcs): (&str, Vec<&str>) = if triple == DARWIN_X86_64 {
+                        let dest = ops[ops.len() - 1];
+                        let mut srcs = ops[..ops.len() - 1].to_vec();
+                        if !mnemonic.starts_with("mov") {
+                            srcs.push(dest);
+                        }
+                        (dest, srcs)
+                    } else if mnemonic.starts_with("st") {
+                        ("", ops.clone())
+                    } else {
+                        (ops[0], ops[1..].to_vec())
+                    };
+                    let reads_clobbered = srcs.iter().any(|op| clobbered.contains(op));
+                    assert!(
+                        !reads_clobbered,
+                        "{triple} {opt}: an argument read from a register the getter \
+                         destroyed ({line}):\n{body}"
+                    );
+                    if names.contains(&dest) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Each thread starts from the initial image, keeps its own copy of every
 /// thread-local -- scalar, `double`, `long double`, struct, zero-filled,
 /// static and `extern` -- while the others write theirs, and has its own
@@ -556,4 +765,87 @@ int *addr(void) { return &tv; }
             );
         }
     }
+}
+
+/// Code for a FreeBSD shared object never uses Local Exec.
+///
+/// Local Exec bakes in an offset from the main executable's thread pointer,
+/// which is only right inside the executable. FreeBSD keeps the static models
+/// for shared code (Linux takes the descriptor model there), and the choice of
+/// Initial Exec ignored `-fPIC`, so a thread-local defined in the same file got
+/// `%fs:t@TPOFF`, which `ld -shared` refuses outright on x86-64 and aarch64's
+/// linker accepts and then resolves against the wrong block.
+#[test]
+fn tls_freebsd_shared_objects_use_initial_exec() {
+    let src = r#"
+_Thread_local int t;
+extern _Thread_local int e;
+int get(void) { return t + e; }
+int *addr(void) { return &t; }
+"#;
+    for (triple, ie, le) in [
+        ("x86_64-unknown-freebsd", "t@GOTTPOFF(%rip)", "@TPOFF"),
+        ("aarch64-unknown-freebsd", ":gottprel:t", ":tprel_"),
+    ] {
+        for flags in [
+            &["-O2", "-fPIC"][..],
+            &["-O0", "-fPIC"],
+            &["-O2", "--shared"],
+        ] {
+            let asm = asm_for_with("tls_freebsd_so", triple, src, flags);
+            assert!(
+                asm.contains(ie) && !asm.contains(le),
+                "{triple} {flags:?}: expected Initial Exec, no Local Exec:\n{asm}"
+            );
+        }
+    }
+}
+
+/// The x86-64 half of the above, linked: `ld -shared` accepts it. FreeBSD
+/// and Linux share the ELF relocations, so the host linker is the check.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn tls_freebsd_shared_object_links() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_tls_freebsd_so_")
+        .tempdir()
+        .expect("tempdir");
+    let d = dir.path();
+    let c = create_c_file(
+        "tls_freebsd_so",
+        "_Thread_local int t;\nint get(void) { return t; }\n",
+    );
+    let s = d.join("t.s");
+    let o = d.join("t.o");
+    let so = d.join("libt.so");
+    let run = run_c17(&[
+        "--target",
+        "x86_64-unknown-freebsd",
+        "-O2",
+        "-fPIC",
+        "-S",
+        "-o",
+        &s.to_string_lossy(),
+        &c.path().to_string_lossy(),
+    ]);
+    assert!(run.success, "{}", run.stderr);
+    let assembled = Command::new("as")
+        .arg(&s)
+        .arg("-o")
+        .arg(&o)
+        .output()
+        .expect("as");
+    assert!(assembled.status.success());
+    let linked = Command::new("ld")
+        .arg("-shared")
+        .arg(&o)
+        .arg("-o")
+        .arg(&so)
+        .output()
+        .expect("ld");
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
 }

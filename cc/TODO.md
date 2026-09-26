@@ -350,7 +350,7 @@ work, and were never a claim about the language.
 
 | Suite | Note |
 |---|---|
-| GCC torture tests | **Running.** `cc/scripts/c17_torture.sh`, baselined. Every sub-suite -- `execute/`, `execute/ieee/`, `execute/builtins/` and `compile/` -- in C17 mode; `dg_scan` strips `-std=` rather than selecting a dialect |
+| GCC torture tests | **Running.** `cc/scripts/c17_torture.sh`, baselined. Every sub-suite -- `execute/`, `execute/ieee/`, `execute/builtins/` and `compile/` -- in C17 mode; `dg_scan` strips `-std=` rather than selecting a dialect. `-t aarch64` builds the same suite for linux-aarch64, assembles every `compile/` output with the cross assembler and runs the executables under qemu, against `torture-baseline-aarch64.txt`: the only gate aarch64 code generation has |
 | clang test suite | Not run against c17 |
 
 These are not only test-coverage work. A differential probe against

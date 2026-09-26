@@ -16,22 +16,27 @@
 #   c17_torture.sh -s compile      one sub-suite: execute|ieee|builtins|compile|all
 #   c17_torture.sh -f 931004       only tests whose name matches this
 #   c17_torture.sh -j 8            job count
+#   c17_torture.sh -t aarch64      build for linux-aarch64 and run under qemu,
+#                                  against torture-baseline-aarch64.txt
+#
+# The aarch64 mode (`-t aarch64`, or TORTURE_TARGET=aarch64) is the only gate
+# for aarch64 code generation: every `compile/` output is assembled with
+# `aarch64-linux-gnu-as`, and every executable is linked with
+# `aarch64-linux-gnu-gcc -static` and run under `qemu-aarch64-static`. The same
+# directives, skip lists and sub-suite handling apply; result tags carry an
+# `aarch64/` prefix so they can never be mistaken for host results. It needs
+# the cross toolchain and qemu-user, and refuses to run without them.
 #
 # Exit status: 0 only if nothing regressed against the baseline. A missing
-# compiler or suite is 2. Never exits 0 on a broken run.
+# compiler, suite or cross toolchain is 2. Never exits 0 on a broken run.
 
 set -u
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 C17="${C17:-$REPO_ROOT/target/release/c17}"
 TORTURE_SUITE="${TORTURE_SUITE:-$HOME/tmp/repo/gcc-testsuite/gcc/testsuite/gcc.c-torture}"
-BASELINE="${BASELINE:-$REPO_ROOT/cc/scripts/torture-baseline.txt}"
 WORK="${WORK:-/tmp/c17-torture-$$}"
-
-# The target triple `dg-skip-if` selectors are matched against. gcc spells
-# these `<arch>-<vendor>-<os>` and globs them, so `x86_64-*-*` has to match and
-# `i?86-*-*` has to not.
-TORTURE_TRIPLE="${TORTURE_TRIPLE:-$(uname -m)-pc-$(uname -s | tr 'A-Z' 'a-z')-gnu}"
+TORTURE_TARGET="${TORTURE_TARGET:-host}"
 
 JOBS=$(nproc)
 SUBSUITE=all
@@ -46,10 +51,48 @@ while [[ "${1:-}" == -* ]]; do
         -s) SUBSUITE="$2"; shift 2;;
         -O) LEVELS="$2"; shift 2;;
         -f) FILTER="$2"; shift 2;;
-        -h|--help) sed -n '2,25p' "$0"; exit 0;;
+        -t) TORTURE_TARGET="$2"; shift 2;;
+        -h|--help) sed -n '2,37p' "$0"; exit 0;;
         *) echo "unknown option: $1" >&2; exit 2;;
     esac
 done
+
+# What each target mode builds with, and the triple `dg-skip-if` selectors are
+# matched against. gcc spells a triple `<arch>-<vendor>-<os>` and globs it, so
+# `x86_64-*-*` has to match on the host and `aarch64*-*-*` in aarch64 mode.
+case "$TORTURE_TARGET" in
+    host)
+        TARGET_FLAGS=""
+        TAG_PREFIX=""
+        DEFAULT_BASELINE="$REPO_ROOT/cc/scripts/torture-baseline.txt"
+        TORTURE_TRIPLE="${TORTURE_TRIPLE:-$(uname -m)-pc-$(uname -s | tr 'A-Z' 'a-z')-gnu}"
+        ;;
+    aarch64)
+        # Debian's cross packages put the target's headers at
+        # /usr/aarch64-linux-gnu/include rather than under a sysroot's
+        # usr/include, so `--sysroot` cannot name them; `-isystem` puts them
+        # ahead of the host directories, the order aarch64-linux-gnu-gcc
+        # itself searches in.
+        TARGET_FLAGS="--target aarch64-unknown-linux-gnu -isystem /usr/aarch64-linux-gnu/include"
+        TAG_PREFIX="aarch64/"
+        DEFAULT_BASELINE="$REPO_ROOT/cc/scripts/torture-baseline-aarch64.txt"
+        TORTURE_TRIPLE="${TORTURE_TRIPLE:-aarch64-unknown-linux-gnu}"
+        # A run that attempted nothing must not look like a clean one, so a
+        # missing tool is fatal rather than a pile of skips.
+        for tool in aarch64-linux-gnu-gcc aarch64-linux-gnu-as qemu-aarch64-static; do
+            command -v "$tool" >/dev/null 2>&1 || {
+                echo "FATAL: aarch64 mode needs $tool, which is not installed" >&2
+                exit 2
+            }
+        done
+        [ -d /usr/aarch64-linux-gnu ] || {
+            echo "FATAL: aarch64 mode needs the target libc at /usr/aarch64-linux-gnu" >&2
+            exit 2
+        }
+        ;;
+    *) echo "unknown target mode: $TORTURE_TARGET (host|aarch64)" >&2; exit 2;;
+esac
+BASELINE="${BASELINE:-$DEFAULT_BASELINE}"
 
 [ -x "$C17" ] || {
     echo "FATAL: no c17 at $C17" >&2
@@ -410,6 +453,17 @@ OUT_OF_SCOPE_ISSIGNALING=" ieee/builtin-issignaling-1 \
 NEEDS_64BIT_FRAMES=" compile/20031023-1 compile/20031023-2 compile/20031023-3 \
  compile/20031023-4 compile/stack-check-1 "
 
+# Tests whose own inline assembly is x86. They are portable C on the host;
+# built for aarch64, gas rightly rejects the template, which says nothing about
+# c17. Applied in aarch64 mode only.
+X86_ASM_ONLY=" execute/990413-2 "
+
+# `dg-do compile` tests whose asm template is deliberately not an instruction
+# -- `asm("%0" :: "r"(1.5))`, `asm("f")` -- so they only mean something up to
+# `-S`, which is where gcc stops. aarch64 mode assembles every other compile
+# test, since rejected output is what it exists to catch; these stop at `-S`.
+TEMPLATE_NOT_ASSEMBLED=" compile/920520-1 compile/920521-1 "
+
 # gcc rejects or fails these at every level here.
 GCC_ALSO_FAILS=" execute/980608-1 execute/bcp-1 execute/eeprof-1 execute/pr117432 \
  execute/pr123864 execute/va-arg-7 execute/va-arg-8 compile/dll "
@@ -435,7 +489,7 @@ run_one() {
         companions="${src%.c}-lib.c $(dirname "$src")/lib/main.c"
         extra="-fno-tree-dse -fno-tree-loop-distribute-patterns -fno-tracer -fno-ipa-ra -fno-inline-functions"
     fi
-    local tag="$suite/$base@${opt// /_}"
+    local tag="$TAG_PREFIX$suite/$base@${opt// /_}"
     # The tag carries a `/`, so it is not a file name; scratch files get the
     # same token with the separator flattened.
     local exe="$work/bin/${tag//\//-}.$$"
@@ -508,6 +562,11 @@ EOF
     case "$NEEDS_64BIT_FRAMES" in
         *" $key "*) echo "SKIP	$tag	needs 64-bit frames"; return;;
     esac
+    if [ "$TORTURE_TARGET" = aarch64 ]; then
+        case "$X86_ASM_ONLY" in
+            *" $key "*) echo "SKIP	$tag	x86 inline assembly in the test"; return;;
+        esac
+    fi
     local scan skip flags mult stack dgdo
     scan=$(dg_scan "$src" "$opt")
     skip=${scan%%|*}; scan=${scan#*|}
@@ -538,11 +597,8 @@ EOF
     # against gcc's 0.02, which is how this was found.
     # shellcheck disable=SC2086
     if [ "$mode" = compile ] || [ "$mode" = assemble ]; then
-        local stop_at=-S out="$exe.s"
-        [ "$mode" = assemble ] && { stop_at=-c; out="$exe.o"; }
-        timeout "$ctimeout" "$cc" $opt -w $extra $flags "$stop_at" "$src" -o "$out" >"$log" 2>&1
+        target_compile_only "$mode" "$ctimeout" "$cc" "$opt $extra $flags" "$src" "$exe" "$log" "$key"
         local crc=$?
-        rm -f "$out"
         case $crc in
             0)   echo "PASS	$tag	";;
             124) echo "CTIMEOUT	$tag	compile exceeded ${ctimeout}s";;
@@ -552,8 +608,7 @@ EOF
         return
     fi
 
-    # shellcheck disable=SC2086
-    timeout "$ctimeout" "$cc" $opt -w $extra $flags "$src" $companions -o "$exe" -lm >"$log" 2>&1
+    target_build "$ctimeout" "$cc" "$opt $extra $flags" "$exe" "$log" "$src" $companions
     local crc=$?
     if [ $crc -ne 0 ]; then
         if [ $crc -eq 124 ]; then
@@ -565,13 +620,7 @@ EOF
     fi
     # `dg-require-stack-size` states what the test needs; give it that rather
     # than reporting a stack overflow as a wrong answer.
-    if [ -n "$stack" ]; then
-        local kb=$(( (stack + 1023) / 1024 * 2 ))
-        [ "$kb" -lt 8192 ] && kb=8192
-        ( ulimit -s "$kb" 2>/dev/null; timeout "$rtimeout" "$exe" >/dev/null 2>&1 )
-    else
-        timeout "$rtimeout" "$exe" >/dev/null 2>&1
-    fi
+    target_run "$rtimeout" "$exe" "$stack"
     local rc=$?
     rm -f "$exe" "$log"
     case $rc in
@@ -580,6 +629,90 @@ EOF
         *)   echo "RFAIL	$tag	exit=$rc";;
     esac
 }
+# ----------------------------------------------------------- target steps
+#
+# The three things a target mode changes; everything above is shared.
+
+# Build `src` without linking. The host stops where gcc does: `-S` for
+# `dg-do compile`, `-c` for `assemble`. In aarch64 mode the output is always
+# assembled with the cross assembler: rejected assembly is the defect that
+# mode exists to catch, and stopping at `-S` would hide it.
+# Returns the compiler's status, 124 for a timeout.
+target_compile_only() {
+    local mode="$1" t="$2" cc="$3" flags="$4" src="$5" exe="$6" log="$7" key="$8"
+    if [ "$TORTURE_TARGET" = aarch64 ]; then
+        # shellcheck disable=SC2086
+        timeout "$t" "$cc" $TARGET_FLAGS $flags -w -S "$src" -o "$exe.s" >"$log" 2>&1
+        local crc=$?
+        case "$TEMPLATE_NOT_ASSEMBLED" in
+            *" $key "*) rm -f "$exe.s"; return $crc;;
+        esac
+        if [ $crc -eq 0 ]; then
+            aarch64-linux-gnu-as "$exe.s" -o "$exe.o" >"$log" 2>&1
+            crc=$?
+        fi
+        rm -f "$exe.s" "$exe.o"
+        return $crc
+    fi
+    local stop_at=-S out="$exe.s"
+    [ "$mode" = assemble ] && { stop_at=-c; out="$exe.o"; }
+    # shellcheck disable=SC2086
+    timeout "$t" "$cc" $flags -w "$stop_at" "$src" -o "$out" >"$log" 2>&1
+    local crc=$?
+    rm -f "$out"
+    return $crc
+}
+
+# Build an executable from one or more sources.
+target_build() {
+    local t="$1" cc="$2" flags="$3" exe="$4" log="$5"
+    shift 5
+    if [ "$TORTURE_TARGET" = aarch64 ]; then
+        local s objs="" i=0 crc
+        for s in "$@"; do
+            i=$((i + 1))
+            # shellcheck disable=SC2086
+            timeout "$t" "$cc" $TARGET_FLAGS $flags -w -S "$s" -o "$exe.$i.s" >>"$log" 2>&1
+            crc=$?
+            if [ $crc -ne 0 ]; then rm -f "$exe".*.s; return $crc; fi
+            objs="$objs $exe.$i.s"
+        done
+        # shellcheck disable=SC2086
+        aarch64-linux-gnu-gcc -static -w $objs -o "$exe" -lm >>"$log" 2>&1
+        crc=$?
+        rm -f "$exe".*.s
+        return $crc
+    fi
+    # shellcheck disable=SC2086
+    timeout "$t" "$cc" $flags -w "$@" -o "$exe" -lm >"$log" 2>&1
+}
+
+# Run a built test, honouring `dg-require-stack-size`. Under qemu-user the
+# guest stack is QEMU_STACK_SIZE, not the host's ulimit, and emulation is
+# slower, so the run gets three times the time.
+target_run() {
+    local t="$1" exe="$2" stack="$3" kb=""
+    if [ -n "$stack" ]; then
+        kb=$(( (stack + 1023) / 1024 * 2 ))
+        [ "$kb" -lt 8192 ] && kb=8192
+    fi
+    if [ "$TORTURE_TARGET" = aarch64 ]; then
+        if [ -n "$kb" ]; then
+            QEMU_STACK_SIZE=$((kb * 1024)) QEMU_LD_PREFIX=/usr/aarch64-linux-gnu \
+                timeout $((t * 3)) qemu-aarch64-static "$exe" >/dev/null 2>&1
+        else
+            QEMU_LD_PREFIX=/usr/aarch64-linux-gnu \
+                timeout $((t * 3)) qemu-aarch64-static "$exe" >/dev/null 2>&1
+        fi
+        return
+    fi
+    if [ -n "$kb" ]; then
+        ( ulimit -s "$kb" 2>/dev/null; timeout "$t" "$exe" >/dev/null 2>&1 )
+    else
+        timeout "$t" "$exe" >/dev/null 2>&1
+    fi
+}
+
 # How a sub-suite is built when the test says nothing. `dg-do` overrides it.
 default_mode() {
     case "$1" in
@@ -589,6 +722,8 @@ default_mode() {
 }
 
 export -f run_one dg_scan has_x_file default_mode
+export -f target_compile_only target_build target_run
+export TORTURE_TARGET TARGET_FLAGS TAG_PREFIX X86_ASM_ONLY TEMPLATE_NOT_ASSEMBLED
 export UNSUPPORTED_RE GCC_ALSO_FAILS NEEDS_OPTIMIZATION TORTURE_TRIPLE
 export OUT_OF_SCOPE_POST_C17 OUT_OF_SCOPE_GNU_ATTR
 export OUT_OF_SCOPE_NESTED_FN OUT_OF_SCOPE_VLA_MEMBER
@@ -627,6 +762,7 @@ NTESTS=$(printf '%s\n' "$TESTS" | grep -c . )
 [ "$NTESTS" -gt 0 ] || { echo "FATAL: no tests matched" >&2; exit 2; }
 
 echo "compiler:  $C17"
+echo "target:    $TORTURE_TARGET ($TORTURE_TRIPLE)"
 echo "suite:     $TORTURE_SUITE"
 echo "sub-suite: $SUBSUITE ($NTESTS tests)"
 echo "levels:    ${OPT_LEVELS[*]}"

@@ -5335,9 +5335,54 @@ fn test_aligned_typedef_as_struct_member() {
     }
 }
 
+/// The argument is an integer constant expression, not one numeric token:
+/// a hex or suffixed literal, arithmetic, `sizeof` and a parenthesised value
+/// all fold.
+#[test]
+fn test_attr_aligned_constant_expressions() {
+    for (src, align) in [
+        ("int __attribute__((aligned(0x40))) x;", 64),
+        ("int __attribute__((aligned(16UL))) x;", 16),
+        ("int __attribute__((aligned(2 * sizeof(int)))) x;", 8),
+        ("int __attribute__((aligned((0x20)))) x;", 32),
+        ("int x __attribute__((__aligned__(1 << 5)));", 32),
+    ] {
+        let (decl, _types, _strings, _symbols) = parse_decl(src).unwrap();
+        assert_eq!(decl.declarators[0].explicit_align, Some(align), "{src}");
+    }
+}
+
+/// An enumerator in `aligned` is its value, not a name the attribute ignores.
+#[test]
+fn test_attr_aligned_enumerator() {
+    let (tu, _types, _strings, _symbols) =
+        parse_tu("enum { A = 32 }; int __attribute__((aligned(A))) x;").unwrap();
+    let ExternalDecl::Declaration(ref decl) = tu.items[1] else {
+        panic!("Expected Declaration");
+    };
+    assert_eq!(decl.declarators[0].explicit_align, Some(32));
+}
+
+/// `vector_size` folds its argument the same way.
+#[test]
+fn test_attr_vector_size_constant_expression() {
+    let (tu, types, _strings, _symbols) = parse_tu(
+        "typedef int V __attribute__((vector_size(2 * sizeof(int)))); \
+         typedef float W __attribute__((vector_size(sizeof(float) * 4))); \
+         V v; W w;",
+    )
+    .unwrap();
+    for (item, size) in [(2, 8), (3, 16)] {
+        let ExternalDecl::Declaration(ref decl) = tu.items[item] else {
+            panic!("Expected Declaration");
+        };
+        assert_eq!(types.size_bytes(decl.declarators[0].typ), size);
+    }
+}
+
 #[test]
 fn test_attr_aligned_nonpow2_ignored() {
-    // Non-power-of-2 is silently ignored — variable gets no explicit alignment
+    // Non-power-of-2 is diagnosed and not applied
     let (decl, _types, _strings, _symbols) =
         parse_decl("int __attribute__((aligned(3))) x;").unwrap();
     assert_eq!(decl.declarators[0].explicit_align, None);

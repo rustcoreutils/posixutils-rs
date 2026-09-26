@@ -106,14 +106,148 @@ pub(crate) enum DeclaratorName {
 /// An argument to a GCC __attribute__
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttributeArg {
-    /// Identifier argument (e.g., `noreturn`, `__printf__`)
+    /// A name the attribute reads as a name rather than a value: `printf` in
+    /// `format(printf, 1, 2)`, `QI` in `mode(QI)`, `fn` in `cleanup(fn)`.
+    /// Only ever the first argument of an attribute that is not
+    /// integer-valued; see [`AttrArgs`].
     Ident(String),
-    /// String literal argument (e.g., `"default"`)
+    /// String literal argument (e.g., `"default"`), adjacent literals joined
     String(String),
-    /// Integer argument (e.g., `16` in `aligned(16)`)
-    Int(i64),
-    /// Nested arguments (e.g., `__format__(__printf__, 1, 2)`)
-    Nested(Vec<AttributeArg>),
+    /// An integer constant expression, already folded: `16` in `aligned(16)`,
+    /// but equally `0x40`, `16UL`, an enumerator or `sizeof(long double)`
+    Int(i128),
+}
+
+/// The largest alignment `aligned` may request: gcc's object-file maximum,
+/// 2^28 bytes.
+const MAX_ATTR_ALIGN: i128 = 1 << 28;
+
+/// How an attribute's arguments are read.
+///
+/// gcc parses every argument of an attribute it knows as an
+/// assignment-expression, keeping a leading bare identifier as a name for the
+/// attributes that want one; what the attribute *is* decides whether that
+/// name is allowed and what a value that is not an integer constant means.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AttrArgs {
+    /// Every argument is an integer constant expression.
+    Integers(IntArgRole),
+    /// A leading name, then strings and integer constants: `format(printf,
+    /// 1, 2)`, `mode(QI)`, `section("x")`, `cleanup(fn)`.
+    General,
+    /// An attribute c17 does not recognise, whose arguments are not read.
+    Unknown,
+}
+
+impl AttrArgs {
+    fn of(name: &str, recognised: bool) -> Self {
+        match name.trim_matches('_') {
+            "aligned" => AttrArgs::Integers(IntArgRole::Alignment),
+            "vector_size" => AttrArgs::Integers(IntArgRole::VectorSize),
+            "constructor" | "destructor" => AttrArgs::Integers(IntArgRole::Priority),
+            "alloc_size"
+            | "alloc_align"
+            | "assume_aligned"
+            | "warn_if_not_aligned"
+            | "nonnull"
+            | "nonnull_if_nonzero"
+            | "sentinel"
+            | "regparm" => AttrArgs::Integers(IntArgRole::Unused),
+            "mode" => AttrArgs::General,
+            _ if recognised => AttrArgs::General,
+            _ => AttrArgs::Unknown,
+        }
+    }
+}
+
+/// What an integer-valued attribute's argument means to c17, which decides
+/// both the values it accepts and how loudly a bad one is refused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IntArgRole {
+    /// `aligned(N)`: a power of two, in bytes.
+    Alignment,
+    /// `vector_size(N)`: a positive width, in bytes.
+    VectorSize,
+    /// `constructor(P)` / `destructor(P)`: an init priority, 0 to 65535.
+    Priority,
+    /// `nonnull(1, 2)`, `alloc_size(1)`, `sentinel(0)`, ...: accepted and not
+    /// acted on, so a bad argument drops the attribute with a warning, as gcc
+    /// does.
+    Unused,
+}
+
+/// What is wrong with an integer-valued attribute's arguments.
+#[derive(Clone, Copy, Debug)]
+enum IntArgFault {
+    NotConstant,
+    Count,
+    Zero,
+    OutOfRange(i128),
+    TooLarge(i128),
+}
+
+/// An attribute whose arguments have already been diagnosed, and which is
+/// dropped rather than applied with a value the source did not give it.
+#[derive(Clone, Copy, Debug)]
+struct Diagnosed;
+
+impl IntArgRole {
+    /// Report `fault` in `name`'s arguments, in gcc's words.
+    fn report(self, name: &str, pos: Position, fault: IntArgFault) {
+        let name = name.trim_matches('_');
+        match (self, fault) {
+            (_, IntArgFault::Count) => diag::error_args(
+                pos,
+                "wrong number of arguments specified for '{0}' attribute",
+                &[name],
+            ),
+            (IntArgRole::Alignment, IntArgFault::NotConstant) => diag::error(
+                pos,
+                &gettext("requested alignment is not an integer constant"),
+            ),
+            // gcc warns and ignores `aligned(0)` rather than refusing it.
+            (IntArgRole::Alignment, IntArgFault::Zero) => {
+                if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
+                    diag::warning(
+                        pos,
+                        &gettext("requested alignment '0' is not a positive power of 2"),
+                    );
+                }
+            }
+            (IntArgRole::Alignment, IntArgFault::OutOfRange(n)) => diag::error_args(
+                pos,
+                "requested alignment '{0}' is not a positive power of 2",
+                &[&n.to_string()],
+            ),
+            (IntArgRole::Alignment, IntArgFault::TooLarge(n)) => diag::error_args(
+                pos,
+                "requested alignment '{0}' exceeds object file maximum {1}",
+                &[&n.to_string(), &MAX_ATTR_ALIGN.to_string()],
+            ),
+            (IntArgRole::VectorSize, IntArgFault::NotConstant) => diag::error(
+                pos,
+                &gettext("'vector_size' attribute argument is not an integer constant"),
+            ),
+            (IntArgRole::VectorSize, _) => diag::error(
+                pos,
+                &gettext("'vector_size' requires a positive byte count"),
+            ),
+            (IntArgRole::Priority, _) => diag::error_args(
+                pos,
+                "{0} priorities must be integers from 0 to 65535 inclusive",
+                &[name],
+            ),
+            (IntArgRole::Unused, _) => {
+                if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
+                    diag::warning_args(
+                        pos,
+                        "'{0}' attribute argument is not an integer constant",
+                        &[name],
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// A single GCC __attribute__
@@ -126,13 +260,6 @@ pub struct Attribute {
 }
 
 impl Attribute {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            args: Vec::new(),
-        }
-    }
-
     pub fn with_args(name: impl Into<String>, args: Vec<AttributeArg>) -> Self {
         Self {
             name: name.into(),
@@ -154,19 +281,6 @@ impl fmt::Display for Attribute {
                     AttributeArg::Ident(s) => write!(f, "{}", s)?,
                     AttributeArg::String(s) => write!(f, "\"{}\"", s)?,
                     AttributeArg::Int(n) => write!(f, "{}", n)?,
-                    AttributeArg::Nested(args) => {
-                        for (j, a) in args.iter().enumerate() {
-                            if j > 0 {
-                                write!(f, ", ")?;
-                            }
-                            match a {
-                                AttributeArg::Ident(s) => write!(f, "{}", s)?,
-                                AttributeArg::String(s) => write!(f, "\"{}\"", s)?,
-                                AttributeArg::Int(n) => write!(f, "{}", n)?,
-                                AttributeArg::Nested(_) => write!(f, "...")?,
-                            }
-                        }
-                    }
                 }
             }
             write!(f, ")")?;
@@ -270,7 +384,8 @@ impl AttributeList {
             .iter()
             .find(|a| a.name == name || a.name == underscored)?;
         match attr.args.first() {
-            Some(AttributeArg::Int(n)) => Some(Some(*n as u16)),
+            // In range: `check_integer_args` drops any other priority.
+            Some(AttributeArg::Int(n)) => Some(u16::try_from(*n).ok()),
             _ => Some(None),
         }
     }
@@ -320,6 +435,8 @@ impl AttributeList {
         out
     }
 
+    /// The alignment `aligned` asks for: a power of two, since
+    /// `check_integer_args` drops any other with a diagnostic.
     pub fn get_alignment(&self) -> Option<u32> {
         for attr in &self.attrs {
             if attr.name == "aligned" || attr.name == "__aligned__" {
@@ -864,78 +981,180 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a single attribute argument
-    /// Returns None if not a recognizable argument
-    fn parse_attribute_arg(&mut self) -> Option<AttributeArg> {
-        match self.peek() {
-            TokenType::Ident => {
-                let name = self.get_ident_name(self.current())?;
-                self.advance();
+    /// Skip to the `,` or `)` that ends the attribute argument at hand,
+    /// stepping over nested parentheses. Leaves that token current.
+    fn skip_attribute_arg(&mut self) {
+        let mut depth = 0usize;
+        while !self.is_eof() {
+            if self.is_special(b'(') {
+                depth += 1;
+            } else if self.is_special(b')') {
+                if depth == 0 {
+                    return;
+                }
+                depth -= 1;
+            } else if self.is_special(b',') && depth == 0 {
+                return;
+            }
+            self.advance();
+        }
+    }
 
-                // Check if this identifier has nested arguments
-                if self.is_special(b'(') {
-                    self.advance();
-                    let mut nested = Vec::new();
-                    while !self.is_special(b')') && !self.is_eof() {
-                        if let Some(arg) = self.parse_attribute_arg() {
-                            nested.push(arg);
-                        }
-                        if self.is_special(b',') {
-                            self.advance();
-                        } else if !self.is_special(b')') {
-                            // Skip unknown tokens
-                            self.advance();
-                        }
-                    }
-                    if self.is_special(b')') {
-                        self.advance();
-                    }
-                    // Return as nested with first element being the function name
-                    let mut all_args = vec![AttributeArg::Ident(name)];
-                    all_args.extend(nested);
-                    Some(AttributeArg::Nested(all_args))
-                } else {
-                    Some(AttributeArg::Ident(name))
+    /// Whether the current token is a bare identifier standing alone as an
+    /// argument: followed by the `,` or `)` that ends it.
+    fn at_bare_attribute_name(&self) -> bool {
+        self.peek() == TokenType::Ident
+            && (self.next_token_is_special(b',') || self.next_token_is_special(b')'))
+    }
+
+    /// Read one argument of an attribute c17 recognises.
+    ///
+    /// gcc's rule: the first argument may be a bare name, and anything else is
+    /// an assignment-expression. The expression is folded here, by the same
+    /// evaluator array bounds and `case` labels use, so `aligned(0x40)`,
+    /// `aligned(A)` for an enumerator and `vector_size(2 * sizeof(int))` all
+    /// mean what they say. An integer-valued attribute takes no names at all:
+    /// `aligned(A)` is the enumerator's value, never the word `A`.
+    ///
+    /// `Ok(None)` is an argument of a general attribute that is neither a
+    /// name, a string nor a constant -- the declaration `copy(&f)` points at
+    /// -- which no c17 consumer reads.
+    fn parse_attribute_arg(
+        &mut self,
+        name: &str,
+        grammar: AttrArgs,
+        first: bool,
+    ) -> Result<Option<AttributeArg>, Diagnosed> {
+        if grammar == AttrArgs::General && first && self.at_bare_attribute_name() {
+            let ident = self.get_ident_name(self.current()).ok_or(Diagnosed)?;
+            self.advance();
+            return Ok(Some(AttributeArg::Ident(ident)));
+        }
+        let pos = self.current_pos();
+        // The expression parser reports an undeclared name and stands `0` in
+        // for it; judging the stand-in as well would add a second, wrong
+        // complaint -- "requested alignment '0'" for `aligned(foo)`.
+        let undeclared = self.at_bare_attribute_name()
+            && self
+                .get_ident_id(self.current())
+                .is_some_and(|id| self.symbols.lookup_id(id, Namespace::Ordinary).is_none());
+        let expr = match self.parse_assignment_expr() {
+            Ok(expr) => expr,
+            Err(e) => {
+                diag::error(e.pos, &e.message);
+                self.skip_attribute_arg();
+                return Err(Diagnosed);
+            }
+        };
+        if undeclared && matches!(expr.kind, ExprKind::IntLit(0)) {
+            return Err(Diagnosed);
+        }
+        if let (AttrArgs::General, ExprKind::StringLit(bytes)) = (grammar, &expr.kind) {
+            return Ok(Some(AttributeArg::String(payload_text(bytes))));
+        }
+        match (self.eval_const_expr(&expr), grammar) {
+            (Some(n), _) => Ok(Some(AttributeArg::Int(n))),
+            (None, AttrArgs::Integers(role)) => {
+                role.report(name, pos, IntArgFault::NotConstant);
+                Err(Diagnosed)
+            }
+            (None, _) => Ok(None),
+        }
+    }
+
+    /// Read the parenthesised arguments of `name`, the `(` already consumed,
+    /// through the closing `)`.
+    ///
+    /// `Err` when an argument was diagnosed: the attribute is then dropped
+    /// rather than applied with a value the source did not give it.
+    fn parse_attribute_args(
+        &mut self,
+        name: &str,
+        grammar: AttrArgs,
+    ) -> Result<Vec<AttributeArg>, Diagnosed> {
+        let mut args = Vec::new();
+        let mut result = Ok(());
+        let mut first = true;
+        while !self.is_special(b')') && !self.is_eof() {
+            if grammar == AttrArgs::Unknown {
+                // An attribute c17 does not know has a grammar c17 does not
+                // know either -- clang's `availability(macos, introduced=10.4)`
+                // is no expression list -- and is ignored, so its tokens are
+                // stepped over rather than parsed.
+                self.skip_attribute_arg();
+            } else {
+                match self.parse_attribute_arg(name, grammar, first) {
+                    Ok(Some(arg)) => args.push(arg),
+                    Ok(None) => {}
+                    Err(d) => result = Err(d),
                 }
             }
-            TokenType::String => {
-                if let TokenValue::String(s) = &self.current().value {
-                    let s = payload_text(s);
-                    self.advance();
-                    Some(AttributeArg::String(s))
-                } else {
-                    None
-                }
-            }
-            TokenType::Number => {
-                if let TokenValue::Number(s) = &self.current().value {
-                    // Parse the number string to i64
-                    let n = s.parse::<i64>().unwrap_or(0);
-                    self.advance();
-                    Some(AttributeArg::Int(n))
-                } else {
-                    None
-                }
-            }
-            // A negative argument. Without this the sign was skipped as an
-            // unknown token and the magnitude parsed on its own, so
-            // `vector_size(-16)` read as `vector_size(16)` and silently
-            // produced a type the source never asked for.
-            TokenType::Special if self.is_special(b'-') => {
+            first = false;
+            if self.is_special(b',') {
                 self.advance();
-                if let TokenValue::Number(s) = &self.current().value {
-                    let n = s.parse::<i64>().unwrap_or(0);
-                    self.advance();
-                    Some(AttributeArg::Int(-n))
-                } else {
-                    None
-                }
+            } else if !self.is_special(b')') && !self.is_eof() {
+                diag::error(
+                    self.current_pos(),
+                    "expected ',' or ')' in attribute arguments",
+                );
+                self.skip_attribute_arg();
+                result = Err(Diagnosed);
+            }
+        }
+        if self.is_special(b')') {
+            self.advance();
+        }
+        result.map(|()| args)
+    }
+
+    /// Check the arguments of an integer-valued attribute against what its
+    /// role allows, diagnosing as gcc does. `Err` drops the attribute.
+    fn check_integer_args(
+        &self,
+        name: &str,
+        role: IntArgRole,
+        args: &[AttributeArg],
+        pos: Position,
+    ) -> Result<(), Diagnosed> {
+        let value = match args {
+            [] => None,
+            [AttributeArg::Int(n)] => Some(*n),
+            _ if role == IntArgRole::Unused => return Ok(()),
+            _ => {
+                role.report(name, pos, IntArgFault::Count);
+                return Err(Diagnosed);
+            }
+        };
+        let fault = match (role, value) {
+            // Bare `aligned` asks for the largest useful alignment.
+            (IntArgRole::Alignment, None) => None,
+            (IntArgRole::Alignment, Some(0)) => Some(IntArgFault::Zero),
+            (IntArgRole::Alignment, Some(n)) if n < 0 || !(n as u128).is_power_of_two() => {
+                Some(IntArgFault::OutOfRange(n))
+            }
+            (IntArgRole::Alignment, Some(n)) if n > MAX_ATTR_ALIGN => {
+                Some(IntArgFault::TooLarge(n))
+            }
+            (IntArgRole::VectorSize, None) => Some(IntArgFault::Count),
+            (IntArgRole::VectorSize, Some(n)) if n <= 0 => Some(IntArgFault::OutOfRange(n)),
+            (IntArgRole::Priority, Some(n)) if !(0..=i128::from(u16::MAX)).contains(&n) => {
+                Some(IntArgFault::OutOfRange(n))
             }
             _ => None,
+        };
+        match fault {
+            Some(fault) => {
+                role.report(name, pos, fault);
+                Err(Diagnosed)
+            }
+            None => Ok(()),
         }
     }
 
     /// Parse a single attribute: name or name(args)
+    ///
+    /// `None` when there is no attribute here, or when its arguments were
+    /// diagnosed and it is dropped.
     fn parse_single_attribute(&mut self) -> Option<Attribute> {
         if self.peek() != TokenType::Ident {
             return None;
@@ -970,49 +1189,30 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Check for arguments
-        if self.is_special(b'(') {
+        let grammar = AttrArgs::of(&name, recognised);
+        let args = if self.is_special(b'(') {
             self.advance();
-            let mut args = Vec::new();
-
-            while !self.is_special(b')') && !self.is_eof() {
-                if let Some(arg) = self.parse_attribute_arg() {
-                    args.push(arg);
-                }
-                if self.is_special(b',') {
-                    self.advance();
-                } else if !self.is_special(b')') {
-                    // Skip unknown tokens
-                    self.advance();
-                }
-            }
-
-            if self.is_special(b')') {
-                self.advance();
-            }
-
-            if name.trim_matches('_') == "mode" {
-                if let Some(AttributeArg::Ident(m)) = args.first() {
-                    self.pending_mode = Some((m.trim_matches('_').to_string(), pos));
-                }
-            } else if name.trim_matches('_') == "vector_size" {
-                match args.first() {
-                    Some(AttributeArg::Int(n)) if *n > 0 => {
-                        self.pending_vector_size = Some((*n as u64, pos));
-                    }
-                    _ => diag::error(pos, "'vector_size' requires a positive byte count"),
-                }
-            } else if name.trim_matches('_') == "aligned" {
-                if let Some(AttributeArg::Int(n)) = args.first() {
-                    if *n > 0 && (*n as u32).is_power_of_two() {
-                        self.pending_attr_align = Some(*n as u32);
-                    }
-                }
-            }
-            Some(Attribute::with_args(name, args))
+            self.parse_attribute_args(&name, grammar).ok()?
         } else {
-            Some(Attribute::new(name))
+            Vec::new()
+        };
+        if let AttrArgs::Integers(role) = grammar {
+            self.check_integer_args(&name, role, &args, pos).ok()?;
         }
+
+        match (name.trim_matches('_'), args.first()) {
+            ("mode", Some(AttributeArg::Ident(m))) => {
+                self.pending_mode = Some((m.trim_matches('_').to_string(), pos));
+            }
+            ("vector_size", Some(AttributeArg::Int(n))) => {
+                self.pending_vector_size = Some((u64::try_from(*n).unwrap_or(u64::MAX), pos));
+            }
+            ("aligned", Some(AttributeArg::Int(n))) => {
+                self.pending_attr_align = Some(*n as u32);
+            }
+            _ => {}
+        }
+        Some(Attribute::with_args(name, args))
     }
 
     /// Parse __attribute__((...)) declarations (GCC extension)

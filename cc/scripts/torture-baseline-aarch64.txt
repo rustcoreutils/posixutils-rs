@@ -1,3 +1,5 @@
+aarch64/builtins/20010124-1@-O0
+aarch64/builtins/20010124-1@-O2
 aarch64/builtins/abs-2@-O0
 aarch64/builtins/abs-3@-O0
 aarch64/builtins/complex-1@-O0
@@ -29,6 +31,7 @@ aarch64/builtins/strncat@-O0
 aarch64/builtins/strncmp-2@-O0
 aarch64/builtins/strncmp-2@-O2
 aarch64/builtins/strncpy@-O0
+aarch64/builtins/strnlen@-O0
 aarch64/builtins/strpbrk@-O0
 aarch64/builtins/strpcpy-2@-O0
 aarch64/builtins/strpcpy-2@-O2
@@ -36,6 +39,7 @@ aarch64/builtins/strpcpy@-O0
 aarch64/builtins/strrchr@-O0
 aarch64/builtins/strspn@-O0
 aarch64/builtins/strspn@-O2
+aarch64/builtins/strstr-asm@-O0
 aarch64/builtins/strstr@-O0
 aarch64/compile/103818@-O0
 aarch64/compile/103818@-O2
@@ -360,6 +364,8 @@ aarch64/compile/20021015-2@-O0
 aarch64/compile/20021015-2@-O2
 aarch64/compile/20021103-1@-O0
 aarch64/compile/20021103-1@-O2
+aarch64/compile/20021108-1@-O0
+aarch64/compile/20021108-1@-O2
 aarch64/compile/20021110@-O0
 aarch64/compile/20021110@-O2
 aarch64/compile/20021119-1@-O0
@@ -548,6 +554,8 @@ aarch64/compile/20040610-1@-O0
 aarch64/compile/20040610-1@-O2
 aarch64/compile/20040611-1@-O0
 aarch64/compile/20040611-1@-O2
+aarch64/compile/20040614-1@-O0
+aarch64/compile/20040614-1@-O2
 aarch64/compile/20040621-1@-O0
 aarch64/compile/20040621-1@-O2
 aarch64/compile/20040624-1@-O0
@@ -618,6 +626,8 @@ aarch64/compile/20050328-1@-O0
 aarch64/compile/20050328-1@-O2
 aarch64/compile/20050423-1@-O0
 aarch64/compile/20050423-1@-O2
+aarch64/compile/20050510-1@-O0
+aarch64/compile/20050510-1@-O2
 aarch64/compile/20050516-1@-O0
 aarch64/compile/20050516-1@-O2
 aarch64/compile/20050520-1@-O0
@@ -876,6 +886,8 @@ aarch64/compile/20180915-1@-O0
 aarch64/compile/20180915-1@-O2
 aarch64/compile/20181114-1@-O0
 aarch64/compile/20181114-1@-O2
+aarch64/compile/20190827-1@-O0
+aarch64/compile/20190827-1@-O2
 aarch64/compile/20191015-1@-O0
 aarch64/compile/20191015-1@-O2
 aarch64/compile/20191015-2@-O0
@@ -904,6 +916,8 @@ aarch64/compile/900407-1@-O0
 aarch64/compile/900407-1@-O2
 aarch64/compile/900516-1@-O0
 aarch64/compile/900516-1@-O2
+aarch64/compile/920301-1@-O0
+aarch64/compile/920301-1@-O2
 aarch64/compile/920409-1@-O0
 aarch64/compile/920409-1@-O2
 aarch64/compile/920409-2@-O0
@@ -920,6 +934,8 @@ aarch64/compile/920428-1@-O0
 aarch64/compile/920428-1@-O2
 aarch64/compile/920428-2@-O0
 aarch64/compile/920428-2@-O2
+aarch64/compile/920428-3@-O0
+aarch64/compile/920428-3@-O2
 aarch64/compile/920428-5@-O0
 aarch64/compile/920428-5@-O2
 aarch64/compile/920428-6@-O0
@@ -942,6 +958,8 @@ aarch64/compile/920501-18@-O0
 aarch64/compile/920501-18@-O2
 aarch64/compile/920501-19@-O0
 aarch64/compile/920501-19@-O2
+aarch64/compile/920501-1@-O0
+aarch64/compile/920501-1@-O2
 aarch64/compile/920501-20@-O0
 aarch64/compile/920501-20@-O2
 aarch64/compile/920501-21@-O0
@@ -958,10 +976,14 @@ aarch64/compile/920501-4@-O0
 aarch64/compile/920501-4@-O2
 aarch64/compile/920501-6@-O0
 aarch64/compile/920501-6@-O2
+aarch64/compile/920501-7@-O0
+aarch64/compile/920501-7@-O2
 aarch64/compile/920501-8@-O0
 aarch64/compile/920501-8@-O2
 aarch64/compile/920501-9@-O0
 aarch64/compile/920501-9@-O2
+aarch64/compile/920502-1@-O0
+aarch64/compile/920502-1@-O2
 aarch64/compile/920502-2@-O0
 aarch64/compile/920502-2@-O2
 aarch64/compile/920520-1@-O0
@@ -1024,10 +1046,14 @@ aarch64/compile/920825-1@-O0
 aarch64/compile/920825-1@-O2
 aarch64/compile/920825-2@-O0
 aarch64/compile/920825-2@-O2
+aarch64/compile/920826-1@-O0
+aarch64/compile/920826-1@-O2
 aarch64/compile/920828-1@-O0
 aarch64/compile/920828-1@-O2
 aarch64/compile/920829-1@-O0
 aarch64/compile/920829-1@-O2
+aarch64/compile/920831-1@-O0
+aarch64/compile/920831-1@-O2
 aarch64/compile/920902-1@-O0
 aarch64/compile/920902-1@-O2
 aarch64/compile/920909-1@-O0
@@ -1154,6 +1180,8 @@ aarch64/compile/930618-1@-O0
 aarch64/compile/930618-1@-O2
 aarch64/compile/930621-1@-O0
 aarch64/compile/930621-1@-O2
+aarch64/compile/930623-1@-O0
+aarch64/compile/930623-1@-O2
 aarch64/compile/930702-1@-O0
 aarch64/compile/930702-1@-O2
 aarch64/compile/930926-1@-O0
@@ -1192,6 +1220,8 @@ aarch64/compile/941014-2@-O0
 aarch64/compile/941014-2@-O2
 aarch64/compile/941014-3@-O0
 aarch64/compile/941014-3@-O2
+aarch64/compile/941014-4@-O0
+aarch64/compile/941014-4@-O2
 aarch64/compile/941019-1@-O0
 aarch64/compile/941019-1@-O2
 aarch64/compile/941111-1@-O0
@@ -1216,6 +1246,8 @@ aarch64/compile/950610-1@-O0
 aarch64/compile/950610-1@-O2
 aarch64/compile/950612-1@-O0
 aarch64/compile/950612-1@-O2
+aarch64/compile/950613-1@-O0
+aarch64/compile/950613-1@-O2
 aarch64/compile/950618-1@-O0
 aarch64/compile/950618-1@-O2
 aarch64/compile/950719-1@-O0
@@ -1366,6 +1398,8 @@ aarch64/compile/991213-1@-O0
 aarch64/compile/991213-1@-O2
 aarch64/compile/991213-2@-O0
 aarch64/compile/991213-2@-O2
+aarch64/compile/991213-3@-O0
+aarch64/compile/991213-3@-O2
 aarch64/compile/991214-1@-O0
 aarch64/compile/991214-1@-O2
 aarch64/compile/991214-2@-O0
@@ -1418,6 +1452,8 @@ aarch64/compile/arr@-O0
 aarch64/compile/arr@-O2
 aarch64/compile/ase@-O0
 aarch64/compile/ase@-O2
+aarch64/compile/asmgoto-1@-O0
+aarch64/compile/asmgoto-1@-O2
 aarch64/compile/asmgoto-2@-O0
 aarch64/compile/asmgoto-2@-O2
 aarch64/compile/asmgoto-3@-O0
@@ -1742,6 +1778,10 @@ aarch64/compile/jmp@-O0
 aarch64/compile/jmp@-O2
 aarch64/compile/jumptab@-O0
 aarch64/compile/jumptab@-O2
+aarch64/compile/labels-1@-O0
+aarch64/compile/labels-1@-O2
+aarch64/compile/labels-2@-O0
+aarch64/compile/labels-2@-O2
 aarch64/compile/layout@-O0
 aarch64/compile/layout@-O2
 aarch64/compile/lbug@-O0
@@ -2066,6 +2106,8 @@ aarch64/compile/pr118501@-O0
 aarch64/compile/pr118501@-O2
 aarch64/compile/pr119226@-O0
 aarch64/compile/pr119226@-O2
+aarch64/compile/pr120250@-O0
+aarch64/compile/pr120250@-O2
 aarch64/compile/pr120807@-O0
 aarch64/compile/pr120807@-O2
 aarch64/compile/pr122066@-O0
@@ -2134,6 +2176,8 @@ aarch64/compile/pr18299-1@-O0
 aarch64/compile/pr18299-1@-O2
 aarch64/compile/pr18712@-O0
 aarch64/compile/pr18712@-O2
+aarch64/compile/pr18903@-O0
+aarch64/compile/pr18903@-O2
 aarch64/compile/pr19080@-O0
 aarch64/compile/pr19080@-O2
 aarch64/compile/pr19121@-O0
@@ -2160,6 +2204,8 @@ aarch64/compile/pr21030@-O0
 aarch64/compile/pr21030@-O2
 aarch64/compile/pr21293@-O0
 aarch64/compile/pr21293@-O2
+aarch64/compile/pr21356@-O0
+aarch64/compile/pr21356@-O2
 aarch64/compile/pr21380@-O0
 aarch64/compile/pr21380@-O2
 aarch64/compile/pr21532@-O0
@@ -2212,6 +2258,8 @@ aarch64/compile/pr24883@-O0
 aarch64/compile/pr24883@-O2
 aarch64/compile/pr24930@-O0
 aarch64/compile/pr24930@-O2
+aarch64/compile/pr25224@-O0
+aarch64/compile/pr25224@-O2
 aarch64/compile/pr25310@-O0
 aarch64/compile/pr25310@-O2
 aarch64/compile/pr25311@-O0
@@ -2258,8 +2306,12 @@ aarch64/compile/pr27528@-O0
 aarch64/compile/pr27528@-O2
 aarch64/compile/pr27571@-O0
 aarch64/compile/pr27571@-O2
+aarch64/compile/pr27863@-O0
+aarch64/compile/pr27863@-O2
 aarch64/compile/pr27907@-O0
 aarch64/compile/pr27907@-O2
+aarch64/compile/pr28489@-O0
+aarch64/compile/pr28489@-O2
 aarch64/compile/pr28675@-O0
 aarch64/compile/pr28675@-O2
 aarch64/compile/pr28776-1@-O0
@@ -2270,6 +2322,8 @@ aarch64/compile/pr28865@-O0
 aarch64/compile/pr28865@-O2
 aarch64/compile/pr28905@-O0
 aarch64/compile/pr28905@-O2
+aarch64/compile/pr29128@-O0
+aarch64/compile/pr29128@-O2
 aarch64/compile/pr29241@-O0
 aarch64/compile/pr29241@-O2
 aarch64/compile/pr29250@-O0
@@ -2288,6 +2342,8 @@ aarch64/compile/pr30564-1@-O0
 aarch64/compile/pr30564-1@-O2
 aarch64/compile/pr30564-2@-O0
 aarch64/compile/pr30564-2@-O2
+aarch64/compile/pr30984@-O0
+aarch64/compile/pr30984@-O2
 aarch64/compile/pr31034@-O0
 aarch64/compile/pr31034@-O2
 aarch64/compile/pr31345-1@-O0
@@ -2328,6 +2384,8 @@ aarch64/compile/pr32780@-O0
 aarch64/compile/pr32780@-O2
 aarch64/compile/pr32796@-O0
 aarch64/compile/pr32796@-O2
+aarch64/compile/pr32919@-O0
+aarch64/compile/pr32919@-O2
 aarch64/compile/pr32920@-O0
 aarch64/compile/pr32920@-O2
 aarch64/compile/pr32988@-O0
@@ -2674,6 +2732,8 @@ aarch64/compile/pr42347@-O0
 aarch64/compile/pr42347@-O2
 aarch64/compile/pr42398@-O0
 aarch64/compile/pr42398@-O2
+aarch64/compile/pr42559@-O0
+aarch64/compile/pr42559@-O2
 aarch64/compile/pr42632@-O0
 aarch64/compile/pr42632@-O2
 aarch64/compile/pr42703@-O0
@@ -2738,6 +2798,8 @@ aarch64/compile/pr44063@-O0
 aarch64/compile/pr44063@-O2
 aarch64/compile/pr44119@-O0
 aarch64/compile/pr44119@-O2
+aarch64/compile/pr44197@-O0
+aarch64/compile/pr44197@-O2
 aarch64/compile/pr44246@-O0
 aarch64/compile/pr44246@-O2
 aarch64/compile/pr44686@-O0
@@ -2788,6 +2850,8 @@ aarch64/compile/pr46002@-O0
 aarch64/compile/pr46002@-O2
 aarch64/compile/pr46034@-O0
 aarch64/compile/pr46034@-O2
+aarch64/compile/pr46107@-O0
+aarch64/compile/pr46107@-O2
 aarch64/compile/pr46248@-O0
 aarch64/compile/pr46248@-O2
 aarch64/compile/pr46388@-O0
@@ -2872,6 +2936,8 @@ aarch64/compile/pr49474@-O0
 aarch64/compile/pr49474@-O2
 aarch64/compile/pr49710@-O0
 aarch64/compile/pr49710@-O2
+aarch64/compile/pr49735@-O0
+aarch64/compile/pr49735@-O2
 aarch64/compile/pr50009@-O0
 aarch64/compile/pr50009@-O2
 aarch64/compile/pr50380@-O0
@@ -2892,6 +2958,8 @@ aarch64/compile/pr51247@-O0
 aarch64/compile/pr51247@-O2
 aarch64/compile/pr51354@-O0
 aarch64/compile/pr51354@-O2
+aarch64/compile/pr51495@-O0
+aarch64/compile/pr51495@-O2
 aarch64/compile/pr51694@-O0
 aarch64/compile/pr51694@-O2
 aarch64/compile/pr51761@-O0
@@ -3018,6 +3086,8 @@ aarch64/compile/pr57698@-O0
 aarch64/compile/pr57698@-O2
 aarch64/compile/pr58088@-O0
 aarch64/compile/pr58088@-O2
+aarch64/compile/pr58164@-O0
+aarch64/compile/pr58164@-O2
 aarch64/compile/pr58332@-O0
 aarch64/compile/pr58332@-O2
 aarch64/compile/pr58340@-O0
@@ -3142,6 +3212,8 @@ aarch64/compile/pr68013@-O0
 aarch64/compile/pr68013@-O2
 aarch64/compile/pr68538@-O0
 aarch64/compile/pr68538@-O2
+aarch64/compile/pr69102@-O0
+aarch64/compile/pr69102@-O2
 aarch64/compile/pr69161@-O0
 aarch64/compile/pr69161@-O2
 aarch64/compile/pr69209@-O0
@@ -3158,8 +3230,14 @@ aarch64/compile/pr69989-2@-O0
 aarch64/compile/pr69989-2@-O2
 aarch64/compile/pr69999@-O0
 aarch64/compile/pr69999@-O2
+aarch64/compile/pr70190@-O0
+aarch64/compile/pr70190@-O2
+aarch64/compile/pr70199@-O0
+aarch64/compile/pr70199@-O2
 aarch64/compile/pr70263-1@-O0
 aarch64/compile/pr70263-1@-O2
+aarch64/compile/pr70633@-O0
+aarch64/compile/pr70633@-O2
 aarch64/compile/pr70916@-O0
 aarch64/compile/pr70916@-O2
 aarch64/compile/pr71109@-O0
@@ -3306,6 +3384,8 @@ aarch64/compile/pr83575@-O0
 aarch64/compile/pr83575@-O2
 aarch64/compile/pr84111@-O0
 aarch64/compile/pr84111@-O2
+aarch64/compile/pr84136@-O0
+aarch64/compile/pr84136@-O2
 aarch64/compile/pr84178-1@-O0
 aarch64/compile/pr84178-1@-O2
 aarch64/compile/pr84195@-O0
@@ -3538,6 +3618,8 @@ aarch64/compile/signext2@-O0
 aarch64/compile/signext2@-O2
 aarch64/compile/signext@-O0
 aarch64/compile/signext@-O2
+aarch64/compile/simd-6@-O0
+aarch64/compile/simd-6@-O2
 aarch64/compile/sim@-O0
 aarch64/compile/sim@-O2
 aarch64/compile/simple@-O0
@@ -3570,6 +3652,8 @@ aarch64/compile/split-path-3@-O0
 aarch64/compile/split-path-3@-O2
 aarch64/compile/split-path-4@-O0
 aarch64/compile/split-path-4@-O2
+aarch64/compile/split-path-5@-O0
+aarch64/compile/split-path-5@-O2
 aarch64/compile/split-path-6@-O0
 aarch64/compile/split-path-6@-O2
 aarch64/compile/split-path-7@-O0
@@ -3670,6 +3754,8 @@ aarch64/compile/USIcmp@-O0
 aarch64/compile/USIcmp@-O2
 aarch64/compile/uuarg@-O0
 aarch64/compile/uuarg@-O2
+aarch64/compile/vector-align-1@-O0
+aarch64/compile/vector-align-1@-O2
 aarch64/compile/vla-const-1@-O0
 aarch64/compile/vla-const-1@-O2
 aarch64/compile/vla-const-2@-O0
@@ -4245,6 +4331,8 @@ aarch64/execute/20040218-1@-O0
 aarch64/execute/20040218-1@-O2
 aarch64/execute/20040223-1@-O0
 aarch64/execute/20040223-1@-O2
+aarch64/execute/20040302-1@-O0
+aarch64/execute/20040302-1@-O2
 aarch64/execute/20040307-1@-O0
 aarch64/execute/20040307-1@-O2
 aarch64/execute/20040309-1@-O0
@@ -4327,6 +4415,8 @@ aarch64/execute/20041212-1@-O0
 aarch64/execute/20041212-1@-O2
 aarch64/execute/20041213-2@-O0
 aarch64/execute/20041213-2@-O2
+aarch64/execute/20041214-1@-O0
+aarch64/execute/20041214-1@-O2
 aarch64/execute/20041218-1@-O0
 aarch64/execute/20041218-1@-O2
 aarch64/execute/20050104-1@-O0
@@ -4449,6 +4539,8 @@ aarch64/execute/20071202-1@-O0
 aarch64/execute/20071202-1@-O2
 aarch64/execute/20071205-1@-O0
 aarch64/execute/20071205-1@-O2
+aarch64/execute/20071210-1@-O0
+aarch64/execute/20071210-1@-O2
 aarch64/execute/20071211-1@-O0
 aarch64/execute/20071211-1@-O2
 aarch64/execute/20071213-1@-O0
@@ -4457,6 +4549,10 @@ aarch64/execute/20071216-1@-O0
 aarch64/execute/20071216-1@-O2
 aarch64/execute/20071219-1@-O0
 aarch64/execute/20071219-1@-O2
+aarch64/execute/20071220-1@-O0
+aarch64/execute/20071220-1@-O2
+aarch64/execute/20071220-2@-O0
+aarch64/execute/20071220-2@-O2
 aarch64/execute/20080117-1@-O0
 aarch64/execute/20080117-1@-O2
 aarch64/execute/20080122-1@-O0
@@ -4609,6 +4705,8 @@ aarch64/execute/20190901-1@-O0
 aarch64/execute/20190901-1@-O2
 aarch64/execute/20191023-1@-O0
 aarch64/execute/20191023-1@-O2
+aarch64/execute/20210505-1@-O0
+aarch64/execute/20210505-1@-O2
 aarch64/execute/20221006-1@-O0
 aarch64/execute/20221006-1@-O2
 aarch64/execute/20230509-1@-O0
@@ -4627,6 +4725,8 @@ aarch64/execute/900409-1@-O0
 aarch64/execute/900409-1@-O2
 aarch64/execute/920202-1@-O0
 aarch64/execute/920202-1@-O2
+aarch64/execute/920302-1@-O0
+aarch64/execute/920302-1@-O2
 aarch64/execute/920409-1@-O0
 aarch64/execute/920409-1@-O2
 aarch64/execute/920410-1@-O0
@@ -4641,6 +4741,12 @@ aarch64/execute/920501-1@-O0
 aarch64/execute/920501-1@-O2
 aarch64/execute/920501-2@-O0
 aarch64/execute/920501-2@-O2
+aarch64/execute/920501-3@-O0
+aarch64/execute/920501-3@-O2
+aarch64/execute/920501-4@-O0
+aarch64/execute/920501-4@-O2
+aarch64/execute/920501-5@-O0
+aarch64/execute/920501-5@-O2
 aarch64/execute/920501-6@-O0
 aarch64/execute/920501-6@-O2
 aarch64/execute/920501-8@-O0
@@ -5087,6 +5193,7 @@ aarch64/execute/990128-1@-O0
 aarch64/execute/990128-1@-O2
 aarch64/execute/990130-1@-O0
 aarch64/execute/990130-1@-O2
+aarch64/execute/990208-1@-O0
 aarch64/execute/990211-1@-O0
 aarch64/execute/990211-1@-O2
 aarch64/execute/990222-1@-O0
@@ -5259,6 +5366,8 @@ aarch64/execute/compare-2@-O0
 aarch64/execute/compare-2@-O2
 aarch64/execute/compare-3@-O0
 aarch64/execute/compare-3@-O2
+aarch64/execute/comp-goto-1@-O0
+aarch64/execute/comp-goto-1@-O2
 aarch64/execute/complex-1@-O0
 aarch64/execute/complex-1@-O2
 aarch64/execute/complex-2@-O0
@@ -6123,6 +6232,8 @@ aarch64/execute/pr56899@-O0
 aarch64/execute/pr56899@-O2
 aarch64/execute/pr56962@-O0
 aarch64/execute/pr56962@-O2
+aarch64/execute/pr56982@-O0
+aarch64/execute/pr56982@-O2
 aarch64/execute/pr57124@-O0
 aarch64/execute/pr57124@-O2
 aarch64/execute/pr57130@-O0

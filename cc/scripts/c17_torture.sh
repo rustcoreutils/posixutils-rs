@@ -225,15 +225,20 @@ dg_scan() {
             }
             else if (d ~ /dg-require-stack-size/) {
                 # The test says how much stack it needs. Honour it rather than
-                # letting it die on the default 8 MB.
-                if (match(text, /0x[0-9a-fA-F]+|[0-9]+/)) stack = substr(text, RSTART, RLENGTH)
+                # letting it die on the default 8 MB. The size is often an
+                # expression -- "8*100*100", "40000 * 4 + 256" -- and taking
+                # its first number read those as 8 and 40000; run_one
+                # evaluates it.
+                if (match(text, /"[^"]*"/)) stack = substr(text, RSTART + 1, RLENGTH - 2)
             }
-            else if (d ~ /dg-require-effective-target/) {
-                # Only the targets we cannot satisfy matter.
-                if (match(text, /^[^}]*/) &&
-                    substr(text, RSTART, RLENGTH) ~ /(vect_|lto|profile|fpic|tls_|alias|weak|trampolines|indirect_jumps|nonlocal_goto|label_values)/)
-                    skip = "unsupported target requirement"
-            }
+            # `dg-require-effective-target`, `dg-require-alias` and the rest
+            # describe gcc'"'"'s runner, not the test, and are not read. A regex
+            # over them once skipped `alias`, `weak`, `fpic` and
+            # `label_values` tests long after c17 had all four, and hid three
+            # bugs behind them; modelling each name instead skipped avx512,
+            # `-fexceptions` and profiling tests that c17 compiles. Every test
+            # is attempted, and one that needs something c17 has decided not
+            # to have is skipped by name in a list below.
             else if (d ~ /dg-timeout-factor/) {
                 if (match(text, /[0-9]+/)) mult = substr(text, RSTART, RLENGTH)
             }
@@ -318,13 +323,62 @@ dg_scan() {
     ' "$1"
 }
 
-# Tests GCC itself excludes via a .x file. We honour the existence of the file
-# rather than interpreting its Tcl.
-has_x_file() { [ -f "${1%.c}.x" ]; }
+# A test's `.x` file is Tcl that gcc's harness runs before the test. Treating
+# its mere existence as "skip" threw away 26 builtins tests, nearly all of
+# whose `.x` files return 0 here: they add a flag, drop one torture level, or
+# exclude a target that is not ours. The suite uses a handful of shapes, and
+# this reads exactly those:
+#
+#   set additional_flags X                      -> extra flags
+#   torture_eval_before_compile ... {*-Og*} ... -> skip that level
+#   istarget "nvptx-*-*" ... return 1           -> skip on a matching target
+#   check_effective_target_freestanding         -> false: we are hosted
+#   check_effective_target_nonlocal_goto        -> true, as for gcc here
+#
+# Anything else is reported as an unrecognised `.x` file, by name, so a new
+# shape is seen rather than guessed at.
+#
+# Prints "skip:<reason>", "flags:<flags>", or nothing.
+x_file_verdict() {
+    local x="${1%.c}.x" opt="$2"
+    [ -f "$x" ] || return 0
+    awk -v OPT="$opt" -v TRIPLE="$TORTURE_TRIPLE" '
+        /^[ \t]*#/ { next }
+        { body = body " " $0 }
+        END {
+            flags = ""
+            if (match(body, /set additional_flags[ \t]+("[^"]*"|[^ \t]+)/)) {
+                flags = substr(body, RSTART, RLENGTH)
+                sub(/set additional_flags[ \t]+/, "", flags)
+                gsub(/"/, "", flags)
+            }
+            rest = body
+            while (match(rest, /string match \{[^}]*\}/)) {
+                pat = substr(rest, RSTART + 14, RLENGTH - 15)
+                rest = substr(rest, RSTART + RLENGTH)
+                gsub(/\*/, "", pat)
+                if (index(OPT, pat)) { print "skip:the test'"'"'s .x file skips " pat; exit }
+            }
+            rest = body
+            while (match(rest, /istarget "[^"]*"/)) {
+                pat = substr(rest, RSTART + 10, RLENGTH - 11)
+                rest = substr(rest, RSTART + RLENGTH)
+                re = pat; gsub(/[.+^$()|\\]/, "\\&", re); gsub(/\*/, ".*", re)
+                if (TRIPLE ~ ("^" re "$")) { print "skip:the test'"'"'s .x file excludes this target"; exit }
+            }
+            # What is left must be the shapes above and nothing else.
+            known = body
+            gsub(/load_lib target-supports\.exp/, "", known)
+            gsub(/set additional_flags[ \t]+("[^"]*"|[^ \t]+)/, "", known)
+            gsub(/set torture_eval_before_compile \{[^{}]*\{[^{}]*\{[^{}]*\}[^{}]*\}[^{}]*\{[^{}]*\}[^{}]*\}/, "", known)
+            gsub(/if \{ *!? *\[check_effective_target_(freestanding|nonlocal_goto)\] *\} *\{[^}]*\}/, "", known)
+            gsub(/if \[istarget "[^"]*"\] *\{[^}]*\}/, "", known)
+            gsub(/return 0;?/, "", known)
+            if (known !~ /^[ \t;]*$/) { print "skip:unrecognised .x file"; exit }
+            if (flags != "") print "flags:" flags
+        }' "$x"
+}
 
-# Features c17 does not implement and will not, per the plan. Skipping these
-# with a named reason is honest; letting them count as failures is not.
-UNSUPPORTED_RE='vector_size|__label__|__builtin_apply|__builtin_setjmp|__builtin_longjmp|attribute__ *\(\( *alias'
 
 # Features c17 has decided not to implement: GNU-only language extensions, and
 # anything newer than C17. A test that needs one is **out of scope**, not a
@@ -340,11 +394,11 @@ UNSUPPORTED_RE='vector_size|__label__|__builtin_apply|__builtin_setjmp|__builtin
 # moment to decide.
 #
 # Post-C17: `_Decimal32/64/128` is TR 24732, folded into C23; `[[...]]` is the
-# C23 attribute syntax.
-OUT_OF_SCOPE_POST_C17=" execute/pr80692 execute/pr123978 execute/pr124358 execute/pr125291 \
- compile/pr111059-7 compile/pr111059-8 compile/pr111059-9 \
+# C23 attribute syntax; `uabs` is C2y.
+OUT_OF_SCOPE_POST_C17=" execute/pr80692 execute/pr123978 execute/pr124358 \
+ execute/pr125291 compile/pr111059-7 compile/pr111059-8 compile/pr111059-9 \
  compile/pr111059-10 compile/pr111059-11 compile/pr111059-12 \
- compile/pr111911-2 "
+ compile/pr111911-2 builtins/uabs-1 builtins/uabs-2 builtins/uabs-3 "
 
 # gcc's own GIMPLE front end (`-fgimple`), which parses its internal
 # representation rather than C. gcc itself rejects these without the flag.
@@ -357,7 +411,8 @@ OUT_OF_SCOPE_GNU89_INLINE=" execute/20021120-1 compile/20021120-1 \
  compile/20021120-2 "
 
 # Written for a target c17 does not have a backend for.
-OUT_OF_SCOPE_OTHER_TARGET=" compile/mipscop-1 compile/mipscop-2 compile/mipscop-3 compile/mipscop-4 "
+OUT_OF_SCOPE_OTHER_TARGET=" compile/mipscop-1 compile/mipscop-2 \
+ compile/mipscop-3 compile/mipscop-4 "
 
 # A GNU-only attribute: reverse-endian load/store lowering.
 OUT_OF_SCOPE_GNU_ATTR=" execute/20230630-2 execute/20230630-4 "
@@ -366,24 +421,26 @@ OUT_OF_SCOPE_GNU_ATTR=" execute/20230630-2 execute/20230630-4 "
 # take.
 #
 # Nested function definitions: a static chain and executable trampolines.
-OUT_OF_SCOPE_NESTED_FN=" execute/20010209-1 compile/20010209-1 execute/20010605-1 \
- compile/20010605-1 execute/20030501-1 execute/20040520-1 \
+OUT_OF_SCOPE_NESTED_FN=" execute/20010209-1 compile/20010209-1 \
+ execute/20010605-1 compile/20010605-1 execute/20030501-1 execute/20040520-1 \
  execute/20090219-1 execute/nest-align-1 execute/nestfunc-7 \
- execute/nest-stdar-1 execute/pr103405 execute/pr22061-3 \
- execute/pr22061-4 compile/20010903-2 compile/20011023-1 \
- compile/20020309-1 compile/20021204-1 \
- compile/20030418-1 compile/20030716-1 \
- compile/20031011-1 compile/20040310-1 compile/20040317-3 \
- compile/20050119-1 compile/951116-1 compile/nested-2 \
- compile/nested-3 compile/pr35006 compile/pr99324 execute/20061220-1 "
+ execute/nest-stdar-1 execute/pr103405 execute/pr22061-3 execute/pr22061-4 \
+ compile/20010903-2 compile/20011023-1 compile/20020309-1 compile/20021204-1 \
+ compile/20030418-1 compile/20030716-1 compile/20031011-1 compile/20040310-1 \
+ compile/20040317-3 compile/20050119-1 compile/951116-1 compile/nested-2 \
+ compile/nested-3 compile/pr35006 compile/pr99324 execute/20061220-1 \
+ compile/20010226-1 compile/20040323-1 compile/930506-2 compile/pr27889 \
+ compile/nested-1 execute/20000822-1 execute/920612-2 execute/921017-1 \
+ execute/921215-1 execute/931002-1 execute/nestfunc-1 execute/nestfunc-2 \
+ execute/nestfunc-3 execute/pr71494 "
 
 # A variable-length array as a struct or union member: struct layout computed
 # at run time, and `offsetof` through it.
-OUT_OF_SCOPE_VLA_MEMBER=" execute/20020412-1 execute/20040308-1 execute/20040423-1 \
- execute/20041218-2 execute/20070919-1 compile/20070919-1 \
+OUT_OF_SCOPE_VLA_MEMBER=" execute/20020412-1 execute/20040308-1 \
+ execute/20040423-1 execute/20041218-2 execute/20070919-1 compile/20070919-1 \
  execute/align-nest execute/pr41935 execute/pr82210 compile/20020210-1 \
  compile/20030224-1 compile/20050801-2 compile/920428-4 compile/920501-16 \
- compile/pr42956 compile/pr77754-6 compile/pr82564 "
+ compile/pr42956 compile/pr77754-6 compile/pr82564 compile/pr39394 "
 
 # gcc-specific *behaviour*, as opposed to a gcc-specific feature. Neither is
 # required by C17 and c17 deliberately does something else; see the
@@ -395,9 +452,8 @@ OUT_OF_SCOPE_VLA_MEMBER=" execute/20020412-1 execute/20040308-1 execute/20040423
 #               saturates to INT_MAX. aarch64 agrees by hardware accident.
 #   pr46309     a conditional with one `void` arm, which gcc takes as an
 #               extension and C17 6.5.15p3 forbids.
-OUT_OF_SCOPE_GCC_BEHAVIOUR=" execute/20021127-1 execute/20031003-1 execute/pr46309 \
- compile/pr26725 compile/20000211-1 \
- compile/950919-1 "
+OUT_OF_SCOPE_GCC_BEHAVIOUR=" execute/20021127-1 execute/20031003-1 \
+ execute/pr46309 compile/pr26725 compile/20000211-1 compile/950919-1 "
 
 # Tests gcc on this machine fails exactly as c17 does, verified by running both
 # at -O0 and -O2. Counting them as c17 failures overstates the gap, and they are
@@ -428,10 +484,21 @@ NEEDS_PRE_C99_DIALECT=" compile/pr29201 "
 # `__builtin_stack_save`/`stack_restore` are the marks gcc puts around a VLA's
 # lifetime, and c17 frees a VLA at the end of its block without them;
 # `__builtin_clear_padding` would have to walk a type to find its padding; and
-# `__builtin_cexpi`/`cpow` are complex libm entry points. See BUILTIN.md's
+# `__builtin_cexpi`/`cpow` are complex libm entry points;
+# `__builtin_setjmp`/`__builtin_longjmp` are gcc's own lightweight nonlocal
+# goto, next to the ordinary `setjmp`/`longjmp` c17 has; and `__builtin_apply`
+# forwards an untyped argument block. Every `builtins/*-chk` test reaches
+# `__builtin_setjmp` through its shared `chk.h`. See BUILTIN.md's
 # "Not implemented" table, which is where these are recorded.
 OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN=" compile/20071117-1 compile/pr98087 \
- compile/pr110266 compile/pr54428 "
+ compile/pr110266 compile/pr54428 builtins/memcpy-chk builtins/memmove-chk \
+ builtins/mempcpy-chk builtins/memset-chk builtins/pr23484-chk \
+ builtins/pr93262-chk builtins/snprintf-chk builtins/sprintf-chk \
+ builtins/stpcpy-chk builtins/stpncpy-chk builtins/strcat-chk \
+ builtins/strcpy-chk builtins/strncat-chk builtins/strncpy-chk \
+ builtins/vsnprintf-chk builtins/vsprintf-chk compile/20011029-1 \
+ compile/complex-6 compile/pr89280 compile/pr82337 execute/built-in-setjmp \
+ execute/pr60003 execute/pr64242 execute/pr84521 execute/pr47237 "
 
 # `__builtin_issignaling`, which distinguishes a signalling NaN from a quiet
 # one. No system header uses it -- `<math.h>` has `issignaling` as its own
@@ -443,6 +510,55 @@ OUT_OF_SCOPE_ISSIGNALING=" ieee/builtin-issignaling-1 \
  ieee/float128x-builtin-issignaling-1 ieee/float16-builtin-issignaling-1 \
  ieee/float32-builtin-issignaling-1 ieee/float32x-builtin-issignaling-1 \
  ieee/float64-builtin-issignaling-1 ieee/float64x-builtin-issignaling-1 "
+
+# Vector values. `vector_size` gives a type a vector's storage -- what glibc's
+# `<link.h>` needs -- and cc/DECISIONS.md stops it there: arithmetic, copies,
+# initializers and comparisons of whole vectors, and `__builtin_convertvector`
+# and `__builtin_shuffle`, are the SIMD subsystem it declines. A test that
+# only declares vectors is not listed, and runs.
+OUT_OF_SCOPE_VECTOR_ARITH=" compile/icfmatch compile/pr100305 \
+ compile/pr10153-1 compile/pr10153-2 compile/pr104499 compile/pr108237 \
+ compile/pr108892 compile/pr111699-1 compile/pr123069 compile/pr124250 \
+ compile/pr33614 compile/pr33617 compile/pr34856 compile/pr39928-1 \
+ compile/pr52750 compile/pr53410-2 compile/pr53748 compile/pr54713-1 \
+ compile/pr54713-2 compile/pr54713-3 compile/pr60502 compile/pr70061 \
+ compile/pr70240 compile/pr70355 compile/pr85945 compile/pr90139 \
+ compile/pr92618 compile/pr94488 compile/pr96426 compile/pr99225 \
+ compile/pr99647 compile/simd-1 compile/simd-2 compile/simd-3 compile/simd-4 \
+ compile/simd-5 compile/vector-1 compile/vector-2 compile/vector-3 \
+ compile/vector-4 compile/vector-5 compile/vector-6 compile/vector-dup-1 \
+ compile/vector-shift-1 execute/20050316-1 execute/20050316-2 \
+ execute/20050316-3 execute/20050604-1 execute/20050607-1 execute/20060420-1 \
+ execute/pr105613 execute/pr108292 execute/pr109040 execute/pr109938 \
+ execute/pr109986 execute/pr110817-1 execute/pr110817-2 execute/pr110817-3 \
+ execute/pr121957 execute/pr123625 execute/pr123625-2 execute/pr123625-3 \
+ execute/pr123753 execute/pr126405 execute/pr126405-2 execute/pr126405-3 \
+ execute/pr23135 execute/pr53645 execute/pr53645-2 execute/pr60960 \
+ execute/pr65427 execute/pr70903 execute/pr71626-1 execute/pr71626-2 \
+ execute/pr85169 execute/pr85331 execute/pr92618 execute/pr94412 \
+ execute/pr94524-1 execute/pr94524-2 execute/pr94591 execute/scal-to-vec1 \
+ execute/scal-to-vec2 execute/scal-to-vec3 execute/simd-1 execute/simd-2 \
+ execute/simd-4 execute/simd-5 execute/simd-6 ieee/fp-cmp-cond-1 \
+ ieee/pr72824-2 "
+
+# `__label__`, a block-scope label declaration. cc/DECISIONS.md rules it out
+# together with nested functions, which are what it exists for.
+OUT_OF_SCOPE_LOCAL_LABELS=" compile/20000326-2 compile/20000518-1 \
+ compile/20050122-2 compile/920415-1 compile/930118-1 compile/981006-1 \
+ compile/pr21728 execute/920415-1 execute/920428-2 execute/920501-7 \
+ execute/920721-4 execute/930406-1 execute/980526-1 execute/comp-goto-2 \
+ execute/nestfunc-5 execute/nestfunc-6 execute/pr24135 execute/pr51447 "
+
+# The difference of two label addresses, `&&a - &&b`, as a constant in a
+# static initializer: a GNU extension on top of labels as values, which c17
+# has. The initializer would need a symbol difference relocation.
+OUT_OF_SCOPE_LABEL_DIFF=" compile/labels-3 execute/pr70460 "
+
+# A C17 constraint gcc only warns about: 6.7.4p3 forbids an inline definition
+# with external linkage from referring to an identifier with internal linkage.
+# c17 diagnoses it as the constraint it is, and `-fpermissive` relaxes it;
+# the test passes neither.
+C17_CONSTRAINT_GCC_WARNS=" compile/pr38857 "
 
 # A local array of 2 GiB to 1 TiB. This is a gap in c17, not a decision: an
 # automatic object past `MAX_STACK_OBJECT_BYTES` is refused with a diagnostic,
@@ -465,8 +581,9 @@ X86_ASM_ONLY=" execute/990413-2 "
 TEMPLATE_NOT_ASSEMBLED=" compile/920520-1 compile/920521-1 "
 
 # gcc rejects or fails these at every level here.
-GCC_ALSO_FAILS=" execute/980608-1 execute/bcp-1 execute/eeprof-1 execute/pr117432 \
- execute/pr123864 execute/va-arg-7 execute/va-arg-8 compile/dll "
+GCC_ALSO_FAILS=" execute/980608-1 execute/bcp-1 execute/eeprof-1 \
+ execute/pr117432 execute/pr123864 execute/va-arg-7 execute/va-arg-8 \
+ compile/dll "
 
 # ------------------------------------------------------------------ one test
 run_one() {
@@ -495,25 +612,12 @@ run_one() {
     local exe="$work/bin/${tag//\//-}.$$"
     local log="$exe.log"
 
-    if has_x_file "$src"; then
-        echo "SKIP	$tag	.x file"; return
-    fi
-    # Scan the test *and* anything it includes by a relative path. Several
-    # tests are a two-line wrapper around a file elsewhere in the tree --
-    # `pr71626-2` includes `pr71626-1.c`, and `pr109938`/`pr109986` reach into
-    # `gcc.dg/tree-ssa/` -- so the feature that blocks them is not in the file
-    # named on the command line, and scanning only that file called three
-    # `vector_size` tests plain compile failures.
-    local scan_files="$src" inc
-    while read -r inc; do
-        [ -n "$inc" ] || continue
-        [ -f "$(dirname "$src")/$inc" ] && scan_files="$scan_files $(dirname "$src")/$inc"
-    done <<EOF
-$(awk -F'"' '/^[[:space:]]*#[[:space:]]*include[[:space:]]*"/ {print $2}' "$src" 2>/dev/null)
-EOF
-    if awk "/$UNSUPPORTED_RE/ {found=1} END {exit !found}" $scan_files 2>/dev/null; then
-        echo "SKIP	$tag	unsupported extension"; return
-    fi
+    local xv xflags=""
+    xv=$(x_file_verdict "$src" "$opt")
+    case "$xv" in
+        skip:*)  echo "SKIP	$tag	${xv#skip:}"; return;;
+        flags:*) xflags=${xv#flags:};;
+    esac
     local key="$suite/$base"
     case "$GCC_ALSO_FAILS" in
         *" $key "*) echo "SKIP	$tag	gcc fails this too"; return;;
@@ -559,6 +663,18 @@ EOF
     case "$OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN" in
         *" $key "*) echo "SKIP	$tag	out of scope: a gcc-internal builtin"; return;;
     esac
+    case "$OUT_OF_SCOPE_VECTOR_ARITH" in
+        *" $key "*) echo "SKIP	$tag	out of scope: vector values"; return;;
+    esac
+    case "$OUT_OF_SCOPE_LOCAL_LABELS" in
+        *" $key "*) echo "SKIP	$tag	out of scope: __label__"; return;;
+    esac
+    case "$OUT_OF_SCOPE_LABEL_DIFF" in
+        *" $key "*) echo "SKIP	$tag	out of scope: label difference as a constant"; return;;
+    esac
+    case "$C17_CONSTRAINT_GCC_WARNS" in
+        *" $key "*) echo "SKIP	$tag	a C17 constraint gcc does not enforce"; return;;
+    esac
     case "$NEEDS_64BIT_FRAMES" in
         *" $key "*) echo "SKIP	$tag	needs 64-bit frames"; return;;
     esac
@@ -587,6 +703,17 @@ EOF
     esac
     if [ -n "$skip" ]; then
         echo "SKIP	$tag	$skip"; return
+    fi
+    # A `.x` file's flags join the test's own, with the same -std= handling:
+    # c17 has one language mode, and a dialect the test asks for is either
+    # honoured by name above or out of scope.
+    [ -n "$xflags" ] && flags="$flags $(printf '%s' "$xflags" | sed -E 's/-std=[a-z0-9:]+//g')"
+    # `dg-require-stack-size` is an expression over integers.
+    if [ -n "$stack" ]; then
+        case "$stack" in
+            *[!0-9xXa-fA-F\ +*\(\)-]*) stack="";;
+            *) stack=$(( stack ));;
+        esac
     fi
 
     local ctimeout=$((30 * mult)) rtimeout=$((20 * mult))
@@ -721,16 +848,17 @@ default_mode() {
     esac
 }
 
-export -f run_one dg_scan has_x_file default_mode
+export -f run_one dg_scan x_file_verdict default_mode
 export -f target_compile_only target_build target_run
 export TORTURE_TARGET TARGET_FLAGS TAG_PREFIX X86_ASM_ONLY TEMPLATE_NOT_ASSEMBLED
-export UNSUPPORTED_RE GCC_ALSO_FAILS NEEDS_OPTIMIZATION TORTURE_TRIPLE
+export GCC_ALSO_FAILS NEEDS_OPTIMIZATION TORTURE_TRIPLE
 export OUT_OF_SCOPE_POST_C17 OUT_OF_SCOPE_GNU_ATTR
 export OUT_OF_SCOPE_NESTED_FN OUT_OF_SCOPE_VLA_MEMBER
 export OUT_OF_SCOPE_GCC_BEHAVIOUR OUT_OF_SCOPE_GCC_INTERNAL
 export OUT_OF_SCOPE_GNU89_INLINE OUT_OF_SCOPE_OTHER_TARGET
 export NEEDS_PRE_C99_DIALECT OUT_OF_SCOPE_ISSIGNALING
 export OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN NEEDS_64BIT_FRAMES
+export OUT_OF_SCOPE_VECTOR_ARITH OUT_OF_SCOPE_LOCAL_LABELS OUT_OF_SCOPE_LABEL_DIFF C17_CONSTRAINT_GCC_WARNS
 
 # ------------------------------------------------------------- collect tests
 # Each line is `<sub-suite>:<path>`, so a worker knows which sub-suite it is in

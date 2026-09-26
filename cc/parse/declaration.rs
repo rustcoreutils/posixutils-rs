@@ -985,43 +985,7 @@ impl Parser<'_> {
                         modifiers |= TypeModifiers::ATOMIC;
                     }
                 }
-                crate::kw::ALIGNAS => {
-                    // C11 alignment specifier: _Alignas(type-name) or _Alignas(constant-expression)
-                    let alignas_pos = self.current_pos();
-                    self.advance();
-                    self.expect_special(b'(')?;
-                    let align = if let Some(type_id) = self.try_parse_type_name() {
-                        // _Alignas(type) - alignment of the type
-                        self.types.alignment(type_id) as u32
-                    } else {
-                        // Parse as constant expression: _Alignas(16)
-                        let expr = self.parse_expression()?;
-                        self.eval_const_expr(&expr).unwrap_or(0) as u32
-                    };
-                    self.expect_special(b')')?;
-
-                    // C11 6.7.5p6: _Alignas(0) has no effect
-                    if align == 0 {
-                        // No effect - don't update pending_alignas
-                    } else {
-                        // C11 6.7.5: alignment must be a positive power of 2
-                        if !align.is_power_of_two() {
-                            return Err(ParseError::new(
-                                format!("_Alignas({}) must be a power of 2", align),
-                                alignas_pos,
-                            ));
-                        }
-                        // Multiple _Alignas can appear; the strictest (largest) wins (C11 6.7.5)
-                        if let Some(existing) = self.pending_alignas {
-                            self.pending_alignas = Some(existing.max(align));
-                        } else {
-                            self.pending_alignas = Some(align);
-                        }
-                        // Record the spelling: 6.7.5p2 constrains the keyword,
-                        // not the `aligned` attribute that shares the slot.
-                        self.pending_alignas_kw.get_or_insert(alignas_pos);
-                    }
-                }
+                crate::kw::ALIGNAS => self.parse_alignas_specifier()?,
                 crate::kw::SHORT => {
                     tally.note_size("short", self.current_pos());
                     self.advance();
@@ -1326,10 +1290,19 @@ impl Parser<'_> {
         self.advance();
         self.expect_special(b'(')?;
         let align = if let Some(type_id) = self.try_parse_type_name() {
-            self.types.alignment(type_id) as u32
+            self.types.alignment(type_id) as i128
         } else {
             let expr = self.parse_expression()?;
-            self.eval_const_expr(&expr).unwrap_or(0) as u32
+            match self.eval_const_expr(&expr) {
+                Some(align) => align,
+                None => {
+                    diag::error(
+                        alignas_pos,
+                        &gettext("requested alignment is not an integer constant"),
+                    );
+                    0
+                }
+            }
         };
         self.expect_special(b')')?;
 
@@ -1337,12 +1310,15 @@ impl Parser<'_> {
         if align == 0 {
             return Ok(());
         }
-        if !align.is_power_of_two() {
-            return Err(ParseError::new(
-                format!("_Alignas({}) must be a power of 2", align),
-                alignas_pos,
-            ));
-        }
+        let align = match u32::try_from(align) {
+            Ok(align) if align.is_power_of_two() => align,
+            _ => {
+                return Err(ParseError::new(
+                    format!("_Alignas({}) must be a power of 2", align),
+                    alignas_pos,
+                ))
+            }
+        };
         // Several may appear; the strictest wins (C11 6.7.5).
         self.pending_alignas = Some(match self.pending_alignas {
             Some(existing) => existing.max(align),

@@ -14486,3 +14486,47 @@ int main(int argc, char **argv)
 "#;
     run_everywhere("backward_goto_in_switch_vla", src);
 }
+
+/// An attribute's integer argument is a constant expression, as it is to gcc.
+/// The attribute parser read one token, and read that with Rust's `i64`
+/// parser: `aligned(0x40)` and `aligned(16UL)` became 0 and were silently
+/// ignored, `aligned(A)` for an enum constant and `aligned(sizeof(T))` were
+/// dropped as unknown identifiers, and `vector_size(2 * sizeof(int))` was
+/// rejected as "2 bytes".
+#[test]
+fn codegen_attribute_arguments_are_constant_expressions() {
+    let src = r#"
+#include <stdint.h>
+enum { A = 64 };
+#define LINE 0x40
+
+char a __attribute__((aligned(0x40)));
+char b __attribute__((aligned(16UL)));
+char c __attribute__((aligned(A)));
+char d __attribute__((aligned(sizeof(long double))));
+char e __attribute__((aligned(2 * sizeof(int))));
+char f __attribute__((aligned((LINE))));
+struct S { char c; int x __attribute__((aligned(4 * sizeof(int)))); };
+typedef int T __attribute__((aligned(0x20)));
+typedef int V __attribute__((vector_size(2 * sizeof(int))));
+typedef float W __attribute__((vector_size(sizeof(float) * 4)));
+typedef unsigned char U __attribute__((vector_size(0x10)));
+
+int main(void)
+{
+    char g __attribute__((aligned(0x20)));
+    if (_Alignof(a) != 64 || (uintptr_t)&a % 64) return 1;
+    if (_Alignof(b) != 16 || (uintptr_t)&b % 16) return 2;
+    if (_Alignof(c) != 64 || (uintptr_t)&c % 64) return 3;
+    if (_Alignof(d) != sizeof(long double)) return 4;
+    if (_Alignof(e) != 2 * sizeof(int)) return 5;
+    if (_Alignof(f) != 64 || (uintptr_t)&f % 64) return 6;
+    if (_Alignof(struct S) != 16) return 7;
+    if (_Alignof(T) != 32) return 8;
+    if (sizeof(V) != 8 || sizeof(W) != 16 || sizeof(U) != 16) return 9;
+    if ((uintptr_t)&g % 32) return 10;
+    return 0;
+}
+"#;
+    run_everywhere("attribute_arguments", src);
+}

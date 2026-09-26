@@ -453,13 +453,19 @@ fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
     // Check for include chain (only on first occurrence of a file)
     let include_note = show_include_chain(pos.stream);
 
-    // Print include context if present
+    // Print include context if present, under the name of the translation
+    // unit the chain starts from. Stream 0 is only the first unit's: with
+    // several operands, a later unit's header error was reported against it.
     if let Some(chain) = include_note {
-        // Get base filename
         let base = STREAMS.with(|s| {
-            s.borrow()
-                .get(0)
-                .map(|st| st.name.clone())
+            let streams = s.borrow();
+            let mut root = pos.stream;
+            while let Some(prev) = streams.prev_stream(root) {
+                root = prev;
+            }
+            streams
+                .get(root)
+                .map(|st| prettify_path(&st.name))
                 .unwrap_or_else(|| "<unknown>".to_string())
         });
         eprintln!(

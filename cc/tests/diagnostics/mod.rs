@@ -4459,6 +4459,92 @@ fn diagnostics_vector_size_is_bounded() {
     );
 }
 
+/// An attribute's integer argument is an integer constant expression, and
+/// one that is not constant, or not a usable value, is refused in gcc's words
+/// rather than dropped: the attribute parser once read a single token, so
+/// `aligned(x)` and `aligned(3)` both left the object silently unaligned.
+#[test]
+fn diagnostics_attribute_integer_arguments() {
+    let main = "int main(void){ return 0; }\n";
+    for (name, decl, expected) in [
+        (
+            "aligned_not_constant",
+            "int x; char a __attribute__((aligned(x)));",
+            "requested alignment is not an integer constant",
+        ),
+        (
+            "aligned_string",
+            "char a __attribute__((aligned(\"s\")));",
+            "requested alignment is not an integer constant",
+        ),
+        (
+            "aligned_not_power_of_two",
+            "char a __attribute__((aligned(3)));",
+            "requested alignment '3' is not a positive power of 2",
+        ),
+        (
+            "aligned_negative",
+            "char a __attribute__((aligned(-4)));",
+            "requested alignment '-4' is not a positive power of 2",
+        ),
+        (
+            "aligned_too_large",
+            "char a __attribute__((aligned(1ULL << 40)));",
+            "exceeds object file maximum",
+        ),
+        (
+            "aligned_two_arguments",
+            "char a __attribute__((aligned(16, 32)));",
+            "wrong number of arguments specified for 'aligned' attribute",
+        ),
+        (
+            "alignas_not_constant",
+            "int x; _Alignas(x) char a;",
+            "requested alignment is not an integer constant",
+        ),
+        (
+            "vector_size_not_constant",
+            "int x; typedef int V __attribute__((vector_size(x)));",
+            "'vector_size' attribute argument is not an integer constant",
+        ),
+        (
+            "constructor_priority_not_constant",
+            "int x; void f(void) __attribute__((constructor(x)));",
+            "constructor priorities must be integers from 0 to 65535 inclusive",
+        ),
+        (
+            "constructor_priority_out_of_range",
+            "void f(void) __attribute__((constructor(70000)));",
+            "constructor priorities must be integers from 0 to 65535 inclusive",
+        ),
+    ] {
+        compile_expect_error(name, &format!("{decl}\n{main}"), expected);
+    }
+    // gcc warns about, and ignores, `aligned(0)`; and an attribute c17 does
+    // not act on is dropped with a warning, not refused.
+    compile_expect_warning(
+        "aligned_zero",
+        &format!("char a __attribute__((aligned(0)));\n{main}"),
+        "requested alignment '0' is not a positive power of 2",
+    );
+    compile_expect_warning(
+        "alloc_size_not_constant",
+        &format!("int x; void *m(int) __attribute__((alloc_size(x)));\n{main}"),
+        "'alloc_size' attribute argument is not an integer constant",
+    );
+    // Names stay names where the attribute wants one.
+    compile_expect_ok(
+        "attribute_names_and_strings",
+        &format!(
+            "enum {{ I = 1 }};\n\
+             int pf(const char *, ...) __attribute__((__format__(__printf__, I, I + 1)));\n\
+             typedef int SI __attribute__((mode(SI)));\n\
+             char s __attribute__((section(\"a\" \"b\"), aligned));\n\
+             void *m(int) __attribute__((alloc_size(I), malloc));\n{main}"
+        ),
+    );
+}
+
 /// Case ranges are checked for overlap, not just equality.
 ///
 /// 6.8.4.2p3 forbids two equal case constants, and GCC extends that to
@@ -5737,5 +5823,41 @@ fn diagnostics_distinct_tagless_structs_are_incompatible() {
         "typedef struct { int x; } T;\nT t1;\nconst T t2;\nstruct { int x; } s1, s2;\n\
          struct o { struct { int y; } in; } a, b;\n\
          void f(void){ t1 = t2; s1 = s2; a.in = b.in; }\n",
+    );
+}
+
+/// With several operands, an error inside a header names the translation unit
+/// that included it. The note took its file name from the first stream ever
+/// opened, so the second operand's error was reported against the first
+/// operand: `one.c: note: in included file (through two.c)`.
+#[test]
+fn diagnostics_include_note_names_its_own_translation_unit() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_include_note_")
+        .tempdir()
+        .unwrap();
+    let one = dir.path().join("one.c");
+    let two = dir.path().join("two.c");
+    std::fs::write(&one, "int main(void){return 0;}\n").unwrap();
+    std::fs::write(&two, "#include \"bad.h\"\n").unwrap();
+    std::fs::write(dir.path().join("bad.h"), "int x = undeclared_thing;\n").unwrap();
+    let exe = dir.path().join("t.out");
+
+    let r = run_c17(&[
+        &one.to_string_lossy(),
+        &two.to_string_lossy(),
+        "-o",
+        &exe.to_string_lossy(),
+    ]);
+    assert!(!r.success, "the header's error must fail the build");
+    let note = r
+        .stderr
+        .lines()
+        .find(|l| l.contains("in included file"))
+        .unwrap_or_else(|| panic!("expected an include note:\n{}", r.stderr));
+    assert!(
+        note.starts_with(&*two.to_string_lossy()),
+        "the note must name two.c, which included the header:\n{}",
+        r.stderr
     );
 }

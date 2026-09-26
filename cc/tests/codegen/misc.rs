@@ -14380,6 +14380,117 @@ int main(void)
     run_everywhere("typeof_storage_class", src);
 }
 
+/// `typeof` of an expression whose type is variably modified names that type
+/// with the extents its object was declared with. The type alone is `int[]`
+/// -- every VLA type interns to one `TypeId` -- so `typeof(v) w;` gave `w` an
+/// incomplete type and no storage, and was then rejected as "array size
+/// missing". The extents are the object's, fixed when it was declared; the
+/// operand is evaluated (once per declarator, as gcc does) only when it is
+/// variably modified, and so is `sizeof`'s (C17 6.5.3.4p2), which c17 skipped.
+#[test]
+fn codegen_typeof_of_variably_modified_object() {
+    let src = r#"
+static int g(int n, int (*a)[n], typeof(a) b, typeof(*a) *c)
+{
+    if ((char *)(b + 1) - (char *)b != n * (long)sizeof(int)) return 1;
+    if ((char *)(c + 1) - (char *)c != n * (long)sizeof(int)) return 2;
+    if (b[1][2] != a[1][2]) return 3;
+    return 0;
+}
+
+static int f(int n)
+{
+    int v[n];
+    typeof(v) w;                    /* int[n], fixed at v's declaration */
+    n = 100;
+    typeof(v) *p = &w;
+    if (sizeof w != 5 * sizeof(int)) return 10;
+    if (sizeof *p != 5 * sizeof(int)) return 11;
+    if ((char *)(p + 1) - (char *)p != 5 * (long)sizeof(int)) return 12;
+    typeof(w) w2;                   /* typeof of a typeof-declared VLA */
+    if (sizeof w2 != 5 * sizeof(int)) return 13;
+    typeof(v) a3[3];                /* int[3][5] */
+    if (sizeof a3 != 15 * sizeof(int)) return 14;
+    if ((char *)&a3[1] - (char *)&a3[0] != 5 * (long)sizeof(int)) return 15;
+
+    int m[n / 50][n / 25][3];       /* 2 x 4 x 3 */
+    typeof(m) m2;
+    typeof(m[0]) row;
+    typeof(m[1][2]) cell;           /* int[3]: constant */
+    if (sizeof m2 != 24 * sizeof(int)) return 20;
+    if (sizeof row != 12 * sizeof(int)) return 21;
+    if (sizeof cell != 3 * sizeof(int)) return 22;
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 4; j++)
+            for (int k = 0; k < 3; k++)
+                m2[i][j][k] = i * 100 + j * 10 + k;
+    if (m2[1][3][2] != 132 || m2[0][2][1] != 21) return 23;
+
+    int (*pv)[n / 10] = 0;          /* pointee int[10] */
+    typeof(*pv) x;
+    typeof(pv) q = pv;
+    typeof(v + 1) r = v;            /* int *: no extent */
+    if (sizeof x != 10 * sizeof(int)) return 30;
+    if ((char *)(q + 1) - (char *)q != 10 * (long)sizeof(int)) return 31;
+    if ((char *)(r + 1) - (char *)r != (long)sizeof(int)) return 32;
+
+    /* A variably modified operand is evaluated, as gcc does. */
+    int i = 0, j = 0, k = 0, a = 0;
+    typeof(pv[i++]) y;
+    if (i != 1 || sizeof y != 10 * sizeof(int)) return 40;
+    if (sizeof(typeof(pv[j++])) != 10 * sizeof(int) || j != 1) return 41;
+    if (sizeof(pv[k++]) != 10 * sizeof(int) || k != 1) return 42;
+    if (sizeof(m[a++]) != 12 * sizeof(int) || a != 1) return 43;
+    /* ...and a constant one is not. */
+    int c = 0;
+    typeof(m[1][c++]) z;
+    if (c != 0 || sizeof z != 3 * sizeof(int)) return 44;
+
+    /* gcc evaluates the operand once per declarator, not once per
+       declaration as it does `typeof(int[n++])`. */
+    int e = 0;
+    typeof(pv[e++]) d1, *d2;
+    if (e != 2 || sizeof d1 != sizeof *d2) return 45;
+    typedef typeof(pv[e++]) T;
+    T t1, t2;
+    if (e != 3 || sizeof t1 != sizeof t2 || sizeof t2 != 10 * sizeof(int)) return 46;
+
+    typedef int (*P)[n / 20];       /* pointer to int[5] */
+    P pp = 0;
+    if ((char *)(pp + 1) - (char *)pp != 5 * (long)sizeof(int)) return 50;
+
+    for (int t = 0; t < 5; t++) w[t] = t * 3;
+    int sum = 0;
+    for (int t = 0; t < 5; t++) sum += (*p)[t];
+    if (sum != 30) return 60;
+
+    int grid[3][n / 25];            /* 3 x 4 */
+    grid[1][2] = 7;
+    return g(n / 25, grid, grid, grid);
+}
+
+/* A static pointer to a VLA takes its pointee's extents each time its
+   declaration is reached. */
+static int h(int n)
+{
+    int rows[2][n];
+    static int (*sp)[n];
+    sp = rows;
+    if (sizeof *sp != n * sizeof(int)) return 70;
+    if ((char *)(sp + 1) - (char *)sp != n * (long)sizeof(int)) return 71;
+    return 0;
+}
+
+int main(void)
+{
+    int r = h(3);
+    if (r == 0) r = h(7);
+    return r ? r : f(5);
+}
+"#;
+    run_everywhere("typeof_vm_object", src);
+}
+
 /// A complex value, a complex cast, `__builtin_complex`, a `__sync` CAS and an
 /// atomic floating-point read-modify-write each need a temporary in memory.
 /// They were `alloca`s, which grow the stack on every evaluation and are

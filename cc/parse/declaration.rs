@@ -232,7 +232,7 @@ pub(crate) struct DeclSpecifiers {
     pub(crate) explicit: bool,
     /// The extents of the variably modified array levels the specifiers
     /// introduced -- through a variably modified typedef name, or through
-    /// `typeof(int[n])` -- outermost-first. They cannot ride on the type:
+    /// `typeof(int[n])` or `typeof(v)` -- outermost-first. They cannot ride on the type:
     /// `int[n]`, `int[m]` and `int[]` all intern to one `TypeId`.
     pub(crate) vm_dims: Vec<Expr>,
 }
@@ -945,7 +945,8 @@ impl<'a> Parser<'a> {
                         Some(named) => named,
                         None => {
                             let expr = self.parse_expression()?;
-                            (expr.typ.unwrap_or(self.types.int_id), Vec::new())
+                            let dims = self.typeof_object_extents(&expr);
+                            (expr.typ.unwrap_or(self.types.int_id), dims)
                         }
                     };
                     self.expect_special(b')')?;
@@ -1164,8 +1165,11 @@ impl Parser<'_> {
     /// given the same one: an unnamed typedef declared ahead of the
     /// declarators evaluates them, and every declarator names its extents.
     ///
-    /// Extents that already name evaluated ones -- a typedef name, or `typeof`
-    /// of one -- are answered as they are.
+    /// Extents that already name evaluated ones -- a typedef name, `typeof`
+    /// of one, or `typeof` of a variably modified object -- are answered as
+    /// they are. The last carries its operand for evaluation, and each
+    /// declarator then evaluates it: gcc steps `i` twice in
+    /// `typeof(p[i++]) a, b;`.
     pub(super) fn bind_specifier_extents(
         &mut self,
         dims: Vec<Expr>,
@@ -1173,10 +1177,7 @@ impl Parser<'_> {
         pos: Position,
         declarators: &mut Vec<InitDeclarator>,
     ) -> Vec<Expr> {
-        if dims
-            .iter()
-            .all(|d| matches!(d.kind, ExprKind::VmTypedefExtent(..)))
-        {
+        if dims.iter().all(names_recorded_extent) {
             return dims;
         }
         let typ = self.types.without_decl_specifiers(spec_type);
@@ -1199,6 +1200,56 @@ impl Parser<'_> {
             pos,
         });
         self.vm_typedef_extents(id).unwrap_or_default()
+    }
+
+    /// The extents `typeof(expr)` names when `expr`'s type is variably
+    /// modified: an array's variable levels, or a pointer's pointee's -- the
+    /// levels a declarator's size expressions describe -- each read from what
+    /// the declaration of the object `expr` is rooted in recorded
+    /// ([`ExprKind::VmObjectExtent`]). The type cannot carry them: `v`'s is
+    /// `int[]`, the same as an incomplete array's, so the object must have
+    /// been declared variably modified for a level to count.
+    ///
+    /// The operand is evaluated only when its type is variably modified (C23
+    /// 6.7.3.6), which the first extent carries out; a bare identifier has
+    /// nothing to evaluate.
+    fn typeof_object_extents(&self, expr: &Expr) -> Vec<Expr> {
+        let Some(typ) = expr.typ else {
+            return Vec::new();
+        };
+        let array = match self.types.kind(typ) {
+            TypeKind::Pointer => self.types.base_type(typ),
+            _ => Some(typ),
+        };
+        let levels = array.map_or(0, |a| self.types.unsized_array_levels(a));
+        let variably_modified = expr
+            .vm_index_base()
+            .is_some_and(|(root, _)| self.symbols.get(root).array_is_variably_modified);
+        if levels == 0 || !variably_modified {
+            return Vec::new();
+        }
+        let ulong = Some(self.types.ulong_id);
+        let mut dims: Vec<Expr> = (0..levels as u32)
+            .map(|level| Expr {
+                kind: ExprKind::VmObjectExtent(Box::new(expr.clone()), level),
+                typ: ulong,
+                pos: expr.pos,
+                bitfield_bits: None,
+            })
+            .collect();
+        if !matches!(expr.kind, ExprKind::Ident(_)) {
+            let first = dims.remove(0);
+            dims.insert(
+                0,
+                Expr {
+                    kind: ExprKind::Comma(vec![expr.clone(), first]),
+                    typ: ulong,
+                    pos: expr.pos,
+                    bitfield_bits: None,
+                },
+            );
+        }
+        dims
     }
 
     /// The extents of the variably modified typedef `sym`, as expressions that
@@ -1533,5 +1584,16 @@ impl Parser<'_> {
             Some(spec) => diag::error_args(pos, "'{0}' in empty declaration", &[spec]),
             None => diag::error(pos, &gettext("declaration declares nothing")),
         }
+    }
+}
+
+/// Whether `dim` names an extent some declaration already recorded -- a
+/// typedef's, or an object's, possibly after evaluating `typeof`'s operand --
+/// rather than a size expression still to evaluate.
+fn names_recorded_extent(dim: &Expr) -> bool {
+    match &dim.kind {
+        ExprKind::VmTypedefExtent(..) | ExprKind::VmObjectExtent(..) => true,
+        ExprKind::Comma(items) => items.last().is_some_and(names_recorded_extent),
+        _ => false,
     }
 }

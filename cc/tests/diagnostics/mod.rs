@@ -2091,6 +2091,19 @@ fn diagnostics_jump_into_statement_expression_is_rejected() {
             "int f(int x) { asm goto (\"\" :::: R); return ({ R: x; }); }",
             1,
         ),
+        // A label in an operand that is never evaluated is still written, so
+        // the jump is the one error, as gcc has it: lowering never placed the
+        // label and added "label 'L' used but not defined".
+        (
+            "se_goto_into_sizeof",
+            "int f(int x) { goto L; return sizeof(({ L: x; })); }",
+            1,
+        ),
+        (
+            "se_goto_into_alignof",
+            "int f(int x) { goto L; return _Alignof(({ L: x; })); }",
+            1,
+        ),
     ] {
         let errors = compile_errors(name, &format!("{src}\n"));
         assert_eq!(errors.len(), count, "{name}: {errors:?}");
@@ -2233,6 +2246,11 @@ int main(void) {
         "se_computed_goto",
         "int f(int x) { void *p = &&Q; goto *p; return ({ Q: x; }); }\n",
     );
+    // The address of a label that is never evaluated still names a block --
+    // one nothing reaches -- rather than a symbol no block defines.
+    let src = "int f(int x) { void *p = &&U; return (int)sizeof(({ U: x; })) + (p != 0); }\n\
+               int main(void) { return f(1) != 5; }\n";
+    assert_eq!(compile_and_run("se_unevaluated_label_address", src, &[]), 0);
 }
 
 // ============================================================================
@@ -6777,6 +6795,50 @@ fn diagnostics_block_scope_array_without_a_size_is_rejected() {
         "block_sized_arrays",
         "void f(int n){ int a[] = {1, 2}; extern int e[]; typedef int T[]; \
          int v[n]; int (*p)[n]; (void)a; (void)v; (void)p; }\n",
+    );
+}
+
+/// C17 6.7.6.2p2: a block-scope object of variably modified type may have no
+/// linkage, and a variable length array may not have static storage. Both
+/// compiled silently, the array with no storage at all -- however it came by
+/// its extent: written, through a typedef, or through `typeof`.
+#[test]
+fn diagnostics_variably_modified_object_with_static_storage_or_linkage() {
+    for (name, src) in [
+        ("vm_static_array", "void f(int n){ static int s[n]; }\n"),
+        (
+            "vm_static_typedef",
+            "void f(int n){ typedef int T[n]; static T s; }\n",
+        ),
+        (
+            "vm_static_typeof",
+            "void f(int n){ int v[n]; static typeof(v) s; }\n",
+        ),
+        (
+            "vm_thread_local",
+            "void f(int n){ static _Thread_local int s[n]; }\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "storage size of 's' isn't constant");
+    }
+    for (name, src) in [
+        ("vm_extern_array", "void f(int n){ extern int e[n]; }\n"),
+        (
+            "vm_extern_typeof",
+            "void f(int n){ int (*p)[n] = 0; extern typeof(p) e; }\n",
+        ),
+    ] {
+        compile_expect_error(
+            name,
+            src,
+            "object with variably modified type must have no linkage",
+        );
+    }
+    // A pointer to a VLA is variably modified but no VLA, and static storage
+    // allows it.
+    compile_expect_ok(
+        "vm_static_pointer",
+        "int f(int n){ static int (*p)[n]; return (int)sizeof *p; }\n",
     );
 }
 

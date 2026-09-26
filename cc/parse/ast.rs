@@ -411,6 +411,17 @@ pub enum ExprKind {
     /// through `vla_sizes` and `SizeofType`'s dimension list.
     VmTypedefExtent(SymbolId, u32),
 
+    /// One variable extent of the variably modified type of an *object*
+    /// expression -- `v`, `v[i]`, `*p`, `p` -- read from what the declaration
+    /// of the object it is rooted in recorded: the expression and the index
+    /// of the extent among the type's variable ones (outermost is 0).
+    ///
+    /// `typeof(v)` needs these for the same reason a typedef use needs
+    /// [`ExprKind::VmTypedefExtent`]: the type is `int[]`, whatever `v`'s
+    /// extent is, and the extent is `v`'s, fixed when `v` was declared. The
+    /// expression is only located, never evaluated here.
+    VmObjectExtent(Box<Expr>, u32),
+
     /// sizeof expression: sizeof expr
     SizeofExpr(Box<Expr>),
 
@@ -1356,6 +1367,60 @@ impl Expr {
         }
     }
 
+    /// Peel index steps off this expression to reach the object being indexed,
+    /// returning it with the number of steps that separate them.
+    ///
+    /// `b` gives depth 0, `b[i]` gives 1, `b[i][j]` gives 2. A dereference is
+    /// an index step too -- 6.5.2.1p2 defines `E1[E2]` as `(*((E1)+(E2)))`,
+    /// so `*p` and `p[0]` are the same expression. Counting only `Index`
+    /// meant the extents were carried on the way in and dropped on the way
+    /// out: `p[0][i][j]` indexed correctly while `(*p)[i][j]` used a stride
+    /// of zero, and `sizeof(*p)` answered 0.
+    ///
+    /// Anything that is not an identifier under such a chain has no recorded
+    /// extents, so it yields None and the caller falls back to the
+    /// compile-time size.
+    pub(crate) fn vm_index_base(&self) -> Option<(SymbolId, usize)> {
+        let mut depth = 0usize;
+        let mut cur = self;
+        loop {
+            match &cur.kind {
+                ExprKind::Ident(symbol_id) => return Some((*symbol_id, depth)),
+                ExprKind::Index { array, .. } => {
+                    depth += 1;
+                    cur = array;
+                }
+                ExprKind::Unary {
+                    op: UnaryOp::Deref,
+                    operand,
+                } => {
+                    depth += 1;
+                    cur = operand;
+                }
+                // `p + i` and `i + p` denote the same kind of object as `p`,
+                // at the same depth: adding to a pointer does not change what
+                // it points at. Whichever side reaches an object is the
+                // pointer, which needs no type information to decide.
+                // Without this, `(p + 2) - p` found no extents and divided by
+                // a compile-time size of zero, which traps at run time.
+                ExprKind::Binary {
+                    op: BinaryOp::Add | BinaryOp::Sub,
+                    left,
+                    right,
+                } => {
+                    if let Some((sym, extra)) = left.vm_index_base() {
+                        return Some((sym, depth + extra));
+                    }
+                    if let Some((sym, extra)) = right.vm_index_base() {
+                        return Some((sym, depth + extra));
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+    }
+
     /// Every expression this one directly contains, apart from the statements
     /// of a statement expression, which are not expressions.
     pub(crate) fn operands(&self) -> Vec<&Expr> {
@@ -1372,6 +1437,7 @@ impl Expr {
             | K::Ident(_)
             | K::FuncName
             | K::VmTypedefExtent(..)
+            | K::VmObjectExtent(..)
             | K::AlignofType(_)
             | K::LabelAddr(_)
             | K::VaArgPack

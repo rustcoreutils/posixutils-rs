@@ -321,6 +321,9 @@ impl Parser<'_> {
             if !is_fn && !specs.is_extern() {
                 self.check_object_complete(scope, name, typ, &vla, pos);
             }
+            if !is_fn && !vla.is_empty() {
+                self.check_variably_modified_storage(specs.storage_class, name, typ, pos);
+            }
             (symbol, init)
         };
 
@@ -567,6 +570,33 @@ impl Parser<'_> {
                     );
                 }
             }
+        }
+    }
+
+    /// C17 6.7.6.2p2 for a block-scope object of variably modified type: it
+    /// may have no linkage, and a variable length array may not have static
+    /// or thread storage duration. Either one has storage laid out at compile
+    /// time, and an extent known only at run time gave it none.
+    fn check_variably_modified_storage(
+        &mut self,
+        storage_class: TypeModifiers,
+        name: StringId,
+        typ: TypeId,
+        pos: Position,
+    ) {
+        if storage_class.contains(TypeModifiers::EXTERN) {
+            diag::error(
+                pos,
+                &gettext("object with variably modified type must have no linkage"),
+            );
+        } else if self.types.kind(typ) == TypeKind::Array
+            && storage_class.intersects(TypeModifiers::STATIC | TypeModifiers::THREAD_LOCAL)
+        {
+            diag::error_args(
+                pos,
+                "storage size of '{0}' isn't constant",
+                &[self.idents.get(name)],
+            );
         }
     }
 

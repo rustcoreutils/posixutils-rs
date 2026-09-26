@@ -517,9 +517,12 @@ impl Parser<'_> {
             let ParsedDeclarator {
                 name: param_name,
                 typ: mut typ_id,
-                vla: vla_sizes,
+                vla: mut vla_sizes,
                 ..
             } = self.parse_declarator(base_type_id, DeclaratorContext::Parameter)?;
+            // The specifiers' extents are the innermost levels, as in any
+            // other declaration: `typeof(a) b` beside `int (*a)[n]`.
+            vla_sizes.extend(param_specs.vm_dims);
             self.check_parameter_specifiers(param_type.modifiers, param_name, param_pos);
 
             // Skip any __attribute__ after parameter declarator

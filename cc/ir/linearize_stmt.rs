@@ -366,9 +366,20 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // is reached in the order of execution" -- here, once, however
                 // many objects the name goes on to declare. Each is spilled to
                 // a hidden local that `ExprKind::VmTypedefExtent` reads back.
-                if !declarator.vla_sizes.is_empty() && self.types.kind(typ) == TypeKind::Array {
+                //
+                // A pointer to a VLA is sized by its pointee's extents, as an
+                // object declared `int (*p)[n]` is below; asking only an
+                // array typedef left `typedef int (*P)[n]; P p;` with no
+                // extents, and `p + 1` a step of 0.
+                let vm_type = match self.types.kind(typ) {
+                    TypeKind::Array => Some(typ),
+                    TypeKind::Pointer => self.types.base_type(typ),
+                    _ => None,
+                };
+                if let Some(vm_type) = vm_type.filter(|_| !declarator.vla_sizes.is_empty()) {
                     let name = self.symbol_name(declarator.symbol);
-                    let (dims, _elem) = self.record_vm_extents(typ, &declarator.vla_sizes, &name);
+                    let (dims, _elem) =
+                        self.record_vm_extents(vm_type, &declarator.vla_sizes, &name);
                     // Keep only the extents that were *variable*.
                     //
                     // `record_vm_extents` reports one entry per array level,
@@ -493,6 +504,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     sym: sym_id,
                     typ,
                     vla_size_sym: None,
+                    vla_outer_extent: None,
                     vla_elem_type: None,
                     vm_row_dims: vec![],
                     storage: crate::ir::linearize::Storage::InSlot,
@@ -507,17 +519,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // This is the same shape as a variably-modified *parameter*,
             // which is adjusted to exactly this pointer type; see
             // `linearize_function`.
-            if !declarator.vla_sizes.is_empty() {
-                if let Some(pointee) = self.types.base_type(typ) {
-                    let name = self.symbol_name(declarator.symbol);
-                    let (dims, elem_type) =
-                        self.record_vm_extents(pointee, &declarator.vla_sizes, &name);
-                    if let Some(info) = self.locals.get_mut(&declarator.symbol) {
-                        info.vm_row_dims = dims;
-                        info.vla_elem_type = Some(elem_type);
-                    }
-                }
-            }
+            self.record_pointee_extents(declarator);
 
             // If there's an initializer, emit Store(s)
             if let Some(init) = &declarator.init {
@@ -584,6 +586,24 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// Record the extents of a pointer-to-VLA declarator's pointee on its
+    /// local, which is what one index step off the pointer has to advance
+    /// by. Nothing for a declarator with no size expressions.
+    fn record_pointee_extents(&mut self, declarator: &crate::parse::ast::InitDeclarator) {
+        if declarator.vla_sizes.is_empty() {
+            return;
+        }
+        let Some(pointee) = self.types.base_type(declarator.typ) else {
+            return;
+        };
+        let name = self.symbol_name(declarator.symbol);
+        let (dims, elem_type) = self.record_vm_extents(pointee, &declarator.vla_sizes, &name);
+        if let Some(info) = self.locals.get_mut(&declarator.symbol) {
+            info.vm_row_dims = dims;
+            info.vla_elem_type = Some(elem_type);
         }
     }
 
@@ -709,6 +729,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 sym: sym_id,
                 typ: ptr_type,
                 vla_size_sym: Some(size_sym_id),
+                vla_outer_extent: dims.first().copied(),
                 vla_elem_type: Some(elem_type),
                 // One index step consumes the outermost extent, so what a row
                 // still spans is everything after it.
@@ -784,11 +805,17 @@ impl<'a> super::linearize::Linearizer<'a> {
                 sym: PseudoId(u32::MAX),
                 typ: declarator.typ,
                 vla_size_sym: None,
+                vla_outer_extent: None,
                 vla_elem_type: None,
                 vm_row_dims: vec![],
                 storage: crate::ir::linearize::Storage::InSlot,
             },
         );
+
+        // A static pointer to a VLA -- the one variably modified type static
+        // storage allows (C17 6.7.6.2p2) -- still steps by its pointee's
+        // extents, evaluated each time the declaration is reached.
+        self.record_pointee_extents(declarator);
 
         // Determine initializer (static locals are initialized at compile time)
         let init = declarator.init.as_ref().map_or(Initializer::None, |e| {
@@ -1636,10 +1663,32 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// is legal.
     pub(crate) fn check_label_references(&mut self) {
         for (name, pos) in std::mem::take(&mut self.label_refs) {
-            if !self.defined_labels.contains(&name) {
-                crate::diag::error_args(pos, "label '{0}' used but not defined", &[&name]);
+            if self.defined_labels.contains(&name) {
+                continue;
             }
+            if self.written_labels.contains(&name) {
+                self.place_unevaluated_label(&name);
+                continue;
+            }
+            crate::diag::error_args(pos, "label '{0}' used but not defined", &[&name]);
         }
+    }
+
+    /// Give a label written inside an operand that is never evaluated -- the
+    /// statement expression of `sizeof(({ L: x; }))` -- a block of its own,
+    /// which nothing reaches.
+    ///
+    /// The label exists, so "used but not defined" is the wrong complaint: a
+    /// `goto` to it has already been reported as a jump into a statement
+    /// expression, which is gcc's one error, and gcc accepts `&&L`, whose
+    /// address has to name some block.
+    fn place_unevaluated_label(&mut self, name: &str) {
+        let resume = self.current_bb;
+        let label_bb = self.get_or_create_label(name);
+        self.switch_bb(label_bb);
+        self.emit(Instruction::new(Opcode::Unreachable).with_type(self.types.void_id));
+        self.defined_labels.insert(name.to_string());
+        self.current_bb = resume;
     }
 
     /// Link the dispatch block to every label whose address was taken.
@@ -1681,7 +1730,12 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// scope also names the declaration that could not be entered, which gcc
     /// does not -- the position says where to look and the name says what the
     /// problem is.
-    pub(crate) fn check_jumps_into_protected_scopes(&self, body: &Stmt) {
+    ///
+    /// Answers the name of every label the body writes, evaluated or not.
+    pub(crate) fn check_jumps_into_protected_scopes(
+        &self,
+        body: &Stmt,
+    ) -> std::collections::HashSet<String> {
         let w = JumpScopeWalk::of(body);
 
         // 6.8.1p3: a label name is unique within the function it appears in.
@@ -1721,6 +1775,11 @@ impl<'a> super::linearize::Linearizer<'a> {
             };
             error(*pos, &gettextrs::gettext(message));
         }
+
+        w.labels
+            .iter()
+            .map(|(name, _, _)| self.strings.get(*name).to_string())
+            .collect()
     }
 
     /// Report a jump into `scope`, by a `switch` reaching a label inside it

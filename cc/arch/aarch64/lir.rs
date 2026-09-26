@@ -244,6 +244,21 @@ pub enum Aarch64Inst {
         dst: Reg,
     },
 
+    /// Mach-O thread-local variable: `adrp dst, sym@TLVPPAGE` -- the page of
+    /// the pointer to `sym`'s TLV descriptor.
+    AdrpTlvpPage {
+        sym: Symbol,
+        dst: Reg,
+    },
+
+    /// Mach-O thread-local variable: `ldr dst, [base, sym@TLVPPAGEOFF]` --
+    /// the descriptor's address, which the getter takes in x0.
+    LdrTlvpPageOff {
+        sym: Symbol,
+        base: Reg,
+        dst: Reg,
+    },
+
     // ========================================================================
     // Integer Arithmetic
     // ========================================================================
@@ -944,6 +959,23 @@ impl EmitAsm for Aarch64Inst {
                 let _ = writeln!(out, "    adrp {}, :gottprel:{}", dst.name64(), sym_name);
             }
 
+            Aarch64Inst::AdrpTlvpPage { sym, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    adrp {}, {}@TLVPPAGE",
+                    dst.name64(),
+                    sym.format_for_target(target)
+                );
+            }
+            Aarch64Inst::LdrTlvpPageOff { sym, base, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    ldr {}, [{}, {}@TLVPPAGEOFF]",
+                    dst.name64(),
+                    base.name64(),
+                    sym.format_for_target(target)
+                );
+            }
             Aarch64Inst::LdrGottprelLo12 { sym, base, dst } => {
                 let sym_name = sym.format_for_target(target);
                 let _ = writeln!(

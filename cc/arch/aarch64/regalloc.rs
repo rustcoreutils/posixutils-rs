@@ -1034,7 +1034,12 @@ pub(super) fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
 /// registers in that list become hard clobbers at the asm position.
 /// Special tokens (`"memory"`, `"cc"`) are filtered out — see x86_64
 /// `get_constraint_info` documentation for the rationale.
-pub fn get_constraint_info_aarch64(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId>)> {
+/// `tls` is how this target obtains a thread-local's address, which decides
+/// what a `TlsAddr` clobbers.
+pub fn get_constraint_info_aarch64(
+    insn: &Instruction,
+    tls: crate::target::TlsAccess,
+) -> Option<(Vec<Reg>, Vec<PseudoId>)> {
     // Inline-asm path — also folds in any scratch-clobber predicate
     // hit, so inline asm in a dirty opcode position carries both sets
     // of clobbers.
@@ -1085,8 +1090,16 @@ pub fn get_constraint_info_aarch64(insn: &Instruction) -> Option<(Vec<Reg>, Vec<
     // register -- which is why this is a plain clobber and deliberately *not*
     // an entry in `is_call_like_aarch64`. Declaring it call-like would spill
     // every live floating-point value for a sequence that needs none of it.
+    //
+    // The Mach-O TLV getter takes its descriptor and returns the address in
+    // x0, and preserves x1-x28 and q0-q31 (LLVM's `CSR_Darwin_AArch64_TLS`);
+    // it also clobbers x16, x17 and the link register, none of which is ever
+    // allocated. So on Darwin x0 is the whole of it.
     if insn.op == Opcode::TlsAddr {
-        clobbers.extend([Reg::X0, Reg::X1]);
+        match tls {
+            crate::target::TlsAccess::MachOTlv => clobbers.push(Reg::X0),
+            _ => clobbers.extend([Reg::X0, Reg::X1]),
+        }
     }
     clobbers.sort();
     clobbers.dedup();
@@ -1228,6 +1241,9 @@ pub fn is_call_like_aarch64(op: Opcode) -> bool {
 pub struct RegAlloc {
     /// Mapping from pseudo to location
     locations: HashMap<PseudoId, Loc>,
+    /// How the target obtains a thread-local's address, which decides what a
+    /// `TlsAddr` clobbers. Set with [`RegAlloc::with_tls_access`].
+    tls_access: crate::target::TlsAccess,
     /// Free GP registers (used by argument pre-allocation and the
     /// spill-args helper; the chordal coloring core ignores it).
     free_regs: Vec<Reg>,
@@ -1263,6 +1279,13 @@ pub struct RegAlloc {
 }
 
 impl RegAlloc {
+    /// The allocator for a target whose thread-locals are reached by
+    /// `access`; see [`crate::target::Target::tls_access`].
+    pub fn with_tls_access(mut self, access: crate::target::TlsAccess) -> Self {
+        self.tls_access = access;
+        self
+    }
+
     pub fn new() -> Self {
         Self {
             locations: HashMap::new(),
@@ -1280,6 +1303,7 @@ impl RegAlloc {
             live_in: Vec::new(),
             live_out: Vec::new(),
             frame_base: FrameBase::Fp,
+            tls_access: crate::target::TlsAccess::ElfStatic,
         }
     }
 
@@ -2201,7 +2225,8 @@ impl RegAlloc {
     }
 
     fn compute_live_intervals(&self, func: &Function) -> LivenessResult<Reg> {
-        compute_live_intervals(func, get_constraint_info_aarch64)
+        let tls = self.tls_access;
+        compute_live_intervals(func, |insn| get_constraint_info_aarch64(insn, tls))
     }
 
     /// Get stack size needed (aligned to max local alignment, minimum 16).
@@ -2420,12 +2445,32 @@ mod tests {
     /// or memory -- unlike an instruction such as `idivq`, which reads its
     /// operands before touching the registers it claims.
     #[test]
+    fn tls_addr_clobbers_follow_the_model() {
+        use crate::target::TlsAccess;
+        let insn = Instruction::tls_addr(PseudoId(1), PseudoId(2), crate::types::TypeId::INVALID);
+        let (elf, _) = get_constraint_info_aarch64(&insn, TlsAccess::ElfDescriptor).unwrap();
+        let (macho, _) = get_constraint_info_aarch64(&insn, TlsAccess::MachOTlv).unwrap();
+        // The descriptor sequence loads its resolver into x1; the Mach-O
+        // getter keeps x1-x28 and returns through x0.
+        assert!(elf.contains(&Reg::X0) && elf.contains(&Reg::X1));
+        assert!(macho.contains(&Reg::X0) && !macho.contains(&Reg::X1));
+        for kept in [Reg::X2, Reg::X7, Reg::X12, Reg::X19, Reg::X28] {
+            assert!(
+                !macho.contains(&kept),
+                "{kept:?} is preserved by the getter"
+            );
+        }
+    }
+
+    #[test]
     fn asm_operands_are_not_exempt_from_the_statements_clobbers() {
         let insn = make_asm_insn(
             &["x0", "memory"],
             &[("=r", PseudoId(1)), ("r", PseudoId(2)), ("m", PseudoId(5))],
         );
-        let (clobbers, exempt) = get_constraint_info_aarch64(&insn).expect("a register is claimed");
+        let (clobbers, exempt) =
+            get_constraint_info_aarch64(&insn, crate::target::TlsAccess::ElfStatic)
+                .expect("a register is claimed");
         assert!(clobbers.contains(&Reg::X0));
         assert!(exempt.is_empty(), "{exempt:?}");
     }

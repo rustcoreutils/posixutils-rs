@@ -195,7 +195,13 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// since that pass is what puts the address computation where the register
     /// allocator can see it.
     pub fn use_tls_dynamic(&self) -> bool {
-        self.shared_mode && self.target.os == Os::Linux
+        self.tls_access() == crate::target::TlsAccess::ElfDescriptor
+    }
+
+    /// How this target obtains a thread-local's address; see
+    /// [`crate::target::Target::tls_access`], which `ir::tls` asks too.
+    pub fn tls_access(&self) -> crate::target::TlsAccess {
+        self.target.tls_access(self.shared_mode)
     }
 
     /// Whether a thread-local access must use the Initial Exec model rather
@@ -341,6 +347,11 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         let size = if size == 0 { 8 } else { size }; // Default to 8 bytes
         let align = global_alignment(global, types);
 
+        if global.is_thread_local && self.target.os == Os::MacOS {
+            self.emit_macho_thread_local(global, size, align);
+            return;
+        }
+
         // Anonymous compound-literal globals (name starts with '.') are addressed
         // as locals via `.LC`-style labels — they must remain ordinary data labels.
         let is_local_label = global.name.starts_with('.');
@@ -458,6 +469,72 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
         // Emit initializer
         self.emit_initializer_data(&global.init, size as usize);
+    }
+
+    /// A Mach-O thread-local variable: its initial image, and the descriptor
+    /// that names it.
+    ///
+    /// On Darwin the symbol a program refers to is not the storage. `_v`
+    /// labels a three-word *descriptor* in `__DATA,__thread_vars` --
+    /// `{ __tlv_bootstrap, 0, _v$tlv$init }`: the getter to call, a key dyld
+    /// fills in, and the initial image -- and every access calls through it
+    /// (see each backend's `emit_tls_addr`). The image itself is
+    /// `_v$tlv$init`: initialized data in `__thread_data`, or `.tbss` for a
+    /// zero-initialized one, which reserves zero-fill in `__thread_bss`.
+    /// This is the layout clang emits, and the one dyld's TLV support and
+    /// ld64 expect: ld64 builds each thread's block from the images and
+    /// rewrites `@TLVP` references to the descriptors.
+    ///
+    /// Emitting the variable as plain data, as this used to, gave every
+    /// thread the one shared copy -- and an `extern` one, reached through
+    /// `@GOTPAGE`, a reference to a thread-local that ld64 rejects.
+    ///
+    /// Linkage belongs to the descriptor: `.globl`/weak/visibility go on `_v`,
+    /// and the image is always a local symbol.
+    fn emit_macho_thread_local(&mut self, global: &crate::ir::GlobalDef, size: u64, align: u32) {
+        let image = Symbol::global(format!("{}$tlv$init", global.name));
+        let zero_fill = global.init.is_all_zero() && global.symbol_attrs.section.is_none();
+        if zero_fill {
+            // `.tbss symbol, size, log2(align)` -- the Mach-O zero-fill form
+            // for a thread-local image; it places the symbol in
+            // `__DATA,__thread_bss` itself.
+            self.push_directive(Directive::ThreadZerofill {
+                sym: image.clone(),
+                size,
+                align_log2: align.max(1).trailing_zeros(),
+            });
+        } else {
+            self.push_directive(Directive::Tdata);
+            if align > 1 {
+                self.push_directive(Directive::Align(align.trailing_zeros()));
+            }
+            self.push_directive(Directive::global_label(image.name.clone()));
+            self.emit_initializer_data(&global.init, size as usize);
+        }
+
+        self.push_directive(Directive::ThreadVars);
+        if !global.is_static {
+            if global.symbol_attrs.weak {
+                self.push_directive(Directive::Weak(
+                    Symbol::global(&global.name),
+                    crate::arch::lir::WeakKind::Definition,
+                ));
+            } else {
+                self.push_directive(Directive::global(&global.name));
+            }
+        }
+        if let Some(how) = &global.symbol_attrs.visibility {
+            self.push_directive(Directive::Visibility(
+                Symbol::global(&global.name),
+                how.clone(),
+            ));
+        }
+        // Three pointers; keep them pointer-aligned whatever precedes them.
+        self.push_directive(Directive::Align(3));
+        self.push_directive(Directive::global_label(&global.name));
+        self.push_directive(Directive::QuadSym(Symbol::global("_tlv_bootstrap")));
+        self.push_directive(Directive::Quad(0));
+        self.push_directive(Directive::QuadSym(image));
     }
 
     /// Emit a floating constant as `size` bytes in the target's format.
@@ -1137,6 +1214,46 @@ pub fn global_alignment(global: &crate::ir::GlobalDef, types: &TypeTable) -> u32
         align = align.max(16);
     }
     align
+}
+
+/// Report a thread-local that reaches the backend as a plain symbol when the
+/// target's model is a call.
+///
+/// Under the ELF descriptor model and on Mach-O, `ir::tls` gives every
+/// thread-local reference an explicit `TlsAddr`, which is what lets the
+/// register allocator see the call. A thread-local named anywhere else --
+/// in `src` or in an inline-asm operand -- would be reached by a backend path
+/// that either emits the call invisibly to the allocator, which destroys
+/// whatever it had placed in the clobbered registers, or, on Darwin, a plain
+/// non-thread-local reference. An inline-asm memory operand did exactly the
+/// first on Linux `-fPIC`. So the contract is checked, and a breach is an
+/// internal error rather than wrong code.
+pub fn check_tls_reached_only_by_address(
+    func: &Function,
+    tls_symbols: &std::collections::HashSet<String>,
+    pos: crate::diag::Position,
+) {
+    for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+        if insn.op == Opcode::TlsAddr {
+            continue;
+        }
+        for id in insn.mentioned() {
+            let Some(crate::ir::PseudoKind::Sym(name)) = func.get_pseudo(id).map(|p| &p.kind)
+            else {
+                continue;
+            };
+            // A local whose name collides with a thread-local is a stack slot.
+            if tls_symbols.contains(name) && !func.locals.contains_key(name) {
+                crate::diag::error_args(
+                    pos,
+                    "internal error: the thread-local '{0}' reached code generation \
+                     without its address being computed",
+                    &[name],
+                );
+                return;
+            }
+        }
+    }
 }
 
 /// The current function's pseudos, looked up by id.

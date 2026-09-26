@@ -152,8 +152,16 @@ impl X86_64CodeGen {
         // Check if this function uses varargs
         let is_variadic = is_variadic_function(func);
 
+        if self.base.tls_access().is_call() {
+            crate::arch::codegen::check_tls_reached_only_by_address(
+                func,
+                &self.tls_symbols,
+                self.base.func_pos,
+            );
+        }
+
         // Register allocation
-        let mut alloc = RegAlloc::new();
+        let mut alloc = RegAlloc::new().with_tls_access(self.base.tls_access());
         self.locations = alloc.allocate(func, types);
         self.int128_pseudos = alloc.int128_pseudos().clone();
         self.pseudos = crate::arch::codegen::PseudoTable::new(&func.pseudos);

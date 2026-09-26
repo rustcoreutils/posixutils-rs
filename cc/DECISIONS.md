@@ -176,8 +176,13 @@ to a stack slot and spill argument registers, none of which a descriptor needs.
 The address computation is an IR opcode (`Opcode::TlsAddr`) rather than
 something a backend `emit_*` helper synthesizes, because register allocation
 runs over the IR and finishes before any machine instruction exists. `ir::tls`
-expands thread-local accesses into it, and only under the dynamic model, so
-Local-Exec keeps its one-instruction form.
+expands thread-local accesses into it -- operands of inline assembly included
+-- only when the model is a call, so Local-Exec keeps its one-instruction form.
+`Target::tls_access` decides that in one place: the ELF descriptor model for
+Linux `-fPIC`/`-shared`, and Mach-O's thread-local variable descriptors for
+every Darwin access, which has no static model at all. Each backend checks the
+contract before allocating registers: a thread-local named anywhere but a
+`TlsAddr` is an internal error.
 
 Both architectures return an *offset* from the thread pointer, which the
 sequence then adds — gcc hides this on x86-64 by folding the addition into the

@@ -15,7 +15,6 @@ use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{Loc, Reg, XmmReg};
 use crate::ir::{Instruction, PseudoId};
-use crate::target::Os;
 use crate::types::{TypeId, TypeKind, TypeTable};
 
 impl X86_64CodeGen {
@@ -139,7 +138,7 @@ impl X86_64CodeGen {
                         }),
                         dst: GpOperand::Reg(dst),
                     });
-                } else if self.tls_symbols.contains(&name) && self.base.target.os == Os::Linux {
+                } else if self.is_tls_symbol(&name) {
                     // Thread-local storage: use FS segment
                     // Use Initial Exec model for external TLS or when building shared libraries.
                     // PIE executables can use Local Exec for their own TLS variables.
@@ -604,7 +603,7 @@ impl X86_64CodeGen {
                 };
 
                 // Check TLS first - TLS symbols need special access pattern even for external symbols
-                if self.tls_symbols.contains(&name) && self.base.target.os == Os::Linux {
+                if self.is_tls_symbol(&name) {
                     // Check if this is an external TLS variable (needs Initial Exec model)
                     // or if we're building a shared library (also needs IE model).
                     // PIE executables can use Local Exec for their own TLS variables.
@@ -916,7 +915,7 @@ impl X86_64CodeGen {
 
                 // Check TLS FIRST before GOT - TLS symbols need special access pattern
                 // and should not go through the GOT path even in PIC mode
-                if self.tls_symbols.contains(&name) && self.base.target.os == Os::Linux {
+                if self.is_tls_symbol(&name) {
                     // Thread-local storage: use FS segment
                     // Use Initial Exec model for external TLS or when building shared libraries.
                     // PIE executables can use Local Exec for their own TLS variables.

@@ -90,10 +90,12 @@ frame.
 
 ### C11 Thread-Local Storage
 
-Complete on Linux, on both architectures. What is left:
+Complete on Linux and macOS, on both architectures. What is left:
 
-- Not implemented on FreeBSD, whose rtld may lack x86-64 descriptor support;
-  TLS is gated on Linux, as it already was.
+- FreeBSD gets the ELF Local and Initial Exec models, but not the descriptor
+  model: its rtld may lack x86-64 descriptor support, so `-fPIC`/`-shared`
+  code uses Initial Exec there, which cannot be `dlopen`ed with a thread-local
+  block larger than the static-TLS surplus.
 - The older `gnu` dialect is not implemented. If a target needs it, it belongs
   behind `-mtls-dialect=gnu`.
 - Four latent Local-Exec sites remain in the x86-64 backend

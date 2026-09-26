@@ -749,6 +749,18 @@ pub enum Directive {
     /// Switch to thread-local BSS section (.section .tbss or __DATA,__thread_bss)
     Tbss,
 
+    /// Mach-O only: switch to `__DATA,__thread_vars`, which holds the
+    /// thread-local variable descriptors a program's references name.
+    ThreadVars,
+
+    /// Mach-O only: `.tbss sym, size, log2(align)` -- zero-fill in
+    /// `__DATA,__thread_bss` for a thread-local's initial image.
+    ThreadZerofill {
+        sym: Symbol,
+        size: u64,
+        align_log2: u32,
+    },
+
     /// Switch to the section holding pointers to `constructor` functions
     /// (`.init_array` on ELF, `__DATA,__mod_init_func` on Mach-O).
     ///
@@ -1158,6 +1170,22 @@ impl EmitAsm for Directive {
                     let _ = writeln!(out, ".section .tdata,\"awT\",@progbits");
                 }
             },
+            Directive::ThreadVars => {
+                let _ = writeln!(out, ".section __DATA,__thread_vars,thread_local_variables");
+            }
+            Directive::ThreadZerofill {
+                sym,
+                size,
+                align_log2,
+            } => {
+                let _ = writeln!(
+                    out,
+                    ".tbss {}, {}, {}",
+                    sym.format_for_target(target),
+                    size,
+                    align_log2
+                );
+            }
             Directive::Tbss => match target.os {
                 Os::MacOS => {
                     let _ = writeln!(out, ".section __DATA,__thread_bss,thread_local_zerofill");

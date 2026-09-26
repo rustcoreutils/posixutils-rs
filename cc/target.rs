@@ -107,6 +107,36 @@ impl Os {
     }
 }
 
+/// How a thread-local's address is obtained on a target.
+///
+/// Decided in one place -- [`Target::tls_access`] -- because two consumers
+/// must agree on it: `ir::tls::expand_dynamic_tls`, which makes a call-based
+/// computation visible to the register allocator as an explicit `TlsAddr`,
+/// and the backends, which emit the sequence for that `TlsAddr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsAccess {
+    /// ELF Local Exec / Initial Exec: the offset from the thread pointer is a
+    /// link-time or load-time constant, so a backend folds the access into
+    /// the load or store itself. No call, nothing for the allocator to see.
+    ElfStatic,
+    /// ELF TLS descriptor, the dynamic model: the address comes from a call
+    /// through a resolver, needed by code that may live in a `dlopen`ed
+    /// shared object.
+    ElfDescriptor,
+    /// Mach-O thread-local variable descriptors. Every access, in every kind
+    /// of image, calls the getter the descriptor names; there is no static
+    /// model on Darwin.
+    MachOTlv,
+}
+
+impl TlsAccess {
+    /// Whether computing the address is a call, which the IR has to expose
+    /// as an explicit `TlsAddr` so the allocator sees what it clobbers.
+    pub fn is_call(self) -> bool {
+        matches!(self, TlsAccess::ElfDescriptor | TlsAccess::MachOTlv)
+    }
+}
+
 /// Target configuration
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -226,6 +256,22 @@ impl Default for Target {
 }
 
 impl Target {
+    /// How this target obtains a thread-local's address. `shared_mode` is
+    /// set for `-shared` and `-fPIC`: code that may be `dlopen`ed.
+    ///
+    /// ELF (Linux, FreeBSD) folds Local and Initial Exec into the access and
+    /// needs a descriptor call only for shared code, and only Linux takes the
+    /// descriptor model here. Mach-O always calls the TLV getter.
+    pub fn tls_access(&self, shared_mode: bool) -> TlsAccess {
+        match self.os {
+            Os::MacOS => TlsAccess::MachOTlv,
+            Os::Linux if shared_mode => TlsAccess::ElfDescriptor,
+            Os::Linux | Os::FreeBSD => TlsAccess::ElfStatic,
+        }
+    }
+}
+
+impl Target {
     /// Parse a target triple (e.g., "aarch64-apple-darwin", "x86_64-unknown-linux-gnu")
     pub fn from_triple(triple: &str) -> Option<Self> {
         let parts: Vec<&str> = triple.split('-').collect();
@@ -259,6 +305,24 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mach-O always calls the TLV getter; ELF calls only for shared code,
+    /// and only Linux takes the descriptor model; FreeBSD is ELF too.
+    #[test]
+    fn test_tls_access_per_target() {
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            let mac = Target::new(arch, Os::MacOS);
+            assert_eq!(mac.tls_access(false), TlsAccess::MachOTlv);
+            assert_eq!(mac.tls_access(true), TlsAccess::MachOTlv);
+            let linux = Target::new(arch, Os::Linux);
+            assert_eq!(linux.tls_access(false), TlsAccess::ElfStatic);
+            assert_eq!(linux.tls_access(true), TlsAccess::ElfDescriptor);
+            let bsd = Target::new(arch, Os::FreeBSD);
+            assert_eq!(bsd.tls_access(false), TlsAccess::ElfStatic);
+        }
+        assert!(TlsAccess::MachOTlv.is_call() && TlsAccess::ElfDescriptor.is_call());
+        assert!(!TlsAccess::ElfStatic.is_call());
+    }
 
     #[test]
     fn test_host_target() {

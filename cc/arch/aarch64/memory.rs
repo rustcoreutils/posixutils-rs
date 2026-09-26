@@ -34,9 +34,11 @@ impl Aarch64CodeGen {
     /// Whether `name` is a thread-local reached through the thread pointer,
     /// so that its address has to come from [`Self::emit_tls_addr`] and never
     /// from `adrp`/`:lo12:`, which would name the variable's initialization
-    /// image rather than this thread's copy. (Linux ELF only.)
+    /// image rather than this thread's copy. ELF only -- Linux and FreeBSD
+    /// alike; on Darwin `ir::tls` turns every thread-local reference into a
+    /// `TlsAddr` before a backend sees it, so none arrives here.
     pub(super) fn is_elf_tls(&self, name: &str) -> bool {
-        self.tls_symbols.contains(name) && self.base.target.os == Os::Linux
+        self.tls_symbols.contains(name) && self.base.target.os != Os::MacOS
     }
 
     /// Load address of a global symbol into a register

@@ -563,7 +563,13 @@ pub fn collect_asm_fixed_precolors_x86_64(func: &Function) -> BTreeMap<PseudoId,
     out
 }
 
-pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId>)> {
+/// `tls` is how this target obtains a thread-local's address, which decides
+/// what a `TlsAddr` clobbers: the ELF descriptor call hard-uses only %rax,
+/// while the Mach-O TLV getter is also passed its descriptor in %rdi.
+pub fn get_constraint_info(
+    insn: &Instruction,
+    tls: crate::target::TlsAccess,
+) -> Option<(Vec<Reg>, Vec<PseudoId>)> {
     // Inline asm: route through the per-operand constraint vocabulary
     // and lower the result back to ConstraintPoint for the chordal
     // allocator.
@@ -600,6 +606,14 @@ pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId
     if needs_r10_r11 {
         clobbers.push(Reg::R10);
         clobbers.push(Reg::R11);
+    }
+    // The Mach-O TLV getter preserves every general register but %rax, which
+    // returns the address, and %rdi, which carries the descriptor in --
+    // LLVM's `CSR_64_TLS_Darwin` keeps the callee-saved set plus %rcx, %rdx,
+    // %rsi and %r8-%r11. It keeps no XMM register; see
+    // `RegAlloc::fp_call_positions`.
+    if insn.op == Opcode::TlsAddr && tls == crate::target::TlsAccess::MachOTlv {
+        clobbers.push(Reg::Rdi);
     }
     clobbers.sort();
     clobbers.dedup();
@@ -759,6 +773,9 @@ pub struct SpilledXmmArg {
 pub struct RegAlloc {
     /// Mapping from pseudo to location
     locations: HashMap<PseudoId, Loc>,
+    /// How the target obtains a thread-local's address, which decides what a
+    /// `TlsAddr` clobbers. Set with [`RegAlloc::with_tls_access`].
+    tls_access: crate::target::TlsAccess,
     /// How many GP argument registers the **named** parameters consumed, capped
     /// at the register file size. `va_start` needs this to seed `gp_offset`.
     named_gp_regs: usize,
@@ -1020,6 +1037,13 @@ impl IncomingOff {
 }
 
 impl RegAlloc {
+    /// The allocator for a target whose thread-locals are reached by
+    /// `access`; see [`crate::target::Target::tls_access`].
+    pub fn with_tls_access(mut self, access: crate::target::TlsAccess) -> Self {
+        self.tls_access = access;
+        self
+    }
+
     pub fn new() -> Self {
         Self {
             locations: HashMap::new(),
@@ -1047,6 +1071,7 @@ impl RegAlloc {
             live_out: Vec::new(),
             max_local_align: 8,
             frame_base: FrameBase::Rbp,
+            tls_access: crate::target::TlsAccess::ElfStatic,
         }
     }
 
@@ -1082,13 +1107,37 @@ impl RegAlloc {
         let intervals = result.intervals;
         let constraint_points = result.constraint_points;
         let call_positions = find_call_positions(func, is_call_like_x86_64);
+        let fp_call_positions = self.fp_call_positions(func, &call_positions);
 
         self.spill_args_across_calls(func, types, &intervals, &call_positions);
         self.spill_args_across_constraints(func, &intervals, &constraint_points);
         self.allocate_alloca_to_stack(func);
-        self.run_chordal_color(func, types, intervals, &call_positions, &constraint_points);
+        self.run_chordal_color(
+            func,
+            types,
+            intervals,
+            &call_positions,
+            &fp_call_positions,
+            &constraint_points,
+        );
 
         crate::arch::regalloc::LocationMap::from(self.locations.clone())
+    }
+
+    /// The positions that destroy every XMM register: the calls, and on
+    /// Darwin also each `TlsAddr`.
+    ///
+    /// The Mach-O TLV getter preserves most general registers, which
+    /// `get_constraint_info` models as a narrow clobber, but no XMM register
+    /// (LLVM's `CSR_64_TLS_Darwin` lists none). A floating-point value live
+    /// across it has to be where one is live across a call: on the stack.
+    /// The ELF descriptor resolver preserves them all, so there it adds
+    /// nothing.
+    fn fp_call_positions(&self, func: &Function, call_positions: &[usize]) -> Vec<usize> {
+        if self.tls_access != crate::target::TlsAccess::MachOTlv {
+            return call_positions.to_vec();
+        }
+        find_call_positions(func, |op| is_call_like_x86_64(op) || op == Opcode::TlsAddr)
     }
 
     /// Reset allocator state for a new function
@@ -1844,6 +1893,7 @@ impl RegAlloc {
         types: &TypeTable,
         intervals: Vec<LiveInterval>,
         call_positions: &[usize],
+        fp_call_positions: &[usize],
         constraint_points: &[ConstraintPoint<Reg>],
     ) {
         // -------- Phase 1: pre-pass --------
@@ -1949,7 +1999,7 @@ impl RegAlloc {
             if needs_fp {
                 let is_longdouble = self.ld_pseudos.contains(&interval.pseudo);
                 let is_quad = self.quad_pseudos.contains(&interval.pseudo);
-                let crosses_call = interval_crosses_call(interval, call_positions);
+                let crosses_call = interval_crosses_call(interval, fp_call_positions);
                 let crosses_block = crosses_blocks.contains(&interval.pseudo);
                 if is_longdouble {
                     self.alloc_stack_slot(interval, 16, 16, false);
@@ -2360,7 +2410,8 @@ impl RegAlloc {
 
     /// Compute live intervals, constraint points, and per-block liveness sets.
     fn compute_live_intervals(&self, func: &Function) -> LivenessResult<Reg> {
-        compute_live_intervals(func, get_constraint_info)
+        let tls = self.tls_access;
+        compute_live_intervals(func, |insn| get_constraint_info(insn, tls))
     }
 
     /// Get stack size needed (aligned to max local alignment, minimum 16)
@@ -2563,6 +2614,25 @@ mod tests {
         insn
     }
 
+    /// What a `TlsAddr` clobbers follows the model: the ELF descriptor call
+    /// hard-uses %rax alone; the Mach-O TLV getter also takes its descriptor
+    /// in %rdi. Every other general register survives either.
+    #[test]
+    fn tls_addr_clobbers_follow_the_model() {
+        use crate::target::TlsAccess;
+        let insn = Instruction::tls_addr(PseudoId(1), PseudoId(2), crate::types::TypeId::INVALID);
+        let (elf, _) = get_constraint_info(&insn, TlsAccess::ElfDescriptor).unwrap();
+        let (macho, _) = get_constraint_info(&insn, TlsAccess::MachOTlv).unwrap();
+        assert!(elf.contains(&Reg::Rax) && !elf.contains(&Reg::Rdi));
+        assert!(macho.contains(&Reg::Rax) && macho.contains(&Reg::Rdi));
+        for kept in [Reg::Rcx, Reg::Rdx, Reg::Rsi, Reg::R8, Reg::R9, Reg::Rbx] {
+            assert!(
+                !macho.contains(&kept),
+                "{kept:?} is preserved by the getter"
+            );
+        }
+    }
+
     /// No operand of an asm statement may live in a register it clobbers:
     /// the template may write that register before reading its operands.
     /// So an asm's declared clobbers exempt none of its operands, register
@@ -2574,7 +2644,8 @@ mod tests {
             &["rax", "memory"],
             &[("=r", PseudoId(1)), ("r", PseudoId(2)), ("m", PseudoId(5))],
         );
-        let (clobbers, exempt) = get_constraint_info(&insn).expect("a register is claimed");
+        let (clobbers, exempt) = get_constraint_info(&insn, crate::target::TlsAccess::ElfStatic)
+            .expect("a register is claimed");
         assert!(clobbers.contains(&Reg::Rax));
         assert!(exempt.is_empty(), "{exempt:?}");
 
@@ -2582,7 +2653,8 @@ mod tests {
         // register and must not be forbidden it. Another operand still may
         // not take that register.
         let mut pinned = make_asm_insn(&[], &[("=a", PseudoId(3)), ("r", PseudoId(4))]);
-        let (clobbers, exempt) = get_constraint_info(&pinned).expect("rax is claimed");
+        let (clobbers, exempt) = get_constraint_info(&pinned, crate::target::TlsAccess::ElfStatic)
+            .expect("rax is claimed");
         assert!(clobbers.contains(&Reg::Rax));
         assert_eq!(exempt, vec![PseudoId(3)]);
         pinned
@@ -2591,7 +2663,8 @@ mod tests {
             .unwrap()
             .clobbers
             .push("rcx".into());
-        let (clobbers, _) = get_constraint_info(&pinned).unwrap();
+        let (clobbers, _) =
+            get_constraint_info(&pinned, crate::target::TlsAccess::ElfStatic).unwrap();
         assert!(clobbers.contains(&Reg::Rcx));
     }
 }

@@ -930,6 +930,46 @@ impl Aarch64CodeGen {
     /// After this call, dst holds the address of the TLS variable.
     pub(super) fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let sym = Symbol::global(name);
+        if self.base.tls_access() == crate::target::TlsAccess::MachOTlv {
+            // Mach-O thread-local variable descriptor (clang's sequence):
+            //   adrp  x0, _v@TLVPPAGE
+            //   ldr   x0, [x0, _v@TLVPPAGEOFF]    ; the descriptor
+            //   ldr   x16, [x0]                   ; its getter
+            //   blr   x16                         ; returns the ADDRESS in x0
+            //
+            // The getter preserves every register but x0, x16, x17 and the
+            // link register -- LLVM's `CSR_Darwin_AArch64_TLS` keeps x1-x28
+            // and q0-q31 -- so x0 is the one allocatable register it
+            // clobbers, which `get_constraint_info_aarch64` declares.
+            // X16/X17 are never allocated and LR is saved by every prologue.
+            //
+            // Reached only through a `TlsAddr`: `ir::tls` rewrites every
+            // Darwin thread-local reference into one, so the allocator sees
+            // the call.
+            self.push_lir(Aarch64Inst::AdrpTlvpPage {
+                sym: sym.clone(),
+                dst: Reg::X0,
+            });
+            self.push_lir(Aarch64Inst::LdrTlvpPageOff {
+                sym,
+                base: Reg::X0,
+                dst: Reg::X0,
+            });
+            self.push_lir(Aarch64Inst::Ldr {
+                size: OperandSize::B64,
+                addr: MemAddr::Base(Reg::X0),
+                dst: Reg::X16,
+            });
+            self.push_lir(Aarch64Inst::Blr { reg: Reg::X16 });
+            if dst != Reg::X0 {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::X0),
+                    dst,
+                });
+            }
+            return;
+        }
         if self.base.use_tls_dynamic() {
             // TLS descriptor, the dynamic model:
             //   adrp  x0, :tlsdesc:sym

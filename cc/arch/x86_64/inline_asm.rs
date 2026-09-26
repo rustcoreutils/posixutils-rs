@@ -796,7 +796,7 @@ impl X86_64CodeGen {
             }
             Loc::Global(name) => {
                 // Check TLS before GOT - TLS symbols need special access pattern
-                if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
+                if self.is_tls_symbol(name) {
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
                         "{} %fs:{}@TPOFF, %{}",
                         mov,
@@ -862,7 +862,7 @@ impl X86_64CodeGen {
                 ))));
             }
             Loc::Global(name) => {
-                if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
+                if self.is_tls_symbol(name) {
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
                         "{} %{}, %fs:{}@TPOFF",
                         mov,

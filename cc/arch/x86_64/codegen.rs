@@ -174,7 +174,7 @@ impl X86_64CodeGen {
                     Symbol::global(name.clone())
                 };
                 // Use TLS addressing for thread-local variables (Linux only)
-                if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
+                if self.is_tls_symbol(name) {
                     GpOperand::Mem(MemAddr::TlsLocalExec(symbol))
                 } else {
                     // Note: For GOT access (PIC mode/external symbols), special handling
@@ -187,10 +187,14 @@ impl X86_64CodeGen {
     }
 
     /// Whether `name` is a thread-local this backend must access through the
-    /// FS segment. TLS lowering here is Linux-only; the other targets fall
-    /// through to ordinary global access.
+    /// FS segment: an ELF thread-local, on Linux or FreeBSD alike. On Darwin a
+    /// thread-local never reaches here as a symbol -- `ir::tls` turns every
+    /// reference into a `TlsAddr` -- so it is not one of these.
+    ///
+    /// This used to ask for Linux alone, which sent every FreeBSD
+    /// thread-local through ordinary global access: one copy for all threads.
     pub(super) fn is_tls_symbol(&self, name: &str) -> bool {
-        self.tls_symbols.contains(name) && self.base.target.os == Os::Linux
+        self.tls_symbols.contains(name) && self.base.target.os != Os::MacOS
     }
 
     /// Whether accessing the thread-local `name` needs the Initial Exec model
@@ -209,6 +213,36 @@ impl X86_64CodeGen {
     /// segfaults on a write.
     fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let symbol = Symbol::global(name.to_string());
+        if self.base.tls_access() == crate::target::TlsAccess::MachOTlv {
+            // Mach-O thread-local variable descriptor (clang's sequence):
+            //   movq _v@TLVP(%rip), %rdi    ; the descriptor
+            //   call *(%rdi)                ; its getter: the ADDRESS in %rax
+            //
+            // The getter preserves the callee-saved registers plus %rcx,
+            // %rdx, %rsi and %r8-%r11 (LLVM's `CSR_64_TLS_Darwin`), so %rax
+            // and %rdi are the general registers it clobbers, which
+            // `get_constraint_info` declares -- and no XMM register, which
+            // `RegAlloc::fp_call_positions` accounts for. ld64 relaxes the
+            // `movq` to a `leaq` of the descriptor when it is local, so it
+            // has to stay a `movq` from `@TLVP`.
+            //
+            // Reached only through a `TlsAddr`: `ir::tls` rewrites every
+            // Darwin thread-local reference into one.
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::Tlvp(symbol)),
+                dst: GpOperand::Reg(Reg::Rdi),
+            });
+            self.push_lir(X86Inst::TlvCall);
+            if dst != Reg::Rax {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Reg(dst),
+                });
+            }
+            return;
+        }
         if self.base.use_tls_dynamic() {
             // TLS descriptor, the dynamic model:
             //   leaq sym@TLSDESC(%rip), %rax

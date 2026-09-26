@@ -13,6 +13,7 @@
 use super::ast::{
     Declaration, ExternalDecl, FunctionDef, InitDeclarator, Parameter, Stmt, TranslationUnit,
 };
+use super::declaration::SpecContext;
 use super::parser::{DeclaratorName, ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::strings::StringId;
@@ -467,11 +468,15 @@ impl Parser<'_> {
             // Now parse explicit type declarations and update parameter types.
             if self.is_declaration_start() && !self.is_special(b'{') {
                 while self.is_declaration_start() {
-                    let knr_type = self.parse_type_specifier()?;
+                    let knr_pos = self.current_pos();
+                    let knr_type = self
+                        .parse_declaration_specifiers(SpecContext::Declaration)?
+                        .ty;
                     let knr_base_id = self.intern_type_with_tag(&knr_type);
                     loop {
                         let (decl_name, mut decl_typ, _vla, _fparams) =
                             self.parse_declarator(knr_base_id, DeclaratorName::Required)?;
+                        self.check_parameter_specifiers(knr_type.modifiers, decl_name, knr_pos);
                         self.check_not_vector_value(Some(decl_typ), self.current_pos());
                         // C99 6.7.5.3: array/function params adjusted to pointers
                         let typ = self.types.get(decl_typ);
@@ -638,7 +643,6 @@ impl Parser<'_> {
                     self.expect_special(b';')?;
                     self.pending_alignas = None;
                     self.pending_alignas_kw = None;
-                    self.pending_vm_typedef_dims = None;
                     self.pending_mode = None;
                     self.pending_transparent_union = None;
                 }
@@ -677,12 +681,13 @@ impl Parser<'_> {
 
         let decl_pos = self.current_pos();
         // Parse type specifier
-        let base_type = self.parse_type_specifier()?;
+        let decl_specs = self.parse_declaration_specifiers(SpecContext::Declaration)?;
+        let base_type = decl_specs.ty;
         // A declaration that stops right here declares nothing, and that --
         // not a missing type specifier -- is what to report. The `;` arms
         // below do it.
         if !self.is_special(b';') {
-            self.check_implicit_int(decl_pos);
+            self.check_implicit_int(decl_specs.explicit, decl_pos);
         }
         // Skip __attribute__ between type and declarator (GCC extension)
         self.skip_extensions();
@@ -1035,9 +1040,6 @@ impl Parser<'_> {
         // Clear pending alignment after declaration
         self.pending_alignas = None;
         self.pending_alignas_kw = None;
-        // Belongs to the declaration whose specifiers named the typedef, and
-        // to no later one.
-        self.pending_vm_typedef_dims = None;
         // A mode that no declarator consumed belongs to no later declaration:
         // leaving it set applied it to whatever came next.
         self.pending_mode = None;

@@ -15525,3 +15525,248 @@ void set(long v) { gb.y = v; }
         }
     }
 }
+
+/// The qualifiers written around `typeof(..)` or `_Atomic(..)` in a type-name
+/// are part of the type it names. The type-name specifier loop returned as
+/// soon as it had parsed the operand, so a leading `const` was dropped --
+/// `_Generic` picked `default` for `const typeof(int) *` against a
+/// `const int *` -- and a trailing one was left for the caller, which then
+/// failed to parse it.
+#[test]
+fn codegen_type_name_keeps_qualifiers_around_typeof() {
+    let src = r#"
+const int *p;
+volatile long *q;
+
+int main(void)
+{
+    /* The qualifier before typeof is part of the association's type. */
+    if (_Generic(p, const typeof(int) *: 1, default: 2) != 1)
+        return 1;
+    if (_Generic(q, volatile __typeof__(long) *: 1, default: 2) != 1)
+        return 2;
+    /* ... and so is one after it, which must still parse. */
+    if (_Generic(p, typeof(int) const *: 1, default: 2) != 1)
+        return 3;
+    /* An unqualified typeof still names the unqualified type. */
+    if (_Generic(p, typeof(int) *: 1, default: 2) != 2)
+        return 4;
+    if (sizeof(_Atomic(int) const) != sizeof(int))
+        return 5;
+    if (sizeof(typeof(short) volatile) != sizeof(short))
+        return 6;
+    return 0;
+}
+"#;
+    run_everywhere("type_name_keeps_qualifiers_around_typeof", src);
+}
+
+/// `typeof(int[n])` in a declaration names a variable length array whose
+/// extent is `n`, as it does in `sizeof`. The declaration specifiers parsed
+/// the operand with the type-name parser that drops variably modified
+/// extents, so `typeof(int[n]) a;` declared an `int[]` and `sizeof a` was
+/// rejected as incomplete. The extent is evaluated once, at the specifier.
+#[test]
+fn codegen_typeof_vla_declaration_keeps_its_extent() {
+    let src = r#"
+static int calls;
+static int next(int n) { calls++; return n; }
+
+static int probe(int n)
+{
+    typeof(int[n]) a;
+    __typeof__(char[n][3]) b;
+    typeof(int[next(n)]) c;
+    if (sizeof a != n * sizeof(int))
+        return 1;
+    if (sizeof b != (unsigned long)n * 3)
+        return 2;
+    if (sizeof c != n * sizeof(int))
+        return 3;
+    for (int i = 0; i < n; i++)
+        a[i] = i * 7;
+    for (int i = 0; i < n; i++)
+        if (a[i] != i * 7)
+            return 4;
+    return 0;
+}
+
+int main(void)
+{
+    int r = probe(5);
+    if (r)
+        return r;
+    r = probe(11);
+    if (r)
+        return 10 + r;
+    if (calls != 2)
+        return 20;
+    return 0;
+}
+"#;
+    run_everywhere("typeof_vla_declaration_keeps_its_extent", src);
+}
+
+/// A typedef name is a type specifier only when no other type specifier has
+/// been given (C17 6.7.2p2), so `unsigned T = ..` declares a variable named
+/// `T`. `unsigned` sets no base type of its own, and the typedef-name test
+/// asked only for one, so `T` was taken as the type and the declaration
+/// failed for want of a declarator.
+#[test]
+fn codegen_typedef_name_after_type_specifier_is_declared() {
+    let src = r#"
+typedef char T;
+
+int f(void)
+{
+    /* `T` here is the name being declared, an unsigned int hiding the
+       typedef -- not a second type specifier. */
+    unsigned T = 3000000000u;
+    if (T != 3000000000u)
+        return 1;
+    if (sizeof T != sizeof(unsigned int))
+        return 2;
+    return 0;
+}
+
+int g(void)
+{
+    const T c = 'x';   /* a qualifier is not a type specifier */
+    return sizeof c == 1 && c == 'x' ? 0 : 3;
+}
+
+int main(void)
+{
+    int r = f();
+    if (r)
+        return r;
+    return g();
+}
+"#;
+    run_everywhere("typedef_name_after_type_specifier_is_declared", src);
+}
+
+/// C17 6.7p1 lets declaration specifiers appear in any order, so a qualifier
+/// or storage class may follow `typeof(..)`, `_Atomic(..)` or an enum
+/// specifier as it may follow `int`. Those arms returned as soon as their
+/// type was parsed (the enum arm consumed qualifiers only), and the next
+/// specifier was read as the declarator's name. The block-scope `static`
+/// enum must keep its value across calls.
+#[test]
+fn codegen_specifiers_may_follow_a_complete_type_specifier() {
+    let src = r#"
+typeof(int) const x = 1;
+_Atomic(int) const y = 2;
+enum E { A = 3, B } static e = B;
+struct S { int v; } __attribute__((unused)) static s = { 5 };
+
+static int counter(void)
+{
+    enum { Z, LAST = 100 } static n;    /* static: keeps its value */
+    return ++n;
+}
+
+int main(void)
+{
+    if (x != 1 || y != 2 || e != B || s.v != 5)
+        return 1;
+    if (_Generic(&x, const int *: 0, default: 1))
+        return 2;
+    counter();
+    counter();
+    if (counter() != 3)
+        return 3;
+    typeof(long) volatile static w = 7;
+    if (w != 7 || sizeof w != sizeof(long))
+        return 4;
+    return 0;
+}
+"#;
+    run_everywhere("specifiers_may_follow_a_complete_type_specifier", src);
+}
+
+/// The declaration specifiers are evaluated once per declaration, however
+/// many declarators share them, so in `typeof(int[n++]) a, b;` gcc increments
+/// `n` once and gives `a` and `b` one extent. c17 copied the size expression
+/// into every declarator and evaluated it once each: `n` ended at 5 and `b`
+/// was a different size from `a`. Also covered: a call as the extent, derived
+/// declarators, a `for`-init, re-evaluation each time a loop reaches the
+/// declaration, and `sizeof(typeof(int[n++]))` evaluating its operand once.
+#[test]
+fn codegen_typeof_vla_extent_is_evaluated_once_per_declaration() {
+    let src = r#"
+static int calls;
+static int bump(int *p) { calls++; return (*p)++; }
+
+static int one_declaration(void)
+{
+    int n = 3;
+    /* One declaration, one evaluation: both objects get extent 3. */
+    typeof(int[n++]) a, b;
+    if (n != 4 || sizeof a != 3 * sizeof(int) || sizeof b != sizeof a)
+        return 1;
+    /* A function call as the extent, three declarators, a pointer and an
+       array of the specifier type among them. */
+    typeof(char[bump(&n)]) c, *pc = &c, d[2];
+    if (calls != 1 || n != 5)
+        return 2;
+    if (sizeof c != 4 || sizeof *pc != 4 || sizeof d != 8)
+        return 3;
+    /* Qualified, two-dimensional, constant inner level. */
+    volatile typeof(short[n++][2]) e, f;
+    if (n != 6 || sizeof e != 5 * 2 * sizeof(short) || sizeof f != sizeof e)
+        return 4;
+    /* A later change to n does not resize what was already declared. */
+    n = 100;
+    if (sizeof a != 3 * sizeof(int) || sizeof b != 3 * sizeof(int))
+        return 5;
+    /* Each object is writable across its whole extent. */
+    for (int i = 0; i < 3; i++)
+        a[i] = b[i] = i + 1;
+    if (a[2] + b[2] != 6)
+        return 6;
+    (void)e; (void)f;
+    return 0;
+}
+
+static int for_init(void)
+{
+    int n = 2, total = 0;
+    for (typeof(int[n++]) x, y; total == 0; total++) {
+        if (n != 3 || sizeof x != 2 * sizeof(int) || sizeof y != sizeof x)
+            return 10;
+    }
+    return 0;
+}
+
+static int in_a_loop(void)
+{
+    /* Reached three times, evaluated three times -- once each. */
+    int n = 1;
+    for (int k = 0; k < 3; k++) {
+        typeof(long[n++]) p, q;
+        if (sizeof p != (unsigned long)(k + 1) * sizeof(long) || sizeof q != sizeof p)
+            return 20 + k;
+    }
+    return n == 4 ? 0 : 23;
+}
+
+static int sizeof_once(void)
+{
+    int n = 7;
+    unsigned long s = sizeof(typeof(int[n++]));
+    if (s != 7 * sizeof(int) || n != 8)
+        return 30;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = one_declaration()) || (r = for_init()) || (r = in_a_loop()) || (r = sizeof_once()))
+        return r;
+    return 0;
+}
+"#;
+    run_everywhere("typeof_vla_extent_evaluated_once", src);
+}

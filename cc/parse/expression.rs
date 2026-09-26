@@ -889,8 +889,10 @@ impl<'a> Parser<'a> {
         }
         self.advance(); // consume typeof's `(`
 
-        // A type-name operand belongs to the other path.
-        if self.try_parse_type_name_vm().is_some() {
+        // A type-name operand belongs to the other path. Asked of the first
+        // token only: parsing the type-name here and then rewinding would
+        // parse it twice, reporting every fault in it twice.
+        if self.starts_type_name() {
             self.pos = saved;
             return Ok(None);
         }

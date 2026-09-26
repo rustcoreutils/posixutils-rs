@@ -105,7 +105,7 @@ pub(crate) enum DeclaratorName {
 /// table with their types.
 pub struct Parser<'a> {
     /// Token stream
-    tokens: &'a [Token],
+    pub(super) tokens: &'a [Token],
     /// Identifier table for looking up names
     pub(crate) idents: &'a IdentTable,
     /// Symbol table for binding declarations
@@ -212,16 +212,6 @@ pub struct Parser<'a> {
     /// Names for which some file-scope declaration omitted `inline`.
     /// See [`crate::symbol::Symbol::has_non_inline_decl`].
     pub(super) declared_non_inline_fns: std::collections::BTreeSet<StringId>,
-    /// Set by `parse_type_specifier`: whether the specifier list actually
-    /// named a type, rather than defaulting to `int`.
-    ///
-    /// C99 removed implicit int, but defaulting is still the right *recovery*
-    /// — the declarator after it is usually fine — so the flag lets each
-    /// caller decide whether a diagnostic belongs at its own position.
-    /// `parse_type_specifier` has seven callers, and some of them (an abstract
-    /// parameter declarator, a K&R identifier list) legitimately reach it with
-    /// no specifier.
-    pub(super) saw_explicit_type: bool,
     /// `#pragma pack` directives, and where they stood in the token stream.
     ///
     /// Sorted by index; `pack_cursor` is how far the parser has consumed
@@ -244,12 +234,6 @@ pub struct Parser<'a> {
     /// iterated, so no iteration order can reach the output. See the container
     /// selection rule in `cc/CLAUDE.md`.
     pub(super) vm_typedefs: HashMap<SymbolId, u32>,
-    /// The extents of the variably modified typedef named by the declaration
-    /// specifiers just parsed, awaiting the declarators they apply to.
-    ///
-    /// Held like `pending_alignas`: the specifier list is parsed before the
-    /// declarator list, and every declarator in the declaration shares it.
-    pub(super) pending_vm_typedef_dims: Option<Vec<Expr>>,
 }
 
 impl<'a> Parser<'a> {
@@ -288,11 +272,9 @@ impl<'a> Parser<'a> {
             declared_asm_labels: BTreeMap::new(),
             declared_extern_fns: std::collections::BTreeSet::new(),
             declared_non_inline_fns: std::collections::BTreeSet::new(),
-            saw_explicit_type: true,
             pack_directives,
             pack_cursor: 0,
             vm_typedefs: HashMap::new(),
-            pending_vm_typedef_dims: None,
             pack_current: None,
             pack_stack: Vec::new(),
         }

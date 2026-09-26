@@ -473,11 +473,12 @@ fn diagnostics_preexisting_constraints_still_fire() {
 // Regressions found in review: checks that fired on legal code
 // ============================================================================
 
-/// #L1's implicit-int check is driven by a parser-wide `saw_explicit_type`
-/// flag. The struct/union/enum/typeof arms of `parse_type_specifier` return
-/// early without setting it, so a specifier-less call — a K&R identifier list,
+/// #L1's implicit-int check was once driven by a parser-wide flag that the
+/// specifier parser set. Its struct/union/enum/typeof arms returned early
+/// without setting it, so a specifier-less call — a K&R identifier list,
 /// whose undeclared parameters have type `int` by C17 6.9.1p6 — left the flag
-/// false and the *next* declaration inherited the complaint.
+/// false and the *next* declaration inherited the complaint. The answer is
+/// now part of what the specifier parser returns, so nothing can go stale.
 #[test]
 fn diagnostics_kr_parameter_list_does_not_poison_the_next_declaration() {
     compile_expect_ok(
@@ -6304,5 +6305,415 @@ fn diagnostics_selection_and_iteration_statements_are_blocks() {
          switch (c + sizeof(enum { N = 1 })) { case N: return N; } \
          for (int i = 0; i < sizeof(struct W { int a; }); i++) { struct W w = {i}; c += w.a; } \
          return c; }\n",
+    );
+}
+
+// ============================================================================
+// One declaration-specifier loop (C17 6.7.2, 6.7.7)
+// ============================================================================
+
+/// Compile `src` and return its stderr, requiring that it was rejected.
+fn rejected_stderr(name: &str, src: &str, extra: &[&str]) -> String {
+    let c = create_c_file(name, src);
+    let path = c.path().to_string_lossy().to_string();
+    let mut args = extra.to_vec();
+    args.extend(["-S", "-o", "/dev/null", &path]);
+    let run = run_c17(&args);
+    assert!(!run.success, "'{name}' should have been rejected:\n{src}");
+    run.stderr
+}
+
+/// A type-name's specifiers are the same specifier set a declaration's are
+/// (C17 6.7.7p1), under the same 6.7.2p2 combination rules. The type-name
+/// copy of the specifier loop kept no tally, so all of these compiled; gcc
+/// rejects each with the wording asserted here.
+#[test]
+fn diagnostics_type_name_specifier_combinations_are_checked() {
+    for (name, src, expected) in [
+        (
+            "tn_int_char",
+            "int f(int x){ return (int char)x; }\n",
+            "two or more data types in declaration specifiers",
+        ),
+        (
+            "tn_float_double",
+            "double f(double x){ return (float double)x; }\n",
+            "two or more data types in declaration specifiers",
+        ),
+        (
+            "tn_signed_unsigned",
+            "int f(void){ return sizeof(signed unsigned); }\n",
+            "both 'signed' and 'unsigned' in declaration specifiers",
+        ),
+        (
+            "tn_signed_float",
+            "float f(float x){ return (signed float)x; }\n",
+            "both 'signed' and 'float' in declaration specifiers",
+        ),
+        (
+            "tn_va_arg_int_char",
+            "#include <stdarg.h>\nint f(int n, ...){ va_list ap; va_start(ap, n); \
+             int r = va_arg(ap, int char); va_end(ap); return r; }\n",
+            "two or more data types in declaration specifiers",
+        ),
+        (
+            "tn_struct_int",
+            "struct S { int a; };\nint f(void){ return sizeof(struct S int); }\n",
+            "two or more data types in declaration specifiers",
+        ),
+    ] {
+        compile_expect_error(name, src, expected);
+    }
+}
+
+/// C17 6.7.2.4p3 and 6.7.3p3 forbid `_Atomic` on an array or function type
+/// wherever the type is written. Only the declaration path checked; in a
+/// type-name `_Atomic(int[3])` and `_Atomic A` (an array typedef) compiled.
+#[test]
+fn diagnostics_atomic_type_name_on_array_or_function_is_rejected() {
+    compile_expect_error(
+        "tn_atomic_array",
+        "int f(void){ return sizeof(_Atomic(int[3])); }\n",
+        "'_Atomic' cannot be applied to an array type",
+    );
+    compile_expect_error(
+        "tn_atomic_typedef_array",
+        "typedef int A[3];\nint f(void){ return sizeof(_Atomic A); }\n",
+        "'_Atomic' cannot be applied to an array type",
+    );
+    compile_expect_error(
+        "tn_atomic_typedef_function",
+        "typedef int F(void);\nint f(void){ return sizeof(_Atomic F *); }\n",
+        "'_Atomic' cannot be applied to a function type",
+    );
+}
+
+/// The specifier arm and the wrapper around the loop each checked `_Atomic`,
+/// so one `_Atomic(int[3])` drew the same error twice.
+#[test]
+fn diagnostics_atomic_array_is_reported_once() {
+    for (name, src) in [
+        ("atomic_array_once", "_Atomic(int[3]) v;\n"),
+        ("atomic_member_once", "struct S { _Atomic(int[3]) v; };\n"),
+        ("atomic_function_once", "_Atomic(int(void)) *w;\n"),
+    ] {
+        let stderr = rejected_stderr(name, src, &[]);
+        assert_eq!(
+            stderr.matches("'_Atomic' cannot be applied").count(),
+            1,
+            "{name}: one constraint violation, one diagnostic:\n{stderr}"
+        );
+    }
+}
+
+/// C17 6.7p1: the declaration specifiers may come in any order, so anything
+/// may follow a complete `typeof(..)`, `_Atomic(..)`, enum, struct or union
+/// specifier. gcc accepts all of these.
+#[test]
+fn diagnostics_specifiers_after_a_complete_type_specifier_are_accepted() {
+    for (name, src) in [
+        ("typeof_const", "typeof(int) const x = 1;\n"),
+        ("atomic_const", "_Atomic(int) const y = 1;\n"),
+        (
+            "tn_atomic_const",
+            "int f(void){ return sizeof(_Atomic(int) const); }\n",
+        ),
+        (
+            "tn_typeof_const",
+            "int f(void){ return sizeof(typeof(int) const); }\n",
+        ),
+        ("enum_static_file", "enum E { A } static e;\n"),
+        (
+            "enum_static_block",
+            "void f(void){ enum E { A } static e; (void)e; }\n",
+        ),
+        (
+            "struct_attr_static",
+            "struct S { int a; } __attribute__((unused)) static s;\n",
+        ),
+        (
+            "struct_const_attr_extern",
+            "struct S { int a; } const __attribute__((unused)) extern s;\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
+/// A second data type after a tag specifier is the ordinary 6.7.2p2
+/// violation. The struct and enum arms returned before the tally saw the
+/// `int`, which was then read as the declarator and reported as a stray
+/// identifier.
+#[test]
+fn diagnostics_data_type_after_tag_specifier_is_rejected() {
+    for (name, src) in [
+        ("struct_int", "struct S { int a; };\nstruct S int x;\n"),
+        (
+            "struct_int_block",
+            "struct S { int a; };\nvoid f(void){ struct S int x; }\n",
+        ),
+        ("enum_int", "enum E { A };\nenum E int x;\n"),
+    ] {
+        compile_expect_error(
+            name,
+            src,
+            "two or more data types in declaration specifiers",
+        );
+    }
+}
+
+/// `__float128` names a type only where the target has one. A declaration
+/// said so; a type-name broke out of the loop and re-read the keyword as an
+/// expression, reporting an undeclared identifier.
+#[test]
+fn diagnostics_float128_type_name_on_a_target_without_it() {
+    let stderr = rejected_stderr(
+        "tn_float128",
+        "int f(void){ return sizeof(__float128); }\n",
+        &["--target", "aarch64-apple-darwin"],
+    );
+    assert!(
+        stderr.contains("__float128 is not supported on this target"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("undeclared identifier"), "{stderr}");
+}
+
+/// A typedef name is a type specifier only when no type specifier of any kind
+/// has been given (C17 6.7.2p2). `unsigned`, `long` and `_Complex` set no base
+/// type, so `unsigned T x;` took `T` as the type where gcc -- and the
+/// standard -- read it as the declarator; and after a typedef name a further
+/// type specifier was silently ignored.
+#[test]
+fn diagnostics_typedef_name_combines_with_no_other_type_specifier() {
+    compile_expect_error(
+        "unsigned_T",
+        "typedef int T;\nunsigned T x;\n",
+        "found identifier 'x'",
+    );
+    compile_expect_error(
+        "complex_T",
+        "typedef double T;\n_Complex T x;\n",
+        "found identifier 'x'",
+    );
+    compile_expect_error(
+        "T_int",
+        "typedef int T;\nT int x;\n",
+        "two or more data types in declaration specifiers",
+    );
+    compile_expect_error(
+        "tn_T_int",
+        "typedef int T;\nint f(void){ return sizeof(T int); }\n",
+        "two or more data types in declaration specifiers",
+    );
+    compile_expect_error(
+        "T_unsigned",
+        "typedef int T;\nT unsigned x;\n",
+        "both 'unsigned' and 'T' in declaration specifiers",
+    );
+    for (name, src) in [
+        (
+            "tn_unsigned_T",
+            "typedef int T;\nint f(void){ return sizeof(unsigned T); }\n",
+        ),
+        (
+            "tn_complex_T",
+            "typedef double T;\nint f(void){ return sizeof(_Complex T); }\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "expected ')' before 'T'");
+    }
+}
+
+/// Once a type-name's first token has committed it, it is not re-read as an
+/// expression. The type-name loop answered "not a type" after consuming
+/// tokens, and its callers carried on from wherever it stopped: an
+/// attribute-only `sizeof(__attribute__((unused)) y)` compiled, and
+/// `sizeof(int x)` reported `int` as an undeclared identifier.
+#[test]
+fn diagnostics_committed_type_name_is_not_reparsed_as_an_expression() {
+    let stderr = rejected_stderr(
+        "tn_attr_only",
+        "int y; int f(void){ return sizeof(__attribute__((unused)) y); }\n",
+        &[],
+    );
+    assert!(stderr.contains("type specifier missing"), "{stderr}");
+    assert!(stderr.contains("expected ')' before 'y'"), "{stderr}");
+
+    let stderr = rejected_stderr("tn_named", "int f(void){ return sizeof(int x); }\n", &[]);
+    assert!(stderr.contains("expected ')' before 'x'"), "{stderr}");
+    assert!(!stderr.contains("undeclared identifier"), "{stderr}");
+
+    // The expression readings the gate must leave alone.
+    compile_expect_ok(
+        "tn_expr_readings",
+        "typedef int T; int x;\n\
+         int f(void){ return sizeof(x) + (x) + sizeof x + sizeof(T) + (int)(T)x; }\n",
+    );
+}
+
+/// A type-name must name a type: C17 6.7.2p2 requires a type specifier, and
+/// c17 does not default to `int` (see `check_implicit_int`). gcc warns
+/// "type defaults to 'int' in type name"; the type-name loop said nothing.
+#[test]
+fn diagnostics_type_name_without_type_specifier_is_rejected() {
+    compile_expect_error(
+        "tn_const_only",
+        "int f(void){ return sizeof(const); }\n",
+        "type specifier missing",
+    );
+    compile_expect_error(
+        "tn_const_cast",
+        "int f(int x){ return (const)x; }\n",
+        "type specifier missing",
+    );
+    compile_expect_error(
+        "member_const_only",
+        "struct S { const x; };\n",
+        "type specifier missing",
+    );
+}
+
+/// A type-name and a member declaration take a specifier-qualifier list
+/// (C17 6.7.2.1p1, 6.7.7p1): no storage class and no function specifier.
+/// Members accepted them silently; in a type-name they fell out of the
+/// specifier loop and were reported as undeclared identifiers. gcc's wording.
+#[test]
+fn diagnostics_specifier_qualifier_list_rejects_declaration_only_specifiers() {
+    for (name, src, word) in [
+        ("member_static", "struct S { static int x; };\n", "static"),
+        ("member_extern", "struct S { extern int x; };\n", "extern"),
+        (
+            "member_typedef",
+            "struct S { typedef int x; };\n",
+            "typedef",
+        ),
+        ("member_inline", "struct S { inline int x; };\n", "inline"),
+        (
+            "member_noreturn",
+            "struct S { _Noreturn int x; };\n",
+            "_Noreturn",
+        ),
+        (
+            "member_thread_local",
+            "struct S { _Thread_local int x; };\n",
+            "_Thread_local",
+        ),
+        (
+            "tn_static_cast",
+            "int f(int x){ return (static int)x; }\n",
+            "static",
+        ),
+        (
+            "tn_register_sizeof",
+            "int f(void){ return sizeof(register int); }\n",
+            "register",
+        ),
+        (
+            "tn_typedef_sizeof",
+            "int f(void){ return sizeof(typedef int); }\n",
+            "typedef",
+        ),
+        (
+            "tn_inline_sizeof",
+            "int f(void){ return sizeof(inline int); }\n",
+            "inline",
+        ),
+        (
+            "tn_static_generic",
+            "int x; int f(void){ return _Generic(x, static int: 1, default: 2); }\n",
+            "static",
+        ),
+        // C23 admits a storage class in a compound literal, and gcc takes it
+        // before C23 as an extension it flags under -pedantic. C17 does not.
+        (
+            "tn_static_compound",
+            "int f(void){ return (static int){1}; }\n",
+            "static",
+        ),
+    ] {
+        let stderr = rejected_stderr(name, src, &[]);
+        let expected = format!("expected specifier-qualifier-list before '{word}'");
+        assert!(stderr.contains(&expected), "{name}: {stderr}");
+        assert!(
+            !stderr.contains("undeclared identifier"),
+            "{name}: {stderr}"
+        );
+    }
+
+    compile_expect_error(
+        "tn_alignas",
+        "int f(void){ return sizeof(_Alignas(8) int); }\n",
+        "_Alignas cannot be applied to a type name",
+    );
+    // A member may carry an alignment specifier (C17 6.7.5p2 excludes only a
+    // bit-field), and a member's qualifiers are what they always were.
+    compile_expect_ok(
+        "member_alignas",
+        "struct S { _Alignas(8) int x; const volatile int y; };\n",
+    );
+}
+
+/// A parameter declaration may carry no storage class but `register`
+/// (C17 6.7.6.3p2). Every other one was accepted and ignored -- in a
+/// prototype, a definition and a K&R declaration list alike.
+#[test]
+fn diagnostics_parameter_storage_class_other_than_register_is_rejected() {
+    for (name, src) in [
+        ("param_static", "void f(static int x);\n"),
+        ("param_extern", "void f(extern int x);\n"),
+        ("param_auto", "void f(auto int x);\n"),
+        ("param_typedef", "void f(typedef int x);\n"),
+        ("param_thread_local", "void f(_Thread_local int x);\n"),
+        ("param_static_def", "int f(static int x){ return x; }\n"),
+        ("knr_static", "int f(x) static int x; { return x; }\n"),
+    ] {
+        compile_expect_error(name, src, "storage class specified for parameter 'x'");
+    }
+    compile_expect_error(
+        "param_unnamed_static",
+        "void f(static int);\n",
+        "storage class specified for unnamed parameter",
+    );
+    compile_expect_warning(
+        "param_inline",
+        "void f(inline int x);\n",
+        "parameter 'x' declared 'inline'",
+    );
+    compile_expect_warning(
+        "param_noreturn",
+        "void f(_Noreturn int x);\n",
+        "parameter 'x' declared '_Noreturn'",
+    );
+    for (name, src) in [
+        ("param_register", "int f(register int x){ return x; }\n"),
+        ("knr_register", "int f(x) register int x; { return x; }\n"),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
+/// A typedef name shares the ordinary name space with objects, functions and
+/// enumerators (C17 6.2.3), so declaring one over the other in the same scope
+/// is 6.7p3. Neither direction was checked: `typedef int T; T T;` and
+/// `int x; typedef int x;` both compiled. Shadowing in an inner scope stays
+/// legal.
+#[test]
+fn diagnostics_typedef_and_object_in_one_scope_collide() {
+    for (name, src) in [
+        ("td_then_object", "typedef int T;\nT T;\n"),
+        (
+            "td_then_object_block",
+            "void f(void){ typedef int T; int T; }\n",
+        ),
+        ("object_then_td", "int x;\ntypedef int x;\n"),
+        ("enumerator_then_td", "enum { E };\ntypedef int E;\n"),
+        ("parameter_then_td", "void f(int x){ typedef int x; }\n"),
+    ] {
+        compile_expect_error(name, src, "redeclared as a different kind of symbol");
+    }
+    compile_expect_ok(
+        "td_shadowed_in_inner_scope",
+        "typedef int T;\nvoid f(void){ T T; T = 1; (void)T; }\nvoid g(int T){ (void)T; }\n",
     );
 }

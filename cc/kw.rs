@@ -13,7 +13,7 @@
 // deterministic StringId and a u32 tag bitmask for O(1) set-membership queries.
 //
 // This eliminates string comparisons in hot paths (is_declaration_start,
-// parse_type_specifiers, parse_statement, is_builtin, etc.) by replacing them
+// parse_declaration_specifiers, parse_statement, is_builtin, etc.) by replacing them
 // with integer comparisons.
 //
 

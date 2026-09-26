@@ -10,6 +10,7 @@
 //
 
 use super::ast::Expr;
+use super::declaration::SpecContext;
 use super::parser::{DeclaratorName, ParameterList, ParseError, ParseResult, Parser, RawParam};
 use crate::diag;
 use crate::strings::StringId;
@@ -497,7 +498,9 @@ impl Parser<'_> {
             }
 
             // Parse parameter type
-            let param_type = self.parse_type_specifier()?;
+            let param_pos = self.current_pos();
+            let param_specs = self.parse_declaration_specifiers(SpecContext::Declaration)?;
+            let param_type = param_specs.ty;
             // C11 6.7.5p2: not on a parameter.
             self.reject_alignas_in("a parameter");
             // An identifier list -- `int f(a, b) int a, b;` -- is not a
@@ -506,7 +509,7 @@ impl Parser<'_> {
             // identifier. The choice is all-or-nothing across the list, so the
             // first parameter settles it.
             if params.is_empty() && !variadic {
-                prototyped = self.saw_explicit_type;
+                prototyped = param_specs.explicit;
             }
             // For struct/union types with tags, use existing TypeId to preserve forward declarations
             let base_type_id = self.intern_type_with_tag(&param_type);
@@ -518,6 +521,7 @@ impl Parser<'_> {
             // Note: parse_declarator returns (name, type, vla_sizes)
             let (param_name, mut typ_id, vla_sizes, _func_params) =
                 self.parse_declarator(base_type_id, DeclaratorName::Optional)?;
+            self.check_parameter_specifiers(param_type.modifiers, param_name, param_pos);
 
             // Skip any __attribute__ after parameter declarator
             self.skip_extensions();
@@ -661,7 +665,7 @@ impl Parser<'_> {
                 // C17 6.7.6.3: a parameter-type-list is a comma-separated list
                 // of parameter declarations, optionally followed by `, ...`.
                 // Nothing else may follow the comma: falling through would let
-                // `parse_type_specifier` supply an implicit `int` and make
+                // the specifier parser supply an implicit `int` and make
                 // `void g(int, );` a two-parameter prototype. (C23 permits the
                 // trailing comma; this compiler is C17.)
                 if self.is_special(b')') {

@@ -6461,3 +6461,90 @@ fn test_aligned_on_a_tag_reference_aligns_the_declaration() {
     assert_eq!(decl.declarators[0].explicit_align, Some(32));
     assert_eq!(types.alignment(decl.declarators[0].typ), 4);
 }
+
+/// The qualifiers written before a `typeof` belong to the type it names, in a
+/// type-name as in a declaration. The type-name copy of the specifier loop
+/// returned the operand's type the moment it had parsed it, so the `const`
+/// in `(const typeof(int) *)` was read and then dropped.
+#[test]
+fn test_type_name_keeps_qualifiers_before_typeof() {
+    let (expr, types, _, _) = parse_expr("(const typeof(int) *)0").unwrap();
+    let ExprKind::Cast { cast_type, .. } = expr.kind else {
+        panic!("expected a cast");
+    };
+    let pointee = types.base_type(cast_type).expect("a pointer");
+    assert_eq!(types.kind(pointee), TypeKind::Int);
+    assert!(types.modifiers(pointee).contains(TypeModifiers::CONST));
+}
+
+/// C17 6.7p1 lets the declaration specifiers come in any order, so a
+/// specifier may follow `typeof(..)`, `_Atomic(..)` or an enum specifier as
+/// it may follow `int`. Each of those arms returned as soon as it had parsed
+/// its type, and the specifier after it was read as the declarator's name.
+#[test]
+fn test_specifiers_may_follow_a_complete_type_specifier() {
+    let (decl, types, _, _) = parse_decl("typeof(int) const x = 1;").unwrap();
+    let typ = decl.declarators[0].typ;
+    assert_eq!(types.kind(typ), TypeKind::Int);
+    assert!(types.modifiers(typ).contains(TypeModifiers::CONST));
+
+    let (decl, types, _, _) = parse_decl("_Atomic(int) const y = 1;").unwrap();
+    let typ = decl.declarators[0].typ;
+    assert!(types
+        .modifiers(typ)
+        .contains(TypeModifiers::CONST | TypeModifiers::ATOMIC));
+
+    let (decl, _, _, _) = parse_decl("enum E { A } static e;").unwrap();
+    assert!(decl.declarators[0]
+        .storage_class
+        .contains(TypeModifiers::STATIC));
+}
+
+/// A typedef name is a type specifier only where no other type specifier has
+/// been given (C17 6.7.2p2 lists no combination that includes one), so in
+/// `unsigned T;` the typedef name is the identifier being declared -- an
+/// `unsigned int` that hides the typedef. It was taken as the type.
+#[test]
+fn test_typedef_name_after_a_type_specifier_is_the_declarator() {
+    let (tu, types, strings, symbols) = parse_tu("typedef char T; unsigned T;").unwrap();
+    let ExternalDecl::Declaration(decl) = &tu.items[1] else {
+        panic!("expected a declaration");
+    };
+    let declared = &decl.declarators[0];
+    let sym = symbols.get(declared.symbol);
+    assert_eq!(strings.get(sym.name), "T");
+    assert_eq!(types.kind(declared.typ), TypeKind::Int);
+    assert!(types.is_unsigned(declared.typ));
+}
+
+/// `typeof(int[n++])`'s extent is evaluated once for the declaration: an
+/// unnamed typedef ahead of the declarators carries the size expression, and
+/// each declarator names the evaluated extent rather than repeating `n++`.
+#[test]
+fn test_typeof_extent_is_bound_once_per_declaration() {
+    let (tu, _types, _strings, _symbols) =
+        parse_tu("void f(int n) { typeof(int[n++]) a, b; }").unwrap();
+    let ExternalDecl::FunctionDef(func) = &tu.items[0] else {
+        panic!("expected a function definition");
+    };
+    let Stmt::Block(items) = &func.body else {
+        panic!("expected a block");
+    };
+    let BlockItem::Declaration(decl) = &items[0] else {
+        panic!("expected a declaration");
+    };
+    let [hidden, a, b] = decl.declarators.as_slice() else {
+        panic!("expected the unnamed typedef and two declarators");
+    };
+    assert!(hidden.storage_class.contains(TypeModifiers::TYPEDEF));
+    let [size] = hidden.vla_sizes.as_slice() else {
+        panic!("the unnamed typedef carries the one size expression");
+    };
+    assert!(matches!(size.kind, ExprKind::PostInc(_)));
+    for d in [a, b] {
+        let [extent] = d.vla_sizes.as_slice() else {
+            panic!("one extent per declarator");
+        };
+        assert!(matches!(extent.kind, ExprKind::VmTypedefExtent(sym, 0) if sym == hidden.symbol));
+    }
+}

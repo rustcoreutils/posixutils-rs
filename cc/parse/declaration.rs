@@ -395,11 +395,10 @@ impl Parser<'_> {
         }
     }
 
-    /// Derive an array type, refusing an extent the compiler cannot describe:
-    /// `TypeTable::size_bits` answers in a `u32`, so an object wider than
-    /// `u32::MAX` bits has no representable size. Enforced here, where the
-    /// element type is known, so an outer dimension is measured against an
-    /// inner one already within the bound.
+    /// Derive an array type, refusing an extent past
+    /// [`TypeTable::max_object_bytes`] (`PTRDIFF_MAX`), gcc's bound too.
+    /// Enforced here, where the element type is known, so an outer dimension
+    /// is measured against an inner one already within the bound.
     pub(super) fn derive_array_type(
         &mut self,
         elem: TypeId,
@@ -408,11 +407,12 @@ impl Parser<'_> {
     ) -> Result<TypeId, ParseError> {
         if let Some(count) = size {
             let total = (count as u128) * (self.types.size_bytes(elem) as u128);
-            if total > TypeTable::MAX_OBJECT_BYTES as u128 {
+            let max = self.types.max_object_bytes();
+            if total > max as u128 {
                 return Err(ParseError::new(
                     format!(
-                        "size of array exceeds the maximum object size of {} bytes",
-                        TypeTable::MAX_OBJECT_BYTES
+                        "size of array is too large: it exceeds the maximum \
+                         object size of {max} bytes"
                     ),
                     pos,
                 ));
@@ -438,7 +438,7 @@ impl Parser<'_> {
     /// Asked only of an object with *automatic* storage duration and of a
     /// by-value parameter type. A static or file-scope object of the same size
     /// is addressed symbolically and works, so widening this to every
-    /// declaration would make it a second, tighter `MAX_OBJECT_BYTES` and would
+    /// declaration would make it a second, tighter `max_object_bytes` and would
     /// reject what `diagnostics_largest_describable_object_is_accepted`
     /// requires.
     ///
@@ -985,43 +985,7 @@ impl Parser<'_> {
                         modifiers |= TypeModifiers::ATOMIC;
                     }
                 }
-                crate::kw::ALIGNAS => {
-                    // C11 alignment specifier: _Alignas(type-name) or _Alignas(constant-expression)
-                    let alignas_pos = self.current_pos();
-                    self.advance();
-                    self.expect_special(b'(')?;
-                    let align = if let Some(type_id) = self.try_parse_type_name() {
-                        // _Alignas(type) - alignment of the type
-                        self.types.alignment(type_id) as u32
-                    } else {
-                        // Parse as constant expression: _Alignas(16)
-                        let expr = self.parse_expression()?;
-                        self.eval_const_expr(&expr).unwrap_or(0) as u32
-                    };
-                    self.expect_special(b')')?;
-
-                    // C11 6.7.5p6: _Alignas(0) has no effect
-                    if align == 0 {
-                        // No effect - don't update pending_alignas
-                    } else {
-                        // C11 6.7.5: alignment must be a positive power of 2
-                        if !align.is_power_of_two() {
-                            return Err(ParseError::new(
-                                format!("_Alignas({}) must be a power of 2", align),
-                                alignas_pos,
-                            ));
-                        }
-                        // Multiple _Alignas can appear; the strictest (largest) wins (C11 6.7.5)
-                        if let Some(existing) = self.pending_alignas {
-                            self.pending_alignas = Some(existing.max(align));
-                        } else {
-                            self.pending_alignas = Some(align);
-                        }
-                        // Record the spelling: 6.7.5p2 constrains the keyword,
-                        // not the `aligned` attribute that shares the slot.
-                        self.pending_alignas_kw.get_or_insert(alignas_pos);
-                    }
-                }
+                crate::kw::ALIGNAS => self.parse_alignas_specifier()?,
                 crate::kw::SHORT => {
                     tally.note_size("short", self.current_pos());
                     self.advance();
@@ -1179,28 +1143,21 @@ impl Parser<'_> {
                     self.advance(); // consume typeof
                     self.expect_special(b'(')?;
 
-                    // typeof can take either a type name or an expression
-                    // Try type name first
-                    if let Some(typ) = self.try_parse_type_name() {
-                        self.expect_special(b')')?;
-                        // Return the type with any modifiers
-                        let result_type = self.types.get(typ).clone();
-                        return Ok((
-                            Type {
-                                modifiers: modifiers | result_type.modifiers,
-                                ..result_type
-                            },
-                            true,
-                        ));
-                    }
-
-                    // Not a type name, try expression
-                    let expr = self.parse_expression()?;
+                    // typeof can take either a type name or an expression;
+                    // try the type name first.
+                    let typ = if let Some(typ) = self.try_parse_type_name() {
+                        typ
+                    } else {
+                        let expr = self.parse_expression()?;
+                        expr.typ.unwrap_or(self.types.int_id)
+                    };
                     self.expect_special(b')')?;
 
-                    // Get the type of the expression
-                    let expr_type_id = expr.typ.unwrap_or(self.types.int_id);
-                    let result_type = self.types.get(expr_type_id).clone();
+                    // The operand's declaration contributes its type and
+                    // qualifiers, never its storage class: `static int g;
+                    // typeof(g) c;` declares an automatic `c`.
+                    let typ = self.types.without_decl_specifiers(typ);
+                    let result_type = self.types.get(typ).clone();
                     return Ok((
                         Type {
                             modifiers: modifiers | result_type.modifiers,
@@ -1333,10 +1290,19 @@ impl Parser<'_> {
         self.advance();
         self.expect_special(b'(')?;
         let align = if let Some(type_id) = self.try_parse_type_name() {
-            self.types.alignment(type_id) as u32
+            self.types.alignment(type_id) as i128
         } else {
             let expr = self.parse_expression()?;
-            self.eval_const_expr(&expr).unwrap_or(0) as u32
+            match self.eval_const_expr(&expr) {
+                Some(align) => align,
+                None => {
+                    diag::error(
+                        alignas_pos,
+                        &gettext("requested alignment is not an integer constant"),
+                    );
+                    0
+                }
+            }
         };
         self.expect_special(b')')?;
 
@@ -1344,12 +1310,15 @@ impl Parser<'_> {
         if align == 0 {
             return Ok(());
         }
-        if !align.is_power_of_two() {
-            return Err(ParseError::new(
-                format!("_Alignas({}) must be a power of 2", align),
-                alignas_pos,
-            ));
-        }
+        let align = match u32::try_from(align) {
+            Ok(align) if align.is_power_of_two() => align,
+            _ => {
+                return Err(ParseError::new(
+                    format!("_Alignas({}) must be a power of 2", align),
+                    alignas_pos,
+                ))
+            }
+        };
         // Several may appear; the strictest wins (C11 6.7.5).
         self.pending_alignas = Some(match self.pending_alignas {
             Some(existing) => existing.max(align),
@@ -1387,53 +1356,6 @@ impl Parser<'_> {
         }
 
         Ok(typ)
-    }
-
-    /// Drop the storage-class bits from a type, leaving only what it denotes.
-    ///
-    /// These describe the *declaration*, not the type, so two names for the
-    /// same type can differ in them and still be compatible.
-    fn strip_declaration_modifiers(&mut self, id: TypeId) -> TypeId {
-        const DECL_ONLY: TypeModifiers = TypeModifiers::TYPEDEF
-            .union(TypeModifiers::EXTERN)
-            .union(TypeModifiers::STATIC)
-            .union(TypeModifiers::AUTO)
-            .union(TypeModifiers::REGISTER)
-            .union(TypeModifiers::THREAD_LOCAL)
-            .union(TypeModifiers::INLINE);
-
-        let t = self.types.get(id);
-        if !t.modifiers.intersects(DECL_ONLY) {
-            return id;
-        }
-        let mut stripped = t.clone();
-        stripped.modifiers = stripped.modifiers.difference(DECL_ONLY);
-        self.types.intern(stripped)
-    }
-
-    /// `strip_declaration_modifiers`, reaching a function type's return type
-    /// as well.
-    ///
-    /// `static`, `extern` and `inline` are recorded on the declaration's base
-    /// type, which for a function declarator *is* the return type -- so
-    /// `inline int hdr(int)` and `extern int hdr(int)` build function types
-    /// whose returns are two different `int`s, and compatibility comparing
-    /// bases by id calls them different, though they print identically.
-    fn strip_declaration_modifiers_deep(&mut self, id: TypeId) -> TypeId {
-        let id = self.strip_declaration_modifiers(id);
-        if self.types.kind(id) != TypeKind::Function {
-            return id;
-        }
-        let Some(ret) = self.types.base_type(id) else {
-            return id;
-        };
-        let stripped_ret = self.strip_declaration_modifiers_deep(ret);
-        if stripped_ret == ret {
-            return id;
-        }
-        let mut func = self.types.get(id).clone();
-        func.base = Some(stripped_ret);
-        self.types.intern(func)
     }
 
     /// Diagnose a redeclaration whose type conflicts with the one already in
@@ -1474,8 +1396,8 @@ impl Parser<'_> {
         }
         let old_kind = existing.kind;
         let old_type = existing.typ;
-        let old_type = self.strip_declaration_modifiers_deep(old_type);
-        let new_type = self.strip_declaration_modifiers_deep(new_type);
+        let old_type = self.types.without_decl_specifiers(old_type);
+        let new_type = self.types.without_decl_specifiers(new_type);
         if self.redeclaration_compatible(old_type, new_type) {
             return;
         }
@@ -1586,8 +1508,8 @@ impl Parser<'_> {
         // storage class from its declaration, and glibc reaches most of these
         // names through a second typedef (`typedef __int16_t int16_t;`), so
         // comparing raw modifiers reports two identical `short`s as different.
-        let old_type = self.strip_declaration_modifiers(old_type);
-        let new_type = self.strip_declaration_modifiers(new_type);
+        let old_type = self.types.without_decl_specifiers(old_type);
+        let new_type = self.types.without_decl_specifiers(new_type);
         if self.types.types_compatible(old_type, new_type) {
             return;
         }

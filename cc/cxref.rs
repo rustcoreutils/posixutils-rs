@@ -175,7 +175,7 @@ fn extract_refs_from_expr(
         ExprKind::FuncName => {
             // __func__ is a special identifier, not a user-defined symbol
         }
-        ExprKind::Call { func, args } => {
+        ExprKind::Call { func, args, .. } => {
             extract_refs_from_expr(func, strings, symbols, xref);
             for arg in args {
                 extract_refs_from_expr(arg, strings, symbols, xref);

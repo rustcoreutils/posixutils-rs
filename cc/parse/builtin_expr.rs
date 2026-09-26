@@ -11,7 +11,8 @@
 //
 
 use super::ast::{
-    BinaryOp, CheckedOp, Expr, ExprKind, FpCompare, FpTest, GnuAtomicOp, OffsetOfPath, UnaryOp,
+    BinaryOp, CalleeBinding, CheckedOp, Expr, ExprKind, FpCompare, FpTest, GnuAtomicOp,
+    OffsetOfPath, UnaryOp,
 };
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
@@ -245,7 +246,12 @@ impl Parser<'_> {
     }
 
     /// One of the C99 7.12.14 relations: `__builtin_isgreater` and its five
-    /// siblings.
+    /// siblings, and C23's `__builtin_iseqsig`.
+    ///
+    /// C17 7.12.14p1 requires real floating arguments. gcc relaxes that to
+    /// "both real, at least one of them floating": an integer operand beside a
+    /// floating one is accepted, and two integers, a pointer, a complex value
+    /// or a structure is the error reported below, in gcc's words.
     ///
     /// The operands go through the usual arithmetic conversions, as the
     /// relational operators they stand for do, so `isless(1, 2.0)` compares
@@ -255,7 +261,12 @@ impl Parser<'_> {
     /// The comparison itself is desugared in the linearizer: writing it out as
     /// `a < b` here would duplicate the operand expressions, and
     /// `isunordered(f(), g())` must call each function once.
-    fn parse_fp_compare(&mut self, token_pos: Position, cmp: FpCompare) -> ParseResult<Expr> {
+    fn parse_fp_compare(
+        &mut self,
+        name_id: StringId,
+        token_pos: Position,
+        cmp: FpCompare,
+    ) -> ParseResult<Expr> {
         self.expect_special(b'(')?;
         let lhs = self.parse_assignment_expr()?;
         self.expect_special(b',')?;
@@ -263,17 +274,21 @@ impl Parser<'_> {
         self.expect_special(b')')?;
 
         let common = match (lhs.typ, rhs.typ) {
-            (Some(l), Some(r)) => self.types.common_type(l, r),
-            (Some(t), None) | (None, Some(t)) => t,
-            (None, None) => self.types.double_id,
-        };
-        // A relation between two integers is not what these are for, but gcc
-        // accepts it and answers the ordinary comparison; converting to a real
-        // floating type keeps one lowering path rather than two.
-        let common = if self.types.is_float(common) {
-            common
-        } else {
-            self.types.double_id
+            (Some(l), Some(r)) if self.fp_compare_operands_valid(l, r) => {
+                self.types.common_type(l, r)
+            }
+            (Some(_), Some(_)) => {
+                let name = self.idents.get_opt(name_id).unwrap_or("").to_string();
+                diag::error_args(
+                    token_pos,
+                    "non-floating-point arguments in call to function '{0}'",
+                    &[&name],
+                );
+                self.types.double_id
+            }
+            // An operand whose type is unknown has been diagnosed already.
+            (Some(t), None) | (None, Some(t)) if self.types.is_float(t) => t,
+            _ => self.types.double_id,
         };
 
         let lhs = self.converted_to(lhs, common, token_pos);
@@ -287,6 +302,17 @@ impl Parser<'_> {
             self.types.int_id,
             token_pos,
         ))
+    }
+
+    /// Whether `l` and `r` may be the operands of an fp comparison builtin:
+    /// both real (integer or real floating), and at least one floating.
+    fn fp_compare_operands_valid(&self, l: TypeId, r: TypeId) -> bool {
+        let t = &self.types;
+        // `is_integer` asks only the kind, so `_Complex int` and a vector of
+        // `int` would pass it; neither is real.
+        let real =
+            |id| !t.is_complex(id) && !t.is_vector(id) && (t.is_integer(id) || t.is_float(id));
+        real(l) && real(r) && (t.is_float(l) || t.is_float(r))
     }
 
     /// `expr` as `typ`, adding a cast only when one is needed.
@@ -992,16 +1018,18 @@ impl Parser<'_> {
             | crate::kw::BUILTIN_ISLESS
             | crate::kw::BUILTIN_ISLESSEQUAL
             | crate::kw::BUILTIN_ISLESSGREATER
-            | crate::kw::BUILTIN_ISUNORDERED => {
+            | crate::kw::BUILTIN_ISUNORDERED
+            | crate::kw::BUILTIN_ISEQSIG => {
                 let cmp = match name_id {
                     crate::kw::BUILTIN_ISGREATER => FpCompare::Greater,
                     crate::kw::BUILTIN_ISGREATEREQUAL => FpCompare::GreaterEqual,
                     crate::kw::BUILTIN_ISLESS => FpCompare::Less,
                     crate::kw::BUILTIN_ISLESSEQUAL => FpCompare::LessEqual,
                     crate::kw::BUILTIN_ISLESSGREATER => FpCompare::LessGreater,
+                    crate::kw::BUILTIN_ISEQSIG => FpCompare::Equal,
                     _ => FpCompare::Unordered,
                 };
-                Some(self.parse_fp_compare(token_pos, cmp))
+                Some(self.parse_fp_compare(name_id, token_pos, cmp))
             }
             crate::kw::BUILTIN_FPCLASSIFY => Some((|| {
                 // __builtin_fpclassify(nan, inf, normal, subnormal, zero, x)
@@ -1281,6 +1309,7 @@ impl Parser<'_> {
                     ExprKind::Call {
                         func: Box::new(Self::typed_expr(ExprKind::Ident(sym), void_id, token_pos)),
                         args: vec![begin, end],
+                        binding: CalleeBinding::Library,
                     },
                     void_id,
                     token_pos,
@@ -2050,6 +2079,7 @@ impl Parser<'_> {
             ExprKind::Call {
                 func: Box::new(Self::typed_expr(ExprKind::Ident(sym), ret, pos)),
                 args: Vec::new(),
+                binding: CalleeBinding::Declared,
             },
             ret,
             pos,
@@ -2364,6 +2394,7 @@ impl Parser<'_> {
                         ExprKind::Call {
                             func: Box::new(func_expr),
                             args,
+                            binding: CalleeBinding::Library,
                         },
                         ret_type,
                         token_pos,
@@ -2389,6 +2420,7 @@ impl Parser<'_> {
                         ExprKind::Call {
                             func: Box::new(func_expr),
                             args,
+                            binding: CalleeBinding::Library,
                         },
                         ret_type,
                         token_pos,
@@ -2593,7 +2625,9 @@ impl Parser<'_> {
             "strlen" => Some(self.types.ulong_id),
             "strcmp" | "abs" | "ffs" | "ffsl" | "ffsll" | "memcmp" | "strncmp" | "printf"
             | "sprintf" | "snprintf" | "puts" | "putchar" | "printf_unlocked"
-            | "fprintf_unlocked" | "fputs_unlocked" => Some(self.types.int_id),
+            | "fprintf_unlocked" | "fputs_unlocked" | "fprintf" | "fputs" | "fputc" => {
+                Some(self.types.int_id)
+            }
             "labs" => Some(self.types.long_id),
             "llabs" => Some(self.types.longlong_id),
             _ if Self::libm_real_kind(name).is_some() => Some(match Self::libm_real_kind(name) {
@@ -2622,7 +2656,7 @@ impl Parser<'_> {
             // are the old spellings of `strchr`/`strrchr`.
             "bcopy" | "bzero" => Some(self.types.void_id),
             "imaxabs" => Some(self.types.long_id),
-            "strcspn" | "strspn" => Some(self.types.ulong_id),
+            "strcspn" | "strspn" | "fwrite" => Some(self.types.ulong_id),
             "strcpy" | "strncpy" | "stpcpy" | "stpncpy" | "strcat" | "strncat" | "strchr"
             | "strrchr" | "strstr" | "index" | "rindex" | "strpbrk" => {
                 let char_id = self.types.char_id;
@@ -2831,6 +2865,10 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_STRPBRK
                 | crate::kw::BUILTIN_PRINTF_UNLOCKED
                 | crate::kw::BUILTIN_FPRINTF_UNLOCKED
+                | crate::kw::BUILTIN_FPRINTF
+                | crate::kw::BUILTIN_FPUTS
+                | crate::kw::BUILTIN_FPUTC
+                | crate::kw::BUILTIN_FWRITE
                 | crate::kw::BUILTIN_FPUTS_UNLOCKED
         )
     }
@@ -2938,6 +2976,7 @@ impl Parser<'_> {
             ExprKind::Call {
                 func: Box::new(func_expr),
                 args: vec![arg],
+                binding: CalleeBinding::Library,
             },
             ret_type,
             pos,
@@ -3013,8 +3052,9 @@ impl Parser<'_> {
             // suite's builtins/ tests supply the library side themselves --
             // glibc has no `printf_unlocked`, so gcc's own link fails without
             // that. Only the three a real corpus uses are here.
-            "fprintf_unlocked" => (2, true),
-            "fputs_unlocked" => (2, false),
+            "fprintf_unlocked" | "fprintf" => (2, true),
+            "fputs_unlocked" | "fputs" | "fputc" => (2, false),
+            "fwrite" => (4, false),
             "sprintf" => (2, true),
             "snprintf" => (3, true),
             // An entry point this does not know is left as it was: variadic,

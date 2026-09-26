@@ -286,7 +286,7 @@ impl Linearizer<'_> {
         // A stack slot holding the expected value. AtomicCas takes its address
         // because both backends write the observed value back through it on
         // failure -- which is exactly the value the next iteration needs.
-        let exp_addr = self.alloc_local_temp(elem_typ);
+        let exp_addr = self.frame_temp_addr("__casexp", elem_typ);
 
         // Seed it with an atomic read of the object.
         let cur = self.emit_atomic_load(lv);

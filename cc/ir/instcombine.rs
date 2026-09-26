@@ -25,13 +25,15 @@
 //
 
 use super::constfold::{
-    at_width, cmp_operand_width, eval_binop, eval_fbinop, eval_fcmp, eval_fcvt, eval_fcvtf,
-    eval_funop, eval_unop, get_cmp_info, result_type_of, CMP_ALL,
+    at_width, cmp_operand_width, eval_binop, eval_fbinop, eval_fcvt, eval_fcvtf, eval_funop,
+    eval_unop, fcmp_mask, fcmp_outcome, get_cmp_info, mirror_mask, result_type_of, CMP_GT, CMP_LT,
+    CMP_UN, FCMP_ALL,
 };
-use super::facts::{CmpFacts, ConstMap};
+use super::facts::{CmpDomain, CmpFacts, ConstMap, Relation};
 use super::{ConstValue, Function, Instruction, Opcode, PseudoId};
 use crate::float::FloatVal;
 use crate::types::{TypeId, TypeTable};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
 // Constant Resolution
@@ -194,7 +196,9 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
         Opcode::Shl | Opcode::Lsr | Opcode::Asr => simplify_shift(insn, consts),
 
         // Bitwise (all handled by unified simplify_bitwise)
-        Opcode::And | Opcode::Or | Opcode::Xor => simplify_bitwise(insn, consts),
+        Opcode::And | Opcode::Or | Opcode::Xor => {
+            or_decided(simplify_bitwise(insn, consts), insn, consts, facts)
+        }
 
         // Comparisons (all handled by unified simplify_comparison)
         Opcode::SetEq
@@ -206,7 +210,12 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
         | Opcode::SetB
         | Opcode::SetBe
         | Opcode::SetA
-        | Opcode::SetAe => simplify_comparison(insn, consts, facts),
+        | Opcode::SetAe => or_decided(
+            simplify_comparison(insn, consts, facts),
+            insn,
+            consts,
+            facts,
+        ),
 
         // A short-circuit `&&`/`||` after if-conversion.
         Opcode::Select => simplify_select(insn, consts, facts),
@@ -599,17 +608,40 @@ fn simplify_comparison(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> 
     Simplification::None
 }
 
-/// `select(c, t, f)` where the arms make it a short-circuit `&&` or `||`.
+/// A 0-or-1 value decided by the comparisons it combines, whatever their
+/// operands are.
 ///
 /// If-conversion turns `a && b` into `select(a, b, 0)` and `a || b` into
-/// `select(a, 1, b)`. When both `a` and `b` compare the *same* operand pair,
-/// the answer needs nothing about the operands: `&&` is never true when their
-/// orderings are disjoint, and `||` is always true when together they cover
-/// less, equal and greater.
-///
-/// `(x == y) && (x != y)` is the first; `(x >= y) || (x < y)` the second. The
-/// operands may be written either way round -- `(x < y) && (y < x)` is also
-/// never true -- which `aligned_mask` handles by mirroring.
+/// `select(a, 1, b)`; `!a` is `a == 0`; and `__builtin_isunordered` is an
+/// `or` of two self-comparisons. When every comparison underneath compares
+/// the *same* operand pair, the answer needs nothing about the operands:
+/// `(x == y) && (x != y)` is never true, and `(x == y) || (x != y)` always
+/// is. The operands may be written either way round -- `(x < y) && (y < x)`
+/// is also never true. See `CmpFacts::relation` for the algebra, and for why
+/// a float `(x >= y) || (x < y)` is not decided.
+fn decided(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Option<Simplification> {
+    let target = insn.target?;
+    match facts.cmps.relation(consts, target, insn.size.max(1))? {
+        Relation::Known(v) => Some(fold_to_const(i128::from(v))),
+        Relation::Holds(_) => None,
+    }
+}
+
+/// `s`, or when that found nothing, whatever [`decided`] finds.
+fn or_decided(
+    s: Simplification,
+    insn: &Instruction,
+    consts: &ConstMap,
+    facts: &Facts,
+) -> Simplification {
+    match s {
+        Simplification::None => decided(insn, consts, facts).unwrap_or(Simplification::None),
+        s => s,
+    }
+}
+
+/// `select(c, t, f)`, which is also the shape of a short-circuit `&&`/`||`
+/// after if-conversion: see [`decided`].
 fn simplify_select(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
     if insn.src.len() != 3 {
         return Simplification::None;
@@ -626,31 +658,7 @@ fn simplify_select(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simp
         return Simplification::CopyFrom(t);
     }
 
-    let Some(c_fact) = facts.cmps.get_through(consts, cond, width) else {
-        return Simplification::None;
-    };
-
-    // `a && b`: false on the `a`-false edge.
-    if consts.get(f) == Some(0) {
-        if let Some(other) = facts.cmps.get_through(consts, t, width) {
-            if let Some(mask) = facts.cmps.aligned_mask(c_fact, other) {
-                if c_fact.mask & mask == 0 {
-                    return fold_to_zero();
-                }
-            }
-        }
-    }
-    // `a || b`: true on the `a`-true edge.
-    if consts.get(t) == Some(1) {
-        if let Some(other) = facts.cmps.get_through(consts, f, width) {
-            if let Some(mask) = facts.cmps.aligned_mask(c_fact, other) {
-                if c_fact.mask | mask == CMP_ALL {
-                    return fold_to_const(1);
-                }
-            }
-        }
-    }
-    Simplification::None
+    decided(insn, consts, facts).unwrap_or(Simplification::None)
 }
 
 // Unary Simplifications
@@ -679,38 +687,84 @@ fn simplify_convert(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
 // Floating-Point Simplification
 
-/// Fold a float comparison, either over two constants or over `fabs`.
+/// Fold a float comparison whose answer does not depend on what is unknown
+/// about its operands.
 ///
-/// The `fabs` half is gcc's `fabs(x) < 0.0` rule: no absolute value is ever
-/// less than zero, and a NaN argument does not spoil it, since an unordered
-/// `<` is false as well. Only the strict form folds -- `fabs(x) <= 0.0` is
-/// true for a zero argument, and `fabs(x) >= 0.0` is false for a NaN one.
+/// Decided from the set of outcomes -- less, equal, greater, unordered --
+/// the two operands can possibly have ([`possible_fcmp_outcomes`]): the
+/// comparison is 0 when none of them makes it true and 1 when all of them
+/// do. That one rule covers two constants, a NaN on either side (only
+/// *unordered* is possible, so every ordered predicate is 0 and `!=` is 1),
+/// an infinity (`x > +Inf` is 0; `x <= +Inf` is not 1, since `x` may be a
+/// NaN), a value compared with itself (`x < x` is 0; `x == x` is not 1), and
+/// gcc's `fabs(x) < 0.0`.
+///
+/// Folding a NaN comparison drops the `FE_INVALID` an ordered comparison
+/// with a NaN is specified to raise, as gcc does. Neither backend raises it
+/// in the first place: both emit the quiet compare (`ucomis*`, `fucomip`,
+/// aarch64 `fcmp`), which signals only for a signaling NaN.
 fn simplify_fcmp(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
     if insn.src.len() != 2 {
         return Simplification::None;
     }
+    let Some(mask) = fcmp_mask(insn.op) else {
+        return Simplification::None;
+    };
+    let possible = possible_fcmp_outcomes(insn, consts, facts);
+    if possible & mask == 0 {
+        fold_to_zero()
+    } else if possible & !mask & FCMP_ALL == 0 {
+        fold_to_const(1)
+    } else {
+        Simplification::None
+    }
+}
+
+/// Which outcomes comparing `insn`'s two float operands can have, from what
+/// is known of each: whether it is a constant (and which), whether the two
+/// are the same value, and whether one is never below zero.
+fn possible_fcmp_outcomes(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> u8 {
     let (lhs, rhs) = (insn.src[0], insn.src[1]);
     let width = insn.size.max(1);
-
-    // `x < 0.0` and its mirror `0.0 > x`, for an `x` that is never below zero.
-    let zero_at = |id: PseudoId| consts.fget(id, width).is_some_and(|v| v.is_zero());
+    if consts.root(lhs, width) == consts.root(rhs, width) {
+        return CmpDomain::Float.reflexive();
+    }
+    // A constant is compared as the value it has in the operands' format. A
+    // `FloatVal` carries a literal at 128 significand bits and rounds to the
+    // target once on the way out, so comparing unrounded makes
+    // `0.1 + 0.2 == 0.3` true, which in `double` it is not -- and makes
+    // `1e39f` finite, which in `float` it is not. Not knowing the format
+    // means not knowing the value.
+    let fmt = facts.fp_format(insn.typ);
+    let known = |id| Some(consts.fget(id, width)?.round_to_format(fmt?));
     let never_below = |id: PseudoId| facts.never_lt_zero.contains(&consts.root(id, width));
-    match insn.op {
-        Opcode::FCmpOLt if never_below(lhs) && zero_at(rhs) => return fold_to_zero(),
-        Opcode::FCmpOGt if zero_at(lhs) && never_below(rhs) => return fold_to_zero(),
-        _ => {}
+    match (known(lhs), known(rhs)) {
+        (Some(a), Some(b)) => fcmp_outcome(a.cmp_value(b)),
+        (None, Some(c)) => possible_against(c, never_below(lhs)),
+        (Some(c), None) => mirror_mask(possible_against(c, never_below(rhs))),
+        (None, None) => FCMP_ALL,
     }
+}
 
-    let (Some(a), Some(b)) = (consts.fget(lhs, width), consts.fget(rhs, width)) else {
-        return Simplification::None;
+/// The outcomes of `x` compared with the constant `c`, for an unknown `x`
+/// that may be told never to be below zero.
+///
+/// Nothing is greater than `+Inf`, nothing is less than `-Inf`, and nothing
+/// is ordered with a NaN -- including a NaN `x`, which is why an infinity
+/// still leaves *unordered* possible. A NaN `x` also leaves `never_below`
+/// true, since it is not less than zero either.
+fn possible_against(c: FloatVal, never_below: bool) -> u8 {
+    let inf = FloatVal::infinity(false);
+    let mut possible = match (c.cmp_value(inf), c.cmp_value(inf.negated())) {
+        (None, _) => return CMP_UN,
+        (Some(Ordering::Equal), _) => FCMP_ALL & !CMP_GT,
+        (_, Some(Ordering::Equal)) => FCMP_ALL & !CMP_LT,
+        _ => FCMP_ALL,
     };
-    let Some(fmt) = facts.fp_format(insn.typ) else {
-        return Simplification::None;
-    };
-    match eval_fcmp(insn.op, fmt, a, b) {
-        Some(v) => Simplification::FoldToConst(v),
-        None => Simplification::None,
+    if never_below && c.cmp_value(FloatVal::from_f64(0.0)) != Some(Ordering::Greater) {
+        possible &= !CMP_LT;
     }
+    possible
 }
 
 /// Fold float arithmetic over two constants.
@@ -2227,7 +2281,23 @@ mod tests {
     /// and the other arm the constant `other`. Returns the folded constant,
     /// or `None` when it did not fold.
     fn select_over_pair(cond_op: Opcode, arm_op: Opcode, other: i128) -> Option<i128> {
+        select_over_typed_pair(cond_op, arm_op, other, false)
+    }
+
+    /// [`select_over_pair`] with both comparisons typed `double` when
+    /// `float`, which is what a float comparison records as its operands.
+    fn select_over_typed_pair(
+        cond_op: Opcode,
+        arm_op: Opcode,
+        other: i128,
+        float: bool,
+    ) -> Option<i128> {
         let types = TypeTable::new(&Target::host());
+        let (typ, size) = if float {
+            (types.double_id, 64)
+        } else {
+            (types.int_id, 32)
+        };
         // `other == 0` is `a && b`, so the comparison is the *true* arm;
         // `other == 1` is `a || b`, so it is the false arm.
         let (t, f) = if other == 0 {
@@ -2237,22 +2307,8 @@ mod tests {
         };
         let mut func = make_test_func_with_insns(
             vec![
-                Instruction::binop(
-                    cond_op,
-                    PseudoId(2),
-                    PseudoId(0),
-                    PseudoId(1),
-                    types.int_id,
-                    32,
-                ),
-                Instruction::binop(
-                    arm_op,
-                    PseudoId(3),
-                    PseudoId(0),
-                    PseudoId(1),
-                    types.int_id,
-                    32,
-                ),
+                Instruction::binop(cond_op, PseudoId(2), PseudoId(0), PseudoId(1), typ, size),
+                Instruction::binop(arm_op, PseudoId(3), PseudoId(0), PseudoId(1), typ, size),
                 Instruction::select(PseudoId(5), PseudoId(2), t, f, types.int_id, 32),
             ],
             vec![
@@ -2432,6 +2488,361 @@ mod tests {
             run(&mut func, &host_types());
             assert_eq!(insn_at(&func, 1).op, op, "{op:?} must survive");
         }
+    }
+
+    /// One `FCmp` of the argument `x` against the constant `c`, written
+    /// `x op c` or, when `const_first`, `c op x`, at `double` or at `float`.
+    /// Returns the folded constant, or `None` when it did not fold.
+    fn fcmp_vs_const(op: Opcode, c: f64, const_first: bool, float: bool) -> Option<i128> {
+        let types = TypeTable::new(&Target::host());
+        let (typ, size) = if float {
+            (types.float_id, 32)
+        } else {
+            (types.double_id, 64)
+        };
+        let (l, r) = if const_first {
+            (PseudoId(1), PseudoId(0))
+        } else {
+            (PseudoId(0), PseudoId(1))
+        };
+        let mut func = make_test_func_with_insns(
+            vec![Instruction::binop(op, PseudoId(2), l, r, typ, size)],
+            vec![
+                Pseudo::arg(PseudoId(0), 0),
+                fval(1, c),
+                Pseudo::reg(PseudoId(2), 2),
+            ],
+        );
+        run(&mut func, &host_types());
+        let insn = insn_at(&func, 0);
+        if insn.op != Opcode::Copy {
+            return None;
+        }
+        func.const_val(insn.src[0])
+    }
+
+    const FCMPS: [Opcode; 6] = [
+        Opcode::FCmpOEq,
+        Opcode::FCmpONe,
+        Opcode::FCmpOLt,
+        Opcode::FCmpOLe,
+        Opcode::FCmpOGt,
+        Opcode::FCmpOGe,
+    ];
+
+    /// Nothing is ordered with a NaN, so a comparison against a NaN constant
+    /// is decided whatever the other side is: every ordered predicate is 0,
+    /// and `!=` -- the unordered one -- is 1.
+    #[test]
+    fn a_comparison_with_a_nan_constant_folds_whatever_the_other_side() {
+        for op in FCMPS {
+            let want = i128::from(op == Opcode::FCmpONe);
+            for const_first in [false, true] {
+                for float in [false, true] {
+                    assert_eq!(
+                        fcmp_vs_const(op, f64::NAN, const_first, float),
+                        Some(want),
+                        "{op:?} const_first={const_first} float={float}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Nothing is above `+Inf` or below `-Inf`, a NaN included. But a NaN
+    /// is not *at or below* `+Inf` either, so `x <= +Inf` must survive, and
+    /// so must every predicate that some ordinary `x` makes true and another
+    /// false.
+    #[test]
+    fn a_comparison_with_an_infinity_folds_only_the_impossible_side() {
+        let inf = f64::INFINITY;
+        // (op, constant, constant written first)
+        for (op, c, const_first) in [
+            (Opcode::FCmpOGt, inf, false),  // x > +Inf
+            (Opcode::FCmpOLt, inf, true),   // +Inf < x
+            (Opcode::FCmpOLt, -inf, false), // x < -Inf
+            (Opcode::FCmpOGt, -inf, true),  // -Inf > x
+        ] {
+            assert_eq!(
+                fcmp_vs_const(op, c, const_first, false),
+                Some(0),
+                "{op:?} {c} const_first={const_first}"
+            );
+        }
+        for (op, c, const_first) in [
+            (Opcode::FCmpOLe, inf, false), // false for a NaN, true otherwise
+            (Opcode::FCmpOGe, -inf, false),
+            (Opcode::FCmpOGe, inf, true),
+            (Opcode::FCmpOLt, inf, false),
+            (Opcode::FCmpOGe, inf, false), // x == +Inf
+            (Opcode::FCmpOEq, inf, false),
+            (Opcode::FCmpONe, inf, false),
+            (Opcode::FCmpOGt, 1.0, false),
+            (Opcode::FCmpOLt, f64::MAX, false),
+        ] {
+            assert_eq!(
+                fcmp_vs_const(op, c, const_first, false),
+                None,
+                "{op:?} {c} const_first={const_first} must survive"
+            );
+        }
+    }
+
+    /// The constant is compared at the operands' format: `1e39` is finite as
+    /// a `double` and `+Inf` as a `float`.
+    #[test]
+    fn an_infinity_is_recognized_after_rounding_to_the_format() {
+        assert_eq!(fcmp_vs_const(Opcode::FCmpOGt, 1e39, false, true), Some(0));
+        assert_eq!(fcmp_vs_const(Opcode::FCmpOGt, 1e39, false, false), None);
+    }
+
+    /// `x < x` is false for every `x`, NaN included; `x == x` is *not*
+    /// always true, and `x != x` is how `isnan` is spelled.
+    #[test]
+    fn a_float_compared_with_itself_folds_only_the_strict_forms() {
+        for op in FCMPS {
+            let types = TypeTable::new(&Target::host());
+            let mut func = make_test_func_with_insns(
+                vec![
+                    Instruction::new(Opcode::Copy)
+                        .with_target(PseudoId(1))
+                        .with_src(PseudoId(0))
+                        .with_type_and_size(types.double_id, 64),
+                    Instruction::binop(
+                        op,
+                        PseudoId(2),
+                        PseudoId(0),
+                        PseudoId(1),
+                        types.double_id,
+                        64,
+                    ),
+                ],
+                vec![
+                    Pseudo::arg(PseudoId(0), 0),
+                    Pseudo::reg(PseudoId(1), 1),
+                    Pseudo::reg(PseudoId(2), 2),
+                ],
+            );
+            run(&mut func, &host_types());
+            let insn = insn_at(&func, 1);
+            if matches!(op, Opcode::FCmpOLt | Opcode::FCmpOGt) {
+                assert_eq!(insn.op, Opcode::Copy, "{op:?}");
+                assert_eq!(func.const_val(insn.src[0]), Some(0), "{op:?}");
+            } else {
+                assert_eq!(insn.op, op, "{op:?} must survive");
+            }
+        }
+    }
+
+    /// `select(c, t, f)` as [`select_over_pair`] builds it, but over two
+    /// `double` arguments.
+    fn select_over_float_pair(cond_op: Opcode, arm_op: Opcode, other: i128) -> Option<i128> {
+        select_over_typed_pair(cond_op, arm_op, other, true)
+    }
+
+    /// The IEEE forms of the relational-pair folds: a float comparison has a
+    /// fourth outcome, *unordered*, so `(x >= y) || (x < y)` is false for a
+    /// NaN and must not fold, while `(x == y) || (x != y)` does -- `!=` is
+    /// the unordered form.
+    #[test]
+    fn float_relational_pairs_fold_only_when_a_nan_agrees() {
+        let pairs = [
+            (Opcode::FCmpOLt, Opcode::FCmpOGt, 0, Some(0)), // (x<y) && (x>y)
+            (Opcode::FCmpOEq, Opcode::FCmpONe, 0, Some(0)), // (x==y) && (x!=y)
+            (Opcode::FCmpOLe, Opcode::FCmpOGt, 0, Some(0)), // (x<=y) && (x>y)
+            (Opcode::FCmpOEq, Opcode::FCmpONe, 1, Some(1)), // (x==y) || (x!=y)
+            (Opcode::FCmpONe, Opcode::FCmpOEq, 1, Some(1)), // (x!=y) || (x==y)
+            (Opcode::FCmpOGe, Opcode::FCmpOLt, 1, None),    // NaN: neither
+            (Opcode::FCmpOLe, Opcode::FCmpOGt, 1, None),    // NaN: neither
+            (Opcode::FCmpOLe, Opcode::FCmpOGe, 0, None),    // x == y: both
+            (Opcode::FCmpONe, Opcode::FCmpOLt, 0, None),    // x < y: both
+        ];
+        for (c, a, other, want) in pairs {
+            assert_eq!(
+                select_over_float_pair(c, a, other),
+                want,
+                "{c:?} {a:?} other={other}"
+            );
+        }
+    }
+
+    /// An integer and a float comparison of one pair never combine: `x < y`
+    /// as integers and `x >= y` as floats cover everything only if they read
+    /// the same operands the same way, and they do not.
+    #[test]
+    fn integer_and_float_comparisons_are_not_combined() {
+        assert_eq!(
+            select_over_typed_pair(Opcode::SetLt, Opcode::FCmpOGe, 1, true),
+            None
+        );
+        assert_eq!(
+            select_over_typed_pair(Opcode::FCmpOLt, Opcode::SetGt, 0, true),
+            None
+        );
+    }
+
+    /// `%2 = x != x; %3 = y != y; %4 = or %2, %3` -- the shape
+    /// `__builtin_isunordered(x, y)` lowers to, for arguments `%0` and `%1`.
+    /// Pseudos `%2`..`%4` are used.
+    fn isunordered(first: u32, second: u32, types: &TypeTable) -> Vec<Instruction> {
+        let dbl = types.double_id;
+        vec![
+            Instruction::binop(
+                Opcode::FCmpONe,
+                PseudoId(2),
+                PseudoId(first),
+                PseudoId(first),
+                dbl,
+                64,
+            ),
+            Instruction::binop(
+                Opcode::FCmpONe,
+                PseudoId(3),
+                PseudoId(second),
+                PseudoId(second),
+                dbl,
+                64,
+            ),
+            Instruction::binop(
+                Opcode::Or,
+                PseudoId(4),
+                PseudoId(2),
+                PseudoId(3),
+                types.int_id,
+                32,
+            ),
+        ]
+    }
+
+    /// Run `tail` after `isunordered(%0, %1)`; `%10` is the constant 0 and
+    /// `%11` the constant 1, and the last instruction is the one inspected.
+    /// Returns what it folded to, or `None`.
+    fn after_isunordered(order: (u32, u32), tail: Vec<Instruction>) -> Option<i128> {
+        let types = TypeTable::new(&Target::host());
+        let mut insns = isunordered(order.0, order.1, &types);
+        insns.extend(tail);
+        let last = insns.len() - 1;
+        let mut pseudos = vec![Pseudo::arg(PseudoId(0), 0), Pseudo::arg(PseudoId(1), 1)];
+        pseudos.extend((2..10).map(|i| Pseudo::reg(PseudoId(i), i)));
+        pseudos.push(Pseudo::val(PseudoId(10), 0));
+        pseudos.push(Pseudo::val(PseudoId(11), 1));
+        let mut func = make_test_func_with_insns(insns, pseudos);
+        run(&mut func, &host_types());
+        let insn = insn_at(&func, last);
+        if insn.op != Opcode::Copy {
+            return None;
+        }
+        func.const_val(insn.src[0])
+    }
+
+    fn fcmp(op: Opcode, target: u32, l: u32, r: u32) -> Instruction {
+        let types = TypeTable::new(&Target::host());
+        Instruction::binop(
+            op,
+            PseudoId(target),
+            PseudoId(l),
+            PseudoId(r),
+            types.double_id,
+            64,
+        )
+    }
+
+    fn select(target: u32, c: u32, t: u32, f: u32) -> Instruction {
+        let types = TypeTable::new(&Target::host());
+        Instruction::select(
+            PseudoId(target),
+            PseudoId(c),
+            PseudoId(t),
+            PseudoId(f),
+            types.int_id,
+            32,
+        )
+    }
+
+    /// `isunordered(x, y) || x >= y || x < y` covers all four outcomes, and
+    /// so does it with the operands of `isunordered` swapped and the
+    /// relationals mirrored. Dropping any one of the three leaves a gap.
+    #[test]
+    fn isunordered_with_the_ordered_outcomes_is_always_true() {
+        for order in [(0, 1), (1, 0)] {
+            // isunordered || x >= y || y < x: less is missing.
+            let gap = vec![
+                fcmp(Opcode::FCmpOGe, 5, 0, 1),
+                select(6, 4, 11, 5),
+                fcmp(Opcode::FCmpOLt, 7, 1, 0),
+                select(8, 6, 11, 7),
+            ];
+            assert_eq!(after_isunordered(order, gap), None, "{order:?}");
+            // isunordered(y, x) || x <= y || y < x: compare-fp-3's test6.
+            let mirrored = vec![
+                fcmp(Opcode::FCmpOLe, 5, 0, 1),
+                select(6, 4, 11, 5),
+                fcmp(Opcode::FCmpOLt, 7, 1, 0),
+                select(8, 6, 11, 7),
+            ];
+            assert_eq!(after_isunordered(order, mirrored), Some(1), "{order:?}");
+            let full = vec![
+                fcmp(Opcode::FCmpOGe, 5, 0, 1),
+                select(6, 4, 11, 5),
+                fcmp(Opcode::FCmpOLt, 7, 0, 1),
+                select(8, 6, 11, 7),
+            ];
+            assert_eq!(after_isunordered(order, full), Some(1), "{order:?}");
+            let no_unordered = vec![
+                fcmp(Opcode::FCmpOGe, 5, 0, 1),
+                fcmp(Opcode::FCmpOLt, 6, 0, 1),
+                select(7, 5, 11, 6),
+            ];
+            assert_eq!(after_isunordered(order, no_unordered), None, "{order:?}");
+        }
+    }
+
+    /// `isunordered(x, y) || !isunordered(x, y)`, with `!` lowered to
+    /// `== 0` and the second call a separate pair of comparisons.
+    #[test]
+    fn isunordered_or_its_negation_is_always_true() {
+        let tail = vec![
+            fcmp(Opcode::FCmpONe, 5, 1, 1),
+            fcmp(Opcode::FCmpONe, 6, 0, 0),
+            Instruction::binop(
+                Opcode::Or,
+                PseudoId(7),
+                PseudoId(5),
+                PseudoId(6),
+                host_types().int_id,
+                32,
+            ),
+            Instruction::binop(
+                Opcode::SetEq,
+                PseudoId(8),
+                PseudoId(7),
+                PseudoId(10),
+                host_types().int_id,
+                32,
+            ),
+            select(9, 4, 11, 8),
+        ];
+        assert_eq!(after_isunordered((0, 1), tail), Some(1));
+        // `isunordered(x, y) && x == y` is never true.
+        let tail = vec![fcmp(Opcode::FCmpOEq, 5, 1, 0), select(6, 4, 5, 10)];
+        assert_eq!(after_isunordered((0, 1), tail), Some(0));
+        // `isunordered(x, y) || x == y` is not decided.
+        let tail = vec![fcmp(Opcode::FCmpOEq, 5, 0, 1), select(6, 4, 11, 5)];
+        assert_eq!(after_isunordered((0, 1), tail), None);
+    }
+
+    /// One NaN test is not the pair's: `x != x || x < y` is not
+    /// `isunordered(x, y) || x < y`, since `y` alone may be the NaN.
+    #[test]
+    fn one_self_test_is_not_an_unordered_pair() {
+        let tail = vec![
+            fcmp(Opcode::FCmpONe, 5, 0, 0),
+            fcmp(Opcode::FCmpOGe, 6, 0, 1),
+            select(7, 5, 11, 6),
+            fcmp(Opcode::FCmpOLt, 8, 0, 1),
+            select(9, 7, 11, 8),
+        ];
+        assert_eq!(after_isunordered((0, 1), tail), None);
     }
 
     /// One `FCvtS`/`FCvtU` of a float constant, folded.

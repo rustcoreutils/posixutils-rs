@@ -1104,6 +1104,7 @@ impl RegAlloc {
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         // Identify long double pseudos (use x87 not XMM)
         self.identify_ld_pseudos(func, types);
+        self.identify_x87_asm_operands(func);
         self.identify_quad_pseudos(func, types);
         // Identify 128-bit integer pseudos (always spill to 16-byte stack slots)
         self.identify_int128_pseudos(func, types);
@@ -1199,6 +1200,33 @@ impl RegAlloc {
                     for &src in &insn.src {
                         self.ld_pseudos.insert(src);
                     }
+                }
+            }
+        }
+    }
+
+    /// Give every x87-class inline-asm operand a floating-point home.
+    ///
+    /// Nothing else types an asm output: a bare `"=t"(r)` pseudo is defined
+    /// only by the asm, so it looked like an integer and got a general
+    /// register -- and a `long double` one then had no memory for `fstpt` to
+    /// store into. A tied input is classed by the output it names.
+    fn identify_x87_asm_operands(&mut self, func: &Function) {
+        for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+            let Some(asm) = insn.asm_data.as_ref().filter(|_| insn.op == Opcode::Asm) else {
+                continue;
+            };
+            for c in asm.outputs.iter().chain(&asm.inputs) {
+                let constraint = match c.matching_output {
+                    Some(i) if i < asm.outputs.len() => &asm.outputs[i].constraint,
+                    _ => &c.constraint,
+                };
+                if c.is_memory() || !super::inline_asm::is_x87_constraint(constraint) {
+                    continue;
+                }
+                self.fp_pseudos.insert(c.pseudo);
+                if c.size > 64 {
+                    self.ld_pseudos.insert(c.pseudo);
                 }
             }
         }
@@ -2650,6 +2678,43 @@ mod tests {
         let (clobbers, _) =
             get_constraint_info(&pinned, crate::target::TlsAccess::ElfStatic).unwrap();
         assert!(clobbers.contains(&Reg::Rcx));
+    }
+
+    /// An x87 asm operand is floating point, and a `long double` one is a
+    /// long double, whatever else defines it -- so a bare `"=t"` output gets a
+    /// floating-point home, never a general register. A tied input takes its
+    /// output's class; a general-register operand is left alone.
+    #[test]
+    fn x87_asm_operands_get_a_floating_point_home() {
+        use crate::ir::{BasicBlock, BasicBlockId, Function};
+        let mut asm = make_asm_insn(
+            &[],
+            &[
+                ("=t", PseudoId(1)),
+                ("=r", PseudoId(2)),
+                ("u", PseudoId(3)),
+                ("0", PseudoId(4)),
+            ],
+        );
+        let data = asm.asm_data.as_mut().unwrap();
+        data.inputs[1].matching_output = Some(0);
+        let mut ld = make_asm_insn(&[], &[("=f", PseudoId(5))]);
+        ld.asm_data.as_mut().unwrap().outputs[0].size = 128;
+
+        let types = crate::types::TypeTable::new(&crate::target::Target::host());
+        let mut func = Function::new("f", types.void_id);
+        let mut block = BasicBlock::new(BasicBlockId(0));
+        block.insns = vec![asm, ld];
+        func.blocks.push(block);
+
+        let mut ra = RegAlloc::new();
+        ra.identify_x87_asm_operands(&func);
+        for p in [1, 3, 4, 5] {
+            assert!(ra.fp_pseudos.contains(&PseudoId(p)), "%{p} is x87");
+        }
+        assert!(!ra.fp_pseudos.contains(&PseudoId(2)));
+        assert!(ra.ld_pseudos.contains(&PseudoId(5)));
+        assert!(!ra.ld_pseudos.contains(&PseudoId(1)));
     }
 }
 

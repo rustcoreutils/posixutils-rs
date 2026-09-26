@@ -51,19 +51,41 @@ struct AsmOperandBuild {
     /// output's register rather than taking a second one.
     pseudo_to_xmm: std::collections::HashMap<PseudoId, XmmReg>,
     /// x87 operands live on the FP stack rather than in a register, so they
-    /// are not given one: each is pushed with `fldt` before the template and
-    /// the result popped back with `fstpt` after, and the template names them
-    /// `%st` and `%st(1)`.
+    /// are not given one: each is pushed before the template and the result
+    /// popped back after, and the template names them `%st` and `%st(1)`.
     ///
-    /// `t` is st(0) and `u` is st(1), so `u` has to be pushed first for `t` to
-    /// end up on top.  Collected in operand order and reversed at emit time.
-    x87_pushes: Vec<(PseudoId, u32)>,
+    /// `t` is st(0) and `u` is st(1), so the deepest is pushed first for `t`
+    /// to end up on top. Collected in operand order -- where a tied input
+    /// comes after the inputs it sits above -- and ordered at emit time.
+    x87_pushes: Vec<X87Operand>,
     /// Set only when there is an output to write back to, so a template that
     /// consumes its operand (`fistpl` on a `"t"` input) leaves nothing to
-    /// store.  A pure `"=t"` output is not pushed -- the template supplies the
-    /// value, as `fldz` does.
-    x87_store: Option<(PseudoId, u32)>,
+    /// store. A pure `"=t"` output is not pushed -- the template supplies the
+    /// value, as `fldz` does; a tied input (`"+t"`, or a `"0"` naming it) is.
+    /// Carries the output's index, which a tied input names.
+    x87_store: Option<(usize, X87Operand)>,
     x87_slots: usize,
+}
+
+/// One operand on the x87 register stack.
+#[derive(Clone, Copy)]
+struct X87Operand {
+    /// Depth on the stack while the template runs: 0 is `%st`.
+    depth: usize,
+    pseudo: PseudoId,
+    /// Operand width in bits: 32 and 64 are `float` and `double`, anything
+    /// wider an x87 `long double`.
+    size: u32,
+}
+
+/// Whether an asm constraint names the x87 register stack: `f` any of it,
+/// `t` its top and `u` the register below. On x86 these are not SSE classes.
+///
+/// The register allocator asks the same question, so that an x87 operand
+/// gets a floating-point home -- and a `long double` one a stack slot, the
+/// only place an 80-bit value can live -- rather than a general register.
+pub(super) fn is_x87_constraint(constraint: &str) -> bool {
+    constraint.chars().any(|c| matches!(c, 'f' | 't' | 'u'))
 }
 
 impl AsmOperandBuild {
@@ -178,7 +200,6 @@ impl X86_64CodeGen {
             used_regs,
             sse_scratch,
             sse_output_moves,
-            x87_pushes,
             x87_store,
             x87_slots,
             pseudo_to_xmm,
@@ -230,18 +251,15 @@ impl X86_64CodeGen {
                     }
                     // An x87-class output. Written back off the FP stack once
                     // the template has run; a read-write `"+t"` is also pushed
-                    // before it, while a pure `"=t"` takes its value from the
-                    // template.
-                    _ if Self::constraint_requires_x87(&output.constraint) => {
-                        let name = Self::x87_slot_name(*x87_slots);
-                        *x87_slots += 1;
-                        // The result is written back through the operand's
-                        // own stack slot. A pseudo the allocator gave no slot
-                        // -- which is what a bare `"=t"` local gets, since
-                        // nothing else in the function forces one -- is
-                        // refused rather than guessed at: addressing it
-                        // through an uninitialised register is how this
-                        // segfaulted while being developed.
+                    // before it, by its tied input, while a pure `"=t"` takes
+                    // its value from the template.
+                    _ if is_x87_constraint(&output.constraint) => {
+                        let depth = Self::x87_depth(&output.constraint, x87_slots);
+                        let operand = X87Operand {
+                            depth,
+                            pseudo: output.pseudo,
+                            size: op_size,
+                        };
                         if x87_store.is_some() {
                             // `x87_store` holds one operand. A second output
                             // would overwrite it and the first result would be
@@ -252,19 +270,16 @@ impl X86_64CodeGen {
                                 "only one x87 asm output is supported in one asm \
                                  statement",
                             );
-                        } else if matches!(loc, Loc::Stack(_)) {
-                            if output.constraint.contains('+') {
-                                x87_pushes.push((output.pseudo, op_size));
-                            }
-                            *x87_store = Some((output.pseudo, op_size));
+                        } else if Self::x87_output_home(&loc, op_size) {
+                            *x87_store = Some((idx, operand));
                         } else {
                             crate::diag::error(
                                 insn.pos.unwrap_or_default(),
-                                "an x87 asm output must be an object with storage; \
-                                 c17 cannot give a write-only x87 operand a home",
+                                "an x87 asm output cannot be written back to this \
+                                 location",
                             );
                         }
-                        slots.push(mk(None, Some(name)));
+                        slots.push(mk(None, Some(Self::x87_slot_name(depth))));
                     }
                     _ if Self::constraint_requires_sse(&output.constraint) => {
                         match sse_scratch.pop() {
@@ -355,6 +370,7 @@ impl X86_64CodeGen {
             sse_scratch,
             sse_input_moves,
             x87_pushes,
+            x87_store,
             x87_slots,
             pseudo_to_xmm,
             ..
@@ -401,6 +417,15 @@ impl X86_64CodeGen {
                         // and the initial value never reached the scratch:
                         // `addsd %xmm15, %xmm15` ran on whatever was there.
                         sse_input_moves.push((xmm, asm_data.outputs[match_idx].pseudo, op_size));
+                    } else if let Some((_, out)) = x87_store.filter(|(i, _)| *i == match_idx) {
+                        // An x87 output's initial value, pushed to the
+                        // output's own depth. Nothing pushed it before, so
+                        // `"=t"(r) : "0"(x)` ran the template on whatever the
+                        // FP stack held.
+                        x87_pushes.push(X87Operand {
+                            pseudo: input.pseudo,
+                            ..out
+                        });
                     }
                     if input.is_hidden_readwrite_input() {
                         hidden.push(match_idx);
@@ -448,16 +473,20 @@ impl X86_64CodeGen {
                         // and the template ran on whatever happened to be on the
                         // stack -- `__asm__("fmulp" : "+t"(a) : "u"(b))` answered
                         // -nan.
-                        _ if Self::constraint_requires_x87(constraint_for_reg) => {
-                            let name = Self::x87_slot_name(*x87_slots);
-                            *x87_slots += 1;
-                            if Self::x87_addressable(&loc) {
-                                x87_pushes.push((input.pseudo, input.size));
+                        _ if is_x87_constraint(constraint_for_reg) => {
+                            let depth = Self::x87_depth(constraint_for_reg, x87_slots);
+                            let name = Self::x87_slot_name(depth);
+                            if Self::x87_input_home(&loc, input.size) {
+                                x87_pushes.push(X87Operand {
+                                    depth,
+                                    pseudo: input.pseudo,
+                                    size: input.size,
+                                });
                             } else {
                                 crate::diag::error(
                                     insn.pos.unwrap_or_default(),
-                                    "an x87 asm operand must live somewhere addressable; \
-                                     c17 cannot spill one here",
+                                    "a long double x87 asm operand must live somewhere \
+                                     addressable; c17 cannot spill one here",
                                 );
                             }
                             slots.push(mk(None, Some(name)));
@@ -583,7 +612,17 @@ impl X86_64CodeGen {
             x87_pushes,
             ..
         } = build;
-        let x87_pushes = std::mem::take(x87_pushes);
+        let mut x87_pushes = std::mem::take(x87_pushes);
+        // Push the x87 operands, deepest first so that `t` ends on top of the
+        // stack where `%st` names it and `u` at `%st(1)`. Before anything
+        // else: a float or double is staged through the reserved XMM scratch,
+        // which the SSE operands below are about to be given, and may borrow
+        // a scratch general register the remapped operands are about to take.
+        x87_pushes.sort_by_key(|op| std::cmp::Reverse(op.depth));
+        for op in x87_pushes {
+            self.emit_x87_asm_push(op.pseudo, op.size);
+        }
+
         // Emit remap setup moves (for inputs that conflicted with reserved regs)
         for (_orig, temp, actual_loc, size) in remap_setup.iter() {
             self.emit_raw_mov_from_loc(actual_loc, *temp, *size);
@@ -598,20 +637,6 @@ impl X86_64CodeGen {
 
         for (specific_reg, actual_loc, size) in input_moves.iter() {
             self.emit_raw_mov_from_loc(actual_loc, *specific_reg, *size);
-        }
-
-        // Push the x87 operands. Reversed, so that the first declared ends on
-        // top of the stack where `%st` names it and the second at `%st(1)`.
-        for (pseudo, size) in x87_pushes.into_iter().rev() {
-            let addr = self.get_x87_mem_addr(pseudo).format(&self.base.target);
-            let mnemonic = match size {
-                32 => "flds",
-                64 => "fldl",
-                _ => "fldt",
-            };
-            self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                "{mnemonic} {addr}"
-            ))));
         }
     }
 
@@ -660,21 +685,6 @@ impl X86_64CodeGen {
             x87_store,
             ..
         } = build;
-        // Pop the x87 result back into the operand's own storage. Only an
-        // output has somewhere to go; a template that consumed its input --
-        // `fistpl` on a `"t"` operand -- leaves nothing here.
-        if let Some((pseudo, size)) = x87_store {
-            let addr = self.get_x87_mem_addr(*pseudo).format(&self.base.target);
-            let mnemonic = match size {
-                32 => "fstps",
-                64 => "fstpl",
-                _ => "fstpt",
-            };
-            self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                "{mnemonic} {addr}"
-            ))));
-        }
-
         // Copy SSE outputs out of the scratch register into where the
         // operand actually lives. `emit_raw_mov_to_loc` below cannot do this
         // -- its source is a general register.
@@ -690,6 +700,14 @@ impl X86_64CodeGen {
             }
             let fp_size = FpSize::from_bits(*size, &self.base.target);
             self.emit_fp_move_from_xmm(*xmm, actual_loc, fp_size);
+        }
+
+        // Pop the x87 result back into the operand's home. Only an output has
+        // somewhere to go; a template that consumed its input -- `fistpl` on a
+        // `"t"` operand -- leaves nothing here. After the SSE outputs, whose
+        // scratch a float or double result is staged through.
+        if let Some((_, op)) = x87_store {
+            self.emit_x87_asm_pop(op.pseudo, op.size);
         }
 
         // These run only on the fall-through: a jump to an `asm goto` label
@@ -1061,34 +1079,59 @@ impl X86_64CodeGen {
         constraint.chars().any(|c| matches!(c, 'x' | 'v' | 'Y'))
     }
 
-    /// Whether `get_x87_mem_addr` can address this location soundly.
+    /// Whether an x87 input at `loc` can be pushed; see `emit_x87_asm_push`.
     ///
-    /// It has no arm for `Loc::Xmm` and falls back to `[rbp+0]` -- the saved
-    /// frame pointer -- so an x87 constraint on a value sitting in an XMM
-    /// register, which is where a `double` lives, silently read garbage.
-    /// Refusing is not gcc's answer, which spills it, but it is the honest one
-    /// until c17 can spill here.
-    fn x87_addressable(loc: &Loc) -> bool {
-        matches!(
-            loc,
-            Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Global(_) | Loc::Reg(_) | Loc::FImm(..)
-        )
+    /// A `float` or `double` is staged through the x87 scratch from wherever
+    /// it is. A `long double` is loaded from memory by `get_x87_mem_addr`,
+    /// which has no arm for `Loc::Xmm` and falls back to `[rbp+0]` -- the
+    /// saved frame pointer -- so anything it cannot address is refused.
+    fn x87_input_home(loc: &Loc, size: u32) -> bool {
+        size <= 64
+            || matches!(
+                loc,
+                Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Global(_) | Loc::Reg(_) | Loc::FImm(..)
+            )
     }
 
-    /// How the template names the `n`th x87 operand.
+    /// Whether an x87 output at `loc` can be popped into; see
+    /// `emit_x87_asm_pop`.
     ///
-    /// `t` is the top of the stack and `u` the one below it, and operands are
-    /// pushed so that the first declared ends on top.
+    /// A `long double` needs memory of its own, which the allocator gives
+    /// every x87 operand of that type. A `float` or `double` is staged through
+    /// the x87 scratch into a register or its slot -- where the allocator puts
+    /// one, and at -O1 and above that is usually an XMM register.
+    fn x87_output_home(loc: &Loc, size: u32) -> bool {
+        if size > 64 {
+            matches!(loc, Loc::Stack(_) | Loc::IncomingArg(_))
+        } else {
+            matches!(loc, Loc::Stack(_) | Loc::Xmm(_) | Loc::Reg(_))
+        }
+    }
+
+    /// The stack depth an x87 operand occupies while the template runs,
+    /// taking the next operand number from `count`.
+    ///
+    /// `t` is the top of the stack and `u` the one below it, whatever order
+    /// the operands are written in; `f` takes its operand number.
+    fn x87_depth(constraint: &str, count: &mut usize) -> usize {
+        let n = *count;
+        *count += 1;
+        if constraint.contains('t') {
+            0
+        } else if constraint.contains('u') {
+            1
+        } else {
+            n
+        }
+    }
+
+    /// How the template names the x87 operand at stack depth `n`.
     fn x87_slot_name(n: usize) -> String {
         if n == 0 {
             "%st".to_string()
         } else {
             format!("%st({n})")
         }
-    }
-
-    fn constraint_requires_x87(constraint: &str) -> bool {
-        constraint.chars().any(|c| matches!(c, 'f' | 't' | 'u'))
     }
 
     /// Whether the constraint offers an immediate alternative.

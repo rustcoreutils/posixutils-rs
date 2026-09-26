@@ -1071,6 +1071,40 @@ impl TypeTable {
         self.get(id).base
     }
 
+    /// The type `id` denotes, without the [`Type::DECL_SPECIFIERS`] of the
+    /// declaration it was read from.
+    ///
+    /// The parser records a declaration's storage class on its base type and
+    /// copies it onto the declarator's derived type, so `static int *p` is a
+    /// `static` pointer to a `static int`, and the bits sit at every level a
+    /// later derivation can reach: an element (`a[i]`), a pointee (`*p`), a
+    /// return type. Anything that takes the type of an existing declaration
+    /// -- `typeof`, a redeclaration check -- must come through here, or it
+    /// inherits the other declaration's storage class along with its type.
+    pub fn without_decl_specifiers(&mut self, id: TypeId) -> TypeId {
+        let t = self.get(id);
+        let base = t.base;
+        let params = t.params.clone();
+        let new_base = base.map(|b| self.without_decl_specifiers(b));
+        let new_params = params.as_ref().map(|ps| {
+            ps.iter()
+                .map(|&p| self.without_decl_specifiers(p))
+                .collect::<Vec<_>>()
+        });
+        let t = self.get(id);
+        if !t.modifiers.intersects(Type::DECL_SPECIFIERS)
+            && new_base == base
+            && new_params == params
+        {
+            return id;
+        }
+        let mut stripped = t.clone();
+        stripped.modifiers.remove(Type::DECL_SPECIFIERS);
+        stripped.base = new_base;
+        stripped.params = new_params;
+        self.intern(stripped)
+    }
+
     /// Look up an existing pointer type to the given base type
     /// Returns void_ptr_id if not found (since all pointers are same size)
     pub fn pointer_to(&self, base: TypeId) -> TypeId {
@@ -1979,37 +2013,36 @@ impl TypeTable {
         }
     }
 
-    /// The largest object c17 can describe, in bytes.
+    /// The largest object c17 can describe, in bytes: `PTRDIFF_MAX`.
     ///
-    /// Two bounds apply and this is the tighter of them, which is the one a
-    /// diagnostic should name:
+    /// An object is addressed by pointer arithmetic, and C17 6.5.6p9 makes the
+    /// difference of two pointers into one object a `ptrdiff_t`, so an object
+    /// larger than that cannot be indexed from end to end. It is gcc's bound
+    /// too, and gcc accepts an object of exactly this size. `ptrdiff_t` is
+    /// `long` on every target (`__PTRDIFF_TYPE__` in `arch/mod.rs`, and the
+    /// type `p - q` is given), so the bound is read from that type's width
+    /// rather than written down.
     ///
-    /// - **C's own**, `i64::MAX`: an object is addressed by pointer
-    ///   arithmetic, and C17 6.5.6p9 makes the difference of two pointers into
-    ///   one object a `ptrdiff_t`, so an object larger than that cannot be
-    ///   indexed from end to end whatever else is true of it.
-    /// - **c17's**, `u64::MAX / 8`, which is a quarter of it and therefore the
-    ///   operative one: struct layout accumulates in *bits*, because a
-    ///   bit-field's position is only expressible there, so a member list
-    ///   whose total passes `u64::MAX` bits has no layout to compute. The
-    ///   accumulation saturates into this rather than wrapping past it.
+    /// Nothing inside the compiler is tighter. Struct layout runs in bits,
+    /// because a bit-field's position is only expressible there, and it
+    /// accumulates them in a `u128`, which no member list whose members are
+    /// each describable can overflow; an array is sized in bytes directly.
     ///
-    /// The tighter bound is applied to arrays as well as aggregates, although
-    /// an array alone is sized in bytes and could go further, so that one
-    /// number appears in one message.
-    ///
-    /// It used to be `u32::MAX / 8` -- 512 MB, two thousand times smaller, and
-    /// nothing to do with C: it was the largest object whose size in *bits*
-    /// fitted the `u32` that [`Self::size_bits`] answers in. Object sizes are
-    /// counted in bytes now, by [`Self::size_bytes`], and that ceiling went
-    /// with the unit.
-    pub const MAX_OBJECT_BYTES: usize = (u64::MAX / 8) as usize;
+    /// It used to be `u64::MAX / 8`, a quarter of this, because layout
+    /// accumulated its bits in a `usize`; and before that `u32::MAX / 8` --
+    /// 512 MB, the largest object whose size in *bits* fitted the `u32` that
+    /// [`Self::size_bits`] answers in. Object sizes are counted in bytes, by
+    /// [`Self::size_bytes`].
+    pub fn max_object_bytes(&self) -> usize {
+        let width = self.size_bits(self.long_id);
+        usize::try_from((1u128 << (width - 1)) - 1).unwrap_or(usize::MAX)
+    }
 
     /// The largest object the backend can give a *stack* slot.
     ///
     /// Two bounds again, and this time the operative one is not C's:
     ///
-    /// - **The object's own**, [`Self::MAX_OBJECT_BYTES`]: what a size can be
+    /// - **The object's own**, [`Self::max_object_bytes`]: what a size can be
     ///   described as at all, and what `sizeof` answers.
     /// - **The frame's**, `i32::MAX` less [`Self::FRAME_HEADROOM_BYTES`] and
     ///   rounded down to an eightbyte, and therefore the operative one here:
@@ -2027,7 +2060,7 @@ impl TypeTable {
     ///
     /// It does **not** apply to an object with static storage duration, which
     /// is addressed symbolically and works at any size
-    /// [`Self::MAX_OBJECT_BYTES`] allows: `char g[3000000000];` emits
+    /// [`Self::max_object_bytes`] allows: `char g[3000000000];` emits
     /// `.zero 3000000000` on both targets.
     ///
     /// Until this existed every size conversion in `arch/` and `abi/` was a
@@ -2368,15 +2401,22 @@ impl TypeTable {
         members: &mut [StructMember],
         pack_cap: Option<u32>,
     ) -> (usize, usize) {
-        let mut bit_offset = 0usize;
+        // In bits, and in a `u128`: every member is at most `usize::MAX`
+        // bytes, and no member list that fits in memory can overflow it, so
+        // the layout of any member list is exact. A byte count derived from
+        // it goes through `bytes_of`, which saturates -- the caller measures
+        // the size against `max_object_bytes`, and a saturated size fails
+        // that where a wrapped one would have come out small.
+        let mut bit_offset = 0u128;
+        let bytes_of = |bits: u128| usize::try_from(bits / 8).unwrap_or(usize::MAX);
         let mut max_align = 1usize;
         // Alignment demanded by a zero-width bitfield, on the ABIs where one
         // demands any. Kept separate because `pack_cap` does not cap it.
         let mut zero_width_align = 1usize;
-        // The furthest byte any access window reaches. Ordinary members never
+        // The furthest bit any access window reaches. Ordinary members never
         // reach past the running offset, but a window is a power-of-two span
         // that can, and the struct has to be large enough to hold it.
-        let mut window_end = 0usize;
+        let mut window_end = 0u128;
 
         for member in members.iter_mut() {
             let Some(bit_width) = member.bit_width else {
@@ -2393,22 +2433,17 @@ impl TypeTable {
                     .unwrap_or(natural_align);
                 max_align = max_align.max(align);
 
-                bit_offset = bit_offset.next_multiple_of(align * 8);
-                member.offset = bit_offset / 8;
+                bit_offset = bit_offset.next_multiple_of(align as u128 * 8);
+                member.offset = bytes_of(bit_offset);
                 member.bit_offset = None;
                 member.access_bytes = None;
 
-                // Saturating: the layout runs in bits, so a member list whose
-                // total passes `u64::MAX` bits has no layout. Wrapping made
-                // two 5-exabyte members come out *small*, and the size check
-                // that follows then had nothing to object to.
-                bit_offset =
-                    bit_offset.saturating_add(self.size_bytes(member.typ).saturating_mul(8));
+                bit_offset += self.size_bytes(member.typ) as u128 * 8;
                 continue;
             };
 
             let unit_bytes = self.size_bytes(member.typ);
-            let unit_bits = unit_bytes * 8;
+            let unit_bits = unit_bytes as u128 * 8;
 
             if bit_width == 0 {
                 // C17 6.7.2.1p12: a zero-width bitfield forces the *next*
@@ -2428,7 +2463,7 @@ impl TypeTable {
                     zero_width_align = zero_width_align.max(self.alignment(member.typ));
                 }
                 bit_offset = bit_offset.next_multiple_of(unit_bits);
-                member.offset = bit_offset / 8;
+                member.offset = bytes_of(bit_offset);
                 member.bit_offset = None;
                 member.access_bytes = None;
                 continue;
@@ -2436,7 +2471,7 @@ impl TypeTable {
 
             max_align = max_align.max(self.alignment(member.typ));
 
-            let bit_width = bit_width as usize;
+            let bit_width = u128::from(bit_width);
             if pack_cap.is_some() {
                 // Under a pack cap the unit rule is switched off entirely --
                 // not narrowed to the cap. `#pragma pack(2)` lets a 16-bit
@@ -2446,9 +2481,8 @@ impl TypeTable {
                 // free bit, and its access span is exactly the bytes its own
                 // bits touch: never wider than the object, so `window_end`
                 // takes no contribution here.
-                let byte = bit_offset / 8;
-                let within = bit_offset - byte * 8;
-                member.offset = byte;
+                let within = bit_offset % 8;
+                member.offset = bytes_of(bit_offset);
                 member.bit_offset = Some(within as u32);
                 member.access_bytes = Some((within + bit_width).div_ceil(8) as u32);
             } else {
@@ -2463,11 +2497,11 @@ impl TypeTable {
                 if bit_offset % unit_bits + bit_width > unit_bits {
                     bit_offset = bit_offset.next_multiple_of(unit_bits);
                 }
-                let offset = bit_offset / unit_bits * unit_bytes;
-                member.offset = offset;
-                member.bit_offset = Some((bit_offset - offset * 8) as u32);
+                let offset_bits = bit_offset / unit_bits * unit_bits;
+                member.offset = bytes_of(offset_bits);
+                member.bit_offset = Some((bit_offset - offset_bits) as u32);
                 member.access_bytes = Some(unit_bytes as u32);
-                window_end = window_end.max(offset + unit_bytes);
+                window_end = window_end.max(offset_bits + unit_bits);
             }
 
             bit_offset += bit_width;
@@ -2478,11 +2512,12 @@ impl TypeTable {
             None => max_align,
         }
         .max(zero_width_align);
-        let size = bit_offset
-            .div_ceil(8)
+        // `window_end` is a multiple of 8, so rounding the larger of the two
+        // up to the alignment is the byte round-up and the padding at once.
+        let size_bits = bit_offset
             .max(window_end)
-            .next_multiple_of(final_align);
-        (size, final_align)
+            .next_multiple_of(final_align as u128 * 8);
+        (bytes_of(size_bits), final_align)
     }
 
     /// Get the number of interned types
@@ -2571,11 +2606,11 @@ impl TypeTable {
         }
 
         let max_align = max_align.max(zero_width_align);
-        let size = if max_align > 1 {
-            (max_size + max_align - 1) & !(max_align - 1)
-        } else {
-            max_size
-        };
+        // Saturating, as in a struct: a size past `max_object_bytes` is
+        // refused by the caller, and rounding must not wrap it small first.
+        let size = max_size
+            .checked_next_multiple_of(max_align)
+            .unwrap_or(usize::MAX);
         (size, max_align)
     }
 }
@@ -3316,5 +3351,114 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The largest object is `PTRDIFF_MAX`, read off the target's `long`.
+    #[test]
+    fn test_max_object_bytes_is_ptrdiff_max() {
+        let types = TypeTable::new(&Target::host());
+        assert_eq!(types.max_object_bytes(), i64::MAX as usize);
+    }
+
+    /// Struct layout is exact however far past `u64::MAX` *bits* it runs.
+    ///
+    /// It accumulated its bits in a `usize`, so a struct past 2^61 bytes had
+    /// no layout, and c17 refused one below `PTRDIFF_MAX` that gcc accepts
+    /// (gcc.c-torture `991014-1`). The member offsets and sizes here are
+    /// gcc's.
+    #[test]
+    fn test_struct_layout_past_u64_bits() {
+        let mut types = TypeTable::new(&Target::host());
+        let member = |typ, bit_width| StructMember {
+            name: StringId::EMPTY,
+            typ,
+            offset: 0,
+            bit_offset: None,
+            bit_width,
+            access_bytes: None,
+            explicit_align: None,
+        };
+        let shorts = types.intern(Type::array(types.short_id, (1 << 62) - 256));
+        let chars_max = types.intern(Type::array(types.char_id, i64::MAX as usize));
+        let chars_5g = types.intern(Type::array(types.char_id, 5_000_000_000));
+
+        // 991014-1's `struct huge_struct`: 2^63 - 512 bytes, then four ints.
+        let int = types.int_id;
+        let mut m = vec![
+            member(shorts, None),
+            member(int, None),
+            member(int, None),
+            member(int, None),
+            member(int, None),
+        ];
+        let (size, align) = types.compute_struct_layout(&mut m, None);
+        assert_eq!((size, align), ((1usize << 63) - 496, 4));
+        assert_eq!(m[1].offset, (1 << 63) - 512);
+        assert_eq!(m[4].offset, (1 << 63) - 500);
+
+        // Two members of `PTRDIFF_MAX` bytes each: past `u64::MAX` bits,
+        // exact in bytes, and so measurably past the bound.
+        let mut m = vec![member(chars_max, None), member(chars_max, None)];
+        let (size, _) = types.compute_struct_layout(&mut m, None);
+        assert_eq!(m[1].offset, i64::MAX as usize);
+        assert_eq!(size, u64::MAX as usize - 1);
+
+        // Three are past `usize::MAX` bytes: saturated, never wrapped small.
+        let mut m = vec![
+            member(chars_max, None),
+            member(chars_max, None),
+            member(chars_max, None),
+            member(int, None),
+        ];
+        let (size, _) = types.compute_struct_layout(&mut m, None);
+        assert_eq!(size, usize::MAX);
+
+        // A bit-field past 2^32 bytes keeps its byte offset and bit position,
+        // packed or not.
+        for pack in [None, Some(1)] {
+            let mut m = vec![
+                member(chars_5g, None),
+                member(types.uint_id, Some(3)),
+                member(types.uint_id, Some(5)),
+            ];
+            let (size, _) = types.compute_struct_layout(&mut m, pack);
+            assert_eq!(m[1].offset, 5_000_000_000);
+            assert_eq!(m[2].offset, 5_000_000_000);
+            assert_eq!((m[1].bit_offset, m[2].bit_offset), (Some(0), Some(3)));
+            assert_eq!(
+                size,
+                if pack.is_some() {
+                    5_000_000_001
+                } else {
+                    5_000_000_004
+                }
+            );
+        }
+    }
+
+    /// A union's rounding saturates rather than wrapping, like a struct's.
+    #[test]
+    fn test_union_layout_near_the_bound() {
+        let mut types = TypeTable::new(&Target::host());
+        let member = |typ| StructMember {
+            name: StringId::EMPTY,
+            typ,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            access_bytes: None,
+            explicit_align: None,
+        };
+        let chars = types.intern(Type::array(types.char_id, (1 << 62) - 256));
+        let mut m = vec![member(types.int_id), member(chars)];
+        assert_eq!(
+            types.compute_union_layout(&mut m, None),
+            ((1 << 62) - 256, 4)
+        );
+
+        // One byte under `usize::MAX`, rounded to 4: saturated.
+        let chars = types.intern(Type::array(types.char_id, usize::MAX - 1));
+        let mut m = vec![member(types.int_id), member(chars)];
+        assert_eq!(types.compute_union_layout(&mut m, None).0, usize::MAX);
     }
 }

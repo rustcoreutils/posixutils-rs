@@ -242,6 +242,10 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_printf_unlocked",
     "__builtin_fprintf_unlocked",
     "__builtin_fputs_unlocked",
+    "__builtin_fprintf",
+    "__builtin_fputs",
+    "__builtin_fputc",
+    "__builtin_fwrite",
     // Checked arithmetic
     "__builtin_add_overflow",
     "__builtin_add_overflow_p",
@@ -354,6 +358,7 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_islessequal",
     "__builtin_islessgreater",
     "__builtin_isunordered",
+    "__builtin_iseqsig",
     "__builtin_fpclassify",
     "__builtin_signbit",
     "__builtin_signbitf",

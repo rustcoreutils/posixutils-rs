@@ -170,10 +170,45 @@ pub(crate) fn cmp_mask(op: Opcode) -> Option<u8> {
     })
 }
 
+/// The fourth outcome a float comparison has and an integer one does not:
+/// the operands are *unordered*, because at least one is a NaN.
+pub(crate) const CMP_UN: u8 = 8;
+/// Every outcome of a float comparison.
+pub(crate) const FCMP_ALL: u8 = CMP_ALL | CMP_UN;
+
+/// The outcomes `op` is true for, or `None` if it is not a float comparison.
+///
+/// Every arm but one is ordered and so excludes [`CMP_UN`]. The exception is
+/// `FCmpONe`, which despite its name is C's `!=` -- true when either operand
+/// is a NaN -- and is emitted that way by both backends: `setne` OR'd with
+/// `setp` on x86-64, `cset ne` (which is taken on unordered) on aarch64.
+pub(crate) fn fcmp_mask(op: Opcode) -> Option<u8> {
+    Some(match op {
+        Opcode::FCmpOEq => CMP_EQ,
+        Opcode::FCmpONe => CMP_LT | CMP_GT | CMP_UN,
+        Opcode::FCmpOLt => CMP_LT,
+        Opcode::FCmpOLe => CMP_LT | CMP_EQ,
+        Opcode::FCmpOGt => CMP_GT,
+        Opcode::FCmpOGe => CMP_GT | CMP_EQ,
+        _ => return None,
+    })
+}
+
+/// The one outcome two known float values have.
+pub(crate) fn fcmp_outcome(ord: Option<Ordering>) -> u8 {
+    match ord {
+        Some(Ordering::Less) => CMP_LT,
+        Some(Ordering::Equal) => CMP_EQ,
+        Some(Ordering::Greater) => CMP_GT,
+        None => CMP_UN,
+    }
+}
+
 /// The same mask read with the operands the other way round: `a < b` and
 /// `b < a` are the same comparison with `less` and `greater` exchanged.
+/// Equal and unordered are symmetric and stay where they are.
 pub(crate) fn mirror_mask(mask: u8) -> u8 {
-    (mask & CMP_EQ)
+    (mask & (CMP_EQ | CMP_UN))
         | if mask & CMP_LT != 0 { CMP_GT } else { 0 }
         | if mask & CMP_GT != 0 { CMP_LT } else { 0 }
 }
@@ -199,16 +234,7 @@ pub(crate) fn cmp_operand_width(insn: &Instruction) -> u32 {
 /// Integer and floating comparisons both, which is the whole set: no other
 /// opcode describes anything but its own result there.
 pub(crate) fn is_comparison(op: Opcode) -> bool {
-    cmp_mask(op).is_some()
-        || matches!(
-            op,
-            Opcode::FCmpOEq
-                | Opcode::FCmpONe
-                | Opcode::FCmpOLt
-                | Opcode::FCmpOLe
-                | Opcode::FCmpOGt
-                | Opcode::FCmpOGe
-        )
+    cmp_mask(op).is_some() || fcmp_mask(op).is_some()
 }
 
 /// The type and width `insn` leaves in its target.
@@ -304,37 +330,6 @@ fn eval_shift(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
         Opcode::Asr => at_width(a, size, true).wrapping_shr(b as u32),
         _ => return None,
     })
-}
-
-/// A float comparison over two constants, at the format its operands are in.
-///
-/// Two things here are not guessable from the opcode name, and both change
-/// the answer rather than its precision.
-///
-/// **`FCmpONe` is the unordered form.** It is C's `!=`, which is *true* when
-/// either operand is a NaN, and both backends emit it that way -- on x86-64
-/// as `setne` OR'd with `setp`, where every other arm AND's in `setnp` or
-/// relies on `ucomisd` setting CF for unordered. Folding it as the ordered
-/// comparison its name suggests would make a folded program disagree with
-/// the same program unfolded.
-///
-/// **The operands must be rounded first.** A [`FloatVal`] carries the literal
-/// at 128 significand bits, wider than any target format, and rounds to the
-/// target once on the way out -- so the constant in a `double` expression is
-/// not yet the `double` the program computes with. Comparing unrounded makes
-/// `0.1 + 0.2 == 0.3` true, which in `double` it is not.
-pub(crate) fn eval_fcmp(op: Opcode, fmt: FpFormat, a: FloatVal, b: FloatVal) -> Option<i128> {
-    let ord = a.round_to_format(fmt).cmp_value(b.round_to_format(fmt));
-    let r = match op {
-        Opcode::FCmpOEq => ord == Some(Ordering::Equal),
-        Opcode::FCmpONe => ord != Some(Ordering::Equal),
-        Opcode::FCmpOLt => ord == Some(Ordering::Less),
-        Opcode::FCmpOLe => matches!(ord, Some(Ordering::Less | Ordering::Equal)),
-        Opcode::FCmpOGt => ord == Some(Ordering::Greater),
-        Opcode::FCmpOGe => matches!(ord, Some(Ordering::Greater | Ordering::Equal)),
-        _ => return None,
-    };
-    Some(i128::from(r))
 }
 
 /// A float arithmetic operation over two constants, at the format of its

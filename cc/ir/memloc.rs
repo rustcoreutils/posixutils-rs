@@ -524,6 +524,35 @@ mod tests {
         assert!(may_alias(&at("g"), &at("w"), &mi));
     }
 
+    /// `__attribute__((alias))` gives one object two names, so an access
+    /// through the alias must overlap every access through the target:
+    /// forwarding `b[i] = 1` past `a[i] = 2` into a load of `b[i]` was
+    /// gcc.c-torture `alias-2`. The alias owns no `GlobalDef`, so it is
+    /// judged as a name this unit does not define.
+    #[test]
+    fn memloc_alias_may_alias_its_target() {
+        let types = host_types();
+        let mut module = super::super::Module::default();
+        module.add_global("a", types.int_id, super::super::Initializer::None);
+        module.add_global("c", types.int_id, super::super::Initializer::None);
+        module.aliases.push(super::super::SymbolAlias {
+            name: "b".to_string(),
+            target: "a".to_string(),
+            is_static: false,
+            weak: false,
+            visibility: None,
+        });
+        let mi = ModuleInfo::build(&module, &types);
+        let at = |n: &str| MemLoc {
+            base: MemBase::Global(n.into()),
+            offset: Some(0),
+            size: 32,
+            typ: None,
+        };
+        assert!(may_alias(&at("a"), &at("b"), &mi));
+        assert!(!may_alias(&at("a"), &at("c"), &mi));
+    }
+
     /// A name this translation unit does not define is assumed to be
     /// everything that would forbid an optimization.
     #[test]

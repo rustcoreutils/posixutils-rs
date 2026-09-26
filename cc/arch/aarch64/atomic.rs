@@ -570,10 +570,9 @@ impl Aarch64CodeGen {
                 // Address through the frame pointer, as every other path in
                 // this backend does ("FP-relative for alloca safety"). This
                 // used its own SP-relative arithmetic, which is wrong the
-                // moment anything moves SP: the atomic CAS loop allocates its
-                // expected-value slot with alloc_local_temp, whose Alloca does
-                // exactly that, and the pointer was then read back 16 bytes
-                // off -- from the saved LR slot.
+                // moment anything moves SP -- a VLA or `alloca` in the same
+                // function -- and a pointer was then read back 16 bytes off,
+                // from the saved LR slot.
                 self.push_lir(Aarch64Inst::Ldr {
                     size: op_size,
                     addr: self.loc_mem(l).unwrap(),

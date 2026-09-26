@@ -1550,7 +1550,7 @@ impl X86_64CodeGen {
 
         // Call setjmp
         self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global("setjmp".to_string())),
+            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
         });
 
         // Store result from EAX to target
@@ -1581,7 +1581,7 @@ impl X86_64CodeGen {
 
         // Call longjmp (noreturn - control never comes back)
         self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global("longjmp".to_string())),
+            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
         });
 
         // Emit ud2 after longjmp since it never returns
@@ -1688,7 +1688,7 @@ impl X86_64CodeGen {
 
         // Call memset
         self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global("memset".to_string())),
+            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
         });
 
         // Store result from RAX to target (returns dest)
@@ -1722,7 +1722,7 @@ impl X86_64CodeGen {
 
         // Call memcpy
         self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global("memcpy".to_string())),
+            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
         });
 
         // Store result from RAX to target (returns dest)
@@ -1756,7 +1756,7 @@ impl X86_64CodeGen {
 
         // Call memmove
         self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global("memmove".to_string())),
+            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
         });
 
         // Store result from RAX to target (returns dest)
@@ -1836,7 +1836,7 @@ impl X86_64CodeGen {
 
         // Call fabsf from libc
         self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global("fabsf".to_string())),
+            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
         });
 
         // Result is in XMM0, store to target
@@ -1860,7 +1860,7 @@ impl X86_64CodeGen {
 
         // Call fabs from libc
         self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global("fabs".to_string())),
+            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
         });
 
         // Result is in XMM0, store to target

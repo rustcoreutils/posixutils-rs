@@ -2498,6 +2498,7 @@ fn test_ternary_impure_uses_phi() {
         ExprKind::Call {
             func: Box::new(Expr::var_typed(foo_sym, int_type)),
             args: vec![],
+            binding: Default::default(),
         },
         int_type,
         test_pos(),
@@ -2506,6 +2507,7 @@ fn test_ternary_impure_uses_phi() {
         ExprKind::Call {
             func: Box::new(Expr::var_typed(bar_sym, int_type)),
             args: vec![],
+            binding: Default::default(),
         },
         int_type,
         test_pos(),
@@ -6639,6 +6641,7 @@ fn test_va_arg_pack_becomes_a_flag_not_an_argument() {
                     bitfield_bits: None,
                 },
             ],
+            binding: Default::default(),
         },
         typ: Some(int_t),
         pos: test_pos(),
@@ -7390,4 +7393,283 @@ fn test_register_sized_struct_through_conditional_is_not_dereferenced() {
             insn.src[0]
         );
     }
+}
+
+/// Linearize `src`, returning the module and the labels the last function
+/// defined, as the linearizer recorded them.
+fn linearize_source_labels(src: &str) -> (Module, std::collections::HashSet<String>) {
+    let target = Target::host();
+    let mut strings = StringTable::new();
+    let mut tokenizer = crate::token::lexer::Tokenizer::new(src.as_bytes(), 0, &mut strings);
+    let tokens = tokenizer.tokenize();
+    let mut symbols = crate::symbol::SymbolTable::new();
+    let mut types = TypeTable::new(&target);
+    let tu = {
+        let mut parser =
+            crate::parse::Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+        parser.parse_translation_unit().expect("parse")
+    };
+    let mut linearizer = Linearizer::new(&symbols, &types, &strings, &target);
+    let module = linearizer.linearize(&tu);
+    (module, linearizer.defined_labels.clone())
+}
+
+/// A label is defined wherever it sits in a `switch` body -- before a case
+/// label, after `default:`, in an arm of an `if` after a case label. The
+/// switch-body walk placed labels through a copy of its own that never
+/// recorded them, so `&&lbl` naming one was reported as undefined.
+#[test]
+fn test_labels_inside_switch_body_are_defined() {
+    let src = "void *p;\n\
+               void f(int a) {\n\
+                 switch (a) {\n\
+                 a0: case 0: p = &&a1; break;\n\
+                 case 1: a1: p = &&dflt; break;\n\
+                 default: dflt: if (a) { arm: p = &&a0; } else other: p = &&arm;\n\
+                 }\n\
+               }\n";
+    let (_, defined) = linearize_source_labels(src);
+    for name in ["a0", "a1", "dflt", "arm", "other"] {
+        assert!(
+            defined.contains(name),
+            "label '{name}' not recorded as defined"
+        );
+    }
+}
+
+/// A backward `goto` to a label inside a `switch` body leaves the scope of a
+/// VLA declared after the label, so it restores the stack. Neither half was
+/// seen: a VLA under a case label did not make the function a VLA function,
+/// and the switch-body walk never recorded the label's depth -- so the loop
+/// grew the stack every time round.
+#[test]
+fn test_backward_goto_to_switch_label_restores_vla_stack() {
+    let src = "void g(volatile char *);\n\
+               void f(int k, int n) {\n\
+                 switch (k) {\n\
+                 case 1: L: { char v[n]; g(v); if (k++ < 9) goto L; }\n\
+                 }\n\
+               }\n";
+    let module = linearize_source(src, &Target::host());
+    let func = module.functions.iter().find(|f| f.name == "f").expect("f");
+    let label = func
+        .blocks
+        .iter()
+        .find(|bb| bb.label.as_deref() == Some("L"))
+        .expect("block for L")
+        .id;
+    // Two edges reach `L`: the fall-in from `case 1:`, before the VLA, and
+    // the `goto`, which has to release it on the way.
+    let restoring_jump = func.blocks.iter().any(|bb| {
+        bb.insns
+            .iter()
+            .any(|i| i.op == Opcode::Br && i.bb_true == Some(label))
+            && bb.insns.iter().any(|i| i.op == Opcode::StackRestore)
+    });
+    assert!(restoring_jump, "the backward goto restores no stack");
+}
+
+/// A complex result lives in a fixed frame slot, never an `alloca`.
+///
+/// Each complex operation needs its result in memory, and that memory was an
+/// `alloca`: it grew the stack on every evaluation and was released only at
+/// return, so a complex expression in a loop exhausted the stack.
+#[test]
+fn test_complex_temporaries_are_frame_slots() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let complex_double = ctx.types.complex_double_id;
+    let a_sym = ctx.var("a", complex_double);
+    let b_sym = ctx.var("b", complex_double);
+
+    // double _Complex test(double _Complex a, double _Complex b)
+    // { return -(a * b + a); }
+    let a = || Box::new(Expr::var_typed(a_sym, complex_double));
+    let mul = Expr::typed_unpositioned(
+        ExprKind::Binary {
+            op: BinaryOp::Mul,
+            left: a(),
+            right: Box::new(Expr::var_typed(b_sym, complex_double)),
+        },
+        complex_double,
+    );
+    let add = Expr::typed_unpositioned(
+        ExprKind::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(mul),
+            right: a(),
+        },
+        complex_double,
+    );
+    let neg = Expr::typed_unpositioned(
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand: Box::new(add),
+        },
+        complex_double,
+    );
+    let param = |symbol| Parameter {
+        symbol: Some(symbol),
+        typ: complex_double,
+        vm_dims: vec![],
+        discarded_dims: vec![],
+    };
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: complex_double,
+        name: test_id,
+        params: vec![param(a_sym), param(b_sym)],
+        body: Stmt::Return(Some(neg)),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
+    let f = &module.functions[0];
+
+    assert!(
+        f.blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .all(|i| i.op != Opcode::Alloca),
+        "a complex temporary must not be an alloca:\n{}",
+        module.display(&ctx.types)
+    );
+    // The multiply, the add and the negation each own a slot.
+    assert_eq!(
+        f.locals.keys().filter(|n| n.starts_with("__ctmp_")).count(),
+        3,
+        "each complex result needs its own frame slot:\n{}",
+        module.display(&ctx.types)
+    );
+}
+
+/// Every opcode a backend lowers to a library call carries that function's
+/// assembler name, resolved through the program's declarations: an asm-label
+/// rename of `memcpy` reaches `__builtin_memcpy` and a structure copy alike,
+/// and a function the program did not rename keeps its own name.
+#[test]
+fn test_library_callee_honours_asm_label() {
+    let src = "typedef unsigned long size_t;\n\
+               void *memcpy(void *, const void *, size_t) __asm(\"my_memcpy\");\n\
+               void *memset(void *, int, size_t) __asm(\"my_memset\");\n\
+               struct big { long a[32]; };\n\
+               void t(struct big *d, struct big *s, char *p, size_t n) {\n\
+                   __builtin_memcpy(p, p + 1, n);\n\
+                   __builtin_memset(p, 0, n);\n\
+                   __builtin_memmove(p, p + 1, n);\n\
+                   *d = *s;\n\
+               }\n";
+    let module = linearize_source(src, &Target::host());
+    let t = module.functions.iter().find(|f| f.name == "t").unwrap();
+    let callees: Vec<(Opcode, &str)> = t
+        .blocks
+        .iter()
+        .flat_map(|b| b.insns.iter())
+        .filter(|i| matches!(i.op, Opcode::Memcpy | Opcode::Memset | Opcode::Memmove))
+        .map(|i| (i.op, i.library_callee()))
+        .collect();
+    let my_memcpy = crate::arch::lir::verbatim("my_memcpy");
+    let my_memset = crate::arch::lir::verbatim("my_memset");
+    assert_eq!(
+        callees,
+        vec![
+            (Opcode::Memcpy, my_memcpy.as_str()),
+            (Opcode::Memset, my_memset.as_str()),
+            (Opcode::Memmove, "memmove"),
+            (Opcode::Memcpy, my_memcpy.as_str()),
+        ]
+    );
+}
+
+/// An `alias` declaration becomes a `SymbolAlias` -- not a definition, and
+/// not an external reference, even when an ordinary redeclaration of the
+/// same name follows it or the target is defined only afterwards. An alias
+/// of an alias names the alias it was written against.
+#[test]
+fn test_alias_declarations_become_symbol_aliases() {
+    let src = "extern int b[4] __attribute__((alias(\"a\")));\n\
+               extern int b[4];\n\
+               int a[4];\n\
+               static int s;\n\
+               static int t __attribute__((weak, alias(\"s\")));\n\
+               int f(void) { return 0; }\n\
+               int g(void) __attribute__((alias(\"f\"), visibility(\"hidden\")));\n\
+               int h(void) __attribute__((alias(\"g\")));\n\
+               int use(void) { return b[0] + g(); }\n";
+    // An ELF target: Mach-O has no aliases, and a Darwin host would reject
+    // every one of these before recording it.
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let module = linearize_source(src, &target);
+    let alias = |name: &str, target: &str, is_static: bool, weak: bool, vis: Option<&str>| {
+        crate::ir::SymbolAlias {
+            name: name.to_string(),
+            target: target.to_string(),
+            is_static,
+            weak,
+            visibility: vis.map(str::to_string),
+        }
+    };
+    assert_eq!(
+        module.aliases,
+        [
+            alias("b", "a", false, false, None),
+            alias("t", "s", true, true, None),
+            alias("g", "f", false, false, Some("hidden")),
+            alias("h", "g", false, false, None),
+        ]
+    );
+    for name in ["b", "t", "g", "h"] {
+        assert!(
+            !module.extern_symbols.contains(name),
+            "{name} is not extern"
+        );
+        assert!(
+            !module.globals.iter().any(|g| g.name == name),
+            "{name} has no storage"
+        );
+        assert!(
+            !module.functions.iter().any(|f| f.name == name),
+            "{name} has no body"
+        );
+    }
+}
+
+/// A constant condition drops the arm it does not take -- unless that arm
+/// defines a label a computed `goto` can reach (compile/pr17913). Dropping it
+/// left the label's block empty and unterminated. The arm without one is
+/// still dropped, for `?:` and for `?:`'s GNU two-operand form alike.
+#[test]
+fn test_constant_conditional_keeps_an_arm_that_defines_a_label() {
+    let src = "int puts(const char *);\n\
+               int f(int k) {\n\
+                   void *p = k ? &&a : &&b;\n\
+                   int v = 1 ? 3 : ({ a: puts(\"x\"); });\n\
+                   int w = 5 ?: ({ b: 6; });\n\
+                   int u = 1 ? 4 : puts(\"dead\");\n\
+                   if (k) return v + w + u;\n\
+                   goto *p;\n\
+               }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    for name in ["a", "b"] {
+        let block = f
+            .blocks
+            .iter()
+            .find(|bb| bb.label.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("no block for label {name}"));
+        assert!(!block.insns.is_empty(), "label {name} was dropped");
+    }
+    // `puts("x")` is kept with its label; `puts("dead")` is still folded away.
+    let calls = f
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| i.op == Opcode::Call)
+        .count();
+    assert_eq!(calls, 1);
 }

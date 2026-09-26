@@ -1281,7 +1281,7 @@ impl Aarch64CodeGen {
 
         // Call setjmp
         self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global("setjmp")),
+            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
         });
 
         // Store result from W0 to target
@@ -1313,7 +1313,7 @@ impl Aarch64CodeGen {
 
         // Call longjmp (noreturn - control never comes back)
         self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global("longjmp")),
+            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
         });
 
         // Emit brk after longjmp since it never returns
@@ -1477,8 +1477,9 @@ impl Aarch64CodeGen {
         self.emit_move_to_loc(Reg::X0, &dst_loc, u32::BITS);
     }
 
-    /// `__builtin_memcpy`/`memset`/`memmove` on aarch64: a call to the libc
-    /// function of the same name.
+    /// `__builtin_memcpy`/`memset`/`memmove` on aarch64: a call to the library
+    /// function, by the assembler name the program declared it with
+    /// (`Instruction::library_callee`).
     ///
     /// x86-64 lowers these in its own `features.rs`; aarch64 did not lower them
     /// at all. The opcode reached codegen, fell into the `_ => {}` arm that
@@ -1489,7 +1490,7 @@ impl Aarch64CodeGen {
     /// return the destination pointer in x0. `is_call_like_aarch64` lists these
     /// opcodes so the allocator stops keeping values in caller-saved registers
     /// across one.
-    pub(super) fn emit_mem_libcall(&mut self, insn: &Instruction, func_name: &str) {
+    pub(super) fn emit_mem_libcall(&mut self, insn: &Instruction) {
         if insn.src.len() < 3 {
             return;
         }
@@ -1500,7 +1501,7 @@ impl Aarch64CodeGen {
         self.emit_move(insn.src[0], Reg::X0, 64);
 
         self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global(func_name)),
+            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
         });
 
         // All three return the destination pointer.
@@ -1545,18 +1546,14 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        let (size, func_name) = if is_double {
-            (64, "fabs")
-        } else {
-            (32, "fabsf")
-        };
+        let size = if is_double { 64 } else { 32 };
 
         // Load argument into V0 (first FP argument register)
         self.emit_fp_move(arg, VReg::V0, None, size, types);
 
         // Call fabs/fabsf from libc
         self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global(func_name)),
+            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
         });
 
         // Result is in V0, store to target

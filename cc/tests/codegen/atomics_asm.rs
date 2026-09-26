@@ -320,23 +320,24 @@ void set_param(float v) { f = v; }
 /// frame pointer.
 ///
 /// `emit_mov_to_reg` computed its own SP-relative offset while every other path
-/// in the backend uses X29 ("FP-relative for alloca safety"). `alloc_local_temp`
-/// emits an Alloca that moves SP, so the pointer was stored at [x29, #N] and
-/// read back from [sp, #N] -- 16 bytes off, landing on the saved LR slot.
+/// in the backend uses X29 ("FP-relative for alloca safety"). Once anything
+/// moved SP, the pointer was stored at [x29, #N] and read back from [sp, #N]
+/// -- 16 bytes off, landing on the saved LR slot. The slot itself is a fixed
+/// frame local; the VLA here is what moves SP.
 #[test]
 fn codegen_aarch64_cas_temp_is_frame_relative() {
     let src = r#"
 #include <stdatomic.h>
 _Atomic int a;
-void mul(void) { a *= 3; }
+void mul(int n) { volatile char buf[n]; buf[0] = 0; a *= 3; }
 "#;
     let asm = asm_for("cas_temp_arm", AARCH64_LINUX, src);
     let body = super::asm_probe::body_of(&asm, "mul");
 
-    // The Alloca moves SP, which is what made the mismatch observable.
+    // The VLA moves SP, which is what makes a mismatch observable.
     assert!(
         body.contains("sub sp, sp"),
-        "expected the temp allocation to move SP:\n{body}"
+        "expected the VLA to move SP:\n{body}"
     );
     // Every access to the temp pointer must go through x29, not sp.
     assert!(
@@ -344,8 +345,32 @@ void mul(void) { a *= 3; }
         "the CAS temp pointer must not be read SP-relative:\n{body}"
     );
     assert!(
-        body.contains("str x") && body.contains("[x29,"),
-        "the CAS temp pointer must be frame-relative:\n{body}"
+        body.contains(", x29, #"),
+        "the CAS temp slot must be addressed from the frame pointer:\n{body}"
+    );
+}
+
+/// aarch64: an `_Atomic double` load must reach the V register its result
+/// lives in.
+///
+/// `ldar` loads into a general register, and `emit_move_to_loc` had no case
+/// for a floating-point destination, so the move was silently dropped:
+/// `return ad;` returned whatever `d0` last held.
+#[test]
+fn codegen_aarch64_atomic_double_load_reaches_fp_register() {
+    let src = r#"
+_Atomic double ad;
+double get(void) { return ad; }
+"#;
+    let asm = asm_for("atomic_double_load_arm", AARCH64_LINUX, src);
+    let body = super::asm_probe::body_of(&asm, "get");
+    assert!(
+        body.contains("ldar x9"),
+        "expected an acquire load:\n{body}"
+    );
+    assert!(
+        body.contains("fmov d0, x9"),
+        "the loaded bits must move to the FP result register:\n{body}"
     );
 }
 

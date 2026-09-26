@@ -102,14 +102,19 @@ pub struct InlineCandidate {
     /// symbol with internal linkage cannot be interposed even if someone
     /// writes `weak` on it.
     pub is_interposable: bool,
-    /// Whether the function takes a label's address (`&&label`).
+    /// Whether the function contains a computed `goto *p`.
     ///
-    /// Such a function cannot be inlined: the address is a symbol naming a
-    /// block in *this* function -- `.L{fn}_{bb}` -- and inlining renumbers the
-    /// blocks into the caller, leaving the reference pointing at a name
-    /// nothing defines. That linked, with a text relocation against an
-    /// undefined local label, and produced a non-executable binary.
-    pub takes_label_addr: bool,
+    /// Taking a label's address is not enough to refuse: each copy gets its
+    /// own blocks and its own label symbols, which is also what gcc does --
+    /// the addresses differ between copies. But a computed goto may jump to
+    /// an address saved by an *earlier* call, which in another copy names a
+    /// block of a different function altogether. gcc never inlines one
+    /// ("contains a computed goto"), and neither does c17.
+    pub has_computed_goto: bool,
+    /// Whether a label address initializes a static object -- see
+    /// `Function::saves_label_in_static`. That table names the blocks of the
+    /// out-of-line body, so no copy of the body can use it.
+    pub saves_label_in_static: bool,
     /// Number of times this function is called in the module
     pub call_count: usize,
     /// Whether the function returns a complex value (should not inline)
@@ -133,7 +138,8 @@ impl InlineCandidate {
     fn cannot_be_inlined(&self) -> bool {
         self.defines_varargs_frame
             || self.is_recursive
-            || self.takes_label_addr
+            || self.has_computed_goto
+            || self.saves_label_in_static
             || self.ret_is_address
             || self.is_noinline
     }
@@ -157,10 +163,8 @@ fn build_call_count_map(module: &Module) -> HashMap<String, usize> {
     for func in &module.functions {
         for bb in &func.blocks {
             for insn in &bb.insns {
-                if insn.op == Opcode::Call {
-                    if let Some(callee) = &insn.func_name {
-                        *counts.entry(callee.clone()).or_insert(0) += 1;
-                    }
+                if let Some(callee) = insn.local_callee() {
+                    *counts.entry(callee.to_string()).or_insert(0) += 1;
                 }
             }
         }
@@ -184,10 +188,7 @@ pub fn analyze_all_functions(module: &Module) -> HashMap<String, InlineCandidate
 /// Analyze a single function for inlineability
 fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> InlineCandidate {
     let mut candidate = InlineCandidate {
-        // Recorded by the linearizer. Matching on the symbol name instead
-        // caught `.LC0` and stopped every function containing a string
-        // literal from being inlined.
-        takes_label_addr: func.takes_label_addr,
+        saves_label_in_static: func.saves_label_in_static,
         is_noinline: func.is_noinline,
         is_always_inline: func.is_always_inline,
         is_interposable: func.symbol_attrs.weak && !func.is_static,
@@ -208,19 +209,13 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
                 Opcode::VaArg | Opcode::VaEnd | Opcode::VaCopy => {
                     candidate.consumes_va_list = true;
                 }
-                // A label address is a `SymAddr` on a symbol named for a
-                // block of *this* function. An indirect branch is the usual
-                // reason to take one, but a function that merely returns one
-                // has the same problem.
                 Opcode::IndirectBr => {
-                    candidate.takes_label_addr = true;
+                    candidate.has_computed_goto = true;
                 }
-                Opcode::Call => {
-                    if let Some(callee) = &insn.func_name {
-                        if callee == &func.name {
-                            candidate.is_recursive = true;
-                        }
-                    }
+                // A `__builtin_X` call from `X`'s own body reaches the
+                // library's `X`, which is not recursion.
+                Opcode::Call if insn.local_callee() == Some(func.name.as_str()) => {
+                    candidate.is_recursive = true;
                 }
                 _ => {}
             }
@@ -424,6 +419,16 @@ struct InlineContext {
     /// Keyed by name, such a global was taken for a local and mangled into
     /// `callee_inlineN_g`, which then failed to link.
     callee_local_syms: HashSet<PseudoId>,
+    /// The callee's label-address symbols (`&&label`), each with the block it
+    /// names, and the caller they are moving into.
+    ///
+    /// Such a symbol is spelled for a block *of the callee*. Kept as it was,
+    /// like a global, every copy pointed back at the out-of-line body: two
+    /// callers stored one address where gcc gives each its own, and a callee
+    /// that was not emitted at all left the reference undefined. Each copy
+    /// instead names its own clone of the block, in the caller.
+    callee_labels: HashMap<String, BasicBlockId>,
+    caller_name: String,
 
     /// Callee block currently being cloned. Set per-block by
     /// `clone_callee_blocks` so the Ret handling in `clone_instruction` can
@@ -478,6 +483,14 @@ impl InlineContext {
         let callee_local_syms: HashSet<PseudoId> =
             callee.locals.values().map(|local| local.sym).collect();
 
+        // The linearizer marks every block whose address is taken.
+        let callee_labels = callee
+            .blocks
+            .iter()
+            .filter(|b| b.addr_taken)
+            .map(|b| (b.id.label_symbol(&callee.name), b.id))
+            .collect();
+
         Self {
             pseudo_map: HashMap::with_capacity(DEFAULT_REMAP_CAPACITY),
             bb_map: HashMap::with_capacity(DEFAULT_ORDER_CAPACITY),
@@ -491,6 +504,8 @@ impl InlineContext {
             inline_id: next_inline_id(),
             callee_name: callee.name.clone(),
             callee_local_syms,
+            callee_labels,
+            caller_name: caller.name.clone(),
             current_callee_bb: None,
             ret_arms: Vec::new(),
             ret_typ: None,
@@ -548,6 +563,11 @@ impl InlineContext {
                     self.alloc_pseudo_id()
                 }
             }
+            // A label address is renamed for this copy, so it is never the
+            // same symbol as anything the caller already holds.
+            Some(PseudoKind::Sym(name)) if self.callee_labels.contains_key(name) => {
+                self.alloc_pseudo_id()
+            }
             // Global symbols: ensure same name maps to same ID across multiple inlinings
             // This is critical when a function is inlined multiple times and references
             // the same global variable - all references must point to the same pseudo
@@ -586,7 +606,9 @@ impl InlineContext {
             }
             PseudoKind::Sym(name) => {
                 // Only mangle local variable names - keep global symbols unchanged
-                if self.callee_local_syms.contains(&callee_pseudo.id) {
+                if let Some(bb) = self.callee_labels.get(name).copied() {
+                    PseudoKind::Sym(self.remap_bb(bb).label_symbol(&self.caller_name))
+                } else if self.callee_local_syms.contains(&callee_pseudo.id) {
                     let new_name =
                         format!("{}_inline{}_{}", self.callee_name, self.inline_id, name);
                     PseudoKind::Sym(new_name)
@@ -936,6 +958,7 @@ fn clone_callee_blocks(ctx: &mut InlineContext, callee: &Function) -> Vec<BasicB
         let mut new_bb = BasicBlock::new(new_bb_id);
         new_bb.parents = callee_bb.parents.clone();
         new_bb.children = callee_bb.children.clone();
+        new_bb.addr_taken = callee_bb.addr_taken;
         // Tell clone_instruction which callee block these instructions belong
         // to. Ret handling needs this to record the predecessor block in the
         // caller's CFG when contributing to the return-value Phi.
@@ -1278,6 +1301,11 @@ fn inline_call_site(
     // Add continuation block
     caller.add_block(continuation_bb);
 
+    // The copy's label addresses now name blocks of the caller, which takes
+    // on everything that means -- memory analysis gives up on it, and a
+    // later inlining of the caller renames them again.
+    caller.takes_label_addr |= callee.takes_label_addr;
+
     // Add cloned pseudos to caller
     for pseudo in inlined_pseudos {
         caller.add_pseudo(pseudo);
@@ -1456,10 +1484,9 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
             // bypass the stack-size check. The HARD_CALLER_SIZE_CAP and
             // proportional growth limits provide sufficient protection.
             let caller_is_recursive = module.functions[func_idx].blocks.iter().any(|bb| {
-                bb.insns.iter().any(|insn| {
-                    insn.op == Opcode::Call
-                        && insn.func_name.as_ref().is_some_and(|n| n == &caller_name)
-                })
+                bb.insns
+                    .iter()
+                    .any(|insn| insn.local_callee() == Some(caller_name.as_str()))
             });
 
             // Find all call sites in this function that should be inlined
@@ -1468,15 +1495,14 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
 
             for (bb_idx, bb) in module.functions[func_idx].blocks.iter().enumerate() {
                 for (insn_idx, insn) in bb.insns.iter().enumerate() {
-                    if insn.op == Opcode::Call {
-                        if let Some(callee_name) = &insn.func_name {
-                            if let Some(candidate) = candidates.get(callee_name) {
-                                if should_inline(candidate, opt, caller_size, caller_is_recursive) {
-                                    // Don't inline recursive calls
-                                    if *callee_name != caller_name {
-                                        call_sites.push((bb_idx, insn_idx, callee_name.clone()));
-                                    }
-                                }
+                    let Some(callee_name) = insn.local_callee() else {
+                        continue;
+                    };
+                    if let Some(candidate) = candidates.get(callee_name) {
+                        if should_inline(candidate, opt, caller_size, caller_is_recursive) {
+                            // Don't inline recursive calls
+                            if callee_name != caller_name {
+                                call_sites.push((bb_idx, insn_idx, callee_name.to_string()));
                             }
                         }
                     }
@@ -1655,6 +1681,16 @@ fn collect_referenced_functions(module: &Module) -> HashSet<String> {
         collect_func_refs_from_initializer(&global.init, &func_names, &mut referenced);
     }
 
+    // `__attribute__((alias))`: the `.set` the backend writes names the
+    // target, and a static function reached only through its alias -- the
+    // usual way to export an internal implementation under a public name --
+    // has no other reference at all.
+    for alias in &module.aliases {
+        if func_names.contains(&alias.target) {
+            referenced.insert(alias.target.clone());
+        }
+    }
+
     referenced
 }
 
@@ -1744,7 +1780,8 @@ mod tests {
             is_recursive: false,
             defines_varargs_frame: false,
             consumes_va_list: false,
-            takes_label_addr: false,
+            has_computed_goto: false,
+            saves_label_in_static: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -1770,7 +1807,8 @@ mod tests {
             is_recursive: false,
             defines_varargs_frame: false,
             consumes_va_list: true,
-            takes_label_addr: false,
+            has_computed_goto: false,
+            saves_label_in_static: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -1814,7 +1852,8 @@ mod tests {
             is_recursive: false,
             defines_varargs_frame: true,
             consumes_va_list: true,
-            takes_label_addr: false,
+            has_computed_goto: false,
+            saves_label_in_static: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -1834,7 +1873,8 @@ mod tests {
             is_recursive: true,
             defines_varargs_frame: false,
             consumes_va_list: false,
-            takes_label_addr: false,
+            has_computed_goto: false,
+            saves_label_in_static: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -1854,7 +1894,8 @@ mod tests {
             is_recursive: false,
             defines_varargs_frame: false,
             consumes_va_list: false,
-            takes_label_addr: false,
+            has_computed_goto: false,
+            saves_label_in_static: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -1874,7 +1915,8 @@ mod tests {
             is_recursive: false,
             defines_varargs_frame: false,
             consumes_va_list: false,
-            takes_label_addr: false,
+            has_computed_goto: false,
+            saves_label_in_static: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -2021,6 +2063,55 @@ mod tests {
 
         assert!(module.functions.iter().any(|f| f.name == "kept"));
         assert!(!module.functions.iter().any(|f| f.name == "dropped"));
+    }
+
+    /// `__attribute__((alias))` names its target in a `.set` the backend
+    /// writes after this pass, so a static function exported only through an
+    /// alias has no other reference -- and dropping it leaves `.set` naming
+    /// nothing.
+    #[test]
+    fn test_alias_target_survives_the_prune() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        module.functions.push(static_fn(&types, "impl", None));
+        module.functions.push(static_fn(&types, "dropped", None));
+        module.functions.push(Function::new("main", types.int_id));
+        module.aliases.push(crate::ir::SymbolAlias {
+            name: "api".to_string(),
+            target: "impl".to_string(),
+            is_static: false,
+            weak: false,
+            visibility: None,
+        });
+
+        remove_dead_functions(&mut module);
+
+        assert!(module.functions.iter().any(|f| f.name == "impl"));
+        assert!(!module.functions.iter().any(|f| f.name == "dropped"));
+    }
+
+    /// A `__builtin_X` call inside `X`'s own body reaches the library's `X`:
+    /// not recursion, and not a call site to splice `X` into. Treating it as
+    /// either rejected glibc's `always_inline` fortify wrappers outright.
+    #[test]
+    fn test_library_call_to_own_name_is_not_recursion() {
+        let types = TypeTable::new(&Target::host());
+        let mut wrapper = static_fn(&types, "strncpy", Some("strncpy"));
+        let recursive = analyze_function(&wrapper, &HashMap::new());
+        assert!(recursive.is_recursive, "a plain self-call is recursion");
+
+        for insn in wrapper.blocks.iter_mut().flat_map(|b| b.insns.iter_mut()) {
+            if insn.op == Opcode::Call {
+                insn.callee_binding = crate::parse::ast::CalleeBinding::Library;
+                assert_eq!(insn.local_callee(), None);
+            }
+        }
+        let library = analyze_function(&wrapper, &HashMap::new());
+        assert!(!library.is_recursive, "a library call is not recursion");
+
+        let mut module = Module::default();
+        module.functions.push(wrapper);
+        assert_eq!(build_call_count_map(&module).get("strncpy"), None);
     }
 
     /// A name written into the assembly text reaches the assembler with no IR
@@ -2322,6 +2413,146 @@ mod tests {
             BasicBlockId(1),
             "leaving the callee's id names an unrelated caller block"
         );
+    }
+
+    /// `void *callee(void) { lab: return &&lab; }` -- the label's block is
+    /// block 1, marked `addr_taken`, and its address a `Sym` spelled for it.
+    fn label_address_callee(types: &TypeTable) -> Function {
+        let mut callee = Function::new("callee", types.void_ptr_id);
+        callee.is_static = true;
+        callee.is_inline = true;
+        callee.takes_label_addr = true;
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.insns.push(Instruction::new(Opcode::Entry));
+        entry.insns.push(Instruction::br(BasicBlockId(1)));
+        entry.children = vec![BasicBlockId(1)];
+        callee.add_block(entry);
+        let mut lab = BasicBlock::new(BasicBlockId(1));
+        lab.addr_taken = true;
+        lab.parents = vec![BasicBlockId(0)];
+        lab.insns.push(Instruction::sym_addr(
+            PseudoId(1),
+            PseudoId(0),
+            types.void_ptr_id,
+        ));
+        lab.insns.push(Instruction::ret_typed(
+            Some(PseudoId(1)),
+            types.void_ptr_id,
+            64,
+        ));
+        callee.add_block(lab);
+        callee.entry = BasicBlockId(0);
+        callee.add_pseudo(Pseudo::sym(
+            PseudoId(0),
+            BasicBlockId(1).label_symbol("callee"),
+        ));
+        callee.add_pseudo(Pseudo::reg(PseudoId(1), 1));
+        callee.next_pseudo = 2;
+        callee
+    }
+
+    /// Each inlined copy of a function that takes a label's address names
+    /// its own clone of the block, in the caller.
+    ///
+    /// The label's `Sym` was treated like a global and kept its name, so every
+    /// copy stored the address of the *callee's* block: gcc's 990208-1, where
+    /// two callers must see different addresses, aborted -- and once the
+    /// out-of-line body was dropped the symbol named nothing at all.
+    #[test]
+    fn test_inlined_label_address_names_the_callers_block() {
+        let types = TypeTable::new(&Target::host());
+        let callee = label_address_callee(&types);
+
+        let candidate = analyze_function(&callee, &HashMap::new());
+        assert!(
+            !candidate.cannot_be_inlined(),
+            "taking a label's address alone does not stop inlining"
+        );
+
+        let mut caller = Function::new("caller", types.void_ptr_id);
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.insns.push(Instruction::new(Opcode::Entry));
+        for target in [PseudoId(0), PseudoId(1)] {
+            bb.insns.push(Instruction::call(
+                Some(target),
+                "callee",
+                vec![],
+                vec![],
+                types.void_ptr_id,
+                64,
+            ));
+        }
+        bb.insns.push(Instruction::ret_typed(
+            Some(PseudoId(1)),
+            types.void_ptr_id,
+            64,
+        ));
+        caller.add_block(bb);
+        caller.entry = BasicBlockId(0);
+        caller.add_pseudo(Pseudo::reg(PseudoId(0), 0));
+        caller.add_pseudo(Pseudo::reg(PseudoId(1), 1));
+        caller.next_pseudo = 2;
+
+        // The first call, then the second -- now at the head of the first
+        // copy's continuation block.
+        assert!(inline_call_site(&mut caller, 0, 1, &callee));
+        let (bb_idx, insn_idx) = caller
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(b, block)| {
+                block
+                    .insns
+                    .iter()
+                    .position(|i| i.op == Opcode::Call)
+                    .map(|i| (b, i))
+            })
+            .expect("the second call is still there");
+        assert!(inline_call_site(&mut caller, bb_idx, insn_idx, &callee));
+
+        let labels: Vec<&str> = caller
+            .pseudos
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PseudoKind::Sym(name) if name.starts_with(".L") => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 2, "one label symbol per copy: {labels:?}");
+        assert_ne!(labels[0], labels[1], "the copies share an address");
+        for name in &labels {
+            let block = caller
+                .blocks
+                .iter()
+                .find(|b| b.id.label_symbol("caller") == *name)
+                .unwrap_or_else(|| panic!("{name} names no block of the caller"));
+            assert!(block.addr_taken, "{name}'s block must survive DCE");
+        }
+        assert!(
+            caller.takes_label_addr,
+            "the caller now takes a label address, and memory analysis must know"
+        );
+    }
+
+    /// What gcc refuses to copy, c17 refuses to inline: a computed `goto`,
+    /// which may jump to an address an earlier call saved -- in another copy,
+    /// a block of another function -- and a label address in a static
+    /// initializer, which names the out-of-line body's blocks.
+    #[test]
+    fn test_computed_goto_and_static_label_table_are_not_inlined() {
+        let types = TypeTable::new(&Target::host());
+
+        let mut goto = label_address_callee(&types);
+        let dispatch = goto.get_block_mut(BasicBlockId(0)).unwrap();
+        dispatch.insns.pop();
+        dispatch.insns.push(Instruction::indirect_br(PseudoId(1)));
+        let candidate = analyze_function(&goto, &HashMap::new());
+        assert!(candidate.has_computed_goto);
+        assert!(candidate.cannot_be_inlined());
+
+        let mut table = label_address_callee(&types);
+        table.saves_label_in_static = true;
+        assert!(analyze_function(&table, &HashMap::new()).cannot_be_inlined());
     }
 
     #[test]

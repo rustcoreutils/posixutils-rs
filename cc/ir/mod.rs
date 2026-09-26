@@ -724,6 +724,19 @@ impl fmt::Display for BasicBlockId {
     }
 }
 
+impl BasicBlockId {
+    /// The assembler symbol that names this block of function `func_name`,
+    /// unquoted: what `&&label` evaluates to, and what the backends define at
+    /// the head of the block.
+    ///
+    /// One spelling for both, because a reference and a definition that
+    /// disagree link against nothing -- and the inliner has to rebuild the
+    /// name when it moves a block into another function.
+    pub fn label_symbol(self, func_name: &str) -> String {
+        format!(".L{}_{}", func_name, self.0)
+    }
+}
+
 // Inline Assembly Support
 
 /// Constraint information for an inline asm operand
@@ -892,6 +905,10 @@ pub struct Instruction {
     /// For calls: true if the called function is noreturn (never returns).
     /// Code after a noreturn call is unreachable.
     pub is_noreturn_call: bool,
+    /// For direct calls: whether `func_name` may be a definition in this
+    /// module or is only ever the external library function. See
+    /// [`Instruction::local_callee`], which is how a pass should ask.
+    pub callee_binding: crate::parse::ast::CalleeBinding,
     /// For indirect calls: pseudo containing the function pointer address.
     /// When this is Some, the call is indirect (call through function pointer).
     pub indirect_target: Option<PseudoId>,
@@ -927,6 +944,7 @@ impl Default for Instruction {
             variadic_arg_start: None,
             ends_with_va_arg_pack: false,
             is_noreturn_call: false,
+            callee_binding: crate::parse::ast::CalleeBinding::Declared,
             indirect_target: None,
             pos: None,
             asm_data: None,
@@ -941,6 +959,21 @@ impl Instruction {
         Self {
             op,
             ..Default::default()
+        }
+    }
+
+    /// The function in this module a direct call may run, by name.
+    ///
+    /// `None` for anything but a direct call, and for a call to a library
+    /// function spelled `__builtin_X`: that one reaches the external `X`
+    /// however this module defines `X`, so it is neither a call to an inline
+    /// definition to splice in nor a recursive call when made from `X`'s own
+    /// body. Inlining and recursion detection ask this rather than reading
+    /// `func_name`, which names the symbol either way.
+    pub fn local_callee(&self) -> Option<&str> {
+        match (self.op, self.callee_binding) {
+            (Opcode::Call, crate::parse::ast::CalleeBinding::Declared) => self.func_name.as_deref(),
+            _ => None,
         }
     }
 
@@ -1003,6 +1036,21 @@ impl Instruction {
     pub fn with_func(mut self, name: impl Into<String>) -> Self {
         self.func_name = Some(name.into());
         self
+    }
+
+    /// The C library function an opcode the backends lower to a call
+    /// (`Memcpy`, `Memset`, `Memmove`, `Fabs32`/`Fabs64`, `Setjmp`,
+    /// `Longjmp`) calls, by its assembler name.
+    ///
+    /// The linearizer resolved it through the program's own declarations
+    /// (`Linearizer::library_function_name`), so an asm-label rename of
+    /// `memcpy` reaches `__builtin_memcpy` and a structure copy alike. A
+    /// backend names the callee through here, never with a literal.
+    pub fn library_callee(&self) -> &str {
+        match &self.func_name {
+            Some(name) => name,
+            None => panic!("{:?} was built without its library callee", self.op),
+        }
     }
 
     /// Set bit size
@@ -1872,13 +1920,22 @@ pub struct Function {
     pub declared_effect: crate::parse::ast::MemEffect,
     /// Whether this function takes the address of one of its own labels.
     ///
-    /// Such a function cannot be inlined: the address is a symbol naming a
-    /// block of *this* function, and inlining renumbers blocks into the
-    /// caller, leaving a reference nothing defines. Recorded here rather than
-    /// recovered from symbol names, because a string literal's symbol is also
-    /// spelled `.L...` and matching on the prefix silently stopped every
-    /// function containing a string literal from being inlined.
+    /// The address is a symbol naming a block of *this* function, so memory
+    /// analysis gives up on it, and the inliner renames the symbol for every
+    /// block it moves into a caller -- which then takes a label address of
+    /// its own. Recorded here rather than recovered from symbol names,
+    /// because a string literal's symbol is also spelled `.L...` and matching
+    /// on the prefix silently stopped every function containing a string
+    /// literal from being inlined.
     pub takes_label_addr: bool,
+    /// Whether a label address of this function initializes an object of
+    /// static storage duration -- `static void *tbl[] = {&&a, &&b};`.
+    ///
+    /// The table is one object however many copies of the body exist, and it
+    /// names *this* function's blocks, so no copy of the body could use it.
+    /// gcc never copies such a function ("saves address of local label in a
+    /// static variable"), and neither does the inliner.
+    pub saves_label_in_static: bool,
     /// `__attribute__((always_inline))`: inline at every call site regardless
     /// of size, and at `-O0` too. `is_noinline` wins if both are present.
     pub is_always_inline: bool,
@@ -1924,6 +1981,7 @@ impl Default for Function {
             symbol_attrs: Default::default(),
             align: None,
             takes_label_addr: false,
+            saves_label_in_static: false,
             return_type: TypeId::INVALID,
             params: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
             blocks: Vec::new(),
@@ -2470,6 +2528,36 @@ impl GlobalDef {
     }
 }
 
+/// A second name for a definition in this translation unit, from
+/// `__attribute__((alias("target")))`.
+///
+/// Neither a definition nor a reference: the alias owns no storage and no
+/// code, and the object file gets `name` as a symbol whose value is
+/// `target`'s address -- `.set name, target`. It has its own binding, which
+/// is why it is not folded into the target: `static` makes it local, `weak`
+/// lets a strong definition elsewhere replace it while `target` keeps its own
+/// name, and visibility is set on it alone.
+///
+/// Two names for one object is exactly what the memory passes must not
+/// assume away. An alias is never in `Module::globals`, so `memloc` knows
+/// nothing about it and answers "may alias anything" for every access made
+/// through it -- which is what makes a store through `b` visible to a load of
+/// `a`. The target must stay emitted even when nothing else names it:
+/// `inline::remove_dead_functions` counts an alias as a reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolAlias {
+    /// The alias, as the assembler spells it.
+    pub name: String,
+    /// The symbol it names: a definition in this unit, or another alias.
+    pub target: String,
+    /// Declared `static`: a local symbol, no `.globl`.
+    pub is_static: bool,
+    /// `weak`: `.weak` rather than `.globl`.
+    pub weak: bool,
+    /// `visibility("...")`, verbatim, as on any other symbol.
+    pub visibility: Option<String>,
+}
+
 // Module (Translation Unit)
 
 /// A module containing multiple functions
@@ -2518,6 +2606,9 @@ pub struct Module {
     /// bits into a scaled load or store (aarch64 `:lo12:`) needs it; a
     /// definition's alignment is on its `GlobalDef`.
     pub extern_object_align: HashMap<String, u32>,
+    /// `__attribute__((alias))` symbols, in declaration order, each checked
+    /// to name something this unit defines.
+    pub aliases: Vec<SymbolAlias>,
     /// Compilation directory (for DW_AT_comp_dir in DWARF)
     pub comp_dir: Option<String>,
     /// Primary source filename (for DW_AT_name in DWARF)

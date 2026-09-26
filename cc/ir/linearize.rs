@@ -285,10 +285,11 @@ pub struct Linearizer<'a> {
     /// without the edges DCE would delete blocks nothing appears to reach.
     pub(crate) addr_taken_labels: Vec<BasicBlockId>,
 
-    /// `&&label` references in this function, with where each was written.
-    /// Checked against `defined_labels` once the body is walked, because a
-    /// forward reference is legal and only the end of the function settles it.
-    pub(crate) label_addr_refs: Vec<(String, crate::diag::Position)>,
+    /// Every label this function names -- by `goto`, `&&label` or
+    /// `asm goto` -- with where each was written. Checked against
+    /// `defined_labels` once the body is walked, because a forward reference
+    /// is legal and only the end of the function settles it.
+    pub(crate) label_refs: Vec<(String, crate::diag::Position)>,
 
     /// Labels this function actually defines.
     pub(crate) defined_labels: std::collections::HashSet<String>,
@@ -368,6 +369,10 @@ pub struct Linearizer<'a> {
     /// Scope stack for locals: each entry records (sym, previous_value) pairs
     /// for undoing inserts when a scope exits.
     pub(crate) local_scope_stack: Vec<Vec<(SymbolId, Option<LocalVarInfo>)>>,
+    /// `__attribute__((alias))` declarations seen so far. Resolved once the
+    /// whole unit has been read, because the target may be defined after the
+    /// alias that names it.
+    pub(crate) declared_aliases: Vec<super::linearize_init::DeclaredAlias>,
 }
 
 impl<'a> Linearizer<'a> {
@@ -399,7 +404,7 @@ impl<'a> Linearizer<'a> {
             two_reg_return_type: None,
             current_func_name: String::new(),
             addr_taken_labels: Vec::new(),
-            label_addr_refs: Vec::new(),
+            label_refs: Vec::new(),
             defined_labels: std::collections::HashSet::new(),
             label_vla_depth: std::collections::HashMap::new(),
             pending_goto_vla: Vec::new(),
@@ -417,6 +422,7 @@ impl<'a> Linearizer<'a> {
             ),
             current_calling_conv: CallingConv::default(),
             local_scope_stack: Vec::new(),
+            declared_aliases: Vec::new(),
         }
     }
 
@@ -501,6 +507,22 @@ impl<'a> Linearizer<'a> {
             .unwrap_or_else(|| self.str(name).to_string())
     }
 
+    /// The assembler name of the C library function `name`, for a call the
+    /// compiler emits itself -- a `__builtin_memcpy`, a structure copy, a
+    /// zero fill, `fabs`, `setjmp`.
+    ///
+    /// Such a call is still a call to *that function*, so a program that
+    /// declared it with an asm label (`void *memcpy(...) __asm("my_memcpy")`,
+    /// or glibc's fortified `longjmp` -> `__longjmp_chk`) gets the label, as
+    /// gcc gives it. Every instruction the backends lower to a library call
+    /// takes its callee from here, never from a literal in the backend.
+    pub(crate) fn library_function_name(&self, name: &str) -> String {
+        match self.strings.lookup(name) {
+            Some(id) => self.emitted_name(id),
+            None => name.to_string(),
+        }
+    }
+
     /// Whether any declaration of `name` in this translation unit said
     /// `extern`. See [`crate::symbol::Symbol::has_extern_decl`].
     pub(crate) fn has_extern_decl(&self, name: StringId) -> bool {
@@ -528,6 +550,7 @@ impl<'a> Linearizer<'a> {
                 }
             }
         }
+        self.resolve_aliases();
         std::mem::take(&mut self.module)
     }
 
@@ -1130,7 +1153,7 @@ impl<'a> Linearizer<'a> {
         self.two_reg_return_type = None;
         self.current_func_name = self.emitted_name(func.name);
         self.addr_taken_labels.clear();
-        self.label_addr_refs.clear();
+        self.label_refs.clear();
         self.defined_labels.clear();
         self.label_vla_depth.clear();
         self.pending_goto_vla.clear();
@@ -1169,7 +1192,9 @@ impl<'a> Linearizer<'a> {
             crate::parse::ast::Stmt::While { body, .. }
             | crate::parse::ast::Stmt::DoWhile { body, .. }
             | crate::parse::ast::Stmt::Switch { body, .. }
-            | crate::parse::ast::Stmt::Label { stmt: body, .. } => Self::declares_vla(body),
+            | crate::parse::ast::Stmt::Label { stmt: body, .. }
+            | crate::parse::ast::Stmt::Case(_, _, body)
+            | crate::parse::ast::Stmt::Default(_, body) => Self::declares_vla(body),
             crate::parse::ast::Stmt::For { init, body, .. } => {
                 init.as_ref().is_some_and(|i| match i {
                     crate::parse::ast::ForInit::Declaration(decl) => {
@@ -1188,8 +1213,9 @@ impl<'a> Linearizer<'a> {
 
         // C17 6.8.6.1p1, before anything is lowered: entering the scope of a
         // variably modified identifier without executing its declaration
-        // leaves the object's size never computed.
-        self.check_jumps_into_variably_modified_scopes(&func.body);
+        // leaves the object's size never computed. gcc holds a statement
+        // expression to the same rule.
+        self.check_jumps_into_protected_scopes(&func.body);
 
         self.reset_for_function(func);
 
@@ -1249,6 +1275,13 @@ impl<'a> Linearizer<'a> {
         ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
         ir_func.symbol_attrs = func.attrs.symbol.clone();
+        // `alias` on a definition -- written on it, or on an earlier
+        // prototype -- asks for two things one symbol cannot be. Recorded
+        // like any other alias, so `resolve_aliases` reports it once.
+        if ir_func.symbol_attrs.alias.take().is_some() {
+            let kind = super::linearize_init::AliasKind::Function;
+            self.declare_alias(&ir_func.name, &func.attrs.symbol, is_static, kind, func.pos);
+        }
         ir_func.align = func.attrs.align;
         ir_func.is_noinline = func.attrs.noinline;
         ir_func.declared_effect = func.attrs.effect;
@@ -1514,6 +1547,7 @@ impl<'a> Linearizer<'a> {
 
         // Linearize body
         self.linearize_stmt(&func.body);
+        self.check_label_references();
 
         // The address-taken set is complete only now, so the dispatch block's
         // successors are linked here rather than at each computed goto.
@@ -2388,7 +2422,7 @@ impl<'a> Linearizer<'a> {
             (re, zero)
         };
 
-        let result = self.alloc_local_temp(cast_type);
+        let result = self.frame_temp_addr("__ctmp", cast_type);
         self.emit(Instruction::store(real_val, result, 0, base_typ, base_bits));
         self.emit(Instruction::store(
             imag_val, result, base_bytes, base_typ, base_bits,
@@ -2884,6 +2918,12 @@ impl<'a> Linearizer<'a> {
             FpCompare::GreaterEqual => self.emit_fcmp(Opcode::FCmpOGe, a, b, typ, size),
             FpCompare::Less => self.emit_fcmp(Opcode::FCmpOLt, a, b, typ, size),
             FpCompare::LessEqual => self.emit_fcmp(Opcode::FCmpOLe, a, b, typ, size),
+            // C23 7.12.17.1 has `iseqsig` raise `FE_INVALID` for an unordered
+            // pair, quiet NaN included -- the reverse of its siblings. The
+            // quiet compare emitted here does not raise it for a quiet NaN.
+            // The *answer* is exact; only the exception flag differs -- the
+            // same gap c17's `<` and `>` have, which use this compare too.
+            FpCompare::Equal => self.emit_fcmp(Opcode::FCmpOEq, a, b, typ, size),
             // Ordered and unequal. `!=` will not do: it is *true* for an
             // unordered pair, and this must be false for one.
             FpCompare::LessGreater => {
@@ -3113,6 +3153,7 @@ impl<'a> Linearizer<'a> {
         expr: &Expr,
         func_expr: &Expr,
         args: &[Expr],
+        binding: crate::parse::ast::CalleeBinding,
     ) -> PseudoId {
         // Determine if this is a direct or indirect call.
         // We need to check the TYPE of the function expression:
@@ -3569,6 +3610,7 @@ impl<'a> Linearizer<'a> {
             call_insn.variadic_arg_start = variadic_arg_start;
             call_insn.ends_with_va_arg_pack = ends_with_va_arg_pack;
             call_insn.is_noreturn_call = is_noreturn_call;
+            call_insn.callee_binding = binding;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
             // After a noreturn call, emit Unreachable and start a dead basic block
@@ -3607,6 +3649,7 @@ impl<'a> Linearizer<'a> {
             call_insn.variadic_arg_start = variadic_arg_start;
             call_insn.ends_with_va_arg_pack = ends_with_va_arg_pack;
             call_insn.is_noreturn_call = is_noreturn_call;
+            call_insn.callee_binding = binding;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
             // After a noreturn call, emit Unreachable and start a dead basic block
@@ -4449,15 +4492,19 @@ impl<'a> Linearizer<'a> {
         //
         // and emitting the untaken call left an undefined reference to
         // `__isinff128` in every object that used `isinf` on a double.
+        //
+        // Not when the untaken arm defines a label, though: a computed `goto`
+        // can still reach it, so it has to be emitted. See
+        // [`Expr::defines_label`].
         if let Some(cond_val) = self.eval_const_expr(cond) {
-            let taken = if cond_val != 0 { then_expr } else { else_expr };
-            let result_typ = self.expr_type(expr);
-            if self.types.is_complex(result_typ) {
-                return self.complex_arm_addr(taken, result_typ);
+            let (taken, untaken) = if cond_val != 0 {
+                (then_expr, else_expr)
+            } else {
+                (else_expr, then_expr)
+            };
+            if !untaken.defines_label() {
+                return self.linearize_constant_arm(expr, taken);
             }
-            let value = self.linearize_expr(taken);
-            let taken_typ = self.expr_type(taken);
-            return self.emit_convert(value, taken_typ, result_typ);
         }
 
         let result_typ = self.expr_type(expr);
@@ -4634,6 +4681,18 @@ impl<'a> Linearizer<'a> {
         result
     }
 
+    /// The value of a conditional expression whose constant condition
+    /// selected `taken`, converted to the conditional's own type.
+    fn linearize_constant_arm(&mut self, expr: &Expr, taken: &Expr) -> PseudoId {
+        let result_typ = self.expr_type(expr);
+        if self.types.is_complex(result_typ) {
+            return self.complex_arm_addr(taken, result_typ);
+        }
+        let value = self.linearize_expr(taken);
+        let taken_typ = self.expr_type(taken);
+        self.emit_convert(value, taken_typ, result_typ)
+    }
+
     pub(crate) fn linearize_elvis(
         &mut self,
         expr: &Expr,
@@ -4645,17 +4704,15 @@ impl<'a> Linearizer<'a> {
 
         // A constant condition picks one side outright and never evaluates the
         // other, for the reason `linearize_ternary` records.
+        // The condition is evaluated either way, so only `else_expr` can be
+        // the untaken arm whose label keeps it alive.
         if let Some(cond_const) = self.eval_const_expr(cond) {
-            let (taken, taken_typ) = if cond_const != 0 {
-                (cond, cond_typ)
-            } else {
-                (else_expr, self.expr_type(else_expr))
-            };
-            if self.types.is_complex(result_typ) {
-                return self.complex_arm_addr(taken, result_typ);
+            if cond_const == 0 {
+                return self.linearize_constant_arm(expr, else_expr);
             }
-            let value = self.linearize_expr(taken);
-            return self.emit_convert(value, taken_typ, result_typ);
+            if !else_expr.defines_label() {
+                return self.linearize_constant_arm(expr, cond);
+            }
         }
 
         // A complex result travels by address, and the left operand is both
@@ -5146,6 +5203,7 @@ impl<'a> Linearizer<'a> {
                 let result = self.alloc_pseudo();
 
                 let insn = Instruction::new(Opcode::Memset)
+                    .with_func(self.library_function_name("memset"))
                     .with_target(result)
                     .with_src3(dest_val, c_val, n_val)
                     .with_type_and_size(self.types.void_ptr_id, 64);
@@ -5160,6 +5218,7 @@ impl<'a> Linearizer<'a> {
                 let result = self.alloc_pseudo();
 
                 let insn = Instruction::new(Opcode::Memcpy)
+                    .with_func(self.library_function_name("memcpy"))
                     .with_target(result)
                     .with_src3(dest_val, src_val, n_val)
                     .with_type_and_size(self.types.void_ptr_id, 64);
@@ -5174,6 +5233,7 @@ impl<'a> Linearizer<'a> {
                 let result = self.alloc_pseudo();
 
                 let insn = Instruction::new(Opcode::Memmove)
+                    .with_func(self.library_function_name("memmove"))
                     .with_target(result)
                     .with_src3(dest_val, src_val, n_val)
                     .with_type_and_size(self.types.void_ptr_id, 64);
@@ -5186,6 +5246,7 @@ impl<'a> Linearizer<'a> {
                 let result = self.alloc_pseudo();
 
                 let insn = Instruction::new(Opcode::Fabs64)
+                    .with_func(self.library_function_name("fabs"))
                     .with_target(result)
                     .with_src(arg_val)
                     .with_size(64)
@@ -5199,6 +5260,7 @@ impl<'a> Linearizer<'a> {
                 let result = self.alloc_pseudo();
 
                 let insn = Instruction::new(Opcode::Fabs32)
+                    .with_func(self.library_function_name("fabsf"))
                     .with_target(result)
                     .with_src(arg_val)
                     .with_size(32)
@@ -5237,28 +5299,6 @@ impl<'a> Linearizer<'a> {
             ExprKind::FpCompare { cmp, lhs, rhs } => self.linearize_fp_compare(*cmp, lhs, rhs),
 
             ExprKind::FpClassify { classes, arg } => self.linearize_fp_classify(classes, arg),
-
-            ExprKind::BuiltinComplex { real, imag } => {
-                // __builtin_complex(real, imag) - construct complex value
-                let complex_typ = self.expr_type(expr);
-                let base_typ = self.types.complex_base(complex_typ);
-                let base_bits = self.types.size_bits(base_typ);
-                let base_bytes = (base_bits / 8) as i64;
-
-                let real_val = self.linearize_expr(real);
-                let imag_val = self.linearize_expr(imag);
-
-                // Allocate local to hold the complex value
-                let result = self.alloc_local_temp(complex_typ);
-
-                // Store real and imag parts
-                self.emit(Instruction::store(real_val, result, 0, base_typ, base_bits));
-                self.emit(Instruction::store(
-                    imag_val, result, base_bytes, base_typ, base_bits,
-                ));
-
-                result
-            }
 
             ExprKind::Unreachable => {
                 // __builtin_unreachable() - marks code path as never reached
@@ -5302,6 +5342,7 @@ impl<'a> Linearizer<'a> {
                 let result = self.alloc_pseudo();
 
                 let insn = Instruction::new(Opcode::Setjmp)
+                    .with_func(self.library_function_name("setjmp"))
                     .with_target(result)
                     .with_src(env_val)
                     .with_type_and_size(self.types.int_id, 32);
@@ -5315,7 +5356,8 @@ impl<'a> Linearizer<'a> {
                 let val_val = self.linearize_expr(val);
                 let result = self.alloc_pseudo();
 
-                let mut insn = Instruction::new(Opcode::Longjmp);
+                let mut insn = Instruction::new(Opcode::Longjmp)
+                    .with_func(self.library_function_name("longjmp"));
                 insn.target = Some(result);
                 insn.src = vec![env_val, val_val];
                 insn.typ = Some(self.types.void_id);
@@ -5441,7 +5483,7 @@ impl<'a> Linearizer<'a> {
         let des_raw = self.linearize_expr(desired);
         let des_val = self.emit_convert(des_raw, des_typ, elem_typ);
 
-        let exp_addr = self.alloc_local_temp(elem_typ);
+        let exp_addr = self.frame_temp_addr("__casexp", elem_typ);
         self.emit(Instruction::store(exp_val, exp_addr, 0, elem_typ, bits));
 
         let ok = self.alloc_reg_pseudo();
@@ -5915,30 +5957,12 @@ impl<'a> Linearizer<'a> {
 
     /// GNU `&&label`: the address of a label, for a computed goto.
     fn linearize_label_addr(&mut self, name: &StringId, expr: &Expr) -> PseudoId {
-        let label = self.str(*name).to_string();
-        // Outside a function there is no block to name, and
-        // `get_or_create_label` would unwrap a `None` current
-        // function -- an ICE on `void *g = &&L;` at file scope.
-        if self.current_func.is_none() {
-            crate::diag::error_args(
-                expr.pos,
-                "label '{0}' referenced outside of any function",
-                &[&label],
-            );
+        let Some(sym) = self.take_label_address(*name, expr.pos) else {
             return self.emit_const(0, self.types.void_ptr_id);
-        }
-        let bb = self.get_or_create_label(&label);
-        let sym = format!(".L{}_{}", self.current_func_name, bb.0);
+        };
         let sym_pseudo = self.alloc_pseudo();
         if let Some(func) = &mut self.current_func {
             func.add_pseudo(Pseudo::sym(sym_pseudo, sym));
-        }
-        // The label is a branch target for every indirect goto in this
-        // function, and the CFG has to say so or DCE deletes the block.
-        self.addr_taken_labels.push(bb);
-        self.label_addr_refs.push((label.clone(), expr.pos));
-        if let Some(func) = &mut self.current_func {
-            func.takes_label_addr = true;
         }
         let dst = self.alloc_pseudo();
         let void_ptr = self.types.void_ptr_id;
@@ -6017,7 +6041,7 @@ impl<'a> Linearizer<'a> {
         let imag_val = self.linearize_expr(imag);
 
         // Allocate local to hold the complex value, return its address
-        let result = self.alloc_local_temp(complex_typ);
+        let result = self.frame_temp_addr("__ctmp", complex_typ);
         self.emit(Instruction::store(real_val, result, 0, base_typ, base_bits));
         self.emit(Instruction::store(
             imag_val, result, base_bytes, base_typ, base_bits,
@@ -6189,7 +6213,11 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::CondElvis { cond, else_expr } => self.linearize_elvis(expr, cond, else_expr),
 
-            ExprKind::Call { func, args } => self.linearize_call(expr, func, args),
+            ExprKind::Call {
+                func,
+                args,
+                binding,
+            } => self.linearize_call(expr, func, args, *binding),
 
             ExprKind::Member {
                 expr: inner_expr,

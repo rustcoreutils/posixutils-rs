@@ -22,9 +22,9 @@
 //
 
 use super::codegen::X86_64CodeGen;
-use super::lir::{GpOperand, MemAddr, X86Inst, X87BinOp};
-use super::regalloc::{Loc, Reg, X87_SCRATCH_BYTES};
-use crate::arch::lir::{CondCode, Directive, Label, OperandSize};
+use super::lir::{GpOperand, MemAddr, X86Inst, X87BinOp, XmmOperand};
+use super::regalloc::{Loc, Reg, XmmReg, X87_SCRATCH_BYTES};
+use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeKind, TypeTable};
 
@@ -43,6 +43,75 @@ impl X86_64CodeGen {
     /// [`X87_SCRATCH_BYTES`]; never address it by hand.
     fn x87_scratch_addr(&self) -> MemAddr {
         self.stack_mem(X87_SCRATCH_BYTES)
+    }
+
+    /// Push an inline-asm operand onto the x87 stack.
+    ///
+    /// A `long double` lives in memory and is loaded from there. A `float` or
+    /// `double` may be anywhere -- an XMM or general register, a constant, a
+    /// slot -- and `fld` reads only memory, so it goes through the reserved
+    /// XMM scratch into the x87 scratch. A constant is read at the width it is
+    /// pooled at, not its type's: see `emit_fp_imm_to_xmm`.
+    pub(super) fn emit_x87_asm_push(&mut self, pseudo: PseudoId, size: u32) {
+        if size > 64 {
+            let addr = self.get_x87_mem_addr(pseudo);
+            self.push_lir(X86Inst::X87Load { addr });
+            return;
+        }
+        let bits = match self.get_location(pseudo) {
+            Loc::FImm(_, imm_bits) => imm_bits,
+            _ => size,
+        };
+        let fp_size = if bits <= 32 {
+            FpSize::Single
+        } else {
+            FpSize::Double
+        };
+        let scratch = self.x87_scratch_addr();
+        self.emit_fp_move(pseudo, XmmReg::Xmm15, fp_size);
+        self.push_lir(X86Inst::MovFp {
+            size: fp_size,
+            src: XmmOperand::Reg(XmmReg::Xmm15),
+            dst: XmmOperand::Mem(scratch.clone()),
+        });
+        self.push_lir(match fp_size {
+            FpSize::Single => X86Inst::X87LoadFloat { addr: scratch },
+            _ => X86Inst::X87LoadDouble { addr: scratch },
+        });
+    }
+
+    /// Pop the top of the x87 stack into an inline-asm output's home.
+    ///
+    /// The mirror of `emit_x87_asm_push`: a `long double` is stored to its
+    /// memory, and a `float` or `double` rounded through the x87 scratch and
+    /// the reserved XMM scratch into wherever the allocator put it.
+    pub(super) fn emit_x87_asm_pop(&mut self, pseudo: PseudoId, size: u32) {
+        if size > 64 {
+            let addr = self.get_x87_mem_addr(pseudo);
+            self.push_lir(X86Inst::X87Store { addr });
+            return;
+        }
+        let fp_size = if size <= 32 {
+            FpSize::Single
+        } else {
+            FpSize::Double
+        };
+        let scratch = self.x87_scratch_addr();
+        self.push_lir(match fp_size {
+            FpSize::Single => X86Inst::X87StoreFloat {
+                addr: scratch.clone(),
+            },
+            _ => X86Inst::X87StoreDouble {
+                addr: scratch.clone(),
+            },
+        });
+        self.push_lir(X86Inst::MovFp {
+            size: fp_size,
+            src: XmmOperand::Mem(scratch),
+            dst: XmmOperand::Reg(XmmReg::Xmm15),
+        });
+        let home = self.get_location(pseudo);
+        self.emit_fp_move_from_xmm(XmmReg::Xmm15, &home, fp_size);
     }
 
     /// Check if this instruction operates on long double (80-bit x87)
@@ -618,8 +687,6 @@ impl X86_64CodeGen {
 
             // If destination is XMM, load from scratch location
             if let Loc::Xmm(xmm_reg) = &dst_loc {
-                use super::lir::XmmOperand;
-                use crate::arch::lir::FpSize;
                 let fp_size = if dst_is_float {
                     FpSize::Single
                 } else {
@@ -646,8 +713,6 @@ impl X86_64CodeGen {
                 Loc::Xmm(xmm_reg) => {
                     // XMM register - store to scratch memory first
                     // Must be after callee-saved register area to avoid collision
-                    use super::lir::XmmOperand;
-                    use crate::arch::lir::FpSize;
                     let scratch = self.x87_scratch_addr();
                     let fp_size = if src_is_float {
                         FpSize::Single

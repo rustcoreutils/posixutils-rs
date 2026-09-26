@@ -307,22 +307,6 @@ int test_typedef_as_struct_member(void) {
 }
 
 // ============================================================================
-// Section 20: Non-power-of-2 __attribute__((aligned(3))) silently ignored
-// GCC errors on this; c17 silently ignores (skips non-power-of-2)
-// The variable should get natural alignment, not 3
-// ============================================================================
-
-int test_nonpow2_aligned_ignored(void) {
-    int __attribute__((aligned(3))) nonpow2;
-    nonpow2 = 12345;
-    // Should still be usable — alignment request was silently dropped
-    if (nonpow2 != 12345) return 200;
-    // Alignment should be natural (4 for int), not 3
-    if (_Alignof(int) != 4) return 201;
-    return 0;
-}
-
-// ============================================================================
 // main
 // ============================================================================
 
@@ -347,7 +331,6 @@ int main(void) {
     if ((r = test_trailing_struct_aligned()) != 0) return r;
     if ((r = test_combined_alignas_and_attr()) != 0) return r;
     if ((r = test_typedef_as_struct_member()) != 0) return r;
-    if ((r = test_nonpow2_aligned_ignored()) != 0) return r;
     return 0;
 }
 "#;

@@ -115,7 +115,7 @@ not bounded. They are both plain integers, so nothing stops one being used
 where the other is meant, and the unit (bits or bytes) is a naming convention
 rather than a type.
 
-That cost a silent miscompile once already. While `MAX_OBJECT_BYTES` was
+That cost a silent miscompile once already. While `max_object_bytes` was
 `u32::MAX / 8`, `size_bits` could not saturate -- the parser refused any type
 that would reach it -- so deriving a byte count as `size_bits / 8` was safe by
 accident. Raising the bound made saturation reachable and every such site
@@ -148,7 +148,7 @@ finds rather than a spelling a reader has to notice. Widening `size_bits` to
 364 want a `u32` because they are value widths, and silencing them with `as
 u32` reintroduces the same truncation at the seventy aggregate-fed sites.
 
-A second unit lives in the same area and is settled: `TypeTable::MAX_OBJECT_BYTES`
+A second unit lives in the same area and is settled: `TypeTable::max_object_bytes`
 bounds what a size can be *described* as, while
 `TypeTable::MAX_STACK_OBJECT_BYTES` bounds what the backends can give a *slot*,
 because a frame displacement is an `i32`. `crate::abi::slot_bytes` is the only
@@ -179,7 +179,7 @@ What it takes:
   `ActiveSlot`/`FreeSlot`, `callee_saved_offset`, `stack_alloc_size`,
   `reg_save_area_offset`, the outgoing-argument layout, `IncomingOff`, and the
   CFI directive offsets. `grow_frame` and `slot_bytes` then bound at
-  `MAX_OBJECT_BYTES` instead, less the prologue headroom
+  `max_object_bytes` instead, less the prologue headroom
   (`FRAME_HEADROOM_BYTES`) and the frame's final alignment rounding, which
   `grow_frame` reserves today for the same reason.
 - A displacement outside the target's encodable range goes through a scratch
@@ -273,10 +273,16 @@ Arithmetic, comparison, negation and both directions of conversion fold over
 float constants, at the format the program computes in rather than at the 128
 significand bits a literal is carried in.
 
-What is deliberately left alone is everything that *raises*: a NaN or infinite
-operand, a division by zero, a narrowing that overflows. C lets a program read
-those flags through `<fenv.h>`, and folding the operation takes the flag with
-it. Reinstating them would mean modelling the exception, not just the value.
+Arithmetic and conversion leave alone everything that *raises*: a NaN or
+infinite operand, a division by zero, a narrowing that overflows. C lets a
+program read those flags through `<fenv.h>`, and folding the operation takes
+the flag with it. Reinstating them would mean modelling the exception, not
+just the value.
+
+Comparisons are the exception, as in gcc: one against a NaN constant folds
+(every ordered predicate to 0, `!=` to 1) although an ordered comparison with
+a NaN is specified to raise `FE_INVALID`. Both backends emit quiet compares,
+which do not raise it for a quiet NaN either.
 
 `sccp` has no float lattice, so a float constant that is only constant along
 one reachable path is not propagated -- only `instcombine` sees these.
@@ -366,14 +372,8 @@ Most of what is left is one thing.
 
 | Group | Note |
 |---|---|
-| Builtin folding | The whole of `execute/builtins/`. Each test defines its own `strlen`, `memcpy` or `printf` that calls `abort()` when `__OPTIMIZE__` is set, so a run-time failure there means c17 emitted a real call where gcc folded the builtin or expanded it inline. Nothing fails to *compile*, so no build is blocked; it is gcc-parity and code quality. Deferred by decision. The same group: `execute/printf-chk-1`, `fprintf-chk-1`, `vprintf-chk-1` and `vfprintf-chk-1` at `-O2`, which expect `__printf_chk` with a constant format to become `puts`/`putchar`; `builtins/abs-2`, `abs-3`, `complex-1` and `memcmp` at `-O2`, which expect a constant call folded so that a `link_error` reference disappears; and `builtins/strncmp` at `-O0`, whose own `strncmp` returns an uninitialised value for `n == 0`, so it passes only when the call is folded to 0 -- which gcc does at every level |
-| Dead-call elimination proofs | `20030330-1` and `medce-1` at `-O0` (a constant branch keeps its arm there, which is recorded in DECISIONS.md), and `ieee/compare-fp-3` and `ieee/fp-cmp-6`/`-7`/`-9` at every level. Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link*. Standard C, and optimizer strength rather than a defect: what is missing is folding a comparison whose operands are known to relate |
-| `always_inline` on a library builtin | `pr46360`. `__attribute__((always_inline))` on a declaration of `strncpy` -- c17 refuses because it has no body to substitute, where gcc inlines its own expansion |
-| An `extern inline` reading a file-scope static | `pr38857`. A C17 6.7.4p3 constraint gcc does not enforce. Relaxed by `-fpermissive`; the test does not pass it |
-| Inline asm | `pr34966` -- an x87 output constraint on an operand with no home, at `-O2` only. `pr39394` -- an anonymous struct with a variably-modified member as an `"=m"` operand |
-| An array subscript in a statement expression | `split-path-5`. `({ __typeof__(pat[i]) __x = (pat[i]); ... })` is rejected as a non-constant initializer for an object with static storage duration, which it is not |
-| `__builtin_iseqsig` | `pr122588-1`. The IEEE signalling equality predicate; no system header uses it |
-| The remaining divergence | `991014-1` |
+| Builtin folding | The whole of `execute/builtins/`. Each test defines its own `strlen`, `memcpy` or `printf` that calls `abort()` when `__OPTIMIZE__` is set, so a run-time failure there means c17 emitted a real call where gcc folded the builtin or expanded it inline. Nothing fails to *compile*, so no build is blocked; it is gcc-parity and code quality. Deferred by decision. The same group: `execute/printf-chk-1`, `fprintf-chk-1`, `vprintf-chk-1` and `vfprintf-chk-1` at `-O2`, which expect `__printf_chk` with a constant format to become `puts`/`putchar`; `builtins/abs-2`, `abs-3`, `complex-1` and `memcmp` at `-O2`, which expect a constant call folded so that a `link_error` reference disappears; `builtins/strncmp` at `-O0`, whose own `strncmp` returns an uninitialised value for `n == 0`, so it passes only when the call is folded to 0 -- which gcc does at every level; `builtins/abs-1`, which expects `labs` expanded inline at every level; and `builtins/strnlen`, `strstr-asm`, `fprintf` and `fputs` at `-O1` and above |
+| Dead-call elimination proofs | `20030330-1`, `medce-1` and `ieee/fp-cmp-7` at `-O0`, where a constant branch keeps its arm (recorded in DECISIONS.md). Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link* |
 
 One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.
 gcc accepts a conditional with one `void` arm as an extension; C17 6.5.15p3

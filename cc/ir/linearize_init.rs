@@ -9,7 +9,7 @@
 //! Initializer and global declaration linearization
 
 use super::linearize::*;
-use super::Initializer;
+use super::{Initializer, SymbolAlias};
 use crate::diag::error;
 use crate::float::FloatVal;
 use crate::parse::ast::{BinaryOp, Declaration, Designator, Expr, ExprKind, InitElement, UnaryOp};
@@ -82,6 +82,36 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             // Skip typedef declarations - they don't define storage
             if storage_class.contains(TypeModifiers::TYPEDEF) {
+                continue;
+            }
+
+            // A second name for a definition: neither storage of its own nor
+            // a reference to storage elsewhere, so none of the paths below.
+            if declarator.symbol_attrs.alias.is_some() {
+                if declarator.init.is_some() {
+                    crate::diag::error_args(
+                        declarator.pos,
+                        "'{0}' defined both normally and as 'alias' attribute",
+                        &[crate::arch::lir::undecorated(&name)],
+                    );
+                    continue;
+                }
+                let kind = if self.types.kind(declarator.typ) == TypeKind::Function {
+                    AliasKind::Function
+                } else {
+                    AliasKind::Object
+                };
+                if storage_class.contains(TypeModifiers::THREAD_LOCAL) {
+                    // Accessed as a thread-local, whatever it names.
+                    self.module.extern_tls_symbols.insert(name.clone());
+                }
+                self.declare_alias(
+                    &name,
+                    &declarator.symbol_attrs,
+                    storage_class.contains(TypeModifiers::STATIC),
+                    kind,
+                    declarator.pos,
+                );
                 continue;
             }
 
@@ -214,27 +244,19 @@ impl<'a> super::linearize::Linearizer<'a> {
             // {&&a, &&b};`, which is how an interpreter builds its dispatch
             // table. The label is a real assembler symbol, so this is the same
             // shape as a string-literal reference.
-            ExprKind::LabelAddr(name) => {
-                let label = self.str(*name).to_string();
-                // A label belongs to a function. At file scope there is no
-                // block to name, and asking for one unwrapped a `None`
-                // current function -- an ICE rather than a diagnostic.
-                if self.current_func.is_none() {
-                    crate::diag::error_args(
-                        expr.pos,
-                        "label '{0}' referenced outside of any function",
-                        &[&label],
-                    );
-                    return Initializer::Int(0);
+            //
+            // Every initializer that reaches here has static storage duration,
+            // so the function can no longer be copied: see
+            // `Function::saves_label_in_static`.
+            ExprKind::LabelAddr(name) => match self.take_label_address(*name, expr.pos) {
+                Some(sym) => {
+                    if let Some(func) = &mut self.current_func {
+                        func.saves_label_in_static = true;
+                    }
+                    Initializer::SymAddr(sym)
                 }
-                let bb = self.get_or_create_label(&label);
-                self.addr_taken_labels.push(bb);
-                self.label_addr_refs.push((label.clone(), expr.pos));
-                if let Some(func) = &mut self.current_func {
-                    func.takes_label_addr = true;
-                }
-                Initializer::SymAddr(format!(".L{}_{}", self.current_func_name, bb.0))
-            }
+                None => Initializer::Int(0),
+            },
 
             // String literal - for arrays, store as String; for pointers, create label reference
             ExprKind::StringLit(s) => {
@@ -1593,5 +1615,205 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         }
         false
+    }
+}
+
+/// Whether an alias, or what it names, is code or data.
+///
+/// gcc refuses to make one name for the other: a function symbol's value is
+/// an address in `.text`, and treating it as an object -- or calling an
+/// object -- is never what the program meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AliasKind {
+    Function,
+    Object,
+}
+
+/// An `__attribute__((alias))` declaration, awaiting the end of the unit.
+#[derive(Debug, Clone)]
+pub(crate) struct DeclaredAlias {
+    /// The alias, as emitted.
+    name: String,
+    /// The target, as written in the attribute.
+    target: String,
+    kind: AliasKind,
+    is_static: bool,
+    weak: bool,
+    visibility: Option<String>,
+    pos: Position,
+}
+
+/// Why an alias's target is not something it can name.
+enum AliasFault {
+    /// Nothing in this unit defines it.
+    Undefined,
+    /// Defined only as an inline definition, which emits no symbol here.
+    External,
+}
+
+impl<'a> super::linearize::Linearizer<'a> {
+    /// Record `name` as `__attribute__((alias))` for the target in `attrs`.
+    ///
+    /// Every declaration of the alias may repeat the attribute; the first is
+    /// the one recorded.
+    pub(crate) fn declare_alias(
+        &mut self,
+        name: &str,
+        attrs: &crate::parse::ast::SymbolAttrs,
+        is_static: bool,
+        kind: AliasKind,
+        pos: Position,
+    ) {
+        let Some(target) = attrs.alias.clone() else {
+            return;
+        };
+        if self.declared_aliases.iter().any(|a| a.name == name) {
+            return;
+        }
+        self.declared_aliases.push(DeclaredAlias {
+            name: name.to_string(),
+            target,
+            kind,
+            is_static,
+            weak: attrs.weak,
+            visibility: attrs.visibility.clone(),
+            pos,
+        });
+    }
+
+    /// Check every alias against the finished unit and hand the good ones to
+    /// the module.
+    ///
+    /// Done last because C lets the target be defined after the alias, and
+    /// because an ordinary redeclaration of the alias -- `extern int b;` after
+    /// `extern int b __attribute__((alias("a")));` -- records it as an
+    /// external reference, which it is not.
+    pub(crate) fn resolve_aliases(&mut self) {
+        let declared = std::mem::take(&mut self.declared_aliases);
+        for a in &declared {
+            self.module.extern_symbols.remove(&a.name);
+            self.module.declared_symbol_attrs.remove(&a.name);
+            self.module.extern_object_align.remove(&a.name);
+        }
+        // Mach-O has no symbol aliases -- clang refuses the attribute on
+        // Darwin for the same reason -- so there is nothing correct to emit.
+        if self.target.os == crate::target::Os::MacOS {
+            for a in &declared {
+                error(
+                    a.pos,
+                    &gettextrs::gettext("aliases are not supported on darwin"),
+                );
+            }
+            return;
+        }
+        for a in &declared {
+            if let Some(alias) = self.resolve_alias(&declared, a) {
+                self.module.aliases.push(alias);
+            }
+        }
+    }
+
+    /// Check one alias, diagnosing it if it cannot be made.
+    fn resolve_alias(&self, declared: &[DeclaredAlias], a: &DeclaredAlias) -> Option<SymbolAlias> {
+        let shown = crate::arch::lir::undecorated(&a.name);
+        // An inline definition emits no symbol, so it and an alias of the
+        // same name coexist: the body is there to inline, and the alias is
+        // what an out-of-line call reaches (gcc.c-torture `20011119-1`).
+        let defined_here = self
+            .module
+            .functions
+            .iter()
+            .any(|f| f.name == a.name && f.emit)
+            || self.module.globals.iter().any(|g| g.name == a.name);
+        if defined_here {
+            crate::diag::error_args(
+                a.pos,
+                "'{0}' defined both normally and as 'alias' attribute",
+                &[shown],
+            );
+            return None;
+        }
+        let (target, kind) = match self.alias_target(declared, &a.target) {
+            Ok(found) => found,
+            Err(AliasFault::Undefined) => {
+                crate::diag::error_args(
+                    a.pos,
+                    "'{0}' aliased to undefined symbol '{1}'",
+                    &[shown, &a.target],
+                );
+                return None;
+            }
+            Err(AliasFault::External) => {
+                crate::diag::error_args(
+                    a.pos,
+                    "'{0}' aliased to external symbol '{1}'",
+                    &[shown, &a.target],
+                );
+                return None;
+            }
+        };
+        if kind != a.kind {
+            crate::diag::error_args(
+                a.pos,
+                "'{0}' alias between function and variable is not supported",
+                &[shown],
+            );
+            return None;
+        }
+        Some(SymbolAlias {
+            name: a.name.clone(),
+            target,
+            is_static: a.is_static,
+            weak: a.weak,
+            visibility: a.visibility.clone(),
+        })
+    }
+
+    /// The emitted name `target` refers to, and what kind of symbol it
+    /// finally names.
+    ///
+    /// The target is matched by its assembler name, as gcc matches it. It may
+    /// itself be an alias: the `.set` names that alias, and the kind is read
+    /// off the definition at the end of the chain.
+    fn alias_target(
+        &self,
+        declared: &[DeclaredAlias],
+        target: &str,
+    ) -> Result<(String, AliasKind), AliasFault> {
+        let undecorated = crate::arch::lir::undecorated;
+        let mut emitted: Option<String> = None;
+        let mut cur = target;
+        // One hop per alias at most; anything longer is a cycle, which
+        // defines nothing.
+        for _ in 0..=declared.len() {
+            if let Some(f) = self
+                .module
+                .functions
+                .iter()
+                .find(|f| undecorated(&f.name) == cur)
+            {
+                if !f.emit {
+                    return Err(AliasFault::External);
+                }
+                return Ok((
+                    emitted.unwrap_or_else(|| f.name.clone()),
+                    AliasKind::Function,
+                ));
+            }
+            if let Some(g) = self
+                .module
+                .globals
+                .iter()
+                .find(|g| undecorated(&g.name) == cur)
+            {
+                return Ok((emitted.unwrap_or_else(|| g.name.clone()), AliasKind::Object));
+            }
+            let Some(next) = declared.iter().find(|d| undecorated(&d.name) == cur) else {
+                return Err(AliasFault::Undefined);
+            };
+            emitted.get_or_insert_with(|| next.name.clone());
+            cur = &next.target;
+        }
+        Err(AliasFault::Undefined)
     }
 }

@@ -12,8 +12,8 @@
 #![allow(clippy::approx_constant)]
 
 use crate::parse::ast::{
-    AssignOp, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ExternalDecl, ForInit, FunctionDef,
-    Stmt, TranslationUnit, UnaryOp,
+    AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Expr, ExprKind, ExternalDecl,
+    ForInit, FunctionDef, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::parse::parser::{ParseResult, Parser};
 use crate::strings::{StringId, StringTable};
@@ -880,7 +880,7 @@ fn test_arrow_access() {
 fn test_function_call_no_args() {
     let (expr, _types, strings, symbols) = parse_expr_with_vars("foo()", &["foo"]).unwrap();
     match expr.kind {
-        ExprKind::Call { func, args } => {
+        ExprKind::Call { func, args, .. } => {
             match func.kind {
                 ExprKind::Ident(symbol_id) => {
                     check_name(&strings, symbols.get(symbol_id).name, "foo")
@@ -897,7 +897,7 @@ fn test_function_call_no_args() {
 fn test_function_call_with_args() {
     let (expr, _types, strings, symbols) = parse_expr_with_vars("foo(1, 2, 3)", &["foo"]).unwrap();
     match expr.kind {
-        ExprKind::Call { func, args } => {
+        ExprKind::Call { func, args, .. } => {
             match func.kind {
                 ExprKind::Ident(symbol_id) => {
                     check_name(&strings, symbols.get(symbol_id).name, "foo")
@@ -5335,9 +5335,69 @@ fn test_aligned_typedef_as_struct_member() {
     }
 }
 
+/// The argument is an integer constant expression, not one numeric token:
+/// a hex or suffixed literal, arithmetic, `sizeof` and a parenthesised value
+/// all fold.
+#[test]
+fn test_attr_aligned_constant_expressions() {
+    for (src, align) in [
+        ("int __attribute__((aligned(0x40))) x;", 64),
+        ("int __attribute__((aligned(16UL))) x;", 16),
+        ("int __attribute__((aligned(2 * sizeof(int)))) x;", 8),
+        ("int __attribute__((aligned((0x20)))) x;", 32),
+        ("int x __attribute__((__aligned__(1 << 5)));", 32),
+    ] {
+        let (decl, _types, _strings, _symbols) = parse_decl(src).unwrap();
+        assert_eq!(decl.declarators[0].explicit_align, Some(align), "{src}");
+    }
+}
+
+/// An enumerator in `aligned` is its value, not a name the attribute ignores.
+#[test]
+fn test_attr_aligned_enumerator() {
+    let (tu, _types, _strings, _symbols) =
+        parse_tu("enum { A = 32 }; int __attribute__((aligned(A))) x;").unwrap();
+    let ExternalDecl::Declaration(ref decl) = tu.items[1] else {
+        panic!("Expected Declaration");
+    };
+    assert_eq!(decl.declarators[0].explicit_align, Some(32));
+}
+
+/// A `vector_size` past 2^31 bytes still aligns to 16, as gcc's does.
+///
+/// The width was rounded to a power of two and then cast to `u32` before the
+/// cap was applied, so 2^32 bytes and more came out with alignment 0.
+#[test]
+fn test_attr_vector_size_wide_alignment() {
+    if let Err(e) = parse_tu(
+        "typedef long V __attribute__((vector_size(8589934592L)));\n\
+         _Static_assert(_Alignof(V) == 16, \"align\");\n\
+         _Static_assert(sizeof(V) == 8589934592UL, \"size\");",
+    ) {
+        panic!("should have parsed: {e}");
+    }
+}
+
+/// `vector_size` folds its argument the same way.
+#[test]
+fn test_attr_vector_size_constant_expression() {
+    let (tu, types, _strings, _symbols) = parse_tu(
+        "typedef int V __attribute__((vector_size(2 * sizeof(int)))); \
+         typedef float W __attribute__((vector_size(sizeof(float) * 4))); \
+         V v; W w;",
+    )
+    .unwrap();
+    for (item, size) in [(2, 8), (3, 16)] {
+        let ExternalDecl::Declaration(ref decl) = tu.items[item] else {
+            panic!("Expected Declaration");
+        };
+        assert_eq!(types.size_bytes(decl.declarators[0].typ), size);
+    }
+}
+
 #[test]
 fn test_attr_aligned_nonpow2_ignored() {
-    // Non-power-of-2 is silently ignored — variable gets no explicit alignment
+    // Non-power-of-2 is diagnosed and not applied
     let (decl, _types, _strings, _symbols) =
         parse_decl("int __attribute__((aligned(3))) x;").unwrap();
     assert_eq!(decl.declarators[0].explicit_align, None);
@@ -5887,7 +5947,7 @@ fn test_stack_object_larger_than_a_frame_slot_is_rejected() {
 /// Static storage duration is not the frame's problem.
 ///
 /// The guard that keeps the new ceiling from becoming a second, tighter
-/// `MAX_OBJECT_BYTES`. `array_parameter_decays` and the pointer case are the two
+/// `max_object_bytes`. `array_parameter_decays` and the pointer case are the two
 /// that break if the parameter check is moved before the C17 6.7.5.3 adjustment:
 /// that parameter is a `char *`. A variable length array has no static extent to
 /// measure, so the rule declines to answer: its extent is subtracted from the
@@ -5908,6 +5968,87 @@ fn test_static_object_larger_than_a_frame_slot_is_accepted() {
     ] {
         if let Err(e) = parse_tu(src) {
             panic!("{src}\nshould have parsed: {e}");
+        }
+    }
+}
+
+/// An object may be as large as `PTRDIFF_MAX`, gcc's bound, and `sizeof` and
+/// every spelling of a member offset fold exactly up to it.
+///
+/// The bound was `u64::MAX / 8` because struct layout accumulated its bits in
+/// a `usize`, so gcc.c-torture `991014-1` -- a struct of 2^63 - 496 bytes --
+/// was refused. Each `_Static_assert` below is gcc's answer.
+#[test]
+fn test_object_up_to_ptrdiff_max_is_accepted() {
+    let src = "\
+        struct H { short buf[(1L << 62) - 256]; int a, b, c, d; };\n\
+        union U { int a; char buf[(1L << 62) - 256]; };\n\
+        struct B { char pad[5000000000L]; int x; unsigned f : 3, g : 5; long y; };\n\
+        struct E { char buf[9223372036854775807L]; };\n\
+        _Static_assert(sizeof(struct H) == 9223372036854775312UL, \"H\");\n\
+        _Static_assert(sizeof(union U) == 4611686018427387648UL, \"U\");\n\
+        _Static_assert(sizeof(struct E) == 9223372036854775807UL, \"E\");\n\
+        _Static_assert(__builtin_offsetof(struct H, d) == 9223372036854775308UL, \"d\");\n\
+        _Static_assert((unsigned long)&((struct H *)0)->b == 9223372036854775300UL, \"b\");\n\
+        _Static_assert(__builtin_offsetof(struct B, y) == 5000000008UL, \"y\");\n\
+        _Static_assert(sizeof(struct B) == 5000000016UL, \"B\");\n\
+        _Static_assert(sizeof(struct B[3]) == 15000000048UL, \"B[3]\");\n\
+        _Static_assert(sizeof(char[9223372036854775807L]) == 9223372036854775807UL, \"max\");\n";
+    if let Err(e) = parse_tu(src) {
+        panic!("should have parsed: {e}");
+    }
+}
+
+/// One byte past `PTRDIFF_MAX` is refused, in each of the shapes that can
+/// reach it, and the message names the bound.
+#[test]
+fn test_object_past_ptrdiff_max_is_rejected() {
+    for (src, needle) in [
+        (
+            "char a[9223372036854775808UL];",
+            "size of array is too large",
+        ),
+        ("int a[2305843009213693952L];", "size of array is too large"),
+        (
+            "char a[4000000000L][4000000000L];",
+            "size of array is too large",
+        ),
+        (
+            "struct H { short buf[(1L << 62) - 256]; int a; }; struct H h[2];",
+            "size of array is too large",
+        ),
+        (
+            "struct S { char a[9223372036854775807L]; int b; };",
+            "type 'struct S' is too large",
+        ),
+        (
+            "struct S { char a[9223372036854775807L]; char b; };",
+            "type 'struct S' is too large",
+        ),
+        (
+            "struct S { char a[9223372036854775807L]; char b[9223372036854775807L]; \
+             char c[9223372036854775807L]; };",
+            "type 'struct S' is too large",
+        ),
+        (
+            "union U { char a[9223372036854775807L]; int b; };",
+            "type 'union U' is too large",
+        ),
+        (
+            "struct { char a[9223372036854775807L]; int b; } s;",
+            "type 'struct <anonymous>' is too large",
+        ),
+    ] {
+        match parse_tu(src) {
+            Err(e) => {
+                let e = e.to_string();
+                assert!(e.contains(needle), "{src}\nwrong message: {e}");
+                assert!(
+                    e.contains("maximum object size of 9223372036854775807 bytes"),
+                    "{src}\nmessage does not name the bound: {e}"
+                );
+            }
+            Ok(_) => panic!("{src}\nshould have been rejected"),
         }
     }
 }
@@ -6136,4 +6277,187 @@ fn test_attributes_follow_their_declarator_in_a_list() {
         .filter(|(n, _)| n.starts_with('w'))
         .collect();
     assert_eq!(weak, [("wa".to_string(), true), ("wb".to_string(), true)]);
+}
+
+/// `alias("target")` is a symbol attribute like `weak`: it reaches the
+/// declarator it is written on and no other, in either spelling.
+#[test]
+fn test_alias_attribute_reaches_its_declarator() {
+    let (tu, _types, strings, symbols) = parse_tu(
+        "int a;\n\
+         extern int b __attribute__((alias(\"a\"))), c;\n\
+         int f(void) __attribute__((__alias__(\"g\")));\n",
+    )
+    .unwrap();
+    let got: Vec<(String, Option<String>)> = tu
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ExternalDecl::Declaration(d) => Some(d.declarators.iter()),
+            _ => None,
+        })
+        .flatten()
+        .map(|d| {
+            let name = strings.get(symbols.get(d.symbol).name).to_string();
+            (name, d.symbol_attrs.alias.clone())
+        })
+        .collect();
+    let want: Vec<(String, Option<String>)> =
+        [("a", None), ("b", Some("a")), ("c", None), ("f", Some("g"))]
+            .into_iter()
+            .map(|(n, t)| (n.to_string(), t.map(str::to_string)))
+            .collect();
+    assert_eq!(got, want);
+}
+
+/// A library function spelled `__builtin_X` is a call to the library's `X`;
+/// the same function called by its own name is a call to whatever the unit
+/// declares, which may be an inline definition.
+#[test]
+fn test_library_builtin_call_binds_to_the_library() {
+    let (tu, _types, strings, _symbols) = parse_tu(
+        "char *strncpy(char *, const char *, unsigned long);\n\
+         char *lib(char *d) { return __builtin_strncpy(d, d, 1); }\n\
+         char *own(char *d) { return strncpy(d, d, 1); }\n",
+    )
+    .unwrap();
+    let binding_in = |fname: &str| {
+        let body = tu
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ExternalDecl::FunctionDef(f) if strings.get(f.name) == fname => Some(&f.body),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no definition of {fname}"));
+        let Stmt::Block(items) = body else {
+            panic!("{fname}: body is not a block");
+        };
+        let Some(BlockItem::Statement(stmt)) = items.first() else {
+            panic!("{fname}: expected a statement");
+        };
+        let Stmt::Return(Some(expr)) = &**stmt else {
+            panic!("{fname}: expected a return statement");
+        };
+        let ExprKind::Call { binding, .. } = &expr.kind else {
+            panic!("{fname}: expected a call");
+        };
+        *binding
+    };
+    assert_eq!(binding_in("lib"), CalleeBinding::Library);
+    assert_eq!(binding_in("own"), CalleeBinding::Declared);
+}
+
+/// A statement expression whose last statement is a labeled expression
+/// statement takes that expression's value, as gcc does (compile/pr17913).
+/// The labels stay where they were, each labelling an empty statement.
+#[test]
+fn test_stmt_expr_labeled_last_statement_has_its_value() {
+    let (expr, types, _, _) = parse_expr("({ a: b: 5; })").unwrap();
+    let ExprKind::StmtExpr { stmts, result } = &expr.kind else {
+        panic!("expected StmtExpr");
+    };
+    assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int);
+    assert!(matches!(result.kind, ExprKind::IntLit(5)));
+    assert_eq!(stmts.len(), 2);
+    for item in stmts {
+        let BlockItem::Statement(stmt) = item else {
+            panic!("expected a statement");
+        };
+        assert!(matches!(&**stmt, Stmt::Label { stmt, .. } if matches!(**stmt, Stmt::Empty)));
+    }
+}
+
+/// A `case` or `default` label in front of the last statement is a label like
+/// any other: the statement expression keeps its value, so the one error such
+/// a program earns is "switch jumps into statement expression", not a second
+/// one about a `void` value.
+#[test]
+fn test_stmt_expr_case_labeled_last_statement_has_its_value() {
+    for src in ["({ case 1: 5; })", "({ default: 5; })"] {
+        let (expr, types, _, _) = parse_expr(src).unwrap();
+        let ExprKind::StmtExpr { stmts, result } = &expr.kind else {
+            panic!("expected StmtExpr");
+        };
+        assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int, "{src}");
+        assert!(matches!(result.kind, ExprKind::IntLit(5)), "{src}");
+        let [BlockItem::Statement(label)] = stmts.as_slice() else {
+            panic!("{src}: expected one label");
+        };
+        assert!(
+            matches!(&**label, Stmt::Case(_, _, s) | Stmt::Default(_, s) if matches!(**s, Stmt::Empty)),
+            "{src}"
+        );
+    }
+}
+
+/// `Expr::defines_label` finds a label in a statement expression at any
+/// depth, and nothing else counts as one.
+#[test]
+fn test_expr_defines_label() {
+    let (expr, _, _, _) = parse_expr("1 ? 2 : ({ a: 3; })").unwrap();
+    let ExprKind::Conditional {
+        then_expr,
+        else_expr,
+        ..
+    } = &expr.kind
+    else {
+        panic!("expected Conditional");
+    };
+    assert!(!then_expr.defines_label());
+    assert!(else_expr.defines_label());
+
+    let nested = "(1, -({ int x = ({ if (1) { b: ; } 1; }); x; }))";
+    assert!(parse_expr(nested).unwrap().0.defines_label());
+    for src in ["({ 1; })", "({ int y = 2; y; })", "1 + 2"] {
+        assert!(!parse_expr(src).unwrap().0.defines_label(), "{src}");
+    }
+}
+
+/// The alignment of a type-name written with `__attribute__((aligned(N)))`,
+/// wherever the attribute stands in it.
+#[test]
+fn test_type_name_attributes() {
+    for (src, want) in [
+        ("_Alignof(int __attribute__((aligned(16))))", 16),
+        ("_Alignof(__attribute__((aligned(8))) int)", 8),
+        ("_Alignof(const __attribute__((aligned(16))) long)", 16),
+        ("_Alignof(int __attribute__((aligned(16))) *)", 16),
+        ("_Alignof(int * __attribute__((aligned(16))))", 16),
+        ("_Alignof(int __attribute__((aligned(2))))", 2),
+        ("_Alignof(int __attribute__((packed)))", 4),
+    ] {
+        let (expr, types, _, _) = parse_expr(src).unwrap();
+        let ExprKind::AlignofType(typ) = expr.kind else {
+            panic!("{src}: expected AlignofType, got {:?}", expr.kind);
+        };
+        assert_eq!(types.alignment(typ), want, "{src}");
+    }
+}
+
+/// A type-name's attributes are its own. Before, the type-name wrote them to
+/// the enclosing declaration's slots, and a struct's member list read the
+/// enclosing declaration's alignment as its first member's.
+#[test]
+fn test_type_name_attributes_do_not_reach_the_declaration() {
+    let (decl, _, _, _) =
+        parse_decl("char c = sizeof(int * __attribute__((aligned(64))));").unwrap();
+    assert_eq!(decl.declarators[0].explicit_align, None);
+
+    let (decl, types, _, _) = parse_decl("_Alignas(16) struct { char a; char b; } x;").unwrap();
+    assert_eq!(decl.declarators[0].explicit_align, Some(16));
+    assert_eq!(types.size_bytes(decl.declarators[0].typ), 2);
+}
+
+/// `aligned` on a reference to an existing tag is the declaration's, as gcc
+/// has it: it aligns `z`, and the struct itself keeps its alignment.
+#[test]
+fn test_aligned_on_a_tag_reference_aligns_the_declaration() {
+    let (tu, types, _, _) =
+        parse_tu("struct S { int a; }; struct S __attribute__((aligned(32))) z;").unwrap();
+    let ExternalDecl::Declaration(decl) = &tu.items[1] else {
+        panic!("expected a declaration");
+    };
+    assert_eq!(decl.declarators[0].explicit_align, Some(32));
+    assert_eq!(types.alignment(decl.declarators[0].typ), 4);
 }

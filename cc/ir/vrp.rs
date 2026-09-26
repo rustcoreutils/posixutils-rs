@@ -42,7 +42,7 @@ use super::constfold::{
     cmp_mask, cmp_operand_width, eval_binop, eval_unop, get_cmp_info, is_comparison,
     result_type_of, CMP_ALL, CMP_EQ, CMP_GT, CMP_LT,
 };
-use super::facts::{CmpFacts, ConstMap};
+use super::facts::{CmpDomain, CmpFacts, ConstMap};
 use super::propagate::{self, cbr_taken, switch_taken, Site};
 use super::range::{allowed_by_predicate, possible_orderings, Range};
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
@@ -528,7 +528,15 @@ impl<'a> Solver<'a> {
             let Some(width) = Range::at(width) else {
                 continue;
             };
-            let Some(fact) = self.cmps.get_through(&self.consts, p, width) else {
+            // A float comparison says nothing about an integer range.
+            let Some((fact, signed)) =
+                self.cmps
+                    .get_through(&self.consts, p, width)
+                    .and_then(|f| match f.domain {
+                        CmpDomain::Int { signed } => Some((f, signed)),
+                        CmpDomain::Float => None,
+                    })
+            else {
                 continue;
             };
             let m = if w { fact.mask } else { !fact.mask & CMP_ALL };
@@ -555,15 +563,11 @@ impl<'a> Solver<'a> {
             self.watch(fact.rhs, site);
             let lhs_r = self.range_or_full(pred, fact.lhs, fact.width);
             let rhs_r = self.range_or_full(pred, fact.rhs, fact.width);
-            record_fact(
-                &mut out,
-                fact.lhs,
-                allowed_by_predicate(m, fact.signed, &rhs_r),
-            );
+            record_fact(&mut out, fact.lhs, allowed_by_predicate(m, signed, &rhs_r));
             record_fact(
                 &mut out,
                 fact.rhs,
-                allowed_by_predicate(super::constfold::mirror_mask(m), fact.signed, &lhs_r),
+                allowed_by_predicate(super::constfold::mirror_mask(m), signed, &lhs_r),
             );
         }
 

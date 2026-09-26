@@ -207,10 +207,9 @@ fn check_forwarding_resolved(module: &Module) {
     let mut reported = std::collections::BTreeSet::new();
     for func in module.functions.iter().filter(|f| f.emit) {
         for insn in func.blocks.iter().flat_map(|b| &b.insns) {
-            if insn.op != crate::ir::Opcode::Call {
-                continue;
-            }
-            let Some(callee) = insn.func_name.as_deref() else {
+            // A `__builtin_X` call reaches the library's `X`, which has the
+            // out-of-line definition this one lacks.
+            let Some(callee) = insn.local_callee() else {
                 continue;
             };
             let Some(&forwards) = suppressed.get(callee) else {

@@ -228,9 +228,7 @@ two members were already there.
 
 Anything GNU-specific or newer than C17 is **out of scope**: the harness skips
 it with a named reason instead of reporting a failure, because counting it
-measures a decision rather than a defect. These are skipped on top of what the
-older `UNSUPPORTED_RE` already caught (`vector_size`, `__label__`,
-`__builtin_apply`, `__builtin_setjmp`, `alias`).
+measures a decision rather than a defect.
 
 Each entry is `<sub-suite>/<name>`, because a test name is not unique across
 them: `20021204-1`, `20031011-1` and `20050119-1` name a nested-function test
@@ -239,15 +237,19 @@ list silenced all six.
 
 | Category | Tests |
 |---|---|
-| Nested functions | `execute/`: `20010209-1`, `20010605-1`, `20030501-1`, `20040520-1`, `20090219-1`, `nest-align-1`, `nestfunc-7`, `nest-stdar-1`, `pr103405`, `pr22061-3`, `pr22061-4`. `compile/`: `20010903-2`, `20011023-1`, `20020309-1`, `20021204-1`, `20030418-1`, `20030716-1`, `20031011-1`, `20040310-1`, `20040317-3`, `20050119-1`, `951116-1`, `nested-2`, `nested-3`, `pr35006`, `pr99324`. Needs a static chain and executable trampolines |
+| Nested functions | `execute/`: `20010209-1`, `20010605-1`, `20030501-1`, `20040520-1`, `20090219-1`, `nest-align-1`, `nestfunc-7`, `nest-stdar-1`, `pr103405`, `pr22061-3`, `pr22061-4`. `compile/`: `20010903-2`, `20011023-1`, `20020309-1`, `20021204-1`, `20030418-1`, `20030716-1`, `20031011-1`, `20040310-1`, `20040317-3`, `20050119-1`, `951116-1`, `nested-2`, `nested-3`, `pr35006`, `pr99324`, `20010226-1`, `20040323-1`, `930506-2`, `pr27889`, `nested-1`; `execute/` also `20000822-1`, `920612-2`, `921017-1`, `921215-1`, `931002-1`, `nestfunc-1`..`-3`, `pr71494`. Needs a static chain and executable trampolines |
 | VLA as a struct member | `execute/`: `20020412-1`, `20040308-1`, `20040423-1`, `20041218-2`, `20070919-1`, `align-nest`, `pr41935`, `pr82210`. `compile/`: `20020210-1`, `20030224-1`, `20050801-2`, `920428-4`, `920501-16`, `pr42956`, `pr77754-6`, `pr82564`. Needs struct layout computed at run time, and `offsetof` through it |
-| Post-C17 | `pr80692` (`_Decimal64`, TR 24732), `pr123978`, `pr124358`, `pr125291` (C23 `[[...]]` attributes), and `compile/pr111059-7`..`-12` and `compile/pr111911-2` (C23 `enum E : bool`) |
+| Post-C17 | `pr80692` (`_Decimal64`, TR 24732), `pr123978`, `pr124358`, `pr125291` (C23 `[[...]]` attributes), `compile/pr111059-7`..`-12` and `compile/pr111911-2` (C23 `enum E : bool`), and `builtins/uabs-1`..`-3` (C2y `uabs`) |
 | GNU-only attribute | `20230630-2`, `20230630-4` (`scalar_storage_order`; needs reverse-endian load/store lowering) |
 | gcc's own front ends | `compile/pr115143-2`, `compile/pr115143-3` (`-fgimple`, which parses gcc's internal representation rather than C; gcc rejects them without the flag too) |
 | `-fgnu89-inline` semantics | `compile/20021120-1`, `compile/20021120-2`. c17 honours the flag; these also want a redefinition *rejected* without it, which c17 does not diagnose |
 | Another target's backend | `compile/mipscop-1`..`-4` |
 | `__builtin_issignaling` | `ieee/builtin-issignaling-1` and its eight format-specific siblings. No system header uses the builtin, and seven of the nine need a format c17 does not have (`_Float128`, `_Float64x`, `bfloat16`) |
 | Pre-C99 implicit `int` with no dialect request | `compile/pr29201`. C17 6.7.2p2 requires a type specifier and gcc made it an error too; a test that asks, with `-std=gnu89` or `-fpermissive`, is honoured and passes |
+| Vector values | Arithmetic, copies, initializers and comparisons of whole vectors, `__builtin_convertvector`. `vector_size` gives storage only (see above), and a test that only declares vectors runs |
+| `__label__` | Block-scope label declarations exist for nested functions and go with them |
+| Label difference as a constant | `compile/labels-3`, `execute/pr70460`: `&&a - &&b` in a static initializer. Labels as values are supported; the difference needs a symbol-difference relocation |
+| A C17 constraint gcc only warns about | `compile/pr38857`: 6.7.4p3, an external inline definition referring to a static. `-fpermissive` relaxes it |
 | gcc-specific *behaviour* | `20021127-1` (gcc folds `llabs()` and never calls the program's own definition of it), `20031003-1` (gcc's folder saturates undefined behaviour; aarch64 agrees by hardware accident), `pr46309` (a conditional with one `void` arm, which C17 6.5.15p3 forbids) |
 
 These are listed **by name** in the harness, never matched against the source.
@@ -257,10 +259,10 @@ content match threw away three cases c17 gets right. A name list also keeps
 every skip auditable, and a test added to the suite later shows up as a new
 failure and gets triaged then -- which is the right moment to decide.
 
-The one thing still matched by content is the older `UNSUPPORTED_RE`, and it
-now follows a relative `#include` too: `pr71626-2`, `pr109938` and `pr109986`
-are thin wrappers around files elsewhere in the tree, so the `vector_size`
-that blocks them is not in the file named on the command line.
+Nothing is matched by content: every test is attempted unless a list names it,
+and a test's `.x` file is read for the few shapes the suite uses rather than
+taken as "skip". Matching the source, the `dg-require-effective-target` names,
+or the mere presence of a `.x` file hid tests c17 passes and bugs it had.
 
 Skipping a test that *passes* is reported as a regression, by name -- proved by
 injecting one into a skip list and watching the gate fail.
@@ -268,14 +270,13 @@ injecting one into a skip list and watching the gate fail.
 ### Deliberate divergences from gcc
 
 `20021127-1`, `20031003-1` and `pr46309` are skipped as gcc-specific behaviour
-above; the reasoning is in that table. Two more are divergences c17 keeps but
-does **not** skip, because neither is GNU-specific:
+above; the reasoning is in that table. One more is a divergence c17 keeps but
+does **not** skip, because it is not GNU-specific:
 
 | Test | Why c17 does not follow |
 |---|---|
-| `991014-1` | Needs an object of ~9.2 exabytes. `MAX_OBJECT_BYTES` is `u64::MAX / 8`, a quarter of that: struct layout runs in **bits**, because a bit-field's position is only expressible there, so a member list whose total passes `u64::MAX` bits has no layout to compute. It is no longer the old 512 MB -- that bound was an accident of `size_bits` answering in a `u32`, and object sizes are counted in bytes now |
 | `920728-1` | `return;` in a function returning non-void. C17 6.8.6.4p1 makes it a constraint violation; gcc issues a warning and compiles. `-fpermissive` arguably ought to downgrade it, as it does for implicit `int` |
 
-Complex integer division is a third, recorded in `BUILTIN.md`: c17 uses
+Complex integer division is a second, recorded in `BUILTIN.md`: c17 uses
 Smith's method because the exact formula overflows, and so answers `6 + 1i`
 for `(-9 + 38i) / (5 + 6i)` exactly as gcc does.

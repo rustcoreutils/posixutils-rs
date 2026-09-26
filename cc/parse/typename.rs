@@ -14,7 +14,6 @@ use super::ast::Expr;
 use super::declaration::SpecifierTally;
 use super::parser::{DeclaratorName, ParseError, ParseResult, Parser};
 use crate::strings::StringId;
-use crate::symbol::Symbol;
 use crate::token::lexer::TokenType;
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 
@@ -132,25 +131,6 @@ impl Parser<'_> {
         mods
     }
 
-    /// Apply the qualifiers written after a tag reference, plus `leading` --
-    /// the ones already collected before it. Both halves matter: `const` and
-    /// `volatile` the back end does not act on, but `_Atomic` decides both the
-    /// access and the alignment.
-    fn apply_trailing_qualifiers_with(
-        &mut self,
-        base_type: TypeId,
-        leading: TypeModifiers,
-    ) -> TypeId {
-        let mods = leading | self.consume_type_qualifiers();
-        if mods.is_empty() {
-            base_type
-        } else {
-            let mut qualified_type = self.types.get(base_type).clone();
-            qualified_type.modifiers |= mods;
-            self.types.intern(qualified_type)
-        }
-    }
-
     /// Parse a type name (required, returns error if not a type)
     pub(super) fn parse_type_name(&mut self) -> ParseResult<TypeId> {
         self.try_parse_type_name()
@@ -177,6 +157,17 @@ impl Parser<'_> {
     /// intern to one `TypeId`. Every other caller wants the type alone and
     /// uses [`Self::try_parse_type_name`].
     pub(crate) fn try_parse_type_name_vm(&mut self) -> Option<(TypeId, Vec<Expr>)> {
+        // The attributes a type-name carries are its own; the declaration it
+        // may sit inside neither lends it any nor receives any back.
+        let outer = self.take_pending_decl_attrs();
+        let result = self.parse_type_name_parts();
+        self.restore_pending_decl_attrs(outer);
+        result
+    }
+
+    /// [`Self::try_parse_type_name_vm`] with the enclosing declaration's
+    /// attribute slots already set aside.
+    fn parse_type_name_parts(&mut self) -> Option<(TypeId, Vec<Expr>)> {
         let saved_pos = self.pos;
         let (base, spec_dims) = self.try_parse_specifier_qualifier_list()?;
 
@@ -191,7 +182,7 @@ impl Parser<'_> {
                 // right for one shape and wrong for another.
                 let mut dims = vla;
                 dims.extend(spec_dims);
-                Some((typ, dims))
+                Some((self.apply_type_name_attrs(typ), dims))
             }
             // A *named* declarator means this was never a type-name -- `(x)`
             // in a cast position, say. Rewind and let the caller read it as
@@ -213,6 +204,95 @@ impl Parser<'_> {
                 Some((self.types.int_id, Vec::new()))
             }
         }
+    }
+
+    /// Apply the attributes a type-name collected to the type it names.
+    ///
+    /// They are applied as a declaration applies its own, through the same
+    /// functions: `mode` and `vector_size` replace the type, and `aligned`
+    /// aligns it as it would a typedef of that type. That puts the alignment
+    /// on the *whole* type -- gcc answers 16 for both
+    /// `_Alignof(int __attribute__((aligned(16))) *)` and
+    /// `_Alignof(int * __attribute__((aligned(16))))`, just as it aligns the
+    /// pointer `p` in either spelling of the declaration.
+    fn apply_type_name_attrs(&mut self, typ: TypeId) -> TypeId {
+        let typ = self.apply_pending_type_attrs(typ);
+        let align = self.pending_alignas.take();
+        self.align_typedef_type(typ, align)
+    }
+
+    /// `struct`, `union` or `enum` in a type-name: a tag reference or a
+    /// definition, parsed by the specifier parser declarations use, with the
+    /// qualifiers and attributes written around it. `leading` is the
+    /// qualifiers already seen before the keyword.
+    ///
+    /// The keyword commits this to being a type-name, so an error inside the
+    /// specifier is reported where it arose. Answering `None` would have the
+    /// caller re-read the tokens as an expression, and its "unexpected token
+    /// in expression" named neither the construct nor the fault.
+    fn type_name_tag_specifier(&mut self, keyword: StringId, leading: TypeModifiers) -> TypeId {
+        let start = self.pos;
+        let parsed = match keyword {
+            crate::kw::ENUM => self.parse_enum_specifier(),
+            _ => self.parse_struct_or_union_specifier(keyword == crate::kw::UNION),
+        };
+        match parsed {
+            Ok(mut typ) => {
+                typ.modifiers |= leading | self.consume_type_name_trailers();
+                self.intern_type_with_tag(&typ)
+            }
+            Err(e) => {
+                crate::diag::error(e.pos, &e.message);
+                self.skip_failed_tag_specifier(start);
+                self.types.int_id
+            }
+        }
+    }
+
+    /// Recover from an error inside the tag specifier that began at `start`.
+    ///
+    /// When the error arose inside the braces, skip to just past the `}` that
+    /// closes them and let the declarator after it parse as usual: in
+    /// `*(struct { char x[n]; } *)p` the cast is still a cast to a pointer,
+    /// and giving up on the whole type-name instead made the `*` in front
+    /// report a second, spurious error. Anywhere else there is no body to
+    /// step over, and the type-name is abandoned up to its `)`.
+    fn skip_failed_tag_specifier(&mut self, start: usize) {
+        let failed_at = self.pos;
+        self.pos = start;
+        while self.pos < failed_at && !self.is_special(b'{') {
+            self.advance();
+        }
+        if self.pos == failed_at {
+            self.resync_to_enclosing_paren();
+            return;
+        }
+        let mut depth = 0u32;
+        while !self.is_eof() {
+            if self.is_special(b'{') {
+                depth += 1;
+            } else if self.is_special(b'}') {
+                depth -= 1;
+                if depth == 0 {
+                    self.advance();
+                    return;
+                }
+            }
+            self.advance();
+        }
+    }
+
+    /// The qualifiers and attributes that may follow a complete type
+    /// specifier in a type-name, in any order: `struct S const
+    /// __attribute__((may_alias)) volatile`. The qualifiers are returned; the
+    /// attributes go to the pending slots.
+    fn consume_type_name_trailers(&mut self) -> TypeModifiers {
+        let mut mods = self.consume_type_qualifiers();
+        while self.is_attribute_keyword() {
+            self.skip_extensions();
+            mods |= self.consume_type_qualifiers();
+        }
+        mods
     }
 
     /// After a committed type-name error, skip to the `)` that closes the
@@ -256,10 +336,14 @@ impl Parser<'_> {
             return None;
         }
 
-        // Check if this looks like a type name (keyword or typedef)
+        // Check if this looks like a type name (keyword or typedef). An
+        // attribute cannot begin an expression, so one here begins a type-name
+        // -- `sizeof(__attribute__((aligned(8))) int)`.
         let name_id = self.get_ident_id(self.current())?;
-        if !Self::is_type_keyword(name_id) && self.symbols.lookup_typedef(name_id).is_none() {
-            // Not a type keyword and not a typedef
+        if !Self::is_type_keyword(name_id)
+            && !self.is_attribute_keyword()
+            && self.symbols.lookup_typedef(name_id).is_none()
+        {
             return None;
         }
 
@@ -485,80 +569,14 @@ impl Parser<'_> {
                     let expr_type = expr.typ.unwrap_or(self.types.int_id);
                     return Some((self.types.without_decl_specifiers(expr_type), Vec::new()));
                 }
-                crate::kw::STRUCT => {
-                    self.advance(); // consume 'struct'
-                                    // For struct tag reference, look up directly in symbol table
-                    if let Some(tag_name) = self.get_ident_id(self.current()) {
-                        if !self.is_special(b'{') {
-                            // This is a tag reference (e.g., "struct Point*")
-                            self.advance(); // consume tag name
-                            if let Some(existing) = self.symbols.lookup_tag(tag_name) {
-                                return Some((
-                                    self.apply_trailing_qualifiers_with(existing.typ, modifiers),
-                                    Vec::new(),
-                                ));
-                            }
-                            // Tag not found - create incomplete struct type and register it
-                            // This ensures that when the struct is later defined, we can update
-                            // this same TypeId rather than creating a new one
-                            let mut incomplete = Type::incomplete_struct(tag_name);
-                            incomplete.modifiers |= self.consume_type_qualifiers();
-                            let result_id = self.types.intern(incomplete);
-                            let sym = Symbol::tag(tag_name, result_id, self.symbols.depth());
-                            let _ = self.symbols.declare(sym);
-                            return Some((result_id, Vec::new()));
-                        }
-                    }
-                    // Fall back to full struct parsing for definitions
-                    self.pos -= 1;
-                    if let Ok(struct_type) = self.parse_struct_or_union_specifier(false) {
-                        let mut typ = struct_type;
-                        typ.modifiers |= modifiers | self.consume_type_qualifiers();
-                        return Some((self.types.intern(typ), Vec::new()));
-                    }
-                    return None;
+                crate::kw::STRUCT | crate::kw::UNION | crate::kw::ENUM => {
+                    return Some((self.type_name_tag_specifier(name_id, modifiers), Vec::new()));
                 }
-                crate::kw::UNION => {
-                    self.advance(); // consume 'union'
-                                    // For union tag reference, look up directly in symbol table
-                    if let Some(tag_name) = self.get_ident_id(self.current()) {
-                        if !self.is_special(b'{') {
-                            // This is a tag reference
-                            self.advance(); // consume tag name
-                            if let Some(existing) = self.symbols.lookup_tag(tag_name) {
-                                return Some((
-                                    self.apply_trailing_qualifiers_with(existing.typ, modifiers),
-                                    Vec::new(),
-                                ));
-                            }
-                            // Tag not found - create incomplete union type and register it
-                            // This ensures that when the union is later defined, we can update
-                            // this same TypeId rather than creating a new one
-                            let mut incomplete = Type::incomplete_union(tag_name);
-                            incomplete.modifiers |= self.consume_type_qualifiers();
-                            let result_id = self.types.intern(incomplete);
-                            let sym = Symbol::tag(tag_name, result_id, self.symbols.depth());
-                            let _ = self.symbols.declare(sym);
-                            return Some((result_id, Vec::new()));
-                        }
-                    }
-                    // Fall back to full union parsing for definitions
-                    self.pos -= 1;
-                    if let Ok(union_type) = self.parse_struct_or_union_specifier(true) {
-                        let mut typ = union_type;
-                        typ.modifiers |= modifiers | self.consume_type_qualifiers();
-                        return Some((self.types.intern(typ), Vec::new()));
-                    }
-                    return None;
-                }
-                crate::kw::ENUM => {
-                    if let Ok(enum_type) = self.parse_enum_specifier() {
-                        let mut typ = enum_type;
-                        typ.modifiers |= modifiers | self.consume_type_qualifiers();
-                        return Some((self.types.intern(typ), Vec::new()));
-                    }
-                    return None;
-                }
+                // An attribute can sit anywhere among the specifiers, as it
+                // can in a declaration, and goes to the same slots; the
+                // type-name applies what it collected once its declarator is
+                // done ([`Self::apply_type_name_attrs`]).
+                _ if self.is_attribute_keyword() => self.skip_extensions(),
                 _ => {
                     // Check if it's a typedef name
                     // Only consume if we haven't already seen a base type or typedef

@@ -30,8 +30,8 @@ int __attribute__((aligned(64))) u, v;      /* u and v */
 _Alignas(64) int w, x;                      /* w and x */
 ```
 
-This matters for the per-symbol attributes -- `weak`, `section`, `visibility`
-and `used` -- where naming the wrong symbol is an ABI change rather than a
+This matters for the per-symbol attributes -- `weak`, `section`, `visibility`,
+`used` and `alias` -- where naming the wrong symbol is an ABI change rather than a
 missed optimization.
 
 ## Supported Attributes
@@ -55,6 +55,7 @@ Attributes fall into two categories based on implementation depth:
 | `weak` | Functions, variables | `.weak` rather than `.globl`: another definition wins, and an unresolved reference is null rather than a link error. Honoured on a *declaration* with no definition too, which is the idiom the attribute exists for. A weak *definition* is also never inlined, since the body that runs may be some other one entirely -- `static` is exempt, having internal linkage nothing can interpose, and `always_inline` outranks it as in gcc |
 | `used` | Functions | Kept even when nothing refers to it. Load-bearing now that an unreferenced static is pruned at `-O1` and above: without it such a function is dropped, which is what gcc does |
 | `visibility` | Functions, variables | ELF `.hidden` / `.protected` / `.internal`; "default" is the *absence* of a directive, not a `.default` pseudo-op. Mach-O has only `.private_extern`, used for "hidden" and "internal". A zero-initialized variable leaves the `.comm` fast path rather than lose it |
+| `alias("target")` | Functions, variables | The declaration becomes a second symbol for `target`, which this translation unit must define: `.set name, target`, with the alias's own binding -- `.globl`, `.weak` with `weak`, nothing when `static` -- and its own visibility. The target may itself be an alias, and a static function reached only through its alias is kept. Rejected, as gcc rejects it, when the target is undefined here or only an inline definition, when one of the two is a function and the other a variable, and when the alias is also defined normally. Mach-O has no symbol aliases, and c17 rejects the attribute there as clang does. The optimizer treats a store through either name as a store to the one object |
 | `section` | Functions, variables | Places the symbol in the named section, ahead of every other rule -- including the zero-initialized fast path, since `.comm` would let the linker choose. ELF flags follow the contents: `"ax"` for code, `"aw"` for mutable data, `"a"` for read-only data |
 
 An attribute the compiler does not recognise is no longer dropped in silence:

@@ -1358,6 +1358,7 @@ impl<'a> Parser<'a> {
                     ExprKind::Call {
                         func: Box::new(expr),
                         args,
+                        binding: crate::parse::ast::CalleeBinding::Declared,
                     },
                     return_type,
                     base_pos,

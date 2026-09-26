@@ -415,7 +415,8 @@ impl AttributeList {
         }
     }
 
-    /// The `weak`, `used`, `section(...)` and `visibility(...)` requests in
+    /// The `weak`, `used`, `section(...)`, `visibility(...)` and `alias(...)`
+    /// requests in this list.
     pub fn symbol_attrs(&self) -> crate::parse::ast::SymbolAttrs {
         let mut out = crate::parse::ast::SymbolAttrs::default();
         for attr in &self.attrs {
@@ -429,6 +430,7 @@ impl AttributeList {
                 "used" => out.used = true,
                 "section" => out.section = text(attr),
                 "visibility" => out.visibility = text(attr),
+                "alias" => out.alias = text(attr),
                 _ => {}
             }
         }
@@ -1641,15 +1643,7 @@ impl<'a> Parser<'a> {
 
     /// Accumulate the symbol-emission attributes from one attribute list.
     pub(super) fn merge_symbol_attrs(&mut self, attrs: &AttributeList) {
-        let found = attrs.symbol_attrs();
-        self.pending_symbol_attrs.weak |= found.weak;
-        self.pending_symbol_attrs.used |= found.used;
-        if found.section.is_some() {
-            self.pending_symbol_attrs.section = found.section;
-        }
-        if found.visibility.is_some() {
-            self.pending_symbol_attrs.visibility = found.visibility;
-        }
+        self.pending_symbol_attrs.merge(&attrs.symbol_attrs());
     }
 
     /// `transparent_union` is a union attribute. gcc warns and ignores it
@@ -1842,13 +1836,15 @@ impl<'a> Parser<'a> {
     /// Merges max: multiple aligned attrs → strictest wins.
     fn apply_attribute_alignment(&mut self, attrs: &AttributeList) {
         if let Some(align) = attrs.get_alignment() {
-            if align > 0 && align.is_power_of_two() {
-                if let Some(existing) = self.pending_alignas {
-                    self.pending_alignas = Some(existing.max(align));
-                } else {
-                    self.pending_alignas = Some(align);
-                }
-            }
+            self.raise_pending_alignas(align);
+        }
+    }
+
+    /// Raise the declaration's pending alignment to `align`, ignoring a value
+    /// that is not a power of two.
+    pub(super) fn raise_pending_alignas(&mut self, align: u32) {
+        if align > 0 && align.is_power_of_two() {
+            self.pending_alignas = Some(self.pending_alignas.map_or(align, |e| e.max(align)));
         }
     }
 
@@ -1912,6 +1908,64 @@ impl<'a> Parser<'a> {
 pub(super) struct SpecifierAttrs {
     fn_attrs: crate::parse::ast::FunctionAttrs,
     symbol_attrs: crate::parse::ast::SymbolAttrs,
+}
+
+/// Every slot an attribute list writes for the declaration being parsed.
+///
+/// A type-name -- in a cast, `sizeof`, `_Alignof`, `typeof`, a compound
+/// literal -- can carry attributes of its own, and can sit in the middle of a
+/// declaration: `int x = sizeof(long __attribute__((aligned(16))));`. Its
+/// attributes go through the same parser and the same slots as a
+/// declaration's, so the type-name takes the enclosing declaration's state
+/// aside while it is parsed ([`Parser::take_pending_decl_attrs`]) and hands it
+/// back afterwards. Otherwise the `aligned(16)` above would align `x`.
+#[derive(Default)]
+pub(super) struct PendingDeclAttrs {
+    alignas: Option<u32>,
+    alignas_kw: Option<Position>,
+    declarator_align: Option<u32>,
+    attr_align: Option<u32>,
+    mode: Option<(String, Position)>,
+    vector_size: Option<(u64, Position)>,
+    transparent_union: Option<Position>,
+    symbol_attrs: crate::parse::ast::SymbolAttrs,
+    fn_attrs: crate::parse::ast::FunctionAttrs,
+    asm_label: Option<String>,
+}
+
+impl Parser<'_> {
+    /// Take every pending declaration attribute, leaving the slots empty.
+    /// See [`PendingDeclAttrs`].
+    pub(super) fn take_pending_decl_attrs(&mut self) -> PendingDeclAttrs {
+        use std::mem::take;
+        PendingDeclAttrs {
+            alignas: take(&mut self.pending_alignas),
+            alignas_kw: take(&mut self.pending_alignas_kw),
+            declarator_align: take(&mut self.pending_declarator_align),
+            attr_align: take(&mut self.pending_attr_align),
+            mode: take(&mut self.pending_mode),
+            vector_size: take(&mut self.pending_vector_size),
+            transparent_union: take(&mut self.pending_transparent_union),
+            symbol_attrs: take(&mut self.pending_symbol_attrs),
+            fn_attrs: take(&mut self.pending_fn_attrs),
+            asm_label: take(&mut self.pending_asm_label),
+        }
+    }
+
+    /// Put back what [`Self::take_pending_decl_attrs`] took, discarding
+    /// whatever was collected in between.
+    pub(super) fn restore_pending_decl_attrs(&mut self, saved: PendingDeclAttrs) {
+        self.pending_alignas = saved.alignas;
+        self.pending_alignas_kw = saved.alignas_kw;
+        self.pending_declarator_align = saved.declarator_align;
+        self.pending_attr_align = saved.attr_align;
+        self.pending_mode = saved.mode;
+        self.pending_vector_size = saved.vector_size;
+        self.pending_transparent_union = saved.transparent_union;
+        self.pending_symbol_attrs = saved.symbol_attrs;
+        self.pending_fn_attrs = saved.fn_attrs;
+        self.pending_asm_label = saved.asm_label;
+    }
 }
 
 // Statement Parsing
@@ -2008,18 +2062,46 @@ impl Parser<'_> {
         Ok(Stmt::Expr(expr))
     }
 
+    /// Parse a selection or iteration statement as the block C17 makes it.
+    ///
+    /// 6.8.4p3 and 6.8.5p5: the whole statement is a block, and so is each of
+    /// its substatements ([`Self::parse_substatement`]). The only things an
+    /// expression can declare are a tag and its enumeration constants --
+    /// `if (sizeof(struct T { int a; }))` -- and without the block they
+    /// leaked into the enclosing scope, where gcc rightly reports `struct T`
+    /// as incomplete.
+    fn parse_in_block(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> ParseResult<Stmt>,
+    ) -> ParseResult<Stmt> {
+        self.symbols.enter_scope();
+        let stmt = parse(self);
+        self.symbols.leave_scope();
+        stmt
+    }
+
+    /// The substatement of a selection or iteration statement, which is a
+    /// block of its own. See [`Self::parse_in_block`].
+    fn parse_substatement(&mut self) -> ParseResult<Stmt> {
+        self.parse_in_block(Self::parse_statement)
+    }
+
     fn parse_if_stmt(&mut self) -> ParseResult<Stmt> {
+        self.parse_in_block(Self::parse_if_stmt_in_block)
+    }
+
+    fn parse_if_stmt_in_block(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'if'
         self.expect_special(b'(')?;
         let cond = self.parse_expression()?;
         self.expect_special(b')')?;
-        let then_stmt = self.parse_statement()?;
+        let then_stmt = self.parse_substatement()?;
 
         let else_stmt = if self.peek() == TokenType::Ident {
             if let Some(name_id) = self.get_ident_id(self.current()) {
                 if name_id == crate::kw::ELSE {
                     self.advance();
-                    Some(Box::new(self.parse_statement()?))
+                    Some(Box::new(self.parse_substatement()?))
                 } else {
                     None
                 }
@@ -2038,11 +2120,15 @@ impl Parser<'_> {
     }
 
     fn parse_while_stmt(&mut self) -> ParseResult<Stmt> {
+        self.parse_in_block(Self::parse_while_stmt_in_block)
+    }
+
+    fn parse_while_stmt_in_block(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'while'
         self.expect_special(b'(')?;
         let cond = self.parse_expression()?;
         self.expect_special(b')')?;
-        let body = self.parse_statement()?;
+        let body = self.parse_substatement()?;
 
         Ok(Stmt::While {
             cond,
@@ -2051,8 +2137,12 @@ impl Parser<'_> {
     }
 
     fn parse_do_while_stmt(&mut self) -> ParseResult<Stmt> {
+        self.parse_in_block(Self::parse_do_while_stmt_in_block)
+    }
+
+    fn parse_do_while_stmt_in_block(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'do'
-        let body = self.parse_statement()?;
+        let body = self.parse_substatement()?;
 
         // Expect 'while'
         if self.peek() != TokenType::Ident {
@@ -2122,7 +2212,7 @@ impl Parser<'_> {
         };
 
         self.expect_special(b')')?;
-        let body = self.parse_statement()?;
+        let body = self.parse_substatement()?;
 
         // Leave for-scope
         self.symbols.leave_scope();
@@ -2150,6 +2240,10 @@ impl Parser<'_> {
     }
 
     fn parse_switch_stmt(&mut self) -> ParseResult<Stmt> {
+        self.parse_in_block(Self::parse_switch_stmt_in_block)
+    }
+
+    fn parse_switch_stmt_in_block(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'switch'
         self.expect_special(b'(')?;
         let expr = self.parse_expression()?;
@@ -2175,7 +2269,7 @@ impl Parser<'_> {
         // flat sibling marker and the statement it prefixed was not part of
         // it. It only ever reached the labels at the top of the body, which
         // is why a `case` nested inside an unbraced `if` escaped the switch.
-        self.parse_statement()
+        self.parse_substatement()
     }
 
     /// Parse a case label, including the GNU range form `case lo ... hi:`.
@@ -2289,13 +2383,11 @@ impl Parser<'_> {
                 self.types.void_id,
             )
         } else {
-            // Check if the last item is an expression statement
+            // Check if the last item is an expression statement, possibly labeled
             let last = items.pop().unwrap();
             match last {
-                BlockItem::Statement(stmt) if matches!(stmt.as_ref(), Stmt::Expr(_)) => {
-                    let Stmt::Expr(expr) = *stmt else {
-                        unreachable!()
-                    };
+                BlockItem::Statement(stmt) if Self::ends_in_expr_stmt(&stmt) => {
+                    let expr = Self::split_labeled_expr_stmt(*stmt, &mut items);
                     let typ = expr.typ.unwrap_or(self.types.int_id);
                     (items, expr, typ)
                 }
@@ -2321,6 +2413,38 @@ impl Parser<'_> {
             result_type,
             paren_pos,
         ))
+    }
+
+    /// Whether a statement expression's final statement gives it a value: an
+    /// expression statement, or one under any number of named labels. GCC
+    /// takes `({ a: 1; })` as 1 (compile/pr17913). A `case` or `default`
+    /// label cannot end a statement expression in a valid program -- its
+    /// switch would jump into the statement expression -- so those stay void.
+    fn ends_in_expr_stmt(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Expr(_) => true,
+            Stmt::Label { stmt, .. } => Self::ends_in_expr_stmt(stmt),
+            _ => false,
+        }
+    }
+
+    /// Split a final statement accepted by [`Self::ends_in_expr_stmt`] into
+    /// its value and the labels in front of it. `L: e;` is `L: ; e;`, so each
+    /// label is pushed onto `items` labelling an empty statement, and the
+    /// value is evaluated after them exactly where the labels were.
+    fn split_labeled_expr_stmt(stmt: Stmt, items: &mut Vec<BlockItem>) -> Expr {
+        match stmt {
+            Stmt::Expr(expr) => expr,
+            Stmt::Label { name, stmt, pos } => {
+                items.push(BlockItem::Statement(Box::new(Stmt::Label {
+                    name,
+                    stmt: Box::new(Stmt::Empty),
+                    pos,
+                })));
+                Self::split_labeled_expr_stmt(*stmt, items)
+            }
+            _ => unreachable!("checked by ends_in_expr_stmt"),
+        }
     }
 
     pub(super) fn is_declaration_start(&self) -> bool {

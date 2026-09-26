@@ -12,8 +12,8 @@
 #![allow(clippy::approx_constant)]
 
 use crate::parse::ast::{
-    AssignOp, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ExternalDecl, ForInit, FunctionDef,
-    Stmt, TranslationUnit, UnaryOp,
+    AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Expr, ExprKind, ExternalDecl,
+    ForInit, FunctionDef, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::parse::parser::{ParseResult, Parser};
 use crate::strings::{StringId, StringTable};
@@ -880,7 +880,7 @@ fn test_arrow_access() {
 fn test_function_call_no_args() {
     let (expr, _types, strings, symbols) = parse_expr_with_vars("foo()", &["foo"]).unwrap();
     match expr.kind {
-        ExprKind::Call { func, args } => {
+        ExprKind::Call { func, args, .. } => {
             match func.kind {
                 ExprKind::Ident(symbol_id) => {
                     check_name(&strings, symbols.get(symbol_id).name, "foo")
@@ -897,7 +897,7 @@ fn test_function_call_no_args() {
 fn test_function_call_with_args() {
     let (expr, _types, strings, symbols) = parse_expr_with_vars("foo(1, 2, 3)", &["foo"]).unwrap();
     match expr.kind {
-        ExprKind::Call { func, args } => {
+        ExprKind::Call { func, args, .. } => {
             match func.kind {
                 ExprKind::Ident(symbol_id) => {
                     check_name(&strings, symbols.get(symbol_id).name, "foo")
@@ -6181,4 +6181,164 @@ fn test_attributes_follow_their_declarator_in_a_list() {
         .filter(|(n, _)| n.starts_with('w'))
         .collect();
     assert_eq!(weak, [("wa".to_string(), true), ("wb".to_string(), true)]);
+}
+
+/// `alias("target")` is a symbol attribute like `weak`: it reaches the
+/// declarator it is written on and no other, in either spelling.
+#[test]
+fn test_alias_attribute_reaches_its_declarator() {
+    let (tu, _types, strings, symbols) = parse_tu(
+        "int a;\n\
+         extern int b __attribute__((alias(\"a\"))), c;\n\
+         int f(void) __attribute__((__alias__(\"g\")));\n",
+    )
+    .unwrap();
+    let got: Vec<(String, Option<String>)> = tu
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ExternalDecl::Declaration(d) => Some(d.declarators.iter()),
+            _ => None,
+        })
+        .flatten()
+        .map(|d| {
+            let name = strings.get(symbols.get(d.symbol).name).to_string();
+            (name, d.symbol_attrs.alias.clone())
+        })
+        .collect();
+    let want: Vec<(String, Option<String>)> =
+        [("a", None), ("b", Some("a")), ("c", None), ("f", Some("g"))]
+            .into_iter()
+            .map(|(n, t)| (n.to_string(), t.map(str::to_string)))
+            .collect();
+    assert_eq!(got, want);
+}
+
+/// A library function spelled `__builtin_X` is a call to the library's `X`;
+/// the same function called by its own name is a call to whatever the unit
+/// declares, which may be an inline definition.
+#[test]
+fn test_library_builtin_call_binds_to_the_library() {
+    let (tu, _types, strings, _symbols) = parse_tu(
+        "char *strncpy(char *, const char *, unsigned long);\n\
+         char *lib(char *d) { return __builtin_strncpy(d, d, 1); }\n\
+         char *own(char *d) { return strncpy(d, d, 1); }\n",
+    )
+    .unwrap();
+    let binding_in = |fname: &str| {
+        let body = tu
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ExternalDecl::FunctionDef(f) if strings.get(f.name) == fname => Some(&f.body),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no definition of {fname}"));
+        let Stmt::Block(items) = body else {
+            panic!("{fname}: body is not a block");
+        };
+        let Some(BlockItem::Statement(stmt)) = items.first() else {
+            panic!("{fname}: expected a statement");
+        };
+        let Stmt::Return(Some(expr)) = &**stmt else {
+            panic!("{fname}: expected a return statement");
+        };
+        let ExprKind::Call { binding, .. } = &expr.kind else {
+            panic!("{fname}: expected a call");
+        };
+        *binding
+    };
+    assert_eq!(binding_in("lib"), CalleeBinding::Library);
+    assert_eq!(binding_in("own"), CalleeBinding::Declared);
+}
+
+/// A statement expression whose last statement is a labeled expression
+/// statement takes that expression's value, as gcc does (compile/pr17913).
+/// The labels stay where they were, each labelling an empty statement.
+#[test]
+fn test_stmt_expr_labeled_last_statement_has_its_value() {
+    let (expr, types, _, _) = parse_expr("({ a: b: 5; })").unwrap();
+    let ExprKind::StmtExpr { stmts, result } = &expr.kind else {
+        panic!("expected StmtExpr");
+    };
+    assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int);
+    assert!(matches!(result.kind, ExprKind::IntLit(5)));
+    assert_eq!(stmts.len(), 2);
+    for item in stmts {
+        let BlockItem::Statement(stmt) = item else {
+            panic!("expected a statement");
+        };
+        assert!(matches!(&**stmt, Stmt::Label { stmt, .. } if matches!(**stmt, Stmt::Empty)));
+    }
+}
+
+/// `Expr::defines_label` finds a label in a statement expression at any
+/// depth, and nothing else counts as one.
+#[test]
+fn test_expr_defines_label() {
+    let (expr, _, _, _) = parse_expr("1 ? 2 : ({ a: 3; })").unwrap();
+    let ExprKind::Conditional {
+        then_expr,
+        else_expr,
+        ..
+    } = &expr.kind
+    else {
+        panic!("expected Conditional");
+    };
+    assert!(!then_expr.defines_label());
+    assert!(else_expr.defines_label());
+
+    let nested = "(1, -({ int x = ({ if (1) { b: ; } 1; }); x; }))";
+    assert!(parse_expr(nested).unwrap().0.defines_label());
+    for src in ["({ 1; })", "({ int y = 2; y; })", "1 + 2"] {
+        assert!(!parse_expr(src).unwrap().0.defines_label(), "{src}");
+    }
+}
+
+/// The alignment of a type-name written with `__attribute__((aligned(N)))`,
+/// wherever the attribute stands in it.
+#[test]
+fn test_type_name_attributes() {
+    for (src, want) in [
+        ("_Alignof(int __attribute__((aligned(16))))", 16),
+        ("_Alignof(__attribute__((aligned(8))) int)", 8),
+        ("_Alignof(const __attribute__((aligned(16))) long)", 16),
+        ("_Alignof(int __attribute__((aligned(16))) *)", 16),
+        ("_Alignof(int * __attribute__((aligned(16))))", 16),
+        ("_Alignof(int __attribute__((aligned(2))))", 2),
+        ("_Alignof(int __attribute__((packed)))", 4),
+    ] {
+        let (expr, types, _, _) = parse_expr(src).unwrap();
+        let ExprKind::AlignofType(typ) = expr.kind else {
+            panic!("{src}: expected AlignofType, got {:?}", expr.kind);
+        };
+        assert_eq!(types.alignment(typ), want, "{src}");
+    }
+}
+
+/// A type-name's attributes are its own. Before, the type-name wrote them to
+/// the enclosing declaration's slots, and a struct's member list read the
+/// enclosing declaration's alignment as its first member's.
+#[test]
+fn test_type_name_attributes_do_not_reach_the_declaration() {
+    let (decl, _, _, _) =
+        parse_decl("char c = sizeof(int * __attribute__((aligned(64))));").unwrap();
+    assert_eq!(decl.declarators[0].explicit_align, None);
+
+    let (decl, types, _, _) = parse_decl("_Alignas(16) struct { char a; char b; } x;").unwrap();
+    assert_eq!(decl.declarators[0].explicit_align, Some(16));
+    assert_eq!(types.size_bytes(decl.declarators[0].typ), 2);
+}
+
+/// `aligned` on a reference to an existing tag is the declaration's, as gcc
+/// has it: it aligns `z`, and the struct itself keeps its alignment.
+#[test]
+fn test_aligned_on_a_tag_reference_aligns_the_declaration() {
+    let (tu, types, _, _) =
+        parse_tu("struct S { int a; }; struct S __attribute__((aligned(32))) z;").unwrap();
+    let ExternalDecl::Declaration(decl) = &tu.items[1] else {
+        panic!("expected a declaration");
+    };
+    assert_eq!(decl.declarators[0].explicit_align, Some(32));
+    assert_eq!(types.alignment(decl.declarators[0].typ), 4);
 }

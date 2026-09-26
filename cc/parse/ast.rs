@@ -151,6 +151,10 @@ pub enum FpCompare {
     LessGreater,
     /// `__builtin_isunordered` -- at least one operand is a NaN.
     Unordered,
+    /// `__builtin_iseqsig` (C23 `iseqsig`) -- ordered and equal. The one
+    /// relation of the family that is specified to *raise* `FE_INVALID` on
+    /// an unordered pair, even a quiet one; see `linearize_fp_compare`.
+    Equal,
 }
 
 /// Assignment operators
@@ -345,6 +349,8 @@ pub enum ExprKind {
     Call {
         func: Box<Expr>,
         args: Vec<Expr>,
+        /// Which definition a call by name reaches.
+        binding: CalleeBinding,
     },
 
     /// Member access: expr.member
@@ -1165,11 +1171,32 @@ impl Expr {
             ExprKind::Call {
                 func: Box::new(func),
                 args,
+                binding: CalleeBinding::Declared,
             },
             types.int_id,
             pos,
         )
     }
+}
+
+/// Which definition a direct call by name reaches.
+///
+/// Almost always the one the name denotes. The exception is a library
+/// function spelled `__builtin_X`: gcc takes that to mean the library's `X`
+/// and never an inline definition of `X` in this unit, and glibc's fortify
+/// headers are built on it -- an `always_inline` `extern inline` `memcpy`
+/// wrapper whose body is a call to `__builtin___memcpy_chk`, or a `strncpy`
+/// wrapper around `__builtin_strncpy`. Binding that call to the wrapper made
+/// the wrapper call itself, so it was never inlined, and `always_inline`
+/// turned that into a rejected program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CalleeBinding {
+    /// Whatever the name denotes, a definition in this unit included.
+    #[default]
+    Declared,
+    /// The external library function of that name. Never inlined and never
+    /// a recursive call; the linker, not this unit, supplies the body.
+    Library,
 }
 
 // Inline Assembly Support (GCC Extended Asm)
@@ -1308,6 +1335,274 @@ pub enum BlockItem {
     Statement(Box<Stmt>),
 }
 
+// Label containment
+//
+// A constant condition lets `?:` drop the arm it does not take -- unless that
+// arm defines a label. A statement expression can hold one, and a computed
+// `goto` can reach it from outside (compile/pr17913: `1 ? 1 : ({ a: 1; })`
+// with `&&a` taken elsewhere). Dropping the arm dropped the label, and the
+// function then failed with "label 'a' used but not defined". GCC asks the
+// same question of a dead arm before it folds one (`contains_label_p`).
+
+impl Expr {
+    /// Whether a label is defined anywhere inside this expression. Only a
+    /// statement expression can hold one, at any depth.
+    pub fn defines_label(&self) -> bool {
+        match &self.kind {
+            ExprKind::StmtExpr { stmts, result } => {
+                stmts.iter().any(BlockItem::defines_label) || result.defines_label()
+            }
+            _ => self.operands().into_iter().any(Expr::defines_label),
+        }
+    }
+
+    /// Every expression this one directly contains, apart from the statements
+    /// of a statement expression, which are not expressions.
+    fn operands(&self) -> Vec<&Expr> {
+        use ExprKind as K;
+        match &self.kind {
+            K::IntLit(_)
+            | K::Int128Lit(_)
+            | K::FloatLit(_)
+            | K::CharLit(_)
+            | K::StringLit(_)
+            | K::WideStringLit(_)
+            | K::Utf16StringLit(_)
+            | K::Utf32StringLit(_)
+            | K::Ident(_)
+            | K::FuncName
+            | K::VmTypedefExtent(..)
+            | K::AlignofType(_)
+            | K::LabelAddr(_)
+            | K::VaArgPack
+            | K::VaArgPackLen
+            | K::Unreachable
+            | K::FrameAddress { .. }
+            | K::ReturnAddress { .. }
+            | K::OffsetOf { .. } => Vec::new(),
+            K::StmtExpr { result, .. } => vec![result],
+            K::Unary { operand: a, .. }
+            | K::PostInc(a)
+            | K::PostDec(a)
+            | K::Member { expr: a, .. }
+            | K::Arrow { expr: a, .. }
+            | K::Cast { expr: a, .. }
+            | K::SizeofExpr(a)
+            | K::AlignofExpr(a)
+            | K::VaStart { ap: a, .. }
+            | K::VaArg { ap: a, .. }
+            | K::VaEnd { ap: a }
+            | K::ConstantP(a)
+            | K::Bswap16 { arg: a }
+            | K::Bswap32 { arg: a }
+            | K::Bswap64 { arg: a }
+            | K::Ctz { arg: a }
+            | K::Ctzl { arg: a }
+            | K::Ctzll { arg: a }
+            | K::Clz { arg: a }
+            | K::Clzl { arg: a }
+            | K::Clzll { arg: a }
+            | K::Clrsb { arg: a }
+            | K::Clrsbl { arg: a }
+            | K::Clrsbll { arg: a }
+            | K::Popcount { arg: a }
+            | K::Popcountl { arg: a }
+            | K::Popcountll { arg: a }
+            | K::Alloca { size: a }
+            | K::Fabs { arg: a }
+            | K::Fabsf { arg: a }
+            | K::Signbit { arg: a }
+            | K::Signbitf { arg: a }
+            | K::FpTest { arg: a, .. }
+            | K::Setjmp { env: a }
+            | K::C11AtomicThreadFence { order: a }
+            | K::C11AtomicSignalFence { order: a } => vec![a],
+            K::Binary {
+                left: a, right: b, ..
+            }
+            | K::Assign {
+                target: a,
+                value: b,
+                ..
+            }
+            | K::CondElvis {
+                cond: a,
+                else_expr: b,
+            }
+            | K::Index { array: a, index: b }
+            | K::VaCopy { dest: a, src: b }
+            | K::FpCompare { lhs: a, rhs: b, .. }
+            | K::BuiltinComplex { real: a, imag: b }
+            | K::Longjmp { env: a, val: b }
+            | K::C11AtomicInit { ptr: a, val: b }
+            | K::C11AtomicLoad { ptr: a, order: b } => vec![a, b],
+            K::Conditional {
+                cond: a,
+                then_expr: b,
+                else_expr: c,
+            }
+            | K::Memset {
+                dest: a,
+                c: b,
+                n: c,
+            }
+            | K::Memcpy {
+                dest: a,
+                src: b,
+                n: c,
+            }
+            | K::Memmove {
+                dest: a,
+                src: b,
+                n: c,
+            }
+            | K::CheckedArith { a, b, res: c, .. }
+            | K::GnuAtomicRmw {
+                ptr: a,
+                val: b,
+                order: c,
+                ..
+            }
+            | K::GnuAtomicCas {
+                ptr: a,
+                expected: b,
+                desired: c,
+                ..
+            }
+            | K::C11AtomicStore {
+                ptr: a,
+                val: b,
+                order: c,
+            }
+            | K::C11AtomicExchange {
+                ptr: a,
+                val: b,
+                order: c,
+            }
+            | K::C11AtomicFetchAdd {
+                ptr: a,
+                val: b,
+                order: c,
+            }
+            | K::C11AtomicFetchSub {
+                ptr: a,
+                val: b,
+                order: c,
+            }
+            | K::C11AtomicFetchAnd {
+                ptr: a,
+                val: b,
+                order: c,
+            }
+            | K::C11AtomicFetchOr {
+                ptr: a,
+                val: b,
+                order: c,
+            }
+            | K::C11AtomicFetchXor {
+                ptr: a,
+                val: b,
+                order: c,
+            } => vec![a, b, c],
+            K::C11AtomicCompareExchangeStrong {
+                ptr,
+                expected,
+                desired,
+                succ_order,
+            }
+            | K::C11AtomicCompareExchangeWeak {
+                ptr,
+                expected,
+                desired,
+                succ_order,
+            } => vec![ptr, expected, desired, succ_order],
+            K::Call { func, args, .. } => std::iter::once(&**func).chain(args).collect(),
+            K::Comma(exprs) | K::SizeofType(_, exprs) => exprs.iter().collect(),
+            K::FpClassify { classes, arg } => {
+                classes.iter().chain(std::iter::once(&**arg)).collect()
+            }
+            K::CompoundLiteral { elements, .. } | K::InitList { elements } => {
+                elements.iter().map(|e| &*e.value).collect()
+            }
+        }
+    }
+}
+
+impl BlockItem {
+    /// Whether a label is defined anywhere inside this block item.
+    pub fn defines_label(&self) -> bool {
+        match self {
+            BlockItem::Declaration(decl) => decl.defines_label(),
+            BlockItem::Statement(stmt) => stmt.defines_label(),
+        }
+    }
+}
+
+impl Declaration {
+    /// Whether a label is defined inside one of this declaration's
+    /// initializers or array extents.
+    pub fn defines_label(&self) -> bool {
+        self.declarators.iter().any(|d| {
+            d.init.as_ref().is_some_and(Expr::defines_label)
+                || d.vla_sizes.iter().any(Expr::defines_label)
+        })
+    }
+}
+
+impl Stmt {
+    /// Whether a label is defined anywhere inside this statement, including
+    /// inside a statement expression in one of its expressions. `case` and
+    /// `default` labels do not count: they belong to a switch, and nothing
+    /// outside a statement expression may jump into one.
+    pub fn defines_label(&self) -> bool {
+        match self {
+            Stmt::Label { .. } => true,
+            Stmt::Empty
+            | Stmt::Break(_)
+            | Stmt::Continue(_)
+            | Stmt::Goto { .. }
+            | Stmt::Return(None) => false,
+            Stmt::Expr(e) | Stmt::Return(Some(e)) | Stmt::GotoIndirect { target: e, .. } => {
+                e.defines_label()
+            }
+            Stmt::Block(items) => items.iter().any(BlockItem::defines_label),
+            Stmt::If {
+                cond,
+                then_stmt,
+                else_stmt,
+            } => {
+                cond.defines_label()
+                    || then_stmt.defines_label()
+                    || else_stmt.as_ref().is_some_and(|s| s.defines_label())
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+                cond.defines_label() || body.defines_label()
+            }
+            Stmt::For {
+                init,
+                cond,
+                post,
+                body,
+            } => {
+                let init_defines = match init {
+                    Some(ForInit::Declaration(decl)) => decl.defines_label(),
+                    Some(ForInit::Expression(e)) => e.defines_label(),
+                    None => false,
+                };
+                init_defines
+                    || cond.as_ref().is_some_and(Expr::defines_label)
+                    || post.as_ref().is_some_and(Expr::defines_label)
+                    || body.defines_label()
+            }
+            Stmt::Switch { expr, body } => expr.defines_label() || body.defines_label(),
+            Stmt::Case(_, _, stmt) | Stmt::Default(_, stmt) => stmt.defines_label(),
+            Stmt::Asm {
+                outputs, inputs, ..
+            } => outputs.iter().chain(inputs).any(|o| o.expr.defines_label()),
+        }
+    }
+}
+
 // Declarations
 
 /// A declaration
@@ -1336,12 +1631,34 @@ pub struct SymbolAttrs {
     /// `visibility("...")`: ELF visibility, verbatim -- "default", "hidden",
     /// "protected" or "internal".
     pub visibility: Option<String>,
+    /// `alias("target")`: this declaration is not a reference to storage
+    /// defined elsewhere but a second name for `target`, which this
+    /// translation unit defines. Becomes an `ir::SymbolAlias`, never a
+    /// definition or an extern reference of its own.
+    pub alias: Option<String>,
 }
 
 impl SymbolAttrs {
     /// Does this ask for anything at all?
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// Fold in the requests of another attribute list for the same symbol:
+    /// a flag once asked for stays, and a later string argument replaces an
+    /// earlier one.
+    pub fn merge(&mut self, other: &SymbolAttrs) {
+        self.weak |= other.weak;
+        self.used |= other.used;
+        if other.section.is_some() {
+            self.section = other.section.clone();
+        }
+        if other.visibility.is_some() {
+            self.visibility = other.visibility.clone();
+        }
+        if other.alias.is_some() {
+            self.alias = other.alias.clone();
+        }
     }
 }
 
@@ -1528,14 +1845,7 @@ impl FunctionAttrs {
     /// declarator, and after the parameter list -- so they are accumulated
     /// rather than read from a single site.
     pub fn merge(&mut self, other: &FunctionAttrs) {
-        self.symbol.weak |= other.symbol.weak;
-        self.symbol.used |= other.symbol.used;
-        if other.symbol.section.is_some() {
-            self.symbol.section = other.symbol.section.clone();
-        }
-        if other.symbol.visibility.is_some() {
-            self.symbol.visibility = other.symbol.visibility.clone();
-        }
+        self.symbol.merge(&other.symbol);
         self.noinline |= other.noinline;
         self.always_inline |= other.always_inline;
         self.gnu_inline |= other.gnu_inline;
@@ -1744,7 +2054,7 @@ mod tests {
         );
 
         match expr.kind {
-            ExprKind::Call { func, args } => {
+            ExprKind::Call { func, args, .. } => {
                 match func.kind {
                     ExprKind::Ident(sym_id) => assert_eq!(sym_id, foo_sym),
                     _ => panic!("Expected Ident"),

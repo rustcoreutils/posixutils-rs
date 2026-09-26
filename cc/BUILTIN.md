@@ -148,12 +148,19 @@ wrong does not fail to link.
 | `__builtin_islessequal(x, y)` | `x <= y` |
 | `__builtin_islessgreater(x, y)` | Ordered and unequal -- **not** `x != y`, which is *true* for an unordered pair |
 | `__builtin_isunordered(x, y)` | At least one operand is a NaN |
+| `__builtin_iseqsig(x, y)` | `x == y`, the C23 `iseqsig`. The answer is exact; see below for the exception it does not raise |
 
 Every one of these is false for an unordered pair except `isunordered`, which
 is the only one true for it. They exist in C because the ordinary relational
 operators are specified to raise `FE_INVALID` on an unordered pair and these
 are not; c17 emits the quiet compare (`ucomis*`, `fucomip`) for both, so the
 two agree and there is nothing further to arrange.
+
+`iseqsig` is the exception in the other direction: C23 7.12.17.1 has it raise
+`FE_INVALID` for any unordered pair, a quiet NaN included, where `==` raises
+it only for a signalling one. c17 emits the same quiet compare for it, so the
+result is right and `FE_INVALID` is not raised for a quiet NaN -- the same gap
+c17's `<` and `>` have, which are emitted with the quiet compare as well.
 
 glibc's `<math.h>` **defines** `isgreater`, `isless`, `isunordered` and the
 rest as these builtins, so a translation unit that includes the header and
@@ -259,6 +266,13 @@ They exist so a translation unit may use one without having included the
 header that declares it, which is what gcc allows and what glibc's fortified
 headers rely on.
 
+The call always reaches the *library's* function, never an inline definition
+of the same name in the translation unit. That is the other half of what the
+fortified headers rely on: an `always_inline` `extern inline` `strncpy` whose
+body is `return __builtin_strncpy(...)` is not recursive, is inlined at every
+call site, and leaves behind a call to the external `strncpy`. A call to a
+function by its own name inside its own body is still recursion, as in gcc.
+
 | Builtin | Description |
 |---------|-------------|
 | `__builtin_abort()` | |
@@ -276,6 +290,9 @@ headers rely on.
 | `__builtin_strchr(s, c)`, `__builtin_strrchr(s, c)`, `__builtin_strstr(h, n)` | |
 | `__builtin_printf(fmt, ...)`, `__builtin_sprintf(buf, fmt, ...)`, `__builtin_snprintf(buf, n, fmt, ...)` | Variadic after the format argument |
 | `__builtin_puts(s)`, `__builtin_putchar(c)` | |
+| `__builtin_fprintf(stream, fmt, ...)` | Variadic after the format argument |
+| `__builtin_fputs(s, stream)`, `__builtin_fputc(c, stream)` | |
+| `__builtin_fwrite(p, size, n, stream)` | Returns a size |
 | `__builtin_memchr(p, c, n)` | Returns `void *` |
 | `__builtin_index(s, c)`, `__builtin_rindex(s, c)` | The older spellings of `strchr`/`strrchr` |
 | `__builtin_strpbrk(s, set)` | |

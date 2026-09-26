@@ -157,10 +157,8 @@ fn build_call_count_map(module: &Module) -> HashMap<String, usize> {
     for func in &module.functions {
         for bb in &func.blocks {
             for insn in &bb.insns {
-                if insn.op == Opcode::Call {
-                    if let Some(callee) = &insn.func_name {
-                        *counts.entry(callee.clone()).or_insert(0) += 1;
-                    }
+                if let Some(callee) = insn.local_callee() {
+                    *counts.entry(callee.to_string()).or_insert(0) += 1;
                 }
             }
         }
@@ -215,12 +213,10 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
                 Opcode::IndirectBr => {
                     candidate.takes_label_addr = true;
                 }
-                Opcode::Call => {
-                    if let Some(callee) = &insn.func_name {
-                        if callee == &func.name {
-                            candidate.is_recursive = true;
-                        }
-                    }
+                // A `__builtin_X` call from `X`'s own body reaches the
+                // library's `X`, which is not recursion.
+                Opcode::Call if insn.local_callee() == Some(func.name.as_str()) => {
+                    candidate.is_recursive = true;
                 }
                 _ => {}
             }
@@ -1456,10 +1452,9 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
             // bypass the stack-size check. The HARD_CALLER_SIZE_CAP and
             // proportional growth limits provide sufficient protection.
             let caller_is_recursive = module.functions[func_idx].blocks.iter().any(|bb| {
-                bb.insns.iter().any(|insn| {
-                    insn.op == Opcode::Call
-                        && insn.func_name.as_ref().is_some_and(|n| n == &caller_name)
-                })
+                bb.insns
+                    .iter()
+                    .any(|insn| insn.local_callee() == Some(caller_name.as_str()))
             });
 
             // Find all call sites in this function that should be inlined
@@ -1468,15 +1463,14 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
 
             for (bb_idx, bb) in module.functions[func_idx].blocks.iter().enumerate() {
                 for (insn_idx, insn) in bb.insns.iter().enumerate() {
-                    if insn.op == Opcode::Call {
-                        if let Some(callee_name) = &insn.func_name {
-                            if let Some(candidate) = candidates.get(callee_name) {
-                                if should_inline(candidate, opt, caller_size, caller_is_recursive) {
-                                    // Don't inline recursive calls
-                                    if *callee_name != caller_name {
-                                        call_sites.push((bb_idx, insn_idx, callee_name.clone()));
-                                    }
-                                }
+                    let Some(callee_name) = insn.local_callee() else {
+                        continue;
+                    };
+                    if let Some(candidate) = candidates.get(callee_name) {
+                        if should_inline(candidate, opt, caller_size, caller_is_recursive) {
+                            // Don't inline recursive calls
+                            if callee_name != caller_name {
+                                call_sites.push((bb_idx, insn_idx, callee_name.to_string()));
                             }
                         }
                     }
@@ -1653,6 +1647,16 @@ fn collect_referenced_functions(module: &Module) -> HashSet<String> {
     // `static const struct { fn_t f; } table[] = { { my_func }, ... }`.
     for global in &module.globals {
         collect_func_refs_from_initializer(&global.init, &func_names, &mut referenced);
+    }
+
+    // `__attribute__((alias))`: the `.set` the backend writes names the
+    // target, and a static function reached only through its alias -- the
+    // usual way to export an internal implementation under a public name --
+    // has no other reference at all.
+    for alias in &module.aliases {
+        if func_names.contains(&alias.target) {
+            referenced.insert(alias.target.clone());
+        }
     }
 
     referenced
@@ -2021,6 +2025,55 @@ mod tests {
 
         assert!(module.functions.iter().any(|f| f.name == "kept"));
         assert!(!module.functions.iter().any(|f| f.name == "dropped"));
+    }
+
+    /// `__attribute__((alias))` names its target in a `.set` the backend
+    /// writes after this pass, so a static function exported only through an
+    /// alias has no other reference -- and dropping it leaves `.set` naming
+    /// nothing.
+    #[test]
+    fn test_alias_target_survives_the_prune() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        module.functions.push(static_fn(&types, "impl", None));
+        module.functions.push(static_fn(&types, "dropped", None));
+        module.functions.push(Function::new("main", types.int_id));
+        module.aliases.push(crate::ir::SymbolAlias {
+            name: "api".to_string(),
+            target: "impl".to_string(),
+            is_static: false,
+            weak: false,
+            visibility: None,
+        });
+
+        remove_dead_functions(&mut module);
+
+        assert!(module.functions.iter().any(|f| f.name == "impl"));
+        assert!(!module.functions.iter().any(|f| f.name == "dropped"));
+    }
+
+    /// A `__builtin_X` call inside `X`'s own body reaches the library's `X`:
+    /// not recursion, and not a call site to splice `X` into. Treating it as
+    /// either rejected glibc's `always_inline` fortify wrappers outright.
+    #[test]
+    fn test_library_call_to_own_name_is_not_recursion() {
+        let types = TypeTable::new(&Target::host());
+        let mut wrapper = static_fn(&types, "strncpy", Some("strncpy"));
+        let recursive = analyze_function(&wrapper, &HashMap::new());
+        assert!(recursive.is_recursive, "a plain self-call is recursion");
+
+        for insn in wrapper.blocks.iter_mut().flat_map(|b| b.insns.iter_mut()) {
+            if insn.op == Opcode::Call {
+                insn.callee_binding = crate::parse::ast::CalleeBinding::Library;
+                assert_eq!(insn.local_callee(), None);
+            }
+        }
+        let library = analyze_function(&wrapper, &HashMap::new());
+        assert!(!library.is_recursive, "a library call is not recursion");
+
+        let mut module = Module::default();
+        module.functions.push(wrapper);
+        assert_eq!(build_call_count_map(&module).get("strncpy"), None);
     }
 
     /// A name written into the assembly text reaches the assembler with no IR

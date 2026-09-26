@@ -345,6 +345,30 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
     }
 
+    /// `__attribute__((alias))` symbols, as gcc writes them on ELF: the
+    /// binding, the visibility, then `.set`. No `.type` or `.size` -- the
+    /// assembler copies both from the target.
+    pub fn emit_symbol_aliases(&mut self, module: &Module) {
+        for alias in &module.aliases {
+            let sym = Symbol::global(&alias.name);
+            if alias.weak && !alias.is_static {
+                self.push_directive(Directive::Weak(
+                    sym.clone(),
+                    crate::arch::lir::WeakKind::Definition,
+                ));
+            } else if !alias.is_static {
+                self.push_directive(Directive::Global(sym.clone()));
+            }
+            if let Some(how) = &alias.visibility {
+                self.push_directive(Directive::Visibility(sym.clone(), how.clone()));
+            }
+            self.push_directive(Directive::SymbolAlias {
+                sym,
+                value: Symbol::global(&alias.target),
+            });
+        }
+    }
+
     pub fn emit_global(&mut self, global: &crate::ir::GlobalDef, types: &TypeTable) {
         let size = types.size_bytes(global.typ) as u64;
         let size = if size == 0 { 8 } else { size }; // Default to 8 bytes

@@ -23,11 +23,12 @@
 // `ConstMap::root` is what makes "two pseudos are the same value" decidable
 // after promotion out of memory gives every use of a local its own `Copy`,
 // and `CmpFacts` is what turns a branch condition into `(ordering mask,
-// canonical operands, signedness, width)` -- the form an edge fact wants.
+// canonical operands, domain, width)` -- the form an edge fact wants.
 //
 
 use super::constfold::{
-    at_width, cmp_mask, cmp_operand_width, get_cmp_info, mirror_mask, unambiguous_at,
+    at_width, cmp_mask, cmp_operand_width, fcmp_mask, get_cmp_info, mirror_mask, unambiguous_at,
+    CMP_ALL, CMP_EQ, CMP_UN, FCMP_ALL,
 };
 use super::{Function, Opcode, PseudoId, PseudoKind};
 use crate::float::FloatVal;
@@ -264,6 +265,41 @@ impl ConstMap {
     }
 }
 
+/// Which kind of comparison a fact came from, and so which outcomes it has.
+///
+/// The two are never combined. An integer comparison has three outcomes and
+/// a signedness; a float one has no signedness and a fourth outcome,
+/// [`CMP_UN`], which is what makes `(x < y) || (x >= y)` true for integers
+/// and false for a NaN.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CmpDomain {
+    /// A signed and an unsigned comparison over one pair are *not*
+    /// comparable: `x < y` and `x > y` read signed are not complementary with
+    /// the unsigned forms.
+    Int { signed: bool },
+    /// IEEE: less, equal, greater or unordered.
+    Float,
+}
+
+impl CmpDomain {
+    /// Every outcome a comparison in this domain can have.
+    pub(crate) fn all(self) -> u8 {
+        match self {
+            CmpDomain::Int { .. } => CMP_ALL,
+            CmpDomain::Float => FCMP_ALL,
+        }
+    }
+
+    /// The outcomes a value compared with *itself* can have: equal, and for
+    /// a float also unordered -- a NaN is not equal to itself.
+    pub(crate) fn reflexive(self) -> u8 {
+        match self {
+            CmpDomain::Int { .. } => CMP_EQ,
+            CmpDomain::Float => CMP_EQ | CMP_UN,
+        }
+    }
+}
+
 /// What is known about a pseudo that holds a comparison's result.
 ///
 /// Built once per run, like `ConstMap`, and sound for the same reason: SSA
@@ -271,48 +307,90 @@ impl ConstMap {
 /// function rather than about a program point.
 #[derive(Clone, Copy)]
 pub(crate) struct CmpFact {
-    /// Which of less/equal/greater make it true.
+    /// Which outcomes make it true: less, equal, greater, and for a float
+    /// also unordered (`constfold::CMP_*`).
     pub(crate) mask: u8,
     pub(crate) lhs: PseudoId,
     pub(crate) rhs: PseudoId,
-    /// A signed and an unsigned comparison over one pair are *not*
-    /// comparable: `x < y` and `x > y` read signed are not complementary with
-    /// the unsigned forms.
-    pub(crate) signed: bool,
+    pub(crate) domain: CmpDomain,
     pub(crate) width: u32,
 }
 
-/// Every pseudo defined by an integer comparison.
+/// What a 0-or-1 value says about the operands of the comparisons it was
+/// computed from.
+#[derive(Clone, Copy)]
+pub(crate) enum Relation {
+    /// The value is this, whatever the operands are.
+    Known(bool),
+    /// The value is 1 exactly when this comparison holds.
+    Holds(CmpFact),
+}
+
+/// An instruction that combines 0-or-1 values into another one.
+///
+/// Recorded by operand rather than evaluated, because whether an operand is
+/// a constant is only known when the question is asked: `instcombine`
+/// records the constants it folds as it goes.
+#[derive(Clone, Copy)]
+enum Combinator {
+    And(PseudoId, PseudoId),
+    Or(PseudoId, PseudoId),
+    Select(PseudoId, PseudoId, PseudoId),
+    /// `SetEq`, which is logical negation when one side is zero.
+    Eq(PseudoId, PseudoId),
+    /// `SetNe`, which is the value itself when one side is zero.
+    Ne(PseudoId, PseudoId),
+}
+
+/// How deep [`CmpFacts::relation`] follows combinators. A C condition nests
+/// one level per `&&`, `||` or `!`, so this is far past anything written by
+/// hand, and it keeps the walk bounded on generated code.
+const MAX_RELATION_DEPTH: u32 = 16;
+
+/// Every pseudo defined by a comparison, integer or float, and every one
+/// that combines 0-or-1 values.
 pub(crate) struct CmpFacts {
     facts: HashMap<PseudoId, CmpFact>,
+    combinators: HashMap<PseudoId, Combinator>,
 }
 
 impl CmpFacts {
     pub(crate) fn new(func: &Function, consts: &ConstMap) -> Self {
         let mut facts = HashMap::new();
+        let mut combinators = HashMap::new();
         for bb in &func.blocks {
             for insn in &bb.insns {
-                let (Some(target), Some(mask)) = (insn.target, cmp_mask(insn.op)) else {
+                let Some(target) = insn.target else {
+                    continue;
+                };
+                if let Some(c) = Combinator::of(insn.op, &insn.src) {
+                    combinators.insert(target, c);
+                }
+                let (mask, domain) = if let Some(mask) = cmp_mask(insn.op) {
+                    let signed = get_cmp_info(insn.op).map(|i| i.signed).unwrap_or(true);
+                    (mask, CmpDomain::Int { signed })
+                } else if let Some(mask) = fcmp_mask(insn.op) {
+                    (mask, CmpDomain::Float)
+                } else {
                     continue;
                 };
                 if insn.src.len() != 2 {
                     continue;
                 }
                 let width = cmp_operand_width(insn);
-                let signed = get_cmp_info(insn.op).map(|i| i.signed).unwrap_or(true);
                 facts.insert(
                     target,
                     CmpFact {
                         mask,
                         lhs: consts.root(insn.src[0], width),
                         rhs: consts.root(insn.src[1], width),
-                        signed,
+                        domain,
                         width,
                     },
                 );
             }
         }
-        Self { facts }
+        Self { facts, combinators }
     }
 
     pub(crate) fn get(&self, id: PseudoId) -> Option<CmpFact> {
@@ -333,18 +411,177 @@ impl CmpFacts {
         self.get(consts.root(id, width))
     }
 
-    /// `other`'s mask expressed over `base`'s operand order, or `None` when
-    /// the two are not comparisons of the same pair in the same signedness.
-    pub(crate) fn aligned_mask(&self, base: CmpFact, other: CmpFact) -> Option<u8> {
-        if base.signed != other.signed || base.width != other.width {
+    /// What the 0-or-1 value `id` says about the operands it was computed
+    /// from, or `None` when it is not known to be 0 or 1 or says something
+    /// no single comparison expresses.
+    ///
+    /// This is the mask algebra that decides `(x < y) && (x > y)` and
+    /// `isunordered(x, y) || x >= y || x < y` without knowing `x` or `y`:
+    /// each comparison is the set of outcomes it is true for, `&&` and `||`
+    /// intersect and unite those sets when both sides compare the same pair,
+    /// and `!` complements within the domain -- which for a float includes
+    /// *unordered*, so `(x < y) || (x >= y)` is correctly left undecided.
+    ///
+    /// `width` is how `id` itself is read. Everything below it is 0 or 1, and
+    /// a 0-or-1 value is the same value through a copy of any width.
+    pub(crate) fn relation(&self, consts: &ConstMap, id: PseudoId, width: u32) -> Option<Relation> {
+        self.relation_at(consts, id, width, 0)
+    }
+
+    fn relation_at(
+        &self,
+        consts: &ConstMap,
+        id: PseudoId,
+        width: u32,
+        depth: u32,
+    ) -> Option<Relation> {
+        if depth > MAX_RELATION_DEPTH {
             return None;
         }
-        if base.lhs == other.lhs && base.rhs == other.rhs {
-            return Some(other.mask);
+        match consts.get(id) {
+            Some(0) => return Some(Relation::Known(false)),
+            Some(1) => return Some(Relation::Known(true)),
+            Some(_) => return None,
+            None => {}
         }
-        if base.lhs == other.rhs && base.rhs == other.lhs {
-            return Some(mirror_mask(other.mask));
-        }
+        let root = consts.root(id, width);
+        let sub = |p: PseudoId| self.relation_at(consts, p, 1, depth + 1);
+        let derived = match self.combinators.get(&root).copied() {
+            Some(Combinator::And(a, b)) => and(sub(a)?, sub(b)?),
+            Some(Combinator::Or(a, b)) => or(sub(a)?, sub(b)?),
+            Some(Combinator::Select(c, t, f)) => {
+                let c = sub(c)?;
+                or(and(c, sub(t)?)?, and(not(c), sub(f)?)?)
+            }
+            Some(Combinator::Ne(a, b)) => against_zero(consts, a, b).and_then(sub),
+            Some(Combinator::Eq(a, b)) => against_zero(consts, a, b).and_then(sub).map(not),
+            None => None,
+        };
+        // A `SetNe`/`SetEq` is a comparison in its own right, and says
+        // something about its operands even when they are not 0 or 1.
+        derived.or_else(|| self.get(root).map(normalize))
+    }
+}
+
+impl Combinator {
+    fn of(op: Opcode, src: &[PseudoId]) -> Option<Self> {
+        Some(match (op, src) {
+            (Opcode::And, &[a, b]) => Combinator::And(a, b),
+            (Opcode::Or, &[a, b]) => Combinator::Or(a, b),
+            (Opcode::Select, &[c, t, f]) => Combinator::Select(c, t, f),
+            (Opcode::SetEq, &[a, b]) => Combinator::Eq(a, b),
+            (Opcode::SetNe, &[a, b]) => Combinator::Ne(a, b),
+            _ => return None,
+        })
+    }
+}
+
+/// The side of `a ? b` that is not the constant zero, if one is.
+fn against_zero(consts: &ConstMap, a: PseudoId, b: PseudoId) -> Option<PseudoId> {
+    if consts.get(b) == Some(0) {
+        Some(a)
+    } else if consts.get(a) == Some(0) {
+        Some(b)
+    } else {
         None
+    }
+}
+
+/// `f` with the outcomes it cannot have removed, or the constant it is when
+/// that leaves it no choice.
+///
+/// The only outcomes knowable from a fact's shape alone are those of a value
+/// compared with itself, and removing them is what makes `x != x` -- "`x` is
+/// a NaN" -- combinable at all: see [`pair_of_self_tests`].
+fn normalize(f: CmpFact) -> Relation {
+    let possible = if f.lhs == f.rhs {
+        f.domain.reflexive()
+    } else {
+        f.domain.all()
+    };
+    let mask = f.mask & possible;
+    if mask == 0 {
+        Relation::Known(false)
+    } else if mask == possible {
+        Relation::Known(true)
+    } else {
+        Relation::Holds(CmpFact { mask, ..f })
+    }
+}
+
+/// `other`'s mask over `base`'s operand order, or `None` when the two are
+/// not comparisons of the same pair in the same domain at the same width.
+fn aligned_mask(base: CmpFact, other: CmpFact) -> Option<u8> {
+    if base.domain != other.domain || base.width != other.width {
+        return None;
+    }
+    if base.lhs == other.lhs && base.rhs == other.rhs {
+        return Some(other.mask);
+    }
+    if base.lhs == other.rhs && base.rhs == other.lhs {
+        return Some(mirror_mask(other.mask));
+    }
+    None
+}
+
+/// The value a float self-comparison tests, when it holds exactly when that
+/// value is a NaN (`want == CMP_UN`) or exactly when it is not (`CMP_EQ`).
+/// `f` is normalized, so `x != x` arrives here as `CMP_UN`.
+fn self_test(f: CmpFact, want: u8) -> Option<PseudoId> {
+    (f.domain == CmpDomain::Float && f.lhs == f.rhs && f.mask == want).then_some(f.lhs)
+}
+
+/// Both operands tested one at a time, as `__builtin_isunordered` lowers:
+/// `x != x || y != y` (`want == CMP_UN`) is `x` and `y` unordered, and
+/// `x == x && y == y` (`CMP_EQ`) is the two ordered.
+fn pair_of_self_tests(a: CmpFact, b: CmpFact, want: u8) -> Option<Relation> {
+    if a.width != b.width {
+        return None;
+    }
+    let (x, y) = (self_test(a, want)?, self_test(b, want)?);
+    let mask = if want == CMP_UN { CMP_UN } else { CMP_ALL };
+    Some(normalize(CmpFact {
+        mask,
+        lhs: x,
+        rhs: y,
+        ..a
+    }))
+}
+
+fn and(a: Relation, b: Relation) -> Option<Relation> {
+    match (a, b) {
+        (Relation::Known(false), _) | (_, Relation::Known(false)) => Some(Relation::Known(false)),
+        (Relation::Known(true), r) | (r, Relation::Known(true)) => Some(r),
+        (Relation::Holds(x), Relation::Holds(y)) => match aligned_mask(x, y) {
+            Some(m) => Some(normalize(CmpFact {
+                mask: x.mask & m,
+                ..x
+            })),
+            None => pair_of_self_tests(x, y, CMP_EQ),
+        },
+    }
+}
+
+fn or(a: Relation, b: Relation) -> Option<Relation> {
+    match (a, b) {
+        (Relation::Known(true), _) | (_, Relation::Known(true)) => Some(Relation::Known(true)),
+        (Relation::Known(false), r) | (r, Relation::Known(false)) => Some(r),
+        (Relation::Holds(x), Relation::Holds(y)) => match aligned_mask(x, y) {
+            Some(m) => Some(normalize(CmpFact {
+                mask: x.mask | m,
+                ..x
+            })),
+            None => pair_of_self_tests(x, y, CMP_UN),
+        },
+    }
+}
+
+fn not(a: Relation) -> Relation {
+    match a {
+        Relation::Known(v) => Relation::Known(!v),
+        Relation::Holds(f) => normalize(CmpFact {
+            mask: !f.mask & f.domain.all(),
+            ..f
+        }),
     }
 }

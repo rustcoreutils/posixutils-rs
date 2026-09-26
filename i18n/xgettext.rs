@@ -713,7 +713,7 @@ impl Walker {
         path: &str,
     ) {
         match &expr.kind {
-            ExprKind::Call { func, args } => {
+            ExprKind::Call { func, args, .. } => {
                 // Check if this is a gettext-family function call
                 if let ExprKind::Ident(symbol_id) = &func.kind {
                     let func_name = strings.get(symbols.get(*symbol_id).name).to_string();

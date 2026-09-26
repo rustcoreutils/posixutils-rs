@@ -907,9 +907,9 @@ impl Aarch64CodeGen {
             // instruction produced nothing rather than failing -- so
             // `__builtin_memcpy` silently copied nothing on every aarch64
             // build.
-            Opcode::Memcpy => self.emit_mem_libcall(insn, "memcpy"),
-            Opcode::Memmove => self.emit_mem_libcall(insn, "memmove"),
-            Opcode::Memset => self.emit_mem_libcall(insn, "memset"),
+            Opcode::Memcpy => self.emit_mem_libcall(insn),
+            Opcode::Memmove => self.emit_mem_libcall(insn),
+            Opcode::Memset => self.emit_mem_libcall(insn),
 
             // Skip no-ops and unimplemented
             _ => {}
@@ -1363,6 +1363,7 @@ impl CodeGenerator for Aarch64CodeGen {
         }
 
         self.base.emit_declared_symbol_attrs(module);
+        self.base.emit_symbol_aliases(module);
 
         // Emit string literals
         if !module.strings.is_empty() {

@@ -892,6 +892,10 @@ pub struct Instruction {
     /// For calls: true if the called function is noreturn (never returns).
     /// Code after a noreturn call is unreachable.
     pub is_noreturn_call: bool,
+    /// For direct calls: whether `func_name` may be a definition in this
+    /// module or is only ever the external library function. See
+    /// [`Instruction::local_callee`], which is how a pass should ask.
+    pub callee_binding: crate::parse::ast::CalleeBinding,
     /// For indirect calls: pseudo containing the function pointer address.
     /// When this is Some, the call is indirect (call through function pointer).
     pub indirect_target: Option<PseudoId>,
@@ -927,6 +931,7 @@ impl Default for Instruction {
             variadic_arg_start: None,
             ends_with_va_arg_pack: false,
             is_noreturn_call: false,
+            callee_binding: crate::parse::ast::CalleeBinding::Declared,
             indirect_target: None,
             pos: None,
             asm_data: None,
@@ -941,6 +946,21 @@ impl Instruction {
         Self {
             op,
             ..Default::default()
+        }
+    }
+
+    /// The function in this module a direct call may run, by name.
+    ///
+    /// `None` for anything but a direct call, and for a call to a library
+    /// function spelled `__builtin_X`: that one reaches the external `X`
+    /// however this module defines `X`, so it is neither a call to an inline
+    /// definition to splice in nor a recursive call when made from `X`'s own
+    /// body. Inlining and recursion detection ask this rather than reading
+    /// `func_name`, which names the symbol either way.
+    pub fn local_callee(&self) -> Option<&str> {
+        match (self.op, self.callee_binding) {
+            (Opcode::Call, crate::parse::ast::CalleeBinding::Declared) => self.func_name.as_deref(),
+            _ => None,
         }
     }
 
@@ -1003,6 +1023,21 @@ impl Instruction {
     pub fn with_func(mut self, name: impl Into<String>) -> Self {
         self.func_name = Some(name.into());
         self
+    }
+
+    /// The C library function an opcode the backends lower to a call
+    /// (`Memcpy`, `Memset`, `Memmove`, `Fabs32`/`Fabs64`, `Setjmp`,
+    /// `Longjmp`) calls, by its assembler name.
+    ///
+    /// The linearizer resolved it through the program's own declarations
+    /// (`Linearizer::library_function_name`), so an asm-label rename of
+    /// `memcpy` reaches `__builtin_memcpy` and a structure copy alike. A
+    /// backend names the callee through here, never with a literal.
+    pub fn library_callee(&self) -> &str {
+        match &self.func_name {
+            Some(name) => name,
+            None => panic!("{:?} was built without its library callee", self.op),
+        }
     }
 
     /// Set bit size
@@ -2470,6 +2505,36 @@ impl GlobalDef {
     }
 }
 
+/// A second name for a definition in this translation unit, from
+/// `__attribute__((alias("target")))`.
+///
+/// Neither a definition nor a reference: the alias owns no storage and no
+/// code, and the object file gets `name` as a symbol whose value is
+/// `target`'s address -- `.set name, target`. It has its own binding, which
+/// is why it is not folded into the target: `static` makes it local, `weak`
+/// lets a strong definition elsewhere replace it while `target` keeps its own
+/// name, and visibility is set on it alone.
+///
+/// Two names for one object is exactly what the memory passes must not
+/// assume away. An alias is never in `Module::globals`, so `memloc` knows
+/// nothing about it and answers "may alias anything" for every access made
+/// through it -- which is what makes a store through `b` visible to a load of
+/// `a`. The target must stay emitted even when nothing else names it:
+/// `inline::remove_dead_functions` counts an alias as a reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolAlias {
+    /// The alias, as the assembler spells it.
+    pub name: String,
+    /// The symbol it names: a definition in this unit, or another alias.
+    pub target: String,
+    /// Declared `static`: a local symbol, no `.globl`.
+    pub is_static: bool,
+    /// `weak`: `.weak` rather than `.globl`.
+    pub weak: bool,
+    /// `visibility("...")`, verbatim, as on any other symbol.
+    pub visibility: Option<String>,
+}
+
 // Module (Translation Unit)
 
 /// A module containing multiple functions
@@ -2518,6 +2583,9 @@ pub struct Module {
     /// bits into a scaled load or store (aarch64 `:lo12:`) needs it; a
     /// definition's alignment is on its `GlobalDef`.
     pub extern_object_align: HashMap<String, u32>,
+    /// `__attribute__((alias))` symbols, in declaration order, each checked
+    /// to name something this unit defines.
+    pub aliases: Vec<SymbolAlias>,
     /// Compilation directory (for DW_AT_comp_dir in DWARF)
     pub comp_dir: Option<String>,
     /// Primary source filename (for DW_AT_name in DWARF)

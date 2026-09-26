@@ -514,6 +514,10 @@ define_keywords! {
     (BUILTIN_PRINTF_UNLOCKED, "__builtin_printf_unlocked", BUILTIN),
     (BUILTIN_FPRINTF_UNLOCKED, "__builtin_fprintf_unlocked", BUILTIN),
     (BUILTIN_FPUTS_UNLOCKED, "__builtin_fputs_unlocked", BUILTIN),
+    (BUILTIN_FPRINTF,   "__builtin_fprintf",   BUILTIN),
+    (BUILTIN_FPUTS,     "__builtin_fputs",     BUILTIN),
+    (BUILTIN_FPUTC,     "__builtin_fputc",     BUILTIN),
+    (BUILTIN_FWRITE,    "__builtin_fwrite",    BUILTIN),
     // ---- Checked arithmetic (C23 spells these ckd_add and friends) ----
     (BUILTIN_ADD_OVERFLOW, "__builtin_add_overflow", BUILTIN),
     (BUILTIN_ADD_OVERFLOW_P, "__builtin_add_overflow_p", BUILTIN),
@@ -629,6 +633,7 @@ define_keywords! {
     (BUILTIN_ISLESSEQUAL, "__builtin_islessequal", BUILTIN),
     (BUILTIN_ISLESSGREATER, "__builtin_islessgreater", BUILTIN),
     (BUILTIN_ISUNORDERED, "__builtin_isunordered", BUILTIN),
+    (BUILTIN_ISEQSIG,   "__builtin_iseqsig",  BUILTIN),
     (BUILTIN_SIGNBIT,   "__builtin_signbit",  BUILTIN),
     (BUILTIN_SIGNBITF,  "__builtin_signbitf", BUILTIN),
     (BUILTIN_SIGNBITL,  "__builtin_signbitl", BUILTIN),
@@ -917,6 +922,10 @@ define_keywords! {
     (_,                 "printf_unlocked",  0),
     (_,                 "fprintf_unlocked",  0),
     (_,                 "fputs_unlocked",  0),
+    (_,                 "fprintf",               0),
+    (_,                 "fputs",                 0),
+    (_,                 "fputc",                 0),
+    (_,                 "fwrite",                0),
     // The long-double magnitude and sign builtins lower to these rather than
     // to `fabs`/`__signbit`, which take a `double` and so read only the low
     // eight bytes of an x87 value. `fabsl` is named above, as a plain
@@ -934,6 +943,7 @@ define_keywords! {
     (_, "weak",                 SUPPORTED_ATTR),
     (_, "section",              SUPPORTED_ATTR),
     (_, "visibility",           SUPPORTED_ATTR),
+    (_, "alias",                SUPPORTED_ATTR),
     (_, "constructor",          SUPPORTED_ATTR),
     (_, "destructor",           SUPPORTED_ATTR),
     (_, "used",                 SUPPORTED_ATTR),
@@ -988,6 +998,7 @@ define_keywords! {
     (_, "__weak__",             SUPPORTED_ATTR),
     (_, "__section__",          SUPPORTED_ATTR),
     (_, "__visibility__",       SUPPORTED_ATTR),
+    (_, "__alias__",            SUPPORTED_ATTR),
     (_, "__constructor__",      SUPPORTED_ATTR),
     (_, "__destructor__",       SUPPORTED_ATTR),
     (_, "__used__",             SUPPORTED_ATTR),

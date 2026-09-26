@@ -207,7 +207,7 @@ fn extract_calls_from_expr(
     calls: &mut Vec<String>,
 ) {
     match &expr.kind {
-        ExprKind::Call { func, args } => {
+        ExprKind::Call { func, args, .. } => {
             // Extract callee name
             if let ExprKind::Ident(symbol_id) = &func.kind {
                 let callee = strings.get(symbols.get(*symbol_id).name).to_string();
@@ -453,7 +453,7 @@ fn visit_subexprs(
     f: &mut dyn FnMut(&posixutils_cc::parse::ast::Expr),
 ) {
     match &expr.kind {
-        ExprKind::Call { func, args } => {
+        ExprKind::Call { func, args, .. } => {
             f(func);
             for a in args {
                 f(a);

@@ -14530,3 +14530,669 @@ int main(void)
 "#;
     run_everywhere("attribute_arguments", src);
 }
+
+/// A library function renamed with `__asm("name")` is called by that name
+/// from every spelling that reaches it: the plain call, the `__builtin_`
+/// form, and a copy or fill the compiler lowers to it. `__builtin_memcpy` and
+/// `__builtin_memset` became the `Memcpy`/`Memset` opcodes, which both
+/// backends emitted as calls to the literal `memcpy`/`memset`, bypassing the
+/// program's rename. gcc.c-torture's `builtins/memops-asm`.
+#[test]
+fn codegen_asm_renamed_library_function_is_honoured() {
+    let src = r#"
+typedef __SIZE_TYPE__ size_t;
+/* The copies below are byte-wise through volatile, or an optimizer turns the
+   loop back into a memcpy call -- which the rename makes a call to itself. */
+extern void *memcpy(void *, const void *, size_t) __asm("my_memcpy");
+extern void *memset(void *, int, size_t) __asm("my_memset");
+extern void *memmove(void *, const void *, size_t) __asm("my_memmove");
+
+int calls;
+
+__attribute__((used)) void *my_memcpy(void *d, const void *s, size_t n)
+{
+    volatile char *dp = d; const volatile char *sp = s;
+    calls++;
+    while (n--) *dp++ = *sp++;
+    return d;
+}
+__attribute__((used)) void *my_memset(void *d, int c, size_t n)
+{
+    volatile char *dp = d;
+    calls++;
+    while (n--) *dp++ = c;
+    return d;
+}
+__attribute__((used)) void *my_memmove(void *d, const void *s, size_t n)
+{
+    volatile char tmp[256]; volatile char *dp = d; const volatile char *sp = s;
+    calls++;
+    for (size_t i = 0; i < n; i++) tmp[i] = sp[i];
+    for (size_t i = 0; i < n; i++) dp[i] = tmp[i];
+    return d;
+}
+
+char x[64] = "foobar", y[64];
+volatile int n = 6;
+
+int main(void)
+{
+    if (__builtin_memcpy(y, x, n) != y || y[5] != 'r') return 1;
+    if (__builtin_memset(y, 'X', n) != y || y[0] != 'X') return 2;
+    if (__builtin_memmove(y + 1, y, n) != y + 1 || y[6] != 'X') return 3;
+    if (memcpy(y, x, n) != y || memset(y, 0, n) != y) return 4;
+    if (calls != 5) return 10 + calls;
+    return 0;
+}
+"#;
+    run_everywhere("asm_renamed_libfn", src);
+}
+
+/// `__attribute__((alias("target")))` makes a second symbol for the storage or
+/// code of a definition in the same unit. c17 ignored it with a warning, so
+/// every use of the alias was an undefined reference at link time
+/// (gcc.c-torture `alias-2`/`-3`/`-4`). Covers objects, an array and a struct,
+/// functions, a static target reached only through its alias, a static alias,
+/// a weak alias, an alias of an alias, and -- the part an optimizer can get
+/// wrong -- a store through one name read back through the other.
+#[test]
+fn codegen_alias_attribute() {
+    let src = r#"
+int a[10] = {0};
+extern int b[10] __attribute__((alias("a")));
+static int s = 5;
+extern int t __attribute__((alias("s")));
+static int u __attribute__((alias("s")));
+int f(void) { return 11; }
+int g(void) __attribute__((alias("f")));
+int w(void) __attribute__((weak, alias("f")));
+int chained(void) __attribute__((alias("g")));
+static int sf(void) { return 22; }
+int h(void) __attribute__((alias("sf"), visibility("hidden")));
+static int only_by_alias(void) { return 33; }
+int public_name(void) __attribute__((alias("only_by_alias")));
+static int lonely = 7;
+extern int lonely_alias __attribute__((alias("lonely")));
+struct pt { int x, y; } origin = {1, 2};
+extern struct pt origin2 __attribute__((alias("origin")));
+int off;
+
+__attribute__((noinline)) static void bump(void) { t++; }
+
+int main(void)
+{
+    b[off] = 1;
+    a[off] = 2;
+    if (b[off] != 2)
+        return 1;
+    if (&b[3] != &a[3])
+        return 2;
+    s = 0;
+    bump();
+    if (s != 1)
+        return 3;
+    if (&u != &s)
+        return 4;
+    if (g() != 11 || w() != 11 || chained() != 11)
+        return 5;
+    if (h() != 22)
+        return 6;
+    if (public_name() != 33)
+        return 7;
+    if (lonely_alias != 7)
+        return 8;
+    origin.y = 5;
+    if (origin2.y != 5 || origin2.x != 1)
+        return 9;
+    int (*pg)(void) = g, (*pf)(void) = f;
+    if (pg != pf)
+        return 10;
+    return 0;
+}
+"#;
+    run_everywhere("alias_attribute", src);
+}
+
+/// An alias is a symbol other translation units link against like any other:
+/// a write through the alias from one unit is a write to the target's storage,
+/// a call through a function alias reaches the target, and a *weak* alias
+/// gives way to a strong definition elsewhere while the target keeps its own
+/// name.
+#[test]
+fn codegen_alias_attribute_across_units() {
+    let unit_a = r#"
+int store[4] = {1, 2, 3, 4};
+extern int view[4] __attribute__((alias("store")));
+int impl(int x) { return x * 2; }
+int api(int) __attribute__((alias("impl")));
+int fallback(void) { return 1; }
+int hook(void) __attribute__((weak, alias("fallback")));
+int unhooked(void) __attribute__((weak, alias("fallback")));
+int read_store(int i) { return store[i]; }
+"#;
+    let unit_b = r#"
+extern int view[4];
+int api(int);
+int fallback(void);
+int unhooked(void);
+int read_store(int);
+int hook(void) { return 2; }
+
+int main(void)
+{
+    view[2] = 30;
+    if (read_store(2) != 30)
+        return 1;
+    if (api(21) != 42)
+        return 2;
+    if (hook() != 2)
+        return 3;
+    if (fallback() != 1 || unhooked() != 1)
+        return 4;
+    return 0;
+}
+"#;
+    for opt in [&[][..], &["-O2".to_string()][..]] {
+        assert_eq!(
+            compile_and_run_two_units("alias_units", unit_a, unit_b, opt),
+            0,
+            "alias across units at {opt:?}"
+        );
+    }
+}
+
+/// An inline definition emits no symbol, so the same name may also be an
+/// alias: the body is there to inline, and the alias is what an out-of-line
+/// call or the function's address reaches. gcc.c-torture `compile/20011119-1`
+/// and `-2` are this shape, which c17 first rejected as a name defined twice.
+#[test]
+fn codegen_alias_beside_inline_definition() {
+    let src = r#"
+extern inline __attribute__((gnu_inline)) int foo(void) { return 23; }
+int bar(void) { return foo(); }
+extern int foo(void) __attribute__((weak, alias("xxx")));
+int xxx(void) { return 24; }
+
+int main(void)
+{
+    int (*p)(void) = foo;
+    int b = bar();
+    if (b != 23 && b != 24)
+        return 1;
+    if (p() != 24 || p != xxx)
+        return 2;
+    return 0;
+}
+"#;
+    run_everywhere("alias_beside_inline", src);
+}
+
+/// The directives an alias is made of, as gcc writes them on ELF: `.set` for
+/// the value, `.globl` or `.weak` for its binding and nothing for a static
+/// one, visibility on the alias itself, and no `.type`/`.size`, which the
+/// assembler copies from the target.
+#[test]
+fn codegen_alias_attribute_asm() {
+    let src = r#"
+int f(void) { return 1; }
+int g(void) __attribute__((alias("f")));
+int w(void) __attribute__((weak, alias("f")));
+int h(void) __attribute__((alias("f"), visibility("hidden")));
+static int s = 5;
+static int u __attribute__((alias("s")));
+int *use(void) { return &u; }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("alias_asm", triple, src, &[]);
+        let lines: Vec<&str> = asm.lines().map(str::trim).collect();
+        for want in [
+            ".globl g",
+            ".set g, f",
+            ".weak w",
+            ".set w, f",
+            ".globl h",
+            ".hidden h",
+            ".set h, f",
+            ".set u, s",
+        ] {
+            assert!(lines.contains(&want), "{triple}: missing {want:?}:\n{asm}");
+        }
+        // A directive naming the symbol, however its operands continue.
+        let names = |directive: &str, sym: &str| {
+            lines.iter().any(|l| {
+                let mut words = l.split([' ', '\t', ',']).filter(|w| !w.is_empty());
+                words.next() == Some(directive) && words.next() == Some(sym)
+            })
+        };
+        for (directive, sym) in [
+            (".globl", "u"),
+            (".globl", "w"),
+            (".type", "g"),
+            (".size", "g"),
+        ] {
+            assert!(
+                !names(directive, sym),
+                "{triple}: unexpected {directive} {sym}:\n{asm}"
+            );
+        }
+    }
+}
+
+/// `__builtin_X` names the library function `X`, never an inline definition
+/// of `X` in this unit. glibc's fortify wrappers are exactly that shape -- an
+/// `always_inline` `gnu_inline` `extern inline` `strncpy` whose body calls
+/// `__builtin_strncpy` -- and c17 bound the builtin to the wrapper itself, so
+/// the wrapper looked recursive and was rejected as an `always_inline` that
+/// could not be inlined (gcc.c-torture `compile/pr46360`).
+#[test]
+fn codegen_library_builtin_binds_past_inline_wrapper() {
+    let src = r#"
+typedef __SIZE_TYPE__ size_t;
+extern char *strncpy(char *, const char *, size_t);
+extern void *memcpy(void *, const void *, size_t);
+extern size_t strlen(const char *);
+
+int wrapped;
+
+__attribute__((gnu_inline, always_inline)) extern inline char *
+strncpy(char *dest, const char *src, size_t len)
+{
+    wrapped++;
+    return __builtin_strncpy(dest, src, len);
+}
+
+__attribute__((gnu_inline, always_inline, artificial)) extern inline void *
+memcpy(void *d, const void *s, size_t n)
+{
+    wrapped += 10;
+    return __builtin___memcpy_chk(d, s, n, __builtin_object_size(d, 0));
+}
+
+int main(void)
+{
+    char buf[16];
+    char out[16];
+    if (strncpy(buf, "hello", sizeof buf) != buf)
+        return 1;
+    if (strlen(buf) != 5 || buf[4] != 'o' || buf[15] != 0)
+        return 2;
+    memcpy(out, buf, 6);
+    if (out[0] != 'h' || out[5] != 0)
+        return 3;
+    if (wrapped != 11)
+        return 4;
+    return 0;
+}
+"#;
+    run_everywhere("library_builtin_wrapper", src);
+}
+
+/// Every float comparison the optimizer decides without knowing its operands
+/// -- against a NaN or an infinity, a value against itself, and `&&`/`||`/`!`
+/// over comparisons of one pair -- must give the answer the unoptimized
+/// program gives, for NaN, both infinities and both zeros, in `float`,
+/// `double` and `long double`. The expected answers come from a rank table
+/// in integer arithmetic, never from a float comparison the compiler could
+/// fold the same wrong way; a fold that forgets a NaN is a wrong answer here.
+#[test]
+fn codegen_float_comparison_folds_agree_with_run_time() {
+    run_everywhere("fcmp_fold_answers", FCMP_FOLD_ANSWERS);
+}
+
+const FCMP_FOLD_ANSWERS: &str = r#"
+/* Every comparison c17 now folds must give the answer the unfolded program
+   gives. The expected answers are computed in integer arithmetic from a
+   rank table, never by a floating comparison the compiler could fold the
+   same wrong way. */
+enum { LT = 1, EQ = 2, GT = 4, UN = 8 };
+
+/* NaN, +Inf, -Inf, +0, -0, 1, -1 -- rank -1 is unordered. */
+static const int rank[] = { -1, 4, 0, 2, 2, 3, 1 };
+#define NV 7
+
+static int outcome(int i, int j)
+{
+    if (rank[i] < 0 || rank[j] < 0)
+        return UN;
+    return rank[i] < rank[j] ? LT : rank[i] == rank[j] ? EQ : GT;
+}
+
+#define T(e, m) do { int got = !!(e); int want = (o & (m)) != 0; \
+    if (got != want) return k; k++; } while (0)
+#define MIR(m) (((m) & (EQ | UN)) | (((m) & LT) ? GT : 0) | (((m) & GT) ? LT : 0))
+
+/* The six predicates against one side, both ways round. */
+#define SIX(x, c)                                                        \
+    T(x < c, LT); T(x <= c, LT | EQ); T(x > c, GT); T(x >= c, GT | EQ);  \
+    T(x == c, EQ); T(x != c, LT | GT | UN);                              \
+    o = MIR(o);                                                          \
+    T(c < x, LT); T(c <= x, LT | EQ); T(c > x, GT); T(c >= x, GT | EQ);  \
+    T(c == x, EQ); T(c != x, LT | GT | UN);                              \
+    o = MIR(o);
+
+#define DEFINE(TY, SUF)                                                  \
+static TY vals_##SUF[NV];                                                \
+__attribute__((noinline)) static int consts_##SUF(TY x, int i)           \
+{                                                                        \
+    int k = 1, o;                                                        \
+    o = outcome(i, 0); SIX(x, (TY)__builtin_nan(""));                    \
+    o = outcome(i, 1); SIX(x, (TY)__builtin_inf());                      \
+    o = outcome(i, 2); SIX(x, -(TY)__builtin_inf());                     \
+    o = outcome(i, 3); SIX(x, (TY)0.0);                                  \
+    o = outcome(i, 4); SIX(x, (TY)-0.0);                                 \
+    o = outcome(i, 5); SIX(x, (TY)1.0);                                  \
+    o = rank[i] < 0 ? UN : EQ;                                           \
+    T(x < x, LT); T(x <= x, LT | EQ); T(x > x, GT); T(x >= x, GT | EQ);  \
+    T(x == x, EQ); T(x != x, LT | GT | UN);                              \
+    return 0;                                                            \
+}                                                                        \
+__attribute__((noinline)) static int pairs_##SUF(TY a, TY b, int o)      \
+{                                                                        \
+    int k = 100;                                                         \
+    SIX(a, b);                                                           \
+    T((a < b) && (a > b), 0);                                            \
+    T((a == b) && (a != b), 0);                                          \
+    T((a < b) && (b < a), 0);                                            \
+    T((a == b) || (a != b), LT | EQ | GT | UN);                          \
+    T(__builtin_isunordered(a, b) || a >= b || a < b, LT | EQ | GT | UN);\
+    T(__builtin_isunordered(b, a) || a <= b || b < a, LT | EQ | GT | UN);\
+    T(__builtin_isunordered(a, b) || !__builtin_isunordered(a, b),       \
+      LT | EQ | GT | UN);                                                \
+    T(__builtin_isunordered(a, b), UN);                                  \
+    T(!__builtin_isunordered(b, a), LT | EQ | GT);                       \
+    T((a < b) || (a >= b), LT | EQ | GT);                                \
+    T((a <= b) && (a >= b), EQ);                                         \
+    T((a < b) || (a == b), LT | EQ);                                     \
+    T(!(a < b) && !(a > b), EQ | UN);                                    \
+    T((a < b) || (a > b), LT | GT);                                      \
+    T((a != b) && !__builtin_isunordered(a, b), LT | GT);                \
+    T((a != b) && (a == b), 0);                                          \
+    T(!(a >= b) || (a >= b), LT | EQ | GT | UN);                         \
+    T(!(a >= b), LT | UN);                                               \
+    T((a > b) ? 1 : (a <= b), LT | EQ | GT);                             \
+    T((a < b) ? (b > a) : 0, LT);                                        \
+    return 0;                                                            \
+}                                                                        \
+static int run_##SUF(void)                                               \
+{                                                                        \
+    vals_##SUF[0] = __builtin_nan("");                                   \
+    vals_##SUF[1] = __builtin_inf();                                     \
+    vals_##SUF[2] = -__builtin_inf();                                    \
+    vals_##SUF[3] = 0.0;                                                 \
+    vals_##SUF[4] = -0.0;                                                \
+    vals_##SUF[5] = 1.0;                                                 \
+    vals_##SUF[6] = -1.0;                                                \
+    for (int i = 0; i < NV; i++) {                                       \
+        int r = consts_##SUF(vals_##SUF[i], i);                          \
+        if (r) return r * 16 + i;                                        \
+        for (int j = 0; j < NV; j++) {                                   \
+            r = pairs_##SUF(vals_##SUF[i], vals_##SUF[j], outcome(i, j));\
+            if (r) return r * 256 + i * 16 + j;                          \
+        }                                                                \
+    }                                                                    \
+    return 0;                                                            \
+}
+
+DEFINE(float, f)
+DEFINE(double, d)
+DEFINE(long double, l)
+
+int main(void)
+{
+    int r;
+    if ((r = run_f())) return 1;
+    if ((r = run_d())) return 2;
+    if ((r = run_l())) return 3;
+    return 0;
+}
+"#;
+
+/// The same folds as proofs: every `link_error` below is behind a comparison
+/// that is false for every operand, NaN included -- gcc.c-torture's
+/// `ieee/fp-cmp-6`, `-7`, `-9` and `compare-fp-3` in one program -- so it
+/// links only when the optimizer deletes all of them. Not at -O0, where no
+/// branch is folded.
+#[test]
+fn codegen_float_comparison_folds_remove_dead_calls() {
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("fcmp_fold_link", FCMP_FOLD_LINK, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+        if let Some(code) = compile_and_run_aarch64("fcmp_fold_link", FCMP_FOLD_LINK, opt) {
+            assert_eq!(code, 0, "on aarch64 at {opt}");
+        }
+    }
+}
+
+const FCMP_FOLD_LINK: &str = r#"
+/* Every `link_error` here is behind a comparison that is false for every
+   operand value, NaN included; the program links only when the optimizer
+   proves it. */
+extern void link_error(void);
+
+const double dnan = 1.0 / 0.0 - 1.0 / 0.0;
+double gx = 1.0;
+
+__attribute__((noinline)) static int nan_side(float x)
+{
+    if (dnan == dnan) link_error();
+    if (dnan != gx) gx = 1.0; else link_error();
+    if (dnan < gx || dnan > gx || dnan <= gx || dnan >= gx || dnan == gx)
+        link_error();
+    if (gx < dnan || gx > dnan || gx <= dnan || gx >= dnan || gx == dnan)
+        link_error();
+    if (x == __builtin_nanf("") || !(x != __builtin_nanf("")))
+        link_error();
+    return 0;
+}
+
+__attribute__((noinline)) static int inf_side(double x, float y)
+{
+    if (x > __builtin_inf()) link_error();
+    if (__builtin_inf() < x) link_error();
+    if (x < -__builtin_inf()) link_error();
+    if (-__builtin_inf() > x) link_error();
+    if (y > __builtin_inff()) link_error();
+    if (x < x || x > x) link_error();
+    return 0;
+}
+
+__attribute__((noinline)) static int pairs(float x, float y)
+{
+    if ((x == y) && (x != y)) link_error();
+    if ((x < y) && (x > y)) link_error();
+    if ((x < y) && (y < x)) link_error();
+    if ((x == y) || (x != y)) {} else link_error();
+    if (__builtin_isunordered(x, y) || (x >= y) || (x < y)) {} else link_error();
+    if (__builtin_isunordered(y, x) || (x <= y) || (y < x)) {} else link_error();
+    if (__builtin_isunordered(x, y) || !__builtin_isunordered(x, y)) {} else link_error();
+    return 0;
+}
+
+int main(void)
+{
+    static const float fv[] = { 0.0f, 1.0f, -0.0f, __builtin_inff(), __builtin_nanf("") };
+    int r = nan_side(1.0f) + inf_side(2.0, fv[3]);
+    for (int i = 0; i < 5; i++)
+        for (int j = 0; j < 5; j++)
+            r += pairs(fv[i], fv[j]);
+    return r;
+}
+"#;
+
+/// A statement expression ending in a labeled expression statement takes that
+/// expression's value, as gcc does -- it was typed `void`, so every use drew
+/// "void value not ignored as it ought to be" (compile/pr17913). A constant
+/// `?:` also has to keep an arm that defines a label, since a computed `goto`
+/// can still reach it; dropping the arm dropped the label.
+#[test]
+fn codegen_stmt_expr_labeled_last_statement() {
+    let src = r#"
+int f(int k) {
+    void *p = &&a;
+    int v = k ? 1 : ({ a: 7; });
+    if (k)
+        return v;
+    goto *p;
+}
+static int g(void) { return ({ x: 5; }); }
+static int h(void) { return ({ int t = 3; x: y: t + 4; }); }
+static int loop(void) {
+    int s = ({ int i = 0, t = 0; again: t += i; if (++i < 4) goto again; lab: t * 2; });
+    return s;
+}
+static int folded(int k) {
+    void *p = k ? &&a : &&b;
+    int v = 1 ? 3 : ({ a: 9; });
+    int w = 5 ?: ({ b: 6; });
+    if (k)
+        return v + w;
+    goto *p;
+}
+int main(void) {
+    if (f(1) != 1) return 1;
+    if (g() != 5) return 2;
+    if (h() != 7) return 3;
+    if (loop() != 12) return 4;
+    if (folded(1) != 8) return 5;
+    return 0;
+}
+"#;
+    run_everywhere("stmt_expr_label", src);
+}
+
+/// GNU attributes inside a type-name -- in a cast, `sizeof`, `_Alignof`,
+/// `typeof` and a compound literal -- were rejected. `aligned` aligns the
+/// type named, `mode` and `vector_size` replace it, and none of them reach an
+/// enclosing declaration. Alongside: a tagged struct defined in a type-name
+/// declares its tag, `aligned` on a tag reference aligns the declaration, and
+/// an enclosing `_Alignas` no longer lands on a struct's first member. Every
+/// answer is gcc's, on both targets.
+#[test]
+fn codegen_type_name_attributes() {
+    let src = r#"
+struct S { int a; char b; };
+#define A(x) __attribute__((x))
+
+/* A type-name's attribute is its own: neither `c` nor `x` may pick it up. */
+char c = sizeof(int * A(aligned(64)));
+_Alignas(16) struct { char a; char b; } x;
+A(aligned(32)) struct Q { char a; char b; } y;
+struct S A(aligned(32)) z;
+typedef struct S A(aligned(64)) T;
+
+int main(void) {
+    struct S s = {1, 2};
+    void *p = &s;
+    if (sizeof(int A(packed)) != 4) return 1;
+    if (sizeof(A(packed) int) != 4) return 2;
+    if (sizeof(long A(aligned(16))) != 8) return 3;
+    if (_Alignof(int A(aligned(8))) != 8) return 4;
+    if (_Alignof(A(aligned(8)) int) != 8) return 5;
+    if (_Alignof(int A(aligned(2))) != 2) return 6;
+    if (_Alignof(char A(aligned)) != 16) return 7;
+    if (_Alignof(struct S A(aligned(32))) != 32) return 8;
+    if (_Alignof(const A(aligned(16)) long) != 16) return 9;
+    if (_Alignof(int A(aligned(16)) *) != 16) return 10;
+    if (_Alignof(int * A(aligned(16))) != 16) return 11;
+    if (sizeof(int A(aligned(16))[3]) != 12) return 12;
+    if ((long A(aligned(16)))0 + 5 != 5) return 13;
+    if (((struct S A(may_alias) *)p)->a != 1) return 14;
+    if (((A(may_alias) struct S *)p)->b != 2) return 15;
+    if ((int A(unused)){7} != 7) return 16;
+    if (_Alignof(__typeof__(int A(aligned(16)))) != 16) return 17;
+    if (sizeof(int A(mode(DI))) != 8) return 18;
+    if (sizeof(int A(vector_size(16))) != 16) return 19;
+    if (_Alignof(c) != 1) return 20;
+    if (sizeof(x) != 2 || _Alignof(x) != 16) return 21;
+    if (sizeof(y) != 2 || _Alignof(y) != 32) return 22;
+    if (_Alignof(z) != 32 || _Alignof(T) != 64 || _Alignof(struct S) != 4) return 23;
+    /* A tagged definition inside a type-name declares the tag. */
+    int n = sizeof(struct U { int a, b; });
+    struct U u = {3, 4};
+    if (n != 8) return 24;
+    if (((struct U *)&u)->b != 4) return 25;
+    return 0;
+}
+"#;
+    run_everywhere("type_name_attrs", src);
+}
+
+/// `__builtin_fprintf`, `__builtin_fputs`, `__builtin_fputc` and
+/// `__builtin_fwrite` are the library functions under gcc's reserved names
+/// (execute/builtins/fprintf.c, fputs.c).
+#[test]
+fn codegen_stdio_library_builtins() {
+    let src = r#"
+/* No <stdio.h>: the builtins must not need their library declarations. */
+typedef struct stdio_file FILE;
+typedef __SIZE_TYPE__ size_t;
+FILE *tmpfile(void);
+FILE *fdopen(int, const char *);
+void rewind(FILE *);
+size_t fread(void *, size_t, size_t, FILE *);
+int fflush(FILE *);
+int fclose(FILE *);
+int strcmp(const char *, const char *);
+
+int main(void) {
+    char buf[64];
+    FILE *f = tmpfile();
+    if (!f) return 1;
+    if (__builtin_fprintf(f, "%d-%s", 42, "ab") != 5) return 2;
+    if (__builtin_fputs("xy", f) < 0) return 3;
+    if (__builtin_fputc('!', f) != '!') return 4;
+    if (__builtin_fwrite("123", 1, 3, f) != 3) return 5;
+    rewind(f);
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    buf[n] = 0;
+    fclose(f);
+    if (strcmp(buf, "42-abxy!123") != 0) return 6;
+    FILE *out = fdopen(1, "w");
+    if (!out) return 7;
+    if (__builtin_fprintf(out, "out %d\n", 7) != 6) return 8;
+    if (__builtin_fputs("done\n", out) < 0) return 9;
+    fflush(out);
+    return 0;
+}
+"#;
+    run_everywhere("stdio_builtins", src);
+}
+
+/// `__builtin_iseqsig` is C23's `iseqsig`: ordered and equal, so false for
+/// any NaN, with the usual arithmetic conversions applied to mixed operands
+/// and each operand evaluated once (compile/pr122588-1).
+#[test]
+fn codegen_builtin_iseqsig() {
+    let src = r#"
+static volatile double zero = 0.0;
+static int eq_d(double a, double b) { return __builtin_iseqsig(a, b); }
+static int eq_f(float a, float b) { return __builtin_iseqsig(a, b); }
+static int eq_l(long double a, long double b) { return __builtin_iseqsig(a, b); }
+static int calls;
+static double next(double v) { calls++; return v; }
+int main(void) {
+    double nan = zero / zero;
+    float fnan = (float)nan;
+    if (eq_d(1.5, 1.5) != 1) return 1;
+    if (eq_d(1.5, 2.5) != 0) return 2;
+    if (eq_d(nan, nan) != 0) return 3;
+    if (eq_d(nan, 1.0) != 0) return 4;
+    if (eq_d(0.0, -0.0) != 1) return 5;
+    if (eq_f(2.0f, 2.0f) != 1) return 6;
+    if (eq_f(fnan, 2.0f) != 0) return 7;
+    if (eq_l(3.0L, 3.0L) != 1) return 8;
+    if (eq_l(3.0L, (long double)nan) != 0) return 9;
+    /* Mixed operands: float and double, int and double. */
+    if (__builtin_iseqsig(0.1f, 0.1) != 0) return 10;
+    if (__builtin_iseqsig(0.5f, 0.5) != 1) return 11;
+    if (__builtin_iseqsig(3, 3.0) != 1) return 12;
+    /* Each operand evaluated exactly once. */
+    if (__builtin_iseqsig(next(1.0), next(1.0)) != 1 || calls != 2) return 13;
+    return 0;
+}
+"#;
+    run_everywhere("iseqsig", src);
+}

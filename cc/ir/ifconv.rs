@@ -46,6 +46,14 @@ use std::collections::{HashSet, VecDeque};
 /// Division and remainder are deliberately absent -- they trap on a zero
 /// divisor -- and so are the shifts, whose behaviour past the operand width is
 /// undefined. Neither is needed for the shape this pass exists for.
+///
+/// A float comparison is listed because every one that reaches this pass is
+/// emitted as a *quiet* compare -- `ucomis*` and `fucomip` on x86-64, `fcmp`
+/// on aarch64 -- which raises nothing for a quiet NaN, so evaluating one on a
+/// path that would not have cannot set a flag the program could observe.
+/// (Annex F leaves signaling NaNs unspecified.) The comparisons that are
+/// library calls, binary128 `long double` on aarch64, have already been
+/// rewritten into `Call`s by the time this runs.
 fn is_speculatable(insn: &Instruction) -> bool {
     matches!(
         insn.op,
@@ -74,6 +82,12 @@ fn is_speculatable(insn: &Instruction) -> bool {
             | Opcode::SetBe
             | Opcode::SetA
             | Opcode::SetAe
+            | Opcode::FCmpOEq
+            | Opcode::FCmpONe
+            | Opcode::FCmpOLt
+            | Opcode::FCmpOLe
+            | Opcode::FCmpOGt
+            | Opcode::FCmpOGe
     )
 }
 
@@ -369,6 +383,46 @@ mod tests {
             None,
             "a folded branch must not keep a stale target"
         );
+    }
+
+    /// `(x < y) && (x > y)` over floats: the comparison is a quiet compare,
+    /// so it is speculated like an integer one, and the two relationals land
+    /// side by side where `instcombine` can compare them. Float arithmetic is
+    /// not: a division can raise divide-by-zero.
+    #[test]
+    fn ifconv_speculates_a_float_comparison_but_not_float_arithmetic() {
+        let types = TypeTable::new(&Target::host());
+        for op in [
+            Opcode::FCmpOEq,
+            Opcode::FCmpONe,
+            Opcode::FCmpOLt,
+            Opcode::FCmpOLe,
+            Opcode::FCmpOGt,
+            Opcode::FCmpOGe,
+        ] {
+            let arm = Instruction::binop(
+                op,
+                PseudoId(2),
+                PseudoId(0),
+                PseudoId(1),
+                types.double_id,
+                64,
+            );
+            let mut func = diamond(arm);
+            assert!(run(&mut func), "{op:?} must be speculated");
+            let merge = func.get_block(BasicBlockId(2)).expect("merge survives");
+            assert_eq!(merge.insns[0].op, Opcode::Select, "{op:?}");
+        }
+        let fdiv = Instruction::binop(
+            Opcode::FDiv,
+            PseudoId(2),
+            PseudoId(0),
+            PseudoId(1),
+            types.double_id,
+            64,
+        );
+        let mut func = diamond(fdiv);
+        assert!(!run(&mut func), "a float division must not be speculated");
     }
 
     /// The guarantee C makes: the right operand of `&&` does not run when the

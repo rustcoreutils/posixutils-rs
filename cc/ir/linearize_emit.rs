@@ -337,6 +337,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let result = self.alloc_pseudo();
         self.emit(
             Instruction::new(Opcode::Memcpy)
+                .with_func(self.library_function_name("memcpy"))
                 .with_target(result)
                 .with_src3(dst_ptr, src, n)
                 .with_type_and_size(self.types.void_ptr_id, 64),

@@ -817,6 +817,12 @@ pub enum Directive {
     /// .globl symbol - mark symbol as globally visible
     Global(Symbol),
 
+    /// `.set sym, value` -- define `sym` as another name for `value`'s
+    /// address, from `__attribute__((alias))`. The assembler gives `sym` the
+    /// section, type and size of `value`; its binding is whatever `.globl`,
+    /// `.weak` or neither says.
+    SymbolAlias { sym: Symbol, value: Symbol },
+
     /// .type symbol, @function/@object (ELF only)
     Type { sym: Symbol, kind: SymbolType },
 
@@ -1241,6 +1247,14 @@ impl EmitAsm for Directive {
             // Symbol visibility
             Directive::Global(sym) => {
                 let _ = writeln!(out, ".globl {}", sym.format_for_target(target));
+            }
+            Directive::SymbolAlias { sym, value } => {
+                let _ = writeln!(
+                    out,
+                    ".set {}, {}",
+                    sym.format_for_target(target),
+                    value.format_for_target(target)
+                );
             }
             Directive::Type { sym, kind } => {
                 // ELF only - skip on macOS

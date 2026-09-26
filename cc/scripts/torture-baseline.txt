@@ -3,10 +3,14 @@ builtins/20010124-1@-O2
 builtins/abs-2@-O0
 builtins/abs-3@-O0
 builtins/complex-1@-O0
+builtins/fprintf@-O0
+builtins/fputs@-O0
 builtins/memchr@-O0
 builtins/memcmp@-O0
 builtins/memmove-2@-O0
 builtins/memmove@-O0
+builtins/memops-asm@-O0
+builtins/memops-asm@-O2
 builtins/mempcpy-2@-O0
 builtins/mempcpy-2@-O2
 builtins/mempcpy@-O0
@@ -2111,6 +2115,8 @@ compile/pr120807@-O0
 compile/pr120807@-O2
 compile/pr122066@-O0
 compile/pr122066@-O2
+compile/pr122588-1@-O0
+compile/pr122588-1@-O2
 compile/pr123365@-O0
 compile/pr123365@-O2
 compile/pr123386@-O0
@@ -2169,6 +2175,8 @@ compile/pr17656@-O0
 compile/pr17656@-O2
 compile/pr17906@-O0
 compile/pr17906@-O2
+compile/pr17913@-O0
+compile/pr17913@-O2
 compile/pr18291@-O0
 compile/pr18291@-O2
 compile/pr18299-1@-O0
@@ -2434,6 +2442,7 @@ compile/pr34808@-O2
 compile/pr34885@-O0
 compile/pr34885@-O2
 compile/pr34966@-O0
+compile/pr34966@-O2
 compile/pr34993@-O0
 compile/pr34993@-O2
 compile/pr35043@-O0
@@ -2852,6 +2861,8 @@ compile/pr46107@-O0
 compile/pr46107@-O2
 compile/pr46248@-O0
 compile/pr46248@-O2
+compile/pr46360@-O0
+compile/pr46360@-O2
 compile/pr46388@-O0
 compile/pr46388@-O2
 compile/pr46461@-O0
@@ -5264,6 +5275,12 @@ execute/991228-1@-O0
 execute/991228-1@-O2
 execute/alias-1@-O0
 execute/alias-1@-O2
+execute/alias-2@-O0
+execute/alias-2@-O2
+execute/alias-3@-O0
+execute/alias-3@-O2
+execute/alias-4@-O0
+execute/alias-4@-O2
 execute/alias-access-path-1@-O0
 execute/alias-access-path-1@-O2
 execute/alias-access-path-2@-O0
@@ -7012,6 +7029,7 @@ ieee/compare-fp-1@-O2
 ieee/compare-fp-2@-O0
 ieee/compare-fp-2@-O2
 ieee/compare-fp-3@-O0
+ieee/compare-fp-3@-O2
 ieee/compare-fp-4@-O0
 ieee/compare-fp-4@-O2
 ieee/copysign1@-O0
@@ -7035,6 +7053,8 @@ ieee/fp-cmp-4@-O2
 ieee/fp-cmp-5@-O0
 ieee/fp-cmp-5@-O2
 ieee/fp-cmp-6@-O0
+ieee/fp-cmp-6@-O2
+ieee/fp-cmp-7@-O2
 ieee/fp-cmp-8e@-O0
 ieee/fp-cmp-8e@-O2
 ieee/fp-cmp-8f@-O0
@@ -7044,6 +7064,7 @@ ieee/fp-cmp-8l@-O2
 ieee/fp-cmp-8@-O0
 ieee/fp-cmp-8@-O2
 ieee/fp-cmp-9@-O0
+ieee/fp-cmp-9@-O2
 ieee/hugeval@-O0
 ieee/hugeval@-O2
 ieee/inf-1@-O0

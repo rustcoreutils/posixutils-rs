@@ -310,184 +310,14 @@ impl Parser<'_> {
         if self.is_special(b'{') {
             self.advance(); // consume '{'
 
-            let mut members = Vec::with_capacity(DEFAULT_MEMBER_CAPACITY);
-
-            while !self.is_special(b'}') && !self.is_eof() {
-                // Check for _Static_assert in struct (C11 6.7.2.1p1)
-                if self.is_static_assert() {
-                    self.parse_static_assert()?;
-                    continue;
-                }
-
-                // Parse member declaration
-                let member_base_type = self.parse_type_specifier()?;
-                let is_struct_or_union =
-                    matches!(member_base_type.kind, TypeKind::Struct | TypeKind::Union);
-                // For struct/union types with tags, use the existing TypeId from symbol table
-                // to ensure forward-declared types are properly linked
-                let member_base_type_id = self.intern_type_with_tag(&member_base_type);
-
-                // Skip any __attribute__ after type specifier (before member name)
-                self.skip_extensions();
-
-                // C11 anonymous struct/union members: "struct { ... };" or "union { ... };"
-                // These have no declarator name, just end with ';'
-                if is_struct_or_union && self.is_special(b';') {
-                    members.push(StructMember {
-                        name: StringId::EMPTY,
-                        typ: member_base_type_id,
-                        offset: 0,
-                        bit_offset: None,
-                        bit_width: None,
-                        access_bytes: None,
-                        explicit_align: None, // anonymous members
-                    });
-                    self.advance(); // consume ';'
-                    continue;
-                }
-
-                // Check for unnamed bitfield (starts with ':')
-                if self.is_special(b':') {
-                    // Unnamed bitfield: parse width only
-                    self.advance(); // consume ':'
-                    let width = self.parse_bitfield_width()?;
-                    // An unnamed bit-field is still a bit-field: its type has
-                    // to be one a bit-field may have, and its width has to fit.
-                    // Neither unnamed site validated anything, so
-                    // `struct { float : 3; }` was accepted.
-                    self.validate_bitfield(member_base_type_id, width, false)?;
-
-                    members.push(StructMember {
-                        name: StringId::EMPTY,
-                        typ: member_base_type_id,
-                        offset: 0,
-                        bit_offset: None,
-                        bit_width: Some(width),
-                        access_bytes: None,
-                        explicit_align: None, // bitfields don't support _Alignas
-                    });
-
-                    self.expect_special(b';')?;
-                    continue;
-                }
-
-                loop {
-                    // Check for unnamed bitfield (can appear after ',' too)
-                    // e.g., "int a : 1, : 2, b : 3;"
-                    if self.is_special(b':') {
-                        // Unnamed bitfield: parse width only
-                        self.advance(); // consume ':'
-                        let width = self.parse_bitfield_width()?;
-                        self.validate_bitfield(member_base_type_id, width, false)?;
-
-                        members.push(StructMember {
-                            name: StringId::EMPTY,
-                            typ: member_base_type_id,
-                            offset: 0,
-                            bit_offset: None,
-                            bit_width: Some(width),
-                            access_bytes: None,
-                            explicit_align: None, // bitfields don't support _Alignas
-                        });
-
-                        if self.is_special(b',') {
-                            self.advance();
-                            continue;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // VLAs are not allowed in struct members
-                    let (name, typ, vla_sizes, _func_params) =
-                        self.parse_declarator(member_base_type_id, DeclaratorName::Required)?;
-
-                    // C99 6.7.5.2: VLAs cannot be members of structures or unions
-                    if !vla_sizes.is_empty() {
-                        return Err(ParseError::new(
-                            "variable length arrays cannot be structure or union members"
-                                .to_string(),
-                            self.current_pos(),
-                        ));
-                    }
-
-                    // 6.7.2.1p9 says the same of a member that reached its
-                    // variably modified type through a typedef, which is the
-                    // only other way in -- the declarator wrote no `[n]`, so
-                    // the check above sees nothing. Without this the member
-                    // looked like a flexible array (its extent is absent) and
-                    // drew a diagnostic about that instead. gcc's wording.
-                    if self.pending_vm_typedef_dims.is_some() {
-                        return Err(ParseError::new(
-                            "a member of a structure or union cannot have a variably modified type"
-                                .to_string(),
-                            self.current_pos(),
-                        ));
-                    }
-
-                    // Check for bitfield: name : width
-                    let bit_width = if self.is_special(b':') {
-                        self.advance(); // consume ':'
-                        let width = self.parse_bitfield_width()?;
-                        // Validate bitfield type and width (this is a named bitfield)
-                        self.validate_bitfield(typ, width, true)?;
-                        Some(width)
-                    } else {
-                        None
-                    };
-
-                    // Skip any __attribute__ after member declaration
-                    self.skip_extensions();
-
-                    // A member's type attributes are the member's: consuming
-                    // them here sizes the member, and keeps a `mode(M)` from
-                    // staying pending for the enclosing declaration.
-                    let typ = self.apply_pending_type_attrs(typ);
-
-                    // Capture any pending _Alignas from type specifier
-                    let member_align = self.pending_alignas.take();
-
-                    // C17 6.7.2.1p2: members share one name space, so a
-                    // repeated name is a constraint violation. Unnamed members
-                    // -- anonymous struct/union members and unnamed bitfields
-                    // -- all carry the empty name and are not repeats of each
-                    // other.
-                    if name != StringId::EMPTY && members.iter().any(|m| m.name == name) {
-                        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
-                        diag::error_args(self.current_pos(), "duplicate member '{0}'", &[&spelled]);
-                    }
-
-                    members.push(StructMember {
-                        name,
-                        typ,
-                        offset: 0, // Computed later
-                        bit_offset: None,
-                        bit_width,
-                        access_bytes: None,
-                        explicit_align: member_align,
-                    });
-
-                    if self.is_special(b',') {
-                        self.advance();
-                    } else {
-                        break;
-                    }
-                }
-
-                // C17 6.7.2.1 requires the `;`. gcc accepts a member list
-                // whose last declaration lacks one and warns, and
-                // `-fpermissive` is where c17 keeps that kind of leniency --
-                // there is nothing ambiguous about `struct S { int a; int b }`,
-                // the `}` says the list ended.
-                if self.is_special(b'}') && diag::permissive() {
-                    diag::warning(
-                        self.current_pos(),
-                        &gettext("the last member of a struct or union needs a ';'"),
-                    );
-                } else {
-                    self.expect_special(b';')?;
-                }
-            }
+            // The members are declarations of their own, parsed through the
+            // same attribute slots as the declaration this specifier begins.
+            // Take that declaration's aside, or `_Alignas(16) struct { char a;
+            // } x;` aligns the member `a` and leaves `x` unaligned.
+            let outer = self.take_pending_decl_attrs();
+            let members = self.parse_member_list();
+            self.restore_pending_decl_attrs(outer);
+            let mut members = members?;
 
             self.expect_special(b'}')?;
 
@@ -604,7 +434,13 @@ impl Parser<'_> {
 
             Ok(struct_type)
         } else {
-            // Forward reference
+            // A reference, not a definition: the type already exists, so an
+            // `aligned` written on it is the declaration's -- gcc aligns `x` in
+            // `struct S __attribute__((aligned(32))) x;`, and a type-name's
+            // type in `_Alignof(struct S __attribute__((aligned(32))))`.
+            if let Some(align) = struct_align {
+                self.raise_pending_alignas(align);
+            }
             if let Some(tag_name) = tag {
                 // Look up existing tag
                 if let Some(existing) = self.symbols.lookup_tag(tag_name) {
@@ -630,6 +466,189 @@ impl Parser<'_> {
                 ))
             }
         }
+    }
+
+    /// The member declarations of a struct or union definition, from just
+    /// after its `{` to just before its `}`.
+    fn parse_member_list(&mut self) -> ParseResult<Vec<StructMember>> {
+        let mut members = Vec::with_capacity(DEFAULT_MEMBER_CAPACITY);
+
+        while !self.is_special(b'}') && !self.is_eof() {
+            // Check for _Static_assert in struct (C11 6.7.2.1p1)
+            if self.is_static_assert() {
+                self.parse_static_assert()?;
+                continue;
+            }
+
+            // Parse member declaration
+            let member_base_type = self.parse_type_specifier()?;
+            let is_struct_or_union =
+                matches!(member_base_type.kind, TypeKind::Struct | TypeKind::Union);
+            // For struct/union types with tags, use the existing TypeId from symbol table
+            // to ensure forward-declared types are properly linked
+            let member_base_type_id = self.intern_type_with_tag(&member_base_type);
+
+            // Skip any __attribute__ after type specifier (before member name)
+            self.skip_extensions();
+
+            // C11 anonymous struct/union members: "struct { ... };" or "union { ... };"
+            // These have no declarator name, just end with ';'
+            if is_struct_or_union && self.is_special(b';') {
+                members.push(StructMember {
+                    name: StringId::EMPTY,
+                    typ: member_base_type_id,
+                    offset: 0,
+                    bit_offset: None,
+                    bit_width: None,
+                    access_bytes: None,
+                    explicit_align: None, // anonymous members
+                });
+                self.advance(); // consume ';'
+                continue;
+            }
+
+            // Check for unnamed bitfield (starts with ':')
+            if self.is_special(b':') {
+                // Unnamed bitfield: parse width only
+                self.advance(); // consume ':'
+                let width = self.parse_bitfield_width()?;
+                // An unnamed bit-field is still a bit-field: its type has
+                // to be one a bit-field may have, and its width has to fit.
+                // Neither unnamed site validated anything, so
+                // `struct { float : 3; }` was accepted.
+                self.validate_bitfield(member_base_type_id, width, false)?;
+
+                members.push(StructMember {
+                    name: StringId::EMPTY,
+                    typ: member_base_type_id,
+                    offset: 0,
+                    bit_offset: None,
+                    bit_width: Some(width),
+                    access_bytes: None,
+                    explicit_align: None, // bitfields don't support _Alignas
+                });
+
+                self.expect_special(b';')?;
+                continue;
+            }
+
+            loop {
+                // Check for unnamed bitfield (can appear after ',' too)
+                // e.g., "int a : 1, : 2, b : 3;"
+                if self.is_special(b':') {
+                    // Unnamed bitfield: parse width only
+                    self.advance(); // consume ':'
+                    let width = self.parse_bitfield_width()?;
+                    self.validate_bitfield(member_base_type_id, width, false)?;
+
+                    members.push(StructMember {
+                        name: StringId::EMPTY,
+                        typ: member_base_type_id,
+                        offset: 0,
+                        bit_offset: None,
+                        bit_width: Some(width),
+                        access_bytes: None,
+                        explicit_align: None, // bitfields don't support _Alignas
+                    });
+
+                    if self.is_special(b',') {
+                        self.advance();
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+
+                // VLAs are not allowed in struct members
+                let (name, typ, vla_sizes, _func_params) =
+                    self.parse_declarator(member_base_type_id, DeclaratorName::Required)?;
+
+                // C99 6.7.5.2: VLAs cannot be members of structures or unions
+                if !vla_sizes.is_empty() {
+                    return Err(ParseError::new(
+                        "variable length arrays cannot be structure or union members".to_string(),
+                        self.current_pos(),
+                    ));
+                }
+
+                // 6.7.2.1p9 says the same of a member that reached its
+                // variably modified type through a typedef, which is the
+                // only other way in -- the declarator wrote no `[n]`, so
+                // the check above sees nothing. Without this the member
+                // looked like a flexible array (its extent is absent) and
+                // drew a diagnostic about that instead. gcc's wording.
+                if self.pending_vm_typedef_dims.is_some() {
+                    return Err(ParseError::new(
+                        "a member of a structure or union cannot have a variably modified type"
+                            .to_string(),
+                        self.current_pos(),
+                    ));
+                }
+
+                // Check for bitfield: name : width
+                let bit_width = if self.is_special(b':') {
+                    self.advance(); // consume ':'
+                    let width = self.parse_bitfield_width()?;
+                    // Validate bitfield type and width (this is a named bitfield)
+                    self.validate_bitfield(typ, width, true)?;
+                    Some(width)
+                } else {
+                    None
+                };
+
+                // Skip any __attribute__ after member declaration
+                self.skip_extensions();
+
+                // A member's type attributes are the member's: consuming
+                // them here sizes the member, and keeps a `mode(M)` from
+                // staying pending for the enclosing declaration.
+                let typ = self.apply_pending_type_attrs(typ);
+
+                // Capture any pending _Alignas from type specifier
+                let member_align = self.pending_alignas.take();
+
+                // C17 6.7.2.1p2: members share one name space, so a
+                // repeated name is a constraint violation. Unnamed members
+                // -- anonymous struct/union members and unnamed bitfields
+                // -- all carry the empty name and are not repeats of each
+                // other.
+                if name != StringId::EMPTY && members.iter().any(|m| m.name == name) {
+                    let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+                    diag::error_args(self.current_pos(), "duplicate member '{0}'", &[&spelled]);
+                }
+
+                members.push(StructMember {
+                    name,
+                    typ,
+                    offset: 0, // Computed later
+                    bit_offset: None,
+                    bit_width,
+                    access_bytes: None,
+                    explicit_align: member_align,
+                });
+
+                if self.is_special(b',') {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+
+            // C17 6.7.2.1 requires the `;`. gcc accepts a member list
+            // whose last declaration lacks one and warns, and
+            // `-fpermissive` is where c17 keeps that kind of leniency --
+            // there is nothing ambiguous about `struct S { int a; int b }`,
+            // the `}` says the list ended.
+            if self.is_special(b'}') && diag::permissive() {
+                diag::warning(
+                    self.current_pos(),
+                    &gettext("the last member of a struct or union needs a ';'"),
+                );
+            } else {
+                self.expect_special(b';')?;
+            }
+        }
+        Ok(members)
     }
 
     /// Parse a bitfield width (constant expression after ':')

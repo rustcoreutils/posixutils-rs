@@ -1532,6 +1532,7 @@ impl CodeGenerator for X86_64CodeGen {
         }
 
         self.base.emit_declared_symbol_attrs(module);
+        self.base.emit_symbol_aliases(module);
 
         // Emit string literals
         if !module.strings.is_empty() {

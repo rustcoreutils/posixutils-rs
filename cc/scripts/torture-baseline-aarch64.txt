@@ -3,10 +3,14 @@ aarch64/builtins/20010124-1@-O2
 aarch64/builtins/abs-2@-O0
 aarch64/builtins/abs-3@-O0
 aarch64/builtins/complex-1@-O0
+aarch64/builtins/fprintf@-O0
+aarch64/builtins/fputs@-O0
 aarch64/builtins/memchr@-O0
 aarch64/builtins/memcmp@-O0
 aarch64/builtins/memmove-2@-O0
 aarch64/builtins/memmove@-O0
+aarch64/builtins/memops-asm@-O0
+aarch64/builtins/memops-asm@-O2
 aarch64/builtins/mempcpy-2@-O0
 aarch64/builtins/mempcpy-2@-O2
 aarch64/builtins/mempcpy@-O0
@@ -2112,6 +2116,8 @@ aarch64/compile/pr120807@-O0
 aarch64/compile/pr120807@-O2
 aarch64/compile/pr122066@-O0
 aarch64/compile/pr122066@-O2
+aarch64/compile/pr122588-1@-O0
+aarch64/compile/pr122588-1@-O2
 aarch64/compile/pr123365@-O0
 aarch64/compile/pr123365@-O2
 aarch64/compile/pr123386@-O0
@@ -2170,6 +2176,8 @@ aarch64/compile/pr17656@-O0
 aarch64/compile/pr17656@-O2
 aarch64/compile/pr17906@-O0
 aarch64/compile/pr17906@-O2
+aarch64/compile/pr17913@-O0
+aarch64/compile/pr17913@-O2
 aarch64/compile/pr18291@-O0
 aarch64/compile/pr18291@-O2
 aarch64/compile/pr18299-1@-O0
@@ -2854,6 +2862,8 @@ aarch64/compile/pr46107@-O0
 aarch64/compile/pr46107@-O2
 aarch64/compile/pr46248@-O0
 aarch64/compile/pr46248@-O2
+aarch64/compile/pr46360@-O0
+aarch64/compile/pr46360@-O2
 aarch64/compile/pr46388@-O0
 aarch64/compile/pr46388@-O2
 aarch64/compile/pr46461@-O0
@@ -5266,6 +5276,12 @@ aarch64/execute/991228-1@-O0
 aarch64/execute/991228-1@-O2
 aarch64/execute/alias-1@-O0
 aarch64/execute/alias-1@-O2
+aarch64/execute/alias-2@-O0
+aarch64/execute/alias-2@-O2
+aarch64/execute/alias-3@-O0
+aarch64/execute/alias-3@-O2
+aarch64/execute/alias-4@-O0
+aarch64/execute/alias-4@-O2
 aarch64/execute/alias-access-path-1@-O0
 aarch64/execute/alias-access-path-1@-O2
 aarch64/execute/alias-access-path-2@-O0
@@ -7014,6 +7030,7 @@ aarch64/ieee/compare-fp-1@-O2
 aarch64/ieee/compare-fp-2@-O0
 aarch64/ieee/compare-fp-2@-O2
 aarch64/ieee/compare-fp-3@-O0
+aarch64/ieee/compare-fp-3@-O2
 aarch64/ieee/compare-fp-4@-O0
 aarch64/ieee/compare-fp-4@-O2
 aarch64/ieee/copysign1@-O0
@@ -7037,6 +7054,8 @@ aarch64/ieee/fp-cmp-4@-O2
 aarch64/ieee/fp-cmp-5@-O0
 aarch64/ieee/fp-cmp-5@-O2
 aarch64/ieee/fp-cmp-6@-O0
+aarch64/ieee/fp-cmp-6@-O2
+aarch64/ieee/fp-cmp-7@-O2
 aarch64/ieee/fp-cmp-8e@-O0
 aarch64/ieee/fp-cmp-8e@-O2
 aarch64/ieee/fp-cmp-8f@-O0
@@ -7046,6 +7065,7 @@ aarch64/ieee/fp-cmp-8l@-O2
 aarch64/ieee/fp-cmp-8@-O0
 aarch64/ieee/fp-cmp-8@-O2
 aarch64/ieee/fp-cmp-9@-O0
+aarch64/ieee/fp-cmp-9@-O2
 aarch64/ieee/hugeval@-O0
 aarch64/ieee/hugeval@-O2
 aarch64/ieee/inf-1@-O0

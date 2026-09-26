@@ -4394,27 +4394,6 @@ fn diagnostics_function_pointer_is_spelled_as_a_declarator() {
     );
 }
 
-/// An x87 asm operand that c17 cannot address is refused, not miscompiled.
-///
-/// `get_x87_mem_addr` has no arm for `Loc::Xmm` and falls back to `[rbp+0]` --
-/// the saved frame pointer -- so an x87 constraint on a value sitting in an
-/// XMM register, which is where a `double` lives, emitted `fldl (%rbp)` and
-/// silently read garbage. gcc spills such an operand; c17 cannot yet, so it
-/// says so.
-///
-/// The same shape with a `long double`, which lives in memory, still works --
-/// see `codegen_inline_asm_x87_constraint`.
-#[test]
-#[cfg(target_arch = "x86_64")]
-fn diagnostics_x87_operand_must_be_addressable() {
-    compile_expect_error(
-        "x87_xmm_operand",
-        "int f(double x){ int r; __asm__(\"fistpl %0\" : \"=m\"(r) : \"t\"(x)); return r; }\n\
-         int main(void){ return f(7.0); }\n",
-        "addressable",
-    );
-}
-
 /// Only one x87 asm output, because only one can be written back.
 ///
 /// The write-back is a single slot; a second output would overwrite it and the
@@ -5859,5 +5838,167 @@ fn diagnostics_include_note_names_its_own_translation_unit() {
         note.starts_with(&*two.to_string_lossy()),
         "the note must name two.c, which included the header:\n{}",
         r.stderr
+    );
+}
+
+/// `__attribute__((alias("target")))` needs its target *defined* in the same
+/// unit, of the same kind, and the alias must not also be defined normally.
+/// Each is a program gcc rejects; emitting it anyway gives an assembler error
+/// at best and, for a second definition, silently drops one of the two.
+#[test]
+fn diagnostics_alias_attribute() {
+    compile_expect_error(
+        "alias_undefined",
+        "extern int b __attribute__((alias(\"nope\")));\n",
+        "'b' aliased to undefined symbol 'nope'",
+    );
+    // Declared is not defined: the target has to be in this unit.
+    compile_expect_error(
+        "alias_declared_only",
+        "extern int x;\nextern int y __attribute__((alias(\"x\")));\n",
+        "'y' aliased to undefined symbol 'x'",
+    );
+    compile_expect_error(
+        "alias_to_inline_definition",
+        "extern inline __attribute__((gnu_inline)) int f(void) { return 1; }\n\
+         int g(void) __attribute__((alias(\"f\")));\n",
+        "'g' aliased to external symbol 'f'",
+    );
+    compile_expect_error(
+        "alias_object_to_function",
+        "int f(void) { return 0; }\nextern int v __attribute__((alias(\"f\")));\n",
+        "'v' alias between function and variable is not supported",
+    );
+    compile_expect_error(
+        "alias_function_to_object",
+        "int a;\nint g(void) __attribute__((alias(\"a\")));\n",
+        "'g' alias between function and variable is not supported",
+    );
+    compile_expect_error(
+        "alias_object_also_defined",
+        "int a;\nextern int c __attribute__((alias(\"a\")));\nint c = 1;\n",
+        "'c' defined both normally and as 'alias' attribute",
+    );
+    compile_expect_error(
+        "alias_with_initializer",
+        "int a;\nint b __attribute__((alias(\"a\"))) = 3;\n",
+        "'b' defined both normally and as 'alias' attribute",
+    );
+    compile_expect_error(
+        "alias_function_also_defined",
+        "int f(void) { return 0; }\nint k(void) __attribute__((alias(\"f\")));\n\
+         int k(void) { return 1; }\n",
+        "'k' defined both normally and as 'alias' attribute",
+    );
+    compile_expect_ok(
+        "alias_ok",
+        "int a;\nextern int b __attribute__((alias(\"a\")));\n\
+         int f(void) { return 0; }\nint g(void) __attribute__((alias(\"f\")));\n",
+    );
+}
+
+/// Mach-O has no symbol aliases: clang rejects the attribute on Darwin, and
+/// so does c17 rather than emit a `.set` whose symbol ld64 treats differently.
+#[test]
+fn diagnostics_alias_attribute_unsupported_on_darwin() {
+    let src = "int f(void) { return 0; }\nint g(void) __attribute__((alias(\"f\")));\n";
+    for target in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+        let c = create_c_file("alias_darwin", src);
+        let out = c.path().with_extension("s");
+        let run = run_c17(&[
+            "--target",
+            target,
+            "-S",
+            "-o",
+            &out.to_string_lossy(),
+            &c.path().to_string_lossy(),
+        ]);
+        let _ = std::fs::remove_file(&out);
+        assert!(!run.success, "{target} accepted an alias:\n{}", run.stderr);
+        assert!(
+            run.stderr.contains("aliases are not supported on darwin"),
+            "{target}: expected the Darwin diagnostic, got:\n{}",
+            run.stderr
+        );
+    }
+}
+
+/// An error inside a struct or union specifier in a type-name is reported
+/// where it arose. It was swallowed and the tokens re-read as an expression,
+/// so compile/pr39394's VLA member in a cast drew "unexpected token in
+/// expression" -- and, recovered too eagerly, a second error on the `*` in
+/// front of the cast.
+#[test]
+fn diagnostics_struct_error_in_a_type_name_is_reported() {
+    let src = "char *p;\n\
+               void f(int n) {\n\
+                   __asm__ volatile (\"\" : \"=m\" (*(struct { char x[n]; } *) p));\n\
+               }\n\
+               int g(int n) { return sizeof(union { int a[n]; }); }\n";
+    let c = create_c_file("type_name_vla_member", src);
+    let path = c.path().to_string_lossy().to_string();
+    let run = run_c17(&["-S", "-o", "/dev/null", &path]);
+    assert!(!run.success, "should be rejected");
+    let errors: Vec<&str> = run
+        .stderr
+        .lines()
+        .filter(|l| l.contains("error:"))
+        .collect();
+    assert_eq!(
+        errors.len(),
+        2,
+        "one error per type-name, got:\n{}",
+        run.stderr
+    );
+    for e in errors {
+        assert!(
+            e.contains("variable length arrays cannot be structure or union members"),
+            "{e}"
+        );
+    }
+}
+
+/// C17 6.8.4p3 and 6.8.5p5: a selection or iteration statement is a block,
+/// and so is each substatement. A tag or enumeration constant declared in its
+/// controlling expression, or in an expression statement that is its body,
+/// leaked into the enclosing block.
+#[test]
+fn diagnostics_selection_and_iteration_statements_are_blocks() {
+    for (name, src) in [
+        (
+            "if_scope",
+            "int f(int c) { if (c == sizeof(enum { K = 3 })) return K; return K; }\n",
+        ),
+        (
+            "while_body_scope",
+            "int f(int c) { while (c--) (enum { L = 4 })0; return L; }\n",
+        ),
+        (
+            "else_scope",
+            "int f(int c) { if (c) (enum { M = 5 })0; else return M; return 0; }\n",
+        ),
+        (
+            "switch_scope",
+            "int f(int c) { switch (c == sizeof(enum { N = 1 })) { case 0: break; } return N; }\n",
+        ),
+        (
+            "do_scope",
+            "int f(int c) { do (enum { Q = 2 })0; while (c--); return Q; }\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "undeclared identifier");
+    }
+    compile_expect_error(
+        "if_tag_scope",
+        "int f(void) { if (sizeof(struct V { int a; })) {} struct V v; return 0; }\n",
+        "not known",
+    );
+    // Inside the statement they are in scope.
+    compile_expect_ok(
+        "selection_scope_inside",
+        "int f(int c) { if (c == sizeof(enum { K = 3 })) return K; \
+         switch (c + sizeof(enum { N = 1 })) { case N: return N; } \
+         for (int i = 0; i < sizeof(struct W { int a; }); i++) { struct W w = {i}; c += w.a; } \
+         return c; }\n",
     );
 }

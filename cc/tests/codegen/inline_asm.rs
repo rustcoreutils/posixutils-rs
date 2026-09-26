@@ -1605,6 +1605,85 @@ int main(void) {
     assert_eq!(compile_and_run_optimized("asm_x87_constraint_opt", code), 0);
 }
 
+/// An x87 asm output whose home is a register, not a stack slot.
+///
+/// A `"=t"` output was accepted only when the allocator had put its pseudo on
+/// the stack, and a bare output pseudo is defined by nothing but the asm, so
+/// it never was: `double r; __asm__("fldpi" : "=t"(r));` was refused at every
+/// level, and gcc.c-torture's `compile/pr34966` -- the same output tied to an
+/// argument arriving in `%xmm0` -- at -O1 and above. A float or double result
+/// now goes through the x87 scratch into its register, and a long double one
+/// gets the stack slot it needs.
+///
+/// The tied input (`"0"(x)`) was never pushed at all, so the template ran on
+/// whatever the FP stack held; and `t` is the top of the stack whatever order
+/// the operands are written in.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn codegen_inline_asm_x87_output_in_register() {
+    let code = r#"
+static double pi(void) { double r; __asm__("fldpi" : "=t"(r)); return r; }
+static float one(void) { float r; __asm__("fld1" : "=t"(r)); return r; }
+static long double pil(void) { long double r; __asm__("fldpi" : "=t"(r)); return r; }
+
+/* pr34966: the output tied to an input that arrives in an XMM register. */
+static double ident(double x) { double r; __asm__ __volatile__("" : "=t"(r) : "0"(x)); return r; }
+static double my_sqrt(double x) { double r; __asm__("fsqrt" : "=t"(r) : "0"(x)); return r; }
+static float my_sqrtf(float x) { __asm__("fsqrt" : "+t"(x)); return x; }
+
+/* `t` and `u` together: fyl2x leaves st(1) * log2(st(0)) and pops. */
+static double ylog2x(double x, double y)
+{
+    double r;
+    __asm__("fyl2x" : "=t"(r) : "0"(x), "u"(y) : "st(1)");
+    return r;
+}
+
+/* The operands the other way round: `t` is still the top of the stack. */
+static double ylog2x_rev(double x, double y)
+{
+    double r;
+    __asm__("fyl2x" : "=t"(r) : "u"(y), "0"(x) : "st(1)");
+    return r;
+}
+
+/* An x87 input the template consumes, arriving in an XMM register. This was
+   refused as "not addressable" rather than staged. */
+static int to_int(double x) { int r; __asm__("fistpl %0" : "=m"(r) : "t"(x)); return r; }
+
+double g;
+volatile double v16 = 16.0;
+
+int main(void)
+{
+    if (pi() != 3.14159265358979323846) return 1;
+    if (one() != 1.0f) return 2;
+    if (pil() != 3.14159265358979323846264338327950288L) return 3;
+    if (ident(2.5) != 2.5) return 4;
+    if (my_sqrt(v16) != 4.0) return 5;
+    if (my_sqrt(16.0) != 4.0) return 6;
+    if (my_sqrtf(9.0f) != 3.0f) return 7;
+    if (ylog2x(8.0, 2.0) != 6.0) return 8;
+    if (ylog2x_rev(8.0, 2.0) != 6.0) return 11;
+    if (ylog2x_rev(2.0, 8.0) != 8.0) return 12;
+    if (to_int(7.0) != 7 || to_int(v16) != 16) return 13;
+    __asm__("fld1" : "=t"(g));
+    if (g != 1.0) return 9;
+    double t = ident(v16);
+    if (t + 1.0 != 17.0) return 10;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        let args = vec![opt.to_string()];
+        assert_eq!(
+            compile_and_run("asm_x87_output_in_register", code, &args),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
 /// A vector-class operand gets a vector register, on both sides of the asm.
 ///
 /// The aarch64 output loop had no vector arm at all, so a `"=w"` output took

@@ -89,6 +89,45 @@ arithmetic.
 
 ---
 
+### aarch64: defects the host gates cannot see
+
+Found by building the torture suite for aarch64 and assembling it with GNU
+as, then running `execute/` under qemu. Neither gate exists in-tree; both
+belong in `cc/scripts` alongside `c17_torture.sh`.
+
+- **Initial-exec TLS uses x86's relocation names.** The aarch64 sequence is
+  printed as `adrp x, :gottpoff:sym` / `:gottpoff_lo12:`, which GNU as rejects;
+  aarch64 spells them `:gottprel:` / `:gottprel_lo12:`. Every initial-exec
+  access to an `extern _Thread_local` fails to assemble (`compile/pr78694`).
+- **No branch relaxation.** A conditional branch reaches +-1 MiB; a function
+  past that fails to assemble (`compile/limits-caselabels`). The fix is the
+  usual one: invert the condition around an unconditional `b`.
+- **Run-time failures under qemu** that gcc's own build passes:
+  `20020615-1`, `20021127-1`, `20050316-2`, `20050607-1`, `20080502-1`,
+  `20230630-2`, `20230630-4`, `990208-1`, `pr108498-1`, `pr19606`,
+  `pr42544`, `pr44942`, `pr95731`, `simd-4`. Not triaged; some may need the
+  test's own `dg` options.
+
+---
+
+### Inline assembly: early-clobber and spilled memory operands
+
+- **aarch64 ignores `&`.** An early-clobber output is parsed, but the
+  aarch64 lowering never adds the interference that keeps it out of an
+  input's register, so `"=&r"` can share a register with a `"+m"` address and
+  the template overwrites the address before using it.
+- **x86-64 renders a spilled memory operand as its spill slot.** A memory
+  operand's pseudo is the lvalue's address; when a statement has more
+  operands than registers and that address is spilled, x86-64 prints the slot
+  (`-392(%rbp)`), so the template reads the saved pointer rather than the
+  object. aarch64 had the same defect and now loads the address into a
+  register first; x86-64 needs the same.
+- **aarch64 has six registers for such addresses.** A statement needing more
+  spilled memory-operand addresses than that is an error where gcc compiles
+  it.
+
+---
+
 ### Dominator construction is quadratic on a wide join
 
 `domtree_build` is Cooper-Harvey-Kennedy, whose `intersect` walks the

@@ -6755,6 +6755,13 @@ fn test_block_scope_extern_declares_no_local() {
         "the name must be recorded as external so codegen reaches it through \
          the GOT on macOS, got {:?}",
         module.extern_symbols
+    ); // And its alignment, which is all a backend knows about an object
+       // defined elsewhere -- aarch64 folds `:lo12:` into an access only when it
+       // covers the access size.
+    assert_eq!(
+        module.extern_object_align.get("g"),
+        Some(&4),
+        "an extern object's declared alignment must be recorded"
     );
 }
 

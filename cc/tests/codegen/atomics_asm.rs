@@ -295,10 +295,11 @@ void set_param(float v) { f = v; }
     let asm = asm_for("atomic_fp_bits_arm", AARCH64_LINUX, src);
 
     // 1.5 as an IEEE double is 0x3FF8000000000000; the high half is 0x3FF8,
-    // which movk materializes as 16376 << 48.
+    // 16376 << 48, which is the only non-zero halfword, so a single
+    // `movz ..., lsl #48` (or a `movk` after one) materializes it.
     let body = super::asm_probe::body_of(&asm, "set_const");
     assert!(
-        body.contains("movk") && body.contains("16376"),
+        (body.contains("movz") || body.contains("movk")) && body.contains("16376"),
         "the constant's bit pattern must be materialized, not replaced by zero:\n{body}"
     );
     assert!(

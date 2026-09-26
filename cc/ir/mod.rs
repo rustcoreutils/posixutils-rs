@@ -2528,6 +2528,12 @@ pub struct Module {
     /// External thread-local symbols (declared extern _Thread_local but not defined)
     /// These need TLS access pattern instead of GOT
     pub extern_tls_symbols: HashSet<String>,
+    /// The alignment, in bytes, of each data object declared `extern` here and
+    /// not defined: at least its declared type's, which is all an object
+    /// defined elsewhere is known to have. A backend that folds a symbol's low
+    /// bits into a scaled load or store (aarch64 `:lo12:`) needs it; a
+    /// definition's alignment is on its `GlobalDef`.
+    pub extern_object_align: HashMap<String, u32>,
     /// Compilation directory (for DW_AT_comp_dir in DWARF)
     pub comp_dir: Option<String>,
     /// Primary source filename (for DW_AT_name in DWARF)

@@ -60,6 +60,8 @@ impl Aarch64CodeGen {
         // the assembler rejects and the build failed.
         //
         // Anything not encodable goes to a register, which every form accepts.
+        // For the logical operations that is the legalizer's call, not this
+        // site's.
         let src2_loc = self.get_location(src2);
         let src2_operand = match &src2_loc {
             Loc::Reg(r) => GpOperand::Reg(*r),
@@ -1084,23 +1086,22 @@ impl Aarch64CodeGen {
     }
 }
 
-/// Whether `value` can be written as an immediate operand of `op` at `size`
-/// bits, rather than having to be moved into a register first.
+/// Whether `value` can be handed to `op` at `size` bits as an immediate,
+/// rather than having to be moved into a register first.
 ///
 /// Each family has its own encoding and they are not interchangeable:
 ///
 /// - `add` / `sub` take a 12-bit unsigned value (a shifted-by-12 form also
 ///   exists; not used here).
-/// - `and` / `orr` / `eor` take a *bitmask immediate*, which encodes a rotated
-///   run of ones replicated across the register. It cannot represent 0, cannot
-///   represent all-ones, and cannot represent most ordinary numbers -- 1000
-///   and 3000 are both unencodable.
+/// - `and` / `orr` / `eor` take a *bitmask immediate*, but any value may be
+///   written: `legalize.rs` keeps an encodable one and puts any other in a
+///   register, which is the one place that rule lives.
 /// - `lsl` / `lsr` / `asr` take a shift amount below the operand width.
 fn immediate_fits(op: Opcode, value: i128, size: u32) -> bool {
     match op {
         Opcode::Add | Opcode::Sub => (0..=4095).contains(&value),
         Opcode::And | Opcode::Or | Opcode::Xor => {
-            value >= 0 && is_logical_immediate(value as u64, size)
+            i64::try_from(value).is_ok() || u64::try_from(value).is_ok()
         }
         Opcode::Shl | Opcode::Lsr | Opcode::Asr => {
             let width = if size > 32 { 64 } else { 32 } as i128;
@@ -1111,129 +1112,9 @@ fn immediate_fits(op: Opcode, value: i128, size: u32) -> bool {
     }
 }
 
-/// Whether `value` is a valid AArch64 logical (bitmask) immediate.
-///
-/// The encoding describes an element of 2, 4, 8, 16, 32 or 64 bits holding a
-/// run of consecutive ones, rotated within the element, replicated to fill the
-/// register. All-zeros and all-ones have no encoding, which is why `x & 0`
-/// assembled as `and w1, w1, #0` and was refused.
-///
-/// A wrong "no" here only costs a register move; a wrong "yes" emits assembly
-/// the assembler rejects, so the test is exact rather than approximate.
-fn is_logical_immediate(value: u64, size: u32) -> bool {
-    let width: u32 = if size > 32 { 64 } else { 32 };
-    let mask = if width == 64 {
-        u64::MAX
-    } else {
-        u32::MAX as u64
-    };
-    let value = value & mask;
-    if value == 0 || value == mask {
-        return false;
-    }
-
-    // Find the smallest element the value repeats at.
-    let mut elem = width;
-    loop {
-        let half = elem / 2;
-        let half_mask = (1u64 << half) - 1;
-        if (value & half_mask) != ((value >> half) & half_mask) {
-            break;
-        }
-        elem = half;
-        if elem <= 2 {
-            break;
-        }
-    }
-
-    // Within one element the ones must be consecutive, allowing for rotation:
-    // rotating the element until the ones are contiguous at the bottom leaves a
-    // value one less than a power of two.
-    let elem_mask = if elem == 64 {
-        u64::MAX
-    } else {
-        (1u64 << elem) - 1
-    };
-    let e = value & elem_mask;
-    if e == 0 || e == elem_mask {
-        return false;
-    }
-    // Rotate within the element. `r == 0` is the unrotated value, and spelling
-    // it as `e << (elem - r)` shifts by `elem`, which is undefined at 64 --
-    // masked to a no-op in release, an "attempt to shift left with overflow"
-    // panic in a debug build, and so an ICE on `x & 0xffffffff00000000`.
-    let rotate = |r: u32| -> u64 {
-        if r == 0 {
-            e
-        } else {
-            ((e >> r) | (e << (elem - r))) & elem_mask
-        }
-    };
-    (0..elem).map(rotate).any(|r| (r + 1) & r == 0)
-}
-
 #[cfg(test)]
 mod immediate_tests {
     use super::*;
-
-    /// The values the AArch64 assembler accepts for `and w0, w0, #N`.
-    ///
-    /// Checked against `aarch64-linux-gnu-as` over all 65 536 values of a
-    /// 16-bit immediate: it accepts 136 of them, and this predicate answers
-    /// yes for exactly those 136 -- no wrong yes, which would emit assembly
-    /// the assembler rejects, and no wrong no, which would cost a register
-    /// move. The cases below are a readable sample of that run.
-    #[test]
-    fn logical_immediates_match_the_encoding() {
-        // Encodable: a rotated run of ones, replicated.
-        for v in [1u64, 3, 7, 255, 4095, 0xFFFF, 0x5555_5555, 0xF0F0_F0F0] {
-            assert!(is_logical_immediate(v, 32), "{v:#x} should encode");
-        }
-        // Not encodable, and the two that mattered: zero has no encoding at
-        // all, and ordinary numbers mostly do not.
-        for v in [0u64, 1000, 3000, 0xFFFF_FFFF] {
-            assert!(!is_logical_immediate(v, 32), "{v:#x} should not encode");
-        }
-        // 64-bit forms.
-        assert!(is_logical_immediate(0xFFFF_FFFF_0000_0000, 64));
-        assert!(is_logical_immediate(0x5555_5555_5555_5555, 64));
-        assert!(!is_logical_immediate(0, 64));
-        assert!(!is_logical_immediate(u64::MAX, 64));
-        assert!(!is_logical_immediate(0x0123_4567_89AB_CDEF, 64));
-    }
-
-    /// A 64-bit element must survive the unrotated case.
-    ///
-    /// Every value whose halves differ leaves the repeat width at 64, so the
-    /// rotation loop reaches `r == 0` with `elem == 64`. Written as
-    /// `e << (elem - r)` that is a shift by 64: masked to a no-op in release,
-    /// but an "attempt to shift left with overflow" panic in a debug build --
-    /// which made `cargo test` fail outright and a debug-built c17 ICE on
-    /// `x & 0xffffffff00000000`. Release and debug must agree.
-    #[test]
-    fn logical_immediates_handle_an_unrotated_64_bit_element() {
-        // Encodable only at rotation 0 or by wrapping: a single run of ones
-        // that does not repeat below 64 bits.
-        assert!(is_logical_immediate(0x0000_0000_FFFF_FFFF, 64));
-        assert!(is_logical_immediate(0xFFFF_FFFF_0000_0000, 64));
-        assert!(is_logical_immediate(0x0000_FFFF_FFFF_0000, 64));
-        // Not encodable, and still must not panic.
-        for v in [
-            0x0123_4567_89AB_CDEFu64,
-            0xDEAD_BEEF_CAFE_BABE,
-            0x8000_0000_0000_0001,
-        ] {
-            let _ = is_logical_immediate(v, 64);
-        }
-        // The whole 64-bit space of single-bit values, every one of which
-        // leaves `elem` at 64 and so walks the full rotation loop.
-        for bit in 0..64 {
-            assert!(
-                is_logical_immediate(1u64 << bit, 64),
-                "a single set bit at {bit} is always encodable"
-            );
-        }
-    }
 
     /// Each family has its own encoding, so one 0..=4095 test cannot serve
     /// all three: `x & 0`, `x | 1000` and `x << 32` all name operands the
@@ -1245,11 +1126,11 @@ mod immediate_tests {
         assert!(!immediate_fits(Opcode::Add, 4096, 32));
         assert!(!immediate_fits(Opcode::Sub, -1, 32));
 
-        // logical: bitmask immediate, so 4095 fits and 1000 does not.
+        // logical: any value; the legalizer decides whether it encodes.
         assert!(immediate_fits(Opcode::And, 4095, 32));
-        assert!(!immediate_fits(Opcode::And, 1000, 32));
-        assert!(!immediate_fits(Opcode::Or, 0, 32));
-        assert!(!immediate_fits(Opcode::Xor, 0, 32));
+        assert!(immediate_fits(Opcode::And, 1000, 32));
+        assert!(immediate_fits(Opcode::Or, 0, 32));
+        assert!(immediate_fits(Opcode::Xor, -17, 64));
 
         // shifts: below the operand width.
         assert!(immediate_fits(Opcode::Shl, 31, 32));

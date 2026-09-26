@@ -455,6 +455,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let name = self.symbol_name(declarator.symbol).to_string();
                 if !is_block_scope_function && !self.module.globals.iter().any(|g| g.name == name) {
                     self.module.extern_symbols.insert(name.clone());
+                    self.module.extern_object_align.insert(
+                        name.clone(),
+                        declarator
+                            .explicit_align
+                            .unwrap_or(self.types.alignment(typ) as u32),
+                    );
                     if declarator
                         .storage_class
                         .contains(TypeModifiers::THREAD_LOCAL)

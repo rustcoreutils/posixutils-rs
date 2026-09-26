@@ -34,6 +34,11 @@
 //!   left by twelve. The assembler flips a negative one to the opposite
 //!   operation (`cmp` to `cmn`), which is exact, so the magnitude is what has
 //!   to fit.
+//! - `and`/`orr`/`eor`: a *bitmask immediate* -- a rotated run of ones
+//!   replicated across the register -- judged at the operation's own width.
+//!   Zero and all-ones have no encoding, nor do most ordinary numbers. One
+//!   that does not encode goes into X15 whole: there is no split that keeps a
+//!   logical operation exact.
 //!
 //! A pre- or post-indexed address has no expansion that keeps its write-back
 //! meaning, so the backend must only ever build encodable ones; one that is
@@ -217,6 +222,48 @@ pub(super) fn legalize(inst: Aarch64Inst, out: &mut Vec<Aarch64Inst>) -> Result<
         } if !add_imm_fits(imm) => {
             let src2 = materialize(imm, src1, out);
             out.push(Aarch64Inst::Cmp { size, src1, src2 });
+        }
+        Aarch64Inst::And {
+            size,
+            src1,
+            src2: GpOperand::Imm(imm),
+            dst,
+        } => {
+            let src2 = logical_operand(size, imm, src1, out);
+            out.push(Aarch64Inst::And {
+                size,
+                src1,
+                src2,
+                dst,
+            });
+        }
+        Aarch64Inst::Orr {
+            size,
+            src1,
+            src2: GpOperand::Imm(imm),
+            dst,
+        } => {
+            let src2 = logical_operand(size, imm, src1, out);
+            out.push(Aarch64Inst::Orr {
+                size,
+                src1,
+                src2,
+                dst,
+            });
+        }
+        Aarch64Inst::Eor {
+            size,
+            src1,
+            src2: GpOperand::Imm(imm),
+            dst,
+        } => {
+            let src2 = logical_operand(size, imm, src1, out);
+            out.push(Aarch64Inst::Eor {
+                size,
+                src1,
+                src2,
+                dst,
+            });
         }
         other => out.push(other),
     }
@@ -405,6 +452,99 @@ fn add_sub(
         dst: LEGALIZE_REG,
     });
     out.push(make(src1, GpOperand::Reg(LEGALIZE_REG)));
+}
+
+/// The second operand of `and`/`orr`/`eor #imm` at `size`.
+///
+/// Only the operation's own width of `imm` counts, since that is all the
+/// instruction reads. When those bits are a bitmask immediate the operand
+/// stays an immediate, printed at that width, so a W-form operation never
+/// shows the assembler a negative or 33-bit value; for a 64-bit operation
+/// that is `imm` itself, unchanged. Otherwise the value goes into X15.
+fn logical_operand(
+    size: OperandSize,
+    imm: i64,
+    src1: Reg,
+    out: &mut Vec<Aarch64Inst>,
+) -> GpOperand {
+    let width = if size.bits() > 32 { 64 } else { 32 };
+    let bits = if width == 64 {
+        imm as u64
+    } else {
+        imm as u64 & u64::from(u32::MAX)
+    };
+    if is_logical_immediate(bits, width) {
+        return GpOperand::Imm(bits as i64);
+    }
+    debug_assert_ne!(src1, LEGALIZE_REG);
+    out.push(Aarch64Inst::Mov {
+        size,
+        src: GpOperand::Imm(bits as i64),
+        dst: LEGALIZE_REG,
+    });
+    GpOperand::Reg(LEGALIZE_REG)
+}
+
+/// Whether `value` is a valid AArch64 logical (bitmask) immediate at `size`
+/// bits (32 or 64; anything at most 32 is the W form).
+///
+/// The encoding describes an element of 2, 4, 8, 16, 32 or 64 bits holding a
+/// run of consecutive ones, rotated within the element, replicated to fill the
+/// register. All-zeros and all-ones have no encoding, which is why `x & 0`
+/// assembled as `and w1, w1, #0` and was refused.
+///
+/// A wrong "no" here only costs a register move; a wrong "yes" emits assembly
+/// the assembler rejects, so the test is exact rather than approximate.
+pub(super) fn is_logical_immediate(value: u64, size: u32) -> bool {
+    let width: u32 = if size > 32 { 64 } else { 32 };
+    let mask = if width == 64 {
+        u64::MAX
+    } else {
+        u32::MAX as u64
+    };
+    let value = value & mask;
+    if value == 0 || value == mask {
+        return false;
+    }
+
+    // Find the smallest element the value repeats at.
+    let mut elem = width;
+    loop {
+        let half = elem / 2;
+        let half_mask = (1u64 << half) - 1;
+        if (value & half_mask) != ((value >> half) & half_mask) {
+            break;
+        }
+        elem = half;
+        if elem <= 2 {
+            break;
+        }
+    }
+
+    // Within one element the ones must be consecutive, allowing for rotation:
+    // rotating the element until the ones are contiguous at the bottom leaves a
+    // value one less than a power of two.
+    let elem_mask = if elem == 64 {
+        u64::MAX
+    } else {
+        (1u64 << elem) - 1
+    };
+    let e = value & elem_mask;
+    if e == 0 || e == elem_mask {
+        return false;
+    }
+    // Rotate within the element. `r == 0` is the unrotated value, and spelling
+    // it as `e << (elem - r)` shifts by `elem`, which is undefined at 64 --
+    // masked to a no-op in release, an "attempt to shift left with overflow"
+    // panic in a debug build, and so an ICE on `x & 0xffffffff00000000`.
+    let rotate = |r: u32| -> u64 {
+        if r == 0 {
+            e
+        } else {
+            ((e >> r) | (e << (elem - r))) & elem_mask
+        }
+    };
+    (0..elem).map(rotate).any(|r| (r + 1) & r == 0)
 }
 
 /// Put `imm` in X15, for a flag-setting instruction's register form.
@@ -654,5 +794,127 @@ mod tests {
             assert_eq!(out.len(), 1);
             assert_eq!(asm(&out), before);
         }
+    }
+
+    /// The values the AArch64 assembler accepts for `and w0, w0, #N`.
+    ///
+    /// Checked against `aarch64-linux-gnu-as` over all 65 536 values of a
+    /// 16-bit immediate: it accepts 136 of them, and this predicate answers
+    /// yes for exactly those 136 -- no wrong yes, which would emit assembly
+    /// the assembler rejects, and no wrong no, which would cost a register
+    /// move. The cases below are a readable sample of that run.
+    #[test]
+    fn logical_immediates_match_the_encoding() {
+        // Encodable: a rotated run of ones, replicated.
+        for v in [1u64, 3, 7, 255, 4095, 0xFFFF, 0x5555_5555, 0xF0F0_F0F0] {
+            assert!(is_logical_immediate(v, 32), "{v:#x} should encode");
+        }
+        // Not encodable, and the two that mattered: zero has no encoding at
+        // all, and ordinary numbers mostly do not.
+        for v in [0u64, 1000, 3000, 0xFFFF_FFFF] {
+            assert!(!is_logical_immediate(v, 32), "{v:#x} should not encode");
+        }
+        // 64-bit forms.
+        assert!(is_logical_immediate(0xFFFF_FFFF_0000_0000, 64));
+        assert!(is_logical_immediate(0x5555_5555_5555_5555, 64));
+        assert!(!is_logical_immediate(0, 64));
+        assert!(!is_logical_immediate(u64::MAX, 64));
+        assert!(!is_logical_immediate(0x0123_4567_89AB_CDEF, 64));
+    }
+
+    /// A 64-bit element must survive the unrotated case.
+    ///
+    /// Every value whose halves differ leaves the repeat width at 64, so the
+    /// rotation loop reaches `r == 0` with `elem == 64`. Written as
+    /// `e << (elem - r)` that is a shift by 64: masked to a no-op in release,
+    /// but an "attempt to shift left with overflow" panic in a debug build --
+    /// which made `cargo test` fail outright and a debug-built c17 ICE on
+    /// `x & 0xffffffff00000000`. Release and debug must agree.
+    #[test]
+    fn logical_immediates_handle_an_unrotated_64_bit_element() {
+        // Encodable only at rotation 0 or by wrapping: a single run of ones
+        // that does not repeat below 64 bits.
+        assert!(is_logical_immediate(0x0000_0000_FFFF_FFFF, 64));
+        assert!(is_logical_immediate(0xFFFF_FFFF_0000_0000, 64));
+        assert!(is_logical_immediate(0x0000_FFFF_FFFF_0000, 64));
+        // Not encodable, and still must not panic.
+        for v in [
+            0x0123_4567_89AB_CDEFu64,
+            0xDEAD_BEEF_CAFE_BABE,
+            0x8000_0000_0000_0001,
+        ] {
+            let _ = is_logical_immediate(v, 64);
+        }
+        // The whole 64-bit space of single-bit values, every one of which
+        // leaves `elem` at 64 and so walks the full rotation loop.
+        for bit in 0..64 {
+            assert!(
+                is_logical_immediate(1u64 << bit, 64),
+                "a single set bit at {bit} is always encodable"
+            );
+        }
+    }
+
+    /// A logical immediate that encodes at the operation's width stays an
+    /// immediate, printed at that width; one that does not goes into X15
+    /// whole, in the same width.
+    #[test]
+    fn test_logical_immediates() {
+        let and = |size, imm| Aarch64Inst::And {
+            size,
+            src1: Reg::X1,
+            src2: GpOperand::Imm(imm),
+            dst: Reg::X0,
+        };
+        // Encodable at 64 bits, including a negative spelling: unchanged.
+        for imm in [0xFF, -16, 0x5555_5555_5555_5555, -0x1_0000_0000] {
+            let inst = and(OperandSize::B64, imm);
+            let before = asm(std::slice::from_ref(&inst));
+            assert_eq!(asm(&run(inst)), before, "{imm:#x}");
+        }
+        // A W-form operation reads the low 32 bits: -16 is 0xfffffff0 there,
+        // which encodes, and is printed as that value rather than negative.
+        assert_eq!(
+            asm(&run(and(OperandSize::B32, -16))),
+            "    and w0, w1, #4294967280\n"
+        );
+        // Not encodable: zero, all-ones, an ordinary number, at either width.
+        for (size, imm) in [
+            (OperandSize::B32, 0),
+            (OperandSize::B32, 1000),
+            (OperandSize::B32, 0xFFFF_FFFF),
+            (OperandSize::B64, 0),
+            (OperandSize::B64, -1),
+            (OperandSize::B64, 0x0123_4567_89AB_CDEF),
+        ] {
+            let out = run(and(size, imm));
+            assert_eq!(out.len(), 2, "{imm:#x}");
+            assert!(matches!(
+                out[0],
+                Aarch64Inst::Mov {
+                    dst: LEGALIZE_REG,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                out[1],
+                Aarch64Inst::And {
+                    src2: GpOperand::Reg(LEGALIZE_REG),
+                    ..
+                }
+            ));
+            assert!(all_encodable(&out), "{imm:#x}");
+        }
+        // The W form materializes the 32-bit value in w15.
+        let text = asm(&run(Aarch64Inst::Eor {
+            size: OperandSize::B32,
+            src1: Reg::X1,
+            src2: GpOperand::Imm(1000),
+            dst: Reg::X0,
+        }));
+        assert!(
+            text.contains("w15") && text.contains("eor w0, w1, w15"),
+            "{text}"
+        );
     }
 }

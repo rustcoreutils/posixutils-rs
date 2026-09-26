@@ -81,6 +81,19 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// Whether an access of `bytes` to the symbol `name` may fold the
+    /// symbol's low bits into the load or store as `[x, :lo12:name]`.
+    ///
+    /// That operand is scaled by the access size, so the linker can encode it
+    /// only when the symbol's address is a multiple of that size -- "relocation
+    /// truncated to fit" otherwise. An 8-byte struct of `int`s is 4-aligned and
+    /// is copied with one 64-bit load, so `struct S y = s;` failed to link
+    /// (`execute/20040709-1`). A symbol whose alignment is unknown here -- a
+    /// literal pool label, say -- is not folded either.
+    pub(super) fn lo12_folds(&self, name: &str, bytes: u32) -> bool {
+        self.sym_align.get(name).is_some_and(|&a| a >= bytes)
+    }
+
     /// Load value of a global symbol into a register with specified size
     pub(super) fn emit_load_global(&mut self, name: &str, dst: Reg, size: OperandSize) {
         // Thread-local storage: compute TLS address, then load value (Linux ELF only)
@@ -121,7 +134,7 @@ impl Aarch64CodeGen {
                 addr: MemAddr::Base(dst),
                 dst,
             });
-        } else {
+        } else if self.lo12_folds(name, size.bits() / 8) {
             // ADRP + LDR sequence for PIC value loading
             self.push_lir(Aarch64Inst::Adrp {
                 sym: sym.clone(),
@@ -133,67 +146,37 @@ impl Aarch64CodeGen {
                 base: dst,
                 dst,
             });
+        } else {
+            // Not aligned to the access: form the address, then load.
+            self.push_lir(Aarch64Inst::Adrp {
+                sym: sym.clone(),
+                dst,
+            });
+            self.push_lir(Aarch64Inst::AddSymOffset {
+                sym,
+                base: dst,
+                dst,
+            });
+            self.push_lir(Aarch64Inst::Ldr {
+                size,
+                addr: MemAddr::Base(dst),
+                dst,
+            });
         }
     }
 
-    /// Move immediate value to register
+    /// Put the immediate `val` in `dst`, at `size` bits (at least 32).
+    ///
+    /// One `Mov`: its printer (`emit_mov_imm` in `lir.rs`) builds whatever
+    /// `movz`/`movk` sequence the value needs, which is the one place that
+    /// sequence is spelled out. This used to build its own for anything
+    /// outside -0x8000..=0xFFFF, a second copy of the same rule.
     pub(super) fn emit_mov_imm(&mut self, dst: Reg, val: i64, size: u32) {
-        let op_size = OperandSize::from_bits(size.max(32));
-
-        // AArch64 can only move 16-bit immediates directly
-        // For larger values, we need movz + movk sequence
-        if (0..=0xFFFF).contains(&val) {
-            // LIR: simple mov immediate
-            self.push_lir(Aarch64Inst::Mov {
-                size: op_size,
-                src: GpOperand::Imm(val),
-                dst,
-            });
-        } else if (-0x8000..0).contains(&val) {
-            // Small negative number - use mov (assembler handles movn)
-            self.push_lir(Aarch64Inst::Mov {
-                size: op_size,
-                src: GpOperand::Imm(val),
-                dst,
-            });
-        } else {
-            // Use movz + movk for larger values
-            let uval = val as u64;
-            // LIR: movz base
-            self.push_lir(Aarch64Inst::Movz {
-                size: OperandSize::B64,
-                imm: (uval & 0xFFFF) as u16,
-                shift: 0,
-                dst,
-            });
-            if (uval >> 16) & 0xFFFF != 0 {
-                // LIR: movk shift 16
-                self.push_lir(Aarch64Inst::Movk {
-                    size: OperandSize::B64,
-                    imm: ((uval >> 16) & 0xFFFF) as u16,
-                    shift: 16,
-                    dst,
-                });
-            }
-            if (uval >> 32) & 0xFFFF != 0 {
-                // LIR: movk shift 32
-                self.push_lir(Aarch64Inst::Movk {
-                    size: OperandSize::B64,
-                    imm: ((uval >> 32) & 0xFFFF) as u16,
-                    shift: 32,
-                    dst,
-                });
-            }
-            if (uval >> 48) & 0xFFFF != 0 {
-                // LIR: movk shift 48
-                self.push_lir(Aarch64Inst::Movk {
-                    size: OperandSize::B64,
-                    imm: ((uval >> 48) & 0xFFFF) as u16,
-                    shift: 48,
-                    dst,
-                });
-            }
-        }
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::from_bits(size.max(32)),
+            src: GpOperand::Imm(val),
+            dst,
+        });
     }
 
     pub(super) fn emit_move(&mut self, src: PseudoId, dst: Reg, size: u32) {

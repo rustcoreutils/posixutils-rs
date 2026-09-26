@@ -217,3 +217,134 @@ int main(void)
 "#,
     );
 }
+
+/// A logical operation with any constant, at both widths.
+///
+/// `and`/`orr`/`eor` take a bitmask immediate, which cannot hold zero,
+/// all-ones or most ordinary numbers. Whether a constant encodes is decided in
+/// one place, `legalize.rs`, which keeps an encodable one as an immediate
+/// (printed at the operation's width, so a W-form operation never shows the
+/// assembler a negative value) and puts any other in X15. Each result is
+/// checked against the same operation with the mask read from a `volatile`,
+/// which always takes the register path, so the program is its own oracle.
+fn logical_masks_source() -> String {
+    let masks64: [&str; 10] = [
+        "0x0UL",
+        "0xffffffffffffffffUL",
+        "0xffUL",
+        "0x3e8UL",
+        "0x5555555555555555UL",
+        "0x123456789abcdefUL",
+        "0xffffffff00000000UL",
+        "0xfffffffffffffff0UL",
+        "0x8000000000000001UL",
+        "0x00ff00ff00ff00ffUL",
+    ];
+    let masks32: [&str; 9] = [
+        "0x0u",
+        "0xffffffffu",
+        "0xffu",
+        "0x3e8u",
+        "0x55555555u",
+        "0x12345678u",
+        "0xfffffff0u",
+        "0x80000001u",
+        "0x00ff00ffu",
+    ];
+    let mut body = String::new();
+    let mut n = 0;
+    for (ty, masks) in [
+        ("unsigned long", &masks64[..]),
+        ("unsigned int", &masks32[..]),
+    ] {
+        for m in masks {
+            for op in ["&", "|", "^"] {
+                n += 1;
+                body.push_str(&format!(
+                    "    {{ volatile {ty} vm = {m}; {ty} x = seed_{w};\n      \
+                     if ((x {op} {m}) != (x {op} vm)) return {n};\n      \
+                     {ty} y = x; y {op}= {m}; if (y != (x {op} vm)) return {n}; }}\n",
+                    w = if ty == "unsigned long" { "l" } else { "i" },
+                ));
+            }
+        }
+    }
+    format!(
+        "volatile unsigned long seed_l = 0xdeadbeefcafebabeUL;\n\
+         volatile unsigned int seed_i = 0xcafebabeu;\n\
+         int main(void)\n{{\n{body}    return 0;\n}}\n"
+    )
+}
+
+#[test]
+fn aarch64_logical_immediates_of_any_value() {
+    run_both_levels("a64_logical_masks", &logical_masks_source());
+}
+
+/// A global copied with an access wider than its alignment.
+///
+/// `ldr x0, [x0, :lo12:sym]` scales the symbol's low bits by the access size,
+/// so the linker can encode it only when the symbol is a multiple of that
+/// size. An 8-byte struct of `int`s is 4-aligned yet copied with one 64-bit
+/// load, and placed after a `char` it sits at an odd multiple of 4: the link
+/// failed with "relocation truncated to fit" (`execute/20040709-1..3`). The
+/// low bits are now folded only when the symbol's known alignment covers the
+/// access.
+#[test]
+fn aarch64_underaligned_global_copied_whole() {
+    run_both_levels(
+        "a64_lo12_align",
+        r#"
+#define NI __attribute__((noinline))
+/* 8 bytes, but only 4-aligned, so a whole-struct copy is one 64-bit load
+   from an address that need not be a multiple of 8. The `char`s before each
+   one push it to an odd multiple of 4. */
+struct P { int a, b; };
+struct B { unsigned i : 6, j : 11, k : 15; unsigned l; };
+char c1; struct P p;
+char c2; struct B b;
+char c3; struct P p2 = { 5, 6 };
+NI struct P getp(void) { return p; }
+NI struct B getb(void) { return b; }
+NI struct P getp2(void) { return p2; }
+NI int sum(void) { struct P x = p; struct B y = b; return x.a + x.b + y.k + (int)y.l; }
+int main(void)
+{
+    p.a = 1; p.b = 2; b.k = 3; b.l = 4;
+    if (getp().a != 1 || getp().b != 2) return 1;
+    if (getb().k != 3 || getb().l != 4) return 2;
+    if (getp2().a != 5 || getp2().b != 6) return 3;
+    if (sum() != 10) return 4;
+    return 0;
+}
+"#,
+    );
+}
+
+/// A `long double` function that can fall off its end.
+///
+/// The implicit `return 0` is an integer immediate moved into the binary128
+/// result register, and there is no general-to-Q `fmov`: the printer
+/// panicked at -O0 (`compile/pr65540`). An immediate is now placed as a bit
+/// pattern through the one helper every floating constant uses.
+#[test]
+fn aarch64_long_double_constants_and_fall_off_return() {
+    run_both_levels(
+        "a64_ld_consts",
+        r#"
+#define NI __attribute__((noinline))
+NI long double k1(void) { return 1.5L; }
+NI long double k2(long double x) { return x * 3.25L + 0.1L; }
+NI int cmpz(long double x) { if (x > 0.0) return 1; else if (x < 0.0) return -1; return 0; }
+NI long double absl_(long double x) { if (x > 0.0) return x; else if (x < 0.0) return -x; else return x; }
+int main(void)
+{
+    if (k1() != 1.5L) return 1;
+    if (k2(2.0L) != 2.0L * 3.25L + 0.1L) return 2;
+    if (cmpz(-2.0L) != -1 || cmpz(3.0L) != 1 || cmpz(0.0L) != 0) return 3;
+    if (absl_(-2.5L) != 2.5L || absl_(4.0L) != 4.0L) return 4;
+    return 0;
+}
+"#,
+    );
+}

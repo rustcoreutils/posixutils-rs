@@ -113,6 +113,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                     self.module
                         .set_declared_symbol_attrs(&name, declarator.symbol_attrs.clone());
                     self.module.extern_symbols.insert(name.clone());
+                    self.module.extern_object_align.insert(
+                        name.clone(),
+                        declarator
+                            .explicit_align
+                            .unwrap_or(self.types.alignment(declarator.typ) as u32),
+                    );
                     // Track extern thread-local symbols separately for TLS access
                     if storage_class.contains(TypeModifiers::THREAD_LOCAL) {
                         self.module.extern_tls_symbols.insert(name);
@@ -133,6 +139,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // A definition here outranks anything recorded for the declaration.
             self.module.declared_symbol_attrs.remove(&name);
             self.module.extern_symbols.remove(&name);
+            self.module.extern_object_align.remove(&name);
 
             // Check for thread-local storage
             let is_static = storage_class.contains(TypeModifiers::STATIC);

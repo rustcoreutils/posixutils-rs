@@ -339,15 +339,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     pub fn emit_global(&mut self, global: &crate::ir::GlobalDef, types: &TypeTable) {
         let size = types.size_bytes(global.typ) as u64;
         let size = if size == 0 { 8 } else { size }; // Default to 8 bytes
-
-        // Get alignment: explicit _Alignas takes precedence over natural alignment
-        let mut align = global
-            .explicit_align
-            .unwrap_or_else(|| types.alignment(global.typ) as u32);
-        // Use 16-byte alignment for arrays >= 16 bytes (matches clang behavior for optimization)
-        if matches!(types.get(global.typ).kind, crate::types::TypeKind::Array) && size >= 16 {
-            align = align.max(16);
-        }
+        let align = global_alignment(global, types);
 
         // Anonymous compound-literal globals (name starts with '.') are addressed
         // as locals via `.LC`-style labels — they must remain ordinary data labels.
@@ -1127,6 +1119,24 @@ pub trait CodeGenerator {
 
     /// Set `-fverbose-asm`: annotate the generated instructions.
     fn set_verbose_asm(&mut self, verbose: bool);
+}
+
+/// The alignment, in bytes, a global definition is emitted at: an explicit
+/// `_Alignas`/`aligned` if it has one, else its type's, and at least 16 for an
+/// array of 16 bytes or more (clang's choice, which vector code relies on).
+///
+/// The one rule, read both where the definition is emitted and where a
+/// backend decides whether an access can assume that alignment.
+pub fn global_alignment(global: &crate::ir::GlobalDef, types: &TypeTable) -> u32 {
+    let size = types.size_bytes(global.typ) as u64;
+    let size = if size == 0 { 8 } else { size };
+    let mut align = global
+        .explicit_align
+        .unwrap_or_else(|| types.alignment(global.typ) as u32);
+    if matches!(types.get(global.typ).kind, crate::types::TypeKind::Array) && size >= 16 {
+        align = align.max(16);
+    }
+    align
 }
 
 /// The current function's pseudos, looked up by id.

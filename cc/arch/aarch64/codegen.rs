@@ -24,7 +24,7 @@ use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
-use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 
 // AArch64 Code Generator
@@ -68,6 +68,9 @@ pub struct Aarch64CodeGen {
     pub(super) extern_symbols: HashSet<String>,
     /// Thread-local storage symbols (need TLS access)
     pub(super) tls_symbols: HashSet<String>,
+    /// Every data symbol's known alignment in bytes -- definitions here and
+    /// `extern` declarations -- for [`Self::lo12_folds`].
+    pub(super) sym_align: HashMap<String, u32>,
     /// Position-independent code mode (for shared libraries)
     pic_mode: bool,
     /// Counter for generating unique labels (atomic loops, etc.)
@@ -96,6 +99,7 @@ impl Aarch64CodeGen {
             darwin_va_sp_slot: None,
             extern_symbols: HashSet::new(),
             tls_symbols: HashSet::new(),
+            sym_align: HashMap::new(),
             pic_mode: false,
             unique_label_counter: 0,
             stack_alloc_size: 0,
@@ -647,28 +651,14 @@ impl Aarch64CodeGen {
                             }
                             Some(Loc::VReg(v)) => {
                                 if let PseudoKind::FVal(f) = &pseudo.kind {
-                                    // Load FP constant using integer register
-                                    // Use type to determine float16 vs float vs double
-                                    let typ = insn.typ.expect("FP constant must have type");
-                                    let type_kind = types.kind(typ);
-                                    let (scratch0, _, _) = Reg::scratch_regs();
-                                    let (bits, fp_size) = match type_kind {
-                                        TypeKind::Float16 => {
-                                            // Convert f64 to IEEE 754 half-precision bits
-                                            (f64_to_f16_bits(f.to_f64()) as i64, FpSize::Half)
-                                        }
-                                        TypeKind::Float => {
-                                            ((f.to_f64() as f32).to_bits() as i64, FpSize::Single)
-                                        }
-                                        _ => (f.to_f64().to_bits() as i64, FpSize::Double),
-                                    };
-                                    self.emit_mov_imm(scratch0, bits, 64);
-                                    // LIR: fmov from GP to FP register
-                                    self.push_lir(Aarch64Inst::FmovFromGp {
-                                        size: fp_size,
-                                        src: scratch0,
-                                        dst: v,
-                                    });
+                                    // The constant at its type's precision. A
+                                    // `long double` fell through to `double`
+                                    // here and was loaded as a double's bits
+                                    // into a binary128 register.
+                                    let fp_size =
+                                        self.fp_size_from_type(insn.typ, insn.size, types);
+                                    let (lo, hi) = super::float::fp_const_bits(*f, fp_size);
+                                    self.emit_fp_bits(lo, hi, fp_size, v);
                                 }
                             }
                             _ => {}
@@ -1231,9 +1221,6 @@ impl Aarch64CodeGen {
     }
 }
 
-// Import shared helper from parent module
-use super::f64_to_f16_bits;
-
 impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
     type Reg = Reg;
 
@@ -1287,6 +1274,23 @@ impl CodeGenerator for Aarch64CodeGen {
             .filter(|g| g.is_thread_local)
             .map(|g| g.name.clone())
             .chain(module.extern_tls_symbols.iter().cloned())
+            .collect();
+
+        self.sym_align = module
+            .globals
+            .iter()
+            .map(|g| {
+                (
+                    g.name.clone(),
+                    crate::arch::codegen::global_alignment(g, types),
+                )
+            })
+            .chain(
+                module
+                    .extern_object_align
+                    .iter()
+                    .map(|(n, a)| (n.clone(), *a)),
+            )
             .collect();
 
         // Emit file header

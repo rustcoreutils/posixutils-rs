@@ -95,22 +95,6 @@ pub enum Aarch64Inst {
         dst: Reg,
     },
 
-    /// MOVZ - Move wide with zero (clear other bits)
-    Movz {
-        size: OperandSize,
-        imm: u16,
-        shift: u8, // 0, 16, 32, or 48
-        dst: Reg,
-    },
-
-    /// MOVK - Move wide with keep (keep other bits)
-    Movk {
-        size: OperandSize,
-        imm: u16,
-        shift: u8, // 0, 16, 32, or 48
-        dst: Reg,
-    },
-
     /// LDR - Load register
     Ldr {
         size: OperandSize,
@@ -827,27 +811,6 @@ impl EmitAsm for Aarch64Inst {
         match self {
             // Data Movement
             Aarch64Inst::Mov { size, src, dst } => Self::emit_mov(size, src, dst, out),
-            Aarch64Inst::Movz {
-                size,
-                imm,
-                shift,
-                dst,
-            } => Self::emit_movz(size, imm, shift, dst, out),
-            Aarch64Inst::Movk {
-                size,
-                imm,
-                shift,
-                dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    movk {}, #{}, lsl #{}",
-                    dst.name_for_size(sz),
-                    imm,
-                    shift
-                );
-            }
 
             Aarch64Inst::Ldr { size, addr, dst } => {
                 let insn = match size {
@@ -1594,21 +1557,6 @@ impl Aarch64Inst {
         }
         if first {
             let _ = writeln!(out, "    movz {}, #0", dst.name_for_size(64));
-        }
-    }
-
-    fn emit_movz(size: &OperandSize, imm: &u16, shift: &u8, dst: &Reg, out: &mut String) {
-        let sz = size.bits().max(32);
-        if *shift == 0 {
-            let _ = writeln!(out, "    movz {}, #{}", dst.name_for_size(sz), imm);
-        } else {
-            let _ = writeln!(
-                out,
-                "    movz {}, #{}, lsl #{}",
-                dst.name_for_size(sz),
-                imm,
-                shift
-            );
         }
     }
 

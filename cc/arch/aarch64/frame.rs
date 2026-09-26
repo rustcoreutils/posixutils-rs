@@ -411,8 +411,12 @@ impl Aarch64CodeGen {
                 });
             } else {
                 // Large frame: separate sub and stp
-                // sub sp, sp, #total_frame
-                self.emit_sub_sp_imm(total_frame);
+                self.push_lir(Aarch64Inst::Sub {
+                    size: OperandSize::B64,
+                    src1: Reg::SP,
+                    src2: GpOperand::Imm(total_frame.into()),
+                    dst: Reg::SP,
+                });
                 // stp x29, x30, [sp]
                 self.push_lir(Aarch64Inst::Stp {
                     size: OperandSize::B64,
@@ -486,195 +490,6 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Emit sub sp, sp, #imm handling large immediates
-    fn emit_sub_sp_imm(&mut self, imm: i32) {
-        // AArch64 add/sub immediate can encode values up to 4095 (12 bits)
-        // For larger values, we need multiple instructions or use a register
-        const MAX_IMM12: i32 = 4095;
-
-        if imm <= MAX_IMM12 {
-            self.push_lir(Aarch64Inst::Sub {
-                size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Imm(imm as i64),
-                dst: Reg::SP,
-            });
-        } else if imm <= MAX_IMM12 * 2 {
-            // Two sub instructions for values up to 8190
-            self.push_lir(Aarch64Inst::Sub {
-                size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Imm(MAX_IMM12 as i64),
-                dst: Reg::SP,
-            });
-            self.push_lir(Aarch64Inst::Sub {
-                size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Imm((imm - MAX_IMM12) as i64),
-                dst: Reg::SP,
-            });
-        } else {
-            // For very large values, load into scratch register
-            let scratch = Reg::X9;
-            self.emit_mov_imm(scratch, imm as i64, 64);
-            self.push_lir(Aarch64Inst::Sub {
-                size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Reg(scratch),
-                dst: Reg::SP,
-            });
-        }
-    }
-
-    /// stp/ldp signed-7-bit-scaled immediate range for `size`.
-    /// Returns `(min, max, step)` in bytes.
-    fn pair_offset_range(size: OperandSize) -> (i32, i32, i32) {
-        match size {
-            OperandSize::B32 => (-256, 252, 4),
-            _ => (-512, 504, 8),
-        }
-    }
-
-    /// True if `offset` fits the stp/ldp encoding for `size`.
-    fn pair_offset_fits(offset: i32, size: OperandSize) -> bool {
-        let (min, max, step) = Self::pair_offset_range(size);
-        offset >= min && offset <= max && offset % step == 0
-    }
-
-    /// Emit `dst = base + offset`, picking the cheapest encoding:
-    ///   * add/sub with 12-bit immediate (single instruction);
-    ///   * two add/sub when the offset fits within 2 × 12-bit;
-    ///   * fall back to `mov dst, imm; add dst, base, dst` for the
-    ///     extreme tail.
-    ///
-    /// `dst` must be a register the caller is free to clobber — the
-    /// pair-legalization path passes X16.
-    fn emit_add_offset(&mut self, dst: Reg, base: Reg, offset: i32) {
-        const MAX_IMM12: i32 = 4095;
-        if offset == 0 {
-            self.push_lir(Aarch64Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Reg(base),
-                dst,
-            });
-            return;
-        }
-        let positive = offset >= 0;
-        let abs = offset.unsigned_abs() as i64;
-        if abs <= MAX_IMM12 as i64 {
-            self.push_lir(if positive {
-                Aarch64Inst::Add {
-                    size: OperandSize::B64,
-                    src1: base,
-                    src2: GpOperand::Imm(abs),
-                    dst,
-                }
-            } else {
-                Aarch64Inst::Sub {
-                    size: OperandSize::B64,
-                    src1: base,
-                    src2: GpOperand::Imm(abs),
-                    dst,
-                }
-            });
-        } else if abs <= 2 * MAX_IMM12 as i64 {
-            // Two-step: first to `dst`, then chain to `dst`.
-            self.push_lir(if positive {
-                Aarch64Inst::Add {
-                    size: OperandSize::B64,
-                    src1: base,
-                    src2: GpOperand::Imm(MAX_IMM12 as i64),
-                    dst,
-                }
-            } else {
-                Aarch64Inst::Sub {
-                    size: OperandSize::B64,
-                    src1: base,
-                    src2: GpOperand::Imm(MAX_IMM12 as i64),
-                    dst,
-                }
-            });
-            self.push_lir(if positive {
-                Aarch64Inst::Add {
-                    size: OperandSize::B64,
-                    src1: dst,
-                    src2: GpOperand::Imm(abs - MAX_IMM12 as i64),
-                    dst,
-                }
-            } else {
-                Aarch64Inst::Sub {
-                    size: OperandSize::B64,
-                    src1: dst,
-                    src2: GpOperand::Imm(abs - MAX_IMM12 as i64),
-                    dst,
-                }
-            });
-        } else {
-            self.emit_mov_imm(dst, offset as i64, 64);
-            self.push_lir(Aarch64Inst::Add {
-                size: OperandSize::B64,
-                src1: base,
-                src2: GpOperand::Reg(dst),
-                dst,
-            });
-        }
-    }
-
-    /// If `addr` is a `BaseOffset` with an out-of-range offset,
-    /// materialize `base + offset` into X16 and rewrite the address
-    /// to `[X16]`. Otherwise returns `addr` unchanged.
-    ///
-    /// Convention: X16 is clobbered iff legalization fires. Callers
-    /// must not rely on X16 being alive past the emit_*_legalized
-    /// call. In practice this is fine — the pattern is always
-    /// "compute source addr (may use X16) → load into X9/X10 →
-    /// legalize destination addr (may reuse X16) → store" — the
-    /// source's use of X16 is dead by the time the destination's
-    /// legalization runs.
-    fn legalize_pair_addr(&mut self, size: OperandSize, addr: MemAddr) -> MemAddr {
-        if let MemAddr::BaseOffset { base, offset } = addr {
-            if !Self::pair_offset_fits(offset, size) {
-                self.emit_add_offset(Reg::X16, base, offset);
-                return MemAddr::Base(Reg::X16);
-            }
-        }
-        addr
-    }
-
-    /// Emit `stp src1, src2, addr` with pair-address legalization.
-    pub(super) fn emit_stp_legalized(
-        &mut self,
-        size: OperandSize,
-        src1: Reg,
-        src2: Reg,
-        addr: MemAddr,
-    ) {
-        let addr = self.legalize_pair_addr(size, addr);
-        self.push_lir(Aarch64Inst::Stp {
-            size,
-            src1,
-            src2,
-            addr,
-        });
-    }
-
-    /// Emit `ldp dst1, dst2, addr` with pair-address legalization.
-    pub(super) fn emit_ldp_legalized(
-        &mut self,
-        size: OperandSize,
-        addr: MemAddr,
-        dst1: Reg,
-        dst2: Reg,
-    ) {
-        let addr = self.legalize_pair_addr(size, addr);
-        self.push_lir(Aarch64Inst::Ldp {
-            size,
-            addr,
-            dst1,
-            dst2,
-        });
-    }
-
     /// Zero-initialize the local variable area of the stack frame.
     /// This ensures all stack slots start as zero, so narrow writes (8/16/32-bit)
     /// leave zero in the unwritten upper bytes.
@@ -730,24 +545,21 @@ impl Aarch64CodeGen {
     /// X16 is the cursor and X17 the end of the paired part. Both are AAPCS64
     /// intra-procedure scratch and nothing is live in them this early in the
     /// prologue: the arguments are still in x0-x7 and v0-v7, and x8 holds the
-    /// indirect-result pointer. Both displacements are materialized with
-    /// `emit_mov_imm` and applied in register form, which encodes at any size.
+    /// indirect-result pointer.
     fn emit_zero_loop(&mut self, base_offset: i32, bytes: i32) {
         let bytes = (bytes + 7) & !7;
         let pairs = bytes & !15;
-        self.emit_mov_imm(Reg::X16, base_offset as i64, 64);
         self.push_lir(Aarch64Inst::Add {
             size: OperandSize::B64,
             src1: Reg::X29,
-            src2: GpOperand::Reg(Reg::X16),
+            src2: GpOperand::Imm(base_offset.into()),
             dst: Reg::X16,
         });
         if pairs > 0 {
-            self.emit_mov_imm(Reg::X17, pairs as i64, 64);
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: Reg::X16,
-                src2: GpOperand::Reg(Reg::X17),
+                src2: GpOperand::Imm(pairs.into()),
                 dst: Reg::X17,
             });
             let top = self.next_unique_label("zero_frame");
@@ -778,42 +590,6 @@ impl Aarch64CodeGen {
                 size: OperandSize::B64,
                 src: Reg::Xzr,
                 addr: MemAddr::Base(Reg::X16),
-            });
-        }
-    }
-
-    /// Emit add sp, sp, #imm handling large immediates
-    fn emit_add_sp_imm(&mut self, imm: i32) {
-        const MAX_IMM12: i32 = 4095;
-
-        if imm <= MAX_IMM12 {
-            self.push_lir(Aarch64Inst::Add {
-                size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Imm(imm as i64),
-                dst: Reg::SP,
-            });
-        } else if imm <= MAX_IMM12 * 2 {
-            self.push_lir(Aarch64Inst::Add {
-                size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Imm(MAX_IMM12 as i64),
-                dst: Reg::SP,
-            });
-            self.push_lir(Aarch64Inst::Add {
-                size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Imm((imm - MAX_IMM12) as i64),
-                dst: Reg::SP,
-            });
-        } else {
-            let scratch = Reg::X9;
-            self.emit_mov_imm(scratch, imm as i64, 64);
-            self.push_lir(Aarch64Inst::Add {
-                size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Reg(scratch),
-                dst: Reg::SP,
             });
         }
     }
@@ -1232,12 +1008,12 @@ impl Aarch64CodeGen {
                     if let Some(local_off) = local_off {
                         if run.is_some() {
                             if gp_n == 2 {
-                                self.emit_stp_legalized(
-                                    OperandSize::B64,
-                                    arg_regs[int_arg_idx],
-                                    arg_regs[int_arg_idx + 1],
-                                    self.stack_mem(local_off),
-                                );
+                                self.push_lir(Aarch64Inst::Stp {
+                                    size: OperandSize::B64,
+                                    src1: arg_regs[int_arg_idx],
+                                    src2: arg_regs[int_arg_idx + 1],
+                                    addr: self.stack_mem(local_off),
+                                });
                             } else {
                                 // One register holding the whole value:
                                 // `_Complex int` is eight bytes.
@@ -1367,12 +1143,12 @@ impl Aarch64CodeGen {
                     ) {
                         int_arg_idx = start;
                         if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id) {
-                            self.emit_stp_legalized(
-                                OperandSize::B64,
-                                arg_regs[int_arg_idx],
-                                arg_regs[int_arg_idx + 1],
-                                self.stack_mem(*offset),
-                            );
+                            self.push_lir(Aarch64Inst::Stp {
+                                size: OperandSize::B64,
+                                src1: arg_regs[int_arg_idx],
+                                src2: arg_regs[int_arg_idx + 1],
+                                addr: self.stack_mem(*offset),
+                            });
                         }
                         int_arg_idx += 2;
                     } else {
@@ -1767,7 +1543,12 @@ impl Aarch64CodeGen {
                 let loc = self.get_location(src);
                 if let Loc::Stack(offset) = loc {
                     let mem = self.stack_mem(offset);
-                    self.emit_ldp_legalized(OperandSize::B64, mem, Reg::X0, Reg::X1);
+                    self.push_lir(Aarch64Inst::Ldp {
+                        size: OperandSize::B64,
+                        addr: mem,
+                        dst1: Reg::X0,
+                        dst2: Reg::X1,
+                    });
                 } else {
                     // Fallback: load lo half to X0, zero X1
                     self.emit_move(src, Reg::X0, 64);
@@ -1880,7 +1661,12 @@ impl Aarch64CodeGen {
                 dst2: Reg::lr(),
             });
             // add sp, sp, #dealloc
-            self.emit_add_sp_imm(dealloc);
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: Reg::SP,
+                src2: GpOperand::Imm(dealloc.into()),
+                dst: Reg::SP,
+            });
         }
         self.push_lir(Aarch64Inst::Ret);
     }

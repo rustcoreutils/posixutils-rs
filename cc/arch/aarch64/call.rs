@@ -221,12 +221,12 @@ impl Aarch64CodeGen {
                             offset: 0,
                         },
                     };
-                    self.emit_ldp_legalized(
-                        OperandSize::B64,
-                        mem,
-                        int_arg_regs[int_arg_idx],
-                        int_arg_regs[int_arg_idx + 1],
-                    );
+                    self.push_lir(Aarch64Inst::Ldp {
+                        size: OperandSize::B64,
+                        addr: mem,
+                        dst1: int_arg_regs[int_arg_idx],
+                        dst2: int_arg_regs[int_arg_idx + 1],
+                    });
                     int_arg_idx += 2;
                 }
             } else {
@@ -413,9 +413,12 @@ impl Aarch64CodeGen {
                     let loc = self.get_location(arg).clone();
                     let mem = self.loc_mem(&loc);
                     match mem {
-                        Some(mem) => {
-                            self.emit_ldp_legalized(OperandSize::B64, mem, Reg::X9, Reg::X10)
-                        }
+                        Some(mem) => self.push_lir(Aarch64Inst::Ldp {
+                            size: OperandSize::B64,
+                            addr: mem,
+                            dst1: Reg::X9,
+                            dst2: Reg::X10,
+                        }),
                         None => {
                             self.emit_move(arg, Reg::X9, 64);
                             self.push_lir(Aarch64Inst::Mov {
@@ -425,15 +428,15 @@ impl Aarch64CodeGen {
                             });
                         }
                     }
-                    self.emit_stp_legalized(
-                        OperandSize::B64,
-                        Reg::X9,
-                        Reg::X10,
-                        MemAddr::BaseOffset {
+                    self.push_lir(Aarch64Inst::Stp {
+                        size: OperandSize::B64,
+                        src1: Reg::X9,
+                        src2: Reg::X10,
+                        addr: MemAddr::BaseOffset {
                             base: Reg::SP,
                             offset,
                         },
-                    );
+                    });
                 } else {
                     self.emit_move(arg, Reg::X9, arg_size);
                     self.push_lir(Aarch64Inst::Str {
@@ -696,12 +699,12 @@ impl Aarch64CodeGen {
                             offset: 0,
                         },
                     };
-                    self.emit_ldp_legalized(
-                        OperandSize::B64,
-                        mem,
-                        int_arg_regs[int_arg_idx],
-                        int_arg_regs[int_arg_idx + 1],
-                    );
+                    self.push_lir(Aarch64Inst::Ldp {
+                        size: OperandSize::B64,
+                        addr: mem,
+                        dst1: int_arg_regs[int_arg_idx],
+                        dst2: int_arg_regs[int_arg_idx + 1],
+                    });
                     int_arg_idx += 2;
                 } else {
                     stack_args_info.push(StackArg {
@@ -783,12 +786,12 @@ impl Aarch64CodeGen {
                             // parameter being forwarded may have arrived on
                             // the stack itself.
                             let mem = self.loc_mem(l).unwrap();
-                            self.emit_ldp_legalized(
-                                OperandSize::B64,
-                                mem,
-                                int_arg_regs[int_arg_idx],
-                                int_arg_regs[int_arg_idx + 1],
-                            );
+                            self.push_lir(Aarch64Inst::Ldp {
+                                size: OperandSize::B64,
+                                addr: mem,
+                                dst1: int_arg_regs[int_arg_idx],
+                                dst2: int_arg_regs[int_arg_idx + 1],
+                            });
                         }
                         Loc::Imm(v) => {
                             let lo = v as u64 as i64;
@@ -853,7 +856,12 @@ impl Aarch64CodeGen {
                 match loc {
                     ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
                         let mem = self.loc_mem(l).unwrap();
-                        self.emit_ldp_legalized(OperandSize::B64, mem, Reg::X9, Reg::X10);
+                        self.push_lir(Aarch64Inst::Ldp {
+                            size: OperandSize::B64,
+                            addr: mem,
+                            dst1: Reg::X9,
+                            dst2: Reg::X10,
+                        });
                     }
                     Loc::Imm(v) => {
                         let lo = v as u64 as i64;

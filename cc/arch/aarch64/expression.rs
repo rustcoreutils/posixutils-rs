@@ -470,7 +470,12 @@ impl Aarch64CodeGen {
                 // fell to the fallback below, which loads 64 bits and zeroes
                 // the top half -- a silent wrong answer, not a crash.
                 let mem = self.loc_mem(l).unwrap();
-                self.emit_ldp_legalized(OperandSize::B64, mem, lo_reg, hi_reg);
+                self.push_lir(Aarch64Inst::Ldp {
+                    size: OperandSize::B64,
+                    addr: mem,
+                    dst1: lo_reg,
+                    dst2: hi_reg,
+                });
             }
             Loc::Imm(v) => {
                 let lo = v as u64 as i64;
@@ -495,7 +500,12 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
         if let Loc::Stack(offset) = dst_loc {
             let mem = self.stack_mem(offset);
-            self.emit_stp_legalized(OperandSize::B64, lo_reg, hi_reg, mem);
+            self.push_lir(Aarch64Inst::Stp {
+                size: OperandSize::B64,
+                src1: lo_reg,
+                src2: hi_reg,
+                addr: mem,
+            });
         }
     }
 

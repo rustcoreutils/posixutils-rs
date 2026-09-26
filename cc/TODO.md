@@ -70,33 +70,15 @@ live `int`s cost 72 bytes where gcc uses callee-saved registers and none. Slot
 reuse is the larger multiplier, but this is why even leaf functions carry a
 frame.
 
-### aarch64 emits frame offsets no instruction can encode
+### aarch64 inline-asm memory operands are printed unlegalized
 
-A frame-relative `ldr`/`str` is printed as `[x29, #off]` whatever `off` is, and
-the scaled 12-bit immediate only reaches 4095 elements of the access size:
-4 KB for a byte, 16 KB for a word, 32 KB for a doubleword. So an ordinary
-function with a 40 KB local array and one `int` fails to *assemble* ("immediate
-offset out of range"), at every optimization level, on Linux and Darwin alike.
-Spills, incoming stacked arguments and the variadic register save area sit
-above the locals and hit the same wall. A packed struct member at a misaligned
-offset past 255 fails through any pointer, with no large frame at all.
-
-Related sites with the same shape:
-
-- `emit_add_imm_legalized` splits an immediate into a shifted and an unshifted
-  12-bit half, so it reaches 16 MiB and no further: taking the address of a
-  local that far up fails to assemble.
-- The over-aligned frame base (`add x19, x29, #...`) is emitted raw, so
-  `_Alignas(4096)` on a local fails.
-- `emit_struct_store`/`emit_struct_zero` add a raw offset to their cursor, and
-  the outgoing-argument `sub sp`/`add sp` and `[sp, #off]` stores are raw past
-  about 4 KB of stacked arguments.
-
-The fix is one legalizer: an address whose displacement does not encode for its
-access size is rebuilt through X16 with `emit_add_offset`, which already handles
-any offset, and `emit_add_imm_legalized` falls back to `emit_mov_imm` plus a
-register add. The pair forms already have `legalize_pair_addr`; the single forms
-have nothing.
+Every instruction the aarch64 backend builds goes through
+`arch/aarch64/legalize.rs`, which rewrites an offset or immediate no encoding
+holds. An inline-asm memory operand does not: `loc_to_asm_string` substitutes
+a stack slot into the template as the text `[x29, #off]`, and the template's
+own `ldr`/`str` cannot encode that once the slot is far enough from the frame
+pointer. It needs the address in a register, as a memory operand whose
+address already lives in one gets.
 
 ---
 
@@ -276,13 +258,10 @@ What it takes:
   CFI directive offsets. `grow_frame` and `slot_bytes` then bound at
   `MAX_OBJECT_BYTES` instead.
 - A displacement outside the target's encodable range goes through a scratch
-  register: `movabsq` plus an indexed or `addq` form on x86-64, the existing
-  `emit_mov_imm`/`emit_add_offset` on aarch64 (both already take the full
-  `i64`). On aarch64 this is the same legalizer the
-  [unencodable-offset bug](#aarch64-emits-frame-offsets-no-instruction-can-encode)
-  needs, so that comes first.
-- The prologue's `subq $N, %rsp` becomes `movabsq $N, %r11; subq %r11, %rsp`;
-  aarch64's `emit_sub_sp_imm`/`emit_add_sp_imm` already materialise any size.
+  register: `movabsq` plus an indexed or `addq` form on x86-64. On aarch64
+  `legalize.rs` already expands any offset through X15; what changes is only
+  the width of the offsets it is given.
+- The prologue's `subq $N, %rsp` becomes `movabsq $N, %r11; subq %r11, %rsp`.
 - `insn.offset as i32` in both backends' load/store paths truncates a constant
   member or element offset past `i32::MAX` -- through *any* pointer, not only
   the frame -- so those casts go too.

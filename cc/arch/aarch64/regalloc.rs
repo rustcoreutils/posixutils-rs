@@ -15,11 +15,15 @@
 //
 // Scratch registers (NEVER allocated to pseudos):
 //   X9, X10, X11 - Reserved for codegen temporaries
+//   X15          - Immediate legalization (see `legalize.rs`). Written only by
+//                  the legalizer, only inside the one instruction it expands,
+//                  and never named by codegen -- so it holds nothing from one
+//                  instruction to the next.
 //   X16, X17     - Linker scratch (IP0/IP1 per AAPCS64)
 //
-// Codegen MUST use only scratch registers (X9, X10, X11) for temporaries.
-// Using allocatable registers (X0-X7, X12-X15, X19-X28) risks clobbering
-// live values that were assigned by the register allocator.
+// Codegen MUST use only scratch registers (X9, X10, X11, X16, X17) for
+// temporaries. Using allocatable registers (X0-X7, X12-X14, X19-X28) risks
+// clobbering live values that were assigned by the register allocator.
 //
 // Reserved registers:
 //   X8          - Indirect result register (large struct returns)
@@ -252,7 +256,8 @@ impl Reg {
 
     /// All allocatable registers
     /// Excludes: x8 (indirect result), x9/x10/x11 (codegen scratch),
-    ///           x16/x17 (linker scratch), x18 (platform), x29 (fp), x30 (lr), sp
+    ///           x15 (immediate legalization), x16/x17 (linker scratch),
+    ///           x18 (platform), x29 (fp), x30 (lr), sp
     pub fn allocatable() -> &'static [Reg] {
         &[
             Reg::X0,
@@ -268,7 +273,7 @@ impl Reg {
             Reg::X12,
             Reg::X13,
             Reg::X14,
-            Reg::X15,
+            // Skip x15 (immediate legalization)
             // Skip x16, x17 (linker scratch)
             // Skip x18 (platform reserved)
             Reg::X19,
@@ -1119,10 +1124,10 @@ fn fp_pseudo_bytes(func: &Function, pseudo: PseudoId) -> i32 {
 ///
 /// `X9` / `X10` / `X11` are the three documented codegen scratches
 /// (the `Reg::scratch_regs()` triple). `X16` / `X17` are AAPCS64
-/// linker-scratch (IP0/IP1) that the pair-address legalizer (commit
-/// `6af088eb`) reuses freely; they're listed for completeness even
-/// though their freeing has its own additional codegen
-/// dependencies.
+/// linker-scratch (IP0/IP1) that codegen uses freely; they're listed for
+/// completeness even though their freeing has its own additional codegen
+/// dependencies. `X15` is not here: it holds nothing across an instruction
+/// boundary, so no constraint point needs to know about it.
 const AARCH64_SCRATCH_REGS: &[Reg] = &[Reg::X9, Reg::X10, Reg::X11, Reg::X16, Reg::X17];
 
 /// Conservative predicate — every IR opcode whose codegen helper
@@ -2355,6 +2360,14 @@ mod tests {
                 "an {align}-aligned argument rounds within the argument area"
             );
         }
+    }
+
+    #[test]
+    fn legalization_register_is_never_allocated() {
+        // X15 carries the expansion of one unencodable instruction and
+        // nothing else; a pseudo living there would be overwritten by the
+        // next far offset.
+        assert!(!Reg::allocatable().contains(&Reg::X15));
     }
 
     #[test]

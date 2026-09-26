@@ -262,8 +262,18 @@ impl Aarch64CodeGen {
                 // was truncated to 64 bits.
                 let src_mem = self.loc_mem(loc).unwrap();
                 let dst_mem = self.stack_mem(dst_offset);
-                self.emit_ldp_legalized(OperandSize::B64, src_mem, Reg::X9, Reg::X10);
-                self.emit_stp_legalized(OperandSize::B64, Reg::X9, Reg::X10, dst_mem);
+                self.push_lir(Aarch64Inst::Ldp {
+                    size: OperandSize::B64,
+                    addr: src_mem,
+                    dst1: Reg::X9,
+                    dst2: Reg::X10,
+                });
+                self.push_lir(Aarch64Inst::Stp {
+                    size: OperandSize::B64,
+                    src1: Reg::X9,
+                    src2: Reg::X10,
+                    addr: dst_mem,
+                });
             }
             Loc::Imm(v) => {
                 let lo = v as u64 as i64;
@@ -271,13 +281,23 @@ impl Aarch64CodeGen {
                 self.emit_mov_imm(Reg::X9, lo, 64);
                 self.emit_mov_imm(Reg::X10, hi, 64);
                 let dst_mem = self.stack_mem(dst_offset);
-                self.emit_stp_legalized(OperandSize::B64, Reg::X9, Reg::X10, dst_mem);
+                self.push_lir(Aarch64Inst::Stp {
+                    size: OperandSize::B64,
+                    src1: Reg::X9,
+                    src2: Reg::X10,
+                    addr: dst_mem,
+                });
             }
             _ => {
                 // For other locations, load as 64-bit and zero-extend
                 self.emit_move(src, Reg::X9, 64);
                 let dst_mem = self.stack_mem(dst_offset);
-                self.emit_stp_legalized(OperandSize::B64, Reg::X9, Reg::Xzr, dst_mem);
+                self.push_lir(Aarch64Inst::Stp {
+                    size: OperandSize::B64,
+                    src1: Reg::X9,
+                    src2: Reg::Xzr,
+                    addr: dst_mem,
+                });
             }
         }
     }
@@ -382,13 +402,18 @@ impl Aarch64CodeGen {
             if let Loc::Stack(dst_offset) = dst_loc {
                 match self.compute_mem_addr(addr, insn.offset, Reg::X16) {
                     ComputedAddr::Direct(mem_addr) | ComputedAddr::WithSetup(mem_addr) => {
-                        self.emit_ldp_legalized(OperandSize::B64, mem_addr, Reg::X9, Reg::X10);
-                        self.emit_stp_legalized(
-                            OperandSize::B64,
-                            Reg::X9,
-                            Reg::X10,
-                            self.stack_mem(dst_offset),
-                        );
+                        self.push_lir(Aarch64Inst::Ldp {
+                            size: OperandSize::B64,
+                            addr: mem_addr,
+                            dst1: Reg::X9,
+                            dst2: Reg::X10,
+                        });
+                        self.push_lir(Aarch64Inst::Stp {
+                            size: OperandSize::B64,
+                            src1: Reg::X9,
+                            src2: Reg::X10,
+                            addr: self.stack_mem(dst_offset),
+                        });
                     }
                     ComputedAddr::Global(name) => {
                         self.emit_load_addr(&name, Reg::X16);
@@ -398,12 +423,12 @@ impl Aarch64CodeGen {
                             dst1: Reg::X9,
                             dst2: Reg::X10,
                         });
-                        self.emit_stp_legalized(
-                            OperandSize::B64,
-                            Reg::X9,
-                            Reg::X10,
-                            self.stack_mem(dst_offset),
-                        );
+                        self.push_lir(Aarch64Inst::Stp {
+                            size: OperandSize::B64,
+                            src1: Reg::X9,
+                            src2: Reg::X10,
+                            addr: self.stack_mem(dst_offset),
+                        });
                     }
                 }
             }
@@ -756,7 +781,12 @@ impl Aarch64CodeGen {
 
         match self.compute_mem_addr(addr, insn.offset, Reg::X16) {
             ComputedAddr::Direct(mem_addr) | ComputedAddr::WithSetup(mem_addr) => {
-                self.emit_stp_legalized(OperandSize::B64, Reg::X9, Reg::X10, mem_addr);
+                self.push_lir(Aarch64Inst::Stp {
+                    size: OperandSize::B64,
+                    src1: Reg::X9,
+                    src2: Reg::X10,
+                    addr: mem_addr,
+                });
             }
             ComputedAddr::Global(name) => {
                 self.emit_load_addr(&name, Reg::X16);

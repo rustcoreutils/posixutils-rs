@@ -226,9 +226,23 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Push a LIR instruction to the buffer (deferred emission)
+    /// Push a LIR instruction to the buffer (deferred emission).
+    ///
+    /// Every instruction passes through [`super::legalize::legalize`], so an
+    /// offset or immediate no encoding can hold is expanded here, once, rather
+    /// than by each site that builds one.
     pub(super) fn push_lir(&mut self, inst: Aarch64Inst) {
-        self.base.push_lir(inst);
+        let mut out = Vec::with_capacity(1);
+        if let Err(super::legalize::Unencodable(what)) = super::legalize::legalize(inst, &mut out) {
+            crate::diag::error_args(
+                self.base.func_pos,
+                "internal error: c17 built {0}, which no aarch64 instruction encodes",
+                &[what],
+            );
+        }
+        for inst in out {
+            self.base.push_lir(inst);
+        }
     }
 
     /// Emit .loc directive for source line tracking (delegates to base)
@@ -263,44 +277,6 @@ impl Aarch64CodeGen {
         }
         self.base.emit_global(global, types);
     }
-
-    // ========================================================================
-    // Pair-addressing legalization (stp / ldp / stpfp / ldpfp)
-    // ========================================================================
-    //
-    // stp/ldp accept signed 7-bit immediate offsets scaled by element
-    // size:
-    //   B64 / Double : [-512,  504] step 8
-    //   B32 / Single : [-256,  252] step 4
-    //   Quad (128b)  : [-1024, 1008] step 16
-    //
-    // A deep stack frame (large alloca, int128-heavy locals, many
-    // spills) routinely overflows these, and the assembler rejects an
-    // out-of-range offset ("index must be a multiple of 8 in range
-    // [-512, 504]").
-    //
-    // Every body-emitted pair instruction that takes a `BaseOffset`
-    // routes through `emit_{stp,ldp,stp_fp,ldp_fp}_legalized`. The
-    // legalizer:
-    //   * leaves in-range offsets untouched (zero overhead);
-    //   * materializes out-of-range addresses into the `X16` scratch
-    //     register and rewrites the addr to `[X16]`.
-    //
-    // `X16` is AAPCS64 IP0 — linker scratch, never in the allocator
-    // palette, and never used by other codegen helpers as a *data*
-    // shuttle (they use x9–x11). Reserving it specifically for
-    // address materialization keeps the scratch convention clean.
-    //
-    // `PreIndex` / `PostIndex` addresses are NOT legalized here. They
-    // appear only in the prologue/epilogue, which already handles its
-    // own large-frame split (see `emit_prologue` / `emit_epilogue`).
-
-    // FP pair legalization helpers (emit_{stp,ldp}_fp_legalized) are
-    // intentionally absent — every current StpFp/LdpFp site emits
-    // either callee-saved save/restore (offset bounded by the small
-    // callee-saved set: ≤288 bytes) or prologue PreIndex (handled by
-    // its own large-frame split). Add them the moment an FP pair
-    // instruction needs body-emission with a possibly-large offset.
 
     pub(super) fn emit_block(
         &mut self,
@@ -346,7 +322,12 @@ impl Aarch64CodeGen {
                 if insn.size >= 128 {
                     // 128-bit: load both halves and ORR them to check for non-zero
                     let (_, scratch1, _) = Reg::scratch_regs();
-                    self.emit_ldp_legalized(OperandSize::B64, mem, scratch0, scratch1);
+                    self.push_lir(Aarch64Inst::Ldp {
+                        size: OperandSize::B64,
+                        addr: mem,
+                        dst1: scratch0,
+                        dst2: scratch1,
+                    });
                     self.push_lir(Aarch64Inst::Orr {
                         size: OperandSize::B64,
                         src1: scratch0,
@@ -741,7 +722,12 @@ impl Aarch64CodeGen {
                             // have its address taken too, and the `_` arm
                             // below would have emitted nothing at all for it.
                             let (base, adjusted) = self.loc_addr_parts(loc).unwrap();
-                            self.emit_add_imm_legalized(dst_reg, base, adjusted as i64);
+                            self.push_lir(Aarch64Inst::Add {
+                                size: OperandSize::B64,
+                                src1: base,
+                                src2: GpOperand::Imm(adjusted.into()),
+                                dst: dst_reg,
+                            });
                         }
                         _ => {}
                     }
@@ -937,52 +923,6 @@ impl Aarch64CodeGen {
 
             // Skip no-ops and unimplemented
             _ => {}
-        }
-    }
-
-    /// `add dst, base, #imm`, split when the immediate does not fit.
-    ///
-    /// AArch64's add immediate is twelve bits, optionally shifted left by
-    /// twelve -- so 0..4095, or a multiple of 4096 up to 0xFFF000. A frame
-    /// large enough to put a local past 4095 produced `add x1, x29, #18032`,
-    /// which the assembler rejects outright: `Error: immediate out of range`.
-    /// Three locals of 9001 bytes is enough to reach it, and inlining at -O2
-    /// reaches it with smaller ones.
-    ///
-    /// Split into the shifted part and the remainder, both of which are
-    /// representable, rather than materializing the value into a scratch
-    /// register: there is no free scratch here -- X16 is already this
-    /// function's fallback destination and X17 is in use elsewhere -- and two
-    /// adds need none.
-    pub(super) fn emit_add_imm_legalized(&mut self, dst: Reg, base: Reg, imm: i64) {
-        const MAX12: i64 = 0xFFF;
-        if (0..=MAX12).contains(&imm) {
-            self.push_lir(Aarch64Inst::Add {
-                size: OperandSize::B64,
-                src1: base,
-                src2: GpOperand::Imm(imm),
-                dst,
-            });
-            return;
-        }
-        // The high part is a multiple of 4096 and so fits the shifted form;
-        // the low part is under 4096 and fits the plain one. `dst` is written
-        // before it is read, so `dst == base` is fine.
-        let hi = imm & !MAX12;
-        let lo = imm & MAX12;
-        self.push_lir(Aarch64Inst::Add {
-            size: OperandSize::B64,
-            src1: base,
-            src2: GpOperand::Imm(hi),
-            dst,
-        });
-        if lo != 0 {
-            self.push_lir(Aarch64Inst::Add {
-                size: OperandSize::B64,
-                src1: dst,
-                src2: GpOperand::Imm(lo),
-                dst,
-            });
         }
     }
 

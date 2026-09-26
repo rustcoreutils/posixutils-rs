@@ -1835,6 +1835,13 @@ pub struct FunctionAttrs {
     /// `__attribute__((aligned(N)))` -- align the function's code to N bytes,
     /// which is also what `__alignof__` of the function answers.
     pub align: Option<u32>,
+    /// `__attribute__((noreturn))`. What a call site reads is the function
+    /// *type*'s `noreturn`, which the declarator is given from this.
+    pub noreturn: bool,
+    /// `__attribute__((sysv_abi))` or `((ms_abi))`, from whichever
+    /// declaration wrote it: gcc compiles a definition under the convention
+    /// an earlier prototype named.
+    pub calling_conv: Option<crate::abi::CallingConv>,
 }
 
 impl FunctionAttrs {
@@ -1862,6 +1869,10 @@ impl FunctionAttrs {
         // Several `aligned` attributes across the declarations: the strictest
         // wins, as it does for an object.
         self.align = self.align.max(other.align);
+        self.noreturn |= other.noreturn;
+        if other.calling_conv.is_some() {
+            self.calling_conv = other.calling_conv;
+        }
     }
 }
 

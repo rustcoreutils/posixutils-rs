@@ -6717,3 +6717,251 @@ fn diagnostics_typedef_and_object_in_one_scope_collide() {
         "typedef int T;\nvoid f(void){ T T; T = 1; (void)T; }\nvoid g(int T){ (void)T; }\n",
     );
 }
+
+// ============================================================================
+// One path binds a declarator, whichever position it holds
+// ============================================================================
+//
+// A file-scope declaration had five hand-written binders -- the first plain
+// declarator, a grouped one, a function declarator, the declarators after the
+// first, and block scope's -- and each check lived in some of them. Every case
+// below is a check one path made and another did not, so each is spelled in
+// the positions that used to skip it.
+
+/// C17 6.7.6.2p1: an array's element type must be complete where the array is
+/// declared. Only the first plain file-scope declarator asked.
+#[test]
+fn diagnostics_incomplete_element_type_in_every_declarator_position() {
+    for (name, src) in [
+        ("inc_elem_later", "struct T;\nstruct T *p, arr[2];\n"),
+        ("inc_elem_grouped", "struct T;\nstruct T (arr)[2];\n"),
+        (
+            "inc_elem_block_extern",
+            "struct T;\nvoid f(void){ extern struct T arr[2]; }\n",
+        ),
+        (
+            "inc_elem_block",
+            "struct U;\nvoid f(void){ struct U a[2]; }\n",
+        ),
+        ("inc_elem_typedef", "struct T;\ntypedef struct T A[2];\n"),
+        (
+            "inc_elem_block_typedef",
+            "struct T;\nvoid f(void){ typedef struct T A[2]; }\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "array type has incomplete element type");
+    }
+    compile_expect_ok(
+        "inc_elem_completed_first",
+        "struct T;\nstruct T *p;\nstruct T { int a; };\nstruct T arr[2], *q;\n\
+         void f(void){ struct T b[2]; extern struct T c[2]; (void)b; }\n",
+    );
+}
+
+/// An automatic array needs its extent where it is declared; nothing later in
+/// the block can supply one. The block binder asked only whether a *tag* was
+/// complete, which an array never is not.
+#[test]
+fn diagnostics_block_scope_array_without_a_size_is_rejected() {
+    compile_expect_error(
+        "block_unsized_array",
+        "void f(void){ int b[]; (void)b; }\n",
+        "array size missing in 'b'",
+    );
+    compile_expect_error(
+        "block_unsized_array_later",
+        "void f(void){ int a, b[]; (void)a; (void)b; }\n",
+        "array size missing in 'b'",
+    );
+    compile_expect_ok(
+        "block_sized_arrays",
+        "void f(int n){ int a[] = {1, 2}; extern int e[]; typedef int T[]; \
+         int v[n]; int (*p)[n]; (void)a; (void)v; (void)p; }\n",
+    );
+}
+
+/// C17 6.9.2p3: a tentative definition may be completed later in the unit, but
+/// something must complete it. Only the first plain declarator was recorded
+/// for the end-of-unit check, so the rest compiled with no storage at all.
+#[test]
+fn diagnostics_tentative_definition_never_completed_in_every_position() {
+    for (name, src) in [
+        ("tent_later", "struct U;\nint x;\nstruct U *p, u;\n"),
+        ("tent_grouped", "struct U;\nstruct U (u);\n"),
+    ] {
+        compile_expect_error(name, src, "storage size of an object");
+    }
+    compile_expect_ok(
+        "tent_later_completed",
+        "struct U;\nstruct U *p, u, (w);\nstruct U { int a; };\n",
+    );
+}
+
+/// C17 6.2.7p4: a later declaration of `extern int a[];` supplies its extent,
+/// whichever position in its list it holds.
+#[test]
+fn diagnostics_extern_array_completed_by_any_declarator() {
+    compile_expect_ok(
+        "extern_completed_later",
+        "extern int a[];\nint z, a[4];\n_Static_assert(sizeof a == 16, \"a\");\n",
+    );
+    compile_expect_ok(
+        "extern_completed_grouped",
+        "extern int b[];\nint (b)[4];\n_Static_assert(sizeof b == 16, \"b\");\n",
+    );
+}
+
+/// A grouped declarator's initializer is an initializer like any other: it
+/// sizes an incomplete array and is checked for excess elements.
+#[test]
+fn diagnostics_grouped_declarator_initializer_is_checked() {
+    compile_expect_ok(
+        "grouped_init_sizes",
+        "int (a)[] = {1, 2, 3};\n_Static_assert(sizeof a == 12, \"a\");\n",
+    );
+    compile_expect_warning(
+        "grouped_init_excess",
+        "int (a)[2] = {1, 2, 3};\n",
+        "excess elements in array initializer",
+    );
+}
+
+/// `typedef int A, B __attribute__((aligned(16)));` aligns `B` alone. The
+/// later-declarator binder never folded the alignment into the typedef.
+#[test]
+fn diagnostics_trailing_alignment_reaches_every_typedef_declarator() {
+    compile_expect_ok(
+        "typedef_align_later",
+        "typedef int A, B __attribute__((aligned(16)));\n\
+         _Static_assert(_Alignof(B) == 16, \"B\");\n\
+         _Static_assert(_Alignof(A) == 4, \"A\");\n",
+    );
+    compile_expect_ok(
+        "typedef_align_grouped",
+        "typedef int (C) __attribute__((aligned(16)));\n\
+         _Static_assert(_Alignof(C) == 16, \"C\");\n\
+         int (o) __attribute__((aligned(32)));\n\
+         _Static_assert(__alignof__(o) == 32, \"o\");\n",
+    );
+}
+
+/// C11 6.7.5p2 forbids `_Alignas` on a function, and a grouped function
+/// declarator is still a function -- bound as one, so it is no lvalue either.
+#[test]
+fn diagnostics_grouped_function_declarator_declares_a_function() {
+    compile_expect_error(
+        "grouped_fn_alignas",
+        "_Alignas(16) void (f)(void);\n",
+        "_Alignas cannot be applied to a function",
+    );
+    compile_expect_error(
+        "grouped_fn_not_lvalue",
+        "void (f)(void);\nvoid g(void){ f = 0; }\n",
+        "lvalue required as left operand of assignment",
+    );
+}
+
+/// C17 6.7.6.2p1: `static` and type qualifiers in an array declarator, and
+/// `[*]`, belong to a function parameter. `parse_declarator` took them
+/// anywhere. A K&R parameter declaration is a parameter too, but not in
+/// prototype scope, so `static` is fine there and `[*]` is not.
+#[test]
+fn diagnostics_parameter_only_array_declarators_are_rejected_elsewhere() {
+    for (name, src) in [
+        ("arr_static_file", "int a[static 3];\n"),
+        ("arr_const_file", "int a[const 3];\n"),
+        (
+            "arr_static_block",
+            "void f(void){ int a[static 3]; (void)a; }\n",
+        ),
+        ("arr_static_typename", "int x = sizeof(int[static 2]);\n"),
+    ] {
+        compile_expect_error(
+            name,
+            src,
+            "static or type qualifiers in non-parameter array declarator",
+        );
+    }
+    for (name, src) in [
+        ("arr_star_file", "int a[*];\n"),
+        ("arr_star_block", "void f(void){ int a[*]; (void)a; }\n"),
+        ("arr_star_nested", "int (*p)[*];\n"),
+        ("arr_star_member", "struct S { int n; int a[*]; };\n"),
+        ("arr_star_typename", "int x = sizeof(int[*]);\n"),
+        ("arr_star_knr", "int f(a) int a[*]; { return a[0]; }\n"),
+    ] {
+        compile_expect_error(
+            name,
+            src,
+            "'[*]' not allowed in other than function prototype scope",
+        );
+    }
+    compile_expect_ok(
+        "arr_parameter_forms",
+        "void f(int n, int a[*]);\nvoid g(int a[static 3]);\nvoid h(int a[const 3]);\n\
+         void i(int (*a)[*]);\nvoid (*fp)(int a[static 3]);\n\
+         int k(a) int a[static 3]; { return a[0]; }\n",
+    );
+}
+
+/// C11 6.7.1p2: `_Thread_local` shall not appear with `auto` or `register`,
+/// at file scope as much as in a block.
+#[test]
+fn diagnostics_thread_local_with_auto_or_register_at_file_scope() {
+    compile_expect_error(
+        "tl_register_file",
+        "_Thread_local register int x;\n",
+        "_Thread_local cannot be combined with register",
+    );
+    compile_expect_error(
+        "tl_auto_file",
+        "_Thread_local auto int x;\n",
+        "_Thread_local cannot be combined with auto",
+    );
+}
+
+/// A variably modified type at file scope is refused however it is spelled:
+/// through a grouped declarator whose inner declarator holds the extent, or
+/// through `typeof`.
+#[test]
+fn diagnostics_variably_modified_file_scope_through_grouping_or_typeof() {
+    for (name, src) in [
+        ("fs_vla_inner_grouped", "int n;\nint (*p[n]);\n"),
+        ("fs_vla_typeof", "int n;\ntypeof(int[n]) x;\n"),
+    ] {
+        compile_expect_error(name, src, "file scope");
+    }
+}
+
+/// A function declarator takes no initializer, whichever position it holds.
+#[test]
+fn diagnostics_function_declarator_with_initializer_is_rejected() {
+    for (name, src) in [
+        ("fn_init_first", "int f(void) = 0;\n"),
+        ("fn_init_later", "int x, f(void) = 0;\n"),
+        ("fn_init_block", "void g(void){ int f(void) = 0; }\n"),
+    ] {
+        compile_expect_error(name, src, "function 'f' is initialized like a variable");
+    }
+}
+
+/// A conflicting redeclaration is reported where the declarator is, as gcc
+/// does, not where its declaration began -- the three binders disagreed.
+#[test]
+fn diagnostics_redeclaration_is_reported_at_the_declarator() {
+    compile_expect_error(
+        "redecl_at_declarator",
+        "int x;\ndouble\n  y, x;\n",
+        ":3:6: error: conflicting types for 'x'",
+    );
+    compile_expect_error(
+        "redecl_first_at_declarator",
+        "int x;\ndouble\n  x;\n",
+        ":3:3: error: conflicting types for 'x'",
+    );
+    compile_expect_error(
+        "typedef_redef_at_declarator",
+        "typedef int T;\ntypedef\n  double U, T;\n",
+        ":3:13: error: typedef 'T' redefined",
+    );
+}

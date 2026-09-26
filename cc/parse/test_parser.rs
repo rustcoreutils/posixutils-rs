@@ -1952,10 +1952,9 @@ fn test_pointer_return() {
     assert_eq!(types.kind(func.return_type), TypeKind::Pointer);
 }
 
-/// Both file-scope grouped-declarator call sites go through one helper
-/// (`parse_grouped_declarator_decl`), reached before the pointer loop for
-/// `void (*fp)(int)` and after it for `char *(*fp)(int)`. They were two
-/// near-identical 140-line blocks; these pin the shapes each one owned.
+/// A grouped declarator before a pointer run -- `void (*fp)(int)` -- and after
+/// one -- `char *(*fp)(int)`. They were once two near-identical 140-line
+/// blocks; these pin the shapes each one owned.
 #[test]
 fn test_grouped_declarator_before_and_after_pointers() {
     // Before the pointer loop: the declarator starts from the specifier type.
@@ -6547,4 +6546,104 @@ fn test_typeof_extent_is_bound_once_per_declaration() {
         };
         assert!(matches!(extent.kind, ExprKind::VmTypedefExtent(sym, 0) if sym == hidden.symbol));
     }
+}
+
+/// The declarators of every file-scope position -- first, grouped, later in
+/// the list -- and block scope's are bound by one path, so each gets the
+/// same symbol kind and the same function type. A grouped or later function
+/// declarator was bound as a *variable*, and only the first one's type
+/// carried `noreturn`.
+#[test]
+fn test_every_declarator_position_binds_the_same_way() {
+    let src = "void a(void) __attribute__((noreturn));\n\
+               void (b)(void) __attribute__((noreturn));\n\
+               int x, c(void) __attribute__((noreturn));\n\
+               _Noreturn void d(void), (e)(void);\n\
+               void outer(void) { void k(void) __attribute__((noreturn)); }\n";
+    let (tu, types, strings, symbols) = parse_tu(src).unwrap();
+    let mut seen = Vec::new();
+    let mut check = |decl: &Declaration| {
+        for d in &decl.declarators {
+            let sym = symbols.get(d.symbol);
+            let name = strings.get(sym.name).to_string();
+            if name == "x" {
+                continue;
+            }
+            assert_eq!(sym.kind, crate::symbol::SymbolKind::Function, "{name}");
+            assert!(types.get(d.typ).noreturn, "{name} must be noreturn");
+            seen.push(name);
+        }
+    };
+    for item in &tu.items {
+        match item {
+            ExternalDecl::Declaration(decl) => check(decl),
+            ExternalDecl::FunctionDef(func) => {
+                let Stmt::Block(items) = &func.body else {
+                    panic!("expected a block");
+                };
+                for item in items {
+                    if let BlockItem::Declaration(decl) = item {
+                        check(decl);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(seen, ["a", "b", "c", "d", "e", "k"]);
+}
+
+/// A later typedef declarator gets its trailing alignment, and a later or
+/// grouped declarator completes an earlier `extern` array.
+#[test]
+fn test_later_declarators_align_and_complete() {
+    let (_tu, types, strings, symbols) = parse_tu(
+        "typedef int A, B __attribute__((aligned(16)));\n\
+         extern int p[]; extern int q[];\n\
+         int z, p[4];\n\
+         int (q)[5];\n",
+    )
+    .unwrap();
+    let find = |name: &str| {
+        let id = strings.lookup(name).expect("interned");
+        symbols
+            .lookup(id, crate::symbol::Namespace::Ordinary)
+            .unwrap_or_else(|| panic!("no symbol {name}"))
+            .typ
+    };
+    assert_eq!(types.get(find("B")).explicit_align, Some(16));
+    assert_eq!(types.get(find("A")).explicit_align, None);
+    assert_eq!(types.get(find("p")).array_size, Some(4));
+    assert_eq!(types.get(find("q")).array_size, Some(5));
+}
+
+/// A definition is compiled under the calling convention any declaration of
+/// its name asked for -- a prototype's, or one written among the specifiers --
+/// as gcc does. Only an attribute directly after the definition's own
+/// parameter list used to count.
+#[test]
+fn test_calling_convention_comes_from_any_declaration() {
+    let (tu, _types, strings, _symbols) = parse_tu(
+        "int f(int a, int b) __attribute__((ms_abi));\n\
+         int f(int a, int b) { return a - b; }\n\
+         __attribute__((ms_abi)) int g(void) { return 0; }\n\
+         int h(void) { return 0; }\n",
+    )
+    .unwrap();
+    let convs: Vec<(String, crate::abi::CallingConv)> = tu
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ExternalDecl::FunctionDef(f) => Some((strings.get(f.name).to_string(), f.calling_conv)),
+            _ => None,
+        })
+        .collect();
+    use crate::abi::CallingConv::{Win64, C};
+    assert_eq!(
+        convs,
+        [
+            ("f".to_string(), Win64),
+            ("g".to_string(), Win64),
+            ("h".to_string(), C)
+        ]
+    );
 }

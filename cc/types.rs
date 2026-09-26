@@ -460,14 +460,23 @@ impl Type {
     /// and they leak into places that only ever wanted the type: the return
     /// type of `static int f(void)` carried `STATIC`, so a call to it was not
     /// compatible with `int`. Invisible to `sizeof`, fatal to any comparison.
-    pub const DECL_SPECIFIERS: TypeModifiers = TypeModifiers::STATIC
+    pub const DECL_SPECIFIERS: TypeModifiers = Self::STORAGE_CLASS.union(TypeModifiers::NORETURN);
+
+    /// The storage-class specifiers of C17 6.7.1, and `inline`.
+    ///
+    /// What a declaration records as its storage class, and what a declarator
+    /// carries from its specifiers onto the type it derives. `inline` is a
+    /// function specifier rather than a storage class, but it travels with
+    /// them: without it `FunctionDef::is_inline` was false for every ordinary
+    /// definition, and a pointer-returning `inline` function -- `memcpy` is
+    /// exactly that shape in glibc -- lost the bit.
+    pub const STORAGE_CLASS: TypeModifiers = TypeModifiers::STATIC
         .union(TypeModifiers::EXTERN)
         .union(TypeModifiers::REGISTER)
         .union(TypeModifiers::AUTO)
         .union(TypeModifiers::TYPEDEF)
         .union(TypeModifiers::THREAD_LOCAL)
-        .union(TypeModifiers::INLINE)
-        .union(TypeModifiers::NORETURN);
+        .union(TypeModifiers::INLINE);
 
     /// Check if two types are compatible (for __builtin_types_compatible_p)
     /// This ignores top-level qualifiers (const, volatile, restrict) and the

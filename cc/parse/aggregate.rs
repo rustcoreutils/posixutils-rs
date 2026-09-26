@@ -10,7 +10,7 @@
 //
 
 use super::declaration::SpecContext;
-use super::parser::{DeclaratorName, ParseError, ParseResult, Parser};
+use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
@@ -564,11 +564,11 @@ impl Parser<'_> {
                 }
 
                 // VLAs are not allowed in struct members
-                let (name, typ, vla_sizes, _func_params) =
-                    self.parse_declarator(member_base_type_id, DeclaratorName::Required)?;
+                let ParsedDeclarator { name, typ, vla, .. } =
+                    self.parse_declarator(member_base_type_id, DeclaratorContext::Declaration)?;
 
                 // C99 6.7.5.2: VLAs cannot be members of structures or unions
-                if !vla_sizes.is_empty() {
+                if !vla.is_empty() {
                     return Err(ParseError::new(
                         "variable length arrays cannot be structure or union members".to_string(),
                         self.current_pos(),

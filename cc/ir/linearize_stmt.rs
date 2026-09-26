@@ -796,11 +796,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         });
 
         // Add as a global - static locals always have internal linkage
-        // Check for thread-local storage
-        let modifiers = self.types.modifiers(declarator.typ);
         // Const at the object level for section selection (see linearize_init.rs)
         let is_const = super::linearize_init::is_const_object_type(self.types, declarator.typ);
-        if modifiers.contains(TypeModifiers::THREAD_LOCAL) {
+        // Thread-local storage is the declaration's storage class, not
+        // anything about the type: a structure's type is its tag's and never
+        // carries one, so asking the type made `static _Thread_local struct S
+        // s;` one object shared by every thread.
+        if declarator
+            .storage_class
+            .contains(TypeModifiers::THREAD_LOCAL)
+        {
             self.module.add_global_tls_aligned(
                 &global_name,
                 declarator.typ,

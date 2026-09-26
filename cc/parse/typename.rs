@@ -13,7 +13,7 @@
 
 use super::ast::Expr;
 use super::declaration::SpecContext;
-use super::parser::{DeclaratorName, ParseError, ParseResult, Parser};
+use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::strings::StringId;
 use crate::token::lexer::TokenType;
 use crate::types::TypeId;
@@ -129,8 +129,8 @@ impl Parser<'_> {
         };
 
         let declarator_start = self.pos;
-        match self.parse_declarator(base, DeclaratorName::Optional) {
-            Ok((name, typ, vla, _params)) => {
+        match self.parse_declarator(base, DeclaratorContext::TypeName) {
+            Ok(ParsedDeclarator { name, typ, vla, .. }) => {
                 // An abstract declarator names nothing. gcc's wording, and the
                 // type-name is kept: one fault, one diagnostic.
                 if name != StringId::EMPTY {

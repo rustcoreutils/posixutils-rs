@@ -10,8 +10,11 @@
 // checking and redeclaration compatibility
 //
 
-use super::ast::{Declaration, Designator, Expr, ExprKind, InitDeclarator, InitElement, MemEffect};
-use super::parser::{DeclaratorName, ParseError, ParseResult, Parser};
+use super::ast::{
+    Declaration, Designator, Expr, ExprKind, ExternalDecl, InitDeclarator, InitElement, MemEffect,
+};
+use super::bind::DeclScope;
+use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind};
@@ -254,16 +257,24 @@ const SIZE_SIGN_COMPLEX: TypeModifiers = TypeModifiers::SIGNED
     .union(TypeModifiers::COMPLEX);
 
 impl Parser<'_> {
-    /// Parse a declaration and bind variables to symbol table
-    ///
-    /// Binds each declared variable to the symbol table immediately during
-    /// parsing, so the symbol is available for subsequent references.
-    ///
-    /// If `forbid_storage_class` is true, emits an error if the declaration
-    /// contains storage class specifiers (static, extern). This is used for
-    /// for-loop init declarations per C99 6.8.5.3.
+    /// Parse a block-scope declaration and bind every name it declares.
     pub(super) fn parse_declaration_and_bind(&mut self) -> ParseResult<Declaration> {
-        self.parse_declaration_and_bind_impl(false)
+        self.parse_block_declaration(false)
+    }
+
+    /// Parse the declaration in the first clause of a `for`, which may not
+    /// name a storage class but `auto` or `register` (C17 6.8.5p3).
+    pub(super) fn parse_for_init_declaration_and_bind(&mut self) -> ParseResult<Declaration> {
+        self.parse_block_declaration(true)
+    }
+
+    fn parse_block_declaration(&mut self, for_init: bool) -> ParseResult<Declaration> {
+        match self.parse_declaration(DeclScope::Block { for_init })? {
+            ExternalDecl::Declaration(decl) => Ok(decl),
+            ExternalDecl::FunctionDef(_) => {
+                unreachable!("a function definition is recognised only at file scope")
+            }
+        }
     }
 
     /// The element count an array takes from a string-literal initializer:
@@ -620,308 +631,6 @@ impl Parser<'_> {
         } else {
             (max_index + 1) as usize
         }
-    }
-
-    /// Parse a for-init declaration and bind variables to symbol table
-    ///
-    /// Same as `parse_declaration_and_bind()` but rejects storage class specifiers.
-    pub(super) fn parse_for_init_declaration_and_bind(&mut self) -> ParseResult<Declaration> {
-        self.parse_declaration_and_bind_impl(true)
-    }
-
-    /// Implementation of declaration parsing with optional storage class check
-    fn parse_declaration_and_bind_impl(
-        &mut self,
-        forbid_storage_class: bool,
-    ) -> ParseResult<Declaration> {
-        self.reset_pending_declaration_state();
-        // Check for _Static_assert first (C11)
-        if self.is_static_assert() {
-            self.parse_static_assert()?;
-            // Return empty declaration - static_assert produces nothing
-            return Ok(Declaration {
-                declarators: vec![],
-            });
-        }
-
-        // Parse type specifiers
-        let decl_pos = self.current_pos();
-        let specs = self.parse_declaration_specifiers(SpecContext::Declaration)?;
-        let base_type = &specs.ty;
-        // A declaration that stops right here declares nothing, and that --
-        // not a missing type specifier -- is what to report. The `;` arms
-        // below do it.
-        if !self.is_special(b';') {
-            self.check_implicit_int(specs.explicit, decl_pos);
-        }
-        // Skip __attribute__ between type and declarator (GCC extension)
-        self.skip_extensions();
-
-        // Check for forbidden storage class specifiers in for-init context
-        if forbid_storage_class {
-            if base_type.modifiers.contains(TypeModifiers::STATIC) {
-                return Err(ParseError::new(
-                    "declaration of static variable in for loop initial declaration",
-                    self.current_pos(),
-                ));
-            }
-            if base_type.modifiers.contains(TypeModifiers::EXTERN) {
-                return Err(ParseError::new(
-                    "declaration of extern variable in for loop initial declaration",
-                    self.current_pos(),
-                ));
-            }
-            if base_type.modifiers.contains(TypeModifiers::THREAD_LOCAL) {
-                return Err(ParseError::new(
-                    "declaration of thread-local variable in for loop initial declaration",
-                    self.current_pos(),
-                ));
-            }
-        }
-
-        // C11 6.7.1p2: _Thread_local shall not appear in a declaration with auto or register
-        if base_type.modifiers.contains(TypeModifiers::THREAD_LOCAL) {
-            if base_type.modifiers.contains(TypeModifiers::AUTO) {
-                return Err(ParseError::new(
-                    "_Thread_local cannot be combined with auto",
-                    self.current_pos(),
-                ));
-            }
-            if base_type.modifiers.contains(TypeModifiers::REGISTER) {
-                return Err(ParseError::new(
-                    "_Thread_local cannot be combined with register",
-                    self.current_pos(),
-                ));
-            }
-        }
-
-        // Check modifiers from the specifier before interning (storage class is not part of type)
-        let is_typedef = base_type.modifiers.contains(TypeModifiers::TYPEDEF);
-        // C11 6.7.5p2 -- both facts are already in the specifier modifiers.
-        if is_typedef {
-            self.reject_alignas_in("a typedef");
-        } else if base_type.modifiers.contains(TypeModifiers::REGISTER) {
-            self.reject_alignas_in("an object with register storage");
-        }
-        // For struct/union types with tags, use existing TypeId to preserve forward declarations
-        let base_type_id = self.intern_type_with_tag(base_type);
-        let spec_attrs = self.specifier_attrs();
-
-        // Parse declarators
-        let mut declarators = Vec::new();
-        let spec_dims = self.bind_specifier_extents(
-            specs.vm_dims.clone(),
-            base_type_id,
-            decl_pos,
-            &mut declarators,
-        );
-
-        // Check for struct/union/enum-only declaration (no declarators)
-        // e.g., "struct point { int x; int y; };"
-        if self.is_special(b';') {
-            self.check_declares_something(decl_pos, base_type);
-        } else {
-            loop {
-                let decl_pos = self.current_pos();
-                let (name, mut typ, mut vla_sizes, _func_params) =
-                    self.parse_declarator(base_type_id, DeclaratorName::Required)?;
-                // C11 6.7.5p2: not on a function. A pointer to function is an
-                // object and stays legal, so this asks the finished type.
-                if self.types.kind(typ) == TypeKind::Function {
-                    self.reject_alignas_in("a function");
-                }
-                // A variably modified typedef, or `typeof(int[n])`, supplies
-                // the extents of the levels it contributed. The declarator's
-                // own `[n]` levels, if it wrote any, are innermost-of-the-outer
-                // and come first -- the same ordering `try_parse_type_name_vm`
-                // applies to a type-name's declarator and specifier levels.
-                vla_sizes.extend(spec_dims.iter().cloned());
-                // Skip GCC extensions like __asm("...") or __attribute__((...))
-                self.skip_extensions_after_declarator();
-
-                // Check if we have a name (needed for symbol binding)
-                let has_name = !self.str(name).is_empty();
-
-                // Validate explicit alignment (C11 6.7.5: >= natural alignment)
-                typ = self.apply_pending_type_attrs(typ);
-                if has_name && !is_typedef && self.types.kind(typ) == TypeKind::Function {
-                    self.accumulate_fn_attrs(name);
-                }
-                let validated_align = self.validated_explicit_align(typ)?;
-
-                // Bind variable to symbol table BEFORE parsing initializer.
-                // This ensures the variable is in scope for sizeof(*var) in initializers.
-                // Per C99 6.2.1p7: "Any other identifier has scope that begins just
-                // after the completion of its declarator."
-                let mut symbol_id: Option<SymbolId> = None;
-                if has_name && !is_typedef {
-                    // C17 6.2.7p4: two declarations of one object with linkage
-                    // describe it by their composite type.
-                    typ = self.composite_with_prior_declaration(name, typ, base_type.modifiers);
-                    self.check_redeclaration(name, typ, decl_pos);
-                    let sym = self
-                        .declared_symbol(name, typ, validated_align)
-                        .with_variably_modified_array(!vla_sizes.is_empty());
-                    if let Ok(id) = self.symbols.declare(sym) {
-                        symbol_id = Some(id);
-                    }
-                }
-
-                let init = if self.is_special(b'=') {
-                    if is_typedef {
-                        return Err(ParseError::new(
-                            "typedef cannot have initializer",
-                            self.current_pos(),
-                        ));
-                    }
-                    self.advance();
-                    Some(self.parse_initializer()?)
-                } else {
-                    None
-                };
-
-                // 6.7p7: the object needs a size here, and unlike at file
-                // scope nothing later can supply one -- a tag completed further
-                // down the block is a different declaration. An `extern`
-                // declaration defines nothing and is exempt, and so does a
-                // `typedef`, which declares no object at all: without that,
-                // `typedef struct Incomplete T;` at block scope was rejected
-                // although it names a type nobody has asked to size. The
-                // file-scope twin has had the guard all along.
-                if !is_typedef
-                    && !base_type.modifiers.contains(TypeModifiers::EXTERN)
-                    && !self.types.is_composite_complete(typ)
-                {
-                    let named = self.types.format_type(typ, Some(self.idents));
-                    diag::error_args(
-                        self.current_pos(),
-                        "storage size of an object of type '{0}' is not known",
-                        &[&named],
-                    );
-                }
-
-                // For incomplete array types, infer size from initializer
-                if let Some(ref init_expr) = init {
-                    // 6.7.9p5: an identifier declared `extern` at block scope
-                    // has linkage, so it refers to a definition elsewhere and
-                    // cannot carry one here. At *file* scope the same spelling
-                    // is a definition with external linkage, which gcc only
-                    // warns about -- hence the scope test.
-                    if base_type.modifiers.contains(TypeModifiers::EXTERN) {
-                        diag::error(
-                            init_expr.pos,
-                            &gettext("'extern' variable has an initializer"),
-                        );
-                    }
-                    let old_type = typ;
-                    typ = self.infer_array_size_from_init(typ, init_expr);
-                    self.check_excess_initializers(typ, init_expr);
-                    self.check_initializer_types(typ, init_expr);
-
-                    // If the type changed (array size was inferred), update the symbol's type
-                    // This is needed because the symbol was already added before parsing the initializer
-                    if typ != old_type {
-                        if let Some(sym_id) = symbol_id {
-                            self.symbols.get_mut(sym_id).typ = typ;
-                        }
-                    }
-                }
-
-                // Bind typedef to symbol table (after parsing initializer, which
-                // is forbidden for typedefs anyway)
-                if has_name && is_typedef {
-                    // C17 6.7.7p3 admits a typedef of a variably modified type
-                    // only at block scope, and this path is only ever reached
-                    // from one -- `parse_block_items` and a `for`-init are its
-                    // sole callers. The file-scope spelling is refused by the
-                    // declarator itself, with "variable length arrays cannot
-                    // have file scope", before it could arrive here.
-                    // A mode replaces the type; alignment then attaches to
-                    // whatever the type ended up being.
-                    typ = self.apply_pending_type_attrs(typ);
-                    typ = self.align_typedef_type(typ, validated_align);
-                    self.check_typedef_redefinition(name, typ, decl_pos);
-                    let sym = Symbol::typedef(name, typ, self.symbols.depth());
-                    if let Ok(id) = self.symbols.declare(sym) {
-                        symbol_id = Some(id);
-                        // Remember how many extents this name carries, so a
-                        // use can name each of them. They cannot be recovered
-                        // from the type: `int[n]`, `int[m]` and `int[]` all
-                        // intern to one `TypeId`.
-                        if !vla_sizes.is_empty() {
-                            self.vm_typedefs.insert(id, vla_sizes.len() as u32);
-                        }
-                    }
-                }
-
-                // Only add declarator if it has a symbol (named declaration)
-                // Nameless declarators like "int;" are allowed but produce no binding
-                if let Some(symbol) = symbol_id {
-                    // Extract storage class specifiers from base_type modifiers
-                    let storage_class_mask = TypeModifiers::EXTERN
-                        | TypeModifiers::STATIC
-                        | TypeModifiers::THREAD_LOCAL
-                        | TypeModifiers::TYPEDEF
-                        | TypeModifiers::AUTO
-                        | TypeModifiers::REGISTER;
-                    let storage_class = base_type.modifiers & storage_class_mask;
-                    // Everything declared here has automatic storage duration
-                    // unless a storage class says otherwise: this function is
-                    // only ever reached from `parse_block_items` and a
-                    // `for`-init, both of which are inside a scope. Checked
-                    // after the initializer, because that is what can still
-                    // infer the extent of `char a[] = { .. }`.
-                    //
-                    // `register` is deliberately not excluded -- a `register`
-                    // array still has automatic storage duration. A VLA has no
-                    // static extent to measure, and a function is not an
-                    // object.
-                    const NO_AUTO_DURATION: TypeModifiers = TypeModifiers::STATIC
-                        .union(TypeModifiers::EXTERN)
-                        .union(TypeModifiers::THREAD_LOCAL)
-                        .union(TypeModifiers::TYPEDEF);
-                    if !storage_class.intersects(NO_AUTO_DURATION)
-                        && vla_sizes.is_empty()
-                        && self.types.kind(typ) != TypeKind::Function
-                    {
-                        self.check_stack_object_size(typ, decl_pos, "an automatic object")?;
-                    }
-                    declarators.push(InitDeclarator {
-                        symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
-                        fn_effect: self.take_pending_fn_effect(),
-                        symbol,
-                        typ,
-                        storage_class,
-                        init,
-                        vla_sizes,
-                        explicit_align: validated_align,
-                        pos: decl_pos,
-                    });
-                }
-
-                if self.is_special(b',') {
-                    self.advance();
-                    self.begin_declarator(&spec_attrs);
-                    // An attribute may come before the next declarator, where
-                    // it belongs to that declarator. See the same call in
-                    // `parse_remaining_declarators`.
-                    self.skip_extensions_after_declarator();
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Clear pending alignment after declaration
-        self.pending_alignas = None;
-        self.pending_alignas_kw = None;
-        // A mode that no declarator consumed belongs to no later declaration:
-        // leaving it set applied it to whatever came next.
-        self.pending_mode = None;
-        self.pending_transparent_union = None;
-        self.expect_special(b';')?;
-
-        Ok(Declaration { declarators })
     }
 }
 
@@ -1467,7 +1176,7 @@ impl Parser<'_> {
     ///
     /// Extents that already name evaluated ones -- a typedef name, or `typeof`
     /// of one -- are answered as they are.
-    fn bind_specifier_extents(
+    pub(super) fn bind_specifier_extents(
         &mut self,
         dims: Vec<Expr>,
         spec_type: TypeId,

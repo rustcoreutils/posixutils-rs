@@ -334,6 +334,8 @@ impl AttributeList {
             artificial: self.has_attr("artificial"),
             effect: self.mem_effect(),
             align: self.get_alignment().filter(|n| n.is_power_of_two()),
+            noreturn: self.has_noreturn(),
+            calling_conv: self.calling_conv(),
         }
     }
 

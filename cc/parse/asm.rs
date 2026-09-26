@@ -112,7 +112,21 @@ impl Parser<'_> {
             sym.has_extern_decl |= self.declared_extern_fns.contains(&name);
             sym.has_non_inline_decl |= self.declared_non_inline_fns.contains(&name);
         }
+        self.settle_asm_label(name);
+    }
 
+    /// Give the symbol now bound to `name` its asm label: the one this
+    /// declaration wrote, which is then recorded for every later declaration
+    /// of the name, or else the one an earlier declaration wrote.
+    ///
+    /// Asked of every declaration with linkage, at block scope too. C99
+    /// 6.7.4p7 asks the *file-scope* declarations whether a function is
+    /// `inline` or `extern`, so a block-scope one leaves those facts alone --
+    /// but it names the same object or function, under the same assembler
+    /// name: `extern int x __asm__("y");` inside a function reads `y`, and a
+    /// block-scope redeclaration of a labelled function still calls the
+    /// label.
+    pub(super) fn settle_asm_label(&mut self, name: StringId) {
         let label = match self.pending_asm_label.take() {
             Some(label) => {
                 self.declared_asm_labels.insert(name, label.clone());

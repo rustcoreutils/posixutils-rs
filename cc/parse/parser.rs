@@ -82,18 +82,64 @@ pub(crate) struct ParameterList {
     pub prototyped: bool,
 }
 
-/// Whether the declarator being parsed must name something.
+/// Where a declarator is written, which settles what it may contain.
 ///
 /// C17 spells the two grammars separately -- `declarator` (6.7.6) always has
-/// an identifier, `abstract-declarator` (6.7.7) never does -- and only the
-/// caller knows which one it asked for. A parameter may be either, so it asks
-/// for `Optional`.
+/// an identifier, `abstract-declarator` (6.7.7) never does -- and 6.7.6.2p1
+/// admits `static`, type qualifiers and `[*]` in an array declarator only in
+/// a function parameter. Only the caller knows which of these it asked for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum DeclaratorName {
-    /// A declaration: the identifier is what is being declared.
-    Required,
-    /// A type-name or a parameter, where the identifier may be absent.
-    Optional,
+pub(crate) enum DeclaratorContext {
+    /// An ordinary or member declaration: the identifier is what is being
+    /// declared, and the array declarators are plain.
+    Declaration,
+    /// A parameter declaration in a K&R declaration list. Named, and a
+    /// parameter, so its array declarator may carry `static` and qualifiers
+    /// (6.7.6.3p7) -- but not in prototype scope, so no `[*]` (6.7.6.2p4).
+    OldStyleParameter,
+    /// A parameter in a prototype: the identifier may be absent, and the
+    /// array declarator takes everything 6.7.6.2p1 allows.
+    Parameter,
+    /// A type-name: an abstract declarator with plain array declarators.
+    TypeName,
+}
+
+impl DeclaratorContext {
+    /// Whether the declarator must name what it declares.
+    pub(crate) fn requires_name(self) -> bool {
+        matches!(self, Self::Declaration | Self::OldStyleParameter)
+    }
+
+    /// Whether an array declarator may carry `static` or type qualifiers.
+    pub(crate) fn is_parameter(self) -> bool {
+        matches!(self, Self::OldStyleParameter | Self::Parameter)
+    }
+
+    /// Whether `[*]` may appear: only in function prototype scope.
+    pub(crate) fn is_prototype_scope(self) -> bool {
+        self == Self::Parameter
+    }
+}
+
+/// A parsed declarator: what it names and the type it derives.
+pub(crate) struct ParsedDeclarator {
+    /// The declared identifier; `EMPTY` for an abstract declarator.
+    pub(crate) name: StringId,
+    /// Where the declarator starts, which is where its diagnostics point.
+    pub(crate) pos: Position,
+    /// The derived type. A function declarator's *return* type carries the
+    /// specifiers' storage class, as any other derived type does.
+    pub(crate) typ: TypeId,
+    /// The run-time extents of its variably modified array levels,
+    /// outermost-first -- the grouped inner declarator's before the outer
+    /// suffix's, since the inner one is the outer level.
+    pub(crate) vla: Vec<Expr>,
+    /// Where the first run-time extent is written, for the diagnostic that
+    /// refuses one where it may not appear.
+    pub(crate) vla_pos: Option<Position>,
+    /// A function declarator's parameters, with their names, for a
+    /// definition to bind.
+    pub(crate) params: Option<Vec<RawParam>>,
 }
 
 // Parser
@@ -655,14 +701,6 @@ impl Parser<'_> {
         crate::constexpr::eval(self, ConstScope::Standard, expr)
     }
 
-    /// Build the symbol for a declared name, choosing its kind from its type.
-    ///
-    /// A declarator whose type is a function declares a *function*, whatever
-    /// company it keeps -- `int f(int), g(int);` at file scope, or
-    /// `void h(void) { int g(int); }` inside a block. `is_lvalue` asks the
-    /// symbol's *kind* rather than its type, so a function bound as a variable
-    /// would be assignable. `_Alignas` does not apply to a function, so an
-    /// alignment is dropped here rather than recorded against one.
     /// The composite type of this declaration and a visible prior one of the
     /// same object (C17 6.2.7p4).
     ///
@@ -705,6 +743,14 @@ impl Parser<'_> {
         }
     }
 
+    /// Build the symbol for a declared name, choosing its kind from its type.
+    ///
+    /// A declarator whose type is a function declares a *function*, whatever
+    /// company it keeps -- `int f(int), g(int);` at file scope, or
+    /// `void h(void) { int g(int); }` inside a block. `is_lvalue` asks the
+    /// symbol's *kind* rather than its type, so a function bound as a variable
+    /// would be assignable. `_Alignas` does not apply to a function, so an
+    /// alignment is dropped here rather than recorded against one.
     pub(super) fn declared_symbol(
         &self,
         name: StringId,
@@ -717,11 +763,6 @@ impl Parser<'_> {
         Symbol::variable(name, typ, self.symbols.depth()).with_align(align)
     }
 
-    /// Validate explicit alignment against natural alignment (C11 6.7.5)
-    ///
-    /// Returns the validated explicit alignment, or error if alignment is weaker than natural.
-    /// Returns None if no explicit alignment was specified.
-    /// Also propagates alignment from typedef's explicit_align.
     /// C11 6.7.5p2: an alignment specifier shall not appear in the declaration
     /// of a typedef, a bit-field, a function, a parameter, or an object with
     /// `register` storage.
@@ -763,6 +804,11 @@ impl Parser<'_> {
         self.types.intern(aligned)
     }
 
+    /// Validate explicit alignment against natural alignment (C11 6.7.5)
+    ///
+    /// Returns the validated explicit alignment, or error if alignment is weaker than natural.
+    /// Returns None if no explicit alignment was specified.
+    /// Also propagates alignment from typedef's explicit_align.
     pub(super) fn validated_explicit_align(&mut self, typ: TypeId) -> ParseResult<Option<u32>> {
         // Combine pending_alignas (from _Alignas / __attribute__) with type's explicit_align
         let type_align = self.types.get(typ).explicit_align;

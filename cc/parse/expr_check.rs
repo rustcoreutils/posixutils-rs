@@ -558,6 +558,9 @@ impl Parser<'_> {
             // A GNU statement expression is an lvalue exactly when the
             // expression it ends with is one, which is what gcc documents.
             ExprKind::StmtExpr { result, .. } => self.is_lvalue(result),
+            // A compound literal stays one when its type-name carried
+            // extents.
+            ExprKind::VmTypeName { expr, .. } => self.is_lvalue(expr),
             _ => false,
         }
     }

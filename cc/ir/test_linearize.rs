@@ -6548,17 +6548,22 @@ fn test_vm_index_base_counts_a_deref_as_an_index_step() {
     assert_eq!(not_an_object.vm_index_base(), None);
     assert_eq!(index(not_an_object).vm_index_base(), None);
 
-    // A unary operator that is not a dereference is not an index step.
-    let addr_of = Expr {
+    // `&` steps back out: `&a` is one step above `a`, and `&*a` is `a`.
+    let addr_of = |base: Expr| Expr {
         kind: ExprKind::Unary {
             op: UnaryOp::AddrOf,
-            operand: Box::new(ident()),
+            operand: Box::new(base),
         },
         typ: Some(int_t),
         pos: test_pos(),
         bitfield_bits: None,
     };
-    assert_eq!(addr_of.vm_index_base(), None);
+    assert_eq!(addr_of(ident()).vm_index_base(), Some((sym, -1)));
+    assert_eq!(addr_of(deref(ident())).vm_index_base(), Some((sym, 0)));
+    assert_eq!(
+        index(addr_of(index(ident()))).vm_index_base(),
+        Some((sym, 1))
+    );
 
     // Adding to a pointer does not change what it points at, so `p + 2` sits
     // at the same depth as `p` -- from either side, and for `-` as well.

@@ -35,7 +35,13 @@ impl Parser<'_> {
 
     /// Parse a type name (required, returns error if not a type)
     pub(super) fn parse_type_name(&mut self) -> ParseResult<TypeId> {
-        self.try_parse_type_name()
+        self.parse_type_name_vm().map(|(typ, _dims)| typ)
+    }
+
+    /// A required type name, with the size expressions of its variably
+    /// modified levels ([`Self::try_parse_type_name_vm`]).
+    pub(super) fn parse_type_name_vm(&mut self) -> ParseResult<(TypeId, Vec<Expr>)> {
+        self.try_parse_type_name_vm()
             .ok_or_else(|| ParseError::new("expected type name".to_string(), self.current_pos()))
     }
 
@@ -61,11 +67,12 @@ impl Parser<'_> {
     /// A type-name together with the size expressions of its variably-modified
     /// array levels, outermost-first.
     ///
-    /// Only `sizeof` and `typeof` need the expressions. C17 6.5.3.4p2
-    /// evaluates the operand of `sizeof` when the type is a variable length
-    /// array, and the size cannot be recovered afterwards: `int[n]`, `int[m]`
-    /// and `int[]` all intern to one `TypeId`. Every other caller wants the
-    /// type alone and uses [`Self::try_parse_type_name`].
+    /// The size cannot be recovered afterwards: `int[n]`, `int[m]` and
+    /// `int[]` all intern to one `TypeId`. So whatever evaluates or measures
+    /// the type keeps them -- `sizeof`, `typeof`, and a cast, compound literal
+    /// or `va_arg`, whose value carries them
+    /// ([`Self::with_type_name_extents`]); a caller that wants the type alone
+    /// uses [`Self::try_parse_type_name`].
     pub(crate) fn try_parse_type_name_vm(&mut self) -> Option<(TypeId, Vec<Expr>)> {
         if !self.starts_type_name() {
             return None;

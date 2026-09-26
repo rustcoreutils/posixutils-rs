@@ -14491,6 +14491,114 @@ int main(void)
     run_everywhere("typeof_vm_object", src);
 }
 
+/// A type-name of variably modified type -- in a cast, a compound literal or
+/// `va_arg` -- carries its extents to the value it yields. The type alone is
+/// `int (*)[]`, so `(int (*)[n])buf + 1` stepped by 0, `sizeof *(int (*)[n])buf`
+/// was 0, and the size expressions were never evaluated at all (C17 6.8p4).
+/// `&` steps back out of an index chain, and the `[]` of `int (*)[][m]` takes
+/// no size expression -- declared or cast, `m` went to it and the rows were 0.
+#[test]
+fn codegen_type_name_of_variably_modified_type_carries_its_extents() {
+    let src = r#"
+#include <stdarg.h>
+
+#define STEP(p) ((char *)((p) + 1) - (char *)(p))
+
+static long through_va_arg(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    char *base = va_arg(ap, char *);
+    long r = (char *)(va_arg(ap, int (*)[n]) + 1) - base;
+    va_end(ap);
+    return r;
+}
+
+static int f(int n, int m)
+{
+    int buf[60];
+    for (int i = 0; i < 60; i++)
+        buf[i] = i;
+    typedef int T[n];
+    int v[n];
+    const long row = n * (long)sizeof(int);
+
+    /* A cast's extents step the pointer it yields... */
+    if (STEP((int (*)[n])buf) != row) return 1;
+    if ((char *)(1 + (int (*)[n])buf) - (char *)buf != row) return 2;
+    if ((int (*)[n])buf + 3 - (int (*)[n])buf != 3) return 3;
+    if ((char *)&((int (*)[n])buf)[2] - (char *)buf != 2 * row) return 4;
+    if (((int (*)[n])buf)[2][3] != 13) return 5;
+    /* ...size what it points at... */
+    if (sizeof *(int (*)[n])buf != row) return 6;
+    if (sizeof((int (*)[n][m])buf)[0][1] != m * sizeof(int)) return 7;
+    if ((*((int (*)[n][m])buf + 1))[1][2] != 20) return 8;
+    /* ...whether written out, through a typedef, or through typeof. */
+    if (STEP((T *)buf) != row) return 9;
+    if (STEP((typeof(v) *)buf) != row) return 10;
+    if (STEP((typeof((int (*)[n])buf))buf) != row) return 11;
+    /* The size expressions are evaluated once, where the cast is. */
+    int k = n;
+    long s = (char *)((int (*)[k++])buf + 1) - (char *)buf;
+    if (s != row || k != n + 1) return 12;
+    /* An initialized pointer takes its own extents, as before. */
+    int (*q)[n] = (int (*)[n])buf;
+    q++;
+    if ((char *)q - (char *)buf != row) return 13;
+    /* A compound literal of pointer-to-VLA type is sized the same way. */
+    if ((char *)&(int (*)[n]){ (void *)buf }[1] - (char *)buf != row) return 14;
+    if (through_va_arg(n, buf, buf) != row) return 15;
+    /* `sizeof` of a pointer type evaluates nothing, as gcc has it. */
+    int b = 0;
+    if (sizeof(int (*)[b++]) != sizeof(void *) || b != 0) return 16;
+    /* `&` steps back out: `&*p` is `p`, and `&v` points at all of `v`. */
+    if (STEP(&*(int (*)[n])buf) != row) return 18;
+    if (STEP(&v) != row || sizeof *&v != row) return 19;
+    typeof(&v) pv = &v;
+    if (STEP(pv) != row || (char *)&(&v)[1] - (char *)v != row) return 20;
+    /* An incomplete outermost level takes no size expression: `m` sizes
+       the rows of `int (*)[][m]`, not the `[]`. */
+    int (*inc)[][m] = (int (*)[][m])buf;
+    if ((*inc)[2][1] != 7 || ((*(int (*)[][m])buf))[2][1] != 7) return 21;
+    if (sizeof (*inc)[0] != m * sizeof(int)) return 22;
+    typeof(inc) inc2 = inc;
+    if ((*inc2)[3][2] != 11) return 23;
+    /* Each evaluation of the cast reads the extent afresh. */
+    for (int w = 1; w <= 3; w++)
+        if (STEP((int (*)[w])buf) != w * (long)sizeof(int)) return 17;
+    return 0;
+}
+
+int main(void)
+{
+    return f(5, 3);
+}
+"#;
+    run_everywhere("vm_type_name_extents", src);
+}
+
+/// `sizeof ( expression )` is `sizeof` of a unary expression, and the
+/// parenthesized expression is only its primary: `sizeof (a)[0]` measures
+/// `a[0]`. c17 stopped at the `)` and rejected the `[`.
+#[test]
+fn codegen_sizeof_parenthesized_operand_takes_postfix_operators() {
+    let src = r#"
+struct S { int x[3]; } s;
+int a[10];
+int *f(void) { return a; }
+int main(void)
+{
+    if (sizeof (a)[0] != sizeof(int)) return 1;
+    if (sizeof (s).x != 3 * sizeof(int)) return 2;
+    if (_Alignof (a)[0] != _Alignof(int)) return 3;
+    if (sizeof (f)() != sizeof(int *)) return 4;
+    if (sizeof (a) != 10 * sizeof(int)) return 5;
+    return 0;
+}
+"#;
+    run_everywhere("sizeof_paren_postfix", src);
+}
+
 /// A complex value, a complex cast, `__builtin_complex`, a `__sync` CAS and an
 /// atomic floating-point read-modify-write each need a temporary in memory.
 /// They were `alloca`s, which grow the stack on every evaluation and are

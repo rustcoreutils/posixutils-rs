@@ -20,6 +20,7 @@ use crate::parse::ast::{
     UnaryOp,
 };
 use crate::strings::StringId;
+use crate::symbol::SymbolId;
 use crate::types::TypeTable;
 
 /// A `return` whose value-ness does not match the function's type.
@@ -519,7 +520,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // This is the same shape as a variably-modified *parameter*,
             // which is adjusted to exactly this pointer type; see
             // `linearize_function`.
-            self.record_pointee_extents(declarator);
+            self.record_pointee_extents(declarator.symbol, declarator.typ, &declarator.vla_sizes);
 
             // If there's an initializer, emit Store(s)
             if let Some(init) = &declarator.init {
@@ -589,22 +590,55 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Record the extents of a pointer-to-VLA declarator's pointee on its
-    /// local, which is what one index step off the pointer has to advance
-    /// by. Nothing for a declarator with no size expressions.
-    fn record_pointee_extents(&mut self, declarator: &crate::parse::ast::InitDeclarator) {
-        if declarator.vla_sizes.is_empty() {
+    /// Record the extents of the pointee of `symbol`, a pointer to a VLA of
+    /// type `typ` sized by `vla_sizes`, on its local: what one index step off
+    /// the pointer has to advance by. Nothing when there are no size
+    /// expressions.
+    pub(crate) fn record_pointee_extents(
+        &mut self,
+        symbol: SymbolId,
+        typ: TypeId,
+        vla_sizes: &[Expr],
+    ) {
+        if vla_sizes.is_empty() {
             return;
         }
-        let Some(pointee) = self.types.base_type(declarator.typ) else {
+        let Some(pointee) = self.types.base_type(typ) else {
             return;
         };
-        let name = self.symbol_name(declarator.symbol);
-        let (dims, elem_type) = self.record_vm_extents(pointee, &declarator.vla_sizes, &name);
-        if let Some(info) = self.locals.get_mut(&declarator.symbol) {
+        let name = self.symbol_name(symbol);
+        let (dims, elem_type) = self.record_vm_extents(pointee, vla_sizes, &name);
+        if let Some(info) = self.locals.get_mut(&symbol) {
             info.vm_row_dims = dims;
             info.vla_elem_type = Some(elem_type);
         }
+    }
+
+    /// Evaluate the size expressions of a type-name's value
+    /// ([`ExprKind::VmTypeName`]) and record its extents under `symbol`, as
+    /// a declared pointer's are recorded under its name.
+    ///
+    /// The entry holds extents and nothing else -- no identifier names
+    /// `symbol`, so no slot is ever read through it.
+    pub(crate) fn record_type_name_extents(
+        &mut self,
+        symbol: SymbolId,
+        typ: TypeId,
+        dims: &[Expr],
+    ) {
+        self.insert_local(
+            symbol,
+            LocalVarInfo {
+                sym: PseudoId(u32::MAX),
+                typ,
+                vla_size_sym: None,
+                vla_outer_extent: None,
+                vla_elem_type: None,
+                vm_row_dims: vec![],
+                storage: crate::ir::linearize::Storage::InSlot,
+            },
+        );
+        self.record_pointee_extents(symbol, typ, dims);
     }
 
     /// Linearize a VLA (Variable Length Array) declaration
@@ -815,7 +849,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // A static pointer to a VLA -- the one variably modified type static
         // storage allows (C17 6.7.6.2p2) -- still steps by its pointee's
         // extents, evaluated each time the declaration is reached.
-        self.record_pointee_extents(declarator);
+        self.record_pointee_extents(declarator.symbol, declarator.typ, &declarator.vla_sizes);
 
         // Determine initializer (static locals are initialized at compile time)
         let init = declarator.init.as_ref().map_or(Initializer::None, |e| {
@@ -2067,6 +2101,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.expr_is_runtime(cond) || self.expr_is_runtime(else_expr)
             }
             ExprKind::Cast { expr: inner, .. } => self.expr_is_runtime(inner),
+            // Its size expressions are evaluated at run time.
+            ExprKind::VmTypeName { .. } => true,
 
             // `sizeof` of a variable length array type is the exception: it
             // does evaluate its operand, and is genuinely not an integer

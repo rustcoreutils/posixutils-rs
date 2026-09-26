@@ -1726,6 +1726,9 @@ impl<'a> Linearizer<'a> {
             // Reads a hidden local the typedef already stored: no side
             // effect, and re-reading it is what makes the extent stable.
             ExprKind::VmTypedefExtent(..) | ExprKind::VmObjectExtent(..) => true,
+            ExprKind::VmTypeName { dims, expr, .. } => {
+                dims.iter().all(|d| self.is_pure_expr(d)) && self.is_pure_expr(expr)
+            }
             // A label's address is a constant of the function.
             ExprKind::LabelAddr(_) => true,
             // The forwarding builtins read the caller's arguments and write
@@ -2041,6 +2044,12 @@ impl<'a> Linearizer<'a> {
     /// Linearize an expression as an lvalue (get its address)
     pub(crate) fn linearize_lvalue(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
+            // `&(int (*)[n]){ p }`: a compound literal is an lvalue, however
+            // its type was written.
+            ExprKind::VmTypeName { symbol, dims, expr } => {
+                self.record_type_name_extents(*symbol, self.expr_type(expr), dims);
+                self.linearize_lvalue(expr)
+            }
             ExprKind::Ident(symbol_id) => {
                 let name_str = self.symbol_name(*symbol_id);
                 // For local variables, emit SymAddr to get the stack address
@@ -2704,6 +2713,15 @@ impl<'a> Linearizer<'a> {
         let mut dims: Vec<VmDim> = Vec::new();
         let mut exprs = vm_exprs.iter();
         let mut elem_type = array_type;
+        // An unsized level with no expression is incomplete -- the `[]` of
+        // `int (*p)[][m]` -- and only the outermost may be (6.7.6.2p1), so
+        // the expressions belong to the innermost unsized levels. Handing
+        // them out from the outside gave `m` to the `[]` and left the row
+        // extent 0.
+        let mut incomplete = self
+            .types
+            .unsized_array_levels(array_type)
+            .saturating_sub(vm_exprs.len());
 
         while self.types.kind(elem_type) == TypeKind::Array {
             let level = elem_type;
@@ -2714,9 +2732,12 @@ impl<'a> Linearizer<'a> {
                 continue;
             }
 
-            let Some(size_expr) = exprs.next() else {
-                // An unspecified extent with no expression to evaluate, as in
-                // `int a[]`; the level contributes nothing measurable.
+            let next = if incomplete == 0 { exprs.next() } else { None };
+            let Some(size_expr) = next else {
+                // Nothing to evaluate and nothing measurable; the entry
+                // keeps every later level at its own index.
+                incomplete = incomplete.saturating_sub(1);
+                dims.push(VmDim::Const(0));
                 continue;
             };
 
@@ -3015,11 +3036,14 @@ impl<'a> Linearizer<'a> {
 
     /// Stride for one index step into `ptr_expr`, when what it denotes is a
     /// variably-modified array reached by indexing a local.
+    ///
+    /// One step spans the object one step further in, whether `ptr_expr` is
+    /// a pointer or an array that decays to one.
     fn vm_index_stride(&mut self, ptr_expr: &Expr) -> Option<PseudoId> {
         let (symbol_id, depth) = ptr_expr.vm_index_base()?;
-        let info = self.locals.get(&symbol_id).cloned()?;
+        let info = self.locals.get(&symbol_id)?;
         let elem = info.vla_elem_type?;
-        let dims = info.vm_row_dims.get(depth..)?.to_vec();
+        let dims = Self::vm_dims_at(info, depth + 1)?;
         self.vm_extent_size(&dims, elem)
     }
 
@@ -3041,36 +3065,44 @@ impl<'a> Linearizer<'a> {
     /// levels, or a pointer's pointee's -- the levels a declarator's size
     /// expressions describe.
     ///
-    /// None unless `expr` is rooted in a local whose declaration recorded
-    /// extents. `vm_row_dims` is what one index step off that local leaves,
-    /// so an array `d` steps in has `vm_row_dims[d - 1..]` and a pointer
-    /// `vm_row_dims[d..]`; the local itself, if it is the array, adds back the
-    /// outermost extent the steps never see.
+    /// None unless `expr` is rooted in a local -- or a type-name's value --
+    /// whose declaration recorded extents. A pointer's are those of what it
+    /// points at, one step further in than the pointer itself.
     fn vm_type_extents(&self, expr: &Expr) -> Option<(Vec<VmDim>, TypeId)> {
         let (symbol_id, depth) = expr.vm_index_base()?;
         let info = self.locals.get(&symbol_id)?;
         let elem = info.vla_elem_type?;
-        if self.types.kind(self.expr_type(expr)) != TypeKind::Array {
-            return Some((info.vm_row_dims.get(depth..)?.to_vec(), elem));
-        }
-        let dims = match depth.checked_sub(1) {
-            Some(from) => info.vm_row_dims.get(from..)?.to_vec(),
-            None => std::iter::once(info.vla_outer_extent?)
-                .chain(info.vm_row_dims.iter().copied())
-                .collect(),
-        };
+        let is_pointer = self.types.kind(self.expr_type(expr)) != TypeKind::Array;
+        let dims = Self::vm_dims_at(info, depth + isize::from(is_pointer))?;
         Some((dims, elem))
+    }
+
+    /// The extents of the object `level` index steps into the local `info`
+    /// describes. `vm_row_dims` is what one step leaves, so step `l` has
+    /// `vm_row_dims[l - 1..]`; step 0 is the local itself, which for a VLA
+    /// adds back the outermost extent no step sees.
+    fn vm_dims_at(info: &LocalVarInfo, level: isize) -> Option<Vec<VmDim>> {
+        match usize::try_from(level).ok()? {
+            0 => Some(
+                std::iter::once(info.vla_outer_extent?)
+                    .chain(info.vm_row_dims.iter().copied())
+                    .collect(),
+            ),
+            l => info.vm_row_dims.get(l - 1..).map(<[VmDim]>::to_vec),
+        }
     }
 
     /// Whether `sizeof` evaluates `inner`: C17 6.5.3.4p2 evaluates an
     /// operand of variable length array type. A bare identifier is left out,
     /// since evaluating one has no effect.
+    ///
+    /// Asked of the declarations, not of the extents recorded: an operand
+    /// rooted in a type-name's value records its extents only as it is
+    /// evaluated, so `sizeof *(int (*)[n])p` has none until it has been.
     fn sizeof_evaluates(&self, inner: &Expr) -> bool {
         !matches!(inner.kind, ExprKind::Ident(_))
             && self.types.kind(self.expr_type(inner)) == TypeKind::Array
-            && self
-                .vm_type_extents(inner)
-                .is_some_and(|(dims, _)| dims.iter().any(|d| matches!(d, VmDim::Sym(_))))
+            && crate::parse::ast::vm_extent_count(self.types, self.symbols, inner) > 0
     }
 
     /// Linearize an array index expression (e.g., arr[i])
@@ -6019,13 +6051,31 @@ impl<'a> Linearizer<'a> {
         self.load_vm_extent(dim)
     }
 
-    /// One variable extent of an object expression's type, read from the
-    /// hidden locals its object's declaration stored.
+    /// One extent of an object expression's type, read from the hidden
+    /// locals its object's declaration stored: that of its `level`-th unsized
+    /// array level, which is how [`crate::parse::ast::vm_extent_count`]
+    /// counts them. An incomplete `[]` among them reads as 0.
     fn linearize_vm_object_extent(&mut self, object: &Expr, level: u32) -> PseudoId {
-        let dim = self.vm_type_extents(object).and_then(|(dims, _)| {
-            dims.into_iter()
-                .filter(|d| matches!(d, VmDim::Sym(_)))
-                .nth(level as usize)
+        let typ = self.expr_type(object);
+        let array = match self.types.kind(typ) {
+            TypeKind::Pointer => self.types.base_type(typ).unwrap_or(typ),
+            _ => typ,
+        };
+        let mut unsized_at = Vec::new();
+        let mut cur = array;
+        while self.types.kind(cur) == TypeKind::Array {
+            unsized_at.push(self.types.get(cur).array_size.is_none());
+            cur = self.types.base_type(cur).unwrap_or(self.types.int_id);
+        }
+        let position = unsized_at
+            .iter()
+            .enumerate()
+            .filter(|(_, is_unsized)| **is_unsized)
+            .nth(level as usize)
+            .map(|(i, _)| i);
+        let dim = position.and_then(|i| {
+            self.vm_type_extents(object)
+                .and_then(|(dims, _)| dims.get(i).copied())
         });
         self.load_vm_extent(dim)
     }
@@ -6148,6 +6198,12 @@ impl<'a> Linearizer<'a> {
             // it, so later changes to what sized `v` do not reach it.
             ExprKind::VmObjectExtent(object, level) => {
                 self.linearize_vm_object_extent(object, *level)
+            }
+            // A value of variably modified type written as a type-name: its
+            // extents first, then the value.
+            ExprKind::VmTypeName { symbol, dims, expr } => {
+                self.record_type_name_extents(*symbol, self.expr_type(expr), dims);
+                self.linearize_expr(expr)
             }
 
             // `__builtin_add_overflow(a, b, res)` and its siblings.

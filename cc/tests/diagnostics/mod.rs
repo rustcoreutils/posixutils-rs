@@ -6842,6 +6842,56 @@ fn diagnostics_variably_modified_object_with_static_storage_or_linkage() {
     );
 }
 
+/// The constraints on a type-name of variably modified or non-scalar type:
+/// a compound literal may not be a VLA (C17 6.5.2.5p1), a cast names a scalar
+/// type (6.5.4p2), and a `_Generic` association no variably modified type
+/// (6.5.1.1p2). All three compiled silently -- `(int[n]){0}` as a one-element
+/// array, a cast to an array as its first element's address.
+#[test]
+fn diagnostics_type_name_constraints_on_variably_modified_and_array_types() {
+    for (name, src, expected) in [
+        (
+            "vla_compound_literal",
+            "int f(int n){ return (int[n]){0}[0]; }\n",
+            "compound literal has variable size",
+        ),
+        (
+            "vla_compound_literal_alignof",
+            "int f(int n){ return _Alignof((int[n]){0}); }\n",
+            "compound literal has variable size",
+        ),
+        (
+            "cast_to_vla",
+            "int f(int n, int *p){ return sizeof((int[n])p); }\n",
+            "cast specifies array type",
+        ),
+        (
+            "cast_to_array",
+            "int f(int *p){ return ((int[3])p)[0]; }\n",
+            "cast specifies array type",
+        ),
+        (
+            "cast_to_function",
+            "int g(void); int f(void){ return ((int(void))g)(); }\n",
+            "cast specifies function type",
+        ),
+        (
+            "generic_vm_association",
+            "int f(int n){ int (*a)[5] = 0; return _Generic(a, int (*)[n]: 1, default: 2); }\n",
+            "'_Generic' association has variable length type",
+        ),
+    ] {
+        compile_expect_error(name, src, expected);
+    }
+    // A pointer to a VLA may be a compound literal, and a union a cast.
+    compile_expect_ok(
+        "vm_type_names_accepted",
+        "union U { int i; float f; };\n\
+         int f(int n, void *p){ int (*q)[n] = (int (*)[n]){ p }; \
+         return (int)sizeof *q + (int)((union U)1).i; }\n",
+    );
+}
+
 /// C17 6.9.2p3: a tentative definition may be completed later in the unit, but
 /// something must complete it. Only the first plain declarator was recorded
 /// for the end-of-unit check, so the rest compiled with no storage at all.

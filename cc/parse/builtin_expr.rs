@@ -440,17 +440,18 @@ impl Parser<'_> {
                 self.expect_special(b'(')?;
                 let ap = self.parse_assignment_expr()?;
                 self.expect_special(b',')?;
-                // Second arg is a type
-                let arg_type = self.parse_type_name()?;
+                // Second arg is a type, whose extents the value carries.
+                let (arg_type, dims) = self.parse_type_name_vm()?;
                 self.expect_special(b')')?;
-                Ok(Self::typed_expr(
+                let value = Self::typed_expr(
                     ExprKind::VaArg {
                         ap: Box::new(ap),
                         arg_type,
                     },
                     arg_type,
                     token_pos,
-                ))
+                );
+                Ok(self.with_type_name_extents(dims, value))
             })()),
             crate::kw::BUILTIN_VA_END => Some((|| {
                 // __builtin_va_end(ap)

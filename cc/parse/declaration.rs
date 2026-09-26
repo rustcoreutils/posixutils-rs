@@ -1206,26 +1206,14 @@ impl Parser<'_> {
     /// modified: an array's variable levels, or a pointer's pointee's -- the
     /// levels a declarator's size expressions describe -- each read from what
     /// the declaration of the object `expr` is rooted in recorded
-    /// ([`ExprKind::VmObjectExtent`]). The type cannot carry them: `v`'s is
-    /// `int[]`, the same as an incomplete array's, so the object must have
-    /// been declared variably modified for a level to count.
+    /// ([`ExprKind::VmObjectExtent`]); see [`super::ast::vm_extent_count`].
     ///
     /// The operand is evaluated only when its type is variably modified (C23
     /// 6.7.3.6), which the first extent carries out; a bare identifier has
     /// nothing to evaluate.
     fn typeof_object_extents(&self, expr: &Expr) -> Vec<Expr> {
-        let Some(typ) = expr.typ else {
-            return Vec::new();
-        };
-        let array = match self.types.kind(typ) {
-            TypeKind::Pointer => self.types.base_type(typ),
-            _ => Some(typ),
-        };
-        let levels = array.map_or(0, |a| self.types.unsized_array_levels(a));
-        let variably_modified = expr
-            .vm_index_base()
-            .is_some_and(|(root, _)| self.symbols.get(root).array_is_variably_modified);
-        if levels == 0 || !variably_modified {
+        let levels = super::ast::vm_extent_count(self.types, self.symbols, expr);
+        if levels == 0 {
             return Vec::new();
         }
         let ulong = Some(self.types.ulong_id);

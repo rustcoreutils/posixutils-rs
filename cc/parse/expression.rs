@@ -14,7 +14,7 @@ use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::float::FloatVal;
 use crate::strings::StringId;
-use crate::symbol::Namespace;
+use crate::symbol::{Namespace, Symbol};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
 use crate::token::literal;
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
@@ -907,6 +907,39 @@ impl<'a> Parser<'a> {
         Ok(Some(expr))
     }
 
+    /// `value`, whose type was written as a type-name with the size
+    /// expressions `dims`, carrying them ([`ExprKind::VmTypeName`]) so that
+    /// what is rooted in it finds its extents -- and they are evaluated.
+    ///
+    /// Only a pointer's pointee has extents to record: a cast to an array
+    /// type is refused elsewhere, a compound literal may not be a VLA (C17
+    /// 6.5.2.5p1), and `sizeof(int (*)[n])`-style uses never get here.
+    pub(crate) fn with_type_name_extents(&mut self, dims: Vec<Expr>, value: Expr) -> Expr {
+        let Some(typ) = value.typ.filter(|_| !dims.is_empty()) else {
+            return value;
+        };
+        if self.types.kind(typ) != TypeKind::Pointer {
+            return value;
+        }
+        let mut sym = Symbol::typedef(StringId::EMPTY, typ, self.symbols.depth())
+            .with_variably_modified_array(true);
+        // Unnamed, so never a redefinition of another one in this scope.
+        sym.defined = false;
+        let Ok(symbol) = self.symbols.declare(sym) else {
+            return value;
+        };
+        let pos = value.pos;
+        Self::typed_expr(
+            ExprKind::VmTypeName {
+                symbol,
+                dims,
+                expr: Box::new(value),
+            },
+            typ,
+            pos,
+        )
+    }
+
     /// The `{ ... }` of a compound literal, with `typ` already parsed.
     ///
     /// Its own function because C99 6.5.2.5 makes a compound literal a
@@ -914,7 +947,26 @@ impl<'a> Parser<'a> {
     /// is not the only thing that can follow a parenthesised type name, and
     /// `sizeof (struct s){1, 2}` and `_Alignof` each committed to the type
     /// alone and left the braces behind.
+    ///
+    /// `dims` are the type-name's size expressions. A variable length array
+    /// may not be a compound literal (C17 6.5.2.5p1) -- `(int[n]){0}` was
+    /// sized by its one initializer instead -- but a pointer to one may, and
+    /// carries its extents ([`Self::with_type_name_extents`]).
     pub(crate) fn parse_compound_literal_tail(
+        &mut self,
+        typ: TypeId,
+        dims: Vec<Expr>,
+        paren_pos: Position,
+    ) -> ParseResult<Expr> {
+        if super::ast::sizeof_type_is_runtime(self.types, typ, &dims) {
+            diag::error(paren_pos, &gettext("compound literal has variable size"));
+        }
+        let literal = self.parse_compound_literal_body(typ, paren_pos)?;
+        Ok(self.with_type_name_extents(dims, literal))
+    }
+
+    /// [`Self::parse_compound_literal_tail`] from its `{`.
+    fn parse_compound_literal_body(
         &mut self,
         typ: TypeId,
         paren_pos: Position,
@@ -1006,7 +1058,7 @@ impl<'a> Parser<'a> {
                 // Committing to the type left the braces for whatever was
                 // parsing the enclosing construct.
                 if self.is_special(b'{') {
-                    let literal = self.parse_compound_literal_tail(typ, sizeof_pos)?;
+                    let literal = self.parse_compound_literal_tail(typ, dims, sizeof_pos)?;
                     let expr = self.parse_postfix_suffixes(literal)?;
                     self.check_sizeof_expr_operand(&expr, sizeof_pos);
                     return Ok(Expr::typed(
@@ -1023,9 +1075,10 @@ impl<'a> Parser<'a> {
                 ));
             }
 
-            // Not a type, parse as expression
-            let expr = self.parse_expression()?;
-            self.expect_special(b')')?;
+            // Not a type: the parenthesized expression is only the primary
+            // of the operand, a unary expression -- `sizeof (a)[0]` measures
+            // `a[0]`, and stopping at the `)` rejected the `[`.
+            let expr = self.parse_parenthesized_operand()?;
             self.check_sizeof_expr_operand(&expr, sizeof_pos);
             Ok(Expr::typed(
                 ExprKind::SizeofExpr(Box::new(expr)),
@@ -1108,35 +1161,42 @@ impl<'a> Parser<'a> {
 
             // Try to parse as type first.
             //
-            // Deliberately NOT the variably-modified form that `sizeof` two
-            // functions above uses. C17 6.5.3.4p3 makes the result of
-            // `_Alignof` an integer constant and does not evaluate the
-            // operand, and the alignment of `int[n]` is the alignment of
-            // `int`, which `TypeTable::alignment` already computes without
-            // ever reading an extent. Collecting the expressions here would
-            // either be dead weight in the AST or an evaluation the standard
-            // forbids.
-            if let Some(typ) = self.try_parse_type_name() {
+            // The size expressions are not the operand's: C17 6.5.3.4p3 makes
+            // the result of `_Alignof` an integer constant and does not
+            // evaluate the operand, and the alignment of `int[n]` is the
+            // alignment of `int`, which `TypeTable::alignment` computes
+            // without ever reading an extent. Only a compound literal, whose
+            // type-name they complete, keeps them.
+            if let Some((typ, dims)) = self.try_parse_type_name_vm() {
                 self.expect_special(b')')?;
                 // As in `sizeof`: a `{` here means the operand was a compound
                 // literal, which is a postfix expression and not the type.
                 if self.is_special(b'{') {
-                    let literal = self.parse_compound_literal_tail(typ, alignof_pos)?;
+                    let literal = self.parse_compound_literal_tail(typ, dims, alignof_pos)?;
                     let expr = self.parse_postfix_suffixes(literal)?;
                     return Ok(self.alignof_expr(expr, size_t, alignof_pos));
                 }
                 return Ok(Expr::typed(ExprKind::AlignofType(typ), size_t, alignof_pos));
             }
 
-            // Not a type, parse as expression
-            let expr = self.parse_expression()?;
-            self.expect_special(b')')?;
+            // Not a type, so an expression -- with its postfix operators, as
+            // in `sizeof`.
+            let expr = self.parse_parenthesized_operand()?;
             Ok(self.alignof_expr(expr, size_t, alignof_pos))
         } else {
             // _Alignof without parens - must be expression
             let expr = self.parse_unary_expr()?;
             Ok(self.alignof_expr(expr, size_t, alignof_pos))
         }
+    }
+
+    /// The rest of a `sizeof` or `_Alignof` operand that began with a `(` not
+    /// starting a type-name, the `(` already consumed: a parenthesized
+    /// expression and whatever postfix operators follow it.
+    fn parse_parenthesized_operand(&mut self) -> ParseResult<Expr> {
+        let expr = self.parse_expression()?;
+        self.expect_special(b')')?;
+        self.parse_postfix_suffixes(expr)
     }
 
     /// `_Alignof` applied to an expression rather than a type name.
@@ -1937,7 +1997,15 @@ impl<'a> Parser<'a> {
                     default_expr = Some(expr);
                 }
             } else {
-                let assoc_typ = self.parse_type_name()?;
+                let (assoc_typ, dims) = self.parse_type_name_vm()?;
+                // 6.5.1.1p2: an association names no variably modified type,
+                // whose compatibility would turn on a run-time extent.
+                if !dims.is_empty() {
+                    diag::error(
+                        assoc_pos,
+                        &gettext("'_Generic' association has variable length type"),
+                    );
+                }
                 self.expect_special(b':')?;
                 let expr = self.parse_assignment_expr()?;
 
@@ -2221,16 +2289,29 @@ impl<'a> Parser<'a> {
                     }
 
                     // Try to detect cast (type) or compound literal (type){...}
-                    if let Some(typ) = self.try_parse_type_name() {
+                    if let Some((typ, dims)) = self.try_parse_type_name_vm() {
                         self.expect_special(b')')?;
 
                         // Check for compound literal: (type){ ... }
                         if self.is_special(b'{') {
-                            return self.parse_compound_literal_tail(typ, paren_pos);
+                            return self.parse_compound_literal_tail(typ, dims, paren_pos);
                         }
 
                         // Regular cast expression
                         let expr = self.parse_unary_expr()?;
+                        // C17 6.5.4p2: a cast names a scalar type or `void`.
+                        // An array was converted as if it were its first
+                        // element's address. (A union stays: gcc casts to
+                        // one, and so does c17.)
+                        match self.types.kind(typ) {
+                            TypeKind::Array => {
+                                diag::error(paren_pos, &gettext("cast specifies array type"))
+                            }
+                            TypeKind::Function => {
+                                diag::error(paren_pos, &gettext("cast specifies function type"))
+                            }
+                            _ => {}
+                        }
                         // gcc reinterprets the bits between a vector and a
                         // same-sized scalar or vector; the array model would
                         // convert an address instead. A cast to `void` reads
@@ -2253,14 +2334,15 @@ impl<'a> Parser<'a> {
                             }
                         }
 
-                        return Ok(Self::typed_expr(
+                        let cast = Self::typed_expr(
                             ExprKind::Cast {
                                 cast_type: typ,
                                 expr: Box::new(expr),
                             },
                             typ,
                             paren_pos,
-                        ));
+                        );
+                        return Ok(self.with_type_name_extents(dims, cast));
                     }
 
                     // Regular parenthesized expression

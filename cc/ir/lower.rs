@@ -53,9 +53,7 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
 
                         // Skip copies from undef sources
                         let is_undef = func
-                            .pseudos
-                            .iter()
-                            .find(|p| p.id == source)
+                            .get_pseudo(source)
                             .is_some_and(|p| matches!(p.kind, PseudoKind::Undef));
 
                         if !is_undef {

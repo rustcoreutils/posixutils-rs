@@ -441,11 +441,19 @@ pub fn idf_compute(func: &Function, dom: &DomTree, alpha: &[BasicBlockId]) -> Ve
     idf
 }
 
+/// Visit the dominator subtree under `root` in pre-order -- a block, then
+/// each dominated child's subtree in order -- recording the J-edges that
+/// leave it at or above `curr_level`.
+///
+/// On an explicit stack rather than the call stack: a function of n
+/// sequential `if` statements has a dominator tree n levels deep, and a
+/// recursion per level overflowed the compiler's stack. Children are pushed
+/// in reverse so they are popped, and so visited, in order.
 #[allow(clippy::too_many_arguments)]
 fn visit_domtree(
     func: &Function,
     dom: &DomTree,
-    bb_id: BasicBlockId,
+    root: BasicBlockId,
     curr_level: u32,
     visited: &mut HashSet<BasicBlockId>,
     in_idf: &mut HashSet<BasicBlockId>,
@@ -453,45 +461,45 @@ fn visit_domtree(
     idf: &mut Vec<BasicBlockId>,
     queue: &mut LevelQueue,
 ) {
-    visited.insert(bb_id);
-
-    // Check successors
-    let children: Vec<BasicBlockId> = func
-        .get_block(bb_id)
-        .map(|bb| bb.children.clone())
-        .unwrap_or_default();
-
-    for y in children {
-        // Skip if y is dominated by bb_id (not a J-edge)
-        if dom.idom(y) == Some(bb_id) {
+    let mut stack = vec![root];
+    while let Some(bb_id) = stack.pop() {
+        if !visited.insert(bb_id) {
             continue;
         }
 
-        // y must be at same or lower level
-        let y_level = dom.level(y);
-        if y_level > curr_level {
-            continue;
-        }
+        // Check successors
+        let children: &[BasicBlockId] = func
+            .get_block(bb_id)
+            .map(|bb| bb.children.as_slice())
+            .unwrap_or(&[]);
 
-        if !in_idf.contains(&y) {
-            in_idf.insert(y);
-            idf.push(y);
+        for &y in children {
+            // Skip if y is dominated by bb_id (not a J-edge)
+            if dom.idom(y) == Some(bb_id) {
+                continue;
+            }
 
-            if !in_alpha.contains(&y) {
-                queue.push(y, y_level);
+            // y must be at same or lower level
+            let y_level = dom.level(y);
+            if y_level > curr_level {
+                continue;
+            }
+
+            if in_idf.insert(y) {
+                idf.push(y);
+                if !in_alpha.contains(&y) {
+                    queue.push(y, y_level);
+                }
             }
         }
-    }
 
-    // Recurse into dominator tree children
-    let dom_children: Vec<BasicBlockId> = dom.children(bb_id).to_vec();
-
-    for child in dom_children {
-        if !visited.contains(&child) {
-            visit_domtree(
-                func, dom, child, curr_level, visited, in_idf, in_alpha, idf, queue,
-            );
-        }
+        stack.extend(
+            dom.children(bb_id)
+                .iter()
+                .rev()
+                .copied()
+                .filter(|c| !visited.contains(c)),
+        );
     }
 }
 

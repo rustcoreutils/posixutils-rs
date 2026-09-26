@@ -34,6 +34,7 @@
 //
 
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
+use std::collections::{HashSet, VecDeque};
 
 /// Whether `insn` may be executed on a path that would not have run it.
 ///
@@ -91,22 +92,44 @@ struct Diamond {
 }
 
 /// Collapse every short-circuit diamond whose arm is safe to speculate.
+///
+/// A worklist in block order. Collapsing the inner diamond of `a && b && c`
+/// turns its predecessor into a straight-line arm, which is what makes the
+/// outer diamond recognizable -- so after a collapse only the blocks that
+/// branch to that predecessor are looked at again. Rescanning the whole
+/// function after every collapse, and removing each arm as it went, made a
+/// function of n `if` statements n^2. The dead arms are removed once, at the
+/// end.
 pub fn run(func: &mut Function) -> bool {
-    let mut changed = false;
-    // To a fixpoint: collapsing the inner diamond of `a && b && c` is what
-    // makes the outer one recognizable.
-    loop {
-        let Some(d) = func
-            .blocks
-            .iter()
-            .filter_map(|bb| recognize(func, bb.id))
-            .next()
-        else {
-            return changed;
+    let mut queue: VecDeque<BasicBlockId> = func.blocks.iter().map(|b| b.id).collect();
+    let mut queued: HashSet<BasicBlockId> = queue.iter().copied().collect();
+    let mut dead: HashSet<BasicBlockId> = HashSet::new();
+    while let Some(b) = queue.pop_front() {
+        queued.remove(&b);
+        if dead.contains(&b) {
+            continue;
+        }
+        let Some(d) = recognize(func, b) else {
+            continue;
         };
         collapse(func, &d);
-        changed = true;
+        dead.insert(d.arm);
+        let outer: Vec<BasicBlockId> = func
+            .get_block(d.pred)
+            .map(|p| p.parents.clone())
+            .unwrap_or_default();
+        for p in outer {
+            if !dead.contains(&p) && queued.insert(p) {
+                queue.push_back(p);
+            }
+        }
     }
+    if dead.is_empty() {
+        return false;
+    }
+    func.blocks.retain(|b| !dead.contains(&b.id));
+    func.rebuild_block_idx();
+    true
 }
 
 /// Whether `pred` ends a diamond this pass can collapse.
@@ -252,8 +275,6 @@ fn collapse(func: &mut Function, d: &Diamond) {
     func.blocks[pred_idx].children.retain(|c| *c != d.arm);
     let merge_idx = func.block_index(d.merge).expect("merge exists");
     func.blocks[merge_idx].parents.retain(|p| *p != d.arm);
-    func.blocks.retain(|b| b.id != d.arm);
-    func.rebuild_block_idx();
 }
 
 #[cfg(test)]

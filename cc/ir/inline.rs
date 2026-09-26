@@ -983,7 +983,7 @@ fn clone_callee_pseudos(
         }
         if ctx.pseudo_map.contains_key(&callee_pseudo.id) {
             let new_pseudo = ctx.clone_pseudo(callee_pseudo, callee);
-            if !caller.pseudos.iter().any(|p| p.id == new_pseudo.id) {
+            if !caller.has_pseudo(new_pseudo.id) {
                 pseudos.push(new_pseudo);
             }
         }
@@ -1293,12 +1293,11 @@ fn inline_call_site(
     // Add value pseudos for constants materialized while cloning, replacing
     // the placeholder the clone made for the same id.
     for pseudo in std::mem::take(&mut ctx.const_pseudos) {
-        caller.pseudos.retain(|p| p.id != pseudo.id);
-        caller.add_pseudo(pseudo);
+        caller.replace_pseudo(pseudo);
     }
     // Add PhiSource target pseudos generated for the return-value Phi.
     for pseudo in std::mem::take(&mut ctx.phisrc_pseudos) {
-        if !caller.pseudos.iter().any(|p| p.id == pseudo.id) {
+        if !caller.has_pseudo(pseudo.id) {
             caller.add_pseudo(pseudo);
         }
     }

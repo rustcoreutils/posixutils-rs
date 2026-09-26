@@ -56,6 +56,13 @@
 //        that later produced one would reintroduce the truncation that sent
 //        a member past 2 GiB gigabytes away.
 //
+//   I7 — THE PSEUDO INDEX AGREES WITH THE PSEUDO LIST
+//        `Function::get_pseudo` answers through `pseudo_idx`, an id-to-
+//        position map. Removing or reordering `pseudos` without rebuilding
+//        it makes every later lookup answer a neighbour's kind, so a
+//        constant reads as a symbol or a register as a constant. Every pseudo
+//        must be found at its own position.
+//
 // The validator is intended to run only in debug builds — production
 // builds skip it for zero overhead. Call via:
 //
@@ -119,6 +126,9 @@ pub enum ValidationError {
         index: usize,
         offset: i64,
     },
+    /// I7 violation: `get_pseudo` does not find this pseudo at its own
+    /// position in `pseudos`.
+    StalePseudoIndex { function: String, pseudo: PseudoId },
     /// A placeholder opcode that something downstream was supposed to
     /// resolve is still here. Neither backend knows it, and both end their
     /// opcode match in a catch-all, so it would be dropped in silence and
@@ -195,6 +205,11 @@ impl fmt::Display for ValidationError {
                 "[ir-validate I6] in function `{function}`: bb={block} insn={index} \
                  load/store offset {offset} does not fit a 32-bit displacement"
             ),
+            ValidationError::StalePseudoIndex { function, pseudo } => write!(
+                f,
+                "[ir-validate I7] in function `{function}`: pseudo {pseudo:?} is not \
+                 found at its own position; `pseudo_idx` is stale"
+            ),
             ValidationError::UnresolvedPlaceholder {
                 function,
                 block,
@@ -268,6 +283,7 @@ pub fn validate_function(func: &Function) -> Result<(), Vec<ValidationError>> {
     check_memory_access_implies_side_effect(func, &mut errors);
     check_branch_targets_valid(func, &mut errors);
     check_displacements_in_range(func, &mut errors);
+    check_pseudo_index(func, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -305,6 +321,18 @@ fn check_single_def(func: &Function, out: &mut Vec<ValidationError>) {
                 function: func.name.clone(),
                 pseudo,
                 sites,
+            });
+        }
+    }
+}
+
+/// I7 — `get_pseudo` finds every pseudo at its own position.
+pub fn check_pseudo_index(func: &Function, out: &mut Vec<ValidationError>) {
+    for pseudo in &func.pseudos {
+        if func.get_pseudo(pseudo.id).map(|p| p.id) != Some(pseudo.id) {
+            out.push(ValidationError::StalePseudoIndex {
+                function: func.name.clone(),
+                pseudo: pseudo.id,
             });
         }
     }

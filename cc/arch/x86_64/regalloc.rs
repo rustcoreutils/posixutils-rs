@@ -1821,13 +1821,6 @@ impl RegAlloc {
         }
     }
 
-    /// Look up an interval by pseudo id (linear scan over the small
-    /// intervals vector; vec is sorted by start position, not pseudo,
-    /// so a linear find is fine).
-    fn interval_by_pseudo(intervals: &[LiveInterval], p: PseudoId) -> Option<&LiveInterval> {
-        intervals.iter().find(|i| i.pseudo == p)
-    }
-
     /// Chordal coloring, with spill-on-fail for uncolorable vertices.
     ///
     /// Three phases:
@@ -1854,6 +1847,7 @@ impl RegAlloc {
         constraint_points: &[ConstraintPoint<Reg>],
     ) {
         // -------- Phase 1: pre-pass --------
+        let crosses_blocks = crate::arch::regalloc::live_out_anywhere(&self.live_out);
         let setval_sizes = crate::arch::regalloc::setval_sizes(func);
         let mut gp_candidates: std::collections::BTreeSet<PseudoId> =
             std::collections::BTreeSet::new();
@@ -1956,7 +1950,7 @@ impl RegAlloc {
                 let is_longdouble = self.ld_pseudos.contains(&interval.pseudo);
                 let is_quad = self.quad_pseudos.contains(&interval.pseudo);
                 let crosses_call = interval_crosses_call(interval, call_positions);
-                let crosses_block = self.live_out.iter().any(|lo| lo.contains(&interval.pseudo));
+                let crosses_block = crosses_blocks.contains(&interval.pseudo);
                 if is_longdouble {
                     self.alloc_stack_slot(interval, 16, 16, false);
                     continue;
@@ -1997,6 +1991,7 @@ impl RegAlloc {
         constraint_points: &[ConstraintPoint<Reg>],
         gp_candidates: &std::collections::BTreeSet<PseudoId>,
     ) {
+        let by_pseudo = crate::arch::regalloc::intervals_by_pseudo(intervals);
         use crate::arch::regalloc::{build_interference_graph, greedy_color, mcs_ordering};
         if gp_candidates.is_empty() {
             return;
@@ -2153,7 +2148,7 @@ impl RegAlloc {
             if colors.contains_key(&spilled) {
                 continue;
             }
-            let interval = match Self::interval_by_pseudo(intervals, spilled) {
+            let interval = match by_pseudo.get(&spilled).copied() {
                 Some(i) => i,
                 None => {
                     final_spilled.insert(spilled);
@@ -2277,7 +2272,7 @@ impl RegAlloc {
         // end, so they cannot interfere within a block.
         let mut ordered_spilled: Vec<(usize, PseudoId)> = final_spilled
             .iter()
-            .filter_map(|&p| Self::interval_by_pseudo(intervals, p).map(|i| (i.start, p)))
+            .filter_map(|&p| by_pseudo.get(&p).copied().map(|i| (i.start, p)))
             .collect();
         ordered_spilled.sort_by_key(|&(start, _)| start);
         for (start, spilled) in ordered_spilled {
@@ -2289,7 +2284,7 @@ impl RegAlloc {
                 &mut self.free_stack_slots,
                 start,
             );
-            if let Some(interval) = Self::interval_by_pseudo(intervals, spilled) {
+            if let Some(interval) = by_pseudo.get(&spilled).copied() {
                 self.alloc_stack_slot(interval, 8, 8, true);
             }
         }
@@ -2301,6 +2296,7 @@ impl RegAlloc {
         intervals: &[LiveInterval],
         xmm_candidates: &std::collections::BTreeSet<PseudoId>,
     ) {
+        let by_pseudo = crate::arch::regalloc::intervals_by_pseudo(intervals);
         use crate::arch::regalloc::{build_interference_graph, greedy_color, mcs_ordering};
         if xmm_candidates.is_empty() {
             return;
@@ -2344,7 +2340,7 @@ impl RegAlloc {
         let mut ordered_spilled: Vec<(usize, PseudoId)> = result
             .spilled
             .iter()
-            .filter_map(|&p| Self::interval_by_pseudo(intervals, p).map(|i| (i.start, p)))
+            .filter_map(|&p| by_pseudo.get(&p).copied().map(|i| (i.start, p)))
             .collect();
         ordered_spilled.sort_by_key(|&(start, _)| start);
         for (start, spilled) in ordered_spilled {
@@ -2356,7 +2352,7 @@ impl RegAlloc {
                 &mut self.free_stack_slots,
                 start,
             );
-            if let Some(interval) = Self::interval_by_pseudo(intervals, spilled) {
+            if let Some(interval) = by_pseudo.get(&spilled).copied() {
                 self.alloc_stack_slot(interval, 8, 8, true);
             }
         }

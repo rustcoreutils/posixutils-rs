@@ -48,16 +48,9 @@ use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-const DEFAULT_INSN_CAPACITY: usize = 32;
-const DEFAULT_CFG_EDGE_CAPACITY: usize = 4;
-const DEFAULT_SRC_CAPACITY: usize = 4;
 /// Operands a typical instruction reads; see [`Instruction::uses`].
 const DEFAULT_USE_CAPACITY: usize = 4;
-const DEFAULT_PHI_CAPACITY: usize = 4;
 const DEFAULT_PARAM_CAPACITY: usize = 8;
-const DEFAULT_BLOCK_CAPACITY: usize = 512;
-const DEFAULT_PSEUDO_CAPACITY: usize = 2048;
-const DEFAULT_LOCAL_CAPACITY: usize = 64;
 
 // Call ABI Information
 
@@ -918,19 +911,19 @@ impl Default for Instruction {
         Self {
             op: Opcode::Nop,
             target: None,
-            src: Vec::with_capacity(DEFAULT_SRC_CAPACITY),
+            src: Vec::new(),
             typ: None,
             bb_true: None,
             bb_false: None,
             offset: 0,
-            phi_list: Vec::with_capacity(DEFAULT_PHI_CAPACITY),
+            phi_list: Vec::new(),
             func_name: None,
             size: 0,
             src_size: 0,
             src_typ: None,
             switch_cases: Vec::new(),
             switch_default: None,
-            arg_types: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
+            arg_types: Vec::new(),
             variadic_arg_start: None,
             ends_with_va_arg_pack: false,
             is_noreturn_call: false,
@@ -1688,12 +1681,12 @@ impl Default for BasicBlock {
     fn default() -> Self {
         Self {
             id: BasicBlockId(0),
-            insns: Vec::with_capacity(DEFAULT_INSN_CAPACITY),
-            parents: Vec::with_capacity(DEFAULT_CFG_EDGE_CAPACITY),
-            children: Vec::with_capacity(DEFAULT_CFG_EDGE_CAPACITY),
+            insns: Vec::new(),
+            parents: Vec::new(),
+            children: Vec::new(),
             label: None,
             addr_taken: false,
-            phi_map: HashMap::with_capacity(DEFAULT_PHI_CAPACITY),
+            phi_map: HashMap::new(),
         }
     }
 }
@@ -1933,11 +1926,11 @@ impl Default for Function {
             takes_label_addr: false,
             return_type: TypeId::INVALID,
             params: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
-            blocks: Vec::with_capacity(DEFAULT_BLOCK_CAPACITY),
+            blocks: Vec::new(),
             entry: BasicBlockId(0),
-            pseudos: Vec::with_capacity(DEFAULT_PSEUDO_CAPACITY),
+            pseudos: Vec::new(),
             next_pseudo: 0,
-            locals: HashMap::with_capacity(DEFAULT_LOCAL_CAPACITY),
+            locals: HashMap::new(),
             is_static: false,
             emit: true,
             is_noreturn: false,
@@ -1949,8 +1942,8 @@ impl Default for Function {
             is_inline: false,
             implicit_param_copies: Vec::new(),
             ret_is_address: false,
-            block_idx: HashMap::with_capacity(DEFAULT_BLOCK_CAPACITY),
-            pseudo_idx: HashMap::with_capacity(DEFAULT_PSEUDO_CAPACITY),
+            block_idx: HashMap::new(),
+            pseudo_idx: HashMap::new(),
         }
     }
 }
@@ -2005,6 +1998,23 @@ impl Function {
         let idx = self.pseudos.len();
         self.pseudo_idx.insert(pseudo.id, idx);
         self.pseudos.push(pseudo);
+    }
+
+    /// Is a pseudo with this id registered?
+    pub fn has_pseudo(&self, id: PseudoId) -> bool {
+        self.pseudo_idx.contains_key(&id)
+    }
+
+    /// Register `pseudo`, overwriting any pseudo with the same id where it
+    /// stands, so no other pseudo moves and `pseudo_idx` stays right.
+    ///
+    /// Removing the old one and appending the new one shifted every later
+    /// pseudo down a position under an index nobody rebuilt.
+    pub fn replace_pseudo(&mut self, pseudo: Pseudo) {
+        match self.pseudo_idx.get(&pseudo.id) {
+            Some(&idx) => self.pseudos[idx] = pseudo,
+            None => self.add_pseudo(pseudo),
+        }
     }
 
     /// Rebuild block index after bulk mutation of `self.blocks`

@@ -7253,3 +7253,72 @@ fn test_cfg_edges_are_recorded_once_in_both_lists() {
         "the label should collect every goto, widest was {widest}"
     );
 }
+
+/// Inlining `__builtin_va_arg_pack_len()` replaces the pseudo standing for
+/// it with a constant. The inliner did that with `pseudos.retain` and never
+/// rebuilt `pseudo_idx`, so every caller pseudo after the removed placeholder
+/// was looked up at its neighbour's position -- `get_pseudo` answered a
+/// different pseudo's kind until `mem2reg` happened to rebuild the index.
+#[test]
+fn test_inlining_va_arg_pack_len_keeps_the_pseudo_index() {
+    let src = "extern inline __attribute__((always_inline, gnu_inline))\n\
+               int count(int a, ...) { int k = a * 3; return __builtin_va_arg_pack_len() + k; }\n\
+               int caller(int x) { int y = x + 1; return count(y, 1, 2, 3) + count(x) * 7 + y; }\n";
+    let mut module = linearize_source(src, &Target::host());
+    let opt = crate::opt::Optimization::from_flag("2").unwrap();
+    crate::ir::inline::run(&mut module, opt);
+    let caller = module
+        .functions
+        .iter()
+        .find(|f| f.name == "caller")
+        .expect("caller");
+    assert!(
+        caller
+            .blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .all(|i| i.op != Opcode::Call),
+        "count should have been inlined"
+    );
+    let mut errors = Vec::new();
+    crate::ir::validate::check_pseudo_index(caller, &mut errors);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// Collapsing the inner diamond of `a && b && c` is what makes the outer one
+/// recognizable, so `ifconv` has to revisit the blocks that branch to a
+/// collapsed predecessor. It does so from a worklist now, not by rescanning
+/// the function after every collapse; this pins that the whole chain still
+/// folds to straight-line code, and that many sequential diamonds all do.
+#[test]
+fn test_ifconv_collapses_nested_and_sequential_diamonds() {
+    let chain = |src: &str, name: &str| -> usize {
+        let mut module = linearize_source(src, &Target::host());
+        let func = module
+            .functions
+            .iter_mut()
+            .find(|f| f.name == name)
+            .expect("function");
+        assert!(crate::ir::ifconv::run(func));
+        let mut errors = Vec::new();
+        crate::ir::validate::check_pseudo_index(func, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        func.blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .filter(|i| i.op == Opcode::Cbr)
+            .count()
+    };
+    assert_eq!(
+        chain(
+            "int f(int a, int b, int c, int d) { return a > 0 && b > 0 && c > 0 && d > 0; }",
+            "f"
+        ),
+        0
+    );
+    let many: String = (0..200)
+        .map(|i| format!("  if (x > {i}) s += {};\n", i % 7))
+        .collect();
+    let src = format!("int g(int x) {{\n  int s = 0;\n{many}  return s;\n}}\n");
+    assert_eq!(chain(&src, "g"), 0);
+}

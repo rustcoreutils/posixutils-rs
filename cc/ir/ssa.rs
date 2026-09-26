@@ -444,31 +444,51 @@ fn rename_insn(
 }
 
 /// Rename variables in a block and its dominated children.
-fn rename_block(converter: &mut SsaConverter, bb_id: BasicBlockId, def_stack: &mut DefStack) {
-    let mark = def_stack.mark();
-
-    // Get instruction count first
-    let insn_count = converter
-        .func
-        .get_block(bb_id)
-        .map(|bb| bb.insns.len())
-        .unwrap_or(0);
-
-    // Process all instructions in this block
-    for i in 0..insn_count {
-        rename_insn(converter, bb_id, i, def_stack);
+///
+/// The walk is a pre-order over the dominator tree -- a block's instructions,
+/// then each dominated child's subtree in order, then the block's definitions
+/// are unwound -- kept on an explicit stack rather than the call stack. A
+/// function of n sequential `if` statements has a dominator tree n levels
+/// deep, and recursing once per level put the compiler's stack, not the
+/// program, in charge of how long a function may be.
+fn rename_block(converter: &mut SsaConverter, entry: BasicBlockId, def_stack: &mut DefStack) {
+    /// A block whose instructions are renamed and whose children are being
+    /// visited.
+    struct Frame {
+        mark: usize,
+        children: Vec<BasicBlockId>,
+        next: usize,
     }
 
-    // Get dominated children
-    let dom_children: Vec<BasicBlockId> = converter.dom.children(bb_id).to_vec();
-
-    // Recurse into dominated children
-    for child in dom_children {
-        rename_block(converter, child, def_stack);
+    fn enter(converter: &mut SsaConverter, bb_id: BasicBlockId, def_stack: &mut DefStack) -> Frame {
+        let mark = def_stack.mark();
+        let insn_count = converter
+            .func
+            .get_block(bb_id)
+            .map(|bb| bb.insns.len())
+            .unwrap_or(0);
+        for i in 0..insn_count {
+            rename_insn(converter, bb_id, i, def_stack);
+        }
+        Frame {
+            mark,
+            children: converter.dom.children(bb_id).to_vec(),
+            next: 0,
+        }
     }
 
-    // Pop definitions made in this block
-    def_stack.unwind(mark);
+    let mut stack = vec![enter(converter, entry, def_stack)];
+    while let Some(top) = stack.last_mut() {
+        if let Some(&child) = top.children.get(top.next) {
+            top.next += 1;
+            let frame = enter(converter, child, def_stack);
+            stack.push(frame);
+        } else {
+            // Pop definitions made in this block
+            let done = stack.pop().expect("the loop saw a frame");
+            def_stack.unwind(done.mark);
+        }
+    }
 }
 
 /// Fill in phi operands from predecessor blocks.

@@ -543,11 +543,33 @@ where
     let mut live_out: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
     let mut worklist: Vec<usize> = Vec::with_capacity(num_blocks);
 
+    // A constant, or a global's symbol, is never held in a register across
+    // blocks: both backends' pre-passes give it an immediate or a global
+    // location whatever its interval. With no def it would otherwise be
+    // propagated from every use back to the entry block -- one pseudo live
+    // across every block before its use -- and a function of n `if (x > i)`
+    // statements, one constant each, held n^2 set entries: gigabytes, and
+    // minutes, for n in the tens of thousands. Such a pseudo gets an interval
+    // spanning its uses and no liveness. One with a def (a 128-bit constant's
+    // `SetVal`, whose stack slot must survive to its last use) is tracked
+    // like any value.
+    let needs_no_liveness = |p: PseudoId| -> bool {
+        !def_blocks.contains_key(&p)
+            && func.get_pseudo(p).is_some_and(|ps| match &ps.kind {
+                PseudoKind::Val(_) | PseudoKind::FVal(_) => true,
+                PseudoKind::Sym(_) => func.local_of(p).is_none(),
+                _ => false,
+            })
+    };
+
     let propagate_use = |use_block: usize,
                          pseudo: PseudoId,
                          live_in: &mut [HashSet<PseudoId>],
                          live_out: &mut [HashSet<PseudoId>],
                          worklist: &mut Vec<usize>| {
+        if needs_no_liveness(pseudo) {
+            return;
+        }
         let defs = def_blocks.get(&pseudo);
         worklist.clear();
         // Seed the use block unconditionally — we are AT a use site,
@@ -713,6 +735,24 @@ where
         }
     }
 
+    // Phase D.1: the pseudos Phase C left without liveness span their uses.
+    for idx in 0..num_blocks {
+        for (&p, &first) in &first_pos_map[idx] {
+            if !needs_no_liveness(p) {
+                continue;
+            }
+            let last = last_pos_map[idx].get(&p).copied().unwrap_or(first);
+            interval_start
+                .entry(p)
+                .and_modify(|s| *s = (*s).min(first))
+                .or_insert(first);
+            interval_end
+                .entry(p)
+                .and_modify(|e| *e = (*e).max(last))
+                .or_insert(last);
+        }
+    }
+
     // Phase E: Detect loop back-edges and mark loop-carried pseudos
     let mut loop_pseudos: HashSet<PseudoId> = HashSet::new();
     for (idx, block) in func.blocks.iter().enumerate() {
@@ -749,6 +789,28 @@ where
         live_in,
         live_out,
     }
+}
+
+/// Each pseudo's live interval, by pseudo -- the first, if several.
+///
+/// Built once per coloring pass. Finding one by scanning every interval,
+/// once per spilled pseudo, made spilling intervals x spills: a function of
+/// tens of thousands of locals spent its time there.
+pub fn intervals_by_pseudo(intervals: &[LiveInterval]) -> HashMap<PseudoId, &LiveInterval> {
+    let mut by_pseudo = HashMap::with_capacity(intervals.len());
+    for interval in intervals {
+        by_pseudo.entry(interval.pseudo).or_insert(interval);
+    }
+    by_pseudo
+}
+
+/// Every pseudo live out of some block: one whose value crosses a block
+/// boundary.
+///
+/// Built once per function. Asking it per interval by scanning every block's
+/// live-out set made the chordal pre-pass intervals x blocks.
+pub fn live_out_anywhere(live_out: &[HashSet<PseudoId>]) -> HashSet<PseudoId> {
+    live_out.iter().flatten().copied().collect()
 }
 
 /// Identify Sym pseudos whose address is taken: by a `SymAddr`, or by an

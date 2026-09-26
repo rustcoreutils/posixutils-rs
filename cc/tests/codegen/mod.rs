@@ -23,5 +23,6 @@ mod misc;
 mod pic;
 mod promotion;
 mod regalloc;
+mod scaling;
 mod sections;
 mod tls_models;

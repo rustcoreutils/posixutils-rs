@@ -1732,6 +1732,7 @@ impl RegAlloc {
         constraint_points: &[ConstraintPoint<Reg>],
     ) {
         // -------- Phase 1: pre-pass --------
+        let crosses_blocks = crate::arch::regalloc::live_out_anywhere(&self.live_out);
         // What the pre-pass asks about each interval, indexed once: asking by
         // scanning the function per interval made it quadratic.
         let setval_sizes = crate::arch::regalloc::setval_sizes(func);
@@ -1848,7 +1849,7 @@ impl RegAlloc {
                 // having to model V-bank cross-call eviction, which is
                 // not implemented yet; matches the x86_64 XMM policy).
                 let crosses_call = interval_crosses_call(interval, call_positions);
-                let crosses_block = self.live_out.iter().any(|lo| lo.contains(&interval.pseudo));
+                let crosses_block = crosses_blocks.contains(&interval.pseudo);
                 if crosses_call || crosses_block {
                     let bytes = fp_pseudo_bytes(func, interval.pseudo);
                     self.alloc_stack_slot(interval, bytes, bytes, true);
@@ -1879,6 +1880,7 @@ impl RegAlloc {
         constraint_points: &[ConstraintPoint<Reg>],
         gp_candidates: &std::collections::BTreeSet<PseudoId>,
     ) {
+        let by_pseudo = crate::arch::regalloc::intervals_by_pseudo(intervals);
         use crate::arch::regalloc::{build_interference_graph, greedy_color, mcs_ordering};
         if gp_candidates.is_empty() {
             return;
@@ -2005,7 +2007,7 @@ impl RegAlloc {
             if colors.contains_key(&spilled) {
                 continue;
             }
-            let interval = match Self::interval_by_pseudo(intervals, spilled) {
+            let interval = match by_pseudo.get(&spilled).copied() {
                 Some(i) => i,
                 None => {
                     final_spilled.insert(spilled);
@@ -2111,7 +2113,7 @@ impl RegAlloc {
         // `PyThread_acquire_lock_timed` miscompile root cause).
         let mut ordered_spilled: Vec<(usize, PseudoId)> = final_spilled
             .iter()
-            .filter_map(|&p| Self::interval_by_pseudo(intervals, p).map(|i| (i.start, p)))
+            .filter_map(|&p| by_pseudo.get(&p).copied().map(|i| (i.start, p)))
             .collect();
         ordered_spilled.sort_by_key(|&(start, _)| start);
         for (start, spilled) in ordered_spilled {
@@ -2123,7 +2125,7 @@ impl RegAlloc {
                 &mut self.free_stack_slots,
                 start,
             );
-            if let Some(interval) = Self::interval_by_pseudo(intervals, spilled) {
+            if let Some(interval) = by_pseudo.get(&spilled).copied() {
                 let bytes = fp_pseudo_bytes(func, interval.pseudo);
                 self.alloc_stack_slot(interval, bytes, bytes, true);
             }
@@ -2136,6 +2138,7 @@ impl RegAlloc {
         intervals: &[LiveInterval],
         vreg_candidates: &std::collections::BTreeSet<PseudoId>,
     ) {
+        let by_pseudo = crate::arch::regalloc::intervals_by_pseudo(intervals);
         use crate::arch::regalloc::{build_interference_graph, greedy_color, mcs_ordering};
         if vreg_candidates.is_empty() {
             return;
@@ -2178,7 +2181,7 @@ impl RegAlloc {
         let mut ordered_spilled: Vec<(usize, PseudoId)> = result
             .spilled
             .iter()
-            .filter_map(|&p| Self::interval_by_pseudo(intervals, p).map(|i| (i.start, p)))
+            .filter_map(|&p| by_pseudo.get(&p).copied().map(|i| (i.start, p)))
             .collect();
         ordered_spilled.sort_by_key(|&(start, _)| start);
         for (start, spilled) in ordered_spilled {
@@ -2190,15 +2193,11 @@ impl RegAlloc {
                 &mut self.free_stack_slots,
                 start,
             );
-            if let Some(interval) = Self::interval_by_pseudo(intervals, spilled) {
+            if let Some(interval) = by_pseudo.get(&spilled).copied() {
                 let bytes = fp_pseudo_bytes(func, interval.pseudo);
                 self.alloc_stack_slot(interval, bytes, bytes, true);
             }
         }
-    }
-
-    fn interval_by_pseudo(intervals: &[LiveInterval], p: PseudoId) -> Option<&LiveInterval> {
-        intervals.iter().find(|i| i.pseudo == p)
     }
 
     fn compute_live_intervals(&self, func: &Function) -> LivenessResult<Reg> {

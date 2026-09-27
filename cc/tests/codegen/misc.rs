@@ -430,6 +430,7 @@ int main() {
 // ============================================================================
 
 /// Create a temporary assembly file
+#[cfg(target_arch = "x86_64")]
 fn create_asm_file(name: &str, content: &str, extension: &str) -> plib::tmp::NamedTempFile {
     let mut file = plib::tmp::Builder::new()
         .prefix(&format!("c17_test_{}_", name))

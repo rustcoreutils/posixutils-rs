@@ -43,11 +43,31 @@ fn parse_expr_under(
     vars: &[&str],
     policy: super::LibraryCallPolicy,
 ) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
+    parse_expr_on(input, vars, policy, &Target::host())
+}
+
+/// An expression parsed for `target`. A test about a property one target
+/// family has -- x87 or binary128 `long double`, `__float128` -- names that
+/// target instead of taking the host's: on an arm64 Mac `long double` is
+/// `double` and there is no `__float128`.
+fn parse_expr_for(
+    input: &str,
+    target: &Target,
+) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
+    parse_expr_on(input, &[], Default::default(), target)
+}
+
+fn parse_expr_on(
+    input: &str,
+    vars: &[&str],
+    policy: super::LibraryCallPolicy,
+    target: &Target,
+) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
     let mut strings = StringTable::new();
     let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
     let mut symbols = SymbolTable::new();
-    let mut types = TypeTable::new(&Target::host());
+    let mut types = TypeTable::new(target);
 
     // Pre-declare variables
     for var_name in vars {
@@ -2044,11 +2064,19 @@ fn test_plain_declaration_is_not_a_function_declarator() {
 // Translation unit tests
 
 fn parse_tu(input: &str) -> ParseResult<(TranslationUnit, TypeTable, StringTable, SymbolTable)> {
+    parse_tu_for(input, &Target::host())
+}
+
+/// [`parse_tu`] for `target`; see [`parse_expr_for`] for when a test needs it.
+fn parse_tu_for(
+    input: &str,
+    target: &Target,
+) -> ParseResult<(TranslationUnit, TypeTable, StringTable, SymbolTable)> {
     let mut strings = StringTable::new();
     let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
     let mut symbols = SymbolTable::new();
-    let mut types = TypeTable::new(&Target::host());
+    let mut types = TypeTable::new(target);
     let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
     let tu = parser.parse_translation_unit()?;
     Ok((tu, types, strings, symbols))
@@ -5332,11 +5360,17 @@ fn test_builtin_float_n_constants() {
         assert_eq!(expr.typ, Some(want(&types)), "{src}");
         assert_eq!(nan_bits(src, fmt), bits, "{src}");
     }
-    for &(src, bits) in binary128 {
-        let (expr, types, _, _) = parse_expr(src).unwrap();
-        if types.has_float128() {
+    // The `f128` forms exist where `__float128` does -- not on Apple arm64,
+    // which test_builtin_float128_constant_follows_the_target covers -- so
+    // they are checked on the Linux targets, not the host.
+    for target in linux_targets() {
+        for &(src, bits) in binary128 {
+            let (expr, types, _, _) = parse_expr_for(src, &target).unwrap();
             assert_eq!(expr.typ, Some(types.float128_id), "{src}");
-            assert_eq!(nan_bits(src, Binary128), bits, "{src}");
+            let ExprKind::FloatLit(v) = expr.kind else {
+                panic!("{src} parsed to {:?}", expr.kind);
+            };
+            assert_eq!(v.to_bits(Binary128), bits, "{src}");
         }
     }
 }
@@ -7210,8 +7244,8 @@ fn test_imaginary_marker_with_float_n_suffixes() {
 #[test]
 fn test_imaginary_marker_with_binary128_suffixes() {
     for src in ["2.0if128", "2.0f128i", "2.0iq", "2.0qi", "0x1p1iF128"] {
-        let (expr, types, _, _) =
-            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let (expr, types, _, _) = parse_expr_for(src, &x86_64_linux())
+            .unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
         let ExprKind::BuiltinComplex { imag, .. } = &expr.kind else {
             panic!("{src} gave {:?}", expr.kind);
         };
@@ -8138,8 +8172,12 @@ fn test_constant_expression_floating_folds_are_exact() {
         _Static_assert(__builtin_nan(\"\") != __builtin_nan(\"\"), \"unordered ne\");\n\
         _Static_assert(!(__builtin_nan(\"\") == __builtin_nan(\"\")), \"unordered eq\");\n\
         _Static_assert(__builtin_constant_p(0x1p62L + 1.0L), \"constant\");\n";
-    if let Err(e) = parse_tu(src) {
-        panic!("should have parsed: {e}");
+    // `0x1p62L + 1.0L` needs a `long double` wider than `double`: x87 on
+    // x86-64, binary128 on aarch64 Linux -- not Apple arm64.
+    for target in linux_targets() {
+        if let Err(e) = parse_tu_for(src, &target) {
+            panic!("{target:?}: should have parsed: {e}");
+        }
     }
 }
 
@@ -8195,4 +8233,17 @@ fn test_constant_p_at_o0_answers_zero() {
         "{:?}",
         expr.kind
     );
+}
+
+/// x86-64 Linux: x87 `long double`, and `__float128`.
+fn x86_64_linux() -> Target {
+    Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux)
+}
+
+/// The Linux targets, whose `long double` is wider than `double`.
+fn linux_targets() -> [Target; 2] {
+    [
+        x86_64_linux(),
+        Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux),
+    ]
 }

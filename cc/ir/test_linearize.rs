@@ -8345,7 +8345,7 @@ fn test_static_float_to_integer_initializer_is_exact() {
                static int g = 3e9;\n\
                static unsigned h = -1.5;\n\
                static int i = __builtin_nan(\"\");\n";
-    let module = linearize_source(src, &Target::host());
+    let module = linearize_source(src, &x86_64_linux());
     let int = |name: &str| match global_init(&module, name) {
         crate::ir::Initializer::Int(v) => *v,
         other => panic!("{name}: expected an integer, got {other:?}"),
@@ -8372,7 +8372,7 @@ fn test_static_initializer_casts_and_integer_subexpressions_convert() {
                static double b = (1 / 2) + 0.5;\n\
                static long long c = (long long)(0x1p62L + 1.0L);\n\
                static int d = (int)1e300;\n";
-    let module = linearize_source(src, &Target::host());
+    let module = linearize_source(src, &x86_64_linux());
     let float = |name: &str| match global_init(&module, name) {
         crate::ir::Initializer::Float(v) => v.to_f64(),
         other => panic!("{name}: expected a float, got {other:?}"),
@@ -8682,4 +8682,11 @@ fn test_void_cast_of_a_float_converts_nothing() {
         .filter(|i| matches!(i.op, Opcode::FCvtS | Opcode::FCvtU))
         .count();
     assert_eq!(converts, 0);
+}
+
+/// x86-64 Linux, whose x87 `long double` holds `0x1p62L + 1.0L` exactly --
+/// a test about that names the target rather than taking the host's, since
+/// on an arm64 Mac `long double` is `double`.
+fn x86_64_linux() -> Target {
+    Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux)
 }

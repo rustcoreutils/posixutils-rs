@@ -282,8 +282,8 @@ int abs(int); long labs(long); double fabs(double);
 double creal(double _Complex); double cimag(double _Complex);
 double _Complex conj(double _Complex);
 int main(void) {
-    char c = -3;
-    if (abs(c) != 3) return 1;               /* char promotes to int */
+    signed char c = -3;                      /* plain char is unsigned on aarch64 Linux */
+    if (abs(c) != 3) return 1;               /* signed char promotes to int */
     if (labs(-4) != 4L) return 2;            /* int converts to long */
     if (abs(-5.9) != 5) return 3;            /* double converts to int */
     if (fabs(-2) != 2.0) return 4;           /* int converts to double */

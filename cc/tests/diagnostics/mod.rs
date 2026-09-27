@@ -3457,7 +3457,12 @@ fn diagnostics_string_literal_must_match_the_array_element_type() {
         ),
         // A wide literal needs its own element type, not merely a wide one.
         ("wide_into_char_array", "char a[] = L\"ab\";\n"),
-        ("wide_into_unsigned_array", "unsigned a[] = L\"ab\";\n"),
+        // wchar_t is `int` on x86-64 and Darwin and `unsigned int` on aarch64
+        // Linux, so the mismatch is the integer type of the other signedness.
+        (
+            "wide_into_other_signedness_array",
+            "#if __WCHAR_MIN__ == 0\nint a[] = L\"ab\";\n#else\nunsigned a[] = L\"ab\";\n#endif\n",
+        ),
         ("u16_into_char_array", "char a[] = u\"ab\";\n"),
         ("u16_into_short_array", "short a[] = u\"ab\";\n"),
         ("u32_into_int_array", "int a[] = U\"ab\";\n"),
@@ -3482,8 +3487,11 @@ fn diagnostics_string_literals_matching_their_array_are_accepted() {
         ("str_braced", "char a[] = {\"hi\"};\n"),
         ("str_u8", "char a[] = u8\"ab\";\n"),
         ("str_local", "void f(void){ char a[] = \"hi\"; (void)a; }\n"),
-        ("wide_into_int", "int a[] = L\"ab\";\n"),
-        ("wide_into_const_int", "const int a[] = L\"ab\";\n"),
+        ("wide_into_wchar", "__WCHAR_TYPE__ a[] = L\"ab\";\n"),
+        (
+            "wide_into_const_wchar",
+            "const __WCHAR_TYPE__ a[] = L\"ab\";\n",
+        ),
         ("u16_into_ushort", "unsigned short a[] = u\"ab\";\n"),
         ("u32_into_uint", "unsigned int a[] = U\"ab\";\n"),
         ("array_from_braces", "int a[] = {1,2,3};\n"),

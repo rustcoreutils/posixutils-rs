@@ -347,6 +347,16 @@ up to 128 bytes, and `sprintf` of a format with no conversion, or of `"%s"`,
 answers the length. `stpcpy`, or `sprintf(d, "%s", s)`, of an unknown `s`
 whose result is unused is `strcpy(d, s)`.
 
+Output calls whose result is unused are rewritten, as gcc rewrites them, into
+calls that write the same bytes: `printf("")` goes, `printf("x")` is
+`putchar('x')`, `printf("text\n")` and `printf("%s\n", s)` are `puts`, and
+`printf("%c", c)` is `putchar(c)`; `fprintf(fp, "text")` and
+`fprintf(fp, "%s", s)` are `fputs`, and `fprintf(fp, "%c", c)` is `fputc`;
+`fputs` of a known string is nothing, `fputc` or `fwrite`. The `v` forms and
+`__printf_chk`, `__vprintf_chk`, `__fprintf_chk` and `__vfprintf_chk` follow,
+the `v` forms only for a format without `%`. The `_unlocked` forms are only
+ever dropped, since there is no portable function to call in their place.
+
 
 The call always reaches the *library's* function, never an inline definition
 of the same name in the translation unit. That is the other half of what the

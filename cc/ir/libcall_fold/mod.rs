@@ -21,25 +21,28 @@
 // call folds to as a [`Folded`] without touching the function; this module
 // finds the calls and writes the answers in. `strings` has the functions
 // that read strings and compute a value; `copies` has `strcpy` and its kin,
-// which write one, and fold to a `memcpy` of a known length. The families
-// still to come each add a module and an arm in `fold`: `memory` (the
-// `mem*` functions beyond comparison) and `stdio` (`printf` and its kin,
-// whose result must be unused).
+// which write one, and fold to a `memcpy` of a known length; `stdio` has
+// `printf` and its kin, whose result must be unused, and which become calls
+// that print the same bytes. The family still to come adds a module and an
+// arm in `fold`: `memory` (the `mem*` functions beyond comparison).
 //
 
 mod copies;
+mod stdio;
 mod strings;
 
 use super::build::Builder;
 use super::facts::ConstMap;
 use super::memloc::{AddrMap, MemBase};
 use super::strdata::{ConstBytes, StrReader};
-use super::{Function, Instruction, Opcode, PseudoId};
+use super::{string_label, Function, Instruction, Opcode, PseudoId};
 use crate::abi::CallingConv;
 use crate::parse::ast::{CalleeBinding, LibFn};
 use crate::target::Target;
+use crate::token::lexer::bytes_payload;
 use crate::types::{TypeId, TypeTable};
-use std::collections::HashMap;
+use std::cell::{OnceCell, RefCell};
+use std::collections::{HashMap, HashSet};
 
 /// What the folds need that is the same for every function in a module.
 pub struct FoldCtx<'a> {
@@ -49,6 +52,44 @@ pub struct FoldCtx<'a> {
     pub(crate) bytes: &'a ConstBytes,
     /// `Module::library_symbols`: whom a call a fold makes calls.
     pub(crate) callees: &'a HashMap<&'static str, String>,
+    /// The string literals the folds add.
+    pub(crate) literals: &'a NewLiterals<'a>,
+}
+
+/// The string literals a fold adds to the module: `printf("hi\n")` is
+/// `puts("hi")`, and the program may have no literal "hi" of its own. A
+/// literal already in the module, or already added, is reused.
+pub struct NewLiterals<'a> {
+    /// `Module::strings`, as it was before the optimizer ran.
+    existing: &'a [(String, String)],
+    added: RefCell<Vec<(String, String)>>,
+}
+
+impl<'a> NewLiterals<'a> {
+    pub fn new(existing: &'a [(String, String)]) -> Self {
+        NewLiterals {
+            existing,
+            added: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The label of the literal holding `bytes` and a terminator.
+    fn label(&self, bytes: &[u8]) -> String {
+        let payload = bytes_payload(bytes);
+        let mut added = self.added.borrow_mut();
+        let mut found = self.existing.iter().chain(added.iter());
+        if let Some((label, _)) = found.find(|(_, c)| *c == payload) {
+            return label.clone();
+        }
+        let label = string_label(self.existing.len() + added.len());
+        added.push((label.clone(), payload));
+        label
+    }
+
+    /// The literals added, to append to `Module::strings` in order.
+    pub fn into_added(self) -> Vec<(String, String)> {
+        self.added.into_inner()
+    }
 }
 
 /// What a call folds to, in terms of its operands.
@@ -72,6 +113,9 @@ pub(crate) enum Folded {
     Call(NewCall),
     /// Bytes written in place of the call, and what it answers.
     Write(copies::Write),
+    /// For a call whose result is unused: nothing, or a call to another
+    /// library function that does the same thing.
+    Discard(Option<NewCall>),
 }
 
 /// One byte of a comparison.
@@ -91,10 +135,13 @@ pub(crate) struct NewCall {
 }
 
 /// An argument of a call a fold makes, and the type it is passed as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Operand {
     Value(PseudoId, TypeId),
     Int(i128, TypeId),
+    /// The address of a string literal of these bytes, and a terminator,
+    /// passed as a `const char *`.
+    Literal(Vec<u8>),
 }
 
 /// What a fold may ask about the function its call is in.
@@ -104,6 +151,8 @@ pub(crate) struct Facts<'a> {
     am: &'a AddrMap,
     func: &'a Function,
     pub(crate) strings: StrReader<'a>,
+    /// Every pseudo some instruction reads, built on first asking.
+    used: OnceCell<HashSet<PseudoId>>,
 }
 
 impl Facts<'_> {
@@ -112,12 +161,11 @@ impl Facts<'_> {
         let Some(t) = insn.target else {
             return true;
         };
-        !self
-            .func
-            .blocks
-            .iter()
-            .flat_map(|bb| &bb.insns)
-            .any(|i| i.uses().contains(&t))
+        let used = self.used.get_or_init(|| {
+            let insns = self.func.blocks.iter().flat_map(|bb| &bb.insns);
+            insns.flat_map(Instruction::uses).collect()
+        });
+        !used.contains(&t)
     }
 
     /// The constant `p` holds, read as an unsigned `bits`-bit value.
@@ -162,6 +210,7 @@ fn collect(func: &Function, ctx: &FoldCtx) -> Vec<Site> {
         am: &am,
         func,
         strings: StrReader::new(ctx.bytes, func, &am),
+        used: OnceCell::new(),
     };
     let mut sites = Vec::new();
     for (b, bb) in func.blocks.iter().enumerate() {
@@ -204,6 +253,18 @@ fn fold(known: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded> {
         L::Strcpy | L::Stpcpy | L::Strncpy | L::Strcat | L::Strncat | L::Sprintf => {
             copies::fold(known, insn, facts)
         }
+        L::Printf
+        | L::PrintfUnlocked
+        | L::Vprintf
+        | L::PrintfChk
+        | L::VprintfChk
+        | L::Fprintf
+        | L::FprintfUnlocked
+        | L::Vfprintf
+        | L::FprintfChk
+        | L::VfprintfChk
+        | L::Fputs
+        | L::FputsUnlocked => stdio::fold(known, insn, facts),
         _ => None,
     }
 }
@@ -212,7 +273,7 @@ fn fold(known: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded> {
 /// terms of `strpbrk` must not become a call to itself.
 fn calls_itself(func: &Function, ctx: &FoldCtx, folded: &Folded) -> bool {
     let calls: &[&str] = match folded {
-        Folded::Call(call) => &[call.name],
+        Folded::Call(call) | Folded::Discard(Some(call)) => &[call.name],
         Folded::Write(write) => write.calls(),
         _ => &[],
     };
@@ -245,7 +306,8 @@ fn apply(func: &mut Function, ctx: &FoldCtx, sites: Vec<Site>) {
 
 /// The instructions that give `call`'s result the value `folded` says.
 ///
-/// A call whose result is unused leaves nothing but what it writes.
+/// A call whose result is unused leaves nothing but what it writes, or
+/// (`Discard`) the call that does what it did.
 fn materialize(b: &mut Builder, ctx: &FoldCtx, call: &Instruction, folded: Folded) {
     if let Folded::Write(write) = folded {
         let result = call
@@ -253,6 +315,13 @@ fn materialize(b: &mut Builder, ctx: &FoldCtx, call: &Instruction, folded: Folde
             .zip(call.typ)
             .map(|(t, typ)| (t, typ, call.size));
         copies::materialize(b, ctx, write, result);
+        return;
+    }
+    if let Folded::Discard(new) = folded {
+        if let Some(new) = new {
+            let ret = new.func.return_type(b.types);
+            make_call(b, ctx, None, ret, new);
+        }
         return;
     }
     let (Some(target), Some(typ)) = (call.target, call.typ) else {
@@ -282,7 +351,7 @@ fn materialize(b: &mut Builder, ctx: &FoldCtx, call: &Instruction, folded: Folde
             make_call(b, ctx, Some(target), typ, new);
             return;
         }
-        Folded::Write(_) => unreachable!("a write is materialized above"),
+        Folded::Write(_) | Folded::Discard(_) => unreachable!("materialized above"),
     };
     b.copy_into(target, value, typ, size);
 }
@@ -318,6 +387,10 @@ fn make_call(b: &mut Builder, ctx: &FoldCtx, target: Option<PseudoId>, ret: Type
         let (v, t) = match arg {
             Operand::Value(p, t) => (p, t),
             Operand::Int(v, t) => (b.constant(v, t, b.types.size_bits(t)), t),
+            Operand::Literal(bytes) => {
+                let t = b.types.const_char_ptr_id;
+                (b.sym_addr(ctx.literals.label(&bytes), t), t)
+            }
         };
         args.push(v);
         arg_types.push(t);
@@ -344,42 +417,50 @@ pub(super) mod tests {
     use crate::ir::strdata::fixture::Fixture;
 
     /// Run `f` with a fold context for `fx`, whose callees are renamed as
-    /// `callees` says.
+    /// `callees` says, and hand back what it answers and the literals the
+    /// folds added.
     fn with_ctx<R>(
         fx: &Fixture,
         callees: &[(&'static str, &str)],
         f: impl FnOnce(&FoldCtx) -> R,
-    ) -> R {
+    ) -> (R, Vec<(String, String)>) {
         let bytes = ConstBytes::build(&fx.module, &fx.types);
         let target = Target::host();
         let callees: HashMap<&'static str, String> =
             callees.iter().map(|&(c, a)| (c, a.to_string())).collect();
-        f(&FoldCtx {
+        let literals = NewLiterals::new(&fx.module.strings);
+        let answer = f(&FoldCtx {
             types: &fx.types,
             target: &target,
             bytes: &bytes,
             callees: &callees,
-        })
+            literals: &literals,
+        });
+        (answer, literals.into_added())
     }
 
     /// What each known call in `fx` that folds folds to, by its index in
     /// the block.
     pub(in crate::ir::libcall_fold) fn folds(fx: &Fixture) -> Vec<(usize, Folded)> {
-        with_ctx(fx, &[], |ctx| {
+        let (folds, _) = with_ctx(fx, &[], |ctx| {
             collect(&fx.module.functions[0], ctx)
                 .into_iter()
                 .map(|((_, i), folded)| (i, folded))
                 .collect()
-        })
+        });
+        folds
     }
 
-    /// Fold `fx`'s function with `callees`, and hand back its instructions.
+    /// Fold `fx`'s function with `callees`, add the literals the folds made
+    /// to its module as `optimize_module` does, and hand back its
+    /// instructions.
     pub(in crate::ir::libcall_fold) fn run_on(
         fx: &mut Fixture,
         callees: &[(&'static str, &str)],
     ) -> Vec<Instruction> {
         let mut func = std::mem::take(&mut fx.module.functions[0]);
-        with_ctx(fx, callees, |ctx| run(&mut func, ctx));
+        let (_, added) = with_ctx(fx, callees, |ctx| run(&mut func, ctx));
+        fx.module.strings.extend(added);
         let insns = func.blocks[0].insns.clone();
         fx.module.functions[0] = func;
         insns

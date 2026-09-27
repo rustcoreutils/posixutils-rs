@@ -286,17 +286,21 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
     // inlining, so the call graph and the set of globals are final.
     let mi = memloc::ModuleInfo::build(module, types);
     let bytes = ConstBytes::build(module, types);
+    let literals = libcall_fold::NewLiterals::new(&module.strings);
     let fold = libcall_fold::FoldCtx {
         types,
         target,
         bytes: &bytes,
         callees: &module.library_symbols,
+        literals: &literals,
     };
 
     // Phase 4: Per-function optimization
     for func in &mut module.functions {
         optimize_function(func, types, &mi, &fold);
     }
+    let added = literals.into_added();
+    module.strings.extend(added);
 
     // Phase 5 (debug builds only): structural IR validation.
     // Runs at the end of optimization, BEFORE `ir::lower::lower_module`

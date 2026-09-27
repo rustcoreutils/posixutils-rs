@@ -451,6 +451,18 @@ pub fn compile_and_run_aarch64_with(
     opts: &[&str],
     libs: &[&str],
 ) -> Option<i32> {
+    compile_and_capture_aarch64(name, content, opts, libs)
+        .map(|out| out.status.code().unwrap_or(-1))
+}
+
+/// [`compile_and_run_aarch64_with`], handing back everything the program
+/// did: its status and what it wrote.
+pub fn compile_and_capture_aarch64(
+    name: &str,
+    content: &str,
+    opts: &[&str],
+    libs: &[&str],
+) -> Option<std::process::Output> {
     if !aarch64_cross_available() {
         eprintln!(
             "SKIP {name}: no aarch64 cross toolchain (aarch64-linux-gnu-gcc, qemu-aarch64-static)"
@@ -476,7 +488,7 @@ pub fn compile_and_run_aarch64_with(
         run.stderr
     );
 
-    Some(cross_link_and_run_with(name, &[&asm_path], libs))
+    Some(cross_link_and_capture(name, &[&asm_path], libs))
 }
 
 /// Assemble/link the given aarch64 sources (`.c` or `.s`) with the cross
@@ -491,6 +503,12 @@ pub fn cross_link_and_run(name: &str, inputs: &[&str]) -> i32 {
 
 /// [`cross_link_and_run`], with `libs` given to the link after the inputs.
 pub fn cross_link_and_run_with(name: &str, inputs: &[&str], libs: &[&str]) -> i32 {
+    let run = cross_link_and_capture(name, inputs, libs);
+    run.status.code().unwrap_or(-1)
+}
+
+/// [`cross_link_and_run_with`], handing back everything the program did.
+fn cross_link_and_capture(name: &str, inputs: &[&str], libs: &[&str]) -> std::process::Output {
     let exe = plib::tmp::Builder::new()
         .prefix(&format!("c17_a64_{name}_"))
         .suffix(".bin")
@@ -511,12 +529,11 @@ pub fn cross_link_and_run_with(name: &str, inputs: &[&str], libs: &[&str]) -> i3
         String::from_utf8_lossy(&linked.stderr)
     );
 
-    let run = Command::new("qemu-aarch64-static")
+    Command::new("qemu-aarch64-static")
         .env("QEMU_LD_PREFIX", "/usr/aarch64-linux-gnu")
         .arg(&exe_path)
         .output()
-        .expect("failed to run qemu-aarch64-static");
-    run.status.code().unwrap_or(-1)
+        .expect("failed to run qemu-aarch64-static")
 }
 
 /// The host's own C compiler, the other half of every host interop test:

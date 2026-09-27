@@ -337,6 +337,18 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
     ]
 };
 
+impl LibFn {
+    /// The type the function returns: what a call an optimizer pass makes
+    /// to it answers.
+    pub fn return_type(self, t: &TypeTable) -> TypeId {
+        LIBRARY_BUILTINS
+            .iter()
+            .find(|lb| lb.called() == Some(self))
+            .expect("every LibFn has a row")
+            .return_type(t)
+    }
+}
+
 impl LibraryBuiltin {
     /// The library builtin `name_id` spells, and which spelling it is.
     fn lookup(name_id: StringId) -> Option<(&'static LibraryBuiltin, Spelling)> {

@@ -2714,6 +2714,11 @@ pub const FOLD_CALLEES: &[&str] = &[
     "strlen", "strchr", "strcpy", "memcpy", "memset", "puts", "putchar", "fputs", "fputc", "fwrite",
 ];
 
+/// The label of the `index`th string literal in [`Module::strings`].
+pub(crate) fn string_label(index: usize) -> String {
+    format!(".LC{index}")
+}
+
 impl Module {
     /// Add a function
     pub fn add_function(&mut self, func: Function) {
@@ -2858,7 +2863,7 @@ impl Module {
         if let Some((label, _)) = self.strings.iter().find(|(_, c)| *c == content) {
             return label.clone();
         }
-        let label = format!(".LC{}", self.strings.len());
+        let label = string_label(self.strings.len());
         self.strings.push((label.clone(), content));
         label
     }

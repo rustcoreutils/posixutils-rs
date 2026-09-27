@@ -27,5 +27,6 @@ mod libm;
 mod math;
 mod mem_expand;
 mod memory;
+mod stdio_fold;
 mod string_fold;
 mod va_arg_pack;

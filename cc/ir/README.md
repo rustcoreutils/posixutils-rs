@@ -344,7 +344,7 @@ extern_symbols          - symbols needing GOT
 | `memexpand.rs` | A `memcpy`, `memset` or `memmove` of a small constant length becomes integer loads and stores, at every level. Also owns the chunking and the size limit the linearizer's aggregate copies use |
 | `build.rs` | `Builder`: the instructions that replace one instruction -- new pseudos, constants, loads, stores, operations -- at its source position. Not a pass; shared by `memexpand` and `libcall_fold` |
 | `strdata.rs` | The bytes of every object whose contents hold for the whole run (string literals, and `const` `char` arrays by `constglobal`'s rule), and the string a pointer into one reads -- or, for a length, the one length every `Select` and phi arm agrees on. Not a pass |
-| `libcall_fold/` | A call the parser tagged as a known library function (`Instruction::known`) becomes its result where the arguments decide it: `strlen("abc")` is 3, `strcmp(p, "")` the first byte of `p`. A dispatcher and one module per family of functions |
+| `libcall_fold/` | A call the parser tagged as a known library function (`Instruction::known`) becomes its result where the arguments decide it: `strlen("abc")` is 3, `strcmp(p, "")` the first byte of `p`; and an output call whose result is unused becomes a cheaper one that writes the same bytes: `printf("hi\n")` is `puts("hi")`. A dispatcher and one module per family of functions |
 | `lower.rs` | Phi elimination to copies |
 
 The driver in `cc/opt.rs` runs `inline → memexpand → constglobal → (memexpand + loadfwd + vrp + ifconv + sccp + instcombine + libcall_fold + dse + dce)*` to fixed

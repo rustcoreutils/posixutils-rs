@@ -1701,7 +1701,12 @@ fn literal_parts(token: &Token) -> Option<(&'static str, u8, &str)> {
 /// Rust string and has to be converted, or the two conventions mix inside one
 /// payload and neither its byte count nor its spelling comes out right.
 pub fn literal_payload(text: &str) -> String {
-    text.bytes().map(char::from).collect()
+    bytes_payload(text.as_bytes())
+}
+
+/// Encode source bytes as a literal payload: one `char` per byte.
+pub fn bytes_payload(bytes: &[u8]) -> String {
+    bytes.iter().copied().map(char::from).collect()
 }
 
 /// The source bytes a literal payload stands for.

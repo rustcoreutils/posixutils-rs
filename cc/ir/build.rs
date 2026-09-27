@@ -16,7 +16,7 @@
 //
 
 use super::constfold::at_width;
-use super::{Function, Instruction, Opcode, PseudoId};
+use super::{Function, Instruction, Opcode, Pseudo, PseudoId};
 use crate::diag::Position;
 use crate::types::{TypeId, TypeTable};
 
@@ -71,6 +71,15 @@ impl<'a> Builder<'a> {
                 .with_type_and_size(typ, size),
         );
         id
+    }
+
+    /// The address of the symbol `name`, as a `typ`.
+    pub(crate) fn sym_addr(&mut self, name: String, typ: TypeId) -> PseudoId {
+        let sym = self.func.alloc_pseudo();
+        self.func.add_pseudo(Pseudo::sym(sym, name));
+        let p = self.func.alloc_pseudo();
+        self.push(Instruction::sym_addr(p, sym, typ));
+        p
     }
 
     /// `op` of `a` and `b` into a new pseudo of `typ` at `size` bits.

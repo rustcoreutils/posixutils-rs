@@ -2401,19 +2401,31 @@ impl<'a> Parser<'a> {
     /// `2.2iL`, `1.0li` are all gcc-accepted -- so it is removed wherever it
     /// sits rather than only at the end.
     ///
-    /// A hex literal is left alone: `0x1i` is not a number, and in
-    /// `0x1f` the `f` is a digit, so scanning the tail for a marker there
-    /// would misread the value.
+    /// A hex *float* takes the marker too (`0x1.8p1i`, `0x1p0fi`,
+    /// `0x2p-1iL`), but only in the suffix after its binary exponent: before
+    /// the `p`, `a`-`f` are digits, so in `0xfp0i` the `f` is the value 15
+    /// and not a suffix. A hex literal with no `p` is left alone: `0x1i` is
+    /// not a number, and in `0x1f` the `f` is a digit.
     fn strip_imaginary_suffix(s: &str) -> (String, bool) {
-        if s.len() < 2 || s.starts_with("0x") || s.starts_with("0X") {
+        if s.len() < 2 {
             return (s.to_string(), false);
         }
+        // Where the suffix search may begin: the whole spelling for a decimal
+        // constant, and only past the binary exponent for a hex one.
+        let search_from = if s.starts_with("0x") || s.starts_with("0X") {
+            match s.find(['p', 'P']) {
+                Some(p) => p + 1,
+                None => return (s.to_string(), false),
+            }
+        } else {
+            0
+        };
         // The suffix is the trailing run of letters. Only that run is searched,
         // so the `i` of a hex digit sequence or an exponent cannot be taken for
         // a marker.
-        let digits_end = s
+        let digits_end = s[search_from..]
             .rfind(|c: char| c.is_ascii_digit() || c == '.')
-            .map_or(0, |i| i + 1);
+            .map_or(search_from, |i| search_from + i + 1);
         let (num, suffix) = s.split_at(digits_end);
         if !suffix.contains(['i', 'I', 'j', 'J']) {
             return (s.to_string(), false);

@@ -1365,3 +1365,34 @@ int main(void) {
         0
     );
 }
+
+/// The GNU imaginary marker on a *hexadecimal* floating constant. gcc
+/// accepts `0x1.8p1i` exactly as it accepts `3.0i`, with the same suffix
+/// orders, and gives the same values; c17 took the marker on a decimal
+/// constant and rejected every hex one as an invalid literal.
+#[test]
+fn c99_gnu_imaginary_hex_constants() {
+    let code = r#"
+int main(void) {
+    { _Complex double z = 0x1.8p1i;
+      if (__real__ z != 0.0 || __imag__ z != 3.0) return 1; }
+    { _Complex float z = 0x1p0fi;
+      if (__imag__ z != 1.0f) return 2; }
+    { _Complex float z = 0x1p-1if;
+      if (__imag__ z != 0.5f) return 3; }
+    { _Complex long double z = 0x2p-1iL;
+      if (__imag__ z != 1.0L) return 4; }
+    { _Complex long double z = 0x1.8p0Li;
+      if (__imag__ z != 1.5L) return 5; }
+    { _Complex double z = 0xAp0j;
+      if (__imag__ z != 10.0) return 6; }
+    if (sizeof(0x1p0i) != sizeof(_Complex double)) return 7;
+    if (sizeof(0x1p0fi) != sizeof(_Complex float)) return 8;
+    if (sizeof(0x1p0iL) != sizeof(_Complex long double)) return 9;
+    { _Complex double z = 0x1p2 + 0x1p3i;
+      if (__real__ z != 4.0 || __imag__ z != 8.0) return 10; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_gnu_imaginary_hex", code, &[]), 0);
+}

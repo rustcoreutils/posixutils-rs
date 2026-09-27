@@ -6056,6 +6056,67 @@ fn test_imaginary_integer_constants() {
     }
 }
 
+/// The GNU imaginary marker on a hexadecimal floating constant.
+///
+/// Only the suffix after the binary exponent may carry the marker; before the
+/// `p`, `a`-`f` are digits, so `0xfp0i` is `15i` and not a `float`. The marker
+/// combines with `f`/`l` on either side, as it does on a decimal constant.
+#[test]
+fn test_imaginary_hex_float_constants() {
+    for (src, want, base) in [
+        ("0x1.8p1i", 3.0, 'd'),
+        ("0xfp0i", 15.0, 'd'),
+        ("0xFp0I", 15.0, 'd'),
+        ("0x1p0fi", 1.0, 'f'),
+        ("0x1p-1if", 0.5, 'f'),
+        ("0x2p-1iL", 1.0, 'l'),
+        ("0x1.8p0Li", 1.5, 'l'),
+        ("0xAp0j", 10.0, 'd'),
+        ("0x1P+2i", 4.0, 'd'),
+    ] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let typ = expr.typ.unwrap_or_else(|| panic!("{src} has no type"));
+        assert!(
+            types.is_complex_float(typ),
+            "{src} should be a complex float"
+        );
+        let ExprKind::BuiltinComplex { real, imag } = &expr.kind else {
+            panic!("{src} gave {:?}", expr.kind);
+        };
+        assert!(
+            matches!(real.kind, ExprKind::FloatLit(v) if v.to_f64() == 0.0),
+            "{src}: real half is {:?}",
+            real.kind
+        );
+        assert!(
+            matches!(imag.kind, ExprKind::FloatLit(v) if v.to_f64() == want),
+            "{src}: imaginary half is {:?}",
+            imag.kind
+        );
+        let want_base = match base {
+            'f' => types.float_id,
+            'l' => types.longdouble_id,
+            _ => types.double_id,
+        };
+        assert_eq!(imag.typ, Some(want_base), "{src} base type");
+    }
+
+    // The control: without a marker, a hex float stays real, and its `f`
+    // digits are still digits.
+    for (src, want) in [("0xfp0", 15.0), ("0x1.8p1", 3.0), ("0xfp0f", 15.0)] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let typ = expr.typ.unwrap_or_else(|| panic!("{src} has no type"));
+        assert!(!types.is_complex(typ), "{src} should not be complex");
+        assert!(
+            matches!(expr.kind, ExprKind::FloatLit(v) if v.to_f64() == want),
+            "{src} gave {:?}",
+            expr.kind
+        );
+    }
+}
+
 /// An object no `i32` frame displacement can reach is refused where it is
 /// declared.
 ///

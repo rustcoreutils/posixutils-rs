@@ -11,7 +11,7 @@
 
 use crate::arch::mapping::{
     build_f16_convert_call, expand_float16_arith, expand_float16_cmp, expand_float16_int_convert,
-    expand_float16_neg, float_suffix, map_binary128, map_int128_divmod, map_int128_expand,
+    expand_float16_neg, float_suffix, map_int128_divmod, map_int128_expand,
     map_int128_float_convert, ArchMapper, MappedInsn, MappingCtx,
 };
 use crate::float::{FpFormat, IntegralRounding};
@@ -34,11 +34,6 @@ impl ArchMapper for X86_64Mapper {
         }
         // Shared: int128↔float → rtlib
         if let Some(r) = map_int128_float_convert(insn, ctx) {
-            return r;
-        }
-        // Shared: IEEE binary128 → rtlib soft-float. On x86-64 this is
-        // `__float128` only; `long double` is x87 and stays in hardware.
-        if let Some(r) = map_binary128(insn, ctx) {
             return r;
         }
         // x86-64 only: Float16 soft-float → expand

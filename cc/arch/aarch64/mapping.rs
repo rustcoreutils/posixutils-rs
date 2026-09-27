@@ -10,8 +10,8 @@
 //
 
 use crate::arch::mapping::{
-    map_binary128, map_int128_divmod, map_int128_expand, map_int128_float_convert,
-    map_int128_to_float16, ArchMapper, MappedInsn, MappingCtx,
+    map_int128_divmod, map_int128_expand, map_int128_float_convert, map_int128_to_float16,
+    ArchMapper, MappedInsn, MappingCtx,
 };
 use crate::float::FpFormat;
 use crate::ir::{Instruction, Opcode};
@@ -39,11 +39,6 @@ impl ArchMapper for Aarch64Mapper {
         if let Some(r) = map_int128_to_float16(insn, ctx) {
             return r;
         }
-        // Shared: IEEE binary128 → rtlib soft-float. On this target that is
-        // `long double` as well as `__float128`.
-        if let Some(r) = map_binary128(insn, ctx) {
-            return r;
-        }
         MappedInsn::Legal
     }
 
@@ -66,7 +61,7 @@ impl ArchMapper for Aarch64Mapper {
 mod tests {
     use super::*;
     use crate::arch::mapping::test_helpers::*;
-    use crate::arch::mapping::MappingCtx;
+    use crate::arch::mapping::{library_call, MappingCtx};
     use crate::ir::{Instruction, Opcode, PseudoId};
     use crate::target::{Arch, Os, Target};
     use crate::types::TypeTable;
@@ -133,7 +128,8 @@ mod tests {
         assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__umodti3");
     }
 
-    // Long double → rtlib (aarch64/Linux only)
+    // Long double → rtlib (aarch64/Linux only), after the optimizer: the
+    // early mapping leaves binary128 alone for the folders.
 
     #[test]
     fn test_aarch64_longdouble_binop() {
@@ -161,7 +157,8 @@ mod tests {
                 types: &types,
                 target: &target,
             };
-            assert_libcall(&mapper.map_insn(&insn, &mut ctx), name);
+            assert_legal(&mapper.map_insn(&insn, &mut ctx));
+            assert_libcall(&library_call(&insn, &mut ctx, &mapper), name);
         }
     }
 
@@ -208,7 +205,8 @@ mod tests {
             types: &types,
             target: &target,
         };
-        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__negtf2");
+        assert_legal(&mapper.map_insn(&insn, &mut ctx));
+        assert_libcall(&library_call(&insn, &mut ctx, &mapper), "__negtf2");
     }
 
     #[test]
@@ -232,7 +230,12 @@ mod tests {
             types: &types,
             target: &target,
         };
-        assert_cmp_libcall(&mapper.map_insn(&insn, &mut ctx), "__lttf2", Opcode::SetLt);
+        assert_legal(&mapper.map_insn(&insn, &mut ctx));
+        assert_cmp_libcall(
+            &library_call(&insn, &mut ctx, &mapper),
+            "__lttf2",
+            Opcode::SetLt,
+        );
 
         let mut insn = Instruction::binop(
             Opcode::FCmpOEq,
@@ -249,7 +252,12 @@ mod tests {
             types: &types,
             target: &target,
         };
-        assert_cmp_libcall(&mapper.map_insn(&insn, &mut ctx), "__eqtf2", Opcode::SetEq);
+        assert_legal(&mapper.map_insn(&insn, &mut ctx));
+        assert_cmp_libcall(
+            &library_call(&insn, &mut ctx, &mapper),
+            "__eqtf2",
+            Opcode::SetEq,
+        );
     }
 
     #[test]
@@ -266,7 +274,8 @@ mod tests {
             types: &types,
             target: &target,
         };
-        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__extendsftf2");
+        assert_legal(&mapper.map_insn(&insn, &mut ctx));
+        assert_libcall(&library_call(&insn, &mut ctx, &mapper), "__extendsftf2");
 
         // longdouble → double
         let insn = make_convert_insn(Opcode::FCvtF, types.double_id, 64, types.longdouble_id, 128);
@@ -276,7 +285,8 @@ mod tests {
             types: &types,
             target: &target,
         };
-        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__trunctfdf2");
+        assert_legal(&mapper.map_insn(&insn, &mut ctx));
+        assert_libcall(&library_call(&insn, &mut ctx, &mapper), "__trunctfdf2");
 
         // int32 → longdouble
         let insn = make_convert_insn(Opcode::SCvtF, types.longdouble_id, 128, types.int_id, 32);
@@ -286,7 +296,8 @@ mod tests {
             types: &types,
             target: &target,
         };
-        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__floatsitf");
+        assert_legal(&mapper.map_insn(&insn, &mut ctx));
+        assert_libcall(&library_call(&insn, &mut ctx, &mapper), "__floatsitf");
 
         // longdouble → int64
         let insn = make_convert_insn(Opcode::FCvtS, types.long_id, 64, types.longdouble_id, 128);
@@ -296,7 +307,8 @@ mod tests {
             types: &types,
             target: &target,
         };
-        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__fixtfdi");
+        assert_legal(&mapper.map_insn(&insn, &mut ctx));
+        assert_libcall(&library_call(&insn, &mut ctx, &mapper), "__fixtfdi");
     }
 
     #[test]

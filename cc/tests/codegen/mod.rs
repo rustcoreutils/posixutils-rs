@@ -15,6 +15,7 @@ mod aarch64_offsets;
 mod aarch64_runtime;
 pub mod asm_probe;
 mod atomics_asm;
+mod binary128;
 mod cross_abi;
 mod debug_info;
 mod inline_asm;

@@ -373,7 +373,6 @@ Most of what is left is one thing.
 | Group | Note |
 |---|---|
 | Builtin folding | What is left of `execute/builtins/`. Each test defines its own `strlen`, `memcpy` or `printf` that calls `abort()` when `__OPTIMIZE__` is set, so a run-time failure there means c17 emitted a real call where gcc folded the builtin or expanded it inline. Nothing fails to *compile*, so no build is blocked; it is gcc-parity and code quality, and it is being worked. The functions that read strings fold (`ir::libcall_fold::strings`), and so do those that copy one (`copies`) and the output functions (`stdio`); still called where gcc folds or expands is `builtins/strlen`, whose strings are built by stores into a local array |
-| binary128 constant folding | On aarch64 `long double` is IEEE binary128 and every operation on it is a soft-float call (`__addtf3`, `__netf2`, ...) that no pass folds, so even `1.0L + 2.0L != 3.0L` survives `-O2`. `builtins/complex-1` fails on aarch64 at `-O1` and above for that reason alone: its `long double _Complex` cases keep their `link_error` calls. x86-64 folds the same code |
 | Dead-call elimination proofs | `20030330-1`, `medce-1` and `ieee/fp-cmp-7` at `-O0`, where a constant branch keeps its arm (recorded in DECISIONS.md). Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link* |
 
 One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.

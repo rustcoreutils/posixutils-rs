@@ -7,6 +7,7 @@ aarch64/builtins/abs-2@-O2
 aarch64/builtins/abs-3@-O0
 aarch64/builtins/abs-3@-O2
 aarch64/builtins/complex-1@-O0
+aarch64/builtins/complex-1@-O2
 aarch64/builtins/fprintf@-O0
 aarch64/builtins/fprintf@-O2
 aarch64/builtins/fputs@-O0

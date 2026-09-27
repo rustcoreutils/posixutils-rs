@@ -406,12 +406,8 @@ pub(crate) fn eval_fcvt(op: Opcode, dst_size: u32, src_fmt: FpFormat, a: FloatVa
         Opcode::FCvtU => false,
         _ => return None,
     };
-    let v = a.round_to_format(src_fmt).trunc_to_i128()?;
-    let size = dst_size.max(1);
-    if !signed && v < 0 {
-        return None;
-    }
-    (at_width(v, size, signed) == v).then_some(v)
+    a.round_to_format(src_fmt)
+        .to_integer(dst_size.clamp(1, 128), signed)
 }
 
 /// `insn`'s unary operation applied to a constant.

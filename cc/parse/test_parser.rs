@@ -7086,3 +7086,58 @@ fn test_calling_convention_comes_from_any_declaration() {
         ]
     );
 }
+
+/// A floating comparison or a cast to an integer in an integer constant
+/// expression is decided exactly, at the operands' common type: through
+/// `f64` the first two were false, `0.1f != 0.1` was false, and
+/// `(_Bool)0.5` was 0. Each `_Static_assert` is gcc's answer.
+#[test]
+fn test_constant_expression_floating_folds_are_exact() {
+    let src = "\
+        _Static_assert(0x1p62L + 1.0L > 0x1p62L, \"order\");\n\
+        _Static_assert((long long)(0x1p62L + 1.0L) == 4611686018427387905LL, \"cast\");\n\
+        _Static_assert((unsigned long long)(0x1p63L + 3.0L) == 9223372036854775811ULL, \"u\");\n\
+        _Static_assert(0.1f != 0.1, \"common type\");\n\
+        _Static_assert((1LL << 60) + 1 == 0x1p60, \"integer operand rounds\");\n\
+        _Static_assert((int)0.99999999999999999999 == 1, \"literal is a double\");\n\
+        _Static_assert((_Bool)0.5 == 1, \"bool\");\n\
+        _Static_assert((int)((1 / 2) + 0.5) == 0, \"integer subexpression\");\n\
+        _Static_assert(__builtin_nan(\"\") != __builtin_nan(\"\"), \"unordered ne\");\n\
+        _Static_assert(!(__builtin_nan(\"\") == __builtin_nan(\"\")), \"unordered eq\");\n\
+        _Static_assert(__builtin_constant_p(0x1p62L + 1.0L), \"constant\");\n";
+    if let Err(e) = parse_tu(src) {
+        panic!("should have parsed: {e}");
+    }
+}
+
+/// A conversion C leaves undefined is not an integer constant expression:
+/// gcc makes `int a[(int)1e300 > 0];` a VLA for the same reason.
+#[test]
+fn test_out_of_range_float_cast_is_not_an_integer_constant() {
+    for src in [
+        "enum { E = (int)1e300 };",
+        "_Static_assert((int)__builtin_nan(\"\") == 0, \"\");",
+        "_Static_assert((unsigned)-1.0 == 0, \"\");",
+    ] {
+        assert!(parse_tu(src).is_err(), "{src} should be rejected");
+    }
+}
+
+/// `==` and `!=` take a complex operand, and fold: both operands convert to
+/// the common complex type and compare half by half. Each answer is gcc's.
+#[test]
+fn test_complex_equality_is_a_constant_expression() {
+    let src = "\
+        _Static_assert((_Complex float)(0.5) == 0.5, \"real promotes\");\n\
+        _Static_assert((1.0f + 2.0fi) == (1.0L + 2.0iL), \"common type\");\n\
+        _Static_assert((0.1f + 0i) != 0.1, \"float half widens exactly\");\n\
+        _Static_assert(3 == (3 + 0i), \"complex integer\");\n\
+        _Static_assert(__builtin_complex(__builtin_nan(\"\"), 0.0) != __builtin_complex(__builtin_nan(\"\"), 0.0), \"NaN half\");\n\
+        _Static_assert(__real__ (3 + 4i) == 3 && __imag__ (3 + 4i) == 4, \"halves\");\n\
+        _Static_assert(!(0.0 + 0.0i) && (0.0 + 1.0i), \"truth\");\n\
+        _Static_assert((_Bool)(0.0 + 1.0i) && (int)(3.75 + 2.5i) == 3, \"conversion\");\n\
+        _Static_assert(((0.0 + 1.0i) ? 7 : 8) == 7, \"condition\");\n";
+    if let Err(e) = parse_tu(src) {
+        panic!("should have parsed: {e}");
+    }
+}

@@ -10,7 +10,7 @@
 // Recursive descent parser with Pratt-style precedence climbing
 //
 
-use super::ast::{BinaryOp, Expr, ExprKind, UnaryOp};
+use super::ast::Expr;
 use crate::constexpr::ConstScope;
 use crate::diag;
 use crate::strings::StringId;
@@ -658,53 +658,6 @@ impl Parser<'_> {
         self.symbols.lookup_typedef(name_id).is_some()
     }
 
-    /// The `f64` value of a constant floating subexpression.
-    ///
-    /// Only reached from a comparison, whose result is an integer -- the
-    /// arithmetic itself is folded at full width by the linearizer's
-    /// `eval_const_float_expr` for anything that survives to code generation.
-    /// `f64` is enough to decide an ordering that `i128` truncation was
-    /// getting wrong.
-    pub(crate) fn eval_const_f64(&self, scope: ConstScope, expr: &Expr) -> Option<f64> {
-        match &expr.kind {
-            ExprKind::FloatLit(v) => Some(v.to_f64()),
-            ExprKind::IntLit(v) => Some(*v as f64),
-            // `CharLit` is an `i64` whose signedness the lexer has already
-            // resolved, so `'\x80'` is -128 where `char` is signed. Rounding
-            // it through `u32` made that 4294967168.0.
-            ExprKind::CharLit(c) => Some(*c as f64),
-            ExprKind::Cast { expr: inner, .. } => {
-                let v = self.eval_const_f64(scope, inner)?;
-                // A cast to an integer type truncates before the comparison.
-                match expr.typ {
-                    Some(t) if self.types.is_integer(t) => Some(v.trunc()),
-                    _ => Some(v),
-                }
-            }
-            ExprKind::Unary {
-                op: UnaryOp::Neg,
-                operand,
-            } => Some(-self.eval_const_f64(scope, operand)?),
-            ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_f64(scope, left)?;
-                let r = self.eval_const_f64(scope, right)?;
-                match op {
-                    BinaryOp::Add => Some(l + r),
-                    BinaryOp::Sub => Some(l - r),
-                    BinaryOp::Mul => Some(l * r),
-                    BinaryOp::Div if r != 0.0 => Some(l / r),
-                    _ => None,
-                }
-            }
-            // Anything else that is an integer constant expression converts to
-            // one. `sizeof`, `_Alignof`, an enumerator and a conditional all
-            // reach here, and each was answered "not a constant expression"
-            // for want of an arm -- so `_Static_assert(sizeof(int) < 4.5, "")`
-            // was rejected although both operands are perfectly constant.
-            _ => crate::constexpr::eval(self, scope, expr).map(|v| v as f64),
-        }
-    }
-
     /// Evaluate an integer constant expression: array bounds, enumerators,
     /// `case` labels, bit-field widths, `_Static_assert`.
     ///
@@ -873,7 +826,7 @@ impl Parser<'_> {
 /// The parser's half of the shared C17 6.6 walk.
 ///
 /// [`crate::constexpr`] owns the walk; what differs between the two hosts is
-/// only what an identifier means and how a floating subexpression folds.
+/// only what an identifier means.
 impl crate::constexpr::ConstEnv for Parser<'_> {
     /// Every constant expression the parser folds is one C requires, so it
     /// always answers.
@@ -897,7 +850,14 @@ impl crate::constexpr::ConstEnv for Parser<'_> {
         self.resolve_struct_type(typ)
     }
 
-    fn float_value(&self, scope: ConstScope, expr: &Expr) -> Option<f64> {
-        self.eval_const_f64(scope, expr)
+    /// No floating identifier has a value in the parser, for the reason
+    /// [`Self::ident_value`] gives: a `const double` lives in a global that
+    /// does not exist yet.
+    fn float_ident_value(
+        &self,
+        _sym: crate::symbol::SymbolId,
+        _scope: ConstScope,
+    ) -> Option<crate::float::FloatVal> {
+        None
     }
 }

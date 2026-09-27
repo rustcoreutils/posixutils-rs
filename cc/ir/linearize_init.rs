@@ -10,11 +10,11 @@
 
 use super::linearize::*;
 use super::{Initializer, SymbolAlias};
+use crate::constexpr;
+use crate::constexpr::ConstScope;
 use crate::diag::error;
 use crate::float::FloatVal;
-use crate::parse::ast::{
-    BinaryOp, Declaration, Designator, Expr, ExprKind, InitElement, InlineLibraryFn, UnaryOp,
-};
+use crate::parse::ast::{BinaryOp, Declaration, Designator, Expr, ExprKind, InitElement, UnaryOp};
 use crate::strings::StringId;
 use crate::token::lexer::Position;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
@@ -43,6 +43,10 @@ pub(crate) fn is_const_object_type(types: &TypeTable, typ: TypeId) -> bool {
         return false;
     }
 }
+
+/// `-Wno-overflow` silences the warning for a floating constant that
+/// converts to an integer type outside its range, as it does in gcc.
+const OVERFLOW_WARNING: &str = "overflow";
 
 /// Name an expression the way a C programmer would, for a diagnostic.
 ///
@@ -656,78 +660,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Fold a constant expression of complex type into its two halves.
-    ///
-    /// Returns `None` for anything that is not a constant, so callers can fall
-    /// through to their existing diagnostics.
-    ///
-    /// A complex constant is two real ones, and each half is carried the way
-    /// [`Self::eval_const_float_expr`] carries a real constant: a literal at
-    /// its full declared width, arithmetic folded through `f64`. Halving the
-    /// precision of a `long double _Complex` literal here, while the real path
-    /// keeps it, would make the two disagree about the same written value.
-    fn eval_const_complex(&self, expr: &Expr) -> Option<(FloatVal, FloatVal)> {
-        match &expr.kind {
-            // `I` itself is `__builtin_complex(0.0, 1.0)`.
-            ExprKind::BuiltinComplex { real, imag } => Some((
-                self.eval_const_float_init_expr(real)?,
-                self.eval_const_float_init_expr(imag)?,
-            )),
-
-            // A real constant is a complex one with a zero imaginary part.
-            ExprKind::FloatLit(_) | ExprKind::IntLit(_) | ExprKind::CharLit(_) => {
-                Some((self.eval_const_float_init_expr(expr)?, FloatVal::ZERO))
-            }
-
-            ExprKind::Cast { expr: inner, .. } => self.eval_const_complex(inner),
-
-            ExprKind::Unary {
-                op: UnaryOp::Neg,
-                operand,
-            } => {
-                let (re, im) = self.eval_const_complex(operand)?;
-                Some((re.negated(), im.negated()))
-            }
-
-            // GNU `~z` on a complex operand is the conjugate, as is `conj(z)`:
-            // only the imaginary half is negated. On an integer operand `~` is
-            // the bitwise complement, which is not a complex fold at all.
-            ExprKind::Unary {
-                op: UnaryOp::BitNot,
-                operand,
-            }
-            | ExprKind::InlineLibraryCall {
-                func: InlineLibraryFn::Conjugate,
-                arg: operand,
-            } if operand.typ.is_some_and(|t| self.types.is_complex(t)) => {
-                let (re, im) = self.eval_const_complex(operand)?;
-                Some((re, im.negated()))
-            }
-
-            ExprKind::Binary { op, left, right } => {
-                let (a, b) = self.eval_const_complex(left)?;
-                let (c, d) = self.eval_const_complex(right)?;
-                let (a, b, c, d) = (a.to_f64(), b.to_f64(), c.to_f64(), d.to_f64());
-                let (re, im) = match op {
-                    BinaryOp::Add => (a + c, b + d),
-                    BinaryOp::Sub => (a - c, b - d),
-                    BinaryOp::Mul => (a * c - b * d, a * d + b * c),
-                    BinaryOp::Div => {
-                        let den = c * c + d * d;
-                        if den == 0.0 {
-                            return None;
-                        }
-                        ((a * c + b * d) / den, (b * c - a * d) / den)
-                    }
-                    _ => return None,
-                };
-                Some((FloatVal::from_f64(re), FloatVal::from_f64(im)))
-            }
-
-            _ => None,
-        }
-    }
-
     /// Build the initializer for an object of complex type.
     ///
     /// A complex value is two reals laid out end to end, which
@@ -739,29 +671,31 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Only the first element initializes the object; gcc warns "excess
         // elements in scalar initializer" for any others and ignores them, so
         // `{1.0, 2.0}` is 1.0 + 0.0i rather than 1.0 + 2.0i.
-        let (re, im) = if let ExprKind::InitList { elements } = &expr.kind {
-            let first = elements.first()?;
-            self.eval_const_complex(&first.value)?
+        let value = if let ExprKind::InitList { elements } = &expr.kind {
+            &elements.first()?.value
         } else {
-            self.eval_const_complex(expr)?
+            expr
         };
-
+        // Converted as in assignment (C17 6.7.9p11), from the initializer's
+        // own type to the object's.
         let base = self.types.complex_base(typ);
+        let (re, im) =
+            constexpr::eval_complex_as(self, ConstScope::StaticInitializer, value, base)?;
+
         let base_bytes = self.types.size_bytes(base);
         // A GNU complex integer's halves are integers. Emitting them as
         // floats laid an eight-byte floating image over a four-byte half, so
         // `_Complex int b = 8;` wrote past its own object and zeroed whatever
         // the frame had put next to it.
-        let (re_init, im_init) = if self.types.is_integer(base) {
-            (
-                Initializer::Int(re.to_f64() as i128),
-                Initializer::Int(im.to_f64() as i128),
-            )
-        } else {
-            // Narrowing to the base width happens at emission, which knows the
-            // field size; `FloatVal` just carries the value.
-            (Initializer::Float(re), Initializer::Float(im))
+        let half = |v: FloatVal| {
+            if self.types.is_integer(base) {
+                // Already an integer of `base`'s range: converting it is exact.
+                constexpr::float_to_integer(self.types, v, base).map(Initializer::Int)
+            } else {
+                Some(Initializer::Float(v))
+            }
         };
+        let (re_init, im_init) = (half(re)?, half(im)?);
         Some(Initializer::Struct {
             total_size: base_bytes * 2,
             fields: vec![(0, base_bytes, re_init), (base_bytes, base_bytes, im_init)],
@@ -778,11 +712,8 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// -- neither of which is an integer, and both of which C17 6.6 makes
     /// perfectly constant.
     fn const_condition(&self, cond: &Expr) -> Option<bool> {
-        if let Some(val) = self.eval_const_init_expr(cond) {
-            return Some(val != 0);
-        }
-        if let Some(val) = self.eval_const_float_init_expr(cond) {
-            return Some(!val.is_zero());
+        if let Some(truth) = constexpr::eval_truth(self, ConstScope::StaticInitializer, cond) {
+            return Some(truth);
         }
         // An address constant. A string literal has storage of its own and the
         // address of an object or a function is never null, so all of these are
@@ -835,14 +766,11 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Converted as in assignment (C17 6.7.9p11), from the
             // initializer's own type: `double d = 0.1f;` holds 0.1f widened,
             // not 0.1, and a `double` signalling NaN initializing a `long
-            // double` is quieted as the conversion at run time quiets it.
-            if let Some(val) = self.eval_const_float_init_expr(expr) {
-                return Some(wrap(self.convert_const_float(val, expr.typ, typ)));
-            }
-            // An integer constant initializing a floating object converts
-            // exactly, however wide it is: `long double x = 1;`.
-            let val = self.eval_const_init_expr(expr)?;
-            return Some(wrap(FloatVal::from_parts(val < 0, val.unsigned_abs(), 0)));
+            // double` is quieted as the conversion at run time quiets it. An
+            // integer constant is exact however wide it is, and rounds once:
+            // `long double x = 1;`. A complex constant gives its real part.
+            let val = constexpr::eval_as_float(self, ConstScope::StaticInitializer, expr, typ)?;
+            return Some(wrap(val));
         }
 
         // Converting to `_Bool` is not a truncation: every non-zero value
@@ -857,13 +785,26 @@ impl<'a> super::linearize::Linearizer<'a> {
             }));
         }
         // C17 6.3.1.4: converting a floating constant to an integer type
-        // discards the fractional part.
-        let val = self.eval_const_float_init_expr(expr)?;
-        Some(Initializer::Int(if is_bool {
-            i128::from(!val.is_zero())
-        } else {
-            val.to_f64() as i128
-        }))
+        // discards the fractional part; a complex one converts its real part.
+        let v = match constexpr::eval_as_integer(self, ConstScope::StaticInitializer, expr, typ)? {
+            constexpr::IntConversion::InRange(v) => return Some(Initializer::Int(v)),
+            constexpr::IntConversion::Saturated(v) => v,
+        };
+        // Out of range, where C gives no value and a static object must still
+        // have one: gcc's, with gcc's warning.
+        if crate::diag::warning_group_enabled(OVERFLOW_WARNING) {
+            let from = expr
+                .typ
+                .map_or_else(String::new, |t| self.types.format_type(t, None));
+            crate::diag::warning(
+                self.expr_pos(expr),
+                &format!(
+                    "overflow in conversion from '{from}' to '{}' changes value",
+                    self.types.format_type(typ, None)
+                ),
+            );
+        }
+        Some(Initializer::Int(v))
     }
 
     /// The position to report for `expr`.

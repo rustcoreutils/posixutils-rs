@@ -2193,92 +2193,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         crate::constexpr::eval(self, scope, expr)
     }
 
-    /// Fold a floating constant expression for a static initializer, with the
-    /// `const`-object folding [`Self::eval_const_init_expr`] describes.
-    ///
-    /// There is no `Standard` entry point beside this one because no strict
-    /// context reaches the floating evaluator: an array size, a `case` label
-    /// and `_Static_assert` all take an *integer* constant expression, and a
-    /// floating one is refused before it gets here. The scope is still a
-    /// parameter rather than a constant so that adding such a caller is a
-    /// one-line change and cannot silently inherit the lax rule.
-    pub(crate) fn eval_const_float_init_expr(&self, expr: &Expr) -> Option<FloatVal> {
-        self.eval_const_float_expr_scoped(ConstScope::StaticInitializer, expr)
-    }
-
-    fn eval_const_float_expr_scoped(&self, scope: ConstScope, expr: &Expr) -> Option<FloatVal> {
-        match &expr.kind {
-            ExprKind::FloatLit(v) => Some(*v),
-            // Exact: a `u128` mantissa has no more bits than the significand,
-            // where `f64` would have rounded anything past the 53rd.
-            ExprKind::IntLit(v) => Some(FloatVal::from_i128(*v as i128)),
-            ExprKind::CharLit(c) => Some(FloatVal::from_i128(*c as i128)),
-
-            // A `const double` folds in a static initializer exactly as a
-            // `const int` does; without this `const double d = 2.5; double x =
-            // d * 2;` was rejected while the integer spelling compiled.
-            ExprKind::Ident(symbol_id) if scope == ConstScope::StaticInitializer => {
-                self.const_object_float_value(*symbol_id)
-            }
-
-            ExprKind::Unary { op, operand } => {
-                let val = self.eval_const_float_expr_scoped(scope, operand)?;
-                match op {
-                    UnaryOp::Neg => Some(val.negated()),
-                    _ => None,
-                }
-            }
-
-            // The operation is done in the format of its own result type,
-            // which is the type the usual arithmetic conversions already gave
-            // this node -- not in whatever width the operands were written at.
-            ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_float_expr_scoped(scope, left)?;
-                let r = self.eval_const_float_expr_scoped(scope, right)?;
-                let fmt = expr.typ.and_then(|t| self.types.fp_format(t))?;
-                Some(match op {
-                    BinaryOp::Add => l.add(r, fmt),
-                    BinaryOp::Sub => l.sub(r, fmt),
-                    BinaryOp::Mul => l.mul(r, fmt),
-                    BinaryOp::Div => l.div(r, fmt),
-                    _ => return None,
-                })
-            }
-
-            // A cast converts to the target format. Discarding the cast type
-            // let `(float)0.1q` keep every bit of its binary128 value in a
-            // static initializer, where the same cast at run time rounds.
-            ExprKind::Cast {
-                expr: inner,
-                cast_type,
-            } => {
-                let val = self.eval_const_float_expr_scoped(scope, inner)?;
-                Some(self.convert_const_float(val, inner.typ, *cast_type))
-            }
-
-            _ => None,
-        }
-    }
-
-    /// The constant `val`, the value of an expression of type `from`,
-    /// converted to type `to` as the program converts it at run time: rounded
-    /// at `from`'s format first, and a NaN quieted when the format changes
-    /// (see [`FloatVal::convert`]). From an integer, whose value is exact
-    /// here, it is one rounding; to a type that is not floating, nothing.
-    pub(crate) fn convert_const_float(
-        &self,
-        val: FloatVal,
-        from: Option<TypeId>,
-        to: TypeId,
-    ) -> FloatVal {
-        let src = from.and_then(|t| self.types.fp_format(t));
-        match (src, self.types.fp_format(to)) {
-            (Some(src), Some(dst)) => val.convert(src, dst),
-            (None, Some(dst)) => val.round_to_format(dst),
-            (_, None) => val,
-        }
-    }
-
     /// The byte offset `array[index]` adds to the address of `array`.
     ///
     /// Shared by the two static-address walks, which differ only in whether
@@ -3849,8 +3763,7 @@ impl JumpScopeWalk {
 /// The linearizer's half of the shared C17 6.6 walk.
 ///
 /// [`crate::constexpr`] owns the walk; what differs from the parser's half is
-/// the `const`-object folding gcc performs in a static initializer, and that a
-/// floating subexpression folds in its own format rather than through `f64`.
+/// the `const`-object folding gcc performs in a static initializer.
 impl crate::constexpr::ConstEnv for Linearizer<'_> {
     /// A static initializer needs an answer; the linearizer's other folds --
     /// a constant `?:` condition, chiefly -- are optimizations, and one of
@@ -3878,13 +3791,17 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
         self.resolve_struct_type(typ)
     }
 
-    /// Folded at the expression's own precision and narrowed once, rather than
-    /// computed in `f64`: the two arms that ask for this -- an ordering and a
-    /// truncating cast -- are both decided correctly by the `f64` result, and
-    /// the exactness matters underneath it.
-    fn float_value(&self, scope: ConstScope, expr: &Expr) -> Option<f64> {
-        self.eval_const_float_expr_scoped(scope, expr)
-            .map(|v| v.to_f64())
+    /// A `const` floating object folds only in a static initializer, as its
+    /// integer counterpart in [`Self::ident_value`] does.
+    fn float_ident_value(
+        &self,
+        sym: crate::symbol::SymbolId,
+        scope: ConstScope,
+    ) -> Option<FloatVal> {
+        match scope {
+            ConstScope::Standard => None,
+            ConstScope::StaticInitializer => self.const_object_float_value(sym),
+        }
     }
 }
 

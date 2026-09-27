@@ -7125,3 +7125,13 @@ fn diagnostics_relational_operator_rejects_a_complex_operand() {
         );
     }
 }
+
+/// `==` and `!=` do take a complex operand (6.5.9p2), and fold as constants.
+#[test]
+fn diagnostics_equality_accepts_a_complex_operand() {
+    compile_expect_ok(
+        "complex_equality",
+        "int f = (_Complex float)(0.5) == 0.5;\n\
+         int g(_Complex double a, double b) { return (a == b) + (a != 2.0i); }\n",
+    );
+}

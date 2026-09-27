@@ -443,35 +443,91 @@ impl FloatVal {
         Some(if self.neg { ord.reverse() } else { ord })
     }
 
-    /// The integer part, truncated toward zero -- C's floating-to-integer
-    /// conversion (6.3.1.4).
+    /// The integer part, truncated toward zero, as a sign and a magnitude.
     ///
-    /// `None` when there is no integer to convert to: a NaN, an infinity, or
-    /// a magnitude of 2^127 or more. Those are the cases C leaves undefined,
-    /// and a caller folding a conversion must leave them to run time rather
-    /// than invent an answer.
+    /// `None` when there is no integer part to take: a NaN, an infinity, or
+    /// a magnitude of 2^128 or more.
     ///
     /// Not `to_f64() as i128`: rounding to `f64` first moves the value before
-    /// the fractional part is discarded, so a `long double` just below an
-    /// integer can round up to it and truncate one too high.
-    pub fn trunc_to_i128(self) -> Option<i128> {
+    /// the fractional part is discarded, so `0x1p62L + 1` came out 2^62 and
+    /// a `long double` just below an integer truncated one too high.
+    fn trunc_magnitude(self) -> Option<(bool, u128)> {
         if self.exp == EXP_SPECIAL {
             return None;
         }
         if self.sig == 0 {
-            return Some(0);
+            return Some((self.neg, 0));
         }
         // The significand's top bit is worth 2^(exp - BIAS).
         let top = self.exp as i32 - BIAS;
         if top < 0 {
             // Magnitude below 1, which includes every subnormal.
-            return Some(0);
+            return Some((self.neg, 0));
         }
-        if top >= 127 {
+        if top >= SIG_BITS as i32 {
             return None;
         }
-        let mag = (self.sig >> (127 - top as u32)) as i128;
-        Some(if self.neg { -mag } else { mag })
+        Some((self.neg, self.sig >> (127 - top as u32)))
+    }
+
+    /// C's conversion of this value to an integer type `bits` wide (C17
+    /// 6.3.1.4p1): the fractional part is discarded, truncating toward zero.
+    ///
+    /// The one place a floating value becomes an integer, for every fold that
+    /// converts one: a cast in a constant expression, a static initializer,
+    /// an `fcvt` instruction with a constant operand.
+    ///
+    /// `None` when the truncated value is outside the type's range -- a NaN
+    /// and an infinity included -- which is where C leaves the conversion
+    /// undefined. The value is whatever it already is: a caller holding a
+    /// wider value than its type rounds it to that type's format first.
+    ///
+    /// The answer is the integer's two's-complement bit pattern read as an
+    /// `i128`, so an unsigned 128-bit result of 2^127 or more is negative
+    /// here, as it is everywhere else c17 carries one.
+    pub fn to_integer(self, bits: u32, signed: bool) -> Option<i128> {
+        debug_assert!((1..=128).contains(&bits), "integer width {bits}");
+        let (neg, mag) = self.trunc_magnitude()?;
+        let limit = if signed { bits - 1 } else { bits };
+        // The largest magnitude on the side the value is on: 2^(bits-1) - 1
+        // or 2^(bits-1) for a signed type, 2^bits - 1 or 0 for an unsigned
+        // one. A negative value truncating to zero is always in range.
+        let largest = match (signed, neg) {
+            (false, true) => 0,
+            (true, true) => 1u128 << limit,
+            _ if limit == 128 => u128::MAX,
+            _ => (1u128 << limit) - 1,
+        };
+        if mag > largest {
+            return None;
+        }
+        let v = mag as i128;
+        Some(if neg { v.wrapping_neg() } else { v })
+    }
+
+    /// [`to_integer`](Self::to_integer), with gcc's answer where C gives
+    /// none: a value beyond the range saturates to the nearer end of it, and
+    /// a NaN becomes 0.
+    ///
+    /// Only for a context that must have *some* value and cannot leave the
+    /// conversion to run time -- a static initializer. gcc folds the same
+    /// constant to the same answer there, so the two compilers agree on a
+    /// program whose behavior C does not define.
+    pub fn to_integer_saturating(self, bits: u32, signed: bool) -> i128 {
+        if let Some(v) = self.to_integer(bits, signed) {
+            return v;
+        }
+        if self.is_nan() {
+            return 0;
+        }
+        match (signed, self.neg) {
+            (false, true) => 0,
+            (true, true) => (-1i128) << (bits - 1),
+            (true, false) if bits == 128 => i128::MAX,
+            (true, false) => (1i128 << (bits - 1)) - 1,
+            (false, false) if bits == 128 => -1,
+            (false, false) => ((1u128 << bits) - 1) as i128,
+        }
     }
 
     /// The encoding as an opaque key, for constant pooling.
@@ -1338,6 +1394,234 @@ impl FloatVal {
     }
 }
 
+/// A complex value: its real half, then its imaginary half.
+pub type Complex = (FloatVal, FloatVal);
+
+impl FpFormat {
+    /// The wider format libgcc divides this one's complex values in, where
+    /// it has one: `__divhc3` works in `float` and `__divsc3` in `double`,
+    /// and the extra precision lets both use the textbook formula. The wider
+    /// formats have nothing wider to work in and use Smith's method instead.
+    fn complex_div_working_format(self) -> Option<FpFormat> {
+        match self {
+            FpFormat::Binary16 => Some(FpFormat::Binary32),
+            FpFormat::Binary32 => Some(FpFormat::Binary64),
+            _ => None,
+        }
+    }
+}
+
+// Complex multiplication and division.
+//
+// A complex constant is folded by the algorithm the program runs when the
+// same operation is not constant: c17 lowers a floating complex `*` and `/`
+// to libgcc's `__mul?c3` and `__div?c3`, and these are those routines
+// (libgcc2.c, GCC 13), each operation rounded to the base format as they
+// round it. Folding by any other rule -- the textbook formula through `f64`
+// was the old one -- makes `static` and automatic copies of one expression
+// differ.
+//
+// Measured against libgcc 13 on 20000 random operand sets per format,
+// specials and cancelling products included, this agrees bit for bit --
+// every finite result, and Annex G's infinity recovery -- with
+// `__mul{s,d,x}c3`/`__div{s,d,x}c3` on x86-64 and with `__mul{s,d,t}c3`,
+// `__div{s,t}c3` on aarch64. A NaN result is a NaN, but its sign and payload
+// are this type's default rather than the hardware's. What does not agree:
+// - aarch64 libgcc is built with floating contraction, and `__divdc3` fuses
+//   each `x * ratio + y` into one `fmadd`, so a `double _Complex` quotient
+//   there can differ in its last place (about a third of random ones do).
+//   The multiplications fuse only inside the infinity recovery, where the
+//   result is scaled by an infinity; `__divsc3`'s fused `double` steps are
+//   rounded to `float` afterwards and were not seen to differ; binary128 is
+//   software and fuses nothing; nothing on x86-64 fuses.
+// - gcc folds a complex constant with MPC, correctly rounded, and can differ
+//   from its own run-time result -- and so from this -- where `ac - bd`
+//   cancels.
+// - Apple's `__divdc3` is compiler-rt's, which scales by `logb` instead.
+impl FloatVal {
+    /// `v` with this value's sign: `copysign(v, self)`.
+    fn sign_onto(self, v: Self) -> Self {
+        FloatVal { neg: self.neg, ..v }
+    }
+
+    /// `1` or `0`, as `isinf(v) ? 1 : 0`, carrying `v`'s sign: how libgcc
+    /// "boxes" an infinite operand before recomputing.
+    fn boxed(self) -> Self {
+        let unit = if self.is_infinite() {
+            FloatVal::from_i128(1)
+        } else {
+            FloatVal::ZERO
+        };
+        self.sign_onto(unit)
+    }
+
+    /// A NaN operand replaced by a zero of its own sign; anything else kept.
+    fn nan_to_zero(self) -> Self {
+        if self.is_nan() {
+            self.sign_onto(FloatVal::ZERO)
+        } else {
+            self
+        }
+    }
+
+    /// `|self| < |other|`, false when either is a NaN -- C's `<` on `fabs`.
+    fn magnitude_below(self, other: Self) -> bool {
+        self.magnitude().cmp_value(other.magnitude()) == Some(std::cmp::Ordering::Less)
+    }
+
+    /// `(a + bi) * (c + di)` at `fmt`, as `__mul?c3` computes it:
+    /// `(ac - bd) + (ad + bc)i`, each product and each sum rounded to `fmt`,
+    /// and C17 Annex G's recovery of an infinity that came out NaN + NaNi.
+    pub fn complex_mul(x: Complex, y: Complex, fmt: FpFormat) -> Complex {
+        let r = |v: Self| v.round_to_format(fmt);
+        let (mut a, mut b, mut c, mut d) = (r(x.0), r(x.1), r(y.0), r(y.1));
+        let (ac, bd) = (a.mul(c, fmt), b.mul(d, fmt));
+        let (ad, bc) = (a.mul(d, fmt), b.mul(c, fmt));
+        let re = ac.sub(bd, fmt);
+        let im = ad.add(bc, fmt);
+        if !(re.is_nan() && im.is_nan()) {
+            return (re, im);
+        }
+
+        let mut recalc = false;
+        if a.is_infinite() || b.is_infinite() {
+            // The left factor is infinite: box it, and zero the NaNs in the
+            // right one.
+            (a, b) = (a.boxed(), b.boxed());
+            (c, d) = (c.nan_to_zero(), d.nan_to_zero());
+            recalc = true;
+        }
+        if c.is_infinite() || d.is_infinite() {
+            (c, d) = (c.boxed(), d.boxed());
+            (a, b) = (a.nan_to_zero(), b.nan_to_zero());
+            recalc = true;
+        }
+        if !recalc && [ac, bd, ad, bc].iter().any(|p| p.is_infinite()) {
+            // An infinity from overflow, not from an operand.
+            (a, b, c, d) = (
+                a.nan_to_zero(),
+                b.nan_to_zero(),
+                c.nan_to_zero(),
+                d.nan_to_zero(),
+            );
+            recalc = true;
+        }
+        if !recalc {
+            return (re, im);
+        }
+        let inf = Self::infinity(false);
+        let re = a.mul(c, fmt).sub(b.mul(d, fmt), fmt);
+        let im = a.mul(d, fmt).add(b.mul(c, fmt), fmt);
+        (inf.mul(re, fmt), inf.mul(im, fmt))
+    }
+
+    /// `(a + bi) / (c + di)` at `fmt`, as `__div?c3` computes it.
+    ///
+    /// `float` and `_Float16` divide by the textbook formula in the next
+    /// wider format and round the result once more; the wider formats use
+    /// Smith's method, dividing through by the larger half of the divisor,
+    /// with libgcc's scaling against overflow and underflow. Annex G's
+    /// recovery of an infinity or a zero that came out NaN + NaNi follows.
+    pub fn complex_div(x: Complex, y: Complex, fmt: FpFormat) -> Complex {
+        let r = |v: Self| v.round_to_format(fmt);
+        let (a, b, c, d) = (r(x.0), r(x.1), r(y.0), r(y.1));
+        let ((re, im), (a, b, c, d)) = match fmt.complex_div_working_format() {
+            Some(wide) => {
+                // Widening is exact, so the operands need no conversion.
+                let denom = c.mul(c, wide).add(d.mul(d, wide), wide);
+                let re = a.mul(c, wide).add(b.mul(d, wide), wide).div(denom, wide);
+                let im = b.mul(c, wide).sub(a.mul(d, wide), wide).div(denom, wide);
+                ((re.convert(wide, fmt), im.convert(wide, fmt)), (a, b, c, d))
+            }
+            None => Self::smith_div((a, b), (c, d), fmt),
+        };
+        if !(re.is_nan() && im.is_nan()) {
+            return (re, im);
+        }
+
+        let inf = Self::infinity(false);
+        let zero = FloatVal::ZERO;
+        if c.is_zero() && d.is_zero() && (!a.is_nan() || !b.is_nan()) {
+            // Non-zero over zero.
+            let inf = c.sign_onto(inf);
+            (inf.mul(a, fmt), inf.mul(b, fmt))
+        } else if (a.is_infinite() || b.is_infinite()) && c.is_finite() && d.is_finite() {
+            // Infinite over finite.
+            let (a, b) = (a.boxed(), b.boxed());
+            let re = a.mul(c, fmt).add(b.mul(d, fmt), fmt);
+            let im = b.mul(c, fmt).sub(a.mul(d, fmt), fmt);
+            (inf.mul(re, fmt), inf.mul(im, fmt))
+        } else if (c.is_infinite() || d.is_infinite()) && a.is_finite() && b.is_finite() {
+            // Finite over infinite.
+            let (c, d) = (c.boxed(), d.boxed());
+            let re = a.mul(c, fmt).add(b.mul(d, fmt), fmt);
+            let im = b.mul(c, fmt).sub(a.mul(d, fmt), fmt);
+            (zero.mul(re, fmt), zero.mul(im, fmt))
+        } else {
+            (re, im)
+        }
+    }
+
+    /// The Smith's-method half of [`complex_div`](Self::complex_div): the
+    /// quotient before Annex G's recovery, and the four operands as scaled
+    /// here, since libgcc scales them in place and recovers from those.
+    fn smith_div(x: Complex, y: Complex, fmt: FpFormat) -> (Complex, (Self, Self, Self, Self)) {
+        let (mut a, mut b) = x;
+        let (c, d) = y;
+        let p = fmt.precision() as i32;
+        // libgcc's thresholds, from the format's own <float.h> values.
+        let rbig = Self::from_parts(false, (1u128 << p) - 1, fmt.emax() - p);
+        let rmin = Self::from_parts(false, 1, fmt.emin());
+        let rmin2 = Self::from_parts(false, 1, 1 - p);
+        let rminscal = Self::from_parts(false, 1, p - 1);
+        let rmax2 = rbig.mul(rmin2, fmt);
+        let two = Self::from_i128(2);
+
+        // Smith's two arms are one computation with the divisor's halves
+        // exchanged: `big` is the half divided through by, `small` the other.
+        let swapped = c.magnitude_below(d);
+        let (mut big, mut small) = if swapped { (d, c) } else { (c, d) };
+        if !big.magnitude_below(rbig) && !big.is_nan() {
+            // Prevent underflow when the denominator is near the largest
+            // finite value.
+            (a, b) = (a.div(two, fmt), b.div(two, fmt));
+            (big, small) = (big.div(two, fmt), small.div(two, fmt));
+        }
+        // Scaling up avoids some underflows; none can overflow, since the
+        // halves are below `rmin2` or `rmax2`.
+        let scale_up = big.magnitude_below(rmin2)
+            || (a.magnitude_below(rmin) && b.magnitude_below(rmax2) && big.magnitude_below(rmax2))
+            || (b.magnitude_below(rmin) && a.magnitude_below(rmax2) && big.magnitude_below(rmax2));
+        if scale_up {
+            (a, b) = (a.mul(rminscal, fmt), b.mul(rminscal, fmt));
+            (big, small) = (big.mul(rminscal, fmt), small.mul(rminscal, fmt));
+        }
+
+        let ratio = small.div(big, fmt);
+        let denom = small.mul(ratio, fmt).add(big, fmt);
+        // The numerators in the order libgcc writes them. `ratio` below the
+        // smallest normal is computed the other way round, dividing first, so
+        // its subnormal precision is not what the products are built from.
+        let ratio_is_normal = rmin.magnitude_below(ratio);
+        let scaled = |v: Self| {
+            if ratio_is_normal {
+                v.mul(ratio, fmt)
+            } else {
+                small.mul(v.div(big, fmt), fmt)
+            }
+        };
+        let (re, im) = if swapped {
+            // |c| < |d|: ((a*r + b) + (b*r - a)i) / (c*r + d), r = c/d.
+            (scaled(a).add(b, fmt), scaled(b).sub(a, fmt))
+        } else {
+            // |c| >= |d|: ((b*r + a) + (b - a*r)i) / (d*r + c), r = d/c.
+            (scaled(b).add(a, fmt), b.sub(scaled(a), fmt))
+        };
+        let (c, d) = if swapped { (small, big) } else { (big, small) };
+        ((re.div(denom, fmt), im.div(denom, fmt)), (a, b, c, d))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1404,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn trunc_to_i128_discards_the_fraction_toward_zero() {
+    fn to_integer_discards_the_fraction_toward_zero() {
         for (v, want) in [
             (0.0, 0),
             (-0.0, 0),
@@ -1417,23 +1701,93 @@ mod tests {
             (1e18, 1_000_000_000_000_000_000i128),
             (-1e18, -1_000_000_000_000_000_000i128),
         ] {
-            assert_eq!(FloatVal::from_f64(v).trunc_to_i128(), Some(want), "{v}");
+            assert_eq!(
+                FloatVal::from_f64(v).to_integer(64, true),
+                Some(want),
+                "{v}"
+            );
         }
+        // A negative value truncating to zero is in range even unsigned.
+        assert_eq!(FloatVal::from_f64(-0.9).to_integer(32, false), Some(0));
+    }
+
+    /// Just past where `double` stops holding every integer, and where a
+    /// `long double` still does: `to_f64() as i128` rounded each of these
+    /// to its neighbour first.
+    #[test]
+    fn to_integer_is_exact_past_double_precision() {
+        // 2^53 + 1, 2^62 + 1 and -(2^62 + 5) as signed 64-bit values.
+        for (mag, neg) in [
+            ((1u128 << 53) + 1, false),
+            ((1u128 << 62) + 1, false),
+            ((1u128 << 62) + 5, true),
+        ] {
+            let v = FloatVal::from_parts(neg, mag, 0);
+            let want = if neg { -(mag as i128) } else { mag as i128 };
+            assert_eq!(v.to_integer(64, true), Some(want), "{want}");
+            // The fraction below the last integer bit is discarded, not
+            // rounded into it.
+            let plus_half = v.add(FloatVal::from_parts(neg, 1, -1), FpFormat::Binary128);
+            assert_eq!(plus_half.to_integer(64, true), Some(want), "{want} + 0.5");
+        }
+        // 2^63 + 3 fits `unsigned long long` and not `long long`.
+        let big = FloatVal::from_parts(false, (1u128 << 63) + 3, 0);
+        assert_eq!(big.to_integer(64, false), Some((1i128 << 63) + 3));
+        assert_eq!(big.to_integer(64, true), None);
+        // The least `long long` fits; one below it does not.
+        let min = FloatVal::from_parts(true, 1u128 << 63, 0);
+        assert_eq!(min.to_integer(64, true), Some(i64::MIN as i128));
+        let below = FloatVal::from_parts(true, (1u128 << 63) + 1, 0);
+        assert_eq!(below.to_integer(64, true), None);
+    }
+
+    /// The range is the destination type's, at every width.
+    #[test]
+    fn to_integer_checks_the_types_range() {
+        let v = |x: f64| FloatVal::from_f64(x);
+        assert_eq!(v(127.9).to_integer(8, true), Some(127));
+        assert_eq!(v(128.0).to_integer(8, true), None);
+        assert_eq!(v(-128.5).to_integer(8, true), Some(-128));
+        assert_eq!(v(-129.0).to_integer(8, true), None);
+        assert_eq!(v(255.5).to_integer(8, false), Some(255));
+        assert_eq!(v(256.0).to_integer(8, false), None);
+        assert_eq!(v(-1.0).to_integer(8, false), None);
+        assert_eq!(v(3e9).to_integer(32, true), None);
+        assert_eq!(v(3e9).to_integer(32, false), Some(3_000_000_000));
+        // An unsigned 128-bit result at or above 2^127 is carried as its
+        // bit pattern.
+        let top = FloatVal::from_parts(false, 1, 127);
+        assert_eq!(top.to_integer(128, false), Some(i128::MIN));
+        assert_eq!(top.to_integer(128, true), None);
+        assert_eq!(
+            FloatVal::from_parts(false, 1, 128).to_integer(128, false),
+            None
+        );
     }
 
     /// Where C leaves the conversion undefined, this must refuse rather than
     /// invent an answer: a fold that guesses disagrees with the hardware.
     #[test]
-    fn trunc_to_i128_refuses_what_it_cannot_represent() {
-        assert_eq!(FloatVal::nan().trunc_to_i128(), None);
-        assert_eq!(FloatVal::infinity(false).trunc_to_i128(), None);
-        assert_eq!(FloatVal::infinity(true).trunc_to_i128(), None);
-        // 2^127 is one past the largest `i128`.
-        let too_big = FloatVal::from_parts(false, 1, 127);
-        assert_eq!(too_big.trunc_to_i128(), None);
-        // 2^126 is not.
-        let fits = FloatVal::from_parts(false, 1, 126);
-        assert_eq!(fits.trunc_to_i128(), Some(1i128 << 126));
+    fn to_integer_refuses_what_it_cannot_represent() {
+        assert_eq!(FloatVal::nan().to_integer(64, true), None);
+        assert_eq!(FloatVal::infinity(false).to_integer(64, true), None);
+        assert_eq!(FloatVal::infinity(true).to_integer(64, true), None);
+    }
+
+    /// gcc's answer for a static initializer C gives none for.
+    #[test]
+    fn to_integer_saturating_follows_gcc() {
+        let v = |x: f64| FloatVal::from_f64(x);
+        assert_eq!(v(1e300).to_integer_saturating(32, true), i32::MAX as i128);
+        assert_eq!(v(-1e300).to_integer_saturating(32, true), i32::MIN as i128);
+        assert_eq!(v(5e9).to_integer_saturating(32, false), u32::MAX as i128);
+        assert_eq!(v(-1.5).to_integer_saturating(32, false), 0);
+        assert_eq!(FloatVal::nan().to_integer_saturating(32, true), 0);
+        assert_eq!(v(1e40).to_integer_saturating(64, true), i64::MAX as i128);
+        assert_eq!(v(1e300).to_integer_saturating(128, true), i128::MAX);
+        assert_eq!(v(1e300).to_integer_saturating(128, false), -1);
+        // In range, it is the exact conversion.
+        assert_eq!(v(-2.5).to_integer_saturating(32, true), -2);
     }
 
     #[test]
@@ -2170,5 +2524,210 @@ mod tests {
         let v = FloatVal::from_parts(false, (1u128 << 54) | (1 << 30) | 1, -54);
         assert_eq!(v.to_bits(FpFormat::Binary32), 0x3f80_0001);
         assert_eq!((v.to_f64() as f32).to_bits(), 0x3f80_0000);
+    }
+
+    // Complex multiplication and division
+
+    /// A finite value from its encoding in `fmt`: the inverse of `to_bits`
+    /// for the operands the libgcc cases below were recorded with.
+    fn finite_from_bits(fmt: FpFormat, bits: u128) -> FloatVal {
+        let stored = fmt.stored_significand_bits();
+        let exp_bits = fmt.exponent_bits();
+        let neg = (bits >> (exp_bits + stored)) & 1 != 0;
+        let biased = ((bits >> stored) & ((1 << exp_bits) - 1)) as i32;
+        assert!(biased != (1 << exp_bits) - 1, "not finite: {bits:x}");
+        let mut sig = bits & ((1u128 << stored) - 1);
+        if fmt != FpFormat::X87Extended && biased != 0 {
+            sig |= 1u128 << stored;
+        }
+        let exp = biased.max(1) - fmt.emax() - (fmt.precision() as i32 - 1);
+        FloatVal::from_parts(neg, sig, exp)
+    }
+
+    /// Each case is an operand set and the four halves libgcc 13 returned
+    /// for it: `__mulxc3`/`__divxc3` on x86-64, `__multc3`/`__divtc3` on
+    /// aarch64.
+    #[test]
+    fn complex_mul_and_div_agree_with_libgcc() {
+        let cases: [(FpFormat, [u128; 8]); 5] = [
+            (
+                FpFormat::X87Extended,
+                [
+                    0xbffaeedd22562c4c680f,
+                    0xc008fdc2ae94e4dbf800,
+                    0xc00aed159abfb303f800,
+                    0xbff5a3ef7347ffdd7fd7,
+                    0x4006dbf1e0b11d859b87,
+                    0x4014eb02a5fd5fee13b1,
+                    0x3fef81b36710062b6755,
+                    0x3ffd8900d764111b2b41,
+                ],
+            ),
+            (
+                FpFormat::X87Extended,
+                [
+                    0x3fe8a5474d793f2c780a,
+                    0x3ff6ff2e6910bdea3800,
+                    0xbffc8cb68db0491e1000,
+                    0x4024bb4de2fabe6d5fd1,
+                    0xc01cbab489f5bea81208,
+                    0x400df1dabce3457e95d8,
+                    0x3fd1ae62c56ac44b93b5,
+                    0xbfc2e1e5688ceda9d084,
+                ],
+            ),
+            (
+                FpFormat::X87Extended,
+                [
+                    0x4011dd56f9d1347a280e,
+                    0x3fd9f4c5fd46fe517800,
+                    0x400da2d0e03f67599800,
+                    0xbfff8a3fadc2684877dd,
+                    0x40208cc5a2a44989ee2c,
+                    0xc011ef0fe29c3b090dfa,
+                    0x4003ae0262cdac84457d,
+                    0x3ff593c0d0627c6c6af6,
+                ],
+            ),
+            (
+                FpFormat::Binary128,
+                [
+                    0xbffaddba44ac5898d01ddba44ac5898d,
+                    0xc008fb855d29c9b7f000000000000000,
+                    0xc00ada2b357f6607f000000000000000,
+                    0xbff547dee68fffbaffae08465c001140,
+                    0x4006b7e3c1623b0b370e4641afcc431b,
+                    0x4014d6054bfabfdc276274af111384db,
+                    0x3fef0366ce200c56cea8cd95d626a0c9,
+                    0x3ffd1201aec822365682a60b022b31ce,
+                ],
+            ),
+            (
+                FpFormat::Binary128,
+                [
+                    0x3fe84a8e9af27e58f014a8e9af27e58f,
+                    0x3ff6fe5cd2217bd47000000000000000,
+                    0xbffc196d1b60923c2000000000000000,
+                    0x4024769bc5f57cdabfa2590e82a0c950,
+                    0xc01c756913eb7d502410b5daa3e92e1a,
+                    0x400de3b579c68afd2bb1e9ecb1d9d620,
+                    0x3fd15cc58ad58897276a77f9462a0f6e,
+                    0xbfc2c3cad119db53a108953a18f51c2e,
+                ],
+            ),
+        ];
+        for (fmt, bits) in cases {
+            let v = |i: usize| finite_from_bits(fmt, bits[i]);
+            let (x, y) = ((v(0), v(1)), (v(2), v(3)));
+            let (mre, mim) = FloatVal::complex_mul(x, y, fmt);
+            let (qre, qim) = FloatVal::complex_div(x, y, fmt);
+            let got = [mre, mim, qre, qim].map(|h| h.to_bits(fmt));
+            assert_eq!(
+                got,
+                [bits[4], bits[5], bits[6], bits[7]],
+                "{fmt:?} {:x?}",
+                &bits[..4]
+            );
+        }
+    }
+
+    /// At `long double` precision, in both of its formats: the halves keep
+    /// the 2^-60 a `double` has no room for.
+    #[test]
+    fn complex_arithmetic_keeps_long_double_precision() {
+        let one = FloatVal::from_i128(1);
+        let tiny = FloatVal::from_parts(false, 1, -60);
+        let one_plus = FloatVal::from_parts(false, (1u128 << 60) + 1, -60);
+        for fmt in [FpFormat::X87Extended, FpFormat::Binary128] {
+            let zero = FloatVal::ZERO;
+            let (re, im) = FloatVal::complex_mul((one_plus, zero), (one, one), fmt);
+            assert_eq!((re, im), (one_plus, one_plus), "{fmt:?} mul");
+            let two_plus = FloatVal::from_parts(false, (1u128 << 60) + 1, -59);
+            let two = FloatVal::from_i128(2);
+            let (re, im) = FloatVal::complex_div((two_plus, zero), (two, zero), fmt);
+            assert_eq!((re, im), (one_plus, zero), "{fmt:?} div");
+            // Where the textbook formula through `f64` loses the 2^-60 twice:
+            // (1 + 2^-60 + i) / (1 + i) = 1 + 2^-61 - 2^-61 i.
+            let (re, im) = FloatVal::complex_div((one_plus, one), (one, one), fmt);
+            let half_tiny = FloatVal::from_parts(false, 1, -61);
+            assert_eq!(re, one.add(half_tiny, fmt), "{fmt:?} re");
+            assert_eq!(im, half_tiny.negated(), "{fmt:?} im");
+            // `(1 + 2^-60) + 2i` and `(1 + i) - 2^-60`, componentwise.
+            assert_eq!(one.add(tiny, fmt), one_plus);
+            assert_eq!(
+                one.sub(tiny, fmt).cmp_value(one),
+                Some(std::cmp::Ordering::Less)
+            );
+        }
+    }
+
+    /// Each product and each sum is rounded to the format, as `__mul?c3`
+    /// rounds it -- not the exact `ac - bd` rounded once.
+    #[test]
+    fn complex_mul_rounds_each_step() {
+        let fmt = FpFormat::Binary64;
+        // a = c = 1 + 2^-30, b = d = 1: ac rounds away its 2^-60 term, so
+        // ac - bd is 2^-29 exactly, where the exact value is 2^-29 + 2^-60.
+        let a = FloatVal::from_parts(false, (1u128 << 30) + 1, -30);
+        let one = FloatVal::from_i128(1);
+        let (re, _) = FloatVal::complex_mul((a, one), (a, one), fmt);
+        assert_eq!(re, FloatVal::from_parts(false, 1, -29));
+    }
+
+    /// Annex G's recovery, as libgcc does it: an infinite operand gives an
+    /// infinite result, not NaN + NaNi, and so does a zero divisor.
+    #[test]
+    fn complex_recovers_infinities_as_libgcc_does() {
+        let fmt = FpFormat::Binary64;
+        let v = FloatVal::from_f64;
+        let inf = FloatVal::infinity(false);
+        let one = v(1.0);
+
+        // (inf + NaN i) * (1 + i): the infinity is boxed to 1 and the NaN
+        // zeroed, giving inf + inf i.
+        let (re, im) = FloatVal::complex_mul((inf, FloatVal::nan()), (one, one), fmt);
+        assert_eq!((re, im), (inf, inf));
+        // Overflow of the products recovers too: (big + big i)^2.
+        let big = v(1e300);
+        let (re, im) = FloatVal::complex_mul((big, big), (big, big), fmt);
+        assert!(re.is_nan() && im.is_infinite(), "{re} {im}");
+
+        // Non-zero over zero is an infinity carrying the operand's sign.
+        let (re, im) = FloatVal::complex_div((one, v(-1.0)), (FloatVal::ZERO, FloatVal::ZERO), fmt);
+        assert_eq!((re, im), (inf, inf.negated()));
+        // Finite over infinite is a zero.
+        let (re, im) = FloatVal::complex_div((one, one), (inf, FloatVal::ZERO), fmt);
+        assert!(re.is_zero() && im.is_zero(), "{re} {im}");
+        // Infinite over finite is infinite.
+        let (re, im) = FloatVal::complex_div((inf, one), (one, one), fmt);
+        assert_eq!((re, im), (inf, inf.negated()));
+    }
+
+    /// Smith's method, and libgcc's scaling, keep a quotient whose operands
+    /// are near the ends of the range from overflowing or flushing to zero.
+    #[test]
+    fn complex_div_scales_extreme_operands() {
+        let fmt = FpFormat::Binary64;
+        let v = FloatVal::from_f64;
+        let max = v(f64::MAX);
+        let (re, im) = FloatVal::complex_div((max, max), (max, max), fmt);
+        assert_eq!((re, im), (v(1.0), FloatVal::ZERO));
+        let tiny = v(f64::MIN_POSITIVE * 4.0);
+        let (re, im) = FloatVal::complex_div((tiny, tiny), (tiny, tiny), fmt);
+        assert_eq!((re, im), (v(1.0), FloatVal::ZERO));
+        // (1 + 2i) / (3 + 4i) = 0.44 + 0.08i, as libgcc computes it.
+        let (re, im) = FloatVal::complex_div((v(1.0), v(2.0)), (v(3.0), v(4.0)), fmt);
+        assert_eq!((re.to_f64(), im.to_f64()), (0.44, 0.08));
+    }
+
+    /// `float` divides in `double` and rounds once more, as `__divsc3` does.
+    #[test]
+    fn complex_div_of_float_works_in_double() {
+        let fmt = FpFormat::Binary32;
+        let v = |x: f32| FloatVal::from_f64(f64::from(x));
+        let (re, im) = FloatVal::complex_div((v(1.0), v(2.0)), (v(3.0), v(4.0)), fmt);
+        assert_eq!((re.to_f64() as f32, im.to_f64() as f32), (0.44f32, 0.08f32));
+        let (re, im) = FloatVal::complex_div((v(1.0), v(1.0)), (v(1.0), v(-1.0)), fmt);
+        assert_eq!((re, im), (FloatVal::ZERO, v(1.0)));
     }
 }

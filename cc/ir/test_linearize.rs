@@ -7796,3 +7796,230 @@ fn test_static_float_initializer_converts_from_its_own_type() {
         0x7ff8_0000_0000_0005
     );
 }
+
+/// The global `name`'s initializer.
+fn global_init<'m>(module: &'m crate::ir::Module, name: &str) -> &'m crate::ir::Initializer {
+    &module
+        .globals
+        .iter()
+        .find(|g| g.name == name)
+        .unwrap_or_else(|| panic!("no global {name}"))
+        .init
+}
+
+/// A floating constant converts to an integer object exactly, truncating
+/// toward zero from the value at the constant's own precision: each of these
+/// came out rounded to `double` first. Out of range, where C gives no value,
+/// the object gets gcc's saturated one.
+#[test]
+fn test_static_float_to_integer_initializer_is_exact() {
+    let src = "static long long a = 0x1p62L + 1.0L;\n\
+               static unsigned long long b = 0x1p63L + 3.0L;\n\
+               static long long c = -0x1p62L - 5.0L;\n\
+               static long long d = 0x1p53 + 1.0L;\n\
+               static int e = 0.99999999999999999999;\n\
+               static _Bool f = 0.5;\n\
+               static int g = 3e9;\n\
+               static unsigned h = -1.5;\n\
+               static int i = __builtin_nan(\"\");\n";
+    let module = linearize_source(src, &Target::host());
+    let int = |name: &str| match global_init(&module, name) {
+        crate::ir::Initializer::Int(v) => *v,
+        other => panic!("{name}: expected an integer, got {other:?}"),
+    };
+    assert_eq!(int("a"), (1i128 << 62) + 1);
+    assert_eq!(int("b"), (1i128 << 63) + 3);
+    assert_eq!(int("c"), -((1i128 << 62) + 5));
+    assert_eq!(int("d"), (1i128 << 53) + 1);
+    // A `double` literal is a `double`: this one rounds to 1.0 before it
+    // is truncated.
+    assert_eq!(int("e"), 1);
+    assert_eq!(int("f"), 1);
+    assert_eq!(int("g"), i128::from(i32::MAX));
+    assert_eq!(int("h"), 0);
+    assert_eq!(int("i"), 0);
+}
+
+/// A cast inside a static initializer converts: `(int)2.5` is 2 whatever
+/// type is being initialized, and an integer subexpression of a floating one
+/// is integer arithmetic.
+#[test]
+fn test_static_initializer_casts_and_integer_subexpressions_convert() {
+    let src = "static double a = (int)2.5;\n\
+               static double b = (1 / 2) + 0.5;\n\
+               static long long c = (long long)(0x1p62L + 1.0L);\n\
+               static int d = (int)1e300;\n";
+    let module = linearize_source(src, &Target::host());
+    let float = |name: &str| match global_init(&module, name) {
+        crate::ir::Initializer::Float(v) => v.to_f64(),
+        other => panic!("{name}: expected a float, got {other:?}"),
+    };
+    assert_eq!(float("a"), 2.0);
+    assert_eq!(float("b"), 0.5);
+    assert!(
+        matches!(global_init(&module, "c"), crate::ir::Initializer::Int(v) if *v == (1i128 << 62) + 1)
+    );
+    assert!(
+        matches!(global_init(&module, "d"), crate::ir::Initializer::Int(v) if *v == i128::from(i32::MAX))
+    );
+}
+
+/// The two halves of a complex static initializer.
+fn complex_halves(
+    module: &crate::ir::Module,
+    name: &str,
+) -> (crate::ir::Initializer, crate::ir::Initializer) {
+    let crate::ir::Initializer::Struct { fields, .. } = global_init(module, name) else {
+        panic!("{name}: expected a two-field initializer");
+    };
+    (fields[0].2.clone(), fields[1].2.clone())
+}
+
+/// Complex constant arithmetic is done in the base format of the
+/// expression's own type, as the program does it at run time, on both
+/// `long double` formats: the old fold went through `f64` and lost the
+/// 2^-60 in every one of these.
+#[test]
+fn test_static_complex_long_double_keeps_its_precision() {
+    use crate::float::FloatVal;
+    let src = "static long double _Complex z = (1.0L + 0x1p-60L) + 2.0iL;\n\
+               static long double _Complex w = (1.0L + 0x1p-60L) * (1.0L + 1.0iL);\n\
+               static long double _Complex q = (2.0L + 0x1p-59L) / 2.0L;\n\
+               static long double _Complex s = (1.0L + 1.0iL) - 0x1p-60L;\n\
+               static long double _Complex r = (1.0L + 0x1p-60L + 1.0iL) / (1.0L + 1.0iL);\n";
+    let one = FloatVal::from_i128(1);
+    let one_plus = FloatVal::from_parts(false, (1u128 << 60) + 1, -60);
+    let one_minus = FloatVal::from_parts(false, (1u128 << 60) - 1, -60);
+    let half_tiny = FloatVal::from_parts(false, 1, -61);
+    for target in [
+        Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux),
+        Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux),
+    ] {
+        let module = linearize_source(src, &target);
+        let halves = |name: &str| match complex_halves(&module, name) {
+            (crate::ir::Initializer::Float(re), crate::ir::Initializer::Float(im)) => (re, im),
+            other => panic!("{name}: expected float halves, got {other:?}"),
+        };
+        assert_eq!(halves("z"), (one_plus, FloatVal::from_i128(2)), "z");
+        assert_eq!(halves("w"), (one_plus, one_plus), "w");
+        assert_eq!(halves("q"), (one_plus, FloatVal::ZERO), "q");
+        assert_eq!(halves("s"), (one_minus, one), "s");
+        let (re, im) = halves("r");
+        assert_eq!(
+            re,
+            one.add(half_tiny, crate::float::FpFormat::Binary128),
+            "r re"
+        );
+        assert_eq!(im, half_tiny.negated(), "r im");
+    }
+}
+
+/// A GNU complex integer folds as integers, by the algorithm the run-time
+/// lowering uses: Smith's method, truncating at every step, which is why
+/// `(-9 + 38i) / (5 + 6i)` is `6 + 1i` in gcc and here, where the exact
+/// quotient is `3 + 4i`. The old fold went through `f64` and the textbook
+/// formula, and answered `3 + 4i`.
+#[test]
+fn test_static_complex_integer_folds_as_integers() {
+    let src = "static _Complex int p = (1 + 2i) * (1 + 2i);\n\
+               static _Complex int q = (-9 + 38i) / (5 + 6i);\n\
+               static _Complex unsigned u = (4000000000u + 0i) / (2u + 0i);\n\
+               static _Complex int t = (_Complex int)(2.5 + 3.5i);\n";
+    let module = linearize_source(src, &Target::host());
+    let halves = |name: &str| match complex_halves(&module, name) {
+        (crate::ir::Initializer::Int(re), crate::ir::Initializer::Int(im)) => (re, im),
+        other => panic!("{name}: expected integer halves, got {other:?}"),
+    };
+    assert_eq!(halves("p"), (-3, 4));
+    assert_eq!(halves("q"), (6, 1));
+    assert_eq!(halves("u"), (2_000_000_000, 0));
+    assert_eq!(halves("t"), (2, 3));
+}
+
+/// Complex constants in the scalar shapes a static initializer takes, each
+/// value gcc's on both targets: `==`/`!=` against the common complex type,
+/// `__real__`/`__imag__`, `!`, `&&`/`||`, a condition, and conversion to a
+/// real, an integer or `_Bool` type.
+#[test]
+fn test_static_initializer_complex_scalar_shapes() {
+    let src = "int f = (_Complex float)(0.5) == 0.5;\n\
+               int f2 = (1.0 + 2.0i) != (1.0 + 2.0i);\n\
+               int f3 = (1.0f + 2.0fi) == (1.0L + 2.0iL);\n\
+               int f4 = 3 == (3 + 0i);\n\
+               int f5 = (0.1f + 0i) == 0.1;\n\
+               int f6 = __builtin_complex(__builtin_nan(\"\"), 0.0) == __builtin_complex(__builtin_nan(\"\"), 0.0);\n\
+               double r1 = __real__ (1.5 + 2.5i);\n\
+               double r2 = __imag__ (1.5 + 2.5i);\n\
+               int r3 = __real__ (3 + 4i);\n\
+               int r4 = __imag__ (3 + 4i);\n\
+               double r5 = __imag__ 2.5;\n\
+               int n1 = !(0.0 + 0.0i);\n\
+               int n2 = !(0.0 + 1.0i);\n\
+               int n3 = !0.5;\n\
+               int l1 = (0.0 + 1.0i) && 1;\n\
+               int l2 = (0.0 + 0.0i) || 0.5;\n\
+               int c1 = (0.0 + 1.0i) ? 7 : 8;\n\
+               int c2 = (0.0 + 0.0i) ? 7 : 8;\n\
+               double k1 = (double)(1.5 + 2.5i);\n\
+               int k2 = (int)(3.75 + 2.5i);\n\
+               _Bool k3 = (_Bool)(0.0 + 1.0i);\n\
+               _Bool k4 = (_Bool)(0.0 + 0.0i);\n\
+               double k5 = 1.25 + 2.0i;\n\
+               int k6 = 3.75 + 2.5i;\n\
+               long long k9 = (long long)(0x1p62L + 1.0L + 1.0iL);\n\
+               int k10 = (int)(5 + 6i);\n\
+               double k11 = (double)(5 + 6i);\n\
+               double q1 = (1 ? 2.5 : 3) * 2;\n\
+               double q2 = __real__ ((0.0 + 1.0i) ? (4.0 + 5.0i) : 0);\n";
+    for target in [
+        Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux),
+        Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux),
+    ] {
+        let module = linearize_source(src, &target);
+        let int = |name: &str| match global_init(&module, name) {
+            crate::ir::Initializer::Int(v) => *v,
+            other => panic!("{name}: expected an integer, got {other:?}"),
+        };
+        let float = |name: &str| match global_init(&module, name) {
+            crate::ir::Initializer::Float(v) => v.to_f64(),
+            other => panic!("{name}: expected a float, got {other:?}"),
+        };
+        for (name, want) in [
+            ("f", 1),
+            ("f2", 0),
+            ("f3", 1),
+            ("f4", 1),
+            ("f5", 0),
+            ("f6", 0),
+            ("r3", 3),
+            ("r4", 4),
+            ("n1", 1),
+            ("n2", 0),
+            ("n3", 0),
+            ("l1", 1),
+            ("l2", 1),
+            ("c1", 7),
+            ("c2", 8),
+            ("k2", 3),
+            ("k3", 1),
+            ("k4", 0),
+            ("k6", 3),
+            ("k9", (1 << 62) + 1),
+            ("k10", 5),
+        ] {
+            assert_eq!(int(name), want, "{name}");
+        }
+        for (name, want) in [
+            ("r1", 1.5),
+            ("r2", 2.5),
+            ("r5", 0.0),
+            ("k1", 1.5),
+            ("k5", 1.25),
+            ("k11", 5.0),
+            ("q1", 5.0),
+            ("q2", 4.0),
+        ] {
+            assert_eq!(float(name), want, "{name}");
+        }
+    }
+}

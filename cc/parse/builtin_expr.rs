@@ -959,9 +959,12 @@ impl Parser<'_> {
                 // expression only as the operand of a cast, so the floating
                 // fold has to be asked as well.
                 let is_constant = self.eval_const_expr(&arg).is_some()
-                    || self
-                        .eval_const_f64(crate::constexpr::ConstScope::Standard, &arg)
-                        .is_some();
+                    || crate::constexpr::eval_float(
+                        self,
+                        crate::constexpr::ConstScope::Standard,
+                        &arg,
+                    )
+                    .is_some();
                 // Answering 1 here is final -- nothing later makes a constant
                 // unconstant. Answering 0 is not: gcc decides this *after*
                 // optimization, so `int x = 42; __builtin_constant_p(x)` is 1

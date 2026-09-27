@@ -1616,6 +1616,7 @@ impl<'a> Parser<'a> {
         self.check_not_void(&right, right.pos);
         self.check_not_vector_value(left.typ, left.pos);
         self.check_not_vector_value(right.typ, right.pos);
+        self.check_relational_operands(op, &left, &right);
 
         // A bit-field operand promotes before anything else looks at it
         // (C17 6.3.1.1p2), and that promotion is not derivable from the

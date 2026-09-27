@@ -10,7 +10,7 @@
 // and lvalue requirements
 //
 
-use super::ast::{Expr, ExprKind, UnaryOp};
+use super::ast::{BinaryOp, Expr, ExprKind, UnaryOp};
 use super::parser::Parser;
 use crate::diag;
 use crate::strings::StringId;
@@ -290,6 +290,29 @@ impl Parser<'_> {
             );
         }
         is_vector
+    }
+
+    /// C17 6.5.8p2: the operands of `<`, `>`, `<=` and `>=` are both real or
+    /// both pointers. A complex value has no ordering, so a relational
+    /// operator on one is a constraint violation; `==` and `!=` accept it.
+    pub(super) fn check_relational_operands(&self, op: BinaryOp, left: &Expr, right: &Expr) {
+        if !matches!(
+            op,
+            BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
+        ) {
+            return;
+        }
+        for operand in [left, right] {
+            if operand.typ.is_some_and(|t| self.types.is_complex(t)) {
+                diag::error(
+                    operand.pos,
+                    &gettext(
+                        "invalid operand to a relational operator: a complex value has no ordering",
+                    ),
+                );
+                return;
+            }
+        }
     }
 
     /// Does this argument's type match some member of a

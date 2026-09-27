@@ -7104,3 +7104,24 @@ fn diagnostics_redeclaration_is_reported_at_the_declarator() {
         ":3:13: error: typedef 'T' redefined",
     );
 }
+
+/// C17 6.5.8p2: `<`, `>`, `<=` and `>=` take real or pointer operands, and a
+/// complex value has no ordering -- constant or not, either side. gcc: "invalid
+/// operands to binary <".
+#[test]
+fn diagnostics_relational_operator_rejects_a_complex_operand() {
+    for (name, src) in [
+        ("const", "int k = (1.0 + 2.0i) < (1.0 + 2.0i);\n"),
+        (
+            "runtime",
+            "int g(void) { _Complex double a = 1, b = 2; return a >= b; }\n",
+        ),
+        ("right", "int g(_Complex int z) { return 1.0 > z; }\n"),
+    ] {
+        compile_expect_error(
+            &format!("complex_relational_{name}"),
+            src,
+            "a complex value has no ordering",
+        );
+    }
+}

@@ -1396,3 +1396,24 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c99_gnu_imaginary_hex", code, &[]), 0);
 }
+
+/// `~` -- the GNU complex conjugate -- in a static initializer. gcc folds it
+/// as it folds `-z`; c17's constant evaluator had no case for it and
+/// rejected the initializer as not constant.
+#[test]
+fn c99_complex_conjugate_in_static_initializer() {
+    let code = r#"
+static _Complex double a = ~(3.0 + 4.0i);
+static _Complex float b = ~(1.0f - 2.0if);
+static _Complex long double c = ~~(5.0L + 6.0iL);
+static _Complex double d = -~(1.0 + 1.0i);
+int main(void) {
+    if (__real__ a != 3.0 || __imag__ a != -4.0) return 1;
+    if (__real__ b != 1.0f || __imag__ b != 2.0f) return 2;
+    if (__real__ c != 5.0L || __imag__ c != 6.0L) return 3;
+    if (__real__ d != -1.0 || __imag__ d != 1.0) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_conj_static_init", code, &[]), 0);
+}

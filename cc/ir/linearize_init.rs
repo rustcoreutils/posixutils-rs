@@ -687,6 +687,17 @@ impl<'a> super::linearize::Linearizer<'a> {
                 Some((re.negated(), im.negated()))
             }
 
+            // GNU `~z` on a complex operand is the conjugate: only the
+            // imaginary half is negated. On an integer operand it is the
+            // bitwise complement, which is not a complex fold at all.
+            ExprKind::Unary {
+                op: UnaryOp::BitNot,
+                operand,
+            } if operand.typ.is_some_and(|t| self.types.is_complex(t)) => {
+                let (re, im) = self.eval_const_complex(operand)?;
+                Some((re, im.negated()))
+            }
+
             ExprKind::Binary { op, left, right } => {
                 let (a, b) = self.eval_const_complex(left)?;
                 let (c, d) = self.eval_const_complex(right)?;

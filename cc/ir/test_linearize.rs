@@ -7724,3 +7724,36 @@ fn test_constant_conditional_keeps_an_arm_that_defines_a_label() {
         .count();
     assert_eq!(calls, 1);
 }
+
+/// GNU `~` on a complex constant is the conjugate, and folds in a static
+/// initializer: only the imaginary half is negated, so `~(3 + 4i)` is
+/// `3 - 4i`, and `~~z` is `z` again.
+#[test]
+fn test_complex_conjugate_static_initializer() {
+    let src = "static _Complex double a = ~(3.0 + 4.0i);\n\
+               static _Complex double b = ~~(5.0 + 6.0i);\n\
+               static _Complex double c = -~(1.0 + 0.0i);\n";
+    let module = linearize_source(src, &Target::host());
+    let halves = |name: &str| -> (f64, f64) {
+        let g = module
+            .globals
+            .iter()
+            .find(|g| g.name == name)
+            .unwrap_or_else(|| panic!("no global {name}"));
+        let crate::ir::Initializer::Struct { fields, .. } = &g.init else {
+            panic!("{name}: expected a two-field initializer, got {:?}", g.init);
+        };
+        let value = |i: usize| match &fields[i].2 {
+            crate::ir::Initializer::Float(v) => v.to_f64(),
+            other => panic!("{name}[{i}]: expected a float half, got {other:?}"),
+        };
+        (value(0), value(1))
+    };
+    assert_eq!(halves("a"), (3.0, -4.0));
+    assert_eq!(halves("b"), (5.0, 6.0));
+    // `-~(1 + 0i)` is `-(1 - 0i)`: the conjugate's `-0.0` imaginary half is
+    // negated back to `+0.0`, and the real half becomes `-1.0`.
+    let (re, im) = halves("c");
+    assert_eq!(re, -1.0);
+    assert!(im == 0.0 && im.is_sign_positive(), "c imag is {im}");
+}

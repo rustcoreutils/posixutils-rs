@@ -284,15 +284,13 @@ int main(void)
 
 /// `__builtin_fabsl` and `__builtin_signbitl` operate on a `long double`, not
 /// on its low eight bytes: on x86-64 that is the 80-bit x87 format, and
-/// reading it as a `double` reads its mantissa. `fabsl` is computed in place
-/// at the `long double` width; `signbitl` is a call to `__signbitl`.
+/// reading it as a `double` reads its mantissa. Both are computed in place at
+/// the `long double` width.
 ///
-/// The `signbit` family is also normalised to 0/1. C17 7.12.3.6 permits any
-/// nonzero value and the library entry points return the sign bit in place --
-/// 8, 128 and 512 for the three widths, which did not even agree with each
-/// other. gcc is no more consistent: on x86-64 it answers 512 for a runtime
-/// `long double` and 1 for a constant one, and on aarch64 it answers 1 for
-/// both. Everything here is conforming; 0/1 is merely predictable.
+/// The `signbit` family answers 0/1. C17 7.12.3.6 permits any nonzero value,
+/// and gcc is not consistent: it answers 1 for a constant, and at run time
+/// the bit in place -- `INT_MIN` for a `float`, and 512 for a `long double`
+/// on x86-64. Everything here is conforming; 0/1 is merely predictable.
 #[test]
 fn builtins_long_double_magnitude_and_sign() {
     let code = r#"
@@ -327,10 +325,10 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(
-        compile_and_run("long_double_magnitude", code, &["-lm".to_string()]),
-        0
-    );
+    assert_eq!(compile_and_run("long_double_magnitude", code, &[]), 0);
+    if let Some(rc) = compile_and_run_aarch64("long_double_magnitude_a64", code, "-O2") {
+        assert_eq!(rc, 0);
+    }
 }
 
 /// A library builtin taking `double` must be declared taking `double`.
@@ -1300,4 +1298,327 @@ int main(void) {
         "double f(void) { return __builtin_nans(\"zz\"); }\n",
         "is not a string literal naming a NaN payload",
     );
+}
+
+// ============================================================================
+// signbit and copysign are computed in place
+// ============================================================================
+
+// Linked without -lm, and run at both levels on both targets. Every value
+// was confirmed with gcc and aarch64-linux-gnu-gcc under qemu. The inputs are
+// built from bits at run time, so the instructions are what is tested; the
+// constant cases at the end are what the optimizer folds, and must agree.
+// `copysign` takes only the sign of `y` -- of a NaN or a zero too -- and
+// changes nothing else of `x`, so a NaN keeps its payload and a signalling
+// one stays signalling.
+const SIGN_PROGRAM: &str = r#"
+double copysign(double, double); float copysignf(float, float);
+long double copysignl(long double, long double);
+typedef unsigned long long u64; typedef unsigned int u32; typedef unsigned char u8;
+#define D_SIGN 0x8000000000000000ULL
+#define F_SIGN 0x80000000U
+static u64 dbits(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
+static double dfrom(u64 u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
+static u32 fbits(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
+static float ffrom(u32 u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
+/* +0, 1.5, inf, a quiet NaN and a signalling NaN with payloads; each is
+   also tried with its sign bit set. */
+static volatile u64 dcase[] = {
+    0, 0x3ff8000000000000ULL, 0x7ff0000000000000ULL,
+    0x7ff8000000001234ULL, 0x7ff0000000005678ULL,
+};
+static volatile u32 fcase[] = {
+    0, 0x3fc00000U, 0x7f800000U, 0x7fc01234U, 0x7f805678U,
+};
+#define NCASE 5
+#if __LDBL_MANT_DIG__ == 64
+#define LD_BYTES 10 /* x87: the rest of the object is padding */
+#else
+#define LD_BYTES ((int)sizeof(long double))
+#endif
+typedef struct { u8 b[sizeof(long double)]; } ldb;
+static ldb ld_bytes(long double v) {
+    ldb r;
+    __builtin_memset(&r, 0, sizeof r);
+    __builtin_memcpy(r.b, &v, LD_BYTES);
+    return r;
+}
+static long double ld_from(ldb r) { long double v; __builtin_memcpy(&v, r.b, sizeof v); return v; }
+/* The byte holding the sign bit, as its top bit. */
+static int sign_index(void) {
+    ldb a = ld_bytes(1.0L), b = ld_bytes(-1.0L);
+    for (int i = 0; i < LD_BYTES; i++)
+        if (a.b[i] != b.b[i]) return i;
+    return -1;
+}
+static ldb ldcase(int i, int si) {
+    int lo = si == 0 ? LD_BYTES - 1 : 0; /* the least significant byte */
+    ldb r;
+    switch (i) {
+    case 0: r = ld_bytes(0.0L); break;
+    case 1: r = ld_bytes(1.5L); break;
+    case 2: r = ld_bytes(__builtin_infl()); break;
+    case 3: r = ld_bytes(__builtin_nanl("")); r.b[lo] |= 0x5a; break;
+    default: r = ld_bytes(__builtin_infl()); r.b[lo] |= 0x5a; break; /* sNaN */
+    }
+    return r;
+}
+static int check_double(void) {
+    for (int i = 0; i < 2 * NCASE; i++) {
+        u64 xb = dcase[i % NCASE] | (i >= NCASE ? D_SIGN : 0);
+        double x = dfrom(xb);
+        int neg = i >= NCASE;
+        if ((__builtin_signbit(x) != 0) != neg) return 1;
+        for (int j = 0; j < 2 * NCASE; j++) {
+            u64 yb = dcase[j % NCASE] | (j >= NCASE ? D_SIGN : 0);
+            double y = dfrom(yb);
+            u64 want = (xb & ~D_SIGN) | (yb & D_SIGN);
+            if (dbits(copysign(x, y)) != want) return 2;
+            if (dbits(__builtin_copysign(x, y)) != want) return 3;
+        }
+    }
+    return 0;
+}
+static int check_float(void) {
+    for (int i = 0; i < 2 * NCASE; i++) {
+        u32 xb = fcase[i % NCASE] | (i >= NCASE ? F_SIGN : 0);
+        float x = ffrom(xb);
+        int neg = i >= NCASE;
+        if ((__builtin_signbit(x) != 0) != neg) return 11;
+        if ((__builtin_signbitf(x) != 0) != neg) return 12;
+        for (int j = 0; j < 2 * NCASE; j++) {
+            u32 yb = fcase[j % NCASE] | (j >= NCASE ? F_SIGN : 0);
+            float y = ffrom(yb);
+            u32 want = (xb & ~F_SIGN) | (yb & F_SIGN);
+            if (fbits(copysignf(x, y)) != want) return 13;
+            if (fbits(__builtin_copysignf(x, y)) != want) return 14;
+        }
+    }
+    return 0;
+}
+static int check_long_double(void) {
+    int si = sign_index();
+    if (si < 0) return 21;
+    for (int i = 0; i < 2 * NCASE; i++) {
+        ldb xb = ldcase(i % NCASE, si);
+        if (i >= NCASE) xb.b[si] |= 0x80;
+        volatile long double x = ld_from(xb);
+        int neg = i >= NCASE;
+        if ((__builtin_signbit(x) != 0) != neg) return 22;
+        if ((__builtin_signbitl(x) != 0) != neg) return 23;
+        for (int j = 0; j < 2 * NCASE; j++) {
+            ldb yb = ldcase(j % NCASE, si);
+            if (j >= NCASE) yb.b[si] |= 0x80;
+            volatile long double y = ld_from(yb);
+            ldb r1 = ld_bytes(copysignl(x, y));
+            ldb r2 = ld_bytes(__builtin_copysignl(x, y));
+            for (int k = 0; k < LD_BYTES; k++) {
+                u8 want = k == si ? (u8)((xb.b[k] & 0x7f) | (yb.b[k] & 0x80)) : xb.b[k];
+                if (r1.b[k] != want) return 24;
+                if (r2.b[k] != want) return 25;
+            }
+        }
+    }
+    return 0;
+}
+/* Constant arguments, which the optimizer folds: the same answers. */
+static int check_constants(void) {
+    if (dbits(copysign(1.5, -0.0)) != 0xbff8000000000000ULL) return 31;
+    if (dbits(copysign(-1.5, 0.0)) != 0x3ff8000000000000ULL) return 32;
+    if (dbits(copysign(__builtin_nan("0x1234"), -1.0)) != 0xfff8000000001234ULL) return 33;
+    if (dbits(copysign(2.0, -__builtin_nan(""))) != 0xc000000000000000ULL) return 34;
+    if (dbits(copysign(-__builtin_inf(), 1.0)) != 0x7ff0000000000000ULL) return 35;
+    if (fbits(copysignf(__builtin_nanf("0x55"), -1.0f)) != 0xffc00055U) return 36;
+    if (fbits(copysignf(3.0f, -0.0f)) != 0xc0400000U) return 37;
+    if (copysignl(2.5L, -0.0L) != -2.5L) return 38;
+    if (copysignl(-2.5L, __builtin_infl()) != 2.5L) return 39;
+    if (__builtin_signbit(-0.0) != 1 || __builtin_signbit(0.0) != 0) return 40;
+    if (__builtin_signbit(-0.0f) != 1 || __builtin_signbitf(-1.0f) != 1) return 41;
+    if (__builtin_signbit(-0.0L) != 1 || __builtin_signbitl(1.0L) != 0) return 42;
+    if (__builtin_signbit(-__builtin_nan("")) != 1) return 43;
+    if (__builtin_signbit(__builtin_nan("")) != 0) return 44;
+    return 0;
+}
+int main(void) {
+    int rc;
+    if ((rc = check_double())) return rc;
+    if ((rc = check_float())) return rc;
+    if ((rc = check_long_double())) return rc;
+    return check_constants();
+}
+"#;
+
+#[test]
+fn builtins_signbit_and_copysign_need_no_libm() {
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("sign_ops{opt}"), SIGN_PROGRAM, &[opt.to_string()]),
+            0,
+            "host {opt}"
+        );
+        if let Some(rc) = compile_and_run_aarch64(&format!("sign_ops_a64{opt}"), SIGN_PROGRAM, opt)
+        {
+            assert_eq!(rc, 0, "aarch64 {opt}");
+        }
+    }
+}
+
+/// Whether `asm` calls a function whose name ends in one of `names`.
+fn calls_any(asm: &str, names: &[&str]) -> bool {
+    asm.lines().any(|l| {
+        let mut w = l.split_whitespace();
+        matches!(w.next(), Some("call" | "bl" | "jmp" | "b"))
+            && w.next().is_some_and(|t| {
+                let t = t.trim_end_matches("@PLT");
+                names.iter().any(|n| t.ends_with(n))
+            })
+    })
+}
+
+/// Neither `signbit` nor `copysign` is a call, at any width, on either
+/// target: not to the libm function, and not to glibc's `__signbit*`.
+#[test]
+fn builtins_signbit_and_copysign_are_not_calls() {
+    const CALLEES: &[&str] = &[
+        "signbit",
+        "signbitf",
+        "signbitl",
+        "signbitd",
+        "copysign",
+        "copysignf",
+        "copysignl",
+    ];
+    let src = "double copysign(double, double); float copysignf(float, float);\n\
+               long double copysignl(long double, long double);\n\
+               int sf(float x) { return __builtin_signbit(x) + __builtin_signbitf(x); }\n\
+               int sd(double x) { return __builtin_signbit(x); }\n\
+               int sl(long double x) { return __builtin_signbit(x) + __builtin_signbitl(x); }\n\
+               double cd(double x, double y) { return copysign(x, y) + __builtin_copysign(y, x); }\n\
+               float cf(float x, float y) { return copysignf(x, y) + __builtin_copysignf(y, x); }\n\
+               long double cl(long double x, long double y)\n\
+               { return copysignl(x, y) + __builtin_copysignl(y, x); }\n";
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_at("sign_ops_inline", src, &[opt]);
+        assert!(!calls_any(&asm, CALLEES), "{opt}: a call remains:\n{asm}");
+        let asm = asm_for_at(
+            "sign_ops_inline_a64",
+            src,
+            &[opt, "--target", "aarch64-unknown-linux-gnu"],
+        );
+        assert!(
+            !calls_any(&asm, CALLEES),
+            "{opt} aarch64: a call remains:\n{asm}"
+        );
+    }
+}
+
+/// glibc's `signbit` macro and the `copysign` family `<math.h>` declares
+/// are the builtins, so a program using them needs no -lm either.
+#[test]
+fn builtins_math_h_signbit_and_copysign() {
+    let code = r#"
+#include <math.h>
+int main(void) {
+    volatile double x = -2.0, z = 0.0;
+    volatile float f = 1.0f;
+    volatile long double l = -0.0L;
+    if (!signbit(x) || signbit(z) || signbit(f) || !signbit(l)) return 1;
+    if (copysign(3.0, x) != -3.0 || copysignf(f, -1.0f) != -1.0f) return 2;
+    if (copysignl(5.0L, l) != -5.0L || !signbit(copysign(z, -1.0))) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("sign_ops_math_h", code, &[]), 0);
+    let asm = asm_for_at("sign_ops_math_h_asm", code, &["-O2"]);
+    assert!(
+        !calls_any(
+            &asm,
+            &[
+                "signbit",
+                "signbitf",
+                "signbitl",
+                "copysign",
+                "copysignf",
+                "copysignl"
+            ]
+        ),
+        "a call remains:\n{asm}"
+    );
+}
+
+/// `-fno-builtin-copysign` keeps the call to `copysign`, and only that one.
+#[test]
+fn builtins_copysign_fno_builtin_keeps_the_call() {
+    let src = "double copysign(double, double); float copysignf(float, float);\n\
+               double f(double x, double y) { return copysign(x, y); }\n\
+               float g(float x, float y) { return copysignf(x, y); }\n";
+    let asm = asm_for_at("copysign_nb", src, &["-fno-builtin-copysign"]);
+    assert!(
+        calls_any(&asm, &["copysign"]),
+        "-fno-builtin-copysign kept copysign inline:\n{asm}"
+    );
+    assert!(
+        !calls_any(&asm, &["copysignf"]),
+        "-fno-builtin-copysign displaced copysignf:\n{asm}"
+    );
+}
+
+/// As in gcc: `signbit` of a constant is an integer constant expression, and
+/// `copysign`, `fabs` and `abs` of constants fold in a static initializer --
+/// but, being calls, are not integer constant expressions, so an array bound
+/// of one at file scope is rejected.
+#[test]
+fn builtins_sign_ops_in_constant_expressions() {
+    let code = r#"
+double copysign(double, double); double fabs(double); int abs(int);
+static double a = copysign(2.0, -0.0);
+static float b = __builtin_copysignf(-1.5f, 1.0f);
+static double c = fabs(-3.0);
+static int d = abs(-4);
+static int e = __builtin_signbit(-1.0) + __builtin_signbitl(-0.0L);
+enum { E = __builtin_signbit(-2.0f) };
+_Static_assert(__builtin_signbit(-1.0), "signbit is a constant");
+static int arr[__builtin_signbit(-1.0) + 1];
+int main(void) {
+    if (a != -2.0 || b != 1.5f || c != 3.0 || d != 4 || e != 2) return 1;
+    if (E != 1 || sizeof arr != 2 * sizeof(int)) return 2;
+    switch (d) { case __builtin_signbit(-1.0) + 3: return 0; }
+    return 3;
+}
+"#;
+    assert_eq!(compile_and_run("sign_ops_constexpr", code, &[]), 0);
+    compile_expect_error(
+        "abs_not_ice",
+        "int abs(int);\nint a[abs(-2)];\n",
+        "variable length arrays cannot have file scope",
+    );
+}
+
+/// `copysign` and `signbit` of constants fold at -O1 and above: nothing is
+/// left to compute them.
+#[test]
+fn builtins_sign_ops_of_constants_fold() {
+    let src = "double f(void) { return __builtin_copysign(3.5, -0.0); }\n\
+               float g(void) { return __builtin_copysignf(2.0f, -1.0f); }\n\
+               int h(void) { return __builtin_signbit(-2.0) + __builtin_signbit(-1.0f); }\n";
+    for opt in ["-O1", "-O2"] {
+        for target in [None, Some("aarch64-unknown-linux-gnu")] {
+            let mut args = vec![opt];
+            if let Some(t) = target {
+                args.extend(["--target", t]);
+            }
+            let asm = asm_for_at("sign_ops_const", src, &args);
+            assert!(
+                !calls_any(&asm, &["signbit", "signbitf", "copysign", "copysignf"]),
+                "{opt} {target:?}: a call remains:\n{asm}"
+            );
+            assert!(
+                !asm.lines().any(|l| matches!(
+                    l.split_whitespace().next(),
+                    Some("shrq" | "shrl" | "shlq" | "shll" | "orq" | "orl" | "lsr" | "lsl" | "orr")
+                )),
+                "{opt} {target:?}: a sign operation on a constant was not folded:\n{asm}"
+            );
+        }
+    }
 }

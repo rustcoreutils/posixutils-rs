@@ -11,9 +11,9 @@
 
 use super::codegen::X86_64CodeGen;
 use super::lir::{popcount_sequence, GpOperand, MemAddr, ShiftCount, X86Inst};
-use super::regalloc::{Loc, Reg, XmmReg};
+use super::regalloc::{Loc, Reg};
 use crate::arch::codegen::BswapSize;
-use crate::arch::lir::{CallTarget, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::lir::{CallTarget, CondCode, Directive, Label, OperandSize, Symbol};
 use crate::ir::Instruction;
 use crate::types::TypeTable;
 
@@ -1760,55 +1760,5 @@ impl X86_64CodeGen {
         });
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
-    }
-
-    /// Emit __builtin_signbitf - test sign bit of float
-    pub(super) fn emit_signbit32(&mut self, insn: &Instruction) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Load argument into XMM0 (first FP argument register)
-        self.emit_fp_move(arg, XmmReg::Xmm0, FpSize::Single);
-
-        // Call __signbitf from libc (C99: signbit is a macro that calls __signbitf)
-        self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global("__signbitf".to_string())),
-        });
-
-        // Result is in EAX (integer return), store to target
-        let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::Rax, &dst_loc, u32::BITS);
-    }
-
-    /// Emit __builtin_signbit - test sign bit of double
-    pub(super) fn emit_signbit64(&mut self, insn: &Instruction) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Load argument into XMM0 (first FP argument register)
-        self.emit_fp_move(arg, XmmReg::Xmm0, FpSize::Double);
-
-        // Call signbit function from libc
-        self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global(
-                self.base.target.os.signbit_double_fn().to_string(),
-            )),
-        });
-
-        // Result is in EAX (integer return), store to target
-        let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::Rax, &dst_loc, u32::BITS);
     }
 }

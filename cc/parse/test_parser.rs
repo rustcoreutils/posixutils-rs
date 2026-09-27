@@ -13,7 +13,7 @@
 
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Expr, ExprKind, ExternalDecl,
-    ForInit, FunctionDef, InlineLibraryFn, Stmt, TranslationUnit, UnaryOp,
+    ForInit, FpTest, FunctionDef, InlineLibraryFn, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::parse::parser::{ParseResult, Parser};
 use crate::strings::{StringId, StringTable};
@@ -5205,12 +5205,20 @@ fn first_statement(tu: &TranslationUnit) -> &Stmt {
 
 // Library builtins: abs, fabs, creal, conj, ... as checked calls
 
-/// The in-place call `expr` is, as (function, argument), or a panic naming
+/// The in-place call `expr` is, as (function, arguments), or a panic naming
 /// `src` and what it was instead.
-fn inline_call<'e>(src: &str, expr: &'e Expr) -> (InlineLibraryFn, &'e Expr) {
+fn inline_call_args<'e>(src: &str, expr: &'e Expr) -> (InlineLibraryFn, &'e [Expr]) {
     match &expr.kind {
-        ExprKind::InlineLibraryCall { func, arg } => (*func, arg),
+        ExprKind::InlineLibraryCall { func, args } => (*func, args),
         other => panic!("{src}: expected an InlineLibraryCall, got {other:?}"),
+    }
+}
+
+/// The in-place call of one argument `expr` is, as (function, argument).
+fn inline_call<'e>(src: &str, expr: &'e Expr) -> (InlineLibraryFn, &'e Expr) {
+    match inline_call_args(src, expr) {
+        (func, [arg]) => (func, arg),
+        (func, args) => panic!("{src}: {func:?} has {} arguments", args.len()),
     }
 }
 
@@ -5270,6 +5278,62 @@ fn test_fabs_builtins() {
         Some(types.longdouble_id),
         "the int converts to long double"
     );
+}
+
+/// `copysign`, `copysignf` and `copysignl`, bare or reserved, are computed in
+/// place at their own type, each of the two arguments converted to it.
+#[test]
+fn test_copysign_builtins() {
+    type Want = fn(&TypeTable) -> crate::types::TypeId;
+    let cases: &[(&str, Want)] = &[
+        ("copysign(i, f)", |t| t.double_id),
+        ("__builtin_copysign(i, f)", |t| t.double_id),
+        ("copysignf(i, f)", |t| t.float_id),
+        ("__builtin_copysignf(i, f)", |t| t.float_id),
+        ("copysignl(i, f)", |t| t.longdouble_id),
+        ("__builtin_copysignl(i, f)", |t| t.longdouble_id),
+    ];
+    for (src, want) in cases {
+        let (expr, types, _, _) = parse_expr_with_vars(src, &["i", "f"]).unwrap();
+        assert_eq!(expr.typ, Some(want(&types)), "{src}");
+        let (func, args) = inline_call_args(src, &expr);
+        assert_eq!(func, InlineLibraryFn::CopySign, "{src}");
+        assert_eq!(args.len(), 2, "{src}");
+        for arg in args {
+            assert_eq!(arg.typ, Some(want(&types)), "{src}: an argument");
+        }
+    }
+}
+
+/// A declaration of `copysign` keeps the builtin only if both parameters, not
+/// just the first, match the library's.
+#[test]
+fn test_copysign_incompatible_declaration_displaces_builtin() {
+    fn returned_is_copysign(src: &str) -> bool {
+        let (tu, _, _, _) = parse_tu(src).unwrap();
+        matches!(
+            first_statement(&tu),
+            Stmt::Return(Some(e)) if matches!(
+                e.kind,
+                ExprKind::InlineLibraryCall { func: InlineLibraryFn::CopySign, .. }
+            )
+        )
+    }
+    assert!(returned_is_copysign(
+        "double copysign(double, double); double f(void) { return copysign(1, 2); }"
+    ));
+    assert!(returned_is_copysign(
+        "double copysign(); double f(void) { return copysign(1.0, 2.0); }"
+    ));
+    assert!(!returned_is_copysign(
+        "double copysign(double, int); double f(void) { return copysign(1, 2); }"
+    ));
+    assert!(!returned_is_copysign(
+        "double copysign(double); double f(void) { return copysign(1); }"
+    ));
+    assert!(!returned_is_copysign(
+        "double copysign(double, double, ...); double f(void) { return copysign(1, 2); }"
+    ));
 }
 
 /// A declaration of `abs` with a type incompatible with `int abs(int)` makes
@@ -6690,21 +6754,17 @@ fn test_alignof_of_an_aligned_function() {
     );
 }
 
-/// `__builtin_signbit` dispatches on its argument's type: a `float` to the
-/// single-precision form, a `long double` to `__signbitl`, a `double` to the
-/// double form. Each result is normalised to 0/1 by a `!= 0`.
+/// `__builtin_signbit` reads the sign at its argument's own type, a
+/// `_Float16` widened to `float`; `__builtin_signbitf` and
+/// `__builtin_signbitl` convert theirs to the type they name. Each is a bit
+/// test, never a call.
 #[test]
 fn test_signbit_is_type_generic() {
-    fn inner(e: &Expr) -> &ExprKind {
-        match &e.kind {
-            ExprKind::Binary { left, .. } => &left.kind,
-            other => other,
-        }
-    }
-    let (tu, _types, strings, symbols) = parse_tu(
-        "float f; double d; long double l;\n\
+    let (tu, types, _, _) = parse_tu(
+        "float f; double d; long double l; _Float16 h;\n\
          int a = 0; void t(void) { a = __builtin_signbit(f); a = __builtin_signbit(d); \
-         a = __builtin_signbit(l); }\n",
+         a = __builtin_signbit(l); a = __builtin_signbit(h); a = __builtin_signbitf(d); \
+         a = __builtin_signbitl(f); }\n",
     )
     .unwrap();
     let body = tu
@@ -6731,15 +6791,24 @@ fn test_signbit_is_type_generic() {
             _ => None,
         })
         .collect();
-    assert_eq!(rhs.len(), 3);
-    assert!(matches!(inner(rhs[0]), ExprKind::Signbitf { .. }), "float");
-    assert!(matches!(inner(rhs[1]), ExprKind::Signbit { .. }), "double");
-    match inner(rhs[2]) {
-        ExprKind::Call { func, .. } => match &func.kind {
-            ExprKind::Ident(id) => check_name(&strings, symbols.get(*id).name, "__signbitl"),
-            other => panic!("long double: expected a call to __signbitl, got {other:?}"),
-        },
-        other => panic!("long double: expected a call, got {other:?}"),
+    let want = [
+        types.float_id,
+        types.double_id,
+        types.longdouble_id,
+        types.float_id,
+        types.float_id,
+        types.longdouble_id,
+    ];
+    assert_eq!(rhs.len(), want.len());
+    for (i, (e, typ)) in rhs.iter().zip(want).enumerate() {
+        assert_eq!(e.typ, Some(types.int_id), "#{i}");
+        match &e.kind {
+            ExprKind::FpTest {
+                test: FpTest::SignBit,
+                arg,
+            } => assert_eq!(arg.typ, Some(typ), "#{i}: the operand's type"),
+            other => panic!("#{i}: expected a sign-bit test, got {other:?}"),
+        }
     }
 }
 

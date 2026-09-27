@@ -1930,10 +1930,9 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcount { arg }
             | ExprKind::Popcountl { arg }
             | ExprKind::Popcountll { arg }
-            | ExprKind::InlineLibraryCall { arg, .. }
-            | ExprKind::Signbit { arg }
-            | ExprKind::Signbitf { arg }
             | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
+
+            ExprKind::InlineLibraryCall { args, .. } => args.iter().all(|a| self.is_pure_expr(a)),
 
             // Pure iff both operands are: the relation itself reads nothing
             // else and raises nothing, which is the point of the family.
@@ -2889,10 +2888,12 @@ impl<'a> Linearizer<'a> {
         Some(total)
     }
 
-    /// Lower a `__builtin_isnan` / `isinf` / `isfinite` / `isnormal`.
+    /// Lower a `__builtin_isnan` / `isinf` / `isfinite` / `isnormal` /
+    /// `signbit`.
     ///
     /// Built from comparisons alone, which keeps them exact at every width and
-    /// needs no new opcode or backend work.
+    /// needs no new opcode or backend work -- except `signbit`, which asks
+    /// what no comparison can see, the sign of a zero or a NaN.
     ///
     ///   isnan(x)     x != x                  (only a NaN differs from itself)
     ///   isinf(x)     x == +inf || x == -inf
@@ -2931,6 +2932,7 @@ impl<'a> Linearizer<'a> {
                 let magnitude = self.emit_at_least_normal(val, typ, size);
                 self.emit_bool_combine(Opcode::And, finite, magnitude)
             }
+            FpTest::SignBit => self.emit_signbit(val, typ),
         }
     }
 
@@ -4107,29 +4109,42 @@ impl<'a> Linearizer<'a> {
         value
     }
 
-    /// A library function's call evaluated in place: its argument, already
-    /// converted to the parameter type, and the computation the call stands
+    /// A library function's call evaluated in place: its arguments, already
+    /// converted to the parameter types, and the computation the call stands
     /// for. Never an lvalue, so only ever reached for its value.
     fn linearize_inline_library_call(
         &mut self,
         expr: &Expr,
         func: InlineLibraryFn,
-        arg: &Expr,
+        args: &[Expr],
     ) -> PseudoId {
         let typ = self.expr_type(expr);
-        match func {
-            InlineLibraryFn::IntAbs => {
+        match (func, args) {
+            (InlineLibraryFn::IntAbs, [arg]) => {
                 let arg_val = self.linearize_expr(arg);
                 let size = self.types.size_bits(typ);
                 self.emit_int_abs(arg_val, typ, size)
             }
-            InlineLibraryFn::Fabs => {
+            (InlineLibraryFn::Fabs, [arg]) => {
                 let arg_val = self.linearize_expr(arg);
                 self.emit_fabs(arg_val, typ)
             }
-            InlineLibraryFn::ComplexReal => self.linearize_complex_half(arg, ComplexHalf::Real),
-            InlineLibraryFn::ComplexImag => self.linearize_complex_half(arg, ComplexHalf::Imag),
-            InlineLibraryFn::Conjugate => self.emit_complex_conjugate(arg, typ),
+            (InlineLibraryFn::CopySign, [x, y]) => {
+                let x_val = self.linearize_expr(x);
+                let y_val = self.linearize_expr(y);
+                self.emit_copysign(x_val, y_val, typ)
+            }
+            (InlineLibraryFn::ComplexReal, [arg]) => {
+                self.linearize_complex_half(arg, ComplexHalf::Real)
+            }
+            (InlineLibraryFn::ComplexImag, [arg]) => {
+                self.linearize_complex_half(arg, ComplexHalf::Imag)
+            }
+            (InlineLibraryFn::Conjugate, [arg]) => self.emit_complex_conjugate(arg, typ),
+            _ => unreachable!(
+                "{func:?} takes {} arguments, and the parser checked the call",
+                func.arity()
+            ),
         }
     }
 
@@ -5379,32 +5394,6 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            ExprKind::Signbit { arg } => {
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Signbit64)
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(64)
-                    .with_type(self.types.int_id);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::Signbitf { arg } => {
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Signbit32)
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(32)
-                    .with_type(self.types.int_id);
-                self.emit(insn);
-                result
-            }
-
             ExprKind::FpTest { test, arg } => self.linearize_fp_test(*test, arg),
             ExprKind::FpCompare { cmp, lhs, rhs } => self.linearize_fp_compare(*cmp, lhs, rhs),
 
@@ -6475,8 +6464,6 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Memset { .. }
             | ExprKind::Memcpy { .. }
             | ExprKind::Memmove { .. }
-            | ExprKind::Signbit { .. }
-            | ExprKind::Signbitf { .. }
             | ExprKind::FpTest { .. }
             | ExprKind::FpCompare { .. }
             | ExprKind::FpClassify { .. }
@@ -6486,8 +6473,8 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Setjmp { .. }
             | ExprKind::Longjmp { .. } => self.linearize_builtin(expr),
 
-            ExprKind::InlineLibraryCall { func, arg } => {
-                self.linearize_inline_library_call(expr, *func, arg)
+            ExprKind::InlineLibraryCall { func, args } => {
+                self.linearize_inline_library_call(expr, *func, args)
             }
 
             ExprKind::OffsetOf { type_id, path } => self.linearize_offsetof(type_id, path),

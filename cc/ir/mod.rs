@@ -159,6 +159,10 @@ pub enum Opcode {
     // Float absolute value, at the width of `typ`: clears the sign bit and
     // nothing else, so it is exact and raises nothing, even for a NaN.
     Fabs,
+    // `copysign`: src[0] with the sign bit of src[1], at the width of `typ`.
+    // Only the sign bit changes, taken from a zero or a NaN as from anything
+    // else, so it is exact and raises nothing, and a NaN keeps its payload.
+    CopySign,
 
     // Type conversions
     Trunc, // Truncate to smaller integer
@@ -248,8 +252,10 @@ pub enum Opcode {
     Memmove, // memmove(dest, src, n) - copy overlapping memory
 
     // Floating-point builtins
-    Signbit32, // Test sign bit of float (returns int)
-    Signbit64, // Test sign bit of double (returns int)
+    // `signbit`: whether the sign bit of the operand is set, as 0 or 1 --
+    // for `-0.0` and a NaN too. Shaped like a conversion: `typ`/`size` are
+    // the `int` result, `src_typ`/`src_size` the floating operand.
+    Signbit,
 
     // Optimization hints
     Unreachable, // Code path is never reached (undefined behavior if reached)
@@ -453,6 +459,7 @@ impl Opcode {
             Opcode::Neg => "neg",
             Opcode::FNeg => "fneg",
             Opcode::Fabs => "fabs",
+            Opcode::CopySign => "copysign",
             Opcode::Trunc => "trunc",
             Opcode::Zext => "zext",
             Opcode::Sext => "sext",
@@ -493,8 +500,7 @@ impl Opcode {
             Opcode::Memset => "memset",
             Opcode::Memcpy => "memcpy",
             Opcode::Memmove => "memmove",
-            Opcode::Signbit32 => "signbit32",
-            Opcode::Signbit64 => "signbit64",
+            Opcode::Signbit => "signbit",
             Opcode::Unreachable => "unreachable",
             Opcode::FrameAddress => "frame_address",
             Opcode::ReturnAddress => "return_address",
@@ -3162,6 +3168,14 @@ mod tests {
     fn test_fabs_opcode() {
         assert_eq!(Opcode::Fabs.name(), "fabs");
         assert!(!Opcode::Fabs.is_terminator());
+    }
+
+    #[test]
+    fn test_sign_opcodes() {
+        assert_eq!(Opcode::Signbit.name(), "signbit");
+        assert_eq!(Opcode::CopySign.name(), "copysign");
+        assert!(!Opcode::Signbit.is_terminator());
+        assert!(!Opcode::CopySign.is_terminator());
     }
 
     #[test]

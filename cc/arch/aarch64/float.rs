@@ -446,6 +446,118 @@ impl Aarch64CodeGen {
         });
     }
 
+    /// The bits of the value in `src` that hold its sign, into `dst`: the
+    /// whole of a `float` or `double`, or the high lane of a binary128. The
+    /// sign is the top bit of the returned width.
+    fn emit_fp_sign_half_to_gp(&mut self, size: FpSize, src: VReg, dst: Reg) -> OperandSize {
+        if size == FpSize::Quad {
+            self.push_lir(Aarch64Inst::UmovVecDToGp { lane: 1, src, dst });
+            return OperandSize::B64;
+        }
+        self.push_lir(Aarch64Inst::FmovToGp { size, src, dst });
+        if size == FpSize::Single {
+            OperandSize::B32
+        } else {
+            OperandSize::B64
+        }
+    }
+
+    /// Shift `reg` in place by `amount`, to the left or the right.
+    fn emit_gp_shift(&mut self, left: bool, size: OperandSize, reg: Reg, amount: u32) {
+        let amount = GpOperand::Imm(i64::from(amount));
+        self.push_lir(if left {
+            Aarch64Inst::Lsl {
+                size,
+                src: reg,
+                amount,
+                dst: reg,
+            }
+        } else {
+            Aarch64Inst::Lsr {
+                size,
+                src: reg,
+                amount,
+                dst: reg,
+            }
+        });
+    }
+
+    /// Emit `Signbit`: the operand's sign bit, shifted down to be the whole
+    /// answer, 0 or 1. The operand's type is `src_typ`; `typ` is the `int`.
+    pub(super) fn emit_fp_signbit(&mut self, insn: &Instruction, types: &TypeTable) {
+        let (Some(&src), Some(target)) = (insn.src.first(), insn.target) else {
+            return;
+        };
+        let size = Self::size_from_type(insn.src_typ, insn.src_size, types);
+        let fp_size = self.fp_size_from_type(insn.src_typ, insn.src_size, types);
+        let (scratch0, _, _) = Reg::scratch_regs();
+        self.emit_fp_move(src, VReg::V17, insn.src_typ, size, types);
+        let width = self.emit_fp_sign_half_to_gp(fp_size, VReg::V17, scratch0);
+        self.emit_gp_shift(false, width, scratch0, width.bits() - 1);
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(scratch0, &dst_loc, u32::BITS);
+    }
+
+    /// Emit `CopySign`: the first operand with the sign bit of the second,
+    /// merged in general registers and nothing computed, so a NaN keeps its
+    /// payload and nothing raises. A binary128 takes the merged high lane
+    /// back into a copy of the first operand, as `Fabs` does.
+    ///
+    /// Both operands are loaded before the general registers are written,
+    /// since loading one may itself go through a scratch register.
+    pub(super) fn emit_fp_copysign(&mut self, insn: &Instruction, types: &TypeTable) {
+        let (Some(&x), Some(&y), Some(target)) = (insn.src.first(), insn.src.get(1), insn.target)
+        else {
+            return;
+        };
+        let size = Self::size_from_type(insn.typ, insn.size, types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
+        let dst_loc = self.get_location(target);
+        let work_reg = match &dst_loc {
+            Loc::VReg(v) => *v,
+            _ => VReg::V16,
+        };
+        let (magnitude, sign, _) = Reg::scratch_regs();
+
+        self.emit_fp_move(x, VReg::V17, insn.typ, size, types);
+        self.emit_fp_move(y, VReg::V18, insn.typ, size, types);
+        let width = self.emit_fp_sign_half_to_gp(fp_size, VReg::V17, magnitude);
+        self.emit_fp_sign_half_to_gp(fp_size, VReg::V18, sign);
+        let top = width.bits() - 1;
+        self.emit_gp_shift(true, width, magnitude, 1);
+        self.emit_gp_shift(false, width, magnitude, 1);
+        self.emit_gp_shift(false, width, sign, top);
+        self.emit_gp_shift(true, width, sign, top);
+        self.push_lir(Aarch64Inst::Orr {
+            size: width,
+            src1: magnitude,
+            src2: GpOperand::Reg(sign),
+            dst: magnitude,
+        });
+        if fp_size == FpSize::Quad {
+            self.push_lir(Aarch64Inst::FmovReg {
+                size: fp_size,
+                src: VReg::V17,
+                dst: work_reg,
+            });
+            self.push_lir(Aarch64Inst::InsGpToVecD {
+                lane: 1,
+                src: magnitude,
+                dst: work_reg,
+            });
+        } else {
+            self.push_lir(Aarch64Inst::FmovFromGp {
+                size: fp_size,
+                src: magnitude,
+                dst: work_reg,
+            });
+        }
+
+        if !matches!(&dst_loc, Loc::VReg(v) if *v == work_reg) {
+            self.emit_fp_move_to_loc(work_reg, &dst_loc, insn.typ, size, types);
+        }
+    }
+
     /// A one-operand FP operation, pushed by `emit` given its size and its
     /// source and destination registers (which differ).
     fn emit_fp_unop(

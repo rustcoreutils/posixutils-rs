@@ -53,8 +53,8 @@ pub enum UnaryOp {
 /// A library function whose call the compiler evaluates in place (C17
 /// 7.1.4p1), as the operand of [`ExprKind::InlineLibraryCall`].
 ///
-/// Each is the whole of what the call computes from its one argument, which
-/// arrives already converted to the prototype's parameter type.
+/// Each is the whole of what the call computes from its arguments, which
+/// arrive already converted to the prototype's parameter types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InlineLibraryFn {
     /// `abs`, `labs`, `llabs`, `imaxabs`: the magnitude of an integer, at the
@@ -70,6 +70,23 @@ pub enum InlineLibraryFn {
     /// `conj`, `conjf`, `conjl`: the complex conjugate, as GNU `~z` computes
     /// it.
     Conjugate,
+    /// `copysign`, `copysignf`, `copysignl`: the first argument with the
+    /// sign bit of the second, at the expression's own type.
+    CopySign,
+}
+
+impl InlineLibraryFn {
+    /// How many arguments the function takes.
+    pub fn arity(self) -> usize {
+        match self {
+            InlineLibraryFn::CopySign => 2,
+            InlineLibraryFn::IntAbs
+            | InlineLibraryFn::Fabs
+            | InlineLibraryFn::ComplexReal
+            | InlineLibraryFn::ComplexImag
+            | InlineLibraryFn::Conjugate => 1,
+        }
+    }
 }
 
 /// Binary operators
@@ -114,10 +131,9 @@ impl BinaryOp {
 
 /// Which classification question a [`ExprKind::FpTest`] asks.
 ///
-/// The variants share an `Is` prefix because the builtins they name do:
-/// `__builtin_isnan`, `__builtin_isinf`, and so on.
+/// The variants are named for the builtins they answer: `__builtin_isnan`,
+/// `__builtin_isinf`, ..., `__builtin_signbit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::enum_variant_names)]
 pub enum FpTest {
     /// Is it a NaN?
     IsNan,
@@ -132,6 +148,10 @@ pub enum FpTest {
     IsFinite,
     /// Is it finite, non-zero and not subnormal?
     IsNormal,
+    /// Is its sign bit set? `signbit`: true for `-0.0` and for a NaN whose
+    /// sign is set, which no comparison can tell, so this one is a bit test.
+    /// Answers 0 or 1.
+    SignBit,
 }
 
 /// Which read-modify-write a [`ExprKind::GnuAtomicRmw`] performs.
@@ -732,27 +752,19 @@ pub enum ExprKind {
     // Floating-point builtins
     // =========================================================================
     /// A call to a library function that is evaluated in place rather than
-    /// called: `abs(x)`, `fabs(x)`, `creal(z)`, `conj(z)` and their siblings,
-    /// bare or as `__builtin_*`. `arg` has been checked against the
-    /// function's prototype and converted to its parameter type, as a call's
-    /// argument is.
+    /// called: `abs(x)`, `fabs(x)`, `copysign(x, y)`, `creal(z)`, `conj(z)`
+    /// and their siblings, bare or as `__builtin_*`. `args` have been checked
+    /// against the function's prototype and converted to its parameter types,
+    /// as a call's arguments are.
     ///
     /// It is a call's result, so a value and never an lvalue (C17 6.5.2.2p5):
     /// `creal(z)` computes what `__real__ z` reads, but `creal(z) = 1.0` is
     /// not an assignment to `z`.
     InlineLibraryCall {
         func: InlineLibraryFn,
-        arg: Box<Expr>,
-    },
-
-    /// __builtin_signbit(x) - test sign bit of double, returns non-zero if negative
-    Signbit {
-        arg: Box<Expr>,
-    },
-
-    /// __builtin_signbitf(x) - test sign bit of float, returns non-zero if negative
-    Signbitf {
-        arg: Box<Expr>,
+        /// One argument for each of `func`'s parameters
+        /// ([`InlineLibraryFn::arity`]), each converted to its type.
+        args: Vec<Expr>,
     },
 
     /// `__builtin_isnan` / `isinf` / `isfinite` / `isnormal` -- classify a
@@ -1559,9 +1571,6 @@ impl Expr {
             | K::Popcountl { arg: a }
             | K::Popcountll { arg: a }
             | K::Alloca { size: a }
-            | K::InlineLibraryCall { arg: a, .. }
-            | K::Signbit { arg: a }
-            | K::Signbitf { arg: a }
             | K::FpTest { arg: a, .. }
             | K::Setjmp { env: a }
             | K::C11AtomicThreadFence { order: a }
@@ -1666,7 +1675,9 @@ impl Expr {
                 succ_order,
             } => vec![ptr, expected, desired, succ_order],
             K::Call { func, args, .. } => std::iter::once(&**func).chain(args).collect(),
-            K::Comma(exprs) | K::SizeofType(_, exprs) => exprs.iter().collect(),
+            K::Comma(exprs)
+            | K::SizeofType(_, exprs)
+            | K::InlineLibraryCall { args: exprs, .. } => exprs.iter().collect(),
             K::FpClassify { classes, arg } => {
                 classes.iter().chain(std::iter::once(&**arg)).collect()
             }
@@ -2407,7 +2418,7 @@ mod tests {
         let call = Expr::typed_unpositioned(
             ExprKind::InlineLibraryCall {
                 func: InlineLibraryFn::Fabs,
-                arg: Box::new(arg),
+                args: vec![arg],
             },
             types.double_id,
         );

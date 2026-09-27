@@ -346,8 +346,14 @@ fn eval_shift(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
 /// C lets a program observe one (`<fenv.h>`); folding the operation away
 /// would quietly take that flag with it. Ordinary finite arithmetic raises
 /// only *inexact*, which is not separable from the fold in the first place.
+///
+/// `CopySign` is not arithmetic, and folds for every pair: it moves one sign
+/// bit, raises nothing, and keeps a NaN's payload.
 pub(crate) fn eval_fbinop(op: Opcode, fmt: FpFormat, a: FloatVal, b: FloatVal) -> Option<FloatVal> {
     let (a, b) = (a.round_to_format(fmt), b.round_to_format(fmt));
+    if op == Opcode::CopySign {
+        return Some(a.with_sign_of(b));
+    }
     if !a.is_finite() || !b.is_finite() {
         return None;
     }
@@ -397,15 +403,21 @@ pub(crate) fn eval_fcvtf(
     r.is_finite().then_some(r)
 }
 
-/// A float-to-integer conversion of a constant, to `dst_size` bits.
+/// A float-to-integer conversion of a constant, to `dst_size` bits, or the
+/// other integer a float operand gives in the same shape: `Signbit`.
 ///
 /// `None` when the value does not fit, which is exactly where C leaves the
 /// conversion undefined (6.3.1.4): a folded answer there would be this
 /// compiler's invention rather than the target's, and the two differ.
+///
+/// `Signbit` folds for every operand, the infinities and NaN included: it
+/// reads a bit and raises nothing, and rounding to a format never changes a
+/// sign.
 pub(crate) fn eval_fcvt(op: Opcode, dst_size: u32, src_fmt: FpFormat, a: FloatVal) -> Option<i128> {
     let signed = match op {
         Opcode::FCvtS => true,
         Opcode::FCvtU => false,
+        Opcode::Signbit => return Some(i128::from(a.sign_bit())),
         _ => return None,
     };
     a.round_to_format(src_fmt)

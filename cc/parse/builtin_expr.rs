@@ -888,22 +888,18 @@ impl Parser<'_> {
                 self.expect_special(b')')?;
                 Ok(self.type_generic_signbit(arg, token_pos))
             })()),
-            crate::kw::BUILTIN_SIGNBITF => Some((|| {
+            // gcc gives the suffixed spellings a prototype, `int (float)` and
+            // `int (long double)`, so the argument converts to it.
+            crate::kw::BUILTIN_SIGNBITF | crate::kw::BUILTIN_SIGNBITL => Some((|| {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                let raw = Self::typed_expr(
-                    ExprKind::Signbitf { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                );
-                Ok(self.normalise_predicate(raw, token_pos))
-            })()),
-            crate::kw::BUILTIN_SIGNBITL => Some((|| {
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(self.signbit_long_double(arg, token_pos))
+                let typ = if name_id == crate::kw::BUILTIN_SIGNBITF {
+                    self.types.float_id
+                } else {
+                    self.types.longdouble_id
+                };
+                Ok(self.signbit_at(arg, typ, token_pos))
             })()),
             crate::kw::BUILTIN_COMPLEX => Some((|| {
                 // __builtin_complex(real, imag) - construct complex value
@@ -1851,8 +1847,8 @@ impl Parser<'_> {
             .unwrap_or(name);
         match stem {
             "fma" => 3,
-            "copysign" | "fmax" | "fmin" | "pow" | "fmod" | "atan2" | "hypot" | "fdim"
-            | "remainder" | "nextafter" | "modf" | "frexp" | "ldexp" => 2,
+            "fmax" | "fmin" | "pow" | "fmod" | "atan2" | "hypot" | "fdim" | "remainder"
+            | "nextafter" | "modf" | "frexp" | "ldexp" => 2,
             _ => 1,
         }
     }
@@ -1899,7 +1895,6 @@ impl Parser<'_> {
             "erfc",
         ];
         const BINARY: &[&str] = &[
-            "copysign",
             "fmax",
             "fmin",
             "pow",
@@ -2503,9 +2498,6 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_FFSL
                 | crate::kw::BUILTIN_FFSLL
                 | crate::kw::BUILTIN_SQRT
-                | crate::kw::BUILTIN_COPYSIGN
-                | crate::kw::BUILTIN_COPYSIGNF
-                | crate::kw::BUILTIN_COPYSIGNL
                 | crate::kw::BUILTIN_SQRTF
                 | crate::kw::BUILTIN_SQRTL
                 | crate::kw::BUILTIN_FMAX
@@ -2691,11 +2683,10 @@ impl Parser<'_> {
     /// `__builtin_signbit`, which gcc makes type-generic: glibc's `signbit`
     /// macro hands it every floating type, not only `double`.
     ///
-    /// Treated as double-only, a `long double` argument reached the
-    /// `Signbit64` emitter unconverted, which reads the low 64 bits. On aarch64
-    /// that is the bottom of a binary128 significand, so `signbit(-1.0L)` was
-    /// 0. Each type goes where its sign bit is read correctly, and a
-    /// conversion on the way only ever widens or keeps the sign.
+    /// The sign is read at the argument's own width. The two types c17 has
+    /// no bit test for are converted on the way, which only ever widens or
+    /// keeps the sign: a `_Float16` to `float`, a `__float128` to
+    /// `long double`.
     fn type_generic_signbit(&mut self, arg: Expr, pos: Position) -> Expr {
         // gcc rejects anything but a real floating type, and so does c17:
         // converting an integer to `double` would answer for a value the
@@ -2706,57 +2697,26 @@ impl Parser<'_> {
                 "non-floating-point argument in call to function '__builtin_signbit'",
             );
         }
-        let kind = arg.typ.map(|t| self.types.kind(t));
-        match kind {
-            Some(TypeKind::LongDouble | TypeKind::Float128) => self.signbit_long_double(arg, pos),
-            Some(TypeKind::Float | TypeKind::Float16) => {
-                let arg = self.convert_operand(arg, self.types.float_id);
-                let raw = Self::typed_expr(
-                    ExprKind::Signbitf { arg: Box::new(arg) },
-                    self.types.int_id,
-                    pos,
-                );
-                self.normalise_predicate(raw, pos)
-            }
-            _ => {
-                let arg = self.convert_operand(arg, self.types.double_id);
-                let raw = Self::typed_expr(
-                    ExprKind::Signbit { arg: Box::new(arg) },
-                    self.types.int_id,
-                    pos,
-                );
-                self.normalise_predicate(raw, pos)
-            }
-        }
+        let typ = match arg.typ.map(|t| self.types.kind(t)) {
+            Some(TypeKind::LongDouble | TypeKind::Float128) => self.types.longdouble_id,
+            Some(TypeKind::Float | TypeKind::Float16) => self.types.float_id,
+            _ => self.types.double_id,
+        };
+        self.signbit_at(arg, typ, pos)
     }
 
-    /// The sign of a `long double` (or `__float128`, converted to it without
-    /// losing the sign), through `__signbitl`.
+    /// `signbit` of `arg` converted to the real floating type `typ`: 0 or 1.
     ///
-    /// Not the `Signbit64` opcode: its emitter calls `__signbit`, which takes
-    /// a `double`, so it would test bit 63 of an x87 mantissa -- the explicit
-    /// integer bit, set for every normal value -- and answer "negative" for
-    /// positive numbers.
-    fn signbit_long_double(&mut self, arg: Expr, pos: Position) -> Expr {
-        let ld = self.types.longdouble_id;
-        let arg = self.convert_operand(arg, ld);
-        let raw = self.libm_call("__signbitl", self.types.int_id, &[ld], arg, pos);
-        self.normalise_predicate(raw, pos)
-    }
-
-    /// Reduce a predicate to 0 or 1.
-    ///
-    /// C17 7.12.3.6 lets `signbit` answer with *any* nonzero value, and the
-    /// library entry points take it literally -- `__signbitf` returns 8,
-    /// `__signbit` 128 and `__signbitl` 512. Comparing against zero costs one
-    /// instruction and gives gcc's 0/1.
-    fn normalise_predicate(&mut self, raw: Expr, pos: Position) -> Expr {
-        let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, pos);
+    /// C17 7.12.3.6 asks only for nonzero when the sign is set, and gcc's own
+    /// answer is not one value: 1 for a constant, and at run time the bit in
+    /// place -- `INT_MIN` for a `float`, 512 for an x87 `long double`. 1 at
+    /// every width and level is the one of its answers that is consistent.
+    fn signbit_at(&mut self, arg: Expr, typ: TypeId, pos: Position) -> Expr {
+        let arg = self.convert_operand(arg, typ);
         Self::typed_expr(
-            ExprKind::Binary {
-                op: BinaryOp::Ne,
-                left: Box::new(raw),
-                right: Box::new(zero),
+            ExprKind::FpTest {
+                test: FpTest::SignBit,
+                arg: Box::new(arg),
             },
             self.types.int_id,
             pos,
@@ -2884,11 +2844,10 @@ impl Parser<'_> {
         // A `double` does not. It is passed in an SSE register, so declaring
         // one of these as an integer sent the argument to the wrong register
         // file outright: `__builtin_sqrt(4.0)` read whatever was in xmm0 and
-        // came back 0.0, and `__builtin_copysign(1.0, -1.0)` answered 1.0
-        // because the sign argument never arrived. Both are silent wrong
-        // answers -- the call links and runs. The library functions of the
-        // same names are unaffected; this path is only taken when the header
-        // that would declare them was not included.
+        // came back 0.0, a silent wrong answer -- the call links and runs.
+        // The library functions of the same names are unaffected; this path
+        // is only taken when the header that would declare them was not
+        // included.
         let param_typ = match Self::libm_real_kind(name) {
             Some(LibmReal::Float) => self.types.float_id,
             Some(LibmReal::Double) => self.types.double_id,

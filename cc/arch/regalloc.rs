@@ -352,9 +352,9 @@ pub fn expire_stack_intervals(
 ///
 /// `is_call_like` decides per-opcode. The shared core opcodes are
 /// `Call`, `Longjmp`, `Setjmp`; backends extend that list with any
-/// IR opcodes whose codegen lowering emits a libc call (e.g.
-/// `Signbit64`, `Memcpy`, `Memmove` on both arches). Without this, chordal coloring will happily put a live
-/// pseudo into a caller-saved register that the codegen helper's
+/// IR opcodes whose codegen lowering emits a libc call (e.g. `Memcpy`,
+/// `Memmove` on both arches). Without this, chordal coloring will happily put
+/// a live pseudo into a caller-saved register that the codegen helper's
 /// embedded libc call silently overwrites — see `memory/MEMORY.md`
 pub fn find_call_positions(func: &Function, is_call_like: impl Fn(Opcode) -> bool) -> Vec<usize> {
     let mut call_positions = Vec::with_capacity(DEFAULT_CALL_POS_CAPACITY);

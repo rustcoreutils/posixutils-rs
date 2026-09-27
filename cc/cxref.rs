@@ -224,7 +224,7 @@ fn extract_refs_from_expr(
         ExprKind::SizeofExpr(e) | ExprKind::AlignofExpr(e) => {
             extract_refs_from_expr(e, strings, symbols, xref);
         }
-        ExprKind::Comma(exprs) => {
+        ExprKind::Comma(exprs) | ExprKind::InlineLibraryCall { args: exprs, .. } => {
             for e in exprs {
                 extract_refs_from_expr(e, strings, symbols, xref);
             }
@@ -262,7 +262,6 @@ fn extract_refs_from_expr(
         | ExprKind::Popcount { arg }
         | ExprKind::Popcountl { arg }
         | ExprKind::Popcountll { arg }
-        | ExprKind::InlineLibraryCall { arg, .. }
         | ExprKind::Alloca { size: arg } => {
             extract_refs_from_expr(arg, strings, symbols, xref);
         }

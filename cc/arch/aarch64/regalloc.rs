@@ -1349,12 +1349,9 @@ pub fn collect_asm_fixed_precolors_aarch64(func: &Function) -> BTreeMap<PseudoId
 /// Used by `find_call_positions` to drive the chordal allocator's
 /// cross-call caller-saved forbidding.
 ///
-/// Beyond the obvious `Call` / `Longjmp` / `Setjmp`:
-/// - `Signbit32` / `Signbit64` → `__signbitf` / target-specific
-///   signbit-double libc call (features.rs)
-///
-/// `Memset`/`Memcpy`/`Memmove` are here for the same reason: they lower to a
-/// `bl` to the libc function of the same name. The comment that used to sit
+/// Beyond the obvious `Call` / `Longjmp` / `Setjmp`, `Memset`/`Memcpy`/
+/// `Memmove` are here: they lower to a `bl` to the libc function of the same
+/// name. The comment that used to sit
 /// here said they reached the regular `Opcode::Call` path instead — nothing
 /// performed that conversion, so they reached codegen's `_ => {}` arm and
 /// emitted nothing at all.
@@ -1364,8 +1361,6 @@ pub fn is_call_like_aarch64(op: Opcode) -> bool {
         Opcode::Call
             | Opcode::Longjmp
             | Opcode::Setjmp
-            | Opcode::Signbit32
-            | Opcode::Signbit64
             | Opcode::Memcpy
             | Opcode::Memmove
             | Opcode::Memset
@@ -2472,8 +2467,6 @@ mod tests {
         assert!(is_call_like_aarch64(Opcode::Call));
         assert!(is_call_like_aarch64(Opcode::Longjmp));
         assert!(is_call_like_aarch64(Opcode::Setjmp));
-        assert!(is_call_like_aarch64(Opcode::Signbit32));
-        assert!(is_call_like_aarch64(Opcode::Signbit64));
         // Aarch64 lowers Memset/Memcpy/Memmove to a libc `bl`, so they are
         // call-like here exactly as on x86-64. They were excluded before,
         // on the strength of a comment saying they reached the ordinary
@@ -2482,8 +2475,10 @@ mod tests {
         assert!(is_call_like_aarch64(Opcode::Memset));
         assert!(is_call_like_aarch64(Opcode::Memcpy));
         assert!(is_call_like_aarch64(Opcode::Memmove));
-        // `Fabs` is computed in place.
+        // The sign operations are computed in place.
         assert!(!is_call_like_aarch64(Opcode::Fabs));
+        assert!(!is_call_like_aarch64(Opcode::CopySign));
+        assert!(!is_call_like_aarch64(Opcode::Signbit));
         assert!(!is_call_like_aarch64(Opcode::Add));
         assert!(!is_call_like_aarch64(Opcode::Asm));
     }

@@ -983,6 +983,23 @@ impl X86_64CodeGen {
                 }
             }
 
+            Opcode::CopySign => {
+                if self.is_longdouble_op(insn, types) {
+                    self.emit_x87_copysign(insn);
+                } else {
+                    self.emit_fp_copysign(insn, types);
+                }
+            }
+
+            // The operand's format is its `src_typ`: `typ` is the `int`.
+            Opcode::Signbit => {
+                if self.fp_format(insn.src_typ, insn.src_size, types) == FpSize::Extended {
+                    self.emit_x87_signbit(insn);
+                } else {
+                    self.emit_fp_signbit(insn, types);
+                }
+            }
+
             // Floating-point comparisons
             Opcode::FCmpOEq
             | Opcode::FCmpONe
@@ -1135,14 +1152,6 @@ impl X86_64CodeGen {
 
             Opcode::Memmove => {
                 self.emit_memmove(insn);
-            }
-
-            Opcode::Signbit32 => {
-                self.emit_signbit32(insn);
-            }
-
-            Opcode::Signbit64 => {
-                self.emit_signbit64(insn);
             }
 
             Opcode::Unreachable => {

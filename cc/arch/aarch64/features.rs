@@ -1458,30 +1458,6 @@ impl Aarch64CodeGen {
         });
     }
 
-    /// Emit __builtin_signbitf - test sign bit of float
-    pub(super) fn emit_signbit32(&mut self, insn: &Instruction, types: &TypeTable) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Load argument into V0 (first FP argument register)
-        self.emit_fp_move(arg, VReg::V0, None, 32, types);
-
-        // Call __signbitf from libc (C99: signbit is a macro that calls __signbitf)
-        self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global("__signbitf")),
-        });
-
-        // Result is in W0 (integer return), store to target
-        let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::X0, &dst_loc, u32::BITS);
-    }
-
     /// `__builtin_memcpy`/`memset`/`memmove` on aarch64: a call to the library
     /// function, by the assembler name the program declared it with
     /// (`Instruction::library_callee`).
@@ -1514,29 +1490,5 @@ impl Aarch64CodeGen {
             let dst_loc = self.get_location(target);
             self.emit_move_to_loc(Reg::X0, &dst_loc, 64);
         }
-    }
-
-    /// Emit __builtin_signbit - test sign bit of double
-    pub(super) fn emit_signbit64(&mut self, insn: &Instruction, types: &TypeTable) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Load argument into V0 (first FP argument register)
-        self.emit_fp_move(arg, VReg::V0, None, 64, types);
-
-        // Call signbit function from libc
-        self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global(self.base.target.os.signbit_double_fn())),
-        });
-
-        // Result is in W0 (integer return), store to target
-        let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::X0, &dst_loc, u32::BITS);
     }
 }

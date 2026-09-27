@@ -22,7 +22,7 @@
 //
 
 use super::codegen::X86_64CodeGen;
-use super::lir::{GpOperand, MemAddr, X86Inst, X87BinOp, X87IntWidth, XmmOperand};
+use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, X87BinOp, X87IntWidth, XmmOperand};
 use super::regalloc::{Loc, Reg, X87ControlWords, XmmReg, X87_SCRATCH_BYTES};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
 use crate::float::FpFormat;
@@ -380,6 +380,105 @@ impl X86_64CodeGen {
     /// the sign, so the payload survives.
     pub(super) fn emit_x87_abs(&mut self, insn: &Instruction) {
         self.emit_x87_sign_op(insn, X86Inst::X87Abs);
+    }
+
+    /// The address of the sign-and-exponent word of the `long double`
+    /// `pseudo`: bytes 8 and 9, above the 64-bit significand, with the sign
+    /// as bit 15. An address that takes no displacement (a RIP-relative
+    /// constant) is first taken into `scratch`.
+    fn x87_sign_word_addr(&mut self, pseudo: PseudoId, scratch: Reg) -> MemAddr {
+        match self.get_x87_mem_addr(pseudo) {
+            MemAddr::BaseOffset { base, offset } => MemAddr::BaseOffset {
+                base,
+                offset: offset + 8,
+            },
+            addr => {
+                self.push_lir(X86Inst::Lea { addr, dst: scratch });
+                MemAddr::BaseOffset {
+                    base: scratch,
+                    offset: 8,
+                }
+            }
+        }
+    }
+
+    /// Load the sign-and-exponent word of the `long double` `pseudo`,
+    /// zero-extended, into `dst`.
+    fn emit_x87_sign_word_load(&mut self, pseudo: PseudoId, dst: Reg) {
+        let addr = self.x87_sign_word_addr(pseudo, dst);
+        self.push_lir(X86Inst::Movzx {
+            src_size: OperandSize::B16,
+            dst_size: OperandSize::B32,
+            src: GpOperand::Mem(addr),
+            dst,
+        });
+    }
+
+    /// Emit `Signbit` of a `long double`: bit 15 of its sign-and-exponent
+    /// word, read from memory, 0 or 1. Nothing is loaded onto the x87 stack.
+    pub(super) fn emit_x87_signbit(&mut self, insn: &Instruction) {
+        let (Some(&src), Some(target)) = (insn.src.first(), insn.target) else {
+            return;
+        };
+        self.emit_x87_sign_word_load(src, Reg::R10);
+        self.push_lir(X86Inst::Shr {
+            size: OperandSize::B32,
+            count: ShiftCount::Imm(15),
+            dst: Reg::R10,
+        });
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, u32::BITS);
+    }
+
+    /// Emit `CopySign` of a `long double`, on its memory image: the
+    /// significand of the first operand copied as it is, and a sign word
+    /// made of the first operand's exponent and the second's sign.
+    ///
+    /// Integer moves only, so every encoding -- a signalling NaN, a payload,
+    /// one the FPU would not even load -- comes through bit for bit. Both
+    /// sign words are read before the result is written, which may be the
+    /// storage of either operand.
+    pub(super) fn emit_x87_copysign(&mut self, insn: &Instruction) {
+        let (Some(&x), Some(&y), Some(target)) = (insn.src.first(), insn.src.get(1), insn.target)
+        else {
+            return;
+        };
+        self.emit_x87_sign_word_load(y, Reg::R11);
+        self.push_lir(X86Inst::And {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(0x8000),
+            dst: Reg::R11,
+        });
+        self.emit_x87_sign_word_load(x, Reg::R10);
+        self.push_lir(X86Inst::And {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(0x7fff),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Or {
+            size: OperandSize::B32,
+            src: GpOperand::Reg(Reg::R11),
+            dst: Reg::R10,
+        });
+
+        let x_addr = self.get_x87_mem_addr(x);
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(x_addr),
+            dst: GpOperand::Reg(Reg::R11),
+        });
+        let dst_addr = self.get_x87_mem_addr(target);
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R11),
+            dst: GpOperand::Mem(dst_addr),
+        });
+        let dst_word = self.x87_sign_word_addr(target, Reg::R11);
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B16,
+            src: GpOperand::Reg(Reg::R10),
+            dst: GpOperand::Mem(dst_word),
+        });
     }
 
     /// Load a `long double`, apply the sign instruction `op` to ST(0), and

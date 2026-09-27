@@ -507,6 +507,109 @@ impl X86_64CodeGen {
         }
     }
 
+    /// The bits of the SSE value in `src` into the general register `dst`.
+    fn emit_xmm_bits_to_gp(&mut self, src: XmmReg, fp_size: FpSize, dst: Reg) {
+        self.push_lir(X86Inst::MovXmmGp {
+            size: Self::fp_bits_size(fp_size),
+            src,
+            dst,
+        });
+    }
+
+    /// The integer operand size that holds an SSE `float` or `double`.
+    fn fp_bits_size(fp_size: FpSize) -> OperandSize {
+        if fp_size == FpSize::Single {
+            OperandSize::B32
+        } else {
+            OperandSize::B64
+        }
+    }
+
+    /// Emit `Signbit` of a `float` or `double`: its bits into R10, shifted
+    /// down so the sign bit is the whole answer, 0 or 1.
+    pub(super) fn emit_fp_signbit(&mut self, insn: &Instruction, types: &TypeTable) {
+        let (Some(&src), Some(target)) = (insn.src.first(), insn.target) else {
+            return;
+        };
+        let fp_size = self.fp_format(insn.src_typ, insn.src_size, types);
+        let size = Self::fp_bits_size(fp_size);
+        self.emit_fp_move(src, XmmReg::Xmm15, fp_size);
+        self.emit_xmm_bits_to_gp(XmmReg::Xmm15, fp_size, Reg::R10);
+        self.push_lir(X86Inst::Shr {
+            size,
+            count: ShiftCount::Imm((size.bits() - 1) as u8),
+            dst: Reg::R10,
+        });
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, u32::BITS);
+    }
+
+    /// Emit `CopySign` of a `float` or `double`: the magnitude bits of the
+    /// first operand and the sign bit of the second, in R10 and R11.
+    ///
+    /// Integer operations, so nothing is computed that could raise, and a
+    /// NaN in either operand is only ever moved. Both operands are staged in
+    /// the two reserved XMM scratch registers before either general one is
+    /// written, because loading an operand may itself go through R10 (an
+    /// immediate) or R11 (a global); and both are read before the
+    /// destination, which may be either one's register, is written.
+    pub(super) fn emit_fp_copysign(&mut self, insn: &Instruction, types: &TypeTable) {
+        let (Some(&x), Some(&y), Some(target)) = (insn.src.first(), insn.src.get(1), insn.target)
+        else {
+            return;
+        };
+        let fp_size = self.fp_format(insn.typ, insn.size, types);
+        let size = Self::fp_bits_size(fp_size);
+        let top = ShiftCount::Imm((size.bits() - 1) as u8);
+        let one = ShiftCount::Imm(1);
+
+        self.emit_fp_move(x, XmmReg::Xmm15, fp_size);
+        self.emit_fp_move(y, XmmReg::Xmm14, fp_size);
+        self.emit_xmm_bits_to_gp(XmmReg::Xmm15, fp_size, Reg::R10);
+        self.emit_xmm_bits_to_gp(XmmReg::Xmm14, fp_size, Reg::R11);
+        // R11 = the sign bit of y, alone.
+        self.push_lir(X86Inst::Shr {
+            size,
+            count: top,
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Shl {
+            size,
+            count: top,
+            dst: Reg::R11,
+        });
+        // R10 = x with its sign bit cleared.
+        self.push_lir(X86Inst::Shl {
+            size,
+            count: one,
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Shr {
+            size,
+            count: one,
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Or {
+            size,
+            src: GpOperand::Reg(Reg::R11),
+            dst: Reg::R10,
+        });
+
+        let dst_loc = self.get_location(target);
+        let dst_xmm = match &dst_loc {
+            Loc::Xmm(x) => *x,
+            _ => XmmReg::Xmm15,
+        };
+        self.push_lir(X86Inst::MovGpXmm {
+            size,
+            src: Reg::R10,
+            dst: dst_xmm,
+        });
+        if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
+            self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, fp_size);
+        }
+    }
+
     /// Emit floating-point comparison
     pub(super) fn emit_fp_compare(&mut self, insn: &Instruction, types: &TypeTable) {
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {

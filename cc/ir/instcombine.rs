@@ -221,7 +221,7 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
         Opcode::Select => simplify_select(insn, consts, facts),
 
         // Floating point
-        Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv => {
+        Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv | Opcode::CopySign => {
             simplify_fbinop(insn, consts, facts)
         }
         Opcode::FNeg | Opcode::Fabs => simplify_funop(insn, consts, facts),
@@ -232,7 +232,7 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
         | Opcode::FCmpOLe
         | Opcode::FCmpOGt
         | Opcode::FCmpOGe => simplify_fcmp(insn, consts, facts),
-        Opcode::FCvtS | Opcode::FCvtU => simplify_fcvt(insn, consts, facts),
+        Opcode::FCvtS | Opcode::FCvtU | Opcode::Signbit => simplify_fcvt(insn, consts, facts),
 
         // Unary
         Opcode::Neg => simplify_neg(insn, consts),
@@ -834,7 +834,8 @@ fn simplify_fcvtf(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simpl
     }
 }
 
-/// Fold a float-to-integer conversion of a constant.
+/// Fold a float-to-integer conversion of a constant, or a `Signbit` of one,
+/// which has the same shape.
 ///
 /// The source format comes from `src_typ`, not `typ`: a conversion's `typ` is
 /// the integer it produces, and the width it reads is the separate `src_size`.
@@ -2922,6 +2923,82 @@ mod tests {
         assert_eq!(fold_fcvt(Opcode::FCvtS, f64::INFINITY, 64), None);
         // The same value the 32-bit case refused does fit 64 bits.
         assert_eq!(fold_fcvt(Opcode::FCvtS, 3e9, 64), Some(3_000_000_000));
+    }
+
+    /// `Signbit` of a constant folds to 0 or 1 for every operand, a zero and
+    /// a NaN included, and the copy is the `int` in `typ`/`size` -- not the
+    /// `double` operand in `src_typ`/`src_size`.
+    #[test]
+    fn signbit_of_a_constant_folds() {
+        let nan = f64::from_bits(0x7ff8_0000_0000_1234);
+        for (v, want) in [
+            (-1.5, 1),
+            (1.5, 0),
+            (-0.0, 1),
+            (0.0, 0),
+            (f64::NEG_INFINITY, 1),
+            (nan, 0),
+            (-nan, 1),
+        ] {
+            assert_eq!(fold_fcvt(Opcode::Signbit, v, 32), Some(want), "{v}");
+        }
+        let types = TypeTable::new(&Target::host());
+        let mut insn = Instruction::new(Opcode::Signbit)
+            .with_target(PseudoId(1))
+            .with_src(PseudoId(0))
+            .with_type_and_size(types.int_id, 32);
+        insn.src_typ = Some(types.double_id);
+        insn.src_size = 64;
+        let mut func =
+            make_test_func_with_insns(vec![insn], vec![fval(0, -2.0), Pseudo::reg(PseudoId(1), 1)]);
+        assert!(run(&mut func, &host_types()));
+        let got = insn_at(&func, 0);
+        assert_eq!(got.op, Opcode::Copy);
+        assert_eq!((got.typ, got.size), (Some(types.int_id), 32));
+    }
+
+    /// `CopySign` of constants folds at every width and for every pair: the
+    /// sign of a zero, an infinity or a NaN is taken, and a NaN in the first
+    /// operand keeps its payload.
+    #[test]
+    fn copysign_of_constants_folds() {
+        let types = TypeTable::new(&Target::host());
+        let widths = [
+            (types.float_id, 32),
+            (types.double_id, 64),
+            (types.longdouble_id, types.size_bits(types.longdouble_id)),
+        ];
+        let nan = f64::from_bits(0x7ff8_0000_0000_1234);
+        for (typ, size) in widths {
+            for (x, y, want) in [
+                (1.5, -0.0, -1.5),
+                (-1.5, 0.0, 1.5),
+                (2.0, -nan, -2.0),
+                (-2.0, nan, 2.0),
+                (f64::INFINITY, -1.0, f64::NEG_INFINITY),
+                (-3.0, f64::INFINITY, 3.0),
+            ] {
+                let got = fold_float(Opcode::CopySign, typ, size, &[x, y]);
+                assert_eq!(
+                    got.map(|(v, sz)| (v.to_f64(), sz)),
+                    Some((want, size)),
+                    "copysign({x}, {y}) at {size}"
+                );
+            }
+            let zero = fold_float(Opcode::CopySign, typ, size, &[0.0, -1.0]).map(|(v, _)| v);
+            assert!(
+                zero.is_some_and(|v| v.is_zero() && v.sign_bit()),
+                "-0.0 at {size}"
+            );
+        }
+        let got = fold_float(Opcode::CopySign, types.double_id, 64, &[nan, -1.0]);
+        let (neg, exp, sig) = FloatVal::from_f64(nan).key();
+        assert!(!neg);
+        assert_eq!(
+            got.map(|(v, _)| v.key()),
+            Some((true, exp, sig)),
+            "only the sign bit of a NaN changes"
+        );
     }
 
     /// One float binary/unary op over constants; returns the folded value

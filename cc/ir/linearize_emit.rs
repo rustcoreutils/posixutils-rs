@@ -1708,6 +1708,35 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
+    /// `copysign(x, y)` at `typ`: the `CopySign` opcode, computed in place
+    /// by both backends like `Fabs`.
+    pub(crate) fn emit_copysign(&mut self, x: PseudoId, y: PseudoId, typ: TypeId) -> PseudoId {
+        let size = self.types.size_bits(typ);
+        let result = self.alloc_pseudo();
+        let insn = Instruction::new(Opcode::CopySign)
+            .with_target(result)
+            .with_src2(x, y)
+            .with_size(size)
+            .with_type(typ);
+        self.emit(insn);
+        result
+    }
+
+    /// `signbit(x)` of `x`, a value of the real floating type `typ`: 0 or 1,
+    /// an `int`.
+    pub(crate) fn emit_signbit(&mut self, x: PseudoId, typ: TypeId) -> PseudoId {
+        let int_id = self.types.int_id;
+        let result = self.alloc_pseudo();
+        let mut insn = Instruction::new(Opcode::Signbit)
+            .with_target(result)
+            .with_src(x)
+            .with_type_and_size(int_id, self.types.size_bits(int_id));
+        insn.src_typ = Some(typ);
+        insn.src_size = self.types.size_bits(typ);
+        self.emit(insn);
+        result
+    }
+
     /// One integer binary operation on complex halves, into a fresh pseudo.
     pub(crate) fn emit_int_binop(
         &mut self,

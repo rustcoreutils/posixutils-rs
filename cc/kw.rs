@@ -696,9 +696,13 @@ define_keywords! {
     // which is what lets `fabs(x) < 0.0` fold to 0 in a program that only
     // declares `extern double fabs(double);`. Tagged 0 for the same reason
     // `alloca` is, and displaceable the same way (see `builtin_is_shadowed`).
+    // The magnitude and sign functions are each one bit operation.
     (FABS,              "fabs",              0),
     (FABSF,             "fabsf",             0),
     (FABSL,             "fabsl",             0),
+    (COPYSIGN,          "copysign",          0),
+    (COPYSIGNF,         "copysignf",         0),
+    (COPYSIGNL,         "copysignl",         0),
 
     // The integer magnitudes, recognized by their plain names for the same
     // reason and displaceable the same way. Each becomes a branch-free
@@ -774,9 +778,6 @@ define_keywords! {
     (_,                 "sqrt",                 0),
     (_,                 "sqrtf",                0),
     (_,                 "sqrtl",                0),
-    (_,                 "copysign",             0),
-    (_,                 "copysignf",            0),
-    (_,                 "copysignl",            0),
     (_,                 "fmax",                 0),
     (_,                 "fmaxf",                0),
     (_,                 "fmaxl",                0),
@@ -945,12 +946,6 @@ define_keywords! {
     (_,                 "fputs",                 0),
     (_,                 "fputc",                 0),
     (_,                 "fwrite",                0),
-    // The long-double magnitude and sign builtins lower to these rather than
-    // to `fabs`/`__signbit`, which take a `double` and so read only the low
-    // eight bytes of an x87 value. `fabsl` is named above, as a plain
-    // spelling the parser recognizes; it is still looked up here by string,
-    // to synthesize the prototype the call needs.
-    (_,                 "__signbitl",           0),
 
     // ---- Supported attribute names (SUPPORTED_ATTR) ----
     // Plain forms

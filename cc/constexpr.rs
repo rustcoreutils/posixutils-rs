@@ -21,7 +21,7 @@
 //! [`ConstEnv`] trait; everything else is here.
 
 use crate::float::{Complex, FloatVal, FpFormat};
-use crate::parse::ast::{BinaryOp, Expr, ExprKind, InlineLibraryFn, OffsetOfPath, UnaryOp};
+use crate::parse::ast::{BinaryOp, Expr, ExprKind, FpTest, InlineLibraryFn, OffsetOfPath, UnaryOp};
 use crate::symbol::SymbolId;
 use crate::types::{TypeId, TypeKind, TypeTable};
 
@@ -184,6 +184,26 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
         }
 
         ExprKind::Binary { op, left, right } => eval_binary(env, scope, *op, left, right),
+
+        // `signbit` of a floating constant. gcc makes it an integer constant
+        // expression, so `enum { E = __builtin_signbit(-1.0) };` and a `case`
+        // label of one are accepted in both scopes, as there.
+        ExprKind::FpTest {
+            test: FpTest::SignBit,
+            arg,
+        } => Some(i128::from(eval_float(env, scope, arg)?.sign_bit())),
+
+        // `abs` of a constant, in a static initializer only: a call is not an
+        // integer constant expression, and gcc rejects `int a[abs(-2)];` at
+        // file scope while folding `static int b = abs(-2);`. The argument
+        // is at this node's type, and `abs(INT_MIN)` wraps.
+        ExprKind::InlineLibraryCall {
+            func: InlineLibraryFn::IntAbs,
+            args,
+        } if scope == ConstScope::StaticInitializer => match args.as_slice() {
+            [x] => Some(eval(env, scope, x)?.wrapping_abs()),
+            _ => None,
+        },
 
         // `a ?: b` folds like `a ? a : b`; at constant-evaluation time `a`
         // has no side effects to duplicate.
@@ -505,6 +525,21 @@ pub(crate) fn eval_float(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) ->
             eval_as_float(env, scope, chosen_arm(env, scope, expr)?, expr.typ?)
         }
 
+        // `fabs` and `copysign` of constants, whose arguments are already at
+        // this node's type. A call is never an integer constant expression,
+        // and gcc agrees -- `int a[(int)fabs(-2.0)];` is a VLA there -- but
+        // it folds one in a static initializer.
+        ExprKind::InlineLibraryCall { func, args } if scope == ConstScope::StaticInitializer => {
+            match (func, args.as_slice()) {
+                (InlineLibraryFn::Fabs, [x]) => Some(eval_float(env, scope, x)?.magnitude()),
+                (InlineLibraryFn::CopySign, [x, y]) => {
+                    let sign = eval_float(env, scope, y)?;
+                    Some(eval_float(env, scope, x)?.with_sign_of(sign))
+                }
+                _ => None,
+            }
+        }
+
         _ => None,
     }
 }
@@ -616,11 +651,17 @@ pub(crate) fn eval_complex(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) 
         ExprKind::Unary {
             op: UnaryOp::BitNot,
             operand,
-        }
-        | ExprKind::InlineLibraryCall {
-            func: InlineLibraryFn::Conjugate,
-            arg: operand,
         } if operand.typ.is_some_and(|t| types.is_complex(t)) => {
+            let (re, im) = eval_complex_as(env, scope, operand, base)?;
+            Some((re, im.negated()))
+        }
+        ExprKind::InlineLibraryCall {
+            func: InlineLibraryFn::Conjugate,
+            args,
+        } => {
+            let [operand] = args.as_slice() else {
+                return None;
+            };
             let (re, im) = eval_complex_as(env, scope, operand, base)?;
             Some((re, im.negated()))
         }

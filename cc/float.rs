@@ -412,6 +412,22 @@ impl FloatVal {
         FloatVal { neg: false, ..self }
     }
 
+    /// Whether the sign bit is set: `signbit`, true for `-0.0` and for a
+    /// NaN whose sign is set, which no comparison can see.
+    pub fn sign_bit(self) -> bool {
+        self.neg
+    }
+
+    /// This magnitude with the sign of `sign`: `copysign(self, sign)`. Only
+    /// the sign bit is taken, of a zero or a NaN as of anything else, and
+    /// nothing of this value but its sign changes, a NaN's payload included.
+    pub fn with_sign_of(self, sign: Self) -> Self {
+        FloatVal {
+            neg: sign.neg,
+            ..self
+        }
+    }
+
     /// This value's ordering against `other`, or `None` when the two are
     /// unordered because either is a NaN.
     ///
@@ -1479,11 +1495,6 @@ impl FpFormat {
 //   cancels.
 // - Apple's `__divdc3` is compiler-rt's, which scales by `logb` instead.
 impl FloatVal {
-    /// `v` with this value's sign: `copysign(v, self)`.
-    fn sign_onto(self, v: Self) -> Self {
-        FloatVal { neg: self.neg, ..v }
-    }
-
     /// `1` or `0`, as `isinf(v) ? 1 : 0`, carrying `v`'s sign: how libgcc
     /// "boxes" an infinite operand before recomputing.
     fn boxed(self) -> Self {
@@ -1492,13 +1503,13 @@ impl FloatVal {
         } else {
             FloatVal::ZERO
         };
-        self.sign_onto(unit)
+        unit.with_sign_of(self)
     }
 
     /// A NaN operand replaced by a zero of its own sign; anything else kept.
     fn nan_to_zero(self) -> Self {
         if self.is_nan() {
-            self.sign_onto(FloatVal::ZERO)
+            FloatVal::ZERO.with_sign_of(self)
         } else {
             self
         }
@@ -1612,7 +1623,7 @@ impl FloatVal {
         let zero = FloatVal::ZERO;
         if c.is_zero() && d.is_zero() && (!a.is_nan() || !b.is_nan()) {
             // Non-zero over zero.
-            let inf = c.sign_onto(inf);
+            let inf = inf.with_sign_of(c);
             (inf.mul(a, fmt), inf.mul(b, fmt))
         } else if (a.is_infinite() || b.is_infinite()) && c.is_finite() && d.is_finite() {
             // Infinite over finite.
@@ -2489,6 +2500,11 @@ mod tests {
             );
             assert_eq!(neg.magnitude(), v);
             assert_eq!(neg.negated(), v);
+            assert!(neg.sign_bit() && !v.sign_bit());
+            // `copysign` takes the sign alone, from a NaN or a zero too.
+            assert_eq!(v.with_sign_of(FloatVal::ZERO.negated()), neg);
+            assert_eq!(neg.with_sign_of(FloatVal::from_f64(2.0)), v);
+            assert_eq!(FloatVal::from_f64(1.5).with_sign_of(neg).to_f64(), -1.5);
         }
         let x87 = FloatVal::nan_with_payload(FpFormat::X87Extended, 0x1234, NanKind::Quiet);
         assert_eq!(

@@ -814,8 +814,8 @@ impl Aarch64CodeGen {
 
             Opcode::Fabs => self.emit_fp_abs(insn, types),
 
-            Opcode::Signbit32 => self.emit_signbit32(insn, types),
-            Opcode::Signbit64 => self.emit_signbit64(insn, types),
+            Opcode::CopySign => self.emit_fp_copysign(insn, types),
+            Opcode::Signbit => self.emit_fp_signbit(insn, types),
 
             Opcode::Unreachable => {
                 // Emit brk #1 instruction - software breakpoint that traps

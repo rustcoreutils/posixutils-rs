@@ -109,9 +109,10 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 
 ## Library Functions Computed in Place
 
-`abs`, `labs`, `llabs`, `imaxabs`, `fabs`, `fabsf`, `fabsl`, `floor`, `ceil`,
-`trunc`, `round`, `rint`, `nearbyint`, and `creal`, `cimag` and `conj` in each
-precision are known to c17 by prototype, under their bare names and (except
+`abs`, `labs`, `llabs`, `imaxabs`, `fabs`, `fabsf`, `fabsl`, `copysign`,
+`copysignf`, `copysignl`, `floor`, `ceil`, `trunc`, `round`, `rint`,
+`nearbyint`, and `creal`, `cimag` and `conj` in each precision are known to
+c17 by prototype, under their bare names and (except
 the floor family) their `__builtin_` spellings. One table in
 `parse/library_builtin.rs` gives each its prototype and how it is evaluated:
 in place, or -- for the floor family -- as a call to the library function,
@@ -134,9 +135,9 @@ call.
 | `floor(x)`, `ceil(x)`, `trunc(x)`, `round(x)`, `rint(x)`, `nearbyint(x)` | Recognized under their plain names and **narrowed to the `f` form when the argument is a `float`**: `(float)floor((double)x)` is `floorf(x)` exactly, because the result is an integer no greater in magnitude than `x`. The condition is the argument's type, not the result's. Only these six qualify -- `sin` and `log` are not exactly rounding, and narrowing one changes the last bit. Displaced like `fabs`; their `__builtin_` spellings are plain library aliases (below) and do not narrow |
 | `fabs(x)`, `fabsf(x)`, `fabsl(x)` | The same three under their bare names, as gcc recognizes them whether or not `<math.h>` was included. Not reserved spellings, so they are displaced by a declaration that is not a function, by a function declaration whose type is not the library prototype (`struct S fabs(int)`), or by `-fno-builtin[-fabs]`. The bare name is still an object where it is not being called, so `double (*p)(double) = fabs;` names the library function. The argument is converted to the prototype's type first; the optimizer gains the one fact it needs to fold `fabs(x) < 0.0` to 0, and a constant argument folds. All three are computed in place by clearing the sign bit and nothing else -- never a call, so no program needs libm for them; `-0.0` becomes `+0.0` and a NaN, quiet or signalling, keeps its payload and raises nothing |
 | `abs(x)`, `labs(x)`, `llabs(x)`, `imaxabs(x)` and their `__builtin_` spellings | Magnitude of an `int`, `long`, `long long` or `intmax_t`, computed in place as `(x ^ s) - s` with `s = x >> (width - 1)` -- never a call, at every level, as gcc does; a constant argument therefore folds. The argument is converted to the prototype's type first. The bare names are displaced like `fabs`, and a declaration with any other type (`struct S abs(int)`) makes the name an ordinary function, as in gcc; a translation unit's own compatible definition of one does **not** displace it, since defining a reserved library name is undefined (C17 7.1.3p2). `abs(INT_MIN)` wraps to `INT_MIN` |
-| `__builtin_signbit(x)` | Returns non-zero if sign bit set (`double`) |
-| `__builtin_signbitf(x)` | Returns non-zero if sign bit set (`float`) |
-| `__builtin_signbitl(x)` | Returns non-zero if sign bit set (`long double`) |
+| `copysign(x, y)`, `copysignf`, `copysignl` and their `__builtin_` spellings | `x` with the sign bit of `y`, computed in place on both targets by moving that one bit -- never a call, so no program needs libm for them. The sign is taken from a zero or a NaN as from anything else (`copysign(1.0, -0.0)` is `-1.0`), and nothing of `x` but its sign changes: a NaN keeps its payload, and a signalling one stays signalling and raises nothing. Both arguments are converted to the prototype's type first, and constant arguments fold, in a static initializer too (but, as in gcc, a call is never an integer constant expression). The bare names are displaced like `fabs`, by a declaration whose parameters are not both the prototype's or by `-fno-builtin[-copysign]`. `bits/floatn.h` reaches for `__builtin_copysignf`, so every spelling is load-bearing |
+| `__builtin_signbit(x)` | 1 if the sign bit of `x` is set, else 0 -- for `-0.0` and a negative NaN too. Any real floating type, read at its own width (a `_Float16` widened to `float`, a `__float128` to `long double`); glibc's `<math.h>` `signbit` is this. Computed in place on both targets, never a call; of a constant it is an integer constant expression, as in gcc. C only asks for nonzero; gcc answers 1 for a constant but at run time the bit in place (`INT_MIN` for a `float`, 512 for an x86-64 `long double`), and c17 answers 1 at every width and level |
+| `__builtin_signbitf(x)`, `__builtin_signbitl(x)` | The same, of `x` converted to `float` or `long double` |
 | `__builtin_isnan(x)`, `__builtin_isnanf`, `__builtin_isnanl` | 1 if `x` is a NaN, else 0. Any real floating type; the suffix is accepted but not consulted, since the operand's own type decides |
 | `__builtin_isinf(x)`, `__builtin_isinff`, `__builtin_isinfl` | 1 if `x` is an infinity of either sign |
 | `__builtin_isfinite(x)` | 1 if `x` is neither infinite nor NaN. gcc has no `f`/`l` spelling of this one, or of `isnormal`, so neither does c17 |
@@ -145,7 +146,6 @@ call.
 | `__builtin_flt_rounds()` | Current FP rounding mode |
 | `__builtin_isinf_sign(x)` | +1 for +inf, -1 for -inf, 0 otherwise |
 | `__builtin_sqrt(x)` | Square root. Calls the library `sqrt`, so it needs `-lm`; gcc folds a constant argument and does not |
-| `__builtin_copysign(x, y)`, `copysignf`, `copysignl` | Magnitude of `x` with the sign of `y`. Calls the library function. `bits/floatn.h` reaches for the `f` spelling, so all three are load-bearing |
 | `__builtin_sqrt(x)`, `sqrtf`, `sqrtl` | Square root |
 | `__builtin_fmax(x, y)`, `fmaxf`, `fmaxl`, `__builtin_fmin(x, y)`, `fminf`, `fminl` | Larger and smaller of two values |
 | `__builtin_pow(x, y)`, `powf`, `powl` | `x` raised to `y` |

@@ -86,7 +86,7 @@ enum Spelling {
     Reserved,
 }
 
-/// A library function c17 knows by prototype. Each takes one argument.
+/// A library function c17 knows by prototype.
 #[derive(Debug)]
 pub(super) struct LibraryBuiltin {
     /// The library's name for the function, which is also its bare keyword.
@@ -96,7 +96,7 @@ pub(super) struct LibraryBuiltin {
     /// aliases instead (see `parse_library_builtin`).
     reserved: Option<StringId>,
     ret: ProtoType,
-    param: ProtoType,
+    params: &'static [ProtoType],
     lowering: Lowering,
 }
 
@@ -104,14 +104,14 @@ const fn entry(
     bare: StringId,
     reserved: Option<StringId>,
     ret: ProtoType,
-    param: ProtoType,
+    params: &'static [ProtoType],
     lowering: Lowering,
 ) -> LibraryBuiltin {
     LibraryBuiltin {
         bare,
         reserved,
         ret,
-        param,
+        params,
         lowering,
     }
 }
@@ -126,29 +126,32 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
     use Lowering::{InPlace, NarrowingCall};
     use ProtoType::*;
     &[
-        //    bare           reserved                   returns            parameter          lowering
-        entry(kw::ABS,       Some(kw::BUILTIN_ABS),     Int,               Int,               InPlace(F::IntAbs)),
-        entry(kw::LABS,      Some(kw::BUILTIN_LABS),    Long,              Long,              InPlace(F::IntAbs)),
-        entry(kw::LLABS,     Some(kw::BUILTIN_LLABS),   LongLong,          LongLong,          InPlace(F::IntAbs)),
-        entry(kw::IMAXABS,   Some(kw::BUILTIN_IMAXABS), Long,              Long,              InPlace(F::IntAbs)),
-        entry(kw::FABS,      Some(kw::BUILTIN_FABS),    Double,            Double,            InPlace(F::Fabs)),
-        entry(kw::FABSF,     Some(kw::BUILTIN_FABSF),   Float,             Float,             InPlace(F::Fabs)),
-        entry(kw::FABSL,     Some(kw::BUILTIN_FABSL),   LongDouble,        LongDouble,        InPlace(F::Fabs)),
-        entry(kw::FLOOR,     None,                      Double,            Double,            NarrowingCall { narrow: "floorf" }),
-        entry(kw::CEIL,      None,                      Double,            Double,            NarrowingCall { narrow: "ceilf" }),
-        entry(kw::TRUNC,     None,                      Double,            Double,            NarrowingCall { narrow: "truncf" }),
-        entry(kw::ROUND,     None,                      Double,            Double,            NarrowingCall { narrow: "roundf" }),
-        entry(kw::RINT,      None,                      Double,            Double,            NarrowingCall { narrow: "rintf" }),
-        entry(kw::NEARBYINT, None,                      Double,            Double,            NarrowingCall { narrow: "nearbyintf" }),
-        entry(kw::CREAL,     Some(kw::BUILTIN_CREAL),   Double,            ComplexDouble,     InPlace(F::ComplexReal)),
-        entry(kw::CREALF,    Some(kw::BUILTIN_CREALF),  Float,             ComplexFloat,      InPlace(F::ComplexReal)),
-        entry(kw::CREALL,    Some(kw::BUILTIN_CREALL),  LongDouble,        ComplexLongDouble, InPlace(F::ComplexReal)),
-        entry(kw::CIMAG,     Some(kw::BUILTIN_CIMAG),   Double,            ComplexDouble,     InPlace(F::ComplexImag)),
-        entry(kw::CIMAGF,    Some(kw::BUILTIN_CIMAGF),  Float,             ComplexFloat,      InPlace(F::ComplexImag)),
-        entry(kw::CIMAGL,    Some(kw::BUILTIN_CIMAGL),  LongDouble,        ComplexLongDouble, InPlace(F::ComplexImag)),
-        entry(kw::CONJ,      Some(kw::BUILTIN_CONJ),    ComplexDouble,     ComplexDouble,     InPlace(F::Conjugate)),
-        entry(kw::CONJF,     Some(kw::BUILTIN_CONJF),   ComplexFloat,      ComplexFloat,      InPlace(F::Conjugate)),
-        entry(kw::CONJL,     Some(kw::BUILTIN_CONJL),   ComplexLongDouble, ComplexLongDouble, InPlace(F::Conjugate)),
+        //    bare           reserved                     returns            parameters                  lowering
+        entry(kw::ABS,       Some(kw::BUILTIN_ABS),       Int,               &[Int],                     InPlace(F::IntAbs)),
+        entry(kw::LABS,      Some(kw::BUILTIN_LABS),      Long,              &[Long],                    InPlace(F::IntAbs)),
+        entry(kw::LLABS,     Some(kw::BUILTIN_LLABS),     LongLong,          &[LongLong],                InPlace(F::IntAbs)),
+        entry(kw::IMAXABS,   Some(kw::BUILTIN_IMAXABS),   Long,              &[Long],                    InPlace(F::IntAbs)),
+        entry(kw::FABS,      Some(kw::BUILTIN_FABS),      Double,            &[Double],                  InPlace(F::Fabs)),
+        entry(kw::FABSF,     Some(kw::BUILTIN_FABSF),     Float,             &[Float],                   InPlace(F::Fabs)),
+        entry(kw::FABSL,     Some(kw::BUILTIN_FABSL),     LongDouble,        &[LongDouble],              InPlace(F::Fabs)),
+        entry(kw::COPYSIGN,  Some(kw::BUILTIN_COPYSIGN),  Double,            &[Double, Double],          InPlace(F::CopySign)),
+        entry(kw::COPYSIGNF, Some(kw::BUILTIN_COPYSIGNF), Float,             &[Float, Float],            InPlace(F::CopySign)),
+        entry(kw::COPYSIGNL, Some(kw::BUILTIN_COPYSIGNL), LongDouble,        &[LongDouble, LongDouble],  InPlace(F::CopySign)),
+        entry(kw::FLOOR,     None,                        Double,            &[Double],                  NarrowingCall { narrow: "floorf" }),
+        entry(kw::CEIL,      None,                        Double,            &[Double],                  NarrowingCall { narrow: "ceilf" }),
+        entry(kw::TRUNC,     None,                        Double,            &[Double],                  NarrowingCall { narrow: "truncf" }),
+        entry(kw::ROUND,     None,                        Double,            &[Double],                  NarrowingCall { narrow: "roundf" }),
+        entry(kw::RINT,      None,                        Double,            &[Double],                  NarrowingCall { narrow: "rintf" }),
+        entry(kw::NEARBYINT, None,                        Double,            &[Double],                  NarrowingCall { narrow: "nearbyintf" }),
+        entry(kw::CREAL,     Some(kw::BUILTIN_CREAL),     Double,            &[ComplexDouble],           InPlace(F::ComplexReal)),
+        entry(kw::CREALF,    Some(kw::BUILTIN_CREALF),    Float,             &[ComplexFloat],            InPlace(F::ComplexReal)),
+        entry(kw::CREALL,    Some(kw::BUILTIN_CREALL),    LongDouble,        &[ComplexLongDouble],       InPlace(F::ComplexReal)),
+        entry(kw::CIMAG,     Some(kw::BUILTIN_CIMAG),     Double,            &[ComplexDouble],           InPlace(F::ComplexImag)),
+        entry(kw::CIMAGF,    Some(kw::BUILTIN_CIMAGF),    Float,             &[ComplexFloat],            InPlace(F::ComplexImag)),
+        entry(kw::CIMAGL,    Some(kw::BUILTIN_CIMAGL),    LongDouble,        &[ComplexLongDouble],       InPlace(F::ComplexImag)),
+        entry(kw::CONJ,      Some(kw::BUILTIN_CONJ),      ComplexDouble,     &[ComplexDouble],           InPlace(F::Conjugate)),
+        entry(kw::CONJF,     Some(kw::BUILTIN_CONJF),     ComplexFloat,      &[ComplexFloat],            InPlace(F::Conjugate)),
+        entry(kw::CONJL,     Some(kw::BUILTIN_CONJL),     ComplexLongDouble, &[ComplexLongDouble],       InPlace(F::Conjugate)),
     ]
 };
 
@@ -180,11 +183,11 @@ impl Parser<'_> {
     /// for built-in function") makes the name an ordinary function, while the
     /// compatible one `<stdlib.h>` or `<math.h>` writes keeps the builtin. An
     /// unprototyped declaration says nothing about the parameters, so only
-    /// its return type is compared; a prototype must have exactly the one
-    /// parameter, whose qualifiers do not count (C17 6.7.6.3p15 -- which
-    /// `types_compatible` already ignores at the top level).
+    /// its return type is compared; a prototype must have exactly the
+    /// library's parameters, whose qualifiers do not count (C17 6.7.6.3p15 --
+    /// which `types_compatible` already ignores at the top level).
     pub(super) fn library_prototype_matches(&self, lb: &LibraryBuiltin, typ: TypeId) -> bool {
-        let (ret, param) = (lb.ret.id(self.types), lb.param.id(self.types));
+        let ret = lb.ret.id(self.types);
         let decl = self.types.get(typ);
         let ret_ok = decl
             .base
@@ -193,10 +196,19 @@ impl Parser<'_> {
             None => true,
             Some(params) => {
                 !decl.variadic
-                    && matches!(params.as_slice(), [p] if self.types.types_compatible(*p, param))
+                    && params.len() == lb.params.len()
+                    && params
+                        .iter()
+                        .zip(lb.params)
+                        .all(|(&p, want)| self.types.types_compatible(p, want.id(self.types)))
             }
         };
         ret_ok && params_ok
+    }
+
+    /// `lb`'s parameter types.
+    fn library_params(&self, lb: &LibraryBuiltin) -> Vec<TypeId> {
+        lb.params.iter().map(|p| p.id(self.types)).collect()
     }
 
     /// A call to a library builtin, if `name_id` spells one and -- for a bare
@@ -232,46 +244,47 @@ impl Parser<'_> {
         let args = self.parse_argument_list()?;
         self.expect_special(b')')?;
 
-        let (ret, param) = (lb.ret.id(self.types), lb.param.id(self.types));
-        let func_type = self
-            .types
-            .intern(Type::function(ret, vec![param], false, false));
+        let ret = lb.ret.id(self.types);
+        let params = self.library_params(lb);
+        let func_type = self.types.intern(Type::function(ret, params, false, false));
         let sound = self.check_call(Some(func_type), &args, call_pos);
-        match <[Expr; 1]>::try_from(args) {
-            Ok([arg]) if sound => Ok(self.lower_library_call(lb, arg, pos)),
+        if sound && args.len() == lb.params.len() {
+            Ok(self.lower_library_call(lb, args, pos))
+        } else {
             // Diagnosed already. A zero of the return type stands in for the
             // call, so the enclosing expression still parses and types, and
             // no conversion is asked of an argument that has none.
-            _ => {
-                let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, pos);
-                Ok(self.convert_operand(zero, ret))
-            }
+            let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, pos);
+            Ok(self.convert_operand(zero, ret))
         }
     }
 
-    /// Evaluate a checked call to `lb` of `arg` as the table says to.
-    fn lower_library_call(&mut self, lb: &LibraryBuiltin, arg: Expr, pos: Position) -> Expr {
-        let (ret, param) = (lb.ret.id(self.types), lb.param.id(self.types));
-        let name = self.idents.get_opt(lb.bare).unwrap_or("");
+    /// Evaluate a checked call to `lb` of `args`, one for each of its
+    /// parameters, as the table says to.
+    fn lower_library_call(&mut self, lb: &LibraryBuiltin, args: Vec<Expr>, pos: Position) -> Expr {
+        let ret = lb.ret.id(self.types);
+        let params = self.library_params(lb);
         match lb.lowering {
             Lowering::InPlace(func) => {
-                let arg = self.convert_operand(arg, param);
-                Self::typed_expr(
-                    ExprKind::InlineLibraryCall {
-                        func,
-                        arg: Box::new(arg),
-                    },
-                    ret,
-                    pos,
-                )
+                let args = args
+                    .into_iter()
+                    .zip(params)
+                    .map(|(arg, param)| self.convert_operand(arg, param))
+                    .collect();
+                Self::typed_expr(ExprKind::InlineLibraryCall { func, args }, ret, pos)
             }
-            Lowering::NarrowingCall { narrow } if self.is_binary32(&arg) => {
-                let f = self.types.float_id;
-                self.libm_call(narrow, f, &[f], arg, pos)
-            }
-            Lowering::NarrowingCall { .. } => {
-                let arg = self.convert_operand(arg, param);
-                self.libm_call(name, ret, &[param], arg, pos)
+            Lowering::NarrowingCall { narrow } => {
+                let (Ok([arg]), &[param]) = (<[Expr; 1]>::try_from(args), params.as_slice()) else {
+                    unreachable!("the table gives a narrowing call one parameter");
+                };
+                if self.is_binary32(&arg) {
+                    let f = self.types.float_id;
+                    self.libm_call(narrow, f, &[f], arg, pos)
+                } else {
+                    let name = self.idents.get_opt(lb.bare).unwrap_or("");
+                    let arg = self.convert_operand(arg, param);
+                    self.libm_call(name, ret, &[param], arg, pos)
+                }
             }
         }
     }
@@ -281,5 +294,24 @@ impl Parser<'_> {
         e.typ
             .and_then(|t| self.types.fp_format(t))
             .is_some_and(|fmt| fmt == crate::float::FpFormat::Binary32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each entry declares as many parameters as its lowering consumes
+    /// arguments: the call is checked against the one and lowered by the
+    /// other.
+    #[test]
+    fn every_entry_takes_what_its_lowering_consumes() {
+        for lb in LIBRARY_BUILTINS {
+            let want = match lb.lowering {
+                Lowering::InPlace(func) => func.arity(),
+                Lowering::NarrowingCall { .. } => 1,
+            };
+            assert_eq!(lb.params.len(), want, "{lb:?}");
+        }
     }
 }

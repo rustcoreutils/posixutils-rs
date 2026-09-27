@@ -61,7 +61,7 @@ fn builtin_library_call_result_is_not_an_lvalue() {
     let decls = "double creal(double _Complex); double cimag(double _Complex);\n\
                  float crealf(float _Complex); long double cimagl(long double _Complex);\n\
                  double _Complex conj(double _Complex);\n\
-                 int abs(int); double fabs(double);\n";
+                 int abs(int); double fabs(double); double copysign(double, double);\n";
     let cases = [
         "creal(z) = 5.0;",
         "cimag(z) += 1.0;",
@@ -76,6 +76,8 @@ fn builtin_library_call_result_is_not_an_lvalue() {
         "conj(z) = z;",
         "abs(i) = 1;",
         "fabs(d) = 1.0;",
+        "copysign(d, d) = 1.0;",
+        "__builtin_copysign(d, d) += 1.0;",
     ];
     for stmt in cases {
         let src = format!(
@@ -152,8 +154,35 @@ const PARITY: &[(&str, &str, &str)] = &[
         "conj(s)",
         "struct S { double a, b; } s;",
     ),
+    (
+        "double F(double, double)",
+        "copysign(s, 1.0)",
+        "struct S { double a; } s;",
+    ),
+    (
+        "float F(float, float)",
+        "__builtin_copysignf(1.0f, p)",
+        "int *p = 0;",
+    ),
+    (
+        "long double F(long double, long double)",
+        "copysignl(1.0L, s)",
+        "struct S { double a; } s;",
+    ),
+    (
+        "double F(double, double)",
+        "__builtin_copysign(p, s)",
+        "int *p = 0; struct S { double a; } s;",
+    ),
     // Arity.
     ("int F(int)", "abs(1, 2)", ""),
+    ("double F(double, double)", "copysign(1.0)", ""),
+    (
+        "double F(double, double)",
+        "__builtin_copysign(1.0, 2.0, 3.0)",
+        "",
+    ),
+    ("float F(float, float)", "copysignf()", ""),
     ("int F(int)", "abs()", ""),
     ("double F(double)", "fabs(1.0, 2.0)", ""),
     ("double F(double _Complex)", "creal()", ""),
@@ -174,6 +203,8 @@ fn builtin_library_call_arguments_are_checked_like_a_call() {
                  long double fabsl(long double); double floor(double); double ceil(double);\n\
                  double creal(double _Complex); float cimagf(float _Complex);\n\
                  double _Complex conj(double _Complex);\n\
+                 double copysign(double, double); float copysignf(float, float);\n\
+                 long double copysignl(long double, long double);\n\
                  unsigned long strlen(const char *);\n";
     for (proto, call, pre) in PARITY {
         // The ordinary call: the builtin's name replaced by `F`, declared with

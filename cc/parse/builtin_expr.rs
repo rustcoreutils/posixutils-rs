@@ -14,6 +14,7 @@ use super::ast::{
     BinaryOp, CalleeBinding, CheckedOp, Expr, ExprKind, FpCompare, FpTest, GnuAtomicOp,
     OffsetOfPath, UnaryOp,
 };
+use super::library_builtin::LibraryBuiltin;
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::float::FloatVal;
@@ -127,16 +128,18 @@ impl Parser<'_> {
     /// and gcc accepts that. `setjmp` and `longjmp` are the exception, and
     /// only against a *function* declaration: `<setjmp.h>` declares exactly
     /// those, and they need code generation an ordinary call cannot produce.
-    /// The library names with one fixed prototype (`abs`, `fabs`, `floor`,
-    /// ...) survive a function declaration only if it is compatible with that
-    /// prototype (see `matches_bare_builtin_prototype`).
+    /// The library builtins (`abs`, `fabs`, `floor`, ...) survive a function
+    /// declaration only if it is compatible with the prototype their table
+    /// gives (see `library_prototype_matches`).
     ///
     /// The reserved spellings (`__builtin_*`, `_Alignof`, `__alignof__`) are
     /// never displaced: C17 7.1.3 reserves them to the implementation in every
     /// scope, so a program that declares one has no claim on the name.
     pub(super) fn builtin_is_shadowed(&self, name_id: StringId) -> bool {
         let shadowed_by_any_decl = matches!(name_id, crate::kw::OFFSETOF | crate::kw::ALIGNOF_C23);
+        let library = LibraryBuiltin::by_bare_name(name_id);
         let shadowable = shadowed_by_any_decl
+            || library.is_some()
             || matches!(
                 name_id,
                 crate::kw::SETJMP
@@ -144,28 +147,6 @@ impl Parser<'_> {
                     | crate::kw::LONGJMP
                     | crate::kw::LONGJMP2
                     | crate::kw::ALLOCA
-                    | crate::kw::FABS
-                    | crate::kw::FABSF
-                    | crate::kw::FABSL
-                    | crate::kw::ABS
-                    | crate::kw::LABS
-                    | crate::kw::LLABS
-                    | crate::kw::IMAXABS
-                    | crate::kw::CREAL
-                    | crate::kw::CREALF
-                    | crate::kw::CREALL
-                    | crate::kw::CIMAG
-                    | crate::kw::CIMAGF
-                    | crate::kw::CIMAGL
-                    | crate::kw::CONJ
-                    | crate::kw::CONJF
-                    | crate::kw::CONJL
-                    | crate::kw::FLOOR
-                    | crate::kw::CEIL
-                    | crate::kw::TRUNC
-                    | crate::kw::ROUND
-                    | crate::kw::RINT
-                    | crate::kw::NEARBYINT
             );
         if !shadowable {
             return false;
@@ -189,64 +170,7 @@ impl Parser<'_> {
         let typ = self.symbols.get(symbol_id).typ;
         shadowed_by_any_decl
             || self.types.kind(typ) != TypeKind::Function
-            || !self.matches_bare_builtin_prototype(name_id, typ)
-    }
-
-    /// The library prototype of a bare builtin name, as (return type, the one
-    /// parameter's type), for the names that have a single fixed prototype.
-    ///
-    /// `None` for the names that have none (`setjmp`, `alloca`, `offsetof`,
-    /// ...): any function declaration of those keeps the builtin.
-    fn bare_builtin_prototype(&self, name_id: StringId) -> Option<(TypeId, TypeId)> {
-        use crate::kw;
-        let t = &self.types;
-        let same = |id: TypeId| Some((id, id));
-        match name_id {
-            kw::ABS => same(t.int_id),
-            // intmax_t is `long` on every c17 target.
-            kw::LABS | kw::IMAXABS => same(t.long_id),
-            kw::LLABS => same(t.longlong_id),
-            kw::FABSF => same(t.float_id),
-            kw::FABSL => same(t.longdouble_id),
-            kw::FABS | kw::FLOOR | kw::CEIL | kw::TRUNC | kw::ROUND | kw::RINT | kw::NEARBYINT => {
-                same(t.double_id)
-            }
-            kw::CREAL | kw::CIMAG => Some((t.double_id, t.complex_double_id)),
-            kw::CREALF | kw::CIMAGF => Some((t.float_id, t.complex_float_id)),
-            kw::CREALL | kw::CIMAGL => Some((t.longdouble_id, t.complex_longdouble_id)),
-            kw::CONJ => same(t.complex_double_id),
-            kw::CONJF => same(t.complex_float_id),
-            kw::CONJL => same(t.complex_longdouble_id),
-            _ => None,
-        }
-    }
-
-    /// Whether the function type `typ` declared for `name_id` is compatible
-    /// with that builtin's library prototype.
-    ///
-    /// gcc's rule: a declaration with an incompatible type ("conflicting types
-    /// for built-in function") makes the name an ordinary function, while the
-    /// compatible one `<stdlib.h>` or `<math.h>` writes keeps the builtin. An
-    /// unprototyped declaration says nothing about the parameters, so only
-    /// its return type is compared; a prototype must have exactly the one
-    /// parameter, whose qualifiers do not count (C17 6.7.6.3p15 -- which
-    /// `types_compatible` already ignores at the top level).
-    fn matches_bare_builtin_prototype(&self, name_id: StringId, typ: TypeId) -> bool {
-        let Some((ret, param)) = self.bare_builtin_prototype(name_id) else {
-            return true;
-        };
-        let decl = self.types.get(typ);
-        let ret_ok = decl
-            .base
-            .is_some_and(|base| self.types.types_compatible(base, ret));
-        let params_ok = match &decl.params {
-            None => true,
-            Some(params) => {
-                !decl.variadic
-                    && matches!(params.as_slice(), [p] if self.types.types_compatible(*p, param))
-            }
-        };
-        ret_ok && params_ok
+            || library.is_some_and(|lb| !self.library_prototype_matches(lb, typ))
     }
 
     /// Try to parse a builtin function expression.
@@ -286,100 +210,6 @@ impl Parser<'_> {
                     level.pos,
                 )
             })
-    }
-
-    /// A one-argument builtin standing for a prototyped library function:
-    /// `fabs(x)`, `abs(x)` and their siblings. The lowering reads its operand
-    /// at a fixed width, so the argument has to arrive already converted to
-    /// `typ`, as the prototype would have converted it.
-    ///
-    /// `fabs(-3)` is a well-formed call under the prototype the standard
-    /// gives it -- and under the `extern double fabs(double);` a program
-    /// writes for itself -- but the opcode is an SSE instruction that masks
-    /// the sign bit, so an unconverted `int` operand is read as a `double`
-    /// bit pattern and the answer is nonsense. `labs(i)` for an `int i` would
-    /// likewise take the sign from bit 63 of a 32-bit value.
-    fn parse_converted_unary(
-        &mut self,
-        token_pos: Position,
-        typ: TypeId,
-        kind: fn(Box<Expr>) -> ExprKind,
-    ) -> ParseResult<Expr> {
-        self.expect_special(b'(')?;
-        let arg = self.parse_assignment_expr()?;
-        self.expect_special(b')')?;
-        let arg = if arg.typ == Some(typ) {
-            arg
-        } else {
-            Self::typed_expr(
-                ExprKind::Cast {
-                    cast_type: typ,
-                    expr: Box::new(arg),
-                },
-                typ,
-                token_pos,
-            )
-        };
-        Ok(Self::typed_expr(kind(Box::new(arg)), typ, token_pos))
-    }
-
-    /// `creal`, `cimag` and `conj` in each precision, bare or as
-    /// `__builtin_*`: the halves `__real__` and `__imag__` already reach, and
-    /// the conjugate `~z` already computes, so none is a libm call.
-    ///
-    /// The argument converts to the complex type the suffix names, as the
-    /// prototype in `<complex.h>` would convert it: `crealf(z)` of a
-    /// `double _Complex` is the `float` real part, and `creal(3)` is 3.0.
-    /// `conj` is `~z` rather than `__real__ z` and `__imag__ z` spelled out
-    /// over two copies of `z`, so its argument is evaluated once.
-    fn parse_complex_accessor(
-        &mut self,
-        name_id: StringId,
-        token_pos: Position,
-    ) -> ParseResult<Expr> {
-        use crate::kw::*;
-        let base = match name_id {
-            BUILTIN_CREALF | CREALF | BUILTIN_CIMAGF | CIMAGF | BUILTIN_CONJF | CONJF => {
-                self.types.float_id
-            }
-            BUILTIN_CREALL | CREALL | BUILTIN_CIMAGL | CIMAGL | BUILTIN_CONJL | CONJL => {
-                self.types.longdouble_id
-            }
-            _ => self.types.double_id,
-        };
-        let complex_typ = self.types.make_complex(base);
-        let (op, result_typ) = match name_id {
-            BUILTIN_CREAL | BUILTIN_CREALF | BUILTIN_CREALL | CREAL | CREALF | CREALL => {
-                (UnaryOp::Real, base)
-            }
-            BUILTIN_CIMAG | BUILTIN_CIMAGF | BUILTIN_CIMAGL | CIMAG | CIMAGF | CIMAGL => {
-                (UnaryOp::Imag, base)
-            }
-            _ => (UnaryOp::BitNot, complex_typ),
-        };
-        self.expect_special(b'(')?;
-        let arg = self.parse_assignment_expr()?;
-        self.expect_special(b')')?;
-        let arg = if arg.typ == Some(complex_typ) {
-            arg
-        } else {
-            Self::typed_expr(
-                ExprKind::Cast {
-                    cast_type: complex_typ,
-                    expr: Box::new(arg),
-                },
-                complex_typ,
-                token_pos,
-            )
-        };
-        Ok(Self::typed_expr(
-            ExprKind::Unary {
-                op,
-                operand: Box::new(arg),
-            },
-            result_typ,
-            token_pos,
-        ))
     }
 
     /// One of the C99 7.12.14 relations: `__builtin_isgreater` and its five
@@ -428,8 +258,8 @@ impl Parser<'_> {
             _ => self.types.double_id,
         };
 
-        let lhs = self.converted_to(lhs, common, token_pos);
-        let rhs = self.converted_to(rhs, common, token_pos);
+        let lhs = self.convert_operand(lhs, common);
+        let rhs = self.convert_operand(rhs, common);
         Ok(Self::typed_expr(
             ExprKind::FpCompare {
                 cmp,
@@ -450,67 +280,6 @@ impl Parser<'_> {
         let real =
             |id| !t.is_complex(id) && !t.is_vector(id) && (t.is_integer(id) || t.is_float(id));
         real(l) && real(r) && (t.is_float(l) || t.is_float(r))
-    }
-
-    /// `expr` as `typ`, adding a cast only when one is needed.
-    fn converted_to(&mut self, expr: Expr, typ: TypeId, pos: Position) -> Expr {
-        if expr.typ == Some(typ) {
-            return expr;
-        }
-        Self::typed_expr(
-            ExprKind::Cast {
-                cast_type: typ,
-                expr: Box::new(expr),
-            },
-            typ,
-            pos,
-        )
-    }
-
-    /// A libm call that narrows to its `float` form when its argument is one.
-    ///
-    /// `(float)floor((double)x)` is `floorf(x)` exactly: the result is an
-    /// integer no greater in magnitude than `x`, so a value representable as
-    /// a `float` stays representable, and converting it up to `double` and
-    /// back changes nothing. The condition is on the **argument** type and
-    /// not the result -- `double q(float a) { return floor(a); }` narrows
-    /// too, because the narrowing happens before the widening.
-    ///
-    /// Only the exactly-rounding functions qualify, which is why the set is
-    /// enumerated rather than derived. `sin` and `log` are not among them:
-    /// `sinf(x)` and `(float)sin((double)x)` differ in the last bit for some
-    /// `x`, and narrowing one is a wrong answer rather than a faster one.
-    fn narrowing_libm_call(
-        &mut self,
-        wide: &str,
-        narrow: &str,
-        arg: Expr,
-        pos: Position,
-    ) -> ParseResult<Expr> {
-        let is_float = arg
-            .typ
-            .and_then(|t| self.types.fp_format(t))
-            .is_some_and(|fmt| fmt == crate::float::FpFormat::Binary32);
-        Ok(if is_float {
-            let f = self.types.float_id;
-            self.libm_call(narrow, f, &[f], arg, pos)
-        } else {
-            let d = self.types.double_id;
-            self.libm_call(wide, d, &[d], arg, pos)
-        })
-    }
-
-    /// `fabsl(x)`, lowered as an ordinary call to `fabsl` rather than as an
-    /// opcode: the `Fabs64` opcode moves its argument as a `double`, so on
-    /// x86-64 it would read only the low eight bytes of an 80-bit x87 value.
-    /// A real call gets the long-double ABI from the call path, which already
-    /// carries one for `__mulxc3`.
-    fn parse_fabsl(&mut self, token_pos: Position) -> ParseResult<Expr> {
-        self.expect_special(b'(')?;
-        let arg = self.parse_assignment_expr()?;
-        self.expect_special(b')')?;
-        let ld = self.types.longdouble_id;
-        Ok(self.libm_call("fabsl", ld, &[ld], arg, token_pos))
     }
 
     /// `__builtin_va_*`: the variadic-argument builtins, plus `_Generic`.
@@ -984,13 +753,6 @@ impl Parser<'_> {
         name_id: StringId,
         token_pos: Position,
     ) -> Option<ParseResult<Expr>> {
-        // A plain spelling is recognized only where it is being *called*.
-        // `double (*p)(double) = fabs;` names the library function, and an
-        // arm that ran here would report a missing `(` rather than letting
-        // the identifier reach the ordinary path. The `__builtin_` spellings
-        // need no such guard: they are not objects, so demanding the `(` is
-        // the right diagnostic for them.
-        let called = self.is_special(b'(');
         match name_id {
             crate::kw::BUILTIN_INF | crate::kw::BUILTIN_HUGE_VAL => Some((|| {
                 self.expect_special(b'(')?;
@@ -1061,55 +823,6 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
-            // Fabs builtins - absolute value for floats
-            crate::kw::BUILTIN_FABS => Some(self.parse_converted_unary(
-                token_pos,
-                self.types.double_id,
-                |arg| ExprKind::Fabs { arg },
-            )),
-            crate::kw::FABS if called => Some(self.parse_converted_unary(
-                token_pos,
-                self.types.double_id,
-                |arg| ExprKind::Fabs { arg },
-            )),
-
-            crate::kw::BUILTIN_FABSF => Some(self.parse_converted_unary(
-                token_pos,
-                self.types.float_id,
-                |arg| ExprKind::Fabsf { arg },
-            )),
-            crate::kw::FABSF if called => Some(self.parse_converted_unary(
-                token_pos,
-                self.types.float_id,
-                |arg| ExprKind::Fabsf { arg },
-            )),
-
-            crate::kw::BUILTIN_FABSL => Some(self.parse_fabsl(token_pos)),
-            crate::kw::FABSL if called => Some(self.parse_fabsl(token_pos)),
-
-            crate::kw::FLOOR
-            | crate::kw::CEIL
-            | crate::kw::TRUNC
-            | crate::kw::ROUND
-            | crate::kw::RINT
-            | crate::kw::NEARBYINT
-                if called =>
-            {
-                let (wide, narrow) = match name_id {
-                    crate::kw::FLOOR => ("floor", "floorf"),
-                    crate::kw::CEIL => ("ceil", "ceilf"),
-                    crate::kw::TRUNC => ("trunc", "truncf"),
-                    crate::kw::ROUND => ("round", "roundf"),
-                    crate::kw::RINT => ("rint", "rintf"),
-                    _ => ("nearbyint", "nearbyintf"),
-                };
-                Some((|| {
-                    self.expect_special(b'(')?;
-                    let arg = self.parse_assignment_expr()?;
-                    self.expect_special(b')')?;
-                    self.narrowing_libm_call(wide, narrow, arg, token_pos)
-                })())
-            }
             // Signbit builtins - test sign bit of floats
             crate::kw::BUILTIN_ISNAN
             | crate::kw::BUILTIN_ISNANF
@@ -1218,28 +931,6 @@ impl Parser<'_> {
                 self.expect_special(b')')?;
                 Ok(self.signbit_long_double(arg, token_pos))
             })()),
-            crate::kw::BUILTIN_CREAL
-            | crate::kw::BUILTIN_CREALF
-            | crate::kw::BUILTIN_CREALL
-            | crate::kw::BUILTIN_CIMAG
-            | crate::kw::BUILTIN_CIMAGF
-            | crate::kw::BUILTIN_CIMAGL
-            | crate::kw::BUILTIN_CONJ
-            | crate::kw::BUILTIN_CONJF
-            | crate::kw::BUILTIN_CONJL => Some(self.parse_complex_accessor(name_id, token_pos)),
-            crate::kw::CREAL
-            | crate::kw::CREALF
-            | crate::kw::CREALL
-            | crate::kw::CIMAG
-            | crate::kw::CIMAGF
-            | crate::kw::CIMAGL
-            | crate::kw::CONJ
-            | crate::kw::CONJF
-            | crate::kw::CONJL
-                if called =>
-            {
-                Some(self.parse_complex_accessor(name_id, token_pos))
-            }
             crate::kw::BUILTIN_COMPLEX => Some((|| {
                 // __builtin_complex(real, imag) - construct complex value
                 self.expect_special(b'(')?;
@@ -2449,62 +2140,40 @@ impl Parser<'_> {
                     _ => &name_str["__builtin_".len()..],
                 };
                 // Parse arguments first (must consume tokens regardless)
+                let call_pos = self.current_pos();
                 self.expect_special(b'(')?;
-                let mut args = Vec::new();
-                if !self.is_special(b')') {
-                    args.push(self.parse_assignment_expr()?);
-                    while self.is_special(b',') {
-                        self.advance();
-                        args.push(self.parse_assignment_expr()?);
-                    }
-                }
+                let args = self.parse_argument_list()?;
                 self.expect_special(b')')?;
-                // Look up the real function by its de-prefixed name
+                // Look up the real function by its de-prefixed name. A
+                // declaration in scope is checked against exactly as an
+                // ordinary call to it would be.
                 let real_name_id = self.idents.lookup(real_name);
                 let symbol_id = real_name_id.and_then(|id| {
                     self.symbols
                         .lookup_id(id, crate::symbol::Namespace::Ordinary)
                 });
                 if let Some(symbol_id) = symbol_id {
-                    let func_type = self.symbols.get(symbol_id).typ;
-                    let ret_type = self.types.base_type(func_type).unwrap_or(self.types.int_id);
-                    let func_expr =
-                        Self::typed_expr(ExprKind::Ident(symbol_id), func_type, token_pos);
-                    return Ok(Self::typed_expr(
-                        ExprKind::Call {
-                            func: Box::new(func_expr),
-                            args,
-                            binding: CalleeBinding::Library,
-                        },
-                        ret_type,
-                        token_pos,
-                    ));
+                    let func_expr = self.library_callee(symbol_id, token_pos);
+                    if !self.placeholder_prototypes.contains(&symbol_id) {
+                        let func_type = self.resolved_function_type(&func_expr);
+                        self.check_call(func_type, &args, call_pos);
+                    }
+                    return Ok(self.library_call(func_expr, args, token_pos));
                 }
                 // Not declared. gcc knows these intrinsically and
                 // glibc relies on that: `bits/string_fortified.h`
                 // calls `__builtin___memcpy_chk` without ever
                 // declaring `__memcpy_chk`. Synthesize the
-                // declaration rather than failing.
+                // declaration rather than failing. Its parameter
+                // types are placeholders (see `declare_chk_builtin`),
+                // so the arguments are not checked against them --
+                // here or at a later call that finds it in scope.
                 if let Some(symbol_id) = self
                     .chk_builtin_return_type(real_name)
                     .and_then(|ret| self.declare_chk_builtin(real_name, ret))
                 {
-                    let ret_type = self
-                        .types
-                        .base_type(self.symbols.get(symbol_id).typ)
-                        .unwrap_or(self.types.int_id);
-                    let func_type = self.symbols.get(symbol_id).typ;
-                    let func_expr =
-                        Self::typed_expr(ExprKind::Ident(symbol_id), func_type, token_pos);
-                    return Ok(Self::typed_expr(
-                        ExprKind::Call {
-                            func: Box::new(func_expr),
-                            args,
-                            binding: CalleeBinding::Library,
-                        },
-                        ret_type,
-                        token_pos,
-                    ));
+                    let func_expr = self.library_callee(symbol_id, token_pos);
+                    return Ok(self.library_call(func_expr, args, token_pos));
                 }
                 diag::error_args(token_pos, "undeclared function '{0}'", &[real_name]);
                 Ok(Self::typed_expr(
@@ -2518,37 +2187,28 @@ impl Parser<'_> {
         }
     }
 
-    /// `abs`, `labs`, `llabs` and `imaxabs`, bare or as `__builtin_*`: the
-    /// magnitude computed in place, never a call.
-    ///
-    /// gcc expands these at every level, `-O0` included, and a program may
-    /// rely on it: `builtins/abs-1` expects `labs` to be expanded while
-    /// `-fno-builtin-abs` keeps `abs` a call. Expanding them also lets a
-    /// constant argument fold, which a call to the library never can.
-    ///
-    /// The bare spellings follow `fabs`: recognized only where called, and
-    /// displaced by `-fno-builtin[-NAME]` or by a declaration that is not the
-    /// library function's (see `builtin_is_shadowed`).
-    fn parse_int_abs_builtin(
-        &mut self,
-        name_id: StringId,
-        token_pos: Position,
-    ) -> Option<ParseResult<Expr>> {
-        let called = self.is_special(b'(');
-        let typ = match name_id {
-            crate::kw::BUILTIN_ABS => self.types.int_id,
-            crate::kw::ABS if called => self.types.int_id,
-            crate::kw::BUILTIN_LABS => self.types.long_id,
-            crate::kw::LABS if called => self.types.long_id,
-            crate::kw::BUILTIN_LLABS => self.types.longlong_id,
-            crate::kw::LLABS if called => self.types.longlong_id,
-            // `intmax_t` is `long` on every target c17 has, as
-            // `chk_builtin_return_type` also answers.
-            crate::kw::BUILTIN_IMAXABS => self.types.long_id,
-            crate::kw::IMAXABS if called => self.types.long_id,
-            _ => return None,
-        };
-        Some(self.parse_converted_unary(token_pos, typ, |arg| ExprKind::IntAbs { arg }))
+    /// A function designator for `symbol_id`, typed with its declared type.
+    fn library_callee(&self, symbol_id: SymbolId, pos: Position) -> Expr {
+        let func_type = self.symbols.get(symbol_id).typ;
+        Self::typed_expr(ExprKind::Ident(symbol_id), func_type, pos)
+    }
+
+    /// A call through `func` that reaches the library's function, never an
+    /// inline definition of the same name (see `CalleeBinding::Library`).
+    fn library_call(&self, func: Expr, args: Vec<Expr>, pos: Position) -> Expr {
+        let ret_type = func
+            .typ
+            .and_then(|t| self.types.base_type(t))
+            .unwrap_or(self.types.int_id);
+        Self::typed_expr(
+            ExprKind::Call {
+                func: Box::new(func),
+                args,
+                binding: CalleeBinding::Library,
+            },
+            ret_type,
+            pos,
+        )
     }
 
     pub(super) fn parse_builtin_expr(
@@ -2557,6 +2217,9 @@ impl Parser<'_> {
         token_pos: Position,
     ) -> Option<ParseResult<Expr>> {
         // Each family answers `None` for a name it does not own.
+        if let Some(result) = self.parse_library_builtin_call(name_id, token_pos) {
+            return Some(result);
+        }
         if let Some(result) = self.parse_varargs_builtin(name_id, token_pos) {
             return Some(result);
         }
@@ -2567,9 +2230,6 @@ impl Parser<'_> {
             return Some(result);
         }
         if let Some(result) = self.parse_float_builtin(name_id, token_pos) {
-            return Some(result);
-        }
-        if let Some(result) = self.parse_int_abs_builtin(name_id, token_pos) {
             return Some(result);
         }
         if let Some(result) = self.parse_misc_builtin(name_id, token_pos) {
@@ -3007,7 +2667,7 @@ impl Parser<'_> {
         match kind {
             Some(TypeKind::LongDouble | TypeKind::Float128) => self.signbit_long_double(arg, pos),
             Some(TypeKind::Float | TypeKind::Float16) => {
-                let arg = self.converted_to(arg, self.types.float_id, pos);
+                let arg = self.convert_operand(arg, self.types.float_id);
                 let raw = Self::typed_expr(
                     ExprKind::Signbitf { arg: Box::new(arg) },
                     self.types.int_id,
@@ -3016,7 +2676,7 @@ impl Parser<'_> {
                 self.normalise_predicate(raw, pos)
             }
             _ => {
-                let arg = self.converted_to(arg, self.types.double_id, pos);
+                let arg = self.convert_operand(arg, self.types.double_id);
                 let raw = Self::typed_expr(
                     ExprKind::Signbit { arg: Box::new(arg) },
                     self.types.int_id,
@@ -3036,7 +2696,7 @@ impl Parser<'_> {
     /// answered "negative" for positive numbers.
     fn signbit_long_double(&mut self, arg: Expr, pos: Position) -> Expr {
         let ld = self.types.longdouble_id;
-        let arg = self.converted_to(arg, ld, pos);
+        let arg = self.convert_operand(arg, ld);
         let raw = self.libm_call("__signbitl", self.types.int_id, &[ld], arg, pos);
         self.normalise_predicate(raw, pos)
     }
@@ -3071,7 +2731,7 @@ impl Parser<'_> {
     ///
     /// Falls back to the argument unchanged if the name cannot be interned,
     /// which would mean `kw.rs` and this list had drifted apart.
-    fn libm_call(
+    pub(super) fn libm_call(
         &mut self,
         name: &str,
         ret_type: TypeId,
@@ -3214,10 +2874,16 @@ impl Parser<'_> {
         let symbol = Symbol::function(name_id, func_type, self.symbols.depth());
         // A redeclaration can only mean the header did declare it after all,
         // in which case the existing symbol is the one to use.
-        Some(self.symbols.declare(symbol).unwrap_or_else(|_| {
-            self.symbols
-                .lookup_id(name_id, Namespace::Ordinary)
-                .expect("declare failed but no existing symbol")
-        }))
+        match self.symbols.declare(symbol) {
+            Ok(id) => {
+                self.placeholder_prototypes.insert(id);
+                Some(id)
+            }
+            Err(_) => Some(
+                self.symbols
+                    .lookup_id(name_id, Namespace::Ordinary)
+                    .expect("declare failed but no existing symbol"),
+            ),
+        }
     }
 }

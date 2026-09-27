@@ -20,16 +20,44 @@ use crate::types::{AssignFault, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
 impl Parser<'_> {
-    /// Check a call against the callee's prototype (C99 6.5.2.2p2).
+    /// Check a call's arguments against the function type it calls: their
+    /// number, then each one's type (C17 6.5.2.2p2).
+    ///
+    /// `func_type` is the called function's type, or `None` when the callee
+    /// has none -- an object that is not a function, already diagnosed by
+    /// `check_callable`. Every call is checked here: the ordinary postfix
+    /// call, a builtin that stands for a library function, and a
+    /// `__builtin_` alias of one, so each is told exactly what the others are.
     ///
     /// Done at parse time rather than in the linearizer: the same `TypeId` is
     /// available here, but the positions are far better — `call_pos` and every
     /// argument's own position are live, whereas by linearization the only
     /// position left points at whichever sub-expression was lowered last.
-    pub(super) fn check_call_arity(&self, callee: &Expr, args: &[Expr], call_pos: Position) {
-        // Resolve through a function pointer, as the return-type logic does.
-        let Some(func_type) = self.resolved_function_type(callee) else {
-            return;
+    ///
+    /// Answers whether the call is sound: `false` once either check reported
+    /// an error, so a caller that goes on to compute the call in place knows
+    /// not to convert an argument that cannot be converted.
+    pub(super) fn check_call(
+        &mut self,
+        func_type: Option<TypeId>,
+        args: &[Expr],
+        call_pos: Position,
+    ) -> bool {
+        let arity_ok = self.check_call_arity(func_type, args, call_pos);
+        let types_ok = self.check_argument_types(func_type, args);
+        arity_ok && types_ok
+    }
+
+    /// The number of arguments against the prototype. `false` when that was
+    /// reported as an error.
+    fn check_call_arity(
+        &self,
+        func_type: Option<TypeId>,
+        args: &[Expr],
+        call_pos: Position,
+    ) -> bool {
+        let Some(func_type) = func_type else {
+            return true;
         };
 
         // `params == None` means no prototype is visible: `int f();`, a K&R
@@ -38,7 +66,7 @@ impl Parser<'_> {
         // diagnostic and carries a dummy `int` type.
         let ft = self.types.get(func_type);
         let Some(params) = ft.params.as_ref() else {
-            return;
+            return true;
         };
         let required = params.len();
 
@@ -50,7 +78,7 @@ impl Parser<'_> {
             args.len() != required
         };
         if !wrong {
-            return;
+            return true;
         }
 
         let expected = if variadic {
@@ -68,9 +96,11 @@ impl Parser<'_> {
             required,
             &[&expected, &args.len().to_string()],
         );
+        false
     }
 
-    /// Check each argument against its parameter's type.
+    /// Check each argument against its parameter's type. `false` when any
+    /// was reported as an error.
     ///
     /// C17 6.5.2.2p2 requires an argument to be assignable to its parameter,
     /// so the constraints are the assignment ones and this asks the same
@@ -79,18 +109,21 @@ impl Parser<'_> {
     /// Arguments past a prototype's fixed parameters get the default argument
     /// promotions instead (p7), and an unprototyped callee has nothing to
     /// check against, so both are skipped.
-    pub(super) fn check_argument_types(&mut self, callee: &Expr, args: &[Expr]) {
+    fn check_argument_types(&mut self, func_type: Option<TypeId>, args: &[Expr]) -> bool {
         // A vector argument goes by value under gcc, in vector registers; the
         // array model would pass its address. Checked for every argument,
         // prototyped or not.
+        let mut sound = true;
         for arg in args {
-            self.check_not_vector_value(arg.typ, arg.pos);
+            if self.check_not_vector_value(arg.typ, arg.pos) {
+                sound = false;
+            }
         }
-        let Some(func_type) = self.resolved_function_type(callee) else {
-            return;
+        let Some(func_type) = func_type else {
+            return sound;
         };
         let Some(params) = self.types.get(func_type).params.clone() else {
-            return;
+            return sound;
         };
         for (i, (arg, &param)) in args.iter().zip(params.iter()).enumerate() {
             let (Some(a), param) = (arg.typ, param) else {
@@ -136,6 +169,7 @@ impl Parser<'_> {
                     "incompatible type for argument {0}: expected '{1}', got '{2}'",
                     &[&n, &p_name, &a_name],
                 );
+                sound = false;
             } else {
                 diag::warning_args(
                     arg.pos,
@@ -144,6 +178,7 @@ impl Parser<'_> {
                 );
             }
         }
+        sound
     }
 
     /// C17 6.5.3.2p2: the operand of unary `*` shall have pointer type. A
@@ -277,7 +312,7 @@ impl Parser<'_> {
 
     /// The function type a callee expression resolves to, through a function
     /// pointer if need be.
-    fn resolved_function_type(&self, callee: &Expr) -> Option<TypeId> {
+    pub(super) fn resolved_function_type(&self, callee: &Expr) -> Option<TypeId> {
         callee.typ.and_then(|t| match self.types.kind(t) {
             TypeKind::Function => Some(t),
             TypeKind::Pointer => self
@@ -530,7 +565,7 @@ impl Parser<'_> {
     /// pointer, a compound literal, or a string literal. Everything else --
     /// the result of arithmetic, a call, a cast, a conditional, a comma -- is
     /// a value, not a place.
-    fn is_lvalue(&self, expr: &Expr) -> bool {
+    pub(super) fn is_lvalue(&self, expr: &Expr) -> bool {
         match &expr.kind {
             ExprKind::Ident(symbol_id) => {
                 // A function designator and an enum constant are not objects.

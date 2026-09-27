@@ -13,7 +13,7 @@
 
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Expr, ExprKind, ExternalDecl,
-    ForInit, FunctionDef, Stmt, TranslationUnit, UnaryOp,
+    ForInit, FunctionDef, InlineLibraryFn, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::parse::parser::{ParseResult, Parser};
 use crate::strings::{StringId, StringTable};
@@ -5086,10 +5086,20 @@ fn first_statement(tu: &TranslationUnit) -> &Stmt {
     stmt
 }
 
-// abs / labs / llabs / imaxabs
+// Library builtins: abs, fabs, creal, conj, ... as checked calls
 
-/// Each spelling, bare or reserved, parses to `IntAbs` of the function's own
-/// type, with the argument converted to it as the prototype would.
+/// The in-place call `expr` is, as (function, argument), or a panic naming
+/// `src` and what it was instead.
+fn inline_call<'e>(src: &str, expr: &'e Expr) -> (InlineLibraryFn, &'e Expr) {
+    match &expr.kind {
+        ExprKind::InlineLibraryCall { func, arg } => (*func, arg),
+        other => panic!("{src}: expected an InlineLibraryCall, got {other:?}"),
+    }
+}
+
+/// Each integer magnitude, bare or reserved, is computed in place at the
+/// function's own type, with the argument converted to it as the prototype
+/// would.
 #[test]
 fn test_int_abs_builtins() {
     // The spelling, the type it answers, and whether an `int` argument is
@@ -5108,9 +5118,8 @@ fn test_int_abs_builtins() {
     for (src, want, converted) in cases {
         let (expr, types, _, _) = parse_expr_with_vars(src, &["i"]).unwrap();
         assert_eq!(expr.typ, Some(want(&types)), "{src}");
-        let ExprKind::IntAbs { arg } = &expr.kind else {
-            panic!("{src}: expected IntAbs, got {:?}", expr.kind);
-        };
+        let (func, arg) = inline_call(src, &expr);
+        assert_eq!(func, InlineLibraryFn::IntAbs, "{src}");
         assert_eq!(arg.typ, Some(want(&types)), "{src}");
         assert_eq!(
             matches!(arg.kind, ExprKind::Cast { .. }),
@@ -5120,13 +5129,42 @@ fn test_int_abs_builtins() {
     }
 }
 
+/// `fabs` and `fabsf` are computed in place at their own type; `fabsl` is a
+/// real call, because the opcode moves its operand as a `double`.
+#[test]
+fn test_fabs_builtins() {
+    let (expr, types, _, _) = parse_expr_with_vars("fabs(i)", &["i"]).unwrap();
+    let (func, arg) = inline_call("fabs(i)", &expr);
+    assert_eq!(func, InlineLibraryFn::Fabs);
+    assert_eq!(expr.typ, Some(types.double_id));
+    assert_eq!(arg.typ, Some(types.double_id), "the int converts to double");
+
+    let (expr, types, _, _) = parse_expr_with_vars("__builtin_fabsf(i)", &["i"]).unwrap();
+    let (func, _) = inline_call("__builtin_fabsf(i)", &expr);
+    assert_eq!(func, InlineLibraryFn::Fabs);
+    assert_eq!(expr.typ, Some(types.float_id));
+
+    let (expr, types, _, _) = parse_expr_with_vars("fabsl(i)", &["i"]).unwrap();
+    let ExprKind::Call { args, .. } = &expr.kind else {
+        panic!("fabsl: expected a call, got {:?}", expr.kind);
+    };
+    assert_eq!(expr.typ, Some(types.longdouble_id));
+    assert_eq!(args[0].typ, Some(types.longdouble_id));
+}
+
 /// A declaration of `abs` with a type incompatible with `int abs(int)` makes
 /// it an ordinary function; the compatible declaration keeps the builtin.
 #[test]
 fn test_int_abs_incompatible_declaration_displaces_builtin() {
     fn returned_is_int_abs(src: &str) -> bool {
         let (tu, _, _, _) = parse_tu(src).unwrap();
-        matches!(first_statement(&tu), Stmt::Return(Some(e)) if matches!(e.kind, ExprKind::IntAbs { .. }))
+        matches!(
+            first_statement(&tu),
+            Stmt::Return(Some(e)) if matches!(
+                e.kind,
+                ExprKind::InlineLibraryCall { func: InlineLibraryFn::IntAbs, .. }
+            )
+        )
     }
     assert!(!returned_is_int_abs(
         "struct S { int a; }; struct S abs(int); struct S f(void) { return abs(1); }"
@@ -5150,70 +5188,68 @@ fn test_int_abs_incompatible_declaration_displaces_builtin() {
 #[test]
 fn test_int_abs_bare_name_not_called_is_an_identifier() {
     let (expr, _, _, _) = parse_expr_with_vars("abs + 1", &["abs"]).unwrap();
-    assert!(!matches!(expr.kind, ExprKind::IntAbs { .. }));
+    assert!(!matches!(expr.kind, ExprKind::InlineLibraryCall { .. }));
 }
 
-// creal / cimag / conj
-
-/// Each accessor, bare or reserved, is `__real__`, `__imag__` or `~` of its
-/// argument converted to the complex type its suffix names.
+/// Each complex accessor, bare or reserved, computes its half or the
+/// conjugate in place, of its argument converted to the complex type its
+/// suffix names.
 #[test]
 fn test_complex_accessor_builtins() {
     type Want = fn(&TypeTable) -> crate::types::TypeId;
-    let cases: &[(&str, UnaryOp, Want, Want)] = &[
+    use InlineLibraryFn::{ComplexImag, ComplexReal, Conjugate};
+    let cases: &[(&str, InlineLibraryFn, Want, Want)] = &[
         (
             "creal(z)",
-            UnaryOp::Real,
+            ComplexReal,
             |t| t.double_id,
             |t| t.complex_double_id,
         ),
         (
             "__builtin_cimag(z)",
-            UnaryOp::Imag,
+            ComplexImag,
             |t| t.double_id,
             |t| t.complex_double_id,
         ),
         (
             "crealf(z)",
-            UnaryOp::Real,
+            ComplexReal,
             |t| t.float_id,
             |t| t.complex_float_id,
         ),
         (
             "cimagl(z)",
-            UnaryOp::Imag,
+            ComplexImag,
             |t| t.longdouble_id,
             |t| t.complex_longdouble_id,
         ),
         (
             "conj(z)",
-            UnaryOp::BitNot,
+            Conjugate,
             |t| t.complex_double_id,
             |t| t.complex_double_id,
         ),
         (
             "__builtin_conjf(z)",
-            UnaryOp::BitNot,
+            Conjugate,
             |t| t.complex_float_id,
             |t| t.complex_float_id,
         ),
     ];
-    for (src, want_op, want_typ, want_arg) in cases {
+    for (src, want_func, want_typ, want_arg) in cases {
         let code = format!("double _Complex z; void t(void) {{ {src}; }}");
         let (tu, types, _, _) = parse_tu(&code).unwrap();
         let Stmt::Expr(expr) = first_statement(&tu) else {
             panic!("{src}: expected an expression statement");
         };
-        let ExprKind::Unary { op, operand } = &expr.kind else {
-            panic!("{src}: expected a unary, got {:?}", expr.kind);
-        };
-        assert_eq!(op, want_op, "{src}");
+        let (func, arg) = inline_call(src, expr);
+        assert_eq!(func, *want_func, "{src}");
         assert_eq!(expr.typ, Some(want_typ(&types)), "{src}");
-        assert_eq!(operand.typ, Some(want_arg(&types)), "{src}");
+        assert_eq!(arg.typ, Some(want_arg(&types)), "{src}");
         // Only a precision other than `double` needs a conversion.
         let converted = want_arg(&types) != types.complex_double_id;
         assert_eq!(
-            matches!(operand.kind, ExprKind::Cast { .. }),
+            matches!(arg.kind, ExprKind::Cast { .. }),
             converted,
             "{src}"
         );
@@ -5226,6 +5262,97 @@ fn test_complex_accessor_incompatible_declaration_displaces_builtin() {
     let code = "struct S { int a; }; struct S creal(int);\n\
                 int t(void) { return creal(1).a; }";
     assert!(parse_tu(code).is_ok());
+}
+
+/// Parse `decls` and a function `t` whose one statement is `stmt`, then hand
+/// that statement's expression to `f` along with the parser that built it.
+fn with_statement_expr<R>(decls: &str, stmt: &str, f: impl FnOnce(&mut Parser, &Expr) -> R) -> R {
+    let src = format!("{decls}\nvoid t(void) {{ {stmt}; }}");
+    let mut strings = StringTable::new();
+    let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);
+    let tokens = tokenizer.tokenize();
+    let mut symbols = SymbolTable::new();
+    let mut types = TypeTable::new(&Target::host());
+    let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+    let tu = parser.parse_translation_unit().unwrap();
+    let Stmt::Expr(expr) = first_statement(&tu) else {
+        panic!("{stmt}: expected an expression statement");
+    };
+    f(&mut parser, expr)
+}
+
+/// A library builtin's result is a value: `creal(z)` is not the object
+/// `__real__ z` designates, even though it reads the same half.
+#[test]
+fn test_library_builtin_result_is_not_an_lvalue() {
+    let decls = "double _Complex z; int i; double d;";
+    for stmt in [
+        "creal(z)",
+        "__builtin_cimag(z)",
+        "conj(z)",
+        "abs(i)",
+        "fabs(d)",
+    ] {
+        let lvalue = with_statement_expr(decls, stmt, |p, e| p.is_lvalue(e));
+        assert!(!lvalue, "`{stmt}` is an lvalue");
+    }
+    for stmt in ["__real__ z", "__imag__ z"] {
+        let lvalue = with_statement_expr(decls, stmt, |p, e| p.is_lvalue(e));
+        assert!(lvalue, "`{stmt}` is not an lvalue");
+    }
+}
+
+/// An argument the prototype rejects, or the wrong number of them, is
+/// reported by the ordinary call checks, and the call is not lowered: a zero
+/// of the return type stands in for it, so nothing converts a structure to
+/// an `int`.
+#[test]
+fn test_library_builtin_bad_arguments_are_not_lowered() {
+    let decls = "struct S { int a; } s; int *p;";
+    type Want = fn(&TypeTable) -> crate::types::TypeId;
+    let cases: &[(&str, Want)] = &[
+        ("abs(s)", |t| t.int_id),
+        ("__builtin_fabsf(p)", |t| t.float_id),
+        ("creal(s)", |t| t.double_id),
+        ("conj(s)", |t| t.complex_double_id),
+        ("abs(1, 2)", |t| t.int_id),
+        ("abs()", |t| t.int_id),
+        ("floor(s)", |t| t.double_id),
+    ];
+    for (stmt, want) in cases {
+        with_statement_expr(decls, stmt, |p, e| {
+            assert_eq!(e.typ, Some(want(p.types)), "{stmt}");
+            assert!(
+                !matches!(
+                    e.kind,
+                    ExprKind::InlineLibraryCall { .. } | ExprKind::Call { .. }
+                ),
+                "`{stmt}` was lowered: {:?}",
+                e.kind
+            );
+        });
+    }
+}
+
+/// The checks are the ordinary call's: they say a call is sound exactly when
+/// the arguments fit the prototype, whoever asks.
+#[test]
+fn test_check_call_answers_soundness() {
+    let decls = "struct S { int a; } s; int *p; int i; int F(int);";
+    let sound = |call: &str| {
+        with_statement_expr(decls, call, |p, e| {
+            let ExprKind::Call { func, args, .. } = &e.kind else {
+                panic!("{call}: expected a call");
+            };
+            let func_type = p.resolved_function_type(func);
+            p.check_call(func_type, args, e.pos)
+        })
+    };
+    assert!(sound("F(i)"));
+    assert!(sound("F(p)"), "a pointer to int is a warning, not an error");
+    assert!(!sound("F(s)"));
+    assert!(!sound("F(1, 2)"));
+    assert!(!sound("F()"));
 }
 
 // __builtin_flt_rounds test

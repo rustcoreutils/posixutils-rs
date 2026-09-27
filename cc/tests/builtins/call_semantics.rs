@@ -1,0 +1,230 @@
+//
+// Copyright (c) 2025-2026 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+// A builtin that stands for a library function is still a call
+//
+// C17 7.1.4p1 lets an implementation compute any library function in place,
+// but the program is still calling a function: its arguments are checked and
+// converted against the prototype (6.5.2.2p2, p7), and its result is a value,
+// not an object (6.5.2.2p5). c17 computes `abs`, `fabs`, `creal`, `conj` and
+// their siblings in place, and reaches the libm entry points and the
+// `__builtin_` library aliases through synthesized calls; none of that may
+// change what the program means.
+//
+
+use crate::common::{compile_and_run, create_c_file, run_c17};
+
+/// Compile `src` to assembly and return (accepted, stderr).
+fn compile(src: &str) -> (bool, String) {
+    let c = create_c_file("call_semantics", src);
+    let s = plib::tmp::Builder::new()
+        .prefix("c17_call_semantics_")
+        .suffix(".s")
+        .tempfile()
+        .expect("temp file");
+    let out = run_c17(&[
+        "-S",
+        "-o",
+        s.path().to_str().unwrap(),
+        c.path().to_str().unwrap(),
+    ]);
+    (out.success, out.stderr)
+}
+
+/// The diagnostic text after `error: ` / `warning: `, one per line, with the
+/// file and position stripped: what a reader is told, not where.
+fn messages(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter_map(|l| {
+            ["error: ", "warning: "]
+                .iter()
+                .find_map(|k| l.find(k).map(|i| l[i..].to_string()))
+        })
+        .collect()
+}
+
+// ============================================================================
+// The result is a value, not an object
+// ============================================================================
+
+/// `creal(z) = 5.0` is an assignment to a function's return value. It became
+/// `__real__ z` -- which gcc makes an lvalue when `z` is one -- and so
+/// compiled, and wrote through into `z`.
+#[test]
+fn builtin_library_call_result_is_not_an_lvalue() {
+    let decls = "double creal(double _Complex); double cimag(double _Complex);\n\
+                 float crealf(float _Complex); long double cimagl(long double _Complex);\n\
+                 double _Complex conj(double _Complex);\n\
+                 int abs(int); double fabs(double);\n";
+    let cases = [
+        "creal(z) = 5.0;",
+        "cimag(z) += 1.0;",
+        "++creal(z);",
+        "cimag(z)--;",
+        "double *p = &creal(z); (void)p;",
+        "crealf(fz) = 1.0f;",
+        "cimagl(lz) = 1.0L;",
+        "__builtin_creal(z) = 5.0;",
+        "__builtin_cimag(z) *= 2.0;",
+        "double *q = &__builtin_cimag(z); (void)q;",
+        "conj(z) = z;",
+        "abs(i) = 1;",
+        "fabs(d) = 1.0;",
+    ];
+    for stmt in cases {
+        let src = format!(
+            "{decls}void f(void) {{ double _Complex z = 1.0; float _Complex fz = 1.0f;\n\
+             long double _Complex lz = 1.0L; int i = 1; double d = 1.0;\n\
+             {stmt}\n}}\n"
+        );
+        let (ok, stderr) = compile(&src);
+        assert!(!ok, "accepted `{stmt}`:\n{stderr}");
+        assert!(
+            stderr.contains("lvalue required"),
+            "`{stmt}` was rejected for the wrong reason:\n{stderr}"
+        );
+    }
+
+    // The GNU operators the accessors are built from are still lvalues.
+    let code = r#"
+int main(void) {
+    double _Complex z = 1.0;
+    __real__ z = 5.0;
+    __imag__ z += 2.0;
+    double *p = &__real__ z;
+    *p += 1.0;
+    return (__real__ z == 6.0 && __imag__ z == 2.0) ? 0 : 1;
+}
+"#;
+    assert_eq!(compile_and_run("gnu_real_imag_lvalue", code, &[]), 0);
+}
+
+// ============================================================================
+// The arguments are checked against the prototype
+// ============================================================================
+
+/// Each builtin call, next to an ordinary function with the builtin's own
+/// prototype and the same arguments. Whatever the ordinary call is told --
+/// an error, a warning, or nothing -- the builtin call must be told too.
+const PARITY: &[(&str, &str, &str)] = &[
+    // (prototype, builtin call, preamble)
+    ("int F(int)", "abs(s)", "struct S { int a; } s = { -3 };"),
+    (
+        "int F(int)",
+        "__builtin_abs(s)",
+        "struct S { int a; } s = { -3 };",
+    ),
+    ("long F(long)", "labs(p)", "int *p = 0;"),
+    (
+        "long long F(long long)",
+        "llabs(s)",
+        "struct S { int a; } s;",
+    ),
+    ("long F(long)", "imaxabs(s)", "struct S { int a; } s;"),
+    ("double F(double)", "fabs(s)", "struct S { double a; } s;"),
+    ("float F(float)", "__builtin_fabsf(p)", "int *p = 0;"),
+    (
+        "long double F(long double)",
+        "fabsl(s)",
+        "struct S { double a; } s;",
+    ),
+    ("double F(double)", "floor(s)", "struct S { double a; } s;"),
+    ("double F(double)", "__builtin_ceil(p)", "int *p = 0;"),
+    (
+        "double F(double _Complex)",
+        "creal(s)",
+        "struct S { double a, b; } s;",
+    ),
+    ("float F(float _Complex)", "cimagf(p)", "int *p = 0;"),
+    (
+        "double F(double _Complex)",
+        "__builtin_creal(s)",
+        "struct S { double a, b; } s;",
+    ),
+    (
+        "double _Complex F(double _Complex)",
+        "conj(s)",
+        "struct S { double a, b; } s;",
+    ),
+    // Arity.
+    ("int F(int)", "abs(1, 2)", ""),
+    ("int F(int)", "abs()", ""),
+    ("double F(double)", "fabs(1.0, 2.0)", ""),
+    ("double F(double _Complex)", "creal()", ""),
+    ("double F(double)", "floor(1.0, 2.0)", ""),
+    // A `__builtin_` library alias, checked against the declaration in scope.
+    (
+        "unsigned long F(const char *)",
+        "__builtin_strlen(s)",
+        "struct S { int a; } s;",
+    ),
+    ("unsigned long F(const char *)", "__builtin_strlen(1.5)", ""),
+];
+
+#[test]
+fn builtin_library_call_arguments_are_checked_like_a_call() {
+    let decls = "int abs(int); long labs(long); long long llabs(long long);\n\
+                 long imaxabs(long); double fabs(double); float fabsf(float);\n\
+                 long double fabsl(long double); double floor(double); double ceil(double);\n\
+                 double creal(double _Complex); float cimagf(float _Complex);\n\
+                 double _Complex conj(double _Complex);\n\
+                 unsigned long strlen(const char *);\n";
+    for (proto, call, pre) in PARITY {
+        // The ordinary call: the builtin's name replaced by `F`, declared with
+        // the builtin's prototype.
+        let open = call.find('(').unwrap();
+        let twin_call = format!("F{}", &call[open..]);
+        let twin = format!("{decls}{proto};\nvoid f(void) {{ {pre} (void){twin_call}; }}\n");
+        let real = format!("{decls}void f(void) {{ {pre} (void){call}; }}\n");
+        let (twin_ok, twin_err) = compile(&twin);
+        let (real_ok, real_err) = compile(&real);
+        assert!(
+            !twin_err.is_empty(),
+            "the twin of `{call}` draws no diagnostic, so this case proves nothing"
+        );
+        assert_eq!(
+            real_ok, twin_ok,
+            "`{call}` accepted={real_ok}, ordinary call accepted={twin_ok}\n\
+             builtin:\n{real_err}\nordinary:\n{twin_err}"
+        );
+        assert_eq!(
+            messages(&real_err),
+            messages(&twin_err),
+            "`{call}` is diagnosed differently from an ordinary call"
+        );
+    }
+}
+
+/// Legal calls stay legal and keep their values: the conversions the
+/// prototype asks for still happen.
+#[test]
+fn builtin_library_call_valid_arguments_convert() {
+    let code = r#"
+int abs(int); long labs(long); double fabs(double);
+double creal(double _Complex); double cimag(double _Complex);
+double _Complex conj(double _Complex);
+int main(void) {
+    char c = -3;
+    if (abs(c) != 3) return 1;               /* char promotes to int */
+    if (labs(-4) != 4L) return 2;            /* int converts to long */
+    if (abs(-5.9) != 5) return 3;            /* double converts to int */
+    if (fabs(-2) != 2.0) return 4;           /* int converts to double */
+    if (creal(7) != 7.0 || cimag(7) != 0.0) return 5;
+    float _Complex w = 1.0f + 2.0fi;
+    if (conj(w) != 1.0 - 2.0i) return 6;     /* float _Complex widens */
+    _Bool b = 1;
+    if (abs(b) != 1) return 7;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("builtin_call_convert", code, &["-lm".to_string()]),
+        0
+    );
+}

@@ -19,6 +19,7 @@ mod declaration;
 mod declarator;
 mod expr_check;
 mod expression;
+mod library_builtin;
 pub mod parser;
 mod statement;
 mod toplevel;

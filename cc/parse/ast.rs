@@ -50,6 +50,29 @@ pub enum UnaryOp {
     Imag,
 }
 
+/// A library function whose call the compiler evaluates in place (C17
+/// 7.1.4p1), as the operand of [`ExprKind::InlineLibraryCall`].
+///
+/// Each is the whole of what the call computes from its one argument, which
+/// arrives already converted to the prototype's parameter type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineLibraryFn {
+    /// `abs`, `labs`, `llabs`, `imaxabs`: the magnitude of an integer, at the
+    /// width of the expression's own type.
+    IntAbs,
+    /// `fabs` and `fabsf`: the magnitude of a `double` or `float`, whichever
+    /// the expression's own type is. `fabsl` is not one: an opcode that moves
+    /// its operand as a `double` would read eight bytes of an x87 value.
+    Fabs,
+    /// `creal`, `crealf`, `creall`: the real half of a complex value.
+    ComplexReal,
+    /// `cimag`, `cimagf`, `cimagl`: the imaginary half.
+    ComplexImag,
+    /// `conj`, `conjf`, `conjl`: the complex conjugate, as GNU `~z` computes
+    /// it.
+    Conjugate,
+}
+
 /// Binary operators
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
@@ -709,20 +732,17 @@ pub enum ExprKind {
     // =========================================================================
     // Floating-point builtins
     // =========================================================================
-    /// __builtin_fabs(x) - absolute value of double
-    Fabs {
-        arg: Box<Expr>,
-    },
-
-    /// __builtin_fabsf(x) - absolute value of float
-    Fabsf {
-        arg: Box<Expr>,
-    },
-
-    /// `abs`, `labs`, `llabs`, `imaxabs` and their `__builtin_` spellings:
-    /// the magnitude of `arg`, which has already been converted to the
-    /// expression's own type.
-    IntAbs {
+    /// A call to a library function that is evaluated in place rather than
+    /// called: `abs(x)`, `fabs(x)`, `creal(z)`, `conj(z)` and their siblings,
+    /// bare or as `__builtin_*`. `arg` has been checked against the
+    /// function's prototype and converted to its parameter type, as a call's
+    /// argument is.
+    ///
+    /// It is a call's result, so a value and never an lvalue (C17 6.5.2.2p5):
+    /// `creal(z)` computes what `__real__ z` reads, but `creal(z) = 1.0` is
+    /// not an assignment to `z`.
+    InlineLibraryCall {
+        func: InlineLibraryFn,
         arg: Box<Expr>,
     },
 
@@ -1540,9 +1560,7 @@ impl Expr {
             | K::Popcountl { arg: a }
             | K::Popcountll { arg: a }
             | K::Alloca { size: a }
-            | K::Fabs { arg: a }
-            | K::Fabsf { arg: a }
-            | K::IntAbs { arg: a }
+            | K::InlineLibraryCall { arg: a, .. }
             | K::Signbit { arg: a }
             | K::Signbitf { arg: a }
             | K::FpTest { arg: a, .. }
@@ -2368,34 +2386,21 @@ mod tests {
     }
 
     #[test]
-    fn test_fabs_builtins() {
+    fn test_inline_library_call_operand() {
         let types = TypeTable::new(&Target::host());
-
-        // Test Fabs (double)
         let arg =
             Expr::typed_unpositioned(ExprKind::FloatLit(FloatVal::from_f64(1.5)), types.double_id);
-        let fabs = Expr::new_unpositioned(ExprKind::Fabs { arg: Box::new(arg) });
-        match fabs.kind {
-            ExprKind::Fabs { arg } => {
-                assert!(matches!(arg.kind, ExprKind::FloatLit(_)));
-            }
-            _ => panic!("Expected Fabs"),
-        }
-
-        // Test Fabsf (float)
-        let arg =
-            Expr::typed_unpositioned(ExprKind::FloatLit(FloatVal::from_f64(2.5)), types.float_id);
-        let fabsf = Expr::new_unpositioned(ExprKind::Fabsf { arg: Box::new(arg) });
-        match fabsf.kind {
-            ExprKind::Fabsf { arg } => {
-                assert!(matches!(arg.kind, ExprKind::FloatLit(_)));
-            }
-            _ => panic!("Expected Fabsf"),
-        }
-
-        // There is no `Fabsl` variant: `__builtin_fabsl` lowers to an ordinary
-        // call to `fabsl`, because a `double` opcode would read only the low
-        // eight bytes of an x87 value.
+        let call = Expr::typed_unpositioned(
+            ExprKind::InlineLibraryCall {
+                func: InlineLibraryFn::Fabs,
+                arg: Box::new(arg),
+            },
+            types.double_id,
+        );
+        // The argument is the one operand a walker must visit.
+        let operands = call.operands();
+        assert_eq!(operands.len(), 1);
+        assert!(matches!(operands[0].kind, ExprKind::FloatLit(_)));
     }
 
     #[test]

@@ -1417,3 +1417,21 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c99_conj_static_init", code, &[]), 0);
 }
+
+/// `conj` in a static initializer folds as `~` does: it is the same
+/// conjugate, computed in place rather than called.
+#[test]
+fn c99_complex_conj_call_in_static_initializer() {
+    let code = r#"
+double _Complex conj(double _Complex);
+float _Complex conjf(float _Complex);
+static _Complex double a = conj(3.0 + 4.0i);
+static _Complex float b = __builtin_conjf(1.0f - 2.0if);
+int main(void) {
+    if (__real__ a != 3.0 || __imag__ a != -4.0) return 1;
+    if (__real__ b != 1.0f || __imag__ b != 2.0f) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_conj_call_static_init", code, &[]), 0);
+}

@@ -258,6 +258,12 @@ pub struct Parser<'a> {
     /// Names for which some file-scope declaration omitted `inline`.
     /// See [`crate::symbol::Symbol::has_non_inline_decl`].
     pub(super) declared_non_inline_fns: std::collections::BTreeSet<StringId>,
+    /// Library functions the parser declared itself, for a `__builtin_` alias
+    /// the translation unit never declared, whose parameter types are
+    /// placeholders rather than the library's (see `declare_chk_builtin`). A
+    /// call is not checked against those types: they would report errors
+    /// the program does not have.
+    pub(super) placeholder_prototypes: std::collections::HashSet<crate::symbol::SymbolId>,
     /// `#pragma pack` directives, and where they stood in the token stream.
     ///
     /// Sorted by index; `pack_cursor` is how far the parser has consumed
@@ -318,6 +324,7 @@ impl<'a> Parser<'a> {
             declared_asm_labels: BTreeMap::new(),
             declared_extern_fns: std::collections::BTreeSet::new(),
             declared_non_inline_fns: std::collections::BTreeSet::new(),
+            placeholder_prototypes: std::collections::HashSet::new(),
             pack_directives,
             pack_cursor: 0,
             vm_typedefs: HashMap::new(),

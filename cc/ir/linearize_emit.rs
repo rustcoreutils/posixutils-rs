@@ -1694,6 +1694,27 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit_int_binop(Opcode::Sub, flipped, sign, typ, size)
     }
 
+    /// `|x|` for a `double` or `float`, whichever `typ` is: the `Fabs64` or
+    /// `Fabs32` opcode, which carries the library function's name for a
+    /// backend that lowers it as a call.
+    pub(crate) fn emit_fabs(&mut self, x: PseudoId, typ: TypeId) -> PseudoId {
+        let size = self.types.size_bits(typ);
+        let (opcode, name) = if size == 32 {
+            (Opcode::Fabs32, "fabsf")
+        } else {
+            (Opcode::Fabs64, "fabs")
+        };
+        let result = self.alloc_pseudo();
+        let insn = Instruction::new(opcode)
+            .with_func(self.library_function_name(name))
+            .with_target(result)
+            .with_src(x)
+            .with_size(size)
+            .with_type(typ);
+        self.emit(insn);
+        result
+    }
+
     /// One integer binary operation on complex halves, into a fresh pseudo.
     pub(crate) fn emit_int_binop(
         &mut self,

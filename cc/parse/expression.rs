@@ -1383,8 +1383,8 @@ impl<'a> Parser<'a> {
                 let args = self.parse_argument_list()?;
                 self.expect_special(b')')?;
                 self.check_callable(&expr, call_pos);
-                self.check_call_arity(&expr, &args, call_pos);
-                self.check_argument_types(&expr, &args);
+                let func_type = self.resolved_function_type(&expr);
+                self.check_call(func_type, &args, call_pos);
 
                 // Get the return type from the function type
                 // The func expression should have type TypeKind::Function
@@ -1563,7 +1563,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_argument_list(&mut self) -> ParseResult<Vec<Expr>> {
+    pub(super) fn parse_argument_list(&mut self) -> ParseResult<Vec<Expr>> {
         let mut args = Vec::with_capacity(DEFAULT_ARG_LIST_CAPACITY);
 
         if self.is_special(b')') {
@@ -1871,7 +1871,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `e` converted to `typ`, or `e` unchanged when it is already that type.
-    fn convert_operand(&mut self, e: Expr, typ: TypeId) -> Expr {
+    pub(super) fn convert_operand(&mut self, e: Expr, typ: TypeId) -> Expr {
         if e.typ == Some(typ) {
             return e;
         }

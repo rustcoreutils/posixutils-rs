@@ -21,7 +21,7 @@ use crate::float::FloatVal;
 use crate::ir::linearize_atomic::AtomicLvalue;
 use crate::parse::ast::{
     BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef, GnuAtomicOp,
-    InitElement, OffsetOfPath, TranslationUnit, UnaryOp,
+    InitElement, InlineLibraryFn, OffsetOfPath, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
@@ -33,6 +33,13 @@ const DEFAULT_VAR_MAP_CAPACITY: usize = 64;
 const DEFAULT_LABEL_MAP_CAPACITY: usize = 16;
 const DEFAULT_LOOP_DEPTH_CAPACITY: usize = 4;
 const DEFAULT_FILE_SCOPE_CAPACITY: usize = 16;
+
+/// Which half of a complex value an rvalue read takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComplexHalf {
+    Real,
+    Imag,
+}
 
 /// One array extent of a variably-modified type.
 ///
@@ -1874,9 +1881,7 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcount { arg }
             | ExprKind::Popcountl { arg }
             | ExprKind::Popcountll { arg }
-            | ExprKind::Fabs { arg }
-            | ExprKind::Fabsf { arg }
-            | ExprKind::IntAbs { arg }
+            | ExprKind::InlineLibraryCall { arg, .. }
             | ExprKind::Signbit { arg }
             | ExprKind::Signbitf { arg }
             | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
@@ -4007,6 +4012,62 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// The value of one half of `operand`: `__real__` and `__imag__` read as
+    /// rvalues, and `creal` and `cimag`.
+    ///
+    /// A real operand is its own real half, and its imaginary half is a zero
+    /// of its type -- gcc accepts both for `__real__` and `__imag__`. (The
+    /// library functions' argument has already been converted to a complex
+    /// type, so they never reach that case.)
+    fn linearize_complex_half(&mut self, operand: &Expr, half: ComplexHalf) -> PseudoId {
+        let op_typ = self.expr_type(operand);
+        if !self.types.is_complex(op_typ) {
+            return match half {
+                ComplexHalf::Real => self.linearize_expr(operand),
+                ComplexHalf::Imag if self.types.is_float(op_typ) => {
+                    self.emit_fconst(crate::float::FloatVal::ZERO, op_typ)
+                }
+                ComplexHalf::Imag => self.emit_const(0, op_typ),
+            };
+        }
+        let base_typ = self.types.complex_base(op_typ);
+        let base_bits = self.types.size_bits(base_typ);
+        let offset = match half {
+            ComplexHalf::Real => 0,
+            ComplexHalf::Imag => (base_bits / 8) as i64,
+        };
+        let addr = self.complex_operand_addr(operand);
+        let value = self.alloc_pseudo();
+        self.emit(Instruction::load(value, addr, offset, base_typ, base_bits));
+        value
+    }
+
+    /// A library function's call evaluated in place: its argument, already
+    /// converted to the parameter type, and the computation the call stands
+    /// for. Never an lvalue, so only ever reached for its value.
+    fn linearize_inline_library_call(
+        &mut self,
+        expr: &Expr,
+        func: InlineLibraryFn,
+        arg: &Expr,
+    ) -> PseudoId {
+        let typ = self.expr_type(expr);
+        match func {
+            InlineLibraryFn::IntAbs => {
+                let arg_val = self.linearize_expr(arg);
+                let size = self.types.size_bits(typ);
+                self.emit_int_abs(arg_val, typ, size)
+            }
+            InlineLibraryFn::Fabs => {
+                let arg_val = self.linearize_expr(arg);
+                self.emit_fabs(arg_val, typ)
+            }
+            InlineLibraryFn::ComplexReal => self.linearize_complex_half(arg, ComplexHalf::Real),
+            InlineLibraryFn::ComplexImag => self.linearize_complex_half(arg, ComplexHalf::Imag),
+            InlineLibraryFn::Conjugate => self.emit_complex_conjugate(arg, typ),
+        }
+    }
+
     /// Linearize a unary expression (prefix operators, address-of, dereference, etc.)
     pub(crate) fn linearize_unary(&mut self, expr: &Expr, op: UnaryOp, operand: &Expr) -> PseudoId {
         // Handle AddrOf specially - we need the lvalue address, not the value
@@ -4014,34 +4075,13 @@ impl<'a> Linearizer<'a> {
             return self.linearize_lvalue(operand);
         }
 
-        // `__real__` / `__imag__`: one half of a complex value, or the operand
-        // itself when it is already real -- gcc accepts both, and `__imag__` of
-        // a real is a zero of that type.
-        if op == UnaryOp::Real || op == UnaryOp::Imag {
-            let op_typ = self.expr_type(operand);
-            if !self.types.is_complex(op_typ) {
-                return if op == UnaryOp::Real {
-                    self.linearize_expr(operand)
-                } else {
-                    // `__imag__` of a real operand is a zero of its type.
-                    if self.types.is_float(op_typ) {
-                        self.emit_fconst(crate::float::FloatVal::ZERO, op_typ)
-                    } else {
-                        self.emit_const(0, op_typ)
-                    }
-                };
-            }
-            let base_typ = self.types.complex_base(op_typ);
-            let base_bits = self.types.size_bits(base_typ);
-            let offset = if op == UnaryOp::Real {
-                0
-            } else {
-                (base_bits / 8) as i64
-            };
-            let addr = self.complex_operand_addr(operand);
-            let half = self.alloc_pseudo();
-            self.emit(Instruction::load(half, addr, offset, base_typ, base_bits));
-            return half;
+        // `__real__` / `__imag__` read as a value; as an lvalue they are
+        // handled by `linearize_lvalue`.
+        if op == UnaryOp::Real {
+            return self.linearize_complex_half(operand, ComplexHalf::Real);
+        }
+        if op == UnaryOp::Imag {
+            return self.linearize_complex_half(operand, ComplexHalf::Imag);
         }
 
         // A complex value travels by address, so the scalar path below would
@@ -5273,41 +5313,6 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            ExprKind::Fabs { arg } => {
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Fabs64)
-                    .with_func(self.library_function_name("fabs"))
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(64)
-                    .with_type(self.types.double_id);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::Fabsf { arg } => {
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Fabs32)
-                    .with_func(self.library_function_name("fabsf"))
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(32)
-                    .with_type(self.types.float_id);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::IntAbs { arg } => {
-                let arg_val = self.linearize_expr(arg);
-                let typ = self.expr_type(expr);
-                let size = self.types.size_bits(typ);
-                self.emit_int_abs(arg_val, typ, size)
-            }
-
             ExprKind::Signbit { arg } => {
                 let arg_val = self.linearize_expr(arg);
                 let result = self.alloc_pseudo();
@@ -6404,9 +6409,6 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Memset { .. }
             | ExprKind::Memcpy { .. }
             | ExprKind::Memmove { .. }
-            | ExprKind::Fabs { .. }
-            | ExprKind::Fabsf { .. }
-            | ExprKind::IntAbs { .. }
             | ExprKind::Signbit { .. }
             | ExprKind::Signbitf { .. }
             | ExprKind::FpTest { .. }
@@ -6417,6 +6419,10 @@ impl<'a> Linearizer<'a> {
             | ExprKind::ReturnAddress { .. }
             | ExprKind::Setjmp { .. }
             | ExprKind::Longjmp { .. } => self.linearize_builtin(expr),
+
+            ExprKind::InlineLibraryCall { func, arg } => {
+                self.linearize_inline_library_call(expr, *func, arg)
+            }
 
             ExprKind::OffsetOf { type_id, path } => self.linearize_offsetof(type_id, path),
 

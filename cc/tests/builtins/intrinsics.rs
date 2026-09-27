@@ -11,7 +11,9 @@
 // Consolidates: types_compatible, constant_p, unreachable, expect tests
 //
 
-use crate::common::{asm_for_at, asm_symbol, compile_and_run, compile_and_run_aarch64};
+use crate::common::{
+    asm_for_at, asm_symbol, compile_and_run, compile_and_run_aarch64, compile_expect_no_diagnostic,
+};
 
 // ============================================================================
 // Mega-test: Intrinsic builtins
@@ -1003,4 +1005,18 @@ long floor(long v) { return 200 + v; }
         "int abs(int);\nlong labs(long);\nlong f(int a, long b) { return abs(a) + labs(b); }\n";
     let asm = asm_for_at("compatible_bare_builtin", src, &[]);
     assert!(!calls(&asm, "abs") && !calls(&asm, "labs"), "{asm}");
+}
+
+/// A `__builtin_` library alias the translation unit never declared is
+/// declared by c17 from what it knows of the entry point, with parameter
+/// types that are placeholders. A later call finds that declaration in
+/// scope, and must not be checked against it: `strlen` does not take an
+/// `unsigned long`.
+#[test]
+fn builtins_undeclared_library_alias_is_not_checked_against_placeholders() {
+    let code = "int f(void) {\n\
+                    return (int)__builtin_strlen(\"a\") + (int)__builtin_strlen(\"bc\")\n\
+                        + __builtin_strcmp(\"a\", \"b\") + __builtin_strcmp(\"c\", \"d\");\n\
+                }\n";
+    compile_expect_no_diagnostic("undeclared_library_alias", code, "argument");
 }

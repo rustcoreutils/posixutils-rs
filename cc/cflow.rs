@@ -303,6 +303,7 @@ fn extract_calls_from_expr(
         | ExprKind::Popcount { arg }
         | ExprKind::Popcountl { arg }
         | ExprKind::Popcountll { arg }
+        | ExprKind::InlineLibraryCall { arg, .. }
         | ExprKind::Alloca { size: arg } => {
             extract_calls_from_expr(arg, strings, symbols, calls);
         }
@@ -490,7 +491,7 @@ fn visit_subexprs(
             f(array);
             f(index);
         }
-        ExprKind::Cast { expr, .. } => f(expr),
+        ExprKind::Cast { expr, .. } | ExprKind::InlineLibraryCall { arg: expr, .. } => f(expr),
         ExprKind::SizeofExpr(e) | ExprKind::AlignofExpr(e) => f(e),
         ExprKind::Comma(exprs) => {
             for e in exprs {

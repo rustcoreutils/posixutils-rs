@@ -12,7 +12,9 @@ use super::linearize::*;
 use super::{Initializer, SymbolAlias};
 use crate::diag::error;
 use crate::float::FloatVal;
-use crate::parse::ast::{BinaryOp, Declaration, Designator, Expr, ExprKind, InitElement, UnaryOp};
+use crate::parse::ast::{
+    BinaryOp, Declaration, Designator, Expr, ExprKind, InitElement, InlineLibraryFn, UnaryOp,
+};
 use crate::strings::StringId;
 use crate::token::lexer::Position;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
@@ -687,12 +689,16 @@ impl<'a> super::linearize::Linearizer<'a> {
                 Some((re.negated(), im.negated()))
             }
 
-            // GNU `~z` on a complex operand is the conjugate: only the
-            // imaginary half is negated. On an integer operand it is the
-            // bitwise complement, which is not a complex fold at all.
+            // GNU `~z` on a complex operand is the conjugate, as is `conj(z)`:
+            // only the imaginary half is negated. On an integer operand `~` is
+            // the bitwise complement, which is not a complex fold at all.
             ExprKind::Unary {
                 op: UnaryOp::BitNot,
                 operand,
+            }
+            | ExprKind::InlineLibraryCall {
+                func: InlineLibraryFn::Conjugate,
+                arg: operand,
             } if operand.typ.is_some_and(|t| self.types.is_complex(t)) => {
                 let (re, im) = self.eval_const_complex(operand)?;
                 Some((re, im.negated()))

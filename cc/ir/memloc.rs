@@ -126,13 +126,30 @@ impl AddrMap {
         func.blocks.get(b)?.insns.get(i)
     }
 
-    /// The width and type the instruction defining `id` produces.
+    /// The width and type of the value `id` holds: what its defining
+    /// instruction produces, or for an incoming scalar argument, the type
+    /// its parameter is passed as.
     ///
-    /// `None` when nothing in this function defines it -- an argument, a
-    /// `Sym`, a constant, an inline-asm output -- which is the answer "this
-    /// pseudo's width is not a fact of this function".
-    pub(crate) fn def_width(&self, func: &Function, id: PseudoId) -> Option<(u32, Option<TypeId>)> {
-        self.def(func, id).map(|d| (d.size, d.typ))
+    /// A parameter is a local like any other, whose slot the entry block
+    /// fills from an `Arg`. Asking only the defining instruction made every
+    /// parameter's value width-less -- no instruction defines an `Arg` -- so
+    /// nothing stored into a parameter's slot could be forwarded, while the
+    /// same shape on a block-scope local was.
+    ///
+    /// `None` when neither answers -- a `Sym`, a constant, an inline-asm
+    /// output, an aggregate argument -- which is the answer "this pseudo's
+    /// width is not a fact of this function".
+    pub(crate) fn value_width(
+        &self,
+        func: &Function,
+        types: &TypeTable,
+        id: PseudoId,
+    ) -> Option<(u32, Option<TypeId>)> {
+        if let Some(d) = self.def(func, id) {
+            return Some((d.size, d.typ));
+        }
+        func.arg_value_type(id, types)
+            .map(|t| (types.size_bits(t), Some(t)))
     }
 
     /// The constant an address-arithmetic operand carries, if any.

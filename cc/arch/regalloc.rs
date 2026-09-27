@@ -1556,11 +1556,7 @@ impl AbiLowering {
         // Detect the hidden return pointer for large struct returns.
         // The linearizer emits it as `Arg(0)` with the literal name
         // `__sret`, shifting all normal-parameter `Arg(n)` indices by 1.
-        let sret_pseudo = func
-            .pseudos
-            .iter()
-            .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"))
-            .map(|p| p.id);
+        let sret_pseudo = func.sret_arg();
         let arg_idx_offset: u32 = if sret_pseudo.is_some() { 1 } else { 0 };
 
         // Index pseudos by Arg(n): O(P) once, O(1) per argument.
@@ -1593,13 +1589,8 @@ impl AbiLowering {
 
     /// The declared type of the parameter an `Arg(arg)` pseudo carries, or
     /// `None` for the hidden sret pointer, which is no declared parameter.
-    ///
-    /// `func.params[arg]` is the answer only without an sret pointer; with
-    /// one, every parameter is one `Arg` further along. Indexing the list
-    /// directly took the *next* parameter's type for each of them.
     pub fn param_type(&self, func: &Function, arg: u32) -> Option<TypeId> {
-        let i = arg.checked_sub(self.arg_idx_offset)?;
-        func.params.get(i as usize).map(|(_, typ)| *typ)
+        func.param_type_of_arg(arg)
     }
 }
 

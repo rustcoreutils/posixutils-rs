@@ -219,7 +219,13 @@ enum Candidate {
 ///
 /// `None` refuses the forward; otherwise the answer says how to read the
 /// pseudo.
-fn narrowing(func: &Function, am: &AddrMap, v: PseudoId, size: u32) -> Option<Available> {
+fn narrowing(
+    func: &Function,
+    types: &TypeTable,
+    am: &AddrMap,
+    v: PseudoId,
+    size: u32,
+) -> Option<Available> {
     // A constant is width-polymorphic: it materializes at whatever width its
     // reader asks for, so it needs no narrowing -- but only where it means
     // one thing at that width, which is exactly what `unambiguous_at` asks.
@@ -229,7 +235,7 @@ fn narrowing(func: &Function, am: &AddrMap, v: PseudoId, size: u32) -> Option<Av
             narrow: None,
         });
     }
-    let (from, typ) = am.def_width(func, v)?;
+    let (from, typ) = am.value_width(func, types, v)?;
     Some(Available {
         value: v,
         narrow: (from > size).then_some(Narrowing { from, typ }),
@@ -253,7 +259,7 @@ fn candidate(
                     // A store this pass cannot forward is still a store: it
                     // has to stop the search, or the walk would run past it
                     // to an older value.
-                    return Some(match narrowing(func, am, v, loc.size) {
+                    return Some(match narrowing(func, types, am, v, loc.size) {
                         Some(a) => Candidate::Value(a),
                         None => Candidate::Clobber,
                     });
@@ -885,6 +891,79 @@ mod tests {
         assert_eq!(fwd.src, vec![PseudoId(30)]);
         assert_eq!(fwd.src_size, 32);
         assert_eq!(fwd.size, 8);
+    }
+
+    /// A parameter's slot is filled from an `Arg`, which no instruction
+    /// defines. Its width is the type its parameter is passed as, so the
+    /// store supplies the load exactly as a block-scope local's does.
+    #[test]
+    fn loadfwd_forwards_an_incoming_argument() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        b.f.add_param("x", i32t);
+        b.f.add_pseudo(Pseudo::arg(PseudoId(30), 0));
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::store(PseudoId(30), PseudoId(0), 0, i32t, 32),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+            ],
+            vec![],
+        );
+        assert!(b.run());
+        assert_eq!(b.op(0, 3), Opcode::Copy);
+        assert_eq!(b.f.blocks[0].insns[3].src, vec![PseudoId(30)]);
+    }
+
+    /// An argument passed wider than the bytes stored -- an identifier-list
+    /// `char` arrives as an `int` -- reaches a narrower load through a
+    /// truncation from the width it was passed at.
+    #[test]
+    fn loadfwd_narrows_an_incoming_argument_passed_wider() {
+        let mut b = Build::new();
+        let (i32t, i8t) = (b.types.int_id, b.types.char_id);
+        b.f.add_param("c", i32t);
+        b.f.add_pseudo(Pseudo::arg(PseudoId(30), 0));
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                Instruction::store(PseudoId(30), PseudoId(10), 0, i8t, 8),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i8t, 8),
+            ],
+            vec![],
+        );
+        assert!(b.run());
+        let fwd = &b.f.blocks[0].insns[3];
+        assert_eq!(fwd.op, Opcode::Trunc);
+        assert_eq!(fwd.src_size, 32);
+    }
+
+    /// A complex or aggregate argument may be an address or the caller's
+    /// storage rather than a value of its type, so its width is no fact and
+    /// the store it feeds stops the search instead of supplying the load.
+    #[test]
+    fn loadfwd_refuses_a_complex_argument() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        let z = b.types.complex_double_id;
+        b.f.add_param("z", z);
+        b.f.add_pseudo(Pseudo::arg(PseudoId(30), 0));
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(30), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+            ],
+            vec![],
+        );
+        assert!(!b.run(), "neither the argument nor the older store");
     }
 
     /// A value already at the access width needs no truncation.

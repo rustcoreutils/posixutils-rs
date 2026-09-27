@@ -2205,6 +2205,44 @@ impl Function {
         by_arg
     }
 
+    /// The hidden struct-return pointer, if this function has one.
+    ///
+    /// The linearizer emits it as `Arg(0)` under the literal name `__sret`,
+    /// which shifts every declared parameter one `Arg` along.
+    pub fn sret_arg(&self) -> Option<PseudoId> {
+        self.pseudos
+            .iter()
+            .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"))
+            .map(|p| p.id)
+    }
+
+    /// The type the caller passes for the parameter an `Arg(arg)` pseudo
+    /// carries, or `None` for the hidden sret pointer, which is no declared
+    /// parameter.
+    ///
+    /// `params[arg]` is the answer only without an sret pointer; with one,
+    /// every parameter is one `Arg` further along. Indexing the list directly
+    /// took the *next* parameter's type for each of them.
+    pub fn param_type_of_arg(&self, arg: u32) -> Option<TypeId> {
+        let i = arg.checked_sub(u32::from(self.sret_arg().is_some()))?;
+        self.params.get(i as usize).map(|(_, typ)| *typ)
+    }
+
+    /// The type of the value an `Arg` pseudo holds, when it holds one.
+    ///
+    /// A scalar parameter arrives as its value, at the width of the type it
+    /// is passed as, and that is what the entry block stores into its slot.
+    /// An aggregate, a complex number or a `va_list` may arrive as an address
+    /// or as the storage itself, so its `Arg` is no value of its declared
+    /// type and this answers `None` for it.
+    pub fn arg_value_type(&self, id: PseudoId, types: &TypeTable) -> Option<TypeId> {
+        let Some(PseudoKind::Arg(n)) = self.get_pseudo(id).map(|p| &p.kind) else {
+            return None;
+        };
+        self.param_type_of_arg(*n)
+            .filter(|&t| types.is_scalar(t) && !types.is_complex(t))
+    }
+
     /// Allocate a new pseudo ID
     /// Returns a unique ID and increments the counter
     pub fn alloc_pseudo(&mut self) -> PseudoId {
@@ -3395,6 +3433,36 @@ mod tests {
         func.add_pseudo(reg);
         assert_eq!(func.sym_name_of(reg_id), None);
         assert_eq!(func.sym_name_of(PseudoId(9999)), None);
+    }
+
+    /// An `Arg` holds a value of its parameter's type only for a scalar, and
+    /// the hidden sret pointer shifts which parameter each `Arg` is.
+    #[test]
+    fn test_arg_value_type() {
+        let types = TypeTable::new(&Target::host());
+        for sret in [false, true] {
+            let mut f = Function::new("f", types.void_id);
+            let off = u32::from(sret);
+            if sret {
+                f.add_pseudo(Pseudo::arg(PseudoId(9), 0).with_name("__sret"));
+            }
+            let params = [
+                types.char_id,
+                types.complex_double_id,
+                types.pointer_to(types.int_id),
+            ];
+            for (i, t) in params.iter().enumerate() {
+                f.add_param(format!("p{i}"), *t);
+                f.add_pseudo(Pseudo::arg(PseudoId(i as u32), i as u32 + off));
+            }
+            assert_eq!(f.sret_arg().is_some(), sret);
+            assert_eq!(f.arg_value_type(PseudoId(0), &types), Some(types.char_id));
+            assert_eq!(f.arg_value_type(PseudoId(1), &types), None, "complex");
+            assert_eq!(f.arg_value_type(PseudoId(2), &types), Some(params[2]));
+            if sret {
+                assert_eq!(f.arg_value_type(PseudoId(9), &types), None, "sret");
+            }
+        }
     }
 
     #[test]

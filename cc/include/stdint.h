@@ -122,21 +122,18 @@ typedef __UINTMAX_TYPE__ uintmax_t;
 #define WINT_MAX       __WINT_MAX__
 #define WINT_MIN       __WINT_MIN__
 
-/* 7.20.4 Macros for integer constants.
-   The suffix for each width is a predefine, so the paste is target-correct:
-   int64_t is `long` on LP64 and `long long` elsewhere. */
-#define __c17_glue(a, b) a##b
-#define __c17_paste(a, b) __c17_glue(a, b)
-
-#define INT8_C(c)   __c17_paste(c, __INT8_C_SUFFIX__)
-#define INT16_C(c)  __c17_paste(c, __INT16_C_SUFFIX__)
-#define INT32_C(c)  __c17_paste(c, __INT32_C_SUFFIX__)
-#define INT64_C(c)  __c17_paste(c, __INT64_C_SUFFIX__)
-#define UINT8_C(c)  __c17_paste(c, __UINT8_C_SUFFIX__)
-#define UINT16_C(c) __c17_paste(c, __UINT16_C_SUFFIX__)
-#define UINT32_C(c) __c17_paste(c, __UINT32_C_SUFFIX__)
-#define UINT64_C(c) __c17_paste(c, __UINT64_C_SUFFIX__)
-#define INTMAX_C(c)  __c17_paste(c, __INTMAX_C_SUFFIX__)
-#define UINTMAX_C(c) __c17_paste(c, __UINTMAX_C_SUFFIX__)
+/* 7.20.4 Macros for integer constants. Each __INTN_C predefine pastes the
+   suffix of int_leastN_t's promoted type, so the result is target-correct:
+   int64_t is `long` on Linux and `long long` on Darwin. */
+#define INT8_C(c)    __INT8_C(c)
+#define INT16_C(c)   __INT16_C(c)
+#define INT32_C(c)   __INT32_C(c)
+#define INT64_C(c)   __INT64_C(c)
+#define UINT8_C(c)   __UINT8_C(c)
+#define UINT16_C(c)  __UINT16_C(c)
+#define UINT32_C(c)  __UINT32_C(c)
+#define UINT64_C(c)  __UINT64_C(c)
+#define INTMAX_C(c)  __INTMAX_C(c)
+#define UINTMAX_C(c) __UINTMAX_C(c)
 
 #endif /* _STDINT_H */

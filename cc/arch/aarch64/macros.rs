@@ -18,11 +18,7 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__ARM_ARCH", Some("8")),
         ("__ARM_64BIT_STATE", Some("1")),
         ("__ARM_ARCH_ISA_A64", Some("1")),
-        // Byte order (AArch64 is little-endian by default)
-        ("__BYTE_ORDER__", Some("__ORDER_LITTLE_ENDIAN__")),
-        ("__ORDER_LITTLE_ENDIAN__", Some("1234")),
-        ("__ORDER_BIG_ENDIAN__", Some("4321")),
-        ("__LITTLE_ENDIAN__", Some("1")),
+        // Byte order is in `arch::get_misc_macros`, for every target.
         ("__AARCH64EL__", Some("1")),
         // Register size
         ("__REGISTER_PREFIX__", Some("")),

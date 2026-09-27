@@ -184,6 +184,17 @@ pub fn get_type_macros(target: &Target) -> Vec<(String, &'static str)> {
         .collect()
 }
 
+/// gcc's `__INTN_C(c)` macros, as (name, suffix): each gives an integer
+/// constant the promoted type of `int_leastN_t` (C17 7.20.4.1), and `<stdint.h>`
+/// defines `INTN_C` as it.
+pub fn get_constant_fn_macros(target: &Target) -> Vec<(String, &'static str)> {
+    integer_typedefs(target)
+        .into_iter()
+        .filter(|t| t.describe.suffix)
+        .map(|t| (format!("__{}_C", t.name), t.ty.constant_suffix()))
+        .collect()
+}
+
 /// `t`'s largest value as a constant of type `t` (or of its promoted type,
 /// for one narrower than `int`): `0x7fffffffffffffffL`.
 fn max_literal(target: &Target, t: IntType) -> String {
@@ -329,14 +340,22 @@ pub fn get_misc_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
         // Alignment
         ("__BIGGEST_ALIGNMENT__", "16"),
         ("__BOOL_WIDTH__", "8"),
-        // Byte order (all our supported architectures are little-endian)
+        // Byte order (all our supported architectures are little-endian),
+        // and the order of the words of a multi-word floating type, which
+        // follows it on both.
         ("__ORDER_LITTLE_ENDIAN__", "1234"),
         ("__ORDER_BIG_ENDIAN__", "4321"),
         ("__ORDER_PDP_ENDIAN__", "3412"),
         ("__BYTE_ORDER__", "__ORDER_LITTLE_ENDIAN__"),
+        ("__FLOAT_WORD_ORDER__", "__ORDER_LITTLE_ENDIAN__"),
         ("__LITTLE_ENDIAN__", "1"),
         // Floating point base
         ("__FLT_RADIX__", "2"),
+        // C17 5.2.4.2.2p9: every floating operation is evaluated in its own
+        // type -- SSE on x86-64, the FP registers on aarch64, never x87 --
+        // so 0. <float.h>'s FLT_EVAL_METHOD and glibc's float_t/double_t
+        // (<bits/flt-eval-method.h>) both read this.
+        ("__FLT_EVAL_METHOD__", "0"),
         ("__FINITE_MATH_ONLY__", "0"),
     ]
 }
@@ -573,6 +592,41 @@ mod tests {
             }
         }
         out
+    }
+
+    /// gcc's `__INTN_C(c)` family exists for exactly the typedefs with a
+    /// `_C_SUFFIX__`, and pastes that suffix.
+    #[test]
+    fn constant_fn_macros_paste_the_typedef_suffix() {
+        for target in all_targets() {
+            let fns = get_constant_fn_macros(&target);
+            let ints = get_integer_macros(&target);
+            let names: Vec<&str> = fns.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(
+                names,
+                [
+                    "__INT8_C",
+                    "__UINT8_C",
+                    "__INT16_C",
+                    "__UINT16_C",
+                    "__INT32_C",
+                    "__UINT32_C",
+                    "__INT64_C",
+                    "__UINT64_C",
+                    "__INTMAX_C",
+                    "__UINTMAX_C"
+                ]
+            );
+            for (name, suffix) in &fns {
+                assert_eq!(
+                    macro_value(&ints, &format!("{name}_SUFFIX__")),
+                    *suffix,
+                    "{name} on {}-{}",
+                    target.arch,
+                    target.os
+                );
+            }
+        }
     }
 
     /// Every type `<stdatomic.h>` names in an `ATOMIC_*_LOCK_FREE` has its

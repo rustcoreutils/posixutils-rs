@@ -17,12 +17,7 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__x86_64", Some("1")),
         ("__amd64__", Some("1")),
         ("__amd64", Some("1")),
-        // Byte order
-        ("__BYTE_ORDER__", Some("__ORDER_LITTLE_ENDIAN__")),
-        ("__ORDER_LITTLE_ENDIAN__", Some("1234")),
-        ("__ORDER_BIG_ENDIAN__", Some("4321")),
-        ("__ORDER_PDP_ENDIAN__", Some("3412")),
-        ("__LITTLE_ENDIAN__", Some("1")),
+        // Byte order is in `arch::get_misc_macros`, for every target.
         // Register size
         ("__REGISTER_PREFIX__", Some("")),
         // Long double is 80-bit extended precision (padded to 128 bits)

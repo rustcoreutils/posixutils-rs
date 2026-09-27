@@ -82,7 +82,7 @@
 // 1 = evaluate float/double to double range/precision
 // 2 = evaluate all to long double range/precision
 // -1 = indeterminate
-#define FLT_EVAL_METHOD 0
+#define FLT_EVAL_METHOD __FLT_EVAL_METHOD__
 
 // Number of decimal digits needed to round-trip the widest type
 #define DECIMAL_DIG __LDBL_DECIMAL_DIG__

@@ -387,3 +387,78 @@ fn atomic_lock_free_macros_are_defined_aarch64() {
         assert_eq!(rc, 0);
     }
 }
+
+/// Representation facts gcc predefines and c17 did not: the evaluation
+/// method <float.h> and glibc's `float_t` read, the floating word order, and
+/// the `__INTN_C(c)` constant macros.
+const REPRESENTATION_MACROS: &str = r#"
+#include <float.h>
+#include <stdint.h>
+
+#ifndef __FLT_EVAL_METHOD__
+#error no __FLT_EVAL_METHOD__
+#endif
+#if __FLT_EVAL_METHOD__ != 0 || FLT_EVAL_METHOD != __FLT_EVAL_METHOD__
+#error floating operations are evaluated in their own type
+#endif
+#if !defined(__FLOAT_WORD_ORDER__) || __FLOAT_WORD_ORDER__ != __BYTE_ORDER__
+#error the float word order follows the byte order on these targets
+#endif
+
+int main(void) {
+    if (!_Generic(__INT8_C(1), int: 1, default: 0)) return 1;
+    if (!_Generic(__UINT16_C(1), int: 1, default: 0)) return 2;
+    if (!_Generic(__UINT32_C(1), unsigned int: 1, default: 0)) return 3;
+    if (!_Generic(__INT64_C(1), int64_t: 1, default: 0)) return 4;
+    if (!_Generic(__UINT64_C(1), uint64_t: 1, default: 0)) return 5;
+    if (!_Generic(__INTMAX_C(1), intmax_t: 1, default: 0)) return 6;
+    if (!_Generic(__UINTMAX_C(1), uintmax_t: 1, default: 0)) return 7;
+    if (__INT64_C(0x7fffffffffffffff) != INT64_MAX) return 8;
+    if (!_Generic(INT64_C(1), int64_t: 1, default: 0)) return 9;
+    if (!_Generic(UINTMAX_C(1), uintmax_t: 1, default: 0)) return 10;
+
+    /* The low word of a double comes first in memory. */
+    double d = 1.0;
+    unsigned int w[2];
+    __builtin_memcpy(w, &d, sizeof d);
+    if (w[0] != 0 || w[1] != 0x3ff00000) return 11;
+    return 0;
+}
+"#;
+
+#[test]
+fn representation_macros_are_defined() {
+    assert_eq!(
+        compile_and_run("representation_macros", REPRESENTATION_MACROS, &[]),
+        0
+    );
+}
+
+#[test]
+fn representation_macros_are_defined_aarch64() {
+    if let Some(rc) =
+        compile_and_run_aarch64("representation_macros_a64", REPRESENTATION_MACROS, "-O0")
+    {
+        assert_eq!(rc, 0);
+    }
+}
+
+/// The `-dM` spelling matches gcc's, parameter name and `##` included.
+#[test]
+fn constant_fn_macros_match_gcc() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        assert_defines(
+            triple,
+            &[
+                "#define __INT8_C(c) c",
+                "#define __UINT32_C(c) c ## U",
+                "#define __INT64_C(c) c ## L",
+                "#define __UINT64_C(c) c ## UL",
+                "#define __INTMAX_C(c) c ## L",
+                "#define __FLOAT_WORD_ORDER__ __ORDER_LITTLE_ENDIAN__",
+                "#define __FLT_EVAL_METHOD__ 0",
+            ],
+        );
+    }
+    assert_defines("aarch64-apple-darwin", &["#define __INT64_C(c) c ## LL"]);
+}

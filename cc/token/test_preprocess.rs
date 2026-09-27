@@ -1550,6 +1550,20 @@ wmacro_signed
     }
 }
 
+/// The predefined `__INTN_C(c)` macros paste their suffix onto the argument,
+/// as gcc's do, and the empty-suffix ones hand it back untouched.
+#[test]
+fn test_predefined_constant_fn_macros_paste() {
+    use crate::target::{Arch, Os};
+    let code = "__INT64_C(5) __UINT32_C(7) __INT8_C(9) __UINTMAX_C(0x10)";
+    for (os, int64) in [(Os::Linux, "5L"), (Os::MacOS, "5LL")] {
+        let target = Target::new(Arch::Aarch64, os);
+        let (tokens, idents) = preprocess_str_for(code, &target);
+        let strs = get_token_strings(&tokens, &idents);
+        assert_eq!(strs, [int64, "7U", "9", "0x10UL"], "{os}");
+    }
+}
+
 /// gcc packs a multi-character constant big-endian into `int` and lets it
 /// wrap, so a five-byte constant keeps only its last four bytes.
 #[test]

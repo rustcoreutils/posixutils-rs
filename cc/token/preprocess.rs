@@ -310,6 +310,40 @@ impl Macro {
         }
     }
 
+    /// A predefined function-like macro `name(c)` that pastes `suffix` onto
+    /// its argument -- `c ## L` -- or is `c` itself for an empty suffix: gcc's
+    /// `__INT64_C(c)` family.
+    pub fn predefined_constant_fn(name: &str, suffix: &str) -> Self {
+        let token = |typ, value, whitespace| MacroToken {
+            typ,
+            value,
+            whitespace,
+            spelling: Spelling::Canonical,
+        };
+        let mut body = vec![token(TokenType::Ident, MacroTokenValue::Param(0), false)];
+        if !suffix.is_empty() {
+            body.push(token(TokenType::Special, MacroTokenValue::Paste, true));
+            body.push(token(
+                TokenType::Ident,
+                MacroTokenValue::Ident(suffix.to_string()),
+                true,
+            ));
+        }
+        Self {
+            name: name.to_string(),
+            body,
+            is_function: true,
+            params: vec![MacroParam {
+                name: "c".to_string(),
+                index: 0,
+            }],
+            is_variadic: false,
+            variadic_name: None,
+            builtin: None,
+            predefined: true,
+        }
+    }
+
     /// Create a keyword alias macro (value is treated as an identifier/keyword)
     pub fn keyword_alias(name: &str, value: &str) -> Self {
         let body = if value.is_empty() {
@@ -1022,6 +1056,11 @@ impl<'a> Preprocessor<'a> {
         // to type names, so they need to be tokenized properly.
         for (name, value) in arch::get_type_macros(self.target) {
             self.define_macro(Macro::predefined_type(&name, value));
+        }
+
+        // gcc's integer constant macros, `__INT64_C(c)` and the rest
+        for (name, suffix) in arch::get_constant_fn_macros(self.target) {
+            self.define_macro(Macro::predefined_constant_fn(&name, suffix));
         }
 
         // Integer limits, widths, sizes, constant suffixes and formats, and

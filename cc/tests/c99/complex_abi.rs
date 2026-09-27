@@ -19,7 +19,10 @@
 // construction, argument passing, return, and round trips, for each base type.
 //
 
-use crate::common::{compile_and_run, compile_and_run_optimized};
+use crate::common::{
+    aarch64_cross_available, compile_and_run, compile_and_run_optimized, create_c_file,
+    cross_link_and_run, run_c17,
+};
 
 /// #C1: `float _Complex` is one packed eightbyte, so it occupies a single
 /// XMM register. Passing it in two registers left the imaginary part in a
@@ -606,5 +609,364 @@ fn c99_real_argument_to_a_complex_parameter() {
     assert_eq!(
         compile_and_run("c99_real_arg_complex_param_o2", src, &["-O2".to_string()]),
         0
+    );
+}
+
+// ============================================================================
+// va_arg of a complex type
+// ============================================================================
+
+// A variadic callee reading every complex type, interleaved with an int and a
+// double, over three rounds so the later arguments are on the stack. The
+// caller is a separate translation unit, so each side can be built by c17 or
+// by gcc: agreeing with gcc about the variadic ABI, not only with itself, is
+// the point. Both halves pass under gcc on x86-64 and aarch64.
+const VA_COMPLEX_CALLEE: &str = r#"
+typedef __builtin_va_list va_list;
+typedef float _Complex fc; typedef double _Complex dc; typedef long double _Complex lc;
+typedef int _Complex ic; typedef _Float16 _Complex hc;
+/* Reads, `rounds` times over: int, fc, double, dc, lc, ic, hc. Round r's
+   values are offset by r, so a slot read from the wrong place is caught. */
+int check(int rounds, ...) {
+    va_list ap;
+    __builtin_va_start(ap, rounds);
+    for (int r = 0; r < rounds; r++) {
+        if (__builtin_va_arg(ap, int) != 10 + r) return 1 + 10 * r;
+        fc f = __builtin_va_arg(ap, fc);
+        if (__real__ f != 1.5f + r || __imag__ f != -2.5f) return 2 + 10 * r;
+        if (__builtin_va_arg(ap, double) != 3.25 + r) return 3 + 10 * r;
+        dc d = __builtin_va_arg(ap, dc);
+        if (__real__ d != 4.5 + r || __imag__ d != -5.5) return 4 + 10 * r;
+        lc l = __builtin_va_arg(ap, lc);
+        if (__real__ l != 6.5L + r || __imag__ l != -7.5L) return 5 + 10 * r;
+        ic i = __builtin_va_arg(ap, ic);
+        if (__real__ i != 8 + r || __imag__ i != -9) return 6 + 10 * r;
+        hc h = __builtin_va_arg(ap, hc);
+        if (__real__ h != (_Float16)(0.5f + r) || __imag__ h != (_Float16)-1.5f) return 7 + 10 * r;
+    }
+    __builtin_va_end(ap);
+    return 0;
+}
+"#;
+
+const VA_COMPLEX_CALLER: &str = r#"
+typedef float _Complex fc; typedef double _Complex dc; typedef long double _Complex lc;
+typedef int _Complex ic; typedef _Float16 _Complex hc;
+int check(int rounds, ...);
+#define ROUND(r) 10 + r, __builtin_complex(1.5f + r, -2.5f), 3.25 + r, \
+    __builtin_complex(4.5 + r, -5.5), __builtin_complex(6.5L + r, -7.5L), \
+    (ic)(8 + r) - 9 * (ic)1i, __builtin_complex((_Float16)(0.5f + r), (_Float16)-1.5f)
+int main(void) {
+    if (check(1, ROUND(0))) return 1;
+    return check(3, ROUND(0), ROUND(1), ROUND(2));
+}
+"#;
+
+/// Compile `src` with c17 to a host object in `dir`, returning its path.
+fn c17_object(name: &str, src: &str, opt: &str, dir: &std::path::Path) -> String {
+    let c = create_c_file(name, src);
+    let o = dir.join(format!("{name}.o"));
+    let run = run_c17(&[
+        opt,
+        "-w",
+        "-c",
+        "-o",
+        o.to_str().unwrap(),
+        c.path().to_str().unwrap(),
+    ]);
+    assert!(run.success, "c17 failed on {name}:\n{}", run.stderr);
+    o.to_string_lossy().into_owned()
+}
+
+/// Link `objs` with the C sources `c_srcs` using the host gcc, and run it.
+fn gcc_link_and_run(name: &str, objs: &[&str], c_srcs: &[&str], dir: &std::path::Path) -> i32 {
+    let exe = dir.join(name);
+    let files: Vec<_> = c_srcs.iter().map(|s| create_c_file(name, s)).collect();
+    let mut cmd = std::process::Command::new("gcc");
+    cmd.arg("-w").arg("-o").arg(&exe);
+    for f in &files {
+        cmd.arg(f.path());
+    }
+    cmd.args(objs);
+    let out = cmd.output().expect("run gcc");
+    assert!(
+        out.status.success(),
+        "gcc link of {name} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::process::Command::new(&exe)
+        .status()
+        .expect("run test binary")
+        .code()
+        .unwrap_or(-1)
+}
+
+#[test]
+fn c99_complex_va_arg_c17_both_sides() {
+    let program = format!("{VA_COMPLEX_CALLEE}\n{VA_COMPLEX_CALLER}");
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("va_complex{opt}"), &program, &[opt.to_string()]),
+            0,
+            "host {opt}"
+        );
+    }
+}
+
+/// The host half of the interop check, gcc and c17 on either side. Linux
+/// x86-64 only, where the host gcc is gcc and the ABI is System V.
+#[test]
+fn c99_complex_va_arg_interoperates_with_gcc_host() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+    let dir = plib::tmp::Builder::new()
+        .prefix("va_complex_")
+        .tempdir()
+        .unwrap();
+    for opt in ["-O0", "-O2"] {
+        let callee = c17_object("va_callee", VA_COMPLEX_CALLEE, opt, dir.path());
+        assert_eq!(
+            gcc_link_and_run("gcc_caller", &[&callee], &[VA_COMPLEX_CALLER], dir.path()),
+            0,
+            "gcc caller, c17 callee, {opt}"
+        );
+        let caller = c17_object("va_caller", VA_COMPLEX_CALLER, opt, dir.path());
+        assert_eq!(
+            gcc_link_and_run("gcc_callee", &[&caller], &[VA_COMPLEX_CALLEE], dir.path()),
+            0,
+            "c17 caller, gcc callee, {opt}"
+        );
+    }
+}
+
+/// The aarch64 half: every pairing of c17 and aarch64 gcc, under qemu.
+#[test]
+fn c99_complex_va_arg_interoperates_with_gcc_aarch64() {
+    if !aarch64_cross_available() {
+        eprintln!("SKIP: no aarch64 cross toolchain");
+        return;
+    }
+    let dir = plib::tmp::Builder::new()
+        .prefix("va_complex_a64_")
+        .tempdir()
+        .unwrap();
+    let callee_c = create_c_file("va_callee_a64", VA_COMPLEX_CALLEE);
+    let caller_c = create_c_file("va_caller_a64", VA_COMPLEX_CALLER);
+    let callee_src = callee_c.path().to_string_lossy().into_owned();
+    let caller_src = caller_c.path().to_string_lossy().into_owned();
+    for opt in ["-O0", "-O2"] {
+        let asm = |src: &str, n: &str| {
+            let s = dir.path().join(format!("{n}{opt}.s"));
+            let run = run_c17(&[
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                opt,
+                "-w",
+                "-S",
+                "-o",
+                s.to_str().unwrap(),
+                src,
+            ]);
+            assert!(run.success, "c17 failed on {n}:\n{}", run.stderr);
+            s.to_string_lossy().into_owned()
+        };
+        let callee_s = asm(&callee_src, "callee");
+        let caller_s = asm(&caller_src, "caller");
+        assert_eq!(
+            cross_link_and_run("va_cc", &[&caller_s, &callee_s]),
+            0,
+            "c17 both, {opt}"
+        );
+        assert_eq!(
+            cross_link_and_run("va_gc", &[&caller_src, &callee_s]),
+            0,
+            "gcc caller, c17 callee, {opt}"
+        );
+        assert_eq!(
+            cross_link_and_run("va_cg", &[&caller_s, &callee_src]),
+            0,
+            "c17 caller, gcc callee, {opt}"
+        );
+    }
+}
+
+// ============================================================================
+// va_arg of the composites a complex value is classified alongside
+// ============================================================================
+
+// Complex integers of every width, HFAs of each float width (two, three and
+// four members), small integer composites, mixed composites and one too large
+// for registers, over three rounds so each is read from the register save area
+// and from the stack. The aarch64 caller put a 9-16 byte integer composite
+// whose address had been spilled into x6/x7 as the address's own bytes;
+// va_arg of a complex integer read one half; and System V classified
+// `_Float128 _Complex` as two SSE eightbytes where gcc, and c17's own call
+// lowering, pass it in memory.
+const VA_AGG_DECLS: &str = r#"
+typedef __builtin_va_list va_list;
+typedef signed char _Complex cc_t; typedef short _Complex cs_t; typedef long long _Complex cl_t;
+struct HF { float a, b; }; struct HD { double a, b; }; struct HH { _Float16 a, b; };
+struct HL { long double a, b; }; struct HF3 { float a, b, c; }; struct HD4 { double a, b, c, d; };
+struct SI { int a, b; }; struct SI3 { int a, b, c; }; struct SL { long a, b; };
+struct MIX { float f; int i; }; struct MD { double d; long l; }; struct BIG { long a, b, c; };
+struct C1 { char c; };
+typedef _Float128 _Complex qc_t;
+"#;
+
+const VA_AGG_CALLEE: &str = r#"
+int check(int rounds, ...) {
+    va_list ap; __builtin_va_start(ap, rounds);
+    for (int r = 0; r < rounds; r++) {
+        int e = 100 * r;
+        cc_t c = __builtin_va_arg(ap, cc_t); if (__real__ c != 1 + r || __imag__ c != -2) return e + 1;
+        cs_t s = __builtin_va_arg(ap, cs_t); if (__real__ s != 3 + r || __imag__ s != -4) return e + 2;
+        cl_t l = __builtin_va_arg(ap, cl_t); if (__real__ l != 5 + r || __imag__ l != -6) return e + 3;
+        struct HF hf = __builtin_va_arg(ap, struct HF); if (hf.a != 1.5f + r || hf.b != -1.5f) return e + 4;
+        struct HD hd = __builtin_va_arg(ap, struct HD); if (hd.a != 2.5 + r || hd.b != -2.5) return e + 5;
+        struct HH hh = __builtin_va_arg(ap, struct HH); if (hh.a != (_Float16)(0.5f + r) || hh.b != (_Float16)-0.5f) return e + 6;
+        struct HL hl = __builtin_va_arg(ap, struct HL); if (hl.a != 3.5L + r || hl.b != -3.5L) return e + 7;
+        struct HF3 h3 = __builtin_va_arg(ap, struct HF3); if (h3.a != 1 + r || h3.b != 2 || h3.c != 3) return e + 8;
+        struct HD4 h4 = __builtin_va_arg(ap, struct HD4); if (h4.a != 1 + r || h4.b != 2 || h4.c != 3 || h4.d != 4) return e + 9;
+        struct SI si = __builtin_va_arg(ap, struct SI); if (si.a != 7 + r || si.b != -7) return e + 10;
+        struct SI3 s3 = __builtin_va_arg(ap, struct SI3); if (s3.a != 8 + r || s3.b != -8 || s3.c != 9) return e + 11;
+        struct SL sl = __builtin_va_arg(ap, struct SL); if (sl.a != 10 + r || sl.b != -10) return e + 12;
+        struct MIX mx = __builtin_va_arg(ap, struct MIX); if (mx.f != 4.5f + r || mx.i != -11) return e + 13;
+        struct MD md = __builtin_va_arg(ap, struct MD); if (md.d != 5.5 + r || md.l != -12) return e + 14;
+        struct BIG bg = __builtin_va_arg(ap, struct BIG); if (bg.a != 13 + r || bg.b != -13 || bg.c != 14) return e + 15;
+        struct C1 c1 = __builtin_va_arg(ap, struct C1); if (c1.c != 15 + r) return e + 16;
+        double _Complex dc = __builtin_va_arg(ap, double _Complex); if (__real__ dc != 6.5 + r || __imag__ dc != -6.5) return e + 17;
+        if (__builtin_va_arg(ap, double) != 7.25 + r) return e + 18;
+        if (__builtin_va_arg(ap, int) != 16 + r) return e + 19;
+        qc_t q = __builtin_va_arg(ap, qc_t); if (__real__ q != 8.5F128 + r || __imag__ q != -8.5F128) return e + 20;
+    }
+    __builtin_va_end(ap);
+    return 0;
+}
+"#;
+
+const VA_AGG_CALLER: &str = r#"
+int check(int rounds, ...);
+#define ROUND(r) (cc_t)((1 + r) - 2 * 1i), (cs_t)((3 + r) - 4 * 1i), (cl_t)(5 + r) - 6 * (cl_t)1i, \
+  (struct HF){1.5f + r, -1.5f}, (struct HD){2.5 + r, -2.5}, (struct HH){0.5f + r, -0.5f}, \
+  (struct HL){3.5L + r, -3.5L}, (struct HF3){1 + r, 2, 3}, (struct HD4){1 + r, 2, 3, 4}, \
+  (struct SI){7 + r, -7}, (struct SI3){8 + r, -8, 9}, (struct SL){10 + r, -10}, \
+  (struct MIX){4.5f + r, -11}, (struct MD){5.5 + r, -12}, (struct BIG){13 + r, -13, 14}, (struct C1){15 + r}, \
+  __builtin_complex(6.5 + r, -6.5), 7.25 + r, 16 + r, __builtin_complex(8.5F128 + r, -8.5F128)
+int main(void) {
+    int rc = check(1, ROUND(0));
+    if (rc) return rc;
+    return check(3, ROUND(0), ROUND(1), ROUND(2));
+}
+"#;
+
+/// Every pairing of c17 and `gcc` on the host, at -O0 and -O2.
+fn va_interop_host(tag: &str, callee: &str, caller: &str) {
+    let dir = plib::tmp::Builder::new()
+        .prefix(&format!("{tag}_"))
+        .tempdir()
+        .unwrap();
+    for opt in ["-O0", "-O2"] {
+        let callee_o = c17_object(&format!("{tag}_callee"), callee, opt, dir.path());
+        let caller_o = c17_object(&format!("{tag}_caller"), caller, opt, dir.path());
+        assert_eq!(
+            gcc_link_and_run("cc", &[&caller_o, &callee_o], &[], dir.path()),
+            0,
+            "c17 both, {opt}"
+        );
+        assert_eq!(
+            gcc_link_and_run("gc", &[&callee_o], &[caller], dir.path()),
+            0,
+            "gcc caller, c17 callee, {opt}"
+        );
+        assert_eq!(
+            gcc_link_and_run("cg", &[&caller_o], &[callee], dir.path()),
+            0,
+            "c17 caller, gcc callee, {opt}"
+        );
+    }
+}
+
+/// Every pairing of c17 and aarch64 `gcc`, under qemu, at -O0 and -O2.
+fn va_interop_aarch64(tag: &str, callee: &str, caller: &str) {
+    let dir = plib::tmp::Builder::new()
+        .prefix(&format!("{tag}_a64_"))
+        .tempdir()
+        .unwrap();
+    let callee_c = create_c_file(&format!("{tag}_callee_a64"), callee);
+    let caller_c = create_c_file(&format!("{tag}_caller_a64"), caller);
+    let callee_src = callee_c.path().to_string_lossy().into_owned();
+    let caller_src = caller_c.path().to_string_lossy().into_owned();
+    for opt in ["-O0", "-O2"] {
+        let asm = |src: &str, n: &str| {
+            let s = dir.path().join(format!("{n}{opt}.s"));
+            let run = run_c17(&[
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                opt,
+                "-w",
+                "-S",
+                "-o",
+                s.to_str().unwrap(),
+                src,
+            ]);
+            assert!(run.success, "c17 failed on {n}:\n{}", run.stderr);
+            s.to_string_lossy().into_owned()
+        };
+        let callee_s = asm(&callee_src, "callee");
+        let caller_s = asm(&caller_src, "caller");
+        assert_eq!(
+            cross_link_and_run(&format!("{tag}_cc"), &[&caller_s, &callee_s]),
+            0,
+            "c17 both, {opt}"
+        );
+        assert_eq!(
+            cross_link_and_run(&format!("{tag}_gc"), &[&caller_src, &callee_s]),
+            0,
+            "gcc caller, c17 callee, {opt}"
+        );
+        assert_eq!(
+            cross_link_and_run(&format!("{tag}_cg"), &[&caller_s, &callee_src]),
+            0,
+            "c17 caller, gcc callee, {opt}"
+        );
+    }
+}
+
+#[test]
+fn c99_va_arg_aggregates_c17_both_sides() {
+    let program = format!("{VA_AGG_DECLS}\n{VA_AGG_CALLEE}\n{VA_AGG_CALLER}");
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("va_agg{opt}"), &program, &[opt.to_string()]),
+            0,
+            "host {opt}"
+        );
+    }
+}
+
+/// Linux x86-64 only, where the host gcc is gcc and the ABI is System V.
+#[test]
+fn c99_va_arg_aggregates_interoperate_with_gcc_host() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+    va_interop_host(
+        "va_agg",
+        &format!("{VA_AGG_DECLS}\n{VA_AGG_CALLEE}"),
+        &format!("{VA_AGG_DECLS}\n{VA_AGG_CALLER}"),
+    );
+}
+
+#[test]
+fn c99_va_arg_aggregates_interoperate_with_gcc_aarch64() {
+    if !aarch64_cross_available() {
+        eprintln!("SKIP: no aarch64 cross toolchain");
+        return;
+    }
+    va_interop_aarch64(
+        "va_agg",
+        &format!("{VA_AGG_DECLS}\n{VA_AGG_CALLEE}"),
+        &format!("{VA_AGG_DECLS}\n{VA_AGG_CALLER}"),
     );
 }

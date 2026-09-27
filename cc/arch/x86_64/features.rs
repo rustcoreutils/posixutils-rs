@@ -886,23 +886,14 @@ impl X86_64CodeGen {
             _ => return,
         };
 
-        let is_aggregate = matches!(
-            types.kind(arg_type),
-            crate::types::TypeKind::Struct
-                | crate::types::TypeKind::Union
-                | crate::types::TypeKind::Array
-        );
-        if types.kind(arg_type) == crate::types::TypeKind::LongDouble {
-            self.emit_va_arg_x87(base_reg, base_offset, &dst_loc);
-        } else if types.kind(arg_type) == crate::types::TypeKind::Int128
-            && !types.is_complex(arg_type)
-        {
-            // Two INTEGER eightbytes, not one saturated at 64 bits. The
-            // complex guard is the same one every sibling site carries:
-            // `kind()` answers the *base* kind, so `_Complex __int128` would
-            // otherwise land here rather than in the aggregate path.
-            self.emit_va_arg_int128(base_reg, base_offset, &dst_loc, label_suffix);
-        } else if is_aggregate {
+        // A complex value is read exactly as the equivalent struct is: its
+        // classification (psABI 3.2.3) names each eightbyte's register area,
+        // or MEMORY for `long double _Complex`, and the aggregate path
+        // follows that. It must be asked first, because a complex type
+        // carries its base's kind: `long double _Complex` would otherwise
+        // take the x87 path and `float _Complex` the scalar SSE one, each
+        // reading one half and stepping over the wrong amount.
+        if types.is_aggregate_or_complex(arg_type) {
             self.emit_va_arg_aggregate(
                 base_reg,
                 base_offset,
@@ -911,6 +902,11 @@ impl X86_64CodeGen {
                 types,
                 label_suffix,
             );
+        } else if types.kind(arg_type) == crate::types::TypeKind::LongDouble {
+            self.emit_va_arg_x87(base_reg, base_offset, &dst_loc);
+        } else if types.kind(arg_type) == crate::types::TypeKind::Int128 {
+            // Two INTEGER eightbytes, not one saturated at 64 bits.
+            self.emit_va_arg_int128(base_reg, base_offset, &dst_loc, label_suffix);
         } else if types.is_float(arg_type) {
             self.emit_va_arg_float(
                 base_reg,

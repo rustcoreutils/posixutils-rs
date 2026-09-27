@@ -73,11 +73,12 @@ impl VaAggKind {
         types: &TypeTable,
         target: &crate::target::Target,
     ) -> Self {
-        use crate::types::TypeKind;
-        if !matches!(
-            types.kind(typ),
-            TypeKind::Struct | TypeKind::Union | TypeKind::Array
-        ) {
+        // A complex value is the two-member composite the classification
+        // says it is -- an HFA of its base, or for `_Complex int` a composite
+        // of the general class -- so it is read exactly as the equivalent
+        // struct is. Asking the kind alone took it for a scalar of its base,
+        // which read one half and stepped over one slot.
+        if !types.is_aggregate_or_complex(typ) {
             return VaAggKind::Scalar;
         }
         let bytes =

@@ -5069,11 +5069,12 @@ impl<'a> Linearizer<'a> {
                 // the struct's own four bytes spelled. Giving the result a
                 // `Sym` makes `rvalue_addr` take its address instead, which
                 // is what the small-struct return path does with `__sret1_`.
-                let is_aggregate = matches!(
-                    self.types.kind(*arg_type),
-                    TypeKind::Struct | TypeKind::Union | TypeKind::Array
-                );
-                let result = if is_aggregate {
+                //
+                // A complex value is addressed at every size, so it takes the
+                // same local. Given a bare pseudo instead, the backend wrote
+                // the value's bytes into a register every consumer then
+                // dereferenced as the address of the two halves.
+                let result = if self.types.is_aggregate_or_complex(*arg_type) {
                     self.frame_temp("__vaarg", *arg_type)
                 } else {
                     self.alloc_pseudo()

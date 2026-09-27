@@ -8023,3 +8023,53 @@ fn test_static_initializer_complex_scalar_shapes() {
         }
     }
 }
+
+/// `va_arg` of a complex type writes a local of its own, exactly as it does
+/// for a struct: a complex value travels by address at every size, so the
+/// result has to *be* storage. A bare register pseudo -- what a scalar gets --
+/// had the backend write the value into it and every consumer then
+/// dereference that value as the address of the two halves.
+#[test]
+fn test_va_arg_of_complex_writes_a_local() {
+    let src = "struct P { double a, b; };\n\
+               void use(void *);\n\
+               void f(int n, ...) {\n\
+                   __builtin_va_list ap;\n\
+                   __builtin_va_start(ap, n);\n\
+                   float _Complex fc = __builtin_va_arg(ap, float _Complex);\n\
+                   double _Complex dc = __builtin_va_arg(ap, double _Complex);\n\
+                   long double _Complex lc = __builtin_va_arg(ap, long double _Complex);\n\
+                   int _Complex ic = __builtin_va_arg(ap, int _Complex);\n\
+                   _Float16 _Complex hc = __builtin_va_arg(ap, _Float16 _Complex);\n\
+                   struct P p = __builtin_va_arg(ap, struct P);\n\
+                   double d = __builtin_va_arg(ap, double);\n\
+                   use(&fc); use(&dc); use(&lc); use(&ic); use(&hc); use(&p); use(&d);\n\
+                   __builtin_va_end(ap);\n\
+               }\n";
+    for target in [
+        Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux),
+        Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux),
+        Target::new(crate::target::Arch::Aarch64, crate::target::Os::MacOS),
+    ] {
+        let module = linearize_source(src, &target);
+        let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+        let names_storage: Vec<bool> = f
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| i.op == Opcode::VaArg)
+            .map(|i| {
+                matches!(
+                    f.get_pseudo(i.target.unwrap()).map(|p| &p.kind),
+                    Some(crate::ir::PseudoKind::Sym(_))
+                )
+            })
+            .collect();
+        // Five complex types and a struct name a local; the double does not.
+        assert_eq!(
+            names_storage,
+            [true, true, true, true, true, true, false],
+            "{target:?}"
+        );
+    }
+}

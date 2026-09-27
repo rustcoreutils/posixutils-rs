@@ -2874,3 +2874,137 @@ fn cross_abi_float16_complex_matches_gcc_on_aarch64() {
         );
     }
 }
+
+/// The cursor advance of each Darwin `va_arg` in `body`, in order: every
+/// `add R, R, #N` that is stored straight back through the `va_list`.
+fn darwin_va_advances(body: &str) -> Vec<i64> {
+    let lines: Vec<&str> = body.lines().map(str::trim).collect();
+    lines
+        .windows(2)
+        .filter_map(|w| {
+            let (dst, rest) = w[0].strip_prefix("add ")?.split_once(", ")?;
+            let (src, imm) = rest.split_once(", #")?;
+            (dst == src && w[1].starts_with(&format!("str {dst}, [")))
+                .then(|| imm.parse().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// Darwin `va_arg` of a complex type reads the value as the object it is on
+/// the stack -- both halves, contiguous at the cursor -- and steps over its
+/// own size rounded to eight.
+///
+/// It took each complex type for a scalar of its base: one half was read,
+/// the cursor moved by one slot, and the result was written into a register
+/// that every consumer then dereferenced as the address of the two halves.
+/// Asserted on assembly because there is no macOS runner and qemu cannot run
+/// Mach-O; the behaviour is pinned on the other targets by
+/// `c99_complex_va_arg_interoperates_with_gcc_aarch64`.
+#[test]
+fn codegen_darwin_va_arg_complex_reads_the_object() {
+    let src = r#"
+typedef __builtin_va_list va_list;
+double re_d(int n, ...) {
+    va_list ap; __builtin_va_start(ap, n);
+    double _Complex z = __builtin_va_arg(ap, double _Complex);
+    int after = __builtin_va_arg(ap, int);
+    __builtin_va_end(ap);
+    return __imag__ z + after;
+}
+float re_f(int n, ...) {
+    va_list ap; __builtin_va_start(ap, n);
+    float _Complex z = __builtin_va_arg(ap, float _Complex);
+    int after = __builtin_va_arg(ap, int);
+    __builtin_va_end(ap);
+    return __imag__ z + after;
+}
+_Float16 re_h(int n, ...) {
+    va_list ap; __builtin_va_start(ap, n);
+    _Float16 _Complex z = __builtin_va_arg(ap, _Float16 _Complex);
+    int after = __builtin_va_arg(ap, int);
+    __builtin_va_end(ap);
+    return __imag__ z + after;
+}
+"#;
+    let asm = asm_for("darwin_va_complex", "aarch64-apple-darwin", src);
+    // Apple's `long double` is `double`, so there is no wider case to check.
+    for (func, first) in [("re_d", 16), ("re_f", 8), ("re_h", 8)] {
+        let body = body_of(&asm, func);
+        assert_eq!(
+            darwin_va_advances(body),
+            [first, 8],
+            "{func}: the complex value takes its own size rounded to eight, \
+             then the `int` one slot:\n{body}"
+        );
+    }
+    // Both halves of the double pair are read, from +0 and +8 of the cursor.
+    let body = body_of(&asm, "re_d");
+    assert!(
+        body.lines()
+            .map(str::trim)
+            .any(|l| l.starts_with("ldr x") && l.ends_with(", #8]")),
+        "re_d: the imaginary half at +8 is never read:\n{body}"
+    );
+}
+
+/// A Darwin variadic call stacks a complex argument's *value*, and passes a
+/// named complex argument in `d0`/`d1` as any other call does.
+///
+/// Its argument walk was its own and knew scalars and wide structs only. A
+/// variadic `_Complex` -- whose pseudo is an address at every size -- was
+/// stored as that pointer, zero-extended into a sixteen-byte pair, and a
+/// named complex or HFA argument went to `x0` as the address.
+#[test]
+fn codegen_darwin_variadic_call_passes_complex_values() {
+    let src = r#"
+struct P { double a, b; };
+int check(int n, ...);
+int nf(double _Complex z, ...);
+int ns(struct P p, ...);
+int var_d(double _Complex x) { return check(1, x); }
+int var_f(float _Complex x) { return check(1, x); }
+int named_d(double _Complex x) { return nf(x, 1); }
+int named_s(struct P p) { return ns(p, 1); }
+"#;
+    let asm = asm_for("darwin_va_complex_call", "aarch64-apple-darwin", src);
+    let lines = |func: &str| -> Vec<String> {
+        body_of(&asm, func)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .collect()
+    };
+
+    let d = lines("var_d");
+    for at in ["[sp]", "[sp, #8]"] {
+        assert!(
+            d.iter().any(|l| l.starts_with("str d") && l.ends_with(at)),
+            "var_d: a double half must be stored at {at}:\n{}",
+            d.join("\n")
+        );
+    }
+    let f = lines("var_f");
+    for at in ["[sp]", "[sp, #4]"] {
+        assert!(
+            f.iter().any(|l| l.starts_with("str s") && l.ends_with(at)),
+            "var_f: a float half must be stored at {at}:\n{}",
+            f.join("\n")
+        );
+    }
+
+    for func in ["named_d", "named_s"] {
+        let body = lines(func);
+        for v in ["d0", "d1"] {
+            assert!(
+                body.iter().any(|l| l.starts_with(&format!("ldr {v}, ["))),
+                "{func}: the named pair must be loaded into {v}:\n{}",
+                body.join("\n")
+            );
+        }
+        assert!(
+            !body.iter().any(|l| l.starts_with("mov x0, x")),
+            "{func}: the pair's address must not be passed in x0:\n{}",
+            body.join("\n")
+        );
+    }
+}

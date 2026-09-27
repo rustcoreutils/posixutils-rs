@@ -93,21 +93,16 @@ impl StackArg {
     }
 }
 
-/// One argument of a Darwin variadic call, on its way to the outgoing area.
+/// Which argument registers a walk over the arguments may still hand out.
 ///
-/// `agg_bytes` is set when the argument's bytes are copied into the slot as an
-/// object rather than moved as a value: it occupies its own size rounded up to
-/// eight, not one slot holding a pointer to it. `typ` is what says how wide
-/// the slot is and where it starts -- Apple aligns each one to the type's own
-/// alignment, and a `__int128` needs two granules rather than the one every
-/// scalar used to get.
-struct DarwinVaArg {
-    pseudo: PseudoId,
-    is_fp: bool,
-    /// Width in bits, for the register move -- not the slot's size.
-    size: u32,
-    agg_bytes: Option<i32>,
-    typ: Option<TypeId>,
+/// `Exhausted` is Apple's rule for a variadic argument: it never goes in a
+/// register, so the walk stacks each one in the form it would take after the
+/// registers ran out -- the one place that decides what a stacked argument is
+/// made of.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArgRegisters {
+    Available,
+    Exhausted,
 }
 
 impl Aarch64CodeGen {
@@ -122,339 +117,130 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Handle Darwin variadic call arguments (all variadic args go on stack)
+    /// Set up the arguments of a Darwin variadic call.
+    ///
+    /// Apple's arm64 convention departs from AAPCS64 in one place only: every
+    /// *variadic* argument is on the stack, each at its own size and
+    /// alignment ([`crate::abi::aapcs64::darwin_va_slot`]), after any named
+    /// argument that overflowed its registers. The named arguments are
+    /// assigned exactly as in any other call, and each variadic argument is
+    /// stacked in the form the ordinary walk gives it once its registers are
+    /// used up -- the same walk, told there are none left -- so a complex
+    /// value, an HFA and a composite are each written as their own bytes.
+    ///
+    /// This had a walk of its own that knew scalars and wide structs only:
+    /// every named argument went to the next X or V register as though it
+    /// were a scalar, and a variadic `_Complex` -- whose pseudo is an
+    /// *address* at every size -- was stored as the pointer.
     pub(super) fn setup_darwin_variadic_args(
         &mut self,
         insn: &Instruction,
         args_start: usize,
         types: &TypeTable,
     ) -> i32 {
-        let int_arg_regs = Reg::arg_regs();
-        let fp_arg_regs = VReg::arg_regs();
-        let variadic_start = insn.variadic_arg_start.unwrap_or(usize::MAX);
-        let mut int_arg_idx = 0;
-        let mut fp_arg_idx = 0;
-        let mut stack_args = 0;
+        let variadic_start = insn
+            .variadic_arg_start
+            .unwrap_or(insn.src.len())
+            .max(args_start);
+        let named = self.assign_arg_registers(
+            insn,
+            args_start..variadic_start,
+            ArgRegisters::Available,
+            types,
+        );
+        let variadic = self.assign_arg_registers(
+            insn,
+            variadic_start..insn.src.len(),
+            ArgRegisters::Exhausted,
+            types,
+        );
 
-        let mut variadic_args: Vec<DarwinVaArg> = Vec::new();
-
-        for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
-            let arg_type = insn.arg_types.get(i).copied();
-
-            if self.arg_is_ignored(arg_type, types) {
-                continue;
-            }
-
-            let is_fp = if let Some(typ) = arg_type {
-                types.is_float(typ)
-            } else {
-                let arg_loc = self.get_location(arg);
-                matches!(arg_loc, Loc::VReg(_) | Loc::FImm(..))
-            };
-
-            let arg_size = if let Some(typ) = arg_type {
-                types.size_bits(typ).max(32)
-            } else {
-                64
-            };
-
-            // A composite of at most sixteen bytes travels in two X registers
-            // here as it does everywhere else (AAPCS64 §5.4.2 C.10). Darwin
-            // takes its own path for a variadic call, and that path still
-            // moved one register's worth -- so the composite that the rest of
-            // the compiler now passes as a pair arrived half formed.
-            // Which aggregates are copied into the stack slot as objects.
-            //
-            // Not one of eight bytes or fewer: that pseudo holds the aggregate
-            // *value*, exactly as a scalar does, so it goes through the
-            // ordinary move below. Copying it meant dereferencing the value as
-            // though it were an address -- `struct { float a, b; }` faulted on
-            // whatever address its two floats spelled.
-            //
-            // And not one too large to pass directly: stage B.4 replaces that
-            // with a pointer to the caller's copy, and `va_arg` reads it that
-            // way, so the pointer travels and the object stays put.
-            let agg_bytes = arg_type.and_then(|t| {
-                let abi =
-                    crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
-                (matches!(
-                    types.kind(t),
-                    TypeKind::Struct | TypeKind::Union | TypeKind::Array
-                ) && types.size_bits(t) > 64
-                    && !matches!(abi.classify_param(t, types), ArgClass::Indirect { .. }))
-                .then(|| {
-                    crate::abi::slot_bytes(
-                        types.size_bytes(t).max(1),
-                        insn.pos.unwrap_or_default(),
-                        "a variadic argument",
-                    )
-                })
+        let mut placed = Self::place_stack_args(named, 0, types, &self.base.target);
+        let mut at = placed
+            .last()
+            .map_or(0, |(a, off)| off + a.slot_bytes(types, &self.base.target));
+        let mut max_align = 16;
+        for arg in variadic {
+            let (bytes, align) = arg.typ.map_or((8, 8), |t| {
+                crate::abi::aapcs64::darwin_va_slot(
+                    insn.pos.unwrap_or_default(),
+                    types,
+                    t,
+                    &self.base.target,
+                )
             });
-            let gp_pair = agg_bytes.is_some_and(|_| {
-                let abi =
-                    crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
-                arg_type.is_some_and(|t| {
-                    matches!(
-                        abi.classify_param(t, types),
-                        ArgClass::Direct { ref classes, .. }
-                            if classes.len() == 2
-                                && classes.iter().all(|c| *c == crate::abi::RegClass::Integer)
-                    )
-                })
-            });
+            at = (at + align - 1) & !(align - 1);
+            max_align = max_align.max(align);
+            placed.push((arg, at));
+            at += bytes;
+        }
+        if placed.is_empty() {
+            return 0;
+        }
+        let aligned_bytes = (at + 15) & !15;
 
-            if i >= variadic_start {
-                variadic_args.push(DarwinVaArg {
-                    pseudo: arg,
-                    is_fp,
-                    size: arg_size,
-                    agg_bytes,
-                    typ: arg_type,
-                });
-            } else if gp_pair {
-                if int_arg_idx + 1 < int_arg_regs.len() {
-                    let mem = match self.get_location(arg) {
-                        ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => self.loc_mem(l).unwrap(),
-                        Loc::Reg(r) => MemAddr::BaseOffset { base: r, offset: 0 },
-                        _ => MemAddr::BaseOffset {
-                            base: Reg::X9,
-                            offset: 0,
-                        },
-                    };
-                    self.push_lir(Aarch64Inst::Ldp {
-                        size: OperandSize::B64,
-                        addr: mem,
-                        dst1: int_arg_regs[int_arg_idx],
-                        dst2: int_arg_regs[int_arg_idx + 1],
-                    });
-                    int_arg_idx += 2;
-                }
-            } else {
-                // Fixed arg - use registers
-                if is_fp {
-                    let fp_size = if let Some(typ) = arg_type {
-                        types.size_bits(typ)
-                    } else {
-                        64
-                    };
-                    if fp_arg_idx < fp_arg_regs.len() {
-                        self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], arg_type, fp_size, types);
-                        fp_arg_idx += 1;
-                    }
-                } else if int_arg_idx < int_arg_regs.len() {
-                    self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size);
-                    int_arg_idx += 1;
-                }
-            }
+        if max_align > 16 {
+            // `%sp` is guaranteed to sixteen, so a slot that wants more only
+            // lands there if the *area* starts there: the offsets above are
+            // static, and rounding one of them means nothing when the base
+            // underneath it is not aligned. Round `%sp` down instead, and
+            // stash the old value just above the arguments -- how much the
+            // rounding consumed is not known until it runs, so the matching
+            // `add` that releases every other outgoing area cannot release
+            // this one.
+            //
+            // The reservation covers the arguments, the worst-case rounding
+            // and the saved pointer, so the slot at `aligned_bytes` is always
+            // inside it.
+            let reserve = aligned_bytes + max_align + 16;
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: Reg::sp(),
+                src2: GpOperand::Imm(0),
+                dst: Reg::X16,
+            });
+            self.push_lir(Aarch64Inst::Sub {
+                size: OperandSize::B64,
+                src1: Reg::sp(),
+                src2: GpOperand::Imm(reserve as i64),
+                dst: Reg::X17,
+            });
+            // A negative mask is not a logical immediate here, so it is
+            // materialized and applied from a register -- which is also why
+            // the result cannot be written straight to `%sp`.
+            self.emit_mov_imm(Reg::X9, -(max_align as i64), 64);
+            self.push_lir(Aarch64Inst::And {
+                size: OperandSize::B64,
+                src1: Reg::X17,
+                src2: GpOperand::Reg(Reg::X9),
+                dst: Reg::X17,
+            });
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: Reg::X17,
+                src2: GpOperand::Imm(0),
+                dst: Reg::sp(),
+            });
+            self.push_lir(Aarch64Inst::Str {
+                size: OperandSize::B64,
+                src: Reg::X16,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::SP,
+                    offset: aligned_bytes,
+                },
+            });
+            self.darwin_va_sp_slot = Some(aligned_bytes);
+        } else {
+            self.push_lir(Aarch64Inst::Sub {
+                size: OperandSize::B64,
+                src1: Reg::sp(),
+                src2: GpOperand::Imm(aligned_bytes as i64),
+                dst: Reg::sp(),
+            });
         }
 
-        // Store variadic args on stack
-        let num_variadic = variadic_args.len();
-        if num_variadic > 0 {
-            // Walked, not summed: the padding between two slots is part of
-            // the area, and summing the sizes alone under-reserved it.
-            let slot = |typ: Option<TypeId>, this: &Self| -> (i32, i32) {
-                typ.map_or((8, 8), |t| {
-                    crate::abi::aapcs64::darwin_va_slot(
-                        insn.pos.unwrap_or_default(),
-                        types,
-                        t,
-                        &this.base.target,
-                    )
-                })
-            };
-            let variadic_bytes: i32 = variadic_args.iter().fold(0, |at, a| {
-                let (bytes, align) = slot(a.typ, self);
-                ((at + align - 1) & !(align - 1)) + bytes
-            });
-            let aligned_bytes = (variadic_bytes + 15) & !15;
-            let max_align = variadic_args
-                .iter()
-                .map(|a| slot(a.typ, self).1)
-                .max()
-                .unwrap_or(8)
-                .max(16);
-
-            if max_align > 16 {
-                // `%sp` is guaranteed to sixteen, so a slot that wants more
-                // only lands there if the *area* starts there: the offsets
-                // below are static, and rounding one of them means nothing
-                // when the base underneath it is not aligned. Round `%sp`
-                // down instead, and stash the old value just above the
-                // arguments -- how much the rounding consumed is not known
-                // until it runs, so the matching `add` that releases every
-                // other outgoing area cannot release this one.
-                //
-                // The reservation covers the arguments, the worst-case
-                // rounding and the saved pointer, so the slot at
-                // `aligned_bytes` is always inside it.
-                let reserve = aligned_bytes + max_align + 16;
-                self.push_lir(Aarch64Inst::Add {
-                    size: OperandSize::B64,
-                    src1: Reg::sp(),
-                    src2: GpOperand::Imm(0),
-                    dst: Reg::X16,
-                });
-                self.push_lir(Aarch64Inst::Sub {
-                    size: OperandSize::B64,
-                    src1: Reg::sp(),
-                    src2: GpOperand::Imm(reserve as i64),
-                    dst: Reg::X17,
-                });
-                // A negative mask is not a logical immediate here, so it is
-                // materialized and applied from a register -- which is also
-                // why the result cannot be written straight to `%sp`.
-                self.emit_mov_imm(Reg::X9, -(max_align as i64), 64);
-                self.push_lir(Aarch64Inst::And {
-                    size: OperandSize::B64,
-                    src1: Reg::X17,
-                    src2: GpOperand::Reg(Reg::X9),
-                    dst: Reg::X17,
-                });
-                self.push_lir(Aarch64Inst::Add {
-                    size: OperandSize::B64,
-                    src1: Reg::X17,
-                    src2: GpOperand::Imm(0),
-                    dst: Reg::sp(),
-                });
-                self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B64,
-                    src: Reg::X16,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::SP,
-                        offset: aligned_bytes,
-                    },
-                });
-                self.darwin_va_sp_slot = Some(aligned_bytes);
-            } else {
-                self.push_lir(Aarch64Inst::Sub {
-                    size: OperandSize::B64,
-                    src1: Reg::sp(),
-                    src2: GpOperand::Imm(aligned_bytes as i64),
-                    dst: Reg::sp(),
-                });
-            }
-
-            let mut offset = 0i32;
-            for DarwinVaArg {
-                pseudo: arg,
-                is_fp,
-                size: arg_size,
-                agg_bytes,
-                typ: arg_type,
-            } in variadic_args.into_iter()
-            {
-                let (slot_bytes, slot_align) = slot(arg_type, self);
-                offset = (offset + slot_align - 1) & !(slot_align - 1);
-                if let Some(bytes) = agg_bytes {
-                    // The pseudo locates the aggregate; its bytes go in the
-                    // slot. Moving it as a scalar wrote the pointer instead.
-                    let src = match self.get_location(arg) {
-                        Loc::Reg(r) => r,
-                        ref loc @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
-                            // Both frames reach here: an aggregate argument
-                            // may be a local or may itself have arrived on the
-                            // stack. `_ => continue` below would skip it.
-                            let (base, disp) = self.loc_addr_parts(loc).unwrap();
-                            self.push_lir(Aarch64Inst::Add {
-                                size: OperandSize::B64,
-                                src1: base,
-                                src2: GpOperand::Imm(disp as i64),
-                                dst: Reg::X9,
-                            });
-                            Reg::X9
-                        }
-                        _ => continue,
-                    };
-                    let mut done = 0;
-                    while done < bytes {
-                        let chunk = [8, 4, 2, 1]
-                            .into_iter()
-                            .find(|c| *c <= bytes - done)
-                            .unwrap_or(1);
-                        let size = OperandSize::from_bits(chunk as u32 * 8);
-                        self.push_lir(Aarch64Inst::Ldr {
-                            size,
-                            addr: MemAddr::BaseOffset {
-                                base: src,
-                                offset: done,
-                            },
-                            dst: Reg::X16,
-                        });
-                        self.push_lir(Aarch64Inst::Str {
-                            size,
-                            src: Reg::X16,
-                            addr: MemAddr::BaseOffset {
-                                base: Reg::SP,
-                                offset: offset + done,
-                            },
-                        });
-                        done += chunk;
-                    }
-                    offset += slot_bytes;
-                    continue;
-                }
-                if is_fp {
-                    // Variadic FP args don't have precise type info, use size-based detection
-                    self.emit_fp_move(arg, VReg::V16, None, arg_size, types);
-                    self.push_lir(Aarch64Inst::StrFp {
-                        size: FpSize::Double,
-                        src: VReg::V16,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::SP,
-                            offset,
-                        },
-                    });
-                } else if slot_bytes > 8 {
-                    // A wide integral scalar -- `__int128` -- is two granules.
-                    // Moving it as one wrote the low half and left the high
-                    // half whatever the slot held, which no c17-only program
-                    // could see: the reader took eight bytes too.
-                    let loc = self.get_location(arg).clone();
-                    let mem = self.loc_mem(&loc);
-                    match mem {
-                        Some(mem) => self.push_lir(Aarch64Inst::Ldp {
-                            size: OperandSize::B64,
-                            addr: mem,
-                            dst1: Reg::X9,
-                            dst2: Reg::X10,
-                        }),
-                        None => {
-                            self.emit_move(arg, Reg::X9, 64);
-                            self.push_lir(Aarch64Inst::Mov {
-                                size: OperandSize::B64,
-                                src: GpOperand::Reg(Reg::Xzr),
-                                dst: Reg::X10,
-                            });
-                        }
-                    }
-                    self.push_lir(Aarch64Inst::Stp {
-                        size: OperandSize::B64,
-                        src1: Reg::X9,
-                        src2: Reg::X10,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::SP,
-                            offset,
-                        },
-                    });
-                } else {
-                    self.emit_move(arg, Reg::X9, arg_size);
-                    self.push_lir(Aarch64Inst::Str {
-                        size: OperandSize::B64,
-                        src: Reg::X9,
-                        addr: MemAddr::BaseOffset {
-                            base: Reg::SP,
-                            offset,
-                        },
-                    });
-                }
-                offset += slot_bytes;
-            }
-
-            stack_args = (aligned_bytes + 15) / 16;
-        }
-
-        stack_args
+        self.store_stack_args(placed, types);
+        (aligned_bytes + 15) / 16
     }
 
     /// Set up register arguments for standard AAPCS64 calls
@@ -468,19 +254,23 @@ impl Aarch64CodeGen {
         args_start: usize,
         types: &TypeTable,
     ) -> i32 {
-        let stack_args_info = self.assign_arg_registers(insn, args_start, types);
+        let stack_args_info = self.assign_arg_registers(
+            insn,
+            args_start..insn.src.len(),
+            ArgRegisters::Available,
+            types,
+        );
+        let placed = Self::place_stack_args(stack_args_info, 0, types, &self.base.target);
 
         // If no stack args, we're done
-        if stack_args_info.is_empty() {
+        let Some((last, last_off)) = placed.last() else {
             return 0;
-        }
+        };
 
         // Pre-allocate stack space for all stack args, 16-byte aligned.
         // Walked, not summed: alignment padding between arguments is part of
         // the area, and summing the sizes alone under-reserved it.
-        let stack_bytes: i32 = stack_args_info.iter().fold(0, |at, a| {
-            a.slot_start(at, types) + a.slot_bytes(types, &self.base.target)
-        });
+        let stack_bytes = last_off + last.slot_bytes(types, &self.base.target);
         let aligned_bytes = (stack_bytes + 15) & !15;
 
         self.push_lir(Aarch64Inst::Sub {
@@ -490,7 +280,7 @@ impl Aarch64CodeGen {
             dst: Reg::sp(),
         });
 
-        self.store_stack_args(stack_args_info, types);
+        self.store_stack_args(placed, types);
 
         // Return number of 16-byte units allocated (for cleanup)
         (aligned_bytes + 15) / 16
@@ -512,21 +302,24 @@ impl Aarch64CodeGen {
         })
     }
 
-    /// Assign each argument to its AAPCS64 register, returning the ones that
-    /// did not fit and must travel on the stack, in parameter order.
+    /// Assign each argument in `args` to its AAPCS64 register, returning the
+    /// ones that did not fit and must travel on the stack, in parameter order.
     fn assign_arg_registers(
         &mut self,
         insn: &Instruction,
-        args_start: usize,
+        args: std::ops::Range<usize>,
+        registers: ArgRegisters,
         types: &TypeTable,
     ) -> Vec<StackArg> {
         let int_arg_regs = Reg::arg_regs();
         let fp_arg_regs = VReg::arg_regs();
         let mut stack_args_info: Vec<StackArg> = Vec::new();
-        let mut int_arg_idx = 0;
-        let mut fp_arg_idx = 0;
+        let (mut int_arg_idx, mut fp_arg_idx) = match registers {
+            ArgRegisters::Available => (0, 0),
+            ArgRegisters::Exhausted => (int_arg_regs.len(), fp_arg_regs.len()),
+        };
 
-        for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
+        for (i, &arg) in insn.src.iter().enumerate().take(args.end).skip(args.start) {
             let arg_type = insn.arg_types.get(i).copied();
             if self.arg_is_ignored(arg_type, types) {
                 continue;
@@ -643,7 +436,7 @@ impl Aarch64CodeGen {
                 })
             {
                 if int_arg_idx + gp_n <= int_arg_regs.len() {
-                    let base = self.load_complex_arg_address(arg);
+                    let base = self.aggregate_arg_address(arg);
                     for k in 0..gp_n {
                         self.push_lir(Aarch64Inst::Ldr {
                             size: OperandSize::B64,
@@ -689,19 +482,10 @@ impl Aarch64CodeGen {
                     int_arg_regs.len(),
                 ) {
                     int_arg_idx = start;
-                    let mem = match self.get_location(arg) {
-                        // The slot holds the aggregate's own bytes.
-                        ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => self.loc_mem(l).unwrap(),
-                        // The register holds its address.
-                        Loc::Reg(r) => MemAddr::BaseOffset { base: r, offset: 0 },
-                        _ => MemAddr::BaseOffset {
-                            base: Reg::X9,
-                            offset: 0,
-                        },
-                    };
+                    let base = self.aggregate_arg_address(arg);
                     self.push_lir(Aarch64Inst::Ldp {
                         size: OperandSize::B64,
-                        addr: mem,
+                        addr: MemAddr::BaseOffset { base, offset: 0 },
                         dst1: int_arg_regs[int_arg_idx],
                         dst2: int_arg_regs[int_arg_idx + 1],
                     });
@@ -841,12 +625,26 @@ impl Aarch64CodeGen {
         stack_args_info
     }
 
-    /// Store each stacked argument at its offset from SP, in parameter order.
-    fn store_stack_args(&mut self, stack_args_info: Vec<StackArg>, types: &TypeTable) {
-        // Store each stack arg at its proper offset from SP (in parameter order)
-        let mut offset: i32 = 0;
-        for stack_arg in stack_args_info.into_iter() {
-            offset = stack_arg.slot_start(offset, types);
+    /// Lay stacked arguments out in parameter order from `at`, each at its
+    /// AAPCS64 slot, pairing every one with its offset from SP.
+    fn place_stack_args(
+        args: Vec<StackArg>,
+        mut at: i32,
+        types: &TypeTable,
+        target: &Target,
+    ) -> Vec<(StackArg, i32)> {
+        args.into_iter()
+            .map(|a| {
+                let off = a.slot_start(at, types);
+                at = off + a.slot_bytes(types, target);
+                (a, off)
+            })
+            .collect()
+    }
+
+    /// Store each stacked argument at its offset from SP.
+    fn store_stack_args(&mut self, placed: Vec<(StackArg, i32)>, types: &TypeTable) {
+        for (stack_arg, offset) in placed {
             if stack_arg
                 .typ
                 .is_some_and(|t| types.kind(t) == TypeKind::Int128)
@@ -878,23 +676,15 @@ impl Aarch64CodeGen {
                         });
                     }
                 }
-                self.push_lir(Aarch64Inst::Str {
+                self.push_lir(Aarch64Inst::Stp {
                     size: OperandSize::B64,
-                    src: Reg::X9,
+                    src1: Reg::X9,
+                    src2: Reg::X10,
                     addr: MemAddr::BaseOffset {
                         base: Reg::SP,
                         offset,
                     },
                 });
-                self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B64,
-                    src: Reg::X10,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::SP,
-                        offset: offset + 8,
-                    },
-                });
-                offset += 16;
                 continue;
             }
             if matches!(stack_arg.kind, StackKind::Complex) {
@@ -903,7 +693,7 @@ impl Aarch64CodeGen {
                 // setup_complex_arg performs for the register-passed case.
                 let typ = stack_arg.typ.expect("complex arg without a type");
                 let (fp_size, imag_offset) = complex_fp_info(types, &self.base.target, typ);
-                let addr = self.load_complex_arg_address(stack_arg.pseudo);
+                let addr = self.aggregate_arg_address(stack_arg.pseudo);
 
                 for (step, elem_off) in [(0i32, 0i32), (1, imag_offset)].into_iter() {
                     self.push_lir(Aarch64Inst::LdrFp {
@@ -923,44 +713,12 @@ impl Aarch64CodeGen {
                         },
                     });
                 }
-                // AAPCS64 rounds each stacked argument up to 8 bytes; the
-                // callee's allocator uses the same rule, so the two agree.
-                offset += stack_arg.slot_bytes(types, &self.base.target);
                 continue;
             }
             if let StackKind::Composite { bytes } = stack_arg.kind {
                 // The pseudo locates the aggregate; its bytes go into the
-                // slot. Whether its slot *is* the aggregate or merely points
-                // at it is the pseudo's kind, not its location: a `Sym` names
-                // storage, and anything else in a slot -- a spilled address,
-                // an `Alloca` result -- holds a pointer. A complex value is
-                // always the latter, so taking the address of the slot copied
-                // the pointer's own bytes into the outgoing argument.
-                let names_storage = self.pseudos.is_sym(stack_arg.pseudo);
-                let src = match self.get_location(stack_arg.pseudo) {
-                    Loc::Reg(r) => r,
-                    ref loc @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
-                        // As above: the aggregate may live in either frame,
-                        // and `_ => continue` would silently drop it.
-                        if names_storage {
-                            let (base, disp) = self.loc_addr_parts(loc).unwrap();
-                            self.push_lir(Aarch64Inst::Add {
-                                size: OperandSize::B64,
-                                src1: base,
-                                src2: GpOperand::Imm(disp as i64),
-                                dst: Reg::X9,
-                            });
-                        } else {
-                            self.push_lir(Aarch64Inst::Ldr {
-                                size: OperandSize::B64,
-                                addr: self.loc_mem(loc).unwrap(),
-                                dst: Reg::X9,
-                            });
-                        }
-                        Reg::X9
-                    }
-                    _ => continue,
-                };
+                // slot.
+                let src = self.aggregate_arg_address(stack_arg.pseudo);
                 let mut done = 0;
                 while done < bytes {
                     let chunk = [8, 4, 2, 1]
@@ -986,7 +744,6 @@ impl Aarch64CodeGen {
                     });
                     done += chunk;
                 }
-                offset += stack_arg.slot_bytes(types, &self.base.target);
                 continue;
             }
             if let StackKind::Hfa { base, count } = stack_arg.kind {
@@ -1007,7 +764,6 @@ impl Aarch64CodeGen {
                         },
                     });
                 }
-                offset += stack_arg.slot_bytes(types, &self.base.target);
                 continue;
             }
             if stack_arg.is_fp {
@@ -1041,21 +797,34 @@ impl Aarch64CodeGen {
                     },
                 });
             }
-            offset += stack_arg.slot_bytes(types, &self.base.target);
         }
     }
 
     /// Set up a complex number argument (real + imaginary in two V registers)
-    /// Load the address a complex-argument pseudo holds into a scratch
-    /// register, and return that register.
+    /// The register holding the address of an argument that travels by
+    /// address -- a complex value at any size, a composite above a
+    /// register's worth -- loading it into X9 when it is not already in one.
     ///
-    /// `Linearizer::complex_operand_addr` makes the pseudo an address, so
-    /// every consumer has to dereference it; reading the slot as though it
-    /// were the value only appeared to work while the pointer stayed in a
-    /// register.
-    fn load_complex_arg_address(&mut self, arg: PseudoId) -> Reg {
+    /// Whether a stack slot *is* the object or merely points at it is the
+    /// pseudo's kind, not its location: a `Sym` names storage, and anything
+    /// else in a slot -- a spilled address, an `Alloca` result -- holds a
+    /// pointer. Each call path used to answer this for itself, and each got
+    /// one half wrong: the register-pair and HFA paths read a spilled
+    /// address's own bytes as the aggregate, and the complex paths
+    /// dereferenced a `Sym`'s contents as though they were a pointer.
+    fn aggregate_arg_address(&mut self, arg: PseudoId) -> Reg {
         match self.get_location(arg) {
             Loc::Reg(r) => r,
+            ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) if self.pseudos.is_sym(arg) => {
+                let (base, disp) = self.loc_addr_parts(l).unwrap();
+                self.push_lir(Aarch64Inst::Add {
+                    size: OperandSize::B64,
+                    src1: base,
+                    src2: GpOperand::Imm(disp as i64),
+                    dst: Reg::X9,
+                });
+                Reg::X9
+            }
             ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
                 self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
@@ -1079,54 +848,14 @@ impl Aarch64CodeGen {
         imag_reg: VReg,
         types: &TypeTable,
     ) {
-        let arg_loc = self.get_location(arg);
         let (fp_size, imag_offset) = complex_fp_info(types, &self.base.target, arg_type.unwrap());
-
-        match arg_loc {
-            ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
-                // The argument pseudo holds the *address* of the complex value
-                // (`Linearizer::complex_operand_addr`), so the slot has to be
-                // loaded and then dereferenced. Reading the slot as though it
-                // were the value worked only while the pointer happened to
-                // stay in a register, and produced garbage the moment it was
-                self.push_lir(Aarch64Inst::Ldr {
-                    size: OperandSize::B64,
-                    dst: Reg::X9,
-                    addr: self.loc_mem(l).unwrap(),
-                });
-                self.push_lir(Aarch64Inst::LdrFp {
-                    size: fp_size,
-                    dst: real_reg,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X9,
-                        offset: 0,
-                    },
-                });
-                self.push_lir(Aarch64Inst::LdrFp {
-                    size: fp_size,
-                    dst: imag_reg,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X9,
-                        offset: imag_offset,
-                    },
-                });
-            }
-            Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::LdrFp {
-                    size: fp_size,
-                    dst: real_reg,
-                    addr: MemAddr::BaseOffset { base: r, offset: 0 },
-                });
-                self.push_lir(Aarch64Inst::LdrFp {
-                    size: fp_size,
-                    dst: imag_reg,
-                    addr: MemAddr::BaseOffset {
-                        base: r,
-                        offset: imag_offset,
-                    },
-                });
-            }
-            _ => {}
+        let base = self.aggregate_arg_address(arg);
+        for (dst, offset) in [(real_reg, 0), (imag_reg, imag_offset)] {
+            self.push_lir(Aarch64Inst::LdrFp {
+                size: fp_size,
+                dst,
+                addr: MemAddr::BaseOffset { base, offset },
+            });
         }
     }
 
@@ -1146,24 +875,28 @@ impl Aarch64CodeGen {
         dst: VReg,
         types: &TypeTable,
     ) {
-        let arg_loc = self.get_location(arg);
         let fp_size = elem.size;
         let delta = index as i32 * elem.bytes;
-        let holds_value = types.size_bits(typ) <= 64;
+        if types.size_bits(typ) > 64 {
+            let base = self.aggregate_arg_address(arg);
+            self.push_lir(Aarch64Inst::LdrFp {
+                size: fp_size,
+                dst,
+                addr: MemAddr::BaseOffset {
+                    base,
+                    offset: delta,
+                },
+            });
+            return;
+        }
 
-        match arg_loc {
+        match self.get_location(arg) {
+            // The slot holds the packed value, which is the aggregate's own
+            // bytes whether the pseudo names storage or not.
             ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => self.push_lir(Aarch64Inst::LdrFp {
                 size: fp_size,
                 dst,
                 addr: self.loc_mem_plus(l, delta).unwrap(),
-            }),
-            Loc::Reg(r) if !holds_value => self.push_lir(Aarch64Inst::LdrFp {
-                size: fp_size,
-                dst,
-                addr: MemAddr::BaseOffset {
-                    base: r,
-                    offset: delta,
-                },
             }),
             Loc::Reg(r) => {
                 let src = if index == 0 {

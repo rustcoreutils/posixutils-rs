@@ -461,9 +461,20 @@ impl Abi for SysVAmd64Abi {
         //                                     MEMORY. There is no XMM form; a
         //                                     value in an x87 slot cannot be
         //                                     moved through one.
+        //   _Float128 _Complex   32 bytes  -> SSE, SSEUP, SSE, SSEUP, which
+        //                                     the post-merger cleanup makes
+        //                                     MEMORY: over sixteen bytes only a
+        //                                     single SSE+SSEUP run survives.
+        //                                     The backend's `complex_sse_regs`
+        //                                     already answered no registers;
+        //                                     answering two here had `va_arg`
+        //                                     read it from the save area.
         if types.is_complex(ty) {
             let base_ty = types.complex_base(ty);
-            if types.kind(base_ty) == TypeKind::LongDouble {
+            if matches!(
+                types.kind(base_ty),
+                TypeKind::LongDouble | TypeKind::Float128
+            ) {
                 return ArgClass::Indirect {
                     align: 16,
                     size_bytes,

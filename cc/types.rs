@@ -1739,6 +1739,24 @@ impl TypeTable {
         }
     }
 
+    /// Whether a value of this type is made of members at offsets: a struct,
+    /// union or array, or a complex number (its real and imaginary halves).
+    ///
+    /// `kind()` alone cannot answer this, because a complex type carries its
+    /// *base's* kind -- `double _Complex` answers `TypeKind::Double` -- so a
+    /// site that asks only for `Struct | Union | Array` takes a complex value
+    /// for a scalar of its base type. The calling conventions lay a complex
+    /// value out as the equivalent two-member struct (a two-element HFA on
+    /// AAPCS64, its eightbytes classified as a struct's on System V), so
+    /// anything that follows the ABI's classification wants both here.
+    pub fn is_aggregate_or_complex(&self, id: TypeId) -> bool {
+        self.is_complex(id)
+            || matches!(
+                self.kind(id),
+                TypeKind::Struct | TypeKind::Union | TypeKind::Array
+            )
+    }
+
     /// Check if type is a scalar type (arithmetic or pointer)
     pub fn is_scalar(&self, id: TypeId) -> bool {
         self.is_arithmetic(id) || self.get(id).kind == TypeKind::Pointer
@@ -2672,6 +2690,33 @@ mod tests {
             Target::new(Arch::Aarch64, Os::Linux),
         ] {
             check_complex_round_trip(&target);
+        }
+    }
+
+    /// A complex type is a composite of its two halves even though `kind()`
+    /// answers its base's kind -- the reason the predicate exists.
+    #[test]
+    fn test_is_aggregate_or_complex() {
+        let mut types = TypeTable::new(&Target::new(Arch::X86_64, Os::Linux));
+        let complex_int = types.make_complex(types.int_id);
+        let array = types.intern(Type::array(types.int_id, 4));
+        for id in [
+            types.complex_float_id,
+            types.complex_double_id,
+            complex_int,
+            array,
+        ] {
+            assert!(types.is_aggregate_or_complex(id), "{id:?}");
+        }
+        let ptr = types.pointer_to(types.int_id);
+        for id in [
+            types.double_id,
+            types.int_id,
+            types.longdouble_id,
+            types.int128_id,
+            ptr,
+        ] {
+            assert!(!types.is_aggregate_or_complex(id), "{id:?}");
         }
     }
 

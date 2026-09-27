@@ -71,14 +71,14 @@ impl X86_64CodeGen {
 
         match addr_loc {
             Loc::Reg(r) => {
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Mem(MemAddr::BaseOffset {
+                self.push_fp_mem_load(
+                    fp_size,
+                    MemAddr::BaseOffset {
                         base: r,
                         offset: insn.displacement(),
-                    }),
-                    dst: XmmOperand::Reg(dst_xmm),
-                });
+                    },
+                    dst_xmm,
+                );
             }
             Loc::Stack(offset) => {
                 // Check if the address operand is a symbol (local variable) or a temp (spilled address)
@@ -86,11 +86,11 @@ impl X86_64CodeGen {
 
                 if is_symbol {
                     // Local variable - load directly from stack slot
-                    self.push_lir(X86Inst::MovFp {
-                        size: fp_size,
-                        src: XmmOperand::Mem(self.stack_mem(offset - insn.displacement())),
-                        dst: XmmOperand::Reg(dst_xmm),
-                    });
+                    self.push_fp_mem_load(
+                        fp_size,
+                        self.stack_mem(offset - insn.displacement()),
+                        dst_xmm,
+                    );
                 } else {
                     // Spilled address - load address first, then load from that address
                     self.push_lir(X86Inst::Mov {
@@ -98,35 +98,31 @@ impl X86_64CodeGen {
                         src: GpOperand::Mem(self.stack_mem(offset)),
                         dst: GpOperand::Reg(Reg::R11),
                     });
-                    self.push_lir(X86Inst::MovFp {
-                        size: fp_size,
-                        src: XmmOperand::Mem(MemAddr::BaseOffset {
+                    self.push_fp_mem_load(
+                        fp_size,
+                        MemAddr::BaseOffset {
                             base: Reg::R11,
                             offset: insn.displacement(),
-                        }),
-                        dst: XmmOperand::Reg(dst_xmm),
-                    });
+                        },
+                        dst_xmm,
+                    );
                 }
             }
             Loc::Global(name) => {
                 let src = self.global_mem(&name, insn.displacement(), Reg::R11);
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Mem(src),
-                    dst: XmmOperand::Reg(dst_xmm),
-                });
+                self.push_fp_mem_load(fp_size, src, dst_xmm);
             }
             _ => {
                 // Load address into R11, then load from that address
                 self.emit_move(addr, Reg::R11, 64);
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Mem(MemAddr::BaseOffset {
+                self.push_fp_mem_load(
+                    fp_size,
+                    MemAddr::BaseOffset {
                         base: Reg::R11,
                         offset: insn.displacement(),
-                    }),
-                    dst: XmmOperand::Reg(dst_xmm),
-                });
+                    },
+                    dst_xmm,
+                );
             }
         }
 
@@ -178,14 +174,14 @@ impl X86_64CodeGen {
             Loc::Reg(_) => {
                 // Use the saved register (R11 if it was RAX, otherwise original)
                 let r = addr_reg.unwrap_or(Reg::Rax);
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm15),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                self.push_fp_mem_store(
+                    fp_size,
+                    XmmReg::Xmm15,
+                    MemAddr::BaseOffset {
                         base: r,
                         offset: insn.displacement(),
-                    }),
-                });
+                    },
+                );
             }
             Loc::Stack(offset) => {
                 // Check if the address operand is a symbol (local variable) or a temp (spilled address)
@@ -193,11 +189,11 @@ impl X86_64CodeGen {
 
                 if is_symbol {
                     // Local variable - store directly to stack slot
-                    self.push_lir(X86Inst::MovFp {
-                        size: fp_size,
-                        src: XmmOperand::Reg(XmmReg::Xmm15),
-                        dst: XmmOperand::Mem(self.stack_mem(offset - insn.displacement())),
-                    });
+                    self.push_fp_mem_store(
+                        fp_size,
+                        XmmReg::Xmm15,
+                        self.stack_mem(offset - insn.displacement()),
+                    );
                 } else {
                     // Spilled address - load address first, then store through it
                     self.push_lir(X86Inst::Mov {
@@ -205,37 +201,89 @@ impl X86_64CodeGen {
                         src: GpOperand::Mem(self.stack_mem(offset)),
                         dst: GpOperand::Reg(Reg::R11),
                     });
-                    self.push_lir(X86Inst::MovFp {
-                        size: fp_size,
-                        src: XmmOperand::Reg(XmmReg::Xmm15),
-                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                    self.push_fp_mem_store(
+                        fp_size,
+                        XmmReg::Xmm15,
+                        MemAddr::BaseOffset {
                             base: Reg::R11,
                             offset: insn.displacement(),
-                        }),
-                    });
+                        },
+                    );
                 }
             }
             Loc::Global(name) => {
                 let dst = self.global_mem(&name, insn.displacement(), Reg::R11);
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm15),
-                    dst: XmmOperand::Mem(dst),
-                });
+                self.push_fp_mem_store(fp_size, XmmReg::Xmm15, dst);
             }
             _ => {
                 // Load address into R11, then store
                 self.emit_move(addr, Reg::R11, 64);
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm15),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                self.push_fp_mem_store(
+                    fp_size,
+                    XmmReg::Xmm15,
+                    MemAddr::BaseOffset {
                         base: Reg::R11,
                         offset: insn.displacement(),
-                    }),
-                });
+                    },
+                );
             }
         }
+    }
+
+    /// Load a `size` value from `src` into `dst`.
+    ///
+    /// binary16 has no SSE2 load of its own width: `movss` reads four bytes,
+    /// two of them past the value, which can fault at the end of a page. It is
+    /// read as a word into R10 (a codegen scratch register) and moved across,
+    /// as gcc does, which also leaves the register's upper bits zero.
+    fn push_fp_mem_load(&mut self, size: FpSize, src: MemAddr, dst: XmmReg) {
+        if size != FpSize::Half {
+            self.push_lir(X86Inst::MovFp {
+                size,
+                src: XmmOperand::Mem(src),
+                dst: XmmOperand::Reg(dst),
+            });
+            return;
+        }
+        self.push_lir(X86Inst::Movzx {
+            src_size: OperandSize::B16,
+            dst_size: OperandSize::B32,
+            src: GpOperand::Mem(src),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::MovGpXmm {
+            size: OperandSize::B32,
+            src: Reg::R10,
+            dst,
+        });
+    }
+
+    /// Store the `size` value in `src` to `dst`.
+    ///
+    /// binary16 has no SSE2 store of its own width, and `movss` writes four
+    /// bytes: storing one half of a `_Float16 _Complex`, or one member of a
+    /// struct of `_Float16`s, overwrote the next one. It goes through R10's
+    /// low word instead, as gcc does (SSE4.1's `pextrw` to memory is not in
+    /// the x86-64 baseline).
+    fn push_fp_mem_store(&mut self, size: FpSize, src: XmmReg, dst: MemAddr) {
+        if size != FpSize::Half {
+            self.push_lir(X86Inst::MovFp {
+                size,
+                src: XmmOperand::Reg(src),
+                dst: XmmOperand::Mem(dst),
+            });
+            return;
+        }
+        self.push_lir(X86Inst::MovXmmGp {
+            size: OperandSize::B32,
+            src,
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B16,
+            src: GpOperand::Reg(Reg::R10),
+            dst: GpOperand::Mem(dst),
+        });
     }
 
     /// Emit floating-point binary operation (addss/addsd, subss/subsd, etc.)

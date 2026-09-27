@@ -5527,6 +5527,60 @@ int main(void) {
     assert_eq!(compile_and_run("codegen_float16_mega", code, &[]), 0);
 }
 
+/// A `_Float16` store writes two bytes, not four.
+///
+/// x86-64 stored a half with `movss`, which writes four bytes: assigning one
+/// member of a struct of `_Float16`s overwrote the next member, and storing
+/// the imaginary half of a `_Float16 _Complex` wrote two bytes past the
+/// object. SSE2 has no two-byte store from an XMM register, so the value
+/// goes through a general register, as gcc does.
+#[test]
+fn codegen_float16_store_writes_two_bytes() {
+    let code = r#"
+typedef _Float16 _Complex hc;
+struct S { _Float16 a, b, c, d; };
+_Float16 g[4] = {1, 2, 3, 4};
+__attribute__((noinline)) void member(struct S *p, _Float16 v) { p->b = v; }
+__attribute__((noinline)) void global(_Float16 v) { g[1] = v; }
+__attribute__((noinline)) void whole(hc *p, hc v) { *p = v; }
+__attribute__((noinline)) void imag(hc *p, _Float16 v) { __imag__ *p = v; }
+__attribute__((noinline)) void real(hc *p, _Float16 v) { __real__ *p = v; }
+static hc mk(int r, int i) { return __builtin_complex((_Float16)r, (_Float16)i); }
+int main(void) {
+    struct S s = {1, 2, 3, 4};
+    member(&s, 9);
+    if (s.a != 1 || s.b != 9 || s.c != 3 || s.d != 4) return 1;
+    global(9);
+    if (g[0] != 1 || g[1] != 9 || g[2] != 3 || g[3] != 4) return 2;
+    hc arr[3] = {mk(1, 2), mk(3, 4), mk(5, 6)};
+    whole(&arr[1], mk(7, 8));
+    if (__imag__ arr[0] != 2 || __real__ arr[1] != 7 || __imag__ arr[1] != 8
+        || __real__ arr[2] != 5)
+        return 3;
+    imag(&arr[0], 10);
+    if (__real__ arr[0] != 1 || __imag__ arr[0] != 10 || __real__ arr[1] != 7) return 4;
+    real(&arr[1], 11);
+    if (__real__ arr[1] != 11 || __imag__ arr[1] != 8 || __real__ arr[2] != 5) return 5;
+    /* A local struct's member, addressed from the frame. */
+    struct S t = {1, 2, 3, 4};
+    volatile _Float16 v = 9;
+    t.b = v;
+    if (t.a != 1 || t.b != 9 || t.c != 3) return 6;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("float16_store{opt}"), code, &[opt.to_string()]),
+            0,
+            "host {opt}"
+        );
+        if let Some(rc) = compile_and_run_aarch64(&format!("float16_store_a64{opt}"), code, opt) {
+            assert_eq!(rc, 0, "aarch64 {opt}");
+        }
+    }
+}
+
 /// Test that the AddC→AdcC carry chain survives optimization.
 /// The optimizer must not insert flag-clobbering instructions between
 /// the add-with-carry pair. This test exercises large int128 values

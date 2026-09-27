@@ -16132,21 +16132,31 @@ static int *mine(void)
     return &s.a;
 }
 
+/* Compare values, not addresses: once a thread exits its copy is freed, and
+   on Darwin, where thread-local storage is allocated on first use, main's
+   copy can then land at the same address. */
 static void *other(void *arg)
 {
     (void)arg;
-    return mine();
+    int *p = mine();
+    if (*p != 0)
+        return (void *)1;       /* a fresh copy starts at zero */
+    *p = 2;
+    return (void *)(long)*mine();
 }
 
 int main(void)
 {
     pthread_t t;
     void *theirs;
+    *mine() = 1;
     if (pthread_create(&t, 0, other, 0) != 0)
         return 1;
     if (pthread_join(t, &theirs) != 0)
         return 2;
-    return theirs != (void *)mine() ? 0 : 3;
+    if (theirs != (void *)2)
+        return 3;               /* the thread did not keep its own write */
+    return *mine() == 1 ? 0 : 4;  /* main's copy is untouched */
 }
 "#;
     // The host only: `<pthread.h>` is a host header.

@@ -180,6 +180,14 @@ pub enum LibFn {
     Putchar,
     Fputc,
     Fwrite,
+    /// libgcc's `__mul?c3`, which a floating complex `*` calls, for the
+    /// format its arguments are in. No program names it: the linearizer
+    /// makes the call (`emit_complex_float_muldiv`), so it has no row in the
+    /// library-builtin table.
+    MulComplex,
+    /// libgcc's `__div?c3`, which a floating complex `/` calls; as
+    /// [`LibFn::MulComplex`].
+    DivComplex,
 }
 
 impl LibFn {

@@ -350,7 +350,7 @@ impl LibFn {
         LIBRARY_BUILTINS
             .iter()
             .find(|lb| lb.called() == Some(self))
-            .expect("every LibFn has a row")
+            .expect("every LibFn a program can call has a row")
             .return_type(t)
     }
 }

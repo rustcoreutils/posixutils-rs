@@ -23,11 +23,14 @@
 // that read strings and compute a value; `copies` has `strcpy` and its kin,
 // which write one, and fold to a `memcpy` of a known length; `stdio` has
 // `printf` and its kin, whose result must be unused, and which become calls
-// that print the same bytes. `memory` is the one family that rewrites an IR
-// operation rather than a call: a `Memmove` whose source and destination
-// cannot overlap becomes a `Memcpy`, in place.
+// that print the same bytes; `complex` has libgcc's `__mul?c3` and
+// `__div?c3`, which a floating complex `*` and `/` call, and whose result is
+// written where the call would have written it. `memory` is the one family
+// that rewrites an IR operation rather than a call: a `Memmove` whose source
+// and destination cannot overlap becomes a `Memcpy`, in place.
 //
 
+mod complex;
 mod copies;
 mod memory;
 mod stdio;
@@ -40,6 +43,7 @@ use super::memloc::{AddrMap, MemBase, ModuleInfo};
 use super::strdata::{ConstBytes, LocalBytes, StrReader};
 use super::{string_label, Function, Instruction, Opcode, PseudoId};
 use crate::abi::CallingConv;
+use crate::float::FloatVal;
 use crate::parse::ast::{CalleeBinding, LibFn};
 use crate::target::Target;
 use crate::token::lexer::bytes_payload;
@@ -121,6 +125,8 @@ pub(crate) enum Folded {
     /// For a call whose result is unused: nothing, or a call to another
     /// library function that does the same thing.
     Discard(Option<NewCall>),
+    /// A complex result, written where the call returns it.
+    Complex(FloatVal, FloatVal),
 }
 
 /// One byte of a comparison.
@@ -152,6 +158,7 @@ pub(crate) enum Operand {
 /// What a fold may ask about the function its call is in.
 pub(crate) struct Facts<'a> {
     pub(crate) types: &'a TypeTable,
+    pub(crate) target: &'a Target,
     consts: &'a ConstMap,
     am: &'a AddrMap,
     func: &'a Function,
@@ -172,6 +179,13 @@ impl Facts<'_> {
             insns.flat_map(Instruction::uses).collect()
         });
         !used.contains(&t)
+    }
+
+    /// The float constant `p` holds, of the format `typ` is in.
+    pub(crate) fn float(&self, p: PseudoId, typ: TypeId) -> Option<FloatVal> {
+        let fmt = self.types.fp_format(typ)?;
+        let v = self.consts.fget(p, self.types.size_bits(typ))?;
+        Some(v.round_to_format(fmt))
     }
 
     /// The constant `p` holds, read as an unsigned `bits`-bit value.
@@ -229,6 +243,7 @@ fn collect(func: &Function, ctx: &FoldCtx) -> Vec<Site> {
             };
             let facts = Facts {
                 types: ctx.types,
+                target: ctx.target,
                 consts: &consts,
                 am: &am,
                 func,
@@ -282,6 +297,7 @@ fn fold(known: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded> {
         | L::VfprintfChk
         | L::Fputs
         | L::FputsUnlocked => stdio::fold(known, insn, facts),
+        L::MulComplex | L::DivComplex => complex::fold(known, insn, facts),
         _ => None,
     }
 }
@@ -344,6 +360,10 @@ fn materialize(b: &mut Builder, ctx: &FoldCtx, call: &Instruction, folded: Folde
         copies::materialize(b, ctx, write, result);
         return;
     }
+    if let Folded::Complex(re, im) = folded {
+        complex::materialize(b, call, (re, im));
+        return;
+    }
     if let Folded::Discard(new) = folded {
         if let Some(new) = new {
             let ret = new.func.return_type(b.types);
@@ -378,7 +398,9 @@ fn materialize(b: &mut Builder, ctx: &FoldCtx, call: &Instruction, folded: Folde
             make_call(b, ctx, Some(target), typ, new);
             return;
         }
-        Folded::Write(_) | Folded::Discard(_) => unreachable!("materialized above"),
+        Folded::Write(_) | Folded::Discard(_) | Folded::Complex(..) => {
+            unreachable!("materialized above")
+        }
     };
     b.copy_into(target, value, typ, size);
 }
@@ -448,18 +470,18 @@ pub(super) mod tests {
     /// folds added.
     fn with_ctx<R>(
         fx: &Fixture,
+        target: &Target,
         callees: &[(&'static str, &str)],
         f: impl FnOnce(&FoldCtx) -> R,
     ) -> (R, Vec<(String, String)>) {
         let bytes = ConstBytes::build(&fx.module, &fx.types);
         let mi = ModuleInfo::build(&fx.module, &fx.types);
-        let target = Target::host();
         let callees: HashMap<&'static str, String> =
             callees.iter().map(|&(c, a)| (c, a.to_string())).collect();
         let literals = NewLiterals::new(&fx.module.strings);
         let answer = f(&FoldCtx {
             types: &fx.types,
-            target: &target,
+            target,
             mi: &mi,
             bytes: &bytes,
             callees: &callees,
@@ -471,7 +493,7 @@ pub(super) mod tests {
     /// What each known call in `fx` that folds folds to, by its index in
     /// the block.
     pub(in crate::ir::libcall_fold) fn folds(fx: &Fixture) -> Vec<(usize, Folded)> {
-        let (folds, _) = with_ctx(fx, &[], |ctx| {
+        let (folds, _) = with_ctx(fx, &Target::host(), &[], |ctx| {
             collect(&fx.module.functions[0], ctx)
                 .into_iter()
                 .map(|((_, i), folded)| (i, folded))
@@ -487,8 +509,24 @@ pub(super) mod tests {
         fx: &mut Fixture,
         callees: &[(&'static str, &str)],
     ) -> Vec<Instruction> {
+        run_with(fx, &Target::host(), callees)
+    }
+
+    /// Fold `fx`'s function for `target`, and hand back its instructions.
+    pub(in crate::ir::libcall_fold) fn run_for(
+        fx: &mut Fixture,
+        target: &Target,
+    ) -> Vec<Instruction> {
+        run_with(fx, target, &[])
+    }
+
+    fn run_with(
+        fx: &mut Fixture,
+        target: &Target,
+        callees: &[(&'static str, &str)],
+    ) -> Vec<Instruction> {
         let mut func = std::mem::take(&mut fx.module.functions[0]);
-        let (_, added) = with_ctx(fx, callees, |ctx| run(&mut func, ctx));
+        let (_, added) = with_ctx(fx, target, callees, |ctx| run(&mut func, ctx));
         fx.module.strings.extend(added);
         let insns = func.blocks[0].insns.clone();
         fx.module.functions[0] = func;

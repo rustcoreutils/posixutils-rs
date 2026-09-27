@@ -59,7 +59,7 @@ The compiler pipeline:
 ```
 Source → Lexer → Preprocessor → Parser → Type Check → Linearize
        → Mapping (target lowering) → Optimize
-       → Library calls (libm fallbacks, binary128 soft-float)
+       → Library calls (libm fallbacks, binary128 and x86-64 _Float16 soft-float)
        → Lower (φ → copies) → Codegen → Assembly
 ```
 

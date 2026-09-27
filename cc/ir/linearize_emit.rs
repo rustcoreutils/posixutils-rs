@@ -14,7 +14,7 @@ use crate::abi::get_abi_for_conv;
 use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
-use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, FpCompare, MathErrno, UnaryOp};
+use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, FpCompare, LibFn, MathErrno, UnaryOp};
 use crate::strings::StringId;
 use crate::types::{MemberInfo, TypeId, TypeKind};
 
@@ -1479,15 +1479,21 @@ impl<'a> super::linearize::Linearizer<'a> {
             .types
             .complex_routine_type(base_typ)
             .expect("a non-integral complex type has a floating base");
-        let func_name = match op {
-            BinaryOp::Mul => crate::arch::mapping::complex_mul_name(routine),
-            _ => crate::arch::mapping::complex_div_name(routine),
+        let routine_fn = match op {
+            BinaryOp::Mul => (
+                LibFn::MulComplex,
+                crate::arch::mapping::complex_mul_name(routine),
+            ),
+            _ => (
+                LibFn::DivComplex,
+                crate::arch::mapping::complex_div_name(routine),
+            ),
         };
         let mut widen = |v| self.emit_convert(v, base_typ, work_typ);
         let left = (widen(left.0), widen(left.1));
         let right = (widen(right.0), widen(right.1));
         let call_result = self.emit_complex_rtlib_call(
-            func_name,
+            routine_fn,
             left,
             right,
             work_typ,
@@ -1927,10 +1933,14 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// `_Float128 _Complex` result back through the hidden pointer -- the
     /// type is MEMORY class -- which is what gcc calls it with.
     ///
+    /// The call is tagged with the routine it calls (`routine_fn`: the
+    /// `LibFn` and its name), so that `ir::libcall_fold` can compute it when
+    /// its operands are constant.
+    ///
     /// Returns the address where the complex result is stored.
     pub(crate) fn emit_complex_rtlib_call(
         &mut self,
-        func_name: &str,
+        routine_fn: (LibFn, &str),
         left: (PseudoId, PseudoId),
         right: (PseudoId, PseudoId),
         base_typ: TypeId,
@@ -1938,6 +1948,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) -> PseudoId {
         let (left_real, left_imag) = left;
         let (right_real, right_imag) = right;
+        let (known, func_name) = routine_fn;
         let sret = self.returns_via_hidden_pointer(complex_typ);
 
         // The result's storage, and the hidden pointer to it if there is one.
@@ -1987,6 +1998,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             )
         };
         call_insn.abi_info = Some(call_abi_info);
+        call_insn.known = Some(known);
         self.emit(call_insn);
 
         result_sym

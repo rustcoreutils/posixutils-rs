@@ -1241,8 +1241,9 @@ fn process_file(
     opt::optimize_module(&mut module, &types, args.optimization(), target);
 
     // An opcode the target computes by a library call -- a libm function it
-    // has no instruction for, or any binary128 operation -- becomes that call
-    // after the optimizer, which could still fold it.
+    // has no instruction for, any binary128 operation, or an x86-64
+    // `_Float16` one -- becomes that call after the optimizer, which could
+    // still fold it.
     arch::mapping::call_library_fallbacks(&mut module, &types, target);
 
     dump_ir(args, &module, &types, "post-opt");

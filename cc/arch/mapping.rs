@@ -48,6 +48,15 @@ pub trait ArchMapper {
     /// on a value in format `fmt` with its own instructions. Where it does
     /// not, [`call_library_fallbacks`] calls the library function instead.
     fn computes_in_place(&self, op: Opcode, fmt: FpFormat) -> bool;
+
+    /// The calls that compute `insn` where this target has no instruction
+    /// for a format it computes in software, apart from binary128 -- which
+    /// every target computes that way ([`map_binary128`]). Asked by
+    /// [`call_library_fallbacks`], after the optimizer; `None` when `insn`
+    /// is not such an operation.
+    fn software_float(&self, _insn: &Instruction, _ctx: &mut MappingCtx<'_>) -> Option<MappedInsn> {
+        None
+    }
 }
 
 /// Whether `target` computes the libm opcode `op` in format `fmt` in place.
@@ -64,8 +73,9 @@ pub fn computes_in_place(op: Opcode, fmt: FpFormat, target: &Target) -> bool {
 /// Two kinds of opcode are computed that way: a libm opcode
 /// ([`Opcode::is_libm`]) the target has no instruction for, which calls the
 /// library function it names, and any arithmetic, comparison or conversion
-/// on an IEEE binary128 value, which no target has hardware for and which
-/// calls libgcc's soft-float routine ([`map_binary128`]).
+/// on a format the target has no hardware for, which calls libgcc's
+/// soft-float routines: IEEE binary128 on every target ([`map_binary128`]),
+/// and `_Float16` on x86-64 ([`ArchMapper::software_float`]).
 ///
 /// Runs after the optimizer rather than with [`run_mapping`], so that the
 /// opcode is still there to be folded, merged or deleted as a value: a call
@@ -96,6 +106,11 @@ pub(crate) fn library_call(
         }
         let call = build_binop_rtlib_call(insn, insn.library_callee(), ctx.types, ctx.target);
         return MappedInsn::Replace(vec![call]);
+    }
+    // First, so that a conversion between `_Float16` and binary128 is the
+    // one routine for the pair rather than a binary128 one.
+    if let Some(mapped) = mapper.software_float(insn, ctx) {
+        return mapped;
     }
     map_binary128(insn, ctx).unwrap_or(MappedInsn::Legal)
 }

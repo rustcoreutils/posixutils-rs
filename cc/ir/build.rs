@@ -18,6 +18,7 @@
 use super::constfold::at_width;
 use super::{Function, Instruction, Opcode, Pseudo, PseudoId};
 use crate::diag::Position;
+use crate::float::FloatVal;
 use crate::types::{TypeId, TypeTable};
 
 /// The instructions that replace one instruction, appended to `out` in
@@ -65,6 +66,19 @@ impl<'a> Builder<'a> {
     /// that gives it its width.
     pub(crate) fn constant(&mut self, v: i128, typ: TypeId, size: u32) -> PseudoId {
         let id = self.func.create_const_pseudo(at_width(v, size, true));
+        self.push(
+            Instruction::new(Opcode::SetVal)
+                .with_target(id)
+                .with_type_and_size(typ, size),
+        );
+        id
+    }
+
+    /// A new float constant of `typ` at `size` bits, with the `SetVal` that
+    /// gives it its width -- without one it would be read at 64 bits.
+    pub(crate) fn float_constant(&mut self, v: FloatVal, typ: TypeId, size: u32) -> PseudoId {
+        let id = self.func.alloc_pseudo();
+        self.func.add_pseudo(Pseudo::fval(id, v));
         self.push(
             Instruction::new(Opcode::SetVal)
                 .with_target(id)

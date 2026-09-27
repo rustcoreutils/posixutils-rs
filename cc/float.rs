@@ -1700,6 +1700,10 @@ impl FloatVal {
 /// A complex value: its real half, then its imaginary half.
 pub type Complex = (FloatVal, FloatVal);
 
+/// The four halves of a complex operation's operands, `(a, b, c, d)` of
+/// `(a + bi) op (c + di)`.
+type Operands = (FloatVal, FloatVal, FloatVal, FloatVal);
+
 /// A format whose floating complex `*` and `/` c17 computes by calling
 /// libgcc's `__mul?c3` and `__div?c3` for that format.
 ///
@@ -1773,14 +1777,28 @@ impl FpFormat {
 // - aarch64 libgcc is built with floating contraction, and `__divdc3` fuses
 //   each `x * ratio + y` into one `fmadd`, so a `double _Complex` quotient
 //   there can differ in its last place (about a third of random ones do).
-//   The multiplications fuse only inside the infinity recovery, where the
-//   result is scaled by an infinity; `__divsc3`'s fused `double` steps are
-//   rounded to `float` afterwards and were not seen to differ; binary128 is
-//   software and fuses nothing; nothing on x86-64 fuses.
+//   [`Contraction::Fused`] computes those steps as aarch64 does, for a
+//   caller that must match its run-time result exactly. The rest fuse to no
+//   effect: the multiplications fuse only inside the infinity recovery,
+//   where each fused product is exact or is added to a zero, so only a
+//   NaN's sign can come out different; `__divsc3`'s fused `double` steps
+//   multiply `float`s, which `double` holds exactly; binary128 is software
+//   and fuses nothing; nothing on x86-64 fuses.
 // - gcc folds a complex constant with MPC, correctly rounded, and can differ
 //   from its own run-time result -- and so from this -- where `ac - bd`
 //   cancels.
 // - Apple's `__divdc3` is compiler-rt's, which scales by `logb` instead.
+/// How a target's `__div?c3` computes a product that feeds a sum, `x * y +
+/// z`, in Smith's method.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Contraction {
+    /// The product is rounded, then the sum: x86-64's libgcc, and every
+    /// binary128 routine, which is software.
+    Separate,
+    /// One `fmadd`, rounded once: aarch64's libgcc.
+    Fused,
+}
+
 impl FloatVal {
     /// `1` or `0`, as `isinf(v) ? 1 : 0`, carrying `v`'s sign: how libgcc
     /// "boxes" an infinite operand before recomputing.
@@ -1810,13 +1828,27 @@ impl FloatVal {
     /// `(a + bi) * (c + di)` with halves in `fmt`, as the program computes
     /// it: by the `__mul?c3` of `fmt`'s routine format, and rounded back.
     pub fn complex_mul(x: Complex, y: Complex, fmt: FpFormat) -> Complex {
-        Self::through_routine(x, y, fmt, Self::routine_mul)
+        Self::through_routine(x, y, fmt, |x, y, r| Some(Self::routine_mul(x, y, r)))
+            .expect("a multiplication always computes")
     }
 
     /// `(a + bi) / (c + di)` with halves in `fmt`, as the program computes
     /// it: by the `__div?c3` of `fmt`'s routine format, and rounded back.
     pub fn complex_div(x: Complex, y: Complex, fmt: FpFormat) -> Complex {
-        Self::through_routine(x, y, fmt, Self::routine_div)
+        Self::complex_div_by(x, y, fmt, Contraction::Separate)
+            .expect("separate steps always compute")
+    }
+
+    /// [`complex_div`](Self::complex_div) by a `__div?c3` that contracts
+    /// as `contraction` says; `None` where a fused step is not computed
+    /// here (see `mul_add`).
+    pub fn complex_div_by(
+        x: Complex,
+        y: Complex,
+        fmt: FpFormat,
+        contraction: Contraction,
+    ) -> Option<Complex> {
+        Self::through_routine(x, y, fmt, |x, y, r| Self::routine_div(x, y, r, contraction))
     }
 
     /// `op` applied in `fmt`'s routine format, as c17's lowering applies it:
@@ -1826,13 +1858,37 @@ impl FloatVal {
         x: Complex,
         y: Complex,
         fmt: FpFormat,
-        op: fn(Complex, Complex, ComplexRoutineFormat) -> Complex,
-    ) -> Complex {
+        op: impl FnOnce(Complex, Complex, ComplexRoutineFormat) -> Option<Complex>,
+    ) -> Option<Complex> {
         let routine = fmt.complex_routine_format();
         let wide = routine.format();
         let w = |v: Self| v.convert(fmt, wide);
-        let (re, im) = op((w(x.0), w(x.1)), (w(y.0), w(y.1)), routine);
-        (re.convert(wide, fmt), im.convert(wide, fmt))
+        let (re, im) = op((w(x.0), w(x.1)), (w(y.0), w(y.1)), routine)?;
+        Some((re.convert(wide, fmt), im.convert(wide, fmt)))
+    }
+
+    /// `x * y + z` in `fmt`, as a routine built with `contraction` computes
+    /// it.
+    ///
+    /// Fused, it is rounded once, which [`Self::fma`] computes for finite
+    /// operands. With an infinite or NaN factor the product is exact, so
+    /// fusing changes nothing; with an infinite or NaN addend it changes
+    /// nothing either while the rounded product is finite. What is left --
+    /// a result that overflows, or a product that overflows only once
+    /// rounded -- is `None`.
+    fn mul_add(x: Self, y: Self, z: Self, fmt: FpFormat, contraction: Contraction) -> Option<Self> {
+        let product = x.mul(y, fmt);
+        let separate = product.add(z, fmt);
+        if contraction == Contraction::Separate {
+            return Some(separate);
+        }
+        if x.is_finite() && y.is_finite() && z.is_finite() {
+            x.fma(y, z, fmt)
+        } else if !x.is_finite() || !y.is_finite() || product.is_finite() {
+            Some(separate)
+        } else {
+            None
+        }
     }
 
     /// `(a + bi) * (c + di)` as `__mul?c3` computes it: `(ac - bd) +
@@ -1889,7 +1945,12 @@ impl FloatVal {
     /// through by the larger half of the divisor, with libgcc's scaling
     /// against overflow and underflow. Annex G's recovery of an infinity or a
     /// zero that came out NaN + NaNi follows.
-    fn routine_div(x: Complex, y: Complex, routine: ComplexRoutineFormat) -> Complex {
+    fn routine_div(
+        x: Complex,
+        y: Complex,
+        routine: ComplexRoutineFormat,
+        contraction: Contraction,
+    ) -> Option<Complex> {
         let fmt = routine.format();
         let (a, b, c, d) = (x.0, x.1, y.0, y.1);
         let ((re, im), (a, b, c, d)) = match routine.div_working_format() {
@@ -1900,12 +1961,17 @@ impl FloatVal {
                 let im = b.mul(c, wide).sub(a.mul(d, wide), wide).div(denom, wide);
                 ((re.convert(wide, fmt), im.convert(wide, fmt)), (a, b, c, d))
             }
-            None => Self::smith_div((a, b), (c, d), fmt),
+            None => Self::smith_div((a, b), (c, d), fmt, contraction)?,
         };
         if !(re.is_nan() && im.is_nan()) {
-            return (re, im);
+            return Some((re, im));
         }
+        Some(Self::recover_quotient((re, im), (a, b, c, d), fmt))
+    }
 
+    /// Annex G's recovery of a quotient `(re, im)` that came out NaN + NaNi,
+    /// from the operands as `__div?c3` left them.
+    fn recover_quotient((re, im): Complex, (a, b, c, d): Operands, fmt: FpFormat) -> Complex {
         let inf = Self::infinity(false);
         let zero = FloatVal::ZERO;
         if c.is_zero() && d.is_zero() && (!a.is_nan() || !b.is_nan()) {
@@ -1932,7 +1998,16 @@ impl FloatVal {
     /// The Smith's-method half of [`complex_div`](Self::complex_div): the
     /// quotient before Annex G's recovery, and the four operands as scaled
     /// here, since libgcc scales them in place and recovers from those.
-    fn smith_div(x: Complex, y: Complex, fmt: FpFormat) -> (Complex, (Self, Self, Self, Self)) {
+    ///
+    /// Every product here feeds a sum, and each is where aarch64 fuses: the
+    /// denominator `small * ratio + big`, and each numerator's product with
+    /// the half it is added to or subtracted from.
+    fn smith_div(
+        x: Complex,
+        y: Complex,
+        fmt: FpFormat,
+        contraction: Contraction,
+    ) -> Option<(Complex, Operands)> {
         let (mut a, mut b) = x;
         let (c, d) = y;
         let p = fmt.precision() as i32;
@@ -1964,28 +2039,30 @@ impl FloatVal {
             (big, small) = (big.mul(rminscal, fmt), small.mul(rminscal, fmt));
         }
 
+        let mul_add = |x, y, z| Self::mul_add(x, y, z, fmt, contraction);
         let ratio = small.div(big, fmt);
-        let denom = small.mul(ratio, fmt).add(big, fmt);
+        let denom = mul_add(small, ratio, big)?;
         // The numerators in the order libgcc writes them. `ratio` below the
         // smallest normal is computed the other way round, dividing first, so
         // its subnormal precision is not what the products are built from.
         let ratio_is_normal = rmin.magnitude_below(ratio);
-        let scaled = |v: Self| {
+        // `v * r + z`, where `v * r` is `v` scaled.
+        let scaled_plus = |v: Self, z| {
             if ratio_is_normal {
-                v.mul(ratio, fmt)
+                mul_add(v, ratio, z)
             } else {
-                small.mul(v.div(big, fmt), fmt)
+                mul_add(v.div(big, fmt), small, z)
             }
         };
         let (re, im) = if swapped {
             // |c| < |d|: ((a*r + b) + (b*r - a)i) / (c*r + d), r = c/d.
-            (scaled(a).add(b, fmt), scaled(b).sub(a, fmt))
+            (scaled_plus(a, b)?, scaled_plus(b, a.negated())?)
         } else {
             // |c| >= |d|: ((b*r + a) + (b - a*r)i) / (d*r + c), r = d/c.
-            (scaled(b).add(a, fmt), b.sub(scaled(a), fmt))
+            (scaled_plus(b, a)?, scaled_plus(a.negated(), b)?)
         };
         let (c, d) = if swapped { (small, big) } else { (big, small) };
-        ((re.div(denom, fmt), im.div(denom, fmt)), (a, b, c, d))
+        Some(((re.div(denom, fmt), im.div(denom, fmt)), (a, b, c, d)))
     }
 }
 
@@ -3150,6 +3227,82 @@ mod tests {
         assert_eq!((re.to_f64() as f32, im.to_f64() as f32), (0.44f32, 0.08f32));
         let (re, im) = FloatVal::complex_div((v(1.0), v(1.0)), (v(1.0), v(-1.0)), fmt);
         assert_eq!((re, im), (FloatVal::ZERO, v(1.0)));
+    }
+
+    /// `__divdc3` as x86-64's libgcc (separate) and aarch64's (fused)
+    /// compute it: each row is four operand halves and the quotient each
+    /// target's routine returned, in both of Smith's arms and with a ratio
+    /// below the smallest normal.
+    #[test]
+    fn complex_div_contracts_as_each_libgcc_does() {
+        let fmt = FpFormat::Binary64;
+        let v = FloatVal::from_f64;
+        let rows: [([f64; 4], [u64; 2], [u64; 2]); 4] = [
+            (
+                [1.0, 1.0, 3.0, 7.0],
+                [0x3fc6_11a7_b961_1a7c, 0xbfb1_a7b9_611a_7b96],
+                [0x3fc6_11a7_b961_1a7b, 0xbfb1_a7b9_611a_7b95],
+            ),
+            (
+                [1.0, 1.0, 7.0, 3.0],
+                [0x3fc6_11a7_b961_1a7c, 0x3fb1_a7b9_611a_7b96],
+                [0x3fc6_11a7_b961_1a7b, 0x3fb1_a7b9_611a_7b95],
+            ),
+            (
+                [0.1, 0.7, 3.0, f64::from_bits(1 << 14)],
+                [0x3fa1_1111_1111_1111, 0x3fcd_dddd_dddd_dddd],
+                [0x3fa1_1111_1111_1111, 0x3fcd_dddd_dddd_dddd],
+            ),
+            (
+                [
+                    f64::from_bits(24),
+                    0.3,
+                    f64::powi(2.0, -1000),
+                    f64::from_bits(1 << 14),
+                ],
+                [0x7a93_3333_3333_3333, 0x7e53_3333_3333_3333],
+                [0x7a93_3333_3333_3333, 0x7e53_3333_3333_3333],
+            ),
+        ];
+        for ([a, b, c, d], separate, fused) in rows {
+            let (x, y) = ((v(a), v(b)), (v(c), v(d)));
+            for (contraction, want) in [
+                (Contraction::Separate, separate),
+                (Contraction::Fused, fused),
+            ] {
+                let (re, im) = FloatVal::complex_div_by(x, y, fmt, contraction).unwrap();
+                let got = [re, im].map(|h| h.to_bits(fmt) as u64);
+                assert_eq!(got, want, "{contraction:?} ({a} + {b}i) / ({c} + {d}i)");
+            }
+        }
+    }
+
+    /// Fused, a step whose operand is infinite or NaN rounds as the separate
+    /// one does, since its product is exact; one whose fused result
+    /// overflows is not computed.
+    #[test]
+    fn complex_div_fused_steps_outside_the_finite_range() {
+        let fmt = FpFormat::Binary64;
+        let v = FloatVal::from_f64;
+        let inf = FloatVal::infinity(false);
+        for (x, y) in [
+            ((inf, v(1.0)), (v(1.0), v(1.0))),
+            ((FloatVal::nan(), v(1.0)), (v(3.0), v(7.0))),
+            ((v(1.0), v(1.0)), (v(3.0), inf)),
+        ] {
+            let fused = FloatVal::complex_div_by(x, y, fmt, Contraction::Fused).unwrap();
+            let separate = FloatVal::complex_div(x, y, fmt);
+            assert_eq!(
+                [fused.0.key(), fused.1.key()],
+                [separate.0.key(), separate.1.key()]
+            );
+        }
+        let max = v(f64::MAX);
+        let y = (v(1.0), v(0.5));
+        assert_eq!(
+            FloatVal::complex_div_by((max, max), y, fmt, Contraction::Fused),
+            None
+        );
     }
 
     // Square root

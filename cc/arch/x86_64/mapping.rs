@@ -36,11 +36,15 @@ impl ArchMapper for X86_64Mapper {
         if let Some(r) = map_int128_float_convert(insn, ctx) {
             return r;
         }
-        // x86-64 only: Float16 soft-float → expand
-        if let Some(r) = self.map_float16(insn, ctx) {
-            return r;
-        }
         MappedInsn::Legal
+    }
+
+    /// `_Float16`: the baseline has no half-precision instructions, so its
+    /// arithmetic, comparisons and conversions go through `float` and
+    /// libgcc's `__extendhf*`/`__trunc*hf2`. Lowered after the optimizer, so
+    /// that constant `_Float16` arithmetic folds.
+    fn software_float(&self, insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Option<MappedInsn> {
+        self.map_float16(insn, ctx)
     }
 
     /// SSE2 has `sqrtss`/`sqrtsd` and x87 has `fsqrt`; binary128 is
@@ -168,7 +172,7 @@ impl X86_64Mapper {
 mod tests {
     use super::*;
     use crate::arch::mapping::test_helpers::*;
-    use crate::arch::mapping::MappingCtx;
+    use crate::arch::mapping::{library_call, MappingCtx};
     use crate::ir::{Instruction, Opcode, PseudoId};
     use crate::target::{Arch, Os, Target};
     use crate::types::TypeTable;
@@ -627,6 +631,47 @@ mod tests {
 
     // Float16 conversions
 
+    /// `_Float16` arithmetic, comparison and conversion are left alone by
+    /// the early mapping, for the optimizer to fold, and lowered by the late
+    /// pass.
+    #[test]
+    fn test_x86_64_float16_lowers_after_the_optimizer() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = X86_64Mapper;
+        let h = types.float16_id;
+        let add = Instruction::binop(Opcode::FAdd, PseudoId(2), PseudoId(0), PseudoId(1), h, 16);
+        let neg = Instruction::unop(Opcode::FNeg, PseudoId(2), PseudoId(0), h, 16);
+        let mut cmp = Instruction::binop(
+            Opcode::FCmpOLt,
+            PseudoId(2),
+            PseudoId(0),
+            PseudoId(1),
+            types.int_id,
+            16,
+        );
+        cmp.src_typ = Some(h);
+        let widen = make_convert_insn(Opcode::FCvtF, types.float_id, 32, h, 16);
+        let to_int = make_convert_insn(Opcode::FCvtS, types.int_id, 32, h, 16);
+        for insn in [add, neg, cmp, widen, to_int] {
+            let mut func = make_minimal_func(&types);
+            let mut ctx = MappingCtx {
+                func: &mut func,
+                types: &types,
+                target: &target,
+            };
+            assert_legal(&mapper.map_insn(&insn, &mut ctx));
+            let MappedInsn::Replace(insns) = library_call(&insn, &mut ctx, &mapper) else {
+                panic!("{:?} must be lowered late", insn.op);
+            };
+            assert!(
+                insns.iter().any(|i| i.op == Opcode::Call),
+                "{:?} calls its conversion",
+                insn.op
+            );
+        }
+    }
+
     #[test]
     fn test_x86_64_float16_to_float_conversion() {
         let target = Target::new(Arch::X86_64, Os::Linux);
@@ -641,7 +686,7 @@ mod tests {
             types: &types,
             target: &target,
         };
-        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__extendhfsf2");
+        assert_libcall(&library_call(&insn, &mut ctx, &mapper), "__extendhfsf2");
     }
 
     #[test]
@@ -658,7 +703,7 @@ mod tests {
             types: &types,
             target: &target,
         };
-        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__truncsfhf2");
+        assert_libcall(&library_call(&insn, &mut ctx, &mapper), "__truncsfhf2");
     }
 
     #[test]
@@ -674,7 +719,7 @@ mod tests {
             types: &types,
             target: &target,
         };
-        assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__extendhfdf2");
+        assert_libcall(&library_call(&insn, &mut ctx, &mapper), "__extendhfdf2");
     }
 
     /// A `_Float16` <-> integer conversion goes through `float`, because
@@ -746,7 +791,7 @@ mod tests {
                 types: &types,
                 target: &target,
             };
-            let MappedInsn::Replace(insns) = mapper.map_insn(&insn, &mut ctx) else {
+            let MappedInsn::Replace(insns) = library_call(&insn, &mut ctx, &mapper) else {
                 panic!("{op:?} should be expanded");
             };
             assert_eq!(insns.len(), 2, "{op:?}: expected a two-step expansion");
@@ -825,7 +870,7 @@ mod tests {
                 types: &types,
                 target: &target,
             };
-            let MappedInsn::Replace(insns) = mapper.map_insn(&insn, &mut ctx) else {
+            let MappedInsn::Replace(insns) = library_call(&insn, &mut ctx, &mapper) else {
                 panic!("{op:?} should be expanded");
             };
             let calls: Vec<&str> = insns

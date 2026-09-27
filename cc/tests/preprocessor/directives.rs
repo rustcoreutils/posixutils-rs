@@ -556,11 +556,11 @@ fn preprocessor_include_next_walks_the_dash_i_path() {
     );
 }
 
-/// The other half of the same index space: a file found on a *system* path
-/// still resumes after that path, not from the front of it. `-I` directories
-/// come first in the numbering, so the system entries had to be renumbered
-/// past them -- getting that offset wrong would make `#include_next` from a
-/// system header re-find the very file it was written in, and loop.
+/// The other half of the same chain: a file found on a *system* path still
+/// resumes after that path, not from the front of it. `-I` directories come
+/// first on the chain -- mistaking a system position for a `-I` one would
+/// make `#include_next` from a system header re-find the very file it was
+/// written in, and loop.
 #[test]
 fn preprocessor_include_next_from_a_system_path_still_advances() {
     let dir = plib::tmp::Builder::new()
@@ -604,6 +604,45 @@ fn preprocessor_include_next_from_a_system_path_still_advances() {
         "expected both system levels:\n{}",
         r.stdout
     );
+}
+
+/// A project's own `<limits.h>` that forwards with `#include_next`, as
+/// gnulib's replacement headers do, reaches c17's bundled one, which sits
+/// between the `-I` and the system directories, and through it the system's:
+/// both the compiler's sizes and the C library's POSIX limits arrive. The
+/// bundled headers used to be skipped by every `#include_next`, and the
+/// bundled `<limits.h>` never forwarded at all.
+#[test]
+fn preprocessor_include_next_reaches_bundled_then_system_limits() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_include_next_bundled_")
+        .tempdir()
+        .unwrap();
+    let inc = dir.path().join("inc");
+    std::fs::create_dir(&inc).unwrap();
+    std::fs::write(
+        inc.join("limits.h"),
+        "#include_next <limits.h>\n#define WRAPPED 1\n",
+    )
+    .unwrap();
+
+    let src = dir.path().join("m.c");
+    std::fs::write(
+        &src,
+        "#include <limits.h>\n\
+         #if !(WRAPPED && INT_MAX == __INT_MAX__ && LINE_MAX >= _POSIX2_LINE_MAX)\n\
+         #error not every layer arrived\n\
+         #endif\n\
+         int main(void) { return 0; }\n",
+    )
+    .unwrap();
+
+    let r = run_c17(&[
+        "-E",
+        &format!("-I{}", inc.display()),
+        &src.to_string_lossy(),
+    ]);
+    assert!(r.success, "include_next chain failed:\n{}", r.stderr);
 }
 
 /// `-nostdinc` drops the *target's own* header directories. It does not drop

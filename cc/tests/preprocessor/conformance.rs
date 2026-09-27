@@ -1396,18 +1396,32 @@ int main(void) {
 /// The rule is per OS too: Apple arm64 makes plain `char` signed where
 /// AAPCS64 makes it unsigned. `<limits.h>` must describe the same type, so
 /// `CHAR_MIN` is checked alongside.
+///
+/// Those are the compiler's part of `<limits.h>`. The bundled header forwards
+/// to the system's for the rest, and this host has no C library for most of
+/// these targets, so the target's directories are rooted in an empty sysroot:
+/// the bundled header then stands alone.
 fn preprocessor_if_char_signedness_is_per_target() {
     let src = "#include <limits.h>\n\
                #if '\\xff' < 0\nSIGNED_CHAR\n#else\nUNSIGNED_CHAR\n#endif\n\
                #if CHAR_MIN < 0 && CHAR_MAX == SCHAR_MAX\nSIGNED_LIMITS\n\
                #elif CHAR_MIN == 0 && CHAR_MAX == UCHAR_MAX\nUNSIGNED_LIMITS\n#endif\n";
+    let sysroot = plib::tmp::Builder::new()
+        .prefix("c17_empty_sysroot_")
+        .tempdir()
+        .unwrap();
+    let sysroot = sysroot.path().to_str().unwrap();
     for (target, signed) in [
         ("x86_64-unknown-linux-gnu", true),
         ("x86_64-apple-darwin", true),
         ("aarch64-unknown-linux-gnu", false),
         ("aarch64-apple-darwin", true),
     ] {
-        let r = preprocess_text("char_sign", src, &["--target", target]);
+        let r = preprocess_text(
+            "char_sign",
+            src,
+            &["--target", target, "--sysroot", sysroot],
+        );
         assert!(r.success, "-E failed for {}: {}", target, r.stderr);
         let (want, limits) = if signed {
             ("SIGNED_CHAR", "SIGNED_LIMITS")

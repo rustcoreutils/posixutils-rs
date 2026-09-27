@@ -416,6 +416,18 @@ pub fn aarch64_cross_available() -> bool {
         })
 }
 
+/// The c17 options that compile for linux-aarch64 against the target's own C
+/// library headers, which the cross toolchain installs outside any sysroot.
+/// Without the `-isystem`, a system header comes from the host's glibc, whose
+/// `<bits/...>` headers live in the host's multiarch directory and are not
+/// found for aarch64. `cc/scripts/c17_torture.sh -t aarch64` passes the same.
+pub const AARCH64_TARGET_ARGS: [&str; 4] = [
+    "--target",
+    "aarch64-unknown-linux-gnu",
+    "-isystem",
+    "/usr/aarch64-linux-gnu/include",
+];
+
 /// Compile `content` for linux-aarch64 with c17, assemble and link it with the
 /// cross toolchain, and run it under qemu. Returns the exit status, or `None`
 /// when the cross toolchain is absent.
@@ -454,7 +466,7 @@ pub fn compile_and_run_aarch64_with(
     let asm_path = asm.path().to_string_lossy().to_string();
 
     let src = c_file.path().to_string_lossy().to_string();
-    let mut args = vec!["--target", "aarch64-unknown-linux-gnu"];
+    let mut args = AARCH64_TARGET_ARGS.to_vec();
     args.extend_from_slice(opts);
     args.extend_from_slice(&["-S", "-o", &asm_path, &src]);
     let run = run_c17(&args);
@@ -600,16 +612,9 @@ pub fn interop_aarch64(tag: &str, callee: &str, caller: &str) {
     for opt in ["-O0", "-O2"] {
         let asm = |src: &str, n: &str| {
             let s = dir.path().join(format!("{n}{opt}.s"));
-            let run = run_c17(&[
-                "--target",
-                "aarch64-unknown-linux-gnu",
-                opt,
-                "-w",
-                "-S",
-                "-o",
-                s.to_str().unwrap(),
-                src,
-            ]);
+            let mut args = AARCH64_TARGET_ARGS.to_vec();
+            args.extend_from_slice(&[opt, "-w", "-S", "-o", s.to_str().unwrap(), src]);
+            let run = run_c17(&args);
             assert!(run.success, "c17 failed on {n}:\n{}", run.stderr);
             s.to_string_lossy().into_owned()
         };

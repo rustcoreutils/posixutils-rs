@@ -45,6 +45,38 @@ const DEFAULT_COND_STACK_CAPACITY: usize = 8;
 const DEFAULT_INCLUDE_PATH_CAPACITY: usize = 8;
 const DEFAULT_INCLUDE_TRACK_CAPACITY: usize = 32;
 
+/// Where on the search chain a header was found.
+///
+/// The chain is gcc's: the `-I` directories, then the directory of headers
+/// the compiler owns (here, the bundled ones), then the system directories.
+/// `#include_next` resumes just after the position the current file came
+/// from, so a bundled header that forwards reaches the system's, and a `-I`
+/// header that forwards reaches the bundled one first. The variant order is
+/// the search order, which is what `Ord` compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SearchPos {
+    /// The `-I` directory at this index.
+    Quote(usize),
+    /// The bundled headers.
+    Bundled,
+    /// The system directory at this index: `-isystem`, the target's own,
+    /// then `-idirafter`.
+    System(usize),
+}
+
+impl SearchPos {
+    /// Where `#include_next` resumes in a file found at `from`: just past
+    /// it, or the start of the chain for a file not found on it at all.
+    pub(super) fn after(from: Option<SearchPos>) -> SearchPos {
+        match from {
+            None => SearchPos::Quote(0),
+            Some(SearchPos::Quote(i)) => SearchPos::Quote(i + 1),
+            Some(SearchPos::Bundled) => SearchPos::System(0),
+            Some(SearchPos::System(i)) => SearchPos::System(i + 1),
+        }
+    }
+}
+
 /// Source of an included file
 pub enum IncludeSource {
     /// File on disk
@@ -506,9 +538,9 @@ pub struct Preprocessor<'a> {
     /// Apply translation phase 1 trigraph replacement to included files.
     trigraphs: bool,
 
-    /// Index of current file's system include path (for #include_next)
-    /// None if current file is not from a system include path
-    current_include_path_index: Option<usize>,
+    /// Where on the search chain the current file was found (for
+    /// `#include_next`); None if it was not found on the chain at all.
+    current_search_pos: Option<SearchPos>,
 
     /// Lexer mode for tokenizing included files (C or Assembly)
     lexer_mode: LexerMode,
@@ -908,7 +940,7 @@ impl<'a> Preprocessor<'a> {
             compile_time,
             use_builtin_headers: true,
             trigraphs: false,
-            current_include_path_index: None,
+            current_search_pos: None,
             lexer_mode: LexerMode::C,
             line_offset: 0,
             line_file_override: None,
@@ -1175,10 +1207,10 @@ impl<'a> Preprocessor<'a> {
         // Searched like `#include "..."`: the working directory first, then
         // `-I`, then the system paths.
         match self.find_include_file(path, false, false) {
-            Some((IncludeSource::File(found), index)) => {
+            Some((IncludeSource::File(found), pos)) => {
                 // A `-include` is a dependency exactly as a `#include` is.
-                self.record_dependency(&found, index.is_some());
-                self.include_file(&found, output, idents, &hash, index)
+                self.record_dependency(&found, pos);
+                self.include_file(&found, output, idents, &hash, pos)
             }
             Some((IncludeSource::Builtin(content), _)) => {
                 self.include_builtin(path, content, output, idents, &hash)

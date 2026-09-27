@@ -419,8 +419,8 @@ int main(void) {
 /// `SSIZE_MAX` belongs to `<limits.h>` (POSIX), not to the compiler. It was
 /// predefined, so a program that defines its own, or tests `#ifndef
 /// SSIZE_MAX` to learn whether it has included `<limits.h>`, was wrong before
-/// it included anything. Only bundled headers here, so the same program runs
-/// for aarch64 without that target's C library.
+/// it included anything. It comes from the system's `<limits.h>`, which the
+/// bundled one forwards to.
 const SSIZE_LIMIT: &str = r#"
 #ifdef SSIZE_MAX
 #error "SSIZE_MAX is defined before <limits.h>"
@@ -469,6 +469,55 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("ssize_type", code, &[]), 0);
+}
+
+/// POSIX adds its limits to `<limits.h>`, which the system's header defines:
+/// the bundled one owns only the integer sizes and forwards to the system's
+/// for the rest. It used to stop at the sizes, so `LINE_MAX`, `NGROUPS_MAX`,
+/// `IOV_MAX` and the like were undeclared. The POSIX base names are checked
+/// everywhere, the XSI ones against glibc; the sizes must still be the
+/// compiler's.
+const POSIX_LIMITS: &str = r#"
+#include <limits.h>
+#include <stdio.h>
+#include <limits.h>
+
+#if LINE_MAX < _POSIX2_LINE_MAX || NGROUPS_MAX < _POSIX_NGROUPS_MAX
+#error "LINE_MAX or NGROUPS_MAX missing or below its POSIX minimum"
+#endif
+#if RE_DUP_MAX < _POSIX2_RE_DUP_MAX
+#error "RE_DUP_MAX missing or below its POSIX minimum"
+#endif
+#ifdef __linux__
+#if IOV_MAX < _XOPEN_IOV_MAX || !defined HOST_NAME_MAX
+#error "IOV_MAX missing or below its POSIX minimum, or HOST_NAME_MAX missing"
+#endif
+#if LONG_BIT != __SIZEOF_LONG__ * CHAR_BIT || WORD_BIT != __SIZEOF_INT__ * CHAR_BIT
+#error "LONG_BIT or WORD_BIT wrong"
+#endif
+#endif
+
+int main(void) {
+    if (_POSIX_ARG_MAX != 4096 || _POSIX2_LINE_MAX != 2048) return 1;
+    if (CHAR_BIT != __CHAR_BIT__ || INT_MAX != __INT_MAX__) return 3;
+    if (LLONG_MIN != -__LONG_LONG_MAX__ - 1 || ULLONG_MAX != (unsigned long long)-1) return 4;
+    if (SCHAR_MIN != -128 || UCHAR_MAX != 255 || USHRT_MAX != 65535) return 5;
+    if (MB_LEN_MAX < 1) return 6;
+    return 0;
+}
+"#;
+
+#[test]
+fn c99_limits_h_has_the_posix_limits() {
+    assert_eq!(compile_and_run("posix_limits", POSIX_LIMITS, &[]), 0);
+    compile_expect_no_diagnostic("posix_limits_clean", POSIX_LIMITS, "redefin");
+}
+
+#[test]
+fn c99_limits_h_has_the_posix_limits_aarch64() {
+    if let Some(rc) = compile_and_run_aarch64("posix_limits", POSIX_LIMITS, "-O0") {
+        assert_eq!(rc, 0);
+    }
 }
 
 /// A program may name its own `SSIZE_MAX` when it has not included

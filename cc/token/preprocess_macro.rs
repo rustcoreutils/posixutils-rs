@@ -1683,7 +1683,11 @@ impl<'a> Preprocessor<'a> {
                                 .collect_macro_args(iter, idents, pos, &mac.name, &open_paren)
                                 .map(|(args, _)| args)
                                 .unwrap_or_default();
-                            let result = self.eval_has_include(&args, idents);
+                            let result = self.eval_has_include(
+                                &args,
+                                idents,
+                                builtin == BuiltinMacro::HasIncludeNext,
+                            );
                             return Some(vec![Token::with_value(
                                 TokenType::Number,
                                 *pos,

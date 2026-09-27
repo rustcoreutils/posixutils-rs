@@ -1825,3 +1825,176 @@ fn test_pragma_operator_destringify() {
         strs
     );
 }
+
+// The search chain: `-I`, then the bundled headers, then the system
+// directories, with `#include_next` resuming just past the current file.
+
+/// A temporary tree of headers: `q` stands for a `-I` directory, `sys` for a
+/// system one, and each file is written as given.
+struct SearchTree {
+    dir: plib::tmp::TempDir,
+}
+
+impl SearchTree {
+    fn new(files: &[(&str, &str)]) -> Self {
+        let dir = plib::tmp::Builder::new()
+            .prefix("c17_search_chain_")
+            .tempdir()
+            .unwrap();
+        for sub in ["q", "sys"] {
+            std::fs::create_dir(dir.path().join(sub)).unwrap();
+        }
+        for (path, text) in files {
+            std::fs::write(dir.path().join(path), text).unwrap();
+        }
+        SearchTree { dir }
+    }
+
+    fn path(&self, sub: &str) -> String {
+        self.dir.path().join(sub).to_string_lossy().into_owned()
+    }
+
+    /// Preprocess `input` with `q` as the only `-I` directory and `sys` as the
+    /// only system directory, returning the token spellings and the headers
+    /// depended on.
+    fn preprocess(&self, input: &str) -> (Vec<String>, Vec<(PathBuf, bool)>) {
+        let include_paths = [self.path("q")];
+        let isystem = [self.path("sys")];
+        let config = PreprocessConfig {
+            include_paths: &include_paths,
+            search: SystemSearch {
+                isystem: &isystem,
+                no_std_inc: true,
+                ..Default::default()
+            },
+            collect_dependencies: true,
+            ..Default::default()
+        };
+        let mut idents = IdentTable::new();
+        let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+        let (out, outcome) =
+            preprocess_collecting(tokens, &Target::host(), &mut idents, "<test>", &config);
+        (get_token_strings(&out, &idents), outcome.dependencies)
+    }
+}
+
+#[test]
+fn test_search_pos_order_is_the_search_order() {
+    assert!(SearchPos::Quote(7) < SearchPos::Bundled);
+    assert!(SearchPos::Bundled < SearchPos::System(0));
+    assert!(SearchPos::System(0) < SearchPos::System(1));
+    assert_eq!(SearchPos::after(None), SearchPos::Quote(0));
+    assert_eq!(
+        SearchPos::after(Some(SearchPos::Quote(2))),
+        SearchPos::Quote(3)
+    );
+    assert_eq!(
+        SearchPos::after(Some(SearchPos::Bundled)),
+        SearchPos::System(0)
+    );
+    assert_eq!(
+        SearchPos::after(Some(SearchPos::System(4))),
+        SearchPos::System(5)
+    );
+}
+
+/// The bundled <limits.h> forwards to the system's, which, like glibc's, would
+/// forward back to the compiler's under `__GNUC__` unless `_GCC_LIMITS_H_` is
+/// defined, and fills in `LLONG_MIN` its own way when it is missing; like
+/// Apple's, it spells `INT_MAX` as a number. The system's limits arrive,
+/// nothing recurses, and the compiler's sizes stand.
+#[test]
+fn test_bundled_limits_h_forwards_to_the_system_header() {
+    let tree = SearchTree::new(&[(
+        "sys/limits.h",
+        "#ifndef SYS_LIMITS\n#define SYS_LIMITS 1\n#define MB_LEN_MAX 6\n\
+         #define INT_MAX 2147483647\n#define LINE_MAX 2048\n#endif\n\
+         #if defined __GNUC__ && !defined _GCC_LIMITS_H_\n#include_next <limits.h>\n#endif\n\
+         #ifndef LLONG_MIN\n#define LLONG_MIN (-LLONG_MAX-1)\n#endif\n",
+    )]);
+    let (strs, _) =
+        tree.preprocess("#include <limits.h>\nLINE_MAX MB_LEN_MAX INT_MAX LLONG_MIN SYS_LIMITS");
+    assert_eq!(
+        strs,
+        [
+            "2048",
+            "6",
+            "0x7fffffff",
+            "(",
+            "-",
+            "0x7fffffffffffffffLL",
+            "-",
+            "1LL",
+            ")",
+            "1"
+        ],
+        "the system's limits must arrive and the compiler's sizes stand"
+    );
+}
+
+/// With no system <limits.h> to forward to, the bundled one still stands on
+/// its own.
+#[test]
+fn test_bundled_limits_h_without_a_system_header() {
+    let tree = SearchTree::new(&[]);
+    let (strs, _) = tree.preprocess("#include <limits.h>\nCHAR_BIT MB_LEN_MAX LINE_MAX");
+    assert_eq!(strs, ["8", "16", "LINE_MAX"]);
+}
+
+/// A `-I` header that forwards, as gnulib's replacement <limits.h> does,
+/// reaches the bundled one, and through it the system's.
+#[test]
+fn test_include_next_from_dash_i_reaches_the_bundled_header() {
+    let tree = SearchTree::new(&[
+        ("q/limits.h", "#include_next <limits.h>\n#define FROM_Q 1\n"),
+        ("sys/limits.h", "#define LINE_MAX 2048\n"),
+    ]);
+    let (strs, _) = tree.preprocess("#include <limits.h>\nFROM_Q CHAR_BIT LINE_MAX");
+    assert_eq!(strs, ["1", "8", "2048"]);
+}
+
+/// A system header's own `#include <limits.h>` starts the search over, so it
+/// reaches the bundled header too, and that header's `#include_next` finds
+/// the system one although the includer came from the last system directory.
+#[test]
+fn test_limits_h_included_from_a_system_header() {
+    let tree = SearchTree::new(&[
+        ("sys/wrap.h", "#include <limits.h>\n"),
+        ("sys/limits.h", "#define LINE_MAX 2048\n"),
+    ]);
+    let (strs, _) = tree.preprocess("#include <wrap.h>\nCHAR_BIT LINE_MAX");
+    assert_eq!(strs, ["8", "2048"]);
+}
+
+/// `__has_include_next` asks what `#include_next` would find, which is never
+/// the current file itself.
+#[test]
+fn test_has_include_next_searches_past_the_current_file() {
+    let probe = "#if __has_include_next(<a.h>)\nNEXT_YES\n#else\nNEXT_NO\n#endif\n";
+    let tree = SearchTree::new(&[("q/a.h", probe)]);
+    let (strs, _) = tree.preprocess("#include <a.h>\n");
+    assert_eq!(strs, ["NEXT_NO"]);
+
+    let tree = SearchTree::new(&[("q/a.h", probe), ("sys/a.h", "")]);
+    let (strs, _) = tree.preprocess("#include <a.h>\n");
+    assert_eq!(strs, ["NEXT_YES"]);
+}
+
+/// A header found through `-I` is the project's, which `-MM` lists; only one
+/// found in a system directory is a system header, however it was spelled.
+#[test]
+fn test_dash_i_header_is_not_a_system_dependency() {
+    let tree = SearchTree::new(&[("q/mine.h", ""), ("sys/theirs.h", "")]);
+    let (_, deps) = tree.preprocess("#include <mine.h>\n#include \"theirs.h\"\n");
+    let deps: Vec<_> = deps
+        .iter()
+        .map(|(p, sys)| (p.file_name().unwrap().to_string_lossy().into_owned(), *sys))
+        .collect();
+    assert_eq!(
+        deps,
+        [
+            ("mine.h".to_string(), false),
+            ("theirs.h".to_string(), true)
+        ]
+    );
+}

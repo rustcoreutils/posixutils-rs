@@ -1620,6 +1620,34 @@ fn driver_dash_mm_writes_a_dependency_rule() {
     assert!(!w.join("d.o").exists(), "-MM must not produce an object");
 }
 
+/// A header found through `-I` is the project's own, so `-MM` lists it,
+/// however it was spelled. Every directory on the `<...>` chain used to count
+/// as a system one, and `-MM` dropped `-I` headers along with `<stdio.h>`.
+#[test]
+fn driver_dash_mm_lists_dash_i_headers() {
+    let w = WorkDir::new("dash_mm_dash_i");
+    std::fs::create_dir(w.join("inc")).unwrap();
+    std::fs::write(w.join("inc/mine.h"), "int mine;\n").unwrap();
+    let src = w.write(
+        "d.c",
+        "#include <mine.h>\n#include <stdio.h>\nint main(void){return 0;}\n",
+    );
+
+    let inc = s(&w.join("inc"));
+    let r = run_c17(&["-MM", "-I", &inc, &s(&src)]);
+    assert!(r.success, "-MM failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("mine.h"),
+        "-I header missing: {:?}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("stdio.h"),
+        "system header listed: {:?}",
+        r.stdout
+    );
+}
+
 /// `-M` keeps the system headers `-MM` drops.
 #[test]
 fn driver_dash_m_includes_system_headers() {

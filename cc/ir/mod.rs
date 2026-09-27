@@ -954,6 +954,10 @@ pub struct Instruction {
     /// module or is only ever the external library function. See
     /// [`Instruction::local_callee`], which is how a pass should ask.
     pub callee_binding: crate::parse::ast::CalleeBinding,
+    /// For calls: the library function called, when the program's name for
+    /// it still means that function (see [`crate::parse::ast::LibFn`]).
+    /// What `ir::libcall_fold` folds, and nothing else reads.
+    pub known: Option<crate::parse::ast::LibFn>,
     /// For indirect calls: pseudo containing the function pointer address.
     /// When this is Some, the call is indirect (call through function pointer).
     pub indirect_target: Option<PseudoId>,
@@ -990,6 +994,7 @@ impl Default for Instruction {
             ends_with_va_arg_pack: false,
             is_noreturn_call: false,
             callee_binding: crate::parse::ast::CalleeBinding::Declared,
+            known: None,
             indirect_target: None,
             pos: None,
             asm_data: None,

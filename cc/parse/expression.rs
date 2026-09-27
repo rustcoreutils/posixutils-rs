@@ -1429,11 +1429,13 @@ impl<'a> Parser<'a> {
                     })
                     .unwrap_or(self.types.int_id); // Default to int
 
+                let known = self.known_callee(&expr);
                 expr = Self::typed_expr(
                     ExprKind::Call {
                         func: Box::new(expr),
                         args,
                         binding: crate::parse::ast::CalleeBinding::Declared,
+                        known,
                     },
                     return_type,
                     base_pos,

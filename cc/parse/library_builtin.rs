@@ -16,14 +16,17 @@
 // the table names for it.
 //
 
-use super::ast::{Expr, ExprKind, InlineLibraryFn, MathErrno, MemoryFn, NarrowedLibraryCall};
+use super::ast::{
+    Expr, ExprKind, InlineLibraryFn, LibFn, MathErrno, MemoryFn, NarrowedLibraryCall,
+};
 use super::parser::{ParseResult, Parser};
 use crate::constexpr::ConstScope;
 use crate::float::IntegralRounding;
 use crate::kw;
 use crate::strings::StringId;
+use crate::symbol::SymbolId;
 use crate::token::lexer::Position;
-use crate::types::{Type, TypeId, TypeTable};
+use crate::types::{Type, TypeId, TypeKind, TypeTable};
 
 /// What the command line says about evaluating library calls in place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +112,14 @@ enum ProtoType {
     ComplexLongDouble,
     VoidPtr,
     ConstVoidPtr,
+    CharPtr,
+    ConstCharPtr,
+    /// `FILE *`. c17 has no `FILE` of its own, so any pointer to an object
+    /// stands for it in a declaration; one this synthesizes says `void *`,
+    /// which every ABI passes the same way.
+    ObjPtr,
+    /// `va_list`.
+    VaList,
     /// `size_t`, which is `unsigned long` on every target c17 has.
     SizeT,
 }
@@ -125,9 +136,31 @@ impl ProtoType {
             ProtoType::ComplexFloat => t.complex_float_id,
             ProtoType::ComplexDouble => t.complex_double_id,
             ProtoType::ComplexLongDouble => t.complex_longdouble_id,
-            ProtoType::VoidPtr => t.void_ptr_id,
+            ProtoType::VoidPtr | ProtoType::ObjPtr => t.void_ptr_id,
             ProtoType::ConstVoidPtr => t.const_void_ptr_id,
+            ProtoType::CharPtr => t.char_ptr_id,
+            ProtoType::ConstCharPtr => t.const_char_ptr_id,
+            ProtoType::VaList => t.va_list_id,
             ProtoType::SizeT => t.ulong_id,
+        }
+    }
+
+    /// Whether a declaration's `declared` type is this one.
+    fn accepts(self, declared: TypeId, t: &TypeTable) -> bool {
+        let pointee = || {
+            (t.kind(declared) == TypeKind::Pointer)
+                .then(|| t.base_type(declared))
+                .flatten()
+                .map(|b| t.kind(b))
+        };
+        match self {
+            ProtoType::ObjPtr => pointee().is_some_and(|k| k != TypeKind::Function),
+            // However the declaration spells it: the builtin type, or the
+            // pointer an array-typed one adjusts to as a parameter.
+            ProtoType::VaList => {
+                t.kind(declared) == TypeKind::VaList || pointee() == Some(TypeKind::VaList)
+            }
+            _ => t.types_compatible(declared, self.id(t)),
         }
     }
 }
@@ -142,19 +175,35 @@ enum Spelling {
     Reserved,
 }
 
+/// What a call to a library function c17 knows becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evaluation {
+    /// Computed in place: an [`ExprKind::InlineLibraryCall`].
+    InPlace(InlineLibraryFn),
+    /// An ordinary call, tagged with what it calls so that the optimizer
+    /// may fold it (`ir::libcall_fold`).
+    Call(LibFn),
+}
+
 /// A library function c17 knows by prototype.
 #[derive(Debug)]
 pub(super) struct LibraryBuiltin {
     /// The library's name for the function, which is also its bare keyword.
     bare: StringId,
-    /// The `__builtin_` spelling.
-    reserved: StringId,
+    /// The `__builtin_` spelling this table parses, for a function computed
+    /// in place. A called function's `__builtin_` spelling is an ordinary
+    /// call to the library (`parse_library_builtin`), which finds its row
+    /// here by the bare name.
+    reserved: Option<StringId>,
     ret: ProtoType,
     params: &'static [ProtoType],
+    /// Whether `...` follows `params`.
+    variadic: bool,
     /// What a call computes, once its arguments have been checked.
-    func: InlineLibraryFn,
+    eval: Evaluation,
 }
 
+/// A function computed in place.
 const fn entry(
     bare: StringId,
     reserved: StringId,
@@ -164,10 +213,29 @@ const fn entry(
 ) -> LibraryBuiltin {
     LibraryBuiltin {
         bare,
-        reserved,
+        reserved: Some(reserved),
         ret,
         params,
-        func,
+        variadic: false,
+        eval: Evaluation::InPlace(func),
+    }
+}
+
+/// A function called, whose result the optimizer may know.
+const fn known(
+    bare: StringId,
+    ret: ProtoType,
+    params: &'static [ProtoType],
+    variadic: bool,
+    func: LibFn,
+) -> LibraryBuiltin {
+    LibraryBuiltin {
+        bare,
+        reserved: None,
+        ret,
+        params,
+        variadic,
+        eval: Evaluation::Call(func),
     }
 }
 
@@ -179,9 +247,12 @@ const fn entry(
 static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
     use InlineLibraryFn as F;
     use IntegralRounding as R;
+    use LibFn as L;
     use MemoryFn as M;
     use ProtoType::*;
     const SQRT: F = F::Sqrt(MathErrno::Set);
+    const FIXED: bool = false;
+    const VARIADIC: bool = true;
     &[
         //    bare            reserved                 returns            parameters                        computes
         entry(kw::ABS,        kw::BUILTIN_ABS,         Int,               &[Int],                           F::IntAbs),
@@ -227,6 +298,42 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         entry(kw::MEMCPY,     kw::BUILTIN_MEMCPY,      VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT],  F::Memory(M::Copy)),
         entry(kw::MEMSET,     kw::BUILTIN_MEMSET,      VoidPtr,           &[VoidPtr, Int, SizeT],           F::Memory(M::Set)),
         entry(kw::MEMMOVE,    kw::BUILTIN_MEMMOVE,     VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT],  F::Memory(M::Move)),
+        //    name                   returns       parameters                                  `...`     calls
+        known(kw::STRLEN,            SizeT,        &[ConstCharPtr],                            FIXED,    L::Strlen),
+        known(kw::STRNLEN,           SizeT,        &[ConstCharPtr, SizeT],                     FIXED,    L::Strnlen),
+        known(kw::STRCMP,            Int,          &[ConstCharPtr, ConstCharPtr],              FIXED,    L::Strcmp),
+        known(kw::STRNCMP,           Int,          &[ConstCharPtr, ConstCharPtr, SizeT],       FIXED,    L::Strncmp),
+        known(kw::MEMCMP,            Int,          &[ConstVoidPtr, ConstVoidPtr, SizeT],       FIXED,    L::Memcmp),
+        known(kw::STRCHR,            CharPtr,      &[ConstCharPtr, Int],                       FIXED,    L::Strchr),
+        known(kw::INDEX,             CharPtr,      &[ConstCharPtr, Int],                       FIXED,    L::Strchr),
+        known(kw::STRRCHR,           CharPtr,      &[ConstCharPtr, Int],                       FIXED,    L::Strrchr),
+        known(kw::RINDEX,            CharPtr,      &[ConstCharPtr, Int],                       FIXED,    L::Strrchr),
+        known(kw::MEMCHR,            VoidPtr,      &[ConstVoidPtr, Int, SizeT],                FIXED,    L::Memchr),
+        known(kw::STRSTR,            CharPtr,      &[ConstCharPtr, ConstCharPtr],              FIXED,    L::Strstr),
+        known(kw::STRPBRK,           CharPtr,      &[ConstCharPtr, ConstCharPtr],              FIXED,    L::Strpbrk),
+        known(kw::STRCSPN,           SizeT,        &[ConstCharPtr, ConstCharPtr],              FIXED,    L::Strcspn),
+        known(kw::STRCPY,            CharPtr,      &[CharPtr, ConstCharPtr],                   FIXED,    L::Strcpy),
+        known(kw::STPCPY,            CharPtr,      &[CharPtr, ConstCharPtr],                   FIXED,    L::Stpcpy),
+        known(kw::STRNCPY,           CharPtr,      &[CharPtr, ConstCharPtr, SizeT],            FIXED,    L::Strncpy),
+        known(kw::STRCAT,            CharPtr,      &[CharPtr, ConstCharPtr],                   FIXED,    L::Strcat),
+        known(kw::STRNCAT,           CharPtr,      &[CharPtr, ConstCharPtr, SizeT],            FIXED,    L::Strncat),
+        known(kw::SPRINTF,           Int,          &[CharPtr, ConstCharPtr],                   VARIADIC, L::Sprintf),
+        known(kw::PRINTF,            Int,          &[ConstCharPtr],                            VARIADIC, L::Printf),
+        known(kw::PRINTF_UNLOCKED,   Int,          &[ConstCharPtr],                            VARIADIC, L::PrintfUnlocked),
+        known(kw::VPRINTF,           Int,          &[ConstCharPtr, VaList],                    FIXED,    L::Vprintf),
+        known(kw::PRINTF_CHK,        Int,          &[Int, ConstCharPtr],                       VARIADIC, L::PrintfChk),
+        known(kw::VPRINTF_CHK,       Int,          &[Int, ConstCharPtr, VaList],               FIXED,    L::VprintfChk),
+        known(kw::FPRINTF,           Int,          &[ObjPtr, ConstCharPtr],                    VARIADIC, L::Fprintf),
+        known(kw::FPRINTF_UNLOCKED,  Int,          &[ObjPtr, ConstCharPtr],                    VARIADIC, L::FprintfUnlocked),
+        known(kw::VFPRINTF,          Int,          &[ObjPtr, ConstCharPtr, VaList],            FIXED,    L::Vfprintf),
+        known(kw::FPRINTF_CHK,       Int,          &[ObjPtr, Int, ConstCharPtr],               VARIADIC, L::FprintfChk),
+        known(kw::VFPRINTF_CHK,      Int,          &[ObjPtr, Int, ConstCharPtr, VaList],       FIXED,    L::VfprintfChk),
+        known(kw::FPUTS,             Int,          &[ConstCharPtr, ObjPtr],                    FIXED,    L::Fputs),
+        known(kw::FPUTS_UNLOCKED,    Int,          &[ConstCharPtr, ObjPtr],                    FIXED,    L::FputsUnlocked),
+        known(kw::PUTS,              Int,          &[ConstCharPtr],                            FIXED,    L::Puts),
+        known(kw::PUTCHAR,           Int,          &[Int],                                     FIXED,    L::Putchar),
+        known(kw::FPUTC,             Int,          &[Int, ObjPtr],                             FIXED,    L::Fputc),
+        known(kw::FWRITE,            SizeT,        &[ConstVoidPtr, SizeT, SizeT, ObjPtr],      FIXED,    L::Fwrite),
     ]
 };
 
@@ -236,7 +343,7 @@ impl LibraryBuiltin {
         LIBRARY_BUILTINS.iter().find_map(|lb| {
             if lb.bare == name_id {
                 Some((lb, Spelling::Bare))
-            } else if lb.reserved == name_id {
+            } else if lb.reserved == Some(name_id) {
                 Some((lb, Spelling::Reserved))
             } else {
                 None
@@ -249,10 +356,38 @@ impl LibraryBuiltin {
         LIBRARY_BUILTINS.iter().find(|lb| lb.bare == name_id)
     }
 
+    /// The library function a call to `name_id` calls, when the table knows
+    /// it as one the optimizer may fold -- whether or not the name still
+    /// means it where it is called, which `builtin_is_shadowed` decides.
+    pub(super) fn known_call(name_id: StringId) -> Option<LibFn> {
+        Self::by_bare_name(name_id)?.called()
+    }
+
+    /// The type the function returns.
+    pub(super) fn return_type(&self, t: &TypeTable) -> TypeId {
+        self.ret.id(t)
+    }
+
+    /// The library function this row calls, if it is called rather than
+    /// computed in place.
+    pub(super) fn called(&self) -> Option<LibFn> {
+        match self.eval {
+            Evaluation::Call(f) => Some(f),
+            Evaluation::InPlace(_) => None,
+        }
+    }
+
     /// Whether a call to this function by its bare name reaches the
     /// program's own definition instead ([`InlineLibraryFn::is_displaced`]).
+    /// A called function never is: a program that defines `strlen` or
+    /// `__printf_chk` has defined a name reserved to the library (C17
+    /// 7.1.3p2), and gcc folds a call to it regardless -- gcc.c-torture's
+    /// `printf-chk-1` counts on it.
     pub(super) fn is_displaced(&self, defined: &std::collections::HashSet<StringId>) -> bool {
-        self.func.is_displaced(self.bare, defined)
+        match self.eval {
+            Evaluation::InPlace(f) => f.is_displaced(self.bare, defined),
+            Evaluation::Call(_) => false,
+        }
     }
 
     /// The `float` function this `double` one narrows to for a `float`
@@ -261,12 +396,15 @@ impl LibraryBuiltin {
     /// `double q(float a) { return floor(a); }` narrows too, because the
     /// narrowing happens before the widening.
     fn float_form(&self) -> Option<&'static LibraryBuiltin> {
-        if !self.func.narrows_exactly() || self.ret != ProtoType::Double {
+        let Evaluation::InPlace(func) = self.eval else {
+            return None;
+        };
+        if !func.narrows_exactly() || self.ret != ProtoType::Double {
             return None;
         }
         LIBRARY_BUILTINS
             .iter()
-            .find(|lb| lb.func == self.func && lb.ret == ProtoType::Float)
+            .find(|lb| lb.eval == self.eval && lb.ret == ProtoType::Float)
     }
 }
 
@@ -281,25 +419,64 @@ impl Parser<'_> {
     /// parameters, so only its return type is compared; a prototype must have
     /// exactly the library's parameters, whose qualifiers do not count (C17
     /// 6.7.6.3p15 -- which `types_compatible` already ignores at the top
-    /// level, so a `restrict` is no obstacle).
+    /// level, so a `restrict` is no obstacle), and a `...` exactly where the
+    /// library has one.
     pub(super) fn library_prototype_matches(&self, lb: &LibraryBuiltin, typ: TypeId) -> bool {
-        let ret = lb.ret.id(self.types);
         let decl = self.types.get(typ);
         let ret_ok = decl
             .base
-            .is_some_and(|base| self.types.types_compatible(base, ret));
+            .is_some_and(|base| lb.ret.accepts(base, self.types));
         let params_ok = match &decl.params {
             None => true,
             Some(params) => {
-                !decl.variadic
+                decl.variadic == lb.variadic
                     && params.len() == lb.params.len()
                     && params
                         .iter()
                         .zip(lb.params)
-                        .all(|(&p, want)| self.types.types_compatible(p, want.id(self.types)))
+                        .all(|(&p, want)| want.accepts(p, self.types))
             }
         };
         ret_ok && params_ok
+    }
+
+    /// The function type `lb`'s prototype spells.
+    fn library_function_type(&mut self, lb: &LibraryBuiltin) -> TypeId {
+        let ret = lb.ret.id(self.types);
+        let params = self.library_params(lb);
+        self.types
+            .intern(Type::function(ret, params, lb.variadic, false))
+    }
+
+    /// Declare the library function `lb` with its own prototype, for a call
+    /// spelled `__builtin_X` where nothing in scope declares `X`. gcc knows
+    /// these intrinsically, and the declaration is the table's rather than a
+    /// guess.
+    pub(super) fn declare_known_library_function(
+        &mut self,
+        lb: &LibraryBuiltin,
+    ) -> Option<SymbolId> {
+        let func_type = self.library_function_type(lb);
+        self.declare_library_function_id(lb.bare, func_type)
+    }
+
+    /// The library function a call through `callee` calls, when `callee`
+    /// names one the table knows and the name still means it there.
+    ///
+    /// Only a function designator by name: `(&strlen)(s)` and a call through
+    /// a pointer are calls to whatever the pointer holds. A declaration with
+    /// the wrong prototype, a variable of that name, and `-fno-builtin`
+    /// each leave the name the program's (`builtin_is_shadowed`); a
+    /// definition does not.
+    pub(super) fn known_callee(&self, callee: &Expr) -> Option<LibFn> {
+        let ExprKind::Ident(symbol) = callee.kind else {
+            return None;
+        };
+        let name = self.symbols.get(symbol).name;
+        let func = LibraryBuiltin::known_call(name)?;
+        (self.types.kind(self.symbols.get(symbol).typ) == TypeKind::Function
+            && !self.builtin_is_shadowed(name))
+        .then_some(func)
     }
 
     /// `lb`'s parameter types.
@@ -322,10 +499,14 @@ impl Parser<'_> {
         pos: Position,
     ) -> Option<ParseResult<Expr>> {
         let (lb, spelling) = LibraryBuiltin::lookup(name_id)?;
+        // A function that is called is parsed as the call it is.
+        let Evaluation::InPlace(func) = lb.eval else {
+            return None;
+        };
         if spelling == Spelling::Bare && !self.is_special(b'(') {
             return None;
         }
-        Some(self.parse_checked_library_call(lb, spelling, pos))
+        Some(self.parse_checked_library_call(lb, func, spelling, pos))
     }
 
     /// The argument list of a call to `lb`, checked as an ordinary call to a
@@ -333,6 +514,7 @@ impl Parser<'_> {
     fn parse_checked_library_call(
         &mut self,
         lb: &LibraryBuiltin,
+        func: InlineLibraryFn,
         spelling: Spelling,
         pos: Position,
     ) -> ParseResult<Expr> {
@@ -342,11 +524,10 @@ impl Parser<'_> {
         self.expect_special(b')')?;
 
         let ret = lb.ret.id(self.types);
-        let params = self.library_params(lb);
-        let func_type = self.types.intern(Type::function(ret, params, false, false));
+        let func_type = self.library_function_type(lb);
         let sound = self.check_call(Some(func_type), &args, call_pos);
         if sound && args.len() == lb.params.len() {
-            Ok(self.lower_library_call(lb, spelling, args, pos))
+            Ok(self.lower_library_call(lb, func, spelling, args, pos))
         } else {
             // Diagnosed already. A zero of the return type stands in for the
             // call, so the enclosing expression still parses and types, and
@@ -362,17 +543,19 @@ impl Parser<'_> {
     fn lower_library_call(
         &mut self,
         lb: &LibraryBuiltin,
+        func: InlineLibraryFn,
         spelling: Spelling,
         args: Vec<Expr>,
         pos: Position,
     ) -> Expr {
         let ret = lb.ret.id(self.types);
-        let func = self.library_call_policy.applied_to(lb.func);
+        let func = self.library_call_policy.applied_to(func);
         let in_place = self.library_call_policy.in_place(func, spelling);
         // Computed at `float` for a `float` argument, and the exact answer
         // widened back: the call is still a `double` (C17 6.5.2.2p5), and
         // still a call to the function the program named. One that is not
-        // computed in place is that call, as gcc makes it.
+        // computed in place is that call, as gcc makes it. A float form is
+        // the same function at another type.
         let (computed, narrowed) = match (lb.float_form(), args.as_slice()) {
             (Some(narrow), [arg]) if in_place && self.is_binary32(arg) => {
                 let typ = narrow.ret.id(self.types);
@@ -445,7 +628,10 @@ mod tests {
     #[test]
     fn every_entry_takes_what_its_lowering_consumes() {
         for lb in LIBRARY_BUILTINS {
-            assert_eq!(lb.params.len(), lb.func.arity(), "{lb:?}");
+            if let Evaluation::InPlace(func) = lb.eval {
+                assert_eq!(lb.params.len(), func.arity(), "{lb:?}");
+                assert!(!lb.variadic, "{lb:?}");
+            }
         }
     }
 
@@ -455,7 +641,9 @@ mod tests {
     fn every_narrowing_function_has_its_float_form() {
         for lb in LIBRARY_BUILTINS {
             let narrow = lb.float_form();
-            let should = lb.func.narrows_exactly() && lb.ret == ProtoType::Double;
+            let should = matches!(lb.eval, Evaluation::InPlace(f) if f.narrows_exactly())
+                && lb.ret == ProtoType::Double;
+
             assert_eq!(narrow.is_some(), should, "{lb:?}");
             if let Some(n) = narrow {
                 assert_eq!(n.params, &[ProtoType::Float], "{lb:?}");

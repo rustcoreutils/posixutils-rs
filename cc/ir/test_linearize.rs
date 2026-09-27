@@ -2531,6 +2531,7 @@ fn test_ternary_impure_uses_phi() {
             func: Box::new(Expr::var_typed(foo_sym, int_type)),
             args: vec![],
             binding: Default::default(),
+            known: None,
         },
         int_type,
         test_pos(),
@@ -2540,6 +2541,7 @@ fn test_ternary_impure_uses_phi() {
             func: Box::new(Expr::var_typed(bar_sym, int_type)),
             args: vec![],
             binding: Default::default(),
+            known: None,
         },
         int_type,
         test_pos(),
@@ -6719,6 +6721,7 @@ fn test_va_arg_pack_becomes_a_flag_not_an_argument() {
                 },
             ],
             binding: Default::default(),
+            known: None,
         },
         typ: Some(int_t),
         pos: test_pos(),
@@ -8434,4 +8437,27 @@ fn test_complex_multiply_routine_follows_the_return_class() {
             "{base} on {arch:?}: {routine} takes the four halves, after any hidden pointer"
         );
     }
+}
+
+/// A known library call keeps its tag in the IR under whatever name the
+/// program gave it: `strstr` renamed by an asm label is called as
+/// `my_strstr` and is still `strstr` to the optimizer. A call through a
+/// pointer to it is not tagged.
+#[test]
+fn test_known_call_keeps_its_tag_under_an_asm_label() {
+    let src = "char *strstr(const char *, const char *) __asm__(\"my_strstr\");\n\
+               char *f(const char *s) { return strstr(s, \"o\"); }\n\
+               char *g(const char *s) { return (&strstr)(s, \"o\"); }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    let call_in = |name: &str| {
+        insns_of(&module, name)
+            .into_iter()
+            .find(|i| i.op == Opcode::Call)
+            .unwrap_or_else(|| panic!("{name}: no call"))
+    };
+    let f = call_in("f");
+    let label = crate::arch::lir::verbatim("my_strstr");
+    assert_eq!(f.func_name.as_deref(), Some(label.as_str()));
+    assert_eq!(f.known, Some(crate::parse::ast::LibFn::Strstr));
+    assert_eq!(call_in("g").known, None);
 }

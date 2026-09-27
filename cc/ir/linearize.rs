@@ -3276,6 +3276,7 @@ impl<'a> Linearizer<'a> {
         func_expr: &Expr,
         args: &[Expr],
         binding: crate::parse::ast::CalleeBinding,
+        known: Option<crate::parse::ast::LibFn>,
     ) -> PseudoId {
         // Determine if this is a direct or indirect call.
         // We need to check the TYPE of the function expression:
@@ -3734,6 +3735,7 @@ impl<'a> Linearizer<'a> {
             call_insn.ends_with_va_arg_pack = ends_with_va_arg_pack;
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.callee_binding = binding;
+            call_insn.known = known;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
             // After a noreturn call, emit Unreachable and start a dead basic block
@@ -3773,6 +3775,7 @@ impl<'a> Linearizer<'a> {
             call_insn.ends_with_va_arg_pack = ends_with_va_arg_pack;
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.callee_binding = binding;
+            call_insn.known = known;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
             // After a noreturn call, emit Unreachable and start a dead basic block
@@ -6417,7 +6420,8 @@ impl<'a> Linearizer<'a> {
                 func,
                 args,
                 binding,
-            } => self.linearize_call(expr, func, args, *binding),
+                known,
+            } => self.linearize_call(expr, func, args, *binding, *known),
 
             ExprKind::Member {
                 expr: inner_expr,

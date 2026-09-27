@@ -837,6 +837,10 @@ pub struct TypeTable {
     /// `const void *`, the source operand of `memcpy` and `memmove`.
     pub const_void_ptr_id: TypeId,
     pub char_ptr_id: TypeId,
+    /// `const char *`, the string operand of `<string.h>` and `<stdio.h>`.
+    pub const_char_ptr_id: TypeId,
+    /// `__builtin_va_list`, the last parameter of `vprintf` and its siblings.
+    pub va_list_id: TypeId,
 }
 
 /// Parenthesize a declarator that has reached a `*` before an array or
@@ -893,6 +897,8 @@ impl TypeTable {
             void_ptr_id: TypeId::INVALID,
             const_void_ptr_id: TypeId::INVALID,
             char_ptr_id: TypeId::INVALID,
+            const_char_ptr_id: TypeId::INVALID,
+            va_list_id: TypeId::INVALID,
         };
 
         // Pre-intern common basic types
@@ -998,6 +1004,9 @@ impl TypeTable {
         let const_void = table.intern(Type::with_modifiers(TypeKind::Void, TypeModifiers::CONST));
         table.const_void_ptr_id = table.intern(Type::pointer(const_void));
         table.char_ptr_id = table.intern(Type::pointer(table.char_id));
+        let const_char = table.intern(Type::with_modifiers(TypeKind::Char, TypeModifiers::CONST));
+        table.const_char_ptr_id = table.intern(Type::pointer(const_char));
+        table.va_list_id = table.intern(Type::basic(TypeKind::VaList));
 
         table
     }

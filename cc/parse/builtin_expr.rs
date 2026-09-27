@@ -11,7 +11,7 @@
 //
 
 use super::ast::{
-    BinaryOp, CalleeBinding, CheckedOp, Expr, ExprKind, FpCompare, FpTest, GnuAtomicOp,
+    BinaryOp, CalleeBinding, CheckedOp, Expr, ExprKind, FpCompare, FpTest, GnuAtomicOp, LibFn,
     OffsetOfPath, UnaryOp,
 };
 use super::library_builtin::LibraryBuiltin;
@@ -979,6 +979,7 @@ impl Parser<'_> {
                         func: Box::new(Self::typed_expr(ExprKind::Ident(sym), void_id, token_pos)),
                         args: vec![begin, end],
                         binding: CalleeBinding::Library,
+                        known: None,
                     },
                     void_id,
                     token_pos,
@@ -1750,6 +1751,7 @@ impl Parser<'_> {
                 func: Box::new(Self::typed_expr(ExprKind::Ident(sym), ret, pos)),
                 args: Vec::new(),
                 binding: CalleeBinding::Declared,
+                known: None,
             },
             ret,
             pos,
@@ -2136,30 +2138,52 @@ impl Parser<'_> {
         // Look up the real function by its name. A declaration in scope is
         // checked against exactly as an ordinary call to it would be.
         let real_name_id = self.idents.lookup(real_name);
+        let row = real_name_id.and_then(LibraryBuiltin::by_bare_name);
         let symbol_id = real_name_id.and_then(|id| {
             self.symbols
                 .lookup_id(id, crate::symbol::Namespace::Ordinary)
         });
         if let Some(symbol_id) = symbol_id {
             let func_expr = self.library_callee(symbol_id, token_pos);
-            if !self.placeholder_prototypes.contains(&symbol_id) {
+            let placeholder = self.placeholder_prototypes.contains(&symbol_id);
+            if !placeholder {
                 let func_type = self.resolved_function_type(&func_expr);
                 self.check_call(func_type, &args, call_pos);
             }
-            return self.library_call(func_expr, args, token_pos);
+            // The reserved spelling means the library function whatever the
+            // program says about its bare name -- unless what it declared is
+            // a different function altogether, whose arguments a fold would
+            // misread.
+            let typ = self.symbols.get(symbol_id).typ;
+            let known = row
+                .filter(|lb| placeholder || self.library_prototype_matches(lb, typ))
+                .and_then(LibraryBuiltin::called);
+            return self.library_call(func_expr, args, known, token_pos);
         }
-        // Not declared. gcc knows these intrinsically and glibc relies on
-        // that: `bits/string_fortified.h` calls `__builtin___memcpy_chk`
-        // without ever declaring `__memcpy_chk`. Synthesize the declaration
-        // rather than failing. Its parameter types are placeholders (see
-        // `declare_chk_builtin`), so the arguments are not checked against
-        // them -- here or at a later call that finds it in scope.
+        // Not declared. gcc knows these intrinsically, and a program may
+        // call `__builtin_puts` without `<stdio.h>`. A function the table
+        // knows is declared with its own prototype, and its arguments are
+        // checked against it.
+        if let Some(lb) = row.filter(|lb| lb.called().is_some()) {
+            if let Some(symbol_id) = self.declare_known_library_function(lb) {
+                let func_expr = self.library_callee(symbol_id, token_pos);
+                let func_type = self.resolved_function_type(&func_expr);
+                self.check_call(func_type, &args, call_pos);
+                return self.library_call(func_expr, args, lb.called(), token_pos);
+            }
+        }
+        // glibc relies on the same: `bits/string_fortified.h` calls
+        // `__builtin___memcpy_chk` without ever declaring `__memcpy_chk`.
+        // Synthesize the declaration rather than failing. Its parameter types
+        // are placeholders (see `declare_chk_builtin`), so the arguments are
+        // not checked against them -- here or at a later call that finds it
+        // in scope.
         if let Some(symbol_id) = self
             .chk_builtin_return_type(real_name)
             .and_then(|ret| self.declare_chk_builtin(real_name, ret))
         {
             let func_expr = self.library_callee(symbol_id, token_pos);
-            return self.library_call(func_expr, args, token_pos);
+            return self.library_call(func_expr, args, None, token_pos);
         }
         diag::error_args(token_pos, "undeclared function '{0}'", &[real_name]);
         Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, token_pos)
@@ -2172,8 +2196,15 @@ impl Parser<'_> {
     }
 
     /// A call through `func` that reaches the library's function, never an
-    /// inline definition of the same name (see `CalleeBinding::Library`).
-    fn library_call(&self, func: Expr, args: Vec<Expr>, pos: Position) -> Expr {
+    /// inline definition of the same name (see `CalleeBinding::Library`),
+    /// and is `known` to call that library function.
+    fn library_call(
+        &self,
+        func: Expr,
+        args: Vec<Expr>,
+        known: Option<LibFn>,
+        pos: Position,
+    ) -> Expr {
         let ret_type = func
             .typ
             .and_then(|t| self.types.base_type(t))
@@ -2183,6 +2214,7 @@ impl Parser<'_> {
                 func: Box::new(func),
                 args,
                 binding: CalleeBinding::Library,
+                known,
             },
             ret_type,
             pos,
@@ -2355,6 +2387,10 @@ impl Parser<'_> {
     /// declaring one of them `int` truncates the returned address to 32 bits.
     /// `None` means "not a known `_chk` function", which stays an error.
     pub(crate) fn chk_builtin_return_type(&mut self, name: &str) -> Option<TypeId> {
+        // A function the prototype table knows returns what it says.
+        if let Some(ret) = self.library_return_type(name) {
+            return Some(ret);
+        }
         // What a `__builtin_nan` whose string is not a constant calls.
         if let Some(suffix) = FloatSuffix::of_nan_library_function(name) {
             return self.float_suffix_type(suffix);
@@ -2374,20 +2410,12 @@ impl Parser<'_> {
                     ..Default::default()
                 }))
             }
-            "__sprintf_chk" | "__snprintf_chk" | "__printf_chk" | "__fprintf_chk"
-            | "__vsprintf_chk" | "__vsnprintf_chk" | "__vprintf_chk" | "__vfprintf_chk" => {
+            "__sprintf_chk" | "__snprintf_chk" | "__vsprintf_chk" | "__vsnprintf_chk" => {
                 Some(self.types.int_id)
             }
             // The library builtins, for the case where the header that would
             // declare them has not been included.
-            "strlen" => Some(self.types.ulong_id),
-            "strcmp" | "abs" | "ffs" | "ffsl" | "ffsll" | "memcmp" | "strncmp" | "printf"
-            | "sprintf" | "snprintf" | "puts" | "putchar" | "printf_unlocked"
-            | "fprintf_unlocked" | "fputs_unlocked" | "fprintf" | "fputs" | "fputc" => {
-                Some(self.types.int_id)
-            }
-            "labs" => Some(self.types.long_id),
-            "llabs" => Some(self.types.longlong_id),
+            "ffs" | "ffsl" | "ffsll" | "snprintf" => Some(self.types.int_id),
             _ if Self::libm_real_kind(name).is_some() => Some(match Self::libm_real_kind(name) {
                 Some(LibmReal::Float) => self.types.float_id,
                 Some(LibmReal::LongDouble) => self.types.longdouble_id,
@@ -2407,25 +2435,20 @@ impl Parser<'_> {
                     ..Default::default()
                 }))
             }
-            "malloc" | "calloc" | "realloc" | "mempcpy" | "memchr" | "alloca" => {
-                Some(self.types.void_ptr_id)
-            }
-            // `bcopy` predates `memmove` and returns nothing; `index`/`rindex`
-            // are the old spellings of `strchr`/`strrchr`.
+            "malloc" | "calloc" | "realloc" | "mempcpy" | "alloca" => Some(self.types.void_ptr_id),
+            // `bcopy` predates `memmove` and returns nothing.
             "bcopy" | "bzero" => Some(self.types.void_id),
-            "imaxabs" => Some(self.types.long_id),
-            "strcspn" | "strspn" | "fwrite" => Some(self.types.ulong_id),
-            "strcpy" | "strncpy" | "stpcpy" | "stpncpy" | "strcat" | "strncat" | "strchr"
-            | "strrchr" | "strstr" | "index" | "rindex" | "strpbrk" => {
-                let char_id = self.types.char_id;
-                Some(self.types.intern(Type {
-                    kind: TypeKind::Pointer,
-                    base: Some(char_id),
-                    ..Default::default()
-                }))
-            }
+            "strspn" => Some(self.types.ulong_id),
+            "stpncpy" => Some(self.types.char_ptr_id),
             _ => None,
         }
+    }
+
+    /// The return type the prototype table gives the library function
+    /// `name`, if it has a row.
+    fn library_return_type(&self, name: &str) -> Option<TypeId> {
+        let lb = LibraryBuiltin::by_bare_name(self.idents.lookup(name)?)?;
+        Some(lb.return_type(self.types))
     }
 
     /// Builtins that are the library function of the same name.
@@ -2665,7 +2688,10 @@ impl Parser<'_> {
         args: Vec<Expr>,
         pos: Position,
     ) -> Expr {
-        let Some(symbol_id) = self.declare_libm_function_id(name_id, ret_type, params) else {
+        let func_type = self
+            .types
+            .intern(Type::function(ret_type, params.to_vec(), false, false));
+        let Some(symbol_id) = self.declare_library_function_id(name_id, func_type) else {
             let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, pos);
             return self.convert_operand(zero, ret_type);
         };
@@ -2676,6 +2702,7 @@ impl Parser<'_> {
                 func: Box::new(func_expr),
                 args,
                 binding: CalleeBinding::Library,
+                known: None,
             },
             ret_type,
             pos,
@@ -2690,26 +2717,22 @@ impl Parser<'_> {
         params: &[TypeId],
     ) -> Option<SymbolId> {
         let name_id = self.idents.lookup(name)?;
-        self.declare_libm_function_id(name_id, ret_type, params)
+        let func_type = self
+            .types
+            .intern(Type::function(ret_type, params.to_vec(), false, false));
+        self.declare_library_function_id(name_id, func_type)
     }
 
-    /// [`Self::declare_libm_function`], for a name already interned.
-    fn declare_libm_function_id(
+    /// Declare the library function `name_id` as of the function type
+    /// `func_type`, reusing any existing declaration.
+    pub(super) fn declare_library_function_id(
         &mut self,
         name_id: StringId,
-        ret_type: TypeId,
-        params: &[TypeId],
+        func_type: TypeId,
     ) -> Option<SymbolId> {
         if let Some(existing) = self.symbols.lookup_id(name_id, Namespace::Ordinary) {
             return Some(existing);
         }
-        let func_type = self.types.intern(Type {
-            kind: TypeKind::Function,
-            base: Some(ret_type),
-            params: Some(params.to_vec()),
-            variadic: false,
-            ..Default::default()
-        });
         let sym = Symbol::function(name_id, func_type, 0);
         self.symbols.declare(sym).ok()
     }
@@ -2739,33 +2762,20 @@ impl Parser<'_> {
             "__memset_chk" | "__strcpy_chk" | "__stpcpy_chk" | "__strcat_chk" => (3, false),
             "__memcpy_chk" | "__memmove_chk" | "__mempcpy_chk" | "__strncpy_chk"
             | "__stpncpy_chk" | "__strncat_chk" => (4, false),
-            "strlen" | "ffs" | "ffsl" | "ffsll" => (1, false),
-            "strcmp" | "bzero" | "strcasecmp" => (2, false),
+            "ffs" | "ffsl" | "ffsll" => (1, false),
+            "bzero" | "strcasecmp" => (2, false),
             "bcmp" | "stpncpy" | "strncasecmp" => (3, false),
             // The libm entry points, from the one table that knows them.
             _ if Self::libm_real_kind(name).is_some() => (Self::libm_arity(name), false),
             "abort" => (0, false),
             _ if FloatSuffix::of_nan_library_function(name).is_some() => (1, false),
-            "exit" | "puts" | "malloc" | "free" | "putchar" | "strdup" => (1, false),
-            "strndup" => (2, false),
-            "calloc" | "realloc" | "strcpy" | "stpcpy" | "strcat" | "strchr" | "strrchr"
-            | "strstr" | "index" | "rindex" | "strpbrk" | "strcspn" | "strspn" => (2, false),
-            "memcmp" | "mempcpy" | "strncpy" | "strncat" | "strncmp" | "memchr" | "bcopy" => {
-                (3, false)
-            }
-            // The printf family is variadic after its format string. Getting
-            // the fixed count right is what keeps the format argument in a
-            // register on Apple arm64, where variadic arguments go on the
-            // stack -- the same reason the `_chk` forms above are spelled out.
-            "printf" | "printf_unlocked" => (1, true),
-            // The stdio `_unlocked` forms. gcc has them, and the torture
-            // suite's builtins/ tests supply the library side themselves --
-            // glibc has no `printf_unlocked`, so gcc's own link fails without
-            // that. Only the three a real corpus uses are here.
-            "fprintf_unlocked" | "fprintf" => (2, true),
-            "fputs_unlocked" | "fputs" | "fputc" => (2, false),
-            "fwrite" => (4, false),
-            "sprintf" => (2, true),
+            "exit" | "malloc" | "free" | "strdup" => (1, false),
+            "strndup" | "calloc" | "realloc" | "strspn" => (2, false),
+            "mempcpy" | "bcopy" => (3, false),
+            // Variadic after its fixed arguments. Getting the fixed count
+            // right is what keeps them in registers on Apple arm64, where
+            // variadic arguments go on the stack -- the same reason the `_chk`
+            // forms above are spelled out.
             "snprintf" => (3, true),
             // An entry point this does not know is left as it was: variadic,
             // with nothing fixed.

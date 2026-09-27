@@ -14,8 +14,8 @@
 use crate::float::IntegralRounding;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Expr, ExprKind, ExternalDecl,
-    ForInit, FpTest, FunctionDef, InlineLibraryFn, MathErrno, MemoryFn, Stmt, TranslationUnit,
-    UnaryOp,
+    ForInit, FpTest, FunctionDef, InlineLibraryFn, LibFn, MathErrno, MemoryFn, Stmt,
+    TranslationUnit, UnaryOp,
 };
 use crate::parse::parser::{ParseResult, Parser};
 use crate::strings::{StringId, StringTable};
@@ -7612,9 +7612,43 @@ fn test_alias_attribute_reaches_its_declarator() {
     assert_eq!(got, want);
 }
 
+/// The expression `fname`'s body returns in its first statement.
+fn returned_expr<'t>(tu: &'t TranslationUnit, strings: &StringTable, fname: &str) -> &'t Expr {
+    let body = tu
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ExternalDecl::FunctionDef(f) if strings.get(f.name) == fname => Some(&f.body),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no definition of {fname}"));
+    let Stmt::Block(items) = body else {
+        panic!("{fname}: body is not a block");
+    };
+    let Some(BlockItem::Statement(stmt)) = items.first() else {
+        panic!("{fname}: expected a statement");
+    };
+    let Stmt::Return(Some(expr)) = &**stmt else {
+        panic!("{fname}: expected a return statement");
+    };
+    expr
+}
+
+/// The binding and library tag of the call `fname` returns.
+fn returned_call(
+    tu: &TranslationUnit,
+    strings: &StringTable,
+    fname: &str,
+) -> (CalleeBinding, Option<LibFn>) {
+    let ExprKind::Call { binding, known, .. } = &returned_expr(tu, strings, fname).kind else {
+        panic!("{fname}: expected a call");
+    };
+    (*binding, *known)
+}
+
 /// A library function spelled `__builtin_X` is a call to the library's `X`;
 /// the same function called by its own name is a call to whatever the unit
-/// declares, which may be an inline definition.
+/// declares, which may be an inline definition. Both are known to call it.
 #[test]
 fn test_library_builtin_call_binds_to_the_library() {
     let (tu, _types, strings, _symbols) = parse_tu(
@@ -7623,31 +7657,87 @@ fn test_library_builtin_call_binds_to_the_library() {
          char *own(char *d) { return strncpy(d, d, 1); }\n",
     )
     .unwrap();
-    let binding_in = |fname: &str| {
-        let body = tu
-            .items
-            .iter()
-            .find_map(|item| match item {
-                ExternalDecl::FunctionDef(f) if strings.get(f.name) == fname => Some(&f.body),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("no definition of {fname}"));
-        let Stmt::Block(items) = body else {
-            panic!("{fname}: body is not a block");
-        };
-        let Some(BlockItem::Statement(stmt)) = items.first() else {
-            panic!("{fname}: expected a statement");
-        };
-        let Stmt::Return(Some(expr)) = &**stmt else {
-            panic!("{fname}: expected a return statement");
-        };
-        let ExprKind::Call { binding, .. } = &expr.kind else {
-            panic!("{fname}: expected a call");
-        };
-        *binding
+    assert_eq!(
+        returned_call(&tu, &strings, "lib"),
+        (CalleeBinding::Library, Some(LibFn::Strncpy))
+    );
+    assert_eq!(
+        returned_call(&tu, &strings, "own"),
+        (CalleeBinding::Declared, Some(LibFn::Strncpy))
+    );
+}
+
+/// A call to a library function the optimizer knows is tagged with it
+/// where the name still means that function: declared with the library's
+/// prototype, by its old spelling (`index`), with a `FILE *` of the
+/// program's own, and even past a definition in the unit, since defining a
+/// reserved name is undefined (C17 7.1.3p2) and gcc folds `__printf_chk`
+/// past one.
+#[test]
+fn test_known_library_call_is_tagged() {
+    let (tu, _types, strings, _symbols) = parse_tu(
+        "unsigned long strlen(const char *);\n\
+         char *index(const char *, int);\n\
+         struct F;\n\
+         int fputs(const char *restrict, struct F *restrict);\n\
+         int __printf_chk(int flag, const char *fmt, ...) { return flag; }\n\
+         unsigned long len(void) { return strlen(\"ab\"); }\n\
+         char *ix(const char *s) { return index(s, 'a'); }\n\
+         int put(struct F *f) { return fputs(\"x\", f); }\n\
+         int chk(void) { return __printf_chk(1, \"%d\", 2); }\n",
+    )
+    .unwrap();
+    let known = |f| returned_call(&tu, &strings, f).1;
+    assert_eq!(known("len"), Some(LibFn::Strlen));
+    assert_eq!(known("ix"), Some(LibFn::Strchr));
+    assert_eq!(known("put"), Some(LibFn::Fputs));
+    assert_eq!(known("chk"), Some(LibFn::PrintfChk));
+}
+
+/// Where the name is the program's, the call is an ordinary one: a
+/// prototype that is not the library's (a different parameter, or a `...`
+/// the library does not have), and a call through a pointer rather than by
+/// name.
+#[test]
+fn test_known_library_call_is_not_tagged_where_the_name_is_the_programs() {
+    let (tu, _types, strings, _symbols) = parse_tu(
+        "int strlen(int);\n\
+         int puts(const char *, ...);\n\
+         unsigned long strnlen(const char *, unsigned long);\n\
+         int len(void) { return strlen(3); }\n\
+         int put(void) { return puts(\"x\", 1); }\n\
+         unsigned long ptr(void) { return (&strnlen)(\"ab\", 1); }\n\
+         unsigned long own(void) { return strnlen(\"ab\", 1); }\n",
+    )
+    .unwrap();
+    let known = |f| returned_call(&tu, &strings, f).1;
+    assert_eq!(known("len"), None);
+    assert_eq!(known("put"), None);
+    assert_eq!(known("ptr"), None);
+    assert_eq!(known("own"), Some(LibFn::Strnlen));
+}
+
+/// `__builtin_puts` with no declaration of `puts` in scope declares it with
+/// the library's own prototype -- so its arguments are checked and
+/// converted, and the call is known.
+#[test]
+fn test_undeclared_known_builtin_gets_the_library_prototype() {
+    let (tu, types, strings, symbols) =
+        parse_tu("int f(void) { return __builtin_puts(\"hi\"); }\n").unwrap();
+    assert_eq!(
+        returned_call(&tu, &strings, "f"),
+        (CalleeBinding::Library, Some(LibFn::Puts))
+    );
+    let ExprKind::Call { func, .. } = &returned_expr(&tu, &strings, "f").kind else {
+        unreachable!("returned_call found a call");
     };
-    assert_eq!(binding_in("lib"), CalleeBinding::Library);
-    assert_eq!(binding_in("own"), CalleeBinding::Declared);
+    let ExprKind::Ident(puts) = func.kind else {
+        panic!("expected a call by name");
+    };
+    let ft = types.get(symbols.get(puts).typ);
+    assert_eq!(ft.base, Some(types.int_id));
+    assert_eq!(ft.params.as_deref(), Some(&[types.const_char_ptr_id][..]));
+    assert!(!ft.variadic);
 }
 
 /// A statement expression whose last statement is a labeled expression

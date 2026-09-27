@@ -127,6 +127,55 @@ pub enum MathErrno {
     Ignored,
 }
 
+/// A library function whose call stays a call, but whose result the
+/// optimizer may know from its arguments (C17 7.1.4p1): `strlen("abc")` is 3,
+/// `strchr(s, 0)` is `s + strlen(s)`.
+///
+/// Carried on [`ExprKind::Call`] and on the IR call it becomes, so that a
+/// pass recognises the function by what the program called and not by its
+/// assembler name: `strstr` renamed with an asm label is still `strstr`. A
+/// call is tagged only where the name still means the library function --
+/// see `builtin_is_shadowed` -- and nothing about it changes until a fold
+/// proves its result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibFn {
+    Strlen,
+    Strnlen,
+    Strcmp,
+    Strncmp,
+    Memcmp,
+    /// `strchr`, and its old spelling `index`.
+    Strchr,
+    /// `strrchr`, and its old spelling `rindex`.
+    Strrchr,
+    Memchr,
+    Strstr,
+    Strpbrk,
+    Strcspn,
+    Strcpy,
+    Stpcpy,
+    Strncpy,
+    Strcat,
+    Strncat,
+    Sprintf,
+    Printf,
+    PrintfUnlocked,
+    Vprintf,
+    PrintfChk,
+    VprintfChk,
+    Fprintf,
+    FprintfUnlocked,
+    Vfprintf,
+    FprintfChk,
+    VfprintfChk,
+    Fputs,
+    FputsUnlocked,
+    Puts,
+    Putchar,
+    Fputc,
+    Fwrite,
+}
+
 impl InlineLibraryFn {
     /// How many arguments the function takes.
     pub fn arity(self) -> usize {
@@ -520,6 +569,8 @@ pub enum ExprKind {
         args: Vec<Expr>,
         /// Which definition a call by name reaches.
         binding: CalleeBinding,
+        /// The library function this calls, when the name still means it.
+        known: Option<LibFn>,
     },
 
     /// Member access: expr.member
@@ -1377,6 +1428,7 @@ impl Expr {
                 func: Box::new(func),
                 args,
                 binding: CalleeBinding::Declared,
+                known: None,
             },
             types.int_id,
             pos,

@@ -368,11 +368,8 @@ only qualify a pointer to object type.
 
 ### Still open
 
-Most of what is left is one thing.
-
 | Group | Note |
 |---|---|
-| Builtin folding | What is left of `execute/builtins/`. Each test defines its own `strlen`, `memcpy` or `printf` that calls `abort()` when `__OPTIMIZE__` is set, so a run-time failure there means c17 emitted a real call where gcc folded the builtin or expanded it inline. Nothing fails to *compile*, so no build is blocked; it is gcc-parity and code quality, and it is being worked. The functions that read strings fold (`ir::libcall_fold::strings`), and so do those that copy one (`copies`) and the output functions (`stdio`); still called where gcc folds or expands is `builtins/strlen`, whose strings are built by stores into a local array |
 | Dead-call elimination proofs | `20030330-1`, `medce-1` and `ieee/fp-cmp-7` at `-O0`, where a constant branch keeps its arm (recorded in DECISIONS.md). Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link* |
 
 One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.

@@ -53,6 +53,7 @@ aarch64/builtins/strlen-2@-O2
 aarch64/builtins/strlen-3@-O0
 aarch64/builtins/strlen-3@-O2
 aarch64/builtins/strlen@-O0
+aarch64/builtins/strlen@-O2
 aarch64/builtins/strncat@-O0
 aarch64/builtins/strncat@-O2
 aarch64/builtins/strncmp-2@-O0

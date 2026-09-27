@@ -348,6 +348,16 @@ impl Target {
         }
     }
 
+    /// Whether a multi-byte integer lies in this target's memory lowest
+    /// byte first. Every target here is little-endian; the host running the
+    /// compiler need not be, so what is stored is laid out by this, never
+    /// by the host's own order.
+    pub fn little_endian(&self) -> bool {
+        match self.arch {
+            Arch::X86_64 | Arch::Aarch64 => true,
+        }
+    }
+
     /// The width in bits of an integer type on this target.
     pub fn int_width(&self, t: IntType) -> u32 {
         match t {

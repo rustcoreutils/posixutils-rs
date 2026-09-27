@@ -48,6 +48,10 @@
 // `GlobalDef`, so both the base and the access type are checked, and a name
 // this translation unit does not define is assumed to be everything.
 //
+// The walk is `MemOracle`, and a load is only one of the things that asks
+// it: `libcall_fold` asks what a local array holds, a byte at a time, where
+// `strlen` reads it.
+//
 
 use super::constfold::unambiguous_at;
 use super::dominate::{domtree_build, DomTree};
@@ -119,11 +123,12 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
 /// What one function's memory holds at a point in it, as far as the stores
 /// and loads before that point say.
 ///
-/// A load asks it for the pseudo already holding its bytes (`value_at`).
-/// The walk is written once, for any question of that shape: up the
-/// dominator chain to the nearest instruction that answers, then over every
-/// path from there to the point for anything that writes the location in
-/// between. Only what counts as an answer is the asker's.
+/// A load asks it for the pseudo already holding its bytes (`value_at`); a
+/// library call that reads a local array asks it for that array's bytes one
+/// at a time (`byte_at`). Both are the same walk, which is written once here:
+/// up the dominator chain to the nearest instruction that answers, then over
+/// every path from there to the point for anything that writes the location
+/// in between. Only what counts as an answer differs.
 ///
 /// The analyses the walk needs are built by the first question, so a pass
 /// that asks none -- a function with no call worth folding -- pays nothing.
@@ -186,6 +191,28 @@ impl<'a> MemOracle<'a> {
     fn value_at(&self, site: (usize, usize), loc: &MemLoc) -> Option<Available> {
         let paths = self.paths()?;
         self.nearest(paths, site, loc, |insn| self.candidate(paths, insn, loc))
+    }
+
+    /// The byte `loc` -- one byte wide -- holds just before `site`, when a
+    /// store of a constant left it there: a one-byte store of it, or any
+    /// wider integer store that covers it, whose bytes lie in memory in the
+    /// order `little_endian` says.
+    ///
+    /// The order is the *target's*: the host that runs this compiler may
+    /// store its own integers the other way round.
+    pub(crate) fn byte_at(
+        &self,
+        site: (usize, usize),
+        loc: &MemLoc,
+        little_endian: bool,
+    ) -> Option<u8> {
+        if loc.size != 8 {
+            return None;
+        }
+        let paths = self.paths()?;
+        self.nearest(paths, site, loc, |insn| {
+            self.byte_candidate(paths, insn, loc, little_endian)
+        })
     }
 
     /// The answer the nearest instruction before `site` that answers for
@@ -278,6 +305,49 @@ impl<'a> MemOracle<'a> {
         }
     }
 
+    /// `candidate` for one byte, answered as its value: a store that covers
+    /// the byte answers when it stores an integer constant, and stops the
+    /// search when it stores anything else.
+    fn byte_candidate(
+        &self,
+        paths: &Paths,
+        insn: &Instruction,
+        loc: &MemLoc,
+        little_endian: bool,
+    ) -> Option<Candidate<u8>> {
+        match insn.op {
+            Opcode::Store => {
+                let s = self.am.location_of(self.func, insn);
+                let Some(at) = byte_index(&s, loc) else {
+                    return may_alias(&s, loc, self.mi).then_some(Candidate::Clobber);
+                };
+                // A floating-point constant is its bits only in its own
+                // format, which is not what `const_operand` holds. And the
+                // object a `volatile` store writes -- a `volatile char`
+                // element, a member -- may change after it, so its bytes are
+                // no fact whatever the object as a whole is.
+                let typ = s.typ.unwrap_or(self.types.int_id);
+                let plain = self.types.fp_format(typ).is_none()
+                    && !self
+                        .types
+                        .modifiers(typ)
+                        .intersects(TypeModifiers::VOLATILE | TypeModifiers::ATOMIC);
+                let byte = insn
+                    .src
+                    .get(1)
+                    .and_then(|&v| self.am.const_operand(self.func, v))
+                    .filter(|_| plain)
+                    .and_then(|c| byte_of(c, s.size / 8, at, little_endian));
+                Some(byte.map_or(Candidate::Clobber, Candidate::Value))
+            }
+            // A load writes nothing, and what it read is a pseudo, not a
+            // byte.
+            Opcode::Load => None,
+            _ if self.writes(paths, insn, loc) => Some(Candidate::Clobber),
+            _ => None,
+        }
+    }
+
     /// Could `insn` write `loc`?
     ///
     /// An allowlist read the safe way round: an opcode this does not
@@ -345,10 +415,7 @@ impl<'a> MemOracle<'a> {
             // escape analysis can say nothing about: a `pure` or `const`
             // function writes no memory the caller can observe, so a global
             // survives across it too.
-            Opcode::Call => {
-                mi.call_effect(insn.func_name.as_deref()).may_write()
-                    && paths.esc.is_captured(&loc.base)
-            }
+            Opcode::Call => mi.call_effect(insn).may_write() && paths.esc.is_captured(&loc.base),
 
             _ if !insn.op.may_access_memory() => false,
 
@@ -503,6 +570,27 @@ fn narrowing(
         value: v,
         narrow: (from > size).then_some(Narrowing { from, typ }),
     })
+}
+
+/// Which byte of the store `s` the one-byte access `b` is, counting from
+/// the store's lowest address; `None` unless `s` writes all of `b`.
+fn byte_index(s: &MemLoc, b: &MemLoc) -> Option<u32> {
+    if s.base == MemBase::Unknown || s.base != b.base || s.size == 0 || s.size % 8 != 0 {
+        return None;
+    }
+    let at = b.offset?.checked_sub(s.offset?)?;
+    let at = u32::try_from(at).ok()?;
+    (at < s.size / 8).then_some(at)
+}
+
+/// Byte `at`, counting from the lowest address, of the `width`-byte integer
+/// `c` as it lies in memory; `None` for a width no integer has.
+fn byte_of(c: i128, width: u32, at: u32, little_endian: bool) -> Option<u8> {
+    if width == 0 || width > 16 || at >= width {
+        return None;
+    }
+    let shift = if little_endian { at } else { width - 1 - at };
+    Some((c >> (8 * shift)) as u8)
 }
 
 /// May this location be forwarded from at all?
@@ -661,6 +749,38 @@ mod tests {
         fn op(&self, b: usize, i: usize) -> Opcode {
             self.f.blocks[b].insns[i].op
         }
+
+        /// What `byte_at` answers for byte `at` of `@a.0` just before the
+        /// last instruction of block 0, in the byte order `little_endian`
+        /// says.
+        fn byte(&mut self, at: i64, little_endian: bool) -> Option<u8> {
+            self.f.entry = self.f.blocks[0].id;
+            self.f.rebuild_block_idx();
+            let mi = module_info(&self.types);
+            let am = AddrMap::build(&self.f);
+            let oracle = MemOracle::new(&self.f, &self.types, &mi, &am);
+            let loc = MemLoc {
+                base: MemBase::Local(PseudoId(0)),
+                offset: Some(at),
+                size: 8,
+                typ: Some(self.types.uchar_id),
+            };
+            let site = (0, self.f.blocks[0].insns.len() - 1);
+            oracle.byte_at(site, &loc, little_endian)
+        }
+
+        /// A constant pseudo holding `v`.
+        fn konst(&mut self, v: i128) -> PseudoId {
+            self.f.create_const_pseudo(v)
+        }
+    }
+
+    fn ret() -> Instruction {
+        Instruction::new(Opcode::Ret)
+    }
+
+    fn store8(v: PseudoId, at: i64, types: &TypeTable) -> Instruction {
+        Instruction::store(v, PseudoId(10), at, types.char_id, 8)
     }
 
     fn entry() -> Instruction {
@@ -1200,5 +1320,137 @@ mod tests {
         );
         assert!(!b.run());
         assert_eq!(b.op(0, 4), Opcode::Load);
+    }
+
+    /// Each byte of a local is what the last store to it left, read one
+    /// byte at a time; a byte nothing stored is not known.
+    #[test]
+    fn oracle_reads_bytes_stored_one_at_a_time() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        let (x, y) = (b.konst(0x61), b.konst(0x62));
+        let insns = vec![
+            entry(),
+            Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+            store8(x, 0, &b.types),
+            store8(PseudoId(6), 1, &b.types),
+            store8(y, 1, &b.types),
+            ret(),
+        ];
+        b.block(0, insns, vec![]);
+        assert_eq!(b.byte(0, true), Some(0x61));
+        assert_eq!(b.byte(1, true), Some(0x62), "the later store wins");
+        assert_eq!(b.byte(2, true), None, "nothing stored byte 2");
+    }
+
+    /// A byte whose value is not a constant stops the reader at that byte,
+    /// and says nothing about its neighbours.
+    #[test]
+    fn oracle_refuses_a_byte_it_does_not_know() {
+        let mut b = Build::new();
+        let (i32t, i8t) = (b.types.int_id, b.types.char_id);
+        let x = b.konst(0x61);
+        b.f.add_param("c", i32t);
+        b.f.add_pseudo(Pseudo::arg(PseudoId(30), 0));
+        let insns = vec![
+            entry(),
+            Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+            store8(x, 0, &b.types),
+            Instruction::store(PseudoId(30), PseudoId(10), 1, i8t, 8),
+            ret(),
+        ];
+        b.block(0, insns, vec![]);
+        assert_eq!(b.byte(0, true), Some(0x61));
+        assert_eq!(b.byte(1, true), None);
+    }
+
+    /// A wider constant store supplies each byte it covers, in the order the
+    /// *target* lays an integer out -- asked both ways, whatever the host.
+    #[test]
+    fn oracle_extracts_a_byte_of_a_wider_store_by_target_byte_order() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        let w = b.konst(0x0403_0201);
+        let z = b.konst(9);
+        let insns = vec![
+            entry(),
+            Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+            Instruction::store(w, PseudoId(10), 0, i32t, 32),
+            store8(z, 1, &b.types),
+            ret(),
+        ];
+        b.block(0, insns, vec![]);
+        assert_eq!(b.byte(0, true), Some(1));
+        assert_eq!(b.byte(3, true), Some(4));
+        assert_eq!(b.byte(0, false), Some(4));
+        assert_eq!(b.byte(2, false), Some(2));
+        assert_eq!(b.byte(1, true), Some(9), "a later byte store overrides");
+        assert_eq!(b.byte(4, true), None, "past the wide store");
+    }
+
+    /// The byte a wider store holds, counting from its lowest address.
+    #[test]
+    fn oracle_byte_of_follows_the_order_asked() {
+        assert_eq!(byte_of(0x0102, 2, 0, true), Some(2));
+        assert_eq!(byte_of(0x0102, 2, 0, false), Some(1));
+        assert_eq!(byte_of(-1, 1, 0, true), Some(0xff));
+        assert_eq!(byte_of(-2, 8, 7, true), Some(0xff));
+        assert_eq!(byte_of(1, 2, 2, true), None, "outside the value");
+        assert_eq!(byte_of(1, 0, 0, true), None);
+    }
+
+    /// A store of anything but an integer constant -- a floating-point
+    /// value, or through a `volatile` type -- stops the search rather than
+    /// being read as bytes.
+    #[test]
+    fn oracle_refuses_a_volatile_or_floating_store() {
+        for which in ["volatile", "float"] {
+            let mut b = Build::new();
+            let i32t = b.types.int_id;
+            let typ = if which == "volatile" {
+                b.types.intern(crate::types::Type::with_modifiers(
+                    crate::types::TypeKind::Char,
+                    TypeModifiers::VOLATILE,
+                ))
+            } else {
+                b.types.float_id
+            };
+            let (x, y) = (b.konst(0x61), b.konst(0x62));
+            let size = b.types.size_bits(typ);
+            let insns = vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                store8(x, 0, &b.types),
+                Instruction::store(y, PseudoId(10), 0, typ, size),
+                ret(),
+            ];
+            b.block(0, insns, vec![]);
+            assert_eq!(b.byte(0, true), None, "{which}");
+        }
+    }
+
+    /// Once the local's address has been handed to a callee, a call that
+    /// may write stops the walk -- unless it is one of the library's
+    /// functions that only read.
+    #[test]
+    fn oracle_crosses_only_a_reading_library_call_of_a_captured_local() {
+        for known in [None, Some(crate::parse::ast::LibFn::Strlen)] {
+            let mut b = Build::new();
+            let i32t = b.types.int_id;
+            let x = b.konst(0x61);
+            let ptr = b.types.char_ptr_id;
+            let mut c = Instruction::call(None, "strlen", vec![PseudoId(10)], vec![ptr], i32t, 32);
+            c.known = known;
+            let insns = vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                store8(x, 0, &b.types),
+                c,
+                ret(),
+            ];
+            b.block(0, insns, vec![]);
+            let want = known.map(|_| 0x61);
+            assert_eq!(b.byte(0, true), want, "{known:?}");
+        }
     }
 }

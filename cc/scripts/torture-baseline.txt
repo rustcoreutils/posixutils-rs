@@ -53,6 +53,7 @@ builtins/strlen-2@-O2
 builtins/strlen-3@-O0
 builtins/strlen-3@-O2
 builtins/strlen@-O0
+builtins/strlen@-O2
 builtins/strncat@-O0
 builtins/strncat@-O2
 builtins/strncmp-2@-O0

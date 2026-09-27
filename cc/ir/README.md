@@ -343,7 +343,8 @@ extern_symbols          - symbols needing GOT
 | `inline.rs` | Function inlining |
 | `memexpand.rs` | A `memcpy`, `memset` or `memmove` of a small constant length becomes integer loads and stores, at every level. Also owns the chunking and the size limit the linearizer's aggregate copies use |
 | `build.rs` | `Builder`: the instructions that replace one instruction -- new pseudos, constants, loads, stores, operations -- at its source position. Not a pass; shared by `memexpand` and `libcall_fold` |
-| `strdata.rs` | The bytes of every object whose contents hold for the whole run (string literals, and `const` `char` arrays by `constglobal`'s rule), and the string a pointer into one reads -- or, for a length, the one length every `Select` and phi arm agrees on. Not a pass |
+| `loadfwd.rs` | Store-to-load forwarding and redundant load elimination, and `MemOracle`, the walk they ask: what a location holds just before an instruction, as a pseudo or, for one byte, a constant |
+| `strdata.rs` | The bytes of every object whose contents hold for the whole run (string literals, and `const` `char` arrays by `constglobal`'s rule), and the string a pointer into one reads -- or, for a length, the one length every `Select` and phi arm agrees on, which for a local array is what `MemOracle` says the stores before the call left in it. Not a pass |
 | `libcall_fold/` | A call the parser tagged as a known library function (`Instruction::known`) becomes its result where the arguments decide it: `strlen("abc")` is 3, `strcmp(p, "")` the first byte of `p`; and an output call whose result is unused becomes a cheaper one that writes the same bytes: `printf("hi\n")` is `puts("hi")`; and a `Memmove` whose blocks cannot overlap becomes a `Memcpy`. A dispatcher and one module per family of functions |
 | `lower.rs` | Phi elimination to copies |
 

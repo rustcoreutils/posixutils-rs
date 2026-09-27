@@ -344,9 +344,11 @@ Once optimizing, a call to `strlen`, `strnlen`, `strcmp`, `strncmp`, `memcmp`,
 `strchr`, `strrchr`, `index`, `rindex`, `memchr`, `strstr`, `strpbrk` or
 `strcspn`, by either spelling, is computed in place where its arguments decide
 the result, as gcc does: the bytes of a string literal or of a `const` `char`
-array defined in the translation unit are read, `strcmp(p, "")` is the first
-byte of `p`, and `strstr(p, "c")` is `strchr(p, 'c')`. A `strncmp` or `memcmp`
-of the constant length 0 is 0 at every level. `-fno-builtin` and
+array defined in the translation unit are read, and for `strlen` and `strnlen`
+so are a local array's, where every byte the stores before the call leave in
+it up to a terminator is a constant; `strcmp(p, "")` is the first byte of
+`p`, and `strstr(p, "c")` is `strchr(p, 'c')`. A `strncmp` or `memcmp` of the
+constant length 0 is 0 at every level. `-fno-builtin` and
 `-fno-builtin-NAME` keep the bare name's call, as does a declaration of the
 name with another prototype.
 

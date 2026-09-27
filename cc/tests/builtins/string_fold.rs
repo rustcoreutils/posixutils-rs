@@ -14,7 +14,7 @@
 // it, and `strcmp(p, "")` is the first byte of `p`.
 //
 
-use crate::common::{asm_for_at, compile_and_run, compile_and_run_aarch64};
+use crate::common::{asm_for_at, asm_prefix, compile_and_run, compile_and_run_aarch64};
 
 /// `__builtin_puts`, `__builtin_putchar` and `__builtin_printf` need no
 /// declaration of the library function: gcc knows each one's prototype, and
@@ -234,10 +234,6 @@ fn builtins_string_fold_keeps_the_call_otherwise() {
             "strchr",
             "char *f(const char *p) { return strchr(p, 'a'); }",
         ),
-        (
-            "strlen",
-            "size_t f(void) { char b[32]; b[0] = 'a'; b[1] = 0; return strlen(b); }",
-        ),
     ];
     for (name, body) in unknown {
         let src = format!("{PROTOTYPES}{body}\n");
@@ -256,6 +252,129 @@ fn builtins_string_fold_keeps_the_call_otherwise() {
             !mentions(asm, "strncmp"),
             "{what}: strncmp was called:\n{asm}"
         );
+    });
+}
+
+/// Functions reading a local array whose bytes the stores before the call
+/// decide, and ones where something else may have written it.
+const LOCAL_ARRAYS: &str = r#"
+void *memcpy(void *, const void *, size_t);
+volatile int vk = 1;
+
+__attribute__((noinline)) static void grow(char *p) { p[1] = 'y'; p[2] = 0; }
+
+size_t by_bytes(void) {
+    char str[8];
+    char *ptr = str;
+    ptr[0] = 'n'; ptr[1] = 't'; ptr[2] = 's'; ptr[3] = '\0';
+    return strlen(ptr) + strlen(ptr + 3) + strlen(str + 1);
+}
+size_t by_word(void) { char s[8]; unsigned v = 0x00636261; memcpy(s, &v, 4); return strlen(s); }
+size_t by_word_mid(void) {
+    char s[8];
+    unsigned v = 0x61626364;
+    memcpy(s, &v, 4);
+    s[3] = 0;
+    return strlen(s + 1);
+}
+size_t high_byte(void) { char s[4]; s[0] = '\xff'; s[1] = 0; return strnlen(s, 4); }
+size_t across_reader(void) {
+    char s[4];
+    s[0] = 'a'; s[1] = 0;
+    size_t n = strlen(s + (vk - 1));
+    return n + strlen(s);
+}
+size_t one_arm(void) { char s[4] = "ab"; if (vk) s[1] = 0; return strlen(s); }
+size_t captured(void) { char s[4]; s[0] = 'x'; s[1] = 0; grow(s); return strlen(s); }
+size_t vol(void) { volatile char s[4]; s[0] = 'x'; s[1] = 0; return strlen((char *)s); }
+size_t unknown_byte(void) { char s[4]; s[0] = 'a'; s[1] = (char)vk; s[2] = 0; return strlen(s); }
+size_t in_loop(void) {
+    char s[4] = {'a', 'b', 0, 0};
+    size_t n = 0;
+    for (int i = 0; i < 3; i++) {
+        n += strlen(s);
+        s[2] = 'c';
+    }
+    return n;
+}
+"#;
+
+/// Each function of `LOCAL_ARRAYS` against the length the library finds.
+fn local_arrays_program() -> String {
+    format!(
+        "{PROTOTYPES}{LOCAL_ARRAYS}{}",
+        r#"
+int main(void) {
+    if (by_bytes() != 3 + 0 + 2) return 1;
+    if (by_word() != 3) return 2;
+    if (by_word_mid() != 2) return 3;
+    if (high_byte() != 1) return 4;
+    if (across_reader() != 2) return 5;
+    if (one_arm() != 1) return 6;
+    if (captured() != 2) return 7;
+    if (vol() != 1) return 8;
+    if (unknown_byte() != 2) return 9;
+    if (in_loop() != 2 + 3 + 3) return 10;
+    return 0;
+}
+"#
+    )
+}
+
+#[test]
+fn builtins_string_fold_local_array_values() {
+    let code = local_arrays_program();
+    for opt in ["-O0", "-O1", "-O2"] {
+        let name = format!("string_fold_local{}", opt.replace('-', "_"));
+        assert_eq!(
+            compile_and_run(&name, &code, &[opt.to_string()]),
+            0,
+            "host {opt}"
+        );
+        if opt != "-O1" {
+            let name = format!("string_fold_local_a64{}", opt.replace('-', "_"));
+            if let Some(rc) = compile_and_run_aarch64(&name, &code, opt) {
+                assert_eq!(rc, 0, "aarch64 {opt}");
+            }
+        }
+    }
+}
+
+/// The body of the function `name` in `asm`: from its label to the end of
+/// its frame description.
+fn function_body(asm: &str, name: &str) -> String {
+    let label = format!("{}{name}:", asm_prefix(asm, name));
+    asm.lines()
+        .skip_while(|l| *l != label)
+        .take_while(|l| !l.contains(".cfi_endproc"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A local array whose bytes are all known at the call is never passed to
+/// `strlen`; one that something else may have written still is.
+#[test]
+fn builtins_string_fold_local_array_calls() {
+    let src = format!("{PROTOTYPES}{LOCAL_ARRAYS}");
+    for_each_target("string_fold_local_asm", &src, &["-O2"], |asm, what| {
+        for f in ["by_bytes", "by_word", "by_word_mid", "high_byte"] {
+            let body = function_body(asm, f);
+            assert!(body.len() > f.len(), "{what}: no {f}:\n{asm}");
+            assert!(
+                !mentions(&body, "strlen") && !mentions(&body, "strnlen"),
+                "{what}: {f} calls:\n{body}"
+            );
+        }
+        let body = function_body(asm, "across_reader");
+        assert_eq!(
+            body.lines().filter(|l| mentions(l, "strlen")).count(),
+            1,
+            "{what}: only the unknown offset is called:\n{body}"
+        );
+        for f in ["one_arm", "captured", "vol", "unknown_byte", "in_loop"] {
+            let body = function_body(asm, f);
+            assert!(mentions(&body, "strlen"), "{what}: {f} folded:\n{body}");
+        }
     });
 }
 

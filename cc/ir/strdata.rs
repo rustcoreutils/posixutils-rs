@@ -13,9 +13,13 @@
 // (C17 6.4.5p7). And a `char` array defined `const` in this translation unit
 // with an initializer, by the rule `constglobal` applies to a scalar -- a
 // store to it is undefined too (C17 6.7.3p6), unless it is weak, `volatile`,
-// thread-local or tentative. A local array is neither, however it was
-// initialized: its bytes are ordinary stores, which the library calls that
-// read it cannot see past.
+// thread-local or tentative.
+//
+// A local array is neither: its bytes are ordinary stores, so what it holds
+// is a fact about one point in the function, not about the run. Its string
+// is read only for a length, and only at the call that asks: `MemOracle`
+// answers for each byte in turn what the stores before that call left there,
+// and the length is known when every byte up to a terminator is a constant.
 //
 // A pointer reads a known string when `AddrMap` resolves it to one of these
 // objects at a constant offset inside it. `string_len` goes further, for
@@ -29,7 +33,8 @@
 //
 
 use super::constglobal;
-use super::memloc::{AddrMap, MemBase};
+use super::loadfwd::MemOracle;
+use super::memloc::{AddrMap, MemBase, MemLoc};
 use super::{Function, GlobalDef, Initializer, Module, Opcode, PseudoId};
 use crate::token::lexer::payload_bytes;
 use crate::types::{TypeKind, TypeModifiers, TypeTable};
@@ -37,6 +42,10 @@ use std::collections::{HashMap, HashSet};
 
 /// How many definitions `string_len` follows before it gives up.
 const MAX_WALK: usize = 64;
+
+/// How many bytes of a local array `string_len` reads before it gives up:
+/// each is a walk of its own over the function.
+const MAX_LOCAL_STRING: usize = 256;
 
 /// The bytes of every object whose contents are known for the whole run,
 /// by symbol.
@@ -159,11 +168,38 @@ pub(crate) struct StrReader<'a> {
     data: &'a ConstBytes,
     func: &'a Function,
     am: &'a AddrMap,
+    /// Where a local array's bytes are read, when they are.
+    locals: Option<LocalBytes<'a>>,
+}
+
+/// What a local array holds at one point in its function.
+pub(crate) struct LocalBytes<'a> {
+    pub(crate) oracle: &'a MemOracle<'a>,
+    pub(crate) types: &'a TypeTable,
+    /// The instruction the bytes are read just before: the call reading
+    /// them.
+    pub(crate) site: (usize, usize),
+    /// The target's byte order, for a byte of a wider store.
+    pub(crate) little_endian: bool,
 }
 
 impl<'a> StrReader<'a> {
     pub(crate) fn new(data: &'a ConstBytes, func: &'a Function, am: &'a AddrMap) -> Self {
-        StrReader { data, func, am }
+        StrReader {
+            data,
+            func,
+            am,
+            locals: None,
+        }
+    }
+
+    /// This reader, also reading a local array for a length, as `locals`
+    /// says it holds.
+    pub(crate) fn with_locals(self, locals: LocalBytes<'a>) -> Self {
+        StrReader {
+            locals: Some(locals),
+            ..self
+        }
     }
 
     /// The object `p` points into, and how far into it, when it is known and
@@ -200,9 +236,13 @@ impl<'a> StrReader<'a> {
             return Some(Walk::Len(Len::Const(s.c_str()?.len() as u64)));
         }
         // An address with a place -- a local, or outside the object -- is
-        // not a string this knows, whatever its arithmetic looks like.
-        if self.am.resolve(self.func, p, 0, 0, None).base != MemBase::Unknown {
-            return None;
+        // not a string this knows, whatever its arithmetic looks like;
+        // unless it is a local whose bytes are known here.
+        let loc = self.am.resolve(self.func, p, 0, 0, None);
+        match loc.base {
+            MemBase::Local(_) => return self.local_len(&loc).map(|n| Walk::Len(Len::Const(n))),
+            MemBase::Global(_) => return None,
+            MemBase::Unknown => {}
         }
         let def = self.am.def(self.func, p)?;
         match (def.op, def.src.as_slice()) {
@@ -222,6 +262,35 @@ impl<'a> StrReader<'a> {
             }
             _ => None,
         }
+    }
+
+    /// The length of the string at `at`, in a local array, when every byte
+    /// from there to a terminator is a constant just before the call; never
+    /// reading past the array's end.
+    fn local_len(&self, at: &MemLoc) -> Option<u64> {
+        let locals = self.locals.as_ref()?;
+        let MemBase::Local(sym) = at.base else {
+            return None;
+        };
+        let size = locals.types.size_bytes(self.func.local_of(sym)?.typ);
+        let start = usize::try_from(at.offset?).ok()?;
+        let end = size.min(start.saturating_add(MAX_LOCAL_STRING));
+        for (len, offset) in (start..end).enumerate() {
+            let byte = MemLoc {
+                base: at.base.clone(),
+                offset: Some(i64::try_from(offset).ok()?),
+                size: 8,
+                typ: Some(locals.types.uchar_id),
+            };
+            if locals
+                .oracle
+                .byte_at(locals.site, &byte, locals.little_endian)?
+                == 0
+            {
+                return Some(len as u64);
+            }
+        }
+        None
     }
 
     /// The one length every arm gives, ignoring the arms that only cycle.
@@ -362,6 +431,25 @@ pub(crate) mod fixture {
             self.push(phi);
         }
 
+        /// A local `char name[size]`, and its address.
+        pub(crate) fn local_array(&mut self, name: &str, size: usize) -> PseudoId {
+            let arr = self.types.intern(Type::array(self.types.char_id, size));
+            let f = self.func();
+            let sym = f.alloc_pseudo();
+            f.add_pseudo(Pseudo::sym(sym, name.to_string()));
+            f.add_local(name, sym, arr, false, false, None, None);
+            let p = f.alloc_pseudo();
+            let ptr = self.types.char_ptr_id;
+            self.push(Instruction::sym_addr(p, sym, ptr));
+            p
+        }
+
+        /// `p[at] = v`, one `char` wide.
+        pub(crate) fn store_byte(&mut self, p: PseudoId, at: i64, v: PseudoId) {
+            let c = self.types.char_id;
+            self.push(Instruction::store(v, p, at, c, 8));
+        }
+
         pub(crate) fn fresh(&mut self) -> PseudoId {
             self.func().alloc_pseudo()
         }
@@ -389,6 +477,25 @@ pub(crate) mod fixture {
             let f = &self.module.functions[0];
             let am = AddrMap::build(f);
             StrReader::new(&bytes, f, &am).string_len(p)
+        }
+
+        /// What `string_len` answers for `p` reading local arrays too, as
+        /// they are after the last instruction.
+        pub(crate) fn len_here(&self, p: PseudoId) -> Option<Len> {
+            let bytes = ConstBytes::build(&self.module, &self.types);
+            let f = &self.module.functions[0];
+            let am = AddrMap::build(f);
+            let mi = crate::ir::memloc::ModuleInfo::build(&self.module, &self.types);
+            let oracle = MemOracle::new(f, &self.types, &mi, &am);
+            let locals = LocalBytes {
+                oracle: &oracle,
+                types: &self.types,
+                site: (0, f.blocks[0].insns.len()),
+                little_endian: true,
+            };
+            StrReader::new(&bytes, f, &am)
+                .with_locals(locals)
+                .string_len(p)
         }
 
         /// The C string `string_at` finds at `p`.
@@ -519,5 +626,56 @@ mod tests {
         let s = fx.select(r, c);
         fx.phi_into(r, &[a, s]);
         assert_eq!(fx.len(r), None);
+    }
+
+    /// A local array's string is read a byte at a time from the stores
+    /// before the point asked about -- and only by a reader told to.
+    #[test]
+    fn a_local_array_reads_as_what_was_stored_in_it() {
+        let mut fx = Fixture::new();
+        let s = fx.local_array("s.0", 8);
+        for (at, v) in [(0, b'n'), (1, b't'), (2, 0)] {
+            let v = fx.konst(v.into());
+            fx.store_byte(s, at, v);
+        }
+        let one = fx.konst(1);
+        let s1 = fx.op(Opcode::Add, s, one);
+        assert_eq!(fx.len_here(s), Some(Len::Const(2)));
+        assert_eq!(fx.len_here(s1), Some(Len::Const(1)));
+        assert_eq!(fx.len(s), None, "without the locals, nothing");
+
+        // Both arms of a choice read the same local memory.
+        let lit = fx.literal("ab");
+        let l = fx.addr(&lit);
+        let either = fx.select(s, l);
+        assert_eq!(fx.len_here(either), Some(Len::Const(2)));
+    }
+
+    /// Every byte up to the terminator must be known; the array's end comes
+    /// first when none is found; and an unknown offset into a local says
+    /// nothing, however full its string is.
+    #[test]
+    fn a_local_array_refuses_what_it_does_not_know() {
+        let mut fx = Fixture::new();
+        let (a, z) = (fx.konst(b'a'.into()), fx.konst(0));
+        let gap = fx.local_array("gap.0", 4);
+        fx.store_byte(gap, 0, a);
+        fx.store_byte(gap, 2, z);
+        let full = fx.local_array("full.0", 2);
+        fx.store_byte(full, 0, a);
+        fx.store_byte(full, 1, a);
+        let odd = fx.local_array("odd.0", 4);
+        let u = fx.unknown();
+        fx.store_byte(odd, 0, u);
+        fx.store_byte(odd, 1, z);
+        let ok = fx.local_array("ok.0", 4);
+        fx.store_byte(ok, 0, a);
+        fx.store_byte(ok, 1, z);
+        let i = fx.unknown();
+        let oki = fx.op(Opcode::Add, ok, i);
+        for (what, p) in [("gap", gap), ("full", full), ("odd", odd), ("ok + i", oki)] {
+            assert_eq!(fx.len_here(p), None, "{what}");
+        }
+        assert_eq!(fx.len_here(ok), Some(Len::Const(1)));
     }
 }

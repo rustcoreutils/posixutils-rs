@@ -182,6 +182,28 @@ pub enum LibFn {
     Fwrite,
 }
 
+impl LibFn {
+    /// Whether the function reads memory and writes none, so a call to it
+    /// leaves every object as it found it.
+    pub fn only_reads(self) -> bool {
+        use LibFn as L;
+        matches!(
+            self,
+            L::Strlen
+                | L::Strnlen
+                | L::Strcmp
+                | L::Strncmp
+                | L::Memcmp
+                | L::Strchr
+                | L::Strrchr
+                | L::Memchr
+                | L::Strstr
+                | L::Strpbrk
+                | L::Strcspn
+        )
+    }
+}
+
 impl InlineLibraryFn {
     /// How many arguments the function takes.
     pub fn arity(self) -> usize {

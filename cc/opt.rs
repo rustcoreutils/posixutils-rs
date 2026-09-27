@@ -290,6 +290,7 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
     let fold = libcall_fold::FoldCtx {
         types,
         target,
+        mi: &mi,
         bytes: &bytes,
         callees: &module.library_symbols,
         literals: &literals,

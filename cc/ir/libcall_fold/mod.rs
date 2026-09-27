@@ -35,8 +35,9 @@ mod strings;
 
 use super::build::Builder;
 use super::facts::ConstMap;
-use super::memloc::{AddrMap, MemBase};
-use super::strdata::{ConstBytes, StrReader};
+use super::loadfwd::MemOracle;
+use super::memloc::{AddrMap, MemBase, ModuleInfo};
+use super::strdata::{ConstBytes, LocalBytes, StrReader};
 use super::{string_label, Function, Instruction, Opcode, PseudoId};
 use crate::abi::CallingConv;
 use crate::parse::ast::{CalleeBinding, LibFn};
@@ -50,6 +51,8 @@ use std::collections::{HashMap, HashSet};
 pub struct FoldCtx<'a> {
     pub(crate) types: &'a TypeTable,
     pub(crate) target: &'a Target,
+    /// What the memory walk needs about the module's globals and callees.
+    pub(crate) mi: &'a ModuleInfo,
     /// The objects whose bytes are known.
     pub(crate) bytes: &'a ConstBytes,
     /// `Module::library_symbols`: whom a call a fold makes calls.
@@ -153,8 +156,9 @@ pub(crate) struct Facts<'a> {
     am: &'a AddrMap,
     func: &'a Function,
     pub(crate) strings: StrReader<'a>,
-    /// Every pseudo some instruction reads, built on first asking.
-    used: OnceCell<HashSet<PseudoId>>,
+    /// Every pseudo some instruction reads, built on first asking and shared
+    /// by every call in the function.
+    used: &'a OnceCell<HashSet<PseudoId>>,
 }
 
 impl Facts<'_> {
@@ -207,19 +211,29 @@ type Site = ((usize, usize), Folded);
 fn collect(func: &Function, ctx: &FoldCtx) -> Vec<Site> {
     let am = AddrMap::build(func);
     let consts = ConstMap::new(func);
-    let facts = Facts {
-        types: ctx.types,
-        consts: &consts,
-        am: &am,
-        func,
-        strings: StrReader::new(ctx.bytes, func, &am),
-        used: OnceCell::new(),
-    };
+    let oracle = MemOracle::new(func, ctx.types, ctx.mi, &am);
+    let used = OnceCell::new();
     let mut sites = Vec::new();
     for (b, bb) in func.blocks.iter().enumerate() {
         for (i, insn) in bb.insns.iter().enumerate() {
             let Some(known) = insn.known.filter(|_| is_direct_call(insn)) else {
                 continue;
+            };
+            // A local array's bytes are what the stores before this call
+            // left in it.
+            let locals = LocalBytes {
+                oracle: &oracle,
+                types: ctx.types,
+                site: (b, i),
+                little_endian: ctx.target.little_endian(),
+            };
+            let facts = Facts {
+                types: ctx.types,
+                consts: &consts,
+                am: &am,
+                func,
+                strings: StrReader::new(ctx.bytes, func, &am).with_locals(locals),
+                used: &used,
             };
             let Some(folded) = fold(known, insn, &facts) else {
                 continue;
@@ -438,6 +452,7 @@ pub(super) mod tests {
         f: impl FnOnce(&FoldCtx) -> R,
     ) -> (R, Vec<(String, String)>) {
         let bytes = ConstBytes::build(&fx.module, &fx.types);
+        let mi = ModuleInfo::build(&fx.module, &fx.types);
         let target = Target::host();
         let callees: HashMap<&'static str, String> =
             callees.iter().map(|&(c, a)| (c, a.to_string())).collect();
@@ -445,6 +460,7 @@ pub(super) mod tests {
         let answer = f(&FoldCtx {
             types: &fx.types,
             target: &target,
+            mi: &mi,
             bytes: &bytes,
             callees: &callees,
             literals: &literals,

@@ -292,6 +292,26 @@ mod tests {
         assert_eq!(fold1(&mut fx, LibFn::Strlen, &[u]), None);
     }
 
+    /// A local array's length is what the stores before *this* call left:
+    /// a store after one call is seen by the next and not by it.
+    #[test]
+    fn strlen_of_a_local_array_reads_it_at_the_call() {
+        let mut fx = Fixture::new();
+        let s = fx.local_array("s.0", 4);
+        let (a, z) = (fx.konst(b'a'.into()), fx.konst(0));
+        fx.store_byte(s, 0, a);
+        fx.store_byte(s, 1, z);
+        assert_eq!(fold1(&mut fx, LibFn::Strlen, &[s]), Some(Folded::Int(1)));
+        fx.store_byte(s, 1, a);
+        fx.store_byte(s, 2, z);
+        assert_eq!(fold1(&mut fx, LibFn::Strlen, &[s]), Some(Folded::Int(2)));
+        let n = fx.unknown();
+        assert_eq!(
+            fold1(&mut fx, LibFn::Strnlen, &[s, n]),
+            Some(Folded::AtMost { n, len: 2 })
+        );
+    }
+
     #[test]
     fn strnlen_is_the_smaller_even_of_an_unknown_bound() {
         let mut fx = Fixture::new();

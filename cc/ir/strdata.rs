@@ -23,6 +23,10 @@
 // and through `p + i` for an `i` it does not know, when the object is one
 // string that fills it -- then the length is the whole string's less `i`.
 //
+// Whatever their type, the objects of both kinds are also the read-only
+// ones: a block move out of one cannot overlap its destination, since
+// nothing may be written there (`libcall_fold::memory`).
+//
 
 use super::constglobal;
 use super::memloc::{AddrMap, MemBase};
@@ -38,22 +42,39 @@ const MAX_WALK: usize = 64;
 /// by symbol.
 pub(crate) struct ConstBytes {
     objects: HashMap<String, Vec<u8>>,
+    /// Every object of either kind, whatever its type: the ones whose bytes
+    /// are recorded above, and the `const` structures and non-`char` arrays
+    /// that no store may change either.
+    read_only: HashSet<String>,
 }
 
 impl ConstBytes {
     pub(crate) fn build(module: &Module, types: &TypeTable) -> ConstBytes {
         let mut objects = HashMap::new();
+        let mut read_only = HashSet::new();
         for (label, payload) in &module.strings {
             let mut bytes: Vec<u8> = payload_bytes(payload).collect();
             bytes.push(0);
             objects.insert(label.clone(), bytes);
+            read_only.insert(label.clone());
         }
-        for g in &module.globals {
+        for g in module
+            .globals
+            .iter()
+            .filter(|g| constglobal::qualifies(g, types))
+        {
             if let Some(bytes) = const_char_array(g, types) {
                 objects.insert(g.name.clone(), bytes);
             }
+            read_only.insert(g.name.clone());
         }
-        ConstBytes { objects }
+        ConstBytes { objects, read_only }
+    }
+
+    /// Whether the object named `name` is one whose contents never change,
+    /// so that nothing the program may do writes to it.
+    pub(crate) fn is_read_only(&self, name: &str) -> bool {
+        self.read_only.contains(name)
     }
 }
 

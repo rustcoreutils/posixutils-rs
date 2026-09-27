@@ -71,6 +71,8 @@ argument folds at `-O1` and above.
 | `memset(dst, c, n)`, `__builtin_memset(dst, c, n)` | Set `n` bytes to `(unsigned char)c` |
 | `memcpy(dst, src, n)`, `__builtin_memcpy(dst, src, n)` | Copy `n` bytes |
 | `memmove(dst, src, n)`, `__builtin_memmove(dst, src, n)` | Copy `n` bytes (overlapping safe) |
+| `mempcpy(dst, src, n)`, `__builtin_mempcpy(dst, src, n)` | Copy `n` bytes, and return `dst + n`, the **end** of the copy: a `memcpy` and an addition, whatever `n` is, so `mempcpy` itself is never called |
+| `bcopy(src, dst, n)`, `__builtin_bcopy(src, dst, n)` | The old BSD `memmove`: the source **first**, and returns `void`. Not in POSIX.2024, but in glibc and known to gcc |
 | `__builtin_prefetch(addr, ...)` | Cache prefetch hint. Emits nothing, but `addr` is still **evaluated** — `__builtin_prefetch((q = p))` assigns `q`. The `rw` and locality arguments must be constants, so they have nothing to evaluate |
 
 ## Control Flow
@@ -119,7 +121,7 @@ as a number makes the quiet forms a call to `nan`, `nanf16` and so on.
 `copysignf`, `copysignl`, `sqrt`, `sqrtf`, `sqrtl`, `floor`, `ceil`,
 `trunc`, `round`, `rint`, `nearbyint`, `fmin`, `fmax` and `fma` and their
 `f` forms, `creal`, `cimag` and `conj` in each precision, and `memcpy`,
-`memset` and `memmove` are known to c17 by prototype, under their bare names
+`memset`, `memmove`, `mempcpy` and `bcopy` are known to c17 by prototype, under their bare names
 and their `__builtin_` spellings. One table in `parse/library_builtin.rs`
 gives each its prototype and what it computes.
 
@@ -137,6 +139,15 @@ own aggregate copies use, in the same chunks. The bare names are displaced
 like `sqrt`: by a declaration that is not the `<string.h>` prototype, by
 `-fno-builtin[-memcpy]`, and by the translation unit's own non-weak
 definition, which glibc's fortify wrappers rely on.
+
+Optimizing, a `memmove` (or `bcopy`) whose two blocks cannot overlap is a
+`memcpy`, as in gcc (`ir/libcall_fold/memory.rs`): its source is a string
+literal or a `const` object defined here, which no destination may be in, or
+its two blocks are different local objects, or one local and one named. So
+`memmove(buf, table, sizeof table)` of a 144-byte `const` table calls
+`memcpy`, and one of at most 128 bytes is expanded as a `memcpy` is. Two
+different named objects are not enough: an alias or a weak definition can put
+two names at one address.
 
 At `-O0`, as in gcc, a libm function named by its bare spelling (`sqrt`) is
 called rather than computed, and so is one that must still set `errno`
@@ -372,7 +383,6 @@ function by its own name inside its own body is still recursion, as in gcc.
 | `__builtin_trap()` | Abnormal termination; lowered to `abort` |
 | `__builtin_malloc(n)`, `__builtin_calloc(n, sz)`, `__builtin_realloc(p, n)`, `__builtin_free(p)` | The allocators. The three allocating forms return `void *` |
 | `__builtin_memcmp(a, b, n)` | |
-| `__builtin_mempcpy(dst, src, n)` | Returns the **end** of the copied region, unlike `memcpy` |
 | `__builtin_strlen(s)`, `__builtin_strcmp(a, b)`, `__builtin_strncmp(a, b, n)` | |
 | `__builtin_strcpy(d, s)`, `__builtin_strncpy(d, s, n)`, `__builtin_stpcpy(d, s)` | `stpcpy` returns the end of the copy |
 | `__builtin_strcat(d, s)`, `__builtin_strncat(d, s, n)` | |
@@ -393,11 +403,10 @@ function by its own name inside its own body is still recursion, as in gcc.
 | `__builtin_bcmp(a, b, n)` | The older spelling of `memcmp` |
 | `__builtin_bzero(p, n)` | The older spelling of `memset(p, 0, n)`; returns `void` |
 | `__builtin_strspn(s, set)`, `__builtin_strcspn(s, set)` | Return a size, not a pointer |
-| `__builtin_bcopy(src, dst, n)` | Returns `void`, and takes the source **first**, unlike `memcpy` |
 | `__builtin_printf_unlocked`, `__builtin_fprintf_unlocked`, `__builtin_fputs_unlocked` | glibc defines none of these, so a program using one supplies it — which is what gcc.c-torture's `builtins/` tests do |
 
 The return types matter and are modelled: the string family returns `char *`,
-the allocators and `mempcpy` return `void *`. Typing one of them `int` would
+the allocators return `void *`. Typing one of them `int` would
 truncate the returned address to 32 bits — a silent wrong answer, since the
 call still links and runs. So would getting the printf family's fixed-argument
 count wrong on Apple arm64, where variadic arguments go on the stack while

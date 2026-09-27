@@ -26,6 +26,7 @@ mod intrinsics;
 mod libm;
 mod math;
 mod mem_expand;
+mod mem_moves;
 mod memory;
 mod stdio_fold;
 mod string_fold;

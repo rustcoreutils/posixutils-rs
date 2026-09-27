@@ -101,6 +101,7 @@ impl LibraryCallPolicy {
 /// A type in one of the prototypes below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProtoType {
+    Void,
     Int,
     Long,
     LongLong,
@@ -127,6 +128,7 @@ enum ProtoType {
 impl ProtoType {
     fn id(self, t: &TypeTable) -> TypeId {
         match self {
+            ProtoType::Void => t.void_id,
             ProtoType::Int => t.int_id,
             ProtoType::Long => t.long_id,
             ProtoType::LongLong => t.longlong_id,
@@ -298,6 +300,8 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         entry(kw::MEMCPY,     kw::BUILTIN_MEMCPY,      VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT],  F::Memory(M::Copy)),
         entry(kw::MEMSET,     kw::BUILTIN_MEMSET,      VoidPtr,           &[VoidPtr, Int, SizeT],           F::Memory(M::Set)),
         entry(kw::MEMMOVE,    kw::BUILTIN_MEMMOVE,     VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT],  F::Memory(M::Move)),
+        entry(kw::MEMPCPY,    kw::BUILTIN_MEMPCPY,     VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT],  F::Memory(M::CopyToEnd)),
+        entry(kw::BCOPY,      kw::BUILTIN_BCOPY,       Void,              &[ConstVoidPtr, VoidPtr, SizeT],  F::Memory(M::MoveSourceFirst)),
         //    name                   returns       parameters                                  `...`     calls
         known(kw::STRLEN,            SizeT,        &[ConstCharPtr],                            FIXED,    L::Strlen),
         known(kw::STRNLEN,           SizeT,        &[ConstCharPtr, SizeT],                     FIXED,    L::Strnlen),

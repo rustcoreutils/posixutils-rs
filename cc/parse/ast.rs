@@ -86,8 +86,8 @@ pub enum InlineLibraryFn {
     FMax,
     /// `fma`, `fmaf`: `x * y + z`, rounded once.
     Fma,
-    /// `memcpy`, `memset`, `memmove`: a block memory function of
-    /// `<string.h>`, as its IR operation.
+    /// `memcpy`, `memset`, `memmove`, `mempcpy`, `bcopy`: a block memory
+    /// function, as its IR operation.
     Memory(MemoryFn),
 }
 
@@ -112,6 +112,12 @@ pub enum MemoryFn {
     Set,
     /// `void *memmove(void *, const void *, size_t)`
     Move,
+    /// `void *mempcpy(void *restrict, const void *restrict, size_t)`, the
+    /// GNU copy that answers the end of what it wrote, `dest + n`.
+    CopyToEnd,
+    /// `void bcopy(const void *, void *, size_t)`, the old BSD move, whose
+    /// source comes first and which answers nothing.
+    MoveSourceFirst,
 }
 
 /// Whether a libm function computed in place must still report a domain

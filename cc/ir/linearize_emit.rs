@@ -1695,7 +1695,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let sqrt = |lin: &mut Self| lin.emit_libm_insn(Opcode::Sqrt, &[x], typ, &callee);
         match errno {
             MathErrno::Ignored => sqrt(self),
-            MathErrno::Set if !in_place => self.emit_library_call(&callee, &[x], typ),
+            MathErrno::Set if !in_place => self.emit_library_call(&callee, &[(x, typ)], typ),
             MathErrno::Set => {
                 let size = self.types.size_bits(typ);
                 let zero = self.emit_fconst(FloatVal::ZERO, typ);
@@ -1711,7 +1711,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.emit_two_way(
                     below,
                     typ,
-                    |lin| lin.emit_library_call(&callee, &[x], typ),
+                    |lin| lin.emit_library_call(&callee, &[(x, typ)], typ),
                     sqrt,
                 )
             }
@@ -1753,19 +1753,20 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// A call to the C library function `callee` (its assembler name) with
-    /// `args`, each and the result of type `typ`.
+    /// `args`, each with its type, returning `typ`.
     pub(crate) fn emit_library_call(
         &mut self,
         callee: &str,
-        args: &[PseudoId],
+        args: &[(PseudoId, TypeId)],
         typ: TypeId,
     ) -> PseudoId {
         let result = self.alloc_pseudo();
+        let (args, arg_types) = args.iter().copied().unzip();
         self.emit(Instruction::call_with_abi(
             Some(result),
             callee,
-            args.to_vec(),
-            vec![typ; args.len()],
+            args,
+            arg_types,
             typ,
             crate::abi::CallingConv::C,
             self.types,

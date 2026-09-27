@@ -23,11 +23,13 @@
 // that read strings and compute a value; `copies` has `strcpy` and its kin,
 // which write one, and fold to a `memcpy` of a known length; `stdio` has
 // `printf` and its kin, whose result must be unused, and which become calls
-// that print the same bytes. The family still to come adds a module and an
-// arm in `fold`: `memory` (the `mem*` functions beyond comparison).
+// that print the same bytes. `memory` is the one family that rewrites an IR
+// operation rather than a call: a `Memmove` whose source and destination
+// cannot overlap becomes a `Memcpy`, in place.
 //
 
 mod copies;
+mod memory;
 mod stdio;
 mod strings;
 
@@ -190,9 +192,10 @@ impl Facts<'_> {
 /// Fold every call in `func` whose result its arguments decide. Answers
 /// whether anything changed.
 pub fn run(func: &mut Function, ctx: &FoldCtx) -> bool {
+    let moved = memory::run(func, ctx);
     let sites = collect(func, ctx);
     if sites.is_empty() {
-        return false;
+        return moved;
     }
     apply(func, ctx, sites);
     true
@@ -277,9 +280,19 @@ fn calls_itself(func: &Function, ctx: &FoldCtx, folded: &Folded) -> bool {
         Folded::Write(write) => write.calls(),
         _ => &[],
     };
-    calls
-        .iter()
-        .any(|&name| func.name == name || ctx.callees.get(name) == Some(&func.name))
+    calls.iter().any(|&name| is_the_function(func, ctx, name))
+}
+
+/// Whether `func` is the library function C calls `name`, by that name or
+/// by the one this unit gives it.
+fn is_the_function(func: &Function, ctx: &FoldCtx, name: &str) -> bool {
+    func.name == name || ctx.callees.get(name) == Some(&func.name)
+}
+
+/// The assembler name of the library function C calls `name`, for a call a
+/// fold makes.
+fn callee_symbol<'a>(ctx: &'a FoldCtx, name: &'a str) -> &'a str {
+    ctx.callees.get(name).map_or(name, String::as_str)
 }
 
 /// Replace each call in `sites` with what it folds to.
@@ -395,7 +408,7 @@ fn make_call(b: &mut Builder, ctx: &FoldCtx, target: Option<PseudoId>, ret: Type
         args.push(v);
         arg_types.push(t);
     }
-    let name = ctx.callees.get(new.name).map_or(new.name, String::as_str);
+    let name = callee_symbol(ctx, new.name);
     let mut insn = Instruction::call_with_abi(
         target,
         name,

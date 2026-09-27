@@ -16,12 +16,15 @@ aarch64/builtins/memchr@-O2
 aarch64/builtins/memcmp@-O0
 aarch64/builtins/memcmp@-O2
 aarch64/builtins/memmove-2@-O0
+aarch64/builtins/memmove-2@-O2
 aarch64/builtins/memmove@-O0
+aarch64/builtins/memmove@-O2
 aarch64/builtins/memops-asm@-O0
 aarch64/builtins/memops-asm@-O2
 aarch64/builtins/mempcpy-2@-O0
 aarch64/builtins/mempcpy-2@-O2
 aarch64/builtins/mempcpy@-O0
+aarch64/builtins/mempcpy@-O2
 aarch64/builtins/memset@-O0
 aarch64/builtins/memset@-O2
 aarch64/builtins/pr22237-1@-O0

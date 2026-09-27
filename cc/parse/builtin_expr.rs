@@ -2423,8 +2423,8 @@ impl Parser<'_> {
             }),
             "bcmp" | "strcasecmp" | "strncasecmp" => Some(self.types.int_id),
             "abort" | "exit" | "free" => Some(self.types.void_id),
-            // The allocators and `mempcpy` return `void *`; the string family
-            // returns `char *`. Answering `int` here would truncate the
+            // The allocators return `void *`; the string family returns
+            // `char *`. Answering `int` here would truncate the
             // returned address to 32 bits, which is the bug the `_chk` cases
             // above are commented for.
             "strndup" | "strdup" => {
@@ -2435,9 +2435,8 @@ impl Parser<'_> {
                     ..Default::default()
                 }))
             }
-            "malloc" | "calloc" | "realloc" | "mempcpy" | "alloca" => Some(self.types.void_ptr_id),
-            // `bcopy` predates `memmove` and returns nothing.
-            "bcopy" | "bzero" => Some(self.types.void_id),
+            "malloc" | "calloc" | "realloc" | "alloca" => Some(self.types.void_ptr_id),
+            "bzero" => Some(self.types.void_id),
             "strspn" => Some(self.types.ulong_id),
             "stpncpy" => Some(self.types.char_ptr_id),
             _ => None,
@@ -2598,7 +2597,6 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_REALLOC
                 | crate::kw::BUILTIN_FREE
                 | crate::kw::BUILTIN_MEMCMP
-                | crate::kw::BUILTIN_MEMPCPY
                 | crate::kw::BUILTIN_STRCPY
                 | crate::kw::BUILTIN_STRNCPY
                 | crate::kw::BUILTIN_STPCPY
@@ -2609,7 +2607,6 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_STRRCHR
                 | crate::kw::BUILTIN_STRSTR
                 | crate::kw::BUILTIN_MEMCHR
-                | crate::kw::BUILTIN_BCOPY
                 | crate::kw::BUILTIN_INDEX
                 | crate::kw::BUILTIN_RINDEX
                 | crate::kw::BUILTIN_PUTCHAR
@@ -2771,7 +2768,6 @@ impl Parser<'_> {
             _ if FloatSuffix::of_nan_library_function(name).is_some() => (1, false),
             "exit" | "malloc" | "free" | "strdup" => (1, false),
             "strndup" | "calloc" | "realloc" | "strspn" => (2, false),
-            "mempcpy" | "bcopy" => (3, false),
             // Variadic after its fixed arguments. Getting the fixed count
             // right is what keeps them in registers on Apple arm64, where
             // variadic arguments go on the stack -- the same reason the `_chk`

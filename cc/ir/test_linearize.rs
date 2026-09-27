@@ -7448,6 +7448,49 @@ fn test_memory_builtins_are_their_opcodes() {
     );
 }
 
+/// `mempcpy` is a `Memcpy` that calls `memcpy`, and its value the
+/// destination advanced by the length; `bcopy` is a `Memmove` that calls
+/// `memmove`, with its source and destination put back in `memmove`'s
+/// order. An asm label on `memcpy` reaches the one `mempcpy` makes.
+#[test]
+fn test_mempcpy_and_bcopy_are_memcpy_and_memmove() {
+    let src = "void *memcpy(void *, const void *, unsigned long) __asm(\"my_memcpy\");\n\
+               void *f(char *d, char *s, unsigned long n) {\n\
+                   bcopy(s, d, n); return mempcpy(d, s, n); }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    let insns = insns_of(&module, "f");
+    let blocks: Vec<_> = insns
+        .iter()
+        .filter(|i| matches!(i.op, Opcode::Memcpy | Opcode::Memmove))
+        .collect();
+    let [bcopy, mempcpy] = blocks.as_slice() else {
+        panic!("two block moves: {blocks:?}");
+    };
+    let my_memcpy = crate::arch::lir::verbatim("my_memcpy");
+    assert_eq!(
+        (bcopy.op, bcopy.library_callee()),
+        (Opcode::Memmove, "memmove")
+    );
+    assert_eq!(
+        (mempcpy.op, mempcpy.library_callee()),
+        (Opcode::Memcpy, my_memcpy.as_str())
+    );
+    // Both write `d` from `s`: each operand loaded from the same parameter.
+    let origin = |p| {
+        let def = insns.iter().find(|i| i.target == Some(p)).unwrap();
+        (def.op, def.src.clone())
+    };
+    for k in 0..2 {
+        assert_eq!(origin(bcopy.src[k]), origin(mempcpy.src[k]), "operand {k}");
+    }
+    assert_ne!(origin(bcopy.src[0]), origin(bcopy.src[1]));
+    let end = insns
+        .iter()
+        .find(|i| i.op == Opcode::Add && i.src == [mempcpy.src[0], mempcpy.src[2]])
+        .expect("mempcpy's value is d + n");
+    assert_eq!(end.size, 64);
+}
+
 /// Under `-fno-math-errno` the opcode stands alone; on a target without the
 /// instruction (binary128 on aarch64) the call alone does everything.
 #[test]

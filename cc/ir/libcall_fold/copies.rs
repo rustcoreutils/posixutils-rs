@@ -22,7 +22,7 @@
 // simpler: `stpcpy` and `sprintf(d, "%s", s)` are then `strcpy`.
 //
 
-use super::{make_call, offset, Facts, FoldCtx, Folded, NewCall, Operand};
+use super::{callee_symbol, make_call, offset, Facts, FoldCtx, Folded, NewCall, Operand};
 use crate::ir::build::Builder;
 use crate::ir::memexpand::INLINE_LIMIT_BYTES;
 use crate::ir::strdata::Len;
@@ -289,7 +289,7 @@ fn block(b: &mut Builder, ctx: &FoldCtx, op: Opcode, dest: PseudoId, second: Pse
         Opcode::Memcpy => "memcpy",
         _ => "memset",
     };
-    let callee = ctx.callees.get(name).map_or(name, String::as_str);
+    let callee = callee_symbol(ctx, name);
     let void_ptr = b.types.void_ptr_id;
     let result = b.func.alloc_pseudo();
     b.push(

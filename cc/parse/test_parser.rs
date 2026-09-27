@@ -5927,24 +5927,28 @@ fn test_complex_accessor_incompatible_declaration_displaces_builtin() {
     assert!(parse_tu(code).is_ok());
 }
 
-/// `memcpy`, `memset` and `memmove`, bare or reserved, are block memory
-/// nodes whose arguments are converted as the prototype says, and whose
-/// constant length is folded to a `size_t` literal.
+/// `memcpy`, `memset`, `memmove`, `mempcpy` and `bcopy`, bare or reserved,
+/// are block memory nodes whose arguments are converted as the prototype
+/// says, and whose constant length is folded to a `size_t` literal.
 #[test]
 fn test_memory_builtins() {
+    use MemoryFn::{Copy, CopyToEnd, Move, MoveSourceFirst, Set};
     let decls = "char *d; const char *s; int c; unsigned char n;";
     let cases = [
-        "memcpy(d, s, 16)",
-        "__builtin_memcpy(d, s, 8 + 8)",
-        "memset(d, c, 16)",
-        "__builtin_memset(d, 'x', 16)",
-        "memmove(d, s, 16)",
-        "__builtin_memmove(d, s, 16)",
+        ("memcpy(d, s, 16)", Copy),
+        ("__builtin_memcpy(d, s, 8 + 8)", Copy),
+        ("memset(d, c, 16)", Set),
+        ("__builtin_memset(d, 'x', 16)", Set),
+        ("memmove(d, s, 16)", Move),
+        ("__builtin_memmove(d, s, 16)", Move),
+        ("mempcpy(d, s, 16)", CopyToEnd),
+        ("__builtin_mempcpy(d, s, 16)", CopyToEnd),
+        ("bcopy(s, d, 16)", MoveSourceFirst),
+        ("__builtin_bcopy(s, d, 16)", MoveSourceFirst),
     ];
-    for stmt in cases {
+    for (stmt, want) in cases {
         with_statement_expr(decls, stmt, |p, e| {
             let t = &*p.types;
-            assert_eq!(e.typ, Some(t.void_ptr_id), "{stmt}");
             let ExprKind::InlineLibraryCall {
                 func: InlineLibraryFn::Memory(mem),
                 args,
@@ -5953,14 +5957,17 @@ fn test_memory_builtins() {
             else {
                 panic!("{stmt}: expected a block memory call, got {:?}", e.kind);
             };
-            let [dest, second, n] = args.as_slice() else {
+            assert_eq!(*mem, want, "{stmt}");
+            let [first, second, n] = args.as_slice() else {
                 panic!("{stmt}: {} arguments", args.len());
             };
-            let second_typ = match mem {
-                MemoryFn::Copy | MemoryFn::Move => t.const_void_ptr_id,
-                MemoryFn::Set => t.int_id,
+            let (ret, first_typ, second_typ) = match mem {
+                Copy | Move | CopyToEnd => (t.void_ptr_id, t.void_ptr_id, t.const_void_ptr_id),
+                Set => (t.void_ptr_id, t.void_ptr_id, t.int_id),
+                MoveSourceFirst => (t.void_id, t.const_void_ptr_id, t.void_ptr_id),
             };
-            assert_eq!(dest.typ, Some(t.void_ptr_id), "{stmt}");
+            assert_eq!(e.typ, Some(ret), "{stmt}");
+            assert_eq!(first.typ, Some(first_typ), "{stmt}");
             assert_eq!(second.typ, Some(second_typ), "{stmt}");
             assert_eq!(n.typ, Some(t.ulong_id), "{stmt}");
             assert!(
@@ -6024,6 +6031,55 @@ fn test_memory_builtin_declarations() {
     ));
     assert!(is_memcpy(
         "__attribute__((weak)) void *memcpy(void *d, const void *s, unsigned long n) { return d; }"
+    ));
+}
+
+/// `bcopy` keeps its builtin under the declaration `<strings.h>` writes,
+/// which returns `void` and takes the source first, and loses it to any
+/// other declaration or to a definition; `mempcpy` likewise.
+#[test]
+fn test_bcopy_and_mempcpy_declarations() {
+    fn is_builtin(decl: &str, call: &str) -> bool {
+        let src = format!("{decl}\nvoid t(char *d, char *s) {{ {call}; }}");
+        let (tu, _, _, _) = parse_tu(&src).unwrap();
+        let t = tu
+            .items
+            .iter()
+            .filter(|item| matches!(item, ExternalDecl::FunctionDef(_)))
+            .count()
+            - 1;
+        matches!(
+            first_statement_of(&tu, t),
+            Stmt::Expr(e) if matches!(
+                e.kind,
+                ExprKind::InlineLibraryCall { func: InlineLibraryFn::Memory(_), .. }
+            )
+        )
+    }
+    let bcopy = "bcopy(s, d, 4)";
+    assert!(is_builtin("", bcopy));
+    assert!(is_builtin(
+        "void bcopy(const void *, void *, unsigned long);",
+        bcopy
+    ));
+    assert!(!is_builtin("void bcopy(char *, char *, int);", bcopy));
+    assert!(!is_builtin(
+        "void *bcopy(const void *, void *, unsigned long);",
+        bcopy
+    ));
+    assert!(!is_builtin(
+        "void bcopy(const void *s, void *d, unsigned long n) {}",
+        bcopy
+    ));
+    let mempcpy = "mempcpy(d, s, 4)";
+    assert!(is_builtin(
+        "void *mempcpy(void *restrict, const void *restrict, unsigned long);",
+        mempcpy
+    ));
+    assert!(!is_builtin("char *mempcpy(char *, char *, int);", mempcpy));
+    assert!(!is_builtin(
+        "void *mempcpy(void *d, const void *s, unsigned long n) { return d; }",
+        mempcpy
     ));
 }
 
@@ -6810,7 +6866,6 @@ fn test_library_builtin_pointer_returns() {
         ("__builtin_malloc(0)", TypeKind::Void),
         ("__builtin_calloc(0, 0)", TypeKind::Void),
         ("__builtin_realloc(0, 0)", TypeKind::Void),
-        ("__builtin_mempcpy(0, 0, 0)", TypeKind::Void),
     ] {
         let (expr, types, _, _) = parse_expr(call).unwrap();
         assert!(

@@ -17,12 +17,15 @@ builtins/memchr@-O2
 builtins/memcmp@-O0
 builtins/memcmp@-O2
 builtins/memmove-2@-O0
+builtins/memmove-2@-O2
 builtins/memmove@-O0
+builtins/memmove@-O2
 builtins/memops-asm@-O0
 builtins/memops-asm@-O2
 builtins/mempcpy-2@-O0
 builtins/mempcpy-2@-O2
 builtins/mempcpy@-O0
+builtins/mempcpy@-O2
 builtins/memset@-O0
 builtins/memset@-O2
 builtins/pr22237-1@-O0

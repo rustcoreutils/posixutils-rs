@@ -210,7 +210,7 @@ fn builtins_mem_expand_every_small_length_aarch64() {
 
 /// Whether the assembly for `src` mentions the library function `name` at
 /// all -- a call, a tail jump or an address taken.
-fn mentions(asm: &str, name: &str) -> bool {
+pub(super) fn mentions(asm: &str, name: &str) -> bool {
     asm.lines()
         .filter(|l| !l.trim_start().starts_with(".file"))
         .any(|l| {
@@ -221,7 +221,7 @@ fn mentions(asm: &str, name: &str) -> bool {
 
 /// Compile `body` at each level for the host and for aarch64, and hand the
 /// assembly to `check`.
-fn for_each_target(prefix: &str, src: &str, extra: &[&str], check: impl Fn(&str, &str)) {
+pub(super) fn for_each_target(prefix: &str, src: &str, extra: &[&str], check: impl Fn(&str, &str)) {
     for opt in ["-O0", "-O2"] {
         for target in [None, Some("aarch64-unknown-linux-gnu")] {
             let mut args = vec![opt];

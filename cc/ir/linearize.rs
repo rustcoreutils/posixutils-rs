@@ -4168,13 +4168,13 @@ impl<'a> Linearizer<'a> {
             // already, or -- narrowed -- at `float`, and then converted to
             // the call's own type, which is every parameter's for a function
             // that narrows.
-            let arg_vals: Vec<PseudoId> = args
+            let arg_vals: Vec<(PseudoId, TypeId)> = args
                 .iter()
                 .map(|a| {
                     let val = self.linearize_expr(a);
                     match narrowed {
-                        Some(n) => self.emit_convert(val, n.typ, typ),
-                        None => val,
+                        Some(n) => (self.emit_convert(val, n.typ, typ), typ),
+                        None => (val, self.expr_type(a)),
                     }
                 })
                 .collect();
@@ -4232,31 +4232,51 @@ impl<'a> Linearizer<'a> {
             (InlineLibraryFn::FMin, [_, _]) => self.linearize_libm(Opcode::FMin, args, typ, name),
             (InlineLibraryFn::FMax, [_, _]) => self.linearize_libm(Opcode::FMax, args, typ, name),
             (InlineLibraryFn::Fma, [_, _, _]) => self.linearize_libm(Opcode::Fma, args, typ, name),
-            (InlineLibraryFn::Memory(mem), [dest, second, n]) => {
-                let op = match mem {
-                    MemoryFn::Copy => Opcode::Memcpy,
-                    MemoryFn::Set => Opcode::Memset,
-                    MemoryFn::Move => Opcode::Memmove,
-                };
-                let dest_val = self.linearize_expr(dest);
-                let second_val = self.linearize_expr(second);
-                let n_val = self.linearize_expr(n);
-                let result = self.alloc_pseudo();
-                let callee = self.library_function_name(self.strings.get(name));
-                let size = self.types.size_bits(typ);
-                self.emit(
-                    Instruction::new(op)
-                        .with_func(callee)
-                        .with_target(result)
-                        .with_src3(dest_val, second_val, n_val)
-                        .with_type_and_size(typ, size),
-                );
-                result
+            (InlineLibraryFn::Memory(mem), [a, b, n]) => {
+                let a = self.linearize_expr(a);
+                let b = self.linearize_expr(b);
+                let n = self.linearize_expr(n);
+                self.emit_memory_fn(mem, [a, b, n])
             }
             _ => unreachable!(
                 "{func:?} takes {} arguments, and the parser checked the call",
                 func.arity()
             ),
+        }
+    }
+
+    /// The block memory function `mem` of the arguments `args`, in the order
+    /// the program wrote them, as the `Memcpy`, `Memset` or `Memmove` it
+    /// performs. The instruction names the library function it calls when it
+    /// is not expanded, which is its own and not always the program's:
+    /// `mempcpy` copies with `memcpy`, `bcopy` moves with `memmove`. Answers
+    /// the call's value.
+    fn emit_memory_fn(&mut self, mem: MemoryFn, args: [PseudoId; 3]) -> PseudoId {
+        let [a, b, n] = args;
+        let (op, callee, dest, second) = match mem {
+            MemoryFn::Copy | MemoryFn::CopyToEnd => (Opcode::Memcpy, "memcpy", a, b),
+            MemoryFn::Set => (Opcode::Memset, "memset", a, b),
+            MemoryFn::Move => (Opcode::Memmove, "memmove", a, b),
+            MemoryFn::MoveSourceFirst => (Opcode::Memmove, "memmove", b, a),
+        };
+        let ptr = self.types.void_ptr_id;
+        let result = self.alloc_pseudo();
+        let callee = self.library_function_name(callee);
+        self.emit(
+            Instruction::new(op)
+                .with_func(callee)
+                .with_target(result)
+                .with_src3(dest, second, n)
+                .with_type_and_size(ptr, 64),
+        );
+        match mem {
+            MemoryFn::CopyToEnd => {
+                let end = self.alloc_pseudo();
+                self.emit(Instruction::binop(Opcode::Add, end, dest, n, ptr, 64));
+                end
+            }
+            // `bcopy` answers nothing: its `void` value is never read.
+            MemoryFn::Copy | MemoryFn::Set | MemoryFn::Move | MemoryFn::MoveSourceFirst => result,
         }
     }
 

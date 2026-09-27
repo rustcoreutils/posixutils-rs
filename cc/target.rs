@@ -234,6 +234,22 @@ impl IntType {
     }
 }
 
+/// Whether an atomic object `bytes` wide is always lock-free: exactly the
+/// machine integer widths, on every target here. There is no 16-byte atomic,
+/// and c17 does not link libatomic's lock-based fallbacks.
+///
+/// One rule for the three places that answer it: the `__GCC_ATOMIC_*_LOCK_FREE`
+/// predefines (and so `<stdatomic.h>`'s `ATOMIC_*_LOCK_FREE`),
+/// `__atomic_always_lock_free` / `__atomic_is_lock_free`, and the linearizer's
+/// choice between an instruction and a rejection.
+pub fn atomic_is_lock_free(bytes: u64) -> bool {
+    matches!(bytes, 1 | 2 | 4 | 8)
+}
+
+/// What `__atomic_test_and_set` stores into the flag, and so what
+/// `__GCC_ATOMIC_TEST_AND_SET_TRUEVAL` says.
+pub const ATOMIC_TEST_AND_SET_TRUEVAL: i64 = 1;
+
 /// How a thread-local's address is obtained on a target.
 ///
 /// Decided in one place -- [`Target::tls_access`] -- because two consumers

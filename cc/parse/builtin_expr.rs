@@ -623,7 +623,11 @@ impl Parser<'_> {
                     _ => ExprKind::Popcountll { arg: Box::new(arg) },
                 };
                 let count = Self::typed_expr(kind, self.types.int_id, token_pos);
-                let one = Self::typed_expr(ExprKind::IntLit(1), self.types.int_id, token_pos);
+                let one = Self::typed_expr(
+                    ExprKind::IntLit(crate::target::ATOMIC_TEST_AND_SET_TRUEVAL),
+                    self.types.int_id,
+                    token_pos,
+                );
                 Ok(Self::typed_expr(
                     ExprKind::Binary {
                         op: BinaryOp::BitAnd,
@@ -1728,7 +1732,8 @@ impl Parser<'_> {
                 self.expect_special(b')')?;
                 let lock_free = self
                     .eval_const_expr(&size)
-                    .is_some_and(|n| matches!(n, 1 | 2 | 4 | 8));
+                    .and_then(|n| u64::try_from(n).ok())
+                    .is_some_and(crate::target::atomic_is_lock_free);
                 Ok(Self::typed_expr(
                     ExprKind::IntLit(i64::from(lock_free)),
                     self.types.bool_id,

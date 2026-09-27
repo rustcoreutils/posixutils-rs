@@ -273,6 +273,43 @@ pub fn get_integer_macros(target: &Target) -> Vec<(String, String)> {
     out
 }
 
+/// `__GCC_ATOMIC_*_LOCK_FREE` for each type `<stdatomic.h>` asks about -- 2,
+/// "always", or 0, "never", from the type's size -- and
+/// `__GCC_ATOMIC_TEST_AND_SET_TRUEVAL`.
+///
+/// Typed out per architecture, the list had no `CHAR16_T`, `CHAR32_T` or
+/// `WCHAR_T` entries, so `ATOMIC_WCHAR_T_LOCK_FREE` expanded to an undeclared
+/// identifier.
+pub fn get_atomic_macros(target: &Target) -> Vec<(String, String)> {
+    let int_bytes = |t: IntType| u64::from(target.int_width(t) / 8);
+    let mut out: Vec<(String, String)> = [
+        ("BOOL", 1),
+        ("CHAR", 1),
+        ("CHAR16_T", int_bytes(target.char16_type())),
+        ("CHAR32_T", int_bytes(target.char32_type())),
+        ("WCHAR_T", int_bytes(target.wchar_type())),
+        ("SHORT", int_bytes(IntType::Short)),
+        ("INT", int_bytes(IntType::Int)),
+        ("LONG", int_bytes(IntType::Long)),
+        ("LLONG", int_bytes(IntType::LongLong)),
+        ("POINTER", u64::from(target.pointer_width / 8)),
+    ]
+    .into_iter()
+    .map(|(name, bytes)| {
+        let always = crate::target::atomic_is_lock_free(bytes);
+        (
+            format!("__GCC_ATOMIC_{name}_LOCK_FREE"),
+            if always { "2" } else { "0" }.to_string(),
+        )
+    })
+    .collect();
+    out.push((
+        "__GCC_ATOMIC_TEST_AND_SET_TRUEVAL".into(),
+        crate::target::ATOMIC_TEST_AND_SET_TRUEVAL.to_string(),
+    ));
+    out
+}
+
 pub fn get_additional_sizeof_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
     // 16 bytes for the x87 80-bit format and for IEEE binary128 alike; Apple's
     // aarch64 `long double` is a `double` and occupies 8.
@@ -536,6 +573,34 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Every type `<stdatomic.h>` names in an `ATOMIC_*_LOCK_FREE` has its
+    /// predefine, and on every target here all ten are always lock-free, as
+    /// gcc says for both Linux targets.
+    #[test]
+    fn atomic_lock_free_macros_cover_stdatomic() {
+        for target in all_targets() {
+            let macros = get_atomic_macros(&target);
+            for name in [
+                "BOOL", "CHAR", "CHAR16_T", "CHAR32_T", "WCHAR_T", "SHORT", "INT", "LONG", "LLONG",
+                "POINTER",
+            ] {
+                assert_eq!(
+                    macro_value(&macros, &format!("__GCC_ATOMIC_{name}_LOCK_FREE")),
+                    "2",
+                    "{name} on {}-{}",
+                    target.arch,
+                    target.os
+                );
+            }
+            assert_eq!(
+                macro_value(&macros, "__GCC_ATOMIC_TEST_AND_SET_TRUEVAL"),
+                "1"
+            );
+        }
+        assert!(!crate::target::atomic_is_lock_free(16));
+        assert!(!crate::target::atomic_is_lock_free(3));
     }
 
     /// `long double` is a different type on each target, and these macros are

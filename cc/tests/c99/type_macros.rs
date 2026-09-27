@@ -334,3 +334,56 @@ fn wchar_predefines_match_the_platform() {
         ],
     );
 }
+
+/// Every `ATOMIC_*_LOCK_FREE` of `<stdatomic.h>` (C17 7.17.1p2) expands to a
+/// constant, in code and in `#if`. `ATOMIC_CHAR16_T_LOCK_FREE`,
+/// `ATOMIC_CHAR32_T_LOCK_FREE` and `ATOMIC_WCHAR_T_LOCK_FREE` named
+/// `__GCC_ATOMIC_*` predefines c17 did not have, so each was an undeclared
+/// identifier -- and silently 0 in `#if`.
+const ATOMIC_LOCK_FREE_MACROS: &str = r#"
+#include <stdatomic.h>
+#include <stddef.h>
+
+#if ATOMIC_CHAR16_T_LOCK_FREE != 2 || ATOMIC_CHAR32_T_LOCK_FREE != 2 \
+    || ATOMIC_WCHAR_T_LOCK_FREE != 2
+#error prefixed character types are not lock-free
+#endif
+
+int main(void) {
+    int all[] = {
+        ATOMIC_BOOL_LOCK_FREE, ATOMIC_CHAR_LOCK_FREE,
+        ATOMIC_CHAR16_T_LOCK_FREE, ATOMIC_CHAR32_T_LOCK_FREE,
+        ATOMIC_WCHAR_T_LOCK_FREE, ATOMIC_SHORT_LOCK_FREE,
+        ATOMIC_INT_LOCK_FREE, ATOMIC_LONG_LOCK_FREE,
+        ATOMIC_LLONG_LOCK_FREE, ATOMIC_POINTER_LOCK_FREE,
+    };
+    for (unsigned i = 0; i < sizeof all / sizeof all[0]; i++)
+        if (all[i] != 2) return 1 + i;
+    if (!__atomic_always_lock_free(sizeof(wchar_t), 0)) return 20;
+    if (__atomic_always_lock_free(16, 0)) return 21;
+    if (__GCC_ATOMIC_TEST_AND_SET_TRUEVAL != 1) return 22;
+    atomic_flag f = ATOMIC_FLAG_INIT;
+    if (atomic_flag_test_and_set(&f)) return 23;
+    if (*(unsigned char *)&f != __GCC_ATOMIC_TEST_AND_SET_TRUEVAL) return 24;
+    return 0;
+}
+"#;
+
+#[test]
+fn atomic_lock_free_macros_are_defined() {
+    assert_eq!(
+        compile_and_run("atomic_lock_free_macros", ATOMIC_LOCK_FREE_MACROS, &[]),
+        0
+    );
+}
+
+#[test]
+fn atomic_lock_free_macros_are_defined_aarch64() {
+    if let Some(rc) = compile_and_run_aarch64(
+        "atomic_lock_free_macros_a64",
+        ATOMIC_LOCK_FREE_MACROS,
+        "-O0",
+    ) {
+        assert_eq!(rc, 0);
+    }
+}

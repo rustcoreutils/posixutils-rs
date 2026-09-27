@@ -1024,8 +1024,12 @@ impl<'a> Preprocessor<'a> {
             self.define_macro(Macro::predefined_type(&name, value));
         }
 
-        // Integer limits, widths, sizes, constant suffixes and formats
-        for (name, value) in arch::get_integer_macros(self.target) {
+        // Integer limits, widths, sizes, constant suffixes and formats, and
+        // the atomic lock-free predefines
+        for (name, value) in arch::get_integer_macros(self.target)
+            .into_iter()
+            .chain(arch::get_atomic_macros(self.target))
+        {
             self.define_macro(Macro::predefined(&name, Some(&value)));
         }
 

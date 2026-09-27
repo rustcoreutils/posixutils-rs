@@ -56,14 +56,8 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2", Some("1")),
         ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4", Some("1")),
         ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8", Some("1")),
-        // Lock-free atomics
-        ("__GCC_ATOMIC_BOOL_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_CHAR_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_SHORT_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_INT_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_LONG_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_LLONG_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_POINTER_LOCK_FREE", Some("2")),
+        // The __GCC_ATOMIC_*_LOCK_FREE family is derived from the type
+        // sizes, in `arch::get_atomic_macros`.
         // ARM-specific features
         ("__ARM_SIZEOF_WCHAR_T", Some("4")),
         ("__ARM_SIZEOF_MINIMAL_ENUM", Some("4")),

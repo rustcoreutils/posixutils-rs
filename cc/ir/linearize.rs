@@ -21,7 +21,7 @@ use crate::float::FloatVal;
 use crate::ir::linearize_atomic::AtomicLvalue;
 use crate::parse::ast::{
     BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef, GnuAtomicOp,
-    InitElement, InlineLibraryFn, OffsetOfPath, ParamStyle, TranslationUnit, UnaryOp,
+    InitElement, InlineLibraryFn, MemoryFn, OffsetOfPath, ParamStyle, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
@@ -411,6 +411,10 @@ pub struct Linearizer<'a> {
     /// whole unit has been read, because the target may be defined after the
     /// alias that names it.
     pub(crate) declared_aliases: Vec<super::linearize_init::DeclaredAlias>,
+    /// Every function the translation unit defines, by name, weak ones aside:
+    /// a call to a library builtin that yields to a definition reaches the
+    /// program's own wherever it is (`InlineLibraryFn::yields_to_a_definition`).
+    pub(crate) defined_functions: std::collections::HashSet<StringId>,
 }
 
 impl<'a> Linearizer<'a> {
@@ -461,6 +465,7 @@ impl<'a> Linearizer<'a> {
             current_calling_conv: CallingConv::default(),
             local_scope_stack: Vec::new(),
             declared_aliases: Vec::new(),
+            defined_functions: std::collections::HashSet::new(),
         }
     }
 
@@ -578,6 +583,16 @@ impl<'a> Linearizer<'a> {
     }
 
     pub fn linearize(&mut self, tu: &TranslationUnit) -> Module {
+        self.defined_functions = tu
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                // A weak definition may be replaced at link time, and gcc
+                // leaves the builtin in its place.
+                ExternalDecl::FunctionDef(func) if !func.attrs.symbol.weak => Some(func.name),
+                _ => None,
+            })
+            .collect();
         for item in &tu.items {
             match item {
                 ExternalDecl::FunctionDef(func) => {
@@ -1932,8 +1947,10 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcountll { arg }
             | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
 
-            ExprKind::InlineLibraryCall { func, args, .. } => {
-                !func.has_side_effects() && args.iter().all(|a| self.is_pure_expr(a))
+            ExprKind::InlineLibraryCall { func, args, name } => {
+                !func.has_side_effects()
+                    && !self.calls_the_programs_own(*func, *name)
+                    && args.iter().all(|a| self.is_pure_expr(a))
             }
 
             // Pure iff both operands are: the relation itself reads nothing
@@ -1950,9 +1967,6 @@ impl<'a> Linearizer<'a> {
 
             // Alloca allocates memory - not pure
             ExprKind::Alloca { .. } => false,
-
-            // Memory builtins modify memory - not pure
-            ExprKind::Memset { .. } | ExprKind::Memcpy { .. } | ExprKind::Memmove { .. } => false,
 
             // Unreachable is pure (no side effects, just UB hint)
             ExprKind::Unreachable => true,
@@ -4111,6 +4125,12 @@ impl<'a> Linearizer<'a> {
         value
     }
 
+    /// Whether a call to the library builtin `func`, named `name`, reaches the
+    /// translation unit's own definition of it instead.
+    fn calls_the_programs_own(&self, func: InlineLibraryFn, name: StringId) -> bool {
+        func.yields_to_a_definition() && self.defined_functions.contains(&name)
+    }
+
     /// A library function's call evaluated in place: its arguments, already
     /// converted to the parameter types, and the computation the call stands
     /// for. Never an lvalue, so only ever reached for its value. `name` is
@@ -4123,6 +4143,13 @@ impl<'a> Linearizer<'a> {
         name: StringId,
     ) -> PseudoId {
         let typ = self.expr_type(expr);
+        if self.calls_the_programs_own(func, name) {
+            // The program's own function, defined below the call: gcc calls
+            // it, and so does this. The arguments are already at `typ`.
+            let arg_vals: Vec<PseudoId> = args.iter().map(|a| self.linearize_expr(a)).collect();
+            let callee = self.library_function_name(self.strings.get(name));
+            return self.emit_library_call(&callee, &arg_vals, typ);
+        }
         match (func, args) {
             (InlineLibraryFn::IntAbs, [arg]) => {
                 let arg_val = self.linearize_expr(arg);
@@ -4148,6 +4175,31 @@ impl<'a> Linearizer<'a> {
             (InlineLibraryFn::Sqrt(errno), [arg]) => {
                 let arg_val = self.linearize_expr(arg);
                 self.emit_sqrt(arg_val, typ, name, errno)
+            }
+            (InlineLibraryFn::RoundToIntegral(how), [arg]) => {
+                let arg_val = self.linearize_expr(arg);
+                self.emit_libm(Opcode::RoundToIntegral(how), &[arg_val], typ, name)
+            }
+            (InlineLibraryFn::Memory(mem), [dest, second, n]) => {
+                let op = match mem {
+                    MemoryFn::Copy => Opcode::Memcpy,
+                    MemoryFn::Set => Opcode::Memset,
+                    MemoryFn::Move => Opcode::Memmove,
+                };
+                let dest_val = self.linearize_expr(dest);
+                let second_val = self.linearize_expr(second);
+                let n_val = self.linearize_expr(n);
+                let result = self.alloc_pseudo();
+                let callee = self.library_function_name(self.strings.get(name));
+                let size = self.types.size_bits(typ);
+                self.emit(
+                    Instruction::new(op)
+                        .with_func(callee)
+                        .with_target(result)
+                        .with_src3(dest_val, second_val, n_val)
+                        .with_type_and_size(typ, size),
+                );
+                result
             }
             _ => unreachable!(
                 "{func:?} takes {} arguments, and the parser checked the call",
@@ -5353,51 +5405,6 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            ExprKind::Memset { dest, c, n } => {
-                let dest_val = self.linearize_expr(dest);
-                let c_val = self.linearize_expr(c);
-                let n_val = self.linearize_expr(n);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Memset)
-                    .with_func(self.library_function_name("memset"))
-                    .with_target(result)
-                    .with_src3(dest_val, c_val, n_val)
-                    .with_type_and_size(self.types.void_ptr_id, 64);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::Memcpy { dest, src, n } => {
-                let dest_val = self.linearize_expr(dest);
-                let src_val = self.linearize_expr(src);
-                let n_val = self.linearize_expr(n);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Memcpy)
-                    .with_func(self.library_function_name("memcpy"))
-                    .with_target(result)
-                    .with_src3(dest_val, src_val, n_val)
-                    .with_type_and_size(self.types.void_ptr_id, 64);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::Memmove { dest, src, n } => {
-                let dest_val = self.linearize_expr(dest);
-                let src_val = self.linearize_expr(src);
-                let n_val = self.linearize_expr(n);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Memmove)
-                    .with_func(self.library_function_name("memmove"))
-                    .with_target(result)
-                    .with_src3(dest_val, src_val, n_val)
-                    .with_type_and_size(self.types.void_ptr_id, 64);
-                self.emit(insn);
-                result
-            }
-
             ExprKind::FpTest { test, arg } => self.linearize_fp_test(*test, arg),
             ExprKind::FpCompare { cmp, lhs, rhs } => self.linearize_fp_compare(*cmp, lhs, rhs),
 
@@ -6460,9 +6467,6 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcountl { .. }
             | ExprKind::Popcountll { .. }
             | ExprKind::Alloca { .. }
-            | ExprKind::Memset { .. }
-            | ExprKind::Memcpy { .. }
-            | ExprKind::Memmove { .. }
             | ExprKind::FpTest { .. }
             | ExprKind::FpCompare { .. }
             | ExprKind::FpClassify { .. }

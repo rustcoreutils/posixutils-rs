@@ -383,3 +383,437 @@ int main(void) {
         "cannot initialize an object with static storage duration",
     );
 }
+
+// ============================================================================
+// floor, ceil, trunc, round, rint, nearbyint and their f forms
+// ============================================================================
+
+/// The rounding direction, set in the SSE or FP control register directly
+/// so that the program needs no `<fenv.h>` and no libm: 0 to nearest, 1
+/// downward, 2 upward, 3 toward zero.
+const SET_ROUNDING: &str = r#"
+static void set_rounding(int m) {
+#if defined(__x86_64__)
+    unsigned csr;
+    __asm__ volatile("stmxcsr %0" : "=m"(csr));
+    csr = (csr & ~0x6000u) | ((unsigned)m << 13);
+    __asm__ volatile("ldmxcsr %0" : : "m"(csr));
+#elif defined(__aarch64__)
+    static const unsigned long rmode[4] = {0, 2, 1, 3};
+    unsigned long fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr = (fpcr & ~(3UL << 22)) | rmode[m] << 22;
+    __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+#endif
+}
+"#;
+
+/// Each input with its floor, ceil, trunc and round, and its rint -- which
+/// nearbyint equals -- in each rounding direction: +-0, 0.5, 0.25, 0.75,
+/// 1.5, 2.5, 2.75, 2^52 - 0.5, 2^52, 2^52 + 1, 2^53, 2^51 + 0.5, 1e300, the
+/// smallest subnormal, the largest finite value, inf, a quiet NaN with a
+/// payload and 100, each of both signs; then the same for `float`, around
+/// 2^23. Every value is glibc's, identical on x86-64 and aarch64.
+const ROUND_TABLES: &str = r#"
+typedef unsigned long long u64; typedef unsigned int u32;
+struct drow { u64 in, fl, ce, tr, ro, ri[4]; };
+static const struct drow dcase[] = {
+    {0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000, {0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000}},
+    {0x3fe0000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x3ff0000000000000, {0x0000000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000}},
+    {0x3fd0000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x0000000000000000, {0x0000000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000}},
+    {0x3fe8000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x3ff0000000000000, {0x3ff0000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000}},
+    {0x3ff8000000000000, 0x3ff0000000000000, 0x4000000000000000, 0x3ff0000000000000, 0x4000000000000000, {0x4000000000000000, 0x3ff0000000000000, 0x4000000000000000, 0x3ff0000000000000}},
+    {0x4004000000000000, 0x4000000000000000, 0x4008000000000000, 0x4000000000000000, 0x4008000000000000, {0x4000000000000000, 0x4000000000000000, 0x4008000000000000, 0x4000000000000000}},
+    {0x4006000000000000, 0x4000000000000000, 0x4008000000000000, 0x4000000000000000, 0x4008000000000000, {0x4008000000000000, 0x4000000000000000, 0x4008000000000000, 0x4000000000000000}},
+    {0x432fffffffffffff, 0x432ffffffffffffe, 0x4330000000000000, 0x432ffffffffffffe, 0x4330000000000000, {0x4330000000000000, 0x432ffffffffffffe, 0x4330000000000000, 0x432ffffffffffffe}},
+    {0x4330000000000000, 0x4330000000000000, 0x4330000000000000, 0x4330000000000000, 0x4330000000000000, {0x4330000000000000, 0x4330000000000000, 0x4330000000000000, 0x4330000000000000}},
+    {0x4330000000000001, 0x4330000000000001, 0x4330000000000001, 0x4330000000000001, 0x4330000000000001, {0x4330000000000001, 0x4330000000000001, 0x4330000000000001, 0x4330000000000001}},
+    {0x4340000000000000, 0x4340000000000000, 0x4340000000000000, 0x4340000000000000, 0x4340000000000000, {0x4340000000000000, 0x4340000000000000, 0x4340000000000000, 0x4340000000000000}},
+    {0x4320000000000001, 0x4320000000000000, 0x4320000000000002, 0x4320000000000000, 0x4320000000000002, {0x4320000000000000, 0x4320000000000000, 0x4320000000000002, 0x4320000000000000}},
+    {0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c, {0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c}},
+    {0x0000000000000001, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x0000000000000000, {0x0000000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000}},
+    {0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff, {0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff}},
+    {0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000, {0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000}},
+    {0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234, {0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234}},
+    {0x4059000000000000, 0x4059000000000000, 0x4059000000000000, 0x4059000000000000, 0x4059000000000000, {0x4059000000000000, 0x4059000000000000, 0x4059000000000000, 0x4059000000000000}},
+    {0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, {0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000}},
+    {0xbfe0000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000, 0xbff0000000000000, {0x8000000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000}},
+    {0xbfd0000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, {0x8000000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000}},
+    {0xbfe8000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000, 0xbff0000000000000, {0xbff0000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000}},
+    {0xbff8000000000000, 0xc000000000000000, 0xbff0000000000000, 0xbff0000000000000, 0xc000000000000000, {0xc000000000000000, 0xc000000000000000, 0xbff0000000000000, 0xbff0000000000000}},
+    {0xc004000000000000, 0xc008000000000000, 0xc000000000000000, 0xc000000000000000, 0xc008000000000000, {0xc000000000000000, 0xc008000000000000, 0xc000000000000000, 0xc000000000000000}},
+    {0xc006000000000000, 0xc008000000000000, 0xc000000000000000, 0xc000000000000000, 0xc008000000000000, {0xc008000000000000, 0xc008000000000000, 0xc000000000000000, 0xc000000000000000}},
+    {0xc32fffffffffffff, 0xc330000000000000, 0xc32ffffffffffffe, 0xc32ffffffffffffe, 0xc330000000000000, {0xc330000000000000, 0xc330000000000000, 0xc32ffffffffffffe, 0xc32ffffffffffffe}},
+    {0xc330000000000000, 0xc330000000000000, 0xc330000000000000, 0xc330000000000000, 0xc330000000000000, {0xc330000000000000, 0xc330000000000000, 0xc330000000000000, 0xc330000000000000}},
+    {0xc330000000000001, 0xc330000000000001, 0xc330000000000001, 0xc330000000000001, 0xc330000000000001, {0xc330000000000001, 0xc330000000000001, 0xc330000000000001, 0xc330000000000001}},
+    {0xc340000000000000, 0xc340000000000000, 0xc340000000000000, 0xc340000000000000, 0xc340000000000000, {0xc340000000000000, 0xc340000000000000, 0xc340000000000000, 0xc340000000000000}},
+    {0xc320000000000001, 0xc320000000000002, 0xc320000000000000, 0xc320000000000000, 0xc320000000000002, {0xc320000000000000, 0xc320000000000002, 0xc320000000000000, 0xc320000000000000}},
+    {0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c, {0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c}},
+    {0x8000000000000001, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, {0x8000000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000}},
+    {0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff, {0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff}},
+    {0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000, {0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000}},
+    {0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234, {0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234}},
+    {0xc059000000000000, 0xc059000000000000, 0xc059000000000000, 0xc059000000000000, 0xc059000000000000, {0xc059000000000000, 0xc059000000000000, 0xc059000000000000, 0xc059000000000000}},
+};
+struct frow { u32 in, fl, ce, tr, ro, ri[4]; };
+static const struct frow fcase[] = {
+    {0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, {0x00000000, 0x00000000, 0x00000000, 0x00000000}},
+    {0x3f000000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000, {0x00000000, 0x00000000, 0x3f800000, 0x00000000}},
+    {0x3e800000, 0x00000000, 0x3f800000, 0x00000000, 0x00000000, {0x00000000, 0x00000000, 0x3f800000, 0x00000000}},
+    {0x3f400000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000, {0x3f800000, 0x00000000, 0x3f800000, 0x00000000}},
+    {0x3fc00000, 0x3f800000, 0x40000000, 0x3f800000, 0x40000000, {0x40000000, 0x3f800000, 0x40000000, 0x3f800000}},
+    {0x40200000, 0x40000000, 0x40400000, 0x40000000, 0x40400000, {0x40000000, 0x40000000, 0x40400000, 0x40000000}},
+    {0x40300000, 0x40000000, 0x40400000, 0x40000000, 0x40400000, {0x40400000, 0x40000000, 0x40400000, 0x40000000}},
+    {0x4affffff, 0x4afffffe, 0x4b000000, 0x4afffffe, 0x4b000000, {0x4b000000, 0x4afffffe, 0x4b000000, 0x4afffffe}},
+    {0x4b000000, 0x4b000000, 0x4b000000, 0x4b000000, 0x4b000000, {0x4b000000, 0x4b000000, 0x4b000000, 0x4b000000}},
+    {0x4b000001, 0x4b000001, 0x4b000001, 0x4b000001, 0x4b000001, {0x4b000001, 0x4b000001, 0x4b000001, 0x4b000001}},
+    {0x4b800000, 0x4b800000, 0x4b800000, 0x4b800000, 0x4b800000, {0x4b800000, 0x4b800000, 0x4b800000, 0x4b800000}},
+    {0x4a800001, 0x4a800000, 0x4a800002, 0x4a800000, 0x4a800002, {0x4a800000, 0x4a800000, 0x4a800002, 0x4a800000}},
+    {0x7e967699, 0x7e967699, 0x7e967699, 0x7e967699, 0x7e967699, {0x7e967699, 0x7e967699, 0x7e967699, 0x7e967699}},
+    {0x00000001, 0x00000000, 0x3f800000, 0x00000000, 0x00000000, {0x00000000, 0x00000000, 0x3f800000, 0x00000000}},
+    {0x7f7fffff, 0x7f7fffff, 0x7f7fffff, 0x7f7fffff, 0x7f7fffff, {0x7f7fffff, 0x7f7fffff, 0x7f7fffff, 0x7f7fffff}},
+    {0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000, {0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000}},
+    {0x7fc01234, 0x7fc01234, 0x7fc01234, 0x7fc01234, 0x7fc01234, {0x7fc01234, 0x7fc01234, 0x7fc01234, 0x7fc01234}},
+    {0x42c80000, 0x42c80000, 0x42c80000, 0x42c80000, 0x42c80000, {0x42c80000, 0x42c80000, 0x42c80000, 0x42c80000}},
+    {0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, {0x80000000, 0x80000000, 0x80000000, 0x80000000}},
+    {0xbf000000, 0xbf800000, 0x80000000, 0x80000000, 0xbf800000, {0x80000000, 0xbf800000, 0x80000000, 0x80000000}},
+    {0xbe800000, 0xbf800000, 0x80000000, 0x80000000, 0x80000000, {0x80000000, 0xbf800000, 0x80000000, 0x80000000}},
+    {0xbf400000, 0xbf800000, 0x80000000, 0x80000000, 0xbf800000, {0xbf800000, 0xbf800000, 0x80000000, 0x80000000}},
+    {0xbfc00000, 0xc0000000, 0xbf800000, 0xbf800000, 0xc0000000, {0xc0000000, 0xc0000000, 0xbf800000, 0xbf800000}},
+    {0xc0200000, 0xc0400000, 0xc0000000, 0xc0000000, 0xc0400000, {0xc0000000, 0xc0400000, 0xc0000000, 0xc0000000}},
+    {0xc0300000, 0xc0400000, 0xc0000000, 0xc0000000, 0xc0400000, {0xc0400000, 0xc0400000, 0xc0000000, 0xc0000000}},
+    {0xcaffffff, 0xcb000000, 0xcafffffe, 0xcafffffe, 0xcb000000, {0xcb000000, 0xcb000000, 0xcafffffe, 0xcafffffe}},
+    {0xcb000000, 0xcb000000, 0xcb000000, 0xcb000000, 0xcb000000, {0xcb000000, 0xcb000000, 0xcb000000, 0xcb000000}},
+    {0xcb000001, 0xcb000001, 0xcb000001, 0xcb000001, 0xcb000001, {0xcb000001, 0xcb000001, 0xcb000001, 0xcb000001}},
+    {0xcb800000, 0xcb800000, 0xcb800000, 0xcb800000, 0xcb800000, {0xcb800000, 0xcb800000, 0xcb800000, 0xcb800000}},
+    {0xca800001, 0xca800002, 0xca800000, 0xca800000, 0xca800002, {0xca800000, 0xca800002, 0xca800000, 0xca800000}},
+    {0xfe967699, 0xfe967699, 0xfe967699, 0xfe967699, 0xfe967699, {0xfe967699, 0xfe967699, 0xfe967699, 0xfe967699}},
+    {0x80000001, 0xbf800000, 0x80000000, 0x80000000, 0x80000000, {0x80000000, 0xbf800000, 0x80000000, 0x80000000}},
+    {0xff7fffff, 0xff7fffff, 0xff7fffff, 0xff7fffff, 0xff7fffff, {0xff7fffff, 0xff7fffff, 0xff7fffff, 0xff7fffff}},
+    {0xff800000, 0xff800000, 0xff800000, 0xff800000, 0xff800000, {0xff800000, 0xff800000, 0xff800000, 0xff800000}},
+    {0xffc01234, 0xffc01234, 0xffc01234, 0xffc01234, 0xffc01234, {0xffc01234, 0xffc01234, 0xffc01234, 0xffc01234}},
+    {0xc2c80000, 0xc2c80000, 0xc2c80000, 0xc2c80000, 0xc2c80000, {0xc2c80000, 0xc2c80000, 0xc2c80000, 0xc2c80000}},
+};
+#define N(a) (int)(sizeof(a) / sizeof((a)[0]))
+static u64 dbits(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
+static double dfrom(u64 u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
+static u32 fbits(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
+static float ffrom(u32 u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
+"#;
+
+/// Every function of every row, bare and `__builtin_`, in all four rounding
+/// directions, at run time; then the constants the optimizer folds. The
+/// code says which: 1 + function + 6 * direction for `double`, 40 + the
+/// same for `float`.
+const ROUND_CHECKS: &str = r#"
+double floor(double); double ceil(double); double trunc(double);
+double round(double); double rint(double); double nearbyint(double);
+float floorf(float); float ceilf(float); float truncf(float);
+float roundf(float); float rintf(float); float nearbyintf(float);
+__attribute__((noinline)) static int check_double(int m) {
+    for (int i = 0; i < N(dcase); i++) {
+        const struct drow *r = &dcase[i];
+        volatile double x = dfrom(r->in);
+        u64 want[6] = {r->fl, r->ce, r->tr, r->ro, r->ri[m], r->ri[m]};
+        u64 bare[6] = {dbits(floor(x)), dbits(ceil(x)), dbits(trunc(x)),
+                       dbits(round(x)), dbits(rint(x)), dbits(nearbyint(x))};
+        u64 blt[6] = {dbits(__builtin_floor(x)), dbits(__builtin_ceil(x)),
+                      dbits(__builtin_trunc(x)), dbits(__builtin_round(x)),
+                      dbits(__builtin_rint(x)), dbits(__builtin_nearbyint(x))};
+        for (int f = 0; f < 6; f++)
+            if (bare[f] != want[f] || blt[f] != want[f]) return 1 + f + 6 * m;
+    }
+    return 0;
+}
+__attribute__((noinline)) static int check_float(int m) {
+    for (int i = 0; i < N(fcase); i++) {
+        const struct frow *r = &fcase[i];
+        volatile float x = ffrom(r->in);
+        u32 want[6] = {r->fl, r->ce, r->tr, r->ro, r->ri[m], r->ri[m]};
+        u32 bare[6] = {fbits(floorf(x)), fbits(ceilf(x)), fbits(truncf(x)),
+                       fbits(roundf(x)), fbits(rintf(x)), fbits(nearbyintf(x))};
+        u32 blt[6] = {fbits(__builtin_floorf(x)), fbits(__builtin_ceilf(x)),
+                      fbits(__builtin_truncf(x)), fbits(__builtin_roundf(x)),
+                      fbits(__builtin_rintf(x)), fbits(__builtin_nearbyintf(x))};
+        /* A float argument to the double function is narrowed, exactly. */
+        double wide[6] = {floor(x), ceil(x), trunc(x), round(x), rint(x), nearbyint(x)};
+        for (int f = 0; f < 6; f++) {
+            if (bare[f] != want[f] || blt[f] != want[f]) return 40 + f + 6 * m;
+            if (fbits((float)wide[f]) != want[f]) return 70 + f + 6 * m;
+        }
+    }
+    return 0;
+}
+/* rint and nearbyint of a constant that is not an integer depend on the
+   direction, so they are not folded; everything else is. */
+__attribute__((noinline)) static int check_constants(int m) {
+    static const u64 rint_2_5[4] = {0x4000000000000000, 0x4000000000000000,
+                                    0x4008000000000000, 0x4000000000000000};
+    static const u64 nearbyint_m2_5[4] = {0xc000000000000000, 0xc008000000000000,
+                                          0xc000000000000000, 0xc000000000000000};
+    if (dbits(rint(2.5)) != rint_2_5[m]) return 101;
+    if (dbits(nearbyint(-2.5)) != nearbyint_m2_5[m]) return 102;
+    if (dbits(floor(-0.5)) != 0xbff0000000000000) return 103;
+    if (dbits(ceil(-0.5)) != 0x8000000000000000) return 104;
+    if (dbits(trunc(-2.75)) != 0xc000000000000000) return 105;
+    if (dbits(round(2.5)) != 0x4008000000000000) return 106;
+    if (dbits(round(-0.25)) != 0x8000000000000000) return 107;
+    if (dbits(rint(-3.0)) != 0xc008000000000000) return 108;
+    if (fbits(floorf(2.5f)) != 0x40000000) return 109;
+    if (fbits(__builtin_roundf(-2.5f)) != 0xc0400000) return 110;
+    if (dbits(floor(__builtin_nan("0x1234"))) != 0x7ff8000000001234) return 111;
+    if (dbits(ceil(-__builtin_inf())) != 0xfff0000000000000) return 112;
+    return 0;
+}
+int main(void) {
+    int rc;
+    for (int m = 0; m < 4; m++) {
+        set_rounding(m);
+        if ((rc = check_double(m)) || (rc = check_float(m)) || (rc = check_constants(m))) {
+            set_rounding(0);
+            return rc;
+        }
+    }
+    set_rounding(0);
+    /* The result of the double function is a double, narrowed or not. */
+    volatile float f = 1.5f;
+    if (sizeof(floor(f)) != sizeof(double)) return 120;
+    if (_Generic(ceil(f), double: 0, default: 1)) return 121;
+    return 0;
+}
+"#;
+
+fn round_program() -> String {
+    format!("{SET_ROUNDING}{ROUND_TABLES}{ROUND_CHECKS}")
+}
+
+#[test]
+fn libm_rounding_values_in_every_direction() {
+    run_everywhere("round_modes", &round_program(), &[], true);
+}
+
+/// What each target computes in place needs no libm, as under gcc: all six
+/// on aarch64; on x86-64 all but `round` and `nearbyint`, which SSE2 has no
+/// sequence for (the `rint` one raises *inexact*). At `-O0` only the
+/// `__builtin_` spellings are computed in place.
+const ROUND_NO_LIBM_PROGRAM: &str = r#"
+double floor(double); double ceil(double); double trunc(double);
+double round(double); double rint(double); double nearbyint(double);
+float floorf(float); float ceilf(float); float truncf(float);
+float roundf(float); float rintf(float); float nearbyintf(float);
+/* Not in `main`, nor in anything only `main` calls: gcc compiles code it
+   knows runs once for size, and calls these there. */
+int check(void);
+int check(void) {
+    volatile double x = -2.5;
+    volatile float f = 2.5f;
+    if (__builtin_floor(x) != -3.0 || __builtin_ceil(x) != -2.0) return 1;
+    if (__builtin_trunc(x) != -2.0 || __builtin_rint(x) != -2.0) return 2;
+    if (__builtin_floorf(f) != 2.0f || __builtin_ceilf(f) != 3.0f) return 3;
+    if (__builtin_truncf(f) != 2.0f || __builtin_rintf(f) != 2.0f) return 4;
+#ifdef __OPTIMIZE__
+    if (floor(x) != -3.0 || ceil(x) != -2.0 || trunc(x) != -2.0 || rint(x) != -2.0) return 5;
+    if (floorf(f) != 2.0f || ceilf(f) != 3.0f || truncf(f) != 2.0f || rintf(f) != 2.0f) return 6;
+#endif
+#ifdef __aarch64__
+    if (__builtin_round(x) != -3.0 || __builtin_nearbyint(x) != -2.0) return 7;
+    if (__builtin_roundf(f) != 3.0f || __builtin_nearbyintf(f) != 2.0f) return 8;
+#ifdef __OPTIMIZE__
+    if (round(x) != -3.0 || nearbyint(x) != -2.0) return 9;
+    if (roundf(f) != 3.0f || nearbyintf(f) != 2.0f) return 10;
+#endif
+#endif
+    return 0;
+}
+int main(void) { return check(); }
+"#;
+
+#[test]
+fn libm_rounding_in_place_needs_no_libm() {
+    run_everywhere("round_no_libm", ROUND_NO_LIBM_PROGRAM, &[], false);
+}
+
+const ROUND_NAMES: [&str; 12] = [
+    "floor",
+    "ceil",
+    "trunc",
+    "round",
+    "rint",
+    "nearbyint",
+    "floorf",
+    "ceilf",
+    "truncf",
+    "roundf",
+    "rintf",
+    "nearbyintf",
+];
+
+/// A function computing each of the twelve, spelled `prefix` + name.
+fn round_source(prefix: &str) -> String {
+    let mut src = String::from(
+        "double floor(double); double ceil(double); double trunc(double);\n\
+         double round(double); double rint(double); double nearbyint(double);\n\
+         float floorf(float); float ceilf(float); float truncf(float);\n\
+         float roundf(float); float rintf(float); float nearbyintf(float);\n",
+    );
+    for name in ROUND_NAMES {
+        let t = if name.ends_with('f') {
+            "float"
+        } else {
+            "double"
+        };
+        src.push_str(&format!(
+            "{t} t_{name}({t} x) {{ return {prefix}{name}(x); }}\n"
+        ));
+    }
+    src
+}
+
+/// The instructions: `frintm`, `frintp`, `frintz`, `frinta`, `frintx` and
+/// `frinti` on aarch64; on x86-64 gcc's SSE2 sequences through `cvttsd2si`
+/// for `floor`, `ceil` and `trunc` and the 2^52 addition for `rint`, and
+/// calls to `round` and `nearbyint`, which gcc keeps too.
+#[test]
+fn libm_rounding_is_computed_in_place() {
+    for prefix in ["", "__builtin_"] {
+        let [(_, host), (_, a64)] = asm_both("round_o2", &round_source(prefix), &["-O2"]);
+        for insn in ["frintm", "frintp", "frintz", "frinta", "frintx", "frinti"] {
+            assert!(has_insn(&a64, insn), "{prefix}: no {insn}:\n{a64}");
+        }
+        assert!(
+            !calls_any(&a64, &ROUND_NAMES),
+            "{prefix}: a call remains:\n{a64}"
+        );
+        if cfg!(target_arch = "x86_64") {
+            assert!(
+                has_insn(&host, "cvttsd2si") || has_insn(&host, "cvttsd2siq"),
+                "{host}"
+            );
+            assert!(
+                has_insn(&host, "cvttss2si") || has_insn(&host, "cvttss2sil"),
+                "{host}"
+            );
+            let called = [
+                "floor", "ceil", "trunc", "rint", "floorf", "ceilf", "truncf", "rintf",
+            ];
+            assert!(
+                !calls_any(&host, &called),
+                "{prefix}: a call remains:\n{host}"
+            );
+            for kept in ["round", "nearbyint", "roundf", "nearbyintf"] {
+                assert!(
+                    calls_any(&host, &[kept]),
+                    "{prefix}: {kept} not called:\n{host}"
+                );
+            }
+        }
+    }
+}
+
+/// At `-O0` the bare spellings are calls, and the `__builtin_` ones are
+/// computed in place where the target can, as in gcc.
+#[test]
+fn libm_rounding_at_o0_follows_gcc() {
+    for (target, asm) in asm_both("round_o0", &round_source(""), &["-O0"]) {
+        for name in ROUND_NAMES {
+            assert!(
+                calls_any(&asm, &[name]),
+                "{target}: {name} not called:\n{asm}"
+            );
+        }
+    }
+    let [(_, host), (_, a64)] = asm_both("round_o0_b", &round_source("__builtin_"), &["-O0"]);
+    assert!(!calls_any(&a64, &ROUND_NAMES), "a call remains:\n{a64}");
+    if cfg!(target_arch = "x86_64") {
+        assert!(
+            !calls_any(&host, &["floor", "ceil", "trunc", "rint"]),
+            "{host}"
+        );
+    }
+}
+
+/// `-fno-builtin-floor` keeps the call to `floor`, and only that one.
+#[test]
+fn libm_rounding_fno_builtin_keeps_the_call() {
+    let opts = ["-O2", "-fno-builtin-floor"];
+    let src = "double floor(double);\ndouble d(double x) { return floor(x); }\n";
+    for (target, asm) in asm_both("floor_nb", src, &opts) {
+        assert!(calls_any(&asm, &["floor"]), "{target}:\n{asm}");
+    }
+    let src = "double ceil(double);\ndouble d(double x) { return ceil(x); }\n";
+    for (target, asm) in asm_both("ceil_nb", src, &opts) {
+        assert!(!calls_any(&asm, &["ceil"]), "{target}:\n{asm}");
+    }
+}
+
+/// Constants fold, in code and in static initializers, except a `rint` or
+/// `nearbyint` of a value that is not already an integer: its answer is the
+/// current rounding direction's, and gcc leaves it too.
+#[test]
+fn libm_rounding_of_constants() {
+    let src = "double floor(double); double ceil(double); double round(double);\n\
+               double f(void) { return floor(-0.5) + ceil(2.5) + round(0.5)\n\
+               + __builtin_trunc(-1.5) + __builtin_rint(3.0) + __builtin_nearbyintf(-4.0f); }\n";
+    for (target, asm) in asm_both("round_fold", src, &["-O2"]) {
+        assert!(!calls_any(&asm, &ROUND_NAMES), "{target}:\n{asm}");
+        assert!(
+            !asm.contains("frint") && !asm.contains("cvtt"),
+            "{target}:\n{asm}"
+        );
+    }
+    let src = "double rint(double);\ndouble f(void) { return rint(2.5); }\n";
+    let [(_, _), (_, a64)] = asm_both("rint_nofold", src, &["-O2"]);
+    assert!(has_insn(&a64, "frintx"), "rint(2.5) folded:\n{a64}");
+
+    let code = r#"
+double floor(double); double ceil(double); double trunc(double);
+double round(double); double rint(double); float roundf(float);
+static double a = floor(-2.5);
+static double b = ceil(-0.5);
+static double c = trunc(2.75);
+static double d = round(-2.5);
+static float e = roundf(0.5f);
+static double f = rint(-7.0);
+int main(void) {
+    if (a != -3.0 || b != 0.0 || !__builtin_signbit(b)) return 1;
+    if (c != 2.0 || d != -3.0 || e != 1.0f || f != -7.0) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("round_static", code, &[]), 0);
+    compile_expect_error(
+        "rint_static_inexact",
+        "double rint(double);\nstatic double z = rint(2.5);\ndouble *p = &z;\n",
+        "cannot initialize an object with static storage duration",
+    );
+}
+
+/// A translation unit's own definition of `sqrt` or a rounding is the
+/// function its calls reach -- above the definition too, and through an
+/// old-style definition that takes no arguments at all (gcc's torture test
+/// ieee/20030331-1 defines `float rintf()` so) -- as under gcc, which folds
+/// only `abs`, `fabs`, `copysign` and the like regardless.
+const OWN_DEFINITIONS_PROGRAM: &str = r#"
+double sqrt(double); double floor(double);
+static volatile int calls;
+double sqrt(double x) { calls++; return x + 100.0; }
+static double use_floor(double x) { return floor(x); }
+double floor(double x) { calls++; return x + 200.0; }
+float x = -1.5f;
+float rintf() { calls++; return x + 300.0f; }
+int main(void) {
+    volatile double v = 4.0;
+    if (sqrt(v) != 104.0 || use_floor(v) != 204.0 || rintf() != 298.5f) return 1;
+    if (calls != 3) return 2;
+    /* Not pure any more: an untaken arm does not call. */
+    volatile int no = 0;
+    double r = no ? floor(v) : 1.0;
+    if (r != 1.0 || calls != 3) return 3;
+    return 0;
+}
+"#;
+
+#[test]
+fn libm_own_definition_is_called() {
+    run_everywhere("own_defs", OWN_DEFINITIONS_PROGRAM, &[], false);
+}

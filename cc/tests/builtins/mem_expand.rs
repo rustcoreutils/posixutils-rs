@@ -394,34 +394,45 @@ int main(void) {
     }
 }
 
-/// This translation unit's own definition of `memcpy` is the one called,
-/// compatible prototype and all, as under gcc: glibc's fortify headers define
-/// an `always_inline` `gnu_inline` wrapper that checks the object size, and
-/// it must not be bypassed.
+/// This translation unit's own non-weak definition of `memcpy` is the one
+/// called, compatible prototype and all, wherever it is -- above its caller
+/// or below it, as for `sqrt`: glibc's fortify headers define an
+/// `always_inline` `gnu_inline` wrapper that checks the object size, and it
+/// must not be bypassed.
 #[test]
 fn builtins_mem_expand_own_definition_is_called() {
     let body = "{ char *dd = d; const char *ss = s; calls++; \
                 while (n--) *dd++ = *ss++; return d; }";
-    for (name, qualifiers) in [
-        ("plain", ""),
+    for (name, qualifiers, below) in [
+        ("plain", "", false),
         (
             "wrapper",
             "__attribute__((gnu_inline, always_inline)) extern inline ",
+            false,
         ),
-        ("static", "static inline "),
+        ("static", "static inline ", false),
+        ("below", "", true),
     ] {
+        let def = format!(
+            "{qualifiers}void *memcpy(void *restrict d, const void *restrict s, size_t n)\n{body}\n"
+        );
+        let (above, after) = if below {
+            (String::new(), def)
+        } else {
+            (def, String::new())
+        };
         let src = format!(
             "typedef unsigned long size_t;\n\
              int calls;\n\
-             {qualifiers}void *memcpy(void *restrict d, const void *restrict s, size_t n)\n\
-             {body}\n\
+             {above}\
              int main(void) {{\n\
                  char a[8] = \"abcdefg\", b[8];\n\
                  /* A static link's libc calls a global one before main. */\n\
                  calls = 0;\n\
                  if (memcpy(b, a, 8) != b || b[6] != 'g') return 1;\n\
                  return calls == 1 ? 0 : 2;\n\
-             }}\n"
+             }}\n\
+             {after}"
         );
         for opt in ["-O0", "-O2"] {
             let tag = format!("mem_expand_own_{name}{}", opt.replace('-', "_"));

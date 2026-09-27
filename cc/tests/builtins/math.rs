@@ -621,7 +621,10 @@ int main(void)
 /// gcc performs it as an optimization and leaves the wide call at `-O0`.
 /// Doing it always is a deliberate difference and a safe one -- the rewrite
 /// is exact at every level -- but it is a difference, so it is stated here
-/// rather than left for someone to discover from a disassembly.
+/// rather than left for someone to discover from a disassembly. At `-O0`
+/// the bare `floor` is a call, to `floorf`; once optimizing it is computed in
+/// place, still at `float` -- `cvttss2si` on x86-64, `frintm` of an `s`
+/// register on aarch64 -- and nothing is called.
 #[test]
 fn builtins_math_narrowing_happens_at_every_level() {
     let src = "double floor(double);\nfloat q(float a) { return floor(a); }\n";
@@ -629,13 +632,19 @@ fn builtins_math_narrowing_happens_at_every_level() {
     // is exercised wherever this runs. The prefix is read off each output
     // rather than assumed -- Mach-O calls `_floorf`, and "floorf" is a
     // substring of that, so a check spelled for ELF keeps passing there
-    // while its negative half matches nothing at all.
-    let targets: [&[&str]; 3] = [
-        &[],
-        &["--target=aarch64-apple-darwin"],
-        &["--target=x86_64-apple-darwin"],
+    // while its negative half matches nothing at all. The last element is
+    // the instruction that computes a `float` floor in place.
+    let host_insn = if cfg!(target_arch = "aarch64") {
+        "frintm s"
+    } else {
+        "cvttss2si"
+    };
+    let targets: [(&[&str], &str); 3] = [
+        (&[], host_insn),
+        (&["--target=aarch64-apple-darwin"], "frintm s"),
+        (&["--target=x86_64-apple-darwin"], "cvttss2si"),
     ];
-    for target in targets {
+    for (target, in_place) in targets {
         for opt in ["-O0", "-O1", "-O2"] {
             let mut args = vec![opt];
             args.extend_from_slice(target);
@@ -659,13 +668,20 @@ fn builtins_math_narrowing_happens_at_every_level() {
                 })
             };
             assert!(
-                calls("floorf"),
-                "{target:?} at {opt}: the call should be narrowed to {p}floorf:\n{asm}"
-            );
-            assert!(
                 !calls("floor"),
                 "{target:?} at {opt}: the wide form must not be called:\n{asm}"
             );
+            if opt == "-O0" {
+                assert!(
+                    calls("floorf"),
+                    "{target:?} at {opt}: the call should be narrowed to {p}floorf:\n{asm}"
+                );
+            } else {
+                assert!(
+                    !calls("floorf") && asm.contains(in_place),
+                    "{target:?} at {opt}: not computed in place at float:\n{asm}"
+                );
+            }
         }
     }
 }

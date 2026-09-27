@@ -17,6 +17,7 @@ use super::regalloc::{Reg, VReg};
 use crate::arch::lir::{
     CallTarget, CondCode, Directive, EmitAsm, FpSize, Label, OperandSize, Symbol,
 };
+use crate::float::IntegralRounding;
 use crate::target::{Os, Target};
 use std::fmt::Write;
 
@@ -650,6 +651,15 @@ pub enum Aarch64Inst {
 
     /// FSQRT - FP square root
     Fsqrt {
+        size: FpSize,
+        src: VReg,
+        dst: VReg,
+    },
+
+    /// FRINTM/FRINTP/FRINTZ/FRINTA/FRINTX/FRINTI - round to an integral
+    /// value, in the direction `how` names
+    Frint {
+        how: IntegralRounding,
         size: FpSize,
         src: VReg,
         dst: VReg,
@@ -1293,6 +1303,29 @@ impl EmitAsm for Aarch64Inst {
                 let _ = writeln!(
                     out,
                     "    fsqrt {}, {}",
+                    dst.name_for_size(size_bits(*size)),
+                    src.name_for_size(size_bits(*size))
+                );
+            }
+            Aarch64Inst::Frint {
+                how,
+                size,
+                src,
+                dst,
+            } => {
+                // `frintx` raises inexact and `frinti` does not: `rint`
+                // against `nearbyint`, both in the current direction.
+                let mnemonic = match how {
+                    IntegralRounding::Floor => "frintm",
+                    IntegralRounding::Ceil => "frintp",
+                    IntegralRounding::Trunc => "frintz",
+                    IntegralRounding::Round => "frinta",
+                    IntegralRounding::Rint => "frintx",
+                    IntegralRounding::NearbyInt => "frinti",
+                };
+                let _ = writeln!(
+                    out,
+                    "    {mnemonic} {}, {}",
                     dst.name_for_size(size_bits(*size)),
                     src.name_for_size(size_bits(*size))
                 );
@@ -2030,6 +2063,48 @@ mod tests {
         };
         inst.emit(&target, &mut out);
         assert_eq!(out.trim(), "mov x0, x1");
+    }
+
+    /// Each rounding is its own `frint`, and the square root `fsqrt`, at
+    /// the operand's width.
+    #[test]
+    fn test_frint_and_fsqrt_emit() {
+        use IntegralRounding::*;
+        let target = linux_target();
+        let emitted = |inst: Aarch64Inst| {
+            let mut out = String::new();
+            inst.emit(&target, &mut out);
+            out.trim().to_string()
+        };
+        for (how, want) in [
+            (Floor, "frintm d1, d2"),
+            (Ceil, "frintp d1, d2"),
+            (Trunc, "frintz d1, d2"),
+            (Round, "frinta d1, d2"),
+            (Rint, "frintx d1, d2"),
+            (NearbyInt, "frinti d1, d2"),
+        ] {
+            let inst = Aarch64Inst::Frint {
+                how,
+                size: FpSize::Double,
+                src: VReg::V2,
+                dst: VReg::V1,
+            };
+            assert_eq!(emitted(inst), want);
+        }
+        let inst = Aarch64Inst::Frint {
+            how: Floor,
+            size: FpSize::Single,
+            src: VReg::V2,
+            dst: VReg::V1,
+        };
+        assert_eq!(emitted(inst), "frintm s1, s2");
+        let inst = Aarch64Inst::Fsqrt {
+            size: FpSize::Single,
+            src: VReg::V0,
+            dst: VReg::V3,
+        };
+        assert_eq!(emitted(inst), "fsqrt s3, s0");
     }
 
     #[test]

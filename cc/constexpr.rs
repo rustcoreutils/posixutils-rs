@@ -526,12 +526,13 @@ pub(crate) fn eval_float(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) ->
             eval_as_float(env, scope, chosen_arm(env, scope, expr)?, expr.typ?)
         }
 
-        // `fabs`, `copysign` and `sqrt` of constants, whose arguments are
-        // already at this node's type. A call is never an integer constant
-        // expression, and gcc agrees -- `int a[(int)fabs(-2.0)];` is a VLA
-        // there -- but it folds one in a static initializer. A root with no
-        // answer of its own -- a domain error -- is not a constant, there as
-        // here.
+        // `fabs`, `copysign`, `sqrt` and the roundings of constants, whose
+        // arguments are already at this node's type. A call is never an
+        // integer constant expression, and gcc agrees -- `int
+        // a[(int)fabs(-2.0)];` is a VLA there -- but it folds one in a static
+        // initializer. One with no answer of its own -- a root's domain
+        // error, a `rint(2.5)` that depends on the rounding direction -- is
+        // not a constant, there as here.
         ExprKind::InlineLibraryCall { func, args, .. }
             if scope == ConstScope::StaticInitializer =>
         {
@@ -542,6 +543,9 @@ pub(crate) fn eval_float(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) ->
                     Some(eval_float(env, scope, x)?.with_sign_of(sign))
                 }
                 (InlineLibraryFn::Sqrt(_), [x]) => eval_float(env, scope, x)?.sqrt(fmt?),
+                (InlineLibraryFn::RoundToIntegral(how), [x]) => {
+                    eval_float(env, scope, x)?.round_to_integral(*how, fmt?)
+                }
                 _ => None,
             }
         }

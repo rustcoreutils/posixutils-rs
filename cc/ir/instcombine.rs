@@ -225,7 +225,9 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
         Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv | Opcode::CopySign => {
             simplify_fbinop(insn, consts, facts)
         }
-        Opcode::FNeg | Opcode::Fabs | Opcode::Sqrt => simplify_funop(insn, consts, facts),
+        Opcode::FNeg | Opcode::Fabs | Opcode::Sqrt | Opcode::RoundToIntegral(_) => {
+            simplify_funop(insn, consts, facts)
+        }
         Opcode::FCvtF => simplify_fcvtf(insn, consts, facts),
         Opcode::FCmpOEq
         | Opcode::FCmpONe
@@ -3150,6 +3152,42 @@ mod tests {
         );
         let got = fold_float(Opcode::Sqrt, types.double_id, 64, &[2.0]).map(|(v, _)| v);
         assert_eq!(got.map(|v| v.to_f64()), Some(2f64.sqrt()));
+    }
+
+    /// The roundings of a constant fold at the operand's format, keeping the
+    /// sign of a zero result; `rint` and `nearbyint` only where the answer
+    /// is the same in every rounding direction.
+    #[test]
+    fn rounding_a_constant_folds_where_the_direction_cannot_matter() {
+        use crate::float::IntegralRounding::*;
+        let types = host_types();
+        for (typ, size) in [(types.float_id, 32), (types.double_id, 64)] {
+            let fold = |how, arg: f64| {
+                fold_float(Opcode::RoundToIntegral(how), typ, size, &[arg]).map(|(v, _)| v)
+            };
+            for (how, arg, want) in [
+                (Floor, -0.5, -1.0),
+                (Ceil, 2.25, 3.0),
+                (Trunc, -2.75, -2.0),
+                (Round, 2.5, 3.0),
+                (Round, -0.5, -1.0),
+                (Rint, 4.0, 4.0),
+                (NearbyInt, -8.0, -8.0),
+            ] {
+                assert_eq!(
+                    fold(how, arg).map(|v| v.to_f64()),
+                    Some(want),
+                    "{how:?}({arg})"
+                );
+            }
+            let zero = fold(Ceil, -0.5).unwrap();
+            assert!(
+                zero.is_zero() && zero.sign_bit(),
+                "ceil(-0.5) is -0 at {size}"
+            );
+            assert!(fold(Rint, 2.5).is_none(), "rint(2.5) is the direction's");
+            assert!(fold(NearbyInt, -0.25).is_none());
+        }
     }
 
     #[test]

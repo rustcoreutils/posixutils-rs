@@ -130,8 +130,9 @@ impl Parser<'_> {
     /// those, and they need code generation an ordinary call cannot produce.
     /// The library builtins (`abs`, `fabs`, `floor`, ...) survive a function
     /// declaration only if it is compatible with the prototype their table
-    /// gives (see `library_prototype_matches`), and `memcpy`, `memset` and
-    /// `memmove` do not survive a definition of their own in this unit.
+    /// gives (see `library_prototype_matches`), and the functions gcc expands
+    /// late (`sqrt`, `floor`, `memcpy`, ...) not a definition of the function
+    /// at all.
     ///
     /// The reserved spellings (`__builtin_*`, `_Alignof`, `__alignof__`) are
     /// never displaced: C17 7.1.3 reserves them to the implementation in every
@@ -164,6 +165,13 @@ impl Parser<'_> {
                 return true;
             }
         }
+        // A definition in this translation unit is the function called; one
+        // further down is found by the linearizer instead.
+        if library.is_some_and(|lb| lb.yields_to_a_definition())
+            && self.defined_functions.contains(&name_id)
+        {
+            return true;
+        }
 
         let Some(symbol_id) = self.symbols.lookup_id(name_id, Namespace::Ordinary) else {
             return false;
@@ -171,10 +179,7 @@ impl Parser<'_> {
         let typ = self.symbols.get(symbol_id).typ;
         shadowed_by_any_decl
             || self.types.kind(typ) != TypeKind::Function
-            || library.is_some_and(|lb| {
-                !self.library_prototype_matches(lb, typ)
-                    || (lb.displaced_by_definition() && self.defined_fns.contains(&name_id))
-            })
+            || library.is_some_and(|lb| !self.library_prototype_matches(lb, typ))
     }
 
     /// Try to parse a builtin function expression.
@@ -2465,23 +2470,11 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_CBRT
                 | crate::kw::BUILTIN_CBRTF
                 | crate::kw::BUILTIN_CBRTL
-                | crate::kw::BUILTIN_CEIL
-                | crate::kw::BUILTIN_CEILF
                 | crate::kw::BUILTIN_CEILL
-                | crate::kw::BUILTIN_FLOOR
-                | crate::kw::BUILTIN_FLOORF
                 | crate::kw::BUILTIN_FLOORL
-                | crate::kw::BUILTIN_TRUNC
-                | crate::kw::BUILTIN_TRUNCF
                 | crate::kw::BUILTIN_TRUNCL
-                | crate::kw::BUILTIN_ROUND
-                | crate::kw::BUILTIN_ROUNDF
                 | crate::kw::BUILTIN_ROUNDL
-                | crate::kw::BUILTIN_RINT
-                | crate::kw::BUILTIN_RINTF
                 | crate::kw::BUILTIN_RINTL
-                | crate::kw::BUILTIN_NEARBYINT
-                | crate::kw::BUILTIN_NEARBYINTF
                 | crate::kw::BUILTIN_NEARBYINTL
                 | crate::kw::BUILTIN_SIN
                 | crate::kw::BUILTIN_SINF

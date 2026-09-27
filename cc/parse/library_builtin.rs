@@ -16,8 +16,9 @@
 // the table names for it.
 //
 
-use super::ast::{Expr, ExprKind, InlineLibraryFn, MathErrno};
+use super::ast::{Expr, ExprKind, InlineLibraryFn, MathErrno, MemoryFn};
 use super::parser::{ParseResult, Parser};
+use crate::float::IntegralRounding;
 use crate::kw;
 use crate::strings::StringId;
 use crate::token::lexer::Position;
@@ -66,7 +67,11 @@ impl LibraryCallPolicy {
     /// arguments that set it. The magnitudes, `copysign` and the complex
     /// accessors are bit operations and moves, and are in place at every
     /// level -- as `abs` and `fabs` are in gcc, which turns them into
-    /// operators before anything else sees them.
+    /// operators before anything else sees them. The block memory functions
+    /// are their IR operation at every level too: whether one becomes loads
+    /// and stores or the library call is decided on the IR
+    /// (`ir::memexpand`), where a length that only inlining makes constant
+    /// can still be seen.
     fn in_place(self, func: InlineLibraryFn, spelling: Spelling) -> bool {
         if self.optimizing {
             return true;
@@ -77,9 +82,12 @@ impl LibraryCallPolicy {
             | InlineLibraryFn::CopySign
             | InlineLibraryFn::ComplexReal
             | InlineLibraryFn::ComplexImag
-            | InlineLibraryFn::Conjugate => true,
+            | InlineLibraryFn::Conjugate
+            | InlineLibraryFn::Memory(_) => true,
             InlineLibraryFn::Sqrt(MathErrno::Set) => false,
-            InlineLibraryFn::Sqrt(MathErrno::Ignored) => spelling == Spelling::Reserved,
+            InlineLibraryFn::Sqrt(MathErrno::Ignored) | InlineLibraryFn::RoundToIntegral(_) => {
+                spelling == Spelling::Reserved
+            }
         }
     }
 }
@@ -121,60 +129,6 @@ impl ProtoType {
     }
 }
 
-/// A block memory function of `<string.h>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MemoryFn {
-    /// `void *memcpy(void *restrict, const void *restrict, size_t)`
-    Copy,
-    /// `void *memset(void *, int, size_t)`
-    Set,
-    /// `void *memmove(void *, const void *, size_t)`
-    Move,
-}
-
-/// How a call to a library builtin is evaluated, once its arguments have
-/// been checked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lowering {
-    /// Computed in place, as an [`ExprKind::InlineLibraryCall`].
-    InPlace(InlineLibraryFn),
-    /// An ordinary call, to the function's `float` form `narrow` when the
-    /// argument is a `float`.
-    ///
-    /// `(float)floor((double)x)` is `floorf(x)` exactly: the result is an
-    /// integer no greater in magnitude than `x`, so a value representable as
-    /// a `float` stays representable, and converting it up to `double` and
-    /// back changes nothing. The condition is on the **argument** type and
-    /// not the result -- `double q(float a) { return floor(a); }` narrows
-    /// too, because the narrowing happens before the widening.
-    ///
-    /// Only the exactly-rounding functions qualify, which is why they are
-    /// enumerated rather than derived. `sin` and `log` are not among them:
-    /// `sinf(x)` and `(float)sin((double)x)` differ in the last bit for some
-    /// `x`, and narrowing one is a wrong answer rather than a faster one.
-    NarrowingCall { narrow: StringId },
-    /// A block memory function, as its [`ExprKind`] node. Whether it becomes
-    /// a call or loads and stores is decided on the IR (`ir::memexpand`),
-    /// where a length that only inlining makes constant can still be seen.
-    Memory(MemoryFn),
-}
-
-impl Lowering {
-    /// Whether this translation unit's own definition of the name displaces
-    /// the builtin.
-    ///
-    /// gcc's answer differs by function, and this follows it. A `memcpy`
-    /// defined here is the one called, at every level -- which is what
-    /// glibc's fortify headers depend on: an `always_inline` `gnu_inline`
-    /// `memcpy` wrapper that checks the object size before it copies. An
-    /// `abs` defined here is folded past all the same (gcc.c-torture
-    /// `execute/20021127-1`), since defining a reserved library name is
-    /// undefined (C17 7.1.3p2) and the value cannot differ.
-    fn displaced_by_definition(self) -> bool {
-        matches!(self, Lowering::Memory(_))
-    }
-}
-
 /// Which spelling of a library builtin named it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Spelling {
@@ -190,28 +144,27 @@ enum Spelling {
 pub(super) struct LibraryBuiltin {
     /// The library's name for the function, which is also its bare keyword.
     bare: StringId,
-    /// The `__builtin_` spelling, when this table is what that spelling
-    /// means. The floor family's reserved spellings are plain library
-    /// aliases instead (see `parse_library_builtin`).
-    reserved: Option<StringId>,
+    /// The `__builtin_` spelling.
+    reserved: StringId,
     ret: ProtoType,
     params: &'static [ProtoType],
-    lowering: Lowering,
+    /// What a call computes, once its arguments have been checked.
+    func: InlineLibraryFn,
 }
 
 const fn entry(
     bare: StringId,
-    reserved: Option<StringId>,
+    reserved: StringId,
     ret: ProtoType,
     params: &'static [ProtoType],
-    lowering: Lowering,
+    func: InlineLibraryFn,
 ) -> LibraryBuiltin {
     LibraryBuiltin {
         bare,
         reserved,
         ret,
         params,
-        lowering,
+        func,
     }
 }
 
@@ -222,42 +175,49 @@ const fn entry(
 #[rustfmt::skip]
 static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
     use InlineLibraryFn as F;
-    use Lowering::{InPlace, Memory, NarrowingCall};
+    use IntegralRounding as R;
     use MemoryFn as M;
     use ProtoType::*;
+    const SQRT: F = F::Sqrt(MathErrno::Set);
     &[
-        //    bare           reserved                     returns            parameters                        lowering
-        entry(kw::ABS,       Some(kw::BUILTIN_ABS),       Int,               &[Int],                           InPlace(F::IntAbs)),
-        entry(kw::LABS,      Some(kw::BUILTIN_LABS),      Long,              &[Long],                          InPlace(F::IntAbs)),
-        entry(kw::LLABS,     Some(kw::BUILTIN_LLABS),     LongLong,          &[LongLong],                      InPlace(F::IntAbs)),
-        entry(kw::IMAXABS,   Some(kw::BUILTIN_IMAXABS),   Long,              &[Long],                          InPlace(F::IntAbs)),
-        entry(kw::FABS,      Some(kw::BUILTIN_FABS),      Double,            &[Double],                        InPlace(F::Fabs)),
-        entry(kw::FABSF,     Some(kw::BUILTIN_FABSF),     Float,             &[Float],                         InPlace(F::Fabs)),
-        entry(kw::FABSL,     Some(kw::BUILTIN_FABSL),     LongDouble,        &[LongDouble],                    InPlace(F::Fabs)),
-        entry(kw::COPYSIGN,  Some(kw::BUILTIN_COPYSIGN),  Double,            &[Double, Double],                InPlace(F::CopySign)),
-        entry(kw::COPYSIGNF, Some(kw::BUILTIN_COPYSIGNF), Float,             &[Float, Float],                  InPlace(F::CopySign)),
-        entry(kw::COPYSIGNL, Some(kw::BUILTIN_COPYSIGNL), LongDouble,        &[LongDouble, LongDouble],        InPlace(F::CopySign)),
-        entry(kw::SQRT,      Some(kw::BUILTIN_SQRT),      Double,            &[Double],                        InPlace(F::Sqrt(MathErrno::Set))),
-        entry(kw::SQRTF,     Some(kw::BUILTIN_SQRTF),     Float,             &[Float],                         InPlace(F::Sqrt(MathErrno::Set))),
-        entry(kw::SQRTL,     Some(kw::BUILTIN_SQRTL),     LongDouble,        &[LongDouble],                    InPlace(F::Sqrt(MathErrno::Set))),
-        entry(kw::FLOOR,     None,                        Double,            &[Double],                        NarrowingCall { narrow: kw::FLOORF }),
-        entry(kw::CEIL,      None,                        Double,            &[Double],                        NarrowingCall { narrow: kw::CEILF }),
-        entry(kw::TRUNC,     None,                        Double,            &[Double],                        NarrowingCall { narrow: kw::TRUNCF }),
-        entry(kw::ROUND,     None,                        Double,            &[Double],                        NarrowingCall { narrow: kw::ROUNDF }),
-        entry(kw::RINT,      None,                        Double,            &[Double],                        NarrowingCall { narrow: kw::RINTF }),
-        entry(kw::NEARBYINT, None,                        Double,            &[Double],                        NarrowingCall { narrow: kw::NEARBYINTF }),
-        entry(kw::CREAL,     Some(kw::BUILTIN_CREAL),     Double,            &[ComplexDouble],                 InPlace(F::ComplexReal)),
-        entry(kw::CREALF,    Some(kw::BUILTIN_CREALF),    Float,             &[ComplexFloat],                  InPlace(F::ComplexReal)),
-        entry(kw::CREALL,    Some(kw::BUILTIN_CREALL),    LongDouble,        &[ComplexLongDouble],             InPlace(F::ComplexReal)),
-        entry(kw::CIMAG,     Some(kw::BUILTIN_CIMAG),     Double,            &[ComplexDouble],                 InPlace(F::ComplexImag)),
-        entry(kw::CIMAGF,    Some(kw::BUILTIN_CIMAGF),    Float,             &[ComplexFloat],                  InPlace(F::ComplexImag)),
-        entry(kw::CIMAGL,    Some(kw::BUILTIN_CIMAGL),    LongDouble,        &[ComplexLongDouble],             InPlace(F::ComplexImag)),
-        entry(kw::CONJ,      Some(kw::BUILTIN_CONJ),      ComplexDouble,     &[ComplexDouble],                 InPlace(F::Conjugate)),
-        entry(kw::CONJF,     Some(kw::BUILTIN_CONJF),     ComplexFloat,      &[ComplexFloat],                  InPlace(F::Conjugate)),
-        entry(kw::CONJL,     Some(kw::BUILTIN_CONJL),     ComplexLongDouble, &[ComplexLongDouble],             InPlace(F::Conjugate)),
-        entry(kw::MEMCPY,    Some(kw::BUILTIN_MEMCPY),    VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT],  Memory(M::Copy)),
-        entry(kw::MEMSET,    Some(kw::BUILTIN_MEMSET),    VoidPtr,           &[VoidPtr, Int, SizeT],           Memory(M::Set)),
-        entry(kw::MEMMOVE,   Some(kw::BUILTIN_MEMMOVE),   VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT],  Memory(M::Move)),
+        //    bare            reserved                 returns            parameters                        computes
+        entry(kw::ABS,        kw::BUILTIN_ABS,         Int,               &[Int],                           F::IntAbs),
+        entry(kw::LABS,       kw::BUILTIN_LABS,        Long,              &[Long],                          F::IntAbs),
+        entry(kw::LLABS,      kw::BUILTIN_LLABS,       LongLong,          &[LongLong],                      F::IntAbs),
+        entry(kw::IMAXABS,    kw::BUILTIN_IMAXABS,     Long,              &[Long],                          F::IntAbs),
+        entry(kw::FABS,       kw::BUILTIN_FABS,        Double,            &[Double],                        F::Fabs),
+        entry(kw::FABSF,      kw::BUILTIN_FABSF,       Float,             &[Float],                         F::Fabs),
+        entry(kw::FABSL,      kw::BUILTIN_FABSL,       LongDouble,        &[LongDouble],                    F::Fabs),
+        entry(kw::COPYSIGN,   kw::BUILTIN_COPYSIGN,    Double,            &[Double, Double],                F::CopySign),
+        entry(kw::COPYSIGNF,  kw::BUILTIN_COPYSIGNF,   Float,             &[Float, Float],                  F::CopySign),
+        entry(kw::COPYSIGNL,  kw::BUILTIN_COPYSIGNL,   LongDouble,        &[LongDouble, LongDouble],        F::CopySign),
+        entry(kw::SQRT,       kw::BUILTIN_SQRT,        Double,            &[Double],                        SQRT),
+        entry(kw::SQRTF,      kw::BUILTIN_SQRTF,       Float,             &[Float],                         SQRT),
+        entry(kw::SQRTL,      kw::BUILTIN_SQRTL,       LongDouble,        &[LongDouble],                    SQRT),
+        entry(kw::FLOOR,      kw::BUILTIN_FLOOR,       Double,            &[Double],                        F::RoundToIntegral(R::Floor)),
+        entry(kw::FLOORF,     kw::BUILTIN_FLOORF,      Float,             &[Float],                         F::RoundToIntegral(R::Floor)),
+        entry(kw::CEIL,       kw::BUILTIN_CEIL,        Double,            &[Double],                        F::RoundToIntegral(R::Ceil)),
+        entry(kw::CEILF,      kw::BUILTIN_CEILF,       Float,             &[Float],                         F::RoundToIntegral(R::Ceil)),
+        entry(kw::TRUNC,      kw::BUILTIN_TRUNC,       Double,            &[Double],                        F::RoundToIntegral(R::Trunc)),
+        entry(kw::TRUNCF,     kw::BUILTIN_TRUNCF,      Float,             &[Float],                         F::RoundToIntegral(R::Trunc)),
+        entry(kw::ROUND,      kw::BUILTIN_ROUND,       Double,            &[Double],                        F::RoundToIntegral(R::Round)),
+        entry(kw::ROUNDF,     kw::BUILTIN_ROUNDF,      Float,             &[Float],                         F::RoundToIntegral(R::Round)),
+        entry(kw::RINT,       kw::BUILTIN_RINT,        Double,            &[Double],                        F::RoundToIntegral(R::Rint)),
+        entry(kw::RINTF,      kw::BUILTIN_RINTF,       Float,             &[Float],                         F::RoundToIntegral(R::Rint)),
+        entry(kw::NEARBYINT,  kw::BUILTIN_NEARBYINT,   Double,            &[Double],                        F::RoundToIntegral(R::NearbyInt)),
+        entry(kw::NEARBYINTF, kw::BUILTIN_NEARBYINTF,  Float,             &[Float],                         F::RoundToIntegral(R::NearbyInt)),
+        entry(kw::CREAL,      kw::BUILTIN_CREAL,       Double,            &[ComplexDouble],                 F::ComplexReal),
+        entry(kw::CREALF,     kw::BUILTIN_CREALF,      Float,             &[ComplexFloat],                  F::ComplexReal),
+        entry(kw::CREALL,     kw::BUILTIN_CREALL,      LongDouble,        &[ComplexLongDouble],             F::ComplexReal),
+        entry(kw::CIMAG,      kw::BUILTIN_CIMAG,       Double,            &[ComplexDouble],                 F::ComplexImag),
+        entry(kw::CIMAGF,     kw::BUILTIN_CIMAGF,      Float,             &[ComplexFloat],                  F::ComplexImag),
+        entry(kw::CIMAGL,     kw::BUILTIN_CIMAGL,      LongDouble,        &[ComplexLongDouble],             F::ComplexImag),
+        entry(kw::CONJ,       kw::BUILTIN_CONJ,        ComplexDouble,     &[ComplexDouble],                 F::Conjugate),
+        entry(kw::CONJF,      kw::BUILTIN_CONJF,       ComplexFloat,      &[ComplexFloat],                  F::Conjugate),
+        entry(kw::CONJL,      kw::BUILTIN_CONJL,       ComplexLongDouble, &[ComplexLongDouble],             F::Conjugate),
+        entry(kw::MEMCPY,     kw::BUILTIN_MEMCPY,      VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT],  F::Memory(M::Copy)),
+        entry(kw::MEMSET,     kw::BUILTIN_MEMSET,      VoidPtr,           &[VoidPtr, Int, SizeT],           F::Memory(M::Set)),
+        entry(kw::MEMMOVE,    kw::BUILTIN_MEMMOVE,     VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT],  F::Memory(M::Move)),
     ]
 };
 
@@ -267,7 +227,7 @@ impl LibraryBuiltin {
         LIBRARY_BUILTINS.iter().find_map(|lb| {
             if lb.bare == name_id {
                 Some((lb, Spelling::Bare))
-            } else if lb.reserved == Some(name_id) {
+            } else if lb.reserved == name_id {
                 Some((lb, Spelling::Reserved))
             } else {
                 None
@@ -280,10 +240,23 @@ impl LibraryBuiltin {
         LIBRARY_BUILTINS.iter().find(|lb| lb.bare == name_id)
     }
 
-    /// Whether a definition of the bare name in this translation unit
-    /// displaces the builtin (see `Lowering::displaced_by_definition`).
-    pub(super) fn displaced_by_definition(&self) -> bool {
-        self.lowering.displaced_by_definition()
+    /// See [`InlineLibraryFn::yields_to_a_definition`].
+    pub(super) fn yields_to_a_definition(&self) -> bool {
+        self.func.yields_to_a_definition()
+    }
+
+    /// The `float` function this `double` one narrows to for a `float`
+    /// argument ([`InlineLibraryFn::narrows_exactly`]): `floorf` for
+    /// `floor`. The condition is on the argument's type, not the result's --
+    /// `double q(float a) { return floor(a); }` narrows too, because the
+    /// narrowing happens before the widening.
+    fn float_form(&self) -> Option<&'static LibraryBuiltin> {
+        if !self.func.narrows_exactly() || self.ret != ProtoType::Double {
+            return None;
+        }
+        LIBRARY_BUILTINS
+            .iter()
+            .find(|lb| lb.func == self.func && lb.ret == ProtoType::Float)
     }
 }
 
@@ -384,77 +357,40 @@ impl Parser<'_> {
         pos: Position,
     ) -> Expr {
         let ret = lb.ret.id(self.types);
-        let params = self.library_params(lb);
-        match lb.lowering {
-            Lowering::InPlace(func) => {
-                let func = self.library_call_policy.applied_to(func);
-                let args = args
-                    .into_iter()
-                    .zip(&params)
-                    .map(|(arg, &param)| self.convert_operand(arg, param))
-                    .collect();
-                if !self.library_call_policy.in_place(func, spelling) {
-                    return self.libm_call(lb.bare, ret, &params, args, pos);
-                }
-                let name = lb.bare;
-                Self::typed_expr(ExprKind::InlineLibraryCall { func, args, name }, ret, pos)
-            }
-            Lowering::NarrowingCall { narrow } => {
-                let (Ok([arg]), &[param]) = (<[Expr; 1]>::try_from(args), params.as_slice()) else {
-                    unreachable!("the table gives a narrowing call one parameter");
-                };
-                if self.is_binary32(&arg) {
-                    let f = self.types.float_id;
-                    self.libm_call(narrow, f, &[f], vec![arg], pos)
-                } else {
-                    let arg = self.convert_operand(arg, param);
-                    self.libm_call(lb.bare, ret, &[param], vec![arg], pos)
-                }
-            }
-            Lowering::Memory(func) => {
-                let Ok(args) = <[Expr; 3]>::try_from(args) else {
-                    unreachable!("the table gives a memory function three parameters");
-                };
-                self.lower_memory_call(func, args, &params, ret, pos)
+        if let (Some(narrow), [arg]) = (lb.float_form(), args.as_slice()) {
+            if self.is_binary32(arg) {
+                // Computed at `float`, and the exact answer widened back: the
+                // call is still a `double` (C17 6.5.2.2p5).
+                let value = self.lower_library_call(narrow, spelling, args, pos);
+                return self.convert_operand(value, ret);
             }
         }
+        let params = self.library_params(lb);
+        let func = self.library_call_policy.applied_to(lb.func);
+        let mut args: Vec<Expr> = args
+            .into_iter()
+            .zip(&params)
+            .map(|(arg, &param)| self.convert_operand(arg, param))
+            .collect();
+        if let (InlineLibraryFn::Memory(_), Some(n)) = (func, args.last_mut()) {
+            self.fold_constant_length(n);
+        }
+        if !self.library_call_policy.in_place(func, spelling) {
+            return self.libm_call(lb.bare, ret, &params, args, pos);
+        }
+        let name = lb.bare;
+        Self::typed_expr(ExprKind::InlineLibraryCall { func, args, name }, ret, pos)
     }
 
-    /// A checked call to a block memory function, each argument converted to
-    /// its parameter's type as the prototype would.
-    fn lower_memory_call(
-        &mut self,
-        func: MemoryFn,
-        [dest, second, n]: [Expr; 3],
-        params: &[TypeId],
-        ret: TypeId,
-        pos: Position,
-    ) -> Expr {
-        let dest = Box::new(self.convert_operand(dest, params[0]));
-        let second = Box::new(self.convert_operand(second, params[1]));
-        // A constant length is folded here, conversion and all, so the IR
-        // receives the constant itself: at -O0 nothing folds a conversion
-        // later, and `ir::memexpand` expands only a length it can see is one.
-        let n = self.convert_operand(n, params[2]);
-        let n = Box::new(match self.eval_const_expr(&n) {
+    /// A block memory function's length, folded to a `size_t` literal when
+    /// it is a constant, conversion and all, so that the IR receives the
+    /// constant itself: at `-O0` nothing folds a conversion later, and
+    /// `ir::memexpand` expands only a length it can see is one.
+    fn fold_constant_length(&self, n: &mut Expr) {
+        if let (Some(v), Some(typ)) = (self.eval_const_expr(n), n.typ) {
             // The bits of a `size_t`, as an unsigned literal carries them.
-            Some(v) => Self::typed_expr(ExprKind::IntLit(v as i64), params[2], n.pos),
-            None => n,
-        });
-        let kind = match func {
-            MemoryFn::Copy => ExprKind::Memcpy {
-                dest,
-                src: second,
-                n,
-            },
-            MemoryFn::Set => ExprKind::Memset { dest, c: second, n },
-            MemoryFn::Move => ExprKind::Memmove {
-                dest,
-                src: second,
-                n,
-            },
-        };
-        Self::typed_expr(kind, ret, pos)
+            *n = Self::typed_expr(ExprKind::IntLit(v as i64), typ, n.pos);
+        }
     }
 
     /// Whether `e` is a value in the IEEE single format.
@@ -469,18 +405,29 @@ impl Parser<'_> {
 mod tests {
     use super::*;
 
-    /// Each entry declares as many parameters as its lowering consumes
+    /// Each entry declares as many parameters as its function consumes
     /// arguments: the call is checked against the one and lowered by the
     /// other.
     #[test]
     fn every_entry_takes_what_its_lowering_consumes() {
         for lb in LIBRARY_BUILTINS {
-            let want = match lb.lowering {
-                Lowering::InPlace(func) => func.arity(),
-                Lowering::NarrowingCall { .. } => 1,
-                Lowering::Memory(_) => 3,
-            };
-            assert_eq!(lb.params.len(), want, "{lb:?}");
+            assert_eq!(lb.params.len(), lb.func.arity(), "{lb:?}");
         }
+    }
+
+    /// Every `double` function that narrows has its `float` form in the
+    /// table, taking a `float`; nothing else narrows.
+    #[test]
+    fn every_narrowing_function_has_its_float_form() {
+        for lb in LIBRARY_BUILTINS {
+            let narrow = lb.float_form();
+            let should = lb.func.narrows_exactly() && lb.ret == ProtoType::Double;
+            assert_eq!(narrow.is_some(), should, "{lb:?}");
+            if let Some(n) = narrow {
+                assert_eq!(n.params, &[ProtoType::Float], "{lb:?}");
+            }
+        }
+        let floor = LibraryBuiltin::by_bare_name(kw::FLOOR).unwrap();
+        assert_eq!(floor.float_form().map(|n| n.bare), Some(kw::FLOORF));
     }
 }

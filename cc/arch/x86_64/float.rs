@@ -13,7 +13,7 @@ use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
-use crate::float::FloatVal;
+use crate::float::{FloatVal, IntegralRounding};
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
@@ -444,6 +444,254 @@ impl X86_64CodeGen {
         if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
             self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, fp_size);
         }
+    }
+
+    /// Emit `RoundToIntegral` of a `float` or `double` -- `floor`, `ceil`,
+    /// `trunc` or `rint` -- with SSE2 alone: gcc's sequences at the x86-64
+    /// baseline, which has no `roundsd`.
+    ///
+    /// A value of magnitude 2^52 (2^23 for a `float`) or more has no
+    /// fraction, and is its own answer, as are an infinity and a NaN, which
+    /// is returned as it came -- a signalling one too, as gcc's sequence
+    /// does. The test is on the biased exponent, in R10, so it raises
+    /// nothing. Below that:
+    /// - `floor`, `ceil`, `trunc`: the value converted to an integer with
+    ///   truncation and back, which is exact, then one subtracted for a
+    ///   `floor` that came out above the value or added for a `ceil` that
+    ///   came out below it.
+    /// - `rint`: 2^52 of the value's own sign added and subtracted, which
+    ///   leaves the value rounded in the current direction.
+    ///
+    /// In both, the sign of the value is then **set** on the result rather
+    /// than or-ed into it, as gcc's sequence does: the zero a `floor(0.5)`
+    /// computes as `0 - 0` is `-0` when rounding downward, and the sign has
+    /// to be the value's in every direction -- `rint(0.5)` is `+0` and
+    /// `rint(-0.5)` is `-0`. gcc's sequences assume the default direction
+    /// (`-fno-rounding-math`) and get these wrong in the others; so does its
+    /// `rint`, which rounds the magnitude and not the value, and this one
+    /// does not. `cvttsd2si` raises *inexact* for a fraction, as it does in
+    /// gcc's `floor`.
+    ///
+    /// The value's bits stay in R11 throughout, which is what leaves the two
+    /// reserved XMM registers enough: xmm15 holds the value and then the
+    /// result, xmm14 the integer being built.
+    pub(super) fn emit_fp_round_to_integral(
+        &mut self,
+        insn: &Instruction,
+        how: IntegralRounding,
+        types: &TypeTable,
+    ) {
+        let (Some(&src), Some(target)) = (insn.src.first(), insn.target) else {
+            return;
+        };
+        let fp_size = self.fp_format(insn.typ, insn.size, types);
+        let size = Self::fp_bits_size(fp_size);
+        // The stored significand's width, and the biased exponent of the
+        // format's first power of two with no fraction bits.
+        let (mant_bits, bias) = if fp_size == FpSize::Single {
+            (23u8, 127i64)
+        } else {
+            (52u8, 1023i64)
+        };
+        let top = ShiftCount::Imm((size.bits() - 1) as u8);
+        let (x, int) = (XmmReg::Xmm15, XmmReg::Xmm14);
+
+        let uid = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        let done = Label::block(&self.base.current_fn, 10000 + uid * 2);
+
+        self.emit_fp_move(src, x, fp_size);
+        self.emit_xmm_bits_to_gp(x, fp_size, Reg::R11);
+        // R10 = the biased exponent: the sign shifted out, then the
+        // significand.
+        self.push_lir(X86Inst::Mov {
+            size,
+            src: GpOperand::Reg(Reg::R11),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        self.push_lir(X86Inst::Shl {
+            size,
+            count: ShiftCount::Imm(1),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Shr {
+            size,
+            count: ShiftCount::Imm(mant_bits + 1),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Cmp {
+            size,
+            src: GpOperand::Imm(bias + i64::from(mant_bits)),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Uge,
+            target: done.clone(),
+        });
+
+        match how {
+            IntegralRounding::Rint => {
+                // R10 = 2^52 with the value's sign: sign, then the biased
+                // exponent of 2^52 below it, shifted up over the significand.
+                self.push_lir(X86Inst::Mov {
+                    size,
+                    src: GpOperand::Reg(Reg::R11),
+                    dst: GpOperand::Reg(Reg::R10),
+                });
+                self.push_lir(X86Inst::Shr {
+                    size,
+                    count: top,
+                    dst: Reg::R10,
+                });
+                let exp_bits = size.bits() as u8 - 1 - mant_bits;
+                self.push_lir(X86Inst::Shl {
+                    size,
+                    count: ShiftCount::Imm(exp_bits),
+                    dst: Reg::R10,
+                });
+                self.push_lir(X86Inst::Or {
+                    size,
+                    src: GpOperand::Imm(bias + i64::from(mant_bits)),
+                    dst: Reg::R10,
+                });
+                self.push_lir(X86Inst::Shl {
+                    size,
+                    count: ShiftCount::Imm(mant_bits),
+                    dst: Reg::R10,
+                });
+                self.push_lir(X86Inst::MovGpXmm {
+                    size,
+                    src: Reg::R10,
+                    dst: int,
+                });
+                self.push_lir(X86Inst::AddFp {
+                    size: fp_size,
+                    src: XmmOperand::Reg(int),
+                    dst: x,
+                });
+                self.push_lir(X86Inst::SubFp {
+                    size: fp_size,
+                    src: XmmOperand::Reg(int),
+                    dst: x,
+                });
+                self.push_lir(X86Inst::MovFp {
+                    size: fp_size,
+                    src: XmmOperand::Reg(x),
+                    dst: XmmOperand::Reg(int),
+                });
+            }
+            IntegralRounding::Floor | IntegralRounding::Ceil | IntegralRounding::Trunc => {
+                self.push_lir(X86Inst::CvtFpToInt {
+                    fp_size,
+                    int_size: size,
+                    src: XmmOperand::Reg(x),
+                    dst: Reg::R10,
+                });
+                self.push_lir(X86Inst::CvtIntToFp {
+                    int_size: size,
+                    fp_size,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: int,
+                });
+                self.emit_fp_integral_step(how, fp_size, x, int);
+            }
+            IntegralRounding::Round | IntegralRounding::NearbyInt => {
+                unreachable!("{how:?} is a call on x86-64 (see computes_in_place)")
+            }
+        }
+
+        // The result: the integer's magnitude (R10, its sign shifted out and
+        // back as zero) with the value's sign (R11, shifted down and back).
+        self.emit_xmm_bits_to_gp(int, fp_size, Reg::R10);
+        let one = ShiftCount::Imm(1);
+        self.push_lir(X86Inst::Shl {
+            size,
+            count: one,
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Shr {
+            size,
+            count: one,
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Shr {
+            size,
+            count: top,
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Shl {
+            size,
+            count: top,
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Or {
+            size,
+            src: GpOperand::Reg(Reg::R11),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::MovGpXmm {
+            size,
+            src: Reg::R10,
+            dst: x,
+        });
+
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(done)));
+        let dst_loc = self.get_location(target);
+        self.emit_fp_move_from_xmm(x, &dst_loc, fp_size);
+    }
+
+    /// The `floor` or `ceil` correction of the truncated integer in `int`,
+    /// against the value in `x`: one less for a `floor` that came out above
+    /// the value, one more for a `ceil` that came out below it; nothing for
+    /// a `trunc`. The 0 or 1 is built in R10 from the comparison and
+    /// converted, overwriting `x`, whose bits are kept in R11.
+    fn emit_fp_integral_step(
+        &mut self,
+        how: IntegralRounding,
+        fp_size: FpSize,
+        x: XmmReg,
+        int: XmmReg,
+    ) {
+        // `ucomis[sd] src, dst` sets "above" when dst > src.
+        let (above, below) = match how {
+            IntegralRounding::Floor => (int, x),
+            IntegralRounding::Ceil => (x, int),
+            _ => return,
+        };
+        self.push_lir(X86Inst::UComiFp {
+            size: fp_size,
+            src: XmmOperand::Reg(below),
+            dst: above,
+        });
+        self.push_lir(X86Inst::SetCC {
+            cc: CondCode::Ugt,
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Movzx {
+            src_size: OperandSize::B8,
+            dst_size: OperandSize::B32,
+            src: GpOperand::Reg(Reg::R10),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::CvtIntToFp {
+            int_size: OperandSize::B32,
+            fp_size,
+            src: GpOperand::Reg(Reg::R10),
+            dst: x,
+        });
+        self.push_lir(if how == IntegralRounding::Floor {
+            X86Inst::SubFp {
+                size: fp_size,
+                src: XmmOperand::Reg(x),
+                dst: int,
+            }
+        } else {
+            X86Inst::AddFp {
+                size: fp_size,
+                src: XmmOperand::Reg(x),
+                dst: int,
+            }
+        });
     }
 
     /// Flip or clear the sign bit of an SSE float or double: an

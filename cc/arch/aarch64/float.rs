@@ -13,6 +13,7 @@ use super::codegen::Aarch64CodeGen;
 use super::lir::{Aarch64Inst, GpOperand, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::arch::lir::{CondCode, FpSize, OperandSize, Symbol};
+use crate::float::IntegralRounding;
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
@@ -453,6 +454,26 @@ impl Aarch64CodeGen {
         self.emit_fp_unop(insn, types, |cg, size, src, dst| {
             debug_assert!(size != FpSize::Quad, "binary128 sqrt is a call");
             cg.push_lir(Aarch64Inst::Fsqrt { size, src, dst });
+        });
+    }
+
+    /// Emit `RoundToIntegral` of a `float` or `double`: the `frint`
+    /// instruction for its direction. Binary128 is a call by now, as for
+    /// `Sqrt`.
+    pub(super) fn emit_fp_round_to_integral(
+        &mut self,
+        insn: &Instruction,
+        how: IntegralRounding,
+        types: &TypeTable,
+    ) {
+        self.emit_fp_unop(insn, types, |cg, size, src, dst| {
+            debug_assert!(size != FpSize::Quad, "a binary128 rounding is a call");
+            cg.push_lir(Aarch64Inst::Frint {
+                how,
+                size,
+                src,
+                dst,
+            });
         });
     }
 

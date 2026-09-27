@@ -1692,8 +1692,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         let in_place = self.types.fp_format(typ).is_some_and(|fmt| {
             crate::arch::mapping::computes_in_place(Opcode::Sqrt, fmt, self.target)
         });
+        let sqrt = |lin: &mut Self| lin.emit_libm_insn(Opcode::Sqrt, &[x], typ, &callee);
         match errno {
-            MathErrno::Ignored => self.emit_sqrt_insn(x, typ, &callee),
+            MathErrno::Ignored => sqrt(self),
             MathErrno::Set if !in_place => self.emit_library_call(&callee, &[x], typ),
             MathErrno::Set => {
                 let size = self.types.size_bits(typ);
@@ -1711,30 +1712,54 @@ impl<'a> super::linearize::Linearizer<'a> {
                     below,
                     typ,
                     |lin| lin.emit_library_call(&callee, &[x], typ),
-                    |lin| lin.emit_sqrt_insn(x, typ, &callee),
+                    sqrt,
                 )
             }
         }
     }
 
-    /// The `Sqrt` opcode of `x` at `typ`, naming `callee` for a target
-    /// that calls it instead.
-    fn emit_sqrt_insn(&mut self, x: PseudoId, typ: TypeId, callee: &str) -> PseudoId {
+    /// The libm opcode `op` ([`Opcode::is_libm`]) of `args` at `typ`, for a
+    /// call that named the library function `callee`: which a target
+    /// without the instruction calls instead.
+    pub(crate) fn emit_libm(
+        &mut self,
+        op: Opcode,
+        args: &[PseudoId],
+        typ: TypeId,
+        callee: StringId,
+    ) -> PseudoId {
+        let callee = self.library_function_name(self.strings.get(callee));
+        self.emit_libm_insn(op, args, typ, &callee)
+    }
+
+    /// [`Self::emit_libm`], with the callee's assembler name resolved.
+    fn emit_libm_insn(
+        &mut self,
+        op: Opcode,
+        args: &[PseudoId],
+        typ: TypeId,
+        callee: &str,
+    ) -> PseudoId {
         let size = self.types.size_bits(typ);
         let result = self.alloc_pseudo();
-        let insn = Instruction::new(Opcode::Sqrt)
+        let mut insn = Instruction::new(op)
             .with_target(result)
-            .with_src(x)
             .with_size(size)
             .with_type(typ)
             .with_func(callee);
+        insn.src = args.to_vec();
         self.emit(insn);
         result
     }
 
     /// A call to the C library function `callee` (its assembler name) with
     /// `args`, each and the result of type `typ`.
-    fn emit_library_call(&mut self, callee: &str, args: &[PseudoId], typ: TypeId) -> PseudoId {
+    pub(crate) fn emit_library_call(
+        &mut self,
+        callee: &str,
+        args: &[PseudoId],
+        typ: TypeId,
+    ) -> PseudoId {
         let result = self.alloc_pseudo();
         self.emit(Instruction::call_with_abi(
             Some(result),

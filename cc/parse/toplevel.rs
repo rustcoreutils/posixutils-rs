@@ -246,7 +246,11 @@ impl Parser<'_> {
         let _ = self
             .symbols
             .declare(Symbol::function(name, typ, self.symbols.depth()));
-        self.defined_fns.insert(name);
+        // A weak definition may be replaced at link time, so gcc leaves the
+        // builtin in place of it; so does this.
+        if !attrs.symbol.weak {
+            self.defined_functions.insert(name);
+        }
         // A definition binds a fresh symbol, so the facts accumulated over
         // every declaration of the name are settled onto it -- without them
         // its C99 6.7.4p6 inline classification is computed from declarations

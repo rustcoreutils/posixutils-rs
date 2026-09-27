@@ -736,12 +736,11 @@ define_keywords! {
     (MEMSET,            "memset",            0),
     (MEMMOVE,           "memmove",           0),
 
-    // The exactly-rounding functions, whose `float` form gives the same
-    // answer as the `double` one applied to a `float` argument. Narrowing
-    // them is what lets `(float)floor((double)x)` become `floorf(x)`;
-    // `sin` and `log` are deliberately absent, since theirs differ in the
-    // last bit. The `f` spellings are interned so the prototype can be
-    // synthesized for a program that never declared one.
+    // The roundings, computed in place, and exactly rounding: the `float`
+    // form gives the same answer as the `double` one applied to a `float`
+    // argument, which is what lets `(float)floor((double)x)` become
+    // `floorf(x)`; `sin` and `log` are deliberately absent, since theirs
+    // differ in the last bit.
     (FLOOR,             "floor",             0),
     (CEIL,              "ceil",              0),
     (TRUNC,             "trunc",             0),

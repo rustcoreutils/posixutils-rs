@@ -59,6 +59,7 @@ SSA-form intermediate representation for the c17 C17 compiler. Inspired by Linus
 | `fabs` | Float absolute value (unary): clears the sign bit and nothing else |
 | `copysign` | The first operand with the sign bit of the second, and nothing else changed |
 | `sqrt` | Correctly rounded square root (unary); sets no `errno`. Names its library function, which a target without the instruction calls instead after optimization |
+| `ffloor`, `fceil`, `ftrunc`, `fround`, `frint`, `fnearbyint` | `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint` (unary, one opcode keyed on its rounding): the integer the operand rounds to, with its sign. Named and called like `sqrt` where the target has no instruction |
 
 ### Integer Comparisons (result: 0 or 1)
 

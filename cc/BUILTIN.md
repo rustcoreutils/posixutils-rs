@@ -111,13 +111,11 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 
 `abs`, `labs`, `llabs`, `imaxabs`, `fabs`, `fabsf`, `fabsl`, `copysign`,
 `copysignf`, `copysignl`, `sqrt`, `sqrtf`, `sqrtl`, `floor`, `ceil`,
-`trunc`, `round`, `rint`, `nearbyint`, `creal`, `cimag` and `conj` in each
-precision, and `memcpy`, `memset` and `memmove` are known to c17 by
-prototype, under their bare names and (except the floor family) their
-`__builtin_` spellings. One table in
-`parse/library_builtin.rs` gives each its prototype and how it is evaluated:
-in place, as a block memory operation, or -- for the floor family -- as a call
-to the library function, narrowed to the `float` form for a `float` argument.
+`trunc`, `round`, `rint`, `nearbyint` and their `f` forms, `creal`, `cimag`
+and `conj` in each precision, and `memcpy`, `memset` and `memmove` are known
+to c17 by prototype, under their bare names and their `__builtin_`
+spellings. One table in `parse/library_builtin.rs` gives each its prototype
+and what it computes.
 
 A `memcpy` or `memset` whose length is a constant of at most 128 bytes, or a
 `memmove` of at most 64, is expanded into integer loads and stores of 8, 4, 2
@@ -130,16 +128,19 @@ alignment is assumed. `memmove` loads every chunk before it stores any, which
 is what makes it right for an overlap in either direction, and why its limit
 is lower -- every chunk is live at once. The limit is the one the linearizer's
 own aggregate copies use, in the same chunks. The bare names are displaced
-like `fabs`, including by a declaration that is not the `<string.h>`
-prototype and by `-fno-builtin[-memcpy]`.
+like `sqrt`: by a declaration that is not the `<string.h>` prototype, by
+`-fno-builtin[-memcpy]`, and by the translation unit's own non-weak
+definition, which glibc's fortify wrappers rely on.
 
 At `-O0`, as in gcc, a libm function named by its bare spelling (`sqrt`) is
 called rather than computed, and so is one that must still set `errno`
 whatever its spelling; the magnitudes, `copysign` and the complex accessors
-are computed in place at every level. A libm function computed in place is
+are computed in place at every level, and the block memory functions are
+their IR operation at every level. A libm function computed in place is
 one IR opcode keyed on its type; where the target has no instruction for
-that type (binary128 on aarch64) it becomes a call to the library function
-again after the optimizer, which could still fold it.
+that type (binary128 on aarch64, `round` and `nearbyint` on x86-64) it
+becomes a call to the library function again after the optimizer, which
+could still fold it.
 
 However it is evaluated, what the program wrote is a call (C17 7.1.4p1). The
 arguments are checked exactly as an ordinary call to a function of that
@@ -155,7 +156,7 @@ call.
 | `__builtin_fabs(x)` | Absolute value (`double`), computed in place |
 | `__builtin_fabsf(x)` | Absolute value (`float`), computed in place |
 | `__builtin_fabsl(x)` | Absolute value (`long double`), computed in place |
-| `floor(x)`, `ceil(x)`, `trunc(x)`, `round(x)`, `rint(x)`, `nearbyint(x)` | Recognized under their plain names and **narrowed to the `f` form when the argument is a `float`**: `(float)floor((double)x)` is `floorf(x)` exactly, because the result is an integer no greater in magnitude than `x`. The condition is the argument's type, not the result's. Only these six qualify -- `sin` and `log` are not exactly rounding, and narrowing one changes the last bit. Displaced like `fabs`; their `__builtin_` spellings are plain library aliases (below) and do not narrow |
+| `floor(x)`, `ceil(x)`, `trunc(x)`, `round(x)`, `rint(x)`, `nearbyint(x)`, their `f` forms, and their `__builtin_` spellings | The integer `x` rounds to, with `x`'s sign (`ceil(-0.5)` is `-0`), computed in place: `frintm`, `frintp`, `frintz`, `frinta`, `frintx` and `frinti` on aarch64; on x86-64, whose baseline has no `roundsd`, gcc's SSE2 sequences for `floor`, `ceil` and `trunc` (a truncating conversion, corrected by one) and `rint` (2^52 added and subtracted), each for a magnitude below 2^52 (2^23) -- anything larger, infinite or NaN is its own answer. Unlike gcc's, these set the sign of the result rather than or-ing it in, and `rint` rounds the value rather than its magnitude, so they are right in every rounding direction, not only the default one. `round` and `nearbyint` are calls on x86-64, as in gcc (the SSE2 `rint` raises *inexact*, which `nearbyint` must not). **A `float` argument to the `double` function is narrowed to the `f` form**: `(float)floor((double)x)` is `floorf(x)` exactly, because the result is an integer no greater in magnitude than `x`; the condition is the argument's type, not the result's, and the call is still a `double` (`sizeof floor(1.0f)` is 8). Only these six qualify -- `sin` and `log` are not exactly rounding, and narrowing one changes the last bit. Constants fold, in static initializers too, except a `rint` or `nearbyint` of a value that is not already an integer, whose answer is the current direction's; gcc leaves those too. The `l` forms are library aliases (below). Displaced like `sqrt`, a definition included |
 | `fabs(x)`, `fabsf(x)`, `fabsl(x)` | The same three under their bare names, as gcc recognizes them whether or not `<math.h>` was included. Not reserved spellings, so they are displaced by a declaration that is not a function, by a function declaration whose type is not the library prototype (`struct S fabs(int)`), or by `-fno-builtin[-fabs]`. The bare name is still an object where it is not being called, so `double (*p)(double) = fabs;` names the library function. The argument is converted to the prototype's type first; the optimizer gains the one fact it needs to fold `fabs(x) < 0.0` to 0, and a constant argument folds. All three are computed in place by clearing the sign bit and nothing else -- never a call, so no program needs libm for them; `-0.0` becomes `+0.0` and a NaN, quiet or signalling, keeps its payload and raises nothing |
 | `abs(x)`, `labs(x)`, `llabs(x)`, `imaxabs(x)` and their `__builtin_` spellings | Magnitude of an `int`, `long`, `long long` or `intmax_t`, computed in place as `(x ^ s) - s` with `s = x >> (width - 1)` -- never a call, at every level, as gcc does; a constant argument therefore folds. The argument is converted to the prototype's type first. The bare names are displaced like `fabs`, and a declaration with any other type (`struct S abs(int)`) makes the name an ordinary function, as in gcc; a translation unit's own compatible definition of one does **not** displace it, since defining a reserved library name is undefined (C17 7.1.3p2). `abs(INT_MIN)` wraps to `INT_MIN` |
 | `copysign(x, y)`, `copysignf`, `copysignl` and their `__builtin_` spellings | `x` with the sign bit of `y`, computed in place on both targets by moving that one bit -- never a call, so no program needs libm for them. The sign is taken from a zero or a NaN as from anything else (`copysign(1.0, -0.0)` is `-1.0`), and nothing of `x` but its sign changes: a NaN keeps its payload, and a signalling one stays signalling and raises nothing. Both arguments are converted to the prototype's type first, and constant arguments fold, in a static initializer too (but, as in gcc, a call is never an integer constant expression). The bare names are displaced like `fabs`, by a declaration whose parameters are not both the prototype's or by `-fno-builtin[-copysign]`. `bits/floatn.h` reaches for `__builtin_copysignf`, so every spelling is load-bearing |
@@ -168,11 +169,12 @@ call.
 | `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` | Whichever of the five class codes describes `x` |
 | `__builtin_flt_rounds()` | Current FP rounding mode |
 | `__builtin_isinf_sign(x)` | +1 for +inf, -1 for -inf, 0 otherwise |
-| `sqrt(x)`, `sqrtf`, `sqrtl` and their `__builtin_` spellings | The correctly rounded square root, by the instruction: `sqrtsd`/`sqrtss` and x87 `fsqrt` on x86-64, `fsqrt` on aarch64; binary128 (`sqrtl` on aarch64 Linux) is a call. As in gcc, an argument below zero -- an ordered `x < 0`, so not `-0` and not a NaN -- still goes to the library, which sets `errno` to `EDOM`; `-fno-math-errno` drops that call and the program needs no libm. A constant argument folds, in a static initializer too, exactly as the instruction rounds it; a negative one is left to run time, and in a static initializer is not a constant. Under `-fno-math-errno`, `sqrt(x) < 0` folds to 0. Displaced like `fabs` |
+| `sqrt(x)`, `sqrtf`, `sqrtl` and their `__builtin_` spellings | The correctly rounded square root, by the instruction: `sqrtsd`/`sqrtss` and x87 `fsqrt` on x86-64, `fsqrt` on aarch64; binary128 (`sqrtl` on aarch64 Linux) is a call. As in gcc, an argument below zero -- an ordered `x < 0`, so not `-0` and not a NaN -- still goes to the library, which sets `errno` to `EDOM`; `-fno-math-errno` drops that call and the program needs no libm. A constant argument folds, in a static initializer too, exactly as the instruction rounds it; a negative one is left to run time, and in a static initializer is not a constant. Under `-fno-math-errno`, `sqrt(x) < 0` folds to 0. Displaced like `fabs`, and also, as in gcc, by the translation unit's own definition of the function, wherever it is: its calls, above the definition too, reach it |
 | `__builtin_fmax(x, y)`, `fmaxf`, `fmaxl`, `__builtin_fmin(x, y)`, `fminf`, `fminl` | Larger and smaller of two values |
 | `__builtin_pow(x, y)`, `powf`, `powl` | `x` raised to `y` |
 | `__builtin_fma(x, y, z)`, `fmaf`, `fmal` | `x * y + z`, rounded once |
-| `__builtin_ceil`, `floor`, `trunc`, `round`, `rint`, `nearbyint`, `cbrt` | And their `f` and `l` spellings |
+| `__builtin_ceill`, `floorl`, `truncl`, `roundl`, `rintl`, `nearbyintl` | The `long double` roundings |
+| `__builtin_cbrt` | And its `f` and `l` spellings |
 | `__builtin_sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` | And their `f` and `l` spellings |
 | `__builtin_exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `logb`, `tgamma`, `lgamma`, `erf`, `erfc` | And their `f` and `l` spellings |
 | `__builtin_fmod`, `atan2`, `hypot`, `fdim`, `remainder`, `nextafter` | Two arguments; and their `f` and `l` spellings |

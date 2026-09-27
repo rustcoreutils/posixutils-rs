@@ -14,7 +14,7 @@ use crate::arch::mapping::{
     expand_float16_neg, float_suffix, map_binary128, map_int128_divmod, map_int128_expand,
     map_int128_float_convert, ArchMapper, MappedInsn, MappingCtx,
 };
-use crate::float::FpFormat;
+use crate::float::{FpFormat, IntegralRounding};
 use crate::ir::{Instruction, Opcode};
 use crate::rtlib::RtlibNames;
 use crate::types::TypeKind;
@@ -50,12 +50,19 @@ impl ArchMapper for X86_64Mapper {
 
     /// SSE2 has `sqrtss`/`sqrtsd` and x87 has `fsqrt`; binary128 is
     /// software.
+    ///
+    /// The baseline has no `roundsd` (SSE4.1), so the roundings are gcc's
+    /// SSE2 sequences, for `float` and `double`: `floor`, `ceil` and `trunc`
+    /// through a truncating conversion, `rint` by adding and subtracting
+    /// 2^52. `round` has no such sequence and gcc calls it; nor does
+    /// `nearbyint`, which must not raise *inexact* where the `rint` one does.
     fn computes_in_place(&self, op: Opcode, fmt: FpFormat) -> bool {
+        let sse = matches!(fmt, FpFormat::Binary32 | FpFormat::Binary64);
         match op {
-            Opcode::Sqrt => matches!(
-                fmt,
-                FpFormat::Binary32 | FpFormat::Binary64 | FpFormat::X87Extended
-            ),
+            Opcode::Sqrt => sse || fmt == FpFormat::X87Extended,
+            Opcode::RoundToIntegral(how) => {
+                sse && !matches!(how, IntegralRounding::Round | IntegralRounding::NearbyInt)
+            }
             _ => false,
         }
     }

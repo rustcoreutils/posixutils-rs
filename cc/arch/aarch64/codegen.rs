@@ -816,6 +816,7 @@ impl Aarch64CodeGen {
 
             Opcode::CopySign => self.emit_fp_copysign(insn, types),
             Opcode::Sqrt => self.emit_fp_sqrt(insn, types),
+            Opcode::RoundToIntegral(how) => self.emit_fp_round_to_integral(insn, how, types),
             Opcode::Signbit => self.emit_fp_signbit(insn, types),
 
             Opcode::Unreachable => {

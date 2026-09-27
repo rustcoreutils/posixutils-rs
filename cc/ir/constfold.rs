@@ -380,11 +380,16 @@ pub(crate) fn eval_fbinop(op: Opcode, fmt: FpFormat, a: FloatVal, b: FloatVal) -
 /// `Sqrt` folds as [`FloatVal::sqrt`] says: rounded once like arithmetic,
 /// and exact for a zero, `+inf` and a quiet NaN; a negative operand, whose
 /// NaN is the target's own, and a signalling NaN are left to run time.
+///
+/// `RoundToIntegral` folds as [`FloatVal::round_to_integral`] says: exactly,
+/// except a signalling NaN, and a `rint` or `nearbyint` whose answer is the
+/// rounding direction's.
 pub(crate) fn eval_funop(op: Opcode, fmt: FpFormat, a: FloatVal) -> Option<FloatVal> {
     match op {
         Opcode::FNeg => Some(a.round_to_format(fmt).negated()),
         Opcode::Fabs => Some(a.round_to_format(fmt).magnitude()),
         Opcode::Sqrt => a.sqrt(fmt),
+        Opcode::RoundToIntegral(how) => a.round_to_integral(how, fmt),
         _ => None,
     }
 }

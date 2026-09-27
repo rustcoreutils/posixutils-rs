@@ -43,6 +43,25 @@ const QUIET_BIT: u128 = 1 << 126;
 /// once, on the way out, at the width being emitted.
 const SIG_BITS: u32 = 128;
 
+/// Which integer a value rounds to: the choice between `floor`, `ceil`,
+/// `trunc`, `round`, `rint` and `nearbyint`, named after them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntegralRounding {
+    /// Toward negative infinity.
+    Floor,
+    /// Toward positive infinity.
+    Ceil,
+    /// Toward zero.
+    Trunc,
+    /// To nearest, a tie away from zero.
+    Round,
+    /// In the current rounding direction, raising *inexact* when the value
+    /// changes.
+    Rint,
+    /// In the current rounding direction, raising nothing.
+    NearbyInt,
+}
+
 /// Which of the two kinds of NaN a value is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NanKind {
@@ -1422,6 +1441,56 @@ impl FloatVal {
             inexact,
             fmt,
         ))
+    }
+
+    /// The integer `how` rounds this value to, in `fmt`: what `floor`,
+    /// `ceil`, `trunc`, `round`, `rint` and `nearbyint` compute.
+    ///
+    /// Exact, since the integer is always representable where the value is,
+    /// and the sign is always the value's: `ceil(-0.5)` is `-0`. An infinity,
+    /// a zero and a quiet NaN (sign and payload kept) are their own answer.
+    ///
+    /// `None` where the answer is not the value's alone: a signalling NaN,
+    /// which raises *invalid* as it is quieted, and a `rint` or `nearbyint`
+    /// of a value that is not already an integer, whose answer is the current
+    /// rounding direction's -- a program can change it with `fesetround`, so
+    /// gcc does not fold one either.
+    pub fn round_to_integral(self, how: IntegralRounding, fmt: FpFormat) -> Option<Self> {
+        let a = self.round_to_format(fmt);
+        if a.is_nan() {
+            return (!a.is_signalling_nan()).then_some(a);
+        }
+        if a.exp == EXP_SPECIAL || a.is_zero() {
+            return Some(a);
+        }
+        // The value is `sig * 2^exp2`; nothing below 2^0 means an integer.
+        let (sig, exp2) = a.scaled();
+        if exp2 >= 0 {
+            return Some(a);
+        }
+        let frac_bits = exp2.unsigned_abs();
+        let (int, rem, half) = match frac_bits {
+            ..=127 => (
+                sig >> frac_bits,
+                sig & ((1u128 << frac_bits) - 1),
+                1u128 << (frac_bits - 1),
+            ),
+            // The whole significand is fraction; at 128 bits it is at least
+            // half, beyond that below it.
+            128 => (0, sig, 1u128 << 127),
+            _ => (0, sig, u128::MAX),
+        };
+        if rem == 0 {
+            return Some(a);
+        }
+        let away = match how {
+            IntegralRounding::Floor => a.neg,
+            IntegralRounding::Ceil => !a.neg,
+            IntegralRounding::Trunc => false,
+            IntegralRounding::Round => rem >= half,
+            IntegralRounding::Rint | IntegralRounding::NearbyInt => return None,
+        };
+        Some(Self::from_parts(a.neg, int + u128::from(away), 0))
     }
 
     /// Round `w * 2^scale` to `fmt`, once, to nearest with ties to even.
@@ -3053,6 +3122,110 @@ mod tests {
                 "{mx:#x}: root too small"
             );
         }
+    }
+
+    /// `floor`, `ceil`, `trunc` and `round` agree with the host's, for
+    /// `double` and `float`, over a random sample weighted to the exponents
+    /// where there is a fraction to round away.
+    #[test]
+    fn round_to_integral_agrees_with_the_host() {
+        use IntegralRounding::*;
+        let mut next = xorshift(0x0123_4567_89AB_CDEF);
+        let d = |f: f64| FloatVal::from_f64(f);
+        for _ in 0..50000 {
+            let bits = next();
+            // An exponent within 60 of 2^0 most of the time.
+            let exp = if bits & 3 == 0 {
+                bits >> 52 & 0x7ff
+            } else {
+                1023 - 60 + (bits >> 52) % 120
+            };
+            let a = f64::from_bits(bits & 0x800f_ffff_ffff_ffff | exp << 52);
+            if !a.is_finite() {
+                continue;
+            }
+            let fmt = FpFormat::Binary64;
+            for (how, want) in [
+                (Floor, a.floor()),
+                (Ceil, a.ceil()),
+                (Trunc, a.trunc()),
+                (Round, a.round()),
+            ] {
+                let got = d(a).round_to_integral(how, fmt).unwrap();
+                assert_eq!(got.to_f64().to_bits(), want.to_bits(), "{how:?}({a:e})");
+            }
+            let f = a as f32;
+            if f.is_finite() {
+                let fmt = FpFormat::Binary32;
+                for (how, want) in [
+                    (Floor, f.floor()),
+                    (Ceil, f.ceil()),
+                    (Trunc, f.trunc()),
+                    (Round, f.round()),
+                ] {
+                    let got = d(f as f64).round_to_integral(how, fmt).unwrap();
+                    assert_eq!(got.to_bits(fmt) as u32, want.to_bits(), "{how:?}f({f:e})");
+                }
+            }
+        }
+    }
+
+    /// The edges: signed zeros out of a fraction of either sign, halves,
+    /// the values at and past the last fraction bit, and the operands that
+    /// have no fold -- a signalling NaN, and a `rint` or `nearbyint` that
+    /// would depend on the rounding direction.
+    #[test]
+    fn round_to_integral_edges() {
+        use IntegralRounding::*;
+        let v = FloatVal::from_f64;
+        let bits = |r: Option<FloatVal>| r.map(|r| r.to_f64().to_bits());
+        let fmt = FpFormat::Binary64;
+        assert_eq!(
+            bits(v(-0.5).round_to_integral(Ceil, fmt)),
+            Some(0x8000_0000_0000_0000)
+        );
+        assert_eq!(
+            bits(v(-0.5).round_to_integral(Trunc, fmt)),
+            Some(0x8000_0000_0000_0000)
+        );
+        assert_eq!(
+            bits(v(-0.4).round_to_integral(Round, fmt)),
+            Some(0x8000_0000_0000_0000)
+        );
+        assert_eq!(bits(v(0.5).round_to_integral(Floor, fmt)), Some(0));
+        assert_eq!(v(-2.5).round_to_integral(Round, fmt), Some(v(-3.0)));
+        assert_eq!(v(0.5).round_to_integral(Round, fmt), Some(v(1.0)));
+        let tiny = v(f64::from_bits(1));
+        assert_eq!(tiny.round_to_integral(Ceil, fmt), Some(v(1.0)));
+        assert_eq!(tiny.negated().round_to_integral(Floor, fmt), Some(v(-1.0)));
+        assert_eq!(bits(tiny.round_to_integral(Round, fmt)), Some(0));
+        let below = v(4503599627370495.5); // 2^52 - 0.5
+        assert_eq!(
+            below.round_to_integral(Ceil, fmt),
+            Some(v(4503599627370496.0))
+        );
+        assert_eq!(
+            below.round_to_integral(Round, fmt),
+            Some(v(4503599627370496.0))
+        );
+        for how in [Floor, Ceil, Trunc, Round, Rint, NearbyInt] {
+            assert_eq!(v(3.0).round_to_integral(how, fmt), Some(v(3.0)), "{how:?}");
+            let inf = v(f64::NEG_INFINITY);
+            assert_eq!(inf.round_to_integral(how, fmt), Some(inf), "{how:?}");
+            let qnan = FloatVal::nan_with_payload(fmt, 0x12, NanKind::Quiet).negated();
+            assert_eq!(qnan.round_to_integral(how, fmt), Some(qnan), "{how:?}");
+            let snan = FloatVal::nan_with_payload(fmt, 0x12, NanKind::Signalling);
+            assert_eq!(snan.round_to_integral(how, fmt), None, "{how:?}");
+        }
+        assert_eq!(v(2.5).round_to_integral(Rint, fmt), None);
+        assert_eq!(v(-0.25).round_to_integral(NearbyInt, fmt), None);
+        // Rounded to the format first: 2.5 + 2^-30 is 2.5 as a float.
+        let f = v(2.5 + 2f64.powi(-30));
+        assert_eq!(f.round_to_integral(Round, FpFormat::Binary32), Some(v(3.0)));
+        assert_eq!(
+            f.round_to_integral(Trunc, FpFormat::X87Extended),
+            Some(v(2.0))
+        );
     }
 
     /// The operands with no root to compute: zeros and infinity are their

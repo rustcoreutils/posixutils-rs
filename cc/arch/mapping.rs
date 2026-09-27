@@ -2200,6 +2200,20 @@ mod tests {
         assert!(computes_in_place(Opcode::Sqrt, FpFormat::X87Extended, &x86));
         assert!(!computes_in_place(Opcode::Sqrt, FpFormat::Binary128, &x86));
         assert!(!computes_in_place(Opcode::Sqrt, FpFormat::Binary128, &a64));
+
+        // Every rounding on aarch64; on x86-64 all but `round` and
+        // `nearbyint`, which SSE2 has no sequence for.
+        use crate::float::IntegralRounding::*;
+        for how in [Floor, Ceil, Trunc, Round, Rint, NearbyInt] {
+            let op = Opcode::RoundToIntegral(how);
+            let sse = !matches!(how, Round | NearbyInt);
+            for fmt in [FpFormat::Binary32, FpFormat::Binary64] {
+                assert!(computes_in_place(op, fmt, &a64), "{how:?}");
+                assert_eq!(computes_in_place(op, fmt, &x86), sse, "{how:?}");
+            }
+            assert!(!computes_in_place(op, FpFormat::Binary128, &a64));
+            assert!(!computes_in_place(op, FpFormat::X87Extended, &x86));
+        }
     }
 
     /// The late pass turns only the opcodes a target cannot compute into
@@ -2226,6 +2240,19 @@ mod tests {
         let mut module = libm_module(&types, Opcode::Sqrt, types.longdouble_id, "sqrtl");
         call_library_fallbacks(&mut module, &types, &x86);
         assert_eq!(module.functions[0].blocks[0].insns[1].op, Opcode::Sqrt);
+
+        // `round` is a call on x86-64, `floor` is not.
+        use crate::float::IntegralRounding::{Floor, Round};
+        let round = Opcode::RoundToIntegral(Round);
+        let mut module = libm_module(&types, round, types.float_id, "roundf");
+        call_library_fallbacks(&mut module, &types, &x86);
+        let call = &module.functions[0].blocks[0].insns[1];
+        assert_eq!(call.op, Opcode::Call);
+        assert_eq!(call.func_name.as_deref(), Some("roundf"));
+        let floor = Opcode::RoundToIntegral(Floor);
+        let mut module = libm_module(&types, floor, types.double_id, "floor");
+        call_library_fallbacks(&mut module, &types, &x86);
+        assert_eq!(module.functions[0].blocks[0].insns[1].op, floor);
     }
 
     // Pass runner tests

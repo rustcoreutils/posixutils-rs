@@ -138,6 +138,15 @@ const PARITY: &[(&str, &str, &str)] = &[
     ),
     ("double F(double)", "floor(s)", "struct S { double a; } s;"),
     ("double F(double)", "__builtin_ceil(p)", "int *p = 0;"),
+    ("float F(float)", "__builtin_floorf(p)", "int *p = 0;"),
+    ("float F(float)", "rintf(s)", "struct S { float a; } s;"),
+    ("double F(double)", "nearbyint(1.0, 2.0)", ""),
+    ("float F(float)", "roundf()", ""),
+    (
+        "double F(double)",
+        "__builtin_trunc(s)",
+        "struct S { double a; } s;",
+    ),
     (
         "double F(double _Complex)",
         "creal(s)",
@@ -216,6 +225,8 @@ fn builtin_library_call_arguments_are_checked_like_a_call() {
                  double copysign(double, double); float copysignf(float, float);\n\
                  long double copysignl(long double, long double);\n\
                  double sqrt(double); float sqrtf(float); long double sqrtl(long double);\n\
+                 double nearbyint(double); float floorf(float); float rintf(float);\n\
+                 float roundf(float); double trunc(double);\n\
                  unsigned long strlen(const char *);\n";
     for (proto, call, pre) in PARITY {
         // The ordinary call: the builtin's name replaced by `F`, declared with

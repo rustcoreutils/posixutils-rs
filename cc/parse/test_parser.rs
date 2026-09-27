@@ -11,9 +11,11 @@
 
 #![allow(clippy::approx_constant)]
 
+use crate::float::IntegralRounding;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Expr, ExprKind, ExternalDecl,
-    ForInit, FpTest, FunctionDef, InlineLibraryFn, MathErrno, Stmt, TranslationUnit, UnaryOp,
+    ForInit, FpTest, FunctionDef, InlineLibraryFn, MathErrno, MemoryFn, Stmt, TranslationUnit,
+    UnaryOp,
 };
 use crate::parse::parser::{ParseResult, Parser};
 use crate::strings::{StringId, StringTable};
@@ -5255,13 +5257,19 @@ fn test_builtin_nan_of_a_malformed_string_is_a_call() {
 
 /// The first statement of the first function defined in `tu`.
 fn first_statement(tu: &TranslationUnit) -> &Stmt {
+    first_statement_of(tu, 0)
+}
+
+/// The first statement of the function defined `n`th (from 0) in `tu`.
+fn first_statement_of(tu: &TranslationUnit, n: usize) -> &Stmt {
     let func = tu
         .items
         .iter()
-        .find_map(|item| match item {
+        .filter_map(|item| match item {
             ExternalDecl::FunctionDef(f) => Some(f),
             _ => None,
         })
+        .nth(n)
         .expect("function definition");
     let Stmt::Block(items) = &func.body else {
         panic!("function body is not a block");
@@ -5434,6 +5442,131 @@ fn test_sqrt_follows_the_library_call_policy() {
     }
 }
 
+/// The six roundings and their `f` forms, bare or reserved, are computed in
+/// place at their own type and named for the call a target may still make.
+#[test]
+fn test_rounding_builtins() {
+    use IntegralRounding::*;
+    for (base, how) in [
+        ("floor", Floor),
+        ("ceil", Ceil),
+        ("trunc", Trunc),
+        ("round", Round),
+        ("rint", Rint),
+        ("nearbyint", NearbyInt),
+    ] {
+        for suffix in ["", "f"] {
+            for prefix in ["", "__builtin_"] {
+                let src = format!("{prefix}{base}{suffix}(i)");
+                let (expr, types, strings, _) = parse_expr_with_vars(&src, &["i"]).unwrap();
+                let want = if suffix.is_empty() {
+                    types.double_id
+                } else {
+                    types.float_id
+                };
+                assert_eq!(expr.typ, Some(want), "{src}");
+                let (func, arg) = inline_call(&src, &expr);
+                assert_eq!(func, InlineLibraryFn::RoundToIntegral(how), "{src}");
+                assert_eq!(arg.typ, Some(want), "{src}");
+                let ExprKind::InlineLibraryCall { name, .. } = expr.kind else {
+                    unreachable!()
+                };
+                check_name(&strings, name, &format!("{base}{suffix}"));
+            }
+        }
+    }
+}
+
+/// A `float` argument to a `double` rounding is rounded as a `float`, by
+/// the `f` form, and the exact answer widened: the call is still a
+/// `double`. A `double` argument is not narrowed, and a root never is.
+#[test]
+fn test_rounding_narrows_a_float_argument() {
+    let decls = "float f; double d;";
+    with_statement_expr(decls, "floor(f)", |p, e| {
+        assert_eq!(e.typ, Some(p.types.double_id));
+        let ExprKind::Cast { expr: inner, .. } = &e.kind else {
+            panic!("floor(f) is not widened: {:?}", e.kind);
+        };
+        assert_eq!(inner.typ, Some(p.types.float_id));
+        let (func, arg) = inline_call("floor(f)", inner);
+        assert_eq!(
+            func,
+            InlineLibraryFn::RoundToIntegral(IntegralRounding::Floor)
+        );
+        assert_eq!(arg.typ, Some(p.types.float_id), "not converted to double");
+    });
+    with_statement_expr(decls, "__builtin_rint(d)", |p, e| {
+        assert_eq!(e.typ, Some(p.types.double_id));
+        inline_call("__builtin_rint(d)", e);
+    });
+    with_statement_expr(decls, "sqrt(f)", |p, e| {
+        let (_, arg) = inline_call("sqrt(f)", e);
+        assert_eq!(arg.typ, Some(p.types.double_id), "a root is not narrowed");
+    });
+}
+
+/// At `-O0` a bare rounding is a call -- to the `f` form for a `float`
+/// argument, widened -- and a `__builtin_` one is computed in place.
+#[test]
+fn test_rounding_at_o0() {
+    let o0 = super::LibraryCallPolicy {
+        optimizing: false,
+        math_errno: true,
+    };
+    let called = |src: &str, vars: &[&str]| {
+        let (expr, types, strings, symbols) = parse_expr_under(src, vars, o0).unwrap();
+        assert_eq!(expr.typ, Some(types.double_id), "{src}");
+        let e = match &expr.kind {
+            ExprKind::Cast { expr, .. } => expr.as_ref(),
+            _ => &expr,
+        };
+        let ExprKind::Call { func, .. } = &e.kind else {
+            panic!("{src} at -O0 is not a call: {:?}", e.kind);
+        };
+        let ExprKind::Ident(sym) = func.kind else {
+            panic!("{src} at -O0 names no function");
+        };
+        strings.get(symbols.get(sym).name).to_string()
+    };
+    assert_eq!(called("ceil(i)", &["i"]), "ceil");
+    let (expr, _, _, _) = parse_expr_under("__builtin_ceil(i)", &["i"], o0).unwrap();
+    inline_call("__builtin_ceil(i)", &expr);
+}
+
+/// A definition of `sqrt` or a rounding above the call displaces the
+/// builtin -- an old-style one taking nothing included, whose call takes
+/// nothing -- while a definition of `abs` does not.
+#[test]
+fn test_definition_displaces_a_late_expanded_builtin() {
+    fn returned(src: &str) -> ExprKind {
+        let (tu, _, _, _) = parse_tu(src).unwrap();
+        let Stmt::Return(Some(e)) = first_statement_of(&tu, 1) else {
+            panic!("{src}: expected a return");
+        };
+        e.kind.clone()
+    }
+    let is_call = |k: &ExprKind| matches!(k, ExprKind::Call { .. });
+    assert!(is_call(&returned(
+        "double sqrt(double x) { return x; } double f(double y) { return sqrt(y); }"
+    )));
+    assert!(is_call(&returned(
+        "float rintf() { return 1.0f; } float f(void) { return rintf(); }"
+    )));
+    assert!(matches!(
+        returned("int abs(int v) { return v; } int f(int y) { return abs(y); }"),
+        ExprKind::InlineLibraryCall { .. }
+    ));
+    // A weak definition may be replaced at link time; gcc keeps the builtin.
+    assert!(matches!(
+        returned(
+            "__attribute__((weak)) double sqrt(double x) { return x; }\n\
+             double f(double y) { return sqrt(y); }"
+        ),
+        ExprKind::InlineLibraryCall { .. }
+    ));
+}
+
 /// A declaration of `copysign` keeps the builtin only if both parameters, not
 /// just the first, match the library's.
 #[test]
@@ -5595,12 +5728,20 @@ fn test_memory_builtins() {
         with_statement_expr(decls, stmt, |p, e| {
             let t = &*p.types;
             assert_eq!(e.typ, Some(t.void_ptr_id), "{stmt}");
-            let (dest, second, n, second_typ) = match &e.kind {
-                ExprKind::Memcpy { dest, src, n } | ExprKind::Memmove { dest, src, n } => {
-                    (dest, src, n, t.const_void_ptr_id)
-                }
-                ExprKind::Memset { dest, c, n } => (dest, c, n, t.int_id),
-                other => panic!("{stmt}: expected a block memory node, got {other:?}"),
+            let ExprKind::InlineLibraryCall {
+                func: InlineLibraryFn::Memory(mem),
+                args,
+                ..
+            } = &e.kind
+            else {
+                panic!("{stmt}: expected a block memory call, got {:?}", e.kind);
+            };
+            let [dest, second, n] = args.as_slice() else {
+                panic!("{stmt}: {} arguments", args.len());
+            };
+            let second_typ = match mem {
+                MemoryFn::Copy | MemoryFn::Move => t.const_void_ptr_id,
+                MemoryFn::Set => t.int_id,
             };
             assert_eq!(dest.typ, Some(t.void_ptr_id), "{stmt}");
             assert_eq!(second.typ, Some(second_typ), "{stmt}");
@@ -5614,23 +5755,42 @@ fn test_memory_builtins() {
     }
     // A length known only at run time is converted, not folded.
     with_statement_expr(decls, "memcpy(d, s, n)", |p, e| {
-        let ExprKind::Memcpy { n, .. } = &e.kind else {
-            panic!("expected Memcpy, got {:?}", e.kind);
+        let ExprKind::InlineLibraryCall {
+            func: InlineLibraryFn::Memory(MemoryFn::Copy),
+            args,
+            ..
+        } = &e.kind
+        else {
+            panic!("expected memcpy, got {:?}", e.kind);
         };
+        let n = &args[2];
         assert_eq!(n.typ, Some(p.types.ulong_id));
         assert!(matches!(n.kind, ExprKind::Cast { .. }), "{:?}", n.kind);
     });
 }
 
 /// The declaration `<string.h>` writes keeps `memcpy` a builtin, `restrict`
-/// and all; one of another type, or a definition, makes it the program's own
-/// function.
+/// and all; one of another type, or a non-weak definition, makes it the
+/// program's own function.
 #[test]
 fn test_memory_builtin_declarations() {
     fn is_memcpy(decl: &str) -> bool {
         let src = format!("{decl}\nvoid t(char *d, char *s) {{ memcpy(d, s, 4); }}");
         let (tu, _, _, _) = parse_tu(&src).unwrap();
-        matches!(first_statement(&tu), Stmt::Expr(e) if matches!(e.kind, ExprKind::Memcpy { .. }))
+        // `t`, which follows any definition `decl` makes.
+        let t = tu
+            .items
+            .iter()
+            .filter(|item| matches!(item, ExternalDecl::FunctionDef(_)))
+            .count()
+            - 1;
+        matches!(
+            first_statement_of(&tu, t),
+            Stmt::Expr(e) if matches!(
+                e.kind,
+                ExprKind::InlineLibraryCall { func: InlineLibraryFn::Memory(MemoryFn::Copy), .. }
+            )
+        )
     }
     assert!(is_memcpy(""));
     assert!(is_memcpy(
@@ -5644,6 +5804,9 @@ fn test_memory_builtin_declarations() {
     ));
     assert!(!is_memcpy(
         "void *memcpy(void *d, const void *s, unsigned long n) { return d; }"
+    ));
+    assert!(is_memcpy(
+        "__attribute__((weak)) void *memcpy(void *d, const void *s, unsigned long n) { return d; }"
     ));
 }
 

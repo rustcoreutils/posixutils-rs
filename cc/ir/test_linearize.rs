@@ -7352,6 +7352,78 @@ fn test_sqrt_keeps_a_call_for_errno() {
     assert!(insns.iter().any(|i| i.op == Opcode::Phi));
 }
 
+/// A rounding is its opcode, naming its library function, with no call on
+/// any path -- `floor` of a `float` at `float`, by `floorf`, widened after.
+#[test]
+fn test_rounding_is_one_opcode() {
+    use crate::float::IntegralRounding::{Floor, NearbyInt};
+    let src = "double floor(double); double nearbyint(double);\n\
+               double f(float x, double y) { return floor(x) + nearbyint(y); }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    let insns = insns_of(&module, "f");
+    assert!(!insns.iter().any(|i| i.op == Opcode::Call));
+    let floor = insns
+        .iter()
+        .find(|i| i.op == Opcode::RoundToIntegral(Floor))
+        .expect("floor");
+    assert_eq!(floor.func_name.as_deref(), Some("floorf"));
+    assert_eq!(floor.size, 32, "computed at float");
+    let nearby = insns
+        .iter()
+        .find(|i| i.op == Opcode::RoundToIntegral(NearbyInt))
+        .expect("nearbyint");
+    assert_eq!(nearby.func_name.as_deref(), Some("nearbyint"));
+    assert_eq!(nearby.size, 64);
+}
+
+/// The translation unit's own `floor` and `memcpy`, defined below the call,
+/// are called -- `fabs`, which gcc folds as it parses, stays computed in
+/// place.
+#[test]
+fn test_own_definition_below_the_call_is_called() {
+    let src = "double floor(double); double fabs(double);\n\
+               double f(double x, char *d, char *s) {\n\
+                   memcpy(d, s, 8); return floor(x) + fabs(x); }\n\
+               double floor(double x) { return x; }\n\
+               double fabs(double x) { return x; }\n\
+               void *memcpy(void *d, const void *s, unsigned long n) { return d; }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    let insns = insns_of(&module, "f");
+    let calls: Vec<_> = insns
+        .iter()
+        .filter(|i| i.op == Opcode::Call)
+        .map(|i| i.func_name.as_deref())
+        .collect();
+    assert_eq!(calls, [Some("memcpy"), Some("floor")]);
+    assert!(!insns
+        .iter()
+        .any(|i| i.op.is_libm() || i.op == Opcode::Memcpy));
+    assert!(insns.iter().any(|i| i.op == Opcode::Fabs));
+}
+
+/// `memcpy`, `memset` and `memmove`, bare or reserved, are their block
+/// memory opcodes, naming the library function the IR calls when it does
+/// not expand them.
+#[test]
+fn test_memory_builtins_are_their_opcodes() {
+    let src = "void f(char *d, char *s, int c, unsigned long n) {\n\
+                   memcpy(d, s, n); __builtin_memset(d, c, n); memmove(d, s, n); }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    let ops: Vec<_> = insns_of(&module, "f")
+        .iter()
+        .filter(|i| matches!(i.op, Opcode::Memcpy | Opcode::Memset | Opcode::Memmove))
+        .map(|i| (i.op, i.func_name.as_deref(), i.src.len()))
+        .collect();
+    assert_eq!(
+        ops,
+        [
+            (Opcode::Memcpy, Some("memcpy"), 3),
+            (Opcode::Memset, Some("memset"), 3),
+            (Opcode::Memmove, Some("memmove"), 3),
+        ]
+    );
+}
+
 /// Under `-fno-math-errno` the opcode stands alone; on a target without the
 /// instruction (binary128 on aarch64) the call alone does everything.
 #[test]

@@ -43,7 +43,7 @@ pub mod vrp;
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::diag::Position;
-use crate::float::FloatVal;
+use crate::float::{FloatVal, IntegralRounding};
 use crate::target::Target;
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
@@ -170,6 +170,10 @@ pub enum Opcode {
     // and `func_name` names the library function a target without the
     // instruction calls instead (see `arch::mapping::computes_in_place`).
     Sqrt,
+    // `floor`, `ceil`, `trunc`, `round`, `rint` or `nearbyint` of src[0], at
+    // the width of `typ`: the integer it rounds to, with its sign. Named in
+    // `func_name` like `Sqrt`.
+    RoundToIntegral(IntegralRounding),
 
     // Type conversions
     Trunc, // Truncate to smaller integer
@@ -363,7 +367,7 @@ impl Opcode {
     /// Whether this opcode computes a libm function, which its instruction
     /// names in `func_name` for a target that calls the function instead.
     pub fn is_libm(&self) -> bool {
-        matches!(self, Opcode::Sqrt)
+        matches!(self, Opcode::Sqrt | Opcode::RoundToIntegral(_))
     }
 
     /// Check if this opcode has side effects (cannot be deleted even if unused).
@@ -474,6 +478,14 @@ impl Opcode {
             Opcode::Fabs => "fabs",
             Opcode::CopySign => "copysign",
             Opcode::Sqrt => "sqrt",
+            Opcode::RoundToIntegral(how) => match how {
+                IntegralRounding::Floor => "ffloor",
+                IntegralRounding::Ceil => "fceil",
+                IntegralRounding::Trunc => "ftrunc",
+                IntegralRounding::Round => "fround",
+                IntegralRounding::Rint => "frint",
+                IntegralRounding::NearbyInt => "fnearbyint",
+            },
             Opcode::Trunc => "trunc",
             Opcode::Zext => "zext",
             Opcode::Sext => "sext",
@@ -3190,6 +3202,26 @@ mod tests {
         assert!(!Opcode::Sqrt.has_side_effects());
         assert!(Opcode::Sqrt.is_libm());
         assert!(!Opcode::Fabs.is_libm() && !Opcode::Call.is_libm());
+    }
+
+    /// One opcode per rounding, each named apart from the others and from
+    /// the integer `trunc`.
+    #[test]
+    fn test_round_to_integral_opcodes() {
+        use IntegralRounding::*;
+        let names: Vec<&str> = [Floor, Ceil, Trunc, Round, Rint, NearbyInt]
+            .into_iter()
+            .map(|how| {
+                let op = Opcode::RoundToIntegral(how);
+                assert!(op.is_libm() && !op.is_terminator() && !op.has_side_effects());
+                op.name()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["ffloor", "fceil", "ftrunc", "fround", "frint", "fnearbyint"]
+        );
+        assert_ne!(Opcode::RoundToIntegral(Trunc).name(), Opcode::Trunc.name());
     }
 
     #[test]

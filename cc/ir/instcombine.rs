@@ -25,9 +25,9 @@
 //
 
 use super::constfold::{
-    at_width, cmp_operand_width, eval_binop, eval_fbinop, eval_fcvt, eval_fcvtf, eval_funop,
-    eval_unop, fcmp_mask, fcmp_outcome, get_cmp_info, mirror_mask, result_type_of, CMP_GT, CMP_LT,
-    CMP_UN, FCMP_ALL,
+    at_width, cmp_operand_width, eval_binop, eval_fbinop, eval_fcvt, eval_fcvtf, eval_fternop,
+    eval_funop, eval_unop, fcmp_mask, fcmp_outcome, get_cmp_info, mirror_mask, result_type_of,
+    CMP_GT, CMP_LT, CMP_UN, FCMP_ALL,
 };
 use super::facts::{CmpDomain, CmpFacts, ConstMap, Relation};
 use super::{ConstValue, Function, Instruction, Opcode, PseudoId};
@@ -222,9 +222,14 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
         Opcode::Select => simplify_select(insn, consts, facts),
 
         // Floating point
-        Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv | Opcode::CopySign => {
-            simplify_fbinop(insn, consts, facts)
-        }
+        Opcode::FAdd
+        | Opcode::FSub
+        | Opcode::FMul
+        | Opcode::FDiv
+        | Opcode::CopySign
+        | Opcode::FMin
+        | Opcode::FMax => simplify_fbinop(insn, consts, facts),
+        Opcode::Fma => simplify_fternop(insn, consts, facts),
         Opcode::FNeg | Opcode::Fabs | Opcode::Sqrt | Opcode::RoundToIntegral(_) => {
             simplify_funop(insn, consts, facts)
         }
@@ -788,6 +793,25 @@ fn simplify_fbinop(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simp
         return Simplification::None;
     };
     match eval_fbinop(insn.op, fmt, a, b) {
+        Some(v) => Simplification::FoldToFloat(v),
+        None => Simplification::None,
+    }
+}
+
+/// Fold `Fma` of three constants.
+fn simplify_fternop(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+    let width = insn.size.max(1);
+    let (Some(fmt), [a, b, c]) = (facts.fp_format(insn.typ), insn.src.as_slice()) else {
+        return Simplification::None;
+    };
+    let (Some(a), Some(b), Some(c)) = (
+        consts.fget(*a, width),
+        consts.fget(*b, width),
+        consts.fget(*c, width),
+    ) else {
+        return Simplification::None;
+    };
+    match eval_fternop(insn.op, fmt, a, b, c) {
         Some(v) => Simplification::FoldToFloat(v),
         None => Simplification::None,
     }
@@ -3034,11 +3058,14 @@ mod tests {
             .collect();
         pseudos.push(Pseudo::reg(target, target.0));
         let insn = match args.len() {
-            1 => Instruction::new(op)
-                .with_target(target)
-                .with_src(PseudoId(0))
-                .with_type_and_size(typ, size),
-            _ => Instruction::binop(op, target, PseudoId(0), PseudoId(1), typ, size),
+            2 => Instruction::binop(op, target, PseudoId(0), PseudoId(1), typ, size),
+            n => {
+                let mut insn = Instruction::new(op)
+                    .with_target(target)
+                    .with_type_and_size(typ, size);
+                insn.src = (0..n as u32).map(PseudoId).collect();
+                insn
+            }
         };
         let mut func = make_test_func_with_insns(vec![insn], pseudos);
         run(&mut func, &host_types());
@@ -3188,6 +3215,33 @@ mod tests {
             assert!(fold(Rint, 2.5).is_none(), "rint(2.5) is the direction's");
             assert!(fold(NearbyInt, -0.25).is_none());
         }
+    }
+
+    /// `fmin` and `fmax` of constants fold -- a quiet NaN operand to the
+    /// other, the zeros to -0 and +0 -- and `fma` rounds once.
+    #[test]
+    fn min_max_and_fma_of_constants_fold() {
+        let types = host_types();
+        let d = types.double_id;
+        let val = |op, args: &[f64]| fold_float(op, d, 64, args).map(|(v, _)| v.to_f64().to_bits());
+        assert_eq!(val(Opcode::FMin, &[1.0, 2.0]), Some(1f64.to_bits()));
+        assert_eq!(val(Opcode::FMax, &[1.0, 2.0]), Some(2f64.to_bits()));
+        assert_eq!(val(Opcode::FMin, &[f64::NAN, 3.0]), Some(3f64.to_bits()));
+        assert_eq!(val(Opcode::FMin, &[0.0, -0.0]), Some(1 << 63));
+        assert_eq!(val(Opcode::FMax, &[-0.0, 0.0]), Some(0));
+        let (a, b) = (1.0 + f64::EPSILON, 1.0 - f64::EPSILON / 2.0);
+        assert_eq!(
+            val(Opcode::Fma, &[a, b, -1.0]),
+            Some(a.mul_add(b, -1.0).to_bits())
+        );
+        assert_ne!(
+            a.mul_add(b, -1.0),
+            a * b - 1.0,
+            "the case needs one rounding"
+        );
+        assert_eq!(val(Opcode::Fma, &[1.0, 1.0, f64::INFINITY]), None);
+        let got = fold_float(Opcode::Fma, types.float_id, 32, &[2.0, 3.0, 4.0]);
+        assert_eq!(got.map(|(v, _)| v.to_f64()), Some(10.0));
     }
 
     #[test]

@@ -7376,6 +7376,27 @@ fn test_rounding_is_one_opcode() {
     assert_eq!(nearby.size, 64);
 }
 
+/// `fma` is one three-operand opcode, and `fmin` and `fmax` two-operand
+/// ones, each naming its function; nothing is called.
+#[test]
+fn test_min_max_fma_are_opcodes() {
+    let src = "double fma(double, double, double); float fminf(float, float);\n\
+               double fmax(double, double);\n\
+               double f(double x, float y) { return fma(x, x, x) + fminf(y, y) + fmax(x, 1.0); }\n";
+    let module = linearize_source(src, &Target::new(Arch::Aarch64, Os::Linux));
+    let insns = insns_of(&module, "f");
+    assert!(!insns.iter().any(|i| i.op == Opcode::Call));
+    for (op, name, srcs, size) in [
+        (Opcode::Fma, "fma", 3, 64),
+        (Opcode::FMin, "fminf", 2, 32),
+        (Opcode::FMax, "fmax", 2, 64),
+    ] {
+        let insn = insns.iter().find(|i| i.op == op).expect(name);
+        assert_eq!(insn.func_name.as_deref(), Some(name));
+        assert_eq!((insn.src.len(), insn.size), (srcs, size), "{name}");
+    }
+}
+
 /// The translation unit's own `floor` and `memcpy`, defined below the call,
 /// are called -- `fabs`, which gcc folds as it parses, stays computed in
 /// place.

@@ -5477,6 +5477,33 @@ fn test_rounding_builtins() {
     }
 }
 
+/// `fmin`, `fmax`, `fma` and their `f` forms, bare or reserved, are computed
+/// in place at their own type, every argument converted to it; nothing
+/// narrows.
+#[test]
+fn test_min_max_fma_builtins() {
+    for (src, func, float) in [
+        ("fmin(i, f)", InlineLibraryFn::FMin, false),
+        ("__builtin_fminf(i, f)", InlineLibraryFn::FMin, true),
+        ("fmaxf(f, i)", InlineLibraryFn::FMax, true),
+        ("__builtin_fmax(f, f)", InlineLibraryFn::FMax, false),
+        ("fma(i, f, i)", InlineLibraryFn::Fma, false),
+        ("__builtin_fmaf(i, i, i)", InlineLibraryFn::Fma, true),
+    ] {
+        let (expr, types, _, _) = parse_expr_with_vars(src, &["i", "f"]).unwrap();
+        let want = if float {
+            types.float_id
+        } else {
+            types.double_id
+        };
+        assert_eq!(expr.typ, Some(want), "{src}");
+        let (got, args) = inline_call_args(src, &expr);
+        assert_eq!(got, func, "{src}");
+        assert_eq!(args.len(), func.arity(), "{src}");
+        assert!(args.iter().all(|a| a.typ == Some(want)), "{src}");
+    }
+}
+
 /// A `float` argument to a `double` rounding is rounded as a `float`, by
 /// the `f` form, and the exact answer widened: the call is still a
 /// `double`. A `double` argument is not narrowed, and a root never is.

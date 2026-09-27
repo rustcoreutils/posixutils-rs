@@ -2214,6 +2214,15 @@ mod tests {
             assert!(!computes_in_place(op, FpFormat::Binary128, &a64));
             assert!(!computes_in_place(op, FpFormat::X87Extended, &x86));
         }
+
+        // fmin, fmax and fma: instructions on aarch64, calls on x86-64.
+        for op in [Opcode::FMin, Opcode::FMax, Opcode::Fma] {
+            for fmt in [FpFormat::Binary32, FpFormat::Binary64] {
+                assert!(computes_in_place(op, fmt, &a64), "{op:?}");
+                assert!(!computes_in_place(op, fmt, &x86), "{op:?}");
+            }
+            assert!(!computes_in_place(op, FpFormat::Binary128, &a64));
+        }
     }
 
     /// The late pass turns only the opcodes a target cannot compute into
@@ -2253,6 +2262,16 @@ mod tests {
         let mut module = libm_module(&types, floor, types.double_id, "floor");
         call_library_fallbacks(&mut module, &types, &x86);
         assert_eq!(module.functions[0].blocks[0].insns[1].op, floor);
+
+        // `fma` on x86-64 is a call of three arguments, all of its type.
+        let mut module = libm_module(&types, Opcode::Fma, types.double_id, "fma");
+        module.functions[0].blocks[0].insns[1].src = vec![PseudoId(0), PseudoId(0), PseudoId(0)];
+        call_library_fallbacks(&mut module, &types, &x86);
+        let call = &module.functions[0].blocks[0].insns[1];
+        assert_eq!(call.op, Opcode::Call);
+        assert_eq!(call.func_name.as_deref(), Some("fma"));
+        assert_eq!(call.src.len(), 3);
+        assert_eq!(call.arg_types, vec![types.double_id; 3]);
     }
 
     // Pass runner tests

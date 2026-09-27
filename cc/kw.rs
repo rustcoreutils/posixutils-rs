@@ -708,6 +708,14 @@ define_keywords! {
     (SQRT,              "sqrt",              0),
     (SQRTF,             "sqrtf",             0),
     (SQRTL,             "sqrtl",             0),
+    // Minimum, maximum and fused multiply-add: instructions on aarch64,
+    // calls on the x86-64 baseline, and folded for constants on both.
+    (FMIN,              "fmin",              0),
+    (FMINF,             "fminf",             0),
+    (FMAX,              "fmax",              0),
+    (FMAXF,             "fmaxf",             0),
+    (FMA,               "fma",               0),
+    (FMAF,              "fmaf",              0),
 
     // The integer magnitudes, recognized by their plain names for the same
     // reason and displaceable the same way. Each becomes a branch-free
@@ -786,17 +794,11 @@ define_keywords! {
     (_,                 "ffs",                  0),
     (_,                 "ffsl",                 0),
     (_,                 "ffsll",                0),
-    (_,                 "fmax",                 0),
-    (_,                 "fmaxf",                0),
     (_,                 "fmaxl",                0),
-    (_,                 "fmin",                 0),
-    (_,                 "fminf",                0),
     (_,                 "fminl",                0),
     (_,                 "pow",                  0),
     (_,                 "powf",                 0),
     (_,                 "powl",                 0),
-    (_,                 "fma",                  0),
-    (_,                 "fmaf",                 0),
     (_,                 "fmal",                 0),
     (_,                 "bcmp",                 0),
     (_,                 "bzero",                0),

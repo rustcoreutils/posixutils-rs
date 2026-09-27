@@ -348,11 +348,16 @@ fn eval_shift(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
 /// only *inexact*, which is not separable from the fold in the first place.
 ///
 /// `CopySign` is not arithmetic, and folds for every pair: it moves one sign
-/// bit, raises nothing, and keeps a NaN's payload.
+/// bit, raises nothing, and keeps a NaN's payload. `FMin` and `FMax` fold
+/// as [`FloatVal::fmin`] says, a quiet NaN operand included, since neither
+/// raises anything for one.
 pub(crate) fn eval_fbinop(op: Opcode, fmt: FpFormat, a: FloatVal, b: FloatVal) -> Option<FloatVal> {
     let (a, b) = (a.round_to_format(fmt), b.round_to_format(fmt));
-    if op == Opcode::CopySign {
-        return Some(a.with_sign_of(b));
+    match op {
+        Opcode::CopySign => return Some(a.with_sign_of(b)),
+        Opcode::FMin => return a.fmin(b, fmt),
+        Opcode::FMax => return a.fmax(b, fmt),
+        _ => {}
     }
     if !a.is_finite() || !b.is_finite() {
         return None;
@@ -367,6 +372,21 @@ pub(crate) fn eval_fbinop(op: Opcode, fmt: FpFormat, a: FloatVal, b: FloatVal) -
         _ => return None,
     };
     r.is_finite().then_some(r)
+}
+
+/// A float operation of three constants: `Fma`, as [`FloatVal::fma`] says --
+/// rounded once, and held to the arithmetic's rule for what raises.
+pub(crate) fn eval_fternop(
+    op: Opcode,
+    fmt: FpFormat,
+    a: FloatVal,
+    b: FloatVal,
+    c: FloatVal,
+) -> Option<FloatVal> {
+    match op {
+        Opcode::Fma => a.fma(b, c, fmt),
+        _ => None,
+    }
 }
 
 /// A float unary operation over a constant.

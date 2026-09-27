@@ -526,13 +526,13 @@ pub(crate) fn eval_float(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) ->
             eval_as_float(env, scope, chosen_arm(env, scope, expr)?, expr.typ?)
         }
 
-        // `fabs`, `copysign`, `sqrt` and the roundings of constants, whose
-        // arguments are already at this node's type. A call is never an
-        // integer constant expression, and gcc agrees -- `int
-        // a[(int)fabs(-2.0)];` is a VLA there -- but it folds one in a static
-        // initializer. One with no answer of its own -- a root's domain
-        // error, a `rint(2.5)` that depends on the rounding direction -- is
-        // not a constant, there as here.
+        // `fabs`, `copysign`, `sqrt`, the roundings, `fmin`, `fmax` and
+        // `fma` of constants, whose arguments are already at this node's
+        // type. A call is never an integer constant expression, and gcc
+        // agrees -- `int a[(int)fabs(-2.0)];` is a VLA there -- but it folds
+        // one in a static initializer. One with no answer of its own -- a
+        // root's domain error, a `rint(2.5)` that depends on the rounding
+        // direction -- is not a constant, there as here.
         ExprKind::InlineLibraryCall { func, args, .. }
             if scope == ConstScope::StaticInitializer =>
         {
@@ -545,6 +545,23 @@ pub(crate) fn eval_float(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) ->
                 (InlineLibraryFn::Sqrt(_), [x]) => eval_float(env, scope, x)?.sqrt(fmt?),
                 (InlineLibraryFn::RoundToIntegral(how), [x]) => {
                     eval_float(env, scope, x)?.round_to_integral(*how, fmt?)
+                }
+                // gcc does not take a NaN argument to either as a constant,
+                // though the optimizer folds one to the other argument.
+                (InlineLibraryFn::FMin | InlineLibraryFn::FMax, [x, y]) => {
+                    let (x, y) = (eval_float(env, scope, x)?, eval_float(env, scope, y)?);
+                    if x.is_nan() || y.is_nan() {
+                        return None;
+                    }
+                    if *func == InlineLibraryFn::FMin {
+                        x.fmin(y, fmt?)
+                    } else {
+                        x.fmax(y, fmt?)
+                    }
+                }
+                (InlineLibraryFn::Fma, [x, y, z]) => {
+                    let (x, y) = (eval_float(env, scope, x)?, eval_float(env, scope, y)?);
+                    x.fma(y, eval_float(env, scope, z)?, fmt?)
                 }
                 _ => None,
             }

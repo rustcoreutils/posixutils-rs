@@ -4125,6 +4125,19 @@ impl<'a> Linearizer<'a> {
         value
     }
 
+    /// The libm opcode `op` of `args`, each already at `typ`, for a call
+    /// that named `name`.
+    fn linearize_libm(
+        &mut self,
+        op: Opcode,
+        args: &[Expr],
+        typ: TypeId,
+        name: StringId,
+    ) -> PseudoId {
+        let arg_vals: Vec<PseudoId> = args.iter().map(|a| self.linearize_expr(a)).collect();
+        self.emit_libm(op, &arg_vals, typ, name)
+    }
+
     /// Whether a call to the library builtin `func`, named `name`, reaches the
     /// translation unit's own definition of it instead.
     fn calls_the_programs_own(&self, func: InlineLibraryFn, name: StringId) -> bool {
@@ -4176,10 +4189,12 @@ impl<'a> Linearizer<'a> {
                 let arg_val = self.linearize_expr(arg);
                 self.emit_sqrt(arg_val, typ, name, errno)
             }
-            (InlineLibraryFn::RoundToIntegral(how), [arg]) => {
-                let arg_val = self.linearize_expr(arg);
-                self.emit_libm(Opcode::RoundToIntegral(how), &[arg_val], typ, name)
+            (InlineLibraryFn::RoundToIntegral(how), [_]) => {
+                self.linearize_libm(Opcode::RoundToIntegral(how), args, typ, name)
             }
+            (InlineLibraryFn::FMin, [_, _]) => self.linearize_libm(Opcode::FMin, args, typ, name),
+            (InlineLibraryFn::FMax, [_, _]) => self.linearize_libm(Opcode::FMax, args, typ, name),
+            (InlineLibraryFn::Fma, [_, _, _]) => self.linearize_libm(Opcode::Fma, args, typ, name),
             (InlineLibraryFn::Memory(mem), [dest, second, n]) => {
                 let op = match mem {
                     MemoryFn::Copy => Opcode::Memcpy,

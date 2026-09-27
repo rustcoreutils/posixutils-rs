@@ -85,9 +85,11 @@ impl LibraryCallPolicy {
             | InlineLibraryFn::Conjugate
             | InlineLibraryFn::Memory(_) => true,
             InlineLibraryFn::Sqrt(MathErrno::Set) => false,
-            InlineLibraryFn::Sqrt(MathErrno::Ignored) | InlineLibraryFn::RoundToIntegral(_) => {
-                spelling == Spelling::Reserved
-            }
+            InlineLibraryFn::Sqrt(MathErrno::Ignored)
+            | InlineLibraryFn::RoundToIntegral(_)
+            | InlineLibraryFn::FMin
+            | InlineLibraryFn::FMax
+            | InlineLibraryFn::Fma => spelling == Spelling::Reserved,
         }
     }
 }
@@ -206,6 +208,12 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         entry(kw::RINTF,      kw::BUILTIN_RINTF,       Float,             &[Float],                         F::RoundToIntegral(R::Rint)),
         entry(kw::NEARBYINT,  kw::BUILTIN_NEARBYINT,   Double,            &[Double],                        F::RoundToIntegral(R::NearbyInt)),
         entry(kw::NEARBYINTF, kw::BUILTIN_NEARBYINTF,  Float,             &[Float],                         F::RoundToIntegral(R::NearbyInt)),
+        entry(kw::FMIN,       kw::BUILTIN_FMIN,        Double,            &[Double, Double],                F::FMin),
+        entry(kw::FMINF,      kw::BUILTIN_FMINF,       Float,             &[Float, Float],                  F::FMin),
+        entry(kw::FMAX,       kw::BUILTIN_FMAX,        Double,            &[Double, Double],                F::FMax),
+        entry(kw::FMAXF,      kw::BUILTIN_FMAXF,       Float,             &[Float, Float],                  F::FMax),
+        entry(kw::FMA,        kw::BUILTIN_FMA,         Double,            &[Double, Double, Double],        F::Fma),
+        entry(kw::FMAF,       kw::BUILTIN_FMAF,        Float,             &[Float, Float, Float],           F::Fma),
         entry(kw::CREAL,      kw::BUILTIN_CREAL,       Double,            &[ComplexDouble],                 F::ComplexReal),
         entry(kw::CREALF,     kw::BUILTIN_CREALF,      Float,             &[ComplexFloat],                  F::ComplexReal),
         entry(kw::CREALL,     kw::BUILTIN_CREALL,      LongDouble,        &[ComplexLongDouble],             F::ComplexReal),

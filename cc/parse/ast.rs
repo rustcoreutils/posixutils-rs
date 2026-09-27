@@ -80,6 +80,12 @@ pub enum InlineLibraryFn {
     /// `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint` and their `f`
     /// forms: the integer the argument rounds to, at the expression's type.
     RoundToIntegral(IntegralRounding),
+    /// `fmin`, `fminf`: the smaller argument, a NaN one ignored.
+    FMin,
+    /// `fmax`, `fmaxf`: the larger argument, a NaN one ignored.
+    FMax,
+    /// `fma`, `fmaf`: `x * y + z`, rounded once.
+    Fma,
     /// `memcpy`, `memset`, `memmove`: a block memory function of
     /// `<string.h>`, as its IR operation.
     Memory(MemoryFn),
@@ -113,8 +119,8 @@ impl InlineLibraryFn {
     /// How many arguments the function takes.
     pub fn arity(self) -> usize {
         match self {
-            InlineLibraryFn::Memory(_) => 3,
-            InlineLibraryFn::CopySign => 2,
+            InlineLibraryFn::Memory(_) | InlineLibraryFn::Fma => 3,
+            InlineLibraryFn::CopySign | InlineLibraryFn::FMin | InlineLibraryFn::FMax => 2,
             InlineLibraryFn::IntAbs
             | InlineLibraryFn::Fabs
             | InlineLibraryFn::ComplexReal
@@ -171,6 +177,9 @@ impl InlineLibraryFn {
             self,
             InlineLibraryFn::Sqrt(_)
                 | InlineLibraryFn::RoundToIntegral(_)
+                | InlineLibraryFn::FMin
+                | InlineLibraryFn::FMax
+                | InlineLibraryFn::Fma
                 | InlineLibraryFn::Memory(_)
         )
     }
@@ -2484,6 +2493,11 @@ mod tests {
         assert!(InlineLibraryFn::Sqrt(MathErrno::Set).yields_to_a_definition());
         assert!(InlineLibraryFn::RoundToIntegral(IntegralRounding::Rint).yields_to_a_definition());
         assert!(InlineLibraryFn::Memory(MemoryFn::Move).yields_to_a_definition());
+        assert!(InlineLibraryFn::Fma.yields_to_a_definition());
+        assert!(InlineLibraryFn::FMin.yields_to_a_definition());
+        assert_eq!(InlineLibraryFn::Fma.arity(), 3);
+        assert_eq!(InlineLibraryFn::FMax.arity(), 2);
+        assert!(!InlineLibraryFn::FMin.narrows_exactly());
         for f in [
             InlineLibraryFn::IntAbs,
             InlineLibraryFn::Fabs,

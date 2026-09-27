@@ -737,7 +737,12 @@ impl Aarch64CodeGen {
             }
 
             // Floating-point arithmetic operations
-            Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv => {
+            Opcode::FAdd
+            | Opcode::FSub
+            | Opcode::FMul
+            | Opcode::FDiv
+            | Opcode::FMin
+            | Opcode::FMax => {
                 self.emit_fp_binop(insn, types);
             }
 
@@ -817,6 +822,7 @@ impl Aarch64CodeGen {
             Opcode::CopySign => self.emit_fp_copysign(insn, types),
             Opcode::Sqrt => self.emit_fp_sqrt(insn, types),
             Opcode::RoundToIntegral(how) => self.emit_fp_round_to_integral(insn, how, types),
+            Opcode::Fma => self.emit_fp_fma(insn, types),
             Opcode::Signbit => self.emit_fp_signbit(insn, types),
 
             Opcode::Unreachable => {

@@ -174,6 +174,13 @@ pub enum Opcode {
     // the width of `typ`: the integer it rounds to, with its sign. Named in
     // `func_name` like `Sqrt`.
     RoundToIntegral(IntegralRounding),
+    // `fmin` and `fmax` of src[0] and src[1], at the width of `typ`: a NaN
+    // operand is ignored for the other. Named in `func_name` like `Sqrt`.
+    FMin,
+    FMax,
+    // `fma`: src[0] * src[1] + src[2], rounded once, at the width of `typ`.
+    // Named in `func_name` like `Sqrt`.
+    Fma,
 
     // Type conversions
     Trunc, // Truncate to smaller integer
@@ -367,7 +374,10 @@ impl Opcode {
     /// Whether this opcode computes a libm function, which its instruction
     /// names in `func_name` for a target that calls the function instead.
     pub fn is_libm(&self) -> bool {
-        matches!(self, Opcode::Sqrt | Opcode::RoundToIntegral(_))
+        matches!(
+            self,
+            Opcode::Sqrt | Opcode::RoundToIntegral(_) | Opcode::FMin | Opcode::FMax | Opcode::Fma
+        )
     }
 
     /// Check if this opcode has side effects (cannot be deleted even if unused).
@@ -478,6 +488,9 @@ impl Opcode {
             Opcode::Fabs => "fabs",
             Opcode::CopySign => "copysign",
             Opcode::Sqrt => "sqrt",
+            Opcode::FMin => "fmin",
+            Opcode::FMax => "fmax",
+            Opcode::Fma => "fma",
             Opcode::RoundToIntegral(how) => match how {
                 IntegralRounding::Floor => "ffloor",
                 IntegralRounding::Ceil => "fceil",
@@ -3222,6 +3235,19 @@ mod tests {
             ["ffloor", "fceil", "ftrunc", "fround", "frint", "fnearbyint"]
         );
         assert_ne!(Opcode::RoundToIntegral(Trunc).name(), Opcode::Trunc.name());
+    }
+
+    /// `fmin`, `fmax` and `fma` are libm opcodes like the rest.
+    #[test]
+    fn test_min_max_fma_opcodes() {
+        for (op, name) in [
+            (Opcode::FMin, "fmin"),
+            (Opcode::FMax, "fmax"),
+            (Opcode::Fma, "fma"),
+        ] {
+            assert_eq!(op.name(), name);
+            assert!(op.is_libm() && !op.is_terminator() && !op.has_side_effects());
+        }
     }
 
     #[test]

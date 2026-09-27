@@ -399,6 +399,25 @@ impl Aarch64CodeGen {
                     dst: work_reg,
                 });
             }
+            // `fmin` and `fmax`: the `nm` forms, which answer the number for
+            // a quiet NaN operand, as C asks. A binary128 one is a call by
+            // now (see `arch::mapping::call_library_fallbacks`).
+            Opcode::FMin => {
+                self.push_lir(Aarch64Inst::Fminnm {
+                    size: fp_size,
+                    src1: VReg::V17,
+                    src2: VReg::V18,
+                    dst: work_reg,
+                });
+            }
+            Opcode::FMax => {
+                self.push_lir(Aarch64Inst::Fmaxnm {
+                    size: fp_size,
+                    src1: VReg::V17,
+                    src2: VReg::V18,
+                    dst: work_reg,
+                });
+            }
             _ => return,
         }
 
@@ -455,6 +474,37 @@ impl Aarch64CodeGen {
             debug_assert!(size != FpSize::Quad, "binary128 sqrt is a call");
             cg.push_lir(Aarch64Inst::Fsqrt { size, src, dst });
         });
+    }
+
+    /// Emit `Fma` of `float` or `double` operands: `fmadd`, rounded once.
+    /// The three are staged in the scratch registers before the destination,
+    /// which may be one of their registers, is written. A binary128 one is a
+    /// call by now, as for `Sqrt`.
+    pub(super) fn emit_fp_fma(&mut self, insn: &Instruction, types: &TypeTable) {
+        let (Some(target), [x, y, z]) = (insn.target, insn.src.as_slice()) else {
+            return;
+        };
+        let size = Self::size_from_type(insn.typ, insn.size, types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
+        debug_assert!(fp_size != FpSize::Quad, "a binary128 fma is a call");
+        let dst_loc = self.get_location(target);
+        let work_reg = match &dst_loc {
+            Loc::VReg(v) => *v,
+            _ => VReg::V16,
+        };
+        self.emit_fp_move(*x, VReg::V17, insn.typ, size, types);
+        self.emit_fp_move(*y, VReg::V18, insn.typ, size, types);
+        self.emit_fp_move(*z, VReg::V16, insn.typ, size, types);
+        self.push_lir(Aarch64Inst::Fmadd {
+            size: fp_size,
+            src1: VReg::V17,
+            src2: VReg::V18,
+            addend: VReg::V16,
+            dst: work_reg,
+        });
+        if !matches!(&dst_loc, Loc::VReg(v) if *v == work_reg) {
+            self.emit_fp_move_to_loc(work_reg, &dst_loc, insn.typ, size, types);
+        }
     }
 
     /// Emit `RoundToIntegral` of a `float` or `double`: the `frint`

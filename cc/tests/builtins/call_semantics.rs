@@ -139,6 +139,23 @@ const PARITY: &[(&str, &str, &str)] = &[
     ("double F(double)", "floor(s)", "struct S { double a; } s;"),
     ("double F(double)", "__builtin_ceil(p)", "int *p = 0;"),
     ("float F(float)", "__builtin_floorf(p)", "int *p = 0;"),
+    (
+        "double F(double, double)",
+        "fmin(s, 1.0)",
+        "struct S { double a; } s;",
+    ),
+    (
+        "float F(float, float)",
+        "__builtin_fmaxf(1.0f, p)",
+        "int *p = 0;",
+    ),
+    (
+        "double F(double, double, double)",
+        "fma(1.0, s, 2.0)",
+        "struct S { double a; } s;",
+    ),
+    ("float F(float, float, float)", "fmaf(1.0f, 2.0f)", ""),
+    ("double F(double, double)", "__builtin_fmin(1.0)", ""),
     ("float F(float)", "rintf(s)", "struct S { float a; } s;"),
     ("double F(double)", "nearbyint(1.0, 2.0)", ""),
     ("float F(float)", "roundf()", ""),
@@ -227,6 +244,8 @@ fn builtin_library_call_arguments_are_checked_like_a_call() {
                  double sqrt(double); float sqrtf(float); long double sqrtl(long double);\n\
                  double nearbyint(double); float floorf(float); float rintf(float);\n\
                  float roundf(float); double trunc(double);\n\
+                 double fmin(double, double); float fmaxf(float, float);\n\
+                 double fma(double, double, double); float fmaf(float, float, float);\n\
                  unsigned long strlen(const char *);\n";
     for (proto, call, pre) in PARITY {
         // The ordinary call: the builtin's name replaced by `F`, declared with

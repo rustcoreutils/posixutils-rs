@@ -635,6 +635,31 @@ pub enum Aarch64Inst {
         dst: VReg,
     },
 
+    /// FMINNM - FP minimum, a quiet NaN operand ignored for the other
+    Fminnm {
+        size: FpSize,
+        src1: VReg,
+        src2: VReg,
+        dst: VReg,
+    },
+
+    /// FMAXNM - FP maximum, a quiet NaN operand ignored for the other
+    Fmaxnm {
+        size: FpSize,
+        src1: VReg,
+        src2: VReg,
+        dst: VReg,
+    },
+
+    /// FMADD - fused multiply-add: dst = src1 * src2 + addend, rounded once
+    Fmadd {
+        size: FpSize,
+        src1: VReg,
+        src2: VReg,
+        addend: VReg,
+        dst: VReg,
+    },
+
     /// FNEG - FP negate
     Fneg {
         size: FpSize,
@@ -1283,6 +1308,35 @@ impl EmitAsm for Aarch64Inst {
                 src2,
                 dst,
             } => Self::emit_fp3("fdiv", size, src1, src2, dst, out),
+            Aarch64Inst::Fminnm {
+                size,
+                src1,
+                src2,
+                dst,
+            } => Self::emit_fp3("fminnm", size, src1, src2, dst, out),
+            Aarch64Inst::Fmaxnm {
+                size,
+                src1,
+                src2,
+                dst,
+            } => Self::emit_fp3("fmaxnm", size, src1, src2, dst, out),
+            Aarch64Inst::Fmadd {
+                size,
+                src1,
+                src2,
+                addend,
+                dst,
+            } => {
+                let reg = |r: &VReg| r.name_for_size(size_bits(*size));
+                let _ = writeln!(
+                    out,
+                    "    fmadd {}, {}, {}, {}",
+                    reg(dst),
+                    reg(src1),
+                    reg(src2),
+                    reg(addend)
+                );
+            }
             Aarch64Inst::Fneg { size, src, dst } => {
                 let _ = writeln!(
                     out,
@@ -2105,6 +2159,28 @@ mod tests {
             dst: VReg::V3,
         };
         assert_eq!(emitted(inst), "fsqrt s3, s0");
+        let inst = Aarch64Inst::Fminnm {
+            size: FpSize::Double,
+            src1: VReg::V1,
+            src2: VReg::V2,
+            dst: VReg::V0,
+        };
+        assert_eq!(emitted(inst), "fminnm d0, d1, d2");
+        let inst = Aarch64Inst::Fmaxnm {
+            size: FpSize::Single,
+            src1: VReg::V1,
+            src2: VReg::V2,
+            dst: VReg::V0,
+        };
+        assert_eq!(emitted(inst), "fmaxnm s0, s1, s2");
+        let inst = Aarch64Inst::Fmadd {
+            size: FpSize::Double,
+            src1: VReg::V17,
+            src2: VReg::V18,
+            addend: VReg::V16,
+            dst: VReg::V3,
+        };
+        assert_eq!(emitted(inst), "fmadd d3, d17, d18, d16");
     }
 
     #[test]

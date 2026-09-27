@@ -794,21 +794,23 @@ int main(void) {
 /// ieee/20030331-1 defines `float rintf()` so) -- as under gcc, which folds
 /// only `abs`, `fabs`, `copysign` and the like regardless.
 const OWN_DEFINITIONS_PROGRAM: &str = r#"
-double sqrt(double); double floor(double);
+double sqrt(double); double floor(double); double fma(double, double, double);
 static volatile int calls;
 double sqrt(double x) { calls++; return x + 100.0; }
 static double use_floor(double x) { return floor(x); }
 double floor(double x) { calls++; return x + 200.0; }
 float x = -1.5f;
 float rintf() { calls++; return x + 300.0f; }
+double fma(double a, double b, double c) { calls++; return a + b + c; }
 int main(void) {
     volatile double v = 4.0;
     if (sqrt(v) != 104.0 || use_floor(v) != 204.0 || rintf() != 298.5f) return 1;
-    if (calls != 3) return 2;
+    if (fma(v, v, v) != 12.0) return 4;
+    if (calls != 4) return 2;
     /* Not pure any more: an untaken arm does not call. */
     volatile int no = 0;
     double r = no ? floor(v) : 1.0;
-    if (r != 1.0 || calls != 3) return 3;
+    if (r != 1.0 || calls != 4) return 3;
     return 0;
 }
 "#;
@@ -816,4 +818,294 @@ int main(void) {
 #[test]
 fn libm_own_definition_is_called() {
     run_everywhere("own_defs", OWN_DEFINITIONS_PROGRAM, &[], false);
+}
+
+// ============================================================================
+// fmin, fmax, fma and their f forms
+// ============================================================================
+
+/// Run-time values bit for bit against glibc's, which agree on x86-64 and
+/// aarch64 except where C leaves the answer open: the signed zeros of
+/// `fmin` and `fmax` (glibc's x86-64 functions answer the first operand;
+/// aarch64's `fminnm` and `fmaxnm`, and gcc's fold, the -0 and +0), checked
+/// on aarch64 only, and which NaN two NaNs give, checked for being one. The
+/// `fma` cases are the ones a separate multiply and add get wrong: the
+/// product's low half cancelling against the addend, a tie decided by the
+/// bits below it, an overflow, and a subnormal result.
+const MIN_MAX_FMA_PROGRAM: &str = r#"
+typedef unsigned long long u64; typedef unsigned int u32;
+double fmin(double, double); double fmax(double, double); double fma(double, double, double);
+float fminf(float, float); float fmaxf(float, float); float fmaf(float, float, float);
+static u64 dbits(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
+static double dfrom(u64 u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
+static u32 fbits(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
+static float ffrom(u32 u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
+#define N(a) (int)(sizeof(a) / sizeof((a)[0]))
+static const u64 dfma[][4] = {
+    {0x3ff0000000000001, 0x3fefffffffffffff, 0xbff0000000000000, 0x3c9ffffffffffffe},
+    {0x3fb999999999999a, 0x4024000000000000, 0xbff0000000000000, 0x3c90000000000000},
+    {0x4000000000000000, 0x4008000000000000, 0x4010000000000000, 0x4024000000000000},
+    {0x8000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x0000000000000000},
+    {0x8000000000000000, 0x3ff0000000000000, 0x8000000000000000, 0x8000000000000000},
+    {0x7fe0000000000000, 0x4000000000000000, 0xffe0000000000000, 0x7fe0000000000000},
+    {0x0010000000000000, 0x3fe0000000000000, 0x0000000000000001, 0x0008000000000001},
+    {0x3ff5555555555555, 0x4008000000000000, 0xc010000000000000, 0xbcb0000000000000},
+    {0x4340000000000001, 0x3ff0000000000001, 0xc340000000000002, 0x3cc0000000000000},
+    {0x3ff0000000000000, 0x3ff0000000000000, 0x3ca0000000000000, 0x3ff0000000000000},
+    {0x3ff0000000000000, 0x3ff0000000000001, 0x3ca0000000000000, 0x3ff0000000000002},
+    {0x7fefffffffffffff, 0x4000000000000000, 0x0000000000000000, 0x7ff0000000000000},
+};
+static const u32 ffma[][4] = {
+    {0x3f800001, 0x3f7fffff, 0xbf800000, 0x337ffffe},
+    {0x3dcccccd, 0x41200000, 0xbf800000, 0x32800000},
+    {0x40000000, 0x40400000, 0x40800000, 0x41200000},
+    {0x80000000, 0x3f800000, 0x00000000, 0x00000000},
+    {0x7f000000, 0x40000000, 0xff000000, 0x7f000000},
+    {0x00800000, 0x3f000000, 0x00000001, 0x00400001},
+    {0x3faaaaab, 0x40400000, 0xc0800000, 0x34000000},
+    {0x7f7fffff, 0x40000000, 0x00000000, 0x7f800000},
+};
+/* x, y, fmin, fmax: ordered pairs both ways, -inf, a quiet NaN on each
+   side, two negatives, inf against the smallest subnormal, a tie. */
+static const u64 dmm[][4] = {
+    {0x3ff0000000000000, 0x4000000000000000, 0x3ff0000000000000, 0x4000000000000000},
+    {0x4000000000000000, 0x3ff0000000000000, 0x3ff0000000000000, 0x4000000000000000},
+    {0xfff0000000000000, 0x4008000000000000, 0xfff0000000000000, 0x4008000000000000},
+    {0x7ff8000000001234, 0x4008000000000000, 0x4008000000000000, 0x4008000000000000},
+    {0x4008000000000000, 0x7ff8000000001234, 0x4008000000000000, 0x4008000000000000},
+    {0xc000000000000000, 0xbff0000000000000, 0xc000000000000000, 0xbff0000000000000},
+    {0x7ff0000000000000, 0x0000000000000001, 0x0000000000000001, 0x7ff0000000000000},
+    {0x3ff0000000000000, 0x3ff0000000000000, 0x3ff0000000000000, 0x3ff0000000000000},
+};
+static const u32 fmm[][4] = {
+    {0x3f800000, 0x40000000, 0x3f800000, 0x40000000},
+    {0x40000000, 0x3f800000, 0x3f800000, 0x40000000},
+    {0xff800000, 0x40400000, 0xff800000, 0x40400000},
+    {0x7fc01234, 0x40400000, 0x40400000, 0x40400000},
+    {0x40400000, 0x7fc01234, 0x40400000, 0x40400000},
+    {0xc0000000, 0xbf800000, 0xc0000000, 0xbf800000},
+};
+static int check_fma(void) {
+    for (int i = 0; i < N(dfma); i++) {
+        volatile double x = dfrom(dfma[i][0]), y = dfrom(dfma[i][1]), z = dfrom(dfma[i][2]);
+        if (dbits(fma(x, y, z)) != dfma[i][3]) return 1;
+        if (dbits(__builtin_fma(x, y, z)) != dfma[i][3]) return 2;
+    }
+    for (int i = 0; i < N(ffma); i++) {
+        volatile float x = ffrom(ffma[i][0]), y = ffrom(ffma[i][1]), z = ffrom(ffma[i][2]);
+        if (fbits(fmaf(x, y, z)) != ffma[i][3]) return 3;
+        if (fbits(__builtin_fmaf(x, y, z)) != ffma[i][3]) return 4;
+    }
+    volatile double nan = __builtin_nan(""), one = 1.0;
+    if (!__builtin_isnan(fma(nan, one, one)) || !__builtin_isnan(fma(one, one, nan))) return 5;
+    return 0;
+}
+static int check_min_max(void) {
+    for (int i = 0; i < N(dmm); i++) {
+        volatile double x = dfrom(dmm[i][0]), y = dfrom(dmm[i][1]);
+        if (dbits(fmin(x, y)) != dmm[i][2] || dbits(__builtin_fmin(x, y)) != dmm[i][2]) return 11;
+        if (dbits(fmax(x, y)) != dmm[i][3] || dbits(__builtin_fmax(x, y)) != dmm[i][3]) return 12;
+    }
+    for (int i = 0; i < N(fmm); i++) {
+        volatile float x = ffrom(fmm[i][0]), y = ffrom(fmm[i][1]);
+        if (fbits(fminf(x, y)) != fmm[i][2] || fbits(__builtin_fminf(x, y)) != fmm[i][2]) return 13;
+        if (fbits(fmaxf(x, y)) != fmm[i][3] || fbits(__builtin_fmaxf(x, y)) != fmm[i][3]) return 14;
+    }
+    volatile double n1 = __builtin_nan("1"), n2 = __builtin_nan("2");
+    if (!__builtin_isnan(fmin(n1, n2)) || !__builtin_isnan(fmax(n1, n2))) return 15;
+#ifdef __aarch64__
+    volatile double pz = 0.0, nz = -0.0;
+    if (dbits(fmin(pz, nz)) != 0x8000000000000000 || dbits(fmin(nz, pz)) != 0x8000000000000000) return 16;
+    if (dbits(fmax(pz, nz)) != 0 || dbits(fmax(nz, pz)) != 0) return 17;
+#endif
+    return 0;
+}
+/* Constants, which fold: the same answers, and gcc's for the zeros. */
+static int check_constants(void) {
+    if (dbits(fma(0x1.0000000000001p0, 0x1.fffffffffffffp-1, -1.0)) != 0x3c9ffffffffffffe) return 21;
+    if (dbits(fma(0.1, 10.0, -1.0)) != 0x3c90000000000000) return 22;
+    if (fbits(fmaf(0x1.000002p0f, 0x1.fffffep-1f, -1.0f)) != 0x337ffffe) return 23;
+#if defined(__OPTIMIZE__) || defined(__aarch64__)
+    /* Folded, or fminnm: at -O0 on x86-64 the call is glibc's, which
+       answers the first operand. */
+    if (dbits(fmin(0.0, -0.0)) != 0x8000000000000000 || dbits(fmin(-0.0, 0.0)) != 0x8000000000000000) return 24;
+    if (dbits(fmax(0.0, -0.0)) != 0 || dbits(fmax(-0.0, 0.0)) != 0) return 25;
+#endif
+    if (fmin(__builtin_nan(""), 3.0) != 3.0 || fmaxf(2.0f, __builtin_nanf("")) != 2.0f) return 26;
+    if (fmin(-__builtin_inf(), 1.0) != -__builtin_inf()) return 27;
+    return 0;
+}
+int main(void) {
+    int rc;
+    if ((rc = check_fma()) || (rc = check_min_max())) return rc;
+    return check_constants();
+}
+"#;
+
+#[test]
+fn libm_min_max_fma_values() {
+    run_everywhere("min_max_fma", MIN_MAX_FMA_PROGRAM, &[], true);
+}
+
+/// On aarch64 all six are instructions, so the program needs no libm once
+/// optimizing -- and at `-O0` only through the `__builtin_` spellings.
+#[test]
+fn libm_min_max_fma_on_aarch64_need_no_libm() {
+    let code = r#"
+double fmin(double, double); double fmax(double, double); double fma(double, double, double);
+float fminf(float, float); float fmaxf(float, float); float fmaf(float, float, float);
+int main(void) {
+    volatile double a = 2.0, b = -3.0, c = 0.5;
+    volatile float x = 2.0f, y = -3.0f, z = 0.5f;
+    if (__builtin_fmin(a, b) != -3.0 || __builtin_fmax(a, b) != 2.0) return 1;
+    if (__builtin_fma(a, b, c) != -5.5) return 2;
+    if (__builtin_fminf(x, y) != -3.0f || __builtin_fmaxf(x, y) != 2.0f) return 3;
+    if (__builtin_fmaf(x, y, z) != -5.5f) return 4;
+#ifdef __OPTIMIZE__
+    if (fmin(a, b) != -3.0 || fmax(a, b) != 2.0 || fma(a, b, c) != -5.5) return 5;
+    if (fminf(x, y) != -3.0f || fmaxf(x, y) != 2.0f || fmaf(x, y, z) != -5.5f) return 6;
+#endif
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        if let Some(rc) =
+            compile_and_run_aarch64_with(&format!("mmf_nolibm{opt}"), code, &[opt], &[])
+        {
+            assert_eq!(rc, 0, "aarch64 {opt}");
+        }
+    }
+}
+
+const MIN_MAX_FMA_NAMES: [&str; 6] = ["fmin", "fmax", "fma", "fminf", "fmaxf", "fmaf"];
+
+/// A function computing each of the six, spelled `prefix` + name.
+fn min_max_fma_source(prefix: &str) -> String {
+    let mut src = String::from(
+        "double fmin(double, double); double fmax(double, double);\n\
+         double fma(double, double, double); float fminf(float, float);\n\
+         float fmaxf(float, float); float fmaf(float, float, float);\n",
+    );
+    for name in MIN_MAX_FMA_NAMES {
+        let t = if name.ends_with('f') {
+            "float"
+        } else {
+            "double"
+        };
+        let (params, args) = if name == "fma" || name == "fmaf" {
+            (format!("{t} x, {t} y, {t} z"), "x, y, z")
+        } else {
+            (format!("{t} x, {t} y"), "x, y")
+        };
+        src.push_str(&format!(
+            "{t} t_{name}({params}) {{ return {prefix}{name}({args}); }}\n"
+        ));
+    }
+    src
+}
+
+/// `fminnm`, `fmaxnm` and `fmadd` on aarch64, as gcc emits them; calls on
+/// x86-64, whose baseline has no FMA and whose `minsd` is not `fmin`, as in
+/// gcc. At `-O0` the bare spellings are calls everywhere.
+#[test]
+fn libm_min_max_fma_instructions() {
+    for prefix in ["", "__builtin_"] {
+        let [(_, host), (_, a64)] = asm_both("mmf_o2", &min_max_fma_source(prefix), &["-O2"]);
+        for insn in ["fminnm", "fmaxnm", "fmadd"] {
+            assert!(has_insn(&a64, insn), "{prefix}: no {insn}:\n{a64}");
+        }
+        assert!(!calls_any(&a64, &MIN_MAX_FMA_NAMES), "{prefix}:\n{a64}");
+        if cfg!(target_arch = "x86_64") {
+            for name in MIN_MAX_FMA_NAMES {
+                assert!(
+                    calls_any(&host, &[name]),
+                    "{prefix}: {name} not called:\n{host}"
+                );
+            }
+        }
+    }
+    for (target, asm) in asm_both("mmf_o0", &min_max_fma_source(""), &["-O0"]) {
+        for name in MIN_MAX_FMA_NAMES {
+            assert!(
+                calls_any(&asm, &[name]),
+                "{target}: {name} not called:\n{asm}"
+            );
+        }
+    }
+    let [_, (_, a64)] = asm_both("mmf_o0_b", &min_max_fma_source("__builtin_"), &["-O0"]);
+    assert!(!calls_any(&a64, &MIN_MAX_FMA_NAMES), "{a64}");
+}
+
+/// `-fno-builtin-fma` keeps the call to `fma`, and only that one.
+#[test]
+fn libm_fma_fno_builtin_keeps_the_call() {
+    let src = "double fma(double, double, double); double fmin(double, double);\n\
+               double f(double x, double y) { return fma(x, y, x) + fmin(x, y); }\n";
+    let asm = asm_for_at(
+        "fma_nb",
+        src,
+        &[
+            "-O2",
+            "-fno-builtin-fma",
+            "--target",
+            "aarch64-unknown-linux-gnu",
+        ],
+    );
+    assert!(
+        calls_any(&asm, &["fma"]) && !has_insn(&asm, "fmadd"),
+        "{asm}"
+    );
+    assert!(
+        has_insn(&asm, "fminnm") && !calls_any(&asm, &["fmin"]),
+        "{asm}"
+    );
+}
+
+/// Constants fold on both targets -- on x86-64 too, where the function is
+/// otherwise a call -- exactly: `fma` rounds once, and the zeros of `fmin`
+/// and `fmax` fold to gcc's -0 and +0. In a static initializer gcc refuses a
+/// NaN argument, and so does this.
+#[test]
+fn libm_min_max_fma_of_constants() {
+    let src = "double fmin(double, double); double fmax(double, double);\n\
+               double fma(double, double, double);\n\
+               double f(void) { return fmin(1.0, 2.0) + fmax(-1.0, __builtin_nan(\"\"))\n\
+               + fma(0x1.0000000000001p0, 0x1.fffffffffffffp-1, -1.0)\n\
+               + __builtin_fmaf(2.0f, 3.0f, 4.0f); }\n";
+    for (target, asm) in asm_both("mmf_fold", src, &["-O2"]) {
+        assert!(!calls_any(&asm, &MIN_MAX_FMA_NAMES), "{target}:\n{asm}");
+        assert!(
+            !asm.contains("fminnm") && !asm.contains("fmadd"),
+            "{target}:\n{asm}"
+        );
+    }
+
+    let code = r#"
+typedef unsigned long long u64;
+double fmin(double, double); double fmax(double, double);
+double fma(double, double, double); float fmaf(float, float, float);
+static double a = fmin(0.0, -0.0);
+static double b = fmax(-0.0, 0.0);
+static double c = fma(0x1.0000000000001p0, 0x1.fffffffffffffp-1, -1.0);
+static float d = fmaf(2.0f, 3.0f, 4.0f);
+static double e = fmin(-2.0, 1.0);
+int main(void) {
+    u64 u;
+    __builtin_memcpy(&u, &a, 8);
+    if (u != 0x8000000000000000ULL) return 1;
+    __builtin_memcpy(&u, &b, 8);
+    if (u != 0) return 2;
+    __builtin_memcpy(&u, &c, 8);
+    if (u != 0x3c9ffffffffffffeULL) return 3;
+    if (d != 10.0f || e != -2.0) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("mmf_static", code, &[]), 0);
+    compile_expect_error(
+        "fmin_static_nan",
+        "double fmin(double, double);\nstatic double z = fmin(__builtin_nan(\"\"), 3.0);\n\
+         double *p = &z;\n",
+        "cannot initialize an object with static storage duration",
+    );
 }

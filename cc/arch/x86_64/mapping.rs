@@ -56,6 +56,10 @@ impl ArchMapper for X86_64Mapper {
     /// through a truncating conversion, `rint` by adding and subtracting
     /// 2^52. `round` has no such sequence and gcc calls it; nor does
     /// `nearbyint`, which must not raise *inexact* where the `rint` one does.
+    ///
+    /// `fmin`, `fmax` and `fma` are calls too, as in gcc: the baseline has no
+    /// FMA, and `minsd` is not `fmin` -- it answers its second operand for a
+    /// NaN where C asks for the number.
     fn computes_in_place(&self, op: Opcode, fmt: FpFormat) -> bool {
         let sse = matches!(fmt, FpFormat::Binary32 | FpFormat::Binary64);
         match op {

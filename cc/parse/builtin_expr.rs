@@ -2452,17 +2452,11 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_FFS
                 | crate::kw::BUILTIN_FFSL
                 | crate::kw::BUILTIN_FFSLL
-                | crate::kw::BUILTIN_FMAX
-                | crate::kw::BUILTIN_FMAXF
                 | crate::kw::BUILTIN_FMAXL
-                | crate::kw::BUILTIN_FMIN
-                | crate::kw::BUILTIN_FMINF
                 | crate::kw::BUILTIN_FMINL
                 | crate::kw::BUILTIN_POW
                 | crate::kw::BUILTIN_POWF
                 | crate::kw::BUILTIN_POWL
-                | crate::kw::BUILTIN_FMA
-                | crate::kw::BUILTIN_FMAF
                 | crate::kw::BUILTIN_FMAL
                 | crate::kw::BUILTIN_BCMP
                 | crate::kw::BUILTIN_BZERO

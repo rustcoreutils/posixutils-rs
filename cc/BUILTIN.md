@@ -111,11 +111,11 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 
 `abs`, `labs`, `llabs`, `imaxabs`, `fabs`, `fabsf`, `fabsl`, `copysign`,
 `copysignf`, `copysignl`, `sqrt`, `sqrtf`, `sqrtl`, `floor`, `ceil`,
-`trunc`, `round`, `rint`, `nearbyint` and their `f` forms, `creal`, `cimag`
-and `conj` in each precision, and `memcpy`, `memset` and `memmove` are known
-to c17 by prototype, under their bare names and their `__builtin_`
-spellings. One table in `parse/library_builtin.rs` gives each its prototype
-and what it computes.
+`trunc`, `round`, `rint`, `nearbyint`, `fmin`, `fmax` and `fma` and their
+`f` forms, `creal`, `cimag` and `conj` in each precision, and `memcpy`,
+`memset` and `memmove` are known to c17 by prototype, under their bare names
+and their `__builtin_` spellings. One table in `parse/library_builtin.rs`
+gives each its prototype and what it computes.
 
 A `memcpy` or `memset` whose length is a constant of at most 128 bytes, or a
 `memmove` of at most 64, is expanded into integer loads and stores of 8, 4, 2
@@ -136,11 +136,11 @@ At `-O0`, as in gcc, a libm function named by its bare spelling (`sqrt`) is
 called rather than computed, and so is one that must still set `errno`
 whatever its spelling; the magnitudes, `copysign` and the complex accessors
 are computed in place at every level, and the block memory functions are
-their IR operation at every level. A libm function computed in place is
-one IR opcode keyed on its type; where the target has no instruction for
-that type (binary128 on aarch64, `round` and `nearbyint` on x86-64) it
-becomes a call to the library function again after the optimizer, which
-could still fold it.
+their IR operation at every level. A libm function computed in place is one
+IR opcode keyed on its type; where the target has no instruction for that
+type (binary128 on aarch64; `round`, `nearbyint`, `fmin`, `fmax` and `fma`
+on x86-64) it becomes a call to the library function again after the
+optimizer, which could still fold it.
 
 However it is evaluated, what the program wrote is a call (C17 7.1.4p1). The
 arguments are checked exactly as an ordinary call to a function of that
@@ -170,9 +170,9 @@ call.
 | `__builtin_flt_rounds()` | Current FP rounding mode |
 | `__builtin_isinf_sign(x)` | +1 for +inf, -1 for -inf, 0 otherwise |
 | `sqrt(x)`, `sqrtf`, `sqrtl` and their `__builtin_` spellings | The correctly rounded square root, by the instruction: `sqrtsd`/`sqrtss` and x87 `fsqrt` on x86-64, `fsqrt` on aarch64; binary128 (`sqrtl` on aarch64 Linux) is a call. As in gcc, an argument below zero -- an ordered `x < 0`, so not `-0` and not a NaN -- still goes to the library, which sets `errno` to `EDOM`; `-fno-math-errno` drops that call and the program needs no libm. A constant argument folds, in a static initializer too, exactly as the instruction rounds it; a negative one is left to run time, and in a static initializer is not a constant. Under `-fno-math-errno`, `sqrt(x) < 0` folds to 0. Displaced like `fabs`, and also, as in gcc, by the translation unit's own definition of the function, wherever it is: its calls, above the definition too, reach it |
-| `__builtin_fmax(x, y)`, `fmaxf`, `fmaxl`, `__builtin_fmin(x, y)`, `fminf`, `fminl` | Larger and smaller of two values |
+| `fmin(x, y)`, `fmax(x, y)`, `fma(x, y, z)`, their `f` forms, and their `__builtin_` spellings | The smaller and larger of two values -- a quiet NaN argument ignored for the other -- and `x * y + z` rounded once. `fminnm`, `fmaxnm` and `fmadd` on aarch64; calls on x86-64, as in gcc, whose baseline has no FMA and whose `minsd` does not ignore a NaN. Constants fold on both targets, exactly: `fma` with one rounding, and the zeros C leaves open as gcc folds them and `fminnm` answers, `fmin(+0, -0)` -0 and `fmax(-0, +0)` +0 (glibc's x86-64 functions answer the first argument). In a static initializer a NaN argument is not a constant, as in gcc. The `l` forms are library aliases (below). Displaced like `sqrt`, a definition included |
+| `__builtin_fmaxl`, `fminl`, `fmal` | The `long double` forms |
 | `__builtin_pow(x, y)`, `powf`, `powl` | `x` raised to `y` |
-| `__builtin_fma(x, y, z)`, `fmaf`, `fmal` | `x * y + z`, rounded once |
 | `__builtin_ceill`, `floorl`, `truncl`, `roundl`, `rintl`, `nearbyintl` | The `long double` roundings |
 | `__builtin_cbrt` | And its `f` and `l` spellings |
 | `__builtin_sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` | And their `f` and `l` spellings |

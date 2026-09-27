@@ -2479,6 +2479,8 @@ mod tests {
         assert!(!is_call_like_aarch64(Opcode::Fabs));
         assert!(!is_call_like_aarch64(Opcode::CopySign));
         assert!(!is_call_like_aarch64(Opcode::Sqrt));
+        assert!(!is_call_like_aarch64(Opcode::Fma));
+        assert!(!is_call_like_aarch64(Opcode::FMin));
         assert!(!is_call_like_aarch64(Opcode::RoundToIntegral(
             crate::float::IntegralRounding::Floor
         )));

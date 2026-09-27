@@ -1056,6 +1056,14 @@ impl U256 {
         }
     }
 
+    fn trailing_zeros(self) -> u32 {
+        if self.lo == 0 {
+            128 + self.hi.trailing_zeros()
+        } else {
+            self.lo.trailing_zeros()
+        }
+    }
+
     fn add(self, o: Self) -> Self {
         let (lo, carry) = self.lo.overflowing_add(o.lo);
         U256 {
@@ -1441,6 +1449,143 @@ impl FloatVal {
             inexact,
             fmt,
         ))
+    }
+
+    /// The smaller of two values, as `fmin` computes it: a NaN operand is
+    /// ignored for the other, and of two zeros `-0` is the smaller.
+    ///
+    /// C leaves the zeros to the implementation (F.10.9.2); `-0` is what
+    /// aarch64's `fminnm` answers and what gcc folds. glibc's x86-64 `fmin`
+    /// answers its first operand instead, so there the fold and the call can
+    /// disagree, as they do under gcc. Two NaNs give the first, quiet. `None`
+    /// for a signalling NaN, which raises *invalid*.
+    pub fn fmin(self, other: Self, fmt: FpFormat) -> Option<Self> {
+        self.min_max(other, fmt, std::cmp::Ordering::Less)
+    }
+
+    /// The larger of two values, as `fmax` computes it: [`Self::fmin`]'s
+    /// rules, with `+0` the larger of two zeros.
+    pub fn fmax(self, other: Self, fmt: FpFormat) -> Option<Self> {
+        self.min_max(other, fmt, std::cmp::Ordering::Greater)
+    }
+
+    /// `fmin` (`want` Less) or `fmax` (`want` Greater).
+    fn min_max(self, other: Self, fmt: FpFormat, want: std::cmp::Ordering) -> Option<Self> {
+        let (a, b) = (self.round_to_format(fmt), other.round_to_format(fmt));
+        if a.is_signalling_nan() || b.is_signalling_nan() {
+            return None;
+        }
+        if a.is_nan() {
+            return Some(if b.is_nan() { a } else { b });
+        }
+        if b.is_nan() {
+            return Some(a);
+        }
+        if a.is_zero() && b.is_zero() {
+            // -0 below +0, for this purpose only.
+            let neg = if want == std::cmp::Ordering::Less {
+                a.neg || b.neg
+            } else {
+                a.neg && b.neg
+            };
+            return Some(Self::signed_zero(neg));
+        }
+        Some(if a.cmp_value(b) == Some(want.reverse()) {
+            b
+        } else {
+            a
+        })
+    }
+
+    /// `self * y + z`, rounded once to `fmt`: what `fma` computes.
+    ///
+    /// The product is exact in 256 bits, and the sum is formed exactly or with
+    /// a sticky bit below the smaller addend, as in `add_rounded`, so there is
+    /// one rounding at the end. `None` for an infinite or NaN operand, and for
+    /// a result that overflows -- the cases that raise, which arithmetic
+    /// leaves to run time too.
+    pub fn fma(self, y: Self, z: Self, fmt: FpFormat) -> Option<Self> {
+        let (a, b, c) = (
+            self.round_to_format(fmt),
+            y.round_to_format(fmt),
+            z.round_to_format(fmt),
+        );
+        if !a.is_finite() || !b.is_finite() || !c.is_finite() {
+            return None;
+        }
+        let neg_p = a.neg != b.neg;
+        let r = if a.is_zero() || b.is_zero() {
+            if c.is_zero() {
+                // Round to nearest gives +0 unless both addends are -0.
+                Self::signed_zero(neg_p && c.neg)
+            } else {
+                c
+            }
+        } else {
+            let (sa, ea) = a.scaled();
+            let (sb, eb) = b.scaled();
+            let product = U256::mul(sa, sb);
+            if c.is_zero() {
+                Self::round_wide(neg_p, product, ea + eb, false, fmt)
+            } else {
+                let (sc, ec) = c.scaled();
+                Self::sum_exact(
+                    (neg_p, product, ea + eb),
+                    (c.neg, U256 { hi: 0, lo: sc }, ec),
+                    fmt,
+                )
+            }
+        };
+        r.is_finite().then_some(r)
+    }
+
+    /// `p + c` for two nonzero values each `(sign, magnitude, exponent of its
+    /// low bit)`, rounded once to `fmt`.
+    ///
+    /// Both are aligned in one 256-bit frame whose top is two bits above the
+    /// larger's leading bit, so the sum cannot carry out of it. The larger
+    /// always fits exactly; the smaller may fall off the bottom, and then it
+    /// is at least 28 bits below the larger's leading bit, far enough that a
+    /// sticky bit in its place rounds exactly as the lost bits would (see
+    /// `add_rounded`).
+    fn sum_exact(p: (bool, U256, i32), c: (bool, U256, i32), fmt: FpFormat) -> Self {
+        // Trailing zeros cost nothing to drop, and dropping them leaves each
+        // magnitude at most 226 bits: no format has more than 113.
+        let trim = |(neg, m, e): (bool, U256, i32)| {
+            let tz = m.trailing_zeros();
+            (neg, m.shr(tz), e + tz as i32)
+        };
+        let (p, c) = (trim(p), trim(c));
+        let top = |(_, m, e): (bool, U256, i32)| 255 - m.leading_zeros() as i32 + e;
+        let frame = top(p).max(top(c)) - 253;
+        let place = |(neg, m, e): (bool, U256, i32)| {
+            if e >= frame {
+                (neg, m.shl((e - frame) as u32), false)
+            } else {
+                let (m, lost) = m.shr_lossy((frame - e) as u32);
+                (neg, m, lost)
+            }
+        };
+        let ((pn, pm, pl), (cn, cm, cl)) = (place(p), place(c));
+        if pn == cn {
+            return Self::round_wide(pn, pm.add(cm), frame, pl || cl, fmt);
+        }
+        let (big, small, small_lost, neg) = match pm.cmp(&cm) {
+            std::cmp::Ordering::Greater => (pm, cm, cl, pn),
+            std::cmp::Ordering::Less => (cm, pm, pl, cn),
+            // Only an exact tie cancels to zero: a lossy operand is far below
+            // the other.
+            std::cmp::Ordering::Equal => return Self::ZERO,
+        };
+        let diff = big.sub(small);
+        // A lossy smaller operand is truly a little above `small`, so the
+        // difference is a little below `diff`.
+        let (w, sticky) = if small_lost {
+            (diff.sub(U256::ONE), true)
+        } else {
+            (diff, false)
+        };
+        Self::round_wide(neg, w, frame, sticky, fmt)
     }
 
     /// The integer `how` rounds this value to, in `fmt`: what `floor`,
@@ -3226,6 +3371,99 @@ mod tests {
             f.round_to_integral(Trunc, FpFormat::X87Extended),
             Some(v(2.0))
         );
+    }
+
+    /// Every `double` and `float` fused multiply-add agrees with the host's
+    /// `mul_add`, which is correctly rounded, over a random sample -- a third
+    /// of it with the addend built to cancel most of the product, which is
+    /// where a multiply and an add each rounded come out different.
+    #[test]
+    fn fma_agrees_with_the_host() {
+        let mut next = xorshift(0xF00D_FACE_1234_5678);
+        let d = FloatVal::from_f64;
+        // An exponent within 30 of 2^0, so products neither overflow nor
+        // vanish.
+        let mut near_one = |sign: u64| {
+            let bits = next();
+            let exp = 1023 - 30 + (bits >> 52) % 60;
+            f64::from_bits(sign << 63 | exp << 52 | bits & ((1 << 52) - 1))
+        };
+        for i in 0..30000 {
+            let (a, b) = (near_one(i & 1), near_one(i >> 1 & 1));
+            let c = if i % 3 == 0 {
+                // -(a * b), rounded, nudged by a few ulps.
+                -(a * b) * (1.0 + (i % 7) as f64 * f64::EPSILON)
+            } else {
+                near_one(i >> 2 & 1)
+            };
+            let got = d(a).fma(d(b), d(c), FpFormat::Binary64);
+            assert_eq!(
+                got.map(|v| v.to_f64().to_bits()),
+                Some(a.mul_add(b, c).to_bits()),
+                "fma({a:e}, {b:e}, {c:e})"
+            );
+            let (fa, fb, fc) = (a as f32, b as f32, c as f32);
+            let got = d(fa as f64).fma(d(fb as f64), d(fc as f64), FpFormat::Binary32);
+            assert_eq!(
+                got.map(|v| v.to_bits(FpFormat::Binary32) as u32),
+                Some(fa.mul_add(fb, fc).to_bits()),
+                "fmaf({fa:e}, {fb:e}, {fc:e})"
+            );
+        }
+    }
+
+    /// The `fma` edges: signed zeros out of a zero product, an exact
+    /// cancellation, a subnormal result, and the operands and results that
+    /// are not folded.
+    #[test]
+    fn fma_edges() {
+        let v = FloatVal::from_f64;
+        let bits = |r: Option<FloatVal>| r.map(|r| r.to_f64().to_bits());
+        let f = FpFormat::Binary64;
+        assert_eq!(bits(v(-0.0).fma(v(1.0), v(0.0), f)), Some(0));
+        assert_eq!(bits(v(-0.0).fma(v(1.0), v(-0.0), f)), Some(1 << 63));
+        assert_eq!(bits(v(2.0).fma(v(3.0), v(-6.0), f)), Some(0), "+0, not -0");
+        assert_eq!(v(0.0).fma(v(5.0), v(-2.5), f), Some(v(-2.5)));
+        // 2^-1022 * 0.5 + 2^-1074: a subnormal, exactly.
+        let min_normal = v(f64::MIN_POSITIVE);
+        let got = min_normal.fma(v(0.5), v(f64::from_bits(1)), f);
+        assert_eq!(bits(got), Some(0x0008_0000_0000_0001));
+        assert_eq!(v(f64::MAX).fma(v(2.0), v(0.0), f), None, "overflow");
+        assert_eq!(v(f64::INFINITY).fma(v(1.0), v(1.0), f), None);
+        assert_eq!(v(1.0).fma(v(1.0), v(f64::NAN), f), None);
+        // binary128 and x87: the product's low half survives the addend.
+        for fmt in [FpFormat::X87Extended, FpFormat::Binary128] {
+            let ulp = v(2f64.powi(1 - fmt.precision() as i32));
+            let one = v(1.0);
+            let got = one.add(ulp, fmt).fma(one.sub(ulp, fmt), v(-1.0), fmt);
+            assert_eq!(got, Some(ulp.mul(ulp, fmt).negated()), "{fmt:?}");
+        }
+    }
+
+    /// `fmin` and `fmax`: a quiet NaN gives the other operand, two NaNs the
+    /// first, the zeros gcc's and `fminnm`'s -0 and +0, and a signalling NaN
+    /// no fold.
+    #[test]
+    fn fmin_and_fmax() {
+        let v = FloatVal::from_f64;
+        let f = FpFormat::Binary64;
+        let bits = |r: Option<FloatVal>| r.map(|r| r.to_f64().to_bits());
+        assert_eq!(v(1.0).fmin(v(2.0), f), Some(v(1.0)));
+        assert_eq!(v(2.0).fmin(v(1.0), f), Some(v(1.0)));
+        assert_eq!(v(1.0).fmax(v(-2.0), f), Some(v(1.0)));
+        assert_eq!(v(f64::NEG_INFINITY).fmax(v(-2.0), f), Some(v(-2.0)));
+        let qnan = FloatVal::nan_with_payload(f, 0x12, NanKind::Quiet);
+        let other = FloatVal::nan_with_payload(f, 0x34, NanKind::Quiet);
+        assert_eq!(qnan.fmin(v(3.0), f), Some(v(3.0)));
+        assert_eq!(v(3.0).fmax(qnan, f), Some(v(3.0)));
+        assert_eq!(qnan.fmin(other, f), Some(qnan));
+        for (a, b) in [(0.0, -0.0), (-0.0, 0.0)] {
+            assert_eq!(bits(v(a).fmin(v(b), f)), Some(1 << 63), "fmin({a}, {b})");
+            assert_eq!(bits(v(a).fmax(v(b), f)), Some(0), "fmax({a}, {b})");
+        }
+        let snan = FloatVal::nan_with_payload(f, 0x12, NanKind::Signalling);
+        assert_eq!(snan.fmin(v(1.0), f), None);
+        assert_eq!(v(1.0).fmax(snan, f), None);
     }
 
     /// The operands with no root to compute: zeros and infinity are their

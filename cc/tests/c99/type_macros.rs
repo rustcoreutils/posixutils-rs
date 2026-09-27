@@ -177,3 +177,70 @@ fn integer_predefines_match_the_platform() {
         ],
     );
 }
+
+/// `int_fastN_t` is the C library's choice, and glibc makes the 16- and
+/// 32-bit ones `long` on a 64-bit target. c17 said `short` and `int`, so the
+/// same typedef was 2 bytes in c17 and 8 in gcc, and INT_FAST16_MAX was 32767.
+const FAST_TYPES_ARE_GLIBCS: &str = r#"
+#include <stdint.h>
+int main(void) {
+    if (!_Generic((int_fast8_t)0, signed char: 1, default: 0)) return 1;
+    if (!_Generic((int_fast16_t)0, long: 1, default: 0)) return 2;
+    if (!_Generic((int_fast32_t)0, long: 1, default: 0)) return 3;
+    if (!_Generic((int_fast64_t)0, long: 1, default: 0)) return 4;
+    if (!_Generic((uint_fast8_t)0, unsigned char: 1, default: 0)) return 5;
+    if (!_Generic((uint_fast16_t)0, unsigned long: 1, default: 0)) return 6;
+    if (!_Generic((uint_fast32_t)0, unsigned long: 1, default: 0)) return 7;
+    if (!_Generic((uint_fast64_t)0, unsigned long: 1, default: 0)) return 8;
+    if (INT_FAST16_MAX != 0x7fffffffffffffffL) return 9;
+    if (UINT_FAST32_MAX != 0xffffffffffffffffUL) return 10;
+    if (INT_FAST32_MIN != -0x7fffffffffffffffL - 1) return 11;
+    if (sizeof(int_fast16_t) != 8) return 12;
+    return 0;
+}
+"#;
+
+#[cfg(target_os = "linux")]
+#[test]
+fn int_fast_types_are_glibcs() {
+    assert_eq!(
+        compile_and_run("fast_types_glibc", FAST_TYPES_ARE_GLIBCS, &[]),
+        0
+    );
+}
+
+#[test]
+fn int_fast_types_are_glibcs_aarch64() {
+    if let Some(rc) = compile_and_run_aarch64("fast_types_glibc_a64", FAST_TYPES_ARE_GLIBCS, "-O0")
+    {
+        assert_eq!(rc, 0);
+    }
+}
+
+/// The same facts as the predefines state them, against gcc's for Linux, and
+/// Darwin's exact-width choice.
+#[test]
+fn int_fast_predefines_match_the_platform() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        assert_defines(
+            triple,
+            &[
+                "#define __INT_FAST8_TYPE__ signed char",
+                "#define __INT_FAST16_TYPE__ long int",
+                "#define __INT_FAST16_MAX__ 0x7fffffffffffffffL",
+                "#define __INT_FAST16_WIDTH__ 64",
+                "#define __INT_FAST32_TYPE__ long int",
+                "#define __UINT_FAST16_TYPE__ long unsigned int",
+                "#define __UINT_FAST32_MAX__ 0xffffffffffffffffUL",
+            ],
+        );
+    }
+    assert_defines(
+        "aarch64-apple-darwin",
+        &[
+            "#define __INT_FAST16_TYPE__ short int",
+            "#define __INT_FAST32_TYPE__ int",
+            "#define __INT_FAST64_TYPE__ long long int",
+        ],
+    );
+}

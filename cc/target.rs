@@ -364,9 +364,25 @@ impl Target {
         self.exact_int_type(bits)
     }
 
-    /// `int_fastN_t` (C17 7.20.1.3).
+    /// `int_fastN_t` (C17 7.20.1.3), which each C library chooses for itself
+    /// and our `<stdint.h>` has to choose the same way:
+    ///
+    /// - glibc: `signed char` for 8, and `long` -- the word -- for 16, 32
+    ///   and 64 on a 64-bit target (`__WORDSIZE == 64` in its `<stdint.h>`).
+    /// - FreeBSD: `int` for 8, 16 and 32 (`__int_fast*_t` in
+    ///   `<machine/_types.h>`), `int64_t` for 64.
+    /// - Darwin: the exact-width type at every width.
+    ///
+    /// Answering the exact-width type everywhere made `int_fast16_t` a
+    /// 2-byte `short` in c17 and an 8-byte `long` in gcc on Linux -- a
+    /// different size for the same type in any structure or prototype the
+    /// two share.
     pub fn fast_int_type(&self, bits: u32) -> IntType {
-        self.exact_int_type(bits)
+        match (self.os, bits) {
+            (Os::Linux, 16 | 32) => IntType::Long,
+            (Os::FreeBSD, 8 | 16) => IntType::Int,
+            _ => self.exact_int_type(bits),
+        }
     }
 
     /// `intptr_t` (C17 7.20.1.4): `long` on every LP64 target, Darwin
@@ -650,6 +666,27 @@ mod tests {
             (Arch::Aarch64, Os::MacOS, Signed),
         ] {
             assert_eq!(Target::new(arch, os).plain_char, want, "{arch}-{os}");
+        }
+    }
+
+    /// `int_fastN_t` is each C library's own choice, and differs at 16 and
+    /// 32 bits between all three.
+    #[test]
+    fn test_fast_int_types_per_platform() {
+        use IntType::*;
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            for (os, want) in [
+                (Os::Linux, [SChar, Long, Long, Long]),
+                (Os::FreeBSD, [Int, Int, Int, Long]),
+                (Os::MacOS, [SChar, Short, Int, LongLong]),
+            ] {
+                let t = Target::new(arch, os);
+                let got = [8, 16, 32, 64].map(|bits| t.fast_int_type(bits));
+                assert_eq!(got, want, "{arch}-{os}");
+                for (bits, ty) in [8, 16, 32, 64].into_iter().zip(got) {
+                    assert!(t.int_width(ty) >= bits && ty.is_signed());
+                }
+            }
         }
     }
 

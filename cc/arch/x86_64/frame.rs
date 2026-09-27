@@ -990,17 +990,25 @@ impl X86_64CodeGen {
         // Struct returns depend on ABI classification (SSE for all-float structs)
         if let Some(src) = insn.src.first() {
             let src_loc = self.get_location(*src);
-            // `long double _Complex` is COMPLEX_X87 and returns through the
-            // hidden pointer, not in XMM registers — it has no XMM form, and
-            // trying to give it one is what emitted `movt %xmm0`.
+            // Only a complex value the ABI returns in SSE registers takes this
+            // arm: `long double _Complex` is COMPLEX_X87 (st(0)/st(1), below)
+            // and `_Float128 _Complex` is MEMORY. Giving either an XMM form is
+            // what emitted `movt %xmm0`.
             let is_complex = insn.typ.is_some_and(|t| {
                 types.is_complex_float(t) && crate::arch::lir::complex_sse_regs(types, t) > 0
             });
             // `long double _Complex` is COMPLEX_X87: st(0) and st(1), never
             // XMM. It needs its own arm — `is_float` deliberately excludes
-            // complex types, so it never reaches the FP path below.
+            // complex types, so it never reaches the FP path below. Asked of
+            // the classification: "no SSE registers" is also what a MEMORY
+            // `_Float128 _Complex` answers, and it is returned through the
+            // hidden pointer, not the FPU.
             let is_complex_x87 = insn.typ.is_some_and(|t| {
-                types.is_complex_float(t) && crate::arch::lir::complex_sse_regs(types, t) == 0
+                types.is_complex_float(t)
+                    && matches!(
+                        get_abi(&self.base.target).classify_return(t, types),
+                        ArgClass::X87 { .. }
+                    )
             });
             let is_fp = matches!(src_loc, Loc::Xmm(_) | Loc::FImm(..))
                 || insn.typ.is_some_and(|t| types.is_float(t));

@@ -153,7 +153,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         .unwrap_or(expr_typ);
 
                     if let Some(sret_ptr) = self.struct_return_ptr {
-                        self.emit_sret_return(e, sret_ptr, self.struct_return_bytes);
+                        self.emit_sret_return(e, sret_ptr, func_ret_type);
                     } else if let Some(ret_type) = self.two_reg_return_type {
                         self.emit_two_reg_return(e, ret_type);
                     } else if let Some(b) = self.complex_to_bool(e, func_ret_type) {

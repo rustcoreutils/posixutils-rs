@@ -218,6 +218,18 @@ pub(crate) struct VlaMark {
     pub(crate) continue_depth: usize,
 }
 
+/// Where a call returning through the hidden pointer (sret) puts its result.
+///
+/// See [`Linearizer::hidden_return_slot`].
+pub(crate) struct HiddenReturnSlot {
+    /// The local the callee writes the value into.
+    pub(crate) storage: PseudoId,
+    /// Its address: the call's hidden first argument.
+    pub(crate) arg: PseudoId,
+    /// The argument's type, a pointer to the returned type.
+    pub(crate) arg_typ: TypeId,
+}
+
 /// A forward `goto` whose VLA restore is decided once its label is placed.
 ///
 /// `marks` is the mark stack as it stood at the jump, so the restore can name
@@ -280,10 +292,9 @@ pub struct Linearizer<'a> {
     pub(crate) types: &'a TypeTable,
     /// String table for converting StringId to String at IR boundary
     pub(crate) strings: &'a StringTable,
-    /// Hidden struct return pointer (for functions returning large structs via sret)
+    /// Hidden return pointer (for functions returning via sret: large
+    /// aggregates, and complex types the ABI classifies MEMORY)
     pub(crate) struct_return_ptr: Option<PseudoId>,
-    /// Size of struct being returned (for functions returning large structs via sret)
-    pub(crate) struct_return_bytes: usize,
     /// Type of struct being returned via two registers (9-16 bytes, per ABI)
     pub(crate) two_reg_return_type: Option<TypeId>,
     /// Current function name (for generating unique static local names)
@@ -414,7 +425,6 @@ impl<'a> Linearizer<'a> {
             types,
             strings,
             struct_return_ptr: None,
-            struct_return_bytes: 0,
             two_reg_return_type: None,
             current_func_name: String::new(),
             addr_taken_labels: Vec::new(),
@@ -887,18 +897,17 @@ impl<'a> Linearizer<'a> {
     /// Whether a return value of this type comes back through a hidden
     /// pointer (sret) rather than in registers.
     ///
-    /// `long double _Complex` deliberately does *not*: System V classifies it
-    /// COMPLEX_X87 and returns it in st(0)/st(1), and complex multiply and
-    /// divide are lowered to libgcc's `__mulxc3`/`__divxc3`, which follow that
-    /// convention. Returning it indirectly would silently disagree with the
-    /// very library calls the arithmetic depends on.
-    fn returns_via_hidden_pointer(&self, typ: TypeId) -> bool {
+    /// A complex value does exactly when the ABI classifies its return
+    /// MEMORY, whatever its size. So `_Complex __int128` and, on x86-64,
+    /// `_Float128 _Complex` -- both thirty-two bytes -- come back through the
+    /// hidden pointer, while `long double _Complex`, as large, does not:
+    /// System V classifies it COMPLEX_X87 and returns it in st(0)/st(1).
+    /// libgcc's `__mul?c3`/`__div?c3` follow the same classification, which
+    /// is why the complex arithmetic asks this too
+    /// (`emit_complex_rtlib_call`).
+    pub(crate) fn returns_via_hidden_pointer(&self, typ: TypeId) -> bool {
         let kind = self.types.kind(typ);
-        // A GNU complex integer over two eightbytes does: `_Complex __int128`
-        // is thirty-two bytes and comes back through the hidden pointer, the
-        // same as any other MEMORY-class object. Its floating cousins do not,
-        // which is why this asks the classifier rather than the size.
-        if self.types.is_complex_integer(typ) {
+        if self.types.is_complex(typ) {
             let abi = get_abi_for_conv(self.current_calling_conv, self.target);
             return matches!(
                 abi.classify_return(typ, self.types),
@@ -906,8 +915,7 @@ impl<'a> Linearizer<'a> {
             );
         }
         if kind != TypeKind::Struct && kind != TypeKind::Union {
-            // Scalars and `_Complex` never do, which is what keeps the
-            // `long double _Complex` guarantee above local and testable.
+            // Scalars never do.
             return false;
         }
         let abi = get_abi_for_conv(self.current_calling_conv, self.target);
@@ -1168,7 +1176,6 @@ impl<'a> Linearizer<'a> {
         self.break_targets.clear();
         self.continue_targets.clear();
         self.struct_return_ptr = None;
-        self.struct_return_bytes = 0;
         self.two_reg_return_type = None;
         self.current_func_name = self.emitted_name(func.name);
         self.addr_taken_labels.clear();
@@ -1324,7 +1331,6 @@ impl<'a> Linearizer<'a> {
             let sret_pseudo = Pseudo::arg(sret_id, 0).with_name("__sret");
             ir_func.add_pseudo(sret_pseudo);
             self.struct_return_ptr = Some(sret_id);
-            self.struct_return_bytes = self.types.size_bytes(func.return_type);
         }
 
         // Check if function returns a medium struct (9-16 bytes) via two registers
@@ -1618,13 +1624,21 @@ impl<'a> Linearizer<'a> {
 
     // Statement linearization
 
-    /// Emit large struct return via hidden pointer (sret)
-    pub(crate) fn emit_sret_return(&mut self, e: &Expr, sret_ptr: PseudoId, struct_bytes: usize) {
-        // Only structs and unions return through a hidden pointer
-        // (`returns_via_hidden_pointer`), so `e` is always an aggregate here —
-        // complex returns take the register path and go through
-        // `complex_operand_addr`.
-        let src_addr = self.linearize_lvalue(e);
+    /// Emit a return through the hidden pointer (sret).
+    ///
+    /// The value is an aggregate or a MEMORY-class complex
+    /// (`returns_via_hidden_pointer`). A complex one is converted to the
+    /// return type first, as the register return path does: the caller reads
+    /// it with the declared base type's stride.
+    pub(crate) fn emit_sret_return(&mut self, e: &Expr, sret_ptr: PseudoId, ret_type: TypeId) {
+        let src_addr = if !self.types.is_complex(ret_type) {
+            self.linearize_lvalue(e)
+        } else if self.types.is_complex(self.expr_type(e)) {
+            self.complex_operand_at_precision(e, ret_type)
+        } else {
+            self.promote_real_to_complex(e, ret_type)
+        };
+        let struct_bytes = self.types.size_bytes(ret_type);
         // The shared block copy, for the same two reasons the parameter
         // prologue uses it: a large struct becomes a `memcpy` call instead of
         // an unbounded unroll, and a size that is not a multiple of eight is
@@ -3181,6 +3195,24 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Storage for a call returning `typ` through the hidden pointer, and
+    /// the pointer to it, which is passed as the call's first argument.
+    ///
+    /// The call itself hands the same pointer back (in RAX on x86-64), so its
+    /// target is a pointer-typed value; the result the caller reads is
+    /// [`HiddenReturnSlot::storage`].
+    pub(crate) fn hidden_return_slot(&mut self, typ: TypeId) -> HiddenReturnSlot {
+        let storage = self.frame_temp("__sret", typ);
+        let arg_typ = self.types.pointer_to(typ);
+        let arg = self.alloc_reg_pseudo();
+        self.emit(Instruction::sym_addr(arg, storage, arg_typ));
+        HiddenReturnSlot {
+            storage,
+            arg,
+            arg_typ,
+        }
+    }
+
     /// Linearize a function call expression
     pub(crate) fn linearize_call(
         &mut self,
@@ -3271,24 +3303,15 @@ impl<'a> Linearizer<'a> {
         let returns_reg_aggregate = (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
             && struct_size_bits > 64
             && !returns_large_struct;
-        // `long double _Complex` comes back through the hidden pointer above,
-        // not in registers.
+        // A complex value the ABI returns in registers (x87 or SSE) is handed
+        // back as the address of its halves; one it returns in memory --
+        // `_Float128 _Complex` on x86-64 -- came back through the hidden
+        // pointer above.
         let ret_is_address = self.types.is_complex(typ) && !returns_large_struct;
 
         let (result_sym, mut arg_vals, mut arg_types_vec) = if returns_large_struct {
-            // Allocate local storage for the return value
-            let sret_sym = self.frame_temp("__sret", typ);
-
-            // Get address of the allocated space
-            let sret_addr = self.alloc_reg_pseudo();
-            self.emit(Instruction::sym_addr(
-                sret_addr,
-                sret_sym,
-                self.types.pointer_to(typ),
-            ));
-
-            // Hidden return pointer is the first argument (pointer type)
-            (sret_sym, vec![sret_addr], vec![self.types.pointer_to(typ)])
+            let slot = self.hidden_return_slot(typ);
+            (slot.storage, vec![slot.arg], vec![slot.arg_typ])
         } else if returns_reg_aggregate {
             // Two-register struct returns: allocate local storage for the result
             // Codegen will store RAX+RDX (x86-64) or X0+X1 (AArch64) to this location

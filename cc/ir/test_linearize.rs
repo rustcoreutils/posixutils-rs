@@ -8073,3 +8073,51 @@ fn test_va_arg_of_complex_writes_a_local() {
         );
     }
 }
+
+/// A complex `*` calls `__mul?c3` by the ABI's classification of the complex
+/// type, as any other call returning it would be: on x86-64 a
+/// `_Float128 _Complex` is MEMORY class, so `__multc3` is handed a hidden
+/// pointer ahead of its four halves and the function itself returns through
+/// one; `long double _Complex` is COMPLEX_X87 and comes back in st(0)/st(1),
+/// with no hidden pointer. On aarch64 `_Float128` is `long double` and its
+/// complex an HFA, so neither has one.
+#[test]
+fn test_complex_multiply_routine_follows_the_return_class() {
+    use crate::target::{Arch, Os};
+    let cases = [
+        (Arch::X86_64, "_Float128", "__multc3", true),
+        (Arch::X86_64, "long double", "__mulxc3", false),
+        (Arch::Aarch64, "_Float128", "__multc3", false),
+    ];
+    for (arch, base, routine, sret) in cases {
+        let src = format!(
+            "{base} _Complex m({base} _Complex x, {base} _Complex y) {{ return x * y; }}\n"
+        );
+        let module = linearize_source(&src, &Target::new(arch, Os::Linux));
+        let m = module.functions.iter().find(|f| f.name == "m").unwrap();
+        let has_sret = m
+            .pseudos
+            .iter()
+            .any(|p| p.kind == PseudoKind::Arg(0) && p.name.as_deref() == Some("__sret"));
+        assert_eq!(
+            has_sret, sret,
+            "{base} on {arch:?}: the function's own return"
+        );
+        let call = m
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .find(|i| i.op == Opcode::Call && i.func_name.as_deref() == Some(routine))
+            .unwrap_or_else(|| panic!("{base} on {arch:?}: no {routine} call"));
+        assert_eq!(
+            call.returns_via_sret(),
+            sret,
+            "{base} on {arch:?}: {routine}"
+        );
+        assert_eq!(
+            call.src.len(),
+            4 + usize::from(sret),
+            "{base} on {arch:?}: {routine} takes the four halves, after any hidden pointer"
+        );
+    }
+}

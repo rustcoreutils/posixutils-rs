@@ -182,6 +182,53 @@ fn sole_scalar_content(ty: TypeId, types: &TypeTable) -> Option<TypeId> {
     (types.size_bytes(ty) == types.size_bytes(inner)).then_some(inner)
 }
 
+/// A floating complex type's argument class.
+///
+/// §3.2.3 classifies the four differently, and it is not "two SSE eightbytes"
+/// for any of them but `double _Complex`:
+///
+/// ```text
+///   float _Complex        8 bytes  -> ONE eightbyte, class SSE. Both floats
+///                                     are packed into the low 64 bits of a
+///                                     single XMM.
+///   double _Complex      16 bytes  -> two eightbytes, both SSE.
+///   long double _Complex 32 bytes  -> COMPLEX_X87, which is passed in
+///                                     MEMORY. There is no XMM form; a value
+///                                     in an x87 slot cannot be moved through
+///                                     one.
+///   _Float128 _Complex   32 bytes  -> SSE, SSEUP, SSE, SSEUP, which the
+///                                     post-merger cleanup makes MEMORY: over
+///                                     sixteen bytes only a single SSE+SSEUP
+///                                     run survives. The backend's
+///                                     `complex_sse_regs` already answered no
+///                                     registers; answering two here had
+///                                     `va_arg` read it from the save area.
+/// ```
+///
+/// The return class is the same but for COMPLEX_X87; see `classify_return`.
+fn classify_complex_float(ty: TypeId, types: &TypeTable) -> ArgClass {
+    let base_ty = types.complex_base(ty);
+    if matches!(
+        types.kind(base_ty),
+        TypeKind::LongDouble | TypeKind::Float128
+    ) {
+        return ArgClass::Indirect {
+            align: 16,
+            size_bytes: types.size_bytes(ty),
+        };
+    }
+    let total_bits = types.size_bits(base_ty) * 2;
+    let classes = if total_bits <= 64 {
+        vec![RegClass::Sse]
+    } else {
+        vec![RegClass::Sse, RegClass::Sse]
+    };
+    ArgClass::Direct {
+        classes,
+        size_bits: total_bits,
+    }
+}
+
 /// A GNU complex integer's argument or return class.
 ///
 /// §3.2.3 has no special case for these: the object is classified by its
@@ -449,48 +496,8 @@ impl Abi for SysVAmd64Abi {
 
         // Complex types - check BEFORE is_float, since a complex type carries
         // the Float/Double/LongDouble kind of its base.
-        //
-        // §3.2.3 classifies the three differently, and it is not "two SSE
-        // eightbytes" for any of them but `double _Complex`:
-        //
-        //   float _Complex        8 bytes  -> ONE eightbyte, class SSE. Both
-        //                                     floats are packed into the low
-        //                                     64 bits of a single XMM.
-        //   double _Complex      16 bytes  -> two eightbytes, both SSE.
-        //   long double _Complex 32 bytes  -> COMPLEX_X87, which is passed in
-        //                                     MEMORY. There is no XMM form; a
-        //                                     value in an x87 slot cannot be
-        //                                     moved through one.
-        //   _Float128 _Complex   32 bytes  -> SSE, SSEUP, SSE, SSEUP, which
-        //                                     the post-merger cleanup makes
-        //                                     MEMORY: over sixteen bytes only a
-        //                                     single SSE+SSEUP run survives.
-        //                                     The backend's `complex_sse_regs`
-        //                                     already answered no registers;
-        //                                     answering two here had `va_arg`
-        //                                     read it from the save area.
         if types.is_complex(ty) {
-            let base_ty = types.complex_base(ty);
-            if matches!(
-                types.kind(base_ty),
-                TypeKind::LongDouble | TypeKind::Float128
-            ) {
-                return ArgClass::Indirect {
-                    align: 16,
-                    size_bytes,
-                };
-            }
-            let base_bits = types.size_bits(base_ty);
-            let total_bits = base_bits * 2;
-            let classes = if total_bits <= 64 {
-                vec![RegClass::Sse]
-            } else {
-                vec![RegClass::Sse, RegClass::Sse]
-            };
-            return ArgClass::Direct {
-                classes,
-                size_bits: total_bits,
-            };
+            return classify_complex_float(ty, types);
         }
 
         // Floating-point types (non-complex)
@@ -577,30 +584,17 @@ impl Abi for SysVAmd64Abi {
 
         // Complex types - check BEFORE is_float, as in `classify_param`.
         //
-        //   float _Complex        -> XMM0, both halves packed in one eightbyte
-        //   double _Complex       -> XMM0 (real) + XMM1 (imag)
-        //   long double _Complex  -> COMPLEX_X87: st(0) and st(1). We return
-        //                            it indirectly instead, which keeps the
-        //                            value correct within a translation unit
-        //                            without inventing an x87 register pair
-        //                            the rest of the backend cannot model.
+        // §3.2.3 returns a value by the class it is passed by, with one
+        // exception: COMPLEX_X87 is passed in memory and returned in st(0)
+        // (real) and st(1) (imaginary). Everything else is the argument's
+        // class -- `_Float128 _Complex` included, which is MEMORY and so
+        // comes back through the hidden pointer. Answering two SSE registers
+        // for it had the callee load its halves with `fldt`.
         if types.is_complex(ty) {
-            let base_ty = types.complex_base(ty);
-            if types.kind(base_ty) == TypeKind::LongDouble {
-                // COMPLEX_X87: real in st(0), imaginary in st(1).
+            if types.kind(types.complex_base(ty)) == TypeKind::LongDouble {
                 return ArgClass::X87 { size_bits };
             }
-            let base_bits = types.size_bits(base_ty);
-            let total_bits = base_bits * 2;
-            let classes = if total_bits <= 64 {
-                vec![RegClass::Sse]
-            } else {
-                vec![RegClass::Sse, RegClass::Sse]
-            };
-            return ArgClass::Direct {
-                classes,
-                size_bits: total_bits,
-            };
+            return classify_complex_float(ty, types);
         }
 
         // Floating-point types - return in XMM0 (non-complex)
@@ -880,5 +874,42 @@ mod tests {
             ),
             "a struct holding a long double is MEMORY class as an argument"
         );
+    }
+
+    /// A floating complex value comes back by the class it is passed by,
+    /// except COMPLEX_X87, which is passed in memory and returned in st(0)
+    /// and st(1). `_Float128 _Complex` is MEMORY both ways: it was answered
+    /// two SSE eightbytes on return, and the callee loaded its halves with
+    /// `fldt` while a gcc caller waited for them through the hidden pointer.
+    #[test]
+    fn complex_float_returns_by_its_argument_class_but_complex_x87() {
+        let abi = SysVAmd64Abi::new();
+        let types = x86_types();
+        for base in [types.float_id, types.double_id, types.float128_id] {
+            let c = types.make_complex(base);
+            assert_eq!(
+                abi.classify_return(c, &types),
+                abi.classify_param(c, &types),
+                "{:?}",
+                types.kind(base)
+            );
+        }
+        let q = types.make_complex(types.float128_id);
+        assert!(matches!(
+            abi.classify_return(q, &types),
+            ArgClass::Indirect {
+                align: 16,
+                size_bytes: 32
+            }
+        ));
+        let ld = types.make_complex(types.longdouble_id);
+        assert!(matches!(
+            abi.classify_param(ld, &types),
+            ArgClass::Indirect { .. }
+        ));
+        assert!(matches!(
+            abi.classify_return(ld, &types),
+            ArgClass::X87 { size_bits: 256 }
+        ));
     }
 }

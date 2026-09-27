@@ -10,7 +10,7 @@
 //
 
 use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
-use crate::types::TypeTable;
+use crate::types::{TypeId, TypeTable};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
@@ -849,7 +849,7 @@ pub fn identify_addr_taken_syms(func: &Function) -> HashSet<PseudoId> {
 /// targets should NOT be in FP registers.
 pub fn identify_fp_pseudos<F>(func: &Function, is_float_type: F) -> HashSet<PseudoId>
 where
-    F: Fn(crate::types::TypeId) -> bool,
+    F: Fn(TypeId) -> bool,
 {
     use crate::ir::Opcode;
 
@@ -1590,11 +1590,59 @@ impl AbiLowering {
             arg_idx_offset,
         }
     }
+
+    /// The declared type of the parameter an `Arg(arg)` pseudo carries, or
+    /// `None` for the hidden sret pointer, which is no declared parameter.
+    ///
+    /// `func.params[arg]` is the answer only without an sret pointer; with
+    /// one, every parameter is one `Arg` further along. Indexing the list
+    /// directly took the *next* parameter's type for each of them.
+    pub fn param_type(&self, func: &Function, arg: u32) -> Option<TypeId> {
+        let i = arg.checked_sub(self.arg_idx_offset)?;
+        func.params.get(i as usize).map(|(_, typ)| *typ)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With a hidden sret pointer, `Arg(0)` is that pointer and each declared
+    /// parameter is one `Arg` further along; without one, `Arg(n)` is
+    /// `params[n]`. Indexing `params` by the `Arg` number took the next
+    /// parameter's type -- a `double _Complex` parameter of a function
+    /// returning a large struct was not recognised as complex and lost its
+    /// imaginary half.
+    #[test]
+    fn param_type_skips_the_hidden_return_pointer() {
+        use crate::ir::Pseudo;
+        let types = TypeTable::new(&crate::target::Target::host());
+        let params = [types.int_id, types.double_id];
+        for sret in [false, true] {
+            let mut func = Function::new("f", types.void_id);
+            let offset = u32::from(sret);
+            if sret {
+                func.add_pseudo(Pseudo::arg(PseudoId(0), 0).with_name("__sret"));
+            }
+            for (i, typ) in params.iter().enumerate() {
+                func.add_param(format!("p{i}"), *typ);
+                let n = i as u32 + offset;
+                func.add_pseudo(Pseudo::arg(PseudoId(n), n));
+            }
+            let lowering = AbiLowering::new(&func);
+            if sret {
+                assert_eq!(lowering.param_type(&func, 0), None, "the sret pointer");
+            }
+            for (i, typ) in params.iter().enumerate() {
+                assert_eq!(
+                    lowering.param_type(&func, i as u32 + offset),
+                    Some(*typ),
+                    "parameter {i}, sret {sret}"
+                );
+            }
+            assert_eq!(lowering.param_type(&func, 2 + offset), None);
+        }
+    }
 
     /// A slot's size is rounded up to its alignment inside the check, and the
     /// frame's final rounding is reserved: the largest admitted locals area

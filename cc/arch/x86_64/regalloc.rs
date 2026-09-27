@@ -1754,14 +1754,14 @@ impl RegAlloc {
         // register into an unrelated 8-byte slot -- losing the imaginary half
         // of a `double _Complex` -- and, because the pseudo would then be
         // marked already-spilled, suppress that correct handling entirely.
+        let lowering = crate::arch::regalloc::AbiLowering::new(func);
         let complex_arg_pseudos: HashSet<PseudoId> = func
             .pseudos
             .iter()
             .filter_map(|p| match p.kind {
-                PseudoKind::Arg(idx) => func
-                    .params
-                    .get(idx as usize)
-                    .filter(|(_, typ)| types.is_complex_float(*typ))
+                PseudoKind::Arg(idx) => lowering
+                    .param_type(func, idx)
+                    .filter(|typ| types.is_complex_float(*typ))
                     .map(|_| p.id),
                 _ => None,
             })

@@ -1759,6 +1759,13 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// These functions take 4 scalar args (left_real, left_imag, right_real, right_imag)
     /// and return a complex value. The result is stored in newly allocated local storage.
     ///
+    /// They are ordinary C functions, so they are called by the ABI's
+    /// classification of their signature like any other: each half in its
+    /// own argument register, and the result wherever the complex type's
+    /// return class puts it. On x86-64 `__multc3` hands its
+    /// `_Float128 _Complex` result back through the hidden pointer -- the
+    /// type is MEMORY class -- which is what gcc calls it with.
+    ///
     /// Returns the address where the complex result is stored.
     pub(crate) fn emit_complex_rtlib_call(
         &mut self,
@@ -1770,12 +1777,21 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) -> PseudoId {
         let (left_real, left_imag) = left;
         let (right_real, right_imag) = right;
-        // Allocate local storage for the complex result
-        let result_sym = self.frame_temp("__cret", complex_typ);
+        let sret = self.returns_via_hidden_pointer(complex_typ);
 
-        // Build argument list: 4 scalar FP values
-        let arg_vals = vec![left_real, left_imag, right_real, right_imag];
-        let arg_types = vec![base_typ, base_typ, base_typ, base_typ];
+        // The result's storage, and the hidden pointer to it if there is one.
+        let (result_sym, mut arg_vals, mut arg_types) = if sret {
+            let slot = self.hidden_return_slot(complex_typ);
+            (slot.storage, vec![slot.arg], vec![slot.arg_typ])
+        } else {
+            (
+                self.frame_temp("__cret", complex_typ),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        arg_vals.extend([left_real, left_imag, right_real, right_imag]);
+        arg_types.extend([base_typ; 4]);
 
         // Compute ABI classification for the call
         let abi = get_abi_for_conv(self.current_calling_conv, self.target);
@@ -1786,16 +1802,29 @@ impl<'a> super::linearize::Linearizer<'a> {
         let ret_class = abi.classify_return(complex_typ, self.types);
         let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
 
-        // Create the call instruction
-        let ret_size = self.types.size_bits(complex_typ);
-        let mut call_insn = Instruction::call(
-            Some(result_sym),
-            func_name,
-            arg_vals,
-            arg_types,
-            complex_typ,
-            ret_size,
-        );
+        // Through the hidden pointer, the call's own value is that pointer
+        // and the result is read from the storage; otherwise the backend
+        // writes the returned registers into the storage directly.
+        let mut call_insn = if sret {
+            let arg_typ = arg_types[0];
+            Instruction::call(
+                Some(self.alloc_reg_pseudo()),
+                func_name,
+                arg_vals,
+                arg_types,
+                arg_typ,
+                64,
+            )
+        } else {
+            Instruction::call(
+                Some(result_sym),
+                func_name,
+                arg_vals,
+                arg_types,
+                complex_typ,
+                self.types.size_bits(complex_typ),
+            )
+        };
         call_insn.abi_info = Some(call_abi_info);
         self.emit(call_insn);
 

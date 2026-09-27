@@ -20,8 +20,8 @@
 //
 
 use crate::common::{
-    aarch64_cross_available, compile_and_run, compile_and_run_optimized, create_c_file,
-    cross_link_and_run, run_c17,
+    aarch64_cross_available, compile_and_run, compile_and_run_aarch64, compile_and_run_optimized,
+    create_c_file, cross_link_and_run, run_c17,
 };
 
 /// #C1: `float _Complex` is one packed eightbyte, so it occupies a single
@@ -969,4 +969,228 @@ fn c99_va_arg_aggregates_interoperate_with_gcc_aarch64() {
         &format!("{VA_AGG_DECLS}\n{VA_AGG_CALLEE}"),
         &format!("{VA_AGG_DECLS}\n{VA_AGG_CALLER}"),
     );
+}
+
+// ============================================================================
+// _Float128 _Complex through calls
+// ============================================================================
+
+// Returned from, passed to and computed by functions: segfaulted on x86-64,
+// where _Float128 is not long double. Passes under gcc on both targets.
+const FLOAT128_COMPLEX_CALLS: &str = r#"
+typedef _Float128 _Complex qc;
+__attribute__((noinline)) qc mk(int a, double d) { return (qc)(a + 0.5F128) - (qc)(d * 1.0if128); }
+__attribute__((noinline)) qc id(qc z) { return z; }
+__attribute__((noinline)) qc mul(qc x, qc y) { return x * y; }
+__attribute__((noinline)) qc dv(qc x, qc y) { return x / y; }
+int main(void) {
+    volatile int a = 3; volatile double d = 2.0;
+    qc z = mk(a, d);
+    if (__real__ z != 3.5F128 || __imag__ z != -2.0F128) return 1;
+    qc w = id(z);
+    if (__real__ w != 3.5F128 || __imag__ w != -2.0F128) return 2;
+    qc p = mul(z, __builtin_complex((_Float128)1, (_Float128)1));
+    if (__real__ p != 5.5F128 || __imag__ p != 1.5F128) return 3;
+    qc q = dv(p, __builtin_complex((_Float128)1, (_Float128)1));
+    if (__real__ q != 3.5F128 || __imag__ q != -2.0F128) return 4;
+    return 0;
+}
+"#;
+
+#[test]
+fn c99_float128_complex_through_calls() {
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("f128_complex{opt}"),
+                FLOAT128_COMPLEX_CALLS,
+                &[opt.to_string()]
+            ),
+            0,
+            "host {opt}"
+        );
+    }
+}
+
+// ============================================================================
+// _Float128 _Complex operations, across translation units
+// ============================================================================
+
+// On x86-64 `_Float128 _Complex` is MEMORY class both ways, so it is returned
+// through the hidden pointer, and `__multc3`/`__divtc3` -- ordinary functions
+// of that return type -- write their result the same way. Every operation is
+// in the callee's unit, so each side can be built by c17 or by gcc. The `E`
+// half is one only binary128 holds: an eight-byte move, or a trip through
+// `double` or the x87 format, loses it.
+const F128C_DECLS: &str = r#"
+typedef __builtin_va_list va_list;
+typedef _Float128 _Complex qc; typedef double _Complex dc;
+typedef float _Complex fc; typedef long double _Complex lc;
+#define E 0x1p-100F128
+qc q_add(qc x, qc y); qc q_sub(qc x, qc y); qc q_mul(qc x, qc y); qc q_div(qc x, qc y);
+qc q_neg(qc x); qc q_conj(qc x);
+qc q_from_d(dc z); dc d_from_q(qc z); lc l_from_q(qc z); qc q_from_f(fc z);
+_Float128 q_re(qc z); _Float128 q_im(qc z); qc q_make(_Float128 re, _Float128 im);
+qc q_va(int n, ...);
+"#;
+
+const F128C_CALLEE: &str = r#"
+qc q_add(qc x, qc y) { return x + y; }
+qc q_sub(qc x, qc y) { return x - y; }
+qc q_mul(qc x, qc y) { return x * y; }
+qc q_div(qc x, qc y) { return x / y; }
+qc q_neg(qc x) { return -x; }
+qc q_conj(qc x) { return ~x; }
+qc q_from_d(dc z) { return z; }
+dc d_from_q(qc z) { return z; }
+lc l_from_q(qc z) { return (lc)z; }
+qc q_from_f(fc z) { return (qc)z; }
+_Float128 q_re(qc z) { return __real__ z; }
+_Float128 q_im(qc z) { return __imag__ z; }
+qc q_make(_Float128 re, _Float128 im) { qc z; __real__ z = re; __imag__ z = im; return z; }
+/* n rounds of (int k, qc z, double d), summing z * k + d. */
+qc q_va(int n, ...) {
+    va_list ap;
+    __builtin_va_start(ap, n);
+    qc s = 0;
+    for (int i = 0; i < n; i++) {
+        int k = __builtin_va_arg(ap, int);
+        qc z = __builtin_va_arg(ap, qc);
+        double d = __builtin_va_arg(ap, double);
+        s += z * k + d;
+    }
+    __builtin_va_end(ap);
+    return s;
+}
+"#;
+
+const F128C_CALLER: &str = r#"
+#define EQ(z, re, im) (__real__ (z) == (re) && __imag__ (z) == (im))
+#define R(k) k, a, 0.5
+int main(void) {
+    qc a = __builtin_complex(3 + E, -2 - E);
+    qc b = __builtin_complex((_Float128)1, (_Float128)1);
+    if (!EQ(q_add(a, b), 4 + E, -1 - E)) return 1;
+    if (!EQ(q_sub(a, b), 2 + E, -3 - E)) return 2;
+    qc m = q_mul(a, b);
+    if (!EQ(m, 5 + 2 * E, (_Float128)1)) return 3;
+    if (!EQ(q_div(m, b), 3 + E, -2 - E)) return 4;
+    if (!EQ(q_neg(a), -3 - E, 2 + E)) return 5;
+    if (!EQ(q_conj(a), 3 + E, 2 + E)) return 6;
+    if (!EQ(q_from_d(__builtin_complex(1.5, -2.25)), (_Float128)1.5, (_Float128)-2.25)) return 7;
+    dc d = d_from_q(a);
+    if (!EQ(d, 3.0, -2.0)) return 8;
+    lc l = l_from_q(a);
+    if (!EQ(l, (long double)(3 + E), (long double)(-2 - E))) return 9;
+    if (!EQ(q_from_f(__builtin_complex(0.5f, 4.0f)), (_Float128)0.5, (_Float128)4)) return 10;
+    if (q_re(a) != 3 + E || q_im(a) != -2 - E) return 11;
+    if (!EQ(q_make(3 + E, -2 - E), 3 + E, -2 - E)) return 12;
+    /* Nine rounds: the ints and doubles run out of registers too. */
+    qc s = q_va(9, R(1), R(1), R(1), R(1), R(1), R(1), R(1), R(1), R(1));
+    if (!EQ(s, 31.5F128 + 9 * E, -18 - 9 * E)) return 13;
+    if (!EQ(q_va(1, 2, b, 0.25), 2.25F128, (_Float128)2)) return 14;
+    return 0;
+}
+"#;
+
+#[test]
+fn c99_float128_complex_operations_c17_both_sides() {
+    let program = format!("{F128C_DECLS}\n{F128C_CALLEE}\n{F128C_CALLER}");
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("f128c_ops{opt}"), &program, &[opt.to_string()]),
+            0,
+            "host {opt}"
+        );
+    }
+}
+
+/// Linux x86-64 only, where the host gcc is gcc and the ABI is System V.
+#[test]
+fn c99_float128_complex_operations_interoperate_with_gcc_host() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+    va_interop_host(
+        "f128c",
+        &format!("{F128C_DECLS}\n{F128C_CALLEE}"),
+        &format!("{F128C_DECLS}\n{F128C_CALLER}"),
+    );
+}
+
+/// On aarch64 `_Float128` is `long double`, and its complex an HFA.
+#[test]
+fn c99_float128_complex_operations_interoperate_with_gcc_aarch64() {
+    if !aarch64_cross_available() {
+        eprintln!("SKIP: no aarch64 cross toolchain");
+        return;
+    }
+    va_interop_aarch64(
+        "f128c",
+        &format!("{F128C_DECLS}\n{F128C_CALLEE}"),
+        &format!("{F128C_DECLS}\n{F128C_CALLER}"),
+    );
+}
+
+// ============================================================================
+// Parameters of a function that returns through the hidden pointer
+// ============================================================================
+
+// The hidden pointer is `Arg(0)`, so each declared parameter is one `Arg`
+// further along. Two allocator sites looked a parameter's type up by the `Arg`
+// number itself, and so took the *next* parameter's: on x86-64 a complex
+// parameter was not recognised as one, spilled as a lone `double`, and its
+// local never written; on aarch64 a `long double` spilled across a call kept
+// eight of its sixteen bytes.
+const SRET_COMPLEX_PARAMS: &str = r#"
+typedef double _Complex dc;
+struct Big { long a[4]; };
+__attribute__((noinline)) struct Big f(dc z) {
+    struct Big b = {{(long)__real__ z, (long)__imag__ z, 0, 0}};
+    return b;
+}
+__attribute__((noinline)) struct Big g(int x, dc z, float _Complex w) {
+    struct Big b = {{(long)__real__ z, (long)__imag__ z, x, (long)__imag__ w}};
+    return b;
+}
+int main(void) {
+    struct Big b = f(__builtin_complex(3.0, 4.0));
+    if (b.a[0] != 3 || b.a[1] != 4) return 1;
+    b = g(7, __builtin_complex(3.0, 4.0), __builtin_complex(1.0f, 9.0f));
+    if (b.a[0] != 3 || b.a[1] != 4 || b.a[2] != 7 || b.a[3] != 9) return 2;
+    return 0;
+}
+"#;
+
+const SRET_LONG_DOUBLE_PARAM: &str = r#"
+struct Big { long a[4]; };
+__attribute__((noinline)) long double id(long double x) { return x; }
+__attribute__((noinline)) struct Big f(long double x) {
+    long double y = id(1.0L);
+    struct Big b = {{(long)(x * 4), (long)y, (long)(x * 1e30L / 1e29L), 0}};
+    return b;
+}
+int main(void) {
+    struct Big b = f(2.5L);
+    return b.a[0] == 10 && b.a[1] == 1 && b.a[2] == 25 ? 0 : 1;
+}
+"#;
+
+#[test]
+fn c99_sret_function_reads_its_own_parameters() {
+    for opt in ["-O0", "-O2"] {
+        for (name, src) in [
+            ("sret_complex", SRET_COMPLEX_PARAMS),
+            ("sret_ld", SRET_LONG_DOUBLE_PARAM),
+        ] {
+            assert_eq!(
+                compile_and_run(&format!("{name}{opt}"), src, &[opt.to_string()]),
+                0,
+                "{name} host {opt}"
+            );
+            if let Some(rc) = compile_and_run_aarch64(&format!("{name}_a64"), src, opt) {
+                assert_eq!(rc, 0, "{name} aarch64 {opt}");
+            }
+        }
+    }
 }

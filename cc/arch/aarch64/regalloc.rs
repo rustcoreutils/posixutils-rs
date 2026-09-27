@@ -1068,13 +1068,18 @@ pub struct SpilledArg {
 /// Bytes an argument pseudo's value occupies, from the function's parameter
 /// list. Eight when it cannot be identified, which is what every argument but
 /// a binary128 one needs anyway.
-fn fp_arg_bytes(func: &Function, pseudo: PseudoId, types: &TypeTable) -> i32 {
+fn fp_arg_bytes(
+    func: &Function,
+    lowering: &crate::arch::regalloc::AbiLowering,
+    pseudo: PseudoId,
+    types: &TypeTable,
+) -> i32 {
     func.get_pseudo(pseudo)
         .and_then(|p| match p.kind {
-            PseudoKind::Arg(idx) => func.params.get(idx as usize),
+            PseudoKind::Arg(idx) => lowering.param_type(func, idx),
             _ => None,
         })
-        .map(|(_, typ)| if types.size_bits(*typ) > 64 { 16 } else { 8 })
+        .map(|typ| if types.size_bits(typ) > 64 { 16 } else { 8 })
         .unwrap_or(8)
 }
 
@@ -1601,6 +1606,7 @@ impl RegAlloc {
 
         // Check FP arguments in caller-saved registers (v0-v7)
         let fp_arg_regs_set = VReg::arg_regs();
+        let lowering = crate::arch::regalloc::AbiLowering::new(func);
         for interval in intervals {
             if let Some(Loc::VReg(reg)) = self.locations.get(&interval.pseudo) {
                 if fp_arg_regs_set.contains(reg) && interval_crosses_call(interval, call_positions)
@@ -1609,7 +1615,7 @@ impl RegAlloc {
                     // Reserve what the value actually needs: a binary128
                     // argument is sixteen bytes, and eight left half of it
                     // overlapping whatever came next.
-                    let bytes = fp_arg_bytes(func, interval.pseudo, types);
+                    let bytes = fp_arg_bytes(func, &lowering, interval.pseudo, types);
                     let slot = LocalSlot::alloc(&mut self.stack_offset, bytes);
 
                     // Record the spill for codegen to emit stores in prologue

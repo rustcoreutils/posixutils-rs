@@ -1397,16 +1397,56 @@ impl FloatVal {
 /// A complex value: its real half, then its imaginary half.
 pub type Complex = (FloatVal, FloatVal);
 
-impl FpFormat {
-    /// The wider format libgcc divides this one's complex values in, where
-    /// it has one: `__divhc3` works in `float` and `__divsc3` in `double`,
-    /// and the extra precision lets both use the textbook formula. The wider
-    /// formats have nothing wider to work in and use Smith's method instead.
-    fn complex_div_working_format(self) -> Option<FpFormat> {
+/// A format whose floating complex `*` and `/` c17 computes by calling
+/// libgcc's `__mul?c3` and `__div?c3` for that format.
+///
+/// Every floating format but binary16 has its own routine. gcc does not call
+/// `__mulhc3`/`__divhc3` for `_Float16 _Complex` on x86-64 or aarch64: it
+/// widens the operands to `float`, calls `__mulsc3`/`__divsc3`, and narrows
+/// the result -- which rounds differently from computing each step in half
+/// precision. Leaving binary16 out of this type is what makes a caller ask
+/// [`FpFormat::complex_routine_format`] rather than pick a routine for it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ComplexRoutineFormat {
+    Binary32,
+    Binary64,
+    X87Extended,
+    Binary128,
+}
+
+impl ComplexRoutineFormat {
+    /// The format the routine takes and returns its halves in.
+    pub fn format(self) -> FpFormat {
         match self {
-            FpFormat::Binary16 => Some(FpFormat::Binary32),
-            FpFormat::Binary32 => Some(FpFormat::Binary64),
+            ComplexRoutineFormat::Binary32 => FpFormat::Binary32,
+            ComplexRoutineFormat::Binary64 => FpFormat::Binary64,
+            ComplexRoutineFormat::X87Extended => FpFormat::X87Extended,
+            ComplexRoutineFormat::Binary128 => FpFormat::Binary128,
+        }
+    }
+
+    /// The wider format libgcc divides this one's complex values in, where
+    /// it has one: `__divsc3` works in `double`, and the extra precision lets
+    /// it use the textbook formula. The wider formats have nothing wider to
+    /// work in and use Smith's method instead.
+    fn div_working_format(self) -> Option<FpFormat> {
+        match self {
+            ComplexRoutineFormat::Binary32 => Some(FpFormat::Binary64),
             _ => None,
+        }
+    }
+}
+
+impl FpFormat {
+    /// The format a complex `*` or `/` with halves in this format is
+    /// computed in, as gcc computes it: the format itself, except that
+    /// binary16 is widened to binary32 (see [`ComplexRoutineFormat`]).
+    pub fn complex_routine_format(self) -> ComplexRoutineFormat {
+        match self {
+            FpFormat::Binary16 | FpFormat::Binary32 => ComplexRoutineFormat::Binary32,
+            FpFormat::Binary64 => ComplexRoutineFormat::Binary64,
+            FpFormat::X87Extended => ComplexRoutineFormat::X87Extended,
+            FpFormat::Binary128 => ComplexRoutineFormat::Binary128,
         }
     }
 }
@@ -1469,12 +1509,41 @@ impl FloatVal {
         self.magnitude().cmp_value(other.magnitude()) == Some(std::cmp::Ordering::Less)
     }
 
-    /// `(a + bi) * (c + di)` at `fmt`, as `__mul?c3` computes it:
-    /// `(ac - bd) + (ad + bc)i`, each product and each sum rounded to `fmt`,
-    /// and C17 Annex G's recovery of an infinity that came out NaN + NaNi.
+    /// `(a + bi) * (c + di)` with halves in `fmt`, as the program computes
+    /// it: by the `__mul?c3` of `fmt`'s routine format, and rounded back.
     pub fn complex_mul(x: Complex, y: Complex, fmt: FpFormat) -> Complex {
-        let r = |v: Self| v.round_to_format(fmt);
-        let (mut a, mut b, mut c, mut d) = (r(x.0), r(x.1), r(y.0), r(y.1));
+        Self::through_routine(x, y, fmt, Self::routine_mul)
+    }
+
+    /// `(a + bi) / (c + di)` with halves in `fmt`, as the program computes
+    /// it: by the `__div?c3` of `fmt`'s routine format, and rounded back.
+    pub fn complex_div(x: Complex, y: Complex, fmt: FpFormat) -> Complex {
+        Self::through_routine(x, y, fmt, Self::routine_div)
+    }
+
+    /// `op` applied in `fmt`'s routine format, as c17's lowering applies it:
+    /// the operands, held in `fmt`, converted to the routine's format, and
+    /// the result converted back.
+    fn through_routine(
+        x: Complex,
+        y: Complex,
+        fmt: FpFormat,
+        op: fn(Complex, Complex, ComplexRoutineFormat) -> Complex,
+    ) -> Complex {
+        let routine = fmt.complex_routine_format();
+        let wide = routine.format();
+        let w = |v: Self| v.convert(fmt, wide);
+        let (re, im) = op((w(x.0), w(x.1)), (w(y.0), w(y.1)), routine);
+        (re.convert(wide, fmt), im.convert(wide, fmt))
+    }
+
+    /// `(a + bi) * (c + di)` as `__mul?c3` computes it: `(ac - bd) +
+    /// (ad + bc)i`, each product and each sum rounded to the routine's
+    /// format, and C17 Annex G's recovery of an infinity that came out
+    /// NaN + NaNi.
+    fn routine_mul(x: Complex, y: Complex, routine: ComplexRoutineFormat) -> Complex {
+        let fmt = routine.format();
+        let (mut a, mut b, mut c, mut d) = (x.0, x.1, y.0, y.1);
         let (ac, bd) = (a.mul(c, fmt), b.mul(d, fmt));
         let (ad, bc) = (a.mul(d, fmt), b.mul(c, fmt));
         let re = ac.sub(bd, fmt);
@@ -1515,17 +1584,17 @@ impl FloatVal {
         (inf.mul(re, fmt), inf.mul(im, fmt))
     }
 
-    /// `(a + bi) / (c + di)` at `fmt`, as `__div?c3` computes it.
+    /// `(a + bi) / (c + di)` as `__div?c3` computes it.
     ///
-    /// `float` and `_Float16` divide by the textbook formula in the next
-    /// wider format and round the result once more; the wider formats use
-    /// Smith's method, dividing through by the larger half of the divisor,
-    /// with libgcc's scaling against overflow and underflow. Annex G's
-    /// recovery of an infinity or a zero that came out NaN + NaNi follows.
-    pub fn complex_div(x: Complex, y: Complex, fmt: FpFormat) -> Complex {
-        let r = |v: Self| v.round_to_format(fmt);
-        let (a, b, c, d) = (r(x.0), r(x.1), r(y.0), r(y.1));
-        let ((re, im), (a, b, c, d)) = match fmt.complex_div_working_format() {
+    /// `float` divides by the textbook formula in `double` and rounds the
+    /// result once more; the wider formats use Smith's method, dividing
+    /// through by the larger half of the divisor, with libgcc's scaling
+    /// against overflow and underflow. Annex G's recovery of an infinity or a
+    /// zero that came out NaN + NaNi follows.
+    fn routine_div(x: Complex, y: Complex, routine: ComplexRoutineFormat) -> Complex {
+        let fmt = routine.format();
+        let (a, b, c, d) = (x.0, x.1, y.0, y.1);
+        let ((re, im), (a, b, c, d)) = match routine.div_working_format() {
             Some(wide) => {
                 // Widening is exact, so the operands need no conversion.
                 let denom = c.mul(c, wide).add(d.mul(d, wide), wide);
@@ -2718,6 +2787,55 @@ mod tests {
         // (1 + 2i) / (3 + 4i) = 0.44 + 0.08i, as libgcc computes it.
         let (re, im) = FloatVal::complex_div((v(1.0), v(2.0)), (v(3.0), v(4.0)), fmt);
         assert_eq!((re.to_f64(), im.to_f64()), (0.44, 0.08));
+    }
+
+    /// `_Float16 _Complex` `*` and `/` fold as gcc computes them at run time
+    /// on x86-64 and aarch64: widened to `float`, through `__mulsc3` and
+    /// `__divsc3`, and narrowed. Each row is four operand halves and the four
+    /// result halves gcc 13's program printed, identical on both targets.
+    ///
+    /// The fourth row tells the two rules apart: rounding each step to half
+    /// precision, as `__mulhc3` would, gives an imaginary part of `0x59c0`.
+    #[test]
+    fn complex_binary16_goes_through_the_float_routines() {
+        let fmt = FpFormat::Binary16;
+        let rows: [[u128; 8]; 6] = [
+            [
+                0xbd80, 0x392f, 0xd42f, 0x1c78, 0x55c1, 0xd16c, 0x2542, 0xa0f5,
+            ],
+            [
+                0x6760, 0xcca1, 0xe42d, 0x35cb, 0xfc00, 0x7500, 0xbf11, 0x2448,
+            ],
+            [
+                0x3628, 0x2581, 0x0ab3, 0x9e0d, 0x0abe, 0x98a6, 0xbd89, 0x5413,
+            ],
+            [
+                0xa6f1, 0x0869, 0x5d2b, 0xeea1, 0xc807, 0x59c1, 0x8004, 0x8043,
+            ],
+            [
+                0xf5b3, 0x043a, 0xb333, 0x5591, 0x6d21, 0xfc00, 0x394c, 0x5c18,
+            ],
+            [
+                0x0cea, 0x1f1e, 0x05f6, 0x862c, 0x000b, 0x000a, 0xd093, 0x50d1,
+            ],
+        ];
+        for bits in rows {
+            let v = |i: usize| finite_from_bits(fmt, bits[i]);
+            let (x, y) = ((v(0), v(1)), (v(2), v(3)));
+            let (mre, mim) = FloatVal::complex_mul(x, y, fmt);
+            let (qre, qim) = FloatVal::complex_div(x, y, fmt);
+            let got = [mre, mim, qre, qim].map(|h| h.to_bits(fmt));
+            assert_eq!(
+                got,
+                [bits[4], bits[5], bits[6], bits[7]],
+                "{:x?}",
+                &bits[..4]
+            );
+        }
+        assert_eq!(
+            FpFormat::Binary16.complex_routine_format(),
+            ComplexRoutineFormat::Binary32
+        );
     }
 
     /// `float` divides in `double` and rounds once more, as `__divsc3` does.

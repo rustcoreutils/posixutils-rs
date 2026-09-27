@@ -22,7 +22,9 @@
 //
 
 use super::asm_probe::{asm_for, asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
-use crate::common::{aarch64_cross_available, create_c_file, cross_link_and_run, run_c17};
+use crate::common::{
+    aarch64_cross_available, compile_with_host_cc, create_c_file, cross_link_and_run, run_c17,
+};
 
 /// AAPCS64 passes a `_Complex` as a two-element HFA, so it occupies **two**
 /// V registers and the next floating-point parameter starts after both.
@@ -2749,5 +2751,126 @@ int main(void)
                 "{what} at {opt}"
             );
         }
+    }
+}
+
+// `_Float16 _Complex` across a call, against gcc. System V classifies it as
+// one SSE eightbyte (both halves packed in the low 32 bits of %xmm0); AAPCS64
+// and Apple arm64 make it a two-member HFA in h0/h1. The callee takes them
+// first, between other scalars, and past the eight argument registers.
+const HALF_COMPLEX_CALLEE: &str = r#"
+typedef _Float16 _Complex hc;
+hc id(hc a) { return a; }
+hc swap(hc a) { return __builtin_complex(__imag__ a, __real__ a); }
+hc mix(int n, hc a, double d, hc b) {
+    return __builtin_complex((_Float16)(__imag__ b + (_Float16)n),
+                             (_Float16)(__real__ a + (_Float16)d));
+}
+hc many(hc a, hc b, hc c, hc d, hc e, hc f, hc g, hc h, hc i, hc j) {
+    (void)c; (void)d; (void)e; (void)f; (void)g;
+    return __builtin_complex((_Float16)(__real__ a + __real__ j),
+                             (_Float16)(__imag__ i - __imag__ b + __real__ h));
+}
+"#;
+
+const HALF_COMPLEX_CALLER: &str = r#"
+typedef _Float16 _Complex hc;
+hc id(hc a);
+hc swap(hc a);
+hc mix(int n, hc a, double d, hc b);
+hc many(hc a, hc b, hc c, hc d, hc e, hc f, hc g, hc h, hc i, hc j);
+static hc mk(double r, double i) { return __builtin_complex((_Float16)r, (_Float16)i); }
+int main(void) {
+    hc r = id(mk(1.5, -2.25));
+    if (__real__ r != 1.5f16 || __imag__ r != -2.25f16) return 1;
+    r = swap(mk(3, 4));
+    if (__real__ r != 4 || __imag__ r != 3) return 2;
+    r = mix(3, mk(1, 2), 0.5, mk(4, 5));
+    if (__real__ r != 8 || __imag__ r != 1.5f16) return 3;
+    r = many(mk(1, 2), mk(3, 4), mk(5, 6), mk(7, 8), mk(9, 10), mk(11, 12), mk(13, 14),
+             mk(15, 16), mk(17, 18), mk(19, 20));
+    if (__real__ r != 20 || __imag__ r != 29) return 4;
+    return 0;
+}
+"#;
+
+/// `_Float16 _Complex` arguments and returns agree with gcc on x86-64: a c17
+/// callee under a gcc caller, and the reverse.
+#[test]
+fn cross_abi_float16_complex_matches_gcc_on_the_host() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+    for (name, c17_unit, host_unit) in [
+        (
+            "half_complex_c17_callee",
+            HALF_COMPLEX_CALLEE,
+            HALF_COMPLEX_CALLER,
+        ),
+        (
+            "half_complex_c17_caller",
+            HALF_COMPLEX_CALLER,
+            HALF_COMPLEX_CALLEE,
+        ),
+    ] {
+        if let Some(rc) = compile_with_host_cc(name, c17_unit, host_unit) {
+            assert_eq!(rc, 0, "{name}");
+        }
+    }
+}
+
+/// The same pairings on aarch64 under qemu, with the gcc/gcc pair as the
+/// reference; and on Apple arm64, whose non-variadic HFA rule is AAPCS64's,
+/// the callee reads both halves from h0 and h1.
+#[test]
+fn cross_abi_float16_complex_matches_gcc_on_aarch64() {
+    let asm = super::asm_probe::asm_for(
+        "half_complex_darwin",
+        "aarch64-apple-darwin",
+        HALF_COMPLEX_CALLEE,
+    );
+    let body = body_of(&asm, "swap");
+    assert!(
+        body.contains("h0") && body.contains("h1"),
+        "Apple arm64 passes a _Float16 _Complex in h0/h1:\n{body}"
+    );
+
+    if !aarch64_cross_available() {
+        eprintln!("SKIP: no aarch64 cross toolchain");
+        return;
+    }
+    let callee_c = create_c_file("half_complex_callee", HALF_COMPLEX_CALLEE);
+    let caller_c = create_c_file("half_complex_caller", HALF_COMPLEX_CALLER);
+    let callee_src = callee_c.path().to_string_lossy().into_owned();
+    let caller_src = caller_c.path().to_string_lossy().into_owned();
+    assert_eq!(
+        cross_link_and_run("half_complex_ref", &[&caller_src, &callee_src]),
+        0,
+        "the gcc/gcc reference must pass, or this probe is not testing the ABI"
+    );
+    for opt in ["-O0", "-O2"] {
+        let asm = |src: &str, tag: &str| {
+            let out = plib::tmp::Builder::new()
+                .prefix(&format!("c17_half_complex_{tag}_"))
+                .suffix(".s")
+                .tempfile()
+                .expect("failed to create temp file");
+            let path = out.path().to_string_lossy().into_owned();
+            let run = run_c17(&["--target", AARCH64_LINUX, opt, "-S", "-o", &path, src]);
+            assert!(run.success, "c17 failed on the {tag}:\n{}", run.stderr);
+            (out, path)
+        };
+        let (_callee_tmp, callee_s) = asm(&callee_src, "callee");
+        let (_caller_tmp, caller_s) = asm(&caller_src, "caller");
+        assert_eq!(
+            cross_link_and_run("half_complex_c17_callee", &[&caller_src, &callee_s]),
+            0,
+            "gcc caller, c17 callee, {opt}"
+        );
+        assert_eq!(
+            cross_link_and_run("half_complex_c17_caller", &[&caller_s, &callee_src]),
+            0,
+            "c17 caller, gcc callee, {opt}"
+        );
     }
 }

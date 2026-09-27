@@ -14,6 +14,7 @@
 //
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
+use crate::float::ComplexRoutineFormat;
 use crate::ir::{CallAbiInfo, Function, Instruction, Module, Opcode, PseudoId};
 use crate::rtlib::{Float16Abi, RtlibNames};
 use crate::target::{Arch, Os, Target};
@@ -46,45 +47,28 @@ pub trait ArchMapper {
 
 // Complex number rtlib name selection
 
-/// Get the rtlib function name for complex multiplication.
-/// Target-dependent for long double (x87 vs IEEE quad).
-pub fn complex_mul_name(base_kind: TypeKind, target: &Target) -> &'static str {
-    match base_kind {
-        TypeKind::Float128 => "__multc3",
-        TypeKind::Float => "__mulsc3",
-        TypeKind::Double => "__muldc3",
-        TypeKind::LongDouble => {
-            if target.arch == Arch::Aarch64 && target.os == Os::MacOS {
-                "__muldc3" // macOS aarch64: long double == double
-            } else {
-                match target.arch {
-                    Arch::X86_64 => "__mulxc3",
-                    Arch::Aarch64 => "__multc3",
-                }
-            }
-        }
-        _ => "__muldc3",
+/// libgcc's routine for a floating complex multiplication in `routine`.
+///
+/// Keyed by format, not by type: `long double` is three formats across the
+/// targets, and binary128 is `__float128` on one and `long double` on
+/// another, but each format has exactly one routine. There is no binary16
+/// case to get wrong -- see [`ComplexRoutineFormat`].
+pub fn complex_mul_name(routine: ComplexRoutineFormat) -> &'static str {
+    match routine {
+        ComplexRoutineFormat::Binary32 => "__mulsc3",
+        ComplexRoutineFormat::Binary64 => "__muldc3",
+        ComplexRoutineFormat::X87Extended => "__mulxc3",
+        ComplexRoutineFormat::Binary128 => "__multc3",
     }
 }
 
-/// Get the rtlib function name for complex division.
-/// Target-dependent for long double (x87 vs IEEE quad).
-pub fn complex_div_name(base_kind: TypeKind, target: &Target) -> &'static str {
-    match base_kind {
-        TypeKind::Float128 => "__divtc3",
-        TypeKind::Float => "__divsc3",
-        TypeKind::Double => "__divdc3",
-        TypeKind::LongDouble => {
-            if target.arch == Arch::Aarch64 && target.os == Os::MacOS {
-                "__divdc3"
-            } else {
-                match target.arch {
-                    Arch::X86_64 => "__divxc3",
-                    Arch::Aarch64 => "__divtc3",
-                }
-            }
-        }
-        _ => "__divdc3",
+/// libgcc's routine for a floating complex division in `routine`.
+pub fn complex_div_name(routine: ComplexRoutineFormat) -> &'static str {
+    match routine {
+        ComplexRoutineFormat::Binary32 => "__divsc3",
+        ComplexRoutineFormat::Binary64 => "__divdc3",
+        ComplexRoutineFormat::X87Extended => "__divxc3",
+        ComplexRoutineFormat::Binary128 => "__divtc3",
     }
 }
 
@@ -2306,57 +2290,90 @@ mod tests {
 
     // Complex mul/div rtlib name tests
 
+    /// The routine each floating complex type's `*` and `/` call, on every
+    /// target: what gcc 13 calls for the same source. `_Float16 _Complex`
+    /// calls the `float` routines, on operands widened to `float`; it used to
+    /// fall through to the `double` ones, on half-precision bits.
     #[test]
-    fn test_complex_mul_name_float() {
-        let target = Target::new(Arch::X86_64, Os::Linux);
-        assert_eq!(complex_mul_name(TypeKind::Float, &target), "__mulsc3");
-    }
-
-    #[test]
-    fn test_complex_mul_name_double() {
-        let target = Target::new(Arch::X86_64, Os::Linux);
-        assert_eq!(complex_mul_name(TypeKind::Double, &target), "__muldc3");
-    }
-
-    #[test]
-    fn test_complex_mul_name_longdouble() {
-        let x86 = Target::new(Arch::X86_64, Os::Linux);
-        assert_eq!(complex_mul_name(TypeKind::LongDouble, &x86), "__mulxc3");
-
-        let arm_linux = Target::new(Arch::Aarch64, Os::Linux);
-        assert_eq!(
-            complex_mul_name(TypeKind::LongDouble, &arm_linux),
-            "__multc3"
-        );
-
-        let arm_macos = Target::new(Arch::Aarch64, Os::MacOS);
-        assert_eq!(
-            complex_mul_name(TypeKind::LongDouble, &arm_macos),
-            "__muldc3"
-        );
-    }
-
-    #[test]
-    fn test_complex_div_name_float() {
-        let target = Target::new(Arch::X86_64, Os::Linux);
-        assert_eq!(complex_div_name(TypeKind::Float, &target), "__divsc3");
-    }
-
-    #[test]
-    fn test_complex_div_name_longdouble() {
-        let x86 = Target::new(Arch::X86_64, Os::Linux);
-        assert_eq!(complex_div_name(TypeKind::LongDouble, &x86), "__divxc3");
-
-        let arm_linux = Target::new(Arch::Aarch64, Os::Linux);
-        assert_eq!(
-            complex_div_name(TypeKind::LongDouble, &arm_linux),
-            "__divtc3"
-        );
-
-        let arm_macos = Target::new(Arch::Aarch64, Os::MacOS);
-        assert_eq!(
-            complex_div_name(TypeKind::LongDouble, &arm_macos),
-            "__divdc3"
-        );
+    fn test_complex_routine_per_type_and_target() {
+        use crate::types::TypeKind as K;
+        // A base type, and its multiply and divide routines.
+        type Row = (K, &'static str, &'static str);
+        let cases: [(Arch, Os, &[Row]); 4] = [
+            (
+                Arch::X86_64,
+                Os::Linux,
+                &[
+                    (K::Float16, "__mulsc3", "__divsc3"),
+                    (K::Float, "__mulsc3", "__divsc3"),
+                    (K::Double, "__muldc3", "__divdc3"),
+                    (K::LongDouble, "__mulxc3", "__divxc3"),
+                    (K::Float128, "__multc3", "__divtc3"),
+                ],
+            ),
+            (
+                Arch::X86_64,
+                Os::MacOS,
+                &[
+                    (K::Float16, "__mulsc3", "__divsc3"),
+                    (K::LongDouble, "__mulxc3", "__divxc3"),
+                ],
+            ),
+            (
+                Arch::Aarch64,
+                Os::Linux,
+                &[
+                    (K::Float16, "__mulsc3", "__divsc3"),
+                    (K::Float, "__mulsc3", "__divsc3"),
+                    (K::Double, "__muldc3", "__divdc3"),
+                    (K::LongDouble, "__multc3", "__divtc3"),
+                ],
+            ),
+            (
+                Arch::Aarch64,
+                Os::MacOS,
+                &[
+                    (K::Float16, "__mulsc3", "__divsc3"),
+                    // Apple arm64: long double is double.
+                    (K::LongDouble, "__muldc3", "__divdc3"),
+                ],
+            ),
+        ];
+        for (arch, os, rows) in cases {
+            let types = TypeTable::new(&Target::new(arch, os));
+            for &(kind, mul, div) in rows {
+                let base = match kind {
+                    K::Float16 => types.float16_id,
+                    K::Float => types.float_id,
+                    K::Double => types.double_id,
+                    K::LongDouble => types.longdouble_id,
+                    _ => types.float128_id,
+                };
+                let (work, routine) = types
+                    .complex_routine_type(base)
+                    .unwrap_or_else(|| panic!("{kind:?} is floating"));
+                assert_eq!(
+                    complex_mul_name(routine),
+                    mul,
+                    "{kind:?} on {arch:?}/{os:?}"
+                );
+                assert_eq!(
+                    complex_div_name(routine),
+                    div,
+                    "{kind:?} on {arch:?}/{os:?}"
+                );
+                // The operands are converted to the routine's own type, which
+                // is the base itself wherever the base has a routine.
+                let want_work = if kind == K::Float16 {
+                    types.float_id
+                } else {
+                    base
+                };
+                assert_eq!(work, want_work, "{kind:?} on {arch:?}/{os:?}");
+            }
+        }
+        // Not a floating type: no routine.
+        let types = TypeTable::new(&Target::new(Arch::X86_64, Os::Linux));
+        assert!(types.complex_routine_type(types.int_id).is_none());
     }
 }

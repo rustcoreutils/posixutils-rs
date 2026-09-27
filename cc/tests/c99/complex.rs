@@ -8,7 +8,7 @@
 //
 // C99 Complex Number Tests
 
-use crate::common::{compile_and_run, compile_and_run_optimized};
+use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_optimized};
 
 #[test]
 fn c99_complex_mega() {
@@ -1434,4 +1434,52 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("c99_conj_call_static_init", code, &[]), 0);
+}
+
+// `_Float16 _Complex` arithmetic at run time, and its imaginary constants in
+// both suffix orders. Every value was checked against gcc on x86-64 and
+// aarch64. Multiplication and division called the `double` routines
+// (__muldc3/__divdc3) on half-precision operands and returned 0.
+const FLOAT16_COMPLEX_PROGRAM: &str = r#"
+typedef _Float16 _Complex hc;
+int main(void) {
+    volatile _Float16 a = 1.5f16, b = 2.0f16, c = 3.0f16, d = -1.0f16;
+    hc x = __builtin_complex((_Float16)a, (_Float16)b);
+    hc y = __builtin_complex((_Float16)c, (_Float16)d);
+    hc p = x * y, q = x / y, s = x + y, t = x - y;
+    if (__real__ p != 6.5f16 || __imag__ p != 4.5f16) return 1;
+    if (__real__ s != 4.5f16 || __imag__ s != 1.0f16) return 2;
+    /* (1.5+2i)/(3-i) = (4.5-2 + (6+1.5)i)/10 */
+    if (__real__ q != 0.25f16 || __imag__ q != 0.75f16) return 3;
+    if (__real__ t != -1.5f16 || __imag__ t != 3.0f16) return 4;
+    hc k = 2.0f16i;
+    hc k2 = 2.0if16;
+    if (__imag__ k != 2.0f16 || __imag__ k2 != 2.0f16 || __real__ k2 != 0) return 5;
+    if (sizeof(k) != 4 || sizeof(2.0if16) != 4) return 6;
+    hc m = x * 2.0if16;
+    if (__real__ m != -4.0f16 || __imag__ m != 3.0f16) return 7;
+    return 0;
+}
+"#;
+
+#[test]
+fn c99_float16_complex_arithmetic() {
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("f16_complex{opt}"),
+                FLOAT16_COMPLEX_PROGRAM,
+                &[opt.to_string()]
+            ),
+            0,
+            "host {opt}"
+        );
+        if let Some(rc) = compile_and_run_aarch64(
+            &format!("f16_complex_a64{opt}"),
+            FLOAT16_COMPLEX_PROGRAM,
+            opt,
+        ) {
+            assert_eq!(rc, 0, "aarch64 {opt}");
+        }
+    }
 }

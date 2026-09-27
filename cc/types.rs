@@ -9,7 +9,7 @@
 // Compositional type model with interning for efficient comparison.
 //
 
-use crate::float::FpFormat;
+use crate::float::{ComplexRoutineFormat, FpFormat};
 use crate::strings::{StringId, StringTable as IdentTable};
 use crate::target::{Arch, Os, Target};
 use std::collections::HashMap;
@@ -1548,6 +1548,29 @@ impl TypeTable {
             },
             _ => return None,
         })
+    }
+
+    /// The real type a floating complex `*` or `/` whose halves have type
+    /// `base` is computed in, and the libgcc routine format that computes it;
+    /// `None` if `base` is not a floating type.
+    ///
+    /// The type is `base` itself wherever `base`'s format has a routine, and
+    /// otherwise the type the operands are widened to: `float`, for a
+    /// `_Float16` base (see [`FpFormat::complex_routine_format`]).
+    pub fn complex_routine_type(&self, base: TypeId) -> Option<(TypeId, ComplexRoutineFormat)> {
+        let fmt = self.fp_format(base)?;
+        let routine = fmt.complex_routine_format();
+        let typ = if routine.format() == fmt {
+            base
+        } else {
+            match routine {
+                ComplexRoutineFormat::Binary32 => self.float_id,
+                ComplexRoutineFormat::Binary64 => self.double_id,
+                ComplexRoutineFormat::X87Extended => self.longdouble_id,
+                ComplexRoutineFormat::Binary128 => self.float128_id,
+            }
+        };
+        Some((typ, routine))
     }
 
     /// Get the complex type for a float base type (e.g., double → double _Complex)

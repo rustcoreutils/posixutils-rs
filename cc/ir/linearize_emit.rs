@@ -1450,54 +1450,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                 );
                 return result_addr;
             }
-            BinaryOp::Mul => {
-                // Complex multiply via rtlib call (__mulsc3, __muldc3, etc.)
-                let base_kind = self.types.kind(base_typ);
-                let func_name = crate::arch::mapping::complex_mul_name(base_kind, self.target);
-                let call_result = self.emit_complex_rtlib_call(
-                    func_name,
-                    (left_real, left_imag),
-                    (right_real, right_imag),
-                    base_typ,
-                    complex_typ,
-                );
-                // Load real/imag from the call result
-                let real = self.alloc_pseudo();
-                self.emit(Instruction::load(real, call_result, 0, base_typ, base_size));
-                let imag = self.alloc_pseudo();
-                self.emit(Instruction::load(
-                    imag,
-                    call_result,
-                    base_bytes,
-                    base_typ,
-                    base_size,
-                ));
-                (real, imag)
-            }
-            BinaryOp::Div => {
-                // Complex divide via rtlib call (__divsc3, __divdc3, etc.)
-                let base_kind = self.types.kind(base_typ);
-                let func_name = crate::arch::mapping::complex_div_name(base_kind, self.target);
-                let call_result = self.emit_complex_rtlib_call(
-                    func_name,
-                    (left_real, left_imag),
-                    (right_real, right_imag),
-                    base_typ,
-                    complex_typ,
-                );
-                // Load real/imag from the call result
-                let real = self.alloc_pseudo();
-                self.emit(Instruction::load(real, call_result, 0, base_typ, base_size));
-                let imag = self.alloc_pseudo();
-                self.emit(Instruction::load(
-                    imag,
-                    call_result,
-                    base_bytes,
-                    base_typ,
-                    base_size,
-                ));
-                (real, imag)
-            }
+            BinaryOp::Mul | BinaryOp::Div => self.emit_complex_float_muldiv(
+                op,
+                (left_real, left_imag),
+                (right_real, right_imag),
+                base_typ,
+            ),
             _ => {
                 // Other operations not supported for complex types
                 error(
@@ -1525,6 +1483,47 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         result_addr
+    }
+
+    /// A floating complex `*` or `/`, by libgcc's `__mul?c3`/`__div?c3`.
+    ///
+    /// The routine is the one for the halves' routine format, as gcc picks
+    /// it: `_Float16 _Complex` has no routine of its own that gcc calls, so
+    /// its halves are widened to `float`, `__mulsc3`/`__divsc3` computes, and
+    /// the result is narrowed back -- the same steps the constant folder takes
+    /// (`FloatVal::complex_mul`), so a folded and a run-time result agree.
+    /// It used to call the `double` routines on half-precision bits.
+    fn emit_complex_float_muldiv(
+        &mut self,
+        op: BinaryOp,
+        left: (PseudoId, PseudoId),
+        right: (PseudoId, PseudoId),
+        base_typ: TypeId,
+    ) -> (PseudoId, PseudoId) {
+        let (work_typ, routine) = self
+            .types
+            .complex_routine_type(base_typ)
+            .expect("a non-integral complex type has a floating base");
+        let func_name = match op {
+            BinaryOp::Mul => crate::arch::mapping::complex_mul_name(routine),
+            _ => crate::arch::mapping::complex_div_name(routine),
+        };
+        let mut widen = |v| self.emit_convert(v, base_typ, work_typ);
+        let left = (widen(left.0), widen(left.1));
+        let right = (widen(right.0), widen(right.1));
+        let call_result = self.emit_complex_rtlib_call(
+            func_name,
+            left,
+            right,
+            work_typ,
+            self.types.make_complex(work_typ),
+        );
+        let (real, imag, _, _) =
+            self.load_complex_halves(call_result, self.types.make_complex(work_typ));
+        (
+            self.emit_convert(real, work_typ, base_typ),
+            self.emit_convert(imag, work_typ, base_typ),
+        )
     }
 
     /// `(a + bi) * (c + di)` for integer halves: `(ac - bd) + (ad + bc)i`.

@@ -10,7 +10,7 @@
 //
 
 use super::codegen::Aarch64CodeGen;
-use super::lir::{Aarch64Inst, MemAddr};
+use super::lir::{Aarch64Inst, GpOperand, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::arch::lir::{CondCode, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, Opcode, PseudoId};
@@ -408,6 +408,52 @@ impl Aarch64CodeGen {
 
     /// Emit FP negation
     pub(super) fn emit_fp_neg(&mut self, insn: &Instruction, types: &TypeTable) {
+        self.emit_fp_unop(insn, types, |cg, size, src, dst| {
+            cg.push_lir(Aarch64Inst::Fneg { size, src, dst })
+        });
+    }
+
+    /// Emit `Fabs`: clear the sign bit and nothing else, so `-0.0` becomes
+    /// `+0.0` and a NaN keeps its payload.
+    ///
+    /// `fabs` for the scalar sizes. A binary128 has no FP instruction, and
+    /// its arithmetic is in libgcc, but this is not arithmetic: bit 127 is
+    /// bit 63 of lane 1, cleared through a general register.
+    pub(super) fn emit_fp_abs(&mut self, insn: &Instruction, types: &TypeTable) {
+        self.emit_fp_unop(insn, types, |cg, size, src, dst| {
+            if size != FpSize::Quad {
+                cg.push_lir(Aarch64Inst::Fabs { size, src, dst });
+                return;
+            }
+            let (scratch0, _, _) = Reg::scratch_regs();
+            cg.push_lir(Aarch64Inst::FmovReg { size, src, dst });
+            cg.push_lir(Aarch64Inst::UmovVecDToGp {
+                lane: 1,
+                src: dst,
+                dst: scratch0,
+            });
+            cg.push_lir(Aarch64Inst::And {
+                size: OperandSize::B64,
+                src1: scratch0,
+                src2: GpOperand::Imm(i64::MAX),
+                dst: scratch0,
+            });
+            cg.push_lir(Aarch64Inst::InsGpToVecD {
+                lane: 1,
+                src: scratch0,
+                dst,
+            });
+        });
+    }
+
+    /// A one-operand FP operation, pushed by `emit` given its size and its
+    /// source and destination registers (which differ).
+    fn emit_fp_unop(
+        &mut self,
+        insn: &Instruction,
+        types: &TypeTable,
+        emit: impl FnOnce(&mut Self, FpSize, VReg, VReg),
+    ) {
         let size = Self::size_from_type(insn.typ, insn.size, types);
         let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
         let src = match insn.src.first() {
@@ -426,11 +472,7 @@ impl Aarch64CodeGen {
 
         self.emit_fp_move(src, VReg::V17, insn.typ, size, types);
 
-        self.push_lir(Aarch64Inst::Fneg {
-            size: fp_size,
-            src: VReg::V17,
-            dst: work_reg,
-        });
+        emit(self, fp_size, VReg::V17, work_reg);
 
         if !matches!(&dst_loc, Loc::VReg(v) if *v == work_reg) {
             self.emit_fp_move_to_loc(work_reg, &dst_loc, insn.typ, size, types);

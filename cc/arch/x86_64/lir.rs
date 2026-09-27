@@ -500,6 +500,13 @@ pub enum X86Inst {
         dst: XmmReg,
     },
 
+    /// ANDPS/ANDPD - AND packed floating-point (used for absolute value)
+    AndFp {
+        size: FpSize,
+        src: XmmReg,
+        dst: XmmReg,
+    },
+
     /// UCOMISS/UCOMISD - Unordered compare scalar floating-point
     UComiFp {
         size: FpSize,
@@ -546,6 +553,9 @@ pub enum X86Inst {
 
     /// FCHS - Negate ST(0)
     X87Neg,
+
+    /// FABS - Clear the sign of ST(0)
+    X87Abs,
 
     /// FCOMIP - Compare ST(0) with ST(1), set EFLAGS, pop ST(0)
     X87CmpPop,
@@ -906,6 +916,15 @@ impl EmitAsm for X86Inst {
                     dst.name()
                 );
             }
+            X86Inst::AndFp { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    and{} {}, {}",
+                    size.x86_packed_suffix(),
+                    src.name(),
+                    dst.name()
+                );
+            }
 
             X86Inst::UComiFp { size, src, dst } => {
                 Self::emit_fp_alu("ucomi", size, src, dst, target, out)
@@ -953,6 +972,10 @@ impl EmitAsm for X86Inst {
 
             X86Inst::X87Neg => {
                 let _ = writeln!(out, "    fchs");
+            }
+
+            X86Inst::X87Abs => {
+                let _ = writeln!(out, "    fabs");
             }
 
             X86Inst::X87CmpPop => {

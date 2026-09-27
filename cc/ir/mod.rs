@@ -156,6 +156,9 @@ pub enum Opcode {
     Not,  // Bitwise NOT
     Neg,  // Integer negation
     FNeg, // Float negation
+    // Float absolute value, at the width of `typ`: clears the sign bit and
+    // nothing else, so it is exact and raises nothing, even for a NaN.
+    Fabs,
 
     // Type conversions
     Trunc, // Truncate to smaller integer
@@ -245,8 +248,6 @@ pub enum Opcode {
     Memmove, // memmove(dest, src, n) - copy overlapping memory
 
     // Floating-point builtins
-    Fabs32,    // Absolute value of float
-    Fabs64,    // Absolute value of double
     Signbit32, // Test sign bit of float (returns int)
     Signbit64, // Test sign bit of double (returns int)
 
@@ -451,6 +452,7 @@ impl Opcode {
             Opcode::Not => "not",
             Opcode::Neg => "neg",
             Opcode::FNeg => "fneg",
+            Opcode::Fabs => "fabs",
             Opcode::Trunc => "trunc",
             Opcode::Zext => "zext",
             Opcode::Sext => "sext",
@@ -491,8 +493,6 @@ impl Opcode {
             Opcode::Memset => "memset",
             Opcode::Memcpy => "memcpy",
             Opcode::Memmove => "memmove",
-            Opcode::Fabs32 => "fabs32",
-            Opcode::Fabs64 => "fabs64",
             Opcode::Signbit32 => "signbit32",
             Opcode::Signbit64 => "signbit64",
             Opcode::Unreachable => "unreachable",
@@ -1039,8 +1039,7 @@ impl Instruction {
     }
 
     /// The C library function an opcode the backends lower to a call
-    /// (`Memcpy`, `Memset`, `Memmove`, `Fabs32`/`Fabs64`, `Setjmp`,
-    /// `Longjmp`) calls, by its assembler name.
+    /// (`Memcpy`, `Memset`, `Memmove`, `Setjmp`, `Longjmp`) calls, by its assembler name.
     ///
     /// The linearizer resolved it through the program's own declarations
     /// (`Linearizer::library_function_name`), so an asm-label rename of
@@ -3160,11 +3159,9 @@ mod tests {
     }
 
     #[test]
-    fn test_fabs_opcodes() {
-        assert_eq!(Opcode::Fabs32.name(), "fabs32");
-        assert_eq!(Opcode::Fabs64.name(), "fabs64");
-        assert!(!Opcode::Fabs32.is_terminator());
-        assert!(!Opcode::Fabs64.is_terminator());
+    fn test_fabs_opcode() {
+        assert_eq!(Opcode::Fabs.name(), "fabs");
+        assert!(!Opcode::Fabs.is_terminator());
     }
 
     #[test]

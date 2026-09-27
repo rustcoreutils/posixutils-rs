@@ -60,9 +60,8 @@ pub enum InlineLibraryFn {
     /// `abs`, `labs`, `llabs`, `imaxabs`: the magnitude of an integer, at the
     /// width of the expression's own type.
     IntAbs,
-    /// `fabs` and `fabsf`: the magnitude of a `double` or `float`, whichever
-    /// the expression's own type is. `fabsl` is not one: an opcode that moves
-    /// its operand as a `double` would read eight bytes of an x87 value.
+    /// `fabs`, `fabsf`, `fabsl`: the magnitude of a `double`, `float` or
+    /// `long double`, whichever the expression's own type is.
     Fabs,
     /// `creal`, `crealf`, `creall`: the real half of a complex value.
     ComplexReal,

@@ -56,6 +56,7 @@ SSA-form intermediate representation for the c17 C17 compiler. Inspired by Linus
 | `not` | Bitwise NOT (unary) |
 | `neg` | Integer negation (unary) |
 | `fneg` | Float negation (unary) |
+| `fabs` | Float absolute value (unary): clears the sign bit and nothing else |
 
 ### Integer Comparisons (result: 0 or 1)
 
@@ -182,8 +183,6 @@ Use `returns_via_sret()` and `returns_two_regs()` to query return strategy.
 
 | Opcode | Description |
 |--------|-------------|
-| `fabs32` | Absolute value (`float`) |
-| `fabs64` | Absolute value (`double`) |
 | `signbit32` | Test sign bit (`float`); returns int |
 | `signbit64` | Test sign bit (`double`); returns int |
 

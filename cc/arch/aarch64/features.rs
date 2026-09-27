@@ -1534,30 +1534,4 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::X0, &dst_loc, u32::BITS);
     }
-
-    /// Emit __builtin_fabsf/__builtin_fabs - absolute value of float/double
-    pub(super) fn emit_fabs(&mut self, insn: &Instruction, types: &TypeTable, is_double: bool) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let size = if is_double { 64 } else { 32 };
-
-        // Load argument into V0 (first FP argument register)
-        self.emit_fp_move(arg, VReg::V0, None, size, types);
-
-        // Call fabs/fabsf from libc
-        self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
-        });
-
-        // Result is in V0, store to target
-        let dst_loc = self.get_location(target);
-        self.emit_fp_move_to_loc(VReg::V0, &dst_loc, None, size, types);
-    }
 }

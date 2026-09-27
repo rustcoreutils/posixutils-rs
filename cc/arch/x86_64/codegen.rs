@@ -970,6 +970,14 @@ impl X86_64CodeGen {
                 }
             }
 
+            Opcode::Fabs => {
+                if self.is_longdouble_op(insn, types) {
+                    self.emit_x87_abs(insn);
+                } else {
+                    self.emit_fp_abs(insn, types);
+                }
+            }
+
             // Floating-point comparisons
             Opcode::FCmpOEq
             | Opcode::FCmpONe
@@ -1125,14 +1133,6 @@ impl X86_64CodeGen {
 
             Opcode::Memmove => {
                 self.emit_memmove(insn);
-            }
-
-            Opcode::Fabs32 => {
-                self.emit_fabs32(insn);
-            }
-
-            Opcode::Fabs64 => {
-                self.emit_fabs64(insn);
             }
 
             Opcode::Signbit32 => {

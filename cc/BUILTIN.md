@@ -109,8 +109,8 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 precision are known to c17 by prototype, under their bare names and (except
 the floor family) their `__builtin_` spellings. One table in
 `parse/library_builtin.rs` gives each its prototype and how it is evaluated:
-in place, as a call to the library function, or -- for the floor family -- as
-a call narrowed to the `float` form.
+in place, or -- for the floor family -- as a call to the library function,
+narrowed to the `float` form for a `float` argument.
 
 However it is evaluated, what the program wrote is a call (C17 7.1.4p1). The
 arguments are checked exactly as an ordinary call to a function of that
@@ -123,11 +123,11 @@ call.
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_fabs(x)` | Absolute value (`double`). Lowered to the `Fabs64` opcode, which both backends still emit as a call to `fabs` |
-| `__builtin_fabsf(x)` | Absolute value (`float`). Lowered to the `Fabs32` opcode, which both backends still emit as a call to `fabsf` |
-| `__builtin_fabsl(x)` | Absolute value (`long double`). A call to `fabsl`: the `Fabs64` opcode moves its operand as a `double`, and would read eight bytes of an x87 value |
+| `__builtin_fabs(x)` | Absolute value (`double`), computed in place |
+| `__builtin_fabsf(x)` | Absolute value (`float`), computed in place |
+| `__builtin_fabsl(x)` | Absolute value (`long double`), computed in place |
 | `floor(x)`, `ceil(x)`, `trunc(x)`, `round(x)`, `rint(x)`, `nearbyint(x)` | Recognized under their plain names and **narrowed to the `f` form when the argument is a `float`**: `(float)floor((double)x)` is `floorf(x)` exactly, because the result is an integer no greater in magnitude than `x`. The condition is the argument's type, not the result's. Only these six qualify -- `sin` and `log` are not exactly rounding, and narrowing one changes the last bit. Displaced like `fabs`; their `__builtin_` spellings are plain library aliases (below) and do not narrow |
-| `fabs(x)`, `fabsf(x)`, `fabsl(x)` | The same three under their bare names, as gcc recognizes them whether or not `<math.h>` was included. Not reserved spellings, so they are displaced by a declaration that is not a function, by a function declaration whose type is not the library prototype (`struct S fabs(int)`), or by `-fno-builtin[-fabs]`. The bare name is still an object where it is not being called, so `double (*p)(double) = fabs;` names the library function. The argument is converted to the prototype's type first; the optimizer gains the one fact it needs to fold `fabs(x) < 0.0` to 0 |
+| `fabs(x)`, `fabsf(x)`, `fabsl(x)` | The same three under their bare names, as gcc recognizes them whether or not `<math.h>` was included. Not reserved spellings, so they are displaced by a declaration that is not a function, by a function declaration whose type is not the library prototype (`struct S fabs(int)`), or by `-fno-builtin[-fabs]`. The bare name is still an object where it is not being called, so `double (*p)(double) = fabs;` names the library function. The argument is converted to the prototype's type first; the optimizer gains the one fact it needs to fold `fabs(x) < 0.0` to 0, and a constant argument folds. All three are computed in place by clearing the sign bit and nothing else -- never a call, so no program needs libm for them; `-0.0` becomes `+0.0` and a NaN, quiet or signalling, keeps its payload and raises nothing |
 | `abs(x)`, `labs(x)`, `llabs(x)`, `imaxabs(x)` and their `__builtin_` spellings | Magnitude of an `int`, `long`, `long long` or `intmax_t`, computed in place as `(x ^ s) - s` with `s = x >> (width - 1)` -- never a call, at every level, as gcc does; a constant argument therefore folds. The argument is converted to the prototype's type first. The bare names are displaced like `fabs`, and a declaration with any other type (`struct S abs(int)`) makes the name an ordinary function, as in gcc; a translation unit's own compatible definition of one does **not** displace it, since defining a reserved library name is undefined (C17 7.1.3p2). `abs(INT_MIN)` wraps to `INT_MIN` |
 | `__builtin_signbit(x)` | Returns non-zero if sign bit set (`double`) |
 | `__builtin_signbitf(x)` | Returns non-zero if sign bit set (`float`) |

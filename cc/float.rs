@@ -539,6 +539,12 @@ impl FloatVal {
         }
     }
 
+    /// The same magnitude with the sign cleared: `fabs`, which changes
+    /// nothing else, a NaN's payload included.
+    pub fn magnitude(self) -> Self {
+        FloatVal { neg: false, ..self }
+    }
+
     /// This value's ordering against `other`, or `None` when the two are
     /// unordered because either is a NaN.
     ///

@@ -1820,54 +1820,6 @@ impl X86_64CodeGen {
         self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
     }
 
-    /// Emit __builtin_fabsf - absolute value of float
-    pub(super) fn emit_fabs32(&mut self, insn: &Instruction) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Load argument into XMM0 (first FP argument register)
-        self.emit_fp_move(arg, XmmReg::Xmm0, FpSize::Single);
-
-        // Call fabsf from libc
-        self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
-        });
-
-        // Result is in XMM0, store to target
-        let dst_loc = self.get_location(target);
-        self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, FpSize::Single);
-    }
-
-    /// Emit __builtin_fabs - absolute value of double
-    pub(super) fn emit_fabs64(&mut self, insn: &Instruction) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Load argument into XMM0 (first FP argument register)
-        self.emit_fp_move(arg, XmmReg::Xmm0, FpSize::Double);
-
-        // Call fabs from libc
-        self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
-        });
-
-        // Result is in XMM0, store to target
-        let dst_loc = self.get_location(target);
-        self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, FpSize::Double);
-    }
-
     /// Emit __builtin_signbitf - test sign bit of float
     pub(super) fn emit_signbit32(&mut self, insn: &Instruction) {
         let arg = match insn.src.first() {

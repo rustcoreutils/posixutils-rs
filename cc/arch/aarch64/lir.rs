@@ -548,6 +548,14 @@ pub enum Aarch64Inst {
         dst: VReg,
     },
 
+    /// UMOV Xd, Vn.D[lane] — read a 64-bit vector lane into a GP register,
+    /// the inverse of `InsGpToVecD`.
+    UmovVecDToGp {
+        lane: u8,
+        src: VReg,
+        dst: Reg,
+    },
+
     FmovToGp {
         size: FpSize,
         src: VReg,
@@ -628,6 +636,13 @@ pub enum Aarch64Inst {
 
     /// FNEG - FP negate
     Fneg {
+        size: FpSize,
+        src: VReg,
+        dst: VReg,
+    },
+
+    /// FABS - FP absolute value
+    Fabs {
         size: FpSize,
         src: VReg,
         dst: VReg,
@@ -1166,6 +1181,15 @@ impl EmitAsm for Aarch64Inst {
                     src.name64()
                 );
             }
+            Aarch64Inst::UmovVecDToGp { lane, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    mov {}, {}.d[{}]",
+                    dst.name64(),
+                    src.name_v(),
+                    lane
+                );
+            }
 
             Aarch64Inst::FmovToGp { size, src, dst } => Self::emit_fmov_to_gp(size, src, dst, out),
             Aarch64Inst::LdrFp { size, addr, dst } => Self::emit_ldr_fp(size, addr, dst, out),
@@ -1246,6 +1270,14 @@ impl EmitAsm for Aarch64Inst {
                 let _ = writeln!(
                     out,
                     "    fneg {}, {}",
+                    dst.name_for_size(size_bits(*size)),
+                    src.name_for_size(size_bits(*size))
+                );
+            }
+            Aarch64Inst::Fabs { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    fabs {}, {}",
                     dst.name_for_size(size_bits(*size)),
                     src.name_for_size(size_bits(*size))
                 );

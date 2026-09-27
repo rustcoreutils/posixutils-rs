@@ -5129,8 +5129,8 @@ fn test_int_abs_builtins() {
     }
 }
 
-/// `fabs` and `fabsf` are computed in place at their own type; `fabsl` is a
-/// real call, because the opcode moves its operand as a `double`.
+/// `fabs`, `fabsf` and `fabsl` are all computed in place, each at its own
+/// type.
 #[test]
 fn test_fabs_builtins() {
     let (expr, types, _, _) = parse_expr_with_vars("fabs(i)", &["i"]).unwrap();
@@ -5145,11 +5145,14 @@ fn test_fabs_builtins() {
     assert_eq!(expr.typ, Some(types.float_id));
 
     let (expr, types, _, _) = parse_expr_with_vars("fabsl(i)", &["i"]).unwrap();
-    let ExprKind::Call { args, .. } = &expr.kind else {
-        panic!("fabsl: expected a call, got {:?}", expr.kind);
-    };
+    let (func, arg) = inline_call("fabsl(i)", &expr);
+    assert_eq!(func, InlineLibraryFn::Fabs);
     assert_eq!(expr.typ, Some(types.longdouble_id));
-    assert_eq!(args[0].typ, Some(types.longdouble_id));
+    assert_eq!(
+        arg.typ,
+        Some(types.longdouble_id),
+        "the int converts to long double"
+    );
 }
 
 /// A declaration of `abs` with a type incompatible with `int abs(int)` makes

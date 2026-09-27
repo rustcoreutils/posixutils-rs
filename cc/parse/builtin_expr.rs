@@ -2690,10 +2690,10 @@ impl Parser<'_> {
     /// The sign of a `long double` (or `__float128`, converted to it without
     /// losing the sign), through `__signbitl`.
     ///
-    /// Same reason as `__builtin_fabsl`: the `Signbit64` emitter calls
-    /// `__signbit`, which takes a `double`, so it tested bit 63 of an x87
-    /// mantissa -- the explicit integer bit, set for every normal value -- and
-    /// answered "negative" for positive numbers.
+    /// Not the `Signbit64` opcode: its emitter calls `__signbit`, which takes
+    /// a `double`, so it would test bit 63 of an x87 mantissa -- the explicit
+    /// integer bit, set for every normal value -- and answer "negative" for
+    /// positive numbers.
     fn signbit_long_double(&mut self, arg: Expr, pos: Position) -> Expr {
         let ld = self.types.longdouble_id;
         let arg = self.convert_operand(arg, ld);

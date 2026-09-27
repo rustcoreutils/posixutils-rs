@@ -363,13 +363,15 @@ pub(crate) fn eval_fbinop(op: Opcode, fmt: FpFormat, a: FloatVal, b: FloatVal) -
 
 /// A float unary operation over a constant.
 ///
-/// `FNeg` alone, and unlike the arithmetic above it folds for every operand
-/// including the infinities and NaN: flipping a sign bit computes nothing
-/// and raises nothing. It is also exact, so the result needs no rounding
-/// that the operand has not already had.
+/// `FNeg` and `Fabs`, and unlike the arithmetic above they fold for every
+/// operand including the infinities and NaN: flipping or clearing a sign bit
+/// computes nothing and raises nothing, and a NaN keeps its payload. Both are
+/// also exact, so the result needs no rounding that the operand has not
+/// already had.
 pub(crate) fn eval_funop(op: Opcode, fmt: FpFormat, a: FloatVal) -> Option<FloatVal> {
     match op {
         Opcode::FNeg => Some(a.round_to_format(fmt).negated()),
+        Opcode::Fabs => Some(a.round_to_format(fmt).magnitude()),
         _ => None,
     }
 }

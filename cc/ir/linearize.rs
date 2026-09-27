@@ -524,7 +524,7 @@ impl<'a> Linearizer<'a> {
 
     /// The assembler name of the C library function `name`, for a call the
     /// compiler emits itself -- a `__builtin_memcpy`, a structure copy, a
-    /// zero fill, `fabs`, `setjmp`.
+    /// zero fill, `setjmp`.
     ///
     /// Such a call is still a call to *that function*, so a program that
     /// declared it with an asm label (`void *memcpy(...) __asm("my_memcpy")`,
@@ -2843,10 +2843,7 @@ impl<'a> Linearizer<'a> {
     /// Lower a `__builtin_isnan` / `isinf` / `isfinite` / `isnormal`.
     ///
     /// Built from comparisons alone, which keeps them exact at every width and
-    /// needs no new opcode or backend work. Deliberately *not* expressed with
-    /// `fabs`: `__builtin_fabsl` still narrows a `long double` to a double, so
-    /// a magnitude test through it answers the wrong question at the one width
-    /// that most needs it. Comparing against both signed bounds avoids that.
+    /// needs no new opcode or backend work.
     ///
     ///   isnan(x)     x != x                  (only a NaN differs from itself)
     ///   isinf(x)     x == +inf || x == -inf

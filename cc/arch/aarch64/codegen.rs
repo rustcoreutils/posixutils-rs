@@ -812,8 +812,7 @@ impl Aarch64CodeGen {
             Opcode::StackSave => self.emit_stack_save(insn),
             Opcode::StackRestore => self.emit_stack_restore(insn),
 
-            Opcode::Fabs32 => self.emit_fabs(insn, types, false),
-            Opcode::Fabs64 => self.emit_fabs(insn, types, true),
+            Opcode::Fabs => self.emit_fp_abs(insn, types),
 
             Opcode::Signbit32 => self.emit_signbit32(insn, types),
             Opcode::Signbit64 => self.emit_signbit64(insn, types),

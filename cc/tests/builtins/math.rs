@@ -155,9 +155,6 @@ int main(void) {
 ///
 /// `__builtin_isnan` and friends are lowered as comparisons rather than bit
 /// tests, which keeps them exact for `long double` and needs no backend work.
-/// They were also deliberately not expressed with `fabs`, because
-/// `__builtin_fabsl` used to narrow a `long double` to a double -- that is
-/// #C121 and is fixed, but a comparison is still the cheaper lowering.
 ///
 /// Checked against gcc on the same source at -O0 and -O2.
 #[test]
@@ -284,14 +281,9 @@ int main(void)
 }
 
 /// `__builtin_fabsl` and `__builtin_signbitl` operate on a `long double`, not
-/// on its low eight bytes (#C121).
-///
-/// Both lowered to the *`double`* opcode, whose emitter moves the argument as a
-/// `double` and calls `fabs` / `__signbit`. On x86-64 a `long double` is the
-/// 80-bit x87 format, so that read its mantissa:
-/// `__builtin_fabsl(-3.5L)` returned **2.5e-4932**. They are ordinary calls to
-/// `fabsl` and `__signbitl` now, which gets the long-double ABI from the call
-/// path that already carries one for `__mulxc3`.
+/// on its low eight bytes: on x86-64 that is the 80-bit x87 format, and
+/// reading it as a `double` reads its mantissa. `fabsl` is computed in place
+/// at the `long double` width; `signbitl` is a call to `__signbitl`.
 ///
 /// The `signbit` family is also normalised to 0/1. C17 7.12.3.6 permits any
 /// nonzero value and the library entry points return the sign bit in place --
@@ -1034,4 +1026,179 @@ int main(void) {
         !calls(&asm, "conj"),
         "-fno-builtin-creal displaced conj:\n{asm}"
     );
+}
+
+// ============================================================================
+// fabs and fabsf are computed in place
+// ============================================================================
+
+// Linked without -lm on purpose: gcc never needs libm for these, at any
+// level, and c17 used to lower the opcode to a call to `fabs`, so this
+// failed to link. Self-contained for the header-less aarch64 run.
+const FABS_PROGRAM: &str = r#"
+double fabs(double); float fabsf(float);
+typedef unsigned long long u64; typedef unsigned int u32;
+static u64 bits(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
+static u32 fbits(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
+int main(void) {
+    volatile double m = -1.5, nz = -0.0, ninf = -__builtin_inf();
+    volatile float fm = -2.5f, fnz = -0.0f;
+    volatile double nnan = -__builtin_nan("");
+    if (fabs(m) != 1.5 || __builtin_fabs(m) != 1.5) return 1;
+    if (fabsf(fm) != 2.5f || __builtin_fabsf(fm) != 2.5f) return 2;
+    /* Only the sign bit changes: -0 becomes +0, -inf +inf, and a negative
+       NaN keeps its payload with the sign cleared. */
+    if (bits(fabs(nz)) != 0) return 3;
+    if (fbits(fabsf(fnz)) != 0) return 4;
+    if (fabs(ninf) != __builtin_inf()) return 5;
+    if (bits(fabs(nnan)) != (bits(nnan) & 0x7fffffffffffffffULL)) return 6;
+    if (fabs(1.25) != 1.25 || fabsf(3.0f) != 3.0f) return 7;
+    return 0;
+}
+"#;
+
+#[test]
+fn builtins_fabs_needs_no_libm() {
+    assert_eq!(compile_and_run("fabs_no_libm", FABS_PROGRAM, &[]), 0);
+    if let Some(rc) = compile_and_run_aarch64("fabs_no_libm_a64", FABS_PROGRAM, "-O0") {
+        assert_eq!(rc, 0);
+    }
+    if let Some(rc) = compile_and_run_aarch64("fabs_no_libm_a64_o2", FABS_PROGRAM, "-O2") {
+        assert_eq!(rc, 0);
+    }
+    let src = "double f(double x) { return __builtin_fabs(x); }\n\
+               float g(float x) { return __builtin_fabsf(x); }\n";
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_at("fabs_inline", src, &[opt]);
+        for name in ["fabs", "fabsf"] {
+            let sym = asm_symbol(name);
+            assert!(
+                !asm.lines().any(|l| {
+                    let mut w = l.split_whitespace();
+                    matches!(w.next(), Some("call" | "bl" | "jmp" | "b"))
+                        && w.next().map(|t| t.trim_end_matches("@PLT")) == Some(sym.as_str())
+                }),
+                "{opt}: {name} was called:\n{asm}"
+            );
+        }
+    }
+}
+
+// Linked without -lm on purpose, like the test above: `fabsl` is a sign-bit
+// operation on every target, the x87 `fabs` on x86-64 and a clear of bit 127
+// of the binary128 on aarch64. The NaN inputs are built from bytes at run
+// time, so no constant fold stands in for the instruction; the payload and
+// the quiet bit must come through unchanged, for a signalling NaN too.
+const FABSL_PROGRAM: &str = r#"
+long double fabsl(long double);
+typedef unsigned char u8;
+#if __LDBL_MANT_DIG__ == 64
+#define LD_BYTES 10 /* x87: the rest of the object is padding */
+#else
+#define LD_BYTES ((int)sizeof(long double))
+#endif
+static void to_bytes(u8 *out, long double v) { __builtin_memcpy(out, &v, sizeof v); }
+/* The byte holding the sign bit, as its top bit. */
+static int sign_index(void) {
+    u8 a[sizeof(long double)], b[sizeof(long double)];
+    to_bytes(a, 1.0L);
+    to_bytes(b, -1.0L);
+    for (int i = 0; i < LD_BYTES; i++)
+        if (a[i] != b[i]) return i;
+    return -1;
+}
+/* Whether fabsl of the value in `in` is `in` with only the sign cleared. */
+static int only_sign_cleared(const u8 *in, int si) {
+    volatile long double v;
+    __builtin_memcpy((void *)&v, in, sizeof v);
+    u8 out[sizeof(long double)];
+    to_bytes(out, fabsl(v));
+    for (int i = 0; i < LD_BYTES; i++) {
+        u8 want = i == si ? in[i] & 0x7f : in[i];
+        if (out[i] != want) return 0;
+    }
+    return 1;
+}
+int main(void) {
+    volatile long double m = -1.5L, nz = -0.0L, ninf = -__builtin_infl();
+    int si = sign_index();
+    if (si < 0) return 1;
+    int lo = si == 0 ? LD_BYTES - 1 : 0; /* the least significant byte */
+    if (fabsl(m) != 1.5L || __builtin_fabsl(m) != 1.5L) return 2;
+    u8 b[sizeof(long double)];
+    to_bytes(b, fabsl(nz));
+    for (int i = 0; i < LD_BYTES; i++)
+        if (b[i] != 0) return 3;
+    if (fabsl(ninf) != __builtin_infl()) return 4;
+    to_bytes(b, m);
+    if (!only_sign_cleared(b, si)) return 5;
+    /* A negative quiet NaN with a payload. */
+    to_bytes(b, __builtin_nanl(""));
+    b[lo] |= 0x5a;
+    b[si] |= 0x80;
+    if (!only_sign_cleared(b, si)) return 6;
+    /* A negative signalling NaN: an infinity with payload bits, quiet bit
+       clear. */
+    to_bytes(b, __builtin_infl());
+    b[lo] |= 0x5a;
+    b[si] |= 0x80;
+    if (!only_sign_cleared(b, si)) return 7;
+    if (fabsl(2.25L) != 2.25L) return 8;
+    return 0;
+}
+"#;
+
+#[test]
+fn builtins_fabsl_needs_no_libm() {
+    assert_eq!(compile_and_run("fabsl_no_libm", FABSL_PROGRAM, &[]), 0);
+    if let Some(rc) = compile_and_run_aarch64("fabsl_no_libm_a64", FABSL_PROGRAM, "-O0") {
+        assert_eq!(rc, 0);
+    }
+    if let Some(rc) = compile_and_run_aarch64("fabsl_no_libm_a64_o2", FABSL_PROGRAM, "-O2") {
+        assert_eq!(rc, 0);
+    }
+    let called = |asm: &str| {
+        asm.lines().any(|l| {
+            let mut w = l.split_whitespace();
+            matches!(w.next(), Some("call" | "bl" | "jmp" | "b"))
+                && w.next()
+                    .is_some_and(|t| t.trim_end_matches("@PLT").ends_with("fabsl"))
+        })
+    };
+    let src = "long double f(long double x) { return __builtin_fabsl(x); }\n\
+               long double g(long double x) { return fabsl(x); }\n";
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_at("fabsl_inline", src, &[opt]);
+        assert!(!called(&asm), "{opt}: fabsl was called:\n{asm}");
+        let asm = asm_for_at(
+            "fabsl_inline_a64",
+            src,
+            &[opt, "--target", "aarch64-unknown-linux-gnu"],
+        );
+        assert!(!called(&asm), "{opt} aarch64: fabsl was called:\n{asm}");
+    }
+}
+
+/// `fabs` of a constant folds at -O1 and above: no sign-clearing instruction
+/// is left. Checked for `long double` only where its negation folds too; a
+/// binary128 `-3.5L` is a libgcc call before the optimizer sees it.
+#[test]
+fn builtins_fabs_of_a_constant_folds() {
+    let mut src = String::from(
+        "double f(void) { return __builtin_fabs(-3.5); }\n\
+         float g(void) { return __builtin_fabsf(-2.0f); }\n",
+    );
+    if cfg!(target_arch = "x86_64") {
+        src.push_str("long double h(void) { return __builtin_fabsl(-3.5L); }\n");
+    }
+    for opt in ["-O1", "-O2"] {
+        let asm = asm_for_at("fabs_const", &src, &[opt]);
+        assert!(
+            !asm.lines().any(|l| matches!(
+                l.split_whitespace().next(),
+                Some("andpd" | "andps" | "fabs")
+            )),
+            "{opt}: fabs of a constant was not folded:\n{asm}"
+        );
+    }
 }

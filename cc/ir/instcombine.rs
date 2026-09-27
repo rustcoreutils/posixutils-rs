@@ -57,7 +57,7 @@ impl<'a> Facts<'a> {
         let mut never_lt_zero = HashSet::new();
         for bb in &func.blocks {
             for insn in &bb.insns {
-                if matches!(insn.op, Opcode::Fabs32 | Opcode::Fabs64) {
+                if insn.op == Opcode::Fabs {
                     if let Some(target) = insn.target {
                         never_lt_zero.insert(target);
                     }
@@ -224,7 +224,7 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
         Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv => {
             simplify_fbinop(insn, consts, facts)
         }
-        Opcode::FNeg => simplify_funop(insn, consts, facts),
+        Opcode::FNeg | Opcode::Fabs => simplify_funop(insn, consts, facts),
         Opcode::FCvtF => simplify_fcvtf(insn, consts, facts),
         Opcode::FCmpOEq
         | Opcode::FCmpONe
@@ -2437,7 +2437,7 @@ mod tests {
             };
             let mut func = make_test_func_with_insns(
                 vec![
-                    Instruction::new(Opcode::Fabs64)
+                    Instruction::new(Opcode::Fabs)
                         .with_target(PseudoId(1))
                         .with_src(PseudoId(0))
                         .with_type_and_size(types.double_id, 64),
@@ -2465,7 +2465,7 @@ mod tests {
             let types = TypeTable::new(&Target::host());
             let mut func = make_test_func_with_insns(
                 vec![
-                    Instruction::new(Opcode::Fabs64)
+                    Instruction::new(Opcode::Fabs)
                         .with_target(PseudoId(1))
                         .with_src(PseudoId(0))
                         .with_type_and_size(types.double_id, 64),
@@ -2979,6 +2979,40 @@ mod tests {
         // A sign flip computes nothing and raises nothing, so it folds for
         // every operand.
         assert!(fold_float(Opcode::FNeg, d, 64, &[f64::INFINITY]).is_some());
+    }
+
+    /// `Fabs` of a constant folds at every width and for every operand: it
+    /// clears the sign and nothing else, so `-0.0` becomes `+0.0`, an
+    /// infinity folds, and a NaN keeps its payload.
+    #[test]
+    fn fabs_of_a_constant_folds_to_its_magnitude() {
+        let types = TypeTable::new(&Target::host());
+        let widths = [
+            (types.float_id, 32),
+            (types.double_id, 64),
+            (types.longdouble_id, types.size_bits(types.longdouble_id)),
+        ];
+        for (typ, size) in widths {
+            for (arg, want) in [(-1.5, 1.5), (2.0, 2.0), (f64::NEG_INFINITY, f64::INFINITY)] {
+                let got = fold_float(Opcode::Fabs, typ, size, &[arg]);
+                assert_eq!(
+                    got.map(|(v, sz)| (v.to_f64(), sz)),
+                    Some((want, size)),
+                    "{arg}"
+                );
+            }
+            let zero = fold_float(Opcode::Fabs, typ, size, &[-0.0]).map(|(v, _)| v);
+            assert!(zero.is_some_and(|v| v.is_positive_zero()), "-0.0 at {size}");
+        }
+        let nan = f64::from_bits(0xfff8_0000_0000_1234);
+        let got = fold_float(Opcode::Fabs, types.double_id, 64, &[nan]);
+        let (neg, exp, sig) = FloatVal::from_f64(nan).key();
+        assert!(neg);
+        assert_eq!(
+            got.map(|(v, _)| v.key()),
+            Some((false, exp, sig)),
+            "only the sign bit of a NaN changes"
+        );
     }
 
     /// One `FCvtF` from `src` to `dst`, folded.

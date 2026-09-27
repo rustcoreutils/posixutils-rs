@@ -59,8 +59,6 @@ impl ProtoType {
 enum Lowering {
     /// Computed in place, as an [`ExprKind::InlineLibraryCall`].
     InPlace(InlineLibraryFn),
-    /// An ordinary call to the library function of the builtin's own name.
-    Call,
     /// An ordinary call, to the function's `float` form `narrow` when the
     /// argument is a `float`.
     ///
@@ -125,7 +123,7 @@ const fn entry(
 #[rustfmt::skip]
 static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
     use InlineLibraryFn as F;
-    use Lowering::{Call, InPlace, NarrowingCall};
+    use Lowering::{InPlace, NarrowingCall};
     use ProtoType::*;
     &[
         //    bare           reserved                   returns            parameter          lowering
@@ -135,7 +133,7 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         entry(kw::IMAXABS,   Some(kw::BUILTIN_IMAXABS), Long,              Long,              InPlace(F::IntAbs)),
         entry(kw::FABS,      Some(kw::BUILTIN_FABS),    Double,            Double,            InPlace(F::Fabs)),
         entry(kw::FABSF,     Some(kw::BUILTIN_FABSF),   Float,             Float,             InPlace(F::Fabs)),
-        entry(kw::FABSL,     Some(kw::BUILTIN_FABSL),   LongDouble,        LongDouble,        Call),
+        entry(kw::FABSL,     Some(kw::BUILTIN_FABSL),   LongDouble,        LongDouble,        InPlace(F::Fabs)),
         entry(kw::FLOOR,     None,                      Double,            Double,            NarrowingCall { narrow: "floorf" }),
         entry(kw::CEIL,      None,                      Double,            Double,            NarrowingCall { narrow: "ceilf" }),
         entry(kw::TRUNC,     None,                      Double,            Double,            NarrowingCall { narrow: "truncf" }),
@@ -271,7 +269,7 @@ impl Parser<'_> {
                 let f = self.types.float_id;
                 self.libm_call(narrow, f, &[f], arg, pos)
             }
-            Lowering::Call | Lowering::NarrowingCall { .. } => {
+            Lowering::NarrowingCall { .. } => {
                 let arg = self.convert_operand(arg, param);
                 self.libm_call(name, ret, &[param], arg, pos)
             }

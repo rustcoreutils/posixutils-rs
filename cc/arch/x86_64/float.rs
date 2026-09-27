@@ -17,6 +17,15 @@ use crate::float::{f64_to_f16_bits, FloatVal};
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
+/// What `emit_fp_sign_bit_op` does to the sign bit.
+#[derive(Clone, Copy)]
+enum SignBitOp {
+    /// Negate (`FNeg`).
+    Flip,
+    /// Take the magnitude (`Fabs`).
+    Clear,
+}
+
 impl X86_64CodeGen {
     /// Get size in bits from type, with fallback to provided size.
     fn size_from_type(typ: Option<TypeId>, size: u32, types: &TypeTable) -> u32 {
@@ -353,8 +362,20 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit floating-point negation
+    /// Emit floating-point negation: flip the sign bit.
     pub(super) fn emit_fp_neg(&mut self, insn: &Instruction, types: &TypeTable) {
+        self.emit_fp_sign_bit_op(insn, types, SignBitOp::Flip);
+    }
+
+    /// Emit `Fabs` of a `float` or `double`: clear the sign bit, in place. Only that bit
+    /// changes, so `-0.0` becomes `+0.0` and a NaN keeps its payload.
+    pub(super) fn emit_fp_abs(&mut self, insn: &Instruction, types: &TypeTable) {
+        self.emit_fp_sign_bit_op(insn, types, SignBitOp::Clear);
+    }
+
+    /// Flip or clear the sign bit of an SSE float or double: an
+    /// `xorps`/`xorpd` or `andps`/`andpd` with a mask built through R10.
+    fn emit_fp_sign_bit_op(&mut self, insn: &Instruction, types: &TypeTable, op: SignBitOp) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -378,9 +399,7 @@ impl X86_64CodeGen {
         // Move source to destination
         self.emit_fp_move(src, dst_xmm, self.fp_format(insn.typ, insn.size, types));
 
-        // XOR with sign bit mask to negate
-        // For float: 0x80000000, for double: 0x8000000000000000
-        // Use a scratch register that's not dst_xmm to hold the sign mask
+        // The sign-bit mask goes in a scratch register that's not dst_xmm.
         let scratch_xmm = if dst_xmm == XmmReg::Xmm15 {
             XmmReg::Xmm14
         } else {
@@ -389,10 +408,17 @@ impl X86_64CodeGen {
         // Use R10 (scratch) to avoid clobbering RAX which may hold
         // a live pseudo (the register allocator allocates RAX to pseudos
         // but doesn't know FP operations use it as scratch).
-        if fp_size == FpSize::Single {
+        let single = fp_size == FpSize::Single;
+        let sign_bit: u64 = if single { 1 << 31 } else { 1 << 63 };
+        let mask = match op {
+            SignBitOp::Flip => sign_bit,
+            // Every bit below the sign bit.
+            SignBitOp::Clear => sign_bit - 1,
+        };
+        if single {
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B32,
-                src: GpOperand::Imm(0x80000000),
+                src: GpOperand::Imm(mask as i64),
                 dst: GpOperand::Reg(Reg::R10),
             });
             self.push_lir(X86Inst::MovGpXmm {
@@ -400,14 +426,9 @@ impl X86_64CodeGen {
                 src: Reg::R10,
                 dst: scratch_xmm,
             });
-            self.push_lir(X86Inst::XorFp {
-                size: fp_size,
-                src: scratch_xmm,
-                dst: dst_xmm,
-            });
         } else {
             self.push_lir(X86Inst::MovAbs {
-                imm: 0x8000000000000000u64 as i64,
+                imm: mask as i64,
                 dst: Reg::R10,
             });
             self.push_lir(X86Inst::MovGpXmm {
@@ -415,12 +436,19 @@ impl X86_64CodeGen {
                 src: Reg::R10,
                 dst: scratch_xmm,
             });
-            self.push_lir(X86Inst::XorFp {
+        }
+        self.push_lir(match op {
+            SignBitOp::Flip => X86Inst::XorFp {
                 size: fp_size,
                 src: scratch_xmm,
                 dst: dst_xmm,
-            });
-        }
+            },
+            SignBitOp::Clear => X86Inst::AndFp {
+                size: fp_size,
+                src: scratch_xmm,
+                dst: dst_xmm,
+            },
+        });
 
         if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
             self.emit_fp_move_from_xmm(

@@ -1694,19 +1694,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit_int_binop(Opcode::Sub, flipped, sign, typ, size)
     }
 
-    /// `|x|` for a `double` or `float`, whichever `typ` is: the `Fabs64` or
-    /// `Fabs32` opcode, which carries the library function's name for a
-    /// backend that lowers it as a call.
+    /// `|x|` for a `float`, `double` or `long double`, whichever `typ` is:
+    /// the `Fabs` opcode, which both backends compute in place by clearing
+    /// the sign bit -- never a call, so no program needs libm for it.
     pub(crate) fn emit_fabs(&mut self, x: PseudoId, typ: TypeId) -> PseudoId {
         let size = self.types.size_bits(typ);
-        let (opcode, name) = if size == 32 {
-            (Opcode::Fabs32, "fabsf")
-        } else {
-            (Opcode::Fabs64, "fabs")
-        };
         let result = self.alloc_pseudo();
-        let insn = Instruction::new(opcode)
-            .with_func(self.library_function_name(name))
+        let insn = Instruction::new(Opcode::Fabs)
             .with_target(result)
             .with_src(x)
             .with_size(size)

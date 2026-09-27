@@ -370,6 +370,20 @@ impl X86_64CodeGen {
     ///   fchs                 ; negate ST(0)
     ///   fstpt  result(%rbp)  ; store and pop
     pub(super) fn emit_x87_neg(&mut self, insn: &Instruction) {
+        self.emit_x87_sign_op(insn, X86Inst::X87Neg);
+    }
+
+    /// Emit `Fabs` of a `long double`: `fabs` between the same load and
+    /// store as negation. An 80-bit `fldt`/`fstpt` converts nothing and
+    /// raises nothing, not even for a signalling NaN, and `fabs` clears only
+    /// the sign, so the payload survives.
+    pub(super) fn emit_x87_abs(&mut self, insn: &Instruction) {
+        self.emit_x87_sign_op(insn, X86Inst::X87Abs);
+    }
+
+    /// Load a `long double`, apply the sign instruction `op` to ST(0), and
+    /// store the result.
+    fn emit_x87_sign_op(&mut self, insn: &Instruction, op: X86Inst) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -381,7 +395,7 @@ impl X86_64CodeGen {
 
         let src_addr = self.get_x87_mem_addr(src);
         self.push_lir(X86Inst::X87Load { addr: src_addr });
-        self.push_lir(X86Inst::X87Neg);
+        self.push_lir(op);
 
         let dst_addr = self.get_x87_mem_addr(target);
         self.push_lir(X86Inst::X87Store { addr: dst_addr });

@@ -1928,7 +1928,8 @@ fn preprocessor_malformed_conditional_operand_in_a_dead_branch_is_quiet() {
 /// The parser and the `#if` evaluator decode the same token, so they must
 /// agree about it. They stopped agreeing when only the evaluator learned to
 /// pack a multi-character constant: `'ab'` compiled to 97 while `#if 'ab' ==
-/// 24930` took the true branch.
+/// 24930` took the true branch. `'\777'` is out of range for `char`, so it
+/// needs `-fpermissive`, and both must then truncate it alike.
 #[test]
 fn preprocessor_character_constants_agree_with_the_compiler() {
     let src = r#"
@@ -1949,7 +1950,7 @@ int main(void) {
 }
 "#;
     assert_eq!(
-        crate::common::compile_and_run("char_agreement", src, &[]),
+        crate::common::compile_and_run("char_agreement", src, &["-fpermissive".to_string()]),
         0
     );
 }

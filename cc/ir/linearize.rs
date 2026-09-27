@@ -16,7 +16,7 @@ use super::{
     Opcode, Pseudo, PseudoId, PseudoKind,
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
-use crate::diag::{error, get_all_stream_names, Position};
+use crate::diag::{get_all_stream_names, Position};
 use crate::float::FloatVal;
 use crate::ir::linearize_atomic::AtomicLvalue;
 use crate::parse::ast::{
@@ -4456,11 +4456,7 @@ impl<'a> Linearizer<'a> {
                     // `static const int` from an inline definition. It is
                     // relaxed by `-fpermissive`, which is where c17 keeps the
                     // constraints gcc lets through.
-                    if crate::diag::permissive() {
-                        crate::diag::warning(pos, &msg);
-                    } else {
-                        error(pos, &msg);
-                    }
+                    crate::diag::permissive_error(pos, &msg);
                 }
             }
 

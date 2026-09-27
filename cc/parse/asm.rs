@@ -14,6 +14,7 @@ use super::parser::{ParseError, ParseResult, Parser};
 use crate::strings::StringId;
 use crate::symbol::Namespace;
 use crate::token::lexer::{payload_text, TokenType, TokenValue};
+use crate::token::literal;
 use crate::types::TypeModifiers;
 
 impl Parser<'_> {
@@ -222,21 +223,16 @@ impl Parser<'_> {
             ));
         }
 
-        // Parse first string
-        let token = self.consume();
-        if let TokenValue::String(s) = &token.value {
-            result.push_str(&crate::token::literal::literal_bytes(
-                &crate::token::literal::parse_string_literal(s),
-            ));
-        }
-
-        // Handle string concatenation (adjacent string literals)
-        while self.peek() == TokenType::String {
+        // The first string, then any adjacent ones it concatenates with.
+        loop {
             let token = self.consume();
             if let TokenValue::String(s) = &token.value {
-                result.push_str(&crate::token::literal::literal_bytes(
-                    &crate::token::literal::parse_string_literal(s),
-                ));
+                let elements = literal::parse_string_literal(s);
+                literal::check_elements(&elements, literal::CHAR_UNIT_BITS, token.pos);
+                result.push_str(&literal::literal_bytes(&elements));
+            }
+            if self.peek() != TokenType::String {
+                break;
             }
         }
 

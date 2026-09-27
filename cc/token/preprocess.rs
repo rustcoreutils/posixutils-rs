@@ -19,9 +19,9 @@ use std::time::SystemTime;
 
 use super::cursor::{Provenance, TokenCursor};
 use super::lexer::{
-    literal_payload, payload_bytes, payload_text, report_forbidden_ucn, show_token,
-    tokens_to_source_bytes, write_token, IdentTable, LexerMode, Position, Punctuator, SpecialToken,
-    Spelling, Token, TokenType, TokenValue, Tokenizer,
+    literal_payload, payload_bytes, payload_text, show_token, tokens_to_source_bytes, write_token,
+    IdentTable, LexerMode, Position, Punctuator, SpecialToken, Spelling, Token, TokenType,
+    TokenValue, Tokenizer,
 };
 use super::literal;
 use crate::arch;
@@ -2135,12 +2135,9 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     /// `wide` is the type of a prefixed constant, `None` for a plain one.
     fn char_constant(&mut self, payload: &str, wide: Option<IntType>, pos: Position) -> PpValue {
         let elements = literal::parse_string_literal(payload);
-        for e in &elements {
-            if let literal::Escaped::ForbiddenUcn(val) = e {
-                if !self.suppressed {
-                    report_forbidden_ucn(pos, *val);
-                }
-            }
+        if !self.suppressed {
+            let bits = wide.map_or(literal::CHAR_UNIT_BITS, |t| self.pp.target.int_width(t));
+            literal::check_elements(&elements, bits, pos);
         }
         if elements.is_empty() {
             self.err(pos, "empty character constant");

@@ -32,11 +32,7 @@ use crate::types::TypeTable;
 /// The value is discarded either way, and a missing one leaves the returned
 /// value indeterminate, which is what gcc's program does as well.
 fn return_value_ness_violation(pos: Position, msg: &str) {
-    if crate::diag::permissive() {
-        crate::diag::warning(pos, msg);
-    } else {
-        error(pos, msg);
-    }
+    crate::diag::permissive_error(pos, msg);
 }
 
 use crate::types::{TypeId, TypeKind, TypeModifiers};

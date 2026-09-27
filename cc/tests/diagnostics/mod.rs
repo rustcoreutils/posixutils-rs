@@ -19,8 +19,8 @@
 //
 
 use crate::common::{
-    compile_and_run, compile_and_run_two_units, compile_expect_error, compile_expect_ok,
-    compile_expect_warning, create_c_file, run_c17,
+    compile_and_run, compile_and_run_two_units, compile_expect_error, compile_expect_no_diagnostic,
+    compile_expect_ok, compile_expect_warning, create_c_file, run_c17,
 };
 
 // ============================================================================
@@ -7171,5 +7171,120 @@ fn diagnostics_equality_accepts_a_complex_operand() {
         "complex_equality",
         "int f = (_Complex float)(0.5) == 0.5;\n\
          int g(_Complex double a, double b) { return (a == b) + (a != 2.0i); }\n",
+    );
+}
+
+// ==== numeric escapes out of range (C17 6.4.4.4p9) ====
+
+/// An octal or hex escape's value must be representable in the literal's
+/// element type: `unsigned char` for a plain literal, and the unsigned type
+/// of `wchar_t`, `char16_t` or `char32_t` for a prefixed one. gcc warns and
+/// truncates; c17 was silent. A constraint gcc only warns about is an error
+/// here, and `-fpermissive` makes it a warning with gcc's truncation.
+#[test]
+fn diagnostics_escape_out_of_range() {
+    for (name, src, msg) in [
+        (
+            "esc_oct_char",
+            "int c = '\\400';\n",
+            "octal escape sequence out of range",
+        ),
+        (
+            "esc_oct_str",
+            "char s[] = \"a\\777\";\n",
+            "octal escape sequence out of range",
+        ),
+        (
+            "esc_hex_char",
+            "int c = '\\x100';\n",
+            "hex escape sequence out of range",
+        ),
+        (
+            "esc_hex_str",
+            "char s[] = \"\\x123\";\n",
+            "hex escape sequence out of range",
+        ),
+        (
+            "esc_hex_u16",
+            "unsigned short s[] = u\"\\x12345\";\n",
+            "hex escape sequence out of range",
+        ),
+        (
+            "esc_hex_u16c",
+            "int c = u'\\x10000';\n",
+            "hex escape sequence out of range",
+        ),
+        (
+            "esc_hex_u32",
+            "unsigned s[] = U\"\\x100000000\";\n",
+            "hex escape sequence out of range",
+        ),
+        (
+            "esc_hex_wide",
+            "int c = L'\\x123456789';\n",
+            "hex escape sequence out of range",
+        ),
+        // A narrow piece concatenated to a prefixed one takes its type
+        // (6.4.5p5), so the bound is the prefixed one's...
+        (
+            "esc_hex_concat",
+            "unsigned short s[] = \"\\x12345\" u\"a\";\n",
+            "hex escape sequence out of range",
+        ),
+        (
+            "esc_if",
+            "#if '\\x100'\n#endif\nint x;\n",
+            "hex escape sequence out of range",
+        ),
+    ] {
+        let strict = compile_with(name, src, &[]);
+        assert!(
+            !strict.success && strict.stderr.contains("error:") && strict.stderr.contains(msg),
+            "{name}: expected an error mentioning {msg:?}:\n{}",
+            strict.stderr
+        );
+        let lax = compile_with(name, src, &["-fpermissive"]);
+        assert!(
+            lax.success && lax.stderr.contains("warning:") && lax.stderr.contains(msg),
+            "{name}: -fpermissive should warn {msg:?}:\n{}",
+            lax.stderr
+        );
+    }
+}
+
+/// The bound is the element type's, and a value's leading zeros do not count.
+#[test]
+fn diagnostics_escape_in_range_is_accepted() {
+    compile_expect_no_diagnostic(
+        "esc_in_range",
+        "char a[] = \"\\377\\xff\\x00000041\\0\";\n\
+         int b = '\\377' + '\\xff';\n\
+         unsigned short c[] = u\"\\xffff\\777\";\n\
+         unsigned d[] = U\"\\xffffffff\\x0000000000041\";\n\
+         int e = L'\\xffffffff' + L'\\777';\n\
+         unsigned short f[] = \"\\xff\" u\"a\";\n\
+         #if '\\xff' && u'\\xffff' && U'\\xffffffff'\n\
+         int g;\n\
+         #endif\n",
+        "escape sequence out of range",
+    );
+}
+
+/// Under `-fpermissive` the program keeps gcc's truncation to the low bits.
+#[test]
+fn diagnostics_escape_out_of_range_truncates_under_fpermissive() {
+    let src = r#"
+typedef __CHAR16_TYPE__ char16_t;
+int main(void) {
+    const char16_t *u = u"\x12345";
+    if ((unsigned char)"\x141"[0] != 0x41) return 1;
+    if ((unsigned char)'\777' != 0xff) return 2;
+    if (u[0] != 0x2345) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("esc_truncate", src, &["-fpermissive".to_string()]),
+        0
     );
 }

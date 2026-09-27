@@ -319,8 +319,6 @@ int main(void) {
 #else
     if (wchar_signed) return 15;
 #endif
-    /* A narrow literal still takes the low eight bits, as gcc does. */
-    if ((unsigned char)"\x141"[0] != 0x41) return 16;
     return 0;
 }
 "#;

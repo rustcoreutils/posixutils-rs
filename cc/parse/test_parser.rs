@@ -5735,6 +5735,7 @@ fn test_prefixed_escapes_keep_their_width() {
             ("L'\\777'", 0o777),
             ("L'\\xffffffff'", all_ones),
             ("u'\\x1234'", 0x1234),
+            // Out of range: diagnosed, then the low bits, as gcc keeps.
             ("u'\\x12345'", 0x2345),
             ("U'\\xffffffff'", 0xffff_ffff),
         ] {
@@ -5758,7 +5759,13 @@ fn test_prefixed_escapes_keep_their_width() {
             ExprKind::Utf32StringLit(u) => assert_eq!(u, [0xffff_ffff, 0o777]),
             other => panic!("{other:?}"),
         }
-        // A narrow literal still takes the low eight bits.
+        // A plain piece takes the run's prefix (6.4.5p5), so its escape is a
+        // `char16_t` unit, bounded and truncated as one.
+        match parse("\"\\x12345\" u\"a\"") {
+            ExprKind::Utf16StringLit(u) => assert_eq!(u, [0x2345, 0x61]),
+            other => panic!("{other:?}"),
+        }
+        // Out of range for `char`: diagnosed, then the low eight bits.
         assert!(matches!(parse("'\\x141'"), ExprKind::CharLit(0x41)));
     }
 }

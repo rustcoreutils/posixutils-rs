@@ -1455,7 +1455,7 @@ impl<'a> Parser<'a> {
         let start_pos = self.current_pos();
         // Elements of the concatenated literal, still distinguishing a byte
         // from a named character so each encoding can ask for what it needs.
-        let mut elements: Vec<literal::Escaped> = Vec::new();
+        let mut pieces: Vec<(Position, Vec<literal::Escaped>)> = Vec::new();
         let mut encoding: Option<TokenType> = None;
         let mut mixed_reported = false;
 
@@ -1472,23 +1472,14 @@ impl<'a> Parser<'a> {
                         | TokenValue::WideString(s)
                         | TokenValue::Utf16String(s)
                         | TokenValue::Utf32String(s) => {
-                            let piece = literal::parse_string_literal(s);
-                            // `parse_string_literal` has no position to report
-                            // from, so the constraint is raised here, where the
-                            // token still does.
-                            for e in &piece {
-                                if let literal::Escaped::ForbiddenUcn(val) = e {
-                                    self.report_forbidden_ucn_at(token.pos, *val);
-                                }
-                            }
-                            piece
+                            (token.pos, literal::parse_string_literal(s))
                         }
                         _ => return Err(ParseError::new("invalid string token", token.pos)),
                     }
                 }
                 _ => break,
             };
-            elements.extend(piece);
+            pieces.push(piece);
 
             if kind != TokenType::String {
                 match encoding {
@@ -1505,6 +1496,22 @@ impl<'a> Parser<'a> {
                     _ => {}
                 }
             }
+        }
+
+        // Each piece is checked against the run's element type, since a plain
+        // piece takes the prefix of the run it is in (6.4.5p5) -- and from its
+        // own token's position, which `parse_string_literal` has no way to
+        // report from.
+        let unit_bits = match encoding {
+            None => literal::CHAR_UNIT_BITS,
+            Some(TokenType::WideString) => self.types.size_bits(self.types.wchar_id),
+            Some(TokenType::Utf16String) => self.types.size_bits(self.types.char16_id),
+            Some(_) => self.types.size_bits(self.types.char32_id),
+        };
+        let mut elements: Vec<literal::Escaped> = Vec::new();
+        for (pos, piece) in pieces {
+            literal::check_elements(&piece, unit_bits, pos);
+            elements.extend(piece);
         }
 
         match encoding {
@@ -2220,7 +2227,7 @@ impl<'a> Parser<'a> {
                     // plain `char`'s, which is the target's. `'\x80'` is -128
                     // where `char` is signed and 128 where it is not.
                     let (v, is_code_point) =
-                        literal::char_literal_value(s, false, self.current_pos());
+                        literal::char_literal_value(s, None, self.current_pos());
                     let value = if is_code_point {
                         // Not a byte, so plain `char`'s signedness does not
                         // reach it.
@@ -2252,16 +2259,17 @@ impl<'a> Parser<'a> {
                         // A prefixed constant takes the code point in its own
                         // type, with no reference to plain `char`'s
                         // signedness: `L'\x80'` is 128, not -128.
-                        let (code_point, _) =
-                            literal::char_literal_value(s, true, self.current_pos());
                         let typ = match kind {
                             TokenType::WideChar => self.types.wchar_id,
                             TokenType::Utf16Char => self.types.char16_id,
                             _ => self.types.char32_id,
                         };
+                        let bits = self.types.size_bits(typ);
+                        let (code_point, _) =
+                            literal::char_literal_value(s, Some(bits), self.current_pos());
                         let value = literal::prefixed_char_value(
                             code_point,
-                            self.types.size_bits(typ),
+                            bits,
                             !self.types.is_unsigned(typ),
                         );
                         Ok(Self::typed_expr(ExprKind::CharLit(value), typ, token_pos))
@@ -2623,18 +2631,6 @@ impl<'a> Parser<'a> {
             mantissa |= 1;
         }
         Ok((mantissa, exp2))
-    }
-
-    /// C17 6.4.3p2: a universal character name may not name a character below
-    /// 00A0 other than `$`, `@` and `` ` ``, nor a UTF-16 surrogate.
-    ///
-    /// The first half stops a UCN spelling a character that already has a
-    /// spelling, which would let `\u0041` smuggle an `A` past anything that
-    /// reads the source as text. Both were accepted silently -- a surrogate
-    /// even degraded to the letter `u`, because `char::from_u32` rejects it
-    /// and the caller took that for "not an escape".
-    fn report_forbidden_ucn_at(&self, pos: Position, val: u32) {
-        crate::token::lexer::report_forbidden_ucn(pos, val);
     }
 }
 

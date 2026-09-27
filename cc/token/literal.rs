@@ -29,21 +29,22 @@ use crate::token::lexer::{report_forbidden_ucn, ucn_is_forbidden, Position};
 /// point as if it were a byte is how `"caf\u00e9"` became the single byte
 /// 0xE9 -- five bytes and Latin-1, where gcc gives six and UTF-8.
 pub(crate) enum Escaped {
-    /// One code unit named by an escape: `\n`, `\x41`, `\101`, `\x1234`.
-    /// It is one element of any literal whatever its value -- `L"\xc3\xa9"`
-    /// is two wide characters, not one, because the program asked for two
-    /// unit values -- and C17 6.4.4.4p9 bounds it by the element type, not
-    /// by a byte: `L'\x1234'` is 0x1234. A narrow literal takes the low eight
-    /// bits (gcc's truncation of `'\x100'`), a prefixed one the low bits of
-    /// its type. Kept as the low 32 bits of the escape's value, which is as
-    /// wide as any element type here.
+    /// One code unit named by a simple escape, `\n`, or an unknown one, `\q`.
     Unit(u32),
+    /// One code unit named by an octal or hexadecimal escape: `\101`,
+    /// `\x41`, `\x1234`. Like [`Escaped::Unit`] it is one element of any
+    /// literal whatever its value -- `L"\xc3\xa9"` is two wide characters,
+    /// not one, because the program asked for two unit values -- and C17
+    /// 6.4.4.4p9 bounds it by the element type, not by a byte: `L'\x1234'` is
+    /// 0x1234, and `'\x100'` is a constraint violation, which
+    /// [`check_elements`] reports.
+    Numeric(NumericEscape),
     /// One byte of the source text itself. The lexer hands over a source
     /// character one byte at a time, so a run of these is the UTF-8 of a
     /// character the programmer typed, and a wide literal wants that character
     /// rather than its bytes.
     ///
-    /// Kept apart from `Byte` because after escape processing the two look
+    /// Kept apart from `Unit` because after escape processing the two look
     /// identical, and collapsing them makes `L"café"` and `L"caf\xc3\xa9"`
     /// the same literal when C says they differ.
     SourceByte(u8),
@@ -56,6 +57,86 @@ pub(crate) enum Escaped {
     /// `char` to carry.
     ForbiddenUcn(u32),
 }
+
+/// An octal or hexadecimal escape's value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NumericEscape {
+    /// The low 32 bits of the value, which is as wide as any element type
+    /// here. An element narrower than that takes the low bits of this -- the
+    /// truncation gcc applies after its warning, and c17 under
+    /// `-fpermissive`.
+    pub(crate) unit: u32,
+    /// How many bits the whole value needs. C allows a hex escape any number
+    /// of digits, so this can exceed 32.
+    bits: u32,
+    hex: bool,
+}
+
+impl NumericEscape {
+    /// An escape of `digits` in `radix` (8 or 16), which are all valid.
+    fn new(digits: &[char], radix: u32) -> Self {
+        let significant: Vec<u32> = digits
+            .iter()
+            .filter_map(|c| c.to_digit(radix))
+            .skip_while(|&d| d == 0)
+            .collect();
+        let bits = match significant.first() {
+            None => 0,
+            Some(&top) => {
+                (u32::BITS - top.leading_zeros()) + radix.ilog2() * (significant.len() as u32 - 1)
+            }
+        };
+        let unit = significant
+            .iter()
+            .fold(0u32, |v, &d| v.wrapping_shl(radix.ilog2()) | d);
+        NumericEscape {
+            unit,
+            bits,
+            hex: radix == 16,
+        }
+    }
+
+    /// Does the value fit an element `unit_bits` wide (C17 6.4.4.4p9)?
+    pub(crate) fn fits(&self, unit_bits: u32) -> bool {
+        self.bits <= unit_bits
+    }
+
+    /// gcc's words for an escape that does not fit.
+    fn out_of_range_message(&self) -> &'static str {
+        if self.hex {
+            "hex escape sequence out of range"
+        } else {
+            "octal escape sequence out of range"
+        }
+    }
+}
+
+/// Report the constraint violations among a literal's elements, for an
+/// element type `unit_bits` wide: a universal character name C17 6.4.3p2
+/// forbids, and an octal or hex escape whose value the element type cannot
+/// represent (6.4.4.4p9).
+///
+/// The second is an error, as a constraint violation is here, and a warning
+/// under `-fpermissive`: gcc only warns, and the literal then holds the
+/// escape's low bits, as gcc's does.
+///
+/// Every decoder of a literal calls this -- the parser for a constant or a
+/// string, and `#if` for a character constant -- so a literal is checked by
+/// one rule wherever it is read.
+pub(crate) fn check_elements(elements: &[Escaped], unit_bits: u32, pos: Position) {
+    for e in elements {
+        match e {
+            Escaped::ForbiddenUcn(val) => report_forbidden_ucn(pos, *val),
+            Escaped::Numeric(n) if !n.fits(unit_bits) => {
+                crate::diag::permissive_error(pos, n.out_of_range_message())
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The width of a plain literal's element, `char`.
+pub(crate) const CHAR_UNIT_BITS: u32 = u8::BITS;
 
 /// Parse an escape sequence starting at position i (after the backslash).
 ///
@@ -85,14 +166,11 @@ pub(crate) fn parse_escape_sequence(chars: &[char], i: usize) -> (Escaped, usize
                 hex_chars += 1;
             }
             if hex_chars > 0 {
-                // C allows arbitrarily many digits. The value is kept to its
-                // low 32 bits, which every element type fits within; the
-                // consumer reduces it further to its own width.
-                let val = chars[i + 1..i + 1 + hex_chars]
-                    .iter()
-                    .filter_map(|c| c.to_digit(16))
-                    .fold(0u32, |v, d| (v << 4) | d);
-                (Escaped::Unit(val), 1 + hex_chars)
+                let digits = &chars[i + 1..i + 1 + hex_chars];
+                (
+                    Escaped::Numeric(NumericEscape::new(digits, 16)),
+                    1 + hex_chars,
+                )
             } else {
                 (Escaped::Unit(u32::from(b'x')), 1) // \x with no hex digits - just 'x'
             }
@@ -140,12 +218,10 @@ pub(crate) fn parse_escape_sequence(chars: &[char], i: usize) -> (Escaped, usize
             {
                 oct_chars += 1;
             }
-            let oct: String = chars[i..i + oct_chars].iter().collect();
-            // `\777` is 511, which is not a byte. A narrow literal takes the
-            // low eight bits, as gcc does, so `'\777'` is 255; `L'\777'` is
-            // 511.
-            let val = u32::from_str_radix(&oct, 8).unwrap_or(0);
-            (Escaped::Unit(val), oct_chars)
+            // `\777` is 511, which is not a byte: `L'\777'` is 511, and
+            // `'\777'` is out of range.
+            let digits = &chars[i..i + oct_chars];
+            (Escaped::Numeric(NumericEscape::new(digits, 8)), oct_chars)
         }
         // An unknown escape stands for the character itself. In a narrow
         // literal that character came from the source one byte at a time,
@@ -166,20 +242,23 @@ pub(crate) fn parse_escape_sequence(chars: &[char], i: usize) -> (Escaped, usize
 /// a *single*-character constant. A multi-character constant such as `'ab'` is
 /// the preprocessor's business (C17 6.10.1) and goes through
 /// [`parse_string_literal`] instead.
-pub(crate) fn char_literal_value(s: &str, wide: bool, pos: Position) -> (u32, bool) {
+///
+/// `prefixed_bits` is the width of a prefixed constant's type, `None` for a
+/// plain constant.
+pub(crate) fn char_literal_value(
+    s: &str,
+    prefixed_bits: Option<u32>,
+    pos: Position,
+) -> (u32, bool) {
     let elements = parse_string_literal(s);
-    for e in &elements {
-        if let Escaped::ForbiddenUcn(val) = e {
-            report_forbidden_ucn(pos, *val);
-        }
-    }
+    check_elements(&elements, prefixed_bits.unwrap_or(CHAR_UNIT_BITS), pos);
     if elements.is_empty() {
         return (0, false);
     }
 
     // A prefixed constant holds characters, not bytes: `L'é'` is the one wide
     // character U+00E9, never the first byte of its UTF-8.
-    if wide {
+    if prefixed_bits.is_some() {
         let units = literal_wide_chars(&elements);
         return (units.first().copied().unwrap_or(0), true);
     }
@@ -228,7 +307,8 @@ pub(crate) fn char_literal_value(s: &str, wide: bool, pos: Position) -> (u32, bo
 /// A character -- typed, or named by a universal character name -- is encoded
 /// in UTF-16, so one beyond the BMP becomes a surrogate pair. A unit named by
 /// an escape is *not* a character and is not encoded: `u"\xd800"` is the one
-/// unit 0xD800, and `u"\x12345"` keeps the low sixteen bits, as gcc does.
+/// unit 0xD800, and `u"\x12345"` (out of range) keeps the low sixteen bits,
+/// as gcc does.
 pub(crate) fn literal_utf16_units(elements: &[Escaped]) -> Vec<u16> {
     let mut out = Vec::with_capacity(elements.len());
     let mut run = Vec::new();
@@ -239,7 +319,7 @@ pub(crate) fn literal_utf16_units(elements: &[Escaped]) -> Vec<u16> {
     for e in elements {
         match e {
             Escaped::SourceByte(b) => run.push(*b),
-            Escaped::Unit(u) => {
+            Escaped::Unit(u) | Escaped::Numeric(NumericEscape { unit: u, .. }) => {
                 flush(&mut run, &mut out);
                 out.push(*u as u16);
             }
@@ -304,7 +384,9 @@ pub(crate) fn literal_bytes(elements: &[Escaped]) -> String {
     let mut out = String::with_capacity(elements.len());
     for e in elements {
         match e {
-            Escaped::Unit(u) => out.push(*u as u8 as char),
+            Escaped::Unit(u) | Escaped::Numeric(NumericEscape { unit: u, .. }) => {
+                out.push(*u as u8 as char)
+            }
             Escaped::SourceByte(b) => out.push(*b as char),
             // Already diagnosed where the literal was parsed; encoded as
             // written so the rest of the literal still makes sense.
@@ -340,7 +422,7 @@ pub(crate) fn literal_wide_chars(elements: &[Escaped]) -> Vec<u32> {
     for e in elements {
         match e {
             Escaped::SourceByte(b) => run.push(*b),
-            Escaped::Unit(u) => {
+            Escaped::Unit(u) | Escaped::Numeric(NumericEscape { unit: u, .. }) => {
                 flush(&mut run, &mut out);
                 out.push(*u);
             }
@@ -358,3 +440,7 @@ pub(crate) fn literal_wide_chars(elements: &[Escaped]) -> Vec<u32> {
     flush(&mut run, &mut out);
     out
 }
+
+#[cfg(test)]
+#[path = "test_literal.rs"]
+mod tests;

@@ -4949,15 +4949,45 @@ fn test_float64_literal_suffix() {
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Double);
 }
 
+/// A `_FloatN` suffix is a *floating* suffix (TS 18661-3): it does not make
+/// an integer constant floating. gcc rejects `42f16` with "invalid suffix on
+/// integer constant"; c17 took it for a `_Float16` 42.
 #[test]
-fn test_int_with_float16_suffix() {
-    // Integer with f16 suffix becomes float literal
-    let (expr, types, _, _) = parse_expr("42f16").unwrap();
-    match expr.kind {
-        ExprKind::FloatLit(v) => assert!((v.to_f64() - 42.0).abs() < 0.001),
-        _ => panic!("Expected FloatLit"),
+fn test_int_with_float_suffix_is_rejected() {
+    for src in ["42f16", "42f32", "42f64", "42f128", "42f", "42q", "42lf"] {
+        assert!(parse_expr(src).is_err(), "{src} should be rejected");
     }
-    assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float16);
+}
+
+/// A `_FloatN` suffix on a hex floating constant, after the `p` exponent.
+///
+/// Suffixes were found by `ends_with` on the whole spelling and the `fN` ones
+/// were only looked for on decimal constants, since before a `p` they are
+/// hex digits; so `0x1p0f16` was rejected outright.
+#[test]
+fn test_hex_float_with_float_n_suffix() {
+    for (src, want) in [
+        ("0x1p0f16", TypeKind::Float16),
+        ("0x1.8p1F16", TypeKind::Float16),
+        ("0x1p0f32", TypeKind::Float),
+        ("0x1p0f64", TypeKind::Double),
+    ] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        assert!(matches!(expr.kind, ExprKind::FloatLit(_)), "{src}");
+        assert_eq!(types.kind(expr.typ.unwrap()), want, "{src}");
+    }
+}
+
+/// Malformed suffixes are rejected rather than trimmed until something
+/// parses: `1.0lf` was a `long double` and `1f` the integer 1.
+#[test]
+fn test_malformed_number_suffixes_are_rejected() {
+    for src in [
+        "1.0lf", "1.0fl", "1f", "1lL", "1uu", "1lul", "1.0ff", "2.0f32x", "1.5e+",
+    ] {
+        assert!(parse_expr(src).is_err(), "{src} should be rejected");
+    }
 }
 
 // _Alignof expression tests (C11)
@@ -6331,6 +6361,96 @@ fn test_imaginary_hex_float_constants() {
             "{src} gave {:?}",
             expr.kind
         );
+    }
+}
+
+/// The imaginary marker with every `_FloatN` suffix c17 has a type for, in
+/// both orders, as gcc accepts it.
+///
+/// The marker used to be found in "the trailing run of letters", and the
+/// digits of `f16` ended that run, so `2.0if16` was rejected while
+/// `2.0f16i` was accepted.
+#[test]
+fn test_imaginary_marker_with_float_n_suffixes() {
+    for (suffix, want) in [
+        ("f16", TypeKind::Float16),
+        ("F16", TypeKind::Float16),
+        ("f32", TypeKind::Float),
+        ("f64", TypeKind::Double),
+        ("f", TypeKind::Float),
+        ("l", TypeKind::LongDouble),
+        ("", TypeKind::Double),
+    ] {
+        for marker in ["i", "j", "I", "J"] {
+            for src in [
+                format!("2.5{marker}{suffix}"),
+                format!("2.5{suffix}{marker}"),
+                format!("0x1.4p1{marker}{suffix}"),
+                format!("0x1.4p1{suffix}{marker}"),
+                format!("25e-1{marker}{suffix}"),
+            ] {
+                let (expr, types, _, _) =
+                    parse_expr(&src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+                let typ = expr.typ.unwrap();
+                assert!(types.is_complex_float(typ), "{src} should be complex");
+                let ExprKind::BuiltinComplex { real, imag } = &expr.kind else {
+                    panic!("{src} gave {:?}", expr.kind);
+                };
+                assert!(
+                    matches!(real.kind, ExprKind::FloatLit(v) if v.to_f64() == 0.0),
+                    "{src}: real half is {:?}",
+                    real.kind
+                );
+                assert!(
+                    matches!(imag.kind, ExprKind::FloatLit(v) if v.to_f64() == 2.5),
+                    "{src}: imaginary half is {:?}",
+                    imag.kind
+                );
+                assert_eq!(types.kind(imag.typ.unwrap()), want, "{src} base type");
+            }
+        }
+    }
+}
+
+/// `f128`/`q` with the marker in both orders, where the target has binary128.
+#[test]
+fn test_imaginary_marker_with_binary128_suffixes() {
+    for src in ["2.0if128", "2.0f128i", "2.0iq", "2.0qi", "0x1p1iF128"] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let ExprKind::BuiltinComplex { imag, .. } = &expr.kind else {
+            panic!("{src} gave {:?}", expr.kind);
+        };
+        assert_eq!(types.kind(imag.typ.unwrap()), TypeKind::Float128, "{src}");
+    }
+}
+
+/// Where gcc places the marker, and where it does not.
+///
+/// It may stand between an integer's `u` and its `l`s and on a hex integer,
+/// but only once, and never inside another suffix: not between the `f` and
+/// the digits of `f16`, not inside `ll`.
+#[test]
+fn test_imaginary_marker_placement() {
+    for (src, want_bits) in [
+        ("1uil", 128),
+        ("1liu", 128),
+        ("1ill", 128),
+        ("1llui", 128),
+        ("0x1i", 64),
+        ("0xfi", 64),
+        ("0b1i", 64),
+    ] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let typ = expr.typ.unwrap();
+        assert!(types.is_complex_integer(typ), "{src} should be complex int");
+        assert_eq!(types.size_bits(typ), want_bits, "{src} width");
+    }
+    for src in [
+        "2.0fi16", "2.0f1i6", "2.0f16ij", "2.0iif", "1lil", "1.0ii", "2.0Lif", "1if16", "1f16i",
+    ] {
+        assert!(parse_expr(src).is_err(), "{src} should be rejected");
     }
 }
 

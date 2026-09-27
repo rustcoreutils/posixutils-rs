@@ -6469,8 +6469,9 @@ fn test_bitfield_value_mask_covers_the_full_carrier() {
     }
 }
 
-/// `vm_index_base` finds the object whose recorded extents give the stride for
-/// a variably-modified type, and counts the index steps that separate them.
+/// `Expr::vm_index_base` finds the object whose recorded extents give the
+/// stride for a variably-modified type, and counts the index steps that
+/// separate them.
 ///
 /// A dereference is an index step: 6.5.2.1p2 defines `E1[E2]` as
 /// `(*((E1)+(E2)))`, so `*p` and `p[0]` are the same expression at the same
@@ -6518,19 +6519,19 @@ fn test_vm_index_base_counts_a_deref_as_an_index_step() {
     };
 
     // The object itself is depth 0.
-    assert_eq!(Linearizer::vm_index_base(&ident()), Some((sym, 0)));
+    assert_eq!(ident().vm_index_base(), Some((sym, 0)));
 
     // `a[0]` and `*a` are the same depth, and so are `a[0][0]`, `(*a)[0]`,
     // `*(a[0])` and `**a`.
-    assert_eq!(Linearizer::vm_index_base(&index(ident())), Some((sym, 1)));
-    assert_eq!(Linearizer::vm_index_base(&deref(ident())), Some((sym, 1)));
+    assert_eq!(index(ident()).vm_index_base(), Some((sym, 1)));
+    assert_eq!(deref(ident()).vm_index_base(), Some((sym, 1)));
     for at_two in [
         index(index(ident())),
         index(deref(ident())),
         deref(index(ident())),
         deref(deref(ident())),
     ] {
-        assert_eq!(Linearizer::vm_index_base(&at_two), Some((sym, 2)));
+        assert_eq!(at_two.vm_index_base(), Some((sym, 2)));
     }
 
     // Anything else under the chain has no recorded extents, so the caller
@@ -6544,20 +6545,25 @@ fn test_vm_index_base_counts_a_deref_as_an_index_step() {
         pos: test_pos(),
         bitfield_bits: None,
     };
-    assert_eq!(Linearizer::vm_index_base(&not_an_object), None);
-    assert_eq!(Linearizer::vm_index_base(&index(not_an_object)), None);
+    assert_eq!(not_an_object.vm_index_base(), None);
+    assert_eq!(index(not_an_object).vm_index_base(), None);
 
-    // A unary operator that is not a dereference is not an index step.
-    let addr_of = Expr {
+    // `&` steps back out: `&a` is one step above `a`, and `&*a` is `a`.
+    let addr_of = |base: Expr| Expr {
         kind: ExprKind::Unary {
             op: UnaryOp::AddrOf,
-            operand: Box::new(ident()),
+            operand: Box::new(base),
         },
         typ: Some(int_t),
         pos: test_pos(),
         bitfield_bits: None,
     };
-    assert_eq!(Linearizer::vm_index_base(&addr_of), None);
+    assert_eq!(addr_of(ident()).vm_index_base(), Some((sym, -1)));
+    assert_eq!(addr_of(deref(ident())).vm_index_base(), Some((sym, 0)));
+    assert_eq!(
+        index(addr_of(index(ident()))).vm_index_base(),
+        Some((sym, 1))
+    );
 
     // Adding to a pointer does not change what it points at, so `p + 2` sits
     // at the same depth as `p` -- from either side, and for `-` as well.
@@ -6582,27 +6588,24 @@ fn test_vm_index_base_counts_a_deref_as_an_index_step() {
         bitfield_bits: None,
     };
     assert_eq!(
-        Linearizer::vm_index_base(&arith(BinaryOp::Add, ident(), false)),
+        arith(BinaryOp::Add, ident(), false).vm_index_base(),
         Some((sym, 0))
     );
     assert_eq!(
-        Linearizer::vm_index_base(&arith(BinaryOp::Add, ident(), true)),
+        arith(BinaryOp::Add, ident(), true).vm_index_base(),
         Some((sym, 0))
     );
     assert_eq!(
-        Linearizer::vm_index_base(&arith(BinaryOp::Sub, ident(), false)),
+        arith(BinaryOp::Sub, ident(), false).vm_index_base(),
         Some((sym, 0))
     );
     // And the steps compose: `(*p + 2)[0]` is two steps from `p`.
     assert_eq!(
-        Linearizer::vm_index_base(&index(arith(BinaryOp::Add, deref(ident()), false))),
+        index(arith(BinaryOp::Add, deref(ident()), false)).vm_index_base(),
         Some((sym, 2))
     );
     // An arithmetic operator that is not `+`/`-` reaches no object.
-    assert_eq!(
-        Linearizer::vm_index_base(&arith(BinaryOp::Mul, ident(), false)),
-        None
-    );
+    assert_eq!(arith(BinaryOp::Mul, ident(), false).vm_index_base(), None);
 }
 
 /// `__builtin_va_arg_pack()` is not an argument: it stands for the caller's

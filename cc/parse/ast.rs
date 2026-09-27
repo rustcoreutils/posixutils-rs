@@ -13,7 +13,7 @@
 use crate::diag::Position;
 use crate::float::FloatVal;
 use crate::strings::StringId;
-use crate::symbol::SymbolId;
+use crate::symbol::{SymbolId, SymbolTable};
 use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
 
 // Operators
@@ -410,6 +410,33 @@ pub enum ExprKind {
     /// integer everywhere else, so a use rides the existing VLA machinery
     /// through `vla_sizes` and `SizeofType`'s dimension list.
     VmTypedefExtent(SymbolId, u32),
+
+    /// One variable extent of the variably modified type of an *object*
+    /// expression -- `v`, `v[i]`, `*p`, `p` -- read from what the declaration
+    /// of the object it is rooted in recorded: the expression and the index
+    /// of the extent among the type's variable ones (outermost is 0).
+    ///
+    /// `typeof(v)` needs these for the same reason a typedef use needs
+    /// [`ExprKind::VmTypedefExtent`]: the type is `int[]`, whatever `v`'s
+    /// extent is, and the extent is `v`'s, fixed when `v` was declared. The
+    /// expression is only located, never evaluated here.
+    VmObjectExtent(Box<Expr>, u32),
+
+    /// A value whose variably modified type was written as a type-name -- a
+    /// cast `(int (*)[n])p`, a compound literal, `va_arg(ap, int (*)[n])` --
+    /// with that type-name's size expressions, which are evaluated each time
+    /// the value is (C17 6.8p4), before it.
+    ///
+    /// The type alone is `int (*)[]`, so the extents are recorded under
+    /// `symbol`, an unnamed symbol declared variably modified, the way a
+    /// declared `int (*p)[n]` records them under `p`: whatever is rooted in
+    /// the value -- `+ 1`, `*`, `[i]`, `sizeof`, `typeof` -- finds them as it
+    /// finds `p`'s.
+    VmTypeName {
+        symbol: SymbolId,
+        dims: Vec<Expr>,
+        expr: Box<Expr>,
+    },
 
     /// sizeof expression: sizeof expr
     SizeofExpr(Box<Expr>),
@@ -1034,6 +1061,33 @@ pub fn sizeof_type_is_runtime(types: &TypeTable, typ: TypeId, dims: &[Expr]) -> 
         && types.unsized_array_levels(typ) == dims.len()
 }
 
+/// How many variable extents the type of `expr` has, counted as a
+/// declarator's size expressions count them: an array's unsized levels, or a
+/// pointer's pointee's. Zero unless `expr` is rooted in an object -- or a
+/// type-name's value ([`ExprKind::VmTypeName`]) -- declared variably
+/// modified, since the type cannot tell `int[n]` from the incomplete `int[]`.
+///
+/// `typeof(expr)` names this many extents, and `sizeof` evaluates an operand
+/// of array type that has any.
+pub(crate) fn vm_extent_count(types: &TypeTable, symbols: &SymbolTable, expr: &Expr) -> usize {
+    let Some(typ) = expr.typ else {
+        return 0;
+    };
+    let array = match types.kind(typ) {
+        TypeKind::Pointer => types.base_type(typ),
+        _ => Some(typ),
+    };
+    let levels = array.map_or(0, |a| types.unsized_array_levels(a));
+    let declared_vm = expr
+        .vm_index_base()
+        .is_some_and(|(root, _)| symbols.get(root).array_is_variably_modified);
+    if declared_vm {
+        levels
+    } else {
+        0
+    }
+}
+
 /// Does this initializer element initialize `target_type` by elided braces?
 ///
 /// C17 6.7.9p20: a brace-less initializer for an aggregate member takes as
@@ -1356,6 +1410,74 @@ impl Expr {
         }
     }
 
+    /// Peel index steps off this expression to reach the object being indexed,
+    /// returning it with the number of steps that separate them.
+    ///
+    /// `b` gives depth 0, `b[i]` gives 1, `b[i][j]` gives 2. A dereference is
+    /// an index step too -- 6.5.2.1p2 defines `E1[E2]` as `(*((E1)+(E2)))`,
+    /// so `*p` and `p[0]` are the same expression. Counting only `Index`
+    /// meant the extents were carried on the way in and dropped on the way
+    /// out: `p[0][i][j]` indexed correctly while `(*p)[i][j]` used a stride
+    /// of zero, and `sizeof(*p)` answered 0.
+    ///
+    /// `&` takes a step back out: `&*p` is `p` again, and `&v` is -1, one
+    /// step above the VLA `v` -- a pointer to the whole of it.
+    ///
+    /// Anything that is not an identifier -- or a type-name's value,
+    /// [`ExprKind::VmTypeName`] -- under such a chain has no recorded
+    /// extents, so it yields None and the caller falls back to the
+    /// compile-time size.
+    pub(crate) fn vm_index_base(&self) -> Option<(SymbolId, isize)> {
+        let mut depth = 0isize;
+        let mut cur = self;
+        loop {
+            match &cur.kind {
+                ExprKind::Ident(symbol_id)
+                | ExprKind::VmTypeName {
+                    symbol: symbol_id, ..
+                } => return Some((*symbol_id, depth)),
+                ExprKind::Index { array, .. } => {
+                    depth += 1;
+                    cur = array;
+                }
+                ExprKind::Unary {
+                    op: UnaryOp::Deref,
+                    operand,
+                } => {
+                    depth += 1;
+                    cur = operand;
+                }
+                ExprKind::Unary {
+                    op: UnaryOp::AddrOf,
+                    operand,
+                } => {
+                    let (sym, inner) = operand.vm_index_base()?;
+                    return Some((sym, depth + inner - 1));
+                }
+                // `p + i` and `i + p` denote the same kind of object as `p`,
+                // at the same depth: adding to a pointer does not change what
+                // it points at. Whichever side reaches an object is the
+                // pointer, which needs no type information to decide.
+                // Without this, `(p + 2) - p` found no extents and divided by
+                // a compile-time size of zero, which traps at run time.
+                ExprKind::Binary {
+                    op: BinaryOp::Add | BinaryOp::Sub,
+                    left,
+                    right,
+                } => {
+                    if let Some((sym, extra)) = left.vm_index_base() {
+                        return Some((sym, depth + extra));
+                    }
+                    if let Some((sym, extra)) = right.vm_index_base() {
+                        return Some((sym, depth + extra));
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+    }
+
     /// Every expression this one directly contains, apart from the statements
     /// of a statement expression, which are not expressions.
     pub(crate) fn operands(&self) -> Vec<&Expr> {
@@ -1372,6 +1494,7 @@ impl Expr {
             | K::Ident(_)
             | K::FuncName
             | K::VmTypedefExtent(..)
+            | K::VmObjectExtent(..)
             | K::AlignofType(_)
             | K::LabelAddr(_)
             | K::VaArgPack
@@ -1381,6 +1504,7 @@ impl Expr {
             | K::ReturnAddress { .. }
             | K::OffsetOf { .. } => Vec::new(),
             K::StmtExpr { result, .. } => vec![result],
+            K::VmTypeName { dims, expr, .. } => dims.iter().chain([&**expr]).collect(),
             K::Unary { operand: a, .. }
             | K::PostInc(a)
             | K::PostDec(a)
@@ -1835,6 +1959,13 @@ pub struct FunctionAttrs {
     /// `__attribute__((aligned(N)))` -- align the function's code to N bytes,
     /// which is also what `__alignof__` of the function answers.
     pub align: Option<u32>,
+    /// `__attribute__((noreturn))`. What a call site reads is the function
+    /// *type*'s `noreturn`, which the declarator is given from this.
+    pub noreturn: bool,
+    /// `__attribute__((sysv_abi))` or `((ms_abi))`, from whichever
+    /// declaration wrote it: gcc compiles a definition under the convention
+    /// an earlier prototype named.
+    pub calling_conv: Option<crate::abi::CallingConv>,
 }
 
 impl FunctionAttrs {
@@ -1862,6 +1993,10 @@ impl FunctionAttrs {
         // Several `aligned` attributes across the declarations: the strictest
         // wins, as it does for an object.
         self.align = self.align.max(other.align);
+        self.noreturn |= other.noreturn;
+        if other.calling_conv.is_some() {
+            self.calling_conv = other.calling_conv;
+        }
     }
 }
 

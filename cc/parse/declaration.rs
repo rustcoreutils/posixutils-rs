@@ -10,12 +10,15 @@
 // checking and redeclaration compatibility
 //
 
-use super::ast::{Declaration, Designator, Expr, ExprKind, InitDeclarator, InitElement};
-use super::parser::{DeclaratorName, ParseError, ParseResult, Parser};
+use super::ast::{
+    Declaration, Designator, Expr, ExprKind, ExternalDecl, InitDeclarator, InitElement, MemEffect,
+};
+use super::bind::DeclScope;
+use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind};
-use crate::token::lexer::{Position, TokenType};
+use crate::token::lexer::Position;
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use gettextrs::gettext;
 
@@ -24,10 +27,14 @@ use gettextrs::gettext;
 /// `short`/`long`/`signed`/`unsigned` are counted; they qualify a
 /// data type rather than naming one.
 #[derive(Default)]
-pub(crate) struct SpecifierTally {
-    /// Data-type specifiers, in source order, under their canonical spelling.
-    /// More than one is always a constraint violation.
-    data_types: Vec<(&'static str, Position)>,
+struct SpecifierTally<'a> {
+    /// Data-type specifiers, in source order, under their canonical spelling
+    /// -- or, for a typedef name or `typeof`, as written. More than one is
+    /// always a constraint violation.
+    data_types: Vec<(&'a str, Position)>,
+    /// Whether `_Complex` appeared. It names no data type of its own, but it
+    /// is a type specifier, so a typedef name after it is the declarator.
+    complex: bool,
     short_count: u32,
     long_count: u32,
     signed_count: u32,
@@ -41,7 +48,7 @@ pub(crate) struct SpecifierTally {
     storage_classes: Vec<(&'static str, Position)>,
 }
 
-impl SpecifierTally {
+impl<'a> SpecifierTally<'a> {
     /// Whether an *alias* type specifier appearing now is the name of what is
     /// being declared rather than a second data type.
     ///
@@ -54,8 +61,19 @@ impl SpecifierTally {
         !self.data_types.is_empty()
     }
 
-    fn note_data_type(&mut self, name: &'static str, pos: Position) {
+    fn note_data_type(&mut self, name: &'a str, pos: Position) {
         self.data_types.push((name, pos));
+    }
+
+    /// Whether any type specifier at all has been given -- a data type, a
+    /// size, a signedness or `_Complex`. A typedef name is a type specifier
+    /// only where none has (6.7.2p2 lists no combination containing one), so
+    /// in `unsigned T x;` the `T` is the declarator, not the type; asking
+    /// only whether a data type had been seen took it as the type.
+    fn has_type_specifier(&self) -> bool {
+        !self.data_types.is_empty()
+            || self.complex
+            || self.short_count + self.long_count + self.signed_count + self.unsigned_count > 0
     }
 
     fn note_size(&mut self, name: &'static str, pos: Position) {
@@ -70,7 +88,7 @@ impl SpecifierTally {
     /// `_Thread_local` is deliberately not recorded: 6.7.1p2 lets it appear
     /// with `static` or `extern`, and gcc accepts both orders, so counting it
     /// would reject `static _Thread_local int x;`.
-    pub(crate) fn note_storage_class(&mut self, name: &'static str, pos: Position) {
+    fn note_storage_class(&mut self, name: &'static str, pos: Position) {
         self.storage_classes.push((name, pos));
     }
 
@@ -88,7 +106,7 @@ impl SpecifierTally {
     /// Reporting rather than returning an error: a constraint violation needs a
     /// diagnostic (C17 5.1.1.3), and the parser recovers with the type it had
     /// already built, so one bad declaration does not cascade.
-    pub(crate) fn check(&self) {
+    fn check(&self) {
         if let Some((second, pos)) = self.storage_classes.get(1) {
             let first = self.storage_classes[0].0;
             if first == *second {
@@ -175,17 +193,88 @@ impl SpecifierTally {
     }
 }
 
+/// Where a list of declaration specifiers is written, which settles the
+/// specifiers it may hold.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpecContext {
+    /// A declaration, including a parameter declaration (C17 6.7p1): every
+    /// specifier. A parameter may carry no storage class but `register`
+    /// (6.7.6.3p2), but that diagnostic names the parameter, so it is made
+    /// once the declarator has supplied the name
+    /// ([`Parser::check_parameter_specifiers`]).
+    Declaration,
+    /// A structure or union member (6.7.2.1p1): a specifier-qualifier list,
+    /// which admits an alignment specifier but no storage class or function
+    /// specifier.
+    Member,
+    /// A type-name (6.7.7p1): a specifier-qualifier list, and no alignment
+    /// specifier either (6.7.5p2).
+    TypeName,
+}
+
+/// The type a list of declaration specifiers names, and what came with it.
+pub(crate) struct DeclSpecifiers {
+    /// The type, still carrying the storage-class and function specifiers,
+    /// which a declaration takes off its modifiers.
+    pub(crate) ty: Type,
+    /// `ty`'s interned id, when the specifiers resolved to an existing type
+    /// -- a typedef name or `typeof` -- and added nothing to it. A type-name
+    /// answers with that id rather than interning a copy: a composite type is
+    /// never deduplicated, so the copy would be a distinct type.
+    pub(crate) id: Option<TypeId>,
+    /// Whether a type specifier was given, rather than `int` defaulted.
+    ///
+    /// C99 removed implicit int, but defaulting is still the right recovery,
+    /// so a declaration decides whether the omission is an error at its own
+    /// position: a K&R identifier list and an abstract parameter reach here
+    /// legitimately with no specifier, and a declaration that stops at `;`
+    /// has a different fault to report.
+    pub(crate) explicit: bool,
+    /// The extents of the variably modified array levels the specifiers
+    /// introduced -- through a variably modified typedef name, or through
+    /// `typeof(int[n])` or `typeof(v)` -- outermost-first. They cannot ride on the type:
+    /// `int[n]`, `int[m]` and `int[]` all intern to one `TypeId`.
+    pub(crate) vm_dims: Vec<Expr>,
+}
+
+/// A type specifier that names a complete type by itself.
+enum Resolved {
+    /// An existing type: a typedef name or `typeof`.
+    Id(TypeId),
+    /// A type the specifier built: `_Atomic(..)`, or a struct, union or enum
+    /// specifier.
+    Built(Type),
+}
+
+/// The modifier bits `short`, `long`, `signed`, `unsigned` and `_Complex`
+/// record. Beside a resolved type they are a 6.7.2p2 violation the tally has
+/// already reported, and are dropped rather than applied to it.
+const SIZE_SIGN_COMPLEX: TypeModifiers = TypeModifiers::SIGNED
+    .union(TypeModifiers::UNSIGNED)
+    .union(TypeModifiers::SHORT)
+    .union(TypeModifiers::LONG)
+    .union(TypeModifiers::LONGLONG)
+    .union(TypeModifiers::COMPLEX);
+
 impl Parser<'_> {
-    /// Parse a declaration and bind variables to symbol table
-    ///
-    /// Binds each declared variable to the symbol table immediately during
-    /// parsing, so the symbol is available for subsequent references.
-    ///
-    /// If `forbid_storage_class` is true, emits an error if the declaration
-    /// contains storage class specifiers (static, extern). This is used for
-    /// for-loop init declarations per C99 6.8.5.3.
+    /// Parse a block-scope declaration and bind every name it declares.
     pub(super) fn parse_declaration_and_bind(&mut self) -> ParseResult<Declaration> {
-        self.parse_declaration_and_bind_impl(false)
+        self.parse_block_declaration(false)
+    }
+
+    /// Parse the declaration in the first clause of a `for`, which may not
+    /// name a storage class but `auto` or `register` (C17 6.8.5p3).
+    pub(super) fn parse_for_init_declaration_and_bind(&mut self) -> ParseResult<Declaration> {
+        self.parse_block_declaration(true)
+    }
+
+    fn parse_block_declaration(&mut self, for_init: bool) -> ParseResult<Declaration> {
+        match self.parse_declaration(DeclScope::Block { for_init })? {
+            ExternalDecl::Declaration(decl) => Ok(decl),
+            ExternalDecl::FunctionDef(_) => {
+                unreachable!("a function definition is recognised only at file scope")
+            }
+        }
     }
 
     /// The element count an array takes from a string-literal initializer:
@@ -543,324 +632,41 @@ impl Parser<'_> {
             (max_index + 1) as usize
         }
     }
+}
 
-    /// Parse a for-init declaration and bind variables to symbol table
+impl<'a> Parser<'a> {
+    /// Parse a list of declaration specifiers (C17 6.7p1) -- or, in a member
+    /// declaration or a type-name, a specifier-qualifier list.
     ///
-    /// Same as `parse_declaration_and_bind()` but rejects storage class specifiers.
-    pub(super) fn parse_for_init_declaration_and_bind(&mut self) -> ParseResult<Declaration> {
-        self.parse_declaration_and_bind_impl(true)
-    }
-
-    /// Implementation of declaration parsing with optional storage class check
-    fn parse_declaration_and_bind_impl(
+    /// The one specifier loop. There used to be two, one for declarations and
+    /// one for type-names, and they drifted: the type-name copy kept no
+    /// [`SpecifierTally`], dropped the qualifiers written before `typeof`,
+    /// never checked `_Atomic` on an array, and answered "not a type" after
+    /// consuming tokens.
+    ///
+    /// 6.7p1 lets the specifiers come in any order, so a type specifier that
+    /// names a complete type by itself -- `typeof`, `_Atomic(..)`, a struct,
+    /// union or enum specifier, a typedef name -- is recorded and the loop
+    /// goes on: `typeof(int) const x;` and `enum E { A } static e;` read as
+    /// written. Returning as soon as one was parsed left the specifier after
+    /// it to be read as the declarator's name.
+    ///
+    /// A type-name's caller decides beforehand, from the current token alone,
+    /// whether one begins here ([`Self::starts_type_name`]). Past that point
+    /// the list is committed and every fault is reported.
+    pub(super) fn parse_declaration_specifiers(
         &mut self,
-        forbid_storage_class: bool,
-    ) -> ParseResult<Declaration> {
-        self.reset_pending_declaration_state();
-        // Check for _Static_assert first (C11)
-        if self.is_static_assert() {
-            self.parse_static_assert()?;
-            // Return empty declaration - static_assert produces nothing
-            return Ok(Declaration {
-                declarators: vec![],
-            });
-        }
-
-        // Parse type specifiers
-        let decl_pos = self.current_pos();
-        let base_type = self.parse_type_specifier()?;
-        // A declaration that stops right here declares nothing, and that --
-        // not a missing type specifier -- is what to report. The `;` arms
-        // below do it.
-        if !self.is_special(b';') {
-            self.check_implicit_int(decl_pos);
-        }
-        // Skip __attribute__ between type and declarator (GCC extension)
-        self.skip_extensions();
-
-        // Check for forbidden storage class specifiers in for-init context
-        if forbid_storage_class {
-            if base_type.modifiers.contains(TypeModifiers::STATIC) {
-                return Err(ParseError::new(
-                    "declaration of static variable in for loop initial declaration",
-                    self.current_pos(),
-                ));
-            }
-            if base_type.modifiers.contains(TypeModifiers::EXTERN) {
-                return Err(ParseError::new(
-                    "declaration of extern variable in for loop initial declaration",
-                    self.current_pos(),
-                ));
-            }
-            if base_type.modifiers.contains(TypeModifiers::THREAD_LOCAL) {
-                return Err(ParseError::new(
-                    "declaration of thread-local variable in for loop initial declaration",
-                    self.current_pos(),
-                ));
-            }
-        }
-
-        // C11 6.7.1p2: _Thread_local shall not appear in a declaration with auto or register
-        if base_type.modifiers.contains(TypeModifiers::THREAD_LOCAL) {
-            if base_type.modifiers.contains(TypeModifiers::AUTO) {
-                return Err(ParseError::new(
-                    "_Thread_local cannot be combined with auto",
-                    self.current_pos(),
-                ));
-            }
-            if base_type.modifiers.contains(TypeModifiers::REGISTER) {
-                return Err(ParseError::new(
-                    "_Thread_local cannot be combined with register",
-                    self.current_pos(),
-                ));
-            }
-        }
-
-        // Check modifiers from the specifier before interning (storage class is not part of type)
-        let is_typedef = base_type.modifiers.contains(TypeModifiers::TYPEDEF);
-        // C11 6.7.5p2 -- both facts are already in the specifier modifiers.
-        if is_typedef {
-            self.reject_alignas_in("a typedef");
-        } else if base_type.modifiers.contains(TypeModifiers::REGISTER) {
-            self.reject_alignas_in("an object with register storage");
-        }
-        // For struct/union types with tags, use existing TypeId to preserve forward declarations
-        let base_type_id = self.intern_type_with_tag(&base_type);
-        let spec_attrs = self.specifier_attrs();
-
-        // Parse declarators
-        let mut declarators = Vec::new();
-
-        // Check for struct/union/enum-only declaration (no declarators)
-        // e.g., "struct point { int x; int y; };"
-        if self.is_special(b';') {
-            self.check_declares_something(decl_pos, &base_type);
-        } else {
-            loop {
-                let decl_pos = self.current_pos();
-                let (name, mut typ, mut vla_sizes, _func_params) =
-                    self.parse_declarator(base_type_id, DeclaratorName::Required)?;
-                // C11 6.7.5p2: not on a function. A pointer to function is an
-                // object and stays legal, so this asks the finished type.
-                if self.types.kind(typ) == TypeKind::Function {
-                    self.reject_alignas_in("a function");
-                }
-                // A variably modified typedef supplies the extents of the
-                // levels it contributed. The declarator's own `[n]` levels, if
-                // it wrote any, are innermost-of-the-outer and come first --
-                // the same ordering `try_parse_type_name_vm` applies to a
-                // type-name's declarator and specifier levels.
-                if let Some(dims) = &self.pending_vm_typedef_dims {
-                    vla_sizes.extend(dims.iter().cloned());
-                }
-                // Skip GCC extensions like __asm("...") or __attribute__((...))
-                self.skip_extensions_after_declarator();
-
-                // Check if we have a name (needed for symbol binding)
-                let has_name = !self.str(name).is_empty();
-
-                // Validate explicit alignment (C11 6.7.5: >= natural alignment)
-                typ = self.apply_pending_type_attrs(typ);
-                if has_name && !is_typedef && self.types.kind(typ) == TypeKind::Function {
-                    self.accumulate_fn_attrs(name);
-                }
-                let validated_align = self.validated_explicit_align(typ)?;
-
-                // Bind variable to symbol table BEFORE parsing initializer.
-                // This ensures the variable is in scope for sizeof(*var) in initializers.
-                // Per C99 6.2.1p7: "Any other identifier has scope that begins just
-                // after the completion of its declarator."
-                let mut symbol_id: Option<SymbolId> = None;
-                if has_name && !is_typedef {
-                    // C17 6.2.7p4: two declarations of one object with linkage
-                    // describe it by their composite type.
-                    typ = self.composite_with_prior_declaration(name, typ, base_type.modifiers);
-                    self.check_redeclaration(name, typ, decl_pos);
-                    let sym = self
-                        .declared_symbol(name, typ, validated_align)
-                        .with_variably_modified_array(!vla_sizes.is_empty());
-                    if let Ok(id) = self.symbols.declare(sym) {
-                        symbol_id = Some(id);
-                    }
-                }
-
-                let init = if self.is_special(b'=') {
-                    if is_typedef {
-                        return Err(ParseError::new(
-                            "typedef cannot have initializer",
-                            self.current_pos(),
-                        ));
-                    }
-                    self.advance();
-                    Some(self.parse_initializer()?)
-                } else {
-                    None
-                };
-
-                // 6.7p7: the object needs a size here, and unlike at file
-                // scope nothing later can supply one -- a tag completed further
-                // down the block is a different declaration. An `extern`
-                // declaration defines nothing and is exempt, and so does a
-                // `typedef`, which declares no object at all: without that,
-                // `typedef struct Incomplete T;` at block scope was rejected
-                // although it names a type nobody has asked to size. The
-                // file-scope twin has had the guard all along.
-                if !is_typedef
-                    && !base_type.modifiers.contains(TypeModifiers::EXTERN)
-                    && !self.types.is_composite_complete(typ)
-                {
-                    let named = self.types.format_type(typ, Some(self.idents));
-                    diag::error_args(
-                        self.current_pos(),
-                        "storage size of an object of type '{0}' is not known",
-                        &[&named],
-                    );
-                }
-
-                // For incomplete array types, infer size from initializer
-                if let Some(ref init_expr) = init {
-                    // 6.7.9p5: an identifier declared `extern` at block scope
-                    // has linkage, so it refers to a definition elsewhere and
-                    // cannot carry one here. At *file* scope the same spelling
-                    // is a definition with external linkage, which gcc only
-                    // warns about -- hence the scope test.
-                    if base_type.modifiers.contains(TypeModifiers::EXTERN) {
-                        diag::error(
-                            init_expr.pos,
-                            &gettext("'extern' variable has an initializer"),
-                        );
-                    }
-                    let old_type = typ;
-                    typ = self.infer_array_size_from_init(typ, init_expr);
-                    self.check_excess_initializers(typ, init_expr);
-                    self.check_initializer_types(typ, init_expr);
-
-                    // If the type changed (array size was inferred), update the symbol's type
-                    // This is needed because the symbol was already added before parsing the initializer
-                    if typ != old_type {
-                        if let Some(sym_id) = symbol_id {
-                            self.symbols.get_mut(sym_id).typ = typ;
-                        }
-                    }
-                }
-
-                // Bind typedef to symbol table (after parsing initializer, which
-                // is forbidden for typedefs anyway)
-                if has_name && is_typedef {
-                    // C17 6.7.7p3 admits a typedef of a variably modified type
-                    // only at block scope, and this path is only ever reached
-                    // from one -- `parse_block_items` and a `for`-init are its
-                    // sole callers. The file-scope spelling is refused by the
-                    // declarator itself, with "variable length arrays cannot
-                    // have file scope", before it could arrive here.
-                    // A mode replaces the type; alignment then attaches to
-                    // whatever the type ended up being.
-                    typ = self.apply_pending_type_attrs(typ);
-                    typ = self.align_typedef_type(typ, validated_align);
-                    self.check_typedef_redefinition(name, typ, decl_pos);
-                    let sym = Symbol::typedef(name, typ, self.symbols.depth());
-                    if let Ok(id) = self.symbols.declare(sym) {
-                        symbol_id = Some(id);
-                        // Remember how many extents this name carries, so a
-                        // use can name each of them. They cannot be recovered
-                        // from the type: `int[n]`, `int[m]` and `int[]` all
-                        // intern to one `TypeId`.
-                        if !vla_sizes.is_empty() {
-                            self.vm_typedefs.insert(id, vla_sizes.len() as u32);
-                        }
-                    }
-                }
-
-                // Only add declarator if it has a symbol (named declaration)
-                // Nameless declarators like "int;" are allowed but produce no binding
-                if let Some(symbol) = symbol_id {
-                    // Extract storage class specifiers from base_type modifiers
-                    let storage_class_mask = TypeModifiers::EXTERN
-                        | TypeModifiers::STATIC
-                        | TypeModifiers::THREAD_LOCAL
-                        | TypeModifiers::TYPEDEF
-                        | TypeModifiers::AUTO
-                        | TypeModifiers::REGISTER;
-                    let storage_class = base_type.modifiers & storage_class_mask;
-                    // Everything declared here has automatic storage duration
-                    // unless a storage class says otherwise: this function is
-                    // only ever reached from `parse_block_items` and a
-                    // `for`-init, both of which are inside a scope. Checked
-                    // after the initializer, because that is what can still
-                    // infer the extent of `char a[] = { .. }`.
-                    //
-                    // `register` is deliberately not excluded -- a `register`
-                    // array still has automatic storage duration. A VLA has no
-                    // static extent to measure, and a function is not an
-                    // object.
-                    const NO_AUTO_DURATION: TypeModifiers = TypeModifiers::STATIC
-                        .union(TypeModifiers::EXTERN)
-                        .union(TypeModifiers::THREAD_LOCAL)
-                        .union(TypeModifiers::TYPEDEF);
-                    if !storage_class.intersects(NO_AUTO_DURATION)
-                        && vla_sizes.is_empty()
-                        && self.types.kind(typ) != TypeKind::Function
-                    {
-                        self.check_stack_object_size(typ, decl_pos, "an automatic object")?;
-                    }
-                    declarators.push(InitDeclarator {
-                        symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
-                        fn_effect: self.take_pending_fn_effect(),
-                        symbol,
-                        typ,
-                        storage_class,
-                        init,
-                        vla_sizes,
-                        explicit_align: validated_align,
-                        pos: decl_pos,
-                    });
-                }
-
-                if self.is_special(b',') {
-                    self.advance();
-                    self.begin_declarator(&spec_attrs);
-                    // An attribute may come before the next declarator, where
-                    // it belongs to that declarator. See the same call in
-                    // `parse_remaining_declarators`.
-                    self.skip_extensions_after_declarator();
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Clear pending alignment after declaration
-        self.pending_alignas = None;
-        self.pending_alignas_kw = None;
-        // Belongs to the declaration whose specifiers named the typedef, and
-        // to no later one.
-        self.pending_vm_typedef_dims = None;
-        // A mode that no declarator consumed belongs to no later declaration:
-        // leaving it set applied it to whatever came next.
-        self.pending_mode = None;
-        self.pending_transparent_union = None;
-        self.expect_special(b';')?;
-
-        Ok(Declaration { declarators })
-    }
-
-    /// Parse a type specifier, reporting whether one was actually present.
-    ///
-    /// See [`SpecifierTally`] for the C17 6.7.2p2 combination check this makes.
-    ///
-    /// The flag has to be written on *every* path out, including the early
-    /// returns for struct/union/enum/typeof. Leaving a stale value behind is
-    /// invisible until the next declaration inherits it: a K&R identifier list
-    /// — whose parameters are `int` by C17 6.9.1p6, so no specifier appears —
-    /// left it false, and the *following* `struct S s;` drew "type specifier
-    /// missing". Returning it rather than assigning a field is what makes the
-    /// compiler check the paths.
-    fn parse_type_specifier_inner(&mut self) -> ParseResult<(Type, bool)> {
+        ctx: SpecContext,
+    ) -> ParseResult<DeclSpecifiers> {
+        let start = self.current_pos();
+        // The spellings the tally records outlive this borrow of `self`.
+        let idents: &'a crate::strings::StringTable = self.idents;
         let mut modifiers = TypeModifiers::empty();
         let mut base_kind: Option<TypeKind> = None;
-        // Track typedef type separately - we continue parsing after a typedef
-        // to collect trailing qualifiers like "z_word_t const"
-        let mut typedef_base: Option<TypeId> = None;
+        let mut resolved: Option<Resolved> = None;
+        let mut vm_dims = Vec::new();
+        // Where `_Atomic` was written, for the constraint checked at the end.
+        let mut atomic_pos: Option<Position> = None;
         // C17 6.7.2p2 admits only a fixed list of specifier combinations. The
         // loop below merely overwrites `base_kind`, so the specifiers are
         // recorded here and checked once the list is complete.
@@ -869,17 +675,12 @@ impl Parser<'_> {
         // Skip any leading __attribute__
         self.skip_extensions();
 
-        loop {
-            if self.peek() != TokenType::Ident {
-                break;
-            }
-
-            let name_id = match self.get_ident_id(self.current()) {
-                Some(id) => id,
-                None => break,
-            };
+        while let Some(name_id) = self.current_ident() {
+            let pos = self.current_pos();
             match name_id {
-                // Skip __attribute__ in the type specifier loop
+                // An attribute can sit anywhere among the specifiers and goes
+                // to the pending slots; a type-name has set the enclosing
+                // declaration's aside ([`Self::try_parse_type_name_vm`]).
                 crate::kw::GNU_ATTRIBUTE | crate::kw::GNU_ATTRIBUTE2 => {
                     self.skip_extensions();
                     continue;
@@ -890,104 +691,95 @@ impl Parser<'_> {
                     self.advance();
                     modifiers |= m;
                 }
-                crate::kw::STATIC => {
-                    tally.note_storage_class("static", self.current_pos());
+                crate::kw::STATIC
+                | crate::kw::EXTERN
+                | crate::kw::REGISTER
+                | crate::kw::AUTO
+                | crate::kw::TYPEDEF => {
+                    if self.reject_outside_declaration(ctx) {
+                        continue;
+                    }
+                    let (name, m) = match name_id {
+                        crate::kw::STATIC => ("static", TypeModifiers::STATIC),
+                        crate::kw::EXTERN => ("extern", TypeModifiers::EXTERN),
+                        crate::kw::REGISTER => ("register", TypeModifiers::REGISTER),
+                        crate::kw::AUTO => ("auto", TypeModifiers::AUTO),
+                        _ => ("typedef", TypeModifiers::TYPEDEF),
+                    };
+                    tally.note_storage_class(name, pos);
                     self.advance();
-                    modifiers |= TypeModifiers::STATIC;
-                }
-                crate::kw::EXTERN => {
-                    tally.note_storage_class("extern", self.current_pos());
-                    self.advance();
-                    modifiers |= TypeModifiers::EXTERN;
-                }
-                crate::kw::REGISTER => {
-                    tally.note_storage_class("register", self.current_pos());
-                    self.advance();
-                    modifiers |= TypeModifiers::REGISTER;
-                }
-                crate::kw::AUTO => {
-                    tally.note_storage_class("auto", self.current_pos());
-                    self.advance();
-                    modifiers |= TypeModifiers::AUTO;
-                }
-                crate::kw::TYPEDEF => {
-                    tally.note_storage_class("typedef", self.current_pos());
-                    self.advance();
-                    modifiers |= TypeModifiers::TYPEDEF;
+                    modifiers |= m;
                 }
                 crate::kw::THREAD_LOCAL | crate::kw::GNU_THREAD => {
+                    if self.reject_outside_declaration(ctx) {
+                        continue;
+                    }
                     self.advance();
                     modifiers |= TypeModifiers::THREAD_LOCAL;
                 }
                 crate::kw::INLINE | crate::kw::GNU_INLINE2 | crate::kw::GNU_INLINE => {
+                    if self.reject_outside_declaration(ctx) {
+                        continue;
+                    }
                     self.advance();
                     modifiers |= TypeModifiers::INLINE;
                 }
                 crate::kw::NORETURN | crate::kw::GNU_NORETURN => {
+                    if self.reject_outside_declaration(ctx) {
+                        continue;
+                    }
                     self.advance();
                     modifiers |= TypeModifiers::NORETURN;
                 }
                 crate::kw::SIGNED => {
-                    tally.note_sign("signed", self.current_pos());
+                    tally.note_sign("signed", pos);
                     self.advance();
                     modifiers |= TypeModifiers::SIGNED;
                 }
                 crate::kw::UNSIGNED => {
-                    tally.note_sign("unsigned", self.current_pos());
+                    tally.note_sign("unsigned", pos);
                     self.advance();
                     modifiers |= TypeModifiers::UNSIGNED;
                 }
                 crate::kw::COMPLEX | crate::kw::GNU_COMPLEX | crate::kw::GNU_COMPLEX2 => {
+                    tally.complex = true;
                     self.advance();
                     modifiers |= TypeModifiers::COMPLEX;
                 }
+                // `_Atomic` immediately followed by `(` is the type specifier
+                // `_Atomic(type-name)` (C17 6.7.2.4p4); anywhere else it is
+                // the qualifier.
                 crate::kw::ATOMIC => {
-                    self.advance();
-                    // _Atomic can be:
-                    // 1. Type specifier: _Atomic(type-name)
-                    // 2. Type qualifier: _Atomic (without parens)
-                    if self.is_special(b'(') {
-                        // Type specifier form: _Atomic(type-name)
-                        self.advance(); // consume '('
-                        if let Some(inner_type) = self.try_parse_type_name() {
-                            self.expect_special(b')')?;
-                            // Return the type with ATOMIC modifier
-                            // C17 6.7.2.4p3: the type name in `_Atomic(T)`
-                            // shall not be an array or a function type.
-                            let inner_kind = self.types.kind(inner_type);
-                            if matches!(inner_kind, TypeKind::Array | TypeKind::Function) {
-                                diag::error_args(
-                                    self.current_pos(),
-                                    "'_Atomic' cannot be applied to {0} type",
-                                    &[if inner_kind == TypeKind::Array {
-                                        "an array"
-                                    } else {
-                                        "a function"
-                                    }],
-                                );
-                            }
-                            let inner = self.types.get(inner_type).clone();
-                            return Ok((
-                                Type {
-                                    modifiers: modifiers | inner.modifiers | TypeModifiers::ATOMIC,
-                                    ..inner
-                                },
-                                true,
-                            ));
-                        } else {
-                            return Err(ParseError::new(
-                                "expected type-name in _Atomic(...)",
-                                self.current_pos(),
-                            ));
-                        }
-                    } else {
-                        // Qualifier form: just _Atomic
+                    atomic_pos.get_or_insert(pos);
+                    if !self.next_token_is_open_paren() {
+                        self.advance();
                         modifiers |= TypeModifiers::ATOMIC;
+                        continue;
+                    }
+                    self.advance(); // consume `_Atomic`
+                    self.advance(); // consume '('
+                    let Some(inner) = self.try_parse_type_name() else {
+                        return Err(ParseError::new(
+                            "expected type-name in _Atomic(...)",
+                            self.current_pos(),
+                        ));
+                    };
+                    self.expect_special(b')')?;
+                    tally.note_data_type("_Atomic", pos);
+                    let mut atomic = self.types.get(inner).clone();
+                    atomic.modifiers |= TypeModifiers::ATOMIC;
+                    resolved = Some(Resolved::Built(atomic));
+                }
+                crate::kw::ALIGNAS => {
+                    self.parse_alignas_specifier()?;
+                    // C11 6.7.5p2 lists no type-name among the places an
+                    // alignment specifier may appear.
+                    if ctx == SpecContext::TypeName {
+                        self.reject_alignas_in("a type name");
                     }
                 }
-                crate::kw::ALIGNAS => self.parse_alignas_specifier()?,
                 crate::kw::SHORT => {
-                    tally.note_size("short", self.current_pos());
+                    tally.note_size("short", pos);
                     self.advance();
                     modifiers |= TypeModifiers::SHORT;
                     // C17 6.7.2p2 lists the declaration specifiers as a set,
@@ -1000,7 +792,7 @@ impl Parser<'_> {
                     }
                 }
                 crate::kw::LONG => {
-                    tally.note_size("long", self.current_pos());
+                    tally.note_size("long", pos);
                     self.advance();
                     if modifiers.contains(TypeModifiers::LONG) {
                         modifiers |= TypeModifiers::LONGLONG;
@@ -1017,17 +809,17 @@ impl Parser<'_> {
                     }
                 }
                 crate::kw::VOID => {
-                    tally.note_data_type("void", self.current_pos());
+                    tally.note_data_type("void", pos);
                     self.advance();
                     base_kind = Some(TypeKind::Void);
                 }
                 crate::kw::CHAR => {
-                    tally.note_data_type("char", self.current_pos());
+                    tally.note_data_type("char", pos);
                     self.advance();
                     base_kind = Some(TypeKind::Char);
                 }
                 crate::kw::INT => {
-                    tally.note_data_type("int", self.current_pos());
+                    tally.note_data_type("int", pos);
                     self.advance();
                     if base_kind.is_none()
                         || !matches!(
@@ -1039,12 +831,12 @@ impl Parser<'_> {
                     }
                 }
                 crate::kw::FLOAT => {
-                    tally.note_data_type("float", self.current_pos());
+                    tally.note_data_type("float", pos);
                     self.advance();
                     base_kind = Some(TypeKind::Float);
                 }
                 crate::kw::DOUBLE => {
-                    tally.note_data_type("double", self.current_pos());
+                    tally.note_data_type("double", pos);
                     self.advance();
                     // Handle long double
                     if modifiers.contains(TypeModifiers::LONG) {
@@ -1057,7 +849,7 @@ impl Parser<'_> {
                     if tally.alias_is_declarator_name() {
                         break;
                     }
-                    tally.note_data_type("_Float16", self.current_pos());
+                    tally.note_data_type("_Float16", pos);
                     self.advance();
                     base_kind = Some(TypeKind::Float16);
                 }
@@ -1066,7 +858,7 @@ impl Parser<'_> {
                     if tally.alias_is_declarator_name() {
                         break;
                     }
-                    tally.note_data_type("float", self.current_pos());
+                    tally.note_data_type("float", pos);
                     self.advance();
                     base_kind = Some(TypeKind::Float);
                 }
@@ -1075,7 +867,7 @@ impl Parser<'_> {
                     if tally.alias_is_declarator_name() {
                         break;
                     }
-                    tally.note_data_type("double", self.current_pos());
+                    tally.note_data_type("double", pos);
                     self.advance();
                     base_kind = Some(TypeKind::Double);
                 }
@@ -1091,20 +883,20 @@ impl Parser<'_> {
                     if !self.types.has_float128() {
                         return Err(ParseError::new(
                             "__float128 is not supported on this target",
-                            self.current_pos(),
+                            pos,
                         ));
                     }
-                    tally.note_data_type("__float128", self.current_pos());
+                    tally.note_data_type("__float128", pos);
                     self.advance();
                     base_kind = Some(TypeKind::Float128);
                 }
                 crate::kw::BOOL => {
-                    tally.note_data_type("_Bool", self.current_pos());
+                    tally.note_data_type("_Bool", pos);
                     self.advance();
                     base_kind = Some(TypeKind::Bool);
                 }
                 crate::kw::INT128 => {
-                    tally.note_data_type("__int128", self.current_pos());
+                    tally.note_data_type("__int128", pos);
                     self.advance();
                     base_kind = Some(TypeKind::Int128);
                 }
@@ -1112,7 +904,7 @@ impl Parser<'_> {
                     if tally.alias_is_declarator_name() {
                         break;
                     }
-                    tally.note_data_type("__int128", self.current_pos());
+                    tally.note_data_type("__int128", pos);
                     self.advance();
                     base_kind = Some(TypeKind::Int128);
                 }
@@ -1120,13 +912,13 @@ impl Parser<'_> {
                     if tally.alias_is_declarator_name() {
                         break;
                     }
-                    tally.note_data_type("__int128", self.current_pos());
+                    tally.note_data_type("__int128", pos);
                     self.advance();
                     modifiers |= TypeModifiers::UNSIGNED;
                     base_kind = Some(TypeKind::Int128);
                 }
                 crate::kw::BUILTIN_VA_LIST => {
-                    tally.note_data_type("__builtin_va_list", self.current_pos());
+                    tally.note_data_type("__builtin_va_list", pos);
                     self.advance();
                     base_kind = Some(TypeKind::VaList);
                 }
@@ -1141,76 +933,68 @@ impl Parser<'_> {
                         break;
                     }
                     self.advance(); // consume typeof
-                    self.expect_special(b'(')?;
+                    self.advance(); // consume '('
 
                     // typeof can take either a type name or an expression;
-                    // try the type name first.
-                    let typ = if let Some(typ) = self.try_parse_type_name() {
-                        typ
-                    } else {
-                        let expr = self.parse_expression()?;
-                        expr.typ.unwrap_or(self.types.int_id)
+                    // try the type name first, keeping any variably modified
+                    // extents it found: `typeof(int[n])` is a complete type
+                    // whose size is `n * sizeof(int)`, and dropping them left
+                    // it indistinguishable from `int[]` -- in a declaration as
+                    // much as in `sizeof`.
+                    let (typ, dims) = match self.try_parse_type_name_vm() {
+                        Some(named) => named,
+                        None => {
+                            let expr = self.parse_expression()?;
+                            let dims = self.typeof_object_extents(&expr);
+                            (expr.typ.unwrap_or(self.types.int_id), dims)
+                        }
                     };
                     self.expect_special(b')')?;
+                    tally.note_data_type(idents.get(name_id), pos);
 
                     // The operand's declaration contributes its type and
                     // qualifiers, never its storage class: `static int g;
                     // typeof(g) c;` declares an automatic `c`.
-                    let typ = self.types.without_decl_specifiers(typ);
-                    let result_type = self.types.get(typ).clone();
-                    return Ok((
-                        Type {
-                            modifiers: modifiers | result_type.modifiers,
-                            ..result_type
-                        },
-                        true,
-                    ));
+                    resolved = Some(Resolved::Id(self.types.without_decl_specifiers(typ)));
+                    vm_dims = dims;
                 }
-                crate::kw::ENUM => {
-                    tally.note_data_type("enum", self.current_pos());
-                    tally.check();
-                    let mut enum_type = self.parse_enum_specifier()?;
-                    // Consume trailing qualifiers (e.g., "enum foo const")
-                    let trailing_mods = self.consume_type_qualifiers();
-                    // Apply any modifiers we collected
-                    enum_type.modifiers |= modifiers | trailing_mods;
-                    return Ok((enum_type, true));
-                }
-                crate::kw::STRUCT => {
-                    tally.note_data_type("struct", self.current_pos());
-                    tally.check();
-                    let mut struct_type = self.parse_struct_or_union_specifier(false)?;
-                    // Trailing specifiers: `struct foo const`, and also
-                    // `struct { ... } static g` -- C17 6.7p1 allows any order.
-                    let trailing_mods = self.consume_trailing_specifiers(&mut tally)?;
-                    struct_type.modifiers |= modifiers | trailing_mods;
-                    return Ok((struct_type, true));
-                }
-                crate::kw::UNION => {
-                    tally.note_data_type("union", self.current_pos());
-                    tally.check();
-                    let mut union_type = self.parse_struct_or_union_specifier(true)?;
-                    // As for `struct` above.
-                    let trailing_mods = self.consume_trailing_specifiers(&mut tally)?;
-                    union_type.modifiers |= modifiers | trailing_mods;
-                    return Ok((union_type, true));
+                crate::kw::ENUM | crate::kw::STRUCT | crate::kw::UNION => {
+                    tally.note_data_type(idents.get(name_id), pos);
+                    let tag_start = self.pos;
+                    let parsed = if name_id == crate::kw::ENUM {
+                        self.parse_enum_specifier()
+                    } else {
+                        self.parse_struct_or_union_specifier(name_id == crate::kw::UNION)
+                    };
+                    resolved = Some(match parsed {
+                        Ok(typ) => Resolved::Built(typ),
+                        // A type-name reports the fault where it arose and
+                        // steps over the specifier, so the declarator after it
+                        // still parses: in `*(struct { char x[n]; } *)p` the
+                        // cast is still a cast to a pointer.
+                        Err(e) if ctx == SpecContext::TypeName => {
+                            diag::error(e.pos, &e.message);
+                            self.skip_failed_tag_specifier(tag_start);
+                            Resolved::Id(self.types.int_id)
+                        }
+                        Err(e) => return Err(e),
+                    });
                 }
                 _ => {
-                    // Check if it's a typedef name
-                    // Only consume the typedef if we haven't already seen a base type or typedef
-                    if base_kind.is_none() && typedef_base.is_none() {
+                    // A typedef name is a type specifier only where no other
+                    // has been given; after one it is the declarator's name.
+                    if !tally.has_type_specifier() {
                         if let Some((sym, typedef_type_id)) =
                             self.symbols.lookup_typedef_symbol(name_id)
                         {
                             self.advance();
+                            tally.note_data_type(idents.get(name_id), pos);
                             // A variably modified typedef carries extents the
                             // `TypeId` cannot: hand the declarator list the
                             // names of the ones this typedef already evaluated
                             // (C17 6.7.7p3), not its size expressions.
-                            self.pending_vm_typedef_dims = self.vm_typedef_extents(sym);
-                            // Save the typedef type and continue looping to collect trailing
-                            // qualifiers (e.g., "z_word_t const" where const comes after typedef)
-                            typedef_base = Some(typedef_type_id);
+                            vm_dims = self.vm_typedef_extents(sym).unwrap_or_default();
+                            resolved = Some(Resolved::Id(typedef_type_id));
                             continue;
                         }
                     }
@@ -1220,43 +1004,240 @@ impl Parser<'_> {
         }
 
         tally.check();
+        let explicit = tally.has_type_specifier();
 
-        // If we parsed a typedef, return that with any trailing modifiers applied
-        if let Some(typedef_type_id) = typedef_base {
-            let typedef_type = self.types.get(typedef_type_id);
-            let mut result = typedef_type.clone();
-            // Strip TYPEDEF modifier - we're using the typedef, not defining one
-            result.modifiers &= !TypeModifiers::TYPEDEF;
-            result.modifiers |= modifiers;
-            return Ok((result, true));
+        let (ty, id) = match resolved {
+            Some(resolved) => {
+                let added = modifiers.difference(SIZE_SIGN_COMPLEX);
+                match resolved {
+                    Resolved::Id(rid) => {
+                        let named = self.types.get(rid);
+                        if added.is_empty() && !named.modifiers.contains(TypeModifiers::TYPEDEF) {
+                            (named.clone(), Some(rid))
+                        } else {
+                            // Drop the TYPEDEF bit either way. It records how
+                            // the name was *declared*, not anything about the
+                            // type, and leaving it on made a typedef's type
+                            // differ from the type it aliases -- so
+                            // `__builtin_types_compatible_p(int, MyInt)`
+                            // answered 0.
+                            let mut ty = named.clone();
+                            ty.modifiers.remove(TypeModifiers::TYPEDEF);
+                            ty.modifiers |= added;
+                            (ty, None)
+                        }
+                    }
+                    Resolved::Built(mut ty) => {
+                        ty.modifiers |= added;
+                        (ty, None)
+                    }
+                }
+            }
+            None => {
+                // `_Complex` with no base type is `_Complex double`, which is
+                // what gcc gives it. C17 requires a base (6.7.2p2 lists only
+                // the three floating spellings), so this is the GNU reading;
+                // and now that c17 has `_Complex int`, defaulting to `int` like
+                // everything else would have made `_Complex v;` an eight-byte
+                // integer pair rather than gcc's sixteen-byte double one.
+                //
+                // Only a *bare* `_Complex`: a signedness modifier names an
+                // integer base of its own -- `_Complex unsigned` is `_Complex
+                // unsigned int`, eight bytes, not sixteen.
+                let kind = match base_kind {
+                    Some(k) => k,
+                    None if modifiers.contains(TypeModifiers::COMPLEX)
+                        && !modifiers
+                            .intersects(TypeModifiers::SIGNED | TypeModifiers::UNSIGNED) =>
+                    {
+                        TypeKind::Double
+                    }
+                    None => TypeKind::Int,
+                };
+                (Type::with_modifiers(kind, modifiers), None)
+            }
+        };
+
+        // C17 6.7.2.4p3 and 6.7.3p3: neither `_Atomic(T)` nor the `_Atomic`
+        // qualifier may name an array or function type. The qualifier reaches
+        // one only through a typedef -- `_Atomic int a[4]` is an array *of*
+        // atomic ints, and perfectly legal. Asked once, of the finished type:
+        // the specifier arm and a wrapper around the loop each asked before,
+        // and `_Atomic(int[3]) v;` drew the error twice.
+        if let Some(at) = atomic_pos {
+            let what = match ty.kind {
+                TypeKind::Array => Some("an array"),
+                TypeKind::Function => Some("a function"),
+                _ => None,
+            };
+            if let Some(what) = what {
+                diag::error_args(at, "'_Atomic' cannot be applied to {0} type", &[what]);
+            }
         }
 
-        // `signed x;` and `unsigned x;` name a type without setting `base_kind`
-        // — those two only ever set a modifier — so they are explicit even
-        // though the kind defaults. `short`/`long` do set the kind.
-        let explicit = base_kind.is_some()
-            || modifiers.intersects(TypeModifiers::SIGNED | TypeModifiers::UNSIGNED);
+        // A member or a type-name has no `;`-only form and no identifier
+        // list: nothing but a missing type specifier leaves it without one.
+        if ctx != SpecContext::Declaration {
+            self.check_implicit_int(explicit, start);
+        }
 
-        // `_Complex` with no base type is `_Complex double`, which is what
-        // gcc gives it -- and it counts as having named a type, so the
-        // "implicit int was removed in C99" diagnostic does not fire. C17
-        // requires a base (6.7.2p2 lists only the three floating spellings),
-        // so this is the GNU reading; and now that c17 has `_Complex int`,
-        // defaulting to `int` like everything else would have made
-        // `_Complex v;` an eight-byte integer pair rather than gcc's
-        // sixteen-byte double one.
-        // A *bare* `_Complex`: no base kind and no signedness modifier, since
-        // `_Complex unsigned` names `_Complex unsigned int` and is eight bytes.
-        let bare_complex = base_kind.is_none()
-            && modifiers.contains(TypeModifiers::COMPLEX)
-            && !modifiers.intersects(TypeModifiers::SIGNED | TypeModifiers::UNSIGNED);
-        let kind = match base_kind {
-            Some(k) => k,
-            None if bare_complex => TypeKind::Double,
-            None => TypeKind::Int,
+        Ok(DeclSpecifiers {
+            ty,
+            id,
+            explicit,
+            vm_dims,
+        })
+    }
+
+    /// Refuse a storage-class or function specifier outside a declaration:
+    /// a specifier-qualifier list admits neither (C17 6.7.2.1p1, 6.7.7p1).
+    /// Reported in gcc's words and skipped, so the list recovers as if it
+    /// had not been written. Answers whether it did.
+    fn reject_outside_declaration(&mut self, ctx: SpecContext) -> bool {
+        if ctx == SpecContext::Declaration {
+            return false;
+        }
+        let spelled = self.current_ident().map_or("", |id| self.idents.get(id));
+        diag::error_args(
+            self.current_pos(),
+            "expected specifier-qualifier-list before '{0}'",
+            &[spelled],
+        );
+        self.advance();
+        true
+    }
+
+    /// C17 6.7.6.3p2: the only storage-class specifier a parameter
+    /// declaration may carry is `register`. `spec_modifiers` are the
+    /// specifiers' modifiers, and `name` the parameter's, `EMPTY` for an
+    /// abstract one. A function specifier is gcc's warning, not an error.
+    pub(super) fn check_parameter_specifiers(
+        &self,
+        spec_modifiers: TypeModifiers,
+        name: StringId,
+        pos: Position,
+    ) {
+        const NOT_REGISTER: TypeModifiers = TypeModifiers::STATIC
+            .union(TypeModifiers::EXTERN)
+            .union(TypeModifiers::AUTO)
+            .union(TypeModifiers::TYPEDEF)
+            .union(TypeModifiers::THREAD_LOCAL);
+        let spelled = self.str(name);
+        if spec_modifiers.intersects(NOT_REGISTER) {
+            if spelled.is_empty() {
+                diag::error(pos, "storage class specified for unnamed parameter");
+            } else {
+                diag::error_args(
+                    pos,
+                    "storage class specified for parameter '{0}'",
+                    &[spelled],
+                );
+            }
+        }
+        for (bit, specifier) in [
+            (TypeModifiers::INLINE, "inline"),
+            (TypeModifiers::NORETURN, "_Noreturn"),
+        ] {
+            if !spec_modifiers.contains(bit) {
+                continue;
+            }
+            if spelled.is_empty() {
+                diag::warning_args(pos, "unnamed parameter declared '{0}'", &[specifier]);
+            } else {
+                diag::warning_args(pos, "parameter '{0}' declared '{1}'", &[spelled, specifier]);
+            }
+        }
+    }
+}
+
+impl Parser<'_> {
+    /// Evaluate the extents a declaration's specifiers introduced once, for
+    /// the whole declaration, and answer the expressions each declarator's
+    /// levels should name.
+    ///
+    /// The declaration specifiers are evaluated once per declaration, however
+    /// many declarators share them: in `typeof(int[n++]) a, b;` gcc increments
+    /// `n` once and gives `a` and `b` one extent. Copying `n++` into every
+    /// declarator evaluated it once each, so `b` came out a different size
+    /// from `a`. A variably modified typedef name already has this shape --
+    /// its extents were evaluated at the typedef, and a use names them
+    /// ([`ExprKind::VmTypedefExtent`]) -- so `typeof`'s size expressions are
+    /// given the same one: an unnamed typedef declared ahead of the
+    /// declarators evaluates them, and every declarator names its extents.
+    ///
+    /// Extents that already name evaluated ones -- a typedef name, `typeof`
+    /// of one, or `typeof` of a variably modified object -- are answered as
+    /// they are. The last carries its operand for evaluation, and each
+    /// declarator then evaluates it: gcc steps `i` twice in
+    /// `typeof(p[i++]) a, b;`.
+    pub(super) fn bind_specifier_extents(
+        &mut self,
+        dims: Vec<Expr>,
+        spec_type: TypeId,
+        pos: Position,
+        declarators: &mut Vec<InitDeclarator>,
+    ) -> Vec<Expr> {
+        if dims.iter().all(names_recorded_extent) {
+            return dims;
+        }
+        let typ = self.types.without_decl_specifiers(spec_type);
+        let mut sym = Symbol::typedef(StringId::EMPTY, typ, self.symbols.depth());
+        // Unnamed, so never a redefinition of another one in this scope.
+        sym.defined = false;
+        let Ok(id) = self.symbols.declare(sym) else {
+            return dims;
         };
-        let explicit = explicit || bare_complex;
-        Ok((Type::with_modifiers(kind, modifiers), explicit))
+        self.vm_typedefs.insert(id, dims.len() as u32);
+        declarators.push(InitDeclarator {
+            symbol_attrs: Default::default(),
+            fn_effect: MemEffect::Unknown,
+            symbol: id,
+            typ,
+            storage_class: TypeModifiers::TYPEDEF,
+            init: None,
+            vla_sizes: dims,
+            explicit_align: None,
+            pos,
+        });
+        self.vm_typedef_extents(id).unwrap_or_default()
+    }
+
+    /// The extents `typeof(expr)` names when `expr`'s type is variably
+    /// modified: an array's variable levels, or a pointer's pointee's -- the
+    /// levels a declarator's size expressions describe -- each read from what
+    /// the declaration of the object `expr` is rooted in recorded
+    /// ([`ExprKind::VmObjectExtent`]); see [`super::ast::vm_extent_count`].
+    ///
+    /// The operand is evaluated only when its type is variably modified (C23
+    /// 6.7.3.6), which the first extent carries out; a bare identifier has
+    /// nothing to evaluate.
+    fn typeof_object_extents(&self, expr: &Expr) -> Vec<Expr> {
+        let levels = super::ast::vm_extent_count(self.types, self.symbols, expr);
+        if levels == 0 {
+            return Vec::new();
+        }
+        let ulong = Some(self.types.ulong_id);
+        let mut dims: Vec<Expr> = (0..levels as u32)
+            .map(|level| Expr {
+                kind: ExprKind::VmObjectExtent(Box::new(expr.clone()), level),
+                typ: ulong,
+                pos: expr.pos,
+                bitfield_bits: None,
+            })
+            .collect();
+        if !matches!(expr.kind, ExprKind::Ident(_)) {
+            let first = dims.remove(0);
+            dims.insert(
+                0,
+                Expr {
+                    kind: ExprKind::Comma(vec![expr.clone(), first]),
+                    typ: ulong,
+                    pos: expr.pos,
+                    bitfield_bits: None,
+                },
+            );
+        }
+        dims
     }
 
     /// The extents of the variably modified typedef `sym`, as expressions that
@@ -1277,15 +1258,9 @@ impl Parser<'_> {
         )
     }
 
-    /// Parse a type specifier and record whether one was present.
     /// `_Alignas(type-name)` or `_Alignas(constant-expression)`, folded into
     /// the pending alignment slot.
-    ///
-    /// Its own function because a declaration may reach it from two places --
-    /// the specifier loop, and the trailing specifiers after a `struct`,
-    /// `union` or `enum` -- and C17 6.7p1 lets a specifier appear in any
-    /// order, so both have to accept it.
-    pub(crate) fn parse_alignas_specifier(&mut self) -> ParseResult<()> {
+    fn parse_alignas_specifier(&mut self) -> ParseResult<()> {
         let alignas_pos = self.current_pos();
         self.advance();
         self.expect_special(b'(')?;
@@ -1330,34 +1305,6 @@ impl Parser<'_> {
         Ok(())
     }
 
-    pub(super) fn parse_type_specifier(&mut self) -> ParseResult<Type> {
-        let pos = self.current_pos();
-        let (typ, explicit) = self.parse_type_specifier_inner()?;
-        self.saw_explicit_type = explicit;
-
-        // C17 6.7.3p3: the _Atomic *qualifier* shall not be applied to an array
-        // or function type. The specifier form `_Atomic(T)` is checked where it
-        // is parsed, but the qualifier form only sets a bit, so
-        //
-        //     typedef int A[4];   _Atomic A x;
-        //     typedef int F(void); _Atomic F f;
-        //
-        // both slipped through -- the only way to reach the constraint, since
-        // `_Atomic int a[4]` is an array *of* atomic ints and perfectly legal.
-        if typ.modifiers.contains(TypeModifiers::ATOMIC) {
-            let what = match typ.kind {
-                TypeKind::Array => Some("an array"),
-                TypeKind::Function => Some("a function"),
-                _ => None,
-            };
-            if let Some(what) = what {
-                diag::error_args(pos, "'_Atomic' cannot be applied to {0} type", &[what]);
-            }
-        }
-
-        Ok(typ)
-    }
-
     /// Diagnose a redeclaration whose type conflicts with the one already in
     /// scope (C17 6.7p4: all declarations of the same object or function shall
     /// specify compatible types). Two guards keep legal code legal: only a
@@ -1376,6 +1323,20 @@ impl Parser<'_> {
         // int Z;` compiled and the two names collided silently.
         if existing.kind == SymbolKind::EnumConstant && existing.scope_depth == self.symbols.depth()
         {
+            let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+            diag::error_args(
+                pos,
+                "'{0}' redeclared as a different kind of symbol",
+                &[&spelled],
+            );
+            return;
+        }
+        // A typedef name is in the ordinary name space too (C17 6.2.3), so an
+        // object or function of the same name in the same scope is a second
+        // kind of symbol. `typedef int T; T T;` compiled: the specifier loop
+        // takes the first `T` as the type and the second as the declarator,
+        // which is right, and nothing then noticed the collision.
+        if existing.is_typedef() && existing.scope_depth == self.symbols.depth() {
             let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
             diag::error_args(
                 pos,
@@ -1490,7 +1451,25 @@ impl Parser<'_> {
             return;
         };
         let existing = self.symbols.get(existing_id);
+        // The reverse of the typedef arm in `check_redeclaration`: an object,
+        // function or enumerator already holds the name in this scope.
         if !existing.is_typedef() {
+            if existing.scope_depth == self.symbols.depth()
+                && matches!(
+                    existing.kind,
+                    SymbolKind::Variable
+                        | SymbolKind::Function
+                        | SymbolKind::Parameter
+                        | SymbolKind::EnumConstant
+                )
+            {
+                let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+                diag::error_args(
+                    pos,
+                    "'{0}' redeclared as a different kind of symbol",
+                    &[&spelled],
+                );
+            }
             return;
         }
         // 6.7p3 governs a *repeat* declaration, which means the same scope.
@@ -1527,10 +1506,10 @@ impl Parser<'_> {
 
     /// Diagnose a declaration that named no type (C99 removed implicit int;
     /// 6.7.2p2 makes "at least one type specifier shall be given" a
-    /// constraint). Call after `parse_type_specifier` at a site where a type is
-    /// genuinely required.
-    pub(super) fn check_implicit_int(&mut self, pos: Position) {
-        if !self.saw_explicit_type {
+    /// constraint). `explicit` is [`DeclSpecifiers::explicit`]; call at a site
+    /// where a type is genuinely required.
+    pub(super) fn check_implicit_int(&self, explicit: bool, pos: Position) {
+        if !explicit {
             // `-fpermissive` downgrades this to a warning. The recovery below
             // is the same either way -- the type defaults to `int` -- so the
             // flag changes only whether the translation unit is rejected.
@@ -1540,10 +1519,9 @@ impl Parser<'_> {
             } else {
                 diag::error(pos, &msg);
             }
-            // Keep the defaulted `int` and carry on: the declarator that
-            // follows is usually well-formed, and one diagnostic per
-            // declaration reads better than a cascade.
-            self.saw_explicit_type = true;
+            // The caller keeps the defaulted `int` and carries on: the
+            // declarator that follows is usually well-formed, and one
+            // diagnostic per declaration reads better than a cascade.
         }
     }
 
@@ -1594,5 +1572,16 @@ impl Parser<'_> {
             Some(spec) => diag::error_args(pos, "'{0}' in empty declaration", &[spec]),
             None => diag::error(pos, &gettext("declaration declares nothing")),
         }
+    }
+}
+
+/// Whether `dim` names an extent some declaration already recorded -- a
+/// typedef's, or an object's, possibly after evaluating `typeof`'s operand --
+/// rather than a size expression still to evaluate.
+fn names_recorded_extent(dim: &Expr) -> bool {
+    match &dim.kind {
+        ExprKind::VmTypedefExtent(..) | ExprKind::VmObjectExtent(..) => true,
+        ExprKind::Comma(items) => items.last().is_some_and(names_recorded_extent),
+        _ => false,
     }
 }

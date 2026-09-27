@@ -1952,10 +1952,9 @@ fn test_pointer_return() {
     assert_eq!(types.kind(func.return_type), TypeKind::Pointer);
 }
 
-/// Both file-scope grouped-declarator call sites go through one helper
-/// (`parse_grouped_declarator_decl`), reached before the pointer loop for
-/// `void (*fp)(int)` and after it for `char *(*fp)(int)`. They were two
-/// near-identical 140-line blocks; these pin the shapes each one owned.
+/// A grouped declarator before a pointer run -- `void (*fp)(int)` -- and after
+/// one -- `char *(*fp)(int)`. They were once two near-identical 140-line
+/// blocks; these pin the shapes each one owned.
 #[test]
 fn test_grouped_declarator_before_and_after_pointers() {
     // Before the pointer loop: the declarator starts from the specifier type.
@@ -6460,4 +6459,191 @@ fn test_aligned_on_a_tag_reference_aligns_the_declaration() {
     };
     assert_eq!(decl.declarators[0].explicit_align, Some(32));
     assert_eq!(types.alignment(decl.declarators[0].typ), 4);
+}
+
+/// The qualifiers written before a `typeof` belong to the type it names, in a
+/// type-name as in a declaration. The type-name copy of the specifier loop
+/// returned the operand's type the moment it had parsed it, so the `const`
+/// in `(const typeof(int) *)` was read and then dropped.
+#[test]
+fn test_type_name_keeps_qualifiers_before_typeof() {
+    let (expr, types, _, _) = parse_expr("(const typeof(int) *)0").unwrap();
+    let ExprKind::Cast { cast_type, .. } = expr.kind else {
+        panic!("expected a cast");
+    };
+    let pointee = types.base_type(cast_type).expect("a pointer");
+    assert_eq!(types.kind(pointee), TypeKind::Int);
+    assert!(types.modifiers(pointee).contains(TypeModifiers::CONST));
+}
+
+/// C17 6.7p1 lets the declaration specifiers come in any order, so a
+/// specifier may follow `typeof(..)`, `_Atomic(..)` or an enum specifier as
+/// it may follow `int`. Each of those arms returned as soon as it had parsed
+/// its type, and the specifier after it was read as the declarator's name.
+#[test]
+fn test_specifiers_may_follow_a_complete_type_specifier() {
+    let (decl, types, _, _) = parse_decl("typeof(int) const x = 1;").unwrap();
+    let typ = decl.declarators[0].typ;
+    assert_eq!(types.kind(typ), TypeKind::Int);
+    assert!(types.modifiers(typ).contains(TypeModifiers::CONST));
+
+    let (decl, types, _, _) = parse_decl("_Atomic(int) const y = 1;").unwrap();
+    let typ = decl.declarators[0].typ;
+    assert!(types
+        .modifiers(typ)
+        .contains(TypeModifiers::CONST | TypeModifiers::ATOMIC));
+
+    let (decl, _, _, _) = parse_decl("enum E { A } static e;").unwrap();
+    assert!(decl.declarators[0]
+        .storage_class
+        .contains(TypeModifiers::STATIC));
+}
+
+/// A typedef name is a type specifier only where no other type specifier has
+/// been given (C17 6.7.2p2 lists no combination that includes one), so in
+/// `unsigned T;` the typedef name is the identifier being declared -- an
+/// `unsigned int` that hides the typedef. It was taken as the type.
+#[test]
+fn test_typedef_name_after_a_type_specifier_is_the_declarator() {
+    let (tu, types, strings, symbols) = parse_tu("typedef char T; unsigned T;").unwrap();
+    let ExternalDecl::Declaration(decl) = &tu.items[1] else {
+        panic!("expected a declaration");
+    };
+    let declared = &decl.declarators[0];
+    let sym = symbols.get(declared.symbol);
+    assert_eq!(strings.get(sym.name), "T");
+    assert_eq!(types.kind(declared.typ), TypeKind::Int);
+    assert!(types.is_unsigned(declared.typ));
+}
+
+/// `typeof(int[n++])`'s extent is evaluated once for the declaration: an
+/// unnamed typedef ahead of the declarators carries the size expression, and
+/// each declarator names the evaluated extent rather than repeating `n++`.
+#[test]
+fn test_typeof_extent_is_bound_once_per_declaration() {
+    let (tu, _types, _strings, _symbols) =
+        parse_tu("void f(int n) { typeof(int[n++]) a, b; }").unwrap();
+    let ExternalDecl::FunctionDef(func) = &tu.items[0] else {
+        panic!("expected a function definition");
+    };
+    let Stmt::Block(items) = &func.body else {
+        panic!("expected a block");
+    };
+    let BlockItem::Declaration(decl) = &items[0] else {
+        panic!("expected a declaration");
+    };
+    let [hidden, a, b] = decl.declarators.as_slice() else {
+        panic!("expected the unnamed typedef and two declarators");
+    };
+    assert!(hidden.storage_class.contains(TypeModifiers::TYPEDEF));
+    let [size] = hidden.vla_sizes.as_slice() else {
+        panic!("the unnamed typedef carries the one size expression");
+    };
+    assert!(matches!(size.kind, ExprKind::PostInc(_)));
+    for d in [a, b] {
+        let [extent] = d.vla_sizes.as_slice() else {
+            panic!("one extent per declarator");
+        };
+        assert!(matches!(extent.kind, ExprKind::VmTypedefExtent(sym, 0) if sym == hidden.symbol));
+    }
+}
+
+/// The declarators of every file-scope position -- first, grouped, later in
+/// the list -- and block scope's are bound by one path, so each gets the
+/// same symbol kind and the same function type. A grouped or later function
+/// declarator was bound as a *variable*, and only the first one's type
+/// carried `noreturn`.
+#[test]
+fn test_every_declarator_position_binds_the_same_way() {
+    let src = "void a(void) __attribute__((noreturn));\n\
+               void (b)(void) __attribute__((noreturn));\n\
+               int x, c(void) __attribute__((noreturn));\n\
+               _Noreturn void d(void), (e)(void);\n\
+               void outer(void) { void k(void) __attribute__((noreturn)); }\n";
+    let (tu, types, strings, symbols) = parse_tu(src).unwrap();
+    let mut seen = Vec::new();
+    let mut check = |decl: &Declaration| {
+        for d in &decl.declarators {
+            let sym = symbols.get(d.symbol);
+            let name = strings.get(sym.name).to_string();
+            if name == "x" {
+                continue;
+            }
+            assert_eq!(sym.kind, crate::symbol::SymbolKind::Function, "{name}");
+            assert!(types.get(d.typ).noreturn, "{name} must be noreturn");
+            seen.push(name);
+        }
+    };
+    for item in &tu.items {
+        match item {
+            ExternalDecl::Declaration(decl) => check(decl),
+            ExternalDecl::FunctionDef(func) => {
+                let Stmt::Block(items) = &func.body else {
+                    panic!("expected a block");
+                };
+                for item in items {
+                    if let BlockItem::Declaration(decl) = item {
+                        check(decl);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(seen, ["a", "b", "c", "d", "e", "k"]);
+}
+
+/// A later typedef declarator gets its trailing alignment, and a later or
+/// grouped declarator completes an earlier `extern` array.
+#[test]
+fn test_later_declarators_align_and_complete() {
+    let (_tu, types, strings, symbols) = parse_tu(
+        "typedef int A, B __attribute__((aligned(16)));\n\
+         extern int p[]; extern int q[];\n\
+         int z, p[4];\n\
+         int (q)[5];\n",
+    )
+    .unwrap();
+    let find = |name: &str| {
+        let id = strings.lookup(name).expect("interned");
+        symbols
+            .lookup(id, crate::symbol::Namespace::Ordinary)
+            .unwrap_or_else(|| panic!("no symbol {name}"))
+            .typ
+    };
+    assert_eq!(types.get(find("B")).explicit_align, Some(16));
+    assert_eq!(types.get(find("A")).explicit_align, None);
+    assert_eq!(types.get(find("p")).array_size, Some(4));
+    assert_eq!(types.get(find("q")).array_size, Some(5));
+}
+
+/// A definition is compiled under the calling convention any declaration of
+/// its name asked for -- a prototype's, or one written among the specifiers --
+/// as gcc does. Only an attribute directly after the definition's own
+/// parameter list used to count.
+#[test]
+fn test_calling_convention_comes_from_any_declaration() {
+    let (tu, _types, strings, _symbols) = parse_tu(
+        "int f(int a, int b) __attribute__((ms_abi));\n\
+         int f(int a, int b) { return a - b; }\n\
+         __attribute__((ms_abi)) int g(void) { return 0; }\n\
+         int h(void) { return 0; }\n",
+    )
+    .unwrap();
+    let convs: Vec<(String, crate::abi::CallingConv)> = tu
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ExternalDecl::FunctionDef(f) => Some((strings.get(f.name).to_string(), f.calling_conv)),
+            _ => None,
+        })
+        .collect();
+    use crate::abi::CallingConv::{Win64, C};
+    assert_eq!(
+        convs,
+        [
+            ("f".to_string(), Win64),
+            ("g".to_string(), Win64),
+            ("h".to_string(), C)
+        ]
+    );
 }

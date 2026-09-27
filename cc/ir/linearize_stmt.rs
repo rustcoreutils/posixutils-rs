@@ -20,6 +20,7 @@ use crate::parse::ast::{
     UnaryOp,
 };
 use crate::strings::StringId;
+use crate::symbol::SymbolId;
 use crate::types::TypeTable;
 
 /// A `return` whose value-ness does not match the function's type.
@@ -366,9 +367,20 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // is reached in the order of execution" -- here, once, however
                 // many objects the name goes on to declare. Each is spilled to
                 // a hidden local that `ExprKind::VmTypedefExtent` reads back.
-                if !declarator.vla_sizes.is_empty() && self.types.kind(typ) == TypeKind::Array {
+                //
+                // A pointer to a VLA is sized by its pointee's extents, as an
+                // object declared `int (*p)[n]` is below; asking only an
+                // array typedef left `typedef int (*P)[n]; P p;` with no
+                // extents, and `p + 1` a step of 0.
+                let vm_type = match self.types.kind(typ) {
+                    TypeKind::Array => Some(typ),
+                    TypeKind::Pointer => self.types.base_type(typ),
+                    _ => None,
+                };
+                if let Some(vm_type) = vm_type.filter(|_| !declarator.vla_sizes.is_empty()) {
                     let name = self.symbol_name(declarator.symbol);
-                    let (dims, _elem) = self.record_vm_extents(typ, &declarator.vla_sizes, &name);
+                    let (dims, _elem) =
+                        self.record_vm_extents(vm_type, &declarator.vla_sizes, &name);
                     // Keep only the extents that were *variable*.
                     //
                     // `record_vm_extents` reports one entry per array level,
@@ -493,6 +505,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     sym: sym_id,
                     typ,
                     vla_size_sym: None,
+                    vla_outer_extent: None,
                     vla_elem_type: None,
                     vm_row_dims: vec![],
                     storage: crate::ir::linearize::Storage::InSlot,
@@ -507,17 +520,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // This is the same shape as a variably-modified *parameter*,
             // which is adjusted to exactly this pointer type; see
             // `linearize_function`.
-            if !declarator.vla_sizes.is_empty() {
-                if let Some(pointee) = self.types.base_type(typ) {
-                    let name = self.symbol_name(declarator.symbol);
-                    let (dims, elem_type) =
-                        self.record_vm_extents(pointee, &declarator.vla_sizes, &name);
-                    if let Some(info) = self.locals.get_mut(&declarator.symbol) {
-                        info.vm_row_dims = dims;
-                        info.vla_elem_type = Some(elem_type);
-                    }
-                }
-            }
+            self.record_pointee_extents(declarator.symbol, declarator.typ, &declarator.vla_sizes);
 
             // If there's an initializer, emit Store(s)
             if let Some(init) = &declarator.init {
@@ -585,6 +588,57 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
         }
+    }
+
+    /// Record the extents of the pointee of `symbol`, a pointer to a VLA of
+    /// type `typ` sized by `vla_sizes`, on its local: what one index step off
+    /// the pointer has to advance by. Nothing when there are no size
+    /// expressions.
+    pub(crate) fn record_pointee_extents(
+        &mut self,
+        symbol: SymbolId,
+        typ: TypeId,
+        vla_sizes: &[Expr],
+    ) {
+        if vla_sizes.is_empty() {
+            return;
+        }
+        let Some(pointee) = self.types.base_type(typ) else {
+            return;
+        };
+        let name = self.symbol_name(symbol);
+        let (dims, elem_type) = self.record_vm_extents(pointee, vla_sizes, &name);
+        if let Some(info) = self.locals.get_mut(&symbol) {
+            info.vm_row_dims = dims;
+            info.vla_elem_type = Some(elem_type);
+        }
+    }
+
+    /// Evaluate the size expressions of a type-name's value
+    /// ([`ExprKind::VmTypeName`]) and record its extents under `symbol`, as
+    /// a declared pointer's are recorded under its name.
+    ///
+    /// The entry holds extents and nothing else -- no identifier names
+    /// `symbol`, so no slot is ever read through it.
+    pub(crate) fn record_type_name_extents(
+        &mut self,
+        symbol: SymbolId,
+        typ: TypeId,
+        dims: &[Expr],
+    ) {
+        self.insert_local(
+            symbol,
+            LocalVarInfo {
+                sym: PseudoId(u32::MAX),
+                typ,
+                vla_size_sym: None,
+                vla_outer_extent: None,
+                vla_elem_type: None,
+                vm_row_dims: vec![],
+                storage: crate::ir::linearize::Storage::InSlot,
+            },
+        );
+        self.record_pointee_extents(symbol, typ, dims);
     }
 
     /// Linearize a VLA (Variable Length Array) declaration
@@ -709,6 +763,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 sym: sym_id,
                 typ: ptr_type,
                 vla_size_sym: Some(size_sym_id),
+                vla_outer_extent: dims.first().copied(),
                 vla_elem_type: Some(elem_type),
                 // One index step consumes the outermost extent, so what a row
                 // still spans is everything after it.
@@ -784,11 +839,17 @@ impl<'a> super::linearize::Linearizer<'a> {
                 sym: PseudoId(u32::MAX),
                 typ: declarator.typ,
                 vla_size_sym: None,
+                vla_outer_extent: None,
                 vla_elem_type: None,
                 vm_row_dims: vec![],
                 storage: crate::ir::linearize::Storage::InSlot,
             },
         );
+
+        // A static pointer to a VLA -- the one variably modified type static
+        // storage allows (C17 6.7.6.2p2) -- still steps by its pointee's
+        // extents, evaluated each time the declaration is reached.
+        self.record_pointee_extents(declarator.symbol, declarator.typ, &declarator.vla_sizes);
 
         // Determine initializer (static locals are initialized at compile time)
         let init = declarator.init.as_ref().map_or(Initializer::None, |e| {
@@ -796,11 +857,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         });
 
         // Add as a global - static locals always have internal linkage
-        // Check for thread-local storage
-        let modifiers = self.types.modifiers(declarator.typ);
         // Const at the object level for section selection (see linearize_init.rs)
         let is_const = super::linearize_init::is_const_object_type(self.types, declarator.typ);
-        if modifiers.contains(TypeModifiers::THREAD_LOCAL) {
+        // Thread-local storage is the declaration's storage class, not
+        // anything about the type: a structure's type is its tag's and never
+        // carries one, so asking the type made `static _Thread_local struct S
+        // s;` one object shared by every thread.
+        if declarator
+            .storage_class
+            .contains(TypeModifiers::THREAD_LOCAL)
+        {
             self.module.add_global_tls_aligned(
                 &global_name,
                 declarator.typ,
@@ -1631,10 +1697,32 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// is legal.
     pub(crate) fn check_label_references(&mut self) {
         for (name, pos) in std::mem::take(&mut self.label_refs) {
-            if !self.defined_labels.contains(&name) {
-                crate::diag::error_args(pos, "label '{0}' used but not defined", &[&name]);
+            if self.defined_labels.contains(&name) {
+                continue;
             }
+            if self.written_labels.contains(&name) {
+                self.place_unevaluated_label(&name);
+                continue;
+            }
+            crate::diag::error_args(pos, "label '{0}' used but not defined", &[&name]);
         }
+    }
+
+    /// Give a label written inside an operand that is never evaluated -- the
+    /// statement expression of `sizeof(({ L: x; }))` -- a block of its own,
+    /// which nothing reaches.
+    ///
+    /// The label exists, so "used but not defined" is the wrong complaint: a
+    /// `goto` to it has already been reported as a jump into a statement
+    /// expression, which is gcc's one error, and gcc accepts `&&L`, whose
+    /// address has to name some block.
+    fn place_unevaluated_label(&mut self, name: &str) {
+        let resume = self.current_bb;
+        let label_bb = self.get_or_create_label(name);
+        self.switch_bb(label_bb);
+        self.emit(Instruction::new(Opcode::Unreachable).with_type(self.types.void_id));
+        self.defined_labels.insert(name.to_string());
+        self.current_bb = resume;
     }
 
     /// Link the dispatch block to every label whose address was taken.
@@ -1676,7 +1764,12 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// scope also names the declaration that could not be entered, which gcc
     /// does not -- the position says where to look and the name says what the
     /// problem is.
-    pub(crate) fn check_jumps_into_protected_scopes(&self, body: &Stmt) {
+    ///
+    /// Answers the name of every label the body writes, evaluated or not.
+    pub(crate) fn check_jumps_into_protected_scopes(
+        &self,
+        body: &Stmt,
+    ) -> std::collections::HashSet<String> {
         let w = JumpScopeWalk::of(body);
 
         // 6.8.1p3: a label name is unique within the function it appears in.
@@ -1716,6 +1809,11 @@ impl<'a> super::linearize::Linearizer<'a> {
             };
             error(*pos, &gettextrs::gettext(message));
         }
+
+        w.labels
+            .iter()
+            .map(|(name, _, _)| self.strings.get(*name).to_string())
+            .collect()
     }
 
     /// Report a jump into `scope`, by a `switch` reaching a label inside it
@@ -2003,6 +2101,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.expr_is_runtime(cond) || self.expr_is_runtime(else_expr)
             }
             ExprKind::Cast { expr: inner, .. } => self.expr_is_runtime(inner),
+            // Its size expressions are evaluated at run time.
+            ExprKind::VmTypeName { .. } => true,
 
             // `sizeof` of a variable length array type is the exception: it
             // does evaluate its operand, and is genuinely not an integer

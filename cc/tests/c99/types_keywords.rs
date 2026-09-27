@@ -288,10 +288,9 @@ int main(void) {
 ///
 /// The specifier tally took the size only when it had not already settled on
 /// `int`, so `int long` was a four-byte `long` and `int short` a four-byte
-/// `short`. Two independent copies of the tally had the same defect -- one
-/// for declarations, one for type-names -- so `long int x;` was right while
-/// `sizeof(int long)` was wrong even after the first was fixed. Both spellings
-/// of both paths are asserted here.
+/// `short`. Declarations and type-names reach the specifiers from different
+/// places -- they once had a specifier loop each, and the defect had to be
+/// fixed in both -- so both spellings of both paths are asserted here.
 #[test]
 fn c99_size_specifiers_are_order_independent() {
     let code = r#"
@@ -315,7 +314,7 @@ int main(void) {
     if (sizeof e1 != sizeof e2) return 9;
     if (sizeof e1 != 2) return 10;
 
-    /* Type-name path: a separate specifier tally from the one above. */
+    /* Type-name path. */
     if (sizeof(int long) != 8) return 11;
     if (sizeof(int short) != 2) return 12;
     if (sizeof(int long long) != 8) return 13;

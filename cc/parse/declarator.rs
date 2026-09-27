@@ -10,7 +10,10 @@
 //
 
 use super::ast::Expr;
-use super::parser::{DeclaratorName, ParameterList, ParseError, ParseResult, Parser, RawParam};
+use super::declaration::SpecContext;
+use super::parser::{
+    DeclaratorContext, ParameterList, ParseError, ParseResult, ParsedDeclarator, Parser, RawParam,
+};
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::Symbol;
@@ -20,10 +23,6 @@ use gettextrs::gettext;
 
 const DEFAULT_PARAM_CAPACITY: usize = 8;
 
-/// Result of parsing a declarator: (name, type, VLA expressions, raw function parameters)
-type DeclaratorResult = (StringId, TypeId, Vec<Expr>, Option<Vec<RawParam>>);
-
-/// Function parameter type info: (type IDs, is_variadic)
 /// The signature a function declarator's `( ... )` suffix contributes.
 ///
 /// `prototyped` is false for `()` and for a K&R identifier list, which C17
@@ -55,10 +54,7 @@ impl Parser<'_> {
     /// as the identifier.
     pub(super) fn parse_pointer_qualifiers(&mut self) -> TypeModifiers {
         let mut modifiers = TypeModifiers::empty();
-        while self.peek() == TokenType::Ident {
-            let Some(name_id) = self.get_ident_id(self.current()) else {
-                break;
-            };
+        while let Some(name_id) = self.current_ident() {
             match name_id {
                 crate::kw::ATOMIC => modifiers |= TypeModifiers::ATOMIC,
                 // Every spelling of the three CV qualifiers, from the one
@@ -91,13 +87,16 @@ impl Parser<'_> {
     /// - `[3]` after the parens means "to array of 3"
     ///   So p is "pointer to array of 3 ints"
     ///
-    /// Returns: (name, type, VLA size expressions, function parameters if declarator is function)
-    /// The function parameters include names for use in function definitions.
+    /// The one declarator parser: every declaration, member, parameter and
+    /// type-name reaches its declarator through here, and `ctx` says which it
+    /// is. The function parameters it returns include names, for a function
+    /// definition to bind.
     pub(crate) fn parse_declarator(
         &mut self,
         base_type_id: TypeId,
-        name: DeclaratorName,
-    ) -> ParseResult<DeclaratorResult> {
+        ctx: DeclaratorContext,
+    ) -> ParseResult<ParsedDeclarator> {
+        let start = self.current_pos();
         // Collect pointer modifiers (they bind tighter than array/function)
         let mut pointer_modifiers: Vec<TypeModifiers> = Vec::new();
         while self.is_special(b'*') {
@@ -110,134 +109,54 @@ impl Parser<'_> {
 
         // Check for parenthesized declarator: int (*p)[3]
         // The paren comes AFTER pointers, e.g. int *(*p)[3] = pointer to (pointer to array of 3 ints)
-        let (name, inner_type_id, inner_func_params) = if self.is_special(b'(') {
+        let (name, inner) = if self.is_special(b'(') {
             // Check if this looks like a function parameter list or a grouped declarator
             // A grouped declarator will have * or identifier immediately after (
             let saved_pos = self.pos;
             self.advance(); // consume '('
 
-            let is_grouped = self.is_grouped_declarator();
-
-            if is_grouped {
+            if self.is_grouped_declarator() {
                 // For int (*p)[3]: we're now at *p), base_type is int
-
-                // Note: We ignore any VLA expression from inner declarators - VLAs would be
-                // in the outer array dimensions, not inner pointer/grouped declarators
-                let (inner_name, inner_decl_type_id, _inner_vla, inner_func_params) =
-                    self.parse_declarator(self.types.void_id, name)?;
+                let inner = self.parse_declarator(self.types.void_id, ctx)?;
                 self.expect_special(b')')?;
-
-                (inner_name, Some(inner_decl_type_id), inner_func_params)
+                (inner.name, Some(inner))
             } else {
                 // The `(` opens a parameter list, so this declarator is
                 // abstract: `int (size_t)` names a function type, and there is
                 // no identifier to find. Rewind to the `(` and let the
                 // function-suffix loop below consume the parameter list.
                 self.pos = saved_pos;
-                (StringId::EMPTY, None, None)
+                if ctx.requires_name() {
+                    // A declaration has to declare something: `int (void);`
+                    // is the abstract form where only a declarator may go.
+                    (self.expect_declarator_name()?, None)
+                } else {
+                    (StringId::EMPTY, None)
+                }
             }
-        } else if self.peek() == TokenType::Ident {
-            (self.expect_declarator_name()?, None, None)
-        } else if name == DeclaratorName::Optional {
+        } else if self.peek() == TokenType::Ident || ctx.requires_name() {
+            (self.expect_declarator_name()?, None)
+        } else {
             // An abstract declarator has no identifier by construction
             // (C17 6.7.7): `void (*)(int)`, or a parameter written as a bare
             // type. Whether that is allowed is the caller's question, not a
             // guess from the next token: any token may follow, and
             // `_Generic(1, int: 11)` ends its type-name at a `:`.
-            (StringId::EMPTY, None, None)
-        } else {
-            (self.expect_declarator_name()?, None, None)
+            (StringId::EMPTY, None)
         };
 
+        // The inner declarator is the outer level, so its extents come first:
+        // `int (*p[n])` is an array of `n` pointers. Dropping them left that
+        // array incomplete.
+        let mut vla_pos = inner.as_ref().and_then(|i| i.vla_pos);
+        let mut vla_exprs: Vec<Expr> = inner.as_ref().map(|i| i.vla.clone()).unwrap_or_default();
+
         // Handle array declarators - collect all dimensions first
-        // Also track VLA expressions (non-constant size) for each dimension
         let mut dimensions: Vec<(Option<usize>, Position)> = Vec::new();
-        let mut vla_exprs: Vec<Expr> = Vec::new();
         while self.is_special(b'[') {
             let dim_pos = self.current_pos();
             self.advance();
-
-            // Parse optional qualifiers and static (C99 6.7.5.3)
-            // These are valid in function parameter array declarators
-            while self.peek() == TokenType::Ident {
-                if let Some(name_id) = self.get_ident_id(self.current()) {
-                    match name_id {
-                        // C17 6.7.6.2: the array declarator of a parameter
-                        // takes a type-qualifier list, which includes
-                        // `_Atomic`, and optionally `static`.
-                        crate::kw::STATIC | crate::kw::ATOMIC => {
-                            self.advance();
-                        }
-                        _ if super::cv_qualifier_modifier(name_id).is_some() => {
-                            self.advance();
-                        }
-                        _ => break,
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            // Check for [*] VLA unspecified size (C99 6.7.5.2)
-            // This is used in function prototypes: void f(int n, int arr[*])
-            let size = if self.is_special(b']') {
-                None
-            } else if self.is_special(b'*') {
-                // Check if it's [*] (VLA star) or just a multiplication expression
-                let saved_pos = self.pos;
-                self.advance();
-                if self.is_special(b']') {
-                    // It's [*] - VLA with unspecified size
-                    None
-                } else {
-                    // It's an expression starting with * (e.g., [*ptr])
-                    self.pos = saved_pos;
-                    let size_pos = self.current_pos();
-                    let expr = self.parse_assignment_expr()?;
-                    match self.eval_const_expr(&expr) {
-                        Some(n) if n >= 0 => Some(n as usize),
-                        Some(_) => {
-                            return Err(ParseError::new(
-                                "size of array is negative".to_string(),
-                                size_pos,
-                            ));
-                        }
-                        None => {
-                            self.check_array_size_type(&expr, size_pos)?;
-                            vla_exprs.push(expr);
-                            None
-                        }
-                    }
-                }
-            } else {
-                // Parse constant expression for array size (C99 6.7.5.2)
-                let size_pos = self.current_pos();
-                let expr = self.parse_assignment_expr()?;
-                // Evaluate as integer constant expression
-                match self.eval_const_expr(&expr) {
-                    Some(n) if n >= 0 => Some(n as usize),
-                    // C17 6.7.6.2p1: the size shall be greater than zero.
-                    Some(_) => {
-                        // gcc distinguishes the two, and the abstract case is
-                        // the one a type-name reaches: `sizeof(char[-1])`
-                        // says "unnamed", `char a[-1];` names `a`.
-                        return Err(ParseError::new(
-                            if name == StringId::EMPTY {
-                                "size of unnamed array is negative".to_string()
-                            } else {
-                                format!("size of array '{}' is negative", self.idents.get(name))
-                            },
-                            size_pos,
-                        ));
-                    }
-                    None => {
-                        // Non-constant (VLA) - save expression for VLA handling
-                        self.check_array_size_type(&expr, size_pos)?;
-                        vla_exprs.push(expr);
-                        None
-                    }
-                }
-            };
+            let size = self.parse_array_extent(name, dim_pos, ctx, &mut vla_exprs, &mut vla_pos)?;
             self.expect_special(b']')?;
             dimensions.push((size, dim_pos));
         }
@@ -266,35 +185,31 @@ impl Parser<'_> {
         // Build the type from the base type
         let mut result_type_id = base_type_id;
 
-        if let Some(inner_tid) = inner_type_id {
+        // Apply pointer modifiers to base type first
+        // Note: Forward iteration is correct - qualifiers after each * apply to that pointer level
+        for modifiers in pointer_modifiers.into_iter() {
+            let ptr_type = Type {
+                kind: TypeKind::Pointer,
+                modifiers,
+                base: Some(result_type_id),
+                ..Default::default()
+            };
+            result_type_id = self.types.intern(ptr_type);
+        }
+
+        if let Some(inner) = &inner {
             // Grouped declarator: int (*p)[3] or void (*fp)(int) or int *(*q)[3]
-            // Outer pointers (before parens) apply to the base type first
-            // Then arrays/functions in suffix are applied
-            // Finally we substitute into the inner declarator
-
-            // Apply any outer pointers (before the parens) to base type FIRST
-            // For struct node *(*fp)(int): base is struct node, outer * -> Pointer(struct node)
-            // For int *(*q)[3]: base is int, outer * -> Pointer(int)
-            // Note: Forward iteration is correct - qualifiers after each * apply to that pointer level
-            for modifiers in pointer_modifiers.into_iter() {
-                let ptr_type = Type {
-                    kind: TypeKind::Pointer,
-                    modifiers,
-                    base: Some(result_type_id),
-                    ..Default::default()
-                };
-                result_type_id = self.types.intern(ptr_type);
-            }
-
-            // Apply function parameters to (possibly pointer-modified) base type
-            // For struct node *(*fp)(int): result is Pointer(struct node)
+            // Outer pointers (before parens) apply to the base type first,
+            // then the suffix, and finally the result is substituted into the
+            // inner declarator.
+            //
+            // For struct node *(*fp)(int): Pointer(struct node)
             //   -> Function(Pointer(struct node), [int])
             if let Some(sig) = func_params {
                 let func_type = sig.into_type(result_type_id);
                 result_type_id = self.types.intern(func_type);
             }
 
-            // Apply array dimensions to result type
             // For int *(*q)[3]: result is Pointer(int) -> Array(3, Pointer(int))
             for (size, pos) in dimensions.into_iter().rev() {
                 result_type_id = self.derive_array_type(result_type_id, size, pos)?;
@@ -303,24 +218,10 @@ impl Parser<'_> {
             // Substitute the result type into the inner declarator: for
             // `int (*p)[3]`, Pointer(Void) and Array(3, int) compose into
             // Pointer(Array(3, int)).
-            result_type_id = self.substitute_base_type(inner_tid, result_type_id);
+            result_type_id = self.substitute_base_type(inner.typ, result_type_id);
         } else {
             // Simple declarator: char *arr[3]
             // Pointers bind tighter than arrays: *arr[3] = array of pointers
-
-            // Apply pointer modifiers to base type first
-            // Note: Forward iteration is correct - qualifiers after each * apply to that pointer level
-            for modifiers in pointer_modifiers.into_iter() {
-                let ptr_type = Type {
-                    kind: TypeKind::Pointer,
-                    modifiers,
-                    base: Some(result_type_id),
-                    ..Default::default()
-                };
-                result_type_id = self.types.intern(ptr_type);
-            }
-
-            // Then apply array dimensions
             // For char *arr[3]: result_type is char*, suffix [3] -> Array(3, char*)
             for (size, pos) in dimensions.into_iter().rev() {
                 result_type_id = self.derive_array_type(result_type_id, size, pos)?;
@@ -328,7 +229,6 @@ impl Parser<'_> {
 
             // Apply function parameters if present (for function declarators)
             // For int get_op(int which): base is int, suffix (int) -> Function(int, [int])
-            // This is needed for nested declarators like int (*get_op(int))(int, int)
             if let Some(sig) = func_params {
                 let func_type = sig.into_type(result_type_id);
                 result_type_id = self.types.intern(func_type);
@@ -337,29 +237,123 @@ impl Parser<'_> {
 
         // The inner declarator's parameters win when it has them, as in
         // `int (*get_op(int which))(int)`; otherwise the outer suffix's do.
-        let returned_func_params = if inner_func_params.is_some() {
-            inner_func_params
-        } else {
-            full_func_params
+        let params = match inner {
+            Some(ParsedDeclarator {
+                params: Some(params),
+                ..
+            }) => Some(params),
+            _ => full_func_params,
         };
 
-        // Propagate storage class modifiers from base type to derived type
-        // For "extern int *p", the EXTERN should be on the pointer type, not just int
-        let storage_class_mask = TypeModifiers::EXTERN
-            | TypeModifiers::STATIC
-            | TypeModifiers::TYPEDEF
-            | TypeModifiers::REGISTER
-            | TypeModifiers::AUTO
-            | TypeModifiers::THREAD_LOCAL;
-        let base_storage_class = self.types.modifiers(base_type_id) & storage_class_mask;
-        if !base_storage_class.is_empty() && result_type_id != base_type_id {
-            // Add storage class modifiers to the result type
-            let mut result_type = self.types.get(result_type_id).clone();
-            result_type.modifiers |= base_storage_class;
-            result_type_id = self.types.intern(result_type);
+        Ok(ParsedDeclarator {
+            name,
+            pos: start,
+            typ: self.carry_storage_class(base_type_id, result_type_id),
+            vla: vla_exprs,
+            vla_pos,
+            params,
+        })
+    }
+
+    /// The extent inside one `[ ]` of an array declarator, after the `[`.
+    ///
+    /// A constant extent is answered; a run-time one is appended to `vla` and
+    /// answers `None`, as does an absent one and `[*]`.
+    fn parse_array_extent(
+        &mut self,
+        name: StringId,
+        dim_pos: Position,
+        ctx: DeclaratorContext,
+        vla: &mut Vec<Expr>,
+        vla_pos: &mut Option<Position>,
+    ) -> ParseResult<Option<usize>> {
+        // C17 6.7.6.2p1: the optional type qualifiers and `static` belong to
+        // the declaration of a function parameter -- `_Atomic` among them.
+        let mut qualified = false;
+        while let Some(name_id) = self.current_ident() {
+            match name_id {
+                crate::kw::STATIC | crate::kw::ATOMIC => {}
+                _ if super::cv_qualifier_modifier(name_id).is_some() => {}
+                _ => break,
+            }
+            qualified = true;
+            self.advance();
+        }
+        if qualified && !ctx.is_parameter() {
+            diag::error(
+                dim_pos,
+                "static or type qualifiers in non-parameter array declarator",
+            );
         }
 
-        Ok((name, result_type_id, vla_exprs, returned_func_params))
+        if self.is_special(b']') {
+            return Ok(None);
+        }
+        // `[*]`: a variable length array of unspecified size, which only a
+        // prototype can declare (C17 6.7.6.2p4). `[*p]` is an expression.
+        if self.is_special(b'*') && self.next_token_is_special(b']') {
+            self.advance();
+            if !ctx.is_prototype_scope() {
+                diag::error(
+                    dim_pos,
+                    "'[*]' not allowed in other than function prototype scope",
+                );
+            }
+            return Ok(None);
+        }
+
+        // Parse constant expression for array size (C99 6.7.5.2)
+        let size_pos = self.current_pos();
+        let expr = self.parse_assignment_expr()?;
+        match self.eval_const_expr(&expr) {
+            Some(n) if n >= 0 => Ok(Some(n as usize)),
+            // C17 6.7.6.2p1: the size shall be greater than zero. Zero itself
+            // is a GNU extension gcc accepts, so only a negative size is
+            // refused here.
+            Some(_) => {
+                // gcc distinguishes the two, and the abstract case is the one
+                // a type-name reaches: `sizeof(char[-1])` says "unnamed",
+                // `char a[-1];` names `a`.
+                Err(ParseError::new(
+                    if name == StringId::EMPTY {
+                        "size of unnamed array is negative".to_string()
+                    } else {
+                        format!("size of array '{}' is negative", self.idents.get(name))
+                    },
+                    size_pos,
+                ))
+            }
+            None => {
+                // Non-constant (VLA) - save expression for VLA handling
+                self.check_array_size_type(&expr, size_pos)?;
+                vla.push(expr);
+                vla_pos.get_or_insert(size_pos);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Carry the specifiers' storage class onto a type derived from them.
+    ///
+    /// Storage class is not part of a type, but the declaration binders read
+    /// it off the declarator's type -- `extern int *p` needs `EXTERN` on the
+    /// pointer, `typedef int a[3]` `TYPEDEF` on the array. A function
+    /// declarator carries it on its *return* type instead: that is the type a
+    /// function definition is emitted from, and the linearizer reads `extern`
+    /// there. The function type itself stays bare.
+    fn carry_storage_class(&mut self, base: TypeId, derived: TypeId) -> TypeId {
+        let storage = self.types.modifiers(base) & Type::STORAGE_CLASS;
+        if storage.is_empty() || derived == base {
+            return derived;
+        }
+        let mut typ = self.types.get(derived).clone();
+        if typ.kind == TypeKind::Function {
+            let ret = typ.base.expect("a function type has a return type");
+            typ.base = Some(self.carry_storage_class(base, ret));
+        } else {
+            typ.modifiers |= storage;
+        }
+        self.types.intern(typ)
     }
 
     /// Substitute the actual base type into a declarator parsed with a placeholder
@@ -429,10 +423,15 @@ impl Parser<'_> {
     /// *object* -- saw the outer `_Alignas` while parsing `(int)` and reported
     /// it as an alignment on a parameter.
     ///
-    /// The parameter scope is bracketed here for the same reason.
+    /// The parameter scope is bracketed here for the same reason, and so are
+    /// the pending function and symbol attributes: an attribute written on a
+    /// parameter is the parameter's, and `void f(void (*cb)(void)
+    /// __attribute__((noreturn)));` does not make `f` noreturn.
     pub(crate) fn parse_parameter_list(&mut self) -> ParseResult<ParameterList> {
         let saved_align = self.pending_alignas.take();
         let saved_align_kw = self.pending_alignas_kw.take();
+        let saved_fn_attrs = std::mem::take(&mut self.pending_fn_attrs);
+        let saved_symbol_attrs = std::mem::take(&mut self.pending_symbol_attrs);
         // The parameter scope is opened and closed here rather than inside, so
         // that it is balanced however the inner parse exits. It used to be left
         // open on the `?` paths and on the trailing-comma `return Err`.
@@ -441,6 +440,8 @@ impl Parser<'_> {
         self.symbols.leave_scope();
         self.pending_alignas = saved_align;
         self.pending_alignas_kw = saved_align_kw;
+        self.pending_fn_attrs = saved_fn_attrs;
+        self.pending_symbol_attrs = saved_symbol_attrs;
         result
     }
 
@@ -462,22 +463,18 @@ impl Parser<'_> {
         }
 
         // Check for (void)
-        if self.peek() == TokenType::Ident {
-            if let Some(name_id) = self.get_ident_id(self.current()) {
-                if name_id == crate::kw::VOID {
-                    let saved_pos = self.pos;
-                    self.advance();
-                    if self.is_special(b')') {
-                        return Ok(ParameterList {
-                            params,
-                            variadic,
-                            prototyped: true,
-                        });
-                    }
-                    // Not just void, backtrack
-                    self.pos = saved_pos;
-                }
+        if self.is_keyword(crate::kw::VOID) {
+            let saved_pos = self.pos;
+            self.advance();
+            if self.is_special(b')') {
+                return Ok(ParameterList {
+                    params,
+                    variadic,
+                    prototyped: true,
+                });
             }
+            // Not just void, backtrack
+            self.pos = saved_pos;
         }
 
         loop {
@@ -497,7 +494,9 @@ impl Parser<'_> {
             }
 
             // Parse parameter type
-            let param_type = self.parse_type_specifier()?;
+            let param_pos = self.current_pos();
+            let param_specs = self.parse_declaration_specifiers(SpecContext::Declaration)?;
+            let param_type = param_specs.ty;
             // C11 6.7.5p2: not on a parameter.
             self.reject_alignas_in("a parameter");
             // An identifier list -- `int f(a, b) int a, b;` -- is not a
@@ -506,7 +505,7 @@ impl Parser<'_> {
             // identifier. The choice is all-or-nothing across the list, so the
             // first parameter settles it.
             if params.is_empty() && !variadic {
-                prototyped = self.saw_explicit_type;
+                prototyped = param_specs.explicit;
             }
             // For struct/union types with tags, use existing TypeId to preserve forward declarations
             let base_type_id = self.intern_type_with_tag(&param_type);
@@ -515,9 +514,16 @@ impl Parser<'_> {
             // - Simple pointers: void *, int *
             // - Grouped declarators: void (*)(int), int (*)[10]
             // - Arrays: int arr[], int arr[10]
-            // Note: parse_declarator returns (name, type, vla_sizes)
-            let (param_name, mut typ_id, vla_sizes, _func_params) =
-                self.parse_declarator(base_type_id, DeclaratorName::Optional)?;
+            let ParsedDeclarator {
+                name: param_name,
+                typ: mut typ_id,
+                vla: mut vla_sizes,
+                ..
+            } = self.parse_declarator(base_type_id, DeclaratorContext::Parameter)?;
+            // The specifiers' extents are the innermost levels, as in any
+            // other declaration: `typeof(a) b` beside `int (*a)[n]`.
+            vla_sizes.extend(param_specs.vm_dims);
+            self.check_parameter_specifiers(param_type.modifiers, param_name, param_pos);
 
             // Skip any __attribute__ after parameter declarator
             self.skip_extensions();
@@ -661,7 +667,7 @@ impl Parser<'_> {
                 // C17 6.7.6.3: a parameter-type-list is a comma-separated list
                 // of parameter declarations, optionally followed by `, ...`.
                 // Nothing else may follow the comma: falling through would let
-                // `parse_type_specifier` supply an implicit `int` and make
+                // the specifier parser supply an implicit `int` and make
                 // `void g(int, );` a two-parameter prototype. (C23 permits the
                 // trailing comma; this compiler is C17.)
                 if self.is_special(b')') {

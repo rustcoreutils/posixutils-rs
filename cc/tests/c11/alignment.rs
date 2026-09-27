@@ -487,9 +487,8 @@ int main(void) {
     );
 }
 
-/// The same alignments must survive a block scope, where the declaration goes
-/// through `parse_declaration_and_bind_impl` rather than `parse_external_decl`.
-/// That is a third copy of the same rule and it had drifted the same way.
+/// The same alignments must survive a block scope. The block-scope binder was
+/// a third copy of the same rule and it had drifted the same way.
 #[test]
 fn c11_alignment_typedef_at_block_scope() {
     let code = r#"

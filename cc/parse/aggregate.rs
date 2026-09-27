@@ -9,7 +9,8 @@
 // struct, union and enum specifiers, and the bit-field constraints
 //
 
-use super::parser::{DeclaratorName, ParseError, ParseResult, Parser};
+use super::declaration::SpecContext;
+use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
@@ -483,12 +484,13 @@ impl Parser<'_> {
             }
 
             // Parse member declaration
-            let member_base_type = self.parse_type_specifier()?;
+            let member_specs = self.parse_declaration_specifiers(SpecContext::Member)?;
+            let member_base_type = &member_specs.ty;
             let is_struct_or_union =
                 matches!(member_base_type.kind, TypeKind::Struct | TypeKind::Union);
             // For struct/union types with tags, use the existing TypeId from symbol table
             // to ensure forward-declared types are properly linked
-            let member_base_type_id = self.intern_type_with_tag(&member_base_type);
+            let member_base_type_id = self.intern_type_with_tag(member_base_type);
 
             // Skip any __attribute__ after type specifier (before member name)
             self.skip_extensions();
@@ -562,11 +564,11 @@ impl Parser<'_> {
                 }
 
                 // VLAs are not allowed in struct members
-                let (name, typ, vla_sizes, _func_params) =
-                    self.parse_declarator(member_base_type_id, DeclaratorName::Required)?;
+                let ParsedDeclarator { name, typ, vla, .. } =
+                    self.parse_declarator(member_base_type_id, DeclaratorContext::Declaration)?;
 
                 // C99 6.7.5.2: VLAs cannot be members of structures or unions
-                if !vla_sizes.is_empty() {
+                if !vla.is_empty() {
                     return Err(ParseError::new(
                         "variable length arrays cannot be structure or union members".to_string(),
                         self.current_pos(),
@@ -574,12 +576,13 @@ impl Parser<'_> {
                 }
 
                 // 6.7.2.1p9 says the same of a member that reached its
-                // variably modified type through a typedef, which is the
-                // only other way in -- the declarator wrote no `[n]`, so
-                // the check above sees nothing. Without this the member
-                // looked like a flexible array (its extent is absent) and
-                // drew a diagnostic about that instead. gcc's wording.
-                if self.pending_vm_typedef_dims.is_some() {
+                // variably modified type through its specifiers -- a
+                // typedef, or `typeof(int[n])` -- the declarator having
+                // written no `[n]`, so the check above sees nothing. Without
+                // this the member looked like a flexible array (its extent is
+                // absent) and drew a diagnostic about that instead. gcc's
+                // wording.
+                if !member_specs.vm_dims.is_empty() {
                     return Err(ParseError::new(
                         "a member of a structure or union cannot have a variably modified type"
                             .to_string(),

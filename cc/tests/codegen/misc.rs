@@ -6569,6 +6569,51 @@ int call(int x) { return myfn(x) + my_var; }
     }
 }
 
+/// An asm label on a block-scope declaration with linkage renames it too, and
+/// a block-scope redeclaration keeps the label an earlier declaration gave the
+/// name. The block binder never settled either: the first emitted a reference
+/// to `x`, which does not exist, and the second called `f` instead of
+/// `impl_f`.
+#[test]
+fn codegen_asm_label_on_block_scope_declarations() {
+    let src = r#"
+#define XSTR(s) #s
+#define STR(s) XSTR(s)
+#define ASMNAME(cname) __asm__(STR(__USER_LABEL_PREFIX__) cname)
+
+int y = 42;
+int impl_f(void) { return 7; }
+int f(void) ASMNAME("impl_f");
+
+int main(void)
+{
+    extern int x ASMNAME("y");
+    if (x != 42) return 1;
+    int f(void);
+    if (f() != 7) return 2;
+    return 0;
+}
+"#;
+    run_everywhere("asm_label_block_scope", src);
+
+    // The same through a second translation unit, where nothing but the
+    // label can connect the name to the object.
+    let unit_a = "int y = 42;\n";
+    let unit_b = r#"
+#define XSTR(s) #s
+#define STR(s) XSTR(s)
+int main(void)
+{
+    extern int x __asm__(STR(__USER_LABEL_PREFIX__) "y");
+    return x == 42 ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run_two_units("asm_label_block_scope_2tu", unit_a, unit_b, &[]),
+        0
+    );
+}
+
 // ============================================================================
 // C99 and GNU inline: which definitions produce an external symbol
 // ============================================================================
@@ -14335,6 +14380,225 @@ int main(void)
     run_everywhere("typeof_storage_class", src);
 }
 
+/// `typeof` of an expression whose type is variably modified names that type
+/// with the extents its object was declared with. The type alone is `int[]`
+/// -- every VLA type interns to one `TypeId` -- so `typeof(v) w;` gave `w` an
+/// incomplete type and no storage, and was then rejected as "array size
+/// missing". The extents are the object's, fixed when it was declared; the
+/// operand is evaluated (once per declarator, as gcc does) only when it is
+/// variably modified, and so is `sizeof`'s (C17 6.5.3.4p2), which c17 skipped.
+#[test]
+fn codegen_typeof_of_variably_modified_object() {
+    let src = r#"
+static int g(int n, int (*a)[n], typeof(a) b, typeof(*a) *c)
+{
+    if ((char *)(b + 1) - (char *)b != n * (long)sizeof(int)) return 1;
+    if ((char *)(c + 1) - (char *)c != n * (long)sizeof(int)) return 2;
+    if (b[1][2] != a[1][2]) return 3;
+    return 0;
+}
+
+static int f(int n)
+{
+    int v[n];
+    typeof(v) w;                    /* int[n], fixed at v's declaration */
+    n = 100;
+    typeof(v) *p = &w;
+    if (sizeof w != 5 * sizeof(int)) return 10;
+    if (sizeof *p != 5 * sizeof(int)) return 11;
+    if ((char *)(p + 1) - (char *)p != 5 * (long)sizeof(int)) return 12;
+    typeof(w) w2;                   /* typeof of a typeof-declared VLA */
+    if (sizeof w2 != 5 * sizeof(int)) return 13;
+    typeof(v) a3[3];                /* int[3][5] */
+    if (sizeof a3 != 15 * sizeof(int)) return 14;
+    if ((char *)&a3[1] - (char *)&a3[0] != 5 * (long)sizeof(int)) return 15;
+
+    int m[n / 50][n / 25][3];       /* 2 x 4 x 3 */
+    typeof(m) m2;
+    typeof(m[0]) row;
+    typeof(m[1][2]) cell;           /* int[3]: constant */
+    if (sizeof m2 != 24 * sizeof(int)) return 20;
+    if (sizeof row != 12 * sizeof(int)) return 21;
+    if (sizeof cell != 3 * sizeof(int)) return 22;
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 4; j++)
+            for (int k = 0; k < 3; k++)
+                m2[i][j][k] = i * 100 + j * 10 + k;
+    if (m2[1][3][2] != 132 || m2[0][2][1] != 21) return 23;
+
+    int (*pv)[n / 10] = 0;          /* pointee int[10] */
+    typeof(*pv) x;
+    typeof(pv) q = pv;
+    typeof(v + 1) r = v;            /* int *: no extent */
+    if (sizeof x != 10 * sizeof(int)) return 30;
+    if ((char *)(q + 1) - (char *)q != 10 * (long)sizeof(int)) return 31;
+    if ((char *)(r + 1) - (char *)r != (long)sizeof(int)) return 32;
+
+    /* A variably modified operand is evaluated, as gcc does. */
+    int i = 0, j = 0, k = 0, a = 0;
+    typeof(pv[i++]) y;
+    if (i != 1 || sizeof y != 10 * sizeof(int)) return 40;
+    if (sizeof(typeof(pv[j++])) != 10 * sizeof(int) || j != 1) return 41;
+    if (sizeof(pv[k++]) != 10 * sizeof(int) || k != 1) return 42;
+    if (sizeof(m[a++]) != 12 * sizeof(int) || a != 1) return 43;
+    /* ...and a constant one is not. */
+    int c = 0;
+    typeof(m[1][c++]) z;
+    if (c != 0 || sizeof z != 3 * sizeof(int)) return 44;
+
+    /* gcc evaluates the operand once per declarator, not once per
+       declaration as it does `typeof(int[n++])`. */
+    int e = 0;
+    typeof(pv[e++]) d1, *d2;
+    if (e != 2 || sizeof d1 != sizeof *d2) return 45;
+    typedef typeof(pv[e++]) T;
+    T t1, t2;
+    if (e != 3 || sizeof t1 != sizeof t2 || sizeof t2 != 10 * sizeof(int)) return 46;
+
+    typedef int (*P)[n / 20];       /* pointer to int[5] */
+    P pp = 0;
+    if ((char *)(pp + 1) - (char *)pp != 5 * (long)sizeof(int)) return 50;
+
+    for (int t = 0; t < 5; t++) w[t] = t * 3;
+    int sum = 0;
+    for (int t = 0; t < 5; t++) sum += (*p)[t];
+    if (sum != 30) return 60;
+
+    int grid[3][n / 25];            /* 3 x 4 */
+    grid[1][2] = 7;
+    return g(n / 25, grid, grid, grid);
+}
+
+/* A static pointer to a VLA takes its pointee's extents each time its
+   declaration is reached. */
+static int h(int n)
+{
+    int rows[2][n];
+    static int (*sp)[n];
+    sp = rows;
+    if (sizeof *sp != n * sizeof(int)) return 70;
+    if ((char *)(sp + 1) - (char *)sp != n * (long)sizeof(int)) return 71;
+    return 0;
+}
+
+int main(void)
+{
+    int r = h(3);
+    if (r == 0) r = h(7);
+    return r ? r : f(5);
+}
+"#;
+    run_everywhere("typeof_vm_object", src);
+}
+
+/// A type-name of variably modified type -- in a cast, a compound literal or
+/// `va_arg` -- carries its extents to the value it yields. The type alone is
+/// `int (*)[]`, so `(int (*)[n])buf + 1` stepped by 0, `sizeof *(int (*)[n])buf`
+/// was 0, and the size expressions were never evaluated at all (C17 6.8p4).
+/// `&` steps back out of an index chain, and the `[]` of `int (*)[][m]` takes
+/// no size expression -- declared or cast, `m` went to it and the rows were 0.
+#[test]
+fn codegen_type_name_of_variably_modified_type_carries_its_extents() {
+    let src = r#"
+#include <stdarg.h>
+
+#define STEP(p) ((char *)((p) + 1) - (char *)(p))
+
+static long through_va_arg(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    char *base = va_arg(ap, char *);
+    long r = (char *)(va_arg(ap, int (*)[n]) + 1) - base;
+    va_end(ap);
+    return r;
+}
+
+static int f(int n, int m)
+{
+    int buf[60];
+    for (int i = 0; i < 60; i++)
+        buf[i] = i;
+    typedef int T[n];
+    int v[n];
+    const long row = n * (long)sizeof(int);
+
+    /* A cast's extents step the pointer it yields... */
+    if (STEP((int (*)[n])buf) != row) return 1;
+    if ((char *)(1 + (int (*)[n])buf) - (char *)buf != row) return 2;
+    if ((int (*)[n])buf + 3 - (int (*)[n])buf != 3) return 3;
+    if ((char *)&((int (*)[n])buf)[2] - (char *)buf != 2 * row) return 4;
+    if (((int (*)[n])buf)[2][3] != 13) return 5;
+    /* ...size what it points at... */
+    if (sizeof *(int (*)[n])buf != row) return 6;
+    if (sizeof((int (*)[n][m])buf)[0][1] != m * sizeof(int)) return 7;
+    if ((*((int (*)[n][m])buf + 1))[1][2] != 20) return 8;
+    /* ...whether written out, through a typedef, or through typeof. */
+    if (STEP((T *)buf) != row) return 9;
+    if (STEP((typeof(v) *)buf) != row) return 10;
+    if (STEP((typeof((int (*)[n])buf))buf) != row) return 11;
+    /* The size expressions are evaluated once, where the cast is. */
+    int k = n;
+    long s = (char *)((int (*)[k++])buf + 1) - (char *)buf;
+    if (s != row || k != n + 1) return 12;
+    /* An initialized pointer takes its own extents, as before. */
+    int (*q)[n] = (int (*)[n])buf;
+    q++;
+    if ((char *)q - (char *)buf != row) return 13;
+    /* A compound literal of pointer-to-VLA type is sized the same way. */
+    if ((char *)&(int (*)[n]){ (void *)buf }[1] - (char *)buf != row) return 14;
+    if (through_va_arg(n, buf, buf) != row) return 15;
+    /* `sizeof` of a pointer type evaluates nothing, as gcc has it. */
+    int b = 0;
+    if (sizeof(int (*)[b++]) != sizeof(void *) || b != 0) return 16;
+    /* `&` steps back out: `&*p` is `p`, and `&v` points at all of `v`. */
+    if (STEP(&*(int (*)[n])buf) != row) return 18;
+    if (STEP(&v) != row || sizeof *&v != row) return 19;
+    typeof(&v) pv = &v;
+    if (STEP(pv) != row || (char *)&(&v)[1] - (char *)v != row) return 20;
+    /* An incomplete outermost level takes no size expression: `m` sizes
+       the rows of `int (*)[][m]`, not the `[]`. */
+    int (*inc)[][m] = (int (*)[][m])buf;
+    if ((*inc)[2][1] != 7 || ((*(int (*)[][m])buf))[2][1] != 7) return 21;
+    if (sizeof (*inc)[0] != m * sizeof(int)) return 22;
+    typeof(inc) inc2 = inc;
+    if ((*inc2)[3][2] != 11) return 23;
+    /* Each evaluation of the cast reads the extent afresh. */
+    for (int w = 1; w <= 3; w++)
+        if (STEP((int (*)[w])buf) != w * (long)sizeof(int)) return 17;
+    return 0;
+}
+
+int main(void)
+{
+    return f(5, 3);
+}
+"#;
+    run_everywhere("vm_type_name_extents", src);
+}
+
+/// `sizeof ( expression )` is `sizeof` of a unary expression, and the
+/// parenthesized expression is only its primary: `sizeof (a)[0]` measures
+/// `a[0]`. c17 stopped at the `)` and rejected the `[`.
+#[test]
+fn codegen_sizeof_parenthesized_operand_takes_postfix_operators() {
+    let src = r#"
+struct S { int x[3]; } s;
+int a[10];
+int *f(void) { return a; }
+int main(void)
+{
+    if (sizeof (a)[0] != sizeof(int)) return 1;
+    if (sizeof (s).x != 3 * sizeof(int)) return 2;
+    if (_Alignof (a)[0] != _Alignof(int)) return 3;
+    if (sizeof (f)() != sizeof(int *)) return 4;
+    if (sizeof (a) != 10 * sizeof(int)) return 5;
+    return 0;
+}
+"#;
+    run_everywhere("sizeof_paren_postfix", src);
+}
+
 /// A complex value, a complex cast, `__builtin_complex`, a `__sync` CAS and an
 /// atomic floating-point read-modify-write each need a temporary in memory.
 /// They were `alloca`s, which grow the stack on every evaluation and are
@@ -15523,5 +15787,384 @@ void set(long v) { gb.y = v; }
                 );
             }
         }
+    }
+}
+
+/// The qualifiers written around `typeof(..)` or `_Atomic(..)` in a type-name
+/// are part of the type it names. The type-name specifier loop returned as
+/// soon as it had parsed the operand, so a leading `const` was dropped --
+/// `_Generic` picked `default` for `const typeof(int) *` against a
+/// `const int *` -- and a trailing one was left for the caller, which then
+/// failed to parse it.
+#[test]
+fn codegen_type_name_keeps_qualifiers_around_typeof() {
+    let src = r#"
+const int *p;
+volatile long *q;
+
+int main(void)
+{
+    /* The qualifier before typeof is part of the association's type. */
+    if (_Generic(p, const typeof(int) *: 1, default: 2) != 1)
+        return 1;
+    if (_Generic(q, volatile __typeof__(long) *: 1, default: 2) != 1)
+        return 2;
+    /* ... and so is one after it, which must still parse. */
+    if (_Generic(p, typeof(int) const *: 1, default: 2) != 1)
+        return 3;
+    /* An unqualified typeof still names the unqualified type. */
+    if (_Generic(p, typeof(int) *: 1, default: 2) != 2)
+        return 4;
+    if (sizeof(_Atomic(int) const) != sizeof(int))
+        return 5;
+    if (sizeof(typeof(short) volatile) != sizeof(short))
+        return 6;
+    return 0;
+}
+"#;
+    run_everywhere("type_name_keeps_qualifiers_around_typeof", src);
+}
+
+/// `typeof(int[n])` in a declaration names a variable length array whose
+/// extent is `n`, as it does in `sizeof`. The declaration specifiers parsed
+/// the operand with the type-name parser that drops variably modified
+/// extents, so `typeof(int[n]) a;` declared an `int[]` and `sizeof a` was
+/// rejected as incomplete. The extent is evaluated once, at the specifier.
+#[test]
+fn codegen_typeof_vla_declaration_keeps_its_extent() {
+    let src = r#"
+static int calls;
+static int next(int n) { calls++; return n; }
+
+static int probe(int n)
+{
+    typeof(int[n]) a;
+    __typeof__(char[n][3]) b;
+    typeof(int[next(n)]) c;
+    if (sizeof a != n * sizeof(int))
+        return 1;
+    if (sizeof b != (unsigned long)n * 3)
+        return 2;
+    if (sizeof c != n * sizeof(int))
+        return 3;
+    for (int i = 0; i < n; i++)
+        a[i] = i * 7;
+    for (int i = 0; i < n; i++)
+        if (a[i] != i * 7)
+            return 4;
+    return 0;
+}
+
+int main(void)
+{
+    int r = probe(5);
+    if (r)
+        return r;
+    r = probe(11);
+    if (r)
+        return 10 + r;
+    if (calls != 2)
+        return 20;
+    return 0;
+}
+"#;
+    run_everywhere("typeof_vla_declaration_keeps_its_extent", src);
+}
+
+/// A typedef name is a type specifier only when no other type specifier has
+/// been given (C17 6.7.2p2), so `unsigned T = ..` declares a variable named
+/// `T`. `unsigned` sets no base type of its own, and the typedef-name test
+/// asked only for one, so `T` was taken as the type and the declaration
+/// failed for want of a declarator.
+#[test]
+fn codegen_typedef_name_after_type_specifier_is_declared() {
+    let src = r#"
+typedef char T;
+
+int f(void)
+{
+    /* `T` here is the name being declared, an unsigned int hiding the
+       typedef -- not a second type specifier. */
+    unsigned T = 3000000000u;
+    if (T != 3000000000u)
+        return 1;
+    if (sizeof T != sizeof(unsigned int))
+        return 2;
+    return 0;
+}
+
+int g(void)
+{
+    const T c = 'x';   /* a qualifier is not a type specifier */
+    return sizeof c == 1 && c == 'x' ? 0 : 3;
+}
+
+int main(void)
+{
+    int r = f();
+    if (r)
+        return r;
+    return g();
+}
+"#;
+    run_everywhere("typedef_name_after_type_specifier_is_declared", src);
+}
+
+/// C17 6.7p1 lets declaration specifiers appear in any order, so a qualifier
+/// or storage class may follow `typeof(..)`, `_Atomic(..)` or an enum
+/// specifier as it may follow `int`. Those arms returned as soon as their
+/// type was parsed (the enum arm consumed qualifiers only), and the next
+/// specifier was read as the declarator's name. The block-scope `static`
+/// enum must keep its value across calls.
+#[test]
+fn codegen_specifiers_may_follow_a_complete_type_specifier() {
+    let src = r#"
+typeof(int) const x = 1;
+_Atomic(int) const y = 2;
+enum E { A = 3, B } static e = B;
+struct S { int v; } __attribute__((unused)) static s = { 5 };
+
+static int counter(void)
+{
+    enum { Z, LAST = 100 } static n;    /* static: keeps its value */
+    return ++n;
+}
+
+int main(void)
+{
+    if (x != 1 || y != 2 || e != B || s.v != 5)
+        return 1;
+    if (_Generic(&x, const int *: 0, default: 1))
+        return 2;
+    counter();
+    counter();
+    if (counter() != 3)
+        return 3;
+    typeof(long) volatile static w = 7;
+    if (w != 7 || sizeof w != sizeof(long))
+        return 4;
+    return 0;
+}
+"#;
+    run_everywhere("specifiers_may_follow_a_complete_type_specifier", src);
+}
+
+/// The declaration specifiers are evaluated once per declaration, however
+/// many declarators share them, so in `typeof(int[n++]) a, b;` gcc increments
+/// `n` once and gives `a` and `b` one extent. c17 copied the size expression
+/// into every declarator and evaluated it once each: `n` ended at 5 and `b`
+/// was a different size from `a`. Also covered: a call as the extent, derived
+/// declarators, a `for`-init, re-evaluation each time a loop reaches the
+/// declaration, and `sizeof(typeof(int[n++]))` evaluating its operand once.
+#[test]
+fn codegen_typeof_vla_extent_is_evaluated_once_per_declaration() {
+    let src = r#"
+static int calls;
+static int bump(int *p) { calls++; return (*p)++; }
+
+static int one_declaration(void)
+{
+    int n = 3;
+    /* One declaration, one evaluation: both objects get extent 3. */
+    typeof(int[n++]) a, b;
+    if (n != 4 || sizeof a != 3 * sizeof(int) || sizeof b != sizeof a)
+        return 1;
+    /* A function call as the extent, three declarators, a pointer and an
+       array of the specifier type among them. */
+    typeof(char[bump(&n)]) c, *pc = &c, d[2];
+    if (calls != 1 || n != 5)
+        return 2;
+    if (sizeof c != 4 || sizeof *pc != 4 || sizeof d != 8)
+        return 3;
+    /* Qualified, two-dimensional, constant inner level. */
+    volatile typeof(short[n++][2]) e, f;
+    if (n != 6 || sizeof e != 5 * 2 * sizeof(short) || sizeof f != sizeof e)
+        return 4;
+    /* A later change to n does not resize what was already declared. */
+    n = 100;
+    if (sizeof a != 3 * sizeof(int) || sizeof b != 3 * sizeof(int))
+        return 5;
+    /* Each object is writable across its whole extent. */
+    for (int i = 0; i < 3; i++)
+        a[i] = b[i] = i + 1;
+    if (a[2] + b[2] != 6)
+        return 6;
+    (void)e; (void)f;
+    return 0;
+}
+
+static int for_init(void)
+{
+    int n = 2, total = 0;
+    for (typeof(int[n++]) x, y; total == 0; total++) {
+        if (n != 3 || sizeof x != 2 * sizeof(int) || sizeof y != sizeof x)
+            return 10;
+    }
+    return 0;
+}
+
+static int in_a_loop(void)
+{
+    /* Reached three times, evaluated three times -- once each. */
+    int n = 1;
+    for (int k = 0; k < 3; k++) {
+        typeof(long[n++]) p, q;
+        if (sizeof p != (unsigned long)(k + 1) * sizeof(long) || sizeof q != sizeof p)
+            return 20 + k;
+    }
+    return n == 4 ? 0 : 23;
+}
+
+static int sizeof_once(void)
+{
+    int n = 7;
+    unsigned long s = sizeof(typeof(int[n++]));
+    if (s != 7 * sizeof(int) || n != 8)
+        return 30;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = one_declaration()) || (r = for_init()) || (r = in_a_loop()) || (r = sizeof_once()))
+        return r;
+    return 0;
+}
+"#;
+    run_everywhere("typeof_vla_extent_evaluated_once", src);
+}
+
+/// `int (*p[n]);` is an array of `n` pointers: the extent sits in the grouped
+/// inner declarator, and `parse_declarator` dropped every inner extent, so the
+/// array came out incomplete and `sizeof p` was refused.
+#[test]
+fn codegen_vla_extent_inside_a_grouped_declarator() {
+    let src = r#"
+static int grouped(int n)
+{
+    int v = 5;
+    int (*p[n]);
+    if (sizeof p != (unsigned long)n * sizeof(int *))
+        return 1;
+    for (int i = 0; i < n; i++)
+        p[i] = &v;
+    return *p[n - 1] == 5 ? 0 : 2;
+}
+
+int main(void)
+{
+    return grouped(3);
+}
+"#;
+    run_everywhere("vla_extent_in_grouped_declarator", src);
+}
+
+/// `noreturn` belongs to the function *type*, since that is what a call site
+/// reads. Only the first plain file-scope declarator put it there, so a
+/// grouped, later or block-scope declarator produced a function the caller
+/// believed could return -- visible at -O2 as the code after the call
+/// surviving.
+#[test]
+fn codegen_noreturn_reaches_the_type_from_every_declarator() {
+    let shapes = [
+        ("first", "void f(void) __attribute__((noreturn));\n", ""),
+        ("grouped", "void (f)(void) __attribute__((noreturn));\n", ""),
+        ("later", "int x, f(void) __attribute__((noreturn));\n", ""),
+        ("block", "", "void f(void) __attribute__((noreturn));"),
+        ("block_keyword", "", "_Noreturn void f(void);"),
+        // Written among the specifiers, the attribute belongs to every
+        // declarator of the list, as gcc has it.
+        (
+            "specifier",
+            "__attribute__((noreturn)) void e(void), f(void);\n",
+            "",
+        ),
+        // And a prototype's attribute carries to a later redeclaration.
+        (
+            "redeclared",
+            "void f(void) __attribute__((noreturn));\nvoid f(void);\n",
+            "",
+        ),
+    ];
+    for (name, file_decl, block_decl) in shapes {
+        let src = format!("{file_decl}int g(void) {{ {block_decl} f(); return 12345; }}\n");
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            let asm = asm_for_with(&format!("noreturn_{name}"), triple, &src, &["-O2"]);
+            assert!(
+                !body_of(&asm, "g").contains("12345"),
+                "{name} on {triple}: the code after a noreturn call must be dead:\n{asm}"
+            );
+        }
+    }
+    // The controls: without the attribute the return survives, so the probe
+    // above can fail -- and an attribute on a *parameter* is the parameter's,
+    // not the function's.
+    for (name, decl, call) in [
+        ("noreturn_control", "void f(void);", "f()"),
+        (
+            "noreturn_param",
+            "void f(void (*cb)(void) __attribute__((noreturn)));",
+            "f(0)",
+        ),
+    ] {
+        let src = format!("{decl}\nint g(void) {{ {call}; return 12345; }}\n");
+        let asm = asm_for_with(name, X86_64_LINUX, &src, &["-O2"]);
+        assert!(body_of(&asm, "g").contains("12345"), "{name}:\n{asm}");
+    }
+}
+
+/// A `static _Thread_local` local is thread-local whatever its type. The
+/// block-scope path asked the declarator's *type* for `_Thread_local`, and a
+/// structure's type is its tag's, which never carries a storage class -- so
+/// `static _Thread_local struct S s;` became an ordinary static, one object
+/// shared by every thread.
+#[test]
+fn codegen_static_thread_local_struct_local_is_per_thread() {
+    let src = r#"
+#include <pthread.h>
+
+struct S { int a; };
+
+static int *mine(void)
+{
+    static _Thread_local struct S s;
+    return &s.a;
+}
+
+/* Compare values, not addresses: once a thread exits its copy is freed, and
+   on Darwin, where thread-local storage is allocated on first use, main's
+   copy can then land at the same address. */
+static void *other(void *arg)
+{
+    (void)arg;
+    int *p = mine();
+    if (*p != 0)
+        return (void *)1;       /* a fresh copy starts at zero */
+    *p = 2;
+    return (void *)(long)*mine();
+}
+
+int main(void)
+{
+    pthread_t t;
+    void *theirs;
+    *mine() = 1;
+    if (pthread_create(&t, 0, other, 0) != 0)
+        return 1;
+    if (pthread_join(t, &theirs) != 0)
+        return 2;
+    if (theirs != (void *)2)
+        return 3;               /* the thread did not keep its own write */
+    return *mine() == 1 ? 0 : 4;  /* main's copy is untouched */
+}
+"#;
+    // The host only: `<pthread.h>` is a host header.
+    for opts in [vec![], vec!["-O2".to_string()]] {
+        assert_eq!(
+            compile_and_run("static_thread_local_struct_local", src, &opts),
+            0,
+            "{opts:?}"
+        );
     }
 }

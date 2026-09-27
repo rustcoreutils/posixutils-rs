@@ -1508,6 +1508,48 @@ no
     }
 }
 
+/// A prefixed constant has its type's signedness in `#if` (C17 6.10.1p4):
+/// `char16_t` and `char32_t` are unsigned everywhere and `wchar_t` is
+/// unsigned on aarch64 Linux, so `X'\0' - 1 > 0` there -- the test glibc's
+/// <bits/wchar.h> uses to find WCHAR_MIN. Answers match gcc's on both Linux
+/// targets. The macros say the same as the constants.
+#[test]
+fn test_if_prefixed_constants_have_their_types_signedness() {
+    use crate::target::{Arch, Os};
+    let code = "#if L'\\0' - 1 > 0
+w_unsigned
+#endif
+#if u'\\0' - 1 > 0
+u_unsigned
+#endif
+#if U'\\0' - 1 > 0
+U_unsigned
+#endif
+#if __WCHAR_MIN__ == 0 && __WCHAR_MAX__ == 0xffffffffU
+wmacro_unsigned
+#endif
+#if __WCHAR_MIN__ < 0 && __WCHAR_MAX__ == 0x7fffffff
+wmacro_signed
+#endif";
+    for (arch, os, wchar_unsigned) in [
+        (Arch::X86_64, Os::Linux, false),
+        (Arch::X86_64, Os::MacOS, false),
+        (Arch::Aarch64, Os::Linux, true),
+        (Arch::Aarch64, Os::FreeBSD, true),
+        (Arch::Aarch64, Os::MacOS, false),
+    ] {
+        let target = Target::new(arch, os);
+        let (tokens, idents) = preprocess_str_for(code, &target);
+        let strs = get_token_strings(&tokens, &idents);
+        let want: &[&str] = if wchar_unsigned {
+            &["w_unsigned", "u_unsigned", "U_unsigned", "wmacro_unsigned"]
+        } else {
+            &["u_unsigned", "U_unsigned", "wmacro_signed"]
+        };
+        assert_eq!(strs, want, "{arch}-{os}");
+    }
+}
+
 /// gcc packs a multi-character constant big-endian into `int` and lets it
 /// wrap, so a five-byte constant keeps only its last four bytes.
 #[test]

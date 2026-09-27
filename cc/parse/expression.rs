@@ -1507,8 +1507,7 @@ impl<'a> Parser<'a> {
                     start_pos,
                 ))
             }
-            // wchar_t[N] — int on the targets here. Like char16_t/char32_t
-            // below, its elements are code points rather than bytes, so the
+            // wchar_t[N]. Like char16_t/char32_t below, its elements are code points rather than bytes, so the
             // UTF-8 the lexer preserved is decoded here. Taking `bytes`
             // straight through instead gave `L"café"` five elements, the first
             // two being the halves of the UTF-8 pair.
@@ -1516,7 +1515,7 @@ impl<'a> Parser<'a> {
                 let units = literal::literal_wide_chars(&elements);
                 let wstr_type = self
                     .types
-                    .intern(Type::array(self.types.int_id, units.len() + 1));
+                    .intern(Type::array(self.types.wchar_id, units.len() + 1));
                 // `WideStringLit` carries one `char` per element.
                 let text: String = units
                     .iter()
@@ -1541,7 +1540,7 @@ impl<'a> Parser<'a> {
                     let units: Vec<u16> = text.encode_utf16().collect();
                     let t = self
                         .types
-                        .intern(Type::array(self.types.ushort_id, units.len() + 1));
+                        .intern(Type::array(self.types.char16_id, units.len() + 1));
                     Ok(Self::typed_expr(
                         ExprKind::Utf16StringLit(units),
                         t,
@@ -1551,7 +1550,7 @@ impl<'a> Parser<'a> {
                     let units: Vec<u32> = text.chars().map(|c| c as u32).collect();
                     let t = self
                         .types
-                        .intern(Type::array(self.types.uint_id, units.len() + 1));
+                        .intern(Type::array(self.types.char32_id, units.len() + 1));
                     Ok(Self::typed_expr(
                         ExprKind::Utf32StringLit(units),
                         t,
@@ -2251,14 +2250,16 @@ impl<'a> Parser<'a> {
                         // signedness: `L'\x80'` is 128, not -128.
                         let (code_point, _) =
                             literal::char_literal_value(s, true, self.current_pos());
-                        let (typ, value) = match kind {
-                            // wchar_t is int on the targets here.
-                            TokenType::WideChar => (self.types.int_id, code_point as i32 as i64),
-                            TokenType::Utf16Char => {
-                                (self.types.ushort_id, code_point as u16 as i64)
-                            }
-                            _ => (self.types.uint_id, code_point as i64),
+                        let typ = match kind {
+                            TokenType::WideChar => self.types.wchar_id,
+                            TokenType::Utf16Char => self.types.char16_id,
+                            _ => self.types.char32_id,
                         };
+                        let value = literal::prefixed_char_value(
+                            code_point,
+                            self.types.size_bits(typ),
+                            !self.types.is_unsigned(typ),
+                        );
                         Ok(Self::typed_expr(ExprKind::CharLit(value), typ, token_pos))
                     }
                     _ => Err(ParseError::new("invalid character token", token.pos)),

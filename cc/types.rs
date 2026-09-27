@@ -11,7 +11,7 @@
 
 use crate::float::{ComplexRoutineFormat, FpFormat};
 use crate::strings::{StringId, StringTable as IdentTable};
-use crate::target::{Arch, CharSignedness, Os, Target};
+use crate::target::{Arch, CharSignedness, IntType, Os, Target};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -815,6 +815,12 @@ pub struct TypeTable {
     pub longdouble_id: TypeId,
     pub float16_id: TypeId,
     pub float128_id: TypeId,
+    /// `wchar_t`, `char16_t` and `char32_t`: the types of the `L`, `u` and
+    /// `U` prefixed literals, as [`Target`] decides them. Each is one of the
+    /// integer types above, not a type of its own.
+    pub wchar_id: TypeId,
+    pub char16_id: TypeId,
+    pub char32_id: TypeId,
     /// Every arithmetic base type paired with its `_Complex` counterpart.
     ///
     /// [`Self::make_complex`] takes `&self`, so it cannot intern on demand,
@@ -875,6 +881,9 @@ impl TypeTable {
             longdouble_id: TypeId::INVALID,
             float16_id: TypeId::INVALID,
             float128_id: TypeId::INVALID,
+            wchar_id: TypeId::INVALID,
+            char16_id: TypeId::INVALID,
+            char32_id: TypeId::INVALID,
             complex_of: std::collections::HashMap::new(),
             complex_float_id: TypeId::INVALID,
             complex_double_id: TypeId::INVALID,
@@ -922,6 +931,9 @@ impl TypeTable {
         table.longdouble_id = table.intern(Type::basic(TypeKind::LongDouble));
         table.float16_id = table.intern(Type::basic(TypeKind::Float16));
         table.float128_id = table.intern(Type::basic(TypeKind::Float128));
+        table.wchar_id = table.int_type_id(target.wchar_type());
+        table.char16_id = table.int_type_id(target.char16_type());
+        table.char32_id = table.int_type_id(target.char32_type());
 
         // Pre-intern complex types
         table.complex_float_id = table.intern(Type::with_modifiers(
@@ -988,6 +1000,22 @@ impl TypeTable {
         table.char_ptr_id = table.intern(Type::pointer(table.char_id));
 
         table
+    }
+
+    /// The type a [`Target`]'s ABI choice names.
+    pub fn int_type_id(&self, t: IntType) -> TypeId {
+        match t {
+            IntType::SChar => self.schar_id,
+            IntType::UChar => self.uchar_id,
+            IntType::Short => self.short_id,
+            IntType::UShort => self.ushort_id,
+            IntType::Int => self.int_id,
+            IntType::UInt => self.uint_id,
+            IntType::Long => self.long_id,
+            IntType::ULong => self.ulong_id,
+            IntType::LongLong => self.longlong_id,
+            IntType::ULongLong => self.ulonglong_id,
+        }
     }
 
     /// A fresh identity for a tagless composite definition; see

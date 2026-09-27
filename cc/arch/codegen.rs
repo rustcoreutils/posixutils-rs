@@ -659,7 +659,8 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 }
             }
             Initializer::WideString(s) => {
-                // Emit wide string as sequence of 4-byte values (wchar_t = int)
+                // Emit wide string as sequence of 4-byte values (wchar_t is 4 bytes
+                // on every target, `int` or `unsigned int` by the ABI)
                 // -- at most as many as fit, for the reason `String` truncates.
                 // A flexible array member has no bound; see `String`.
                 let room = if size == 0 { usize::MAX } else { size / 4 };
@@ -856,14 +857,15 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     }
 
     /// Emit wide string literals to the rodata section
-    /// Each character is output as a 4-byte value (wchar_t = int = 4 bytes)
+    /// Each character is output as a 4-byte value: `wchar_t` is 4 bytes on
+    /// every target, `int` or `unsigned int` by the ABI
     pub fn emit_wide_strings(&mut self, wide_strings: &[(String, String)]) {
         if wide_strings.is_empty() {
             return;
         }
 
         self.push_directive(Directive::Rodata);
-        // wchar_t is a 4-byte int: two, as a power of two.
+        // wchar_t is 4 bytes: two, as a power of two.
         self.push_directive(Directive::Align(2));
 
         for (label, content) in wide_strings {

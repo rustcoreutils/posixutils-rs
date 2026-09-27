@@ -144,8 +144,10 @@ impl CharSignedness {
 /// same width -- `int64_t` is `long` on glibc and `long long` on Darwin -- so
 /// [`Target`] decides each one, in one place, and everything that describes
 /// the type is derived from it: the `__*_TYPE__` spelling, its limits, its
-/// constant suffix and its `printf` length modifier. Hand-typing those per
-/// macro is how `__INT64_MAX__` came to say `LL` for a `long`.
+/// constant suffix and its `printf` length modifier -- and, for `wchar_t`,
+/// `char16_t` and `char32_t`, the type the parser gives a prefixed literal.
+/// Hand-typing those per macro is how `__INT64_MAX__` came to say `LL` for a
+/// `long`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntType {
     SChar,
@@ -409,8 +411,18 @@ impl Target {
 
     /// `wchar_t` (C17 7.19), the type of a wide character constant and the
     /// element type of a wide string literal (6.4.4.4p10, 6.4.5p6).
+    ///
+    /// AAPCS64 makes it `unsigned int` (its "Arm C and C++ language
+    /// mappings"), and Linux and FreeBSD follow it; Apple arm64 departs and
+    /// makes it `int`, as x86-64 is everywhere. The type system, the
+    /// predefines and `#if` all read this answer, so `L'\xffffffff' > 0`,
+    /// `(wchar_t)-1 > 0` and `WCHAR_MIN == 0` agree with gcc on aarch64
+    /// Linux.
     pub fn wchar_type(&self) -> IntType {
-        IntType::Int
+        match (self.arch, self.os) {
+            (Arch::Aarch64, Os::Linux | Os::FreeBSD) => IntType::UInt,
+            (Arch::Aarch64, Os::MacOS) | (Arch::X86_64, _) => IntType::Int,
+        }
     }
 
     /// `wint_t` (C17 7.29.1), which has to hold every `wchar_t` value *plus*
@@ -666,6 +678,22 @@ mod tests {
             (Arch::Aarch64, Os::MacOS, Signed),
         ] {
             assert_eq!(Target::new(arch, os).plain_char, want, "{arch}-{os}");
+        }
+    }
+
+    /// `wchar_t` is unsigned under AAPCS64, which Linux and FreeBSD follow,
+    /// and signed on Apple arm64 and on x86-64.
+    #[test]
+    fn test_wchar_type_per_target() {
+        for (arch, os, want) in [
+            (Arch::X86_64, Os::Linux, IntType::Int),
+            (Arch::X86_64, Os::MacOS, IntType::Int),
+            (Arch::X86_64, Os::FreeBSD, IntType::Int),
+            (Arch::Aarch64, Os::Linux, IntType::UInt),
+            (Arch::Aarch64, Os::FreeBSD, IntType::UInt),
+            (Arch::Aarch64, Os::MacOS, IntType::Int),
+        ] {
+            assert_eq!(Target::new(arch, os).wchar_type(), want, "{arch}-{os}");
         }
     }
 

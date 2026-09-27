@@ -4469,12 +4469,12 @@ fn test_wide_string_literal_basic() {
         }
         _ => panic!("Expected WideStringLit, got {:?}", expr.kind),
     }
-    // Type should be wchar_t[N] (int[N] on this platform), not wchar_t*
+    // Type should be wchar_t[N], not wchar_t*
     // C11 6.4.5: "wide string literal has type wchar_t[N]"
     let typ = expr.typ.unwrap();
     assert_eq!(types.kind(typ), TypeKind::Array);
     let elem_type = types.get(typ).base.unwrap();
-    assert_eq!(types.kind(elem_type), TypeKind::Int);
+    assert_eq!(elem_type, types.wchar_id);
     // Array size should be 6 (5 chars + null terminator)
     assert_eq!(types.array_size(typ), Some(6));
 }
@@ -5679,8 +5679,42 @@ fn test_builtin_expect_with_expression() {
 fn test_wide_char_literal() {
     let (expr, types, _, _) = parse_expr("L'A'").unwrap();
     assert!(matches!(expr.kind, ExprKind::CharLit(65)));
-    // wchar_t is int on most Unix systems
-    assert_eq!(expr.typ, Some(types.int_id));
+    assert_eq!(expr.typ, Some(types.wchar_id));
+}
+
+/// A prefixed literal takes the target's `wchar_t`, `char16_t` or
+/// `char32_t` -- and `wchar_t` is `unsigned int` under AAPCS64, which Linux
+/// follows, where it was `int` on every target.
+#[test]
+fn test_prefixed_literal_types_follow_the_target() {
+    use crate::target::{Arch, Os};
+    for (arch, os, wchar_unsigned) in [
+        (Arch::X86_64, Os::Linux, false),
+        (Arch::X86_64, Os::MacOS, false),
+        (Arch::Aarch64, Os::Linux, true),
+        (Arch::Aarch64, Os::FreeBSD, true),
+        (Arch::Aarch64, Os::MacOS, false),
+    ] {
+        for src in ["L'A'", "L\"ab\"", "u'A'", "u\"ab\"", "U'A'", "U\"ab\""] {
+            let mut strings = StringTable::new();
+            let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);
+            let tokens = tokenizer.tokenize();
+            let mut symbols = SymbolTable::new();
+            let mut types = TypeTable::new(&Target::new(arch, os));
+            let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+            parser.skip_stream_tokens();
+            let expr = parser.parse_expression().unwrap();
+            let typ = expr.typ.unwrap();
+            let elem = types.base_type(typ).unwrap_or(typ);
+            let (kind, unsigned) = match src.as_bytes()[0] {
+                b'L' => (TypeKind::Int, wchar_unsigned),
+                b'u' => (TypeKind::Short, true),
+                _ => (TypeKind::Int, true),
+            };
+            assert_eq!(types.kind(elem), kind, "{src} on {arch}-{os}");
+            assert_eq!(types.is_unsigned(elem), unsigned, "{src} on {arch}-{os}");
+        }
+    }
 }
 
 #[test]

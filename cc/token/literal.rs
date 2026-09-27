@@ -213,6 +213,22 @@ pub(crate) fn char_literal_value(s: &str, wide: bool, pos: Position) -> (u32, bo
     }
 }
 
+/// The value of a prefixed character constant (`L'x'`, `u'x'`, `U'x'`) whose
+/// code unit is `unit`, in its type -- `bits` wide and `signed` or not, as the
+/// target makes `wchar_t`, `char16_t` or `char32_t` (C17 6.4.4.4p11). A
+/// signed `wchar_t` makes `L'\xffffffff'` -1; an unsigned one, 4294967295.
+///
+/// The parser and `#if` both take the value from here, so the compiled
+/// constant and the controlling expression cannot disagree about it.
+pub(crate) fn prefixed_char_value(unit: u32, bits: u32, signed: bool) -> i64 {
+    let v = u64::from(unit) & (u64::MAX >> (64 - bits));
+    if signed && v >> (bits - 1) == 1 {
+        v as i64 - (1i64 << bits)
+    } else {
+        v as i64
+    }
+}
+
 /// Parse a string literal, converting escape sequences to their actual values.
 /// This implements C99 translation phase 5 for string literals.
 pub(crate) fn parse_string_literal(s: &str) -> Vec<Escaped> {

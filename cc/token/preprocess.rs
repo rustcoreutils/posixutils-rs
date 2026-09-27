@@ -28,7 +28,7 @@ use crate::arch;
 use crate::builtin_headers;
 use crate::diag;
 use crate::os;
-use crate::target::{Target, STDC_VERSION};
+use crate::target::{IntType, Target, STDC_VERSION};
 use gettextrs::gettext;
 
 #[path = "preprocess_directive.rs"]
@@ -2029,10 +2029,13 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
 
         // Handle character literal (any encoding prefix: L'x', u'x', U'x')
         if let Some(tok) = self.current() {
-            let wide = matches!(
-                &tok.value,
-                TokenValue::WideChar(_) | TokenValue::Utf16Char(_) | TokenValue::Utf32Char(_)
-            );
+            let target = self.pp.target;
+            let wide = match &tok.value {
+                TokenValue::WideChar(_) => Some(target.wchar_type()),
+                TokenValue::Utf16Char(_) => Some(target.char16_type()),
+                TokenValue::Utf32Char(_) => Some(target.char32_type()),
+                _ => None,
+            };
             let char_str = match &tok.value {
                 TokenValue::Char(c)
                 | TokenValue::WideChar(c)
@@ -2085,7 +2088,9 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     /// `#if '\0'` came to be *true*. Decoding goes through the same
     /// [`literal`] module the parser uses, so `#if 'c' == V` and the compiled
     /// `'c' == V` cannot disagree.
-    fn char_constant(&mut self, payload: &str, wide: bool, pos: Position) -> PpValue {
+    ///
+    /// `wide` is the type of a prefixed constant, `None` for a plain one.
+    fn char_constant(&mut self, payload: &str, wide: Option<IntType>, pos: Position) -> PpValue {
         let elements = literal::parse_string_literal(payload);
         for e in &elements {
             if let literal::Escaped::ForbiddenUcn(val) = e {
@@ -2101,9 +2106,16 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
 
         // A prefixed constant holds characters, not bytes: `L'\n'` is the one
         // wide character 10, never the two bytes of a UTF-8 encoding.
-        if wide {
+        if let Some(t) = wide {
             let units = literal::literal_wide_chars(&elements);
-            return PpValue::signed(units.first().copied().unwrap_or(0) as i128);
+            let unit = units.first().copied().unwrap_or(0);
+            // It has its type's signedness in `#if` too (6.10.1p4): an
+            // unsigned `wchar_t`, `char16_t` or `char32_t` acts as
+            // `uintmax_t`, so `L'\0' - 1 > 0` is how glibc's <bits/wchar.h>
+            // detects an unsigned `wchar_t`.
+            let bits = self.pp.target.int_width(t);
+            let v = literal::prefixed_char_value(unit, bits, t.is_signed());
+            return PpValue::from_parts(v.into(), !t.is_signed());
         }
 
         // C17 6.4.4.4p10: an ordinary character constant has type `int`. One

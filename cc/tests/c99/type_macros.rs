@@ -244,3 +244,93 @@ fn int_fast_predefines_match_the_platform() {
         ],
     );
 }
+
+/// `wchar_t` is `unsigned int` under AAPCS64, which Linux follows, and `int`
+/// on x86-64 and Apple arm64. c17 made it `int` everywhere -- the predefine,
+/// the type of `L'x'` and of `L"..."`'s elements alike -- so on aarch64 Linux
+/// `(wchar_t)-1 > 0` was false where gcc says true, and WCHAR_MIN was
+/// negative.
+const WCHAR_FOLLOWS_THE_ABI: &str = r#"
+#include <stddef.h>
+#include <stdint.h>
+
+#if defined(__aarch64__) && !defined(__APPLE__)
+#define WCHAR_UNSIGNED 1
+#else
+#define WCHAR_UNSIGNED 0
+#endif
+
+/* glibc's <bits/wchar.h> asks the preprocessor this way. */
+#if L'\0' - 1 > 0
+#define PP_WCHAR_UNSIGNED 1
+#else
+#define PP_WCHAR_UNSIGNED 0
+#endif
+
+int main(void) {
+    if (!_Generic(L'a', wchar_t: 1, default: 0)) return 1;
+    if (!_Generic(L"a"[0], wchar_t: 1, default: 0)) return 2;
+    if (!_Generic(L'a', __WCHAR_TYPE__: 1, default: 0)) return 3;
+    if (((wchar_t)-1 > 0) != WCHAR_UNSIGNED) return 4;
+    if ((L'A' - L'B' > 0) != WCHAR_UNSIGNED) return 5;
+    if (PP_WCHAR_UNSIGNED != WCHAR_UNSIGNED) return 6;
+    if (WCHAR_UNSIGNED) {
+        if (WCHAR_MIN != 0) return 7;
+        if (WCHAR_MAX != 0xffffffffU) return 8;
+    } else {
+        if (WCHAR_MIN != -2147483647 - 1) return 9;
+        if (WCHAR_MAX != 2147483647) return 10;
+    }
+    if (!_Generic(WCHAR_MAX, __typeof__((wchar_t)0 + 0): 1, default: 0)) return 11;
+    if (sizeof(wchar_t) != __SIZEOF_WCHAR_T__) return 12;
+
+    /* A wide literal initializes an array of its own element type. */
+    wchar_t w[] = L"hi";
+    if (sizeof(w) != 3 * sizeof(wchar_t) || w[1] != L'i') return 13;
+    return 0;
+}
+"#;
+
+#[test]
+fn wchar_follows_the_abi() {
+    assert_eq!(
+        compile_and_run("wchar_follows_abi", WCHAR_FOLLOWS_THE_ABI, &[]),
+        0
+    );
+}
+
+#[test]
+fn wchar_follows_the_abi_aarch64() {
+    if let Some(rc) = compile_and_run_aarch64("wchar_follows_abi_a64", WCHAR_FOLLOWS_THE_ABI, "-O0")
+    {
+        assert_eq!(rc, 0);
+    }
+}
+
+/// The predefines agree with gcc's for both Linux targets.
+#[test]
+fn wchar_predefines_match_the_platform() {
+    assert_defines(
+        "x86_64-unknown-linux-gnu",
+        &[
+            "#define __WCHAR_TYPE__ int",
+            "#define __WCHAR_MAX__ 0x7fffffff",
+            "#define __WCHAR_MIN__ (-__WCHAR_MAX__ - 1)",
+        ],
+    );
+    assert_defines(
+        "aarch64-unknown-linux-gnu",
+        &[
+            "#define __WCHAR_TYPE__ unsigned int",
+            "#define __WCHAR_MAX__ 0xffffffffU",
+            "#define __WCHAR_MIN__ 0U",
+        ],
+    );
+    assert_defines(
+        "aarch64-apple-darwin",
+        &[
+            "#define __WCHAR_TYPE__ int",
+            "#define __WCHAR_MIN__ (-__WCHAR_MAX__ - 1)",
+        ],
+    );
+}

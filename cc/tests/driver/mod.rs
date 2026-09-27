@@ -2174,11 +2174,13 @@ fn driver_repeated_flags_are_accepted() {
 #[test]
 fn driver_repeated_flag_last_one_wins() {
     let work = WorkDir::new("last_wins");
-    // A constant branch survives at -O0 and is folded from -O1 up, so the
-    // assembly says which level actually ran.
+    // A branch on a variable that only propagation proves zero survives at
+    // -O0 and is folded from -O1 up, so the assembly says which level
+    // actually ran. (A constant condition would not do: its arm is dropped
+    // at every level.)
     let src = work.write(
         "a.c",
-        "extern int missing(void);\nint f(void){ if (0) return missing(); return 1; }\n",
+        "extern int missing(void);\nint f(void){ int z = 0; if (z) return missing(); return 1; }\n",
     );
     let asm = work.join("a.s");
 

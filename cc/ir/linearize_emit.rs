@@ -52,6 +52,16 @@ struct ComplexHalfOps {
     integral: bool,
 }
 
+/// A controlling expression, evaluated for a branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Controlling {
+    /// A constant expression, and whether it holds: the branch goes one way
+    /// only, and the arm it never takes has no edge into it.
+    Constant(bool),
+    /// A value computed at run time, nonzero when the condition holds.
+    Value(PseudoId),
+}
+
 /// The low-`bit_width` mask for a bit-field value.
 ///
 /// Spelled as a shift of `u64::MAX` rather than `(1 << bit_width) - 1` because
@@ -2110,6 +2120,91 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit_compare_zero(val, typ)
     }
 
+    /// Whether a controlling expression holds, when it is a constant
+    /// expression (C17 6.6) and so decides that by itself.
+    ///
+    /// The one question every construct that branches asks before it emits
+    /// the branch: `if`, the three loops, `?:`, and the left operand of `&&`
+    /// and `||`. gcc's front end folds the same conditions at every level,
+    /// `-O0` included, and emits nothing for the arm one makes unreachable.
+    /// A `const` object is not a constant expression, so `const int k = 0;
+    /// if (k)` keeps its arm, as it does in gcc.
+    pub(crate) fn constant_condition(&self, cond: &Expr) -> Option<bool> {
+        crate::constexpr::eval_truth(self, crate::constexpr::ConstScope::Standard, cond)
+    }
+
+    /// Evaluate a controlling expression for a branch: as the constant it is,
+    /// or as a value computed at run time. See [`Self::constant_condition`].
+    ///
+    /// `0 && g()` is a constant too. C17 6.6p3 admits a call in an operand
+    /// that is not evaluated, and gcc folds the branch -- but the shared walk
+    /// refuses it, because gcc does not make it an *integer* constant
+    /// expression (`int a[0 && g()]` is a VLA there). So the short circuit is
+    /// taken here: a left operand that decides `&&` or `||` decides the
+    /// branch, and one that does not leaves the right operand to decide it.
+    pub(crate) fn controlling_value(&mut self, cond: &Expr) -> Controlling {
+        if let Some(holds) = self.constant_condition(cond) {
+            return Controlling::Constant(holds);
+        }
+        if let ExprKind::Binary {
+            op: op @ (BinaryOp::LogAnd | BinaryOp::LogOr),
+            left,
+            right,
+        } = &cond.kind
+        {
+            // `&&` is decided by a false left operand, `||` by a true one.
+            let decides = *op == BinaryOp::LogOr;
+            match self.constant_condition(left) {
+                Some(holds) if holds == decides => return Controlling::Constant(holds),
+                Some(_) => return self.controlling_value(right),
+                None => {}
+            }
+        }
+        Controlling::Value(self.linearize_condition(cond))
+    }
+
+    /// Branch from the current block to `then_bb` when `cond` holds and to
+    /// `else_bb` when it does not.
+    ///
+    /// A constant condition jumps straight to the block it selects, and the
+    /// other one gets no edge. Nothing else in the linearizer has to know:
+    /// a block that nothing reaches is removed when the function is finished
+    /// (`dce::remove_unreachable_blocks`), and one a label, `case` or `default`
+    /// inside the dead arm still reaches keeps its edge and so survives.
+    pub(crate) fn branch_on(
+        &mut self,
+        cond: Controlling,
+        then_bb: BasicBlockId,
+        else_bb: BasicBlockId,
+    ) {
+        let Some(current) = self.current_bb else {
+            return;
+        };
+        match cond {
+            Controlling::Constant(holds) => {
+                let target = if holds { then_bb } else { else_bb };
+                self.emit(Instruction::br(target));
+                self.link_bb(current, target);
+            }
+            Controlling::Value(val) => {
+                self.emit(Instruction::cbr(val, then_bb, else_bb));
+                self.link_bb(current, then_bb);
+                self.link_bb(current, else_bb);
+            }
+        }
+    }
+
+    /// [`Self::controlling_value`] of `cond`, then [`Self::branch_on`] it.
+    pub(crate) fn branch_on_condition(
+        &mut self,
+        cond: &Expr,
+        then_bb: BasicBlockId,
+        else_bb: BasicBlockId,
+    ) {
+        let cond = self.controlling_value(cond);
+        self.branch_on(cond, then_bb, else_bb);
+    }
+
     /// `val != 0`, read the way `operand_typ` says to read it.
     pub(crate) fn emit_compare_zero(&mut self, val: PseudoId, operand_typ: TypeId) -> PseudoId {
         let result = self.alloc_pseudo();
@@ -2151,7 +2246,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         let merge_bb = self.alloc_bb();
 
         // Evaluate LHS
-        let left_bool = self.linearize_condition(left);
+        let left_cond = self.controlling_value(left);
+        // A constant true LHS always goes on to the RHS, so the merge has no
+        // edge from here.
+        let short_circuits = !matches!(left_cond, Controlling::Constant(true));
 
         // Emit the short-circuit value (0) BEFORE the branch, while still in LHS block
         // This value will be used if we short-circuit (LHS is false)
@@ -2162,9 +2260,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let lhs_end_bb = self.current_bb.unwrap();
 
         // Branch: if LHS is false, go to merge (result = 0); else evaluate RHS
-        self.emit(Instruction::cbr(left_bool, eval_b_bb, merge_bb));
-        self.link_bb(lhs_end_bb, eval_b_bb);
-        self.link_bb(lhs_end_bb, merge_bb);
+        self.branch_on(left_cond, eval_b_bb, merge_bb);
 
         // eval_b_bb: Evaluate RHS
         self.switch_bb(eval_b_bb);
@@ -2190,8 +2286,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             func.add_pseudo(phi_pseudo);
         }
         let mut phi_insn = Instruction::phi(result, result_typ, 32);
-        let phisrc1 = self.emit_phi_source(lhs_end_bb, zero, result, merge_bb, result_typ, 32);
-        phi_insn.phi_list.push((lhs_end_bb, phisrc1));
+        if short_circuits {
+            let phisrc1 = self.emit_phi_source(lhs_end_bb, zero, result, merge_bb, result_typ, 32);
+            phi_insn.phi_list.push((lhs_end_bb, phisrc1));
+        }
         let phisrc2 =
             self.emit_phi_source(rhs_end_bb, right_bool, result, merge_bb, result_typ, 32);
         phi_insn.phi_list.push((rhs_end_bb, phisrc2));
@@ -2211,7 +2309,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         let merge_bb = self.alloc_bb();
 
         // Evaluate LHS
-        let left_bool = self.linearize_condition(left);
+        let left_cond = self.controlling_value(left);
+        // A constant false LHS always goes on to the RHS, so the merge has no
+        // edge from here.
+        let short_circuits = !matches!(left_cond, Controlling::Constant(false));
 
         // Emit the short-circuit value (1) BEFORE the branch, while still in LHS block
         // This value will be used if we short-circuit (LHS is true)
@@ -2222,9 +2323,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let lhs_end_bb = self.current_bb.unwrap();
 
         // Branch: if LHS is true, go to merge (result = 1); else evaluate RHS
-        self.emit(Instruction::cbr(left_bool, merge_bb, eval_b_bb));
-        self.link_bb(lhs_end_bb, merge_bb);
-        self.link_bb(lhs_end_bb, eval_b_bb);
+        self.branch_on(left_cond, merge_bb, eval_b_bb);
 
         // eval_b_bb: Evaluate RHS
         self.switch_bb(eval_b_bb);
@@ -2250,8 +2349,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             func.add_pseudo(phi_pseudo);
         }
         let mut phi_insn = Instruction::phi(result, result_typ, 32);
-        let phisrc1 = self.emit_phi_source(lhs_end_bb, one, result, merge_bb, result_typ, 32);
-        phi_insn.phi_list.push((lhs_end_bb, phisrc1));
+        if short_circuits {
+            let phisrc1 = self.emit_phi_source(lhs_end_bb, one, result, merge_bb, result_typ, 32);
+            phi_insn.phi_list.push((lhs_end_bb, phisrc1));
+        }
         let phisrc2 =
             self.emit_phi_source(rhs_end_bb, right_bool, result, merge_bb, result_typ, 32);
         phi_insn.phi_list.push((rhs_end_bb, phisrc2));

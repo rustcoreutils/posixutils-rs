@@ -8174,3 +8174,25 @@ fn test_complex_equality_is_a_constant_expression() {
         panic!("should have parsed: {e}");
     }
 }
+
+/// `__builtin_constant_p` of something the parser cannot fold is 0 at once
+/// at `-O0`, where no optimizer will run to prove it constant, and deferred
+/// once optimizing. A constant operand answers 1 at every level.
+#[test]
+fn test_constant_p_at_o0_answers_zero() {
+    let o0 = super::LibraryCallPolicy {
+        optimizing: false,
+        math_errno: true,
+    };
+    let (expr, _, _, _) = parse_expr_under("__builtin_constant_p(n)", &["n"], o0).unwrap();
+    assert!(matches!(expr.kind, ExprKind::IntLit(0)), "{:?}", expr.kind);
+    let (expr, _, _, _) = parse_expr_under("__builtin_constant_p(3)", &[], o0).unwrap();
+    assert!(matches!(expr.kind, ExprKind::IntLit(1)), "{:?}", expr.kind);
+    let (expr, _, _, _) =
+        parse_expr_under("__builtin_constant_p(n)", &["n"], Default::default()).unwrap();
+    assert!(
+        matches!(expr.kind, ExprKind::ConstantP(_)),
+        "{:?}",
+        expr.kind
+    );
+}

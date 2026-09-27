@@ -64,6 +64,33 @@ literals — `"What??!"` becomes `"What|"` — and `??` is far likelier to appea
 by accident than by intent; gcc and clang default them off for the same reason.
 `git log --grep '#C55'` has the record.
 
+### Unreachable code is not emitted, at any level
+
+**Settled.** It replaces an earlier record that `-O0` kept the arm of a
+constant branch.
+
+At every level, `-O0` included, c17 emits nothing for code that no path
+reaches. That covers the arm of an `if`, `?:`, `while`, `for`, `do` or
+`switch` whose controlling expression is a constant expression, the right
+operand of a `&&` or `||` whose left operand decides it, and whatever follows
+a `return`, `break`, `continue` or `goto` up to the next label. A block that a
+label, `case` or `default` reaches is kept, and so is one whose address is
+taken. In `if (0) { f(); case 1: g(); }` only `f()` goes. At `-O0`,
+`__builtin_constant_p` of anything not already a constant is 0 straight away,
+so a branch on it folds too.
+
+gcc does the same. Its front end folds the condition and its CFG cleanup,
+which runs at every level, deletes what the fold cut off. Programs rely on
+this: gcc.c-torture's `link_error` tests call a function that exists nowhere
+from such an arm. What is lost is a breakpoint on a dead line, which gcc loses
+as well.
+
+The condition has to be a constant expression, asked through the shared walk
+(`constexpr::eval_truth`). A `const` object does not qualify, so
+`const int k = 0; if (k)` keeps its arm, as in gcc. Unlike gcc, c17 does not
+fold `&x == 0`, `(g(), 0)` or `g() && 0`: none of them is a constant
+expression.
+
 ## Known Divergences
 
 ### `_Generic` on a wide bit-field expression
@@ -94,7 +121,6 @@ does or claims.
 | Non-NFC identifiers | GCC warns `-Wnormalized=` when an identifier is not in Normalization Form C; c17 is silent. A diagnostic-quality gap, not a conformance one -- both compile the same program |
 | `#__VA_ARGS__` spacing | `V(a , b)` stringifies as `"a, b"`; gcc gives `"a , b"`. The separating comma's own spacing is discarded by the argument splitter. Pinned by `preprocessor_va_args_loses_space_before_a_separator` |
 | Darwin: an over-aligned variadic aggregate | clang disagrees with itself, so no compiler satisfies this in both directions. Measured on macOS CI: its caller stacks the aggregate at the next eight-byte granule and its `va_arg` rounds the cursor up to the type's own alignment, reading somewhere else. A program built entirely with clang has the same defect. c17 follows `va_arg` -- its caller realigns the outgoing area so the argument really is that aligned -- which means a c17 caller reaches a clang callee and a clang caller does not reach a c17 callee. `codegen_over_aligned_argument_area` therefore does not put this shape through its host-compiler cross-check on Apple; the pure-c17 runs still cover it at every optimization level |
-| A constant branch at `-O0` | c17 runs no optimizer at `-O0`, so `if (0) { ... }` keeps its arm; gcc folds it in a CFG cleanup it runs at every level. Deliberate: `-O0` output stays a faithful transcription of the source, so a breakpoint in a dead arm still has somewhere to land. The visible cost is that `20030330-1` and `medce-1` link at `-O1` and above and not at `-O0` |
 | `max_align_t` | `long double` here (16 bytes), a struct of `long long` + `long double` under gcc (32). Both meet the alignment requirement; `sizeof` differs. Implementation-defined (C17 7.19) |
 
 ## GNU extensions: what c17 will and will not grow

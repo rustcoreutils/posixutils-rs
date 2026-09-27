@@ -4300,6 +4300,7 @@ execute/20030316-1@-O0
 execute/20030316-1@-O2
 execute/20030323-1@-O0
 execute/20030323-1@-O2
+execute/20030330-1@-O0
 execute/20030330-1@-O2
 execute/20030401-1@-O0
 execute/20030401-1@-O2
@@ -5578,6 +5579,7 @@ execute/mayalias-2@-O0
 execute/mayalias-2@-O2
 execute/mayalias-3@-O0
 execute/mayalias-3@-O2
+execute/medce-1@-O0
 execute/medce-1@-O2
 execute/memchr-1@-O0
 execute/memchr-1@-O2

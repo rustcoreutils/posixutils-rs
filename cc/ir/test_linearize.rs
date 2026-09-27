@@ -1807,9 +1807,120 @@ fn test_linearize_if() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
 
+    // A constant condition jumps straight to the arm it selects, and the
+    // other arm is not emitted at all.
     let module = test_linearize(&tu, &types, &strings);
     let ir = format!("{}", module.display(&types));
-    assert!(ir.contains("cbr")); // Conditional branch
+    assert!(!ir.contains("cbr"), "{ir}");
+    let rets = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| i.op == Opcode::Ret)
+        .count();
+    assert_eq!(rets, 1, "only the taken arm's return is emitted\n{ir}");
+}
+
+/// The functions `f` in `module` calls, by name.
+fn calls_in(module: &Module, f: &str) -> Vec<String> {
+    let func = module.functions.iter().find(|x| x.name == f).unwrap();
+    func.blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| i.op == Opcode::Call)
+        .filter_map(|i| i.func_name.clone())
+        .collect()
+}
+
+/// Whether `f` in `module` has any conditional branch or switch left.
+fn still_branches(module: &Module, f: &str) -> bool {
+    let func = module.functions.iter().find(|x| x.name == f).unwrap();
+    func.blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .any(|i| matches!(i.op, Opcode::Cbr | Opcode::Switch))
+}
+
+/// Each construct that branches on a constant emits only the arm it takes,
+/// with no conditional branch left behind: `if`, the loops, `?:`, the
+/// short circuits, `switch`, and a floating condition decided exactly (a NaN is
+/// unequal to itself; -0.0 equals 0.0).
+#[test]
+fn test_constant_condition_emits_only_the_taken_arm() {
+    let src = "void dead(void); void live(void); int g(void);\n\
+               void f_if(void) { if (0) dead(); else live(); }\n\
+               void f_while(void) { while (0) dead(); live(); }\n\
+               void f_do(void) { do live(); while (0); }\n\
+               void f_for(void) { for (; 0;) dead(); live(); }\n\
+               void f_and(void) { if (0 && g()) dead(); else live(); }\n\
+               void f_or(void) { if (1 || g()) live(); else dead(); }\n\
+               void f_and_rest(void) { if (1 && 0) dead(); live(); }\n\
+               int f_value(void) { return 0 && (dead(), 1); }\n\
+               void f_nan(void) { if (__builtin_nan(\"\") != __builtin_nan(\"\")) live(); else dead(); }\n\
+               void f_zero(void) { if (-0.0 == 0.0) live(); else dead(); }\n\
+               void f_ternary(void) { 0.5 ? live() : dead(); }\n\
+               void f_return(void) { live(); return; dead(); }\n\
+               void f_break(void) { for (;;) { live(); break; dead(); } }\n\
+               void f_switch(void) { switch (1) { case 0: dead(); break; case 1: live(); } }\n";
+    let module = linearize_source(src, &Target::host());
+    for f in [
+        "f_if",
+        "f_while",
+        "f_do",
+        "f_for",
+        "f_and",
+        "f_or",
+        "f_and_rest",
+        "f_value",
+        "f_nan",
+        "f_zero",
+        "f_ternary",
+        "f_return",
+        "f_break",
+        "f_switch",
+    ] {
+        let calls = calls_in(&module, f);
+        assert!(!calls.iter().any(|c| c == "dead"), "{f}: {calls:?}");
+        assert!(
+            !still_branches(&module, f),
+            "{f} still branches on a constant"
+        );
+    }
+    for f in [
+        "f_if", "f_while", "f_do", "f_for", "f_and", "f_or", "f_nan", "f_zero",
+    ] {
+        assert!(calls_in(&module, f).iter().any(|c| c == "live"), "{f}");
+    }
+}
+
+/// Only a constant expression decides a branch. A `const` object is not one,
+/// and neither is a condition whose first operand must run.
+#[test]
+fn test_constant_condition_needs_a_constant_expression() {
+    let src = "void maybe(void); int g(void);\n\
+               void f_const(void) { const int k = 0; if (k) maybe(); }\n\
+               void f_call(void) { if (g() && 0) maybe(); }\n";
+    let module = linearize_source(src, &Target::host());
+    for f in ["f_const", "f_call"] {
+        assert!(still_branches(&module, f), "{f} must still branch");
+        assert!(calls_in(&module, f).iter().any(|c| c == "maybe"), "{f}");
+    }
+}
+
+/// A block inside a dead arm that a label, a `case` or a `default` reaches
+/// is kept, and only the code in front of the label is dropped
+/// (gcc.c-torture medce-1).
+#[test]
+fn test_constant_condition_keeps_what_a_label_reaches() {
+    let src = "void dead(void); void live(void);\n\
+               void f_case(int x) { switch (x) { case 0: if (0) { dead(); case 1: live(); } } }\n\
+               void f_goto(int c) { if (c) goto in; if (0) { dead(); in: live(); } }\n\
+               void f_default(int x) { switch (x) { case 0: while (0) { dead(); default: live(); } } }\n";
+    let module = linearize_source(src, &Target::host());
+    for f in ["f_case", "f_goto", "f_default"] {
+        let calls = calls_in(&module, f);
+        assert_eq!(calls, ["live"], "{f}");
+    }
 }
 
 #[test]

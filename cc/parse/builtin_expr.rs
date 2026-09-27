@@ -891,8 +891,15 @@ impl Parser<'_> {
                 // optimization, so `int x = 42; __builtin_constant_p(x)` is 1
                 // at `-O1` and above, and only propagation knows. What the
                 // parser cannot fold is deferred rather than refused.
+                //
+                // At `-O0` there is no optimization to wait for, and gcc
+                // answers 0 on the spot: the answer is then a constant, and
+                // `if (__builtin_constant_p(n))` drops its arm as any other
+                // constant condition does (gcc.c-torture 20030330-1).
                 let kind = if is_constant {
                     ExprKind::IntLit(1)
+                } else if !self.library_call_policy.optimizing {
+                    ExprKind::IntLit(0)
                 } else {
                     ExprKind::ConstantP(Box::new(arg))
                 };

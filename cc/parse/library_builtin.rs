@@ -33,7 +33,9 @@ use crate::types::{Type, TypeId, TypeKind, TypeTable};
 pub struct LibraryCallPolicy {
     /// `-O1` and above. At `-O0` gcc calls the library for a libm function
     /// named by its own spelling, and computes in place only one named
-    /// `__builtin_*`; c17 does the same.
+    /// `__builtin_*`; c17 does the same. It also answers
+    /// `__builtin_constant_p` of anything it cannot fold with 0 at once,
+    /// since no optimizer will run to prove it constant.
     pub optimizing: bool,
     /// `-fmath-errno`, gcc's default: a domain error sets `errno`, so a
     /// function that has one keeps a call for the arguments that raise it.

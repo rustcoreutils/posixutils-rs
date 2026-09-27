@@ -211,6 +211,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 } else {
                     self.emit(Instruction::ret(None));
                 }
+                self.start_unreachable_block();
             }
 
             Stmt::Break(_) => {
@@ -219,6 +220,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.unwind_vla_marks(JumpKind::Break);
                         self.emit(Instruction::br(target));
                         self.link_bb(current, target);
+                        self.start_unreachable_block();
                     }
                 }
             }
@@ -229,6 +231,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.unwind_vla_marks(JumpKind::Continue);
                         self.emit(Instruction::br(target));
                         self.link_bb(current, target);
+                        self.start_unreachable_block();
                     }
                 }
             }
@@ -1284,26 +1287,18 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     pub(crate) fn linearize_if(&mut self, cond: &Expr, then_stmt: &Stmt, else_stmt: Option<&Stmt>) {
-        let cond_val = self.linearize_condition(cond);
+        let cond_val = self.controlling_value(cond);
 
         let then_bb = self.alloc_bb();
         let else_bb = self.alloc_bb();
         let merge_bb = self.alloc_bb();
 
-        // Conditional branch
-        if let Some(current) = self.current_bb {
-            if else_stmt.is_some() {
-                self.emit(Instruction::cbr(cond_val, then_bb, else_bb));
-            } else {
-                self.emit(Instruction::cbr(cond_val, then_bb, merge_bb));
-            }
-            self.link_bb(current, then_bb);
-            if else_stmt.is_some() {
-                self.link_bb(current, else_bb);
-            } else {
-                self.link_bb(current, merge_bb);
-            }
-        }
+        let false_bb = if else_stmt.is_some() {
+            else_bb
+        } else {
+            merge_bb
+        };
+        self.branch_on(cond_val, then_bb, false_bb);
 
         // Then block
         self.switch_bb(then_bb);
@@ -1336,15 +1331,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Condition block
         self.switch_bb(cond_bb);
-        let cond_val = self.linearize_condition(cond);
-        // After linearizing condition, current_bb may be different from cond_bb
-        // (e.g., if condition contains short-circuit operators like && or ||).
-        // Link the CURRENT block to body_bb and exit_bb.
-        if let Some(cond_end_bb) = self.current_bb {
-            self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
-            self.link_bb(cond_end_bb, body_bb);
-            self.link_bb(cond_end_bb, exit_bb);
-        }
+        // From the block the condition ended in, which short-circuit
+        // operators can make a different one from cond_bb.
+        self.branch_on_condition(cond, body_bb, exit_bb);
 
         // Body block
         self.break_targets.push(exit_bb);
@@ -1400,15 +1389,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Condition block
         self.switch_bb(cond_bb);
-        let cond_val = self.linearize_condition(cond);
-        // After linearizing condition, current_bb may be different from cond_bb
-        // (e.g., if condition contains short-circuit operators like && or ||).
-        // Link the CURRENT block to body_bb and exit_bb.
-        if let Some(cond_end_bb) = self.current_bb {
-            self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
-            self.link_bb(cond_end_bb, body_bb);
-            self.link_bb(cond_end_bb, exit_bb);
-        }
+        // From the block the condition ended in, which short-circuit
+        // operators can make a different one from cond_bb.
+        self.branch_on_condition(cond, body_bb, exit_bb);
 
         // Exit block
         self.switch_bb(exit_bb);
@@ -1450,15 +1433,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Condition block
         self.switch_bb(cond_bb);
         if let Some(cond_expr) = cond {
-            let cond_val = self.linearize_condition(cond_expr);
-            // After linearizing condition, current_bb may be different from cond_bb
-            // (e.g., if condition contains short-circuit operators like && or ||).
-            // Link the CURRENT block to body_bb and exit_bb.
-            if let Some(cond_end_bb) = self.current_bb {
-                self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
-                self.link_bb(cond_end_bb, body_bb);
-                self.link_bb(cond_end_bb, exit_bb);
-            }
+            // From the block the condition ended in, which short-circuit
+            // operators can make a different one from cond_bb.
+            self.branch_on_condition(cond_expr, body_bb, exit_bb);
         } else {
             // No condition = always true
             self.emit(Instruction::br(body_bb));
@@ -1542,7 +1519,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Default goes to default_bb if present, otherwise exit_bb
         let default_target = default_bb.unwrap_or(exit_bb);
 
-        if size > 64 {
+        if let Some(selector) = self.eval_const_expr(expr) {
+            // A constant selector takes one edge, as a constant condition does
+            // (`branch_on`): the labels it does not select are reached only by
+            // falling into them, and a block nothing reaches is not emitted.
+            // Both sides are values of the promoted type, as the collector
+            // records the labels.
+            let target = case_values
+                .iter()
+                .position(|&(lo, hi)| lo <= selector && selector <= hi)
+                .map_or(default_target, |idx| case_bbs[idx]);
+            if let Some(current) = self.current_bb {
+                self.emit(Instruction::br(target));
+                self.link_bb(current, target);
+            }
+        } else if size > 64 {
             // The `Switch` instruction carries its labels as `i64` and both
             // backends compare in one general register, so a controlling
             // expression wider than that had its high half ignored:
@@ -2576,12 +2567,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.continue_targets.pop();
 
                 self.switch_bb(cond_bb);
-                let cond_val = self.linearize_condition(cond);
-                if let Some(cond_end_bb) = self.current_bb {
-                    self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
-                    self.link_bb(cond_end_bb, body_bb);
-                    self.link_bb(cond_end_bb, exit_bb);
-                }
+                self.branch_on_condition(cond, body_bb, exit_bb);
 
                 self.switch_bb(exit_bb);
             }
@@ -2599,12 +2585,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
 
                 self.switch_bb(cond_bb);
-                let cond_val = self.linearize_condition(cond);
-                if let Some(cond_end_bb) = self.current_bb {
-                    self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
-                    self.link_bb(cond_end_bb, body_bb);
-                    self.link_bb(cond_end_bb, exit_bb);
-                }
+                self.branch_on_condition(cond, body_bb, exit_bb);
 
                 self.break_targets.push(exit_bb);
                 self.continue_targets.push(cond_bb);
@@ -2655,12 +2636,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
                 self.switch_bb(cond_bb);
                 if let Some(cond_expr) = cond {
-                    let cond_val = self.linearize_condition(cond_expr);
-                    if let Some(cond_end_bb) = self.current_bb {
-                        self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
-                        self.link_bb(cond_end_bb, body_bb);
-                        self.link_bb(cond_end_bb, exit_bb);
-                    }
+                    self.branch_on_condition(cond_expr, body_bb, exit_bb);
                 } else {
                     self.emit(Instruction::br(body_bb));
                     self.link_bb(cond_bb, body_bb);
@@ -2727,12 +2703,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     merge_bb
                 };
 
-                let cond_val = self.linearize_condition(cond);
-                if let Some(current) = self.current_bb {
-                    self.emit(Instruction::cbr(cond_val, then_bb, else_bb));
-                    self.link_bb(current, then_bb);
-                    self.link_bb(current, else_bb);
-                }
+                self.branch_on_condition(cond, then_bb, else_bb);
 
                 self.switch_bb(then_bb);
                 self.linearize_switch_stmt(then_stmt, case_values, case_bbs, default_bb, case_idx);

@@ -370,7 +370,7 @@ only qualify a pointer to object type.
 
 | Group | Note |
 |---|---|
-| Dead-call elimination proofs | `20030330-1`, `medce-1` and `ieee/fp-cmp-7` at `-O0`, where a constant branch keeps its arm (recorded in DECISIONS.md). Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link* |
+| Dead-call elimination proofs | `ieee/fp-cmp-7`, which compares a variable against `+Inf` under `-fno-trapping-math`. gcc folds that comparison and c17 does not, so the `link_error` call stays and the test fails to *link* |
 
 One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.
 gcc accepts a conditional with one `void` arm as an extension; C17 6.5.15p3

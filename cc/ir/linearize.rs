@@ -925,6 +925,19 @@ impl<'a> Linearizer<'a> {
         self.get_or_create_bb(id);
     }
 
+    /// Continue in a fresh block that nothing branches to, after a `return`,
+    /// `break` or `continue`.
+    ///
+    /// What follows is unreachable until a label, and still gets a block of
+    /// its own so every construct in it is lowered the ordinary way; the
+    /// block is removed when the function is finished
+    /// (`dce::remove_unreachable_blocks`). Appending it to the block the
+    /// jump ends instead put instructions after a terminator.
+    pub(crate) fn start_unreachable_block(&mut self) {
+        let bb = self.alloc_bb();
+        self.switch_bb(bb);
+    }
+
     // Function linearization
 
     /// Whether a return value of this type comes back through a hidden
@@ -1650,6 +1663,13 @@ impl<'a> Linearizer<'a> {
                 let zero = self.emit_const(0, ret_type);
                 self.emit(Instruction::ret_typed(Some(zero), ret_type, ret_size));
             }
+        }
+
+        // Nothing is emitted for code no path reaches, at any level: see
+        // `dce::remove_unreachable_blocks`. Before SSA, which then never
+        // sees a definition or a phi source in a block that cannot run.
+        if let Some(ref mut ir_func) = self.current_func {
+            super::dce::remove_unreachable_blocks(ir_func);
         }
 
         // Run SSA conversion if enabled
@@ -4776,8 +4796,8 @@ impl<'a> Linearizer<'a> {
         // Not when the untaken arm defines a label, though: a computed `goto`
         // can still reach it, so it has to be emitted. See
         // [`Expr::defines_label`].
-        if let Some(cond_val) = self.eval_const_expr(cond) {
-            let (taken, untaken) = if cond_val != 0 {
+        if let Some(holds) = self.constant_condition(cond) {
+            let (taken, untaken) = if holds {
                 (then_expr, else_expr)
             } else {
                 (else_expr, then_expr)

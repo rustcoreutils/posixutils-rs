@@ -121,6 +121,8 @@ aarch64/compile/20000802-1@-O0
 aarch64/compile/20000802-1@-O2
 aarch64/compile/20000803-1@-O0
 aarch64/compile/20000803-1@-O2
+aarch64/compile/20000804-1@-O0
+aarch64/compile/20000804-1@-O2
 aarch64/compile/20000818-1@-O0
 aarch64/compile/20000818-1@-O2
 aarch64/compile/20000825-1@-O0
@@ -1464,6 +1466,7 @@ aarch64/compile/asmgoto-3@-O0
 aarch64/compile/asmgoto-3@-O2
 aarch64/compile/asmgoto-4@-O0
 aarch64/compile/asmgoto-4@-O2
+aarch64/compile/asmgoto-5@-O0
 aarch64/compile/asmgoto-5@-O2
 aarch64/compile/asmgoto-6@-O0
 aarch64/compile/asmgoto-6@-O2
@@ -1587,6 +1590,7 @@ aarch64/compile/call386@-O0
 aarch64/compile/call386@-O2
 aarch64/compile/callind@-O0
 aarch64/compile/callind@-O2
+aarch64/compile/call@-O0
 aarch64/compile/call@-O2
 aarch64/compile/calls@-O0
 aarch64/compile/calls@-O2

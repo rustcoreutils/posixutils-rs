@@ -120,6 +120,8 @@ compile/20000802-1@-O0
 compile/20000802-1@-O2
 compile/20000803-1@-O0
 compile/20000803-1@-O2
+compile/20000804-1@-O0
+compile/20000804-1@-O2
 compile/20000818-1@-O0
 compile/20000818-1@-O2
 compile/20000825-1@-O0
@@ -1586,6 +1588,7 @@ compile/call386@-O0
 compile/call386@-O2
 compile/callind@-O0
 compile/callind@-O2
+compile/call@-O0
 compile/call@-O2
 compile/calls@-O0
 compile/calls@-O2
@@ -5214,6 +5217,8 @@ execute/990326-1@-O0
 execute/990326-1@-O2
 execute/990404-1@-O0
 execute/990404-1@-O2
+execute/990413-2@-O0
+execute/990413-2@-O2
 execute/990513-1@-O0
 execute/990513-1@-O2
 execute/990524-1@-O0

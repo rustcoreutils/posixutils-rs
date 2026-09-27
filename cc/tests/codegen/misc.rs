@@ -16286,3 +16286,43 @@ fn codegen_x86_64_long_double_to_integer_is_baseline() {
         assert!(!asm.contains("fisttp"), "{opt}: fisttp emitted:\n{asm}");
     }
 }
+
+/// A cast to `void` discards the value (C17 6.3.2.2) and converts nothing.
+/// `(void)x` of a floating `x` was lowered as a conversion to an integer --
+/// `cvttss2si` at `-O0` -- which raises `FE_INVALID` for a NaN, so
+/// `(void)b;` in a function that ignores a NaN argument raised it.
+#[test]
+fn codegen_void_cast_of_a_float_converts_nothing() {
+    let src = r#"
+#include <fenv.h>
+__attribute__((noinline)) static void ignore(float f, double d, long double l) {
+    (void)f; (void)d; (void)l;
+}
+int main(void) {
+    volatile float nan = __builtin_nanf("");
+    volatile double big = 1e300;
+    feclearexcept(FE_ALL_EXCEPT);
+    ignore(nan, big, -big);
+    return fetestexcept(FE_INVALID) ? 1 : 0;
+}
+"#;
+    for level in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                "void_cast_float",
+                src,
+                &[level.to_string(), "-lm".to_string()]
+            ),
+            0,
+            "{level}"
+        );
+        if let Some(rc) = crate::common::compile_and_run_aarch64_with(
+            "void_cast_float_a64",
+            src,
+            &[level],
+            &["-lm"],
+        ) {
+            assert_eq!(rc, 0, "aarch64 {level}");
+        }
+    }
+}

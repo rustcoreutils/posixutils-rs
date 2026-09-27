@@ -2592,6 +2592,14 @@ impl<'a> Linearizer<'a> {
 
         let src = self.linearize_expr(inner_expr);
 
+        // C17 6.3.2.2: a cast to `void` discards the value and converts
+        // nothing. `void` is not a floating type, so a floating operand fell
+        // into the float-to-integer arm below and `(void)x` became a
+        // `cvttss2si`, which raises `FE_INVALID` for a NaN.
+        if self.types.kind(cast_type) == TypeKind::Void {
+            return src;
+        }
+
         // Emit conversion if needed
         let src_is_float = self.types.is_float(src_type);
         let dst_is_float = self.types.is_float(cast_type);

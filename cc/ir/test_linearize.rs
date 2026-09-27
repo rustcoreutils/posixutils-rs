@@ -8667,3 +8667,19 @@ fn test_known_call_keeps_its_tag_under_an_asm_label() {
     assert_eq!(f.known, Some(crate::parse::ast::LibFn::Strstr));
     assert_eq!(call_in("g").known, None);
 }
+
+/// A cast to `void` converts nothing: `(void)x` of a floating `x` was a
+/// float-to-integer conversion, which raises `FE_INVALID` for a NaN.
+#[test]
+fn test_void_cast_of_a_float_converts_nothing() {
+    let src = "void f(float a, double b, long double c) { (void)a; (void)b; (void)c; }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let converts = f
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| matches!(i.op, Opcode::FCvtS | Opcode::FCvtU))
+        .count();
+    assert_eq!(converts, 0);
+}

@@ -15,7 +15,7 @@
 use super::*;
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, ExprKind, ExternalDecl,
-    ForInit, FunctionDef, InitDeclarator, InitElement, Parameter, Stmt, UnaryOp,
+    ForInit, FunctionDef, InitDeclarator, InitElement, ParamStyle, Parameter, Stmt, UnaryOp,
 };
 use crate::strings::StringTable;
 use crate::symbol::Symbol;
@@ -103,6 +103,7 @@ fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) -> FunctionDe
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     }
 }
 
@@ -134,6 +135,7 @@ fn test_parameter_stored_to_local() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -191,6 +193,7 @@ fn test_function_with_many_params() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -253,6 +256,7 @@ fn test_compound_assignment_deref() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -333,6 +337,7 @@ fn test_compound_assignment_index() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -401,6 +406,7 @@ fn test_simple_array_element_store() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -501,6 +507,7 @@ fn test_nested_if_cfg_linking() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -582,6 +589,7 @@ fn test_switch_basic() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -663,6 +671,7 @@ fn test_switch_with_break() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -740,6 +749,7 @@ fn test_do_while_basic() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -829,6 +839,7 @@ fn test_do_while_with_break() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -910,6 +921,7 @@ fn test_goto_forward() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -994,6 +1006,7 @@ fn test_goto_backward() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1071,6 +1084,7 @@ fn test_nested_loop_break() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1164,6 +1178,7 @@ fn test_nested_loop_continue() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1224,6 +1239,7 @@ fn test_unary_logical_not() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1272,6 +1288,7 @@ fn test_unary_bitwise_not() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1320,6 +1337,7 @@ fn test_unary_negate() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1368,6 +1386,7 @@ fn test_pre_increment() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1427,6 +1446,7 @@ fn test_pointer_add_int() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1495,6 +1515,7 @@ fn test_pointer_difference() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1560,6 +1581,7 @@ fn test_float_add() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1617,6 +1639,7 @@ fn test_float_comparison() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1666,6 +1689,7 @@ fn test_float_to_int_cast() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1715,6 +1739,7 @@ fn test_int_to_float_cast() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1921,6 +1946,7 @@ fn test_linearize_function_with_params() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2124,6 +2150,7 @@ fn test_local_var_emits_load_store() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2201,6 +2228,7 @@ fn test_ssa_converts_local_to_phi() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2268,6 +2296,7 @@ fn test_ssa_loop_variable() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2321,6 +2350,7 @@ fn test_short_circuit_and() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2384,6 +2414,7 @@ fn test_short_circuit_or() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2458,6 +2489,7 @@ fn test_ternary_pure_uses_select() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2537,6 +2569,7 @@ fn test_ternary_impure_uses_phi() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2628,6 +2661,7 @@ fn test_ternary_with_assignment_uses_phi() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2704,6 +2738,7 @@ fn test_ternary_with_post_increment_uses_phi() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2768,6 +2803,7 @@ fn test_string_literal_char_array_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2823,6 +2859,7 @@ fn test_string_literal_char_pointer_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2984,6 +3021,7 @@ fn test_incomplete_struct_type_resolution() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -3066,6 +3104,7 @@ fn test_static_local_pre_increment() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3143,6 +3182,7 @@ fn test_static_local_pre_decrement() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3213,6 +3253,7 @@ fn test_static_local_post_increment() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3283,6 +3324,7 @@ fn test_static_local_post_decrement() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3361,6 +3403,7 @@ fn test_static_local_compound_assignment() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3414,6 +3457,7 @@ fn test_wide_string_literal_expression() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3481,6 +3525,7 @@ fn test_wide_string_literal_is_pure() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3522,6 +3567,7 @@ fn test_gcc_function_identifier() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3563,6 +3609,7 @@ fn test_gcc_pretty_function_identifier() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3656,6 +3703,7 @@ fn test_static_local_address_in_initializer() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3747,6 +3795,7 @@ fn test_struct_deref_returns_address() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3802,6 +3851,7 @@ fn test_int_to_float_cast_has_src_typ() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -3854,6 +3904,7 @@ fn test_float_to_int_cast_has_src_typ() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -3906,6 +3957,7 @@ fn test_integer_extension_has_src_typ() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -3957,6 +4009,7 @@ fn test_float16_to_float_conversion() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4012,6 +4065,7 @@ fn test_float_to_float16_conversion() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4067,6 +4121,7 @@ fn test_float16_to_int_conversion() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4122,6 +4177,7 @@ fn test_int_to_float16_conversion() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4167,6 +4223,7 @@ fn test_alignof_type_emits_setval() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4211,6 +4268,7 @@ fn test_alignof_expr_emits_setval() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4251,6 +4309,7 @@ fn test_frame_address_emits_opcode() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4289,6 +4348,7 @@ fn test_return_address_emits_opcode() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4424,6 +4484,7 @@ fn test_mixed_designated_positional_struct_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4522,6 +4583,7 @@ fn test_mixed_designated_positional_array_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4679,6 +4741,7 @@ fn test_designator_chain_nested_struct_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -4760,6 +4823,7 @@ fn test_designator_chain_array_member_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -4826,6 +4890,7 @@ fn test_repeated_designator_last_wins_array() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -4932,6 +4997,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -5022,6 +5088,7 @@ fn test_union_first_named_member_positional_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -5073,6 +5140,7 @@ fn test_valist_parameter_stored_as_pointer() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -5136,6 +5204,7 @@ fn test_valist_local_not_indirect() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -5215,6 +5284,7 @@ fn test_valist_expression_decay() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -5359,6 +5429,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -5500,6 +5571,7 @@ fn test_bitfield_designated_init_local_var() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -5636,6 +5708,7 @@ fn test_large_struct_copy_from_array() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -5794,6 +5867,7 @@ fn test_compound_literal_zero_init_lvalue() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -5915,6 +5989,7 @@ fn test_conditional_short_circuit_arrow() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -6081,6 +6156,7 @@ fn compound_module(op: AssignOp, atomic: bool) -> (TestContext, Module) {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -6299,6 +6375,7 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let module = ctx.linearize(&TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -6408,6 +6485,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -6723,6 +6801,7 @@ fn test_block_scope_extern_declares_no_local() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -6807,6 +6886,7 @@ fn test_float_condition_compares_against_zero() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -6891,6 +6971,7 @@ fn test_complex_equality_compares_both_halves() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -6989,6 +7070,7 @@ fn test_asm_goto_output_written_back_on_the_label_edge() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -7068,6 +7150,7 @@ fn test_asm_memory_operand_names_its_object() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -7145,6 +7228,12 @@ fn test_asm_memory_operand_keeps_an_address_something_else_reads() {
 
 /// Parse `src` and linearize it for `target`.
 fn linearize_source(src: &str, target: &Target) -> Module {
+    linearize_source_with_types(src, target).0
+}
+
+/// [`linearize_source`], also handing back the type table the module's type
+/// ids index.
+fn linearize_source_with_types(src: &str, target: &Target) -> (Module, TypeTable) {
     let mut strings = StringTable::new();
     let mut tokenizer = crate::token::lexer::Tokenizer::new(src.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
@@ -7155,7 +7244,81 @@ fn linearize_source(src: &str, target: &Target) -> Module {
             crate::parse::Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
         parser.parse_translation_unit().expect("parse")
     };
-    linearize(&tu, &symbols, &types, &strings, target, false)
+    let module = linearize(&tu, &symbols, &types, &strings, target, false);
+    (module, types)
+}
+
+/// A call records each argument at the type the callee receives it as, which
+/// is what the ABI places it by: the parameter's type under a prototype --
+/// narrower included -- and the default argument promotions without one
+/// (C17 6.5.2.2p6-7). Apple arm64 stacks a `char` parameter in one byte, so
+/// `p('a')` recorded as `int` took four; and an unprototyped call passed a
+/// `float` where a gcc-compiled K&R callee reads a `double`.
+#[test]
+fn test_call_argument_types_follow_the_callee() {
+    use crate::target::{Arch, Os};
+    let src = "void p(char, short, int);\n\
+               int u();\n\
+               void f(long l, char c, float x) { p(l, 300, l); u(c, x); }\n";
+    let target = Target::new(Arch::Aarch64, Os::MacOS);
+    let (module, types) = linearize_source_with_types(src, &target);
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let calls: Vec<&Instruction> = f
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| i.op == Opcode::Call)
+        .collect();
+    assert_eq!(calls.len(), 2);
+    let kinds = |call: &Instruction| -> Vec<TypeKind> {
+        call.arg_types.iter().map(|&t| types.kind(t)).collect()
+    };
+    assert_eq!(
+        kinds(calls[0]),
+        [TypeKind::Char, TypeKind::Short, TypeKind::Int],
+        "a prototyped call passes each argument as its parameter's type"
+    );
+    assert_eq!(
+        kinds(calls[1]),
+        [TypeKind::Int, TypeKind::Double],
+        "an unprototyped call passes the promoted types"
+    );
+}
+
+/// An identifier-list definition receives each parameter as its default
+/// argument promotion -- what every caller passes, having no prototype to
+/// convert to -- and converts it to the declared type on entry (C17
+/// 6.9.1p10). It read a `float` parameter out of the register a caller had
+/// put a `double` in.
+#[test]
+fn test_identifier_list_parameters_arrive_promoted() {
+    use crate::target::{Arch, Os};
+    let src = "int kr(f, c, s, l) float f; char c; short s; long l;\n\
+               { return (int)f + c + s + (int)l; }\n\
+               int pr(float f, char c) { return (int)f + c; }\n";
+    let (module, types) = linearize_source_with_types(src, &Target::new(Arch::Aarch64, Os::Linux));
+    let params = |name: &str| -> Vec<TypeKind> {
+        let f = module.functions.iter().find(|f| f.name == name).unwrap();
+        f.params.iter().map(|(_, t)| types.kind(*t)).collect()
+    };
+    assert_eq!(
+        params("kr"),
+        [
+            TypeKind::Double,
+            TypeKind::Int,
+            TypeKind::Int,
+            TypeKind::Long
+        ]
+    );
+    assert_eq!(params("pr"), [TypeKind::Float, TypeKind::Char]);
+    let kr = module.functions.iter().find(|f| f.name == "kr").unwrap();
+    assert!(
+        kr.blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .any(|i| i.op == Opcode::FCvtF),
+        "the double must be converted to the float parameter on entry"
+    );
 }
 
 /// `abs` and its siblings become the branch-free `(x ^ s) - s` sequence
@@ -7575,6 +7738,7 @@ fn test_complex_temporaries_are_frame_slots() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],

@@ -12,10 +12,10 @@
 use super::codegen::Aarch64CodeGen;
 use super::lir::{Aarch64Inst, GpOperand, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
+use crate::abi::aapcs64::{StackSlot, StackedArgs};
 use crate::abi::{ArgClass, HfaBase, RegClass};
 use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
-use crate::target::Target;
 use crate::types::{TypeId, TypeKind, TypeTable};
 
 /// What a stacked argument is made of, which decides both how many
@@ -52,45 +52,31 @@ struct StackArg {
 }
 
 impl StackArg {
-    /// Where this argument starts, relative to the outgoing area.
-    ///
-    /// AAPCS64 §6.4.2 stage C rounds the next stacked-argument address
-    /// up to `max(8, alignof(type))` *before* placing it. Advancing by
-    /// the rounded size alone put a sixteen-byte-aligned argument eight
-    /// bytes low whenever an odd number of eight-byte slots came first,
-    /// and the callee made the same mistake, so it showed only against
-    /// another compiler.
-    fn slot_start(&self, at: i32, types: &TypeTable) -> i32 {
-        // `argument_alignment`, not `alignment`: AAPCS64 derives this from the
-        // members and ignores the type's own `aligned` attribute, so an
-        // `aligned(32)` struct is placed where gcc places it rather than
-        // padded to 32. See that function for the measured rule.
-        let align = self.typ.map_or(8, |t| {
-            crate::abi::aapcs64::stacked_argument_alignment(types, t) as i32
-        });
-        (at + align - 1) & !(align - 1)
-    }
-
-    fn slot_bytes(&self, types: &TypeTable, target: &Target) -> i32 {
-        match self.kind {
-            StackKind::Complex => {
-                let elem = self
-                    .typ
-                    .map(|t| complex_fp_info(types, target, t).1)
-                    .unwrap_or(8);
-                ((2 * elem) + 7) & !7
-            }
-            StackKind::Hfa { base, count } => ((count as i32 * HfaElem::of(base).bytes) + 7) & !7,
-            StackKind::Composite { bytes } => (bytes + 7) & !7,
-            StackKind::Scalar => {
-                if self.size == 128 {
-                    16
-                } else {
-                    8
-                }
-            }
+    /// The slot this argument occupies, by the rule the callee reads it back
+    /// with ([`StackedArgs::slot`]). An argument with no recorded type is
+    /// one general register's worth, or two for a 128-bit value.
+    fn slot(&self, types: &TypeTable, stacked: StackedArgs) -> StackSlot {
+        match self.typ {
+            Some(t) => stacked.slot(types, t),
+            None => StackSlot {
+                bytes: if self.size == 128 { 16 } else { 8 },
+                align: 8,
+            },
         }
     }
+}
+
+/// A stacked argument at its offset from SP, in a slot of its own size.
+struct PlacedArg {
+    arg: StackArg,
+    slot: StackSlot,
+    offset: i32,
+}
+
+/// Stacked arguments laid out, and the byte just past the last of them.
+struct StackLayout {
+    args: Vec<PlacedArg>,
+    end: i32,
 }
 
 /// Which argument registers a walk over the arguments may still hand out.
@@ -155,10 +141,12 @@ impl Aarch64CodeGen {
             types,
         );
 
-        let mut placed = Self::place_stack_args(named, 0, types, &self.base.target);
-        let mut at = placed
-            .last()
-            .map_or(0, |(a, off)| off + a.slot_bytes(types, &self.base.target));
+        let stacked = StackedArgs::of(&self.base.target);
+        let StackLayout {
+            args: mut placed,
+            end,
+        } = Self::place_stack_args(named, types, stacked);
+        let mut at = crate::abi::aapcs64::darwin_va_area_start(end);
         let mut max_align = 16;
         for arg in variadic {
             let (bytes, align) = arg.typ.map_or((8, 8), |t| {
@@ -171,7 +159,14 @@ impl Aarch64CodeGen {
             });
             at = (at + align - 1) & !(align - 1);
             max_align = max_align.max(align);
-            placed.push((arg, at));
+            placed.push(PlacedArg {
+                arg,
+                slot: StackSlot {
+                    bytes: bytes as usize,
+                    align: align as usize,
+                },
+                offset: at,
+            });
             at += bytes;
         }
         if placed.is_empty() {
@@ -260,18 +255,18 @@ impl Aarch64CodeGen {
             ArgRegisters::Available,
             types,
         );
-        let placed = Self::place_stack_args(stack_args_info, 0, types, &self.base.target);
+        let placed =
+            Self::place_stack_args(stack_args_info, types, StackedArgs::of(&self.base.target));
 
         // If no stack args, we're done
-        let Some((last, last_off)) = placed.last() else {
+        if placed.args.is_empty() {
             return 0;
-        };
+        }
 
         // Pre-allocate stack space for all stack args, 16-byte aligned.
         // Walked, not summed: alignment padding between arguments is part of
         // the area, and summing the sizes alone under-reserved it.
-        let stack_bytes = last_off + last.slot_bytes(types, &self.base.target);
-        let aligned_bytes = (stack_bytes + 15) & !15;
+        let aligned_bytes = (placed.end + 15) & !15;
 
         self.push_lir(Aarch64Inst::Sub {
             size: OperandSize::B64,
@@ -280,7 +275,7 @@ impl Aarch64CodeGen {
             dst: Reg::sp(),
         });
 
-        self.store_stack_args(placed, types);
+        self.store_stack_args(placed.args, types);
 
         // Return number of 16-byte units allocated (for cleanup)
         (aligned_bytes + 15) / 16
@@ -625,26 +620,44 @@ impl Aarch64CodeGen {
         stack_args_info
     }
 
-    /// Lay stacked arguments out in parameter order from `at`, each at its
-    /// AAPCS64 slot, pairing every one with its offset from SP.
+    /// Lay stacked named arguments out in parameter order from the base of
+    /// the outgoing area, each in the slot `stacked` gives it -- the rule the
+    /// callee's `param_layout` reads them back by.
     fn place_stack_args(
         args: Vec<StackArg>,
-        mut at: i32,
         types: &TypeTable,
-        target: &Target,
-    ) -> Vec<(StackArg, i32)> {
-        args.into_iter()
-            .map(|a| {
-                let off = a.slot_start(at, types);
-                at = off + a.slot_bytes(types, target);
-                (a, off)
+        stacked: StackedArgs,
+    ) -> StackLayout {
+        let mut at = 0i64;
+        let args = args
+            .into_iter()
+            .map(|arg| {
+                let slot = arg.slot(types, stacked);
+                let (start, end) = slot.place(at);
+                at = end;
+                PlacedArg {
+                    arg,
+                    slot,
+                    offset: i32::try_from(start).unwrap_or(i32::MAX),
+                }
             })
-            .collect()
+            .collect();
+        StackLayout {
+            args,
+            end: i32::try_from(at).unwrap_or(i32::MAX),
+        }
     }
 
-    /// Store each stacked argument at its offset from SP.
-    fn store_stack_args(&mut self, placed: Vec<(StackArg, i32)>, types: &TypeTable) {
-        for (stack_arg, offset) in placed {
+    /// Store each stacked argument at its offset from SP, writing no more
+    /// than its slot: under Apple's rule the next argument may start at the
+    /// very next byte.
+    fn store_stack_args(&mut self, placed: Vec<PlacedArg>, types: &TypeTable) {
+        for PlacedArg {
+            arg: stack_arg,
+            slot,
+            offset,
+        } in placed
+        {
             if stack_arg
                 .typ
                 .is_some_and(|t| types.kind(t) == TypeKind::Int128)
@@ -776,8 +789,21 @@ impl Aarch64CodeGen {
                     types,
                 );
                 // Width comes from the type, so a binary128 stack argument
-                // keeps its top half rather than taking the 8-byte stride.
-                let fp_sz = self.fp_size_from_type(stack_arg.typ, stack_arg.size, types);
+                // keeps its top half rather than taking the 8-byte stride. A
+                // one-element HFA is as wide as its element: a
+                // `struct { _Float16 h; }` written as a single overran its
+                // two-byte Apple slot into the next argument.
+                let one_elem = stack_arg.typ.and_then(|t| {
+                    let abi =
+                        crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+                    match abi.classify_param(t, types) {
+                        ArgClass::Hfa { base, count: 1 } => Some(HfaElem::of(base).size),
+                        _ => None,
+                    }
+                });
+                let fp_sz = one_elem.unwrap_or_else(|| {
+                    self.fp_size_from_type(stack_arg.typ, stack_arg.size, types)
+                });
                 self.push_lir(Aarch64Inst::StrFp {
                     size: fp_sz,
                     src: VReg::V16,
@@ -788,8 +814,11 @@ impl Aarch64CodeGen {
                 });
             } else {
                 self.emit_move(stack_arg.pseudo, Reg::X9, stack_arg.size);
+                // The slot's width, not the register's: eight on AAPCS64,
+                // the value's own size on Apple, where a `char` is one byte
+                // and the next argument begins right after it.
                 self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B64,
+                    size: OperandSize::from_bits((slot.bytes.min(8) * 8) as u32),
                     src: Reg::X9,
                     addr: MemAddr::BaseOffset {
                         base: Reg::SP,
@@ -1220,12 +1249,15 @@ pub(super) struct HfaElem {
 
 impl HfaElem {
     pub(super) fn of(base: HfaBase) -> HfaElem {
-        let (size, bytes) = match base {
-            HfaBase::Float16 => (FpSize::Half, 2),
-            HfaBase::Float32 => (FpSize::Single, 4),
-            HfaBase::Float64 => (FpSize::Double, 8),
-            HfaBase::Float128 => (FpSize::Quad, 16),
+        let size = match base {
+            HfaBase::Float16 => FpSize::Half,
+            HfaBase::Float32 => FpSize::Single,
+            HfaBase::Float64 => FpSize::Double,
+            HfaBase::Float128 => FpSize::Quad,
         };
-        HfaElem { size, bytes }
+        HfaElem {
+            size,
+            bytes: base.bytes() as i32,
+        }
     }
 }

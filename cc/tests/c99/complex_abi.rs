@@ -20,8 +20,9 @@
 //
 
 use crate::common::{
-    aarch64_cross_available, compile_and_run, compile_and_run_aarch64, compile_and_run_optimized,
-    create_c_file, cross_link_and_run, run_c17,
+    aarch64_cross_available, c17_object, compile_and_run, compile_and_run_aarch64,
+    compile_and_run_optimized, create_c_file, cross_link_and_run, host_link_and_run,
+    interop_aarch64, interop_host, run_c17,
 };
 
 /// #C1: `float _Complex` is one packed eightbyte, so it occupies a single
@@ -662,45 +663,6 @@ int main(void) {
 }
 "#;
 
-/// Compile `src` with c17 to a host object in `dir`, returning its path.
-fn c17_object(name: &str, src: &str, opt: &str, dir: &std::path::Path) -> String {
-    let c = create_c_file(name, src);
-    let o = dir.join(format!("{name}.o"));
-    let run = run_c17(&[
-        opt,
-        "-w",
-        "-c",
-        "-o",
-        o.to_str().unwrap(),
-        c.path().to_str().unwrap(),
-    ]);
-    assert!(run.success, "c17 failed on {name}:\n{}", run.stderr);
-    o.to_string_lossy().into_owned()
-}
-
-/// Link `objs` with the C sources `c_srcs` using the host gcc, and run it.
-fn gcc_link_and_run(name: &str, objs: &[&str], c_srcs: &[&str], dir: &std::path::Path) -> i32 {
-    let exe = dir.join(name);
-    let files: Vec<_> = c_srcs.iter().map(|s| create_c_file(name, s)).collect();
-    let mut cmd = std::process::Command::new("gcc");
-    cmd.arg("-w").arg("-o").arg(&exe);
-    for f in &files {
-        cmd.arg(f.path());
-    }
-    cmd.args(objs);
-    let out = cmd.output().expect("run gcc");
-    assert!(
-        out.status.success(),
-        "gcc link of {name} failed:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    std::process::Command::new(&exe)
-        .status()
-        .expect("run test binary")
-        .code()
-        .unwrap_or(-1)
-}
-
 #[test]
 fn c99_complex_va_arg_c17_both_sides() {
     let program = format!("{VA_COMPLEX_CALLEE}\n{VA_COMPLEX_CALLER}");
@@ -727,13 +689,13 @@ fn c99_complex_va_arg_interoperates_with_gcc_host() {
     for opt in ["-O0", "-O2"] {
         let callee = c17_object("va_callee", VA_COMPLEX_CALLEE, opt, dir.path());
         assert_eq!(
-            gcc_link_and_run("gcc_caller", &[&callee], &[VA_COMPLEX_CALLER], dir.path()),
+            host_link_and_run("gcc_caller", &[&callee], &[VA_COMPLEX_CALLER], dir.path()),
             0,
             "gcc caller, c17 callee, {opt}"
         );
         let caller = c17_object("va_caller", VA_COMPLEX_CALLER, opt, dir.path());
         assert_eq!(
-            gcc_link_and_run("gcc_callee", &[&caller], &[VA_COMPLEX_CALLEE], dir.path()),
+            host_link_and_run("gcc_callee", &[&caller], &[VA_COMPLEX_CALLEE], dir.path()),
             0,
             "c17 caller, gcc callee, {opt}"
         );
@@ -860,79 +822,6 @@ int main(void) {
 }
 "#;
 
-/// Every pairing of c17 and `gcc` on the host, at -O0 and -O2.
-fn va_interop_host(tag: &str, callee: &str, caller: &str) {
-    let dir = plib::tmp::Builder::new()
-        .prefix(&format!("{tag}_"))
-        .tempdir()
-        .unwrap();
-    for opt in ["-O0", "-O2"] {
-        let callee_o = c17_object(&format!("{tag}_callee"), callee, opt, dir.path());
-        let caller_o = c17_object(&format!("{tag}_caller"), caller, opt, dir.path());
-        assert_eq!(
-            gcc_link_and_run("cc", &[&caller_o, &callee_o], &[], dir.path()),
-            0,
-            "c17 both, {opt}"
-        );
-        assert_eq!(
-            gcc_link_and_run("gc", &[&callee_o], &[caller], dir.path()),
-            0,
-            "gcc caller, c17 callee, {opt}"
-        );
-        assert_eq!(
-            gcc_link_and_run("cg", &[&caller_o], &[callee], dir.path()),
-            0,
-            "c17 caller, gcc callee, {opt}"
-        );
-    }
-}
-
-/// Every pairing of c17 and aarch64 `gcc`, under qemu, at -O0 and -O2.
-fn va_interop_aarch64(tag: &str, callee: &str, caller: &str) {
-    let dir = plib::tmp::Builder::new()
-        .prefix(&format!("{tag}_a64_"))
-        .tempdir()
-        .unwrap();
-    let callee_c = create_c_file(&format!("{tag}_callee_a64"), callee);
-    let caller_c = create_c_file(&format!("{tag}_caller_a64"), caller);
-    let callee_src = callee_c.path().to_string_lossy().into_owned();
-    let caller_src = caller_c.path().to_string_lossy().into_owned();
-    for opt in ["-O0", "-O2"] {
-        let asm = |src: &str, n: &str| {
-            let s = dir.path().join(format!("{n}{opt}.s"));
-            let run = run_c17(&[
-                "--target",
-                "aarch64-unknown-linux-gnu",
-                opt,
-                "-w",
-                "-S",
-                "-o",
-                s.to_str().unwrap(),
-                src,
-            ]);
-            assert!(run.success, "c17 failed on {n}:\n{}", run.stderr);
-            s.to_string_lossy().into_owned()
-        };
-        let callee_s = asm(&callee_src, "callee");
-        let caller_s = asm(&caller_src, "caller");
-        assert_eq!(
-            cross_link_and_run(&format!("{tag}_cc"), &[&caller_s, &callee_s]),
-            0,
-            "c17 both, {opt}"
-        );
-        assert_eq!(
-            cross_link_and_run(&format!("{tag}_gc"), &[&caller_src, &callee_s]),
-            0,
-            "gcc caller, c17 callee, {opt}"
-        );
-        assert_eq!(
-            cross_link_and_run(&format!("{tag}_cg"), &[&caller_s, &callee_src]),
-            0,
-            "c17 caller, gcc callee, {opt}"
-        );
-    }
-}
-
 #[test]
 fn c99_va_arg_aggregates_c17_both_sides() {
     let program = format!("{VA_AGG_DECLS}\n{VA_AGG_CALLEE}\n{VA_AGG_CALLER}");
@@ -951,7 +840,7 @@ fn c99_va_arg_aggregates_interoperate_with_gcc_host() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
     }
-    va_interop_host(
+    interop_host(
         "va_agg",
         &format!("{VA_AGG_DECLS}\n{VA_AGG_CALLEE}"),
         &format!("{VA_AGG_DECLS}\n{VA_AGG_CALLER}"),
@@ -964,7 +853,7 @@ fn c99_va_arg_aggregates_interoperate_with_gcc_aarch64() {
         eprintln!("SKIP: no aarch64 cross toolchain");
         return;
     }
-    va_interop_aarch64(
+    interop_aarch64(
         "va_agg",
         &format!("{VA_AGG_DECLS}\n{VA_AGG_CALLEE}"),
         &format!("{VA_AGG_DECLS}\n{VA_AGG_CALLER}"),
@@ -1111,7 +1000,7 @@ fn c99_float128_complex_operations_interoperate_with_gcc_host() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
     }
-    va_interop_host(
+    interop_host(
         "f128c",
         &format!("{F128C_DECLS}\n{F128C_CALLEE}"),
         &format!("{F128C_DECLS}\n{F128C_CALLER}"),
@@ -1125,7 +1014,7 @@ fn c99_float128_complex_operations_interoperate_with_gcc_aarch64() {
         eprintln!("SKIP: no aarch64 cross toolchain");
         return;
     }
-    va_interop_aarch64(
+    interop_aarch64(
         "f128c",
         &format!("{F128C_DECLS}\n{F128C_CALLEE}"),
         &format!("{F128C_DECLS}\n{F128C_CALLER}"),

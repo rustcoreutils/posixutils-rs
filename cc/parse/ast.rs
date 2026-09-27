@@ -2025,6 +2025,19 @@ impl FunctionAttrs {
     }
 }
 
+/// How a function definition declared its parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamStyle {
+    /// A prototype, `int f(float x)`: each argument is converted to its
+    /// parameter's type and passed as that.
+    Prototype,
+    /// An identifier list, `int f(x) float x;`: the function type has no
+    /// prototype, so every caller passes the default argument promotions of
+    /// what it has (C17 6.5.2.2p6), and the definition converts each one to
+    /// its declared type on entry (6.9.1p10).
+    IdentifierList,
+}
+
 /// A function definition
 #[derive(Debug, Clone)]
 pub struct FunctionDef {
@@ -2034,6 +2047,8 @@ pub struct FunctionDef {
     pub name: StringId,
     /// Parameters
     pub params: Vec<Parameter>,
+    /// Whether `params` came from a prototype or an identifier list.
+    pub param_style: ParamStyle,
     /// Function body
     pub body: Stmt,
     /// Source position of function definition (for debug info)

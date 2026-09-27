@@ -10,7 +10,9 @@
 // and _Static_assert
 //
 
-use super::ast::{ExternalDecl, FunctionAttrs, FunctionDef, Parameter, Stmt, TranslationUnit};
+use super::ast::{
+    ExternalDecl, FunctionAttrs, FunctionDef, ParamStyle, Parameter, Stmt, TranslationUnit,
+};
 use super::bind::{DeclScope, DeclSpecs};
 use super::declaration::SpecContext;
 use super::parser::{
@@ -230,6 +232,12 @@ impl Parser<'_> {
         let mut params = params.unwrap_or_default();
         let typ = self.parse_old_style_parameters(typ, &mut params)?;
         let func = self.types.get(typ);
+        // An identifier list records no parameter types (C17 6.7.6.3p14).
+        let param_style = if func.params.is_some() {
+            ParamStyle::Prototype
+        } else {
+            ParamStyle::IdentifierList
+        };
         let return_type = func.base.expect("a function type has a return type");
         // An old-style declarator has no `...` to be variadic with.
         let is_variadic = func.variadic;
@@ -265,6 +273,7 @@ impl Parser<'_> {
             return_type,
             name,
             params,
+            param_style,
             body,
             pos: specs.pos,
             is_static: specs.storage_class.contains(TypeModifiers::STATIC),

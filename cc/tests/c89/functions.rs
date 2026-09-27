@@ -421,3 +421,79 @@ int main() {
         0
     );
 }
+
+// ============================================================================
+// Calls without a prototype, and identifier-list definitions
+// ============================================================================
+
+// A call through a type with no prototype passes each argument as its default
+// argument promotion (C17 6.5.2.2p6), and an identifier-list definition
+// receives it so and converts it to the declared type (6.9.1p10). c17 passed a
+// `float` as a single and read it back as one, which agreed with itself and
+// with no other compiler; and on Apple arm64 a stacked `char` took one byte
+// where the callee reads an `int`. Eight `int`s first, so the rest are stacked
+// on aarch64 as well.
+
+const KNR_CALLEE: &str = r#"
+int knr(i0, i1, i2, i3, i4, i5, i6, i7, f, c, s, uc, b, g, h, d)
+    int i0, i1, i2, i3, i4, i5, i6, i7;
+    float f; char c; short s; unsigned char uc; _Bool b; float g; short h;
+    double d;
+{
+    if (i0 != 1 || i7 != 8) return 1;
+    if (f != 1.5f || c != 'k' || s != -300) return 2;
+    if (uc != 200 || b != 1) return 3;
+    if (g != -2.25f || h != 7 || d != 9.5) return 4;
+    return 0;
+}
+"#;
+
+const KNR_CALLER: &str = r#"
+int knr();
+int main(void)
+{
+    float f = 1.5f, g = -2.25f;
+    char c = 'k';
+    short s = -300, h = 7;
+    unsigned char uc = 200;
+    _Bool b = 1;
+    return knr(1, 2, 3, 4, 5, 6, 7, 8, f, c, s, uc, b, g, h, 9.5);
+}
+"#;
+
+#[test]
+fn c89_functions_identifier_list_parameters_arrive_promoted() {
+    let program = format!("{KNR_CALLEE}\n{KNR_CALLER}");
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("c89_knr_promoted{opt}"),
+                &program,
+                &[opt.to_string()]
+            ),
+            0,
+            "{opt}"
+        );
+    }
+}
+
+/// Against the platform's own compiler, which is the only check that the
+/// promoted types are the ones actually passed.
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn c89_functions_identifier_list_parameters_interoperate_with_host() {
+    crate::common::interop_host("knr", KNR_CALLEE, KNR_CALLER);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn c89_functions_identifier_list_parameters_interoperate_with_gcc_aarch64() {
+    if !crate::common::aarch64_cross_available() {
+        eprintln!("SKIP: no aarch64 cross toolchain");
+        return;
+    }
+    crate::common::interop_aarch64("knr", KNR_CALLEE, KNR_CALLER);
+}

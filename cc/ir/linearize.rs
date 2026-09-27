@@ -21,7 +21,7 @@ use crate::float::FloatVal;
 use crate::ir::linearize_atomic::AtomicLvalue;
 use crate::parse::ast::{
     BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef, GnuAtomicOp,
-    InitElement, InlineLibraryFn, OffsetOfPath, TranslationUnit, UnaryOp,
+    InitElement, InlineLibraryFn, OffsetOfPath, ParamStyle, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
@@ -52,6 +52,19 @@ pub(crate) enum VmDim {
     /// An extent computed at run time and kept in a hidden local, so it
     /// survives SSA and can be reloaded at each use.
     Sym(PseudoId),
+}
+
+/// A scalar parameter, which the prologue stores into a local of its own.
+struct ScalarParam {
+    name: String,
+    symbol: Option<SymbolId>,
+    /// The declared type: the local's.
+    typ: TypeId,
+    /// The type the caller passes it as, which differs from `typ` only for
+    /// an identifier-list definition ([`ParamStyle::IdentifierList`]).
+    passed_as: TypeId,
+    /// The incoming argument.
+    arg: PseudoId,
 }
 
 /// Information about a local variable
@@ -1119,14 +1132,18 @@ impl<'a> Linearizer<'a> {
 
     /// Store scalar parameters into local storage, so that a parameter
     /// reassigned inside a branch still gets its phi nodes at the merge.
-    fn store_scalar_params(
-        &mut self,
-        scalar_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)>,
-    ) {
+    fn store_scalar_params(&mut self, scalar_params: Vec<ScalarParam>) {
         // Store scalar parameters to local storage for SSA-correct reassignment handling
         // This ensures that if a parameter is reassigned inside a branch, phi nodes
         // are properly inserted at merge points.
-        for (name, symbol_id_opt, typ, arg_pseudo) in scalar_params {
+        for ScalarParam {
+            name,
+            symbol: symbol_id_opt,
+            typ,
+            passed_as,
+            arg,
+        } in scalar_params
+        {
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
             let sym = Pseudo::sym(local_sym, name.clone());
@@ -1138,7 +1155,13 @@ impl<'a> Linearizer<'a> {
                 func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
             }
 
-            // Store the incoming argument value to the local
+            // Store the incoming argument value to the local, converted from
+            // its promoted type when an identifier list declared it.
+            let arg_pseudo = if passed_as == typ {
+                arg
+            } else {
+                self.emit_convert(arg, passed_as, typ)
+            };
             let typ_size = self.types.size_bits(typ);
             self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
 
@@ -1384,8 +1407,7 @@ impl<'a> Linearizer<'a> {
         let mut complex_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId, u32)> =
             Vec::with_capacity(func.params.len());
         // Scalar parameters need local storage for SSA-correct reassignment handling
-        let mut scalar_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
-            Vec::with_capacity(func.params.len());
+        let mut scalar_params: Vec<ScalarParam> = Vec::with_capacity(func.params.len());
         // va_list parameters need special handling (pointer storage)
         let mut valist_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
             Vec::with_capacity(func.params.len());
@@ -1395,7 +1417,14 @@ impl<'a> Linearizer<'a> {
                 .symbol
                 .map(|id| self.symbol_name(id))
                 .unwrap_or_else(|| format!("arg{}", i));
-            ir_func.add_param(&name, param.typ);
+            // What the caller passes: the parameter's own type under a
+            // prototype, its default argument promotion under an identifier
+            // list -- converted back to the declared type on entry.
+            let passed_as = match func.param_style {
+                ParamStyle::Prototype => param.typ,
+                ParamStyle::IdentifierList => self.types.default_argument_promote(param.typ),
+            };
+            ir_func.add_param(&name, passed_as);
 
             // Create argument pseudo (offset by 1 if there's a hidden return pointer)
             let pseudo_id = self.alloc_pseudo();
@@ -1503,7 +1532,13 @@ impl<'a> Linearizer<'a> {
                 // Store all scalar parameters to locals so SSA conversion can properly
                 // handle reassignment with phi nodes. If the parameter is never modified,
                 // SSA will optimize away the redundant load/store.
-                scalar_params.push((name, param.symbol, param.typ, pseudo_id));
+                scalar_params.push(ScalarParam {
+                    name,
+                    symbol: param.symbol,
+                    typ: param.typ,
+                    passed_as,
+                    arg: pseudo_id,
+                });
             }
         }
 
@@ -3360,6 +3395,22 @@ impl<'a> Linearizer<'a> {
             };
             self.types.get(resolved).params.clone()
         });
+        // A call through a function type with no prototype: C17 6.5.2.2p6
+        // gives every argument the default argument promotions, as it does
+        // a variadic one, and an identifier-list definition receives them so
+        // (see `ParamStyle`). Passing a `float` as a float had a gcc-compiled
+        // K&R callee read a double out of a register that held a single, and
+        // a `char` took Apple arm64's one-byte stack slot where the callee
+        // reads an `int`.
+        let unprototyped = func_expr.typ.is_some_and(|ft_id| {
+            let resolved = if self.types.kind(ft_id) == TypeKind::Pointer {
+                self.types.base_type(ft_id).unwrap_or(ft_id)
+            } else {
+                ft_id
+            };
+            self.types.kind(resolved) == TypeKind::Function
+                && self.types.get(resolved).params.is_none()
+        });
 
         // Linearize regular arguments
         // For large structs, pass by reference (address) instead of by value
@@ -3557,6 +3608,13 @@ impl<'a> Linearizer<'a> {
                             // decided by the two sizes alone: nothing about it
                             // stops at 64 bits.
                             (arg_is_int && param_is_int && arg_size < param_size)
+                            // Integer narrowing (long→int, int→char, ...).
+                            // The callee reads only the parameter's own bytes,
+                            // but the ABI places the argument by the
+                            // *parameter's* type: Apple arm64 stacks a `char`
+                            // in one byte, so `f(..., 'a')` recorded as `int`
+                            // took four and moved every later argument.
+                            || (arg_is_int && param_is_int && arg_size > param_size)
                             // FP size mismatch (float→double, long double→double, etc.)
                             || (arg_is_fp && param_is_fp && arg_size != param_size)
                             // Integer to FP (uint32_t→double, int→float, etc.)
@@ -3564,11 +3622,8 @@ impl<'a> Linearizer<'a> {
                             // FP to integer (rare but legal)
                             || (arg_is_fp && param_is_int)
                             // To `_Bool`, whose conversion is `!= 0` and not
-                            // a truncation (C17 6.3.1.2). Every other
-                            // narrowing can be left to the callee, which
-                            // reads the low bytes of the register -- but
-                            // `f(42)` with a `_Bool` parameter must pass 1,
-                            // and passing 42 was wrong for a direct call too.
+                            // a truncation (C17 6.3.1.2): `f(42)` with a
+                            // `_Bool` parameter must pass 1.
                             || self.types.kind(param_type) == TypeKind::Bool;
 
                         if needs_convert {
@@ -3578,7 +3633,8 @@ impl<'a> Linearizer<'a> {
                     }
                 }
 
-                // C99 6.5.2.2p7: default argument promotions for variadic args.
+                // C99 6.5.2.2p7: default argument promotions for variadic args,
+                // and 6.5.2.2p6 for every argument of an unprototyped call.
                 //
                 // Both halves have to happen here. The formal-parameter
                 // conversion above is guarded by `arg_idx < params.len()`, and
@@ -3588,22 +3644,11 @@ impl<'a> Linearizer<'a> {
                 // conversions -- without an explicit promotion the pseudo still
                 // holds the sign-extended load, and `printf("%02x", (unsigned
                 // char)c)` prints ffffff80 for a negative `signed char`.
-                if let Some(va_start) = variadic_arg_start {
-                    if arg_idx >= va_start {
-                        let promoted = match self.types.kind(arg_type) {
-                            // float and _Float16 promote to double.
-                            TypeKind::Float | TypeKind::Float16 => Some(self.types.double_id),
-                            // _Bool, char and short promote to int.
-                            _ => {
-                                let promoted = self.types.integer_promote(arg_type);
-                                (promoted != arg_type).then_some(promoted)
-                            }
-                        };
-
-                        if let Some(promoted) = promoted {
-                            val = self.emit_convert(val, arg_type, promoted);
-                            arg_type = promoted;
-                        }
+                if unprototyped || variadic_arg_start.is_some_and(|v| arg_idx >= v) {
+                    let promoted = self.types.default_argument_promote(arg_type);
+                    if promoted != arg_type {
+                        val = self.emit_convert(val, arg_type, promoted);
+                        arg_type = promoted;
                     }
                 }
 

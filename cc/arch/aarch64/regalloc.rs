@@ -39,6 +39,7 @@
 //   V8-V15      - Callee-saved (lower 64 bits)
 // ============================================================================
 
+use crate::abi::aapcs64::{StackSlot, StackedArgs};
 use crate::arch::asm_constraints::OperandConstraint;
 use crate::arch::regalloc::{
     compute_live_intervals, find_call_positions, identify_addr_taken_syms, identify_fp_pseudos,
@@ -858,7 +859,9 @@ pub struct ParamLayout {
     pub stack_end: IncomingOff,
 }
 
-/// Lay out a function's named parameters by AAPCS64 §6.4.2 stage C.
+/// Lay out a function's named parameters by AAPCS64 §6.4.2 stage C, stacking
+/// the ones that overflow their registers by `stacked` -- the rule the caller
+/// placed them by.
 ///
 /// The one implementation of the rule: `allocate_arguments` binds each
 /// parameter's pseudo to its place, and `va_start` reads the totals to know
@@ -868,8 +871,12 @@ pub struct ParamLayout {
 /// slot) where the tally charged its whole size, and a zero-sized parameter
 /// takes nothing where the tally charged a register -- so `va_arg` read the
 /// wrong slot.
-pub fn param_layout(params: &[(String, TypeId)], types: &TypeTable) -> ParamLayout {
-    use crate::abi::{Aapcs64Abi, Abi, ArgClass, HfaBase, RegClass};
+pub fn param_layout(
+    params: &[(String, TypeId)],
+    types: &TypeTable,
+    stacked: StackedArgs,
+) -> ParamLayout {
+    use crate::abi::{Aapcs64Abi, Abi, ArgClass, RegClass};
     const REGS: usize = 8;
     let abi = Aapcs64Abi::new();
     let mut ngrn = 0usize;
@@ -878,17 +885,13 @@ pub fn param_layout(params: &[(String, TypeId)], types: &TypeTable) -> ParamLayo
     let mut places = Vec::with_capacity(params.len());
     for (_, typ) in params {
         let typ = *typ;
-        let stack = |next: &mut IncomingOff, bytes: usize, fp: bool| ParamPlace::Stack {
-            at: IncomingOff::take(
-                next,
-                bytes as i32,
-                crate::abi::aapcs64::stacked_argument_alignment(types, typ) as i32,
-            ),
+        let stack = |next: &mut IncomingOff, fp: bool| ParamPlace::Stack {
+            at: IncomingOff::take(next, stacked.slot(types, typ)),
             fp,
         };
         let place = match abi.classify_param(typ, types) {
             // Float / double / _Float16 / long double: one V register.
-            ArgClass::Direct { classes, size_bits }
+            ArgClass::Direct { classes, .. }
                 if classes.len() == 1 && classes[0] == RegClass::Sse =>
             {
                 let place = if nsrn < REGS {
@@ -897,7 +900,7 @@ pub fn param_layout(params: &[(String, TypeId)], types: &TypeTable) -> ParamLayo
                         count: 1,
                     }
                 } else {
-                    stack(&mut next, (size_bits / 8) as usize, true)
+                    stack(&mut next, true)
                 };
                 nsrn += 1;
                 place
@@ -906,21 +909,15 @@ pub fn param_layout(params: &[(String, TypeId)], types: &TypeTable) -> ParamLayo
             // `count` consecutive V registers. Once one is stacked, NSRN
             // becomes 8 and every later floating-point argument follows it
             // there (§6.4.2), unlike System V.
-            ArgClass::Hfa { base, count } => {
+            ArgClass::Hfa { count, .. } => {
                 let count = count as usize;
-                let elem = match base {
-                    HfaBase::Float16 => 2,
-                    HfaBase::Float32 => 4,
-                    HfaBase::Float64 => 8,
-                    HfaBase::Float128 => 16,
-                };
                 if nsrn + count <= REGS {
                     let place = ParamPlace::Fp { first: nsrn, count };
                     nsrn += count;
                     place
                 } else {
                     nsrn = REGS;
-                    stack(&mut next, count * elem, true)
+                    stack(&mut next, true)
                 }
             }
             // A 128-bit integer, or a composite of at most sixteen bytes that
@@ -940,7 +937,7 @@ pub fn param_layout(params: &[(String, TypeId)], types: &TypeTable) -> ParamLayo
                     }
                     None => {
                         ngrn = REGS;
-                        stack(&mut next, 16, false)
+                        stack(&mut next, false)
                     }
                 }
             }
@@ -956,7 +953,7 @@ pub fn param_layout(params: &[(String, TypeId)], types: &TypeTable) -> ParamLayo
                         count: 1,
                     }
                 } else {
-                    stack(&mut next, 8, false)
+                    stack(&mut next, false)
                 }
             }
         };
@@ -981,36 +978,25 @@ impl IncomingOff {
     /// The first incoming stack argument, just above the saved FP and LR.
     pub const FIRST: IncomingOff = IncomingOff(16);
 
-    /// Reserve `bytes` for an argument whose type wants `align`-byte
-    /// alignment, and hand back where it starts.
+    /// Reserve `slot` for the next stacked argument, and hand back where it
+    /// starts.
     ///
-    /// AAPCS64 §6.4.2 stage C rounds the next stacked-argument address up to
-    /// `max(8, alignof(type))` *before* placing the argument, not only its
-    /// size afterwards. Rounding to 8 alone put a sixteen-byte-aligned
-    /// argument eight bytes low whenever an odd number of eight-byte slots
-    /// came before it. Both sides shared the error, so it showed only against
-    /// another compiler.
-    ///
-    /// Stage C rounds the NSAA -- the next stacked-argument *address*, whose
-    /// origin is the argument area's base -- so the rounding belongs to the
-    /// offset within that area, not to the frame displacement. The two differ
-    /// by the saved FP and LR pair, and rounding the displacement directly
-    /// charged an over-aligned argument for those 16 bytes and started it a
-    /// whole alignment unit too high. Only alignment past 16 can tell the two
-    /// apart, which is why this survived: below that the base is already a
-    /// multiple of the alignment. x86-64's `IncomingOff::take` is the same
-    /// shape and had the same defect.
+    /// The placement is [`StackSlot::place`], the same call the caller lays
+    /// its outgoing area out with; this only translates between the argument
+    /// area's own offsets and the frame displacement it sits at. The rounding
+    /// belongs to the offset within the area -- the NSAA of stage C -- and not
+    /// to the displacement: the two differ by the saved FP and LR pair, and
+    /// rounding the displacement directly charged an over-aligned argument
+    /// for those 16 bytes and started it a whole alignment unit too high.
     ///
     /// Summed in `i64` and saturated: two stacked arguments each inside the
     /// frame ceiling can still overflow their total. The caller checks the
     /// end once, with [`crate::arch::regalloc::check_incoming_area`].
-    pub fn take(next: &mut IncomingOff, bytes: i32, align: i32) -> Self {
-        let align = i64::from(align.max(8));
+    pub fn take(next: &mut IncomingOff, slot: StackSlot) -> Self {
         let base = i64::from(IncomingOff::FIRST.0);
-        let at = base + ((i64::from(next.0) - base + align - 1) & !(align - 1));
-        let end = at + ((i64::from(bytes) + 7) & !7);
-        next.0 = i32::try_from(end).unwrap_or(i32::MAX);
-        IncomingOff(i32::try_from(at).unwrap_or(i32::MAX))
+        let (at, end) = slot.place(i64::from(next.0) - base);
+        next.0 = i32::try_from(base + end).unwrap_or(i32::MAX);
+        IncomingOff(i32::try_from(base + at).unwrap_or(i32::MAX))
     }
 
     /// The displacement the addressing helpers work in.
@@ -1425,6 +1411,8 @@ pub struct RegAlloc {
     /// Maximum alignment requirement of any local variable (for dynamic stack alignment)
     /// Which register locals are addressed through, decided before allocation.
     frame_base: FrameBase,
+    /// How the target stacks named parameters that overflow their registers.
+    stacked_args: StackedArgs,
 }
 
 impl RegAlloc {
@@ -1435,8 +1423,11 @@ impl RegAlloc {
         self
     }
 
-    pub fn new() -> Self {
+    /// An allocator for a target that stacks overflowing named parameters
+    /// by `stacked_args` -- [`StackedArgs::of`] the target.
+    pub fn new(stacked_args: StackedArgs) -> Self {
         Self {
+            stacked_args,
             locations: HashMap::new(),
             free_regs: Reg::allocatable().to_vec(),
             free_fp_regs: VReg::allocatable().to_vec(),
@@ -1537,7 +1528,7 @@ impl RegAlloc {
             self.locations.insert(sret_id, Loc::Reg(Reg::X8));
         }
 
-        let layout = param_layout(&func.params, types);
+        let layout = param_layout(&func.params, types, self.stacked_args);
         for (i, place) in layout.places.iter().enumerate() {
             let arg_idx = i + lowering.arg_idx_offset as usize;
             let Some(pseudo) = lowering.arg_pseudos.get(arg_idx).copied().flatten() else {
@@ -2302,12 +2293,6 @@ impl RegAlloc {
     }
 }
 
-impl Default for RegAlloc {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2326,31 +2311,41 @@ mod tests {
     /// that stays true.
     #[test]
     fn incoming_args_are_laid_out_from_the_area_base() {
+        let slot = |bytes: usize, align: usize| StackSlot { bytes, align };
         let first = IncomingOff::FIRST.0;
 
         // Alignment up to the base's own: unchanged, and packed at 8.
         let mut next = IncomingOff::FIRST;
-        assert_eq!(IncomingOff::take(&mut next, 8, 8).displacement(), first);
-        assert_eq!(IncomingOff::take(&mut next, 8, 8).displacement(), first + 8);
         assert_eq!(
-            IncomingOff::take(&mut next, 16, 16).displacement(),
+            IncomingOff::take(&mut next, slot(8, 8)).displacement(),
+            first
+        );
+        assert_eq!(
+            IncomingOff::take(&mut next, slot(8, 8)).displacement(),
+            first + 8
+        );
+        assert_eq!(
+            IncomingOff::take(&mut next, slot(16, 16)).displacement(),
             first + 16
         );
 
         // A 16-aligned argument landing on an odd 8-byte slot still rounds.
         let mut next = IncomingOff::FIRST;
-        assert_eq!(IncomingOff::take(&mut next, 8, 8).displacement(), first);
         assert_eq!(
-            IncomingOff::take(&mut next, 16, 16).displacement(),
+            IncomingOff::take(&mut next, slot(8, 8)).displacement(),
+            first
+        );
+        assert_eq!(
+            IncomingOff::take(&mut next, slot(16, 16)).displacement(),
             first + 16
         );
 
         // Past the base's alignment is where the bases diverge. Arriving
         // first, an over-aligned argument must start *at* the base.
-        for align in [32, 64] {
+        for align in [32usize, 64] {
             let mut next = IncomingOff::FIRST;
             assert_eq!(
-                IncomingOff::take(&mut next, align, align).displacement(),
+                IncomingOff::take(&mut next, slot(align, align)).displacement(),
                 first,
                 "an {align}-aligned argument arriving first starts at the area base"
             );
@@ -2358,14 +2353,63 @@ mod tests {
 
         // And after an 8-byte argument it rounds to the next multiple of its
         // alignment measured from the base, not from the displacement.
-        for align in [32, 64] {
+        for align in [32usize, 64] {
             let mut next = IncomingOff::FIRST;
-            assert_eq!(IncomingOff::take(&mut next, 8, 8).displacement(), first);
             assert_eq!(
-                IncomingOff::take(&mut next, align, align).displacement(),
-                first + align,
+                IncomingOff::take(&mut next, slot(8, 8)).displacement(),
+                first
+            );
+            assert_eq!(
+                IncomingOff::take(&mut next, slot(align, align)).displacement(),
+                first + align as i32,
                 "an {align}-aligned argument rounds within the argument area"
             );
+        }
+    }
+
+    /// Named parameters past the registers, read back by each platform's
+    /// rule: eight ints and eight doubles fill x0-x7 and v0-v7, and then
+    /// `char, short, char, int, double, char` arrive on the stack.
+    ///
+    /// AAPCS64 gives each an eight-byte granule; Apple packs each at its
+    /// natural size and alignment. The caller's side of the same sequence is
+    /// asserted in `cc/tests/codegen/cross_abi.rs`.
+    #[test]
+    fn stacked_params_follow_the_platform_rule() {
+        use crate::target::{Arch, Os, Target};
+        for (os, stacked, want) in [
+            (Os::Linux, StackedArgs::Granules, [0, 8, 16, 24, 32, 40]),
+            (Os::MacOS, StackedArgs::Natural, [0, 2, 4, 8, 16, 24]),
+        ] {
+            let target = Target::new(Arch::Aarch64, os);
+            assert_eq!(StackedArgs::of(&target), stacked);
+            let types = TypeTable::new(&target);
+            let mut params: Vec<(String, TypeId)> = Vec::new();
+            params.extend((0..8).map(|i| (format!("i{i}"), types.int_id)));
+            params.extend((0..8).map(|i| (format!("d{i}"), types.double_id)));
+            for t in [
+                types.char_id,
+                types.short_id,
+                types.char_id,
+                types.int_id,
+                types.double_id,
+                types.char_id,
+            ] {
+                params.push((format!("s{}", params.len()), t));
+            }
+            let layout = param_layout(&params, &types, stacked);
+            let got: Vec<i32> = layout.places[16..]
+                .iter()
+                .map(|p| match p {
+                    ParamPlace::Stack { at, .. } => {
+                        at.displacement() - IncomingOff::FIRST.displacement()
+                    }
+                    other => panic!("expected a stacked parameter on {os:?}, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(got, want, "stacked parameter offsets on {os:?}");
+            let end = layout.stack_end.displacement() - IncomingOff::FIRST.displacement();
+            assert_eq!(end, if os == Os::MacOS { 25 } else { 48 });
         }
     }
 

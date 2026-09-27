@@ -25,4 +25,5 @@ mod promotion;
 mod regalloc;
 mod scaling;
 mod sections;
+mod stacked_args;
 mod tls_models;

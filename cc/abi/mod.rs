@@ -134,6 +134,18 @@ pub enum HfaBase {
     Float128,
 }
 
+impl HfaBase {
+    /// The width of one element, in bytes.
+    pub fn bytes(self) -> usize {
+        match self {
+            HfaBase::Float16 => 2,
+            HfaBase::Float32 => 4,
+            HfaBase::Float64 => 8,
+            HfaBase::Float128 => 16,
+        }
+    }
+}
+
 /// How an argument or return value should be passed.
 ///
 /// This is the primary classification result used by the backend to

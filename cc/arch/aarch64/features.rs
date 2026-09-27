@@ -176,11 +176,15 @@ impl Aarch64CodeGen {
 
         if self.base.target.os == crate::target::Os::MacOS {
             // Darwin passes every variadic argument on the stack and spells
-            // va_list as a plain pointer to it, starting at the original SP.
+            // va_list as a plain pointer to it: past any named parameter that
+            // overflowed its registers, where the caller began laying them
+            // out. Starting at the original SP read the named ones as the
+            // first variadic arguments.
             let Some(ap) = self.va_list_addr(&ap_loc, scratch1) else {
                 return;
             };
-            self.store_va_frame_ptr(ap, 0, self.frame_size, scratch0);
+            let first_va = crate::abi::aapcs64::darwin_va_area_start(self.named_stack_param_bytes);
+            self.store_va_frame_ptr(ap, 0, self.frame_size + first_va, scratch0);
             return;
         }
 

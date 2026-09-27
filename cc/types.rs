@@ -2011,6 +2011,24 @@ impl TypeTable {
         }
     }
 
+    /// The default argument promotions (C17 6.5.2.2p6): the type an argument
+    /// with no parameter type to convert it to is passed as -- a variadic
+    /// one, or any argument of a call without a prototype -- and so the type
+    /// a definition with an identifier list receives each parameter as.
+    ///
+    /// The integer promotions, and `float` (with `_Float16`, as gcc passes
+    /// it) to `double`. A complex type is left alone: `kind` answers its
+    /// base's kind, and `float _Complex` is not a `float`.
+    pub fn default_argument_promote(&self, id: TypeId) -> TypeId {
+        if self.is_complex(id) {
+            return id;
+        }
+        match self.kind(id) {
+            TypeKind::Float | TypeKind::Float16 => self.double_id,
+            _ => self.integer_promote(id),
+        }
+    }
+
     /// Get the size of a type in bits
     pub fn size_bits(&self, id: TypeId) -> u32 {
         let typ = self.get(id);
@@ -2959,6 +2977,30 @@ mod tests {
     /// different question from how the type is spelled. `signed char` and
     /// `unsigned char` say what they are on every target; only bare `char`
     /// moves.
+    /// C17 6.5.2.2p6: the integer promotions, and `float` to `double`; a
+    /// complex type is not a `float` although `kind` answers `Float` for it.
+    #[test]
+    fn test_default_argument_promotions() {
+        let types = TypeTable::new(&Target::new(Arch::Aarch64, Os::MacOS));
+        for (from, to) in [
+            (types.bool_id, types.int_id),
+            (types.char_id, types.int_id),
+            (types.uchar_id, types.int_id),
+            (types.short_id, types.int_id),
+            (types.ushort_id, types.int_id),
+            (types.int_id, types.int_id),
+            (types.long_id, types.long_id),
+            (types.float_id, types.double_id),
+            (types.float16_id, types.double_id),
+            (types.double_id, types.double_id),
+            (types.longdouble_id, types.longdouble_id),
+            (types.complex_float_id, types.complex_float_id),
+            (types.void_ptr_id, types.void_ptr_id),
+        ] {
+            assert_eq!(types.default_argument_promote(from), to, "{from:?}");
+        }
+    }
+
     #[test]
     fn test_plain_char_signedness_follows_the_target() {
         let x86 = TypeTable::new(&Target::new(Arch::X86_64, Os::Linux));

@@ -145,6 +145,109 @@ pub(crate) fn darwin_va_slot(
     (bytes, (types.alignment(ty) as i32).max(8))
 }
 
+/// Where the first variadic argument of a Darwin call sits, given where the
+/// named arguments that overflowed their registers end.
+///
+/// Named arguments pack at their natural size ([`StackedArgs::Natural`]), so
+/// they can end on any byte; every variadic slot starts on at least an
+/// eight-byte boundary ([`darwin_va_slot`]). The caller lays the first one
+/// out from here, and the callee's `va_start` points here.
+pub(crate) fn darwin_va_area_start(named_end: i32) -> i32 {
+    (named_end + 7) & !7
+}
+
+/// How a platform lays out the *named* arguments that did not fit in
+/// registers.
+///
+/// This is the one rule both sides of a call ask: the caller's outgoing
+/// argument area and the callee's incoming parameter offsets are laid out by
+/// [`StackedArgs::slot`] and [`StackSlot::place`] and nothing else, so the two
+/// cannot drift apart the way they could when each counted slots for itself.
+/// Variadic arguments on Apple targets follow [`darwin_va_slot`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackedArgs {
+    /// AAPCS64 §6.4.2 stages C.12-C.16: the next stacked-argument address is
+    /// rounded up to `max(8, alignment)` and the argument's size to a
+    /// multiple of eight, so every argument takes whole eight-byte granules.
+    /// A `char` occupies eight bytes.
+    Granules,
+    /// Apple arm64 ("Writing ARM64 code for Apple platforms"): a scalar takes
+    /// its natural size at its natural alignment -- a `char` one byte, a
+    /// `short` two at an even offset -- and an HFA packs its elements at the
+    /// element's alignment. A composite that is not an HFA is still rounded
+    /// to eight-byte granules, because clang coerces it to an array of
+    /// `i64` (or an `i128`) before it is placed, exactly as AAPCS64 does.
+    Natural,
+}
+
+impl StackedArgs {
+    /// The rule `target` lays its stacked named arguments out by.
+    pub fn of(target: &crate::target::Target) -> Self {
+        if target.os == crate::target::Os::MacOS {
+            StackedArgs::Natural
+        } else {
+            StackedArgs::Granules
+        }
+    }
+
+    /// The slot a named argument of type `ty` occupies once it is on the
+    /// stack.
+    ///
+    /// Only asked of an argument that is passed at all: a zero-sized type
+    /// (`ArgClass::Ignore`) never reaches the stack.
+    pub fn slot(self, types: &TypeTable, ty: TypeId) -> StackSlot {
+        let class = Aapcs64Abi::new().classify_param(ty, types);
+        // An argument replaced by a pointer to a copy (stage C.4) is that
+        // pointer on the stack, whatever the object is.
+        if matches!(class, ArgClass::Indirect { .. }) {
+            return StackSlot { bytes: 8, align: 8 };
+        }
+        let bytes = match class {
+            ArgClass::Hfa { base, count } => base.bytes() * count as usize,
+            _ => types.size_bytes(ty),
+        };
+        match self {
+            StackedArgs::Natural => match class {
+                ArgClass::Hfa { base, .. } => StackSlot {
+                    bytes,
+                    align: base.bytes(),
+                },
+                _ if types.is_aggregate_or_complex(ty) => StackedArgs::Granules.slot(types, ty),
+                _ => StackSlot {
+                    bytes,
+                    align: types.natural_alignment(ty).max(1),
+                },
+            },
+            StackedArgs::Granules => StackSlot {
+                bytes: (bytes + 7) & !7,
+                align: stacked_argument_alignment(types, ty),
+            },
+        }
+    }
+}
+
+/// The bytes a stacked argument occupies and the alignment its start needs,
+/// both relative to the base of the argument area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StackSlot {
+    pub bytes: usize,
+    pub align: usize,
+}
+
+impl StackSlot {
+    /// Place this slot at the first suitably aligned offset at or after `at`,
+    /// returning where it starts and where the next argument may begin.
+    ///
+    /// The rounding applies to the offset within the argument area -- the
+    /// NSAA of stage C -- not to any frame displacement the area happens to
+    /// sit at.
+    pub fn place(self, at: i64) -> (i64, i64) {
+        let align = self.align as i64;
+        let start = (at + align - 1) & !(align - 1);
+        (start, start + self.bytes as i64)
+    }
+}
+
 /// Maximum aggregate size (in bits) that can be passed in registers.
 /// Structs larger than 128 bits (16 bytes) must use sret (unless HFA).
 const MAX_AGGREGATE_BITS: u32 = 128;
@@ -755,6 +858,139 @@ mod tests {
             "a struct of two doubles is two elements, got {:?}",
             abi.classify_return(st, &types)
         );
+    }
+
+    /// A struct of `members` at the given offsets, sized and aligned as C
+    /// lays it out.
+    fn record(types: &mut TypeTable, members: &[(TypeId, usize)], size: usize) -> TypeId {
+        let align = members
+            .iter()
+            .map(|(t, _)| types.alignment(*t))
+            .max()
+            .unwrap_or(1);
+        types.intern(Type::struct_type(CompositeType {
+            tag: None,
+            members: members
+                .iter()
+                .map(|&(typ, offset)| StructMember {
+                    name: crate::strings::StringId::default(),
+                    typ,
+                    offset,
+                    bit_width: None,
+                    bit_offset: None,
+                    access_bytes: None,
+                    explicit_align: None,
+                })
+                .collect(),
+            enum_constants: vec![],
+            size,
+            align,
+            member_align: align,
+            is_complete: true,
+            transparent: false,
+            anon_id: None,
+        }))
+    }
+
+    /// The slot each kind of named argument takes once it is on the stack,
+    /// under AAPCS64's granules and under Apple's natural packing.
+    ///
+    /// Apple's rule ("Writing ARM64 code for Apple platforms"): a scalar at
+    /// its own size and alignment, an HFA at its element's, and a composite
+    /// that is not an HFA in eight-byte granules -- clang coerces it to
+    /// `i64`s before it is placed. Anything over sixteen bytes is a pointer.
+    #[test]
+    fn stacked_argument_slots_per_platform() {
+        for os in [Os::Linux, Os::MacOS] {
+            let target = Target::new(Arch::Aarch64, os);
+            let mut types = TypeTable::new(&target);
+            let (c, sh, f, d, h, l) = (
+                types.char_id,
+                types.short_id,
+                types.float_id,
+                types.double_id,
+                types.float16_id,
+                types.long_id,
+            );
+            let s3 = record(&mut types, &[(c, 0), (c, 1), (c, 2)], 3);
+            let s5 = record(&mut types, &[(c, 0), (c, 1), (c, 2), (c, 3), (c, 4)], 5);
+            let s6 = record(&mut types, &[(sh, 0), (sh, 2), (sh, 4)], 6);
+            let s16 = record(&mut types, &[(l, 0), (l, 8)], 16);
+            let big = record(&mut types, &[(l, 0), (l, 8), (l, 16)], 24);
+            let f1 = record(&mut types, &[(f, 0)], 4);
+            let f3 = record(&mut types, &[(f, 0), (f, 4), (f, 8)], 12);
+            let d2 = record(&mut types, &[(d, 0), (d, 8)], 16);
+            let h3 = record(&mut types, &[(h, 0), (h, 2), (h, 4)], 6);
+            let ptr = types.void_ptr_id;
+
+            let slot = |bytes, align| StackSlot { bytes, align };
+            let darwin = os == Os::MacOS;
+            // (type, what, Apple's slot); AAPCS64 rounds each up to granules.
+            let rows = [
+                (types.bool_id, "_Bool", slot(1, 1)),
+                (c, "char", slot(1, 1)),
+                (sh, "short", slot(2, 2)),
+                (types.int_id, "int", slot(4, 4)),
+                (l, "long", slot(8, 8)),
+                (ptr, "void *", slot(8, 8)),
+                (h, "_Float16", slot(2, 2)),
+                (f, "float", slot(4, 4)),
+                (d, "double", slot(8, 8)),
+                (types.int128_id, "__int128", slot(16, 16)),
+                (s3, "struct of 3 chars", slot(8, 8)),
+                (s5, "struct of 5 chars", slot(8, 8)),
+                (s6, "struct of 3 shorts", slot(8, 8)),
+                (s16, "struct of 2 longs", slot(16, 8)),
+                (big, "24-byte struct (by reference)", slot(8, 8)),
+                (f1, "struct { float; }", slot(4, 4)),
+                (f3, "HFA of 3 floats", slot(12, 4)),
+                (d2, "HFA of 2 doubles", slot(16, 8)),
+                (h3, "HFA of 3 _Float16", slot(6, 2)),
+                (types.complex_float_id, "float _Complex", slot(8, 4)),
+                (types.complex_double_id, "double _Complex", slot(16, 8)),
+            ];
+            let stacked = StackedArgs::of(&target);
+            for (ty, what, apple) in rows {
+                let want = if darwin {
+                    apple
+                } else {
+                    slot((apple.bytes + 7) & !7, apple.align.clamp(8, 16))
+                };
+                assert_eq!(stacked.slot(&types, ty), want, "{what} on {os:?}");
+            }
+
+            // `long double` is binary128 on Linux and a double on Apple.
+            let ld = stacked.slot(&types, types.longdouble_id);
+            assert_eq!(ld, if darwin { slot(8, 8) } else { slot(16, 16) });
+
+            // Placed one after another from the area's base.
+            let mut at = 0;
+            let offsets: Vec<i64> = [c, f3, c, s3, sh, d]
+                .into_iter()
+                .map(|t| {
+                    let (start, end) = stacked.slot(&types, t).place(at);
+                    at = end;
+                    start
+                })
+                .collect();
+            if darwin {
+                assert_eq!(offsets, [0, 4, 16, 24, 32, 40]);
+                assert_eq!(at, 48);
+            } else {
+                assert_eq!(offsets, [0, 8, 24, 32, 40, 48]);
+                assert_eq!(at, 56);
+            }
+        }
+    }
+
+    /// A Darwin callee's `va_list` starts where its caller began laying the
+    /// variadic arguments out: past the packed named ones, on a granule.
+    #[test]
+    fn darwin_variadics_start_on_a_granule() {
+        assert_eq!(darwin_va_area_start(0), 0);
+        assert_eq!(darwin_va_area_start(1), 8);
+        assert_eq!(darwin_va_area_start(8), 8);
+        assert_eq!(darwin_va_area_start(25), 32);
     }
 
     #[test]

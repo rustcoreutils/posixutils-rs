@@ -188,7 +188,7 @@ Use `returns_via_sret()` and `returns_two_regs()` to query return strategy.
 
 ### Memory Builtins
 
-These lower to libc calls (`memset` / `memcpy` / `memmove`) and are marked as side-effecting roots so DCE preserves them.
+These lower to libc calls (`memset` / `memcpy` / `memmove`) and are marked as side-effecting roots so DCE preserves them. One whose length is a small constant never gets that far: `memexpand` replaces it with loads and stores.
 
 | Opcode | Description |
 |--------|-------------|
@@ -337,9 +337,10 @@ extern_symbols          - symbols needing GOT
 | `ifconv.rs` | If-conversion: collapses a short-circuit `&&`/`||` diamond whose arm is safe to speculate into a `Select` |
 | `sccp.rs` | Sparse conditional constant propagation: constants along reachable paths only, and the only thing that folds a branch on a constant condition |
 | `inline.rs` | Function inlining |
+| `memexpand.rs` | A `memcpy`, `memset` or `memmove` of a small constant length becomes integer loads and stores, at every level. Also owns the chunking and the size limit the linearizer's aggregate copies use |
 | `lower.rs` | Phi elimination to copies |
 
-The driver in `cc/opt.rs` runs `inline → constglobal → (vrp + ifconv + sccp + instcombine + dce)*` to fixed
+The driver in `cc/opt.rs` runs `inline → memexpand → constglobal → (memexpand + loadfwd + vrp + ifconv + sccp + instcombine + dse + dce)*` to fixed
 point (up to 10 iterations). The order inside the loop is load-bearing in both
 directions: `instcombine` derives constants `sccp` structurally cannot (`x - x`,
 `x ^ x`), any of which can make a branch condition constant, and `sccp` deletes

@@ -68,9 +68,9 @@ argument folds at `-O1` and above.
 |---------|-------------|
 | `__builtin_alloca(size)` | Allocate `size` bytes on stack (freed on function return) |
 | `alloca(size)` | The same builtin under its bare name, as gcc predefines it. Unlike a `__builtin_*` spelling it is not reserved, so a declaration that is not a function displaces it; the one in `<alloca.h>` is a function and does not |
-| `__builtin_memset(dst, c, n)` | Set `n` bytes to `c` |
-| `__builtin_memcpy(dst, src, n)` | Copy `n` bytes |
-| `__builtin_memmove(dst, src, n)` | Copy `n` bytes (overlapping safe) |
+| `memset(dst, c, n)`, `__builtin_memset(dst, c, n)` | Set `n` bytes to `(unsigned char)c` |
+| `memcpy(dst, src, n)`, `__builtin_memcpy(dst, src, n)` | Copy `n` bytes |
+| `memmove(dst, src, n)`, `__builtin_memmove(dst, src, n)` | Copy `n` bytes (overlapping safe) |
 | `__builtin_prefetch(addr, ...)` | Cache prefetch hint. Emits nothing, but `addr` is still **evaluated** — `__builtin_prefetch((q = p))` assigns `q`. The `rw` and locality arguments must be constants, so they have nothing to evaluate |
 
 ## Control Flow
@@ -111,12 +111,26 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 
 `abs`, `labs`, `llabs`, `imaxabs`, `fabs`, `fabsf`, `fabsl`, `copysign`,
 `copysignf`, `copysignl`, `floor`, `ceil`, `trunc`, `round`, `rint`,
-`nearbyint`, and `creal`, `cimag` and `conj` in each precision are known to
-c17 by prototype, under their bare names and (except
-the floor family) their `__builtin_` spellings. One table in
+`nearbyint`, `creal`, `cimag` and `conj` in each precision, and `memcpy`,
+`memset` and `memmove` are known to c17 by prototype, under their bare names
+and (except the floor family) their `__builtin_` spellings. One table in
 `parse/library_builtin.rs` gives each its prototype and how it is evaluated:
-in place, or -- for the floor family -- as a call to the library function,
-narrowed to the `float` form for a `float` argument.
+in place, as a block memory operation, or -- for the floor family -- as a call
+to the library function, narrowed to the `float` form for a `float` argument.
+
+A `memcpy` or `memset` whose length is a constant of at most 128 bytes, or a
+`memmove` of at most 64, is expanded into integer loads and stores of 8, 4, 2
+and 1 bytes at every level, as gcc does at `-O2`; a longer or a variable
+length is a call. The expansion is IR (`ir/memexpand.rs`), after inlining and
+again in the optimizer's loop, so a length that inlining makes constant is
+expanded too, and the stored bytes are forwarded like any others: `unsigned x
+= 5, y; memcpy(&y, &x, 4); return y + 1;` returns the constant 6. No
+alignment is assumed. `memmove` loads every chunk before it stores any, which
+is what makes it right for an overlap in either direction, and why its limit
+is lower -- every chunk is live at once. The limit is the one the linearizer's
+own aggregate copies use, in the same chunks. The bare names are displaced
+like `fabs`, including by a declaration that is not the `<string.h>`
+prototype and by `-fno-builtin[-memcpy]`.
 
 However it is evaluated, what the program wrote is a call (C17 7.1.4p1). The
 arguments are checked exactly as an ordinary call to a function of that

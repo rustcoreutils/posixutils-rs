@@ -8,6 +8,7 @@
 
 //! Emit helpers for the linearizer (constants, block copies, bitfields, operators, assignments)
 
+use super::memexpand;
 use super::{CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
 use crate::abi::get_abi_for_conv;
 use crate::diag::{error, Position};
@@ -212,23 +213,12 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit_block_copy_at_offset(dst, 0, src, size_bytes);
     }
 
-    /// Above this many bytes, a block copy becomes a `memcpy` call rather than
-    /// an unrolled load/store sequence.
-    ///
-    /// The unrolled form costs one load, one store and one fresh pseudo per
-    /// eight bytes, with no upper bound: a 256 KB struct passed by value --
-    /// `struct big { int i[0x10000]; }`, which gcc.c-torture's pr28982b does --
-    /// produced 65,536 IR instructions, 131,108 lines of assembly and a
-    /// **65-second** compile, against gcc's 48 lines and one `call memcpy`.
-    ///
-    /// Small copies stay inline, where they belong: a call would cost more than
-    /// the moves it replaces, and `test_linearize.rs` pins two 64-bit loads and
-    /// two 64-bit stores for a 128-bit copy. 128 bytes leaves every realistic
-    /// struct on the inline path and takes only the pathological ones off it.
-    const BLOCK_COPY_INLINE_LIMIT: i64 = 128;
-
     /// Emit a block copy from src to dst using integer chunks.
     /// The destination stores start at dst_base_offset.
+    ///
+    /// Above `memexpand::INLINE_LIMIT_BYTES` the copy is a `memcpy` call
+    /// instead, by the same rule and in the same chunks as a `memcpy` the
+    /// program wrote.
     pub(crate) fn emit_block_copy_at_offset(
         &mut self,
         dst: PseudoId,
@@ -236,63 +226,20 @@ impl<'a> super::linearize::Linearizer<'a> {
         src: PseudoId,
         size_bytes: i64,
     ) {
-        if size_bytes > Self::BLOCK_COPY_INLINE_LIMIT {
+        if size_bytes > memexpand::INLINE_LIMIT_BYTES {
             self.emit_block_copy_call(dst, dst_base_offset, src, size_bytes);
             return;
         }
-        let mut offset: i64 = 0;
-        while offset + 8 <= size_bytes {
+        for (offset, chunk) in memexpand::block_chunks(size_bytes) {
+            let (typ, bits) = (chunk.typ(self.types), chunk.bits());
             let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(tmp, src, offset, self.types.ulong_id, 64));
+            self.emit(Instruction::load(tmp, src, offset, typ, bits));
             self.emit(Instruction::store(
                 tmp,
                 dst,
                 dst_base_offset + offset,
-                self.types.ulong_id,
-                64,
-            ));
-            offset += 8;
-        }
-        let remaining = size_bytes - offset;
-        if remaining >= 4 {
-            let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(tmp, src, offset, self.types.uint_id, 32));
-            self.emit(Instruction::store(
-                tmp,
-                dst,
-                dst_base_offset + offset,
-                self.types.uint_id,
-                32,
-            ));
-            offset += 4;
-        }
-        if remaining % 4 >= 2 {
-            let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(
-                tmp,
-                src,
-                offset,
-                self.types.ushort_id,
-                16,
-            ));
-            self.emit(Instruction::store(
-                tmp,
-                dst,
-                dst_base_offset + offset,
-                self.types.ushort_id,
-                16,
-            ));
-            offset += 2;
-        }
-        if remaining % 2 == 1 {
-            let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(tmp, src, offset, self.types.uchar_id, 8));
-            self.emit(Instruction::store(
-                tmp,
-                dst,
-                dst_base_offset + offset,
-                self.types.uchar_id,
-                8,
+                typ,
+                bits,
             ));
         }
     }

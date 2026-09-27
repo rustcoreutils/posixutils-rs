@@ -23,5 +23,6 @@ mod gnu_atomics;
 mod has_feature;
 mod intrinsics;
 mod math;
+mod mem_expand;
 mod memory;
 mod va_arg_pack;

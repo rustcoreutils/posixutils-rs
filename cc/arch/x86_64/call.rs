@@ -56,7 +56,7 @@ pub(super) struct CallArgInfo {
 
 /// The largest stacked aggregate argument copied with unrolled moves; past
 /// it, `rep movsq`. The IR stops unrolling a block copy at 128 bytes
-/// (`BLOCK_COPY_INLINE_LIMIT`) for the same reason: one load/store pair per
+/// (`memexpand::INLINE_LIMIT_BYTES`) for the same reason: one load/store pair per
 /// eightbyte made a 600 MB argument 75 million instructions and tens of
 /// gigabytes of compiler memory.
 const STACK_ARG_UNROLL_QWORDS: usize = 16;

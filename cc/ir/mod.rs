@@ -31,6 +31,7 @@ pub mod loadfwd;
 pub mod lower;
 pub mod mach_o_dtors;
 pub mod mem2reg;
+pub mod memexpand;
 pub mod memloc;
 pub mod propagate;
 pub mod range;

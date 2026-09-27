@@ -5448,6 +5448,76 @@ fn test_complex_accessor_incompatible_declaration_displaces_builtin() {
     assert!(parse_tu(code).is_ok());
 }
 
+/// `memcpy`, `memset` and `memmove`, bare or reserved, are block memory
+/// nodes whose arguments are converted as the prototype says, and whose
+/// constant length is folded to a `size_t` literal.
+#[test]
+fn test_memory_builtins() {
+    let decls = "char *d; const char *s; int c; unsigned char n;";
+    let cases = [
+        "memcpy(d, s, 16)",
+        "__builtin_memcpy(d, s, 8 + 8)",
+        "memset(d, c, 16)",
+        "__builtin_memset(d, 'x', 16)",
+        "memmove(d, s, 16)",
+        "__builtin_memmove(d, s, 16)",
+    ];
+    for stmt in cases {
+        with_statement_expr(decls, stmt, |p, e| {
+            let t = &*p.types;
+            assert_eq!(e.typ, Some(t.void_ptr_id), "{stmt}");
+            let (dest, second, n, second_typ) = match &e.kind {
+                ExprKind::Memcpy { dest, src, n } | ExprKind::Memmove { dest, src, n } => {
+                    (dest, src, n, t.const_void_ptr_id)
+                }
+                ExprKind::Memset { dest, c, n } => (dest, c, n, t.int_id),
+                other => panic!("{stmt}: expected a block memory node, got {other:?}"),
+            };
+            assert_eq!(dest.typ, Some(t.void_ptr_id), "{stmt}");
+            assert_eq!(second.typ, Some(second_typ), "{stmt}");
+            assert_eq!(n.typ, Some(t.ulong_id), "{stmt}");
+            assert!(
+                matches!(n.kind, ExprKind::IntLit(16)),
+                "{stmt}: {:?}",
+                n.kind
+            );
+        });
+    }
+    // A length known only at run time is converted, not folded.
+    with_statement_expr(decls, "memcpy(d, s, n)", |p, e| {
+        let ExprKind::Memcpy { n, .. } = &e.kind else {
+            panic!("expected Memcpy, got {:?}", e.kind);
+        };
+        assert_eq!(n.typ, Some(p.types.ulong_id));
+        assert!(matches!(n.kind, ExprKind::Cast { .. }), "{:?}", n.kind);
+    });
+}
+
+/// The declaration `<string.h>` writes keeps `memcpy` a builtin, `restrict`
+/// and all; one of another type, or a definition, makes it the program's own
+/// function.
+#[test]
+fn test_memory_builtin_declarations() {
+    fn is_memcpy(decl: &str) -> bool {
+        let src = format!("{decl}\nvoid t(char *d, char *s) {{ memcpy(d, s, 4); }}");
+        let (tu, _, _, _) = parse_tu(&src).unwrap();
+        matches!(first_statement(&tu), Stmt::Expr(e) if matches!(e.kind, ExprKind::Memcpy { .. }))
+    }
+    assert!(is_memcpy(""));
+    assert!(is_memcpy(
+        "void *memcpy(void *restrict, const void *restrict, unsigned long);"
+    ));
+    assert!(is_memcpy("void *memcpy();"));
+    assert!(!is_memcpy("char *memcpy(char *, char *, int);"));
+    assert!(!is_memcpy("void *memcpy(void *, void *, unsigned long);"));
+    assert!(!is_memcpy(
+        "void *memcpy(void *, const void *, unsigned long, ...);"
+    ));
+    assert!(!is_memcpy(
+        "void *memcpy(void *d, const void *s, unsigned long n) { return d; }"
+    ));
+}
+
 /// Parse `decls` and a function `t` whose one statement is `stmt`, then hand
 /// that statement's expression to `f` along with the parser that built it.
 fn with_statement_expr<R>(decls: &str, stmt: &str, f: impl FnOnce(&mut Parser, &Expr) -> R) -> R {

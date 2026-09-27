@@ -830,6 +830,8 @@ pub struct TypeTable {
     pub complex_float16_id: TypeId,
     pub complex_float128_id: TypeId,
     pub void_ptr_id: TypeId,
+    /// `const void *`, the source operand of `memcpy` and `memmove`.
+    pub const_void_ptr_id: TypeId,
     pub char_ptr_id: TypeId,
 }
 
@@ -882,6 +884,7 @@ impl TypeTable {
             complex_float16_id: TypeId::INVALID,
             complex_float128_id: TypeId::INVALID,
             void_ptr_id: TypeId::INVALID,
+            const_void_ptr_id: TypeId::INVALID,
             char_ptr_id: TypeId::INVALID,
         };
 
@@ -982,6 +985,8 @@ impl TypeTable {
 
         // Pre-intern common pointer types
         table.void_ptr_id = table.intern(Type::pointer(table.void_id));
+        let const_void = table.intern(Type::with_modifiers(TypeKind::Void, TypeModifiers::CONST));
+        table.const_void_ptr_id = table.intern(Type::pointer(const_void));
         table.char_ptr_id = table.intern(Type::pointer(table.char_id));
 
         table

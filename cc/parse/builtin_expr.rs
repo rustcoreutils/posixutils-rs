@@ -130,7 +130,8 @@ impl Parser<'_> {
     /// those, and they need code generation an ordinary call cannot produce.
     /// The library builtins (`abs`, `fabs`, `floor`, ...) survive a function
     /// declaration only if it is compatible with the prototype their table
-    /// gives (see `library_prototype_matches`).
+    /// gives (see `library_prototype_matches`), and `memcpy`, `memset` and
+    /// `memmove` do not survive a definition of their own in this unit.
     ///
     /// The reserved spellings (`__builtin_*`, `_Alignof`, `__alignof__`) are
     /// never displaced: C17 7.1.3 reserves them to the implementation in every
@@ -170,7 +171,10 @@ impl Parser<'_> {
         let typ = self.symbols.get(symbol_id).typ;
         shadowed_by_any_decl
             || self.types.kind(typ) != TypeKind::Function
-            || library.is_some_and(|lb| !self.library_prototype_matches(lb, typ))
+            || library.is_some_and(|lb| {
+                !self.library_prototype_matches(lb, typ)
+                    || (lb.displaced_by_definition() && self.defined_fns.contains(&name_id))
+            })
     }
 
     /// Try to parse a builtin function expression.
@@ -664,7 +668,7 @@ impl Parser<'_> {
         }
     }
 
-    /// `alloca` and the `mem*` builtins, which lower to library calls.
+    /// `alloca`, bare or reserved.
     fn parse_memory_builtin(
         &mut self,
         name_id: StringId,
@@ -684,65 +688,6 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
-            // Memory builtins - generate calls to C library functions
-            crate::kw::BUILTIN_MEMSET => Some((|| {
-                // __builtin_memset(dest, c, n) - returns void*
-                self.expect_special(b'(')?;
-                let dest = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let c = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let n = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Memset {
-                        dest: Box::new(dest),
-                        c: Box::new(c),
-                        n: Box::new(n),
-                    },
-                    self.types.void_ptr_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_MEMCPY => Some((|| {
-                // __builtin_memcpy(dest, src, n) - returns void*
-                self.expect_special(b'(')?;
-                let dest = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let src = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let n = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Memcpy {
-                        dest: Box::new(dest),
-                        src: Box::new(src),
-                        n: Box::new(n),
-                    },
-                    self.types.void_ptr_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_MEMMOVE => Some((|| {
-                // __builtin_memmove(dest, src, n) - returns void*
-                self.expect_special(b'(')?;
-                let dest = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let src = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let n = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Memmove {
-                        dest: Box::new(dest),
-                        src: Box::new(src),
-                        n: Box::new(n),
-                    },
-                    self.types.void_ptr_id,
-                    token_pos,
-                ))
-            })()),
-            // Infinity builtins - return float constants
             _ => None,
         }
     }

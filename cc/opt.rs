@@ -18,6 +18,7 @@ use crate::ir::ifconv;
 use crate::ir::inline;
 use crate::ir::instcombine;
 use crate::ir::loadfwd;
+use crate::ir::memexpand;
 use crate::ir::memloc;
 use crate::ir::sccp;
 use crate::ir::validate;
@@ -238,8 +239,9 @@ fn check_forwarding_resolved(module: &Module) {
 
 /// Optimize a module as `opt` asks.
 ///
-/// Level 0: nothing but `__attribute__((always_inline))` inlining
-/// Level 1+: inlining, then the per-function passes below to fixed point
+/// Level 0: `__attribute__((always_inline))` inlining, then `memexpand`
+/// Level 1+: inlining and `memexpand`, then the per-function passes below to
+/// fixed point
 pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization) {
     // Phase 1: Function inlining (module-level pass)
     // This inlines small functions at their call sites and removes
@@ -259,6 +261,14 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
     // survives would be emitted as a call with its arguments missing, so say
     // so instead.
     check_forwarding_resolved(module);
+
+    // A `memcpy`, `memset` or `memmove` of a small constant length becomes
+    // loads and stores at every level, as the linearizer's own aggregate
+    // copies already are: nothing about it is an optimization a debugger
+    // would miss. After inlining, which is what makes some lengths constant.
+    for func in &mut module.functions {
+        memexpand::run(func, types);
+    }
 
     if !opt.optimizes() {
         return;
@@ -334,6 +344,10 @@ fn optimize_function(func: &mut Function, types: &TypeTable, mi: &memloc::Module
         // `add %sym, (mul (sext 1) 4)` and only becomes a constant
         // displacement once `instcombine` has folded the multiply -- which is
         // why it sits inside the loop rather than ahead of it.
+        // `memexpand` ahead of all of them, so the loads and stores it makes
+        // of a length SCCP has only now proved constant are forwarded and
+        // killed in the same iteration.
+        let mx_changed = memexpand::run(func, types);
         let lf_changed = loadfwd::run(func, types, mi);
         let vrp_changed = vrp::run(func, types);
         let ifc_changed = ifconv::run(func);
@@ -344,7 +358,8 @@ fn optimize_function(func: &mut Function, types: &TypeTable, mi: &memloc::Module
         let dse_changed = dse::run(func, types, mi);
         let dce_changed = dce::run(func);
 
-        if !lf_changed
+        if !mx_changed
+            && !lf_changed
             && !vrp_changed
             && !ifc_changed
             && !sccp_changed

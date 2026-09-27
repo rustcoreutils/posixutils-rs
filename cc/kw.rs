@@ -724,6 +724,13 @@ define_keywords! {
     (CONJF,             "conjf",             0),
     (CONJL,             "conjl",             0),
 
+    // The block memory functions of <string.h>, recognized by their plain
+    // names for the same reason and displaceable the same way. A constant
+    // length small enough is expanded into loads and stores, as under gcc.
+    (MEMCPY,            "memcpy",            0),
+    (MEMSET,            "memset",            0),
+    (MEMMOVE,           "memmove",           0),
+
     // The exactly-rounding functions, whose `float` form gives the same
     // answer as the `double` one applied to a `float` argument. Narrowing
     // them is what lets `(float)floor((double)x)` become `floorf(x)`;

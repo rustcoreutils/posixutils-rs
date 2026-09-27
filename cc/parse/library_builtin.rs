@@ -35,6 +35,10 @@ enum ProtoType {
     ComplexFloat,
     ComplexDouble,
     ComplexLongDouble,
+    VoidPtr,
+    ConstVoidPtr,
+    /// `size_t`, which is `unsigned long` on every target c17 has.
+    SizeT,
 }
 
 impl ProtoType {
@@ -49,12 +53,26 @@ impl ProtoType {
             ProtoType::ComplexFloat => t.complex_float_id,
             ProtoType::ComplexDouble => t.complex_double_id,
             ProtoType::ComplexLongDouble => t.complex_longdouble_id,
+            ProtoType::VoidPtr => t.void_ptr_id,
+            ProtoType::ConstVoidPtr => t.const_void_ptr_id,
+            ProtoType::SizeT => t.ulong_id,
         }
     }
 }
 
-/// How a call to a library builtin is evaluated, once its argument has been
-/// checked.
+/// A block memory function of `<string.h>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryFn {
+    /// `void *memcpy(void *restrict, const void *restrict, size_t)`
+    Copy,
+    /// `void *memset(void *, int, size_t)`
+    Set,
+    /// `void *memmove(void *, const void *, size_t)`
+    Move,
+}
+
+/// How a call to a library builtin is evaluated, once its arguments have
+/// been checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lowering {
     /// Computed in place, as an [`ExprKind::InlineLibraryCall`].
@@ -74,6 +92,26 @@ enum Lowering {
     /// `sinf(x)` and `(float)sin((double)x)` differ in the last bit for some
     /// `x`, and narrowing one is a wrong answer rather than a faster one.
     NarrowingCall { narrow: &'static str },
+    /// A block memory function, as its [`ExprKind`] node. Whether it becomes
+    /// a call or loads and stores is decided on the IR (`ir::memexpand`),
+    /// where a length that only inlining makes constant can still be seen.
+    Memory(MemoryFn),
+}
+
+impl Lowering {
+    /// Whether this translation unit's own definition of the name displaces
+    /// the builtin.
+    ///
+    /// gcc's answer differs by function, and this follows it. A `memcpy`
+    /// defined here is the one called, at every level -- which is what
+    /// glibc's fortify headers depend on: an `always_inline` `gnu_inline`
+    /// `memcpy` wrapper that checks the object size before it copies. An
+    /// `abs` defined here is folded past all the same (gcc.c-torture
+    /// `execute/20021127-1`), since defining a reserved library name is
+    /// undefined (C17 7.1.3p2) and the value cannot differ.
+    fn displaced_by_definition(self) -> bool {
+        matches!(self, Lowering::Memory(_))
+    }
 }
 
 /// Which spelling of a library builtin named it.
@@ -123,35 +161,39 @@ const fn entry(
 #[rustfmt::skip]
 static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
     use InlineLibraryFn as F;
-    use Lowering::{InPlace, NarrowingCall};
+    use Lowering::{InPlace, Memory, NarrowingCall};
+    use MemoryFn as M;
     use ProtoType::*;
     &[
-        //    bare           reserved                     returns            parameters                  lowering
-        entry(kw::ABS,       Some(kw::BUILTIN_ABS),       Int,               &[Int],                     InPlace(F::IntAbs)),
-        entry(kw::LABS,      Some(kw::BUILTIN_LABS),      Long,              &[Long],                    InPlace(F::IntAbs)),
-        entry(kw::LLABS,     Some(kw::BUILTIN_LLABS),     LongLong,          &[LongLong],                InPlace(F::IntAbs)),
-        entry(kw::IMAXABS,   Some(kw::BUILTIN_IMAXABS),   Long,              &[Long],                    InPlace(F::IntAbs)),
-        entry(kw::FABS,      Some(kw::BUILTIN_FABS),      Double,            &[Double],                  InPlace(F::Fabs)),
-        entry(kw::FABSF,     Some(kw::BUILTIN_FABSF),     Float,             &[Float],                   InPlace(F::Fabs)),
-        entry(kw::FABSL,     Some(kw::BUILTIN_FABSL),     LongDouble,        &[LongDouble],              InPlace(F::Fabs)),
-        entry(kw::COPYSIGN,  Some(kw::BUILTIN_COPYSIGN),  Double,            &[Double, Double],          InPlace(F::CopySign)),
-        entry(kw::COPYSIGNF, Some(kw::BUILTIN_COPYSIGNF), Float,             &[Float, Float],            InPlace(F::CopySign)),
-        entry(kw::COPYSIGNL, Some(kw::BUILTIN_COPYSIGNL), LongDouble,        &[LongDouble, LongDouble],  InPlace(F::CopySign)),
-        entry(kw::FLOOR,     None,                        Double,            &[Double],                  NarrowingCall { narrow: "floorf" }),
-        entry(kw::CEIL,      None,                        Double,            &[Double],                  NarrowingCall { narrow: "ceilf" }),
-        entry(kw::TRUNC,     None,                        Double,            &[Double],                  NarrowingCall { narrow: "truncf" }),
-        entry(kw::ROUND,     None,                        Double,            &[Double],                  NarrowingCall { narrow: "roundf" }),
-        entry(kw::RINT,      None,                        Double,            &[Double],                  NarrowingCall { narrow: "rintf" }),
-        entry(kw::NEARBYINT, None,                        Double,            &[Double],                  NarrowingCall { narrow: "nearbyintf" }),
-        entry(kw::CREAL,     Some(kw::BUILTIN_CREAL),     Double,            &[ComplexDouble],           InPlace(F::ComplexReal)),
-        entry(kw::CREALF,    Some(kw::BUILTIN_CREALF),    Float,             &[ComplexFloat],            InPlace(F::ComplexReal)),
-        entry(kw::CREALL,    Some(kw::BUILTIN_CREALL),    LongDouble,        &[ComplexLongDouble],       InPlace(F::ComplexReal)),
-        entry(kw::CIMAG,     Some(kw::BUILTIN_CIMAG),     Double,            &[ComplexDouble],           InPlace(F::ComplexImag)),
-        entry(kw::CIMAGF,    Some(kw::BUILTIN_CIMAGF),    Float,             &[ComplexFloat],            InPlace(F::ComplexImag)),
-        entry(kw::CIMAGL,    Some(kw::BUILTIN_CIMAGL),    LongDouble,        &[ComplexLongDouble],       InPlace(F::ComplexImag)),
-        entry(kw::CONJ,      Some(kw::BUILTIN_CONJ),      ComplexDouble,     &[ComplexDouble],           InPlace(F::Conjugate)),
-        entry(kw::CONJF,     Some(kw::BUILTIN_CONJF),     ComplexFloat,      &[ComplexFloat],            InPlace(F::Conjugate)),
-        entry(kw::CONJL,     Some(kw::BUILTIN_CONJL),     ComplexLongDouble, &[ComplexLongDouble],       InPlace(F::Conjugate)),
+        //    bare           reserved                     returns            parameters                        lowering
+        entry(kw::ABS,       Some(kw::BUILTIN_ABS),       Int,               &[Int],                           InPlace(F::IntAbs)),
+        entry(kw::LABS,      Some(kw::BUILTIN_LABS),      Long,              &[Long],                          InPlace(F::IntAbs)),
+        entry(kw::LLABS,     Some(kw::BUILTIN_LLABS),     LongLong,          &[LongLong],                      InPlace(F::IntAbs)),
+        entry(kw::IMAXABS,   Some(kw::BUILTIN_IMAXABS),   Long,              &[Long],                          InPlace(F::IntAbs)),
+        entry(kw::FABS,      Some(kw::BUILTIN_FABS),      Double,            &[Double],                        InPlace(F::Fabs)),
+        entry(kw::FABSF,     Some(kw::BUILTIN_FABSF),     Float,             &[Float],                         InPlace(F::Fabs)),
+        entry(kw::FABSL,     Some(kw::BUILTIN_FABSL),     LongDouble,        &[LongDouble],                    InPlace(F::Fabs)),
+        entry(kw::COPYSIGN,  Some(kw::BUILTIN_COPYSIGN),  Double,            &[Double, Double],                InPlace(F::CopySign)),
+        entry(kw::COPYSIGNF, Some(kw::BUILTIN_COPYSIGNF), Float,             &[Float, Float],                  InPlace(F::CopySign)),
+        entry(kw::COPYSIGNL, Some(kw::BUILTIN_COPYSIGNL), LongDouble,        &[LongDouble, LongDouble],        InPlace(F::CopySign)),
+        entry(kw::FLOOR,     None,                        Double,            &[Double],                        NarrowingCall { narrow: "floorf" }),
+        entry(kw::CEIL,      None,                        Double,            &[Double],                        NarrowingCall { narrow: "ceilf" }),
+        entry(kw::TRUNC,     None,                        Double,            &[Double],                        NarrowingCall { narrow: "truncf" }),
+        entry(kw::ROUND,     None,                        Double,            &[Double],                        NarrowingCall { narrow: "roundf" }),
+        entry(kw::RINT,      None,                        Double,            &[Double],                        NarrowingCall { narrow: "rintf" }),
+        entry(kw::NEARBYINT, None,                        Double,            &[Double],                        NarrowingCall { narrow: "nearbyintf" }),
+        entry(kw::CREAL,     Some(kw::BUILTIN_CREAL),     Double,            &[ComplexDouble],                 InPlace(F::ComplexReal)),
+        entry(kw::CREALF,    Some(kw::BUILTIN_CREALF),    Float,             &[ComplexFloat],                  InPlace(F::ComplexReal)),
+        entry(kw::CREALL,    Some(kw::BUILTIN_CREALL),    LongDouble,        &[ComplexLongDouble],             InPlace(F::ComplexReal)),
+        entry(kw::CIMAG,     Some(kw::BUILTIN_CIMAG),     Double,            &[ComplexDouble],                 InPlace(F::ComplexImag)),
+        entry(kw::CIMAGF,    Some(kw::BUILTIN_CIMAGF),    Float,             &[ComplexFloat],                  InPlace(F::ComplexImag)),
+        entry(kw::CIMAGL,    Some(kw::BUILTIN_CIMAGL),    LongDouble,        &[ComplexLongDouble],             InPlace(F::ComplexImag)),
+        entry(kw::CONJ,      Some(kw::BUILTIN_CONJ),      ComplexDouble,     &[ComplexDouble],                 InPlace(F::Conjugate)),
+        entry(kw::CONJF,     Some(kw::BUILTIN_CONJF),     ComplexFloat,      &[ComplexFloat],                  InPlace(F::Conjugate)),
+        entry(kw::CONJL,     Some(kw::BUILTIN_CONJL),     ComplexLongDouble, &[ComplexLongDouble],             InPlace(F::Conjugate)),
+        entry(kw::MEMCPY,    Some(kw::BUILTIN_MEMCPY),    VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT],  Memory(M::Copy)),
+        entry(kw::MEMSET,    Some(kw::BUILTIN_MEMSET),    VoidPtr,           &[VoidPtr, Int, SizeT],           Memory(M::Set)),
+        entry(kw::MEMMOVE,   Some(kw::BUILTIN_MEMMOVE),   VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT],  Memory(M::Move)),
     ]
 };
 
@@ -173,6 +215,12 @@ impl LibraryBuiltin {
     pub(super) fn by_bare_name(name_id: StringId) -> Option<&'static LibraryBuiltin> {
         LIBRARY_BUILTINS.iter().find(|lb| lb.bare == name_id)
     }
+
+    /// Whether a definition of the bare name in this translation unit
+    /// displaces the builtin (see `Lowering::displaced_by_definition`).
+    pub(super) fn displaced_by_definition(&self) -> bool {
+        self.lowering.displaced_by_definition()
+    }
 }
 
 impl Parser<'_> {
@@ -181,11 +229,12 @@ impl Parser<'_> {
     ///
     /// gcc's rule: a declaration with an incompatible type ("conflicting types
     /// for built-in function") makes the name an ordinary function, while the
-    /// compatible one `<stdlib.h>` or `<math.h>` writes keeps the builtin. An
-    /// unprototyped declaration says nothing about the parameters, so only
-    /// its return type is compared; a prototype must have exactly the
-    /// library's parameters, whose qualifiers do not count (C17 6.7.6.3p15 --
-    /// which `types_compatible` already ignores at the top level).
+    /// compatible one `<stdlib.h>`, `<math.h>` or `<string.h>` writes keeps
+    /// the builtin. An unprototyped declaration says nothing about the
+    /// parameters, so only its return type is compared; a prototype must have
+    /// exactly the library's parameters, whose qualifiers do not count (C17
+    /// 6.7.6.3p15 -- which `types_compatible` already ignores at the top
+    /// level, so a `restrict` is no obstacle).
     pub(super) fn library_prototype_matches(&self, lb: &LibraryBuiltin, typ: TypeId) -> bool {
         let ret = lb.ret.id(self.types);
         let decl = self.types.get(typ);
@@ -286,7 +335,50 @@ impl Parser<'_> {
                     self.libm_call(name, ret, &[param], arg, pos)
                 }
             }
+            Lowering::Memory(func) => {
+                let Ok(args) = <[Expr; 3]>::try_from(args) else {
+                    unreachable!("the table gives a memory function three parameters");
+                };
+                self.lower_memory_call(func, args, &params, ret, pos)
+            }
         }
+    }
+
+    /// A checked call to a block memory function, each argument converted to
+    /// its parameter's type as the prototype would.
+    fn lower_memory_call(
+        &mut self,
+        func: MemoryFn,
+        [dest, second, n]: [Expr; 3],
+        params: &[TypeId],
+        ret: TypeId,
+        pos: Position,
+    ) -> Expr {
+        let dest = Box::new(self.convert_operand(dest, params[0]));
+        let second = Box::new(self.convert_operand(second, params[1]));
+        // A constant length is folded here, conversion and all, so the IR
+        // receives the constant itself: at -O0 nothing folds a conversion
+        // later, and `ir::memexpand` expands only a length it can see is one.
+        let n = self.convert_operand(n, params[2]);
+        let n = Box::new(match self.eval_const_expr(&n) {
+            // The bits of a `size_t`, as an unsigned literal carries them.
+            Some(v) => Self::typed_expr(ExprKind::IntLit(v as i64), params[2], n.pos),
+            None => n,
+        });
+        let kind = match func {
+            MemoryFn::Copy => ExprKind::Memcpy {
+                dest,
+                src: second,
+                n,
+            },
+            MemoryFn::Set => ExprKind::Memset { dest, c: second, n },
+            MemoryFn::Move => ExprKind::Memmove {
+                dest,
+                src: second,
+                n,
+            },
+        };
+        Self::typed_expr(kind, ret, pos)
     }
 
     /// Whether `e` is a value in the IEEE single format.
@@ -310,6 +402,7 @@ mod tests {
             let want = match lb.lowering {
                 Lowering::InPlace(func) => func.arity(),
                 Lowering::NarrowingCall { .. } => 1,
+                Lowering::Memory(_) => 3,
             };
             assert_eq!(lb.params.len(), want, "{lb:?}");
         }

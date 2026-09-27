@@ -55,6 +55,7 @@ use super::escape::EscapeInfo;
 use super::memloc::{is_same_access, may_alias, AddrMap, MemBase, MemLoc, ModuleInfo};
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeModifiers, TypeTable};
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
 /// How far up the dominator chain one load will look.
@@ -73,14 +74,8 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
     if func.blocks.is_empty() {
         return false;
     }
-    let esc = EscapeInfo::analyze(func);
-    if esc.gave_up() {
-        return false;
-    }
     let am = AddrMap::build(func);
-    let dom = domtree_build(func);
-    let preds = build_preds(func);
-    let succs = invert(&preds);
+    let oracle = MemOracle::new(func, types, mi, &am);
 
     // Collected under `&Function` -- resolving an address needs the pseudo
     // table -- then applied under `&mut`, as `constglobal` does.
@@ -90,9 +85,7 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
             if insn.op != Opcode::Load {
                 continue;
             }
-            if let Some(a) =
-                available_value(func, types, mi, &esc, &am, &dom, &preds, &succs, (b, i))
-            {
+            if let Some(a) = oracle.value_at((b, i), &am.location_of(func, insn)) {
                 sites.push((b, i, a));
             }
         }
@@ -123,66 +116,337 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
     changed
 }
 
-/// The pseudo already holding what the load at `site` would read.
-#[allow(clippy::too_many_arguments)]
-fn available_value(
-    func: &Function,
-    types: &TypeTable,
-    mi: &ModuleInfo,
-    esc: &EscapeInfo,
-    am: &AddrMap,
-    dom: &DomTree,
-    preds: &HashMap<BasicBlockId, Vec<BasicBlockId>>,
-    succs: &HashMap<BasicBlockId, Vec<BasicBlockId>>,
-    (bl, il): (usize, usize),
-) -> Option<Available> {
-    let load = &func.blocks[bl].insns[il];
-    let loc = am.location_of(func, load);
-    if !forwardable(func, types, mi, &loc) {
-        return None;
+/// What one function's memory holds at a point in it, as far as the stores
+/// and loads before that point say.
+///
+/// A load asks it for the pseudo already holding its bytes (`value_at`).
+/// The walk is written once, for any question of that shape: up the
+/// dominator chain to the nearest instruction that answers, then over every
+/// path from there to the point for anything that writes the location in
+/// between. Only what counts as an answer is the asker's.
+///
+/// The analyses the walk needs are built by the first question, so a pass
+/// that asks none -- a function with no call worth folding -- pays nothing.
+pub(crate) struct MemOracle<'a> {
+    func: &'a Function,
+    types: &'a TypeTable,
+    mi: &'a ModuleInfo,
+    am: &'a AddrMap,
+    /// `None` inside when escape analysis gave up on the function: nothing
+    /// in it may be forwarded.
+    paths: OnceCell<Option<Paths>>,
+}
+
+/// What the walk needs to know about the function's control flow and about
+/// which locals a callee can reach.
+struct Paths {
+    esc: EscapeInfo,
+    dom: DomTree,
+    preds: HashMap<BasicBlockId, Vec<BasicBlockId>>,
+    succs: HashMap<BasicBlockId, Vec<BasicBlockId>>,
+}
+
+impl<'a> MemOracle<'a> {
+    pub(crate) fn new(
+        func: &'a Function,
+        types: &'a TypeTable,
+        mi: &'a ModuleInfo,
+        am: &'a AddrMap,
+    ) -> Self {
+        MemOracle {
+            func,
+            types,
+            mi,
+            am,
+            paths: OnceCell::new(),
+        }
     }
 
-    // Walk up the dominator chain for the nearest definition of this
-    // location, stopping at the first thing that may write it.
-    let mut block = func.blocks[bl].id;
-    let mut start = il;
-    let mut scanned = 0usize;
-    for _ in 0..MAX_DOM_LEVELS {
-        let bi = func.block_index(block)?;
-        for i in (0..start).rev() {
-            scanned += 1;
-            if scanned > MAX_SCAN_INSNS {
-                return None;
-            }
-            let insn = &func.blocks[bi].insns[i];
-            if insn.op == Opcode::Nop {
-                continue;
-            }
-            match candidate(func, types, mi, esc, am, insn, &loc) {
-                Some(Candidate::Value(avail)) => {
-                    return no_clobber_between(
-                        func,
-                        types,
-                        mi,
-                        esc,
-                        am,
-                        preds,
-                        succs,
-                        (bi, i),
-                        (bl, il),
-                        &loc,
-                    )
-                    .then_some(avail);
+    fn paths(&self) -> Option<&Paths> {
+        self.paths
+            .get_or_init(|| {
+                let esc = EscapeInfo::analyze(self.func);
+                if esc.gave_up() {
+                    return None;
                 }
-                Some(Candidate::Clobber) => return None,
-                None => {}
+                let preds = build_preds(self.func);
+                let succs = invert(&preds);
+                Some(Paths {
+                    esc,
+                    dom: domtree_build(self.func),
+                    preds,
+                    succs,
+                })
+            })
+            .as_ref()
+    }
+
+    /// The pseudo already holding what a load of `loc` just before `site`
+    /// would read.
+    fn value_at(&self, site: (usize, usize), loc: &MemLoc) -> Option<Available> {
+        let paths = self.paths()?;
+        self.nearest(paths, site, loc, |insn| self.candidate(paths, insn, loc))
+    }
+
+    /// The answer the nearest instruction before `site` that answers for
+    /// `loc` gives, by `classify`, when nothing on any path from it to
+    /// `site` may write `loc`.
+    fn nearest<T>(
+        &self,
+        paths: &Paths,
+        (bl, il): (usize, usize),
+        loc: &MemLoc,
+        classify: impl Fn(&Instruction) -> Option<Candidate<T>>,
+    ) -> Option<T> {
+        let func = self.func;
+        if !forwardable(func, self.types, self.mi, loc) {
+            return None;
+        }
+
+        // Walk up the dominator chain for the nearest definition of this
+        // location, stopping at the first thing that may write it.
+        let mut block = func.blocks[bl].id;
+        let mut start = il;
+        let mut scanned = 0usize;
+        for _ in 0..MAX_DOM_LEVELS {
+            let bi = func.block_index(block)?;
+            for i in (0..start).rev() {
+                scanned += 1;
+                if scanned > MAX_SCAN_INSNS {
+                    return None;
+                }
+                let insn = &func.blocks[bi].insns[i];
+                if insn.op == Opcode::Nop {
+                    continue;
+                }
+                match classify(insn) {
+                    Some(Candidate::Value(v)) => {
+                        return self
+                            .no_clobber_between(paths, (bi, i), (bl, il), loc)
+                            .then_some(v);
+                    }
+                    Some(Candidate::Clobber) => return None,
+                    None => {}
+                }
+            }
+            let idom = paths.dom.idom(block)?;
+            block = idom;
+            start = func.blocks[func.block_index(block)?].insns.len();
+        }
+        None
+    }
+
+    fn candidate(
+        &self,
+        paths: &Paths,
+        insn: &Instruction,
+        loc: &MemLoc,
+    ) -> Option<Candidate<Available>> {
+        let (func, types, am) = (self.func, self.types, self.am);
+        match insn.op {
+            Opcode::Store => {
+                let s = am.location_of(func, insn);
+                if is_same_access(&s, loc, types) {
+                    if let Some(v) = insn.src.get(1).copied() {
+                        // A store this pass cannot forward is still a store:
+                        // it has to stop the search, or the walk would run
+                        // past it to an older value.
+                        return Some(match narrowing(func, types, am, v, loc.size) {
+                            Some(a) => Candidate::Value(a),
+                            None => Candidate::Clobber,
+                        });
+                    }
+                }
+                may_alias(&s, loc, self.mi).then_some(Candidate::Clobber)
+            }
+            Opcode::Load => {
+                let s = am.location_of(func, insn);
+                if is_same_access(&s, loc, types) {
+                    // A load's target holds exactly the bytes that were
+                    // read, so this one needs no narrowing.
+                    return insn.target.map(|t| {
+                        Candidate::Value(Available {
+                            value: t,
+                            narrow: None,
+                        })
+                    });
+                }
+                None
+            }
+            _ if self.writes(paths, insn, loc) => Some(Candidate::Clobber),
+            _ => None,
+        }
+    }
+
+    /// Could `insn` write `loc`?
+    ///
+    /// An allowlist read the safe way round: an opcode this does not
+    /// recognize is assumed to write, so a new one is conservative by
+    /// default. That is the same discipline `ifconv::is_speculatable` uses,
+    /// and the reason `Instruction::is_memory_barrier` is not enough on its
+    /// own -- it answers ordering, and omits `Store`, the mem intrinsics, the
+    /// `Va*` family, `Alloca` and `StackSave` entirely.
+    fn writes(&self, paths: &Paths, insn: &Instruction, loc: &MemLoc) -> bool {
+        let (func, am, mi) = (self.func, self.am, self.mi);
+        // A `Sym` target *is* storage, so an instruction that targets one
+        // writes the object it names -- a struct-returning call writes its
+        // receiving local this way, with no `Store` anywhere. The extent is
+        // left unknown because `insn.size` describes a register, not the
+        // aggregate.
+        if let Some(t) = insn.target {
+            if matches!(
+                func.get_pseudo(t).map(|p| &p.kind),
+                Some(super::PseudoKind::Sym(_))
+            ) && may_alias(&am.resolve(func, t, 0, 0, None), loc, mi)
+            {
+                return true;
             }
         }
-        let idom = dom.idom(block)?;
-        block = idom;
-        start = func.blocks[func.block_index(block)?].insns.len();
+
+        match insn.op {
+            // Nothing here reaches memory.
+            Opcode::Nop
+            | Opcode::Entry
+            | Opcode::Phi
+            | Opcode::PhiSource
+            | Opcode::Copy
+            | Opcode::SetVal
+            | Opcode::SymAddr
+            | Opcode::Select
+            | Opcode::Br
+            | Opcode::Cbr
+            | Opcode::Switch
+            | Opcode::IndirectBr
+            | Opcode::Ret
+            | Opcode::Unreachable
+            | Opcode::Load => false,
+
+            Opcode::Store => {
+                let s = am.location_of(func, insn);
+                may_alias(&s, loc, mi)
+            }
+
+            // The extent is in the operands; `insn.size` on these is the
+            // pointer's width, not the access's.
+            Opcode::Memset | Opcode::Memcpy | Opcode::Memmove => {
+                let dst = insn
+                    .src
+                    .first()
+                    .map(|a| am.resolve(func, *a, 0, 0, None))
+                    .unwrap_or_else(MemLoc::unknown);
+                may_alias(&dst, loc, mi)
+            }
+
+            // **The rule that closes `pure-1`**: a callee cannot write a
+            // local whose address never left this function, whatever it
+            // does. That needs nothing at all from the callee.
+            //
+            // What the callee's effect adds is the *global* case, which
+            // escape analysis can say nothing about: a `pure` or `const`
+            // function writes no memory the caller can observe, so a global
+            // survives across it too.
+            Opcode::Call => {
+                mi.call_effect(insn.func_name.as_deref()).may_write()
+                    && paths.esc.is_captured(&loc.base)
+            }
+
+            _ if !insn.op.may_access_memory() => false,
+
+            // `Asm`, `Fence`, `Alloca`, `StackSave`/`StackRestore`, the `Va*`
+            // family, every atomic, and anything unlisted. A `"memory"`
+            // clobber can name a frame slot without naming an operand --
+            // `asm("movl $1, -8(%rbp)")` is legal and reaches a local no
+            // analysis saw -- so being blunt here costs nothing and removes
+            // the class.
+            _ => true,
+        }
     }
-    None
+
+    /// Is every path from the definition to the load free of a write to
+    /// `loc`?
+    fn no_clobber_between(
+        &self,
+        paths: &Paths,
+        (bc, ic): (usize, usize),
+        (bl, il): (usize, usize),
+        loc: &MemLoc,
+    ) -> bool {
+        let func = self.func;
+        let def_block = func.blocks[bc].id;
+        let load_block = func.blocks[bl].id;
+
+        // Every block that can be entered on the way from the definition to
+        // the load: forward-reachable from the definition's block *and*
+        // backward-reachable from the load's.
+        //
+        // The intersection is what makes this right, not either half. A
+        // backward walk alone climbs past the definition -- fatally so when
+        // the two share a block, where it enumerates the whole function above
+        // them although none of it runs between the two points. A forward
+        // walk alone runs off down every path that never reaches the load.
+        let Some(fwd) = reachable(&paths.succs, def_block) else {
+            return false;
+        };
+        let Some(back) = reachable(&paths.preds, load_block) else {
+            return false;
+        };
+        let region: HashSet<BasicBlockId> = fwd.intersection(&back).copied().collect();
+
+        let scan = |bi: usize, from: usize, to: usize| -> bool {
+            for i in from..to {
+                let insn = &func.blocks[bi].insns[i];
+                if insn.op == Opcode::Nop {
+                    continue;
+                }
+                if self.writes(paths, insn, loc) {
+                    return false;
+                }
+            }
+            true
+        };
+
+        // A back edge can put the load's own block in the region, and then
+        // the instructions *after* the load run before the next execution
+        // of it.
+        let load_block_wraps = region.contains(&load_block);
+
+        if bc == bl {
+            let to = if load_block_wraps {
+                func.blocks[bl].insns.len()
+            } else {
+                il
+            };
+            let from = if load_block_wraps { 0 } else { ic + 1 };
+            if !scan(bl, from, to) {
+                return false;
+            }
+        } else {
+            if !scan(bc, ic + 1, func.blocks[bc].insns.len()) {
+                return false;
+            }
+            let (from, to) = if load_block_wraps {
+                (0, func.blocks[bl].insns.len())
+            } else {
+                (0, il)
+            };
+            if !scan(bl, from, to) {
+                return false;
+            }
+        }
+
+        for b in &region {
+            if *b == load_block {
+                continue;
+            }
+            let Some(bi) = func.block_index(*b) else {
+                return false;
+            };
+            if !scan(bi, 0, func.blocks[bi].insns.len()) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// A value the load can be rewritten to read, and how it has to be read.
@@ -200,10 +464,9 @@ struct Narrowing {
     typ: Option<TypeId>,
 }
 
-enum Candidate {
-    /// This instruction leaves the wanted value in a pseudo, reached either
-    /// directly or through a narrowing.
-    Value(Available),
+enum Candidate<T> {
+    /// This instruction says what the location holds.
+    Value(T),
     /// This instruction may write the location, so nothing before it counts.
     Clobber,
 }
@@ -242,137 +505,6 @@ fn narrowing(
     })
 }
 
-fn candidate(
-    func: &Function,
-    types: &TypeTable,
-    mi: &ModuleInfo,
-    esc: &EscapeInfo,
-    am: &AddrMap,
-    insn: &Instruction,
-    loc: &MemLoc,
-) -> Option<Candidate> {
-    match insn.op {
-        Opcode::Store => {
-            let s = am.location_of(func, insn);
-            if is_same_access(&s, loc, types) {
-                if let Some(v) = insn.src.get(1).copied() {
-                    // A store this pass cannot forward is still a store: it
-                    // has to stop the search, or the walk would run past it
-                    // to an older value.
-                    return Some(match narrowing(func, types, am, v, loc.size) {
-                        Some(a) => Candidate::Value(a),
-                        None => Candidate::Clobber,
-                    });
-                }
-            }
-            may_alias(&s, loc, mi).then_some(Candidate::Clobber)
-        }
-        Opcode::Load => {
-            let s = am.location_of(func, insn);
-            if is_same_access(&s, loc, types) {
-                // A load's target holds exactly the bytes that were read, so
-                // this one needs no narrowing.
-                return insn.target.map(|t| {
-                    Candidate::Value(Available {
-                        value: t,
-                        narrow: None,
-                    })
-                });
-            }
-            None
-        }
-        _ if writes(func, mi, esc, am, insn, loc) => Some(Candidate::Clobber),
-        _ => None,
-    }
-}
-
-/// Could `insn` write `loc`?
-///
-/// An allowlist read the safe way round: an opcode this does not recognize
-/// is assumed to write, so a new one is conservative by default. That is the
-/// same discipline `ifconv::is_speculatable` uses, and the reason
-/// `Instruction::is_memory_barrier` is not enough on its own -- it answers
-/// ordering, and omits `Store`, the mem intrinsics, the `Va*` family,
-/// `Alloca` and `StackSave` entirely.
-fn writes(
-    func: &Function,
-    mi: &ModuleInfo,
-    esc: &EscapeInfo,
-    am: &AddrMap,
-    insn: &Instruction,
-    loc: &MemLoc,
-) -> bool {
-    // A `Sym` target *is* storage, so an instruction that targets one writes
-    // the object it names -- a struct-returning call writes its receiving
-    // local this way, with no `Store` anywhere. The extent is left unknown
-    // because `insn.size` describes a register, not the aggregate.
-    if let Some(t) = insn.target {
-        if matches!(
-            func.get_pseudo(t).map(|p| &p.kind),
-            Some(super::PseudoKind::Sym(_))
-        ) && may_alias(&am.resolve(func, t, 0, 0, None), loc, mi)
-        {
-            return true;
-        }
-    }
-
-    match insn.op {
-        // Nothing here reaches memory.
-        Opcode::Nop
-        | Opcode::Entry
-        | Opcode::Phi
-        | Opcode::PhiSource
-        | Opcode::Copy
-        | Opcode::SetVal
-        | Opcode::SymAddr
-        | Opcode::Select
-        | Opcode::Br
-        | Opcode::Cbr
-        | Opcode::Switch
-        | Opcode::IndirectBr
-        | Opcode::Ret
-        | Opcode::Unreachable
-        | Opcode::Load => false,
-
-        Opcode::Store => {
-            let s = am.location_of(func, insn);
-            may_alias(&s, loc, mi)
-        }
-
-        // The extent is in the operands; `insn.size` on these is the
-        // pointer's width, not the access's.
-        Opcode::Memset | Opcode::Memcpy | Opcode::Memmove => {
-            let dst = insn
-                .src
-                .first()
-                .map(|a| am.resolve(func, *a, 0, 0, None))
-                .unwrap_or_else(MemLoc::unknown);
-            may_alias(&dst, loc, mi)
-        }
-
-        // **The rule that closes `pure-1`**: a callee cannot write a local
-        // whose address never left this function, whatever it does. That
-        // needs nothing at all from the callee.
-        //
-        // What the callee's effect adds is the *global* case, which escape
-        // analysis can say nothing about: a `pure` or `const` function
-        // writes no memory the caller can observe, so a global survives
-        // across it too.
-        Opcode::Call => {
-            mi.call_effect(insn.func_name.as_deref()).may_write() && esc.is_captured(&loc.base)
-        }
-
-        _ if !insn.op.may_access_memory() => false,
-
-        // `Asm`, `Fence`, `Alloca`, `StackSave`/`StackRestore`, the `Va*`
-        // family, every atomic, and anything unlisted. A `"memory"` clobber
-        // can name a frame slot without naming an operand -- `asm("movl $1,
-        // -8(%rbp)")` is legal and reaches a local no analysis saw -- so
-        // being blunt here costs nothing and removes the class.
-        _ => true,
-    }
-}
-
 /// May this location be forwarded from at all?
 fn forwardable(func: &Function, types: &TypeTable, mi: &ModuleInfo, loc: &MemLoc) -> bool {
     if loc.offset.is_none() || loc.size == 0 {
@@ -397,95 +529,6 @@ fn forwardable(func: &Function, types: &TypeTable, mi: &ModuleInfo, loc: &MemLoc
             !g.is_volatile && !g.is_thread_local
         }
     }
-}
-
-/// Is every path from the definition to the load free of a write to `loc`?
-#[allow(clippy::too_many_arguments)]
-fn no_clobber_between(
-    func: &Function,
-    _types: &TypeTable,
-    mi: &ModuleInfo,
-    esc: &EscapeInfo,
-    am: &AddrMap,
-    preds: &HashMap<BasicBlockId, Vec<BasicBlockId>>,
-    succs: &HashMap<BasicBlockId, Vec<BasicBlockId>>,
-    (bc, ic): (usize, usize),
-    (bl, il): (usize, usize),
-    loc: &MemLoc,
-) -> bool {
-    let def_block = func.blocks[bc].id;
-    let load_block = func.blocks[bl].id;
-
-    // Every block that can be entered on the way from the definition to the
-    // load: forward-reachable from the definition's block *and*
-    // backward-reachable from the load's.
-    //
-    // The intersection is what makes this right, not either half. A backward
-    // walk alone climbs past the definition -- fatally so when the two share
-    // a block, where it enumerates the whole function above them although
-    // none of it runs between the two points. A forward walk alone runs off
-    // down every path that never reaches the load.
-    let Some(fwd) = reachable(succs, def_block) else {
-        return false;
-    };
-    let Some(back) = reachable(preds, load_block) else {
-        return false;
-    };
-    let region: HashSet<BasicBlockId> = fwd.intersection(&back).copied().collect();
-
-    let scan = |bi: usize, from: usize, to: usize| -> bool {
-        for i in from..to {
-            let insn = &func.blocks[bi].insns[i];
-            if insn.op == Opcode::Nop {
-                continue;
-            }
-            if writes(func, mi, esc, am, insn, loc) {
-                return false;
-            }
-        }
-        true
-    };
-
-    // A back edge can put the load's own block in the region, and then the
-    // instructions *after* the load run before the next execution of it.
-    let load_block_wraps = region.contains(&load_block);
-
-    if bc == bl {
-        let to = if load_block_wraps {
-            func.blocks[bl].insns.len()
-        } else {
-            il
-        };
-        let from = if load_block_wraps { 0 } else { ic + 1 };
-        if !scan(bl, from, to) {
-            return false;
-        }
-    } else {
-        if !scan(bc, ic + 1, func.blocks[bc].insns.len()) {
-            return false;
-        }
-        let (from, to) = if load_block_wraps {
-            (0, func.blocks[bl].insns.len())
-        } else {
-            (0, il)
-        };
-        if !scan(bl, from, to) {
-            return false;
-        }
-    }
-
-    for b in &region {
-        if *b == load_block {
-            continue;
-        }
-        let Some(bi) = func.block_index(*b) else {
-            return false;
-        };
-        if !scan(bi, 0, func.blocks[bi].insns.len()) {
-            return false;
-        }
-    }
-    true
 }
 
 /// Successors, as the exact inverse of the predecessor map, so the two can

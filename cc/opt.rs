@@ -17,13 +17,16 @@ use crate::ir::dse;
 use crate::ir::ifconv;
 use crate::ir::inline;
 use crate::ir::instcombine;
+use crate::ir::libcall_fold;
 use crate::ir::loadfwd;
 use crate::ir::memexpand;
 use crate::ir::memloc;
 use crate::ir::sccp;
+use crate::ir::strdata::ConstBytes;
 use crate::ir::validate;
 use crate::ir::vrp;
 use crate::ir::{Function, Module};
+use crate::target::Target;
 use crate::types::TypeTable;
 
 // What optimization was asked for
@@ -242,7 +245,7 @@ fn check_forwarding_resolved(module: &Module) {
 /// Level 0: `__attribute__((always_inline))` inlining, then `memexpand`
 /// Level 1+: inlining and `memexpand`, then the per-function passes below to
 /// fixed point
-pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization) {
+pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization, target: &Target) {
     // Phase 1: Function inlining (module-level pass)
     // This inlines small functions at their call sites and removes
     // dead static functions that were fully inlined.
@@ -282,10 +285,17 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
     // Phase 3: module-wide facts the memory passes need. Built after
     // inlining, so the call graph and the set of globals are final.
     let mi = memloc::ModuleInfo::build(module, types);
+    let bytes = ConstBytes::build(module, types);
+    let fold = libcall_fold::FoldCtx {
+        types,
+        target,
+        bytes: &bytes,
+        callees: &module.library_symbols,
+    };
 
     // Phase 4: Per-function optimization
     for func in &mut module.functions {
-        optimize_function(func, types, &mi);
+        optimize_function(func, types, &mi, &fold);
     }
 
     // Phase 5 (debug builds only): structural IR validation.
@@ -309,7 +319,12 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
 }
 
 /// Optimize a single function by running passes until fixed point.
-fn optimize_function(func: &mut Function, types: &TypeTable, mi: &memloc::ModuleInfo) {
+fn optimize_function(
+    func: &mut Function,
+    types: &TypeTable,
+    mi: &memloc::ModuleInfo,
+    fold: &libcall_fold::FoldCtx,
+) {
     for _ in 0..MAX_ITERATIONS {
         // The order is load-bearing, and each pass hands the next one a
         // shape it could not have seen for itself.
@@ -353,6 +368,10 @@ fn optimize_function(func: &mut Function, types: &TypeTable, mi: &memloc::Module
         let ifc_changed = ifconv::run(func);
         let sccp_changed = sccp::run(func, types);
         let ic_changed = instcombine::run(func, types);
+        // `libcall_fold` once the arguments are as constant as `sccp` and
+        // `instcombine` can make them; what it leaves -- a constant, a load
+        // of one byte, a `Select` -- is theirs and `loadfwd`'s next round.
+        let lf_fold_changed = libcall_fold::run(func, fold);
         // `dse` before `dce`, so the value chain feeding a killed store is
         // swept in the same iteration rather than surviving to the next one.
         let dse_changed = dse::run(func, types, mi);
@@ -364,6 +383,7 @@ fn optimize_function(func: &mut Function, types: &TypeTable, mi: &memloc::Module
             && !ifc_changed
             && !sccp_changed
             && !ic_changed
+            && !lf_fold_changed
             && !dse_changed
             && !dce_changed
         {

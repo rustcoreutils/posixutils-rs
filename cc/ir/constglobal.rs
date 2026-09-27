@@ -83,7 +83,7 @@ fn collect(module: &Module, types: &TypeTable) -> HashMap<String, KnownGlobal> {
 }
 
 /// Is this global's initializer the value for the whole run?
-fn qualifies(g: &super::GlobalDef, types: &TypeTable) -> bool {
+pub(crate) fn qualifies(g: &super::GlobalDef, types: &TypeTable) -> bool {
     // Not `const`: an ordinary store may change it.
     if !g.is_const {
         return false;

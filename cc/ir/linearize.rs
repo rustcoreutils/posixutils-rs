@@ -605,6 +605,10 @@ impl<'a> Linearizer<'a> {
             }
         }
         self.resolve_aliases();
+        for &name in super::FOLD_CALLEES {
+            let symbol = self.library_function_name(name);
+            self.module.library_symbols.insert(name, symbol);
+        }
         std::mem::take(&mut self.module)
     }
 

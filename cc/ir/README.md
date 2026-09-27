@@ -342,9 +342,13 @@ extern_symbols          - symbols needing GOT
 | `sccp.rs` | Sparse conditional constant propagation: constants along reachable paths only, and the only thing that folds a branch on a constant condition |
 | `inline.rs` | Function inlining |
 | `memexpand.rs` | A `memcpy`, `memset` or `memmove` of a small constant length becomes integer loads and stores, at every level. Also owns the chunking and the size limit the linearizer's aggregate copies use |
+| `build.rs` | `Builder`: the instructions that replace one instruction -- new pseudos, constants, loads, stores, operations -- at its source position. Not a pass; shared by `memexpand` and `libcall_fold` |
+| `strdata.rs` | The bytes of every object whose contents hold for the whole run (string literals, and `const` `char` arrays by `constglobal`'s rule), and the string a pointer into one reads -- or, for a length, the one length every `Select` and phi arm agrees on. Not a pass |
+| `libcall_fold/` | A call the parser tagged as a known library function (`Instruction::known`) becomes its result where the arguments decide it: `strlen("abc")` is 3, `strcmp(p, "")` the first byte of `p`. A dispatcher and one module per family of functions |
 | `lower.rs` | Phi elimination to copies |
 
-The driver in `cc/opt.rs` runs `inline → memexpand → constglobal → (memexpand + loadfwd + vrp + ifconv + sccp + instcombine + dse + dce)*` to fixed
+The driver in `cc/opt.rs` runs `inline → memexpand → constglobal → (memexpand + loadfwd + vrp + ifconv + sccp + instcombine + libcall_fold + dse + dce)*` to fixed
+
 point (up to 10 iterations). The order inside the loop is load-bearing in both
 directions: `instcombine` derives constants `sccp` structurally cannot (`x - x`,
 `x ^ x`), any of which can make a branch condition constant, and `sccp` deletes

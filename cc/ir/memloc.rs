@@ -121,7 +121,8 @@ impl AddrMap {
         AddrMap { defs }
     }
 
-    fn def<'f>(&self, func: &'f Function, id: PseudoId) -> Option<&'f Instruction> {
+    /// The one instruction defining `id`, if this function has it.
+    pub(crate) fn def<'f>(&self, func: &'f Function, id: PseudoId) -> Option<&'f Instruction> {
         let (b, i) = *self.defs.get(&id)?;
         func.blocks.get(b)?.insns.get(i)
     }

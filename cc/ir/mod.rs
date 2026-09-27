@@ -11,6 +11,7 @@
 // once so that dataflow analysis and the optimization passes stay simple.
 //
 
+mod build;
 mod constfold;
 pub mod constglobal;
 pub mod dce;
@@ -22,6 +23,7 @@ pub mod facts;
 pub mod ifconv;
 pub mod inline;
 pub mod instcombine;
+pub mod libcall_fold;
 pub mod linearize;
 mod linearize_atomic;
 mod linearize_emit;
@@ -37,6 +39,7 @@ pub mod propagate;
 pub mod range;
 pub mod sccp;
 pub mod ssa;
+pub(crate) mod strdata;
 pub mod tls;
 pub mod validate;
 pub mod vrp;
@@ -2697,7 +2700,19 @@ pub struct Module {
     pub comp_dir: Option<String>,
     /// Primary source filename (for DW_AT_name in DWARF)
     pub source_name: Option<String>,
+    /// The assembler name of each function in [`FOLD_CALLEES`], as this
+    /// unit's declarations spell it (`Linearizer::library_function_name`):
+    /// a call an optimizer pass makes to `strchr` in place of the program's
+    /// `strstr` is still a call to `strchr`, asm label and all.
+    pub library_symbols: HashMap<&'static str, String>,
 }
+
+/// The C library functions an optimizer pass may call where the program
+/// called something else -- `strstr(s, "c")` becomes `strchr(s, 'c')` --
+/// by their C names.
+pub const FOLD_CALLEES: &[&str] = &[
+    "strlen", "strchr", "strcpy", "memcpy", "puts", "putchar", "fputs", "fputc", "fwrite",
+];
 
 impl Module {
     /// Add a function

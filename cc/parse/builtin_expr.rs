@@ -2209,7 +2209,7 @@ impl Parser<'_> {
             .typ
             .and_then(|t| self.types.base_type(t))
             .unwrap_or(self.types.int_id);
-        Self::typed_expr(
+        self.fold_zero_length_compare(Self::typed_expr(
             ExprKind::Call {
                 func: Box::new(func),
                 args,
@@ -2218,7 +2218,7 @@ impl Parser<'_> {
             },
             ret_type,
             pos,
-        )
+        ))
     }
 
     pub(super) fn parse_builtin_expr(

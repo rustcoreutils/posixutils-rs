@@ -323,9 +323,22 @@ headers rely on.
 
 When the translation unit does declare the function, a call through the
 `__builtin_` name is checked against that declaration exactly as a call through
-the plain name is. When it does not, c17 declares the function itself from
-what it knows of the entry point -- how many parameters it has, but not always
-their types -- so such a call's arguments are not checked.
+the plain name is. When it does not, c17 declares the function itself. A
+`<string.h>` or `<stdio.h>` function the optimizer knows (below) is declared
+with the library's own prototype, and its arguments are checked against it;
+for anything else c17 knows only how many parameters the entry point has, not
+always their types, so such a call's arguments are not checked.
+
+Once optimizing, a call to `strlen`, `strnlen`, `strcmp`, `strncmp`, `memcmp`,
+`strchr`, `strrchr`, `index`, `rindex`, `memchr`, `strstr`, `strpbrk` or
+`strcspn`, by either spelling, is computed in place where its arguments decide
+the result, as gcc does: the bytes of a string literal or of a `const` `char`
+array defined in the translation unit are read, `strcmp(p, "")` is the first
+byte of `p`, and `strstr(p, "c")` is `strchr(p, 'c')`. A `strncmp` or `memcmp`
+of the constant length 0 is 0 at every level. `-fno-builtin` and
+`-fno-builtin-NAME` keep the bare name's call, as does a declaration of the
+name with another prototype.
+
 
 The call always reaches the *library's* function, never an inline definition
 of the same name in the translation unit. That is the other half of what the

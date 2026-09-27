@@ -6837,8 +6837,8 @@ fn test_library_builtin_pointer_returns() {
 #[test]
 fn test_library_builtin_scalar_returns() {
     for (call, want) in [
-        ("__builtin_memcmp(0, 0, 0)", TypeKind::Int),
-        ("__builtin_strncmp(0, 0, 0)", TypeKind::Int),
+        ("__builtin_memcmp(0, 0, 1)", TypeKind::Int),
+        ("__builtin_strncmp(0, 0, 1)", TypeKind::Int),
         ("__builtin_printf(0)", TypeKind::Int),
         ("__builtin_sprintf(0, 0)", TypeKind::Int),
         ("__builtin_snprintf(0, 0, 0)", TypeKind::Int),
@@ -7738,6 +7738,30 @@ fn test_undeclared_known_builtin_gets_the_library_prototype() {
     assert_eq!(ft.base, Some(types.int_id));
     assert_eq!(ft.params.as_deref(), Some(&[types.const_char_ptr_id][..]));
     assert!(!ft.variadic);
+}
+
+/// `strncmp` or `memcmp` of the constant length 0 is 0 as it is parsed, at
+/// every level, with each argument still evaluated; any other length, and
+/// a function that is not one of the two, stays a call.
+#[test]
+fn test_zero_length_compare_is_zero_with_its_arguments_evaluated() {
+    let (tu, _types, strings, _symbols) = parse_tu(
+        "typedef unsigned long size_t;\n\
+         int strncmp(const char *, const char *, size_t);\n\
+         int memcmp(const void *, const void *, size_t);\n\
+         int n(const char *p) { return strncmp(p++, \"x\", 0); }\n\
+         int m(const char *p) { return __builtin_memcmp(p, p, 2 - 2); }\n\
+         int one(const char *p) { return strncmp(p, \"x\", 1); }\n",
+    )
+    .unwrap();
+    for f in ["n", "m"] {
+        let ExprKind::Comma(parts) = &returned_expr(&tu, &strings, f).kind else {
+            panic!("{f}: expected the arguments, then 0");
+        };
+        assert_eq!(parts.len(), 4, "{f}");
+        assert!(matches!(parts[3].kind, ExprKind::IntLit(0)), "{f}");
+    }
+    assert_eq!(returned_call(&tu, &strings, "one").1, Some(LibFn::Strncmp));
 }
 
 /// A statement expression whose last statement is a labeled expression

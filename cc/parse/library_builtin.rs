@@ -479,6 +479,36 @@ impl Parser<'_> {
         .then_some(func)
     }
 
+    /// `call` itself, or 0 when it is a `strncmp` or `memcmp` of the constant
+    /// length 0.
+    ///
+    /// gcc answers that as it parses, so at every level, and a library's
+    /// own `strncmp` may not: gcc.c-torture's returns the difference of two
+    /// bytes it never read. The pointer arguments are still evaluated, for
+    /// whatever they do, and nothing is read through them. This is the one
+    /// fold of a known call made here rather than in `ir::libcall_fold`,
+    /// because it is the one gcc makes at `-O0`.
+    pub(super) fn fold_zero_length_compare(&self, call: Expr) -> Expr {
+        let zero_length = match &call.kind {
+            ExprKind::Call {
+                known: Some(LibFn::Strncmp | LibFn::Memcmp),
+                args,
+                ..
+            } => args.len() == 3 && self.eval_const_expr(&args[2]) == Some(0),
+            _ => false,
+        };
+        if !zero_length {
+            return call;
+        }
+        let pos = call.pos;
+        let ExprKind::Call { mut args, .. } = call.kind else {
+            unreachable!("matched as a call above");
+        };
+        let int = self.types.int_id;
+        args.push(Self::typed_expr(ExprKind::IntLit(0), int, pos));
+        Self::typed_expr(ExprKind::Comma(args), int, pos)
+    }
+
     /// `lb`'s parameter types.
     fn library_params(&self, lb: &LibraryBuiltin) -> Vec<TypeId> {
         lb.params.iter().map(|p| p.id(self.types)).collect()

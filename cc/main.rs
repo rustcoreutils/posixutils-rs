@@ -1220,7 +1220,7 @@ fn process_file(
     // Optimize IR. Called even at -O0, where the only pass that does anything
     // is inlining of `__attribute__((always_inline))` functions, which gcc
     // honours with optimization off.
-    opt::optimize_module(&mut module, &types, args.optimization());
+    opt::optimize_module(&mut module, &types, args.optimization(), target);
 
     // A libm opcode the target has no instruction for becomes the call it
     // stands for -- after the optimizer, which could still fold it.

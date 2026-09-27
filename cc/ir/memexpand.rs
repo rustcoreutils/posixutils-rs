@@ -29,7 +29,7 @@
 // `void *` that has already dropped the qualifier.
 //
 
-use super::constfold::at_width;
+use super::build::Builder;
 use super::facts::ConstMap;
 use super::{Function, Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeTable};
@@ -145,11 +145,9 @@ pub fn run(func: &mut Function, types: &TypeTable) -> bool {
             match expandable(&insn, &consts) {
                 Some((op, n)) => {
                     Expander {
-                        func: &mut *func,
-                        types,
+                        b: Builder::new(&mut *func, types, insn.pos, &mut out),
                         consts: &consts,
                         model: &insn,
-                        out: &mut out,
                     }
                     .expand(op, n);
                     changed = true;
@@ -174,13 +172,10 @@ fn expandable(insn: &Instruction, consts: &ConstMap) -> Option<(BlockOp, i64)> {
 
 /// The instructions that replace one block memory operation.
 struct Expander<'a> {
-    func: &'a mut Function,
-    types: &'a TypeTable,
+    b: Builder<'a>,
     consts: &'a ConstMap,
-    /// The instruction being replaced: its operands, its result and its
-    /// source position.
+    /// The instruction being replaced: its operands and its result.
     model: &'a Instruction,
-    out: &'a mut Vec<Instruction>,
 }
 
 impl Expander<'_> {
@@ -204,69 +199,26 @@ impl Expander<'_> {
             BlockOp::Set => {
                 let mut fill = Fill::new(second, self.consts);
                 for (at, chunk) in block_chunks(n) {
-                    let v = fill.at(&mut self, chunk);
+                    let v = fill.at(&mut self.b, chunk);
                     self.store(v, dest, at, chunk);
                 }
             }
         }
         // Each returns its destination.
         if let Some(target) = self.model.target {
-            let typ = self.model.typ.unwrap_or(self.types.void_ptr_id);
-            self.push(Instruction::unop(Opcode::Copy, target, dest, typ, 64));
+            let typ = self.model.typ.unwrap_or(self.b.types.void_ptr_id);
+            self.b.copy_into(target, dest, typ, 64);
         }
     }
 
-    fn push(&mut self, mut insn: Instruction) {
-        insn.pos = self.model.pos;
-        self.out.push(insn);
-    }
-
     fn load(&mut self, addr: PseudoId, at: i64, chunk: Chunk) -> PseudoId {
-        let v = self.func.alloc_pseudo();
-        let typ = chunk.typ(self.types);
-        self.push(Instruction::load(v, addr, at, typ, chunk.bits()));
-        v
+        let typ = chunk.typ(self.b.types);
+        self.b.load(addr, at, typ, chunk.bits())
     }
 
     fn store(&mut self, v: PseudoId, addr: PseudoId, at: i64, chunk: Chunk) {
-        let typ = chunk.typ(self.types);
-        self.push(Instruction::store(v, addr, at, typ, chunk.bits()));
-    }
-
-    /// A new integer constant of `typ` at `size` bits, with the `SetVal`
-    /// that gives it its width.
-    fn constant(&mut self, v: i128, typ: TypeId, size: u32) -> PseudoId {
-        let id = self.func.create_const_pseudo(at_width(v, size, true));
-        self.push(
-            Instruction::new(Opcode::SetVal)
-                .with_target(id)
-                .with_type_and_size(typ, size),
-        );
-        id
-    }
-
-    /// `op` of `a` and `b` into a new pseudo of `typ` at `size` bits.
-    fn binop(&mut self, op: Opcode, a: PseudoId, b: PseudoId, typ: TypeId, size: u32) -> PseudoId {
-        let t = self.func.alloc_pseudo();
-        self.push(Instruction::binop(op, t, a, b, typ, size));
-        t
-    }
-
-    /// A conversion `op` of `src`, of `from` at `from_size` bits, to `to` at
-    /// `size` bits.
-    fn convert(
-        &mut self,
-        op: Opcode,
-        src: PseudoId,
-        (from, from_size): (TypeId, u32),
-        (to, size): (TypeId, u32),
-    ) -> PseudoId {
-        let t = self.func.alloc_pseudo();
-        let mut insn = Instruction::unop(op, t, src, to, size);
-        insn.src_size = from_size;
-        insn.src_typ = Some(from);
-        self.push(insn);
-        t
+        let typ = chunk.typ(self.b.types);
+        self.b.store(v, addr, at, typ, chunk.bits());
     }
 }
 
@@ -296,7 +248,7 @@ impl Fill {
         }
     }
 
-    fn at(&mut self, ex: &mut Expander<'_>, chunk: Chunk) -> PseudoId {
+    fn at(&mut self, ex: &mut Builder<'_>, chunk: Chunk) -> PseudoId {
         let slot = chunk as usize;
         if let Some(v) = self.at_width[slot] {
             return v;
@@ -322,7 +274,7 @@ impl Fill {
     }
 
     /// `(unsigned long)(c & 0xff) * 0x0101010101010101`.
-    fn word(&mut self, ex: &mut Expander<'_>) -> PseudoId {
+    fn word(&mut self, ex: &mut Builder<'_>) -> PseudoId {
         if let Some(w) = self.word {
             return w;
         }
@@ -340,6 +292,7 @@ impl Fill {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::constfold::at_width;
     use crate::ir::{BasicBlock, BasicBlockId, Pseudo, PseudoKind};
     use crate::target::Target;
 

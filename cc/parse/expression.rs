@@ -1430,7 +1430,7 @@ impl<'a> Parser<'a> {
                     .unwrap_or(self.types.int_id); // Default to int
 
                 let known = self.known_callee(&expr);
-                expr = Self::typed_expr(
+                expr = self.fold_zero_length_compare(Self::typed_expr(
                     ExprKind::Call {
                         func: Box::new(expr),
                         args,
@@ -1439,7 +1439,7 @@ impl<'a> Parser<'a> {
                     },
                     return_type,
                     base_pos,
-                );
+                ));
             } else {
                 break;
             }

@@ -5067,6 +5067,90 @@ fn test_builtin_nans() {
     assert_eq!(expr.typ, Some(types.double_id));
 }
 
+// abs / labs / llabs / imaxabs
+
+/// Each spelling, bare or reserved, parses to `IntAbs` of the function's own
+/// type, with the argument converted to it as the prototype would.
+#[test]
+fn test_int_abs_builtins() {
+    // The spelling, the type it answers, and whether an `int` argument is
+    // converted to reach it.
+    type Want = fn(&TypeTable) -> crate::types::TypeId;
+    let cases: &[(&str, Want, bool)] = &[
+        ("abs(i)", |t| t.int_id, false),
+        ("__builtin_abs(i)", |t| t.int_id, false),
+        ("labs(i)", |t| t.long_id, true),
+        ("__builtin_labs(i)", |t| t.long_id, true),
+        ("llabs(i)", |t| t.longlong_id, true),
+        ("__builtin_llabs(i)", |t| t.longlong_id, true),
+        ("imaxabs(i)", |t| t.long_id, true),
+        ("__builtin_imaxabs(i)", |t| t.long_id, true),
+    ];
+    for (src, want, converted) in cases {
+        let (expr, types, _, _) = parse_expr_with_vars(src, &["i"]).unwrap();
+        assert_eq!(expr.typ, Some(want(&types)), "{src}");
+        let ExprKind::IntAbs { arg } = &expr.kind else {
+            panic!("{src}: expected IntAbs, got {:?}", expr.kind);
+        };
+        assert_eq!(arg.typ, Some(want(&types)), "{src}");
+        assert_eq!(
+            matches!(arg.kind, ExprKind::Cast { .. }),
+            *converted,
+            "{src}"
+        );
+    }
+}
+
+/// A declaration of `abs` with a type incompatible with `int abs(int)` makes
+/// it an ordinary function; the compatible declaration keeps the builtin.
+#[test]
+fn test_int_abs_incompatible_declaration_displaces_builtin() {
+    fn returned_is_int_abs(src: &str) -> bool {
+        let (tu, _, _, _) = parse_tu(src).unwrap();
+        let func = tu
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ExternalDecl::FunctionDef(f) => Some(f),
+                _ => None,
+            })
+            .expect("function definition");
+        let Stmt::Block(items) = &func.body else {
+            panic!("function body is not a block");
+        };
+        let BlockItem::Statement(stmt) = &items[0] else {
+            panic!("expected a statement");
+        };
+        let Stmt::Return(Some(expr)) = &**stmt else {
+            panic!("expected a return statement");
+        };
+        matches!(expr.kind, ExprKind::IntAbs { .. })
+    }
+    assert!(!returned_is_int_abs(
+        "struct S { int a; }; struct S abs(int); struct S f(void) { return abs(1); }"
+    ));
+    assert!(!returned_is_int_abs(
+        "long abs(long); long f(void) { return abs(1); }"
+    ));
+    assert!(returned_is_int_abs(
+        "int abs(int); int f(void) { return abs(1); }"
+    ));
+    assert!(returned_is_int_abs(
+        "extern int abs(const int); int f(void) { return abs(1); }"
+    ));
+    assert!(returned_is_int_abs(
+        "int abs(); int f(void) { return abs(1); }"
+    ));
+}
+
+/// A bare name that is not being called is an ordinary identifier: here the
+/// variable `abs`, which also displaces the builtin.
+#[test]
+fn test_int_abs_bare_name_not_called_is_an_identifier() {
+    let (expr, _, _, _) = parse_expr_with_vars("abs + 1", &["abs"]).unwrap();
+    assert!(!matches!(expr.kind, ExprKind::IntAbs { .. }));
+}
+
 // __builtin_flt_rounds test
 
 #[test]

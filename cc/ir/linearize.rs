@@ -1876,6 +1876,7 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcountll { arg }
             | ExprKind::Fabs { arg }
             | ExprKind::Fabsf { arg }
+            | ExprKind::IntAbs { arg }
             | ExprKind::Signbit { arg }
             | ExprKind::Signbitf { arg }
             | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
@@ -5300,6 +5301,13 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            ExprKind::IntAbs { arg } => {
+                let arg_val = self.linearize_expr(arg);
+                let typ = self.expr_type(expr);
+                let size = self.types.size_bits(typ);
+                self.emit_int_abs(arg_val, typ, size)
+            }
+
             ExprKind::Signbit { arg } => {
                 let arg_val = self.linearize_expr(arg);
                 let result = self.alloc_pseudo();
@@ -6398,6 +6406,7 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Memmove { .. }
             | ExprKind::Fabs { .. }
             | ExprKind::Fabsf { .. }
+            | ExprKind::IntAbs { .. }
             | ExprKind::Signbit { .. }
             | ExprKind::Signbitf { .. }
             | ExprKind::FpTest { .. }

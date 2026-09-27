@@ -1684,7 +1684,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// `t = x >> (width - 1)` is all ones for a negative value and zero
     /// otherwise, so `(x ^ t) - t` is the magnitude either way. An unsigned
     /// value is already its own magnitude.
-    fn emit_int_abs(&mut self, x: PseudoId, typ: TypeId, size: u32) -> PseudoId {
+    pub(crate) fn emit_int_abs(&mut self, x: PseudoId, typ: TypeId, size: u32) -> PseudoId {
         if self.types.is_unsigned(typ) {
             return x;
         }

@@ -250,7 +250,7 @@ list silenced all six.
 | `__label__` | Block-scope label declarations exist for nested functions and go with them |
 | Label difference as a constant | `compile/labels-3`, `execute/pr70460`: `&&a - &&b` in a static initializer. Labels as values are supported; the difference needs a symbol-difference relocation |
 | A C17 constraint gcc only warns about | `compile/pr38857`: 6.7.4p3, an external inline definition referring to a static. `-fpermissive` relaxes it |
-| gcc-specific *behaviour* | `20021127-1` (gcc folds `llabs()` and never calls the program's own definition of it), `20031003-1` (gcc's folder saturates undefined behaviour; aarch64 agrees by hardware accident), `pr46309` (a conditional with one `void` arm, which C17 6.5.15p3 forbids) |
+| gcc-specific *behaviour* | `20031003-1` (gcc's folder saturates undefined behaviour; aarch64 agrees by hardware accident), `pr46309` (a conditional with one `void` arm, which C17 6.5.15p3 forbids) |
 
 These are listed **by name** in the harness, never matched against the source.
 Scanning for the feature looked tidier and was wrong: `pr86659-1`, `pr86659-2`
@@ -269,7 +269,7 @@ injecting one into a skip list and watching the gate fail.
 
 ### Deliberate divergences from gcc
 
-`20021127-1`, `20031003-1` and `pr46309` are skipped as gcc-specific behaviour
+`20031003-1` and `pr46309` are skipped as gcc-specific behaviour
 above; the reasoning is in that table. One more is a divergence c17 keeps but
 does **not** skip, because it is not GNU-specific:
 

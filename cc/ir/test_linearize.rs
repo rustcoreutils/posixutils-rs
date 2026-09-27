@@ -7158,6 +7158,32 @@ fn linearize_source(src: &str, target: &Target) -> Module {
     linearize(&tu, &symbols, &types, &strings, target, false)
 }
 
+/// `abs` and its siblings become the branch-free `(x ^ s) - s` sequence
+/// rather than a call -- including when the translation unit defines the
+/// function itself, which is undefined behaviour and does not displace it.
+#[test]
+fn test_int_abs_is_linearized_without_a_call() {
+    let src = "long labs(long);\n\
+               int abs(int v) { return 42; }\n\
+               long f(int a, long b) { return abs(a) + labs(b) + __builtin_llabs(b); }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let insns: Vec<&Instruction> = f.blocks.iter().flat_map(|bb| bb.insns.iter()).collect();
+    assert!(
+        !insns.iter().any(|i| i.op == Opcode::Call),
+        "f still calls a library function"
+    );
+    let count = |op| insns.iter().filter(|i| i.op == op).count();
+    assert_eq!(count(Opcode::Asr), 3);
+    assert_eq!(count(Opcode::Xor), 3);
+    let widths: Vec<u32> = insns
+        .iter()
+        .filter(|i| i.op == Opcode::Asr)
+        .map(|i| i.size)
+        .collect();
+    assert_eq!(widths, vec![32, 64, 64]);
+}
+
 /// AAPCS64 B.4 passes a composite over sixteen bytes as a pointer to a copy
 /// the caller makes; System V puts the bytes themselves in the argument area.
 /// So only the aarch64 lowering copies the argument into a frame temporary

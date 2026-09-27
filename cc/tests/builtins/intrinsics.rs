@@ -11,7 +11,7 @@
 // Consolidates: types_compatible, constant_p, unreachable, expect tests
 //
 
-use crate::common::compile_and_run;
+use crate::common::{asm_for_at, asm_symbol, compile_and_run, compile_and_run_aarch64};
 
 // ============================================================================
 // Mega-test: Intrinsic builtins
@@ -857,4 +857,150 @@ int main(void)
             "at {opt}"
         );
     }
+}
+
+// ============================================================================
+// Integer magnitude: abs, labs, llabs, imaxabs
+// ============================================================================
+
+/// Does `asm` call `name`? Matches `call abs@PLT`, `call _abs` and `bl abs`.
+fn calls(asm: &str, name: &str) -> bool {
+    let sym = asm_symbol(name);
+    asm.lines().any(|l| {
+        let mut words = l.split_whitespace();
+        matches!(words.next(), Some("call" | "bl" | "jmp" | "b"))
+            && words.next().map(|t| t.trim_end_matches("@PLT")) == Some(sym.as_str())
+    })
+}
+
+// Self-contained, since the aarch64 run has no target headers to include.
+const INT_ABS_PROGRAM: &str = r#"typedef __INTMAX_TYPE__ intmax_t;
+int abs(int);
+long labs(long);
+long long llabs(long long);
+intmax_t imaxabs(intmax_t);
+#define INT_MIN (-__INT_MAX__ - 1)
+#define LONG_MAX __LONG_MAX__
+#define LLONG_MAX __LONG_LONG_MAX__
+static int n;
+static int side(int v) { n++; return v; }
+int main(void) {
+    volatile int m = -5;
+    volatile long lm = -7;
+    volatile long long llm = -9;
+    volatile intmax_t jm = -11;
+    volatile int imin = INT_MIN;
+
+    /* Bare and reserved spellings, every width. */
+    if (abs(m) != 5 || labs(lm) != 7 || llabs(llm) != 9 || imaxabs(jm) != 11) return 1;
+    if (__builtin_abs(m) != 5 || __builtin_labs(lm) != 7) return 2;
+    if (__builtin_llabs(llm) != 9 || __builtin_imaxabs(jm) != 11) return 3;
+    if (abs(-m) != 5 || labs(7L) != 7 || llabs(LLONG_MAX) != LLONG_MAX) return 4;
+    if (abs(0) != 0 || labs(-LONG_MAX) != LONG_MAX) return 5;
+
+    /* The argument is evaluated exactly once. */
+    if (abs(side(-4)) != 4 || n != 1) return 6;
+
+    /* Named without a call, the identifier is the library function. */
+    int (*fp)(int) = abs;
+    if (fp(-6) != 6) return 7;
+
+    /* The argument converts as the prototype says: an int widened to long
+       keeps its sign, a double is truncated to int. */
+    if (labs(m) != 5 || llabs(m) != 5) return 8;
+    if (abs(3.9) != 3 || abs(-3.9) != 3) return 9;
+
+    /* The one value with no magnitude of its own type wraps to itself. */
+    if ((unsigned)abs(imin) != 0x80000000u) return 10;
+
+    /* The result has the function's type. */
+    if (sizeof(abs(m)) != sizeof(int) || sizeof(labs(m)) != sizeof(long)) return 11;
+    if (sizeof(llabs(m)) != sizeof(long long)) return 12;
+    return 0;
+}
+"#;
+
+/// `abs` and its siblings are computed in place at every level, bare or
+/// reserved, as gcc does; a call is what `-fno-builtin[-NAME]` asks for.
+#[test]
+fn builtins_int_abs_is_expanded_inline() {
+    assert_eq!(compile_and_run("int_abs", INT_ABS_PROGRAM, &[]), 0);
+    if let Some(rc) = compile_and_run_aarch64("int_abs_a64", INT_ABS_PROGRAM, "-O2") {
+        assert_eq!(rc, 0);
+    }
+
+    let src = "#include <stdlib.h>\n\
+               #include <inttypes.h>\n\
+               long f(int a, long b, long long c, intmax_t d) {\n\
+                   return abs(a) + labs(b) + llabs(c) + imaxabs(d)\n\
+                        + __builtin_abs(a) + __builtin_labs(b);\n\
+               }\n";
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_at("int_abs_asm", src, &[opt]);
+        for name in ["abs", "labs", "llabs", "imaxabs"] {
+            assert!(!calls(&asm, name), "{opt}: {name} was called:\n{asm}");
+        }
+    }
+
+    // `-fno-builtin-abs` turns off the bare spelling it names and nothing
+    // else; `-fno-builtin` turns off every bare spelling. The reserved
+    // spelling is never displaced.
+    let asm = asm_for_at("int_abs_nb_abs", src, &["-fno-builtin-abs"]);
+    assert!(
+        calls(&asm, "abs"),
+        "-fno-builtin-abs kept abs inline:\n{asm}"
+    );
+    assert!(
+        !calls(&asm, "labs"),
+        "-fno-builtin-abs displaced labs:\n{asm}"
+    );
+    let asm = asm_for_at("int_abs_nb", src, &["-fno-builtin"]);
+    for name in ["abs", "labs", "llabs", "imaxabs"] {
+        assert!(calls(&asm, name), "-fno-builtin kept {name} inline:\n{asm}");
+    }
+}
+
+/// A translation unit's own definition of a reserved library name does not
+/// displace the builtin, as for `fabs`: defining it is undefined behaviour
+/// (C17 7.1.3p2), and gcc's execute/20021127-1 expects exactly this.
+#[test]
+fn builtins_int_abs_ignores_a_local_definition() {
+    let code = r#"
+void abort(void);
+long long llabs(long long);
+volatile long long a = -1;
+int main(void) { return llabs(a) == 1 ? 0 : 1; }
+long long llabs(long long b) { abort(); }
+"#;
+    assert_eq!(compile_and_run("int_abs_local_def", code, &[]), 0);
+}
+
+/// A bare library name declared with a type that is not the library's is
+/// the program's own function, and the builtin must stand aside: gcc warns
+/// that the declaration conflicts with the builtin and then calls it
+/// (compile/pr123703 declares `struct S abs(int)`). A compatible
+/// redeclaration -- the one `<stdlib.h>` writes -- keeps the builtin.
+#[test]
+fn builtins_incompatible_declaration_displaces_the_bare_builtin() {
+    let code = r#"
+struct S { int a; };
+struct S abs(int);
+struct S fabs(int);
+long floor(long);
+int main(void) {
+    if (abs(-3).a != 103) return 1;
+    if (fabs(-4).a != 104) return 2;
+    if (floor(7L) != 207) return 3;
+    return 0;
+}
+struct S abs(int v) { struct S s = { 100 - v }; return s; }
+struct S fabs(int v) { struct S s = { 100 - v }; return s; }
+long floor(long v) { return 200 + v; }
+"#;
+    assert_eq!(compile_and_run("incompatible_bare_builtin", code, &[]), 0);
+
+    let src =
+        "int abs(int);\nlong labs(long);\nlong f(int a, long b) { return abs(a) + labs(b); }\n";
+    let asm = asm_for_at("compatible_bare_builtin", src, &[]);
+    assert!(!calls(&asm, "abs") && !calls(&asm, "labs"), "{asm}");
 }

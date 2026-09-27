@@ -515,14 +515,12 @@ OUT_OF_SCOPE_VLA_MEMBER=" execute/20020412-1 execute/20040308-1 \
 # required by C17 and c17 deliberately does something else; see the
 # "Deliberate divergences" table in cc/DECISIONS.md.
 #
-#   20021127-1  gcc folds llabs() and never calls the program's own definition
-#               of llabs. Matching it means a local definition is ignored.
 #   20031003-1  (int)2147483648.0f is undefined behaviour; gcc's folder
 #               saturates to INT_MAX. aarch64 agrees by hardware accident.
 #   pr46309     a conditional with one `void` arm, which gcc takes as an
 #               extension and C17 6.5.15p3 forbids.
-OUT_OF_SCOPE_GCC_BEHAVIOUR=" execute/20021127-1 execute/20031003-1 \
- execute/pr46309 compile/pr26725 compile/20000211-1 compile/950919-1 "
+OUT_OF_SCOPE_GCC_BEHAVIOUR=" execute/20031003-1 execute/pr46309 \
+ compile/pr26725 compile/20000211-1 compile/950919-1 "
 
 # Tests gcc on this machine fails exactly as c17 does, verified by running both
 # at -O0 and -O2. Counting them as c17 failures overstates the gap, and they are

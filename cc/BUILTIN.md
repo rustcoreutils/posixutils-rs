@@ -110,7 +110,8 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 | `__builtin_fabsf(x)` | Absolute value (`float`) |
 | `__builtin_fabsl(x)` | Absolute value (`long double`) |
 | `floor(x)`, `ceil(x)`, `trunc(x)`, `round(x)`, `rint(x)`, `nearbyint(x)` | Recognized under their plain names and **narrowed to the `f` form when the argument is a `float`**: `(float)floor((double)x)` is `floorf(x)` exactly, because the result is an integer no greater in magnitude than `x`. The condition is the argument's type, not the result's. Only these six qualify -- `sin` and `log` are not exactly rounding, and narrowing one changes the last bit. Displaced like `fabs` |
-| `fabs(x)`, `fabsf(x)`, `fabsl(x)` | The same three under their bare names, as gcc recognizes them whether or not `<math.h>` was included. Not reserved spellings, so they are displaced the same way `alloca` is: by a declaration that is not a function, or by `-fno-builtin[-fabs]`. The bare name is still an object where it is not being called, so `double (*p)(double) = fabs;` names the library function. The argument is converted to the prototype's type first, which is the whole of what recognition buys at run time -- all three are lowered as calls -- while the optimizer gains the one fact it needs to fold `fabs(x) < 0.0` to 0 |
+| `fabs(x)`, `fabsf(x)`, `fabsl(x)` | The same three under their bare names, as gcc recognizes them whether or not `<math.h>` was included. Not reserved spellings, so they are displaced by a declaration that is not a function, by a function declaration whose type is not the library prototype (`struct S fabs(int)`), or by `-fno-builtin[-fabs]`. The bare name is still an object where it is not being called, so `double (*p)(double) = fabs;` names the library function. The argument is converted to the prototype's type first, which is the whole of what recognition buys at run time -- all three are lowered as calls -- while the optimizer gains the one fact it needs to fold `fabs(x) < 0.0` to 0 |
+| `abs(x)`, `labs(x)`, `llabs(x)`, `imaxabs(x)` and their `__builtin_` spellings | Magnitude of an `int`, `long`, `long long` or `intmax_t`, computed in place as `(x ^ s) - s` with `s = x >> (width - 1)` -- never a call, at every level, as gcc does; a constant argument therefore folds. The argument is converted to the prototype's type first. The bare names are displaced like `fabs`, and a declaration with any other type (`struct S abs(int)`) makes the name an ordinary function, as in gcc; a translation unit's own compatible definition of one does **not** displace it, since defining a reserved library name is undefined (C17 7.1.3p2). `abs(INT_MIN)` wraps to `INT_MIN` |
 | `__builtin_signbit(x)` | Returns non-zero if sign bit set (`double`) |
 | `__builtin_signbitf(x)` | Returns non-zero if sign bit set (`float`) |
 | `__builtin_signbitl(x)` | Returns non-zero if sign bit set (`long double`) |
@@ -277,9 +278,6 @@ function by its own name inside its own body is still recursion, as in gcc.
 |---------|-------------|
 | `__builtin_abort()` | |
 | `__builtin_exit(status)` | |
-| `__builtin_abs(x)` | Absolute value, `int` |
-| `__builtin_labs(x)` | Absolute value, `long` |
-| `__builtin_llabs(x)` | Absolute value, `long long` |
 | `__builtin_trap()` | Abnormal termination; lowered to `abort` |
 | `__builtin_malloc(n)`, `__builtin_calloc(n, sz)`, `__builtin_realloc(p, n)`, `__builtin_free(p)` | The allocators. The three allocating forms return `void *` |
 | `__builtin_memcmp(a, b, n)` | |
@@ -304,7 +302,6 @@ function by its own name inside its own body is still recursion, as in gcc.
 | `__builtin_bcmp(a, b, n)` | The older spelling of `memcmp` |
 | `__builtin_bzero(p, n)` | The older spelling of `memset(p, 0, n)`; returns `void` |
 | `__builtin_strspn(s, set)`, `__builtin_strcspn(s, set)` | Return a size, not a pointer |
-| `__builtin_imaxabs(x)` | Absolute value, `intmax_t` |
 | `__builtin_bcopy(src, dst, n)` | Returns `void`, and takes the source **first**, unlike `memcpy` |
 | `__builtin_printf_unlocked`, `__builtin_fprintf_unlocked`, `__builtin_fputs_unlocked` | glibc defines none of these, so a program using one supplies it — which is what gcc.c-torture's `builtins/` tests do |
 

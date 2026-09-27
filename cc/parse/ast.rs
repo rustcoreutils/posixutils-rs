@@ -719,6 +719,13 @@ pub enum ExprKind {
         arg: Box<Expr>,
     },
 
+    /// `abs`, `labs`, `llabs`, `imaxabs` and their `__builtin_` spellings:
+    /// the magnitude of `arg`, which has already been converted to the
+    /// expression's own type.
+    IntAbs {
+        arg: Box<Expr>,
+    },
+
     /// __builtin_signbit(x) - test sign bit of double, returns non-zero if negative
     Signbit {
         arg: Box<Expr>,
@@ -1535,6 +1542,7 @@ impl Expr {
             | K::Alloca { size: a }
             | K::Fabs { arg: a }
             | K::Fabsf { arg: a }
+            | K::IntAbs { arg: a }
             | K::Signbit { arg: a }
             | K::Signbitf { arg: a }
             | K::FpTest { arg: a, .. }

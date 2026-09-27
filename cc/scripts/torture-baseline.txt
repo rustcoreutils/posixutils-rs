@@ -1,7 +1,11 @@
 builtins/20010124-1@-O0
 builtins/20010124-1@-O2
+builtins/abs-1@-O0
+builtins/abs-1@-O2
 builtins/abs-2@-O0
+builtins/abs-2@-O2
 builtins/abs-3@-O0
+builtins/abs-3@-O2
 builtins/complex-1@-O0
 builtins/fprintf@-O0
 builtins/fputs@-O0
@@ -4224,6 +4228,8 @@ execute/20021120-2@-O0
 execute/20021120-2@-O2
 execute/20021120-3@-O0
 execute/20021120-3@-O2
+execute/20021127-1@-O0
+execute/20021127-1@-O2
 execute/20021204-1@-O0
 execute/20021204-1@-O2
 execute/20021219-1@-O0

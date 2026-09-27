@@ -127,6 +127,9 @@ impl Parser<'_> {
     /// and gcc accepts that. `setjmp` and `longjmp` are the exception, and
     /// only against a *function* declaration: `<setjmp.h>` declares exactly
     /// those, and they need code generation an ordinary call cannot produce.
+    /// The library names with one fixed prototype (`abs`, `fabs`, `floor`,
+    /// ...) survive a function declaration only if it is compatible with that
+    /// prototype (see `matches_bare_builtin_prototype`).
     ///
     /// The reserved spellings (`__builtin_*`, `_Alignof`, `__alignof__`) are
     /// never displaced: C17 7.1.3 reserves them to the implementation in every
@@ -144,6 +147,10 @@ impl Parser<'_> {
                     | crate::kw::FABS
                     | crate::kw::FABSF
                     | crate::kw::FABSL
+                    | crate::kw::ABS
+                    | crate::kw::LABS
+                    | crate::kw::LLABS
+                    | crate::kw::IMAXABS
                     | crate::kw::FLOOR
                     | crate::kw::CEIL
                     | crate::kw::TRUNC
@@ -170,8 +177,61 @@ impl Parser<'_> {
         let Some(symbol_id) = self.symbols.lookup_id(name_id, Namespace::Ordinary) else {
             return false;
         };
+        let typ = self.symbols.get(symbol_id).typ;
         shadowed_by_any_decl
-            || self.types.kind(self.symbols.get(symbol_id).typ) != TypeKind::Function
+            || self.types.kind(typ) != TypeKind::Function
+            || !self.matches_bare_builtin_prototype(name_id, typ)
+    }
+
+    /// The library prototype of a bare builtin name, as (return type, the one
+    /// parameter's type), for the names that have a single fixed prototype.
+    ///
+    /// `None` for the names that have none (`setjmp`, `alloca`, `offsetof`,
+    /// ...): any function declaration of those keeps the builtin.
+    fn bare_builtin_prototype(&self, name_id: StringId) -> Option<(TypeId, TypeId)> {
+        use crate::kw;
+        let t = &self.types;
+        let same = |id: TypeId| Some((id, id));
+        match name_id {
+            kw::ABS => same(t.int_id),
+            // intmax_t is `long` on every c17 target.
+            kw::LABS | kw::IMAXABS => same(t.long_id),
+            kw::LLABS => same(t.longlong_id),
+            kw::FABSF => same(t.float_id),
+            kw::FABSL => same(t.longdouble_id),
+            kw::FABS | kw::FLOOR | kw::CEIL | kw::TRUNC | kw::ROUND | kw::RINT | kw::NEARBYINT => {
+                same(t.double_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the function type `typ` declared for `name_id` is compatible
+    /// with that builtin's library prototype.
+    ///
+    /// gcc's rule: a declaration with an incompatible type ("conflicting types
+    /// for built-in function") makes the name an ordinary function, while the
+    /// compatible one `<stdlib.h>` or `<math.h>` writes keeps the builtin. An
+    /// unprototyped declaration says nothing about the parameters, so only
+    /// its return type is compared; a prototype must have exactly the one
+    /// parameter, whose qualifiers do not count (C17 6.7.6.3p15 -- which
+    /// `types_compatible` already ignores at the top level).
+    fn matches_bare_builtin_prototype(&self, name_id: StringId, typ: TypeId) -> bool {
+        let Some((ret, param)) = self.bare_builtin_prototype(name_id) else {
+            return true;
+        };
+        let decl = self.types.get(typ);
+        let ret_ok = decl
+            .base
+            .is_some_and(|base| self.types.types_compatible(base, ret));
+        let params_ok = match &decl.params {
+            None => true,
+            Some(params) => {
+                !decl.variadic
+                    && matches!(params.as_slice(), [p] if self.types.types_compatible(*p, param))
+            }
+        };
+        ret_ok && params_ok
     }
 
     /// Try to parse a builtin function expression.
@@ -213,15 +273,18 @@ impl Parser<'_> {
             })
     }
 
-    /// `fabs(x)` / `fabsf(x)`, whose opcode reads its operand at a fixed
-    /// width, so the argument has to arrive already converted.
+    /// A one-argument builtin standing for a prototyped library function:
+    /// `fabs(x)`, `abs(x)` and their siblings. The lowering reads its operand
+    /// at a fixed width, so the argument has to arrive already converted to
+    /// `typ`, as the prototype would have converted it.
     ///
     /// `fabs(-3)` is a well-formed call under the prototype the standard
     /// gives it -- and under the `extern double fabs(double);` a program
     /// writes for itself -- but the opcode is an SSE instruction that masks
     /// the sign bit, so an unconverted `int` operand is read as a `double`
-    /// bit pattern and the answer is nonsense.
-    fn parse_fabs(
+    /// bit pattern and the answer is nonsense. `labs(i)` for an `int i` would
+    /// likewise take the sign from bit 63 of a 32-bit value.
+    fn parse_converted_unary(
         &mut self,
         token_pos: Position,
         typ: TypeId,
@@ -925,23 +988,23 @@ impl Parser<'_> {
                 ))
             })()),
             // Fabs builtins - absolute value for floats
-            crate::kw::BUILTIN_FABS => Some(self.parse_fabs(
+            crate::kw::BUILTIN_FABS => Some(self.parse_converted_unary(
                 token_pos,
                 self.types.double_id,
                 |arg| ExprKind::Fabs { arg },
             )),
-            crate::kw::FABS if called => Some(self.parse_fabs(
+            crate::kw::FABS if called => Some(self.parse_converted_unary(
                 token_pos,
                 self.types.double_id,
                 |arg| ExprKind::Fabs { arg },
             )),
 
-            crate::kw::BUILTIN_FABSF => Some(self.parse_fabs(
+            crate::kw::BUILTIN_FABSF => Some(self.parse_converted_unary(
                 token_pos,
                 self.types.float_id,
                 |arg| ExprKind::Fabsf { arg },
             )),
-            crate::kw::FABSF if called => Some(self.parse_fabs(
+            crate::kw::FABSF if called => Some(self.parse_converted_unary(
                 token_pos,
                 self.types.float_id,
                 |arg| ExprKind::Fabsf { arg },
@@ -2439,6 +2502,39 @@ impl Parser<'_> {
         }
     }
 
+    /// `abs`, `labs`, `llabs` and `imaxabs`, bare or as `__builtin_*`: the
+    /// magnitude computed in place, never a call.
+    ///
+    /// gcc expands these at every level, `-O0` included, and a program may
+    /// rely on it: `builtins/abs-1` expects `labs` to be expanded while
+    /// `-fno-builtin-abs` keeps `abs` a call. Expanding them also lets a
+    /// constant argument fold, which a call to the library never can.
+    ///
+    /// The bare spellings follow `fabs`: recognized only where called, and
+    /// displaced by `-fno-builtin[-NAME]` or by a declaration that is not the
+    /// library function's (see `builtin_is_shadowed`).
+    fn parse_int_abs_builtin(
+        &mut self,
+        name_id: StringId,
+        token_pos: Position,
+    ) -> Option<ParseResult<Expr>> {
+        let called = self.is_special(b'(');
+        let typ = match name_id {
+            crate::kw::BUILTIN_ABS => self.types.int_id,
+            crate::kw::ABS if called => self.types.int_id,
+            crate::kw::BUILTIN_LABS => self.types.long_id,
+            crate::kw::LABS if called => self.types.long_id,
+            crate::kw::BUILTIN_LLABS => self.types.longlong_id,
+            crate::kw::LLABS if called => self.types.longlong_id,
+            // `intmax_t` is `long` on every target c17 has, as
+            // `chk_builtin_return_type` also answers.
+            crate::kw::BUILTIN_IMAXABS => self.types.long_id,
+            crate::kw::IMAXABS if called => self.types.long_id,
+            _ => return None,
+        };
+        Some(self.parse_converted_unary(token_pos, typ, |arg| ExprKind::IntAbs { arg }))
+    }
+
     pub(super) fn parse_builtin_expr(
         &mut self,
         name_id: StringId,
@@ -2455,6 +2551,9 @@ impl Parser<'_> {
             return Some(result);
         }
         if let Some(result) = self.parse_float_builtin(name_id, token_pos) {
+            return Some(result);
+        }
+        if let Some(result) = self.parse_int_abs_builtin(name_id, token_pos) {
             return Some(result);
         }
         if let Some(result) = self.parse_misc_builtin(name_id, token_pos) {
@@ -2681,9 +2780,6 @@ impl Parser<'_> {
             name_id,
             crate::kw::BUILTIN_STRLEN
                 | crate::kw::BUILTIN_STRCMP
-                | crate::kw::BUILTIN_ABS
-                | crate::kw::BUILTIN_LABS
-                | crate::kw::BUILTIN_LLABS
                 | crate::kw::BUILTIN_FFS
                 | crate::kw::BUILTIN_FFSL
                 | crate::kw::BUILTIN_FFSLL
@@ -2855,7 +2951,6 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_STRCHR
                 | crate::kw::BUILTIN_STRRCHR
                 | crate::kw::BUILTIN_STRSTR
-                | crate::kw::BUILTIN_IMAXABS
                 | crate::kw::BUILTIN_MEMCHR
                 | crate::kw::BUILTIN_BCOPY
                 | crate::kw::BUILTIN_INDEX
@@ -3031,13 +3126,13 @@ impl Parser<'_> {
             "__memset_chk" | "__strcpy_chk" | "__stpcpy_chk" | "__strcat_chk" => (3, false),
             "__memcpy_chk" | "__memmove_chk" | "__mempcpy_chk" | "__strncpy_chk"
             | "__stpncpy_chk" | "__strncat_chk" => (4, false),
-            "strlen" | "abs" | "labs" | "llabs" | "ffs" | "ffsl" | "ffsll" => (1, false),
+            "strlen" | "ffs" | "ffsl" | "ffsll" => (1, false),
             "strcmp" | "bzero" | "strcasecmp" => (2, false),
             "bcmp" | "stpncpy" | "strncasecmp" => (3, false),
             // The libm entry points, from the one table that knows them.
             _ if Self::libm_real_kind(name).is_some() => (Self::libm_arity(name), false),
             "abort" => (0, false),
-            "exit" | "puts" | "malloc" | "free" | "putchar" | "imaxabs" | "strdup" => (1, false),
+            "exit" | "puts" | "malloc" | "free" | "putchar" | "strdup" => (1, false),
             "strndup" => (2, false),
             "calloc" | "realloc" | "strcpy" | "stpcpy" | "strcat" | "strchr" | "strrchr"
             | "strstr" | "index" | "rindex" | "strpbrk" | "strcspn" | "strspn" => (2, false),

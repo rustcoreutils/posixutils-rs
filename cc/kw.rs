@@ -700,6 +700,14 @@ define_keywords! {
     (FABSF,             "fabsf",             0),
     (FABSL,             "fabsl",             0),
 
+    // The integer magnitudes, recognized by their plain names for the same
+    // reason and displaceable the same way. Each becomes a branch-free
+    // expression rather than a call, as it does under gcc at every level.
+    (ABS,               "abs",               0),
+    (LABS,              "labs",              0),
+    (LLABS,             "llabs",             0),
+    (IMAXABS,           "imaxabs",           0),
+
     // The exactly-rounding functions, whose `float` form gives the same
     // answer as the `double` one applied to a `float` argument. Narrowing
     // them is what lets `(float)floor((double)x)` become `floorf(x)`;
@@ -748,9 +756,6 @@ define_keywords! {
     // the header that declares `strlen`, exactly as gcc allows.
     (_,                 "strlen",               0),
     (_,                 "strcmp",               0),
-    (_,                 "abs",                  0),
-    (_,                 "labs",                 0),
-    (_,                 "llabs",                0),
     (_,                 "ffs",                  0),
     (_,                 "ffsl",                 0),
     (_,                 "ffsll",                0),
@@ -910,7 +915,6 @@ define_keywords! {
     (_,                 "strchr",               0),
     (_,                 "strrchr",              0),
     (_,                 "strstr",               0),
-    (_,                 "imaxabs",               0),
     (_,                 "memchr",                0),
     (_,                 "bcopy",                 0),
     (_,                 "index",                 0),

@@ -832,8 +832,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                     Initializer::Float(val)
                 }
             };
+            // Converted as in assignment (C17 6.7.9p11), from the
+            // initializer's own type: `double d = 0.1f;` holds 0.1f widened,
+            // not 0.1, and a `double` signalling NaN initializing a `long
+            // double` is quieted as the conversion at run time quiets it.
             if let Some(val) = self.eval_const_float_init_expr(expr) {
-                return Some(wrap(val));
+                return Some(wrap(self.convert_const_float(val, expr.typ, typ)));
             }
             // An integer constant initializing a floating object converts
             // exactly, however wide it is: `long double x = 1;`.

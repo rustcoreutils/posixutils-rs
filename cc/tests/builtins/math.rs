@@ -11,7 +11,9 @@
 // Consolidates: nan, nans, flt_rounds tests
 //
 
-use crate::common::{asm_for_at, asm_symbol, compile_and_run, compile_and_run_aarch64};
+use crate::common::{
+    asm_for_at, asm_symbol, compile_and_run, compile_and_run_aarch64, compile_expect_error,
+};
 
 // ============================================================================
 // Mega-test: Math builtins
@@ -1201,4 +1203,101 @@ fn builtins_fabs_of_a_constant_folds() {
             "{opt}: fabs of a constant was not folded:\n{asm}"
         );
     }
+}
+
+// ============================================================================
+// NaN payloads
+// ============================================================================
+
+// Every value here was read off gcc on the same source, x86-64 and aarch64,
+// at -O0 and -O2. A NaN's payload and sign are part of its value: the
+// payload a `__builtin_nan` string names, the quiet bit `__builtin_nans`
+// leaves clear, the sign a negation flips, and the payload bits a conversion
+// keeps. Self-contained for the header-less aarch64 run.
+const NAN_PAYLOAD_PROGRAM: &str = r#"
+typedef unsigned long long u64; typedef unsigned u32;
+static u64 b64(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
+static u32 b32(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
+static const double sd = __builtin_nan("0x1234");
+static const float sf = __builtin_nanf("0x123");
+static double sneg = -__builtin_nan("0x1234");
+int main(void) {
+    double d = __builtin_nan("0x1234");
+    volatile double vd = __builtin_nan("0x1234");
+    if (b64(sd) != 0x7ff8000000001234ULL) return 1;
+    if (b64(d) != 0x7ff8000000001234ULL) return 2;
+    if (b64(vd) != 0x7ff8000000001234ULL) return 3;
+    if (b64(-__builtin_nan("0x1234")) != 0xfff8000000001234ULL) return 4;
+    if (b64(sneg) != 0xfff8000000001234ULL) return 5;
+    if (b64(__builtin_nans("0x1234")) != 0x7ff0000000001234ULL) return 6;
+    if (b64(__builtin_nan("")) != 0x7ff8000000000000ULL) return 7;
+    if (b64(__builtin_nan("4660")) != 0x7ff8000000001234ULL) return 8;
+    if (b32(__builtin_nanf("0x123")) != 0x7fc00123u) return 9;
+    if (b32(sf) != 0x7fc00123u) return 10;
+    if (b32(__builtin_nansf("0x123")) != 0x7f800123u) return 11;
+    /* A conversion keeps the payload's high bits, as the hardware does. */
+    if (b32((float)__builtin_nan("0x40000000")) != 0x7fc00002u) return 12;
+    if (b64((double)__builtin_nanf("0x123")) != 0x7ff8002460000000ULL) return 13;
+    /* long double: x87 extended on x86-64, binary128 on aarch64. */
+    long double l = __builtin_nanl("0x1234");
+    unsigned char c[16] = {0};
+    __builtin_memcpy(c, &l, sizeof(long double) == 16 && __LDBL_MANT_DIG__ == 64 ? 10 : sizeof(long double));
+    u64 lo, hi;
+    __builtin_memcpy(&lo, c, 8);
+    __builtin_memcpy(&hi, c + 8, 8);
+#if __LDBL_MANT_DIG__ == 64
+    if (lo != 0xc000000000001234ULL || hi != 0x7fffULL) return 14;
+#else
+    if (lo != 0x1234ULL || hi != 0x7fff800000000000ULL) return 14;
+#endif
+    return 0;
+}
+"#;
+
+#[test]
+fn builtins_nan_payloads_survive() {
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("nan_payload{opt}"),
+                NAN_PAYLOAD_PROGRAM,
+                &[opt.to_string()]
+            ),
+            0,
+            "host {opt}"
+        );
+        if let Some(rc) =
+            compile_and_run_aarch64(&format!("nan_payload_a64{opt}"), NAN_PAYLOAD_PROGRAM, opt)
+        {
+            assert_eq!(rc, 0, "aarch64 {opt}");
+        }
+    }
+}
+
+/// A string gcc does not fold is not folded here either. `__builtin_nan` of
+/// one is a call to the library's `nan`, which reads the string at run time;
+/// `__builtin_nans` has no library function, so it is an error -- gcc's is a
+/// link failure against `__builtin_nans`.
+#[test]
+fn builtins_nan_of_a_string_that_does_not_fold() {
+    let code = r#"
+double nan(const char *);
+float nanf(const char *);
+int main(void) {
+    const char *volatile s = "0x77";
+    if (!__builtin_isnan(__builtin_nan(s))) return 1;
+    if (!__builtin_isnan(__builtin_nan("abc"))) return 2;
+    if (!__builtin_isnan(__builtin_nanf("08"))) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("nan_library_call", code, &["-lm".to_string()]),
+        0
+    );
+    compile_expect_error(
+        "nans_malformed",
+        "double f(void) { return __builtin_nans(\"zz\"); }\n",
+        "is not a string literal naming a NaN payload",
+    );
 }

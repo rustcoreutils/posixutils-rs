@@ -7757,3 +7757,42 @@ fn test_complex_conjugate_static_initializer() {
     assert_eq!(re, -1.0);
     assert!(im == 0.0 && im.is_sign_positive(), "c imag is {im}");
 }
+
+/// A static floating initializer is converted from its own type to the
+/// object's, as an assignment converts it (C17 6.7.9p11): rounded at the
+/// initializer's format first, and a NaN quieted when the format changes
+/// while keeping its sign and the high bits of its payload. Every encoding
+/// is gcc's for the same declaration.
+#[test]
+fn test_static_float_initializer_converts_from_its_own_type() {
+    use crate::float::FpFormat;
+    let src = "static double widened = 0.1f;\n\
+               static float narrowed = (float)__builtin_nans(\"0x40000000\");\n\
+               static double quieted = __builtin_nansf(\"0x123\");\n\
+               static double kept = -__builtin_nans(\"0x5\");\n\
+               static double propagated = __builtin_nan(\"0x5\") + 1.0;\n";
+    let module = linearize_source(src, &Target::host());
+    let bits = |name: &str, fmt: FpFormat| -> u128 {
+        let g = module
+            .globals
+            .iter()
+            .find(|g| g.name == name)
+            .unwrap_or_else(|| panic!("no global {name}"));
+        match &g.init {
+            crate::ir::Initializer::Float(v) => v.to_bits(fmt),
+            other => panic!("{name}: expected a float initializer, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        bits("widened", FpFormat::Binary64),
+        u128::from(f64::from(0.1f32).to_bits())
+    );
+    assert_eq!(bits("narrowed", FpFormat::Binary32), 0x7fc0_0002);
+    assert_eq!(bits("quieted", FpFormat::Binary64), 0x7ff8_0024_6000_0000);
+    // No conversion: a negated signalling NaN stays signalling.
+    assert_eq!(bits("kept", FpFormat::Binary64), 0xfff0_0000_0000_0005);
+    assert_eq!(
+        bits("propagated", FpFormat::Binary64),
+        0x7ff8_0000_0000_0005
+    );
+}

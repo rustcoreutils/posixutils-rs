@@ -2245,7 +2245,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 })
             }
 
-            // A cast rounds to the target format. Discarding the cast type
+            // A cast converts to the target format. Discarding the cast type
             // let `(float)0.1q` keep every bit of its binary128 value in a
             // static initializer, where the same cast at run time rounds.
             ExprKind::Cast {
@@ -2253,13 +2253,29 @@ impl<'a> super::linearize::Linearizer<'a> {
                 cast_type,
             } => {
                 let val = self.eval_const_float_expr_scoped(scope, inner)?;
-                Some(match self.types.fp_format(*cast_type) {
-                    Some(fmt) => val.round_to_format(fmt),
-                    None => val,
-                })
+                Some(self.convert_const_float(val, inner.typ, *cast_type))
             }
 
             _ => None,
+        }
+    }
+
+    /// The constant `val`, the value of an expression of type `from`,
+    /// converted to type `to` as the program converts it at run time: rounded
+    /// at `from`'s format first, and a NaN quieted when the format changes
+    /// (see [`FloatVal::convert`]). From an integer, whose value is exact
+    /// here, it is one rounding; to a type that is not floating, nothing.
+    pub(crate) fn convert_const_float(
+        &self,
+        val: FloatVal,
+        from: Option<TypeId>,
+        to: TypeId,
+    ) -> FloatVal {
+        let src = from.and_then(|t| self.types.fp_format(t));
+        match (src, self.types.fp_format(to)) {
+            (Some(src), Some(dst)) => val.convert(src, dst),
+            (None, Some(dst)) => val.round_to_format(dst),
+            (_, None) => val,
         }
     }
 

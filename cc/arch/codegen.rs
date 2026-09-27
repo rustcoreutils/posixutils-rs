@@ -11,7 +11,7 @@
 
 use crate::arch::lir::{Directive, EmitAsm, LirInst, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
-use crate::float::FloatVal;
+use crate::float::{FloatVal, FpFormat};
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId};
 use crate::target::{Os, Target};
 use crate::types::TypeTable;
@@ -569,41 +569,24 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// `size` is the storage size of the declared type, so it selects the
     /// format: 2 is `_Float16`, 4 is binary32, 8 is binary64, and 16 is
     /// whatever `long double` means here -- binary128 on aarch64, an x87
-    /// 80-bit extended padded to 16 bytes on x86_64.
+    /// 80-bit extended padded to 16 bytes on x86_64. Every width is encoded
+    /// from the exact value, so `LDBL_MAX` is not already infinity and a NaN
+    /// keeps its sign and payload.
     fn emit_float_initializer(&mut self, val: FloatVal, size: usize) {
         match size {
-            2 => {
-                // IEEE-754 binary16 is the same encoding on both targets; the
-                // two backends carry byte-identical copies of this conversion.
-                let bits = crate::arch::aarch64::f64_to_f16_bits(val.to_f64());
-                self.push_directive(Directive::Short(bits as i64));
-            }
-            4 => {
-                let bits = (val.to_f64() as f32).to_bits();
-                self.push_directive(Directive::Long(bits as i64));
-            }
+            2 => self.push_directive(Directive::Short(val.to_bits_at_width(16))),
+            4 => self.push_directive(Directive::Long(val.to_bits_at_width(32))),
             16 => {
-                // The only width where the literal's full precision matters:
-                // both encodings are produced from the exact value rather than
-                // from a double, so `LDBL_MAX` is not already infinity here.
-                let (lo, hi) = match self.target.arch {
-                    crate::target::Arch::Aarch64 => val.to_f128_bits(),
-                    crate::target::Arch::X86_64 => {
-                        let bytes = val.to_x87_bytes();
-                        let mut lo = [0u8; 8];
-                        let mut hi = [0u8; 8];
-                        lo.copy_from_slice(&bytes[..8]);
-                        hi.copy_from_slice(&bytes[8..]);
-                        (u64::from_le_bytes(lo), u64::from_le_bytes(hi))
-                    }
+                let fmt = match self.target.arch {
+                    crate::target::Arch::Aarch64 => FpFormat::Binary128,
+                    crate::target::Arch::X86_64 => FpFormat::X87Extended,
                 };
-                self.push_directive(Directive::Quad(lo as i64));
-                self.push_directive(Directive::Quad(hi as i64));
+                // Both targets are little-endian: the low half first.
+                let bits = val.to_bits(fmt);
+                self.push_directive(Directive::Quad(bits as i64));
+                self.push_directive(Directive::Quad((bits >> 64) as i64));
             }
-            _ => {
-                // double - emit as 64-bit IEEE 754
-                self.push_directive(Directive::Quad(val.to_f64().to_bits() as i64));
-            }
+            _ => self.push_directive(Directive::Quad(val.to_bits_at_width(64))),
         }
     }
 

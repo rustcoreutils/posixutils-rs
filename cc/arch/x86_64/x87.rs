@@ -25,6 +25,7 @@ use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, X86Inst, X87BinOp, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg, X87_SCRATCH_BYTES};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
+use crate::float::FpFormat;
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeKind, TypeTable};
 
@@ -743,10 +744,16 @@ impl X86_64CodeGen {
                 Loc::FImm(val, _) => {
                     // Float/double immediate - create constant in rodata.
                     // `double_constants` is emitted as `.quad`, so this is a
-                    // 64-bit object regardless of the expression's type. The
-                    // f64 holds the f32 value exactly, so reading it as a
-                    // double is both correct and lossless.
-                    let val = val.to_f64();
+                    // 64-bit object regardless of the expression's type: the
+                    // value as its own type holds it, widened to double.
+                    // Widening is exact for a number, and for a NaN it quiets
+                    // just as the `flds` it stands in for would.
+                    let src_fmt = if src_is_float {
+                        FpFormat::Binary32
+                    } else {
+                        FpFormat::Binary64
+                    };
+                    let val = val.convert(src_fmt, FpFormat::Binary64).to_f64();
                     let bits = val.to_bits();
                     let label = crate::arch::lir::internal_label("dbl_const", bits);
                     self.double_constants.insert(bits, val);

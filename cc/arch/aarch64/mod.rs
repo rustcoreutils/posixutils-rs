@@ -26,5 +26,3 @@ pub mod regalloc;
 mod relax;
 
 pub use macros::get_macros;
-
-pub(super) use crate::float::f64_to_f16_bits;

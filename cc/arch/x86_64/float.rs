@@ -13,7 +13,7 @@ use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
-use crate::float::{f64_to_f16_bits, FloatVal};
+use crate::float::FloatVal;
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
@@ -1033,16 +1033,15 @@ impl X86_64CodeGen {
 
     /// Load a float immediate value into an XMM register
     ///
-    /// XMM holds only `float` and `double`; an x87 80-bit constant never
-    /// reaches here, so narrowing to `f64` up front loses nothing.
+    /// XMM holds only `_Float16`, `float` and `double`; an x87 80-bit or a
+    /// binary128 constant never reaches here. The bits are the value's own
+    /// encoding at `size`, taken from the exact value.
     pub(super) fn emit_fp_imm_to_xmm(&mut self, value: FloatVal, xmm: XmmReg, size: u32) {
         // `is_positive_zero`, not `is_zero`: the shortcut below produces
         // `+0.0`, and `-0.0` is a different value with the same magnitude.
         // C equates the two under `==` but not under `signbit`, and
         // `copysign(1.0, -0.0)` is `-1.0`.
-        let is_positive_zero = value.is_positive_zero();
-        let value = value.to_f64();
-        if is_positive_zero {
+        if value.is_positive_zero() {
             // Use xorps/xorpd to zero the register (faster)
             let fp_size = FpSize::from_bits(size, &self.base.target);
             self.push_lir(X86Inst::XorFp {
@@ -1050,45 +1049,29 @@ impl X86_64CodeGen {
                 src: xmm,
                 dst: xmm,
             });
-        } else if size == 16 {
-            // Float16: load via integer register (use R10 scratch)
-            let bits = f64_to_f16_bits(value);
+            return;
+        }
+        // Loaded through an integer register (R10 scratch).
+        let bits = value.to_bits_at_width(size);
+        let width = if size <= 32 {
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B32,
-                src: GpOperand::Imm(bits as i64),
+                src: GpOperand::Imm(bits),
                 dst: GpOperand::Reg(Reg::R10),
             });
-            self.push_lir(X86Inst::MovGpXmm {
-                size: OperandSize::B32,
-                src: Reg::R10,
-                dst: xmm,
-            });
-        } else if size == 32 {
-            // Float: load via integer register (use R10 scratch)
-            let bits = (value as f32).to_bits();
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B32,
-                src: GpOperand::Imm(bits as i64),
-                dst: GpOperand::Reg(Reg::R10),
-            });
-            self.push_lir(X86Inst::MovGpXmm {
-                size: OperandSize::B32,
-                src: Reg::R10,
-                dst: xmm,
-            });
+            OperandSize::B32
         } else {
-            // Double: load via integer register (use R10 scratch)
-            let bits = value.to_bits();
             self.push_lir(X86Inst::MovAbs {
-                imm: bits as i64,
+                imm: bits,
                 dst: Reg::R10,
             });
-            self.push_lir(X86Inst::MovGpXmm {
-                size: OperandSize::B64,
-                src: Reg::R10,
-                dst: xmm,
-            });
-        }
+            OperandSize::B64
+        };
+        self.push_lir(X86Inst::MovGpXmm {
+            size: width,
+            src: Reg::R10,
+            dst: xmm,
+        });
     }
 
     /// Move a value to an XMM register

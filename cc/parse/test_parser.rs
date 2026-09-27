@@ -5061,10 +5061,97 @@ fn test_builtin_nanl() {
 
 #[test]
 fn test_builtin_nans() {
-    // Signaling NaN variant (same implementation, returns NaN)
     let (expr, types, _, _) = parse_expr("__builtin_nans(\"\")").unwrap();
     assert!(matches!(expr.kind, ExprKind::FloatLit(v) if v.is_nan()));
     assert_eq!(expr.typ, Some(types.double_id));
+}
+
+/// The encoding of the NaN constant `src` parses to, at `fmt`.
+fn nan_bits(src: &str, fmt: crate::float::FpFormat) -> u128 {
+    let (expr, _, _, _) = parse_expr(src).unwrap();
+    match expr.kind {
+        ExprKind::FloatLit(v) => v.to_bits(fmt),
+        other => panic!("{src} parsed to {other:?}"),
+    }
+}
+
+/// The string is parsed as gcc parses it -- `strtoull` with base 0 -- and
+/// its value is the payload: every expectation is gcc's emitted constant.
+#[test]
+fn test_builtin_nan_payload_parsing() {
+    use crate::float::FpFormat::{Binary32, Binary64};
+    let cases = [
+        // Empty, and the spellings of zero.
+        ("__builtin_nan(\"\")", 0x7ff8_0000_0000_0000),
+        ("__builtin_nan(\"0\")", 0x7ff8_0000_0000_0000),
+        ("__builtin_nan(\"0x\")", 0x7ff8_0000_0000_0000),
+        // Hexadecimal, either case of the prefix.
+        ("__builtin_nan(\"0x1234\")", 0x7ff8_0000_0000_1234),
+        ("__builtin_nan(\"0X10\")", 0x7ff8_0000_0000_0010),
+        // Decimal.
+        ("__builtin_nan(\"4660\")", 0x7ff8_0000_0000_1234),
+        // Octal, from a leading zero.
+        ("__builtin_nan(\"010\")", 0x7ff8_0000_0000_0008),
+        // Leading white space and a sign are skipped; the sign is ignored.
+        ("__builtin_nan(\" 5\")", 0x7ff8_0000_0000_0005),
+        ("__builtin_nan(\"-1\")", 0x7ff8_0000_0000_0001),
+        // Wider than the payload: the low bits are kept.
+        (
+            "__builtin_nan(\"0xffffffffffffffff\")",
+            0x7fff_ffff_ffff_ffff,
+        ),
+        (
+            "__builtin_nan(\"18446744073709551616\")",
+            0x7ff8_0000_0000_0000,
+        ),
+        // A C string ends at its first NUL.
+        ("__builtin_nan(\"12\\0abc\")", 0x7ff8_0000_0000_000c),
+        // Signalling: the quiet bit clear, and an empty payload made
+        // non-empty so the result is not an infinity.
+        ("__builtin_nans(\"0x1234\")", 0x7ff0_0000_0000_1234),
+        ("__builtin_nans(\"\")", 0x7ff4_0000_0000_0000),
+    ];
+    for (src, want) in cases {
+        assert_eq!(nan_bits(src, Binary64), want, "{src}");
+    }
+    assert_eq!(nan_bits("__builtin_nanf(\"0x123\")", Binary32), 0x7fc0_0123);
+    assert_eq!(
+        nan_bits("__builtin_nansf(\"0x123\")", Binary32),
+        0x7f80_0123
+    );
+    assert_eq!(nan_bits("__builtin_nansf(\"\")", Binary32), 0x7fa0_0000);
+}
+
+/// `long double` puts the payload in its own format's significand.
+#[test]
+fn test_builtin_nanl_payload() {
+    let (expr, types, _, _) = parse_expr("__builtin_nanl(\"0x1234\")").unwrap();
+    let fmt = types.fp_format(types.longdouble_id).unwrap();
+    let want = match fmt {
+        crate::float::FpFormat::X87Extended => 0x7fff_c000_0000_0000_1234,
+        crate::float::FpFormat::Binary128 => 0x7fff_8000_0000_0000_0000_0000_0000_1234,
+        _ => 0x7ff8_0000_0000_1234,
+    };
+    assert!(matches!(expr.kind, ExprKind::FloatLit(v) if v.to_bits(fmt) == want));
+}
+
+/// A string gcc does not fold is left to the library, as gcc leaves it:
+/// `__builtin_nan` becomes a call to `nan`.
+#[test]
+fn test_builtin_nan_of_a_malformed_string_is_a_call() {
+    for src in [
+        "__builtin_nan(\"abc\")",
+        "__builtin_nan(\"08\")",
+        "__builtin_nan(\"12x\")",
+    ] {
+        let (expr, types, _, _) = parse_expr(src).unwrap();
+        assert!(
+            matches!(expr.kind, ExprKind::Call { .. }),
+            "{src}: {:?}",
+            expr.kind
+        );
+        assert_eq!(expr.typ, Some(types.double_id), "{src}");
+    }
 }
 
 /// The first statement of the first function defined in `tu`.

@@ -654,11 +654,7 @@ impl X86_64CodeGen {
                 });
             }
             Loc::FImm(v, bits) => {
-                let pattern: i64 = if bits <= 32 {
-                    (v.to_f64() as f32).to_bits() as i64
-                } else {
-                    v.to_f64().to_bits() as i64
-                };
+                let pattern = v.to_bits_at_width(bits);
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
                     src: GpOperand::Imm(pattern),

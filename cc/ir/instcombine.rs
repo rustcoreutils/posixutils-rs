@@ -884,6 +884,7 @@ fn simplify_not(insn: &Instruction, consts: &ConstMap) -> Simplification {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::float::{FpFormat, NanKind};
     use crate::ir::{BasicBlock, BasicBlockId, Pseudo, PseudoKind};
     use crate::target::Target;
     use crate::types::TypeTable;
@@ -2888,11 +2889,23 @@ mod tests {
     /// One float binary/unary op over constants; returns the folded value
     /// and the `SetVal` the instruction became.
     fn fold_float(op: Opcode, typ: TypeId, size: u32, args: &[f64]) -> Option<(FloatVal, u32)> {
+        let args: Vec<FloatVal> = args.iter().map(|v| FloatVal::from_f64(*v)).collect();
+        fold_float_vals(op, typ, size, &args)
+    }
+
+    /// [`fold_float`] over exact constants, for a value an `f64` cannot
+    /// spell: a `float` or `long double` NaN with a payload.
+    fn fold_float_vals(
+        op: Opcode,
+        typ: TypeId,
+        size: u32,
+        args: &[FloatVal],
+    ) -> Option<(FloatVal, u32)> {
         let target = PseudoId(args.len() as u32);
         let mut pseudos: Vec<Pseudo> = args
             .iter()
             .enumerate()
-            .map(|(i, v)| fval(i as u32, *v))
+            .map(|(i, v)| Pseudo::fval(PseudoId(i as u32), *v))
             .collect();
         pseudos.push(Pseudo::reg(target, target.0));
         let insn = match args.len() {
@@ -3013,6 +3026,65 @@ mod tests {
             Some((false, exp, sig)),
             "only the sign bit of a NaN changes"
         );
+        // And the bits the constant is emitted as say the same.
+        assert_eq!(
+            got.map(|(v, _)| v.to_bits(FpFormat::Binary64)),
+            Some(0x7ff8_0000_0000_1234)
+        );
+    }
+
+    /// `FNeg` of a NaN constant flips its sign and keeps everything else --
+    /// payload and quiet bit alike -- at every width. This is the fold that
+    /// made `-__builtin_nan("0x1234")` a positive NaN at -O2: the folded
+    /// value was right and its emission, through `f64::NAN`, was not, so the
+    /// assertion is on the emitted bits.
+    #[test]
+    fn fneg_of_a_nan_constant_keeps_its_payload() {
+        let types = TypeTable::new(&Target::host());
+        let ld = types.longdouble_id;
+        let ld_fmt = types.fp_format(ld).expect("long double is floating");
+        // (type, width, quiet -0x1234 bits, signalling -0x1234 bits)
+        let cases = [
+            (types.float_id, 32, 0xffc0_1234, 0xff80_1234),
+            (
+                types.double_id,
+                64,
+                0xfff8_0000_0000_1234,
+                0xfff0_0000_0000_1234,
+            ),
+            match ld_fmt {
+                FpFormat::X87Extended => (
+                    ld,
+                    types.size_bits(ld),
+                    0xffff_c000_0000_0000_1234,
+                    0xffff_8000_0000_0000_1234,
+                ),
+                FpFormat::Binary128 => (
+                    ld,
+                    types.size_bits(ld),
+                    0xffff_8000_0000_0000_0000_0000_0000_1234,
+                    0xffff_0000_0000_0000_0000_0000_0000_1234,
+                ),
+                _ => (
+                    ld,
+                    types.size_bits(ld),
+                    0xfff8_0000_0000_1234,
+                    0xfff0_0000_0000_1234,
+                ),
+            },
+        ];
+        for (typ, size, quiet, signalling) in cases {
+            let fmt = types.fp_format(typ).expect("a floating type");
+            for (kind, want) in [(NanKind::Quiet, quiet), (NanKind::Signalling, signalling)] {
+                let nan = FloatVal::nan_with_payload(fmt, 0x1234, kind);
+                let got = fold_float_vals(Opcode::FNeg, typ, size, &[nan]);
+                assert_eq!(
+                    got.map(|(v, _)| v.to_bits(fmt)),
+                    Some(want),
+                    "{kind:?} NaN at {fmt:?}"
+                );
+            }
+        }
     }
 
     /// One `FCvtF` from `src` to `dst`, folded.
@@ -3061,23 +3133,12 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let h = (types.float16_id, 16);
         let f = (types.float_id, 32);
-        let want = f64::from(half_of(0.3));
+        // 0.3 rounded to binary16 is 0x34CD, which is exactly
+        // 1229 * 2^-12 -- written out rather than computed, so the
+        // expectation does not come from the code under test.
+        let want = 1229.0 / 4096.0;
         assert_eq!(fold_fcvtf(0.3, h, f), Some(want));
         assert_ne!(fold_fcvtf(0.3, h, f), Some(f64::from(0.3f32)));
-    }
-
-    /// `v` rounded to IEEE binary16 and back, computed independently of the
-    /// code under test.
-    fn half_of(v: f64) -> f32 {
-        let bits = crate::float::f64_to_f16_bits(v);
-        let sign = u32::from(bits >> 15) << 31;
-        let exp = i32::from((bits >> 10) & 0x1F);
-        let frac = u32::from(bits & 0x3FF);
-        if exp == 0 {
-            // Subnormal or zero; 0.3 is neither, so this is for completeness.
-            return f32::from_bits(sign) + (frac as f32) * 2f32.powi(-24);
-        }
-        f32::from_bits(sign | (((exp - 15 + 127) as u32) << 23) | (frac << 13))
     }
 
     /// A pseudo that means something beyond its value must not be converted.

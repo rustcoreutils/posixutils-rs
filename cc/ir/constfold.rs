@@ -376,15 +376,8 @@ pub(crate) fn eval_funop(op: Opcode, fmt: FpFormat, a: FloatVal) -> Option<Float
     }
 }
 
-/// A float-to-float conversion of a constant, from one format to another.
-///
-/// **Rounded twice, and both roundings are load-bearing.** The operand is a
-/// literal at 128 significand bits, not yet the value its own type holds, so
-/// rounding straight to the destination skips a step the program does not:
-/// `(float)(_Float16)0.3f16` is `0.30004883`, the nearest `float` to the
-/// nearest `_Float16` to `0.3`, and converting in one go gives `0.3f`
-/// instead. Widening looks harmless and is not -- that is the direction
-/// this got wrong.
+/// A float-to-float conversion of a constant, from one format to another:
+/// [`FloatVal::convert`], which rounds at the source format first.
 ///
 /// Held to the same rule as the arithmetic above otherwise: a non-finite
 /// operand is left alone, and so is a narrowing that overflows to infinity,
@@ -395,14 +388,10 @@ pub(crate) fn eval_fcvtf(
     dst_fmt: FpFormat,
     a: FloatVal,
 ) -> Option<FloatVal> {
-    if op != Opcode::FCvtF {
+    if op != Opcode::FCvtF || !a.is_finite() {
         return None;
     }
-    let a = a.round_to_format(src_fmt);
-    if !a.is_finite() {
-        return None;
-    }
-    let r = a.round_to_format(dst_fmt);
+    let r = a.convert(src_fmt, dst_fmt);
     r.is_finite().then_some(r)
 }
 

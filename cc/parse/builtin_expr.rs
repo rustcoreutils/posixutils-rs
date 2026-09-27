@@ -781,38 +781,12 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
-            // NaN builtins - returns quiet NaN
-            // The string argument is typically empty "" for quiet NaN
-            crate::kw::BUILTIN_NAN | crate::kw::BUILTIN_NANS => Some((|| {
-                self.expect_special(b'(')?;
-                let _arg = self.parse_assignment_expr()?; // string argument (ignored)
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::FloatLit(FloatVal::nan()),
-                    self.types.double_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_NANF | crate::kw::BUILTIN_NANSF => Some((|| {
-                self.expect_special(b'(')?;
-                let _arg = self.parse_assignment_expr()?; // string argument (ignored)
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::FloatLit(FloatVal::nan()),
-                    self.types.float_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_NANL | crate::kw::BUILTIN_NANSL => Some((|| {
-                self.expect_special(b'(')?;
-                let _arg = self.parse_assignment_expr()?; // string argument (ignored)
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::FloatLit(FloatVal::nan()),
-                    self.types.longdouble_id,
-                    token_pos,
-                ))
-            })()),
+            crate::kw::BUILTIN_NAN
+            | crate::kw::BUILTIN_NANF
+            | crate::kw::BUILTIN_NANL
+            | crate::kw::BUILTIN_NANS
+            | crate::kw::BUILTIN_NANSF
+            | crate::kw::BUILTIN_NANSL => Some(self.parse_builtin_nan(name_id, token_pos)),
             // FLT_ROUNDS - returns current rounding mode (1 = to nearest)
             crate::kw::BUILTIN_FLT_ROUNDS => Some((|| {
                 self.expect_special(b'(')?;
@@ -2101,6 +2075,63 @@ impl Parser<'_> {
         }
     }
 
+    /// `__builtin_nan`, `__builtin_nans` and their `f`/`l` forms: the NaN
+    /// of the result type whose payload the string argument names.
+    ///
+    /// A string literal that parses as gcc parses it (see [`nan_payload`])
+    /// is a constant, carrying that payload -- quiet for `nan`, signalling
+    /// for `nans`. Anything else is not folded, which is gcc's behaviour
+    /// too: the `nan` forms become a call to the library function of the
+    /// same name, which reads the string at run time, and the `nans` forms,
+    /// which have no library function, are an error here where gcc's is a
+    /// link failure.
+    fn parse_builtin_nan(&mut self, name_id: StringId, token_pos: Position) -> ParseResult<Expr> {
+        use crate::float::NanKind;
+        let (typ, kind, library) = match name_id {
+            crate::kw::BUILTIN_NAN => (self.types.double_id, NanKind::Quiet, "nan"),
+            crate::kw::BUILTIN_NANF => (self.types.float_id, NanKind::Quiet, "nanf"),
+            crate::kw::BUILTIN_NANL => (self.types.longdouble_id, NanKind::Quiet, "nanl"),
+            crate::kw::BUILTIN_NANS => (self.types.double_id, NanKind::Signalling, "nans"),
+            crate::kw::BUILTIN_NANSF => (self.types.float_id, NanKind::Signalling, "nansf"),
+            _ => (self.types.longdouble_id, NanKind::Signalling, "nansl"),
+        };
+        let call_pos = self.current_pos();
+        self.expect_special(b'(')?;
+        let arg = self.parse_assignment_expr()?;
+        self.expect_special(b')')?;
+
+        let payload = match &arg.kind {
+            ExprKind::StringLit(s) => nan_payload(crate::token::lexer::payload_bytes(s)),
+            _ => None,
+        };
+        let fmt = self
+            .types
+            .fp_format(typ)
+            .expect("a NaN builtin's result type is a floating type");
+        match (payload, kind) {
+            (Some(payload), _) => Ok(Self::typed_expr(
+                ExprKind::FloatLit(FloatVal::nan_with_payload(fmt, payload, kind)),
+                typ,
+                token_pos,
+            )),
+            (None, NanKind::Quiet) => {
+                Ok(self.call_library_function(library, vec![arg], call_pos, token_pos))
+            }
+            (None, NanKind::Signalling) => {
+                diag::error_args(
+                    arg.pos,
+                    "the argument of '__builtin_{0}' is not a string literal naming a NaN payload",
+                    &[library],
+                );
+                Ok(Self::typed_expr(
+                    ExprKind::FloatLit(FloatVal::nan()),
+                    typ,
+                    token_pos,
+                ))
+            }
+        }
+    }
+
     /// A builtin that is nothing but the library function under a
     /// reserved name, including the fortified `__builtin___*_chk`
     /// family.  These ride a de-prefixing path rather than getting an
@@ -2144,47 +2175,52 @@ impl Parser<'_> {
                 self.expect_special(b'(')?;
                 let args = self.parse_argument_list()?;
                 self.expect_special(b')')?;
-                // Look up the real function by its de-prefixed name. A
-                // declaration in scope is checked against exactly as an
-                // ordinary call to it would be.
-                let real_name_id = self.idents.lookup(real_name);
-                let symbol_id = real_name_id.and_then(|id| {
-                    self.symbols
-                        .lookup_id(id, crate::symbol::Namespace::Ordinary)
-                });
-                if let Some(symbol_id) = symbol_id {
-                    let func_expr = self.library_callee(symbol_id, token_pos);
-                    if !self.placeholder_prototypes.contains(&symbol_id) {
-                        let func_type = self.resolved_function_type(&func_expr);
-                        self.check_call(func_type, &args, call_pos);
-                    }
-                    return Ok(self.library_call(func_expr, args, token_pos));
-                }
-                // Not declared. gcc knows these intrinsically and
-                // glibc relies on that: `bits/string_fortified.h`
-                // calls `__builtin___memcpy_chk` without ever
-                // declaring `__memcpy_chk`. Synthesize the
-                // declaration rather than failing. Its parameter
-                // types are placeholders (see `declare_chk_builtin`),
-                // so the arguments are not checked against them --
-                // here or at a later call that finds it in scope.
-                if let Some(symbol_id) = self
-                    .chk_builtin_return_type(real_name)
-                    .and_then(|ret| self.declare_chk_builtin(real_name, ret))
-                {
-                    let func_expr = self.library_callee(symbol_id, token_pos);
-                    return Ok(self.library_call(func_expr, args, token_pos));
-                }
-                diag::error_args(token_pos, "undeclared function '{0}'", &[real_name]);
-                Ok(Self::typed_expr(
-                    ExprKind::IntLit(0),
-                    self.types.int_id,
-                    token_pos,
-                ))
+                Ok(self.call_library_function(real_name, args, call_pos, token_pos))
             })())
         } else {
             None
         }
+    }
+
+    /// A call to the library function `real_name` with `args`, for a builtin
+    /// that stands for it.
+    fn call_library_function(
+        &mut self,
+        real_name: &str,
+        args: Vec<Expr>,
+        call_pos: Position,
+        token_pos: Position,
+    ) -> Expr {
+        // Look up the real function by its name. A declaration in scope is
+        // checked against exactly as an ordinary call to it would be.
+        let real_name_id = self.idents.lookup(real_name);
+        let symbol_id = real_name_id.and_then(|id| {
+            self.symbols
+                .lookup_id(id, crate::symbol::Namespace::Ordinary)
+        });
+        if let Some(symbol_id) = symbol_id {
+            let func_expr = self.library_callee(symbol_id, token_pos);
+            if !self.placeholder_prototypes.contains(&symbol_id) {
+                let func_type = self.resolved_function_type(&func_expr);
+                self.check_call(func_type, &args, call_pos);
+            }
+            return self.library_call(func_expr, args, token_pos);
+        }
+        // Not declared. gcc knows these intrinsically and glibc relies on
+        // that: `bits/string_fortified.h` calls `__builtin___memcpy_chk`
+        // without ever declaring `__memcpy_chk`. Synthesize the declaration
+        // rather than failing. Its parameter types are placeholders (see
+        // `declare_chk_builtin`), so the arguments are not checked against
+        // them -- here or at a later call that finds it in scope.
+        if let Some(symbol_id) = self
+            .chk_builtin_return_type(real_name)
+            .and_then(|ret| self.declare_chk_builtin(real_name, ret))
+        {
+            let func_expr = self.library_callee(symbol_id, token_pos);
+            return self.library_call(func_expr, args, token_pos);
+        }
+        diag::error_args(token_pos, "undeclared function '{0}'", &[real_name]);
+        Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, token_pos)
     }
 
     /// A function designator for `symbol_id`, typed with its declared type.
@@ -2405,6 +2441,10 @@ impl Parser<'_> {
                 Some(self.types.int_id)
             }
             "labs" => Some(self.types.long_id),
+            // What a `__builtin_nan` whose string is not a constant calls.
+            "nan" => Some(self.types.double_id),
+            "nanf" => Some(self.types.float_id),
+            "nanl" => Some(self.types.longdouble_id),
             "llabs" => Some(self.types.longlong_id),
             _ if Self::libm_real_kind(name).is_some() => Some(match Self::libm_real_kind(name) {
                 Some(LibmReal::Float) => self.types.float_id,
@@ -2808,7 +2848,8 @@ impl Parser<'_> {
             // The libm entry points, from the one table that knows them.
             _ if Self::libm_real_kind(name).is_some() => (Self::libm_arity(name), false),
             "abort" => (0, false),
-            "exit" | "puts" | "malloc" | "free" | "putchar" | "strdup" => (1, false),
+            "exit" | "puts" | "malloc" | "free" | "putchar" | "strdup" | "nan" | "nanf"
+            | "nanl" => (1, false),
             "strndup" => (2, false),
             "calloc" | "realloc" | "strcpy" | "stpcpy" | "strcat" | "strchr" | "strrchr"
             | "strstr" | "index" | "rindex" | "strpbrk" | "strcspn" | "strspn" => (2, false),
@@ -2886,4 +2927,43 @@ impl Parser<'_> {
             ),
         }
     }
+}
+
+/// The payload a `__builtin_nan` string names, or `None` if the string is
+/// not one gcc folds.
+///
+/// Parsed as gcc's `real_nan` parses it, which is `strtoull` with base 0 and
+/// no overflow check: leading white space, an optional sign that is then
+/// ignored, `0x` for hexadecimal or a leading `0` for octal, and digits that
+/// must run to the end of the string. An empty string, and a bare `0x`, are
+/// zero. Digits past the 128th bit wrap, which drops only bits that no
+/// format's payload has room for. A C string ends at its first NUL.
+fn nan_payload(bytes: impl Iterator<Item = u8>) -> Option<u128> {
+    let s: Vec<u8> = bytes.take_while(|&b| b != 0).collect();
+    let mut rest = s.as_slice();
+    while let [b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r', tail @ ..] = rest {
+        rest = tail;
+    }
+    if let [b'-' | b'+', tail @ ..] = rest {
+        rest = tail;
+    }
+    let base = match rest {
+        [b'0', b'x' | b'X', tail @ ..] => {
+            rest = tail;
+            16
+        }
+        [b'0', tail @ ..] => {
+            rest = tail;
+            8
+        }
+        _ => 10,
+    };
+    let mut value: u128 = 0;
+    for &c in rest {
+        let digit = char::from(c).to_digit(16).filter(|&d| d < base)?;
+        value = value
+            .wrapping_mul(u128::from(base))
+            .wrapping_add(u128::from(digit));
+    }
+    Some(value)
 }

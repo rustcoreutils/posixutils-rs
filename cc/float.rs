@@ -34,95 +34,42 @@ const EXP_MAX_FINITE: u16 = 0x7FFE;
 /// The top bit of the significand, which is always set for a normal value:
 /// the integer bit, held explicitly as x87 holds it.
 const INTEGER_BIT: u128 = 1 << 127;
+/// The top fraction bit, which in a NaN is the quiet bit: set for a quiet
+/// NaN, clear for a signalling one. Every target format c17 supports puts it
+/// there (IEEE 754-2008 6.2.1's recommendation), so it is one position here
+/// whatever the format.
+const QUIET_BIT: u128 = 1 << 126;
 /// Significand width. Wider than any target format, so that rounding happens
 /// once, on the way out, at the width being emitted.
 const SIG_BITS: u32 = 128;
+
+/// Which of the two kinds of NaN a value is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NanKind {
+    /// Propagates through arithmetic without raising anything.
+    Quiet,
+    /// Raises *invalid* when an operation consumes it, and is quieted by that
+    /// operation -- or by a conversion -- rather than passed through.
+    Signalling,
+}
 
 /// A floating-point literal, held wider than any target format.
 ///
 /// The value is `(-1)^neg * sig * 2^(exp - BIAS - 127)` for a normal number.
 /// `exp == 0` is zero (`sig == 0`) or subnormal; `exp == 0x7FFF` is infinity
 /// (`sig == INTEGER_BIT`) or NaN.
+///
+/// A NaN is a value like any other: its sign, its quiet bit and its payload
+/// are all part of it. The significand is held left-aligned as for a number
+/// -- the integer bit at the top, the quiet bit below it, the rest of the
+/// payload below that -- so a NaN of a narrower format has its payload in the
+/// high bits, and converting it between formats is a shift, as it is in the
+/// hardware.
 #[derive(Clone, Copy, Debug)]
 pub struct FloatVal {
     neg: bool,
     exp: u16,
     sig: u128,
-}
-
-/// Convert an `f64` to IEEE 754 half-precision (binary16) bits.
-///
-/// Rounds to nearest, ties to even, which is the default rounding mode every
-/// target uses and what the standard requires of a conversion. Truncating
-/// instead put every inexact `_Float16` constant one ulp below the value the
-/// source named -- `0.3f16` came out 0.299805 where gcc gives 0.300049 -- so
-/// a program's constants disagreed with the same constants computed at run
-/// time.
-pub(crate) fn f64_to_f16_bits(val: f64) -> u16 {
-    let bits = val.to_bits();
-    let sign = ((bits >> 63) & 1) as u16;
-    let exp = ((bits >> 52) & 0x7FF) as i32;
-    let frac = bits & 0xF_FFFF_FFFF_FFFF;
-
-    if exp == 0x7FF {
-        // NaN keeps its quiet bit and as much payload as fits; infinity is
-        // exact either way.
-        if frac != 0 {
-            return (sign << 15) | 0x7E00 | ((frac >> 42) as u16 & 0x1FF);
-        }
-        return (sign << 15) | 0x7C00;
-    }
-
-    // Rebias: f64 is excess-1023, f16 excess-15.
-    let new_exp = exp - 1023 + 15;
-
-    if new_exp >= 31 {
-        return (sign << 15) | 0x7C00;
-    }
-
-    if new_exp <= 0 {
-        // Subnormal, or small enough to vanish. The significand carries its
-        // hidden bit and is shifted a further `1 - new_exp` places.
-        let shift = (1 - new_exp) as u32;
-        let Some(drop) = 42u32.checked_add(shift).filter(|d| *d < 64) else {
-            // Below half the smallest subnormal: rounds to zero, and the
-            // shift would be undefined.
-            return sign << 15;
-        };
-        let sig = frac | 0x10_0000_0000_0000;
-        // A carry out of the ten fraction bits lands in the exponent field as
-        // exponent 1, fraction 0 -- the smallest normal, which is exactly the
-        // value being rounded to.
-        return (sign << 15) | (round_to_nearest_even(sig, drop) as u16 & 0x7FFF);
-    }
-
-    let rounded = round_to_nearest_even(frac, 42);
-    // A carry out of the fraction is one more power of two.
-    let (new_exp, new_frac) = if rounded > 0x3FF {
-        (new_exp + 1, 0)
-    } else {
-        (new_exp, rounded)
-    };
-    if new_exp >= 31 {
-        return (sign << 15) | 0x7C00;
-    }
-    (sign << 15) | ((new_exp as u16) << 10) | (new_frac as u16 & 0x3FF)
-}
-
-/// Shift `value` right by `drop` bits, rounding to nearest with ties to even.
-///
-/// The result can be one greater than `value >> drop` fits, which the callers
-/// read as a carry into the exponent.
-fn round_to_nearest_even(value: u64, drop: u32) -> u64 {
-    debug_assert!(drop > 0 && drop < 64);
-    let kept = value >> drop;
-    let half = 1u64 << (drop - 1);
-    let rest = value & ((1u64 << drop) - 1);
-    if rest > half || (rest == half && kept & 1 == 1) {
-        kept + 1
-    } else {
-        kept
-    }
 }
 
 impl FloatVal {
@@ -142,13 +89,59 @@ impl FloatVal {
         }
     }
 
-    /// A quiet NaN.
+    /// The default quiet NaN: positive, with an empty payload.
     pub fn nan() -> Self {
         FloatVal {
             neg: false,
             exp: EXP_SPECIAL,
             // Integer bit plus the quiet bit, matching what x87 produces.
-            sig: INTEGER_BIT | (1 << 126),
+            sig: INTEGER_BIT | QUIET_BIT,
+        }
+    }
+
+    /// The positive NaN of format `fmt` whose payload is `payload`: what
+    /// `__builtin_nan` and `__builtin_nans` build from their string.
+    ///
+    /// The payload is the integer value of the trailing significand field
+    /// below the quiet bit, so it keeps as many low bits of `payload` as the
+    /// format has room for -- 22 in `float`, 51 in `double` -- and the quiet
+    /// bit is then set or cleared by `kind`, whatever `payload` said there.
+    /// A signalling NaN cannot have an all-zero significand, which would
+    /// encode an infinity, so an empty signalling payload becomes the bit
+    /// just below the quiet bit. Both rules are gcc's, and its emitted bits
+    /// are what they were checked against.
+    pub fn nan_with_payload(fmt: FpFormat, payload: u128, kind: NanKind) -> Self {
+        let p = fmt.precision();
+        // The fraction below the integer bit, as the format stores it.
+        let mut frac = payload & ((1u128 << (p - 1)) - 1);
+        let quiet = 1u128 << (p - 2);
+        match kind {
+            NanKind::Quiet => frac |= quiet,
+            NanKind::Signalling => {
+                frac &= !quiet;
+                if frac == 0 {
+                    frac = quiet >> 1;
+                }
+            }
+        }
+        FloatVal {
+            neg: false,
+            exp: EXP_SPECIAL,
+            sig: INTEGER_BIT | frac << (SIG_BITS - p),
+        }
+    }
+
+    /// The same value with a NaN made quiet: what an operation or a
+    /// conversion does to a signalling NaN it consumes. The sign and the rest
+    /// of the payload are kept. Anything else is returned unchanged.
+    fn quieted(self) -> Self {
+        if self.is_nan() {
+            FloatVal {
+                sig: self.sig | QUIET_BIT,
+                ..self
+            }
+        } else {
+            self
         }
     }
 
@@ -270,66 +263,11 @@ impl FloatVal {
     }
 
     /// Round to `f64`, saturating to infinity on overflow.
+    ///
+    /// The `double` encoding read back as a host `f64`, so a NaN comes out
+    /// with its own sign and payload rather than as `f64::NAN`.
     pub fn to_f64(self) -> f64 {
-        if self.is_nan() {
-            return f64::NAN;
-        }
-        if self.exp == EXP_SPECIAL {
-            return if self.neg {
-                f64::NEG_INFINITY
-            } else {
-                f64::INFINITY
-            };
-        }
-        if self.sig == 0 {
-            return if self.neg { -0.0 } else { 0.0 };
-        }
-
-        // Re-normalize before converting. A subnormal 80-bit value cannot
-        // become a normal double -- the range only shrinks -- but a
-        // subnormal's significand is not left-aligned, and the exponent
-        // arithmetic below assumes it is, so align it first.
-        let (sig, unbiased) = self.aligned();
-
-        let exp11 = unbiased + 1023;
-        if exp11 >= 0x7FF {
-            return if self.neg {
-                f64::NEG_INFINITY
-            } else {
-                f64::INFINITY
-            };
-        }
-
-        // 53 significand bits, so 75 of the 128 are rounded away.
-        const DROP: u32 = SIG_BITS - 53;
-        let (frac, exp11) = if exp11 <= 0 {
-            // Subnormal double, or zero.
-            let shift = 1 - exp11;
-            if shift >= 64 {
-                return if self.neg { -0.0 } else { 0.0 };
-            }
-            (Self::round_to(sig >> shift, DROP) as u64, 0)
-        } else {
-            let rounded = Self::round_to(sig, DROP);
-            // Rounding can carry out of the 53 bits, which means the
-            // significand became 2.0 and the exponent steps.
-            if rounded >> 52 > 1 {
-                (0, exp11 + 1)
-            } else {
-                ((rounded & ((1u64 << 52) - 1) as u128) as u64, exp11)
-            }
-        };
-
-        if exp11 >= 0x7FF {
-            return if self.neg {
-                f64::NEG_INFINITY
-            } else {
-                f64::INFINITY
-            };
-        }
-
-        let bits = ((self.neg as u64) << 63) | ((exp11 as u64) << 52) | frac;
-        f64::from_bits(bits)
+        f64::from_bits(self.to_bits(FpFormat::Binary64) as u64)
     }
 
     /// Round `sig` right by `drop` bits, to nearest with ties to even.
@@ -370,144 +308,73 @@ impl FloatVal {
         (self.sig << shift, unbiased)
     }
 
-    /// The x87 80-bit encoding, as `(significand, sign-and-exponent)`.
+    /// The value's encoding in `fmt`, right-aligned in a `u128`: sign, then
+    /// biased exponent, then the stored significand.
     ///
-    /// Rounds the significand to x87's 64 bits, which is where a value wider
-    /// than the target format gives up its extra precision -- once, here,
-    /// rather than at parse time when the type is not yet known.
-    fn to_x87_parts(self) -> (u64, u16) {
-        let se = |exp: u16| ((self.neg as u16) << 15) | (exp & 0x7FFF);
+    /// The one place a value becomes bits. It is rounded to `fmt` first (see
+    /// [`round_to_format`](Self::round_to_format)), which leaves it exactly
+    /// representable there, so what follows only moves fields -- including a
+    /// NaN's sign, quiet bit and payload, which never pass through a host
+    /// float that could change them. For the x87 format the integer bit is
+    /// stored, so the 80 bits are `sign:exp:64-bit significand`.
+    pub fn to_bits(self, fmt: FpFormat) -> u128 {
+        let v = self.round_to_format(fmt);
+        let p = fmt.precision();
+        let stored_bits = fmt.stored_significand_bits();
+        let exp_bits = fmt.exponent_bits();
+        // The top `p` bits of a left-aligned significand, less the integer
+        // bit where the format leaves it implicit.
+        let stored = |sig: u128| (sig >> (SIG_BITS - p)) & ((1u128 << stored_bits) - 1);
 
-        if self.exp == EXP_SPECIAL {
-            // Infinity keeps just the integer bit; a NaN keeps its payload,
-            // which lives immediately below it.
-            let sig = if self.is_nan() {
-                (self.sig >> (SIG_BITS - 64)) as u64 | (1 << 63) | 1
-            } else {
-                1 << 63
-            };
-            return (sig, se(EXP_SPECIAL));
-        }
-        if self.sig == 0 {
-            return (0, se(0));
-        }
-
-        const DROP: u32 = SIG_BITS - 64;
-        let (aligned, unbiased) = self.aligned();
-        let biased = unbiased + BIAS;
-
-        if biased <= 0 {
-            // Subnormal in x87 as well: shift down to exponent 1 and round
-            // whatever falls off, exactly as `from_normalized` does.
-            let shift = DROP as i32 + 1 - biased;
-            if shift > SIG_BITS as i32 {
-                return (0, se(0));
-            }
-            let rounded = Self::round_to(aligned, shift as u32) as u64;
-            // A carry into the integer bit makes it the smallest normal.
-            let exp = u16::from(rounded & (1 << 63) != 0);
-            return (rounded, se(exp));
-        }
-
-        let rounded = Self::round_to(aligned, DROP);
-        // Rounding can carry out of the 64 bits, giving 2.0 and one more
-        // exponent -- which can in turn overflow to infinity.
-        let (sig, biased) = if rounded > u64::MAX as u128 {
-            (1u64 << 63, biased + 1)
+        let (biased, sig) = if v.exp == EXP_SPECIAL {
+            ((1u128 << exp_bits) - 1, stored(v.sig))
+        } else if v.sig == 0 {
+            (0, 0)
         } else {
-            (rounded as u64, biased)
+            let (sig, unbiased) = v.aligned();
+            if unbiased >= fmt.emin() {
+                ((unbiased + fmt.emax()) as u128, stored(sig))
+            } else {
+                // Subnormal in `fmt`: the exponent field is zero and the
+                // significand is shifted down to the smallest normal's scale.
+                // `v` is representable, so nothing is shifted out.
+                (0, stored(sig >> (fmt.emin() - unbiased)))
+            }
         };
-        if biased > EXP_MAX_FINITE as i32 {
-            return (1 << 63, se(EXP_SPECIAL));
-        }
-        (sig, se(biased as u16))
+        ((v.neg as u128) << (exp_bits + stored_bits)) | (biased << stored_bits) | sig
     }
 
     /// The 16-byte x87 80-bit image, little-endian, as stored in memory.
     pub fn to_x87_bytes(self) -> [u8; 16] {
-        let (sig, se) = self.to_x87_parts();
-        let mut out = [0u8; 16];
-        out[..8].copy_from_slice(&sig.to_le_bytes());
-        out[8..10].copy_from_slice(&se.to_le_bytes());
-        out
+        // x86 is little-endian whatever the host is, and `to_le_bytes` says
+        // so rather than assuming the host agrees.
+        self.to_bits(FpFormat::X87Extended).to_le_bytes()
     }
 
     /// The value's bit pattern at `fp_size` bits, as an integer.
     ///
     /// This is the only way to name a floating constant in an assembler
-    /// operand: an inline-asm constraint asking for an immediate gets these
-    /// bits, and one asking for a general register gets them loaded into it.
+    /// operand or an immediate: an inline-asm constraint asking for an
+    /// immediate gets these bits, and one asking for a general register gets
+    /// them loaded into it.
     ///
     /// Widths above 64 bits are not representable in one integer; callers with
-    /// a `long double` want [`to_x87_bytes`](Self::to_x87_bytes) or
-    /// [`to_f128_bits`](Self::to_f128_bits) instead, and this answers with the
-    /// `double` rounding rather than a wrong wide value.
+    /// a `long double` want [`to_bits`](Self::to_bits) at its format instead,
+    /// and this answers with the `double` encoding rather than a wrong wide
+    /// value.
     pub fn to_bits_at_width(self, fp_size: u32) -> i64 {
-        match fp_size {
-            16 => f64_to_f16_bits(self.to_f64()) as i64,
-            32 => (self.to_f64() as f32).to_bits() as i64,
-            _ => self.to_f64().to_bits() as i64,
-        }
+        let fmt = match fp_size {
+            16 => FpFormat::Binary16,
+            32 => FpFormat::Binary32,
+            _ => FpFormat::Binary64,
+        };
+        self.to_bits(fmt) as i64
     }
 
     /// The IEEE binary128 encoding, as `(low, high)` 64-bit halves.
-    ///
-    /// Rounds the significand to binary128's 113 bits, which is the other
-    /// width a `long double` can have.
     pub fn to_f128_bits(self) -> (u64, u64) {
-        let sign = (self.neg as u64) << 63;
-        let halves = |sig: u128, biased: i32| {
-            // The integer bit is implicit in binary128, so only the 112 bits
-            // below it are stored.
-            let frac = sig & ((1u128 << 112) - 1);
-            let hi = sign | ((biased as u64) << 48) | ((frac >> 64) as u64);
-            (frac as u64, hi)
-        };
-
-        if self.exp == EXP_SPECIAL {
-            let hi = sign | (0x7FFF << 48);
-            return if self.is_nan() {
-                // Move the payload below the explicit integer bit.
-                (0, hi | (1 << 47))
-            } else {
-                (0, hi)
-            };
-        }
-        if self.sig == 0 {
-            return (0, sign);
-        }
-
-        // 113 significand bits, so 15 of the 128 are rounded away.
-        const DROP: u32 = SIG_BITS - 113;
-        let (aligned, unbiased) = self.aligned();
-        let biased = unbiased + BIAS;
-
-        if biased <= 0 {
-            // Subnormal in binary128: shift down to exponent 1, rounding.
-            let shift = DROP as i32 + 1 - biased;
-            if shift > SIG_BITS as i32 {
-                return (0, sign);
-            }
-            let rounded = Self::round_to(aligned, shift as u32);
-            // A carry into the integer bit makes it the smallest normal, and
-            // the encoding of that is a biased exponent of 1 with a zero
-            // fraction -- which is what dropping the implicit bit leaves.
-            let biased = i32::from(rounded >> 112 != 0);
-            return halves(rounded, biased);
-        }
-
-        let rounded = Self::round_to(aligned, DROP);
-        // Rounding can carry out of the 113 bits, giving 2.0 and one more
-        // exponent.
-        let (rounded, biased) = if rounded >> 113 != 0 {
-            (rounded >> 1, biased + 1)
-        } else {
-            (rounded, biased)
-        };
-        if biased >= 0x7FFF {
-            return (0, sign | (0x7FFF << 48));
-        }
-        halves(rounded, biased)
+        let bits = self.to_bits(FpFormat::Binary128);
+        (bits as u64, (bits >> 64) as u64)
     }
 
     /// True if this is any NaN.
@@ -621,8 +488,7 @@ impl FloatVal {
     /// what is emitted, and two literals that differ only below x87's 64th
     /// significand bit emit the same constant and should share one slot.
     pub fn pool_key(self) -> u128 {
-        let (sig, se) = self.to_x87_parts();
-        ((se as u128) << 64) | sig as u128
+        self.to_bits(FpFormat::X87Extended)
     }
 }
 
@@ -1014,6 +880,25 @@ impl FpFormat {
         }
     }
 
+    /// Width of the stored significand field: the fraction, plus the integer
+    /// bit in the one format that stores it explicitly.
+    fn stored_significand_bits(self) -> u32 {
+        match self {
+            FpFormat::X87Extended => 64,
+            _ => self.precision() - 1,
+        }
+    }
+
+    /// Width of the biased exponent field.
+    fn exponent_bits(self) -> u32 {
+        match self {
+            FpFormat::Binary16 => 5,
+            FpFormat::Binary32 => 8,
+            FpFormat::Binary64 => 11,
+            FpFormat::X87Extended | FpFormat::Binary128 => 15,
+        }
+    }
+
     /// The unbiased exponent of the smallest normal value.
     fn emin(self) -> i32 {
         match self {
@@ -1195,12 +1080,56 @@ impl FloatVal {
     /// This is what a cast does, and what each operand of an arithmetic
     /// operation has already had done to it: an operand's type says how many
     /// bits it has, whatever the literal it came from was written with.
+    ///
+    /// A NaN keeps its sign, its kind and as much of its payload as `fmt` has
+    /// room for -- the high-order bits, since the payload is held
+    /// left-aligned. The one NaN `fmt` cannot hold as it is, a signalling one
+    /// whose payload lies wholly below `fmt`'s significand, is quieted rather
+    /// than turned into an infinity; no NaN c17 builds has that shape, since
+    /// each is built in the format of its own type.
     pub fn round_to_format(self, fmt: FpFormat) -> Self {
+        if self.is_nan() {
+            let kept = self.sig & !((1u128 << (SIG_BITS - fmt.precision())) - 1);
+            let nan = FloatVal { sig: kept, ..self };
+            return if nan.is_nan() { nan } else { self.quieted() };
+        }
         if self.exp == EXP_SPECIAL || self.is_zero() {
             return self;
         }
         let (sig, exp2) = self.scaled();
         Self::round_wide(self.neg, U256::scaled127(sig), exp2 - 127, false, fmt)
+    }
+
+    /// C's conversion of this value from format `src` to format `dst`
+    /// (6.3.1.5): as `src` holds it, then rounded to `dst`.
+    ///
+    /// **Rounded twice, and both roundings are load-bearing.** A literal is
+    /// held at 128 significand bits, not yet the value its own type holds, so
+    /// rounding straight to `dst` skips a step the program does not:
+    /// `(float)(_Float16)0.3f16` is `0.30004883`, the nearest `float` to the
+    /// nearest `_Float16` to `0.3`, and converting in one go gives `0.3f`
+    /// instead.
+    ///
+    /// A conversion between two formats quiets a signalling NaN, as every
+    /// target's conversion instruction does, and keeps its sign and the
+    /// high-order bits of its payload: narrowing drops the low ones, widening
+    /// appends zeros. Converting to the same format is no conversion at all
+    /// and leaves a signalling NaN signalling.
+    pub fn convert(self, src: FpFormat, dst: FpFormat) -> Self {
+        let v = self.round_to_format(src);
+        if src == dst {
+            return v;
+        }
+        v.quieted().round_to_format(dst)
+    }
+
+    /// The NaN an arithmetic operation on `a` and `b` gives when either of
+    /// them is one: the first NaN operand, quieted, with its own sign and
+    /// payload -- what x86-64's SSE and x87 instructions deliver, and what
+    /// aarch64 delivers unless only the second operand is signalling. `None`
+    /// when neither operand is a NaN.
+    fn propagated_nan(a: Self, b: Self) -> Option<Self> {
+        [a, b].into_iter().find(|v| v.is_nan()).map(Self::quieted)
     }
 
     /// `self + other`, rounded once to `fmt`.
@@ -1210,7 +1139,13 @@ impl FloatVal {
 
     /// `self - other`, rounded once to `fmt`.
     pub fn sub(self, other: Self, fmt: FpFormat) -> Self {
-        self.add_rounded(other.negated(), fmt)
+        // A NaN subtrahend comes out with its own sign: the subtraction does
+        // not negate it, so it is taken out before the negation below.
+        let (a, b) = (self.round_to_format(fmt), other.round_to_format(fmt));
+        if let Some(nan) = Self::propagated_nan(a, b) {
+            return nan;
+        }
+        a.add_rounded(b.negated(), fmt)
     }
 
     /// The common core of `add` and `sub`: `sub` negates first, since
@@ -1219,8 +1154,8 @@ impl FloatVal {
         let a = self.round_to_format(fmt);
         let b = other.round_to_format(fmt);
 
-        if a.is_nan() || b.is_nan() {
-            return Self::nan();
+        if let Some(nan) = Self::propagated_nan(a, b) {
+            return nan;
         }
         if a.is_infinite() || b.is_infinite() {
             // Infinities of opposite sign have no defined difference.
@@ -1283,8 +1218,8 @@ impl FloatVal {
         let a = self.round_to_format(fmt);
         let b = other.round_to_format(fmt);
 
-        if a.is_nan() || b.is_nan() {
-            return Self::nan();
+        if let Some(nan) = Self::propagated_nan(a, b) {
+            return nan;
         }
         let neg = a.neg != b.neg;
         if a.is_infinite() || b.is_infinite() {
@@ -1309,8 +1244,8 @@ impl FloatVal {
         let a = self.round_to_format(fmt);
         let b = other.round_to_format(fmt);
 
-        if a.is_nan() || b.is_nan() {
-            return Self::nan();
+        if let Some(nan) = Self::propagated_nan(a, b) {
+            return nan;
         }
         let neg = a.neg != b.neg;
         if a.is_infinite() {
@@ -2030,5 +1965,210 @@ mod tests {
         assert_eq!(a.to_f64().to_bits(), b.to_f64().to_bits());
         assert_ne!(a.key(), b.key());
         assert_ne!(a, b);
+    }
+
+    // NaN payloads
+    //
+    // Every expected encoding below is what gcc emits for the same constant,
+    // on x86-64 for x87 and on aarch64 for binary128.
+
+    /// `nan_with_payload` puts the payload in the low bits of the trailing
+    /// significand field, and the kind decides the quiet bit.
+    #[test]
+    fn a_nan_is_built_with_its_payload_in_each_format() {
+        use NanKind::{Quiet, Signalling};
+        let nan = FloatVal::nan_with_payload;
+        let cases: &[(FpFormat, u128, NanKind, u128)] = &[
+            (FpFormat::Binary16, 0x5, Quiet, 0x7e05),
+            (FpFormat::Binary32, 0x123, Quiet, 0x7fc0_0123),
+            (FpFormat::Binary32, 0x123, Signalling, 0x7f80_0123),
+            (FpFormat::Binary64, 0x1234, Quiet, 0x7ff8_0000_0000_1234),
+            (
+                FpFormat::Binary64,
+                0x1234,
+                Signalling,
+                0x7ff0_0000_0000_1234,
+            ),
+            (FpFormat::Binary64, 0, Quiet, 0x7ff8_0000_0000_0000),
+            (
+                FpFormat::X87Extended,
+                0x1234,
+                Quiet,
+                0x7fff_c000_0000_0000_1234,
+            ),
+            (
+                FpFormat::X87Extended,
+                0x1234,
+                Signalling,
+                0x7fff_8000_0000_0000_1234,
+            ),
+            (
+                FpFormat::Binary128,
+                0x1234,
+                Quiet,
+                0x7fff_8000_0000_0000_0000_0000_0000_1234,
+            ),
+            (
+                FpFormat::Binary128,
+                0x1234,
+                Signalling,
+                0x7fff_0000_0000_0000_0000_0000_0000_1234,
+            ),
+        ];
+        for &(fmt, payload, kind, want) in cases {
+            let v = nan(fmt, payload, kind);
+            assert!(v.is_nan());
+            assert_eq!(v.to_bits(fmt), want, "{kind:?} {payload:#x} at {fmt:?}");
+        }
+    }
+
+    /// A signalling NaN cannot have an empty significand -- that would be an
+    /// infinity -- so gcc gives it the bit below the quiet bit; and a payload
+    /// wider than the format keeps its low bits, the quiet bit overridden.
+    #[test]
+    fn nan_payload_edges_follow_gcc() {
+        use NanKind::{Quiet, Signalling};
+        let bits = |fmt, payload, kind| FloatVal::nan_with_payload(fmt, payload, kind).to_bits(fmt);
+        assert_eq!(
+            bits(FpFormat::Binary64, 0, Signalling),
+            0x7ff4_0000_0000_0000
+        );
+        assert_eq!(bits(FpFormat::Binary32, 0, Signalling), 0x7fa0_0000);
+        assert_eq!(
+            bits(FpFormat::X87Extended, 0, Signalling),
+            0x7fff_a000_0000_0000_0000
+        );
+        // The payload is exactly the quiet bit: cleared, so empty again.
+        assert_eq!(
+            bits(FpFormat::Binary64, 1 << 51, Signalling),
+            0x7ff4_0000_0000_0000
+        );
+        assert_eq!(
+            bits(FpFormat::Binary64, u64::MAX as u128, Quiet),
+            0x7fff_ffff_ffff_ffff
+        );
+        assert_eq!(
+            bits(FpFormat::Binary64, u64::MAX as u128, Signalling),
+            0x7ff7_ffff_ffff_ffff
+        );
+        assert_eq!(bits(FpFormat::Binary32, u128::MAX, Signalling), 0x7fbf_ffff);
+    }
+
+    /// The sign operations change the sign and nothing else.
+    #[test]
+    fn negating_a_nan_flips_only_its_sign() {
+        for kind in [NanKind::Quiet, NanKind::Signalling] {
+            let v = FloatVal::nan_with_payload(FpFormat::Binary64, 0x1234, kind);
+            let neg = v.negated();
+            assert_eq!(
+                neg.to_bits(FpFormat::Binary64),
+                v.to_bits(FpFormat::Binary64) | 1 << 63
+            );
+            assert_eq!(neg.magnitude(), v);
+            assert_eq!(neg.negated(), v);
+        }
+        let x87 = FloatVal::nan_with_payload(FpFormat::X87Extended, 0x1234, NanKind::Quiet);
+        assert_eq!(
+            x87.negated().to_bits(FpFormat::X87Extended),
+            0xffff_c000_0000_0000_1234
+        );
+    }
+
+    /// A conversion keeps the payload's high-order bits, as the hardware
+    /// does: narrowing drops the low ones, widening appends zeros. It quiets
+    /// a signalling NaN and keeps the sign.
+    #[test]
+    fn converting_a_nan_keeps_its_high_payload_bits() {
+        use FpFormat::{Binary128, Binary32, Binary64, X87Extended};
+        let d = |payload, kind| FloatVal::nan_with_payload(Binary64, payload, kind);
+        let f = |payload, kind| FloatVal::nan_with_payload(Binary32, payload, kind);
+
+        // Narrowing: the payload moves down 29 bits, what falls off is lost.
+        let v = d(0x4000_0000, NanKind::Quiet).convert(Binary64, Binary32);
+        assert_eq!(v.to_bits(Binary32), 0x7fc0_0002);
+        let v = d(0x1234, NanKind::Quiet).convert(Binary64, Binary32);
+        assert_eq!(v.to_bits(Binary32), 0x7fc0_0000);
+        // Widening: up 29 bits.
+        let v = f(0x123, NanKind::Quiet).convert(Binary32, Binary64);
+        assert_eq!(v.to_bits(Binary64), 0x7ff8_0024_6000_0000);
+        // And from binary64 into both long doubles.
+        let v = d(0x1234, NanKind::Quiet);
+        assert_eq!(
+            v.convert(Binary64, X87Extended).to_bits(X87Extended),
+            0x7fff_c000_0000_0091_a000
+        );
+        assert_eq!(
+            v.convert(Binary64, Binary128).to_bits(Binary128),
+            0x7fff_8000_0000_0123_4000_0000_0000_0000
+        );
+
+        // A conversion quiets, and keeps the sign.
+        let s = d(0x4000_0000, NanKind::Signalling).negated();
+        assert_eq!(s.convert(Binary64, Binary32).to_bits(Binary32), 0xffc0_0002);
+        let s = f(0x123, NanKind::Signalling);
+        assert_eq!(
+            s.convert(Binary32, Binary64).to_bits(Binary64),
+            0x7ff8_0024_6000_0000
+        );
+        // Converting to the same format is no conversion: still signalling.
+        let s = d(0x1234, NanKind::Signalling);
+        assert_eq!(
+            s.convert(Binary64, Binary64).to_bits(Binary64),
+            0x7ff0_0000_0000_1234
+        );
+        // Rounding to a format a signalling NaN's payload lies wholly below
+        // cannot keep it signalling; it stays a NaN rather than an infinity.
+        assert!(s.round_to_format(Binary32).is_nan());
+    }
+
+    /// Arithmetic on a NaN gives the first NaN operand, quieted, with its own
+    /// sign and payload -- which a subtraction does not negate.
+    #[test]
+    fn arithmetic_propagates_a_nan_operand() {
+        let fmt = FpFormat::Binary64;
+        let one = FloatVal::from_f64(1.0);
+        let q5 = FloatVal::nan_with_payload(fmt, 5, NanKind::Quiet);
+        let s7 = FloatVal::nan_with_payload(fmt, 7, NanKind::Signalling).negated();
+        let bits = |v: FloatVal| v.to_bits(fmt);
+        assert_eq!(bits(q5.add(one, fmt)), 0x7ff8_0000_0000_0005);
+        assert_eq!(bits(one.mul(q5, fmt)), 0x7ff8_0000_0000_0005);
+        assert_eq!(bits(one.sub(s7, fmt)), 0xfff8_0000_0000_0007);
+        assert_eq!(bits(s7.div(q5, fmt)), 0xfff8_0000_0000_0007);
+        assert_eq!(bits(q5.sub(s7, fmt)), 0x7ff8_0000_0000_0005);
+    }
+
+    /// `to_f64` is the binary64 encoding exactly, NaNs included: it used to
+    /// answer `f64::NAN` for every NaN, dropping sign, payload and kind.
+    #[test]
+    fn to_f64_of_a_nan_is_exact() {
+        let s = FloatVal::nan_with_payload(FpFormat::Binary64, 0x1234, NanKind::Signalling);
+        assert_eq!(s.negated().to_f64().to_bits(), 0xfff0_0000_0000_1234);
+        for bits in [0x7ff8_0000_0000_1234u64, 0xfff4_0000_0000_0001] {
+            let v = FloatVal::from_f64(f64::from_bits(bits));
+            assert_eq!(v.to_f64().to_bits(), bits);
+            assert_eq!(v.to_bits(FpFormat::Binary64), u128::from(bits));
+        }
+    }
+
+    /// `to_bits` at the narrow formats rounds once, from the exact value, and
+    /// saturates and underflows at each format's own limits.
+    #[test]
+    fn narrow_encodings_round_once_from_the_exact_value() {
+        let bits16 = |v: f64| FloatVal::from_f64(v).to_bits(FpFormat::Binary16);
+        assert_eq!(bits16(0.3), 0x34cd);
+        assert_eq!(bits16(-2.0), 0xc000);
+        assert_eq!(bits16(65504.0), 0x7bff);
+        assert_eq!(bits16(65520.0), 0x7c00, "rounds up to infinity");
+        assert_eq!(bits16(2f64.powi(-24)), 0x0001, "smallest subnormal");
+        assert_eq!(bits16(2f64.powi(-26)), 0x0000, "below half of it");
+        assert_eq!(bits16(f64::NEG_INFINITY), 0xfc00);
+
+        // A `float` literal is rounded to `float` directly, not through
+        // `double`: 1 + 2^-24 + 2^-54 is just above a `float` tie, and
+        // rounding it to `double` first drops the 2^-54 and makes it a tie,
+        // which goes to even -- down.
+        let v = FloatVal::from_parts(false, (1u128 << 54) | (1 << 30) | 1, -54);
+        assert_eq!(v.to_bits(FpFormat::Binary32), 0x3f80_0001);
+        assert_eq!((v.to_f64() as f32).to_bits(), 0x3f80_0000);
     }
 }

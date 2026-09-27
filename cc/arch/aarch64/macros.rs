@@ -14,7 +14,7 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
     vec![
         // Architecture identification
         ("__aarch64__", Some("1")),
-        ("__arm64__", Some("1")), // macOS uses this
+        // `__arm64__` is Apple's spelling, in `get_darwin_macros`.
         ("__ARM_ARCH", Some("8")),
         ("__ARM_64BIT_STATE", Some("1")),
         ("__ARM_ARCH_ISA_A64", Some("1")),
@@ -62,4 +62,10 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         // 128-bit integer support
         ("__SIZEOF_INT128__", Some("16")),
     ]
+}
+
+/// The macros clang adds for arm64 on Darwin alone. gcc on aarch64 Linux
+/// defines neither, and code reads `__arm64__` as "Apple".
+pub fn get_darwin_macros() -> Vec<(&'static str, Option<&'static str>)> {
+    vec![("__arm64__", Some("1")), ("__arm64", Some("1"))]
 }

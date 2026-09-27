@@ -25,4 +25,4 @@ mod memory;
 pub mod regalloc;
 mod relax;
 
-pub use macros::get_macros;
+pub use macros::{get_darwin_macros, get_macros};

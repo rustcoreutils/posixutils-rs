@@ -25,20 +25,22 @@ pub fn get_os_macros(target: &Target) -> Vec<(&'static str, Option<String>)> {
         // prototypes behind this, so a c17-branded compiler that left it at
         // the 2008 value exposed a 16-year-old interface by default.
         ("_POSIX_C_SOURCE", Some("202405L".into())),
-        // Unix-like
-        ("__unix__", Some("1".into())),
-        ("__unix", Some("1".into())),
-        ("unix", Some("1".into())),
     ];
+
+    // The `unix` family names the ELF Unixes. Neither clang nor gcc defines
+    // it for Darwin, which code tells apart by `__APPLE__` instead.
+    let unix = ["__unix__", "__unix", "unix"].map(|name| (name, Some("1".to_string())));
 
     match target.os {
         Os::Linux => {
+            macros.extend(unix);
             macros.extend(linux::get_macros(target));
         }
         Os::MacOS => {
             macros.extend(macos::get_macros());
         }
         Os::FreeBSD => {
+            macros.extend(unix);
             macros.extend(freebsd::get_macros());
         }
     }
@@ -67,5 +69,68 @@ pub fn get_include_paths(target: &Target, sysroot: Option<&str>) -> Vec<String> 
             paths.iter().map(|p| format!("{}{}", root, p)).collect()
         }
         None => paths.iter().map(|p| p.to_string()).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::target::Arch;
+
+    fn defines(target: &Target, name: &str) -> bool {
+        get_os_macros(target).iter().any(|(n, _)| *n == name)
+    }
+
+    /// Each OS predefines its own identity and no other's. The macOS list
+    /// carried `__FreeBSD__` and `__NetBSD__` as "not defined" entries, which
+    /// defined both, empty, so `#ifdef __FreeBSD__` was true on Apple. And
+    /// neither clang nor gcc defines the `unix` family for Darwin: portable
+    /// code tests `__unix__ || __APPLE__` for exactly that reason.
+    #[test]
+    fn each_os_names_only_itself() {
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            for (os, own, foreign) in [
+                (
+                    Os::Linux,
+                    &[
+                        "__linux__",
+                        "__linux",
+                        "linux",
+                        "__gnu_linux__",
+                        "unix",
+                        "__unix",
+                        "__unix__",
+                    ][..],
+                    &["__APPLE__", "__MACH__", "__FreeBSD__", "__NetBSD__"][..],
+                ),
+                (
+                    Os::MacOS,
+                    &["__APPLE__", "__MACH__"][..],
+                    &[
+                        "__linux__",
+                        "linux",
+                        "__FreeBSD__",
+                        "__NetBSD__",
+                        "unix",
+                        "__unix",
+                        "__unix__",
+                        "__ELF__",
+                    ][..],
+                ),
+                (
+                    Os::FreeBSD,
+                    &["__FreeBSD__", "unix", "__unix", "__unix__"][..],
+                    &["__APPLE__", "__MACH__", "__linux__", "linux", "__NetBSD__"][..],
+                ),
+            ] {
+                let target = Target::new(arch, os);
+                for name in own {
+                    assert!(defines(&target, name), "{name} missing on {arch}-{os}");
+                }
+                for name in foreign {
+                    assert!(!defines(&target, name), "{name} defined on {arch}-{os}");
+                }
+            }
+        }
     }
 }

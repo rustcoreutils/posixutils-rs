@@ -74,6 +74,9 @@ pub fn get_arch_macros(target: &Target) -> Vec<(&'static str, Option<&'static st
         }
         Arch::Aarch64 => {
             macros.extend(aarch64::get_macros());
+            if target.os == Os::MacOS {
+                macros.extend(aarch64::get_darwin_macros());
+            }
         }
     }
 
@@ -842,6 +845,29 @@ mod tests {
                     "__{name}_MIN__"
                 );
             }
+        }
+    }
+
+    /// `__arm64__` and `__arm64` are Apple's spellings: clang defines them
+    /// for Darwin arm64 only, and gcc for aarch64 Linux defines neither. Code
+    /// reads `__arm64__` as "Apple", so on Linux it must be absent.
+    #[test]
+    fn arm64_spelling_is_apple_only() {
+        for target in all_targets() {
+            let macros = get_arch_macros(&target);
+            let apple_arm64 = target.arch == Arch::Aarch64 && target.os == Os::MacOS;
+            for name in ["__arm64__", "__arm64"] {
+                let defs = macros.iter().filter(|(n, _)| *n == name).count();
+                assert_eq!(
+                    defs,
+                    usize::from(apple_arm64),
+                    "{name} on {}-{}",
+                    target.arch,
+                    target.os
+                );
+            }
+            let aarch64 = macros.iter().any(|(n, _)| *n == "__aarch64__");
+            assert_eq!(aarch64, target.arch == Arch::Aarch64);
         }
     }
 }

@@ -12,7 +12,7 @@
 // Headers come from system libc (glibc/macOS); our compiler just parses them.
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_aarch64, compile_expect_no_diagnostic};
 
 #[test]
 fn c99_stdlib_headers_mega() {
@@ -414,4 +414,72 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("wint_platform", code, &[]), 0);
+}
+
+/// `SSIZE_MAX` belongs to `<limits.h>` (POSIX), not to the compiler. It was
+/// predefined, so a program that defines its own, or tests `#ifndef
+/// SSIZE_MAX` to learn whether it has included `<limits.h>`, was wrong before
+/// it included anything. Only bundled headers here, so the same program runs
+/// for aarch64 without that target's C library.
+const SSIZE_LIMIT: &str = r#"
+#ifdef SSIZE_MAX
+#error "SSIZE_MAX is defined before <limits.h>"
+#endif
+#include <limits.h>
+#include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#if !(SSIZE_MAX > 0 && SSIZE_MAX == SIZE_MAX / 2)
+#error "SSIZE_MAX is not usable in #if, or not size_t's signed half"
+#endif
+
+int main(void) {
+    /* ssize_t is the signed type of size_t's width. */
+    if (sizeof(SSIZE_MAX) != sizeof(size_t)) return 1;
+    if ((__typeof__(SSIZE_MAX))-1 >= 0) return 2;
+    if (SSIZE_MAX != PTRDIFF_MAX) return 3;
+    if (_POSIX_SSIZE_MAX != 32767 || SSIZE_MAX < _POSIX_SSIZE_MAX) return 4;
+    return 0;
+}
+"#;
+
+#[test]
+fn c99_ssize_max_comes_from_limits_h() {
+    assert_eq!(compile_and_run("ssize_limit", SSIZE_LIMIT, &[]), 0);
+    compile_expect_no_diagnostic("ssize_limit_clean", SSIZE_LIMIT, "redefin");
+}
+
+#[test]
+fn c99_ssize_max_comes_from_limits_h_aarch64() {
+    if let Some(rc) = compile_and_run_aarch64("ssize_limit", SSIZE_LIMIT, "-O0") {
+        assert_eq!(rc, 0);
+    }
+}
+
+/// And it is the C library's type: `ssize_t` itself, where `<sys/types.h>`
+/// declares it.
+#[test]
+fn c99_ssize_max_has_ssize_t_type() {
+    let code = r#"
+#include <limits.h>
+#include <sys/types.h>
+int main(void) {
+    return _Generic(SSIZE_MAX, ssize_t: 0, default: 1);
+}
+"#;
+    assert_eq!(compile_and_run("ssize_type", code, &[]), 0);
+}
+
+/// A program may name its own `SSIZE_MAX` when it has not included
+/// `<limits.h>`, and one that has not decided yet may ask.
+#[test]
+fn c99_ssize_max_is_the_programs_without_limits_h() {
+    let code = r#"
+#ifndef SSIZE_MAX
+#define SSIZE_MAX 5
+#endif
+int main(void) { return SSIZE_MAX - 5; }
+"#;
+    assert_eq!(compile_and_run("own_ssize_max", code, &[]), 0);
 }

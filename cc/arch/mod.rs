@@ -242,11 +242,6 @@ pub fn get_integer_macros(target: &Target) -> Vec<(String, String)> {
     ] {
         out.push((format!("__SIZEOF_{name}__"), sizeof(ty)));
     }
-    // POSIX's `ssize_t` is the signed type of `size_t`'s rank.
-    out.push((
-        "SSIZE_MAX".into(),
-        max_literal(target, target.size_type().to_signed()),
-    ));
 
     for t in integer_typedefs(target) {
         let (name, ty, d) = (&t.name, t.ty, t.describe);
@@ -844,6 +839,38 @@ mod tests {
                     lookup(&format!("__{name}_MIN__")).is_some(),
                     "__{name}_MIN__"
                 );
+            }
+        }
+    }
+
+    /// Every integer predefine is in the implementation's namespace (C17
+    /// 7.1.3): `SSIZE_MAX` was predefined, where POSIX puts it in
+    /// `<limits.h>` and a program without that header may use the name.
+    #[test]
+    fn integer_macros_are_reserved_names() {
+        let reserved = |n: &str| {
+            n.starts_with("__")
+                || (n.starts_with('_') && n[1..].starts_with(|c: char| c.is_ascii_uppercase()))
+        };
+        for target in all_targets() {
+            for (name, _) in get_integer_macros(&target)
+                .into_iter()
+                .chain(get_atomic_macros(&target))
+                .chain(
+                    get_type_macros(&target)
+                        .into_iter()
+                        .map(|(n, v)| (n, v.to_string())),
+                )
+                .chain(
+                    get_constant_fn_macros(&target)
+                        .into_iter()
+                        .map(|(n, v)| (n, v.to_string())),
+                )
+            {
+                assert!(reserved(&name), "{name} on {}-{}", target.arch, target.os);
+            }
+            for (name, _) in get_arch_macros(&target) {
+                assert!(reserved(name), "{name} on {}-{}", target.arch, target.os);
             }
         }
     }

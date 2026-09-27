@@ -133,4 +133,24 @@ mod tests {
             }
         }
     }
+
+    /// The only predefines outside the implementation's namespace are gcc's
+    /// own, `unix` and `linux`. FreeBSD's list had `BSD`, which is
+    /// `<sys/param.h>`'s and which neither gcc nor clang predefines.
+    #[test]
+    fn unreserved_os_macros_are_gccs() {
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            for os in [Os::Linux, Os::MacOS, Os::FreeBSD] {
+                for (name, _) in get_os_macros(&Target::new(arch, os)) {
+                    let reserved = name.starts_with("__")
+                        || (name.starts_with('_')
+                            && name[1..].starts_with(|c: char| c.is_ascii_uppercase()));
+                    assert!(
+                        reserved || name == "unix" || name == "linux",
+                        "{name} on {arch}-{os}"
+                    );
+                }
+            }
+        }
+    }
 }

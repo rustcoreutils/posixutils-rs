@@ -114,6 +114,19 @@
 #define _POSIX_SSIZE_MAX 32767
 #endif
 
+/* POSIX: the largest ssize_t, the signed type of size_t's width. It is this
+   header's, not a predefine, so a program that has not included <limits.h>
+   may use the name itself; and a definition made first, as glibc's
+   <bits/posix1_lim.h> makes one, stands. Spelled as glibc and Apple spell
+   it, so a system header that defines it again repeats it exactly. */
+#ifndef SSIZE_MAX
+#if __SIZEOF_SIZE_T__ == __SIZEOF_LONG__
+#define SSIZE_MAX LONG_MAX
+#else
+#define SSIZE_MAX INT_MAX
+#endif
+#endif
+
 #ifndef _POSIX_STREAM_MAX
 #define _POSIX_STREAM_MAX 8
 #endif

@@ -359,18 +359,11 @@ is GPLv3 and is not vendored) and diffs a recorded baseline, so a regression
 fails by name rather than shifting a percentage.
 
 The suite is run at `-O0` and `-O2`. `c17_torture.sh` prints the totals and
-names every regression against `torture-baseline.txt`; the groups below say
-what each remaining failure needs.
+names every regression against `torture-baseline.txt`.
 
 One conformance gap found while working through it: c17 has no C17 6.7.3p2
 check, so `restrict int x;` is accepted where gcc errors that `restrict` may
 only qualify a pointer to object type.
-
-### Still open
-
-| Group | Note |
-|---|---|
-| Dead-call elimination proofs | `ieee/fp-cmp-7`, which compares a variable against `+Inf` under `-fno-trapping-math`. gcc folds that comparison and c17 does not, so the `link_error` call stays and the test fails to *link* |
 
 One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.
 gcc accepts a conditional with one `void` arm as an extension; C17 6.5.15p3

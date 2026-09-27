@@ -204,6 +204,54 @@ pub(crate) fn fcmp_outcome(ord: Option<Ordering>) -> u8 {
     }
 }
 
+/// The answer of a float comparison true for the outcomes in `mask`, when
+/// every outcome in `possible` gives the same one: 0 when none of them makes
+/// it true, 1 when all of them do.
+pub(crate) fn fcmp_decided(mask: u8, possible: u8) -> Option<bool> {
+    if possible & mask == 0 {
+        Some(false)
+    } else if possible & !mask & FCMP_ALL == 0 {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// The outcomes of `x` compared with the constant `c`, for an unknown `x`
+/// that may be told never to be below zero.
+///
+/// Nothing is greater than `+Inf`, nothing is less than `-Inf`, and nothing
+/// is ordered with a NaN -- including a NaN `x`, which is why an infinity
+/// still leaves *unordered* possible. A NaN `x` also leaves `never_below`
+/// true, since it is not less than zero either.
+pub(crate) fn possible_against(c: FloatVal, never_below: bool) -> u8 {
+    let inf = FloatVal::infinity(false);
+    let mut possible = match (c.cmp_value(inf), c.cmp_value(inf.negated())) {
+        (None, _) => return CMP_UN,
+        (Some(Ordering::Equal), _) => FCMP_ALL & !CMP_GT,
+        (_, Some(Ordering::Equal)) => FCMP_ALL & !CMP_LT,
+        _ => FCMP_ALL,
+    };
+    if never_below && c.cmp_value(FloatVal::from_f64(0.0)) != Some(Ordering::Greater) {
+        possible &= !CMP_LT;
+    }
+    possible
+}
+
+/// The answer of `op` comparing an unknown value with the constant `c`
+/// (`c op x` when `const_first`), when no value -- a NaN included -- can
+/// change it: `x > +Inf` is 0, `x != NaN` is 1. The one rule the optimizer
+/// folds by, and the linearizer too under `-fno-trapping-math`.
+pub(crate) fn fcmp_against_constant(op: Opcode, c: FloatVal, const_first: bool) -> Option<bool> {
+    let possible = possible_against(c, false);
+    let possible = if const_first {
+        mirror_mask(possible)
+    } else {
+        possible
+    };
+    fcmp_decided(fcmp_mask(op)?, possible)
+}
+
 /// The same mask read with the operands the other way round: `a < b` and
 /// `b < a` are the same comparison with `less` and `greater` exchanged.
 /// Equal and unordered are symmetric and stay where they are.
@@ -504,4 +552,41 @@ pub(crate) fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
 /// negative `char` would come back positive.
 fn conversion_src_width(insn: &Instruction) -> Option<u32> {
     (insn.src_size != 0).then_some(insn.src_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rule both the optimizer and the linearizer fold by: decided only
+    /// when every value of the unknown side, a NaN included, gives the same
+    /// answer -- and read the right way round when the constant comes first.
+    #[test]
+    fn fcmp_against_constant_decides_only_what_no_value_changes() {
+        let inf = FloatVal::infinity(false);
+        let nan = FloatVal::nan();
+        for (op, c, const_first, want) in [
+            (Opcode::FCmpOGt, inf, false, Some(false)), // x > +Inf
+            (Opcode::FCmpOLt, inf, true, Some(false)),  // +Inf < x
+            (Opcode::FCmpOLt, inf.negated(), false, Some(false)), // x < -Inf
+            (Opcode::FCmpOGt, inf.negated(), true, Some(false)), // -Inf > x
+            (Opcode::FCmpOGt, nan, false, Some(false)), // x > NaN
+            (Opcode::FCmpOEq, nan, true, Some(false)),  // NaN == x
+            (Opcode::FCmpONe, nan, false, Some(true)),  // x != NaN
+            (Opcode::FCmpOLe, inf, false, None),        // false for a NaN only
+            (Opcode::FCmpOGe, inf, false, None),        // x == +Inf
+            (Opcode::FCmpOLt, inf, false, None),
+            (Opcode::FCmpOEq, inf, false, None),
+            (Opcode::FCmpONe, inf, false, None),
+            (Opcode::FCmpOGt, inf, true, None), // +Inf > x
+            (Opcode::FCmpOGt, FloatVal::from_f64(1.0), false, None),
+        ] {
+            assert_eq!(
+                fcmp_against_constant(op, c, const_first),
+                want,
+                "{op:?} {c:?} const_first={const_first}"
+            );
+        }
+        assert_eq!(fcmp_against_constant(Opcode::SetGt, inf, false), None);
+    }
 }

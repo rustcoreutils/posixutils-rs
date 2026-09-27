@@ -26,14 +26,13 @@
 
 use super::constfold::{
     at_width, cmp_operand_width, eval_binop, eval_fbinop, eval_fcvt, eval_fcvtf, eval_fternop,
-    eval_funop, eval_unop, fcmp_mask, fcmp_outcome, get_cmp_info, mirror_mask, result_type_of,
-    CMP_GT, CMP_LT, CMP_UN, FCMP_ALL,
+    eval_funop, eval_unop, fcmp_decided, fcmp_mask, fcmp_outcome, get_cmp_info, mirror_mask,
+    possible_against, result_type_of, FCMP_ALL,
 };
 use super::facts::{CmpDomain, CmpFacts, ConstMap, Relation};
 use super::{ConstValue, Function, Instruction, Opcode, PseudoId};
 use crate::float::FloatVal;
 use crate::types::{TypeId, TypeTable};
-use std::cmp::Ordering;
 use std::collections::HashSet;
 
 // Constant Resolution
@@ -720,13 +719,10 @@ fn simplify_fcmp(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simpli
     let Some(mask) = fcmp_mask(insn.op) else {
         return Simplification::None;
     };
-    let possible = possible_fcmp_outcomes(insn, consts, facts);
-    if possible & mask == 0 {
-        fold_to_zero()
-    } else if possible & !mask & FCMP_ALL == 0 {
-        fold_to_const(1)
-    } else {
-        Simplification::None
+    match fcmp_decided(mask, possible_fcmp_outcomes(insn, consts, facts)) {
+        Some(false) => fold_to_zero(),
+        Some(true) => fold_to_const(1),
+        None => Simplification::None,
     }
 }
 
@@ -754,27 +750,6 @@ fn possible_fcmp_outcomes(insn: &Instruction, consts: &ConstMap, facts: &Facts) 
         (Some(c), None) => mirror_mask(possible_against(c, never_below(rhs))),
         (None, None) => FCMP_ALL,
     }
-}
-
-/// The outcomes of `x` compared with the constant `c`, for an unknown `x`
-/// that may be told never to be below zero.
-///
-/// Nothing is greater than `+Inf`, nothing is less than `-Inf`, and nothing
-/// is ordered with a NaN -- including a NaN `x`, which is why an infinity
-/// still leaves *unordered* possible. A NaN `x` also leaves `never_below`
-/// true, since it is not less than zero either.
-fn possible_against(c: FloatVal, never_below: bool) -> u8 {
-    let inf = FloatVal::infinity(false);
-    let mut possible = match (c.cmp_value(inf), c.cmp_value(inf.negated())) {
-        (None, _) => return CMP_UN,
-        (Some(Ordering::Equal), _) => FCMP_ALL & !CMP_GT,
-        (_, Some(Ordering::Equal)) => FCMP_ALL & !CMP_LT,
-        _ => FCMP_ALL,
-    };
-    if never_below && c.cmp_value(FloatVal::from_f64(0.0)) != Some(Ordering::Greater) {
-        possible &= !CMP_LT;
-    }
-    possible
 }
 
 /// Fold float arithmetic over two constants.

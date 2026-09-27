@@ -91,6 +91,14 @@ The condition has to be a constant expression, asked through the shared walk
 fold `&x == 0`, `(g(), 0)` or `g() && 0`: none of them is a constant
 expression.
 
+One more condition decides its branch, and only under `-fno-trapping-math`:
+a floating comparison of an unknown value with a constant, when no value,
+NaN included, can change the answer. `x > +Inf` is the example. gcc folds
+exactly those forms at `-O0`. With trapping math on, the default, the
+comparison stays, because a NaN operand would raise `FE_INVALID`. The
+optimizer decides which comparisons qualify by the same rule
+(`constfold::fcmp_against_constant`).
+
 ## Known Divergences
 
 ### `_Generic` on a wide bit-field expression

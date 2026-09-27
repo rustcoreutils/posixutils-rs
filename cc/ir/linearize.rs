@@ -416,6 +416,11 @@ pub struct Linearizer<'a> {
     /// a call to a library builtin that yields to a definition reaches the
     /// program's own wherever it is (`InlineLibraryFn::yields_to_a_definition`).
     pub(crate) defined_functions: std::collections::HashSet<StringId>,
+    /// `-ftrapping-math`, the default: the program may observe the
+    /// floating-point exception flags, so a comparison that would raise one
+    /// is emitted even where its answer is known. `-fno-trapping-math` turns
+    /// it off.
+    pub(crate) trapping_math: bool,
 }
 
 impl<'a> Linearizer<'a> {
@@ -467,6 +472,7 @@ impl<'a> Linearizer<'a> {
             local_scope_stack: Vec::new(),
             declared_aliases: Vec::new(),
             defined_functions: std::collections::HashSet::new(),
+            trapping_math: true,
         }
     }
 
@@ -2995,17 +3001,10 @@ impl<'a> Linearizer<'a> {
         let a = self.linearize_expr(lhs);
         let b = self.linearize_expr(rhs);
 
+        if let Some(op) = super::linearize_emit::fp_compare_opcode(cmp) {
+            return self.emit_fcmp(op, a, b, typ, size);
+        }
         match cmp {
-            FpCompare::Greater => self.emit_fcmp(Opcode::FCmpOGt, a, b, typ, size),
-            FpCompare::GreaterEqual => self.emit_fcmp(Opcode::FCmpOGe, a, b, typ, size),
-            FpCompare::Less => self.emit_fcmp(Opcode::FCmpOLt, a, b, typ, size),
-            FpCompare::LessEqual => self.emit_fcmp(Opcode::FCmpOLe, a, b, typ, size),
-            // C23 7.12.17.1 has `iseqsig` raise `FE_INVALID` for an unordered
-            // pair, quiet NaN included -- the reverse of its siblings. The
-            // quiet compare emitted here does not raise it for a quiet NaN.
-            // The *answer* is exact; only the exception flag differs -- the
-            // same gap c17's `<` and `>` have, which use this compare too.
-            FpCompare::Equal => self.emit_fcmp(Opcode::FCmpOEq, a, b, typ, size),
             // Ordered and unequal. `!=` will not do: it is *true* for an
             // unordered pair, and this must be false for one.
             FpCompare::LessGreater => {
@@ -3020,6 +3019,7 @@ impl<'a> Linearizer<'a> {
                 let b_nan = self.emit_fcmp(Opcode::FCmpONe, b, b, typ, size);
                 self.emit_bool_combine(Opcode::Or, a_nan, b_nan)
             }
+            _ => unreachable!("{cmp:?} is one comparison"),
         }
     }
 
@@ -6643,8 +6643,10 @@ pub fn linearize(
     strings: &StringTable,
     target: &Target,
     debug: bool,
+    trapping_math: bool,
 ) -> Module {
     let mut linearizer = Linearizer::new(symbols, types, strings, target);
+    linearizer.trapping_math = trapping_math;
     let mut module = linearizer.linearize(tu);
     module.debug = debug;
     // Get all source files from the stream registry (includes all #included files)

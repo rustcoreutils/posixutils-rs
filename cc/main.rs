@@ -373,6 +373,17 @@ struct Args {
     #[arg(long = "fmath-errno", overrides_with = "fno_math_errno", help = gettext("Set errno after math functions computed in place (default)"))]
     fmath_errno: bool,
 
+    /// The program does not look at floating-point exception flags, so a
+    /// comparison whose answer no operand can change -- `x > +Inf` -- may
+    /// be folded although a NaN `x` would have raised `FE_INVALID`.
+    #[arg(long = "fno-trapping-math", help = gettext("Assume floating-point operations do not raise exceptions the program observes"))]
+    fno_trapping_math: bool,
+
+    /// Undo `-fno-trapping-math`: the default. Accepted so the last flag on
+    /// the line wins.
+    #[arg(long = "ftrapping-math", overrides_with = "fno_trapping_math", help = gettext("Keep every floating-point exception the program can observe (default)"))]
+    ftrapping_math: bool,
+
     /// Extra flags to pass through to the linker (set by preprocess_args)
     #[arg(long = "c17-linker-flag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
     linker_flags: Vec<String>,
@@ -1164,8 +1175,15 @@ fn process_file(
     }
 
     // Linearize to IR
-    let mut module =
-        ir::linearize::linearize(&ast, &symbols, &types, &strings, target, args.debug > 0);
+    let mut module = ir::linearize::linearize(
+        &ast,
+        &symbols,
+        &types,
+        &strings,
+        target,
+        args.debug > 0,
+        !args.fno_trapping_math,
+    );
 
     // Check for errors during linearization (e.g., unsupported global initializers)
     if diag::has_error() != 0 {
@@ -1546,8 +1564,6 @@ fn is_known_ignorable_f_flag(arg: &str) -> bool {
         // Floating point c17 already treats strictly.
         "-ffloat-store",
         "-fno-float-store",
-        "-fno-trapping-math",
-        "-ftrapping-math",
         "-fsigned-zeros",
         "-fno-signed-zeros",
         // Linkage and layout.
@@ -1731,6 +1747,8 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             || arg == "-fno-gnu89-inline"
             || arg == "-fmath-errno"
             || arg == "-fno-math-errno"
+            || arg == "-ftrapping-math"
+            || arg == "-fno-trapping-math"
         {
             result.push(format!("-{arg}"));
             i += 1;

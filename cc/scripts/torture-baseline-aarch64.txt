@@ -7103,6 +7103,7 @@ aarch64/ieee/fp-cmp-5@-O0
 aarch64/ieee/fp-cmp-5@-O2
 aarch64/ieee/fp-cmp-6@-O0
 aarch64/ieee/fp-cmp-6@-O2
+aarch64/ieee/fp-cmp-7@-O0
 aarch64/ieee/fp-cmp-7@-O2
 aarch64/ieee/fp-cmp-8e@-O0
 aarch64/ieee/fp-cmp-8e@-O2

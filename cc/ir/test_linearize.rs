@@ -82,6 +82,7 @@ impl TestContext {
             &self.strings,
             &target,
             false,
+            true,
         )
     }
 }
@@ -89,7 +90,7 @@ impl TestContext {
 fn test_linearize(tu: &TranslationUnit, types: &TypeTable, strings: &StringTable) -> Module {
     let symbols = SymbolTable::new();
     let target = Target::host();
-    linearize(tu, &symbols, types, strings, &target, false)
+    linearize(tu, &symbols, types, strings, &target, false, true)
 }
 
 fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) -> FunctionDef {
@@ -1893,6 +1894,39 @@ fn test_constant_condition_emits_only_the_taken_arm() {
     }
 }
 
+/// Under `-fno-trapping-math` a floating comparison no value can change the
+/// answer of decides its branch, as gcc's front end folds it at `-O0`; the
+/// unknown side is still evaluated. With trapping math, the default, it is
+/// a comparison like any other: a NaN operand would raise `FE_INVALID`.
+#[test]
+fn test_decided_float_comparison_folds_only_without_trapping_math() {
+    let src = "void dead(void); void live(void); double g(void);\n\
+               void f_gt(double x) { if (x > __builtin_inf()) dead(); }\n\
+               void f_lt(float y) { if (-__builtin_inff() > y) dead(); }\n\
+               void f_huge(double x) { if (x > 1e308 * 10) dead(); }\n\
+               void f_nan(double x) { if (x != __builtin_nan(\"\")) live(); else dead(); }\n\
+               void f_isgreater(double x) { if (__builtin_isgreater(x, __builtin_inf())) dead(); }\n\
+               void f_call(void) { if (g() > __builtin_inf()) dead(); }\n\
+               void f_le(double x) { if (x <= __builtin_inf()) live(); }\n";
+    let policy = Default::default();
+    let (module, _) = linearize_source_trapping(src, &Target::host(), policy, false);
+    for f in ["f_gt", "f_lt", "f_huge", "f_nan", "f_isgreater", "f_call"] {
+        assert!(!calls_in(&module, f).iter().any(|c| c == "dead"), "{f}");
+        assert!(!still_branches(&module, f), "{f}");
+    }
+    assert!(
+        calls_in(&module, "f_call").iter().any(|c| c == "g"),
+        "g() still runs"
+    );
+    // False for a NaN and true otherwise, so undecided.
+    assert!(still_branches(&module, "f_le"));
+
+    let (module, _) = linearize_source_trapping(src, &Target::host(), policy, true);
+    for f in ["f_gt", "f_lt", "f_huge", "f_nan", "f_isgreater", "f_call"] {
+        assert!(still_branches(&module, f), "{f} folded under trapping math");
+    }
+}
+
 /// Only a constant expression decides a branch. A `const` object is not one,
 /// and neither is a condition whose first operand must run.
 #[test]
@@ -3007,7 +3041,7 @@ fn test_linearize_with_symbols(
     strings: &StringTable,
 ) -> Module {
     let target = Target::host();
-    linearize(tu, symbols, types, strings, &target, false)
+    linearize(tu, symbols, types, strings, &target, false, true)
 }
 
 #[test]
@@ -7354,6 +7388,16 @@ fn linearize_source_under(
     target: &Target,
     policy: crate::parse::LibraryCallPolicy,
 ) -> (Module, TypeTable) {
+    linearize_source_trapping(src, target, policy, true)
+}
+
+/// [`linearize_source_under`], with `-f[no-]trapping-math` as given.
+fn linearize_source_trapping(
+    src: &str,
+    target: &Target,
+    policy: crate::parse::LibraryCallPolicy,
+    trapping_math: bool,
+) -> (Module, TypeTable) {
     let mut strings = StringTable::new();
     let mut tokenizer = crate::token::lexer::Tokenizer::new(src.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
@@ -7365,7 +7409,15 @@ fn linearize_source_under(
         parser.set_library_call_policy(policy);
         parser.parse_translation_unit().expect("parse")
     };
-    let module = linearize(&tu, &symbols, &types, &strings, target, false);
+    let module = linearize(
+        &tu,
+        &symbols,
+        &types,
+        &strings,
+        target,
+        false,
+        trapping_math,
+    );
     (module, types)
 }
 

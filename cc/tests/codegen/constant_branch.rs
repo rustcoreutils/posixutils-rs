@@ -212,3 +212,64 @@ fn constant_branch_debug_info_stays_coherent() {
         "the removed call leaves no line entry\n{asm}"
     );
 }
+
+/// gcc.c-torture ieee/fp-cmp-7's shape: nothing is greater than `+Inf`, so
+/// under `-fno-trapping-math` gcc drops the call at `-O0`, and the program
+/// links although `link_error` exists nowhere.
+const INF_COMPARE: &str = r#"
+extern void link_error(void);
+static int calls;
+static double next(double x) { calls++; return x; }
+static void foo(double x, float y, long double z) {
+    if (x > __builtin_inf()) link_error();
+    if (-__builtin_inf() > x) link_error();
+    if (y < -__builtin_inff()) link_error();
+    if (z > __builtin_infl()) link_error();
+    if (next(x) > 1e308 * 10) link_error();
+    if (__builtin_isgreater(x, __builtin_inf())) link_error();
+}
+int main(void) {
+    foo(1.0, 2.0f, 3.0L);
+    foo(__builtin_nan(""), __builtin_nanf(""), __builtin_nanl(""));
+    return calls == 2 ? 0 : 1;
+}
+"#;
+
+#[test]
+fn trapping_math_off_folds_a_comparison_no_value_changes() {
+    for level in ["-O0", "-O2"] {
+        let opts = [level.to_string(), "-fno-trapping-math".to_string()];
+        assert_eq!(compile_and_run("cbr_inf", INF_COMPARE, &opts), 0, "{level}");
+        if let Some(rc) = crate::common::compile_and_run_aarch64_with(
+            "cbr_inf_a64",
+            INF_COMPARE,
+            &[level, "-fno-trapping-math"],
+            &[],
+        ) {
+            assert_eq!(rc, 0, "aarch64 {level}");
+        }
+    }
+}
+
+/// With trapping math -- the default, or `-ftrapping-math` after
+/// `-fno-trapping-math` -- `-O0` keeps the comparison: a NaN operand raises
+/// `FE_INVALID`, which a folded one would not.
+#[test]
+fn trapping_math_keeps_the_comparison_at_o0() {
+    let src = "extern void link_error(void);\n\
+               void foo(double x) { if (x > __builtin_inf()) link_error(); }\n";
+    for opts in [
+        &["-O0"][..],
+        &["-O0", "-ftrapping-math"][..],
+        &["-O0", "-fno-trapping-math", "-ftrapping-math"][..],
+    ] {
+        let asm = asm_for_at("cbr_trap", src, opts);
+        assert!(mentions(&asm, "link_error"), "{opts:?}\n{asm}");
+    }
+    let asm = asm_for_at(
+        "cbr_notrap",
+        src,
+        &["-ftrapping-math", "-fno-trapping-math"],
+    );
+    assert!(!mentions(&asm, "link_error"), "the last flag wins\n{asm}");
+}

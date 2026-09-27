@@ -11,9 +11,10 @@
 use super::memexpand;
 use super::{BasicBlockId, CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
 use crate::abi::get_abi_for_conv;
+use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
-use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, MathErrno, UnaryOp};
+use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, FpCompare, MathErrno, UnaryOp};
 use crate::strings::StringId;
 use crate::types::{MemberInfo, TypeId, TypeKind};
 
@@ -50,6 +51,38 @@ struct ComplexHalfOps {
     eq: Opcode,
     ne: Opcode,
     integral: bool,
+}
+
+/// The floating comparison C's relational or equality operator `op` is.
+pub(crate) fn float_comparison(op: BinaryOp) -> Option<Opcode> {
+    Some(match op {
+        BinaryOp::Lt => Opcode::FCmpOLt,
+        BinaryOp::Gt => Opcode::FCmpOGt,
+        BinaryOp::Le => Opcode::FCmpOLe,
+        BinaryOp::Ge => Opcode::FCmpOGe,
+        BinaryOp::Eq => Opcode::FCmpOEq,
+        BinaryOp::Ne => Opcode::FCmpONe,
+        _ => return None,
+    })
+}
+
+/// The one floating comparison a member of the `isgreater` family is, or
+/// `None` for the two that take more than one (`islessgreater`,
+/// `isunordered`).
+pub(crate) fn fp_compare_opcode(cmp: FpCompare) -> Option<Opcode> {
+    Some(match cmp {
+        FpCompare::Greater => Opcode::FCmpOGt,
+        FpCompare::GreaterEqual => Opcode::FCmpOGe,
+        FpCompare::Less => Opcode::FCmpOLt,
+        FpCompare::LessEqual => Opcode::FCmpOLe,
+        // C23 7.12.17.1 has `iseqsig` raise `FE_INVALID` for an unordered
+        // pair, quiet NaN included -- the reverse of its siblings. The quiet
+        // compare emitted for it does not raise it for a quiet NaN. The
+        // *answer* is exact; only the exception flag differs -- the same gap
+        // c17's `<` and `>` have, which use this compare too.
+        FpCompare::Equal => Opcode::FCmpOEq,
+        FpCompare::LessGreater | FpCompare::Unordered => return None,
+    })
 }
 
 /// A controlling expression, evaluated for a branch.
@@ -975,111 +1008,95 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         let result = self.alloc_pseudo();
 
-        let opcode = match op {
-            BinaryOp::Add => {
-                if is_float {
-                    Opcode::FAdd
-                } else {
-                    Opcode::Add
+        let opcode = if let Some(fcmp) = float_comparison(op).filter(|_| is_float) {
+            fcmp
+        } else {
+            match op {
+                BinaryOp::Add => {
+                    if is_float {
+                        Opcode::FAdd
+                    } else {
+                        Opcode::Add
+                    }
                 }
-            }
-            BinaryOp::Sub => {
-                if is_float {
-                    Opcode::FSub
-                } else {
-                    Opcode::Sub
+                BinaryOp::Sub => {
+                    if is_float {
+                        Opcode::FSub
+                    } else {
+                        Opcode::Sub
+                    }
                 }
-            }
-            BinaryOp::Mul => {
-                if is_float {
-                    Opcode::FMul
-                } else {
-                    Opcode::Mul
+                BinaryOp::Mul => {
+                    if is_float {
+                        Opcode::FMul
+                    } else {
+                        Opcode::Mul
+                    }
                 }
-            }
-            BinaryOp::Div => {
-                if is_float {
-                    Opcode::FDiv
-                } else if is_unsigned {
-                    Opcode::DivU
-                } else {
-                    Opcode::DivS
+                BinaryOp::Div => {
+                    if is_float {
+                        Opcode::FDiv
+                    } else if is_unsigned {
+                        Opcode::DivU
+                    } else {
+                        Opcode::DivS
+                    }
                 }
-            }
-            BinaryOp::Mod => {
-                // Modulo is not supported for floats in hardware - use fmod() library call
-                // For now, use integer modulo (semantic analysis should catch float % float)
-                if is_unsigned {
-                    Opcode::ModU
-                } else {
-                    Opcode::ModS
+                BinaryOp::Mod => {
+                    // Modulo is not supported for floats in hardware - use fmod() library call
+                    // For now, use integer modulo (semantic analysis should catch float % float)
+                    if is_unsigned {
+                        Opcode::ModU
+                    } else {
+                        Opcode::ModS
+                    }
                 }
-            }
-            BinaryOp::Lt => {
-                if is_float {
-                    Opcode::FCmpOLt
-                } else if is_unsigned {
-                    Opcode::SetB
-                } else {
-                    Opcode::SetLt
+                BinaryOp::Lt => {
+                    if is_unsigned {
+                        Opcode::SetB
+                    } else {
+                        Opcode::SetLt
+                    }
                 }
-            }
-            BinaryOp::Gt => {
-                if is_float {
-                    Opcode::FCmpOGt
-                } else if is_unsigned {
-                    Opcode::SetA
-                } else {
-                    Opcode::SetGt
+                BinaryOp::Gt => {
+                    if is_unsigned {
+                        Opcode::SetA
+                    } else {
+                        Opcode::SetGt
+                    }
                 }
-            }
-            BinaryOp::Le => {
-                if is_float {
-                    Opcode::FCmpOLe
-                } else if is_unsigned {
-                    Opcode::SetBe
-                } else {
-                    Opcode::SetLe
+                BinaryOp::Le => {
+                    if is_unsigned {
+                        Opcode::SetBe
+                    } else {
+                        Opcode::SetLe
+                    }
                 }
-            }
-            BinaryOp::Ge => {
-                if is_float {
-                    Opcode::FCmpOGe
-                } else if is_unsigned {
-                    Opcode::SetAe
-                } else {
-                    Opcode::SetGe
+                BinaryOp::Ge => {
+                    if is_unsigned {
+                        Opcode::SetAe
+                    } else {
+                        Opcode::SetGe
+                    }
                 }
-            }
-            BinaryOp::Eq => {
-                if is_float {
-                    Opcode::FCmpOEq
-                } else {
-                    Opcode::SetEq
+                BinaryOp::Eq => Opcode::SetEq,
+                BinaryOp::Ne => Opcode::SetNe,
+                // LogAnd and LogOr are handled earlier in linearize_expr via
+                // emit_logical_and/emit_logical_or for proper short-circuit evaluation
+                BinaryOp::LogAnd | BinaryOp::LogOr => {
+                    unreachable!("LogAnd/LogOr should be handled in ExprKind::Binary")
                 }
-            }
-            BinaryOp::Ne => {
-                if is_float {
-                    Opcode::FCmpONe
-                } else {
-                    Opcode::SetNe
-                }
-            }
-            // LogAnd and LogOr are handled earlier in linearize_expr via
-            // emit_logical_and/emit_logical_or for proper short-circuit evaluation
-            BinaryOp::LogAnd | BinaryOp::LogOr => {
-                unreachable!("LogAnd/LogOr should be handled in ExprKind::Binary")
-            }
-            BinaryOp::BitAnd => Opcode::And,
-            BinaryOp::BitOr => Opcode::Or,
-            BinaryOp::BitXor => Opcode::Xor,
-            BinaryOp::Shl => Opcode::Shl,
-            BinaryOp::Shr => {
-                // Logical shift for unsigned, arithmetic for signed
-                if is_unsigned {
-                    Opcode::Lsr
-                } else {
-                    Opcode::Asr
+                BinaryOp::BitAnd => Opcode::And,
+                BinaryOp::BitOr => Opcode::Or,
+                BinaryOp::BitXor => Opcode::Xor,
+                BinaryOp::Shl => Opcode::Shl,
+                BinaryOp::Shr => {
+                    // Logical shift for unsigned, arithmetic for signed
+                    if is_unsigned {
+                        Opcode::Lsr
+                    } else {
+                        Opcode::Asr
+                    }
                 }
             }
         };
@@ -2130,7 +2147,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// A `const` object is not a constant expression, so `const int k = 0;
     /// if (k)` keeps its arm, as it does in gcc.
     pub(crate) fn constant_condition(&self, cond: &Expr) -> Option<bool> {
-        crate::constexpr::eval_truth(self, crate::constexpr::ConstScope::Standard, cond)
+        crate::constexpr::eval_truth(self, ConstScope::Standard, cond)
     }
 
     /// Evaluate a controlling expression for a branch: as the constant it is,
@@ -2144,6 +2161,9 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// branch, and one that does not leaves the right operand to decide it.
     pub(crate) fn controlling_value(&mut self, cond: &Expr) -> Controlling {
         if let Some(holds) = self.constant_condition(cond) {
+            return Controlling::Constant(holds);
+        }
+        if let Some(holds) = self.decided_float_comparison(cond) {
             return Controlling::Constant(holds);
         }
         if let ExprKind::Binary {
@@ -2161,6 +2181,45 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         }
         Controlling::Value(self.linearize_condition(cond))
+    }
+
+    /// A floating comparison of an unknown value with a constant that no
+    /// value can change the answer of -- `x > +Inf` is 0 whatever `x` is, a
+    /// NaN included -- under `-fno-trapping-math` only. The unknown operand is
+    /// still evaluated, for its side effects.
+    ///
+    /// gcc folds these at `-O0` exactly when trapping math is off: an ordered
+    /// comparison with a NaN raises `FE_INVALID`, and a folded one would not.
+    /// Which comparisons are decided is the optimizer's own rule
+    /// (`constfold::fcmp_against_constant`), asked of the constant as it
+    /// converts to the operands' common type -- `1e308 * 10` is `+Inf` as a
+    /// `double`. The `isgreater` family asks it too.
+    fn decided_float_comparison(&mut self, cond: &Expr) -> Option<bool> {
+        if self.trapping_math {
+            return None;
+        }
+        let (op, left, right) = match &cond.kind {
+            ExprKind::Binary { op, left, right } => (float_comparison(*op)?, left, right),
+            ExprKind::FpCompare { cmp, lhs, rhs } => (fp_compare_opcode(*cmp)?, lhs, rhs),
+            _ => return None,
+        };
+        let common = self.types.common_type(left.typ?, right.typ?);
+        let fmt = self.types.fp_format(common)?;
+        if !self.types.is_float(common) {
+            return None;
+        }
+        let known = |e: &Expr| {
+            crate::constexpr::eval_as_float(self, ConstScope::Standard, e, common)
+                .map(|v| v.round_to_format(fmt))
+        };
+        let (c, const_first, unknown) = match (known(left), known(right)) {
+            (None, Some(c)) => (c, false, left),
+            (Some(c), None) => (c, true, right),
+            _ => return None,
+        };
+        let holds = super::constfold::fcmp_against_constant(op, c, const_first)?;
+        self.linearize_expr(unknown);
+        Some(holds)
     }
 
     /// Branch from the current block to `then_bb` when `cond` holds and to

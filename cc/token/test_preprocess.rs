@@ -1550,6 +1550,33 @@ wmacro_signed
     }
 }
 
+/// An escape in a prefixed constant keeps the width of its type in `#if`
+/// too, and a `wchar_t` one its signedness: `L'\xffffffff'` is -1 where
+/// `wchar_t` is `int` and 4294967295 where it is `unsigned int`, as gcc says
+/// on both Linux targets. Escapes were cut to a byte, so `L'\x1234'` was 0x34.
+#[test]
+fn test_if_prefixed_escapes_keep_their_width() {
+    use crate::target::{Arch, Os};
+    let code = "#if L'\\x1234' == 0x1234 && u'\\x1234' == 0x1234 && U'\\x10000' == 0x10000
+wide
+#endif
+#if L'\\xffffffff' < 0
+negative
+#endif
+#if L'\\xffffffff' == 4294967295
+all_ones
+#endif";
+    for (arch, os, want) in [
+        (Arch::X86_64, Os::Linux, ["wide", "negative"]),
+        (Arch::Aarch64, Os::Linux, ["wide", "all_ones"]),
+        (Arch::Aarch64, Os::MacOS, ["wide", "negative"]),
+    ] {
+        let target = Target::new(arch, os);
+        let (tokens, idents) = preprocess_str_for(code, &target);
+        assert_eq!(get_token_strings(&tokens, &idents), want, "{arch}-{os}");
+    }
+}
+
 /// The predefined `__INTN_C(c)` macros paste their suffix onto the argument,
 /// as gcc's do, and the empty-suffix ones hand it back untouched.
 #[test]

@@ -330,8 +330,10 @@ pub enum ExprKind {
     /// String literal
     StringLit(String),
 
-    /// Wide string literal (L"...")
-    WideStringLit(String),
+    /// `L"..."` — the literal's `wchar_t` code units. Held as units, not as
+    /// text, because a unit an escape names need not be a character:
+    /// `L"\xffffffff"` has no `char`.
+    WideStringLit(Vec<u32>),
     /// `u"..."` — the literal's `char16_t` code units, surrogate pairs already
     /// formed. Held as units rather than text because the element width is
     /// what codegen emits.

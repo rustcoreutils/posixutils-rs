@@ -6319,17 +6319,12 @@ impl<'a> Linearizer<'a> {
                 self.emit_string_sym(expr, label)
             }
 
-            ExprKind::WideStringLit(s) => {
-                let label = self.module.add_wide_string(s.clone());
-                self.emit_string_sym(expr, label)
-            }
-
             ExprKind::Utf16StringLit(u) => {
                 let label = self.module.add_utf16_string(u.clone());
                 self.emit_string_sym(expr, label)
             }
 
-            ExprKind::Utf32StringLit(u) => {
+            ExprKind::WideStringLit(u) | ExprKind::Utf32StringLit(u) => {
                 let label = self.module.add_utf32_string(u.clone());
                 self.emit_string_sym(expr, label)
             }

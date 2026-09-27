@@ -1522,56 +1522,45 @@ impl<'a> Parser<'a> {
                     start_pos,
                 ))
             }
-            // wchar_t[N]. Like char16_t/char32_t below, its elements are code points rather than bytes, so the
-            // UTF-8 the lexer preserved is decoded here. Taking `bytes`
-            // straight through instead gave `L"café"` five elements, the first
-            // two being the halves of the UTF-8 pair.
+            // wchar_t[N], char16_t[N] and char32_t[N]. Their elements are
+            // code units rather than bytes, so the UTF-8 the lexer preserved
+            // is decoded here -- taking the bytes straight through gave
+            // `L"café"` five elements, the first two the halves of a UTF-8
+            // pair -- while a unit an escape names is kept as the number it
+            // is: `L"\xffffffff"` is one element, all ones. A character
+            // beyond the BMP becomes a surrogate pair in a `u"..."` literal.
             Some(TokenType::WideString) => {
                 let units = literal::literal_wide_chars(&elements);
-                let wstr_type = self
+                let t = self
                     .types
                     .intern(Type::array(self.types.wchar_id, units.len() + 1));
-                // `WideStringLit` carries one `char` per element.
-                let text: String = units
-                    .iter()
-                    .map(|&u| char::from_u32(u).unwrap_or('\u{fffd}'))
-                    .collect();
                 Ok(Self::typed_expr(
-                    ExprKind::WideStringLit(text),
-                    wstr_type,
+                    ExprKind::WideStringLit(units),
+                    t,
                     start_pos,
                 ))
             }
-            // char16_t[N] / char32_t[N]. These carry real code units rather
-            // than bytes, so the UTF-8 the lexer preserved is decoded here; a
-            // code point outside the BMP becomes a surrogate pair in the
-            // char16_t case.
-            Some(kind @ (TokenType::Utf16String | TokenType::Utf32String)) => {
-                let text: String = literal::literal_wide_chars(&elements)
-                    .into_iter()
-                    .map(|u| char::from_u32(u).unwrap_or('\u{fffd}'))
-                    .collect();
-                if kind == TokenType::Utf16String {
-                    let units: Vec<u16> = text.encode_utf16().collect();
-                    let t = self
-                        .types
-                        .intern(Type::array(self.types.char16_id, units.len() + 1));
-                    Ok(Self::typed_expr(
-                        ExprKind::Utf16StringLit(units),
-                        t,
-                        start_pos,
-                    ))
-                } else {
-                    let units: Vec<u32> = text.chars().map(|c| c as u32).collect();
-                    let t = self
-                        .types
-                        .intern(Type::array(self.types.char32_id, units.len() + 1));
-                    Ok(Self::typed_expr(
-                        ExprKind::Utf32StringLit(units),
-                        t,
-                        start_pos,
-                    ))
-                }
+            Some(TokenType::Utf16String) => {
+                let units = literal::literal_utf16_units(&elements);
+                let t = self
+                    .types
+                    .intern(Type::array(self.types.char16_id, units.len() + 1));
+                Ok(Self::typed_expr(
+                    ExprKind::Utf16StringLit(units),
+                    t,
+                    start_pos,
+                ))
+            }
+            Some(TokenType::Utf32String) => {
+                let units = literal::literal_wide_chars(&elements);
+                let t = self
+                    .types
+                    .intern(Type::array(self.types.char32_id, units.len() + 1));
+                Ok(Self::typed_expr(
+                    ExprKind::Utf32StringLit(units),
+                    t,
+                    start_pos,
+                ))
             }
             Some(_) => unreachable!("only string token types reach here"),
         }

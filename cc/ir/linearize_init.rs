@@ -276,20 +276,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
-            // Wide string literal - for arrays, store as WideString; for pointers, create label reference
-            ExprKind::WideStringLit(s) => {
-                let type_kind = self.types.kind(typ);
-                if type_kind == TypeKind::Array {
-                    // wchar_t array - embed the wide string directly
-                    Initializer::WideString(s.clone())
-                } else {
-                    // Pointer - create a wide string constant and reference it
-                    Initializer::SymAddr(self.module.add_wide_string(s.clone()))
-                }
-            }
-
-            // char16_t / char32_t string literals, same shape as the wide
-            // case: embedded for an array, interned and referenced otherwise.
+            // Prefixed string literals: embedded for an array, interned and
+            // referenced otherwise.
             ExprKind::Utf16StringLit(units) => {
                 if self.types.kind(typ) == TypeKind::Array {
                     Initializer::Utf16String(units.clone())
@@ -299,7 +287,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
-            ExprKind::Utf32StringLit(units) => {
+            // `wchar_t` is 4 bytes on every target, so a wide literal is laid
+            // out exactly as a `char32_t` one.
+            ExprKind::WideStringLit(units) | ExprKind::Utf32StringLit(units) => {
                 if self.types.kind(typ) == TypeKind::Array {
                     Initializer::Utf32String(units.clone())
                 } else {

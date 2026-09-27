@@ -2052,9 +2052,10 @@ impl<'a> super::linearize::Linearizer<'a> {
     fn string_literal_units(kind: &ExprKind) -> Option<Vec<i128>> {
         match kind {
             ExprKind::StringLit(s) => Some(s.chars().map(|c| (c as u32 as u8) as i128).collect()),
-            ExprKind::WideStringLit(s) => Some(s.chars().map(|c| c as u32 as i128).collect()),
             ExprKind::Utf16StringLit(u) => Some(u.iter().map(|c| *c as i128).collect()),
-            ExprKind::Utf32StringLit(u) => Some(u.iter().map(|c| *c as i128).collect()),
+            ExprKind::WideStringLit(u) | ExprKind::Utf32StringLit(u) => {
+                Some(u.iter().map(|c| *c as i128).collect())
+            }
             _ => None,
         }
     }
@@ -2261,15 +2262,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let lit = lit.clone();
                 Some((self.module.add_string(lit), 0))
             }
-            ExprKind::WideStringLit(lit) => {
-                let lit = lit.clone();
-                Some((self.module.add_wide_string(lit), 0))
-            }
             ExprKind::Utf16StringLit(units) => {
                 let units = units.clone();
                 Some((self.module.add_utf16_string(units), 0))
             }
-            ExprKind::Utf32StringLit(units) => {
+            ExprKind::WideStringLit(units) | ExprKind::Utf32StringLit(units) => {
                 let units = units.clone();
                 Some((self.module.add_utf32_string(units), 0))
             }

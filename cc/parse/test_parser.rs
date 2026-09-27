@@ -4491,7 +4491,7 @@ fn test_wide_string_literal_basic() {
     let (expr, types, _, _) = parse_expr("L\"hello\"").unwrap();
     match &expr.kind {
         ExprKind::WideStringLit(s) => {
-            assert_eq!(s, "hello");
+            assert_eq!(s, &"hello".chars().map(u32::from).collect::<Vec<_>>());
         }
         _ => panic!("Expected WideStringLit, got {:?}", expr.kind),
     }
@@ -4511,7 +4511,7 @@ fn test_wide_string_literal_concatenation() {
     let (expr, _, _, _) = parse_expr("L\"hello\" L\" world\"").unwrap();
     match &expr.kind {
         ExprKind::WideStringLit(s) => {
-            assert_eq!(s, "hello world");
+            assert_eq!(s, &"hello world".chars().map(u32::from).collect::<Vec<_>>());
         }
         _ => panic!("Expected WideStringLit, got {:?}", expr.kind),
     }
@@ -5706,6 +5706,61 @@ fn test_wide_char_literal() {
     let (expr, types, _, _) = parse_expr("L'A'").unwrap();
     assert!(matches!(expr.kind, ExprKind::CharLit(65)));
     assert_eq!(expr.typ, Some(types.wchar_id));
+}
+
+/// An escape in a prefixed literal is bounded by the element type, not by a
+/// byte (C17 6.4.4.4p9): `L'\x1234'` is 0x1234 where it was 0x34, and a
+/// `wchar_t` unit takes the target's signedness -- `L'\xffffffff'` is -1
+/// where `wchar_t` is `int` and 4294967295 where it is `unsigned int`.
+#[test]
+fn test_prefixed_escapes_keep_their_width() {
+    use crate::target::{Arch, Os};
+    for (arch, os, all_ones) in [
+        (Arch::X86_64, Os::Linux, -1i64),
+        (Arch::Aarch64, Os::Linux, 0xffff_ffff),
+        (Arch::Aarch64, Os::MacOS, -1),
+    ] {
+        let parse = |src: &str| {
+            let mut strings = StringTable::new();
+            let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);
+            let tokens = tokenizer.tokenize();
+            let mut symbols = SymbolTable::new();
+            let mut types = TypeTable::new(&Target::new(arch, os));
+            let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+            parser.skip_stream_tokens();
+            parser.parse_expression().unwrap().kind
+        };
+        for (src, want) in [
+            ("L'\\x1234'", 0x1234),
+            ("L'\\777'", 0o777),
+            ("L'\\xffffffff'", all_ones),
+            ("u'\\x1234'", 0x1234),
+            ("u'\\x12345'", 0x2345),
+            ("U'\\xffffffff'", 0xffff_ffff),
+        ] {
+            assert!(
+                matches!(parse(src), ExprKind::CharLit(v) if v == want),
+                "{src} on {arch}-{os}: {:?}",
+                parse(src)
+            );
+        }
+        match parse("L\"\\x1234\\xffffffff\\U0001F600\"") {
+            ExprKind::WideStringLit(u) => assert_eq!(u, [0x1234, 0xffff_ffff, 0x1f600]),
+            other => panic!("{other:?}"),
+        }
+        // A character beyond the BMP is a surrogate pair in UTF-16; an
+        // escaped unit is not a character and is never encoded.
+        match parse("u\"\\xd800\\U0001F600\\x12345\"") {
+            ExprKind::Utf16StringLit(u) => assert_eq!(u, [0xd800, 0xd83d, 0xde00, 0x2345]),
+            other => panic!("{other:?}"),
+        }
+        match parse("U\"\\xffffffff\\777\"") {
+            ExprKind::Utf32StringLit(u) => assert_eq!(u, [0xffff_ffff, 0o777]),
+            other => panic!("{other:?}"),
+        }
+        // A narrow literal still takes the low eight bits.
+        assert!(matches!(parse("'\\x141'"), ExprKind::CharLit(0x41)));
+    }
 }
 
 /// A prefixed literal takes the target's `wchar_t`, `char16_t` or

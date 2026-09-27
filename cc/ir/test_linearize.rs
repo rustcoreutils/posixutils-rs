@@ -3450,7 +3450,7 @@ fn test_wide_string_literal_expression() {
         name: test_id,
         params: vec![],
         body: Stmt::Return(Some(Expr::typed_unpositioned(
-            ExprKind::WideStringLit("hello".to_string()),
+            ExprKind::WideStringLit("hello".chars().map(u32::from).collect()),
             wchar_ptr_type,
         ))),
         pos: test_pos(),
@@ -3466,20 +3466,16 @@ fn test_wide_string_literal_expression() {
 
     let module = test_linearize(&tu, &types, &strings);
 
-    // Check that wide string was added to the module
+    // A wide literal is interned with the other 4-byte-unit literals:
+    // wchar_t is 4 bytes on every target, laid out as char32_t is.
+    let (label, content) = &module.utf32_strings[0];
     assert!(
-        !module.wide_strings.is_empty(),
-        "Wide string literal should be added to module.wide_strings"
-    );
-
-    // Check label format
-    let (label, content) = &module.wide_strings[0];
-    assert!(
-        label.starts_with(".LWC"),
-        "Wide string label should start with .LWC, got: {}",
+        label.starts_with(".LU32C"),
+        "4-byte-unit literal label should start with .LU32C, got: {}",
         label
     );
-    assert_eq!(content, "hello", "Wide string content should match");
+    let hello: Vec<u32> = "hello".chars().map(u32::from).collect();
+    assert_eq!(content, &hello, "Wide string content should match");
 }
 
 #[test]
@@ -3499,11 +3495,11 @@ fn test_wide_string_literal_is_pure() {
         ExprKind::Conditional {
             cond: Box::new(Expr::var_typed(cond_sym, int_type)),
             then_expr: Box::new(Expr::typed_unpositioned(
-                ExprKind::WideStringLit("yes".to_string()),
+                ExprKind::WideStringLit("yes".chars().map(u32::from).collect()),
                 wchar_ptr_type,
             )),
             else_expr: Box::new(Expr::typed_unpositioned(
-                ExprKind::WideStringLit("no".to_string()),
+                ExprKind::WideStringLit("no".chars().map(u32::from).collect()),
                 wchar_ptr_type,
             )),
         },

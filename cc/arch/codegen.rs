@@ -658,27 +658,6 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                     self.push_directive(Directive::Zero(size - bytes_emitted));
                 }
             }
-            Initializer::WideString(s) => {
-                // Emit wide string as sequence of 4-byte values (wchar_t is 4 bytes
-                // on every target, `int` or `unsigned int` by the ABI)
-                // -- at most as many as fit, for the reason `String` truncates.
-                // A flexible array member has no bound; see `String`.
-                let room = if size == 0 { usize::MAX } else { size / 4 };
-                let mut emitted = 0;
-                for ch in s.chars().take(room) {
-                    self.push_directive(Directive::Long(ch as i64));
-                    emitted += 4;
-                }
-                // The null terminator is part of the value only when there is
-                // room for it: `wchar_t w[3] = L"abc"` holds no terminator.
-                if size == 0 || emitted + 4 <= size {
-                    self.push_directive(Directive::Long(0));
-                    emitted += 4;
-                }
-                if size > emitted {
-                    self.push_directive(Directive::Zero(size - emitted));
-                }
-            }
             Initializer::Utf16String(units) => {
                 // char16_t: 2 bytes per code unit.
                 // A flexible array member has no bound; see `String`.
@@ -697,7 +676,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 }
             }
             Initializer::Utf32String(units) => {
-                // char32_t: 4 bytes per code point.
+                // char32_t, and wchar_t: 4 bytes per code unit.
                 // A flexible array member has no bound; see `String`.
                 let room = if size == 0 { usize::MAX } else { size / 4 };
                 let mut emitted = 0;
@@ -856,31 +835,6 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         self.push_directive(Directive::Text);
     }
 
-    /// Emit wide string literals to the rodata section
-    /// Each character is output as a 4-byte value: `wchar_t` is 4 bytes on
-    /// every target, `int` or `unsigned int` by the ABI
-    pub fn emit_wide_strings(&mut self, wide_strings: &[(String, String)]) {
-        if wide_strings.is_empty() {
-            return;
-        }
-
-        self.push_directive(Directive::Rodata);
-        // wchar_t is 4 bytes: two, as a power of two.
-        self.push_directive(Directive::Align(2));
-
-        for (label, content) in wide_strings {
-            self.push_directive(Directive::local_label(label));
-            // Emit each character as a 4-byte value
-            for ch in content.chars() {
-                self.push_directive(Directive::Long(ch as i64));
-            }
-            // Null terminator
-            self.push_directive(Directive::Long(0));
-        }
-
-        self.push_directive(Directive::Text);
-    }
-
     /// Emit `u"..."` literals referenced by address.
     pub fn emit_utf16_strings(&mut self, strings: &[(String, Vec<u16>)]) {
         if strings.is_empty() {
@@ -898,7 +852,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         self.push_directive(Directive::Text);
     }
 
-    /// Emit `U"..."` literals referenced by address.
+    /// Emit `U"..."` and `L"..."` literals referenced by address.
     pub fn emit_utf32_strings(&mut self, strings: &[(String, Vec<u32>)]) {
         if strings.is_empty() {
             return;

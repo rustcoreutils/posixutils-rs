@@ -2337,11 +2337,10 @@ pub enum Initializer {
     Float128(FloatVal),
     /// String literal initializer (for char arrays)
     String(String),
-    /// Wide string literal initializer (for wchar_t arrays)
-    WideString(String),
     /// A `u"..."` initializer: char16_t code units.
     Utf16String(Vec<u16>),
-    /// A `U"..."` initializer: char32_t code points.
+    /// A `U"..."` or `L"..."` initializer: 4-byte code units, which is what
+    /// both `char32_t` and `wchar_t` are on every target.
     Utf32String(Vec<u32>),
     /// Array initializer: element size in bytes, list of (offset, initializer) pairs
     /// Elements not listed are zero-initialized
@@ -2378,7 +2377,6 @@ impl Initializer {
             // A zero-length string is all-zero; a non-empty char array initialized
             // by a string literal is zero iff every byte is `\0`.
             Initializer::String(s) => s.chars().all(|c| c == '\0'),
-            Initializer::WideString(s) => s.chars().all(|c| c == '\0'),
             Initializer::Utf16String(u) => u.iter().all(|&c| c == 0),
             Initializer::Utf32String(u) => u.iter().all(|&c| c == 0),
             Initializer::Array { elements, .. } => {
@@ -2411,7 +2409,6 @@ impl Initializer {
             | Initializer::Int(_)
             | Initializer::Float(_)
             | Initializer::String(_)
-            | Initializer::WideString(_)
             | Initializer::Utf16String(_)
             | Initializer::Utf32String(_) => false,
         }
@@ -2425,7 +2422,6 @@ impl fmt::Display for Initializer {
             Initializer::Int(v) => write!(f, "{}", v),
             Initializer::Float(v) | Initializer::Float128(v) => write!(f, "{}", v),
             Initializer::String(s) => write!(f, "\"{}\"", s.escape_default()),
-            Initializer::WideString(s) => write!(f, "L\"{}\"", s.escape_default()),
             Initializer::Utf16String(u) => write!(f, "u\"<{} units>\"", u.len()),
             Initializer::Utf32String(u) => write!(f, "U\"<{} units>\"", u.len()),
             Initializer::Array {
@@ -2575,11 +2571,10 @@ pub struct Module {
     pub globals: Vec<GlobalDef>,
     /// String literals (label, content)
     pub strings: Vec<(String, String)>,
-    /// Wide string literals (label, content)
-    pub wide_strings: Vec<(String, String)>,
     /// `u"..."` literals referenced by address, as char16_t code units.
     pub utf16_strings: Vec<(String, Vec<u16>)>,
-    /// `U"..."` literals referenced by address, as char32_t code points.
+    /// `U"..."` and `L"..."` literals referenced by address, as 4-byte code
+    /// units.
     pub utf32_strings: Vec<(String, Vec<u32>)>,
     /// Generate debug info
     pub debug: bool,
@@ -2770,13 +2765,6 @@ impl Module {
         label
     }
 
-    /// Add a wide string literal and return its label
-    pub fn add_wide_string(&mut self, content: String) -> String {
-        let label = format!(".LWC{}", self.wide_strings.len());
-        self.wide_strings.push((label.clone(), content));
-        label
-    }
-
     /// Intern a `u"..."` literal and return its label.
     pub fn add_utf16_string(&mut self, units: Vec<u16>) -> String {
         let label = format!(".LU16C{}", self.utf16_strings.len());
@@ -2784,7 +2772,7 @@ impl Module {
         label
     }
 
-    /// Intern a `U"..."` literal and return its label.
+    /// Intern a `U"..."` or `L"..."` literal and return its label.
     pub fn add_utf32_string(&mut self, units: Vec<u32>) -> String {
         let label = format!(".LU32C{}", self.utf32_strings.len());
         self.utf32_strings.push((label.clone(), units));

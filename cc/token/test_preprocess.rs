@@ -1998,3 +1998,21 @@ fn test_dash_i_header_is_not_a_system_dependency() {
         ]
     );
 }
+
+/// `__has_builtin` answers for the `_Float128` constants only where the type
+/// exists, in a directive and in running text alike; the `_Float16` ones
+/// exist everywhere.
+#[test]
+fn test_has_builtin_float128_constants_follow_the_target() {
+    use crate::target::{Arch, Os};
+    let code = "#if __has_builtin(__builtin_nanf128)\nYES\n#else\nNO\n#endif\n\
+                __has_builtin(__builtin_inff128) __has_builtin(__builtin_inff16)\n";
+    for (os, want) in [
+        (Os::Linux, ["YES", "1", "1"]),
+        (Os::MacOS, ["NO", "0", "1"]),
+    ] {
+        let target = Target::new(Arch::Aarch64, os);
+        let (tokens, idents) = preprocess_str_for(code, &target);
+        assert_eq!(get_token_strings(&tokens, &idents), want, "{os:?}");
+    }
+}

@@ -2280,7 +2280,9 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         };
 
         // Use centralized builtin registry
-        if crate::builtins::is_builtin(name.as_str()) {
+        if crate::builtins::is_builtin(name.as_str())
+            && crate::builtins::available_on(name.as_str(), self.pp.target)
+        {
             1
         } else {
             0

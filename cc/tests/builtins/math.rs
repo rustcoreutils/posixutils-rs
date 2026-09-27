@@ -1638,3 +1638,94 @@ fn builtins_sign_ops_of_constants_fold() {
         }
     }
 }
+
+/// The `_FloatN` infinity and NaN builtins, bit for bit as gcc emits them on
+/// both targets, at run time and in a static initializer, at -O0 and -O2;
+/// `__has_builtin` knows each. `_Float128` exists wherever `__float128`
+/// does, which is not macOS.
+const FLOAT_N_CONSTANTS_PROGRAM: &str = r#"
+typedef unsigned short u16; typedef unsigned int u32; typedef unsigned long long u64;
+static u16 b16(_Float16 v) { u16 u; __builtin_memcpy(&u, &v, 2); return u; }
+static u32 b32(_Float32 v) { u32 u; __builtin_memcpy(&u, &v, 4); return u; }
+static u64 b64(_Float64 v) { u64 u; __builtin_memcpy(&u, &v, 8); return u; }
+#if !__has_builtin(__builtin_inff16) || !__has_builtin(__builtin_nansf16) \
+    || !__has_builtin(__builtin_huge_valf32) || !__has_builtin(__builtin_nanf64)
+#error "a _FloatN builtin is missing"
+#endif
+static const _Float16 s16[] = { __builtin_inff16(), __builtin_nanf16("0x12"), __builtin_nansf16("") };
+static const _Float32 s32 = __builtin_nansf32("0x5");
+static const _Float64 s64 = __builtin_huge_valf64();
+#ifdef __linux__
+#if !__has_builtin(__builtin_nanf128)
+#error "__builtin_nanf128 is missing"
+#endif
+static u64 hi(_Float128 v) { u64 u[2]; __builtin_memcpy(u, &v, 16); return u[1]; }
+static u64 lo(_Float128 v) { u64 u[2]; __builtin_memcpy(u, &v, 16); return u[0]; }
+static const _Float128 s128 = __builtin_nansf128("0x1234");
+static int check128(void) {
+    if (hi(__builtin_inff128()) != 0x7fff000000000000ull || lo(__builtin_inff128())) return 1;
+    if (hi(__builtin_huge_valf128()) != 0x7fff000000000000ull) return 2;
+    if (hi(__builtin_nanf128("0x1234")) != 0x7fff800000000000ull) return 3;
+    if (lo(__builtin_nanf128("0x1234")) != 0x1234) return 4;
+    if (hi(__builtin_nansf128("")) != 0x7fff400000000000ull || lo(__builtin_nansf128(""))) return 5;
+    if (hi(s128) != 0x7fff000000000000ull || lo(s128) != 0x1234) return 6;
+    return 0;
+}
+#else
+static int check128(void) { return 0; }
+#endif
+int main(void) {
+    if (b16(__builtin_inff16()) != 0x7c00 || b16(__builtin_huge_valf16()) != 0x7c00) return 10;
+    if (b16(__builtin_nanf16("")) != 0x7e00 || b16(__builtin_nanf16("0xfff")) != 0x7fff) return 11;
+    if (b16(__builtin_nansf16("0x12")) != 0x7c12) return 12;
+    if (b16(s16[0]) != 0x7c00 || b16(s16[1]) != 0x7e12 || b16(s16[2]) != 0x7d00) return 13;
+    if (b32(__builtin_inff32()) != 0x7f800000 || b32(__builtin_nanf32("0x5")) != 0x7fc00005) return 20;
+    if (b32(s32) != 0x7f800005) return 21;
+    if (b64(__builtin_inff64()) != 0x7ff0000000000000ull) return 30;
+    if (b64(__builtin_nansf64("")) != 0x7ff4000000000000ull) return 31;
+    if (b64(s64) != 0x7ff0000000000000ull) return 32;
+    int r = check128();
+    return r ? 40 + r : 0;
+}
+"#;
+
+#[test]
+fn builtins_float_n_constants() {
+    for opt in ["-O0", "-O2"] {
+        let name = format!("float_n_consts{opt}");
+        assert_eq!(
+            compile_and_run(&name, FLOAT_N_CONSTANTS_PROGRAM, &[opt.to_string()]),
+            0,
+            "host {opt}"
+        );
+        if let Some(rc) =
+            compile_and_run_aarch64(&format!("{name}_a64"), FLOAT_N_CONSTANTS_PROGRAM, opt)
+        {
+            assert_eq!(rc, 0, "aarch64 {opt}");
+        }
+    }
+}
+
+/// `<math.h>` from a glibc that thinks c17 predates gcc 7 defines some of
+/// these builtins as macros over the double forms; a program that includes
+/// it and also names the builtins still compiles, and the infinities and
+/// default NaNs agree either way.
+#[test]
+fn builtins_float_n_constants_with_math_h() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let code = r#"
+#include <math.h>
+#include <string.h>
+int main(void) {
+    _Float32 f = __builtin_inff32();
+    _Float64 d = __builtin_nanf64("");
+    _Float128 q = __builtin_huge_valf128(), n = __builtin_nanf128("");
+    _Float128 inf = HUGE_VAL;
+    if (!isinf(f) || !isnan(d) || memcmp(&q, &inf, 16) != 0 || !__builtin_isnan(n)) return 1;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("float_n_math_h", code, &[]), 0);
+}

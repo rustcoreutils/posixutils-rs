@@ -107,6 +107,12 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 | `__builtin_nansf(str)` | Signaling NaN (`float`) |
 | `__builtin_nansl(str)` | Signaling NaN (`long double`) |
 
+Each also has `f16`, `f32`, `f64` and `f128` forms (`__builtin_inff16()`,
+`__builtin_nansf128(str)`, ...) giving a `_Float16`, `float`, `double` and
+`_Float128` respectively; the `f128` forms exist only where `_Float128` does,
+which is not macOS. A NaN's string names its payload; one that does not parse
+as a number makes the quiet forms a call to `nan`, `nanf16` and so on.
+
 ## Library Functions Computed in Place
 
 `abs`, `labs`, `llabs`, `imaxabs`, `fabs`, `fabsf`, `fabsl`, `copysign`,

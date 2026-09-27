@@ -5167,7 +5167,7 @@ fn test_builtin_nans() {
     assert_eq!(expr.typ, Some(types.double_id));
 }
 
-/// The encoding of the NaN constant `src` parses to, at `fmt`.
+/// The encoding of the floating constant `src` parses to, at `fmt`.
 fn nan_bits(src: &str, fmt: crate::float::FpFormat) -> u128 {
     let (expr, _, _, _) = parse_expr(src).unwrap();
     match expr.kind {
@@ -5234,6 +5234,167 @@ fn test_builtin_nanl_payload() {
         _ => 0x7ff8_0000_0000_1234,
     };
     assert!(matches!(expr.kind, ExprKind::FloatLit(v) if v.to_bits(fmt) == want));
+}
+
+/// The `_FloatN` forms of the infinity and NaN builtins: each is a constant
+/// of the type its suffix names -- `_Float32` and `_Float64` being `float`
+/// and `double` here -- whose encoding is gcc's, payload and all.
+#[test]
+fn test_builtin_float_n_constants() {
+    use crate::float::FpFormat::{Binary128, Binary16, Binary32, Binary64};
+    type Want = fn(&TypeTable) -> crate::types::TypeId;
+    let cases: &[(&str, Want, crate::float::FpFormat, u128)] = &[
+        ("__builtin_inff16()", |t| t.float16_id, Binary16, 0x7c00),
+        (
+            "__builtin_huge_valf16()",
+            |t| t.float16_id,
+            Binary16,
+            0x7c00,
+        ),
+        ("__builtin_nanf16(\"\")", |t| t.float16_id, Binary16, 0x7e00),
+        (
+            "__builtin_nanf16(\"0x12\")",
+            |t| t.float16_id,
+            Binary16,
+            0x7e12,
+        ),
+        (
+            "__builtin_nanf16(\"0xfff\")",
+            |t| t.float16_id,
+            Binary16,
+            0x7fff,
+        ),
+        (
+            "__builtin_nansf16(\"\")",
+            |t| t.float16_id,
+            Binary16,
+            0x7d00,
+        ),
+        (
+            "__builtin_nansf16(\"0x12\")",
+            |t| t.float16_id,
+            Binary16,
+            0x7c12,
+        ),
+        ("__builtin_inff32()", |t| t.float_id, Binary32, 0x7f80_0000),
+        (
+            "__builtin_huge_valf32()",
+            |t| t.float_id,
+            Binary32,
+            0x7f80_0000,
+        ),
+        (
+            "__builtin_nanf32(\"0x5\")",
+            |t| t.float_id,
+            Binary32,
+            0x7fc0_0005,
+        ),
+        (
+            "__builtin_nansf32(\"\")",
+            |t| t.float_id,
+            Binary32,
+            0x7fa0_0000,
+        ),
+        (
+            "__builtin_inff64()",
+            |t| t.double_id,
+            Binary64,
+            0x7ff0 << 48,
+        ),
+        (
+            "__builtin_huge_valf64()",
+            |t| t.double_id,
+            Binary64,
+            0x7ff0 << 48,
+        ),
+        (
+            "__builtin_nanf64(\"0x5\")",
+            |t| t.double_id,
+            Binary64,
+            0x7ff8_0000_0000_0005,
+        ),
+        (
+            "__builtin_nansf64(\"\")",
+            |t| t.double_id,
+            Binary64,
+            0x7ff4 << 48,
+        ),
+    ];
+    let binary128: &[(&str, u128)] = &[
+        ("__builtin_inff128()", 0x7fff << 112),
+        ("__builtin_huge_valf128()", 0x7fff << 112),
+        ("__builtin_nanf128(\"0x1234\")", 0x7fff8 << 108 | 0x1234),
+        ("__builtin_nansf128(\"\")", 0x7fff4 << 108),
+        ("__builtin_nansf128(\"0x1234\")", 0x7fff << 112 | 0x1234),
+    ];
+    for &(src, want, fmt, bits) in cases {
+        let (expr, types, _, _) = parse_expr(src).unwrap();
+        assert_eq!(expr.typ, Some(want(&types)), "{src}");
+        assert_eq!(nan_bits(src, fmt), bits, "{src}");
+    }
+    for &(src, bits) in binary128 {
+        let (expr, types, _, _) = parse_expr(src).unwrap();
+        if types.has_float128() {
+            assert_eq!(expr.typ, Some(types.float128_id), "{src}");
+            assert_eq!(nan_bits(src, Binary128), bits, "{src}");
+        }
+    }
+}
+
+/// A `_FloatN` NaN whose string is not a payload calls the library function
+/// gcc calls, `nanf16` and so on, whose type is the builtin's.
+#[test]
+fn test_builtin_nan_float_n_of_a_malformed_string_is_a_call() {
+    for (src, float16) in [
+        ("__builtin_nanf16(\"abc\")", true),
+        ("__builtin_nanf32(\"abc\")", false),
+    ] {
+        let (expr, types, _, _) = parse_expr(src).unwrap();
+        assert!(matches!(expr.kind, ExprKind::Call { .. }), "{src}");
+        let want = if float16 {
+            types.float16_id
+        } else {
+            types.float_id
+        };
+        assert_eq!(expr.typ, Some(want), "{src}");
+    }
+}
+
+/// `__builtin_nanf128` is a `_Float128` wherever the target has one -- on
+/// aarch64 Linux too, where `long double` has the same format but is another
+/// type -- and an error where it has none.
+#[test]
+fn test_builtin_float128_constant_follows_the_target() {
+    use crate::target::{Arch, Os};
+    for (arch, os, supported) in [
+        (Arch::X86_64, Os::Linux, true),
+        (Arch::Aarch64, Os::Linux, true),
+        (Arch::Aarch64, Os::MacOS, false),
+    ] {
+        let src = "__builtin_nanf128(\"0x1\")";
+        let mut strings = StringTable::new();
+        let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);
+        let tokens = tokenizer.tokenize();
+        let mut symbols = SymbolTable::new();
+        let mut types = TypeTable::new(&Target::new(arch, os));
+        let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+        parser.skip_stream_tokens();
+        let result = parser.parse_expression();
+        match (result, supported) {
+            (Ok(expr), true) => {
+                assert_eq!(expr.typ, Some(types.float128_id), "{arch}-{os}");
+                let ExprKind::FloatLit(v) = expr.kind else {
+                    panic!("{arch}-{os}: {:?}", expr.kind);
+                };
+                assert_eq!(
+                    v.to_bits(crate::float::FpFormat::Binary128),
+                    0x7fff8 << 108 | 1
+                );
+            }
+            (Err(e), false) => assert!(e.to_string().contains("not supported"), "{e}"),
+            (other, _) => panic!("{arch}-{os}: {other:?}"),
+        }
+    }
 }
 
 /// A string gcc does not fold is left to the library, as gcc leaves it:

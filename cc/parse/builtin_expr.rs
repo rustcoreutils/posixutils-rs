@@ -17,7 +17,7 @@ use super::ast::{
 use super::library_builtin::LibraryBuiltin;
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
-use crate::float::FloatVal;
+use crate::float::{FloatVal, NanKind};
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
 use crate::token::lexer::Position;
@@ -707,40 +707,13 @@ impl Parser<'_> {
         name_id: StringId,
         token_pos: Position,
     ) -> Option<ParseResult<Expr>> {
+        if let Some(&(_, value, suffix)) = FLOAT_CONSTANT_BUILTINS
+            .iter()
+            .find(|(id, _, _)| *id == name_id)
+        {
+            return Some(self.parse_float_constant_builtin(name_id, value, suffix, token_pos));
+        }
         match name_id {
-            crate::kw::BUILTIN_INF | crate::kw::BUILTIN_HUGE_VAL => Some((|| {
-                self.expect_special(b'(')?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::FloatLit(FloatVal::infinity(false)),
-                    self.types.double_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_INFF | crate::kw::BUILTIN_HUGE_VALF => Some((|| {
-                self.expect_special(b'(')?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::FloatLit(FloatVal::infinity(false)),
-                    self.types.float_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_INFL | crate::kw::BUILTIN_HUGE_VALL => Some((|| {
-                self.expect_special(b'(')?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::FloatLit(FloatVal::infinity(false)),
-                    self.types.longdouble_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_NAN
-            | crate::kw::BUILTIN_NANF
-            | crate::kw::BUILTIN_NANL
-            | crate::kw::BUILTIN_NANS
-            | crate::kw::BUILTIN_NANSF
-            | crate::kw::BUILTIN_NANSL => Some(self.parse_builtin_nan(name_id, token_pos)),
             // FLT_ROUNDS - returns current rounding mode (1 = to nearest)
             crate::kw::BUILTIN_FLT_ROUNDS => Some((|| {
                 self.expect_special(b'(')?;
@@ -2028,59 +2001,77 @@ impl Parser<'_> {
         }
     }
 
-    /// `__builtin_nan`, `__builtin_nans` and their `f`/`l` forms: the NaN
-    /// of the result type whose payload the string argument names.
+    /// The floating type `suffix` names, or `None` where the target has no
+    /// such type: `_Float128` is `__float128`, which macOS lacks.
+    fn float_suffix_type(&self, suffix: FloatSuffix) -> Option<TypeId> {
+        let t = &self.types;
+        Some(match suffix {
+            FloatSuffix::Double | FloatSuffix::F64 => t.double_id,
+            FloatSuffix::Float | FloatSuffix::F32 => t.float_id,
+            FloatSuffix::LongDouble => t.longdouble_id,
+            FloatSuffix::F16 => t.float16_id,
+            FloatSuffix::F128 if t.has_float128() => t.float128_id,
+            FloatSuffix::F128 => return None,
+        })
+    }
+
+    /// An infinity or NaN builtin ([`FLOAT_CONSTANT_BUILTINS`]): a constant
+    /// of the type its suffix names.
     ///
-    /// A string literal that parses as gcc parses it (see [`nan_payload`])
-    /// is a constant, carrying that payload -- quiet for `nan`, signalling
-    /// for `nans`. Anything else is not folded, which is gcc's behaviour
-    /// too: the `nan` forms become a call to the library function of the
-    /// same name, which reads the string at run time, and the `nans` forms,
-    /// which have no library function, are an error here where gcc's is a
-    /// link failure.
-    fn parse_builtin_nan(&mut self, name_id: StringId, token_pos: Position) -> ParseResult<Expr> {
-        use crate::float::NanKind;
-        let (typ, kind, library) = match name_id {
-            crate::kw::BUILTIN_NAN => (self.types.double_id, NanKind::Quiet, "nan"),
-            crate::kw::BUILTIN_NANF => (self.types.float_id, NanKind::Quiet, "nanf"),
-            crate::kw::BUILTIN_NANL => (self.types.longdouble_id, NanKind::Quiet, "nanl"),
-            crate::kw::BUILTIN_NANS => (self.types.double_id, NanKind::Signalling, "nans"),
-            crate::kw::BUILTIN_NANSF => (self.types.float_id, NanKind::Signalling, "nansf"),
-            _ => (self.types.longdouble_id, NanKind::Signalling, "nansl"),
-        };
+    /// A NaN's string argument, when it is a literal that parses as gcc
+    /// parses it (see [`nan_payload`]), is the payload -- quiet for `nan`,
+    /// signalling for `nans`. Anything else is not folded, which is gcc's
+    /// behaviour too: the `nan` forms become a call to the library function
+    /// of the same name (`nanf16` and so on), which reads the string at run
+    /// time, and the `nans` forms, which have no library function, are an
+    /// error here where gcc's is a link failure.
+    fn parse_float_constant_builtin(
+        &mut self,
+        name_id: StringId,
+        value: FloatConstant,
+        suffix: FloatSuffix,
+        token_pos: Position,
+    ) -> ParseResult<Expr> {
         let call_pos = self.current_pos();
         self.expect_special(b'(')?;
-        let arg = self.parse_assignment_expr()?;
+        let arg = match value {
+            FloatConstant::Infinity => None,
+            FloatConstant::Nan(_) => Some(self.parse_assignment_expr()?),
+        };
         self.expect_special(b')')?;
 
-        let payload = match &arg.kind {
-            ExprKind::StringLit(s) => nan_payload(crate::token::lexer::payload_bytes(s)),
-            _ => None,
+        let Some(typ) = self.float_suffix_type(suffix) else {
+            let name = self.idents.get(name_id).to_string();
+            return Err(ParseError::new(
+                format!("'{name}' is not supported on this target"),
+                token_pos,
+            ));
         };
         let fmt = self
             .types
             .fp_format(typ)
-            .expect("a NaN builtin's result type is a floating type");
+            .expect("a floating constant builtin's type is a floating type");
+        let constant = |v| Ok(Self::typed_expr(ExprKind::FloatLit(v), typ, token_pos));
+        let (FloatConstant::Nan(kind), Some(arg)) = (value, arg) else {
+            return constant(FloatVal::infinity(false));
+        };
+        let payload = match &arg.kind {
+            ExprKind::StringLit(s) => nan_payload(crate::token::lexer::payload_bytes(s)),
+            _ => None,
+        };
         match (payload, kind) {
-            (Some(payload), _) => Ok(Self::typed_expr(
-                ExprKind::FloatLit(FloatVal::nan_with_payload(fmt, payload, kind)),
-                typ,
-                token_pos,
-            )),
+            (Some(payload), _) => constant(FloatVal::nan_with_payload(fmt, payload, kind)),
             (None, NanKind::Quiet) => {
-                Ok(self.call_library_function(library, vec![arg], call_pos, token_pos))
+                let library = suffix.nan_library_function();
+                Ok(self.call_library_function(&library, vec![arg], call_pos, token_pos))
             }
             (None, NanKind::Signalling) => {
                 diag::error_args(
                     arg.pos,
-                    "the argument of '__builtin_{0}' is not a string literal naming a NaN payload",
-                    &[library],
+                    "the argument of '__builtin_nans{0}' is not a string literal naming a NaN payload",
+                    &[suffix.text()],
                 );
-                Ok(Self::typed_expr(
-                    ExprKind::FloatLit(FloatVal::nan()),
-                    typ,
-                    token_pos,
-                ))
+                constant(FloatVal::nan())
             }
         }
     }
@@ -2366,6 +2357,10 @@ impl Parser<'_> {
     /// declaring one of them `int` truncates the returned address to 32 bits.
     /// `None` means "not a known `_chk` function", which stays an error.
     pub(crate) fn chk_builtin_return_type(&mut self, name: &str) -> Option<TypeId> {
+        // What a `__builtin_nan` whose string is not a constant calls.
+        if let Some(suffix) = FloatSuffix::of_nan_library_function(name) {
+            return self.float_suffix_type(suffix);
+        }
         // The string family returns `char *`; the memory family returns
         // `void *`; the printf family returns `int`.
         match name {
@@ -2394,10 +2389,6 @@ impl Parser<'_> {
                 Some(self.types.int_id)
             }
             "labs" => Some(self.types.long_id),
-            // What a `__builtin_nan` whose string is not a constant calls.
-            "nan" => Some(self.types.double_id),
-            "nanf" => Some(self.types.float_id),
-            "nanl" => Some(self.types.longdouble_id),
             "llabs" => Some(self.types.longlong_id),
             _ if Self::libm_real_kind(name).is_some() => Some(match Self::libm_real_kind(name) {
                 Some(LibmReal::Float) => self.types.float_id,
@@ -2756,8 +2747,8 @@ impl Parser<'_> {
             // The libm entry points, from the one table that knows them.
             _ if Self::libm_real_kind(name).is_some() => (Self::libm_arity(name), false),
             "abort" => (0, false),
-            "exit" | "puts" | "malloc" | "free" | "putchar" | "strdup" | "nan" | "nanf"
-            | "nanl" => (1, false),
+            _ if FloatSuffix::of_nan_library_function(name).is_some() => (1, false),
+            "exit" | "puts" | "malloc" | "free" | "putchar" | "strdup" => (1, false),
             "strndup" => (2, false),
             "calloc" | "realloc" | "strcpy" | "stpcpy" | "strcat" | "strchr" | "strrchr"
             | "strstr" | "index" | "rindex" | "strpbrk" | "strcspn" | "strspn" => (2, false),
@@ -2835,6 +2826,110 @@ impl Parser<'_> {
         }
     }
 }
+
+/// The floating type a builtin's suffix names: `__builtin_inf` is a
+/// `double`, `__builtin_inff16` a `_Float16`. `_Float32` and `_Float64` are
+/// `float` and `double` in c17, not types of their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FloatSuffix {
+    Double,
+    Float,
+    LongDouble,
+    F16,
+    F32,
+    F64,
+    F128,
+}
+
+impl FloatSuffix {
+    const ALL: [FloatSuffix; 7] = [
+        FloatSuffix::Double,
+        FloatSuffix::Float,
+        FloatSuffix::LongDouble,
+        FloatSuffix::F16,
+        FloatSuffix::F32,
+        FloatSuffix::F64,
+        FloatSuffix::F128,
+    ];
+
+    /// How the suffix is spelled at the end of a function's name.
+    fn text(self) -> &'static str {
+        match self {
+            FloatSuffix::Double => "",
+            FloatSuffix::Float => "f",
+            FloatSuffix::LongDouble => "l",
+            FloatSuffix::F16 => "f16",
+            FloatSuffix::F32 => "f32",
+            FloatSuffix::F64 => "f64",
+            FloatSuffix::F128 => "f128",
+        }
+    }
+
+    /// The library function a quiet NaN builtin of this suffix calls for a
+    /// string it cannot fold, as gcc's does.
+    fn nan_library_function(self) -> String {
+        format!("nan{}", self.text())
+    }
+
+    /// The suffix of `name`, if it is the library function a quiet NaN
+    /// builtin calls for a string it cannot fold: `nanf16` for
+    /// `__builtin_nanf16`.
+    fn of_nan_library_function(name: &str) -> Option<FloatSuffix> {
+        let text = name.strip_prefix("nan")?;
+        Self::ALL.into_iter().find(|s| s.text() == text)
+    }
+}
+
+/// The value an infinity or NaN builtin produces.
+#[derive(Debug, Clone, Copy)]
+enum FloatConstant {
+    /// `__builtin_inf` and `__builtin_huge_val`, which are the same thing
+    /// on every IEEE format.
+    Infinity,
+    /// `__builtin_nan` (quiet) and `__builtin_nans` (signalling), whose
+    /// string argument names the payload.
+    Nan(NanKind),
+}
+
+/// Every infinity and NaN builtin: what it produces, and in which type.
+#[rustfmt::skip]
+const FLOAT_CONSTANT_BUILTINS: &[(StringId, FloatConstant, FloatSuffix)] = {
+    use crate::kw::*;
+    use FloatConstant::{Infinity as Inf, Nan};
+    use FloatSuffix::*;
+    const QUIET: FloatConstant = Nan(NanKind::Quiet);
+    const SIGNALLING: FloatConstant = Nan(NanKind::Signalling);
+    &[
+        (BUILTIN_INF,           Inf,        Double),
+        (BUILTIN_INFF,          Inf,        Float),
+        (BUILTIN_INFL,          Inf,        LongDouble),
+        (BUILTIN_INFF16,        Inf,        F16),
+        (BUILTIN_INFF32,        Inf,        F32),
+        (BUILTIN_INFF64,        Inf,        F64),
+        (BUILTIN_INFF128,       Inf,        F128),
+        (BUILTIN_HUGE_VAL,      Inf,        Double),
+        (BUILTIN_HUGE_VALF,     Inf,        Float),
+        (BUILTIN_HUGE_VALL,     Inf,        LongDouble),
+        (BUILTIN_HUGE_VALF16,   Inf,        F16),
+        (BUILTIN_HUGE_VALF32,   Inf,        F32),
+        (BUILTIN_HUGE_VALF64,   Inf,        F64),
+        (BUILTIN_HUGE_VALF128,  Inf,        F128),
+        (BUILTIN_NAN,           QUIET,      Double),
+        (BUILTIN_NANF,          QUIET,      Float),
+        (BUILTIN_NANL,          QUIET,      LongDouble),
+        (BUILTIN_NANF16,        QUIET,      F16),
+        (BUILTIN_NANF32,        QUIET,      F32),
+        (BUILTIN_NANF64,        QUIET,      F64),
+        (BUILTIN_NANF128,       QUIET,      F128),
+        (BUILTIN_NANS,          SIGNALLING, Double),
+        (BUILTIN_NANSF,         SIGNALLING, Float),
+        (BUILTIN_NANSL,         SIGNALLING, LongDouble),
+        (BUILTIN_NANSF16,       SIGNALLING, F16),
+        (BUILTIN_NANSF32,       SIGNALLING, F32),
+        (BUILTIN_NANSF64,       SIGNALLING, F64),
+        (BUILTIN_NANSF128,      SIGNALLING, F128),
+    ]
+};
 
 /// The payload a `__builtin_nan` string names, or `None` if the string is
 /// not one gcc folds.

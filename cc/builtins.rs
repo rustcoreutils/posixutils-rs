@@ -290,6 +290,14 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_huge_val",
     "__builtin_huge_valf",
     "__builtin_huge_vall",
+    "__builtin_inff16",
+    "__builtin_inff32",
+    "__builtin_inff64",
+    "__builtin_inff128",
+    "__builtin_huge_valf16",
+    "__builtin_huge_valf32",
+    "__builtin_huge_valf64",
+    "__builtin_huge_valf128",
     // Floating-point math
     "__builtin_fabs",
     "__builtin_fabsf",
@@ -372,6 +380,14 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_nans",
     "__builtin_nansf",
     "__builtin_nansl",
+    "__builtin_nanf16",
+    "__builtin_nanf32",
+    "__builtin_nanf64",
+    "__builtin_nanf128",
+    "__builtin_nansf16",
+    "__builtin_nansf32",
+    "__builtin_nansf64",
+    "__builtin_nansf128",
     // Branch prediction
     "__builtin_expect",
     // Pointer alignment hints
@@ -478,6 +494,13 @@ pub fn is_builtin(name: &str) -> bool {
     SUPPORTED_BUILTINS.contains(&name)
 }
 
+/// Whether `target` has the builtin `name`, which is assumed to be one: all
+/// of them, except that the `_Float128` constants (`__builtin_inff128` and
+/// its siblings) need that type, which macOS does not have.
+pub fn available_on(name: &str, target: &crate::target::Target) -> bool {
+    crate::arch::has_float128(target) || !name.ends_with("f128")
+}
+
 /// Check if a StringId is a supported builtin function (O(1) via tag lookup).
 pub fn is_builtin_id(id: crate::strings::StringId) -> bool {
     crate::kw::has_tag(id, crate::kw::BUILTIN)
@@ -495,6 +518,24 @@ mod tests {
         assert!(is_builtin("__c11_atomic_load"));
         assert!(!is_builtin("__builtin_nonexistent"));
         assert!(!is_builtin("printf"));
+    }
+
+    /// The `_Float128` constants are builtins only where the type exists.
+    #[test]
+    fn test_float128_builtins_need_the_type() {
+        use crate::target::{Arch, Os, Target};
+        let linux = Target::new(Arch::Aarch64, Os::Linux);
+        let macos = Target::new(Arch::Aarch64, Os::MacOS);
+        for name in [
+            "__builtin_inff128",
+            "__builtin_nansf128",
+            "__builtin_huge_valf128",
+        ] {
+            assert!(is_builtin(name), "{name}");
+            assert!(available_on(name, &linux), "{name}");
+            assert!(!available_on(name, &macos), "{name}");
+        }
+        assert!(available_on("__builtin_nanf16", &macos));
     }
 
     /// Verify every SUPPORTED_BUILTINS entry has the BUILTIN tag in kw.rs,

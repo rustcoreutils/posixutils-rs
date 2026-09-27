@@ -748,15 +748,30 @@ impl<'a> Parser<'a> {
         }
 
         if self.is_special(b'+') && !self.is_special_token(SpecialToken::Increment) {
+            // C17 6.5.3.3p2: the result is the value of the *promoted*
+            // operand, with the promoted type -- and a value, not an lvalue.
+            // Returning the operand itself made `+(signed char)0` a
+            // `signed char` and `+x = 1` an assignment.
+            let op_pos = self.current_pos();
             self.advance();
-            // Unary + is a no-op for numeric types, but we need to parse it
-            return self.parse_unary_expr();
+            let operand = self.parse_unary_expr()?;
+            self.check_unary_arithmetic_operand(&operand, "unary plus", op_pos);
+            let (operand, typ) = self.promote_unary_operand(operand);
+            return Ok(Self::typed_expr(
+                ExprKind::Cast {
+                    cast_type: typ,
+                    expr: Box::new(operand),
+                },
+                typ,
+                op_pos,
+            ));
         }
 
         if self.is_special(b'-') && !self.is_special_token(SpecialToken::Decrement) {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_unary_arithmetic_operand(&operand, "unary minus", op_pos);
             let (operand, typ) = self.promote_unary_operand(operand);
             let width = self.unary_bitfield_width(&operand, typ);
             let mut e = Self::typed_expr(

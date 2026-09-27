@@ -587,3 +587,41 @@ int main(void) {
         0,
     );
 }
+
+/// Unary `+` promotes its operand and yields the promoted type (C17
+/// 6.5.3.3p2), in every context an expression reaches: `sizeof`, `_Generic`,
+/// arithmetic, and the constant expressions of an initializer, a case label
+/// and an array bound.
+#[test]
+fn c89_unary_plus_promotes() {
+    let code = r#"
+static int s = +(signed char)-3;
+enum { E = +(unsigned char)200 };
+
+int main(void) {
+    signed char c = -1;
+    unsigned char u = 255;
+    short h = -2;
+    _Bool b = 1;
+    char buf[+(short)4];
+
+    if (sizeof(+c) != sizeof(int)) return 1;
+    if (sizeof(+h) != sizeof(int)) return 2;
+    if (!_Generic(+c, int: 1, default: 0)) return 3;
+    if (!_Generic(+u, int: 1, default: 0)) return 4;
+    if (!_Generic(+b, int: 1, default: 0)) return 5;
+    if (!_Generic(+1.5f, float: 1, default: 0)) return 6;
+    if (!_Generic(+2UL, unsigned long: 1, default: 0)) return 7;
+    if (+c != -1 || +u != 255 || +h != -2 || +b != 1) return 8;
+    if (s != -3 || E != 200 || sizeof buf != 4) return 9;
+    switch (u) {
+    case +(unsigned char)255: break;
+    default: return 10;
+    }
+    /* `+u` is an int, so this subtraction is signed. */
+    if (!(+u - 256 < 0)) return 11;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("unary_plus_promotes", code, &[]), 0);
+}

@@ -737,6 +737,32 @@ fn unary_minus_and_bitnot_convert_their_operand() {
     }
 }
 
+/// Unary `+` performs the integer promotions too (C17 6.5.3.3p2), and its
+/// result is a value of the promoted type. It used to hand back the operand
+/// itself, so `+(signed char)1` was a `signed char` and `+x` an lvalue.
+#[test]
+fn unary_plus_promotes_and_is_a_value() {
+    for (src, want_int) in [
+        ("+(signed char)200", true),
+        ("+(short)9", true),
+        ("+(_Bool)1", true),
+        ("+(unsigned char)1", true),
+        ("+1L", false),
+        ("+1.5f", false),
+    ] {
+        let (expr, types, _strings, _symbols) = parse_expr(src).unwrap();
+        let typ = expr.typ.unwrap();
+        assert!(
+            matches!(expr.kind, ExprKind::Cast { cast_type, .. } if cast_type == typ),
+            "{src}: `+` yields a converted value, never its operand"
+        );
+        assert_eq!(typ == types.int_id, want_int, "{src}: result type");
+        if src == "+1.5f" {
+            assert_eq!(typ, types.float_id, "{src}: no default promotion");
+        }
+    }
+}
+
 /// An operand that already has its promoted type gains nothing: the
 /// conversion is the promotion, not a wrapper on every unary operator.
 ///

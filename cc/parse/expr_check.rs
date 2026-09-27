@@ -292,6 +292,16 @@ impl Parser<'_> {
         is_vector
     }
 
+    /// C17 6.5.3.3p1: the operand of unary `+` and `-` has arithmetic type.
+    /// A vector is diagnosed on its own by `check_not_vector_value`, and an
+    /// operand with no type has been diagnosed already.
+    pub(super) fn check_unary_arithmetic_operand(&self, operand: &Expr, op: &str, pos: Position) {
+        let Some(t) = operand.typ else { return };
+        if !self.types.is_arithmetic(t) && !self.types.is_vector(t) {
+            diag::error_args(pos, "wrong type argument to {0}", &[op]);
+        }
+    }
+
     /// C17 6.5.8p2: the operands of `<`, `>`, `<=` and `>=` are both real or
     /// both pointers. A complex value has no ordering, so a relational
     /// operator on one is a constraint violation; `==` and `!=` accept it.

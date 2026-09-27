@@ -1029,6 +1029,32 @@ fn diagnostics_unprototyped_calls_are_accepted() {
     }
 }
 
+/// C17 6.5.3.3p1: the operand of unary `+` or `-` has arithmetic type. A
+/// pointer, array or structure operand compiled in silence -- `+p` was `p`.
+/// Worded as gcc words it.
+#[test]
+fn diagnostics_unary_plus_and_minus_need_arithmetic_operands() {
+    for (name, src, expected) in [
+        (
+            "unary_plus_pointer",
+            "int *p;\nint f(void){ (void)+p; return 0; }\n",
+            "wrong type argument to unary plus",
+        ),
+        (
+            "unary_plus_struct",
+            "struct S { int x; } s;\nint f(void){ (void)+s; return 0; }\n",
+            "wrong type argument to unary plus",
+        ),
+        (
+            "unary_minus_pointer",
+            "int *p;\nint f(void){ (void)-p; return 0; }\n",
+            "wrong type argument to unary minus",
+        ),
+    ] {
+        compile_expect_error(name, src, expected);
+    }
+}
+
 // ==== lvalue constraints (C17 6.5.16p2, 6.5.3.1p1, 6.5.3.2p1) ====
 
 /// Assignment and the increment operators require a *modifiable lvalue*, and
@@ -1051,6 +1077,18 @@ fn diagnostics_non_lvalue_targets_are_rejected() {
             "assign_to_cast",
             "int main(void){ int a=1; (int)a = 2; return 0; }\n",
             "lvalue required as left operand of assignment",
+        ),
+        // Unary `+` yields a value (C17 6.5.3.3p2); it returned its operand,
+        // lvalue and all.
+        (
+            "assign_to_unary_plus",
+            "int main(void){ int a=1; +a = 2; return 0; }\n",
+            "lvalue required as left operand of assignment",
+        ),
+        (
+            "address_of_unary_plus",
+            "int main(void){ int a=1; int *p = &+a; return *p; }\n",
+            "lvalue required as unary '&' operand",
         ),
         (
             "assign_to_call",

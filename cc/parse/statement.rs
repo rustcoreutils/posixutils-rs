@@ -422,9 +422,9 @@ impl Parser<'_> {
                     (items, expr, typ)
                 }
                 _ => {
-                    // Last item is not an expression statement (e.g. if, while, for)
-                    // Following sparse: the type becomes void (evaluate.c handles this
-                    // by returning NULL which becomes void_ctype)
+                    // Last item is not an expression statement (e.g. if, while,
+                    // for): the statement expression yields no value, so its
+                    // type is `void`, as in gcc.
                     items.push(last);
                     (
                         items,

@@ -539,7 +539,8 @@ impl<'a> Parser<'a> {
         //   (name)     - function type typedef
         //   (name[N])  - parenthesized array declarator
         //   (name(...)) - parenthesized function declarator
-        // Following sparse's is_nested() logic: if identifier is not a type, it's grouped
+        // An identifier that cannot start a declaration is the declarator's
+        // name, so the parenthesis groups it rather than opening parameters.
         if self.peek() == TokenType::Ident {
             // "Does a declaration start here?" has one answer, and this asked
             // a narrower question than `is_declaration_start` did: it tested

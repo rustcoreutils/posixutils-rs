@@ -91,6 +91,18 @@ pub enum InlineLibraryFn {
     Memory(MemoryFn),
 }
 
+/// A `double` library call computed by its `float` form, because the answer
+/// is the same there ([`InlineLibraryFn::narrows_exactly`]): `floor(x)` of a
+/// `float` `x` is `floorf(x)`, widened to the `double` the call is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NarrowedLibraryCall {
+    /// The `float` form, by its own name (`floorf`): what is called instead
+    /// where the target has no instruction for it.
+    pub name: StringId,
+    /// The type it computes in, which every argument has.
+    pub typ: TypeId,
+}
+
 /// A block memory function of `<string.h>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryFn {
@@ -182,6 +194,23 @@ impl InlineLibraryFn {
                 | InlineLibraryFn::Fma
                 | InlineLibraryFn::Memory(_)
         )
+    }
+
+    /// Whether a call the program wrote to `called` reaches the program's
+    /// own definition of it instead: `defined` holds every name the
+    /// translation unit defines a function under, weak definitions aside.
+    ///
+    /// `called` is the function the program named -- `floor`, even where a
+    /// `float` argument is computed by `floorf` -- because that is the one
+    /// its definition replaces. The one rule for both places that ask: the
+    /// parser, of a definition above the call, and the linearizer, of one
+    /// anywhere in the unit.
+    pub fn is_displaced(
+        self,
+        called: StringId,
+        defined: &std::collections::HashSet<StringId>,
+    ) -> bool {
+        self.yields_to_a_definition() && defined.contains(&called)
     }
 }
 
@@ -837,13 +866,18 @@ pub enum ExprKind {
     InlineLibraryCall {
         func: InlineLibraryFn,
         /// One argument for each of `func`'s parameters
-        /// ([`InlineLibraryFn::arity`]), each converted to its type.
+        /// ([`InlineLibraryFn::arity`]), each converted to its type -- or,
+        /// when `narrowed`, at the type it is computed in.
         args: Vec<Expr>,
-        /// The library function computed, by its own name (`sqrtf`): what is
-        /// called instead where the target has no instruction for it, where
-        /// the call must still set `errno`, or where a block memory function
-        /// is not expanded.
+        /// The library function the program called, by its own name
+        /// (`sqrtf`, or `floor` of a `float`): the one a definition in the
+        /// translation unit displaces ([`InlineLibraryFn::is_displaced`]),
+        /// and unless `narrowed`, what is called instead where the target
+        /// has no instruction for it, where the call must still set `errno`,
+        /// or where a block memory function is not expanded.
         name: StringId,
+        /// Set when the call is computed by its `float` form.
+        narrowed: Option<NarrowedLibraryCall>,
     },
 
     /// `__builtin_isnan` / `isinf` / `isfinite` / `isnormal` -- classify a
@@ -2508,6 +2542,19 @@ mod tests {
         }
     }
 
+    /// Displacement asks about the function the program called, and only
+    /// of one that yields to a definition.
+    #[test]
+    fn test_inline_library_fn_is_displaced_by_the_called_name() {
+        let floor = InlineLibraryFn::RoundToIntegral(IntegralRounding::Floor);
+        let defined: std::collections::HashSet<StringId> = [crate::kw::FLOOR].into();
+        assert!(floor.is_displaced(crate::kw::FLOOR, &defined));
+        assert!(!floor.is_displaced(crate::kw::FLOORF, &defined));
+        assert!(!InlineLibraryFn::Fabs.is_displaced(crate::kw::FLOOR, &defined));
+        let floorf: std::collections::HashSet<StringId> = [crate::kw::FLOORF].into();
+        assert!(!floor.is_displaced(crate::kw::FLOOR, &floorf));
+    }
+
     /// Only the exactly rounding functions narrow; a root does not.
     #[test]
     fn test_inline_library_fn_narrows_exactly() {
@@ -2527,6 +2574,7 @@ mod tests {
                 func: InlineLibraryFn::Fabs,
                 args: vec![arg],
                 name: crate::kw::FABS,
+                narrowed: None,
             },
             types.double_id,
         );

@@ -534,11 +534,9 @@ int main(void)
 /// and `(float)sin((double)x)` differ in the last bit for some `x`, so
 /// narrowing `sin` would be a wrong answer rather than a faster one.
 ///
-/// c17 narrows in the parser and so does it at every level, where gcc does
-/// it only with the optimizer on. Both are correct, since the rewrite is
-/// exact; [`builtins_math_narrowing_happens_at_every_level`] pins the
-/// difference down on the assembly, because a run-time test of it would
-/// disagree with gcc at `-O0` for a reason that is not a defect.
+/// c17 narrows where it computes the answer itself, as gcc does once
+/// optimizing; [`builtins_math_narrowing_computes_in_place`] pins that down
+/// on the assembly.
 #[test]
 fn builtins_exactly_rounding_math_narrows_to_its_float_form() {
     let code = r#"
@@ -589,11 +587,9 @@ __attribute__((noinline)) static double transcendental(float x)
 
 int main(void)
 {
-    /* Guarded because gcc narrows only with the optimizer on, so at `-O0` it
-       reaches the aborting wide form and this program is not a statement
-       about it. c17 narrows at every level, which
-       `builtins_math_narrowing_happens_at_every_level` checks on the
-       assembly instead. */
+    /* Guarded because gcc and c17 narrow only with the optimizer on: at
+       `-O0` the call is the one the program wrote, and reaches the aborting
+       wide form. */
 #ifdef __OPTIMIZE__
     /* Six identities at an integral argument. */
     if (narrow(0.0f) != 0.0f) abort();
@@ -616,17 +612,13 @@ int main(void)
     }
 }
 
-/// The narrowing happens in the parser, so it does not wait for `-O`.
-///
-/// gcc performs it as an optimization and leaves the wide call at `-O0`.
-/// Doing it always is a deliberate difference and a safe one -- the rewrite
-/// is exact at every level -- but it is a difference, so it is stated here
-/// rather than left for someone to discover from a disassembly. At `-O0`
-/// the bare `floor` is a call, to `floorf`; once optimizing it is computed in
-/// place, still at `float` -- `cvttss2si` on x86-64, `frintm` of an `s`
-/// register on aarch64 -- and nothing is called.
+/// A narrowed call is computed in place, at `float` -- `cvttss2si` on
+/// x86-64, `frintm` of an `s` register on aarch64 -- and nothing is called.
+/// At `-O0` the bare `floor` is not computed but called, as under gcc, and
+/// the call is the one the program wrote: to `floor`, never `floorf`, so
+/// that a definition of `floor` anywhere in the unit is what it reaches.
 #[test]
-fn builtins_math_narrowing_happens_at_every_level() {
+fn builtins_math_narrowing_computes_in_place() {
     let src = "double floor(double);\nfloat q(float a) { return floor(a); }\n";
     // The host's own format, plus both Darwin triples so the Mach-O spelling
     // is exercised wherever this runs. The prefix is read off each output
@@ -668,17 +660,17 @@ fn builtins_math_narrowing_happens_at_every_level() {
                 })
             };
             assert!(
-                !calls("floor"),
-                "{target:?} at {opt}: the wide form must not be called:\n{asm}"
+                !calls("floorf"),
+                "{target:?} at {opt}: the float form must not be called:\n{asm}"
             );
             if opt == "-O0" {
                 assert!(
-                    calls("floorf"),
-                    "{target:?} at {opt}: the call should be narrowed to {p}floorf:\n{asm}"
+                    calls("floor"),
+                    "{target:?} at {opt}: the call should be to {p}floor:\n{asm}"
                 );
             } else {
                 assert!(
-                    !calls("floorf") && asm.contains(in_place),
+                    !calls("floor") && asm.contains(in_place),
                     "{target:?} at {opt}: not computed in place at float:\n{asm}"
                 );
             }

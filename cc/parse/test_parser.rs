@@ -5667,26 +5667,35 @@ fn test_min_max_fma_builtins() {
 
 /// A `float` argument to a `double` rounding is rounded as a `float`, by
 /// the `f` form, and the exact answer widened: the call is still a
-/// `double`. A `double` argument is not narrowed, and a root never is.
+/// `double`, and still a call to the function the program named, whose
+/// definition would displace it. A `double` argument is not narrowed, and a
+/// root never is.
 #[test]
 fn test_rounding_narrows_a_float_argument() {
     let decls = "float f; double d;";
     with_statement_expr(decls, "floor(f)", |p, e| {
         assert_eq!(e.typ, Some(p.types.double_id));
-        let ExprKind::Cast { expr: inner, .. } = &e.kind else {
-            panic!("floor(f) is not widened: {:?}", e.kind);
-        };
-        assert_eq!(inner.typ, Some(p.types.float_id));
-        let (func, arg) = inline_call("floor(f)", inner);
+        let (func, arg) = inline_call("floor(f)", e);
         assert_eq!(
             func,
             InlineLibraryFn::RoundToIntegral(IntegralRounding::Floor)
         );
         assert_eq!(arg.typ, Some(p.types.float_id), "not converted to double");
+        let ExprKind::InlineLibraryCall { name, narrowed, .. } = e.kind else {
+            unreachable!()
+        };
+        assert_eq!(name, crate::kw::FLOOR, "the function called");
+        let narrowed = narrowed.expect("computed by floorf");
+        assert_eq!(narrowed.name, crate::kw::FLOORF);
+        assert_eq!(narrowed.typ, p.types.float_id);
     });
     with_statement_expr(decls, "__builtin_rint(d)", |p, e| {
         assert_eq!(e.typ, Some(p.types.double_id));
         inline_call("__builtin_rint(d)", e);
+        assert!(matches!(
+            e.kind,
+            ExprKind::InlineLibraryCall { narrowed: None, .. }
+        ));
     });
     with_statement_expr(decls, "sqrt(f)", |p, e| {
         let (_, arg) = inline_call("sqrt(f)", e);
@@ -5694,8 +5703,8 @@ fn test_rounding_narrows_a_float_argument() {
     });
 }
 
-/// At `-O0` a bare rounding is a call -- to the `f` form for a `float`
-/// argument, widened -- and a `__builtin_` one is computed in place.
+/// At `-O0` a bare rounding is a call to the function it names, whatever
+/// its argument, and a `__builtin_` one is computed in place.
 #[test]
 fn test_rounding_at_o0() {
     let o0 = super::LibraryCallPolicy {
@@ -5718,6 +5727,9 @@ fn test_rounding_at_o0() {
         strings.get(symbols.get(sym).name).to_string()
     };
     assert_eq!(called("ceil(i)", &["i"]), "ceil");
+    // The call the program wrote, as gcc makes it: a `float` argument is
+    // narrowed only where c17 computes the answer itself.
+    assert_eq!(called("ceil(f)", &["f"]), "ceil");
     let (expr, _, _, _) = parse_expr_under("__builtin_ceil(i)", &["i"], o0).unwrap();
     inline_call("__builtin_ceil(i)", &expr);
 }
@@ -5741,6 +5753,15 @@ fn test_definition_displaces_a_late_expanded_builtin() {
     assert!(is_call(&returned(
         "float rintf() { return 1.0f; } float f(void) { return rintf(); }"
     )));
+    // A `float` argument asks about the function called, not its `f` form:
+    // `floor` is displaced, and `floorf` displaces nothing.
+    assert!(is_call(&returned(
+        "double floor(double x) { return x; } double f(float y) { return floor(y); }"
+    )));
+    assert!(matches!(
+        returned("float floorf(float x) { return x; } double f(float y) { return floor(y); }"),
+        ExprKind::InlineLibraryCall { .. }
+    ));
     assert!(matches!(
         returned("int abs(int v) { return v; } int f(int y) { return abs(y); }"),
         ExprKind::InlineLibraryCall { .. }

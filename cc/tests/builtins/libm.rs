@@ -820,6 +820,71 @@ fn libm_own_definition_is_called() {
     run_everywhere("own_defs", OWN_DEFINITIONS_PROGRAM, &[], false);
 }
 
+/// A `float` argument does not hide the program's `floor` behind `floorf`:
+/// the definition displaces the call the program wrote, which is to
+/// `floor`, and that call receives the argument converted to `double` and
+/// answers a `double` -- `x + 0.1` is not a `float`, so a result narrowed on
+/// the way would show. Above the definition and below it, bare and
+/// reserved, as a `double` and a `float` result.
+const OWN_FLOOR_OF_A_FLOAT_PROGRAM: &str = r#"
+double floor(double);
+static volatile int calls;
+volatile float fv = 2.5f;
+static double below_bare(float x) { return floor(x); }
+static double below_reserved(float x) { return __builtin_floor(x); }
+static float below_float(float x) { return floor(x); }
+double floor(double x) { calls++; return x + 0.1; }
+static double above_bare(float x) { return floor(x); }
+static double above_reserved(float x) { return __builtin_floor(x); }
+static float above_float(float x) { return floor(x); }
+int main(void) {
+    float x = fv;
+    if (below_bare(x) != 2.5 + 0.1) return 1;
+    if (below_reserved(x) != 2.5 + 0.1) return 2;
+    if (below_float(x) != (float)(2.5 + 0.1)) return 3;
+    if (above_bare(x) != 2.5 + 0.1) return 4;
+    if (above_reserved(x) != 2.5 + 0.1) return 5;
+    if (above_float(x) != (float)(2.5 + 0.1)) return 6;
+    if (calls != 6) return 7;
+    return 0;
+}
+"#;
+
+#[test]
+fn libm_own_definition_is_called_for_a_float_argument() {
+    run_everywhere("own_floor_float", OWN_FLOOR_OF_A_FLOAT_PROGRAM, &[], false);
+}
+
+/// A weak definition displaces nothing: a `float` argument is still floored
+/// in place, at `float`. At `-O0` the bare spelling is a call, as under gcc,
+/// and the call is the one the program wrote -- to `floor`, which this
+/// program defines.
+const WEAK_FLOOR_OF_A_FLOAT_PROGRAM: &str = r#"
+__attribute__((weak)) double floor(double x) { return -1.0; }
+static double bare(float x) { return floor(x); }
+static double reserved(float x) { return __builtin_floor(x); }
+volatile float fv = 2.5f;
+int main(void) {
+    if (reserved(fv) != 2.0) return 1;
+#ifdef __OPTIMIZE__
+    if (bare(fv) != 2.0) return 2;
+#else
+    if (bare(fv) != -1.0) return 3;
+#endif
+    return 0;
+}
+"#;
+
+#[test]
+fn libm_weak_definition_does_not_displace_a_float_argument() {
+    run_everywhere(
+        "weak_floor_float",
+        WEAK_FLOOR_OF_A_FLOAT_PROGRAM,
+        &[],
+        false,
+    );
+}
+
 // ============================================================================
 // fmin, fmax, fma and their f forms
 // ============================================================================

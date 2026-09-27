@@ -167,9 +167,7 @@ impl Parser<'_> {
         }
         // A definition in this translation unit is the function called; one
         // further down is found by the linearizer instead.
-        if library.is_some_and(|lb| lb.yields_to_a_definition())
-            && self.defined_functions.contains(&name_id)
-        {
+        if library.is_some_and(|lb| lb.is_displaced(&self.defined_functions)) {
             return true;
         }
 

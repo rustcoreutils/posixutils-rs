@@ -16,7 +16,7 @@
 // the table names for it.
 //
 
-use super::ast::{Expr, ExprKind, InlineLibraryFn, MathErrno, MemoryFn};
+use super::ast::{Expr, ExprKind, InlineLibraryFn, MathErrno, MemoryFn, NarrowedLibraryCall};
 use super::parser::{ParseResult, Parser};
 use crate::float::IntegralRounding;
 use crate::kw;
@@ -248,9 +248,10 @@ impl LibraryBuiltin {
         LIBRARY_BUILTINS.iter().find(|lb| lb.bare == name_id)
     }
 
-    /// See [`InlineLibraryFn::yields_to_a_definition`].
-    pub(super) fn yields_to_a_definition(&self) -> bool {
-        self.func.yields_to_a_definition()
+    /// Whether a call to this function by its bare name reaches the
+    /// program's own definition instead ([`InlineLibraryFn::is_displaced`]).
+    pub(super) fn is_displaced(&self, defined: &std::collections::HashSet<StringId>) -> bool {
+        self.func.is_displaced(self.bare, defined)
     }
 
     /// The `float` function this `double` one narrows to for a `float`
@@ -365,16 +366,21 @@ impl Parser<'_> {
         pos: Position,
     ) -> Expr {
         let ret = lb.ret.id(self.types);
-        if let (Some(narrow), [arg]) = (lb.float_form(), args.as_slice()) {
-            if self.is_binary32(arg) {
-                // Computed at `float`, and the exact answer widened back: the
-                // call is still a `double` (C17 6.5.2.2p5).
-                let value = self.lower_library_call(narrow, spelling, args, pos);
-                return self.convert_operand(value, ret);
-            }
-        }
-        let params = self.library_params(lb);
         let func = self.library_call_policy.applied_to(lb.func);
+        let in_place = self.library_call_policy.in_place(func, spelling);
+        // Computed at `float` for a `float` argument, and the exact answer
+        // widened back: the call is still a `double` (C17 6.5.2.2p5), and
+        // still a call to the function the program named. One that is not
+        // computed in place is that call, as gcc makes it.
+        let (computed, narrowed) = match (lb.float_form(), args.as_slice()) {
+            (Some(narrow), [arg]) if in_place && self.is_binary32(arg) => {
+                let typ = narrow.ret.id(self.types);
+                let name = narrow.bare;
+                (narrow, Some(NarrowedLibraryCall { name, typ }))
+            }
+            _ => (lb, None),
+        };
+        let params = self.library_params(computed);
         let mut args: Vec<Expr> = args
             .into_iter()
             .zip(&params)
@@ -383,11 +389,16 @@ impl Parser<'_> {
         if let (InlineLibraryFn::Memory(_), Some(n)) = (func, args.last_mut()) {
             self.fold_constant_length(n);
         }
-        if !self.library_call_policy.in_place(func, spelling) {
+        if !in_place {
             return self.libm_call(lb.bare, ret, &params, args, pos);
         }
-        let name = lb.bare;
-        Self::typed_expr(ExprKind::InlineLibraryCall { func, args, name }, ret, pos)
+        let call = ExprKind::InlineLibraryCall {
+            func,
+            args,
+            name: lb.bare,
+            narrowed,
+        };
+        Self::typed_expr(call, ret, pos)
     }
 
     /// A block memory function's length, folded to a `size_t` literal when

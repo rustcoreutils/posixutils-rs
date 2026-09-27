@@ -21,7 +21,8 @@ use crate::float::FloatVal;
 use crate::ir::linearize_atomic::AtomicLvalue;
 use crate::parse::ast::{
     BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef, GnuAtomicOp,
-    InitElement, InlineLibraryFn, MemoryFn, OffsetOfPath, ParamStyle, TranslationUnit, UnaryOp,
+    InitElement, InlineLibraryFn, MemoryFn, NarrowedLibraryCall, OffsetOfPath, ParamStyle,
+    TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
@@ -1947,9 +1948,11 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcountll { arg }
             | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
 
-            ExprKind::InlineLibraryCall { func, args, name } => {
+            ExprKind::InlineLibraryCall {
+                func, args, name, ..
+            } => {
                 !func.has_side_effects()
-                    && !self.calls_the_programs_own(*func, *name)
+                    && !func.is_displaced(*name, &self.defined_functions)
                     && args.iter().all(|a| self.is_pure_expr(a))
             }
 
@@ -4138,31 +4141,58 @@ impl<'a> Linearizer<'a> {
         self.emit_libm(op, &arg_vals, typ, name)
     }
 
-    /// Whether a call to the library builtin `func`, named `name`, reaches the
-    /// translation unit's own definition of it instead.
-    fn calls_the_programs_own(&self, func: InlineLibraryFn, name: StringId) -> bool {
-        func.yields_to_a_definition() && self.defined_functions.contains(&name)
-    }
-
     /// A library function's call evaluated in place: its arguments, already
     /// converted to the parameter types, and the computation the call stands
     /// for. Never an lvalue, so only ever reached for its value. `name` is
-    /// the library function's, for what is still a call.
+    /// the function the program called, and `narrowed` says whether it is
+    /// computed by its `float` form instead.
     fn linearize_inline_library_call(
         &mut self,
         expr: &Expr,
         func: InlineLibraryFn,
         args: &[Expr],
         name: StringId,
+        narrowed: Option<NarrowedLibraryCall>,
     ) -> PseudoId {
         let typ = self.expr_type(expr);
-        if self.calls_the_programs_own(func, name) {
+        if func.is_displaced(name, &self.defined_functions) {
             // The program's own function, defined below the call: gcc calls
-            // it, and so does this. The arguments are already at `typ`.
-            let arg_vals: Vec<PseudoId> = args.iter().map(|a| self.linearize_expr(a)).collect();
+            // it, and so does this. The arguments are at its parameter types
+            // already, or -- narrowed -- at `float`, and then converted to
+            // the call's own type, which is every parameter's for a function
+            // that narrows.
+            let arg_vals: Vec<PseudoId> = args
+                .iter()
+                .map(|a| {
+                    let val = self.linearize_expr(a);
+                    match narrowed {
+                        Some(n) => self.emit_convert(val, n.typ, typ),
+                        None => val,
+                    }
+                })
+                .collect();
             let callee = self.library_function_name(self.strings.get(name));
             return self.emit_library_call(&callee, &arg_vals, typ);
         }
+        match narrowed {
+            Some(n) => {
+                let val = self.compute_library_call(func, args, n.typ, n.name);
+                self.emit_convert(val, n.typ, typ)
+            }
+            None => self.compute_library_call(func, args, typ, name),
+        }
+    }
+
+    /// The computation a library call of `args` stands for, at `typ`; `name`
+    /// is the library function that computes it, for a target or an
+    /// argument that still needs the call.
+    fn compute_library_call(
+        &mut self,
+        func: InlineLibraryFn,
+        args: &[Expr],
+        typ: TypeId,
+        name: StringId,
+    ) -> PseudoId {
         match (func, args) {
             (InlineLibraryFn::IntAbs, [arg]) => {
                 let arg_val = self.linearize_expr(arg);
@@ -6491,9 +6521,12 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Setjmp { .. }
             | ExprKind::Longjmp { .. } => self.linearize_builtin(expr),
 
-            ExprKind::InlineLibraryCall { func, args, name } => {
-                self.linearize_inline_library_call(expr, *func, args, *name)
-            }
+            ExprKind::InlineLibraryCall {
+                func,
+                args,
+                name,
+                narrowed,
+            } => self.linearize_inline_library_call(expr, *func, args, *name, *narrowed),
 
             ExprKind::OffsetOf { type_id, path } => self.linearize_offsetof(type_id, path),
 

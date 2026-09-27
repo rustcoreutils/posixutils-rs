@@ -38,6 +38,7 @@
 //   Rbx, Rbp, R12-R15          - Callee-saved
 // ============================================================================
 
+use super::x87::is_x87_float_to_int;
 use crate::arch::asm_constraints::OperandConstraint;
 use crate::arch::lir::FpSize;
 use crate::arch::regalloc::{
@@ -799,6 +800,8 @@ pub struct RegAlloc {
     active_xmm: Vec<(LiveInterval, XmmReg)>,
     /// Next stack slot offset
     stack_offset: i32,
+    /// Reserved when the function converts a long double to an integer.
+    x87_control_words: Option<X87ControlWords>,
     /// A source position for this function, for the frame diagnostics
     /// `grow_frame` and [`crate::abi::slot_bytes`] emit. `alloc_stack_slot` and
     /// `IncomingOff::take` have no `&Function` to recover one from.
@@ -996,6 +999,37 @@ fn exempt_from_clobber(cp: &ConstraintPoint<Reg>, interval: &LiveInterval) -> bo
 /// See [`X86_64CodeGen::x87_scratch_addr`].
 pub(super) const X87_SCRATCH_BYTES: i32 = 16;
 
+/// The frame slot holding the two x87 control words a long double to integer
+/// conversion switches between.
+///
+/// `fistp` rounds as the control word says, and C truncates, so every such
+/// conversion saves the control word it finds, stores a copy with rounding
+/// control set to truncate, loads that around the `fistp`, and loads the saved
+/// one back -- `fisttp`, which truncates unaided, is SSE3 and so not baseline.
+/// The two words live in one slot the allocator reserves for any function
+/// containing such a conversion, and only for those.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct X87ControlWords {
+    slot: i32,
+}
+
+impl X87ControlWords {
+    /// Bytes reserved: the two 16-bit words, rounded up to the eight every
+    /// other slot is laid out in, so the slots after this one stay aligned.
+    const BYTES: i32 = 8;
+
+    /// The stack slot the two words are fields of.
+    pub(super) fn slot(self) -> i32 {
+        self.slot
+    }
+
+    /// Byte offset of the control word found on entry, restored afterwards.
+    pub(super) const SAVED: i32 = 0;
+
+    /// Byte offset of the truncating copy loaded around the `fistp`.
+    pub(super) const TRUNCATING: i32 = 2;
+}
+
 /// Where the next stack-passed argument starts, measured from `%rbp` in the
 /// callee's frame.
 ///
@@ -1061,6 +1095,7 @@ impl RegAlloc {
             active: Vec::new(),
             active_xmm: Vec::new(),
             stack_offset: X87_SCRATCH_BYTES,
+            x87_control_words: None,
             func_pos: crate::diag::Position::default(),
             used_callee_saved: Vec::new(),
             fp_pseudos: HashSet::new(),
@@ -1101,6 +1136,7 @@ impl RegAlloc {
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         // Identify long double pseudos (use x87 not XMM)
         self.identify_ld_pseudos(func, types);
+        self.reserve_x87_control_words(func, types);
         self.identify_x87_asm_operands(func);
         self.identify_quad_pseudos(func, types);
         // Identify 128-bit integer pseudos (always spill to 16-byte stack slots)
@@ -1162,6 +1198,7 @@ impl RegAlloc {
         self.active.clear();
         self.active_xmm.clear();
         self.stack_offset = X87_SCRATCH_BYTES;
+        self.x87_control_words = None;
         self.used_callee_saved.clear();
         self.fp_pseudos.clear();
         self.ld_pseudos.clear();
@@ -1176,6 +1213,34 @@ impl RegAlloc {
         self.live_in.clear();
         self.live_out.clear();
         self.max_local_align = 8;
+    }
+
+    /// Reserve the [`X87ControlWords`] slot if any instruction of `func` is a
+    /// long double to integer conversion.
+    fn reserve_x87_control_words(&mut self, func: &Function, types: &TypeTable) {
+        let converts = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insns)
+            .any(|insn| is_x87_float_to_int(insn, types));
+        if !converts {
+            return;
+        }
+        let frame_align = self.frame_align();
+        let slot = crate::arch::regalloc::grow_frame(
+            &mut self.stack_offset,
+            X87ControlWords::BYTES,
+            X87ControlWords::BYTES,
+            frame_align,
+            self.func_pos,
+        );
+        self.x87_control_words = Some(X87ControlWords { slot });
+    }
+
+    /// The control-word slot, if this function converts a long double to an
+    /// integer.
+    pub(super) fn x87_control_words(&self) -> Option<X87ControlWords> {
+        self.x87_control_words
     }
 
     /// Identify pseudos that are long double (80-bit extended precision).

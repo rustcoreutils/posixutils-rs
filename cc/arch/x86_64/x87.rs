@@ -22,8 +22,8 @@
 //
 
 use super::codegen::X86_64CodeGen;
-use super::lir::{GpOperand, MemAddr, X86Inst, X87BinOp, XmmOperand};
-use super::regalloc::{Loc, Reg, XmmReg, X87_SCRATCH_BYTES};
+use super::lir::{GpOperand, MemAddr, X86Inst, X87BinOp, X87IntWidth, XmmOperand};
+use super::regalloc::{Loc, Reg, X87ControlWords, XmmReg, X87_SCRATCH_BYTES};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
 use crate::float::FpFormat;
 use crate::ir::{Instruction, Opcode, PseudoId};
@@ -876,12 +876,19 @@ impl X86_64CodeGen {
 
     /// Emit long double to integer conversion.
     ///
-    /// Pattern:
-    ///   fldt   src(%rbp)          ; load long double to ST(0)
-    ///   fisttpl dst(%rbp)         ; convert with truncation and store
+    /// The value is converted by the narrowest `fistp` that holds every value
+    /// of the destination type -- see [`fistp_width`] -- under a truncating
+    /// control word ([`Self::emit_x87_truncating_store`]), through the x87
+    /// scratch into `%r10`, and from there to the destination:
     ///
-    /// `fisttp` stores a *signed* integer at every width, so an unsigned
-    /// destination needs help: see [`Self::emit_x87_float_to_unsigned`].
+    /// ```text
+    ///     fldt    src
+    ///     <truncating fistpl scratch>
+    ///     movl    scratch, %r10d
+    /// ```
+    ///
+    /// `unsigned long` is the one integer no `fistp` holds; it takes
+    /// [`Self::emit_x87_float_to_u64`].
     pub(super) fn emit_x87_float_to_int(&mut self, insn: &Instruction) {
         let src = match insn.src.first() {
             Some(&s) => s,
@@ -892,73 +899,93 @@ impl X86_64CodeGen {
             None => return,
         };
 
-        let dst_size = insn.size.max(32);
+        let dst_size = insn.size;
         let dst_loc = self.get_location(target);
 
         // Load long double to x87 stack
         let src_addr = self.get_x87_mem_addr(src);
         self.push_lir(X86Inst::X87Load { addr: src_addr });
 
-        if insn.op == Opcode::FCvtU {
-            self.emit_x87_float_to_unsigned(dst_size, &dst_loc);
+        let Some(width) = fistp_width(dst_size, insn.op == Opcode::FCvtS) else {
+            self.emit_x87_float_to_u64(&dst_loc);
             return;
-        }
-
-        // Determine where to store the result
-        let needs_load_to_reg = matches!(&dst_loc, Loc::Reg(_) | Loc::Xmm(_));
-
-        let store_addr = match &dst_loc {
-            Loc::Stack(offset) => self.stack_mem(*offset),
-            Loc::IncomingArg(offset) => MemAddr::BaseOffset {
-                base: Reg::Rbp,
-                offset: *offset,
-            },
-            _ => {
-                // Store to scratch location, will load to register afterwards
-                // Must be after callee-saved register area to avoid collision
-                self.x87_scratch_addr()
-            }
         };
-
-        // Convert and store with fisttp (truncation toward zero)
-        if dst_size <= 32 {
-            self.push_lir(X86Inst::X87StoreInt32 {
-                addr: store_addr.clone(),
-            });
-        } else {
-            self.push_lir(X86Inst::X87StoreInt64 {
-                addr: store_addr.clone(),
-            });
-        }
-
-        // If destination is a register, load the result
-        if needs_load_to_reg {
-            if let Loc::Reg(dst_reg) = &dst_loc {
-                let op_size = if dst_size <= 32 {
-                    OperandSize::B32
-                } else {
-                    OperandSize::B64
-                };
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Mem(store_addr),
-                    dst: GpOperand::Reg(*dst_reg),
-                });
+        let result = self.x87_scratch_addr();
+        self.emit_x87_truncating_store(width, result.clone());
+        // A 16-bit store is only ever read by a destination of 16 bits or
+        // fewer; every wider one is read at the destination's own width.
+        self.push_lir(if width == X87IntWidth::W16 {
+            X86Inst::Movsx {
+                src_size: OperandSize::B16,
+                dst_size: OperandSize::B32,
+                src: GpOperand::Mem(result),
+                dst: Reg::R10,
             }
-        }
+        } else {
+            X86Inst::Mov {
+                size: OperandSize::from_bits(dst_size.max(32)),
+                src: GpOperand::Mem(result),
+                dst: GpOperand::Reg(Reg::R10),
+            }
+        });
+        self.emit_move_to_loc(Reg::R10, &dst_loc, dst_size);
     }
 
-    /// Convert the long double in ST(0) to an *unsigned* integer in `dst_loc`.
+    /// Store ST(0) to `addr` as an integer of `width`, truncating, and pop.
     ///
-    /// `fisttp` has no unsigned form: it stores a signed integer of the named
-    /// width, so `fisttpl` answers 0x80000000 for any value at or above 2^31
-    /// and `fisttpq` answers 0x8000000000000000 for any value at or above
-    /// 2^63 -- both well inside the unsigned range.
+    /// `fistp` rounds as the control word says, and `fisttp` -- which always
+    /// truncates -- is SSE3, past the x86-64 baseline. So, as gcc does, set
+    /// the rounding-control field (bits 10-11) to truncate for the one
+    /// instruction and put back the word that was there:
     ///
-    /// A 32-bit destination is fixed by converting at 64 bits and keeping the
-    /// low half; the whole of `unsigned int` fits a signed 64-bit result.
-    /// A 64-bit destination needs the range split, exactly as the SSE path
-    /// does in `emit_float_to_u64`:
+    /// ```text
+    ///     fnstcw  saved
+    ///     movzwl  saved, %r11d
+    ///     orl     $0xc00, %r11d
+    ///     movw    %r11w, truncating
+    ///     fldcw   truncating
+    ///     fistpl  addr
+    ///     fldcw   saved
+    /// ```
+    ///
+    /// The words live in the function's [`X87ControlWords`] slot, which the
+    /// allocator reserves for exactly the functions that get here.
+    fn emit_x87_truncating_store(&mut self, width: X87IntWidth, addr: MemAddr) {
+        let words = self
+            .x87_control_words
+            .expect("the allocator reserves the x87 control words for every conversion");
+        let saved = self.stack_field(words.slot(), X87ControlWords::SAVED);
+        let truncating = self.stack_field(words.slot(), X87ControlWords::TRUNCATING);
+        self.push_lir(X86Inst::X87StoreControlWord {
+            addr: saved.clone(),
+        });
+        self.push_lir(X86Inst::Movzx {
+            src_size: OperandSize::B16,
+            dst_size: OperandSize::B32,
+            src: GpOperand::Mem(saved.clone()),
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Or {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(X87_ROUND_TOWARD_ZERO),
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B16,
+            src: GpOperand::Reg(Reg::R11),
+            dst: GpOperand::Mem(truncating.clone()),
+        });
+        self.push_lir(X86Inst::X87LoadControlWord { addr: truncating });
+        self.push_lir(X86Inst::X87StoreInt { width, addr });
+        self.push_lir(X86Inst::X87LoadControlWord { addr: saved });
+    }
+
+    /// Convert the long double in ST(0) to an `unsigned long` in `dst_loc`.
+    ///
+    /// `fistpq` stores a *signed* 64-bit integer and answers
+    /// 0x8000000000000000 for any value at or above 2^63, well inside the
+    /// unsigned range. So the range is split, exactly as the SSE path does in
+    /// `emit_float_to_u64`, and as gcc does:
     ///
     /// ```text
     ///     movabs $0x43e0000000000000, %r11   # 2^63 as a double
@@ -966,13 +993,13 @@ impl X86_64CodeGen {
     ///     fldl   8+scratch                   # ST0 = 2^63, ST1 = x
     ///     fucomip %st(1), %st                # compare, pop; ST0 = x
     ///     jbe    .big                        # 2^63 <= x
-    ///     fisttpq scratch
+    ///     <truncating fistpq scratch>
     ///     mov    scratch, %r10
     ///     jmp    .done
     ///   .big:
     ///     fldl   8+scratch
     ///     fsubrp                             # ST0 = x - 2^63
-    ///     fisttpq scratch
+    ///     <truncating fistpq scratch>
     ///     mov    scratch, %r10
     ///     movabs $1<<63, %r11
     ///     xor    %r11, %r10                  # put the bit back
@@ -981,85 +1008,127 @@ impl X86_64CodeGen {
     ///
     /// The subtraction is exact -- 2^63 is a power of two and x87's 64-bit
     /// significand covers the whole of `unsigned long long`.
-    fn emit_x87_float_to_unsigned(&mut self, dst_size: u32, dst_loc: &Loc) {
+    fn emit_x87_float_to_u64(&mut self, dst_loc: &Loc) {
         // Two disjoint halves of the 16-byte x87 scratch: the result goes in
         // the first, the 2^63 constant in byte 8 of the same object.
         let result_addr = self.x87_scratch_addr();
         let const_addr = self.stack_field(X87_SCRATCH_BYTES, 8);
 
-        if dst_size > 32 {
-            let uid = self.unique_label_counter;
-            self.unique_label_counter += 1;
-            let big_label = Label::block(&self.base.current_fn, 10000 + uid * 2);
-            let done_label = Label::block(&self.base.current_fn, 10000 + uid * 2 + 1);
+        let uid = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        let big_label = Label::block(&self.base.current_fn, 10000 + uid * 2);
+        let done_label = Label::block(&self.base.current_fn, 10000 + uid * 2 + 1);
 
-            self.push_lir(X86Inst::MovAbs {
-                imm: TWO_POW_63_BITS,
-                dst: Reg::R11,
-            });
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Reg(Reg::R11),
-                dst: GpOperand::Mem(const_addr.clone()),
-            });
-            self.push_lir(X86Inst::X87LoadDouble {
-                addr: const_addr.clone(),
-            });
-            self.push_lir(X86Inst::X87CmpPop);
-            self.push_lir(X86Inst::Jcc {
-                cc: CondCode::Ule,
-                target: big_label.clone(),
-            });
-
-            self.push_lir(X86Inst::X87StoreInt64 {
-                addr: result_addr.clone(),
-            });
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Mem(result_addr.clone()),
-                dst: GpOperand::Reg(Reg::R10),
-            });
-            self.push_lir(X86Inst::Jmp {
-                target: done_label.clone(),
-            });
-
-            self.push_lir(X86Inst::Directive(Directive::BlockLabel(big_label)));
-            self.push_lir(X86Inst::X87LoadDouble { addr: const_addr });
-            self.push_lir(X86Inst::X87BinOp { op: X87BinOp::Sub });
-            self.push_lir(X86Inst::X87StoreInt64 {
-                addr: result_addr.clone(),
-            });
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Mem(result_addr),
-                dst: GpOperand::Reg(Reg::R10),
-            });
-            // Put back the bit the subtraction removed. It is known clear in
-            // the converted result, so `xor` and `add` agree here.
-            self.push_lir(X86Inst::MovAbs {
-                imm: i64::MIN,
-                dst: Reg::R11,
-            });
-            self.push_lir(X86Inst::Xor {
-                size: OperandSize::B64,
-                src: GpOperand::Reg(Reg::R11),
-                dst: Reg::R10,
-            });
-            self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
-            self.emit_move_to_loc(Reg::R10, dst_loc, dst_size);
-            return;
-        }
-
-        // 32-bit destination: convert at 64 bits and keep the low half. Every
-        // `unsigned int` fits a signed 64-bit result, so no split is needed.
-        self.push_lir(X86Inst::X87StoreInt64 {
-            addr: result_addr.clone(),
+        self.push_lir(X86Inst::MovAbs {
+            imm: TWO_POW_63_BITS,
+            dst: Reg::R11,
         });
         self.push_lir(X86Inst::Mov {
-            size: OperandSize::B32,
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R11),
+            dst: GpOperand::Mem(const_addr.clone()),
+        });
+        self.push_lir(X86Inst::X87LoadDouble {
+            addr: const_addr.clone(),
+        });
+        self.push_lir(X86Inst::X87CmpPop);
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Ule,
+            target: big_label.clone(),
+        });
+
+        self.emit_x87_truncating_store(X87IntWidth::W64, result_addr.clone());
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(result_addr.clone()),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        self.push_lir(X86Inst::Jmp {
+            target: done_label.clone(),
+        });
+
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(big_label)));
+        self.push_lir(X86Inst::X87LoadDouble { addr: const_addr });
+        self.push_lir(X86Inst::X87BinOp { op: X87BinOp::Sub });
+        self.emit_x87_truncating_store(X87IntWidth::W64, result_addr.clone());
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
             src: GpOperand::Mem(result_addr),
             dst: GpOperand::Reg(Reg::R10),
         });
-        self.emit_move_to_loc(Reg::R10, dst_loc, dst_size);
+        // Put back the bit the subtraction removed. It is known clear in
+        // the converted result, so `xor` and `add` agree here.
+        self.push_lir(X86Inst::MovAbs {
+            imm: i64::MIN,
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Xor {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R11),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+        self.emit_move_to_loc(Reg::R10, dst_loc, 64);
+    }
+}
+
+/// Whether `insn` converts a long double to an integer.
+///
+/// The one rule for both the codegen dispatch and the allocator, which
+/// reserves the [`X87ControlWords`] slot for exactly these.
+pub(super) fn is_x87_float_to_int(insn: &Instruction, types: &TypeTable) -> bool {
+    matches!(insn.op, Opcode::FCvtS | Opcode::FCvtU)
+        && insn
+            .src_typ
+            .is_some_and(|t| types.kind(t) == TypeKind::LongDouble)
+}
+
+/// The narrowest `fistp` holding every value of a `bits`-bit integer, or
+/// `None` when none does -- `unsigned long`, which needs a 65-bit signed
+/// store.
+///
+/// An unsigned destination needs one bit more than its width, since `fistp`
+/// stores a signed integer: an `unsigned int` is converted at 64 bits and an
+/// `unsigned short` at 32, as gcc does. Any value representable in the
+/// destination is then representable in the store, and C leaves every other
+/// value undefined.
+fn fistp_width(bits: u32, signed: bool) -> Option<X87IntWidth> {
+    match bits + u32::from(!signed) {
+        0..=16 => Some(X87IntWidth::W16),
+        17..=32 => Some(X87IntWidth::W32),
+        33..=64 => Some(X87IntWidth::W64),
+        _ => None,
+    }
+}
+
+/// The x87 control word's rounding-control field set to round toward zero.
+const X87_ROUND_TOWARD_ZERO: i64 = 0xc00;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Signed destinations store at their own width (with `char` widened to
+    /// the narrowest `fistp`), unsigned ones one bit wider, and `unsigned
+    /// long` -- which no `fistp` holds -- takes the split.
+    #[test]
+    fn fistp_width_holds_every_destination_value() {
+        use X87IntWidth::*;
+        for (bits, signed, want) in [
+            (8, true, Some(W16)),
+            (16, true, Some(W16)),
+            (32, true, Some(W32)),
+            (64, true, Some(W64)),
+            (8, false, Some(W16)),
+            (16, false, Some(W32)),
+            (32, false, Some(W64)),
+            (64, false, None),
+        ] {
+            assert_eq!(
+                fistp_width(bits, signed),
+                want,
+                "{bits} bits, signed {signed}"
+            );
+        }
     }
 }

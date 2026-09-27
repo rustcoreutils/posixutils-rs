@@ -181,6 +181,7 @@ impl X86_64CodeGen {
         self.callee_saved_regs = alloc.callee_saved_used().to_vec();
         self.max_local_align = alloc.max_local_align();
         self.frame_base = alloc.frame_base();
+        self.x87_control_words = alloc.x87_control_words();
         // Pad callee_saved_offset to multiple of 16 so that 16-byte-aligned
         // stack_offset values produce 16-byte-aligned final addresses.
         // rbp is 16-aligned (ABI), so -(padded_offset + aligned_stack_offset) is also aligned.

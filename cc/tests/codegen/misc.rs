@@ -16222,3 +16222,67 @@ int main(void)
         );
     }
 }
+
+// ============================================================================
+// long double to integer on the x86-64 baseline
+// ============================================================================
+
+// Truncation under every rounding mode, and the mode left as it was found.
+const LD_TO_INT_PROGRAM: &str = r#"
+#include <fenv.h>
+static int check(void) {
+    volatile long double a = 2.9L, b = -2.9L, c = 0x1p62L + 0.5L, d = -0.99L, e = 65535.75L;
+    if ((int)a != 2 || (int)b != -2) return 1;
+    if ((long)c != 0x4000000000000000L) return 2;
+    if ((long long)d != 0 || (unsigned short)e != 65535 || (short)b != -2) return 3;
+    if ((unsigned)a != 2u || (unsigned long)c != 0x4000000000000000UL) return 4;
+    return 0;
+}
+int main(void) {
+    const int modes[] = { FE_TONEAREST, FE_UPWARD, FE_DOWNWARD, FE_TOWARDZERO };
+    for (int i = 0; i < 4; i++) {
+        fesetround(modes[i]);
+        int r = check();
+        if (r) return 10 * (i + 1) + r;
+        /* The conversion must leave the rounding mode as it found it. */
+        if (fegetround() != modes[i]) return 50 + i;
+        volatile long double h = 0.5L;
+        volatile long double one = 1.0L;
+        long double s = h + one * 0x1p-64L;   /* an inexact add: rounds per mode */
+        (void)s;
+    }
+    fesetround(FE_TONEAREST);
+    return 0;
+}
+"#;
+
+/// `fisttp` is SSE3, which the x86-64 baseline c17 targets does not include:
+/// gcc converts a long double to an integer by switching the x87 control word
+/// to truncation around a `fistp`, then restoring it. The value was always
+/// right; the instruction raised SIGILL on a processor without SSE3.
+#[test]
+fn codegen_x86_64_long_double_to_integer_is_baseline() {
+    if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        return;
+    }
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("ld_to_int{opt}"),
+                LD_TO_INT_PROGRAM,
+                &[opt.to_string(), "-lm".to_string()]
+            ),
+            0,
+            "{opt}"
+        );
+        let asm = asm_for_at(
+            "ld_to_int_asm",
+            "int f(long double x) { return (int)x; }\n\
+             long g(long double x) { return (long)x; }\n\
+             unsigned long h(long double x) { return (unsigned long)x; }\n\
+             short k(long double x) { return (short)x; }\n",
+            &[opt],
+        );
+        assert!(!asm.contains("fisttp"), "{opt}: fisttp emitted:\n{asm}");
+    }
+}

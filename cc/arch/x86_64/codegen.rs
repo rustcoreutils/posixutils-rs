@@ -15,7 +15,8 @@
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
-use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, XmmReg};
+use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, X87ControlWords, XmmReg};
+use crate::arch::x86_64::x87::is_x87_float_to_int;
 use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::{TypeKind, TypeTable};
@@ -84,6 +85,9 @@ pub struct X86_64CodeGen {
     pub(super) max_local_align: i32,
     /// Pseudos that are 128-bit integers (need full 16-byte copies)
     pub(super) int128_pseudos: HashSet<PseudoId>,
+    /// Where the allocator put the x87 control words, when this function
+    /// converts a long double to an integer.
+    pub(super) x87_control_words: Option<X87ControlWords>,
 }
 
 impl X86_64CodeGen {
@@ -110,6 +114,7 @@ impl X86_64CodeGen {
             frame_base: FrameBase::Rbp,
             max_local_align: 16,
             int128_pseudos: HashSet::new(),
+            x87_control_words: None,
         }
     }
 
@@ -1008,10 +1013,7 @@ impl X86_64CodeGen {
             // Float to integer conversions
             Opcode::FCvtU | Opcode::FCvtS => {
                 // Use x87 for long double source
-                let src_is_longdouble = insn
-                    .src_typ
-                    .is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
-                if src_is_longdouble {
+                if is_x87_float_to_int(insn, types) {
                     self.emit_x87_float_to_int(insn);
                 } else {
                     self.emit_float_to_int(insn, types);

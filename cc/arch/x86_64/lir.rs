@@ -194,6 +194,29 @@ pub enum X87BinOp {
     Div,
 }
 
+/// The integer width an x87 `fistp` stores.
+///
+/// `fistp` has a 16-, a 32- and a 64-bit form and nothing narrower, so a
+/// conversion to `char` goes through the 16-bit one; the type keeps a width
+/// the instruction does not have from being asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum X87IntWidth {
+    W16,
+    W32,
+    W64,
+}
+
+impl X87IntWidth {
+    /// The AT&T mnemonic that stores this width and pops.
+    fn fistp(self) -> &'static str {
+        match self {
+            X87IntWidth::W16 => "fistps",
+            X87IntWidth::W32 => "fistpl",
+            X87IntWidth::W64 => "fistpq",
+        }
+    }
+}
+
 // x86-64 LIR Instructions
 
 /// x86-64 Low-level IR instruction
@@ -581,11 +604,19 @@ pub enum X86Inst {
     /// FILDQ - Load 64-bit integer to x87 ST(0), converting to extended precision
     X87LoadInt64 { addr: MemAddr },
 
-    /// FISTTPL - Convert ST(0) to 32-bit integer with truncation, pop
-    X87StoreInt32 { addr: MemAddr },
+    /// FISTP{S,L,Q} - Convert ST(0) to an integer of `width`, rounding as the
+    /// control word's rounding-control field says, and pop.
+    ///
+    /// Not `fisttp`, which always truncates but is SSE3 and so not part of
+    /// the x86-64 baseline. C's truncation is had by switching the control
+    /// word around this; see `X86_64CodeGen::emit_x87_truncating_store`.
+    X87StoreInt { width: X87IntWidth, addr: MemAddr },
 
-    /// FISTTPQ - Convert ST(0) to 64-bit integer with truncation, pop
-    X87StoreInt64 { addr: MemAddr },
+    /// FNSTCW - Store the x87 control word (16 bits) to memory
+    X87StoreControlWord { addr: MemAddr },
+
+    /// FLDCW - Load the x87 control word (16 bits) from memory
+    X87LoadControlWord { addr: MemAddr },
 
     // ========================================================================
     // Special Instructions
@@ -987,8 +1018,13 @@ impl EmitAsm for X86Inst {
             X86Inst::X87StoreDouble { addr } => Self::emit_x87_mem("fstpl", addr, target, out),
             X86Inst::X87LoadInt32 { addr } => Self::emit_x87_mem("fildl", addr, target, out),
             X86Inst::X87LoadInt64 { addr } => Self::emit_x87_mem("fildq", addr, target, out),
-            X86Inst::X87StoreInt32 { addr } => Self::emit_x87_mem("fisttpl", addr, target, out),
-            X86Inst::X87StoreInt64 { addr } => Self::emit_x87_mem("fisttpq", addr, target, out),
+            X86Inst::X87StoreInt { width, addr } => {
+                Self::emit_x87_mem(width.fistp(), addr, target, out)
+            }
+            X86Inst::X87StoreControlWord { addr } => {
+                Self::emit_x87_mem("fnstcw", addr, target, out)
+            }
+            X86Inst::X87LoadControlWord { addr } => Self::emit_x87_mem("fldcw", addr, target, out),
             // Special Instructions
             X86Inst::Cltd => {
                 let _ = writeln!(out, "    cltd");
@@ -1472,6 +1508,34 @@ mod tests {
                 out
             );
         }
+    }
+
+    /// The conversion stores are the baseline `fistp` at each width, never
+    /// the SSE3 `fisttp`; the control-word pair brackets them.
+    #[test]
+    fn test_x87_integer_store_and_control_word_emit() {
+        let target = linux_target();
+        let addr = MemAddr::BaseOffset {
+            base: Reg::Rbp,
+            offset: -24,
+        };
+        for (width, expected) in [
+            (X87IntWidth::W16, "fistps -24(%rbp)"),
+            (X87IntWidth::W32, "fistpl -24(%rbp)"),
+            (X87IntWidth::W64, "fistpq -24(%rbp)"),
+        ] {
+            let mut out = String::new();
+            X86Inst::X87StoreInt {
+                width,
+                addr: addr.clone(),
+            }
+            .emit(&target, &mut out);
+            assert_eq!(out.trim(), expected);
+        }
+        let mut out = String::new();
+        X86Inst::X87StoreControlWord { addr: addr.clone() }.emit(&target, &mut out);
+        X86Inst::X87LoadControlWord { addr }.emit(&target, &mut out);
+        assert_eq!(out, "    fnstcw -24(%rbp)\n    fldcw -24(%rbp)\n");
     }
 
     #[test]

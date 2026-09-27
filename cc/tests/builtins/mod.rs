@@ -22,6 +22,7 @@ mod frame_address;
 mod gnu_atomics;
 mod has_feature;
 mod intrinsics;
+mod libm;
 mod math;
 mod mem_expand;
 mod memory;

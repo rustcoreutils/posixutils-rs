@@ -58,6 +58,7 @@ SSA-form intermediate representation for the c17 C17 compiler. Inspired by Linus
 | `fneg` | Float negation (unary) |
 | `fabs` | Float absolute value (unary): clears the sign bit and nothing else |
 | `copysign` | The first operand with the sign bit of the second, and nothing else changed |
+| `sqrt` | Correctly rounded square root (unary); sets no `errno`. Names its library function, which a target without the instruction calls instead after optimization |
 
 ### Integer Comparisons (result: 0 or 1)
 

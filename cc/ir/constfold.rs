@@ -376,10 +376,15 @@ pub(crate) fn eval_fbinop(op: Opcode, fmt: FpFormat, a: FloatVal, b: FloatVal) -
 /// computes nothing and raises nothing, and a NaN keeps its payload. Both are
 /// also exact, so the result needs no rounding that the operand has not
 /// already had.
+///
+/// `Sqrt` folds as [`FloatVal::sqrt`] says: rounded once like arithmetic,
+/// and exact for a zero, `+inf` and a quiet NaN; a negative operand, whose
+/// NaN is the target's own, and a signalling NaN are left to run time.
 pub(crate) fn eval_funop(op: Opcode, fmt: FpFormat, a: FloatVal) -> Option<FloatVal> {
     match op {
         Opcode::FNeg => Some(a.round_to_format(fmt).negated()),
         Opcode::Fabs => Some(a.round_to_format(fmt).magnitude()),
+        Opcode::Sqrt => a.sqrt(fmt),
         _ => None,
     }
 }

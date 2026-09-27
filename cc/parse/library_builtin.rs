@@ -16,12 +16,73 @@
 // the table names for it.
 //
 
-use super::ast::{Expr, ExprKind, InlineLibraryFn};
+use super::ast::{Expr, ExprKind, InlineLibraryFn, MathErrno};
 use super::parser::{ParseResult, Parser};
 use crate::kw;
 use crate::strings::StringId;
 use crate::token::lexer::Position;
 use crate::types::{Type, TypeId, TypeTable};
+
+/// What the command line says about evaluating library calls in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LibraryCallPolicy {
+    /// `-O1` and above. At `-O0` gcc calls the library for a libm function
+    /// named by its own spelling, and computes in place only one named
+    /// `__builtin_*`; c17 does the same.
+    pub optimizing: bool,
+    /// `-fmath-errno`, gcc's default: a domain error sets `errno`, so a
+    /// function that has one keeps a call for the arguments that raise it.
+    pub math_errno: bool,
+}
+
+impl Default for LibraryCallPolicy {
+    /// gcc's defaults once optimizing: in place, with `errno` kept.
+    fn default() -> Self {
+        LibraryCallPolicy {
+            optimizing: true,
+            math_errno: true,
+        }
+    }
+}
+
+impl LibraryCallPolicy {
+    /// `func` as the table names it, with `-fno-math-errno` applied: a
+    /// function that would report a domain error through `errno` does not.
+    fn applied_to(self, func: InlineLibraryFn) -> InlineLibraryFn {
+        match func {
+            InlineLibraryFn::Sqrt(MathErrno::Set) if !self.math_errno => {
+                InlineLibraryFn::Sqrt(MathErrno::Ignored)
+            }
+            _ => func,
+        }
+    }
+
+    /// Whether a call to `func`, written with `spelling`, is computed in
+    /// place rather than called.
+    ///
+    /// Always once optimizing. At `-O0` gcc calls the library for the bare
+    /// spelling of a libm function, and for any spelling of one that must
+    /// set `errno`, since only its optimizer can split a call off for the
+    /// arguments that set it. The magnitudes, `copysign` and the complex
+    /// accessors are bit operations and moves, and are in place at every
+    /// level -- as `abs` and `fabs` are in gcc, which turns them into
+    /// operators before anything else sees them.
+    fn in_place(self, func: InlineLibraryFn, spelling: Spelling) -> bool {
+        if self.optimizing {
+            return true;
+        }
+        match func {
+            InlineLibraryFn::IntAbs
+            | InlineLibraryFn::Fabs
+            | InlineLibraryFn::CopySign
+            | InlineLibraryFn::ComplexReal
+            | InlineLibraryFn::ComplexImag
+            | InlineLibraryFn::Conjugate => true,
+            InlineLibraryFn::Sqrt(MathErrno::Set) => false,
+            InlineLibraryFn::Sqrt(MathErrno::Ignored) => spelling == Spelling::Reserved,
+        }
+    }
+}
 
 /// A type in one of the prototypes below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +152,7 @@ enum Lowering {
     /// enumerated rather than derived. `sin` and `log` are not among them:
     /// `sinf(x)` and `(float)sin((double)x)` differ in the last bit for some
     /// `x`, and narrowing one is a wrong answer rather than a faster one.
-    NarrowingCall { narrow: &'static str },
+    NarrowingCall { narrow: StringId },
     /// A block memory function, as its [`ExprKind`] node. Whether it becomes
     /// a call or loads and stores is decided on the IR (`ir::memexpand`),
     /// where a length that only inlining makes constant can still be seen.
@@ -176,12 +237,15 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         entry(kw::COPYSIGN,  Some(kw::BUILTIN_COPYSIGN),  Double,            &[Double, Double],                InPlace(F::CopySign)),
         entry(kw::COPYSIGNF, Some(kw::BUILTIN_COPYSIGNF), Float,             &[Float, Float],                  InPlace(F::CopySign)),
         entry(kw::COPYSIGNL, Some(kw::BUILTIN_COPYSIGNL), LongDouble,        &[LongDouble, LongDouble],        InPlace(F::CopySign)),
-        entry(kw::FLOOR,     None,                        Double,            &[Double],                        NarrowingCall { narrow: "floorf" }),
-        entry(kw::CEIL,      None,                        Double,            &[Double],                        NarrowingCall { narrow: "ceilf" }),
-        entry(kw::TRUNC,     None,                        Double,            &[Double],                        NarrowingCall { narrow: "truncf" }),
-        entry(kw::ROUND,     None,                        Double,            &[Double],                        NarrowingCall { narrow: "roundf" }),
-        entry(kw::RINT,      None,                        Double,            &[Double],                        NarrowingCall { narrow: "rintf" }),
-        entry(kw::NEARBYINT, None,                        Double,            &[Double],                        NarrowingCall { narrow: "nearbyintf" }),
+        entry(kw::SQRT,      Some(kw::BUILTIN_SQRT),      Double,            &[Double],                        InPlace(F::Sqrt(MathErrno::Set))),
+        entry(kw::SQRTF,     Some(kw::BUILTIN_SQRTF),     Float,             &[Float],                         InPlace(F::Sqrt(MathErrno::Set))),
+        entry(kw::SQRTL,     Some(kw::BUILTIN_SQRTL),     LongDouble,        &[LongDouble],                    InPlace(F::Sqrt(MathErrno::Set))),
+        entry(kw::FLOOR,     None,                        Double,            &[Double],                        NarrowingCall { narrow: kw::FLOORF }),
+        entry(kw::CEIL,      None,                        Double,            &[Double],                        NarrowingCall { narrow: kw::CEILF }),
+        entry(kw::TRUNC,     None,                        Double,            &[Double],                        NarrowingCall { narrow: kw::TRUNCF }),
+        entry(kw::ROUND,     None,                        Double,            &[Double],                        NarrowingCall { narrow: kw::ROUNDF }),
+        entry(kw::RINT,      None,                        Double,            &[Double],                        NarrowingCall { narrow: kw::RINTF }),
+        entry(kw::NEARBYINT, None,                        Double,            &[Double],                        NarrowingCall { narrow: kw::NEARBYINTF }),
         entry(kw::CREAL,     Some(kw::BUILTIN_CREAL),     Double,            &[ComplexDouble],                 InPlace(F::ComplexReal)),
         entry(kw::CREALF,    Some(kw::BUILTIN_CREALF),    Float,             &[ComplexFloat],                  InPlace(F::ComplexReal)),
         entry(kw::CREALL,    Some(kw::BUILTIN_CREALL),    LongDouble,        &[ComplexLongDouble],             InPlace(F::ComplexReal)),
@@ -278,7 +342,7 @@ impl Parser<'_> {
         if spelling == Spelling::Bare && !self.is_special(b'(') {
             return None;
         }
-        Some(self.parse_checked_library_call(lb, pos))
+        Some(self.parse_checked_library_call(lb, spelling, pos))
     }
 
     /// The argument list of a call to `lb`, checked as an ordinary call to a
@@ -286,6 +350,7 @@ impl Parser<'_> {
     fn parse_checked_library_call(
         &mut self,
         lb: &LibraryBuiltin,
+        spelling: Spelling,
         pos: Position,
     ) -> ParseResult<Expr> {
         let call_pos = self.current_pos();
@@ -298,7 +363,7 @@ impl Parser<'_> {
         let func_type = self.types.intern(Type::function(ret, params, false, false));
         let sound = self.check_call(Some(func_type), &args, call_pos);
         if sound && args.len() == lb.params.len() {
-            Ok(self.lower_library_call(lb, args, pos))
+            Ok(self.lower_library_call(lb, spelling, args, pos))
         } else {
             // Diagnosed already. A zero of the return type stands in for the
             // call, so the enclosing expression still parses and types, and
@@ -309,18 +374,30 @@ impl Parser<'_> {
     }
 
     /// Evaluate a checked call to `lb` of `args`, one for each of its
-    /// parameters, as the table says to.
-    fn lower_library_call(&mut self, lb: &LibraryBuiltin, args: Vec<Expr>, pos: Position) -> Expr {
+    /// parameters, as the table says to -- and as the command line allows
+    /// (see [`LibraryCallPolicy`]).
+    fn lower_library_call(
+        &mut self,
+        lb: &LibraryBuiltin,
+        spelling: Spelling,
+        args: Vec<Expr>,
+        pos: Position,
+    ) -> Expr {
         let ret = lb.ret.id(self.types);
         let params = self.library_params(lb);
         match lb.lowering {
             Lowering::InPlace(func) => {
+                let func = self.library_call_policy.applied_to(func);
                 let args = args
                     .into_iter()
-                    .zip(params)
-                    .map(|(arg, param)| self.convert_operand(arg, param))
+                    .zip(&params)
+                    .map(|(arg, &param)| self.convert_operand(arg, param))
                     .collect();
-                Self::typed_expr(ExprKind::InlineLibraryCall { func, args }, ret, pos)
+                if !self.library_call_policy.in_place(func, spelling) {
+                    return self.libm_call(lb.bare, ret, &params, args, pos);
+                }
+                let name = lb.bare;
+                Self::typed_expr(ExprKind::InlineLibraryCall { func, args, name }, ret, pos)
             }
             Lowering::NarrowingCall { narrow } => {
                 let (Ok([arg]), &[param]) = (<[Expr; 1]>::try_from(args), params.as_slice()) else {
@@ -328,11 +405,10 @@ impl Parser<'_> {
                 };
                 if self.is_binary32(&arg) {
                     let f = self.types.float_id;
-                    self.libm_call(narrow, f, &[f], arg, pos)
+                    self.libm_call(narrow, f, &[f], vec![arg], pos)
                 } else {
-                    let name = self.idents.get_opt(lb.bare).unwrap_or("");
                     let arg = self.convert_operand(arg, param);
-                    self.libm_call(name, ret, &[param], arg, pos)
+                    self.libm_call(lb.bare, ret, &[param], vec![arg], pos)
                 }
             }
             Lowering::Memory(func) => {

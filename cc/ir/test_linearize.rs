@@ -19,7 +19,7 @@ use crate::parse::ast::{
 };
 use crate::strings::StringTable;
 use crate::symbol::Symbol;
-use crate::target::Target;
+use crate::target::{Arch, Os, Target};
 use crate::types::{CompositeType, StructMember, Type, TypeTable};
 
 /// Create a default position for test code
@@ -7230,6 +7230,16 @@ fn linearize_source(src: &str, target: &Target) -> Module {
 /// [`linearize_source`], also handing back the type table the module's type
 /// ids index.
 fn linearize_source_with_types(src: &str, target: &Target) -> (Module, TypeTable) {
+    linearize_source_under(src, target, Default::default())
+}
+
+/// [`linearize_source_with_types`], with library builtins evaluated as
+/// `policy` says.
+fn linearize_source_under(
+    src: &str,
+    target: &Target,
+    policy: crate::parse::LibraryCallPolicy,
+) -> (Module, TypeTable) {
     let mut strings = StringTable::new();
     let mut tokenizer = crate::token::lexer::Tokenizer::new(src.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
@@ -7238,6 +7248,7 @@ fn linearize_source_with_types(src: &str, target: &Target) -> (Module, TypeTable
     let tu = {
         let mut parser =
             crate::parse::Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+        parser.set_library_call_policy(policy);
         parser.parse_translation_unit().expect("parse")
     };
     let module = linearize(&tu, &symbols, &types, &strings, target, false);
@@ -7315,6 +7326,56 @@ fn test_identifier_list_parameters_arrive_promoted() {
             .any(|i| i.op == Opcode::FCvtF),
         "the double must be converted to the float parameter on entry"
     );
+}
+
+/// Every instruction of the function `name` in `module`.
+fn insns_of<'m>(module: &'m Module, name: &str) -> Vec<&'m Instruction> {
+    let f = module.functions.iter().find(|f| f.name == name).unwrap();
+    f.blocks.iter().flat_map(|bb| bb.insns.iter()).collect()
+}
+
+/// `sqrt` is the `Sqrt` opcode, naming its library function, with a call to
+/// that function behind an ordered `x < 0` so that a domain error still sets
+/// `errno`.
+#[test]
+fn test_sqrt_keeps_a_call_for_errno() {
+    let src = "double sqrt(double);\ndouble f(double x) { return sqrt(x); }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    let insns = insns_of(&module, "f");
+    let sqrt: Vec<_> = insns.iter().filter(|i| i.op == Opcode::Sqrt).collect();
+    assert_eq!(sqrt.len(), 1);
+    assert_eq!(sqrt[0].func_name.as_deref(), Some("sqrt"));
+    let calls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::Call).collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].func_name.as_deref(), Some("sqrt"));
+    assert!(insns.iter().any(|i| i.op == Opcode::FCmpOLt));
+    assert!(insns.iter().any(|i| i.op == Opcode::Phi));
+}
+
+/// Under `-fno-math-errno` the opcode stands alone; on a target without the
+/// instruction (binary128 on aarch64) the call alone does everything.
+#[test]
+fn test_sqrt_without_errno_or_without_an_instruction() {
+    let policy = crate::parse::LibraryCallPolicy {
+        optimizing: true,
+        math_errno: false,
+    };
+    let src = "double sqrt(double);\ndouble f(double x) { return sqrt(x); }\n";
+    let (module, _) = linearize_source_under(src, &Target::new(Arch::X86_64, Os::Linux), policy);
+    let ops: Vec<Opcode> = insns_of(&module, "f").iter().map(|i| i.op).collect();
+    assert!(ops.contains(&Opcode::Sqrt));
+    assert!(!ops.contains(&Opcode::Call) && !ops.contains(&Opcode::FCmpOLt));
+
+    let src = "long double sqrtl(long double);\n\
+               long double f(long double x) { return sqrtl(x); }\n";
+    let module = linearize_source(src, &Target::new(Arch::Aarch64, Os::Linux));
+    let insns = insns_of(&module, "f");
+    assert!(!insns
+        .iter()
+        .any(|i| i.op == Opcode::Sqrt || i.op == Opcode::FCmpOLt));
+    let calls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::Call).collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].func_name.as_deref(), Some("sqrtl"));
 }
 
 /// `abs` and its siblings become the branch-free `(x ^ s) - s` sequence

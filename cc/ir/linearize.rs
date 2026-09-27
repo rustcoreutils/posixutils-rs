@@ -1932,7 +1932,9 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcountll { arg }
             | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
 
-            ExprKind::InlineLibraryCall { args, .. } => args.iter().all(|a| self.is_pure_expr(a)),
+            ExprKind::InlineLibraryCall { func, args, .. } => {
+                !func.has_side_effects() && args.iter().all(|a| self.is_pure_expr(a))
+            }
 
             // Pure iff both operands are: the relation itself reads nothing
             // else and raises nothing, which is the point of the family.
@@ -4111,12 +4113,14 @@ impl<'a> Linearizer<'a> {
 
     /// A library function's call evaluated in place: its arguments, already
     /// converted to the parameter types, and the computation the call stands
-    /// for. Never an lvalue, so only ever reached for its value.
+    /// for. Never an lvalue, so only ever reached for its value. `name` is
+    /// the library function's, for what is still a call.
     fn linearize_inline_library_call(
         &mut self,
         expr: &Expr,
         func: InlineLibraryFn,
         args: &[Expr],
+        name: StringId,
     ) -> PseudoId {
         let typ = self.expr_type(expr);
         match (func, args) {
@@ -4141,6 +4145,10 @@ impl<'a> Linearizer<'a> {
                 self.linearize_complex_half(arg, ComplexHalf::Imag)
             }
             (InlineLibraryFn::Conjugate, [arg]) => self.emit_complex_conjugate(arg, typ),
+            (InlineLibraryFn::Sqrt(errno), [arg]) => {
+                let arg_val = self.linearize_expr(arg);
+                self.emit_sqrt(arg_val, typ, name, errno)
+            }
             _ => unreachable!(
                 "{func:?} takes {} arguments, and the parser checked the call",
                 func.arity()
@@ -6464,8 +6472,8 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Setjmp { .. }
             | ExprKind::Longjmp { .. } => self.linearize_builtin(expr),
 
-            ExprKind::InlineLibraryCall { func, args } => {
-                self.linearize_inline_library_call(expr, *func, args)
+            ExprKind::InlineLibraryCall { func, args, name } => {
+                self.linearize_inline_library_call(expr, *func, args, *name)
             }
 
             ExprKind::OffsetOf { type_id, path } => self.linearize_offsetof(type_id, path),

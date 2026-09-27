@@ -1464,7 +1464,7 @@ fn builtins_signbit_and_copysign_need_no_libm() {
 }
 
 /// Whether `asm` calls a function whose name ends in one of `names`.
-fn calls_any(asm: &str, names: &[&str]) -> bool {
+pub(super) fn calls_any(asm: &str, names: &[&str]) -> bool {
     asm.lines().any(|l| {
         let mut w = l.split_whitespace();
         matches!(w.next(), Some("call" | "bl" | "jmp" | "b"))

@@ -290,6 +290,9 @@ pub struct Parser<'a> {
     /// iterated, so no iteration order can reach the output. See the container
     /// selection rule in `cc/CLAUDE.md`.
     pub(super) vm_typedefs: HashMap<SymbolId, u32>,
+    /// How a call to a library builtin is evaluated: the optimization level
+    /// and `-f[no-]math-errno`. See [`Self::set_library_call_policy`].
+    pub(super) library_call_policy: super::library_builtin::LibraryCallPolicy,
 }
 
 impl<'a> Parser<'a> {
@@ -333,9 +336,17 @@ impl<'a> Parser<'a> {
             pack_directives,
             pack_cursor: 0,
             vm_typedefs: HashMap::new(),
+            library_call_policy: Default::default(),
             pack_current: None,
             pack_stack: Vec::new(),
         }
+    }
+
+    /// Evaluate library builtins as the command line says: whether the
+    /// optimizer is on, and whether `errno` is to be set. The default is
+    /// [`LibraryCallPolicy::default`](super::library_builtin::LibraryCallPolicy).
+    pub fn set_library_call_policy(&mut self, policy: super::library_builtin::LibraryCallPolicy) {
+        self.library_call_policy = policy;
     }
 
     /// The alignment cap `#pragma pack` puts on a structure defined here.

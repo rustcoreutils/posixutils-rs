@@ -516,6 +516,13 @@ pub enum X86Inst {
         dst: XmmReg,
     },
 
+    /// SQRTSS/SQRTSD - Square root of scalar floating-point
+    SqrtFp {
+        size: FpSize,
+        src: XmmOperand,
+        dst: XmmReg,
+    },
+
     /// XORPS/XORPD - XOR packed floating-point (used for zeroing/negation)
     XorFp {
         size: FpSize,
@@ -579,6 +586,9 @@ pub enum X86Inst {
 
     /// FABS - Clear the sign of ST(0)
     X87Abs,
+
+    /// FSQRT - Replace ST(0) by its square root
+    X87Sqrt,
 
     /// FCOMIP - Compare ST(0) with ST(1), set EFLAGS, pop ST(0)
     X87CmpPop,
@@ -930,6 +940,9 @@ impl EmitAsm for X86Inst {
             X86Inst::DivFp { size, src, dst } => {
                 Self::emit_fp_alu("div", size, src, dst, target, out)
             }
+            X86Inst::SqrtFp { size, src, dst } => {
+                Self::emit_fp_alu("sqrt", size, src, dst, target, out)
+            }
             X86Inst::XorFp { size, src, dst } => {
                 let _ = writeln!(
                     out,
@@ -999,6 +1012,10 @@ impl EmitAsm for X86Inst {
 
             X86Inst::X87Abs => {
                 let _ = writeln!(out, "    fabs");
+            }
+
+            X86Inst::X87Sqrt => {
+                let _ = writeln!(out, "    fsqrt");
             }
 
             X86Inst::X87CmpPop => {

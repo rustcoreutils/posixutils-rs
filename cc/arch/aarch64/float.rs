@@ -446,6 +446,16 @@ impl Aarch64CodeGen {
         });
     }
 
+    /// Emit `Sqrt` of a `float` or `double`: `fsqrt`. A binary128 root is a
+    /// call to `sqrtl` by the time code is generated (see
+    /// `arch::mapping::call_library_fallbacks`).
+    pub(super) fn emit_fp_sqrt(&mut self, insn: &Instruction, types: &TypeTable) {
+        self.emit_fp_unop(insn, types, |cg, size, src, dst| {
+            debug_assert!(size != FpSize::Quad, "binary128 sqrt is a call");
+            cg.push_lir(Aarch64Inst::Fsqrt { size, src, dst });
+        });
+    }
+
     /// The bits of the value in `src` that hold its sign, into `dst`: the
     /// whole of a `float` or `double`, or the high lane of a binary128. The
     /// sign is the top bit of the returned width.

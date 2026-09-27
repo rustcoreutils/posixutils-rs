@@ -200,6 +200,7 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
         ExprKind::InlineLibraryCall {
             func: InlineLibraryFn::IntAbs,
             args,
+            ..
         } if scope == ConstScope::StaticInitializer => match args.as_slice() {
             [x] => Some(eval(env, scope, x)?.wrapping_abs()),
             _ => None,
@@ -525,17 +526,22 @@ pub(crate) fn eval_float(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) ->
             eval_as_float(env, scope, chosen_arm(env, scope, expr)?, expr.typ?)
         }
 
-        // `fabs` and `copysign` of constants, whose arguments are already at
-        // this node's type. A call is never an integer constant expression,
-        // and gcc agrees -- `int a[(int)fabs(-2.0)];` is a VLA there -- but
-        // it folds one in a static initializer.
-        ExprKind::InlineLibraryCall { func, args } if scope == ConstScope::StaticInitializer => {
+        // `fabs`, `copysign` and `sqrt` of constants, whose arguments are
+        // already at this node's type. A call is never an integer constant
+        // expression, and gcc agrees -- `int a[(int)fabs(-2.0)];` is a VLA
+        // there -- but it folds one in a static initializer. A root with no
+        // answer of its own -- a domain error -- is not a constant, there as
+        // here.
+        ExprKind::InlineLibraryCall { func, args, .. }
+            if scope == ConstScope::StaticInitializer =>
+        {
             match (func, args.as_slice()) {
                 (InlineLibraryFn::Fabs, [x]) => Some(eval_float(env, scope, x)?.magnitude()),
                 (InlineLibraryFn::CopySign, [x, y]) => {
                     let sign = eval_float(env, scope, y)?;
                     Some(eval_float(env, scope, x)?.with_sign_of(sign))
                 }
+                (InlineLibraryFn::Sqrt(_), [x]) => eval_float(env, scope, x)?.sqrt(fmt?),
                 _ => None,
             }
         }
@@ -658,6 +664,7 @@ pub(crate) fn eval_complex(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) 
         ExprKind::InlineLibraryCall {
             func: InlineLibraryFn::Conjugate,
             args,
+            ..
         } => {
             let [operand] = args.as_slice() else {
                 return None;

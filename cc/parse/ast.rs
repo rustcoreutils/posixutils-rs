@@ -73,6 +73,23 @@ pub enum InlineLibraryFn {
     /// `copysign`, `copysignf`, `copysignl`: the first argument with the
     /// sign bit of the second, at the expression's own type.
     CopySign,
+    /// `sqrt`, `sqrtf`, `sqrtl`: the correctly rounded square root, and
+    /// whether a negative argument must still reach the library to set
+    /// `errno`.
+    Sqrt(MathErrno),
+}
+
+/// Whether a libm function computed in place must still report a domain
+/// error through `errno` (C17 7.12.1p2): `-fmath-errno`, gcc's default, or
+/// `-fno-math-errno`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MathErrno {
+    /// An argument outside the domain is handed to the library function,
+    /// which sets `errno` to `EDOM` and returns its NaN.
+    Set,
+    /// The instruction's answer stands for every argument; `errno` is left
+    /// alone.
+    Ignored,
 }
 
 impl InlineLibraryFn {
@@ -84,8 +101,15 @@ impl InlineLibraryFn {
             | InlineLibraryFn::Fabs
             | InlineLibraryFn::ComplexReal
             | InlineLibraryFn::ComplexImag
-            | InlineLibraryFn::Conjugate => 1,
+            | InlineLibraryFn::Conjugate
+            | InlineLibraryFn::Sqrt(_) => 1,
         }
+    }
+
+    /// Whether evaluating the call can do anything but compute its value:
+    /// set `errno`.
+    pub fn has_side_effects(self) -> bool {
+        self == InlineLibraryFn::Sqrt(MathErrno::Set)
     }
 }
 
@@ -767,6 +791,10 @@ pub enum ExprKind {
         /// One argument for each of `func`'s parameters
         /// ([`InlineLibraryFn::arity`]), each converted to its type.
         args: Vec<Expr>,
+        /// The library function computed, by its own name (`sqrtf`): what is
+        /// called instead where the target has no instruction for it, or
+        /// where the call must still set `errno`.
+        name: StringId,
     },
 
     /// `__builtin_isnan` / `isinf` / `isfinite` / `isnormal` -- classify a
@@ -2412,6 +2440,15 @@ mod tests {
         }
     }
 
+    /// Only a root that must still set `errno` does more than compute.
+    #[test]
+    fn test_inline_library_fn_side_effects() {
+        assert!(InlineLibraryFn::Sqrt(MathErrno::Set).has_side_effects());
+        assert!(!InlineLibraryFn::Sqrt(MathErrno::Ignored).has_side_effects());
+        assert!(!InlineLibraryFn::Fabs.has_side_effects());
+        assert_eq!(InlineLibraryFn::Sqrt(MathErrno::Set).arity(), 1);
+    }
+
     #[test]
     fn test_inline_library_call_operand() {
         let types = TypeTable::new(&Target::host());
@@ -2421,6 +2458,7 @@ mod tests {
             ExprKind::InlineLibraryCall {
                 func: InlineLibraryFn::Fabs,
                 args: vec![arg],
+                name: crate::kw::FABS,
             },
             types.double_id,
         );

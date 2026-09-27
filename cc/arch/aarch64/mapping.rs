@@ -13,7 +13,8 @@ use crate::arch::mapping::{
     map_binary128, map_int128_divmod, map_int128_expand, map_int128_float_convert,
     map_int128_to_float16, ArchMapper, MappedInsn, MappingCtx,
 };
-use crate::ir::Instruction;
+use crate::float::FpFormat;
+use crate::ir::{Instruction, Opcode};
 
 /// AArch64 instruction mapper.
 pub struct Aarch64Mapper;
@@ -44,6 +45,15 @@ impl ArchMapper for Aarch64Mapper {
             return r;
         }
         MappedInsn::Legal
+    }
+
+    /// `fsqrt` for the scalar formats; binary128, `long double` on Linux,
+    /// is software.
+    fn computes_in_place(&self, op: Opcode, fmt: FpFormat) -> bool {
+        match op {
+            Opcode::Sqrt => matches!(fmt, FpFormat::Binary32 | FpFormat::Binary64),
+            _ => false,
+        }
     }
 }
 

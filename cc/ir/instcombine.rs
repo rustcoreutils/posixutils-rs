@@ -47,7 +47,8 @@ struct Facts<'a> {
     /// same as non-negative, and is deliberately the weaker fact: `fabs` of
     /// a NaN is a NaN, and a NaN is not less than zero either, because an
     /// unordered comparison is false. Stating it this way is what makes the
-    /// rule below correct without a NaN test.
+    /// rule below correct without a NaN test. `sqrt` gives the same fact: its
+    /// root of `-0` is `-0`, and of any other negative number a NaN.
     never_lt_zero: HashSet<PseudoId>,
     types: &'a TypeTable,
 }
@@ -57,7 +58,7 @@ impl<'a> Facts<'a> {
         let mut never_lt_zero = HashSet::new();
         for bb in &func.blocks {
             for insn in &bb.insns {
-                if insn.op == Opcode::Fabs {
+                if matches!(insn.op, Opcode::Fabs | Opcode::Sqrt) {
                     if let Some(target) = insn.target {
                         never_lt_zero.insert(target);
                     }
@@ -224,7 +225,7 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
         Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv | Opcode::CopySign => {
             simplify_fbinop(insn, consts, facts)
         }
-        Opcode::FNeg | Opcode::Fabs => simplify_funop(insn, consts, facts),
+        Opcode::FNeg | Opcode::Fabs | Opcode::Sqrt => simplify_funop(insn, consts, facts),
         Opcode::FCvtF => simplify_fcvtf(insn, consts, facts),
         Opcode::FCmpOEq
         | Opcode::FCmpONe
@@ -2465,10 +2466,17 @@ mod tests {
     }
 
     /// `fabs(x) < 0.0` is false for every `x`, a NaN included, because an
-    /// unordered `<` is false as well. The value itself is unknown.
+    /// unordered `<` is false as well. The value itself is unknown. So is
+    /// `sqrt(x) < 0.0`: the root of `-0` is `-0`, which is not below zero,
+    /// and of anything else below zero a NaN.
     #[test]
     fn fabs_is_never_below_zero() {
-        for (op, fabs_first) in [(Opcode::FCmpOLt, true), (Opcode::FCmpOGt, false)] {
+        for (unary, op, fabs_first) in [
+            (Opcode::Fabs, Opcode::FCmpOLt, true),
+            (Opcode::Fabs, Opcode::FCmpOGt, false),
+            (Opcode::Sqrt, Opcode::FCmpOLt, true),
+            (Opcode::Sqrt, Opcode::FCmpOGt, false),
+        ] {
             let types = TypeTable::new(&Target::host());
             let (l, r) = if fabs_first {
                 (PseudoId(1), PseudoId(2))
@@ -2477,7 +2485,7 @@ mod tests {
             };
             let mut func = make_test_func_with_insns(
                 vec![
-                    Instruction::new(Opcode::Fabs)
+                    Instruction::new(unary)
                         .with_target(PseudoId(1))
                         .with_src(PseudoId(0))
                         .with_type_and_size(types.double_id, 64),
@@ -3112,6 +3120,38 @@ mod tests {
     /// `Fabs` of a constant folds at every width and for every operand: it
     /// clears the sign and nothing else, so `-0.0` becomes `+0.0`, an
     /// infinity folds, and a NaN keeps its payload.
+    #[test]
+    fn sqrt_of_a_constant_folds_where_the_answer_is_its_own() {
+        let types = host_types();
+        let widths = [
+            (types.float_id, 32),
+            (types.double_id, 64),
+            (types.longdouble_id, types.size_bits(types.longdouble_id)),
+        ];
+        for (typ, size) in widths {
+            for (arg, want) in [(4.0, 2.0), (0.25, 0.5), (f64::INFINITY, f64::INFINITY)] {
+                let got = fold_float(Opcode::Sqrt, typ, size, &[arg]);
+                assert_eq!(got.map(|(v, sz)| (v.to_f64(), sz)), Some((want, size)));
+            }
+            let zero = fold_float(Opcode::Sqrt, typ, size, &[-0.0]).map(|(v, _)| v);
+            assert!(
+                zero.is_some_and(|v| v.is_zero() && v.sign_bit()),
+                "-0 at {size}"
+            );
+            // A domain error's NaN is the target's own, and not folded.
+            assert!(fold_float(Opcode::Sqrt, typ, size, &[-1.0]).is_none());
+        }
+        // Rounded at the operand's format: the float root of 2 is not the
+        // double one.
+        let got = fold_float(Opcode::Sqrt, types.float_id, 32, &[2.0]).map(|(v, _)| v);
+        assert_eq!(
+            got.map(|v| v.to_bits(FpFormat::Binary32)),
+            Some(0x3fb5_04f3)
+        );
+        let got = fold_float(Opcode::Sqrt, types.double_id, 64, &[2.0]).map(|(v, _)| v);
+        assert_eq!(got.map(|v| v.to_f64()), Some(2f64.sqrt()));
+    }
+
     #[test]
     fn fabs_of_a_constant_folds_to_its_magnitude() {
         let types = TypeTable::new(&Target::host());

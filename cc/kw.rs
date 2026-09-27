@@ -703,6 +703,11 @@ define_keywords! {
     (COPYSIGN,          "copysign",          0),
     (COPYSIGNF,         "copysignf",         0),
     (COPYSIGNL,         "copysignl",         0),
+    // The square roots, one instruction on both targets, with a call kept
+    // for a negative argument so that `errno` is set.
+    (SQRT,              "sqrt",              0),
+    (SQRTF,             "sqrtf",             0),
+    (SQRTL,             "sqrtl",             0),
 
     // The integer magnitudes, recognized by their plain names for the same
     // reason and displaceable the same way. Each becomes a branch-free
@@ -743,12 +748,12 @@ define_keywords! {
     (ROUND,             "round",             0),
     (RINT,              "rint",              0),
     (NEARBYINT,         "nearbyint",         0),
-    (_,                 "floorf",            0),
-    (_,                 "ceilf",             0),
-    (_,                 "truncf",            0),
-    (_,                 "roundf",            0),
-    (_,                 "rintf",             0),
-    (_,                 "nearbyintf",        0),
+    (FLOORF,            "floorf",            0),
+    (CEILF,             "ceilf",             0),
+    (TRUNCF,            "truncf",            0),
+    (ROUNDF,            "roundf",            0),
+    (RINTF,             "rintf",             0),
+    (NEARBYINTF,        "nearbyintf",        0),
 
     // ---- Fortified libc entry points ----
     // Interned but untagged: these are ordinary identifiers, listed only so
@@ -782,9 +787,6 @@ define_keywords! {
     (_,                 "ffs",                  0),
     (_,                 "ffsl",                 0),
     (_,                 "ffsll",                0),
-    (_,                 "sqrt",                 0),
-    (_,                 "sqrtf",                0),
-    (_,                 "sqrtl",                0),
     (_,                 "fmax",                 0),
     (_,                 "fmaxf",                0),
     (_,                 "fmaxl",                0),

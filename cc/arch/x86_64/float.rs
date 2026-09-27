@@ -421,6 +421,31 @@ impl X86_64CodeGen {
         self.emit_fp_sign_bit_op(insn, types, SignBitOp::Clear);
     }
 
+    /// Emit `Sqrt` of a `float` or `double`: `sqrtss`/`sqrtsd`, correctly
+    /// rounded in the current rounding mode.
+    pub(super) fn emit_fp_sqrt(&mut self, insn: &Instruction, types: &TypeTable) {
+        let (Some(&src), Some(target)) = (insn.src.first(), insn.target) else {
+            return;
+        };
+        let fp_size = self.fp_format(insn.typ, insn.size, types);
+        let dst_loc = self.get_location(target);
+        // A reserved scratch register when the result lives on the stack; see
+        // emit_fp_binop.
+        let dst_xmm = match &dst_loc {
+            Loc::Xmm(x) => *x,
+            _ => XmmReg::Xmm15,
+        };
+        self.emit_fp_move(src, dst_xmm, fp_size);
+        self.push_lir(X86Inst::SqrtFp {
+            size: fp_size,
+            src: XmmOperand::Reg(dst_xmm),
+            dst: dst_xmm,
+        });
+        if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
+            self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, fp_size);
+        }
+    }
+
     /// Flip or clear the sign bit of an SSE float or double: an
     /// `xorps`/`xorpd` or `andps`/`andpd` with a mask built through R10.
     fn emit_fp_sign_bit_op(&mut self, insn: &Instruction, types: &TypeTable, op: SignBitOp) {

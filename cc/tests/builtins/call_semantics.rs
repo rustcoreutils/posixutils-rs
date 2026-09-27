@@ -187,6 +187,16 @@ const PARITY: &[(&str, &str, &str)] = &[
     ("double F(double)", "fabs(1.0, 2.0)", ""),
     ("double F(double _Complex)", "creal()", ""),
     ("double F(double)", "floor(1.0, 2.0)", ""),
+    ("double F(double)", "sqrt(s)", "struct S { double a; } s;"),
+    ("float F(float)", "__builtin_sqrtf(p)", "int *p = 0;"),
+    (
+        "long double F(long double)",
+        "sqrtl(s)",
+        "struct S { double a; } s;",
+    ),
+    ("double F(double)", "__builtin_sqrt(p)", "int *p = 0;"),
+    ("double F(double)", "sqrt(1.0, 2.0)", ""),
+    ("float F(float)", "sqrtf()", ""),
     // A `__builtin_` library alias, checked against the declaration in scope.
     (
         "unsigned long F(const char *)",
@@ -205,6 +215,7 @@ fn builtin_library_call_arguments_are_checked_like_a_call() {
                  double _Complex conj(double _Complex);\n\
                  double copysign(double, double); float copysignf(float, float);\n\
                  long double copysignl(long double, long double);\n\
+                 double sqrt(double); float sqrtf(float); long double sqrtl(long double);\n\
                  unsigned long strlen(const char *);\n";
     for (proto, call, pre) in PARITY {
         // The ordinary call: the builtin's name replaced by `F`, declared with

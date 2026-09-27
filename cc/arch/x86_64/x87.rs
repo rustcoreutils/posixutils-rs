@@ -371,7 +371,7 @@ impl X86_64CodeGen {
     ///   fchs                 ; negate ST(0)
     ///   fstpt  result(%rbp)  ; store and pop
     pub(super) fn emit_x87_neg(&mut self, insn: &Instruction) {
-        self.emit_x87_sign_op(insn, X86Inst::X87Neg);
+        self.emit_x87_unary_op(insn, X86Inst::X87Neg);
     }
 
     /// Emit `Fabs` of a `long double`: `fabs` between the same load and
@@ -379,7 +379,13 @@ impl X86_64CodeGen {
     /// raises nothing, not even for a signalling NaN, and `fabs` clears only
     /// the sign, so the payload survives.
     pub(super) fn emit_x87_abs(&mut self, insn: &Instruction) {
-        self.emit_x87_sign_op(insn, X86Inst::X87Abs);
+        self.emit_x87_unary_op(insn, X86Inst::X87Abs);
+    }
+
+    /// Emit `Sqrt` of a `long double`: `fsqrt`, correctly rounded at the
+    /// extended precision the control word is left at.
+    pub(super) fn emit_x87_sqrt(&mut self, insn: &Instruction) {
+        self.emit_x87_unary_op(insn, X86Inst::X87Sqrt);
     }
 
     /// The address of the sign-and-exponent word of the `long double`
@@ -481,9 +487,9 @@ impl X86_64CodeGen {
         });
     }
 
-    /// Load a `long double`, apply the sign instruction `op` to ST(0), and
-    /// store the result.
-    fn emit_x87_sign_op(&mut self, insn: &Instruction, op: X86Inst) {
+    /// Load a `long double`, apply the one-operand instruction `op` to ST(0),
+    /// and store the result.
+    fn emit_x87_unary_op(&mut self, insn: &Instruction, op: X86Inst) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,

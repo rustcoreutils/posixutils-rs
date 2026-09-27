@@ -2478,6 +2478,7 @@ mod tests {
         // The sign operations are computed in place.
         assert!(!is_call_like_aarch64(Opcode::Fabs));
         assert!(!is_call_like_aarch64(Opcode::CopySign));
+        assert!(!is_call_like_aarch64(Opcode::Sqrt));
         assert!(!is_call_like_aarch64(Opcode::Signbit));
         assert!(!is_call_like_aarch64(Opcode::Add));
         assert!(!is_call_like_aarch64(Opcode::Asm));

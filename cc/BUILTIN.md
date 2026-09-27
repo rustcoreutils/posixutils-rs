@@ -110,10 +110,11 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 ## Library Functions Computed in Place
 
 `abs`, `labs`, `llabs`, `imaxabs`, `fabs`, `fabsf`, `fabsl`, `copysign`,
-`copysignf`, `copysignl`, `floor`, `ceil`, `trunc`, `round`, `rint`,
-`nearbyint`, `creal`, `cimag` and `conj` in each precision, and `memcpy`,
-`memset` and `memmove` are known to c17 by prototype, under their bare names
-and (except the floor family) their `__builtin_` spellings. One table in
+`copysignf`, `copysignl`, `sqrt`, `sqrtf`, `sqrtl`, `floor`, `ceil`,
+`trunc`, `round`, `rint`, `nearbyint`, `creal`, `cimag` and `conj` in each
+precision, and `memcpy`, `memset` and `memmove` are known to c17 by
+prototype, under their bare names and (except the floor family) their
+`__builtin_` spellings. One table in
 `parse/library_builtin.rs` gives each its prototype and how it is evaluated:
 in place, as a block memory operation, or -- for the floor family -- as a call
 to the library function, narrowed to the `float` form for a `float` argument.
@@ -131,6 +132,14 @@ is lower -- every chunk is live at once. The limit is the one the linearizer's
 own aggregate copies use, in the same chunks. The bare names are displaced
 like `fabs`, including by a declaration that is not the `<string.h>`
 prototype and by `-fno-builtin[-memcpy]`.
+
+At `-O0`, as in gcc, a libm function named by its bare spelling (`sqrt`) is
+called rather than computed, and so is one that must still set `errno`
+whatever its spelling; the magnitudes, `copysign` and the complex accessors
+are computed in place at every level. A libm function computed in place is
+one IR opcode keyed on its type; where the target has no instruction for
+that type (binary128 on aarch64) it becomes a call to the library function
+again after the optimizer, which could still fold it.
 
 However it is evaluated, what the program wrote is a call (C17 7.1.4p1). The
 arguments are checked exactly as an ordinary call to a function of that
@@ -159,8 +168,7 @@ call.
 | `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` | Whichever of the five class codes describes `x` |
 | `__builtin_flt_rounds()` | Current FP rounding mode |
 | `__builtin_isinf_sign(x)` | +1 for +inf, -1 for -inf, 0 otherwise |
-| `__builtin_sqrt(x)` | Square root. Calls the library `sqrt`, so it needs `-lm`; gcc folds a constant argument and does not |
-| `__builtin_sqrt(x)`, `sqrtf`, `sqrtl` | Square root |
+| `sqrt(x)`, `sqrtf`, `sqrtl` and their `__builtin_` spellings | The correctly rounded square root, by the instruction: `sqrtsd`/`sqrtss` and x87 `fsqrt` on x86-64, `fsqrt` on aarch64; binary128 (`sqrtl` on aarch64 Linux) is a call. As in gcc, an argument below zero -- an ordered `x < 0`, so not `-0` and not a NaN -- still goes to the library, which sets `errno` to `EDOM`; `-fno-math-errno` drops that call and the program needs no libm. A constant argument folds, in a static initializer too, exactly as the instruction rounds it; a negative one is left to run time, and in a static initializer is not a constant. Under `-fno-math-errno`, `sqrt(x) < 0` folds to 0. Displaced like `fabs` |
 | `__builtin_fmax(x, y)`, `fmaxf`, `fmaxl`, `__builtin_fmin(x, y)`, `fminf`, `fminl` | Larger and smaller of two values |
 | `__builtin_pow(x, y)`, `powf`, `powl` | `x` raised to `y` |
 | `__builtin_fma(x, y, z)`, `fmaf`, `fmal` | `x * y + z`, rounded once |
@@ -299,7 +307,7 @@ result did not fit, 0 if it did — so the result is written either way.
 ## Library Functions
 
 The builtin of the same name as a library function. c17 emits a call to that
-function, so the usual library rules apply — `__builtin_sqrt` needs `-lm`.
+function, so the usual library rules apply — `__builtin_pow` needs `-lm`.
 They exist so a translation unit may use one without having included the
 header that declares it, which is what gcc allows and what glibc's fortified
 headers rely on.

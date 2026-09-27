@@ -991,6 +991,16 @@ impl X86_64CodeGen {
                 }
             }
 
+            // A binary128 root never gets here: it is a call by now (see
+            // `arch::mapping::call_library_fallbacks`).
+            Opcode::Sqrt => {
+                if self.is_longdouble_op(insn, types) {
+                    self.emit_x87_sqrt(insn);
+                } else {
+                    self.emit_fp_sqrt(insn, types);
+                }
+            }
+
             // The operand's format is its `src_typ`: `typ` is the `int`.
             Opcode::Signbit => {
                 if self.fp_format(insn.src_typ, insn.src_size, types) == FpSize::Extended {

@@ -14,6 +14,7 @@ use crate::arch::mapping::{
     expand_float16_neg, float_suffix, map_binary128, map_int128_divmod, map_int128_expand,
     map_int128_float_convert, ArchMapper, MappedInsn, MappingCtx,
 };
+use crate::float::FpFormat;
 use crate::ir::{Instruction, Opcode};
 use crate::rtlib::RtlibNames;
 use crate::types::TypeKind;
@@ -45,6 +46,18 @@ impl ArchMapper for X86_64Mapper {
             return r;
         }
         MappedInsn::Legal
+    }
+
+    /// SSE2 has `sqrtss`/`sqrtsd` and x87 has `fsqrt`; binary128 is
+    /// software.
+    fn computes_in_place(&self, op: Opcode, fmt: FpFormat) -> bool {
+        match op {
+            Opcode::Sqrt => matches!(
+                fmt,
+                FpFormat::Binary32 | FpFormat::Binary64 | FpFormat::X87Extended
+            ),
+            _ => false,
+        }
     }
 }
 

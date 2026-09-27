@@ -9,11 +9,12 @@
 //! Emit helpers for the linearizer (constants, block copies, bitfields, operators, assignments)
 
 use super::memexpand;
-use super::{CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
+use super::{BasicBlockId, CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
 use crate::abi::get_abi_for_conv;
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
-use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, UnaryOp};
+use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, MathErrno, UnaryOp};
+use crate::strings::StringId;
 use crate::types::{MemberInfo, TypeId, TypeKind};
 
 /// A read-modify-write target whose address has been computed **once**.
@@ -1667,6 +1668,137 @@ impl<'a> super::linearize::Linearizer<'a> {
             .with_type(typ);
         self.emit(insn);
         result
+    }
+
+    /// `sqrt(x)` at `typ`, where `callee` is the library function the call
+    /// named (`sqrtf`): the `Sqrt` opcode, which the backends compute with
+    /// their square-root instruction, or which a late mapping turns back into
+    /// a call to `callee` on a target that has none for `typ`.
+    ///
+    /// When `errno` is to be set, an argument below zero goes to the library
+    /// instead, as gcc arranges it: `x < 0` is ordered, so `-0`, and a NaN,
+    /// which the instruction answers the same way the library does, stay on
+    /// the instruction. A target that calls the library for every argument
+    /// anyway gets only the call -- the call sets `errno` itself, and the
+    /// comparison would cost a call of its own on binary128.
+    pub(crate) fn emit_sqrt(
+        &mut self,
+        x: PseudoId,
+        typ: TypeId,
+        callee: StringId,
+        errno: MathErrno,
+    ) -> PseudoId {
+        let callee = self.library_function_name(self.strings.get(callee));
+        let in_place = self.types.fp_format(typ).is_some_and(|fmt| {
+            crate::arch::mapping::computes_in_place(Opcode::Sqrt, fmt, self.target)
+        });
+        match errno {
+            MathErrno::Ignored => self.emit_sqrt_insn(x, typ, &callee),
+            MathErrno::Set if !in_place => self.emit_library_call(&callee, &[x], typ),
+            MathErrno::Set => {
+                let size = self.types.size_bits(typ);
+                let zero = self.emit_fconst(FloatVal::ZERO, typ);
+                let below = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FCmpOLt,
+                    below,
+                    x,
+                    zero,
+                    typ,
+                    size,
+                ));
+                self.emit_two_way(
+                    below,
+                    typ,
+                    |lin| lin.emit_library_call(&callee, &[x], typ),
+                    |lin| lin.emit_sqrt_insn(x, typ, &callee),
+                )
+            }
+        }
+    }
+
+    /// The `Sqrt` opcode of `x` at `typ`, naming `callee` for a target
+    /// that calls it instead.
+    fn emit_sqrt_insn(&mut self, x: PseudoId, typ: TypeId, callee: &str) -> PseudoId {
+        let size = self.types.size_bits(typ);
+        let result = self.alloc_pseudo();
+        let insn = Instruction::new(Opcode::Sqrt)
+            .with_target(result)
+            .with_src(x)
+            .with_size(size)
+            .with_type(typ)
+            .with_func(callee);
+        self.emit(insn);
+        result
+    }
+
+    /// A call to the C library function `callee` (its assembler name) with
+    /// `args`, each and the result of type `typ`.
+    fn emit_library_call(&mut self, callee: &str, args: &[PseudoId], typ: TypeId) -> PseudoId {
+        let result = self.alloc_pseudo();
+        self.emit(Instruction::call_with_abi(
+            Some(result),
+            callee,
+            args.to_vec(),
+            vec![typ; args.len()],
+            typ,
+            crate::abi::CallingConv::C,
+            self.types,
+            self.target,
+        ));
+        result
+    }
+
+    /// `cond ? taken() : fallthrough()`, each arm in a block of its own and
+    /// merged by a phi of type `typ`: for arms that may not both be
+    /// evaluated.
+    fn emit_two_way(
+        &mut self,
+        cond: PseudoId,
+        typ: TypeId,
+        taken: impl FnOnce(&mut Self) -> PseudoId,
+        fallthrough: impl FnOnce(&mut Self) -> PseudoId,
+    ) -> PseudoId {
+        let size = self.types.size_bits(typ);
+        let (taken_bb, fall_bb, merge_bb) = (self.alloc_bb(), self.alloc_bb(), self.alloc_bb());
+        let from = self.current_bb.unwrap();
+        self.emit(Instruction::cbr(cond, taken_bb, fall_bb));
+        self.link_bb(from, taken_bb);
+        self.link_bb(from, fall_bb);
+
+        let arms = [
+            self.emit_arm(taken_bb, merge_bb, taken),
+            self.emit_arm(fall_bb, merge_bb, fallthrough),
+        ];
+
+        self.switch_bb(merge_bb);
+        let result = self.alloc_pseudo();
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(Pseudo::phi(result, result.0));
+        }
+        let mut phi = Instruction::phi(result, typ, size);
+        for (end, value) in arms {
+            let src = self.emit_phi_source(end, value, result, merge_bb, typ, size);
+            phi.phi_list.push((end, src));
+        }
+        self.emit(phi);
+        result
+    }
+
+    /// One arm of [`Self::emit_two_way`]: `arm` evaluated in `bb`, which then
+    /// branches to `merge`. Returns the block the arm ended in, and its value.
+    fn emit_arm(
+        &mut self,
+        bb: BasicBlockId,
+        merge: BasicBlockId,
+        arm: impl FnOnce(&mut Self) -> PseudoId,
+    ) -> (BasicBlockId, PseudoId) {
+        self.switch_bb(bb);
+        let value = arm(self);
+        let end = self.current_bb.unwrap();
+        self.emit(Instruction::br(merge));
+        self.link_bb(end, merge);
+        (end, value)
     }
 
     /// `signbit(x)` of `x`, a value of the real floating type `typ`: 0 or 1,

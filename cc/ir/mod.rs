@@ -164,6 +164,12 @@ pub enum Opcode {
     // Only the sign bit changes, taken from a zero or a NaN as from anything
     // else, so it is exact and raises nothing, and a NaN keeps its payload.
     CopySign,
+    // Square root of src[0], correctly rounded, at the width of `typ`: what
+    // IEEE 754's squareRoot and every target's instruction compute. Sets no
+    // `errno` -- the linearizer keeps a call for the arguments that must --
+    // and `func_name` names the library function a target without the
+    // instruction calls instead (see `arch::mapping::computes_in_place`).
+    Sqrt,
 
     // Type conversions
     Trunc, // Truncate to smaller integer
@@ -354,6 +360,12 @@ impl Opcode {
         )
     }
 
+    /// Whether this opcode computes a libm function, which its instruction
+    /// names in `func_name` for a target that calls the function instead.
+    pub fn is_libm(&self) -> bool {
+        matches!(self, Opcode::Sqrt)
+    }
+
     /// Check if this opcode has side effects (cannot be deleted even if unused).
     /// These are "root" instructions for dead code elimination.
     pub fn has_side_effects(&self) -> bool {
@@ -461,6 +473,7 @@ impl Opcode {
             Opcode::FNeg => "fneg",
             Opcode::Fabs => "fabs",
             Opcode::CopySign => "copysign",
+            Opcode::Sqrt => "sqrt",
             Opcode::Trunc => "trunc",
             Opcode::Zext => "zext",
             Opcode::Sext => "sext",
@@ -1046,7 +1059,9 @@ impl Instruction {
     }
 
     /// The C library function an opcode the backends lower to a call
-    /// (`Memcpy`, `Memset`, `Memmove`, `Setjmp`, `Longjmp`) calls, by its assembler name.
+    /// (`Memcpy`, `Memset`, `Memmove`, `Setjmp`, `Longjmp`) calls, or a libm
+    /// opcode (`Sqrt`) calls on a target without the instruction, by its
+    /// assembler name.
     ///
     /// The linearizer resolved it through the program's own declarations
     /// (`Linearizer::library_function_name`), so an asm-label rename of
@@ -3165,6 +3180,16 @@ mod tests {
         assert_eq!(Opcode::CopySign.name(), "copysign");
         assert!(!Opcode::Signbit.is_terminator());
         assert!(!Opcode::CopySign.is_terminator());
+    }
+
+    /// `Sqrt` is an ordinary value: no terminator, and nothing but its result.
+    #[test]
+    fn test_sqrt_opcode() {
+        assert_eq!(Opcode::Sqrt.name(), "sqrt");
+        assert!(!Opcode::Sqrt.is_terminator());
+        assert!(!Opcode::Sqrt.has_side_effects());
+        assert!(Opcode::Sqrt.is_libm());
+        assert!(!Opcode::Fabs.is_libm() && !Opcode::Call.is_libm());
     }
 
     #[test]

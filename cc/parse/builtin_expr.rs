@@ -2447,9 +2447,6 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_FFS
                 | crate::kw::BUILTIN_FFSL
                 | crate::kw::BUILTIN_FFSLL
-                | crate::kw::BUILTIN_SQRT
-                | crate::kw::BUILTIN_SQRTF
-                | crate::kw::BUILTIN_SQRTL
                 | crate::kw::BUILTIN_FMAX
                 | crate::kw::BUILTIN_FMAXF
                 | crate::kw::BUILTIN_FMAXL
@@ -2673,34 +2670,35 @@ impl Parser<'_> {
         )
     }
 
-    /// Lower a one-argument math builtin to an ordinary call to the library
-    /// function that implements it, declaring that function if the translation
-    /// unit has not.
+    /// Lower a math builtin to an ordinary call to the library function
+    /// `name_id` that implements it, declaring that function if the
+    /// translation unit has not. `args` are already converted to `params`.
     ///
     /// Unlike `declare_chk_builtin`, the parameter types are *modelled*: that
     /// one spells every parameter `unsigned long` because a pointer, a size and
     /// a flag all classify the same way, which is false the moment an argument
     /// is a `long double`.
     ///
-    /// Falls back to the argument unchanged if the name cannot be interned,
-    /// which would mean `kw.rs` and this list had drifted apart.
+    /// A zero of the return type stands in if the name cannot be declared,
+    /// which the symbol table has already diagnosed.
     pub(super) fn libm_call(
         &mut self,
-        name: &str,
+        name_id: StringId,
         ret_type: TypeId,
         params: &[TypeId],
-        arg: Expr,
+        args: Vec<Expr>,
         pos: Position,
     ) -> Expr {
-        let Some(symbol_id) = self.declare_libm_function(name, ret_type, params) else {
-            return arg;
+        let Some(symbol_id) = self.declare_libm_function_id(name_id, ret_type, params) else {
+            let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, pos);
+            return self.convert_operand(zero, ret_type);
         };
         let func_type = self.symbols.get(symbol_id).typ;
         let func_expr = Self::typed_expr(ExprKind::Ident(symbol_id), func_type, pos);
         Self::typed_expr(
             ExprKind::Call {
                 func: Box::new(func_expr),
-                args: vec![arg],
+                args,
                 binding: CalleeBinding::Library,
             },
             ret_type,
@@ -2716,6 +2714,16 @@ impl Parser<'_> {
         params: &[TypeId],
     ) -> Option<SymbolId> {
         let name_id = self.idents.lookup(name)?;
+        self.declare_libm_function_id(name_id, ret_type, params)
+    }
+
+    /// [`Self::declare_libm_function`], for a name already interned.
+    fn declare_libm_function_id(
+        &mut self,
+        name_id: StringId,
+        ret_type: TypeId,
+        params: &[TypeId],
+    ) -> Option<SymbolId> {
         if let Some(existing) = self.symbols.lookup_id(name_id, Namespace::Ordinary) {
             return Some(existing);
         }

@@ -13,7 +13,7 @@
 
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Expr, ExprKind, ExternalDecl,
-    ForInit, FpTest, FunctionDef, InlineLibraryFn, Stmt, TranslationUnit, UnaryOp,
+    ForInit, FpTest, FunctionDef, InlineLibraryFn, MathErrno, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::parse::parser::{ParseResult, Parser};
 use crate::strings::{StringId, StringTable};
@@ -31,6 +31,16 @@ fn parse_expr_with_vars(
     input: &str,
     vars: &[&str],
 ) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
+    parse_expr_under(input, vars, Default::default())
+}
+
+/// [`parse_expr_with_vars`], with library builtins evaluated as `policy`
+/// says.
+fn parse_expr_under(
+    input: &str,
+    vars: &[&str],
+    policy: super::LibraryCallPolicy,
+) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
     let mut strings = StringTable::new();
     let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
@@ -45,6 +55,7 @@ fn parse_expr_with_vars(
     }
 
     let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+    parser.set_library_call_policy(policy);
     parser.skip_stream_tokens();
     let expr = parser.parse_expression()?;
     Ok((expr, types, strings, symbols))
@@ -5267,7 +5278,7 @@ fn first_statement(tu: &TranslationUnit) -> &Stmt {
 /// `src` and what it was instead.
 fn inline_call_args<'e>(src: &str, expr: &'e Expr) -> (InlineLibraryFn, &'e [Expr]) {
     match &expr.kind {
-        ExprKind::InlineLibraryCall { func, args } => (*func, args),
+        ExprKind::InlineLibraryCall { func, args, .. } => (*func, args),
         other => panic!("{src}: expected an InlineLibraryCall, got {other:?}"),
     }
 }
@@ -5360,6 +5371,66 @@ fn test_copysign_builtins() {
         for arg in args {
             assert_eq!(arg.typ, Some(want(&types)), "{src}: an argument");
         }
+    }
+}
+
+/// `sqrt`, `sqrtf` and `sqrtl`, bare or reserved, are computed in place at
+/// their own type, reporting a domain error through `errno` by default, and
+/// carry the library name a call path needs.
+#[test]
+fn test_sqrt_builtins() {
+    type Want = fn(&TypeTable) -> crate::types::TypeId;
+    let cases: &[(&str, Want, &str)] = &[
+        ("sqrt(i)", |t| t.double_id, "sqrt"),
+        ("__builtin_sqrt(i)", |t| t.double_id, "sqrt"),
+        ("sqrtf(i)", |t| t.float_id, "sqrtf"),
+        ("__builtin_sqrtf(i)", |t| t.float_id, "sqrtf"),
+        ("sqrtl(i)", |t| t.longdouble_id, "sqrtl"),
+        ("__builtin_sqrtl(i)", |t| t.longdouble_id, "sqrtl"),
+    ];
+    for (src, want, callee) in cases {
+        let (expr, types, strings, _) = parse_expr_with_vars(src, &["i"]).unwrap();
+        assert_eq!(expr.typ, Some(want(&types)), "{src}");
+        let (func, arg) = inline_call(src, &expr);
+        assert_eq!(func, InlineLibraryFn::Sqrt(MathErrno::Set), "{src}");
+        assert_eq!(arg.typ, Some(want(&types)), "{src}: the int converts");
+        let ExprKind::InlineLibraryCall { name, .. } = expr.kind else {
+            unreachable!()
+        };
+        check_name(&strings, name, callee);
+    }
+}
+
+/// `-fno-math-errno` drops the domain-error path; `-O0` calls the library
+/// for a bare spelling, and for any spelling that must still set `errno`,
+/// as gcc does.
+#[test]
+fn test_sqrt_follows_the_library_call_policy() {
+    use super::LibraryCallPolicy;
+    let no_errno = LibraryCallPolicy {
+        optimizing: true,
+        math_errno: false,
+    };
+    let (expr, _, _, _) = parse_expr_under("sqrt(i)", &["i"], no_errno).unwrap();
+    let (func, _) = inline_call("sqrt(i)", &expr);
+    assert_eq!(func, InlineLibraryFn::Sqrt(MathErrno::Ignored));
+
+    let is_call = |e: &Expr| matches!(e.kind, ExprKind::Call { .. });
+    let o0 = |math_errno| LibraryCallPolicy {
+        optimizing: false,
+        math_errno,
+    };
+    for (src, math_errno, called) in [
+        ("sqrt(i)", true, true),
+        ("__builtin_sqrt(i)", true, true),
+        ("sqrt(i)", false, true),
+        ("__builtin_sqrt(i)", false, false),
+        ("fabs(i)", true, false),
+        ("copysign(i, i)", true, false),
+    ] {
+        let (expr, types, _, _) = parse_expr_under(src, &["i"], o0(math_errno)).unwrap();
+        assert_eq!(is_call(&expr), called, "{src} errno={math_errno}");
+        assert_eq!(expr.typ, Some(types.double_id), "{src}");
     }
 }
 

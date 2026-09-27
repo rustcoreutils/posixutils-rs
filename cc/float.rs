@@ -382,6 +382,12 @@ impl FloatVal {
         self.exp == EXP_SPECIAL && self.sig & !INTEGER_BIT != 0
     }
 
+    /// True for a signalling NaN: one whose quiet bit is clear, so that an
+    /// operation consuming it raises *invalid*.
+    pub fn is_signalling_nan(self) -> bool {
+        self.is_nan() && self.sig & QUIET_BIT == 0
+    }
+
     /// True for a finite value: neither an infinity nor a NaN.
     pub fn is_finite(self) -> bool {
         self.exp != EXP_SPECIAL
@@ -1120,6 +1126,30 @@ impl U256 {
         }
         (q, !r.is_zero())
     }
+
+    /// The integer square root, `floor(sqrt(self))`, and whether it was
+    /// inexact -- whether a remainder was left.
+    ///
+    /// Digit by digit, two bits of the radicand for each bit of the root:
+    /// the root of a 256-bit value has at most 128 bits, and the remainder
+    /// stays below `2 * root + 1`, so neither leaves its type.
+    fn isqrt(self) -> (u128, bool) {
+        let mut root: u128 = 0;
+        let mut rem = U256::ZERO;
+        for i in (0..128).rev() {
+            rem = rem.shl(2);
+            rem.lo |= self.shr(2 * i).lo & 3;
+            // Whether the next root bit is 1: (2 * root + 1)^2 - (2 * root)^2
+            // is 4 * root + 1, in the scale of the two bits just brought down.
+            let trial = U256 { hi: 0, lo: root }.shl(2).add(U256::ONE);
+            root <<= 1;
+            if rem >= trial {
+                rem = rem.sub(trial);
+                root |= 1;
+            }
+        }
+        (root, !rem.is_zero())
+    }
 }
 
 impl FloatVal {
@@ -1349,6 +1379,49 @@ impl FloatVal {
         // remainder as a sticky.
         let q = if inexact { q.add(U256::ONE) } else { q };
         Self::round_wide(neg, q, exp_a - exp_b - 128, inexact, fmt)
+    }
+
+    /// The square root, rounded once to `fmt` (to nearest, ties to even):
+    /// what `sqrt`, `sqrtf` and `sqrtl` compute, and what every target's
+    /// square-root instruction delivers.
+    ///
+    /// `None` where the answer is not the value's alone. A number below zero
+    /// is a domain error: the library sets `errno`, and the NaN it returns is
+    /// the target's default NaN, which is negative on x86-64 and positive on
+    /// aarch64. A signalling NaN raises *invalid* as it is quieted. Everything
+    /// else is exact: `-0` and `+inf` are their own roots, and a quiet NaN
+    /// comes back as it went in, sign and payload included.
+    ///
+    /// The root is taken of the significand as an integer: scaled by an even
+    /// power of two to 255 or 256 bits, its integer square root has 128,
+    /// which is more than any format keeps, and a remainder is the sticky bit
+    /// that settles a tie -- though a square root is never exactly half way.
+    pub fn sqrt(self, fmt: FpFormat) -> Option<Self> {
+        let a = self.round_to_format(fmt);
+        if a.is_nan() {
+            return (!a.is_signalling_nan()).then_some(a);
+        }
+        if a.is_zero() {
+            return Some(a);
+        }
+        if a.neg {
+            return None;
+        }
+        if a.is_infinite() {
+            return Some(a);
+        }
+        // The value is `sig * 2^exp2`. Shifting `sig` up by 127 or 128 bits,
+        // whichever leaves an even exponent, halves that exponent exactly.
+        let (sig, exp2) = a.scaled();
+        let shift = if exp2.rem_euclid(2) == 0 { 128 } else { 127 };
+        let (root, inexact) = U256::scaled127(sig).shl(shift - 127).isqrt();
+        Some(Self::round_wide(
+            false,
+            U256 { hi: 0, lo: root },
+            (exp2 - shift as i32) / 2,
+            inexact,
+            fmt,
+        ))
     }
 
     /// Round `w * 2^scale` to `fmt`, once, to nearest with ties to even.
@@ -2863,5 +2936,148 @@ mod tests {
         assert_eq!((re.to_f64() as f32, im.to_f64() as f32), (0.44f32, 0.08f32));
         let (re, im) = FloatVal::complex_div((v(1.0), v(1.0)), (v(1.0), v(-1.0)), fmt);
         assert_eq!((re, im), (FloatVal::ZERO, v(1.0)));
+    }
+
+    // Square root
+
+    /// A xorshift, so a sample is fixed without pulling in a dependency.
+    fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        }
+    }
+
+    /// Every `double` and `float` root agrees with the hardware's, which
+    /// IEEE 754 requires to be correctly rounded, over a wide random sample
+    /// that includes the subnormals.
+    #[test]
+    fn sqrt_agrees_with_hardware() {
+        let mut next = xorshift(0x5DEECE66D);
+        for _ in 0..50000 {
+            let a = f64::from_bits(next() >> 1);
+            if a.is_finite() {
+                let got = FloatVal::from_f64(a).sqrt(FpFormat::Binary64).unwrap();
+                assert_eq!(got.to_f64().to_bits(), a.sqrt().to_bits(), "sqrt({a:e})");
+            }
+            let f = f32::from_bits((next() >> 33) as u32);
+            if f.is_finite() {
+                let got = FloatVal::from_f64(f as f64)
+                    .sqrt(FpFormat::Binary32)
+                    .unwrap();
+                assert_eq!(
+                    got.to_bits(FpFormat::Binary32) as u32,
+                    f.sqrt().to_bits(),
+                    "sqrtf({f:e})"
+                );
+            }
+        }
+    }
+
+    /// The 80-bit root agrees with the x87 unit's `fsqrt`, at the extended
+    /// precision a Linux process runs it in.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn sqrt_agrees_with_x87() {
+        fn fsqrt(x: [u8; 16]) -> [u8; 16] {
+            let mut out = [0u8; 16];
+            // SAFETY: loads ten bytes from `x` and stores ten to `out`, both
+            // sixteen bytes long; the x87 stack is left as it was found.
+            unsafe {
+                std::arch::asm!(
+                    "fld tbyte ptr [{x}]",
+                    "fsqrt",
+                    "fstp tbyte ptr [{out}]",
+                    x = in(reg) x.as_ptr(),
+                    out = in(reg) out.as_mut_ptr(),
+                    out("st(0)") _,
+                    options(nostack),
+                );
+            }
+            out
+        }
+        let mut next = xorshift(0x1234_5678_9ABC_DEF1);
+        for _ in 0..20000 {
+            // A normal value: the integer bit set, and an exponent kept
+            // clear of the extremes so the sample is spread across scales.
+            let sig = next() | 1 << 63;
+            let exp = 16383 - 2000 + (next() % 4000) as u128;
+            let bits = exp << 64 | sig as u128;
+            let v = finite_from_bits(FpFormat::X87Extended, bits);
+            let got = v.sqrt(FpFormat::X87Extended).unwrap().to_x87_bytes();
+            let want = fsqrt(v.to_x87_bytes());
+            assert_eq!(got[..10], want[..10], "sqrtl of {bits:#x}");
+        }
+    }
+
+    /// A binary128 root: exact for a perfect square, and otherwise the
+    /// nearest -- `(2m - 1)^2 < 4x < (2m + 1)^2` for the root's significand
+    /// `m`, which says no other representable value is nearer. There is no
+    /// hardware to ask.
+    #[test]
+    fn sqrt_rounds_binary128_to_nearest() {
+        let fmt = FpFormat::Binary128;
+        let mut next = xorshift(0xC0FF_EE00_DEAD_BEEF);
+        for _ in 0..2000 {
+            let a = next() >> 8 | 1;
+            let square = FloatVal::from_parts(false, a as u128 * a as u128, 0);
+            assert_eq!(
+                square.sqrt(fmt),
+                Some(FloatVal::from_parts(false, a as u128, 0))
+            );
+
+            // x in [1, 4) is mx * 2^-112, with mx below 2^114 and at most 113
+            // significant bits; its root in [1, 2) is m * 2^-112, so 4x
+            // against (2m +- 1)^2 is mx * 2^114 against (2m +- 1)^2, all in
+            // integers.
+            let frac = ((next() as u128) << 64 | next() as u128) >> 16;
+            let mx = (frac | 1 << 112) << (next() & 1);
+            let x = FloatVal::from_parts(false, mx, -112);
+            let r = x.sqrt(fmt).unwrap();
+            let bits = r.to_bits(fmt);
+            assert_eq!(bits >> 112, 0x3fff, "the root of [1, 4) is in [1, 2)");
+            let m = bits & ((1 << 112) - 1) | 1 << 112;
+            let four_x = U256 {
+                hi: mx >> 14,
+                lo: mx << 114,
+            };
+            assert!(
+                U256::mul(2 * m - 1, 2 * m - 1) < four_x,
+                "{mx:#x}: root too big"
+            );
+            assert!(
+                four_x < U256::mul(2 * m + 1, 2 * m + 1),
+                "{mx:#x}: root too small"
+            );
+        }
+    }
+
+    /// The operands with no root to compute: zeros and infinity are their
+    /// own, a quiet NaN passes through unchanged, and a negative number or a
+    /// signalling NaN has no answer that is the value's alone.
+    #[test]
+    fn sqrt_of_special_operands() {
+        let v = FloatVal::from_f64;
+        for fmt in [
+            FpFormat::Binary32,
+            FpFormat::Binary64,
+            FpFormat::X87Extended,
+            FpFormat::Binary128,
+        ] {
+            assert_eq!(v(0.0).sqrt(fmt), Some(v(0.0)), "{fmt:?}");
+            assert_eq!(v(-0.0).sqrt(fmt), Some(v(-0.0)), "{fmt:?}");
+            assert_eq!(v(f64::INFINITY).sqrt(fmt), Some(v(f64::INFINITY)));
+            assert_eq!(v(4.0).sqrt(fmt), Some(v(2.0)));
+            assert_eq!(v(0.25).sqrt(fmt), Some(v(0.5)));
+            assert_eq!(v(-4.0).sqrt(fmt), None, "a domain error");
+            assert_eq!(v(f64::NEG_INFINITY).sqrt(fmt), None, "a domain error");
+            let qnan = FloatVal::nan_with_payload(fmt, 0x15, NanKind::Quiet).negated();
+            assert_eq!(qnan.sqrt(fmt), Some(qnan), "payload and sign kept");
+            let snan = FloatVal::nan_with_payload(fmt, 0x15, NanKind::Signalling);
+            assert_eq!(snan.sqrt(fmt), None, "raises invalid");
+        }
     }
 }

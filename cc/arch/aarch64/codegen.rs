@@ -815,6 +815,7 @@ impl Aarch64CodeGen {
             Opcode::Fabs => self.emit_fp_abs(insn, types),
 
             Opcode::CopySign => self.emit_fp_copysign(insn, types),
+            Opcode::Sqrt => self.emit_fp_sqrt(insn, types),
             Opcode::Signbit => self.emit_fp_signbit(insn, types),
 
             Opcode::Unreachable => {

@@ -428,6 +428,17 @@ pub fn aarch64_cross_available() -> bool {
 /// with each other while disagreeing with gcc. Only running c17 code against
 /// gcc-compiled code shows that, which `cross_link_with` below is for.
 pub fn compile_and_run_aarch64(name: &str, content: &str, opt: &str) -> Option<i32> {
+    compile_and_run_aarch64_with(name, content, &[opt], &[])
+}
+
+/// [`compile_and_run_aarch64`] with any number of c17 options, and `libs`
+/// (`-lm`) given to the link after the program.
+pub fn compile_and_run_aarch64_with(
+    name: &str,
+    content: &str,
+    opts: &[&str],
+    libs: &[&str],
+) -> Option<i32> {
     if !aarch64_cross_available() {
         eprintln!(
             "SKIP {name}: no aarch64 cross toolchain (aarch64-linux-gnu-gcc, qemu-aarch64-static)"
@@ -442,22 +453,18 @@ pub fn compile_and_run_aarch64(name: &str, content: &str, opt: &str) -> Option<i
         .expect("failed to create temp file");
     let asm_path = asm.path().to_string_lossy().to_string();
 
-    let run = run_c17(&[
-        "--target",
-        "aarch64-unknown-linux-gnu",
-        opt,
-        "-S",
-        "-o",
-        &asm_path,
-        &c_file.path().to_string_lossy(),
-    ]);
+    let src = c_file.path().to_string_lossy().to_string();
+    let mut args = vec!["--target", "aarch64-unknown-linux-gnu"];
+    args.extend_from_slice(opts);
+    args.extend_from_slice(&["-S", "-o", &asm_path, &src]);
+    let run = run_c17(&args);
     assert!(
         run.success,
-        "c17 failed to compile {name} for aarch64 at {opt}:\n{}",
+        "c17 failed to compile {name} for aarch64 with {opts:?}:\n{}",
         run.stderr
     );
 
-    Some(cross_link_and_run(name, &[&asm_path]))
+    Some(cross_link_and_run_with(name, &[&asm_path], libs))
 }
 
 /// Assemble/link the given aarch64 sources (`.c` or `.s`) with the cross
@@ -467,6 +474,11 @@ pub fn compile_and_run_aarch64(name: &str, content: &str, opt: &str) -> Option<i
 /// the only way to test that c17 agrees with gcc about the ABI rather than
 /// merely with itself.
 pub fn cross_link_and_run(name: &str, inputs: &[&str]) -> i32 {
+    cross_link_and_run_with(name, inputs, &[])
+}
+
+/// [`cross_link_and_run`], with `libs` given to the link after the inputs.
+pub fn cross_link_and_run_with(name: &str, inputs: &[&str], libs: &[&str]) -> i32 {
     let exe = plib::tmp::Builder::new()
         .prefix(&format!("c17_a64_{name}_"))
         .suffix(".bin")
@@ -479,6 +491,7 @@ pub fn cross_link_and_run(name: &str, inputs: &[&str]) -> i32 {
     for input in inputs {
         link.arg(input);
     }
+    link.args(libs);
     let linked = link.output().expect("failed to run the cross linker");
     assert!(
         linked.status.success(),

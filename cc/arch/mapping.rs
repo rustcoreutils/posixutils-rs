@@ -14,7 +14,7 @@
 //
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
-use crate::float::ComplexRoutineFormat;
+use crate::float::{ComplexRoutineFormat, FpFormat};
 use crate::ir::{CallAbiInfo, Function, Instruction, Module, Opcode, PseudoId};
 use crate::rtlib::{Float16Abi, RtlibNames};
 use crate::target::{Arch, Os, Target};
@@ -43,6 +43,45 @@ pub trait ArchMapper {
     /// Map one instruction. The arch impl calls shared helpers
     /// to build replacement IR, then returns it in MappedInsn::Replace.
     fn map_insn(&self, insn: &Instruction, ctx: &mut MappingCtx<'_>) -> MappedInsn;
+
+    /// Whether the backend computes the libm opcode `op` ([`Opcode::is_libm`])
+    /// on a value in format `fmt` with its own instructions. Where it does
+    /// not, [`call_library_fallbacks`] calls the library function instead.
+    fn computes_in_place(&self, op: Opcode, fmt: FpFormat) -> bool;
+}
+
+/// Whether `target` computes the libm opcode `op` in format `fmt` in place.
+/// See [`ArchMapper::computes_in_place`].
+///
+/// Asked by the linearizer too, which leaves out the `errno` guard in front
+/// of an opcode that is going to be a call anyway.
+pub fn computes_in_place(op: Opcode, fmt: FpFormat, target: &Target) -> bool {
+    create_mapper(target).computes_in_place(op, fmt)
+}
+
+/// Turn every libm opcode the target has no instruction for back into a call
+/// to the library function it names.
+///
+/// Runs after the optimizer rather than with [`run_mapping`], so that the
+/// opcode is still there to be folded, merged or deleted as a value: a call
+/// is none of those. These functions have no side effect but `errno`, and an
+/// opcode never sets it -- the linearizer arranges a real call wherever one
+/// must.
+pub fn call_library_fallbacks(module: &mut Module, types: &TypeTable, target: &Target) {
+    let mapper = create_mapper(target);
+    for func in &mut module.functions {
+        for block in &mut func.blocks {
+            for insn in &mut block.insns {
+                let fmt = insn.typ.and_then(|t| types.fp_format(t));
+                let Some(fmt) = fmt.filter(|_| insn.op.is_libm()) else {
+                    continue;
+                };
+                if !mapper.computes_in_place(insn.op, fmt) {
+                    *insn = build_binop_rtlib_call(insn, insn.library_callee(), types, target);
+                }
+            }
+        }
+    }
 }
 
 // Complex number rtlib name selection
@@ -2128,6 +2167,66 @@ mod tests {
     use crate::ir::{BasicBlock, BasicBlockId, Instruction, Opcode, Pseudo, PseudoId};
     use crate::target::{Arch, Os, Target};
     use crate::types::TypeTable;
+
+    // Library fallbacks
+
+    /// A module of one function computing `op` of a `typ` value, calling it
+    /// `callee` where it is still a call.
+    fn libm_module(types: &TypeTable, op: Opcode, typ: TypeId, callee: &str) -> Module {
+        let mut func = make_minimal_func(types);
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(
+            Instruction::unop(op, PseudoId(1), PseudoId(0), typ, types.size_bits(typ))
+                .with_func(callee),
+        );
+        bb.add_insn(Instruction::ret(Some(PseudoId(1))));
+        func.add_block(bb);
+        let mut module = Module::default();
+        module.add_function(func);
+        module
+    }
+
+    /// What each target computes in place: SSE2 and x87 on x86-64, the
+    /// scalar formats on aarch64, and binary128 nowhere.
+    #[test]
+    fn test_computes_in_place_by_target() {
+        let x86 = Target::new(Arch::X86_64, Os::Linux);
+        let a64 = Target::new(Arch::Aarch64, Os::Linux);
+        for fmt in [FpFormat::Binary32, FpFormat::Binary64] {
+            assert!(computes_in_place(Opcode::Sqrt, fmt, &x86));
+            assert!(computes_in_place(Opcode::Sqrt, fmt, &a64));
+        }
+        assert!(computes_in_place(Opcode::Sqrt, FpFormat::X87Extended, &x86));
+        assert!(!computes_in_place(Opcode::Sqrt, FpFormat::Binary128, &x86));
+        assert!(!computes_in_place(Opcode::Sqrt, FpFormat::Binary128, &a64));
+    }
+
+    /// The late pass turns only the opcodes a target cannot compute into
+    /// calls, to the function each names, with the ABI of its type.
+    #[test]
+    fn test_call_library_fallbacks() {
+        let a64 = Target::new(Arch::Aarch64, Os::Linux);
+        let types = TypeTable::new(&a64);
+        let mut module = libm_module(&types, Opcode::Sqrt, types.longdouble_id, "sqrtl");
+        call_library_fallbacks(&mut module, &types, &a64);
+        let call = &module.functions[0].blocks[0].insns[1];
+        assert_eq!(call.op, Opcode::Call);
+        assert_eq!(call.func_name.as_deref(), Some("sqrtl"));
+        assert_eq!(call.target, Some(PseudoId(1)));
+        assert_eq!(call.src, vec![PseudoId(0)]);
+        assert!(call.abi_info.is_some());
+
+        let mut module = libm_module(&types, Opcode::Sqrt, types.double_id, "sqrt");
+        call_library_fallbacks(&mut module, &types, &a64);
+        assert_eq!(module.functions[0].blocks[0].insns[1].op, Opcode::Sqrt);
+
+        let x86 = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&x86);
+        let mut module = libm_module(&types, Opcode::Sqrt, types.longdouble_id, "sqrtl");
+        call_library_fallbacks(&mut module, &types, &x86);
+        assert_eq!(module.functions[0].blocks[0].insns[1].op, Opcode::Sqrt);
+    }
 
     // Pass runner tests
 

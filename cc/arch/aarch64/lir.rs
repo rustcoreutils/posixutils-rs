@@ -648,6 +648,13 @@ pub enum Aarch64Inst {
         dst: VReg,
     },
 
+    /// FSQRT - FP square root
+    Fsqrt {
+        size: FpSize,
+        src: VReg,
+        dst: VReg,
+    },
+
     /// FCMP - FP compare
     Fcmp {
         size: FpSize,
@@ -1278,6 +1285,14 @@ impl EmitAsm for Aarch64Inst {
                 let _ = writeln!(
                     out,
                     "    fabs {}, {}",
+                    dst.name_for_size(size_bits(*size)),
+                    src.name_for_size(size_bits(*size))
+                );
+            }
+            Aarch64Inst::Fsqrt { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    fsqrt {}, {}",
                     dst.name_for_size(size_bits(*size)),
                     src.name_for_size(size_bits(*size))
                 );

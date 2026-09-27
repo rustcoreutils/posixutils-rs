@@ -1244,7 +1244,8 @@ int main(void) {
     /* A conversion keeps the payload's high bits, as the hardware does. */
     if (b32((float)__builtin_nan("0x40000000")) != 0x7fc00002u) return 12;
     if (b64((double)__builtin_nanf("0x123")) != 0x7ff8002460000000ULL) return 13;
-    /* long double: x87 extended on x86-64, binary128 on aarch64. */
+    /* long double: x87 extended on x86-64, binary128 on aarch64 Linux, and
+       double on Apple arm64. */
     long double l = __builtin_nanl("0x1234");
     unsigned char c[16] = {0};
     __builtin_memcpy(c, &l, sizeof(long double) == 16 && __LDBL_MANT_DIG__ == 64 ? 10 : sizeof(long double));
@@ -1253,6 +1254,8 @@ int main(void) {
     __builtin_memcpy(&hi, c + 8, 8);
 #if __LDBL_MANT_DIG__ == 64
     if (lo != 0xc000000000001234ULL || hi != 0x7fffULL) return 14;
+#elif __LDBL_MANT_DIG__ == 53
+    if (lo != 0x7ff8000000001234ULL || hi != 0) return 14;
 #else
     if (lo != 0x1234ULL || hi != 0x7fff800000000000ULL) return 14;
 #endif

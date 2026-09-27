@@ -2359,9 +2359,12 @@ int main(void) {
 
 // A static initializer is evaluated at the precision of its operands' own
 // type. A `long double` constant carries 64 significand bits on x86-64 and
-// 113 on aarch64, so each value below is exact in both -- and was read off
-// gcc on both. They came out rounded to `double`: the float-to-integer
-// conversion and the complex arithmetic both went through `f64`.
+// 113 on aarch64 Linux, so each value below is exact in both -- and was read
+// off gcc on both. They came out rounded to `double`: the float-to-integer
+// conversion and the complex arithmetic both went through `f64`. Apple
+// arm64's `long double` is `double`, where each sum rounds to its leading
+// term, so what is expected is the exact value in a wide `long double` and
+// that rounding in a `double` one.
 const LONG_DOUBLE_STATIC_INIT_PROGRAM: &str = r#"
 static long long a = 0x1p62L + 1.0L;
 static unsigned long long b = 0x1p63L + 3.0L;
@@ -2370,14 +2373,16 @@ static long double _Complex z = (1.0L + 0x1p-60L) + 2.0iL;
 static long double _Complex w = (1.0L + 0x1p-60L) * (1.0L + 1.0iL);
 static long double _Complex q = (2.0L + 0x1p-59L) / 2.0L;
 static long double _Complex s = (1.0L + 1.0iL) - 0x1p-60L;
+#define WIDE (__LDBL_MANT_DIG__ > 53)
+#define T60 (WIDE ? 0x1p-60L : 0.0L)
 int main(void) {
-    if (a != 4611686018427387905LL) return 1;
-    if (b != 9223372036854775811ULL) return 2;
-    if (c != -4611686018427387909LL) return 3;
-    if (__real__ z - 1.0L != 0x1p-60L || __imag__ z != 2.0L) return 4;
-    if (__real__ w - 1.0L != 0x1p-60L || __imag__ w - 1.0L != 0x1p-60L) return 5;
-    if (__real__ q - 1.0L != 0x1p-60L || __imag__ q != 0.0L) return 6;
-    if (1.0L - __real__ s != 0x1p-60L || __imag__ s != 1.0L) return 7;
+    if (a != 4611686018427387904LL + WIDE) return 1;
+    if (b != 9223372036854775808ULL + 3 * WIDE) return 2;
+    if (c != -4611686018427387904LL - 5 * WIDE) return 3;
+    if (__real__ z - 1.0L != T60 || __imag__ z != 2.0L) return 4;
+    if (__real__ w - 1.0L != T60 || __imag__ w - 1.0L != T60) return 5;
+    if (__real__ q - 1.0L != T60 || __imag__ q != 0.0L) return 6;
+    if (1.0L - __real__ s != T60 || __imag__ s != 1.0L) return 7;
     return 0;
 }
 "#;
@@ -2439,7 +2444,12 @@ int main(void) {
     if (!same(s, (one + i) - t60)) return 7;
     if (!same(r, (one + t60 + i) / (one + i))) return 8;
     if (!same(m, (three + t58 + 5.0L * i) * (seven - t57 * i))) return 9;
+#ifndef __APPLE__
+    /* Apple's `__divdc3` is compiler-rt's, which scales by `logb` where
+       libgcc's divides by Smith's method; c17 folds as libgcc computes, and
+       for this quotient the two differ in the last place. */
     if (!same(d, (three + t58 + 5.0L * i) / (seven - two * i))) return 10;
+#endif
 
     volatile _Complex int n = -9 + 38i, e = 5 + 6i;
     _Complex int rq = n / e;
@@ -2509,7 +2519,9 @@ int main(void) {
     if (n1 != 1 || n2 != 0 || n3 != 0 || l1 != 1 || l2 != 1) return 3;
     if (c1 != 7 || c2 != 8) return 4;
     if (k1 != 1.5 || k2 != 3 || k3 != 1 || k4 != 0 || k5 != 1.25 || k6 != 3) return 5;
-    if (k8 != 1.0f || k9 != 4611686018427387905LL || k10 != 5 || k11 != 5.0) return 6;
+    /* 2^62 + 1 is exact in a wide long double, and 2^62 in Apple's. */
+    if (k8 != 1.0f || k9 != 4611686018427387904LL + (__LDBL_MANT_DIG__ > 53)) return 6;
+    if (k10 != 5 || k11 != 5.0) return 6;
     if (__real__ k12 != 3.0 || __imag__ k12 != 4.0) return 7;
     if (q1 != 5.0 || __real__ q2 != 2.0 || __imag__ q2 != 3.0) return 8;
     return 0;

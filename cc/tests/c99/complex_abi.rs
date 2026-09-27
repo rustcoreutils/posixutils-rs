@@ -773,7 +773,12 @@ struct HL { long double a, b; }; struct HF3 { float a, b, c; }; struct HD4 { dou
 struct SI { int a, b; }; struct SI3 { int a, b, c; }; struct SL { long a, b; };
 struct MIX { float f; int i; }; struct MD { double d; long l; }; struct BIG { long a, b, c; };
 struct C1 { char c; };
+#ifdef __APPLE__ /* Darwin has no _Float128 */
+#define QC_ARG(r)
+#else
 typedef _Float128 _Complex qc_t;
+#define QC_ARG(r) , __builtin_complex(8.5F128 + r, -8.5F128)
+#endif
 "#;
 
 const VA_AGG_CALLEE: &str = r#"
@@ -800,7 +805,9 @@ int check(int rounds, ...) {
         double _Complex dc = __builtin_va_arg(ap, double _Complex); if (__real__ dc != 6.5 + r || __imag__ dc != -6.5) return e + 17;
         if (__builtin_va_arg(ap, double) != 7.25 + r) return e + 18;
         if (__builtin_va_arg(ap, int) != 16 + r) return e + 19;
+#ifndef __APPLE__
         qc_t q = __builtin_va_arg(ap, qc_t); if (__real__ q != 8.5F128 + r || __imag__ q != -8.5F128) return e + 20;
+#endif
     }
     __builtin_va_end(ap);
     return 0;
@@ -814,7 +821,7 @@ int check(int rounds, ...);
   (struct HL){3.5L + r, -3.5L}, (struct HF3){1 + r, 2, 3}, (struct HD4){1 + r, 2, 3, 4}, \
   (struct SI){7 + r, -7}, (struct SI3){8 + r, -8, 9}, (struct SL){10 + r, -10}, \
   (struct MIX){4.5f + r, -11}, (struct MD){5.5 + r, -12}, (struct BIG){13 + r, -13, 14}, (struct C1){15 + r}, \
-  __builtin_complex(6.5 + r, -6.5), 7.25 + r, 16 + r, __builtin_complex(8.5F128 + r, -8.5F128)
+  __builtin_complex(6.5 + r, -6.5), 7.25 + r, 16 + r QC_ARG(r)
 int main(void) {
     int rc = check(1, ROUND(0));
     if (rc) return rc;
@@ -866,6 +873,8 @@ fn c99_va_arg_aggregates_interoperate_with_gcc_aarch64() {
 
 // Returned from, passed to and computed by functions: segfaulted on x86-64,
 // where _Float128 is not long double. Passes under gcc on both targets.
+// Darwin has no `_Float128`, and c17 rejects it there, as clang does.
+#[cfg(not(target_os = "macos"))]
 const FLOAT128_COMPLEX_CALLS: &str = r#"
 typedef _Float128 _Complex qc;
 __attribute__((noinline)) qc mk(int a, double d) { return (qc)(a + 0.5F128) - (qc)(d * 1.0if128); }
@@ -886,6 +895,7 @@ int main(void) {
 }
 "#;
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn c99_float128_complex_through_calls() {
     for opt in ["-O0", "-O2"] {
@@ -982,6 +992,7 @@ int main(void) {
 }
 "#;
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn c99_float128_complex_operations_c17_both_sides() {
     let program = format!("{F128C_DECLS}\n{F128C_CALLEE}\n{F128C_CALLER}");

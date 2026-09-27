@@ -66,12 +66,23 @@ fn has_insn(asm: &str, mnemonic: &str) -> bool {
 /// argument below zero -- `-0` and a NaN are not -- and left alone
 /// otherwise. A call whose value is discarded still sets it, and one in the
 /// arm of a conditional that is not taken does not.
+///
+/// That is glibc's `errno`. Apple's libm reports a domain error by the
+/// exception alone (its `math_errhandling` is `MATH_ERREXCEPT`), so there the
+/// same calls must leave `errno` at zero: c17 still calls the library for a
+/// negative argument, and nothing on that path may write it.
 const SQRT_PROGRAM: &str = r#"
 typedef unsigned long long u64; typedef unsigned int u32;
 double sqrt(double); float sqrtf(float); long double sqrtl(long double);
+#ifdef __APPLE__
+extern int *__error(void);
+#define ERRNO (*__error())
+#define DOMAIN_ERRNO 0
+#else
 extern int *__errno_location(void);
 #define ERRNO (*__errno_location())
-#define EDOM 33
+#define DOMAIN_ERRNO 33 /* EDOM */
+#endif
 static u64 dbits(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
 static double dfrom(u64 u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
 static u32 fbits(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
@@ -118,12 +129,12 @@ static int check_double(void) {
     for (int i = 0; i < N(dneg); i++) {
         volatile double x = dfrom(dneg[i]);
         ERRNO = 0;
-        if (!__builtin_isnan(sqrt(x)) || ERRNO != EDOM) return 4;
+        if (!__builtin_isnan(sqrt(x)) || ERRNO != DOMAIN_ERRNO) return 4;
         ERRNO = 0;
-        if (!__builtin_isnan(__builtin_sqrt(x)) || ERRNO != EDOM) return 5;
+        if (!__builtin_isnan(__builtin_sqrt(x)) || ERRNO != DOMAIN_ERRNO) return 5;
         ERRNO = 0;
         (void)sqrt(x);
-        if (ERRNO != EDOM) return 6;
+        if (ERRNO != DOMAIN_ERRNO) return 6;
         volatile int no = 0;
         ERRNO = 0;
         double r = no ? sqrt(x) : 1.0;
@@ -146,9 +157,9 @@ static int check_float(void) {
     for (int i = 0; i < N(fneg); i++) {
         volatile float x = ffrom(fneg[i]);
         ERRNO = 0;
-        if (!__builtin_isnan(sqrtf(x)) || ERRNO != EDOM) return 14;
+        if (!__builtin_isnan(sqrtf(x)) || ERRNO != DOMAIN_ERRNO) return 14;
         ERRNO = 0;
-        if (!__builtin_isnan(__builtin_sqrtf(x)) || ERRNO != EDOM) return 15;
+        if (!__builtin_isnan(__builtin_sqrtf(x)) || ERRNO != DOMAIN_ERRNO) return 15;
     }
     return 0;
 }
@@ -164,9 +175,9 @@ static int check_long_double(void) {
     if (sqrtl(inf) != inf) return 25;
     if (!__builtin_isnan(sqrtl(nan))) return 26;
     if (ERRNO != 0) return 27;
-    if (!__builtin_isnan(sqrtl(m1)) || ERRNO != EDOM) return 28;
+    if (!__builtin_isnan(sqrtl(m1)) || ERRNO != DOMAIN_ERRNO) return 28;
     ERRNO = 0;
-    if (!__builtin_isnan(__builtin_sqrtl(m1)) || ERRNO != EDOM) return 29;
+    if (!__builtin_isnan(__builtin_sqrtl(m1)) || ERRNO != DOMAIN_ERRNO) return 29;
     return 0;
 }
 /* Constant arguments, which the optimizer folds: the same answers, and a
@@ -180,7 +191,7 @@ static int check_constants(void) {
     if (sqrtl(2.0L) != 1.4142135623730950488016887242096980785697L) return 35;
     if (sqrt(__builtin_inf()) != __builtin_inf()) return 36;
     if (ERRNO != 0) return 37;
-    if (!__builtin_isnan(sqrt(-4.0)) || ERRNO != EDOM) return 38;
+    if (!__builtin_isnan(sqrt(-4.0)) || ERRNO != DOMAIN_ERRNO) return 38;
     return 0;
 }
 int main(void) {
@@ -1022,7 +1033,9 @@ static int check_min_max(void) {
     }
     volatile double n1 = __builtin_nan("1"), n2 = __builtin_nan("2");
     if (!__builtin_isnan(fmin(n1, n2)) || !__builtin_isnan(fmax(n1, n2))) return 15;
-#ifdef __aarch64__
+/* fminnm's zeros. At -O0 the bare call is the C library's, which C leaves
+   free here: glibc's aarch64 function is fminnm, Apple's is not known to be. */
+#if defined(__aarch64__) && (defined(__OPTIMIZE__) || !defined(__APPLE__))
     volatile double pz = 0.0, nz = -0.0;
     if (dbits(fmin(pz, nz)) != 0x8000000000000000 || dbits(fmin(nz, pz)) != 0x8000000000000000) return 16;
     if (dbits(fmax(pz, nz)) != 0 || dbits(fmax(nz, pz)) != 0) return 17;

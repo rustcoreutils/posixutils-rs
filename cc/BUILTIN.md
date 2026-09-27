@@ -339,6 +339,14 @@ of the constant length 0 is 0 at every level. `-fno-builtin` and
 `-fno-builtin-NAME` keep the bare name's call, as does a declaration of the
 name with another prototype.
 
+A call to `strcpy`, `stpcpy`, `strncpy`, `strcat`, `strncat` or `sprintf`
+whose source string has a known length -- one string, or a choice among strings
+of one length -- is a `memcpy` of that length and the terminator, as gcc makes
+it: `strcat` finds the end with `strlen`, `strncpy` pads with a `memset` of zero
+up to 128 bytes, and `sprintf` of a format with no conversion, or of `"%s"`,
+answers the length. `stpcpy`, or `sprintf(d, "%s", s)`, of an unknown `s`
+whose result is unused is `strcpy(d, s)`.
+
 
 The call always reaches the *library's* function, never an inline definition
 of the same name in the translation unit. That is the other half of what the

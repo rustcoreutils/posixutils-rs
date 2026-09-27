@@ -18,6 +18,7 @@
 
 mod bit_ops;
 mod call_semantics;
+mod copy_fold;
 mod frame_address;
 mod gnu_atomics;
 mod has_feature;

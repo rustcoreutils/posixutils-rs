@@ -2711,7 +2711,7 @@ pub struct Module {
 /// called something else -- `strstr(s, "c")` becomes `strchr(s, 'c')` --
 /// by their C names.
 pub const FOLD_CALLEES: &[&str] = &[
-    "strlen", "strchr", "strcpy", "memcpy", "puts", "putchar", "fputs", "fputc", "fwrite",
+    "strlen", "strchr", "strcpy", "memcpy", "memset", "puts", "putchar", "fputs", "fputc", "fwrite",
 ];
 
 impl Module {

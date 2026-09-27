@@ -20,12 +20,14 @@
 // Each family of functions is a module of its own, which answers what one
 // call folds to as a [`Folded`] without touching the function; this module
 // finds the calls and writes the answers in. `strings` has the functions
-// that read strings and compute a value. The families still to come each
-// add a module and an arm in `fold`: `copies` (`strcpy` and its kin, which
-// write), `memory` (the `mem*` functions beyond comparison) and `stdio`
-// (`printf` and its kin, whose result must be unused).
+// that read strings and compute a value; `copies` has `strcpy` and its kin,
+// which write one, and fold to a `memcpy` of a known length. The families
+// still to come each add a module and an arm in `fold`: `memory` (the
+// `mem*` functions beyond comparison) and `stdio` (`printf` and its kin,
+// whose result must be unused).
 //
 
+mod copies;
 mod strings;
 
 use super::build::Builder;
@@ -68,6 +70,8 @@ pub(crate) enum Folded {
     ByteDiff(Byte, Byte),
     /// A call to another library function that computes the same thing.
     Call(NewCall),
+    /// Bytes written in place of the call, and what it answers.
+    Write(copies::Write),
 }
 
 /// One byte of a comparison.
@@ -103,6 +107,19 @@ pub(crate) struct Facts<'a> {
 }
 
 impl Facts<'_> {
+    /// Whether nothing reads `insn`'s result.
+    pub(crate) fn result_unused(&self, insn: &Instruction) -> bool {
+        let Some(t) = insn.target else {
+            return true;
+        };
+        !self
+            .func
+            .blocks
+            .iter()
+            .flat_map(|bb| &bb.insns)
+            .any(|i| i.uses().contains(&t))
+    }
+
     /// The constant `p` holds, read as an unsigned `bits`-bit value.
     pub(crate) fn unsigned(&self, p: PseudoId, bits: u32) -> Option<u128> {
         self.consts.get_at(p, bits, false).map(|v| v as u128)
@@ -184,6 +201,9 @@ fn fold(known: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded> {
         | L::Strstr
         | L::Strpbrk
         | L::Strcspn => strings::fold(known, insn, facts),
+        L::Strcpy | L::Stpcpy | L::Strncpy | L::Strcat | L::Strncat | L::Sprintf => {
+            copies::fold(known, insn, facts)
+        }
         _ => None,
     }
 }
@@ -191,10 +211,14 @@ fn fold(known: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded> {
 /// Whether `folded` calls the very function it is in: `strchr` written in
 /// terms of `strpbrk` must not become a call to itself.
 fn calls_itself(func: &Function, ctx: &FoldCtx, folded: &Folded) -> bool {
-    let Folded::Call(call) = folded else {
-        return false;
+    let calls: &[&str] = match folded {
+        Folded::Call(call) => &[call.name],
+        Folded::Write(write) => write.calls(),
+        _ => &[],
     };
-    func.name == call.name || ctx.callees.get(call.name) == Some(&func.name)
+    calls
+        .iter()
+        .any(|&name| func.name == name || ctx.callees.get(name) == Some(&func.name))
 }
 
 /// Replace each call in `sites` with what it folds to.
@@ -221,9 +245,16 @@ fn apply(func: &mut Function, ctx: &FoldCtx, sites: Vec<Site>) {
 
 /// The instructions that give `call`'s result the value `folded` says.
 ///
-/// A call whose result is unused leaves nothing: every function folded
-/// here only computes a value.
+/// A call whose result is unused leaves nothing but what it writes.
 fn materialize(b: &mut Builder, ctx: &FoldCtx, call: &Instruction, folded: Folded) {
+    if let Folded::Write(write) = folded {
+        let result = call
+            .target
+            .zip(call.typ)
+            .map(|(t, typ)| (t, typ, call.size));
+        copies::materialize(b, ctx, write, result);
+        return;
+    }
     let (Some(target), Some(typ)) = (call.target, call.typ) else {
         return;
     };
@@ -231,12 +262,7 @@ fn materialize(b: &mut Builder, ctx: &FoldCtx, call: &Instruction, folded: Folde
     let value = match folded {
         Folded::Int(v) => b.constant(v, typ, size),
         Folded::Null => b.constant(0, typ, size),
-        Folded::Offset(p, 0) => p,
-        Folded::Offset(p, k) => {
-            let ulong = b.types.ulong_id;
-            let k = b.constant(i128::from(k), ulong, 64);
-            b.binop(Opcode::Add, p, k, typ, size)
-        }
+        Folded::Offset(p, k) => offset(b, p, k, typ, size),
         Folded::LenMinus { len, var } => {
             let len = b.constant(i128::from(len), typ, size);
             b.binop(Opcode::Sub, len, var, typ, size)
@@ -253,11 +279,22 @@ fn materialize(b: &mut Builder, ctx: &FoldCtx, call: &Instruction, folded: Folde
             b.binop(Opcode::Sub, x, y, typ, size)
         }
         Folded::Call(new) => {
-            make_call(b, ctx, call, target, new);
+            make_call(b, ctx, Some(target), typ, new);
             return;
         }
+        Folded::Write(_) => unreachable!("a write is materialized above"),
     };
     b.copy_into(target, value, typ, size);
+}
+
+/// The pointer `p` advanced `k` bytes, of the pointer type `typ`.
+fn offset(b: &mut Builder, p: PseudoId, k: i64, typ: TypeId, size: u32) -> PseudoId {
+    if k == 0 {
+        return p;
+    }
+    let ulong = b.types.ulong_id;
+    let k = b.constant(i128::from(k), ulong, 64);
+    b.binop(Opcode::Add, p, k, typ, size)
 }
 
 /// `byte` at the comparison's result type (`int`): loaded as an `unsigned
@@ -273,8 +310,8 @@ fn byte_value(b: &mut Builder, byte: Byte, typ: TypeId, size: u32) -> PseudoId {
     }
 }
 
-/// The call `new`, defining `target` as `call` did.
-fn make_call(b: &mut Builder, ctx: &FoldCtx, call: &Instruction, target: PseudoId, new: NewCall) {
+/// The call `new`, returning `ret` into `target`.
+fn make_call(b: &mut Builder, ctx: &FoldCtx, target: Option<PseudoId>, ret: TypeId, new: NewCall) {
     let mut args = Vec::with_capacity(new.args.len());
     let mut arg_types = Vec::with_capacity(new.args.len());
     for arg in new.args {
@@ -286,9 +323,8 @@ fn make_call(b: &mut Builder, ctx: &FoldCtx, call: &Instruction, target: PseudoI
         arg_types.push(t);
     }
     let name = ctx.callees.get(new.name).map_or(new.name, String::as_str);
-    let ret = call.typ.unwrap_or(b.types.int_id);
     let mut insn = Instruction::call_with_abi(
-        Some(target),
+        target,
         name,
         args,
         arg_types,
@@ -338,7 +374,10 @@ pub(super) mod tests {
     }
 
     /// Fold `fx`'s function with `callees`, and hand back its instructions.
-    fn run_on(fx: &mut Fixture, callees: &[(&'static str, &str)]) -> Vec<Instruction> {
+    pub(in crate::ir::libcall_fold) fn run_on(
+        fx: &mut Fixture,
+        callees: &[(&'static str, &str)],
+    ) -> Vec<Instruction> {
         let mut func = std::mem::take(&mut fx.module.functions[0]);
         with_ctx(fx, callees, |ctx| run(&mut func, ctx));
         let insns = func.blocks[0].insns.clone();
@@ -347,14 +386,14 @@ pub(super) mod tests {
     }
 
     /// The instruction defining `p`.
-    fn def(insns: &[Instruction], p: PseudoId) -> &Instruction {
+    pub(in crate::ir::libcall_fold) fn def(insns: &[Instruction], p: PseudoId) -> &Instruction {
         insns
             .iter()
             .find(|i| i.target == Some(p))
             .unwrap_or_else(|| panic!("nothing defines {p}"))
     }
 
-    fn ops(insns: &[Instruction]) -> Vec<Opcode> {
+    pub(in crate::ir::libcall_fold) fn ops(insns: &[Instruction]) -> Vec<Opcode> {
         insns.iter().map(|i| i.op).collect()
     }
 

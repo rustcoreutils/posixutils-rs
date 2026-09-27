@@ -142,7 +142,7 @@ fn builtins_string_fold_values_aarch64() {
 
 /// Whether the assembly mentions the function `name` at all -- a call, a
 /// tail jump or an address taken.
-fn mentions(asm: &str, name: &str) -> bool {
+pub(super) fn mentions(asm: &str, name: &str) -> bool {
     asm.lines()
         .filter(|l| !l.trim_start().starts_with(".file"))
         .any(|l| {
@@ -153,7 +153,7 @@ fn mentions(asm: &str, name: &str) -> bool {
 
 /// Compile `src` at `opt` for the host and for aarch64, and hand the
 /// assembly to `check`.
-fn for_each_target(prefix: &str, src: &str, extra: &[&str], check: impl Fn(&str, &str)) {
+pub(super) fn for_each_target(prefix: &str, src: &str, extra: &[&str], check: impl Fn(&str, &str)) {
     for target in [None, Some("aarch64-unknown-linux-gnu")] {
         let mut args = extra.to_vec();
         if let Some(t) = target {

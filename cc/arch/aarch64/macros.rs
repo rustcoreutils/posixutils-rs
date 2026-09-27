@@ -30,8 +30,9 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         // and `get_additional_sizeof_macros`, which know the OS as well as the
         // architecture — it is quad on aarch64 Linux but plain double on
         // Apple, and this list cannot tell them apart.
-        // char is unsigned on ARM by default
-        ("__CHAR_UNSIGNED__", Some("1")),
+        // `__CHAR_UNSIGNED__` is not here: plain `char` is unsigned under
+        // AAPCS64 but signed on Apple arm64, so `get_arch_macros` defines it
+        // from `Target::plain_char`.
         // Advanced SIMD is mandatory in the AArch64 base architecture, so
         // this is a fact about the target and gcc defines it unconditionally
         // here. It says nothing about whether <arm_neon.h> is available --

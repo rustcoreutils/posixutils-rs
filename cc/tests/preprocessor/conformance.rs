@@ -1392,15 +1392,30 @@ int main(void) {
 /// signedness, which differs by target. `compile_and_run` only ever exercises
 /// the host, so the other answer is only visible through `--target`.
 #[test]
+///
+/// The rule is per OS too: Apple arm64 makes plain `char` signed where
+/// AAPCS64 makes it unsigned. `<limits.h>` must describe the same type, so
+/// `CHAR_MIN` is checked alongside.
 fn preprocessor_if_char_signedness_is_per_target() {
-    let src = "#if '\\xff' < 0\nSIGNED_CHAR\n#else\nUNSIGNED_CHAR\n#endif\n";
-    for (target, want) in [
-        ("x86_64-unknown-linux-gnu", "SIGNED_CHAR"),
-        ("aarch64-unknown-linux-gnu", "UNSIGNED_CHAR"),
+    let src = "#include <limits.h>\n\
+               #if '\\xff' < 0\nSIGNED_CHAR\n#else\nUNSIGNED_CHAR\n#endif\n\
+               #if CHAR_MIN < 0 && CHAR_MAX == SCHAR_MAX\nSIGNED_LIMITS\n\
+               #elif CHAR_MIN == 0 && CHAR_MAX == UCHAR_MAX\nUNSIGNED_LIMITS\n#endif\n";
+    for (target, signed) in [
+        ("x86_64-unknown-linux-gnu", true),
+        ("x86_64-apple-darwin", true),
+        ("aarch64-unknown-linux-gnu", false),
+        ("aarch64-apple-darwin", true),
     ] {
         let r = preprocess_text("char_sign", src, &["--target", target]);
         assert!(r.success, "-E failed for {}: {}", target, r.stderr);
+        let (want, limits) = if signed {
+            ("SIGNED_CHAR", "SIGNED_LIMITS")
+        } else {
+            ("UNSIGNED_CHAR", "UNSIGNED_LIMITS")
+        };
         assert_has(&r.stdout, want, target);
+        assert_has(&r.stdout, limits, target);
     }
 }
 

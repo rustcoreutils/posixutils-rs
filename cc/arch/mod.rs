@@ -23,7 +23,7 @@ pub mod x86_64;
 // Re-export inline asm support traits and functions
 pub use codegen::{substitute_asm_operands, AsmOperandFormatter, AsmOperandSlot};
 
-use crate::target::{Arch, Os, Target};
+use crate::target::{Arch, CharSignedness, Os, Target};
 
 /// The first source position this function's instructions carry, for a backend
 /// diagnostic that has no better one.
@@ -46,9 +46,6 @@ pub fn get_arch_macros(target: &Target) -> Vec<(&'static str, Option<&'static st
     // long is 64-bit on LP64 (Unix), 32-bit on LLP64 (Windows)
     let long_size = if target.long_width == 64 { "8" } else { "4" };
 
-    // Signedness: __CHAR_UNSIGNED__ is defined only if char is unsigned
-    let char_unsigned: Option<&'static str> = if target.char_signed { None } else { Some("1") };
-
     let mut macros = vec![
         // Common architecture macros based on type sizes
         ("__CHAR_BIT__", Some("8")),
@@ -62,11 +59,12 @@ pub fn get_arch_macros(target: &Target) -> Vec<(&'static str, Option<&'static st
         ("__SIZEOF_DOUBLE__", Some("8")),
     ];
 
-    // __CHAR_UNSIGNED__: only define when char is unsigned.
-    // An empty-body #define still satisfies #ifdef, so we must
-    // not add the macro at all when char is signed.
-    if let Some(val) = char_unsigned {
-        macros.push(("__CHAR_UNSIGNED__", Some(val)));
+    // __CHAR_UNSIGNED__ is defined exactly when plain `char` is unsigned, and
+    // is the only place that fact reaches <limits.h>'s CHAR_MIN/CHAR_MAX. An
+    // empty-body #define still satisfies #ifdef, so a signed target must not
+    // get the macro at all.
+    if target.plain_char == CharSignedness::Unsigned {
+        macros.push(("__CHAR_UNSIGNED__", Some("1")));
     }
 
     // LP64 macros only on LP64 targets (Unix), not on LLP64 (Windows)
@@ -700,6 +698,44 @@ mod tests {
                 eps, expected,
                 "__LDBL_EPSILON__ does not match a {}-bit mantissa on {:?}/{:?}",
                 mant_dig, arch, os
+            );
+        }
+    }
+
+    /// `__CHAR_UNSIGNED__` is defined exactly when plain `char` is unsigned,
+    /// once, and per OS as well as per architecture: Apple arm64 makes `char`
+    /// signed where AAPCS64 makes it unsigned, and `<limits.h>` derives
+    /// `CHAR_MIN`/`CHAR_MAX` from this macro alone.
+    #[test]
+    fn char_unsigned_macro_follows_the_target() {
+        for (arch, os, unsigned) in [
+            (Arch::X86_64, Os::Linux, false),
+            (Arch::X86_64, Os::MacOS, false),
+            (Arch::Aarch64, Os::Linux, true),
+            (Arch::Aarch64, Os::MacOS, false),
+        ] {
+            let target = Target::new(arch, os);
+            let macros = get_arch_macros(&target);
+            let defs: Vec<_> = macros
+                .iter()
+                .filter(|(n, _)| *n == "__CHAR_UNSIGNED__")
+                .collect();
+            assert_eq!(
+                defs.len(),
+                usize::from(unsigned),
+                "__CHAR_UNSIGNED__ on {arch}-{os}"
+            );
+            // The macro and the type system read the same fact.
+            assert_eq!(
+                unsigned,
+                target.plain_char == CharSignedness::Unsigned,
+                "{arch}-{os}"
+            );
+            let bits = macros.iter().find(|(n, _)| *n == "__CHAR_BIT__");
+            assert_eq!(bits, Some(&("__CHAR_BIT__", Some("8"))));
+            assert_eq!(
+                macro_value(&get_limit_macros(&target), "__SCHAR_MAX__"),
+                "127"
             );
         }
     }

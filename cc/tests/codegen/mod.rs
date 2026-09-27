@@ -21,6 +21,7 @@ mod inline_asm;
 mod memopt;
 mod misc;
 mod pic;
+mod plain_char;
 mod promotion;
 mod regalloc;
 mod scaling;

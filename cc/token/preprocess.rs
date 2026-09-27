@@ -2124,15 +2124,11 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         // C17 6.4.4.4p10: an ordinary character constant has type `int`. One
         // character takes plain `char`'s signedness, so `'\xff'` is negative
         // where `char` is signed and positive where it is not -- which is the
-        // whole reason `Target::char_signed` exists.
+        // whole reason `Target::plain_char` exists.
         let bytes: Vec<u8> = payload_bytes(&literal::literal_bytes(&elements)).collect();
         if bytes.len() == 1 {
             let b = bytes[0];
-            return PpValue::signed(if self.pp.target.char_signed {
-                b as i8 as i128
-            } else {
-                b as i128
-            });
+            return PpValue::signed(self.pp.target.plain_char.byte_value(b) as i128);
         }
 
         // More than one: gcc packs big-endian and lets the value wrap in

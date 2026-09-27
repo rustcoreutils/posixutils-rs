@@ -15,13 +15,16 @@ use super::*;
 use crate::token::lexer::Tokenizer;
 
 fn preprocess_str(input: &str) -> (Vec<Token>, IdentTable) {
-    let target = Target::host();
+    preprocess_str_for(input, &Target::host())
+}
+
+fn preprocess_str_for(input: &str, target: &Target) -> (Vec<Token>, IdentTable) {
     let mut strings = IdentTable::new();
     let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
     let (result, _) = preprocess_collecting(
         tokens,
-        &target,
+        target,
         &mut strings,
         "<test>",
         &PreprocessConfig::default(),
@@ -1447,26 +1450,38 @@ no
 /// C17 6.4.4.4p10: an ordinary character constant has plain `char`'s
 /// signedness, so the answer differs by target and `#if` must agree with what
 /// the compiled program would compute.
+///
+/// `__CHAR_UNSIGNED__` must agree with it, since `<limits.h>` reads that
+/// macro alone -- per OS as well as per architecture, because Apple arm64
+/// makes plain `char` signed where AAPCS64 makes it unsigned.
 #[test]
 fn test_if_char_signedness_follows_target() {
+    use crate::target::{Arch, CharSignedness, Os};
     let code = "#if '\\xff' < 0
 signed
 #else
 unsigned
+#endif
+#ifdef __CHAR_UNSIGNED__
+macro_unsigned
+#else
+macro_signed
 #endif";
-    let (tokens, idents) = preprocess_str(code);
-    let strs = get_token_strings(&tokens, &idents);
-    let want = if Target::host().char_signed {
-        "signed"
-    } else {
-        "unsigned"
-    };
-    assert!(
-        strs.contains(&want.to_string()),
-        "expected {:?} for '\\xff' < 0 on this target, got: {:?}",
-        want,
-        strs
-    );
+    for (arch, os) in [
+        (Arch::X86_64, Os::Linux),
+        (Arch::X86_64, Os::MacOS),
+        (Arch::Aarch64, Os::Linux),
+        (Arch::Aarch64, Os::MacOS),
+    ] {
+        let target = Target::new(arch, os);
+        let (tokens, idents) = preprocess_str_for(code, &target);
+        let strs = get_token_strings(&tokens, &idents);
+        let want = match target.plain_char {
+            CharSignedness::Signed => ["signed", "macro_signed"],
+            CharSignedness::Unsigned => ["unsigned", "macro_unsigned"],
+        };
+        assert_eq!(strs, want, "{arch}-{os}");
+    }
 }
 
 /// A prefixed constant holds one wide character, not the bytes of an

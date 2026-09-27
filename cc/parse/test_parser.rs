@@ -3999,6 +3999,38 @@ fn test_octal_escape_boundary() {
     }
 }
 
+/// C17 6.4.4.4p10: `'\x80'` has the value of a plain `char` holding 0x80,
+/// so it follows the target's `char` signedness -- which is per OS as well as
+/// per architecture: Apple arm64 is signed where AAPCS64 is unsigned. A
+/// prefixed constant is the code point on every target.
+#[test]
+fn test_char_constant_value_follows_target_signedness() {
+    use crate::target::{Arch, Os};
+    for (arch, os, want) in [
+        (Arch::X86_64, Os::Linux, -128),
+        (Arch::X86_64, Os::MacOS, -128),
+        (Arch::Aarch64, Os::Linux, 128),
+        (Arch::Aarch64, Os::MacOS, -128),
+    ] {
+        for (src, expected) in [("'\\x80'", want), ("L'\\x80'", 128)] {
+            let mut strings = StringTable::new();
+            let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);
+            let tokens = tokenizer.tokenize();
+            let mut symbols = SymbolTable::new();
+            let mut types = TypeTable::new(&Target::new(arch, os));
+            let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+            parser.skip_stream_tokens();
+            let expr = parser.parse_expression().unwrap();
+            let value = match expr.kind {
+                ExprKind::CharLit(v) => v,
+                ExprKind::IntLit(v) => v,
+                other => panic!("{src}: expected a character constant, got {other:?}"),
+            };
+            assert_eq!(value, expected, "{src} on {arch}-{os}");
+        }
+    }
+}
+
 #[test]
 fn test_hex_escape_single_digit() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\x0'").unwrap();

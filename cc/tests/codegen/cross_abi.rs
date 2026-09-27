@@ -21,7 +21,9 @@
 // everywhere.
 //
 
-use super::asm_probe::{asm_for, asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
+use super::asm_probe::{
+    asm_for, asm_for_with, body_of, AARCH64_DARWIN, AARCH64_LINUX, X86_64_LINUX,
+};
 use crate::common::{
     aarch64_cross_available, compile_with_host_cc, create_c_file, cross_link_and_run, run_c17,
 };
@@ -1736,7 +1738,7 @@ long take_l(long a, long b, long c, long d, long e, long f, long g, long v)
 ///
 /// C17 6.2.5p15 leaves plain `char`'s signedness implementation-defined; the
 /// x86-64 psABI makes it signed and AAPCS64 makes it unsigned, and
-/// `Target::char_signed` has recorded that all along. Only the two backends'
+/// `Target::plain_char` has recorded that all along. Only the two backends'
 /// load paths consulted it, so aarch64 emitted a correct zero-extending load
 /// and the front end then sign-extended the result back:
 ///
@@ -1747,15 +1749,21 @@ long take_l(long a, long b, long c, long d, long e, long f, long g, long v)
 ///
 /// cross-gcc emits the `ldrb` alone. Both directions are asserted, and both
 /// architectures, so a fix cannot pass by making every `char` unsigned.
+///
+/// The rule is per OS as well: Apple arm64 departs from AAPCS64 and makes
+/// plain `char` signed, as Apple clang does, so the same source must
+/// sign-extend under `aarch64-apple-darwin` -- both for a load and for a
+/// `char` parameter widened to `int`.
 #[test]
 fn codegen_plain_char_follows_the_target_signedness() {
     let src = r#"
 int  ld_plain(char *p)          { return *p; }
 int  ld_signed(signed char *p)  { return *p; }
 int  ld_unsigned(unsigned char *p) { return *p; }
+int  arg_plain(char c)          { return c; }
 "#;
 
-    // aarch64: plain char is unsigned, so it must not be sign-extended.
+    // aarch64 Linux: plain char is unsigned, so it must not be sign-extended.
     let a = asm_for("char_sign_a64", AARCH64_LINUX, src);
     let plain = body_of(&a, "ld_plain");
     assert!(
@@ -1776,6 +1784,30 @@ int  ld_unsigned(unsigned char *p) { return *p; }
     assert!(
         !unsigned.contains("sxtb") && !unsigned.contains("ldrsb"),
         "aarch64: unsigned char must not sign-extend:\n{unsigned}"
+    );
+    let arg = body_of(&a, "arg_plain");
+    assert!(
+        !arg.contains("sxtb") && arg.contains("uxtb"),
+        "aarch64: a plain char parameter widens by zero extension:\n{arg}"
+    );
+
+    // Apple arm64: plain char is signed, so the same load sign-extends.
+    let d = asm_for("char_sign_darwin", AARCH64_DARWIN, src);
+    let plain = body_of(&d, "ld_plain");
+    assert!(
+        plain.contains("ldrsb") && !plain.contains("ldrb") && !plain.contains("uxtb"),
+        "Apple arm64: plain char is signed and must sign-extend:\n{plain}"
+    );
+    let arg = body_of(&d, "arg_plain");
+    assert!(
+        arg.contains("sxtb") && !arg.contains("uxtb"),
+        "Apple arm64: a plain char parameter widens by sign extension:\n{arg}"
+    );
+    // The control: `unsigned char` still zero-extends there.
+    let unsigned = body_of(&d, "ld_unsigned");
+    assert!(
+        !unsigned.contains("sxtb") && !unsigned.contains("ldrsb"),
+        "Apple arm64: unsigned char must not sign-extend:\n{unsigned}"
     );
 
     // x86-64: plain char is signed, and must keep sign-extending.

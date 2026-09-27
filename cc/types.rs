@@ -11,7 +11,7 @@
 
 use crate::float::{ComplexRoutineFormat, FpFormat};
 use crate::strings::{StringId, StringTable as IdentTable};
-use crate::target::{Arch, Os, Target};
+use crate::target::{Arch, CharSignedness, Os, Target};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -787,14 +787,12 @@ pub struct TypeTable {
     target_arch: Arch,
     /// Target OS for runtime type size calculations
     target_os: Os,
-    /// Whether plain `char` is signed on the target.
-    ///
-    /// C17 6.2.5p15 leaves this implementation-defined: the x86-64 psABI says
-    /// signed, AAPCS64 says unsigned. Copied from `Target` at construction
+    /// Plain `char`'s signedness on the target (C17 6.2.5p15), as
+    /// [`CharSignedness::of`] decides it. Copied from `Target` at construction
     /// rather than recomputed, because the table cannot reconstruct the
     /// *requested* target -- `has_float128` rebuilds one with
     /// `..Target::host()` and would answer for the host instead.
-    char_signed: bool,
+    plain_char: CharSignedness,
 
     // Pre-computed common type IDs for fast access
     pub void_id: TypeId,
@@ -856,7 +854,7 @@ impl TypeTable {
             pointer_width: target.pointer_width,
             target_arch: target.arch,
             target_os: target.os,
-            char_signed: target.char_signed,
+            plain_char: target.plain_char,
             void_id: TypeId::INVALID,
             bool_id: TypeId::INVALID,
             char_id: TypeId::INVALID,
@@ -1361,8 +1359,8 @@ impl TypeTable {
                     result.push_str("volatile ");
                 }
                 // Spelling, not signedness: a diagnostic must name the type the
-                // source wrote. Plain `char` is an unsigned type on aarch64 and
-                // is still `char` here.
+                // source wrote. Plain `char` is an unsigned type on aarch64
+                // Linux and is still `char` here.
                 if self.spelled_unsigned(id) {
                     result.push_str("unsigned ");
                 } else if typ.modifiers.contains(TypeModifiers::SIGNED)
@@ -1835,18 +1833,23 @@ impl TypeTable {
                     .modifiers
                     .intersects(TypeModifiers::SIGNED | TypeModifiers::UNSIGNED) =>
             {
-                !self.char_signed
+                self.plain_char == CharSignedness::Unsigned
             }
             _ => typ.modifiers.contains(TypeModifiers::UNSIGNED),
         }
+    }
+
+    /// Plain `char`'s signedness on the target this table describes.
+    pub fn plain_char(&self) -> CharSignedness {
+        self.plain_char
     }
 
     /// Whether the declaration of `id` spelled the keyword `unsigned`.
     ///
     /// A question about source text rather than about values, and the only one
     /// a caller that *reprints* a type should ask: plain `char` is an unsigned
-    /// type on aarch64 and is still written `char`, and `_Bool` is unsigned
-    /// and is written neither way. Using [`Self::is_unsigned`] here would make
+    /// type on aarch64 Linux and is still written `char`, and `_Bool` is
+    /// unsigned and is written neither way. Using [`Self::is_unsigned`] here would make
     /// a type printer say `unsigned char` for a declaration that says `char`.
     pub fn spelled_unsigned(&self, id: TypeId) -> bool {
         self.get(id).modifiers.contains(TypeModifiers::UNSIGNED)
@@ -2704,13 +2707,15 @@ mod tests {
     /// 16-byte value for a 32-byte type.
     #[test]
     fn test_complex_base_and_make_complex_are_inverses() {
-        // Both targets, not just the host: plain `char` is signed on x86-64
-        // and unsigned on aarch64, and canonicalizing it by `is_unsigned`
-        // rather than by its modifiers sent plain `char` to `unsigned char`
-        // on one of them -- so the round trip held here and broke on CI.
+        // Every target, not just the host: plain `char` is signed on x86-64
+        // and Apple arm64 and unsigned on aarch64 Linux, and canonicalizing
+        // it by `is_unsigned` rather than by its modifiers sent plain `char`
+        // to `unsigned char` on one of them -- so the round trip held here
+        // and broke on CI.
         for target in [
             Target::new(Arch::X86_64, Os::Linux),
             Target::new(Arch::Aarch64, Os::Linux),
+            Target::new(Arch::Aarch64, Os::MacOS),
         ] {
             check_complex_round_trip(&target);
         }
@@ -3008,15 +3013,30 @@ mod tests {
 
     #[test]
     fn test_plain_char_signedness_follows_the_target() {
-        let x86 = TypeTable::new(&Target::new(Arch::X86_64, Os::Linux));
-        let arm = TypeTable::new(&Target::new(Arch::Aarch64, Os::Linux));
-
-        // The x86-64 psABI makes plain char signed; AAPCS64 makes it unsigned.
-        assert!(!x86.is_unsigned(x86.char_id), "x86-64: char is signed");
-        assert!(arm.is_unsigned(arm.char_id), "aarch64: char is unsigned");
+        // The x86-64 psABI makes plain char signed on Linux and Darwin alike;
+        // AAPCS64 makes it unsigned, and Apple arm64 overrides that to signed.
+        let tables: Vec<_> = [
+            (Arch::X86_64, Os::Linux, false),
+            (Arch::X86_64, Os::MacOS, false),
+            (Arch::Aarch64, Os::Linux, true),
+            (Arch::Aarch64, Os::MacOS, false),
+        ]
+        .into_iter()
+        .map(|(arch, os, unsigned)| {
+            let t = TypeTable::new(&Target::new(arch, os));
+            assert_eq!(t.is_unsigned(t.char_id), unsigned, "{arch}-{os}");
+            assert_eq!(
+                t.plain_char() == CharSignedness::Unsigned,
+                unsigned,
+                "{arch}-{os}"
+            );
+            t
+        })
+        .collect();
+        let arm = &tables[2];
 
         // The explicit spellings do not move with the target.
-        for t in [&x86, &arm] {
+        for t in &tables {
             assert!(!t.is_unsigned(t.schar_id), "signed char is always signed");
             assert!(
                 t.is_unsigned(t.uchar_id),
@@ -3027,8 +3047,8 @@ mod tests {
         }
 
         // Spelling is target-independent, and is what a type printer asks.
-        // Plain `char` is unsigned on aarch64 and is still written `char`.
-        for t in [&x86, &arm] {
+        // Plain `char` is unsigned on aarch64 Linux and is still written `char`.
+        for t in &tables {
             assert!(!t.spelled_unsigned(t.char_id));
             assert!(!t.spelled_unsigned(t.schar_id));
             assert!(t.spelled_unsigned(t.uchar_id));

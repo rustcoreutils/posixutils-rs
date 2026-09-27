@@ -2222,10 +2222,8 @@ impl<'a> Parser<'a> {
                         // Not a byte, so plain `char`'s signedness does not
                         // reach it.
                         v as i64
-                    } else if self.types.is_unsigned(self.types.char_id) {
-                        v as u8 as i64
                     } else {
-                        v as u8 as i8 as i64
+                        self.types.plain_char().byte_value(v as u8)
                     };
                     Ok(Self::typed_expr(
                         ExprKind::CharLit(value),

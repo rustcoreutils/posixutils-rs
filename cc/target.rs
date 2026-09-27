@@ -96,6 +96,47 @@ impl fmt::Display for Os {
     }
 }
 
+/// Whether plain `char` is a signed or an unsigned type on a target.
+///
+/// C17 6.2.5p15 leaves the choice to the implementation, and the platform ABIs
+/// make it -- per architecture *and* operating system, not per architecture:
+///
+/// - x86-64 (System V psABI, and Darwin, which follows it): signed.
+/// - AAPCS64, which Linux and FreeBSD follow: unsigned.
+/// - Apple arm64 departs from AAPCS64 here ("Writing ARM64 code for Apple
+///   platforms": "The char type is signed"), so Darwin is signed on both
+///   architectures.
+///
+/// Decided in one place -- [`CharSignedness::of`] -- and carried on
+/// [`Target`], because the type system, the predefined macros and the
+/// preprocessor's `#if` arithmetic must all give the same answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CharSignedness {
+    Signed,
+    Unsigned,
+}
+
+impl CharSignedness {
+    /// The platform ABI's choice for plain `char`.
+    pub fn of(arch: Arch, os: Os) -> Self {
+        match (arch, os) {
+            (Arch::X86_64, _) => CharSignedness::Signed,
+            (Arch::Aarch64, Os::MacOS) => CharSignedness::Signed,
+            (Arch::Aarch64, Os::Linux | Os::FreeBSD) => CharSignedness::Unsigned,
+        }
+    }
+
+    /// The value a `char` object holding the byte `b` has, converted to an
+    /// integer: C17 6.4.4.4p10 gives an unprefixed one-character constant
+    /// exactly this value, in the compiler and in `#if` alike.
+    pub fn byte_value(self, b: u8) -> i64 {
+        match self {
+            CharSignedness::Signed => b as i8 as i64,
+            CharSignedness::Unsigned => b as i64,
+        }
+    }
+}
+
 /// How a thread-local's address is obtained on a target.
 ///
 /// Decided in one place -- [`Target::tls_access`] -- because two consumers
@@ -137,8 +178,8 @@ pub struct Target {
     pub pointer_width: u32,
     /// Size of long in bits
     pub long_width: u32,
-    /// char is signed by default
-    pub char_signed: bool,
+    /// Plain `char`'s signedness, the platform ABI's choice
+    pub plain_char: CharSignedness,
     /// Maximum size (in bits) for aggregate types (struct/union) that can be
     /// passed or returned by value in registers. Aggregates larger than this
     /// require indirect passing (pointer) or sret (struct return pointer).
@@ -163,14 +204,6 @@ impl Target {
             Os::Linux | Os::MacOS | Os::FreeBSD => 64,
         };
 
-        // char signedness varies by platform
-        let char_signed = match (arch, os) {
-            // ARM defaults to unsigned char
-            (Arch::Aarch64, _) => false,
-            // x86_64 defaults to signed char
-            (Arch::X86_64, _) => true,
-        };
-
         // Maximum aggregate size that can be returned in registers.
         // Both x86-64 SysV ABI and AAPCS64 support returning 16-byte structs
         // in two registers (rax+rdx or x0+x1). Structs larger than 16 bytes
@@ -182,7 +215,7 @@ impl Target {
             os,
             pointer_width,
             long_width,
-            char_signed,
+            plain_char: CharSignedness::of(arch, os),
             max_aggregate_register_bits,
         }
     }
@@ -329,7 +362,6 @@ mod tests {
         assert_eq!(target.os, Os::Linux);
         assert_eq!(target.pointer_width, 64);
         assert_eq!(target.long_width, 64); // LP64
-        assert!(target.char_signed); // x86 default
     }
 
     /// Every accepted spelling is classified; the `c`/`gnu` prefix does not
@@ -405,6 +437,32 @@ mod tests {
         assert_eq!(target.arch, Arch::Aarch64);
         assert_eq!(target.os, Os::Linux);
         assert_eq!(target.pointer_width, 64);
-        assert!(!target.char_signed); // ARM default
+    }
+
+    /// Plain `char` follows the platform ABI, which is a property of the
+    /// architecture *and* the OS: Apple arm64 is signed where AAPCS64 is not.
+    #[test]
+    fn test_plain_char_signedness_per_target() {
+        use CharSignedness::{Signed, Unsigned};
+        for (arch, os, want) in [
+            (Arch::X86_64, Os::Linux, Signed),
+            (Arch::X86_64, Os::MacOS, Signed),
+            (Arch::X86_64, Os::FreeBSD, Signed),
+            (Arch::Aarch64, Os::Linux, Unsigned),
+            (Arch::Aarch64, Os::FreeBSD, Unsigned),
+            (Arch::Aarch64, Os::MacOS, Signed),
+        ] {
+            assert_eq!(Target::new(arch, os).plain_char, want, "{arch}-{os}");
+        }
+    }
+
+    #[test]
+    fn test_char_byte_value() {
+        assert_eq!(CharSignedness::Signed.byte_value(0x80), -128);
+        assert_eq!(CharSignedness::Signed.byte_value(0xff), -1);
+        assert_eq!(CharSignedness::Signed.byte_value(0x7f), 127);
+        assert_eq!(CharSignedness::Unsigned.byte_value(0x80), 128);
+        assert_eq!(CharSignedness::Unsigned.byte_value(0xff), 255);
+        assert_eq!(CharSignedness::Unsigned.byte_value(0x7f), 127);
     }
 }

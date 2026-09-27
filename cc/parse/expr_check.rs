@@ -550,7 +550,9 @@ impl Parser<'_> {
             // `s.x` designates an object only when `s` does: `f().x` is a
             // member of a returned value, and has nowhere to live.
             ExprKind::Member { expr, .. } => self.is_lvalue(expr),
+            // `__func__` is a `static const char` array (C17 6.4.2.2p1).
             ExprKind::CompoundLiteral { .. }
+            | ExprKind::FuncName
             | ExprKind::StringLit(_)
             | ExprKind::WideStringLit(_)
             | ExprKind::Utf16StringLit(_)
@@ -565,13 +567,23 @@ impl Parser<'_> {
         }
     }
 
-    /// Report an operand of unary `&` that has no address (C17 6.5.3.2p1).
+    /// Report an operand of unary `&` that has no address (C17 6.5.3.2p1):
+    /// one that is neither a function designator nor an lvalue, such as
+    /// `&(i + 1)` or `&creal(z)` -- a call's result is a value, even when the
+    /// call is evaluated in place.
     ///
-    /// `register` is the case that bites: the storage class is a hint the
-    /// compiler may ignore, but taking the address is still a constraint
-    /// violation, and a program that does it is relying on the hint being
-    /// ignored.
+    /// `register` is the other case, and the one that bites: the storage
+    /// class is a hint the compiler may ignore, but taking the address is
+    /// still a constraint violation, and a program that does it is relying on
+    /// the hint being ignored.
     pub(super) fn check_addressable(&self, operand: &Expr, pos: Position) {
+        let designates_function = operand
+            .typ
+            .is_some_and(|t| self.types.kind(t) == TypeKind::Function);
+        if !designates_function && !self.is_lvalue(operand) {
+            diag::error_args(pos, "lvalue required as {0}", &["unary '&' operand"]);
+            return;
+        }
         let ExprKind::Ident(symbol_id) = &operand.kind else {
             return;
         };

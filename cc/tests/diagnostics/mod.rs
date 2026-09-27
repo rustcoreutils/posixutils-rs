@@ -1101,6 +1101,29 @@ fn diagnostics_non_lvalue_targets_are_rejected() {
             "int main(void){ register int a=1; return *&a; }\n",
             "address of register variable 'a' requested",
         ),
+        // Unary `&` needs an lvalue or a function designator (6.5.3.2p1).
+        // Anything else compiled, and took the address of a temporary.
+        (
+            "address_of_sum",
+            "int main(void){ int a=1; int *p = &(a+1); return *p; }\n",
+            "lvalue required as unary '&' operand",
+        ),
+        (
+            "address_of_call",
+            "int f(void);\nint main(void){ int *p = &f(); return *p; }\n",
+            "lvalue required as unary '&' operand",
+        ),
+        (
+            "address_of_conditional",
+            "int main(void){ int a=1,b=2; int *p = &(a ? a : b); return *p; }\n",
+            "lvalue required as unary '&' operand",
+        ),
+        (
+            "address_of_member_of_call",
+            "struct S { int x; };\nstruct S g(void);\n\
+             int main(void){ int *p = &g().x; return *p; }\n",
+            "lvalue required as unary '&' operand",
+        ),
     ] {
         compile_expect_error(name, src, expected);
     }
@@ -1145,6 +1168,10 @@ int main(void) {
     (void)&"literal"[0];
     /* a compound literal is an object, so it is an lvalue */
     s = (struct S){1, {2,3,4}};
+    (void)&(struct S){0};
+    /* `&` also takes a function designator, and __func__ is an array */
+    int (*fp)(void) = &main; (void)fp; (void)&*fp;
+    (void)&__func__; (void)&__real__ z;
     return 0;
 }
 "#;

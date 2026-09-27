@@ -140,7 +140,8 @@ definition, which glibc's fortify wrappers rely on.
 
 At `-O0`, as in gcc, a libm function named by its bare spelling (`sqrt`) is
 called rather than computed, and so is one that must still set `errno`
-whatever its spelling; the magnitudes, `copysign` and the complex accessors
+whatever its spelling -- unless its answer is a constant, which it is at
+every level, so `static double d = floor(2.5);` compiles at `-O0` too; the magnitudes, `copysign` and the complex accessors
 are computed in place at every level, and the block memory functions are
 their IR operation at every level. A libm function computed in place is one
 IR opcode keyed on its type; where the target has no instruction for that

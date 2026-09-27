@@ -18,6 +18,7 @@
 
 use super::ast::{Expr, ExprKind, InlineLibraryFn, MathErrno, MemoryFn, NarrowedLibraryCall};
 use super::parser::{ParseResult, Parser};
+use crate::constexpr::ConstScope;
 use crate::float::IntegralRounding;
 use crate::kw;
 use crate::strings::StringId;
@@ -389,16 +390,30 @@ impl Parser<'_> {
         if let (InlineLibraryFn::Memory(_), Some(n)) = (func, args.last_mut()) {
             self.fold_constant_length(n);
         }
-        if !in_place {
-            return self.libm_call(lb.bare, ret, &params, args, pos);
-        }
         let call = ExprKind::InlineLibraryCall {
             func,
             args,
             name: lb.bare,
             narrowed,
         };
-        Self::typed_expr(call, ret, pos)
+        let call = Self::typed_expr(call, ret, pos);
+        // A call whose answer is a constant is that constant at every level,
+        // as under gcc, so that it initializes a static object at `-O0` too.
+        if in_place || self.is_constant_call(&call) {
+            return call;
+        }
+        let ExprKind::InlineLibraryCall { args, .. } = call.kind else {
+            unreachable!("built as an in-place call just above")
+        };
+        self.libm_call(lb.bare, ret, &params, args, pos)
+    }
+
+    /// Whether the in-place call `call` folds to a constant: every argument
+    /// is one, and the answer does not depend on anything at run time -- not
+    /// a root's domain error, nor a `rint` of a value that is not already an
+    /// integer, whose answer is the current rounding direction's.
+    fn is_constant_call(&self, call: &Expr) -> bool {
+        crate::constexpr::eval_float(self, ConstScope::StaticInitializer, call).is_some()
     }
 
     /// A block memory function's length, folded to a `size_t` literal when

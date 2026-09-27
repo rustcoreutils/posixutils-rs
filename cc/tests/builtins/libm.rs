@@ -875,6 +875,50 @@ int main(void) {
 }
 "#;
 
+/// A call whose answer is a constant is that constant at every level, as
+/// under gcc: at `-O0`, where a bare libm spelling is otherwise a call, it
+/// still initializes a static object, and a rounding of a constant calls
+/// nothing. (A root keeps its call for `errno` until the optimizer folds it.)
+/// One whose answer is not a constant -- a root's domain error, a `rint` of
+/// a value that is not an integer -- stays a call, and cannot.
+const CONSTANT_LIBM_CALLS_PROGRAM: &str = r#"
+double floor(double), sqrt(double), fmin(double, double), fma(double, double, double);
+float floorf(float);
+static double a = floor(2.5);
+static double b = sqrt(4.0);
+static double c = fmin(1.0, 2.0);
+static double d = fma(1.0, 2.0, 3.0);
+static float e = floorf(2.5f);
+static double f = floor(2.5f);
+int main(void) {
+    if (a != 2.0 || b != 2.0 || c != 1.0 || d != 5.0 || e != 2.0f || f != 2.0) return 1;
+    if (floor(-2.5) != -3.0 || sqrt(9.0) != 3.0) return 2;
+    return 0;
+}
+"#;
+
+#[test]
+fn libm_constant_call_is_a_constant_at_every_level() {
+    run_everywhere("libm_const_calls", CONSTANT_LIBM_CALLS_PROGRAM, &[], true);
+    let src = "double floor(double);\ndouble g(void) { return floor(2.5); }\n";
+    for target in [None, Some("aarch64-unknown-linux-gnu")] {
+        let mut args = vec!["-O0"];
+        if let Some(t) = target {
+            args.extend(["--target", t]);
+        }
+        let asm = asm_for_at("libm_const_o0", src, &args);
+        assert!(
+            !calls_any(&asm, &["floor"]),
+            "{target:?}: a call remains:\n{asm}"
+        );
+    }
+    compile_expect_error(
+        "sqrt_static_domain_error",
+        "double sqrt(double);\nstatic double z = sqrt(-1.0);\ndouble *p = &z;\n",
+        "cannot initialize an object with static storage duration",
+    );
+}
+
 #[test]
 fn libm_weak_definition_does_not_displace_a_float_argument() {
     run_everywhere(

@@ -617,14 +617,6 @@ pub enum X86Inst {
         dst: Reg,
     },
 
-    /// POPCNT - Population count (count set bits)
-    /// Returns the number of 1 bits in the source operand
-    Popcnt {
-        size: OperandSize,
-        src: GpOperand,
-        dst: Reg,
-    },
-
     /// XORPS with same register - Fast zero XMM register
     XorpsSelf { reg: XmmReg },
 
@@ -1013,9 +1005,6 @@ impl EmitAsm for X86Inst {
             X86Inst::Bsr { size, src, dst } => {
                 Self::emit_alu2_to_reg("bsr", size, src, dst, target, out)
             }
-            X86Inst::Popcnt { size, src, dst } => {
-                Self::emit_alu2_to_reg("popcnt", size, src, dst, target, out)
-            }
             X86Inst::XorpsSelf { reg } => {
                 let _ = writeln!(out, "    xorps {}, {}", reg.name(), reg.name());
             }
@@ -1331,6 +1320,106 @@ impl X86Inst {
     }
 }
 
+/// Count the set bits of `x` in place, at the width of `size`, using only
+/// baseline x86-64 instructions.
+///
+/// c17 targets the x86-64 baseline (x86-64-v1), and POPCNT is not in it:
+/// emitting `popcnt` raises SIGILL on a processor without the extension.
+/// This is the standard branch-free SWAR count instead:
+///
+/// ```text
+/// x = x - ((x & 0xAA..) >> 1)          // 2-bit field counts
+/// x = (x & 0x33..) + ((x & 0xCC..) >> 2) // 4-bit field counts
+/// x = (x + (x >> 4)) & 0x0F..          // byte counts
+/// x = (x * 0x0101..) >> (width - 8)    // sum of the bytes
+/// ```
+///
+/// Masking before shifting (`(x & 0xAA..) >> 1` rather than
+/// `(x >> 1) & 0x55..`) is the same value, and it is what lets the whole
+/// sequence run in two registers: every 64-bit mask needs a register of its
+/// own, since `and` takes at most a 32-bit immediate, and each mask is
+/// consumed by the one instruction after it is loaded into `tmp`. The
+/// second step takes `x & 0x33..` as `x - (x & 0xCC..)`, for the same reason.
+///
+/// `x` must hold the value zero-extended to `size`; `tmp` is clobbered. The
+/// count is left in `x`, and fits in its low byte. `__builtin_parity*`
+/// is the low bit of this same count (see `parse/builtin_expr.rs`), so it
+/// has no sequence of its own.
+pub fn popcount_sequence(size: OperandSize, x: Reg, tmp: Reg) -> Vec<X86Inst> {
+    let bits = size.bits();
+    debug_assert!(bits == 32 || bits == 64, "popcount of a {bits}-bit value");
+    let load_mask = |byte: u8| {
+        let pattern = u64::from_ne_bytes([byte; 8]);
+        if bits == 64 {
+            X86Inst::MovAbs {
+                imm: pattern as i64,
+                dst: tmp,
+            }
+        } else {
+            X86Inst::Mov {
+                size,
+                src: GpOperand::Imm(i64::from(pattern as u32)),
+                dst: GpOperand::Reg(tmp),
+            }
+        }
+    };
+    let shr = |count: u8, dst: Reg| X86Inst::Shr {
+        size,
+        count: ShiftCount::Imm(count),
+        dst,
+    };
+    let and_x_into_tmp = X86Inst::And {
+        size,
+        src: GpOperand::Reg(x),
+        dst: tmp,
+    };
+    let sub_tmp = X86Inst::Sub {
+        size,
+        src: GpOperand::Reg(tmp),
+        dst: x,
+    };
+    let add_tmp = X86Inst::Add {
+        size,
+        src: GpOperand::Reg(tmp),
+        dst: x,
+    };
+    vec![
+        // x -= (x & 0xAA..) >> 1
+        load_mask(0xAA),
+        and_x_into_tmp.clone(),
+        shr(1, tmp),
+        sub_tmp.clone(),
+        // x = (x - (x & 0xCC..)) + ((x & 0xCC..) >> 2)
+        load_mask(0xCC),
+        and_x_into_tmp,
+        sub_tmp,
+        shr(2, tmp),
+        add_tmp.clone(),
+        // x = (x + (x >> 4)) & 0x0F..
+        X86Inst::Mov {
+            size,
+            src: GpOperand::Reg(x),
+            dst: GpOperand::Reg(tmp),
+        },
+        shr(4, tmp),
+        add_tmp,
+        load_mask(0x0F),
+        X86Inst::And {
+            size,
+            src: GpOperand::Reg(tmp),
+            dst: x,
+        },
+        // x = (x * 0x0101..) >> (width - 8)
+        load_mask(0x01),
+        X86Inst::IMul2 {
+            size,
+            src: GpOperand::Reg(tmp),
+            dst: x,
+        },
+        shr((bits - 8) as u8, x),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1447,6 +1536,53 @@ mod tests {
                 out
             );
         }
+    }
+
+    fn emit_all(insts: &[X86Inst]) -> String {
+        let target = linux_target();
+        let mut out = String::new();
+        for inst in insts {
+            inst.emit(&target, &mut out);
+        }
+        out
+    }
+
+    /// The population count is the baseline SWAR sequence, never `popcnt`,
+    /// which is not in x86-64-v1 and raises SIGILL where it is missing.
+    #[test]
+    fn test_popcount_sequence_is_baseline() {
+        let expected64 = [
+            "movabsq $-6148914691236517206, %r11",
+            "andq %r10, %r11",
+            "shrq $1, %r11",
+            "subq %r11, %r10",
+            "movabsq $-3689348814741910324, %r11",
+            "andq %r10, %r11",
+            "subq %r11, %r10",
+            "shrq $2, %r11",
+            "addq %r11, %r10",
+            "movq %r10, %r11",
+            "shrq $4, %r11",
+            "addq %r11, %r10",
+            "movabsq $1085102592571150095, %r11",
+            "andq %r11, %r10",
+            "movabsq $72340172838076673, %r11",
+            "imulq %r11, %r10",
+            "shrq $56, %r10",
+        ];
+        let out = emit_all(&popcount_sequence(OperandSize::B64, Reg::R10, Reg::R11));
+        let out64: Vec<&str> = out.lines().map(str::trim).collect();
+        assert_eq!(out64, expected64);
+
+        // The 32-bit count is the same sequence at 32 bits: the masks are
+        // plain immediates and the byte sum is in the top byte of 32.
+        let out = emit_all(&popcount_sequence(OperandSize::B32, Reg::R10, Reg::R11));
+        assert!(out.contains("movl $2863311530, %r11d"), "{out}");
+        assert!(out.contains("imull %r11d, %r10d"), "{out}");
+        assert!(out.ends_with("shrl $24, %r10d\n"), "{out}");
+        assert!(!out.contains("movabs"), "{out}");
+        assert_eq!(out.lines().count(), expected64.len());
+        assert!(!out.contains("popcnt"), "{out}");
     }
 
     #[test]

@@ -243,7 +243,9 @@ pub(crate) fn is_comparison(op: Opcode) -> bool {
 /// give that copy the type of the *value*, and for all but one family of
 /// opcodes `insn.typ`/`insn.size` are exactly that. The exception is the
 /// comparisons, which describe their operands there (see
-/// [`cmp_operand_width`]) and produce an `int`.
+/// [`cmp_operand_width`]) and produce an `int`, and the population counts,
+/// whose `size` is the width of the operand they count while the count is an
+/// `int`.
 ///
 /// Carrying the operand type across is invisible for an integer comparison --
 /// an integer of the wrong width still lands in a general register -- and a
@@ -251,7 +253,7 @@ pub(crate) fn is_comparison(op: Opcode) -> bool {
 /// backend puts it in an SSE register and the caller reads the return value
 /// out of the wrong one.
 pub(crate) fn result_type_of(insn: &Instruction, types: &TypeTable) -> (Option<TypeId>, u32) {
-    if is_comparison(insn.op) {
+    if is_comparison(insn.op) || matches!(insn.op, Opcode::Popcount32 | Opcode::Popcount64) {
         let int_id = types.int_id;
         (Some(int_id), types.size_bits(int_id))
     } else {
@@ -422,6 +424,10 @@ pub(crate) fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
     match insn.op {
         Opcode::Neg => Some(a.wrapping_neg()),
         Opcode::Not => Some(!a),
+        // The count of the operand at its own width. It is at most 64, so
+        // it reads the same at every width the `int` result is taken at.
+        Opcode::Popcount32 => Some(i128::from((a as u32).count_ones())),
+        Opcode::Popcount64 => Some(i128::from((a as u64).count_ones())),
 
         // Read the operand at the width it was stored in, in the signedness
         // the opcode names, and leave it there: the destination is wider.

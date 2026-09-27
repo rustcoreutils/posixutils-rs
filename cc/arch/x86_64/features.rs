@@ -10,7 +10,7 @@
 //
 
 use super::codegen::X86_64CodeGen;
-use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst};
+use super::lir::{popcount_sequence, GpOperand, MemAddr, ShiftCount, X86Inst};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::codegen::BswapSize;
 use crate::arch::lir::{CallTarget, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
@@ -1458,73 +1458,19 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit population count
+    /// Emit population count with the baseline sequence of
+    /// [`popcount_sequence`] -- never `popcnt`, which is not in x86-64-v1.
+    /// Works in the R10/R11 scratch pair; the result is an `int`.
     pub(super) fn emit_popcount(&mut self, insn: &Instruction, src_size: OperandSize) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
+        let (Some(&src), Some(dst)) = (insn.src.first(), insn.target) else {
+            return;
         };
-        let dst = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let src_loc = self.get_location(src);
+        self.emit_move(src, Reg::R10, src_size.bits());
+        for inst in popcount_sequence(src_size, Reg::R10, Reg::R11) {
+            self.push_lir(inst);
+        }
         let dst_loc = self.get_location(dst);
-
-        // POPCNT instruction directly counts set bits
-        // Use R10 as scratch register
-        match src_loc {
-            Loc::Reg(r) => {
-                self.push_lir(X86Inst::Popcnt {
-                    size: src_size,
-                    src: GpOperand::Reg(r),
-                    dst: Reg::R10,
-                });
-            }
-            Loc::Stack(off) => {
-                self.push_lir(X86Inst::Popcnt {
-                    size: src_size,
-                    src: GpOperand::Mem(self.stack_field(off, 0)),
-                    dst: Reg::R10,
-                });
-            }
-            Loc::Imm(v) => {
-                // Load immediate first, then POPCNT
-                self.push_lir(X86Inst::Mov {
-                    size: src_size,
-                    src: GpOperand::Imm(v as i64),
-                    dst: GpOperand::Reg(Reg::R10),
-                });
-                self.push_lir(X86Inst::Popcnt {
-                    size: src_size,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: Reg::R10,
-                });
-            }
-            _ => return,
-        }
-
-        // Store result (return type is int, always 32-bit)
-        match dst_loc {
-            Loc::Reg(r) => {
-                if r != Reg::R10 {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::R10),
-                        dst: GpOperand::Reg(r),
-                    });
-                }
-            }
-            Loc::Stack(off) => {
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(self.stack_field(off, 0)),
-                });
-            }
-            _ => {}
-        }
+        self.emit_move_to_loc(Reg::R10, &dst_loc, u32::BITS);
     }
 
     // setjmp/longjmp/alloca support

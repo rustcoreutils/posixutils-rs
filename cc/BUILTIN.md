@@ -48,6 +48,11 @@ differs from gcc, the row says so rather than leaving the reader to find out.
 | `__builtin_ffsl(x)` | Same, `long` |
 | `__builtin_ffsll(x)` | Same, `long long` |
 
+The population counts, and the parities built on them, are inline and use only
+baseline instructions: on x86-64 a branch-free SWAR sequence rather than
+`popcnt`, which is not in x86-64-v1; on AArch64 `cnt` and `addv`. A constant
+argument folds at `-O1` and above.
+
 ## Type Introspection
 
 | Builtin | Description |

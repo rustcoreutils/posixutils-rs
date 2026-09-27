@@ -236,7 +236,9 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
 
         // Unary
         Opcode::Neg => simplify_neg(insn, consts),
-        Opcode::Not => simplify_not(insn, consts),
+        Opcode::Not | Opcode::Popcount32 | Opcode::Popcount64 => {
+            simplify_unary_of_const(insn, consts)
+        }
         Opcode::Sext | Opcode::Zext | Opcode::Trunc => simplify_convert(insn, consts),
 
         _ => Simplification::None,
@@ -869,7 +871,9 @@ fn simplify_neg(insn: &Instruction, consts: &ConstMap) -> Simplification {
     }
 }
 
-fn simplify_not(insn: &Instruction, consts: &ConstMap) -> Simplification {
+/// Fold a unary operation with no algebraic identities -- `~x`, a
+/// population count -- when its operand is a known constant.
+fn simplify_unary_of_const(insn: &Instruction, consts: &ConstMap) -> Simplification {
     if insn.src.len() != 1 {
         return Simplification::None;
     }
@@ -1552,6 +1556,40 @@ mod tests {
 
         let new_const = func.get_pseudo(result_insn.src[0]).unwrap();
         assert_eq!(new_const.kind, PseudoKind::Val(-1));
+    }
+
+    /// A population count of a constant folds to the count of the operand at
+    /// the width the opcode names, and the copy that replaces it is an `int`
+    /// -- not the 64-bit operand width `popcount64` records in `size`.
+    #[test]
+    fn test_const_fold_popcount() {
+        let types = TypeTable::new(&Target::host());
+        for (op, operand, count) in [
+            (Opcode::Popcount64, 0xF0F0_F0F0_F0F0_F0F0_i128, 32),
+            (Opcode::Popcount64, -1, 64),
+            // Bits above the operand width are not counted.
+            (Opcode::Popcount32, (1 << 40) | 7, 3),
+            (Opcode::Popcount32, 0, 0),
+        ] {
+            let size = if op == Opcode::Popcount64 { 64 } else { 32 };
+            let insn = Instruction::new(op)
+                .with_target(PseudoId(1))
+                .with_src(PseudoId(0))
+                .with_size(size)
+                .with_type(types.int_id);
+            let pseudos = vec![
+                Pseudo::val(PseudoId(0), operand),
+                Pseudo::reg(PseudoId(1), 1),
+            ];
+            let mut func = make_test_func_with_insn(insn, pseudos);
+
+            assert!(run(&mut func, &host_types()), "{op:?} of {operand:#x}");
+            let result_insn = &func.blocks[0].insns[1];
+            assert_eq!(result_insn.op, Opcode::Copy);
+            assert_eq!(result_insn.typ, Some(types.int_id));
+            assert_eq!(result_insn.size, 32, "the count is an int");
+            assert_eq!(func.const_val(result_insn.src[0]), Some(count));
+        }
     }
 
     /// Several instructions in one block, for chains that need more than a

@@ -708,6 +708,18 @@ define_keywords! {
     (LLABS,             "llabs",             0),
     (IMAXABS,           "imaxabs",           0),
 
+    // The complex accessors, from <complex.h>: parts and conjugate, each
+    // exact at every precision, so recognized and computed in place.
+    (CREAL,             "creal",             0),
+    (CREALF,            "crealf",            0),
+    (CREALL,            "creall",            0),
+    (CIMAG,             "cimag",             0),
+    (CIMAGF,            "cimagf",            0),
+    (CIMAGL,            "cimagl",            0),
+    (CONJ,              "conj",              0),
+    (CONJF,             "conjf",             0),
+    (CONJL,             "conjl",             0),
+
     // The exactly-rounding functions, whose `float` form gives the same
     // answer as the `double` one applied to a `float` argument. Narrowing
     // them is what lets `(float)floor((double)x)` become `floorf(x)`;

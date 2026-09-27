@@ -188,7 +188,8 @@ in the linearizer, not written out as `a < b` in the parser.
 | `__builtin_complex(re, im)` | Build a complex value from two reals of the same type |
 | `__builtin_creal(z)`, `__builtin_crealf`, `__builtin_creall` | The real half. Lowers to `__real__`, not a libm call |
 | `__builtin_cimag(z)`, `__builtin_cimagf`, `__builtin_cimagl` | The imaginary half |
-| `__builtin_conj(z)`, `__builtin_conjf`, `__builtin_conjl` | The complex conjugate. Built from `__builtin_complex(__real__ z, -__imag__ z)`, so a zero imaginary part conjugates to **negative** zero, as it must |
+| `__builtin_conj(z)`, `__builtin_conjf`, `__builtin_conjl` | The complex conjugate. Lowers to `~z`, which negates the imaginary half, so a zero imaginary part conjugates to **negative** zero, as it must, and `z` is evaluated once |
+| `creal`, `crealf`, `creall`, `cimag`, `cimagf`, `cimagl`, `conj`, `conjf`, `conjl` | The same nine under their bare names, as gcc recognizes them. Displaced like `fabs`: by a declaration that is not a function or whose type is not the `<complex.h>` prototype, or by `-fno-builtin[-NAME]`; recognized only where called. For every spelling the argument converts to the complex type the suffix names first, as the prototype would convert it -- `crealf` of a `double _Complex` is the rounded `float` half, and `creal(3)` is 3.0 |
 
 Used by `<complex.h>` for `I` and the `CMPLX`/`CMPLXF`/`CMPLXL` macros, which
 exist precisely so `x + y*I` has an exact alternative that cannot corrupt an

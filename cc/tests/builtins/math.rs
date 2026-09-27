@@ -11,7 +11,7 @@
 // Consolidates: nan, nans, flt_rounds tests
 //
 
-use crate::common::{asm_for_at, compile_and_run};
+use crate::common::{asm_for_at, asm_symbol, compile_and_run, compile_and_run_aarch64};
 
 // ============================================================================
 // Mega-test: Math builtins
@@ -927,5 +927,111 @@ int main(void) {
     assert_eq!(
         compile_and_run("libm_entry_points", code, &["-lm".into()]),
         0
+    );
+}
+
+// ============================================================================
+// Bare complex accessors: creal, cimag, conj
+// ============================================================================
+
+// Self-contained, since the aarch64 run has no target headers to include.
+const COMPLEX_ACCESSOR_PROGRAM: &str = r#"
+double creal(double _Complex); float crealf(float _Complex);
+long double creall(long double _Complex);
+double cimag(double _Complex); float cimagf(float _Complex);
+long double cimagl(long double _Complex);
+double _Complex conj(double _Complex); float _Complex conjf(float _Complex);
+long double _Complex conjl(long double _Complex);
+static int n;
+static double _Complex g(void) { n++; return 1.0 + 2.0i; }
+int main(void) {
+    volatile double _Complex d = 1.5 + 2.5i;
+    volatile float _Complex f = 3.0f - 4.0if;
+    volatile long double _Complex l = 5.0L + 6.0iL;
+
+    /* The bare spellings, every precision. */
+    if (creal(d) != 1.5 || cimag(d) != 2.5) return 1;
+    if (crealf(f) != 3.0f || cimagf(f) != -4.0f) return 2;
+    if (creall(l) != 5.0L || cimagl(l) != 6.0L) return 3;
+    if (conj(d) != 1.5 - 2.5i || conjf(f) != 3.0f + 4.0if) return 4;
+    if (conjl(l) != 5.0L - 6.0iL) return 5;
+
+    /* The argument is evaluated once, bare or reserved. */
+    if (conj(g()) != 1.0 - 2.0i || n != 1) return 6;
+    if (__builtin_conj(g()) != 1.0 - 2.0i || n != 2) return 7;
+    if (creal(g()) != 1.0 || n != 3) return 8;
+
+    /* The argument converts to the suffix's type, as the prototype says:
+       a real is a complex with a zero imaginary part, and a double half
+       narrows to float. 1 + 2^-25 rounds to 1.0f. */
+    if (creal(3) != 3.0 || cimag(3) != 0.0) return 9;
+    volatile double _Complex p = 1.0 + 1.0000000298023223876953125i;
+    if (cimagf(p) != 1.0f || __builtin_cimagf(p) != 1.0f) return 10;
+    if (sizeof(crealf(d)) != sizeof(float)) return 11;
+    if (sizeof(conjf(d)) != sizeof(float _Complex)) return 12;
+    if (sizeof(__builtin_creall(d)) != sizeof(long double)) return 13;
+    return 0;
+}
+"#;
+
+/// `creal`, `cimag` and `conj` are computed in place under their bare names,
+/// as the `__builtin_` spellings always were; `-fno-builtin-NAME` keeps the
+/// library call.
+#[test]
+fn builtins_bare_complex_accessors() {
+    assert_eq!(
+        compile_and_run(
+            "complex_accessors",
+            COMPLEX_ACCESSOR_PROGRAM,
+            &["-lm".to_string()]
+        ),
+        0
+    );
+    if let Some(rc) =
+        compile_and_run_aarch64("complex_accessors_a64", COMPLEX_ACCESSOR_PROGRAM, "-O2")
+    {
+        assert_eq!(rc, 0);
+    }
+
+    // Named without a call, the identifier is the library function. Host
+    // only: the aarch64 helper links no libm.
+    let code = r#"
+double creal(double _Complex);
+int main(void) {
+    double (*fp)(double _Complex) = creal;
+    return fp(1.5 + 2.5i) == 1.5 ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("complex_accessor_fnptr", code, &["-lm".to_string()]),
+        0
+    );
+
+    let calls = |asm: &str, name: &str| {
+        let sym = asm_symbol(name);
+        asm.lines().any(|l| {
+            let mut words = l.split_whitespace();
+            matches!(words.next(), Some("call" | "bl" | "jmp" | "b"))
+                && words.next().map(|t| t.trim_end_matches("@PLT")) == Some(sym.as_str())
+        })
+    };
+    let src = "double creal(double _Complex);\n\
+               double cimag(double _Complex);\n\
+               double _Complex conj(double _Complex);\n\
+               double f(double _Complex z) { return creal(z) + cimag(conj(z)); }\n";
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_at("complex_accessors_asm", src, &[opt]);
+        for name in ["creal", "cimag", "conj"] {
+            assert!(!calls(&asm, name), "{opt}: {name} was called:\n{asm}");
+        }
+    }
+    let asm = asm_for_at("complex_accessors_nb", src, &["-fno-builtin-creal"]);
+    assert!(
+        calls(&asm, "creal"),
+        "-fno-builtin-creal kept creal inline:\n{asm}"
+    );
+    assert!(
+        !calls(&asm, "conj"),
+        "-fno-builtin-creal displaced conj:\n{asm}"
     );
 }

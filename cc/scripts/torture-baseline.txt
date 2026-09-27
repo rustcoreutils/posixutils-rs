@@ -7,6 +7,7 @@ builtins/abs-2@-O2
 builtins/abs-3@-O0
 builtins/abs-3@-O2
 builtins/complex-1@-O0
+builtins/complex-1@-O2
 builtins/fprintf@-O0
 builtins/fputs@-O0
 builtins/memchr@-O0

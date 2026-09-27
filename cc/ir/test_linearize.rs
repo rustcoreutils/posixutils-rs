@@ -7184,6 +7184,28 @@ fn test_int_abs_is_linearized_without_a_call() {
     assert_eq!(widths, vec![32, 64, 64]);
 }
 
+/// `conj` of a call calls once: it lowers as the conjugate `~z` of one
+/// evaluated operand, where it used to read `__real__` and `__imag__` of two
+/// copies of the argument expression, each with its own call.
+#[test]
+fn test_conj_evaluates_its_argument_once() {
+    let src = "double _Complex g(void);\n\
+               double _Complex conj(double _Complex);\n\
+               double _Complex f(void) { return conj(g()); }\n\
+               double _Complex h(void) { return __builtin_conj(g()); }\n";
+    let module = linearize_source(src, &Target::host());
+    for name in ["f", "h"] {
+        let func = module.functions.iter().find(|f| f.name == name).unwrap();
+        let calls = func
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| i.op == Opcode::Call)
+            .count();
+        assert_eq!(calls, 1, "{name}");
+    }
+}
+
 /// AAPCS64 B.4 passes a composite over sixteen bytes as a pointer to a copy
 /// the caller makes; System V puts the bytes themselves in the argument area.
 /// So only the aarch64 lowering copies the argument into a frame temporary

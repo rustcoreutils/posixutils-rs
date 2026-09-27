@@ -5067,6 +5067,25 @@ fn test_builtin_nans() {
     assert_eq!(expr.typ, Some(types.double_id));
 }
 
+/// The first statement of the first function defined in `tu`.
+fn first_statement(tu: &TranslationUnit) -> &Stmt {
+    let func = tu
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ExternalDecl::FunctionDef(f) => Some(f),
+            _ => None,
+        })
+        .expect("function definition");
+    let Stmt::Block(items) = &func.body else {
+        panic!("function body is not a block");
+    };
+    let Some(BlockItem::Statement(stmt)) = items.first() else {
+        panic!("expected a statement");
+    };
+    stmt
+}
+
 // abs / labs / llabs / imaxabs
 
 /// Each spelling, bare or reserved, parses to `IntAbs` of the function's own
@@ -5107,24 +5126,7 @@ fn test_int_abs_builtins() {
 fn test_int_abs_incompatible_declaration_displaces_builtin() {
     fn returned_is_int_abs(src: &str) -> bool {
         let (tu, _, _, _) = parse_tu(src).unwrap();
-        let func = tu
-            .items
-            .iter()
-            .find_map(|item| match item {
-                ExternalDecl::FunctionDef(f) => Some(f),
-                _ => None,
-            })
-            .expect("function definition");
-        let Stmt::Block(items) = &func.body else {
-            panic!("function body is not a block");
-        };
-        let BlockItem::Statement(stmt) = &items[0] else {
-            panic!("expected a statement");
-        };
-        let Stmt::Return(Some(expr)) = &**stmt else {
-            panic!("expected a return statement");
-        };
-        matches!(expr.kind, ExprKind::IntAbs { .. })
+        matches!(first_statement(&tu), Stmt::Return(Some(e)) if matches!(e.kind, ExprKind::IntAbs { .. }))
     }
     assert!(!returned_is_int_abs(
         "struct S { int a; }; struct S abs(int); struct S f(void) { return abs(1); }"
@@ -5149,6 +5151,81 @@ fn test_int_abs_incompatible_declaration_displaces_builtin() {
 fn test_int_abs_bare_name_not_called_is_an_identifier() {
     let (expr, _, _, _) = parse_expr_with_vars("abs + 1", &["abs"]).unwrap();
     assert!(!matches!(expr.kind, ExprKind::IntAbs { .. }));
+}
+
+// creal / cimag / conj
+
+/// Each accessor, bare or reserved, is `__real__`, `__imag__` or `~` of its
+/// argument converted to the complex type its suffix names.
+#[test]
+fn test_complex_accessor_builtins() {
+    type Want = fn(&TypeTable) -> crate::types::TypeId;
+    let cases: &[(&str, UnaryOp, Want, Want)] = &[
+        (
+            "creal(z)",
+            UnaryOp::Real,
+            |t| t.double_id,
+            |t| t.complex_double_id,
+        ),
+        (
+            "__builtin_cimag(z)",
+            UnaryOp::Imag,
+            |t| t.double_id,
+            |t| t.complex_double_id,
+        ),
+        (
+            "crealf(z)",
+            UnaryOp::Real,
+            |t| t.float_id,
+            |t| t.complex_float_id,
+        ),
+        (
+            "cimagl(z)",
+            UnaryOp::Imag,
+            |t| t.longdouble_id,
+            |t| t.complex_longdouble_id,
+        ),
+        (
+            "conj(z)",
+            UnaryOp::BitNot,
+            |t| t.complex_double_id,
+            |t| t.complex_double_id,
+        ),
+        (
+            "__builtin_conjf(z)",
+            UnaryOp::BitNot,
+            |t| t.complex_float_id,
+            |t| t.complex_float_id,
+        ),
+    ];
+    for (src, want_op, want_typ, want_arg) in cases {
+        let code = format!("double _Complex z; void t(void) {{ {src}; }}");
+        let (tu, types, _, _) = parse_tu(&code).unwrap();
+        let Stmt::Expr(expr) = first_statement(&tu) else {
+            panic!("{src}: expected an expression statement");
+        };
+        let ExprKind::Unary { op, operand } = &expr.kind else {
+            panic!("{src}: expected a unary, got {:?}", expr.kind);
+        };
+        assert_eq!(op, want_op, "{src}");
+        assert_eq!(expr.typ, Some(want_typ(&types)), "{src}");
+        assert_eq!(operand.typ, Some(want_arg(&types)), "{src}");
+        // Only a precision other than `double` needs a conversion.
+        let converted = want_arg(&types) != types.complex_double_id;
+        assert_eq!(
+            matches!(operand.kind, ExprKind::Cast { .. }),
+            converted,
+            "{src}"
+        );
+    }
+}
+
+/// A `creal` declared with some other type is the program's own function.
+#[test]
+fn test_complex_accessor_incompatible_declaration_displaces_builtin() {
+    let code = "struct S { int a; }; struct S creal(int);\n\
+                int t(void) { return creal(1).a; }";
+    assert!(parse_tu(code).is_ok());
 }
 
 // __builtin_flt_rounds test

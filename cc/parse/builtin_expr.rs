@@ -151,6 +151,15 @@ impl Parser<'_> {
                     | crate::kw::LABS
                     | crate::kw::LLABS
                     | crate::kw::IMAXABS
+                    | crate::kw::CREAL
+                    | crate::kw::CREALF
+                    | crate::kw::CREALL
+                    | crate::kw::CIMAG
+                    | crate::kw::CIMAGF
+                    | crate::kw::CIMAGL
+                    | crate::kw::CONJ
+                    | crate::kw::CONJF
+                    | crate::kw::CONJL
                     | crate::kw::FLOOR
                     | crate::kw::CEIL
                     | crate::kw::TRUNC
@@ -202,6 +211,12 @@ impl Parser<'_> {
             kw::FABS | kw::FLOOR | kw::CEIL | kw::TRUNC | kw::ROUND | kw::RINT | kw::NEARBYINT => {
                 same(t.double_id)
             }
+            kw::CREAL | kw::CIMAG => Some((t.double_id, t.complex_double_id)),
+            kw::CREALF | kw::CIMAGF => Some((t.float_id, t.complex_float_id)),
+            kw::CREALL | kw::CIMAGL => Some((t.longdouble_id, t.complex_longdouble_id)),
+            kw::CONJ => same(t.complex_double_id),
+            kw::CONJF => same(t.complex_float_id),
+            kw::CONJL => same(t.complex_longdouble_id),
             _ => None,
         }
     }
@@ -306,6 +321,65 @@ impl Parser<'_> {
             )
         };
         Ok(Self::typed_expr(kind(Box::new(arg)), typ, token_pos))
+    }
+
+    /// `creal`, `cimag` and `conj` in each precision, bare or as
+    /// `__builtin_*`: the halves `__real__` and `__imag__` already reach, and
+    /// the conjugate `~z` already computes, so none is a libm call.
+    ///
+    /// The argument converts to the complex type the suffix names, as the
+    /// prototype in `<complex.h>` would convert it: `crealf(z)` of a
+    /// `double _Complex` is the `float` real part, and `creal(3)` is 3.0.
+    /// `conj` is `~z` rather than `__real__ z` and `__imag__ z` spelled out
+    /// over two copies of `z`, so its argument is evaluated once.
+    fn parse_complex_accessor(
+        &mut self,
+        name_id: StringId,
+        token_pos: Position,
+    ) -> ParseResult<Expr> {
+        use crate::kw::*;
+        let base = match name_id {
+            BUILTIN_CREALF | CREALF | BUILTIN_CIMAGF | CIMAGF | BUILTIN_CONJF | CONJF => {
+                self.types.float_id
+            }
+            BUILTIN_CREALL | CREALL | BUILTIN_CIMAGL | CIMAGL | BUILTIN_CONJL | CONJL => {
+                self.types.longdouble_id
+            }
+            _ => self.types.double_id,
+        };
+        let complex_typ = self.types.make_complex(base);
+        let (op, result_typ) = match name_id {
+            BUILTIN_CREAL | BUILTIN_CREALF | BUILTIN_CREALL | CREAL | CREALF | CREALL => {
+                (UnaryOp::Real, base)
+            }
+            BUILTIN_CIMAG | BUILTIN_CIMAGF | BUILTIN_CIMAGL | CIMAG | CIMAGF | CIMAGL => {
+                (UnaryOp::Imag, base)
+            }
+            _ => (UnaryOp::BitNot, complex_typ),
+        };
+        self.expect_special(b'(')?;
+        let arg = self.parse_assignment_expr()?;
+        self.expect_special(b')')?;
+        let arg = if arg.typ == Some(complex_typ) {
+            arg
+        } else {
+            Self::typed_expr(
+                ExprKind::Cast {
+                    cast_type: complex_typ,
+                    expr: Box::new(arg),
+                },
+                complex_typ,
+                token_pos,
+            )
+        };
+        Ok(Self::typed_expr(
+            ExprKind::Unary {
+                op,
+                operand: Box::new(arg),
+            },
+            result_typ,
+            token_pos,
+        ))
     }
 
     /// One of the C99 7.12.14 relations: `__builtin_isgreater` and its five
@@ -1149,80 +1223,22 @@ impl Parser<'_> {
             | crate::kw::BUILTIN_CREALL
             | crate::kw::BUILTIN_CIMAG
             | crate::kw::BUILTIN_CIMAGF
-            | crate::kw::BUILTIN_CIMAGL => Some((|| {
-                // `creal`/`cimag` name the halves `__real__` and `__imag__`
-                // already reach, so they lower to those rather than to a
-                // library call. The suffix is not consulted: the operand's own
-                // type gives the precision, and a mismatch there would be the
-                // caller's bug, not something the spelling can fix.
-                let op = matches!(
-                    name_id,
-                    crate::kw::BUILTIN_CREAL
-                        | crate::kw::BUILTIN_CREALF
-                        | crate::kw::BUILTIN_CREALL
-                )
-                .then_some(UnaryOp::Real)
-                .unwrap_or(UnaryOp::Imag);
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                let arg_typ = arg.typ.unwrap_or(self.types.double_id);
-                let base = self.types.complex_base(arg_typ);
-                Ok(Self::typed_expr(
-                    ExprKind::Unary {
-                        op,
-                        operand: Box::new(arg),
-                    },
-                    base,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_CONJ | crate::kw::BUILTIN_CONJF | crate::kw::BUILTIN_CONJL => {
-                Some((|| {
-                    // conj(z) is z with the sign of its imaginary part flipped.
-                    // Built from `__builtin_complex(__real__ z, -__imag__ z)`
-                    // rather than a libm call: every piece already exists, and
-                    // negating the imaginary half is exact at every precision,
-                    // where a call would need -lm for nothing.
-                    self.expect_special(b'(')?;
-                    let arg = self.parse_assignment_expr()?;
-                    self.expect_special(b')')?;
-                    let arg_typ = arg.typ.unwrap_or(self.types.double_id);
-                    let base = self.types.complex_base(arg_typ);
-                    let complex_typ = self.types.make_complex(base);
-                    let real = Self::typed_expr(
-                        ExprKind::Unary {
-                            op: UnaryOp::Real,
-                            operand: Box::new(arg.clone()),
-                        },
-                        base,
-                        token_pos,
-                    );
-                    let imag = Self::typed_expr(
-                        ExprKind::Unary {
-                            op: UnaryOp::Imag,
-                            operand: Box::new(arg),
-                        },
-                        base,
-                        token_pos,
-                    );
-                    let neg_imag = Self::typed_expr(
-                        ExprKind::Unary {
-                            op: UnaryOp::Neg,
-                            operand: Box::new(imag),
-                        },
-                        base,
-                        token_pos,
-                    );
-                    Ok(Self::typed_expr(
-                        ExprKind::BuiltinComplex {
-                            real: Box::new(real),
-                            imag: Box::new(neg_imag),
-                        },
-                        complex_typ,
-                        token_pos,
-                    ))
-                })())
+            | crate::kw::BUILTIN_CIMAGL
+            | crate::kw::BUILTIN_CONJ
+            | crate::kw::BUILTIN_CONJF
+            | crate::kw::BUILTIN_CONJL => Some(self.parse_complex_accessor(name_id, token_pos)),
+            crate::kw::CREAL
+            | crate::kw::CREALF
+            | crate::kw::CREALL
+            | crate::kw::CIMAG
+            | crate::kw::CIMAGF
+            | crate::kw::CIMAGL
+            | crate::kw::CONJ
+            | crate::kw::CONJF
+            | crate::kw::CONJL
+                if called =>
+            {
+                Some(self.parse_complex_accessor(name_id, token_pos))
             }
             crate::kw::BUILTIN_COMPLEX => Some((|| {
                 // __builtin_complex(real, imag) - construct complex value

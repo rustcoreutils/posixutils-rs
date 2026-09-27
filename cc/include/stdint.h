@@ -111,14 +111,15 @@ typedef __UINTMAX_TYPE__ uintmax_t;
 /* 7.20.3 Limits of other integer types */
 #define PTRDIFF_MAX    __PTRDIFF_MAX__
 #define PTRDIFF_MIN    (-PTRDIFF_MAX - 1)
+/* Not `-MAX - 1`: these three are unsigned on some targets, so each minimum
+   is its own predefine rather than the two's-complement companion of its
+   maximum. */
 #define SIG_ATOMIC_MAX __SIG_ATOMIC_MAX__
-#define SIG_ATOMIC_MIN (-SIG_ATOMIC_MAX - 1)
+#define SIG_ATOMIC_MIN __SIG_ATOMIC_MIN__
 #define SIZE_MAX       __SIZE_MAX__
 #define WCHAR_MAX      __WCHAR_MAX__
-#define WCHAR_MIN      (-WCHAR_MAX - 1)
+#define WCHAR_MIN      __WCHAR_MIN__
 #define WINT_MAX       __WINT_MAX__
-/* Not `-WINT_MAX - 1`: wint_t is unsigned, so its minimum is its own
-   predefine rather than the two's-complement companion of its maximum. */
 #define WINT_MIN       __WINT_MIN__
 
 /* 7.20.4 Macros for integer constants.

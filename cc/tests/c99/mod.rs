@@ -23,5 +23,6 @@ mod identifiers;
 mod initializers;
 mod stdlib_headers;
 mod translation_limits;
+mod type_macros;
 mod types;
 mod types_keywords;

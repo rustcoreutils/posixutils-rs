@@ -1018,30 +1018,15 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // Limit macros
-        for (name, value) in arch::get_limit_macros(self.target) {
-            self.define_macro(Macro::predefined(name, Some(value)));
-        }
-
-        // Type definition macros (for <stdint.h> and <stddef.h>)
-        // These expand to type names, so they need to be tokenized properly
+        // Integer type macros (for <stdint.h> and <stddef.h>). These expand
+        // to type names, so they need to be tokenized properly.
         for (name, value) in arch::get_type_macros(self.target) {
-            self.define_macro(Macro::predefined_type(name, value));
+            self.define_macro(Macro::predefined_type(&name, value));
         }
 
-        // Fixed-width integer limit macros (for <stdint.h>)
-        for (name, value) in arch::get_stdint_limit_macros(self.target) {
-            self.define_macro(Macro::predefined(name, Some(value)));
-        }
-
-        // Integer constant suffix macros
-        for (name, value) in arch::get_suffix_macros(self.target) {
-            self.define_macro(Macro::predefined(name, Some(value)));
-        }
-
-        // Format specifier macros (for <inttypes.h>)
-        for (name, value) in arch::get_format_macros(self.target) {
-            self.define_macro(Macro::predefined(name, Some(value)));
+        // Integer limits, widths, sizes, constant suffixes and formats
+        for (name, value) in arch::get_integer_macros(self.target) {
+            self.define_macro(Macro::predefined(&name, Some(&value)));
         }
 
         // Additional sizeof macros

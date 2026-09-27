@@ -137,6 +137,101 @@ impl CharSignedness {
     }
 }
 
+/// A standard integer type, as a platform ABI names the type behind one of
+/// the library's integer typedefs (`int64_t`, `size_t`, `wchar_t`, ...).
+///
+/// The typedefs are the platform's choice and differ between targets of the
+/// same width -- `int64_t` is `long` on glibc and `long long` on Darwin -- so
+/// [`Target`] decides each one, in one place, and everything that describes
+/// the type is derived from it: the `__*_TYPE__` spelling, its limits, its
+/// constant suffix and its `printf` length modifier. Hand-typing those per
+/// macro is how `__INT64_MAX__` came to say `LL` for a `long`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntType {
+    SChar,
+    UChar,
+    Short,
+    UShort,
+    Int,
+    UInt,
+    Long,
+    ULong,
+    LongLong,
+    ULongLong,
+}
+
+impl IntType {
+    pub fn is_signed(self) -> bool {
+        matches!(
+            self,
+            IntType::SChar | IntType::Short | IntType::Int | IntType::Long | IntType::LongLong
+        )
+    }
+
+    /// The unsigned type of the same rank (C17 6.2.5p6).
+    pub fn to_unsigned(self) -> IntType {
+        match self {
+            IntType::SChar | IntType::UChar => IntType::UChar,
+            IntType::Short | IntType::UShort => IntType::UShort,
+            IntType::Int | IntType::UInt => IntType::UInt,
+            IntType::Long | IntType::ULong => IntType::ULong,
+            IntType::LongLong | IntType::ULongLong => IntType::ULongLong,
+        }
+    }
+
+    /// The signed type of the same rank (C17 6.2.5p6).
+    pub fn to_signed(self) -> IntType {
+        match self {
+            IntType::SChar | IntType::UChar => IntType::SChar,
+            IntType::Short | IntType::UShort => IntType::Short,
+            IntType::Int | IntType::UInt => IntType::Int,
+            IntType::Long | IntType::ULong => IntType::Long,
+            IntType::LongLong | IntType::ULongLong => IntType::LongLong,
+        }
+    }
+
+    /// The type's name as gcc spells it in a `__*_TYPE__` macro.
+    pub fn spelling(self) -> &'static str {
+        match self {
+            IntType::SChar => "signed char",
+            IntType::UChar => "unsigned char",
+            IntType::Short => "short int",
+            IntType::UShort => "short unsigned int",
+            IntType::Int => "int",
+            IntType::UInt => "unsigned int",
+            IntType::Long => "long int",
+            IntType::ULong => "long unsigned int",
+            IntType::LongLong => "long long int",
+            IntType::ULongLong => "long long unsigned int",
+        }
+    }
+
+    /// The suffix that gives an integer constant this type once promoted --
+    /// what `INT64_C(c)` pastes on. A type narrower than `int` has none: no
+    /// constant has such a type, and C17 7.20.4p2 wants the promoted one.
+    pub fn constant_suffix(self) -> &'static str {
+        match self {
+            IntType::SChar | IntType::UChar | IntType::Short | IntType::UShort | IntType::Int => "",
+            IntType::UInt => "U",
+            IntType::Long => "L",
+            IntType::ULong => "UL",
+            IntType::LongLong => "LL",
+            IntType::ULongLong => "ULL",
+        }
+    }
+
+    /// The `printf` length modifier for the type (C17 7.21.6.1p7).
+    pub fn printf_length(self) -> &'static str {
+        match self {
+            IntType::SChar | IntType::UChar => "hh",
+            IntType::Short | IntType::UShort => "h",
+            IntType::Int | IntType::UInt => "",
+            IntType::Long | IntType::ULong => "l",
+            IntType::LongLong | IntType::ULongLong => "ll",
+        }
+    }
+}
+
 /// How a thread-local's address is obtained on a target.
 ///
 /// Decided in one place -- [`Target::tls_access`] -- because two consumers
@@ -220,7 +315,7 @@ impl Target {
         }
     }
 
-    /// Does this platform spell the exact-width 64-bit integers `long long`?
+    /// The type behind `int64_t`: `long` or `long long`?
     ///
     /// Every target here is LP64, so `long` is 64 bits and either spelling is
     /// wide enough — but they are *distinct types*, and our `<stdint.h>` has to
@@ -228,8 +323,110 @@ impl Target {
     /// both is rejected. Linux and the BSDs use `long`; Darwin uses
     /// `long long`, and picking by width alone made every macOS build that
     /// reached a system header fail on `int64_t`.
-    pub fn int64_is_long_long(&self) -> bool {
-        self.os == Os::MacOS
+    fn int64_type(&self) -> IntType {
+        match self.os {
+            Os::MacOS => IntType::LongLong,
+            Os::Linux | Os::FreeBSD => IntType::Long,
+        }
+    }
+
+    /// The width in bits of an integer type on this target.
+    pub fn int_width(&self, t: IntType) -> u32 {
+        match t {
+            IntType::SChar | IntType::UChar => 8,
+            IntType::Short | IntType::UShort => 16,
+            IntType::Int | IntType::UInt => 32,
+            IntType::Long | IntType::ULong => self.long_width,
+            IntType::LongLong | IntType::ULongLong => 64,
+        }
+    }
+
+    /// The largest value of an integer type on this target.
+    pub fn int_max(&self, t: IntType) -> u64 {
+        let bits = self.int_width(t) - u32::from(t.is_signed());
+        u64::MAX >> (64 - bits)
+    }
+
+    /// `intN_t`, for N of 8, 16, 32 and 64 (C17 7.20.1.1).
+    pub fn exact_int_type(&self, bits: u32) -> IntType {
+        match bits {
+            8 => IntType::SChar,
+            16 => IntType::Short,
+            32 => IntType::Int,
+            64 => self.int64_type(),
+            _ => panic!("no int{bits}_t"),
+        }
+    }
+
+    /// `int_leastN_t` (C17 7.20.1.2): the exact-width type on every target,
+    /// since every target has all four.
+    pub fn least_int_type(&self, bits: u32) -> IntType {
+        self.exact_int_type(bits)
+    }
+
+    /// `int_fastN_t` (C17 7.20.1.3).
+    pub fn fast_int_type(&self, bits: u32) -> IntType {
+        self.exact_int_type(bits)
+    }
+
+    /// `intptr_t` (C17 7.20.1.4): `long` on every LP64 target, Darwin
+    /// included.
+    pub fn intptr_type(&self) -> IntType {
+        IntType::Long
+    }
+
+    /// `ptrdiff_t` (C17 7.19), the type of a pointer difference.
+    pub fn ptrdiff_type(&self) -> IntType {
+        IntType::Long
+    }
+
+    /// `intmax_t` (C17 7.20.1.5). `long` everywhere -- on Darwin too, where
+    /// `int64_t` is `long long` but `intmax_t` is not.
+    pub fn intmax_type(&self) -> IntType {
+        IntType::Long
+    }
+
+    /// `size_t` (C17 7.19).
+    pub fn size_type(&self) -> IntType {
+        IntType::ULong
+    }
+
+    /// `wchar_t` (C17 7.19), the type of a wide character constant and the
+    /// element type of a wide string literal (6.4.4.4p10, 6.4.5p6).
+    pub fn wchar_type(&self) -> IntType {
+        IntType::Int
+    }
+
+    /// `wint_t` (C17 7.29.1), which has to hold every `wchar_t` value *plus*
+    /// `WEOF`, and the two platforms solve that differently. glibc makes it
+    /// `unsigned int`, so `WEOF` -- `(wint_t)-1` -- is `0xffffffff`, a value
+    /// no `wchar_t` reaches. Darwin makes it `int`, following
+    /// `__darwin_ct_rune_t`, and spends the negative half of the range
+    /// instead.
+    ///
+    /// It has to be the platform's choice rather than ours: the C library's
+    /// own headers typedef `wint_t` from their own definition, and
+    /// `__mbstate_t` holds one.
+    pub fn wint_type(&self) -> IntType {
+        match self.os {
+            Os::MacOS => IntType::Int,
+            Os::Linux | Os::FreeBSD => IntType::UInt,
+        }
+    }
+
+    /// `char16_t` (C17 7.28): `uint_least16_t`.
+    pub fn char16_type(&self) -> IntType {
+        self.least_int_type(16).to_unsigned()
+    }
+
+    /// `char32_t` (C17 7.28): `uint_least32_t`.
+    pub fn char32_type(&self) -> IntType {
+        self.least_int_type(32).to_unsigned()
+    }
+
+    /// `sig_atomic_t` (C17 7.14).
+    pub fn sig_atomic_type(&self) -> IntType {
+        IntType::Int
     }
 
     /// Detect host architecture at runtime

@@ -186,7 +186,15 @@ fn fputs(facts: &Facts, s: PseudoId, fp: Arg, locking: Locking) -> Option<Folded
         return None;
     };
     if len == 0 {
-        return Some(Folded::Discard(None));
+        // Nothing is written, but the call is not nothing: C17 7.21.2p4 gives
+        // a stream no orientation until an input or output function is
+        // applied to it, and the first one sets it whether or not it
+        // transfers a byte. Discarding this left `fwide(fp, 0)` answering 0
+        // where -O0 answered a byte orientation. gcc and clang keep it too.
+        //
+        // Rewriting it as a zero-length `fwrite` would not do: that does not
+        // orient the stream either.
+        return None;
     }
     let types = facts.types;
     if let Some(&[c]) = c_str(facts, s) {
@@ -447,7 +455,8 @@ mod tests {
         );
         assert_eq!(fold1(&mut fx, LibFn::FprintfUnlocked, &[fp, a]), None);
         assert_eq!(fold1(&mut fx, LibFn::FprintfUnlocked, &[fp, ps, a]), None);
-        assert_eq!(fold1(&mut fx, LibFn::FputsUnlocked, &[empty, fp]), DROP);
+        // As for the locking form: it still orients the stream.
+        assert_eq!(fold1(&mut fx, LibFn::FputsUnlocked, &[empty, fp]), None);
         assert_eq!(fold1(&mut fx, LibFn::FputsUnlocked, &[a, fp]), None);
         assert_eq!(fold1(&mut fx, LibFn::FputsUnlocked, &[nl, fp]), None);
     }
@@ -516,7 +525,11 @@ mod tests {
         let mut fx = Fixture::new();
         let (empty, nl, hello) = (lit(&mut fx, ""), lit(&mut fx, "\n"), lit(&mut fx, "hello"));
         let fp = stream(&mut fx);
-        assert_eq!(fold1(&mut fx, LibFn::Fputs, &[empty, fp]), DROP);
+        // Writes nothing, but orients the stream (C17 7.21.2p4), so it is
+        // not dropped -- gcc and clang keep it too. The `fprintf` forms
+        // above write nothing *and* orient nothing those compilers preserve,
+        // and stay dropped.
+        assert_eq!(fold1(&mut fx, LibFn::Fputs, &[empty, fp]), None);
         let want = made(LibFn::Fputc, "fputc", vec![int(&fx, b'\n'), val(fp)]);
         assert_eq!(fold1(&mut fx, LibFn::Fputs, &[nl, fp]), want);
         let want = fwrite(&fx, hello.0, 5, fp);

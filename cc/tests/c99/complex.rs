@@ -1511,7 +1511,10 @@ fn c99_unary_plus_and_minus_keep_a_complex_integer_whole() {
     let code = r#"
 int main(void) {
     _Complex short z = 3 + 4i;
-    _Complex char  c = 1 + 2i;
+    /* `signed char`, not plain `char`: plain `char` is unsigned on aarch64
+       Linux, where negating at the narrow width gives 255 rather than -1.
+       The width is what this test is about, not the signedness. */
+    _Complex signed char c = 1 + 2i;
     _Complex int   w = 5 + 6i;
 
     _Complex int p = +z;
@@ -1669,9 +1672,16 @@ int main(void) {
     return 0;
 }
 "#;
+    // `-lm`: glibc keeps feclearexcept and fetestexcept in libm, which is
+    // not linked by default. macOS has them in libSystem and needs no flag,
+    // which is why this passed there and failed on both Linux runners.
     for opt in ["-O0", "-O1", "-O2"] {
         assert_eq!(
-            compile_and_run("void_cast_complex", code, &[opt.to_string()]),
+            compile_and_run(
+                "void_cast_complex",
+                code,
+                &[opt.to_string(), "-lm".to_string()]
+            ),
             0,
             "{opt}"
         );

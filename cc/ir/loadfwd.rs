@@ -328,10 +328,8 @@ impl<'a> MemOracle<'a> {
                 // no fact whatever the object as a whole is.
                 let typ = s.typ.unwrap_or(self.types.int_id);
                 let plain = self.types.fp_format(typ).is_none()
-                    && !self
-                        .types
-                        .modifiers(typ)
-                        .intersects(TypeModifiers::VOLATILE | TypeModifiers::ATOMIC);
+                    && !self.types.contains_volatile(typ)
+                    && !self.types.modifiers(typ).contains(TypeModifiers::ATOMIC);
                 let byte = insn
                     .src
                     .get(1)

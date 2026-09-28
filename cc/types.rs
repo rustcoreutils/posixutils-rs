@@ -1802,6 +1802,40 @@ impl TypeTable {
         self.is_arithmetic(id) || self.get(id).kind == TypeKind::Pointer
     }
 
+    /// Does this type, or anything inside it, carry `volatile`?
+    ///
+    /// A qualifier on a *member* makes that member's storage volatile (C17
+    /// 6.7.3p7), but the object holding it is not itself volatile-qualified:
+    /// `struct { volatile int v; int n; } s;` answers no to
+    /// `modifiers(id).contains(VOLATILE)`, because that reports what was
+    /// written on the struct. An optimizer asking whether it may move or drop
+    /// an access to `s` has to ask this instead -- `loadfwd` forwarded a load
+    /// of such a struct across a second copy of it, and `dse` would delete a
+    /// store to one.
+    ///
+    /// A pointer is not followed: `volatile int *p` makes `*p` volatile, not
+    /// `p`, and stopping there is also what keeps this finite, since a type
+    /// can only contain itself through a pointer. An incomplete composite has
+    /// no members to prove otherwise and answers yes, which is the answer
+    /// that forbids rather than permits.
+    pub fn contains_volatile(&self, id: TypeId) -> bool {
+        if self.modifiers(id).contains(TypeModifiers::VOLATILE) {
+            return true;
+        }
+        match self.kind(id) {
+            TypeKind::Array => self
+                .base_type(id)
+                .is_some_and(|elem| self.contains_volatile(elem)),
+            TypeKind::Struct | TypeKind::Union => match self.composite(id) {
+                Some(c) if c.is_complete => c.members.iter().any(|m| self.contains_volatile(m.typ)),
+                // An incomplete composite lists no members, which is not the
+                // same as having none.
+                _ => true,
+            },
+            _ => false,
+        }
+    }
+
     /// How many scalar initializers it takes to fill this type.
     ///
     /// This is the measure brace elision runs on (C17 6.7.9p20): a brace-less
@@ -2738,6 +2772,75 @@ impl TypeTable {
 
 #[cfg(test)]
 mod tests {
+
+    /// `volatile` anywhere inside, and nothing through a pointer.
+    ///
+    /// The qualifier on a member is recorded on `StructMember::typ`, not on
+    /// the aggregate, so `modifiers()` of the struct cannot see it -- which is
+    /// how `loadfwd` came to forward a load of such a struct across a second
+    /// copy of it.
+    #[test]
+    fn contains_volatile_looks_inside_but_not_through_a_pointer() {
+        let mut types = TypeTable::new(&crate::target::Target::host());
+        let int = types.int_id;
+        let vol_int = types.intern(Type::with_modifiers(TypeKind::Int, TypeModifiers::VOLATILE));
+        let member = |typ| StructMember {
+            name: StringId::EMPTY,
+            typ,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            access_bytes: None,
+            explicit_align: None,
+        };
+        let composite = |members| CompositeType {
+            tag: None,
+            members,
+            enum_constants: Vec::new(),
+            size: 8,
+            align: 4,
+            member_align: 4,
+            is_complete: true,
+            transparent: false,
+            anon_id: None,
+        };
+
+        // The plain scalars.
+        assert!(!types.contains_volatile(int));
+        assert!(types.contains_volatile(vol_int));
+
+        // A member carries it to the aggregate, in a struct and in a union.
+        let plain_struct = types.intern(Type::struct_type(composite(vec![member(int)])));
+        let vol_struct = types.intern(Type::struct_type(composite(vec![
+            member(int),
+            member(vol_int),
+        ])));
+        assert!(!types.contains_volatile(plain_struct));
+        assert!(types.contains_volatile(vol_struct));
+        let vol_union = types.intern(Type::union_type(composite(vec![member(vol_int)])));
+        assert!(types.contains_volatile(vol_union));
+
+        // Through another level of nesting, and through an array of them.
+        let nested = types.intern(Type::struct_type(composite(vec![member(vol_struct)])));
+        assert!(types.contains_volatile(nested));
+        let arr = types.intern(Type::array(vol_struct, 4));
+        assert!(types.contains_volatile(arr));
+        let plain_arr = types.intern(Type::array(plain_struct, 4));
+        assert!(!types.contains_volatile(plain_arr));
+
+        // But not through a pointer: `volatile int *p` makes `*p` volatile,
+        // not `p`, and a pointer is the only way a type reaches itself.
+        let ptr = types.intern(Type::pointer(vol_struct));
+        assert!(!types.contains_volatile(ptr));
+        let ptr_to_vol_int = types.intern(Type::pointer(vol_int));
+        assert!(!types.contains_volatile(ptr_to_vol_int));
+
+        // An incomplete composite has nothing to prove itself with, and
+        // answers the way that forbids an optimization.
+        let opaque = types.intern(Type::struct_type(CompositeType::incomplete(None)));
+        assert!(types.contains_volatile(opaque));
+    }
+
     use super::*;
 
     /// `make_complex` and `complex_base` must be exact inverses, for every

@@ -15,6 +15,7 @@
 // if the pass forwards one byte it should not have.
 //
 
+use crate::codegen::asm_probe::{asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
 use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_two_units, run_c17};
 
 fn at_o2(name: &str, code: &str) -> i32 {
@@ -903,5 +904,109 @@ int main(void) {
         if let Some(rc) = compile_and_run_aarch64("memopt_param_object_a64", code, opt) {
             assert_eq!(rc, 0, "aarch64 at {opt}");
         }
+    }
+}
+
+/// An aggregate with a `volatile` member is re-read for each copy of it.
+///
+/// C17 6.7.3p7: an object with volatile-qualified type may change in ways
+/// the implementation cannot see, so every access to it happens as written.
+/// A qualifier on a *member* makes that member's storage volatile, but the
+/// struct holding it is not itself volatile-qualified -- and the struct's own
+/// modifiers, plus the access type, were all `forwardable` asked. Once the
+/// copy is expanded into loads and stores those accesses are plain integers,
+/// so `t = s; u = s;` loaded `s` once and fed both copies from it.
+///
+/// The unqualified struct beside it is the control: forwarding *is* right
+/// there, and clang does it -- 4 loads of the volatile object against 2 of
+/// the plain one. The assertion is relative for that reason, rather than
+/// pinning an instruction count that codegen may fairly change.
+#[test]
+fn codegen_volatile_member_is_reread_for_each_aggregate_copy() {
+    let src = r#"
+struct V { volatile int v; int pad[7]; };
+struct P { int v; int pad[7]; };
+struct V vs, vt, vu;
+struct P ps, pt, pu;
+void fv(void) { vt = vs; vu = vs; }
+void fp(void) { pt = ps; pu = ps; }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("vol_member_copy", triple, src, &["-O2"]);
+        // A load is an instruction whose *source* operand is memory.
+        let loads = |func: &str| -> usize {
+            body_of(&asm, func)
+                .lines()
+                .map(str::trim)
+                .filter(|l| {
+                    if triple == X86_64_LINUX {
+                        l.starts_with("mov")
+                            && l.split_once(char::is_whitespace).is_some_and(|(_, ops)| {
+                                ops.split(',').next().is_some_and(|src| src.contains('('))
+                            })
+                    } else {
+                        l.starts_with("ldr ") || l.starts_with("ldp ")
+                    }
+                })
+                .count()
+        };
+        let (volatile, plain) = (loads("fv"), loads("fp"));
+        assert!(
+            volatile > plain,
+            "{triple}: the volatile member must be re-read for the second \
+             copy -- volatile {volatile} loads, plain {plain}:\n{}",
+            body_of(&asm, "fv")
+        );
+    }
+}
+
+/// A store into an aggregate with a `volatile` member is not deleted by a
+/// later store that covers it.
+///
+/// The mirror of the load case: `dse::deletable` asked the same three
+/// questions `loadfwd::forwardable` did -- the access type, which an expanded
+/// aggregate copy makes a plain integer, and the object's own modifiers, which
+/// a `struct` holding a volatile member does not carry -- so `s = x; s = y;`
+/// let the first copy's stores go, dropping a write to the volatile member
+/// that C17 6.7.3p7 says must happen.
+///
+/// The unqualified struct beside it is the control: deleting the dead store
+/// *is* right there, so the fix cannot pass by giving up on every aggregate.
+#[test]
+fn codegen_volatile_member_keeps_a_store_a_later_one_covers() {
+    let src = r#"
+struct V { volatile int v; int pad[7]; };
+struct P { int v; int pad[7]; };
+struct V vs, vx, vy;
+struct P ps, px, py;
+void fv(void) { vs = vx; vs = vy; }
+void fp(void) { ps = px; ps = py; }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("vol_member_dse", triple, src, &["-O2"]);
+        let stores = |func: &str| -> usize {
+            body_of(&asm, func)
+                .lines()
+                .map(str::trim)
+                .filter(|l| {
+                    if triple == X86_64_LINUX {
+                        // `movq %rdx, 8(%rax)` -- a memory *destination*.
+                        l.starts_with("mov")
+                            && l.split_once(char::is_whitespace).is_some_and(|(_, ops)| {
+                                ops.rsplit(',').next().is_some_and(|d| d.contains('('))
+                            })
+                    } else {
+                        l.starts_with("str ") || l.starts_with("stp ")
+                    }
+                })
+                .count()
+        };
+        let (volatile, plain) = (stores("fv"), stores("fp"));
+        assert!(
+            volatile > plain,
+            "{triple}: the store to a volatile member survives a later copy \
+             (volatile {volatile} stores, plain {plain}):\n{}",
+            body_of(&asm, "fv")
+        );
     }
 }

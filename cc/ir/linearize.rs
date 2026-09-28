@@ -1068,7 +1068,7 @@ impl<'a> Linearizer<'a> {
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
                 let mods = self.types.modifiers(typ);
-                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+                let is_volatile = self.types.contains_volatile(typ);
                 let is_atomic = mods.contains(TypeModifiers::ATOMIC);
                 func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
             }
@@ -1154,7 +1154,7 @@ impl<'a> Linearizer<'a> {
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
                 let mods = self.types.modifiers(typ);
-                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+                let is_volatile = self.types.contains_volatile(typ);
                 let is_atomic = mods.contains(TypeModifiers::ATOMIC);
                 func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
                 // Record for inliner: the backend prologue fills this local from
@@ -1213,7 +1213,7 @@ impl<'a> Linearizer<'a> {
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
                 let mods = self.types.modifiers(typ);
-                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+                let is_volatile = self.types.contains_volatile(typ);
                 let is_atomic = mods.contains(TypeModifiers::ATOMIC);
                 func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
             }

@@ -484,7 +484,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // Register with function's local variable tracking for SSA
                 // Pass the current basic block as the declaration block for scope-aware phi placement
                 let mods = self.types.modifiers(typ);
-                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+                let is_volatile = self.types.contains_volatile(typ);
                 let is_atomic = mods.contains(TypeModifiers::ATOMIC);
                 func.add_local(
                     &unique_name,
@@ -737,7 +737,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             func.add_pseudo(sym);
             // Register as a pointer variable, not as the array type
             let mods = self.types.modifiers(typ);
-            let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+            let is_volatile = self.types.contains_volatile(typ);
             let is_atomic = mods.contains(TypeModifiers::ATOMIC);
             func.add_local(
                 &unique_name,

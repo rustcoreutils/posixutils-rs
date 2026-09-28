@@ -1803,7 +1803,12 @@ pub enum ComplexDivision {
     /// compiler-rt's: the textbook formula with the divisor scaled by a
     /// power of two taken from `logb` of its larger half, at the routine's
     /// own format. What Apple and FreeBSD ship.
-    CompilerRt,
+    ///
+    /// It contracts where libgcc's does and for the same reason: each of its
+    /// three sums is written with both products inside the expression, so a
+    /// target with an `fmadd` fuses one of them. `__mul?c3` writes its four
+    /// products into variables first and fuses nothing.
+    CompilerRt(Contraction),
 }
 
 /// How a target's `__div?c3` computes a product that feeds a sum, `x * y +
@@ -1983,7 +1988,7 @@ impl FloatVal {
         // `double`.
         let contraction = match division {
             ComplexDivision::Libgcc(c) => c,
-            ComplexDivision::CompilerRt => return Some(Self::compiler_rt_div(x, y, fmt)),
+            ComplexDivision::CompilerRt(c) => return Self::compiler_rt_div(x, y, fmt, c),
         };
         let ((re, im), (a, b, c, d)) = match routine.div_working_format() {
             Some(wide) => {
@@ -2068,7 +2073,12 @@ impl FloatVal {
     /// spanning subnormal to huge, the two agree on every quadruple whose
     /// operands and quotient are finite and non-zero -- which is every one a
     /// constant folder folds, the rest being left to the routine.
-    fn compiler_rt_div(x: Complex, y: Complex, fmt: FpFormat) -> Complex {
+    fn compiler_rt_div(
+        x: Complex,
+        y: Complex,
+        fmt: FpFormat,
+        contraction: Contraction,
+    ) -> Option<Complex> {
         let (a, b) = x;
         let (mut c, mut d) = y;
         let larger = if c.magnitude_below(d) { d } else { c };
@@ -2078,14 +2088,30 @@ impl FloatVal {
             c = c.scalbn(-ilogbw, fmt);
             d = d.scalbn(-ilogbw, fmt);
         }
-        let denom = c.mul(c, fmt).add(d.mul(d, fmt), fmt);
-        let re = a.mul(c, fmt).add(b.mul(d, fmt), fmt).div(denom, fmt);
-        let im = b.mul(c, fmt).sub(a.mul(d, fmt), fmt).div(denom, fmt);
+        // Each sum fuses its *first* product and rounds the second, which is
+        // what the target emits for `c*c + d*d`, `a*c + b*d` and
+        // `b*c - a*d` written that way:
+        //
+        //     fmul  d4, d3, d3        ; d*d, rounded
+        //     fmadd d4, d2, d2, d4    ; c*c fused into the sum
+        //
+        // and the same shape for the two numerators, the second negating its
+        // rounded product with `fnmul`.
+        let mul_add = |x, y, z| Self::mul_add(x, y, z, fmt, contraction);
+        let denom = mul_add(c, c, d.mul(d, fmt))?;
+        let re = mul_add(a, c, b.mul(d, fmt))?.div(denom, fmt);
+        let im = mul_add(b, c, a.mul(d, fmt).negated())?.div(denom, fmt);
         let (re, im) = (re.scalbn(-ilogbw, fmt), im.scalbn(-ilogbw, fmt));
         if !(re.is_nan() && im.is_nan()) {
-            return (re, im);
+            return Some((re, im));
         }
-        Self::recover_compiler_rt_quotient((re, im), (a, b, c, d), larger, fmt)
+        Some(Self::recover_compiler_rt_quotient(
+            (re, im),
+            (a, b, c, d),
+            larger,
+            denom,
+            fmt,
+        ))
     }
 
     /// compiler-rt's recovery of a quotient that came out NaN + NaNi, from
@@ -2098,11 +2124,11 @@ impl FloatVal {
         (re, im): Complex,
         (a, b, c, d): Operands,
         larger: Self,
+        denom: Self,
         fmt: FpFormat,
     ) -> Complex {
         let inf = Self::infinity(false);
         let zero = FloatVal::ZERO;
-        let denom = c.mul(c, fmt).add(d.mul(d, fmt), fmt);
         if denom.is_zero() && (!a.is_nan() || !b.is_nan()) {
             // Non-zero over zero.
             let inf = inf.with_sign_of(c);
@@ -2237,6 +2263,71 @@ mod tests {
         assert!(FloatVal::infinity(true).scalbn(-10, fmt).is_infinite());
     }
 
+    /// compiler-rt's division contracts where the target has an `fmadd`.
+    ///
+    /// Each of its three sums is written with both products inside the
+    /// expression that adds them, so aarch64 fuses the *first* product of
+    /// each and rounds the second:
+    ///
+    /// ```text
+    ///     fmul  d4, d3, d3        ; d*d, rounded
+    ///     fmadd d4, d2, d2, d4    ; c*c fused into the sum
+    /// ```
+    ///
+    /// The pairs here are ones where that changes the answer -- computing
+    /// separately and computing fused differ in the last place -- so the
+    /// test cannot pass if the contraction is dropped. The expected values
+    /// were computed with C's `fma`, which is the correctly rounded
+    /// operation `fmadd` performs, rather than worked out here.
+    ///
+    /// x86-64 has no `fma` at the baseline and so stays separate; that half
+    /// is `compiler_rt_division_matches_the_shipped_routine`.
+    #[test]
+    fn compiler_rt_division_contracts_where_the_target_does() {
+        let fmt = FpFormat::Binary64;
+        let v = |x: f64| FloatVal::from_f64(x);
+        let cases = [
+            (
+                (0.7, 0.7),
+                (1e5, -7.0),
+                (6.999509965702401e-06, 7.000489965697599e-06),
+                (6.9995099657024005e-06, 7.000489965697599e-06),
+            ),
+            (
+                (0.7, 1e-5),
+                (1e5, -0.1),
+                (6.999999999893e-06, 1.06999999999893e-10),
+                (6.999999999892999e-06, 1.06999999999893e-10),
+            ),
+            (
+                (0.3, 0.1),
+                (123.456, -123.456),
+                (0.0008100051840331777, 0.0016200103680663557),
+                (0.0008100051840331777, 0.0016200103680663555),
+            ),
+        ];
+        for ((a, b), (c, d), (sre, sim), (fre, fim)) in cases {
+            let q = |k| {
+                FloatVal::complex_div_on(
+                    (v(a), v(b)),
+                    (v(c), v(d)),
+                    fmt,
+                    ComplexDivision::CompilerRt(k),
+                )
+            };
+            let (re, im) = q(Contraction::Separate);
+            assert_eq!(re.to_f64(), sre, "({a}+{b}i)/({c}+{d}i) separate real");
+            assert_eq!(im.to_f64(), sim, "({a}+{b}i)/({c}+{d}i) separate imag");
+            let (re, im) = q(Contraction::Fused);
+            assert_eq!(re.to_f64(), fre, "({a}+{b}i)/({c}+{d}i) fused real");
+            assert_eq!(im.to_f64(), fim, "({a}+{b}i)/({c}+{d}i) fused imag");
+            assert!(
+                (sre, sim) != (fre, fim),
+                "({a}+{b}i)/({c}+{d}i) must distinguish the two, or it proves nothing"
+            );
+        }
+    }
+
     /// compiler-rt's division, against the `__divdc3` a Mac links.
     ///
     /// The quadruples and their answers were taken from that routine
@@ -2274,7 +2365,8 @@ mod tests {
                 (v(a), v(b)),
                 (v(c), v(d)),
                 fmt,
-                ComplexDivision::CompilerRt,
+                // x86-64, where the baseline has no `fma`.
+                ComplexDivision::CompilerRt(Contraction::Separate),
             );
             assert_eq!(re.to_f64(), wre, "({a}+{b}i)/({c}+{d}i) real");
             assert_eq!(im.to_f64(), wim, "({a}+{b}i)/({c}+{d}i) imag");

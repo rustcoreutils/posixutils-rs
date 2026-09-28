@@ -326,10 +326,24 @@ mod tests {
             x86.complex_division(R::X87Extended),
             Libgcc(Contraction::Separate)
         );
+        // The rest divide by compiler-rt's, which contracts wherever
+        // libgcc's does -- both write each sum's products inside the
+        // expression that adds them, so the target's `fmadd` decides, not
+        // the library. Getting this wrong on Apple arm64 made a folded
+        // quotient differ from the routine in the last place.
         for os in [Os::MacOS, Os::FreeBSD] {
-            for arch in [Arch::X86_64, Arch::Aarch64] {
+            for (arch, want) in [
+                (Arch::X86_64, Contraction::Separate),
+                (Arch::Aarch64, Contraction::Fused),
+            ] {
                 let t = Target::new(arch, os);
-                assert_eq!(t.complex_division(R::Binary64), CompilerRt, "{t:?}");
+                assert_eq!(t.complex_division(R::Binary64), CompilerRt(want), "{t:?}");
+                // binary128 is software on either arch, and fuses nothing.
+                assert_eq!(
+                    t.complex_division(R::Binary128),
+                    CompilerRt(Contraction::Separate),
+                    "{t:?}"
+                );
             }
         }
     }

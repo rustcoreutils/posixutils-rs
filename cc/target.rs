@@ -560,15 +560,21 @@ impl Target {
     /// Apple is measured; FreeBSD is taken to be compiler-rt's because it
     /// builds with clang and ships compiler-rt, and is not tested here.
     pub fn complex_division(&self, routine: ComplexRoutineFormat) -> ComplexDivision {
-        if self.os != Os::Linux {
-            return ComplexDivision::CompilerRt;
-        }
-        ComplexDivision::Libgcc(match (self.arch, routine) {
+        // Both libraries write each sum's two products inside the expression
+        // that adds them, so a target with an `fmadd` contracts one of them.
+        // aarch64 has one at the two formats it computes in hardware;
+        // binary128 is software and fuses nothing, and x86-64 has no `fma` at
+        // the baseline.
+        let contraction = match (self.arch, routine) {
             (Arch::Aarch64, ComplexRoutineFormat::Binary32 | ComplexRoutineFormat::Binary64) => {
                 Contraction::Fused
             }
             _ => Contraction::Separate,
-        })
+        };
+        if self.os != Os::Linux {
+            return ComplexDivision::CompilerRt(contraction);
+        }
+        ComplexDivision::Libgcc(contraction)
     }
 }
 

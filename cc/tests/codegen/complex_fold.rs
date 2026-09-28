@@ -340,9 +340,18 @@ fn folded_complex_arithmetic_matches_the_hosts_own_routine() {
     let mut src = String::from(
         r#"
 #include <complex.h>
+#include <stdio.h>
 static int bad;
-static void chk(double _Complex s, double _Complex r) {
-    if (__real__ s != __real__ r || __imag__ s != __imag__ r) bad++;
+/* Prints the first few disagreements: a bare count leaves whoever sees this
+   fail with nothing to go on but the number, and the operands are what say
+   which step of the routine was modelled wrongly. */
+static void chk(const char *what, double _Complex s, double _Complex r) {
+    if (__real__ s != __real__ r || __imag__ s != __imag__ r) {
+        if (bad < 8)
+            printf("%s\n  folded  (%.17g, %.17g)\n  routine (%.17g, %.17g)\n",
+                   what, __real__ s, __imag__ s, __real__ r, __imag__ r);
+        bad++;
+    }
 }
 "#,
     );
@@ -371,7 +380,8 @@ static void chk(double _Complex s, double _Complex r) {
     for (n, a, b, c, d) in &cases {
         src.push_str(&format!(
             "  {{ volatile double _Complex x = {a} + {b}i, y = {c} + {d}i;\n\
-             \x20   chk(sm{n}, x * y); chk(sd{n}, x / y); }}\n"
+             \x20   chk(\"({a} + {b}i) * ({c} + {d}i)\", sm{n}, x * y);\n\
+             \x20   chk(\"({a} + {b}i) / ({c} + {d}i)\", sd{n}, x / y); }}\n"
         ));
     }
     src.push_str("  return bad;\n}\n");

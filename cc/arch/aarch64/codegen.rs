@@ -733,7 +733,7 @@ impl Aarch64CodeGen {
             }
 
             Opcode::Zext | Opcode::Sext | Opcode::Trunc => {
-                self.emit_extend(insn);
+                self.emit_extend(insn, types);
             }
 
             // Floating-point arithmetic operations

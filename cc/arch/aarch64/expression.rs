@@ -331,7 +331,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    pub(super) fn emit_extend(&mut self, insn: &Instruction) {
+    pub(super) fn emit_extend(&mut self, insn: &Instruction, types: &TypeTable) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -415,10 +415,33 @@ impl Aarch64CodeGen {
                 }
             }
             Opcode::Trunc => {
-                // Truncate: move value then mask to target size
+                // Truncate, then extend the result to the register by the
+                // destination type's own signedness -- `sxtb` for a signed
+                // type, `and` for an unsigned one -- exactly as gcc and clang
+                // do. Masking unconditionally is self-consistent, because a
+                // consumer re-extends before it uses the value, but it is not
+                // what a *calling convention* means by the value: Apple's
+                // arm64 ABI has the producer extend a narrow argument or
+                // return value and lets the other side assume it, so a
+                // zero-extended `(char)0xC3` reached Apple clang as 195 where
+                // it reads -61.
                 self.emit_move(src, dst_reg, 64);
-                // Mask to target size using AND
+                let signed = insn.typ.is_some_and(|t| !types.is_unsigned(t));
                 match insn.size {
+                    8 if signed => {
+                        self.push_lir(Aarch64Inst::Sxtb {
+                            dst_size: OperandSize::B32,
+                            src: dst_reg,
+                            dst: dst_reg,
+                        });
+                    }
+                    16 if signed => {
+                        self.push_lir(Aarch64Inst::Sxth {
+                            dst_size: OperandSize::B32,
+                            src: dst_reg,
+                            dst: dst_reg,
+                        });
+                    }
                     8 => {
                         self.push_lir(Aarch64Inst::And {
                             size: OperandSize::B32,

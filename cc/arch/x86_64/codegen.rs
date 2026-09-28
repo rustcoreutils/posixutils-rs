@@ -1116,7 +1116,7 @@ impl X86_64CodeGen {
             }
 
             Opcode::Zext | Opcode::Sext | Opcode::Trunc => {
-                self.emit_extend(insn);
+                self.emit_extend(insn, types);
             }
 
             // Variadic function support (va_* builtins)

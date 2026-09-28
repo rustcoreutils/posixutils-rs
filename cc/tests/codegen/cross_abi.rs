@@ -1824,6 +1824,97 @@ int  arg_plain(char c)          { return c; }
     );
 }
 
+/// Apple arm64 makes narrowing to a small integer type *the ABI's* business,
+/// so the narrowed value must be extended by its own signedness.
+///
+/// AAPCS64 §6.8.2 leaves the bits above a return value narrower than 32 bits
+/// unspecified, and the caller re-extends; Apple's ABI does not. There the
+/// callee extends a narrow return to 32 bits, the caller extends a narrow
+/// argument, and each side is entitled to assume the other did. c17 narrowed
+/// with a zero-extending mask whatever the type's signedness:
+///
+/// ```text
+///     movz x0, #195
+///     and  w0, w0, #255       ; 195, where Apple clang reads -61
+/// ```
+///
+/// c17 could not catch this against itself, because it re-extends after every
+/// call it makes -- `bl _f; sxtb x0, w0` -- so both sides agreed on a value
+/// the ABI says is already wrong. It takes Apple clang on the other side, and
+/// `plain_char_interoperates_with_apple_clang` is what found it.
+///
+/// Asserted at `-O0` and `-O2`: constant folding hid the defect at `-O2` for a
+/// constant return, but not for a computed one. `unsigned char` and
+/// `unsigned short` are the controls, so a fix cannot pass by sign-extending
+/// everything, and aarch64 Linux keeps plain `char` unsigned, so a fix cannot
+/// pass by making every `char` signed either.
+#[test]
+fn codegen_darwin_narrowing_extends_by_the_types_signedness() {
+    let src = r#"
+signed char    ret_sc(int x)   { return (signed char)x; }
+unsigned char  ret_uc(int x)   { return (unsigned char)x; }
+short          ret_sh(int x)   { return (short)x; }
+unsigned short ret_ush(int x)  { return (unsigned short)x; }
+char           ret_plain(int x){ return (char)x; }
+char           ret_const(void) { return (char)0xC3; }
+
+int take_sc(signed char c);
+int pass_sc(int x) { return take_sc((signed char)x); }
+"#;
+
+    for opt in ["-O0", "-O2"] {
+        let d = asm_for_with("narrow_ext_darwin", AARCH64_DARWIN, src, &[opt]);
+
+        // Every signed narrowing leaves a sign-extended value behind.
+        for (func, insn, mask) in [
+            ("ret_sc", "sxtb", "#255"),
+            ("ret_sh", "sxth", "#65535"),
+            ("ret_plain", "sxtb", "#255"),
+            ("ret_const", "sxtb", "#255"),
+        ] {
+            let b = body_of(&d, func);
+            assert!(
+                b.contains(insn) || !b.contains(mask),
+                "Apple arm64 {opt}: {func} must extend its return by sign, \
+                 not mask it with {mask}:\n{b}"
+            );
+            assert!(
+                !b.contains(mask),
+                "Apple arm64 {opt}: {func} still zero-extends a signed \
+                 narrowing:\n{b}"
+            );
+        }
+
+        // The caller extends a narrow argument for the same reason.
+        let b = body_of(&d, "pass_sc");
+        assert!(
+            b.contains("sxtb") && !b.contains("#255"),
+            "Apple arm64 {opt}: a signed char argument is sign-extended by the \
+             caller:\n{b}"
+        );
+
+        // Controls: the unsigned types must not acquire a sign extension.
+        for (func, insn) in [("ret_uc", "sxtb"), ("ret_ush", "sxth")] {
+            let b = body_of(&d, func);
+            assert!(
+                !b.contains(insn),
+                "Apple arm64 {opt}: {func} is unsigned and must not \
+                 sign-extend:\n{b}"
+            );
+        }
+
+        // Control: plain `char` is unsigned on aarch64 Linux, so the same
+        // source must *not* sign-extend there.
+        let a = asm_for_with("narrow_ext_a64", AARCH64_LINUX, src, &[opt]);
+        let b = body_of(&a, "ret_plain");
+        assert!(
+            !b.contains("sxtb"),
+            "aarch64 Linux {opt}: plain char is unsigned and must not \
+             sign-extend:\n{b}"
+        );
+    }
+}
+
 /// A pointer comparison must select the *unsigned* condition code.
 ///
 /// C17 6.5.8 compares addresses, and an address is unsigned. The behavioural

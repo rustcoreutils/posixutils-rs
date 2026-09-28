@@ -149,6 +149,10 @@ int call(void) { return vf(0, 1, 2, 3, 4, 5, 6, 7, 'c', 5, 6L); }
     );
 }
 
+/// The interop sources below are built only where a second compiler can run
+/// the result: Apple clang on an arm64 Mac, or gcc on Linux. An x86-64 Mac
+/// has neither, so they are not compiled there.
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "linux"))]
 const INTEROP_DECLS: &str = r#"
 #include <stdarg.h>
 typedef struct { char a, b, c; } S3;
@@ -177,6 +181,7 @@ int packed_then_va(int i0, int i1, int i2, int i3, int i4, int i5, int i6,
                    int i7, char c, short s, char c2, ...);
 "#;
 
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "linux"))]
 const INTEROP_CALLEE: &str = r#"
 #define CK(n, cond) do { if (!(cond)) return n; } while (0)
 int many(int i0, int i1, int i2, int i3, int i4, int i5, int i6, int i7,
@@ -239,6 +244,7 @@ int packed_then_va(int i0, int i1, int i2, int i3, int i4, int i5, int i6,
 }
 "#;
 
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "linux"))]
 const INTEROP_CALLER: &str = r#"
 int main(void)
 {
@@ -269,6 +275,7 @@ int main(void)
 }
 "#;
 
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "linux"))]
 fn interop_sources() -> (String, String) {
     (
         format!("{INTEROP_DECLS}\n{INTEROP_CALLEE}"),

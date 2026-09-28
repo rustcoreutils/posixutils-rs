@@ -11586,12 +11586,14 @@ int main(void) {
 /// Either defect alone reproduces the loss, so both are checked here with a
 /// value whose upper half is the part that matters.
 ///
-/// x86-64 only. All three defects are in `cc/arch/x86_64/`, and `__float128`
-/// is that target's spelling for binary128 -- aarch64 reaches the same type
-/// through `long double`, with its own lowering and its own save area, so this
-/// source does not describe it. `compile_and_run` builds for the host, which
-/// is what makes the guard necessary rather than merely tidy.
-#[cfg(target_arch = "x86_64")]
+/// x86-64 Linux only. All three defects are in `cc/arch/x86_64/`, and
+/// `__float128` is that target's spelling for binary128 -- aarch64 reaches the
+/// same type through `long double`, with its own lowering and its own save
+/// area, so this source does not describe it. macOS is excluded on either
+/// architecture because `arch::has_float128` is false for the whole OS, so the
+/// type does not parse there at all. `compile_and_run` builds for the host,
+/// which is what makes the guard necessary rather than merely tidy.
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
 #[test]
 fn codegen_va_arg_sse_up_aggregate() {
     let code = r#"

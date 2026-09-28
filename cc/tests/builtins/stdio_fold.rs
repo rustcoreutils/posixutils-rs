@@ -170,7 +170,9 @@ fn for_each_target(body: &str, opts: &[&str], check: impl Fn(&[String], &str)) {
 #[test]
 fn builtins_stdio_fold_makes_the_calls() {
     let cases: &[(&str, &[&str])] = &[
-        ("void f(void) { printf(\"\"); }", &[]),
+        // An empty write orients the stream (C17 7.21.2p4), so the call
+        // stays; see `Print::text`.
+        ("void f(void) { printf(\"\"); }", &["printf"]),
         ("void f(void) { printf(\"a\"); }", &["putchar"]),
         ("void f(void) { printf(\"hi\\n\"); }", &["puts"]),
         ("void f(const char *s) { printf(\"%s\\n\", s); }", &["puts"]),
@@ -185,9 +187,7 @@ fn builtins_stdio_fold_makes_the_calls() {
             &["fputc"],
         ),
         // Writes nothing, but still orients the stream (C17 7.21.2p4), so
-        // the call stays -- as it does in gcc and clang. The two `fprintf`
-        // forms above are dropped by those compilers too, and are left that
-        // way here.
+        // the call stays.
         ("void f(FILE *fp) { fputs(\"\", fp); }", &["fputs"]),
         ("void f(FILE *fp) { fputs(\"x\", fp); }", &["fputc"]),
         (
@@ -251,9 +251,10 @@ fn builtins_stdio_fold_follows_asm_labels() {
 ///     fputs("", fp);  fwide(fp, 0)   ->   -1 at -O0,  0 at -O2
 /// ```
 ///
-/// gcc and clang keep this call for the same reason. They *do* drop
-/// `fprintf(fp, "")` and `fprintf(fp, "%s", "")`, and this compiler follows
-/// them there, so those are not asserted here.
+/// gcc and clang keep this call for the same reason. They drop
+/// `fprintf(fp, "")` and `fprintf(fp, "%s", "")` and lose the orientation
+/// with them; every empty write is treated alike here, so those are
+/// asserted too.
 #[test]
 fn stdio_fold_empty_fputs_still_orients_the_stream() {
     let src = r#"
@@ -275,6 +276,19 @@ int main(void) {
     fputs(empty, g);
     if (fwide(g, 0) >= 0) return 6;
     fclose(g);
+
+    /* Every other empty write orients the stream too. */
+    FILE *h = fopen("/dev/null", "w");
+    if (!h) return 7;
+    fprintf(h, "");
+    if (fwide(h, 0) >= 0) return 8;
+    fclose(h);
+
+    FILE *i = fopen("/dev/null", "w");
+    if (!i) return 9;
+    fprintf(i, "%s", "");
+    if (fwide(i, 0) >= 0) return 10;
+    fclose(i);
     return 0;
 }
 "#;

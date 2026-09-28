@@ -560,12 +560,26 @@ pub fn c17_object(name: &str, src: &str, opt: &str, dir: &std::path::Path) -> St
     o.to_string_lossy().into_owned()
 }
 
-/// Link `objs` with the C sources `c_srcs` using [`HOST_CC`], and run it.
-pub fn host_link_and_run(name: &str, objs: &[&str], c_srcs: &[&str], dir: &std::path::Path) -> i32 {
+/// Link `objs` with the C sources `c_srcs` using [`HOST_CC`] at `opt`, and run
+/// it.
+///
+/// `opt` is the platform compiler's own optimization level, and it matters to
+/// what the test can see. At `-O0` gcc and clang re-extend a narrow integer
+/// argument on entry, which hides a caller that never extended it; at `-O1`
+/// and above `int take(signed char)` is a bare `movl %edi, %eax` that reads
+/// whatever the caller left above the byte. Building this side unoptimized is
+/// what let a wrong narrowing cross every one of these tests untouched.
+pub fn host_link_and_run(
+    name: &str,
+    objs: &[&str],
+    c_srcs: &[&str],
+    opt: &str,
+    dir: &std::path::Path,
+) -> i32 {
     let exe = dir.join(name);
     let files: Vec<_> = c_srcs.iter().map(|s| create_c_file(name, s)).collect();
     let mut cmd = Command::new(HOST_CC);
-    cmd.arg("-w").arg("-o").arg(&exe);
+    cmd.arg("-w").arg(opt).arg("-o").arg(&exe);
     for f in &files {
         cmd.arg(f.path());
     }
@@ -597,17 +611,17 @@ pub fn interop_host(tag: &str, callee: &str, caller: &str) {
         let callee_o = c17_object(&format!("{tag}_callee"), callee, opt, dir.path());
         let caller_o = c17_object(&format!("{tag}_caller"), caller, opt, dir.path());
         assert_eq!(
-            host_link_and_run("cc", &[&caller_o, &callee_o], &[], dir.path()),
+            host_link_and_run("cc", &[&caller_o, &callee_o], &[], opt, dir.path()),
             0,
             "c17 both, {opt}"
         );
         assert_eq!(
-            host_link_and_run("gc", &[&callee_o], &[caller], dir.path()),
+            host_link_and_run("gc", &[&callee_o], &[caller], opt, dir.path()),
             0,
             "{HOST_CC} caller, c17 callee, {opt}"
         );
         assert_eq!(
-            host_link_and_run("cg", &[&caller_o], &[callee], dir.path()),
+            host_link_and_run("cg", &[&caller_o], &[callee], opt, dir.path()),
             0,
             "c17 caller, {HOST_CC} callee, {opt}"
         );

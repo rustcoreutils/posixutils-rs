@@ -96,6 +96,8 @@ char callee_make(void);
 struct pair callee_pair(void);
 int callee_widen_pair(struct pair p);
 int callee_vararg(int n, ...);
+int callee_widen_sc(signed char c);
+int callee_widen_sh(short s);
 "#;
 
 const INTEROP_CALLEE: &str = r#"
@@ -105,6 +107,8 @@ int callee_widen(char c) { return c; }
 char callee_make(void) { return (char)0xC3; }
 struct pair callee_pair(void) { struct pair p = { (char)0x80, (char)0xFF }; return p; }
 int callee_widen_pair(struct pair p) { return p.a + p.b; }
+int callee_widen_sc(signed char c) { return c; }
+int callee_widen_sh(short s) { return s; }
 int callee_vararg(int n, ...) {
     va_list ap;
     va_start(ap, n);
@@ -136,6 +140,16 @@ int main(void) {{
     if (callee_widen_pair(p) != widen(c80) + widen(cff)) return 9;
     /* The default argument promotion is the caller's. */
     if (callee_vararg(1, cff) != (WANT_SIGNED ? -1 : 255)) return 10;
+    /* A narrowing conversion *at the call site*, which is a different path
+       from every check above: loading a `char` object already extends it by
+       the type's signedness, so those never reach the conversion. Only a
+       value narrowed here does, and the callee is entitled to assume the
+       caller extended it -- an optimized gcc or clang compiles
+       `int f(signed char)` to a bare register move. */
+    volatile int wide = 0xC3, wide16 = 0xFFC3;
+    if (callee_widen((char)wide) != (WANT_SIGNED ? -61 : 195)) return 11;
+    if (callee_widen_sc((signed char)wide) != -61) return 12;
+    if (callee_widen_sh((short)wide16) != -61) return 13;
     return 0;
 }}
 "#,

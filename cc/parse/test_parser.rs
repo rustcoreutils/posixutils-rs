@@ -8247,3 +8247,33 @@ fn linux_targets() -> [Target; 2] {
         Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux),
     ]
 }
+
+/// Unary `+` and `-` leave a GNU complex integer's type alone.
+///
+/// `integer_promote` switches on `kind()`, which answers a complex type's
+/// base kind, so `_Complex short` looked like a `short` and promoted to
+/// `int` -- and the conversion that carries out the promotion then kept only
+/// the real half, so `+z` came out `(3, 0)`. gcc and clang give `+z` the
+/// type of `z`. The real `short` beside it is the control: 6.5.3.3p2 still
+/// promotes that one.
+#[test]
+fn test_unary_plus_leaves_a_complex_integer_alone() {
+    for op in ["+", "-"] {
+        let (expr, types, _strings, _symbols) =
+            parse_expr(&format!("{op}(_Complex short)1")).unwrap();
+        let t = expr.typ.expect("a unary arithmetic operator has a type");
+        assert!(
+            types.is_complex_integer(t),
+            "`{op}` on a complex integer keeps both halves' type"
+        );
+        assert_eq!(
+            types.size_bits(t),
+            types.size_bits(types.short_id) * 2,
+            "`{op}` does not widen it to _Complex int either"
+        );
+    }
+
+    // The control: a real narrow operand still promotes.
+    let (expr, types, _strings, _symbols) = parse_expr("+(short)1").unwrap();
+    assert_eq!(expr.typ, Some(types.int_id));
+}

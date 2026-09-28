@@ -1483,3 +1483,71 @@ fn c99_float16_complex_arithmetic() {
         }
     }
 }
+
+/// Unary `+` and `-` on a GNU complex *integer* keep both halves.
+///
+/// C17 6.5.3.3p2 gives unary `+` the value of the promoted operand, and this
+/// compiler promotes through `TypeTable::integer_promote`, which switches on
+/// `kind()`. `kind()` answers a complex type's *base* kind, so
+/// `_Complex short` looked like a `short` and promoted to `int` -- and the
+/// conversion that carries out the promotion then threw the imaginary half
+/// away:
+///
+/// ```text
+///     _Complex short z = 3 + 4i;   +z  ->  (3, 0)     -z  ->  (-3, 0)
+/// ```
+///
+/// gcc and clang leave the type alone: `sizeof(+z)` is `sizeof(z)`, not
+/// `sizeof(_Complex int)`. `default_argument_promote` already had this
+/// guard, and said why -- "a complex type is left alone: `kind` answers its
+/// base's kind".
+///
+/// `integer_promote` itself must keep reducing a complex integer to its
+/// promoted base, because the usual arithmetic conversions call it for
+/// exactly that and re-wrap the result with `pick_complex`; the binary case
+/// below is the control that pins it.
+#[test]
+fn c99_unary_plus_and_minus_keep_a_complex_integer_whole() {
+    let code = r#"
+int main(void) {
+    _Complex short z = 3 + 4i;
+    _Complex char  c = 1 + 2i;
+    _Complex int   w = 5 + 6i;
+
+    _Complex int p = +z;
+    if (__real__ p != 3 || __imag__ p != 4) return 1;
+    _Complex int m = -z;
+    if (__real__ m != -3 || __imag__ m != -4) return 2;
+    _Complex int pc = +c;
+    if (__real__ pc != 1 || __imag__ pc != 2) return 3;
+    _Complex int mc = -c;
+    if (__real__ mc != -1 || __imag__ mc != -2) return 4;
+
+    /* An already-`int` complex was never narrowed, and must stay right. */
+    _Complex int pw = +w;
+    if (__real__ pw != 5 || __imag__ pw != 6) return 5;
+
+    /* The promoted type is the operand's own, as gcc and clang have it. */
+    if (sizeof(+z) != sizeof(z)) return 6;
+    if (sizeof(+c) != sizeof(c)) return 7;
+
+    /* The control: a *binary* operator still promotes the halves, which is
+       what integer_promote is called for. */
+    _Complex short sum = z + z;
+    if (__real__ sum != 6 || __imag__ sum != 8) return 8;
+
+    /* A real operand is unaffected: 6.5.3.3p2 still promotes it. */
+    signed char sc = -100;
+    if (-sc != 100) return 9;
+    if (sizeof(+sc) != sizeof(int)) return 10;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("complex_int_unary", code, &[opt.to_string()]),
+            0,
+            "{opt}"
+        );
+    }
+}

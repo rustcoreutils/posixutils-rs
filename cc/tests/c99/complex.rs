@@ -1551,3 +1551,63 @@ int main(void) {
         );
     }
 }
+
+/// `__imag__` of a *real* operand still evaluates it.
+///
+/// gcc accepts `__real__` and `__imag__` on a real operand: the real half is
+/// the value itself, and the imaginary half is a zero of its type. Only the
+/// *value* is known in advance, though -- the operand is not in an
+/// unevaluated context the way a `sizeof` operand is, so its side effects
+/// have to happen. `linearize_complex_half` returned the zero constant
+/// without ever linearizing the operand, so every effect in it was dropped:
+///
+/// ```text
+///     double x = 1.0;  __imag__ (x += 5.0);   /* x stayed 1.0 */
+/// ```
+///
+/// The `__real__` arm always linearized the operand, so the two disagreed
+/// about the same expression. Both are checked here, for a floating and an
+/// integer operand, since the zero is built by a different call for each.
+#[test]
+fn c99_imag_of_a_real_operand_still_evaluates_it() {
+    let code = r#"
+int calls;
+static double bump(void) { calls++; return 1.0; }
+
+int main(void) {
+    /* A floating operand: the zero comes from emit_fconst. */
+    double x = 1.0;
+    double y = __imag__ (x += 5.0);
+    if (x != 6.0) return 1;
+    if (y != 0.0) return 2;
+
+    /* An integer operand: the zero comes from emit_const. */
+    int i = 1;
+    int j = __imag__ (i += 5);
+    if (i != 6) return 3;
+    if (j != 0) return 4;
+
+    /* A call is an effect too, and must happen exactly once. */
+    calls = 0;
+    (void)__imag__ bump();
+    if (calls != 1) return 5;
+
+    /* The control: __real__ was always right, and stays so. */
+    double a = 1.0;
+    double b = __real__ (a += 5.0);
+    if (a != 6.0 || b != 6.0) return 6;
+
+    /* And a genuinely complex operand is untouched by any of this. */
+    double _Complex z = 3.0 + 4.0i;
+    if (__imag__ z != 4.0 || __real__ z != 3.0) return 7;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("imag_of_real", code, &[opt.to_string()]),
+            0,
+            "{opt}"
+        );
+    }
+}

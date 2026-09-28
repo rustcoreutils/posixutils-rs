@@ -8764,6 +8764,26 @@ fn test_cast_to_bool_from_a_float_does_not_truncate() {
     );
 }
 
+/// `__imag__` of a real operand evaluates it, even though its value is a
+/// zero known in advance.
+///
+/// The zero was returned without linearizing the operand at all, so every
+/// effect in it was dropped -- `__imag__ (x += 5.0)` left `x` alone. The
+/// store the assignment owes must still be emitted.
+#[test]
+fn test_imag_of_a_real_operand_emits_its_side_effects() {
+    let src = "void f(double x) { (void)(__imag__ (x += 5.0)); }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let adds = f
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| i.op == Opcode::FAdd)
+        .count();
+    assert_eq!(adds, 1, "the assignment inside __imag__ still happens");
+}
+
 /// x86-64 Linux, whose x87 `long double` holds `0x1p62L + 1.0L` exactly --
 /// a test about that names the target rather than taking the host's, since
 /// on an arm64 Mac `long double` is `double`.

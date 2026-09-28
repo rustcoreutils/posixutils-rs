@@ -4176,15 +4176,29 @@ impl<'a> Linearizer<'a> {
     /// of its type -- gcc accepts both for `__real__` and `__imag__`. (The
     /// library functions' argument has already been converted to a complex
     /// type, so they never reach that case.)
+    ///
+    /// The zero is known without looking at the operand, but the operand is
+    /// still *evaluated*: this is not an unevaluated context, so the effects
+    /// in `__imag__ (x += 5.0)` have to happen.
     fn linearize_complex_half(&mut self, operand: &Expr, half: ComplexHalf) -> PseudoId {
         let op_typ = self.expr_type(operand);
         if !self.types.is_complex(op_typ) {
             return match half {
                 ComplexHalf::Real => self.linearize_expr(operand),
-                ComplexHalf::Imag if self.types.is_float(op_typ) => {
-                    self.emit_fconst(crate::float::FloatVal::ZERO, op_typ)
+                ComplexHalf::Imag => {
+                    // The *value* is known in advance, the operand is not.
+                    // `__imag__` is not an unevaluated context the way a
+                    // `sizeof` operand is, so the effects still have to
+                    // happen: returning the zero without linearizing the
+                    // operand dropped them, and `__imag__ (x += 5.0)` left
+                    // `x` alone. Only the value is discarded.
+                    self.linearize_expr(operand);
+                    if self.types.is_float(op_typ) {
+                        self.emit_fconst(crate::float::FloatVal::ZERO, op_typ)
+                    } else {
+                        self.emit_const(0, op_typ)
+                    }
                 }
-                ComplexHalf::Imag => self.emit_const(0, op_typ),
             };
         }
         let base_typ = self.types.complex_base(op_typ);

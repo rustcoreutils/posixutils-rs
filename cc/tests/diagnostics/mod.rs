@@ -7296,3 +7296,54 @@ int main(void) {
         0
     );
 }
+
+/// An out-of-range escape is reported where the literal is, not where the
+/// next token is.
+///
+/// The character-constant paths bind `token_pos` from the token they consume
+/// and then passed `self.current_pos()`, which after the `consume` is the
+/// *following* token. With the terminator on a line of its own the
+/// diagnostic named the wrong line outright:
+///
+/// ```text
+///     2 |   char c = '\400'
+///     3 |   ;
+///     c17    3:3: error: octal escape sequence out of range
+///     clang  2:12: error: octal escape sequence out of range
+/// ```
+///
+/// The string-literal path already reported from each piece's own position,
+/// and is the control here.
+#[test]
+fn diagnostics_escape_out_of_range_names_the_literals_line() {
+    for (name, src) in [
+        // The escape is on line 2; the `;` that follows is on line 3.
+        (
+            "esc_pos_char",
+            "int main(void) {\n  char c = '\\400'\n  ;\n}\n",
+        ),
+        (
+            "esc_pos_wchar",
+            "int main(void) {\n  int c = u'\\x10000'\n  ;\n}\n",
+        ),
+        (
+            "esc_pos_str",
+            "int main(void) {\n  char s[] = \"a\\777\"\n  ;\n}\n",
+        ),
+    ] {
+        let out = compile_with(name, src, &[]);
+        let line = out
+            .stderr
+            .lines()
+            .find(|l| l.contains("escape sequence out of range"))
+            .unwrap_or_else(|| panic!("{name}: no escape diagnostic in:\n{}", out.stderr));
+        let at = line
+            .rsplit_once(".c:")
+            .map(|(_, rest)| rest)
+            .unwrap_or(line);
+        assert!(
+            at.starts_with("2:"),
+            "{name}: the escape is on line 2, but the diagnostic says {at:?}"
+        );
+    }
+}

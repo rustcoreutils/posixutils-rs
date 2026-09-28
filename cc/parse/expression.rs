@@ -2242,8 +2242,11 @@ impl<'a> Parser<'a> {
                     // character, converted to `int` -- so its signedness is
                     // plain `char`'s, which is the target's. `'\x80'` is -128
                     // where `char` is signed and 128 where it is not.
-                    let (v, is_code_point) =
-                        literal::char_literal_value(s, None, self.current_pos());
+                    // `token_pos`, not `current_pos`: the token has been
+                    // consumed, so the current position is the *next* one --
+                    // a different line, where the terminator is on one of its
+                    // own.
+                    let (v, is_code_point) = literal::char_literal_value(s, None, token_pos);
                     let value = if is_code_point {
                         // Not a byte, so plain `char`'s signedness does not
                         // reach it.
@@ -2281,8 +2284,8 @@ impl<'a> Parser<'a> {
                             _ => self.types.char32_id,
                         };
                         let bits = self.types.size_bits(typ);
-                        let (code_point, _) =
-                            literal::char_literal_value(s, Some(bits), self.current_pos());
+                        // The consumed token's position, as above.
+                        let (code_point, _) = literal::char_literal_value(s, Some(bits), token_pos);
                         let value = literal::prefixed_char_value(
                             code_point,
                             bits,

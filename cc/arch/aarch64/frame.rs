@@ -889,11 +889,7 @@ impl Aarch64CodeGen {
                     } else if is_fp {
                         fp_arg_idx += 1;
                     } else {
-                        let n = gp_regs.unwrap_or(if types.kind(*typ) == TypeKind::Int128 {
-                            2
-                        } else {
-                            1
-                        });
+                        let n = gp_regs.unwrap_or(if types.is_plain_int128(*typ) { 2 } else { 1 });
                         int_arg_idx = match crate::abi::aapcs64::gr_run_start(
                             types,
                             *typ,
@@ -1050,7 +1046,7 @@ impl Aarch64CodeGen {
                         }
                     }
                     fp_arg_idx += 1;
-                } else if types.kind(*typ) == TypeKind::Int128 {
+                } else if types.is_plain_int128(*typ) {
                     // __int128 argument — uses TWO consecutive GP registers,
                     // even-aligned per AAPCS64 stage C.10, so an odd NGRN
                     // skips one. Asked through the same helper the caller
@@ -1465,7 +1461,12 @@ impl Aarch64CodeGen {
                     }
                     _ => {}
                 }
-            } else if insn.typ.is_some_and(|t| types.kind(t) == TypeKind::Int128) {
+            // A *complex* `__int128` does not return this way: it is
+            // thirty-two bytes, `classify_return` answers `Indirect`, and the
+            // sret path has already written it through X8. Narrowed all the
+            // same, so that no reader has to re-derive which of the two
+            // `kind()` means here.
+            } else if insn.typ.is_some_and(|t| types.is_plain_int128(t)) {
                 // __int128 return: lo half → X0, hi half → X1
                 let loc = self.get_location(src);
                 if let Loc::Stack(offset) = loc {

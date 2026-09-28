@@ -1400,11 +1400,17 @@ impl FloatVal {
 
         let (sig_a, exp_a) = a.scaled();
         let (sig_b, exp_b) = b.scaled();
+        // `U256::div` answers the exact floor of the quotient and whether
+        // anything was left over, which is precisely what `round_wide` asks
+        // for: a truncation, and a sticky reporting what fell below its low
+        // bit. The remainder goes in once, through the sticky.
+        //
+        // It used to go in twice -- the quotient's magnitude was bumped by
+        // one as well -- and with the dropped bits equal to `half - 1` that
+        // made the residue exactly `half`, which the sticky then rounded up,
+        // though the true value is strictly below the midpoint. `sqrt` reads
+        // `isqrt`'s two answers the way this now does.
         let (q, inexact) = U256::div(sig_a, sig_b);
-        // The quotient is at least 2^127 and the widest format keeps 113 bits,
-        // so bit 0 is far below the rounding position and can carry the
-        // remainder as a sticky.
-        let q = if inexact { q.add(U256::ONE) } else { q };
         Self::round_wide(neg, q, exp_a - exp_b - 128, inexact, fmt)
     }
 
@@ -2814,6 +2820,245 @@ mod tests {
             (0x3fff_0000_0000_0000, 0x0000_0000_0000_1448)
         );
         assert_eq!(one.add(tiny, FpFormat::Binary64).to_f64(), 1.0);
+    }
+
+    /// A quotient rounds to nearest at binary128, including where the bits
+    /// below the rounding position sit one short of the midpoint.
+    ///
+    /// `div` folded the remainder in twice: it bumped the quotient's
+    /// magnitude by one *and* passed the same "remainder non-zero" flag as
+    /// `round_wide`'s sticky, where that helper's contract is that its `w`
+    /// is a truncation and the sticky reports only what fell below `w`'s low
+    /// bit. With the dropped bits equal to `half - 1`, the bump made the
+    /// residue exactly `half` and the sticky then rounded it up, though the
+    /// true value is strictly below the midpoint:
+    ///
+    /// ```text
+    ///     0x1.0a3a0d300cc2940d2069294e2ab7p+0 / 0x1.decbbf450142f40118d653a966adp+0
+    ///     was ...4f09cf, is ...4f09ce
+    /// ```
+    ///
+    /// Half the cases below are on that trigger and half are ordinary
+    /// quotients. Every expectation is the correctly rounded value computed
+    /// by exact rational arithmetic (Python `fractions.Fraction`, rounding
+    /// to nearest with ties to even), not worked out here. Over 200000
+    /// random binary128 divisions that oracle disagreed with the old code 5
+    /// times and with the current code not at all.
+    ///
+    /// binary128 is where this is reachable: `drop` is 15 or 16 bits there,
+    /// so the trigger comes up about once in 40000, where binary64's 75-bit
+    /// `drop` puts it past 2^-75 -- which is why
+    /// `double_results_agree_with_hardware` never saw it.
+    #[test]
+    fn div_rounds_binary128_to_nearest() {
+        /// A significand and the power of two its low bit is worth.
+        type Parts = (u128, i32);
+        /// A binary128 encoding, high half first.
+        type Encoded = (u64, u64);
+
+        let fmt = FpFormat::Binary128;
+        let v = |(sig, exp): Parts| FloatVal::from_parts(false, sig, exp);
+        let cases: [(Parts, Parts, Encoded); 24] = [
+            (
+                (0x10a3a0d300cc2940d2069294e2ab7, -112),
+                (0x1decbbf450142f40118d653a966ad, -112),
+                (0x3ffe1cb07b08a34c, 0x0140fe9e4e4f09ce),
+            ), // trigger
+            (
+                (0x19fae2e241ec1e6ebc00ead72ea1b, 56),
+                (0x1e880dce50fbf7d4ecee7bf438cb5, -6),
+                (0x403cb3ac9e72cd7f, 0xd1ff33e5a9aa3379),
+            ), // trigger
+            (
+                (0x11672b2aeb2283257c6286271ab7b, -53),
+                (0x1ef97678987d847ddf0863de4cfb3, -17),
+                (0x3fda1faacd755dcc, 0x2c365c92529e602b),
+            ), // trigger
+            (
+                (0x1695f415ee99c1dbbea7e435d44a2, -54),
+                (0x14ea5f8fd2ee8285578bdbf64905f, -31),
+                (0x3fe81471758daaa5, 0x460c4363bc99f801),
+            ), // trigger
+            (
+                (0x1afa94d3c621343e2a7750f85fae2, -40),
+                (0x1131b5558d6986850a9eb8ad60a1b, 59),
+                (0x3f9c91ae7714f2a1, 0xcc197400645c7ab5),
+            ), // trigger
+            (
+                (0x10e55fc8880a6a2360257554afe9b, -16),
+                (0x1098241f7b18472def19344622176, -21),
+                (0x400404a77910b7a2, 0xf32427ec94bc6a82),
+            ), // trigger
+            (
+                (0x1ba4306a14f385e2d426f2b0a6e18, -48),
+                (0x14c67d4a2e44b43c30c2e6fb57587, 45),
+                (0x3fa2549ae551c521, 0x41909b1fa13fc5e0),
+            ), // trigger
+            (
+                (0x14161d2b6a9da628def7750d10fe7, -41),
+                (0x1a89ae7b153fdd75517128e435499, 24),
+                (0x3fbd8387f0dac49b, 0xe9348abfcab3a647),
+            ), // trigger
+            (
+                (0x1f313ffacdcc8038e10836ead2cd5, -19),
+                (0x1084eaf464f9107548a4bbb7199ed, -6),
+                (0x3ff2e36449d9406d, 0x75a55ce067de7742),
+            ), // trigger
+            (
+                (0x1326eb7c0b6b2ddedf90c27659af4, 15),
+                (0x14f441b7edec7203f703bd4a0d323, -55),
+                (0x4044d3f78b746dcd, 0x8ca8907d268ff051),
+            ), // trigger
+            (
+                (0x1a301587a200568b9f6f2eeea9517, 45),
+                (0x1cb7f40c79a400ede7ec7b2a3115d, -42),
+                (0x4055d2e1aa96b030, 0xd4fe2651ec0ce50d),
+            ), // trigger
+            (
+                (0x16eb74318c09a8f549561764f1e50, -25),
+                (0x1f55196774f9c483ad7172f05b9f6, 1),
+                (0x3fe476877dcc44ae, 0xa31425ed8e83cd47),
+            ), // trigger
+            (
+                (0x154c735201402213de924583fc4d5, -36),
+                (0x10ee0395106c3a5cf42cb0a5fd0a9, 346),
+                (0x3e8142103b8e9db0, 0x63d89d19b470c98c),
+            ),
+            (
+                (0x1f25ee26f81ae3c14b184d2942785, -52),
+                (0x16c5b7c7b25c8c44a034301c3436e, -230),
+                (0x40b15e289d59a426, 0xf3209302b5f36f52),
+            ),
+            (
+                (0x13eac519eb47cd734603a472884ad, 132),
+                (0x1710530a974516809b29c42333d3d, -66),
+                (0x40c4ba253cae8878, 0x8c562240dab33db3),
+            ),
+            (
+                (0x1a17277bbc1c05bbb5bb99709f250, -61),
+                (0x1ba7445e7688ec985d0e825ed672d, 55),
+                (0x3f8ae30ff24b28ce, 0x6f8764118d6f9cd5),
+            ),
+            (
+                (0x190637a7a92b1a024aac375e169d3, -264),
+                (0x1d8d5c212c37b501eb7f3841461ff, 312),
+                (0x3dbeb18d8755f91a, 0x66e6bdf60eb24989),
+            ),
+            (
+                (0x1f639c571734cfa6cd016201cd029, 79),
+                (0x1204647e7864fce6f26559a9e7640, -151),
+                (0x40e5bdff6768df8b, 0x50fcc09c879b2ec7),
+            ),
+            (
+                (0x18d6d68bd9225ba86d47572698909, -151),
+                (0x1977c6f1dc478583dd3c70a9005ea, -208),
+                (0x4037f35c854bba3e, 0x1937b3356b994b97),
+            ),
+            (
+                (0x1b60135f057718bc285a2a8999b1e, -220),
+                (0x1547aa54ee9dcc0f86145f00483d6, -3),
+                (0x3f264953e75ffc5a, 0xc807a2daf2e3c574),
+            ),
+            (
+                (0x13b9596a184168d10a1fb0ca789ec, 275),
+                (0x11d4637b071693ad1b1bbba5e6980, 313),
+                (0x3fd91b331e95177c, 0x0bbc60e4ee030ff2),
+            ),
+            (
+                (0x1397f1e1f368cd52fddc05b44dd1d, 106),
+                (0x1b0f102bc20e55b44300c8639cbc0, 248),
+                (0x3f7072be572aeb9c, 0x2f328cf62ee559f2),
+            ),
+            (
+                (0x1c8d10c651fd77daafd644ee75929, 241),
+                (0x1109244c8cedd614018db1b3d33d9, 381),
+                (0x3f73ad0b3562f83f, 0xe145d685449906c1),
+            ),
+            (
+                (0x182c13bda53e44530b37a2322b3a9, -79),
+                (0x1db4026db224a92343cdeae93362c, -210),
+                (0x4081a0a9425f0162, 0xe07611057ba52448),
+            ),
+        ];
+        for (a, b, want) in cases {
+            let (lo, hi) = v(a).div(v(b), fmt).to_f128_bits();
+            assert_eq!((hi, lo), want, "{:#x}p{} / {:#x}p{}", a.0, a.1, b.0, b.1);
+        }
+    }
+
+    /// Every quotient is the representable value nearest the true one,
+    /// checked by multiplying it back.
+    ///
+    /// `r` is correct exactly when `|a - r*b|` is at most half an ulp of `r`
+    /// times `b` -- multiplying through by `b`, which is positive, preserves
+    /// the ordering, so this is the same question as `|a/b - r|` against half
+    /// an ulp, asked in integers that are exact. In the units of the
+    /// comparison below (`r*b` and `a`, both divided by `2^(er+eb)`) that
+    /// bound is `sb << 14`, since a binary128 significand left-aligned to bit
+    /// 127 steps by `2^15`.
+    ///
+    /// The arithmetic is `U256::mul`, which is a different routine from the
+    /// `U256::div` the defect was in -- a check rebuilt from `U256::div`'s own
+    /// two answers would be the same computation twice and could not
+    /// disagree with it. `div_rounds_binary128_to_nearest` pins the values;
+    /// this says the rule holds generally.
+    #[test]
+    fn div_is_nearest_representable() {
+        let fmt = FpFormat::Binary128;
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20000 {
+            let sig = |r: &mut dyn FnMut() -> u64| {
+                (((r() as u128) << 64) | r() as u128) >> 15 | (1u128 << 112)
+            };
+            let (sa, sb) = (sig(&mut rand), sig(&mut rand));
+            // A modest exponent range, so every quotient stays normal: the
+            // half-ulp below assumes the full 113 bits are kept.
+            let ea = (rand() % 200) as i32 - 100;
+            let eb = (rand() % 200) as i32 - 100;
+            let a = FloatVal::from_parts(false, sa, ea);
+            let b = FloatVal::from_parts(false, sb, eb);
+            let r = a.div(b, fmt);
+            assert!(r.is_finite() && !r.is_zero());
+
+            let (sa, ea) = a.scaled();
+            let (sb, eb) = b.scaled();
+            let (sr, er) = r.scaled();
+            // The quotient is exactly representable, so its low fifteen bits
+            // are clear -- which is what makes half an ulp `2^14` here.
+            assert_eq!(sr & 0x7fff, 0, "a binary128 result keeps 113 bits");
+            let shift = ea - er - eb;
+            assert!(
+                (0..=128).contains(&shift),
+                "the multiply-back shift must stay inside 256 bits: {shift}"
+            );
+
+            let product = U256::mul(sr, sb);
+            let scaled_a = U256 { hi: 0, lo: sa }.shl(shift as u32);
+            let (big, small) = if scaled_a >= product {
+                (scaled_a, product)
+            } else {
+                (product, scaled_a)
+            };
+            let off = big.sub(small);
+            let half_ulp = U256 { hi: 0, lo: sb }.shl(14);
+            assert!(
+                off <= half_ulp,
+                "{sa:#x}p{ea} / {sb:#x}p{eb} is more than half an ulp out"
+            );
+            if off == half_ulp {
+                assert_eq!(
+                    (sr >> 15) & 1,
+                    0,
+                    "{sa:#x}p{ea} / {sb:#x}p{eb} is an exact tie and must go to even"
+                );
+            }
+        }
     }
 
     /// Ties go to even, and only exact ties are ties.

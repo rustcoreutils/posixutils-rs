@@ -8684,6 +8684,43 @@ fn test_void_cast_of_a_float_converts_nothing() {
     assert_eq!(converts, 0);
 }
 
+/// A construct that builds control flow of its own, reached where control
+/// cannot arrive.
+///
+/// `current_bb` is `None` after a `goto` and before a `switch`'s first
+/// `case`, and `emit` quietly drops what it is handed there. `emit_two_way`
+/// cannot be dropped that way -- it has to hang three blocks off something --
+/// and it took `self.current_bb.unwrap()`, so `sqrt`, whose errno check is a
+/// two-way, panicked the compiler outright on the dead statement after a
+/// `goto`.
+#[test]
+fn test_two_way_in_unreachable_code_does_not_panic() {
+    let src = "\
+double sqrt(double);
+double d;
+void f(void) { goto skip; d = sqrt(d); skip: return; }
+";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    // The unreachable statement is lowered into a block of its own, which
+    // nothing branches to; what matters is that lowering finished at all.
+    assert!(!f.blocks.is_empty());
+}
+
+/// The same, before a `switch`'s first `case`, which leaves `current_bb`
+/// `None` for the same reason (C17 6.8.4.2 gives such a statement no edge).
+#[test]
+fn test_two_way_before_the_first_case_does_not_panic() {
+    let src = "\
+double sqrt(double);
+double d;
+void f(int x) { switch (x) { d = sqrt(d); case 1: d = 1.0; } }
+";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    assert!(!f.blocks.is_empty());
+}
+
 /// x86-64 Linux, whose x87 `long double` holds `0x1p62L + 1.0L` exactly --
 /// a test about that names the target rather than taking the host's, since
 /// on an arm64 Mac `long double` is `double`.

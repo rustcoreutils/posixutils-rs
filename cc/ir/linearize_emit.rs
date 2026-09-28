@@ -1820,7 +1820,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) -> PseudoId {
         let size = self.types.size_bits(typ);
         let (taken_bb, fall_bb, merge_bb) = (self.alloc_bb(), self.alloc_bb(), self.alloc_bb());
-        let from = self.current_bb.unwrap();
+        let from = self.current_or_unreachable_bb();
         self.emit(Instruction::cbr(cond, taken_bb, fall_bb));
         self.link_bb(from, taken_bb);
         self.link_bb(from, fall_bb);
@@ -1854,7 +1854,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) -> (BasicBlockId, PseudoId) {
         self.switch_bb(bb);
         let value = arm(self);
-        let end = self.current_bb.unwrap();
+        let end = self.current_or_unreachable_bb();
         self.emit(Instruction::br(merge));
         self.link_bb(end, merge);
         (end, value)

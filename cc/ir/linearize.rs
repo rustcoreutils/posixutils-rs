@@ -944,6 +944,24 @@ impl<'a> Linearizer<'a> {
         self.switch_bb(bb);
     }
 
+    /// The block to emit into, starting an unreachable one where there is
+    /// none.
+    ///
+    /// `current_bb` is `None` wherever control cannot arrive -- after a
+    /// `goto`, and before a `switch`'s first `case` -- and [`Self::emit`]
+    /// quietly drops what it is handed there. A construct that builds
+    /// *control flow* of its own cannot be dropped that way: it has to hang
+    /// its blocks off an existing one. This is that block, and
+    /// `dce::remove_unreachable_blocks` takes it away again with everything
+    /// lowered into it.
+    pub(crate) fn current_or_unreachable_bb(&mut self) -> BasicBlockId {
+        if self.current_bb.is_none() {
+            self.start_unreachable_block();
+        }
+        self.current_bb
+            .expect("start_unreachable_block leaves a current block")
+    }
+
     // Function linearization
 
     /// Whether a return value of this type comes back through a hidden

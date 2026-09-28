@@ -16329,3 +16329,52 @@ int main(void) {
         }
     }
 }
+
+/// A library call whose lowering builds control flow, standing where control
+/// cannot arrive.
+///
+/// `sqrt` is lowered with an errno check, which is a two-way branch, and the
+/// builder took the block to hang it off with `current_bb.unwrap()`. After a
+/// `goto`, and before a `switch`'s first `case`, there is no current block --
+/// C17 6.8.4.2 gives such a statement no edge -- so the compiler panicked
+/// outright on a statement it was about to throw away. Both forms are
+/// checked, at every level, because the two-way is only built once the call
+/// is lowered rather than left as a call.
+#[test]
+fn codegen_two_way_lowering_in_unreachable_code_compiles() {
+    let code = r#"
+#include <math.h>
+double d;
+
+static int after_goto(void) {
+    goto skip;
+    d = sqrt(d);
+skip:
+    return 0;
+}
+
+static int before_first_case(int x) {
+    switch (x) {
+        d = sqrt(d);
+    case 1:
+        return 0;
+    }
+    return 0;
+}
+
+int main(void) {
+    d = 4.0;
+    if (after_goto()) return 1;
+    if (before_first_case(1)) return 2;
+    /* The dead statements must not have run: `d` is untouched. */
+    return d == 4.0 ? 0 : 3;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("two_way_unreachable", code, &[opt.to_string()]),
+            0,
+            "{opt}"
+        );
+    }
+}

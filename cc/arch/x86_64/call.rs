@@ -412,8 +412,7 @@ impl X86_64CodeGen {
                 });
             } else {
                 // Check if this is an __int128 arg (needs 16 bytes = 2 stack slots)
-                let is_int128 = arg_type
-                    .is_some_and(|t| types.kind(t) == TypeKind::Int128 && !types.is_complex(t));
+                let is_int128 = arg_type.is_some_and(|t| types.is_plain_int128(t));
                 if is_int128 {
                     let arg_loc = self.get_location(arg).clone();
                     for (half, off) in [
@@ -804,9 +803,7 @@ impl X86_64CodeGen {
                     self.setup_int_arg(arg, arg_size, int_arg_regs[int_arg_idx], saved_arg_regs);
                     int_arg_idx += 1;
                 }
-            } else if arg_type
-                .is_some_and(|t| types.kind(t) == TypeKind::Int128 && !types.is_complex(t))
-            {
+            } else if arg_type.is_some_and(|t| types.is_plain_int128(t)) {
                 // __int128 argument: load lo and hi halves into two consecutive GP registers
                 if int_arg_idx + 1 < int_arg_regs.len() {
                     let arg_loc = self.get_location(arg).clone();

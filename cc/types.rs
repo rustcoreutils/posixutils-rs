@@ -1797,6 +1797,19 @@ impl TypeTable {
             )
     }
 
+    /// A plain 128-bit integer, and not a complex one.
+    ///
+    /// `kind()` answers a complex type's *base* kind, exactly as it does for
+    /// the aggregates above, so `_Complex __int128` satisfies a bare
+    /// `kind(id) == TypeKind::Int128` as well. The two want opposite
+    /// treatment: a bare `__int128` is a value for two consecutive registers,
+    /// while `_Complex __int128` is a thirty-two byte composite that AAPCS64
+    /// and System V both pass by reference. A back end reaching for the
+    /// register pair has to ask this.
+    pub fn is_plain_int128(&self, id: TypeId) -> bool {
+        self.kind(id) == TypeKind::Int128 && !self.is_complex(id)
+    }
+
     /// Check if type is a scalar type (arithmetic or pointer)
     pub fn is_scalar(&self, id: TypeId) -> bool {
         self.is_arithmetic(id) || self.get(id).kind == TypeKind::Pointer
@@ -2772,6 +2785,24 @@ impl TypeTable {
 
 #[cfg(test)]
 mod tests {
+
+    /// `is_plain_int128` separates the two types `kind()` cannot.
+    #[test]
+    fn is_plain_int128_excludes_the_complex_one() {
+        let mut types = TypeTable::new(&crate::target::Target::host());
+        let plain = types.int128_id;
+        let complex = types.intern(Type::with_modifiers(
+            TypeKind::Int128,
+            TypeModifiers::COMPLEX,
+        ));
+        // Both answer the same `kind`, which is the whole hazard.
+        assert_eq!(types.kind(plain), types.kind(complex));
+        assert!(types.is_plain_int128(plain));
+        assert!(!types.is_plain_int128(complex));
+        // And nothing else is one.
+        assert!(!types.is_plain_int128(types.long_id));
+        assert!(!types.is_plain_int128(types.double_id));
+    }
 
     /// `volatile` anywhere inside, and nothing through a pointer.
     ///

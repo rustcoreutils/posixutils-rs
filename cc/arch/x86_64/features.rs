@@ -905,7 +905,10 @@ impl X86_64CodeGen {
         } else if types.kind(arg_type) == crate::types::TypeKind::LongDouble {
             self.emit_va_arg_x87(base_reg, base_offset, &dst_loc);
         } else if types.kind(arg_type) == crate::types::TypeKind::Int128 {
-            // Two INTEGER eightbytes, not one saturated at 64 bits.
+            // Two INTEGER eightbytes, not one saturated at 64 bits. `kind`
+            // suffices rather than `is_plain_int128`: the aggregate-or-complex
+            // arm above has already taken every complex type, for the reason
+            // given there.
             self.emit_va_arg_int128(base_reg, base_offset, &dst_loc, label_suffix);
         } else if types.is_float(arg_type) {
             self.emit_va_arg_float(

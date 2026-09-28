@@ -617,7 +617,7 @@ impl X86_64CodeGen {
 
         if is_complex {
             spend_arg_regs(fp_arg_idx, complex_sse_regs(types, typ), fp_arg_reg_count);
-        } else if kind == TypeKind::Int128 && !types.is_complex(typ) {
+        } else if types.is_plain_int128(typ) {
             // Only when it actually took the pair: 3.2.3 step 5 leaves the
             // registers it did not fit in available to later arguments.
             if *int_arg_idx + 1 < int_arg_reg_count {
@@ -863,7 +863,7 @@ impl X86_64CodeGen {
                         }
                     }
                     spend_arg_regs(&mut fp_arg_idx, 1, fp_arg_regs.len());
-                } else if types.kind(*typ) == TypeKind::Int128 && !types.is_complex(*typ) {
+                } else if types.is_plain_int128(*typ) {
                     // __int128 argument — uses TWO consecutive GP registers
                     // Store to the arg pseudo's stack slot (allocated by regalloc)
                     let int128_in_regs = int_arg_idx + 1 < int_arg_regs.len();
@@ -1327,9 +1327,7 @@ impl X86_64CodeGen {
                     let fp_fmt = self.fp_format(Some(fp_typ), fp_size, types);
                     self.emit_fp_move(*src, XmmReg::Xmm0, fp_fmt);
                 }
-            } else if ret_typ
-                .is_some_and(|t| types.kind(t) == TypeKind::Int128 && !types.is_complex(t))
-            {
+            } else if ret_typ.is_some_and(|t| types.is_plain_int128(t)) {
                 // __int128 return: lo half → RAX, hi half → RDX
                 let loc = self.get_location(*src).clone();
                 self.push_lir(X86Inst::Mov {

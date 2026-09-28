@@ -11,7 +11,9 @@
 // Consolidates: clz, ctz, popcount, bswap tests
 //
 
-use crate::common::{compile_and_run, compile_and_run_optimized};
+use crate::common::{
+    asm_for_at, compile_and_run, compile_and_run_aarch64, compile_and_run_optimized,
+};
 
 // ============================================================================
 // Mega-test: Bit operation builtins
@@ -305,4 +307,61 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("builtins_ffsll", code, &[]), 0);
+}
+
+// ============================================================================
+// popcount and parity on the x86-64 baseline
+// ============================================================================
+
+// Self-contained for the header-less aarch64 run.
+const POPCOUNT_PROGRAM: &str = r#"
+int main(void) {
+    volatile unsigned z = 0, ones = ~0u, alt = 0xaaaaaaaau, one = 1u, top = 0x80000000u;
+    volatile unsigned long long lz = 0, lones = ~0ull, lalt = 0x5555555555555555ull,
+        ltop = 1ull << 63, mixed = 0x0123456789abcdefull;
+    if (__builtin_popcount(z) != 0 || __builtin_popcount(ones) != 32) return 1;
+    if (__builtin_popcount(alt) != 16 || __builtin_popcount(one) != 1) return 2;
+    if (__builtin_popcount(top) != 1) return 3;
+    if (__builtin_popcountll(lz) != 0 || __builtin_popcountll(lones) != 64) return 4;
+    if (__builtin_popcountll(lalt) != 32 || __builtin_popcountll(ltop) != 1) return 5;
+    if (__builtin_popcountll(mixed) != 32 || __builtin_popcountl(mixed) != 32) return 6;
+    if (__builtin_parity(alt) != 0 || __builtin_parity(one) != 1) return 7;
+    if (__builtin_parityll(mixed) != 0 || __builtin_parityll(ltop) != 1) return 8;
+    if (__builtin_parityl(lones) != 0) return 9;
+    return 0;
+}
+"#;
+
+/// `popcnt` is not in the x86-64 baseline -- it arrived with SSE4.2-era
+/// processors -- and c17 targets the baseline, as gcc does without
+/// `-mpopcnt`. It was emitted unconditionally, so a popcount or parity
+/// raised SIGILL on a processor without it. gcc calls libgcc's
+/// `__popcountdi2`; c17 counts inline instead.
+#[test]
+fn builtins_popcount_uses_baseline_instructions() {
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("popcount{opt}"),
+                POPCOUNT_PROGRAM,
+                &[opt.to_string()]
+            ),
+            0,
+            "host {opt}"
+        );
+        if let Some(rc) =
+            compile_and_run_aarch64(&format!("popcount_a64{opt}"), POPCOUNT_PROGRAM, opt)
+        {
+            assert_eq!(rc, 0, "aarch64 {opt}");
+        }
+        let asm = asm_for_at(
+            "popcount_asm",
+            "int a(unsigned x) { return __builtin_popcount(x); }\n\
+             int b(unsigned long x) { return __builtin_popcountl(x); }\n\
+             int c(unsigned x) { return __builtin_parity(x); }\n\
+             int d(unsigned long long x) { return __builtin_parityll(x); }\n",
+            &["--target", "x86_64-unknown-linux-gnu", opt],
+        );
+        assert!(!asm.contains("popcnt"), "{opt}: popcnt emitted:\n{asm}");
+    }
 }

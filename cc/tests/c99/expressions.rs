@@ -584,9 +584,9 @@ int main(void)
 /// A floating comparison in a constant expression reaches the integer folder
 /// for its integer-valued operands.
 ///
-/// `eval_const_f64` had arms only for literals, casts, negation and the four
-/// arithmetic operators, so `_Static_assert(sizeof(int) < 4.5, "")` was
-/// rejected as "not a constant expression" although both operands are
+/// The parser's floating fold had arms only for literals, casts, negation and
+/// the four arithmetic operators, so `_Static_assert(sizeof(int) < 4.5, "")`
+/// was rejected as "not a constant expression" although both operands are
 /// constant. And `CharLit` -- an `i64` whose signedness the lexer has already
 /// resolved -- was read through `u32`, so `'\x80'` folded to 4294967168.0
 /// instead of -128.0 where `char` is signed.

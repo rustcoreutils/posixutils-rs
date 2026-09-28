@@ -416,6 +416,18 @@ pub fn aarch64_cross_available() -> bool {
         })
 }
 
+/// The c17 options that compile for linux-aarch64 against the target's own C
+/// library headers, which the cross toolchain installs outside any sysroot.
+/// Without the `-isystem`, a system header comes from the host's glibc, whose
+/// `<bits/...>` headers live in the host's multiarch directory and are not
+/// found for aarch64. `cc/scripts/c17_torture.sh -t aarch64` passes the same.
+pub const AARCH64_TARGET_ARGS: [&str; 4] = [
+    "--target",
+    "aarch64-unknown-linux-gnu",
+    "-isystem",
+    "/usr/aarch64-linux-gnu/include",
+];
+
 /// Compile `content` for linux-aarch64 with c17, assemble and link it with the
 /// cross toolchain, and run it under qemu. Returns the exit status, or `None`
 /// when the cross toolchain is absent.
@@ -428,6 +440,29 @@ pub fn aarch64_cross_available() -> bool {
 /// with each other while disagreeing with gcc. Only running c17 code against
 /// gcc-compiled code shows that, which `cross_link_with` below is for.
 pub fn compile_and_run_aarch64(name: &str, content: &str, opt: &str) -> Option<i32> {
+    compile_and_run_aarch64_with(name, content, &[opt], &[])
+}
+
+/// [`compile_and_run_aarch64`] with any number of c17 options, and `libs`
+/// (`-lm`) given to the link after the program.
+pub fn compile_and_run_aarch64_with(
+    name: &str,
+    content: &str,
+    opts: &[&str],
+    libs: &[&str],
+) -> Option<i32> {
+    compile_and_capture_aarch64(name, content, opts, libs)
+        .map(|out| out.status.code().unwrap_or(-1))
+}
+
+/// [`compile_and_run_aarch64_with`], handing back everything the program
+/// did: its status and what it wrote.
+pub fn compile_and_capture_aarch64(
+    name: &str,
+    content: &str,
+    opts: &[&str],
+    libs: &[&str],
+) -> Option<std::process::Output> {
     if !aarch64_cross_available() {
         eprintln!(
             "SKIP {name}: no aarch64 cross toolchain (aarch64-linux-gnu-gcc, qemu-aarch64-static)"
@@ -442,22 +477,18 @@ pub fn compile_and_run_aarch64(name: &str, content: &str, opt: &str) -> Option<i
         .expect("failed to create temp file");
     let asm_path = asm.path().to_string_lossy().to_string();
 
-    let run = run_c17(&[
-        "--target",
-        "aarch64-unknown-linux-gnu",
-        opt,
-        "-S",
-        "-o",
-        &asm_path,
-        &c_file.path().to_string_lossy(),
-    ]);
+    let src = c_file.path().to_string_lossy().to_string();
+    let mut args = AARCH64_TARGET_ARGS.to_vec();
+    args.extend_from_slice(opts);
+    args.extend_from_slice(&["-S", "-o", &asm_path, &src]);
+    let run = run_c17(&args);
     assert!(
         run.success,
-        "c17 failed to compile {name} for aarch64 at {opt}:\n{}",
+        "c17 failed to compile {name} for aarch64 with {opts:?}:\n{}",
         run.stderr
     );
 
-    Some(cross_link_and_run(name, &[&asm_path]))
+    Some(cross_link_and_capture(name, &[&asm_path], libs))
 }
 
 /// Assemble/link the given aarch64 sources (`.c` or `.s`) with the cross
@@ -467,6 +498,17 @@ pub fn compile_and_run_aarch64(name: &str, content: &str, opt: &str) -> Option<i
 /// the only way to test that c17 agrees with gcc about the ABI rather than
 /// merely with itself.
 pub fn cross_link_and_run(name: &str, inputs: &[&str]) -> i32 {
+    cross_link_and_run_with(name, inputs, &[])
+}
+
+/// [`cross_link_and_run`], with `libs` given to the link after the inputs.
+pub fn cross_link_and_run_with(name: &str, inputs: &[&str], libs: &[&str]) -> i32 {
+    let run = cross_link_and_capture(name, inputs, libs);
+    run.status.code().unwrap_or(-1)
+}
+
+/// [`cross_link_and_run_with`], handing back everything the program did.
+fn cross_link_and_capture(name: &str, inputs: &[&str], libs: &[&str]) -> std::process::Output {
     let exe = plib::tmp::Builder::new()
         .prefix(&format!("c17_a64_{name}_"))
         .suffix(".bin")
@@ -479,6 +521,7 @@ pub fn cross_link_and_run(name: &str, inputs: &[&str]) -> i32 {
     for input in inputs {
         link.arg(input);
     }
+    link.args(libs);
     let linked = link.output().expect("failed to run the cross linker");
     assert!(
         linked.status.success(),
@@ -486,12 +529,130 @@ pub fn cross_link_and_run(name: &str, inputs: &[&str]) -> i32 {
         String::from_utf8_lossy(&linked.stderr)
     );
 
-    let run = Command::new("qemu-aarch64-static")
+    Command::new("qemu-aarch64-static")
         .env("QEMU_LD_PREFIX", "/usr/aarch64-linux-gnu")
         .arg(&exe_path)
         .output()
-        .expect("failed to run qemu-aarch64-static");
-    run.status.code().unwrap_or(-1)
+        .expect("failed to run qemu-aarch64-static")
+}
+
+/// The host's own C compiler, the other half of every host interop test:
+/// Apple clang on macOS, gcc elsewhere.
+pub const HOST_CC: &str = if cfg!(target_os = "macos") {
+    "cc"
+} else {
+    "gcc"
+};
+
+/// Compile `src` with c17 to a host object in `dir`, returning its path.
+pub fn c17_object(name: &str, src: &str, opt: &str, dir: &std::path::Path) -> String {
+    let c = create_c_file(name, src);
+    let o = dir.join(format!("{name}.o"));
+    let run = run_c17(&[
+        opt,
+        "-w",
+        "-c",
+        "-o",
+        o.to_str().unwrap(),
+        c.path().to_str().unwrap(),
+    ]);
+    assert!(run.success, "c17 failed on {name}:\n{}", run.stderr);
+    o.to_string_lossy().into_owned()
+}
+
+/// Link `objs` with the C sources `c_srcs` using [`HOST_CC`], and run it.
+pub fn host_link_and_run(name: &str, objs: &[&str], c_srcs: &[&str], dir: &std::path::Path) -> i32 {
+    let exe = dir.join(name);
+    let files: Vec<_> = c_srcs.iter().map(|s| create_c_file(name, s)).collect();
+    let mut cmd = Command::new(HOST_CC);
+    cmd.arg("-w").arg("-o").arg(&exe);
+    for f in &files {
+        cmd.arg(f.path());
+    }
+    cmd.args(objs);
+    let out = cmd.output().expect("run the host C compiler");
+    assert!(
+        out.status.success(),
+        "{HOST_CC} link of {name} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Command::new(&exe)
+        .status()
+        .expect("run test binary")
+        .code()
+        .unwrap_or(-1)
+}
+
+/// Every pairing of c17 and [`HOST_CC`] on the host -- c17 on both sides,
+/// then each compiler as the caller of the other -- at -O0 and -O2.
+///
+/// `callee` and `caller` are separate translation units, so each side reads
+/// what the other wrote only through the calling convention.
+pub fn interop_host(tag: &str, callee: &str, caller: &str) {
+    let dir = plib::tmp::Builder::new()
+        .prefix(&format!("{tag}_"))
+        .tempdir()
+        .unwrap();
+    for opt in ["-O0", "-O2"] {
+        let callee_o = c17_object(&format!("{tag}_callee"), callee, opt, dir.path());
+        let caller_o = c17_object(&format!("{tag}_caller"), caller, opt, dir.path());
+        assert_eq!(
+            host_link_and_run("cc", &[&caller_o, &callee_o], &[], dir.path()),
+            0,
+            "c17 both, {opt}"
+        );
+        assert_eq!(
+            host_link_and_run("gc", &[&callee_o], &[caller], dir.path()),
+            0,
+            "{HOST_CC} caller, c17 callee, {opt}"
+        );
+        assert_eq!(
+            host_link_and_run("cg", &[&caller_o], &[callee], dir.path()),
+            0,
+            "c17 caller, {HOST_CC} callee, {opt}"
+        );
+    }
+}
+
+/// Every pairing of c17 and aarch64 `gcc`, under qemu, at -O0 and -O2: the
+/// linux-aarch64 counterpart of [`interop_host`]. The caller checks
+/// [`aarch64_cross_available`] first.
+pub fn interop_aarch64(tag: &str, callee: &str, caller: &str) {
+    let dir = plib::tmp::Builder::new()
+        .prefix(&format!("{tag}_a64_"))
+        .tempdir()
+        .unwrap();
+    let callee_c = create_c_file(&format!("{tag}_callee_a64"), callee);
+    let caller_c = create_c_file(&format!("{tag}_caller_a64"), caller);
+    let callee_src = callee_c.path().to_string_lossy().into_owned();
+    let caller_src = caller_c.path().to_string_lossy().into_owned();
+    for opt in ["-O0", "-O2"] {
+        let asm = |src: &str, n: &str| {
+            let s = dir.path().join(format!("{n}{opt}.s"));
+            let mut args = AARCH64_TARGET_ARGS.to_vec();
+            args.extend_from_slice(&[opt, "-w", "-S", "-o", s.to_str().unwrap(), src]);
+            let run = run_c17(&args);
+            assert!(run.success, "c17 failed on {n}:\n{}", run.stderr);
+            s.to_string_lossy().into_owned()
+        };
+        let callee_s = asm(&callee_src, "callee");
+        let caller_s = asm(&caller_src, "caller");
+        assert_eq!(
+            cross_link_and_run(&format!("{tag}_cc"), &[&caller_s, &callee_s]),
+            0,
+            "c17 both, {opt}"
+        );
+        assert_eq!(
+            cross_link_and_run(&format!("{tag}_gc"), &[&caller_src, &callee_s]),
+            0,
+            "gcc caller, c17 callee, {opt}"
+        );
+        assert_eq!(
+            cross_link_and_run(&format!("{tag}_cg"), &[&caller_s, &callee_src]),
+            0,
+            "c17 caller, gcc callee, {opt}"
+        );
+    }
 }
 
 /// Compile `content` and require it to be **rejected** with a diagnostic

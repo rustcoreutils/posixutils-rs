@@ -430,6 +430,7 @@ int main() {
 // ============================================================================
 
 /// Create a temporary assembly file
+#[cfg(target_arch = "x86_64")]
 fn create_asm_file(name: &str, content: &str, extension: &str) -> plib::tmp::NamedTempFile {
     let mut file = plib::tmp::Builder::new()
         .prefix(&format!("c17_test_{}_", name))
@@ -5525,6 +5526,60 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("codegen_float16_mega", code, &[]), 0);
+}
+
+/// A `_Float16` store writes two bytes, not four.
+///
+/// x86-64 stored a half with `movss`, which writes four bytes: assigning one
+/// member of a struct of `_Float16`s overwrote the next member, and storing
+/// the imaginary half of a `_Float16 _Complex` wrote two bytes past the
+/// object. SSE2 has no two-byte store from an XMM register, so the value
+/// goes through a general register, as gcc does.
+#[test]
+fn codegen_float16_store_writes_two_bytes() {
+    let code = r#"
+typedef _Float16 _Complex hc;
+struct S { _Float16 a, b, c, d; };
+_Float16 g[4] = {1, 2, 3, 4};
+__attribute__((noinline)) void member(struct S *p, _Float16 v) { p->b = v; }
+__attribute__((noinline)) void global(_Float16 v) { g[1] = v; }
+__attribute__((noinline)) void whole(hc *p, hc v) { *p = v; }
+__attribute__((noinline)) void imag(hc *p, _Float16 v) { __imag__ *p = v; }
+__attribute__((noinline)) void real(hc *p, _Float16 v) { __real__ *p = v; }
+static hc mk(int r, int i) { return __builtin_complex((_Float16)r, (_Float16)i); }
+int main(void) {
+    struct S s = {1, 2, 3, 4};
+    member(&s, 9);
+    if (s.a != 1 || s.b != 9 || s.c != 3 || s.d != 4) return 1;
+    global(9);
+    if (g[0] != 1 || g[1] != 9 || g[2] != 3 || g[3] != 4) return 2;
+    hc arr[3] = {mk(1, 2), mk(3, 4), mk(5, 6)};
+    whole(&arr[1], mk(7, 8));
+    if (__imag__ arr[0] != 2 || __real__ arr[1] != 7 || __imag__ arr[1] != 8
+        || __real__ arr[2] != 5)
+        return 3;
+    imag(&arr[0], 10);
+    if (__real__ arr[0] != 1 || __imag__ arr[0] != 10 || __real__ arr[1] != 7) return 4;
+    real(&arr[1], 11);
+    if (__real__ arr[1] != 11 || __imag__ arr[1] != 8 || __real__ arr[2] != 5) return 5;
+    /* A local struct's member, addressed from the frame. */
+    struct S t = {1, 2, 3, 4};
+    volatile _Float16 v = 9;
+    t.b = v;
+    if (t.a != 1 || t.b != 9 || t.c != 3) return 6;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("float16_store{opt}"), code, &[opt.to_string()]),
+            0,
+            "host {opt}"
+        );
+        if let Some(rc) = compile_and_run_aarch64(&format!("float16_store_a64{opt}"), code, opt) {
+            assert_eq!(rc, 0, "aarch64 {opt}");
+        }
+    }
 }
 
 /// Test that the AddC→AdcC carry chain survives optimization.
@@ -11531,12 +11586,14 @@ int main(void) {
 /// Either defect alone reproduces the loss, so both are checked here with a
 /// value whose upper half is the part that matters.
 ///
-/// x86-64 only. All three defects are in `cc/arch/x86_64/`, and `__float128`
-/// is that target's spelling for binary128 -- aarch64 reaches the same type
-/// through `long double`, with its own lowering and its own save area, so this
-/// source does not describe it. `compile_and_run` builds for the host, which
-/// is what makes the guard necessary rather than merely tidy.
-#[cfg(target_arch = "x86_64")]
+/// x86-64 Linux only. All three defects are in `cc/arch/x86_64/`, and
+/// `__float128` is that target's spelling for binary128 -- aarch64 reaches the
+/// same type through `long double`, with its own lowering and its own save
+/// area, so this source does not describe it. macOS is excluded on either
+/// architecture because `arch::has_float128` is false for the whole OS, so the
+/// type does not parse there at all. `compile_and_run` builds for the host,
+/// which is what makes the guard necessary rather than merely tidy.
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
 #[test]
 fn codegen_va_arg_sse_up_aggregate() {
     let code = r#"
@@ -16166,5 +16223,109 @@ int main(void)
             0,
             "{opts:?}"
         );
+    }
+}
+
+// ============================================================================
+// long double to integer on the x86-64 baseline
+// ============================================================================
+
+// Truncation under every rounding mode, and the mode left as it was found.
+const LD_TO_INT_PROGRAM: &str = r#"
+#include <fenv.h>
+static int check(void) {
+    volatile long double a = 2.9L, b = -2.9L, c = 0x1p62L + 0.5L, d = -0.99L, e = 65535.75L;
+    if ((int)a != 2 || (int)b != -2) return 1;
+    if ((long)c != 0x4000000000000000L) return 2;
+    if ((long long)d != 0 || (unsigned short)e != 65535 || (short)b != -2) return 3;
+    if ((unsigned)a != 2u || (unsigned long)c != 0x4000000000000000UL) return 4;
+    return 0;
+}
+int main(void) {
+    const int modes[] = { FE_TONEAREST, FE_UPWARD, FE_DOWNWARD, FE_TOWARDZERO };
+    for (int i = 0; i < 4; i++) {
+        fesetround(modes[i]);
+        int r = check();
+        if (r) return 10 * (i + 1) + r;
+        /* The conversion must leave the rounding mode as it found it. */
+        if (fegetround() != modes[i]) return 50 + i;
+        volatile long double h = 0.5L;
+        volatile long double one = 1.0L;
+        long double s = h + one * 0x1p-64L;   /* an inexact add: rounds per mode */
+        (void)s;
+    }
+    fesetround(FE_TONEAREST);
+    return 0;
+}
+"#;
+
+/// `fisttp` is SSE3, which the x86-64 baseline c17 targets does not include:
+/// gcc converts a long double to an integer by switching the x87 control word
+/// to truncation around a `fistp`, then restoring it. The value was always
+/// right; the instruction raised SIGILL on a processor without SSE3.
+#[test]
+fn codegen_x86_64_long_double_to_integer_is_baseline() {
+    if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        return;
+    }
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("ld_to_int{opt}"),
+                LD_TO_INT_PROGRAM,
+                &[opt.to_string(), "-lm".to_string()]
+            ),
+            0,
+            "{opt}"
+        );
+        let asm = asm_for_at(
+            "ld_to_int_asm",
+            "int f(long double x) { return (int)x; }\n\
+             long g(long double x) { return (long)x; }\n\
+             unsigned long h(long double x) { return (unsigned long)x; }\n\
+             short k(long double x) { return (short)x; }\n",
+            &[opt],
+        );
+        assert!(!asm.contains("fisttp"), "{opt}: fisttp emitted:\n{asm}");
+    }
+}
+
+/// A cast to `void` discards the value (C17 6.3.2.2) and converts nothing.
+/// `(void)x` of a floating `x` was lowered as a conversion to an integer --
+/// `cvttss2si` at `-O0` -- which raises `FE_INVALID` for a NaN, so
+/// `(void)b;` in a function that ignores a NaN argument raised it.
+#[test]
+fn codegen_void_cast_of_a_float_converts_nothing() {
+    let src = r#"
+#include <fenv.h>
+__attribute__((noinline)) static void ignore(float f, double d, long double l) {
+    (void)f; (void)d; (void)l;
+}
+int main(void) {
+    volatile float nan = __builtin_nanf("");
+    volatile double big = 1e300;
+    feclearexcept(FE_ALL_EXCEPT);
+    ignore(nan, big, -big);
+    return fetestexcept(FE_INVALID) ? 1 : 0;
+}
+"#;
+    for level in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                "void_cast_float",
+                src,
+                &[level.to_string(), "-lm".to_string()]
+            ),
+            0,
+            "{level}"
+        );
+        if let Some(rc) = crate::common::compile_and_run_aarch64_with(
+            "void_cast_float_a64",
+            src,
+            &[level],
+            &["-lm"],
+        ) {
+            assert_eq!(rc, 0, "aarch64 {level}");
+        }
     }
 }

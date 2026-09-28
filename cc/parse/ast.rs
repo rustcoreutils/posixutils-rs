@@ -11,7 +11,7 @@
 //
 
 use crate::diag::Position;
-use crate::float::FloatVal;
+use crate::float::{FloatVal, IntegralRounding};
 use crate::strings::StringId;
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
@@ -48,6 +48,255 @@ pub enum UnaryOp {
     Real,
     /// GCC `__imag__ x`: the imaginary part.
     Imag,
+}
+
+/// A library function whose call the compiler evaluates in place (C17
+/// 7.1.4p1), as the operand of [`ExprKind::InlineLibraryCall`].
+///
+/// Each is the whole of what the call computes from its arguments, which
+/// arrive already converted to the prototype's parameter types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineLibraryFn {
+    /// `abs`, `labs`, `llabs`, `imaxabs`: the magnitude of an integer, at the
+    /// width of the expression's own type.
+    IntAbs,
+    /// `fabs`, `fabsf`, `fabsl`: the magnitude of a `double`, `float` or
+    /// `long double`, whichever the expression's own type is.
+    Fabs,
+    /// `creal`, `crealf`, `creall`: the real half of a complex value.
+    ComplexReal,
+    /// `cimag`, `cimagf`, `cimagl`: the imaginary half.
+    ComplexImag,
+    /// `conj`, `conjf`, `conjl`: the complex conjugate, as GNU `~z` computes
+    /// it.
+    Conjugate,
+    /// `copysign`, `copysignf`, `copysignl`: the first argument with the
+    /// sign bit of the second, at the expression's own type.
+    CopySign,
+    /// `sqrt`, `sqrtf`, `sqrtl`: the correctly rounded square root, and
+    /// whether a negative argument must still reach the library to set
+    /// `errno`.
+    Sqrt(MathErrno),
+    /// `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint` and their `f`
+    /// forms: the integer the argument rounds to, at the expression's type.
+    RoundToIntegral(IntegralRounding),
+    /// `fmin`, `fminf`: the smaller argument, a NaN one ignored.
+    FMin,
+    /// `fmax`, `fmaxf`: the larger argument, a NaN one ignored.
+    FMax,
+    /// `fma`, `fmaf`: `x * y + z`, rounded once.
+    Fma,
+    /// `memcpy`, `memset`, `memmove`, `mempcpy`, `bcopy`: a block memory
+    /// function, as its IR operation.
+    Memory(MemoryFn),
+}
+
+/// A `double` library call computed by its `float` form, because the answer
+/// is the same there ([`InlineLibraryFn::narrows_exactly`]): `floor(x)` of a
+/// `float` `x` is `floorf(x)`, widened to the `double` the call is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NarrowedLibraryCall {
+    /// The `float` form, by its own name (`floorf`): what is called instead
+    /// where the target has no instruction for it.
+    pub name: StringId,
+    /// The type it computes in, which every argument has.
+    pub typ: TypeId,
+}
+
+/// A block memory function of `<string.h>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryFn {
+    /// `void *memcpy(void *restrict, const void *restrict, size_t)`
+    Copy,
+    /// `void *memset(void *, int, size_t)`
+    Set,
+    /// `void *memmove(void *, const void *, size_t)`
+    Move,
+    /// `void *mempcpy(void *restrict, const void *restrict, size_t)`, the
+    /// GNU copy that answers the end of what it wrote, `dest + n`.
+    CopyToEnd,
+    /// `void bcopy(const void *, void *, size_t)`, the old BSD move, whose
+    /// source comes first and which answers nothing.
+    MoveSourceFirst,
+}
+
+/// Whether a libm function computed in place must still report a domain
+/// error through `errno` (C17 7.12.1p2): `-fmath-errno`, gcc's default, or
+/// `-fno-math-errno`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MathErrno {
+    /// An argument outside the domain is handed to the library function,
+    /// which sets `errno` to `EDOM` and returns its NaN.
+    Set,
+    /// The instruction's answer stands for every argument; `errno` is left
+    /// alone.
+    Ignored,
+}
+
+/// A library function whose call stays a call, but whose result the
+/// optimizer may know from its arguments (C17 7.1.4p1): `strlen("abc")` is 3,
+/// `strchr(s, 0)` is `s + strlen(s)`.
+///
+/// Carried on [`ExprKind::Call`] and on the IR call it becomes, so that a
+/// pass recognises the function by what the program called and not by its
+/// assembler name: `strstr` renamed with an asm label is still `strstr`. A
+/// call is tagged only where the name still means the library function --
+/// see `builtin_is_shadowed` -- and nothing about it changes until a fold
+/// proves its result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibFn {
+    Strlen,
+    Strnlen,
+    Strcmp,
+    Strncmp,
+    Memcmp,
+    /// `strchr`, and its old spelling `index`.
+    Strchr,
+    /// `strrchr`, and its old spelling `rindex`.
+    Strrchr,
+    Memchr,
+    Strstr,
+    Strpbrk,
+    Strcspn,
+    Strcpy,
+    Stpcpy,
+    Strncpy,
+    Strcat,
+    Strncat,
+    Sprintf,
+    Printf,
+    PrintfUnlocked,
+    Vprintf,
+    PrintfChk,
+    VprintfChk,
+    Fprintf,
+    FprintfUnlocked,
+    Vfprintf,
+    FprintfChk,
+    VfprintfChk,
+    Fputs,
+    FputsUnlocked,
+    Puts,
+    Putchar,
+    Fputc,
+    Fwrite,
+    /// libgcc's `__mul?c3`, which a floating complex `*` calls, for the
+    /// format its arguments are in. No program names it: the linearizer
+    /// makes the call (`emit_complex_float_muldiv`), so it has no row in the
+    /// library-builtin table.
+    MulComplex,
+    /// libgcc's `__div?c3`, which a floating complex `/` calls; as
+    /// [`LibFn::MulComplex`].
+    DivComplex,
+}
+
+impl LibFn {
+    /// Whether the function reads memory and writes none, so a call to it
+    /// leaves every object as it found it.
+    pub fn only_reads(self) -> bool {
+        use LibFn as L;
+        matches!(
+            self,
+            L::Strlen
+                | L::Strnlen
+                | L::Strcmp
+                | L::Strncmp
+                | L::Memcmp
+                | L::Strchr
+                | L::Strrchr
+                | L::Memchr
+                | L::Strstr
+                | L::Strpbrk
+                | L::Strcspn
+        )
+    }
+}
+
+impl InlineLibraryFn {
+    /// How many arguments the function takes.
+    pub fn arity(self) -> usize {
+        match self {
+            InlineLibraryFn::Memory(_) | InlineLibraryFn::Fma => 3,
+            InlineLibraryFn::CopySign | InlineLibraryFn::FMin | InlineLibraryFn::FMax => 2,
+            InlineLibraryFn::IntAbs
+            | InlineLibraryFn::Fabs
+            | InlineLibraryFn::ComplexReal
+            | InlineLibraryFn::ComplexImag
+            | InlineLibraryFn::Conjugate
+            | InlineLibraryFn::Sqrt(_)
+            | InlineLibraryFn::RoundToIntegral(_) => 1,
+        }
+    }
+
+    /// Whether the `double` function gives exactly the `float` one's answer
+    /// for a `float` argument, so that `floor((double)x)` may be computed as
+    /// `floorf(x)` -- only for a function whose answer is exactly
+    /// representable wherever its argument is.
+    ///
+    /// `(float)floor((double)x)` is `floorf(x)` exactly: the result is an
+    /// integer no greater in magnitude than `x`, so a value representable as
+    /// a `float` stays representable, and converting it up to `double` and
+    /// back changes nothing. `sin` and `log` are not like this: `sinf(x)` and
+    /// `(float)sin((double)x)` differ in the last bit for some `x`, and
+    /// narrowing one is a wrong answer rather than a faster one. Neither is
+    /// `sqrt`, whose `double` root of a `float` is not a `float`.
+    pub fn narrows_exactly(self) -> bool {
+        matches!(self, InlineLibraryFn::RoundToIntegral(_))
+    }
+
+    /// Whether evaluating the call can do anything but compute its value:
+    /// set `errno`, or write memory.
+    pub fn has_side_effects(self) -> bool {
+        matches!(
+            self,
+            InlineLibraryFn::Sqrt(MathErrno::Set) | InlineLibraryFn::Memory(_)
+        )
+    }
+
+    /// Whether the translation unit's own definition of the function is what
+    /// a call reaches, wherever in the unit the definition is.
+    ///
+    /// gcc's rule for the libm functions it expands late -- `sqrt`, `floor`
+    /// and the rest: `double sqrt(double x) { ... }` makes `sqrt` an ordinary
+    /// function again, even for a call above it -- unless the definition is
+    /// weak, and may be replaced at link time. The block memory functions
+    /// follow the same rule, which is what glibc's fortify headers need: an
+    /// `always_inline` `gnu_inline` `memcpy` that checks the object size
+    /// before it copies must not be bypassed. gcc honours only that wrapper,
+    /// and still expands a constant-length copy past a plain definition; but
+    /// defining a reserved library name is undefined (C17 7.1.3p2), so
+    /// calling the program's own is as right, and keeps one rule. `abs`,
+    /// `fabs`, `copysign` and the complex accessors gcc folds as it parses,
+    /// past a definition too (gcc.c-torture `execute/20021127-1`), and they
+    /// stay builtins here as well.
+    pub fn yields_to_a_definition(self) -> bool {
+        matches!(
+            self,
+            InlineLibraryFn::Sqrt(_)
+                | InlineLibraryFn::RoundToIntegral(_)
+                | InlineLibraryFn::FMin
+                | InlineLibraryFn::FMax
+                | InlineLibraryFn::Fma
+                | InlineLibraryFn::Memory(_)
+        )
+    }
+
+    /// Whether a call the program wrote to `called` reaches the program's
+    /// own definition of it instead: `defined` holds every name the
+    /// translation unit defines a function under, weak definitions aside.
+    ///
+    /// `called` is the function the program named -- `floor`, even where a
+    /// `float` argument is computed by `floorf` -- because that is the one
+    /// its definition replaces. The one rule for both places that ask: the
+    /// parser, of a definition above the call, and the linearizer, of one
+    /// anywhere in the unit.
+    pub fn is_displaced(
+        self,
+        called: StringId,
+        defined: &std::collections::HashSet<StringId>,
+    ) -> bool {
+        self.yields_to_a_definition() && defined.contains(&called)
+    }
 }
 
 /// Binary operators
@@ -92,10 +341,9 @@ impl BinaryOp {
 
 /// Which classification question a [`ExprKind::FpTest`] asks.
 ///
-/// The variants share an `Is` prefix because the builtins they name do:
-/// `__builtin_isnan`, `__builtin_isinf`, and so on.
+/// The variants are named for the builtins they answer: `__builtin_isnan`,
+/// `__builtin_isinf`, ..., `__builtin_signbit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::enum_variant_names)]
 pub enum FpTest {
     /// Is it a NaN?
     IsNan,
@@ -110,6 +358,10 @@ pub enum FpTest {
     IsFinite,
     /// Is it finite, non-zero and not subnormal?
     IsNormal,
+    /// Is its sign bit set? `signbit`: true for `-0.0` and for a NaN whose
+    /// sign is set, which no comparison can tell, so this one is a bit test.
+    /// Answers 0 or 1.
+    SignBit,
 }
 
 /// Which read-modify-write a [`ExprKind::GnuAtomicRmw`] performs.
@@ -288,8 +540,10 @@ pub enum ExprKind {
     /// String literal
     StringLit(String),
 
-    /// Wide string literal (L"...")
-    WideStringLit(String),
+    /// `L"..."` — the literal's `wchar_t` code units. Held as units, not as
+    /// text, because a unit an escape names need not be a character:
+    /// `L"\xffffffff"` has no `char`.
+    WideStringLit(Vec<u32>),
     /// `u"..."` — the literal's `char16_t` code units, surrogate pairs already
     /// formed. Held as units rather than text because the element width is
     /// what codegen emits.
@@ -351,6 +605,8 @@ pub enum ExprKind {
         args: Vec<Expr>,
         /// Which definition a call by name reaches.
         binding: CalleeBinding,
+        /// The library function this calls, when the name still means it.
+        known: Option<LibFn>,
     },
 
     /// Member access: expr.member
@@ -683,50 +939,32 @@ pub enum ExprKind {
     },
 
     // =========================================================================
-    // Memory builtins - generate calls to C library functions
-    // =========================================================================
-    /// __builtin_memset(dest, c, n) - calls memset
-    Memset {
-        dest: Box<Expr>,
-        c: Box<Expr>,
-        n: Box<Expr>,
-    },
-
-    /// __builtin_memcpy(dest, src, n) - calls memcpy
-    Memcpy {
-        dest: Box<Expr>,
-        src: Box<Expr>,
-        n: Box<Expr>,
-    },
-
-    /// __builtin_memmove(dest, src, n) - calls memmove
-    Memmove {
-        dest: Box<Expr>,
-        src: Box<Expr>,
-        n: Box<Expr>,
-    },
-
-    // =========================================================================
     // Floating-point builtins
     // =========================================================================
-    /// __builtin_fabs(x) - absolute value of double
-    Fabs {
-        arg: Box<Expr>,
-    },
-
-    /// __builtin_fabsf(x) - absolute value of float
-    Fabsf {
-        arg: Box<Expr>,
-    },
-
-    /// __builtin_signbit(x) - test sign bit of double, returns non-zero if negative
-    Signbit {
-        arg: Box<Expr>,
-    },
-
-    /// __builtin_signbitf(x) - test sign bit of float, returns non-zero if negative
-    Signbitf {
-        arg: Box<Expr>,
+    /// A call to a library function that is evaluated in place rather than
+    /// called: `abs(x)`, `fabs(x)`, `copysign(x, y)`, `creal(z)`, `conj(z)`,
+    /// `memcpy(d, s, n)` and their siblings, bare or as `__builtin_*`. `args`
+    /// have been checked against the function's prototype and converted to
+    /// its parameter types, as a call's arguments are.
+    ///
+    /// It is a call's result, so a value and never an lvalue (C17 6.5.2.2p5):
+    /// `creal(z)` computes what `__real__ z` reads, but `creal(z) = 1.0` is
+    /// not an assignment to `z`.
+    InlineLibraryCall {
+        func: InlineLibraryFn,
+        /// One argument for each of `func`'s parameters
+        /// ([`InlineLibraryFn::arity`]), each converted to its type -- or,
+        /// when `narrowed`, at the type it is computed in.
+        args: Vec<Expr>,
+        /// The library function the program called, by its own name
+        /// (`sqrtf`, or `floor` of a `float`): the one a definition in the
+        /// translation unit displaces ([`InlineLibraryFn::is_displaced`]),
+        /// and unless `narrowed`, what is called instead where the target
+        /// has no instruction for it, where the call must still set `errno`,
+        /// or where a block memory function is not expanded.
+        name: StringId,
+        /// Set when the call is computed by its `float` form.
+        narrowed: Option<NarrowedLibraryCall>,
     },
 
     /// `__builtin_isnan` / `isinf` / `isfinite` / `isnormal` -- classify a
@@ -1226,6 +1464,7 @@ impl Expr {
                 func: Box::new(func),
                 args,
                 binding: CalleeBinding::Declared,
+                known: None,
             },
             types.int_id,
             pos,
@@ -1533,10 +1772,6 @@ impl Expr {
             | K::Popcountl { arg: a }
             | K::Popcountll { arg: a }
             | K::Alloca { size: a }
-            | K::Fabs { arg: a }
-            | K::Fabsf { arg: a }
-            | K::Signbit { arg: a }
-            | K::Signbitf { arg: a }
             | K::FpTest { arg: a, .. }
             | K::Setjmp { env: a }
             | K::C11AtomicThreadFence { order: a }
@@ -1564,21 +1799,6 @@ impl Expr {
                 cond: a,
                 then_expr: b,
                 else_expr: c,
-            }
-            | K::Memset {
-                dest: a,
-                c: b,
-                n: c,
-            }
-            | K::Memcpy {
-                dest: a,
-                src: b,
-                n: c,
-            }
-            | K::Memmove {
-                dest: a,
-                src: b,
-                n: c,
             }
             | K::CheckedArith { a, b, res: c, .. }
             | K::GnuAtomicRmw {
@@ -1641,7 +1861,9 @@ impl Expr {
                 succ_order,
             } => vec![ptr, expected, desired, succ_order],
             K::Call { func, args, .. } => std::iter::once(&**func).chain(args).collect(),
-            K::Comma(exprs) | K::SizeofType(_, exprs) => exprs.iter().collect(),
+            K::Comma(exprs)
+            | K::SizeofType(_, exprs)
+            | K::InlineLibraryCall { args: exprs, .. } => exprs.iter().collect(),
             K::FpClassify { classes, arg } => {
                 classes.iter().chain(std::iter::once(&**arg)).collect()
             }
@@ -2000,6 +2222,19 @@ impl FunctionAttrs {
     }
 }
 
+/// How a function definition declared its parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamStyle {
+    /// A prototype, `int f(float x)`: each argument is converted to its
+    /// parameter's type and passed as that.
+    Prototype,
+    /// An identifier list, `int f(x) float x;`: the function type has no
+    /// prototype, so every caller passes the default argument promotions of
+    /// what it has (C17 6.5.2.2p6), and the definition converts each one to
+    /// its declared type on entry (6.9.1p10).
+    IdentifierList,
+}
+
 /// A function definition
 #[derive(Debug, Clone)]
 pub struct FunctionDef {
@@ -2009,6 +2244,8 @@ pub struct FunctionDef {
     pub name: StringId,
     /// Parameters
     pub params: Vec<Parameter>,
+    /// Whether `params` came from a prototype or an identifier list.
+    pub param_style: ParamStyle,
     /// Function body
     pub body: Stmt,
     /// Source position of function definition (for debug info)
@@ -2359,35 +2596,80 @@ mod tests {
         }
     }
 
+    /// Only a root that must still set `errno` does more than compute.
     #[test]
-    fn test_fabs_builtins() {
-        let types = TypeTable::new(&Target::host());
+    fn test_inline_library_fn_side_effects() {
+        assert!(InlineLibraryFn::Sqrt(MathErrno::Set).has_side_effects());
+        assert!(!InlineLibraryFn::Sqrt(MathErrno::Ignored).has_side_effects());
+        assert!(!InlineLibraryFn::Fabs.has_side_effects());
+        assert!(InlineLibraryFn::Memory(MemoryFn::Copy).has_side_effects());
+        assert_eq!(InlineLibraryFn::Sqrt(MathErrno::Set).arity(), 1);
+        assert_eq!(InlineLibraryFn::Memory(MemoryFn::Set).arity(), 3);
+    }
 
-        // Test Fabs (double)
+    /// A definition displaces the functions gcc expands late -- the libm
+    /// ones and the block memory ones -- and not the ones it folds as it
+    /// parses.
+    #[test]
+    fn test_inline_library_fn_yields_to_a_definition() {
+        assert!(InlineLibraryFn::Sqrt(MathErrno::Set).yields_to_a_definition());
+        assert!(InlineLibraryFn::RoundToIntegral(IntegralRounding::Rint).yields_to_a_definition());
+        assert!(InlineLibraryFn::Memory(MemoryFn::Move).yields_to_a_definition());
+        assert!(InlineLibraryFn::Fma.yields_to_a_definition());
+        assert!(InlineLibraryFn::FMin.yields_to_a_definition());
+        assert_eq!(InlineLibraryFn::Fma.arity(), 3);
+        assert_eq!(InlineLibraryFn::FMax.arity(), 2);
+        assert!(!InlineLibraryFn::FMin.narrows_exactly());
+        for f in [
+            InlineLibraryFn::IntAbs,
+            InlineLibraryFn::Fabs,
+            InlineLibraryFn::CopySign,
+            InlineLibraryFn::ComplexReal,
+        ] {
+            assert!(!f.yields_to_a_definition(), "{f:?}");
+        }
+    }
+
+    /// Displacement asks about the function the program called, and only
+    /// of one that yields to a definition.
+    #[test]
+    fn test_inline_library_fn_is_displaced_by_the_called_name() {
+        let floor = InlineLibraryFn::RoundToIntegral(IntegralRounding::Floor);
+        let defined: std::collections::HashSet<StringId> = [crate::kw::FLOOR].into();
+        assert!(floor.is_displaced(crate::kw::FLOOR, &defined));
+        assert!(!floor.is_displaced(crate::kw::FLOORF, &defined));
+        assert!(!InlineLibraryFn::Fabs.is_displaced(crate::kw::FLOOR, &defined));
+        let floorf: std::collections::HashSet<StringId> = [crate::kw::FLOORF].into();
+        assert!(!floor.is_displaced(crate::kw::FLOOR, &floorf));
+    }
+
+    /// Only the exactly rounding functions narrow; a root does not.
+    #[test]
+    fn test_inline_library_fn_narrows_exactly() {
+        assert!(InlineLibraryFn::RoundToIntegral(IntegralRounding::Floor).narrows_exactly());
+        assert!(InlineLibraryFn::RoundToIntegral(IntegralRounding::NearbyInt).narrows_exactly());
+        assert!(!InlineLibraryFn::Sqrt(MathErrno::Ignored).narrows_exactly());
+        assert!(!InlineLibraryFn::Fabs.narrows_exactly());
+    }
+
+    #[test]
+    fn test_inline_library_call_operand() {
+        let types = TypeTable::new(&Target::host());
         let arg =
             Expr::typed_unpositioned(ExprKind::FloatLit(FloatVal::from_f64(1.5)), types.double_id);
-        let fabs = Expr::new_unpositioned(ExprKind::Fabs { arg: Box::new(arg) });
-        match fabs.kind {
-            ExprKind::Fabs { arg } => {
-                assert!(matches!(arg.kind, ExprKind::FloatLit(_)));
-            }
-            _ => panic!("Expected Fabs"),
-        }
-
-        // Test Fabsf (float)
-        let arg =
-            Expr::typed_unpositioned(ExprKind::FloatLit(FloatVal::from_f64(2.5)), types.float_id);
-        let fabsf = Expr::new_unpositioned(ExprKind::Fabsf { arg: Box::new(arg) });
-        match fabsf.kind {
-            ExprKind::Fabsf { arg } => {
-                assert!(matches!(arg.kind, ExprKind::FloatLit(_)));
-            }
-            _ => panic!("Expected Fabsf"),
-        }
-
-        // There is no `Fabsl` variant: `__builtin_fabsl` lowers to an ordinary
-        // call to `fabsl`, because a `double` opcode would read only the low
-        // eight bytes of an x87 value.
+        let call = Expr::typed_unpositioned(
+            ExprKind::InlineLibraryCall {
+                func: InlineLibraryFn::Fabs,
+                args: vec![arg],
+                name: crate::kw::FABS,
+                narrowed: None,
+            },
+            types.double_id,
+        );
+        // The argument is the one operand a walker must visit.
+        let operands = call.operands();
+        assert_eq!(operands.len(), 1);
+        assert!(matches!(operands[0].kind, ExprKind::FloatLit(_)));
     }
 
     #[test]

@@ -14,9 +14,10 @@
 //
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
+use crate::float::{ComplexRoutineFormat, FpFormat};
 use crate::ir::{CallAbiInfo, Function, Instruction, Module, Opcode, PseudoId};
 use crate::rtlib::{Float16Abi, RtlibNames};
-use crate::target::{Arch, Os, Target};
+use crate::target::{Arch, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
 // Trait and types
@@ -42,49 +43,102 @@ pub trait ArchMapper {
     /// Map one instruction. The arch impl calls shared helpers
     /// to build replacement IR, then returns it in MappedInsn::Replace.
     fn map_insn(&self, insn: &Instruction, ctx: &mut MappingCtx<'_>) -> MappedInsn;
+
+    /// Whether the backend computes the libm opcode `op` ([`Opcode::is_libm`])
+    /// on a value in format `fmt` with its own instructions. Where it does
+    /// not, [`call_library_fallbacks`] calls the library function instead.
+    fn computes_in_place(&self, op: Opcode, fmt: FpFormat) -> bool;
+
+    /// The calls that compute `insn` where this target has no instruction
+    /// for a format it computes in software, apart from binary128 -- which
+    /// every target computes that way ([`map_binary128`]). Asked by
+    /// [`call_library_fallbacks`], after the optimizer; `None` when `insn`
+    /// is not such an operation.
+    fn software_float(&self, _insn: &Instruction, _ctx: &mut MappingCtx<'_>) -> Option<MappedInsn> {
+        None
+    }
+}
+
+/// Whether `target` computes the libm opcode `op` in format `fmt` in place.
+/// See [`ArchMapper::computes_in_place`].
+///
+/// Asked by the linearizer too, which leaves out the `errno` guard in front
+/// of an opcode that is going to be a call anyway.
+pub fn computes_in_place(op: Opcode, fmt: FpFormat, target: &Target) -> bool {
+    create_mapper(target).computes_in_place(op, fmt)
+}
+
+/// Turn every opcode the target computes by a library call into that call.
+///
+/// Two kinds of opcode are computed that way: a libm opcode
+/// ([`Opcode::is_libm`]) the target has no instruction for, which calls the
+/// library function it names, and any arithmetic, comparison or conversion
+/// on a format the target has no hardware for, which calls libgcc's
+/// soft-float routines: IEEE binary128 on every target ([`map_binary128`]),
+/// and `_Float16` on x86-64 ([`ArchMapper::software_float`]).
+///
+/// Runs after the optimizer rather than with [`run_mapping`], so that the
+/// opcode is still there to be folded, merged or deleted as a value: a call
+/// is none of those. `1.0L + 2.0L != 3.0L` on aarch64 was a `__addtf3` and a
+/// `__netf2` the optimizer could not see into. These functions have no side
+/// effect but `errno`, and an opcode never sets it -- the linearizer arranges
+/// a real call wherever one must.
+pub fn call_library_fallbacks(module: &mut Module, types: &TypeTable, target: &Target) {
+    let mapper = create_mapper(target);
+    for func in &mut module.functions {
+        map_function(func, types, target, |insn, ctx| {
+            library_call(insn, ctx, mapper.as_ref())
+        });
+    }
+}
+
+/// The call that computes `insn` on this target, as [`call_library_fallbacks`]
+/// describes, or [`MappedInsn::Legal`] if the backend computes it in place.
+pub(crate) fn library_call(
+    insn: &Instruction,
+    ctx: &mut MappingCtx<'_>,
+    mapper: &dyn ArchMapper,
+) -> MappedInsn {
+    let fmt = insn.typ.and_then(|t| ctx.types.fp_format(t));
+    if let Some(fmt) = fmt.filter(|_| insn.op.is_libm()) {
+        if mapper.computes_in_place(insn.op, fmt) {
+            return MappedInsn::Legal;
+        }
+        let call = build_binop_rtlib_call(insn, insn.library_callee(), ctx.types, ctx.target);
+        return MappedInsn::Replace(vec![call]);
+    }
+    // First, so that a conversion between `_Float16` and binary128 is the
+    // one routine for the pair rather than a binary128 one.
+    if let Some(mapped) = mapper.software_float(insn, ctx) {
+        return mapped;
+    }
+    map_binary128(insn, ctx).unwrap_or(MappedInsn::Legal)
 }
 
 // Complex number rtlib name selection
 
-/// Get the rtlib function name for complex multiplication.
-/// Target-dependent for long double (x87 vs IEEE quad).
-pub fn complex_mul_name(base_kind: TypeKind, target: &Target) -> &'static str {
-    match base_kind {
-        TypeKind::Float128 => "__multc3",
-        TypeKind::Float => "__mulsc3",
-        TypeKind::Double => "__muldc3",
-        TypeKind::LongDouble => {
-            if target.arch == Arch::Aarch64 && target.os == Os::MacOS {
-                "__muldc3" // macOS aarch64: long double == double
-            } else {
-                match target.arch {
-                    Arch::X86_64 => "__mulxc3",
-                    Arch::Aarch64 => "__multc3",
-                }
-            }
-        }
-        _ => "__muldc3",
+/// libgcc's routine for a floating complex multiplication in `routine`.
+///
+/// Keyed by format, not by type: `long double` is three formats across the
+/// targets, and binary128 is `__float128` on one and `long double` on
+/// another, but each format has exactly one routine. There is no binary16
+/// case to get wrong -- see [`ComplexRoutineFormat`].
+pub fn complex_mul_name(routine: ComplexRoutineFormat) -> &'static str {
+    match routine {
+        ComplexRoutineFormat::Binary32 => "__mulsc3",
+        ComplexRoutineFormat::Binary64 => "__muldc3",
+        ComplexRoutineFormat::X87Extended => "__mulxc3",
+        ComplexRoutineFormat::Binary128 => "__multc3",
     }
 }
 
-/// Get the rtlib function name for complex division.
-/// Target-dependent for long double (x87 vs IEEE quad).
-pub fn complex_div_name(base_kind: TypeKind, target: &Target) -> &'static str {
-    match base_kind {
-        TypeKind::Float128 => "__divtc3",
-        TypeKind::Float => "__divsc3",
-        TypeKind::Double => "__divdc3",
-        TypeKind::LongDouble => {
-            if target.arch == Arch::Aarch64 && target.os == Os::MacOS {
-                "__divdc3"
-            } else {
-                match target.arch {
-                    Arch::X86_64 => "__divxc3",
-                    Arch::Aarch64 => "__divtc3",
-                }
-            }
-        }
-        _ => "__divdc3",
+/// libgcc's routine for a floating complex division in `routine`.
+pub fn complex_div_name(routine: ComplexRoutineFormat) -> &'static str {
+    match routine {
+        ComplexRoutineFormat::Binary32 => "__divsc3",
+        ComplexRoutineFormat::Binary64 => "__divdc3",
+        ComplexRoutineFormat::X87Extended => "__divxc3",
+        ComplexRoutineFormat::Binary128 => "__divtc3",
     }
 }
 
@@ -108,25 +162,14 @@ pub(crate) fn float_suffix(kind: TypeKind, target: &Target) -> &'static str {
     }
 }
 
-/// Check if long double needs soft-float rtlib on this target.
-/// Returns true only for aarch64/Linux (128-bit IEEE quad).
-/// x86_64 uses native x87; macOS aarch64 long double == double.
-pub(crate) fn longdouble_needs_rtlib(target: &Target) -> bool {
-    target.arch == Arch::Aarch64 && target.os != Os::MacOS
-}
-
-/// Whether `typ` is an IEEE binary128 value on this target.
+/// Whether `typ` is an IEEE binary128 value on the target `types` describes.
 ///
 /// Two spellings reach the same format: `__float128`, which is binary128
 /// everywhere, and `long double` on the targets whose long double *is*
 /// binary128 (aarch64, other than Apple's). x86-64's `long double` is x87
 /// extended and is not this.
-pub(crate) fn is_binary128(types: &TypeTable, typ: TypeId, target: &Target) -> bool {
-    match types.kind(typ) {
-        TypeKind::Float128 => true,
-        TypeKind::LongDouble => longdouble_needs_rtlib(target),
-        _ => false,
-    }
+fn is_binary128(types: &TypeTable, typ: TypeId) -> bool {
+    types.fp_format(typ) == Some(FpFormat::Binary128)
 }
 
 /// Get the integer suffix for a long double↔int conversion.
@@ -1695,8 +1738,13 @@ fn create_mapper(target: &Target) -> Box<dyn ArchMapper> {
     }
 }
 
-/// Run the instruction mapping pass on a single function.
-fn map_function(func: &mut Function, types: &TypeTable, target: &Target, mapper: &dyn ArchMapper) {
+/// Rewrite every instruction of `func` as `map` says.
+fn map_function(
+    func: &mut Function,
+    types: &TypeTable,
+    target: &Target,
+    map: impl Fn(&Instruction, &mut MappingCtx<'_>) -> MappedInsn,
+) {
     for block_idx in 0..func.blocks.len() {
         // Take the insns out of the block to avoid borrow conflicts
         let old_insns = std::mem::take(&mut func.blocks[block_idx].insns);
@@ -1709,7 +1757,7 @@ fn map_function(func: &mut Function, types: &TypeTable, target: &Target, mapper:
                 types,
                 target,
             };
-            match mapper.map_insn(insn, &mut ctx) {
+            match map(insn, &mut ctx) {
                 MappedInsn::Legal => new_insns.push(insn.clone()),
                 MappedInsn::Replace(replacements) => {
                     new_insns.extend(replacements);
@@ -1730,7 +1778,7 @@ fn map_function(func: &mut Function, types: &TypeTable, target: &Target, mapper:
 pub fn run_mapping(module: &mut Module, types: &TypeTable, target: &Target) {
     let mapper = create_mapper(target);
     for func in &mut module.functions {
-        map_function(func, types, target, mapper.as_ref());
+        map_function(func, types, target, |insn, ctx| mapper.map_insn(insn, ctx));
     }
 }
 
@@ -1743,12 +1791,15 @@ pub fn run_mapping(module: &mut Module, types: &TypeTable, target: &Target) {
 /// has hardware binary128, so every arithmetic, comparison and conversion is a
 /// `__*tf*` call. Keyed on the *type* rather than on the target — asking "is
 /// this value binary128" is what lets one lowering serve both.
-pub(crate) fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Option<MappedInsn> {
+///
+/// Part of [`call_library_fallbacks`], after the optimizer, which folds the
+/// opcodes exactly in [`FpFormat::Binary128`] until then.
+fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Option<MappedInsn> {
     match insn.op {
         // Binary arithmetic: FAdd/FSub/FMul/FDiv → single rtlib call
         Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv => {
             let typ = insn.typ?;
-            if !is_binary128(ctx.types, typ, ctx.target) {
+            if !is_binary128(ctx.types, typ) {
                 return None;
             }
             let name = match insn.op {
@@ -1765,7 +1816,7 @@ pub(crate) fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Opt
         // Negation: FNeg → single rtlib call
         Opcode::FNeg => {
             let typ = insn.typ?;
-            if !is_binary128(ctx.types, typ, ctx.target) {
+            if !is_binary128(ctx.types, typ) {
                 return None;
             }
             let call = build_binop_rtlib_call(insn, "__negtf2", ctx.types, ctx.target);
@@ -1788,7 +1839,7 @@ pub(crate) fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Opt
             // is an int -- so that is the one to ask; `src_typ` is set on the
             // paths that build one explicitly.
             let operand_typ = insn.src_typ.or(insn.typ)?;
-            if !is_binary128(ctx.types, operand_typ, ctx.target) {
+            if !is_binary128(ctx.types, operand_typ) {
                 return None;
             }
             let (name, cmp_op) = match insn.op {
@@ -1836,8 +1887,8 @@ pub(crate) fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Opt
         Opcode::FCvtF => {
             let dst_typ = insn.typ?;
             let src_typ = insn.src_typ?;
-            let src_quad = is_binary128(ctx.types, src_typ, ctx.target);
-            let dst_quad = is_binary128(ctx.types, dst_typ, ctx.target);
+            let src_quad = is_binary128(ctx.types, src_typ);
+            let dst_quad = is_binary128(ctx.types, dst_typ);
             // Both or neither: nothing for this pass. Both is the identity on
             // a target whose `long double` is itself binary128.
             if src_quad == dst_quad {
@@ -1865,7 +1916,7 @@ pub(crate) fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Opt
         // Int-to-float: int → longdouble
         Opcode::SCvtF | Opcode::UCvtF => {
             let dst_typ = insn.typ?;
-            if !is_binary128(ctx.types, dst_typ, ctx.target) {
+            if !is_binary128(ctx.types, dst_typ) {
                 return None;
             }
             let src_typ = insn.src_typ?;
@@ -1888,7 +1939,7 @@ pub(crate) fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Opt
         // Float-to-int: longdouble → int
         Opcode::FCvtS | Opcode::FCvtU => {
             let src_typ = insn.src_typ?;
-            if !is_binary128(ctx.types, src_typ, ctx.target) {
+            if !is_binary128(ctx.types, src_typ) {
                 return None;
             }
             let dst_typ = insn.typ?;
@@ -2145,6 +2196,178 @@ mod tests {
     use crate::target::{Arch, Os, Target};
     use crate::types::TypeTable;
 
+    // Library fallbacks
+
+    /// A module of one function computing `op` of a `typ` value, calling it
+    /// `callee` where it is still a call.
+    fn libm_module(types: &TypeTable, op: Opcode, typ: TypeId, callee: &str) -> Module {
+        let mut func = make_minimal_func(types);
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(
+            Instruction::unop(op, PseudoId(1), PseudoId(0), typ, types.size_bits(typ))
+                .with_func(callee),
+        );
+        bb.add_insn(Instruction::ret(Some(PseudoId(1))));
+        func.add_block(bb);
+        let mut module = Module::default();
+        module.add_function(func);
+        module
+    }
+
+    /// What each target computes in place: SSE2 and x87 on x86-64, the
+    /// scalar formats on aarch64, and binary128 nowhere.
+    #[test]
+    fn test_computes_in_place_by_target() {
+        let x86 = Target::new(Arch::X86_64, Os::Linux);
+        let a64 = Target::new(Arch::Aarch64, Os::Linux);
+        for fmt in [FpFormat::Binary32, FpFormat::Binary64] {
+            assert!(computes_in_place(Opcode::Sqrt, fmt, &x86));
+            assert!(computes_in_place(Opcode::Sqrt, fmt, &a64));
+        }
+        assert!(computes_in_place(Opcode::Sqrt, FpFormat::X87Extended, &x86));
+        assert!(!computes_in_place(Opcode::Sqrt, FpFormat::Binary128, &x86));
+        assert!(!computes_in_place(Opcode::Sqrt, FpFormat::Binary128, &a64));
+
+        // Every rounding on aarch64; on x86-64 all but `round` and
+        // `nearbyint`, which SSE2 has no sequence for.
+        use crate::float::IntegralRounding::*;
+        for how in [Floor, Ceil, Trunc, Round, Rint, NearbyInt] {
+            let op = Opcode::RoundToIntegral(how);
+            let sse = !matches!(how, Round | NearbyInt);
+            for fmt in [FpFormat::Binary32, FpFormat::Binary64] {
+                assert!(computes_in_place(op, fmt, &a64), "{how:?}");
+                assert_eq!(computes_in_place(op, fmt, &x86), sse, "{how:?}");
+            }
+            assert!(!computes_in_place(op, FpFormat::Binary128, &a64));
+            assert!(!computes_in_place(op, FpFormat::X87Extended, &x86));
+        }
+
+        // fmin, fmax and fma: instructions on aarch64, calls on x86-64.
+        for op in [Opcode::FMin, Opcode::FMax, Opcode::Fma] {
+            for fmt in [FpFormat::Binary32, FpFormat::Binary64] {
+                assert!(computes_in_place(op, fmt, &a64), "{op:?}");
+                assert!(!computes_in_place(op, fmt, &x86), "{op:?}");
+            }
+            assert!(!computes_in_place(op, FpFormat::Binary128, &a64));
+        }
+    }
+
+    /// The late pass turns only the opcodes a target cannot compute into
+    /// calls, to the function each names, with the ABI of its type.
+    #[test]
+    fn test_call_library_fallbacks() {
+        let a64 = Target::new(Arch::Aarch64, Os::Linux);
+        let types = TypeTable::new(&a64);
+        let mut module = libm_module(&types, Opcode::Sqrt, types.longdouble_id, "sqrtl");
+        call_library_fallbacks(&mut module, &types, &a64);
+        let call = &module.functions[0].blocks[0].insns[1];
+        assert_eq!(call.op, Opcode::Call);
+        assert_eq!(call.func_name.as_deref(), Some("sqrtl"));
+        assert_eq!(call.target, Some(PseudoId(1)));
+        assert_eq!(call.src, vec![PseudoId(0)]);
+        assert!(call.abi_info.is_some());
+
+        let mut module = libm_module(&types, Opcode::Sqrt, types.double_id, "sqrt");
+        call_library_fallbacks(&mut module, &types, &a64);
+        assert_eq!(module.functions[0].blocks[0].insns[1].op, Opcode::Sqrt);
+
+        let x86 = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&x86);
+        let mut module = libm_module(&types, Opcode::Sqrt, types.longdouble_id, "sqrtl");
+        call_library_fallbacks(&mut module, &types, &x86);
+        assert_eq!(module.functions[0].blocks[0].insns[1].op, Opcode::Sqrt);
+
+        // `round` is a call on x86-64, `floor` is not.
+        use crate::float::IntegralRounding::{Floor, Round};
+        let round = Opcode::RoundToIntegral(Round);
+        let mut module = libm_module(&types, round, types.float_id, "roundf");
+        call_library_fallbacks(&mut module, &types, &x86);
+        let call = &module.functions[0].blocks[0].insns[1];
+        assert_eq!(call.op, Opcode::Call);
+        assert_eq!(call.func_name.as_deref(), Some("roundf"));
+        let floor = Opcode::RoundToIntegral(Floor);
+        let mut module = libm_module(&types, floor, types.double_id, "floor");
+        call_library_fallbacks(&mut module, &types, &x86);
+        assert_eq!(module.functions[0].blocks[0].insns[1].op, floor);
+
+        // `fma` on x86-64 is a call of three arguments, all of its type.
+        let mut module = libm_module(&types, Opcode::Fma, types.double_id, "fma");
+        module.functions[0].blocks[0].insns[1].src = vec![PseudoId(0), PseudoId(0), PseudoId(0)];
+        call_library_fallbacks(&mut module, &types, &x86);
+        let call = &module.functions[0].blocks[0].insns[1];
+        assert_eq!(call.op, Opcode::Call);
+        assert_eq!(call.func_name.as_deref(), Some("fma"));
+        assert_eq!(call.src.len(), 3);
+        assert_eq!(call.arg_types, vec![types.double_id; 3]);
+    }
+
+    /// A module of one function comparing two `typ` values with `op`.
+    fn fcmp_module(types: &TypeTable, op: Opcode, typ: TypeId) -> Module {
+        let mut func = make_minimal_func(types);
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        let mut cmp = Instruction::binop(
+            op,
+            PseudoId(2),
+            PseudoId(0),
+            PseudoId(1),
+            typ,
+            types.size_bits(typ),
+        );
+        cmp.src_typ = Some(typ);
+        bb.add_insn(cmp);
+        bb.add_insn(Instruction::ret(Some(PseudoId(2))));
+        func.add_block(bb);
+        let mut module = Module::default();
+        module.add_function(func);
+        module
+    }
+
+    /// binary128 is left to the optimizer by the early mapping and becomes
+    /// libgcc's soft-float calls in the late pass, on every target where it
+    /// is that format, and only there.
+    #[test]
+    fn test_call_library_fallbacks_binary128() {
+        let a64 = Target::new(Arch::Aarch64, Os::Linux);
+        let types = TypeTable::new(&a64);
+        let neg = |module: &Module| module.functions[0].blocks[0].insns[1].clone();
+
+        let mut module = libm_module(&types, Opcode::FNeg, types.longdouble_id, "");
+        run_mapping(&mut module, &types, &a64);
+        assert_eq!(neg(&module).op, Opcode::FNeg);
+        call_library_fallbacks(&mut module, &types, &a64);
+        assert_eq!(neg(&module).func_name.as_deref(), Some("__negtf2"));
+
+        // A comparison is the call and a test of its answer against zero.
+        let mut module = fcmp_module(&types, Opcode::FCmpONe, types.longdouble_id);
+        run_mapping(&mut module, &types, &a64);
+        assert_eq!(module.functions[0].blocks[0].insns.len(), 3);
+        call_library_fallbacks(&mut module, &types, &a64);
+        let insns = &module.functions[0].blocks[0].insns;
+        assert_eq!(insns.len(), 4);
+        assert_eq!(insns[1].func_name.as_deref(), Some("__netf2"));
+        assert_eq!(insns[2].op, Opcode::SetNe);
+        assert_eq!(insns[2].target, Some(PseudoId(2)));
+
+        // x86-64: `_Float128` is binary128, `long double` is x87.
+        let x86 = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&x86);
+        let mut module = libm_module(&types, Opcode::FNeg, types.float128_id, "");
+        call_library_fallbacks(&mut module, &types, &x86);
+        assert_eq!(neg(&module).func_name.as_deref(), Some("__negtf2"));
+        let mut module = libm_module(&types, Opcode::FNeg, types.longdouble_id, "");
+        call_library_fallbacks(&mut module, &types, &x86);
+        assert_eq!(neg(&module).op, Opcode::FNeg);
+
+        // Apple's aarch64 `long double` is `double`.
+        let darwin = Target::new(Arch::Aarch64, Os::MacOS);
+        let types = TypeTable::new(&darwin);
+        let mut module = libm_module(&types, Opcode::FNeg, types.longdouble_id, "");
+        call_library_fallbacks(&mut module, &types, &darwin);
+        assert_eq!(neg(&module).op, Opcode::FNeg);
+    }
+
     // Pass runner tests
 
     #[test]
@@ -2306,57 +2529,90 @@ mod tests {
 
     // Complex mul/div rtlib name tests
 
+    /// The routine each floating complex type's `*` and `/` call, on every
+    /// target: what gcc 13 calls for the same source. `_Float16 _Complex`
+    /// calls the `float` routines, on operands widened to `float`; it used to
+    /// fall through to the `double` ones, on half-precision bits.
     #[test]
-    fn test_complex_mul_name_float() {
-        let target = Target::new(Arch::X86_64, Os::Linux);
-        assert_eq!(complex_mul_name(TypeKind::Float, &target), "__mulsc3");
-    }
-
-    #[test]
-    fn test_complex_mul_name_double() {
-        let target = Target::new(Arch::X86_64, Os::Linux);
-        assert_eq!(complex_mul_name(TypeKind::Double, &target), "__muldc3");
-    }
-
-    #[test]
-    fn test_complex_mul_name_longdouble() {
-        let x86 = Target::new(Arch::X86_64, Os::Linux);
-        assert_eq!(complex_mul_name(TypeKind::LongDouble, &x86), "__mulxc3");
-
-        let arm_linux = Target::new(Arch::Aarch64, Os::Linux);
-        assert_eq!(
-            complex_mul_name(TypeKind::LongDouble, &arm_linux),
-            "__multc3"
-        );
-
-        let arm_macos = Target::new(Arch::Aarch64, Os::MacOS);
-        assert_eq!(
-            complex_mul_name(TypeKind::LongDouble, &arm_macos),
-            "__muldc3"
-        );
-    }
-
-    #[test]
-    fn test_complex_div_name_float() {
-        let target = Target::new(Arch::X86_64, Os::Linux);
-        assert_eq!(complex_div_name(TypeKind::Float, &target), "__divsc3");
-    }
-
-    #[test]
-    fn test_complex_div_name_longdouble() {
-        let x86 = Target::new(Arch::X86_64, Os::Linux);
-        assert_eq!(complex_div_name(TypeKind::LongDouble, &x86), "__divxc3");
-
-        let arm_linux = Target::new(Arch::Aarch64, Os::Linux);
-        assert_eq!(
-            complex_div_name(TypeKind::LongDouble, &arm_linux),
-            "__divtc3"
-        );
-
-        let arm_macos = Target::new(Arch::Aarch64, Os::MacOS);
-        assert_eq!(
-            complex_div_name(TypeKind::LongDouble, &arm_macos),
-            "__divdc3"
-        );
+    fn test_complex_routine_per_type_and_target() {
+        use crate::types::TypeKind as K;
+        // A base type, and its multiply and divide routines.
+        type Row = (K, &'static str, &'static str);
+        let cases: [(Arch, Os, &[Row]); 4] = [
+            (
+                Arch::X86_64,
+                Os::Linux,
+                &[
+                    (K::Float16, "__mulsc3", "__divsc3"),
+                    (K::Float, "__mulsc3", "__divsc3"),
+                    (K::Double, "__muldc3", "__divdc3"),
+                    (K::LongDouble, "__mulxc3", "__divxc3"),
+                    (K::Float128, "__multc3", "__divtc3"),
+                ],
+            ),
+            (
+                Arch::X86_64,
+                Os::MacOS,
+                &[
+                    (K::Float16, "__mulsc3", "__divsc3"),
+                    (K::LongDouble, "__mulxc3", "__divxc3"),
+                ],
+            ),
+            (
+                Arch::Aarch64,
+                Os::Linux,
+                &[
+                    (K::Float16, "__mulsc3", "__divsc3"),
+                    (K::Float, "__mulsc3", "__divsc3"),
+                    (K::Double, "__muldc3", "__divdc3"),
+                    (K::LongDouble, "__multc3", "__divtc3"),
+                ],
+            ),
+            (
+                Arch::Aarch64,
+                Os::MacOS,
+                &[
+                    (K::Float16, "__mulsc3", "__divsc3"),
+                    // Apple arm64: long double is double.
+                    (K::LongDouble, "__muldc3", "__divdc3"),
+                ],
+            ),
+        ];
+        for (arch, os, rows) in cases {
+            let types = TypeTable::new(&Target::new(arch, os));
+            for &(kind, mul, div) in rows {
+                let base = match kind {
+                    K::Float16 => types.float16_id,
+                    K::Float => types.float_id,
+                    K::Double => types.double_id,
+                    K::LongDouble => types.longdouble_id,
+                    _ => types.float128_id,
+                };
+                let (work, routine) = types
+                    .complex_routine_type(base)
+                    .unwrap_or_else(|| panic!("{kind:?} is floating"));
+                assert_eq!(
+                    complex_mul_name(routine),
+                    mul,
+                    "{kind:?} on {arch:?}/{os:?}"
+                );
+                assert_eq!(
+                    complex_div_name(routine),
+                    div,
+                    "{kind:?} on {arch:?}/{os:?}"
+                );
+                // The operands are converted to the routine's own type, which
+                // is the base itself wherever the base has a routine.
+                let want_work = if kind == K::Float16 {
+                    types.float_id
+                } else {
+                    base
+                };
+                assert_eq!(work, want_work, "{kind:?} on {arch:?}/{os:?}");
+            }
+        }
+        // Not a floating type: no routine.
+        let types = TypeTable::new(&Target::new(Arch::X86_64, Os::Linux));
+        assert!(types.complex_routine_type(types.int_id).is_none());
     }
 }

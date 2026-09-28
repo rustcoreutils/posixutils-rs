@@ -15,7 +15,7 @@
 // if the pass forwards one byte it should not have.
 //
 
-use crate::common::{compile_and_run, compile_and_run_two_units};
+use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_two_units, run_c17};
 
 fn at_o2(name: &str, code: &str) -> i32 {
     compile_and_run(name, code, &["-O2".to_string()])
@@ -772,4 +772,136 @@ fn memopt_a_deep_call_chain_still_reaches_its_callee() {
 
     assert_eq!(at_o2("memopt_deep_chain", &code), 0);
     assert_eq!(at_o2_no_inline("memopt_deep_chain_ni", &code), 0);
+}
+
+/// The optimized IR of `src` for `target`, as `--dump-ir post-opt` prints it.
+fn post_opt_ir(prefix: &str, src: &str, target: &str) -> String {
+    let dir = plib::tmp::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("tempdir");
+    let c = dir.path().join("t.c");
+    std::fs::write(&c, src).expect("write source");
+    let r = run_c17(&[
+        "--target",
+        target,
+        "-O2",
+        "-fno-inline",
+        "--dump-ir",
+        "post-opt",
+        "-o",
+        "/dev/null",
+        &c.to_string_lossy(),
+    ]);
+    assert!(r.success, "compile failed: {}", r.stderr);
+    format!("{}{}", r.stdout, r.stderr)
+}
+
+/// A parameter's stack slot is a local like any other: the value stored into
+/// it on entry is the incoming argument, and a load of it through a pointer
+/// is that argument. The store's value is an `Arg`, which no instruction in
+/// the function defines, and asking only the defining instruction for its
+/// width refused every parameter while forwarding the same shape for a local.
+#[test]
+fn memopt_a_parameter_slot_forwards_like_a_local() {
+    // No headers: the aarch64 target's are not on the default search path.
+    let src = r#"
+void *memcpy(void *, const void *, unsigned long);
+unsigned through_ptr(unsigned x) { unsigned *p = &x; return *p + 1; }
+unsigned through_memcpy(unsigned x) { unsigned y; memcpy(&y, &x, 4); return y; }
+double a_double(double d) { double *p = &d; return *p * 2.0; }
+char *a_pointer(char *s) { char **p = &s; return *p; }
+int a_narrow(signed char c) { signed char *p = &c; return *p; }
+"#;
+    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let ir = post_opt_ir("c17_param_fwd_", src, target);
+        assert!(
+            !ir.contains("load"),
+            "{target}: every parameter read should be forwarded:\n{ir}"
+        );
+    }
+}
+
+/// What forwarding a parameter's slot must still decline: an address that
+/// reaches a callee, a pointer that writes the slot, a `volatile` parameter,
+/// the named parameter of a variadic function and a `va_list` parameter,
+/// narrow and reinterpreted reads, promoted identifier-list parameters.
+#[test]
+fn memopt_a_parameter_slot_is_still_an_object() {
+    let code = r#"
+#include <stdarg.h>
+#include <string.h>
+extern void abort(void);
+
+__attribute__((noinline)) void bump(int *p) { *p += 5; }
+int *gp;
+__attribute__((noinline)) void through_global(void) { *gp = 99; }
+
+__attribute__((noinline)) int escapes(int x) { int *p = &x; *p = 3; bump(&x); return *p; }
+__attribute__((noinline)) int via_global(int x) { gp = &x; x = 1; through_global(); return x; }
+__attribute__((noinline)) int written(int x) { int *p = &x; *p = x * 2; return x + *p; }
+__attribute__((noinline)) int is_volatile(volatile int x) {
+    volatile int *p = &x; int a = *p; *p = a + 1; return *p + x;
+}
+__attribute__((noinline)) int variadic(int n, ...) {
+    int *p = &n; va_list ap; va_start(ap, n);
+    int s = va_arg(ap, int); va_end(ap);
+    return *p + s;
+}
+__attribute__((noinline)) int takes_va_list(int k, va_list ap) {
+    int *q = &k; int r = va_arg(ap, int); return *q + r;
+}
+__attribute__((noinline)) int pass_va_list(int k, ...) {
+    va_list ap; va_start(ap, k); int r = takes_va_list(k, ap); va_end(ap); return r;
+}
+__attribute__((noinline)) int reinterpret(signed char c) { return *(unsigned char *)&c; }
+__attribute__((noinline)) int sign(signed char c) { signed char *p = &c; return *p; }
+__attribute__((noinline)) int wide_short(short s) { short *p = &s; return *p; }
+__attribute__((noinline)) unsigned bytes(unsigned x) {
+    unsigned char b[4]; unsigned y;
+    memcpy(b, &x, 4); b[1] ^= 0xff; memcpy(&y, b, 4);
+    return y;
+}
+__attribute__((noinline)) unsigned partial(unsigned x) {
+    unsigned char *p = (unsigned char *)&x; p[1] = 0; return x;
+}
+__attribute__((noinline)) double dbl(double d) { double *p = &d; *p += 0.5; return d; }
+__attribute__((noinline)) long double ldbl(long double d) { long double *p = &d; return *p * 2; }
+__attribute__((noinline)) int kr(c, f) signed char c; float f; { signed char *p = &c; float *q = &f; return *p + (int)*q; }
+__attribute__((noinline)) int *ptr(int *q) { int **r = &q; return *r; }
+
+int main(void) {
+    int z = 7;
+    union { unsigned u; unsigned char b[4]; } e1, e2;
+    e1.u = e2.u = 0x12345678u;
+    e1.b[1] ^= 0xff;
+    e2.b[1] = 0;
+    if (escapes(1) != 8) abort();
+    if (via_global(5) != 99) abort();
+    if (written(4) != 16) abort();
+    if (is_volatile(10) != 22) abort();
+    if (variadic(3, 4) != 7) abort();
+    if (pass_va_list(6, 9) != 15) abort();
+    if (reinterpret(-1) != 255) abort();
+    if (sign(-3) != -3) abort();
+    if (wide_short(-2) != -2) abort();
+    if (bytes(0x12345678u) != e1.u) abort();
+    if (partial(0x12345678u) != e2.u) abort();
+    if (dbl(1.0) != 1.5) abort();
+    if (ldbl(1.25L) != 2.5L) abort();
+    if (kr(-5, 2.5f) != -3) abort();
+    if (ptr(&z) != &z) abort();
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("memopt_param_object", code, &[opt.to_string()]),
+            0,
+            "host at {opt}"
+        );
+        if let Some(rc) = compile_and_run_aarch64("memopt_param_object_a64", code, opt) {
+            assert_eq!(rc, 0, "aarch64 at {opt}");
+        }
+    }
 }

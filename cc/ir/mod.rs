@@ -11,6 +11,7 @@
 // once so that dataflow analysis and the optimization passes stay simple.
 //
 
+mod build;
 mod constfold;
 pub mod constglobal;
 pub mod dce;
@@ -22,6 +23,7 @@ pub mod facts;
 pub mod ifconv;
 pub mod inline;
 pub mod instcombine;
+pub mod libcall_fold;
 pub mod linearize;
 mod linearize_atomic;
 mod linearize_emit;
@@ -31,18 +33,20 @@ pub mod loadfwd;
 pub mod lower;
 pub mod mach_o_dtors;
 pub mod mem2reg;
+pub mod memexpand;
 pub mod memloc;
 pub mod propagate;
 pub mod range;
 pub mod sccp;
 pub mod ssa;
+pub(crate) mod strdata;
 pub mod tls;
 pub mod validate;
 pub mod vrp;
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::diag::Position;
-use crate::float::FloatVal;
+use crate::float::{FloatVal, IntegralRounding};
 use crate::target::Target;
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
@@ -156,6 +160,30 @@ pub enum Opcode {
     Not,  // Bitwise NOT
     Neg,  // Integer negation
     FNeg, // Float negation
+    // Float absolute value, at the width of `typ`: clears the sign bit and
+    // nothing else, so it is exact and raises nothing, even for a NaN.
+    Fabs,
+    // `copysign`: src[0] with the sign bit of src[1], at the width of `typ`.
+    // Only the sign bit changes, taken from a zero or a NaN as from anything
+    // else, so it is exact and raises nothing, and a NaN keeps its payload.
+    CopySign,
+    // Square root of src[0], correctly rounded, at the width of `typ`: what
+    // IEEE 754's squareRoot and every target's instruction compute. Sets no
+    // `errno` -- the linearizer keeps a call for the arguments that must --
+    // and `func_name` names the library function a target without the
+    // instruction calls instead (see `arch::mapping::computes_in_place`).
+    Sqrt,
+    // `floor`, `ceil`, `trunc`, `round`, `rint` or `nearbyint` of src[0], at
+    // the width of `typ`: the integer it rounds to, with its sign. Named in
+    // `func_name` like `Sqrt`.
+    RoundToIntegral(IntegralRounding),
+    // `fmin` and `fmax` of src[0] and src[1], at the width of `typ`: a NaN
+    // operand is ignored for the other. Named in `func_name` like `Sqrt`.
+    FMin,
+    FMax,
+    // `fma`: src[0] * src[1] + src[2], rounded once, at the width of `typ`.
+    // Named in `func_name` like `Sqrt`.
+    Fma,
 
     // Type conversions
     Trunc, // Truncate to smaller integer
@@ -245,10 +273,10 @@ pub enum Opcode {
     Memmove, // memmove(dest, src, n) - copy overlapping memory
 
     // Floating-point builtins
-    Fabs32,    // Absolute value of float
-    Fabs64,    // Absolute value of double
-    Signbit32, // Test sign bit of float (returns int)
-    Signbit64, // Test sign bit of double (returns int)
+    // `signbit`: whether the sign bit of the operand is set, as 0 or 1 --
+    // for `-0.0` and a NaN too. Shaped like a conversion: `typ`/`size` are
+    // the `int` result, `src_typ`/`src_size` the floating operand.
+    Signbit,
 
     // Optimization hints
     Unreachable, // Code path is never reached (undefined behavior if reached)
@@ -343,6 +371,15 @@ impl Opcode {
                 | Opcode::AtomicFetchAnd
                 | Opcode::AtomicFetchOr
                 | Opcode::AtomicFetchXor
+        )
+    }
+
+    /// Whether this opcode computes a libm function, which its instruction
+    /// names in `func_name` for a target that calls the function instead.
+    pub fn is_libm(&self) -> bool {
+        matches!(
+            self,
+            Opcode::Sqrt | Opcode::RoundToIntegral(_) | Opcode::FMin | Opcode::FMax | Opcode::Fma
         )
     }
 
@@ -451,6 +488,20 @@ impl Opcode {
             Opcode::Not => "not",
             Opcode::Neg => "neg",
             Opcode::FNeg => "fneg",
+            Opcode::Fabs => "fabs",
+            Opcode::CopySign => "copysign",
+            Opcode::Sqrt => "sqrt",
+            Opcode::FMin => "fmin",
+            Opcode::FMax => "fmax",
+            Opcode::Fma => "fma",
+            Opcode::RoundToIntegral(how) => match how {
+                IntegralRounding::Floor => "ffloor",
+                IntegralRounding::Ceil => "fceil",
+                IntegralRounding::Trunc => "ftrunc",
+                IntegralRounding::Round => "fround",
+                IntegralRounding::Rint => "frint",
+                IntegralRounding::NearbyInt => "fnearbyint",
+            },
             Opcode::Trunc => "trunc",
             Opcode::Zext => "zext",
             Opcode::Sext => "sext",
@@ -491,10 +542,7 @@ impl Opcode {
             Opcode::Memset => "memset",
             Opcode::Memcpy => "memcpy",
             Opcode::Memmove => "memmove",
-            Opcode::Fabs32 => "fabs32",
-            Opcode::Fabs64 => "fabs64",
-            Opcode::Signbit32 => "signbit32",
-            Opcode::Signbit64 => "signbit64",
+            Opcode::Signbit => "signbit",
             Opcode::Unreachable => "unreachable",
             Opcode::FrameAddress => "frame_address",
             Opcode::ReturnAddress => "return_address",
@@ -909,6 +957,10 @@ pub struct Instruction {
     /// module or is only ever the external library function. See
     /// [`Instruction::local_callee`], which is how a pass should ask.
     pub callee_binding: crate::parse::ast::CalleeBinding,
+    /// For calls: the library function called, when the program's name for
+    /// it still means that function (see [`crate::parse::ast::LibFn`]).
+    /// What `ir::libcall_fold` folds, and nothing else reads.
+    pub known: Option<crate::parse::ast::LibFn>,
     /// For indirect calls: pseudo containing the function pointer address.
     /// When this is Some, the call is indirect (call through function pointer).
     pub indirect_target: Option<PseudoId>,
@@ -945,6 +997,7 @@ impl Default for Instruction {
             ends_with_va_arg_pack: false,
             is_noreturn_call: false,
             callee_binding: crate::parse::ast::CalleeBinding::Declared,
+            known: None,
             indirect_target: None,
             pos: None,
             asm_data: None,
@@ -1039,8 +1092,9 @@ impl Instruction {
     }
 
     /// The C library function an opcode the backends lower to a call
-    /// (`Memcpy`, `Memset`, `Memmove`, `Fabs32`/`Fabs64`, `Setjmp`,
-    /// `Longjmp`) calls, by its assembler name.
+    /// (`Memcpy`, `Memset`, `Memmove`, `Setjmp`, `Longjmp`) calls, or a libm
+    /// opcode (`Sqrt`) calls on a target without the instruction, by its
+    /// assembler name.
     ///
     /// The linearizer resolved it through the program's own declarations
     /// (`Linearizer::library_function_name`), so an asm-label rename of
@@ -2159,6 +2213,44 @@ impl Function {
         by_arg
     }
 
+    /// The hidden struct-return pointer, if this function has one.
+    ///
+    /// The linearizer emits it as `Arg(0)` under the literal name `__sret`,
+    /// which shifts every declared parameter one `Arg` along.
+    pub fn sret_arg(&self) -> Option<PseudoId> {
+        self.pseudos
+            .iter()
+            .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"))
+            .map(|p| p.id)
+    }
+
+    /// The type the caller passes for the parameter an `Arg(arg)` pseudo
+    /// carries, or `None` for the hidden sret pointer, which is no declared
+    /// parameter.
+    ///
+    /// `params[arg]` is the answer only without an sret pointer; with one,
+    /// every parameter is one `Arg` further along. Indexing the list directly
+    /// took the *next* parameter's type for each of them.
+    pub fn param_type_of_arg(&self, arg: u32) -> Option<TypeId> {
+        let i = arg.checked_sub(u32::from(self.sret_arg().is_some()))?;
+        self.params.get(i as usize).map(|(_, typ)| *typ)
+    }
+
+    /// The type of the value an `Arg` pseudo holds, when it holds one.
+    ///
+    /// A scalar parameter arrives as its value, at the width of the type it
+    /// is passed as, and that is what the entry block stores into its slot.
+    /// An aggregate, a complex number or a `va_list` may arrive as an address
+    /// or as the storage itself, so its `Arg` is no value of its declared
+    /// type and this answers `None` for it.
+    pub fn arg_value_type(&self, id: PseudoId, types: &TypeTable) -> Option<TypeId> {
+        let Some(PseudoKind::Arg(n)) = self.get_pseudo(id).map(|p| &p.kind) else {
+            return None;
+        };
+        self.param_type_of_arg(*n)
+            .filter(|&t| types.is_scalar(t) && !types.is_complex(t))
+    }
+
     /// Allocate a new pseudo ID
     /// Returns a unique ID and increments the counter
     pub fn alloc_pseudo(&mut self) -> PseudoId {
@@ -2331,11 +2423,10 @@ pub enum Initializer {
     Float128(FloatVal),
     /// String literal initializer (for char arrays)
     String(String),
-    /// Wide string literal initializer (for wchar_t arrays)
-    WideString(String),
     /// A `u"..."` initializer: char16_t code units.
     Utf16String(Vec<u16>),
-    /// A `U"..."` initializer: char32_t code points.
+    /// A `U"..."` or `L"..."` initializer: 4-byte code units, which is what
+    /// both `char32_t` and `wchar_t` are on every target.
     Utf32String(Vec<u32>),
     /// Array initializer: element size in bytes, list of (offset, initializer) pairs
     /// Elements not listed are zero-initialized
@@ -2372,7 +2463,6 @@ impl Initializer {
             // A zero-length string is all-zero; a non-empty char array initialized
             // by a string literal is zero iff every byte is `\0`.
             Initializer::String(s) => s.chars().all(|c| c == '\0'),
-            Initializer::WideString(s) => s.chars().all(|c| c == '\0'),
             Initializer::Utf16String(u) => u.iter().all(|&c| c == 0),
             Initializer::Utf32String(u) => u.iter().all(|&c| c == 0),
             Initializer::Array { elements, .. } => {
@@ -2405,7 +2495,6 @@ impl Initializer {
             | Initializer::Int(_)
             | Initializer::Float(_)
             | Initializer::String(_)
-            | Initializer::WideString(_)
             | Initializer::Utf16String(_)
             | Initializer::Utf32String(_) => false,
         }
@@ -2419,7 +2508,6 @@ impl fmt::Display for Initializer {
             Initializer::Int(v) => write!(f, "{}", v),
             Initializer::Float(v) | Initializer::Float128(v) => write!(f, "{}", v),
             Initializer::String(s) => write!(f, "\"{}\"", s.escape_default()),
-            Initializer::WideString(s) => write!(f, "L\"{}\"", s.escape_default()),
             Initializer::Utf16String(u) => write!(f, "u\"<{} units>\"", u.len()),
             Initializer::Utf32String(u) => write!(f, "U\"<{} units>\"", u.len()),
             Initializer::Array {
@@ -2569,11 +2657,10 @@ pub struct Module {
     pub globals: Vec<GlobalDef>,
     /// String literals (label, content)
     pub strings: Vec<(String, String)>,
-    /// Wide string literals (label, content)
-    pub wide_strings: Vec<(String, String)>,
     /// `u"..."` literals referenced by address, as char16_t code units.
     pub utf16_strings: Vec<(String, Vec<u16>)>,
-    /// `U"..."` literals referenced by address, as char32_t code points.
+    /// `U"..."` and `L"..."` literals referenced by address, as 4-byte code
+    /// units.
     pub utf32_strings: Vec<(String, Vec<u32>)>,
     /// Generate debug info
     pub debug: bool,
@@ -2613,6 +2700,23 @@ pub struct Module {
     pub comp_dir: Option<String>,
     /// Primary source filename (for DW_AT_name in DWARF)
     pub source_name: Option<String>,
+    /// The assembler name of each function in [`FOLD_CALLEES`], as this
+    /// unit's declarations spell it (`Linearizer::library_function_name`):
+    /// a call an optimizer pass makes to `strchr` in place of the program's
+    /// `strstr` is still a call to `strchr`, asm label and all.
+    pub library_symbols: HashMap<&'static str, String>,
+}
+
+/// The C library functions an optimizer pass may call where the program
+/// called something else -- `strstr(s, "c")` becomes `strchr(s, 'c')` --
+/// by their C names.
+pub const FOLD_CALLEES: &[&str] = &[
+    "strlen", "strchr", "strcpy", "memcpy", "memset", "puts", "putchar", "fputs", "fputc", "fwrite",
+];
+
+/// The label of the `index`th string literal in [`Module::strings`].
+pub(crate) fn string_label(index: usize) -> String {
+    format!(".LC{index}")
 }
 
 impl Module {
@@ -2759,15 +2863,8 @@ impl Module {
         if let Some((label, _)) = self.strings.iter().find(|(_, c)| *c == content) {
             return label.clone();
         }
-        let label = format!(".LC{}", self.strings.len());
+        let label = string_label(self.strings.len());
         self.strings.push((label.clone(), content));
-        label
-    }
-
-    /// Add a wide string literal and return its label
-    pub fn add_wide_string(&mut self, content: String) -> String {
-        let label = format!(".LWC{}", self.wide_strings.len());
-        self.wide_strings.push((label.clone(), content));
         label
     }
 
@@ -2778,7 +2875,7 @@ impl Module {
         label
     }
 
-    /// Intern a `U"..."` literal and return its label.
+    /// Intern a `U"..."` or `L"..."` literal and return its label.
     pub fn add_utf32_string(&mut self, units: Vec<u32>) -> String {
         let label = format!(".LU32C{}", self.utf32_strings.len());
         self.utf32_strings.push((label.clone(), units));
@@ -3160,11 +3257,60 @@ mod tests {
     }
 
     #[test]
-    fn test_fabs_opcodes() {
-        assert_eq!(Opcode::Fabs32.name(), "fabs32");
-        assert_eq!(Opcode::Fabs64.name(), "fabs64");
-        assert!(!Opcode::Fabs32.is_terminator());
-        assert!(!Opcode::Fabs64.is_terminator());
+    fn test_fabs_opcode() {
+        assert_eq!(Opcode::Fabs.name(), "fabs");
+        assert!(!Opcode::Fabs.is_terminator());
+    }
+
+    #[test]
+    fn test_sign_opcodes() {
+        assert_eq!(Opcode::Signbit.name(), "signbit");
+        assert_eq!(Opcode::CopySign.name(), "copysign");
+        assert!(!Opcode::Signbit.is_terminator());
+        assert!(!Opcode::CopySign.is_terminator());
+    }
+
+    /// `Sqrt` is an ordinary value: no terminator, and nothing but its result.
+    #[test]
+    fn test_sqrt_opcode() {
+        assert_eq!(Opcode::Sqrt.name(), "sqrt");
+        assert!(!Opcode::Sqrt.is_terminator());
+        assert!(!Opcode::Sqrt.has_side_effects());
+        assert!(Opcode::Sqrt.is_libm());
+        assert!(!Opcode::Fabs.is_libm() && !Opcode::Call.is_libm());
+    }
+
+    /// One opcode per rounding, each named apart from the others and from
+    /// the integer `trunc`.
+    #[test]
+    fn test_round_to_integral_opcodes() {
+        use IntegralRounding::*;
+        let names: Vec<&str> = [Floor, Ceil, Trunc, Round, Rint, NearbyInt]
+            .into_iter()
+            .map(|how| {
+                let op = Opcode::RoundToIntegral(how);
+                assert!(op.is_libm() && !op.is_terminator() && !op.has_side_effects());
+                op.name()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["ffloor", "fceil", "ftrunc", "fround", "frint", "fnearbyint"]
+        );
+        assert_ne!(Opcode::RoundToIntegral(Trunc).name(), Opcode::Trunc.name());
+    }
+
+    /// `fmin`, `fmax` and `fma` are libm opcodes like the rest.
+    #[test]
+    fn test_min_max_fma_opcodes() {
+        for (op, name) in [
+            (Opcode::FMin, "fmin"),
+            (Opcode::FMax, "fmax"),
+            (Opcode::Fma, "fma"),
+        ] {
+            assert_eq!(op.name(), name);
+            assert!(op.is_libm() && !op.is_terminator() && !op.has_side_effects());
+        }
     }
 
     #[test]
@@ -3312,6 +3458,36 @@ mod tests {
         func.add_pseudo(reg);
         assert_eq!(func.sym_name_of(reg_id), None);
         assert_eq!(func.sym_name_of(PseudoId(9999)), None);
+    }
+
+    /// An `Arg` holds a value of its parameter's type only for a scalar, and
+    /// the hidden sret pointer shifts which parameter each `Arg` is.
+    #[test]
+    fn test_arg_value_type() {
+        let types = TypeTable::new(&Target::host());
+        for sret in [false, true] {
+            let mut f = Function::new("f", types.void_id);
+            let off = u32::from(sret);
+            if sret {
+                f.add_pseudo(Pseudo::arg(PseudoId(9), 0).with_name("__sret"));
+            }
+            let params = [
+                types.char_id,
+                types.complex_double_id,
+                types.pointer_to(types.int_id),
+            ];
+            for (i, t) in params.iter().enumerate() {
+                f.add_param(format!("p{i}"), *t);
+                f.add_pseudo(Pseudo::arg(PseudoId(i as u32), i as u32 + off));
+            }
+            assert_eq!(f.sret_arg().is_some(), sret);
+            assert_eq!(f.arg_value_type(PseudoId(0), &types), Some(types.char_id));
+            assert_eq!(f.arg_value_type(PseudoId(1), &types), None, "complex");
+            assert_eq!(f.arg_value_type(PseudoId(2), &types), Some(params[2]));
+            if sret {
+                assert_eq!(f.arg_value_type(PseudoId(9), &types), None, "sret");
+            }
+        }
     }
 
     #[test]

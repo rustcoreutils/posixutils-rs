@@ -25,15 +25,14 @@
 //
 
 use super::constfold::{
-    at_width, cmp_operand_width, eval_binop, eval_fbinop, eval_fcvt, eval_fcvtf, eval_funop,
-    eval_unop, fcmp_mask, fcmp_outcome, get_cmp_info, mirror_mask, result_type_of, CMP_GT, CMP_LT,
-    CMP_UN, FCMP_ALL,
+    at_width, cmp_operand_width, eval_binop, eval_fbinop, eval_fcvt, eval_fcvtf, eval_fternop,
+    eval_funop, eval_unop, fcmp_decided, fcmp_mask, fcmp_outcome, get_cmp_info, mirror_mask,
+    possible_against, result_type_of, FCMP_ALL,
 };
 use super::facts::{CmpDomain, CmpFacts, ConstMap, Relation};
 use super::{ConstValue, Function, Instruction, Opcode, PseudoId};
 use crate::float::FloatVal;
 use crate::types::{TypeId, TypeTable};
-use std::cmp::Ordering;
 use std::collections::HashSet;
 
 // Constant Resolution
@@ -47,7 +46,8 @@ struct Facts<'a> {
     /// same as non-negative, and is deliberately the weaker fact: `fabs` of
     /// a NaN is a NaN, and a NaN is not less than zero either, because an
     /// unordered comparison is false. Stating it this way is what makes the
-    /// rule below correct without a NaN test.
+    /// rule below correct without a NaN test. `sqrt` gives the same fact: its
+    /// root of `-0` is `-0`, and of any other negative number a NaN.
     never_lt_zero: HashSet<PseudoId>,
     types: &'a TypeTable,
 }
@@ -57,7 +57,7 @@ impl<'a> Facts<'a> {
         let mut never_lt_zero = HashSet::new();
         for bb in &func.blocks {
             for insn in &bb.insns {
-                if matches!(insn.op, Opcode::Fabs32 | Opcode::Fabs64) {
+                if matches!(insn.op, Opcode::Fabs | Opcode::Sqrt) {
                     if let Some(target) = insn.target {
                         never_lt_zero.insert(target);
                     }
@@ -221,10 +221,17 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
         Opcode::Select => simplify_select(insn, consts, facts),
 
         // Floating point
-        Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv => {
-            simplify_fbinop(insn, consts, facts)
+        Opcode::FAdd
+        | Opcode::FSub
+        | Opcode::FMul
+        | Opcode::FDiv
+        | Opcode::CopySign
+        | Opcode::FMin
+        | Opcode::FMax => simplify_fbinop(insn, consts, facts),
+        Opcode::Fma => simplify_fternop(insn, consts, facts),
+        Opcode::FNeg | Opcode::Fabs | Opcode::Sqrt | Opcode::RoundToIntegral(_) => {
+            simplify_funop(insn, consts, facts)
         }
-        Opcode::FNeg => simplify_funop(insn, consts, facts),
         Opcode::FCvtF => simplify_fcvtf(insn, consts, facts),
         Opcode::FCmpOEq
         | Opcode::FCmpONe
@@ -232,11 +239,13 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
         | Opcode::FCmpOLe
         | Opcode::FCmpOGt
         | Opcode::FCmpOGe => simplify_fcmp(insn, consts, facts),
-        Opcode::FCvtS | Opcode::FCvtU => simplify_fcvt(insn, consts, facts),
+        Opcode::FCvtS | Opcode::FCvtU | Opcode::Signbit => simplify_fcvt(insn, consts, facts),
 
         // Unary
         Opcode::Neg => simplify_neg(insn, consts),
-        Opcode::Not => simplify_not(insn, consts),
+        Opcode::Not | Opcode::Popcount32 | Opcode::Popcount64 => {
+            simplify_unary_of_const(insn, consts)
+        }
         Opcode::Sext | Opcode::Zext | Opcode::Trunc => simplify_convert(insn, consts),
 
         _ => Simplification::None,
@@ -710,13 +719,10 @@ fn simplify_fcmp(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simpli
     let Some(mask) = fcmp_mask(insn.op) else {
         return Simplification::None;
     };
-    let possible = possible_fcmp_outcomes(insn, consts, facts);
-    if possible & mask == 0 {
-        fold_to_zero()
-    } else if possible & !mask & FCMP_ALL == 0 {
-        fold_to_const(1)
-    } else {
-        Simplification::None
+    match fcmp_decided(mask, possible_fcmp_outcomes(insn, consts, facts)) {
+        Some(false) => fold_to_zero(),
+        Some(true) => fold_to_const(1),
+        None => Simplification::None,
     }
 }
 
@@ -746,27 +752,6 @@ fn possible_fcmp_outcomes(insn: &Instruction, consts: &ConstMap, facts: &Facts) 
     }
 }
 
-/// The outcomes of `x` compared with the constant `c`, for an unknown `x`
-/// that may be told never to be below zero.
-///
-/// Nothing is greater than `+Inf`, nothing is less than `-Inf`, and nothing
-/// is ordered with a NaN -- including a NaN `x`, which is why an infinity
-/// still leaves *unordered* possible. A NaN `x` also leaves `never_below`
-/// true, since it is not less than zero either.
-fn possible_against(c: FloatVal, never_below: bool) -> u8 {
-    let inf = FloatVal::infinity(false);
-    let mut possible = match (c.cmp_value(inf), c.cmp_value(inf.negated())) {
-        (None, _) => return CMP_UN,
-        (Some(Ordering::Equal), _) => FCMP_ALL & !CMP_GT,
-        (_, Some(Ordering::Equal)) => FCMP_ALL & !CMP_LT,
-        _ => FCMP_ALL,
-    };
-    if never_below && c.cmp_value(FloatVal::from_f64(0.0)) != Some(Ordering::Greater) {
-        possible &= !CMP_LT;
-    }
-    possible
-}
-
 /// Fold float arithmetic over two constants.
 fn simplify_fbinop(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
     if insn.src.len() != 2 {
@@ -783,6 +768,25 @@ fn simplify_fbinop(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simp
         return Simplification::None;
     };
     match eval_fbinop(insn.op, fmt, a, b) {
+        Some(v) => Simplification::FoldToFloat(v),
+        None => Simplification::None,
+    }
+}
+
+/// Fold `Fma` of three constants.
+fn simplify_fternop(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+    let width = insn.size.max(1);
+    let (Some(fmt), [a, b, c]) = (facts.fp_format(insn.typ), insn.src.as_slice()) else {
+        return Simplification::None;
+    };
+    let (Some(a), Some(b), Some(c)) = (
+        consts.fget(*a, width),
+        consts.fget(*b, width),
+        consts.fget(*c, width),
+    ) else {
+        return Simplification::None;
+    };
+    match eval_fternop(insn.op, fmt, a, b, c) {
         Some(v) => Simplification::FoldToFloat(v),
         None => Simplification::None,
     }
@@ -832,7 +836,8 @@ fn simplify_fcvtf(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simpl
     }
 }
 
-/// Fold a float-to-integer conversion of a constant.
+/// Fold a float-to-integer conversion of a constant, or a `Signbit` of one,
+/// which has the same shape.
 ///
 /// The source format comes from `src_typ`, not `typ`: a conversion's `typ` is
 /// the integer it produces, and the width it reads is the separate `src_size`.
@@ -869,7 +874,9 @@ fn simplify_neg(insn: &Instruction, consts: &ConstMap) -> Simplification {
     }
 }
 
-fn simplify_not(insn: &Instruction, consts: &ConstMap) -> Simplification {
+/// Fold a unary operation with no algebraic identities -- `~x`, a
+/// population count -- when its operand is a known constant.
+fn simplify_unary_of_const(insn: &Instruction, consts: &ConstMap) -> Simplification {
     if insn.src.len() != 1 {
         return Simplification::None;
     }
@@ -884,6 +891,7 @@ fn simplify_not(insn: &Instruction, consts: &ConstMap) -> Simplification {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::float::{FpFormat, NanKind};
     use crate::ir::{BasicBlock, BasicBlockId, Pseudo, PseudoKind};
     use crate::target::Target;
     use crate::types::TypeTable;
@@ -1551,6 +1559,40 @@ mod tests {
 
         let new_const = func.get_pseudo(result_insn.src[0]).unwrap();
         assert_eq!(new_const.kind, PseudoKind::Val(-1));
+    }
+
+    /// A population count of a constant folds to the count of the operand at
+    /// the width the opcode names, and the copy that replaces it is an `int`
+    /// -- not the 64-bit operand width `popcount64` records in `size`.
+    #[test]
+    fn test_const_fold_popcount() {
+        let types = TypeTable::new(&Target::host());
+        for (op, operand, count) in [
+            (Opcode::Popcount64, 0xF0F0_F0F0_F0F0_F0F0_i128, 32),
+            (Opcode::Popcount64, -1, 64),
+            // Bits above the operand width are not counted.
+            (Opcode::Popcount32, (1 << 40) | 7, 3),
+            (Opcode::Popcount32, 0, 0),
+        ] {
+            let size = if op == Opcode::Popcount64 { 64 } else { 32 };
+            let insn = Instruction::new(op)
+                .with_target(PseudoId(1))
+                .with_src(PseudoId(0))
+                .with_size(size)
+                .with_type(types.int_id);
+            let pseudos = vec![
+                Pseudo::val(PseudoId(0), operand),
+                Pseudo::reg(PseudoId(1), 1),
+            ];
+            let mut func = make_test_func_with_insn(insn, pseudos);
+
+            assert!(run(&mut func, &host_types()), "{op:?} of {operand:#x}");
+            let result_insn = &func.blocks[0].insns[1];
+            assert_eq!(result_insn.op, Opcode::Copy);
+            assert_eq!(result_insn.typ, Some(types.int_id));
+            assert_eq!(result_insn.size, 32, "the count is an int");
+            assert_eq!(func.const_val(result_insn.src[0]), Some(count));
+        }
     }
 
     /// Several instructions in one block, for chains that need more than a
@@ -2425,10 +2467,17 @@ mod tests {
     }
 
     /// `fabs(x) < 0.0` is false for every `x`, a NaN included, because an
-    /// unordered `<` is false as well. The value itself is unknown.
+    /// unordered `<` is false as well. The value itself is unknown. So is
+    /// `sqrt(x) < 0.0`: the root of `-0` is `-0`, which is not below zero,
+    /// and of anything else below zero a NaN.
     #[test]
     fn fabs_is_never_below_zero() {
-        for (op, fabs_first) in [(Opcode::FCmpOLt, true), (Opcode::FCmpOGt, false)] {
+        for (unary, op, fabs_first) in [
+            (Opcode::Fabs, Opcode::FCmpOLt, true),
+            (Opcode::Fabs, Opcode::FCmpOGt, false),
+            (Opcode::Sqrt, Opcode::FCmpOLt, true),
+            (Opcode::Sqrt, Opcode::FCmpOGt, false),
+        ] {
             let types = TypeTable::new(&Target::host());
             let (l, r) = if fabs_first {
                 (PseudoId(1), PseudoId(2))
@@ -2437,7 +2486,7 @@ mod tests {
             };
             let mut func = make_test_func_with_insns(
                 vec![
-                    Instruction::new(Opcode::Fabs64)
+                    Instruction::new(unary)
                         .with_target(PseudoId(1))
                         .with_src(PseudoId(0))
                         .with_type_and_size(types.double_id, 64),
@@ -2465,7 +2514,7 @@ mod tests {
             let types = TypeTable::new(&Target::host());
             let mut func = make_test_func_with_insns(
                 vec![
-                    Instruction::new(Opcode::Fabs64)
+                    Instruction::new(Opcode::Fabs)
                         .with_target(PseudoId(1))
                         .with_src(PseudoId(0))
                         .with_type_and_size(types.double_id, 64),
@@ -2885,22 +2934,113 @@ mod tests {
         assert_eq!(fold_fcvt(Opcode::FCvtS, 3e9, 64), Some(3_000_000_000));
     }
 
+    /// `Signbit` of a constant folds to 0 or 1 for every operand, a zero and
+    /// a NaN included, and the copy is the `int` in `typ`/`size` -- not the
+    /// `double` operand in `src_typ`/`src_size`.
+    #[test]
+    fn signbit_of_a_constant_folds() {
+        let nan = f64::from_bits(0x7ff8_0000_0000_1234);
+        for (v, want) in [
+            (-1.5, 1),
+            (1.5, 0),
+            (-0.0, 1),
+            (0.0, 0),
+            (f64::NEG_INFINITY, 1),
+            (nan, 0),
+            (-nan, 1),
+        ] {
+            assert_eq!(fold_fcvt(Opcode::Signbit, v, 32), Some(want), "{v}");
+        }
+        let types = TypeTable::new(&Target::host());
+        let mut insn = Instruction::new(Opcode::Signbit)
+            .with_target(PseudoId(1))
+            .with_src(PseudoId(0))
+            .with_type_and_size(types.int_id, 32);
+        insn.src_typ = Some(types.double_id);
+        insn.src_size = 64;
+        let mut func =
+            make_test_func_with_insns(vec![insn], vec![fval(0, -2.0), Pseudo::reg(PseudoId(1), 1)]);
+        assert!(run(&mut func, &host_types()));
+        let got = insn_at(&func, 0);
+        assert_eq!(got.op, Opcode::Copy);
+        assert_eq!((got.typ, got.size), (Some(types.int_id), 32));
+    }
+
+    /// `CopySign` of constants folds at every width and for every pair: the
+    /// sign of a zero, an infinity or a NaN is taken, and a NaN in the first
+    /// operand keeps its payload.
+    #[test]
+    fn copysign_of_constants_folds() {
+        let types = TypeTable::new(&Target::host());
+        let widths = [
+            (types.float_id, 32),
+            (types.double_id, 64),
+            (types.longdouble_id, types.size_bits(types.longdouble_id)),
+        ];
+        let nan = f64::from_bits(0x7ff8_0000_0000_1234);
+        for (typ, size) in widths {
+            for (x, y, want) in [
+                (1.5, -0.0, -1.5),
+                (-1.5, 0.0, 1.5),
+                (2.0, -nan, -2.0),
+                (-2.0, nan, 2.0),
+                (f64::INFINITY, -1.0, f64::NEG_INFINITY),
+                (-3.0, f64::INFINITY, 3.0),
+            ] {
+                let got = fold_float(Opcode::CopySign, typ, size, &[x, y]);
+                assert_eq!(
+                    got.map(|(v, sz)| (v.to_f64(), sz)),
+                    Some((want, size)),
+                    "copysign({x}, {y}) at {size}"
+                );
+            }
+            let zero = fold_float(Opcode::CopySign, typ, size, &[0.0, -1.0]).map(|(v, _)| v);
+            assert!(
+                zero.is_some_and(|v| v.is_zero() && v.sign_bit()),
+                "-0.0 at {size}"
+            );
+        }
+        let got = fold_float(Opcode::CopySign, types.double_id, 64, &[nan, -1.0]);
+        let (neg, exp, sig) = FloatVal::from_f64(nan).key();
+        assert!(!neg);
+        assert_eq!(
+            got.map(|(v, _)| v.key()),
+            Some((true, exp, sig)),
+            "only the sign bit of a NaN changes"
+        );
+    }
+
     /// One float binary/unary op over constants; returns the folded value
     /// and the `SetVal` the instruction became.
     fn fold_float(op: Opcode, typ: TypeId, size: u32, args: &[f64]) -> Option<(FloatVal, u32)> {
+        let args: Vec<FloatVal> = args.iter().map(|v| FloatVal::from_f64(*v)).collect();
+        fold_float_vals(op, typ, size, &args)
+    }
+
+    /// [`fold_float`] over exact constants, for a value an `f64` cannot
+    /// spell: a `float` or `long double` NaN with a payload.
+    fn fold_float_vals(
+        op: Opcode,
+        typ: TypeId,
+        size: u32,
+        args: &[FloatVal],
+    ) -> Option<(FloatVal, u32)> {
         let target = PseudoId(args.len() as u32);
         let mut pseudos: Vec<Pseudo> = args
             .iter()
             .enumerate()
-            .map(|(i, v)| fval(i as u32, *v))
+            .map(|(i, v)| Pseudo::fval(PseudoId(i as u32), *v))
             .collect();
         pseudos.push(Pseudo::reg(target, target.0));
         let insn = match args.len() {
-            1 => Instruction::new(op)
-                .with_target(target)
-                .with_src(PseudoId(0))
-                .with_type_and_size(typ, size),
-            _ => Instruction::binop(op, target, PseudoId(0), PseudoId(1), typ, size),
+            2 => Instruction::binop(op, target, PseudoId(0), PseudoId(1), typ, size),
+            n => {
+                let mut insn = Instruction::new(op)
+                    .with_target(target)
+                    .with_type_and_size(typ, size);
+                insn.src = (0..n as u32).map(PseudoId).collect();
+                insn
+            }
         };
         let mut func = make_test_func_with_insns(vec![insn], pseudos);
         run(&mut func, &host_types());
@@ -2981,6 +3121,194 @@ mod tests {
         assert!(fold_float(Opcode::FNeg, d, 64, &[f64::INFINITY]).is_some());
     }
 
+    /// `Fabs` of a constant folds at every width and for every operand: it
+    /// clears the sign and nothing else, so `-0.0` becomes `+0.0`, an
+    /// infinity folds, and a NaN keeps its payload.
+    #[test]
+    fn sqrt_of_a_constant_folds_where_the_answer_is_its_own() {
+        let types = host_types();
+        let widths = [
+            (types.float_id, 32),
+            (types.double_id, 64),
+            (types.longdouble_id, types.size_bits(types.longdouble_id)),
+        ];
+        for (typ, size) in widths {
+            for (arg, want) in [(4.0, 2.0), (0.25, 0.5), (f64::INFINITY, f64::INFINITY)] {
+                let got = fold_float(Opcode::Sqrt, typ, size, &[arg]);
+                assert_eq!(got.map(|(v, sz)| (v.to_f64(), sz)), Some((want, size)));
+            }
+            let zero = fold_float(Opcode::Sqrt, typ, size, &[-0.0]).map(|(v, _)| v);
+            assert!(
+                zero.is_some_and(|v| v.is_zero() && v.sign_bit()),
+                "-0 at {size}"
+            );
+            // A domain error's NaN is the target's own, and not folded.
+            assert!(fold_float(Opcode::Sqrt, typ, size, &[-1.0]).is_none());
+        }
+        // Rounded at the operand's format: the float root of 2 is not the
+        // double one.
+        let got = fold_float(Opcode::Sqrt, types.float_id, 32, &[2.0]).map(|(v, _)| v);
+        assert_eq!(
+            got.map(|v| v.to_bits(FpFormat::Binary32)),
+            Some(0x3fb5_04f3)
+        );
+        let got = fold_float(Opcode::Sqrt, types.double_id, 64, &[2.0]).map(|(v, _)| v);
+        assert_eq!(got.map(|v| v.to_f64()), Some(2f64.sqrt()));
+    }
+
+    /// The roundings of a constant fold at the operand's format, keeping the
+    /// sign of a zero result; `rint` and `nearbyint` only where the answer
+    /// is the same in every rounding direction.
+    #[test]
+    fn rounding_a_constant_folds_where_the_direction_cannot_matter() {
+        use crate::float::IntegralRounding::*;
+        let types = host_types();
+        for (typ, size) in [(types.float_id, 32), (types.double_id, 64)] {
+            let fold = |how, arg: f64| {
+                fold_float(Opcode::RoundToIntegral(how), typ, size, &[arg]).map(|(v, _)| v)
+            };
+            for (how, arg, want) in [
+                (Floor, -0.5, -1.0),
+                (Ceil, 2.25, 3.0),
+                (Trunc, -2.75, -2.0),
+                (Round, 2.5, 3.0),
+                (Round, -0.5, -1.0),
+                (Rint, 4.0, 4.0),
+                (NearbyInt, -8.0, -8.0),
+            ] {
+                assert_eq!(
+                    fold(how, arg).map(|v| v.to_f64()),
+                    Some(want),
+                    "{how:?}({arg})"
+                );
+            }
+            let zero = fold(Ceil, -0.5).unwrap();
+            assert!(
+                zero.is_zero() && zero.sign_bit(),
+                "ceil(-0.5) is -0 at {size}"
+            );
+            assert!(fold(Rint, 2.5).is_none(), "rint(2.5) is the direction's");
+            assert!(fold(NearbyInt, -0.25).is_none());
+        }
+    }
+
+    /// `fmin` and `fmax` of constants fold -- a quiet NaN operand to the
+    /// other, the zeros to -0 and +0 -- and `fma` rounds once.
+    #[test]
+    fn min_max_and_fma_of_constants_fold() {
+        let types = host_types();
+        let d = types.double_id;
+        let val = |op, args: &[f64]| fold_float(op, d, 64, args).map(|(v, _)| v.to_f64().to_bits());
+        assert_eq!(val(Opcode::FMin, &[1.0, 2.0]), Some(1f64.to_bits()));
+        assert_eq!(val(Opcode::FMax, &[1.0, 2.0]), Some(2f64.to_bits()));
+        assert_eq!(val(Opcode::FMin, &[f64::NAN, 3.0]), Some(3f64.to_bits()));
+        assert_eq!(val(Opcode::FMin, &[0.0, -0.0]), Some(1 << 63));
+        assert_eq!(val(Opcode::FMax, &[-0.0, 0.0]), Some(0));
+        let (a, b) = (1.0 + f64::EPSILON, 1.0 - f64::EPSILON / 2.0);
+        assert_eq!(
+            val(Opcode::Fma, &[a, b, -1.0]),
+            Some(a.mul_add(b, -1.0).to_bits())
+        );
+        assert_ne!(
+            a.mul_add(b, -1.0),
+            a * b - 1.0,
+            "the case needs one rounding"
+        );
+        assert_eq!(val(Opcode::Fma, &[1.0, 1.0, f64::INFINITY]), None);
+        let got = fold_float(Opcode::Fma, types.float_id, 32, &[2.0, 3.0, 4.0]);
+        assert_eq!(got.map(|(v, _)| v.to_f64()), Some(10.0));
+    }
+
+    #[test]
+    fn fabs_of_a_constant_folds_to_its_magnitude() {
+        let types = TypeTable::new(&Target::host());
+        let widths = [
+            (types.float_id, 32),
+            (types.double_id, 64),
+            (types.longdouble_id, types.size_bits(types.longdouble_id)),
+        ];
+        for (typ, size) in widths {
+            for (arg, want) in [(-1.5, 1.5), (2.0, 2.0), (f64::NEG_INFINITY, f64::INFINITY)] {
+                let got = fold_float(Opcode::Fabs, typ, size, &[arg]);
+                assert_eq!(
+                    got.map(|(v, sz)| (v.to_f64(), sz)),
+                    Some((want, size)),
+                    "{arg}"
+                );
+            }
+            let zero = fold_float(Opcode::Fabs, typ, size, &[-0.0]).map(|(v, _)| v);
+            assert!(zero.is_some_and(|v| v.is_positive_zero()), "-0.0 at {size}");
+        }
+        let nan = f64::from_bits(0xfff8_0000_0000_1234);
+        let got = fold_float(Opcode::Fabs, types.double_id, 64, &[nan]);
+        let (neg, exp, sig) = FloatVal::from_f64(nan).key();
+        assert!(neg);
+        assert_eq!(
+            got.map(|(v, _)| v.key()),
+            Some((false, exp, sig)),
+            "only the sign bit of a NaN changes"
+        );
+        // And the bits the constant is emitted as say the same.
+        assert_eq!(
+            got.map(|(v, _)| v.to_bits(FpFormat::Binary64)),
+            Some(0x7ff8_0000_0000_1234)
+        );
+    }
+
+    /// `FNeg` of a NaN constant flips its sign and keeps everything else --
+    /// payload and quiet bit alike -- at every width. This is the fold that
+    /// made `-__builtin_nan("0x1234")` a positive NaN at -O2: the folded
+    /// value was right and its emission, through `f64::NAN`, was not, so the
+    /// assertion is on the emitted bits.
+    #[test]
+    fn fneg_of_a_nan_constant_keeps_its_payload() {
+        let types = TypeTable::new(&Target::host());
+        let ld = types.longdouble_id;
+        let ld_fmt = types.fp_format(ld).expect("long double is floating");
+        // (type, width, quiet -0x1234 bits, signalling -0x1234 bits)
+        let cases = [
+            (types.float_id, 32, 0xffc0_1234, 0xff80_1234),
+            (
+                types.double_id,
+                64,
+                0xfff8_0000_0000_1234,
+                0xfff0_0000_0000_1234,
+            ),
+            match ld_fmt {
+                FpFormat::X87Extended => (
+                    ld,
+                    types.size_bits(ld),
+                    0xffff_c000_0000_0000_1234,
+                    0xffff_8000_0000_0000_1234,
+                ),
+                FpFormat::Binary128 => (
+                    ld,
+                    types.size_bits(ld),
+                    0xffff_8000_0000_0000_0000_0000_0000_1234,
+                    0xffff_0000_0000_0000_0000_0000_0000_1234,
+                ),
+                _ => (
+                    ld,
+                    types.size_bits(ld),
+                    0xfff8_0000_0000_1234,
+                    0xfff0_0000_0000_1234,
+                ),
+            },
+        ];
+        for (typ, size, quiet, signalling) in cases {
+            let fmt = types.fp_format(typ).expect("a floating type");
+            for (kind, want) in [(NanKind::Quiet, quiet), (NanKind::Signalling, signalling)] {
+                let nan = FloatVal::nan_with_payload(fmt, 0x1234, kind);
+                let got = fold_float_vals(Opcode::FNeg, typ, size, &[nan]);
+                assert_eq!(
+                    got.map(|(v, _)| v.to_bits(fmt)),
+                    Some(want),
+                    "{kind:?} NaN at {fmt:?}"
+                );
+            }
+        }
+    }
+
     /// One `FCvtF` from `src` to `dst`, folded.
     fn fold_fcvtf(v: f64, src: (TypeId, u32), dst: (TypeId, u32)) -> Option<f64> {
         let mut insn = Instruction::new(Opcode::FCvtF)
@@ -3027,23 +3355,12 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let h = (types.float16_id, 16);
         let f = (types.float_id, 32);
-        let want = f64::from(half_of(0.3));
+        // 0.3 rounded to binary16 is 0x34CD, which is exactly
+        // 1229 * 2^-12 -- written out rather than computed, so the
+        // expectation does not come from the code under test.
+        let want = 1229.0 / 4096.0;
         assert_eq!(fold_fcvtf(0.3, h, f), Some(want));
         assert_ne!(fold_fcvtf(0.3, h, f), Some(f64::from(0.3f32)));
-    }
-
-    /// `v` rounded to IEEE binary16 and back, computed independently of the
-    /// code under test.
-    fn half_of(v: f64) -> f32 {
-        let bits = crate::float::f64_to_f16_bits(v);
-        let sign = u32::from(bits >> 15) << 31;
-        let exp = i32::from((bits >> 10) & 0x1F);
-        let frac = u32::from(bits & 0x3FF);
-        if exp == 0 {
-            // Subnormal or zero; 0.3 is neither, so this is for completeness.
-            return f32::from_bits(sign) + (frac as f32) * 2f32.powi(-24);
-        }
-        f32::from_bits(sign | (((exp - 15 + 127) as u32) << 23) | (frac << 13))
     }
 
     /// A pseudo that means something beyond its value must not be converted.

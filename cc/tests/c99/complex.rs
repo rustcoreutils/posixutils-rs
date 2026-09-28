@@ -8,7 +8,7 @@
 //
 // C99 Complex Number Tests
 
-use crate::common::{compile_and_run, compile_and_run_optimized};
+use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_optimized};
 
 #[test]
 fn c99_complex_mega() {
@@ -1364,4 +1364,122 @@ int main(void) {
         compile_and_run("c99_complex_int_div_o2", code, &["-O2".to_string()]),
         0
     );
+}
+
+/// The GNU imaginary marker on a *hexadecimal* floating constant. gcc
+/// accepts `0x1.8p1i` exactly as it accepts `3.0i`, with the same suffix
+/// orders, and gives the same values; c17 took the marker on a decimal
+/// constant and rejected every hex one as an invalid literal.
+#[test]
+fn c99_gnu_imaginary_hex_constants() {
+    let code = r#"
+int main(void) {
+    { _Complex double z = 0x1.8p1i;
+      if (__real__ z != 0.0 || __imag__ z != 3.0) return 1; }
+    { _Complex float z = 0x1p0fi;
+      if (__imag__ z != 1.0f) return 2; }
+    { _Complex float z = 0x1p-1if;
+      if (__imag__ z != 0.5f) return 3; }
+    { _Complex long double z = 0x2p-1iL;
+      if (__imag__ z != 1.0L) return 4; }
+    { _Complex long double z = 0x1.8p0Li;
+      if (__imag__ z != 1.5L) return 5; }
+    { _Complex double z = 0xAp0j;
+      if (__imag__ z != 10.0) return 6; }
+    if (sizeof(0x1p0i) != sizeof(_Complex double)) return 7;
+    if (sizeof(0x1p0fi) != sizeof(_Complex float)) return 8;
+    if (sizeof(0x1p0iL) != sizeof(_Complex long double)) return 9;
+    { _Complex double z = 0x1p2 + 0x1p3i;
+      if (__real__ z != 4.0 || __imag__ z != 8.0) return 10; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_gnu_imaginary_hex", code, &[]), 0);
+}
+
+/// `~` -- the GNU complex conjugate -- in a static initializer. gcc folds it
+/// as it folds `-z`; c17's constant evaluator had no case for it and
+/// rejected the initializer as not constant.
+#[test]
+fn c99_complex_conjugate_in_static_initializer() {
+    let code = r#"
+static _Complex double a = ~(3.0 + 4.0i);
+static _Complex float b = ~(1.0f - 2.0if);
+static _Complex long double c = ~~(5.0L + 6.0iL);
+static _Complex double d = -~(1.0 + 1.0i);
+int main(void) {
+    if (__real__ a != 3.0 || __imag__ a != -4.0) return 1;
+    if (__real__ b != 1.0f || __imag__ b != 2.0f) return 2;
+    if (__real__ c != 5.0L || __imag__ c != 6.0L) return 3;
+    if (__real__ d != -1.0 || __imag__ d != 1.0) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_conj_static_init", code, &[]), 0);
+}
+
+/// `conj` in a static initializer folds as `~` does: it is the same
+/// conjugate, computed in place rather than called.
+#[test]
+fn c99_complex_conj_call_in_static_initializer() {
+    let code = r#"
+double _Complex conj(double _Complex);
+float _Complex conjf(float _Complex);
+static _Complex double a = conj(3.0 + 4.0i);
+static _Complex float b = __builtin_conjf(1.0f - 2.0if);
+int main(void) {
+    if (__real__ a != 3.0 || __imag__ a != -4.0) return 1;
+    if (__real__ b != 1.0f || __imag__ b != 2.0f) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_conj_call_static_init", code, &[]), 0);
+}
+
+// `_Float16 _Complex` arithmetic at run time, and its imaginary constants in
+// both suffix orders. Every value was checked against gcc on x86-64 and
+// aarch64. Multiplication and division called the `double` routines
+// (__muldc3/__divdc3) on half-precision operands and returned 0.
+const FLOAT16_COMPLEX_PROGRAM: &str = r#"
+typedef _Float16 _Complex hc;
+int main(void) {
+    volatile _Float16 a = 1.5f16, b = 2.0f16, c = 3.0f16, d = -1.0f16;
+    hc x = __builtin_complex((_Float16)a, (_Float16)b);
+    hc y = __builtin_complex((_Float16)c, (_Float16)d);
+    hc p = x * y, q = x / y, s = x + y, t = x - y;
+    if (__real__ p != 6.5f16 || __imag__ p != 4.5f16) return 1;
+    if (__real__ s != 4.5f16 || __imag__ s != 1.0f16) return 2;
+    /* (1.5+2i)/(3-i) = (4.5-2 + (6+1.5)i)/10 */
+    if (__real__ q != 0.25f16 || __imag__ q != 0.75f16) return 3;
+    if (__real__ t != -1.5f16 || __imag__ t != 3.0f16) return 4;
+    hc k = 2.0f16i;
+    hc k2 = 2.0if16;
+    if (__imag__ k != 2.0f16 || __imag__ k2 != 2.0f16 || __real__ k2 != 0) return 5;
+    if (sizeof(k) != 4 || sizeof(2.0if16) != 4) return 6;
+    hc m = x * 2.0if16;
+    if (__real__ m != -4.0f16 || __imag__ m != 3.0f16) return 7;
+    return 0;
+}
+"#;
+
+#[test]
+fn c99_float16_complex_arithmetic() {
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("f16_complex{opt}"),
+                FLOAT16_COMPLEX_PROGRAM,
+                &[opt.to_string()]
+            ),
+            0,
+            "host {opt}"
+        );
+        if let Some(rc) = compile_and_run_aarch64(
+            &format!("f16_complex_a64{opt}"),
+            FLOAT16_COMPLEX_PROGRAM,
+            opt,
+        ) {
+            assert_eq!(rc, 0, "aarch64 {opt}");
+        }
+    }
 }

@@ -96,16 +96,159 @@ impl fmt::Display for Os {
     }
 }
 
-impl Os {
-    /// Returns the libc function name for signbit(double)
-    /// macOS/Darwin uses __signbitd, Linux/glibc and FreeBSD use __signbit
-    pub fn signbit_double_fn(&self) -> &'static str {
+/// Whether plain `char` is a signed or an unsigned type on a target.
+///
+/// C17 6.2.5p15 leaves the choice to the implementation, and the platform ABIs
+/// make it -- per architecture *and* operating system, not per architecture:
+///
+/// - x86-64 (System V psABI, and Darwin, which follows it): signed.
+/// - AAPCS64, which Linux and FreeBSD follow: unsigned.
+/// - Apple arm64 departs from AAPCS64 here ("Writing ARM64 code for Apple
+///   platforms": "The char type is signed"), so Darwin is signed on both
+///   architectures.
+///
+/// Decided in one place -- [`CharSignedness::of`] -- and carried on
+/// [`Target`], because the type system, the predefined macros and the
+/// preprocessor's `#if` arithmetic must all give the same answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CharSignedness {
+    Signed,
+    Unsigned,
+}
+
+impl CharSignedness {
+    /// The platform ABI's choice for plain `char`.
+    pub fn of(arch: Arch, os: Os) -> Self {
+        match (arch, os) {
+            (Arch::X86_64, _) => CharSignedness::Signed,
+            (Arch::Aarch64, Os::MacOS) => CharSignedness::Signed,
+            (Arch::Aarch64, Os::Linux | Os::FreeBSD) => CharSignedness::Unsigned,
+        }
+    }
+
+    /// The value a `char` object holding the byte `b` has, converted to an
+    /// integer: C17 6.4.4.4p10 gives an unprefixed one-character constant
+    /// exactly this value, in the compiler and in `#if` alike.
+    pub fn byte_value(self, b: u8) -> i64 {
         match self {
-            Os::MacOS => "__signbitd",
-            Os::Linux | Os::FreeBSD => "__signbit",
+            CharSignedness::Signed => b as i8 as i64,
+            CharSignedness::Unsigned => b as i64,
         }
     }
 }
+
+/// A standard integer type, as a platform ABI names the type behind one of
+/// the library's integer typedefs (`int64_t`, `size_t`, `wchar_t`, ...).
+///
+/// The typedefs are the platform's choice and differ between targets of the
+/// same width -- `int64_t` is `long` on glibc and `long long` on Darwin -- so
+/// [`Target`] decides each one, in one place, and everything that describes
+/// the type is derived from it: the `__*_TYPE__` spelling, its limits, its
+/// constant suffix and its `printf` length modifier -- and, for `wchar_t`,
+/// `char16_t` and `char32_t`, the type the parser gives a prefixed literal.
+/// Hand-typing those per macro is how `__INT64_MAX__` came to say `LL` for a
+/// `long`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntType {
+    SChar,
+    UChar,
+    Short,
+    UShort,
+    Int,
+    UInt,
+    Long,
+    ULong,
+    LongLong,
+    ULongLong,
+}
+
+impl IntType {
+    pub fn is_signed(self) -> bool {
+        matches!(
+            self,
+            IntType::SChar | IntType::Short | IntType::Int | IntType::Long | IntType::LongLong
+        )
+    }
+
+    /// The unsigned type of the same rank (C17 6.2.5p6).
+    pub fn to_unsigned(self) -> IntType {
+        match self {
+            IntType::SChar | IntType::UChar => IntType::UChar,
+            IntType::Short | IntType::UShort => IntType::UShort,
+            IntType::Int | IntType::UInt => IntType::UInt,
+            IntType::Long | IntType::ULong => IntType::ULong,
+            IntType::LongLong | IntType::ULongLong => IntType::ULongLong,
+        }
+    }
+
+    /// The signed type of the same rank (C17 6.2.5p6).
+    pub fn to_signed(self) -> IntType {
+        match self {
+            IntType::SChar | IntType::UChar => IntType::SChar,
+            IntType::Short | IntType::UShort => IntType::Short,
+            IntType::Int | IntType::UInt => IntType::Int,
+            IntType::Long | IntType::ULong => IntType::Long,
+            IntType::LongLong | IntType::ULongLong => IntType::LongLong,
+        }
+    }
+
+    /// The type's name as gcc spells it in a `__*_TYPE__` macro.
+    pub fn spelling(self) -> &'static str {
+        match self {
+            IntType::SChar => "signed char",
+            IntType::UChar => "unsigned char",
+            IntType::Short => "short int",
+            IntType::UShort => "short unsigned int",
+            IntType::Int => "int",
+            IntType::UInt => "unsigned int",
+            IntType::Long => "long int",
+            IntType::ULong => "long unsigned int",
+            IntType::LongLong => "long long int",
+            IntType::ULongLong => "long long unsigned int",
+        }
+    }
+
+    /// The suffix that gives an integer constant this type once promoted --
+    /// what `INT64_C(c)` pastes on. A type narrower than `int` has none: no
+    /// constant has such a type, and C17 7.20.4p2 wants the promoted one.
+    pub fn constant_suffix(self) -> &'static str {
+        match self {
+            IntType::SChar | IntType::UChar | IntType::Short | IntType::UShort | IntType::Int => "",
+            IntType::UInt => "U",
+            IntType::Long => "L",
+            IntType::ULong => "UL",
+            IntType::LongLong => "LL",
+            IntType::ULongLong => "ULL",
+        }
+    }
+
+    /// The `printf` length modifier for the type (C17 7.21.6.1p7).
+    pub fn printf_length(self) -> &'static str {
+        match self {
+            IntType::SChar | IntType::UChar => "hh",
+            IntType::Short | IntType::UShort => "h",
+            IntType::Int | IntType::UInt => "",
+            IntType::Long | IntType::ULong => "l",
+            IntType::LongLong | IntType::ULongLong => "ll",
+        }
+    }
+}
+
+/// Whether an atomic object `bytes` wide is always lock-free: exactly the
+/// machine integer widths, on every target here. There is no 16-byte atomic,
+/// and c17 does not link libatomic's lock-based fallbacks.
+///
+/// One rule for the three places that answer it: the `__GCC_ATOMIC_*_LOCK_FREE`
+/// predefines (and so `<stdatomic.h>`'s `ATOMIC_*_LOCK_FREE`),
+/// `__atomic_always_lock_free` / `__atomic_is_lock_free`, and the linearizer's
+/// choice between an instruction and a rejection.
+pub fn atomic_is_lock_free(bytes: u64) -> bool {
+    matches!(bytes, 1 | 2 | 4 | 8)
+}
+
+/// What `__atomic_test_and_set` stores into the flag, and so what
+/// `__GCC_ATOMIC_TEST_AND_SET_TRUEVAL` says.
+pub const ATOMIC_TEST_AND_SET_TRUEVAL: i64 = 1;
 
 /// How a thread-local's address is obtained on a target.
 ///
@@ -148,8 +291,8 @@ pub struct Target {
     pub pointer_width: u32,
     /// Size of long in bits
     pub long_width: u32,
-    /// char is signed by default
-    pub char_signed: bool,
+    /// Plain `char`'s signedness, the platform ABI's choice
+    pub plain_char: CharSignedness,
     /// Maximum size (in bits) for aggregate types (struct/union) that can be
     /// passed or returned by value in registers. Aggregates larger than this
     /// require indirect passing (pointer) or sret (struct return pointer).
@@ -174,14 +317,6 @@ impl Target {
             Os::Linux | Os::MacOS | Os::FreeBSD => 64,
         };
 
-        // char signedness varies by platform
-        let char_signed = match (arch, os) {
-            // ARM defaults to unsigned char
-            (Arch::Aarch64, _) => false,
-            // x86_64 defaults to signed char
-            (Arch::X86_64, _) => true,
-        };
-
         // Maximum aggregate size that can be returned in registers.
         // Both x86-64 SysV ABI and AAPCS64 support returning 16-byte structs
         // in two registers (rax+rdx or x0+x1). Structs larger than 16 bytes
@@ -193,12 +328,12 @@ impl Target {
             os,
             pointer_width,
             long_width,
-            char_signed,
+            plain_char: CharSignedness::of(arch, os),
             max_aggregate_register_bits,
         }
     }
 
-    /// Does this platform spell the exact-width 64-bit integers `long long`?
+    /// The type behind `int64_t`: `long` or `long long`?
     ///
     /// Every target here is LP64, so `long` is 64 bits and either spelling is
     /// wide enough — but they are *distinct types*, and our `<stdint.h>` has to
@@ -206,8 +341,146 @@ impl Target {
     /// both is rejected. Linux and the BSDs use `long`; Darwin uses
     /// `long long`, and picking by width alone made every macOS build that
     /// reached a system header fail on `int64_t`.
-    pub fn int64_is_long_long(&self) -> bool {
-        self.os == Os::MacOS
+    fn int64_type(&self) -> IntType {
+        match self.os {
+            Os::MacOS => IntType::LongLong,
+            Os::Linux | Os::FreeBSD => IntType::Long,
+        }
+    }
+
+    /// Whether a multi-byte integer lies in this target's memory lowest
+    /// byte first. Every target here is little-endian; the host running the
+    /// compiler need not be, so what is stored is laid out by this, never
+    /// by the host's own order.
+    pub fn little_endian(&self) -> bool {
+        match self.arch {
+            Arch::X86_64 | Arch::Aarch64 => true,
+        }
+    }
+
+    /// The width in bits of an integer type on this target.
+    pub fn int_width(&self, t: IntType) -> u32 {
+        match t {
+            IntType::SChar | IntType::UChar => 8,
+            IntType::Short | IntType::UShort => 16,
+            IntType::Int | IntType::UInt => 32,
+            IntType::Long | IntType::ULong => self.long_width,
+            IntType::LongLong | IntType::ULongLong => 64,
+        }
+    }
+
+    /// The largest value of an integer type on this target.
+    pub fn int_max(&self, t: IntType) -> u64 {
+        let bits = self.int_width(t) - u32::from(t.is_signed());
+        u64::MAX >> (64 - bits)
+    }
+
+    /// `intN_t`, for N of 8, 16, 32 and 64 (C17 7.20.1.1).
+    pub fn exact_int_type(&self, bits: u32) -> IntType {
+        match bits {
+            8 => IntType::SChar,
+            16 => IntType::Short,
+            32 => IntType::Int,
+            64 => self.int64_type(),
+            _ => panic!("no int{bits}_t"),
+        }
+    }
+
+    /// `int_leastN_t` (C17 7.20.1.2): the exact-width type on every target,
+    /// since every target has all four.
+    pub fn least_int_type(&self, bits: u32) -> IntType {
+        self.exact_int_type(bits)
+    }
+
+    /// `int_fastN_t` (C17 7.20.1.3), which each C library chooses for itself
+    /// and our `<stdint.h>` has to choose the same way:
+    ///
+    /// - glibc: `signed char` for 8, and `long` -- the word -- for 16, 32
+    ///   and 64 on a 64-bit target (`__WORDSIZE == 64` in its `<stdint.h>`).
+    /// - FreeBSD: `int` for 8, 16 and 32 (`__int_fast*_t` in
+    ///   `<machine/_types.h>`), `int64_t` for 64.
+    /// - Darwin: the exact-width type at every width.
+    ///
+    /// Answering the exact-width type everywhere made `int_fast16_t` a
+    /// 2-byte `short` in c17 and an 8-byte `long` in gcc on Linux -- a
+    /// different size for the same type in any structure or prototype the
+    /// two share.
+    pub fn fast_int_type(&self, bits: u32) -> IntType {
+        match (self.os, bits) {
+            (Os::Linux, 16 | 32) => IntType::Long,
+            (Os::FreeBSD, 8 | 16) => IntType::Int,
+            _ => self.exact_int_type(bits),
+        }
+    }
+
+    /// `intptr_t` (C17 7.20.1.4): `long` on every LP64 target, Darwin
+    /// included.
+    pub fn intptr_type(&self) -> IntType {
+        IntType::Long
+    }
+
+    /// `ptrdiff_t` (C17 7.19), the type of a pointer difference.
+    pub fn ptrdiff_type(&self) -> IntType {
+        IntType::Long
+    }
+
+    /// `intmax_t` (C17 7.20.1.5). `long` everywhere -- on Darwin too, where
+    /// `int64_t` is `long long` but `intmax_t` is not.
+    pub fn intmax_type(&self) -> IntType {
+        IntType::Long
+    }
+
+    /// `size_t` (C17 7.19).
+    pub fn size_type(&self) -> IntType {
+        IntType::ULong
+    }
+
+    /// `wchar_t` (C17 7.19), the type of a wide character constant and the
+    /// element type of a wide string literal (6.4.4.4p10, 6.4.5p6).
+    ///
+    /// AAPCS64 makes it `unsigned int` (its "Arm C and C++ language
+    /// mappings"), and Linux and FreeBSD follow it; Apple arm64 departs and
+    /// makes it `int`, as x86-64 is everywhere. The type system, the
+    /// predefines and `#if` all read this answer, so `L'\xffffffff' > 0`,
+    /// `(wchar_t)-1 > 0` and `WCHAR_MIN == 0` agree with gcc on aarch64
+    /// Linux.
+    pub fn wchar_type(&self) -> IntType {
+        match (self.arch, self.os) {
+            (Arch::Aarch64, Os::Linux | Os::FreeBSD) => IntType::UInt,
+            (Arch::Aarch64, Os::MacOS) | (Arch::X86_64, _) => IntType::Int,
+        }
+    }
+
+    /// `wint_t` (C17 7.29.1), which has to hold every `wchar_t` value *plus*
+    /// `WEOF`, and the two platforms solve that differently. glibc makes it
+    /// `unsigned int`, so `WEOF` -- `(wint_t)-1` -- is `0xffffffff`, a value
+    /// no `wchar_t` reaches. Darwin makes it `int`, following
+    /// `__darwin_ct_rune_t`, and spends the negative half of the range
+    /// instead.
+    ///
+    /// It has to be the platform's choice rather than ours: the C library's
+    /// own headers typedef `wint_t` from their own definition, and
+    /// `__mbstate_t` holds one.
+    pub fn wint_type(&self) -> IntType {
+        match self.os {
+            Os::MacOS => IntType::Int,
+            Os::Linux | Os::FreeBSD => IntType::UInt,
+        }
+    }
+
+    /// `char16_t` (C17 7.28): `uint_least16_t`.
+    pub fn char16_type(&self) -> IntType {
+        self.least_int_type(16).to_unsigned()
+    }
+
+    /// `char32_t` (C17 7.28): `uint_least32_t`.
+    pub fn char32_type(&self) -> IntType {
+        self.least_int_type(32).to_unsigned()
+    }
+
+    /// `sig_atomic_t` (C17 7.14).
+    pub fn sig_atomic_type(&self) -> IntType {
+        IntType::Int
     }
 
     /// Detect host architecture at runtime
@@ -340,7 +613,6 @@ mod tests {
         assert_eq!(target.os, Os::Linux);
         assert_eq!(target.pointer_width, 64);
         assert_eq!(target.long_width, 64); // LP64
-        assert!(target.char_signed); // x86 default
     }
 
     /// Every accepted spelling is classified; the `c`/`gnu` prefix does not
@@ -416,6 +688,69 @@ mod tests {
         assert_eq!(target.arch, Arch::Aarch64);
         assert_eq!(target.os, Os::Linux);
         assert_eq!(target.pointer_width, 64);
-        assert!(!target.char_signed); // ARM default
+    }
+
+    /// Plain `char` follows the platform ABI, which is a property of the
+    /// architecture *and* the OS: Apple arm64 is signed where AAPCS64 is not.
+    #[test]
+    fn test_plain_char_signedness_per_target() {
+        use CharSignedness::{Signed, Unsigned};
+        for (arch, os, want) in [
+            (Arch::X86_64, Os::Linux, Signed),
+            (Arch::X86_64, Os::MacOS, Signed),
+            (Arch::X86_64, Os::FreeBSD, Signed),
+            (Arch::Aarch64, Os::Linux, Unsigned),
+            (Arch::Aarch64, Os::FreeBSD, Unsigned),
+            (Arch::Aarch64, Os::MacOS, Signed),
+        ] {
+            assert_eq!(Target::new(arch, os).plain_char, want, "{arch}-{os}");
+        }
+    }
+
+    /// `wchar_t` is unsigned under AAPCS64, which Linux and FreeBSD follow,
+    /// and signed on Apple arm64 and on x86-64.
+    #[test]
+    fn test_wchar_type_per_target() {
+        for (arch, os, want) in [
+            (Arch::X86_64, Os::Linux, IntType::Int),
+            (Arch::X86_64, Os::MacOS, IntType::Int),
+            (Arch::X86_64, Os::FreeBSD, IntType::Int),
+            (Arch::Aarch64, Os::Linux, IntType::UInt),
+            (Arch::Aarch64, Os::FreeBSD, IntType::UInt),
+            (Arch::Aarch64, Os::MacOS, IntType::Int),
+        ] {
+            assert_eq!(Target::new(arch, os).wchar_type(), want, "{arch}-{os}");
+        }
+    }
+
+    /// `int_fastN_t` is each C library's own choice, and differs at 16 and
+    /// 32 bits between all three.
+    #[test]
+    fn test_fast_int_types_per_platform() {
+        use IntType::*;
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            for (os, want) in [
+                (Os::Linux, [SChar, Long, Long, Long]),
+                (Os::FreeBSD, [Int, Int, Int, Long]),
+                (Os::MacOS, [SChar, Short, Int, LongLong]),
+            ] {
+                let t = Target::new(arch, os);
+                let got = [8, 16, 32, 64].map(|bits| t.fast_int_type(bits));
+                assert_eq!(got, want, "{arch}-{os}");
+                for (bits, ty) in [8, 16, 32, 64].into_iter().zip(got) {
+                    assert!(t.int_width(ty) >= bits && ty.is_signed());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_char_byte_value() {
+        assert_eq!(CharSignedness::Signed.byte_value(0x80), -128);
+        assert_eq!(CharSignedness::Signed.byte_value(0xff), -1);
+        assert_eq!(CharSignedness::Signed.byte_value(0x7f), 127);
+        assert_eq!(CharSignedness::Unsigned.byte_value(0x80), 128);
+        assert_eq!(CharSignedness::Unsigned.byte_value(0xff), 255);
+        assert_eq!(CharSignedness::Unsigned.byte_value(0x7f), 127);
     }
 }

@@ -19,8 +19,8 @@
 //
 
 use crate::common::{
-    compile_and_run, compile_and_run_two_units, compile_expect_error, compile_expect_ok,
-    compile_expect_warning, create_c_file, run_c17,
+    compile_and_run, compile_and_run_two_units, compile_expect_error, compile_expect_no_diagnostic,
+    compile_expect_ok, compile_expect_warning, create_c_file, run_c17,
 };
 
 // ============================================================================
@@ -1029,6 +1029,32 @@ fn diagnostics_unprototyped_calls_are_accepted() {
     }
 }
 
+/// C17 6.5.3.3p1: the operand of unary `+` or `-` has arithmetic type. A
+/// pointer, array or structure operand compiled in silence -- `+p` was `p`.
+/// Worded as gcc words it.
+#[test]
+fn diagnostics_unary_plus_and_minus_need_arithmetic_operands() {
+    for (name, src, expected) in [
+        (
+            "unary_plus_pointer",
+            "int *p;\nint f(void){ (void)+p; return 0; }\n",
+            "wrong type argument to unary plus",
+        ),
+        (
+            "unary_plus_struct",
+            "struct S { int x; } s;\nint f(void){ (void)+s; return 0; }\n",
+            "wrong type argument to unary plus",
+        ),
+        (
+            "unary_minus_pointer",
+            "int *p;\nint f(void){ (void)-p; return 0; }\n",
+            "wrong type argument to unary minus",
+        ),
+    ] {
+        compile_expect_error(name, src, expected);
+    }
+}
+
 // ==== lvalue constraints (C17 6.5.16p2, 6.5.3.1p1, 6.5.3.2p1) ====
 
 /// Assignment and the increment operators require a *modifiable lvalue*, and
@@ -1051,6 +1077,18 @@ fn diagnostics_non_lvalue_targets_are_rejected() {
             "assign_to_cast",
             "int main(void){ int a=1; (int)a = 2; return 0; }\n",
             "lvalue required as left operand of assignment",
+        ),
+        // Unary `+` yields a value (C17 6.5.3.3p2); it returned its operand,
+        // lvalue and all.
+        (
+            "assign_to_unary_plus",
+            "int main(void){ int a=1; +a = 2; return 0; }\n",
+            "lvalue required as left operand of assignment",
+        ),
+        (
+            "address_of_unary_plus",
+            "int main(void){ int a=1; int *p = &+a; return *p; }\n",
+            "lvalue required as unary '&' operand",
         ),
         (
             "assign_to_call",
@@ -1101,6 +1139,29 @@ fn diagnostics_non_lvalue_targets_are_rejected() {
             "int main(void){ register int a=1; return *&a; }\n",
             "address of register variable 'a' requested",
         ),
+        // Unary `&` needs an lvalue or a function designator (6.5.3.2p1).
+        // Anything else compiled, and took the address of a temporary.
+        (
+            "address_of_sum",
+            "int main(void){ int a=1; int *p = &(a+1); return *p; }\n",
+            "lvalue required as unary '&' operand",
+        ),
+        (
+            "address_of_call",
+            "int f(void);\nint main(void){ int *p = &f(); return *p; }\n",
+            "lvalue required as unary '&' operand",
+        ),
+        (
+            "address_of_conditional",
+            "int main(void){ int a=1,b=2; int *p = &(a ? a : b); return *p; }\n",
+            "lvalue required as unary '&' operand",
+        ),
+        (
+            "address_of_member_of_call",
+            "struct S { int x; };\nstruct S g(void);\n\
+             int main(void){ int *p = &g().x; return *p; }\n",
+            "lvalue required as unary '&' operand",
+        ),
     ] {
         compile_expect_error(name, src, expected);
     }
@@ -1145,6 +1206,10 @@ int main(void) {
     (void)&"literal"[0];
     /* a compound literal is an object, so it is an lvalue */
     s = (struct S){1, {2,3,4}};
+    (void)&(struct S){0};
+    /* `&` also takes a function designator, and __func__ is an array */
+    int (*fp)(void) = &main; (void)fp; (void)&*fp;
+    (void)&__func__; (void)&__real__ z;
     return 0;
 }
 "#;
@@ -3392,7 +3457,12 @@ fn diagnostics_string_literal_must_match_the_array_element_type() {
         ),
         // A wide literal needs its own element type, not merely a wide one.
         ("wide_into_char_array", "char a[] = L\"ab\";\n"),
-        ("wide_into_unsigned_array", "unsigned a[] = L\"ab\";\n"),
+        // wchar_t is `int` on x86-64 and Darwin and `unsigned int` on aarch64
+        // Linux, so the mismatch is the integer type of the other signedness.
+        (
+            "wide_into_other_signedness_array",
+            "#if __WCHAR_MIN__ == 0\nint a[] = L\"ab\";\n#else\nunsigned a[] = L\"ab\";\n#endif\n",
+        ),
         ("u16_into_char_array", "char a[] = u\"ab\";\n"),
         ("u16_into_short_array", "short a[] = u\"ab\";\n"),
         ("u32_into_int_array", "int a[] = U\"ab\";\n"),
@@ -3417,8 +3487,11 @@ fn diagnostics_string_literals_matching_their_array_are_accepted() {
         ("str_braced", "char a[] = {\"hi\"};\n"),
         ("str_u8", "char a[] = u8\"ab\";\n"),
         ("str_local", "void f(void){ char a[] = \"hi\"; (void)a; }\n"),
-        ("wide_into_int", "int a[] = L\"ab\";\n"),
-        ("wide_into_const_int", "const int a[] = L\"ab\";\n"),
+        ("wide_into_wchar", "__WCHAR_TYPE__ a[] = L\"ab\";\n"),
+        (
+            "wide_into_const_wchar",
+            "const __WCHAR_TYPE__ a[] = L\"ab\";\n",
+        ),
         ("u16_into_ushort", "unsigned short a[] = u\"ab\";\n"),
         ("u32_into_uint", "unsigned int a[] = U\"ab\";\n"),
         ("array_from_braces", "int a[] = {1,2,3};\n"),
@@ -7075,5 +7148,151 @@ fn diagnostics_redeclaration_is_reported_at_the_declarator() {
         "typedef_redef_at_declarator",
         "typedef int T;\ntypedef\n  double U, T;\n",
         ":3:13: error: typedef 'T' redefined",
+    );
+}
+
+/// C17 6.5.8p2: `<`, `>`, `<=` and `>=` take real or pointer operands, and a
+/// complex value has no ordering -- constant or not, either side. gcc: "invalid
+/// operands to binary <".
+#[test]
+fn diagnostics_relational_operator_rejects_a_complex_operand() {
+    for (name, src) in [
+        ("const", "int k = (1.0 + 2.0i) < (1.0 + 2.0i);\n"),
+        (
+            "runtime",
+            "int g(void) { _Complex double a = 1, b = 2; return a >= b; }\n",
+        ),
+        ("right", "int g(_Complex int z) { return 1.0 > z; }\n"),
+    ] {
+        compile_expect_error(
+            &format!("complex_relational_{name}"),
+            src,
+            "a complex value has no ordering",
+        );
+    }
+}
+
+/// `==` and `!=` do take a complex operand (6.5.9p2), and fold as constants.
+#[test]
+fn diagnostics_equality_accepts_a_complex_operand() {
+    compile_expect_ok(
+        "complex_equality",
+        "int f = (_Complex float)(0.5) == 0.5;\n\
+         int g(_Complex double a, double b) { return (a == b) + (a != 2.0i); }\n",
+    );
+}
+
+// ==== numeric escapes out of range (C17 6.4.4.4p9) ====
+
+/// An octal or hex escape's value must be representable in the literal's
+/// element type: `unsigned char` for a plain literal, and the unsigned type
+/// of `wchar_t`, `char16_t` or `char32_t` for a prefixed one. gcc warns and
+/// truncates; c17 was silent. A constraint gcc only warns about is an error
+/// here, and `-fpermissive` makes it a warning with gcc's truncation.
+#[test]
+fn diagnostics_escape_out_of_range() {
+    for (name, src, msg) in [
+        (
+            "esc_oct_char",
+            "int c = '\\400';\n",
+            "octal escape sequence out of range",
+        ),
+        (
+            "esc_oct_str",
+            "char s[] = \"a\\777\";\n",
+            "octal escape sequence out of range",
+        ),
+        (
+            "esc_hex_char",
+            "int c = '\\x100';\n",
+            "hex escape sequence out of range",
+        ),
+        (
+            "esc_hex_str",
+            "char s[] = \"\\x123\";\n",
+            "hex escape sequence out of range",
+        ),
+        (
+            "esc_hex_u16",
+            "unsigned short s[] = u\"\\x12345\";\n",
+            "hex escape sequence out of range",
+        ),
+        (
+            "esc_hex_u16c",
+            "int c = u'\\x10000';\n",
+            "hex escape sequence out of range",
+        ),
+        (
+            "esc_hex_u32",
+            "unsigned s[] = U\"\\x100000000\";\n",
+            "hex escape sequence out of range",
+        ),
+        (
+            "esc_hex_wide",
+            "int c = L'\\x123456789';\n",
+            "hex escape sequence out of range",
+        ),
+        // A narrow piece concatenated to a prefixed one takes its type
+        // (6.4.5p5), so the bound is the prefixed one's...
+        (
+            "esc_hex_concat",
+            "unsigned short s[] = \"\\x12345\" u\"a\";\n",
+            "hex escape sequence out of range",
+        ),
+        (
+            "esc_if",
+            "#if '\\x100'\n#endif\nint x;\n",
+            "hex escape sequence out of range",
+        ),
+    ] {
+        let strict = compile_with(name, src, &[]);
+        assert!(
+            !strict.success && strict.stderr.contains("error:") && strict.stderr.contains(msg),
+            "{name}: expected an error mentioning {msg:?}:\n{}",
+            strict.stderr
+        );
+        let lax = compile_with(name, src, &["-fpermissive"]);
+        assert!(
+            lax.success && lax.stderr.contains("warning:") && lax.stderr.contains(msg),
+            "{name}: -fpermissive should warn {msg:?}:\n{}",
+            lax.stderr
+        );
+    }
+}
+
+/// The bound is the element type's, and a value's leading zeros do not count.
+#[test]
+fn diagnostics_escape_in_range_is_accepted() {
+    compile_expect_no_diagnostic(
+        "esc_in_range",
+        "char a[] = \"\\377\\xff\\x00000041\\0\";\n\
+         int b = '\\377' + '\\xff';\n\
+         unsigned short c[] = u\"\\xffff\\777\";\n\
+         unsigned d[] = U\"\\xffffffff\\x0000000000041\";\n\
+         int e = L'\\xffffffff' + L'\\777';\n\
+         unsigned short f[] = \"\\xff\" u\"a\";\n\
+         #if '\\xff' && u'\\xffff' && U'\\xffffffff'\n\
+         int g;\n\
+         #endif\n",
+        "escape sequence out of range",
+    );
+}
+
+/// Under `-fpermissive` the program keeps gcc's truncation to the low bits.
+#[test]
+fn diagnostics_escape_out_of_range_truncates_under_fpermissive() {
+    let src = r#"
+typedef __CHAR16_TYPE__ char16_t;
+int main(void) {
+    const char16_t *u = u"\x12345";
+    if ((unsigned char)"\x141"[0] != 0x41) return 1;
+    if ((unsigned char)'\777' != 0xff) return 2;
+    if (u[0] != 0x2345) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("esc_truncate", src, &["-fpermissive".to_string()]),
+        0
     );
 }

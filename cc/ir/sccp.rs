@@ -422,16 +422,20 @@ impl Solver {
                 _ => Val::Const(0),
             },
 
-            Opcode::Neg | Opcode::Not | Opcode::Sext | Opcode::Zext | Opcode::Trunc => {
-                match insn.src.first().map(|s| self.get(*s)) {
-                    Some(Val::Const(a)) => match eval_unop(insn, a) {
-                        Some(v) => Val::Const(v),
-                        None => Val::Bottom,
-                    },
-                    Some(Val::Top) => Val::Top,
-                    _ => Val::Bottom,
-                }
-            }
+            Opcode::Neg
+            | Opcode::Not
+            | Opcode::Sext
+            | Opcode::Zext
+            | Opcode::Trunc
+            | Opcode::Popcount32
+            | Opcode::Popcount64 => match insn.src.first().map(|s| self.get(*s)) {
+                Some(Val::Const(a)) => match eval_unop(insn, a) {
+                    Some(v) => Val::Const(v),
+                    None => Val::Bottom,
+                },
+                Some(Val::Top) => Val::Top,
+                _ => Val::Bottom,
+            },
 
             _ if is_modelled_binop(insn.op) => {
                 if insn.src.len() != 2 {
@@ -773,6 +777,52 @@ mod tests {
                 .all(|i| i.op != Opcode::PhiSource),
             "no PhiSource should survive a folded phi"
         );
+    }
+
+    /// A branch on a population count of a constant is decided, and the
+    /// count is taken at the operand's width: `1 << 40` has one bit set as a
+    /// 64-bit value and none as a 32-bit one.
+    #[test]
+    fn sccp_folds_a_branch_on_a_constant_popcount() {
+        let types = TypeTable::new(&Target::host());
+        for (op, size, taken) in [
+            (Opcode::Popcount64, 64, BasicBlockId(1)),
+            (Opcode::Popcount32, 32, BasicBlockId(2)),
+        ] {
+            let mut func = Function::new("t", types.int_id);
+            func.add_pseudo(Pseudo::val(PseudoId(1), 1 << 40));
+            func.add_pseudo(Pseudo::reg(PseudoId(2), 2));
+            func.next_pseudo = 5;
+
+            let insn = Instruction::new(op)
+                .with_target(PseudoId(2))
+                .with_src(PseudoId(1))
+                .with_size(size)
+                .with_type(types.int_id);
+
+            let mut b0 = BasicBlock::new(BasicBlockId(0));
+            b0.add_insn(Instruction::new(Opcode::Entry));
+            b0.add_insn(insn);
+            b0.add_insn(Instruction::cbr(
+                PseudoId(2),
+                BasicBlockId(1),
+                BasicBlockId(2),
+            ));
+            b0.children = vec![BasicBlockId(1), BasicBlockId(2)];
+            func.add_block(b0);
+            for id in [BasicBlockId(1), BasicBlockId(2)] {
+                let mut bb = BasicBlock::new(id);
+                bb.add_insn(Instruction::ret(None));
+                bb.parents = vec![BasicBlockId(0)];
+                func.add_block(bb);
+            }
+            func.entry = BasicBlockId(0);
+
+            assert!(run(&mut func, &host_types()), "{op:?}");
+            let t = terminator(&func, 0);
+            assert_eq!(t.op, Opcode::Br, "{op:?}");
+            assert_eq!(t.bb_true, Some(taken), "{op:?}");
+        }
     }
 
     // Safety

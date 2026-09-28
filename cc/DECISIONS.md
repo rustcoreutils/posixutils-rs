@@ -64,6 +64,41 @@ literals — `"What??!"` becomes `"What|"` — and `??` is far likelier to appea
 by accident than by intent; gcc and clang default them off for the same reason.
 `git log --grep '#C55'` has the record.
 
+### Unreachable code is not emitted, at any level
+
+**Settled.** It replaces an earlier record that `-O0` kept the arm of a
+constant branch.
+
+At every level, `-O0` included, c17 emits nothing for code that no path
+reaches. That covers the arm of an `if`, `?:`, `while`, `for`, `do` or
+`switch` whose controlling expression is a constant expression, the right
+operand of a `&&` or `||` whose left operand decides it, and whatever follows
+a `return`, `break`, `continue` or `goto` up to the next label. A block that a
+label, `case` or `default` reaches is kept, and so is one whose address is
+taken. In `if (0) { f(); case 1: g(); }` only `f()` goes. At `-O0`,
+`__builtin_constant_p` of anything not already a constant is 0 straight away,
+so a branch on it folds too.
+
+gcc does the same. Its front end folds the condition and its CFG cleanup,
+which runs at every level, deletes what the fold cut off. Programs rely on
+this: gcc.c-torture's `link_error` tests call a function that exists nowhere
+from such an arm. What is lost is a breakpoint on a dead line, which gcc loses
+as well.
+
+The condition has to be a constant expression, asked through the shared walk
+(`constexpr::eval_truth`). A `const` object does not qualify, so
+`const int k = 0; if (k)` keeps its arm, as in gcc. Unlike gcc, c17 does not
+fold `&x == 0`, `(g(), 0)` or `g() && 0`: none of them is a constant
+expression.
+
+One more condition decides its branch, and only under `-fno-trapping-math`:
+a floating comparison of an unknown value with a constant, when no value,
+NaN included, can change the answer. `x > +Inf` is the example. gcc folds
+exactly those forms at `-O0`. With trapping math on, the default, the
+comparison stays, because a NaN operand would raise `FE_INVALID`. The
+optimizer decides which comparisons qualify by the same rule
+(`constfold::fcmp_against_constant`).
+
 ## Known Divergences
 
 ### `_Generic` on a wide bit-field expression
@@ -88,12 +123,12 @@ does or claims.
 | `__attribute__((used))` | Honoured only because nothing is pruned: an unreferenced static survives `-O2` whether or not it is marked. Real pruning would have to start reading the attribute |
 | `mode` on a vector type | `vector_size` gives a type a vector's storage and `mode` binds to a declarator, including a struct member's and a parameter's. The vector modes themselves still warn that they are ignored |
 | `return` with the wrong value-ness | `return expr;` in a `void` function, and a bare `return;` in a non-`void` one, are errors here and warnings in gcc. Both are genuine C17 6.8.6.4p1 constraint violations. `-fpermissive` downgrades them, as it does implicit `int` |
+| An octal or hex escape out of range | `'\400'`, `"\x123"`, `u"\x12345"`: an escape its element type cannot represent is an error here and a warning in gcc. C17 6.4.4.4p9 makes it a constraint violation. `-fpermissive` downgrades it, and the literal then keeps the low bits, as gcc's does |
 | `_FORTIFY_SOURCE` | Compiles the wrappers and emits `__*_chk` calls, but still checks nothing. What remains -- folding `__builtin_object_size` after inlining -- is described above, and is an ordinary compiler feature rather than fortify-specific work |
 | Identifier characters U+FD3E, U+FD3F | Rejected here; GCC's binary accepts them. Ornate parentheses, which ISO C Annex D excludes between its F900-FD3D and FD40-FDCF ranges -- GCC's own `ucnid.tab` does not list them and Clang's table does not either, so the table is followed rather than the binary. See #C158 |
 | Non-NFC identifiers | GCC warns `-Wnormalized=` when an identifier is not in Normalization Form C; c17 is silent. A diagnostic-quality gap, not a conformance one -- both compile the same program |
 | `#__VA_ARGS__` spacing | `V(a , b)` stringifies as `"a, b"`; gcc gives `"a , b"`. The separating comma's own spacing is discarded by the argument splitter. Pinned by `preprocessor_va_args_loses_space_before_a_separator` |
 | Darwin: an over-aligned variadic aggregate | clang disagrees with itself, so no compiler satisfies this in both directions. Measured on macOS CI: its caller stacks the aggregate at the next eight-byte granule and its `va_arg` rounds the cursor up to the type's own alignment, reading somewhere else. A program built entirely with clang has the same defect. c17 follows `va_arg` -- its caller realigns the outgoing area so the argument really is that aligned -- which means a c17 caller reaches a clang callee and a clang caller does not reach a c17 callee. `codegen_over_aligned_argument_area` therefore does not put this shape through its host-compiler cross-check on Apple; the pure-c17 runs still cover it at every optimization level |
-| A constant branch at `-O0` | c17 runs no optimizer at `-O0`, so `if (0) { ... }` keeps its arm; gcc folds it in a CFG cleanup it runs at every level. Deliberate: `-O0` output stays a faithful transcription of the source, so a breakpoint in a dead arm still has somewhere to land. The visible cost is that `20030330-1` and `medce-1` link at `-O1` and above and not at `-O0` |
 | `max_align_t` | `long double` here (16 bytes), a struct of `long long` + `long double` under gcc (32). Both meet the alignment requirement; `sizeof` differs. Implementation-defined (C17 7.19) |
 
 ## GNU extensions: what c17 will and will not grow
@@ -250,7 +285,7 @@ list silenced all six.
 | `__label__` | Block-scope label declarations exist for nested functions and go with them |
 | Label difference as a constant | `compile/labels-3`, `execute/pr70460`: `&&a - &&b` in a static initializer. Labels as values are supported; the difference needs a symbol-difference relocation |
 | A C17 constraint gcc only warns about | `compile/pr38857`: 6.7.4p3, an external inline definition referring to a static. `-fpermissive` relaxes it |
-| gcc-specific *behaviour* | `20021127-1` (gcc folds `llabs()` and never calls the program's own definition of it), `20031003-1` (gcc's folder saturates undefined behaviour; aarch64 agrees by hardware accident), `pr46309` (a conditional with one `void` arm, which C17 6.5.15p3 forbids) |
+| gcc-specific *behaviour* | `20031003-1` (gcc's folder saturates undefined behaviour; aarch64 agrees by hardware accident), `pr46309` (a conditional with one `void` arm, which C17 6.5.15p3 forbids) |
 
 These are listed **by name** in the harness, never matched against the source.
 Scanning for the feature looked tidier and was wrong: `pr86659-1`, `pr86659-2`
@@ -269,7 +304,7 @@ injecting one into a skip list and watching the gate fail.
 
 ### Deliberate divergences from gcc
 
-`20021127-1`, `20031003-1` and `pr46309` are skipped as gcc-specific behaviour
+`20031003-1` and `pr46309` are skipped as gcc-specific behaviour
 above; the reasoning is in that table. One more is a divergence c17 keeps but
 does **not** skip, because it is not GNU-specific:
 

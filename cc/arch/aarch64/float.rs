@@ -10,9 +10,10 @@
 //
 
 use super::codegen::Aarch64CodeGen;
-use super::lir::{Aarch64Inst, MemAddr};
+use super::lir::{Aarch64Inst, GpOperand, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::arch::lir::{CondCode, FpSize, OperandSize, Symbol};
+use crate::float::IntegralRounding;
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
@@ -398,6 +399,25 @@ impl Aarch64CodeGen {
                     dst: work_reg,
                 });
             }
+            // `fmin` and `fmax`: the `nm` forms, which answer the number for
+            // a quiet NaN operand, as C asks. A binary128 one is a call by
+            // now (see `arch::mapping::call_library_fallbacks`).
+            Opcode::FMin => {
+                self.push_lir(Aarch64Inst::Fminnm {
+                    size: fp_size,
+                    src1: VReg::V17,
+                    src2: VReg::V18,
+                    dst: work_reg,
+                });
+            }
+            Opcode::FMax => {
+                self.push_lir(Aarch64Inst::Fmaxnm {
+                    size: fp_size,
+                    src1: VReg::V17,
+                    src2: VReg::V18,
+                    dst: work_reg,
+                });
+            }
             _ => return,
         }
 
@@ -408,6 +428,225 @@ impl Aarch64CodeGen {
 
     /// Emit FP negation
     pub(super) fn emit_fp_neg(&mut self, insn: &Instruction, types: &TypeTable) {
+        self.emit_fp_unop(insn, types, |cg, size, src, dst| {
+            cg.push_lir(Aarch64Inst::Fneg { size, src, dst })
+        });
+    }
+
+    /// Emit `Fabs`: clear the sign bit and nothing else, so `-0.0` becomes
+    /// `+0.0` and a NaN keeps its payload.
+    ///
+    /// `fabs` for the scalar sizes. A binary128 has no FP instruction, and
+    /// its arithmetic is in libgcc, but this is not arithmetic: bit 127 is
+    /// bit 63 of lane 1, cleared through a general register.
+    pub(super) fn emit_fp_abs(&mut self, insn: &Instruction, types: &TypeTable) {
+        self.emit_fp_unop(insn, types, |cg, size, src, dst| {
+            if size != FpSize::Quad {
+                cg.push_lir(Aarch64Inst::Fabs { size, src, dst });
+                return;
+            }
+            let (scratch0, _, _) = Reg::scratch_regs();
+            cg.push_lir(Aarch64Inst::FmovReg { size, src, dst });
+            cg.push_lir(Aarch64Inst::UmovVecDToGp {
+                lane: 1,
+                src: dst,
+                dst: scratch0,
+            });
+            cg.push_lir(Aarch64Inst::And {
+                size: OperandSize::B64,
+                src1: scratch0,
+                src2: GpOperand::Imm(i64::MAX),
+                dst: scratch0,
+            });
+            cg.push_lir(Aarch64Inst::InsGpToVecD {
+                lane: 1,
+                src: scratch0,
+                dst,
+            });
+        });
+    }
+
+    /// Emit `Sqrt` of a `float` or `double`: `fsqrt`. A binary128 root is a
+    /// call to `sqrtl` by the time code is generated (see
+    /// `arch::mapping::call_library_fallbacks`).
+    pub(super) fn emit_fp_sqrt(&mut self, insn: &Instruction, types: &TypeTable) {
+        self.emit_fp_unop(insn, types, |cg, size, src, dst| {
+            debug_assert!(size != FpSize::Quad, "binary128 sqrt is a call");
+            cg.push_lir(Aarch64Inst::Fsqrt { size, src, dst });
+        });
+    }
+
+    /// Emit `Fma` of `float` or `double` operands: `fmadd`, rounded once.
+    /// The three are staged in the scratch registers before the destination,
+    /// which may be one of their registers, is written. A binary128 one is a
+    /// call by now, as for `Sqrt`.
+    pub(super) fn emit_fp_fma(&mut self, insn: &Instruction, types: &TypeTable) {
+        let (Some(target), [x, y, z]) = (insn.target, insn.src.as_slice()) else {
+            return;
+        };
+        let size = Self::size_from_type(insn.typ, insn.size, types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
+        debug_assert!(fp_size != FpSize::Quad, "a binary128 fma is a call");
+        let dst_loc = self.get_location(target);
+        let work_reg = match &dst_loc {
+            Loc::VReg(v) => *v,
+            _ => VReg::V16,
+        };
+        self.emit_fp_move(*x, VReg::V17, insn.typ, size, types);
+        self.emit_fp_move(*y, VReg::V18, insn.typ, size, types);
+        self.emit_fp_move(*z, VReg::V16, insn.typ, size, types);
+        self.push_lir(Aarch64Inst::Fmadd {
+            size: fp_size,
+            src1: VReg::V17,
+            src2: VReg::V18,
+            addend: VReg::V16,
+            dst: work_reg,
+        });
+        if !matches!(&dst_loc, Loc::VReg(v) if *v == work_reg) {
+            self.emit_fp_move_to_loc(work_reg, &dst_loc, insn.typ, size, types);
+        }
+    }
+
+    /// Emit `RoundToIntegral` of a `float` or `double`: the `frint`
+    /// instruction for its direction. Binary128 is a call by now, as for
+    /// `Sqrt`.
+    pub(super) fn emit_fp_round_to_integral(
+        &mut self,
+        insn: &Instruction,
+        how: IntegralRounding,
+        types: &TypeTable,
+    ) {
+        self.emit_fp_unop(insn, types, |cg, size, src, dst| {
+            debug_assert!(size != FpSize::Quad, "a binary128 rounding is a call");
+            cg.push_lir(Aarch64Inst::Frint {
+                how,
+                size,
+                src,
+                dst,
+            });
+        });
+    }
+
+    /// The bits of the value in `src` that hold its sign, into `dst`: the
+    /// whole of a `float` or `double`, or the high lane of a binary128. The
+    /// sign is the top bit of the returned width.
+    fn emit_fp_sign_half_to_gp(&mut self, size: FpSize, src: VReg, dst: Reg) -> OperandSize {
+        if size == FpSize::Quad {
+            self.push_lir(Aarch64Inst::UmovVecDToGp { lane: 1, src, dst });
+            return OperandSize::B64;
+        }
+        self.push_lir(Aarch64Inst::FmovToGp { size, src, dst });
+        if size == FpSize::Single {
+            OperandSize::B32
+        } else {
+            OperandSize::B64
+        }
+    }
+
+    /// Shift `reg` in place by `amount`, to the left or the right.
+    fn emit_gp_shift(&mut self, left: bool, size: OperandSize, reg: Reg, amount: u32) {
+        let amount = GpOperand::Imm(i64::from(amount));
+        self.push_lir(if left {
+            Aarch64Inst::Lsl {
+                size,
+                src: reg,
+                amount,
+                dst: reg,
+            }
+        } else {
+            Aarch64Inst::Lsr {
+                size,
+                src: reg,
+                amount,
+                dst: reg,
+            }
+        });
+    }
+
+    /// Emit `Signbit`: the operand's sign bit, shifted down to be the whole
+    /// answer, 0 or 1. The operand's type is `src_typ`; `typ` is the `int`.
+    pub(super) fn emit_fp_signbit(&mut self, insn: &Instruction, types: &TypeTable) {
+        let (Some(&src), Some(target)) = (insn.src.first(), insn.target) else {
+            return;
+        };
+        let size = Self::size_from_type(insn.src_typ, insn.src_size, types);
+        let fp_size = self.fp_size_from_type(insn.src_typ, insn.src_size, types);
+        let (scratch0, _, _) = Reg::scratch_regs();
+        self.emit_fp_move(src, VReg::V17, insn.src_typ, size, types);
+        let width = self.emit_fp_sign_half_to_gp(fp_size, VReg::V17, scratch0);
+        self.emit_gp_shift(false, width, scratch0, width.bits() - 1);
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(scratch0, &dst_loc, u32::BITS);
+    }
+
+    /// Emit `CopySign`: the first operand with the sign bit of the second,
+    /// merged in general registers and nothing computed, so a NaN keeps its
+    /// payload and nothing raises. A binary128 takes the merged high lane
+    /// back into a copy of the first operand, as `Fabs` does.
+    ///
+    /// Both operands are loaded before the general registers are written,
+    /// since loading one may itself go through a scratch register.
+    pub(super) fn emit_fp_copysign(&mut self, insn: &Instruction, types: &TypeTable) {
+        let (Some(&x), Some(&y), Some(target)) = (insn.src.first(), insn.src.get(1), insn.target)
+        else {
+            return;
+        };
+        let size = Self::size_from_type(insn.typ, insn.size, types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
+        let dst_loc = self.get_location(target);
+        let work_reg = match &dst_loc {
+            Loc::VReg(v) => *v,
+            _ => VReg::V16,
+        };
+        let (magnitude, sign, _) = Reg::scratch_regs();
+
+        self.emit_fp_move(x, VReg::V17, insn.typ, size, types);
+        self.emit_fp_move(y, VReg::V18, insn.typ, size, types);
+        let width = self.emit_fp_sign_half_to_gp(fp_size, VReg::V17, magnitude);
+        self.emit_fp_sign_half_to_gp(fp_size, VReg::V18, sign);
+        let top = width.bits() - 1;
+        self.emit_gp_shift(true, width, magnitude, 1);
+        self.emit_gp_shift(false, width, magnitude, 1);
+        self.emit_gp_shift(false, width, sign, top);
+        self.emit_gp_shift(true, width, sign, top);
+        self.push_lir(Aarch64Inst::Orr {
+            size: width,
+            src1: magnitude,
+            src2: GpOperand::Reg(sign),
+            dst: magnitude,
+        });
+        if fp_size == FpSize::Quad {
+            self.push_lir(Aarch64Inst::FmovReg {
+                size: fp_size,
+                src: VReg::V17,
+                dst: work_reg,
+            });
+            self.push_lir(Aarch64Inst::InsGpToVecD {
+                lane: 1,
+                src: magnitude,
+                dst: work_reg,
+            });
+        } else {
+            self.push_lir(Aarch64Inst::FmovFromGp {
+                size: fp_size,
+                src: magnitude,
+                dst: work_reg,
+            });
+        }
+
+        if !matches!(&dst_loc, Loc::VReg(v) if *v == work_reg) {
+            self.emit_fp_move_to_loc(work_reg, &dst_loc, insn.typ, size, types);
+        }
+    }
+
+    /// A one-operand FP operation, pushed by `emit` given its size and its
+    /// source and destination registers (which differ).
+    fn emit_fp_unop(
+        &mut self,
+        insn: &Instruction,
+        types: &TypeTable,
+        emit: impl FnOnce(&mut Self, FpSize, VReg, VReg),
+    ) {
         let size = Self::size_from_type(insn.typ, insn.size, types);
         let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
         let src = match insn.src.first() {
@@ -426,11 +665,7 @@ impl Aarch64CodeGen {
 
         self.emit_fp_move(src, VReg::V17, insn.typ, size, types);
 
-        self.push_lir(Aarch64Inst::Fneg {
-            size: fp_size,
-            src: VReg::V17,
-            dst: work_reg,
-        });
+        emit(self, fp_size, VReg::V17, work_reg);
 
         if !matches!(&dst_loc, Loc::VReg(v) if *v == work_reg) {
             self.emit_fp_move_to_loc(work_reg, &dst_loc, insn.typ, size, types);
@@ -762,9 +997,9 @@ impl Aarch64CodeGen {
 /// `hi` is zero for everything narrower than binary128.
 pub(super) fn fp_const_bits(f: crate::float::FloatVal, size: FpSize) -> (u64, u64) {
     match size {
-        FpSize::Half => (u64::from(super::f64_to_f16_bits(f.to_f64())), 0),
-        FpSize::Single => (u64::from((f.to_f64() as f32).to_bits()), 0),
+        FpSize::Half => (f.to_bits_at_width(16) as u64, 0),
+        FpSize::Single => (f.to_bits_at_width(32) as u64, 0),
         FpSize::Quad => f.to_f128_bits(),
-        FpSize::Double | FpSize::Extended => (f.to_f64().to_bits(), 0),
+        FpSize::Double | FpSize::Extended => (f.to_bits_at_width(64) as u64, 0),
     }
 }

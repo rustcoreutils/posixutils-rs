@@ -20,9 +20,10 @@
 //! identifier means, and which struct a member path starts from. That is the
 //! [`ConstEnv`] trait; everything else is here.
 
-use crate::parse::ast::{BinaryOp, Expr, ExprKind, OffsetOfPath, UnaryOp};
+use crate::float::{Complex, FloatVal, FpFormat};
+use crate::parse::ast::{BinaryOp, Expr, ExprKind, FpTest, InlineLibraryFn, OffsetOfPath, UnaryOp};
 use crate::symbol::SymbolId;
-use crate::types::{TypeId, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeTable};
 
 /// Which identifiers carry a value in a constant expression.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,14 +66,9 @@ pub(crate) trait ConstEnv {
     /// typedefs and qualifiers stripped.
     fn struct_of(&self, typ: TypeId) -> TypeId;
 
-    /// The value of a constant *floating* subexpression, folded to `f64`.
-    ///
-    /// Only two arms need it -- a comparison, whose result is an integer, and
-    /// a cast to an integer type -- and `f64` decides both. Each host folds at
-    /// its own precision underneath: the linearizer's static initializers are
-    /// computed in the expression's own format, which matters for a
-    /// `long double` and does not matter for an ordering.
-    fn float_value(&self, scope: ConstScope, expr: &Expr) -> Option<f64>;
+    /// The value of an identifier of floating type, or `None` when it is not
+    /// a constant in this scope: [`Self::ident_value`] for a `const double`.
+    fn float_ident_value(&self, sym: SymbolId, scope: ConstScope) -> Option<FloatVal>;
 }
 
 /// Reduce a value to what its type can hold.
@@ -88,15 +84,14 @@ pub(crate) trait ConstEnv {
 /// A type wider than the `i128` the walk carries -- `unsigned __int128` --
 /// is left alone: there is nothing to reduce it to. The unsigned arms of
 /// [`eval_binary`] handle that case directly instead.
-fn normalize(env: &impl ConstEnv, typ: Option<TypeId>, value: i128) -> i128 {
+fn normalize(types: &TypeTable, typ: Option<TypeId>, value: i128) -> i128 {
     let Some(t) = typ else { return value };
-    let types = env.types();
     if !types.is_integer(t) {
         return value;
     }
     // A conversion to `_Bool` yields 0 or 1 (6.3.1.2), not the low byte:
     // `(_Bool)2` is 1, where masking to eight bits left it 2.
-    if types.kind(t) == crate::types::TypeKind::Bool {
+    if types.kind(t) == TypeKind::Bool {
         return (value != 0) as i128;
     }
     let bits = types.size_bits(t);
@@ -111,14 +106,16 @@ fn normalize(env: &impl ConstEnv, typ: Option<TypeId>, value: i128) -> i128 {
     }
 }
 
-/// Does either operand of a comparison have floating type?
+/// Does either operand of a comparison have floating or complex type?
 ///
 /// Asked of the operands rather than the node, because a comparison's own type
 /// is `int` whatever it compares.
 fn has_float_operand(env: &impl ConstEnv, left: &Expr, right: &Expr) -> bool {
-    [left, right]
-        .iter()
-        .any(|e| e.typ.is_some_and(|t| env.types().is_float(t)))
+    let types = env.types();
+    [left, right].iter().any(|e| {
+        e.typ
+            .is_some_and(|t| types.is_float(t) || types.is_complex(t))
+    })
 }
 
 /// Evaluate an integer constant expression, or `None` if it is not one.
@@ -128,7 +125,7 @@ fn has_float_operand(env: &impl ConstEnv, left: &Expr, right: &Expr) -> bool {
 /// converts. See [`normalize`].
 pub(crate) fn eval(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Option<i128> {
     Some(normalize(
-        env,
+        env.types(),
         expr.typ,
         eval_unnormalized(env, scope, expr)?,
     ))
@@ -158,17 +155,56 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             operand,
         } => eval_pointer(env, scope, operand),
 
+        // `!` asks whether its operand is zero, which a floating or complex
+        // operand answers too.
+        ExprKind::Unary {
+            op: UnaryOp::Not,
+            operand,
+        } => Some(i128::from(!eval_truth(env, scope, operand)?)),
+
+        // `__real__` and `__imag__` of an integer: a GNU complex integer's
+        // half, or a real integer and its zero imaginary part.
+        ExprKind::Unary {
+            op: op @ (UnaryOp::Real | UnaryOp::Imag),
+            operand,
+        } => {
+            let typ = expr.typ.filter(|&t| env.types().is_integer(t))?;
+            let (re, im) = eval_complex(env, scope, operand)?;
+            let half = if *op == UnaryOp::Real { re } else { im };
+            float_to_integer(env.types(), half, typ)
+        }
+
         ExprKind::Unary { op, operand } => {
             let val = eval(env, scope, operand)?;
             match op {
                 UnaryOp::Neg => Some(val.wrapping_neg()),
-                UnaryOp::Not => Some(if val == 0 { 1 } else { 0 }),
                 UnaryOp::BitNot => Some(!val),
                 _ => None,
             }
         }
 
         ExprKind::Binary { op, left, right } => eval_binary(env, scope, *op, left, right),
+
+        // `signbit` of a floating constant. gcc makes it an integer constant
+        // expression, so `enum { E = __builtin_signbit(-1.0) };` and a `case`
+        // label of one are accepted in both scopes, as there.
+        ExprKind::FpTest {
+            test: FpTest::SignBit,
+            arg,
+        } => Some(i128::from(eval_float(env, scope, arg)?.sign_bit())),
+
+        // `abs` of a constant, in a static initializer only: a call is not an
+        // integer constant expression, and gcc rejects `int a[abs(-2)];` at
+        // file scope while folding `static int b = abs(-2);`. The argument
+        // is at this node's type, and `abs(INT_MIN)` wraps.
+        ExprKind::InlineLibraryCall {
+            func: InlineLibraryFn::IntAbs,
+            args,
+            ..
+        } if scope == ConstScope::StaticInitializer => match args.as_slice() {
+            [x] => Some(eval(env, scope, x)?.wrapping_abs()),
+            _ => None,
+        },
 
         // `a ?: b` folds like `a ? a : b`; at constant-evaluation time `a`
         // has no side effects to duplicate.
@@ -186,8 +222,7 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             then_expr,
             else_expr,
         } => {
-            let cond_val = eval(env, scope, cond)?;
-            if cond_val != 0 {
+            if eval_truth(env, scope, cond)? {
                 eval(env, scope, then_expr)
             } else {
                 eval(env, scope, else_expr)
@@ -230,13 +265,23 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             // A cast *from* a floating operand truncates the floating value,
             // so the arithmetic below it has to be done in floating point:
             // folding `1.5 + 1.5` through the integer walk made it `1 + 1`,
-            // and `(int)(1.5 + 1.5)` came out 2 rather than 3.
-            if inner.typ.is_some_and(|t| env.types().is_float(t))
-                && env.types().is_integer(*cast_type)
+            // and `(int)(1.5 + 1.5)` came out 2 rather than 3. A complex
+            // operand converts by its real part, or to `_Bool` by both.
+            let types = env.types();
+            if inner
+                .typ
+                .is_some_and(|t| types.is_float(t) || types.is_complex(t))
+                && types.is_integer(*cast_type)
             {
-                if let Some(v) = env.float_value(scope, inner) {
-                    return Some(v.trunc() as i128);
-                }
+                return match (eval_as_integer(env, scope, inner, *cast_type)?, scope) {
+                    (IntConversion::InRange(v), _) => Some(v),
+                    // A value C does not define is no integer constant
+                    // expression -- gcc makes `int a[(int)1e300 > 0];` a VLA.
+                    (IntConversion::Saturated(_), ConstScope::Standard) => None,
+                    // A static initializer must have a value, and gcc's is
+                    // the saturated one.
+                    (IntConversion::Saturated(v), ConstScope::StaticInitializer) => Some(v),
+                };
             }
             eval(env, scope, inner)
         }
@@ -282,9 +327,20 @@ fn eval_binary(
     // `_Static_assert(1.5 > 1.0, "")` is legal and so is `int a[1.5 > 1.0 ? 4 : 8]`.
     // Truncating each side to `i128` first made `1.5 > 1.0` into `1 > 1`.
     if op.is_comparison() && has_float_operand(env, left, right) {
-        let l = env.float_value(scope, left)?;
-        let r = env.float_value(scope, right)?;
-        return Some(compare(op, l.partial_cmp(&r)?) as i128);
+        return eval_float_comparison(env, scope, op, left, right);
+    }
+    // `&&` and `||` ask whether each operand is zero, which a floating or
+    // complex operand answers as well as an integer one.
+    if matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr) {
+        let (l, r) = (
+            eval_truth(env, scope, left)?,
+            eval_truth(env, scope, right)?,
+        );
+        return Some(i128::from(if op == BinaryOp::LogAnd {
+            l && r
+        } else {
+            l || r
+        }));
     }
 
     let l = eval(env, scope, left)?;
@@ -317,7 +373,10 @@ fn eval_binary(
     // The shifts below deliberately use the raw `l` and `r`: 6.5.7p3 promotes
     // each operand separately, so there is no common type to convert to.
     let (lc, rc) = match common {
-        Some(t) => (normalize(env, Some(t), l), normalize(env, Some(t), r)),
+        Some(t) => (
+            normalize(env.types(), Some(t), l),
+            normalize(env.types(), Some(t), r),
+        ),
         None => (l, r),
     };
 
@@ -391,11 +450,516 @@ fn eval_binary(
                 (_, false) => l.wrapping_shr(amount),
             })
         }
-        BinaryOp::LogAnd => Some((l != 0 && r != 0) as i128),
-        BinaryOp::LogOr => Some((l != 0 || r != 0) as i128),
-        // Every comparison returned above.
+        // Every comparison and logical operator returned above.
         _ => None,
     }
+}
+
+/// Evaluate a constant expression of arithmetic type to its exact floating
+/// value, or `None` if it is not one.
+///
+/// The value is the one the expression has *at its own type*: a `double`
+/// literal is rounded to `double` here, an operation is done in its result
+/// type's format (the one the usual arithmetic conversions gave the node), and
+/// a cast converts. So whatever consumes the answer -- a conversion to an
+/// integer, a comparison, a static initializer -- sees what the program would
+/// compute, and none of it has passed through `f64`.
+///
+/// An expression of integer type has an integer value, so it is folded by
+/// [`eval`] and converted exactly: `(1 / 2) + 0.5` is 0.5, and a cast to an
+/// integer type truncates.
+pub(crate) fn eval_float(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Option<FloatVal> {
+    let types = env.types();
+    // A complex value is two reals, which this has no way to answer with.
+    if expr.typ.is_some_and(|t| types.is_complex(t)) {
+        return None;
+    }
+    if let Some(t) = expr.typ.filter(|&t| types.is_integer(t)) {
+        let v = eval(env, scope, expr)?;
+        return Some(integer_to_float(types, t, v));
+    }
+    let fmt = expr.typ.and_then(|t| types.fp_format(t));
+    match &expr.kind {
+        ExprKind::FloatLit(v) => Some(fmt.map_or(*v, |f| v.round_to_format(f))),
+
+        ExprKind::Ident(sym) => env.float_ident_value(*sym, scope),
+
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } => Some(eval_float(env, scope, operand)?.negated()),
+
+        // A half of a complex value, already at the base type this node has;
+        // of a real operand, the value itself and a zero.
+        ExprKind::Unary {
+            op: op @ (UnaryOp::Real | UnaryOp::Imag),
+            operand,
+        } => {
+            let (re, im) = eval_complex(env, scope, operand)?;
+            Some(if *op == UnaryOp::Real { re } else { im })
+        }
+
+        ExprKind::Binary { op, left, right } => {
+            let l = eval_float(env, scope, left)?;
+            let r = eval_float(env, scope, right)?;
+            let fmt = fmt?;
+            Some(match op {
+                BinaryOp::Add => l.add(r, fmt),
+                BinaryOp::Sub => l.sub(r, fmt),
+                BinaryOp::Mul => l.mul(r, fmt),
+                BinaryOp::Div => l.div(r, fmt),
+                _ => return None,
+            })
+        }
+
+        // A cast converts to the target format. Discarding the cast type
+        // let `(float)0.1q` keep every bit of its binary128 value in a static
+        // initializer, where the same cast at run time rounds.
+        ExprKind::Cast {
+            expr: inner,
+            cast_type,
+        } if types.is_float(*cast_type) => eval_as_float(env, scope, inner, *cast_type),
+
+        // The chosen arm, converted to the type the usual arithmetic
+        // conversions gave the whole expression.
+        ExprKind::Conditional { .. } | ExprKind::CondElvis { .. } => {
+            eval_as_float(env, scope, chosen_arm(env, scope, expr)?, expr.typ?)
+        }
+
+        // `fabs`, `copysign`, `sqrt`, the roundings, `fmin`, `fmax` and
+        // `fma` of constants, whose arguments are already at this node's
+        // type. A call is never an integer constant expression, and gcc
+        // agrees -- `int a[(int)fabs(-2.0)];` is a VLA there -- but it folds
+        // one in a static initializer. One with no answer of its own -- a
+        // root's domain error, a `rint(2.5)` that depends on the rounding
+        // direction -- is not a constant, there as here.
+        ExprKind::InlineLibraryCall { func, args, .. }
+            if scope == ConstScope::StaticInitializer =>
+        {
+            match (func, args.as_slice()) {
+                (InlineLibraryFn::Fabs, [x]) => Some(eval_float(env, scope, x)?.magnitude()),
+                (InlineLibraryFn::CopySign, [x, y]) => {
+                    let sign = eval_float(env, scope, y)?;
+                    Some(eval_float(env, scope, x)?.with_sign_of(sign))
+                }
+                (InlineLibraryFn::Sqrt(_), [x]) => eval_float(env, scope, x)?.sqrt(fmt?),
+                (InlineLibraryFn::RoundToIntegral(how), [x]) => {
+                    eval_float(env, scope, x)?.round_to_integral(*how, fmt?)
+                }
+                // gcc does not take a NaN argument to either as a constant,
+                // though the optimizer folds one to the other argument.
+                (InlineLibraryFn::FMin | InlineLibraryFn::FMax, [x, y]) => {
+                    let (x, y) = (eval_float(env, scope, x)?, eval_float(env, scope, y)?);
+                    if x.is_nan() || y.is_nan() {
+                        return None;
+                    }
+                    if *func == InlineLibraryFn::FMin {
+                        x.fmin(y, fmt?)
+                    } else {
+                        x.fmax(y, fmt?)
+                    }
+                }
+                (InlineLibraryFn::Fma, [x, y, z]) => {
+                    let (x, y) = (eval_float(env, scope, x)?, eval_float(env, scope, y)?);
+                    x.fma(y, eval_float(env, scope, z)?, fmt?)
+                }
+                _ => None,
+            }
+        }
+
+        _ => None,
+    }
+}
+
+/// An integer constant of type `typ` as a floating value: exactly, since a
+/// 128-bit magnitude fits the significand. `v` is the two's-complement
+/// pattern the integer walk carries, so an `unsigned __int128` at or above
+/// 2^127 arrives negative and is read back as the unsigned value it is.
+pub(crate) fn integer_to_float(types: &TypeTable, typ: TypeId, v: i128) -> FloatVal {
+    if types.is_unsigned(typ) {
+        FloatVal::from_parts(false, v as u128, 0)
+    } else {
+        FloatVal::from_i128(v)
+    }
+}
+
+/// The constant `val`, the value of an expression of type `from`, converted
+/// to the floating type `to` as the program converts it at run time: rounded
+/// at `from`'s format first, and a NaN quieted when the format changes (see
+/// [`FloatVal::convert`]). From an integer, whose value is exact here, it is
+/// one rounding; to a type that is not floating, nothing.
+pub(crate) fn convert_float(
+    types: &TypeTable,
+    val: FloatVal,
+    from: Option<TypeId>,
+    to: TypeId,
+) -> FloatVal {
+    let src = from.and_then(|t| types.fp_format(t));
+    match (src, types.fp_format(to)) {
+        (Some(src), Some(dst)) => val.convert(src, dst),
+        (None, Some(dst)) => val.round_to_format(dst),
+        (_, None) => val,
+    }
+}
+
+/// The width and signedness [`FloatVal::to_integer`] converts to for the
+/// integer type `to`, or `None` for `_Bool`, whose conversion is no
+/// truncation: every non-zero value -- 0.5 and a NaN included -- becomes 1
+/// (6.3.1.2).
+fn integer_shape(types: &TypeTable, to: TypeId) -> Option<(u32, bool)> {
+    if types.kind(to) == TypeKind::Bool {
+        return None;
+    }
+    Some((types.size_bits(to).clamp(1, 128), !types.is_unsigned(to)))
+}
+
+/// C's conversion of the constant `val` to the integer type `to` (6.3.1.2,
+/// 6.3.1.4), or `None` where it is undefined because the value is out of
+/// range. `val` is at its own type's format already, as [`eval_float`]
+/// leaves it.
+pub(crate) fn float_to_integer(types: &TypeTable, val: FloatVal, to: TypeId) -> Option<i128> {
+    match integer_shape(types, to) {
+        Some((bits, signed)) => val.to_integer(bits, signed),
+        None => Some(i128::from(!val.is_zero())),
+    }
+}
+
+/// [`float_to_integer`] for a context that must have a value, with gcc's
+/// saturated answer where C gives none: see
+/// [`FloatVal::to_integer_saturating`].
+fn float_to_integer_saturating(types: &TypeTable, val: FloatVal, to: TypeId) -> i128 {
+    match integer_shape(types, to) {
+        Some((bits, signed)) => val.to_integer_saturating(bits, signed),
+        None => i128::from(!val.is_zero()),
+    }
+}
+
+/// Evaluate a constant expression of arithmetic type to its complex value,
+/// or `None` if it is not one. A real expression is a complex one with a
+/// zero imaginary part, which is also how the run-time lowering promotes it.
+///
+/// Each half is exact at the base of the expression's own type, as
+/// [`eval_float`] leaves a real constant, and an operation is done in that
+/// base's format by the algorithm c17 runs for the same operation at run
+/// time -- componentwise for `+` and `-`, libgcc's for `*` and `/` (see
+/// [`FloatVal::complex_mul`]). A GNU complex integer's halves are integers.
+pub(crate) fn eval_complex(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Option<Complex> {
+    let types = env.types();
+    let typ = expr.typ?;
+    if !types.is_complex(typ) {
+        return Some((eval_float(env, scope, expr)?, FloatVal::ZERO));
+    }
+    let base = types.complex_base(typ);
+    match &expr.kind {
+        // `I` itself is `__builtin_complex(0.0, 1.0)`.
+        ExprKind::BuiltinComplex { real, imag } => {
+            let half =
+                |e: &Expr| convert_complex_half(types, eval_float(env, scope, e)?, e.typ?, base);
+            Some((half(real)?, half(imag)?))
+        }
+
+        ExprKind::Cast { expr: inner, .. } => eval_complex_as(env, scope, inner, base),
+
+        ExprKind::Conditional { .. } | ExprKind::CondElvis { .. } => {
+            eval_complex_as(env, scope, chosen_arm(env, scope, expr)?, base)
+        }
+
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } => {
+            let (re, im) = eval_complex_as(env, scope, operand, base)?;
+            Some((re.negated(), im.negated()))
+        }
+
+        // GNU `~z` on a complex operand is the conjugate, as is `conj(z)`:
+        // only the imaginary half is negated. On an integer operand `~` is
+        // the bitwise complement, which is not a complex fold at all.
+        ExprKind::Unary {
+            op: UnaryOp::BitNot,
+            operand,
+        } if operand.typ.is_some_and(|t| types.is_complex(t)) => {
+            let (re, im) = eval_complex_as(env, scope, operand, base)?;
+            Some((re, im.negated()))
+        }
+        ExprKind::InlineLibraryCall {
+            func: InlineLibraryFn::Conjugate,
+            args,
+            ..
+        } => {
+            let [operand] = args.as_slice() else {
+                return None;
+            };
+            let (re, im) = eval_complex_as(env, scope, operand, base)?;
+            Some((re, im.negated()))
+        }
+
+        // The usual arithmetic conversions have made `base` the type both
+        // operands are converted to.
+        ExprKind::Binary { op, left, right } => {
+            let x = eval_complex_as(env, scope, left, base)?;
+            let y = eval_complex_as(env, scope, right, base)?;
+            match types.fp_format(base) {
+                Some(fmt) => fold_complex_float(*op, x, y, fmt),
+                None => fold_complex_int(types, *op, x, y, base),
+            }
+        }
+
+        _ => None,
+    }
+}
+
+/// [`eval_complex`], converted to the complex type whose halves are `base`
+/// (C17 6.3.1.6: each half converts as a real value of its type would).
+pub(crate) fn eval_complex_as(
+    env: &impl ConstEnv,
+    scope: ConstScope,
+    expr: &Expr,
+    base: TypeId,
+) -> Option<Complex> {
+    let types = env.types();
+    let (re, im) = eval_complex(env, scope, expr)?;
+    let from = types.complex_base(expr.typ?);
+    Some((
+        convert_complex_half(types, re, from, base)?,
+        convert_complex_half(types, im, from, base)?,
+    ))
+}
+
+/// One half of a complex constant, of the real type `from`, converted to
+/// the real type `to`. A GNU complex integer's halves are integers: one
+/// converting to another wraps as any integer conversion does, and a
+/// floating half converting to one truncates.
+fn convert_complex_half(
+    types: &TypeTable,
+    v: FloatVal,
+    from: TypeId,
+    to: TypeId,
+) -> Option<FloatVal> {
+    if !types.is_integer(to) {
+        return Some(convert_float(types, v, Some(from), to));
+    }
+    let n = if types.is_integer(from) {
+        normalize(types, Some(to), float_to_integer(types, v, from)?)
+    } else {
+        float_to_integer(types, v, to)?
+    };
+    Some(integer_to_float(types, to, n))
+}
+
+/// `x op y` for floating complex constants at `fmt`, as c17's run-time
+/// lowering computes it: `+` and `-` componentwise, `*` and `/` by libgcc's
+/// `__mul?c3` and `__div?c3`, which that lowering calls.
+fn fold_complex_float(op: BinaryOp, x: Complex, y: Complex, fmt: FpFormat) -> Option<Complex> {
+    Some(match op {
+        BinaryOp::Add => (x.0.add(y.0, fmt), x.1.add(y.1, fmt)),
+        BinaryOp::Sub => (x.0.sub(y.0, fmt), x.1.sub(y.1, fmt)),
+        BinaryOp::Mul => FloatVal::complex_mul(x, y, fmt),
+        BinaryOp::Div => FloatVal::complex_div(x, y, fmt),
+        _ => return None,
+    })
+}
+
+/// `x op y` for GNU complex integers whose halves are `base`, as c17's
+/// run-time lowering computes it: the textbook product, and Smith's method
+/// for the quotient (see `emit_complex_int_div`), every step at `base`'s
+/// width and truncating.
+fn fold_complex_int(
+    types: &TypeTable,
+    op: BinaryOp,
+    x: Complex,
+    y: Complex,
+    base: TypeId,
+) -> Option<Complex> {
+    let unsigned = types.is_unsigned(base);
+    let int = |v: FloatVal| float_to_integer(types, v, base);
+    let (a, b, c, d) = (int(x.0)?, int(x.1)?, int(y.0)?, int(y.1)?);
+    let w = |v: i128| normalize(types, Some(base), v);
+    let add = |p: i128, q: i128| w(p.wrapping_add(q));
+    let sub = |p: i128, q: i128| w(p.wrapping_sub(q));
+    let mul = |p: i128, q: i128| w(p.wrapping_mul(q));
+    // Division by zero has no value; leaving it unfolded leaves the
+    // diagnosis to the caller.
+    let div = |p: i128, q: i128| match (q, unsigned) {
+        (0, _) => None,
+        (_, false) => Some(w(p.wrapping_div(q))),
+        (_, true) => Some(w((p as u128 / q as u128) as i128)),
+    };
+    let (re, im) = match op {
+        BinaryOp::Add => (add(a, c), add(b, d)),
+        BinaryOp::Sub => (sub(a, c), sub(b, d)),
+        BinaryOp::Mul => (sub(mul(a, c), mul(b, d)), add(mul(a, d), mul(b, c))),
+        BinaryOp::Div => {
+            let c_smaller = if unsigned {
+                (c as u128) < (d as u128)
+            } else {
+                w(c.wrapping_abs()) < w(d.wrapping_abs())
+            };
+            if c_smaller {
+                let r = div(c, d)?;
+                let denom = add(d, mul(c, r));
+                (
+                    div(add(mul(a, r), b), denom)?,
+                    div(sub(mul(b, r), a), denom)?,
+                )
+            } else {
+                let r = div(d, c)?;
+                let denom = add(c, mul(d, r));
+                (
+                    div(add(a, mul(b, r)), denom)?,
+                    div(sub(b, mul(a, r)), denom)?,
+                )
+            }
+        }
+        _ => return None,
+    };
+    Some((
+        integer_to_float(types, base, re),
+        integer_to_float(types, base, im),
+    ))
+}
+
+/// The arm a constant `?:` or `?:`-elvis chooses, or `None` when `expr` is
+/// neither or its condition is not a constant. The arm still has to be
+/// converted to the node's type, which the caller knows how to do.
+fn chosen_arm<'e>(env: &impl ConstEnv, scope: ConstScope, expr: &'e Expr) -> Option<&'e Expr> {
+    match &expr.kind {
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => Some(if eval_truth(env, scope, cond)? {
+            then_expr
+        } else {
+            else_expr
+        }),
+        ExprKind::CondElvis { cond, else_expr } => Some(if eval_truth(env, scope, cond)? {
+            cond
+        } else {
+            else_expr
+        }),
+        _ => None,
+    }
+}
+
+/// The value `expr` has once converted to a real type: its real part if it is
+/// complex (6.3.1.7p2), and the real type that part has.
+fn real_part(
+    env: &impl ConstEnv,
+    scope: ConstScope,
+    expr: &Expr,
+) -> Option<(FloatVal, Option<TypeId>)> {
+    let types = env.types();
+    match expr.typ {
+        Some(t) if types.is_complex(t) => Some((
+            eval_complex(env, scope, expr)?.0,
+            Some(types.complex_base(t)),
+        )),
+        _ => Some((eval_float(env, scope, expr)?, expr.typ)),
+    }
+}
+
+/// The constant `expr` converted to the real floating type `to`, as a cast
+/// or an assignment converts it: rounded from its own type, and a complex
+/// value's imaginary part discarded.
+pub(crate) fn eval_as_float(
+    env: &impl ConstEnv,
+    scope: ConstScope,
+    expr: &Expr,
+    to: TypeId,
+) -> Option<FloatVal> {
+    let (v, from) = real_part(env, scope, expr)?;
+    Some(convert_float(env.types(), v, from, to))
+}
+
+/// A constant converted to an integer type: in range, or out of range with
+/// gcc's saturated value standing in for the one C does not define.
+pub(crate) enum IntConversion {
+    InRange(i128),
+    Saturated(i128),
+}
+
+/// The constant `expr` of floating or complex type converted to the integer
+/// type `to`, as a cast or an assignment converts it (6.3.1.2, 6.3.1.4,
+/// 6.3.1.7): `_Bool` asks whether the value is zero, any other integer type
+/// truncates the real part. A complex integer's real part is already an
+/// integer, and the caller's reduction to `to` wraps it.
+pub(crate) fn eval_as_integer(
+    env: &impl ConstEnv,
+    scope: ConstScope,
+    expr: &Expr,
+    to: TypeId,
+) -> Option<IntConversion> {
+    let types = env.types();
+    if types.kind(to) == TypeKind::Bool {
+        return Some(IntConversion::InRange(i128::from(eval_truth(
+            env, scope, expr,
+        )?)));
+    }
+    let (v, from) = real_part(env, scope, expr)?;
+    if let Some(from) = from.filter(|&f| types.is_integer(f)) {
+        return Some(IntConversion::InRange(float_to_integer(types, v, from)?));
+    }
+    Some(match float_to_integer(types, v, to) {
+        Some(n) => IntConversion::InRange(n),
+        None => IntConversion::Saturated(float_to_integer_saturating(types, v, to)),
+    })
+}
+
+/// Whether a scalar constant is non-zero -- what `!`, `&&`, `||` and a
+/// condition ask of it (6.5.3.3p5, 6.5.13, 6.5.15p4). A floating value is
+/// zero only as either zero, so a NaN is true; a complex one is zero only
+/// when both halves are.
+pub(crate) fn eval_truth(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Option<bool> {
+    let types = env.types();
+    match expr.typ {
+        Some(t) if types.is_complex(t) => {
+            let (re, im) = eval_complex(env, scope, expr)?;
+            Some(!re.is_zero() || !im.is_zero())
+        }
+        Some(t) if types.is_float(t) => Some(!eval_float(env, scope, expr)?.is_zero()),
+        _ => Some(eval(env, scope, expr)? != 0),
+    }
+}
+
+/// C's `op`, a relational or equality operator, on two floating values
+/// already converted to their common real type. Exact, since `cmp_value`
+/// is; unordered, a NaN is unequal to everything and ordered against
+/// nothing, so only `!=` holds.
+fn compare_floats(op: BinaryOp, l: FloatVal, r: FloatVal) -> bool {
+    match l.cmp_value(r) {
+        Some(ord) => compare(op, ord),
+        None => op == BinaryOp::Ne,
+    }
+}
+
+/// A comparison with a floating or complex operand. Both operands convert to
+/// their common type first (6.5.8p3, 6.5.9p4; 6.3.1.8), then compare exactly
+/// in it: a complex pair is equal when both halves are. Only `==` and `!=`
+/// take a complex operand -- the parser rejects an ordering of one.
+fn eval_float_comparison(
+    env: &impl ConstEnv,
+    scope: ConstScope,
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+) -> Option<i128> {
+    let types = env.types();
+    let common = types.common_type(left.typ?, right.typ?);
+    if types.is_complex(common) {
+        if !matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
+            return None;
+        }
+        let base = types.complex_base(common);
+        let x = eval_complex_as(env, scope, left, base)?;
+        let y = eval_complex_as(env, scope, right, base)?;
+        let equal =
+            compare_floats(BinaryOp::Eq, x.0, y.0) && compare_floats(BinaryOp::Eq, x.1, y.1);
+        return Some(i128::from(equal == (op == BinaryOp::Eq)));
+    }
+    let l = eval_as_float(env, scope, left, common)?;
+    let r = eval_as_float(env, scope, right, common)?;
+    Some(i128::from(compare_floats(op, l, r)))
 }
 
 /// Turn an ordering into the 0/1 a relational or equality operator yields.

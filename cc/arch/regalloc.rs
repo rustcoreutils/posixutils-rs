@@ -10,7 +10,7 @@
 //
 
 use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
-use crate::types::TypeTable;
+use crate::types::{TypeId, TypeTable};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
@@ -352,10 +352,9 @@ pub fn expire_stack_intervals(
 ///
 /// `is_call_like` decides per-opcode. The shared core opcodes are
 /// `Call`, `Longjmp`, `Setjmp`; backends extend that list with any
-/// IR opcodes whose codegen lowering emits a libc call (e.g.
-/// `Fabs32`, `Signbit64` on both arches; `Memcpy`, `Memmove` on
-/// x86_64). Without this, chordal coloring will happily put a live
-/// pseudo into a caller-saved register that the codegen helper's
+/// IR opcodes whose codegen lowering emits a libc call (e.g. `Memcpy`,
+/// `Memmove` on both arches). Without this, chordal coloring will happily put
+/// a live pseudo into a caller-saved register that the codegen helper's
 /// embedded libc call silently overwrites — see `memory/MEMORY.md`
 pub fn find_call_positions(func: &Function, is_call_like: impl Fn(Opcode) -> bool) -> Vec<usize> {
     let mut call_positions = Vec::with_capacity(DEFAULT_CALL_POS_CAPACITY);
@@ -850,7 +849,7 @@ pub fn identify_addr_taken_syms(func: &Function) -> HashSet<PseudoId> {
 /// targets should NOT be in FP registers.
 pub fn identify_fp_pseudos<F>(func: &Function, is_float_type: F) -> HashSet<PseudoId>
 where
-    F: Fn(crate::types::TypeId) -> bool,
+    F: Fn(TypeId) -> bool,
 {
     use crate::ir::Opcode;
 
@@ -1557,11 +1556,7 @@ impl AbiLowering {
         // Detect the hidden return pointer for large struct returns.
         // The linearizer emits it as `Arg(0)` with the literal name
         // `__sret`, shifting all normal-parameter `Arg(n)` indices by 1.
-        let sret_pseudo = func
-            .pseudos
-            .iter()
-            .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"))
-            .map(|p| p.id);
+        let sret_pseudo = func.sret_arg();
         let arg_idx_offset: u32 = if sret_pseudo.is_some() { 1 } else { 0 };
 
         // Index pseudos by Arg(n): O(P) once, O(1) per argument.
@@ -1591,11 +1586,54 @@ impl AbiLowering {
             arg_idx_offset,
         }
     }
+
+    /// The declared type of the parameter an `Arg(arg)` pseudo carries, or
+    /// `None` for the hidden sret pointer, which is no declared parameter.
+    pub fn param_type(&self, func: &Function, arg: u32) -> Option<TypeId> {
+        func.param_type_of_arg(arg)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With a hidden sret pointer, `Arg(0)` is that pointer and each declared
+    /// parameter is one `Arg` further along; without one, `Arg(n)` is
+    /// `params[n]`. Indexing `params` by the `Arg` number took the next
+    /// parameter's type -- a `double _Complex` parameter of a function
+    /// returning a large struct was not recognised as complex and lost its
+    /// imaginary half.
+    #[test]
+    fn param_type_skips_the_hidden_return_pointer() {
+        use crate::ir::Pseudo;
+        let types = TypeTable::new(&crate::target::Target::host());
+        let params = [types.int_id, types.double_id];
+        for sret in [false, true] {
+            let mut func = Function::new("f", types.void_id);
+            let offset = u32::from(sret);
+            if sret {
+                func.add_pseudo(Pseudo::arg(PseudoId(0), 0).with_name("__sret"));
+            }
+            for (i, typ) in params.iter().enumerate() {
+                func.add_param(format!("p{i}"), *typ);
+                let n = i as u32 + offset;
+                func.add_pseudo(Pseudo::arg(PseudoId(n), n));
+            }
+            let lowering = AbiLowering::new(&func);
+            if sret {
+                assert_eq!(lowering.param_type(&func, 0), None, "the sret pointer");
+            }
+            for (i, typ) in params.iter().enumerate() {
+                assert_eq!(
+                    lowering.param_type(&func, i as u32 + offset),
+                    Some(*typ),
+                    "parameter {i}, sret {sret}"
+                );
+            }
+            assert_eq!(lowering.param_type(&func, 2 + offset), None);
+        }
+    }
 
     /// A slot's size is rounded up to its alignment inside the check, and the
     /// frame's final rounding is reserved: the largest admitted locals area

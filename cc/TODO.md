@@ -359,21 +359,11 @@ is GPLv3 and is not vendored) and diffs a recorded baseline, so a regression
 fails by name rather than shifting a percentage.
 
 The suite is run at `-O0` and `-O2`. `c17_torture.sh` prints the totals and
-names every regression against `torture-baseline.txt`; the groups below say
-what each remaining failure needs.
+names every regression against `torture-baseline.txt`.
 
 One conformance gap found while working through it: c17 has no C17 6.7.3p2
 check, so `restrict int x;` is accepted where gcc errors that `restrict` may
 only qualify a pointer to object type.
-
-### Still open
-
-Most of what is left is one thing.
-
-| Group | Note |
-|---|---|
-| Builtin folding | The whole of `execute/builtins/`. Each test defines its own `strlen`, `memcpy` or `printf` that calls `abort()` when `__OPTIMIZE__` is set, so a run-time failure there means c17 emitted a real call where gcc folded the builtin or expanded it inline. Nothing fails to *compile*, so no build is blocked; it is gcc-parity and code quality. Deferred by decision. The same group: `execute/printf-chk-1`, `fprintf-chk-1`, `vprintf-chk-1` and `vfprintf-chk-1` at `-O2`, which expect `__printf_chk` with a constant format to become `puts`/`putchar`; `builtins/abs-2`, `abs-3`, `complex-1` and `memcmp` at `-O2`, which expect a constant call folded so that a `link_error` reference disappears; `builtins/strncmp` at `-O0`, whose own `strncmp` returns an uninitialised value for `n == 0`, so it passes only when the call is folded to 0 -- which gcc does at every level; `builtins/abs-1`, which expects `labs` expanded inline at every level; and `builtins/strnlen`, `strstr-asm`, `fprintf` and `fputs` at `-O1` and above |
-| Dead-call elimination proofs | `20030330-1`, `medce-1` and `ieee/fp-cmp-7` at `-O0`, where a constant branch keeps its arm (recorded in DECISIONS.md). Each calls an undefined `link_error` the optimizer is expected to delete, so they fail to *link* |
 
 One conformance gap worth naming: `(cond) ? some_void_call() : 0` is rejected.
 gcc accepts a conditional with one `void` arm as an extension; C17 6.5.15p3

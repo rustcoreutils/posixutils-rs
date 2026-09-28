@@ -13,9 +13,18 @@ use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
-use crate::float::{f64_to_f16_bits, FloatVal};
+use crate::float::{FloatVal, IntegralRounding};
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
+
+/// What `emit_fp_sign_bit_op` does to the sign bit.
+#[derive(Clone, Copy)]
+enum SignBitOp {
+    /// Negate (`FNeg`).
+    Flip,
+    /// Take the magnitude (`Fabs`).
+    Clear,
+}
 
 impl X86_64CodeGen {
     /// Get size in bits from type, with fallback to provided size.
@@ -62,14 +71,14 @@ impl X86_64CodeGen {
 
         match addr_loc {
             Loc::Reg(r) => {
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Mem(MemAddr::BaseOffset {
+                self.push_fp_mem_load(
+                    fp_size,
+                    MemAddr::BaseOffset {
                         base: r,
                         offset: insn.displacement(),
-                    }),
-                    dst: XmmOperand::Reg(dst_xmm),
-                });
+                    },
+                    dst_xmm,
+                );
             }
             Loc::Stack(offset) => {
                 // Check if the address operand is a symbol (local variable) or a temp (spilled address)
@@ -77,11 +86,11 @@ impl X86_64CodeGen {
 
                 if is_symbol {
                     // Local variable - load directly from stack slot
-                    self.push_lir(X86Inst::MovFp {
-                        size: fp_size,
-                        src: XmmOperand::Mem(self.stack_mem(offset - insn.displacement())),
-                        dst: XmmOperand::Reg(dst_xmm),
-                    });
+                    self.push_fp_mem_load(
+                        fp_size,
+                        self.stack_mem(offset - insn.displacement()),
+                        dst_xmm,
+                    );
                 } else {
                     // Spilled address - load address first, then load from that address
                     self.push_lir(X86Inst::Mov {
@@ -89,35 +98,31 @@ impl X86_64CodeGen {
                         src: GpOperand::Mem(self.stack_mem(offset)),
                         dst: GpOperand::Reg(Reg::R11),
                     });
-                    self.push_lir(X86Inst::MovFp {
-                        size: fp_size,
-                        src: XmmOperand::Mem(MemAddr::BaseOffset {
+                    self.push_fp_mem_load(
+                        fp_size,
+                        MemAddr::BaseOffset {
                             base: Reg::R11,
                             offset: insn.displacement(),
-                        }),
-                        dst: XmmOperand::Reg(dst_xmm),
-                    });
+                        },
+                        dst_xmm,
+                    );
                 }
             }
             Loc::Global(name) => {
                 let src = self.global_mem(&name, insn.displacement(), Reg::R11);
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Mem(src),
-                    dst: XmmOperand::Reg(dst_xmm),
-                });
+                self.push_fp_mem_load(fp_size, src, dst_xmm);
             }
             _ => {
                 // Load address into R11, then load from that address
                 self.emit_move(addr, Reg::R11, 64);
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Mem(MemAddr::BaseOffset {
+                self.push_fp_mem_load(
+                    fp_size,
+                    MemAddr::BaseOffset {
                         base: Reg::R11,
                         offset: insn.displacement(),
-                    }),
-                    dst: XmmOperand::Reg(dst_xmm),
-                });
+                    },
+                    dst_xmm,
+                );
             }
         }
 
@@ -169,14 +174,14 @@ impl X86_64CodeGen {
             Loc::Reg(_) => {
                 // Use the saved register (R11 if it was RAX, otherwise original)
                 let r = addr_reg.unwrap_or(Reg::Rax);
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm15),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                self.push_fp_mem_store(
+                    fp_size,
+                    XmmReg::Xmm15,
+                    MemAddr::BaseOffset {
                         base: r,
                         offset: insn.displacement(),
-                    }),
-                });
+                    },
+                );
             }
             Loc::Stack(offset) => {
                 // Check if the address operand is a symbol (local variable) or a temp (spilled address)
@@ -184,11 +189,11 @@ impl X86_64CodeGen {
 
                 if is_symbol {
                     // Local variable - store directly to stack slot
-                    self.push_lir(X86Inst::MovFp {
-                        size: fp_size,
-                        src: XmmOperand::Reg(XmmReg::Xmm15),
-                        dst: XmmOperand::Mem(self.stack_mem(offset - insn.displacement())),
-                    });
+                    self.push_fp_mem_store(
+                        fp_size,
+                        XmmReg::Xmm15,
+                        self.stack_mem(offset - insn.displacement()),
+                    );
                 } else {
                     // Spilled address - load address first, then store through it
                     self.push_lir(X86Inst::Mov {
@@ -196,37 +201,89 @@ impl X86_64CodeGen {
                         src: GpOperand::Mem(self.stack_mem(offset)),
                         dst: GpOperand::Reg(Reg::R11),
                     });
-                    self.push_lir(X86Inst::MovFp {
-                        size: fp_size,
-                        src: XmmOperand::Reg(XmmReg::Xmm15),
-                        dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                    self.push_fp_mem_store(
+                        fp_size,
+                        XmmReg::Xmm15,
+                        MemAddr::BaseOffset {
                             base: Reg::R11,
                             offset: insn.displacement(),
-                        }),
-                    });
+                        },
+                    );
                 }
             }
             Loc::Global(name) => {
                 let dst = self.global_mem(&name, insn.displacement(), Reg::R11);
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm15),
-                    dst: XmmOperand::Mem(dst),
-                });
+                self.push_fp_mem_store(fp_size, XmmReg::Xmm15, dst);
             }
             _ => {
                 // Load address into R11, then store
                 self.emit_move(addr, Reg::R11, 64);
-                self.push_lir(X86Inst::MovFp {
-                    size: fp_size,
-                    src: XmmOperand::Reg(XmmReg::Xmm15),
-                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                self.push_fp_mem_store(
+                    fp_size,
+                    XmmReg::Xmm15,
+                    MemAddr::BaseOffset {
                         base: Reg::R11,
                         offset: insn.displacement(),
-                    }),
-                });
+                    },
+                );
             }
         }
+    }
+
+    /// Load a `size` value from `src` into `dst`.
+    ///
+    /// binary16 has no SSE2 load of its own width: `movss` reads four bytes,
+    /// two of them past the value, which can fault at the end of a page. It is
+    /// read as a word into R10 (a codegen scratch register) and moved across,
+    /// as gcc does, which also leaves the register's upper bits zero.
+    fn push_fp_mem_load(&mut self, size: FpSize, src: MemAddr, dst: XmmReg) {
+        if size != FpSize::Half {
+            self.push_lir(X86Inst::MovFp {
+                size,
+                src: XmmOperand::Mem(src),
+                dst: XmmOperand::Reg(dst),
+            });
+            return;
+        }
+        self.push_lir(X86Inst::Movzx {
+            src_size: OperandSize::B16,
+            dst_size: OperandSize::B32,
+            src: GpOperand::Mem(src),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::MovGpXmm {
+            size: OperandSize::B32,
+            src: Reg::R10,
+            dst,
+        });
+    }
+
+    /// Store the `size` value in `src` to `dst`.
+    ///
+    /// binary16 has no SSE2 store of its own width, and `movss` writes four
+    /// bytes: storing one half of a `_Float16 _Complex`, or one member of a
+    /// struct of `_Float16`s, overwrote the next one. It goes through R10's
+    /// low word instead, as gcc does (SSE4.1's `pextrw` to memory is not in
+    /// the x86-64 baseline).
+    fn push_fp_mem_store(&mut self, size: FpSize, src: XmmReg, dst: MemAddr) {
+        if size != FpSize::Half {
+            self.push_lir(X86Inst::MovFp {
+                size,
+                src: XmmOperand::Reg(src),
+                dst: XmmOperand::Mem(dst),
+            });
+            return;
+        }
+        self.push_lir(X86Inst::MovXmmGp {
+            size: OperandSize::B32,
+            src,
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B16,
+            src: GpOperand::Reg(Reg::R10),
+            dst: GpOperand::Mem(dst),
+        });
     }
 
     /// Emit floating-point binary operation (addss/addsd, subss/subsd, etc.)
@@ -353,8 +410,293 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit floating-point negation
+    /// Emit floating-point negation: flip the sign bit.
     pub(super) fn emit_fp_neg(&mut self, insn: &Instruction, types: &TypeTable) {
+        self.emit_fp_sign_bit_op(insn, types, SignBitOp::Flip);
+    }
+
+    /// Emit `Fabs` of a `float` or `double`: clear the sign bit, in place. Only that bit
+    /// changes, so `-0.0` becomes `+0.0` and a NaN keeps its payload.
+    pub(super) fn emit_fp_abs(&mut self, insn: &Instruction, types: &TypeTable) {
+        self.emit_fp_sign_bit_op(insn, types, SignBitOp::Clear);
+    }
+
+    /// Emit `Sqrt` of a `float` or `double`: `sqrtss`/`sqrtsd`, correctly
+    /// rounded in the current rounding mode.
+    pub(super) fn emit_fp_sqrt(&mut self, insn: &Instruction, types: &TypeTable) {
+        let (Some(&src), Some(target)) = (insn.src.first(), insn.target) else {
+            return;
+        };
+        let fp_size = self.fp_format(insn.typ, insn.size, types);
+        let dst_loc = self.get_location(target);
+        // A reserved scratch register when the result lives on the stack; see
+        // emit_fp_binop.
+        let dst_xmm = match &dst_loc {
+            Loc::Xmm(x) => *x,
+            _ => XmmReg::Xmm15,
+        };
+        self.emit_fp_move(src, dst_xmm, fp_size);
+        self.push_lir(X86Inst::SqrtFp {
+            size: fp_size,
+            src: XmmOperand::Reg(dst_xmm),
+            dst: dst_xmm,
+        });
+        if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
+            self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, fp_size);
+        }
+    }
+
+    /// Emit `RoundToIntegral` of a `float` or `double` -- `floor`, `ceil`,
+    /// `trunc` or `rint` -- with SSE2 alone: gcc's sequences at the x86-64
+    /// baseline, which has no `roundsd`.
+    ///
+    /// A value of magnitude 2^52 (2^23 for a `float`) or more has no
+    /// fraction, and is its own answer, as are an infinity and a NaN, which
+    /// is returned as it came -- a signalling one too, as gcc's sequence
+    /// does. The test is on the biased exponent, in R10, so it raises
+    /// nothing. Below that:
+    /// - `floor`, `ceil`, `trunc`: the value converted to an integer with
+    ///   truncation and back, which is exact, then one subtracted for a
+    ///   `floor` that came out above the value or added for a `ceil` that
+    ///   came out below it.
+    /// - `rint`: 2^52 of the value's own sign added and subtracted, which
+    ///   leaves the value rounded in the current direction.
+    ///
+    /// In both, the sign of the value is then **set** on the result rather
+    /// than or-ed into it, as gcc's sequence does: the zero a `floor(0.5)`
+    /// computes as `0 - 0` is `-0` when rounding downward, and the sign has
+    /// to be the value's in every direction -- `rint(0.5)` is `+0` and
+    /// `rint(-0.5)` is `-0`. gcc's sequences assume the default direction
+    /// (`-fno-rounding-math`) and get these wrong in the others; so does its
+    /// `rint`, which rounds the magnitude and not the value, and this one
+    /// does not. `cvttsd2si` raises *inexact* for a fraction, as it does in
+    /// gcc's `floor`.
+    ///
+    /// The value's bits stay in R11 throughout, which is what leaves the two
+    /// reserved XMM registers enough: xmm15 holds the value and then the
+    /// result, xmm14 the integer being built.
+    pub(super) fn emit_fp_round_to_integral(
+        &mut self,
+        insn: &Instruction,
+        how: IntegralRounding,
+        types: &TypeTable,
+    ) {
+        let (Some(&src), Some(target)) = (insn.src.first(), insn.target) else {
+            return;
+        };
+        let fp_size = self.fp_format(insn.typ, insn.size, types);
+        let size = Self::fp_bits_size(fp_size);
+        // The stored significand's width, and the biased exponent of the
+        // format's first power of two with no fraction bits.
+        let (mant_bits, bias) = if fp_size == FpSize::Single {
+            (23u8, 127i64)
+        } else {
+            (52u8, 1023i64)
+        };
+        let top = ShiftCount::Imm((size.bits() - 1) as u8);
+        let (x, int) = (XmmReg::Xmm15, XmmReg::Xmm14);
+
+        let uid = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        let done = Label::block(&self.base.current_fn, 10000 + uid * 2);
+
+        self.emit_fp_move(src, x, fp_size);
+        self.emit_xmm_bits_to_gp(x, fp_size, Reg::R11);
+        // R10 = the biased exponent: the sign shifted out, then the
+        // significand.
+        self.push_lir(X86Inst::Mov {
+            size,
+            src: GpOperand::Reg(Reg::R11),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        self.push_lir(X86Inst::Shl {
+            size,
+            count: ShiftCount::Imm(1),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Shr {
+            size,
+            count: ShiftCount::Imm(mant_bits + 1),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Cmp {
+            size,
+            src: GpOperand::Imm(bias + i64::from(mant_bits)),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Uge,
+            target: done.clone(),
+        });
+
+        match how {
+            IntegralRounding::Rint => {
+                // R10 = 2^52 with the value's sign: sign, then the biased
+                // exponent of 2^52 below it, shifted up over the significand.
+                self.push_lir(X86Inst::Mov {
+                    size,
+                    src: GpOperand::Reg(Reg::R11),
+                    dst: GpOperand::Reg(Reg::R10),
+                });
+                self.push_lir(X86Inst::Shr {
+                    size,
+                    count: top,
+                    dst: Reg::R10,
+                });
+                let exp_bits = size.bits() as u8 - 1 - mant_bits;
+                self.push_lir(X86Inst::Shl {
+                    size,
+                    count: ShiftCount::Imm(exp_bits),
+                    dst: Reg::R10,
+                });
+                self.push_lir(X86Inst::Or {
+                    size,
+                    src: GpOperand::Imm(bias + i64::from(mant_bits)),
+                    dst: Reg::R10,
+                });
+                self.push_lir(X86Inst::Shl {
+                    size,
+                    count: ShiftCount::Imm(mant_bits),
+                    dst: Reg::R10,
+                });
+                self.push_lir(X86Inst::MovGpXmm {
+                    size,
+                    src: Reg::R10,
+                    dst: int,
+                });
+                self.push_lir(X86Inst::AddFp {
+                    size: fp_size,
+                    src: XmmOperand::Reg(int),
+                    dst: x,
+                });
+                self.push_lir(X86Inst::SubFp {
+                    size: fp_size,
+                    src: XmmOperand::Reg(int),
+                    dst: x,
+                });
+                self.push_lir(X86Inst::MovFp {
+                    size: fp_size,
+                    src: XmmOperand::Reg(x),
+                    dst: XmmOperand::Reg(int),
+                });
+            }
+            IntegralRounding::Floor | IntegralRounding::Ceil | IntegralRounding::Trunc => {
+                self.push_lir(X86Inst::CvtFpToInt {
+                    fp_size,
+                    int_size: size,
+                    src: XmmOperand::Reg(x),
+                    dst: Reg::R10,
+                });
+                self.push_lir(X86Inst::CvtIntToFp {
+                    int_size: size,
+                    fp_size,
+                    src: GpOperand::Reg(Reg::R10),
+                    dst: int,
+                });
+                self.emit_fp_integral_step(how, fp_size, x, int);
+            }
+            IntegralRounding::Round | IntegralRounding::NearbyInt => {
+                unreachable!("{how:?} is a call on x86-64 (see computes_in_place)")
+            }
+        }
+
+        // The result: the integer's magnitude (R10, its sign shifted out and
+        // back as zero) with the value's sign (R11, shifted down and back).
+        self.emit_xmm_bits_to_gp(int, fp_size, Reg::R10);
+        let one = ShiftCount::Imm(1);
+        self.push_lir(X86Inst::Shl {
+            size,
+            count: one,
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Shr {
+            size,
+            count: one,
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Shr {
+            size,
+            count: top,
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Shl {
+            size,
+            count: top,
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Or {
+            size,
+            src: GpOperand::Reg(Reg::R11),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::MovGpXmm {
+            size,
+            src: Reg::R10,
+            dst: x,
+        });
+
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(done)));
+        let dst_loc = self.get_location(target);
+        self.emit_fp_move_from_xmm(x, &dst_loc, fp_size);
+    }
+
+    /// The `floor` or `ceil` correction of the truncated integer in `int`,
+    /// against the value in `x`: one less for a `floor` that came out above
+    /// the value, one more for a `ceil` that came out below it; nothing for
+    /// a `trunc`. The 0 or 1 is built in R10 from the comparison and
+    /// converted, overwriting `x`, whose bits are kept in R11.
+    fn emit_fp_integral_step(
+        &mut self,
+        how: IntegralRounding,
+        fp_size: FpSize,
+        x: XmmReg,
+        int: XmmReg,
+    ) {
+        // `ucomis[sd] src, dst` sets "above" when dst > src.
+        let (above, below) = match how {
+            IntegralRounding::Floor => (int, x),
+            IntegralRounding::Ceil => (x, int),
+            _ => return,
+        };
+        self.push_lir(X86Inst::UComiFp {
+            size: fp_size,
+            src: XmmOperand::Reg(below),
+            dst: above,
+        });
+        self.push_lir(X86Inst::SetCC {
+            cc: CondCode::Ugt,
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Movzx {
+            src_size: OperandSize::B8,
+            dst_size: OperandSize::B32,
+            src: GpOperand::Reg(Reg::R10),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::CvtIntToFp {
+            int_size: OperandSize::B32,
+            fp_size,
+            src: GpOperand::Reg(Reg::R10),
+            dst: x,
+        });
+        self.push_lir(if how == IntegralRounding::Floor {
+            X86Inst::SubFp {
+                size: fp_size,
+                src: XmmOperand::Reg(x),
+                dst: int,
+            }
+        } else {
+            X86Inst::AddFp {
+                size: fp_size,
+                src: XmmOperand::Reg(x),
+                dst: int,
+            }
+        });
+    }
+
+    /// Flip or clear the sign bit of an SSE float or double: an
+    /// `xorps`/`xorpd` or `andps`/`andpd` with a mask built through R10.
+    fn emit_fp_sign_bit_op(&mut self, insn: &Instruction, types: &TypeTable, op: SignBitOp) {
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -378,9 +720,7 @@ impl X86_64CodeGen {
         // Move source to destination
         self.emit_fp_move(src, dst_xmm, self.fp_format(insn.typ, insn.size, types));
 
-        // XOR with sign bit mask to negate
-        // For float: 0x80000000, for double: 0x8000000000000000
-        // Use a scratch register that's not dst_xmm to hold the sign mask
+        // The sign-bit mask goes in a scratch register that's not dst_xmm.
         let scratch_xmm = if dst_xmm == XmmReg::Xmm15 {
             XmmReg::Xmm14
         } else {
@@ -389,10 +729,17 @@ impl X86_64CodeGen {
         // Use R10 (scratch) to avoid clobbering RAX which may hold
         // a live pseudo (the register allocator allocates RAX to pseudos
         // but doesn't know FP operations use it as scratch).
-        if fp_size == FpSize::Single {
+        let single = fp_size == FpSize::Single;
+        let sign_bit: u64 = if single { 1 << 31 } else { 1 << 63 };
+        let mask = match op {
+            SignBitOp::Flip => sign_bit,
+            // Every bit below the sign bit.
+            SignBitOp::Clear => sign_bit - 1,
+        };
+        if single {
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B32,
-                src: GpOperand::Imm(0x80000000),
+                src: GpOperand::Imm(mask as i64),
                 dst: GpOperand::Reg(Reg::R10),
             });
             self.push_lir(X86Inst::MovGpXmm {
@@ -400,14 +747,9 @@ impl X86_64CodeGen {
                 src: Reg::R10,
                 dst: scratch_xmm,
             });
-            self.push_lir(X86Inst::XorFp {
-                size: fp_size,
-                src: scratch_xmm,
-                dst: dst_xmm,
-            });
         } else {
             self.push_lir(X86Inst::MovAbs {
-                imm: 0x8000000000000000u64 as i64,
+                imm: mask as i64,
                 dst: Reg::R10,
             });
             self.push_lir(X86Inst::MovGpXmm {
@@ -415,12 +757,19 @@ impl X86_64CodeGen {
                 src: Reg::R10,
                 dst: scratch_xmm,
             });
-            self.push_lir(X86Inst::XorFp {
+        }
+        self.push_lir(match op {
+            SignBitOp::Flip => X86Inst::XorFp {
                 size: fp_size,
                 src: scratch_xmm,
                 dst: dst_xmm,
-            });
-        }
+            },
+            SignBitOp::Clear => X86Inst::AndFp {
+                size: fp_size,
+                src: scratch_xmm,
+                dst: dst_xmm,
+            },
+        });
 
         if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
             self.emit_fp_move_from_xmm(
@@ -428,6 +777,109 @@ impl X86_64CodeGen {
                 &dst_loc,
                 self.fp_format(insn.typ, insn.size, types),
             );
+        }
+    }
+
+    /// The bits of the SSE value in `src` into the general register `dst`.
+    fn emit_xmm_bits_to_gp(&mut self, src: XmmReg, fp_size: FpSize, dst: Reg) {
+        self.push_lir(X86Inst::MovXmmGp {
+            size: Self::fp_bits_size(fp_size),
+            src,
+            dst,
+        });
+    }
+
+    /// The integer operand size that holds an SSE `float` or `double`.
+    fn fp_bits_size(fp_size: FpSize) -> OperandSize {
+        if fp_size == FpSize::Single {
+            OperandSize::B32
+        } else {
+            OperandSize::B64
+        }
+    }
+
+    /// Emit `Signbit` of a `float` or `double`: its bits into R10, shifted
+    /// down so the sign bit is the whole answer, 0 or 1.
+    pub(super) fn emit_fp_signbit(&mut self, insn: &Instruction, types: &TypeTable) {
+        let (Some(&src), Some(target)) = (insn.src.first(), insn.target) else {
+            return;
+        };
+        let fp_size = self.fp_format(insn.src_typ, insn.src_size, types);
+        let size = Self::fp_bits_size(fp_size);
+        self.emit_fp_move(src, XmmReg::Xmm15, fp_size);
+        self.emit_xmm_bits_to_gp(XmmReg::Xmm15, fp_size, Reg::R10);
+        self.push_lir(X86Inst::Shr {
+            size,
+            count: ShiftCount::Imm((size.bits() - 1) as u8),
+            dst: Reg::R10,
+        });
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, u32::BITS);
+    }
+
+    /// Emit `CopySign` of a `float` or `double`: the magnitude bits of the
+    /// first operand and the sign bit of the second, in R10 and R11.
+    ///
+    /// Integer operations, so nothing is computed that could raise, and a
+    /// NaN in either operand is only ever moved. Both operands are staged in
+    /// the two reserved XMM scratch registers before either general one is
+    /// written, because loading an operand may itself go through R10 (an
+    /// immediate) or R11 (a global); and both are read before the
+    /// destination, which may be either one's register, is written.
+    pub(super) fn emit_fp_copysign(&mut self, insn: &Instruction, types: &TypeTable) {
+        let (Some(&x), Some(&y), Some(target)) = (insn.src.first(), insn.src.get(1), insn.target)
+        else {
+            return;
+        };
+        let fp_size = self.fp_format(insn.typ, insn.size, types);
+        let size = Self::fp_bits_size(fp_size);
+        let top = ShiftCount::Imm((size.bits() - 1) as u8);
+        let one = ShiftCount::Imm(1);
+
+        self.emit_fp_move(x, XmmReg::Xmm15, fp_size);
+        self.emit_fp_move(y, XmmReg::Xmm14, fp_size);
+        self.emit_xmm_bits_to_gp(XmmReg::Xmm15, fp_size, Reg::R10);
+        self.emit_xmm_bits_to_gp(XmmReg::Xmm14, fp_size, Reg::R11);
+        // R11 = the sign bit of y, alone.
+        self.push_lir(X86Inst::Shr {
+            size,
+            count: top,
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Shl {
+            size,
+            count: top,
+            dst: Reg::R11,
+        });
+        // R10 = x with its sign bit cleared.
+        self.push_lir(X86Inst::Shl {
+            size,
+            count: one,
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Shr {
+            size,
+            count: one,
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Or {
+            size,
+            src: GpOperand::Reg(Reg::R11),
+            dst: Reg::R10,
+        });
+
+        let dst_loc = self.get_location(target);
+        let dst_xmm = match &dst_loc {
+            Loc::Xmm(x) => *x,
+            _ => XmmReg::Xmm15,
+        };
+        self.push_lir(X86Inst::MovGpXmm {
+            size,
+            src: Reg::R10,
+            dst: dst_xmm,
+        });
+        if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
+            self.emit_fp_move_from_xmm(dst_xmm, &dst_loc, fp_size);
         }
     }
 
@@ -1005,16 +1457,15 @@ impl X86_64CodeGen {
 
     /// Load a float immediate value into an XMM register
     ///
-    /// XMM holds only `float` and `double`; an x87 80-bit constant never
-    /// reaches here, so narrowing to `f64` up front loses nothing.
+    /// XMM holds only `_Float16`, `float` and `double`; an x87 80-bit or a
+    /// binary128 constant never reaches here. The bits are the value's own
+    /// encoding at `size`, taken from the exact value.
     pub(super) fn emit_fp_imm_to_xmm(&mut self, value: FloatVal, xmm: XmmReg, size: u32) {
         // `is_positive_zero`, not `is_zero`: the shortcut below produces
         // `+0.0`, and `-0.0` is a different value with the same magnitude.
         // C equates the two under `==` but not under `signbit`, and
         // `copysign(1.0, -0.0)` is `-1.0`.
-        let is_positive_zero = value.is_positive_zero();
-        let value = value.to_f64();
-        if is_positive_zero {
+        if value.is_positive_zero() {
             // Use xorps/xorpd to zero the register (faster)
             let fp_size = FpSize::from_bits(size, &self.base.target);
             self.push_lir(X86Inst::XorFp {
@@ -1022,45 +1473,29 @@ impl X86_64CodeGen {
                 src: xmm,
                 dst: xmm,
             });
-        } else if size == 16 {
-            // Float16: load via integer register (use R10 scratch)
-            let bits = f64_to_f16_bits(value);
+            return;
+        }
+        // Loaded through an integer register (R10 scratch).
+        let bits = value.to_bits_at_width(size);
+        let width = if size <= 32 {
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B32,
-                src: GpOperand::Imm(bits as i64),
+                src: GpOperand::Imm(bits),
                 dst: GpOperand::Reg(Reg::R10),
             });
-            self.push_lir(X86Inst::MovGpXmm {
-                size: OperandSize::B32,
-                src: Reg::R10,
-                dst: xmm,
-            });
-        } else if size == 32 {
-            // Float: load via integer register (use R10 scratch)
-            let bits = (value as f32).to_bits();
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B32,
-                src: GpOperand::Imm(bits as i64),
-                dst: GpOperand::Reg(Reg::R10),
-            });
-            self.push_lir(X86Inst::MovGpXmm {
-                size: OperandSize::B32,
-                src: Reg::R10,
-                dst: xmm,
-            });
+            OperandSize::B32
         } else {
-            // Double: load via integer register (use R10 scratch)
-            let bits = value.to_bits();
             self.push_lir(X86Inst::MovAbs {
-                imm: bits as i64,
+                imm: bits,
                 dst: Reg::R10,
             });
-            self.push_lir(X86Inst::MovGpXmm {
-                size: OperandSize::B64,
-                src: Reg::R10,
-                dst: xmm,
-            });
-        }
+            OperandSize::B64
+        };
+        self.push_lir(X86Inst::MovGpXmm {
+            size: width,
+            src: Reg::R10,
+            dst: xmm,
+        });
     }
 
     /// Move a value to an XMM register

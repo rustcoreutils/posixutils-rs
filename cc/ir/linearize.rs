@@ -16,12 +16,13 @@ use super::{
     Opcode, Pseudo, PseudoId, PseudoKind,
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
-use crate::diag::{error, get_all_stream_names, Position};
+use crate::diag::{get_all_stream_names, Position};
 use crate::float::FloatVal;
 use crate::ir::linearize_atomic::AtomicLvalue;
 use crate::parse::ast::{
     BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef, GnuAtomicOp,
-    InitElement, OffsetOfPath, TranslationUnit, UnaryOp,
+    InitElement, InlineLibraryFn, MemoryFn, NarrowedLibraryCall, OffsetOfPath, ParamStyle,
+    TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
@@ -34,6 +35,13 @@ const DEFAULT_LABEL_MAP_CAPACITY: usize = 16;
 const DEFAULT_LOOP_DEPTH_CAPACITY: usize = 4;
 const DEFAULT_FILE_SCOPE_CAPACITY: usize = 16;
 
+/// Which half of a complex value an rvalue read takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComplexHalf {
+    Real,
+    Imag,
+}
+
 /// One array extent of a variably-modified type.
 ///
 /// A variably-modified type can mix constant and run-time extents
@@ -45,6 +53,19 @@ pub(crate) enum VmDim {
     /// An extent computed at run time and kept in a hidden local, so it
     /// survives SSA and can be reloaded at each use.
     Sym(PseudoId),
+}
+
+/// A scalar parameter, which the prologue stores into a local of its own.
+struct ScalarParam {
+    name: String,
+    symbol: Option<SymbolId>,
+    /// The declared type: the local's.
+    typ: TypeId,
+    /// The type the caller passes it as, which differs from `typ` only for
+    /// an identifier-list definition ([`ParamStyle::IdentifierList`]).
+    passed_as: TypeId,
+    /// The incoming argument.
+    arg: PseudoId,
 }
 
 /// Information about a local variable
@@ -211,6 +232,18 @@ pub(crate) struct VlaMark {
     pub(crate) continue_depth: usize,
 }
 
+/// Where a call returning through the hidden pointer (sret) puts its result.
+///
+/// See [`Linearizer::hidden_return_slot`].
+pub(crate) struct HiddenReturnSlot {
+    /// The local the callee writes the value into.
+    pub(crate) storage: PseudoId,
+    /// Its address: the call's hidden first argument.
+    pub(crate) arg: PseudoId,
+    /// The argument's type, a pointer to the returned type.
+    pub(crate) arg_typ: TypeId,
+}
+
 /// A forward `goto` whose VLA restore is decided once its label is placed.
 ///
 /// `marks` is the mark stack as it stood at the jump, so the restore can name
@@ -273,10 +306,9 @@ pub struct Linearizer<'a> {
     pub(crate) types: &'a TypeTable,
     /// String table for converting StringId to String at IR boundary
     pub(crate) strings: &'a StringTable,
-    /// Hidden struct return pointer (for functions returning large structs via sret)
+    /// Hidden return pointer (for functions returning via sret: large
+    /// aggregates, and complex types the ABI classifies MEMORY)
     pub(crate) struct_return_ptr: Option<PseudoId>,
-    /// Size of struct being returned (for functions returning large structs via sret)
-    pub(crate) struct_return_bytes: usize,
     /// Type of struct being returned via two registers (9-16 bytes, per ABI)
     pub(crate) two_reg_return_type: Option<TypeId>,
     /// Current function name (for generating unique static local names)
@@ -380,6 +412,15 @@ pub struct Linearizer<'a> {
     /// whole unit has been read, because the target may be defined after the
     /// alias that names it.
     pub(crate) declared_aliases: Vec<super::linearize_init::DeclaredAlias>,
+    /// Every function the translation unit defines, by name, weak ones aside:
+    /// a call to a library builtin that yields to a definition reaches the
+    /// program's own wherever it is (`InlineLibraryFn::yields_to_a_definition`).
+    pub(crate) defined_functions: std::collections::HashSet<StringId>,
+    /// `-ftrapping-math`, the default: the program may observe the
+    /// floating-point exception flags, so a comparison that would raise one
+    /// is emitted even where its answer is known. `-fno-trapping-math` turns
+    /// it off.
+    pub(crate) trapping_math: bool,
 }
 
 impl<'a> Linearizer<'a> {
@@ -407,7 +448,6 @@ impl<'a> Linearizer<'a> {
             types,
             strings,
             struct_return_ptr: None,
-            struct_return_bytes: 0,
             two_reg_return_type: None,
             current_func_name: String::new(),
             addr_taken_labels: Vec::new(),
@@ -431,6 +471,8 @@ impl<'a> Linearizer<'a> {
             current_calling_conv: CallingConv::default(),
             local_scope_stack: Vec::new(),
             declared_aliases: Vec::new(),
+            defined_functions: std::collections::HashSet::new(),
+            trapping_math: true,
         }
     }
 
@@ -517,7 +559,7 @@ impl<'a> Linearizer<'a> {
 
     /// The assembler name of the C library function `name`, for a call the
     /// compiler emits itself -- a `__builtin_memcpy`, a structure copy, a
-    /// zero fill, `fabs`, `setjmp`.
+    /// zero fill, `setjmp`.
     ///
     /// Such a call is still a call to *that function*, so a program that
     /// declared it with an asm label (`void *memcpy(...) __asm("my_memcpy")`,
@@ -548,6 +590,16 @@ impl<'a> Linearizer<'a> {
     }
 
     pub fn linearize(&mut self, tu: &TranslationUnit) -> Module {
+        self.defined_functions = tu
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                // A weak definition may be replaced at link time, and gcc
+                // leaves the builtin in its place.
+                ExternalDecl::FunctionDef(func) if !func.attrs.symbol.weak => Some(func.name),
+                _ => None,
+            })
+            .collect();
         for item in &tu.items {
             match item {
                 ExternalDecl::FunctionDef(func) => {
@@ -559,6 +611,10 @@ impl<'a> Linearizer<'a> {
             }
         }
         self.resolve_aliases();
+        for &name in super::FOLD_CALLEES {
+            let symbol = self.library_function_name(name);
+            self.module.library_symbols.insert(name, symbol);
+        }
         std::mem::take(&mut self.module)
     }
 
@@ -875,23 +931,35 @@ impl<'a> Linearizer<'a> {
         self.get_or_create_bb(id);
     }
 
+    /// Continue in a fresh block that nothing branches to, after a `return`,
+    /// `break` or `continue`.
+    ///
+    /// What follows is unreachable until a label, and still gets a block of
+    /// its own so every construct in it is lowered the ordinary way; the
+    /// block is removed when the function is finished
+    /// (`dce::remove_unreachable_blocks`). Appending it to the block the
+    /// jump ends instead put instructions after a terminator.
+    pub(crate) fn start_unreachable_block(&mut self) {
+        let bb = self.alloc_bb();
+        self.switch_bb(bb);
+    }
+
     // Function linearization
 
     /// Whether a return value of this type comes back through a hidden
     /// pointer (sret) rather than in registers.
     ///
-    /// `long double _Complex` deliberately does *not*: System V classifies it
-    /// COMPLEX_X87 and returns it in st(0)/st(1), and complex multiply and
-    /// divide are lowered to libgcc's `__mulxc3`/`__divxc3`, which follow that
-    /// convention. Returning it indirectly would silently disagree with the
-    /// very library calls the arithmetic depends on.
-    fn returns_via_hidden_pointer(&self, typ: TypeId) -> bool {
+    /// A complex value does exactly when the ABI classifies its return
+    /// MEMORY, whatever its size. So `_Complex __int128` and, on x86-64,
+    /// `_Float128 _Complex` -- both thirty-two bytes -- come back through the
+    /// hidden pointer, while `long double _Complex`, as large, does not:
+    /// System V classifies it COMPLEX_X87 and returns it in st(0)/st(1).
+    /// libgcc's `__mul?c3`/`__div?c3` follow the same classification, which
+    /// is why the complex arithmetic asks this too
+    /// (`emit_complex_rtlib_call`).
+    pub(crate) fn returns_via_hidden_pointer(&self, typ: TypeId) -> bool {
         let kind = self.types.kind(typ);
-        // A GNU complex integer over two eightbytes does: `_Complex __int128`
-        // is thirty-two bytes and comes back through the hidden pointer, the
-        // same as any other MEMORY-class object. Its floating cousins do not,
-        // which is why this asks the classifier rather than the size.
-        if self.types.is_complex_integer(typ) {
+        if self.types.is_complex(typ) {
             let abi = get_abi_for_conv(self.current_calling_conv, self.target);
             return matches!(
                 abi.classify_return(typ, self.types),
@@ -899,8 +967,7 @@ impl<'a> Linearizer<'a> {
             );
         }
         if kind != TypeKind::Struct && kind != TypeKind::Union {
-            // Scalars and `_Complex` never do, which is what keeps the
-            // `long double _Complex` guarantee above local and testable.
+            // Scalars never do.
             return false;
         }
         let abi = get_abi_for_conv(self.current_calling_conv, self.target);
@@ -1104,14 +1171,18 @@ impl<'a> Linearizer<'a> {
 
     /// Store scalar parameters into local storage, so that a parameter
     /// reassigned inside a branch still gets its phi nodes at the merge.
-    fn store_scalar_params(
-        &mut self,
-        scalar_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)>,
-    ) {
+    fn store_scalar_params(&mut self, scalar_params: Vec<ScalarParam>) {
         // Store scalar parameters to local storage for SSA-correct reassignment handling
         // This ensures that if a parameter is reassigned inside a branch, phi nodes
         // are properly inserted at merge points.
-        for (name, symbol_id_opt, typ, arg_pseudo) in scalar_params {
+        for ScalarParam {
+            name,
+            symbol: symbol_id_opt,
+            typ,
+            passed_as,
+            arg,
+        } in scalar_params
+        {
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
             let sym = Pseudo::sym(local_sym, name.clone());
@@ -1123,7 +1194,13 @@ impl<'a> Linearizer<'a> {
                 func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
             }
 
-            // Store the incoming argument value to the local
+            // Store the incoming argument value to the local, converted from
+            // its promoted type when an identifier list declared it.
+            let arg_pseudo = if passed_as == typ {
+                arg
+            } else {
+                self.emit_convert(arg, passed_as, typ)
+            };
             let typ_size = self.types.size_bits(typ);
             self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
 
@@ -1161,7 +1238,6 @@ impl<'a> Linearizer<'a> {
         self.break_targets.clear();
         self.continue_targets.clear();
         self.struct_return_ptr = None;
-        self.struct_return_bytes = 0;
         self.two_reg_return_type = None;
         self.current_func_name = self.emitted_name(func.name);
         self.addr_taken_labels.clear();
@@ -1317,7 +1393,6 @@ impl<'a> Linearizer<'a> {
             let sret_pseudo = Pseudo::arg(sret_id, 0).with_name("__sret");
             ir_func.add_pseudo(sret_pseudo);
             self.struct_return_ptr = Some(sret_id);
-            self.struct_return_bytes = self.types.size_bytes(func.return_type);
         }
 
         // Check if function returns a medium struct (9-16 bytes) via two registers
@@ -1371,8 +1446,7 @@ impl<'a> Linearizer<'a> {
         let mut complex_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId, u32)> =
             Vec::with_capacity(func.params.len());
         // Scalar parameters need local storage for SSA-correct reassignment handling
-        let mut scalar_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
-            Vec::with_capacity(func.params.len());
+        let mut scalar_params: Vec<ScalarParam> = Vec::with_capacity(func.params.len());
         // va_list parameters need special handling (pointer storage)
         let mut valist_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
             Vec::with_capacity(func.params.len());
@@ -1382,7 +1456,14 @@ impl<'a> Linearizer<'a> {
                 .symbol
                 .map(|id| self.symbol_name(id))
                 .unwrap_or_else(|| format!("arg{}", i));
-            ir_func.add_param(&name, param.typ);
+            // What the caller passes: the parameter's own type under a
+            // prototype, its default argument promotion under an identifier
+            // list -- converted back to the declared type on entry.
+            let passed_as = match func.param_style {
+                ParamStyle::Prototype => param.typ,
+                ParamStyle::IdentifierList => self.types.default_argument_promote(param.typ),
+            };
+            ir_func.add_param(&name, passed_as);
 
             // Create argument pseudo (offset by 1 if there's a hidden return pointer)
             let pseudo_id = self.alloc_pseudo();
@@ -1490,7 +1571,13 @@ impl<'a> Linearizer<'a> {
                 // Store all scalar parameters to locals so SSA conversion can properly
                 // handle reassignment with phi nodes. If the parameter is never modified,
                 // SSA will optimize away the redundant load/store.
-                scalar_params.push((name, param.symbol, param.typ, pseudo_id));
+                scalar_params.push(ScalarParam {
+                    name,
+                    symbol: param.symbol,
+                    typ: param.typ,
+                    passed_as,
+                    arg: pseudo_id,
+                });
             }
         }
 
@@ -1584,6 +1671,13 @@ impl<'a> Linearizer<'a> {
             }
         }
 
+        // Nothing is emitted for code no path reaches, at any level: see
+        // `dce::remove_unreachable_blocks`. Before SSA, which then never
+        // sees a definition or a phi source in a block that cannot run.
+        if let Some(ref mut ir_func) = self.current_func {
+            super::dce::remove_unreachable_blocks(ir_func);
+        }
+
         // Run SSA conversion if enabled
         if self.run_ssa {
             if let Some(ref mut ir_func) = self.current_func {
@@ -1611,13 +1705,21 @@ impl<'a> Linearizer<'a> {
 
     // Statement linearization
 
-    /// Emit large struct return via hidden pointer (sret)
-    pub(crate) fn emit_sret_return(&mut self, e: &Expr, sret_ptr: PseudoId, struct_bytes: usize) {
-        // Only structs and unions return through a hidden pointer
-        // (`returns_via_hidden_pointer`), so `e` is always an aggregate here —
-        // complex returns take the register path and go through
-        // `complex_operand_addr`.
-        let src_addr = self.linearize_lvalue(e);
+    /// Emit a return through the hidden pointer (sret).
+    ///
+    /// The value is an aggregate or a MEMORY-class complex
+    /// (`returns_via_hidden_pointer`). A complex one is converted to the
+    /// return type first, as the register return path does: the caller reads
+    /// it with the declared base type's stride.
+    pub(crate) fn emit_sret_return(&mut self, e: &Expr, sret_ptr: PseudoId, ret_type: TypeId) {
+        let src_addr = if !self.types.is_complex(ret_type) {
+            self.linearize_lvalue(e)
+        } else if self.types.is_complex(self.expr_type(e)) {
+            self.complex_operand_at_precision(e, ret_type)
+        } else {
+            self.promote_real_to_complex(e, ret_type)
+        };
+        let struct_bytes = self.types.size_bytes(ret_type);
         // The shared block copy, for the same two reasons the parameter
         // prologue uses it: a large struct becomes a `memcpy` call instead of
         // an unbounded unroll, and a size that is not a multiple of eight is
@@ -1874,11 +1976,15 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcount { arg }
             | ExprKind::Popcountl { arg }
             | ExprKind::Popcountll { arg }
-            | ExprKind::Fabs { arg }
-            | ExprKind::Fabsf { arg }
-            | ExprKind::Signbit { arg }
-            | ExprKind::Signbitf { arg }
             | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
+
+            ExprKind::InlineLibraryCall {
+                func, args, name, ..
+            } => {
+                !func.has_side_effects()
+                    && !func.is_displaced(*name, &self.defined_functions)
+                    && args.iter().all(|a| self.is_pure_expr(a))
+            }
 
             // Pure iff both operands are: the relation itself reads nothing
             // else and raises nothing, which is the point of the family.
@@ -1894,9 +2000,6 @@ impl<'a> Linearizer<'a> {
 
             // Alloca allocates memory - not pure
             ExprKind::Alloca { .. } => false,
-
-            // Memory builtins modify memory - not pure
-            ExprKind::Memset { .. } | ExprKind::Memcpy { .. } | ExprKind::Memmove { .. } => false,
 
             // Unreachable is pure (no side effects, just UB hint)
             ExprKind::Unreachable => true,
@@ -2489,6 +2592,14 @@ impl<'a> Linearizer<'a> {
 
         let src = self.linearize_expr(inner_expr);
 
+        // C17 6.3.2.2: a cast to `void` discards the value and converts
+        // nothing. `void` is not a floating type, so a floating operand fell
+        // into the float-to-integer arm below and `(void)x` became a
+        // `cvttss2si`, which raises `FE_INVALID` for a NaN.
+        if self.types.kind(cast_type) == TypeKind::Void {
+            return src;
+        }
+
         // Emit conversion if needed
         let src_is_float = self.types.is_float(src_type);
         let dst_is_float = self.types.is_float(cast_type);
@@ -2834,13 +2945,12 @@ impl<'a> Linearizer<'a> {
         Some(total)
     }
 
-    /// Lower a `__builtin_isnan` / `isinf` / `isfinite` / `isnormal`.
+    /// Lower a `__builtin_isnan` / `isinf` / `isfinite` / `isnormal` /
+    /// `signbit`.
     ///
     /// Built from comparisons alone, which keeps them exact at every width and
-    /// needs no new opcode or backend work. Deliberately *not* expressed with
-    /// `fabs`: `__builtin_fabsl` still narrows a `long double` to a double, so
-    /// a magnitude test through it answers the wrong question at the one width
-    /// that most needs it. Comparing against both signed bounds avoids that.
+    /// needs no new opcode or backend work -- except `signbit`, which asks
+    /// what no comparison can see, the sign of a zero or a NaN.
     ///
     ///   isnan(x)     x != x                  (only a NaN differs from itself)
     ///   isinf(x)     x == +inf || x == -inf
@@ -2879,6 +2989,7 @@ impl<'a> Linearizer<'a> {
                 let magnitude = self.emit_at_least_normal(val, typ, size);
                 self.emit_bool_combine(Opcode::And, finite, magnitude)
             }
+            FpTest::SignBit => self.emit_signbit(val, typ),
         }
     }
 
@@ -2898,17 +3009,10 @@ impl<'a> Linearizer<'a> {
         let a = self.linearize_expr(lhs);
         let b = self.linearize_expr(rhs);
 
+        if let Some(op) = super::linearize_emit::fp_compare_opcode(cmp) {
+            return self.emit_fcmp(op, a, b, typ, size);
+        }
         match cmp {
-            FpCompare::Greater => self.emit_fcmp(Opcode::FCmpOGt, a, b, typ, size),
-            FpCompare::GreaterEqual => self.emit_fcmp(Opcode::FCmpOGe, a, b, typ, size),
-            FpCompare::Less => self.emit_fcmp(Opcode::FCmpOLt, a, b, typ, size),
-            FpCompare::LessEqual => self.emit_fcmp(Opcode::FCmpOLe, a, b, typ, size),
-            // C23 7.12.17.1 has `iseqsig` raise `FE_INVALID` for an unordered
-            // pair, quiet NaN included -- the reverse of its siblings. The
-            // quiet compare emitted here does not raise it for a quiet NaN.
-            // The *answer* is exact; only the exception flag differs -- the
-            // same gap c17's `<` and `>` have, which use this compare too.
-            FpCompare::Equal => self.emit_fcmp(Opcode::FCmpOEq, a, b, typ, size),
             // Ordered and unequal. `!=` will not do: it is *true* for an
             // unordered pair, and this must be false for one.
             FpCompare::LessGreater => {
@@ -2923,6 +3027,7 @@ impl<'a> Linearizer<'a> {
                 let b_nan = self.emit_fcmp(Opcode::FCmpONe, b, b, typ, size);
                 self.emit_bool_combine(Opcode::Or, a_nan, b_nan)
             }
+            _ => unreachable!("{cmp:?} is one comparison"),
         }
     }
 
@@ -3178,6 +3283,24 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Storage for a call returning `typ` through the hidden pointer, and
+    /// the pointer to it, which is passed as the call's first argument.
+    ///
+    /// The call itself hands the same pointer back (in RAX on x86-64), so its
+    /// target is a pointer-typed value; the result the caller reads is
+    /// [`HiddenReturnSlot::storage`].
+    pub(crate) fn hidden_return_slot(&mut self, typ: TypeId) -> HiddenReturnSlot {
+        let storage = self.frame_temp("__sret", typ);
+        let arg_typ = self.types.pointer_to(typ);
+        let arg = self.alloc_reg_pseudo();
+        self.emit(Instruction::sym_addr(arg, storage, arg_typ));
+        HiddenReturnSlot {
+            storage,
+            arg,
+            arg_typ,
+        }
+    }
+
     /// Linearize a function call expression
     pub(crate) fn linearize_call(
         &mut self,
@@ -3185,6 +3308,7 @@ impl<'a> Linearizer<'a> {
         func_expr: &Expr,
         args: &[Expr],
         binding: crate::parse::ast::CalleeBinding,
+        known: Option<crate::parse::ast::LibFn>,
     ) -> PseudoId {
         // Determine if this is a direct or indirect call.
         // We need to check the TYPE of the function expression:
@@ -3268,24 +3392,15 @@ impl<'a> Linearizer<'a> {
         let returns_reg_aggregate = (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
             && struct_size_bits > 64
             && !returns_large_struct;
-        // `long double _Complex` comes back through the hidden pointer above,
-        // not in registers.
+        // A complex value the ABI returns in registers (x87 or SSE) is handed
+        // back as the address of its halves; one it returns in memory --
+        // `_Float128 _Complex` on x86-64 -- came back through the hidden
+        // pointer above.
         let ret_is_address = self.types.is_complex(typ) && !returns_large_struct;
 
         let (result_sym, mut arg_vals, mut arg_types_vec) = if returns_large_struct {
-            // Allocate local storage for the return value
-            let sret_sym = self.frame_temp("__sret", typ);
-
-            // Get address of the allocated space
-            let sret_addr = self.alloc_reg_pseudo();
-            self.emit(Instruction::sym_addr(
-                sret_addr,
-                sret_sym,
-                self.types.pointer_to(typ),
-            ));
-
-            // Hidden return pointer is the first argument (pointer type)
-            (sret_sym, vec![sret_addr], vec![self.types.pointer_to(typ)])
+            let slot = self.hidden_return_slot(typ);
+            (slot.storage, vec![slot.arg], vec![slot.arg_typ])
         } else if returns_reg_aggregate {
             // Two-register struct returns: allocate local storage for the result
             // Codegen will store RAX+RDX (x86-64) or X0+X1 (AArch64) to this location
@@ -3333,6 +3448,22 @@ impl<'a> Linearizer<'a> {
                 ft_id
             };
             self.types.get(resolved).params.clone()
+        });
+        // A call through a function type with no prototype: C17 6.5.2.2p6
+        // gives every argument the default argument promotions, as it does
+        // a variadic one, and an identifier-list definition receives them so
+        // (see `ParamStyle`). Passing a `float` as a float had a gcc-compiled
+        // K&R callee read a double out of a register that held a single, and
+        // a `char` took Apple arm64's one-byte stack slot where the callee
+        // reads an `int`.
+        let unprototyped = func_expr.typ.is_some_and(|ft_id| {
+            let resolved = if self.types.kind(ft_id) == TypeKind::Pointer {
+                self.types.base_type(ft_id).unwrap_or(ft_id)
+            } else {
+                ft_id
+            };
+            self.types.kind(resolved) == TypeKind::Function
+                && self.types.get(resolved).params.is_none()
         });
 
         // Linearize regular arguments
@@ -3531,6 +3662,13 @@ impl<'a> Linearizer<'a> {
                             // decided by the two sizes alone: nothing about it
                             // stops at 64 bits.
                             (arg_is_int && param_is_int && arg_size < param_size)
+                            // Integer narrowing (long→int, int→char, ...).
+                            // The callee reads only the parameter's own bytes,
+                            // but the ABI places the argument by the
+                            // *parameter's* type: Apple arm64 stacks a `char`
+                            // in one byte, so `f(..., 'a')` recorded as `int`
+                            // took four and moved every later argument.
+                            || (arg_is_int && param_is_int && arg_size > param_size)
                             // FP size mismatch (float→double, long double→double, etc.)
                             || (arg_is_fp && param_is_fp && arg_size != param_size)
                             // Integer to FP (uint32_t→double, int→float, etc.)
@@ -3538,11 +3676,8 @@ impl<'a> Linearizer<'a> {
                             // FP to integer (rare but legal)
                             || (arg_is_fp && param_is_int)
                             // To `_Bool`, whose conversion is `!= 0` and not
-                            // a truncation (C17 6.3.1.2). Every other
-                            // narrowing can be left to the callee, which
-                            // reads the low bytes of the register -- but
-                            // `f(42)` with a `_Bool` parameter must pass 1,
-                            // and passing 42 was wrong for a direct call too.
+                            // a truncation (C17 6.3.1.2): `f(42)` with a
+                            // `_Bool` parameter must pass 1.
                             || self.types.kind(param_type) == TypeKind::Bool;
 
                         if needs_convert {
@@ -3552,7 +3687,8 @@ impl<'a> Linearizer<'a> {
                     }
                 }
 
-                // C99 6.5.2.2p7: default argument promotions for variadic args.
+                // C99 6.5.2.2p7: default argument promotions for variadic args,
+                // and 6.5.2.2p6 for every argument of an unprototyped call.
                 //
                 // Both halves have to happen here. The formal-parameter
                 // conversion above is guarded by `arg_idx < params.len()`, and
@@ -3562,22 +3698,11 @@ impl<'a> Linearizer<'a> {
                 // conversions -- without an explicit promotion the pseudo still
                 // holds the sign-extended load, and `printf("%02x", (unsigned
                 // char)c)` prints ffffff80 for a negative `signed char`.
-                if let Some(va_start) = variadic_arg_start {
-                    if arg_idx >= va_start {
-                        let promoted = match self.types.kind(arg_type) {
-                            // float and _Float16 promote to double.
-                            TypeKind::Float | TypeKind::Float16 => Some(self.types.double_id),
-                            // _Bool, char and short promote to int.
-                            _ => {
-                                let promoted = self.types.integer_promote(arg_type);
-                                (promoted != arg_type).then_some(promoted)
-                            }
-                        };
-
-                        if let Some(promoted) = promoted {
-                            val = self.emit_convert(val, arg_type, promoted);
-                            arg_type = promoted;
-                        }
+                if unprototyped || variadic_arg_start.is_some_and(|v| arg_idx >= v) {
+                    let promoted = self.types.default_argument_promote(arg_type);
+                    if promoted != arg_type {
+                        val = self.emit_convert(val, arg_type, promoted);
+                        arg_type = promoted;
                     }
                 }
 
@@ -3642,6 +3767,7 @@ impl<'a> Linearizer<'a> {
             call_insn.ends_with_va_arg_pack = ends_with_va_arg_pack;
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.callee_binding = binding;
+            call_insn.known = known;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
             // After a noreturn call, emit Unreachable and start a dead basic block
@@ -3681,6 +3807,7 @@ impl<'a> Linearizer<'a> {
             call_insn.ends_with_va_arg_pack = ends_with_va_arg_pack;
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.callee_binding = binding;
+            call_insn.known = known;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
             // After a noreturn call, emit Unreachable and start a dead basic block
@@ -4006,6 +4133,181 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// The value of one half of `operand`: `__real__` and `__imag__` read as
+    /// rvalues, and `creal` and `cimag`.
+    ///
+    /// A real operand is its own real half, and its imaginary half is a zero
+    /// of its type -- gcc accepts both for `__real__` and `__imag__`. (The
+    /// library functions' argument has already been converted to a complex
+    /// type, so they never reach that case.)
+    fn linearize_complex_half(&mut self, operand: &Expr, half: ComplexHalf) -> PseudoId {
+        let op_typ = self.expr_type(operand);
+        if !self.types.is_complex(op_typ) {
+            return match half {
+                ComplexHalf::Real => self.linearize_expr(operand),
+                ComplexHalf::Imag if self.types.is_float(op_typ) => {
+                    self.emit_fconst(crate::float::FloatVal::ZERO, op_typ)
+                }
+                ComplexHalf::Imag => self.emit_const(0, op_typ),
+            };
+        }
+        let base_typ = self.types.complex_base(op_typ);
+        let base_bits = self.types.size_bits(base_typ);
+        let offset = match half {
+            ComplexHalf::Real => 0,
+            ComplexHalf::Imag => (base_bits / 8) as i64,
+        };
+        let addr = self.complex_operand_addr(operand);
+        let value = self.alloc_pseudo();
+        self.emit(Instruction::load(value, addr, offset, base_typ, base_bits));
+        value
+    }
+
+    /// The libm opcode `op` of `args`, each already at `typ`, for a call
+    /// that named `name`.
+    fn linearize_libm(
+        &mut self,
+        op: Opcode,
+        args: &[Expr],
+        typ: TypeId,
+        name: StringId,
+    ) -> PseudoId {
+        let arg_vals: Vec<PseudoId> = args.iter().map(|a| self.linearize_expr(a)).collect();
+        self.emit_libm(op, &arg_vals, typ, name)
+    }
+
+    /// A library function's call evaluated in place: its arguments, already
+    /// converted to the parameter types, and the computation the call stands
+    /// for. Never an lvalue, so only ever reached for its value. `name` is
+    /// the function the program called, and `narrowed` says whether it is
+    /// computed by its `float` form instead.
+    fn linearize_inline_library_call(
+        &mut self,
+        expr: &Expr,
+        func: InlineLibraryFn,
+        args: &[Expr],
+        name: StringId,
+        narrowed: Option<NarrowedLibraryCall>,
+    ) -> PseudoId {
+        let typ = self.expr_type(expr);
+        if func.is_displaced(name, &self.defined_functions) {
+            // The program's own function, defined below the call: gcc calls
+            // it, and so does this. The arguments are at its parameter types
+            // already, or -- narrowed -- at `float`, and then converted to
+            // the call's own type, which is every parameter's for a function
+            // that narrows.
+            let arg_vals: Vec<(PseudoId, TypeId)> = args
+                .iter()
+                .map(|a| {
+                    let val = self.linearize_expr(a);
+                    match narrowed {
+                        Some(n) => (self.emit_convert(val, n.typ, typ), typ),
+                        None => (val, self.expr_type(a)),
+                    }
+                })
+                .collect();
+            let callee = self.library_function_name(self.strings.get(name));
+            return self.emit_library_call(&callee, &arg_vals, typ);
+        }
+        match narrowed {
+            Some(n) => {
+                let val = self.compute_library_call(func, args, n.typ, n.name);
+                self.emit_convert(val, n.typ, typ)
+            }
+            None => self.compute_library_call(func, args, typ, name),
+        }
+    }
+
+    /// The computation a library call of `args` stands for, at `typ`; `name`
+    /// is the library function that computes it, for a target or an
+    /// argument that still needs the call.
+    fn compute_library_call(
+        &mut self,
+        func: InlineLibraryFn,
+        args: &[Expr],
+        typ: TypeId,
+        name: StringId,
+    ) -> PseudoId {
+        match (func, args) {
+            (InlineLibraryFn::IntAbs, [arg]) => {
+                let arg_val = self.linearize_expr(arg);
+                let size = self.types.size_bits(typ);
+                self.emit_int_abs(arg_val, typ, size)
+            }
+            (InlineLibraryFn::Fabs, [arg]) => {
+                let arg_val = self.linearize_expr(arg);
+                self.emit_fabs(arg_val, typ)
+            }
+            (InlineLibraryFn::CopySign, [x, y]) => {
+                let x_val = self.linearize_expr(x);
+                let y_val = self.linearize_expr(y);
+                self.emit_copysign(x_val, y_val, typ)
+            }
+            (InlineLibraryFn::ComplexReal, [arg]) => {
+                self.linearize_complex_half(arg, ComplexHalf::Real)
+            }
+            (InlineLibraryFn::ComplexImag, [arg]) => {
+                self.linearize_complex_half(arg, ComplexHalf::Imag)
+            }
+            (InlineLibraryFn::Conjugate, [arg]) => self.emit_complex_conjugate(arg, typ),
+            (InlineLibraryFn::Sqrt(errno), [arg]) => {
+                let arg_val = self.linearize_expr(arg);
+                self.emit_sqrt(arg_val, typ, name, errno)
+            }
+            (InlineLibraryFn::RoundToIntegral(how), [_]) => {
+                self.linearize_libm(Opcode::RoundToIntegral(how), args, typ, name)
+            }
+            (InlineLibraryFn::FMin, [_, _]) => self.linearize_libm(Opcode::FMin, args, typ, name),
+            (InlineLibraryFn::FMax, [_, _]) => self.linearize_libm(Opcode::FMax, args, typ, name),
+            (InlineLibraryFn::Fma, [_, _, _]) => self.linearize_libm(Opcode::Fma, args, typ, name),
+            (InlineLibraryFn::Memory(mem), [a, b, n]) => {
+                let a = self.linearize_expr(a);
+                let b = self.linearize_expr(b);
+                let n = self.linearize_expr(n);
+                self.emit_memory_fn(mem, [a, b, n])
+            }
+            _ => unreachable!(
+                "{func:?} takes {} arguments, and the parser checked the call",
+                func.arity()
+            ),
+        }
+    }
+
+    /// The block memory function `mem` of the arguments `args`, in the order
+    /// the program wrote them, as the `Memcpy`, `Memset` or `Memmove` it
+    /// performs. The instruction names the library function it calls when it
+    /// is not expanded, which is its own and not always the program's:
+    /// `mempcpy` copies with `memcpy`, `bcopy` moves with `memmove`. Answers
+    /// the call's value.
+    fn emit_memory_fn(&mut self, mem: MemoryFn, args: [PseudoId; 3]) -> PseudoId {
+        let [a, b, n] = args;
+        let (op, callee, dest, second) = match mem {
+            MemoryFn::Copy | MemoryFn::CopyToEnd => (Opcode::Memcpy, "memcpy", a, b),
+            MemoryFn::Set => (Opcode::Memset, "memset", a, b),
+            MemoryFn::Move => (Opcode::Memmove, "memmove", a, b),
+            MemoryFn::MoveSourceFirst => (Opcode::Memmove, "memmove", b, a),
+        };
+        let ptr = self.types.void_ptr_id;
+        let result = self.alloc_pseudo();
+        let callee = self.library_function_name(callee);
+        self.emit(
+            Instruction::new(op)
+                .with_func(callee)
+                .with_target(result)
+                .with_src3(dest, second, n)
+                .with_type_and_size(ptr, 64),
+        );
+        match mem {
+            MemoryFn::CopyToEnd => {
+                let end = self.alloc_pseudo();
+                self.emit(Instruction::binop(Opcode::Add, end, dest, n, ptr, 64));
+                end
+            }
+            // `bcopy` answers nothing: its `void` value is never read.
+            MemoryFn::Copy | MemoryFn::Set | MemoryFn::Move | MemoryFn::MoveSourceFirst => result,
+        }
+    }
+
     /// Linearize a unary expression (prefix operators, address-of, dereference, etc.)
     pub(crate) fn linearize_unary(&mut self, expr: &Expr, op: UnaryOp, operand: &Expr) -> PseudoId {
         // Handle AddrOf specially - we need the lvalue address, not the value
@@ -4013,34 +4315,13 @@ impl<'a> Linearizer<'a> {
             return self.linearize_lvalue(operand);
         }
 
-        // `__real__` / `__imag__`: one half of a complex value, or the operand
-        // itself when it is already real -- gcc accepts both, and `__imag__` of
-        // a real is a zero of that type.
-        if op == UnaryOp::Real || op == UnaryOp::Imag {
-            let op_typ = self.expr_type(operand);
-            if !self.types.is_complex(op_typ) {
-                return if op == UnaryOp::Real {
-                    self.linearize_expr(operand)
-                } else {
-                    // `__imag__` of a real operand is a zero of its type.
-                    if self.types.is_float(op_typ) {
-                        self.emit_fconst(crate::float::FloatVal::ZERO, op_typ)
-                    } else {
-                        self.emit_const(0, op_typ)
-                    }
-                };
-            }
-            let base_typ = self.types.complex_base(op_typ);
-            let base_bits = self.types.size_bits(base_typ);
-            let offset = if op == UnaryOp::Real {
-                0
-            } else {
-                (base_bits / 8) as i64
-            };
-            let addr = self.complex_operand_addr(operand);
-            let half = self.alloc_pseudo();
-            self.emit(Instruction::load(half, addr, offset, base_typ, base_bits));
-            return half;
+        // `__real__` / `__imag__` read as a value; as an lvalue they are
+        // handled by `linearize_lvalue`.
+        if op == UnaryOp::Real {
+            return self.linearize_complex_half(operand, ComplexHalf::Real);
+        }
+        if op == UnaryOp::Imag {
+            return self.linearize_complex_half(operand, ComplexHalf::Imag);
         }
 
         // A complex value travels by address, so the scalar path below would
@@ -4335,11 +4616,7 @@ impl<'a> Linearizer<'a> {
                     // `static const int` from an inline definition. It is
                     // relaxed by `-fpermissive`, which is where c17 keeps the
                     // constraints gcc lets through.
-                    if crate::diag::permissive() {
-                        crate::diag::warning(pos, &msg);
-                    } else {
-                        error(pos, &msg);
-                    }
+                    crate::diag::permissive_error(pos, &msg);
                 }
             }
 
@@ -4527,8 +4804,8 @@ impl<'a> Linearizer<'a> {
         // Not when the untaken arm defines a label, though: a computed `goto`
         // can still reach it, so it has to be emitted. See
         // [`Expr::defines_label`].
-        if let Some(cond_val) = self.eval_const_expr(cond) {
-            let (taken, untaken) = if cond_val != 0 {
+        if let Some(holds) = self.constant_condition(cond) {
+            let (taken, untaken) = if holds {
                 (then_expr, else_expr)
             } else {
                 (else_expr, then_expr)
@@ -5031,11 +5308,12 @@ impl<'a> Linearizer<'a> {
                 // the struct's own four bytes spelled. Giving the result a
                 // `Sym` makes `rvalue_addr` take its address instead, which
                 // is what the small-struct return path does with `__sret1_`.
-                let is_aggregate = matches!(
-                    self.types.kind(*arg_type),
-                    TypeKind::Struct | TypeKind::Union | TypeKind::Array
-                );
-                let result = if is_aggregate {
+                //
+                // A complex value is addressed at every size, so it takes the
+                // same local. Given a bare pseudo instead, the backend wrote
+                // the value's bytes into a register every consumer then
+                // dereferenced as the address of the two halves.
+                let result = if self.types.is_aggregate_or_complex(*arg_type) {
                     self.frame_temp("__vaarg", *arg_type)
                 } else {
                     self.alloc_pseudo()
@@ -5223,105 +5501,6 @@ impl<'a> Linearizer<'a> {
                     .with_target(result)
                     .with_src(size_val)
                     .with_type_and_size(self.types.void_ptr_id, 64);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::Memset { dest, c, n } => {
-                let dest_val = self.linearize_expr(dest);
-                let c_val = self.linearize_expr(c);
-                let n_val = self.linearize_expr(n);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Memset)
-                    .with_func(self.library_function_name("memset"))
-                    .with_target(result)
-                    .with_src3(dest_val, c_val, n_val)
-                    .with_type_and_size(self.types.void_ptr_id, 64);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::Memcpy { dest, src, n } => {
-                let dest_val = self.linearize_expr(dest);
-                let src_val = self.linearize_expr(src);
-                let n_val = self.linearize_expr(n);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Memcpy)
-                    .with_func(self.library_function_name("memcpy"))
-                    .with_target(result)
-                    .with_src3(dest_val, src_val, n_val)
-                    .with_type_and_size(self.types.void_ptr_id, 64);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::Memmove { dest, src, n } => {
-                let dest_val = self.linearize_expr(dest);
-                let src_val = self.linearize_expr(src);
-                let n_val = self.linearize_expr(n);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Memmove)
-                    .with_func(self.library_function_name("memmove"))
-                    .with_target(result)
-                    .with_src3(dest_val, src_val, n_val)
-                    .with_type_and_size(self.types.void_ptr_id, 64);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::Fabs { arg } => {
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Fabs64)
-                    .with_func(self.library_function_name("fabs"))
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(64)
-                    .with_type(self.types.double_id);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::Fabsf { arg } => {
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Fabs32)
-                    .with_func(self.library_function_name("fabsf"))
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(32)
-                    .with_type(self.types.float_id);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::Signbit { arg } => {
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Signbit64)
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(64)
-                    .with_type(self.types.int_id);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::Signbitf { arg } => {
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Signbit32)
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(32)
-                    .with_type(self.types.int_id);
                 self.emit(insn);
                 result
             }
@@ -6251,17 +6430,12 @@ impl<'a> Linearizer<'a> {
                 self.emit_string_sym(expr, label)
             }
 
-            ExprKind::WideStringLit(s) => {
-                let label = self.module.add_wide_string(s.clone());
-                self.emit_string_sym(expr, label)
-            }
-
             ExprKind::Utf16StringLit(u) => {
                 let label = self.module.add_utf16_string(u.clone());
                 self.emit_string_sym(expr, label)
             }
 
-            ExprKind::Utf32StringLit(u) => {
+            ExprKind::WideStringLit(u) | ExprKind::Utf32StringLit(u) => {
                 let label = self.module.add_utf32_string(u.clone());
                 self.emit_string_sym(expr, label)
             }
@@ -6298,7 +6472,8 @@ impl<'a> Linearizer<'a> {
                 func,
                 args,
                 binding,
-            } => self.linearize_call(expr, func, args, *binding),
+                known,
+            } => self.linearize_call(expr, func, args, *binding, *known),
 
             ExprKind::Member {
                 expr: inner_expr,
@@ -6393,13 +6568,6 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcountl { .. }
             | ExprKind::Popcountll { .. }
             | ExprKind::Alloca { .. }
-            | ExprKind::Memset { .. }
-            | ExprKind::Memcpy { .. }
-            | ExprKind::Memmove { .. }
-            | ExprKind::Fabs { .. }
-            | ExprKind::Fabsf { .. }
-            | ExprKind::Signbit { .. }
-            | ExprKind::Signbitf { .. }
             | ExprKind::FpTest { .. }
             | ExprKind::FpCompare { .. }
             | ExprKind::FpClassify { .. }
@@ -6408,6 +6576,13 @@ impl<'a> Linearizer<'a> {
             | ExprKind::ReturnAddress { .. }
             | ExprKind::Setjmp { .. }
             | ExprKind::Longjmp { .. } => self.linearize_builtin(expr),
+
+            ExprKind::InlineLibraryCall {
+                func,
+                args,
+                name,
+                narrowed,
+            } => self.linearize_inline_library_call(expr, *func, args, *name, *narrowed),
 
             ExprKind::OffsetOf { type_id, path } => self.linearize_offsetof(type_id, path),
 
@@ -6476,8 +6651,10 @@ pub fn linearize(
     strings: &StringTable,
     target: &Target,
     debug: bool,
+    trapping_math: bool,
 ) -> Module {
     let mut linearizer = Linearizer::new(symbols, types, strings, target);
+    linearizer.trapping_math = trapping_math;
     let mut module = linearizer.linearize(tu);
     module.debug = debug;
     // Get all source files from the stream registry (includes all #included files)

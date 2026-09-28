@@ -17,12 +17,16 @@ use crate::ir::dse;
 use crate::ir::ifconv;
 use crate::ir::inline;
 use crate::ir::instcombine;
+use crate::ir::libcall_fold;
 use crate::ir::loadfwd;
+use crate::ir::memexpand;
 use crate::ir::memloc;
 use crate::ir::sccp;
+use crate::ir::strdata::ConstBytes;
 use crate::ir::validate;
 use crate::ir::vrp;
 use crate::ir::{Function, Module};
+use crate::target::Target;
 use crate::types::TypeTable;
 
 // What optimization was asked for
@@ -238,9 +242,10 @@ fn check_forwarding_resolved(module: &Module) {
 
 /// Optimize a module as `opt` asks.
 ///
-/// Level 0: nothing but `__attribute__((always_inline))` inlining
-/// Level 1+: inlining, then the per-function passes below to fixed point
-pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization) {
+/// Level 0: `__attribute__((always_inline))` inlining, then `memexpand`
+/// Level 1+: inlining and `memexpand`, then the per-function passes below to
+/// fixed point
+pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization, target: &Target) {
     // Phase 1: Function inlining (module-level pass)
     // This inlines small functions at their call sites and removes
     // dead static functions that were fully inlined.
@@ -260,6 +265,14 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
     // so instead.
     check_forwarding_resolved(module);
 
+    // A `memcpy`, `memset` or `memmove` of a small constant length becomes
+    // loads and stores at every level, as the linearizer's own aggregate
+    // copies already are: nothing about it is an optimization a debugger
+    // would miss. After inlining, which is what makes some lengths constant.
+    for func in &mut module.functions {
+        memexpand::run(func, types);
+    }
+
     if !opt.optimizes() {
         return;
     }
@@ -272,11 +285,23 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
     // Phase 3: module-wide facts the memory passes need. Built after
     // inlining, so the call graph and the set of globals are final.
     let mi = memloc::ModuleInfo::build(module, types);
+    let bytes = ConstBytes::build(module, types);
+    let literals = libcall_fold::NewLiterals::new(&module.strings);
+    let fold = libcall_fold::FoldCtx {
+        types,
+        target,
+        mi: &mi,
+        bytes: &bytes,
+        callees: &module.library_symbols,
+        literals: &literals,
+    };
 
     // Phase 4: Per-function optimization
     for func in &mut module.functions {
-        optimize_function(func, types, &mi);
+        optimize_function(func, types, &mi, &fold);
     }
+    let added = literals.into_added();
+    module.strings.extend(added);
 
     // Phase 5 (debug builds only): structural IR validation.
     // Runs at the end of optimization, BEFORE `ir::lower::lower_module`
@@ -299,7 +324,12 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
 }
 
 /// Optimize a single function by running passes until fixed point.
-fn optimize_function(func: &mut Function, types: &TypeTable, mi: &memloc::ModuleInfo) {
+fn optimize_function(
+    func: &mut Function,
+    types: &TypeTable,
+    mi: &memloc::ModuleInfo,
+    fold: &libcall_fold::FoldCtx,
+) {
     for _ in 0..MAX_ITERATIONS {
         // The order is load-bearing, and each pass hands the next one a
         // shape it could not have seen for itself.
@@ -334,21 +364,31 @@ fn optimize_function(func: &mut Function, types: &TypeTable, mi: &memloc::Module
         // `add %sym, (mul (sext 1) 4)` and only becomes a constant
         // displacement once `instcombine` has folded the multiply -- which is
         // why it sits inside the loop rather than ahead of it.
+        // `memexpand` ahead of all of them, so the loads and stores it makes
+        // of a length SCCP has only now proved constant are forwarded and
+        // killed in the same iteration.
+        let mx_changed = memexpand::run(func, types);
         let lf_changed = loadfwd::run(func, types, mi);
         let vrp_changed = vrp::run(func, types);
         let ifc_changed = ifconv::run(func);
         let sccp_changed = sccp::run(func, types);
         let ic_changed = instcombine::run(func, types);
+        // `libcall_fold` once the arguments are as constant as `sccp` and
+        // `instcombine` can make them; what it leaves -- a constant, a load
+        // of one byte, a `Select` -- is theirs and `loadfwd`'s next round.
+        let lf_fold_changed = libcall_fold::run(func, fold);
         // `dse` before `dce`, so the value chain feeding a killed store is
         // swept in the same iteration rather than surviving to the next one.
         let dse_changed = dse::run(func, types, mi);
         let dce_changed = dce::run(func);
 
-        if !lf_changed
+        if !mx_changed
+            && !lf_changed
             && !vrp_changed
             && !ifc_changed
             && !sccp_changed
             && !ic_changed
+            && !lf_fold_changed
             && !dse_changed
             && !dce_changed
         {

@@ -312,11 +312,14 @@ pub fn warnings_suppressed() -> bool {
     SUPPRESS_WARNINGS.load(Ordering::Relaxed)
 }
 
-/// `-fpermissive`: accept two pre-C99 constructs as warnings.
+/// `-fpermissive`: accept as warnings the pre-C99 constructs and the
+/// constraint violations gcc lets through.
 ///
-/// Exactly two, both removed by C99 and both an error here by default:
-/// implicit `int` in a declaration that names no type (6.7.2p2), and the
-/// implicit declaration of a function called before it is declared (6.5.1p2).
+/// The pre-C99 constructs, removed by C99 and an error here by default, are
+/// implicit `int` in a declaration that names no type (6.7.2p2) and the
+/// implicit declaration of a function called before it is declared
+/// (6.5.1p2). The constraint violations are those [`permissive_error`]
+/// reports.
 ///
 /// This is not a dialect switch and does not make c17 a C89 compiler. The
 /// language it accepts is still C17; `-std=` remains inert. gcc draws the same
@@ -333,6 +336,17 @@ pub fn set_permissive() {
 /// Is `-fpermissive` in effect?
 pub fn permissive() -> bool {
     PERMISSIVE.load(Ordering::Relaxed)
+}
+
+/// A constraint violation gcc lets through with only a warning: an error
+/// here, and a warning under `-fpermissive`, which is where c17 keeps that
+/// leniency.
+pub fn permissive_error(pos: Position, msg: &str) {
+    if permissive() {
+        warning(pos, msg);
+    } else {
+        error(pos, msg);
+    }
 }
 
 pub fn has_error() -> u32 {

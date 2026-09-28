@@ -194,6 +194,29 @@ pub enum X87BinOp {
     Div,
 }
 
+/// The integer width an x87 `fistp` stores.
+///
+/// `fistp` has a 16-, a 32- and a 64-bit form and nothing narrower, so a
+/// conversion to `char` goes through the 16-bit one; the type keeps a width
+/// the instruction does not have from being asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum X87IntWidth {
+    W16,
+    W32,
+    W64,
+}
+
+impl X87IntWidth {
+    /// The AT&T mnemonic that stores this width and pops.
+    fn fistp(self) -> &'static str {
+        match self {
+            X87IntWidth::W16 => "fistps",
+            X87IntWidth::W32 => "fistpl",
+            X87IntWidth::W64 => "fistpq",
+        }
+    }
+}
+
 // x86-64 LIR Instructions
 
 /// x86-64 Low-level IR instruction
@@ -493,8 +516,22 @@ pub enum X86Inst {
         dst: XmmReg,
     },
 
+    /// SQRTSS/SQRTSD - Square root of scalar floating-point
+    SqrtFp {
+        size: FpSize,
+        src: XmmOperand,
+        dst: XmmReg,
+    },
+
     /// XORPS/XORPD - XOR packed floating-point (used for zeroing/negation)
     XorFp {
+        size: FpSize,
+        src: XmmReg,
+        dst: XmmReg,
+    },
+
+    /// ANDPS/ANDPD - AND packed floating-point (used for absolute value)
+    AndFp {
         size: FpSize,
         src: XmmReg,
         dst: XmmReg,
@@ -547,6 +584,12 @@ pub enum X86Inst {
     /// FCHS - Negate ST(0)
     X87Neg,
 
+    /// FABS - Clear the sign of ST(0)
+    X87Abs,
+
+    /// FSQRT - Replace ST(0) by its square root
+    X87Sqrt,
+
     /// FCOMIP - Compare ST(0) with ST(1), set EFLAGS, pop ST(0)
     X87CmpPop,
 
@@ -571,11 +614,19 @@ pub enum X86Inst {
     /// FILDQ - Load 64-bit integer to x87 ST(0), converting to extended precision
     X87LoadInt64 { addr: MemAddr },
 
-    /// FISTTPL - Convert ST(0) to 32-bit integer with truncation, pop
-    X87StoreInt32 { addr: MemAddr },
+    /// FISTP{S,L,Q} - Convert ST(0) to an integer of `width`, rounding as the
+    /// control word's rounding-control field says, and pop.
+    ///
+    /// Not `fisttp`, which always truncates but is SSE3 and so not part of
+    /// the x86-64 baseline. C's truncation is had by switching the control
+    /// word around this; see `X86_64CodeGen::emit_x87_truncating_store`.
+    X87StoreInt { width: X87IntWidth, addr: MemAddr },
 
-    /// FISTTPQ - Convert ST(0) to 64-bit integer with truncation, pop
-    X87StoreInt64 { addr: MemAddr },
+    /// FNSTCW - Store the x87 control word (16 bits) to memory
+    X87StoreControlWord { addr: MemAddr },
+
+    /// FLDCW - Load the x87 control word (16 bits) from memory
+    X87LoadControlWord { addr: MemAddr },
 
     // ========================================================================
     // Special Instructions
@@ -602,14 +653,6 @@ pub enum X86Inst {
     /// Returns index of most significant set bit
     /// Result is undefined if src is 0
     Bsr {
-        size: OperandSize,
-        src: GpOperand,
-        dst: Reg,
-    },
-
-    /// POPCNT - Population count (count set bits)
-    /// Returns the number of 1 bits in the source operand
-    Popcnt {
         size: OperandSize,
         src: GpOperand,
         dst: Reg,
@@ -897,10 +940,22 @@ impl EmitAsm for X86Inst {
             X86Inst::DivFp { size, src, dst } => {
                 Self::emit_fp_alu("div", size, src, dst, target, out)
             }
+            X86Inst::SqrtFp { size, src, dst } => {
+                Self::emit_fp_alu("sqrt", size, src, dst, target, out)
+            }
             X86Inst::XorFp { size, src, dst } => {
                 let _ = writeln!(
                     out,
                     "    xor{} {}, {}",
+                    size.x86_packed_suffix(),
+                    src.name(),
+                    dst.name()
+                );
+            }
+            X86Inst::AndFp { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    and{} {}, {}",
                     size.x86_packed_suffix(),
                     src.name(),
                     dst.name()
@@ -955,6 +1010,14 @@ impl EmitAsm for X86Inst {
                 let _ = writeln!(out, "    fchs");
             }
 
+            X86Inst::X87Abs => {
+                let _ = writeln!(out, "    fabs");
+            }
+
+            X86Inst::X87Sqrt => {
+                let _ = writeln!(out, "    fsqrt");
+            }
+
             X86Inst::X87CmpPop => {
                 // `fucomip`, not `fcomip`: the quiet form does not raise
                 // invalid-operation on a QNaN, which is what C's relational
@@ -972,8 +1035,13 @@ impl EmitAsm for X86Inst {
             X86Inst::X87StoreDouble { addr } => Self::emit_x87_mem("fstpl", addr, target, out),
             X86Inst::X87LoadInt32 { addr } => Self::emit_x87_mem("fildl", addr, target, out),
             X86Inst::X87LoadInt64 { addr } => Self::emit_x87_mem("fildq", addr, target, out),
-            X86Inst::X87StoreInt32 { addr } => Self::emit_x87_mem("fisttpl", addr, target, out),
-            X86Inst::X87StoreInt64 { addr } => Self::emit_x87_mem("fisttpq", addr, target, out),
+            X86Inst::X87StoreInt { width, addr } => {
+                Self::emit_x87_mem(width.fistp(), addr, target, out)
+            }
+            X86Inst::X87StoreControlWord { addr } => {
+                Self::emit_x87_mem("fnstcw", addr, target, out)
+            }
+            X86Inst::X87LoadControlWord { addr } => Self::emit_x87_mem("fldcw", addr, target, out),
             // Special Instructions
             X86Inst::Cltd => {
                 let _ = writeln!(out, "    cltd");
@@ -989,9 +1057,6 @@ impl EmitAsm for X86Inst {
             }
             X86Inst::Bsr { size, src, dst } => {
                 Self::emit_alu2_to_reg("bsr", size, src, dst, target, out)
-            }
-            X86Inst::Popcnt { size, src, dst } => {
-                Self::emit_alu2_to_reg("popcnt", size, src, dst, target, out)
             }
             X86Inst::XorpsSelf { reg } => {
                 let _ = writeln!(out, "    xorps {}, {}", reg.name(), reg.name());
@@ -1308,6 +1373,106 @@ impl X86Inst {
     }
 }
 
+/// Count the set bits of `x` in place, at the width of `size`, using only
+/// baseline x86-64 instructions.
+///
+/// c17 targets the x86-64 baseline (x86-64-v1), and POPCNT is not in it:
+/// emitting `popcnt` raises SIGILL on a processor without the extension.
+/// This is the standard branch-free SWAR count instead:
+///
+/// ```text
+/// x = x - ((x & 0xAA..) >> 1)          // 2-bit field counts
+/// x = (x & 0x33..) + ((x & 0xCC..) >> 2) // 4-bit field counts
+/// x = (x + (x >> 4)) & 0x0F..          // byte counts
+/// x = (x * 0x0101..) >> (width - 8)    // sum of the bytes
+/// ```
+///
+/// Masking before shifting (`(x & 0xAA..) >> 1` rather than
+/// `(x >> 1) & 0x55..`) is the same value, and it is what lets the whole
+/// sequence run in two registers: every 64-bit mask needs a register of its
+/// own, since `and` takes at most a 32-bit immediate, and each mask is
+/// consumed by the one instruction after it is loaded into `tmp`. The
+/// second step takes `x & 0x33..` as `x - (x & 0xCC..)`, for the same reason.
+///
+/// `x` must hold the value zero-extended to `size`; `tmp` is clobbered. The
+/// count is left in `x`, and fits in its low byte. `__builtin_parity*`
+/// is the low bit of this same count (see `parse/builtin_expr.rs`), so it
+/// has no sequence of its own.
+pub fn popcount_sequence(size: OperandSize, x: Reg, tmp: Reg) -> Vec<X86Inst> {
+    let bits = size.bits();
+    debug_assert!(bits == 32 || bits == 64, "popcount of a {bits}-bit value");
+    let load_mask = |byte: u8| {
+        let pattern = u64::from_ne_bytes([byte; 8]);
+        if bits == 64 {
+            X86Inst::MovAbs {
+                imm: pattern as i64,
+                dst: tmp,
+            }
+        } else {
+            X86Inst::Mov {
+                size,
+                src: GpOperand::Imm(i64::from(pattern as u32)),
+                dst: GpOperand::Reg(tmp),
+            }
+        }
+    };
+    let shr = |count: u8, dst: Reg| X86Inst::Shr {
+        size,
+        count: ShiftCount::Imm(count),
+        dst,
+    };
+    let and_x_into_tmp = X86Inst::And {
+        size,
+        src: GpOperand::Reg(x),
+        dst: tmp,
+    };
+    let sub_tmp = X86Inst::Sub {
+        size,
+        src: GpOperand::Reg(tmp),
+        dst: x,
+    };
+    let add_tmp = X86Inst::Add {
+        size,
+        src: GpOperand::Reg(tmp),
+        dst: x,
+    };
+    vec![
+        // x -= (x & 0xAA..) >> 1
+        load_mask(0xAA),
+        and_x_into_tmp.clone(),
+        shr(1, tmp),
+        sub_tmp.clone(),
+        // x = (x - (x & 0xCC..)) + ((x & 0xCC..) >> 2)
+        load_mask(0xCC),
+        and_x_into_tmp,
+        sub_tmp,
+        shr(2, tmp),
+        add_tmp.clone(),
+        // x = (x + (x >> 4)) & 0x0F..
+        X86Inst::Mov {
+            size,
+            src: GpOperand::Reg(x),
+            dst: GpOperand::Reg(tmp),
+        },
+        shr(4, tmp),
+        add_tmp,
+        load_mask(0x0F),
+        X86Inst::And {
+            size,
+            src: GpOperand::Reg(tmp),
+            dst: x,
+        },
+        // x = (x * 0x0101..) >> (width - 8)
+        load_mask(0x01),
+        X86Inst::IMul2 {
+            size,
+            src: GpOperand::Reg(tmp),
+            dst: x,
+        },
+        shr((bits - 8) as u8, x),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1360,6 +1525,34 @@ mod tests {
                 out
             );
         }
+    }
+
+    /// The conversion stores are the baseline `fistp` at each width, never
+    /// the SSE3 `fisttp`; the control-word pair brackets them.
+    #[test]
+    fn test_x87_integer_store_and_control_word_emit() {
+        let target = linux_target();
+        let addr = MemAddr::BaseOffset {
+            base: Reg::Rbp,
+            offset: -24,
+        };
+        for (width, expected) in [
+            (X87IntWidth::W16, "fistps -24(%rbp)"),
+            (X87IntWidth::W32, "fistpl -24(%rbp)"),
+            (X87IntWidth::W64, "fistpq -24(%rbp)"),
+        ] {
+            let mut out = String::new();
+            X86Inst::X87StoreInt {
+                width,
+                addr: addr.clone(),
+            }
+            .emit(&target, &mut out);
+            assert_eq!(out.trim(), expected);
+        }
+        let mut out = String::new();
+        X86Inst::X87StoreControlWord { addr: addr.clone() }.emit(&target, &mut out);
+        X86Inst::X87LoadControlWord { addr }.emit(&target, &mut out);
+        assert_eq!(out, "    fnstcw -24(%rbp)\n    fldcw -24(%rbp)\n");
     }
 
     #[test]
@@ -1424,6 +1617,53 @@ mod tests {
                 out
             );
         }
+    }
+
+    fn emit_all(insts: &[X86Inst]) -> String {
+        let target = linux_target();
+        let mut out = String::new();
+        for inst in insts {
+            inst.emit(&target, &mut out);
+        }
+        out
+    }
+
+    /// The population count is the baseline SWAR sequence, never `popcnt`,
+    /// which is not in x86-64-v1 and raises SIGILL where it is missing.
+    #[test]
+    fn test_popcount_sequence_is_baseline() {
+        let expected64 = [
+            "movabsq $-6148914691236517206, %r11",
+            "andq %r10, %r11",
+            "shrq $1, %r11",
+            "subq %r11, %r10",
+            "movabsq $-3689348814741910324, %r11",
+            "andq %r10, %r11",
+            "subq %r11, %r10",
+            "shrq $2, %r11",
+            "addq %r11, %r10",
+            "movq %r10, %r11",
+            "shrq $4, %r11",
+            "addq %r11, %r10",
+            "movabsq $1085102592571150095, %r11",
+            "andq %r11, %r10",
+            "movabsq $72340172838076673, %r11",
+            "imulq %r11, %r10",
+            "shrq $56, %r10",
+        ];
+        let out = emit_all(&popcount_sequence(OperandSize::B64, Reg::R10, Reg::R11));
+        let out64: Vec<&str> = out.lines().map(str::trim).collect();
+        assert_eq!(out64, expected64);
+
+        // The 32-bit count is the same sequence at 32 bits: the masks are
+        // plain immediates and the byte sum is in the top byte of 32.
+        let out = emit_all(&popcount_sequence(OperandSize::B32, Reg::R10, Reg::R11));
+        assert!(out.contains("movl $2863311530, %r11d"), "{out}");
+        assert!(out.contains("imull %r11d, %r10d"), "{out}");
+        assert!(out.ends_with("shrl $24, %r10d\n"), "{out}");
+        assert!(!out.contains("movabs"), "{out}");
+        assert_eq!(out.lines().count(), expected64.len());
+        assert!(!out.contains("popcnt"), "{out}");
     }
 
     #[test]

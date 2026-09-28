@@ -74,7 +74,10 @@ impl Linearizer<'_> {
 
         let is_aggregate = matches!(kind, TypeKind::Struct | TypeKind::Union);
 
-        (is_scalar || is_aggregate) && matches!(self.types.size_bits(typ), 8 | 16 | 32 | 64)
+        let bits = self.types.size_bits(typ);
+        (is_scalar || is_aggregate)
+            && bits % 8 == 0
+            && crate::target::atomic_is_lock_free(u64::from(bits / 8))
     }
 
     /// The type the atomic instruction actually operates through.

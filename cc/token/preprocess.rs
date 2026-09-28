@@ -19,16 +19,16 @@ use std::time::SystemTime;
 
 use super::cursor::{Provenance, TokenCursor};
 use super::lexer::{
-    literal_payload, payload_bytes, payload_text, report_forbidden_ucn, show_token,
-    tokens_to_source_bytes, write_token, IdentTable, LexerMode, Position, Punctuator, SpecialToken,
-    Spelling, Token, TokenType, TokenValue, Tokenizer,
+    literal_payload, payload_bytes, payload_text, show_token, tokens_to_source_bytes, write_token,
+    IdentTable, LexerMode, Position, Punctuator, SpecialToken, Spelling, Token, TokenType,
+    TokenValue, Tokenizer,
 };
 use super::literal;
 use crate::arch;
 use crate::builtin_headers;
 use crate::diag;
 use crate::os;
-use crate::target::{Target, STDC_VERSION};
+use crate::target::{IntType, Target, STDC_VERSION};
 use gettextrs::gettext;
 
 #[path = "preprocess_directive.rs"]
@@ -44,6 +44,38 @@ const DEFAULT_MACRO_CAPACITY: usize = 32;
 const DEFAULT_COND_STACK_CAPACITY: usize = 8;
 const DEFAULT_INCLUDE_PATH_CAPACITY: usize = 8;
 const DEFAULT_INCLUDE_TRACK_CAPACITY: usize = 32;
+
+/// Where on the search chain a header was found.
+///
+/// The chain is gcc's: the `-I` directories, then the directory of headers
+/// the compiler owns (here, the bundled ones), then the system directories.
+/// `#include_next` resumes just after the position the current file came
+/// from, so a bundled header that forwards reaches the system's, and a `-I`
+/// header that forwards reaches the bundled one first. The variant order is
+/// the search order, which is what `Ord` compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SearchPos {
+    /// The `-I` directory at this index.
+    Quote(usize),
+    /// The bundled headers.
+    Bundled,
+    /// The system directory at this index: `-isystem`, the target's own,
+    /// then `-idirafter`.
+    System(usize),
+}
+
+impl SearchPos {
+    /// Where `#include_next` resumes in a file found at `from`: just past
+    /// it, or the start of the chain for a file not found on it at all.
+    pub(super) fn after(from: Option<SearchPos>) -> SearchPos {
+        match from {
+            None => SearchPos::Quote(0),
+            Some(SearchPos::Quote(i)) => SearchPos::Quote(i + 1),
+            Some(SearchPos::Bundled) => SearchPos::System(0),
+            Some(SearchPos::System(i)) => SearchPos::System(i + 1),
+        }
+    }
+}
 
 /// Source of an included file
 pub enum IncludeSource {
@@ -310,6 +342,40 @@ impl Macro {
         }
     }
 
+    /// A predefined function-like macro `name(c)` that pastes `suffix` onto
+    /// its argument -- `c ## L` -- or is `c` itself for an empty suffix: gcc's
+    /// `__INT64_C(c)` family.
+    pub fn predefined_constant_fn(name: &str, suffix: &str) -> Self {
+        let token = |typ, value, whitespace| MacroToken {
+            typ,
+            value,
+            whitespace,
+            spelling: Spelling::Canonical,
+        };
+        let mut body = vec![token(TokenType::Ident, MacroTokenValue::Param(0), false)];
+        if !suffix.is_empty() {
+            body.push(token(TokenType::Special, MacroTokenValue::Paste, true));
+            body.push(token(
+                TokenType::Ident,
+                MacroTokenValue::Ident(suffix.to_string()),
+                true,
+            ));
+        }
+        Self {
+            name: name.to_string(),
+            body,
+            is_function: true,
+            params: vec![MacroParam {
+                name: "c".to_string(),
+                index: 0,
+            }],
+            is_variadic: false,
+            variadic_name: None,
+            builtin: None,
+            predefined: true,
+        }
+    }
+
     /// Create a keyword alias macro (value is treated as an identifier/keyword)
     pub fn keyword_alias(name: &str, value: &str) -> Self {
         let body = if value.is_empty() {
@@ -472,9 +538,9 @@ pub struct Preprocessor<'a> {
     /// Apply translation phase 1 trigraph replacement to included files.
     trigraphs: bool,
 
-    /// Index of current file's system include path (for #include_next)
-    /// None if current file is not from a system include path
-    current_include_path_index: Option<usize>,
+    /// Where on the search chain the current file was found (for
+    /// `#include_next`); None if it was not found on the chain at all.
+    current_search_pos: Option<SearchPos>,
 
     /// Lexer mode for tokenizing included files (C or Assembly)
     lexer_mode: LexerMode,
@@ -874,7 +940,7 @@ impl<'a> Preprocessor<'a> {
             compile_time,
             use_builtin_headers: true,
             trigraphs: false,
-            current_include_path_index: None,
+            current_search_pos: None,
             lexer_mode: LexerMode::C,
             line_offset: 0,
             line_file_override: None,
@@ -1018,30 +1084,24 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // Limit macros
-        for (name, value) in arch::get_limit_macros(self.target) {
-            self.define_macro(Macro::predefined(name, Some(value)));
-        }
-
-        // Type definition macros (for <stdint.h> and <stddef.h>)
-        // These expand to type names, so they need to be tokenized properly
+        // Integer type macros (for <stdint.h> and <stddef.h>). These expand
+        // to type names, so they need to be tokenized properly.
         for (name, value) in arch::get_type_macros(self.target) {
-            self.define_macro(Macro::predefined_type(name, value));
+            self.define_macro(Macro::predefined_type(&name, value));
         }
 
-        // Fixed-width integer limit macros (for <stdint.h>)
-        for (name, value) in arch::get_stdint_limit_macros(self.target) {
-            self.define_macro(Macro::predefined(name, Some(value)));
+        // gcc's integer constant macros, `__INT64_C(c)` and the rest
+        for (name, suffix) in arch::get_constant_fn_macros(self.target) {
+            self.define_macro(Macro::predefined_constant_fn(&name, suffix));
         }
 
-        // Integer constant suffix macros
-        for (name, value) in arch::get_suffix_macros(self.target) {
-            self.define_macro(Macro::predefined(name, Some(value)));
-        }
-
-        // Format specifier macros (for <inttypes.h>)
-        for (name, value) in arch::get_format_macros(self.target) {
-            self.define_macro(Macro::predefined(name, Some(value)));
+        // Integer limits, widths, sizes, constant suffixes and formats, and
+        // the atomic lock-free predefines
+        for (name, value) in arch::get_integer_macros(self.target)
+            .into_iter()
+            .chain(arch::get_atomic_macros(self.target))
+        {
+            self.define_macro(Macro::predefined(&name, Some(&value)));
         }
 
         // Additional sizeof macros
@@ -1147,10 +1207,10 @@ impl<'a> Preprocessor<'a> {
         // Searched like `#include "..."`: the working directory first, then
         // `-I`, then the system paths.
         match self.find_include_file(path, false, false) {
-            Some((IncludeSource::File(found), index)) => {
+            Some((IncludeSource::File(found), pos)) => {
                 // A `-include` is a dependency exactly as a `#include` is.
-                self.record_dependency(&found, index.is_some());
-                self.include_file(&found, output, idents, &hash, index)
+                self.record_dependency(&found, pos);
+                self.include_file(&found, output, idents, &hash, pos)
             }
             Some((IncludeSource::Builtin(content), _)) => {
                 self.include_builtin(path, content, output, idents, &hash)
@@ -2044,10 +2104,13 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
 
         // Handle character literal (any encoding prefix: L'x', u'x', U'x')
         if let Some(tok) = self.current() {
-            let wide = matches!(
-                &tok.value,
-                TokenValue::WideChar(_) | TokenValue::Utf16Char(_) | TokenValue::Utf32Char(_)
-            );
+            let target = self.pp.target;
+            let wide = match &tok.value {
+                TokenValue::WideChar(_) => Some(target.wchar_type()),
+                TokenValue::Utf16Char(_) => Some(target.char16_type()),
+                TokenValue::Utf32Char(_) => Some(target.char32_type()),
+                _ => None,
+            };
             let char_str = match &tok.value {
                 TokenValue::Char(c)
                 | TokenValue::WideChar(c)
@@ -2100,14 +2163,13 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     /// `#if '\0'` came to be *true*. Decoding goes through the same
     /// [`literal`] module the parser uses, so `#if 'c' == V` and the compiled
     /// `'c' == V` cannot disagree.
-    fn char_constant(&mut self, payload: &str, wide: bool, pos: Position) -> PpValue {
+    ///
+    /// `wide` is the type of a prefixed constant, `None` for a plain one.
+    fn char_constant(&mut self, payload: &str, wide: Option<IntType>, pos: Position) -> PpValue {
         let elements = literal::parse_string_literal(payload);
-        for e in &elements {
-            if let literal::Escaped::ForbiddenUcn(val) = e {
-                if !self.suppressed {
-                    report_forbidden_ucn(pos, *val);
-                }
-            }
+        if !self.suppressed {
+            let bits = wide.map_or(literal::CHAR_UNIT_BITS, |t| self.pp.target.int_width(t));
+            literal::check_elements(&elements, bits, pos);
         }
         if elements.is_empty() {
             self.err(pos, "empty character constant");
@@ -2116,23 +2178,26 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
 
         // A prefixed constant holds characters, not bytes: `L'\n'` is the one
         // wide character 10, never the two bytes of a UTF-8 encoding.
-        if wide {
+        if let Some(t) = wide {
             let units = literal::literal_wide_chars(&elements);
-            return PpValue::signed(units.first().copied().unwrap_or(0) as i128);
+            let unit = units.first().copied().unwrap_or(0);
+            // It has its type's signedness in `#if` too (6.10.1p4): an
+            // unsigned `wchar_t`, `char16_t` or `char32_t` acts as
+            // `uintmax_t`, so `L'\0' - 1 > 0` is how glibc's <bits/wchar.h>
+            // detects an unsigned `wchar_t`.
+            let bits = self.pp.target.int_width(t);
+            let v = literal::prefixed_char_value(unit, bits, t.is_signed());
+            return PpValue::from_parts(v.into(), !t.is_signed());
         }
 
         // C17 6.4.4.4p10: an ordinary character constant has type `int`. One
         // character takes plain `char`'s signedness, so `'\xff'` is negative
         // where `char` is signed and positive where it is not -- which is the
-        // whole reason `Target::char_signed` exists.
+        // whole reason `Target::plain_char` exists.
         let bytes: Vec<u8> = payload_bytes(&literal::literal_bytes(&elements)).collect();
         if bytes.len() == 1 {
             let b = bytes[0];
-            return PpValue::signed(if self.pp.target.char_signed {
-                b as i8 as i128
-            } else {
-                b as i128
-            });
+            return PpValue::signed(self.pp.target.plain_char.byte_value(b) as i128);
         }
 
         // More than one: gcc packs big-endian and lets the value wrap in
@@ -2215,7 +2280,9 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         };
 
         // Use centralized builtin registry
-        if crate::builtins::is_builtin(name.as_str()) {
+        if crate::builtins::is_builtin(name.as_str())
+            && crate::builtins::available_on(name.as_str(), self.pp.target)
+        {
             1
         } else {
             0

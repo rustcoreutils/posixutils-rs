@@ -145,7 +145,8 @@ fi
 # construction and needs no guess about where the header ends.
 dg_scan() {
     awk -v TRIPLE="$TORTURE_TRIPLE" -v OPTS="${2:-}" '
-    BEGIN { skip=""; flags=""; mult=1; stack=""; dgdo=""; in_c=0 }
+    BEGIN { skip=""; flags=""; mult=1; stack=""; dgdo=""; in_c=0
+            SEL_FALSE = 0; SEL_TRUE = 1; SEL_UNKNOWN = 2 }
 
     # Reduce the line to the comment text it contains, tracking /* */ across
     # lines. A // comment runs to end of line. Anything outside a comment --
@@ -251,28 +252,96 @@ dg_scan() {
     # group naming only other architectures does not apply here; `*-*-*` names
     # every target, and then the option group decides -- `{ *-*-* } "-O1"`
     # skips only at -O1.
-    function dg_skip_applies(text,   grp, rest, i, n, tok, toks, hit) {
+    #
+    # The target group is an expression, not a word list: `{ ! { x86_64-*-* } }`
+    # and `{ { x86_64-*-* } && { ia32 } }` both occur, and reading every word
+    # as a target that might match skipped 990413-2 and 20000804-1 on the one
+    # target each of them is meant to run on.
+    function dg_skip_applies(text,   grp, rest, v, i, n) {
         grp = first_group(text)
         if (grp == "") return 1           # no selector at all: unconditional
         rest = substr(text, GRP_END + 1)
 
-        gsub(/[{}"]/, " ", grp)
-        n = split(grp, toks, /[ \t]+/)
-        hit = 0
-        for (i = 1; i <= n; i++) {
-            tok = toks[i]
-            if (tok == "" || tok == "&&" || tok == "||" || tok == "!") continue
-            # `freestanding` is the one effective target here that is plainly
-            # false for us: this harness links against a hosted libc.
-            if (tok == "freestanding") continue
-            # An effective-target name we do not model. Assume it applies, so
-            # an unread selector errs towards skipping rather than towards a
-            # failure we would have to triage as a target question.
-            if (index(tok, "-") == 0) return option_group_applies(rest)
-            if (glob_match(tok, TRIPLE)) hit = 1
+        gsub(/"/, " ", grp)
+        gsub(/\{/, " { ", grp)
+        gsub(/\}/, " } ", grp)
+        gsub(/!/, " ! ", grp)
+        gsub(/&&/, " \\&\\& ", grp)
+        gsub(/\|\|/, " || ", grp)
+        NTK = split(grp, TK, /[ \t]+/)
+        # split() leaves an empty first field for leading blanks; drop empties.
+        n = 0
+        for (i = 1; i <= NTK; i++) if (TK[i] != "") TK[++n] = TK[i]
+        NTK = n
+        PTK = 1
+        v = sel_or()
+        # An effective target we do not model leaves the answer unknown. Assume
+        # the skip applies, so an unread selector errs towards skipping rather
+        # than towards a failure we would have to triage as a target question.
+        if (v == SEL_FALSE) return 0
+        return option_group_applies(rest)
+    }
+
+    # A three-valued evaluator over the tokens in TK[PTK..NTK]: SEL_FALSE,
+    # SEL_TRUE, or SEL_UNKNOWN for an effective target not modelled here.
+    #
+    #   or      := and { "||" and }
+    #   and     := unary { "&&" unary }
+    #   unary   := "!" unary | primary
+    #   primary := "{" or { or } "}" | word
+    #
+    # Items side by side inside braces -- `{ avr-*-* pdp11-*-* }` -- are a
+    # list, and a list matches when any of its items does.
+    function sel_or(   v, w) {
+        v = sel_and()
+        while (PTK <= NTK && TK[PTK] == "||") { PTK++; w = sel_and(); v = sel_any(v, w) }
+        return v
+    }
+    function sel_and(   v, w) {
+        v = sel_unary()
+        while (PTK <= NTK && TK[PTK] == "&&") { PTK++; w = sel_unary(); v = sel_all(v, w) }
+        return v
+    }
+    function sel_unary(   v) {
+        if (PTK <= NTK && TK[PTK] == "!") {
+            PTK++
+            v = sel_unary()
+            if (v == SEL_UNKNOWN) return v
+            return v == SEL_TRUE ? SEL_FALSE : SEL_TRUE
         }
-        if (hit) return option_group_applies(rest)
-        return 0
+        return sel_primary()
+    }
+    function sel_primary(   v, tok) {
+        if (PTK > NTK) return SEL_UNKNOWN
+        tok = TK[PTK++]
+        if (tok == "{") {
+            v = SEL_FALSE
+            while (PTK <= NTK && TK[PTK] != "}") v = sel_any(v, sel_or())
+            PTK++                         # the closing brace
+            return v
+        }
+        return sel_word(tok)
+    }
+    function sel_any(a, b) {
+        if (a == SEL_TRUE || b == SEL_TRUE) return SEL_TRUE
+        if (a == SEL_UNKNOWN || b == SEL_UNKNOWN) return SEL_UNKNOWN
+        return SEL_FALSE
+    }
+    function sel_all(a, b) {
+        if (a == SEL_FALSE || b == SEL_FALSE) return SEL_FALSE
+        if (a == SEL_UNKNOWN || b == SEL_UNKNOWN) return SEL_UNKNOWN
+        return SEL_TRUE
+    }
+
+    # A target triple is globbed; anything else is an effective-target name.
+    # These are the ones the torture selectors name whose answer is the same
+    # on every target c17 builds for: both are hosted LP64 Linux, and each is
+    # the check_effective_target_* of the same name in gcc lib/target-supports.exp.
+    function sel_word(tok) {
+        if (index(tok, "-") > 0) return glob_match(tok, TRIPLE) ? SEL_TRUE : SEL_FALSE
+        if (tok == "freestanding" || tok == "ia32" || tok == "ilp32") return SEL_FALSE
+        if (tok == "lp64" || tok == "untyped_assembly" || tok == "size20plus") return SEL_TRUE
+        return SEL_UNKNOWN
     }
 
     # The option group, when present, lists the command lines the skip applies
@@ -446,14 +515,12 @@ OUT_OF_SCOPE_VLA_MEMBER=" execute/20020412-1 execute/20040308-1 \
 # required by C17 and c17 deliberately does something else; see the
 # "Deliberate divergences" table in cc/DECISIONS.md.
 #
-#   20021127-1  gcc folds llabs() and never calls the program's own definition
-#               of llabs. Matching it means a local definition is ignored.
 #   20031003-1  (int)2147483648.0f is undefined behaviour; gcc's folder
 #               saturates to INT_MAX. aarch64 agrees by hardware accident.
 #   pr46309     a conditional with one `void` arm, which gcc takes as an
 #               extension and C17 6.5.15p3 forbids.
-OUT_OF_SCOPE_GCC_BEHAVIOUR=" execute/20021127-1 execute/20031003-1 \
- execute/pr46309 compile/pr26725 compile/20000211-1 compile/950919-1 "
+OUT_OF_SCOPE_GCC_BEHAVIOUR=" execute/20031003-1 execute/pr46309 \
+ compile/pr26725 compile/20000211-1 compile/950919-1 "
 
 # Tests gcc on this machine fails exactly as c17 does, verified by running both
 # at -O0 and -O2. Counting them as c17 failures overstates the gap, and they are
@@ -569,11 +636,6 @@ C17_CONSTRAINT_GCC_WARNS=" compile/pr38857 "
 NEEDS_64BIT_FRAMES=" compile/20031023-1 compile/20031023-2 compile/20031023-3 \
  compile/20031023-4 compile/stack-check-1 "
 
-# Tests whose own inline assembly is x86. They are portable C on the host;
-# built for aarch64, gas rightly rejects the template, which says nothing about
-# c17. Applied in aarch64 mode only.
-X86_ASM_ONLY=" execute/990413-2 "
-
 # `dg-do compile` tests whose asm template is deliberately not an instruction
 # -- `asm("%0" :: "r"(1.5))`, `asm("f")` -- so they only mean something up to
 # `-S`, which is where gcc stops. aarch64 mode assembles every other compile
@@ -678,11 +740,6 @@ run_one() {
     case "$NEEDS_64BIT_FRAMES" in
         *" $key "*) echo "SKIP	$tag	needs 64-bit frames"; return;;
     esac
-    if [ "$TORTURE_TARGET" = aarch64 ]; then
-        case "$X86_ASM_ONLY" in
-            *" $key "*) echo "SKIP	$tag	x86 inline assembly in the test"; return;;
-        esac
-    fi
     local scan skip flags mult stack dgdo
     scan=$(dg_scan "$src" "$opt")
     skip=${scan%%|*}; scan=${scan#*|}
@@ -850,7 +907,7 @@ default_mode() {
 
 export -f run_one dg_scan x_file_verdict default_mode
 export -f target_compile_only target_build target_run
-export TORTURE_TARGET TARGET_FLAGS TAG_PREFIX X86_ASM_ONLY TEMPLATE_NOT_ASSEMBLED
+export TORTURE_TARGET TARGET_FLAGS TAG_PREFIX TEMPLATE_NOT_ASSEMBLED
 export GCC_ALSO_FAILS NEEDS_OPTIMIZATION TORTURE_TRIPLE
 export OUT_OF_SCOPE_POST_C17 OUT_OF_SCOPE_GNU_ATTR
 export OUT_OF_SCOPE_NESTED_FN OUT_OF_SCOPE_VLA_MEMBER

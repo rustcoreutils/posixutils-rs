@@ -15,7 +15,8 @@
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
-use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, XmmReg};
+use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, X87ControlWords, XmmReg};
+use crate::arch::x86_64::x87::is_x87_float_to_int;
 use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::{TypeKind, TypeTable};
@@ -84,6 +85,9 @@ pub struct X86_64CodeGen {
     pub(super) max_local_align: i32,
     /// Pseudos that are 128-bit integers (need full 16-byte copies)
     pub(super) int128_pseudos: HashSet<PseudoId>,
+    /// Where the allocator put the x87 control words, when this function
+    /// converts a long double to an integer.
+    pub(super) x87_control_words: Option<X87ControlWords>,
 }
 
 impl X86_64CodeGen {
@@ -110,6 +114,7 @@ impl X86_64CodeGen {
             frame_base: FrameBase::Rbp,
             max_local_align: 16,
             int128_pseudos: HashSet::new(),
+            x87_control_words: None,
         }
     }
 
@@ -970,6 +975,48 @@ impl X86_64CodeGen {
                 }
             }
 
+            Opcode::Fabs => {
+                if self.is_longdouble_op(insn, types) {
+                    self.emit_x87_abs(insn);
+                } else {
+                    self.emit_fp_abs(insn, types);
+                }
+            }
+
+            Opcode::CopySign => {
+                if self.is_longdouble_op(insn, types) {
+                    self.emit_x87_copysign(insn);
+                } else {
+                    self.emit_fp_copysign(insn, types);
+                }
+            }
+
+            // A binary128 root never gets here: it is a call by now (see
+            // `arch::mapping::call_library_fallbacks`).
+            Opcode::Sqrt => {
+                if self.is_longdouble_op(insn, types) {
+                    self.emit_x87_sqrt(insn);
+                } else {
+                    self.emit_fp_sqrt(insn, types);
+                }
+            }
+
+            // Only a `float` or `double` `floor`, `ceil`, `trunc` or `rint`
+            // gets here; the rest are calls by now.
+            Opcode::RoundToIntegral(how) => self.emit_fp_round_to_integral(insn, how, types),
+            Opcode::FMin | Opcode::FMax | Opcode::Fma => {
+                unreachable!("{:?} is a call on x86-64 (see computes_in_place)", insn.op)
+            }
+
+            // The operand's format is its `src_typ`: `typ` is the `int`.
+            Opcode::Signbit => {
+                if self.fp_format(insn.src_typ, insn.src_size, types) == FpSize::Extended {
+                    self.emit_x87_signbit(insn);
+                } else {
+                    self.emit_fp_signbit(insn, types);
+                }
+            }
+
             // Floating-point comparisons
             Opcode::FCmpOEq
             | Opcode::FCmpONe
@@ -1000,10 +1047,7 @@ impl X86_64CodeGen {
             // Float to integer conversions
             Opcode::FCvtU | Opcode::FCvtS => {
                 // Use x87 for long double source
-                let src_is_longdouble = insn
-                    .src_typ
-                    .is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
-                if src_is_longdouble {
+                if is_x87_float_to_int(insn, types) {
                     self.emit_x87_float_to_int(insn);
                 } else {
                     self.emit_float_to_int(insn, types);
@@ -1072,7 +1116,7 @@ impl X86_64CodeGen {
             }
 
             Opcode::Zext | Opcode::Sext | Opcode::Trunc => {
-                self.emit_extend(insn);
+                self.emit_extend(insn, types);
             }
 
             // Variadic function support (va_* builtins)
@@ -1125,22 +1169,6 @@ impl X86_64CodeGen {
 
             Opcode::Memmove => {
                 self.emit_memmove(insn);
-            }
-
-            Opcode::Fabs32 => {
-                self.emit_fabs32(insn);
-            }
-
-            Opcode::Fabs64 => {
-                self.emit_fabs64(insn);
-            }
-
-            Opcode::Signbit32 => {
-                self.emit_signbit32(insn);
-            }
-
-            Opcode::Signbit64 => {
-                self.emit_signbit64(insn);
             }
 
             Opcode::Unreachable => {
@@ -1539,12 +1567,7 @@ impl CodeGenerator for X86_64CodeGen {
             self.base.emit_strings(&module.strings);
         }
 
-        // Emit wide string literals
-        if !module.wide_strings.is_empty() {
-            self.base.emit_wide_strings(&module.wide_strings);
-        }
-
-        // Emit char16_t / char32_t string literals
+        // Emit char16_t, char32_t and wchar_t string literals
         if !module.utf16_strings.is_empty() {
             self.base.emit_utf16_strings(&module.utf16_strings);
         }

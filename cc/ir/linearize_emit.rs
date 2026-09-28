@@ -8,11 +8,14 @@
 
 //! Emit helpers for the linearizer (constants, block copies, bitfields, operators, assignments)
 
-use super::{CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
+use super::memexpand;
+use super::{BasicBlockId, CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
 use crate::abi::get_abi_for_conv;
+use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
-use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, UnaryOp};
+use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, FpCompare, LibFn, MathErrno, UnaryOp};
+use crate::strings::StringId;
 use crate::types::{MemberInfo, TypeId, TypeKind};
 
 /// A read-modify-write target whose address has been computed **once**.
@@ -48,6 +51,48 @@ struct ComplexHalfOps {
     eq: Opcode,
     ne: Opcode,
     integral: bool,
+}
+
+/// The floating comparison C's relational or equality operator `op` is.
+pub(crate) fn float_comparison(op: BinaryOp) -> Option<Opcode> {
+    Some(match op {
+        BinaryOp::Lt => Opcode::FCmpOLt,
+        BinaryOp::Gt => Opcode::FCmpOGt,
+        BinaryOp::Le => Opcode::FCmpOLe,
+        BinaryOp::Ge => Opcode::FCmpOGe,
+        BinaryOp::Eq => Opcode::FCmpOEq,
+        BinaryOp::Ne => Opcode::FCmpONe,
+        _ => return None,
+    })
+}
+
+/// The one floating comparison a member of the `isgreater` family is, or
+/// `None` for the two that take more than one (`islessgreater`,
+/// `isunordered`).
+pub(crate) fn fp_compare_opcode(cmp: FpCompare) -> Option<Opcode> {
+    Some(match cmp {
+        FpCompare::Greater => Opcode::FCmpOGt,
+        FpCompare::GreaterEqual => Opcode::FCmpOGe,
+        FpCompare::Less => Opcode::FCmpOLt,
+        FpCompare::LessEqual => Opcode::FCmpOLe,
+        // C23 7.12.17.1 has `iseqsig` raise `FE_INVALID` for an unordered
+        // pair, quiet NaN included -- the reverse of its siblings. The quiet
+        // compare emitted for it does not raise it for a quiet NaN. The
+        // *answer* is exact; only the exception flag differs -- the same gap
+        // c17's `<` and `>` have, which use this compare too.
+        FpCompare::Equal => Opcode::FCmpOEq,
+        FpCompare::LessGreater | FpCompare::Unordered => return None,
+    })
+}
+
+/// A controlling expression, evaluated for a branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Controlling {
+    /// A constant expression, and whether it holds: the branch goes one way
+    /// only, and the arm it never takes has no edge into it.
+    Constant(bool),
+    /// A value computed at run time, nonzero when the condition holds.
+    Value(PseudoId),
 }
 
 /// The low-`bit_width` mask for a bit-field value.
@@ -212,23 +257,12 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit_block_copy_at_offset(dst, 0, src, size_bytes);
     }
 
-    /// Above this many bytes, a block copy becomes a `memcpy` call rather than
-    /// an unrolled load/store sequence.
-    ///
-    /// The unrolled form costs one load, one store and one fresh pseudo per
-    /// eight bytes, with no upper bound: a 256 KB struct passed by value --
-    /// `struct big { int i[0x10000]; }`, which gcc.c-torture's pr28982b does --
-    /// produced 65,536 IR instructions, 131,108 lines of assembly and a
-    /// **65-second** compile, against gcc's 48 lines and one `call memcpy`.
-    ///
-    /// Small copies stay inline, where they belong: a call would cost more than
-    /// the moves it replaces, and `test_linearize.rs` pins two 64-bit loads and
-    /// two 64-bit stores for a 128-bit copy. 128 bytes leaves every realistic
-    /// struct on the inline path and takes only the pathological ones off it.
-    const BLOCK_COPY_INLINE_LIMIT: i64 = 128;
-
     /// Emit a block copy from src to dst using integer chunks.
     /// The destination stores start at dst_base_offset.
+    ///
+    /// Above `memexpand::INLINE_LIMIT_BYTES` the copy is a `memcpy` call
+    /// instead, by the same rule and in the same chunks as a `memcpy` the
+    /// program wrote.
     pub(crate) fn emit_block_copy_at_offset(
         &mut self,
         dst: PseudoId,
@@ -236,63 +270,20 @@ impl<'a> super::linearize::Linearizer<'a> {
         src: PseudoId,
         size_bytes: i64,
     ) {
-        if size_bytes > Self::BLOCK_COPY_INLINE_LIMIT {
+        if size_bytes > memexpand::INLINE_LIMIT_BYTES {
             self.emit_block_copy_call(dst, dst_base_offset, src, size_bytes);
             return;
         }
-        let mut offset: i64 = 0;
-        while offset + 8 <= size_bytes {
+        for (offset, chunk) in memexpand::block_chunks(size_bytes) {
+            let (typ, bits) = (chunk.typ(self.types), chunk.bits());
             let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(tmp, src, offset, self.types.ulong_id, 64));
+            self.emit(Instruction::load(tmp, src, offset, typ, bits));
             self.emit(Instruction::store(
                 tmp,
                 dst,
                 dst_base_offset + offset,
-                self.types.ulong_id,
-                64,
-            ));
-            offset += 8;
-        }
-        let remaining = size_bytes - offset;
-        if remaining >= 4 {
-            let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(tmp, src, offset, self.types.uint_id, 32));
-            self.emit(Instruction::store(
-                tmp,
-                dst,
-                dst_base_offset + offset,
-                self.types.uint_id,
-                32,
-            ));
-            offset += 4;
-        }
-        if remaining % 4 >= 2 {
-            let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(
-                tmp,
-                src,
-                offset,
-                self.types.ushort_id,
-                16,
-            ));
-            self.emit(Instruction::store(
-                tmp,
-                dst,
-                dst_base_offset + offset,
-                self.types.ushort_id,
-                16,
-            ));
-            offset += 2;
-        }
-        if remaining % 2 == 1 {
-            let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(tmp, src, offset, self.types.uchar_id, 8));
-            self.emit(Instruction::store(
-                tmp,
-                dst,
-                dst_base_offset + offset,
-                self.types.uchar_id,
-                8,
+                typ,
+                bits,
             ));
         }
     }
@@ -1017,111 +1008,95 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         let result = self.alloc_pseudo();
 
-        let opcode = match op {
-            BinaryOp::Add => {
-                if is_float {
-                    Opcode::FAdd
-                } else {
-                    Opcode::Add
+        let opcode = if let Some(fcmp) = float_comparison(op).filter(|_| is_float) {
+            fcmp
+        } else {
+            match op {
+                BinaryOp::Add => {
+                    if is_float {
+                        Opcode::FAdd
+                    } else {
+                        Opcode::Add
+                    }
                 }
-            }
-            BinaryOp::Sub => {
-                if is_float {
-                    Opcode::FSub
-                } else {
-                    Opcode::Sub
+                BinaryOp::Sub => {
+                    if is_float {
+                        Opcode::FSub
+                    } else {
+                        Opcode::Sub
+                    }
                 }
-            }
-            BinaryOp::Mul => {
-                if is_float {
-                    Opcode::FMul
-                } else {
-                    Opcode::Mul
+                BinaryOp::Mul => {
+                    if is_float {
+                        Opcode::FMul
+                    } else {
+                        Opcode::Mul
+                    }
                 }
-            }
-            BinaryOp::Div => {
-                if is_float {
-                    Opcode::FDiv
-                } else if is_unsigned {
-                    Opcode::DivU
-                } else {
-                    Opcode::DivS
+                BinaryOp::Div => {
+                    if is_float {
+                        Opcode::FDiv
+                    } else if is_unsigned {
+                        Opcode::DivU
+                    } else {
+                        Opcode::DivS
+                    }
                 }
-            }
-            BinaryOp::Mod => {
-                // Modulo is not supported for floats in hardware - use fmod() library call
-                // For now, use integer modulo (semantic analysis should catch float % float)
-                if is_unsigned {
-                    Opcode::ModU
-                } else {
-                    Opcode::ModS
+                BinaryOp::Mod => {
+                    // Modulo is not supported for floats in hardware - use fmod() library call
+                    // For now, use integer modulo (semantic analysis should catch float % float)
+                    if is_unsigned {
+                        Opcode::ModU
+                    } else {
+                        Opcode::ModS
+                    }
                 }
-            }
-            BinaryOp::Lt => {
-                if is_float {
-                    Opcode::FCmpOLt
-                } else if is_unsigned {
-                    Opcode::SetB
-                } else {
-                    Opcode::SetLt
+                BinaryOp::Lt => {
+                    if is_unsigned {
+                        Opcode::SetB
+                    } else {
+                        Opcode::SetLt
+                    }
                 }
-            }
-            BinaryOp::Gt => {
-                if is_float {
-                    Opcode::FCmpOGt
-                } else if is_unsigned {
-                    Opcode::SetA
-                } else {
-                    Opcode::SetGt
+                BinaryOp::Gt => {
+                    if is_unsigned {
+                        Opcode::SetA
+                    } else {
+                        Opcode::SetGt
+                    }
                 }
-            }
-            BinaryOp::Le => {
-                if is_float {
-                    Opcode::FCmpOLe
-                } else if is_unsigned {
-                    Opcode::SetBe
-                } else {
-                    Opcode::SetLe
+                BinaryOp::Le => {
+                    if is_unsigned {
+                        Opcode::SetBe
+                    } else {
+                        Opcode::SetLe
+                    }
                 }
-            }
-            BinaryOp::Ge => {
-                if is_float {
-                    Opcode::FCmpOGe
-                } else if is_unsigned {
-                    Opcode::SetAe
-                } else {
-                    Opcode::SetGe
+                BinaryOp::Ge => {
+                    if is_unsigned {
+                        Opcode::SetAe
+                    } else {
+                        Opcode::SetGe
+                    }
                 }
-            }
-            BinaryOp::Eq => {
-                if is_float {
-                    Opcode::FCmpOEq
-                } else {
-                    Opcode::SetEq
+                BinaryOp::Eq => Opcode::SetEq,
+                BinaryOp::Ne => Opcode::SetNe,
+                // LogAnd and LogOr are handled earlier in linearize_expr via
+                // emit_logical_and/emit_logical_or for proper short-circuit evaluation
+                BinaryOp::LogAnd | BinaryOp::LogOr => {
+                    unreachable!("LogAnd/LogOr should be handled in ExprKind::Binary")
                 }
-            }
-            BinaryOp::Ne => {
-                if is_float {
-                    Opcode::FCmpONe
-                } else {
-                    Opcode::SetNe
-                }
-            }
-            // LogAnd and LogOr are handled earlier in linearize_expr via
-            // emit_logical_and/emit_logical_or for proper short-circuit evaluation
-            BinaryOp::LogAnd | BinaryOp::LogOr => {
-                unreachable!("LogAnd/LogOr should be handled in ExprKind::Binary")
-            }
-            BinaryOp::BitAnd => Opcode::And,
-            BinaryOp::BitOr => Opcode::Or,
-            BinaryOp::BitXor => Opcode::Xor,
-            BinaryOp::Shl => Opcode::Shl,
-            BinaryOp::Shr => {
-                // Logical shift for unsigned, arithmetic for signed
-                if is_unsigned {
-                    Opcode::Lsr
-                } else {
-                    Opcode::Asr
+                BinaryOp::BitAnd => Opcode::And,
+                BinaryOp::BitOr => Opcode::Or,
+                BinaryOp::BitXor => Opcode::Xor,
+                BinaryOp::Shl => Opcode::Shl,
+                BinaryOp::Shr => {
+                    // Logical shift for unsigned, arithmetic for signed
+                    if is_unsigned {
+                        Opcode::Lsr
+                    } else {
+                        Opcode::Asr
+                    }
                 }
             }
         };
@@ -1450,54 +1425,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                 );
                 return result_addr;
             }
-            BinaryOp::Mul => {
-                // Complex multiply via rtlib call (__mulsc3, __muldc3, etc.)
-                let base_kind = self.types.kind(base_typ);
-                let func_name = crate::arch::mapping::complex_mul_name(base_kind, self.target);
-                let call_result = self.emit_complex_rtlib_call(
-                    func_name,
-                    (left_real, left_imag),
-                    (right_real, right_imag),
-                    base_typ,
-                    complex_typ,
-                );
-                // Load real/imag from the call result
-                let real = self.alloc_pseudo();
-                self.emit(Instruction::load(real, call_result, 0, base_typ, base_size));
-                let imag = self.alloc_pseudo();
-                self.emit(Instruction::load(
-                    imag,
-                    call_result,
-                    base_bytes,
-                    base_typ,
-                    base_size,
-                ));
-                (real, imag)
-            }
-            BinaryOp::Div => {
-                // Complex divide via rtlib call (__divsc3, __divdc3, etc.)
-                let base_kind = self.types.kind(base_typ);
-                let func_name = crate::arch::mapping::complex_div_name(base_kind, self.target);
-                let call_result = self.emit_complex_rtlib_call(
-                    func_name,
-                    (left_real, left_imag),
-                    (right_real, right_imag),
-                    base_typ,
-                    complex_typ,
-                );
-                // Load real/imag from the call result
-                let real = self.alloc_pseudo();
-                self.emit(Instruction::load(real, call_result, 0, base_typ, base_size));
-                let imag = self.alloc_pseudo();
-                self.emit(Instruction::load(
-                    imag,
-                    call_result,
-                    base_bytes,
-                    base_typ,
-                    base_size,
-                ));
-                (real, imag)
-            }
+            BinaryOp::Mul | BinaryOp::Div => self.emit_complex_float_muldiv(
+                op,
+                (left_real, left_imag),
+                (right_real, right_imag),
+                base_typ,
+            ),
             _ => {
                 // Other operations not supported for complex types
                 error(
@@ -1525,6 +1458,53 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         result_addr
+    }
+
+    /// A floating complex `*` or `/`, by libgcc's `__mul?c3`/`__div?c3`.
+    ///
+    /// The routine is the one for the halves' routine format, as gcc picks
+    /// it: `_Float16 _Complex` has no routine of its own that gcc calls, so
+    /// its halves are widened to `float`, `__mulsc3`/`__divsc3` computes, and
+    /// the result is narrowed back -- the same steps the constant folder takes
+    /// (`FloatVal::complex_mul`), so a folded and a run-time result agree.
+    /// It used to call the `double` routines on half-precision bits.
+    fn emit_complex_float_muldiv(
+        &mut self,
+        op: BinaryOp,
+        left: (PseudoId, PseudoId),
+        right: (PseudoId, PseudoId),
+        base_typ: TypeId,
+    ) -> (PseudoId, PseudoId) {
+        let (work_typ, routine) = self
+            .types
+            .complex_routine_type(base_typ)
+            .expect("a non-integral complex type has a floating base");
+        let routine_fn = match op {
+            BinaryOp::Mul => (
+                LibFn::MulComplex,
+                crate::arch::mapping::complex_mul_name(routine),
+            ),
+            _ => (
+                LibFn::DivComplex,
+                crate::arch::mapping::complex_div_name(routine),
+            ),
+        };
+        let mut widen = |v| self.emit_convert(v, base_typ, work_typ);
+        let left = (widen(left.0), widen(left.1));
+        let right = (widen(right.0), widen(right.1));
+        let call_result = self.emit_complex_rtlib_call(
+            routine_fn,
+            left,
+            right,
+            work_typ,
+            self.types.make_complex(work_typ),
+        );
+        let (real, imag, _, _) =
+            self.load_complex_halves(call_result, self.types.make_complex(work_typ));
+        (
+            self.emit_convert(real, work_typ, base_typ),
+            self.emit_convert(imag, work_typ, base_typ),
+        )
     }
 
     /// `(a + bi) * (c + di)` for integer halves: `(ac - bd) + (ad + bc)i`.
@@ -1684,7 +1664,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// `t = x >> (width - 1)` is all ones for a negative value and zero
     /// otherwise, so `(x ^ t) - t` is the magnitude either way. An unsigned
     /// value is already its own magnitude.
-    fn emit_int_abs(&mut self, x: PseudoId, typ: TypeId, size: u32) -> PseudoId {
+    pub(crate) fn emit_int_abs(&mut self, x: PseudoId, typ: TypeId, size: u32) -> PseudoId {
         if self.types.is_unsigned(typ) {
             return x;
         }
@@ -1692,6 +1672,207 @@ impl<'a> super::linearize::Linearizer<'a> {
         let sign = self.emit_int_binop(Opcode::Asr, x, shift, typ, size);
         let flipped = self.emit_int_binop(Opcode::Xor, x, sign, typ, size);
         self.emit_int_binop(Opcode::Sub, flipped, sign, typ, size)
+    }
+
+    /// `|x|` for a `float`, `double` or `long double`, whichever `typ` is:
+    /// the `Fabs` opcode, which both backends compute in place by clearing
+    /// the sign bit -- never a call, so no program needs libm for it.
+    pub(crate) fn emit_fabs(&mut self, x: PseudoId, typ: TypeId) -> PseudoId {
+        let size = self.types.size_bits(typ);
+        let result = self.alloc_pseudo();
+        let insn = Instruction::new(Opcode::Fabs)
+            .with_target(result)
+            .with_src(x)
+            .with_size(size)
+            .with_type(typ);
+        self.emit(insn);
+        result
+    }
+
+    /// `copysign(x, y)` at `typ`: the `CopySign` opcode, computed in place
+    /// by both backends like `Fabs`.
+    pub(crate) fn emit_copysign(&mut self, x: PseudoId, y: PseudoId, typ: TypeId) -> PseudoId {
+        let size = self.types.size_bits(typ);
+        let result = self.alloc_pseudo();
+        let insn = Instruction::new(Opcode::CopySign)
+            .with_target(result)
+            .with_src2(x, y)
+            .with_size(size)
+            .with_type(typ);
+        self.emit(insn);
+        result
+    }
+
+    /// `sqrt(x)` at `typ`, where `callee` is the library function the call
+    /// named (`sqrtf`): the `Sqrt` opcode, which the backends compute with
+    /// their square-root instruction, or which a late mapping turns back into
+    /// a call to `callee` on a target that has none for `typ`.
+    ///
+    /// When `errno` is to be set, an argument below zero goes to the library
+    /// instead, as gcc arranges it: `x < 0` is ordered, so `-0`, and a NaN,
+    /// which the instruction answers the same way the library does, stay on
+    /// the instruction. A target that calls the library for every argument
+    /// anyway gets only the call -- the call sets `errno` itself, and the
+    /// comparison would cost a call of its own on binary128.
+    pub(crate) fn emit_sqrt(
+        &mut self,
+        x: PseudoId,
+        typ: TypeId,
+        callee: StringId,
+        errno: MathErrno,
+    ) -> PseudoId {
+        let callee = self.library_function_name(self.strings.get(callee));
+        let in_place = self.types.fp_format(typ).is_some_and(|fmt| {
+            crate::arch::mapping::computes_in_place(Opcode::Sqrt, fmt, self.target)
+        });
+        let sqrt = |lin: &mut Self| lin.emit_libm_insn(Opcode::Sqrt, &[x], typ, &callee);
+        match errno {
+            MathErrno::Ignored => sqrt(self),
+            MathErrno::Set if !in_place => self.emit_library_call(&callee, &[(x, typ)], typ),
+            MathErrno::Set => {
+                let size = self.types.size_bits(typ);
+                let zero = self.emit_fconst(FloatVal::ZERO, typ);
+                let below = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FCmpOLt,
+                    below,
+                    x,
+                    zero,
+                    typ,
+                    size,
+                ));
+                self.emit_two_way(
+                    below,
+                    typ,
+                    |lin| lin.emit_library_call(&callee, &[(x, typ)], typ),
+                    sqrt,
+                )
+            }
+        }
+    }
+
+    /// The libm opcode `op` ([`Opcode::is_libm`]) of `args` at `typ`, for a
+    /// call that named the library function `callee`: which a target
+    /// without the instruction calls instead.
+    pub(crate) fn emit_libm(
+        &mut self,
+        op: Opcode,
+        args: &[PseudoId],
+        typ: TypeId,
+        callee: StringId,
+    ) -> PseudoId {
+        let callee = self.library_function_name(self.strings.get(callee));
+        self.emit_libm_insn(op, args, typ, &callee)
+    }
+
+    /// [`Self::emit_libm`], with the callee's assembler name resolved.
+    fn emit_libm_insn(
+        &mut self,
+        op: Opcode,
+        args: &[PseudoId],
+        typ: TypeId,
+        callee: &str,
+    ) -> PseudoId {
+        let size = self.types.size_bits(typ);
+        let result = self.alloc_pseudo();
+        let mut insn = Instruction::new(op)
+            .with_target(result)
+            .with_size(size)
+            .with_type(typ)
+            .with_func(callee);
+        insn.src = args.to_vec();
+        self.emit(insn);
+        result
+    }
+
+    /// A call to the C library function `callee` (its assembler name) with
+    /// `args`, each with its type, returning `typ`.
+    pub(crate) fn emit_library_call(
+        &mut self,
+        callee: &str,
+        args: &[(PseudoId, TypeId)],
+        typ: TypeId,
+    ) -> PseudoId {
+        let result = self.alloc_pseudo();
+        let (args, arg_types) = args.iter().copied().unzip();
+        self.emit(Instruction::call_with_abi(
+            Some(result),
+            callee,
+            args,
+            arg_types,
+            typ,
+            crate::abi::CallingConv::C,
+            self.types,
+            self.target,
+        ));
+        result
+    }
+
+    /// `cond ? taken() : fallthrough()`, each arm in a block of its own and
+    /// merged by a phi of type `typ`: for arms that may not both be
+    /// evaluated.
+    fn emit_two_way(
+        &mut self,
+        cond: PseudoId,
+        typ: TypeId,
+        taken: impl FnOnce(&mut Self) -> PseudoId,
+        fallthrough: impl FnOnce(&mut Self) -> PseudoId,
+    ) -> PseudoId {
+        let size = self.types.size_bits(typ);
+        let (taken_bb, fall_bb, merge_bb) = (self.alloc_bb(), self.alloc_bb(), self.alloc_bb());
+        let from = self.current_bb.unwrap();
+        self.emit(Instruction::cbr(cond, taken_bb, fall_bb));
+        self.link_bb(from, taken_bb);
+        self.link_bb(from, fall_bb);
+
+        let arms = [
+            self.emit_arm(taken_bb, merge_bb, taken),
+            self.emit_arm(fall_bb, merge_bb, fallthrough),
+        ];
+
+        self.switch_bb(merge_bb);
+        let result = self.alloc_pseudo();
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(Pseudo::phi(result, result.0));
+        }
+        let mut phi = Instruction::phi(result, typ, size);
+        for (end, value) in arms {
+            let src = self.emit_phi_source(end, value, result, merge_bb, typ, size);
+            phi.phi_list.push((end, src));
+        }
+        self.emit(phi);
+        result
+    }
+
+    /// One arm of [`Self::emit_two_way`]: `arm` evaluated in `bb`, which then
+    /// branches to `merge`. Returns the block the arm ended in, and its value.
+    fn emit_arm(
+        &mut self,
+        bb: BasicBlockId,
+        merge: BasicBlockId,
+        arm: impl FnOnce(&mut Self) -> PseudoId,
+    ) -> (BasicBlockId, PseudoId) {
+        self.switch_bb(bb);
+        let value = arm(self);
+        let end = self.current_bb.unwrap();
+        self.emit(Instruction::br(merge));
+        self.link_bb(end, merge);
+        (end, value)
+    }
+
+    /// `signbit(x)` of `x`, a value of the real floating type `typ`: 0 or 1,
+    /// an `int`.
+    pub(crate) fn emit_signbit(&mut self, x: PseudoId, typ: TypeId) -> PseudoId {
+        let int_id = self.types.int_id;
+        let result = self.alloc_pseudo();
+        let mut insn = Instruction::new(Opcode::Signbit)
+            .with_target(result)
+            .with_src(x)
+            .with_type_and_size(int_id, self.types.size_bits(int_id));
+        insn.src_typ = Some(typ);
+        insn.src_size = self.types.size_bits(typ);
+        self.emit(insn);
+        result
     }
 
     /// One integer binary operation on complex halves, into a fresh pseudo.
@@ -1745,10 +1926,21 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// These functions take 4 scalar args (left_real, left_imag, right_real, right_imag)
     /// and return a complex value. The result is stored in newly allocated local storage.
     ///
+    /// They are ordinary C functions, so they are called by the ABI's
+    /// classification of their signature like any other: each half in its
+    /// own argument register, and the result wherever the complex type's
+    /// return class puts it. On x86-64 `__multc3` hands its
+    /// `_Float128 _Complex` result back through the hidden pointer -- the
+    /// type is MEMORY class -- which is what gcc calls it with.
+    ///
+    /// The call is tagged with the routine it calls (`routine_fn`: the
+    /// `LibFn` and its name), so that `ir::libcall_fold` can compute it when
+    /// its operands are constant.
+    ///
     /// Returns the address where the complex result is stored.
     pub(crate) fn emit_complex_rtlib_call(
         &mut self,
-        func_name: &str,
+        routine_fn: (LibFn, &str),
         left: (PseudoId, PseudoId),
         right: (PseudoId, PseudoId),
         base_typ: TypeId,
@@ -1756,12 +1948,22 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) -> PseudoId {
         let (left_real, left_imag) = left;
         let (right_real, right_imag) = right;
-        // Allocate local storage for the complex result
-        let result_sym = self.frame_temp("__cret", complex_typ);
+        let (known, func_name) = routine_fn;
+        let sret = self.returns_via_hidden_pointer(complex_typ);
 
-        // Build argument list: 4 scalar FP values
-        let arg_vals = vec![left_real, left_imag, right_real, right_imag];
-        let arg_types = vec![base_typ, base_typ, base_typ, base_typ];
+        // The result's storage, and the hidden pointer to it if there is one.
+        let (result_sym, mut arg_vals, mut arg_types) = if sret {
+            let slot = self.hidden_return_slot(complex_typ);
+            (slot.storage, vec![slot.arg], vec![slot.arg_typ])
+        } else {
+            (
+                self.frame_temp("__cret", complex_typ),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        arg_vals.extend([left_real, left_imag, right_real, right_imag]);
+        arg_types.extend([base_typ; 4]);
 
         // Compute ABI classification for the call
         let abi = get_abi_for_conv(self.current_calling_conv, self.target);
@@ -1772,17 +1974,31 @@ impl<'a> super::linearize::Linearizer<'a> {
         let ret_class = abi.classify_return(complex_typ, self.types);
         let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
 
-        // Create the call instruction
-        let ret_size = self.types.size_bits(complex_typ);
-        let mut call_insn = Instruction::call(
-            Some(result_sym),
-            func_name,
-            arg_vals,
-            arg_types,
-            complex_typ,
-            ret_size,
-        );
+        // Through the hidden pointer, the call's own value is that pointer
+        // and the result is read from the storage; otherwise the backend
+        // writes the returned registers into the storage directly.
+        let mut call_insn = if sret {
+            let arg_typ = arg_types[0];
+            Instruction::call(
+                Some(self.alloc_reg_pseudo()),
+                func_name,
+                arg_vals,
+                arg_types,
+                arg_typ,
+                64,
+            )
+        } else {
+            Instruction::call(
+                Some(result_sym),
+                func_name,
+                arg_vals,
+                arg_types,
+                complex_typ,
+                self.types.size_bits(complex_typ),
+            )
+        };
         call_insn.abi_info = Some(call_abi_info);
+        call_insn.known = Some(known);
         self.emit(call_insn);
 
         result_sym
@@ -1933,6 +2149,133 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit_compare_zero(val, typ)
     }
 
+    /// Whether a controlling expression holds, when it is a constant
+    /// expression (C17 6.6) and so decides that by itself.
+    ///
+    /// The one question every construct that branches asks before it emits
+    /// the branch: `if`, the three loops, `?:`, and the left operand of `&&`
+    /// and `||`. gcc's front end folds the same conditions at every level,
+    /// `-O0` included, and emits nothing for the arm one makes unreachable.
+    /// A `const` object is not a constant expression, so `const int k = 0;
+    /// if (k)` keeps its arm, as it does in gcc.
+    pub(crate) fn constant_condition(&self, cond: &Expr) -> Option<bool> {
+        crate::constexpr::eval_truth(self, ConstScope::Standard, cond)
+    }
+
+    /// Evaluate a controlling expression for a branch: as the constant it is,
+    /// or as a value computed at run time. See [`Self::constant_condition`].
+    ///
+    /// `0 && g()` is a constant too. C17 6.6p3 admits a call in an operand
+    /// that is not evaluated, and gcc folds the branch -- but the shared walk
+    /// refuses it, because gcc does not make it an *integer* constant
+    /// expression (`int a[0 && g()]` is a VLA there). So the short circuit is
+    /// taken here: a left operand that decides `&&` or `||` decides the
+    /// branch, and one that does not leaves the right operand to decide it.
+    pub(crate) fn controlling_value(&mut self, cond: &Expr) -> Controlling {
+        if let Some(holds) = self.constant_condition(cond) {
+            return Controlling::Constant(holds);
+        }
+        if let Some(holds) = self.decided_float_comparison(cond) {
+            return Controlling::Constant(holds);
+        }
+        if let ExprKind::Binary {
+            op: op @ (BinaryOp::LogAnd | BinaryOp::LogOr),
+            left,
+            right,
+        } = &cond.kind
+        {
+            // `&&` is decided by a false left operand, `||` by a true one.
+            let decides = *op == BinaryOp::LogOr;
+            match self.constant_condition(left) {
+                Some(holds) if holds == decides => return Controlling::Constant(holds),
+                Some(_) => return self.controlling_value(right),
+                None => {}
+            }
+        }
+        Controlling::Value(self.linearize_condition(cond))
+    }
+
+    /// A floating comparison of an unknown value with a constant that no
+    /// value can change the answer of -- `x > +Inf` is 0 whatever `x` is, a
+    /// NaN included -- under `-fno-trapping-math` only. The unknown operand is
+    /// still evaluated, for its side effects.
+    ///
+    /// gcc folds these at `-O0` exactly when trapping math is off: an ordered
+    /// comparison with a NaN raises `FE_INVALID`, and a folded one would not.
+    /// Which comparisons are decided is the optimizer's own rule
+    /// (`constfold::fcmp_against_constant`), asked of the constant as it
+    /// converts to the operands' common type -- `1e308 * 10` is `+Inf` as a
+    /// `double`. The `isgreater` family asks it too.
+    fn decided_float_comparison(&mut self, cond: &Expr) -> Option<bool> {
+        if self.trapping_math {
+            return None;
+        }
+        let (op, left, right) = match &cond.kind {
+            ExprKind::Binary { op, left, right } => (float_comparison(*op)?, left, right),
+            ExprKind::FpCompare { cmp, lhs, rhs } => (fp_compare_opcode(*cmp)?, lhs, rhs),
+            _ => return None,
+        };
+        let common = self.types.common_type(left.typ?, right.typ?);
+        let fmt = self.types.fp_format(common)?;
+        if !self.types.is_float(common) {
+            return None;
+        }
+        let known = |e: &Expr| {
+            crate::constexpr::eval_as_float(self, ConstScope::Standard, e, common)
+                .map(|v| v.round_to_format(fmt))
+        };
+        let (c, const_first, unknown) = match (known(left), known(right)) {
+            (None, Some(c)) => (c, false, left),
+            (Some(c), None) => (c, true, right),
+            _ => return None,
+        };
+        let holds = super::constfold::fcmp_against_constant(op, c, const_first)?;
+        self.linearize_expr(unknown);
+        Some(holds)
+    }
+
+    /// Branch from the current block to `then_bb` when `cond` holds and to
+    /// `else_bb` when it does not.
+    ///
+    /// A constant condition jumps straight to the block it selects, and the
+    /// other one gets no edge. Nothing else in the linearizer has to know:
+    /// a block that nothing reaches is removed when the function is finished
+    /// (`dce::remove_unreachable_blocks`), and one a label, `case` or `default`
+    /// inside the dead arm still reaches keeps its edge and so survives.
+    pub(crate) fn branch_on(
+        &mut self,
+        cond: Controlling,
+        then_bb: BasicBlockId,
+        else_bb: BasicBlockId,
+    ) {
+        let Some(current) = self.current_bb else {
+            return;
+        };
+        match cond {
+            Controlling::Constant(holds) => {
+                let target = if holds { then_bb } else { else_bb };
+                self.emit(Instruction::br(target));
+                self.link_bb(current, target);
+            }
+            Controlling::Value(val) => {
+                self.emit(Instruction::cbr(val, then_bb, else_bb));
+                self.link_bb(current, then_bb);
+                self.link_bb(current, else_bb);
+            }
+        }
+    }
+
+    /// [`Self::controlling_value`] of `cond`, then [`Self::branch_on`] it.
+    pub(crate) fn branch_on_condition(
+        &mut self,
+        cond: &Expr,
+        then_bb: BasicBlockId,
+        else_bb: BasicBlockId,
+    ) {
+        let cond = self.controlling_value(cond);
+        self.branch_on(cond, then_bb, else_bb);
+    }
+
     /// `val != 0`, read the way `operand_typ` says to read it.
     pub(crate) fn emit_compare_zero(&mut self, val: PseudoId, operand_typ: TypeId) -> PseudoId {
         let result = self.alloc_pseudo();
@@ -1974,7 +2317,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         let merge_bb = self.alloc_bb();
 
         // Evaluate LHS
-        let left_bool = self.linearize_condition(left);
+        let left_cond = self.controlling_value(left);
+        // A constant true LHS always goes on to the RHS, so the merge has no
+        // edge from here.
+        let short_circuits = !matches!(left_cond, Controlling::Constant(true));
 
         // Emit the short-circuit value (0) BEFORE the branch, while still in LHS block
         // This value will be used if we short-circuit (LHS is false)
@@ -1985,9 +2331,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let lhs_end_bb = self.current_bb.unwrap();
 
         // Branch: if LHS is false, go to merge (result = 0); else evaluate RHS
-        self.emit(Instruction::cbr(left_bool, eval_b_bb, merge_bb));
-        self.link_bb(lhs_end_bb, eval_b_bb);
-        self.link_bb(lhs_end_bb, merge_bb);
+        self.branch_on(left_cond, eval_b_bb, merge_bb);
 
         // eval_b_bb: Evaluate RHS
         self.switch_bb(eval_b_bb);
@@ -2013,8 +2357,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             func.add_pseudo(phi_pseudo);
         }
         let mut phi_insn = Instruction::phi(result, result_typ, 32);
-        let phisrc1 = self.emit_phi_source(lhs_end_bb, zero, result, merge_bb, result_typ, 32);
-        phi_insn.phi_list.push((lhs_end_bb, phisrc1));
+        if short_circuits {
+            let phisrc1 = self.emit_phi_source(lhs_end_bb, zero, result, merge_bb, result_typ, 32);
+            phi_insn.phi_list.push((lhs_end_bb, phisrc1));
+        }
         let phisrc2 =
             self.emit_phi_source(rhs_end_bb, right_bool, result, merge_bb, result_typ, 32);
         phi_insn.phi_list.push((rhs_end_bb, phisrc2));
@@ -2034,7 +2380,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         let merge_bb = self.alloc_bb();
 
         // Evaluate LHS
-        let left_bool = self.linearize_condition(left);
+        let left_cond = self.controlling_value(left);
+        // A constant false LHS always goes on to the RHS, so the merge has no
+        // edge from here.
+        let short_circuits = !matches!(left_cond, Controlling::Constant(false));
 
         // Emit the short-circuit value (1) BEFORE the branch, while still in LHS block
         // This value will be used if we short-circuit (LHS is true)
@@ -2045,9 +2394,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let lhs_end_bb = self.current_bb.unwrap();
 
         // Branch: if LHS is true, go to merge (result = 1); else evaluate RHS
-        self.emit(Instruction::cbr(left_bool, merge_bb, eval_b_bb));
-        self.link_bb(lhs_end_bb, merge_bb);
-        self.link_bb(lhs_end_bb, eval_b_bb);
+        self.branch_on(left_cond, merge_bb, eval_b_bb);
 
         // eval_b_bb: Evaluate RHS
         self.switch_bb(eval_b_bb);
@@ -2073,8 +2420,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             func.add_pseudo(phi_pseudo);
         }
         let mut phi_insn = Instruction::phi(result, result_typ, 32);
-        let phisrc1 = self.emit_phi_source(lhs_end_bb, one, result, merge_bb, result_typ, 32);
-        phi_insn.phi_list.push((lhs_end_bb, phisrc1));
+        if short_circuits {
+            let phisrc1 = self.emit_phi_source(lhs_end_bb, one, result, merge_bb, result_typ, 32);
+            phi_insn.phi_list.push((lhs_end_bb, phisrc1));
+        }
         let phisrc2 =
             self.emit_phi_source(rhs_end_bb, right_bool, result, merge_bb, result_typ, 32);
         phi_insn.phi_list.push((rhs_end_bb, phisrc2));

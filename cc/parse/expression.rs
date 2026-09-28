@@ -748,15 +748,30 @@ impl<'a> Parser<'a> {
         }
 
         if self.is_special(b'+') && !self.is_special_token(SpecialToken::Increment) {
+            // C17 6.5.3.3p2: the result is the value of the *promoted*
+            // operand, with the promoted type -- and a value, not an lvalue.
+            // Returning the operand itself made `+(signed char)0` a
+            // `signed char` and `+x = 1` an assignment.
+            let op_pos = self.current_pos();
             self.advance();
-            // Unary + is a no-op for numeric types, but we need to parse it
-            return self.parse_unary_expr();
+            let operand = self.parse_unary_expr()?;
+            self.check_unary_arithmetic_operand(&operand, "unary plus", op_pos);
+            let (operand, typ) = self.promote_unary_operand(operand);
+            return Ok(Self::typed_expr(
+                ExprKind::Cast {
+                    cast_type: typ,
+                    expr: Box::new(operand),
+                },
+                typ,
+                op_pos,
+            ));
         }
 
         if self.is_special(b'-') && !self.is_special_token(SpecialToken::Decrement) {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_unary_arithmetic_operand(&operand, "unary minus", op_pos);
             let (operand, typ) = self.promote_unary_operand(operand);
             let width = self.unary_bitfield_width(&operand, typ);
             let mut e = Self::typed_expr(
@@ -1383,8 +1398,8 @@ impl<'a> Parser<'a> {
                 let args = self.parse_argument_list()?;
                 self.expect_special(b')')?;
                 self.check_callable(&expr, call_pos);
-                self.check_call_arity(&expr, &args, call_pos);
-                self.check_argument_types(&expr, &args);
+                let func_type = self.resolved_function_type(&expr);
+                self.check_call(func_type, &args, call_pos);
 
                 // Get the return type from the function type
                 // The func expression should have type TypeKind::Function
@@ -1414,15 +1429,17 @@ impl<'a> Parser<'a> {
                     })
                     .unwrap_or(self.types.int_id); // Default to int
 
-                expr = Self::typed_expr(
+                let known = self.known_callee(&expr);
+                expr = self.fold_zero_length_compare(Self::typed_expr(
                     ExprKind::Call {
                         func: Box::new(expr),
                         args,
                         binding: crate::parse::ast::CalleeBinding::Declared,
+                        known,
                     },
                     return_type,
                     base_pos,
-                );
+                ));
             } else {
                 break;
             }
@@ -1440,7 +1457,7 @@ impl<'a> Parser<'a> {
         let start_pos = self.current_pos();
         // Elements of the concatenated literal, still distinguishing a byte
         // from a named character so each encoding can ask for what it needs.
-        let mut elements: Vec<literal::Escaped> = Vec::new();
+        let mut pieces: Vec<(Position, Vec<literal::Escaped>)> = Vec::new();
         let mut encoding: Option<TokenType> = None;
         let mut mixed_reported = false;
 
@@ -1457,23 +1474,14 @@ impl<'a> Parser<'a> {
                         | TokenValue::WideString(s)
                         | TokenValue::Utf16String(s)
                         | TokenValue::Utf32String(s) => {
-                            let piece = literal::parse_string_literal(s);
-                            // `parse_string_literal` has no position to report
-                            // from, so the constraint is raised here, where the
-                            // token still does.
-                            for e in &piece {
-                                if let literal::Escaped::ForbiddenUcn(val) = e {
-                                    self.report_forbidden_ucn_at(token.pos, *val);
-                                }
-                            }
-                            piece
+                            (token.pos, literal::parse_string_literal(s))
                         }
                         _ => return Err(ParseError::new("invalid string token", token.pos)),
                     }
                 }
                 _ => break,
             };
-            elements.extend(piece);
+            pieces.push(piece);
 
             if kind != TokenType::String {
                 match encoding {
@@ -1492,6 +1500,22 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // Each piece is checked against the run's element type, since a plain
+        // piece takes the prefix of the run it is in (6.4.5p5) -- and from its
+        // own token's position, which `parse_string_literal` has no way to
+        // report from.
+        let unit_bits = match encoding {
+            None => literal::CHAR_UNIT_BITS,
+            Some(TokenType::WideString) => self.types.size_bits(self.types.wchar_id),
+            Some(TokenType::Utf16String) => self.types.size_bits(self.types.char16_id),
+            Some(_) => self.types.size_bits(self.types.char32_id),
+        };
+        let mut elements: Vec<literal::Escaped> = Vec::new();
+        for (pos, piece) in pieces {
+            literal::check_elements(&piece, unit_bits, pos);
+            elements.extend(piece);
+        }
+
         match encoding {
             // char[N]. Each element is a byte, and `bytes` already holds one
             // char per byte, so the count is exact for non-ASCII too.
@@ -1507,63 +1531,51 @@ impl<'a> Parser<'a> {
                     start_pos,
                 ))
             }
-            // wchar_t[N] — int on the targets here. Like char16_t/char32_t
-            // below, its elements are code points rather than bytes, so the
-            // UTF-8 the lexer preserved is decoded here. Taking `bytes`
-            // straight through instead gave `L"café"` five elements, the first
-            // two being the halves of the UTF-8 pair.
+            // wchar_t[N], char16_t[N] and char32_t[N]. Their elements are
+            // code units rather than bytes, so the UTF-8 the lexer preserved
+            // is decoded here -- taking the bytes straight through gave
+            // `L"café"` five elements, the first two the halves of a UTF-8
+            // pair -- while a unit an escape names is kept as the number it
+            // is: `L"\xffffffff"` is one element, all ones. A character
+            // beyond the BMP becomes a surrogate pair in a `u"..."` literal.
             Some(TokenType::WideString) => {
                 let units = literal::literal_wide_chars(&elements);
-                let wstr_type = self
+                let t = self
                     .types
-                    .intern(Type::array(self.types.int_id, units.len() + 1));
-                // `WideStringLit` carries one `char` per element.
-                let text: String = units
-                    .iter()
-                    .map(|&u| char::from_u32(u).unwrap_or('\u{fffd}'))
-                    .collect();
+                    .intern(Type::array(self.types.wchar_id, units.len() + 1));
                 Ok(Self::typed_expr(
-                    ExprKind::WideStringLit(text),
-                    wstr_type,
+                    ExprKind::WideStringLit(units),
+                    t,
                     start_pos,
                 ))
             }
-            // char16_t[N] / char32_t[N]. These carry real code units rather
-            // than bytes, so the UTF-8 the lexer preserved is decoded here; a
-            // code point outside the BMP becomes a surrogate pair in the
-            // char16_t case.
-            Some(kind @ (TokenType::Utf16String | TokenType::Utf32String)) => {
-                let text: String = literal::literal_wide_chars(&elements)
-                    .into_iter()
-                    .map(|u| char::from_u32(u).unwrap_or('\u{fffd}'))
-                    .collect();
-                if kind == TokenType::Utf16String {
-                    let units: Vec<u16> = text.encode_utf16().collect();
-                    let t = self
-                        .types
-                        .intern(Type::array(self.types.ushort_id, units.len() + 1));
-                    Ok(Self::typed_expr(
-                        ExprKind::Utf16StringLit(units),
-                        t,
-                        start_pos,
-                    ))
-                } else {
-                    let units: Vec<u32> = text.chars().map(|c| c as u32).collect();
-                    let t = self
-                        .types
-                        .intern(Type::array(self.types.uint_id, units.len() + 1));
-                    Ok(Self::typed_expr(
-                        ExprKind::Utf32StringLit(units),
-                        t,
-                        start_pos,
-                    ))
-                }
+            Some(TokenType::Utf16String) => {
+                let units = literal::literal_utf16_units(&elements);
+                let t = self
+                    .types
+                    .intern(Type::array(self.types.char16_id, units.len() + 1));
+                Ok(Self::typed_expr(
+                    ExprKind::Utf16StringLit(units),
+                    t,
+                    start_pos,
+                ))
+            }
+            Some(TokenType::Utf32String) => {
+                let units = literal::literal_wide_chars(&elements);
+                let t = self
+                    .types
+                    .intern(Type::array(self.types.char32_id, units.len() + 1));
+                Ok(Self::typed_expr(
+                    ExprKind::Utf32StringLit(units),
+                    t,
+                    start_pos,
+                ))
             }
             Some(_) => unreachable!("only string token types reach here"),
         }
     }
 
-    fn parse_argument_list(&mut self) -> ParseResult<Vec<Expr>> {
+    pub(super) fn parse_argument_list(&mut self) -> ParseResult<Vec<Expr>> {
         let mut args = Vec::with_capacity(DEFAULT_ARG_LIST_CAPACITY);
 
         if self.is_special(b')') {
@@ -1616,6 +1628,7 @@ impl<'a> Parser<'a> {
         self.check_not_void(&right, right.pos);
         self.check_not_vector_value(left.typ, left.pos);
         self.check_not_vector_value(right.typ, right.pos);
+        self.check_relational_operands(op, &left, &right);
 
         // A bit-field operand promotes before anything else looks at it
         // (C17 6.3.1.1p2), and that promotion is not derivable from the
@@ -1871,7 +1884,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `e` converted to `typ`, or `e` unchanged when it is already that type.
-    fn convert_operand(&mut self, e: Expr, typ: TypeId) -> Expr {
+    pub(super) fn convert_operand(&mut self, e: Expr, typ: TypeId) -> Expr {
         if e.typ == Some(typ) {
             return e;
         }
@@ -2216,15 +2229,13 @@ impl<'a> Parser<'a> {
                     // plain `char`'s, which is the target's. `'\x80'` is -128
                     // where `char` is signed and 128 where it is not.
                     let (v, is_code_point) =
-                        literal::char_literal_value(s, false, self.current_pos());
+                        literal::char_literal_value(s, None, self.current_pos());
                     let value = if is_code_point {
                         // Not a byte, so plain `char`'s signedness does not
                         // reach it.
                         v as i64
-                    } else if self.types.is_unsigned(self.types.char_id) {
-                        v as u8 as i64
                     } else {
-                        v as u8 as i8 as i64
+                        self.types.plain_char().byte_value(v as u8)
                     };
                     Ok(Self::typed_expr(
                         ExprKind::CharLit(value),
@@ -2250,16 +2261,19 @@ impl<'a> Parser<'a> {
                         // A prefixed constant takes the code point in its own
                         // type, with no reference to plain `char`'s
                         // signedness: `L'\x80'` is 128, not -128.
-                        let (code_point, _) =
-                            literal::char_literal_value(s, true, self.current_pos());
-                        let (typ, value) = match kind {
-                            // wchar_t is int on the targets here.
-                            TokenType::WideChar => (self.types.int_id, code_point as i32 as i64),
-                            TokenType::Utf16Char => {
-                                (self.types.ushort_id, code_point as u16 as i64)
-                            }
-                            _ => (self.types.uint_id, code_point as i64),
+                        let typ = match kind {
+                            TokenType::WideChar => self.types.wchar_id,
+                            TokenType::Utf16Char => self.types.char16_id,
+                            _ => self.types.char32_id,
                         };
+                        let bits = self.types.size_bits(typ);
+                        let (code_point, _) =
+                            literal::char_literal_value(s, Some(bits), self.current_pos());
+                        let value = literal::prefixed_char_value(
+                            code_point,
+                            bits,
+                            !self.types.is_unsigned(typ),
+                        );
                         Ok(Self::typed_expr(ExprKind::CharLit(value), typ, token_pos))
                     }
                     _ => Err(ParseError::new("invalid character token", token.pos)),
@@ -2394,139 +2408,36 @@ impl<'a> Parser<'a> {
         )
     }
 
-    /// Split a GNU imaginary constant's spelling from its marker.
-    ///
-    /// Returns the number without the `i`/`j`, and whether one was there. The
-    /// marker may appear anywhere in the suffix -- `1.0fi`, `2.2if`, `1.0iF`,
-    /// `2.2iL`, `1.0li` are all gcc-accepted -- so it is removed wherever it
-    /// sits rather than only at the end.
-    ///
-    /// A hex literal is left alone: `0x1i` is not a number, and in
-    /// `0x1f` the `f` is a digit, so scanning the tail for a marker there
-    /// would misread the value.
-    fn strip_imaginary_suffix(s: &str) -> (String, bool) {
-        if s.len() < 2 || s.starts_with("0x") || s.starts_with("0X") {
-            return (s.to_string(), false);
-        }
-        // The suffix is the trailing run of letters. Only that run is searched,
-        // so the `i` of a hex digit sequence or an exponent cannot be taken for
-        // a marker.
-        let digits_end = s
-            .rfind(|c: char| c.is_ascii_digit() || c == '.')
-            .map_or(0, |i| i + 1);
-        let (num, suffix) = s.split_at(digits_end);
-        if !suffix.contains(['i', 'I', 'j', 'J']) {
-            return (s.to_string(), false);
-        }
-        let cleaned: String = suffix
-            .chars()
-            .filter(|c| !matches!(c, 'i' | 'I' | 'j' | 'J'))
-            .collect();
-        (format!("{num}{cleaned}"), true)
-    }
-
     /// Parse a number literal string into an expression
     fn parse_number_literal(&self, s: &str, pos: Position) -> ParseResult<Expr> {
+        let spelling = NumberSpelling::split(s);
+        let bad = || {
+            let what = if spelling.is_float {
+                "float"
+            } else {
+                "integer"
+            };
+            ParseError::new(format!("invalid {what} literal: {s}"), pos)
+        };
         // A GNU imaginary constant: a number with an `i` or `j` in its suffix.
-        // The marker may sit on either side of the floating suffix -- gcc takes
-        // `1.0fi`, `2.2if`, `1.0iF`, `2.2iL` and `1.0li` alike -- so it is
-        // removed wherever it lands and the rest of the suffix is parsed as it
-        // always was.
         //
         // C's own spelling of this is `_Imaginary`, which C17 6.4.1 reserves
         // and Annex G makes optional; c17 does not provide the type, and gcc
         // does not either. Both give the constant a *complex* type with a zero
         // real part, which is what `__builtin_complex(0, v)` already builds.
-        let (s_owned, is_imaginary) = Self::strip_imaginary_suffix(s);
-        // `s` from here on is the number with the marker removed, which is what
-        // the ordinary suffix and value parsing expects.
-        let s = s_owned.as_str();
-        let s_lower = s.to_lowercase();
+        let (suffix, is_imaginary) = strip_imaginary_marker(spelling.suffix).ok_or_else(bad)?;
+        let body = spelling.body.to_ascii_lowercase();
+        let is_hex = spelling.is_hex;
 
-        // Check if it's a hex number (must check before suffix trimming)
-        let is_hex = s_lower.starts_with("0x");
-
-        // Check if it's a floating point number
-        let is_float = s_lower.contains('.')
-            || (s_lower.contains('e') && !is_hex)
-            || (s_lower.contains('p') && is_hex);
-
-        // Detect C23 _Float* suffixes (f16, F16, f32, F32, f64, F64)
-        // Only for non-hex numbers since f16/f32/f64 are valid hex digit sequences
-        let is_float16_suffix = !is_hex && s_lower.ends_with("f16");
-        let is_float32_suffix = !is_hex && s_lower.ends_with("f32");
-        let is_float64_suffix = !is_hex && s_lower.ends_with("f64");
-        // `q` is GCC's binary128 suffix, and the one glibc's `__f128(x)` pastes
-        // on. Unlike `f16`/`f32`/`f64` it is safe on a hex literal too, since
-        // `q` is not a hex digit. It is a *floating* suffix: gcc rejects
-        // `1q` with "invalid suffix on integer constant", and accepting it
-        // silently reinterpreted an integer as a binary128.
-        let is_quad_suffix = is_float && s_lower.ends_with('q');
-        // The `f128` spelling, which is valid on a hex literal too -- after a
-        // `p` exponent it cannot be mistaken for hex digits. Like `q` it is a
-        // *floating* suffix: `1f128` is an integer constant with a bad suffix,
-        // and `0x1f128` is a hex integer whose last five digits merely spell
-        // one.
-        let is_float128_suffix = is_float && s_lower.ends_with("f128");
-
-        // Remove suffixes - but for hex numbers, don't strip a-f as they're digits
-        let num_str = if is_hex && is_float && is_float128_suffix {
-            s_lower.trim_end_matches("f128")
-        } else if is_hex && is_float {
-            // Hex float: strip f/l/q suffixes (they appear after p-exponent, not as hex digits)
-            s_lower.trim_end_matches(['u', 'l', 'f', 'q'])
-        } else if is_hex {
-            // Hex integer: only strip u/l (f is a hex digit, and `q` is a
-            // floating suffix -- `0x1q` is not a number)
-            s_lower.trim_end_matches(['u', 'l'])
-        } else if is_float128_suffix {
-            s_lower.trim_end_matches("f128")
-        } else if is_float16_suffix {
-            s_lower.trim_end_matches("f16")
-        } else if is_float32_suffix {
-            s_lower.trim_end_matches("f32")
-        } else if is_float64_suffix {
-            s_lower.trim_end_matches("f64")
-        } else if is_quad_suffix {
-            s_lower.trim_end_matches('q')
-        } else {
-            // For decimal/octal, strip u/l/f suffixes. Not `q`: it is a
-            // floating suffix, so `1q` must fail to parse rather than
-            // quietly becoming the integer 1.
-            s_lower.trim_end_matches(['u', 'l', 'f'])
-        };
-
-        if is_float
-            || is_float16_suffix
-            || is_float32_suffix
-            || is_float64_suffix
-            || is_float128_suffix
-            || is_quad_suffix
-        {
-            // Float - type depends on suffix:
-            // - no suffix = double
-            // - f/F = float
-            // - l/L = long double
-            // - f16/F16 = _Float16
-            // - f32/F32 = float (alias)
-            // - f64/F64 = double (alias)
-            let is_float_suffix = !is_float16_suffix
-                && !is_float32_suffix
-                && !is_float64_suffix
-                && !is_float128_suffix
-                && s_lower.ends_with('f');
-            let is_longdouble_suffix = !is_float16_suffix
-                && !is_float32_suffix
-                && !is_float64_suffix
-                && !is_float128_suffix
-                && s_lower.ends_with('l');
+        if spelling.is_float {
+            let float_suffix = FloatSuffix::parse(&suffix).ok_or_else(bad)?;
             let value: FloatVal = if is_hex {
                 // Hex float parsing: 0x[hex-digits].[hex-digits]p[±exponent]
                 // Value = significand × 2^exponent.
                 // `parse_hex_float_parts` is exact, so the literal reaches the
                 // target format without passing through `f64` -- which would
                 // flush `0x1p-16382L` to zero before its type is even known.
-                let (mantissa, exp2) = Self::parse_hex_float_parts(num_str).map_err(|_| {
+                let (mantissa, exp2) = Self::parse_hex_float_parts(&body).map_err(|_| {
                     ParseError::new(format!("invalid hex float literal: {}", s), pos)
                 })?;
                 FloatVal::from_parts(false, mantissa, exp2)
@@ -2536,56 +2447,47 @@ impl<'a> Parser<'a> {
                 // target's width. Going through `f64` cost a `long double`
                 // eleven of its significand bits and flushed anything outside
                 // double's range before the type was even known.
-                let (mantissa, exp2) = crate::float::parse_decimal_float_parts(num_str)
+                let (mantissa, exp2) = crate::float::parse_decimal_float_parts(&body)
                     .map_err(|_| ParseError::new(format!("invalid float literal: {}", s), pos))?;
                 FloatVal::from_parts(false, mantissa, exp2)
             };
-            let typ = if is_float128_suffix || is_quad_suffix {
-                if !self.types.has_float128() {
-                    return Err(ParseError::new(
-                        format!("__float128 is not supported on this target: {}", s),
-                        pos,
-                    ));
+            let typ = match float_suffix {
+                FloatSuffix::None => self.types.double_id,
+                // `_Float32` and `_Float64` are `float` and `double` here.
+                FloatSuffix::F | FloatSuffix::F32 => self.types.float_id,
+                FloatSuffix::F64 => self.types.double_id,
+                FloatSuffix::L => self.types.longdouble_id,
+                FloatSuffix::F16 => self.types.float16_id,
+                FloatSuffix::F128 => {
+                    if !self.types.has_float128() {
+                        return Err(ParseError::new(
+                            format!("__float128 is not supported on this target: {}", s),
+                            pos,
+                        ));
+                    }
+                    self.types.float128_id
                 }
-                self.types.float128_id
-            } else if is_float16_suffix {
-                self.types.float16_id
-            } else if is_float32_suffix {
-                self.types.float_id // f32 is alias for float
-            } else if is_float64_suffix {
-                self.types.double_id // f64 is alias for double
-            } else if is_float_suffix {
-                self.types.float_id
-            } else if is_longdouble_suffix {
-                self.types.longdouble_id
-            } else {
-                self.types.double_id
             };
             let lit = Self::typed_expr(ExprKind::FloatLit(value), typ, pos);
             Ok(self.imaginary_if(lit, is_imaginary, typ, pos))
         } else {
-            // Integer - determine type from suffix
-            // Check for long long first (ll, ull, llu) before checking for long (l, ul, lu)
-            let is_longlong =
-                s_lower.ends_with("ll") || s_lower.ends_with("ull") || s_lower.ends_with("llu");
-            let is_long = !is_longlong
-                && (s_lower.ends_with('l') || s_lower.ends_with("ul") || s_lower.ends_with("lu"));
-            let is_unsigned = s_lower.contains('u');
+            let IntSuffix {
+                unsigned: is_unsigned,
+                long,
+            } = IntSuffix::parse(&suffix).ok_or_else(bad)?;
+            let is_longlong = long == IntLong::LongLong;
+            let is_long = long == IntLong::Long;
 
             // Parse as u64 first to handle large unsigned values, then reinterpret as i64
             let value_u64: u64 = if is_hex {
                 // Strip 0x or 0X prefix
-                let hex_part = num_str
-                    .strip_prefix("0x")
-                    .or_else(|| num_str.strip_prefix("0X"))
-                    .unwrap_or(num_str);
-                u64::from_str_radix(hex_part, 16)
-            } else if let Some(bin_part) = num_str.strip_prefix("0b") {
+                u64::from_str_radix(&body[2..], 16)
+            } else if let Some(bin_part) = body.strip_prefix("0b") {
                 u64::from_str_radix(bin_part, 2)
-            } else if num_str.starts_with('0') && num_str.len() > 1 {
-                u64::from_str_radix(num_str, 8)
+            } else if body.starts_with('0') && body.len() > 1 {
+                u64::from_str_radix(&body, 8)
             } else {
-                num_str.parse()
+                body.parse()
             }
             .map_err(|_| ParseError::new(format!("invalid integer literal: {}", s), pos))?;
 
@@ -2597,7 +2499,7 @@ impl<'a> Parser<'a> {
             // - Hex/Octal constants: int, unsigned int, long int, unsigned long int,
             //   long long int, unsigned long long int (both signed and unsigned)
             // The type is the first in the list that can represent the value.
-            let is_octal = !is_hex && num_str.starts_with('0') && num_str.len() > 1;
+            let is_octal = !is_hex && body.starts_with('0') && body.len() > 1;
             let typ = if is_unsigned {
                 // Explicit U suffix. 6.4.4.1p5 still picks the *first* of
                 // `unsigned int`, `unsigned long`, `unsigned long long` that
@@ -2732,16 +2634,195 @@ impl<'a> Parser<'a> {
         }
         Ok((mantissa, exp2))
     }
+}
 
-    /// C17 6.4.3p2: a universal character name may not name a character below
-    /// 00A0 other than `$`, `@` and `` ` ``, nor a UTF-16 surrogate.
-    ///
-    /// The first half stops a UCN spelling a character that already has a
-    /// spelling, which would let `\u0041` smuggle an `A` past anything that
-    /// reads the source as text. Both were accepted silently -- a surrogate
-    /// even degraded to the letter `u`, because `char::from_u32` rejects it
-    /// and the caller took that for "not an escape".
-    fn report_forbidden_ucn_at(&self, pos: Position, val: u32) {
-        crate::token::lexer::report_forbidden_ucn(pos, val);
+/// A numeric constant's spelling, split into the number and its suffix.
+///
+/// Where the suffix begins is a property of the number's form, not of which
+/// letters happen to end it: before a hex constant's `p`, `a`-`f` are digits,
+/// so `0x1f16` is an integer and `0x1p0f16` a `_Float16`; and a suffix such as
+/// `f16` has digits of its own, so "the trailing run of letters" is not it.
+/// Classifying the suffix by `ends_with` tests found neither boundary: it
+/// rejected `0x1p0f16`, took `1f16` for a floating constant, and could not
+/// see the imaginary marker in `2.0if16`.
+struct NumberSpelling<'a> {
+    /// The digits, radix point and exponent.
+    body: &'a str,
+    /// Everything after them.
+    suffix: &'a str,
+    is_hex: bool,
+    /// A radix point or an exponent makes a floating constant (C17 6.4.4.2);
+    /// the suffix does not.
+    is_float: bool,
+}
+
+impl<'a> NumberSpelling<'a> {
+    fn split(s: &'a str) -> Self {
+        let b = s.as_bytes();
+        let prefixed = |c: u8| b.len() > 1 && b[0] == b'0' && b[1].eq_ignore_ascii_case(&c);
+        let is_hex = prefixed(b'x');
+        // The digits of the number's radix, the letter that opens its
+        // exponent, and where its digits start.
+        let (is_digit, exponent, start): (fn(&u8) -> bool, Option<u8>, usize) = if is_hex {
+            (u8::is_ascii_hexdigit, Some(b'p'), 2)
+        } else if prefixed(b'b') {
+            (u8::is_ascii_digit, None, 2)
+        } else {
+            (u8::is_ascii_digit, Some(b'e'), 0)
+        };
+        let mut end = start;
+        while end < b.len() && (is_digit(&b[end]) || b[end] == b'.') {
+            end += 1;
+        }
+        let mut is_float = s[start..end].contains('.');
+        if exponent.is_some_and(|e| end < b.len() && b[end].eq_ignore_ascii_case(&e)) {
+            // An exponent is the letter, an optional sign and at least one
+            // decimal digit; anything less is left in the suffix, which then
+            // fails to classify.
+            let mut j = end + 1;
+            if j < b.len() && matches!(b[j], b'+' | b'-') {
+                j += 1;
+            }
+            if j < b.len() && b[j].is_ascii_digit() {
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                end = j;
+                is_float = true;
+            }
+        }
+        NumberSpelling {
+            body: &s[..end],
+            suffix: &s[end..],
+            is_hex,
+            is_float,
+        }
     }
+}
+
+/// The suffixes of a floating constant (C17 6.4.4.2), with the `_FloatN`
+/// spellings of TS 18661-3 that c17 has types for and GNU's `q`.
+///
+/// `f32x` and `f64x` are not here: c17 has no `_Float32x` or `_Float64x`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FloatSuffix {
+    None,
+    F,
+    L,
+    F16,
+    F32,
+    F64,
+    /// `f128`, or GNU's `q`.
+    F128,
+}
+
+impl FloatSuffix {
+    fn parse(suffix: &str) -> Option<Self> {
+        Some(match suffix.to_ascii_lowercase().as_str() {
+            "" => FloatSuffix::None,
+            "f" => FloatSuffix::F,
+            "l" => FloatSuffix::L,
+            "f16" => FloatSuffix::F16,
+            "f32" => FloatSuffix::F32,
+            "f64" => FloatSuffix::F64,
+            "f128" | "q" => FloatSuffix::F128,
+            _ => return None,
+        })
+    }
+}
+
+/// How many `l`s an integer suffix has.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IntLong {
+    None,
+    Long,
+    LongLong,
+}
+
+/// An integer constant's suffix (C17 6.4.4.1): an optional `u` before or
+/// after an optional `l` or `ll`, whose two letters share a case.
+struct IntSuffix {
+    unsigned: bool,
+    long: IntLong,
+}
+
+impl IntSuffix {
+    fn parse(suffix: &str) -> Option<Self> {
+        let (unsigned, rest) = match suffix
+            .strip_prefix(['u', 'U'])
+            .or_else(|| suffix.strip_suffix(['u', 'U']))
+        {
+            Some(rest) => (true, rest),
+            None => (false, suffix),
+        };
+        let long = match rest {
+            "" => IntLong::None,
+            "l" | "L" => IntLong::Long,
+            "ll" | "LL" => IntLong::LongLong,
+            _ => return None,
+        };
+        Some(IntSuffix { unsigned, long })
+    }
+}
+
+/// A suffix without its GNU imaginary marker (`i`, `I`, `j` or `J`), and
+/// whether it had one; `None` if the marker is misplaced.
+///
+/// gcc takes the marker on either side of any other suffix and between an
+/// integer's `u` and `l` -- `2.0if16`, `2.0f16i`, `1.0Li`, `1uil` -- but not
+/// twice, and not inside another suffix: `2.0fi16`, `2.0f1i6` and `1lil` are
+/// errors. So the marker must fall on a boundary between the tokens of the
+/// suffix that remains without it.
+fn strip_imaginary_marker(suffix: &str) -> Option<(String, bool)> {
+    let is_marker = |c: char| matches!(c, 'i' | 'I' | 'j' | 'J');
+    let mut markers = suffix.match_indices(is_marker);
+    let Some((at, _)) = markers.next() else {
+        return Some((suffix.to_string(), false));
+    };
+    if markers.next().is_some() {
+        return None;
+    }
+    let rest = format!("{}{}", &suffix[..at], &suffix[at + 1..]);
+    let on_boundary = at == 0
+        || suffix_tokens(&rest)
+            .iter()
+            .scan(0, |end, t| {
+                *end += t.len();
+                Some(*end)
+            })
+            .any(|end| end == at);
+    on_boundary.then_some((rest, true))
+}
+
+/// A constant's suffix cut into the tokens it is built from: `ll`/`LL`, a
+/// letter with the digits (and `x`) that follow it, such as `f16` or `f32x`,
+/// and any other single character.
+fn suffix_tokens(suffix: &str) -> Vec<&str> {
+    let b = suffix.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        let c = b[i];
+        if !c.is_ascii() {
+            // Not a suffix anything accepts; keep it whole so that no slice
+            // splits a character.
+            tokens.push(&suffix[start..]);
+            break;
+        }
+        i += 1;
+        if matches!(c, b'l' | b'L') && b.get(i) == Some(&c) {
+            i += 1;
+        } else if c.is_ascii_alphabetic() {
+            let digits = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > digits && i < b.len() && b[i].eq_ignore_ascii_case(&b'x') {
+                i += 1;
+            }
+        }
+        tokens.push(&suffix[start..i]);
+    }
+    tokens
 }

@@ -277,6 +277,11 @@ pub enum SpecialToken {
 
 /// Report a universal character name C17 6.4.3p2 forbids, spelled as the
 /// source spells it so the message can be matched against what was written.
+///
+/// A UCN may not name a character below 00A0 other than `$`, `@` and `` ` ``,
+/// nor a UTF-16 surrogate. The first half stops a UCN spelling a character
+/// that already has a spelling, which would let `\u0041` smuggle an `A` past
+/// anything that reads the source as text.
 pub(crate) fn report_forbidden_ucn(pos: Position, val: u32) {
     let (prefix, width) = if val > 0xFFFF { ('U', 8) } else { ('u', 4) };
     crate::diag::error(
@@ -1696,7 +1701,12 @@ fn literal_parts(token: &Token) -> Option<(&'static str, u8, &str)> {
 /// Rust string and has to be converted, or the two conventions mix inside one
 /// payload and neither its byte count nor its spelling comes out right.
 pub fn literal_payload(text: &str) -> String {
-    text.bytes().map(char::from).collect()
+    bytes_payload(text.as_bytes())
+}
+
+/// Encode source bytes as a literal payload: one `char` per byte.
+pub fn bytes_payload(bytes: &[u8]) -> String {
+    bytes.iter().copied().map(char::from).collect()
 }
 
 /// The source bytes a literal payload stands for.

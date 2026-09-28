@@ -15,13 +15,16 @@ use super::*;
 use crate::token::lexer::Tokenizer;
 
 fn preprocess_str(input: &str) -> (Vec<Token>, IdentTable) {
-    let target = Target::host();
+    preprocess_str_for(input, &Target::host())
+}
+
+fn preprocess_str_for(input: &str, target: &Target) -> (Vec<Token>, IdentTable) {
     let mut strings = IdentTable::new();
     let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
     let (result, _) = preprocess_collecting(
         tokens,
-        &target,
+        target,
         &mut strings,
         "<test>",
         &PreprocessConfig::default(),
@@ -1447,26 +1450,38 @@ no
 /// C17 6.4.4.4p10: an ordinary character constant has plain `char`'s
 /// signedness, so the answer differs by target and `#if` must agree with what
 /// the compiled program would compute.
+///
+/// `__CHAR_UNSIGNED__` must agree with it, since `<limits.h>` reads that
+/// macro alone -- per OS as well as per architecture, because Apple arm64
+/// makes plain `char` signed where AAPCS64 makes it unsigned.
 #[test]
 fn test_if_char_signedness_follows_target() {
+    use crate::target::{Arch, CharSignedness, Os};
     let code = "#if '\\xff' < 0
 signed
 #else
 unsigned
+#endif
+#ifdef __CHAR_UNSIGNED__
+macro_unsigned
+#else
+macro_signed
 #endif";
-    let (tokens, idents) = preprocess_str(code);
-    let strs = get_token_strings(&tokens, &idents);
-    let want = if Target::host().char_signed {
-        "signed"
-    } else {
-        "unsigned"
-    };
-    assert!(
-        strs.contains(&want.to_string()),
-        "expected {:?} for '\\xff' < 0 on this target, got: {:?}",
-        want,
-        strs
-    );
+    for (arch, os) in [
+        (Arch::X86_64, Os::Linux),
+        (Arch::X86_64, Os::MacOS),
+        (Arch::Aarch64, Os::Linux),
+        (Arch::Aarch64, Os::MacOS),
+    ] {
+        let target = Target::new(arch, os);
+        let (tokens, idents) = preprocess_str_for(code, &target);
+        let strs = get_token_strings(&tokens, &idents);
+        let want = match target.plain_char {
+            CharSignedness::Signed => ["signed", "macro_signed"],
+            CharSignedness::Unsigned => ["unsigned", "macro_unsigned"],
+        };
+        assert_eq!(strs, want, "{arch}-{os}");
+    }
 }
 
 /// A prefixed constant holds one wide character, not the bytes of an
@@ -1490,6 +1505,89 @@ no
             expr,
             strs
         );
+    }
+}
+
+/// A prefixed constant has its type's signedness in `#if` (C17 6.10.1p4):
+/// `char16_t` and `char32_t` are unsigned everywhere and `wchar_t` is
+/// unsigned on aarch64 Linux, so `X'\0' - 1 > 0` there -- the test glibc's
+/// <bits/wchar.h> uses to find WCHAR_MIN. Answers match gcc's on both Linux
+/// targets. The macros say the same as the constants.
+#[test]
+fn test_if_prefixed_constants_have_their_types_signedness() {
+    use crate::target::{Arch, Os};
+    let code = "#if L'\\0' - 1 > 0
+w_unsigned
+#endif
+#if u'\\0' - 1 > 0
+u_unsigned
+#endif
+#if U'\\0' - 1 > 0
+U_unsigned
+#endif
+#if __WCHAR_MIN__ == 0 && __WCHAR_MAX__ == 0xffffffffU
+wmacro_unsigned
+#endif
+#if __WCHAR_MIN__ < 0 && __WCHAR_MAX__ == 0x7fffffff
+wmacro_signed
+#endif";
+    for (arch, os, wchar_unsigned) in [
+        (Arch::X86_64, Os::Linux, false),
+        (Arch::X86_64, Os::MacOS, false),
+        (Arch::Aarch64, Os::Linux, true),
+        (Arch::Aarch64, Os::FreeBSD, true),
+        (Arch::Aarch64, Os::MacOS, false),
+    ] {
+        let target = Target::new(arch, os);
+        let (tokens, idents) = preprocess_str_for(code, &target);
+        let strs = get_token_strings(&tokens, &idents);
+        let want: &[&str] = if wchar_unsigned {
+            &["w_unsigned", "u_unsigned", "U_unsigned", "wmacro_unsigned"]
+        } else {
+            &["u_unsigned", "U_unsigned", "wmacro_signed"]
+        };
+        assert_eq!(strs, want, "{arch}-{os}");
+    }
+}
+
+/// An escape in a prefixed constant keeps the width of its type in `#if`
+/// too, and a `wchar_t` one its signedness: `L'\xffffffff'` is -1 where
+/// `wchar_t` is `int` and 4294967295 where it is `unsigned int`, as gcc says
+/// on both Linux targets. Escapes were cut to a byte, so `L'\x1234'` was 0x34.
+#[test]
+fn test_if_prefixed_escapes_keep_their_width() {
+    use crate::target::{Arch, Os};
+    let code = "#if L'\\x1234' == 0x1234 && u'\\x1234' == 0x1234 && U'\\x10000' == 0x10000
+wide
+#endif
+#if L'\\xffffffff' < 0
+negative
+#endif
+#if L'\\xffffffff' == 4294967295
+all_ones
+#endif";
+    for (arch, os, want) in [
+        (Arch::X86_64, Os::Linux, ["wide", "negative"]),
+        (Arch::Aarch64, Os::Linux, ["wide", "all_ones"]),
+        (Arch::Aarch64, Os::MacOS, ["wide", "negative"]),
+    ] {
+        let target = Target::new(arch, os);
+        let (tokens, idents) = preprocess_str_for(code, &target);
+        assert_eq!(get_token_strings(&tokens, &idents), want, "{arch}-{os}");
+    }
+}
+
+/// The predefined `__INTN_C(c)` macros paste their suffix onto the argument,
+/// as gcc's do, and the empty-suffix ones hand it back untouched.
+#[test]
+fn test_predefined_constant_fn_macros_paste() {
+    use crate::target::{Arch, Os};
+    let code = "__INT64_C(5) __UINT32_C(7) __INT8_C(9) __UINTMAX_C(0x10)";
+    for (os, int64) in [(Os::Linux, "5L"), (Os::MacOS, "5LL")] {
+        let target = Target::new(Arch::Aarch64, os);
+        let (tokens, idents) = preprocess_str_for(code, &target);
+        let strs = get_token_strings(&tokens, &idents);
+        assert_eq!(strs, [int64, "7U", "9", "0x10UL"], "{os}");
     }
 }
 
@@ -1726,4 +1824,195 @@ fn test_pragma_operator_destringify() {
         "code after _Pragma should pass through, got: {:?}",
         strs
     );
+}
+
+// The search chain: `-I`, then the bundled headers, then the system
+// directories, with `#include_next` resuming just past the current file.
+
+/// A temporary tree of headers: `q` stands for a `-I` directory, `sys` for a
+/// system one, and each file is written as given.
+struct SearchTree {
+    dir: plib::tmp::TempDir,
+}
+
+impl SearchTree {
+    fn new(files: &[(&str, &str)]) -> Self {
+        let dir = plib::tmp::Builder::new()
+            .prefix("c17_search_chain_")
+            .tempdir()
+            .unwrap();
+        for sub in ["q", "sys"] {
+            std::fs::create_dir(dir.path().join(sub)).unwrap();
+        }
+        for (path, text) in files {
+            std::fs::write(dir.path().join(path), text).unwrap();
+        }
+        SearchTree { dir }
+    }
+
+    fn path(&self, sub: &str) -> String {
+        self.dir.path().join(sub).to_string_lossy().into_owned()
+    }
+
+    /// Preprocess `input` with `q` as the only `-I` directory and `sys` as the
+    /// only system directory, returning the token spellings and the headers
+    /// depended on.
+    fn preprocess(&self, input: &str) -> (Vec<String>, Vec<(PathBuf, bool)>) {
+        let include_paths = [self.path("q")];
+        let isystem = [self.path("sys")];
+        let config = PreprocessConfig {
+            include_paths: &include_paths,
+            search: SystemSearch {
+                isystem: &isystem,
+                no_std_inc: true,
+                ..Default::default()
+            },
+            collect_dependencies: true,
+            ..Default::default()
+        };
+        let mut idents = IdentTable::new();
+        let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+        let (out, outcome) =
+            preprocess_collecting(tokens, &Target::host(), &mut idents, "<test>", &config);
+        (get_token_strings(&out, &idents), outcome.dependencies)
+    }
+}
+
+#[test]
+fn test_search_pos_order_is_the_search_order() {
+    assert!(SearchPos::Quote(7) < SearchPos::Bundled);
+    assert!(SearchPos::Bundled < SearchPos::System(0));
+    assert!(SearchPos::System(0) < SearchPos::System(1));
+    assert_eq!(SearchPos::after(None), SearchPos::Quote(0));
+    assert_eq!(
+        SearchPos::after(Some(SearchPos::Quote(2))),
+        SearchPos::Quote(3)
+    );
+    assert_eq!(
+        SearchPos::after(Some(SearchPos::Bundled)),
+        SearchPos::System(0)
+    );
+    assert_eq!(
+        SearchPos::after(Some(SearchPos::System(4))),
+        SearchPos::System(5)
+    );
+}
+
+/// The bundled <limits.h> forwards to the system's, which, like glibc's, would
+/// forward back to the compiler's under `__GNUC__` unless `_GCC_LIMITS_H_` is
+/// defined, and fills in `LLONG_MIN` its own way when it is missing; like
+/// Apple's, it spells `INT_MAX` as a number. The system's limits arrive,
+/// nothing recurses, and the compiler's sizes stand.
+#[test]
+fn test_bundled_limits_h_forwards_to_the_system_header() {
+    let tree = SearchTree::new(&[(
+        "sys/limits.h",
+        "#ifndef SYS_LIMITS\n#define SYS_LIMITS 1\n#define MB_LEN_MAX 6\n\
+         #define INT_MAX 2147483647\n#define LINE_MAX 2048\n#endif\n\
+         #if defined __GNUC__ && !defined _GCC_LIMITS_H_\n#include_next <limits.h>\n#endif\n\
+         #ifndef LLONG_MIN\n#define LLONG_MIN (-LLONG_MAX-1)\n#endif\n",
+    )]);
+    let (strs, _) =
+        tree.preprocess("#include <limits.h>\nLINE_MAX MB_LEN_MAX INT_MAX LLONG_MIN SYS_LIMITS");
+    assert_eq!(
+        strs,
+        [
+            "2048",
+            "6",
+            "0x7fffffff",
+            "(",
+            "-",
+            "0x7fffffffffffffffLL",
+            "-",
+            "1LL",
+            ")",
+            "1"
+        ],
+        "the system's limits must arrive and the compiler's sizes stand"
+    );
+}
+
+/// With no system <limits.h> to forward to, the bundled one still stands on
+/// its own.
+#[test]
+fn test_bundled_limits_h_without_a_system_header() {
+    let tree = SearchTree::new(&[]);
+    let (strs, _) = tree.preprocess("#include <limits.h>\nCHAR_BIT MB_LEN_MAX LINE_MAX");
+    assert_eq!(strs, ["8", "16", "LINE_MAX"]);
+}
+
+/// A `-I` header that forwards, as gnulib's replacement <limits.h> does,
+/// reaches the bundled one, and through it the system's.
+#[test]
+fn test_include_next_from_dash_i_reaches_the_bundled_header() {
+    let tree = SearchTree::new(&[
+        ("q/limits.h", "#include_next <limits.h>\n#define FROM_Q 1\n"),
+        ("sys/limits.h", "#define LINE_MAX 2048\n"),
+    ]);
+    let (strs, _) = tree.preprocess("#include <limits.h>\nFROM_Q CHAR_BIT LINE_MAX");
+    assert_eq!(strs, ["1", "8", "2048"]);
+}
+
+/// A system header's own `#include <limits.h>` starts the search over, so it
+/// reaches the bundled header too, and that header's `#include_next` finds
+/// the system one although the includer came from the last system directory.
+#[test]
+fn test_limits_h_included_from_a_system_header() {
+    let tree = SearchTree::new(&[
+        ("sys/wrap.h", "#include <limits.h>\n"),
+        ("sys/limits.h", "#define LINE_MAX 2048\n"),
+    ]);
+    let (strs, _) = tree.preprocess("#include <wrap.h>\nCHAR_BIT LINE_MAX");
+    assert_eq!(strs, ["8", "2048"]);
+}
+
+/// `__has_include_next` asks what `#include_next` would find, which is never
+/// the current file itself.
+#[test]
+fn test_has_include_next_searches_past_the_current_file() {
+    let probe = "#if __has_include_next(<a.h>)\nNEXT_YES\n#else\nNEXT_NO\n#endif\n";
+    let tree = SearchTree::new(&[("q/a.h", probe)]);
+    let (strs, _) = tree.preprocess("#include <a.h>\n");
+    assert_eq!(strs, ["NEXT_NO"]);
+
+    let tree = SearchTree::new(&[("q/a.h", probe), ("sys/a.h", "")]);
+    let (strs, _) = tree.preprocess("#include <a.h>\n");
+    assert_eq!(strs, ["NEXT_YES"]);
+}
+
+/// A header found through `-I` is the project's, which `-MM` lists; only one
+/// found in a system directory is a system header, however it was spelled.
+#[test]
+fn test_dash_i_header_is_not_a_system_dependency() {
+    let tree = SearchTree::new(&[("q/mine.h", ""), ("sys/theirs.h", "")]);
+    let (_, deps) = tree.preprocess("#include <mine.h>\n#include \"theirs.h\"\n");
+    let deps: Vec<_> = deps
+        .iter()
+        .map(|(p, sys)| (p.file_name().unwrap().to_string_lossy().into_owned(), *sys))
+        .collect();
+    assert_eq!(
+        deps,
+        [
+            ("mine.h".to_string(), false),
+            ("theirs.h".to_string(), true)
+        ]
+    );
+}
+
+/// `__has_builtin` answers for the `_Float128` constants only where the type
+/// exists, in a directive and in running text alike; the `_Float16` ones
+/// exist everywhere.
+#[test]
+fn test_has_builtin_float128_constants_follow_the_target() {
+    use crate::target::{Arch, Os};
+    let code = "#if __has_builtin(__builtin_nanf128)\nYES\n#else\nNO\n#endif\n\
+                __has_builtin(__builtin_inff128) __has_builtin(__builtin_inff16)\n";
+    for (os, want) in [
+        (Os::Linux, ["YES", "1", "1"]),
+        (Os::MacOS, ["NO", "0", "1"]),
+    ] {
+        let target = Target::new(Arch::Aarch64, os);
+        let (tokens, idents) = preprocess_str_for(code, &target);
+        assert_eq!(get_token_strings(&tokens, &idents), want, "{os:?}");
+    }
 }

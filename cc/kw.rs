@@ -559,6 +559,14 @@ define_keywords! {
     (BUILTIN_HUGE_VAL,  "__builtin_huge_val", BUILTIN),
     (BUILTIN_HUGE_VALF, "__builtin_huge_valf", BUILTIN),
     (BUILTIN_HUGE_VALL, "__builtin_huge_vall", BUILTIN),
+    (BUILTIN_INFF16,    "__builtin_inff16",      BUILTIN),
+    (BUILTIN_INFF32,    "__builtin_inff32",      BUILTIN),
+    (BUILTIN_INFF64,    "__builtin_inff64",      BUILTIN),
+    (BUILTIN_INFF128,   "__builtin_inff128",     BUILTIN),
+    (BUILTIN_HUGE_VALF16, "__builtin_huge_valf16", BUILTIN),
+    (BUILTIN_HUGE_VALF32, "__builtin_huge_valf32", BUILTIN),
+    (BUILTIN_HUGE_VALF64, "__builtin_huge_valf64", BUILTIN),
+    (BUILTIN_HUGE_VALF128, "__builtin_huge_valf128", BUILTIN),
     (BUILTIN_FABS,      "__builtin_fabs",     BUILTIN),
     (BUILTIN_FABSF,     "__builtin_fabsf",    BUILTIN),
     (BUILTIN_FABSL,     "__builtin_fabsl",    BUILTIN),
@@ -643,6 +651,14 @@ define_keywords! {
     (BUILTIN_NANS,      "__builtin_nans",     BUILTIN),
     (BUILTIN_NANSF,     "__builtin_nansf",    BUILTIN),
     (BUILTIN_NANSL,     "__builtin_nansl",    BUILTIN),
+    (BUILTIN_NANF16,    "__builtin_nanf16",      BUILTIN),
+    (BUILTIN_NANF32,    "__builtin_nanf32",      BUILTIN),
+    (BUILTIN_NANF64,    "__builtin_nanf64",      BUILTIN),
+    (BUILTIN_NANF128,   "__builtin_nanf128",     BUILTIN),
+    (BUILTIN_NANSF16,   "__builtin_nansf16",     BUILTIN),
+    (BUILTIN_NANSF32,   "__builtin_nansf32",     BUILTIN),
+    (BUILTIN_NANSF64,   "__builtin_nansf64",     BUILTIN),
+    (BUILTIN_NANSF128,  "__builtin_nansf128",    BUILTIN),
     (BUILTIN_COMPLEX,   "__builtin_complex",  BUILTIN),
     (BUILTIN_EXPECT,    "__builtin_expect",   BUILTIN),
     (BUILTIN_ASSUME_ALIGNED, "__builtin_assume_aligned", BUILTIN),
@@ -696,28 +712,71 @@ define_keywords! {
     // which is what lets `fabs(x) < 0.0` fold to 0 in a program that only
     // declares `extern double fabs(double);`. Tagged 0 for the same reason
     // `alloca` is, and displaceable the same way (see `builtin_is_shadowed`).
+    // The magnitude and sign functions are each one bit operation.
     (FABS,              "fabs",              0),
     (FABSF,             "fabsf",             0),
     (FABSL,             "fabsl",             0),
+    (COPYSIGN,          "copysign",          0),
+    (COPYSIGNF,         "copysignf",         0),
+    (COPYSIGNL,         "copysignl",         0),
+    // The square roots, one instruction on both targets, with a call kept
+    // for a negative argument so that `errno` is set.
+    (SQRT,              "sqrt",              0),
+    (SQRTF,             "sqrtf",             0),
+    (SQRTL,             "sqrtl",             0),
+    // Minimum, maximum and fused multiply-add: instructions on aarch64,
+    // calls on the x86-64 baseline, and folded for constants on both.
+    (FMIN,              "fmin",              0),
+    (FMINF,             "fminf",             0),
+    (FMAX,              "fmax",              0),
+    (FMAXF,             "fmaxf",             0),
+    (FMA,               "fma",               0),
+    (FMAF,              "fmaf",              0),
 
-    // The exactly-rounding functions, whose `float` form gives the same
-    // answer as the `double` one applied to a `float` argument. Narrowing
-    // them is what lets `(float)floor((double)x)` become `floorf(x)`;
-    // `sin` and `log` are deliberately absent, since theirs differ in the
-    // last bit. The `f` spellings are interned so the prototype can be
-    // synthesized for a program that never declared one.
+    // The integer magnitudes, recognized by their plain names for the same
+    // reason and displaceable the same way. Each becomes a branch-free
+    // expression rather than a call, as it does under gcc at every level.
+    (ABS,               "abs",               0),
+    (LABS,              "labs",              0),
+    (LLABS,             "llabs",             0),
+    (IMAXABS,           "imaxabs",           0),
+
+    // The complex accessors, from <complex.h>: parts and conjugate, each
+    // exact at every precision, so recognized and computed in place.
+    (CREAL,             "creal",             0),
+    (CREALF,            "crealf",            0),
+    (CREALL,            "creall",            0),
+    (CIMAG,             "cimag",             0),
+    (CIMAGF,            "cimagf",            0),
+    (CIMAGL,            "cimagl",            0),
+    (CONJ,              "conj",              0),
+    (CONJF,             "conjf",             0),
+    (CONJL,             "conjl",             0),
+
+    // The block memory functions of <string.h>, recognized by their plain
+    // names for the same reason and displaceable the same way. A constant
+    // length small enough is expanded into loads and stores, as under gcc.
+    (MEMCPY,            "memcpy",            0),
+    (MEMSET,            "memset",            0),
+    (MEMMOVE,           "memmove",           0),
+
+    // The roundings, computed in place, and exactly rounding: the `float`
+    // form gives the same answer as the `double` one applied to a `float`
+    // argument, which is what lets `(float)floor((double)x)` become
+    // `floorf(x)`; `sin` and `log` are deliberately absent, since theirs
+    // differ in the last bit.
     (FLOOR,             "floor",             0),
     (CEIL,              "ceil",              0),
     (TRUNC,             "trunc",             0),
     (ROUND,             "round",             0),
     (RINT,              "rint",              0),
     (NEARBYINT,         "nearbyint",         0),
-    (_,                 "floorf",            0),
-    (_,                 "ceilf",             0),
-    (_,                 "truncf",            0),
-    (_,                 "roundf",            0),
-    (_,                 "rintf",             0),
-    (_,                 "nearbyintf",        0),
+    (FLOORF,            "floorf",            0),
+    (CEILF,             "ceilf",             0),
+    (TRUNCF,            "truncf",            0),
+    (ROUNDF,            "roundf",            0),
+    (RINTF,             "rintf",             0),
+    (NEARBYINTF,        "nearbyintf",        0),
 
     // ---- Fortified libc entry points ----
     // Interned but untagged: these are ordinary identifiers, listed only so
@@ -737,45 +796,37 @@ define_keywords! {
     (_,                 "__strncat_chk",        0),
     (_,                 "__sprintf_chk",        0),
     (_,                 "__snprintf_chk",       0),
-    (_,                 "__printf_chk",         0),
-    (_,                 "__fprintf_chk",        0),
+    (PRINTF_CHK,        "__printf_chk",         0),
+    (FPRINTF_CHK,       "__fprintf_chk",        0),
     (_,                 "__vsprintf_chk",       0),
     (_,                 "__vsnprintf_chk",      0),
-    (_,                 "__vprintf_chk",        0),
-    (_,                 "__vfprintf_chk",       0),
+    (VPRINTF_CHK,       "__vprintf_chk",        0),
+    (VFPRINTF_CHK,      "__vfprintf_chk",       0),
     // Same reason, for the builtins that are just the library function: a
     // translation unit may call `__builtin_strlen` without having included
     // the header that declares `strlen`, exactly as gcc allows.
-    (_,                 "strlen",               0),
-    (_,                 "strcmp",               0),
-    (_,                 "abs",                  0),
-    (_,                 "labs",                 0),
-    (_,                 "llabs",                0),
+    (STRLEN,            "strlen",               0),
+    (STRCMP,            "strcmp",               0),
     (_,                 "ffs",                  0),
     (_,                 "ffsl",                 0),
     (_,                 "ffsll",                0),
-    (_,                 "sqrt",                 0),
-    (_,                 "sqrtf",                0),
-    (_,                 "sqrtl",                0),
-    (_,                 "copysign",             0),
-    (_,                 "copysignf",            0),
-    (_,                 "copysignl",            0),
-    (_,                 "fmax",                 0),
-    (_,                 "fmaxf",                0),
     (_,                 "fmaxl",                0),
-    (_,                 "fmin",                 0),
-    (_,                 "fminf",                0),
     (_,                 "fminl",                0),
     (_,                 "pow",                  0),
     (_,                 "powf",                 0),
     (_,                 "powl",                 0),
-    (_,                 "fma",                  0),
-    (_,                 "fmaf",                 0),
     (_,                 "fmal",                 0),
     (_,                 "bcmp",                 0),
     (_,                 "bzero",                0),
     (_,                 "stpncpy",              0),
     (_,                 "strdup",               0),
+    (_,                 "nan",                  0),
+    (_,                 "nanf",                 0),
+    (_,                 "nanl",                 0),
+    (_,                 "nanf16",                0),
+    (_,                 "nanf32",                0),
+    (_,                 "nanf64",                0),
+    (_,                 "nanf128",               0),
     (_,                 "strndup",              0),
     (_,                 "cbrt",                   0),
     (_,                 "cbrtf",                  0),
@@ -890,48 +941,46 @@ define_keywords! {
     (_,                 "__clear_cache",        0),
     (_,                 "abort",                0),
     (_,                 "exit",                 0),
-    (_,                 "printf",               0),
-    (_,                 "sprintf",              0),
+    (PRINTF,            "printf",               0),
+    (SPRINTF,           "sprintf",              0),
     (_,                 "snprintf",             0),
-    (_,                 "puts",                 0),
+    (PUTS,              "puts",                 0),
     // `malloc` is not listed here: it is already interned below as the
     // `__attribute__((malloc))` name, and one spelling is one entry.
     (_,                 "calloc",               0),
     (_,                 "realloc",              0),
     (_,                 "free",                 0),
-    (_,                 "memcmp",               0),
-    (_,                 "mempcpy",              0),
-    (_,                 "strcpy",               0),
-    (_,                 "strncpy",              0),
-    (_,                 "stpcpy",               0),
-    (_,                 "strcat",               0),
-    (_,                 "strncat",              0),
-    (_,                 "strncmp",              0),
-    (_,                 "strchr",               0),
-    (_,                 "strrchr",              0),
-    (_,                 "strstr",               0),
-    (_,                 "imaxabs",               0),
-    (_,                 "memchr",                0),
-    (_,                 "bcopy",                 0),
-    (_,                 "index",                 0),
-    (_,                 "rindex",                0),
-    (_,                 "putchar",               0),
-    (_,                 "strcspn",               0),
+    (MEMCMP,            "memcmp",               0),
+    (MEMPCPY,           "mempcpy",              0),
+    (STRCPY,            "strcpy",               0),
+    (STRNCPY,           "strncpy",              0),
+    (STPCPY,            "stpcpy",               0),
+    (STRCAT,            "strcat",               0),
+    (STRNCAT,           "strncat",              0),
+    (STRNCMP,           "strncmp",              0),
+    (STRCHR,            "strchr",               0),
+    (STRRCHR,           "strrchr",              0),
+    (STRSTR,            "strstr",               0),
+    (MEMCHR,            "memchr",               0),
+    (BCOPY,             "bcopy",                 0),
+    (INDEX,             "index",                0),
+    (RINDEX,            "rindex",               0),
+    (PUTCHAR,           "putchar",              0),
+    (STRCSPN,           "strcspn",              0),
     (_,                 "strspn",                0),
-    (_,                 "strpbrk",               0),
-    (_,                 "printf_unlocked",  0),
-    (_,                 "fprintf_unlocked",  0),
-    (_,                 "fputs_unlocked",  0),
-    (_,                 "fprintf",               0),
-    (_,                 "fputs",                 0),
-    (_,                 "fputc",                 0),
-    (_,                 "fwrite",                0),
-    // The long-double magnitude and sign builtins lower to these rather than
-    // to `fabs`/`__signbit`, which take a `double` and so read only the low
-    // eight bytes of an x87 value. `fabsl` is named above, as a plain
-    // spelling the parser recognizes; it is still looked up here by string,
-    // to synthesize the prototype the call needs.
-    (_,                 "__signbitl",           0),
+    (STRPBRK,           "strpbrk",              0),
+    (PRINTF_UNLOCKED,   "printf_unlocked",      0),
+    (FPRINTF_UNLOCKED,  "fprintf_unlocked",     0),
+    (FPUTS_UNLOCKED,    "fputs_unlocked",       0),
+    (FPRINTF,           "fprintf",              0),
+    (FPUTS,             "fputs",                0),
+    (FPUTC,             "fputc",                0),
+    // Known to the optimizer by prototype only, with no `__builtin_` form
+    // of their own that c17 parses.
+    (STRNLEN,           "strnlen",              0),
+    (VPRINTF,           "vprintf",              0),
+    (VFPRINTF,          "vfprintf",             0),
+    (FWRITE,            "fwrite",               0),
 
     // ---- Supported attribute names (SUPPORTED_ATTR) ----
     // Plain forms

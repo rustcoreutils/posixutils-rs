@@ -721,17 +721,11 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Find and include the file
-        if let Some((source, path_index)) =
-            self.find_include_file(&filename, is_system, is_include_next)
-        {
+        if let Some((source, pos)) = self.find_include_file(&filename, is_system, is_include_next) {
             match source {
                 IncludeSource::File(path) => {
-                    // `path_index` is `Some` only for a file found on a system
-                    // path, which is what `-MM` filters on. The `<>` vs `""`
-                    // spelling is not the same question: a `"..."` include can
-                    // resolve out of a system directory and often does.
-                    self.record_dependency(&path, path_index.is_some());
-                    self.include_file(&path, output, idents, hash_token, path_index);
+                    self.record_dependency(&path, pos);
+                    self.include_file(&path, output, idents, hash_token, pos);
                 }
                 IncludeSource::Builtin(content) => {
                     self.include_builtin(&filename, content, output, idents, hash_token);
@@ -799,13 +793,19 @@ impl<'a> Preprocessor<'a> {
         (filename, false)
     }
 
-    /// Find an include file
-    /// Returns (IncludeSource, Option<system_include_path_index>)
-    /// Note a header this translation unit depends on.
-    pub(super) fn record_dependency(&mut self, path: &Path, is_system: bool) {
+    /// Note a header this translation unit depends on, found at `pos` on the
+    /// search chain.
+    ///
+    /// It is a system header, which `-MM` leaves out, when it came from a
+    /// system directory. Neither the `<>` vs `""` spelling nor being found on
+    /// the chain at all is the same question: a `"..."` include can resolve
+    /// out of a system directory and often does, and a `-I` header is the
+    /// project's own.
+    pub(super) fn record_dependency(&mut self, path: &Path, pos: Option<SearchPos>) {
         if !self.collect_dependencies {
             return;
         }
+        let is_system = matches!(pos, Some(SearchPos::System(_)));
         // Listed once however many times it is included. Linear because the
         // list is short and its order is the output's order.
         if !self.dependencies.iter().any(|(p, _)| p == path) {
@@ -813,12 +813,14 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
+    /// Find an include file, and where on the search chain it was found:
+    /// `None` for one found by absolute path or beside the including file.
     pub(super) fn find_include_file(
         &self,
         filename: &str,
         is_system: bool,
         is_include_next: bool,
-    ) -> Option<(IncludeSource, Option<usize>)> {
+    ) -> Option<(IncludeSource, Option<SearchPos>)> {
         // Absolute path
         if filename.starts_with('/') {
             let path = PathBuf::from(filename);
@@ -837,52 +839,44 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // `-I` and the system directories are one ordered search path, indexed
-        // as one. They are stored separately, so `#include_next` resumes by an
-        // index that spans both halves.
-        let start_index = if is_include_next {
-            self.current_include_path_index.map(|i| i + 1).unwrap_or(0)
+        // `-I`, the bundled headers and the system directories are one ordered
+        // chain (see `SearchPos`); `#include_next` resumes just past the
+        // position the current file was found at.
+        let start = if is_include_next {
+            SearchPos::after(self.current_search_pos)
         } else {
-            0
+            SearchPos::Quote(0)
         };
-        let quote_count = self.quote_include_paths.len();
+        let search_dirs = |dirs: &[String], at: fn(usize) -> SearchPos| {
+            dirs.iter()
+                .enumerate()
+                .map(move |(i, dir)| (at(i), dir))
+                .filter(|&(pos, _)| pos >= start)
+                .find_map(|(pos, dir)| {
+                    let path = Path::new(dir).join(filename);
+                    path.exists()
+                        .then_some((IncludeSource::File(path), Some(pos)))
+                })
+        };
 
-        for (idx, dir) in self
-            .quote_include_paths
-            .iter()
-            .enumerate()
-            .skip(start_index)
-        {
-            let path = Path::new(dir).join(filename);
-            if path.exists() {
-                return Some((IncludeSource::File(path), Some(idx)));
-            }
+        if let Some(found) = search_dirs(&self.quote_include_paths, SearchPos::Quote) {
+            return Some(found);
         }
 
         // Bundled headers stand in for the compiler's own include directory,
         // so they come after the user's search paths — a project that ships
-        // its own limits.h or stddef.h must win. #include_next skips them
-        // entirely.
-        if !is_include_next && self.use_builtin_headers {
+        // its own limits.h or stddef.h must win — and ahead of the system's,
+        // to which a bundled header may forward with `#include_next`.
+        if start <= SearchPos::Bundled && self.use_builtin_headers {
             if let Some(content) = builtin_headers::get_builtin_header(filename) {
-                return Some((IncludeSource::Builtin(content), None));
+                return Some((IncludeSource::Builtin(content), Some(SearchPos::Bundled)));
             }
         }
 
-        // Then the system directories. Their indices continue the same
-        // numbering, so a resume point means the same thing whichever half of
-        // the path the current file came from. Under `-nostdinc` the list holds
-        // only what `-isystem` and `-idirafter` put there.
-        for (idx, dir) in self
-            .system_include_paths
-            .iter()
-            .enumerate()
-            .skip(start_index.saturating_sub(quote_count))
-        {
-            let path = Path::new(dir).join(filename);
-            if path.exists() {
-                return Some((IncludeSource::File(path), Some(quote_count + idx)));
-            }
+        // Then the system directories. Under `-nostdinc` the list holds only
+        // what `-isystem` and `-idirafter` put there.
+        if let Some(found) = search_dirs(&self.system_include_paths, SearchPos::System) {
+            return Some(found);
         }
 
         None
@@ -1010,7 +1004,7 @@ impl<'a> Preprocessor<'a> {
         output: &mut Vec<Token>,
         idents: &mut IdentTable,
         hash_token: &Token,
-        include_path_index: Option<usize>,
+        search_pos: Option<SearchPos>,
     ) {
         // Canonicalize path for cycle detection
         let canonical = match path.canonicalize() {
@@ -1083,9 +1077,8 @@ impl<'a> Preprocessor<'a> {
         );
         // Save cond_stack - included files have isolated conditional state
         let saved_cond_stack = std::mem::take(&mut self.cond_stack);
-        // Save include path index for #include_next support
-        let saved_include_path_index =
-            std::mem::replace(&mut self.current_include_path_index, include_path_index);
+        // Where this file was found, for its `#include_next`
+        let saved_search_pos = std::mem::replace(&mut self.current_search_pos, search_pos);
 
         self.include_depth += 1;
 
@@ -1135,7 +1128,7 @@ impl<'a> Preprocessor<'a> {
         // groups; what it leaves open is reported here.
         self.report_unterminated_conditionals();
         self.cond_stack = saved_cond_stack;
-        self.current_include_path_index = saved_include_path_index;
+        self.current_search_pos = saved_search_pos;
     }
 
     /// Include a builtin (embedded) header
@@ -1161,6 +1154,9 @@ impl<'a> Preprocessor<'a> {
         let saved_file = std::mem::replace(&mut self.current_file, format!("<builtin:{}>", name));
         let saved_dir = std::mem::replace(&mut self.current_dir, ".".to_string());
         let saved_cond_stack = std::mem::take(&mut self.cond_stack);
+        // A bundled header's `#include_next` continues into the system
+        // directories, which is how it forwards to the system's own.
+        let saved_search_pos = self.current_search_pos.replace(SearchPos::Bundled);
 
         self.include_depth += 1;
 
@@ -1194,6 +1190,7 @@ impl<'a> Preprocessor<'a> {
         // groups; what it leaves open is reported here.
         self.report_unterminated_conditionals();
         self.cond_stack = saved_cond_stack;
+        self.current_search_pos = saved_search_pos;
     }
 
     fn handle_error(&mut self, iter: &mut TokenCursor, pos: &Position, idents: &IdentTable) {
@@ -1542,13 +1539,20 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    pub(super) fn eval_has_include(&self, args: &[Vec<Token>], idents: &IdentTable) -> bool {
+    /// `__has_include` / `__has_include_next`: whether the `#include` or
+    /// `#include_next` of the operand would find a file.
+    pub(super) fn eval_has_include(
+        &self,
+        args: &[Vec<Token>],
+        idents: &IdentTable,
+        is_include_next: bool,
+    ) -> bool {
         if args.is_empty() {
             return false;
         }
 
         let (filename, is_system) = self.parse_include_path(&args[0], idents);
-        self.find_include_file(&filename, is_system, false)
+        self.find_include_file(&filename, is_system, is_include_next)
             .is_some()
     }
 }

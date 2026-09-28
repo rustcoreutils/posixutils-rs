@@ -148,13 +148,15 @@ fn c17_never_defines_strict_ansi() {
 /// The unreserved and reserved OS macros for the host this test runs on.
 ///
 /// `linux`/`__linux__` do not exist on Darwin, so asserting on them there
-/// tested the build machine rather than the compiler. `unix`/`__unix__` are
-/// common to both.
+/// tested the build machine rather than the compiler. Neither does the `unix`
+/// family: clang and gcc define it on Linux and the BSDs, never on Darwin.
 fn host_os_macros() -> (&'static [&'static str], &'static [&'static str]) {
     if cfg!(target_os = "linux") {
         (&["unix", "linux"], &["__unix__", "__linux__"])
+    } else if cfg!(target_os = "macos") {
+        // Darwin predefines no unreserved OS name at all.
+        (&[], &["__APPLE__"])
     } else {
-        // macOS and the BSDs predefine the unix pair but not the linux one.
         (&["unix"], &["__unix__"])
     }
 }
@@ -596,4 +598,89 @@ fn c17_optimization_macros_can_be_overridden() {
         is_undefined(&got, "__OPTIMIZE__"),
         "-U should remove it, got {got}"
     );
+}
+
+/// The architecture and OS identity macros per target, against what gcc
+/// (Linux) and clang (Darwin) predefine: each target names itself and no
+/// other. `__arm64__` was predefined on aarch64 Linux, where gcc has only
+/// `__aarch64__`, and code reads `__arm64__` as "Apple"; macOS defined
+/// `__FreeBSD__` and `__NetBSD__` (empty) and the `unix` family.
+#[test]
+fn target_identity_macros_name_only_the_target() {
+    let identity = [
+        "__aarch64__",
+        "__arm64__",
+        "__arm64",
+        "__AARCH64EL__",
+        "__x86_64__",
+        "__amd64__",
+        "__APPLE__",
+        "__MACH__",
+        "__linux__",
+        "linux",
+        "__gnu_linux__",
+        "__ELF__",
+        "unix",
+        "__unix__",
+        "__FreeBSD__",
+        "__NetBSD__",
+    ];
+    for (triple, want) in [
+        (
+            "aarch64-unknown-linux-gnu",
+            &[
+                "__aarch64__",
+                "__AARCH64EL__",
+                "__linux__",
+                "linux",
+                "__gnu_linux__",
+                "__ELF__",
+                "unix",
+                "__unix__",
+            ][..],
+        ),
+        (
+            "x86_64-unknown-linux-gnu",
+            &[
+                "__x86_64__",
+                "__amd64__",
+                "__linux__",
+                "linux",
+                "__gnu_linux__",
+                "__ELF__",
+                "unix",
+                "__unix__",
+            ][..],
+        ),
+        (
+            "aarch64-apple-darwin",
+            &[
+                "__aarch64__",
+                "__arm64__",
+                "__arm64",
+                "__AARCH64EL__",
+                "__APPLE__",
+                "__MACH__",
+            ][..],
+        ),
+        (
+            "x86_64-apple-darwin",
+            &["__x86_64__", "__amd64__", "__APPLE__", "__MACH__"][..],
+        ),
+    ] {
+        let r = preprocess_text("identity_dm", "", &["-dM", "--target", triple]);
+        assert!(r.success, "-dM for {triple} failed: {}", r.stderr);
+        let defined: Vec<&str> = r
+            .stdout
+            .lines()
+            .filter_map(|l| l.strip_prefix("#define "))
+            .map(|l| l.split([' ', '(']).next().unwrap_or(""))
+            .filter(|n| identity.contains(n))
+            .collect();
+        let mut got = defined.clone();
+        got.sort_unstable();
+        let mut expected = want.to_vec();
+        expected.sort_unstable();
+        assert_eq!(got, expected, "identity macros for {triple}");
+    }
 }

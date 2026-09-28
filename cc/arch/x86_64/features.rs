@@ -10,10 +10,10 @@
 //
 
 use super::codegen::X86_64CodeGen;
-use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst};
-use super::regalloc::{Loc, Reg, XmmReg};
+use super::lir::{popcount_sequence, GpOperand, MemAddr, ShiftCount, X86Inst};
+use super::regalloc::{Loc, Reg};
 use crate::arch::codegen::BswapSize;
-use crate::arch::lir::{CallTarget, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::lir::{CallTarget, CondCode, Directive, Label, OperandSize, Symbol};
 use crate::ir::Instruction;
 use crate::types::TypeTable;
 
@@ -886,23 +886,14 @@ impl X86_64CodeGen {
             _ => return,
         };
 
-        let is_aggregate = matches!(
-            types.kind(arg_type),
-            crate::types::TypeKind::Struct
-                | crate::types::TypeKind::Union
-                | crate::types::TypeKind::Array
-        );
-        if types.kind(arg_type) == crate::types::TypeKind::LongDouble {
-            self.emit_va_arg_x87(base_reg, base_offset, &dst_loc);
-        } else if types.kind(arg_type) == crate::types::TypeKind::Int128
-            && !types.is_complex(arg_type)
-        {
-            // Two INTEGER eightbytes, not one saturated at 64 bits. The
-            // complex guard is the same one every sibling site carries:
-            // `kind()` answers the *base* kind, so `_Complex __int128` would
-            // otherwise land here rather than in the aggregate path.
-            self.emit_va_arg_int128(base_reg, base_offset, &dst_loc, label_suffix);
-        } else if is_aggregate {
+        // A complex value is read exactly as the equivalent struct is: its
+        // classification (psABI 3.2.3) names each eightbyte's register area,
+        // or MEMORY for `long double _Complex`, and the aggregate path
+        // follows that. It must be asked first, because a complex type
+        // carries its base's kind: `long double _Complex` would otherwise
+        // take the x87 path and `float _Complex` the scalar SSE one, each
+        // reading one half and stepping over the wrong amount.
+        if types.is_aggregate_or_complex(arg_type) {
             self.emit_va_arg_aggregate(
                 base_reg,
                 base_offset,
@@ -911,6 +902,11 @@ impl X86_64CodeGen {
                 types,
                 label_suffix,
             );
+        } else if types.kind(arg_type) == crate::types::TypeKind::LongDouble {
+            self.emit_va_arg_x87(base_reg, base_offset, &dst_loc);
+        } else if types.kind(arg_type) == crate::types::TypeKind::Int128 {
+            // Two INTEGER eightbytes, not one saturated at 64 bits.
+            self.emit_va_arg_int128(base_reg, base_offset, &dst_loc, label_suffix);
         } else if types.is_float(arg_type) {
             self.emit_va_arg_float(
                 base_reg,
@@ -1462,73 +1458,19 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit population count
+    /// Emit population count with the baseline sequence of
+    /// [`popcount_sequence`] -- never `popcnt`, which is not in x86-64-v1.
+    /// Works in the R10/R11 scratch pair; the result is an `int`.
     pub(super) fn emit_popcount(&mut self, insn: &Instruction, src_size: OperandSize) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
+        let (Some(&src), Some(dst)) = (insn.src.first(), insn.target) else {
+            return;
         };
-        let dst = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let src_loc = self.get_location(src);
+        self.emit_move(src, Reg::R10, src_size.bits());
+        for inst in popcount_sequence(src_size, Reg::R10, Reg::R11) {
+            self.push_lir(inst);
+        }
         let dst_loc = self.get_location(dst);
-
-        // POPCNT instruction directly counts set bits
-        // Use R10 as scratch register
-        match src_loc {
-            Loc::Reg(r) => {
-                self.push_lir(X86Inst::Popcnt {
-                    size: src_size,
-                    src: GpOperand::Reg(r),
-                    dst: Reg::R10,
-                });
-            }
-            Loc::Stack(off) => {
-                self.push_lir(X86Inst::Popcnt {
-                    size: src_size,
-                    src: GpOperand::Mem(self.stack_field(off, 0)),
-                    dst: Reg::R10,
-                });
-            }
-            Loc::Imm(v) => {
-                // Load immediate first, then POPCNT
-                self.push_lir(X86Inst::Mov {
-                    size: src_size,
-                    src: GpOperand::Imm(v as i64),
-                    dst: GpOperand::Reg(Reg::R10),
-                });
-                self.push_lir(X86Inst::Popcnt {
-                    size: src_size,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: Reg::R10,
-                });
-            }
-            _ => return,
-        }
-
-        // Store result (return type is int, always 32-bit)
-        match dst_loc {
-            Loc::Reg(r) => {
-                if r != Reg::R10 {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::R10),
-                        dst: GpOperand::Reg(r),
-                    });
-                }
-            }
-            Loc::Stack(off) => {
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(self.stack_field(off, 0)),
-                });
-            }
-            _ => {}
-        }
+        self.emit_move_to_loc(Reg::R10, &dst_loc, u32::BITS);
     }
 
     // setjmp/longjmp/alloca support
@@ -1818,103 +1760,5 @@ impl X86_64CodeGen {
         });
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
-    }
-
-    /// Emit __builtin_fabsf - absolute value of float
-    pub(super) fn emit_fabs32(&mut self, insn: &Instruction) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Load argument into XMM0 (first FP argument register)
-        self.emit_fp_move(arg, XmmReg::Xmm0, FpSize::Single);
-
-        // Call fabsf from libc
-        self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
-        });
-
-        // Result is in XMM0, store to target
-        let dst_loc = self.get_location(target);
-        self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, FpSize::Single);
-    }
-
-    /// Emit __builtin_fabs - absolute value of double
-    pub(super) fn emit_fabs64(&mut self, insn: &Instruction) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Load argument into XMM0 (first FP argument register)
-        self.emit_fp_move(arg, XmmReg::Xmm0, FpSize::Double);
-
-        // Call fabs from libc
-        self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
-        });
-
-        // Result is in XMM0, store to target
-        let dst_loc = self.get_location(target);
-        self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, FpSize::Double);
-    }
-
-    /// Emit __builtin_signbitf - test sign bit of float
-    pub(super) fn emit_signbit32(&mut self, insn: &Instruction) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Load argument into XMM0 (first FP argument register)
-        self.emit_fp_move(arg, XmmReg::Xmm0, FpSize::Single);
-
-        // Call __signbitf from libc (C99: signbit is a macro that calls __signbitf)
-        self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global("__signbitf".to_string())),
-        });
-
-        // Result is in EAX (integer return), store to target
-        let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::Rax, &dst_loc, u32::BITS);
-    }
-
-    /// Emit __builtin_signbit - test sign bit of double
-    pub(super) fn emit_signbit64(&mut self, insn: &Instruction) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Load argument into XMM0 (first FP argument register)
-        self.emit_fp_move(arg, XmmReg::Xmm0, FpSize::Double);
-
-        // Call signbit function from libc
-        self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global(
-                self.base.target.os.signbit_double_fn().to_string(),
-            )),
-        });
-
-        // Result is in EAX (integer return), store to target
-        let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::Rax, &dst_loc, u32::BITS);
     }
 }

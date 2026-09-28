@@ -1,18 +1,54 @@
 /*
- * c17 builtin limits.h - Implementation limits for C99
+ * c17 builtin limits.h - sizes of integer types (C17 7.10, 5.2.4.2.1)
  *
- * This header provides the standard integer type limits defined by C99.
- * It uses compiler-predefined macros to determine the actual limits
- * for the target platform.
+ * Two owners share <limits.h>. The compiler knows how big each integer type
+ * is; the system knows its POSIX limits (LINE_MAX, NGROUPS_MAX, IOV_MAX,
+ * SSIZE_MAX, the _POSIX_* minima, ...). So this header forwards to the
+ * system's, then defines the compiler's part itself, as gcc's and clang's
+ * do.
  */
 
 #ifndef _C17_LIMITS_H
 #define _C17_LIMITS_H
 
+/* glibc's <limits.h>, seeing __GNUC__, would #include_next the compiler's
+   own header for the ISO constants unless this, the name gcc's header
+   defines, says it has been reached already. That is this header. */
+#ifndef _GCC_LIMITS_H_
+#define _GCC_LIMITS_H_
+#endif
+
+#if __has_include_next(<limits.h>)
+#include_next <limits.h>
+#endif
+
+/* The system header may have defined any of these its own way (glibc
+   spells LLONG_MIN as (-LLONG_MAX-1), Apple spells them all as numbers).
+   The compiler knows the sizes, so its definitions replace them. */
+#undef CHAR_BIT
+#undef SCHAR_MIN
+#undef SCHAR_MAX
+#undef UCHAR_MAX
+#undef CHAR_MIN
+#undef CHAR_MAX
+#undef SHRT_MIN
+#undef SHRT_MAX
+#undef USHRT_MAX
+#undef INT_MIN
+#undef INT_MAX
+#undef UINT_MAX
+#undef LONG_MIN
+#undef LONG_MAX
+#undef ULONG_MAX
+#undef LLONG_MIN
+#undef LLONG_MAX
+#undef ULLONG_MAX
+
 /* Number of bits in a char */
 #define CHAR_BIT __CHAR_BIT__
 
-/* Maximum length of a multibyte character */
+/* Maximum length of a multibyte character: the C library's, which knows
+   its locales, when it has said. */
 #ifndef MB_LEN_MAX
 #define MB_LEN_MAX 16
 #endif
@@ -60,94 +96,5 @@
 
 /* Maximum value an unsigned long long int can hold (minimum is 0) */
 #define ULLONG_MAX (__LONG_LONG_MAX__ * 2ULL + 1ULL)
-
-/* POSIX limits - often needed for compatibility */
-#ifndef _POSIX_ARG_MAX
-#define _POSIX_ARG_MAX 4096
-#endif
-
-#ifndef _POSIX_CHILD_MAX
-#define _POSIX_CHILD_MAX 25
-#endif
-
-#ifndef _POSIX_HOST_NAME_MAX
-#define _POSIX_HOST_NAME_MAX 255
-#endif
-
-#ifndef _POSIX_LINK_MAX
-#define _POSIX_LINK_MAX 8
-#endif
-
-#ifndef _POSIX_LOGIN_NAME_MAX
-#define _POSIX_LOGIN_NAME_MAX 9
-#endif
-
-#ifndef _POSIX_MAX_CANON
-#define _POSIX_MAX_CANON 255
-#endif
-
-#ifndef _POSIX_MAX_INPUT
-#define _POSIX_MAX_INPUT 255
-#endif
-
-#ifndef _POSIX_NAME_MAX
-#define _POSIX_NAME_MAX 14
-#endif
-
-#ifndef _POSIX_NGROUPS_MAX
-#define _POSIX_NGROUPS_MAX 8
-#endif
-
-#ifndef _POSIX_OPEN_MAX
-#define _POSIX_OPEN_MAX 20
-#endif
-
-#ifndef _POSIX_PATH_MAX
-#define _POSIX_PATH_MAX 256
-#endif
-
-#ifndef _POSIX_PIPE_BUF
-#define _POSIX_PIPE_BUF 512
-#endif
-
-#ifndef _POSIX_SSIZE_MAX
-#define _POSIX_SSIZE_MAX 32767
-#endif
-
-#ifndef _POSIX_STREAM_MAX
-#define _POSIX_STREAM_MAX 8
-#endif
-
-#ifndef _POSIX_SYMLINK_MAX
-#define _POSIX_SYMLINK_MAX 255
-#endif
-
-#ifndef _POSIX_TTY_NAME_MAX
-#define _POSIX_TTY_NAME_MAX 9
-#endif
-
-#ifndef _POSIX_TZNAME_MAX
-#define _POSIX_TZNAME_MAX 6
-#endif
-
-/* Runtime invariant values - actual system limits may be larger */
-#ifndef NAME_MAX
-#define NAME_MAX 255
-#endif
-
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
-
-#ifndef PIPE_BUF
-#define PIPE_BUF 4096
-#endif
-
-/* Word size helpers */
-#if __SIZEOF_LONG__ == 8
-#define __WORDSIZE 64
-#else
-#define __WORDSIZE 32
-#endif
 
 #endif /* _C17_LIMITS_H */

@@ -73,11 +73,12 @@ impl VaAggKind {
         types: &TypeTable,
         target: &crate::target::Target,
     ) -> Self {
-        use crate::types::TypeKind;
-        if !matches!(
-            types.kind(typ),
-            TypeKind::Struct | TypeKind::Union | TypeKind::Array
-        ) {
+        // A complex value is the two-member composite the classification
+        // says it is -- an HFA of its base, or for `_Complex int` a composite
+        // of the general class -- so it is read exactly as the equivalent
+        // struct is. Asking the kind alone took it for a scalar of its base,
+        // which read one half and stepped over one slot.
+        if !types.is_aggregate_or_complex(typ) {
             return VaAggKind::Scalar;
         }
         let bytes =
@@ -175,11 +176,15 @@ impl Aarch64CodeGen {
 
         if self.base.target.os == crate::target::Os::MacOS {
             // Darwin passes every variadic argument on the stack and spells
-            // va_list as a plain pointer to it, starting at the original SP.
+            // va_list as a plain pointer to it: past any named parameter that
+            // overflowed its registers, where the caller began laying them
+            // out. Starting at the original SP read the named ones as the
+            // first variadic arguments.
             let Some(ap) = self.va_list_addr(&ap_loc, scratch1) else {
                 return;
             };
-            self.store_va_frame_ptr(ap, 0, self.frame_size, scratch0);
+            let first_va = crate::abi::aapcs64::darwin_va_area_start(self.named_stack_param_bytes);
+            self.store_va_frame_ptr(ap, 0, self.frame_size + first_va, scratch0);
             return;
         }
 
@@ -1453,30 +1458,6 @@ impl Aarch64CodeGen {
         });
     }
 
-    /// Emit __builtin_signbitf - test sign bit of float
-    pub(super) fn emit_signbit32(&mut self, insn: &Instruction, types: &TypeTable) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Load argument into V0 (first FP argument register)
-        self.emit_fp_move(arg, VReg::V0, None, 32, types);
-
-        // Call __signbitf from libc (C99: signbit is a macro that calls __signbitf)
-        self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global("__signbitf")),
-        });
-
-        // Result is in W0 (integer return), store to target
-        let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::X0, &dst_loc, u32::BITS);
-    }
-
     /// `__builtin_memcpy`/`memset`/`memmove` on aarch64: a call to the library
     /// function, by the assembler name the program declared it with
     /// (`Instruction::library_callee`).
@@ -1509,55 +1490,5 @@ impl Aarch64CodeGen {
             let dst_loc = self.get_location(target);
             self.emit_move_to_loc(Reg::X0, &dst_loc, 64);
         }
-    }
-
-    /// Emit __builtin_signbit - test sign bit of double
-    pub(super) fn emit_signbit64(&mut self, insn: &Instruction, types: &TypeTable) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Load argument into V0 (first FP argument register)
-        self.emit_fp_move(arg, VReg::V0, None, 64, types);
-
-        // Call signbit function from libc
-        self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global(self.base.target.os.signbit_double_fn())),
-        });
-
-        // Result is in W0 (integer return), store to target
-        let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::X0, &dst_loc, u32::BITS);
-    }
-
-    /// Emit __builtin_fabsf/__builtin_fabs - absolute value of float/double
-    pub(super) fn emit_fabs(&mut self, insn: &Instruction, types: &TypeTable, is_double: bool) {
-        let arg = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let size = if is_double { 64 } else { 32 };
-
-        // Load argument into V0 (first FP argument register)
-        self.emit_fp_move(arg, VReg::V0, None, size, types);
-
-        // Call fabs/fabsf from libc
-        self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
-        });
-
-        // Result is in V0, store to target
-        let dst_loc = self.get_location(target);
-        self.emit_fp_move_to_loc(VReg::V0, &dst_loc, None, size, types);
     }
 }

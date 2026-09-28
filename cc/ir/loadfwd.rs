@@ -48,6 +48,10 @@
 // `GlobalDef`, so both the base and the access type are checked, and a name
 // this translation unit does not define is assumed to be everything.
 //
+// The walk is `MemOracle`, and a load is only one of the things that asks
+// it: `libcall_fold` asks what a local array holds, a byte at a time, where
+// `strlen` reads it.
+//
 
 use super::constfold::unambiguous_at;
 use super::dominate::{domtree_build, DomTree};
@@ -55,6 +59,7 @@ use super::escape::EscapeInfo;
 use super::memloc::{is_same_access, may_alias, AddrMap, MemBase, MemLoc, ModuleInfo};
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeModifiers, TypeTable};
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
 /// How far up the dominator chain one load will look.
@@ -73,14 +78,8 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
     if func.blocks.is_empty() {
         return false;
     }
-    let esc = EscapeInfo::analyze(func);
-    if esc.gave_up() {
-        return false;
-    }
     let am = AddrMap::build(func);
-    let dom = domtree_build(func);
-    let preds = build_preds(func);
-    let succs = invert(&preds);
+    let oracle = MemOracle::new(func, types, mi, &am);
 
     // Collected under `&Function` -- resolving an address needs the pseudo
     // table -- then applied under `&mut`, as `constglobal` does.
@@ -90,9 +89,7 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
             if insn.op != Opcode::Load {
                 continue;
             }
-            if let Some(a) =
-                available_value(func, types, mi, &esc, &am, &dom, &preds, &succs, (b, i))
-            {
+            if let Some(a) = oracle.value_at((b, i), &am.location_of(func, insn)) {
                 sites.push((b, i, a));
             }
         }
@@ -123,66 +120,400 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
     changed
 }
 
-/// The pseudo already holding what the load at `site` would read.
-#[allow(clippy::too_many_arguments)]
-fn available_value(
-    func: &Function,
-    types: &TypeTable,
-    mi: &ModuleInfo,
-    esc: &EscapeInfo,
-    am: &AddrMap,
-    dom: &DomTree,
-    preds: &HashMap<BasicBlockId, Vec<BasicBlockId>>,
-    succs: &HashMap<BasicBlockId, Vec<BasicBlockId>>,
-    (bl, il): (usize, usize),
-) -> Option<Available> {
-    let load = &func.blocks[bl].insns[il];
-    let loc = am.location_of(func, load);
-    if !forwardable(func, types, mi, &loc) {
-        return None;
+/// What one function's memory holds at a point in it, as far as the stores
+/// and loads before that point say.
+///
+/// A load asks it for the pseudo already holding its bytes (`value_at`); a
+/// library call that reads a local array asks it for that array's bytes one
+/// at a time (`byte_at`). Both are the same walk, which is written once here:
+/// up the dominator chain to the nearest instruction that answers, then over
+/// every path from there to the point for anything that writes the location
+/// in between. Only what counts as an answer differs.
+///
+/// The analyses the walk needs are built by the first question, so a pass
+/// that asks none -- a function with no call worth folding -- pays nothing.
+pub(crate) struct MemOracle<'a> {
+    func: &'a Function,
+    types: &'a TypeTable,
+    mi: &'a ModuleInfo,
+    am: &'a AddrMap,
+    /// `None` inside when escape analysis gave up on the function: nothing
+    /// in it may be forwarded.
+    paths: OnceCell<Option<Paths>>,
+}
+
+/// What the walk needs to know about the function's control flow and about
+/// which locals a callee can reach.
+struct Paths {
+    esc: EscapeInfo,
+    dom: DomTree,
+    preds: HashMap<BasicBlockId, Vec<BasicBlockId>>,
+    succs: HashMap<BasicBlockId, Vec<BasicBlockId>>,
+}
+
+impl<'a> MemOracle<'a> {
+    pub(crate) fn new(
+        func: &'a Function,
+        types: &'a TypeTable,
+        mi: &'a ModuleInfo,
+        am: &'a AddrMap,
+    ) -> Self {
+        MemOracle {
+            func,
+            types,
+            mi,
+            am,
+            paths: OnceCell::new(),
+        }
     }
 
-    // Walk up the dominator chain for the nearest definition of this
-    // location, stopping at the first thing that may write it.
-    let mut block = func.blocks[bl].id;
-    let mut start = il;
-    let mut scanned = 0usize;
-    for _ in 0..MAX_DOM_LEVELS {
-        let bi = func.block_index(block)?;
-        for i in (0..start).rev() {
-            scanned += 1;
-            if scanned > MAX_SCAN_INSNS {
-                return None;
-            }
-            let insn = &func.blocks[bi].insns[i];
-            if insn.op == Opcode::Nop {
-                continue;
-            }
-            match candidate(func, types, mi, esc, am, insn, &loc) {
-                Some(Candidate::Value(avail)) => {
-                    return no_clobber_between(
-                        func,
-                        types,
-                        mi,
-                        esc,
-                        am,
-                        preds,
-                        succs,
-                        (bi, i),
-                        (bl, il),
-                        &loc,
-                    )
-                    .then_some(avail);
+    fn paths(&self) -> Option<&Paths> {
+        self.paths
+            .get_or_init(|| {
+                let esc = EscapeInfo::analyze(self.func);
+                if esc.gave_up() {
+                    return None;
                 }
-                Some(Candidate::Clobber) => return None,
-                None => {}
+                let preds = build_preds(self.func);
+                let succs = invert(&preds);
+                Some(Paths {
+                    esc,
+                    dom: domtree_build(self.func),
+                    preds,
+                    succs,
+                })
+            })
+            .as_ref()
+    }
+
+    /// The pseudo already holding what a load of `loc` just before `site`
+    /// would read.
+    fn value_at(&self, site: (usize, usize), loc: &MemLoc) -> Option<Available> {
+        let paths = self.paths()?;
+        self.nearest(paths, site, loc, |insn| self.candidate(paths, insn, loc))
+    }
+
+    /// The byte `loc` -- one byte wide -- holds just before `site`, when a
+    /// store of a constant left it there: a one-byte store of it, or any
+    /// wider integer store that covers it, whose bytes lie in memory in the
+    /// order `little_endian` says.
+    ///
+    /// The order is the *target's*: the host that runs this compiler may
+    /// store its own integers the other way round.
+    pub(crate) fn byte_at(
+        &self,
+        site: (usize, usize),
+        loc: &MemLoc,
+        little_endian: bool,
+    ) -> Option<u8> {
+        if loc.size != 8 {
+            return None;
+        }
+        let paths = self.paths()?;
+        self.nearest(paths, site, loc, |insn| {
+            self.byte_candidate(paths, insn, loc, little_endian)
+        })
+    }
+
+    /// The answer the nearest instruction before `site` that answers for
+    /// `loc` gives, by `classify`, when nothing on any path from it to
+    /// `site` may write `loc`.
+    fn nearest<T>(
+        &self,
+        paths: &Paths,
+        (bl, il): (usize, usize),
+        loc: &MemLoc,
+        classify: impl Fn(&Instruction) -> Option<Candidate<T>>,
+    ) -> Option<T> {
+        let func = self.func;
+        if !forwardable(func, self.types, self.mi, loc) {
+            return None;
+        }
+
+        // Walk up the dominator chain for the nearest definition of this
+        // location, stopping at the first thing that may write it.
+        let mut block = func.blocks[bl].id;
+        let mut start = il;
+        let mut scanned = 0usize;
+        for _ in 0..MAX_DOM_LEVELS {
+            let bi = func.block_index(block)?;
+            for i in (0..start).rev() {
+                scanned += 1;
+                if scanned > MAX_SCAN_INSNS {
+                    return None;
+                }
+                let insn = &func.blocks[bi].insns[i];
+                if insn.op == Opcode::Nop {
+                    continue;
+                }
+                match classify(insn) {
+                    Some(Candidate::Value(v)) => {
+                        return self
+                            .no_clobber_between(paths, (bi, i), (bl, il), loc)
+                            .then_some(v);
+                    }
+                    Some(Candidate::Clobber) => return None,
+                    None => {}
+                }
+            }
+            let idom = paths.dom.idom(block)?;
+            block = idom;
+            start = func.blocks[func.block_index(block)?].insns.len();
+        }
+        None
+    }
+
+    fn candidate(
+        &self,
+        paths: &Paths,
+        insn: &Instruction,
+        loc: &MemLoc,
+    ) -> Option<Candidate<Available>> {
+        let (func, types, am) = (self.func, self.types, self.am);
+        match insn.op {
+            Opcode::Store => {
+                let s = am.location_of(func, insn);
+                if is_same_access(&s, loc, types) {
+                    if let Some(v) = insn.src.get(1).copied() {
+                        // A store this pass cannot forward is still a store:
+                        // it has to stop the search, or the walk would run
+                        // past it to an older value.
+                        return Some(match narrowing(func, types, am, v, loc.size) {
+                            Some(a) => Candidate::Value(a),
+                            None => Candidate::Clobber,
+                        });
+                    }
+                }
+                may_alias(&s, loc, self.mi).then_some(Candidate::Clobber)
+            }
+            Opcode::Load => {
+                let s = am.location_of(func, insn);
+                if is_same_access(&s, loc, types) {
+                    // A load's target holds exactly the bytes that were
+                    // read, so this one needs no narrowing.
+                    return insn.target.map(|t| {
+                        Candidate::Value(Available {
+                            value: t,
+                            narrow: None,
+                        })
+                    });
+                }
+                None
+            }
+            _ if self.writes(paths, insn, loc) => Some(Candidate::Clobber),
+            _ => None,
+        }
+    }
+
+    /// `candidate` for one byte, answered as its value: a store that covers
+    /// the byte answers when it stores an integer constant, and stops the
+    /// search when it stores anything else.
+    fn byte_candidate(
+        &self,
+        paths: &Paths,
+        insn: &Instruction,
+        loc: &MemLoc,
+        little_endian: bool,
+    ) -> Option<Candidate<u8>> {
+        match insn.op {
+            Opcode::Store => {
+                let s = self.am.location_of(self.func, insn);
+                let Some(at) = byte_index(&s, loc) else {
+                    return may_alias(&s, loc, self.mi).then_some(Candidate::Clobber);
+                };
+                // A floating-point constant is its bits only in its own
+                // format, which is not what `const_operand` holds. And the
+                // object a `volatile` store writes -- a `volatile char`
+                // element, a member -- may change after it, so its bytes are
+                // no fact whatever the object as a whole is.
+                let typ = s.typ.unwrap_or(self.types.int_id);
+                let plain = self.types.fp_format(typ).is_none()
+                    && !self
+                        .types
+                        .modifiers(typ)
+                        .intersects(TypeModifiers::VOLATILE | TypeModifiers::ATOMIC);
+                let byte = insn
+                    .src
+                    .get(1)
+                    .and_then(|&v| self.am.const_operand(self.func, v))
+                    .filter(|_| plain)
+                    .and_then(|c| byte_of(c, s.size / 8, at, little_endian));
+                Some(byte.map_or(Candidate::Clobber, Candidate::Value))
+            }
+            // A load writes nothing, and what it read is a pseudo, not a
+            // byte.
+            Opcode::Load => None,
+            _ if self.writes(paths, insn, loc) => Some(Candidate::Clobber),
+            _ => None,
+        }
+    }
+
+    /// Could `insn` write `loc`?
+    ///
+    /// An allowlist read the safe way round: an opcode this does not
+    /// recognize is assumed to write, so a new one is conservative by
+    /// default. That is the same discipline `ifconv::is_speculatable` uses,
+    /// and the reason `Instruction::is_memory_barrier` is not enough on its
+    /// own -- it answers ordering, and omits `Store`, the mem intrinsics, the
+    /// `Va*` family, `Alloca` and `StackSave` entirely.
+    fn writes(&self, paths: &Paths, insn: &Instruction, loc: &MemLoc) -> bool {
+        let (func, am, mi) = (self.func, self.am, self.mi);
+        // A `Sym` target *is* storage, so an instruction that targets one
+        // writes the object it names -- a struct-returning call writes its
+        // receiving local this way, with no `Store` anywhere. The extent is
+        // left unknown because `insn.size` describes a register, not the
+        // aggregate.
+        if let Some(t) = insn.target {
+            if matches!(
+                func.get_pseudo(t).map(|p| &p.kind),
+                Some(super::PseudoKind::Sym(_))
+            ) && may_alias(&am.resolve(func, t, 0, 0, None), loc, mi)
+            {
+                return true;
             }
         }
-        let idom = dom.idom(block)?;
-        block = idom;
-        start = func.blocks[func.block_index(block)?].insns.len();
+
+        match insn.op {
+            // Nothing here reaches memory.
+            Opcode::Nop
+            | Opcode::Entry
+            | Opcode::Phi
+            | Opcode::PhiSource
+            | Opcode::Copy
+            | Opcode::SetVal
+            | Opcode::SymAddr
+            | Opcode::Select
+            | Opcode::Br
+            | Opcode::Cbr
+            | Opcode::Switch
+            | Opcode::IndirectBr
+            | Opcode::Ret
+            | Opcode::Unreachable
+            | Opcode::Load => false,
+
+            Opcode::Store => {
+                let s = am.location_of(func, insn);
+                may_alias(&s, loc, mi)
+            }
+
+            // The extent is in the operands; `insn.size` on these is the
+            // pointer's width, not the access's.
+            Opcode::Memset | Opcode::Memcpy | Opcode::Memmove => {
+                let dst = insn
+                    .src
+                    .first()
+                    .map(|a| am.resolve(func, *a, 0, 0, None))
+                    .unwrap_or_else(MemLoc::unknown);
+                may_alias(&dst, loc, mi)
+            }
+
+            // **The rule that closes `pure-1`**: a callee cannot write a
+            // local whose address never left this function, whatever it
+            // does. That needs nothing at all from the callee.
+            //
+            // What the callee's effect adds is the *global* case, which
+            // escape analysis can say nothing about: a `pure` or `const`
+            // function writes no memory the caller can observe, so a global
+            // survives across it too.
+            Opcode::Call => mi.call_effect(insn).may_write() && paths.esc.is_captured(&loc.base),
+
+            _ if !insn.op.may_access_memory() => false,
+
+            // `Asm`, `Fence`, `Alloca`, `StackSave`/`StackRestore`, the `Va*`
+            // family, every atomic, and anything unlisted. A `"memory"`
+            // clobber can name a frame slot without naming an operand --
+            // `asm("movl $1, -8(%rbp)")` is legal and reaches a local no
+            // analysis saw -- so being blunt here costs nothing and removes
+            // the class.
+            _ => true,
+        }
     }
-    None
+
+    /// Is every path from the definition to the load free of a write to
+    /// `loc`?
+    fn no_clobber_between(
+        &self,
+        paths: &Paths,
+        (bc, ic): (usize, usize),
+        (bl, il): (usize, usize),
+        loc: &MemLoc,
+    ) -> bool {
+        let func = self.func;
+        let def_block = func.blocks[bc].id;
+        let load_block = func.blocks[bl].id;
+
+        // Every block that can be entered on the way from the definition to
+        // the load: forward-reachable from the definition's block *and*
+        // backward-reachable from the load's.
+        //
+        // The intersection is what makes this right, not either half. A
+        // backward walk alone climbs past the definition -- fatally so when
+        // the two share a block, where it enumerates the whole function above
+        // them although none of it runs between the two points. A forward
+        // walk alone runs off down every path that never reaches the load.
+        let Some(fwd) = reachable(&paths.succs, def_block) else {
+            return false;
+        };
+        let Some(back) = reachable(&paths.preds, load_block) else {
+            return false;
+        };
+        let region: HashSet<BasicBlockId> = fwd.intersection(&back).copied().collect();
+
+        let scan = |bi: usize, from: usize, to: usize| -> bool {
+            for i in from..to {
+                let insn = &func.blocks[bi].insns[i];
+                if insn.op == Opcode::Nop {
+                    continue;
+                }
+                if self.writes(paths, insn, loc) {
+                    return false;
+                }
+            }
+            true
+        };
+
+        // A back edge can put the load's own block in the region, and then
+        // the instructions *after* the load run before the next execution
+        // of it.
+        let load_block_wraps = region.contains(&load_block);
+
+        if bc == bl {
+            let to = if load_block_wraps {
+                func.blocks[bl].insns.len()
+            } else {
+                il
+            };
+            let from = if load_block_wraps { 0 } else { ic + 1 };
+            if !scan(bl, from, to) {
+                return false;
+            }
+        } else {
+            if !scan(bc, ic + 1, func.blocks[bc].insns.len()) {
+                return false;
+            }
+            let (from, to) = if load_block_wraps {
+                (0, func.blocks[bl].insns.len())
+            } else {
+                (0, il)
+            };
+            if !scan(bl, from, to) {
+                return false;
+            }
+        }
+
+        for b in &region {
+            if *b == load_block {
+                continue;
+            }
+            let Some(bi) = func.block_index(*b) else {
+                return false;
+            };
+            if !scan(bi, 0, func.blocks[bi].insns.len()) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// A value the load can be rewritten to read, and how it has to be read.
@@ -200,10 +531,9 @@ struct Narrowing {
     typ: Option<TypeId>,
 }
 
-enum Candidate {
-    /// This instruction leaves the wanted value in a pseudo, reached either
-    /// directly or through a narrowing.
-    Value(Available),
+enum Candidate<T> {
+    /// This instruction says what the location holds.
+    Value(T),
     /// This instruction may write the location, so nothing before it counts.
     Clobber,
 }
@@ -219,7 +549,13 @@ enum Candidate {
 ///
 /// `None` refuses the forward; otherwise the answer says how to read the
 /// pseudo.
-fn narrowing(func: &Function, am: &AddrMap, v: PseudoId, size: u32) -> Option<Available> {
+fn narrowing(
+    func: &Function,
+    types: &TypeTable,
+    am: &AddrMap,
+    v: PseudoId,
+    size: u32,
+) -> Option<Available> {
     // A constant is width-polymorphic: it materializes at whatever width its
     // reader asks for, so it needs no narrowing -- but only where it means
     // one thing at that width, which is exactly what `unambiguous_at` asks.
@@ -229,142 +565,32 @@ fn narrowing(func: &Function, am: &AddrMap, v: PseudoId, size: u32) -> Option<Av
             narrow: None,
         });
     }
-    let (from, typ) = am.def_width(func, v)?;
+    let (from, typ) = am.value_width(func, types, v)?;
     Some(Available {
         value: v,
         narrow: (from > size).then_some(Narrowing { from, typ }),
     })
 }
 
-fn candidate(
-    func: &Function,
-    types: &TypeTable,
-    mi: &ModuleInfo,
-    esc: &EscapeInfo,
-    am: &AddrMap,
-    insn: &Instruction,
-    loc: &MemLoc,
-) -> Option<Candidate> {
-    match insn.op {
-        Opcode::Store => {
-            let s = am.location_of(func, insn);
-            if is_same_access(&s, loc, types) {
-                if let Some(v) = insn.src.get(1).copied() {
-                    // A store this pass cannot forward is still a store: it
-                    // has to stop the search, or the walk would run past it
-                    // to an older value.
-                    return Some(match narrowing(func, am, v, loc.size) {
-                        Some(a) => Candidate::Value(a),
-                        None => Candidate::Clobber,
-                    });
-                }
-            }
-            may_alias(&s, loc, mi).then_some(Candidate::Clobber)
-        }
-        Opcode::Load => {
-            let s = am.location_of(func, insn);
-            if is_same_access(&s, loc, types) {
-                // A load's target holds exactly the bytes that were read, so
-                // this one needs no narrowing.
-                return insn.target.map(|t| {
-                    Candidate::Value(Available {
-                        value: t,
-                        narrow: None,
-                    })
-                });
-            }
-            None
-        }
-        _ if writes(func, mi, esc, am, insn, loc) => Some(Candidate::Clobber),
-        _ => None,
+/// Which byte of the store `s` the one-byte access `b` is, counting from
+/// the store's lowest address; `None` unless `s` writes all of `b`.
+fn byte_index(s: &MemLoc, b: &MemLoc) -> Option<u32> {
+    if s.base == MemBase::Unknown || s.base != b.base || s.size == 0 || s.size % 8 != 0 {
+        return None;
     }
+    let at = b.offset?.checked_sub(s.offset?)?;
+    let at = u32::try_from(at).ok()?;
+    (at < s.size / 8).then_some(at)
 }
 
-/// Could `insn` write `loc`?
-///
-/// An allowlist read the safe way round: an opcode this does not recognize
-/// is assumed to write, so a new one is conservative by default. That is the
-/// same discipline `ifconv::is_speculatable` uses, and the reason
-/// `Instruction::is_memory_barrier` is not enough on its own -- it answers
-/// ordering, and omits `Store`, the mem intrinsics, the `Va*` family,
-/// `Alloca` and `StackSave` entirely.
-fn writes(
-    func: &Function,
-    mi: &ModuleInfo,
-    esc: &EscapeInfo,
-    am: &AddrMap,
-    insn: &Instruction,
-    loc: &MemLoc,
-) -> bool {
-    // A `Sym` target *is* storage, so an instruction that targets one writes
-    // the object it names -- a struct-returning call writes its receiving
-    // local this way, with no `Store` anywhere. The extent is left unknown
-    // because `insn.size` describes a register, not the aggregate.
-    if let Some(t) = insn.target {
-        if matches!(
-            func.get_pseudo(t).map(|p| &p.kind),
-            Some(super::PseudoKind::Sym(_))
-        ) && may_alias(&am.resolve(func, t, 0, 0, None), loc, mi)
-        {
-            return true;
-        }
+/// Byte `at`, counting from the lowest address, of the `width`-byte integer
+/// `c` as it lies in memory; `None` for a width no integer has.
+fn byte_of(c: i128, width: u32, at: u32, little_endian: bool) -> Option<u8> {
+    if width == 0 || width > 16 || at >= width {
+        return None;
     }
-
-    match insn.op {
-        // Nothing here reaches memory.
-        Opcode::Nop
-        | Opcode::Entry
-        | Opcode::Phi
-        | Opcode::PhiSource
-        | Opcode::Copy
-        | Opcode::SetVal
-        | Opcode::SymAddr
-        | Opcode::Select
-        | Opcode::Br
-        | Opcode::Cbr
-        | Opcode::Switch
-        | Opcode::IndirectBr
-        | Opcode::Ret
-        | Opcode::Unreachable
-        | Opcode::Load => false,
-
-        Opcode::Store => {
-            let s = am.location_of(func, insn);
-            may_alias(&s, loc, mi)
-        }
-
-        // The extent is in the operands; `insn.size` on these is the
-        // pointer's width, not the access's.
-        Opcode::Memset | Opcode::Memcpy | Opcode::Memmove => {
-            let dst = insn
-                .src
-                .first()
-                .map(|a| am.resolve(func, *a, 0, 0, None))
-                .unwrap_or_else(MemLoc::unknown);
-            may_alias(&dst, loc, mi)
-        }
-
-        // **The rule that closes `pure-1`**: a callee cannot write a local
-        // whose address never left this function, whatever it does. That
-        // needs nothing at all from the callee.
-        //
-        // What the callee's effect adds is the *global* case, which escape
-        // analysis can say nothing about: a `pure` or `const` function
-        // writes no memory the caller can observe, so a global survives
-        // across it too.
-        Opcode::Call => {
-            mi.call_effect(insn.func_name.as_deref()).may_write() && esc.is_captured(&loc.base)
-        }
-
-        _ if !insn.op.may_access_memory() => false,
-
-        // `Asm`, `Fence`, `Alloca`, `StackSave`/`StackRestore`, the `Va*`
-        // family, every atomic, and anything unlisted. A `"memory"` clobber
-        // can name a frame slot without naming an operand -- `asm("movl $1,
-        // -8(%rbp)")` is legal and reaches a local no analysis saw -- so
-        // being blunt here costs nothing and removes the class.
-        _ => true,
-    }
+    let shift = if little_endian { at } else { width - 1 - at };
+    Some((c >> (8 * shift)) as u8)
 }
 
 /// May this location be forwarded from at all?
@@ -391,95 +617,6 @@ fn forwardable(func: &Function, types: &TypeTable, mi: &ModuleInfo, loc: &MemLoc
             !g.is_volatile && !g.is_thread_local
         }
     }
-}
-
-/// Is every path from the definition to the load free of a write to `loc`?
-#[allow(clippy::too_many_arguments)]
-fn no_clobber_between(
-    func: &Function,
-    _types: &TypeTable,
-    mi: &ModuleInfo,
-    esc: &EscapeInfo,
-    am: &AddrMap,
-    preds: &HashMap<BasicBlockId, Vec<BasicBlockId>>,
-    succs: &HashMap<BasicBlockId, Vec<BasicBlockId>>,
-    (bc, ic): (usize, usize),
-    (bl, il): (usize, usize),
-    loc: &MemLoc,
-) -> bool {
-    let def_block = func.blocks[bc].id;
-    let load_block = func.blocks[bl].id;
-
-    // Every block that can be entered on the way from the definition to the
-    // load: forward-reachable from the definition's block *and*
-    // backward-reachable from the load's.
-    //
-    // The intersection is what makes this right, not either half. A backward
-    // walk alone climbs past the definition -- fatally so when the two share
-    // a block, where it enumerates the whole function above them although
-    // none of it runs between the two points. A forward walk alone runs off
-    // down every path that never reaches the load.
-    let Some(fwd) = reachable(succs, def_block) else {
-        return false;
-    };
-    let Some(back) = reachable(preds, load_block) else {
-        return false;
-    };
-    let region: HashSet<BasicBlockId> = fwd.intersection(&back).copied().collect();
-
-    let scan = |bi: usize, from: usize, to: usize| -> bool {
-        for i in from..to {
-            let insn = &func.blocks[bi].insns[i];
-            if insn.op == Opcode::Nop {
-                continue;
-            }
-            if writes(func, mi, esc, am, insn, loc) {
-                return false;
-            }
-        }
-        true
-    };
-
-    // A back edge can put the load's own block in the region, and then the
-    // instructions *after* the load run before the next execution of it.
-    let load_block_wraps = region.contains(&load_block);
-
-    if bc == bl {
-        let to = if load_block_wraps {
-            func.blocks[bl].insns.len()
-        } else {
-            il
-        };
-        let from = if load_block_wraps { 0 } else { ic + 1 };
-        if !scan(bl, from, to) {
-            return false;
-        }
-    } else {
-        if !scan(bc, ic + 1, func.blocks[bc].insns.len()) {
-            return false;
-        }
-        let (from, to) = if load_block_wraps {
-            (0, func.blocks[bl].insns.len())
-        } else {
-            (0, il)
-        };
-        if !scan(bl, from, to) {
-            return false;
-        }
-    }
-
-    for b in &region {
-        if *b == load_block {
-            continue;
-        }
-        let Some(bi) = func.block_index(*b) else {
-            return false;
-        };
-        if !scan(bi, 0, func.blocks[bi].insns.len()) {
-            return false;
-        }
-    }
-    true
 }
 
 /// Successors, as the exact inverse of the predecessor map, so the two can
@@ -612,6 +749,38 @@ mod tests {
         fn op(&self, b: usize, i: usize) -> Opcode {
             self.f.blocks[b].insns[i].op
         }
+
+        /// What `byte_at` answers for byte `at` of `@a.0` just before the
+        /// last instruction of block 0, in the byte order `little_endian`
+        /// says.
+        fn byte(&mut self, at: i64, little_endian: bool) -> Option<u8> {
+            self.f.entry = self.f.blocks[0].id;
+            self.f.rebuild_block_idx();
+            let mi = module_info(&self.types);
+            let am = AddrMap::build(&self.f);
+            let oracle = MemOracle::new(&self.f, &self.types, &mi, &am);
+            let loc = MemLoc {
+                base: MemBase::Local(PseudoId(0)),
+                offset: Some(at),
+                size: 8,
+                typ: Some(self.types.uchar_id),
+            };
+            let site = (0, self.f.blocks[0].insns.len() - 1);
+            oracle.byte_at(site, &loc, little_endian)
+        }
+
+        /// A constant pseudo holding `v`.
+        fn konst(&mut self, v: i128) -> PseudoId {
+            self.f.create_const_pseudo(v)
+        }
+    }
+
+    fn ret() -> Instruction {
+        Instruction::new(Opcode::Ret)
+    }
+
+    fn store8(v: PseudoId, at: i64, types: &TypeTable) -> Instruction {
+        Instruction::store(v, PseudoId(10), at, types.char_id, 8)
     }
 
     fn entry() -> Instruction {
@@ -887,6 +1056,79 @@ mod tests {
         assert_eq!(fwd.size, 8);
     }
 
+    /// A parameter's slot is filled from an `Arg`, which no instruction
+    /// defines. Its width is the type its parameter is passed as, so the
+    /// store supplies the load exactly as a block-scope local's does.
+    #[test]
+    fn loadfwd_forwards_an_incoming_argument() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        b.f.add_param("x", i32t);
+        b.f.add_pseudo(Pseudo::arg(PseudoId(30), 0));
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::store(PseudoId(30), PseudoId(0), 0, i32t, 32),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+            ],
+            vec![],
+        );
+        assert!(b.run());
+        assert_eq!(b.op(0, 3), Opcode::Copy);
+        assert_eq!(b.f.blocks[0].insns[3].src, vec![PseudoId(30)]);
+    }
+
+    /// An argument passed wider than the bytes stored -- an identifier-list
+    /// `char` arrives as an `int` -- reaches a narrower load through a
+    /// truncation from the width it was passed at.
+    #[test]
+    fn loadfwd_narrows_an_incoming_argument_passed_wider() {
+        let mut b = Build::new();
+        let (i32t, i8t) = (b.types.int_id, b.types.char_id);
+        b.f.add_param("c", i32t);
+        b.f.add_pseudo(Pseudo::arg(PseudoId(30), 0));
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                Instruction::store(PseudoId(30), PseudoId(10), 0, i8t, 8),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i8t, 8),
+            ],
+            vec![],
+        );
+        assert!(b.run());
+        let fwd = &b.f.blocks[0].insns[3];
+        assert_eq!(fwd.op, Opcode::Trunc);
+        assert_eq!(fwd.src_size, 32);
+    }
+
+    /// A complex or aggregate argument may be an address or the caller's
+    /// storage rather than a value of its type, so its width is no fact and
+    /// the store it feeds stops the search instead of supplying the load.
+    #[test]
+    fn loadfwd_refuses_a_complex_argument() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        let z = b.types.complex_double_id;
+        b.f.add_param("z", z);
+        b.f.add_pseudo(Pseudo::arg(PseudoId(30), 0));
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(30), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+            ],
+            vec![],
+        );
+        assert!(!b.run(), "neither the argument nor the older store");
+    }
+
     /// A value already at the access width needs no truncation.
     #[test]
     fn loadfwd_does_not_narrow_a_value_already_at_the_access_width() {
@@ -1078,5 +1320,137 @@ mod tests {
         );
         assert!(!b.run());
         assert_eq!(b.op(0, 4), Opcode::Load);
+    }
+
+    /// Each byte of a local is what the last store to it left, read one
+    /// byte at a time; a byte nothing stored is not known.
+    #[test]
+    fn oracle_reads_bytes_stored_one_at_a_time() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        let (x, y) = (b.konst(0x61), b.konst(0x62));
+        let insns = vec![
+            entry(),
+            Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+            store8(x, 0, &b.types),
+            store8(PseudoId(6), 1, &b.types),
+            store8(y, 1, &b.types),
+            ret(),
+        ];
+        b.block(0, insns, vec![]);
+        assert_eq!(b.byte(0, true), Some(0x61));
+        assert_eq!(b.byte(1, true), Some(0x62), "the later store wins");
+        assert_eq!(b.byte(2, true), None, "nothing stored byte 2");
+    }
+
+    /// A byte whose value is not a constant stops the reader at that byte,
+    /// and says nothing about its neighbours.
+    #[test]
+    fn oracle_refuses_a_byte_it_does_not_know() {
+        let mut b = Build::new();
+        let (i32t, i8t) = (b.types.int_id, b.types.char_id);
+        let x = b.konst(0x61);
+        b.f.add_param("c", i32t);
+        b.f.add_pseudo(Pseudo::arg(PseudoId(30), 0));
+        let insns = vec![
+            entry(),
+            Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+            store8(x, 0, &b.types),
+            Instruction::store(PseudoId(30), PseudoId(10), 1, i8t, 8),
+            ret(),
+        ];
+        b.block(0, insns, vec![]);
+        assert_eq!(b.byte(0, true), Some(0x61));
+        assert_eq!(b.byte(1, true), None);
+    }
+
+    /// A wider constant store supplies each byte it covers, in the order the
+    /// *target* lays an integer out -- asked both ways, whatever the host.
+    #[test]
+    fn oracle_extracts_a_byte_of_a_wider_store_by_target_byte_order() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        let w = b.konst(0x0403_0201);
+        let z = b.konst(9);
+        let insns = vec![
+            entry(),
+            Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+            Instruction::store(w, PseudoId(10), 0, i32t, 32),
+            store8(z, 1, &b.types),
+            ret(),
+        ];
+        b.block(0, insns, vec![]);
+        assert_eq!(b.byte(0, true), Some(1));
+        assert_eq!(b.byte(3, true), Some(4));
+        assert_eq!(b.byte(0, false), Some(4));
+        assert_eq!(b.byte(2, false), Some(2));
+        assert_eq!(b.byte(1, true), Some(9), "a later byte store overrides");
+        assert_eq!(b.byte(4, true), None, "past the wide store");
+    }
+
+    /// The byte a wider store holds, counting from its lowest address.
+    #[test]
+    fn oracle_byte_of_follows_the_order_asked() {
+        assert_eq!(byte_of(0x0102, 2, 0, true), Some(2));
+        assert_eq!(byte_of(0x0102, 2, 0, false), Some(1));
+        assert_eq!(byte_of(-1, 1, 0, true), Some(0xff));
+        assert_eq!(byte_of(-2, 8, 7, true), Some(0xff));
+        assert_eq!(byte_of(1, 2, 2, true), None, "outside the value");
+        assert_eq!(byte_of(1, 0, 0, true), None);
+    }
+
+    /// A store of anything but an integer constant -- a floating-point
+    /// value, or through a `volatile` type -- stops the search rather than
+    /// being read as bytes.
+    #[test]
+    fn oracle_refuses_a_volatile_or_floating_store() {
+        for which in ["volatile", "float"] {
+            let mut b = Build::new();
+            let i32t = b.types.int_id;
+            let typ = if which == "volatile" {
+                b.types.intern(crate::types::Type::with_modifiers(
+                    crate::types::TypeKind::Char,
+                    TypeModifiers::VOLATILE,
+                ))
+            } else {
+                b.types.float_id
+            };
+            let (x, y) = (b.konst(0x61), b.konst(0x62));
+            let size = b.types.size_bits(typ);
+            let insns = vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                store8(x, 0, &b.types),
+                Instruction::store(y, PseudoId(10), 0, typ, size),
+                ret(),
+            ];
+            b.block(0, insns, vec![]);
+            assert_eq!(b.byte(0, true), None, "{which}");
+        }
+    }
+
+    /// Once the local's address has been handed to a callee, a call that
+    /// may write stops the walk -- unless it is one of the library's
+    /// functions that only read.
+    #[test]
+    fn oracle_crosses_only_a_reading_library_call_of_a_captured_local() {
+        for known in [None, Some(crate::parse::ast::LibFn::Strlen)] {
+            let mut b = Build::new();
+            let i32t = b.types.int_id;
+            let x = b.konst(0x61);
+            let ptr = b.types.char_ptr_id;
+            let mut c = Instruction::call(None, "strlen", vec![PseudoId(10)], vec![ptr], i32t, 32);
+            c.known = known;
+            let insns = vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                store8(x, 0, &b.types),
+                c,
+                ret(),
+            ];
+            b.block(0, insns, vec![]);
+            let want = known.map(|_| 0x61);
+            assert_eq!(b.byte(0, true), want, "{known:?}");
+        }
     }
 }

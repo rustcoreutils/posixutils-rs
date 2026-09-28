@@ -11,12 +11,13 @@
 //
 
 use super::ast::{
-    BinaryOp, CalleeBinding, CheckedOp, Expr, ExprKind, FpCompare, FpTest, GnuAtomicOp,
+    BinaryOp, CalleeBinding, CheckedOp, Expr, ExprKind, FpCompare, FpTest, GnuAtomicOp, LibFn,
     OffsetOfPath, UnaryOp,
 };
+use super::library_builtin::LibraryBuiltin;
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
-use crate::float::FloatVal;
+use crate::float::{FloatVal, NanKind};
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
 use crate::token::lexer::Position;
@@ -127,13 +128,20 @@ impl Parser<'_> {
     /// and gcc accepts that. `setjmp` and `longjmp` are the exception, and
     /// only against a *function* declaration: `<setjmp.h>` declares exactly
     /// those, and they need code generation an ordinary call cannot produce.
+    /// The library builtins (`abs`, `fabs`, `floor`, ...) survive a function
+    /// declaration only if it is compatible with the prototype their table
+    /// gives (see `library_prototype_matches`), and the functions gcc expands
+    /// late (`sqrt`, `floor`, `memcpy`, ...) not a definition of the function
+    /// at all.
     ///
     /// The reserved spellings (`__builtin_*`, `_Alignof`, `__alignof__`) are
     /// never displaced: C17 7.1.3 reserves them to the implementation in every
     /// scope, so a program that declares one has no claim on the name.
     pub(super) fn builtin_is_shadowed(&self, name_id: StringId) -> bool {
         let shadowed_by_any_decl = matches!(name_id, crate::kw::OFFSETOF | crate::kw::ALIGNOF_C23);
+        let library = LibraryBuiltin::by_bare_name(name_id);
         let shadowable = shadowed_by_any_decl
+            || library.is_some()
             || matches!(
                 name_id,
                 crate::kw::SETJMP
@@ -141,15 +149,6 @@ impl Parser<'_> {
                     | crate::kw::LONGJMP
                     | crate::kw::LONGJMP2
                     | crate::kw::ALLOCA
-                    | crate::kw::FABS
-                    | crate::kw::FABSF
-                    | crate::kw::FABSL
-                    | crate::kw::FLOOR
-                    | crate::kw::CEIL
-                    | crate::kw::TRUNC
-                    | crate::kw::ROUND
-                    | crate::kw::RINT
-                    | crate::kw::NEARBYINT
             );
         if !shadowable {
             return false;
@@ -166,12 +165,19 @@ impl Parser<'_> {
                 return true;
             }
         }
+        // A definition in this translation unit is the function called; one
+        // further down is found by the linearizer instead.
+        if library.is_some_and(|lb| lb.is_displaced(&self.defined_functions)) {
+            return true;
+        }
 
         let Some(symbol_id) = self.symbols.lookup_id(name_id, Namespace::Ordinary) else {
             return false;
         };
+        let typ = self.symbols.get(symbol_id).typ;
         shadowed_by_any_decl
-            || self.types.kind(self.symbols.get(symbol_id).typ) != TypeKind::Function
+            || self.types.kind(typ) != TypeKind::Function
+            || library.is_some_and(|lb| !self.library_prototype_matches(lb, typ))
     }
 
     /// Try to parse a builtin function expression.
@@ -211,38 +217,6 @@ impl Parser<'_> {
                     level.pos,
                 )
             })
-    }
-
-    /// `fabs(x)` / `fabsf(x)`, whose opcode reads its operand at a fixed
-    /// width, so the argument has to arrive already converted.
-    ///
-    /// `fabs(-3)` is a well-formed call under the prototype the standard
-    /// gives it -- and under the `extern double fabs(double);` a program
-    /// writes for itself -- but the opcode is an SSE instruction that masks
-    /// the sign bit, so an unconverted `int` operand is read as a `double`
-    /// bit pattern and the answer is nonsense.
-    fn parse_fabs(
-        &mut self,
-        token_pos: Position,
-        typ: TypeId,
-        kind: fn(Box<Expr>) -> ExprKind,
-    ) -> ParseResult<Expr> {
-        self.expect_special(b'(')?;
-        let arg = self.parse_assignment_expr()?;
-        self.expect_special(b')')?;
-        let arg = if arg.typ == Some(typ) {
-            arg
-        } else {
-            Self::typed_expr(
-                ExprKind::Cast {
-                    cast_type: typ,
-                    expr: Box::new(arg),
-                },
-                typ,
-                token_pos,
-            )
-        };
-        Ok(Self::typed_expr(kind(Box::new(arg)), typ, token_pos))
     }
 
     /// One of the C99 7.12.14 relations: `__builtin_isgreater` and its five
@@ -291,8 +265,8 @@ impl Parser<'_> {
             _ => self.types.double_id,
         };
 
-        let lhs = self.converted_to(lhs, common, token_pos);
-        let rhs = self.converted_to(rhs, common, token_pos);
+        let lhs = self.convert_operand(lhs, common);
+        let rhs = self.convert_operand(rhs, common);
         Ok(Self::typed_expr(
             ExprKind::FpCompare {
                 cmp,
@@ -313,67 +287,6 @@ impl Parser<'_> {
         let real =
             |id| !t.is_complex(id) && !t.is_vector(id) && (t.is_integer(id) || t.is_float(id));
         real(l) && real(r) && (t.is_float(l) || t.is_float(r))
-    }
-
-    /// `expr` as `typ`, adding a cast only when one is needed.
-    fn converted_to(&mut self, expr: Expr, typ: TypeId, pos: Position) -> Expr {
-        if expr.typ == Some(typ) {
-            return expr;
-        }
-        Self::typed_expr(
-            ExprKind::Cast {
-                cast_type: typ,
-                expr: Box::new(expr),
-            },
-            typ,
-            pos,
-        )
-    }
-
-    /// A libm call that narrows to its `float` form when its argument is one.
-    ///
-    /// `(float)floor((double)x)` is `floorf(x)` exactly: the result is an
-    /// integer no greater in magnitude than `x`, so a value representable as
-    /// a `float` stays representable, and converting it up to `double` and
-    /// back changes nothing. The condition is on the **argument** type and
-    /// not the result -- `double q(float a) { return floor(a); }` narrows
-    /// too, because the narrowing happens before the widening.
-    ///
-    /// Only the exactly-rounding functions qualify, which is why the set is
-    /// enumerated rather than derived. `sin` and `log` are not among them:
-    /// `sinf(x)` and `(float)sin((double)x)` differ in the last bit for some
-    /// `x`, and narrowing one is a wrong answer rather than a faster one.
-    fn narrowing_libm_call(
-        &mut self,
-        wide: &str,
-        narrow: &str,
-        arg: Expr,
-        pos: Position,
-    ) -> ParseResult<Expr> {
-        let is_float = arg
-            .typ
-            .and_then(|t| self.types.fp_format(t))
-            .is_some_and(|fmt| fmt == crate::float::FpFormat::Binary32);
-        Ok(if is_float {
-            let f = self.types.float_id;
-            self.libm_call(narrow, f, &[f], arg, pos)
-        } else {
-            let d = self.types.double_id;
-            self.libm_call(wide, d, &[d], arg, pos)
-        })
-    }
-
-    /// `fabsl(x)`, lowered as an ordinary call to `fabsl` rather than as an
-    /// opcode: the `Fabs64` opcode moves its argument as a `double`, so on
-    /// x86-64 it would read only the low eight bytes of an 80-bit x87 value.
-    /// A real call gets the long-double ABI from the call path, which already
-    /// carries one for `__mulxc3`.
-    fn parse_fabsl(&mut self, token_pos: Position) -> ParseResult<Expr> {
-        self.expect_special(b'(')?;
-        let arg = self.parse_assignment_expr()?;
-        self.expect_special(b')')?;
-        let ld = self.types.longdouble_id;
-        Ok(self.libm_call("fabsl", ld, &[ld], arg, token_pos))
     }
 
     /// `__builtin_va_*`: the variadic-argument builtins, plus `_Generic`.
@@ -713,7 +626,11 @@ impl Parser<'_> {
                     _ => ExprKind::Popcountll { arg: Box::new(arg) },
                 };
                 let count = Self::typed_expr(kind, self.types.int_id, token_pos);
-                let one = Self::typed_expr(ExprKind::IntLit(1), self.types.int_id, token_pos);
+                let one = Self::typed_expr(
+                    ExprKind::IntLit(crate::target::ATOMIC_TEST_AND_SET_TRUEVAL),
+                    self.types.int_id,
+                    token_pos,
+                );
                 Ok(Self::typed_expr(
                     ExprKind::Binary {
                         op: BinaryOp::BitAnd,
@@ -758,7 +675,7 @@ impl Parser<'_> {
         }
     }
 
-    /// `alloca` and the `mem*` builtins, which lower to library calls.
+    /// `alloca`, bare or reserved.
     fn parse_memory_builtin(
         &mut self,
         name_id: StringId,
@@ -778,65 +695,6 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
-            // Memory builtins - generate calls to C library functions
-            crate::kw::BUILTIN_MEMSET => Some((|| {
-                // __builtin_memset(dest, c, n) - returns void*
-                self.expect_special(b'(')?;
-                let dest = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let c = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let n = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Memset {
-                        dest: Box::new(dest),
-                        c: Box::new(c),
-                        n: Box::new(n),
-                    },
-                    self.types.void_ptr_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_MEMCPY => Some((|| {
-                // __builtin_memcpy(dest, src, n) - returns void*
-                self.expect_special(b'(')?;
-                let dest = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let src = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let n = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Memcpy {
-                        dest: Box::new(dest),
-                        src: Box::new(src),
-                        n: Box::new(n),
-                    },
-                    self.types.void_ptr_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_MEMMOVE => Some((|| {
-                // __builtin_memmove(dest, src, n) - returns void*
-                self.expect_special(b'(')?;
-                let dest = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let src = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let n = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Memmove {
-                        dest: Box::new(dest),
-                        src: Box::new(src),
-                        n: Box::new(n),
-                    },
-                    self.types.void_ptr_id,
-                    token_pos,
-                ))
-            })()),
-            // Infinity builtins - return float constants
             _ => None,
         }
     }
@@ -847,73 +705,13 @@ impl Parser<'_> {
         name_id: StringId,
         token_pos: Position,
     ) -> Option<ParseResult<Expr>> {
-        // A plain spelling is recognized only where it is being *called*.
-        // `double (*p)(double) = fabs;` names the library function, and an
-        // arm that ran here would report a missing `(` rather than letting
-        // the identifier reach the ordinary path. The `__builtin_` spellings
-        // need no such guard: they are not objects, so demanding the `(` is
-        // the right diagnostic for them.
-        let called = self.is_special(b'(');
+        if let Some(&(_, value, suffix)) = FLOAT_CONSTANT_BUILTINS
+            .iter()
+            .find(|(id, _, _)| *id == name_id)
+        {
+            return Some(self.parse_float_constant_builtin(name_id, value, suffix, token_pos));
+        }
         match name_id {
-            crate::kw::BUILTIN_INF | crate::kw::BUILTIN_HUGE_VAL => Some((|| {
-                self.expect_special(b'(')?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::FloatLit(FloatVal::infinity(false)),
-                    self.types.double_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_INFF | crate::kw::BUILTIN_HUGE_VALF => Some((|| {
-                self.expect_special(b'(')?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::FloatLit(FloatVal::infinity(false)),
-                    self.types.float_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_INFL | crate::kw::BUILTIN_HUGE_VALL => Some((|| {
-                self.expect_special(b'(')?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::FloatLit(FloatVal::infinity(false)),
-                    self.types.longdouble_id,
-                    token_pos,
-                ))
-            })()),
-            // NaN builtins - returns quiet NaN
-            // The string argument is typically empty "" for quiet NaN
-            crate::kw::BUILTIN_NAN | crate::kw::BUILTIN_NANS => Some((|| {
-                self.expect_special(b'(')?;
-                let _arg = self.parse_assignment_expr()?; // string argument (ignored)
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::FloatLit(FloatVal::nan()),
-                    self.types.double_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_NANF | crate::kw::BUILTIN_NANSF => Some((|| {
-                self.expect_special(b'(')?;
-                let _arg = self.parse_assignment_expr()?; // string argument (ignored)
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::FloatLit(FloatVal::nan()),
-                    self.types.float_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_NANL | crate::kw::BUILTIN_NANSL => Some((|| {
-                self.expect_special(b'(')?;
-                let _arg = self.parse_assignment_expr()?; // string argument (ignored)
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::FloatLit(FloatVal::nan()),
-                    self.types.longdouble_id,
-                    token_pos,
-                ))
-            })()),
             // FLT_ROUNDS - returns current rounding mode (1 = to nearest)
             crate::kw::BUILTIN_FLT_ROUNDS => Some((|| {
                 self.expect_special(b'(')?;
@@ -924,55 +722,6 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
-            // Fabs builtins - absolute value for floats
-            crate::kw::BUILTIN_FABS => Some(self.parse_fabs(
-                token_pos,
-                self.types.double_id,
-                |arg| ExprKind::Fabs { arg },
-            )),
-            crate::kw::FABS if called => Some(self.parse_fabs(
-                token_pos,
-                self.types.double_id,
-                |arg| ExprKind::Fabs { arg },
-            )),
-
-            crate::kw::BUILTIN_FABSF => Some(self.parse_fabs(
-                token_pos,
-                self.types.float_id,
-                |arg| ExprKind::Fabsf { arg },
-            )),
-            crate::kw::FABSF if called => Some(self.parse_fabs(
-                token_pos,
-                self.types.float_id,
-                |arg| ExprKind::Fabsf { arg },
-            )),
-
-            crate::kw::BUILTIN_FABSL => Some(self.parse_fabsl(token_pos)),
-            crate::kw::FABSL if called => Some(self.parse_fabsl(token_pos)),
-
-            crate::kw::FLOOR
-            | crate::kw::CEIL
-            | crate::kw::TRUNC
-            | crate::kw::ROUND
-            | crate::kw::RINT
-            | crate::kw::NEARBYINT
-                if called =>
-            {
-                let (wide, narrow) = match name_id {
-                    crate::kw::FLOOR => ("floor", "floorf"),
-                    crate::kw::CEIL => ("ceil", "ceilf"),
-                    crate::kw::TRUNC => ("trunc", "truncf"),
-                    crate::kw::ROUND => ("round", "roundf"),
-                    crate::kw::RINT => ("rint", "rintf"),
-                    _ => ("nearbyint", "nearbyintf"),
-                };
-                Some((|| {
-                    self.expect_special(b'(')?;
-                    let arg = self.parse_assignment_expr()?;
-                    self.expect_special(b')')?;
-                    self.narrowing_libm_call(wide, narrow, arg, token_pos)
-                })())
-            }
             // Signbit builtins - test sign bit of floats
             crate::kw::BUILTIN_ISNAN
             | crate::kw::BUILTIN_ISNANF
@@ -1064,103 +813,19 @@ impl Parser<'_> {
                 self.expect_special(b')')?;
                 Ok(self.type_generic_signbit(arg, token_pos))
             })()),
-            crate::kw::BUILTIN_SIGNBITF => Some((|| {
+            // gcc gives the suffixed spellings a prototype, `int (float)` and
+            // `int (long double)`, so the argument converts to it.
+            crate::kw::BUILTIN_SIGNBITF | crate::kw::BUILTIN_SIGNBITL => Some((|| {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                let raw = Self::typed_expr(
-                    ExprKind::Signbitf { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                );
-                Ok(self.normalise_predicate(raw, token_pos))
+                let typ = if name_id == crate::kw::BUILTIN_SIGNBITF {
+                    self.types.float_id
+                } else {
+                    self.types.longdouble_id
+                };
+                Ok(self.signbit_at(arg, typ, token_pos))
             })()),
-            crate::kw::BUILTIN_SIGNBITL => Some((|| {
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(self.signbit_long_double(arg, token_pos))
-            })()),
-            crate::kw::BUILTIN_CREAL
-            | crate::kw::BUILTIN_CREALF
-            | crate::kw::BUILTIN_CREALL
-            | crate::kw::BUILTIN_CIMAG
-            | crate::kw::BUILTIN_CIMAGF
-            | crate::kw::BUILTIN_CIMAGL => Some((|| {
-                // `creal`/`cimag` name the halves `__real__` and `__imag__`
-                // already reach, so they lower to those rather than to a
-                // library call. The suffix is not consulted: the operand's own
-                // type gives the precision, and a mismatch there would be the
-                // caller's bug, not something the spelling can fix.
-                let op = matches!(
-                    name_id,
-                    crate::kw::BUILTIN_CREAL
-                        | crate::kw::BUILTIN_CREALF
-                        | crate::kw::BUILTIN_CREALL
-                )
-                .then_some(UnaryOp::Real)
-                .unwrap_or(UnaryOp::Imag);
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                let arg_typ = arg.typ.unwrap_or(self.types.double_id);
-                let base = self.types.complex_base(arg_typ);
-                Ok(Self::typed_expr(
-                    ExprKind::Unary {
-                        op,
-                        operand: Box::new(arg),
-                    },
-                    base,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_CONJ | crate::kw::BUILTIN_CONJF | crate::kw::BUILTIN_CONJL => {
-                Some((|| {
-                    // conj(z) is z with the sign of its imaginary part flipped.
-                    // Built from `__builtin_complex(__real__ z, -__imag__ z)`
-                    // rather than a libm call: every piece already exists, and
-                    // negating the imaginary half is exact at every precision,
-                    // where a call would need -lm for nothing.
-                    self.expect_special(b'(')?;
-                    let arg = self.parse_assignment_expr()?;
-                    self.expect_special(b')')?;
-                    let arg_typ = arg.typ.unwrap_or(self.types.double_id);
-                    let base = self.types.complex_base(arg_typ);
-                    let complex_typ = self.types.make_complex(base);
-                    let real = Self::typed_expr(
-                        ExprKind::Unary {
-                            op: UnaryOp::Real,
-                            operand: Box::new(arg.clone()),
-                        },
-                        base,
-                        token_pos,
-                    );
-                    let imag = Self::typed_expr(
-                        ExprKind::Unary {
-                            op: UnaryOp::Imag,
-                            operand: Box::new(arg),
-                        },
-                        base,
-                        token_pos,
-                    );
-                    let neg_imag = Self::typed_expr(
-                        ExprKind::Unary {
-                            op: UnaryOp::Neg,
-                            operand: Box::new(imag),
-                        },
-                        base,
-                        token_pos,
-                    );
-                    Ok(Self::typed_expr(
-                        ExprKind::BuiltinComplex {
-                            real: Box::new(real),
-                            imag: Box::new(neg_imag),
-                        },
-                        complex_typ,
-                        token_pos,
-                    ))
-                })())
-            }
             crate::kw::BUILTIN_COMPLEX => Some((|| {
                 // __builtin_complex(real, imag) - construct complex value
                 self.expect_special(b'(')?;
@@ -1215,16 +880,26 @@ impl Parser<'_> {
                 // expression only as the operand of a cast, so the floating
                 // fold has to be asked as well.
                 let is_constant = self.eval_const_expr(&arg).is_some()
-                    || self
-                        .eval_const_f64(crate::constexpr::ConstScope::Standard, &arg)
-                        .is_some();
+                    || crate::constexpr::eval_float(
+                        self,
+                        crate::constexpr::ConstScope::Standard,
+                        &arg,
+                    )
+                    .is_some();
                 // Answering 1 here is final -- nothing later makes a constant
                 // unconstant. Answering 0 is not: gcc decides this *after*
                 // optimization, so `int x = 42; __builtin_constant_p(x)` is 1
                 // at `-O1` and above, and only propagation knows. What the
                 // parser cannot fold is deferred rather than refused.
+                //
+                // At `-O0` there is no optimization to wait for, and gcc
+                // answers 0 on the spot: the answer is then a constant, and
+                // `if (__builtin_constant_p(n))` drops its arm as any other
+                // constant condition does (gcc.c-torture 20030330-1).
                 let kind = if is_constant {
                     ExprKind::IntLit(1)
+                } else if !self.library_call_policy.optimizing {
+                    ExprKind::IntLit(0)
                 } else {
                     ExprKind::ConstantP(Box::new(arg))
                 };
@@ -1311,6 +986,7 @@ impl Parser<'_> {
                         func: Box::new(Self::typed_expr(ExprKind::Ident(sym), void_id, token_pos)),
                         args: vec![begin, end],
                         binding: CalleeBinding::Library,
+                        known: None,
                     },
                     void_id,
                     token_pos,
@@ -2040,7 +1716,8 @@ impl Parser<'_> {
                 self.expect_special(b')')?;
                 let lock_free = self
                     .eval_const_expr(&size)
-                    .is_some_and(|n| matches!(n, 1 | 2 | 4 | 8));
+                    .and_then(|n| u64::try_from(n).ok())
+                    .is_some_and(crate::target::atomic_is_lock_free);
                 Ok(Self::typed_expr(
                     ExprKind::IntLit(i64::from(lock_free)),
                     self.types.bool_id,
@@ -2081,6 +1758,7 @@ impl Parser<'_> {
                 func: Box::new(Self::typed_expr(ExprKind::Ident(sym), ret, pos)),
                 args: Vec::new(),
                 binding: CalleeBinding::Declared,
+                known: None,
             },
             ret,
             pos,
@@ -2104,8 +1782,8 @@ impl Parser<'_> {
             .unwrap_or(name);
         match stem {
             "fma" => 3,
-            "copysign" | "fmax" | "fmin" | "pow" | "fmod" | "atan2" | "hypot" | "fdim"
-            | "remainder" | "nextafter" | "modf" | "frexp" | "ldexp" => 2,
+            "fmax" | "fmin" | "pow" | "fmod" | "atan2" | "hypot" | "fdim" | "remainder"
+            | "nextafter" | "modf" | "frexp" | "ldexp" => 2,
             _ => 1,
         }
     }
@@ -2152,7 +1830,6 @@ impl Parser<'_> {
             "erfc",
         ];
         const BINARY: &[&str] = &[
-            "copysign",
             "fmax",
             "fmin",
             "pow",
@@ -2331,6 +2008,81 @@ impl Parser<'_> {
         }
     }
 
+    /// The floating type `suffix` names, or `None` where the target has no
+    /// such type: `_Float128` is `__float128`, which macOS lacks.
+    fn float_suffix_type(&self, suffix: FloatSuffix) -> Option<TypeId> {
+        let t = &self.types;
+        Some(match suffix {
+            FloatSuffix::Double | FloatSuffix::F64 => t.double_id,
+            FloatSuffix::Float | FloatSuffix::F32 => t.float_id,
+            FloatSuffix::LongDouble => t.longdouble_id,
+            FloatSuffix::F16 => t.float16_id,
+            FloatSuffix::F128 if t.has_float128() => t.float128_id,
+            FloatSuffix::F128 => return None,
+        })
+    }
+
+    /// An infinity or NaN builtin ([`FLOAT_CONSTANT_BUILTINS`]): a constant
+    /// of the type its suffix names.
+    ///
+    /// A NaN's string argument, when it is a literal that parses as gcc
+    /// parses it (see [`nan_payload`]), is the payload -- quiet for `nan`,
+    /// signalling for `nans`. Anything else is not folded, which is gcc's
+    /// behaviour too: the `nan` forms become a call to the library function
+    /// of the same name (`nanf16` and so on), which reads the string at run
+    /// time, and the `nans` forms, which have no library function, are an
+    /// error here where gcc's is a link failure.
+    fn parse_float_constant_builtin(
+        &mut self,
+        name_id: StringId,
+        value: FloatConstant,
+        suffix: FloatSuffix,
+        token_pos: Position,
+    ) -> ParseResult<Expr> {
+        let call_pos = self.current_pos();
+        self.expect_special(b'(')?;
+        let arg = match value {
+            FloatConstant::Infinity => None,
+            FloatConstant::Nan(_) => Some(self.parse_assignment_expr()?),
+        };
+        self.expect_special(b')')?;
+
+        let Some(typ) = self.float_suffix_type(suffix) else {
+            let name = self.idents.get(name_id).to_string();
+            return Err(ParseError::new(
+                format!("'{name}' is not supported on this target"),
+                token_pos,
+            ));
+        };
+        let fmt = self
+            .types
+            .fp_format(typ)
+            .expect("a floating constant builtin's type is a floating type");
+        let constant = |v| Ok(Self::typed_expr(ExprKind::FloatLit(v), typ, token_pos));
+        let (FloatConstant::Nan(kind), Some(arg)) = (value, arg) else {
+            return constant(FloatVal::infinity(false));
+        };
+        let payload = match &arg.kind {
+            ExprKind::StringLit(s) => nan_payload(crate::token::lexer::payload_bytes(s)),
+            _ => None,
+        };
+        match (payload, kind) {
+            (Some(payload), _) => constant(FloatVal::nan_with_payload(fmt, payload, kind)),
+            (None, NanKind::Quiet) => {
+                let library = suffix.nan_library_function();
+                Ok(self.call_library_function(&library, vec![arg], call_pos, token_pos))
+            }
+            (None, NanKind::Signalling) => {
+                diag::error_args(
+                    arg.pos,
+                    "the argument of '__builtin_nans{0}' is not a string literal naming a NaN payload",
+                    &[suffix.text()],
+                );
+                constant(FloatVal::nan())
+            }
+        }
+    }
+
     /// A builtin that is nothing but the library function under a
     /// reserved name, including the fortified `__builtin___*_chk`
     /// family.  These ride a de-prefixing path rather than getting an
@@ -2370,73 +2122,110 @@ impl Parser<'_> {
                     _ => &name_str["__builtin_".len()..],
                 };
                 // Parse arguments first (must consume tokens regardless)
+                let call_pos = self.current_pos();
                 self.expect_special(b'(')?;
-                let mut args = Vec::new();
-                if !self.is_special(b')') {
-                    args.push(self.parse_assignment_expr()?);
-                    while self.is_special(b',') {
-                        self.advance();
-                        args.push(self.parse_assignment_expr()?);
-                    }
-                }
+                let args = self.parse_argument_list()?;
                 self.expect_special(b')')?;
-                // Look up the real function by its de-prefixed name
-                let real_name_id = self.idents.lookup(real_name);
-                let symbol_id = real_name_id.and_then(|id| {
-                    self.symbols
-                        .lookup_id(id, crate::symbol::Namespace::Ordinary)
-                });
-                if let Some(symbol_id) = symbol_id {
-                    let func_type = self.symbols.get(symbol_id).typ;
-                    let ret_type = self.types.base_type(func_type).unwrap_or(self.types.int_id);
-                    let func_expr =
-                        Self::typed_expr(ExprKind::Ident(symbol_id), func_type, token_pos);
-                    return Ok(Self::typed_expr(
-                        ExprKind::Call {
-                            func: Box::new(func_expr),
-                            args,
-                            binding: CalleeBinding::Library,
-                        },
-                        ret_type,
-                        token_pos,
-                    ));
-                }
-                // Not declared. gcc knows these intrinsically and
-                // glibc relies on that: `bits/string_fortified.h`
-                // calls `__builtin___memcpy_chk` without ever
-                // declaring `__memcpy_chk`. Synthesize the
-                // declaration rather than failing.
-                if let Some(symbol_id) = self
-                    .chk_builtin_return_type(real_name)
-                    .and_then(|ret| self.declare_chk_builtin(real_name, ret))
-                {
-                    let ret_type = self
-                        .types
-                        .base_type(self.symbols.get(symbol_id).typ)
-                        .unwrap_or(self.types.int_id);
-                    let func_type = self.symbols.get(symbol_id).typ;
-                    let func_expr =
-                        Self::typed_expr(ExprKind::Ident(symbol_id), func_type, token_pos);
-                    return Ok(Self::typed_expr(
-                        ExprKind::Call {
-                            func: Box::new(func_expr),
-                            args,
-                            binding: CalleeBinding::Library,
-                        },
-                        ret_type,
-                        token_pos,
-                    ));
-                }
-                diag::error_args(token_pos, "undeclared function '{0}'", &[real_name]);
-                Ok(Self::typed_expr(
-                    ExprKind::IntLit(0),
-                    self.types.int_id,
-                    token_pos,
-                ))
+                Ok(self.call_library_function(real_name, args, call_pos, token_pos))
             })())
         } else {
             None
         }
+    }
+
+    /// A call to the library function `real_name` with `args`, for a builtin
+    /// that stands for it.
+    fn call_library_function(
+        &mut self,
+        real_name: &str,
+        args: Vec<Expr>,
+        call_pos: Position,
+        token_pos: Position,
+    ) -> Expr {
+        // Look up the real function by its name. A declaration in scope is
+        // checked against exactly as an ordinary call to it would be.
+        let real_name_id = self.idents.lookup(real_name);
+        let row = real_name_id.and_then(LibraryBuiltin::by_bare_name);
+        let symbol_id = real_name_id.and_then(|id| {
+            self.symbols
+                .lookup_id(id, crate::symbol::Namespace::Ordinary)
+        });
+        if let Some(symbol_id) = symbol_id {
+            let func_expr = self.library_callee(symbol_id, token_pos);
+            let placeholder = self.placeholder_prototypes.contains(&symbol_id);
+            if !placeholder {
+                let func_type = self.resolved_function_type(&func_expr);
+                self.check_call(func_type, &args, call_pos);
+            }
+            // The reserved spelling means the library function whatever the
+            // program says about its bare name -- unless what it declared is
+            // a different function altogether, whose arguments a fold would
+            // misread.
+            let typ = self.symbols.get(symbol_id).typ;
+            let known = row
+                .filter(|lb| placeholder || self.library_prototype_matches(lb, typ))
+                .and_then(LibraryBuiltin::called);
+            return self.library_call(func_expr, args, known, token_pos);
+        }
+        // Not declared. gcc knows these intrinsically, and a program may
+        // call `__builtin_puts` without `<stdio.h>`. A function the table
+        // knows is declared with its own prototype, and its arguments are
+        // checked against it.
+        if let Some(lb) = row.filter(|lb| lb.called().is_some()) {
+            if let Some(symbol_id) = self.declare_known_library_function(lb) {
+                let func_expr = self.library_callee(symbol_id, token_pos);
+                let func_type = self.resolved_function_type(&func_expr);
+                self.check_call(func_type, &args, call_pos);
+                return self.library_call(func_expr, args, lb.called(), token_pos);
+            }
+        }
+        // glibc relies on the same: `bits/string_fortified.h` calls
+        // `__builtin___memcpy_chk` without ever declaring `__memcpy_chk`.
+        // Synthesize the declaration rather than failing. Its parameter types
+        // are placeholders (see `declare_chk_builtin`), so the arguments are
+        // not checked against them -- here or at a later call that finds it
+        // in scope.
+        if let Some(symbol_id) = self
+            .chk_builtin_return_type(real_name)
+            .and_then(|ret| self.declare_chk_builtin(real_name, ret))
+        {
+            let func_expr = self.library_callee(symbol_id, token_pos);
+            return self.library_call(func_expr, args, None, token_pos);
+        }
+        diag::error_args(token_pos, "undeclared function '{0}'", &[real_name]);
+        Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, token_pos)
+    }
+
+    /// A function designator for `symbol_id`, typed with its declared type.
+    fn library_callee(&self, symbol_id: SymbolId, pos: Position) -> Expr {
+        let func_type = self.symbols.get(symbol_id).typ;
+        Self::typed_expr(ExprKind::Ident(symbol_id), func_type, pos)
+    }
+
+    /// A call through `func` that reaches the library's function, never an
+    /// inline definition of the same name (see `CalleeBinding::Library`),
+    /// and is `known` to call that library function.
+    fn library_call(
+        &self,
+        func: Expr,
+        args: Vec<Expr>,
+        known: Option<LibFn>,
+        pos: Position,
+    ) -> Expr {
+        let ret_type = func
+            .typ
+            .and_then(|t| self.types.base_type(t))
+            .unwrap_or(self.types.int_id);
+        self.fold_zero_length_compare(Self::typed_expr(
+            ExprKind::Call {
+                func: Box::new(func),
+                args,
+                binding: CalleeBinding::Library,
+                known,
+            },
+            ret_type,
+            pos,
+        ))
     }
 
     pub(super) fn parse_builtin_expr(
@@ -2445,6 +2234,9 @@ impl Parser<'_> {
         token_pos: Position,
     ) -> Option<ParseResult<Expr>> {
         // Each family answers `None` for a name it does not own.
+        if let Some(result) = self.parse_library_builtin_call(name_id, token_pos) {
+            return Some(result);
+        }
         if let Some(result) = self.parse_varargs_builtin(name_id, token_pos) {
             return Some(result);
         }
@@ -2602,6 +2394,14 @@ impl Parser<'_> {
     /// declaring one of them `int` truncates the returned address to 32 bits.
     /// `None` means "not a known `_chk` function", which stays an error.
     pub(crate) fn chk_builtin_return_type(&mut self, name: &str) -> Option<TypeId> {
+        // A function the prototype table knows returns what it says.
+        if let Some(ret) = self.library_return_type(name) {
+            return Some(ret);
+        }
+        // What a `__builtin_nan` whose string is not a constant calls.
+        if let Some(suffix) = FloatSuffix::of_nan_library_function(name) {
+            return self.float_suffix_type(suffix);
+        }
         // The string family returns `char *`; the memory family returns
         // `void *`; the printf family returns `int`.
         match name {
@@ -2617,20 +2417,12 @@ impl Parser<'_> {
                     ..Default::default()
                 }))
             }
-            "__sprintf_chk" | "__snprintf_chk" | "__printf_chk" | "__fprintf_chk"
-            | "__vsprintf_chk" | "__vsnprintf_chk" | "__vprintf_chk" | "__vfprintf_chk" => {
+            "__sprintf_chk" | "__snprintf_chk" | "__vsprintf_chk" | "__vsnprintf_chk" => {
                 Some(self.types.int_id)
             }
             // The library builtins, for the case where the header that would
             // declare them has not been included.
-            "strlen" => Some(self.types.ulong_id),
-            "strcmp" | "abs" | "ffs" | "ffsl" | "ffsll" | "memcmp" | "strncmp" | "printf"
-            | "sprintf" | "snprintf" | "puts" | "putchar" | "printf_unlocked"
-            | "fprintf_unlocked" | "fputs_unlocked" | "fprintf" | "fputs" | "fputc" => {
-                Some(self.types.int_id)
-            }
-            "labs" => Some(self.types.long_id),
-            "llabs" => Some(self.types.longlong_id),
+            "ffs" | "ffsl" | "ffsll" | "snprintf" => Some(self.types.int_id),
             _ if Self::libm_real_kind(name).is_some() => Some(match Self::libm_real_kind(name) {
                 Some(LibmReal::Float) => self.types.float_id,
                 Some(LibmReal::LongDouble) => self.types.longdouble_id,
@@ -2638,8 +2430,8 @@ impl Parser<'_> {
             }),
             "bcmp" | "strcasecmp" | "strncasecmp" => Some(self.types.int_id),
             "abort" | "exit" | "free" => Some(self.types.void_id),
-            // The allocators and `mempcpy` return `void *`; the string family
-            // returns `char *`. Answering `int` here would truncate the
+            // The allocators return `void *`; the string family returns
+            // `char *`. Answering `int` here would truncate the
             // returned address to 32 bits, which is the bug the `_chk` cases
             // above are commented for.
             "strndup" | "strdup" => {
@@ -2650,25 +2442,19 @@ impl Parser<'_> {
                     ..Default::default()
                 }))
             }
-            "malloc" | "calloc" | "realloc" | "mempcpy" | "memchr" | "alloca" => {
-                Some(self.types.void_ptr_id)
-            }
-            // `bcopy` predates `memmove` and returns nothing; `index`/`rindex`
-            // are the old spellings of `strchr`/`strrchr`.
-            "bcopy" | "bzero" => Some(self.types.void_id),
-            "imaxabs" => Some(self.types.long_id),
-            "strcspn" | "strspn" | "fwrite" => Some(self.types.ulong_id),
-            "strcpy" | "strncpy" | "stpcpy" | "stpncpy" | "strcat" | "strncat" | "strchr"
-            | "strrchr" | "strstr" | "index" | "rindex" | "strpbrk" => {
-                let char_id = self.types.char_id;
-                Some(self.types.intern(Type {
-                    kind: TypeKind::Pointer,
-                    base: Some(char_id),
-                    ..Default::default()
-                }))
-            }
+            "malloc" | "calloc" | "realloc" | "alloca" => Some(self.types.void_ptr_id),
+            "bzero" => Some(self.types.void_id),
+            "strspn" => Some(self.types.ulong_id),
+            "stpncpy" => Some(self.types.char_ptr_id),
             _ => None,
         }
+    }
+
+    /// The return type the prototype table gives the library function
+    /// `name`, if it has a row.
+    fn library_return_type(&self, name: &str) -> Option<TypeId> {
+        let lb = LibraryBuiltin::by_bare_name(self.idents.lookup(name)?)?;
+        Some(lb.return_type(self.types))
     }
 
     /// Builtins that are the library function of the same name.
@@ -2681,29 +2467,14 @@ impl Parser<'_> {
             name_id,
             crate::kw::BUILTIN_STRLEN
                 | crate::kw::BUILTIN_STRCMP
-                | crate::kw::BUILTIN_ABS
-                | crate::kw::BUILTIN_LABS
-                | crate::kw::BUILTIN_LLABS
                 | crate::kw::BUILTIN_FFS
                 | crate::kw::BUILTIN_FFSL
                 | crate::kw::BUILTIN_FFSLL
-                | crate::kw::BUILTIN_SQRT
-                | crate::kw::BUILTIN_COPYSIGN
-                | crate::kw::BUILTIN_COPYSIGNF
-                | crate::kw::BUILTIN_COPYSIGNL
-                | crate::kw::BUILTIN_SQRTF
-                | crate::kw::BUILTIN_SQRTL
-                | crate::kw::BUILTIN_FMAX
-                | crate::kw::BUILTIN_FMAXF
                 | crate::kw::BUILTIN_FMAXL
-                | crate::kw::BUILTIN_FMIN
-                | crate::kw::BUILTIN_FMINF
                 | crate::kw::BUILTIN_FMINL
                 | crate::kw::BUILTIN_POW
                 | crate::kw::BUILTIN_POWF
                 | crate::kw::BUILTIN_POWL
-                | crate::kw::BUILTIN_FMA
-                | crate::kw::BUILTIN_FMAF
                 | crate::kw::BUILTIN_FMAL
                 | crate::kw::BUILTIN_BCMP
                 | crate::kw::BUILTIN_BZERO
@@ -2711,23 +2482,11 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_CBRT
                 | crate::kw::BUILTIN_CBRTF
                 | crate::kw::BUILTIN_CBRTL
-                | crate::kw::BUILTIN_CEIL
-                | crate::kw::BUILTIN_CEILF
                 | crate::kw::BUILTIN_CEILL
-                | crate::kw::BUILTIN_FLOOR
-                | crate::kw::BUILTIN_FLOORF
                 | crate::kw::BUILTIN_FLOORL
-                | crate::kw::BUILTIN_TRUNC
-                | crate::kw::BUILTIN_TRUNCF
                 | crate::kw::BUILTIN_TRUNCL
-                | crate::kw::BUILTIN_ROUND
-                | crate::kw::BUILTIN_ROUNDF
                 | crate::kw::BUILTIN_ROUNDL
-                | crate::kw::BUILTIN_RINT
-                | crate::kw::BUILTIN_RINTF
                 | crate::kw::BUILTIN_RINTL
-                | crate::kw::BUILTIN_NEARBYINT
-                | crate::kw::BUILTIN_NEARBYINTF
                 | crate::kw::BUILTIN_NEARBYINTL
                 | crate::kw::BUILTIN_SIN
                 | crate::kw::BUILTIN_SINF
@@ -2845,7 +2604,6 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_REALLOC
                 | crate::kw::BUILTIN_FREE
                 | crate::kw::BUILTIN_MEMCMP
-                | crate::kw::BUILTIN_MEMPCPY
                 | crate::kw::BUILTIN_STRCPY
                 | crate::kw::BUILTIN_STRNCPY
                 | crate::kw::BUILTIN_STPCPY
@@ -2855,9 +2613,7 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_STRCHR
                 | crate::kw::BUILTIN_STRRCHR
                 | crate::kw::BUILTIN_STRSTR
-                | crate::kw::BUILTIN_IMAXABS
                 | crate::kw::BUILTIN_MEMCHR
-                | crate::kw::BUILTIN_BCOPY
                 | crate::kw::BUILTIN_INDEX
                 | crate::kw::BUILTIN_RINDEX
                 | crate::kw::BUILTIN_PUTCHAR
@@ -2877,11 +2633,10 @@ impl Parser<'_> {
     /// `__builtin_signbit`, which gcc makes type-generic: glibc's `signbit`
     /// macro hands it every floating type, not only `double`.
     ///
-    /// Treated as double-only, a `long double` argument reached the
-    /// `Signbit64` emitter unconverted, which reads the low 64 bits. On aarch64
-    /// that is the bottom of a binary128 significand, so `signbit(-1.0L)` was
-    /// 0. Each type goes where its sign bit is read correctly, and a
-    /// conversion on the way only ever widens or keeps the sign.
+    /// The sign is read at the argument's own width. The two types c17 has
+    /// no bit test for are converted on the way, which only ever widens or
+    /// keeps the sign: a `_Float16` to `float`, a `__float128` to
+    /// `long double`.
     fn type_generic_signbit(&mut self, arg: Expr, pos: Position) -> Expr {
         // gcc rejects anything but a real floating type, and so does c17:
         // converting an integer to `double` would answer for a value the
@@ -2892,92 +2647,66 @@ impl Parser<'_> {
                 "non-floating-point argument in call to function '__builtin_signbit'",
             );
         }
-        let kind = arg.typ.map(|t| self.types.kind(t));
-        match kind {
-            Some(TypeKind::LongDouble | TypeKind::Float128) => self.signbit_long_double(arg, pos),
-            Some(TypeKind::Float | TypeKind::Float16) => {
-                let arg = self.converted_to(arg, self.types.float_id, pos);
-                let raw = Self::typed_expr(
-                    ExprKind::Signbitf { arg: Box::new(arg) },
-                    self.types.int_id,
-                    pos,
-                );
-                self.normalise_predicate(raw, pos)
-            }
-            _ => {
-                let arg = self.converted_to(arg, self.types.double_id, pos);
-                let raw = Self::typed_expr(
-                    ExprKind::Signbit { arg: Box::new(arg) },
-                    self.types.int_id,
-                    pos,
-                );
-                self.normalise_predicate(raw, pos)
-            }
-        }
+        let typ = match arg.typ.map(|t| self.types.kind(t)) {
+            Some(TypeKind::LongDouble | TypeKind::Float128) => self.types.longdouble_id,
+            Some(TypeKind::Float | TypeKind::Float16) => self.types.float_id,
+            _ => self.types.double_id,
+        };
+        self.signbit_at(arg, typ, pos)
     }
 
-    /// The sign of a `long double` (or `__float128`, converted to it without
-    /// losing the sign), through `__signbitl`.
+    /// `signbit` of `arg` converted to the real floating type `typ`: 0 or 1.
     ///
-    /// Same reason as `__builtin_fabsl`: the `Signbit64` emitter calls
-    /// `__signbit`, which takes a `double`, so it tested bit 63 of an x87
-    /// mantissa -- the explicit integer bit, set for every normal value -- and
-    /// answered "negative" for positive numbers.
-    fn signbit_long_double(&mut self, arg: Expr, pos: Position) -> Expr {
-        let ld = self.types.longdouble_id;
-        let arg = self.converted_to(arg, ld, pos);
-        let raw = self.libm_call("__signbitl", self.types.int_id, &[ld], arg, pos);
-        self.normalise_predicate(raw, pos)
-    }
-
-    /// Reduce a predicate to 0 or 1.
-    ///
-    /// C17 7.12.3.6 lets `signbit` answer with *any* nonzero value, and the
-    /// library entry points take it literally -- `__signbitf` returns 8,
-    /// `__signbit` 128 and `__signbitl` 512. Comparing against zero costs one
-    /// instruction and gives gcc's 0/1.
-    fn normalise_predicate(&mut self, raw: Expr, pos: Position) -> Expr {
-        let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, pos);
+    /// C17 7.12.3.6 asks only for nonzero when the sign is set, and gcc's own
+    /// answer is not one value: 1 for a constant, and at run time the bit in
+    /// place -- `INT_MIN` for a `float`, 512 for an x87 `long double`. 1 at
+    /// every width and level is the one of its answers that is consistent.
+    fn signbit_at(&mut self, arg: Expr, typ: TypeId, pos: Position) -> Expr {
+        let arg = self.convert_operand(arg, typ);
         Self::typed_expr(
-            ExprKind::Binary {
-                op: BinaryOp::Ne,
-                left: Box::new(raw),
-                right: Box::new(zero),
+            ExprKind::FpTest {
+                test: FpTest::SignBit,
+                arg: Box::new(arg),
             },
             self.types.int_id,
             pos,
         )
     }
 
-    /// Lower a one-argument math builtin to an ordinary call to the library
-    /// function that implements it, declaring that function if the translation
-    /// unit has not.
+    /// Lower a math builtin to an ordinary call to the library function
+    /// `name_id` that implements it, declaring that function if the
+    /// translation unit has not. `args` are already converted to `params`.
     ///
     /// Unlike `declare_chk_builtin`, the parameter types are *modelled*: that
     /// one spells every parameter `unsigned long` because a pointer, a size and
     /// a flag all classify the same way, which is false the moment an argument
     /// is a `long double`.
     ///
-    /// Falls back to the argument unchanged if the name cannot be interned,
-    /// which would mean `kw.rs` and this list had drifted apart.
-    fn libm_call(
+    /// A zero of the return type stands in if the name cannot be declared,
+    /// which the symbol table has already diagnosed.
+    pub(super) fn libm_call(
         &mut self,
-        name: &str,
+        name_id: StringId,
         ret_type: TypeId,
         params: &[TypeId],
-        arg: Expr,
+        args: Vec<Expr>,
         pos: Position,
     ) -> Expr {
-        let Some(symbol_id) = self.declare_libm_function(name, ret_type, params) else {
-            return arg;
+        let func_type = self
+            .types
+            .intern(Type::function(ret_type, params.to_vec(), false, false));
+        let Some(symbol_id) = self.declare_library_function_id(name_id, func_type) else {
+            let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, pos);
+            return self.convert_operand(zero, ret_type);
         };
         let func_type = self.symbols.get(symbol_id).typ;
         let func_expr = Self::typed_expr(ExprKind::Ident(symbol_id), func_type, pos);
         Self::typed_expr(
             ExprKind::Call {
                 func: Box::new(func_expr),
-                args: vec![arg],
+                args,
                 binding: CalleeBinding::Library,
+                known: None,
             },
             ret_type,
             pos,
@@ -2992,16 +2721,22 @@ impl Parser<'_> {
         params: &[TypeId],
     ) -> Option<SymbolId> {
         let name_id = self.idents.lookup(name)?;
+        let func_type = self
+            .types
+            .intern(Type::function(ret_type, params.to_vec(), false, false));
+        self.declare_library_function_id(name_id, func_type)
+    }
+
+    /// Declare the library function `name_id` as of the function type
+    /// `func_type`, reusing any existing declaration.
+    pub(super) fn declare_library_function_id(
+        &mut self,
+        name_id: StringId,
+        func_type: TypeId,
+    ) -> Option<SymbolId> {
         if let Some(existing) = self.symbols.lookup_id(name_id, Namespace::Ordinary) {
             return Some(existing);
         }
-        let func_type = self.types.intern(Type {
-            kind: TypeKind::Function,
-            base: Some(ret_type),
-            params: Some(params.to_vec()),
-            variadic: false,
-            ..Default::default()
-        });
         let sym = Symbol::function(name_id, func_type, 0);
         self.symbols.declare(sym).ok()
     }
@@ -3031,32 +2766,19 @@ impl Parser<'_> {
             "__memset_chk" | "__strcpy_chk" | "__stpcpy_chk" | "__strcat_chk" => (3, false),
             "__memcpy_chk" | "__memmove_chk" | "__mempcpy_chk" | "__strncpy_chk"
             | "__stpncpy_chk" | "__strncat_chk" => (4, false),
-            "strlen" | "abs" | "labs" | "llabs" | "ffs" | "ffsl" | "ffsll" => (1, false),
-            "strcmp" | "bzero" | "strcasecmp" => (2, false),
+            "ffs" | "ffsl" | "ffsll" => (1, false),
+            "bzero" | "strcasecmp" => (2, false),
             "bcmp" | "stpncpy" | "strncasecmp" => (3, false),
             // The libm entry points, from the one table that knows them.
             _ if Self::libm_real_kind(name).is_some() => (Self::libm_arity(name), false),
             "abort" => (0, false),
-            "exit" | "puts" | "malloc" | "free" | "putchar" | "imaxabs" | "strdup" => (1, false),
-            "strndup" => (2, false),
-            "calloc" | "realloc" | "strcpy" | "stpcpy" | "strcat" | "strchr" | "strrchr"
-            | "strstr" | "index" | "rindex" | "strpbrk" | "strcspn" | "strspn" => (2, false),
-            "memcmp" | "mempcpy" | "strncpy" | "strncat" | "strncmp" | "memchr" | "bcopy" => {
-                (3, false)
-            }
-            // The printf family is variadic after its format string. Getting
-            // the fixed count right is what keeps the format argument in a
-            // register on Apple arm64, where variadic arguments go on the
-            // stack -- the same reason the `_chk` forms above are spelled out.
-            "printf" | "printf_unlocked" => (1, true),
-            // The stdio `_unlocked` forms. gcc has them, and the torture
-            // suite's builtins/ tests supply the library side themselves --
-            // glibc has no `printf_unlocked`, so gcc's own link fails without
-            // that. Only the three a real corpus uses are here.
-            "fprintf_unlocked" | "fprintf" => (2, true),
-            "fputs_unlocked" | "fputs" | "fputc" => (2, false),
-            "fwrite" => (4, false),
-            "sprintf" => (2, true),
+            _ if FloatSuffix::of_nan_library_function(name).is_some() => (1, false),
+            "exit" | "malloc" | "free" | "strdup" => (1, false),
+            "strndup" | "calloc" | "realloc" | "strspn" => (2, false),
+            // Variadic after its fixed arguments. Getting the fixed count
+            // right is what keeps them in registers on Apple arm64, where
+            // variadic arguments go on the stack -- the same reason the `_chk`
+            // forms above are spelled out.
             "snprintf" => (3, true),
             // An entry point this does not know is left as it was: variadic,
             // with nothing fixed.
@@ -3069,11 +2791,10 @@ impl Parser<'_> {
         // A `double` does not. It is passed in an SSE register, so declaring
         // one of these as an integer sent the argument to the wrong register
         // file outright: `__builtin_sqrt(4.0)` read whatever was in xmm0 and
-        // came back 0.0, and `__builtin_copysign(1.0, -1.0)` answered 1.0
-        // because the sign argument never arrived. Both are silent wrong
-        // answers -- the call links and runs. The library functions of the
-        // same names are unaffected; this path is only taken when the header
-        // that would declare them was not included.
+        // came back 0.0, a silent wrong answer -- the call links and runs.
+        // The library functions of the same names are unaffected; this path
+        // is only taken when the header that would declare them was not
+        // included.
         let param_typ = match Self::libm_real_kind(name) {
             Some(LibmReal::Float) => self.types.float_id,
             Some(LibmReal::Double) => self.types.double_id,
@@ -3103,10 +2824,159 @@ impl Parser<'_> {
         let symbol = Symbol::function(name_id, func_type, self.symbols.depth());
         // A redeclaration can only mean the header did declare it after all,
         // in which case the existing symbol is the one to use.
-        Some(self.symbols.declare(symbol).unwrap_or_else(|_| {
-            self.symbols
-                .lookup_id(name_id, Namespace::Ordinary)
-                .expect("declare failed but no existing symbol")
-        }))
+        match self.symbols.declare(symbol) {
+            Ok(id) => {
+                self.placeholder_prototypes.insert(id);
+                Some(id)
+            }
+            Err(_) => Some(
+                self.symbols
+                    .lookup_id(name_id, Namespace::Ordinary)
+                    .expect("declare failed but no existing symbol"),
+            ),
+        }
     }
+}
+
+/// The floating type a builtin's suffix names: `__builtin_inf` is a
+/// `double`, `__builtin_inff16` a `_Float16`. `_Float32` and `_Float64` are
+/// `float` and `double` in c17, not types of their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FloatSuffix {
+    Double,
+    Float,
+    LongDouble,
+    F16,
+    F32,
+    F64,
+    F128,
+}
+
+impl FloatSuffix {
+    const ALL: [FloatSuffix; 7] = [
+        FloatSuffix::Double,
+        FloatSuffix::Float,
+        FloatSuffix::LongDouble,
+        FloatSuffix::F16,
+        FloatSuffix::F32,
+        FloatSuffix::F64,
+        FloatSuffix::F128,
+    ];
+
+    /// How the suffix is spelled at the end of a function's name.
+    fn text(self) -> &'static str {
+        match self {
+            FloatSuffix::Double => "",
+            FloatSuffix::Float => "f",
+            FloatSuffix::LongDouble => "l",
+            FloatSuffix::F16 => "f16",
+            FloatSuffix::F32 => "f32",
+            FloatSuffix::F64 => "f64",
+            FloatSuffix::F128 => "f128",
+        }
+    }
+
+    /// The library function a quiet NaN builtin of this suffix calls for a
+    /// string it cannot fold, as gcc's does.
+    fn nan_library_function(self) -> String {
+        format!("nan{}", self.text())
+    }
+
+    /// The suffix of `name`, if it is the library function a quiet NaN
+    /// builtin calls for a string it cannot fold: `nanf16` for
+    /// `__builtin_nanf16`.
+    fn of_nan_library_function(name: &str) -> Option<FloatSuffix> {
+        let text = name.strip_prefix("nan")?;
+        Self::ALL.into_iter().find(|s| s.text() == text)
+    }
+}
+
+/// The value an infinity or NaN builtin produces.
+#[derive(Debug, Clone, Copy)]
+enum FloatConstant {
+    /// `__builtin_inf` and `__builtin_huge_val`, which are the same thing
+    /// on every IEEE format.
+    Infinity,
+    /// `__builtin_nan` (quiet) and `__builtin_nans` (signalling), whose
+    /// string argument names the payload.
+    Nan(NanKind),
+}
+
+/// Every infinity and NaN builtin: what it produces, and in which type.
+#[rustfmt::skip]
+const FLOAT_CONSTANT_BUILTINS: &[(StringId, FloatConstant, FloatSuffix)] = {
+    use crate::kw::*;
+    use FloatConstant::{Infinity as Inf, Nan};
+    use FloatSuffix::*;
+    const QUIET: FloatConstant = Nan(NanKind::Quiet);
+    const SIGNALLING: FloatConstant = Nan(NanKind::Signalling);
+    &[
+        (BUILTIN_INF,           Inf,        Double),
+        (BUILTIN_INFF,          Inf,        Float),
+        (BUILTIN_INFL,          Inf,        LongDouble),
+        (BUILTIN_INFF16,        Inf,        F16),
+        (BUILTIN_INFF32,        Inf,        F32),
+        (BUILTIN_INFF64,        Inf,        F64),
+        (BUILTIN_INFF128,       Inf,        F128),
+        (BUILTIN_HUGE_VAL,      Inf,        Double),
+        (BUILTIN_HUGE_VALF,     Inf,        Float),
+        (BUILTIN_HUGE_VALL,     Inf,        LongDouble),
+        (BUILTIN_HUGE_VALF16,   Inf,        F16),
+        (BUILTIN_HUGE_VALF32,   Inf,        F32),
+        (BUILTIN_HUGE_VALF64,   Inf,        F64),
+        (BUILTIN_HUGE_VALF128,  Inf,        F128),
+        (BUILTIN_NAN,           QUIET,      Double),
+        (BUILTIN_NANF,          QUIET,      Float),
+        (BUILTIN_NANL,          QUIET,      LongDouble),
+        (BUILTIN_NANF16,        QUIET,      F16),
+        (BUILTIN_NANF32,        QUIET,      F32),
+        (BUILTIN_NANF64,        QUIET,      F64),
+        (BUILTIN_NANF128,       QUIET,      F128),
+        (BUILTIN_NANS,          SIGNALLING, Double),
+        (BUILTIN_NANSF,         SIGNALLING, Float),
+        (BUILTIN_NANSL,         SIGNALLING, LongDouble),
+        (BUILTIN_NANSF16,       SIGNALLING, F16),
+        (BUILTIN_NANSF32,       SIGNALLING, F32),
+        (BUILTIN_NANSF64,       SIGNALLING, F64),
+        (BUILTIN_NANSF128,      SIGNALLING, F128),
+    ]
+};
+
+/// The payload a `__builtin_nan` string names, or `None` if the string is
+/// not one gcc folds.
+///
+/// Parsed as gcc's `real_nan` parses it, which is `strtoull` with base 0 and
+/// no overflow check: leading white space, an optional sign that is then
+/// ignored, `0x` for hexadecimal or a leading `0` for octal, and digits that
+/// must run to the end of the string. An empty string, and a bare `0x`, are
+/// zero. Digits past the 128th bit wrap, which drops only bits that no
+/// format's payload has room for. A C string ends at its first NUL.
+fn nan_payload(bytes: impl Iterator<Item = u8>) -> Option<u128> {
+    let s: Vec<u8> = bytes.take_while(|&b| b != 0).collect();
+    let mut rest = s.as_slice();
+    while let [b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r', tail @ ..] = rest {
+        rest = tail;
+    }
+    if let [b'-' | b'+', tail @ ..] = rest {
+        rest = tail;
+    }
+    let base = match rest {
+        [b'0', b'x' | b'X', tail @ ..] => {
+            rest = tail;
+            16
+        }
+        [b'0', tail @ ..] => {
+            rest = tail;
+            8
+        }
+        _ => 10,
+    };
+    let mut value: u128 = 0;
+    for &c in rest {
+        let digit = char::from(c).to_digit(16).filter(|&d| d < base)?;
+        value = value
+            .wrapping_mul(u128::from(base))
+            .wrapping_add(u128::from(digit));
+    }
+    Some(value)
 }

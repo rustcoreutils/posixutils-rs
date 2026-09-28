@@ -204,6 +204,54 @@ pub(crate) fn fcmp_outcome(ord: Option<Ordering>) -> u8 {
     }
 }
 
+/// The answer of a float comparison true for the outcomes in `mask`, when
+/// every outcome in `possible` gives the same one: 0 when none of them makes
+/// it true, 1 when all of them do.
+pub(crate) fn fcmp_decided(mask: u8, possible: u8) -> Option<bool> {
+    if possible & mask == 0 {
+        Some(false)
+    } else if possible & !mask & FCMP_ALL == 0 {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// The outcomes of `x` compared with the constant `c`, for an unknown `x`
+/// that may be told never to be below zero.
+///
+/// Nothing is greater than `+Inf`, nothing is less than `-Inf`, and nothing
+/// is ordered with a NaN -- including a NaN `x`, which is why an infinity
+/// still leaves *unordered* possible. A NaN `x` also leaves `never_below`
+/// true, since it is not less than zero either.
+pub(crate) fn possible_against(c: FloatVal, never_below: bool) -> u8 {
+    let inf = FloatVal::infinity(false);
+    let mut possible = match (c.cmp_value(inf), c.cmp_value(inf.negated())) {
+        (None, _) => return CMP_UN,
+        (Some(Ordering::Equal), _) => FCMP_ALL & !CMP_GT,
+        (_, Some(Ordering::Equal)) => FCMP_ALL & !CMP_LT,
+        _ => FCMP_ALL,
+    };
+    if never_below && c.cmp_value(FloatVal::from_f64(0.0)) != Some(Ordering::Greater) {
+        possible &= !CMP_LT;
+    }
+    possible
+}
+
+/// The answer of `op` comparing an unknown value with the constant `c`
+/// (`c op x` when `const_first`), when no value -- a NaN included -- can
+/// change it: `x > +Inf` is 0, `x != NaN` is 1. The one rule the optimizer
+/// folds by, and the linearizer too under `-fno-trapping-math`.
+pub(crate) fn fcmp_against_constant(op: Opcode, c: FloatVal, const_first: bool) -> Option<bool> {
+    let possible = possible_against(c, false);
+    let possible = if const_first {
+        mirror_mask(possible)
+    } else {
+        possible
+    };
+    fcmp_decided(fcmp_mask(op)?, possible)
+}
+
 /// The same mask read with the operands the other way round: `a < b` and
 /// `b < a` are the same comparison with `less` and `greater` exchanged.
 /// Equal and unordered are symmetric and stay where they are.
@@ -243,7 +291,9 @@ pub(crate) fn is_comparison(op: Opcode) -> bool {
 /// give that copy the type of the *value*, and for all but one family of
 /// opcodes `insn.typ`/`insn.size` are exactly that. The exception is the
 /// comparisons, which describe their operands there (see
-/// [`cmp_operand_width`]) and produce an `int`.
+/// [`cmp_operand_width`]) and produce an `int`, and the population counts,
+/// whose `size` is the width of the operand they count while the count is an
+/// `int`.
 ///
 /// Carrying the operand type across is invisible for an integer comparison --
 /// an integer of the wrong width still lands in a general register -- and a
@@ -251,7 +301,7 @@ pub(crate) fn is_comparison(op: Opcode) -> bool {
 /// backend puts it in an SSE register and the caller reads the return value
 /// out of the wrong one.
 pub(crate) fn result_type_of(insn: &Instruction, types: &TypeTable) -> (Option<TypeId>, u32) {
-    if is_comparison(insn.op) {
+    if is_comparison(insn.op) || matches!(insn.op, Opcode::Popcount32 | Opcode::Popcount64) {
         let int_id = types.int_id;
         (Some(int_id), types.size_bits(int_id))
     } else {
@@ -344,8 +394,19 @@ fn eval_shift(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
 /// C lets a program observe one (`<fenv.h>`); folding the operation away
 /// would quietly take that flag with it. Ordinary finite arithmetic raises
 /// only *inexact*, which is not separable from the fold in the first place.
+///
+/// `CopySign` is not arithmetic, and folds for every pair: it moves one sign
+/// bit, raises nothing, and keeps a NaN's payload. `FMin` and `FMax` fold
+/// as [`FloatVal::fmin`] says, a quiet NaN operand included, since neither
+/// raises anything for one.
 pub(crate) fn eval_fbinop(op: Opcode, fmt: FpFormat, a: FloatVal, b: FloatVal) -> Option<FloatVal> {
     let (a, b) = (a.round_to_format(fmt), b.round_to_format(fmt));
+    match op {
+        Opcode::CopySign => return Some(a.with_sign_of(b)),
+        Opcode::FMin => return a.fmin(b, fmt),
+        Opcode::FMax => return a.fmax(b, fmt),
+        _ => {}
+    }
     if !a.is_finite() || !b.is_finite() {
         return None;
     }
@@ -361,28 +422,48 @@ pub(crate) fn eval_fbinop(op: Opcode, fmt: FpFormat, a: FloatVal, b: FloatVal) -
     r.is_finite().then_some(r)
 }
 
-/// A float unary operation over a constant.
-///
-/// `FNeg` alone, and unlike the arithmetic above it folds for every operand
-/// including the infinities and NaN: flipping a sign bit computes nothing
-/// and raises nothing. It is also exact, so the result needs no rounding
-/// that the operand has not already had.
-pub(crate) fn eval_funop(op: Opcode, fmt: FpFormat, a: FloatVal) -> Option<FloatVal> {
+/// A float operation of three constants: `Fma`, as [`FloatVal::fma`] says --
+/// rounded once, and held to the arithmetic's rule for what raises.
+pub(crate) fn eval_fternop(
+    op: Opcode,
+    fmt: FpFormat,
+    a: FloatVal,
+    b: FloatVal,
+    c: FloatVal,
+) -> Option<FloatVal> {
     match op {
-        Opcode::FNeg => Some(a.round_to_format(fmt).negated()),
+        Opcode::Fma => a.fma(b, c, fmt),
         _ => None,
     }
 }
 
-/// A float-to-float conversion of a constant, from one format to another.
+/// A float unary operation over a constant.
 ///
-/// **Rounded twice, and both roundings are load-bearing.** The operand is a
-/// literal at 128 significand bits, not yet the value its own type holds, so
-/// rounding straight to the destination skips a step the program does not:
-/// `(float)(_Float16)0.3f16` is `0.30004883`, the nearest `float` to the
-/// nearest `_Float16` to `0.3`, and converting in one go gives `0.3f`
-/// instead. Widening looks harmless and is not -- that is the direction
-/// this got wrong.
+/// `FNeg` and `Fabs`, and unlike the arithmetic above they fold for every
+/// operand including the infinities and NaN: flipping or clearing a sign bit
+/// computes nothing and raises nothing, and a NaN keeps its payload. Both are
+/// also exact, so the result needs no rounding that the operand has not
+/// already had.
+///
+/// `Sqrt` folds as [`FloatVal::sqrt`] says: rounded once like arithmetic,
+/// and exact for a zero, `+inf` and a quiet NaN; a negative operand, whose
+/// NaN is the target's own, and a signalling NaN are left to run time.
+///
+/// `RoundToIntegral` folds as [`FloatVal::round_to_integral`] says: exactly,
+/// except a signalling NaN, and a `rint` or `nearbyint` whose answer is the
+/// rounding direction's.
+pub(crate) fn eval_funop(op: Opcode, fmt: FpFormat, a: FloatVal) -> Option<FloatVal> {
+    match op {
+        Opcode::FNeg => Some(a.round_to_format(fmt).negated()),
+        Opcode::Fabs => Some(a.round_to_format(fmt).magnitude()),
+        Opcode::Sqrt => a.sqrt(fmt),
+        Opcode::RoundToIntegral(how) => a.round_to_integral(how, fmt),
+        _ => None,
+    }
+}
+
+/// A float-to-float conversion of a constant, from one format to another:
+/// [`FloatVal::convert`], which rounds at the source format first.
 ///
 /// Held to the same rule as the arithmetic above otherwise: a non-finite
 /// operand is left alone, and so is a narrowing that overflows to infinity,
@@ -393,34 +474,32 @@ pub(crate) fn eval_fcvtf(
     dst_fmt: FpFormat,
     a: FloatVal,
 ) -> Option<FloatVal> {
-    if op != Opcode::FCvtF {
+    if op != Opcode::FCvtF || !a.is_finite() {
         return None;
     }
-    let a = a.round_to_format(src_fmt);
-    if !a.is_finite() {
-        return None;
-    }
-    let r = a.round_to_format(dst_fmt);
+    let r = a.convert(src_fmt, dst_fmt);
     r.is_finite().then_some(r)
 }
 
-/// A float-to-integer conversion of a constant, to `dst_size` bits.
+/// A float-to-integer conversion of a constant, to `dst_size` bits, or the
+/// other integer a float operand gives in the same shape: `Signbit`.
 ///
 /// `None` when the value does not fit, which is exactly where C leaves the
 /// conversion undefined (6.3.1.4): a folded answer there would be this
 /// compiler's invention rather than the target's, and the two differ.
+///
+/// `Signbit` folds for every operand, the infinities and NaN included: it
+/// reads a bit and raises nothing, and rounding to a format never changes a
+/// sign.
 pub(crate) fn eval_fcvt(op: Opcode, dst_size: u32, src_fmt: FpFormat, a: FloatVal) -> Option<i128> {
     let signed = match op {
         Opcode::FCvtS => true,
         Opcode::FCvtU => false,
+        Opcode::Signbit => return Some(i128::from(a.sign_bit())),
         _ => return None,
     };
-    let v = a.round_to_format(src_fmt).trunc_to_i128()?;
-    let size = dst_size.max(1);
-    if !signed && v < 0 {
-        return None;
-    }
-    (at_width(v, size, signed) == v).then_some(v)
+    a.round_to_format(src_fmt)
+        .to_integer(dst_size.clamp(1, 128), signed)
 }
 
 /// `insn`'s unary operation applied to a constant.
@@ -435,6 +514,10 @@ pub(crate) fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
     match insn.op {
         Opcode::Neg => Some(a.wrapping_neg()),
         Opcode::Not => Some(!a),
+        // The count of the operand at its own width. It is at most 64, so
+        // it reads the same at every width the `int` result is taken at.
+        Opcode::Popcount32 => Some(i128::from((a as u32).count_ones())),
+        Opcode::Popcount64 => Some(i128::from((a as u64).count_ones())),
 
         // Read the operand at the width it was stored in, in the signedness
         // the opcode names, and leave it there: the destination is wider.
@@ -469,4 +552,41 @@ pub(crate) fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
 /// negative `char` would come back positive.
 fn conversion_src_width(insn: &Instruction) -> Option<u32> {
     (insn.src_size != 0).then_some(insn.src_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rule both the optimizer and the linearizer fold by: decided only
+    /// when every value of the unknown side, a NaN included, gives the same
+    /// answer -- and read the right way round when the constant comes first.
+    #[test]
+    fn fcmp_against_constant_decides_only_what_no_value_changes() {
+        let inf = FloatVal::infinity(false);
+        let nan = FloatVal::nan();
+        for (op, c, const_first, want) in [
+            (Opcode::FCmpOGt, inf, false, Some(false)), // x > +Inf
+            (Opcode::FCmpOLt, inf, true, Some(false)),  // +Inf < x
+            (Opcode::FCmpOLt, inf.negated(), false, Some(false)), // x < -Inf
+            (Opcode::FCmpOGt, inf.negated(), true, Some(false)), // -Inf > x
+            (Opcode::FCmpOGt, nan, false, Some(false)), // x > NaN
+            (Opcode::FCmpOEq, nan, true, Some(false)),  // NaN == x
+            (Opcode::FCmpONe, nan, false, Some(true)),  // x != NaN
+            (Opcode::FCmpOLe, inf, false, None),        // false for a NaN only
+            (Opcode::FCmpOGe, inf, false, None),        // x == +Inf
+            (Opcode::FCmpOLt, inf, false, None),
+            (Opcode::FCmpOEq, inf, false, None),
+            (Opcode::FCmpONe, inf, false, None),
+            (Opcode::FCmpOGt, inf, true, None), // +Inf > x
+            (Opcode::FCmpOGt, FloatVal::from_f64(1.0), false, None),
+        ] {
+            assert_eq!(
+                fcmp_against_constant(op, c, const_first),
+                want,
+                "{op:?} {c:?} const_first={const_first}"
+            );
+        }
+        assert_eq!(fcmp_against_constant(Opcode::SetGt, inf, false), None);
+    }
 }

@@ -56,6 +56,12 @@ SSA-form intermediate representation for the c17 C17 compiler. Inspired by Linus
 | `not` | Bitwise NOT (unary) |
 | `neg` | Integer negation (unary) |
 | `fneg` | Float negation (unary) |
+| `fabs` | Float absolute value (unary): clears the sign bit and nothing else |
+| `copysign` | The first operand with the sign bit of the second, and nothing else changed |
+| `sqrt` | Correctly rounded square root (unary); sets no `errno`. Names its library function, which a target without the instruction calls instead after optimization |
+| `fmin`, `fmax` | The smaller or larger operand, a quiet NaN one ignored for the other. Named and called like `sqrt` |
+| `fma` | `src[0] * src[1] + src[2]`, rounded once. Named and called like `sqrt` |
+| `ffloor`, `fceil`, `ftrunc`, `fround`, `frint`, `fnearbyint` | `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint` (unary, one opcode keyed on its rounding): the integer the operand rounds to, with its sign. Named and called like `sqrt` where the target has no instruction |
 
 ### Integer Comparisons (result: 0 or 1)
 
@@ -182,14 +188,11 @@ Use `returns_via_sret()` and `returns_two_regs()` to query return strategy.
 
 | Opcode | Description |
 |--------|-------------|
-| `fabs32` | Absolute value (`float`) |
-| `fabs64` | Absolute value (`double`) |
-| `signbit32` | Test sign bit (`float`); returns int |
-| `signbit64` | Test sign bit (`double`); returns int |
+| `signbit` | Test the sign bit of the operand (`src_typ`); returns 0 or 1 as an int |
 
 ### Memory Builtins
 
-These lower to libc calls (`memset` / `memcpy` / `memmove`) and are marked as side-effecting roots so DCE preserves them.
+These lower to libc calls (`memset` / `memcpy` / `memmove`) and are marked as side-effecting roots so DCE preserves them. One whose length is a small constant never gets that far: `memexpand` replaces it with loads and stores.
 
 | Opcode | Description |
 |--------|-------------|
@@ -338,9 +341,15 @@ extern_symbols          - symbols needing GOT
 | `ifconv.rs` | If-conversion: collapses a short-circuit `&&`/`||` diamond whose arm is safe to speculate into a `Select` |
 | `sccp.rs` | Sparse conditional constant propagation: constants along reachable paths only, and the only thing that folds a branch on a constant condition |
 | `inline.rs` | Function inlining |
+| `memexpand.rs` | A `memcpy`, `memset` or `memmove` of a small constant length becomes integer loads and stores, at every level. Also owns the chunking and the size limit the linearizer's aggregate copies use |
+| `build.rs` | `Builder`: the instructions that replace one instruction -- new pseudos, constants, loads, stores, operations -- at its source position. Not a pass; shared by `memexpand` and `libcall_fold` |
+| `loadfwd.rs` | Store-to-load forwarding and redundant load elimination, and `MemOracle`, the walk they ask: what a location holds just before an instruction, as a pseudo or, for one byte, a constant |
+| `strdata.rs` | The bytes of every object whose contents hold for the whole run (string literals, and `const` `char` arrays by `constglobal`'s rule), and the string a pointer into one reads -- or, for a length, the one length every `Select` and phi arm agrees on, which for a local array is what `MemOracle` says the stores before the call left in it. Not a pass |
+| `libcall_fold/` | A call the parser tagged as a known library function (`Instruction::known`) becomes its result where the arguments decide it: `strlen("abc")` is 3, `strcmp(p, "")` the first byte of `p`; and an output call whose result is unused becomes a cheaper one that writes the same bytes: `printf("hi\n")` is `puts("hi")`; and a `Memmove` whose blocks cannot overlap becomes a `Memcpy`. A dispatcher and one module per family of functions |
 | `lower.rs` | Phi elimination to copies |
 
-The driver in `cc/opt.rs` runs `inline → constglobal → (vrp + ifconv + sccp + instcombine + dce)*` to fixed
+The driver in `cc/opt.rs` runs `inline → memexpand → constglobal → (memexpand + loadfwd + vrp + ifconv + sccp + instcombine + libcall_fold + dse + dce)*` to fixed
+
 point (up to 10 iterations). The order inside the loop is load-bearing in both
 directions: `instcombine` derives constants `sccp` structurally cannot (`x - x`,
 `x ^ x`), any of which can make a branch condition constant, and `sccp` deletes

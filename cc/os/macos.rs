@@ -21,9 +21,6 @@ pub fn get_macros() -> Vec<(&'static str, Option<String>)> {
         ("__DARWIN__", Some("1".into())),
         // Mach-O binary format
         ("__MACH_O__", Some("1".into())),
-        // BSD compatibility
-        ("__FreeBSD__", None), // Not defined
-        ("__NetBSD__", None),  // Not defined
         // Apple extensions
         ("__APPLE_CC__", Some("1".into())),
         // Disable _FORTIFY_SOURCE — macOS headers redirect memset/memcpy/strcpy

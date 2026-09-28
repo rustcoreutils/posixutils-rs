@@ -11,6 +11,7 @@
 // lowering
 //
 
+use crate::abi::aapcs64::StackedArgs;
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::arch::aarch64::codegen::Aarch64CodeGen;
 use crate::arch::aarch64::features::{VA_GR_SAVE_BYTES, VA_VR_SAVE_BYTES};
@@ -39,7 +40,8 @@ impl Aarch64CodeGen {
         }
 
         // Register allocation
-        let mut alloc = RegAlloc::new().with_tls_access(self.base.tls_access());
+        let mut alloc = RegAlloc::new(StackedArgs::of(&self.base.target))
+            .with_tls_access(self.base.tls_access());
         self.locations = alloc.allocate(func, types);
         self.pseudos = crate::arch::codegen::PseudoTable::new(&func.pseudos);
 
@@ -171,7 +173,11 @@ impl Aarch64CodeGen {
         // Measure what the named parameters consumed, for va_start: the same
         // layout `allocate_arguments` bound them by.
         if is_variadic {
-            let layout = crate::arch::aarch64::regalloc::param_layout(&func.params, types);
+            let layout = crate::arch::aarch64::regalloc::param_layout(
+                &func.params,
+                types,
+                StackedArgs::of(&self.base.target),
+            );
             self.num_fixed_gp_params = layout.ngrn;
             self.num_fixed_fp_params = layout.nsrn;
             self.named_stack_param_bytes =

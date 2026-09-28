@@ -18,8 +18,6 @@ use crate::ir::{Instruction, PseudoId};
 use crate::target::Os;
 use crate::types::{TypeId, TypeTable};
 
-use super::f64_to_f16_bits;
-
 /// Result of computing a memory address for load/store operations
 enum ComputedAddr {
     /// Direct memory address - no setup instructions needed
@@ -231,13 +229,7 @@ impl Aarch64CodeGen {
             Loc::FImm(f, imm_size) => {
                 // Use the size from the FImm, not the passed-in size
                 // This ensures float constants are loaded correctly for their type
-                let bits = if imm_size == 16 {
-                    f64_to_f16_bits(f.to_f64()) as i64
-                } else if imm_size == 32 {
-                    (f.to_f64() as f32).to_bits() as i64
-                } else {
-                    f.to_f64().to_bits() as i64
-                };
+                let bits = f.to_bits_at_width(imm_size);
                 self.emit_mov_imm(dst, bits, imm_size);
             }
         }

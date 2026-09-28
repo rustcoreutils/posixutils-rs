@@ -287,9 +287,11 @@ impl Parser<'_> {
     /// count; the *byte* size follows from the element type.
     pub(crate) fn string_initializer_len(&self, init: &Expr) -> Option<usize> {
         match &init.kind {
-            ExprKind::StringLit(s) | ExprKind::WideStringLit(s) => Some(s.chars().count() + 1),
+            ExprKind::StringLit(s) => Some(s.chars().count() + 1),
             ExprKind::Utf16StringLit(units) => Some(units.len() + 1),
-            ExprKind::Utf32StringLit(units) => Some(units.len() + 1),
+            ExprKind::WideStringLit(units) | ExprKind::Utf32StringLit(units) => {
+                Some(units.len() + 1)
+            }
             _ => None,
         }
     }

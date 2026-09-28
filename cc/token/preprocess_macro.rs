@@ -1683,7 +1683,11 @@ impl<'a> Preprocessor<'a> {
                                 .collect_macro_args(iter, idents, pos, &mac.name, &open_paren)
                                 .map(|(args, _)| args)
                                 .unwrap_or_default();
-                            let result = self.eval_has_include(&args, idents);
+                            let result = self.eval_has_include(
+                                &args,
+                                idents,
+                                builtin == BuiltinMacro::HasIncludeNext,
+                            );
                             return Some(vec![Token::with_value(
                                 TokenType::Number,
                                 *pos,
@@ -1739,12 +1743,12 @@ impl<'a> Preprocessor<'a> {
                 }
             }
             BuiltinMacro::HasBuiltin => {
-                if let Some(id) = arg_id {
-                    crate::builtins::is_builtin_id(id)
-                } else {
-                    let name = self.token_to_string(first_tok, idents);
-                    crate::builtins::is_builtin(name.as_str())
-                }
+                let name = self.token_to_string(first_tok, idents);
+                let known = match arg_id {
+                    Some(id) => crate::builtins::is_builtin_id(id),
+                    None => crate::builtins::is_builtin(name.as_str()),
+                };
+                known && crate::builtins::available_on(name.as_str(), self.target)
             }
             BuiltinMacro::HasFeature | BuiltinMacro::HasExtension => {
                 let name = self.token_to_string(first_tok, idents);

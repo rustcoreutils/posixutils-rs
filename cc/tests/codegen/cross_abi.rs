@@ -21,8 +21,12 @@
 // everywhere.
 //
 
-use super::asm_probe::{asm_for, asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
-use crate::common::{aarch64_cross_available, create_c_file, cross_link_and_run, run_c17};
+use super::asm_probe::{
+    asm_for, asm_for_with, body_of, AARCH64_DARWIN, AARCH64_LINUX, X86_64_LINUX,
+};
+use crate::common::{
+    aarch64_cross_available, compile_with_host_cc, create_c_file, cross_link_and_run, run_c17,
+};
 
 /// AAPCS64 passes a `_Complex` as a two-element HFA, so it occupies **two**
 /// V registers and the next floating-point parameter starts after both.
@@ -1734,7 +1738,7 @@ long take_l(long a, long b, long c, long d, long e, long f, long g, long v)
 ///
 /// C17 6.2.5p15 leaves plain `char`'s signedness implementation-defined; the
 /// x86-64 psABI makes it signed and AAPCS64 makes it unsigned, and
-/// `Target::char_signed` has recorded that all along. Only the two backends'
+/// `Target::plain_char` has recorded that all along. Only the two backends'
 /// load paths consulted it, so aarch64 emitted a correct zero-extending load
 /// and the front end then sign-extended the result back:
 ///
@@ -1745,15 +1749,21 @@ long take_l(long a, long b, long c, long d, long e, long f, long g, long v)
 ///
 /// cross-gcc emits the `ldrb` alone. Both directions are asserted, and both
 /// architectures, so a fix cannot pass by making every `char` unsigned.
+///
+/// The rule is per OS as well: Apple arm64 departs from AAPCS64 and makes
+/// plain `char` signed, as Apple clang does, so the same source must
+/// sign-extend under `aarch64-apple-darwin` -- both for a load and for a
+/// `char` parameter widened to `int`.
 #[test]
 fn codegen_plain_char_follows_the_target_signedness() {
     let src = r#"
 int  ld_plain(char *p)          { return *p; }
 int  ld_signed(signed char *p)  { return *p; }
 int  ld_unsigned(unsigned char *p) { return *p; }
+int  arg_plain(char c)          { return c; }
 "#;
 
-    // aarch64: plain char is unsigned, so it must not be sign-extended.
+    // aarch64 Linux: plain char is unsigned, so it must not be sign-extended.
     let a = asm_for("char_sign_a64", AARCH64_LINUX, src);
     let plain = body_of(&a, "ld_plain");
     assert!(
@@ -1775,6 +1785,30 @@ int  ld_unsigned(unsigned char *p) { return *p; }
         !unsigned.contains("sxtb") && !unsigned.contains("ldrsb"),
         "aarch64: unsigned char must not sign-extend:\n{unsigned}"
     );
+    let arg = body_of(&a, "arg_plain");
+    assert!(
+        !arg.contains("sxtb") && arg.contains("uxtb"),
+        "aarch64: a plain char parameter widens by zero extension:\n{arg}"
+    );
+
+    // Apple arm64: plain char is signed, so the same load sign-extends.
+    let d = asm_for("char_sign_darwin", AARCH64_DARWIN, src);
+    let plain = body_of(&d, "ld_plain");
+    assert!(
+        plain.contains("ldrsb") && !plain.contains("ldrb") && !plain.contains("uxtb"),
+        "Apple arm64: plain char is signed and must sign-extend:\n{plain}"
+    );
+    let arg = body_of(&d, "arg_plain");
+    assert!(
+        arg.contains("sxtb") && !arg.contains("uxtb"),
+        "Apple arm64: a plain char parameter widens by sign extension:\n{arg}"
+    );
+    // The control: `unsigned char` still zero-extends there.
+    let unsigned = body_of(&d, "ld_unsigned");
+    assert!(
+        !unsigned.contains("sxtb") && !unsigned.contains("ldrsb"),
+        "Apple arm64: unsigned char must not sign-extend:\n{unsigned}"
+    );
 
     // x86-64: plain char is signed, and must keep sign-extending.
     let x = asm_for("char_sign_x64", X86_64_LINUX, src);
@@ -1788,6 +1822,97 @@ int  ld_unsigned(unsigned char *p) { return *p; }
         unsigned.contains("movzb"),
         "x86-64: unsigned char must zero-extend:\n{unsigned}"
     );
+}
+
+/// Apple arm64 makes narrowing to a small integer type *the ABI's* business,
+/// so the narrowed value must be extended by its own signedness.
+///
+/// AAPCS64 §6.8.2 leaves the bits above a return value narrower than 32 bits
+/// unspecified, and the caller re-extends; Apple's ABI does not. There the
+/// callee extends a narrow return to 32 bits, the caller extends a narrow
+/// argument, and each side is entitled to assume the other did. c17 narrowed
+/// with a zero-extending mask whatever the type's signedness:
+///
+/// ```text
+///     movz x0, #195
+///     and  w0, w0, #255       ; 195, where Apple clang reads -61
+/// ```
+///
+/// c17 could not catch this against itself, because it re-extends after every
+/// call it makes -- `bl _f; sxtb x0, w0` -- so both sides agreed on a value
+/// the ABI says is already wrong. It takes Apple clang on the other side, and
+/// `plain_char_interoperates_with_apple_clang` is what found it.
+///
+/// Asserted at `-O0` and `-O2`: constant folding hid the defect at `-O2` for a
+/// constant return, but not for a computed one. `unsigned char` and
+/// `unsigned short` are the controls, so a fix cannot pass by sign-extending
+/// everything, and aarch64 Linux keeps plain `char` unsigned, so a fix cannot
+/// pass by making every `char` signed either.
+#[test]
+fn codegen_darwin_narrowing_extends_by_the_types_signedness() {
+    let src = r#"
+signed char    ret_sc(int x)   { return (signed char)x; }
+unsigned char  ret_uc(int x)   { return (unsigned char)x; }
+short          ret_sh(int x)   { return (short)x; }
+unsigned short ret_ush(int x)  { return (unsigned short)x; }
+char           ret_plain(int x){ return (char)x; }
+char           ret_const(void) { return (char)0xC3; }
+
+int take_sc(signed char c);
+int pass_sc(int x) { return take_sc((signed char)x); }
+"#;
+
+    for opt in ["-O0", "-O2"] {
+        let d = asm_for_with("narrow_ext_darwin", AARCH64_DARWIN, src, &[opt]);
+
+        // Every signed narrowing leaves a sign-extended value behind.
+        for (func, insn, mask) in [
+            ("ret_sc", "sxtb", "#255"),
+            ("ret_sh", "sxth", "#65535"),
+            ("ret_plain", "sxtb", "#255"),
+            ("ret_const", "sxtb", "#255"),
+        ] {
+            let b = body_of(&d, func);
+            assert!(
+                b.contains(insn) || !b.contains(mask),
+                "Apple arm64 {opt}: {func} must extend its return by sign, \
+                 not mask it with {mask}:\n{b}"
+            );
+            assert!(
+                !b.contains(mask),
+                "Apple arm64 {opt}: {func} still zero-extends a signed \
+                 narrowing:\n{b}"
+            );
+        }
+
+        // The caller extends a narrow argument for the same reason.
+        let b = body_of(&d, "pass_sc");
+        assert!(
+            b.contains("sxtb") && !b.contains("#255"),
+            "Apple arm64 {opt}: a signed char argument is sign-extended by the \
+             caller:\n{b}"
+        );
+
+        // Controls: the unsigned types must not acquire a sign extension.
+        for (func, insn) in [("ret_uc", "sxtb"), ("ret_ush", "sxth")] {
+            let b = body_of(&d, func);
+            assert!(
+                !b.contains(insn),
+                "Apple arm64 {opt}: {func} is unsigned and must not \
+                 sign-extend:\n{b}"
+            );
+        }
+
+        // Control: plain `char` is unsigned on aarch64 Linux, so the same
+        // source must *not* sign-extend there.
+        let a = asm_for_with("narrow_ext_a64", AARCH64_LINUX, src, &[opt]);
+        let b = body_of(&a, "ret_plain");
+        assert!(
+            !b.contains("sxtb"),
+            "aarch64 Linux {opt}: plain char is unsigned and must not \
+             sign-extend:\n{b}"
+        );
+    }
 }
 
 /// A pointer comparison must select the *unsigned* condition code.
@@ -2749,5 +2874,260 @@ int main(void)
                 "{what} at {opt}"
             );
         }
+    }
+}
+
+// `_Float16 _Complex` across a call, against gcc. System V classifies it as
+// one SSE eightbyte (both halves packed in the low 32 bits of %xmm0); AAPCS64
+// and Apple arm64 make it a two-member HFA in h0/h1. The callee takes them
+// first, between other scalars, and past the eight argument registers.
+const HALF_COMPLEX_CALLEE: &str = r#"
+typedef _Float16 _Complex hc;
+hc id(hc a) { return a; }
+hc swap(hc a) { return __builtin_complex(__imag__ a, __real__ a); }
+hc mix(int n, hc a, double d, hc b) {
+    return __builtin_complex((_Float16)(__imag__ b + (_Float16)n),
+                             (_Float16)(__real__ a + (_Float16)d));
+}
+hc many(hc a, hc b, hc c, hc d, hc e, hc f, hc g, hc h, hc i, hc j) {
+    (void)c; (void)d; (void)e; (void)f; (void)g;
+    return __builtin_complex((_Float16)(__real__ a + __real__ j),
+                             (_Float16)(__imag__ i - __imag__ b + __real__ h));
+}
+"#;
+
+const HALF_COMPLEX_CALLER: &str = r#"
+typedef _Float16 _Complex hc;
+hc id(hc a);
+hc swap(hc a);
+hc mix(int n, hc a, double d, hc b);
+hc many(hc a, hc b, hc c, hc d, hc e, hc f, hc g, hc h, hc i, hc j);
+static hc mk(double r, double i) { return __builtin_complex((_Float16)r, (_Float16)i); }
+int main(void) {
+    hc r = id(mk(1.5, -2.25));
+    if (__real__ r != 1.5f16 || __imag__ r != -2.25f16) return 1;
+    r = swap(mk(3, 4));
+    if (__real__ r != 4 || __imag__ r != 3) return 2;
+    r = mix(3, mk(1, 2), 0.5, mk(4, 5));
+    if (__real__ r != 8 || __imag__ r != 1.5f16) return 3;
+    r = many(mk(1, 2), mk(3, 4), mk(5, 6), mk(7, 8), mk(9, 10), mk(11, 12), mk(13, 14),
+             mk(15, 16), mk(17, 18), mk(19, 20));
+    if (__real__ r != 20 || __imag__ r != 29) return 4;
+    return 0;
+}
+"#;
+
+/// `_Float16 _Complex` arguments and returns agree with gcc on x86-64: a c17
+/// callee under a gcc caller, and the reverse.
+#[test]
+fn cross_abi_float16_complex_matches_gcc_on_the_host() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+    for (name, c17_unit, host_unit) in [
+        (
+            "half_complex_c17_callee",
+            HALF_COMPLEX_CALLEE,
+            HALF_COMPLEX_CALLER,
+        ),
+        (
+            "half_complex_c17_caller",
+            HALF_COMPLEX_CALLER,
+            HALF_COMPLEX_CALLEE,
+        ),
+    ] {
+        if let Some(rc) = compile_with_host_cc(name, c17_unit, host_unit) {
+            assert_eq!(rc, 0, "{name}");
+        }
+    }
+}
+
+/// The same pairings on aarch64 under qemu, with the gcc/gcc pair as the
+/// reference; and on Apple arm64, whose non-variadic HFA rule is AAPCS64's,
+/// the callee reads both halves from h0 and h1.
+#[test]
+fn cross_abi_float16_complex_matches_gcc_on_aarch64() {
+    let asm = super::asm_probe::asm_for(
+        "half_complex_darwin",
+        "aarch64-apple-darwin",
+        HALF_COMPLEX_CALLEE,
+    );
+    let body = body_of(&asm, "swap");
+    assert!(
+        body.contains("h0") && body.contains("h1"),
+        "Apple arm64 passes a _Float16 _Complex in h0/h1:\n{body}"
+    );
+
+    if !aarch64_cross_available() {
+        eprintln!("SKIP: no aarch64 cross toolchain");
+        return;
+    }
+    let callee_c = create_c_file("half_complex_callee", HALF_COMPLEX_CALLEE);
+    let caller_c = create_c_file("half_complex_caller", HALF_COMPLEX_CALLER);
+    let callee_src = callee_c.path().to_string_lossy().into_owned();
+    let caller_src = caller_c.path().to_string_lossy().into_owned();
+    assert_eq!(
+        cross_link_and_run("half_complex_ref", &[&caller_src, &callee_src]),
+        0,
+        "the gcc/gcc reference must pass, or this probe is not testing the ABI"
+    );
+    for opt in ["-O0", "-O2"] {
+        let asm = |src: &str, tag: &str| {
+            let out = plib::tmp::Builder::new()
+                .prefix(&format!("c17_half_complex_{tag}_"))
+                .suffix(".s")
+                .tempfile()
+                .expect("failed to create temp file");
+            let path = out.path().to_string_lossy().into_owned();
+            let run = run_c17(&["--target", AARCH64_LINUX, opt, "-S", "-o", &path, src]);
+            assert!(run.success, "c17 failed on the {tag}:\n{}", run.stderr);
+            (out, path)
+        };
+        let (_callee_tmp, callee_s) = asm(&callee_src, "callee");
+        let (_caller_tmp, caller_s) = asm(&caller_src, "caller");
+        assert_eq!(
+            cross_link_and_run("half_complex_c17_callee", &[&caller_src, &callee_s]),
+            0,
+            "gcc caller, c17 callee, {opt}"
+        );
+        assert_eq!(
+            cross_link_and_run("half_complex_c17_caller", &[&caller_s, &callee_src]),
+            0,
+            "c17 caller, gcc callee, {opt}"
+        );
+    }
+}
+
+/// The cursor advance of each Darwin `va_arg` in `body`, in order: every
+/// `add R, R, #N` that is stored straight back through the `va_list`.
+fn darwin_va_advances(body: &str) -> Vec<i64> {
+    let lines: Vec<&str> = body.lines().map(str::trim).collect();
+    lines
+        .windows(2)
+        .filter_map(|w| {
+            let (dst, rest) = w[0].strip_prefix("add ")?.split_once(", ")?;
+            let (src, imm) = rest.split_once(", #")?;
+            (dst == src && w[1].starts_with(&format!("str {dst}, [")))
+                .then(|| imm.parse().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// Darwin `va_arg` of a complex type reads the value as the object it is on
+/// the stack -- both halves, contiguous at the cursor -- and steps over its
+/// own size rounded to eight.
+///
+/// It took each complex type for a scalar of its base: one half was read,
+/// the cursor moved by one slot, and the result was written into a register
+/// that every consumer then dereferenced as the address of the two halves.
+/// Asserted on assembly because there is no macOS runner and qemu cannot run
+/// Mach-O; the behaviour is pinned on the other targets by
+/// `c99_complex_va_arg_interoperates_with_gcc_aarch64`.
+#[test]
+fn codegen_darwin_va_arg_complex_reads_the_object() {
+    let src = r#"
+typedef __builtin_va_list va_list;
+double re_d(int n, ...) {
+    va_list ap; __builtin_va_start(ap, n);
+    double _Complex z = __builtin_va_arg(ap, double _Complex);
+    int after = __builtin_va_arg(ap, int);
+    __builtin_va_end(ap);
+    return __imag__ z + after;
+}
+float re_f(int n, ...) {
+    va_list ap; __builtin_va_start(ap, n);
+    float _Complex z = __builtin_va_arg(ap, float _Complex);
+    int after = __builtin_va_arg(ap, int);
+    __builtin_va_end(ap);
+    return __imag__ z + after;
+}
+_Float16 re_h(int n, ...) {
+    va_list ap; __builtin_va_start(ap, n);
+    _Float16 _Complex z = __builtin_va_arg(ap, _Float16 _Complex);
+    int after = __builtin_va_arg(ap, int);
+    __builtin_va_end(ap);
+    return __imag__ z + after;
+}
+"#;
+    let asm = asm_for("darwin_va_complex", "aarch64-apple-darwin", src);
+    // Apple's `long double` is `double`, so there is no wider case to check.
+    for (func, first) in [("re_d", 16), ("re_f", 8), ("re_h", 8)] {
+        let body = body_of(&asm, func);
+        assert_eq!(
+            darwin_va_advances(body),
+            [first, 8],
+            "{func}: the complex value takes its own size rounded to eight, \
+             then the `int` one slot:\n{body}"
+        );
+    }
+    // Both halves of the double pair are read, from +0 and +8 of the cursor.
+    let body = body_of(&asm, "re_d");
+    assert!(
+        body.lines()
+            .map(str::trim)
+            .any(|l| l.starts_with("ldr x") && l.ends_with(", #8]")),
+        "re_d: the imaginary half at +8 is never read:\n{body}"
+    );
+}
+
+/// A Darwin variadic call stacks a complex argument's *value*, and passes a
+/// named complex argument in `d0`/`d1` as any other call does.
+///
+/// Its argument walk was its own and knew scalars and wide structs only. A
+/// variadic `_Complex` -- whose pseudo is an address at every size -- was
+/// stored as that pointer, zero-extended into a sixteen-byte pair, and a
+/// named complex or HFA argument went to `x0` as the address.
+#[test]
+fn codegen_darwin_variadic_call_passes_complex_values() {
+    let src = r#"
+struct P { double a, b; };
+int check(int n, ...);
+int nf(double _Complex z, ...);
+int ns(struct P p, ...);
+int var_d(double _Complex x) { return check(1, x); }
+int var_f(float _Complex x) { return check(1, x); }
+int named_d(double _Complex x) { return nf(x, 1); }
+int named_s(struct P p) { return ns(p, 1); }
+"#;
+    let asm = asm_for("darwin_va_complex_call", "aarch64-apple-darwin", src);
+    let lines = |func: &str| -> Vec<String> {
+        body_of(&asm, func)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .collect()
+    };
+
+    let d = lines("var_d");
+    for at in ["[sp]", "[sp, #8]"] {
+        assert!(
+            d.iter().any(|l| l.starts_with("str d") && l.ends_with(at)),
+            "var_d: a double half must be stored at {at}:\n{}",
+            d.join("\n")
+        );
+    }
+    let f = lines("var_f");
+    for at in ["[sp]", "[sp, #4]"] {
+        assert!(
+            f.iter().any(|l| l.starts_with("str s") && l.ends_with(at)),
+            "var_f: a float half must be stored at {at}:\n{}",
+            f.join("\n")
+        );
+    }
+
+    for func in ["named_d", "named_s"] {
+        let body = lines(func);
+        for v in ["d0", "d1"] {
+            assert!(
+                body.iter().any(|l| l.starts_with(&format!("ldr {v}, ["))),
+                "{func}: the named pair must be loaded into {v}:\n{}",
+                body.join("\n")
+            );
+        }
+        assert!(
+            !body.iter().any(|l| l.starts_with("mov x0, x")),
+            "{func}: the pair's address must not be passed in x0:\n{}",
+            body.join("\n")
+        );
     }
 }

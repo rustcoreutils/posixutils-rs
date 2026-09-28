@@ -733,11 +733,16 @@ impl Aarch64CodeGen {
             }
 
             Opcode::Zext | Opcode::Sext | Opcode::Trunc => {
-                self.emit_extend(insn);
+                self.emit_extend(insn, types);
             }
 
             // Floating-point arithmetic operations
-            Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv => {
+            Opcode::FAdd
+            | Opcode::FSub
+            | Opcode::FMul
+            | Opcode::FDiv
+            | Opcode::FMin
+            | Opcode::FMax => {
                 self.emit_fp_binop(insn, types);
             }
 
@@ -812,11 +817,13 @@ impl Aarch64CodeGen {
             Opcode::StackSave => self.emit_stack_save(insn),
             Opcode::StackRestore => self.emit_stack_restore(insn),
 
-            Opcode::Fabs32 => self.emit_fabs(insn, types, false),
-            Opcode::Fabs64 => self.emit_fabs(insn, types, true),
+            Opcode::Fabs => self.emit_fp_abs(insn, types),
 
-            Opcode::Signbit32 => self.emit_signbit32(insn, types),
-            Opcode::Signbit64 => self.emit_signbit64(insn, types),
+            Opcode::CopySign => self.emit_fp_copysign(insn, types),
+            Opcode::Sqrt => self.emit_fp_sqrt(insn, types),
+            Opcode::RoundToIntegral(how) => self.emit_fp_round_to_integral(insn, how, types),
+            Opcode::Fma => self.emit_fp_fma(insn, types),
+            Opcode::Signbit => self.emit_fp_signbit(insn, types),
 
             Opcode::Unreachable => {
                 // Emit brk #1 instruction - software breakpoint that traps
@@ -1370,12 +1377,7 @@ impl CodeGenerator for Aarch64CodeGen {
             self.base.emit_strings(&module.strings);
         }
 
-        // Emit wide string literals
-        if !module.wide_strings.is_empty() {
-            self.base.emit_wide_strings(&module.wide_strings);
-        }
-
-        // Emit char16_t / char32_t string literals
+        // Emit char16_t, char32_t and wchar_t string literals
         if !module.utf16_strings.is_empty() {
             self.base.emit_utf16_strings(&module.utf16_strings);
         }

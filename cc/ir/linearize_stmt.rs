@@ -32,11 +32,7 @@ use crate::types::TypeTable;
 /// The value is discarded either way, and a missing one leaves the returned
 /// value indeterminate, which is what gcc's program does as well.
 fn return_value_ness_violation(pos: Position, msg: &str) {
-    if crate::diag::permissive() {
-        crate::diag::warning(pos, msg);
-    } else {
-        error(pos, msg);
-    }
+    crate::diag::permissive_error(pos, msg);
 }
 
 use crate::types::{TypeId, TypeKind, TypeModifiers};
@@ -153,7 +149,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         .unwrap_or(expr_typ);
 
                     if let Some(sret_ptr) = self.struct_return_ptr {
-                        self.emit_sret_return(e, sret_ptr, self.struct_return_bytes);
+                        self.emit_sret_return(e, sret_ptr, func_ret_type);
                     } else if let Some(ret_type) = self.two_reg_return_type {
                         self.emit_two_reg_return(e, ret_type);
                     } else if let Some(b) = self.complex_to_bool(e, func_ret_type) {
@@ -215,6 +211,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 } else {
                     self.emit(Instruction::ret(None));
                 }
+                self.start_unreachable_block();
             }
 
             Stmt::Break(_) => {
@@ -223,6 +220,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.unwind_vla_marks(JumpKind::Break);
                         self.emit(Instruction::br(target));
                         self.link_bb(current, target);
+                        self.start_unreachable_block();
                     }
                 }
             }
@@ -233,6 +231,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.unwind_vla_marks(JumpKind::Continue);
                         self.emit(Instruction::br(target));
                         self.link_bb(current, target);
+                        self.start_unreachable_block();
                     }
                 }
             }
@@ -1288,26 +1287,18 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     pub(crate) fn linearize_if(&mut self, cond: &Expr, then_stmt: &Stmt, else_stmt: Option<&Stmt>) {
-        let cond_val = self.linearize_condition(cond);
+        let cond_val = self.controlling_value(cond);
 
         let then_bb = self.alloc_bb();
         let else_bb = self.alloc_bb();
         let merge_bb = self.alloc_bb();
 
-        // Conditional branch
-        if let Some(current) = self.current_bb {
-            if else_stmt.is_some() {
-                self.emit(Instruction::cbr(cond_val, then_bb, else_bb));
-            } else {
-                self.emit(Instruction::cbr(cond_val, then_bb, merge_bb));
-            }
-            self.link_bb(current, then_bb);
-            if else_stmt.is_some() {
-                self.link_bb(current, else_bb);
-            } else {
-                self.link_bb(current, merge_bb);
-            }
-        }
+        let false_bb = if else_stmt.is_some() {
+            else_bb
+        } else {
+            merge_bb
+        };
+        self.branch_on(cond_val, then_bb, false_bb);
 
         // Then block
         self.switch_bb(then_bb);
@@ -1340,15 +1331,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Condition block
         self.switch_bb(cond_bb);
-        let cond_val = self.linearize_condition(cond);
-        // After linearizing condition, current_bb may be different from cond_bb
-        // (e.g., if condition contains short-circuit operators like && or ||).
-        // Link the CURRENT block to body_bb and exit_bb.
-        if let Some(cond_end_bb) = self.current_bb {
-            self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
-            self.link_bb(cond_end_bb, body_bb);
-            self.link_bb(cond_end_bb, exit_bb);
-        }
+        // From the block the condition ended in, which short-circuit
+        // operators can make a different one from cond_bb.
+        self.branch_on_condition(cond, body_bb, exit_bb);
 
         // Body block
         self.break_targets.push(exit_bb);
@@ -1404,15 +1389,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Condition block
         self.switch_bb(cond_bb);
-        let cond_val = self.linearize_condition(cond);
-        // After linearizing condition, current_bb may be different from cond_bb
-        // (e.g., if condition contains short-circuit operators like && or ||).
-        // Link the CURRENT block to body_bb and exit_bb.
-        if let Some(cond_end_bb) = self.current_bb {
-            self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
-            self.link_bb(cond_end_bb, body_bb);
-            self.link_bb(cond_end_bb, exit_bb);
-        }
+        // From the block the condition ended in, which short-circuit
+        // operators can make a different one from cond_bb.
+        self.branch_on_condition(cond, body_bb, exit_bb);
 
         // Exit block
         self.switch_bb(exit_bb);
@@ -1454,15 +1433,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Condition block
         self.switch_bb(cond_bb);
         if let Some(cond_expr) = cond {
-            let cond_val = self.linearize_condition(cond_expr);
-            // After linearizing condition, current_bb may be different from cond_bb
-            // (e.g., if condition contains short-circuit operators like && or ||).
-            // Link the CURRENT block to body_bb and exit_bb.
-            if let Some(cond_end_bb) = self.current_bb {
-                self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
-                self.link_bb(cond_end_bb, body_bb);
-                self.link_bb(cond_end_bb, exit_bb);
-            }
+            // From the block the condition ended in, which short-circuit
+            // operators can make a different one from cond_bb.
+            self.branch_on_condition(cond_expr, body_bb, exit_bb);
         } else {
             // No condition = always true
             self.emit(Instruction::br(body_bb));
@@ -1546,7 +1519,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Default goes to default_bb if present, otherwise exit_bb
         let default_target = default_bb.unwrap_or(exit_bb);
 
-        if size > 64 {
+        if let Some(selector) = self.eval_const_expr(expr) {
+            // A constant selector takes one edge, as a constant condition does
+            // (`branch_on`): the labels it does not select are reached only by
+            // falling into them, and a block nothing reaches is not emitted.
+            // Both sides are values of the promoted type, as the collector
+            // records the labels.
+            let target = case_values
+                .iter()
+                .position(|&(lo, hi)| lo <= selector && selector <= hi)
+                .map_or(default_target, |idx| case_bbs[idx]);
+            if let Some(current) = self.current_bb {
+                self.emit(Instruction::br(target));
+                self.link_bb(current, target);
+            }
+        } else if size > 64 {
             // The `Switch` instruction carries its labels as `i64` and both
             // backends compare in one general register, so a controlling
             // expression wider than that had its high half ignored:
@@ -2052,9 +2039,10 @@ impl<'a> super::linearize::Linearizer<'a> {
     fn string_literal_units(kind: &ExprKind) -> Option<Vec<i128>> {
         match kind {
             ExprKind::StringLit(s) => Some(s.chars().map(|c| (c as u32 as u8) as i128).collect()),
-            ExprKind::WideStringLit(s) => Some(s.chars().map(|c| c as u32 as i128).collect()),
             ExprKind::Utf16StringLit(u) => Some(u.iter().map(|c| *c as i128).collect()),
-            ExprKind::Utf32StringLit(u) => Some(u.iter().map(|c| *c as i128).collect()),
+            ExprKind::WideStringLit(u) | ExprKind::Utf32StringLit(u) => {
+                Some(u.iter().map(|c| *c as i128).collect())
+            }
             _ => None,
         }
     }
@@ -2193,76 +2181,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         crate::constexpr::eval(self, scope, expr)
     }
 
-    /// Fold a floating constant expression for a static initializer, with the
-    /// `const`-object folding [`Self::eval_const_init_expr`] describes.
-    ///
-    /// There is no `Standard` entry point beside this one because no strict
-    /// context reaches the floating evaluator: an array size, a `case` label
-    /// and `_Static_assert` all take an *integer* constant expression, and a
-    /// floating one is refused before it gets here. The scope is still a
-    /// parameter rather than a constant so that adding such a caller is a
-    /// one-line change and cannot silently inherit the lax rule.
-    pub(crate) fn eval_const_float_init_expr(&self, expr: &Expr) -> Option<FloatVal> {
-        self.eval_const_float_expr_scoped(ConstScope::StaticInitializer, expr)
-    }
-
-    fn eval_const_float_expr_scoped(&self, scope: ConstScope, expr: &Expr) -> Option<FloatVal> {
-        match &expr.kind {
-            ExprKind::FloatLit(v) => Some(*v),
-            // Exact: a `u128` mantissa has no more bits than the significand,
-            // where `f64` would have rounded anything past the 53rd.
-            ExprKind::IntLit(v) => Some(FloatVal::from_i128(*v as i128)),
-            ExprKind::CharLit(c) => Some(FloatVal::from_i128(*c as i128)),
-
-            // A `const double` folds in a static initializer exactly as a
-            // `const int` does; without this `const double d = 2.5; double x =
-            // d * 2;` was rejected while the integer spelling compiled.
-            ExprKind::Ident(symbol_id) if scope == ConstScope::StaticInitializer => {
-                self.const_object_float_value(*symbol_id)
-            }
-
-            ExprKind::Unary { op, operand } => {
-                let val = self.eval_const_float_expr_scoped(scope, operand)?;
-                match op {
-                    UnaryOp::Neg => Some(val.negated()),
-                    _ => None,
-                }
-            }
-
-            // The operation is done in the format of its own result type,
-            // which is the type the usual arithmetic conversions already gave
-            // this node -- not in whatever width the operands were written at.
-            ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_float_expr_scoped(scope, left)?;
-                let r = self.eval_const_float_expr_scoped(scope, right)?;
-                let fmt = expr.typ.and_then(|t| self.types.fp_format(t))?;
-                Some(match op {
-                    BinaryOp::Add => l.add(r, fmt),
-                    BinaryOp::Sub => l.sub(r, fmt),
-                    BinaryOp::Mul => l.mul(r, fmt),
-                    BinaryOp::Div => l.div(r, fmt),
-                    _ => return None,
-                })
-            }
-
-            // A cast rounds to the target format. Discarding the cast type
-            // let `(float)0.1q` keep every bit of its binary128 value in a
-            // static initializer, where the same cast at run time rounds.
-            ExprKind::Cast {
-                expr: inner,
-                cast_type,
-            } => {
-                let val = self.eval_const_float_expr_scoped(scope, inner)?;
-                Some(match self.types.fp_format(*cast_type) {
-                    Some(fmt) => val.round_to_format(fmt),
-                    None => val,
-                })
-            }
-
-            _ => None,
-        }
-    }
-
     /// The byte offset `array[index]` adds to the address of `array`.
     ///
     /// Shared by the two static-address walks, which differ only in whether
@@ -2331,15 +2249,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let lit = lit.clone();
                 Some((self.module.add_string(lit), 0))
             }
-            ExprKind::WideStringLit(lit) => {
-                let lit = lit.clone();
-                Some((self.module.add_wide_string(lit), 0))
-            }
             ExprKind::Utf16StringLit(units) => {
                 let units = units.clone();
                 Some((self.module.add_utf16_string(units), 0))
             }
-            ExprKind::Utf32StringLit(units) => {
+            ExprKind::WideStringLit(units) | ExprKind::Utf32StringLit(units) => {
                 let units = units.clone();
                 Some((self.module.add_utf32_string(units), 0))
             }
@@ -2653,12 +2567,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.continue_targets.pop();
 
                 self.switch_bb(cond_bb);
-                let cond_val = self.linearize_condition(cond);
-                if let Some(cond_end_bb) = self.current_bb {
-                    self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
-                    self.link_bb(cond_end_bb, body_bb);
-                    self.link_bb(cond_end_bb, exit_bb);
-                }
+                self.branch_on_condition(cond, body_bb, exit_bb);
 
                 self.switch_bb(exit_bb);
             }
@@ -2676,12 +2585,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
 
                 self.switch_bb(cond_bb);
-                let cond_val = self.linearize_condition(cond);
-                if let Some(cond_end_bb) = self.current_bb {
-                    self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
-                    self.link_bb(cond_end_bb, body_bb);
-                    self.link_bb(cond_end_bb, exit_bb);
-                }
+                self.branch_on_condition(cond, body_bb, exit_bb);
 
                 self.break_targets.push(exit_bb);
                 self.continue_targets.push(cond_bb);
@@ -2732,12 +2636,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
                 self.switch_bb(cond_bb);
                 if let Some(cond_expr) = cond {
-                    let cond_val = self.linearize_condition(cond_expr);
-                    if let Some(cond_end_bb) = self.current_bb {
-                        self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
-                        self.link_bb(cond_end_bb, body_bb);
-                        self.link_bb(cond_end_bb, exit_bb);
-                    }
+                    self.branch_on_condition(cond_expr, body_bb, exit_bb);
                 } else {
                     self.emit(Instruction::br(body_bb));
                     self.link_bb(cond_bb, body_bb);
@@ -2804,12 +2703,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     merge_bb
                 };
 
-                let cond_val = self.linearize_condition(cond);
-                if let Some(current) = self.current_bb {
-                    self.emit(Instruction::cbr(cond_val, then_bb, else_bb));
-                    self.link_bb(current, then_bb);
-                    self.link_bb(current, else_bb);
-                }
+                self.branch_on_condition(cond, then_bb, else_bb);
 
                 self.switch_bb(then_bb);
                 self.linearize_switch_stmt(then_stmt, case_values, case_bbs, default_bb, case_idx);
@@ -3833,8 +3727,7 @@ impl JumpScopeWalk {
 /// The linearizer's half of the shared C17 6.6 walk.
 ///
 /// [`crate::constexpr`] owns the walk; what differs from the parser's half is
-/// the `const`-object folding gcc performs in a static initializer, and that a
-/// floating subexpression folds in its own format rather than through `f64`.
+/// the `const`-object folding gcc performs in a static initializer.
 impl crate::constexpr::ConstEnv for Linearizer<'_> {
     /// A static initializer needs an answer; the linearizer's other folds --
     /// a constant `?:` condition, chiefly -- are optimizations, and one of
@@ -3862,13 +3755,17 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
         self.resolve_struct_type(typ)
     }
 
-    /// Folded at the expression's own precision and narrowed once, rather than
-    /// computed in `f64`: the two arms that ask for this -- an ordering and a
-    /// truncating cast -- are both decided correctly by the `f64` result, and
-    /// the exactness matters underneath it.
-    fn float_value(&self, scope: ConstScope, expr: &Expr) -> Option<f64> {
-        self.eval_const_float_expr_scoped(scope, expr)
-            .map(|v| v.to_f64())
+    /// A `const` floating object folds only in a static initializer, as its
+    /// integer counterpart in [`Self::ident_value`] does.
+    fn float_ident_value(
+        &self,
+        sym: crate::symbol::SymbolId,
+        scope: ConstScope,
+    ) -> Option<FloatVal> {
+        match scope {
+            ConstScope::Standard => None,
+            ConstScope::StaticInitializer => self.const_object_float_value(sym),
+        }
     }
 }
 

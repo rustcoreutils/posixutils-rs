@@ -14,15 +14,11 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
     vec![
         // Architecture identification
         ("__aarch64__", Some("1")),
-        ("__arm64__", Some("1")), // macOS uses this
+        // `__arm64__` is Apple's spelling, in `get_darwin_macros`.
         ("__ARM_ARCH", Some("8")),
         ("__ARM_64BIT_STATE", Some("1")),
         ("__ARM_ARCH_ISA_A64", Some("1")),
-        // Byte order (AArch64 is little-endian by default)
-        ("__BYTE_ORDER__", Some("__ORDER_LITTLE_ENDIAN__")),
-        ("__ORDER_LITTLE_ENDIAN__", Some("1234")),
-        ("__ORDER_BIG_ENDIAN__", Some("4321")),
-        ("__LITTLE_ENDIAN__", Some("1")),
+        // Byte order is in `arch::get_misc_macros`, for every target.
         ("__AARCH64EL__", Some("1")),
         // Register size
         ("__REGISTER_PREFIX__", Some("")),
@@ -30,8 +26,9 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         // and `get_additional_sizeof_macros`, which know the OS as well as the
         // architecture — it is quad on aarch64 Linux but plain double on
         // Apple, and this list cannot tell them apart.
-        // char is unsigned on ARM by default
-        ("__CHAR_UNSIGNED__", Some("1")),
+        // `__CHAR_UNSIGNED__` is not here: plain `char` is unsigned under
+        // AAPCS64 but signed on Apple arm64, so `get_arch_macros` defines it
+        // from `Target::plain_char`.
         // Advanced SIMD is mandatory in the AArch64 base architecture, so
         // this is a fact about the target and gcc defines it unconditionally
         // here. It says nothing about whether <arm_neon.h> is available --
@@ -55,14 +52,8 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2", Some("1")),
         ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4", Some("1")),
         ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8", Some("1")),
-        // Lock-free atomics
-        ("__GCC_ATOMIC_BOOL_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_CHAR_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_SHORT_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_INT_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_LONG_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_LLONG_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_POINTER_LOCK_FREE", Some("2")),
+        // The __GCC_ATOMIC_*_LOCK_FREE family is derived from the type
+        // sizes, in `arch::get_atomic_macros`.
         // ARM-specific features
         ("__ARM_SIZEOF_WCHAR_T", Some("4")),
         ("__ARM_SIZEOF_MINIMAL_ENUM", Some("4")),
@@ -71,4 +62,10 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         // 128-bit integer support
         ("__SIZEOF_INT128__", Some("16")),
     ]
+}
+
+/// The macros clang adds for arm64 on Darwin alone. gcc on aarch64 Linux
+/// defines neither, and code reads `__arm64__` as "Apple".
+pub fn get_darwin_macros() -> Vec<(&'static str, Option<&'static str>)> {
+    vec![("__arm64__", Some("1")), ("__arm64", Some("1"))]
 }

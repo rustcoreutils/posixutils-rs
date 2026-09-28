@@ -11,7 +11,7 @@
 
 use crate::arch::lir::{Directive, EmitAsm, LirInst, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
-use crate::float::FloatVal;
+use crate::float::{FloatVal, FpFormat};
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId};
 use crate::target::{Os, Target};
 use crate::types::TypeTable;
@@ -569,41 +569,24 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// `size` is the storage size of the declared type, so it selects the
     /// format: 2 is `_Float16`, 4 is binary32, 8 is binary64, and 16 is
     /// whatever `long double` means here -- binary128 on aarch64, an x87
-    /// 80-bit extended padded to 16 bytes on x86_64.
+    /// 80-bit extended padded to 16 bytes on x86_64. Every width is encoded
+    /// from the exact value, so `LDBL_MAX` is not already infinity and a NaN
+    /// keeps its sign and payload.
     fn emit_float_initializer(&mut self, val: FloatVal, size: usize) {
         match size {
-            2 => {
-                // IEEE-754 binary16 is the same encoding on both targets; the
-                // two backends carry byte-identical copies of this conversion.
-                let bits = crate::arch::aarch64::f64_to_f16_bits(val.to_f64());
-                self.push_directive(Directive::Short(bits as i64));
-            }
-            4 => {
-                let bits = (val.to_f64() as f32).to_bits();
-                self.push_directive(Directive::Long(bits as i64));
-            }
+            2 => self.push_directive(Directive::Short(val.to_bits_at_width(16))),
+            4 => self.push_directive(Directive::Long(val.to_bits_at_width(32))),
             16 => {
-                // The only width where the literal's full precision matters:
-                // both encodings are produced from the exact value rather than
-                // from a double, so `LDBL_MAX` is not already infinity here.
-                let (lo, hi) = match self.target.arch {
-                    crate::target::Arch::Aarch64 => val.to_f128_bits(),
-                    crate::target::Arch::X86_64 => {
-                        let bytes = val.to_x87_bytes();
-                        let mut lo = [0u8; 8];
-                        let mut hi = [0u8; 8];
-                        lo.copy_from_slice(&bytes[..8]);
-                        hi.copy_from_slice(&bytes[8..]);
-                        (u64::from_le_bytes(lo), u64::from_le_bytes(hi))
-                    }
+                let fmt = match self.target.arch {
+                    crate::target::Arch::Aarch64 => FpFormat::Binary128,
+                    crate::target::Arch::X86_64 => FpFormat::X87Extended,
                 };
-                self.push_directive(Directive::Quad(lo as i64));
-                self.push_directive(Directive::Quad(hi as i64));
+                // Both targets are little-endian: the low half first.
+                let bits = val.to_bits(fmt);
+                self.push_directive(Directive::Quad(bits as i64));
+                self.push_directive(Directive::Quad((bits >> 64) as i64));
             }
-            _ => {
-                // double - emit as 64-bit IEEE 754
-                self.push_directive(Directive::Quad(val.to_f64().to_bits() as i64));
-            }
+            _ => self.push_directive(Directive::Quad(val.to_bits_at_width(64))),
         }
     }
 
@@ -675,26 +658,6 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                     self.push_directive(Directive::Zero(size - bytes_emitted));
                 }
             }
-            Initializer::WideString(s) => {
-                // Emit wide string as sequence of 4-byte values (wchar_t = int)
-                // -- at most as many as fit, for the reason `String` truncates.
-                // A flexible array member has no bound; see `String`.
-                let room = if size == 0 { usize::MAX } else { size / 4 };
-                let mut emitted = 0;
-                for ch in s.chars().take(room) {
-                    self.push_directive(Directive::Long(ch as i64));
-                    emitted += 4;
-                }
-                // The null terminator is part of the value only when there is
-                // room for it: `wchar_t w[3] = L"abc"` holds no terminator.
-                if size == 0 || emitted + 4 <= size {
-                    self.push_directive(Directive::Long(0));
-                    emitted += 4;
-                }
-                if size > emitted {
-                    self.push_directive(Directive::Zero(size - emitted));
-                }
-            }
             Initializer::Utf16String(units) => {
                 // char16_t: 2 bytes per code unit.
                 // A flexible array member has no bound; see `String`.
@@ -713,7 +676,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 }
             }
             Initializer::Utf32String(units) => {
-                // char32_t: 4 bytes per code point.
+                // char32_t, and wchar_t: 4 bytes per code unit.
                 // A flexible array member has no bound; see `String`.
                 let room = if size == 0 { usize::MAX } else { size / 4 };
                 let mut emitted = 0;
@@ -872,30 +835,6 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         self.push_directive(Directive::Text);
     }
 
-    /// Emit wide string literals to the rodata section
-    /// Each character is output as a 4-byte value (wchar_t = int = 4 bytes)
-    pub fn emit_wide_strings(&mut self, wide_strings: &[(String, String)]) {
-        if wide_strings.is_empty() {
-            return;
-        }
-
-        self.push_directive(Directive::Rodata);
-        // wchar_t is a 4-byte int: two, as a power of two.
-        self.push_directive(Directive::Align(2));
-
-        for (label, content) in wide_strings {
-            self.push_directive(Directive::local_label(label));
-            // Emit each character as a 4-byte value
-            for ch in content.chars() {
-                self.push_directive(Directive::Long(ch as i64));
-            }
-            // Null terminator
-            self.push_directive(Directive::Long(0));
-        }
-
-        self.push_directive(Directive::Text);
-    }
-
     /// Emit `u"..."` literals referenced by address.
     pub fn emit_utf16_strings(&mut self, strings: &[(String, Vec<u16>)]) {
         if strings.is_empty() {
@@ -913,7 +852,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         self.push_directive(Directive::Text);
     }
 
-    /// Emit `U"..."` literals referenced by address.
+    /// Emit `U"..."` and `L"..."` literals referenced by address.
     pub fn emit_utf32_strings(&mut self, strings: &[(String, Vec<u32>)]) {
         if strings.is_empty() {
             return;

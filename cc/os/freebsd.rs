@@ -19,8 +19,7 @@ pub fn get_macros() -> Vec<(&'static str, Option<String>)> {
         ("__FreeBSD_kernel__", Some("1".into())),
         // ELF binary format
         ("__ELF__", Some("1".into())),
-        // BSD compatibility
-        ("BSD", Some("199506".into())),
+        // BSD visibility. (`BSD` itself is <sys/param.h>'s, not a predefine.)
         ("__BSD_VISIBLE", Some("1".into())),
         // POSIX threads
         ("_REENTRANT", Some("1".into())),

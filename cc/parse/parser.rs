@@ -10,7 +10,7 @@
 // Recursive descent parser with Pratt-style precedence climbing
 //
 
-use super::ast::{BinaryOp, Expr, ExprKind, UnaryOp};
+use super::ast::Expr;
 use crate::constexpr::ConstScope;
 use crate::diag;
 use crate::strings::StringId;
@@ -258,6 +258,18 @@ pub struct Parser<'a> {
     /// Names for which some file-scope declaration omitted `inline`.
     /// See [`crate::symbol::Symbol::has_non_inline_decl`].
     pub(super) declared_non_inline_fns: std::collections::BTreeSet<StringId>,
+    /// Names the translation unit has defined a function under so far, weak
+    /// definitions aside; a definition displaces some library builtins (see
+    /// `InlineLibraryFn::yields_to_a_definition`). Kept here for the same
+    /// reason as `declared_extern_fns`: a later declaration binds a fresh
+    /// symbol that knows nothing of the body.
+    pub(super) defined_functions: std::collections::HashSet<StringId>,
+    /// Library functions the parser declared itself, for a `__builtin_` alias
+    /// the translation unit never declared, whose parameter types are
+    /// placeholders rather than the library's (see `declare_chk_builtin`). A
+    /// call is not checked against those types: they would report errors
+    /// the program does not have.
+    pub(super) placeholder_prototypes: std::collections::HashSet<crate::symbol::SymbolId>,
     /// `#pragma pack` directives, and where they stood in the token stream.
     ///
     /// Sorted by index; `pack_cursor` is how far the parser has consumed
@@ -280,6 +292,9 @@ pub struct Parser<'a> {
     /// iterated, so no iteration order can reach the output. See the container
     /// selection rule in `cc/CLAUDE.md`.
     pub(super) vm_typedefs: HashMap<SymbolId, u32>,
+    /// How a call to a library builtin is evaluated: the optimization level
+    /// and `-f[no-]math-errno`. See [`Self::set_library_call_policy`].
+    pub(super) library_call_policy: super::library_builtin::LibraryCallPolicy,
 }
 
 impl<'a> Parser<'a> {
@@ -318,12 +333,22 @@ impl<'a> Parser<'a> {
             declared_asm_labels: BTreeMap::new(),
             declared_extern_fns: std::collections::BTreeSet::new(),
             declared_non_inline_fns: std::collections::BTreeSet::new(),
+            defined_functions: std::collections::HashSet::new(),
+            placeholder_prototypes: std::collections::HashSet::new(),
             pack_directives,
             pack_cursor: 0,
             vm_typedefs: HashMap::new(),
+            library_call_policy: Default::default(),
             pack_current: None,
             pack_stack: Vec::new(),
         }
+    }
+
+    /// Evaluate library builtins as the command line says: whether the
+    /// optimizer is on, and whether `errno` is to be set. The default is
+    /// [`LibraryCallPolicy::default`](super::library_builtin::LibraryCallPolicy).
+    pub fn set_library_call_policy(&mut self, policy: super::library_builtin::LibraryCallPolicy) {
+        self.library_call_policy = policy;
     }
 
     /// The alignment cap `#pragma pack` puts on a structure defined here.
@@ -651,53 +676,6 @@ impl Parser<'_> {
         self.symbols.lookup_typedef(name_id).is_some()
     }
 
-    /// The `f64` value of a constant floating subexpression.
-    ///
-    /// Only reached from a comparison, whose result is an integer -- the
-    /// arithmetic itself is folded at full width by the linearizer's
-    /// `eval_const_float_expr` for anything that survives to code generation.
-    /// `f64` is enough to decide an ordering that `i128` truncation was
-    /// getting wrong.
-    pub(crate) fn eval_const_f64(&self, scope: ConstScope, expr: &Expr) -> Option<f64> {
-        match &expr.kind {
-            ExprKind::FloatLit(v) => Some(v.to_f64()),
-            ExprKind::IntLit(v) => Some(*v as f64),
-            // `CharLit` is an `i64` whose signedness the lexer has already
-            // resolved, so `'\x80'` is -128 where `char` is signed. Rounding
-            // it through `u32` made that 4294967168.0.
-            ExprKind::CharLit(c) => Some(*c as f64),
-            ExprKind::Cast { expr: inner, .. } => {
-                let v = self.eval_const_f64(scope, inner)?;
-                // A cast to an integer type truncates before the comparison.
-                match expr.typ {
-                    Some(t) if self.types.is_integer(t) => Some(v.trunc()),
-                    _ => Some(v),
-                }
-            }
-            ExprKind::Unary {
-                op: UnaryOp::Neg,
-                operand,
-            } => Some(-self.eval_const_f64(scope, operand)?),
-            ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_f64(scope, left)?;
-                let r = self.eval_const_f64(scope, right)?;
-                match op {
-                    BinaryOp::Add => Some(l + r),
-                    BinaryOp::Sub => Some(l - r),
-                    BinaryOp::Mul => Some(l * r),
-                    BinaryOp::Div if r != 0.0 => Some(l / r),
-                    _ => None,
-                }
-            }
-            // Anything else that is an integer constant expression converts to
-            // one. `sizeof`, `_Alignof`, an enumerator and a conditional all
-            // reach here, and each was answered "not a constant expression"
-            // for want of an arm -- so `_Static_assert(sizeof(int) < 4.5, "")`
-            // was rejected although both operands are perfectly constant.
-            _ => crate::constexpr::eval(self, scope, expr).map(|v| v as f64),
-        }
-    }
-
     /// Evaluate an integer constant expression: array bounds, enumerators,
     /// `case` labels, bit-field widths, `_Static_assert`.
     ///
@@ -866,7 +844,7 @@ impl Parser<'_> {
 /// The parser's half of the shared C17 6.6 walk.
 ///
 /// [`crate::constexpr`] owns the walk; what differs between the two hosts is
-/// only what an identifier means and how a floating subexpression folds.
+/// only what an identifier means.
 impl crate::constexpr::ConstEnv for Parser<'_> {
     /// Every constant expression the parser folds is one C requires, so it
     /// always answers.
@@ -890,7 +868,14 @@ impl crate::constexpr::ConstEnv for Parser<'_> {
         self.resolve_struct_type(typ)
     }
 
-    fn float_value(&self, scope: ConstScope, expr: &Expr) -> Option<f64> {
-        self.eval_const_f64(scope, expr)
+    /// No floating identifier has a value in the parser, for the reason
+    /// [`Self::ident_value`] gives: a `const double` lives in a global that
+    /// does not exist yet.
+    fn float_ident_value(
+        &self,
+        _sym: crate::symbol::SymbolId,
+        _scope: ConstScope,
+    ) -> Option<crate::float::FloatVal> {
+        None
     }
 }

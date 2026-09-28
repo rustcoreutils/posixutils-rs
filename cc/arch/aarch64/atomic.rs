@@ -599,13 +599,7 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::FImm(f, imm_size) => {
-                let bits = if imm_size == 16 {
-                    super::f64_to_f16_bits(f.to_f64()) as i64
-                } else if imm_size == 32 {
-                    (f.to_f64() as f32).to_bits() as i64
-                } else {
-                    f.to_f64().to_bits() as i64
-                };
+                let bits = f.to_bits_at_width(imm_size);
                 self.emit_mov_imm(reg, bits, 64);
             }
         }

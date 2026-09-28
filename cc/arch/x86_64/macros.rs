@@ -17,12 +17,7 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__x86_64", Some("1")),
         ("__amd64__", Some("1")),
         ("__amd64", Some("1")),
-        // Byte order
-        ("__BYTE_ORDER__", Some("__ORDER_LITTLE_ENDIAN__")),
-        ("__ORDER_LITTLE_ENDIAN__", Some("1234")),
-        ("__ORDER_BIG_ENDIAN__", Some("4321")),
-        ("__ORDER_PDP_ENDIAN__", Some("3412")),
-        ("__LITTLE_ENDIAN__", Some("1")),
+        // Byte order is in `arch::get_misc_macros`, for every target.
         // Register size
         ("__REGISTER_PREFIX__", Some("")),
         // Long double is 80-bit extended precision (padded to 128 bits)
@@ -44,14 +39,8 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2", Some("1")),
         ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4", Some("1")),
         ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8", Some("1")),
-        // Atomic primitives
-        ("__GCC_ATOMIC_BOOL_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_CHAR_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_SHORT_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_INT_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_LONG_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_LLONG_LOCK_FREE", Some("2")),
-        ("__GCC_ATOMIC_POINTER_LOCK_FREE", Some("2")),
+        // The __GCC_ATOMIC_*_LOCK_FREE family is derived from the type
+        // sizes, in `arch::get_atomic_macros`.
         // 128-bit integer support
         ("__SIZEOF_INT128__", Some("16")),
     ]

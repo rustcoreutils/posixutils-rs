@@ -255,7 +255,15 @@ fn compute_reachable(func: &Function) -> HashSet<BasicBlockId> {
     reachable
 }
 
-fn remove_unreachable_blocks(func: &mut Function) -> bool {
+/// Remove every block no path from the entry reaches, and every edge and
+/// phi source it contributed.
+///
+/// Also the linearizer's last step on a function, at every level: gcc emits
+/// no code no path reaches even at `-O0` -- the arm of a constant condition,
+/// what follows a `return` or a `goto` -- and a program may depend on it, by
+/// calling a function that exists nowhere from such an arm. A block reached
+/// through a label, `case`, `default` or a taken address is kept.
+pub(crate) fn remove_unreachable_blocks(func: &mut Function) -> bool {
     let reachable = compute_reachable(func);
     let before = func.blocks.len();
 

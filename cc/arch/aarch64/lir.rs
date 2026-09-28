@@ -17,6 +17,7 @@ use super::regalloc::{Reg, VReg};
 use crate::arch::lir::{
     CallTarget, CondCode, Directive, EmitAsm, FpSize, Label, OperandSize, Symbol,
 };
+use crate::float::IntegralRounding;
 use crate::target::{Os, Target};
 use std::fmt::Write;
 
@@ -548,6 +549,14 @@ pub enum Aarch64Inst {
         dst: VReg,
     },
 
+    /// UMOV Xd, Vn.D[lane] — read a 64-bit vector lane into a GP register,
+    /// the inverse of `InsGpToVecD`.
+    UmovVecDToGp {
+        lane: u8,
+        src: VReg,
+        dst: Reg,
+    },
+
     FmovToGp {
         size: FpSize,
         src: VReg,
@@ -626,8 +635,56 @@ pub enum Aarch64Inst {
         dst: VReg,
     },
 
+    /// FMINNM - FP minimum, a quiet NaN operand ignored for the other
+    Fminnm {
+        size: FpSize,
+        src1: VReg,
+        src2: VReg,
+        dst: VReg,
+    },
+
+    /// FMAXNM - FP maximum, a quiet NaN operand ignored for the other
+    Fmaxnm {
+        size: FpSize,
+        src1: VReg,
+        src2: VReg,
+        dst: VReg,
+    },
+
+    /// FMADD - fused multiply-add: dst = src1 * src2 + addend, rounded once
+    Fmadd {
+        size: FpSize,
+        src1: VReg,
+        src2: VReg,
+        addend: VReg,
+        dst: VReg,
+    },
+
     /// FNEG - FP negate
     Fneg {
+        size: FpSize,
+        src: VReg,
+        dst: VReg,
+    },
+
+    /// FABS - FP absolute value
+    Fabs {
+        size: FpSize,
+        src: VReg,
+        dst: VReg,
+    },
+
+    /// FSQRT - FP square root
+    Fsqrt {
+        size: FpSize,
+        src: VReg,
+        dst: VReg,
+    },
+
+    /// FRINTM/FRINTP/FRINTZ/FRINTA/FRINTX/FRINTI - round to an integral
+    /// value, in the direction `how` names
+    Frint {
+        how: IntegralRounding,
         size: FpSize,
         src: VReg,
         dst: VReg,
@@ -1166,6 +1223,15 @@ impl EmitAsm for Aarch64Inst {
                     src.name64()
                 );
             }
+            Aarch64Inst::UmovVecDToGp { lane, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    mov {}, {}.d[{}]",
+                    dst.name64(),
+                    src.name_v(),
+                    lane
+                );
+            }
 
             Aarch64Inst::FmovToGp { size, src, dst } => Self::emit_fmov_to_gp(size, src, dst, out),
             Aarch64Inst::LdrFp { size, addr, dst } => Self::emit_ldr_fp(size, addr, dst, out),
@@ -1242,10 +1308,78 @@ impl EmitAsm for Aarch64Inst {
                 src2,
                 dst,
             } => Self::emit_fp3("fdiv", size, src1, src2, dst, out),
+            Aarch64Inst::Fminnm {
+                size,
+                src1,
+                src2,
+                dst,
+            } => Self::emit_fp3("fminnm", size, src1, src2, dst, out),
+            Aarch64Inst::Fmaxnm {
+                size,
+                src1,
+                src2,
+                dst,
+            } => Self::emit_fp3("fmaxnm", size, src1, src2, dst, out),
+            Aarch64Inst::Fmadd {
+                size,
+                src1,
+                src2,
+                addend,
+                dst,
+            } => {
+                let reg = |r: &VReg| r.name_for_size(size_bits(*size));
+                let _ = writeln!(
+                    out,
+                    "    fmadd {}, {}, {}, {}",
+                    reg(dst),
+                    reg(src1),
+                    reg(src2),
+                    reg(addend)
+                );
+            }
             Aarch64Inst::Fneg { size, src, dst } => {
                 let _ = writeln!(
                     out,
                     "    fneg {}, {}",
+                    dst.name_for_size(size_bits(*size)),
+                    src.name_for_size(size_bits(*size))
+                );
+            }
+            Aarch64Inst::Fabs { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    fabs {}, {}",
+                    dst.name_for_size(size_bits(*size)),
+                    src.name_for_size(size_bits(*size))
+                );
+            }
+            Aarch64Inst::Fsqrt { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    fsqrt {}, {}",
+                    dst.name_for_size(size_bits(*size)),
+                    src.name_for_size(size_bits(*size))
+                );
+            }
+            Aarch64Inst::Frint {
+                how,
+                size,
+                src,
+                dst,
+            } => {
+                // `frintx` raises inexact and `frinti` does not: `rint`
+                // against `nearbyint`, both in the current direction.
+                let mnemonic = match how {
+                    IntegralRounding::Floor => "frintm",
+                    IntegralRounding::Ceil => "frintp",
+                    IntegralRounding::Trunc => "frintz",
+                    IntegralRounding::Round => "frinta",
+                    IntegralRounding::Rint => "frintx",
+                    IntegralRounding::NearbyInt => "frinti",
+                };
+                let _ = writeln!(
+                    out,
+                    "    {mnemonic} {}, {}",
                     dst.name_for_size(size_bits(*size)),
                     src.name_for_size(size_bits(*size))
                 );
@@ -1983,6 +2117,70 @@ mod tests {
         };
         inst.emit(&target, &mut out);
         assert_eq!(out.trim(), "mov x0, x1");
+    }
+
+    /// Each rounding is its own `frint`, and the square root `fsqrt`, at
+    /// the operand's width.
+    #[test]
+    fn test_frint_and_fsqrt_emit() {
+        use IntegralRounding::*;
+        let target = linux_target();
+        let emitted = |inst: Aarch64Inst| {
+            let mut out = String::new();
+            inst.emit(&target, &mut out);
+            out.trim().to_string()
+        };
+        for (how, want) in [
+            (Floor, "frintm d1, d2"),
+            (Ceil, "frintp d1, d2"),
+            (Trunc, "frintz d1, d2"),
+            (Round, "frinta d1, d2"),
+            (Rint, "frintx d1, d2"),
+            (NearbyInt, "frinti d1, d2"),
+        ] {
+            let inst = Aarch64Inst::Frint {
+                how,
+                size: FpSize::Double,
+                src: VReg::V2,
+                dst: VReg::V1,
+            };
+            assert_eq!(emitted(inst), want);
+        }
+        let inst = Aarch64Inst::Frint {
+            how: Floor,
+            size: FpSize::Single,
+            src: VReg::V2,
+            dst: VReg::V1,
+        };
+        assert_eq!(emitted(inst), "frintm s1, s2");
+        let inst = Aarch64Inst::Fsqrt {
+            size: FpSize::Single,
+            src: VReg::V0,
+            dst: VReg::V3,
+        };
+        assert_eq!(emitted(inst), "fsqrt s3, s0");
+        let inst = Aarch64Inst::Fminnm {
+            size: FpSize::Double,
+            src1: VReg::V1,
+            src2: VReg::V2,
+            dst: VReg::V0,
+        };
+        assert_eq!(emitted(inst), "fminnm d0, d1, d2");
+        let inst = Aarch64Inst::Fmaxnm {
+            size: FpSize::Single,
+            src1: VReg::V1,
+            src2: VReg::V2,
+            dst: VReg::V0,
+        };
+        assert_eq!(emitted(inst), "fmaxnm s0, s1, s2");
+        let inst = Aarch64Inst::Fmadd {
+            size: FpSize::Double,
+            src1: VReg::V17,
+            src2: VReg::V18,
+            addend: VReg::V16,
+            dst: VReg::V3,
+        };
+        assert_eq!(emitted(inst), "fmadd d3, d17, d18, d16");
     }
 
     #[test]

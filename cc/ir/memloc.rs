@@ -33,6 +33,7 @@
 //
 
 use super::{Function, Instruction, Opcode, PseudoId, PseudoKind};
+use crate::parse::ast::MemEffect;
 use crate::types::{TypeId, TypeTable};
 use std::collections::HashMap;
 
@@ -121,28 +122,47 @@ impl AddrMap {
         AddrMap { defs }
     }
 
-    fn def<'f>(&self, func: &'f Function, id: PseudoId) -> Option<&'f Instruction> {
+    /// The one instruction defining `id`, if this function has it.
+    pub(crate) fn def<'f>(&self, func: &'f Function, id: PseudoId) -> Option<&'f Instruction> {
         let (b, i) = *self.defs.get(&id)?;
         func.blocks.get(b)?.insns.get(i)
     }
 
-    /// The width and type the instruction defining `id` produces.
+    /// The width and type of the value `id` holds: what its defining
+    /// instruction produces, or for an incoming scalar argument, the type
+    /// its parameter is passed as.
     ///
-    /// `None` when nothing in this function defines it -- an argument, a
-    /// `Sym`, a constant, an inline-asm output -- which is the answer "this
-    /// pseudo's width is not a fact of this function".
-    pub(crate) fn def_width(&self, func: &Function, id: PseudoId) -> Option<(u32, Option<TypeId>)> {
-        self.def(func, id).map(|d| (d.size, d.typ))
+    /// A parameter is a local like any other, whose slot the entry block
+    /// fills from an `Arg`. Asking only the defining instruction made every
+    /// parameter's value width-less -- no instruction defines an `Arg` -- so
+    /// nothing stored into a parameter's slot could be forwarded, while the
+    /// same shape on a block-scope local was.
+    ///
+    /// `None` when neither answers -- a `Sym`, a constant, an inline-asm
+    /// output, an aggregate argument -- which is the answer "this pseudo's
+    /// width is not a fact of this function".
+    pub(crate) fn value_width(
+        &self,
+        func: &Function,
+        types: &TypeTable,
+        id: PseudoId,
+    ) -> Option<(u32, Option<TypeId>)> {
+        if let Some(d) = self.def(func, id) {
+            return Some((d.size, d.typ));
+        }
+        func.arg_value_type(id, types)
+            .map(|t| (types.size_bits(t), Some(t)))
     }
 
-    /// The constant an address-arithmetic operand carries, if any.
+    /// The constant a pseudo carries, if any: an address-arithmetic operand,
+    /// or the value of a store.
     ///
     /// Only `Copy` is followed. A `SetVal` needs no arm of its own: its
     /// constant lives in its *target pseudo*, so `func.const_val` above has
     /// already answered for it, and an arm that asked `const_val` a second
     /// time about the same pseudo could only repeat the `None` that got it
     /// there.
-    fn const_operand(&self, func: &Function, id: PseudoId) -> Option<i128> {
+    pub(crate) fn const_operand(&self, func: &Function, id: PseudoId) -> Option<i128> {
         let mut cur = id;
         for _ in 0..MAX_ADDR_DEPTH {
             if let Some(v) = func.const_val(cur) {
@@ -298,12 +318,21 @@ impl ModuleInfo {
             .unwrap_or_else(GlobalFacts::unknown)
     }
 
-    /// What a call to `name` may do to memory the caller can observe.
-    pub(crate) fn call_effect(&self, name: Option<&str>) -> crate::parse::ast::MemEffect {
-        match name {
+    /// What the call `call` may do to memory the caller can observe.
+    ///
+    /// A call the parser tagged as a library function that only reads
+    /// (`LibFn::only_reads`) writes nothing whatever its callee's body says:
+    /// its definition in this unit, if any, defines a reserved name, which
+    /// is undefined (C17 7.1.3p2).
+    pub(crate) fn call_effect(&self, call: &Instruction) -> MemEffect {
+        let effect = match call.func_name.as_deref() {
             Some(n) => self.effects.of(n),
             // An indirect call names no callee.
-            None => crate::parse::ast::MemEffect::Unknown,
+            None => MemEffect::Unknown,
+        };
+        match call.known {
+            Some(f) if f.only_reads() => effect.min(MemEffect::Pure),
+            _ => effect,
         }
     }
 }
@@ -601,6 +630,28 @@ mod tests {
         let mut sizeless = at(types.long_id);
         sizeless.size = 0;
         assert!(!is_same_access(&sizeless, &sizeless, &types));
+    }
+
+    /// A call the parser tagged as a library function that only reads
+    /// writes nothing, whatever its name's entry says; an untagged call to
+    /// the same name, or a tagged one that writes, keeps its entry's effect.
+    #[test]
+    fn memloc_a_reading_library_call_writes_nothing() {
+        use crate::parse::ast::LibFn;
+        let types = host_types();
+        let mi = empty_module_info();
+        let call = |known: Option<LibFn>| {
+            let mut c = Instruction::call(None, "f", vec![], vec![], types.int_id, 32);
+            c.known = known;
+            c
+        };
+        assert_eq!(mi.call_effect(&call(None)), MemEffect::Unknown);
+        assert_eq!(mi.call_effect(&call(Some(LibFn::Strlen))), MemEffect::Pure);
+        assert_eq!(mi.call_effect(&call(Some(LibFn::Memcmp))), MemEffect::Pure);
+        assert_eq!(
+            mi.call_effect(&call(Some(LibFn::Strcpy))),
+            MemEffect::Unknown
+        );
     }
 
     /// An inline-asm output is the one second definition invariant I1

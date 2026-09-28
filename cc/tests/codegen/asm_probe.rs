@@ -23,6 +23,7 @@ use crate::common::run_c17;
 
 pub const X86_64_LINUX: &str = "x86_64-unknown-linux-gnu";
 pub const AARCH64_LINUX: &str = "aarch64-unknown-linux-gnu";
+pub const AARCH64_DARWIN: &str = "aarch64-apple-darwin";
 
 /// Emit assembly for `src` at `triple` and return it.
 ///

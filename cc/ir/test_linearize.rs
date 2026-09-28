@@ -15,11 +15,11 @@
 use super::*;
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, ExprKind, ExternalDecl,
-    ForInit, FunctionDef, InitDeclarator, InitElement, Parameter, Stmt, UnaryOp,
+    ForInit, FunctionDef, InitDeclarator, InitElement, ParamStyle, Parameter, Stmt, UnaryOp,
 };
 use crate::strings::StringTable;
 use crate::symbol::Symbol;
-use crate::target::Target;
+use crate::target::{Arch, Os, Target};
 use crate::types::{CompositeType, StructMember, Type, TypeTable};
 
 /// Create a default position for test code
@@ -82,6 +82,7 @@ impl TestContext {
             &self.strings,
             &target,
             false,
+            true,
         )
     }
 }
@@ -89,7 +90,7 @@ impl TestContext {
 fn test_linearize(tu: &TranslationUnit, types: &TypeTable, strings: &StringTable) -> Module {
     let symbols = SymbolTable::new();
     let target = Target::host();
-    linearize(tu, &symbols, types, strings, &target, false)
+    linearize(tu, &symbols, types, strings, &target, false, true)
 }
 
 fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) -> FunctionDef {
@@ -103,6 +104,7 @@ fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) -> FunctionDe
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     }
 }
 
@@ -134,6 +136,7 @@ fn test_parameter_stored_to_local() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -191,6 +194,7 @@ fn test_function_with_many_params() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -253,6 +257,7 @@ fn test_compound_assignment_deref() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -333,6 +338,7 @@ fn test_compound_assignment_index() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -401,6 +407,7 @@ fn test_simple_array_element_store() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -501,6 +508,7 @@ fn test_nested_if_cfg_linking() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -582,6 +590,7 @@ fn test_switch_basic() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -663,6 +672,7 @@ fn test_switch_with_break() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -740,6 +750,7 @@ fn test_do_while_basic() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -829,6 +840,7 @@ fn test_do_while_with_break() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -910,6 +922,7 @@ fn test_goto_forward() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -994,6 +1007,7 @@ fn test_goto_backward() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1071,6 +1085,7 @@ fn test_nested_loop_break() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1164,6 +1179,7 @@ fn test_nested_loop_continue() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1224,6 +1240,7 @@ fn test_unary_logical_not() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1272,6 +1289,7 @@ fn test_unary_bitwise_not() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1320,6 +1338,7 @@ fn test_unary_negate() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1368,6 +1387,7 @@ fn test_pre_increment() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1427,6 +1447,7 @@ fn test_pointer_add_int() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1495,6 +1516,7 @@ fn test_pointer_difference() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1560,6 +1582,7 @@ fn test_float_add() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1617,6 +1640,7 @@ fn test_float_comparison() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1666,6 +1690,7 @@ fn test_float_to_int_cast() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1715,6 +1740,7 @@ fn test_int_to_float_cast() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -1782,9 +1808,153 @@ fn test_linearize_if() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
 
+    // A constant condition jumps straight to the arm it selects, and the
+    // other arm is not emitted at all.
     let module = test_linearize(&tu, &types, &strings);
     let ir = format!("{}", module.display(&types));
-    assert!(ir.contains("cbr")); // Conditional branch
+    assert!(!ir.contains("cbr"), "{ir}");
+    let rets = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| i.op == Opcode::Ret)
+        .count();
+    assert_eq!(rets, 1, "only the taken arm's return is emitted\n{ir}");
+}
+
+/// The functions `f` in `module` calls, by name.
+fn calls_in(module: &Module, f: &str) -> Vec<String> {
+    let func = module.functions.iter().find(|x| x.name == f).unwrap();
+    func.blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| i.op == Opcode::Call)
+        .filter_map(|i| i.func_name.clone())
+        .collect()
+}
+
+/// Whether `f` in `module` has any conditional branch or switch left.
+fn still_branches(module: &Module, f: &str) -> bool {
+    let func = module.functions.iter().find(|x| x.name == f).unwrap();
+    func.blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .any(|i| matches!(i.op, Opcode::Cbr | Opcode::Switch))
+}
+
+/// Each construct that branches on a constant emits only the arm it takes,
+/// with no conditional branch left behind: `if`, the loops, `?:`, the
+/// short circuits, `switch`, and a floating condition decided exactly (a NaN is
+/// unequal to itself; -0.0 equals 0.0).
+#[test]
+fn test_constant_condition_emits_only_the_taken_arm() {
+    let src = "void dead(void); void live(void); int g(void);\n\
+               void f_if(void) { if (0) dead(); else live(); }\n\
+               void f_while(void) { while (0) dead(); live(); }\n\
+               void f_do(void) { do live(); while (0); }\n\
+               void f_for(void) { for (; 0;) dead(); live(); }\n\
+               void f_and(void) { if (0 && g()) dead(); else live(); }\n\
+               void f_or(void) { if (1 || g()) live(); else dead(); }\n\
+               void f_and_rest(void) { if (1 && 0) dead(); live(); }\n\
+               int f_value(void) { return 0 && (dead(), 1); }\n\
+               void f_nan(void) { if (__builtin_nan(\"\") != __builtin_nan(\"\")) live(); else dead(); }\n\
+               void f_zero(void) { if (-0.0 == 0.0) live(); else dead(); }\n\
+               void f_ternary(void) { 0.5 ? live() : dead(); }\n\
+               void f_return(void) { live(); return; dead(); }\n\
+               void f_break(void) { for (;;) { live(); break; dead(); } }\n\
+               void f_switch(void) { switch (1) { case 0: dead(); break; case 1: live(); } }\n";
+    let module = linearize_source(src, &Target::host());
+    for f in [
+        "f_if",
+        "f_while",
+        "f_do",
+        "f_for",
+        "f_and",
+        "f_or",
+        "f_and_rest",
+        "f_value",
+        "f_nan",
+        "f_zero",
+        "f_ternary",
+        "f_return",
+        "f_break",
+        "f_switch",
+    ] {
+        let calls = calls_in(&module, f);
+        assert!(!calls.iter().any(|c| c == "dead"), "{f}: {calls:?}");
+        assert!(
+            !still_branches(&module, f),
+            "{f} still branches on a constant"
+        );
+    }
+    for f in [
+        "f_if", "f_while", "f_do", "f_for", "f_and", "f_or", "f_nan", "f_zero",
+    ] {
+        assert!(calls_in(&module, f).iter().any(|c| c == "live"), "{f}");
+    }
+}
+
+/// Under `-fno-trapping-math` a floating comparison no value can change the
+/// answer of decides its branch, as gcc's front end folds it at `-O0`; the
+/// unknown side is still evaluated. With trapping math, the default, it is
+/// a comparison like any other: a NaN operand would raise `FE_INVALID`.
+#[test]
+fn test_decided_float_comparison_folds_only_without_trapping_math() {
+    let src = "void dead(void); void live(void); double g(void);\n\
+               void f_gt(double x) { if (x > __builtin_inf()) dead(); }\n\
+               void f_lt(float y) { if (-__builtin_inff() > y) dead(); }\n\
+               void f_huge(double x) { if (x > 1e308 * 10) dead(); }\n\
+               void f_nan(double x) { if (x != __builtin_nan(\"\")) live(); else dead(); }\n\
+               void f_isgreater(double x) { if (__builtin_isgreater(x, __builtin_inf())) dead(); }\n\
+               void f_call(void) { if (g() > __builtin_inf()) dead(); }\n\
+               void f_le(double x) { if (x <= __builtin_inf()) live(); }\n";
+    let policy = Default::default();
+    let (module, _) = linearize_source_trapping(src, &Target::host(), policy, false);
+    for f in ["f_gt", "f_lt", "f_huge", "f_nan", "f_isgreater", "f_call"] {
+        assert!(!calls_in(&module, f).iter().any(|c| c == "dead"), "{f}");
+        assert!(!still_branches(&module, f), "{f}");
+    }
+    assert!(
+        calls_in(&module, "f_call").iter().any(|c| c == "g"),
+        "g() still runs"
+    );
+    // False for a NaN and true otherwise, so undecided.
+    assert!(still_branches(&module, "f_le"));
+
+    let (module, _) = linearize_source_trapping(src, &Target::host(), policy, true);
+    for f in ["f_gt", "f_lt", "f_huge", "f_nan", "f_isgreater", "f_call"] {
+        assert!(still_branches(&module, f), "{f} folded under trapping math");
+    }
+}
+
+/// Only a constant expression decides a branch. A `const` object is not one,
+/// and neither is a condition whose first operand must run.
+#[test]
+fn test_constant_condition_needs_a_constant_expression() {
+    let src = "void maybe(void); int g(void);\n\
+               void f_const(void) { const int k = 0; if (k) maybe(); }\n\
+               void f_call(void) { if (g() && 0) maybe(); }\n";
+    let module = linearize_source(src, &Target::host());
+    for f in ["f_const", "f_call"] {
+        assert!(still_branches(&module, f), "{f} must still branch");
+        assert!(calls_in(&module, f).iter().any(|c| c == "maybe"), "{f}");
+    }
+}
+
+/// A block inside a dead arm that a label, a `case` or a `default` reaches
+/// is kept, and only the code in front of the label is dropped
+/// (gcc.c-torture medce-1).
+#[test]
+fn test_constant_condition_keeps_what_a_label_reaches() {
+    let src = "void dead(void); void live(void);\n\
+               void f_case(int x) { switch (x) { case 0: if (0) { dead(); case 1: live(); } } }\n\
+               void f_goto(int c) { if (c) goto in; if (0) { dead(); in: live(); } }\n\
+               void f_default(int x) { switch (x) { case 0: while (0) { dead(); default: live(); } } }\n";
+    let module = linearize_source(src, &Target::host());
+    for f in ["f_case", "f_goto", "f_default"] {
+        let calls = calls_in(&module, f);
+        assert_eq!(calls, ["live"], "{f}");
+    }
 }
 
 #[test]
@@ -1921,6 +2091,7 @@ fn test_linearize_function_with_params() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2124,6 +2295,7 @@ fn test_local_var_emits_load_store() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2201,6 +2373,7 @@ fn test_ssa_converts_local_to_phi() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2268,6 +2441,7 @@ fn test_ssa_loop_variable() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2321,6 +2495,7 @@ fn test_short_circuit_and() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2384,6 +2559,7 @@ fn test_short_circuit_or() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2458,6 +2634,7 @@ fn test_ternary_pure_uses_select() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2499,6 +2676,7 @@ fn test_ternary_impure_uses_phi() {
             func: Box::new(Expr::var_typed(foo_sym, int_type)),
             args: vec![],
             binding: Default::default(),
+            known: None,
         },
         int_type,
         test_pos(),
@@ -2508,6 +2686,7 @@ fn test_ternary_impure_uses_phi() {
             func: Box::new(Expr::var_typed(bar_sym, int_type)),
             args: vec![],
             binding: Default::default(),
+            known: None,
         },
         int_type,
         test_pos(),
@@ -2537,6 +2716,7 @@ fn test_ternary_impure_uses_phi() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2628,6 +2808,7 @@ fn test_ternary_with_assignment_uses_phi() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2704,6 +2885,7 @@ fn test_ternary_with_post_increment_uses_phi() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2768,6 +2950,7 @@ fn test_string_literal_char_array_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2823,6 +3006,7 @@ fn test_string_literal_char_pointer_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -2857,7 +3041,7 @@ fn test_linearize_with_symbols(
     strings: &StringTable,
 ) -> Module {
     let target = Target::host();
-    linearize(tu, symbols, types, strings, &target, false)
+    linearize(tu, symbols, types, strings, &target, false, true)
 }
 
 #[test]
@@ -2984,6 +3168,7 @@ fn test_incomplete_struct_type_resolution() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -3066,6 +3251,7 @@ fn test_static_local_pre_increment() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3143,6 +3329,7 @@ fn test_static_local_pre_decrement() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3213,6 +3400,7 @@ fn test_static_local_post_increment() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3283,6 +3471,7 @@ fn test_static_local_post_decrement() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3361,6 +3550,7 @@ fn test_static_local_compound_assignment() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3407,13 +3597,14 @@ fn test_wide_string_literal_expression() {
         name: test_id,
         params: vec![],
         body: Stmt::Return(Some(Expr::typed_unpositioned(
-            ExprKind::WideStringLit("hello".to_string()),
+            ExprKind::WideStringLit("hello".chars().map(u32::from).collect()),
             wchar_ptr_type,
         ))),
         pos: test_pos(),
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3422,20 +3613,16 @@ fn test_wide_string_literal_expression() {
 
     let module = test_linearize(&tu, &types, &strings);
 
-    // Check that wide string was added to the module
+    // A wide literal is interned with the other 4-byte-unit literals:
+    // wchar_t is 4 bytes on every target, laid out as char32_t is.
+    let (label, content) = &module.utf32_strings[0];
     assert!(
-        !module.wide_strings.is_empty(),
-        "Wide string literal should be added to module.wide_strings"
-    );
-
-    // Check label format
-    let (label, content) = &module.wide_strings[0];
-    assert!(
-        label.starts_with(".LWC"),
-        "Wide string label should start with .LWC, got: {}",
+        label.starts_with(".LU32C"),
+        "4-byte-unit literal label should start with .LU32C, got: {}",
         label
     );
-    assert_eq!(content, "hello", "Wide string content should match");
+    let hello: Vec<u32> = "hello".chars().map(u32::from).collect();
+    assert_eq!(content, &hello, "Wide string content should match");
 }
 
 #[test]
@@ -3455,11 +3642,11 @@ fn test_wide_string_literal_is_pure() {
         ExprKind::Conditional {
             cond: Box::new(Expr::var_typed(cond_sym, int_type)),
             then_expr: Box::new(Expr::typed_unpositioned(
-                ExprKind::WideStringLit("yes".to_string()),
+                ExprKind::WideStringLit("yes".chars().map(u32::from).collect()),
                 wchar_ptr_type,
             )),
             else_expr: Box::new(Expr::typed_unpositioned(
-                ExprKind::WideStringLit("no".to_string()),
+                ExprKind::WideStringLit("no".chars().map(u32::from).collect()),
                 wchar_ptr_type,
             )),
         },
@@ -3481,6 +3668,7 @@ fn test_wide_string_literal_is_pure() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3522,6 +3710,7 @@ fn test_gcc_function_identifier() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3563,6 +3752,7 @@ fn test_gcc_pretty_function_identifier() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3656,6 +3846,7 @@ fn test_static_local_address_in_initializer() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3747,6 +3938,7 @@ fn test_struct_deref_returns_address() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -3802,6 +3994,7 @@ fn test_int_to_float_cast_has_src_typ() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -3854,6 +4047,7 @@ fn test_float_to_int_cast_has_src_typ() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -3906,6 +4100,7 @@ fn test_integer_extension_has_src_typ() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -3957,6 +4152,7 @@ fn test_float16_to_float_conversion() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4012,6 +4208,7 @@ fn test_float_to_float16_conversion() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4067,6 +4264,7 @@ fn test_float16_to_int_conversion() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4122,6 +4320,7 @@ fn test_int_to_float16_conversion() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4167,6 +4366,7 @@ fn test_alignof_type_emits_setval() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4211,6 +4411,7 @@ fn test_alignof_expr_emits_setval() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4251,6 +4452,7 @@ fn test_frame_address_emits_opcode() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4289,6 +4491,7 @@ fn test_return_address_emits_opcode() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4424,6 +4627,7 @@ fn test_mixed_designated_positional_struct_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4522,6 +4726,7 @@ fn test_mixed_designated_positional_array_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -4679,6 +4884,7 @@ fn test_designator_chain_nested_struct_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -4760,6 +4966,7 @@ fn test_designator_chain_array_member_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -4826,6 +5033,7 @@ fn test_repeated_designator_last_wins_array() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -4932,6 +5140,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -5022,6 +5231,7 @@ fn test_union_first_named_member_positional_init() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -5073,6 +5283,7 @@ fn test_valist_parameter_stored_as_pointer() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -5136,6 +5347,7 @@ fn test_valist_local_not_indirect() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -5215,6 +5427,7 @@ fn test_valist_expression_decay() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -5359,6 +5572,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -5500,6 +5714,7 @@ fn test_bitfield_designated_init_local_var() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -5636,6 +5851,7 @@ fn test_large_struct_copy_from_array() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -5794,6 +6010,7 @@ fn test_compound_literal_zero_init_lvalue() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -5915,6 +6132,7 @@ fn test_conditional_short_circuit_arrow() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
 
     let tu = TranslationUnit {
@@ -6081,6 +6299,7 @@ fn compound_module(op: AssignOp, atomic: bool) -> (TestContext, Module) {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -6299,6 +6518,7 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let module = ctx.linearize(&TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -6408,6 +6628,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -6645,6 +6866,7 @@ fn test_va_arg_pack_becomes_a_flag_not_an_argument() {
                 },
             ],
             binding: Default::default(),
+            known: None,
         },
         typ: Some(int_t),
         pos: test_pos(),
@@ -6723,6 +6945,7 @@ fn test_block_scope_extern_declares_no_local() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -6807,6 +7030,7 @@ fn test_float_condition_compares_against_zero() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -6891,6 +7115,7 @@ fn test_complex_equality_compares_both_halves() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -6989,6 +7214,7 @@ fn test_asm_goto_output_written_back_on_the_label_edge() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -7068,6 +7294,7 @@ fn test_asm_memory_operand_names_its_object() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -7145,6 +7372,32 @@ fn test_asm_memory_operand_keeps_an_address_something_else_reads() {
 
 /// Parse `src` and linearize it for `target`.
 fn linearize_source(src: &str, target: &Target) -> Module {
+    linearize_source_with_types(src, target).0
+}
+
+/// [`linearize_source`], also handing back the type table the module's type
+/// ids index.
+fn linearize_source_with_types(src: &str, target: &Target) -> (Module, TypeTable) {
+    linearize_source_under(src, target, Default::default())
+}
+
+/// [`linearize_source_with_types`], with library builtins evaluated as
+/// `policy` says.
+fn linearize_source_under(
+    src: &str,
+    target: &Target,
+    policy: crate::parse::LibraryCallPolicy,
+) -> (Module, TypeTable) {
+    linearize_source_trapping(src, target, policy, true)
+}
+
+/// [`linearize_source_under`], with `-f[no-]trapping-math` as given.
+fn linearize_source_trapping(
+    src: &str,
+    target: &Target,
+    policy: crate::parse::LibraryCallPolicy,
+    trapping_math: bool,
+) -> (Module, TypeTable) {
     let mut strings = StringTable::new();
     let mut tokenizer = crate::token::lexer::Tokenizer::new(src.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
@@ -7153,9 +7406,326 @@ fn linearize_source(src: &str, target: &Target) -> Module {
     let tu = {
         let mut parser =
             crate::parse::Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+        parser.set_library_call_policy(policy);
         parser.parse_translation_unit().expect("parse")
     };
-    linearize(&tu, &symbols, &types, &strings, target, false)
+    let module = linearize(
+        &tu,
+        &symbols,
+        &types,
+        &strings,
+        target,
+        false,
+        trapping_math,
+    );
+    (module, types)
+}
+
+/// A call records each argument at the type the callee receives it as, which
+/// is what the ABI places it by: the parameter's type under a prototype --
+/// narrower included -- and the default argument promotions without one
+/// (C17 6.5.2.2p6-7). Apple arm64 stacks a `char` parameter in one byte, so
+/// `p('a')` recorded as `int` took four; and an unprototyped call passed a
+/// `float` where a gcc-compiled K&R callee reads a `double`.
+#[test]
+fn test_call_argument_types_follow_the_callee() {
+    use crate::target::{Arch, Os};
+    let src = "void p(char, short, int);\n\
+               int u();\n\
+               void f(long l, char c, float x) { p(l, 300, l); u(c, x); }\n";
+    let target = Target::new(Arch::Aarch64, Os::MacOS);
+    let (module, types) = linearize_source_with_types(src, &target);
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let calls: Vec<&Instruction> = f
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| i.op == Opcode::Call)
+        .collect();
+    assert_eq!(calls.len(), 2);
+    let kinds = |call: &Instruction| -> Vec<TypeKind> {
+        call.arg_types.iter().map(|&t| types.kind(t)).collect()
+    };
+    assert_eq!(
+        kinds(calls[0]),
+        [TypeKind::Char, TypeKind::Short, TypeKind::Int],
+        "a prototyped call passes each argument as its parameter's type"
+    );
+    assert_eq!(
+        kinds(calls[1]),
+        [TypeKind::Int, TypeKind::Double],
+        "an unprototyped call passes the promoted types"
+    );
+}
+
+/// An identifier-list definition receives each parameter as its default
+/// argument promotion -- what every caller passes, having no prototype to
+/// convert to -- and converts it to the declared type on entry (C17
+/// 6.9.1p10). It read a `float` parameter out of the register a caller had
+/// put a `double` in.
+#[test]
+fn test_identifier_list_parameters_arrive_promoted() {
+    use crate::target::{Arch, Os};
+    let src = "int kr(f, c, s, l) float f; char c; short s; long l;\n\
+               { return (int)f + c + s + (int)l; }\n\
+               int pr(float f, char c) { return (int)f + c; }\n";
+    let (module, types) = linearize_source_with_types(src, &Target::new(Arch::Aarch64, Os::Linux));
+    let params = |name: &str| -> Vec<TypeKind> {
+        let f = module.functions.iter().find(|f| f.name == name).unwrap();
+        f.params.iter().map(|(_, t)| types.kind(*t)).collect()
+    };
+    assert_eq!(
+        params("kr"),
+        [
+            TypeKind::Double,
+            TypeKind::Int,
+            TypeKind::Int,
+            TypeKind::Long
+        ]
+    );
+    assert_eq!(params("pr"), [TypeKind::Float, TypeKind::Char]);
+    let kr = module.functions.iter().find(|f| f.name == "kr").unwrap();
+    assert!(
+        kr.blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .any(|i| i.op == Opcode::FCvtF),
+        "the double must be converted to the float parameter on entry"
+    );
+}
+
+/// Every instruction of the function `name` in `module`.
+fn insns_of<'m>(module: &'m Module, name: &str) -> Vec<&'m Instruction> {
+    let f = module.functions.iter().find(|f| f.name == name).unwrap();
+    f.blocks.iter().flat_map(|bb| bb.insns.iter()).collect()
+}
+
+/// `sqrt` is the `Sqrt` opcode, naming its library function, with a call to
+/// that function behind an ordered `x < 0` so that a domain error still sets
+/// `errno`.
+#[test]
+fn test_sqrt_keeps_a_call_for_errno() {
+    let src = "double sqrt(double);\ndouble f(double x) { return sqrt(x); }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    let insns = insns_of(&module, "f");
+    let sqrt: Vec<_> = insns.iter().filter(|i| i.op == Opcode::Sqrt).collect();
+    assert_eq!(sqrt.len(), 1);
+    assert_eq!(sqrt[0].func_name.as_deref(), Some("sqrt"));
+    let calls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::Call).collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].func_name.as_deref(), Some("sqrt"));
+    assert!(insns.iter().any(|i| i.op == Opcode::FCmpOLt));
+    assert!(insns.iter().any(|i| i.op == Opcode::Phi));
+}
+
+/// A rounding is its opcode, naming its library function, with no call on
+/// any path -- `floor` of a `float` at `float`, by `floorf`, widened after.
+#[test]
+fn test_rounding_is_one_opcode() {
+    use crate::float::IntegralRounding::{Floor, NearbyInt};
+    let src = "double floor(double); double nearbyint(double);\n\
+               double f(float x, double y) { return floor(x) + nearbyint(y); }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    let insns = insns_of(&module, "f");
+    assert!(!insns.iter().any(|i| i.op == Opcode::Call));
+    let floor = insns
+        .iter()
+        .find(|i| i.op == Opcode::RoundToIntegral(Floor))
+        .expect("floor");
+    assert_eq!(floor.func_name.as_deref(), Some("floorf"));
+    assert_eq!(floor.size, 32, "computed at float");
+    let nearby = insns
+        .iter()
+        .find(|i| i.op == Opcode::RoundToIntegral(NearbyInt))
+        .expect("nearbyint");
+    assert_eq!(nearby.func_name.as_deref(), Some("nearbyint"));
+    assert_eq!(nearby.size, 64);
+}
+
+/// `fma` is one three-operand opcode, and `fmin` and `fmax` two-operand
+/// ones, each naming its function; nothing is called.
+#[test]
+fn test_min_max_fma_are_opcodes() {
+    let src = "double fma(double, double, double); float fminf(float, float);\n\
+               double fmax(double, double);\n\
+               double f(double x, float y) { return fma(x, x, x) + fminf(y, y) + fmax(x, 1.0); }\n";
+    let module = linearize_source(src, &Target::new(Arch::Aarch64, Os::Linux));
+    let insns = insns_of(&module, "f");
+    assert!(!insns.iter().any(|i| i.op == Opcode::Call));
+    for (op, name, srcs, size) in [
+        (Opcode::Fma, "fma", 3, 64),
+        (Opcode::FMin, "fminf", 2, 32),
+        (Opcode::FMax, "fmax", 2, 64),
+    ] {
+        let insn = insns.iter().find(|i| i.op == op).expect(name);
+        assert_eq!(insn.func_name.as_deref(), Some(name));
+        assert_eq!((insn.src.len(), insn.size), (srcs, size), "{name}");
+    }
+}
+
+/// The translation unit's own `floor` and `memcpy`, defined below the call,
+/// are called -- `fabs`, which gcc folds as it parses, stays computed in
+/// place.
+#[test]
+fn test_own_definition_below_the_call_is_called() {
+    let src = "double floor(double); double fabs(double);\n\
+               double f(double x, char *d, char *s) {\n\
+                   memcpy(d, s, 8); return floor(x) + fabs(x); }\n\
+               double floor(double x) { return x; }\n\
+               double fabs(double x) { return x; }\n\
+               void *memcpy(void *d, const void *s, unsigned long n) { return d; }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    let insns = insns_of(&module, "f");
+    let calls: Vec<_> = insns
+        .iter()
+        .filter(|i| i.op == Opcode::Call)
+        .map(|i| i.func_name.as_deref())
+        .collect();
+    assert_eq!(calls, [Some("memcpy"), Some("floor")]);
+    assert!(!insns
+        .iter()
+        .any(|i| i.op.is_libm() || i.op == Opcode::Memcpy));
+    assert!(insns.iter().any(|i| i.op == Opcode::Fabs));
+}
+
+/// `memcpy`, `memset` and `memmove`, bare or reserved, are their block
+/// memory opcodes, naming the library function the IR calls when it does
+/// not expand them.
+#[test]
+fn test_memory_builtins_are_their_opcodes() {
+    let src = "void f(char *d, char *s, int c, unsigned long n) {\n\
+                   memcpy(d, s, n); __builtin_memset(d, c, n); memmove(d, s, n); }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    let ops: Vec<_> = insns_of(&module, "f")
+        .iter()
+        .filter(|i| matches!(i.op, Opcode::Memcpy | Opcode::Memset | Opcode::Memmove))
+        .map(|i| (i.op, i.func_name.as_deref(), i.src.len()))
+        .collect();
+    assert_eq!(
+        ops,
+        [
+            (Opcode::Memcpy, Some("memcpy"), 3),
+            (Opcode::Memset, Some("memset"), 3),
+            (Opcode::Memmove, Some("memmove"), 3),
+        ]
+    );
+}
+
+/// `mempcpy` is a `Memcpy` that calls `memcpy`, and its value the
+/// destination advanced by the length; `bcopy` is a `Memmove` that calls
+/// `memmove`, with its source and destination put back in `memmove`'s
+/// order. An asm label on `memcpy` reaches the one `mempcpy` makes.
+#[test]
+fn test_mempcpy_and_bcopy_are_memcpy_and_memmove() {
+    let src = "void *memcpy(void *, const void *, unsigned long) __asm(\"my_memcpy\");\n\
+               void *f(char *d, char *s, unsigned long n) {\n\
+                   bcopy(s, d, n); return mempcpy(d, s, n); }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    let insns = insns_of(&module, "f");
+    let blocks: Vec<_> = insns
+        .iter()
+        .filter(|i| matches!(i.op, Opcode::Memcpy | Opcode::Memmove))
+        .collect();
+    let [bcopy, mempcpy] = blocks.as_slice() else {
+        panic!("two block moves: {blocks:?}");
+    };
+    let my_memcpy = crate::arch::lir::verbatim("my_memcpy");
+    assert_eq!(
+        (bcopy.op, bcopy.library_callee()),
+        (Opcode::Memmove, "memmove")
+    );
+    assert_eq!(
+        (mempcpy.op, mempcpy.library_callee()),
+        (Opcode::Memcpy, my_memcpy.as_str())
+    );
+    // Both write `d` from `s`: each operand loaded from the same parameter.
+    let origin = |p| {
+        let def = insns.iter().find(|i| i.target == Some(p)).unwrap();
+        (def.op, def.src.clone())
+    };
+    for k in 0..2 {
+        assert_eq!(origin(bcopy.src[k]), origin(mempcpy.src[k]), "operand {k}");
+    }
+    assert_ne!(origin(bcopy.src[0]), origin(bcopy.src[1]));
+    let end = insns
+        .iter()
+        .find(|i| i.op == Opcode::Add && i.src == [mempcpy.src[0], mempcpy.src[2]])
+        .expect("mempcpy's value is d + n");
+    assert_eq!(end.size, 64);
+}
+
+/// Under `-fno-math-errno` the opcode stands alone; on a target without the
+/// instruction (binary128 on aarch64) the call alone does everything.
+#[test]
+fn test_sqrt_without_errno_or_without_an_instruction() {
+    let policy = crate::parse::LibraryCallPolicy {
+        optimizing: true,
+        math_errno: false,
+    };
+    let src = "double sqrt(double);\ndouble f(double x) { return sqrt(x); }\n";
+    let (module, _) = linearize_source_under(src, &Target::new(Arch::X86_64, Os::Linux), policy);
+    let ops: Vec<Opcode> = insns_of(&module, "f").iter().map(|i| i.op).collect();
+    assert!(ops.contains(&Opcode::Sqrt));
+    assert!(!ops.contains(&Opcode::Call) && !ops.contains(&Opcode::FCmpOLt));
+
+    let src = "long double sqrtl(long double);\n\
+               long double f(long double x) { return sqrtl(x); }\n";
+    let module = linearize_source(src, &Target::new(Arch::Aarch64, Os::Linux));
+    let insns = insns_of(&module, "f");
+    assert!(!insns
+        .iter()
+        .any(|i| i.op == Opcode::Sqrt || i.op == Opcode::FCmpOLt));
+    let calls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::Call).collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].func_name.as_deref(), Some("sqrtl"));
+}
+
+/// `abs` and its siblings become the branch-free `(x ^ s) - s` sequence
+/// rather than a call -- including when the translation unit defines the
+/// function itself, which is undefined behaviour and does not displace it.
+#[test]
+fn test_int_abs_is_linearized_without_a_call() {
+    let src = "long labs(long);\n\
+               int abs(int v) { return 42; }\n\
+               long f(int a, long b) { return abs(a) + labs(b) + __builtin_llabs(b); }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let insns: Vec<&Instruction> = f.blocks.iter().flat_map(|bb| bb.insns.iter()).collect();
+    assert!(
+        !insns.iter().any(|i| i.op == Opcode::Call),
+        "f still calls a library function"
+    );
+    let count = |op| insns.iter().filter(|i| i.op == op).count();
+    assert_eq!(count(Opcode::Asr), 3);
+    assert_eq!(count(Opcode::Xor), 3);
+    let widths: Vec<u32> = insns
+        .iter()
+        .filter(|i| i.op == Opcode::Asr)
+        .map(|i| i.size)
+        .collect();
+    assert_eq!(widths, vec![32, 64, 64]);
+}
+
+/// `conj` of a call calls once: it lowers as the conjugate `~z` of one
+/// evaluated operand, where it used to read `__real__` and `__imag__` of two
+/// copies of the argument expression, each with its own call.
+#[test]
+fn test_conj_evaluates_its_argument_once() {
+    let src = "double _Complex g(void);\n\
+               double _Complex conj(double _Complex);\n\
+               double _Complex f(void) { return conj(g()); }\n\
+               double _Complex h(void) { return __builtin_conj(g()); }\n";
+    let module = linearize_source(src, &Target::host());
+    for name in ["f", "h"] {
+        let func = module.functions.iter().find(|f| f.name == name).unwrap();
+        let calls = func
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| i.op == Opcode::Call)
+            .count();
+        assert_eq!(calls, 1, "{name}");
+    }
 }
 
 /// AAPCS64 B.4 passes a composite over sixteen bytes as a pointer to a copy
@@ -7527,6 +8097,7 @@ fn test_complex_temporaries_are_frame_slots() {
         is_static: false,
         is_inline: false,
         calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
     };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
@@ -7675,4 +8246,447 @@ fn test_constant_conditional_keeps_an_arm_that_defines_a_label() {
         .filter(|i| i.op == Opcode::Call)
         .count();
     assert_eq!(calls, 1);
+}
+
+/// GNU `~` on a complex constant is the conjugate, and folds in a static
+/// initializer: only the imaginary half is negated, so `~(3 + 4i)` is
+/// `3 - 4i`, and `~~z` is `z` again.
+#[test]
+fn test_complex_conjugate_static_initializer() {
+    let src = "static _Complex double a = ~(3.0 + 4.0i);\n\
+               static _Complex double b = ~~(5.0 + 6.0i);\n\
+               static _Complex double c = -~(1.0 + 0.0i);\n";
+    let module = linearize_source(src, &Target::host());
+    let halves = |name: &str| -> (f64, f64) {
+        let g = module
+            .globals
+            .iter()
+            .find(|g| g.name == name)
+            .unwrap_or_else(|| panic!("no global {name}"));
+        let crate::ir::Initializer::Struct { fields, .. } = &g.init else {
+            panic!("{name}: expected a two-field initializer, got {:?}", g.init);
+        };
+        let value = |i: usize| match &fields[i].2 {
+            crate::ir::Initializer::Float(v) => v.to_f64(),
+            other => panic!("{name}[{i}]: expected a float half, got {other:?}"),
+        };
+        (value(0), value(1))
+    };
+    assert_eq!(halves("a"), (3.0, -4.0));
+    assert_eq!(halves("b"), (5.0, 6.0));
+    // `-~(1 + 0i)` is `-(1 - 0i)`: the conjugate's `-0.0` imaginary half is
+    // negated back to `+0.0`, and the real half becomes `-1.0`.
+    let (re, im) = halves("c");
+    assert_eq!(re, -1.0);
+    assert!(im == 0.0 && im.is_sign_positive(), "c imag is {im}");
+}
+
+/// A static floating initializer is converted from its own type to the
+/// object's, as an assignment converts it (C17 6.7.9p11): rounded at the
+/// initializer's format first, and a NaN quieted when the format changes
+/// while keeping its sign and the high bits of its payload. Every encoding
+/// is gcc's for the same declaration.
+#[test]
+fn test_static_float_initializer_converts_from_its_own_type() {
+    use crate::float::FpFormat;
+    let src = "static double widened = 0.1f;\n\
+               static float narrowed = (float)__builtin_nans(\"0x40000000\");\n\
+               static double quieted = __builtin_nansf(\"0x123\");\n\
+               static double kept = -__builtin_nans(\"0x5\");\n\
+               static double propagated = __builtin_nan(\"0x5\") + 1.0;\n";
+    let module = linearize_source(src, &Target::host());
+    let bits = |name: &str, fmt: FpFormat| -> u128 {
+        let g = module
+            .globals
+            .iter()
+            .find(|g| g.name == name)
+            .unwrap_or_else(|| panic!("no global {name}"));
+        match &g.init {
+            crate::ir::Initializer::Float(v) => v.to_bits(fmt),
+            other => panic!("{name}: expected a float initializer, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        bits("widened", FpFormat::Binary64),
+        u128::from(f64::from(0.1f32).to_bits())
+    );
+    assert_eq!(bits("narrowed", FpFormat::Binary32), 0x7fc0_0002);
+    assert_eq!(bits("quieted", FpFormat::Binary64), 0x7ff8_0024_6000_0000);
+    // No conversion: a negated signalling NaN stays signalling.
+    assert_eq!(bits("kept", FpFormat::Binary64), 0xfff0_0000_0000_0005);
+    assert_eq!(
+        bits("propagated", FpFormat::Binary64),
+        0x7ff8_0000_0000_0005
+    );
+}
+
+/// The global `name`'s initializer.
+fn global_init<'m>(module: &'m crate::ir::Module, name: &str) -> &'m crate::ir::Initializer {
+    &module
+        .globals
+        .iter()
+        .find(|g| g.name == name)
+        .unwrap_or_else(|| panic!("no global {name}"))
+        .init
+}
+
+/// A floating constant converts to an integer object exactly, truncating
+/// toward zero from the value at the constant's own precision: each of these
+/// came out rounded to `double` first. Out of range, where C gives no value,
+/// the object gets gcc's saturated one.
+#[test]
+fn test_static_float_to_integer_initializer_is_exact() {
+    let src = "static long long a = 0x1p62L + 1.0L;\n\
+               static unsigned long long b = 0x1p63L + 3.0L;\n\
+               static long long c = -0x1p62L - 5.0L;\n\
+               static long long d = 0x1p53 + 1.0L;\n\
+               static int e = 0.99999999999999999999;\n\
+               static _Bool f = 0.5;\n\
+               static int g = 3e9;\n\
+               static unsigned h = -1.5;\n\
+               static int i = __builtin_nan(\"\");\n";
+    let module = linearize_source(src, &x86_64_linux());
+    let int = |name: &str| match global_init(&module, name) {
+        crate::ir::Initializer::Int(v) => *v,
+        other => panic!("{name}: expected an integer, got {other:?}"),
+    };
+    assert_eq!(int("a"), (1i128 << 62) + 1);
+    assert_eq!(int("b"), (1i128 << 63) + 3);
+    assert_eq!(int("c"), -((1i128 << 62) + 5));
+    assert_eq!(int("d"), (1i128 << 53) + 1);
+    // A `double` literal is a `double`: this one rounds to 1.0 before it
+    // is truncated.
+    assert_eq!(int("e"), 1);
+    assert_eq!(int("f"), 1);
+    assert_eq!(int("g"), i128::from(i32::MAX));
+    assert_eq!(int("h"), 0);
+    assert_eq!(int("i"), 0);
+}
+
+/// A cast inside a static initializer converts: `(int)2.5` is 2 whatever
+/// type is being initialized, and an integer subexpression of a floating one
+/// is integer arithmetic.
+#[test]
+fn test_static_initializer_casts_and_integer_subexpressions_convert() {
+    let src = "static double a = (int)2.5;\n\
+               static double b = (1 / 2) + 0.5;\n\
+               static long long c = (long long)(0x1p62L + 1.0L);\n\
+               static int d = (int)1e300;\n";
+    let module = linearize_source(src, &x86_64_linux());
+    let float = |name: &str| match global_init(&module, name) {
+        crate::ir::Initializer::Float(v) => v.to_f64(),
+        other => panic!("{name}: expected a float, got {other:?}"),
+    };
+    assert_eq!(float("a"), 2.0);
+    assert_eq!(float("b"), 0.5);
+    assert!(
+        matches!(global_init(&module, "c"), crate::ir::Initializer::Int(v) if *v == (1i128 << 62) + 1)
+    );
+    assert!(
+        matches!(global_init(&module, "d"), crate::ir::Initializer::Int(v) if *v == i128::from(i32::MAX))
+    );
+}
+
+/// The two halves of a complex static initializer.
+fn complex_halves(
+    module: &crate::ir::Module,
+    name: &str,
+) -> (crate::ir::Initializer, crate::ir::Initializer) {
+    let crate::ir::Initializer::Struct { fields, .. } = global_init(module, name) else {
+        panic!("{name}: expected a two-field initializer");
+    };
+    (fields[0].2.clone(), fields[1].2.clone())
+}
+
+/// Complex constant arithmetic is done in the base format of the
+/// expression's own type, as the program does it at run time, on both
+/// `long double` formats: the old fold went through `f64` and lost the
+/// 2^-60 in every one of these.
+#[test]
+fn test_static_complex_long_double_keeps_its_precision() {
+    use crate::float::FloatVal;
+    let src = "static long double _Complex z = (1.0L + 0x1p-60L) + 2.0iL;\n\
+               static long double _Complex w = (1.0L + 0x1p-60L) * (1.0L + 1.0iL);\n\
+               static long double _Complex q = (2.0L + 0x1p-59L) / 2.0L;\n\
+               static long double _Complex s = (1.0L + 1.0iL) - 0x1p-60L;\n\
+               static long double _Complex r = (1.0L + 0x1p-60L + 1.0iL) / (1.0L + 1.0iL);\n";
+    let one = FloatVal::from_i128(1);
+    let one_plus = FloatVal::from_parts(false, (1u128 << 60) + 1, -60);
+    let one_minus = FloatVal::from_parts(false, (1u128 << 60) - 1, -60);
+    let half_tiny = FloatVal::from_parts(false, 1, -61);
+    for target in [
+        Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux),
+        Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux),
+    ] {
+        let module = linearize_source(src, &target);
+        let halves = |name: &str| match complex_halves(&module, name) {
+            (crate::ir::Initializer::Float(re), crate::ir::Initializer::Float(im)) => (re, im),
+            other => panic!("{name}: expected float halves, got {other:?}"),
+        };
+        assert_eq!(halves("z"), (one_plus, FloatVal::from_i128(2)), "z");
+        assert_eq!(halves("w"), (one_plus, one_plus), "w");
+        assert_eq!(halves("q"), (one_plus, FloatVal::ZERO), "q");
+        assert_eq!(halves("s"), (one_minus, one), "s");
+        let (re, im) = halves("r");
+        assert_eq!(
+            re,
+            one.add(half_tiny, crate::float::FpFormat::Binary128),
+            "r re"
+        );
+        assert_eq!(im, half_tiny.negated(), "r im");
+    }
+}
+
+/// A GNU complex integer folds as integers, by the algorithm the run-time
+/// lowering uses: Smith's method, truncating at every step, which is why
+/// `(-9 + 38i) / (5 + 6i)` is `6 + 1i` in gcc and here, where the exact
+/// quotient is `3 + 4i`. The old fold went through `f64` and the textbook
+/// formula, and answered `3 + 4i`.
+#[test]
+fn test_static_complex_integer_folds_as_integers() {
+    let src = "static _Complex int p = (1 + 2i) * (1 + 2i);\n\
+               static _Complex int q = (-9 + 38i) / (5 + 6i);\n\
+               static _Complex unsigned u = (4000000000u + 0i) / (2u + 0i);\n\
+               static _Complex int t = (_Complex int)(2.5 + 3.5i);\n";
+    let module = linearize_source(src, &Target::host());
+    let halves = |name: &str| match complex_halves(&module, name) {
+        (crate::ir::Initializer::Int(re), crate::ir::Initializer::Int(im)) => (re, im),
+        other => panic!("{name}: expected integer halves, got {other:?}"),
+    };
+    assert_eq!(halves("p"), (-3, 4));
+    assert_eq!(halves("q"), (6, 1));
+    assert_eq!(halves("u"), (2_000_000_000, 0));
+    assert_eq!(halves("t"), (2, 3));
+}
+
+/// Complex constants in the scalar shapes a static initializer takes, each
+/// value gcc's on both targets: `==`/`!=` against the common complex type,
+/// `__real__`/`__imag__`, `!`, `&&`/`||`, a condition, and conversion to a
+/// real, an integer or `_Bool` type.
+#[test]
+fn test_static_initializer_complex_scalar_shapes() {
+    let src = "int f = (_Complex float)(0.5) == 0.5;\n\
+               int f2 = (1.0 + 2.0i) != (1.0 + 2.0i);\n\
+               int f3 = (1.0f + 2.0fi) == (1.0L + 2.0iL);\n\
+               int f4 = 3 == (3 + 0i);\n\
+               int f5 = (0.1f + 0i) == 0.1;\n\
+               int f6 = __builtin_complex(__builtin_nan(\"\"), 0.0) == __builtin_complex(__builtin_nan(\"\"), 0.0);\n\
+               double r1 = __real__ (1.5 + 2.5i);\n\
+               double r2 = __imag__ (1.5 + 2.5i);\n\
+               int r3 = __real__ (3 + 4i);\n\
+               int r4 = __imag__ (3 + 4i);\n\
+               double r5 = __imag__ 2.5;\n\
+               int n1 = !(0.0 + 0.0i);\n\
+               int n2 = !(0.0 + 1.0i);\n\
+               int n3 = !0.5;\n\
+               int l1 = (0.0 + 1.0i) && 1;\n\
+               int l2 = (0.0 + 0.0i) || 0.5;\n\
+               int c1 = (0.0 + 1.0i) ? 7 : 8;\n\
+               int c2 = (0.0 + 0.0i) ? 7 : 8;\n\
+               double k1 = (double)(1.5 + 2.5i);\n\
+               int k2 = (int)(3.75 + 2.5i);\n\
+               _Bool k3 = (_Bool)(0.0 + 1.0i);\n\
+               _Bool k4 = (_Bool)(0.0 + 0.0i);\n\
+               double k5 = 1.25 + 2.0i;\n\
+               int k6 = 3.75 + 2.5i;\n\
+               long long k9 = (long long)(0x1p62L + 1.0L + 1.0iL);\n\
+               int k10 = (int)(5 + 6i);\n\
+               double k11 = (double)(5 + 6i);\n\
+               double q1 = (1 ? 2.5 : 3) * 2;\n\
+               double q2 = __real__ ((0.0 + 1.0i) ? (4.0 + 5.0i) : 0);\n";
+    for target in [
+        Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux),
+        Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux),
+    ] {
+        let module = linearize_source(src, &target);
+        let int = |name: &str| match global_init(&module, name) {
+            crate::ir::Initializer::Int(v) => *v,
+            other => panic!("{name}: expected an integer, got {other:?}"),
+        };
+        let float = |name: &str| match global_init(&module, name) {
+            crate::ir::Initializer::Float(v) => v.to_f64(),
+            other => panic!("{name}: expected a float, got {other:?}"),
+        };
+        for (name, want) in [
+            ("f", 1),
+            ("f2", 0),
+            ("f3", 1),
+            ("f4", 1),
+            ("f5", 0),
+            ("f6", 0),
+            ("r3", 3),
+            ("r4", 4),
+            ("n1", 1),
+            ("n2", 0),
+            ("n3", 0),
+            ("l1", 1),
+            ("l2", 1),
+            ("c1", 7),
+            ("c2", 8),
+            ("k2", 3),
+            ("k3", 1),
+            ("k4", 0),
+            ("k6", 3),
+            ("k9", (1 << 62) + 1),
+            ("k10", 5),
+        ] {
+            assert_eq!(int(name), want, "{name}");
+        }
+        for (name, want) in [
+            ("r1", 1.5),
+            ("r2", 2.5),
+            ("r5", 0.0),
+            ("k1", 1.5),
+            ("k5", 1.25),
+            ("k11", 5.0),
+            ("q1", 5.0),
+            ("q2", 4.0),
+        ] {
+            assert_eq!(float(name), want, "{name}");
+        }
+    }
+}
+
+/// `va_arg` of a complex type writes a local of its own, exactly as it does
+/// for a struct: a complex value travels by address at every size, so the
+/// result has to *be* storage. A bare register pseudo -- what a scalar gets --
+/// had the backend write the value into it and every consumer then
+/// dereference that value as the address of the two halves.
+#[test]
+fn test_va_arg_of_complex_writes_a_local() {
+    let src = "struct P { double a, b; };\n\
+               void use(void *);\n\
+               void f(int n, ...) {\n\
+                   __builtin_va_list ap;\n\
+                   __builtin_va_start(ap, n);\n\
+                   float _Complex fc = __builtin_va_arg(ap, float _Complex);\n\
+                   double _Complex dc = __builtin_va_arg(ap, double _Complex);\n\
+                   long double _Complex lc = __builtin_va_arg(ap, long double _Complex);\n\
+                   int _Complex ic = __builtin_va_arg(ap, int _Complex);\n\
+                   _Float16 _Complex hc = __builtin_va_arg(ap, _Float16 _Complex);\n\
+                   struct P p = __builtin_va_arg(ap, struct P);\n\
+                   double d = __builtin_va_arg(ap, double);\n\
+                   use(&fc); use(&dc); use(&lc); use(&ic); use(&hc); use(&p); use(&d);\n\
+                   __builtin_va_end(ap);\n\
+               }\n";
+    for target in [
+        Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux),
+        Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux),
+        Target::new(crate::target::Arch::Aarch64, crate::target::Os::MacOS),
+    ] {
+        let module = linearize_source(src, &target);
+        let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+        let names_storage: Vec<bool> = f
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| i.op == Opcode::VaArg)
+            .map(|i| {
+                matches!(
+                    f.get_pseudo(i.target.unwrap()).map(|p| &p.kind),
+                    Some(crate::ir::PseudoKind::Sym(_))
+                )
+            })
+            .collect();
+        // Five complex types and a struct name a local; the double does not.
+        assert_eq!(
+            names_storage,
+            [true, true, true, true, true, true, false],
+            "{target:?}"
+        );
+    }
+}
+
+/// A complex `*` calls `__mul?c3` by the ABI's classification of the complex
+/// type, as any other call returning it would be: on x86-64 a
+/// `_Float128 _Complex` is MEMORY class, so `__multc3` is handed a hidden
+/// pointer ahead of its four halves and the function itself returns through
+/// one; `long double _Complex` is COMPLEX_X87 and comes back in st(0)/st(1),
+/// with no hidden pointer. On aarch64 `_Float128` is `long double` and its
+/// complex an HFA, so neither has one.
+#[test]
+fn test_complex_multiply_routine_follows_the_return_class() {
+    use crate::target::{Arch, Os};
+    let cases = [
+        (Arch::X86_64, "_Float128", "__multc3", true),
+        (Arch::X86_64, "long double", "__mulxc3", false),
+        (Arch::Aarch64, "_Float128", "__multc3", false),
+    ];
+    for (arch, base, routine, sret) in cases {
+        let src = format!(
+            "{base} _Complex m({base} _Complex x, {base} _Complex y) {{ return x * y; }}\n"
+        );
+        let module = linearize_source(&src, &Target::new(arch, Os::Linux));
+        let m = module.functions.iter().find(|f| f.name == "m").unwrap();
+        let has_sret = m
+            .pseudos
+            .iter()
+            .any(|p| p.kind == PseudoKind::Arg(0) && p.name.as_deref() == Some("__sret"));
+        assert_eq!(
+            has_sret, sret,
+            "{base} on {arch:?}: the function's own return"
+        );
+        let call = m
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .find(|i| i.op == Opcode::Call && i.func_name.as_deref() == Some(routine))
+            .unwrap_or_else(|| panic!("{base} on {arch:?}: no {routine} call"));
+        assert_eq!(
+            call.returns_via_sret(),
+            sret,
+            "{base} on {arch:?}: {routine}"
+        );
+        assert_eq!(
+            call.src.len(),
+            4 + usize::from(sret),
+            "{base} on {arch:?}: {routine} takes the four halves, after any hidden pointer"
+        );
+    }
+}
+
+/// A known library call keeps its tag in the IR under whatever name the
+/// program gave it: `strstr` renamed by an asm label is called as
+/// `my_strstr` and is still `strstr` to the optimizer. A call through a
+/// pointer to it is not tagged.
+#[test]
+fn test_known_call_keeps_its_tag_under_an_asm_label() {
+    let src = "char *strstr(const char *, const char *) __asm__(\"my_strstr\");\n\
+               char *f(const char *s) { return strstr(s, \"o\"); }\n\
+               char *g(const char *s) { return (&strstr)(s, \"o\"); }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    let call_in = |name: &str| {
+        insns_of(&module, name)
+            .into_iter()
+            .find(|i| i.op == Opcode::Call)
+            .unwrap_or_else(|| panic!("{name}: no call"))
+    };
+    let f = call_in("f");
+    let label = crate::arch::lir::verbatim("my_strstr");
+    assert_eq!(f.func_name.as_deref(), Some(label.as_str()));
+    assert_eq!(f.known, Some(crate::parse::ast::LibFn::Strstr));
+    assert_eq!(call_in("g").known, None);
+}
+
+/// A cast to `void` converts nothing: `(void)x` of a floating `x` was a
+/// float-to-integer conversion, which raises `FE_INVALID` for a NaN.
+#[test]
+fn test_void_cast_of_a_float_converts_nothing() {
+    let src = "void f(float a, double b, long double c) { (void)a; (void)b; (void)c; }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let converts = f
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| matches!(i.op, Opcode::FCvtS | Opcode::FCvtU))
+        .count();
+    assert_eq!(converts, 0);
+}
+
+/// x86-64 Linux, whose x87 `long double` holds `0x1p62L + 1.0L` exactly --
+/// a test about that names the target rather than taking the host's, since
+/// on an arm64 Mac `long double` is `double`.
+fn x86_64_linux() -> Target {
+    Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux)
 }

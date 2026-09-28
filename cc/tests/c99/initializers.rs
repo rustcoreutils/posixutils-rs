@@ -11,7 +11,7 @@
 // Consolidates: designated initializers, compound literals tests
 //
 
-use crate::common::{compile_and_run, compile_and_run_optimized};
+use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_optimized};
 
 // ============================================================================
 // Mega-test: C99 initializers (designated init, compound literals)
@@ -2355,4 +2355,194 @@ int main(void) {
         compile_and_run("c99_gnu_colon_designator_o2", code, &["-O2".to_string()]),
         0
     );
+}
+
+// A static initializer is evaluated at the precision of its operands' own
+// type. A `long double` constant carries 64 significand bits on x86-64 and
+// 113 on aarch64 Linux, so each value below is exact in both -- and was read
+// off gcc on both. They came out rounded to `double`: the float-to-integer
+// conversion and the complex arithmetic both went through `f64`. Apple
+// arm64's `long double` is `double`, where each sum rounds to its leading
+// term, so what is expected is the exact value in a wide `long double` and
+// that rounding in a `double` one.
+const LONG_DOUBLE_STATIC_INIT_PROGRAM: &str = r#"
+static long long a = 0x1p62L + 1.0L;
+static unsigned long long b = 0x1p63L + 3.0L;
+static long long c = -0x1p62L - 5.0L;
+static long double _Complex z = (1.0L + 0x1p-60L) + 2.0iL;
+static long double _Complex w = (1.0L + 0x1p-60L) * (1.0L + 1.0iL);
+static long double _Complex q = (2.0L + 0x1p-59L) / 2.0L;
+static long double _Complex s = (1.0L + 1.0iL) - 0x1p-60L;
+#define WIDE (__LDBL_MANT_DIG__ > 53)
+#define T60 (WIDE ? 0x1p-60L : 0.0L)
+int main(void) {
+    if (a != 4611686018427387904LL + WIDE) return 1;
+    if (b != 9223372036854775808ULL + 3 * WIDE) return 2;
+    if (c != -4611686018427387904LL - 5 * WIDE) return 3;
+    if (__real__ z - 1.0L != T60 || __imag__ z != 2.0L) return 4;
+    if (__real__ w - 1.0L != T60 || __imag__ w - 1.0L != T60) return 5;
+    if (__real__ q - 1.0L != T60 || __imag__ q != 0.0L) return 6;
+    if (1.0L - __real__ s != T60 || __imag__ s != 1.0L) return 7;
+    return 0;
+}
+"#;
+
+#[test]
+fn c99_long_double_static_initializers_keep_their_precision() {
+    assert_eq!(
+        compile_and_run("ld_static_init", LONG_DOUBLE_STATIC_INIT_PROGRAM, &[]),
+        0
+    );
+    if let Some(rc) =
+        compile_and_run_aarch64("ld_static_init_a64", LONG_DOUBLE_STATIC_INIT_PROGRAM, "-O0")
+    {
+        assert_eq!(rc, 0);
+    }
+}
+
+// The same expressions as above, and a few more, evaluated at run time from
+// `volatile` operands: a static initializer is folded by the compiler and an
+// automatic one computed by the program, and the two must agree, bit for
+// bit, on both targets. Complex `*` and `/` run through libgcc's `__mul?c3`
+// and `__div?c3`, which is what the fold models.
+const LONG_DOUBLE_FOLD_MATCHES_RUNTIME_PROGRAM: &str = r#"
+static long long a = 0x1p62L + 1.0L;
+static unsigned long long b = 0x1p63L + 3.0L;
+static long long c = -0x1p62L - 5.0L;
+static long double _Complex z = (1.0L + 0x1p-60L) + 2.0iL;
+static long double _Complex w = (1.0L + 0x1p-60L) * (1.0L + 1.0iL);
+static long double _Complex q = (2.0L + 0x1p-59L) / 2.0L;
+static long double _Complex s = (1.0L + 1.0iL) - 0x1p-60L;
+static long double _Complex r = (1.0L + 0x1p-60L + 1.0iL) / (1.0L + 1.0iL);
+static long double _Complex m = (3.0L + 0x1p-58L + 5.0iL) * (7.0L - 0x1p-57iL);
+static long double _Complex d = (3.0L + 0x1p-58L + 5.0iL) / (7.0L - 2.0iL);
+static _Complex int iq = (-9 + 38i) / (5 + 6i);
+
+/* The halves compared as C compares them, and their signs as well. */
+static int same(long double _Complex x, long double _Complex y) {
+    return __real__ x == __real__ y && __imag__ x == __imag__ y
+        && __builtin_signbit(__real__ x) == __builtin_signbit(__real__ y)
+        && __builtin_signbit(__imag__ x) == __builtin_signbit(__imag__ y);
+}
+
+int main(void) {
+    volatile long double one = 1.0L, two = 2.0L, three = 3.0L, seven = 7.0L;
+    volatile long double p62 = 0x1p62L, p63 = 0x1p63L, t58 = 0x1p-58L, t60 = 0x1p-60L;
+    volatile long double t59 = 0x1p-59L, t57 = 0x1p-57L;
+    volatile long double _Complex i = 1.0iL;
+
+    long long ra = p62 + one;
+    unsigned long long rb = p63 + 3.0L;
+    long long rc = -p62 - 5.0L;
+    if (a != ra) return 1;
+    if (b != rb) return 2;
+    if (c != rc) return 3;
+
+    if (!same(z, (one + t60) + two * i)) return 4;
+    if (!same(w, (one + t60) * (one + i))) return 5;
+    if (!same(q, (two + t59) / (long double _Complex)two)) return 6;
+    if (!same(s, (one + i) - t60)) return 7;
+    if (!same(r, (one + t60 + i) / (one + i))) return 8;
+    if (!same(m, (three + t58 + 5.0L * i) * (seven - t57 * i))) return 9;
+#ifndef __APPLE__
+    /* Apple's `__divdc3` is compiler-rt's, which scales by `logb` where
+       libgcc's divides by Smith's method; c17 folds as libgcc computes, and
+       for this quotient the two differ in the last place. */
+    if (!same(d, (three + t58 + 5.0L * i) / (seven - two * i))) return 10;
+#endif
+
+    volatile _Complex int n = -9 + 38i, e = 5 + 6i;
+    _Complex int rq = n / e;
+    if (__real__ iq != __real__ rq || __imag__ iq != __imag__ rq) return 11;
+    return 0;
+}
+"#;
+
+#[test]
+fn c99_long_double_static_initializers_match_run_time_evaluation() {
+    assert_eq!(
+        compile_and_run(
+            "ld_fold_vs_runtime",
+            LONG_DOUBLE_FOLD_MATCHES_RUNTIME_PROGRAM,
+            &[]
+        ),
+        0
+    );
+    if let Some(rc) = compile_and_run_aarch64(
+        "ld_fold_vs_runtime_a64",
+        LONG_DOUBLE_FOLD_MATCHES_RUNTIME_PROGRAM,
+        "-O0",
+    ) {
+        assert_eq!(rc, 0);
+    }
+}
+
+// Complex constants in the scalar shapes a static initializer can take. Each
+// value is gcc's, on both targets. `(_Complex float)(0.5) == 0.5` is
+// gcc.c-torture compile/pr30433.
+const COMPLEX_SCALAR_STATIC_INIT_PROGRAM: &str = r#"
+int f = (_Complex float)(0.5) == 0.5;
+int f2 = (1.0 + 2.0i) != (1.0 + 2.0i);
+int f3 = (1.0f + 2.0fi) == (1.0L + 2.0iL);
+int f4 = 3 == (3 + 0i);
+int f5 = (0.1f + 0i) == 0.1;
+int f6 = __builtin_complex(__builtin_nan(""), 0.0) == __builtin_complex(__builtin_nan(""), 0.0);
+double r1 = __real__ (1.5 + 2.5i);
+double r2 = __imag__ (1.5 + 2.5i);
+int r3 = __real__ (3 + 4i);
+int r4 = __imag__ (3 + 4i);
+double r5 = __imag__ 2.5;
+int n1 = !(0.0 + 0.0i);
+int n2 = !(0.0 + 1.0i);
+int n3 = !0.5;
+int l1 = (0.0 + 1.0i) && 1;
+int l2 = (0.0 + 0.0i) || 0.5;
+int c1 = (0.0 + 1.0i) ? 7 : 8;
+int c2 = (0.0 + 0.0i) ? 7 : 8;
+double k1 = (double)(1.5 + 2.5i);
+int k2 = (int)(3.75 + 2.5i);
+_Bool k3 = (_Bool)(0.0 + 1.0i);
+_Bool k4 = (_Bool)(0.0 + 0.0i);
+double k5 = 1.25 + 2.0i;
+int k6 = 3.75 + 2.5i;
+float k8 = (float)(0x1p-30L + 1.0L + 1.0iL);
+long long k9 = (long long)(0x1p62L + 1.0L + 1.0iL);
+int k10 = (int)(5 + 6i);
+double k11 = (double)(5 + 6i);
+_Complex double k12 = (_Complex double)(3 + 4i);
+double q1 = (1 ? 2.5 : 3) * 2;
+_Complex double q2 = 0 ? 1.0 : (2.0 + 3.0i);
+
+int main(void) {
+    if (f != 1 || f2 != 0 || f3 != 1 || f4 != 1 || f5 != 0 || f6 != 0) return 1;
+    if (r1 != 1.5 || r2 != 2.5 || r3 != 3 || r4 != 4 || r5 != 0.0) return 2;
+    if (n1 != 1 || n2 != 0 || n3 != 0 || l1 != 1 || l2 != 1) return 3;
+    if (c1 != 7 || c2 != 8) return 4;
+    if (k1 != 1.5 || k2 != 3 || k3 != 1 || k4 != 0 || k5 != 1.25 || k6 != 3) return 5;
+    /* 2^62 + 1 is exact in a wide long double, and 2^62 in Apple's. */
+    if (k8 != 1.0f || k9 != 4611686018427387904LL + (__LDBL_MANT_DIG__ > 53)) return 6;
+    if (k10 != 5 || k11 != 5.0) return 6;
+    if (__real__ k12 != 3.0 || __imag__ k12 != 4.0) return 7;
+    if (q1 != 5.0 || __real__ q2 != 2.0 || __imag__ q2 != 3.0) return 8;
+    return 0;
+}
+"#;
+
+#[test]
+fn c99_complex_constants_in_scalar_static_initializers() {
+    assert_eq!(
+        compile_and_run(
+            "complex_scalar_init",
+            COMPLEX_SCALAR_STATIC_INIT_PROGRAM,
+            &[]
+        ),
+        0
+    );
+    if let Some(rc) = compile_and_run_aarch64(
+        "complex_scalar_init_a64",
+        COMPLEX_SCALAR_STATIC_INIT_PROGRAM,
+        "-O0",
+    ) {
+        assert_eq!(rc, 0);
+    }
 }

@@ -10,7 +10,7 @@
 // concatenation, including the mixed-prefix rules.
 //
 
-use crate::common::{compile_and_run, compile_expect_error, run_c17};
+use crate::common::{compile_and_run, compile_and_run_aarch64, compile_expect_error, run_c17};
 
 /// Every prefix lexes, and each has the right element width. `u8"x"` used to
 /// give `undeclared identifier 'u8'` followed by a parse cascade.
@@ -269,4 +269,71 @@ fn c11_local_array_from_utf16_and_utf32_literals() {
         }
     "#;
     assert_eq!(compile_and_run("c11_local_utf_array", src, &[]), 0);
+}
+
+/// An octal or hex escape in a prefixed literal is bounded by the element
+/// type, not by a byte (C17 6.4.4.4p9): `L'\x1234'` is 0x1234, and
+/// `L"\xffffffff"` holds one all-ones `wchar_t`, whose value then follows the
+/// target's signedness. Every escape was cut to eight bits, so `L'\x1234'` was
+/// 0x34 and `L'\x80000000'` was 0; and a wide literal was carried as text, so
+/// a unit that is not a character -- a lone surrogate, or anything above
+/// U+10FFFF -- became U+FFFD. Expected values are gcc's on both Linux
+/// targets.
+const PREFIXED_ESCAPES: &str = r#"
+typedef __WCHAR_TYPE__ wchar_t;
+typedef __CHAR16_TYPE__ char16_t;
+typedef __CHAR32_TYPE__ char32_t;
+
+static const wchar_t ws[] = L"a\x1234\xffffffff\777\U0001F600";
+static const char16_t us[] = u"a\x1234\xd800\777\U0001F600";
+static const char32_t Us[] = U"a\x1234\xffffffff\777\U0001F600";
+
+int main(void) {
+    int wchar_signed = (wchar_t)-1 < 0;
+    long long ones = wchar_signed ? -1 : 4294967295LL;
+
+    if (L'\x1234' != 0x1234 || L'\777' != 0777) return 1;
+    if (L'\xffffffff' != ones) return 2;
+    if (u'\x1234' != 0x1234 || u'\xd800' != 0xd800) return 3;
+    if (U'\xffffffff' != 0xffffffffu || U'\777' != 0777) return 4;
+
+    if (sizeof ws / sizeof ws[0] != 6) return 5;
+    if (ws[1] != 0x1234 || ws[2] != ones || ws[3] != 0777 || ws[4] != 0x1f600) return 6;
+    /* The escaped unit is kept as a unit; the character is encoded. */
+    if (sizeof us / sizeof us[0] != 7) return 7;
+    if (us[1] != 0x1234 || us[2] != 0xd800 || us[3] != 0777) return 8;
+    if (us[4] != 0xd83d || us[5] != 0xde00) return 9;
+    if (Us[2] != 0xffffffffu || Us[4] != 0x1f600) return 10;
+
+    /* Through a pointer, and in an automatic array. */
+    const wchar_t *p = L"\x80000000";
+    if (p[0] != (wchar_signed ? -2147483647 - 1 : 2147483648LL)) return 11;
+    wchar_t a[] = L"\x1234\xfffffffe";
+    if (a[0] != 0x1234 || a[1] != (wchar_signed ? -2 : 4294967294LL)) return 12;
+
+#if L'\x1234' != 0x1234 || u'\x1234' != 0x1234 || U'\x10000' != 0x10000
+    return 13;
+#endif
+#if L'\xffffffff' < 0
+    if (!wchar_signed) return 14;
+#else
+    if (wchar_signed) return 15;
+#endif
+    return 0;
+}
+"#;
+
+#[test]
+fn c11_prefixed_escapes_keep_their_width() {
+    assert_eq!(
+        compile_and_run("prefixed_escapes", PREFIXED_ESCAPES, &[]),
+        0
+    );
+}
+
+#[test]
+fn c11_prefixed_escapes_keep_their_width_aarch64() {
+    if let Some(rc) = compile_and_run_aarch64("prefixed_escapes_a64", PREFIXED_ESCAPES, "-O0") {
+        assert_eq!(rc, 0);
+    }
 }

@@ -19,6 +19,7 @@ mod declaration;
 mod declarator;
 mod expr_check;
 mod expression;
+mod library_builtin;
 pub mod parser;
 mod statement;
 mod toplevel;
@@ -28,6 +29,7 @@ mod typename;
 mod test_parser;
 
 // Re-export parser used by main.rs
+pub use library_builtin::LibraryCallPolicy;
 pub use parser::Parser;
 
 /// Check if a StringId is a C11 nullability qualifier.

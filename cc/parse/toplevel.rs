@@ -10,7 +10,9 @@
 // and _Static_assert
 //
 
-use super::ast::{ExternalDecl, FunctionAttrs, FunctionDef, Parameter, Stmt, TranslationUnit};
+use super::ast::{
+    ExternalDecl, FunctionAttrs, FunctionDef, ParamStyle, Parameter, Stmt, TranslationUnit,
+};
 use super::bind::{DeclScope, DeclSpecs};
 use super::declaration::SpecContext;
 use super::parser::{
@@ -230,6 +232,12 @@ impl Parser<'_> {
         let mut params = params.unwrap_or_default();
         let typ = self.parse_old_style_parameters(typ, &mut params)?;
         let func = self.types.get(typ);
+        // An identifier list records no parameter types (C17 6.7.6.3p14).
+        let param_style = if func.params.is_some() {
+            ParamStyle::Prototype
+        } else {
+            ParamStyle::IdentifierList
+        };
         let return_type = func.base.expect("a function type has a return type");
         // An old-style declarator has no `...` to be variadic with.
         let is_variadic = func.variadic;
@@ -238,6 +246,11 @@ impl Parser<'_> {
         let _ = self
             .symbols
             .declare(Symbol::function(name, typ, self.symbols.depth()));
+        // A weak definition may be replaced at link time, so gcc leaves the
+        // builtin in place of it; so does this.
+        if !attrs.symbol.weak {
+            self.defined_functions.insert(name);
+        }
         // A definition binds a fresh symbol, so the facts accumulated over
         // every declaration of the name are settled onto it -- without them
         // its C99 6.7.4p6 inline classification is computed from declarations
@@ -265,6 +278,7 @@ impl Parser<'_> {
             return_type,
             name,
             params,
+            param_style,
             body,
             pos: specs.pos,
             is_static: specs.storage_class.contains(TypeModifiers::STATIC),

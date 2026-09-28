@@ -11,7 +11,9 @@
 // Consolidates: nan, nans, flt_rounds tests
 //
 
-use crate::common::{asm_for_at, compile_and_run};
+use crate::common::{
+    asm_for_at, asm_symbol, compile_and_run, compile_and_run_aarch64, compile_expect_error,
+};
 
 // ============================================================================
 // Mega-test: Math builtins
@@ -155,9 +157,6 @@ int main(void) {
 ///
 /// `__builtin_isnan` and friends are lowered as comparisons rather than bit
 /// tests, which keeps them exact for `long double` and needs no backend work.
-/// They were also deliberately not expressed with `fabs`, because
-/// `__builtin_fabsl` used to narrow a `long double` to a double -- that is
-/// #C121 and is fixed, but a comparison is still the cheaper lowering.
 ///
 /// Checked against gcc on the same source at -O0 and -O2.
 #[test]
@@ -284,21 +283,14 @@ int main(void)
 }
 
 /// `__builtin_fabsl` and `__builtin_signbitl` operate on a `long double`, not
-/// on its low eight bytes (#C121).
+/// on its low eight bytes: on x86-64 that is the 80-bit x87 format, and
+/// reading it as a `double` reads its mantissa. Both are computed in place at
+/// the `long double` width.
 ///
-/// Both lowered to the *`double`* opcode, whose emitter moves the argument as a
-/// `double` and calls `fabs` / `__signbit`. On x86-64 a `long double` is the
-/// 80-bit x87 format, so that read its mantissa:
-/// `__builtin_fabsl(-3.5L)` returned **2.5e-4932**. They are ordinary calls to
-/// `fabsl` and `__signbitl` now, which gets the long-double ABI from the call
-/// path that already carries one for `__mulxc3`.
-///
-/// The `signbit` family is also normalised to 0/1. C17 7.12.3.6 permits any
-/// nonzero value and the library entry points return the sign bit in place --
-/// 8, 128 and 512 for the three widths, which did not even agree with each
-/// other. gcc is no more consistent: on x86-64 it answers 512 for a runtime
-/// `long double` and 1 for a constant one, and on aarch64 it answers 1 for
-/// both. Everything here is conforming; 0/1 is merely predictable.
+/// The `signbit` family answers 0/1. C17 7.12.3.6 permits any nonzero value,
+/// and gcc is not consistent: it answers 1 for a constant, and at run time
+/// the bit in place -- `INT_MIN` for a `float`, and 512 for a `long double`
+/// on x86-64. Everything here is conforming; 0/1 is merely predictable.
 #[test]
 fn builtins_long_double_magnitude_and_sign() {
     let code = r#"
@@ -333,10 +325,10 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(
-        compile_and_run("long_double_magnitude", code, &["-lm".to_string()]),
-        0
-    );
+    assert_eq!(compile_and_run("long_double_magnitude", code, &[]), 0);
+    if let Some(rc) = compile_and_run_aarch64("long_double_magnitude_a64", code, "-O2") {
+        assert_eq!(rc, 0);
+    }
 }
 
 /// A library builtin taking `double` must be declared taking `double`.
@@ -542,11 +534,9 @@ int main(void)
 /// and `(float)sin((double)x)` differ in the last bit for some `x`, so
 /// narrowing `sin` would be a wrong answer rather than a faster one.
 ///
-/// c17 narrows in the parser and so does it at every level, where gcc does
-/// it only with the optimizer on. Both are correct, since the rewrite is
-/// exact; [`builtins_math_narrowing_happens_at_every_level`] pins the
-/// difference down on the assembly, because a run-time test of it would
-/// disagree with gcc at `-O0` for a reason that is not a defect.
+/// c17 narrows where it computes the answer itself, as gcc does once
+/// optimizing; [`builtins_math_narrowing_computes_in_place`] pins that down
+/// on the assembly.
 #[test]
 fn builtins_exactly_rounding_math_narrows_to_its_float_form() {
     let code = r#"
@@ -597,11 +587,9 @@ __attribute__((noinline)) static double transcendental(float x)
 
 int main(void)
 {
-    /* Guarded because gcc narrows only with the optimizer on, so at `-O0` it
-       reaches the aborting wide form and this program is not a statement
-       about it. c17 narrows at every level, which
-       `builtins_math_narrowing_happens_at_every_level` checks on the
-       assembly instead. */
+    /* Guarded because gcc and c17 narrow only with the optimizer on: at
+       `-O0` the call is the one the program wrote, and reaches the aborting
+       wide form. */
 #ifdef __OPTIMIZE__
     /* Six identities at an integral argument. */
     if (narrow(0.0f) != 0.0f) abort();
@@ -624,26 +612,31 @@ int main(void)
     }
 }
 
-/// The narrowing happens in the parser, so it does not wait for `-O`.
-///
-/// gcc performs it as an optimization and leaves the wide call at `-O0`.
-/// Doing it always is a deliberate difference and a safe one -- the rewrite
-/// is exact at every level -- but it is a difference, so it is stated here
-/// rather than left for someone to discover from a disassembly.
+/// A narrowed call is computed in place, at `float` -- `cvttss2si` on
+/// x86-64, `frintm` of an `s` register on aarch64 -- and nothing is called.
+/// At `-O0` the bare `floor` is not computed but called, as under gcc, and
+/// the call is the one the program wrote: to `floor`, never `floorf`, so
+/// that a definition of `floor` anywhere in the unit is what it reaches.
 #[test]
-fn builtins_math_narrowing_happens_at_every_level() {
+fn builtins_math_narrowing_computes_in_place() {
     let src = "double floor(double);\nfloat q(float a) { return floor(a); }\n";
     // The host's own format, plus both Darwin triples so the Mach-O spelling
     // is exercised wherever this runs. The prefix is read off each output
     // rather than assumed -- Mach-O calls `_floorf`, and "floorf" is a
     // substring of that, so a check spelled for ELF keeps passing there
-    // while its negative half matches nothing at all.
-    let targets: [&[&str]; 3] = [
-        &[],
-        &["--target=aarch64-apple-darwin"],
-        &["--target=x86_64-apple-darwin"],
+    // while its negative half matches nothing at all. The last element is
+    // the instruction that computes a `float` floor in place.
+    let host_insn = if cfg!(target_arch = "aarch64") {
+        "frintm s"
+    } else {
+        "cvttss2si"
+    };
+    let targets: [(&[&str], &str); 3] = [
+        (&[], host_insn),
+        (&["--target=aarch64-apple-darwin"], "frintm s"),
+        (&["--target=x86_64-apple-darwin"], "cvttss2si"),
     ];
-    for target in targets {
+    for (target, in_place) in targets {
         for opt in ["-O0", "-O1", "-O2"] {
             let mut args = vec![opt];
             args.extend_from_slice(target);
@@ -667,13 +660,20 @@ fn builtins_math_narrowing_happens_at_every_level() {
                 })
             };
             assert!(
-                calls("floorf"),
-                "{target:?} at {opt}: the call should be narrowed to {p}floorf:\n{asm}"
+                !calls("floorf"),
+                "{target:?} at {opt}: the float form must not be called:\n{asm}"
             );
-            assert!(
-                !calls("floor"),
-                "{target:?} at {opt}: the wide form must not be called:\n{asm}"
-            );
+            if opt == "-O0" {
+                assert!(
+                    calls("floor"),
+                    "{target:?} at {opt}: the call should be to {p}floor:\n{asm}"
+                );
+            } else {
+                assert!(
+                    !calls("floor") && asm.contains(in_place),
+                    "{target:?} at {opt}: not computed in place at float:\n{asm}"
+                );
+            }
         }
     }
 }
@@ -928,4 +928,799 @@ int main(void) {
         compile_and_run("libm_entry_points", code, &["-lm".into()]),
         0
     );
+}
+
+// ============================================================================
+// Bare complex accessors: creal, cimag, conj
+// ============================================================================
+
+// Self-contained, since the aarch64 run has no target headers to include.
+const COMPLEX_ACCESSOR_PROGRAM: &str = r#"
+double creal(double _Complex); float crealf(float _Complex);
+long double creall(long double _Complex);
+double cimag(double _Complex); float cimagf(float _Complex);
+long double cimagl(long double _Complex);
+double _Complex conj(double _Complex); float _Complex conjf(float _Complex);
+long double _Complex conjl(long double _Complex);
+static int n;
+static double _Complex g(void) { n++; return 1.0 + 2.0i; }
+int main(void) {
+    volatile double _Complex d = 1.5 + 2.5i;
+    volatile float _Complex f = 3.0f - 4.0if;
+    volatile long double _Complex l = 5.0L + 6.0iL;
+
+    /* The bare spellings, every precision. */
+    if (creal(d) != 1.5 || cimag(d) != 2.5) return 1;
+    if (crealf(f) != 3.0f || cimagf(f) != -4.0f) return 2;
+    if (creall(l) != 5.0L || cimagl(l) != 6.0L) return 3;
+    if (conj(d) != 1.5 - 2.5i || conjf(f) != 3.0f + 4.0if) return 4;
+    if (conjl(l) != 5.0L - 6.0iL) return 5;
+
+    /* The argument is evaluated once, bare or reserved. */
+    if (conj(g()) != 1.0 - 2.0i || n != 1) return 6;
+    if (__builtin_conj(g()) != 1.0 - 2.0i || n != 2) return 7;
+    if (creal(g()) != 1.0 || n != 3) return 8;
+
+    /* The argument converts to the suffix's type, as the prototype says:
+       a real is a complex with a zero imaginary part, and a double half
+       narrows to float. 1 + 2^-25 rounds to 1.0f. */
+    if (creal(3) != 3.0 || cimag(3) != 0.0) return 9;
+    volatile double _Complex p = 1.0 + 1.0000000298023223876953125i;
+    if (cimagf(p) != 1.0f || __builtin_cimagf(p) != 1.0f) return 10;
+    if (sizeof(crealf(d)) != sizeof(float)) return 11;
+    if (sizeof(conjf(d)) != sizeof(float _Complex)) return 12;
+    if (sizeof(__builtin_creall(d)) != sizeof(long double)) return 13;
+    return 0;
+}
+"#;
+
+/// `creal`, `cimag` and `conj` are computed in place under their bare names,
+/// as the `__builtin_` spellings always were; `-fno-builtin-NAME` keeps the
+/// library call.
+#[test]
+fn builtins_bare_complex_accessors() {
+    assert_eq!(
+        compile_and_run(
+            "complex_accessors",
+            COMPLEX_ACCESSOR_PROGRAM,
+            &["-lm".to_string()]
+        ),
+        0
+    );
+    if let Some(rc) =
+        compile_and_run_aarch64("complex_accessors_a64", COMPLEX_ACCESSOR_PROGRAM, "-O2")
+    {
+        assert_eq!(rc, 0);
+    }
+
+    // Named without a call, the identifier is the library function. Host
+    // only: the aarch64 helper links no libm.
+    let code = r#"
+double creal(double _Complex);
+int main(void) {
+    double (*fp)(double _Complex) = creal;
+    return fp(1.5 + 2.5i) == 1.5 ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("complex_accessor_fnptr", code, &["-lm".to_string()]),
+        0
+    );
+
+    let calls = |asm: &str, name: &str| {
+        let sym = asm_symbol(name);
+        asm.lines().any(|l| {
+            let mut words = l.split_whitespace();
+            matches!(words.next(), Some("call" | "bl" | "jmp" | "b"))
+                && words.next().map(|t| t.trim_end_matches("@PLT")) == Some(sym.as_str())
+        })
+    };
+    let src = "double creal(double _Complex);\n\
+               double cimag(double _Complex);\n\
+               double _Complex conj(double _Complex);\n\
+               double f(double _Complex z) { return creal(z) + cimag(conj(z)); }\n";
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_at("complex_accessors_asm", src, &[opt]);
+        for name in ["creal", "cimag", "conj"] {
+            assert!(!calls(&asm, name), "{opt}: {name} was called:\n{asm}");
+        }
+    }
+    let asm = asm_for_at("complex_accessors_nb", src, &["-fno-builtin-creal"]);
+    assert!(
+        calls(&asm, "creal"),
+        "-fno-builtin-creal kept creal inline:\n{asm}"
+    );
+    assert!(
+        !calls(&asm, "conj"),
+        "-fno-builtin-creal displaced conj:\n{asm}"
+    );
+}
+
+// ============================================================================
+// fabs and fabsf are computed in place
+// ============================================================================
+
+// Linked without -lm on purpose: gcc never needs libm for these, at any
+// level, and c17 used to lower the opcode to a call to `fabs`, so this
+// failed to link. Self-contained for the header-less aarch64 run.
+const FABS_PROGRAM: &str = r#"
+double fabs(double); float fabsf(float);
+typedef unsigned long long u64; typedef unsigned int u32;
+static u64 bits(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
+static u32 fbits(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
+int main(void) {
+    volatile double m = -1.5, nz = -0.0, ninf = -__builtin_inf();
+    volatile float fm = -2.5f, fnz = -0.0f;
+    volatile double nnan = -__builtin_nan("");
+    if (fabs(m) != 1.5 || __builtin_fabs(m) != 1.5) return 1;
+    if (fabsf(fm) != 2.5f || __builtin_fabsf(fm) != 2.5f) return 2;
+    /* Only the sign bit changes: -0 becomes +0, -inf +inf, and a negative
+       NaN keeps its payload with the sign cleared. */
+    if (bits(fabs(nz)) != 0) return 3;
+    if (fbits(fabsf(fnz)) != 0) return 4;
+    if (fabs(ninf) != __builtin_inf()) return 5;
+    if (bits(fabs(nnan)) != (bits(nnan) & 0x7fffffffffffffffULL)) return 6;
+    if (fabs(1.25) != 1.25 || fabsf(3.0f) != 3.0f) return 7;
+    return 0;
+}
+"#;
+
+#[test]
+fn builtins_fabs_needs_no_libm() {
+    assert_eq!(compile_and_run("fabs_no_libm", FABS_PROGRAM, &[]), 0);
+    if let Some(rc) = compile_and_run_aarch64("fabs_no_libm_a64", FABS_PROGRAM, "-O0") {
+        assert_eq!(rc, 0);
+    }
+    if let Some(rc) = compile_and_run_aarch64("fabs_no_libm_a64_o2", FABS_PROGRAM, "-O2") {
+        assert_eq!(rc, 0);
+    }
+    let src = "double f(double x) { return __builtin_fabs(x); }\n\
+               float g(float x) { return __builtin_fabsf(x); }\n";
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_at("fabs_inline", src, &[opt]);
+        for name in ["fabs", "fabsf"] {
+            let sym = asm_symbol(name);
+            assert!(
+                !asm.lines().any(|l| {
+                    let mut w = l.split_whitespace();
+                    matches!(w.next(), Some("call" | "bl" | "jmp" | "b"))
+                        && w.next().map(|t| t.trim_end_matches("@PLT")) == Some(sym.as_str())
+                }),
+                "{opt}: {name} was called:\n{asm}"
+            );
+        }
+    }
+}
+
+// Linked without -lm on purpose, like the test above: `fabsl` is a sign-bit
+// operation on every target, the x87 `fabs` on x86-64 and a clear of bit 127
+// of the binary128 on aarch64. The NaN inputs are built from bytes at run
+// time, so no constant fold stands in for the instruction; the payload and
+// the quiet bit must come through unchanged, for a signalling NaN too.
+const FABSL_PROGRAM: &str = r#"
+long double fabsl(long double);
+typedef unsigned char u8;
+#if __LDBL_MANT_DIG__ == 64
+#define LD_BYTES 10 /* x87: the rest of the object is padding */
+#else
+#define LD_BYTES ((int)sizeof(long double))
+#endif
+static void to_bytes(u8 *out, long double v) { __builtin_memcpy(out, &v, sizeof v); }
+/* The byte holding the sign bit, as its top bit. */
+static int sign_index(void) {
+    u8 a[sizeof(long double)], b[sizeof(long double)];
+    to_bytes(a, 1.0L);
+    to_bytes(b, -1.0L);
+    for (int i = 0; i < LD_BYTES; i++)
+        if (a[i] != b[i]) return i;
+    return -1;
+}
+/* Whether fabsl of the value in `in` is `in` with only the sign cleared. */
+static int only_sign_cleared(const u8 *in, int si) {
+    volatile long double v;
+    __builtin_memcpy((void *)&v, in, sizeof v);
+    u8 out[sizeof(long double)];
+    to_bytes(out, fabsl(v));
+    for (int i = 0; i < LD_BYTES; i++) {
+        u8 want = i == si ? in[i] & 0x7f : in[i];
+        if (out[i] != want) return 0;
+    }
+    return 1;
+}
+int main(void) {
+    volatile long double m = -1.5L, nz = -0.0L, ninf = -__builtin_infl();
+    int si = sign_index();
+    if (si < 0) return 1;
+    int lo = si == 0 ? LD_BYTES - 1 : 0; /* the least significant byte */
+    if (fabsl(m) != 1.5L || __builtin_fabsl(m) != 1.5L) return 2;
+    u8 b[sizeof(long double)];
+    to_bytes(b, fabsl(nz));
+    for (int i = 0; i < LD_BYTES; i++)
+        if (b[i] != 0) return 3;
+    if (fabsl(ninf) != __builtin_infl()) return 4;
+    to_bytes(b, m);
+    if (!only_sign_cleared(b, si)) return 5;
+    /* A negative quiet NaN with a payload. */
+    to_bytes(b, __builtin_nanl(""));
+    b[lo] |= 0x5a;
+    b[si] |= 0x80;
+    if (!only_sign_cleared(b, si)) return 6;
+    /* A negative signalling NaN: an infinity with payload bits, quiet bit
+       clear. */
+    to_bytes(b, __builtin_infl());
+    b[lo] |= 0x5a;
+    b[si] |= 0x80;
+    if (!only_sign_cleared(b, si)) return 7;
+    if (fabsl(2.25L) != 2.25L) return 8;
+    return 0;
+}
+"#;
+
+#[test]
+fn builtins_fabsl_needs_no_libm() {
+    assert_eq!(compile_and_run("fabsl_no_libm", FABSL_PROGRAM, &[]), 0);
+    if let Some(rc) = compile_and_run_aarch64("fabsl_no_libm_a64", FABSL_PROGRAM, "-O0") {
+        assert_eq!(rc, 0);
+    }
+    if let Some(rc) = compile_and_run_aarch64("fabsl_no_libm_a64_o2", FABSL_PROGRAM, "-O2") {
+        assert_eq!(rc, 0);
+    }
+    let called = |asm: &str| {
+        asm.lines().any(|l| {
+            let mut w = l.split_whitespace();
+            matches!(w.next(), Some("call" | "bl" | "jmp" | "b"))
+                && w.next()
+                    .is_some_and(|t| t.trim_end_matches("@PLT").ends_with("fabsl"))
+        })
+    };
+    let src = "long double f(long double x) { return __builtin_fabsl(x); }\n\
+               long double g(long double x) { return fabsl(x); }\n";
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_at("fabsl_inline", src, &[opt]);
+        assert!(!called(&asm), "{opt}: fabsl was called:\n{asm}");
+        let asm = asm_for_at(
+            "fabsl_inline_a64",
+            src,
+            &[opt, "--target", "aarch64-unknown-linux-gnu"],
+        );
+        assert!(!called(&asm), "{opt} aarch64: fabsl was called:\n{asm}");
+    }
+}
+
+/// `fabs` of a constant folds at -O1 and above: no sign-clearing instruction
+/// is left. Checked for `long double` only where its negation folds too; a
+/// binary128 `-3.5L` is a libgcc call before the optimizer sees it.
+#[test]
+fn builtins_fabs_of_a_constant_folds() {
+    let mut src = String::from(
+        "double f(void) { return __builtin_fabs(-3.5); }\n\
+         float g(void) { return __builtin_fabsf(-2.0f); }\n",
+    );
+    if cfg!(target_arch = "x86_64") {
+        src.push_str("long double h(void) { return __builtin_fabsl(-3.5L); }\n");
+    }
+    for opt in ["-O1", "-O2"] {
+        let asm = asm_for_at("fabs_const", &src, &[opt]);
+        assert!(
+            !asm.lines().any(|l| matches!(
+                l.split_whitespace().next(),
+                Some("andpd" | "andps" | "fabs")
+            )),
+            "{opt}: fabs of a constant was not folded:\n{asm}"
+        );
+    }
+}
+
+// ============================================================================
+// NaN payloads
+// ============================================================================
+
+// Every value here was read off gcc on the same source, x86-64 and aarch64,
+// at -O0 and -O2. A NaN's payload and sign are part of its value: the
+// payload a `__builtin_nan` string names, the quiet bit `__builtin_nans`
+// leaves clear, the sign a negation flips, and the payload bits a conversion
+// keeps. Self-contained for the header-less aarch64 run.
+const NAN_PAYLOAD_PROGRAM: &str = r#"
+typedef unsigned long long u64; typedef unsigned u32;
+static u64 b64(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
+static u32 b32(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
+static const double sd = __builtin_nan("0x1234");
+static const float sf = __builtin_nanf("0x123");
+static double sneg = -__builtin_nan("0x1234");
+int main(void) {
+    double d = __builtin_nan("0x1234");
+    volatile double vd = __builtin_nan("0x1234");
+    if (b64(sd) != 0x7ff8000000001234ULL) return 1;
+    if (b64(d) != 0x7ff8000000001234ULL) return 2;
+    if (b64(vd) != 0x7ff8000000001234ULL) return 3;
+    if (b64(-__builtin_nan("0x1234")) != 0xfff8000000001234ULL) return 4;
+    if (b64(sneg) != 0xfff8000000001234ULL) return 5;
+    if (b64(__builtin_nans("0x1234")) != 0x7ff0000000001234ULL) return 6;
+    if (b64(__builtin_nan("")) != 0x7ff8000000000000ULL) return 7;
+    if (b64(__builtin_nan("4660")) != 0x7ff8000000001234ULL) return 8;
+    if (b32(__builtin_nanf("0x123")) != 0x7fc00123u) return 9;
+    if (b32(sf) != 0x7fc00123u) return 10;
+    if (b32(__builtin_nansf("0x123")) != 0x7f800123u) return 11;
+    /* A conversion keeps the payload's high bits, as the hardware does. */
+    if (b32((float)__builtin_nan("0x40000000")) != 0x7fc00002u) return 12;
+    if (b64((double)__builtin_nanf("0x123")) != 0x7ff8002460000000ULL) return 13;
+    /* long double: x87 extended on x86-64, binary128 on aarch64 Linux, and
+       double on Apple arm64. */
+    long double l = __builtin_nanl("0x1234");
+    unsigned char c[16] = {0};
+    __builtin_memcpy(c, &l, sizeof(long double) == 16 && __LDBL_MANT_DIG__ == 64 ? 10 : sizeof(long double));
+    u64 lo, hi;
+    __builtin_memcpy(&lo, c, 8);
+    __builtin_memcpy(&hi, c + 8, 8);
+#if __LDBL_MANT_DIG__ == 64
+    if (lo != 0xc000000000001234ULL || hi != 0x7fffULL) return 14;
+#elif __LDBL_MANT_DIG__ == 53
+    if (lo != 0x7ff8000000001234ULL || hi != 0) return 14;
+#else
+    if (lo != 0x1234ULL || hi != 0x7fff800000000000ULL) return 14;
+#endif
+    return 0;
+}
+"#;
+
+#[test]
+fn builtins_nan_payloads_survive() {
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("nan_payload{opt}"),
+                NAN_PAYLOAD_PROGRAM,
+                &[opt.to_string()]
+            ),
+            0,
+            "host {opt}"
+        );
+        if let Some(rc) =
+            compile_and_run_aarch64(&format!("nan_payload_a64{opt}"), NAN_PAYLOAD_PROGRAM, opt)
+        {
+            assert_eq!(rc, 0, "aarch64 {opt}");
+        }
+    }
+}
+
+/// A string gcc does not fold is not folded here either. `__builtin_nan` of
+/// one is a call to the library's `nan`, which reads the string at run time;
+/// `__builtin_nans` has no library function, so it is an error -- gcc's is a
+/// link failure against `__builtin_nans`.
+#[test]
+fn builtins_nan_of_a_string_that_does_not_fold() {
+    let code = r#"
+double nan(const char *);
+float nanf(const char *);
+int main(void) {
+    const char *volatile s = "0x77";
+    if (!__builtin_isnan(__builtin_nan(s))) return 1;
+    if (!__builtin_isnan(__builtin_nan("abc"))) return 2;
+    if (!__builtin_isnan(__builtin_nanf("08"))) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("nan_library_call", code, &["-lm".to_string()]),
+        0
+    );
+    compile_expect_error(
+        "nans_malformed",
+        "double f(void) { return __builtin_nans(\"zz\"); }\n",
+        "is not a string literal naming a NaN payload",
+    );
+}
+
+// ============================================================================
+// signbit and copysign are computed in place
+// ============================================================================
+
+// Linked without -lm, and run at both levels on both targets. Every value
+// was confirmed with gcc and aarch64-linux-gnu-gcc under qemu. The inputs are
+// built from bits at run time, so the instructions are what is tested; the
+// constant cases at the end are what the optimizer folds, and must agree.
+// `copysign` takes only the sign of `y` -- of a NaN or a zero too -- and
+// changes nothing else of `x`, so a NaN keeps its payload and a signalling
+// one stays signalling.
+const SIGN_PROGRAM: &str = r#"
+double copysign(double, double); float copysignf(float, float);
+long double copysignl(long double, long double);
+typedef unsigned long long u64; typedef unsigned int u32; typedef unsigned char u8;
+#define D_SIGN 0x8000000000000000ULL
+#define F_SIGN 0x80000000U
+static u64 dbits(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
+static double dfrom(u64 u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
+static u32 fbits(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
+static float ffrom(u32 u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
+/* +0, 1.5, inf, a quiet NaN and a signalling NaN with payloads; each is
+   also tried with its sign bit set. */
+static volatile u64 dcase[] = {
+    0, 0x3ff8000000000000ULL, 0x7ff0000000000000ULL,
+    0x7ff8000000001234ULL, 0x7ff0000000005678ULL,
+};
+static volatile u32 fcase[] = {
+    0, 0x3fc00000U, 0x7f800000U, 0x7fc01234U, 0x7f805678U,
+};
+#define NCASE 5
+#if __LDBL_MANT_DIG__ == 64
+#define LD_BYTES 10 /* x87: the rest of the object is padding */
+#else
+#define LD_BYTES ((int)sizeof(long double))
+#endif
+typedef struct { u8 b[sizeof(long double)]; } ldb;
+static ldb ld_bytes(long double v) {
+    ldb r;
+    __builtin_memset(&r, 0, sizeof r);
+    __builtin_memcpy(r.b, &v, LD_BYTES);
+    return r;
+}
+static long double ld_from(ldb r) { long double v; __builtin_memcpy(&v, r.b, sizeof v); return v; }
+/* The byte holding the sign bit, as its top bit. */
+static int sign_index(void) {
+    ldb a = ld_bytes(1.0L), b = ld_bytes(-1.0L);
+    for (int i = 0; i < LD_BYTES; i++)
+        if (a.b[i] != b.b[i]) return i;
+    return -1;
+}
+static ldb ldcase(int i, int si) {
+    int lo = si == 0 ? LD_BYTES - 1 : 0; /* the least significant byte */
+    ldb r;
+    switch (i) {
+    case 0: r = ld_bytes(0.0L); break;
+    case 1: r = ld_bytes(1.5L); break;
+    case 2: r = ld_bytes(__builtin_infl()); break;
+    case 3: r = ld_bytes(__builtin_nanl("")); r.b[lo] |= 0x5a; break;
+    default: r = ld_bytes(__builtin_infl()); r.b[lo] |= 0x5a; break; /* sNaN */
+    }
+    return r;
+}
+static int check_double(void) {
+    for (int i = 0; i < 2 * NCASE; i++) {
+        u64 xb = dcase[i % NCASE] | (i >= NCASE ? D_SIGN : 0);
+        double x = dfrom(xb);
+        int neg = i >= NCASE;
+        if ((__builtin_signbit(x) != 0) != neg) return 1;
+        for (int j = 0; j < 2 * NCASE; j++) {
+            u64 yb = dcase[j % NCASE] | (j >= NCASE ? D_SIGN : 0);
+            double y = dfrom(yb);
+            u64 want = (xb & ~D_SIGN) | (yb & D_SIGN);
+            if (dbits(copysign(x, y)) != want) return 2;
+            if (dbits(__builtin_copysign(x, y)) != want) return 3;
+        }
+    }
+    return 0;
+}
+static int check_float(void) {
+    for (int i = 0; i < 2 * NCASE; i++) {
+        u32 xb = fcase[i % NCASE] | (i >= NCASE ? F_SIGN : 0);
+        float x = ffrom(xb);
+        int neg = i >= NCASE;
+        if ((__builtin_signbit(x) != 0) != neg) return 11;
+        if ((__builtin_signbitf(x) != 0) != neg) return 12;
+        for (int j = 0; j < 2 * NCASE; j++) {
+            u32 yb = fcase[j % NCASE] | (j >= NCASE ? F_SIGN : 0);
+            float y = ffrom(yb);
+            u32 want = (xb & ~F_SIGN) | (yb & F_SIGN);
+            if (fbits(copysignf(x, y)) != want) return 13;
+            if (fbits(__builtin_copysignf(x, y)) != want) return 14;
+        }
+    }
+    return 0;
+}
+static int check_long_double(void) {
+    int si = sign_index();
+    if (si < 0) return 21;
+    for (int i = 0; i < 2 * NCASE; i++) {
+        ldb xb = ldcase(i % NCASE, si);
+        if (i >= NCASE) xb.b[si] |= 0x80;
+        volatile long double x = ld_from(xb);
+        int neg = i >= NCASE;
+        if ((__builtin_signbit(x) != 0) != neg) return 22;
+        if ((__builtin_signbitl(x) != 0) != neg) return 23;
+        for (int j = 0; j < 2 * NCASE; j++) {
+            ldb yb = ldcase(j % NCASE, si);
+            if (j >= NCASE) yb.b[si] |= 0x80;
+            volatile long double y = ld_from(yb);
+            ldb r1 = ld_bytes(copysignl(x, y));
+            ldb r2 = ld_bytes(__builtin_copysignl(x, y));
+            for (int k = 0; k < LD_BYTES; k++) {
+                u8 want = k == si ? (u8)((xb.b[k] & 0x7f) | (yb.b[k] & 0x80)) : xb.b[k];
+                if (r1.b[k] != want) return 24;
+                if (r2.b[k] != want) return 25;
+            }
+        }
+    }
+    return 0;
+}
+/* Constant arguments, which the optimizer folds: the same answers. */
+static int check_constants(void) {
+    if (dbits(copysign(1.5, -0.0)) != 0xbff8000000000000ULL) return 31;
+    if (dbits(copysign(-1.5, 0.0)) != 0x3ff8000000000000ULL) return 32;
+    if (dbits(copysign(__builtin_nan("0x1234"), -1.0)) != 0xfff8000000001234ULL) return 33;
+    if (dbits(copysign(2.0, -__builtin_nan(""))) != 0xc000000000000000ULL) return 34;
+    if (dbits(copysign(-__builtin_inf(), 1.0)) != 0x7ff0000000000000ULL) return 35;
+    if (fbits(copysignf(__builtin_nanf("0x55"), -1.0f)) != 0xffc00055U) return 36;
+    if (fbits(copysignf(3.0f, -0.0f)) != 0xc0400000U) return 37;
+    if (copysignl(2.5L, -0.0L) != -2.5L) return 38;
+    if (copysignl(-2.5L, __builtin_infl()) != 2.5L) return 39;
+    if (__builtin_signbit(-0.0) != 1 || __builtin_signbit(0.0) != 0) return 40;
+    if (__builtin_signbit(-0.0f) != 1 || __builtin_signbitf(-1.0f) != 1) return 41;
+    if (__builtin_signbit(-0.0L) != 1 || __builtin_signbitl(1.0L) != 0) return 42;
+    if (__builtin_signbit(-__builtin_nan("")) != 1) return 43;
+    if (__builtin_signbit(__builtin_nan("")) != 0) return 44;
+    return 0;
+}
+int main(void) {
+    int rc;
+    if ((rc = check_double())) return rc;
+    if ((rc = check_float())) return rc;
+    if ((rc = check_long_double())) return rc;
+    return check_constants();
+}
+"#;
+
+#[test]
+fn builtins_signbit_and_copysign_need_no_libm() {
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("sign_ops{opt}"), SIGN_PROGRAM, &[opt.to_string()]),
+            0,
+            "host {opt}"
+        );
+        if let Some(rc) = compile_and_run_aarch64(&format!("sign_ops_a64{opt}"), SIGN_PROGRAM, opt)
+        {
+            assert_eq!(rc, 0, "aarch64 {opt}");
+        }
+    }
+}
+
+/// Whether `asm` calls a function whose name ends in one of `names`.
+pub(super) fn calls_any(asm: &str, names: &[&str]) -> bool {
+    asm.lines().any(|l| {
+        let mut w = l.split_whitespace();
+        matches!(w.next(), Some("call" | "bl" | "jmp" | "b"))
+            && w.next().is_some_and(|t| {
+                let t = t.trim_end_matches("@PLT");
+                names.iter().any(|n| t.ends_with(n))
+            })
+    })
+}
+
+/// Neither `signbit` nor `copysign` is a call, at any width, on either
+/// target: not to the libm function, and not to glibc's `__signbit*`.
+#[test]
+fn builtins_signbit_and_copysign_are_not_calls() {
+    const CALLEES: &[&str] = &[
+        "signbit",
+        "signbitf",
+        "signbitl",
+        "signbitd",
+        "copysign",
+        "copysignf",
+        "copysignl",
+    ];
+    let src = "double copysign(double, double); float copysignf(float, float);\n\
+               long double copysignl(long double, long double);\n\
+               int sf(float x) { return __builtin_signbit(x) + __builtin_signbitf(x); }\n\
+               int sd(double x) { return __builtin_signbit(x); }\n\
+               int sl(long double x) { return __builtin_signbit(x) + __builtin_signbitl(x); }\n\
+               double cd(double x, double y) { return copysign(x, y) + __builtin_copysign(y, x); }\n\
+               float cf(float x, float y) { return copysignf(x, y) + __builtin_copysignf(y, x); }\n\
+               long double cl(long double x, long double y)\n\
+               { return copysignl(x, y) + __builtin_copysignl(y, x); }\n";
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_at("sign_ops_inline", src, &[opt]);
+        assert!(!calls_any(&asm, CALLEES), "{opt}: a call remains:\n{asm}");
+        let asm = asm_for_at(
+            "sign_ops_inline_a64",
+            src,
+            &[opt, "--target", "aarch64-unknown-linux-gnu"],
+        );
+        assert!(
+            !calls_any(&asm, CALLEES),
+            "{opt} aarch64: a call remains:\n{asm}"
+        );
+    }
+}
+
+/// glibc's `signbit` macro and the `copysign` family `<math.h>` declares
+/// are the builtins, so a program using them needs no -lm either.
+#[test]
+fn builtins_math_h_signbit_and_copysign() {
+    let code = r#"
+#include <math.h>
+int main(void) {
+    volatile double x = -2.0, z = 0.0;
+    volatile float f = 1.0f;
+    volatile long double l = -0.0L;
+    if (!signbit(x) || signbit(z) || signbit(f) || !signbit(l)) return 1;
+    if (copysign(3.0, x) != -3.0 || copysignf(f, -1.0f) != -1.0f) return 2;
+    if (copysignl(5.0L, l) != -5.0L || !signbit(copysign(z, -1.0))) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("sign_ops_math_h", code, &[]), 0);
+    let asm = asm_for_at("sign_ops_math_h_asm", code, &["-O2"]);
+    assert!(
+        !calls_any(
+            &asm,
+            &[
+                "signbit",
+                "signbitf",
+                "signbitl",
+                "copysign",
+                "copysignf",
+                "copysignl"
+            ]
+        ),
+        "a call remains:\n{asm}"
+    );
+}
+
+/// `-fno-builtin-copysign` keeps the call to `copysign`, and only that one.
+#[test]
+fn builtins_copysign_fno_builtin_keeps_the_call() {
+    let src = "double copysign(double, double); float copysignf(float, float);\n\
+               double f(double x, double y) { return copysign(x, y); }\n\
+               float g(float x, float y) { return copysignf(x, y); }\n";
+    let asm = asm_for_at("copysign_nb", src, &["-fno-builtin-copysign"]);
+    assert!(
+        calls_any(&asm, &["copysign"]),
+        "-fno-builtin-copysign kept copysign inline:\n{asm}"
+    );
+    assert!(
+        !calls_any(&asm, &["copysignf"]),
+        "-fno-builtin-copysign displaced copysignf:\n{asm}"
+    );
+}
+
+/// As in gcc: `signbit` of a constant is an integer constant expression, and
+/// `copysign`, `fabs` and `abs` of constants fold in a static initializer --
+/// but, being calls, are not integer constant expressions, so an array bound
+/// of one at file scope is rejected.
+#[test]
+fn builtins_sign_ops_in_constant_expressions() {
+    let code = r#"
+double copysign(double, double); double fabs(double); int abs(int);
+static double a = copysign(2.0, -0.0);
+static float b = __builtin_copysignf(-1.5f, 1.0f);
+static double c = fabs(-3.0);
+static int d = abs(-4);
+static int e = __builtin_signbit(-1.0) + __builtin_signbitl(-0.0L);
+enum { E = __builtin_signbit(-2.0f) };
+_Static_assert(__builtin_signbit(-1.0), "signbit is a constant");
+static int arr[__builtin_signbit(-1.0) + 1];
+int main(void) {
+    if (a != -2.0 || b != 1.5f || c != 3.0 || d != 4 || e != 2) return 1;
+    if (E != 1 || sizeof arr != 2 * sizeof(int)) return 2;
+    switch (d) { case __builtin_signbit(-1.0) + 3: return 0; }
+    return 3;
+}
+"#;
+    assert_eq!(compile_and_run("sign_ops_constexpr", code, &[]), 0);
+    compile_expect_error(
+        "abs_not_ice",
+        "int abs(int);\nint a[abs(-2)];\n",
+        "variable length arrays cannot have file scope",
+    );
+}
+
+/// `copysign` and `signbit` of constants fold at -O1 and above: nothing is
+/// left to compute them.
+#[test]
+fn builtins_sign_ops_of_constants_fold() {
+    let src = "double f(void) { return __builtin_copysign(3.5, -0.0); }\n\
+               float g(void) { return __builtin_copysignf(2.0f, -1.0f); }\n\
+               int h(void) { return __builtin_signbit(-2.0) + __builtin_signbit(-1.0f); }\n";
+    for opt in ["-O1", "-O2"] {
+        for target in [None, Some("aarch64-unknown-linux-gnu")] {
+            let mut args = vec![opt];
+            if let Some(t) = target {
+                args.extend(["--target", t]);
+            }
+            let asm = asm_for_at("sign_ops_const", src, &args);
+            assert!(
+                !calls_any(&asm, &["signbit", "signbitf", "copysign", "copysignf"]),
+                "{opt} {target:?}: a call remains:\n{asm}"
+            );
+            assert!(
+                !asm.lines().any(|l| matches!(
+                    l.split_whitespace().next(),
+                    Some("shrq" | "shrl" | "shlq" | "shll" | "orq" | "orl" | "lsr" | "lsl" | "orr")
+                )),
+                "{opt} {target:?}: a sign operation on a constant was not folded:\n{asm}"
+            );
+        }
+    }
+}
+
+/// The `_FloatN` infinity and NaN builtins, bit for bit as gcc emits them on
+/// both targets, at run time and in a static initializer, at -O0 and -O2;
+/// `__has_builtin` knows each. `_Float128` exists wherever `__float128`
+/// does, which is not macOS.
+const FLOAT_N_CONSTANTS_PROGRAM: &str = r#"
+typedef unsigned short u16; typedef unsigned int u32; typedef unsigned long long u64;
+static u16 b16(_Float16 v) { u16 u; __builtin_memcpy(&u, &v, 2); return u; }
+static u32 b32(_Float32 v) { u32 u; __builtin_memcpy(&u, &v, 4); return u; }
+static u64 b64(_Float64 v) { u64 u; __builtin_memcpy(&u, &v, 8); return u; }
+#if !__has_builtin(__builtin_inff16) || !__has_builtin(__builtin_nansf16) \
+    || !__has_builtin(__builtin_huge_valf32) || !__has_builtin(__builtin_nanf64)
+#error "a _FloatN builtin is missing"
+#endif
+static const _Float16 s16[] = { __builtin_inff16(), __builtin_nanf16("0x12"), __builtin_nansf16("") };
+static const _Float32 s32 = __builtin_nansf32("0x5");
+static const _Float64 s64 = __builtin_huge_valf64();
+#ifdef __linux__
+#if !__has_builtin(__builtin_nanf128)
+#error "__builtin_nanf128 is missing"
+#endif
+static u64 hi(_Float128 v) { u64 u[2]; __builtin_memcpy(u, &v, 16); return u[1]; }
+static u64 lo(_Float128 v) { u64 u[2]; __builtin_memcpy(u, &v, 16); return u[0]; }
+static const _Float128 s128 = __builtin_nansf128("0x1234");
+static int check128(void) {
+    if (hi(__builtin_inff128()) != 0x7fff000000000000ull || lo(__builtin_inff128())) return 1;
+    if (hi(__builtin_huge_valf128()) != 0x7fff000000000000ull) return 2;
+    if (hi(__builtin_nanf128("0x1234")) != 0x7fff800000000000ull) return 3;
+    if (lo(__builtin_nanf128("0x1234")) != 0x1234) return 4;
+    if (hi(__builtin_nansf128("")) != 0x7fff400000000000ull || lo(__builtin_nansf128(""))) return 5;
+    if (hi(s128) != 0x7fff000000000000ull || lo(s128) != 0x1234) return 6;
+    return 0;
+}
+#else
+static int check128(void) { return 0; }
+#endif
+int main(void) {
+    if (b16(__builtin_inff16()) != 0x7c00 || b16(__builtin_huge_valf16()) != 0x7c00) return 10;
+    if (b16(__builtin_nanf16("")) != 0x7e00 || b16(__builtin_nanf16("0xfff")) != 0x7fff) return 11;
+    if (b16(__builtin_nansf16("0x12")) != 0x7c12) return 12;
+    if (b16(s16[0]) != 0x7c00 || b16(s16[1]) != 0x7e12 || b16(s16[2]) != 0x7d00) return 13;
+    if (b32(__builtin_inff32()) != 0x7f800000 || b32(__builtin_nanf32("0x5")) != 0x7fc00005) return 20;
+    if (b32(s32) != 0x7f800005) return 21;
+    if (b64(__builtin_inff64()) != 0x7ff0000000000000ull) return 30;
+    if (b64(__builtin_nansf64("")) != 0x7ff4000000000000ull) return 31;
+    if (b64(s64) != 0x7ff0000000000000ull) return 32;
+    int r = check128();
+    return r ? 40 + r : 0;
+}
+"#;
+
+#[test]
+fn builtins_float_n_constants() {
+    for opt in ["-O0", "-O2"] {
+        let name = format!("float_n_consts{opt}");
+        assert_eq!(
+            compile_and_run(&name, FLOAT_N_CONSTANTS_PROGRAM, &[opt.to_string()]),
+            0,
+            "host {opt}"
+        );
+        if let Some(rc) =
+            compile_and_run_aarch64(&format!("{name}_a64"), FLOAT_N_CONSTANTS_PROGRAM, opt)
+        {
+            assert_eq!(rc, 0, "aarch64 {opt}");
+        }
+    }
+}
+
+/// `<math.h>` from a glibc that thinks c17 predates gcc 7 defines some of
+/// these builtins as macros over the double forms; a program that includes
+/// it and also names the builtins still compiles, and the infinities and
+/// default NaNs agree either way.
+#[test]
+fn builtins_float_n_constants_with_math_h() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let code = r#"
+#include <math.h>
+#include <string.h>
+int main(void) {
+    _Float32 f = __builtin_inff32();
+    _Float64 d = __builtin_nanf64("");
+    _Float128 q = __builtin_huge_valf128(), n = __builtin_nanf128("");
+    _Float128 inf = HUGE_VAL;
+    if (!isinf(f) || !isnan(d) || memcmp(&q, &inf, 16) != 0 || !__builtin_isnan(n)) return 1;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("float_n_math_h", code, &[]), 0);
 }

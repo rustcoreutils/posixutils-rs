@@ -11,9 +11,11 @@
 
 #![allow(clippy::approx_constant)]
 
+use crate::float::IntegralRounding;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Expr, ExprKind, ExternalDecl,
-    ForInit, FunctionDef, Stmt, TranslationUnit, UnaryOp,
+    ForInit, FpTest, FunctionDef, InlineLibraryFn, LibFn, MathErrno, MemoryFn, Stmt,
+    TranslationUnit, UnaryOp,
 };
 use crate::parse::parser::{ParseResult, Parser};
 use crate::strings::{StringId, StringTable};
@@ -31,11 +33,41 @@ fn parse_expr_with_vars(
     input: &str,
     vars: &[&str],
 ) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
+    parse_expr_under(input, vars, Default::default())
+}
+
+/// [`parse_expr_with_vars`], with library builtins evaluated as `policy`
+/// says.
+fn parse_expr_under(
+    input: &str,
+    vars: &[&str],
+    policy: super::LibraryCallPolicy,
+) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
+    parse_expr_on(input, vars, policy, &Target::host())
+}
+
+/// An expression parsed for `target`. A test about a property one target
+/// family has -- x87 or binary128 `long double`, `__float128` -- names that
+/// target instead of taking the host's: on an arm64 Mac `long double` is
+/// `double` and there is no `__float128`.
+fn parse_expr_for(
+    input: &str,
+    target: &Target,
+) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
+    parse_expr_on(input, &[], Default::default(), target)
+}
+
+fn parse_expr_on(
+    input: &str,
+    vars: &[&str],
+    policy: super::LibraryCallPolicy,
+    target: &Target,
+) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
     let mut strings = StringTable::new();
     let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
     let mut symbols = SymbolTable::new();
-    let mut types = TypeTable::new(&Target::host());
+    let mut types = TypeTable::new(target);
 
     // Pre-declare variables
     for var_name in vars {
@@ -45,6 +77,7 @@ fn parse_expr_with_vars(
     }
 
     let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+    parser.set_library_call_policy(policy);
     parser.skip_stream_tokens();
     let expr = parser.parse_expression()?;
     Ok((expr, types, strings, symbols))
@@ -733,6 +766,32 @@ fn unary_minus_and_bitnot_convert_their_operand() {
                 );
             }
             _ => panic!("Expected Unary for {src}"),
+        }
+    }
+}
+
+/// Unary `+` performs the integer promotions too (C17 6.5.3.3p2), and its
+/// result is a value of the promoted type. It used to hand back the operand
+/// itself, so `+(signed char)1` was a `signed char` and `+x` an lvalue.
+#[test]
+fn unary_plus_promotes_and_is_a_value() {
+    for (src, want_int) in [
+        ("+(signed char)200", true),
+        ("+(short)9", true),
+        ("+(_Bool)1", true),
+        ("+(unsigned char)1", true),
+        ("+1L", false),
+        ("+1.5f", false),
+    ] {
+        let (expr, types, _strings, _symbols) = parse_expr(src).unwrap();
+        let typ = expr.typ.unwrap();
+        assert!(
+            matches!(expr.kind, ExprKind::Cast { cast_type, .. } if cast_type == typ),
+            "{src}: `+` yields a converted value, never its operand"
+        );
+        assert_eq!(typ == types.int_id, want_int, "{src}: result type");
+        if src == "+1.5f" {
+            assert_eq!(typ, types.float_id, "{src}: no default promotion");
         }
     }
 }
@@ -2005,11 +2064,19 @@ fn test_plain_declaration_is_not_a_function_declarator() {
 // Translation unit tests
 
 fn parse_tu(input: &str) -> ParseResult<(TranslationUnit, TypeTable, StringTable, SymbolTable)> {
+    parse_tu_for(input, &Target::host())
+}
+
+/// [`parse_tu`] for `target`; see [`parse_expr_for`] for when a test needs it.
+fn parse_tu_for(
+    input: &str,
+    target: &Target,
+) -> ParseResult<(TranslationUnit, TypeTable, StringTable, SymbolTable)> {
     let mut strings = StringTable::new();
     let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
     let mut symbols = SymbolTable::new();
-    let mut types = TypeTable::new(&Target::host());
+    let mut types = TypeTable::new(target);
     let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
     let tu = parser.parse_translation_unit()?;
     Ok((tu, types, strings, symbols))
@@ -3999,6 +4066,38 @@ fn test_octal_escape_boundary() {
     }
 }
 
+/// C17 6.4.4.4p10: `'\x80'` has the value of a plain `char` holding 0x80,
+/// so it follows the target's `char` signedness -- which is per OS as well as
+/// per architecture: Apple arm64 is signed where AAPCS64 is unsigned. A
+/// prefixed constant is the code point on every target.
+#[test]
+fn test_char_constant_value_follows_target_signedness() {
+    use crate::target::{Arch, Os};
+    for (arch, os, want) in [
+        (Arch::X86_64, Os::Linux, -128),
+        (Arch::X86_64, Os::MacOS, -128),
+        (Arch::Aarch64, Os::Linux, 128),
+        (Arch::Aarch64, Os::MacOS, -128),
+    ] {
+        for (src, expected) in [("'\\x80'", want), ("L'\\x80'", 128)] {
+            let mut strings = StringTable::new();
+            let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);
+            let tokens = tokenizer.tokenize();
+            let mut symbols = SymbolTable::new();
+            let mut types = TypeTable::new(&Target::new(arch, os));
+            let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+            parser.skip_stream_tokens();
+            let expr = parser.parse_expression().unwrap();
+            let value = match expr.kind {
+                ExprKind::CharLit(v) => v,
+                ExprKind::IntLit(v) => v,
+                other => panic!("{src}: expected a character constant, got {other:?}"),
+            };
+            assert_eq!(value, expected, "{src} on {arch}-{os}");
+        }
+    }
+}
+
 #[test]
 fn test_hex_escape_single_digit() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\x0'").unwrap();
@@ -4433,16 +4532,16 @@ fn test_wide_string_literal_basic() {
     let (expr, types, _, _) = parse_expr("L\"hello\"").unwrap();
     match &expr.kind {
         ExprKind::WideStringLit(s) => {
-            assert_eq!(s, "hello");
+            assert_eq!(s, &"hello".chars().map(u32::from).collect::<Vec<_>>());
         }
         _ => panic!("Expected WideStringLit, got {:?}", expr.kind),
     }
-    // Type should be wchar_t[N] (int[N] on this platform), not wchar_t*
+    // Type should be wchar_t[N], not wchar_t*
     // C11 6.4.5: "wide string literal has type wchar_t[N]"
     let typ = expr.typ.unwrap();
     assert_eq!(types.kind(typ), TypeKind::Array);
     let elem_type = types.get(typ).base.unwrap();
-    assert_eq!(types.kind(elem_type), TypeKind::Int);
+    assert_eq!(elem_type, types.wchar_id);
     // Array size should be 6 (5 chars + null terminator)
     assert_eq!(types.array_size(typ), Some(6));
 }
@@ -4453,7 +4552,7 @@ fn test_wide_string_literal_concatenation() {
     let (expr, _, _, _) = parse_expr("L\"hello\" L\" world\"").unwrap();
     match &expr.kind {
         ExprKind::WideStringLit(s) => {
-            assert_eq!(s, "hello world");
+            assert_eq!(s, &"hello world".chars().map(u32::from).collect::<Vec<_>>());
         }
         _ => panic!("Expected WideStringLit, got {:?}", expr.kind),
     }
@@ -4949,15 +5048,45 @@ fn test_float64_literal_suffix() {
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Double);
 }
 
+/// A `_FloatN` suffix is a *floating* suffix (TS 18661-3): it does not make
+/// an integer constant floating. gcc rejects `42f16` with "invalid suffix on
+/// integer constant"; c17 took it for a `_Float16` 42.
 #[test]
-fn test_int_with_float16_suffix() {
-    // Integer with f16 suffix becomes float literal
-    let (expr, types, _, _) = parse_expr("42f16").unwrap();
-    match expr.kind {
-        ExprKind::FloatLit(v) => assert!((v.to_f64() - 42.0).abs() < 0.001),
-        _ => panic!("Expected FloatLit"),
+fn test_int_with_float_suffix_is_rejected() {
+    for src in ["42f16", "42f32", "42f64", "42f128", "42f", "42q", "42lf"] {
+        assert!(parse_expr(src).is_err(), "{src} should be rejected");
     }
-    assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float16);
+}
+
+/// A `_FloatN` suffix on a hex floating constant, after the `p` exponent.
+///
+/// Suffixes were found by `ends_with` on the whole spelling and the `fN` ones
+/// were only looked for on decimal constants, since before a `p` they are
+/// hex digits; so `0x1p0f16` was rejected outright.
+#[test]
+fn test_hex_float_with_float_n_suffix() {
+    for (src, want) in [
+        ("0x1p0f16", TypeKind::Float16),
+        ("0x1.8p1F16", TypeKind::Float16),
+        ("0x1p0f32", TypeKind::Float),
+        ("0x1p0f64", TypeKind::Double),
+    ] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        assert!(matches!(expr.kind, ExprKind::FloatLit(_)), "{src}");
+        assert_eq!(types.kind(expr.typ.unwrap()), want, "{src}");
+    }
+}
+
+/// Malformed suffixes are rejected rather than trimmed until something
+/// parses: `1.0lf` was a `long double` and `1f` the integer 1.
+#[test]
+fn test_malformed_number_suffixes_are_rejected() {
+    for src in [
+        "1.0lf", "1.0fl", "1f", "1lL", "1uu", "1lul", "1.0ff", "2.0f32x", "1.5e+",
+    ] {
+        assert!(parse_expr(src).is_err(), "{src} should be rejected");
+    }
 }
 
 // _Alignof expression tests (C11)
@@ -5061,10 +5190,1022 @@ fn test_builtin_nanl() {
 
 #[test]
 fn test_builtin_nans() {
-    // Signaling NaN variant (same implementation, returns NaN)
     let (expr, types, _, _) = parse_expr("__builtin_nans(\"\")").unwrap();
     assert!(matches!(expr.kind, ExprKind::FloatLit(v) if v.is_nan()));
     assert_eq!(expr.typ, Some(types.double_id));
+}
+
+/// The encoding of the floating constant `src` parses to, at `fmt`.
+fn nan_bits(src: &str, fmt: crate::float::FpFormat) -> u128 {
+    let (expr, _, _, _) = parse_expr(src).unwrap();
+    match expr.kind {
+        ExprKind::FloatLit(v) => v.to_bits(fmt),
+        other => panic!("{src} parsed to {other:?}"),
+    }
+}
+
+/// The string is parsed as gcc parses it -- `strtoull` with base 0 -- and
+/// its value is the payload: every expectation is gcc's emitted constant.
+#[test]
+fn test_builtin_nan_payload_parsing() {
+    use crate::float::FpFormat::{Binary32, Binary64};
+    let cases = [
+        // Empty, and the spellings of zero.
+        ("__builtin_nan(\"\")", 0x7ff8_0000_0000_0000),
+        ("__builtin_nan(\"0\")", 0x7ff8_0000_0000_0000),
+        ("__builtin_nan(\"0x\")", 0x7ff8_0000_0000_0000),
+        // Hexadecimal, either case of the prefix.
+        ("__builtin_nan(\"0x1234\")", 0x7ff8_0000_0000_1234),
+        ("__builtin_nan(\"0X10\")", 0x7ff8_0000_0000_0010),
+        // Decimal.
+        ("__builtin_nan(\"4660\")", 0x7ff8_0000_0000_1234),
+        // Octal, from a leading zero.
+        ("__builtin_nan(\"010\")", 0x7ff8_0000_0000_0008),
+        // Leading white space and a sign are skipped; the sign is ignored.
+        ("__builtin_nan(\" 5\")", 0x7ff8_0000_0000_0005),
+        ("__builtin_nan(\"-1\")", 0x7ff8_0000_0000_0001),
+        // Wider than the payload: the low bits are kept.
+        (
+            "__builtin_nan(\"0xffffffffffffffff\")",
+            0x7fff_ffff_ffff_ffff,
+        ),
+        (
+            "__builtin_nan(\"18446744073709551616\")",
+            0x7ff8_0000_0000_0000,
+        ),
+        // A C string ends at its first NUL.
+        ("__builtin_nan(\"12\\0abc\")", 0x7ff8_0000_0000_000c),
+        // Signalling: the quiet bit clear, and an empty payload made
+        // non-empty so the result is not an infinity.
+        ("__builtin_nans(\"0x1234\")", 0x7ff0_0000_0000_1234),
+        ("__builtin_nans(\"\")", 0x7ff4_0000_0000_0000),
+    ];
+    for (src, want) in cases {
+        assert_eq!(nan_bits(src, Binary64), want, "{src}");
+    }
+    assert_eq!(nan_bits("__builtin_nanf(\"0x123\")", Binary32), 0x7fc0_0123);
+    assert_eq!(
+        nan_bits("__builtin_nansf(\"0x123\")", Binary32),
+        0x7f80_0123
+    );
+    assert_eq!(nan_bits("__builtin_nansf(\"\")", Binary32), 0x7fa0_0000);
+}
+
+/// `long double` puts the payload in its own format's significand.
+#[test]
+fn test_builtin_nanl_payload() {
+    let (expr, types, _, _) = parse_expr("__builtin_nanl(\"0x1234\")").unwrap();
+    let fmt = types.fp_format(types.longdouble_id).unwrap();
+    let want = match fmt {
+        crate::float::FpFormat::X87Extended => 0x7fff_c000_0000_0000_1234,
+        crate::float::FpFormat::Binary128 => 0x7fff_8000_0000_0000_0000_0000_0000_1234,
+        _ => 0x7ff8_0000_0000_1234,
+    };
+    assert!(matches!(expr.kind, ExprKind::FloatLit(v) if v.to_bits(fmt) == want));
+}
+
+/// The `_FloatN` forms of the infinity and NaN builtins: each is a constant
+/// of the type its suffix names -- `_Float32` and `_Float64` being `float`
+/// and `double` here -- whose encoding is gcc's, payload and all.
+#[test]
+fn test_builtin_float_n_constants() {
+    use crate::float::FpFormat::{Binary128, Binary16, Binary32, Binary64};
+    type Want = fn(&TypeTable) -> crate::types::TypeId;
+    let cases: &[(&str, Want, crate::float::FpFormat, u128)] = &[
+        ("__builtin_inff16()", |t| t.float16_id, Binary16, 0x7c00),
+        (
+            "__builtin_huge_valf16()",
+            |t| t.float16_id,
+            Binary16,
+            0x7c00,
+        ),
+        ("__builtin_nanf16(\"\")", |t| t.float16_id, Binary16, 0x7e00),
+        (
+            "__builtin_nanf16(\"0x12\")",
+            |t| t.float16_id,
+            Binary16,
+            0x7e12,
+        ),
+        (
+            "__builtin_nanf16(\"0xfff\")",
+            |t| t.float16_id,
+            Binary16,
+            0x7fff,
+        ),
+        (
+            "__builtin_nansf16(\"\")",
+            |t| t.float16_id,
+            Binary16,
+            0x7d00,
+        ),
+        (
+            "__builtin_nansf16(\"0x12\")",
+            |t| t.float16_id,
+            Binary16,
+            0x7c12,
+        ),
+        ("__builtin_inff32()", |t| t.float_id, Binary32, 0x7f80_0000),
+        (
+            "__builtin_huge_valf32()",
+            |t| t.float_id,
+            Binary32,
+            0x7f80_0000,
+        ),
+        (
+            "__builtin_nanf32(\"0x5\")",
+            |t| t.float_id,
+            Binary32,
+            0x7fc0_0005,
+        ),
+        (
+            "__builtin_nansf32(\"\")",
+            |t| t.float_id,
+            Binary32,
+            0x7fa0_0000,
+        ),
+        (
+            "__builtin_inff64()",
+            |t| t.double_id,
+            Binary64,
+            0x7ff0 << 48,
+        ),
+        (
+            "__builtin_huge_valf64()",
+            |t| t.double_id,
+            Binary64,
+            0x7ff0 << 48,
+        ),
+        (
+            "__builtin_nanf64(\"0x5\")",
+            |t| t.double_id,
+            Binary64,
+            0x7ff8_0000_0000_0005,
+        ),
+        (
+            "__builtin_nansf64(\"\")",
+            |t| t.double_id,
+            Binary64,
+            0x7ff4 << 48,
+        ),
+    ];
+    let binary128: &[(&str, u128)] = &[
+        ("__builtin_inff128()", 0x7fff << 112),
+        ("__builtin_huge_valf128()", 0x7fff << 112),
+        ("__builtin_nanf128(\"0x1234\")", 0x7fff8 << 108 | 0x1234),
+        ("__builtin_nansf128(\"\")", 0x7fff4 << 108),
+        ("__builtin_nansf128(\"0x1234\")", 0x7fff << 112 | 0x1234),
+    ];
+    for &(src, want, fmt, bits) in cases {
+        let (expr, types, _, _) = parse_expr(src).unwrap();
+        assert_eq!(expr.typ, Some(want(&types)), "{src}");
+        assert_eq!(nan_bits(src, fmt), bits, "{src}");
+    }
+    // The `f128` forms exist where `__float128` does -- not on Apple arm64,
+    // which test_builtin_float128_constant_follows_the_target covers -- so
+    // they are checked on the Linux targets, not the host.
+    for target in linux_targets() {
+        for &(src, bits) in binary128 {
+            let (expr, types, _, _) = parse_expr_for(src, &target).unwrap();
+            assert_eq!(expr.typ, Some(types.float128_id), "{src}");
+            let ExprKind::FloatLit(v) = expr.kind else {
+                panic!("{src} parsed to {:?}", expr.kind);
+            };
+            assert_eq!(v.to_bits(Binary128), bits, "{src}");
+        }
+    }
+}
+
+/// A `_FloatN` NaN whose string is not a payload calls the library function
+/// gcc calls, `nanf16` and so on, whose type is the builtin's.
+#[test]
+fn test_builtin_nan_float_n_of_a_malformed_string_is_a_call() {
+    for (src, float16) in [
+        ("__builtin_nanf16(\"abc\")", true),
+        ("__builtin_nanf32(\"abc\")", false),
+    ] {
+        let (expr, types, _, _) = parse_expr(src).unwrap();
+        assert!(matches!(expr.kind, ExprKind::Call { .. }), "{src}");
+        let want = if float16 {
+            types.float16_id
+        } else {
+            types.float_id
+        };
+        assert_eq!(expr.typ, Some(want), "{src}");
+    }
+}
+
+/// `__builtin_nanf128` is a `_Float128` wherever the target has one -- on
+/// aarch64 Linux too, where `long double` has the same format but is another
+/// type -- and an error where it has none.
+#[test]
+fn test_builtin_float128_constant_follows_the_target() {
+    use crate::target::{Arch, Os};
+    for (arch, os, supported) in [
+        (Arch::X86_64, Os::Linux, true),
+        (Arch::Aarch64, Os::Linux, true),
+        (Arch::Aarch64, Os::MacOS, false),
+    ] {
+        let src = "__builtin_nanf128(\"0x1\")";
+        let mut strings = StringTable::new();
+        let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);
+        let tokens = tokenizer.tokenize();
+        let mut symbols = SymbolTable::new();
+        let mut types = TypeTable::new(&Target::new(arch, os));
+        let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+        parser.skip_stream_tokens();
+        let result = parser.parse_expression();
+        match (result, supported) {
+            (Ok(expr), true) => {
+                assert_eq!(expr.typ, Some(types.float128_id), "{arch}-{os}");
+                let ExprKind::FloatLit(v) = expr.kind else {
+                    panic!("{arch}-{os}: {:?}", expr.kind);
+                };
+                assert_eq!(
+                    v.to_bits(crate::float::FpFormat::Binary128),
+                    0x7fff8 << 108 | 1
+                );
+            }
+            (Err(e), false) => assert!(e.to_string().contains("not supported"), "{e}"),
+            (other, _) => panic!("{arch}-{os}: {other:?}"),
+        }
+    }
+}
+
+/// A string gcc does not fold is left to the library, as gcc leaves it:
+/// `__builtin_nan` becomes a call to `nan`.
+#[test]
+fn test_builtin_nan_of_a_malformed_string_is_a_call() {
+    for src in [
+        "__builtin_nan(\"abc\")",
+        "__builtin_nan(\"08\")",
+        "__builtin_nan(\"12x\")",
+    ] {
+        let (expr, types, _, _) = parse_expr(src).unwrap();
+        assert!(
+            matches!(expr.kind, ExprKind::Call { .. }),
+            "{src}: {:?}",
+            expr.kind
+        );
+        assert_eq!(expr.typ, Some(types.double_id), "{src}");
+    }
+}
+
+/// The first statement of the first function defined in `tu`.
+fn first_statement(tu: &TranslationUnit) -> &Stmt {
+    first_statement_of(tu, 0)
+}
+
+/// The first statement of the function defined `n`th (from 0) in `tu`.
+fn first_statement_of(tu: &TranslationUnit, n: usize) -> &Stmt {
+    let func = tu
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ExternalDecl::FunctionDef(f) => Some(f),
+            _ => None,
+        })
+        .nth(n)
+        .expect("function definition");
+    let Stmt::Block(items) = &func.body else {
+        panic!("function body is not a block");
+    };
+    let Some(BlockItem::Statement(stmt)) = items.first() else {
+        panic!("expected a statement");
+    };
+    stmt
+}
+
+// Library builtins: abs, fabs, creal, conj, ... as checked calls
+
+/// The in-place call `expr` is, as (function, arguments), or a panic naming
+/// `src` and what it was instead.
+fn inline_call_args<'e>(src: &str, expr: &'e Expr) -> (InlineLibraryFn, &'e [Expr]) {
+    match &expr.kind {
+        ExprKind::InlineLibraryCall { func, args, .. } => (*func, args),
+        other => panic!("{src}: expected an InlineLibraryCall, got {other:?}"),
+    }
+}
+
+/// The in-place call of one argument `expr` is, as (function, argument).
+fn inline_call<'e>(src: &str, expr: &'e Expr) -> (InlineLibraryFn, &'e Expr) {
+    match inline_call_args(src, expr) {
+        (func, [arg]) => (func, arg),
+        (func, args) => panic!("{src}: {func:?} has {} arguments", args.len()),
+    }
+}
+
+/// Each integer magnitude, bare or reserved, is computed in place at the
+/// function's own type, with the argument converted to it as the prototype
+/// would.
+#[test]
+fn test_int_abs_builtins() {
+    // The spelling, the type it answers, and whether an `int` argument is
+    // converted to reach it.
+    type Want = fn(&TypeTable) -> crate::types::TypeId;
+    let cases: &[(&str, Want, bool)] = &[
+        ("abs(i)", |t| t.int_id, false),
+        ("__builtin_abs(i)", |t| t.int_id, false),
+        ("labs(i)", |t| t.long_id, true),
+        ("__builtin_labs(i)", |t| t.long_id, true),
+        ("llabs(i)", |t| t.longlong_id, true),
+        ("__builtin_llabs(i)", |t| t.longlong_id, true),
+        ("imaxabs(i)", |t| t.long_id, true),
+        ("__builtin_imaxabs(i)", |t| t.long_id, true),
+    ];
+    for (src, want, converted) in cases {
+        let (expr, types, _, _) = parse_expr_with_vars(src, &["i"]).unwrap();
+        assert_eq!(expr.typ, Some(want(&types)), "{src}");
+        let (func, arg) = inline_call(src, &expr);
+        assert_eq!(func, InlineLibraryFn::IntAbs, "{src}");
+        assert_eq!(arg.typ, Some(want(&types)), "{src}");
+        assert_eq!(
+            matches!(arg.kind, ExprKind::Cast { .. }),
+            *converted,
+            "{src}"
+        );
+    }
+}
+
+/// `fabs`, `fabsf` and `fabsl` are all computed in place, each at its own
+/// type.
+#[test]
+fn test_fabs_builtins() {
+    let (expr, types, _, _) = parse_expr_with_vars("fabs(i)", &["i"]).unwrap();
+    let (func, arg) = inline_call("fabs(i)", &expr);
+    assert_eq!(func, InlineLibraryFn::Fabs);
+    assert_eq!(expr.typ, Some(types.double_id));
+    assert_eq!(arg.typ, Some(types.double_id), "the int converts to double");
+
+    let (expr, types, _, _) = parse_expr_with_vars("__builtin_fabsf(i)", &["i"]).unwrap();
+    let (func, _) = inline_call("__builtin_fabsf(i)", &expr);
+    assert_eq!(func, InlineLibraryFn::Fabs);
+    assert_eq!(expr.typ, Some(types.float_id));
+
+    let (expr, types, _, _) = parse_expr_with_vars("fabsl(i)", &["i"]).unwrap();
+    let (func, arg) = inline_call("fabsl(i)", &expr);
+    assert_eq!(func, InlineLibraryFn::Fabs);
+    assert_eq!(expr.typ, Some(types.longdouble_id));
+    assert_eq!(
+        arg.typ,
+        Some(types.longdouble_id),
+        "the int converts to long double"
+    );
+}
+
+/// `copysign`, `copysignf` and `copysignl`, bare or reserved, are computed in
+/// place at their own type, each of the two arguments converted to it.
+#[test]
+fn test_copysign_builtins() {
+    type Want = fn(&TypeTable) -> crate::types::TypeId;
+    let cases: &[(&str, Want)] = &[
+        ("copysign(i, f)", |t| t.double_id),
+        ("__builtin_copysign(i, f)", |t| t.double_id),
+        ("copysignf(i, f)", |t| t.float_id),
+        ("__builtin_copysignf(i, f)", |t| t.float_id),
+        ("copysignl(i, f)", |t| t.longdouble_id),
+        ("__builtin_copysignl(i, f)", |t| t.longdouble_id),
+    ];
+    for (src, want) in cases {
+        let (expr, types, _, _) = parse_expr_with_vars(src, &["i", "f"]).unwrap();
+        assert_eq!(expr.typ, Some(want(&types)), "{src}");
+        let (func, args) = inline_call_args(src, &expr);
+        assert_eq!(func, InlineLibraryFn::CopySign, "{src}");
+        assert_eq!(args.len(), 2, "{src}");
+        for arg in args {
+            assert_eq!(arg.typ, Some(want(&types)), "{src}: an argument");
+        }
+    }
+}
+
+/// `sqrt`, `sqrtf` and `sqrtl`, bare or reserved, are computed in place at
+/// their own type, reporting a domain error through `errno` by default, and
+/// carry the library name a call path needs.
+#[test]
+fn test_sqrt_builtins() {
+    type Want = fn(&TypeTable) -> crate::types::TypeId;
+    let cases: &[(&str, Want, &str)] = &[
+        ("sqrt(i)", |t| t.double_id, "sqrt"),
+        ("__builtin_sqrt(i)", |t| t.double_id, "sqrt"),
+        ("sqrtf(i)", |t| t.float_id, "sqrtf"),
+        ("__builtin_sqrtf(i)", |t| t.float_id, "sqrtf"),
+        ("sqrtl(i)", |t| t.longdouble_id, "sqrtl"),
+        ("__builtin_sqrtl(i)", |t| t.longdouble_id, "sqrtl"),
+    ];
+    for (src, want, callee) in cases {
+        let (expr, types, strings, _) = parse_expr_with_vars(src, &["i"]).unwrap();
+        assert_eq!(expr.typ, Some(want(&types)), "{src}");
+        let (func, arg) = inline_call(src, &expr);
+        assert_eq!(func, InlineLibraryFn::Sqrt(MathErrno::Set), "{src}");
+        assert_eq!(arg.typ, Some(want(&types)), "{src}: the int converts");
+        let ExprKind::InlineLibraryCall { name, .. } = expr.kind else {
+            unreachable!()
+        };
+        check_name(&strings, name, callee);
+    }
+}
+
+/// `-fno-math-errno` drops the domain-error path; `-O0` calls the library
+/// for a bare spelling, and for any spelling that must still set `errno`,
+/// as gcc does.
+#[test]
+fn test_sqrt_follows_the_library_call_policy() {
+    use super::LibraryCallPolicy;
+    let no_errno = LibraryCallPolicy {
+        optimizing: true,
+        math_errno: false,
+    };
+    let (expr, _, _, _) = parse_expr_under("sqrt(i)", &["i"], no_errno).unwrap();
+    let (func, _) = inline_call("sqrt(i)", &expr);
+    assert_eq!(func, InlineLibraryFn::Sqrt(MathErrno::Ignored));
+
+    let is_call = |e: &Expr| matches!(e.kind, ExprKind::Call { .. });
+    let o0 = |math_errno| LibraryCallPolicy {
+        optimizing: false,
+        math_errno,
+    };
+    for (src, math_errno, called) in [
+        ("sqrt(i)", true, true),
+        ("__builtin_sqrt(i)", true, true),
+        ("sqrt(i)", false, true),
+        ("__builtin_sqrt(i)", false, false),
+        ("fabs(i)", true, false),
+        ("copysign(i, i)", true, false),
+    ] {
+        let (expr, types, _, _) = parse_expr_under(src, &["i"], o0(math_errno)).unwrap();
+        assert_eq!(is_call(&expr), called, "{src} errno={math_errno}");
+        assert_eq!(expr.typ, Some(types.double_id), "{src}");
+    }
+}
+
+/// The six roundings and their `f` forms, bare or reserved, are computed in
+/// place at their own type and named for the call a target may still make.
+#[test]
+fn test_rounding_builtins() {
+    use IntegralRounding::*;
+    for (base, how) in [
+        ("floor", Floor),
+        ("ceil", Ceil),
+        ("trunc", Trunc),
+        ("round", Round),
+        ("rint", Rint),
+        ("nearbyint", NearbyInt),
+    ] {
+        for suffix in ["", "f"] {
+            for prefix in ["", "__builtin_"] {
+                let src = format!("{prefix}{base}{suffix}(i)");
+                let (expr, types, strings, _) = parse_expr_with_vars(&src, &["i"]).unwrap();
+                let want = if suffix.is_empty() {
+                    types.double_id
+                } else {
+                    types.float_id
+                };
+                assert_eq!(expr.typ, Some(want), "{src}");
+                let (func, arg) = inline_call(&src, &expr);
+                assert_eq!(func, InlineLibraryFn::RoundToIntegral(how), "{src}");
+                assert_eq!(arg.typ, Some(want), "{src}");
+                let ExprKind::InlineLibraryCall { name, .. } = expr.kind else {
+                    unreachable!()
+                };
+                check_name(&strings, name, &format!("{base}{suffix}"));
+            }
+        }
+    }
+}
+
+/// `fmin`, `fmax`, `fma` and their `f` forms, bare or reserved, are computed
+/// in place at their own type, every argument converted to it; nothing
+/// narrows.
+#[test]
+fn test_min_max_fma_builtins() {
+    for (src, func, float) in [
+        ("fmin(i, f)", InlineLibraryFn::FMin, false),
+        ("__builtin_fminf(i, f)", InlineLibraryFn::FMin, true),
+        ("fmaxf(f, i)", InlineLibraryFn::FMax, true),
+        ("__builtin_fmax(f, f)", InlineLibraryFn::FMax, false),
+        ("fma(i, f, i)", InlineLibraryFn::Fma, false),
+        ("__builtin_fmaf(i, i, i)", InlineLibraryFn::Fma, true),
+    ] {
+        let (expr, types, _, _) = parse_expr_with_vars(src, &["i", "f"]).unwrap();
+        let want = if float {
+            types.float_id
+        } else {
+            types.double_id
+        };
+        assert_eq!(expr.typ, Some(want), "{src}");
+        let (got, args) = inline_call_args(src, &expr);
+        assert_eq!(got, func, "{src}");
+        assert_eq!(args.len(), func.arity(), "{src}");
+        assert!(args.iter().all(|a| a.typ == Some(want)), "{src}");
+    }
+}
+
+/// A `float` argument to a `double` rounding is rounded as a `float`, by
+/// the `f` form, and the exact answer widened: the call is still a
+/// `double`, and still a call to the function the program named, whose
+/// definition would displace it. A `double` argument is not narrowed, and a
+/// root never is.
+#[test]
+fn test_rounding_narrows_a_float_argument() {
+    let decls = "float f; double d;";
+    with_statement_expr(decls, "floor(f)", |p, e| {
+        assert_eq!(e.typ, Some(p.types.double_id));
+        let (func, arg) = inline_call("floor(f)", e);
+        assert_eq!(
+            func,
+            InlineLibraryFn::RoundToIntegral(IntegralRounding::Floor)
+        );
+        assert_eq!(arg.typ, Some(p.types.float_id), "not converted to double");
+        let ExprKind::InlineLibraryCall { name, narrowed, .. } = e.kind else {
+            unreachable!()
+        };
+        assert_eq!(name, crate::kw::FLOOR, "the function called");
+        let narrowed = narrowed.expect("computed by floorf");
+        assert_eq!(narrowed.name, crate::kw::FLOORF);
+        assert_eq!(narrowed.typ, p.types.float_id);
+    });
+    with_statement_expr(decls, "__builtin_rint(d)", |p, e| {
+        assert_eq!(e.typ, Some(p.types.double_id));
+        inline_call("__builtin_rint(d)", e);
+        assert!(matches!(
+            e.kind,
+            ExprKind::InlineLibraryCall { narrowed: None, .. }
+        ));
+    });
+    with_statement_expr(decls, "sqrt(f)", |p, e| {
+        let (_, arg) = inline_call("sqrt(f)", e);
+        assert_eq!(arg.typ, Some(p.types.double_id), "a root is not narrowed");
+    });
+}
+
+/// At `-O0` a bare rounding is a call to the function it names, whatever
+/// its argument, and a `__builtin_` one is computed in place.
+#[test]
+fn test_rounding_at_o0() {
+    let o0 = super::LibraryCallPolicy {
+        optimizing: false,
+        math_errno: true,
+    };
+    let called = |src: &str, vars: &[&str]| {
+        let (expr, types, strings, symbols) = parse_expr_under(src, vars, o0).unwrap();
+        assert_eq!(expr.typ, Some(types.double_id), "{src}");
+        let e = match &expr.kind {
+            ExprKind::Cast { expr, .. } => expr.as_ref(),
+            _ => &expr,
+        };
+        let ExprKind::Call { func, .. } = &e.kind else {
+            panic!("{src} at -O0 is not a call: {:?}", e.kind);
+        };
+        let ExprKind::Ident(sym) = func.kind else {
+            panic!("{src} at -O0 names no function");
+        };
+        strings.get(symbols.get(sym).name).to_string()
+    };
+    assert_eq!(called("ceil(i)", &["i"]), "ceil");
+    // The call the program wrote, as gcc makes it: a `float` argument is
+    // narrowed only where c17 computes the answer itself.
+    assert_eq!(called("ceil(f)", &["f"]), "ceil");
+    // Unless the answer is a constant, which it is at every level; a root's
+    // domain error and a direction-dependent `rint` are not.
+    for src in ["ceil(2.5)", "sqrt(4.0)", "fmin(1.0, 2.0)"] {
+        let (expr, _, _, _) = parse_expr_under(src, &[], o0).unwrap();
+        inline_call_args(src, &expr);
+    }
+    assert_eq!(called("sqrt(-1.0)", &[]), "sqrt");
+    assert_eq!(called("rint(2.5)", &[]), "rint");
+    let (expr, _, _, _) = parse_expr_under("__builtin_ceil(i)", &["i"], o0).unwrap();
+    inline_call("__builtin_ceil(i)", &expr);
+}
+
+/// A definition of `sqrt` or a rounding above the call displaces the
+/// builtin -- an old-style one taking nothing included, whose call takes
+/// nothing -- while a definition of `abs` does not.
+#[test]
+fn test_definition_displaces_a_late_expanded_builtin() {
+    fn returned(src: &str) -> ExprKind {
+        let (tu, _, _, _) = parse_tu(src).unwrap();
+        let Stmt::Return(Some(e)) = first_statement_of(&tu, 1) else {
+            panic!("{src}: expected a return");
+        };
+        e.kind.clone()
+    }
+    let is_call = |k: &ExprKind| matches!(k, ExprKind::Call { .. });
+    assert!(is_call(&returned(
+        "double sqrt(double x) { return x; } double f(double y) { return sqrt(y); }"
+    )));
+    assert!(is_call(&returned(
+        "float rintf() { return 1.0f; } float f(void) { return rintf(); }"
+    )));
+    // A `float` argument asks about the function called, not its `f` form:
+    // `floor` is displaced, and `floorf` displaces nothing.
+    assert!(is_call(&returned(
+        "double floor(double x) { return x; } double f(float y) { return floor(y); }"
+    )));
+    assert!(matches!(
+        returned("float floorf(float x) { return x; } double f(float y) { return floor(y); }"),
+        ExprKind::InlineLibraryCall { .. }
+    ));
+    assert!(matches!(
+        returned("int abs(int v) { return v; } int f(int y) { return abs(y); }"),
+        ExprKind::InlineLibraryCall { .. }
+    ));
+    // A weak definition may be replaced at link time; gcc keeps the builtin.
+    assert!(matches!(
+        returned(
+            "__attribute__((weak)) double sqrt(double x) { return x; }\n\
+             double f(double y) { return sqrt(y); }"
+        ),
+        ExprKind::InlineLibraryCall { .. }
+    ));
+}
+
+/// A declaration of `copysign` keeps the builtin only if both parameters, not
+/// just the first, match the library's.
+#[test]
+fn test_copysign_incompatible_declaration_displaces_builtin() {
+    fn returned_is_copysign(src: &str) -> bool {
+        let (tu, _, _, _) = parse_tu(src).unwrap();
+        matches!(
+            first_statement(&tu),
+            Stmt::Return(Some(e)) if matches!(
+                e.kind,
+                ExprKind::InlineLibraryCall { func: InlineLibraryFn::CopySign, .. }
+            )
+        )
+    }
+    assert!(returned_is_copysign(
+        "double copysign(double, double); double f(void) { return copysign(1, 2); }"
+    ));
+    assert!(returned_is_copysign(
+        "double copysign(); double f(void) { return copysign(1.0, 2.0); }"
+    ));
+    assert!(!returned_is_copysign(
+        "double copysign(double, int); double f(void) { return copysign(1, 2); }"
+    ));
+    assert!(!returned_is_copysign(
+        "double copysign(double); double f(void) { return copysign(1); }"
+    ));
+    assert!(!returned_is_copysign(
+        "double copysign(double, double, ...); double f(void) { return copysign(1, 2); }"
+    ));
+}
+
+/// A declaration of `abs` with a type incompatible with `int abs(int)` makes
+/// it an ordinary function; the compatible declaration keeps the builtin.
+#[test]
+fn test_int_abs_incompatible_declaration_displaces_builtin() {
+    fn returned_is_int_abs(src: &str) -> bool {
+        let (tu, _, _, _) = parse_tu(src).unwrap();
+        matches!(
+            first_statement(&tu),
+            Stmt::Return(Some(e)) if matches!(
+                e.kind,
+                ExprKind::InlineLibraryCall { func: InlineLibraryFn::IntAbs, .. }
+            )
+        )
+    }
+    assert!(!returned_is_int_abs(
+        "struct S { int a; }; struct S abs(int); struct S f(void) { return abs(1); }"
+    ));
+    assert!(!returned_is_int_abs(
+        "long abs(long); long f(void) { return abs(1); }"
+    ));
+    assert!(returned_is_int_abs(
+        "int abs(int); int f(void) { return abs(1); }"
+    ));
+    assert!(returned_is_int_abs(
+        "extern int abs(const int); int f(void) { return abs(1); }"
+    ));
+    assert!(returned_is_int_abs(
+        "int abs(); int f(void) { return abs(1); }"
+    ));
+}
+
+/// A bare name that is not being called is an ordinary identifier: here the
+/// variable `abs`, which also displaces the builtin.
+#[test]
+fn test_int_abs_bare_name_not_called_is_an_identifier() {
+    let (expr, _, _, _) = parse_expr_with_vars("abs + 1", &["abs"]).unwrap();
+    assert!(!matches!(expr.kind, ExprKind::InlineLibraryCall { .. }));
+}
+
+/// Each complex accessor, bare or reserved, computes its half or the
+/// conjugate in place, of its argument converted to the complex type its
+/// suffix names.
+#[test]
+fn test_complex_accessor_builtins() {
+    type Want = fn(&TypeTable) -> crate::types::TypeId;
+    use InlineLibraryFn::{ComplexImag, ComplexReal, Conjugate};
+    let cases: &[(&str, InlineLibraryFn, Want, Want)] = &[
+        (
+            "creal(z)",
+            ComplexReal,
+            |t| t.double_id,
+            |t| t.complex_double_id,
+        ),
+        (
+            "__builtin_cimag(z)",
+            ComplexImag,
+            |t| t.double_id,
+            |t| t.complex_double_id,
+        ),
+        (
+            "crealf(z)",
+            ComplexReal,
+            |t| t.float_id,
+            |t| t.complex_float_id,
+        ),
+        (
+            "cimagl(z)",
+            ComplexImag,
+            |t| t.longdouble_id,
+            |t| t.complex_longdouble_id,
+        ),
+        (
+            "conj(z)",
+            Conjugate,
+            |t| t.complex_double_id,
+            |t| t.complex_double_id,
+        ),
+        (
+            "__builtin_conjf(z)",
+            Conjugate,
+            |t| t.complex_float_id,
+            |t| t.complex_float_id,
+        ),
+    ];
+    for (src, want_func, want_typ, want_arg) in cases {
+        let code = format!("double _Complex z; void t(void) {{ {src}; }}");
+        let (tu, types, _, _) = parse_tu(&code).unwrap();
+        let Stmt::Expr(expr) = first_statement(&tu) else {
+            panic!("{src}: expected an expression statement");
+        };
+        let (func, arg) = inline_call(src, expr);
+        assert_eq!(func, *want_func, "{src}");
+        assert_eq!(expr.typ, Some(want_typ(&types)), "{src}");
+        assert_eq!(arg.typ, Some(want_arg(&types)), "{src}");
+        // Only a precision other than `double` needs a conversion.
+        let converted = want_arg(&types) != types.complex_double_id;
+        assert_eq!(
+            matches!(arg.kind, ExprKind::Cast { .. }),
+            converted,
+            "{src}"
+        );
+    }
+}
+
+/// A `creal` declared with some other type is the program's own function.
+#[test]
+fn test_complex_accessor_incompatible_declaration_displaces_builtin() {
+    let code = "struct S { int a; }; struct S creal(int);\n\
+                int t(void) { return creal(1).a; }";
+    assert!(parse_tu(code).is_ok());
+}
+
+/// `memcpy`, `memset`, `memmove`, `mempcpy` and `bcopy`, bare or reserved,
+/// are block memory nodes whose arguments are converted as the prototype
+/// says, and whose constant length is folded to a `size_t` literal.
+#[test]
+fn test_memory_builtins() {
+    use MemoryFn::{Copy, CopyToEnd, Move, MoveSourceFirst, Set};
+    let decls = "char *d; const char *s; int c; unsigned char n;";
+    let cases = [
+        ("memcpy(d, s, 16)", Copy),
+        ("__builtin_memcpy(d, s, 8 + 8)", Copy),
+        ("memset(d, c, 16)", Set),
+        ("__builtin_memset(d, 'x', 16)", Set),
+        ("memmove(d, s, 16)", Move),
+        ("__builtin_memmove(d, s, 16)", Move),
+        ("mempcpy(d, s, 16)", CopyToEnd),
+        ("__builtin_mempcpy(d, s, 16)", CopyToEnd),
+        ("bcopy(s, d, 16)", MoveSourceFirst),
+        ("__builtin_bcopy(s, d, 16)", MoveSourceFirst),
+    ];
+    for (stmt, want) in cases {
+        with_statement_expr(decls, stmt, |p, e| {
+            let t = &*p.types;
+            let ExprKind::InlineLibraryCall {
+                func: InlineLibraryFn::Memory(mem),
+                args,
+                ..
+            } = &e.kind
+            else {
+                panic!("{stmt}: expected a block memory call, got {:?}", e.kind);
+            };
+            assert_eq!(*mem, want, "{stmt}");
+            let [first, second, n] = args.as_slice() else {
+                panic!("{stmt}: {} arguments", args.len());
+            };
+            let (ret, first_typ, second_typ) = match mem {
+                Copy | Move | CopyToEnd => (t.void_ptr_id, t.void_ptr_id, t.const_void_ptr_id),
+                Set => (t.void_ptr_id, t.void_ptr_id, t.int_id),
+                MoveSourceFirst => (t.void_id, t.const_void_ptr_id, t.void_ptr_id),
+            };
+            assert_eq!(e.typ, Some(ret), "{stmt}");
+            assert_eq!(first.typ, Some(first_typ), "{stmt}");
+            assert_eq!(second.typ, Some(second_typ), "{stmt}");
+            assert_eq!(n.typ, Some(t.ulong_id), "{stmt}");
+            assert!(
+                matches!(n.kind, ExprKind::IntLit(16)),
+                "{stmt}: {:?}",
+                n.kind
+            );
+        });
+    }
+    // A length known only at run time is converted, not folded.
+    with_statement_expr(decls, "memcpy(d, s, n)", |p, e| {
+        let ExprKind::InlineLibraryCall {
+            func: InlineLibraryFn::Memory(MemoryFn::Copy),
+            args,
+            ..
+        } = &e.kind
+        else {
+            panic!("expected memcpy, got {:?}", e.kind);
+        };
+        let n = &args[2];
+        assert_eq!(n.typ, Some(p.types.ulong_id));
+        assert!(matches!(n.kind, ExprKind::Cast { .. }), "{:?}", n.kind);
+    });
+}
+
+/// The declaration `<string.h>` writes keeps `memcpy` a builtin, `restrict`
+/// and all; one of another type, or a non-weak definition, makes it the
+/// program's own function.
+#[test]
+fn test_memory_builtin_declarations() {
+    fn is_memcpy(decl: &str) -> bool {
+        let src = format!("{decl}\nvoid t(char *d, char *s) {{ memcpy(d, s, 4); }}");
+        let (tu, _, _, _) = parse_tu(&src).unwrap();
+        // `t`, which follows any definition `decl` makes.
+        let t = tu
+            .items
+            .iter()
+            .filter(|item| matches!(item, ExternalDecl::FunctionDef(_)))
+            .count()
+            - 1;
+        matches!(
+            first_statement_of(&tu, t),
+            Stmt::Expr(e) if matches!(
+                e.kind,
+                ExprKind::InlineLibraryCall { func: InlineLibraryFn::Memory(MemoryFn::Copy), .. }
+            )
+        )
+    }
+    assert!(is_memcpy(""));
+    assert!(is_memcpy(
+        "void *memcpy(void *restrict, const void *restrict, unsigned long);"
+    ));
+    assert!(is_memcpy("void *memcpy();"));
+    assert!(!is_memcpy("char *memcpy(char *, char *, int);"));
+    assert!(!is_memcpy("void *memcpy(void *, void *, unsigned long);"));
+    assert!(!is_memcpy(
+        "void *memcpy(void *, const void *, unsigned long, ...);"
+    ));
+    assert!(!is_memcpy(
+        "void *memcpy(void *d, const void *s, unsigned long n) { return d; }"
+    ));
+    assert!(is_memcpy(
+        "__attribute__((weak)) void *memcpy(void *d, const void *s, unsigned long n) { return d; }"
+    ));
+}
+
+/// `bcopy` keeps its builtin under the declaration `<strings.h>` writes,
+/// which returns `void` and takes the source first, and loses it to any
+/// other declaration or to a definition; `mempcpy` likewise.
+#[test]
+fn test_bcopy_and_mempcpy_declarations() {
+    fn is_builtin(decl: &str, call: &str) -> bool {
+        let src = format!("{decl}\nvoid t(char *d, char *s) {{ {call}; }}");
+        let (tu, _, _, _) = parse_tu(&src).unwrap();
+        let t = tu
+            .items
+            .iter()
+            .filter(|item| matches!(item, ExternalDecl::FunctionDef(_)))
+            .count()
+            - 1;
+        matches!(
+            first_statement_of(&tu, t),
+            Stmt::Expr(e) if matches!(
+                e.kind,
+                ExprKind::InlineLibraryCall { func: InlineLibraryFn::Memory(_), .. }
+            )
+        )
+    }
+    let bcopy = "bcopy(s, d, 4)";
+    assert!(is_builtin("", bcopy));
+    assert!(is_builtin(
+        "void bcopy(const void *, void *, unsigned long);",
+        bcopy
+    ));
+    assert!(!is_builtin("void bcopy(char *, char *, int);", bcopy));
+    assert!(!is_builtin(
+        "void *bcopy(const void *, void *, unsigned long);",
+        bcopy
+    ));
+    assert!(!is_builtin(
+        "void bcopy(const void *s, void *d, unsigned long n) {}",
+        bcopy
+    ));
+    let mempcpy = "mempcpy(d, s, 4)";
+    assert!(is_builtin(
+        "void *mempcpy(void *restrict, const void *restrict, unsigned long);",
+        mempcpy
+    ));
+    assert!(!is_builtin("char *mempcpy(char *, char *, int);", mempcpy));
+    assert!(!is_builtin(
+        "void *mempcpy(void *d, const void *s, unsigned long n) { return d; }",
+        mempcpy
+    ));
+}
+
+/// Parse `decls` and a function `t` whose one statement is `stmt`, then hand
+/// that statement's expression to `f` along with the parser that built it.
+fn with_statement_expr<R>(decls: &str, stmt: &str, f: impl FnOnce(&mut Parser, &Expr) -> R) -> R {
+    let src = format!("{decls}\nvoid t(void) {{ {stmt}; }}");
+    let mut strings = StringTable::new();
+    let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);
+    let tokens = tokenizer.tokenize();
+    let mut symbols = SymbolTable::new();
+    let mut types = TypeTable::new(&Target::host());
+    let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+    let tu = parser.parse_translation_unit().unwrap();
+    let Stmt::Expr(expr) = first_statement(&tu) else {
+        panic!("{stmt}: expected an expression statement");
+    };
+    f(&mut parser, expr)
+}
+
+/// A library builtin's result is a value: `creal(z)` is not the object
+/// `__real__ z` designates, even though it reads the same half.
+#[test]
+fn test_library_builtin_result_is_not_an_lvalue() {
+    let decls = "double _Complex z; int i; double d;";
+    for stmt in [
+        "creal(z)",
+        "__builtin_cimag(z)",
+        "conj(z)",
+        "abs(i)",
+        "fabs(d)",
+    ] {
+        let lvalue = with_statement_expr(decls, stmt, |p, e| p.is_lvalue(e));
+        assert!(!lvalue, "`{stmt}` is an lvalue");
+    }
+    for stmt in ["__real__ z", "__imag__ z"] {
+        let lvalue = with_statement_expr(decls, stmt, |p, e| p.is_lvalue(e));
+        assert!(lvalue, "`{stmt}` is not an lvalue");
+    }
+}
+
+/// An argument the prototype rejects, or the wrong number of them, is
+/// reported by the ordinary call checks, and the call is not lowered: a zero
+/// of the return type stands in for it, so nothing converts a structure to
+/// an `int`.
+#[test]
+fn test_library_builtin_bad_arguments_are_not_lowered() {
+    let decls = "struct S { int a; } s; int *p;";
+    type Want = fn(&TypeTable) -> crate::types::TypeId;
+    let cases: &[(&str, Want)] = &[
+        ("abs(s)", |t| t.int_id),
+        ("__builtin_fabsf(p)", |t| t.float_id),
+        ("creal(s)", |t| t.double_id),
+        ("conj(s)", |t| t.complex_double_id),
+        ("abs(1, 2)", |t| t.int_id),
+        ("abs()", |t| t.int_id),
+        ("floor(s)", |t| t.double_id),
+    ];
+    for (stmt, want) in cases {
+        with_statement_expr(decls, stmt, |p, e| {
+            assert_eq!(e.typ, Some(want(p.types)), "{stmt}");
+            assert!(
+                !matches!(
+                    e.kind,
+                    ExprKind::InlineLibraryCall { .. } | ExprKind::Call { .. }
+                ),
+                "`{stmt}` was lowered: {:?}",
+                e.kind
+            );
+        });
+    }
+}
+
+/// The checks are the ordinary call's: they say a call is sound exactly when
+/// the arguments fit the prototype, whoever asks.
+#[test]
+fn test_check_call_answers_soundness() {
+    let decls = "struct S { int a; } s; int *p; int i; int F(int);";
+    let sound = |call: &str| {
+        with_statement_expr(decls, call, |p, e| {
+            let ExprKind::Call { func, args, .. } = &e.kind else {
+                panic!("{call}: expected a call");
+            };
+            let func_type = p.resolved_function_type(func);
+            p.check_call(func_type, args, e.pos)
+        })
+    };
+    assert!(sound("F(i)"));
+    assert!(sound("F(p)"), "a pointer to int is a warning, not an error");
+    assert!(!sound("F(s)"));
+    assert!(!sound("F(1, 2)"));
+    assert!(!sound("F()"));
 }
 
 // __builtin_flt_rounds test
@@ -5105,8 +6246,104 @@ fn test_builtin_expect_with_expression() {
 fn test_wide_char_literal() {
     let (expr, types, _, _) = parse_expr("L'A'").unwrap();
     assert!(matches!(expr.kind, ExprKind::CharLit(65)));
-    // wchar_t is int on most Unix systems
-    assert_eq!(expr.typ, Some(types.int_id));
+    assert_eq!(expr.typ, Some(types.wchar_id));
+}
+
+/// An escape in a prefixed literal is bounded by the element type, not by a
+/// byte (C17 6.4.4.4p9): `L'\x1234'` is 0x1234 where it was 0x34, and a
+/// `wchar_t` unit takes the target's signedness -- `L'\xffffffff'` is -1
+/// where `wchar_t` is `int` and 4294967295 where it is `unsigned int`.
+#[test]
+fn test_prefixed_escapes_keep_their_width() {
+    use crate::target::{Arch, Os};
+    for (arch, os, all_ones) in [
+        (Arch::X86_64, Os::Linux, -1i64),
+        (Arch::Aarch64, Os::Linux, 0xffff_ffff),
+        (Arch::Aarch64, Os::MacOS, -1),
+    ] {
+        let parse = |src: &str| {
+            let mut strings = StringTable::new();
+            let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);
+            let tokens = tokenizer.tokenize();
+            let mut symbols = SymbolTable::new();
+            let mut types = TypeTable::new(&Target::new(arch, os));
+            let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+            parser.skip_stream_tokens();
+            parser.parse_expression().unwrap().kind
+        };
+        for (src, want) in [
+            ("L'\\x1234'", 0x1234),
+            ("L'\\777'", 0o777),
+            ("L'\\xffffffff'", all_ones),
+            ("u'\\x1234'", 0x1234),
+            // Out of range: diagnosed, then the low bits, as gcc keeps.
+            ("u'\\x12345'", 0x2345),
+            ("U'\\xffffffff'", 0xffff_ffff),
+        ] {
+            assert!(
+                matches!(parse(src), ExprKind::CharLit(v) if v == want),
+                "{src} on {arch}-{os}: {:?}",
+                parse(src)
+            );
+        }
+        match parse("L\"\\x1234\\xffffffff\\U0001F600\"") {
+            ExprKind::WideStringLit(u) => assert_eq!(u, [0x1234, 0xffff_ffff, 0x1f600]),
+            other => panic!("{other:?}"),
+        }
+        // A character beyond the BMP is a surrogate pair in UTF-16; an
+        // escaped unit is not a character and is never encoded.
+        match parse("u\"\\xd800\\U0001F600\\x12345\"") {
+            ExprKind::Utf16StringLit(u) => assert_eq!(u, [0xd800, 0xd83d, 0xde00, 0x2345]),
+            other => panic!("{other:?}"),
+        }
+        match parse("U\"\\xffffffff\\777\"") {
+            ExprKind::Utf32StringLit(u) => assert_eq!(u, [0xffff_ffff, 0o777]),
+            other => panic!("{other:?}"),
+        }
+        // A plain piece takes the run's prefix (6.4.5p5), so its escape is a
+        // `char16_t` unit, bounded and truncated as one.
+        match parse("\"\\x12345\" u\"a\"") {
+            ExprKind::Utf16StringLit(u) => assert_eq!(u, [0x2345, 0x61]),
+            other => panic!("{other:?}"),
+        }
+        // Out of range for `char`: diagnosed, then the low eight bits.
+        assert!(matches!(parse("'\\x141'"), ExprKind::CharLit(0x41)));
+    }
+}
+
+/// A prefixed literal takes the target's `wchar_t`, `char16_t` or
+/// `char32_t` -- and `wchar_t` is `unsigned int` under AAPCS64, which Linux
+/// follows, where it was `int` on every target.
+#[test]
+fn test_prefixed_literal_types_follow_the_target() {
+    use crate::target::{Arch, Os};
+    for (arch, os, wchar_unsigned) in [
+        (Arch::X86_64, Os::Linux, false),
+        (Arch::X86_64, Os::MacOS, false),
+        (Arch::Aarch64, Os::Linux, true),
+        (Arch::Aarch64, Os::FreeBSD, true),
+        (Arch::Aarch64, Os::MacOS, false),
+    ] {
+        for src in ["L'A'", "L\"ab\"", "u'A'", "u\"ab\"", "U'A'", "U\"ab\""] {
+            let mut strings = StringTable::new();
+            let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);
+            let tokens = tokenizer.tokenize();
+            let mut symbols = SymbolTable::new();
+            let mut types = TypeTable::new(&Target::new(arch, os));
+            let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+            parser.skip_stream_tokens();
+            let expr = parser.parse_expression().unwrap();
+            let typ = expr.typ.unwrap();
+            let elem = types.base_type(typ).unwrap_or(typ);
+            let (kind, unsigned) = match src.as_bytes()[0] {
+                b'L' => (TypeKind::Int, wchar_unsigned),
+                b'u' => (TypeKind::Short, true),
+                _ => (TypeKind::Int, true),
+            };
+            assert_eq!(types.kind(elem), kind, "{src} on {arch}-{os}");
+            assert_eq!(types.is_unsigned(elem), unsigned, "{src} on {arch}-{os}");
+        }
+    }
 }
 
 #[test]
@@ -5663,7 +6900,6 @@ fn test_library_builtin_pointer_returns() {
         ("__builtin_malloc(0)", TypeKind::Void),
         ("__builtin_calloc(0, 0)", TypeKind::Void),
         ("__builtin_realloc(0, 0)", TypeKind::Void),
-        ("__builtin_mempcpy(0, 0, 0)", TypeKind::Void),
     ] {
         let (expr, types, _, _) = parse_expr(call).unwrap();
         assert!(
@@ -5690,8 +6926,8 @@ fn test_library_builtin_pointer_returns() {
 #[test]
 fn test_library_builtin_scalar_returns() {
     for (call, want) in [
-        ("__builtin_memcmp(0, 0, 0)", TypeKind::Int),
-        ("__builtin_strncmp(0, 0, 0)", TypeKind::Int),
+        ("__builtin_memcmp(0, 0, 1)", TypeKind::Int),
+        ("__builtin_strncmp(0, 0, 1)", TypeKind::Int),
         ("__builtin_printf(0)", TypeKind::Int),
         ("__builtin_sprintf(0, 0)", TypeKind::Int),
         ("__builtin_snprintf(0, 0, 0)", TypeKind::Int),
@@ -5892,6 +7128,157 @@ fn test_imaginary_integer_constants() {
             "{src}: real half is {:?}",
             real.kind
         );
+    }
+}
+
+/// The GNU imaginary marker on a hexadecimal floating constant.
+///
+/// Only the suffix after the binary exponent may carry the marker; before the
+/// `p`, `a`-`f` are digits, so `0xfp0i` is `15i` and not a `float`. The marker
+/// combines with `f`/`l` on either side, as it does on a decimal constant.
+#[test]
+fn test_imaginary_hex_float_constants() {
+    for (src, want, base) in [
+        ("0x1.8p1i", 3.0, 'd'),
+        ("0xfp0i", 15.0, 'd'),
+        ("0xFp0I", 15.0, 'd'),
+        ("0x1p0fi", 1.0, 'f'),
+        ("0x1p-1if", 0.5, 'f'),
+        ("0x2p-1iL", 1.0, 'l'),
+        ("0x1.8p0Li", 1.5, 'l'),
+        ("0xAp0j", 10.0, 'd'),
+        ("0x1P+2i", 4.0, 'd'),
+    ] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let typ = expr.typ.unwrap_or_else(|| panic!("{src} has no type"));
+        assert!(
+            types.is_complex_float(typ),
+            "{src} should be a complex float"
+        );
+        let ExprKind::BuiltinComplex { real, imag } = &expr.kind else {
+            panic!("{src} gave {:?}", expr.kind);
+        };
+        assert!(
+            matches!(real.kind, ExprKind::FloatLit(v) if v.to_f64() == 0.0),
+            "{src}: real half is {:?}",
+            real.kind
+        );
+        assert!(
+            matches!(imag.kind, ExprKind::FloatLit(v) if v.to_f64() == want),
+            "{src}: imaginary half is {:?}",
+            imag.kind
+        );
+        let want_base = match base {
+            'f' => types.float_id,
+            'l' => types.longdouble_id,
+            _ => types.double_id,
+        };
+        assert_eq!(imag.typ, Some(want_base), "{src} base type");
+    }
+
+    // The control: without a marker, a hex float stays real, and its `f`
+    // digits are still digits.
+    for (src, want) in [("0xfp0", 15.0), ("0x1.8p1", 3.0), ("0xfp0f", 15.0)] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let typ = expr.typ.unwrap_or_else(|| panic!("{src} has no type"));
+        assert!(!types.is_complex(typ), "{src} should not be complex");
+        assert!(
+            matches!(expr.kind, ExprKind::FloatLit(v) if v.to_f64() == want),
+            "{src} gave {:?}",
+            expr.kind
+        );
+    }
+}
+
+/// The imaginary marker with every `_FloatN` suffix c17 has a type for, in
+/// both orders, as gcc accepts it.
+///
+/// The marker used to be found in "the trailing run of letters", and the
+/// digits of `f16` ended that run, so `2.0if16` was rejected while
+/// `2.0f16i` was accepted.
+#[test]
+fn test_imaginary_marker_with_float_n_suffixes() {
+    for (suffix, want) in [
+        ("f16", TypeKind::Float16),
+        ("F16", TypeKind::Float16),
+        ("f32", TypeKind::Float),
+        ("f64", TypeKind::Double),
+        ("f", TypeKind::Float),
+        ("l", TypeKind::LongDouble),
+        ("", TypeKind::Double),
+    ] {
+        for marker in ["i", "j", "I", "J"] {
+            for src in [
+                format!("2.5{marker}{suffix}"),
+                format!("2.5{suffix}{marker}"),
+                format!("0x1.4p1{marker}{suffix}"),
+                format!("0x1.4p1{suffix}{marker}"),
+                format!("25e-1{marker}{suffix}"),
+            ] {
+                let (expr, types, _, _) =
+                    parse_expr(&src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+                let typ = expr.typ.unwrap();
+                assert!(types.is_complex_float(typ), "{src} should be complex");
+                let ExprKind::BuiltinComplex { real, imag } = &expr.kind else {
+                    panic!("{src} gave {:?}", expr.kind);
+                };
+                assert!(
+                    matches!(real.kind, ExprKind::FloatLit(v) if v.to_f64() == 0.0),
+                    "{src}: real half is {:?}",
+                    real.kind
+                );
+                assert!(
+                    matches!(imag.kind, ExprKind::FloatLit(v) if v.to_f64() == 2.5),
+                    "{src}: imaginary half is {:?}",
+                    imag.kind
+                );
+                assert_eq!(types.kind(imag.typ.unwrap()), want, "{src} base type");
+            }
+        }
+    }
+}
+
+/// `f128`/`q` with the marker in both orders, where the target has binary128.
+#[test]
+fn test_imaginary_marker_with_binary128_suffixes() {
+    for src in ["2.0if128", "2.0f128i", "2.0iq", "2.0qi", "0x1p1iF128"] {
+        let (expr, types, _, _) = parse_expr_for(src, &x86_64_linux())
+            .unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let ExprKind::BuiltinComplex { imag, .. } = &expr.kind else {
+            panic!("{src} gave {:?}", expr.kind);
+        };
+        assert_eq!(types.kind(imag.typ.unwrap()), TypeKind::Float128, "{src}");
+    }
+}
+
+/// Where gcc places the marker, and where it does not.
+///
+/// It may stand between an integer's `u` and its `l`s and on a hex integer,
+/// but only once, and never inside another suffix: not between the `f` and
+/// the digits of `f16`, not inside `ll`.
+#[test]
+fn test_imaginary_marker_placement() {
+    for (src, want_bits) in [
+        ("1uil", 128),
+        ("1liu", 128),
+        ("1ill", 128),
+        ("1llui", 128),
+        ("0x1i", 64),
+        ("0xfi", 64),
+        ("0b1i", 64),
+    ] {
+        let (expr, types, _, _) =
+            parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
+        let typ = expr.typ.unwrap();
+        assert!(types.is_complex_integer(typ), "{src} should be complex int");
+        assert_eq!(types.size_bits(typ), want_bits, "{src} width");
+    }
+    for src in [
+        "2.0fi16", "2.0f1i6", "2.0f16ij", "2.0iif", "1lil", "1.0ii", "2.0Lif", "1if16", "1f16i",
+    ] {
+        assert!(parse_expr(src).is_err(), "{src} should be rejected");
     }
 }
 
@@ -6131,21 +7518,17 @@ fn test_alignof_of_an_aligned_function() {
     );
 }
 
-/// `__builtin_signbit` dispatches on its argument's type: a `float` to the
-/// single-precision form, a `long double` to `__signbitl`, a `double` to the
-/// double form. Each result is normalised to 0/1 by a `!= 0`.
+/// `__builtin_signbit` reads the sign at its argument's own type, a
+/// `_Float16` widened to `float`; `__builtin_signbitf` and
+/// `__builtin_signbitl` convert theirs to the type they name. Each is a bit
+/// test, never a call.
 #[test]
 fn test_signbit_is_type_generic() {
-    fn inner(e: &Expr) -> &ExprKind {
-        match &e.kind {
-            ExprKind::Binary { left, .. } => &left.kind,
-            other => other,
-        }
-    }
-    let (tu, _types, strings, symbols) = parse_tu(
-        "float f; double d; long double l;\n\
+    let (tu, types, _, _) = parse_tu(
+        "float f; double d; long double l; _Float16 h;\n\
          int a = 0; void t(void) { a = __builtin_signbit(f); a = __builtin_signbit(d); \
-         a = __builtin_signbit(l); }\n",
+         a = __builtin_signbit(l); a = __builtin_signbit(h); a = __builtin_signbitf(d); \
+         a = __builtin_signbitl(f); }\n",
     )
     .unwrap();
     let body = tu
@@ -6172,15 +7555,24 @@ fn test_signbit_is_type_generic() {
             _ => None,
         })
         .collect();
-    assert_eq!(rhs.len(), 3);
-    assert!(matches!(inner(rhs[0]), ExprKind::Signbitf { .. }), "float");
-    assert!(matches!(inner(rhs[1]), ExprKind::Signbit { .. }), "double");
-    match inner(rhs[2]) {
-        ExprKind::Call { func, .. } => match &func.kind {
-            ExprKind::Ident(id) => check_name(&strings, symbols.get(*id).name, "__signbitl"),
-            other => panic!("long double: expected a call to __signbitl, got {other:?}"),
-        },
-        other => panic!("long double: expected a call, got {other:?}"),
+    let want = [
+        types.float_id,
+        types.double_id,
+        types.longdouble_id,
+        types.float_id,
+        types.float_id,
+        types.longdouble_id,
+    ];
+    assert_eq!(rhs.len(), want.len());
+    for (i, (e, typ)) in rhs.iter().zip(want).enumerate() {
+        assert_eq!(e.typ, Some(types.int_id), "#{i}");
+        match &e.kind {
+            ExprKind::FpTest {
+                test: FpTest::SignBit,
+                arg,
+            } => assert_eq!(arg.typ, Some(typ), "#{i}: the operand's type"),
+            other => panic!("#{i}: expected a sign-bit test, got {other:?}"),
+        }
     }
 }
 
@@ -6309,9 +7701,43 @@ fn test_alias_attribute_reaches_its_declarator() {
     assert_eq!(got, want);
 }
 
+/// The expression `fname`'s body returns in its first statement.
+fn returned_expr<'t>(tu: &'t TranslationUnit, strings: &StringTable, fname: &str) -> &'t Expr {
+    let body = tu
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ExternalDecl::FunctionDef(f) if strings.get(f.name) == fname => Some(&f.body),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no definition of {fname}"));
+    let Stmt::Block(items) = body else {
+        panic!("{fname}: body is not a block");
+    };
+    let Some(BlockItem::Statement(stmt)) = items.first() else {
+        panic!("{fname}: expected a statement");
+    };
+    let Stmt::Return(Some(expr)) = &**stmt else {
+        panic!("{fname}: expected a return statement");
+    };
+    expr
+}
+
+/// The binding and library tag of the call `fname` returns.
+fn returned_call(
+    tu: &TranslationUnit,
+    strings: &StringTable,
+    fname: &str,
+) -> (CalleeBinding, Option<LibFn>) {
+    let ExprKind::Call { binding, known, .. } = &returned_expr(tu, strings, fname).kind else {
+        panic!("{fname}: expected a call");
+    };
+    (*binding, *known)
+}
+
 /// A library function spelled `__builtin_X` is a call to the library's `X`;
 /// the same function called by its own name is a call to whatever the unit
-/// declares, which may be an inline definition.
+/// declares, which may be an inline definition. Both are known to call it.
 #[test]
 fn test_library_builtin_call_binds_to_the_library() {
     let (tu, _types, strings, _symbols) = parse_tu(
@@ -6320,31 +7746,111 @@ fn test_library_builtin_call_binds_to_the_library() {
          char *own(char *d) { return strncpy(d, d, 1); }\n",
     )
     .unwrap();
-    let binding_in = |fname: &str| {
-        let body = tu
-            .items
-            .iter()
-            .find_map(|item| match item {
-                ExternalDecl::FunctionDef(f) if strings.get(f.name) == fname => Some(&f.body),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("no definition of {fname}"));
-        let Stmt::Block(items) = body else {
-            panic!("{fname}: body is not a block");
-        };
-        let Some(BlockItem::Statement(stmt)) = items.first() else {
-            panic!("{fname}: expected a statement");
-        };
-        let Stmt::Return(Some(expr)) = &**stmt else {
-            panic!("{fname}: expected a return statement");
-        };
-        let ExprKind::Call { binding, .. } = &expr.kind else {
-            panic!("{fname}: expected a call");
-        };
-        *binding
+    assert_eq!(
+        returned_call(&tu, &strings, "lib"),
+        (CalleeBinding::Library, Some(LibFn::Strncpy))
+    );
+    assert_eq!(
+        returned_call(&tu, &strings, "own"),
+        (CalleeBinding::Declared, Some(LibFn::Strncpy))
+    );
+}
+
+/// A call to a library function the optimizer knows is tagged with it
+/// where the name still means that function: declared with the library's
+/// prototype, by its old spelling (`index`), with a `FILE *` of the
+/// program's own, and even past a definition in the unit, since defining a
+/// reserved name is undefined (C17 7.1.3p2) and gcc folds `__printf_chk`
+/// past one.
+#[test]
+fn test_known_library_call_is_tagged() {
+    let (tu, _types, strings, _symbols) = parse_tu(
+        "unsigned long strlen(const char *);\n\
+         char *index(const char *, int);\n\
+         struct F;\n\
+         int fputs(const char *restrict, struct F *restrict);\n\
+         int __printf_chk(int flag, const char *fmt, ...) { return flag; }\n\
+         unsigned long len(void) { return strlen(\"ab\"); }\n\
+         char *ix(const char *s) { return index(s, 'a'); }\n\
+         int put(struct F *f) { return fputs(\"x\", f); }\n\
+         int chk(void) { return __printf_chk(1, \"%d\", 2); }\n",
+    )
+    .unwrap();
+    let known = |f| returned_call(&tu, &strings, f).1;
+    assert_eq!(known("len"), Some(LibFn::Strlen));
+    assert_eq!(known("ix"), Some(LibFn::Strchr));
+    assert_eq!(known("put"), Some(LibFn::Fputs));
+    assert_eq!(known("chk"), Some(LibFn::PrintfChk));
+}
+
+/// Where the name is the program's, the call is an ordinary one: a
+/// prototype that is not the library's (a different parameter, or a `...`
+/// the library does not have), and a call through a pointer rather than by
+/// name.
+#[test]
+fn test_known_library_call_is_not_tagged_where_the_name_is_the_programs() {
+    let (tu, _types, strings, _symbols) = parse_tu(
+        "int strlen(int);\n\
+         int puts(const char *, ...);\n\
+         unsigned long strnlen(const char *, unsigned long);\n\
+         int len(void) { return strlen(3); }\n\
+         int put(void) { return puts(\"x\", 1); }\n\
+         unsigned long ptr(void) { return (&strnlen)(\"ab\", 1); }\n\
+         unsigned long own(void) { return strnlen(\"ab\", 1); }\n",
+    )
+    .unwrap();
+    let known = |f| returned_call(&tu, &strings, f).1;
+    assert_eq!(known("len"), None);
+    assert_eq!(known("put"), None);
+    assert_eq!(known("ptr"), None);
+    assert_eq!(known("own"), Some(LibFn::Strnlen));
+}
+
+/// `__builtin_puts` with no declaration of `puts` in scope declares it with
+/// the library's own prototype -- so its arguments are checked and
+/// converted, and the call is known.
+#[test]
+fn test_undeclared_known_builtin_gets_the_library_prototype() {
+    let (tu, types, strings, symbols) =
+        parse_tu("int f(void) { return __builtin_puts(\"hi\"); }\n").unwrap();
+    assert_eq!(
+        returned_call(&tu, &strings, "f"),
+        (CalleeBinding::Library, Some(LibFn::Puts))
+    );
+    let ExprKind::Call { func, .. } = &returned_expr(&tu, &strings, "f").kind else {
+        unreachable!("returned_call found a call");
     };
-    assert_eq!(binding_in("lib"), CalleeBinding::Library);
-    assert_eq!(binding_in("own"), CalleeBinding::Declared);
+    let ExprKind::Ident(puts) = func.kind else {
+        panic!("expected a call by name");
+    };
+    let ft = types.get(symbols.get(puts).typ);
+    assert_eq!(ft.base, Some(types.int_id));
+    assert_eq!(ft.params.as_deref(), Some(&[types.const_char_ptr_id][..]));
+    assert!(!ft.variadic);
+}
+
+/// `strncmp` or `memcmp` of the constant length 0 is 0 as it is parsed, at
+/// every level, with each argument still evaluated; any other length, and
+/// a function that is not one of the two, stays a call.
+#[test]
+fn test_zero_length_compare_is_zero_with_its_arguments_evaluated() {
+    let (tu, _types, strings, _symbols) = parse_tu(
+        "typedef unsigned long size_t;\n\
+         int strncmp(const char *, const char *, size_t);\n\
+         int memcmp(const void *, const void *, size_t);\n\
+         int n(const char *p) { return strncmp(p++, \"x\", 0); }\n\
+         int m(const char *p) { return __builtin_memcmp(p, p, 2 - 2); }\n\
+         int one(const char *p) { return strncmp(p, \"x\", 1); }\n",
+    )
+    .unwrap();
+    for f in ["n", "m"] {
+        let ExprKind::Comma(parts) = &returned_expr(&tu, &strings, f).kind else {
+            panic!("{f}: expected the arguments, then 0");
+        };
+        assert_eq!(parts.len(), 4, "{f}");
+        assert!(matches!(parts[3].kind, ExprKind::IntLit(0)), "{f}");
+    }
+    assert_eq!(returned_call(&tu, &strings, "one").1, Some(LibFn::Strncmp));
 }
 
 /// A statement expression whose last statement is a labeled expression
@@ -6646,4 +8152,98 @@ fn test_calling_convention_comes_from_any_declaration() {
             ("h".to_string(), C)
         ]
     );
+}
+
+/// A floating comparison or a cast to an integer in an integer constant
+/// expression is decided exactly, at the operands' common type: through
+/// `f64` the first two were false, `0.1f != 0.1` was false, and
+/// `(_Bool)0.5` was 0. Each `_Static_assert` is gcc's answer.
+#[test]
+fn test_constant_expression_floating_folds_are_exact() {
+    let src = "\
+        _Static_assert(0x1p62L + 1.0L > 0x1p62L, \"order\");\n\
+        _Static_assert((long long)(0x1p62L + 1.0L) == 4611686018427387905LL, \"cast\");\n\
+        _Static_assert((unsigned long long)(0x1p63L + 3.0L) == 9223372036854775811ULL, \"u\");\n\
+        _Static_assert(0.1f != 0.1, \"common type\");\n\
+        _Static_assert((1LL << 60) + 1 == 0x1p60, \"integer operand rounds\");\n\
+        _Static_assert((int)0.99999999999999999999 == 1, \"literal is a double\");\n\
+        _Static_assert((_Bool)0.5 == 1, \"bool\");\n\
+        _Static_assert((int)((1 / 2) + 0.5) == 0, \"integer subexpression\");\n\
+        _Static_assert(__builtin_nan(\"\") != __builtin_nan(\"\"), \"unordered ne\");\n\
+        _Static_assert(!(__builtin_nan(\"\") == __builtin_nan(\"\")), \"unordered eq\");\n\
+        _Static_assert(__builtin_constant_p(0x1p62L + 1.0L), \"constant\");\n";
+    // `0x1p62L + 1.0L` needs a `long double` wider than `double`: x87 on
+    // x86-64, binary128 on aarch64 Linux -- not Apple arm64.
+    for target in linux_targets() {
+        if let Err(e) = parse_tu_for(src, &target) {
+            panic!("{target:?}: should have parsed: {e}");
+        }
+    }
+}
+
+/// A conversion C leaves undefined is not an integer constant expression:
+/// gcc makes `int a[(int)1e300 > 0];` a VLA for the same reason.
+#[test]
+fn test_out_of_range_float_cast_is_not_an_integer_constant() {
+    for src in [
+        "enum { E = (int)1e300 };",
+        "_Static_assert((int)__builtin_nan(\"\") == 0, \"\");",
+        "_Static_assert((unsigned)-1.0 == 0, \"\");",
+    ] {
+        assert!(parse_tu(src).is_err(), "{src} should be rejected");
+    }
+}
+
+/// `==` and `!=` take a complex operand, and fold: both operands convert to
+/// the common complex type and compare half by half. Each answer is gcc's.
+#[test]
+fn test_complex_equality_is_a_constant_expression() {
+    let src = "\
+        _Static_assert((_Complex float)(0.5) == 0.5, \"real promotes\");\n\
+        _Static_assert((1.0f + 2.0fi) == (1.0L + 2.0iL), \"common type\");\n\
+        _Static_assert((0.1f + 0i) != 0.1, \"float half widens exactly\");\n\
+        _Static_assert(3 == (3 + 0i), \"complex integer\");\n\
+        _Static_assert(__builtin_complex(__builtin_nan(\"\"), 0.0) != __builtin_complex(__builtin_nan(\"\"), 0.0), \"NaN half\");\n\
+        _Static_assert(__real__ (3 + 4i) == 3 && __imag__ (3 + 4i) == 4, \"halves\");\n\
+        _Static_assert(!(0.0 + 0.0i) && (0.0 + 1.0i), \"truth\");\n\
+        _Static_assert((_Bool)(0.0 + 1.0i) && (int)(3.75 + 2.5i) == 3, \"conversion\");\n\
+        _Static_assert(((0.0 + 1.0i) ? 7 : 8) == 7, \"condition\");\n";
+    if let Err(e) = parse_tu(src) {
+        panic!("should have parsed: {e}");
+    }
+}
+
+/// `__builtin_constant_p` of something the parser cannot fold is 0 at once
+/// at `-O0`, where no optimizer will run to prove it constant, and deferred
+/// once optimizing. A constant operand answers 1 at every level.
+#[test]
+fn test_constant_p_at_o0_answers_zero() {
+    let o0 = super::LibraryCallPolicy {
+        optimizing: false,
+        math_errno: true,
+    };
+    let (expr, _, _, _) = parse_expr_under("__builtin_constant_p(n)", &["n"], o0).unwrap();
+    assert!(matches!(expr.kind, ExprKind::IntLit(0)), "{:?}", expr.kind);
+    let (expr, _, _, _) = parse_expr_under("__builtin_constant_p(3)", &[], o0).unwrap();
+    assert!(matches!(expr.kind, ExprKind::IntLit(1)), "{:?}", expr.kind);
+    let (expr, _, _, _) =
+        parse_expr_under("__builtin_constant_p(n)", &["n"], Default::default()).unwrap();
+    assert!(
+        matches!(expr.kind, ExprKind::ConstantP(_)),
+        "{:?}",
+        expr.kind
+    );
+}
+
+/// x86-64 Linux: x87 `long double`, and `__float128`.
+fn x86_64_linux() -> Target {
+    Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux)
+}
+
+/// The Linux targets, whose `long double` is wider than `double`.
+fn linux_targets() -> [Target; 2] {
+    [
+        x86_64_linux(),
+        Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux),
+    ]
 }

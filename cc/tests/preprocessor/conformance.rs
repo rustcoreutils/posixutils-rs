@@ -1392,15 +1392,44 @@ int main(void) {
 /// signedness, which differs by target. `compile_and_run` only ever exercises
 /// the host, so the other answer is only visible through `--target`.
 #[test]
+///
+/// The rule is per OS too: Apple arm64 makes plain `char` signed where
+/// AAPCS64 makes it unsigned. `<limits.h>` must describe the same type, so
+/// `CHAR_MIN` is checked alongside.
+///
+/// Those are the compiler's part of `<limits.h>`. The bundled header forwards
+/// to the system's for the rest, and this host has no C library for most of
+/// these targets, so the target's directories are rooted in an empty sysroot:
+/// the bundled header then stands alone.
 fn preprocessor_if_char_signedness_is_per_target() {
-    let src = "#if '\\xff' < 0\nSIGNED_CHAR\n#else\nUNSIGNED_CHAR\n#endif\n";
-    for (target, want) in [
-        ("x86_64-unknown-linux-gnu", "SIGNED_CHAR"),
-        ("aarch64-unknown-linux-gnu", "UNSIGNED_CHAR"),
+    let src = "#include <limits.h>\n\
+               #if '\\xff' < 0\nSIGNED_CHAR\n#else\nUNSIGNED_CHAR\n#endif\n\
+               #if CHAR_MIN < 0 && CHAR_MAX == SCHAR_MAX\nSIGNED_LIMITS\n\
+               #elif CHAR_MIN == 0 && CHAR_MAX == UCHAR_MAX\nUNSIGNED_LIMITS\n#endif\n";
+    let sysroot = plib::tmp::Builder::new()
+        .prefix("c17_empty_sysroot_")
+        .tempdir()
+        .unwrap();
+    let sysroot = sysroot.path().to_str().unwrap();
+    for (target, signed) in [
+        ("x86_64-unknown-linux-gnu", true),
+        ("x86_64-apple-darwin", true),
+        ("aarch64-unknown-linux-gnu", false),
+        ("aarch64-apple-darwin", true),
     ] {
-        let r = preprocess_text("char_sign", src, &["--target", target]);
+        let r = preprocess_text(
+            "char_sign",
+            src,
+            &["--target", target, "--sysroot", sysroot],
+        );
         assert!(r.success, "-E failed for {}: {}", target, r.stderr);
+        let (want, limits) = if signed {
+            ("SIGNED_CHAR", "SIGNED_LIMITS")
+        } else {
+            ("UNSIGNED_CHAR", "UNSIGNED_LIMITS")
+        };
         assert_has(&r.stdout, want, target);
+        assert_has(&r.stdout, limits, target);
     }
 }
 
@@ -1913,7 +1942,8 @@ fn preprocessor_malformed_conditional_operand_in_a_dead_branch_is_quiet() {
 /// The parser and the `#if` evaluator decode the same token, so they must
 /// agree about it. They stopped agreeing when only the evaluator learned to
 /// pack a multi-character constant: `'ab'` compiled to 97 while `#if 'ab' ==
-/// 24930` took the true branch.
+/// 24930` took the true branch. `'\777'` is out of range for `char`, so it
+/// needs `-fpermissive`, and both must then truncate it alike.
 #[test]
 fn preprocessor_character_constants_agree_with_the_compiler() {
     let src = r#"
@@ -1934,7 +1964,7 @@ int main(void) {
 }
 "#;
     assert_eq!(
-        crate::common::compile_and_run("char_agreement", src, &[]),
+        crate::common::compile_and_run("char_agreement", src, &["-fpermissive".to_string()]),
         0
     );
 }

@@ -17,10 +17,17 @@
 //
 
 mod bit_ops;
+mod call_semantics;
+mod copy_fold;
 mod frame_address;
 mod gnu_atomics;
 mod has_feature;
 mod intrinsics;
+mod libm;
 mod math;
+mod mem_expand;
+mod mem_moves;
 mod memory;
+mod stdio_fold;
+mod string_fold;
 mod va_arg_pack;

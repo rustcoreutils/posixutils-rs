@@ -134,6 +134,18 @@ pub enum HfaBase {
     Float128,
 }
 
+impl HfaBase {
+    /// The width of one element, in bytes.
+    pub fn bytes(self) -> usize {
+        match self {
+            HfaBase::Float16 => 2,
+            HfaBase::Float32 => 4,
+            HfaBase::Float64 => 8,
+            HfaBase::Float128 => 16,
+        }
+    }
+}
+
 /// How an argument or return value should be passed.
 ///
 /// This is the primary classification result used by the backend to
@@ -364,6 +376,48 @@ mod tests {
         // Void -> Ignore
         let void_class = abi.classify_param(types.void_id, &types);
         assert!(matches!(void_class, ArgClass::Ignore));
+    }
+
+    /// Each complex type as psABI 3.2.3 classifies it for a parameter, which
+    /// is what `va_arg` now reads it by. `_Float128 _Complex` is four
+    /// eightbytes (SSE, SSEUP, SSE, SSEUP) that the post-merger cleanup makes
+    /// MEMORY, as gcc passes it and as c17's own call lowering
+    /// (`complex_sse_regs`) already did.
+    #[test]
+    fn test_sysv_amd64_complex_params() {
+        use crate::types::TypeTable;
+
+        let types = TypeTable::new(&Target::new(
+            crate::target::Arch::X86_64,
+            crate::target::Os::Linux,
+        ));
+        let abi = SysVAmd64Abi::new();
+        let sse = |n| vec![RegClass::Sse; n];
+        for (base, want) in [
+            (types.float16_id, Some(sse(1))),
+            (types.float_id, Some(sse(1))),
+            (types.double_id, Some(sse(2))),
+            (types.longdouble_id, None),
+            (types.float128_id, None),
+        ] {
+            let got = abi.classify_param(types.make_complex(base), &types);
+            match want {
+                Some(classes) => assert!(
+                    matches!(&got, ArgClass::Direct { classes: c, .. } if *c == classes),
+                    "{base:?}: {got:?}"
+                ),
+                None => assert!(
+                    matches!(
+                        got,
+                        ArgClass::Indirect {
+                            align: 16,
+                            size_bytes: 32
+                        }
+                    ),
+                    "{base:?}: {got:?}"
+                ),
+            }
+        }
     }
 
     #[test]

@@ -9,9 +9,9 @@
 // Compositional type model with interning for efficient comparison.
 //
 
-use crate::float::FpFormat;
+use crate::float::{ComplexRoutineFormat, FpFormat};
 use crate::strings::{StringId, StringTable as IdentTable};
-use crate::target::{Arch, Os, Target};
+use crate::target::{Arch, CharSignedness, IntType, Os, Target};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -787,14 +787,12 @@ pub struct TypeTable {
     target_arch: Arch,
     /// Target OS for runtime type size calculations
     target_os: Os,
-    /// Whether plain `char` is signed on the target.
-    ///
-    /// C17 6.2.5p15 leaves this implementation-defined: the x86-64 psABI says
-    /// signed, AAPCS64 says unsigned. Copied from `Target` at construction
+    /// Plain `char`'s signedness on the target (C17 6.2.5p15), as
+    /// [`CharSignedness::of`] decides it. Copied from `Target` at construction
     /// rather than recomputed, because the table cannot reconstruct the
     /// *requested* target -- `has_float128` rebuilds one with
     /// `..Target::host()` and would answer for the host instead.
-    char_signed: bool,
+    plain_char: CharSignedness,
 
     // Pre-computed common type IDs for fast access
     pub void_id: TypeId,
@@ -817,6 +815,12 @@ pub struct TypeTable {
     pub longdouble_id: TypeId,
     pub float16_id: TypeId,
     pub float128_id: TypeId,
+    /// `wchar_t`, `char16_t` and `char32_t`: the types of the `L`, `u` and
+    /// `U` prefixed literals, as [`Target`] decides them. Each is one of the
+    /// integer types above, not a type of its own.
+    pub wchar_id: TypeId,
+    pub char16_id: TypeId,
+    pub char32_id: TypeId,
     /// Every arithmetic base type paired with its `_Complex` counterpart.
     ///
     /// [`Self::make_complex`] takes `&self`, so it cannot intern on demand,
@@ -830,7 +834,13 @@ pub struct TypeTable {
     pub complex_float16_id: TypeId,
     pub complex_float128_id: TypeId,
     pub void_ptr_id: TypeId,
+    /// `const void *`, the source operand of `memcpy` and `memmove`.
+    pub const_void_ptr_id: TypeId,
     pub char_ptr_id: TypeId,
+    /// `const char *`, the string operand of `<string.h>` and `<stdio.h>`.
+    pub const_char_ptr_id: TypeId,
+    /// `__builtin_va_list`, the last parameter of `vprintf` and its siblings.
+    pub va_list_id: TypeId,
 }
 
 /// Parenthesize a declarator that has reached a `*` before an array or
@@ -854,7 +864,7 @@ impl TypeTable {
             pointer_width: target.pointer_width,
             target_arch: target.arch,
             target_os: target.os,
-            char_signed: target.char_signed,
+            plain_char: target.plain_char,
             void_id: TypeId::INVALID,
             bool_id: TypeId::INVALID,
             char_id: TypeId::INVALID,
@@ -875,6 +885,9 @@ impl TypeTable {
             longdouble_id: TypeId::INVALID,
             float16_id: TypeId::INVALID,
             float128_id: TypeId::INVALID,
+            wchar_id: TypeId::INVALID,
+            char16_id: TypeId::INVALID,
+            char32_id: TypeId::INVALID,
             complex_of: std::collections::HashMap::new(),
             complex_float_id: TypeId::INVALID,
             complex_double_id: TypeId::INVALID,
@@ -882,7 +895,10 @@ impl TypeTable {
             complex_float16_id: TypeId::INVALID,
             complex_float128_id: TypeId::INVALID,
             void_ptr_id: TypeId::INVALID,
+            const_void_ptr_id: TypeId::INVALID,
             char_ptr_id: TypeId::INVALID,
+            const_char_ptr_id: TypeId::INVALID,
+            va_list_id: TypeId::INVALID,
         };
 
         // Pre-intern common basic types
@@ -921,6 +937,9 @@ impl TypeTable {
         table.longdouble_id = table.intern(Type::basic(TypeKind::LongDouble));
         table.float16_id = table.intern(Type::basic(TypeKind::Float16));
         table.float128_id = table.intern(Type::basic(TypeKind::Float128));
+        table.wchar_id = table.int_type_id(target.wchar_type());
+        table.char16_id = table.int_type_id(target.char16_type());
+        table.char32_id = table.int_type_id(target.char32_type());
 
         // Pre-intern complex types
         table.complex_float_id = table.intern(Type::with_modifiers(
@@ -982,9 +1001,30 @@ impl TypeTable {
 
         // Pre-intern common pointer types
         table.void_ptr_id = table.intern(Type::pointer(table.void_id));
+        let const_void = table.intern(Type::with_modifiers(TypeKind::Void, TypeModifiers::CONST));
+        table.const_void_ptr_id = table.intern(Type::pointer(const_void));
         table.char_ptr_id = table.intern(Type::pointer(table.char_id));
+        let const_char = table.intern(Type::with_modifiers(TypeKind::Char, TypeModifiers::CONST));
+        table.const_char_ptr_id = table.intern(Type::pointer(const_char));
+        table.va_list_id = table.intern(Type::basic(TypeKind::VaList));
 
         table
+    }
+
+    /// The type a [`Target`]'s ABI choice names.
+    pub fn int_type_id(&self, t: IntType) -> TypeId {
+        match t {
+            IntType::SChar => self.schar_id,
+            IntType::UChar => self.uchar_id,
+            IntType::Short => self.short_id,
+            IntType::UShort => self.ushort_id,
+            IntType::Int => self.int_id,
+            IntType::UInt => self.uint_id,
+            IntType::Long => self.long_id,
+            IntType::ULong => self.ulong_id,
+            IntType::LongLong => self.longlong_id,
+            IntType::ULongLong => self.ulonglong_id,
+        }
     }
 
     /// A fresh identity for a tagless composite definition; see
@@ -1356,8 +1396,8 @@ impl TypeTable {
                     result.push_str("volatile ");
                 }
                 // Spelling, not signedness: a diagnostic must name the type the
-                // source wrote. Plain `char` is an unsigned type on aarch64 and
-                // is still `char` here.
+                // source wrote. Plain `char` is an unsigned type on aarch64
+                // Linux and is still `char` here.
                 if self.spelled_unsigned(id) {
                     result.push_str("unsigned ");
                 } else if typ.modifiers.contains(TypeModifiers::SIGNED)
@@ -1550,6 +1590,29 @@ impl TypeTable {
         })
     }
 
+    /// The real type a floating complex `*` or `/` whose halves have type
+    /// `base` is computed in, and the libgcc routine format that computes it;
+    /// `None` if `base` is not a floating type.
+    ///
+    /// The type is `base` itself wherever `base`'s format has a routine, and
+    /// otherwise the type the operands are widened to: `float`, for a
+    /// `_Float16` base (see [`FpFormat::complex_routine_format`]).
+    pub fn complex_routine_type(&self, base: TypeId) -> Option<(TypeId, ComplexRoutineFormat)> {
+        let fmt = self.fp_format(base)?;
+        let routine = fmt.complex_routine_format();
+        let typ = if routine.format() == fmt {
+            base
+        } else {
+            match routine {
+                ComplexRoutineFormat::Binary32 => self.float_id,
+                ComplexRoutineFormat::Binary64 => self.double_id,
+                ComplexRoutineFormat::X87Extended => self.longdouble_id,
+                ComplexRoutineFormat::Binary128 => self.float128_id,
+            }
+        };
+        Some((typ, routine))
+    }
+
     /// Get the complex type for a float base type (e.g., double → double _Complex)
     pub fn make_complex(&self, id: TypeId) -> TypeId {
         if self.is_complex(id) {
@@ -1716,6 +1779,24 @@ impl TypeTable {
         }
     }
 
+    /// Whether a value of this type is made of members at offsets: a struct,
+    /// union or array, or a complex number (its real and imaginary halves).
+    ///
+    /// `kind()` alone cannot answer this, because a complex type carries its
+    /// *base's* kind -- `double _Complex` answers `TypeKind::Double` -- so a
+    /// site that asks only for `Struct | Union | Array` takes a complex value
+    /// for a scalar of its base type. The calling conventions lay a complex
+    /// value out as the equivalent two-member struct (a two-element HFA on
+    /// AAPCS64, its eightbytes classified as a struct's on System V), so
+    /// anything that follows the ABI's classification wants both here.
+    pub fn is_aggregate_or_complex(&self, id: TypeId) -> bool {
+        self.is_complex(id)
+            || matches!(
+                self.kind(id),
+                TypeKind::Struct | TypeKind::Union | TypeKind::Array
+            )
+    }
+
     /// Check if type is a scalar type (arithmetic or pointer)
     pub fn is_scalar(&self, id: TypeId) -> bool {
         self.is_arithmetic(id) || self.get(id).kind == TypeKind::Pointer
@@ -1789,18 +1870,23 @@ impl TypeTable {
                     .modifiers
                     .intersects(TypeModifiers::SIGNED | TypeModifiers::UNSIGNED) =>
             {
-                !self.char_signed
+                self.plain_char == CharSignedness::Unsigned
             }
             _ => typ.modifiers.contains(TypeModifiers::UNSIGNED),
         }
+    }
+
+    /// Plain `char`'s signedness on the target this table describes.
+    pub fn plain_char(&self) -> CharSignedness {
+        self.plain_char
     }
 
     /// Whether the declaration of `id` spelled the keyword `unsigned`.
     ///
     /// A question about source text rather than about values, and the only one
     /// a caller that *reprints* a type should ask: plain `char` is an unsigned
-    /// type on aarch64 and is still written `char`, and `_Bool` is unsigned
-    /// and is written neither way. Using [`Self::is_unsigned`] here would make
+    /// type on aarch64 Linux and is still written `char`, and `_Bool` is
+    /// unsigned and is written neither way. Using [`Self::is_unsigned`] here would make
     /// a type printer say `unsigned char` for a declaration that says `char`.
     pub fn spelled_unsigned(&self, id: TypeId) -> bool {
         self.get(id).modifiers.contains(TypeModifiers::UNSIGNED)
@@ -1967,6 +2053,24 @@ impl TypeTable {
         match self.kind(id) {
             TypeKind::Bool | TypeKind::Char | TypeKind::Short => self.int_id,
             _ => id,
+        }
+    }
+
+    /// The default argument promotions (C17 6.5.2.2p6): the type an argument
+    /// with no parameter type to convert it to is passed as -- a variadic
+    /// one, or any argument of a call without a prototype -- and so the type
+    /// a definition with an identifier list receives each parameter as.
+    ///
+    /// The integer promotions, and `float` (with `_Float16`, as gcc passes
+    /// it) to `double`. A complex type is left alone: `kind` answers its
+    /// base's kind, and `float _Complex` is not a `float`.
+    pub fn default_argument_promote(&self, id: TypeId) -> TypeId {
+        if self.is_complex(id) {
+            return id;
+        }
+        match self.kind(id) {
+            TypeKind::Float | TypeKind::Float16 => self.double_id,
+            _ => self.integer_promote(id),
         }
     }
 
@@ -2640,15 +2744,44 @@ mod tests {
     /// 16-byte value for a 32-byte type.
     #[test]
     fn test_complex_base_and_make_complex_are_inverses() {
-        // Both targets, not just the host: plain `char` is signed on x86-64
-        // and unsigned on aarch64, and canonicalizing it by `is_unsigned`
-        // rather than by its modifiers sent plain `char` to `unsigned char`
-        // on one of them -- so the round trip held here and broke on CI.
+        // Every target, not just the host: plain `char` is signed on x86-64
+        // and Apple arm64 and unsigned on aarch64 Linux, and canonicalizing
+        // it by `is_unsigned` rather than by its modifiers sent plain `char`
+        // to `unsigned char` on one of them -- so the round trip held here
+        // and broke on CI.
         for target in [
             Target::new(Arch::X86_64, Os::Linux),
             Target::new(Arch::Aarch64, Os::Linux),
+            Target::new(Arch::Aarch64, Os::MacOS),
         ] {
             check_complex_round_trip(&target);
+        }
+    }
+
+    /// A complex type is a composite of its two halves even though `kind()`
+    /// answers its base's kind -- the reason the predicate exists.
+    #[test]
+    fn test_is_aggregate_or_complex() {
+        let mut types = TypeTable::new(&Target::new(Arch::X86_64, Os::Linux));
+        let complex_int = types.make_complex(types.int_id);
+        let array = types.intern(Type::array(types.int_id, 4));
+        for id in [
+            types.complex_float_id,
+            types.complex_double_id,
+            complex_int,
+            array,
+        ] {
+            assert!(types.is_aggregate_or_complex(id), "{id:?}");
+        }
+        let ptr = types.pointer_to(types.int_id);
+        for id in [
+            types.double_id,
+            types.int_id,
+            types.longdouble_id,
+            types.int128_id,
+            ptr,
+        ] {
+            assert!(!types.is_aggregate_or_complex(id), "{id:?}");
         }
     }
 
@@ -2891,17 +3024,56 @@ mod tests {
     /// different question from how the type is spelled. `signed char` and
     /// `unsigned char` say what they are on every target; only bare `char`
     /// moves.
+    /// C17 6.5.2.2p6: the integer promotions, and `float` to `double`; a
+    /// complex type is not a `float` although `kind` answers `Float` for it.
+    #[test]
+    fn test_default_argument_promotions() {
+        let types = TypeTable::new(&Target::new(Arch::Aarch64, Os::MacOS));
+        for (from, to) in [
+            (types.bool_id, types.int_id),
+            (types.char_id, types.int_id),
+            (types.uchar_id, types.int_id),
+            (types.short_id, types.int_id),
+            (types.ushort_id, types.int_id),
+            (types.int_id, types.int_id),
+            (types.long_id, types.long_id),
+            (types.float_id, types.double_id),
+            (types.float16_id, types.double_id),
+            (types.double_id, types.double_id),
+            (types.longdouble_id, types.longdouble_id),
+            (types.complex_float_id, types.complex_float_id),
+            (types.void_ptr_id, types.void_ptr_id),
+        ] {
+            assert_eq!(types.default_argument_promote(from), to, "{from:?}");
+        }
+    }
+
     #[test]
     fn test_plain_char_signedness_follows_the_target() {
-        let x86 = TypeTable::new(&Target::new(Arch::X86_64, Os::Linux));
-        let arm = TypeTable::new(&Target::new(Arch::Aarch64, Os::Linux));
-
-        // The x86-64 psABI makes plain char signed; AAPCS64 makes it unsigned.
-        assert!(!x86.is_unsigned(x86.char_id), "x86-64: char is signed");
-        assert!(arm.is_unsigned(arm.char_id), "aarch64: char is unsigned");
+        // The x86-64 psABI makes plain char signed on Linux and Darwin alike;
+        // AAPCS64 makes it unsigned, and Apple arm64 overrides that to signed.
+        let tables: Vec<_> = [
+            (Arch::X86_64, Os::Linux, false),
+            (Arch::X86_64, Os::MacOS, false),
+            (Arch::Aarch64, Os::Linux, true),
+            (Arch::Aarch64, Os::MacOS, false),
+        ]
+        .into_iter()
+        .map(|(arch, os, unsigned)| {
+            let t = TypeTable::new(&Target::new(arch, os));
+            assert_eq!(t.is_unsigned(t.char_id), unsigned, "{arch}-{os}");
+            assert_eq!(
+                t.plain_char() == CharSignedness::Unsigned,
+                unsigned,
+                "{arch}-{os}"
+            );
+            t
+        })
+        .collect();
+        let arm = &tables[2];
 
         // The explicit spellings do not move with the target.
-        for t in [&x86, &arm] {
+        for t in &tables {
             assert!(!t.is_unsigned(t.schar_id), "signed char is always signed");
             assert!(
                 t.is_unsigned(t.uchar_id),
@@ -2912,8 +3084,8 @@ mod tests {
         }
 
         // Spelling is target-independent, and is what a type printer asks.
-        // Plain `char` is unsigned on aarch64 and is still written `char`.
-        for t in [&x86, &arm] {
+        // Plain `char` is unsigned on aarch64 Linux and is still written `char`.
+        for t in &tables {
             assert!(!t.spelled_unsigned(t.char_id));
             assert!(!t.spelled_unsigned(t.schar_id));
             assert!(t.spelled_unsigned(t.uchar_id));

@@ -415,7 +415,7 @@ impl X86_64CodeGen {
         }
     }
 
-    pub(super) fn emit_extend(&mut self, insn: &Instruction) {
+    pub(super) fn emit_extend(&mut self, insn: &Instruction, types: &TypeTable) {
         // Handle conversions to/from 128-bit integers
         // Check if target or source is an int128 pseudo
         let target_is_int128 = insn
@@ -494,10 +494,30 @@ impl X86_64CodeGen {
                 }
             }
             Opcode::Trunc => {
-                // Move source value to register, then mask to target size
+                // Move source value to register, then narrow it to the target
+                // size, extending by the destination type's own signedness --
+                // `movsbl` for a signed type, `movzbl` for an unsigned one --
+                // exactly as gcc and clang do. Masking unconditionally is
+                // self-consistent, because a consumer re-extends before it
+                // uses the value, but an optimized clang callee does not:
+                // `int take(signed char)` compiles to a bare `movl %edi, %eax`
+                // and reads whatever the caller left above the byte.
                 self.emit_move(src, dst_reg, 64);
-                // Truncate by masking to the target size
+                let signed = insn.typ.is_some_and(|t| !types.is_unsigned(t));
                 match insn.size {
+                    8 | 16 if signed => {
+                        // LIR: sign-extend byte/word to dword
+                        self.push_lir(X86Inst::Movsx {
+                            src_size: if insn.size == 8 {
+                                OperandSize::B8
+                            } else {
+                                OperandSize::B16
+                            },
+                            dst_size: OperandSize::B32,
+                            src: GpOperand::Reg(dst_reg),
+                            dst: dst_reg,
+                        });
+                    }
                     8 => {
                         // LIR: zero-extend byte to dword (masks to 8 bits)
                         self.push_lir(X86Inst::Movzx {

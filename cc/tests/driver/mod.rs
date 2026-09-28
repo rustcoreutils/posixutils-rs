@@ -1620,6 +1620,34 @@ fn driver_dash_mm_writes_a_dependency_rule() {
     assert!(!w.join("d.o").exists(), "-MM must not produce an object");
 }
 
+/// A header found through `-I` is the project's own, so `-MM` lists it,
+/// however it was spelled. Every directory on the `<...>` chain used to count
+/// as a system one, and `-MM` dropped `-I` headers along with `<stdio.h>`.
+#[test]
+fn driver_dash_mm_lists_dash_i_headers() {
+    let w = WorkDir::new("dash_mm_dash_i");
+    std::fs::create_dir(w.join("inc")).unwrap();
+    std::fs::write(w.join("inc/mine.h"), "int mine;\n").unwrap();
+    let src = w.write(
+        "d.c",
+        "#include <mine.h>\n#include <stdio.h>\nint main(void){return 0;}\n",
+    );
+
+    let inc = s(&w.join("inc"));
+    let r = run_c17(&["-MM", "-I", &inc, &s(&src)]);
+    assert!(r.success, "-MM failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("mine.h"),
+        "-I header missing: {:?}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("stdio.h"),
+        "system header listed: {:?}",
+        r.stdout
+    );
+}
+
 /// `-M` keeps the system headers `-MM` drops.
 #[test]
 fn driver_dash_m_includes_system_headers() {
@@ -2146,11 +2174,13 @@ fn driver_repeated_flags_are_accepted() {
 #[test]
 fn driver_repeated_flag_last_one_wins() {
     let work = WorkDir::new("last_wins");
-    // A constant branch survives at -O0 and is folded from -O1 up, so the
-    // assembly says which level actually ran.
+    // A branch on a variable that only propagation proves zero survives at
+    // -O0 and is folded from -O1 up, so the assembly says which level
+    // actually ran. (A constant condition would not do: its arm is dropped
+    // at every level.)
     let src = work.write(
         "a.c",
-        "extern int missing(void);\nint f(void){ if (0) return missing(); return 1; }\n",
+        "extern int missing(void);\nint f(void){ int z = 0; if (z) return missing(); return 1; }\n",
     );
     let asm = work.join("a.s");
 

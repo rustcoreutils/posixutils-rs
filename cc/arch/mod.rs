@@ -23,7 +23,7 @@ pub mod x86_64;
 // Re-export inline asm support traits and functions
 pub use codegen::{substitute_asm_operands, AsmOperandFormatter, AsmOperandSlot};
 
-use crate::target::{Arch, Os, Target};
+use crate::target::{Arch, CharSignedness, IntType, Os, Target};
 
 /// The first source position this function's instructions carry, for a backend
 /// diagnostic that has no better one.
@@ -43,30 +43,22 @@ pub(crate) fn func_pos(func: &crate::ir::Function) -> crate::diag::Position {
 
 /// Get architecture-specific predefined macros as (name, value) pairs
 pub fn get_arch_macros(target: &Target) -> Vec<(&'static str, Option<&'static str>)> {
-    // long is 64-bit on LP64 (Unix), 32-bit on LLP64 (Windows)
-    let long_size = if target.long_width == 64 { "8" } else { "4" };
-
-    // Signedness: __CHAR_UNSIGNED__ is defined only if char is unsigned
-    let char_unsigned: Option<&'static str> = if target.char_signed { None } else { Some("1") };
-
     let mut macros = vec![
         // Common architecture macros based on type sizes
         ("__CHAR_BIT__", Some("8")),
         ("__SIZEOF_POINTER__", Some("8")),
-        // Type sizes
-        ("__SIZEOF_SHORT__", Some("2")),
-        ("__SIZEOF_INT__", Some("4")),
-        ("__SIZEOF_LONG__", Some(long_size)),
-        ("__SIZEOF_LONG_LONG__", Some("8")),
+        // The integer sizes are with the rest of the integer facts, in
+        // `get_integer_macros`.
         ("__SIZEOF_FLOAT__", Some("4")),
         ("__SIZEOF_DOUBLE__", Some("8")),
     ];
 
-    // __CHAR_UNSIGNED__: only define when char is unsigned.
-    // An empty-body #define still satisfies #ifdef, so we must
-    // not add the macro at all when char is signed.
-    if let Some(val) = char_unsigned {
-        macros.push(("__CHAR_UNSIGNED__", Some(val)));
+    // __CHAR_UNSIGNED__ is defined exactly when plain `char` is unsigned, and
+    // is the only place that fact reaches <limits.h>'s CHAR_MIN/CHAR_MAX. An
+    // empty-body #define still satisfies #ifdef, so a signed target must not
+    // get the macro at all.
+    if target.plain_char == CharSignedness::Unsigned {
+        macros.push(("__CHAR_UNSIGNED__", Some("1")));
     }
 
     // LP64 macros only on LP64 targets (Unix), not on LLP64 (Windows)
@@ -82,300 +74,249 @@ pub fn get_arch_macros(target: &Target) -> Vec<(&'static str, Option<&'static st
         }
         Arch::Aarch64 => {
             macros.extend(aarch64::get_macros());
+            if target.os == Os::MacOS {
+                macros.extend(aarch64::get_darwin_macros());
+            }
         }
     }
 
     macros
 }
 
-/// Get type limit macros (for <limits.h> compatibility)
-pub fn get_limit_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
-    // long is 64-bit on LP64 (Unix), 32-bit on LLP64 (Windows)
-    let (long_max, long_width) = if target.long_width == 64 {
-        ("9223372036854775807L", "64")
-    } else {
-        ("2147483647L", "32")
-    };
-
-    vec![
-        // Character limits
-        ("__SCHAR_MAX__", "127"),
-        ("__SHRT_MAX__", "32767"),
-        ("__INT_MAX__", "2147483647"),
-        ("__LONG_MAX__", long_max),
-        ("__LONG_LONG_MAX__", "9223372036854775807LL"),
-        // Width macros
-        ("__SCHAR_WIDTH__", "8"),
-        ("__SHRT_WIDTH__", "16"),
-        ("__INT_WIDTH__", "32"),
-        ("__LONG_WIDTH__", long_width),
-        ("__LLONG_WIDTH__", "64"),
-        // Size type (always 64-bit on our targets)
-        ("__SIZE_MAX__", "18446744073709551615UL"),
-        ("__SIZE_WIDTH__", "64"),
-        ("__PTRDIFF_MAX__", "9223372036854775807L"),
-        ("__PTRDIFF_WIDTH__", "64"),
-        ("__INTPTR_MAX__", "9223372036854775807L"),
-        ("__INTPTR_WIDTH__", "64"),
-        ("__UINTPTR_MAX__", "18446744073709551615UL"),
-        // POSIX ssize_t limits (same as LONG_MAX/LONG_MIN on LP64)
-        ("SSIZE_MAX", long_max),
-    ]
+/// Which facts about an integer typedef its predefines state.
+///
+/// The set per typedef is gcc's, plus the `_WIDTH__`, `_C_SUFFIX__` and
+/// `_FMT*__` macros clang adds, which c17 has always provided.
+#[derive(Clone, Copy, Default)]
+struct Describe {
+    max: bool,
+    /// Only the three typedefs whose minimum `<stdint.h>` cannot write as
+    /// `-MAX - 1` or `0` without knowing the signedness get one.
+    min: bool,
+    width: bool,
+    suffix: bool,
+    fmt: bool,
 }
 
-/// Get type definition macros (for <stdint.h> and <stddef.h> compatibility)
-/// These define the underlying C type for various abstract types
-pub fn get_type_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
-    // The 64-bit exact/least/fast types are distinct types even at the same
-    // width, so getting this wrong makes our <stdint.h> and the host's
-    // disagree about int64_t — which is exactly what surfaced when
-    // <stdint.h> stopped being delegated. Every target is LP64, so the choice
-    // is the platform's convention, not the width: Darwin says `long long`.
-    let (s64, u64_) = if target.int64_is_long_long() {
-        ("long long int", "long long unsigned int")
-    } else {
-        ("long int", "long unsigned int")
-    };
-    let wint = wint_type(target);
-    vec![
-        // Fixed-width integer types
-        ("__INT8_TYPE__", "signed char"),
-        ("__INT16_TYPE__", "short"),
-        ("__INT32_TYPE__", "int"),
-        ("__INT64_TYPE__", s64),
-        ("__UINT8_TYPE__", "unsigned char"),
-        ("__UINT16_TYPE__", "unsigned short"),
-        ("__UINT32_TYPE__", "unsigned int"),
-        ("__UINT64_TYPE__", u64_),
-        // Least-width integer types (same as fixed-width for common targets)
-        ("__INT_LEAST8_TYPE__", "signed char"),
-        ("__INT_LEAST16_TYPE__", "short"),
-        ("__INT_LEAST32_TYPE__", "int"),
-        ("__INT_LEAST64_TYPE__", s64),
-        ("__UINT_LEAST8_TYPE__", "unsigned char"),
-        ("__UINT_LEAST16_TYPE__", "unsigned short"),
-        ("__UINT_LEAST32_TYPE__", "unsigned int"),
-        ("__UINT_LEAST64_TYPE__", u64_),
-        // Fast integer types (same as fixed-width for common targets)
-        ("__INT_FAST8_TYPE__", "signed char"),
-        ("__INT_FAST16_TYPE__", "short"),
-        ("__INT_FAST32_TYPE__", "int"),
-        ("__INT_FAST64_TYPE__", s64),
-        ("__UINT_FAST8_TYPE__", "unsigned char"),
-        ("__UINT_FAST16_TYPE__", "unsigned short"),
-        ("__UINT_FAST32_TYPE__", "unsigned int"),
-        ("__UINT_FAST64_TYPE__", u64_),
-        // Pointer-width types (always 64-bit on our targets)
-        ("__SIZE_TYPE__", "long unsigned int"),
-        ("__PTRDIFF_TYPE__", "long int"),
-        ("__INTPTR_TYPE__", "long int"),
-        ("__UINTPTR_TYPE__", "long unsigned int"),
-        ("__INTMAX_TYPE__", "long int"),
-        ("__UINTMAX_TYPE__", "long unsigned int"),
-        // Character types.
-        ("__WCHAR_TYPE__", "int"),
-        ("__WINT_TYPE__", wint),
-        ("__CHAR16_TYPE__", "unsigned short"),
-        ("__CHAR32_TYPE__", "unsigned int"),
-        // sig_atomic_t
-        ("__SIG_ATOMIC_TYPE__", "int"),
-    ]
+/// One of the library's integer typedefs: the `NAME` in `__NAME_TYPE__`, and
+/// the type the target gives it.
+struct Typedef {
+    name: String,
+    ty: IntType,
+    describe: Describe,
 }
 
-/// Get fixed-width integer limit macros (for <stdint.h> compatibility)
-pub fn get_stdint_limit_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
-    // The bounds follow `wint_t`'s own signedness; see `wint_type`.
-    let (wint_min, wint_max) = if wint_type(target) == "unsigned int" {
-        ("0U", "0xffffffffU")
-    } else {
-        ("(-2147483647 - 1)", "2147483647")
+/// Every integer typedef the predefines describe, with the target's type for
+/// each. The types come from [`Target`] alone; nothing here restates one.
+fn integer_typedefs(target: &Target) -> Vec<Typedef> {
+    let signed = Describe {
+        max: true,
+        width: true,
+        fmt: true,
+        ..Describe::default()
     };
-    vec![
-        // Signed fixed-width limits
-        ("__INT8_MAX__", "127"),
-        ("__INT16_MAX__", "32767"),
-        ("__INT32_MAX__", "2147483647"),
-        ("__INT64_MAX__", "9223372036854775807LL"),
-        // Unsigned fixed-width limits
-        ("__UINT8_MAX__", "255"),
-        ("__UINT16_MAX__", "65535"),
-        ("__UINT32_MAX__", "4294967295U"),
-        ("__UINT64_MAX__", "18446744073709551615ULL"),
-        // Least-width limits (same as fixed-width)
-        ("__INT_LEAST8_MAX__", "127"),
-        ("__INT_LEAST16_MAX__", "32767"),
-        ("__INT_LEAST32_MAX__", "2147483647"),
-        ("__INT_LEAST64_MAX__", "9223372036854775807LL"),
-        ("__UINT_LEAST8_MAX__", "255"),
-        ("__UINT_LEAST16_MAX__", "65535"),
-        ("__UINT_LEAST32_MAX__", "4294967295U"),
-        ("__UINT_LEAST64_MAX__", "18446744073709551615ULL"),
-        // Fast limits (same as fixed-width)
-        ("__INT_FAST8_MAX__", "127"),
-        ("__INT_FAST16_MAX__", "32767"),
-        ("__INT_FAST32_MAX__", "2147483647"),
-        ("__INT_FAST64_MAX__", "9223372036854775807LL"),
-        ("__UINT_FAST8_MAX__", "255"),
-        ("__UINT_FAST16_MAX__", "65535"),
-        ("__UINT_FAST32_MAX__", "4294967295U"),
-        ("__UINT_FAST64_MAX__", "18446744073709551615ULL"),
-        // Width macros for fixed-width types
-        ("__INT8_WIDTH__", "8"),
-        ("__INT16_WIDTH__", "16"),
-        ("__INT32_WIDTH__", "32"),
-        ("__INT64_WIDTH__", "64"),
-        ("__INT_LEAST8_WIDTH__", "8"),
-        ("__INT_LEAST16_WIDTH__", "16"),
-        ("__INT_LEAST32_WIDTH__", "32"),
-        ("__INT_LEAST64_WIDTH__", "64"),
-        ("__INT_FAST8_WIDTH__", "8"),
-        ("__INT_FAST16_WIDTH__", "16"),
-        ("__INT_FAST32_WIDTH__", "32"),
-        ("__INT_FAST64_WIDTH__", "64"),
-        // intmax_t limits (64-bit on all our targets)
-        ("__INTMAX_MAX__", "9223372036854775807L"),
-        ("__UINTMAX_MAX__", "18446744073709551615UL"),
-        ("__INTMAX_WIDTH__", "64"),
-        ("__UINTMAX_WIDTH__", "64"),
-        // wchar_t and wint_t limits
-        ("__WCHAR_MAX__", "2147483647"),
-        ("__WCHAR_WIDTH__", "32"),
-        ("__WINT_MAX__", wint_max),
-        ("__WINT_MIN__", wint_min),
-        ("__WINT_WIDTH__", "32"),
-        // sig_atomic_t limits
-        ("__SIG_ATOMIC_MAX__", "2147483647"),
-        ("__SIG_ATOMIC_WIDTH__", "32"),
-    ]
+    let unsigned = Describe {
+        width: false,
+        ..signed
+    };
+    let with_suffix = |d: Describe| Describe { suffix: true, ..d };
+    let bounded = Describe {
+        max: true,
+        min: true,
+        width: true,
+        ..Describe::default()
+    };
+
+    let mut out = Vec::new();
+    let mut add =
+        |name: String, ty: IntType, describe: Describe| out.push(Typedef { name, ty, describe });
+    for bits in [8, 16, 32, 64] {
+        let exact = target.exact_int_type(bits);
+        add(format!("INT{bits}"), exact, with_suffix(signed));
+        add(
+            format!("UINT{bits}"),
+            exact.to_unsigned(),
+            with_suffix(unsigned),
+        );
+    }
+    for bits in [8, 16, 32, 64] {
+        let least = target.least_int_type(bits);
+        add(format!("INT_LEAST{bits}"), least, signed);
+        add(format!("UINT_LEAST{bits}"), least.to_unsigned(), unsigned);
+    }
+    for bits in [8, 16, 32, 64] {
+        let fast = target.fast_int_type(bits);
+        add(format!("INT_FAST{bits}"), fast, signed);
+        add(format!("UINT_FAST{bits}"), fast.to_unsigned(), unsigned);
+    }
+    let intptr = target.intptr_type();
+    add("INTPTR".into(), intptr, signed);
+    add("UINTPTR".into(), intptr.to_unsigned(), unsigned);
+    let intmax = target.intmax_type();
+    add("INTMAX".into(), intmax, with_suffix(signed));
+    add(
+        "UINTMAX".into(),
+        intmax.to_unsigned(),
+        with_suffix(Describe {
+            width: true,
+            ..unsigned
+        }),
+    );
+    add("PTRDIFF".into(), target.ptrdiff_type(), signed);
+    add(
+        "SIZE".into(),
+        target.size_type(),
+        Describe {
+            width: true,
+            ..unsigned
+        },
+    );
+    add("WCHAR".into(), target.wchar_type(), bounded);
+    add("WINT".into(), target.wint_type(), bounded);
+    add("SIG_ATOMIC".into(), target.sig_atomic_type(), bounded);
+    add("CHAR16".into(), target.char16_type(), Describe::default());
+    add("CHAR32".into(), target.char32_type(), Describe::default());
+    out
 }
 
-/// Get integer constant suffix macros (for <stdint.h> compatibility)
-pub fn get_suffix_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
-    // Must agree with get_type_macros: an INT64_C() constant has to come out
-    // the same type as int64_t.
-    let (c64, uc64) = if target.int64_is_long_long() {
-        ("LL", "ULL")
-    } else {
-        ("L", "UL")
-    };
-    vec![
-        // Fixed-width suffixes
-        ("__INT8_C_SUFFIX__", ""),
-        ("__INT16_C_SUFFIX__", ""),
-        ("__INT32_C_SUFFIX__", ""),
-        ("__INT64_C_SUFFIX__", c64),
-        ("__UINT8_C_SUFFIX__", ""),
-        ("__UINT16_C_SUFFIX__", ""),
-        ("__UINT32_C_SUFFIX__", "U"),
-        ("__UINT64_C_SUFFIX__", uc64),
-        // intmax_t suffixes (64-bit uses L suffix on all our targets)
-        ("__INTMAX_C_SUFFIX__", "L"),
-        ("__UINTMAX_C_SUFFIX__", "UL"),
-    ]
+/// The `__*_TYPE__` macros: each typedef's type, spelled as gcc spells it.
+pub fn get_type_macros(target: &Target) -> Vec<(String, &'static str)> {
+    integer_typedefs(target)
+        .into_iter()
+        .map(|t| (format!("__{}_TYPE__", t.name), t.ty.spelling()))
+        .collect()
 }
 
-/// Get format specifier macros (for <inttypes.h> compatibility)
-pub fn get_format_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
-    vec![
-        // Signed format specifiers
-        ("__INT8_FMTd__", "\"hhd\""),
-        ("__INT8_FMTi__", "\"hhi\""),
-        ("__INT16_FMTd__", "\"hd\""),
-        ("__INT16_FMTi__", "\"hi\""),
-        ("__INT32_FMTd__", "\"d\""),
-        ("__INT32_FMTi__", "\"i\""),
-        ("__INT64_FMTd__", "\"lld\""),
-        ("__INT64_FMTi__", "\"lli\""),
-        // Unsigned format specifiers
-        ("__UINT8_FMTo__", "\"hho\""),
-        ("__UINT8_FMTu__", "\"hhu\""),
-        ("__UINT8_FMTx__", "\"hhx\""),
-        ("__UINT8_FMTX__", "\"hhX\""),
-        ("__UINT16_FMTo__", "\"ho\""),
-        ("__UINT16_FMTu__", "\"hu\""),
-        ("__UINT16_FMTx__", "\"hx\""),
-        ("__UINT16_FMTX__", "\"hX\""),
-        ("__UINT32_FMTo__", "\"o\""),
-        ("__UINT32_FMTu__", "\"u\""),
-        ("__UINT32_FMTx__", "\"x\""),
-        ("__UINT32_FMTX__", "\"X\""),
-        ("__UINT64_FMTo__", "\"llo\""),
-        ("__UINT64_FMTu__", "\"llu\""),
-        ("__UINT64_FMTx__", "\"llx\""),
-        ("__UINT64_FMTX__", "\"llX\""),
-        // Least-width format specifiers (same as fixed-width)
-        ("__INT_LEAST8_FMTd__", "\"hhd\""),
-        ("__INT_LEAST8_FMTi__", "\"hhi\""),
-        ("__INT_LEAST16_FMTd__", "\"hd\""),
-        ("__INT_LEAST16_FMTi__", "\"hi\""),
-        ("__INT_LEAST32_FMTd__", "\"d\""),
-        ("__INT_LEAST32_FMTi__", "\"i\""),
-        ("__INT_LEAST64_FMTd__", "\"lld\""),
-        ("__INT_LEAST64_FMTi__", "\"lli\""),
-        ("__UINT_LEAST8_FMTo__", "\"hho\""),
-        ("__UINT_LEAST8_FMTu__", "\"hhu\""),
-        ("__UINT_LEAST8_FMTx__", "\"hhx\""),
-        ("__UINT_LEAST8_FMTX__", "\"hhX\""),
-        ("__UINT_LEAST16_FMTo__", "\"ho\""),
-        ("__UINT_LEAST16_FMTu__", "\"hu\""),
-        ("__UINT_LEAST16_FMTx__", "\"hx\""),
-        ("__UINT_LEAST16_FMTX__", "\"hX\""),
-        ("__UINT_LEAST32_FMTo__", "\"o\""),
-        ("__UINT_LEAST32_FMTu__", "\"u\""),
-        ("__UINT_LEAST32_FMTx__", "\"x\""),
-        ("__UINT_LEAST32_FMTX__", "\"X\""),
-        ("__UINT_LEAST64_FMTo__", "\"llo\""),
-        ("__UINT_LEAST64_FMTu__", "\"llu\""),
-        ("__UINT_LEAST64_FMTx__", "\"llx\""),
-        ("__UINT_LEAST64_FMTX__", "\"llX\""),
-        // Fast format specifiers (same as fixed-width)
-        ("__INT_FAST8_FMTd__", "\"hhd\""),
-        ("__INT_FAST8_FMTi__", "\"hhi\""),
-        ("__INT_FAST16_FMTd__", "\"hd\""),
-        ("__INT_FAST16_FMTi__", "\"hi\""),
-        ("__INT_FAST32_FMTd__", "\"d\""),
-        ("__INT_FAST32_FMTi__", "\"i\""),
-        ("__INT_FAST64_FMTd__", "\"lld\""),
-        ("__INT_FAST64_FMTi__", "\"lli\""),
-        ("__UINT_FAST8_FMTo__", "\"hho\""),
-        ("__UINT_FAST8_FMTu__", "\"hhu\""),
-        ("__UINT_FAST8_FMTx__", "\"hhx\""),
-        ("__UINT_FAST8_FMTX__", "\"hhX\""),
-        ("__UINT_FAST16_FMTo__", "\"ho\""),
-        ("__UINT_FAST16_FMTu__", "\"hu\""),
-        ("__UINT_FAST16_FMTx__", "\"hx\""),
-        ("__UINT_FAST16_FMTX__", "\"hX\""),
-        ("__UINT_FAST32_FMTo__", "\"o\""),
-        ("__UINT_FAST32_FMTu__", "\"u\""),
-        ("__UINT_FAST32_FMTx__", "\"x\""),
-        ("__UINT_FAST32_FMTX__", "\"X\""),
-        ("__UINT_FAST64_FMTo__", "\"llo\""),
-        ("__UINT_FAST64_FMTu__", "\"llu\""),
-        ("__UINT_FAST64_FMTx__", "\"llx\""),
-        ("__UINT_FAST64_FMTX__", "\"llX\""),
-        // intmax_t format specifiers (64-bit uses l format on all our targets)
-        ("__INTMAX_FMTd__", "\"ld\""),
-        ("__INTMAX_FMTi__", "\"li\""),
-        ("__UINTMAX_FMTo__", "\"lo\""),
-        ("__UINTMAX_FMTu__", "\"lu\""),
-        ("__UINTMAX_FMTx__", "\"lx\""),
-        ("__UINTMAX_FMTX__", "\"lX\""),
-        // intptr_t format specifiers (64-bit uses l format)
-        ("__INTPTR_FMTd__", "\"ld\""),
-        ("__INTPTR_FMTi__", "\"li\""),
-        ("__UINTPTR_FMTo__", "\"lo\""),
-        ("__UINTPTR_FMTu__", "\"lu\""),
-        ("__UINTPTR_FMTx__", "\"lx\""),
-        ("__UINTPTR_FMTX__", "\"lX\""),
-        // ptrdiff_t format specifiers
-        ("__PTRDIFF_FMTd__", "\"ld\""),
-        ("__PTRDIFF_FMTi__", "\"li\""),
-        // size_t format specifiers
-        ("__SIZE_FMTo__", "\"lo\""),
-        ("__SIZE_FMTu__", "\"lu\""),
-        ("__SIZE_FMTx__", "\"lx\""),
-        ("__SIZE_FMTX__", "\"lX\""),
+/// gcc's `__INTN_C(c)` macros, as (name, suffix): each gives an integer
+/// constant the promoted type of `int_leastN_t` (C17 7.20.4.1), and `<stdint.h>`
+/// defines `INTN_C` as it.
+pub fn get_constant_fn_macros(target: &Target) -> Vec<(String, &'static str)> {
+    integer_typedefs(target)
+        .into_iter()
+        .filter(|t| t.describe.suffix)
+        .map(|t| (format!("__{}_C", t.name), t.ty.constant_suffix()))
+        .collect()
+}
+
+/// `t`'s largest value as a constant of type `t` (or of its promoted type,
+/// for one narrower than `int`): `0x7fffffffffffffffL`.
+fn max_literal(target: &Target, t: IntType) -> String {
+    format!("{:#x}{}", target.int_max(t), t.constant_suffix())
+}
+
+/// Every integer limit, width, size, constant-suffix and format predefine,
+/// derived from the target's types -- for the basic types (`<limits.h>`) and
+/// for each typedef (`<stdint.h>`, `<stddef.h>`, `<inttypes.h>`).
+pub fn get_integer_macros(target: &Target) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+
+    // The basic types. `__LLONG_WIDTH__` is clang's spelling of gcc's
+    // `__LONG_LONG_WIDTH__`; both are in use.
+    for (name, ty) in [
+        ("SCHAR", IntType::SChar),
+        ("SHRT", IntType::Short),
+        ("INT", IntType::Int),
+        ("LONG", IntType::Long),
+        ("LONG_LONG", IntType::LongLong),
+    ] {
+        out.push((format!("__{name}_MAX__"), max_literal(target, ty)));
+        out.push((
+            format!("__{name}_WIDTH__"),
+            target.int_width(ty).to_string(),
+        ));
+    }
+    out.push((
+        "__LLONG_WIDTH__".into(),
+        target.int_width(IntType::LongLong).to_string(),
+    ));
+    let sizeof = |ty: IntType| (target.int_width(ty) / 8).to_string();
+    for (name, ty) in [
+        ("SHORT", IntType::Short),
+        ("INT", IntType::Int),
+        ("LONG", IntType::Long),
+        ("LONG_LONG", IntType::LongLong),
+        ("SIZE_T", target.size_type()),
+        ("PTRDIFF_T", target.ptrdiff_type()),
+        ("WCHAR_T", target.wchar_type()),
+        ("WINT_T", target.wint_type()),
+    ] {
+        out.push((format!("__SIZEOF_{name}__"), sizeof(ty)));
+    }
+
+    for t in integer_typedefs(target) {
+        let (name, ty, d) = (&t.name, t.ty, t.describe);
+        if d.max {
+            out.push((format!("__{name}_MAX__"), max_literal(target, ty)));
+        }
+        if d.min {
+            let min = if ty.is_signed() {
+                format!("(-__{name}_MAX__ - 1)")
+            } else {
+                format!("0{}", ty.constant_suffix())
+            };
+            out.push((format!("__{name}_MIN__"), min));
+        }
+        if d.width {
+            out.push((
+                format!("__{name}_WIDTH__"),
+                target.int_width(ty).to_string(),
+            ));
+        }
+        if d.suffix {
+            out.push((format!("__{name}_C_SUFFIX__"), ty.constant_suffix().into()));
+        }
+        if d.fmt {
+            let convs: &[char] = if ty.is_signed() {
+                &['d', 'i']
+            } else {
+                &['o', 'u', 'x', 'X']
+            };
+            for c in convs {
+                out.push((
+                    format!("__{name}_FMT{c}__"),
+                    format!("\"{}{c}\"", ty.printf_length()),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// `__GCC_ATOMIC_*_LOCK_FREE` for each type `<stdatomic.h>` asks about -- 2,
+/// "always", or 0, "never", from the type's size -- and
+/// `__GCC_ATOMIC_TEST_AND_SET_TRUEVAL`.
+///
+/// Typed out per architecture, the list had no `CHAR16_T`, `CHAR32_T` or
+/// `WCHAR_T` entries, so `ATOMIC_WCHAR_T_LOCK_FREE` expanded to an undeclared
+/// identifier.
+pub fn get_atomic_macros(target: &Target) -> Vec<(String, String)> {
+    let int_bytes = |t: IntType| u64::from(target.int_width(t) / 8);
+    let mut out: Vec<(String, String)> = [
+        ("BOOL", 1),
+        ("CHAR", 1),
+        ("CHAR16_T", int_bytes(target.char16_type())),
+        ("CHAR32_T", int_bytes(target.char32_type())),
+        ("WCHAR_T", int_bytes(target.wchar_type())),
+        ("SHORT", int_bytes(IntType::Short)),
+        ("INT", int_bytes(IntType::Int)),
+        ("LONG", int_bytes(IntType::Long)),
+        ("LLONG", int_bytes(IntType::LongLong)),
+        ("POINTER", u64::from(target.pointer_width / 8)),
     ]
+    .into_iter()
+    .map(|(name, bytes)| {
+        let always = crate::target::atomic_is_lock_free(bytes);
+        (
+            format!("__GCC_ATOMIC_{name}_LOCK_FREE"),
+            if always { "2" } else { "0" }.to_string(),
+        )
+    })
+    .collect();
+    out.push((
+        "__GCC_ATOMIC_TEST_AND_SET_TRUEVAL".into(),
+        crate::target::ATOMIC_TEST_AND_SET_TRUEVAL.to_string(),
+    ));
+    out
 }
 
 pub fn get_additional_sizeof_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
@@ -386,15 +327,7 @@ pub fn get_additional_sizeof_macros(target: &Target) -> Vec<(&'static str, &'sta
     } else {
         "16"
     };
-    vec![
-        // size_t and ptrdiff_t sizes (always 8 bytes on 64-bit)
-        ("__SIZEOF_SIZE_T__", "8"),
-        ("__SIZEOF_PTRDIFF_T__", "8"),
-        // wchar_t and wint_t sizes
-        ("__SIZEOF_WCHAR_T__", "4"),
-        ("__SIZEOF_WINT_T__", "4"),
-        ("__SIZEOF_LONG_DOUBLE__", sizeof_long_double),
-    ]
+    vec![("__SIZEOF_LONG_DOUBLE__", sizeof_long_double)]
 }
 
 /// Get miscellaneous macros
@@ -405,14 +338,22 @@ pub fn get_misc_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
         // Alignment
         ("__BIGGEST_ALIGNMENT__", "16"),
         ("__BOOL_WIDTH__", "8"),
-        // Byte order (all our supported architectures are little-endian)
+        // Byte order (all our supported architectures are little-endian),
+        // and the order of the words of a multi-word floating type, which
+        // follows it on both.
         ("__ORDER_LITTLE_ENDIAN__", "1234"),
         ("__ORDER_BIG_ENDIAN__", "4321"),
         ("__ORDER_PDP_ENDIAN__", "3412"),
         ("__BYTE_ORDER__", "__ORDER_LITTLE_ENDIAN__"),
+        ("__FLOAT_WORD_ORDER__", "__ORDER_LITTLE_ENDIAN__"),
         ("__LITTLE_ENDIAN__", "1"),
         // Floating point base
         ("__FLT_RADIX__", "2"),
+        // C17 5.2.4.2.2p9: every floating operation is evaluated in its own
+        // type -- SSE on x86-64, the FP registers on aarch64, never x87 --
+        // so 0. <float.h>'s FLT_EVAL_METHOD and glibc's float_t/double_t
+        // (<bits/flt-eval-method.h>) both read this.
+        ("__FLT_EVAL_METHOD__", "0"),
         ("__FINITE_MATH_ONLY__", "0"),
     ]
 }
@@ -546,26 +487,6 @@ pub fn get_float_limit_macros(target: &Target) -> Vec<(&'static str, &'static st
     macros
 }
 
-/// The type behind `wint_t`, which is not the same on every target.
-///
-/// `wint_t` has to hold every `wchar_t` value *plus* `WEOF`, and the two
-/// platforms solve that differently. glibc makes it `unsigned int`, so `WEOF`
-/// -- `(wint_t)-1` -- is `0xffffffff`, a value no `wchar_t` reaches. Darwin
-/// makes it `int`, following `__darwin_ct_rune_t`, and spends the negative
-/// half of the range instead.
-///
-/// It has to be the platform's choice rather than ours: the C library's own
-/// headers typedef `wint_t` from their own definition, and `__mbstate_t` holds
-/// one. Predefining the other signedness puts the compiler and the library in
-/// disagreement about a type they share -- which is how this was wrong in the
-/// first place, as plain `int` on both.
-fn wint_type(target: &Target) -> &'static str {
-    match target.os {
-        Os::MacOS => "int",
-        Os::Linux | Os::FreeBSD => "unsigned int",
-    }
-}
-
 /// Whether `__float128` exists on this target; see `TypeTable::has_float128`,
 /// which must agree with this.
 pub fn has_float128(target: &Target) -> bool {
@@ -651,13 +572,87 @@ mod tests {
     use super::*;
     use crate::target::Os;
 
-    fn macro_value(macros: &[(&'static str, &'static str)], name: &str) -> String {
+    fn macro_value<N: AsRef<str>, V: AsRef<str>>(macros: &[(N, V)], name: &str) -> String {
         macros
             .iter()
-            .find(|(n, _)| *n == name)
+            .find(|(n, _)| n.as_ref() == name)
             .unwrap_or_else(|| panic!("{} is not defined", name))
             .1
+            .as_ref()
             .to_string()
+    }
+
+    fn all_targets() -> Vec<Target> {
+        let mut out = Vec::new();
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            for os in [Os::Linux, Os::MacOS, Os::FreeBSD] {
+                out.push(Target::new(arch, os));
+            }
+        }
+        out
+    }
+
+    /// gcc's `__INTN_C(c)` family exists for exactly the typedefs with a
+    /// `_C_SUFFIX__`, and pastes that suffix.
+    #[test]
+    fn constant_fn_macros_paste_the_typedef_suffix() {
+        for target in all_targets() {
+            let fns = get_constant_fn_macros(&target);
+            let ints = get_integer_macros(&target);
+            let names: Vec<&str> = fns.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(
+                names,
+                [
+                    "__INT8_C",
+                    "__UINT8_C",
+                    "__INT16_C",
+                    "__UINT16_C",
+                    "__INT32_C",
+                    "__UINT32_C",
+                    "__INT64_C",
+                    "__UINT64_C",
+                    "__INTMAX_C",
+                    "__UINTMAX_C"
+                ]
+            );
+            for (name, suffix) in &fns {
+                assert_eq!(
+                    macro_value(&ints, &format!("{name}_SUFFIX__")),
+                    *suffix,
+                    "{name} on {}-{}",
+                    target.arch,
+                    target.os
+                );
+            }
+        }
+    }
+
+    /// Every type `<stdatomic.h>` names in an `ATOMIC_*_LOCK_FREE` has its
+    /// predefine, and on every target here all ten are always lock-free, as
+    /// gcc says for both Linux targets.
+    #[test]
+    fn atomic_lock_free_macros_cover_stdatomic() {
+        for target in all_targets() {
+            let macros = get_atomic_macros(&target);
+            for name in [
+                "BOOL", "CHAR", "CHAR16_T", "CHAR32_T", "WCHAR_T", "SHORT", "INT", "LONG", "LLONG",
+                "POINTER",
+            ] {
+                assert_eq!(
+                    macro_value(&macros, &format!("__GCC_ATOMIC_{name}_LOCK_FREE")),
+                    "2",
+                    "{name} on {}-{}",
+                    target.arch,
+                    target.os
+                );
+            }
+            assert_eq!(
+                macro_value(&macros, "__GCC_ATOMIC_TEST_AND_SET_TRUEVAL"),
+                "1"
+            );
+        }
+        assert!(!crate::target::atomic_is_lock_free(16));
+        assert!(!crate::target::atomic_is_lock_free(3));
     }
 
     /// `long double` is a different type on each target, and these macros are
@@ -704,6 +699,44 @@ mod tests {
         }
     }
 
+    /// `__CHAR_UNSIGNED__` is defined exactly when plain `char` is unsigned,
+    /// once, and per OS as well as per architecture: Apple arm64 makes `char`
+    /// signed where AAPCS64 makes it unsigned, and `<limits.h>` derives
+    /// `CHAR_MIN`/`CHAR_MAX` from this macro alone.
+    #[test]
+    fn char_unsigned_macro_follows_the_target() {
+        for (arch, os, unsigned) in [
+            (Arch::X86_64, Os::Linux, false),
+            (Arch::X86_64, Os::MacOS, false),
+            (Arch::Aarch64, Os::Linux, true),
+            (Arch::Aarch64, Os::MacOS, false),
+        ] {
+            let target = Target::new(arch, os);
+            let macros = get_arch_macros(&target);
+            let defs: Vec<_> = macros
+                .iter()
+                .filter(|(n, _)| *n == "__CHAR_UNSIGNED__")
+                .collect();
+            assert_eq!(
+                defs.len(),
+                usize::from(unsigned),
+                "__CHAR_UNSIGNED__ on {arch}-{os}"
+            );
+            // The macro and the type system read the same fact.
+            assert_eq!(
+                unsigned,
+                target.plain_char == CharSignedness::Unsigned,
+                "{arch}-{os}"
+            );
+            let bits = macros.iter().find(|(n, _)| *n == "__CHAR_BIT__");
+            assert_eq!(bits, Some(&("__CHAR_BIT__", Some("8"))));
+            assert_eq!(
+                macro_value(&get_integer_macros(&target), "__SCHAR_MAX__"),
+                "0x7f"
+            );
+        }
+    }
+
     /// Our `<stdint.h>` has to name the same type the host's headers do.
     /// Every target is LP64, so the width does not settle it: Linux says
     /// `long`, Darwin says `long long`, and they are distinct types.
@@ -721,13 +754,147 @@ mod tests {
                 "__INT64_TYPE__ on {:?}",
                 os
             );
-            // INT64_C() must produce that same type.
+            // INT64_C() must produce that same type, and so must INT64_MAX,
+            // and PRId64 must print it.
+            let ints = get_integer_macros(&target);
             assert_eq!(
-                macro_value(&get_suffix_macros(&target), "__INT64_C_SUFFIX__"),
+                macro_value(&ints, "__INT64_C_SUFFIX__"),
                 suffix,
-                "__INT64_C_SUFFIX__ on {:?}",
-                os
+                "__INT64_C_SUFFIX__ on {os}"
             );
+            assert_eq!(
+                macro_value(&ints, "__INT64_MAX__"),
+                format!("0x7fffffffffffffff{suffix}"),
+                "__INT64_MAX__ on {os}"
+            );
+            assert_eq!(
+                macro_value(&ints, "__INT64_FMTd__"),
+                format!("\"{}d\"", suffix.to_lowercase()),
+                "__INT64_FMTd__ on {os}"
+            );
+        }
+    }
+
+    /// Every limit, constant suffix and format a typedef's predefines state
+    /// has to describe the type its `__*_TYPE__` names. They were typed out
+    /// one macro at a time, and `__INT64_MAX__` said `LL` and
+    /// `__INT64_FMTd__` said `"lld"` for an `int64_t` that is `long` on
+    /// Linux. This reads the facts back out of the macro text alone.
+    #[test]
+    fn integer_macros_agree_with_their_type() {
+        // (spelling, width, signed, promoted constant suffix, length modifier)
+        let table: &[(&str, u32, bool, &str, &str)] = &[
+            ("signed char", 8, true, "", "hh"),
+            ("unsigned char", 8, false, "", "hh"),
+            ("short int", 16, true, "", "h"),
+            ("short unsigned int", 16, false, "", "h"),
+            ("int", 32, true, "", ""),
+            ("unsigned int", 32, false, "U", ""),
+            ("long int", 64, true, "L", "l"),
+            ("long unsigned int", 64, false, "UL", "l"),
+            ("long long int", 64, true, "LL", "ll"),
+            ("long long unsigned int", 64, false, "ULL", "ll"),
+        ];
+        for target in all_targets() {
+            let types = get_type_macros(&target);
+            let ints = get_integer_macros(&target);
+            let lookup = |n: &str| ints.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+            for (tname, spelling) in &types {
+                let name = &tname[2..tname.len() - "_TYPE__".len()];
+                let &(_, width, signed, suffix, len) = table
+                    .iter()
+                    .find(|row| row.0 == *spelling)
+                    .unwrap_or_else(|| panic!("{tname} is {spelling}"));
+                let what = format!("{name} ({spelling}) on {}-{}", target.arch, target.os);
+                if let Some(max) = lookup(&format!("__{name}_MAX__")) {
+                    let bits = width - u32::from(signed);
+                    let want = format!("{:#x}{suffix}", u64::MAX >> (64 - bits));
+                    assert_eq!(max, want, "max of {what}");
+                }
+                if let Some(min) = lookup(&format!("__{name}_MIN__")) {
+                    let want = if signed {
+                        format!("(-__{name}_MAX__ - 1)")
+                    } else {
+                        format!("0{suffix}")
+                    };
+                    assert_eq!(min, want, "min of {what}");
+                }
+                if let Some(w) = lookup(&format!("__{name}_WIDTH__")) {
+                    assert_eq!(w, width.to_string(), "width of {what}");
+                }
+                if let Some(sfx) = lookup(&format!("__{name}_C_SUFFIX__")) {
+                    assert_eq!(sfx, suffix, "constant suffix of {what}");
+                }
+                for c in ['d', 'i', 'o', 'u', 'x', 'X'] {
+                    if let Some(fmt) = lookup(&format!("__{name}_FMT{c}__")) {
+                        assert_eq!(fmt, format!("\"{len}{c}\""), "format of {what}");
+                        assert_eq!(signed, matches!(c, 'd' | 'i'), "{c} for {what}");
+                    }
+                }
+            }
+            // The three minimums <stdint.h> cannot compute without knowing
+            // the signedness.
+            for name in ["WCHAR", "WINT", "SIG_ATOMIC"] {
+                assert!(
+                    lookup(&format!("__{name}_MIN__")).is_some(),
+                    "__{name}_MIN__"
+                );
+            }
+        }
+    }
+
+    /// Every integer predefine is in the implementation's namespace (C17
+    /// 7.1.3): `SSIZE_MAX` was predefined, where POSIX puts it in
+    /// `<limits.h>` and a program without that header may use the name.
+    #[test]
+    fn integer_macros_are_reserved_names() {
+        let reserved = |n: &str| {
+            n.starts_with("__")
+                || (n.starts_with('_') && n[1..].starts_with(|c: char| c.is_ascii_uppercase()))
+        };
+        for target in all_targets() {
+            for (name, _) in get_integer_macros(&target)
+                .into_iter()
+                .chain(get_atomic_macros(&target))
+                .chain(
+                    get_type_macros(&target)
+                        .into_iter()
+                        .map(|(n, v)| (n, v.to_string())),
+                )
+                .chain(
+                    get_constant_fn_macros(&target)
+                        .into_iter()
+                        .map(|(n, v)| (n, v.to_string())),
+                )
+            {
+                assert!(reserved(&name), "{name} on {}-{}", target.arch, target.os);
+            }
+            for (name, _) in get_arch_macros(&target) {
+                assert!(reserved(name), "{name} on {}-{}", target.arch, target.os);
+            }
+        }
+    }
+
+    /// `__arm64__` and `__arm64` are Apple's spellings: clang defines them
+    /// for Darwin arm64 only, and gcc for aarch64 Linux defines neither. Code
+    /// reads `__arm64__` as "Apple", so on Linux it must be absent.
+    #[test]
+    fn arm64_spelling_is_apple_only() {
+        for target in all_targets() {
+            let macros = get_arch_macros(&target);
+            let apple_arm64 = target.arch == Arch::Aarch64 && target.os == Os::MacOS;
+            for name in ["__arm64__", "__arm64"] {
+                let defs = macros.iter().filter(|(n, _)| *n == name).count();
+                assert_eq!(
+                    defs,
+                    usize::from(apple_arm64),
+                    "{name} on {}-{}",
+                    target.arch,
+                    target.os
+                );
+            }
+            let aarch64 = macros.iter().any(|(n, _)| *n == "__aarch64__");
+            assert_eq!(aarch64, target.arch == Arch::Aarch64);
         }
     }
 }

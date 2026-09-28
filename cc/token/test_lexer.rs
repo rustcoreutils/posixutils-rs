@@ -946,6 +946,11 @@ fn test_write_token_emits_source_bytes() {
         b"caf\xc3\xa9"
     );
 
+    // bytes_payload takes bytes that need not be text, one `char` each.
+    assert_eq!(bytes_payload(b"caf\xc3\xa9"), literal_payload("caf\u{e9}"));
+    let raw = b"\xe9\x00\xff";
+    assert_eq!(payload_bytes(&bytes_payload(raw)).collect::<Vec<_>>(), raw);
+
     // payload_text reads one back out, for the consumers that want Rust
     // text: a header name to open, an `__asm__` symbol, a message to
     // print. Reading a payload as if it were already text gave mojibake.

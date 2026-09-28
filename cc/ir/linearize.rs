@@ -801,7 +801,13 @@ impl<'a> Linearizer<'a> {
                 Opcode::SetNe
             };
 
-            let mut insn = Instruction::binop(opcode, result, val, zero, to_typ, to_size);
+            // A comparison carries its *operand* type, not its result type:
+            // that is what `emit_compare` sizes the compare from, and what
+            // every comparison built in `linearize_emit` passes. Carrying
+            // `_Bool` here sized it at 8 bits, which `.max(32)` made a 32-bit
+            // `cmpl`, so `(_Bool)0x100000000L` compared only the low half and
+            // came out 0.
+            let mut insn = Instruction::binop(opcode, result, val, zero, from_typ, from_size);
             insn.src_size = from_size;
             insn.src_typ = Some(from_typ);
             self.emit(insn);
@@ -2616,6 +2622,18 @@ impl<'a> Linearizer<'a> {
         // `cvttss2si`, which raises `FE_INVALID` for a NaN.
         if self.types.kind(cast_type) == TypeKind::Void {
             return src;
+        }
+
+        // C17 6.3.1.2: a conversion to `_Bool` compares against zero. It is
+        // not a truncation, and `_Bool` is an integer type, so a floating
+        // operand fell into the float-to-integer arm below and `(_Bool)0.5`
+        // became a `cvttsd2si` -- 0, where the value is plainly not zero.
+        // `emit_convert` carries the rule for every source type; this path
+        // has a conversion of its own and reached it only for an integer.
+        if self.types.kind(cast_type) == TypeKind::Bool
+            && self.types.kind(src_type) != TypeKind::Bool
+        {
+            return self.emit_convert(src, src_type, cast_type);
         }
 
         // Emit conversion if needed

@@ -8721,6 +8721,49 @@ void f(int x) { switch (x) { d = sqrt(d); case 1: d = 1.0; } }
     assert!(!f.blocks.is_empty());
 }
 
+/// A conversion to `_Bool` is a comparison against zero, and a comparison
+/// carries its operand type so the backend sizes it from the operands.
+///
+/// Carrying `_Bool` sized the compare at 8 bits, which became a 32-bit `cmpl`
+/// -- `(_Bool)0x100000000L` then read only the low half. The instruction now
+/// carries `long`, as every comparison built in `linearize_emit` does.
+#[test]
+fn test_bool_conversion_compares_at_the_operand_width() {
+    let src = "void f(long x) { _Bool b = x; (void)b; }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let cmp = f
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .find(|i| i.op == Opcode::SetNe)
+        .expect("a _Bool conversion compares against zero");
+    assert_eq!(
+        cmp.size, 64,
+        "the compare is sized by its operand, not _Bool"
+    );
+}
+
+/// An explicit cast to `_Bool` from a floating type takes the same rule, and
+/// not the float-to-integer truncation beside it: `(_Bool)0.5` is 1.
+#[test]
+fn test_cast_to_bool_from_a_float_does_not_truncate() {
+    let src = "void f(double x) { _Bool b = (_Bool)x; (void)b; }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let insns: Vec<_> = f.blocks.iter().flat_map(|bb| bb.insns.iter()).collect();
+    assert!(
+        insns.iter().any(|i| i.op == Opcode::FCmpONe),
+        "the cast compares against zero"
+    );
+    assert!(
+        !insns
+            .iter()
+            .any(|i| matches!(i.op, Opcode::FCvtS | Opcode::FCvtU)),
+        "and does not convert the float to an integer"
+    );
+}
+
 /// x86-64 Linux, whose x87 `long double` holds `0x1p62L + 1.0L` exactly --
 /// a test about that names the target rather than taking the host's, since
 /// on an arm64 Mac `long double` is `double`.

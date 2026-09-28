@@ -5764,11 +5764,22 @@ fn test_rounding_at_o0() {
     // The call the program wrote, as gcc makes it: a `float` argument is
     // narrowed only where c17 computes the answer itself.
     assert_eq!(called("ceil(f)", &["f"]), "ceil");
-    // Unless the answer is a constant, which it is at every level; a root's
-    // domain error and a direction-dependent `rint` are not.
-    for src in ["ceil(2.5)", "sqrt(4.0)", "fmin(1.0, 2.0)"] {
+    // Unless the answer is a constant, which it is at every level -- and it
+    // is the constant *itself*, not the in-place form: at -O0 nothing folds
+    // that form afterwards, and a back end with no instruction for the
+    // function lowers it back to the library call, which is how `fmin` came
+    // to answer one thing at -O0 and another at -O2. A root's domain error
+    // and a direction-dependent `rint` are not constants.
+    for (src, want) in [
+        ("ceil(2.5)", 3.0),
+        ("sqrt(4.0)", 2.0),
+        ("fmin(1.0, 2.0)", 1.0),
+    ] {
         let (expr, _, _, _) = parse_expr_under(src, &[], o0).unwrap();
-        inline_call_args(src, &expr);
+        let ExprKind::FloatLit(v) = expr.kind else {
+            panic!("{src} at -O0 is not a constant: {:?}", expr.kind);
+        };
+        assert_eq!(v.to_f64(), want, "{src}");
     }
     assert_eq!(called("sqrt(-1.0)", &[]), "sqrt");
     assert_eq!(called("rint(2.5)", &[]), "rint");

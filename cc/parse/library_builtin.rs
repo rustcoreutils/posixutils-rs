@@ -628,10 +628,21 @@ impl Parser<'_> {
             narrowed,
         };
         let call = Self::typed_expr(call, ret, pos);
+        if in_place {
+            return call;
+        }
         // A call whose answer is a constant is that constant at every level,
         // as under gcc, so that it initializes a static object at `-O0` too.
-        if in_place || self.is_constant_call(&call) {
-            return call;
+        //
+        // The constant itself, not merely the in-place form: at `-O0`
+        // nothing folds that form afterwards, and a back end with no
+        // instruction for the function lowers it to the library call --
+        // x86-64 has none for `fmin`, `fmax` or `fma`. So `-O0` answered
+        // whatever the platform's libm does and `-O2` answered the fold, and
+        // `fmin(0.0, -0.0)` came out `+0` at one level and `-0` at the
+        // other. `floor` and `fabs` hid this by becoming instructions.
+        if let Some(v) = self.constant_call_value(&call) {
+            return Self::typed_expr(ExprKind::FloatLit(v), ret, pos);
         }
         let ExprKind::InlineLibraryCall { args, .. } = call.kind else {
             unreachable!("built as an in-place call just above")
@@ -639,12 +650,12 @@ impl Parser<'_> {
         self.libm_call(lb.bare, ret, &params, args, pos)
     }
 
-    /// Whether the in-place call `call` folds to a constant: every argument
-    /// is one, and the answer does not depend on anything at run time -- not
-    /// a root's domain error, nor a `rint` of a value that is not already an
-    /// integer, whose answer is the current rounding direction's.
-    fn is_constant_call(&self, call: &Expr) -> bool {
-        crate::constexpr::eval_float(self, ConstScope::StaticInitializer, call).is_some()
+    /// The constant the in-place call `call` folds to, if it does: every
+    /// argument is one, and the answer does not depend on anything at run
+    /// time -- not a root's domain error, nor a `rint` of a value that is not
+    /// already an integer, whose answer is the current rounding direction's.
+    fn constant_call_value(&self, call: &Expr) -> Option<crate::float::FloatVal> {
+        crate::constexpr::eval_float(self, ConstScope::StaticInitializer, call)
     }
 
     /// A block memory function's length, folded to a `size_t` literal when

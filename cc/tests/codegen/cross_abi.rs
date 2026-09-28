@@ -1915,6 +1915,71 @@ int pass_sc(int x) { return take_sc((signed char)x); }
     }
 }
 
+/// An HFA's members are counted through every level of nesting, arrays of
+/// aggregates included.
+///
+/// AAPCS64 5.9.5 defines a homogeneous floating-point aggregate by the
+/// floating-point members a composite has when it is flattened, so
+/// `struct { struct { float x, y; } p[2]; }` is four floats and goes in
+/// s0-s3. `try_classify_hfa` recursed into a nested *struct* member but its
+/// array arm asked only whether the element was a scalar floating type, so an
+/// array of structs answered "not an HFA" and the whole aggregate went in
+/// general registers:
+///
+/// ```text
+///     c17    stp x0, x1, [x29, #16]     ; the parameter, in x0 and x1
+///     clang  fadd s0, s0, s3            ; s0-s3
+/// ```
+///
+/// Both sides are asserted, and a `struct { float x, y; }[2]` that is *too
+/// long* to be an HFA -- five floats -- is the control, since flattening
+/// must still respect the four-element bound.
+#[test]
+fn codegen_aarch64_hfa_counts_through_an_array_of_aggregates() {
+    let src = r#"
+struct Pair { float x, y; };
+struct NEST { struct Pair p[2]; };
+struct BIG  { struct Pair p[3]; };
+
+float take(struct NEST n);
+float sum(struct NEST n) { return n.p[0].x + n.p[1].y; }
+float call(void) { struct NEST n; n.p[0].x = 1; n.p[0].y = 2;
+                   n.p[1].x = 3; n.p[1].y = 4; return take(n) + 1.0f; }
+
+float take_big(struct BIG b);
+float big(void) { struct BIG b; b.p[0].x = 1; return take_big(b) + 1.0f; }
+"#;
+    for triple in [AARCH64_LINUX, AARCH64_DARWIN] {
+        let a = asm_for_with("hfa_nested", triple, src, &["-O1"]);
+
+        // The callee receives four floats, so the fourth is in s3.
+        let body = body_of(&a, "sum");
+        assert!(
+            body.contains("s3"),
+            "{triple}: a four-float HFA arrives in s0-s3:\n{body}"
+        );
+        assert!(
+            !body.contains("stp x0, x1"),
+            "{triple}: and not in general registers:\n{body}"
+        );
+
+        // The caller puts it there too.
+        let body = body_of(&a, "call");
+        assert!(
+            body.contains("s3"),
+            "{triple}: the caller passes a four-float HFA in s0-s3:\n{body}"
+        );
+
+        // The control: six floats is past the four-element bound, so it is
+        // not an HFA and must go the ordinary way.
+        let body = body_of(&a, "big");
+        assert!(
+            !body.contains("s5"),
+            "{triple}: six floats exceed the HFA bound:\n{body}"
+        );
+    }
+}
+
 /// A pointer comparison must select the *unsigned* condition code.
 ///
 /// C17 6.5.8 compares addresses, and an address is unsigned. The behavioural

@@ -344,17 +344,26 @@ impl Aapcs64Abi {
             return None;
         }
 
-        // For arrays, check if element type is float/double
+        // For arrays, the element contributes however many members it has.
         if kind == TypeKind::Array {
-            if let Some(elem_ty) = typ.base {
-                let elem_kind = types.kind(elem_ty);
-                if let Some(base) = self.is_hfa_base_type(elem_kind, elem_ty, types) {
-                    if let Some(len) = typ.array_size {
-                        if len >= 1 && len <= MAX_HFA_ELEMENTS as usize {
-                            return Some((base, len as u8));
-                        }
-                    }
-                }
+            let elem_ty = typ.base?;
+            let len = typ.array_size?;
+            let elem_kind = types.kind(elem_ty);
+            // A scalar element is one member; an aggregate element is as
+            // many as it flattens to. AAPCS64 5.9.5 counts a composite's
+            // floating-point members through every level of nesting, and the
+            // struct arm below already recurses -- only this one asked
+            // whether the element was itself a floating type, so
+            // `struct { struct { float x, y; } p[2]; }` answered "not an
+            // HFA" and four floats went in general registers where gcc and
+            // clang use s0-s3.
+            let (base, per_element) = match self.is_hfa_base_type(elem_kind, elem_ty, types) {
+                Some(base) => (base, 1u8),
+                None => self.try_classify_hfa(elem_ty, types)?,
+            };
+            let total = len.checked_mul(per_element as usize)?;
+            if (1..=MAX_HFA_ELEMENTS as usize).contains(&total) {
+                return Some((base, total as u8));
             }
             return None;
         }

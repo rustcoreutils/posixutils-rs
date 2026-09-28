@@ -1611,3 +1611,69 @@ int main(void) {
         );
     }
 }
+
+/// A cast to `void` converts nothing, including from a complex type.
+///
+/// C17 6.3.2.2: the operand is evaluated and its value discarded. The cast
+/// path checks for `void` -- but only after the arm that converts a complex
+/// operand to a real type, and `void` is not complex, so a complex operand
+/// took that arm and was "converted" to `void` as though it were an
+/// arithmetic type. At -O0 that is a `cvttsd2si`, which raises `FE_INVALID`
+/// for a NaN real part:
+///
+/// ```text
+///     double _Complex z;   (void)z;   ->   cvttsd2sil %xmm15, %eax
+/// ```
+///
+/// The optimizer dropped the dead conversion at -O1 and above, so only -O0
+/// raised the exception -- one more place where the levels disagreed about
+/// the same program. The effects in the operand must still happen.
+#[test]
+fn c99_void_cast_of_a_complex_operand_converts_nothing() {
+    let code = r#"
+#include <fenv.h>
+#include <math.h>
+#pragma STDC FENV_ACCESS ON
+
+int calls;
+static double _Complex bump(void) { calls++; return 1.0 + 2.0i; }
+
+int main(void) {
+    double _Complex z;
+    __real__ z = NAN;
+    __imag__ z = 1.0;
+
+    feclearexcept(FE_ALL_EXCEPT);
+    (void)z;
+    if (fetestexcept(FE_INVALID)) return 1;
+
+    /* Every complex width takes the same path. */
+    float _Complex fz;
+    __real__ fz = NAN;
+    __imag__ fz = 1.0f;
+    feclearexcept(FE_ALL_EXCEPT);
+    (void)fz;
+    if (fetestexcept(FE_INVALID)) return 2;
+
+    /* The value is discarded, but the operand is still evaluated. */
+    calls = 0;
+    (void)bump();
+    if (calls != 1) return 3;
+
+    /* The control: a real NaN was already right (a cast to void converts
+       nothing there either). */
+    double d = NAN;
+    feclearexcept(FE_ALL_EXCEPT);
+    (void)d;
+    if (fetestexcept(FE_INVALID)) return 4;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("void_cast_complex", code, &[opt.to_string()]),
+            0,
+            "{opt}"
+        );
+    }
+}

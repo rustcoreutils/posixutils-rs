@@ -8784,6 +8784,28 @@ fn test_imag_of_a_real_operand_emits_its_side_effects() {
     assert_eq!(adds, 1, "the assignment inside __imag__ still happens");
 }
 
+/// A cast to `void` converts nothing, from a complex operand as well as a
+/// real one.
+///
+/// The `void` check sat after the arm that converts a complex operand to a
+/// real type, and `void` is not complex, so `(void)z` took that arm and
+/// emitted a conversion -- a `cvttsd2si` at -O0, which raises `FE_INVALID`
+/// for a NaN real part. `test_void_cast_of_a_float_converts_nothing` covers
+/// the real operand; this is the complex one.
+#[test]
+fn test_void_cast_of_a_complex_converts_nothing() {
+    let src = "void f(double _Complex z, float _Complex w) { (void)z; (void)w; }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let converts = f
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| matches!(i.op, Opcode::FCvtS | Opcode::FCvtU | Opcode::FCvtF))
+        .count();
+    assert_eq!(converts, 0);
+}
+
 /// x86-64 Linux, whose x87 `long double` holds `0x1p62L + 1.0L` exactly --
 /// a test about that names the target rather than taking the host's, since
 /// on an arm64 Mac `long double` is `double`.

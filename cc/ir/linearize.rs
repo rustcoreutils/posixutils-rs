@@ -2600,6 +2600,19 @@ impl<'a> Linearizer<'a> {
             return self.emit_complex_nonzero(inner_expr);
         }
 
+        // C17 6.3.2.2: a cast to `void` evaluates the operand and discards
+        // the value, converting nothing. This has to come before the complex
+        // arms as well as before the arithmetic ones: `void` is neither
+        // complex nor floating, so a complex operand took the
+        // complex-to-real arm just below and a floating one the
+        // float-to-integer arm further down, and `(void)z` became a
+        // `cvttsd2si` that raises `FE_INVALID` for a NaN. The optimizer
+        // deleted the dead conversion at -O1 and above, so only -O0 raised
+        // it.
+        if self.types.kind(cast_type) == TypeKind::Void {
+            return self.linearize_expr(inner_expr);
+        }
+
         if self.types.is_complex(src_type) && !self.types.is_complex(cast_type) {
             return self.emit_complex_to_real(inner_expr, cast_type);
         }
@@ -2615,14 +2628,6 @@ impl<'a> Linearizer<'a> {
         }
 
         let src = self.linearize_expr(inner_expr);
-
-        // C17 6.3.2.2: a cast to `void` discards the value and converts
-        // nothing. `void` is not a floating type, so a floating operand fell
-        // into the float-to-integer arm below and `(void)x` became a
-        // `cvttss2si`, which raises `FE_INVALID` for a NaN.
-        if self.types.kind(cast_type) == TypeKind::Void {
-            return src;
-        }
 
         // C17 6.3.1.2: a conversion to `_Bool` compares against zero. It is
         // not a truncation, and `_Bool` is an integer type, so a floating

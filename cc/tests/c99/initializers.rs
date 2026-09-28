@@ -2444,12 +2444,10 @@ int main(void) {
     if (!same(s, (one + i) - t60)) return 7;
     if (!same(r, (one + t60 + i) / (one + i))) return 8;
     if (!same(m, (three + t58 + 5.0L * i) * (seven - t57 * i))) return 9;
-#ifndef __APPLE__
     /* Apple's `__divdc3` is compiler-rt's, which scales by `logb` where
-       libgcc's divides by Smith's method; c17 folds as libgcc computes, and
-       for this quotient the two differ in the last place. */
+       libgcc's divides by Smith's method; c17 models both and folds as the
+       target's own routine computes, so the two agree here too. */
     if (!same(d, (three + t58 + 5.0L * i) / (seven - two * i))) return 10;
-#endif
 
     volatile _Complex int n = -9 + 38i, e = 5 + 6i;
     _Complex int rq = n / e;

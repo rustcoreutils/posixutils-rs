@@ -2286,6 +2286,14 @@ impl TypeTable {
     /// `GCC_4.3.0`. Apple's arm64 runtime has none of them, and clang does not
     /// offer the type there either, so a program using it would compile and
     /// then fail to link on every operation it performed.
+    /// The target these types were built for.
+    ///
+    /// The arch and the OS are what anything here depends on; the rest of a
+    /// `Target` is derived from those two.
+    pub fn target(&self) -> Target {
+        Target::new(self.target_arch, self.target_os)
+    }
+
     pub fn has_float128(&self) -> bool {
         crate::arch::has_float128(&Target {
             arch: self.target_arch,

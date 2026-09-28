@@ -78,8 +78,7 @@ fn constant_complex_mul_and_div_leave_no_call() {
 }
 
 /// An infinite or NaN operand, a zero divisor and a product that overflows
-/// are left to the routine, which raises what they raise; so is any Apple
-/// target, whose compiler-rt routines c17 does not model.
+/// are left to the routine, which raises what they raise.
 #[test]
 fn what_the_routine_must_compute_stays_a_call() {
     let src = "
@@ -109,10 +108,15 @@ fn what_the_routine_must_compute_stays_a_call() {
             );
         }
     }
+    // Darwin's routines are compiler-rt's, which c17 models beside
+    // libgcc's, so a constant folds there as it does anywhere else.
     let src = CONSTANT.replace("TY", "double");
     let asm = asm_for_with("cfold_darwin", AARCH64_DARWIN, &src, &["-O2"]);
     for callee in ["___muldc3", "___divdc3"] {
-        assert!(asm.contains(callee), "Darwin keeps {callee}:\n{asm}");
+        assert!(
+            !asm.contains(callee),
+            "Darwin folds a constant rather than calling {callee}:\n{asm}"
+        );
     }
 }
 
@@ -307,5 +311,76 @@ fn float16_folds_exactly_on_x86_64() {
     for opt in ["-O0", "-O2"] {
         let code = compile_and_run("f16_exact", src, &[opt.to_string()]);
         assert_eq!(code, 0, "{opt}: check {code} disagrees");
+    }
+}
+
+/// A folded product or quotient equals the one the target's own routine
+/// computes, on the host, for operands the folder folds.
+///
+/// The fold and the routine have to agree, and which routine that is depends
+/// on the target: Linux ships libgcc's `__mul?c3`/`__div?c3`, Apple and
+/// FreeBSD ship compiler-rt's, and the two divide differently -- libgcc by
+/// Smith's method and its own thresholds, compiler-rt by the textbook
+/// formula with the divisor scaled from `logb` of its larger half. c17
+/// folded as libgcc divides wherever it folded at all, so on Darwin a static
+/// quotient sat one place from the `__divdc3` beside it:
+///
+/// ```text
+///     static double _Complex s = (0.1 + 0.7i) / (0.3 + 0.9i);
+///     static   0.73333333333333328152
+///     runtime  0.73333333333333339255
+/// ```
+///
+/// Each pair below is computed twice in the one program -- once as a static
+/// initializer, which c17 folds, and once from `volatile` operands, which
+/// calls the routine -- so the comparison is against whatever the host
+/// actually links, and the test says nothing about which routine that is.
+#[test]
+fn folded_complex_arithmetic_matches_the_hosts_own_routine() {
+    let mut src = String::from(
+        r#"
+#include <complex.h>
+static int bad;
+static void chk(double _Complex s, double _Complex r) {
+    if (__real__ s != __real__ r || __imag__ s != __imag__ r) bad++;
+}
+"#,
+    );
+    // Magnitudes from subnormal-adjacent to huge, so the scaling each
+    // routine does for an extreme divisor is exercised as well as the
+    // ordinary case neither scales.
+    let vals = [
+        "0.1", "0.7", "0.3", "0.9", "2.25", "1e-5", "1e5", "123.456", "7.0", "1e-100", "1e100",
+        "6.02e23",
+    ];
+    let mut cases = Vec::new();
+    for (i, a) in vals.iter().enumerate() {
+        for (j, b) in vals.iter().enumerate() {
+            let (c, d) = (vals[(i + 5) % vals.len()], vals[(j + 7) % vals.len()]);
+            let sign = if (i + j) % 2 == 0 { "-" } else { "" };
+            cases.push((i * vals.len() + j, *a, *b, c, format!("{sign}{d}")));
+        }
+    }
+    for (n, a, b, c, d) in &cases {
+        src.push_str(&format!(
+            "static double _Complex sm{n} = ({a} + {b}i) * ({c} + {d}i);\n\
+             static double _Complex sd{n} = ({a} + {b}i) / ({c} + {d}i);\n"
+        ));
+    }
+    src.push_str("int main(void) {\n");
+    for (n, a, b, c, d) in &cases {
+        src.push_str(&format!(
+            "  {{ volatile double _Complex x = {a} + {b}i, y = {c} + {d}i;\n\
+             \x20   chk(sm{n}, x * y); chk(sd{n}, x / y); }}\n"
+        ));
+    }
+    src.push_str("  return bad;\n}\n");
+
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("fold_vs_routine", &src, &[opt.to_string()]),
+            0,
+            "{opt}: a folded product or quotient differs from the routine's"
+        );
     }
 }

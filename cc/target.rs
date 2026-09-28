@@ -12,6 +12,7 @@
 // preprocessing and code generation.
 //
 
+use crate::float::{ComplexDivision, ComplexRoutineFormat, Contraction};
 use std::fmt;
 
 /// The value of `__STDC_VERSION__`. c17 compiles one language: C17, the
@@ -543,6 +544,31 @@ impl Target {
             Os::Linux if shared_mode => TlsAccess::ElfDescriptor,
             Os::Linux | Os::FreeBSD => TlsAccess::ElfStatic,
         }
+    }
+
+    /// Which `__div?c3` this target ships, in `routine`'s format.
+    ///
+    /// Linux ships libgcc's, whose Smith's-method steps fuse on aarch64 at
+    /// the two formats that have an `fmadd`; every other target here ships
+    /// compiler-rt's, which scales the divisor by a power of two taken from
+    /// `logb` of its larger half instead. The two differ in the last place
+    /// for operands neither has to scale, so a constant folded as one
+    /// divides disagrees with the other's run-time answer -- which is what
+    /// `(0.1 + 0.7i) / (0.3 + 0.9i)` did on Darwin, folded as libgcc divides
+    /// and computed by the `__divdc3` beside it.
+    ///
+    /// Apple is measured; FreeBSD is taken to be compiler-rt's because it
+    /// builds with clang and ships compiler-rt, and is not tested here.
+    pub fn complex_division(&self, routine: ComplexRoutineFormat) -> ComplexDivision {
+        if self.os != Os::Linux {
+            return ComplexDivision::CompilerRt;
+        }
+        ComplexDivision::Libgcc(match (self.arch, routine) {
+            (Arch::Aarch64, ComplexRoutineFormat::Binary32 | ComplexRoutineFormat::Binary64) => {
+                Contraction::Fused
+            }
+            _ => Contraction::Separate,
+        })
     }
 }
 

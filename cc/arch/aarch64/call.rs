@@ -124,10 +124,18 @@ impl Aarch64CodeGen {
         args_start: usize,
         types: &TypeTable,
     ) -> i32 {
-        let variadic_start = insn
-            .variadic_arg_start
-            .unwrap_or(insn.src.len())
-            .max(args_start);
+        // `variadic_arg_start` counts the call's own arguments, while
+        // `insn.src` carries the hidden sret pointer ahead of them, so the two
+        // are one apart for a call that returns in memory. Comparing them
+        // directly left the named range empty -- `.max(args_start)` raises the
+        // index but never shifts it -- and every argument was stacked as
+        // though it were variadic, so `struct Big f(int n, ...)` read garbage
+        // for `n` where Apple clang puts 7 in w0. `args_start` is zero for a
+        // call that returns in registers, which is why only sret was wrong.
+        let variadic_start = match insn.variadic_arg_start {
+            Some(v) => (args_start + v).min(insn.src.len()),
+            None => insn.src.len(),
+        };
         let named = self.assign_arg_registers(
             insn,
             args_start..variadic_start,

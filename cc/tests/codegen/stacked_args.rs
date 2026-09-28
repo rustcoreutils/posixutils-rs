@@ -149,6 +149,63 @@ int call(void) { return vf(0, 1, 2, 3, 4, 5, 6, 7, 'c', 5, 6L); }
     );
 }
 
+/// A Darwin variadic call that also returns a struct in memory keeps its
+/// named arguments in registers.
+///
+/// `variadic_arg_start` counts the call's *own* arguments, but `insn.src`
+/// carries the hidden sret pointer ahead of them, so the two are one apart
+/// for a call that returns in memory. `setup_darwin_variadic_args` compared
+/// them directly -- `.max(args_start)` raises the index but never shifts it
+/// -- so the named range came out empty and every argument, `n` included,
+/// was stacked as though it were variadic:
+///
+/// ```text
+///     str x9, [sp]        ; 7, the named argument, belongs in w0
+///     str x9, [sp, #8]    ; 11
+///     str x9, [sp, #16]   ; 22
+/// ```
+///
+/// Apple clang emits `mov w0, #7` and stacks only the two variadic ones, so
+/// the callee read garbage for `n`. The non-sret call beside it is the
+/// control: it was always right, and `args_start` is zero there, so the fix
+/// must not move it.
+#[test]
+fn codegen_darwin_sret_variadic_keeps_its_named_argument_in_a_register() {
+    let src = r#"
+struct Big { long a, b, c, d; };
+struct Big f(int n, ...);
+struct Big sret_call(void) { return f(7, 11, 22); }
+
+int g(int n, ...);
+int plain_call(void) { return g(7, 11, 22); }
+"#;
+    let asm = asm_for_with("darwin_sret_va", AARCH64_DARWIN, src, &["-O0"]);
+
+    // The named argument is in w0, and only the two variadic ones are stacked.
+    let body = body_of(&asm, "sret_call");
+    assert!(
+        body.contains("movz w0, #7") || body.contains("mov w0, #7"),
+        "the named argument of an sret variadic call goes in w0:\n{body}"
+    );
+    assert_eq!(
+        sp_stores(body).len(),
+        2,
+        "only the two variadic arguments are stacked:\n{body}"
+    );
+
+    // The control: without sret the same call was already correct.
+    let body = body_of(&asm, "plain_call");
+    assert!(
+        body.contains("movz w0, #7") || body.contains("mov w0, #7"),
+        "a non-sret variadic call still passes its named argument in w0:\n{body}"
+    );
+    assert_eq!(
+        sp_stores(body).len(),
+        2,
+        "and still stacks only the variadic ones:\n{body}"
+    );
+}
+
 /// The interop sources below are built only where a second compiler can run
 /// the result: Apple clang on an arm64 Mac, or gcc on Linux. An x86-64 Mac
 /// has neither, so they are not compiled there.

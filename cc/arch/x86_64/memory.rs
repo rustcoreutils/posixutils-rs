@@ -281,6 +281,93 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Load `mem_size` bits from `mem` into `dst`, reading no byte outside
+    /// the object.
+    ///
+    /// A size that is not a natural access width -- 3, 5, 6 or 7 bytes, which
+    /// is what a small composite gives -- is read as two overlapping halves
+    /// rather than rounded up to the next width, which reads up to three
+    /// bytes past the end and faults when the object ends a page.
+    fn emit_gp_load(&mut self, mem: MemAddr, mem_size: u32, reg_size: u32, dst: Reg) {
+        match (crate::ir::memexpand::overlapping_halves(mem_size), &mem) {
+            (Some((width, high)), MemAddr::BaseOffset { base, offset }) => {
+                let (base, offset) = (*base, *offset);
+                self.emit_overlapped_load(base, offset, width, high, dst);
+            }
+            // A RIP-relative address carries no addend to bump, so take the
+            // symbol's address first and read the halves through that.
+            (Some((width, high)), MemAddr::RipRelative(sym)) => {
+                let addr = MemAddr::RipRelative(sym.clone());
+                self.push_lir(X86Inst::Lea {
+                    addr,
+                    dst: Reg::R11,
+                });
+                self.emit_overlapped_load(Reg::R11, 0, width, high, dst);
+            }
+            // Thread-local and GOT forms name a location rather than a base
+            // this can offset from; a ragged one keeps the wide read.
+            _ => {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::from_bits(reg_size),
+                    src: GpOperand::Mem(mem),
+                    dst: GpOperand::Reg(dst),
+                });
+            }
+        }
+    }
+
+    /// Read `width + high` bytes at `offset(base)` into `dst` as two
+    /// overlapping halves: `width` bytes at the front and `width` bytes at
+    /// `high`, which `overlapping_halves` chose so the second ends exactly on
+    /// the object's last byte.
+    ///
+    /// The halves share their middle bytes, which come back the same from
+    /// both reads, so OR-ing them is exact -- and neither read passes the end
+    /// of the object.
+    fn emit_overlapped_load(&mut self, base: Reg, offset: i32, width: i64, high: i64, dst: Reg) {
+        // R10 and R11 are the only scratch registers, and `dst` is either an
+        // allocated register or R10 -- never R11. R11 also carries the
+        // computed address at several callers, which is why the half that
+        // lands in `base` is read last.
+        let scratch = Reg::R11;
+        let halves = [(offset, dst), (offset + high as i32, scratch)];
+        let halves = if dst == base {
+            [halves[1], halves[0]]
+        } else {
+            // `base` may be R11, and then the high half overwrites it -- which
+            // is already the last read, so the natural order stands.
+            halves
+        };
+        for (at, into) in halves {
+            let addr = MemAddr::BaseOffset { base, offset: at };
+            if width == 4 {
+                // `movl` zeroes the upper half; `movw` would not.
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Mem(addr),
+                    dst: GpOperand::Reg(into),
+                });
+            } else {
+                self.push_lir(X86Inst::Movzx {
+                    src_size: OperandSize::from_bits(width as u32 * 8),
+                    dst_size: OperandSize::B32,
+                    src: GpOperand::Mem(addr),
+                    dst: into,
+                });
+            }
+        }
+        self.push_lir(X86Inst::Shl {
+            size: OperandSize::B64,
+            count: ShiftCount::Imm(high as u8 * 8),
+            dst: scratch,
+        });
+        self.push_lir(X86Inst::Or {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(scratch),
+            dst,
+        });
+    }
+
     pub(super) fn emit_load(&mut self, insn: &Instruction, types: &TypeTable) {
         let mem_size = insn.size;
         let reg_size = insn.size.max(32);
@@ -501,16 +588,15 @@ impl X86_64CodeGen {
                     }
                 } else {
                     // 32/64-bit load
-                    let op_size = OperandSize::from_bits(reg_size);
-                    // LIR: simple Mov
-                    self.push_lir(X86Inst::Mov {
-                        size: op_size,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                    self.emit_gp_load(
+                        MemAddr::BaseOffset {
                             base: r,
                             offset: insn.displacement(),
-                        }),
-                        dst: GpOperand::Reg(dst_reg),
-                    });
+                        },
+                        mem_size,
+                        reg_size,
+                        dst_reg,
+                    );
                 }
             }
             Loc::Stack(offset) => {
@@ -540,12 +626,7 @@ impl X86_64CodeGen {
                         }
                     } else {
                         // LIR: regular load from stack
-                        let op_size = OperandSize::from_bits(reg_size);
-                        self.push_lir(X86Inst::Mov {
-                            size: op_size,
-                            src: GpOperand::Mem(stack_addr),
-                            dst: GpOperand::Reg(dst_reg),
-                        });
+                        self.emit_gp_load(stack_addr, mem_size, reg_size, dst_reg);
                     }
                 } else {
                     // Spilled address - load address first, then load from that address
@@ -581,15 +662,15 @@ impl X86_64CodeGen {
                         }
                     } else {
                         // LIR: regular load through R11
-                        let op_size = OperandSize::from_bits(reg_size);
-                        self.push_lir(X86Inst::Mov {
-                            size: op_size,
-                            src: GpOperand::Mem(MemAddr::BaseOffset {
+                        self.emit_gp_load(
+                            MemAddr::BaseOffset {
                                 base: Reg::R11,
                                 offset: insn.displacement(),
-                            }),
-                            dst: GpOperand::Reg(dst_reg),
-                        });
+                            },
+                            mem_size,
+                            reg_size,
+                            dst_reg,
+                        );
                     }
                 }
             }
@@ -637,12 +718,12 @@ impl X86_64CodeGen {
                                 });
                             }
                         } else {
-                            let op_size = OperandSize::from_bits(reg_size);
-                            self.push_lir(X86Inst::Mov {
-                                size: op_size,
-                                src: GpOperand::Mem(MemAddr::FsBase(Reg::R11)),
-                                dst: GpOperand::Reg(dst_reg),
-                            });
+                            self.emit_gp_load(
+                                MemAddr::FsBase(Reg::R11),
+                                mem_size,
+                                reg_size,
+                                dst_reg,
+                            );
                         }
                     } else {
                         // Local Exec TLS model for local symbols: %fs:symbol@TPOFF
@@ -665,12 +746,7 @@ impl X86_64CodeGen {
                                 });
                             }
                         } else {
-                            let op_size = OperandSize::from_bits(reg_size);
-                            self.push_lir(X86Inst::Mov {
-                                size: op_size,
-                                src: GpOperand::Mem(mem_addr),
-                                dst: GpOperand::Reg(dst_reg),
-                            });
+                            self.emit_gp_load(mem_addr, mem_size, reg_size, dst_reg);
                         }
                     }
                 } else if self.needs_got_access(&name) {
@@ -704,15 +780,15 @@ impl X86_64CodeGen {
                             });
                         }
                     } else {
-                        let op_size = OperandSize::from_bits(reg_size);
-                        self.push_lir(X86Inst::Mov {
-                            size: op_size,
-                            src: GpOperand::Mem(MemAddr::BaseOffset {
+                        self.emit_gp_load(
+                            MemAddr::BaseOffset {
                                 base: Reg::R11,
                                 offset: insn.displacement(),
-                            }),
-                            dst: GpOperand::Reg(dst_reg),
-                        });
+                            },
+                            mem_size,
+                            reg_size,
+                            dst_reg,
+                        );
                     }
                 } else {
                     // Regular global: RIP-relative addressing
@@ -737,12 +813,7 @@ impl X86_64CodeGen {
                         }
                     } else {
                         // LIR: regular load from global
-                        let op_size = OperandSize::from_bits(reg_size);
-                        self.push_lir(X86Inst::Mov {
-                            size: op_size,
-                            src: GpOperand::Mem(mem_addr),
-                            dst: GpOperand::Reg(dst_reg),
-                        });
+                        self.emit_gp_load(mem_addr, mem_size, reg_size, dst_reg);
                     }
                 }
             }
@@ -774,15 +845,15 @@ impl X86_64CodeGen {
                     }
                 } else {
                     // LIR: regular load through R11
-                    let op_size = OperandSize::from_bits(reg_size);
-                    self.push_lir(X86Inst::Mov {
-                        size: op_size,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                    self.emit_gp_load(
+                        MemAddr::BaseOffset {
                             base: Reg::R11,
                             offset: insn.displacement(),
-                        }),
-                        dst: GpOperand::Reg(dst_reg),
-                    });
+                        },
+                        mem_size,
+                        reg_size,
+                        dst_reg,
+                    );
                 }
             }
         }

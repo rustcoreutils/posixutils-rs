@@ -376,6 +376,51 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// Read `width + high` bytes at `[base, #offset]` into `dst` as two
+    /// overlapping halves: `width` bytes at the front and `width` bytes at
+    /// `high`, which `overlapping_halves` chose so the second ends exactly on
+    /// the object's last byte.
+    ///
+    /// The halves share their middle bytes, which come back the same from
+    /// both reads, so OR-ing them is exact -- and neither read passes the end
+    /// of the object. Rounding the access up to the next width instead, which
+    /// is what a bare `from_bits` does, reads up to three bytes too far and
+    /// faults whenever a 3, 5, 6 or 7 byte object ends a page.
+    fn emit_overlapped_load(&mut self, base: Reg, offset: i32, width: i64, high: i64, dst: Reg) {
+        // `dst` is an allocated register or X9, so it is never X16 or X17;
+        // `base` may be either, since that is what carries a computed address.
+        let scratch = if base == Reg::X16 { Reg::X17 } else { Reg::X16 };
+        let size = OperandSize::from_bits(width as u32 * 8);
+        // Whichever half lands in `base` has to be read last: after
+        // coalescing, `dst` can be the very register holding the address.
+        // `scratch` is chosen above so that it never is.
+        let halves = [(offset, dst), (offset + high as i32, scratch)];
+        let halves = if dst == base {
+            [halves[1], halves[0]]
+        } else {
+            halves
+        };
+        for (at, into) in halves {
+            self.push_lir(Aarch64Inst::Ldr {
+                size,
+                addr: MemAddr::BaseOffset { base, offset: at },
+                dst: into,
+            });
+        }
+        self.push_lir(Aarch64Inst::Lsl {
+            size: OperandSize::B64,
+            src: scratch,
+            amount: GpOperand::Imm(high * 8),
+            dst: scratch,
+        });
+        self.push_lir(Aarch64Inst::Orr {
+            size: OperandSize::B64,
+            src1: dst,
+            src2: GpOperand::Reg(scratch),
+            dst,
+        });
+    }
+
     pub(super) fn emit_load(&mut self, insn: &Instruction, types: &TypeTable) {
         let mem_size = insn.size;
         let reg_size = insn.size.max(32);
@@ -477,13 +522,22 @@ impl Aarch64CodeGen {
                     dst: dst_reg,
                 });
             }
-            _ => {
-                this.push_lir(Aarch64Inst::Ldr {
-                    size: OperandSize::from_bits(mem_size),
-                    addr: mem_addr,
-                    dst: dst_reg,
-                });
-            }
+            _ => match (
+                crate::ir::memexpand::overlapping_halves(mem_size),
+                &mem_addr,
+            ) {
+                (Some((width, high)), MemAddr::BaseOffset { base, offset }) => {
+                    let (base, offset) = (*base, *offset);
+                    this.emit_overlapped_load(base, offset, width, high, dst_reg);
+                }
+                _ => {
+                    this.push_lir(Aarch64Inst::Ldr {
+                        size: OperandSize::from_bits(mem_size),
+                        addr: mem_addr,
+                        dst: dst_reg,
+                    });
+                }
+            },
         };
 
         match self.compute_mem_addr(addr, insn.displacement(), Reg::X16) {
@@ -491,8 +545,18 @@ impl Aarch64CodeGen {
                 emit_load_lir(self, mem_addr);
             }
             ComputedAddr::Global(name) => {
-                let load_size = OperandSize::from_bits(mem_size);
-                self.emit_load_global(&name, dst_reg, load_size);
+                match crate::ir::memexpand::overlapping_halves(mem_size) {
+                    // A ragged global is read through its own address, so
+                    // that the two halves can be addressed separately.
+                    Some((width, high)) => {
+                        self.emit_load_addr(&name, Reg::X17);
+                        self.emit_overlapped_load(Reg::X17, 0, width, high, dst_reg);
+                    }
+                    None => {
+                        let load_size = OperandSize::from_bits(mem_size);
+                        self.emit_load_global(&name, dst_reg, load_size);
+                    }
+                }
             }
         }
 

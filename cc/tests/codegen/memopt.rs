@@ -1051,6 +1051,10 @@ fn codegen_composite_argument_is_read_at_its_own_size() {
         ("_Complex short", "c"),
         ("struct S1 { char a[1]; }", "s"),
         ("struct S2 { char a[2]; }", "s"),
+        ("struct S3 { char a[3]; }", "s"),
+        ("struct S5 { char a[5]; }", "s"),
+        ("struct S6 { char a[6]; }", "s"),
+        ("struct S7 { char a[7]; }", "s"),
         ("struct S9 { char a[9]; }", "s"),
         ("struct S12 { int a[3]; }", "i"),
         ("struct S15 { char a[15]; }", "s"),
@@ -1108,6 +1112,63 @@ int main(void) {{
                 got, 0,
                 "{opt}: `{ty}` argument -- a non-zero status here is the read \
                  running past the object into the guard page",
+            );
+        }
+    }
+}
+
+/// A composite whose size is not a natural access width -- 3, 5, 6 or 7 bytes
+/// -- is assembled from two overlapping reads, so the guard-page test above
+/// proves only that nothing was read too far. This one proves the bytes that
+/// *were* read all arrive, in order: the halves overlap, and getting the
+/// shift or the OR wrong drops or doubles a middle byte silently.
+#[test]
+fn codegen_ragged_composite_keeps_every_byte() {
+    for n in [3usize, 5, 6, 7] {
+        let decl = format!("struct S {{ unsigned char a[{n}]; }};");
+        // The callee rebuilds the value it was handed; the caller compares.
+        let callee = format!(
+            "{decl}\n\
+             unsigned long take(struct S v) {{\n\
+             \x20   unsigned long r = 0;\n\
+             \x20   for (unsigned i = 0; i < {n}; i++) r |= (unsigned long)v.a[i] << (i * 8);\n\
+             \x20   return r;\n\
+             }}\n"
+        );
+        let caller = format!(
+            r#"
+#include <stdio.h>
+{decl}
+unsigned long take(struct S v);
+int main(void) {{
+    struct S s;
+    unsigned long want = 0;
+    for (unsigned i = 0; i < {n}; i++) {{
+        s.a[i] = (unsigned char)(0x11 * (i + 1));
+        want |= (unsigned long)s.a[i] << (i * 8);
+    }}
+    struct S *p = &s;                 /* read through a pointer, as the ABI path does */
+    unsigned long got = take(*p);
+    if (got != want) {{
+        printf("%zu bytes: got %lx want %lx\n", (size_t){n}, got, want);
+        return 1;
+    }}
+    return 0;
+}}
+"#
+        );
+        for opt in ["-O0", "-O2"] {
+            let got = compile_and_run_two_units(
+                &format!("ragged_{n}"),
+                &caller,
+                &callee,
+                &[opt.to_string()],
+            );
+            assert_eq!(
+                got, 0,
+                "{opt}: a {n}-byte struct passed by value came back with the \
+                 wrong bytes -- the two overlapping halves were not recombined \
+                 correctly",
             );
         }
     }

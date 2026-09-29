@@ -155,13 +155,18 @@ fn called(asm: &str) -> Vec<String> {
 /// Compile `body` at `opts` for the host and for aarch64, and hand what
 /// it calls to `check`.
 fn for_each_target(body: &str, opts: &[&str], check: impl Fn(&[String], &str)) {
-    let src = format!("{PROTOTYPES}{body}\n");
+    for_each_target_src(&format!("{PROTOTYPES}{body}\n"), opts, check);
+}
+
+/// The same, for a test that must spell its own prototypes -- one that binds
+/// a name [`PROTOTYPES`] declares as a function to something else.
+fn for_each_target_src(src: &str, opts: &[&str], check: impl Fn(&[String], &str)) {
     for target in [None, Some("aarch64-unknown-linux-gnu")] {
         let mut args = opts.to_vec();
         if let Some(t) = target {
             args.extend(["--target", t]);
         }
-        let asm = asm_for_at("stdio_fold", &src, &args);
+        let asm = asm_for_at("stdio_fold", src, &args);
         check(&called(&asm), target.unwrap_or("host"));
     }
 }
@@ -308,5 +313,76 @@ int main(void) {
             .code()
             .unwrap_or(-1);
         assert_eq!(code, 0, "{opt}");
+    }
+}
+
+/// A library function a fold would call has to *be* that function.
+///
+/// `int puts;` binds a name C17 7.1.3 reserves to an object, so the program
+/// is undefined -- but gcc and clang degrade gracefully and keep the call,
+/// where c17 folded `printf("hi\n")` to `puts` and emitted `call puts`
+/// against the four-byte `.bss` object it had just defined. That runs:
+///
+/// ```text
+///     int puts;  int main(void) { printf("ok\n"); }   ->   bus error
+/// ```
+#[test]
+fn builtins_stdio_fold_declines_a_callee_that_is_not_a_function() {
+    // Each case binds the name a fold would reach for to an object, and
+    // names the call that has to survive instead.
+    // (the shadowed name, the object binding it, the body, the calls left)
+    let cases: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "puts",
+            "int puts;",
+            "void f(void) { printf(\"hi\\n\"); }",
+            &["printf"],
+        ),
+        (
+            "putchar",
+            "int putchar;",
+            "void f(void) { printf(\"a\"); }",
+            &["printf"],
+        ),
+        (
+            "fputc",
+            "int fputc;",
+            "void f(FILE *fp, int c) { fprintf(fp, \"%c\", c); }",
+            &["fprintf"],
+        ),
+        // This one rewrites in two steps -- `fprintf` to `fputs`, then
+        // `fputs` of a known length to `fwrite`. Only the second step is
+        // barred, so it stops at `fputs`, which writes the same bytes and
+        // is a real function. Degrading to the next legitimate call is the
+        // point; what must not happen is a call to the object.
+        (
+            "fwrite",
+            "int fwrite;",
+            "void f(FILE *fp) { fprintf(fp, \"hello\"); }",
+            &["fputs"],
+        ),
+    ];
+    for (shadowed, object, body, want) in cases {
+        let src = format!(
+            "typedef struct F FILE;\n\
+             typedef unsigned long size_t;\n\
+             int printf(const char *, ...);\n\
+             int fprintf(FILE *, const char *, ...);\n\
+             {object}\n{body}\n"
+        );
+        for_each_target_src(&src, &["-O2"], |calls, what| {
+            // The invariant: nothing may call the object.
+            assert!(
+                !calls.iter().any(|c| c == shadowed),
+                "{what}: with `{object}` in scope, `{body}` compiled to \
+                 {calls:?} -- `{shadowed}` is that object's own storage, so \
+                 calling it jumps into .bss"
+            );
+            assert_eq!(
+                calls, *want,
+                "{what}: with `{object}` in scope, `{body}` should leave \
+                 {want:?}, not {calls:?}"
+            );
+        });
     }
 }

@@ -7817,6 +7817,29 @@ fn test_known_library_call_is_not_tagged_where_the_name_is_the_programs() {
     assert_eq!(known("own"), Some(LibFn::Strnlen));
 }
 
+/// The declaration a builtin reaches for must be a function.
+///
+/// `int __clear_cache;` binds a reserved name to an object, so there is no
+/// function of that name to call. Reusing the object's symbol made
+/// `__builtin___clear_cache` a call through its own storage; declining
+/// leaves the diagnostic the caller already had. This is the test
+/// `builtin_is_shadowed` ends with, applied where a builtin declares the
+/// library function rather than where a bare call looks one up.
+#[test]
+fn test_library_builtin_declines_a_name_bound_to_an_object() {
+    let body = "void f(char *a, char *b) { __builtin___clear_cache(a, b); }\n";
+    assert!(
+        parse_tu(&format!("int __clear_cache;\n{body}")).is_err(),
+        "`int __clear_cache;` is an object, so __builtin___clear_cache has \
+         no function to call and must not reuse the object's symbol"
+    );
+    // The control: with the name left alone, the builtin still declares it.
+    assert!(
+        parse_tu(body).is_ok(),
+        "with nothing shadowing it, __builtin___clear_cache must still parse"
+    );
+}
+
 /// `__builtin_puts` with no declaration of `puts` in scope declares it with
 /// the library's own prototype -- so its arguments are checked and
 /// converted, and the call is known.

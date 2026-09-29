@@ -2735,6 +2735,19 @@ impl Parser<'_> {
         func_type: TypeId,
     ) -> Option<SymbolId> {
         if let Some(existing) = self.symbols.lookup_id(name_id, Namespace::Ordinary) {
+            // What the name already means may not be a function at all --
+            // `int puts;` binds a name C17 7.1.3 reserves to an object. There
+            // is then no library function here to call, and handing back the
+            // object's symbol makes a call through its storage. This is the
+            // same test `builtin_is_shadowed` ends with.
+            //
+            // Declining is what every caller expects: the libm path
+            // substitutes a zero, `__builtin___clear_cache` raises a parse
+            // error, and a `__builtin_X` call falls through to `_chk`
+            // synthesis and then a diagnostic.
+            if self.types.kind(self.symbols.get(existing).typ) != TypeKind::Function {
+                return None;
+            }
             return Some(existing);
         }
         let sym = Symbol::function(name_id, func_type, 0);

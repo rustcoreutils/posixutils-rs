@@ -10,7 +10,7 @@
 //
 
 use super::codegen::X86_64CodeGen;
-use super::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
+use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::abi::{Abi, ArgClass, RegClass};
 use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
@@ -550,6 +550,57 @@ impl X86_64CodeGen {
     /// bytes, so a spilled one is loaded with `mov`: `lea` would give the
     /// address of the slot holding the pointer, which is a pointer to a
     /// pointer and reads as garbage.
+    /// Load the `bytes` bytes at `[base + offset]` into `dst`, touching no
+    /// byte outside them.
+    ///
+    /// The System V psABI leaves the bits above a composite's value in its
+    /// register unspecified, so the only thing that has to be right is which
+    /// bytes are *read*. Reading a fixed eight ran past every object that is
+    /// not a multiple of eight -- six past a `_Complex char`, four past a
+    /// twelve-byte struct -- which is a fault when the object ends a page.
+    ///
+    /// The aarch64 back end does the same, through its own instructions; the
+    /// chunking both ask for is `ir::memexpand::block_chunks`.
+    fn load_object_bytes(&mut self, dst: Reg, base: Reg, offset: i32, bytes: i64) {
+        for (at, chunk) in crate::ir::memexpand::block_chunks(bytes) {
+            let size = OperandSize::from_bits(chunk.bits());
+            let mem = GpOperand::Mem(MemAddr::BaseOffset {
+                base,
+                offset: offset + at as i32,
+            });
+            // The first piece lands in `dst`; the rest are shifted into it
+            // through R11, which no argument register is.
+            let into = if at == 0 { dst } else { Reg::R11 };
+            match size {
+                OperandSize::B64 | OperandSize::B32 => self.push_lir(X86Inst::Mov {
+                    size,
+                    src: mem,
+                    dst: GpOperand::Reg(into),
+                }),
+                // A byte or a halfword is widened on the way in, so the bits
+                // above it are this load's and not the last one's.
+                _ => self.push_lir(X86Inst::Movzx {
+                    src_size: size,
+                    dst_size: OperandSize::B64,
+                    src: mem,
+                    dst: into,
+                }),
+            }
+            if at != 0 {
+                self.push_lir(X86Inst::Shl {
+                    size: OperandSize::B64,
+                    count: ShiftCount::Imm((at * 8) as u8),
+                    dst: Reg::R11,
+                });
+                self.push_lir(X86Inst::Or {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::R11),
+                    dst,
+                });
+            }
+        }
+    }
+
     fn struct_arg_base(&mut self, arg: PseudoId) -> Reg {
         match self.get_location(arg) {
             Loc::Reg(r) => r,
@@ -636,15 +687,12 @@ impl X86_64CodeGen {
                 // complex arg pseudo always holds an address and that arm
                 // moves the pseudo itself.
                 let base = self.struct_arg_base(arg);
+                let bytes = arg_type.map_or(0, |t| types.size_bytes(t)) as i64;
                 for i in 0..classes.len() {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base,
-                            offset: (i * 8) as i32,
-                        }),
-                        dst: GpOperand::Reg(int_arg_regs[int_arg_idx]),
-                    });
+                    // Only what this eightbyte holds: `_Complex char` is two
+                    // bytes, not eight.
+                    let take = (bytes - (i as i64) * 8).clamp(0, 8);
+                    self.load_object_bytes(int_arg_regs[int_arg_idx], base, (i * 8) as i32, take);
                     int_arg_idx += 1;
                 }
             } else if is_fp {
@@ -751,24 +799,17 @@ impl X86_64CodeGen {
                                 Reg::R10
                             }
                         };
-                        // Load first 8 bytes
-                        self.push_lir(X86Inst::Mov {
-                            size: OperandSize::B64,
-                            src: GpOperand::Mem(MemAddr::BaseOffset {
-                                base: addr,
-                                offset: 0,
-                            }),
-                            dst: GpOperand::Reg(int_arg_regs[int_arg_idx]),
-                        });
-                        // Load second 8 bytes
-                        self.push_lir(X86Inst::Mov {
-                            size: OperandSize::B64,
-                            src: GpOperand::Mem(MemAddr::BaseOffset {
-                                base: addr,
-                                offset: 8,
-                            }),
-                            dst: GpOperand::Reg(int_arg_regs[int_arg_idx + 1]),
-                        });
+                        // Two registers, but not always sixteen bytes: a
+                        // twelve-byte composite fills the first and four
+                        // bytes of the second.
+                        let bytes = arg_type.map_or(16, |t| types.size_bytes(t)) as i64;
+                        self.load_object_bytes(int_arg_regs[int_arg_idx], addr, 0, bytes.min(8));
+                        self.load_object_bytes(
+                            int_arg_regs[int_arg_idx + 1],
+                            addr,
+                            8,
+                            (bytes - 8).clamp(0, 8),
+                        );
                         int_arg_idx += 2;
                     } else {
                         // Mixed: one eightbyte to a general register and one to

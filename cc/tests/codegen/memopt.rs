@@ -1010,3 +1010,105 @@ void fp(void) { ps = px; ps = py; }
         );
     }
 }
+
+/// A composite argument is read at its own size, not rounded up to a
+/// register.
+///
+/// c17 loaded every composite argument with a fixed eight- or sixteen-byte
+/// access, whatever the object held: `_Complex char` (two bytes) and a
+/// five-byte struct were both read as eight, and a twelve-byte struct as
+/// sixteen. AAPCS64 and System V both leave the *register's* upper bits
+/// unspecified, so the value handed over was right either way -- what was
+/// wrong was the memory read, which runs past the end of the object:
+///
+/// ```text
+///     _Complex char        2 bytes, read 8   -- 6 past
+///     struct { char[5]; }  5 bytes, read 8   -- 3 past
+///     struct { int[3]; }  12 bytes, read 16  -- 4 past
+/// ```
+///
+/// Ordinarily invisible, because the bytes past a small object are usually
+/// its own padding. Here each object is placed flush against a guard page,
+/// so reading even one byte too far is a fault rather than a guess -- the
+/// program returns the value it was given, or it dies. The callee is a
+/// separate translation unit, or it inlines and no argument is passed at
+/// all.
+///
+/// One-byte and two-byte structs were always read at their own width, and a
+/// sixteen-byte struct fills its two registers exactly; both are here as
+/// controls, so the fix cannot pass by refusing to use registers.
+///
+/// A composite of three, five, six or seven bytes is *not* here. It over-reads
+/// too, but for a different reason and in a different place: its dereference
+/// reaches the back end as a correct `load.40`, and it is load lowering that
+/// widens it, `OperandSize::from_bits` having no encoding for those widths.
+/// That one is its own defect and its own fix.
+#[test]
+fn codegen_composite_argument_is_read_at_its_own_size() {
+    // Each case: a type, and an initializer for its first member.
+    let cases: &[(&str, &str)] = &[
+        ("_Complex char", "c"),
+        ("_Complex short", "c"),
+        ("struct S1 { char a[1]; }", "s"),
+        ("struct S2 { char a[2]; }", "s"),
+        ("struct S9 { char a[9]; }", "s"),
+        ("struct S12 { int a[3]; }", "i"),
+        ("struct S15 { char a[15]; }", "s"),
+        ("struct S16 { long a[2]; }", "l"),
+    ];
+    for (n, (ty, kind)) in cases.iter().enumerate() {
+        // `T` is the argument type; `first(x)` reads its first byte or word,
+        // which is all the callee needs to prove it received the value.
+        let (decl, read) = match *kind {
+            "c" => (format!("typedef {ty} T;"), "(int)(__real__ v)"),
+            "i" => (format!("{ty}; typedef struct S12 T;"), "v.a[0]"),
+            "l" => (format!("{ty}; typedef struct S16 T;"), "(int)v.a[0]"),
+            _ => {
+                let tag = ty.split_whitespace().nth(1).unwrap();
+                (format!("{ty}; typedef struct {tag} T;"), "(int)v.a[0]")
+            }
+        };
+        let callee = format!("{decl}\nint take(T v) {{ return {read}; }}\n");
+        let caller = format!(
+            r#"
+#include <stdio.h>
+#include <sys/mman.h>
+#include <unistd.h>
+{decl}
+int take(T v);
+int main(void) {{
+    long ps = sysconf(_SC_PAGESIZE);
+    char *p = mmap(0, 2 * ps, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == (char *)-1) return 77;                 /* cannot test here */
+    if (mprotect(p + ps, ps, PROT_NONE) != 0) return 77;
+    /* Flush against the guard page: one byte too far is a fault. */
+    T *obj = (T *)(p + ps - sizeof(T));
+    char *raw = (char *)obj;
+    for (unsigned i = 0; i < sizeof(T); i++) raw[i] = 0;
+    raw[0] = 42;
+    return take(*obj) == 42 ? 0 : 1;
+}}
+"#
+        );
+        for opt in ["-O0", "-O2"] {
+            let got = compile_and_run_two_units(
+                &format!("argread_{n}"),
+                &caller,
+                &callee,
+                &[opt.to_string()],
+            );
+            // 77 means this host has no usable mmap/mprotect; skip loudly
+            // rather than pass quietly.
+            if got == 77 {
+                eprintln!("SKIP codegen_composite_argument_is_read_at_its_own_size: no guard page");
+                return;
+            }
+            assert_eq!(
+                got, 0,
+                "{opt}: `{ty}` argument -- a non-zero status here is the read \
+                 running past the object into the guard page",
+            );
+        }
+    }
+}

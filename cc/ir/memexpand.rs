@@ -107,6 +107,33 @@ pub(crate) fn block_chunks(bytes: i64) -> impl Iterator<Item = (i64, Chunk)> {
     })
 }
 
+/// How to read a whole object of `bytes` bytes into one register when
+/// `bytes` is not a natural access width -- 3, 5, 6 or 7, which is what a
+/// small composite gives.
+///
+/// The answer is a pair of *overlapping* power-of-two accesses, returned as
+/// `(width, high_offset)`: one of `width` bytes at offset 0, and one of
+/// `width` bytes at `high_offset`, chosen so the second ends exactly on the
+/// object's last byte. The two overlap in the middle, and the overlapping
+/// bytes are read twice with the same value, so OR-ing the halves together
+/// (after shifting the high one up by `high_offset * 8`) reproduces the
+/// object exactly -- and neither access reaches past its end.
+///
+/// `None` for a size that is already one access: 1, 2, 4 and 8, and anything
+/// larger than a register, which is copied rather than loaded.
+///
+/// Rounding a ragged size up to the next width instead is what the back ends
+/// used to do, and it reads up to three bytes past the object -- which faults
+/// when the object ends a page.
+pub(crate) fn overlapping_halves(bits: u32) -> Option<(i64, i64)> {
+    let bytes = i64::from(bits / 8);
+    if bits % 8 != 0 || bytes == 0 || bytes > 8 || bytes.count_ones() == 1 {
+        return None;
+    }
+    let width = 1i64 << (63 - bytes.leading_zeros() as i64);
+    Some((width, bytes - width))
+}
+
 /// The three block memory operations, and how far each is expanded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockOp {
@@ -491,5 +518,46 @@ mod tests {
         assert_eq!(count(&f, Opcode::Load) + count(&f, Opcode::Store), 0);
         assert_eq!(count(&f, Opcode::Memcpy), 0);
         assert!(ops(&f).contains(&Opcode::Copy));
+    }
+
+    /// The ragged widths are the ones a small composite gives; each pair must
+    /// cover the object exactly and end on its last byte, never past it.
+    #[test]
+    fn overlapping_halves_covers_a_ragged_size_without_passing_its_end() {
+        for (bytes, want) in [(3i64, (2, 1)), (5, (4, 1)), (6, (4, 2)), (7, (4, 3))] {
+            let got = overlapping_halves(bytes as u32 * 8);
+            assert_eq!(
+                got,
+                Some(want),
+                "{bytes} bytes: split as {got:?}, expected {want:?}"
+            );
+            let (width, high) = got.unwrap();
+            assert_eq!(
+                width + high,
+                bytes,
+                "{bytes} bytes: the high half at {high} spans {width} and so ends \
+                 at {}, not on the last byte",
+                width + high
+            );
+            assert!(
+                high < width,
+                "{bytes} bytes: the halves at 0 and {high} leave a {} byte gap \
+                 rather than overlapping",
+                high - width
+            );
+        }
+    }
+
+    /// A size that is already one access must stay one access, and anything
+    /// wider than a register is copied, not loaded.
+    #[test]
+    fn overlapping_halves_declines_a_size_that_is_already_one_access() {
+        for bits in [0, 8, 16, 32, 64, 72, 96, 128, 40 + 4] {
+            assert_eq!(
+                overlapping_halves(bits),
+                None,
+                "{bits} bits was split, but it is not a ragged sub-register size"
+            );
+        }
     }
 }

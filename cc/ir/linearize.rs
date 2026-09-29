@@ -573,6 +573,26 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Whether the C library function `name` is one a fold may call: this
+    /// unit has not bound the name to something that is not a function.
+    ///
+    /// A program may write `int puts;`, redefining a name C17 7.1.3 reserves
+    /// to the implementation. That makes the program undefined, but gcc and
+    /// clang degrade gracefully -- they decline the rewrite and keep the call
+    /// the program wrote. Taking the name regardless emits `call puts`
+    /// against the object's own storage, which crashes.
+    ///
+    /// A name this unit never mentions is available: the linker supplies it.
+    fn library_function_available(&self, name: &str) -> bool {
+        let Some(id) = self.strings.lookup(name) else {
+            return true;
+        };
+        match self.symbols.lookup(id, crate::symbol::Namespace::Ordinary) {
+            Some(sym) => self.types.kind(sym.typ) == TypeKind::Function,
+            None => true,
+        }
+    }
+
     /// Whether any declaration of `name` in this translation unit said
     /// `extern`. See [`crate::symbol::Symbol::has_extern_decl`].
     pub(crate) fn has_extern_decl(&self, name: StringId) -> bool {
@@ -612,6 +632,9 @@ impl<'a> Linearizer<'a> {
         }
         self.resolve_aliases();
         for &name in super::FOLD_CALLEES {
+            if !self.library_function_available(name) {
+                continue;
+            }
             let symbol = self.library_function_name(name);
             self.module.library_symbols.insert(name, symbol);
         }

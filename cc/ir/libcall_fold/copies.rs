@@ -22,7 +22,9 @@
 // simpler: `stpcpy` and `sprintf(d, "%s", s)` are then `strcpy`.
 //
 
-use super::{callee_symbol, make_call, offset, Facts, FoldCtx, Folded, NewCall, Operand};
+use super::{
+    callee_symbol, is_pointer, make_call, offset, Facts, FoldCtx, Folded, NewCall, Operand,
+};
 use crate::ir::build::Builder;
 use crate::ir::memexpand::INLINE_LIMIT_BYTES;
 use crate::ir::strdata::Len;
@@ -80,6 +82,11 @@ impl Write {
 /// What the call `insn` to `f`, one of the functions that write a string,
 /// folds to.
 pub(super) fn fold(f: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded> {
+    // `sprintf` reads an argument's type below, and the two are indexed in
+    // parallel; `stdio::fold` requires the same.
+    if insn.src.len() != insn.arg_types.len() {
+        return None;
+    }
     match (f, insn.src.as_slice()) {
         (LibFn::Strcpy, &[d, s]) => {
             let len = known_len(facts, s)?;
@@ -196,7 +203,12 @@ fn sprintf(
 ) -> Option<Folded> {
     let text = facts.strings.string_at(fmt)?.c_str()?;
     let s = match (text, rest) {
-        (b"%s", &[s]) => s,
+        // `%s` is the one variadic position in this file: every other
+        // pointer a fold here reads through is in the prototype, which
+        // `known_callee` has already matched. Nothing has checked this one,
+        // so `sprintf(d, "%s", 42)` would copy from address 42.
+        // `rest[k]` was passed as `insn.arg_types[k + 2]`.
+        (b"%s", &[s]) if is_pointer(facts.types, *insn.arg_types.get(2)?) => s,
         (_, []) if !text.contains(&b'%') => fmt,
         _ => return None,
     };
@@ -308,9 +320,22 @@ mod tests {
     use crate::ir::strdata::fixture::Fixture;
 
     /// What a call to `f` of `args`, returning `ret`, added to `fx`, folds
-    /// to.
+    /// to. Every argument is passed as `unsigned long`.
     fn fold1(fx: &mut Fixture, f: LibFn, args: &[PseudoId], ret: TypeId) -> Option<Folded> {
-        fx.call(f, "callee", args, ret);
+        let ulong = fx.types.ulong_id;
+        let typed: Vec<_> = args.iter().map(|&a| (a, ulong)).collect();
+        fold1_typed(fx, f, &typed, ret)
+    }
+
+    /// The same, each argument passed as its own type -- which is what a
+    /// `%s` in a variadic position is judged by.
+    fn fold1_typed(
+        fx: &mut Fixture,
+        f: LibFn,
+        args: &[(PseudoId, TypeId)],
+        ret: TypeId,
+    ) -> Option<Folded> {
+        fx.call_typed(f, "callee", args, ret);
         let at = fx.func().blocks[0].insns.len() - 1;
         folds(fx)
             .into_iter()
@@ -463,17 +488,42 @@ mod tests {
         let (d, u) = (fx.unknown(), fx.unknown());
         let int = fx.types.int_id;
         let at = Place::At(d);
+        // `%s` takes a pointer, and that is what makes it a copy.
+        let cptr = fx.types.const_char_ptr_id;
+        let ulong = fx.types.ulong_id;
         assert_eq!(
             fold1(&mut fx, LibFn::Sprintf, &[d, foo], int),
             copy(at, foo, 4, 0, Answer::Int(3))
         );
         assert_eq!(
-            fold1(&mut fx, LibFn::Sprintf, &[d, pct_s, foo], int),
+            fold1_typed(
+                &mut fx,
+                LibFn::Sprintf,
+                &[(d, cptr), (pct_s, cptr), (foo, cptr)],
+                int
+            ),
             copy(at, foo, 4, 0, Answer::Int(3))
         );
         assert_eq!(
-            fold1(&mut fx, LibFn::Sprintf, &[d, pct_s, u], int),
+            fold1_typed(
+                &mut fx,
+                LibFn::Sprintf,
+                &[(d, cptr), (pct_s, cptr), (u, cptr)],
+                int
+            ),
             Some(Folded::Write(Write::Strcpy { dest: d, src: u }))
+        );
+        // Passed anything else, there is no string to copy: the argument is
+        // a value, not an address, so the call stays.
+        assert_eq!(
+            fold1_typed(
+                &mut fx,
+                LibFn::Sprintf,
+                &[(d, cptr), (pct_s, cptr), (u, ulong)],
+                int
+            ),
+            None,
+            "`sprintf(d, \"%s\", <an unsigned long>)` is not a copy from it"
         );
         // A format with extra arguments, a conversion other than one `%s`,
         // or an escaped `%` is left to the library.
@@ -565,7 +615,15 @@ mod tests {
         let lc = fx.literal("%s");
         let fmt = fx.addr(&lc);
         let (d, u) = (fx.unknown(), fx.unknown());
-        fx.call(LibFn::Sprintf, "sprintf", &[d, fmt, u], int);
+        // The `%s` argument is passed as a pointer; that is the premise of
+        // the rewrite, not an incidental detail.
+        let cptr = fx.types.const_char_ptr_id;
+        fx.call_typed(
+            LibFn::Sprintf,
+            "sprintf",
+            &[(d, cptr), (fmt, cptr), (u, cptr)],
+            int,
+        );
         let insns = run_on(&mut fx, &[("strcpy", "my_strcpy")]);
         let call = insns.iter().find(|i| i.op == Opcode::Call).unwrap();
         assert_eq!(

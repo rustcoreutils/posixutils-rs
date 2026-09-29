@@ -1010,3 +1010,257 @@ void fp(void) { ps = px; ps = py; }
         );
     }
 }
+
+/// A composite argument is read at its own size, not rounded up to a
+/// register.
+///
+/// c17 loaded every composite argument with a fixed eight- or sixteen-byte
+/// access, whatever the object held: `_Complex char` (two bytes) and a
+/// five-byte struct were both read as eight, and a twelve-byte struct as
+/// sixteen. AAPCS64 and System V both leave the *register's* upper bits
+/// unspecified, so the value handed over was right either way -- what was
+/// wrong was the memory read, which runs past the end of the object:
+///
+/// ```text
+///     _Complex char        2 bytes, read 8   -- 6 past
+///     struct { char[5]; }  5 bytes, read 8   -- 3 past
+///     struct { int[3]; }  12 bytes, read 16  -- 4 past
+/// ```
+///
+/// Ordinarily invisible, because the bytes past a small object are usually
+/// its own padding. Here each object is placed flush against a guard page,
+/// so reading even one byte too far is a fault rather than a guess -- the
+/// program returns the value it was given, or it dies. The callee is a
+/// separate translation unit, or it inlines and no argument is passed at
+/// all.
+///
+/// One-byte and two-byte structs were always read at their own width, and a
+/// sixteen-byte struct fills its two registers exactly; both are here as
+/// controls, so the fix cannot pass by refusing to use registers.
+///
+/// A composite of three, five, six or seven bytes is *not* here. It over-reads
+/// too, but for a different reason and in a different place: its dereference
+/// reaches the back end as a correct `load.40`, and it is load lowering that
+/// widens it, `OperandSize::from_bits` having no encoding for those widths.
+/// That one is its own defect and its own fix.
+#[test]
+fn codegen_composite_argument_is_read_at_its_own_size() {
+    // Each case: a type, and an initializer for its first member.
+    let cases: &[(&str, &str)] = &[
+        ("_Complex char", "c"),
+        ("_Complex short", "c"),
+        ("struct S1 { char a[1]; }", "s"),
+        ("struct S2 { char a[2]; }", "s"),
+        ("struct S3 { char a[3]; }", "s"),
+        ("struct S5 { char a[5]; }", "s"),
+        ("struct S6 { char a[6]; }", "s"),
+        ("struct S7 { char a[7]; }", "s"),
+        ("struct S9 { char a[9]; }", "s"),
+        ("struct S12 { int a[3]; }", "i"),
+        ("struct S15 { char a[15]; }", "s"),
+        ("struct S16 { long a[2]; }", "l"),
+    ];
+    for (n, (ty, kind)) in cases.iter().enumerate() {
+        // `T` is the argument type; `first(x)` reads its first byte or word,
+        // which is all the callee needs to prove it received the value.
+        let (decl, read) = match *kind {
+            "c" => (format!("typedef {ty} T;"), "(int)(__real__ v)"),
+            "i" => (format!("{ty}; typedef struct S12 T;"), "v.a[0]"),
+            "l" => (format!("{ty}; typedef struct S16 T;"), "(int)v.a[0]"),
+            _ => {
+                let tag = ty.split_whitespace().nth(1).unwrap();
+                (format!("{ty}; typedef struct {tag} T;"), "(int)v.a[0]")
+            }
+        };
+        let callee = format!("{decl}\nint take(T v) {{ return {read}; }}\n");
+        let caller = format!(
+            r#"
+#include <stdio.h>
+#include <sys/mman.h>
+#include <unistd.h>
+{decl}
+int take(T v);
+int main(void) {{
+    long ps = sysconf(_SC_PAGESIZE);
+    char *p = mmap(0, 2 * ps, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == (char *)-1) return 77;                 /* cannot test here */
+    if (mprotect(p + ps, ps, PROT_NONE) != 0) return 77;
+    /* Flush against the guard page: one byte too far is a fault. */
+    T *obj = (T *)(p + ps - sizeof(T));
+    char *raw = (char *)obj;
+    for (unsigned i = 0; i < sizeof(T); i++) raw[i] = 0;
+    raw[0] = 42;
+    return take(*obj) == 42 ? 0 : 1;
+}}
+"#
+        );
+        for opt in ["-O0", "-O2"] {
+            let got = compile_and_run_two_units(
+                &format!("argread_{n}"),
+                &caller,
+                &callee,
+                &[opt.to_string()],
+            );
+            // 77 means this host has no usable mmap/mprotect; skip loudly
+            // rather than pass quietly.
+            if got == 77 {
+                eprintln!("SKIP codegen_composite_argument_is_read_at_its_own_size: no guard page");
+                return;
+            }
+            assert_eq!(
+                got, 0,
+                "{opt}: `{ty}` argument -- a non-zero status here is the read \
+                 running past the object into the guard page",
+            );
+        }
+    }
+}
+
+/// A composite whose size is not a natural access width -- 3, 5, 6 or 7 bytes
+/// -- is assembled from two overlapping reads, so the guard-page test above
+/// proves only that nothing was read too far. This one proves the bytes that
+/// *were* read all arrive, in order: the halves overlap, and getting the
+/// shift or the OR wrong drops or doubles a middle byte silently.
+#[test]
+fn codegen_ragged_composite_keeps_every_byte() {
+    for n in [3usize, 5, 6, 7] {
+        let decl = format!("struct S {{ unsigned char a[{n}]; }};");
+        // The callee rebuilds the value it was handed; the caller compares.
+        let callee = format!(
+            "{decl}\n\
+             unsigned long take(struct S v) {{\n\
+             \x20   unsigned long r = 0;\n\
+             \x20   for (unsigned i = 0; i < {n}; i++) r |= (unsigned long)v.a[i] << (i * 8);\n\
+             \x20   return r;\n\
+             }}\n"
+        );
+        let caller = format!(
+            r#"
+#include <stdio.h>
+{decl}
+unsigned long take(struct S v);
+int main(void) {{
+    struct S s;
+    unsigned long want = 0;
+    for (unsigned i = 0; i < {n}; i++) {{
+        s.a[i] = (unsigned char)(0x11 * (i + 1));
+        want |= (unsigned long)s.a[i] << (i * 8);
+    }}
+    struct S *p = &s;                 /* read through a pointer, as the ABI path does */
+    unsigned long got = take(*p);
+    if (got != want) {{
+        printf("%zu bytes: got %lx want %lx\n", (size_t){n}, got, want);
+        return 1;
+    }}
+    return 0;
+}}
+"#
+        );
+        for opt in ["-O0", "-O2"] {
+            let got = compile_and_run_two_units(
+                &format!("ragged_{n}"),
+                &caller,
+                &callee,
+                &[opt.to_string()],
+            );
+            assert_eq!(
+                got, 0,
+                "{opt}: a {n}-byte struct passed by value came back with the \
+                 wrong bytes -- the two overlapping halves were not recombined \
+                 correctly",
+            );
+        }
+    }
+}
+
+/// The widest load in `body` that reads through a pointer, in bytes, or 0.
+///
+/// Frame-relative accesses are skipped: a spill or a stack temporary is the
+/// compiler's own storage, and its width says nothing about the object.
+fn widest_object_load(body: &str, aarch64: bool) -> (u32, String) {
+    let mut widest = 0;
+    let mut at = String::new();
+    for line in body.lines() {
+        let text = line.trim();
+        let (mnemonic, operands) = match text.split_once(char::is_whitespace) {
+            Some(pair) => pair,
+            None => continue,
+        };
+        let width = if aarch64 {
+            if operands.contains("[sp") || operands.contains("[x29") {
+                continue;
+            }
+            match mnemonic {
+                "ldrb" | "ldrsb" => 1,
+                "ldrh" | "ldrsh" => 2,
+                "ldr" | "ldrsw" if operands.starts_with('w') => 4,
+                "ldr" if operands.starts_with('x') => 8,
+                "ldp" if operands.starts_with('x') => 16,
+                "ldp" if operands.starts_with('w') => 8,
+                _ => continue,
+            }
+        } else {
+            // The source is the first operand; it must be a memory reference
+            // through something other than the frame.
+            let src = operands.split(',').next().unwrap_or("").trim();
+            if !src.contains("(%r") || src.contains("%rbp)") || src.contains("%rsp)") {
+                continue;
+            }
+            match mnemonic {
+                "movb" | "movzbl" | "movsbl" | "movzbq" | "movsbq" => 1,
+                "movw" | "movzwl" | "movswl" | "movzwq" | "movswq" => 2,
+                "movl" | "movslq" => 4,
+                "movq" => 8,
+                _ => continue,
+            }
+        };
+        if width > widest {
+            widest = width;
+            at = text.to_string();
+        }
+    }
+    (widest, at)
+}
+
+/// No composite is read wider than it is, on either target.
+///
+/// The runtime tests above execute, so they only ever cover the host --
+/// x86-64 here. This one compiles for both triples and reads the widths out
+/// of the assembly, which is what covers the aarch64 lowering on a machine
+/// that cannot run it. A ragged size is read as two overlapping halves, so
+/// the widest access is the half, never the object rounded up.
+#[test]
+fn codegen_no_composite_is_read_wider_than_itself() {
+    // (bytes in the struct, the widest load its value may be read with)
+    let cases: &[(usize, u32)] = &[
+        (1, 1),
+        (2, 2),
+        // The ragged sizes: 3 is two halves of 2, and 5, 6 and 7 are two of 4.
+        (3, 2),
+        (5, 4),
+        (6, 4),
+        (7, 4),
+        // The controls, each already one natural access.
+        (4, 4),
+        (8, 8),
+    ];
+    for &(bytes, want) in cases {
+        let src = format!(
+            "struct S {{ char a[{bytes}]; }};\n\
+             int g(struct S s);\n\
+             int f(struct S *p) {{ return g(*p); }}\n"
+        );
+        for (triple, is_a64) in [(X86_64_LINUX, false), (AARCH64_LINUX, true)] {
+            let asm = asm_for_with(&format!("widest_{bytes}"), triple, &src, &["-O1"]);
+            let body = body_of(&asm, "f");
+            let (got, line) = widest_object_load(body, is_a64);
+            assert_eq!(
+                got, want,
+                "{triple}: a {bytes}-byte struct is read with a {got}-byte \
+                 access (`{line}`), not {want} -- anything wider reaches past \
+                 the object:\n{body}"
+            );
+        }
+    }
+}

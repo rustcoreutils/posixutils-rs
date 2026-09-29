@@ -454,7 +454,28 @@ pub(crate) mod fixture {
             self.func().alloc_pseudo()
         }
 
-        /// A call of `ret` to `known`, as the linearizer makes one.
+        /// A call of `ret` to `known`, as the linearizer makes one, each
+        /// argument passed as its own type.
+        ///
+        /// A fold that reads a variadic argument asks what type it was
+        /// passed as -- `%s` takes a pointer -- so a test of one has to say.
+        pub(crate) fn call_typed(
+            &mut self,
+            known: crate::parse::ast::LibFn,
+            name: &str,
+            args: &[(PseudoId, TypeId)],
+            ret: TypeId,
+        ) -> PseudoId {
+            let t = self.func().alloc_pseudo();
+            let (srcs, arg_types): (Vec<_>, Vec<_>) = args.iter().copied().unzip();
+            let size = self.types.size_bits(ret);
+            let mut call = Instruction::call(Some(t), name, srcs, arg_types, ret, size);
+            call.known = Some(known);
+            self.push(call);
+            t
+        }
+
+        /// The same, with every argument passed as `unsigned long`.
         pub(crate) fn call(
             &mut self,
             known: crate::parse::ast::LibFn,
@@ -462,13 +483,9 @@ pub(crate) mod fixture {
             args: &[PseudoId],
             ret: TypeId,
         ) -> PseudoId {
-            let t = self.func().alloc_pseudo();
-            let arg_types = vec![self.types.ulong_id; args.len()];
-            let size = self.types.size_bits(ret);
-            let mut call = Instruction::call(Some(t), name, args.to_vec(), arg_types, ret, size);
-            call.known = Some(known);
-            self.push(call);
-            t
+            let ulong = self.types.ulong_id;
+            let typed: Vec<_> = args.iter().map(|&a| (a, ulong)).collect();
+            self.call_typed(known, name, &typed, ret)
         }
 
         /// What `string_len` answers for `p`.

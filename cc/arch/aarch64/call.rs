@@ -440,15 +440,17 @@ impl Aarch64CodeGen {
             {
                 if int_arg_idx + gp_n <= int_arg_regs.len() {
                     let base = self.aggregate_arg_address(arg);
+                    let bytes = arg_type.map_or(0, |t| types.size_bytes(t)) as i64;
                     for k in 0..gp_n {
-                        self.push_lir(Aarch64Inst::Ldr {
-                            size: OperandSize::B64,
-                            dst: int_arg_regs[int_arg_idx],
-                            addr: MemAddr::BaseOffset {
-                                base,
-                                offset: (k * 8) as i32,
-                            },
-                        });
+                        // Only what this register's eightbyte actually holds:
+                        // `_Complex char` is two bytes, not eight.
+                        let take = (bytes - (k as i64) * 8).clamp(0, 8);
+                        self.load_object_bytes(
+                            int_arg_regs[int_arg_idx],
+                            base,
+                            (k * 8) as i32,
+                            take,
+                        );
                         int_arg_idx += 1;
                     }
                 } else {
@@ -486,12 +488,18 @@ impl Aarch64CodeGen {
                 ) {
                     int_arg_idx = start;
                     let base = self.aggregate_arg_address(arg);
-                    self.push_lir(Aarch64Inst::Ldp {
-                        size: OperandSize::B64,
-                        addr: MemAddr::BaseOffset { base, offset: 0 },
-                        dst1: int_arg_regs[int_arg_idx],
-                        dst2: int_arg_regs[int_arg_idx + 1],
-                    });
+                    // Two registers, but not always sixteen bytes: a
+                    // twelve-byte composite fills the first and four bytes of
+                    // the second. `Ldp` has no narrow form, so the pair is two
+                    // sized loads rather than one that reads past the object.
+                    let bytes = arg_type.map_or(16, |t| types.size_bytes(t)) as i64;
+                    self.load_object_bytes(int_arg_regs[int_arg_idx], base, 0, bytes.min(8));
+                    self.load_object_bytes(
+                        int_arg_regs[int_arg_idx + 1],
+                        base,
+                        8,
+                        (bytes - 8).clamp(0, 8),
+                    );
                     int_arg_idx += 2;
                 } else {
                     stack_args_info.push(StackArg {
@@ -840,7 +848,50 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Set up a complex number argument (real + imaginary in two V registers)
+    /// Load the `bytes` bytes at `[base + offset]` into `dst`, touching no
+    /// byte outside them.
+    ///
+    /// A composite argument's register holds the object in its low bits and
+    /// whatever the load left above; AAPCS64 §5.4.2 leaves those upper bits
+    /// unspecified, so the only thing that has to be right is which bytes
+    /// are *read*. Reading a fixed eight ran past every object that is not a
+    /// multiple of eight -- six bytes past a `_Complex char`, three past a
+    /// five-byte struct -- which is a fault when the object ends a page.
+    ///
+    /// A width the hardware loads directly (1, 2, 4, 8) is one instruction.
+    /// A ragged width is assembled from the pieces `block_chunks` gives, each
+    /// shifted to its place, which is what clang emits for the same argument.
+    fn load_object_bytes(&mut self, dst: Reg, base: Reg, offset: i32, bytes: i64) {
+        for (at, chunk) in crate::ir::memexpand::block_chunks(bytes) {
+            let size = OperandSize::from_bits(chunk.bits());
+            // The first piece lands in `dst`; the rest are shifted into it
+            // through the address scratch, which the base is not held in.
+            let into = if at == 0 { dst } else { Reg::X16 };
+            self.push_lir(Aarch64Inst::Ldr {
+                size,
+                dst: into,
+                addr: MemAddr::BaseOffset {
+                    base,
+                    offset: offset + at as i32,
+                },
+            });
+            if at != 0 {
+                self.push_lir(Aarch64Inst::Lsl {
+                    size: OperandSize::B64,
+                    src: Reg::X16,
+                    amount: GpOperand::Imm(at * 8),
+                    dst: Reg::X16,
+                });
+                self.push_lir(Aarch64Inst::Orr {
+                    size: OperandSize::B64,
+                    src1: dst,
+                    src2: GpOperand::Reg(Reg::X16),
+                    dst,
+                });
+            }
+        }
+    }
+
     /// The register holding the address of an argument that travels by
     /// address -- a complex value at any size, a composite above a
     /// register's worth -- loading it into X9 when it is not already in one.
@@ -880,6 +931,7 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// Set up a complex number argument (real + imaginary in two V registers)
     fn setup_complex_arg(
         &mut self,
         arg: PseudoId,

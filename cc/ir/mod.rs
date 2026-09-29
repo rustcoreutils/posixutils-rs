@@ -2700,10 +2700,16 @@ pub struct Module {
     pub comp_dir: Option<String>,
     /// Primary source filename (for DW_AT_name in DWARF)
     pub source_name: Option<String>,
-    /// The assembler name of each function in [`FOLD_CALLEES`], as this
-    /// unit's declarations spell it (`Linearizer::library_function_name`):
-    /// a call an optimizer pass makes to `strchr` in place of the program's
-    /// `strstr` is still a call to `strchr`, asm label and all.
+    /// Each function in [`FOLD_CALLEES`] a fold may call, and the assembler
+    /// name this unit's declarations give it
+    /// (`Linearizer::library_function_name`): a call an optimizer pass makes
+    /// to `strchr` in place of the program's `strstr` is still a call to
+    /// `strchr`, asm label and all.
+    ///
+    /// A name is *absent* when the program bound it to something that is not
+    /// a function -- `int puts;` -- and no fold may then reach for it, since
+    /// the call would go to the program's own object. So this answers both
+    /// "may a fold call this?" and "by what name?".
     pub library_symbols: HashMap<&'static str, String>,
 }
 

@@ -47,7 +47,7 @@ use crate::float::FloatVal;
 use crate::parse::ast::{CalleeBinding, LibFn};
 use crate::target::Target;
 use crate::token::lexer::bytes_payload;
-use crate::types::{TypeId, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeTable};
 use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 
@@ -253,7 +253,7 @@ fn collect(func: &Function, ctx: &FoldCtx) -> Vec<Site> {
             let Some(folded) = fold(known, insn, &facts) else {
                 continue;
             };
-            if calls_itself(func, ctx, &folded) {
+            if calls_itself(func, ctx, &folded) || calls_unavailable(ctx, &folded) {
                 continue;
             }
             sites.push(((b, i), folded));
@@ -305,18 +305,45 @@ fn fold(known: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded> {
 /// Whether `folded` calls the very function it is in: `strchr` written in
 /// terms of `strpbrk` must not become a call to itself.
 fn calls_itself(func: &Function, ctx: &FoldCtx, folded: &Folded) -> bool {
-    let calls: &[&str] = match folded {
-        Folded::Call(call) | Folded::Discard(Some(call)) => &[call.name],
+    calls_made(folded)
+        .iter()
+        .any(|&name| is_the_function(func, ctx, name))
+}
+
+/// The library functions `folded` will call, by their C names.
+fn calls_made(folded: &Folded) -> &[&'static str] {
+    match folded {
+        Folded::Call(call) | Folded::Discard(Some(call)) => std::slice::from_ref(&call.name),
         Folded::Write(write) => write.calls(),
         _ => &[],
-    };
-    calls.iter().any(|&name| is_the_function(func, ctx, name))
+    }
+}
+
+/// Whether `folded` would call a library function this unit has taken away
+/// by binding its name to something that is not a function.
+///
+/// `Module::library_symbols` holds every [`crate::ir::FOLD_CALLEES`] name the
+/// program left alone, so a name missing from it is one no fold may reach
+/// for -- calling it would jump into the program's own object.
+fn calls_unavailable(ctx: &FoldCtx, folded: &Folded) -> bool {
+    calls_made(folded)
+        .iter()
+        .any(|name| !ctx.callees.contains_key(name))
 }
 
 /// Whether `func` is the library function C calls `name`, by that name or
 /// by the one this unit gives it.
 fn is_the_function(func: &Function, ctx: &FoldCtx, name: &str) -> bool {
     func.name == name || ctx.callees.get(name) == Some(&func.name)
+}
+
+/// Whether an argument of type `t` is a pointer.
+///
+/// A variadic argument's type is not in the prototype, so a fold that means
+/// to read through one has to ask: `%s` takes a pointer, and
+/// `sprintf(d, "%s", 42)` is not a copy from address 42.
+pub(super) fn is_pointer(types: &TypeTable, t: TypeId) -> bool {
+    types.kind(t) == TypeKind::Pointer
 }
 
 /// The assembler name of the library function C calls `name`, for a call a
@@ -468,16 +495,27 @@ pub(super) mod tests {
     /// Run `f` with a fold context for `fx`, whose callees are renamed as
     /// `callees` says, and hand back what it answers and the literals the
     /// folds added.
+    ///
+    /// The map starts out as the linearizer builds it: every
+    /// [`crate::ir::FOLD_CALLEES`] name, called by itself, since that is what
+    /// a program that leaves those names alone produces. The case where one
+    /// is *missing* -- the program bound the name to an object, so no fold
+    /// may call it -- is driven end to end from
+    /// `cc/tests/builtins/stdio_fold.rs`, which compiles the C and reads the
+    /// calls back out of the assembly.
     fn with_ctx<R>(
         fx: &Fixture,
         target: &Target,
-        callees: &[(&'static str, &str)],
+        renames: &[(&'static str, &str)],
         f: impl FnOnce(&FoldCtx) -> R,
     ) -> (R, Vec<(String, String)>) {
         let bytes = ConstBytes::build(&fx.module, &fx.types);
         let mi = ModuleInfo::build(&fx.module, &fx.types);
-        let callees: HashMap<&'static str, String> =
-            callees.iter().map(|&(c, a)| (c, a.to_string())).collect();
+        let mut callees: HashMap<&'static str, String> = crate::ir::FOLD_CALLEES
+            .iter()
+            .map(|&c| (c, c.to_string()))
+            .collect();
+        callees.extend(renames.iter().map(|&(c, a)| (c, a.to_string())));
         let literals = NewLiterals::new(&fx.module.strings);
         let answer = f(&FoldCtx {
             types: &fx.types,

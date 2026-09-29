@@ -47,7 +47,7 @@ use crate::float::FloatVal;
 use crate::parse::ast::{CalleeBinding, LibFn};
 use crate::target::Target;
 use crate::token::lexer::bytes_payload;
-use crate::types::{TypeId, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeTable};
 use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 
@@ -335,6 +335,15 @@ fn calls_unavailable(ctx: &FoldCtx, folded: &Folded) -> bool {
 /// by the one this unit gives it.
 fn is_the_function(func: &Function, ctx: &FoldCtx, name: &str) -> bool {
     func.name == name || ctx.callees.get(name) == Some(&func.name)
+}
+
+/// Whether an argument of type `t` is a pointer.
+///
+/// A variadic argument's type is not in the prototype, so a fold that means
+/// to read through one has to ask: `%s` takes a pointer, and
+/// `sprintf(d, "%s", 42)` is not a copy from address 42.
+pub(super) fn is_pointer(types: &TypeTable, t: TypeId) -> bool {
+    types.kind(t) == TypeKind::Pointer
 }
 
 /// The assembler name of the library function C calls `name`, for a call a

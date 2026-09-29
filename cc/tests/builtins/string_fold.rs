@@ -426,3 +426,48 @@ fn builtins_string_fold_follows_asm_labels() {
         );
     });
 }
+
+/// `sprintf`'s `%s` argument sits in a variadic position, where the
+/// prototype says nothing about its type, so the rewrite to `strcpy` has to
+/// check it itself.
+///
+/// `sprintf(d, "%s", 42)` is undefined either way -- `%s` requires a pointer
+/// and the library dereferences whatever it is given -- but the compiler
+/// must not be the one inventing the read: rewriting it to `strcpy(d, 42)`
+/// makes up a memory access from a value that was never an address. clang
+/// keeps the `sprintf`, and so must this. Every other pointer a fold here
+/// reads through sits in a prototyped position, which `known_callee` has
+/// already matched.
+#[test]
+fn builtins_string_fold_sprintf_needs_a_pointer_for_percent_s() {
+    let decl = "int sprintf(char *, const char *, ...);\n";
+    // Each case: the `%s` argument, and whether the copy is allowed.
+    let cases: &[(&str, bool)] = &[
+        ("const char *s", true),
+        ("int x", false),
+        ("long x", false),
+        ("unsigned long x", false),
+        ("double x", false),
+    ];
+    for (param, folds) in cases {
+        let arg = param.rsplit([' ', '*']).next().unwrap();
+        let src = format!("{decl}void f(char *d, {param}) {{ sprintf(d, \"%s\", {arg}); }}\n");
+        for_each_target("sprintf_pct_s", &src, &["-O2"], |asm, what| {
+            assert_eq!(
+                mentions(asm, "strcpy"),
+                *folds,
+                "{what}: `sprintf(d, \"%s\", {arg})` with `{param}` -- \
+                 strcpy is {} here; only a pointer may be copied from",
+                if *folds { "required" } else { "forbidden" }
+            );
+            // When it does not fold, the program's own call has to remain.
+            if !*folds {
+                assert!(
+                    mentions(asm, "sprintf"),
+                    "{what}: `{param}` did not fold, so the sprintf call \
+                     must still be there"
+                );
+            }
+        });
+    }
+}

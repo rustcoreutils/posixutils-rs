@@ -31,7 +31,7 @@
 // `fwrite_unlocked`, so there is nothing to call instead.
 //
 
-use super::{Facts, Folded, NewCall, Operand};
+use super::{is_pointer, Facts, Folded, NewCall, Operand};
 use crate::ir::strdata::Len;
 use crate::ir::{Instruction, PseudoId};
 use crate::parse::ast::LibFn;
@@ -257,11 +257,6 @@ fn fputs_call(s: Operand, (fp, t): Arg) -> NewCall {
     }
 }
 
-/// Whether an argument of type `t` is what `%s` takes: a pointer.
-fn is_pointer(types: &TypeTable, t: TypeId) -> bool {
-    types.kind(t) == TypeKind::Pointer
-}
-
 /// Whether an argument of type `t` is what `%c` takes: an `int`, which a
 /// narrower one has been promoted to.
 fn is_int(types: &TypeTable, t: TypeId) -> bool {
@@ -278,13 +273,8 @@ mod tests {
     /// A call to `f` of `args`, each passed as its type, as the linearizer
     /// makes one.
     fn call(fx: &mut Fixture, f: LibFn, args: &[Arg]) -> PseudoId {
-        let t = fx.fresh();
-        let (srcs, types): (Vec<_>, Vec<_>) = args.iter().copied().unzip();
         let int = fx.types.int_id;
-        let mut insn = Instruction::call(Some(t), "callee", srcs, types, int, 32);
-        insn.known = Some(f);
-        fx.push(insn);
-        t
+        fx.call_typed(f, "callee", args, int)
     }
 
     /// What a call to `f` of `args`, its result unused, folds to.

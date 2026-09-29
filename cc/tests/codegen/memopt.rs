@@ -1173,3 +1173,94 @@ int main(void) {{
         }
     }
 }
+
+/// The widest load in `body` that reads through a pointer, in bytes, or 0.
+///
+/// Frame-relative accesses are skipped: a spill or a stack temporary is the
+/// compiler's own storage, and its width says nothing about the object.
+fn widest_object_load(body: &str, aarch64: bool) -> (u32, String) {
+    let mut widest = 0;
+    let mut at = String::new();
+    for line in body.lines() {
+        let text = line.trim();
+        let (mnemonic, operands) = match text.split_once(char::is_whitespace) {
+            Some(pair) => pair,
+            None => continue,
+        };
+        let width = if aarch64 {
+            if operands.contains("[sp") || operands.contains("[x29") {
+                continue;
+            }
+            match mnemonic {
+                "ldrb" | "ldrsb" => 1,
+                "ldrh" | "ldrsh" => 2,
+                "ldr" | "ldrsw" if operands.starts_with('w') => 4,
+                "ldr" if operands.starts_with('x') => 8,
+                "ldp" if operands.starts_with('x') => 16,
+                "ldp" if operands.starts_with('w') => 8,
+                _ => continue,
+            }
+        } else {
+            // The source is the first operand; it must be a memory reference
+            // through something other than the frame.
+            let src = operands.split(',').next().unwrap_or("").trim();
+            if !src.contains("(%r") || src.contains("%rbp)") || src.contains("%rsp)") {
+                continue;
+            }
+            match mnemonic {
+                "movb" | "movzbl" | "movsbl" | "movzbq" | "movsbq" => 1,
+                "movw" | "movzwl" | "movswl" | "movzwq" | "movswq" => 2,
+                "movl" | "movslq" => 4,
+                "movq" => 8,
+                _ => continue,
+            }
+        };
+        if width > widest {
+            widest = width;
+            at = text.to_string();
+        }
+    }
+    (widest, at)
+}
+
+/// No composite is read wider than it is, on either target.
+///
+/// The runtime tests above execute, so they only ever cover the host --
+/// x86-64 here. This one compiles for both triples and reads the widths out
+/// of the assembly, which is what covers the aarch64 lowering on a machine
+/// that cannot run it. A ragged size is read as two overlapping halves, so
+/// the widest access is the half, never the object rounded up.
+#[test]
+fn codegen_no_composite_is_read_wider_than_itself() {
+    // (bytes in the struct, the widest load its value may be read with)
+    let cases: &[(usize, u32)] = &[
+        (1, 1),
+        (2, 2),
+        // The ragged sizes: 3 is two halves of 2, and 5, 6 and 7 are two of 4.
+        (3, 2),
+        (5, 4),
+        (6, 4),
+        (7, 4),
+        // The controls, each already one natural access.
+        (4, 4),
+        (8, 8),
+    ];
+    for &(bytes, want) in cases {
+        let src = format!(
+            "struct S {{ char a[{bytes}]; }};\n\
+             int g(struct S s);\n\
+             int f(struct S *p) {{ return g(*p); }}\n"
+        );
+        for (triple, is_a64) in [(X86_64_LINUX, false), (AARCH64_LINUX, true)] {
+            let asm = asm_for_with(&format!("widest_{bytes}"), triple, &src, &["-O1"]);
+            let body = body_of(&asm, "f");
+            let (got, line) = widest_object_load(body, is_a64);
+            assert_eq!(
+                got, want,
+                "{triple}: a {bytes}-byte struct is read with a {got}-byte \
+                 access (`{line}`), not {want} -- anything wider reaches past \
+                 the object:\n{body}"
+            );
+        }
+    }
+}

@@ -543,13 +543,6 @@ impl X86_64CodeGen {
         saved_arg_regs
     }
 
-    /// Set up register arguments (returns number of FP args for variadic AL)
-    /// The register holding a struct argument's *address*.
-    ///
-    /// The argument pseudo carries a pointer (from `symaddr`), not the struct's
-    /// bytes, so a spilled one is loaded with `mov`: `lea` would give the
-    /// address of the slot holding the pointer, which is a pointer to a
-    /// pointer and reads as garbage.
     /// Load the `bytes` bytes at `[base + offset]` into `dst`, touching no
     /// byte outside them.
     ///
@@ -601,6 +594,12 @@ impl X86_64CodeGen {
         }
     }
 
+    /// The register holding a struct argument's *address*.
+    ///
+    /// The argument pseudo carries a pointer (from `symaddr`), not the struct's
+    /// bytes, so a spilled one is loaded with `mov`: `lea` would give the
+    /// address of the slot holding the pointer, which is a pointer to a
+    /// pointer and reads as garbage.
     fn struct_arg_base(&mut self, arg: PseudoId) -> Reg {
         match self.get_location(arg) {
             Loc::Reg(r) => r,
@@ -620,6 +619,7 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Set up register arguments (returns number of FP args for variadic AL)
     pub(super) fn setup_register_args(
         &mut self,
         insn: &Instruction,

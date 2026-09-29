@@ -848,18 +848,6 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Set up a complex number argument (real + imaginary in two V registers)
-    /// The register holding the address of an argument that travels by
-    /// address -- a complex value at any size, a composite above a
-    /// register's worth -- loading it into X9 when it is not already in one.
-    ///
-    /// Whether a stack slot *is* the object or merely points at it is the
-    /// pseudo's kind, not its location: a `Sym` names storage, and anything
-    /// else in a slot -- a spilled address, an `Alloca` result -- holds a
-    /// pointer. Each call path used to answer this for itself, and each got
-    /// one half wrong: the register-pair and HFA paths read a spilled
-    /// address's own bytes as the aggregate, and the complex paths
-    /// dereferenced a `Sym`'s contents as though they were a pointer.
     /// Load the `bytes` bytes at `[base + offset]` into `dst`, touching no
     /// byte outside them.
     ///
@@ -904,6 +892,17 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// The register holding the address of an argument that travels by
+    /// address -- a complex value at any size, a composite above a
+    /// register's worth -- loading it into X9 when it is not already in one.
+    ///
+    /// Whether a stack slot *is* the object or merely points at it is the
+    /// pseudo's kind, not its location: a `Sym` names storage, and anything
+    /// else in a slot -- a spilled address, an `Alloca` result -- holds a
+    /// pointer. Each call path used to answer this for itself, and each got
+    /// one half wrong: the register-pair and HFA paths read a spilled
+    /// address's own bytes as the aggregate, and the complex paths
+    /// dereferenced a `Sym`'s contents as though they were a pointer.
     fn aggregate_arg_address(&mut self, arg: PseudoId) -> Reg {
         match self.get_location(arg) {
             Loc::Reg(r) => r,
@@ -932,6 +931,7 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// Set up a complex number argument (real + imaginary in two V registers)
     fn setup_complex_arg(
         &mut self,
         arg: PseudoId,

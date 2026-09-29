@@ -124,10 +124,18 @@ impl Aarch64CodeGen {
         args_start: usize,
         types: &TypeTable,
     ) -> i32 {
-        let variadic_start = insn
-            .variadic_arg_start
-            .unwrap_or(insn.src.len())
-            .max(args_start);
+        // `variadic_arg_start` counts the call's own arguments, while
+        // `insn.src` carries the hidden sret pointer ahead of them, so the two
+        // are one apart for a call that returns in memory. Comparing them
+        // directly left the named range empty -- `.max(args_start)` raises the
+        // index but never shifts it -- and every argument was stacked as
+        // though it were variadic, so `struct Big f(int n, ...)` read garbage
+        // for `n` where Apple clang puts 7 in w0. `args_start` is zero for a
+        // call that returns in registers, which is why only sret was wrong.
+        let variadic_start = match insn.variadic_arg_start {
+            Some(v) => (args_start + v).min(insn.src.len()),
+            None => insn.src.len(),
+        };
         let named = self.assign_arg_registers(
             insn,
             args_start..variadic_start,
@@ -547,8 +555,11 @@ impl Aarch64CodeGen {
                         kind: StackKind::Scalar,
                     });
                 }
-            } else if arg_type.is_some_and(|t| types.kind(t) == crate::types::TypeKind::Int128) {
+            } else if arg_type.is_some_and(|t| types.is_plain_int128(t)) {
                 // __int128 uses two consecutive *even-aligned* GP registers.
+                // A *complex* one is not this: thirty-two bytes travel by
+                // reference (stage C.12), and fall to the single-register arm
+                // below as any other composite that size does.
                 if let Some(start) = crate::abi::aapcs64::gr_run_start(
                     types,
                     arg_type.unwrap(),
@@ -658,11 +669,11 @@ impl Aarch64CodeGen {
             offset,
         } in placed
         {
-            if stack_arg
-                .typ
-                .is_some_and(|t| types.kind(t) == TypeKind::Int128)
-            {
-                // Int128: store both 64-bit halves
+            if stack_arg.typ.is_some_and(|t| types.is_plain_int128(t)) {
+                // Int128: store both 64-bit halves. A complex one is a
+                // pointer in a single eight-byte slot, which is what
+                // `StackedArgs::slot` reserved for it -- writing sixteen here
+                // went over the next argument.
                 let loc = self.get_location(stack_arg.pseudo);
                 match loc {
                     ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {

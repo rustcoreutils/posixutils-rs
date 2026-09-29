@@ -8684,6 +8684,128 @@ fn test_void_cast_of_a_float_converts_nothing() {
     assert_eq!(converts, 0);
 }
 
+/// A construct that builds control flow of its own, reached where control
+/// cannot arrive.
+///
+/// `current_bb` is `None` after a `goto` and before a `switch`'s first
+/// `case`, and `emit` quietly drops what it is handed there. `emit_two_way`
+/// cannot be dropped that way -- it has to hang three blocks off something --
+/// and it took `self.current_bb.unwrap()`, so `sqrt`, whose errno check is a
+/// two-way, panicked the compiler outright on the dead statement after a
+/// `goto`.
+#[test]
+fn test_two_way_in_unreachable_code_does_not_panic() {
+    let src = "\
+double sqrt(double);
+double d;
+void f(void) { goto skip; d = sqrt(d); skip: return; }
+";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    // The unreachable statement is lowered into a block of its own, which
+    // nothing branches to; what matters is that lowering finished at all.
+    assert!(!f.blocks.is_empty());
+}
+
+/// The same, before a `switch`'s first `case`, which leaves `current_bb`
+/// `None` for the same reason (C17 6.8.4.2 gives such a statement no edge).
+#[test]
+fn test_two_way_before_the_first_case_does_not_panic() {
+    let src = "\
+double sqrt(double);
+double d;
+void f(int x) { switch (x) { d = sqrt(d); case 1: d = 1.0; } }
+";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    assert!(!f.blocks.is_empty());
+}
+
+/// A conversion to `_Bool` is a comparison against zero, and a comparison
+/// carries its operand type so the backend sizes it from the operands.
+///
+/// Carrying `_Bool` sized the compare at 8 bits, which became a 32-bit `cmpl`
+/// -- `(_Bool)0x100000000L` then read only the low half. The instruction now
+/// carries `long`, as every comparison built in `linearize_emit` does.
+#[test]
+fn test_bool_conversion_compares_at_the_operand_width() {
+    let src = "void f(long x) { _Bool b = x; (void)b; }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let cmp = f
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .find(|i| i.op == Opcode::SetNe)
+        .expect("a _Bool conversion compares against zero");
+    assert_eq!(
+        cmp.size, 64,
+        "the compare is sized by its operand, not _Bool"
+    );
+}
+
+/// An explicit cast to `_Bool` from a floating type takes the same rule, and
+/// not the float-to-integer truncation beside it: `(_Bool)0.5` is 1.
+#[test]
+fn test_cast_to_bool_from_a_float_does_not_truncate() {
+    let src = "void f(double x) { _Bool b = (_Bool)x; (void)b; }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let insns: Vec<_> = f.blocks.iter().flat_map(|bb| bb.insns.iter()).collect();
+    assert!(
+        insns.iter().any(|i| i.op == Opcode::FCmpONe),
+        "the cast compares against zero"
+    );
+    assert!(
+        !insns
+            .iter()
+            .any(|i| matches!(i.op, Opcode::FCvtS | Opcode::FCvtU)),
+        "and does not convert the float to an integer"
+    );
+}
+
+/// `__imag__` of a real operand evaluates it, even though its value is a
+/// zero known in advance.
+///
+/// The zero was returned without linearizing the operand at all, so every
+/// effect in it was dropped -- `__imag__ (x += 5.0)` left `x` alone. The
+/// store the assignment owes must still be emitted.
+#[test]
+fn test_imag_of_a_real_operand_emits_its_side_effects() {
+    let src = "void f(double x) { (void)(__imag__ (x += 5.0)); }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let adds = f
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| i.op == Opcode::FAdd)
+        .count();
+    assert_eq!(adds, 1, "the assignment inside __imag__ still happens");
+}
+
+/// A cast to `void` converts nothing, from a complex operand as well as a
+/// real one.
+///
+/// The `void` check sat after the arm that converts a complex operand to a
+/// real type, and `void` is not complex, so `(void)z` took that arm and
+/// emitted a conversion -- a `cvttsd2si` at -O0, which raises `FE_INVALID`
+/// for a NaN real part. `test_void_cast_of_a_float_converts_nothing` covers
+/// the real operand; this is the complex one.
+#[test]
+fn test_void_cast_of_a_complex_converts_nothing() {
+    let src = "void f(double _Complex z, float _Complex w) { (void)z; (void)w; }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let converts = f
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| matches!(i.op, Opcode::FCvtS | Opcode::FCvtU | Opcode::FCvtF))
+        .count();
+    assert_eq!(converts, 0);
+}
+
 /// x86-64 Linux, whose x87 `long double` holds `0x1p62L + 1.0L` exactly --
 /// a test about that names the target rather than taking the host's, since
 /// on an arm64 Mac `long double` is `double`.

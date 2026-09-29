@@ -170,7 +170,9 @@ fn for_each_target(body: &str, opts: &[&str], check: impl Fn(&[String], &str)) {
 #[test]
 fn builtins_stdio_fold_makes_the_calls() {
     let cases: &[(&str, &[&str])] = &[
-        ("void f(void) { printf(\"\"); }", &[]),
+        // An empty write orients the stream (C17 7.21.2p4), so the call
+        // stays; see `Print::text`.
+        ("void f(void) { printf(\"\"); }", &["printf"]),
         ("void f(void) { printf(\"a\"); }", &["putchar"]),
         ("void f(void) { printf(\"hi\\n\"); }", &["puts"]),
         ("void f(const char *s) { printf(\"%s\\n\", s); }", &["puts"]),
@@ -184,7 +186,9 @@ fn builtins_stdio_fold_makes_the_calls() {
             "void f(FILE *fp, int c) { fprintf(fp, \"%c\", c); }",
             &["fputc"],
         ),
-        ("void f(FILE *fp) { fputs(\"\", fp); }", &[]),
+        // Writes nothing, but still orients the stream (C17 7.21.2p4), so
+        // the call stays.
+        ("void f(FILE *fp) { fputs(\"\", fp); }", &["fputs"]),
         ("void f(FILE *fp) { fputs(\"x\", fp); }", &["fputc"]),
         (
             "void f(FILE *fp, int i) { fputs(i ? \"ab\" : \"cd\", fp); }",
@@ -234,4 +238,75 @@ fn builtins_stdio_fold_follows_asm_labels() {
     for_each_target(body, &["-O2"], |calls, what| {
         assert_eq!(calls, ["my_puts"], "{what}");
     });
+}
+
+/// `fputs("", fp)` writes nothing, but it still orients the stream.
+///
+/// C17 7.21.2p4: a stream has no orientation until an input or output
+/// function is applied to it, and the first one sets it -- whether or not it
+/// transfers any bytes. Folding the call away took the orientation with it,
+/// so `fwide(fp, 0)` answered 0 at -O2 and a byte orientation at -O0:
+///
+/// ```text
+///     fputs("", fp);  fwide(fp, 0)   ->   -1 at -O0,  0 at -O2
+/// ```
+///
+/// gcc and clang keep this call for the same reason. They drop
+/// `fprintf(fp, "")` and `fprintf(fp, "%s", "")` and lose the orientation
+/// with them; every empty write is treated alike here, so those are
+/// asserted too.
+#[test]
+fn stdio_fold_empty_fputs_still_orients_the_stream() {
+    let src = r#"
+#include <stdio.h>
+#include <wchar.h>
+int main(void) {
+    FILE *f = fopen("/dev/null", "w");
+    if (!f) return 1;
+    /* Nothing is written, but the stream becomes byte-oriented. The result
+       is deliberately unused: that is the shape the fold applies to. */
+    fputs("", f);
+    if (fwide(f, 0) >= 0) return 3;
+    fclose(f);
+
+    /* The same through a variable the optimizer can see is empty. */
+    FILE *g = fopen("/dev/null", "w");
+    if (!g) return 4;
+    const char *empty = "";
+    fputs(empty, g);
+    if (fwide(g, 0) >= 0) return 6;
+    fclose(g);
+
+    /* Every other empty write orients the stream too. */
+    FILE *h = fopen("/dev/null", "w");
+    if (!h) return 7;
+    fprintf(h, "");
+    if (fwide(h, 0) >= 0) return 8;
+    fclose(h);
+
+    FILE *i = fopen("/dev/null", "w");
+    if (!i) return 9;
+    fprintf(i, "%s", "");
+    if (fwide(i, 0) >= 0) return 10;
+    fclose(i);
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        let dir = plib::tmp::Builder::new()
+            .prefix("c17_fputs_orient_")
+            .tempdir()
+            .expect("tempdir");
+        let c = dir.path().join("t.c");
+        let exe = dir.path().join("t");
+        std::fs::write(&c, src).expect("write source");
+        let built = run_c17(&[opt, "-o", exe.to_str().unwrap(), c.to_str().unwrap()]);
+        assert!(built.success, "{opt}: {}{}", built.stdout, built.stderr);
+        let code = Command::new(&exe)
+            .status()
+            .expect("run")
+            .code()
+            .unwrap_or(-1);
+        assert_eq!(code, 0, "{opt}");
+    }
 }

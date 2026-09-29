@@ -801,7 +801,13 @@ impl<'a> Linearizer<'a> {
                 Opcode::SetNe
             };
 
-            let mut insn = Instruction::binop(opcode, result, val, zero, to_typ, to_size);
+            // A comparison carries its *operand* type, not its result type:
+            // that is what `emit_compare` sizes the compare from, and what
+            // every comparison built in `linearize_emit` passes. Carrying
+            // `_Bool` here sized it at 8 bits, which `.max(32)` made a 32-bit
+            // `cmpl`, so `(_Bool)0x100000000L` compared only the low half and
+            // came out 0.
+            let mut insn = Instruction::binop(opcode, result, val, zero, from_typ, from_size);
             insn.src_size = from_size;
             insn.src_typ = Some(from_typ);
             self.emit(insn);
@@ -944,6 +950,24 @@ impl<'a> Linearizer<'a> {
         self.switch_bb(bb);
     }
 
+    /// The block to emit into, starting an unreachable one where there is
+    /// none.
+    ///
+    /// `current_bb` is `None` wherever control cannot arrive -- after a
+    /// `goto`, and before a `switch`'s first `case` -- and [`Self::emit`]
+    /// quietly drops what it is handed there. A construct that builds
+    /// *control flow* of its own cannot be dropped that way: it has to hang
+    /// its blocks off an existing one. This is that block, and
+    /// `dce::remove_unreachable_blocks` takes it away again with everything
+    /// lowered into it.
+    pub(crate) fn current_or_unreachable_bb(&mut self) -> BasicBlockId {
+        if self.current_bb.is_none() {
+            self.start_unreachable_block();
+        }
+        self.current_bb
+            .expect("start_unreachable_block leaves a current block")
+    }
+
     // Function linearization
 
     /// Whether a return value of this type comes back through a hidden
@@ -1044,7 +1068,7 @@ impl<'a> Linearizer<'a> {
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
                 let mods = self.types.modifiers(typ);
-                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+                let is_volatile = self.types.contains_volatile(typ);
                 let is_atomic = mods.contains(TypeModifiers::ATOMIC);
                 func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
             }
@@ -1130,7 +1154,7 @@ impl<'a> Linearizer<'a> {
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
                 let mods = self.types.modifiers(typ);
-                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+                let is_volatile = self.types.contains_volatile(typ);
                 let is_atomic = mods.contains(TypeModifiers::ATOMIC);
                 func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
                 // Record for inliner: the backend prologue fills this local from
@@ -1189,7 +1213,7 @@ impl<'a> Linearizer<'a> {
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
                 let mods = self.types.modifiers(typ);
-                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+                let is_volatile = self.types.contains_volatile(typ);
                 let is_atomic = mods.contains(TypeModifiers::ATOMIC);
                 func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
             }
@@ -2576,6 +2600,19 @@ impl<'a> Linearizer<'a> {
             return self.emit_complex_nonzero(inner_expr);
         }
 
+        // C17 6.3.2.2: a cast to `void` evaluates the operand and discards
+        // the value, converting nothing. This has to come before the complex
+        // arms as well as before the arithmetic ones: `void` is neither
+        // complex nor floating, so a complex operand took the
+        // complex-to-real arm just below and a floating one the
+        // float-to-integer arm further down, and `(void)z` became a
+        // `cvttsd2si` that raises `FE_INVALID` for a NaN. The optimizer
+        // deleted the dead conversion at -O1 and above, so only -O0 raised
+        // it.
+        if self.types.kind(cast_type) == TypeKind::Void {
+            return self.linearize_expr(inner_expr);
+        }
+
         if self.types.is_complex(src_type) && !self.types.is_complex(cast_type) {
             return self.emit_complex_to_real(inner_expr, cast_type);
         }
@@ -2592,12 +2629,16 @@ impl<'a> Linearizer<'a> {
 
         let src = self.linearize_expr(inner_expr);
 
-        // C17 6.3.2.2: a cast to `void` discards the value and converts
-        // nothing. `void` is not a floating type, so a floating operand fell
-        // into the float-to-integer arm below and `(void)x` became a
-        // `cvttss2si`, which raises `FE_INVALID` for a NaN.
-        if self.types.kind(cast_type) == TypeKind::Void {
-            return src;
+        // C17 6.3.1.2: a conversion to `_Bool` compares against zero. It is
+        // not a truncation, and `_Bool` is an integer type, so a floating
+        // operand fell into the float-to-integer arm below and `(_Bool)0.5`
+        // became a `cvttsd2si` -- 0, where the value is plainly not zero.
+        // `emit_convert` carries the rule for every source type; this path
+        // has a conversion of its own and reached it only for an integer.
+        if self.types.kind(cast_type) == TypeKind::Bool
+            && self.types.kind(src_type) != TypeKind::Bool
+        {
+            return self.emit_convert(src, src_type, cast_type);
         }
 
         // Emit conversion if needed
@@ -4140,15 +4181,29 @@ impl<'a> Linearizer<'a> {
     /// of its type -- gcc accepts both for `__real__` and `__imag__`. (The
     /// library functions' argument has already been converted to a complex
     /// type, so they never reach that case.)
+    ///
+    /// The zero is known without looking at the operand, but the operand is
+    /// still *evaluated*: this is not an unevaluated context, so the effects
+    /// in `__imag__ (x += 5.0)` have to happen.
     fn linearize_complex_half(&mut self, operand: &Expr, half: ComplexHalf) -> PseudoId {
         let op_typ = self.expr_type(operand);
         if !self.types.is_complex(op_typ) {
             return match half {
                 ComplexHalf::Real => self.linearize_expr(operand),
-                ComplexHalf::Imag if self.types.is_float(op_typ) => {
-                    self.emit_fconst(crate::float::FloatVal::ZERO, op_typ)
+                ComplexHalf::Imag => {
+                    // The *value* is known in advance, the operand is not.
+                    // `__imag__` is not an unevaluated context the way a
+                    // `sizeof` operand is, so the effects still have to
+                    // happen: returning the zero without linearizing the
+                    // operand dropped them, and `__imag__ (x += 5.0)` left
+                    // `x` alone. Only the value is discarded.
+                    self.linearize_expr(operand);
+                    if self.types.is_float(op_typ) {
+                        self.emit_fconst(crate::float::FloatVal::ZERO, op_typ)
+                    } else {
+                        self.emit_const(0, op_typ)
+                    }
                 }
-                ComplexHalf::Imag => self.emit_const(0, op_typ),
             };
         }
         let base_typ = self.types.complex_base(op_typ);

@@ -689,13 +689,25 @@ fn c99_complex_va_arg_interoperates_with_gcc_host() {
     for opt in ["-O0", "-O2"] {
         let callee = c17_object("va_callee", VA_COMPLEX_CALLEE, opt, dir.path());
         assert_eq!(
-            host_link_and_run("gcc_caller", &[&callee], &[VA_COMPLEX_CALLER], dir.path()),
+            host_link_and_run(
+                "gcc_caller",
+                &[&callee],
+                &[VA_COMPLEX_CALLER],
+                opt,
+                dir.path()
+            ),
             0,
             "gcc caller, c17 callee, {opt}"
         );
         let caller = c17_object("va_caller", VA_COMPLEX_CALLER, opt, dir.path());
         assert_eq!(
-            host_link_and_run("gcc_callee", &[&caller], &[VA_COMPLEX_CALLEE], dir.path()),
+            host_link_and_run(
+                "gcc_callee",
+                &[&caller],
+                &[VA_COMPLEX_CALLEE],
+                opt,
+                dir.path()
+            ),
             0,
             "c17 caller, gcc callee, {opt}"
         );

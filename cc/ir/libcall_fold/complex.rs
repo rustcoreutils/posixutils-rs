@@ -30,10 +30,13 @@
 //
 
 use super::{Facts, Folded};
-use crate::float::{ComplexRoutineFormat, Contraction, FloatVal};
+use crate::float::FloatVal;
+#[cfg(test)]
+use crate::float::{ComplexDivision, ComplexRoutineFormat, Contraction};
 use crate::ir::build::Builder;
 use crate::ir::Instruction;
 use crate::parse::ast::LibFn;
+#[cfg(test)]
 use crate::target::{Arch, Os, Target};
 
 /// What the call `insn` to `__mul?c3` (`MulComplex`) or `__div?c3`
@@ -54,32 +57,14 @@ pub(super) fn fold(known: LibFn, insn: &Instruction, facts: &Facts) -> Option<Fo
     for (half, &p) in halves.iter_mut().zip(&insn.src[first..]) {
         *half = facts.float(p, typ).filter(|v| v.is_finite())?;
     }
-    let contraction = libgcc_contraction(facts.target, routine)?;
+    let division = facts.target.complex_division(routine);
     let [a, b, c, d] = halves;
     let (re, im) = match known {
         LibFn::MulComplex => FloatVal::complex_mul((a, b), (c, d), fmt),
-        LibFn::DivComplex => FloatVal::complex_div_by((a, b), (c, d), fmt, contraction)?,
+        LibFn::DivComplex => FloatVal::complex_div_as((a, b), (c, d), fmt, division)?,
         _ => return None,
     };
     (re.is_finite() && im.is_finite()).then_some(Folded::Complex(re, im))
-}
-
-/// How `target`'s libgcc divides in `routine`'s format; `None` where the
-/// target's routines are not libgcc's.
-///
-/// Multiplication asks only whether they are: `__mul?c3` fuses only inside
-/// Annex G's recovery, where fusing changes nothing but a NaN's sign (see
-/// the comment over `FloatVal::complex_mul`).
-fn libgcc_contraction(target: &Target, routine: ComplexRoutineFormat) -> Option<Contraction> {
-    if target.os != Os::Linux {
-        return None;
-    }
-    Some(match (target.arch, routine) {
-        (Arch::Aarch64, ComplexRoutineFormat::Binary32 | ComplexRoutineFormat::Binary64) => {
-            Contraction::Fused
-        }
-        _ => Contraction::Separate,
-    })
 }
 
 /// Write `(re, im)` where `call` returns its result, in place of the call:
@@ -237,11 +222,14 @@ mod tests {
     }
 
     /// An operand that is not constant, or not finite, leaves the call; so
-    /// does a result that is not finite, and any target whose routines are
-    /// not libgcc's.
+    /// does a result that is not finite.
+    ///
+    /// The target no longer decides this: compiler-rt's routines are
+    /// modelled beside libgcc's, so Apple and FreeBSD fold what Linux folds
+    /// (`only_linux_divides_by_libgcc` pins which routine each uses).
     #[test]
     fn what_the_program_would_compute_differently_is_left_to_it() {
-        let cases: [(LibFn, [Option<f64>; 4], Target); 7] = [
+        let cases: [(LibFn, [Option<f64>; 4], Target); 5] = [
             (
                 LibFn::MulComplex,
                 [Some(1.0), None, Some(1.0), Some(1.0)],
@@ -266,16 +254,6 @@ mod tests {
                 LibFn::DivComplex,
                 [Some(1.0), Some(1.0), Some(0.0), Some(0.0)],
                 linux(Arch::X86_64),
-            ),
-            (
-                LibFn::DivComplex,
-                [Some(1.0), Some(2.0), Some(3.0), Some(4.0)],
-                Target::new(Arch::Aarch64, Os::MacOS),
-            ),
-            (
-                LibFn::MulComplex,
-                [Some(1.0), Some(2.0), Some(3.0), Some(4.0)],
-                Target::new(Arch::X86_64, Os::FreeBSD),
             ),
         ];
         for (known, halves, target) in cases {
@@ -320,36 +298,52 @@ mod tests {
         );
     }
 
-    /// Which targets run libgcc's routines, and which of those fuse.
+    /// Which targets divide by libgcc's routines, and which of those fuse;
+    /// the rest divide by compiler-rt's.
     #[test]
     fn only_linux_divides_by_libgcc() {
+        use ComplexDivision::{CompilerRt, Libgcc};
         use ComplexRoutineFormat as R;
         let aarch64 = linux(Arch::Aarch64);
         let x86 = linux(Arch::X86_64);
         assert_eq!(
-            libgcc_contraction(&aarch64, R::Binary64),
-            Some(Contraction::Fused)
+            aarch64.complex_division(R::Binary64),
+            Libgcc(Contraction::Fused)
         );
         assert_eq!(
-            libgcc_contraction(&aarch64, R::Binary32),
-            Some(Contraction::Fused)
+            aarch64.complex_division(R::Binary32),
+            Libgcc(Contraction::Fused)
         );
         assert_eq!(
-            libgcc_contraction(&aarch64, R::Binary128),
-            Some(Contraction::Separate)
+            aarch64.complex_division(R::Binary128),
+            Libgcc(Contraction::Separate)
         );
         assert_eq!(
-            libgcc_contraction(&x86, R::Binary64),
-            Some(Contraction::Separate)
+            x86.complex_division(R::Binary64),
+            Libgcc(Contraction::Separate)
         );
         assert_eq!(
-            libgcc_contraction(&x86, R::X87Extended),
-            Some(Contraction::Separate)
+            x86.complex_division(R::X87Extended),
+            Libgcc(Contraction::Separate)
         );
+        // The rest divide by compiler-rt's, which contracts wherever
+        // libgcc's does -- both write each sum's products inside the
+        // expression that adds them, so the target's `fmadd` decides, not
+        // the library. Getting this wrong on Apple arm64 made a folded
+        // quotient differ from the routine in the last place.
         for os in [Os::MacOS, Os::FreeBSD] {
-            for arch in [Arch::X86_64, Arch::Aarch64] {
+            for (arch, want) in [
+                (Arch::X86_64, Contraction::Separate),
+                (Arch::Aarch64, Contraction::Fused),
+            ] {
                 let t = Target::new(arch, os);
-                assert_eq!(libgcc_contraction(&t, R::Binary64), None, "{t:?}");
+                assert_eq!(t.complex_division(R::Binary64), CompilerRt(want), "{t:?}");
+                // binary128 is software on either arch, and fuses nothing.
+                assert_eq!(
+                    t.complex_division(R::Binary128),
+                    CompilerRt(Contraction::Separate),
+                    "{t:?}"
+                );
             }
         }
     }

@@ -1915,6 +1915,321 @@ int pass_sc(int x) { return take_sc((signed char)x); }
     }
 }
 
+/// An HFA's members are counted through every level of nesting, arrays of
+/// aggregates included.
+///
+/// AAPCS64 5.9.5 defines a homogeneous floating-point aggregate by the
+/// floating-point members a composite has when it is flattened, so
+/// `struct { struct { float x, y; } p[2]; }` is four floats and goes in
+/// s0-s3. `try_classify_hfa` recursed into a nested *struct* member but its
+/// array arm asked only whether the element was a scalar floating type, so an
+/// array of structs answered "not an HFA" and the whole aggregate went in
+/// general registers:
+///
+/// ```text
+///     c17    stp x0, x1, [x29, #16]     ; the parameter, in x0 and x1
+///     clang  fadd s0, s0, s3            ; s0-s3
+/// ```
+///
+/// Both sides are asserted, and a `struct { float x, y; }[2]` that is *too
+/// long* to be an HFA -- five floats -- is the control, since flattening
+/// must still respect the four-element bound.
+#[test]
+fn codegen_aarch64_hfa_counts_through_an_array_of_aggregates() {
+    let src = r#"
+struct Pair { float x, y; };
+struct NEST { struct Pair p[2]; };
+struct BIG  { struct Pair p[3]; };
+
+float take(struct NEST n);
+float sum(struct NEST n) { return n.p[0].x + n.p[1].y; }
+float call(void) { struct NEST n; n.p[0].x = 1; n.p[0].y = 2;
+                   n.p[1].x = 3; n.p[1].y = 4; return take(n) + 1.0f; }
+
+float take_big(struct BIG b);
+float big(void) { struct BIG b; b.p[0].x = 1; return take_big(b) + 1.0f; }
+"#;
+    for triple in [AARCH64_LINUX, AARCH64_DARWIN] {
+        let a = asm_for_with("hfa_nested", triple, src, &["-O1"]);
+
+        // The callee receives four floats, so the fourth is in s3.
+        let body = body_of(&a, "sum");
+        assert!(
+            body.contains("s3"),
+            "{triple}: a four-float HFA arrives in s0-s3:\n{body}"
+        );
+        assert!(
+            !body.contains("stp x0, x1"),
+            "{triple}: and not in general registers:\n{body}"
+        );
+
+        // The caller puts it there too.
+        let body = body_of(&a, "call");
+        assert!(
+            body.contains("s3"),
+            "{triple}: the caller passes a four-float HFA in s0-s3:\n{body}"
+        );
+
+        // The control: six floats is past the four-element bound, so it is
+        // not an HFA and must go the ordinary way.
+        let body = body_of(&a, "big");
+        assert!(
+            !body.contains("s5"),
+            "{triple}: six floats exceed the HFA bound:\n{body}"
+        );
+    }
+}
+
+/// `_Complex __int128` travels by reference on aarch64, in one register.
+///
+/// It is thirty-two bytes, and AAPCS64 §5.4.2 stage C.12 replaces a composite
+/// larger than sixteen with a pointer to a copy -- which `classify_param`
+/// already answers, `classify_complex_integer` naming this very case. The
+/// back end overrode it: `kind()` reports a complex type's *base* kind, so
+/// `kind(t) == TypeKind::Int128` was true here too and took the arm meant for
+/// a bare `__int128`, two consecutive even-aligned X registers.
+///
+/// ```text
+///     int g(long a, _Complex __int128 z, long b, long c)
+///     was  a->x0  z->x2,x3  b->x4  c->x5
+///     is   a->x0  z->x1     b->x2  c->x3
+/// ```
+///
+/// Caller and callee were wrong in the same direction, so no program c17
+/// compiles on both sides can see it; the shapes are asserted instead. The
+/// thirty-two byte struct beside each case is the control -- it classifies
+/// `Indirect` too, and was always right, so the fix cannot pass by moving
+/// both.
+#[test]
+fn codegen_aarch64_complex_int128_argument_travels_by_reference() {
+    let src = r#"
+struct Big { long a, b, c, d; };
+int g_struct(long a, struct Big z, long b, long c);
+int g_cplx(long a, _Complex __int128 z, long b, long c);
+int c_struct(struct Big *p) { return g_struct(1111, *p, 2222, 3333); }
+int c_cplx(_Complex __int128 *p) { return g_cplx(1111, *p, 2222, 3333); }
+long k_struct(long a, struct Big z, long b, long c) { return a + b + c; }
+long k_cplx(long a, _Complex __int128 z, long b, long c) { return a + b + c; }
+"#;
+    for triple in [AARCH64_LINUX, AARCH64_DARWIN] {
+        let asm = asm_for_with("cplx_i128_arg", triple, src, &["-O1"]);
+
+        // Caller: the last argument lands in x3, because the one before it
+        // took a single register. The immediate is materialized into a
+        // scratch first, so follow that one move.
+        let last_arg_register = |func: &str| -> String {
+            let body = body_of(&asm, func);
+            let scratch = body
+                .lines()
+                .map(str::trim)
+                .find_map(|l| l.strip_prefix("movz ")?.split_once(", #3333"))
+                .map(|(r, _)| r.to_string())
+                .unwrap_or_else(|| panic!("{func}: nothing materializes 3333:\n{body}"));
+            body.lines()
+                .map(str::trim)
+                .find_map(|l| {
+                    let (dst, src) = l.strip_prefix("mov ")?.split_once(", ")?;
+                    (src == scratch).then(|| dst.to_string())
+                })
+                .unwrap_or_else(|| panic!("{func}: {scratch} never reaches an argument:\n{body}"))
+        };
+        assert_eq!(
+            last_arg_register("c_struct"),
+            "x3",
+            "{triple}: the control's last argument is x3"
+        );
+        assert_eq!(
+            last_arg_register("c_cplx"),
+            "x3",
+            "{triple}: a complex __int128 takes one register, so the last \
+             argument is x3 and not x5:\n{}",
+            body_of(&asm, "c_cplx")
+        );
+
+        // Callee: a parameter passed by reference is one register, so nothing
+        // spills a consecutive pair for it.
+        for func in ["k_struct", "k_cplx"] {
+            let body = body_of(&asm, func);
+            assert!(
+                !body.contains("stp x2, x3"),
+                "{triple}: {func} receives a pointer in one register, so no \
+                 pair is spilled for it:\n{body}"
+            );
+        }
+    }
+}
+
+/// The same argument, once it has run out of registers: its stack slot is
+/// eight bytes, not sixteen.
+///
+/// `StackedArgs::slot` gives an `Indirect` argument an eight-byte slot,
+/// because what travels is the pointer. The stacked-store path asked
+/// `kind(t) == TypeKind::Int128` as well and wrote both halves of a
+/// sixteen-byte value into it, over whatever the next argument had been put
+/// in.
+#[test]
+fn codegen_aarch64_stacked_complex_int128_writes_one_slot() {
+    let src = r#"
+int g(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7,
+      _Complex __int128 z, long tail);
+int call(_Complex __int128 *p) {
+    return g(0, 1, 2, 3, 4, 5, 6, 7, *p, 4242);
+}
+"#;
+    for triple in [AARCH64_LINUX, AARCH64_DARWIN] {
+        let asm = asm_for_with("cplx_i128_stacked", triple, src, &["-O1"]);
+        let body = body_of(&asm, "call");
+        // The outgoing area is written with `str`, one slot at a time. A
+        // `stp` into it is the sixteen-byte write that overruns the slot.
+        // The frame record's own `stp x29, x30, [sp, #-N]!` is pre-indexed
+        // and is not a store into that area.
+        assert!(
+            !body.lines().any(|l| {
+                let l = l.trim();
+                l.starts_with("stp ") && l.contains("[sp") && !l.contains("]!")
+            }),
+            "{triple}: a by-reference argument fills one eight-byte slot, so \
+             no pair is stored into the outgoing area:\n{body}"
+        );
+    }
+}
+
+/// c17 and aarch64 gcc on either side of a call carrying `_Complex __int128`.
+///
+/// The asm-shape tests above say the register assignment is right; this says
+/// gcc agrees, which is the only way to be sure -- caller and callee were
+/// wrong in the same direction, so c17 on both sides of the call could not
+/// tell. Runs only where the cross toolchain is installed.
+///
+/// `t_stk` is the stacked half: `z` overflows the registers and travels as a
+/// pointer in an eight-byte slot, with `tail` in the next. Writing sixteen
+/// bytes there is what took `tail` with it.
+#[test]
+fn codegen_aarch64_agrees_with_gcc_on_complex_int128() {
+    if !aarch64_cross_available() {
+        eprintln!(
+            "SKIP codegen_aarch64_agrees_with_gcc_on_complex_int128: \
+             no aarch64 cross toolchain"
+        );
+        return;
+    }
+
+    let decls = r#"
+typedef _Complex __int128 CI;
+int t_arg(long a, CI z, long b, long c);
+int t_stk(long a0, long a1, long a2, long a3, long a4, long a5, long a6,
+          long a7, CI z, long tail);
+"#;
+
+    // gcc's own support for the type is what this rests on, so ask before
+    // assuming it: a skip that says why beats a failure that looks like the
+    // compiler's.
+    let probe = create_c_file(
+        "a64_ci_probe",
+        &format!("{decls}CI probe(CI z) {{ return z; }}\n"),
+    );
+    let probe_ok = std::process::Command::new("aarch64-linux-gnu-gcc")
+        .args(["-c", "-o", "/dev/null"])
+        .arg(probe.path())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !probe_ok {
+        eprintln!(
+            "SKIP codegen_aarch64_agrees_with_gcc_on_complex_int128: \
+             this gcc does not accept _Complex __int128"
+        );
+        return;
+    }
+
+    let callee_src = format!(
+        "{decls}{}",
+        r#"
+#define CHK(cond) return (cond) ? 0 : __LINE__
+int t_arg(long a, CI z, long b, long c)
+{ CHK(a == 1 && (long)__real__ z == 77 && (long)__imag__ z == 78 && b == 2 && c == 3); }
+int t_stk(long a0, long a1, long a2, long a3, long a4, long a5, long a6,
+          long a7, CI z, long tail)
+{ (void)a1;(void)a2;(void)a3;(void)a4;(void)a5;(void)a6;
+  CHK(a0 == 0 && a7 == 7 && (long)__real__ z == 77 && (long)__imag__ z == 78
+      && tail == 4242); }
+"#
+    );
+
+    let caller_src = format!(
+        "{decls}{}",
+        r#"
+int main(void)
+{
+    CI z;
+    __real__ z = 77;
+    __imag__ z = 78;
+    if (t_arg(1, z, 2, 3)) return 1;
+    if (t_stk(0, 1, 2, 3, 4, 5, 6, 7, z, 4242)) return 2;
+    return 0;
+}
+"#
+    );
+
+    let callee_c = create_c_file("a64_ci_callee", &callee_src);
+    let caller_c = create_c_file("a64_ci_caller", &caller_src);
+    let callee_path = callee_c.path().to_string_lossy().to_string();
+    let caller_path = caller_c.path().to_string_lossy().to_string();
+
+    for opt in ["-O0", "-O2"] {
+        let mut asm_paths = Vec::new();
+        for (tag, src_path) in [("callee", &callee_path), ("caller", &caller_path)] {
+            let out = plib::tmp::Builder::new()
+                .prefix(&format!("c17_a64_ci_{tag}_"))
+                .suffix(".s")
+                .tempfile()
+                .expect("failed to create temp file");
+            let out_path = out.path().to_string_lossy().to_string();
+            let run = run_c17(&[
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                opt,
+                "-S",
+                "-o",
+                &out_path,
+                src_path,
+            ]);
+            assert!(
+                run.success,
+                "c17 failed on the {tag} at {opt}:\n{}",
+                run.stderr
+            );
+            asm_paths.push((out, out_path));
+        }
+        let callee_asm = asm_paths[0].1.clone();
+        let caller_asm = asm_paths[1].1.clone();
+
+        assert_eq!(
+            cross_link_and_run("a64_ci_ref", &[&caller_path, &callee_path]),
+            0,
+            "the gcc/gcc reference must pass, or this probe is not testing the ABI"
+        );
+        assert_eq!(
+            cross_link_and_run("a64_ci_c17_callee", &[&caller_path, &callee_asm]),
+            0,
+            "{opt}: a gcc caller must reach a c17 callee -- c17 read the \
+             thirty-two byte complex from a register pair gcc passes a \
+             pointer in"
+        );
+        assert_eq!(
+            cross_link_and_run("a64_ci_c17_caller", &[&caller_asm, &callee_path]),
+            0,
+            "{opt}: a c17 caller must reach a gcc callee -- c17 spent three \
+             registers on an argument gcc reads from one, shifting the rest"
+        );
+        assert_eq!(
+            cross_link_and_run("a64_ci_c17_both", &[&caller_asm, &callee_asm]),
+            0,
+            "{opt}: c17 must also agree with itself"
+        );
+    }
+}
+
 /// A pointer comparison must select the *unsigned* condition code.
 ///
 /// C17 6.5.8 compares addresses, and an address is unsigned. The behavioural

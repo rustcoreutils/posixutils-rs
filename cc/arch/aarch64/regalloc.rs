@@ -925,10 +925,9 @@ pub fn param_layout(
             // NGRN when the type is 16-aligned (stage C.10). Not fitting sends
             // it, and everything after it, to the stack (C.11).
             class
-                if types.kind(typ) == TypeKind::Int128
-                    || matches!(&class, ArgClass::Direct { classes, .. }
-                        if classes.len() == 2
-                            && classes.iter().all(|c| *c == RegClass::Integer)) =>
+                if matches!(&class, ArgClass::Direct { classes, .. }
+                    if classes.len() == 2
+                        && classes.iter().all(|c| *c == RegClass::Integer)) =>
             {
                 match crate::abi::aapcs64::gr_run_start(types, typ, ngrn, 2, REGS) {
                     Some(first) => {
@@ -1541,7 +1540,7 @@ impl RegAlloc {
                 // __int128 arrives in an even-aligned register pair, but
                 // always lives in a 16-byte local slot; the prologue spills
                 // the pair into it.
-                ParamPlace::Gp { first, count } if types.kind(typ) == TypeKind::Int128 => {
+                ParamPlace::Gp { first, count } if types.is_plain_int128(typ) => {
                     self.stack_offset += 16;
                     let slot = -self.stack_offset;
                     self.locations
@@ -1779,7 +1778,7 @@ impl RegAlloc {
         let mut multi_reg_returns: HashMap<PseudoId, TypeId> = HashMap::new();
         for insn in func.blocks.iter().flat_map(|b| &b.insns) {
             let Some(typ) = insn.typ else { continue };
-            if types.kind(typ) == TypeKind::Int128 {
+            if types.is_plain_int128(typ) {
                 int128_pseudos.extend(insn.target);
                 int128_pseudos.extend(insn.src.iter().copied());
             }

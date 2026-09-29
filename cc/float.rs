@@ -1400,11 +1400,17 @@ impl FloatVal {
 
         let (sig_a, exp_a) = a.scaled();
         let (sig_b, exp_b) = b.scaled();
+        // `U256::div` answers the exact floor of the quotient and whether
+        // anything was left over, which is precisely what `round_wide` asks
+        // for: a truncation, and a sticky reporting what fell below its low
+        // bit. The remainder goes in once, through the sticky.
+        //
+        // It used to go in twice -- the quotient's magnitude was bumped by
+        // one as well -- and with the dropped bits equal to `half - 1` that
+        // made the residue exactly `half`, which the sticky then rounded up,
+        // though the true value is strictly below the midpoint. `sqrt` reads
+        // `isqrt`'s two answers the way this now does.
         let (q, inexact) = U256::div(sig_a, sig_b);
-        // The quotient is at least 2^127 and the widest format keeps 113 bits,
-        // so bit 0 is far below the rounding position and can carry the
-        // remainder as a sticky.
-        let q = if inexact { q.add(U256::ONE) } else { q };
         Self::round_wide(neg, q, exp_a - exp_b - 128, inexact, fmt)
     }
 
@@ -1788,6 +1794,29 @@ impl FpFormat {
 //   from its own run-time result -- and so from this -- where `ac - bd`
 //   cancels.
 // - Apple's `__divdc3` is compiler-rt's, which scales by `logb` instead.
+/// Which `__div?c3` a target ships, which decides how a complex quotient
+/// folds.
+///
+/// The two differ in the last place for operands neither has to scale --
+/// `(0.1 + 0.7i) / (0.3 + 0.9i)` among them -- so a constant folded as one
+/// divides disagrees with the other's run-time answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ComplexDivision {
+    /// libgcc's: Smith's method with libgcc's own scaling thresholds, whose
+    /// products contract as [`Contraction`] says, and which computes a
+    /// `float` quotient in `double`.
+    Libgcc(Contraction),
+    /// compiler-rt's: the textbook formula with the divisor scaled by a
+    /// power of two taken from `logb` of its larger half, at the routine's
+    /// own format. What Apple and FreeBSD ship.
+    ///
+    /// It contracts where libgcc's does and for the same reason: each of its
+    /// three sums is written with both products inside the expression, so a
+    /// target with an `fmadd` fuses one of them. `__mul?c3` writes its four
+    /// products into variables first and fuses nothing.
+    CompilerRt(Contraction),
+}
+
 /// How a target's `__div?c3` computes a product that feeds a sum, `x * y +
 /// z`, in Smith's method.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1834,21 +1863,27 @@ impl FloatVal {
 
     /// `(a + bi) / (c + di)` with halves in `fmt`, as the program computes
     /// it: by the `__div?c3` of `fmt`'s routine format, and rounded back.
-    pub fn complex_div(x: Complex, y: Complex, fmt: FpFormat) -> Complex {
-        Self::complex_div_by(x, y, fmt, Contraction::Separate)
-            .expect("separate steps always compute")
-    }
-
-    /// [`complex_div`](Self::complex_div) by a `__div?c3` that contracts
-    /// as `contraction` says; `None` where a fused step is not computed
-    /// here (see `mul_add`).
-    pub fn complex_div_by(
+    /// [`complex_div`](Self::complex_div) as `division` computes it, where
+    /// the caller knows the target's routine; the separate-step libgcc form
+    /// and compiler-rt's both always compute.
+    pub fn complex_div_on(
         x: Complex,
         y: Complex,
         fmt: FpFormat,
-        contraction: Contraction,
+        division: ComplexDivision,
+    ) -> Complex {
+        Self::complex_div_as(x, y, fmt, division).expect("these steps always compute")
+    }
+
+    /// [`complex_div`](Self::complex_div) by the `__div?c3` `division`
+    /// names; `None` where a fused step is not computed here (see `mul_add`).
+    pub fn complex_div_as(
+        x: Complex,
+        y: Complex,
+        fmt: FpFormat,
+        division: ComplexDivision,
     ) -> Option<Complex> {
-        Self::through_routine(x, y, fmt, |x, y, r| Self::routine_div(x, y, r, contraction))
+        Self::through_routine(x, y, fmt, |x, y, r| Self::routine_div(x, y, r, division))
     }
 
     /// `op` applied in `fmt`'s routine format, as c17's lowering applies it:
@@ -1949,10 +1984,18 @@ impl FloatVal {
         x: Complex,
         y: Complex,
         routine: ComplexRoutineFormat,
-        contraction: Contraction,
+        division: ComplexDivision,
     ) -> Option<Complex> {
         let fmt = routine.format();
         let (a, b, c, d) = (x.0, x.1, y.0, y.1);
+        // compiler-rt's routine carries its own scaling and its own
+        // recovery, and stays at the routine's format -- the widening below
+        // is libgcc's, whose `__divsc3` computes a `float` quotient in
+        // `double`.
+        let contraction = match division {
+            ComplexDivision::Libgcc(c) => c,
+            ComplexDivision::CompilerRt(c) => return Self::compiler_rt_div(x, y, fmt, c),
+        };
         let ((re, im), (a, b, c, d)) = match routine.div_working_format() {
             Some(wide) => {
                 // Widening is exact, so the operands need no conversion.
@@ -1985,6 +2028,124 @@ impl FloatVal {
             let im = b.mul(c, fmt).sub(a.mul(d, fmt), fmt);
             (inf.mul(re, fmt), inf.mul(im, fmt))
         } else if (c.is_infinite() || d.is_infinite()) && a.is_finite() && b.is_finite() {
+            // Finite over infinite.
+            let (c, d) = (c.boxed(), d.boxed());
+            let re = a.mul(c, fmt).add(b.mul(d, fmt), fmt);
+            let im = b.mul(c, fmt).sub(a.mul(d, fmt), fmt);
+            (zero.mul(re, fmt), zero.mul(im, fmt))
+        } else {
+            (re, im)
+        }
+    }
+
+    /// `logb(self)` at `fmt`: the exponent `e` with `|self| = m * 2^e` and
+    /// `1 <= m < 2`, as C's `logb` answers it -- a subnormal's true exponent
+    /// included, which is below the format's `emin`.
+    ///
+    /// `None` where C's `logb` is not finite: a zero (`-inf`), an infinity
+    /// (`+inf`) and a NaN. compiler-rt's `__div?c3` tests exactly that, and
+    /// scales by nothing when it fails.
+    fn logb(self, fmt: FpFormat) -> Option<i32> {
+        let v = self.round_to_format(fmt);
+        (v.is_finite() && !v.is_zero()).then(|| v.aligned().1)
+    }
+
+    /// `self * 2^n`, rounded to `fmt`: C's `scalbn`.
+    ///
+    /// Exact but for the rounding `fmt` imposes at the ends -- an overflow
+    /// to infinity, and the precision a subnormal result keeps. A zero, an
+    /// infinity and a NaN are returned unchanged, as `scalbn` leaves them.
+    fn scalbn(self, n: i32, fmt: FpFormat) -> Self {
+        if !self.is_finite() || self.is_zero() {
+            return self;
+        }
+        let (sig, exp) = self.scaled();
+        Self::from_parts(self.neg, sig, exp.saturating_add(n)).round_to_format(fmt)
+    }
+
+    /// `(a + bi) / (c + di)` as compiler-rt's `__div?c3` computes it, which
+    /// is what Apple and FreeBSD ship where Linux ships libgcc's.
+    ///
+    /// The textbook formula, with the divisor scaled by a power of two taken
+    /// from `logb` of its larger half so that `c*c + d*d` neither overflows
+    /// nor underflows, and the quotient unscaled by the same amount. libgcc
+    /// reaches for Smith's method and its own thresholds instead
+    /// ([`Self::smith_div`]), and the two differ in the last place for
+    /// operands where neither is in danger -- `(0.1 + 0.7i) / (0.3 + 0.9i)`
+    /// among them, which is how the divergence was found.
+    ///
+    /// Transcribed from compiler-rt's `divdc3.c`, and checked against the
+    /// `__divdc3` macOS links: over 300000 random operand quadruples
+    /// spanning subnormal to huge, the two agree on every quadruple whose
+    /// operands and quotient are finite and non-zero -- which is every one a
+    /// constant folder folds, the rest being left to the routine.
+    fn compiler_rt_div(
+        x: Complex,
+        y: Complex,
+        fmt: FpFormat,
+        contraction: Contraction,
+    ) -> Option<Complex> {
+        let (a, b) = x;
+        let (mut c, mut d) = y;
+        let larger = if c.magnitude_below(d) { d } else { c };
+        let logbw = larger.logb(fmt);
+        let ilogbw = logbw.unwrap_or(0);
+        if logbw.is_some() {
+            c = c.scalbn(-ilogbw, fmt);
+            d = d.scalbn(-ilogbw, fmt);
+        }
+        // Each sum fuses its *first* product and rounds the second, which is
+        // what the target emits for `c*c + d*d`, `a*c + b*d` and
+        // `b*c - a*d` written that way:
+        //
+        //     fmul  d4, d3, d3        ; d*d, rounded
+        //     fmadd d4, d2, d2, d4    ; c*c fused into the sum
+        //
+        // and the same shape for the two numerators, the second negating its
+        // rounded product with `fnmul`.
+        let mul_add = |x, y, z| Self::mul_add(x, y, z, fmt, contraction);
+        let denom = mul_add(c, c, d.mul(d, fmt))?;
+        let re = mul_add(a, c, b.mul(d, fmt))?.div(denom, fmt);
+        let im = mul_add(b, c, a.mul(d, fmt).negated())?.div(denom, fmt);
+        let (re, im) = (re.scalbn(-ilogbw, fmt), im.scalbn(-ilogbw, fmt));
+        if !(re.is_nan() && im.is_nan()) {
+            return Some((re, im));
+        }
+        Some(Self::recover_compiler_rt_quotient(
+            (re, im),
+            (a, b, c, d),
+            larger,
+            denom,
+            fmt,
+        ))
+    }
+
+    /// compiler-rt's recovery of a quotient that came out NaN + NaNi, from
+    /// the operands as `__div?c3` left them -- the divisor's halves scaled.
+    ///
+    /// The same three cases Annex G gives, but the last asks whether the
+    /// divisor's larger half was infinite, where libgcc asks about the
+    /// halves themselves ([`Self::recover_quotient`]).
+    fn recover_compiler_rt_quotient(
+        (re, im): Complex,
+        (a, b, c, d): Operands,
+        larger: Self,
+        denom: Self,
+        fmt: FpFormat,
+    ) -> Complex {
+        let inf = Self::infinity(false);
+        let zero = FloatVal::ZERO;
+        if denom.is_zero() && (!a.is_nan() || !b.is_nan()) {
+            // Non-zero over zero.
+            let inf = inf.with_sign_of(c);
+            (inf.mul(a, fmt), inf.mul(b, fmt))
+        } else if (a.is_infinite() || b.is_infinite()) && c.is_finite() && d.is_finite() {
+            // Infinite over finite.
+            let (a, b) = (a.boxed(), b.boxed());
+            let re = a.mul(c, fmt).add(b.mul(d, fmt), fmt);
+            let im = b.mul(c, fmt).sub(a.mul(d, fmt), fmt);
+            (inf.mul(re, fmt), inf.mul(im, fmt))
+        } else if larger.is_infinite() && a.is_finite() && b.is_finite() {
             // Finite over infinite.
             let (c, d) = (c.boxed(), d.boxed());
             let re = a.mul(c, fmt).add(b.mul(d, fmt), fmt);
@@ -2069,6 +2230,161 @@ impl FloatVal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ComplexDivision::Libgcc;
+
+    /// libgcc's `__div?c3` with separate steps, which most of these tests
+    /// pin: they were written before compiler-rt's was modelled beside it,
+    /// and each is about what libgcc computes.
+    fn libgcc_div(x: Complex, y: Complex, fmt: FpFormat) -> Complex {
+        FloatVal::complex_div_on(x, y, fmt, Libgcc(Contraction::Separate))
+    }
+
+    /// `logb` and `scalbn`, which compiler-rt's division scales by.
+    #[test]
+    fn logb_and_scalbn_are_cs() {
+        let fmt = FpFormat::Binary64;
+        let v = |x: f64| FloatVal::from_f64(x);
+        assert_eq!(v(1.0).logb(fmt), Some(0));
+        assert_eq!(v(2.0).logb(fmt), Some(1));
+        assert_eq!(v(0.5).logb(fmt), Some(-1));
+        assert_eq!(v(-12.0).logb(fmt), Some(3));
+        // A subnormal answers its true exponent, below the format's emin.
+        let sub = FloatVal::from_parts(false, 1, -1074);
+        assert_eq!(sub.logb(fmt), Some(-1074));
+        // Where C's logb is not finite there is nothing to scale by.
+        assert_eq!(FloatVal::ZERO.logb(fmt), None);
+        assert_eq!(FloatVal::infinity(false).logb(fmt), None);
+        assert_eq!(
+            FloatVal::nan_with_payload(fmt, 1, NanKind::Quiet).logb(fmt),
+            None
+        );
+
+        assert_eq!(v(3.0).scalbn(4, fmt).to_f64(), 48.0);
+        assert_eq!(v(3.0).scalbn(-4, fmt).to_f64(), 3.0 / 16.0);
+        assert_eq!(v(-1.5).scalbn(0, fmt).to_f64(), -1.5);
+        // The ends: an overflow becomes an infinity, and a zero, infinity
+        // and NaN are returned as they are.
+        assert!(v(1.0).scalbn(2000, fmt).is_infinite());
+        assert!(FloatVal::ZERO.scalbn(10, fmt).is_zero());
+        assert!(FloatVal::infinity(true).scalbn(-10, fmt).is_infinite());
+    }
+
+    /// compiler-rt's division contracts where the target has an `fmadd`.
+    ///
+    /// Each of its three sums is written with both products inside the
+    /// expression that adds them, so aarch64 fuses the *first* product of
+    /// each and rounds the second:
+    ///
+    /// ```text
+    ///     fmul  d4, d3, d3        ; d*d, rounded
+    ///     fmadd d4, d2, d2, d4    ; c*c fused into the sum
+    /// ```
+    ///
+    /// The pairs here are ones where that changes the answer -- computing
+    /// separately and computing fused differ in the last place -- so the
+    /// test cannot pass if the contraction is dropped. The expected values
+    /// were computed with C's `fma`, which is the correctly rounded
+    /// operation `fmadd` performs, rather than worked out here.
+    ///
+    /// x86-64 has no `fma` at the baseline and so stays separate; that half
+    /// is `compiler_rt_division_matches_the_shipped_routine`.
+    #[test]
+    fn compiler_rt_division_contracts_where_the_target_does() {
+        let fmt = FpFormat::Binary64;
+        let v = |x: f64| FloatVal::from_f64(x);
+        let cases = [
+            (
+                (0.7, 0.7),
+                (1e5, -7.0),
+                (6.999509965702401e-06, 7.000489965697599e-06),
+                (6.9995099657024005e-06, 7.000489965697599e-06),
+            ),
+            (
+                (0.7, 1e-5),
+                (1e5, -0.1),
+                (6.999999999893e-06, 1.06999999999893e-10),
+                (6.999999999892999e-06, 1.06999999999893e-10),
+            ),
+            (
+                (0.3, 0.1),
+                (123.456, -123.456),
+                (0.0008100051840331777, 0.0016200103680663557),
+                (0.0008100051840331777, 0.0016200103680663555),
+            ),
+        ];
+        for ((a, b), (c, d), (sre, sim), (fre, fim)) in cases {
+            let q = |k| {
+                FloatVal::complex_div_on(
+                    (v(a), v(b)),
+                    (v(c), v(d)),
+                    fmt,
+                    ComplexDivision::CompilerRt(k),
+                )
+            };
+            let (re, im) = q(Contraction::Separate);
+            assert_eq!(re.to_f64(), sre, "({a}+{b}i)/({c}+{d}i) separate real");
+            assert_eq!(im.to_f64(), sim, "({a}+{b}i)/({c}+{d}i) separate imag");
+            let (re, im) = q(Contraction::Fused);
+            assert_eq!(re.to_f64(), fre, "({a}+{b}i)/({c}+{d}i) fused real");
+            assert_eq!(im.to_f64(), fim, "({a}+{b}i)/({c}+{d}i) fused imag");
+            assert!(
+                (sre, sim) != (fre, fim),
+                "({a}+{b}i)/({c}+{d}i) must distinguish the two, or it proves nothing"
+            );
+        }
+    }
+
+    /// compiler-rt's division, against the `__divdc3` a Mac links.
+    ///
+    /// The quadruples and their answers were taken from that routine
+    /// directly -- a C transcription of compiler-rt's `divdc3.c` was checked
+    /// against it over 300000 random quadruples spanning subnormal to huge,
+    /// and agreed on every one whose operands and quotient are finite and
+    /// non-zero, which is every one a folder folds. The first is the pair
+    /// that found the divergence: libgcc answers ...328152 for its real
+    /// half, and the two differ in the last place.
+    #[test]
+    fn compiler_rt_division_matches_the_shipped_routine() {
+        let fmt = FpFormat::Binary64;
+        let v = |x: f64| FloatVal::from_f64(x);
+        // Printed by that routine at full precision, not worked out here.
+        let cases = [
+            (
+                (0.1, 0.7),
+                (0.3, 0.9),
+                (0.7333333333333334, 0.1333333333333333),
+            ),
+            (
+                (1.0, 1.0),
+                (3.0, 7.0),
+                (0.1724137931034483, -0.06896551724137931),
+            ),
+            ((1.0, 2.0), (3.0, -1.0), (0.1, 0.7)),
+            (
+                (123.456, -7.0),
+                (100000.0, 2.25),
+                (0.0012345584243750047, -7.002777756454843e-05),
+            ),
+        ];
+        for ((a, b), (c, d), (wre, wim)) in cases {
+            let (re, im) = FloatVal::complex_div_on(
+                (v(a), v(b)),
+                (v(c), v(d)),
+                fmt,
+                // x86-64, where the baseline has no `fma`.
+                ComplexDivision::CompilerRt(Contraction::Separate),
+            );
+            assert_eq!(re.to_f64(), wre, "({a}+{b}i)/({c}+{d}i) real");
+            assert_eq!(im.to_f64(), wim, "({a}+{b}i)/({c}+{d}i) imag");
+        }
+        // And the divergence itself: libgcc answers otherwise for the first.
+        let (re, _) = libgcc_div((v(0.1), v(0.7)), (v(0.3), v(0.9)), fmt);
+        assert_ne!(
+            re.to_f64(),
+            0.7333333333333334,
+            "the two routines must differ here, or this test proves nothing"
+        );
+    }
 
     // Value comparison and truncation
     //
@@ -2504,6 +2820,245 @@ mod tests {
             (0x3fff_0000_0000_0000, 0x0000_0000_0000_1448)
         );
         assert_eq!(one.add(tiny, FpFormat::Binary64).to_f64(), 1.0);
+    }
+
+    /// A quotient rounds to nearest at binary128, including where the bits
+    /// below the rounding position sit one short of the midpoint.
+    ///
+    /// `div` folded the remainder in twice: it bumped the quotient's
+    /// magnitude by one *and* passed the same "remainder non-zero" flag as
+    /// `round_wide`'s sticky, where that helper's contract is that its `w`
+    /// is a truncation and the sticky reports only what fell below `w`'s low
+    /// bit. With the dropped bits equal to `half - 1`, the bump made the
+    /// residue exactly `half` and the sticky then rounded it up, though the
+    /// true value is strictly below the midpoint:
+    ///
+    /// ```text
+    ///     0x1.0a3a0d300cc2940d2069294e2ab7p+0 / 0x1.decbbf450142f40118d653a966adp+0
+    ///     was ...4f09cf, is ...4f09ce
+    /// ```
+    ///
+    /// Half the cases below are on that trigger and half are ordinary
+    /// quotients. Every expectation is the correctly rounded value computed
+    /// by exact rational arithmetic (Python `fractions.Fraction`, rounding
+    /// to nearest with ties to even), not worked out here. Over 200000
+    /// random binary128 divisions that oracle disagreed with the old code 5
+    /// times and with the current code not at all.
+    ///
+    /// binary128 is where this is reachable: `drop` is 15 or 16 bits there,
+    /// so the trigger comes up about once in 40000, where binary64's 75-bit
+    /// `drop` puts it past 2^-75 -- which is why
+    /// `double_results_agree_with_hardware` never saw it.
+    #[test]
+    fn div_rounds_binary128_to_nearest() {
+        /// A significand and the power of two its low bit is worth.
+        type Parts = (u128, i32);
+        /// A binary128 encoding, high half first.
+        type Encoded = (u64, u64);
+
+        let fmt = FpFormat::Binary128;
+        let v = |(sig, exp): Parts| FloatVal::from_parts(false, sig, exp);
+        let cases: [(Parts, Parts, Encoded); 24] = [
+            (
+                (0x10a3a0d300cc2940d2069294e2ab7, -112),
+                (0x1decbbf450142f40118d653a966ad, -112),
+                (0x3ffe1cb07b08a34c, 0x0140fe9e4e4f09ce),
+            ), // trigger
+            (
+                (0x19fae2e241ec1e6ebc00ead72ea1b, 56),
+                (0x1e880dce50fbf7d4ecee7bf438cb5, -6),
+                (0x403cb3ac9e72cd7f, 0xd1ff33e5a9aa3379),
+            ), // trigger
+            (
+                (0x11672b2aeb2283257c6286271ab7b, -53),
+                (0x1ef97678987d847ddf0863de4cfb3, -17),
+                (0x3fda1faacd755dcc, 0x2c365c92529e602b),
+            ), // trigger
+            (
+                (0x1695f415ee99c1dbbea7e435d44a2, -54),
+                (0x14ea5f8fd2ee8285578bdbf64905f, -31),
+                (0x3fe81471758daaa5, 0x460c4363bc99f801),
+            ), // trigger
+            (
+                (0x1afa94d3c621343e2a7750f85fae2, -40),
+                (0x1131b5558d6986850a9eb8ad60a1b, 59),
+                (0x3f9c91ae7714f2a1, 0xcc197400645c7ab5),
+            ), // trigger
+            (
+                (0x10e55fc8880a6a2360257554afe9b, -16),
+                (0x1098241f7b18472def19344622176, -21),
+                (0x400404a77910b7a2, 0xf32427ec94bc6a82),
+            ), // trigger
+            (
+                (0x1ba4306a14f385e2d426f2b0a6e18, -48),
+                (0x14c67d4a2e44b43c30c2e6fb57587, 45),
+                (0x3fa2549ae551c521, 0x41909b1fa13fc5e0),
+            ), // trigger
+            (
+                (0x14161d2b6a9da628def7750d10fe7, -41),
+                (0x1a89ae7b153fdd75517128e435499, 24),
+                (0x3fbd8387f0dac49b, 0xe9348abfcab3a647),
+            ), // trigger
+            (
+                (0x1f313ffacdcc8038e10836ead2cd5, -19),
+                (0x1084eaf464f9107548a4bbb7199ed, -6),
+                (0x3ff2e36449d9406d, 0x75a55ce067de7742),
+            ), // trigger
+            (
+                (0x1326eb7c0b6b2ddedf90c27659af4, 15),
+                (0x14f441b7edec7203f703bd4a0d323, -55),
+                (0x4044d3f78b746dcd, 0x8ca8907d268ff051),
+            ), // trigger
+            (
+                (0x1a301587a200568b9f6f2eeea9517, 45),
+                (0x1cb7f40c79a400ede7ec7b2a3115d, -42),
+                (0x4055d2e1aa96b030, 0xd4fe2651ec0ce50d),
+            ), // trigger
+            (
+                (0x16eb74318c09a8f549561764f1e50, -25),
+                (0x1f55196774f9c483ad7172f05b9f6, 1),
+                (0x3fe476877dcc44ae, 0xa31425ed8e83cd47),
+            ), // trigger
+            (
+                (0x154c735201402213de924583fc4d5, -36),
+                (0x10ee0395106c3a5cf42cb0a5fd0a9, 346),
+                (0x3e8142103b8e9db0, 0x63d89d19b470c98c),
+            ),
+            (
+                (0x1f25ee26f81ae3c14b184d2942785, -52),
+                (0x16c5b7c7b25c8c44a034301c3436e, -230),
+                (0x40b15e289d59a426, 0xf3209302b5f36f52),
+            ),
+            (
+                (0x13eac519eb47cd734603a472884ad, 132),
+                (0x1710530a974516809b29c42333d3d, -66),
+                (0x40c4ba253cae8878, 0x8c562240dab33db3),
+            ),
+            (
+                (0x1a17277bbc1c05bbb5bb99709f250, -61),
+                (0x1ba7445e7688ec985d0e825ed672d, 55),
+                (0x3f8ae30ff24b28ce, 0x6f8764118d6f9cd5),
+            ),
+            (
+                (0x190637a7a92b1a024aac375e169d3, -264),
+                (0x1d8d5c212c37b501eb7f3841461ff, 312),
+                (0x3dbeb18d8755f91a, 0x66e6bdf60eb24989),
+            ),
+            (
+                (0x1f639c571734cfa6cd016201cd029, 79),
+                (0x1204647e7864fce6f26559a9e7640, -151),
+                (0x40e5bdff6768df8b, 0x50fcc09c879b2ec7),
+            ),
+            (
+                (0x18d6d68bd9225ba86d47572698909, -151),
+                (0x1977c6f1dc478583dd3c70a9005ea, -208),
+                (0x4037f35c854bba3e, 0x1937b3356b994b97),
+            ),
+            (
+                (0x1b60135f057718bc285a2a8999b1e, -220),
+                (0x1547aa54ee9dcc0f86145f00483d6, -3),
+                (0x3f264953e75ffc5a, 0xc807a2daf2e3c574),
+            ),
+            (
+                (0x13b9596a184168d10a1fb0ca789ec, 275),
+                (0x11d4637b071693ad1b1bbba5e6980, 313),
+                (0x3fd91b331e95177c, 0x0bbc60e4ee030ff2),
+            ),
+            (
+                (0x1397f1e1f368cd52fddc05b44dd1d, 106),
+                (0x1b0f102bc20e55b44300c8639cbc0, 248),
+                (0x3f7072be572aeb9c, 0x2f328cf62ee559f2),
+            ),
+            (
+                (0x1c8d10c651fd77daafd644ee75929, 241),
+                (0x1109244c8cedd614018db1b3d33d9, 381),
+                (0x3f73ad0b3562f83f, 0xe145d685449906c1),
+            ),
+            (
+                (0x182c13bda53e44530b37a2322b3a9, -79),
+                (0x1db4026db224a92343cdeae93362c, -210),
+                (0x4081a0a9425f0162, 0xe07611057ba52448),
+            ),
+        ];
+        for (a, b, want) in cases {
+            let (lo, hi) = v(a).div(v(b), fmt).to_f128_bits();
+            assert_eq!((hi, lo), want, "{:#x}p{} / {:#x}p{}", a.0, a.1, b.0, b.1);
+        }
+    }
+
+    /// Every quotient is the representable value nearest the true one,
+    /// checked by multiplying it back.
+    ///
+    /// `r` is correct exactly when `|a - r*b|` is at most half an ulp of `r`
+    /// times `b` -- multiplying through by `b`, which is positive, preserves
+    /// the ordering, so this is the same question as `|a/b - r|` against half
+    /// an ulp, asked in integers that are exact. In the units of the
+    /// comparison below (`r*b` and `a`, both divided by `2^(er+eb)`) that
+    /// bound is `sb << 14`, since a binary128 significand left-aligned to bit
+    /// 127 steps by `2^15`.
+    ///
+    /// The arithmetic is `U256::mul`, which is a different routine from the
+    /// `U256::div` the defect was in -- a check rebuilt from `U256::div`'s own
+    /// two answers would be the same computation twice and could not
+    /// disagree with it. `div_rounds_binary128_to_nearest` pins the values;
+    /// this says the rule holds generally.
+    #[test]
+    fn div_is_nearest_representable() {
+        let fmt = FpFormat::Binary128;
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20000 {
+            let sig = |r: &mut dyn FnMut() -> u64| {
+                (((r() as u128) << 64) | r() as u128) >> 15 | (1u128 << 112)
+            };
+            let (sa, sb) = (sig(&mut rand), sig(&mut rand));
+            // A modest exponent range, so every quotient stays normal: the
+            // half-ulp below assumes the full 113 bits are kept.
+            let ea = (rand() % 200) as i32 - 100;
+            let eb = (rand() % 200) as i32 - 100;
+            let a = FloatVal::from_parts(false, sa, ea);
+            let b = FloatVal::from_parts(false, sb, eb);
+            let r = a.div(b, fmt);
+            assert!(r.is_finite() && !r.is_zero());
+
+            let (sa, ea) = a.scaled();
+            let (sb, eb) = b.scaled();
+            let (sr, er) = r.scaled();
+            // The quotient is exactly representable, so its low fifteen bits
+            // are clear -- which is what makes half an ulp `2^14` here.
+            assert_eq!(sr & 0x7fff, 0, "a binary128 result keeps 113 bits");
+            let shift = ea - er - eb;
+            assert!(
+                (0..=128).contains(&shift),
+                "the multiply-back shift must stay inside 256 bits: {shift}"
+            );
+
+            let product = U256::mul(sr, sb);
+            let scaled_a = U256 { hi: 0, lo: sa }.shl(shift as u32);
+            let (big, small) = if scaled_a >= product {
+                (scaled_a, product)
+            } else {
+                (product, scaled_a)
+            };
+            let off = big.sub(small);
+            let half_ulp = U256 { hi: 0, lo: sb }.shl(14);
+            assert!(
+                off <= half_ulp,
+                "{sa:#x}p{ea} / {sb:#x}p{eb} is more than half an ulp out"
+            );
+            if off == half_ulp {
+                assert_eq!(
+                    (sr >> 15) & 1,
+                    0,
+                    "{sa:#x}p{ea} / {sb:#x}p{eb} is an exact tie and must go to even"
+                );
+            }
+        }
     }
 
     /// Ties go to even, and only exact ties are ties.
@@ -3069,7 +3624,7 @@ mod tests {
             let v = |i: usize| finite_from_bits(fmt, bits[i]);
             let (x, y) = ((v(0), v(1)), (v(2), v(3)));
             let (mre, mim) = FloatVal::complex_mul(x, y, fmt);
-            let (qre, qim) = FloatVal::complex_div(x, y, fmt);
+            let (qre, qim) = libgcc_div(x, y, fmt);
             let got = [mre, mim, qre, qim].map(|h| h.to_bits(fmt));
             assert_eq!(
                 got,
@@ -3093,11 +3648,11 @@ mod tests {
             assert_eq!((re, im), (one_plus, one_plus), "{fmt:?} mul");
             let two_plus = FloatVal::from_parts(false, (1u128 << 60) + 1, -59);
             let two = FloatVal::from_i128(2);
-            let (re, im) = FloatVal::complex_div((two_plus, zero), (two, zero), fmt);
+            let (re, im) = libgcc_div((two_plus, zero), (two, zero), fmt);
             assert_eq!((re, im), (one_plus, zero), "{fmt:?} div");
             // Where the textbook formula through `f64` loses the 2^-60 twice:
             // (1 + 2^-60 + i) / (1 + i) = 1 + 2^-61 - 2^-61 i.
-            let (re, im) = FloatVal::complex_div((one_plus, one), (one, one), fmt);
+            let (re, im) = libgcc_div((one_plus, one), (one, one), fmt);
             let half_tiny = FloatVal::from_parts(false, 1, -61);
             assert_eq!(re, one.add(half_tiny, fmt), "{fmt:?} re");
             assert_eq!(im, half_tiny.negated(), "{fmt:?} im");
@@ -3142,13 +3697,13 @@ mod tests {
         assert!(re.is_nan() && im.is_infinite(), "{re} {im}");
 
         // Non-zero over zero is an infinity carrying the operand's sign.
-        let (re, im) = FloatVal::complex_div((one, v(-1.0)), (FloatVal::ZERO, FloatVal::ZERO), fmt);
+        let (re, im) = libgcc_div((one, v(-1.0)), (FloatVal::ZERO, FloatVal::ZERO), fmt);
         assert_eq!((re, im), (inf, inf.negated()));
         // Finite over infinite is a zero.
-        let (re, im) = FloatVal::complex_div((one, one), (inf, FloatVal::ZERO), fmt);
+        let (re, im) = libgcc_div((one, one), (inf, FloatVal::ZERO), fmt);
         assert!(re.is_zero() && im.is_zero(), "{re} {im}");
         // Infinite over finite is infinite.
-        let (re, im) = FloatVal::complex_div((inf, one), (one, one), fmt);
+        let (re, im) = libgcc_div((inf, one), (one, one), fmt);
         assert_eq!((re, im), (inf, inf.negated()));
     }
 
@@ -3159,13 +3714,13 @@ mod tests {
         let fmt = FpFormat::Binary64;
         let v = FloatVal::from_f64;
         let max = v(f64::MAX);
-        let (re, im) = FloatVal::complex_div((max, max), (max, max), fmt);
+        let (re, im) = libgcc_div((max, max), (max, max), fmt);
         assert_eq!((re, im), (v(1.0), FloatVal::ZERO));
         let tiny = v(f64::MIN_POSITIVE * 4.0);
-        let (re, im) = FloatVal::complex_div((tiny, tiny), (tiny, tiny), fmt);
+        let (re, im) = libgcc_div((tiny, tiny), (tiny, tiny), fmt);
         assert_eq!((re, im), (v(1.0), FloatVal::ZERO));
         // (1 + 2i) / (3 + 4i) = 0.44 + 0.08i, as libgcc computes it.
-        let (re, im) = FloatVal::complex_div((v(1.0), v(2.0)), (v(3.0), v(4.0)), fmt);
+        let (re, im) = libgcc_div((v(1.0), v(2.0)), (v(3.0), v(4.0)), fmt);
         assert_eq!((re.to_f64(), im.to_f64()), (0.44, 0.08));
     }
 
@@ -3203,7 +3758,7 @@ mod tests {
             let v = |i: usize| finite_from_bits(fmt, bits[i]);
             let (x, y) = ((v(0), v(1)), (v(2), v(3)));
             let (mre, mim) = FloatVal::complex_mul(x, y, fmt);
-            let (qre, qim) = FloatVal::complex_div(x, y, fmt);
+            let (qre, qim) = libgcc_div(x, y, fmt);
             let got = [mre, mim, qre, qim].map(|h| h.to_bits(fmt));
             assert_eq!(
                 got,
@@ -3223,9 +3778,9 @@ mod tests {
     fn complex_div_of_float_works_in_double() {
         let fmt = FpFormat::Binary32;
         let v = |x: f32| FloatVal::from_f64(f64::from(x));
-        let (re, im) = FloatVal::complex_div((v(1.0), v(2.0)), (v(3.0), v(4.0)), fmt);
+        let (re, im) = libgcc_div((v(1.0), v(2.0)), (v(3.0), v(4.0)), fmt);
         assert_eq!((re.to_f64() as f32, im.to_f64() as f32), (0.44f32, 0.08f32));
-        let (re, im) = FloatVal::complex_div((v(1.0), v(1.0)), (v(1.0), v(-1.0)), fmt);
+        let (re, im) = libgcc_div((v(1.0), v(1.0)), (v(1.0), v(-1.0)), fmt);
         assert_eq!((re, im), (FloatVal::ZERO, v(1.0)));
     }
 
@@ -3270,7 +3825,7 @@ mod tests {
                 (Contraction::Separate, separate),
                 (Contraction::Fused, fused),
             ] {
-                let (re, im) = FloatVal::complex_div_by(x, y, fmt, contraction).unwrap();
+                let (re, im) = FloatVal::complex_div_as(x, y, fmt, Libgcc(contraction)).unwrap();
                 let got = [re, im].map(|h| h.to_bits(fmt) as u64);
                 assert_eq!(got, want, "{contraction:?} ({a} + {b}i) / ({c} + {d}i)");
             }
@@ -3290,8 +3845,8 @@ mod tests {
             ((FloatVal::nan(), v(1.0)), (v(3.0), v(7.0))),
             ((v(1.0), v(1.0)), (v(3.0), inf)),
         ] {
-            let fused = FloatVal::complex_div_by(x, y, fmt, Contraction::Fused).unwrap();
-            let separate = FloatVal::complex_div(x, y, fmt);
+            let fused = FloatVal::complex_div_as(x, y, fmt, Libgcc(Contraction::Fused)).unwrap();
+            let separate = libgcc_div(x, y, fmt);
             assert_eq!(
                 [fused.0.key(), fused.1.key()],
                 [separate.0.key(), separate.1.key()]
@@ -3300,7 +3855,7 @@ mod tests {
         let max = v(f64::MAX);
         let y = (v(1.0), v(0.5));
         assert_eq!(
-            FloatVal::complex_div_by((max, max), y, fmt, Contraction::Fused),
+            FloatVal::complex_div_as((max, max), y, fmt, Libgcc(Contraction::Fused)),
             None
         );
     }

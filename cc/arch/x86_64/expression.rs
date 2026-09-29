@@ -23,6 +23,11 @@ impl X86_64CodeGen {
             .typ
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.max(32));
+        // `kind` and not `is_plain_int128`: complex arithmetic is split into
+        // per-half operations whose type is the base `__int128`, so no
+        // instruction reaching here carries a complex type. Checked:
+        // `_Complex __int128` addition compiles and runs, its halves
+        // travelling indirectly.
         if insn.typ.is_some_and(|t| types.kind(t) == TypeKind::Int128) {
             self.emit_int128_binop(insn);
             return;

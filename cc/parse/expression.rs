@@ -1872,7 +1872,21 @@ impl<'a> Parser<'a> {
         self.check_not_vector_value(operand.typ, operand.pos);
         let operand = self.promote_bitfield_operand(operand);
         let op_typ = operand.typ.unwrap_or(self.types.int_id);
-        let typ = self.types.integer_promote(op_typ);
+        // A GNU complex integer is left alone. `integer_promote` switches on
+        // `kind()`, which answers a complex type's *base* kind, so
+        // `_Complex short` looked like a `short` and promoted to `int` -- and
+        // the conversion below then kept only the real half, so `+z` and `-z`
+        // came out `(3, 0)` and `(-3, 0)`. gcc and clang leave the type as it
+        // is, and `default_argument_promote` already draws the same line.
+        //
+        // The guard belongs here and not in `integer_promote`, which the usual
+        // arithmetic conversions call precisely to reduce a complex integer to
+        // its promoted base before `pick_complex` re-wraps it.
+        let typ = if self.types.is_complex(op_typ) {
+            op_typ
+        } else {
+            self.types.integer_promote(op_typ)
+        };
         // The *value* is promoted, not just the type it is computed at. The
         // conversion used to be left out, on the reasoning that the operand
         // is already in a wider register -- but nothing in the IR then says
@@ -2228,8 +2242,11 @@ impl<'a> Parser<'a> {
                     // character, converted to `int` -- so its signedness is
                     // plain `char`'s, which is the target's. `'\x80'` is -128
                     // where `char` is signed and 128 where it is not.
-                    let (v, is_code_point) =
-                        literal::char_literal_value(s, None, self.current_pos());
+                    // `token_pos`, not `current_pos`: the token has been
+                    // consumed, so the current position is the *next* one --
+                    // a different line, where the terminator is on one of its
+                    // own.
+                    let (v, is_code_point) = literal::char_literal_value(s, None, token_pos);
                     let value = if is_code_point {
                         // Not a byte, so plain `char`'s signedness does not
                         // reach it.
@@ -2267,8 +2284,8 @@ impl<'a> Parser<'a> {
                             _ => self.types.char32_id,
                         };
                         let bits = self.types.size_bits(typ);
-                        let (code_point, _) =
-                            literal::char_literal_value(s, Some(bits), self.current_pos());
+                        // The consumed token's position, as above.
+                        let (code_point, _) = literal::char_literal_value(s, Some(bits), token_pos);
                         let value = literal::prefixed_char_value(
                             code_point,
                             bits,

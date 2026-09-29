@@ -1231,3 +1231,57 @@ int main(void) {
         "cannot initialize an object with static storage duration",
     );
 }
+
+/// A libm call of constants is that constant at every level, so the levels
+/// cannot disagree about it.
+///
+/// `603ac89f` kept such a call in its in-place form rather than making it
+/// the library call, so that a static initializer could use it. That is
+/// enough for a function the back end has an instruction for -- `floor`
+/// becomes one, and folds -- but not for `fmin`, `fmax` or `fma`, which
+/// x86-64 has none for: at -O0 nothing folds the in-place form afterwards
+/// and the back end lowers it to the library call, so -O0 answered whatever
+/// the platform's libm does and -O2 answered the fold.
+///
+/// Two zeros of different signs are where that is visible. C leaves the
+/// result to the implementation (F.10.9.2) and both answers conform, so the
+/// bug is not the sign but the disagreement: one program, two answers.
+/// gcc and clang answer `-0` for `fmin` at every level, which is what the
+/// fold has always computed.
+#[test]
+fn libm_constant_min_max_fma_agree_at_every_level() {
+    let src = r#"
+#include <math.h>
+static int sgn(double v) { return __builtin_signbit(v) ? -1 : +1; }
+int main(void) {
+    /* Constant arguments: the answer is a constant, so every level owes
+       the same one. */
+    if (sgn(fmin(0.0, -0.0)) != -1) return 1;
+    if (sgn(fmin(-0.0, 0.0)) != -1) return 2;
+    if (sgn(fmax(0.0, -0.0)) != +1) return 3;
+    if (sgn(fmax(-0.0, 0.0)) != +1) return 4;
+
+    /* The ordinary cases stay right. */
+    if (fmin(2.0, 3.0) != 2.0) return 5;
+    if (fmax(2.0, 3.0) != 3.0) return 6;
+    if (fma(2.0, 3.0, 4.0) != 10.0) return 7;
+
+    /* And a static initializer, which has folded all along, agrees with
+       them -- that is the disagreement this is about. */
+    static double s = fmin(0.0, -0.0);
+    if (sgn(s) != -1) return 8;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                "libm_minmax_levels",
+                src,
+                &[opt.to_string(), "-lm".to_string()]
+            ),
+            0,
+            "{opt}"
+        );
+    }
+}

@@ -1483,3 +1483,207 @@ fn c99_float16_complex_arithmetic() {
         }
     }
 }
+
+/// Unary `+` and `-` on a GNU complex *integer* keep both halves.
+///
+/// C17 6.5.3.3p2 gives unary `+` the value of the promoted operand, and this
+/// compiler promotes through `TypeTable::integer_promote`, which switches on
+/// `kind()`. `kind()` answers a complex type's *base* kind, so
+/// `_Complex short` looked like a `short` and promoted to `int` -- and the
+/// conversion that carries out the promotion then threw the imaginary half
+/// away:
+///
+/// ```text
+///     _Complex short z = 3 + 4i;   +z  ->  (3, 0)     -z  ->  (-3, 0)
+/// ```
+///
+/// gcc and clang leave the type alone: `sizeof(+z)` is `sizeof(z)`, not
+/// `sizeof(_Complex int)`. `default_argument_promote` already had this
+/// guard, and said why -- "a complex type is left alone: `kind` answers its
+/// base's kind".
+///
+/// `integer_promote` itself must keep reducing a complex integer to its
+/// promoted base, because the usual arithmetic conversions call it for
+/// exactly that and re-wrap the result with `pick_complex`; the binary case
+/// below is the control that pins it.
+#[test]
+fn c99_unary_plus_and_minus_keep_a_complex_integer_whole() {
+    let code = r#"
+int main(void) {
+    _Complex short z = 3 + 4i;
+    /* `signed char`, not plain `char`: plain `char` is unsigned on aarch64
+       Linux, where negating at the narrow width gives 255 rather than -1.
+       The width is what this test is about, not the signedness. */
+    _Complex signed char c = 1 + 2i;
+    _Complex int   w = 5 + 6i;
+
+    _Complex int p = +z;
+    if (__real__ p != 3 || __imag__ p != 4) return 1;
+    _Complex int m = -z;
+    if (__real__ m != -3 || __imag__ m != -4) return 2;
+    _Complex int pc = +c;
+    if (__real__ pc != 1 || __imag__ pc != 2) return 3;
+    _Complex int mc = -c;
+    if (__real__ mc != -1 || __imag__ mc != -2) return 4;
+
+    /* An already-`int` complex was never narrowed, and must stay right. */
+    _Complex int pw = +w;
+    if (__real__ pw != 5 || __imag__ pw != 6) return 5;
+
+    /* The promoted type is the operand's own, as gcc and clang have it. */
+    if (sizeof(+z) != sizeof(z)) return 6;
+    if (sizeof(+c) != sizeof(c)) return 7;
+
+    /* The control: a *binary* operator still promotes the halves, which is
+       what integer_promote is called for. */
+    _Complex short sum = z + z;
+    if (__real__ sum != 6 || __imag__ sum != 8) return 8;
+
+    /* A real operand is unaffected: 6.5.3.3p2 still promotes it. */
+    signed char sc = -100;
+    if (-sc != 100) return 9;
+    if (sizeof(+sc) != sizeof(int)) return 10;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("complex_int_unary", code, &[opt.to_string()]),
+            0,
+            "{opt}"
+        );
+    }
+}
+
+/// `__imag__` of a *real* operand still evaluates it.
+///
+/// gcc accepts `__real__` and `__imag__` on a real operand: the real half is
+/// the value itself, and the imaginary half is a zero of its type. Only the
+/// *value* is known in advance, though -- the operand is not in an
+/// unevaluated context the way a `sizeof` operand is, so its side effects
+/// have to happen. `linearize_complex_half` returned the zero constant
+/// without ever linearizing the operand, so every effect in it was dropped:
+///
+/// ```text
+///     double x = 1.0;  __imag__ (x += 5.0);   /* x stayed 1.0 */
+/// ```
+///
+/// The `__real__` arm always linearized the operand, so the two disagreed
+/// about the same expression. Both are checked here, for a floating and an
+/// integer operand, since the zero is built by a different call for each.
+#[test]
+fn c99_imag_of_a_real_operand_still_evaluates_it() {
+    let code = r#"
+int calls;
+static double bump(void) { calls++; return 1.0; }
+
+int main(void) {
+    /* A floating operand: the zero comes from emit_fconst. */
+    double x = 1.0;
+    double y = __imag__ (x += 5.0);
+    if (x != 6.0) return 1;
+    if (y != 0.0) return 2;
+
+    /* An integer operand: the zero comes from emit_const. */
+    int i = 1;
+    int j = __imag__ (i += 5);
+    if (i != 6) return 3;
+    if (j != 0) return 4;
+
+    /* A call is an effect too, and must happen exactly once. */
+    calls = 0;
+    (void)__imag__ bump();
+    if (calls != 1) return 5;
+
+    /* The control: __real__ was always right, and stays so. */
+    double a = 1.0;
+    double b = __real__ (a += 5.0);
+    if (a != 6.0 || b != 6.0) return 6;
+
+    /* And a genuinely complex operand is untouched by any of this. */
+    double _Complex z = 3.0 + 4.0i;
+    if (__imag__ z != 4.0 || __real__ z != 3.0) return 7;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("imag_of_real", code, &[opt.to_string()]),
+            0,
+            "{opt}"
+        );
+    }
+}
+
+/// A cast to `void` converts nothing, including from a complex type.
+///
+/// C17 6.3.2.2: the operand is evaluated and its value discarded. The cast
+/// path checks for `void` -- but only after the arm that converts a complex
+/// operand to a real type, and `void` is not complex, so a complex operand
+/// took that arm and was "converted" to `void` as though it were an
+/// arithmetic type. At -O0 that is a `cvttsd2si`, which raises `FE_INVALID`
+/// for a NaN real part:
+///
+/// ```text
+///     double _Complex z;   (void)z;   ->   cvttsd2sil %xmm15, %eax
+/// ```
+///
+/// The optimizer dropped the dead conversion at -O1 and above, so only -O0
+/// raised the exception -- one more place where the levels disagreed about
+/// the same program. The effects in the operand must still happen.
+#[test]
+fn c99_void_cast_of_a_complex_operand_converts_nothing() {
+    let code = r#"
+#include <fenv.h>
+#include <math.h>
+#pragma STDC FENV_ACCESS ON
+
+int calls;
+static double _Complex bump(void) { calls++; return 1.0 + 2.0i; }
+
+int main(void) {
+    double _Complex z;
+    __real__ z = NAN;
+    __imag__ z = 1.0;
+
+    feclearexcept(FE_ALL_EXCEPT);
+    (void)z;
+    if (fetestexcept(FE_INVALID)) return 1;
+
+    /* Every complex width takes the same path. */
+    float _Complex fz;
+    __real__ fz = NAN;
+    __imag__ fz = 1.0f;
+    feclearexcept(FE_ALL_EXCEPT);
+    (void)fz;
+    if (fetestexcept(FE_INVALID)) return 2;
+
+    /* The value is discarded, but the operand is still evaluated. */
+    calls = 0;
+    (void)bump();
+    if (calls != 1) return 3;
+
+    /* The control: a real NaN was already right (a cast to void converts
+       nothing there either). */
+    double d = NAN;
+    feclearexcept(FE_ALL_EXCEPT);
+    (void)d;
+    if (fetestexcept(FE_INVALID)) return 4;
+    return 0;
+}
+"#;
+    // `-lm`: glibc keeps feclearexcept and fetestexcept in libm, which is
+    // not linked by default. macOS has them in libSystem and needs no flag,
+    // which is why this passed there and failed on both Linux runners.
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                "void_cast_complex",
+                code,
+                &[opt.to_string(), "-lm".to_string()]
+            ),
+            0,
+            "{opt}"
+        );
+    }
+}

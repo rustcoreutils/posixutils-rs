@@ -16329,3 +16329,112 @@ int main(void) {
         }
     }
 }
+
+/// A library call whose lowering builds control flow, standing where control
+/// cannot arrive.
+///
+/// `sqrt` is lowered with an errno check, which is a two-way branch, and the
+/// builder took the block to hang it off with `current_bb.unwrap()`. After a
+/// `goto`, and before a `switch`'s first `case`, there is no current block --
+/// C17 6.8.4.2 gives such a statement no edge -- so the compiler panicked
+/// outright on a statement it was about to throw away. Both forms are
+/// checked, at every level, because the two-way is only built once the call
+/// is lowered rather than left as a call.
+#[test]
+fn codegen_two_way_lowering_in_unreachable_code_compiles() {
+    let code = r#"
+#include <math.h>
+double d;
+
+static int after_goto(void) {
+    goto skip;
+    d = sqrt(d);
+skip:
+    return 0;
+}
+
+static int before_first_case(int x) {
+    switch (x) {
+        d = sqrt(d);
+    case 1:
+        return 0;
+    }
+    return 0;
+}
+
+int main(void) {
+    d = 4.0;
+    if (after_goto()) return 1;
+    if (before_first_case(1)) return 2;
+    /* The dead statements must not have run: `d` is untouched. */
+    return d == 4.0 ? 0 : 3;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("two_way_unreachable", code, &[opt.to_string()]),
+            0,
+            "{opt}"
+        );
+    }
+}
+
+/// A conversion to `_Bool` compares against zero; it is not a truncation.
+///
+/// C17 6.3.1.2p1: the result is 0 if the value compares equal to 0 and 1
+/// otherwise, whatever the source type. Two separate paths got it wrong:
+///
+/// - `linearize_cast` has a conversion of its own and had no `_Bool` case, so
+///   an explicit cast from a floating type fell into its float-to-integer arm
+///   and `(_Bool)0.5` became a `cvttsd2si` -- 0, where every other compiler
+///   says 1. `emit_convert` has the rule, and the cast path now defers to it.
+/// - `emit_convert`'s own `_Bool` compare carried `_Bool` as the instruction
+///   type, but a comparison must carry its *operand* type: that is how
+///   `emit_compare` sizes it (see `linearize_emit`, where every other
+///   comparison passes `operand_typ`). Sized at `_Bool`, it emitted `cmpl`
+///   for a 64-bit operand, so `(_Bool)0x100000000L` read only the low half
+///   and came out 0.
+///
+/// The static initializers are the control: `constexpr` folds those and was
+/// right all along, so the two halves of the language disagreed.
+#[test]
+fn codegen_conversion_to_bool_compares_against_zero() {
+    let code = r#"
+static _Bool sd = 0.5;
+static _Bool sl = 0x100000000L;
+
+int main(void) {
+    volatile double h = 0.5, nh = -0.5, tiny = 1e-300, zero = 0.0;
+    volatile float fh = 0.5f;
+    volatile long big = 0x100000000L, lzero = 0;
+    volatile int i256 = 256;
+    volatile char *p = (char *)1;
+
+    /* A fraction is not zero, so it converts to 1. */
+    if ((_Bool)h != 1) return 1;
+    if ((_Bool)nh != 1) return 2;
+    if ((_Bool)tiny != 1) return 3;
+    if ((_Bool)fh != 1) return 4;
+    /* A value whose low 32 bits are zero is still not zero. */
+    if ((_Bool)big != 1) return 5;
+    if ((_Bool)i256 != 1) return 6;
+    if ((_Bool)p != 1) return 7;
+    /* The implicit conversion takes the same rule. */
+    _Bool b = big;
+    if (b != 1) return 8;
+    /* Zero is still zero, by either path. */
+    if ((_Bool)zero != 0) return 9;
+    if ((_Bool)lzero != 0) return 10;
+    /* And the constant-folded initializers agree. */
+    if (sd != 1 || sl != 1) return 11;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("bool_convert", code, &[opt.to_string()]),
+            0,
+            "{opt}"
+        );
+    }
+}

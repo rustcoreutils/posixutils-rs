@@ -297,9 +297,11 @@ impl ModuleInfo {
             globals.insert(
                 g.name.clone(),
                 GlobalFacts {
-                    is_volatile: types
-                        .modifiers(g.typ)
-                        .contains(crate::types::TypeModifiers::VOLATILE),
+                    // Anywhere inside, not only on the object itself: a
+                    // `struct { volatile int v; ... }` is not
+                    // volatile-qualified, but every access to it still has to
+                    // happen as written (C17 6.7.3p7).
+                    is_volatile: types.contains_volatile(g.typ),
                     is_weak: g.symbol_attrs.weak,
                     is_thread_local: g.is_thread_local,
                 },
@@ -551,6 +553,55 @@ mod tests {
         };
         assert!(!may_alias(&at("g"), &at("h"), &mi));
         assert!(may_alias(&at("g"), &at("w"), &mi));
+    }
+
+    /// A global whose *member* is `volatile` is volatile storage.
+    ///
+    /// `GlobalFacts::is_volatile` was `modifiers(g.typ)`, which reports what
+    /// was written on the struct -- nothing, for
+    /// `struct S { volatile int v; }` -- so `forwardable` and `deletable`
+    /// treated `s` as ordinary and forwarded a load of it across a second
+    /// copy. The plain struct beside it is the control.
+    #[test]
+    fn memloc_a_volatile_member_makes_the_global_volatile() {
+        let mut types = host_types();
+        let vol_int = types.intern(crate::types::Type::with_modifiers(
+            crate::types::TypeKind::Int,
+            crate::types::TypeModifiers::VOLATILE,
+        ));
+        let member = |typ| crate::types::StructMember {
+            name: crate::strings::StringId::EMPTY,
+            typ,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            access_bytes: None,
+            explicit_align: None,
+        };
+        let composite = |members| crate::types::CompositeType {
+            tag: None,
+            members,
+            enum_constants: Vec::new(),
+            size: 4,
+            align: 4,
+            member_align: 4,
+            is_complete: true,
+            transparent: false,
+            anon_id: None,
+        };
+        let vol_struct = types.intern(crate::types::Type::struct_type(composite(vec![member(
+            vol_int,
+        )])));
+        let plain_struct = types.intern(crate::types::Type::struct_type(composite(vec![member(
+            types.int_id,
+        )])));
+
+        let mut module = super::super::Module::default();
+        module.add_global("v", vol_struct, super::super::Initializer::None);
+        module.add_global("p", plain_struct, super::super::Initializer::None);
+        let mi = ModuleInfo::build(&module, &types);
+        assert!(mi.global("v").is_volatile, "a volatile member carries");
+        assert!(!mi.global("p").is_volatile, "and a plain struct does not");
     }
 
     /// `__attribute__((alias))` gives one object two names, so an access

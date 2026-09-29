@@ -23,6 +23,7 @@
 use crate::float::{Complex, FloatVal, FpFormat};
 use crate::parse::ast::{BinaryOp, Expr, ExprKind, FpTest, InlineLibraryFn, OffsetOfPath, UnaryOp};
 use crate::symbol::SymbolId;
+use crate::target::Target;
 use crate::types::{TypeId, TypeKind, TypeTable};
 
 /// Which identifiers carry a value in a constant expression.
@@ -700,7 +701,7 @@ pub(crate) fn eval_complex(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) 
             let x = eval_complex_as(env, scope, left, base)?;
             let y = eval_complex_as(env, scope, right, base)?;
             match types.fp_format(base) {
-                Some(fmt) => fold_complex_float(*op, x, y, fmt),
+                Some(fmt) => fold_complex_float(*op, x, y, fmt, &types.target()),
                 None => fold_complex_int(types, *op, x, y, base),
             }
         }
@@ -748,14 +749,32 @@ fn convert_complex_half(
 }
 
 /// `x op y` for floating complex constants at `fmt`, as c17's run-time
-/// lowering computes it: `+` and `-` componentwise, `*` and `/` by libgcc's
-/// `__mul?c3` and `__div?c3`, which that lowering calls.
-fn fold_complex_float(op: BinaryOp, x: Complex, y: Complex, fmt: FpFormat) -> Option<Complex> {
+/// lowering computes it: `+` and `-` componentwise, `*` and `/` by the
+/// `__mul?c3` and `__div?c3` that lowering calls -- `target`'s own, since
+/// Linux ships libgcc's and Apple and FreeBSD ship compiler-rt's, and the
+/// two divide differently.
+///
+/// The optimizer asks the same question of the same method
+/// (`ir::libcall_fold::complex`). It may decline where it cannot answer for
+/// the routine; this cannot, because a static initializer has to fold or
+/// the program does not compile -- which is why folding as libgcc divides
+/// wherever the answer was wanted left a static quotient one place from the
+/// `__divdc3` beside it on Darwin.
+fn fold_complex_float(
+    op: BinaryOp,
+    x: Complex,
+    y: Complex,
+    fmt: FpFormat,
+    target: &Target,
+) -> Option<Complex> {
     Some(match op {
         BinaryOp::Add => (x.0.add(y.0, fmt), x.1.add(y.1, fmt)),
         BinaryOp::Sub => (x.0.sub(y.0, fmt), x.1.sub(y.1, fmt)),
         BinaryOp::Mul => FloatVal::complex_mul(x, y, fmt),
-        BinaryOp::Div => FloatVal::complex_div(x, y, fmt),
+        BinaryOp::Div => {
+            let division = target.complex_division(fmt.complex_routine_format());
+            FloatVal::complex_div_on(x, y, fmt, division)
+        }
         _ => return None,
     })
 }

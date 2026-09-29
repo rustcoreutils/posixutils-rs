@@ -147,11 +147,6 @@ impl<'a> Print<'a> {
             (b"%s", Stream::Stdout) if is_pointer(types, t) => {
                 self.text(types, c_str(facts, p)?, p)
             }
-            // What `fputs` of "" comes to, which the `_unlocked` form reaches
-            // too.
-            (b"%s", Stream::File(_)) if is_pointer(types, t) && c_str(facts, p) == Some(b"") => {
-                Some(Folded::Discard(None))
-            }
             (b"%s", Stream::File(fp)) if is_pointer(types, t) => {
                 self.locking.call(fputs_call(Operand::Value(p, t), fp))
             }
@@ -168,7 +163,14 @@ impl<'a> Print<'a> {
     /// Printing the known `text`, which `p` points at.
     fn text(&self, types: &TypeTable, text: &[u8], p: PseudoId) -> Option<Folded> {
         if text.is_empty() {
-            return Some(Folded::Discard(None));
+            // Nothing is written, and the call still stays: C17 7.21.2p4
+            // gives a stream no orientation until an input or output
+            // function is applied to it, and the first one sets it whether
+            // or not it transfers a byte. gcc and clang drop these two forms
+            // -- `printf("")` and `fprintf(fp, "")` -- and lose the
+            // orientation with them; `fputs("", fp)` they keep, and every
+            // empty write is treated alike here.
+            return None;
         }
         let new = match (self.stream, text) {
             (Stream::File(fp), _) => fputs_call(Operand::Value(p, types.const_char_ptr_id), fp),
@@ -186,7 +188,15 @@ fn fputs(facts: &Facts, s: PseudoId, fp: Arg, locking: Locking) -> Option<Folded
         return None;
     };
     if len == 0 {
-        return Some(Folded::Discard(None));
+        // Nothing is written, but the call is not nothing: C17 7.21.2p4 gives
+        // a stream no orientation until an input or output function is
+        // applied to it, and the first one sets it whether or not it
+        // transfers a byte. Discarding this left `fwide(fp, 0)` answering 0
+        // where -O0 answered a byte orientation. gcc and clang keep it too.
+        //
+        // Rewriting it as a zero-length `fwrite` would not do: that does not
+        // orient the stream either.
+        return None;
     }
     let types = facts.types;
     if let Some(&[c]) = c_str(facts, s) {
@@ -318,13 +328,13 @@ mod tests {
         made(LibFn::Puts, "puts", vec![Operand::Literal(text.to_vec())])
     }
 
-    const DROP: Option<Folded> = Some(Folded::Discard(None));
-
     #[test]
     fn printf_of_text_is_nothing_putchar_or_puts() {
         let mut fx = Fixture::new();
+        // An empty write orients the stream, so it keeps its call; see
+        // `Print::text`.
         let empty = lit(&mut fx, "");
-        assert_eq!(fold1(&mut fx, LibFn::Printf, &[empty]), DROP);
+        assert_eq!(fold1(&mut fx, LibFn::Printf, &[empty]), None);
         let a = lit(&mut fx, "a");
         let want = made(LibFn::Putchar, "putchar", vec![int(&fx, b'a')]);
         assert_eq!(fold1(&mut fx, LibFn::Printf, &[a]), want);
@@ -366,7 +376,7 @@ mod tests {
             puts_literal(b"hello")
         );
         let empty = lit(&mut fx, "");
-        assert_eq!(fold1(&mut fx, LibFn::Printf, &[ps, empty]), DROP);
+        assert_eq!(fold1(&mut fx, LibFn::Printf, &[ps, empty]), None);
         let pct_nl = lit(&mut fx, "%d\n");
         assert_eq!(
             fold1(&mut fx, LibFn::Printf, &[ps, pct_nl]),
@@ -420,8 +430,11 @@ mod tests {
     #[test]
     fn a_call_with_no_result_is_unused() {
         let mut fx = Fixture::new();
-        let empty = lit(&mut fx, "");
-        call(&mut fx, LibFn::Printf, &[empty]);
+        // A one-character write, which folds to `putchar`: an empty one no
+        // longer folds at all, and this test is about the *result* being
+        // unused rather than about what the call becomes.
+        let a = lit(&mut fx, "a");
+        call(&mut fx, LibFn::Printf, &[a]);
         fx.func().blocks[0].insns.last_mut().unwrap().target = None;
         assert_eq!(folds(&fx).len(), 1);
     }
@@ -436,18 +449,21 @@ mod tests {
             lit(&mut fx, "%s"),
         );
         let fp = stream(&mut fx);
-        assert_eq!(fold1(&mut fx, LibFn::PrintfUnlocked, &[empty]), DROP);
-        assert_eq!(fold1(&mut fx, LibFn::PrintfUnlocked, &[ps, empty]), DROP);
+        // An empty write still orients the stream (C17 7.21.2p4), so none of
+        // these is dropped; see `Print::text`.
+        assert_eq!(fold1(&mut fx, LibFn::PrintfUnlocked, &[empty]), None);
+        assert_eq!(fold1(&mut fx, LibFn::PrintfUnlocked, &[ps, empty]), None);
         assert_eq!(fold1(&mut fx, LibFn::PrintfUnlocked, &[a]), None);
         assert_eq!(fold1(&mut fx, LibFn::PrintfUnlocked, &[nl]), None);
-        assert_eq!(fold1(&mut fx, LibFn::FprintfUnlocked, &[fp, empty]), DROP);
+        assert_eq!(fold1(&mut fx, LibFn::FprintfUnlocked, &[fp, empty]), None);
         assert_eq!(
             fold1(&mut fx, LibFn::FprintfUnlocked, &[fp, ps, empty]),
-            DROP
+            None
         );
         assert_eq!(fold1(&mut fx, LibFn::FprintfUnlocked, &[fp, a]), None);
         assert_eq!(fold1(&mut fx, LibFn::FprintfUnlocked, &[fp, ps, a]), None);
-        assert_eq!(fold1(&mut fx, LibFn::FputsUnlocked, &[empty, fp]), DROP);
+        // As for the locking form: it still orients the stream.
+        assert_eq!(fold1(&mut fx, LibFn::FputsUnlocked, &[empty, fp]), None);
         assert_eq!(fold1(&mut fx, LibFn::FputsUnlocked, &[a, fp]), None);
         assert_eq!(fold1(&mut fx, LibFn::FputsUnlocked, &[nl, fp]), None);
     }
@@ -498,8 +514,12 @@ mod tests {
         let fp = stream(&mut fx);
         let s = unknown(&mut fx, |t| t.char_ptr_id);
         let c = unknown(&mut fx, |t| t.int_id);
-        assert_eq!(fold1(&mut fx, LibFn::Fprintf, &[fp, empty]), DROP);
-        assert_eq!(fold1(&mut fx, LibFn::Fprintf, &[fp, ps, empty]), DROP);
+        assert_eq!(fold1(&mut fx, LibFn::Fprintf, &[fp, empty]), None);
+        // `fprintf(fp, "%s", "")` takes the ordinary `%s` rewrite now that
+        // the empty case no longer short-circuits to a discard: `fputs` of
+        // the empty string, which writes nothing and orients the stream.
+        let want = made(LibFn::Fputs, "fputs", vec![val(empty), val(fp)]);
+        assert_eq!(fold1(&mut fx, LibFn::Fprintf, &[fp, ps, empty]), want);
         let want = made(LibFn::Fputs, "fputs", vec![val(hello), val(fp)]);
         assert_eq!(fold1(&mut fx, LibFn::Fprintf, &[fp, hello]), want);
         let want = made(LibFn::Fputs, "fputs", vec![val(s), val(fp)]);
@@ -516,7 +536,9 @@ mod tests {
         let mut fx = Fixture::new();
         let (empty, nl, hello) = (lit(&mut fx, ""), lit(&mut fx, "\n"), lit(&mut fx, "hello"));
         let fp = stream(&mut fx);
-        assert_eq!(fold1(&mut fx, LibFn::Fputs, &[empty, fp]), DROP);
+        // Writes nothing, but orients the stream (C17 7.21.2p4), so it is
+        // not dropped. Every empty write is alike in this.
+        assert_eq!(fold1(&mut fx, LibFn::Fputs, &[empty, fp]), None);
         let want = made(LibFn::Fputc, "fputc", vec![int(&fx, b'\n'), val(fp)]);
         assert_eq!(fold1(&mut fx, LibFn::Fputs, &[nl, fp]), want);
         let want = fwrite(&fx, hello.0, 5, fp);
@@ -567,12 +589,14 @@ mod tests {
     }
 
     /// `printf("hi\n")` is `puts` of a new literal "hi", defining no result,
-    /// and a dropped call leaves nothing.
+    /// and a rewritten call beside it leaves its own result behind.
     #[test]
     fn a_made_puts_passes_a_new_literal() {
         let mut fx = Fixture::new();
-        let (empty, nl) = (lit(&mut fx, ""), lit(&mut fx, "hi\n"));
-        let dropped = call(&mut fx, LibFn::Printf, &[empty]);
+        // `printf("a")` becomes `putchar`, so its result pseudo goes too;
+        // an empty write would not fold at all any more.
+        let (a, nl) = (lit(&mut fx, "a"), lit(&mut fx, "hi\n"));
+        let dropped = call(&mut fx, LibFn::Printf, &[a]);
         let r = call(&mut fx, LibFn::Printf, &[nl]);
         let base = fx.module.strings.len();
         let insns = run_on(&mut fx, &[]);
@@ -582,8 +606,12 @@ mod tests {
             [(label.clone(), "hi".to_string())]
         );
         let calls = calls(&insns);
-        assert_eq!(calls.len(), 1);
-        let puts = calls[0];
+        assert_eq!(calls.len(), 2, "putchar and puts");
+        let puts = calls
+            .iter()
+            .copied()
+            .find(|c| c.func_name.as_deref() == Some("puts"))
+            .expect("the newline form becomes puts");
         assert_eq!(puts.func_name.as_deref(), Some("puts"));
         assert_eq!(puts.known, Some(LibFn::Puts));
         assert!(puts.abi_info.is_some());

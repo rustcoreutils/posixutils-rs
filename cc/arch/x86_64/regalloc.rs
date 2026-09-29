@@ -1321,9 +1321,7 @@ impl RegAlloc {
         for block in &func.blocks {
             for insn in &block.insns {
                 // Only match Int128 type, not 16-byte structs or long doubles
-                let is_int128 = insn.typ.is_some_and(|t| {
-                    types.kind(t) == crate::types::TypeKind::Int128 && !types.is_complex(t)
-                });
+                let is_int128 = insn.typ.is_some_and(|t| types.is_plain_int128(t));
 
                 if is_int128 {
                     // Comparison results are always small integers, not 128-bit.
@@ -1647,8 +1645,7 @@ impl RegAlloc {
                     );
                 }
                 spend_arg_regs(&mut fp_arg_idx, 1, fp_arg_regs.len());
-            } else if types.kind(*typ) == crate::types::TypeKind::Int128 && !types.is_complex(*typ)
-            {
+            } else if types.is_plain_int128(*typ) {
                 // __int128: uses two GP registers when available.
                 // Always allocate a local stack slot — for register params,
                 // store_args_to_stack stores register values; for stack params,

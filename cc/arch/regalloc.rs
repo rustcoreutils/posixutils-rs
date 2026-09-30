@@ -884,38 +884,13 @@ where
                 }
             }
 
-            // Type information decides the rest -- except for a comparison,
-            // whose *result* is a boolean integer whatever it compared. The
-            // `Set*` family is typed by its operands too: `emit_compare_zero`
-            // on a `float` produces a `SetNe` typed `float`, whose boolean
-            // would otherwise land in a vector register while the code that
-            // computed it wrote a general one.
-            let is_comparison = matches!(
-                insn.op,
-                Opcode::FCmpOEq
-                    | Opcode::FCmpONe
-                    | Opcode::FCmpOLt
-                    | Opcode::FCmpOLe
-                    | Opcode::FCmpOGt
-                    | Opcode::FCmpOGe
-                    | Opcode::SetEq
-                    | Opcode::SetNe
-                    | Opcode::SetLt
-                    | Opcode::SetLe
-                    | Opcode::SetGt
-                    | Opcode::SetGe
-                    | Opcode::SetB
-                    | Opcode::SetBe
-                    | Opcode::SetA
-                    | Opcode::SetAe
-            );
-
-            if !is_comparison {
-                if let Some(typ) = insn.typ {
-                    if is_float_type(typ) {
-                        if let Some(target) = insn.target {
-                            fp_pseudos.insert(target);
-                        }
+            // The result type decides the rest. A comparison's is an
+            // integer whatever it compared, so its 0 or 1 lands in a general
+            // register, where its emitter writes it.
+            if let Some(typ) = insn.typ {
+                if is_float_type(typ) {
+                    if let Some(target) = insn.target {
+                        fp_pseudos.insert(target);
                     }
                 }
             }

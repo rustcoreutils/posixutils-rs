@@ -27,8 +27,8 @@
 //
 
 use super::constfold::{
-    at_width, cmp_mask, cmp_operand_width, fcmp_mask, get_cmp_info, mirror_mask, unambiguous_at,
-    CMP_ALL, CMP_EQ, CMP_UN, FCMP_ALL,
+    at_width, cmp_mask, fcmp_mask, get_cmp_info, mirror_mask, unambiguous_at, CMP_ALL, CMP_EQ,
+    CMP_UN, FCMP_ALL,
 };
 use super::{Function, Opcode, PseudoId, PseudoKind};
 use crate::float::FloatVal;
@@ -377,7 +377,7 @@ impl CmpFacts {
                 if insn.src.len() != 2 {
                     continue;
                 }
-                let width = cmp_operand_width(insn);
+                let width = insn.operand_width();
                 facts.insert(
                     target,
                     CmpFact {

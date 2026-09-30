@@ -1018,12 +1018,7 @@ impl X86_64CodeGen {
             }
 
             // Floating-point comparisons
-            Opcode::FCmpOEq
-            | Opcode::FCmpONe
-            | Opcode::FCmpOLt
-            | Opcode::FCmpOLe
-            | Opcode::FCmpOGt
-            | Opcode::FCmpOGe => {
+            op if op.is_float_comparison() => {
                 if self.is_longdouble_op(insn, types) {
                     self.emit_x87_compare(insn);
                 } else {
@@ -1070,16 +1065,7 @@ impl X86_64CodeGen {
                 }
             }
 
-            Opcode::SetEq
-            | Opcode::SetNe
-            | Opcode::SetLt
-            | Opcode::SetLe
-            | Opcode::SetGt
-            | Opcode::SetGe
-            | Opcode::SetB
-            | Opcode::SetBe
-            | Opcode::SetA
-            | Opcode::SetAe => {
+            op if op.is_int_comparison() => {
                 self.emit_compare(insn, types);
             }
 

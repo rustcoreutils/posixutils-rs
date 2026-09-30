@@ -9394,6 +9394,38 @@ int main(void) {
 /// The attribute cases are grouped because they share a shape: an attribute
 /// that reaches the *parser* but not the object file, or reaches an object it
 /// was never written on.
+/// A function designator tested for truth is tested as the pointer it decays
+/// to, at the full width of an address (C17 6.3.2.1p4).
+///
+/// Typed as the function itself, the test had no width -- a function's is 0
+/// -- which both back ends raised to 32 bits: `if (weak_fn)` compared the low
+/// half of the address, so a function placed at a multiple of 4 GiB read as
+/// absent. `cmpl`/`cmp w` against 0 is the defect; the whole register is the
+/// fix.
+#[test]
+fn codegen_a_function_designator_is_tested_at_address_width() {
+    // And comparing two of them, which is the same question at a second site.
+    let src = "extern int wkfn(void) __attribute__((weak));\n\
+               extern int other(void) __attribute__((weak));\n\
+               int probe(void) { if (wkfn) return 1; return 0; }\n\
+               int same(void) { return wkfn == other; }\n";
+    let asm = asm_for_with("fn_truth", X86_64_LINUX, src, &["-O0"]);
+    let body = body_of(&asm, "probe");
+    assert!(body.contains("cmpq $0"), "{body}");
+    assert!(!body.contains("cmpl $0"), "{body}");
+    let body = body_of(&asm, "same");
+    assert!(body.contains("cmpq"), "{body}");
+    assert!(!body.contains("cmpl"), "{body}");
+    let asm = asm_for_with("fn_truth_a64", AARCH64_LINUX, src, &["-O0"]);
+    for f in ["probe", "same"] {
+        let body = body_of(&asm, f);
+        assert!(
+            !body.lines().any(|l| l.trim().starts_with("cmp w")),
+            "{body}"
+        );
+    }
+}
+
 #[test]
 fn codegen_symbol_attributes_do_not_leak_or_vanish() {
     // A function definition consumed its attributes through the function-attribute

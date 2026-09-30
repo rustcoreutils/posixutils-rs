@@ -893,9 +893,10 @@ impl X86_64CodeGen {
             Some(t) => t,
             None => return,
         };
-        // Use type-aware FP size determination
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
-        let move_size = self.fp_format(insn.typ, insn.size, types);
+        // The operands' format; the result is an `int`.
+        let (operand, width) = (insn.operand_type(), insn.operand_width());
+        let fp_size = FpSize::from_type_or_bits(operand, width, types, &self.base.target);
+        let move_size = self.fp_format(operand, width, types);
 
         // Use Xmm15 as the work register for src1 (Xmm15/Xmm14 are
         // reserved scratch — not in the allocator palette). src2 cannot

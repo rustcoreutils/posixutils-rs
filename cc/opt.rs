@@ -349,9 +349,9 @@ fn optimize_function(
         // killed in the same iteration.
         let mx_changed = memexpand::run(func, types);
         let lf_changed = loadfwd::run(func, types, mi);
-        let vrp_changed = vrp::run(func, types);
+        let vrp_changed = vrp::run(func);
         let ifc_changed = ifconv::run(func);
-        let sccp_changed = sccp::run(func, types);
+        let sccp_changed = sccp::run(func);
         let ic_changed = instcombine::run(func, types);
         // `libcall_fold` once the arguments are as constant as `sccp` and
         // `instcombine` can make them; what it leaves -- a constant, a load

@@ -25,7 +25,7 @@
 //
 
 use crate::float::{FloatVal, FpFormat};
-use crate::types::{TypeId, TypeTable};
+
 use std::cmp::Ordering;
 
 use super::{Instruction, Opcode};
@@ -36,9 +36,8 @@ use super::{Instruction, Opcode};
 /// An `i128` in this IR holds whatever bit pattern its constant was built
 /// from, and nothing on the instruction says how to read it back: the same
 /// 32 bits are -1 or 4294967295 depending on the consumer, and a `Set*`
-/// cannot even ask, because its `size` is the width of its own `_Bool`/`int`
-/// result rather than of its operands (`(_Bool)x` lowers to `setne.8` over
-/// two 32-bit values).
+/// cannot even ask: it records how wide its operands are
+/// (`Instruction::operand_width`), not how to read them.
 ///
 /// That ambiguity is pre-existing and harmless while a folded constant only
 /// ever reaches codegen, which truncates when it materializes an immediate.
@@ -261,54 +260,6 @@ pub(crate) fn mirror_mask(mask: u8) -> u8 {
         | if mask & CMP_GT != 0 { CMP_LT } else { 0 }
 }
 
-/// The width a `Set*` reads its operands at.
-///
-/// `insn.size` is the width of the *result* at one of the four `Set*`
-/// construction sites -- a `_Bool` conversion lowers to `setne.8` over two
-/// 32-bit operands -- and that site is the only one that records the operand
-/// width, in `src_size`. Preferring `src_size` when it is set is right at all
-/// four.
-pub(crate) fn cmp_operand_width(insn: &Instruction) -> u32 {
-    if insn.src_size != 0 {
-        insn.src_size
-    } else {
-        insn.size.max(1)
-    }
-}
-
-/// True for the opcodes that record their *operands* in `typ`/`size` and
-/// produce an `int`.
-///
-/// Integer and floating comparisons both, which is the whole set: no other
-/// opcode describes anything but its own result there.
-pub(crate) fn is_comparison(op: Opcode) -> bool {
-    cmp_mask(op).is_some() || fcmp_mask(op).is_some()
-}
-
-/// The type and width `insn` leaves in its target.
-///
-/// A rewrite that replaces an instruction with a `Copy` of its value has to
-/// give that copy the type of the *value*, and for all but one family of
-/// opcodes `insn.typ`/`insn.size` are exactly that. The exception is the
-/// comparisons, which describe their operands there (see
-/// [`cmp_operand_width`]) and produce an `int`, and the population counts,
-/// whose `size` is the width of the operand they count while the count is an
-/// `int`.
-///
-/// Carrying the operand type across is invisible for an integer comparison --
-/// an integer of the wrong width still lands in a general register -- and a
-/// miscompile for a float one: the folded constant is typed `double`, so the
-/// backend puts it in an SSE register and the caller reads the return value
-/// out of the wrong one.
-pub(crate) fn result_type_of(insn: &Instruction, types: &TypeTable) -> (Option<TypeId>, u32) {
-    if is_comparison(insn.op) || matches!(insn.op, Opcode::Popcount32 | Opcode::Popcount64) {
-        let int_id = types.int_id;
-        (Some(int_id), types.size_bits(int_id))
-    } else {
-        (insn.typ, insn.size)
-    }
-}
-
 /// `insn`'s operation applied to two constants, or `None` if the opcode is
 /// not one this folds or the operation is undefined for these operands.
 ///
@@ -331,7 +282,7 @@ pub(crate) fn eval_binop(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
 
         _ => {
             let info = get_cmp_info(insn.op)?;
-            let size = cmp_operand_width(insn);
+            let size = insn.operand_width();
             let a = at_width(a, size, info.signed);
             let b = at_width(b, size, info.signed);
             Some(if (info.compare)(a, b) { 1 } else { 0 })

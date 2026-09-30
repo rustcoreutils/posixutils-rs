@@ -57,6 +57,13 @@
 //        constant reads as a symbol or a register as a constant. Every pseudo
 //        must be found at its own position.
 //
+//   I10 — AN OPERAND OF ANOTHER TYPE IS RECORDED AS ONE
+//        `typ`/`size` describe an instruction's result, for every opcode; a
+//        comparison or a population count, which reads another type than it
+//        produces, records its operands in `src_typ`/`src_size`
+//        (`Instruction::operand_type`). Built without them, a backend would
+//        compare at the result's width.
+//
 //   I8 — THE CFG CACHE AGREES WITH THE INSTRUCTIONS
 //        Every block ends in exactly one terminator; `children` is exactly the
 //        successors its instructions name (`BasicBlock::named_successors`, or
@@ -138,6 +145,14 @@ pub enum ValidationError {
         function: String,
         block: BasicBlockId,
         what: String,
+    },
+    /// I10 violation: a comparison or population count with no operand
+    /// type or width recorded.
+    MissingOperandType {
+        function: String,
+        block: usize,
+        index: usize,
+        opcode: Opcode,
     },
     /// I7 violation: `get_pseudo` does not find this pseudo at its own
     /// position in `pseudos`.
@@ -225,6 +240,16 @@ impl fmt::Display for ValidationError {
             } => write!(
                 f,
                 "[ir-validate I8/I9] in function `{function}`: {block}: {what}"
+            ),
+            ValidationError::MissingOperandType {
+                function,
+                block,
+                index,
+                opcode,
+            } => write!(
+                f,
+                "[ir-validate I10] in function `{function}`: bb={block} insn={index} \
+                 op={opcode:?} records no operand type or width"
             ),
             ValidationError::StalePseudoIndex { function, pseudo } => write!(
                 f,
@@ -350,6 +375,7 @@ pub fn validate_function_at(func: &Function, stage: Stage) -> Result<(), Vec<Val
     check_displacements_in_range(func, &mut errors);
     check_pseudo_index(func, &mut errors);
     check_cfg(func, &mut errors);
+    check_operand_types(func, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -492,6 +518,24 @@ fn check_memory_access_implies_side_effect(func: &Function, out: &mut Vec<Valida
             }
             if !insn.op.has_side_effects() {
                 out.push(ValidationError::MemoryAccessWithoutSideEffect {
+                    function: func.name.clone(),
+                    block,
+                    index,
+                    opcode: insn.op,
+                });
+            }
+        }
+    }
+}
+
+/// I10 -- a comparison or population count records the operands it reads.
+fn check_operand_types(func: &Function, out: &mut Vec<ValidationError>) {
+    for (block, bb) in func.blocks.iter().enumerate() {
+        for (index, insn) in bb.insns.iter().enumerate() {
+            let counts = matches!(insn.op, Opcode::Popcount32 | Opcode::Popcount64);
+            if (insn.op.is_comparison() || counts) && (insn.src_typ.is_none() || insn.src_size == 0)
+            {
+                out.push(ValidationError::MissingOperandType {
                     function: func.name.clone(),
                     block,
                     index,
@@ -1168,6 +1212,54 @@ mod tests {
         assert_eq!(
             f.blocks[2].insns[0].phi_list,
             vec![(BasicBlockId(1), PseudoId(4))]
+        );
+    }
+
+    /// I10: a comparison records its operands in `src_typ`/`src_size`, where
+    /// every opcode that reads another type does. One assembled by hand
+    /// without them is reported; one from `Instruction::compare` is not.
+    #[test]
+    fn i10_a_comparison_without_its_operand_type_is_flagged() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = fresh_func("cmp");
+        for i in 0..3 {
+            func.add_pseudo(Pseudo::reg(PseudoId(i), i));
+        }
+        let bare = Instruction::new(Opcode::SetLt)
+            .with_target(PseudoId(2))
+            .with_src2(PseudoId(0), PseudoId(1))
+            .with_type_and_size(types.int_id, 32);
+        push(&mut func, bare);
+        let errors = validate_function(&func).unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::MissingOperandType {
+                opcode: Opcode::SetLt,
+                ..
+            }
+        )));
+
+        let mut func = fresh_func("cmp");
+        for i in 0..3 {
+            func.add_pseudo(Pseudo::reg(PseudoId(i), i));
+        }
+        let cmp = Instruction::compare(
+            Opcode::SetLt,
+            PseudoId(2),
+            (PseudoId(0), PseudoId(1)),
+            (types.long_id, 64),
+            (types.int_id, 32),
+        );
+        assert_eq!(
+            (cmp.operand_type(), cmp.operand_width()),
+            (Some(types.long_id), 64)
+        );
+        assert_eq!((cmp.typ, cmp.size), (Some(types.int_id), 32));
+        push(&mut func, cmp);
+        assert!(
+            validate_function(&func).is_ok(),
+            "{:?}",
+            validate_function(&func)
         );
     }
 }

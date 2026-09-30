@@ -715,10 +715,20 @@ fn expand_int128_cmp_eq(
     ));
 
     let zero = func.create_const_pseudo(0);
-    insns.push(Instruction::binop(
-        insn.op, result, or_result, zero, long_type, 64,
+    insns.push(Instruction::compare(
+        insn.op,
+        result,
+        (or_result, zero),
+        (long_type, 64),
+        comparison_result_type(insn, types),
     ));
     insns
+}
+
+/// The result type and width of the comparison `insn`, which a comparison
+/// expanded from it produces too.
+fn comparison_result_type(insn: &Instruction, types: &TypeTable) -> (TypeId, u32) {
+    (insn.typ.unwrap_or(types.int_id), insn.size)
 }
 
 /// Expand int128 ordered comparison (SetLt/SetLe/SetGt/SetGe/SetB/SetBe/SetA/SetAe).
@@ -734,19 +744,23 @@ fn expand_int128_cmp_ord(
     let (a_lo, a_hi) = extract_halves(func, &mut insns, insn.src[0], long_type);
     let (b_lo, b_hi) = extract_halves(func, &mut insns, insn.src[1], long_type);
 
+    let result_type = comparison_result_type(insn, types);
     let hi_eq = func.create_reg_pseudo();
-    insns.push(Instruction::binop(
+    insns.push(Instruction::compare(
         Opcode::SetEq,
         hi_eq,
-        a_hi,
-        b_hi,
-        long_type,
-        64,
+        (a_hi, b_hi),
+        (long_type, 64),
+        result_type,
     ));
 
     let hi_cmp = func.create_reg_pseudo();
-    insns.push(Instruction::binop(
-        insn.op, hi_cmp, a_hi, b_hi, long_type, 64,
+    insns.push(Instruction::compare(
+        insn.op,
+        hi_cmp,
+        (a_hi, b_hi),
+        (long_type, 64),
+        result_type,
     ));
 
     // Low halves always use unsigned compare
@@ -758,10 +772,21 @@ fn expand_int128_cmp_ord(
         _ => unreachable!(),
     };
     let lo_cmp = func.create_reg_pseudo();
-    insns.push(Instruction::binop(lo_op, lo_cmp, a_lo, b_lo, long_type, 64));
+    insns.push(Instruction::compare(
+        lo_op,
+        lo_cmp,
+        (a_lo, b_lo),
+        (long_type, 64),
+        result_type,
+    ));
 
     insns.push(Instruction::select(
-        result, hi_eq, lo_cmp, hi_cmp, long_type, 64,
+        result,
+        hi_eq,
+        lo_cmp,
+        hi_cmp,
+        result_type.0,
+        result_type.1,
     ));
     insns
 }
@@ -1484,17 +1509,14 @@ pub(crate) fn expand_float16_cmp(
     let right_ext = func.create_reg_pseudo();
     insns.push(build_f16_extend_call(right_ext, right, pos, types, target));
 
-    // Float comparison — result type is int, keep original type/size
-    let mut cmp = Instruction::binop(
+    // The same comparison, of the widened operands; its result is unchanged.
+    insns.push(Instruction::compare(
         insn.op,
         result,
-        left_ext,
-        right_ext,
-        insn.typ.unwrap_or(types.int_id),
-        float_size,
-    );
-    cmp.src_typ = Some(float_type);
-    insns.push(cmp);
+        (left_ext, right_ext),
+        (float_type, float_size),
+        comparison_result_type(insn, types),
+    ));
     insns
 }
 
@@ -1524,11 +1546,19 @@ pub(crate) fn map_int128_divmod(
 }
 
 /// Classify and expand an int128 operation into 64-bit sequences.
+///
+/// An operation is 128-bit when its value is -- or, for a comparison, when
+/// its operands are: a comparison's result is an `int` whatever it compares.
 pub(crate) fn map_int128_expand(
     insn: &Instruction,
     ctx: &mut MappingCtx<'_>,
 ) -> Option<MappedInsn> {
-    if insn.size != 128 {
+    let width = if insn.op.is_comparison() {
+        insn.operand_width()
+    } else {
+        insn.size
+    };
+    if width != 128 {
         return None;
     }
     let types = ctx.types;
@@ -1627,7 +1657,7 @@ pub(crate) fn map_int128_expand(
         }
         // Equality comparisons
         Opcode::SetEq | Opcode::SetNe => {
-            let typ = insn.typ?;
+            let typ = insn.operand_type()?;
             if types.kind(typ) != TypeKind::Int128 {
                 return None;
             }
@@ -1644,7 +1674,7 @@ pub(crate) fn map_int128_expand(
         | Opcode::SetBe
         | Opcode::SetA
         | Opcode::SetAe => {
-            let typ = insn.typ?;
+            let typ = insn.operand_type()?;
             if types.kind(typ) != TypeKind::Int128 {
                 return None;
             }
@@ -1824,21 +1854,13 @@ fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Option<MappedI
         }
 
         // Comparisons: call rtlib cmp, then compare result against 0
-        Opcode::FCmpOLt
-        | Opcode::FCmpOLe
-        | Opcode::FCmpOGt
-        | Opcode::FCmpOGe
-        | Opcode::FCmpOEq
-        | Opcode::FCmpONe => {
+        op if op.is_float_comparison() => {
             // The operand type decides, not the width: x87 extended is also
             // 128 bits wide here, and treating an untyped 128-bit compare as
             // binary128 sent every x86-64 `long double` comparison to
             // `__lttf2` instead of to the x87 unit.
             //
-            // A comparison carries its *operand* type in `typ` -- the result
-            // is an int -- so that is the one to ask; `src_typ` is set on the
-            // paths that build one explicitly.
-            let operand_typ = insn.src_typ.or(insn.typ)?;
+            let operand_typ = insn.operand_type()?;
             if !is_binary128(ctx.types, operand_typ) {
                 return None;
             }
@@ -1855,7 +1877,7 @@ fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Option<MappedI
             let result_pseudo = insn.target.expect("cmp must have target");
             let int_type = ctx.types.int_id;
             let int_size = ctx.types.size_bits(int_type);
-            let ld_type = insn.src_typ.or(insn.typ).unwrap_or(ctx.types.longdouble_id);
+            let ld_type = operand_typ;
 
             // Allocate pseudo for cmp call result
             let cmp_result = ctx.func.create_reg_pseudo();
@@ -1877,8 +1899,13 @@ fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Option<MappedI
             call.pos = insn.pos;
 
             // Build the int comparison: result = cmp_op(cmp_result, 0)
-            let cmp =
-                Instruction::binop(cmp_op, result_pseudo, cmp_result, zero, int_type, int_size);
+            let cmp = Instruction::compare(
+                cmp_op,
+                result_pseudo,
+                (cmp_result, zero),
+                (int_type, int_size),
+                comparison_result_type(insn, ctx.types),
+            );
 
             Some(MappedInsn::Replace(vec![call, cmp]))
         }
@@ -2043,21 +2070,19 @@ pub(crate) mod test_helpers {
         ));
 
         // Comparisons
-        bb.add_insn(Instruction::binop(
+        bb.add_insn(Instruction::compare(
             Opcode::SetEq,
             PseudoId(2),
-            PseudoId(0),
-            PseudoId(1),
-            types.int_id,
-            32,
+            (PseudoId(0), PseudoId(1)),
+            (types.int_id, 32),
+            (types.int_id, 32),
         ));
-        bb.add_insn(Instruction::binop(
+        bb.add_insn(Instruction::compare(
             Opcode::SetLt,
             PseudoId(2),
-            PseudoId(0),
-            PseudoId(1),
-            types.int_id,
-            32,
+            (PseudoId(0), PseudoId(1)),
+            (types.int_id, 32),
+            (types.int_id, 32),
         ));
 
         // Unary
@@ -2307,11 +2332,10 @@ mod tests {
         let mut func = make_minimal_func(types);
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.add_insn(Instruction::new(Opcode::Entry));
-        let mut cmp = Instruction::binop(
+        let mut cmp = Instruction::test_binary(
             op,
             PseudoId(2),
-            PseudoId(0),
-            PseudoId(1),
+            (PseudoId(0), PseudoId(1)),
             typ,
             types.size_bits(typ),
         );

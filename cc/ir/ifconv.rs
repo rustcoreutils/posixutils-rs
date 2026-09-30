@@ -72,23 +72,7 @@ fn is_speculatable(insn: &Instruction) -> bool {
             | Opcode::Zext
             | Opcode::Sext
             | Opcode::Select
-            | Opcode::SetEq
-            | Opcode::SetNe
-            | Opcode::SetLt
-            | Opcode::SetLe
-            | Opcode::SetGt
-            | Opcode::SetGe
-            | Opcode::SetB
-            | Opcode::SetBe
-            | Opcode::SetA
-            | Opcode::SetAe
-            | Opcode::FCmpOEq
-            | Opcode::FCmpONe
-            | Opcode::FCmpOLt
-            | Opcode::FCmpOLe
-            | Opcode::FCmpOGt
-            | Opcode::FCmpOGe
-    )
+    ) || insn.op.is_comparison()
 }
 
 /// One recognized diamond.
@@ -346,13 +330,12 @@ mod tests {
 
     fn pure_arm() -> Instruction {
         let types = TypeTable::new(&Target::host());
-        Instruction::binop(
+        Instruction::compare(
             Opcode::SetNe,
             PseudoId(2),
-            PseudoId(0),
-            PseudoId(1),
-            types.int_id,
-            32,
+            (PseudoId(0), PseudoId(1)),
+            (types.int_id, 32),
+            (types.int_id, 32),
         )
     }
 
@@ -395,11 +378,10 @@ mod tests {
             Opcode::FCmpOGt,
             Opcode::FCmpOGe,
         ] {
-            let arm = Instruction::binop(
+            let arm = Instruction::test_binary(
                 op,
                 PseudoId(2),
-                PseudoId(0),
-                PseudoId(1),
+                (PseudoId(0), PseudoId(1)),
                 types.double_id,
                 64,
             );

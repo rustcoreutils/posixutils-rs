@@ -43,7 +43,6 @@
 use super::constfold::{eval_binop, eval_unop, get_cmp_info};
 use super::propagate::{self, cbr_taken, switch_taken, Site};
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
-use crate::types::TypeTable;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// The lattice, of height three.
@@ -91,13 +90,13 @@ struct Solver {
 }
 
 /// Run SCCP over `func`, returning whether anything changed.
-pub fn run(func: &mut Function, types: &TypeTable) -> bool {
+pub fn run(func: &mut Function) -> bool {
     if func.blocks.is_empty() {
         return false;
     }
     let mut solver = Solver::new(func);
     solver.solve(func);
-    solver.apply(func, types)
+    solver.apply(func)
 }
 
 impl Solver {
@@ -460,7 +459,7 @@ impl Solver {
     }
 
     /// Rewrite what the solution proves, returning whether anything changed.
-    fn apply(&mut self, func: &mut Function, types: &TypeTable) -> bool {
+    fn apply(&mut self, func: &mut Function) -> bool {
         let mut changed = false;
         // One pseudo per distinct constant per run, so repeated folds do not
         // inflate the pseudo table.
@@ -473,7 +472,7 @@ impl Solver {
                 continue;
             }
             for i in 0..func.blocks[b].insns.len() {
-                changed |= self.fold_value(func, types, (b, i), &mut minted);
+                changed |= self.fold_value(func, (b, i), &mut minted);
             }
         }
 
@@ -491,7 +490,6 @@ impl Solver {
     fn fold_value(
         &self,
         func: &mut Function,
-        types: &TypeTable,
         site: Site,
         minted: &mut HashMap<i128, PseudoId>,
     ) -> bool {
@@ -504,7 +502,7 @@ impl Solver {
         let Val::Const(v) = self.get(target) else {
             return false;
         };
-        propagate::fold_target_to_const(func, types, site, v, minted)
+        propagate::fold_target_to_const(func, site, v, minted)
     }
 
     /// Turn a conditional terminator whose outcome is known into a `Br`.
@@ -569,17 +567,7 @@ fn is_modelled_binop(op: Opcode) -> bool {
             | Opcode::And
             | Opcode::Or
             | Opcode::Xor
-            | Opcode::SetEq
-            | Opcode::SetNe
-            | Opcode::SetLt
-            | Opcode::SetLe
-            | Opcode::SetGt
-            | Opcode::SetGe
-            | Opcode::SetB
-            | Opcode::SetBe
-            | Opcode::SetA
-            | Opcode::SetAe
-    )
+    ) || op.is_int_comparison()
 }
 
 #[cfg(test)]
@@ -665,7 +653,7 @@ mod tests {
     #[test]
     fn sccp_folds_cbr_on_constant_true() {
         let mut func = diamond(Pseudo::val(PseudoId(1), 1), 5, 9);
-        assert!(run(&mut func, &host_types()));
+        assert!(run(&mut func));
         let t = terminator(&func, 0);
         assert_eq!(t.op, Opcode::Br);
         assert_eq!(t.bb_true, Some(BasicBlockId(1)));
@@ -680,7 +668,7 @@ mod tests {
     #[test]
     fn sccp_folds_cbr_on_constant_false() {
         let mut func = diamond(Pseudo::val(PseudoId(1), 0), 5, 9);
-        assert!(run(&mut func, &host_types()));
+        assert!(run(&mut func));
         let t = terminator(&func, 0);
         assert_eq!(t.op, Opcode::Br);
         assert_eq!(t.bb_true, Some(BasicBlockId(2)));
@@ -690,7 +678,7 @@ mod tests {
     #[test]
     fn sccp_does_not_fold_cbr_on_an_argument() {
         let mut func = diamond(Pseudo::arg(PseudoId(1), 0), 5, 9);
-        assert!(!run(&mut func, &host_types()), "nothing is knowable here");
+        assert!(!run(&mut func), "nothing is knowable here");
         assert_eq!(terminator(&func, 0).op, Opcode::Cbr);
     }
 
@@ -699,7 +687,7 @@ mod tests {
     #[test]
     fn sccp_does_not_fold_cbr_on_a_width_ambiguous_constant() {
         let mut func = diamond(Pseudo::val(PseudoId(1), 1i128 << 32), 5, 9);
-        run(&mut func, &host_types());
+        run(&mut func);
         assert_eq!(terminator(&func, 0).op, Opcode::Cbr);
     }
 
@@ -710,7 +698,7 @@ mod tests {
     #[test]
     fn sccp_phi_over_a_dead_edge_folds() {
         let mut func = diamond(Pseudo::val(PseudoId(1), 1), 5, 9);
-        assert!(run(&mut func, &host_types()));
+        assert!(run(&mut func));
         let phi = &func.blocks[3].insns[0];
         assert_eq!(phi.op, Opcode::Copy);
         assert!(phi.phi_list.is_empty(), "a folded phi keeps no incoming");
@@ -726,7 +714,7 @@ mod tests {
     #[test]
     fn sccp_phi_with_differing_constants_does_not_fold() {
         let mut func = diamond(Pseudo::arg(PseudoId(1), 0), 5, 9);
-        run(&mut func, &host_types());
+        run(&mut func);
         assert_eq!(func.blocks[3].insns[0].op, Opcode::Phi);
     }
 
@@ -735,7 +723,7 @@ mod tests {
     #[test]
     fn sccp_never_rewrites_a_phisource() {
         let mut func = diamond(Pseudo::val(PseudoId(1), 1), 5, 5);
-        run(&mut func, &host_types());
+        run(&mut func);
         assert_eq!(func.blocks[1].insns[0].op, Opcode::PhiSource);
     }
 
@@ -745,7 +733,7 @@ mod tests {
     #[test]
     fn sccp_leaves_the_dead_phisource_for_dce() {
         let mut func = diamond(Pseudo::val(PseudoId(1), 1), 5, 9);
-        run(&mut func, &host_types());
+        run(&mut func);
         crate::ir::dce::run(&mut func);
 
         // The untaken arm has no predecessor left, so `dce` deletes it.
@@ -803,7 +791,7 @@ mod tests {
             }
             func.entry = BasicBlockId(0);
 
-            assert!(run(&mut func, &host_types()), "{op:?}");
+            assert!(run(&mut func), "{op:?}");
             let t = terminator(&func, 0);
             assert_eq!(t.op, Opcode::Br, "{op:?}");
             assert_eq!(t.bb_true, Some(taken), "{op:?}");
@@ -857,7 +845,7 @@ mod tests {
             }
             func.entry = BasicBlockId(0);
 
-            run(&mut func, &host_types());
+            run(&mut func);
             assert_eq!(
                 terminator(&func, 0).op,
                 Opcode::Cbr,
@@ -866,11 +854,9 @@ mod tests {
         }
     }
 
-    /// A comparison records its *operands* in `typ`/`size`, so the `Copy`
-    /// that replaces a folded one has to be re-typed. Left as it stood, the
-    /// copy claimed the operand's type -- invisible for an integer, which
-    /// lands in a general register either way, and a miscompile for a float,
-    /// whose constant would be returned in an SSE register.
+    /// The `Copy` that replaces a folded comparison has the comparison's
+    /// result type, an `int`, and not its operands': claiming a float
+    /// operand's type would put the constant in an SSE register.
     #[test]
     fn sccp_retypes_a_folded_comparison_to_its_result() {
         let types = TypeTable::new(&Target::host());
@@ -882,19 +868,18 @@ mod tests {
 
         let mut b0 = BasicBlock::new(BasicBlockId(0));
         b0.add_insn(Instruction::new(Opcode::Entry));
-        b0.add_insn(Instruction::binop(
+        b0.add_insn(Instruction::compare(
             Opcode::SetLt,
             PseudoId(3),
-            PseudoId(1),
-            PseudoId(2),
-            types.long_id,
-            64,
+            (PseudoId(1), PseudoId(2)),
+            (types.long_id, 64),
+            (types.int_id, 32),
         ));
         b0.add_insn(Instruction::ret(Some(PseudoId(3))));
         func.add_block(b0);
         func.entry = BasicBlockId(0);
 
-        assert!(run(&mut func, &host_types()));
+        assert!(run(&mut func));
         let folded = &func.blocks[0].insns[1];
         assert_eq!(folded.op, Opcode::Copy);
         assert_eq!(func.const_val(folded.src[0]), Some(1));
@@ -928,7 +913,7 @@ mod tests {
         func.add_block(b0);
         func.entry = BasicBlockId(0);
 
-        run(&mut func, &host_types());
+        run(&mut func);
         assert_eq!(func.blocks[0].insns[1].op, Opcode::Add);
     }
 
@@ -1013,7 +998,7 @@ mod tests {
         }
         func.entry = entry;
 
-        run(&mut func, &host_types());
+        run(&mut func);
         crate::ir::dce::run(&mut func);
         assert!(
             func.get_block(label).is_some(),
@@ -1031,7 +1016,7 @@ mod tests {
             Pseudo::arg(PseudoId(1), 0),
         ] {
             let mut func = diamond(cond, 5, 9);
-            run(&mut func, &host_types());
+            run(&mut func);
             crate::ir::dce::run(&mut func);
             assert!(
                 crate::ir::validate::validate_function(&func).is_ok(),
@@ -1044,9 +1029,9 @@ mod tests {
     #[test]
     fn sccp_is_idempotent() {
         let mut func = diamond(Pseudo::val(PseudoId(1), 1), 5, 9);
-        assert!(run(&mut func, &host_types()));
+        assert!(run(&mut func));
         assert!(
-            !run(&mut func, &host_types()),
+            !run(&mut func),
             "a second run must find nothing, or the fixpoint loop burns its budget"
         );
     }
@@ -1054,7 +1039,7 @@ mod tests {
     #[test]
     fn sccp_keeps_parents_and_children_consistent() {
         let mut func = diamond(Pseudo::val(PseudoId(1), 1), 5, 9);
-        run(&mut func, &host_types());
+        run(&mut func);
         for bb in &func.blocks {
             for child in &bb.children {
                 let c = func.get_block(*child).expect("child must exist");
@@ -1095,7 +1080,7 @@ mod tests {
         func.add_block(b0);
         func.entry = BasicBlockId(0);
 
-        run(&mut func, &types);
+        run(&mut func);
         let insn = &func.blocks[0].insns[1];
         if insn.op != Opcode::Copy {
             return None;

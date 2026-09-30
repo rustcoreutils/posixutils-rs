@@ -2700,7 +2700,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         case_bbs: &[BasicBlockId],
         default_target: BasicBlockId,
     ) {
-        let size = self.types.size_bits(cmp_type);
         // `>=` and `<=` for a range, in the controlling type's own signedness
         // -- the same `conv` that converted the labels, so the comparison and
         // the constants it compares are describing one type.
@@ -2719,13 +2718,13 @@ impl<'a> super::linearize::Linearizer<'a> {
             let next = self.alloc_bb();
             let cond = if lo == hi {
                 let k = self.emit_const(lo, cmp_type);
-                self.emit_int_binop(Opcode::SetEq, switch_val, k, cmp_type, size)
+                self.emit_compare(Opcode::SetEq, switch_val, k, cmp_type)
             } else {
                 // A GNU `case lo ... hi:` range.
                 let lo_k = self.emit_const(lo, cmp_type);
                 let hi_k = self.emit_const(hi, cmp_type);
-                let at_least = self.emit_int_binop(ge, switch_val, lo_k, cmp_type, size);
-                let at_most = self.emit_int_binop(le, switch_val, hi_k, cmp_type, size);
+                let at_least = self.emit_compare(ge, switch_val, lo_k, cmp_type);
+                let at_most = self.emit_compare(le, switch_val, hi_k, cmp_type);
                 let int_typ = self.types.int_id;
                 let int_bits = self.types.size_bits(int_typ);
                 self.emit_int_binop(Opcode::And, at_least, at_most, int_typ, int_bits)

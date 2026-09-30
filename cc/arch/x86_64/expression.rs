@@ -328,10 +328,11 @@ impl X86_64CodeGen {
     }
 
     pub(super) fn emit_compare(&mut self, insn: &Instruction, types: &TypeTable) {
+        // Compared at the operands' width; the result is an `int`.
         let size = insn
-            .typ
+            .operand_type()
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .unwrap_or(insn.operand_width().max(32));
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),

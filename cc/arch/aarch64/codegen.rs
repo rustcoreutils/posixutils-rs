@@ -612,16 +612,7 @@ impl Aarch64CodeGen {
                 self.emit_div(insn, types);
             }
 
-            Opcode::SetEq
-            | Opcode::SetNe
-            | Opcode::SetLt
-            | Opcode::SetLe
-            | Opcode::SetGt
-            | Opcode::SetGe
-            | Opcode::SetB
-            | Opcode::SetBe
-            | Opcode::SetA
-            | Opcode::SetAe => {
+            op if op.is_int_comparison() => {
                 self.emit_compare(insn, types);
             }
 
@@ -752,12 +743,7 @@ impl Aarch64CodeGen {
             }
 
             // Floating-point comparisons
-            Opcode::FCmpOEq
-            | Opcode::FCmpONe
-            | Opcode::FCmpOLt
-            | Opcode::FCmpOLe
-            | Opcode::FCmpOGt
-            | Opcode::FCmpOGe => {
+            op if op.is_float_comparison() => {
                 self.emit_fp_compare(insn, types);
             }
 

@@ -355,6 +355,65 @@ pub enum Opcode {
 }
 
 impl Opcode {
+    /// An integer comparison: `seteq` .. `setae`, a 0-or-1 result.
+    pub fn is_int_comparison(self) -> bool {
+        matches!(
+            self,
+            Opcode::SetEq
+                | Opcode::SetNe
+                | Opcode::SetLt
+                | Opcode::SetLe
+                | Opcode::SetGt
+                | Opcode::SetGe
+                | Opcode::SetB
+                | Opcode::SetBe
+                | Opcode::SetA
+                | Opcode::SetAe
+        )
+    }
+
+    /// A floating comparison: `fcmp_oeq` .. `fcmp_oge`, a 0-or-1 result.
+    pub fn is_float_comparison(self) -> bool {
+        matches!(
+            self,
+            Opcode::FCmpOEq
+                | Opcode::FCmpONe
+                | Opcode::FCmpOLt
+                | Opcode::FCmpOLe
+                | Opcode::FCmpOGt
+                | Opcode::FCmpOGe
+        )
+    }
+
+    /// Any comparison, integer or floating.
+    pub fn is_comparison(self) -> bool {
+        self.is_int_comparison() || self.is_float_comparison()
+    }
+
+    /// Does this opcode read operands of a type other than its result's --
+    /// recorded in `src_typ`/`src_size` while `typ`/`size` describe the
+    /// result, as for every opcode?
+    ///
+    /// The conversions, the comparisons (which read any type and produce an
+    /// `int` or a `_Bool`), and the population counts (which count a 32- or
+    /// 64-bit operand into an `int`).
+    pub fn reads_another_type(self) -> bool {
+        self.is_comparison()
+            || matches!(
+                self,
+                Opcode::Sext
+                    | Opcode::Zext
+                    | Opcode::Trunc
+                    | Opcode::FCvtS
+                    | Opcode::FCvtU
+                    | Opcode::SCvtF
+                    | Opcode::UCvtF
+                    | Opcode::FCvtF
+                    | Opcode::Popcount32
+                    | Opcode::Popcount64
+            )
+    }
+
     /// Check if this opcode is a terminator (ends a basic block)
     pub fn is_terminator(&self) -> bool {
         matches!(
@@ -962,9 +1021,11 @@ pub struct Instruction {
     pub phi_list: Vec<(BasicBlockId, PseudoId)>,
     /// For calls: function name or pseudo
     pub func_name: Option<String>,
-    /// Bit size of the operation (target size for conversions)
+    /// Bit size of the result -- for every opcode.
     pub size: u32,
-    /// Source size for extension/truncation operations
+    /// Bit size of the operands, for an opcode whose operands are of another
+    /// type than its result ([`Opcode::reads_another_type`]); 0 otherwise.
+    /// Read it through [`Instruction::operand_width`].
     pub src_size: u32,
     /// Source type for conversion operations (interned TypeId)
     pub src_typ: Option<TypeId>,
@@ -1402,10 +1463,82 @@ impl Instruction {
         typ: TypeId,
         size: u32,
     ) -> Self {
+        // Not an assertion only debug builds make: every gate runs release.
+        assert!(
+            !op.is_comparison(),
+            "{op:?} is a comparison: build it with Instruction::compare"
+        );
         Self::new(op)
             .with_target(target)
             .with_src2(src1, src2)
             .with_type_and_size(typ, size)
+    }
+
+    /// A comparison `op` of `lhs` and `rhs`, which are of type `operand.0` at
+    /// `operand.1` bits, producing a 0-or-1 of type `result.0` at `result.1`
+    /// bits -- an `int` for C's operators, a `_Bool` for a conversion to one.
+    ///
+    /// The one constructor for a comparison, so that each records its
+    /// operands where every other opcode that reads another type does
+    /// (`src_typ`/`src_size`) and its result where every opcode does
+    /// (`typ`/`size`). They used to put the *operand* type in `typ`, the only
+    /// opcodes to do so, and two folds that copied a comparison's `typ` onto
+    /// the constant replacing it were miscompiles.
+    pub fn compare(
+        op: Opcode,
+        target: PseudoId,
+        (lhs, rhs): (PseudoId, PseudoId),
+        operand: (TypeId, u32),
+        result: (TypeId, u32),
+    ) -> Self {
+        assert!(op.is_comparison(), "{op:?} is not a comparison");
+        let mut insn = Self::new(op)
+            .with_target(target)
+            .with_src2(lhs, rhs)
+            .with_type_and_size(result.0, result.1);
+        insn.src_typ = Some(operand.0);
+        insn.src_size = operand.1;
+        insn
+    }
+
+    /// `op` of `a` and `b` into `target`, as a comparison producing an `int`
+    /// when `op` is one and as an ordinary binary operation of `typ` at
+    /// `size` bits otherwise. For tests whose helpers take the opcode as a
+    /// parameter.
+    #[cfg(test)]
+    pub fn test_binary(
+        op: Opcode,
+        target: PseudoId,
+        (a, b): (PseudoId, PseudoId),
+        typ: TypeId,
+        size: u32,
+    ) -> Self {
+        if op.is_comparison() {
+            let int = crate::types::TypeTable::new(&crate::target::Target::host()).int_id;
+            Self::compare(op, target, (a, b), (typ, size), (int, 32))
+        } else {
+            Self::binop(op, target, a, b, typ, size)
+        }
+    }
+
+    /// The type of this instruction's operands: `src_typ` for an opcode that
+    /// reads another type than it produces ([`Opcode::reads_another_type`]),
+    /// `typ` for every other.
+    pub fn operand_type(&self) -> Option<TypeId> {
+        if self.op.reads_another_type() {
+            self.src_typ
+        } else {
+            self.typ
+        }
+    }
+
+    /// The width of this instruction's operands; see [`Self::operand_type`].
+    pub fn operand_width(&self) -> u32 {
+        if self.op.reads_another_type() {
+            self.src_size
+        } else {
+            self.size
+        }
     }
 
     /// Create a unary operation
@@ -1724,20 +1857,7 @@ impl fmt::Display for InstructionDisplay<'_> {
         write!(f, "{}", self.insn.op.name())?;
 
         // Size suffix (for conversions, show src_size→size)
-        if this.src_size > 0
-            && this.src_size != this.size
-            && matches!(
-                this.op,
-                Opcode::Sext
-                    | Opcode::Zext
-                    | Opcode::Trunc
-                    | Opcode::FCvtS
-                    | Opcode::FCvtU
-                    | Opcode::SCvtF
-                    | Opcode::UCvtF
-                    | Opcode::FCvtF
-            )
-        {
+        if this.src_size > 0 && this.src_size != this.size && this.op.reads_another_type() {
             write!(f, ".{}to{}", this.src_size, this.size)?;
         } else if this.size > 0 {
             write!(f, ".{}", this.size)?;

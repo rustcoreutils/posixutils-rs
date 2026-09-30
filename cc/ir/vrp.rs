@@ -39,14 +39,12 @@
 //
 
 use super::constfold::{
-    cmp_mask, cmp_operand_width, eval_binop, eval_unop, get_cmp_info, is_comparison,
-    result_type_of, CMP_ALL, CMP_EQ, CMP_GT, CMP_LT,
+    cmp_mask, eval_binop, eval_unop, get_cmp_info, CMP_ALL, CMP_EQ, CMP_GT, CMP_LT,
 };
 use super::facts::{CmpDomain, CmpFacts, ConstMap};
 use super::propagate::{self, cbr_taken, switch_taken, Site};
 use super::range::{allowed_by_predicate, possible_orderings, Range};
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
-use crate::types::TypeTable;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// How many times one cell may move before it is pinned at the bottom of its
@@ -82,20 +80,19 @@ impl RVal {
 }
 
 /// Run value-range propagation over `func`, returning whether it changed.
-pub fn run(func: &mut Function, types: &TypeTable) -> bool {
+pub fn run(func: &mut Function) -> bool {
     if func.blocks.is_empty() {
         return false;
     }
-    let mut solver = Solver::new(func, types);
+    let mut solver = Solver::new(func);
     if !solver.solve(func) {
         // Budget exhausted. The partial solution is too precise to act on.
         return false;
     }
-    solver.apply(func, types)
+    solver.apply(func)
 }
 
-struct Solver<'a> {
-    types: &'a TypeTable,
+struct Solver {
     consts: ConstMap,
     cmps: CmpFacts,
     /// Width of the value each pseudo's definition produces; 0 = unknown.
@@ -121,13 +118,12 @@ struct Solver<'a> {
     steps: usize,
 }
 
-impl<'a> Solver<'a> {
-    fn new(func: &Function, types: &'a TypeTable) -> Self {
+impl Solver {
+    fn new(func: &Function) -> Self {
         let consts = ConstMap::new(func);
         let cmps = CmpFacts::new(func, &consts);
         let n = func.next_pseudo as usize + 1;
         let mut s = Solver {
-            types,
             consts,
             cmps,
             widths: vec![0; n],
@@ -156,13 +152,10 @@ impl<'a> Solver<'a> {
                 for u in insn.uses() {
                     self.uses.entry(u).or_default().push((b, i));
                 }
-                // The width a definition produces comes from
-                // `result_type_of`, never from `insn.size`: on a comparison
-                // that field describes the *operands*.
                 if let Some(t) = insn.target {
                     let idx = t.0 as usize;
                     if idx < self.widths.len() {
-                        self.widths[idx] = result_type_of(insn, self.types).1;
+                        self.widths[idx] = insn.size;
                     }
                 }
             }
@@ -623,9 +616,7 @@ impl<'a> Solver<'a> {
             Opcode::Neg | Opcode::Not => self.unary(insn, block, target_width),
             Opcode::Zext | Opcode::Sext | Opcode::Trunc => self.convert(insn, block),
 
-            _ if is_comparison(insn.op) && !insn.op.to_string().starts_with("fcmp") => {
-                self.compare(insn, block, target_width)
-            }
+            _ if insn.op.is_int_comparison() => self.compare(insn, block, target_width),
 
             _ if is_modelled_binop(insn.op) => self.binop(insn, block, target_width),
 
@@ -645,12 +636,10 @@ impl<'a> Solver<'a> {
         let vals: Option<Vec<i128>> = insn
             .src
             .iter()
-            .map(
-                |s| match self.operand(block, *s, self.operand_width(insn)) {
-                    RVal::Known(r) => r.single_value().map(|v| v as i128),
-                    _ => None,
-                },
-            )
+            .map(|s| match self.operand(block, *s, insn.operand_width()) {
+                RVal::Known(r) => r.single_value().map(|v| v as i128),
+                _ => None,
+            })
             .collect();
         let vals = vals?;
         let v = match vals.len() {
@@ -659,17 +648,6 @@ impl<'a> Solver<'a> {
             _ => return None,
         };
         Some(RVal::Known(Range::from_const(w, v)))
-    }
-
-    /// The width an instruction reads its operands at.
-    fn operand_width(&self, insn: &Instruction) -> u32 {
-        if is_comparison(insn.op) {
-            cmp_operand_width(insn)
-        } else if matches!(insn.op, Opcode::Zext | Opcode::Sext) {
-            insn.src_size
-        } else {
-            insn.size
-        }
     }
 
     fn unary(&self, insn: &Instruction, block: BasicBlockId, width: u32) -> RVal {
@@ -762,7 +740,7 @@ impl<'a> Solver<'a> {
         if insn.src.len() != 2 {
             return RVal::Bottom;
         }
-        let (Some(rw), Some(ow)) = (Range::at(result_width), Range::at(cmp_operand_width(insn)))
+        let (Some(rw), Some(ow)) = (Range::at(result_width), Range::at(insn.operand_width()))
         else {
             return RVal::Bottom;
         };
@@ -795,7 +773,7 @@ impl<'a> Solver<'a> {
         RVal::Known(Range::inclusive(rw, 0, 1))
     }
 
-    fn apply(&mut self, func: &mut Function, types: &TypeTable) -> bool {
+    fn apply(&mut self, func: &mut Function) -> bool {
         let mut changed = false;
         let mut minted: HashMap<i128, PseudoId> = HashMap::new();
 
@@ -827,7 +805,7 @@ impl<'a> Solver<'a> {
                 // whichever is minted. Where an unambiguous form exists the
                 // two readings are the same number.
                 let v = super::constfold::at_width(v as i128, w, true);
-                changed |= propagate::fold_target_to_const(func, types, (b, i), v, &mut minted);
+                changed |= propagate::fold_target_to_const(func, (b, i), v, &mut minted);
             }
         }
 
@@ -916,6 +894,7 @@ mod tests {
     use super::*;
     use crate::ir::{BasicBlock, Pseudo};
     use crate::target::Target;
+    use crate::types::TypeTable;
 
     fn host_types() -> TypeTable {
         TypeTable::new(&Target::host())
@@ -951,21 +930,19 @@ mod tests {
 
         let mut l0 = BasicBlock::new(BasicBlockId(0));
         l0.add_insn(Instruction::new(Opcode::Entry));
-        l0.add_insn(Instruction::binop(
+        l0.add_insn(Instruction::compare(
             Opcode::SetLe,
             PseudoId(4),
-            PseudoId(0),
-            PseudoId(3),
-            i32t,
-            32,
+            (PseudoId(0), PseudoId(3)),
+            (i32t, 32),
+            (types.int_id, 32),
         ));
-        l0.add_insn(Instruction::binop(
+        l0.add_insn(Instruction::compare(
             Opcode::SetNe,
             PseudoId(5),
-            PseudoId(4),
-            PseudoId(6),
-            i32t,
-            32,
+            (PseudoId(4), PseudoId(6)),
+            (i32t, 32),
+            (types.int_id, 32),
         ));
         let mut ps0 = Instruction::new(Opcode::PhiSource)
             .with_target(PseudoId(22))
@@ -994,13 +971,12 @@ mod tests {
             .with_type_and_size(i64t, 64);
         zext.src_size = 32;
         l1.add_insn(zext);
-        l1.add_insn(Instruction::binop(
+        l1.add_insn(Instruction::compare(
             Opcode::SetB,
             PseudoId(18),
-            PseudoId(11),
-            PseudoId(17),
-            i64t,
-            64,
+            (PseudoId(11), PseudoId(17)),
+            (i64t, 64),
+            (types.int_id, 32),
         ));
         let mut ps1 = Instruction::new(Opcode::PhiSource)
             .with_target(PseudoId(23))
@@ -1082,9 +1058,8 @@ mod tests {
     /// the guard and delete the `link_failure` arm.
     #[test]
     fn vrp_folds_a_guard_proved_by_an_edge_range() {
-        let types = host_types();
         let mut func = range_guard(false);
-        assert!(run(&mut func, &types), "should change something");
+        assert!(run(&mut func), "should change something");
         assert!(
             folds_the_guard(&func),
             "guard should be unconditional:\n{func:?}"
@@ -1095,9 +1070,8 @@ mod tests {
     /// there is no critical-edge splitting to make it hold for the block.
     #[test]
     fn vrp_does_not_refine_a_block_with_two_predecessors() {
-        let types = host_types();
         let mut func = range_guard(true);
-        run(&mut func, &types);
+        run(&mut func);
         assert!(
             !folds_the_guard(&func),
             "a fact from one edge must not govern a block reached another way"
@@ -1108,10 +1082,9 @@ mod tests {
     /// predecessor does not mean one way in.
     #[test]
     fn vrp_does_not_refine_an_address_taken_block() {
-        let types = host_types();
         let mut func = range_guard(false);
         func.get_block_mut(BasicBlockId(1)).unwrap().addr_taken = true;
-        run(&mut func, &types);
+        run(&mut func);
         assert!(
             !folds_the_guard(&func),
             "an addr_taken block has a hidden entry"
@@ -1131,7 +1104,7 @@ mod tests {
             .with_target(PseudoId(10))
             .with_src(PseudoId(0))
             .with_type_and_size(types.int_id, 32);
-        run(&mut func, &types);
+        run(&mut func);
         assert!(
             !folds_the_guard(&func),
             "a value from an unmodelled opcode proves nothing"
@@ -1142,19 +1115,17 @@ mod tests {
     /// ten-iteration budget in `opt::optimize_function`.
     #[test]
     fn vrp_is_idempotent() {
-        let types = host_types();
         let mut func = range_guard(false);
-        assert!(run(&mut func, &types));
-        assert!(!run(&mut func, &types), "a second run must find nothing");
+        assert!(run(&mut func));
+        assert!(!run(&mut func), "a second run must find nothing");
     }
 
     /// Folding a terminator must repair the CFG, or `dce` later deletes a
     /// block a live branch still names.
     #[test]
     fn vrp_repairs_the_cfg_when_it_folds_a_terminator() {
-        let types = host_types();
         let mut func = range_guard(false);
-        run(&mut func, &types);
+        run(&mut func);
         let l2 = func.get_block(BasicBlockId(2)).unwrap();
         assert_eq!(l2.children, vec![BasicBlockId(5)], "dropped edge removed");
         assert_eq!(l2.insns.last().unwrap().bb_false, None, "no stale target");
@@ -1230,7 +1201,7 @@ mod tests {
         f.entry = BasicBlockId(0);
 
         // The point is that this returns at all.
-        run(&mut f, &types);
+        run(&mut f);
         let term = f.get_block(BasicBlockId(1)).unwrap().insns.last().unwrap();
         assert_eq!(term.op, Opcode::Cbr, "a data-dependent exit stays a branch");
     }
@@ -1265,7 +1236,7 @@ mod tests {
     /// happens to reach things in, so this shape is the behavioural guard
     /// and [`vrp_a_branch_reads_what_its_fact_is_derived_from`] pins the
     /// mechanism directly.
-    fn counting_loop() -> (Function, TypeTable) {
+    fn counting_loop() -> Function {
         let types = host_types();
         let i64t = types.long_id;
         let mut f = Function::new("f", i64t);
@@ -1329,13 +1300,12 @@ mod tests {
                 .with_src(PseudoId(0))
                 .with_type_and_size(i64t, 64),
         );
-        l2.add_insn(Instruction::binop(
+        l2.add_insn(Instruction::compare(
             Opcode::SetEq,
             PseudoId(14),
-            PseudoId(15),
-            PseudoId(16),
-            i64t,
-            64,
+            (PseudoId(15), PseudoId(16)),
+            (i64t, 64),
+            (types.int_id, 32),
         ));
         l2.add_insn(
             Instruction::new(Opcode::Copy)
@@ -1384,13 +1354,13 @@ mod tests {
         f.entry = BasicBlockId(0);
         f.blocks = vec![l0, l1, l2, l3, l4, l5];
         f.rebuild_parents();
-        (f, types)
+        f
     }
 
     #[test]
     fn vrp_re_derives_an_edge_fact_when_its_operands_widen() {
-        let (mut f, types) = counting_loop();
-        run(&mut f, &types);
+        let mut f = counting_loop();
+        run(&mut f);
 
         // `.L3` returns the bound. Nothing in this function says what the
         // bound is, so the copy must still read the argument.
@@ -1418,8 +1388,8 @@ mod tests {
     /// stands.
     #[test]
     fn vrp_a_branch_reads_what_its_fact_is_derived_from() {
-        let (f, types) = counting_loop();
-        let mut solver = Solver::new(&f, &types);
+        let f = counting_loop();
+        let mut solver = Solver::new(&f);
         solver.solve(&f);
 
         // The inner `cbr` is the last instruction of `.L2`.
@@ -1455,7 +1425,7 @@ mod tests {
             types.int_id,
             32,
         );
-        run(&mut func, &types);
+        run(&mut func);
         assert!(
             !folds_the_guard(&func),
             "a divisor that may be zero proves nothing about the quotient"
@@ -1479,7 +1449,7 @@ mod tests {
             types.int_id,
             32,
         );
-        assert!(run(&mut func, &types));
+        assert!(run(&mut func));
         assert!(folds_the_guard(&func));
     }
 }

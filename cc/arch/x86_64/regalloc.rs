@@ -1258,6 +1258,14 @@ impl RegAlloc {
                     for &src in &insn.src {
                         self.ld_pseudos.insert(src);
                     }
+                } else if insn.op.is_float_comparison()
+                    && insn
+                        .operand_type()
+                        .is_some_and(|t| types.kind(t) == crate::types::TypeKind::LongDouble)
+                {
+                    // Comparing two `long double`s: the operands are x87
+                    // values, the result an `int`.
+                    self.ld_pseudos.extend(insn.src.iter().copied());
                 }
             }
         }
@@ -1308,6 +1316,12 @@ impl RegAlloc {
                     for &src in &insn.src {
                         self.quad_pseudos.insert(src);
                     }
+                } else if insn.op.is_float_comparison()
+                    && insn
+                        .operand_type()
+                        .is_some_and(|t| types.kind(t) == crate::types::TypeKind::Float128)
+                {
+                    self.quad_pseudos.extend(insn.src.iter().copied());
                 }
             }
         }
@@ -1324,21 +1338,6 @@ impl RegAlloc {
                 let is_int128 = insn.typ.is_some_and(|t| types.is_plain_int128(t));
 
                 if is_int128 {
-                    // Comparison results are always small integers, not 128-bit.
-                    let is_comparison = matches!(
-                        insn.op,
-                        Opcode::SetEq
-                            | Opcode::SetNe
-                            | Opcode::SetLt
-                            | Opcode::SetLe
-                            | Opcode::SetGt
-                            | Opcode::SetGe
-                            | Opcode::SetB
-                            | Opcode::SetBe
-                            | Opcode::SetA
-                            | Opcode::SetAe
-                    );
-
                     // Lo64/Hi64: target is 64-bit (not int128), source is int128
                     // Pair64: target is int128, sources are 64-bit (not int128)
                     // AddC/AdcC/SubC/SbcC/UMulHi: 64-bit ops, not int128
@@ -1358,8 +1357,9 @@ impl RegAlloc {
                         _ => {
                             // For Load: target is int128, but src[0] is the address (64-bit pointer).
                             // For Store: src[0] is address (64-bit), src[1] is the int128 value.
-                            // For comparisons: target is a small integer result.
-                            if !is_comparison && !matches!(insn.op, Opcode::Load) {
+                            // A comparison is never here: its result is an `int`,
+                            // and `mapping` has split its 128-bit operands.
+                            if !matches!(insn.op, Opcode::Load) {
                                 if let Some(target) = insn.target {
                                     self.int128_pseudos.insert(target);
                                 }

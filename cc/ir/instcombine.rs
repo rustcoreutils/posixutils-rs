@@ -25,9 +25,9 @@
 //
 
 use super::constfold::{
-    at_width, cmp_operand_width, divmod_may_trap, eval_binop, eval_fbinop, eval_fcvt, eval_fcvtf,
-    eval_fternop, eval_funop, eval_unop, fcmp_decided, fcmp_mask, fcmp_outcome, get_cmp_info,
-    mirror_mask, possible_against, result_type_of, FCMP_ALL,
+    at_width, divmod_may_trap, eval_binop, eval_fbinop, eval_fcvt, eval_fcvtf, eval_fternop,
+    eval_funop, eval_unop, fcmp_decided, fcmp_mask, fcmp_outcome, get_cmp_info, mirror_mask,
+    possible_against, FCMP_ALL,
 };
 use super::facts::{CmpDomain, CmpFacts, ConstMap, Relation};
 use super::{ConstValue, Function, Instruction, Opcode, PseudoId};
@@ -142,8 +142,7 @@ pub fn run(func: &mut Function, types: &TypeTable) -> bool {
         // Extract necessary data from the instruction before any mutation
         let (target, typ, size) = {
             let insn = &func.blocks[bb_idx].insns[insn_idx];
-            let (typ, size) = result_type_of(insn, types);
-            (insn.target, typ, size)
+            (insn.target, insn.typ, insn.size)
         };
 
         let new_insn = match simplification {
@@ -201,16 +200,7 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
         }
 
         // Comparisons (all handled by unified simplify_comparison)
-        Opcode::SetEq
-        | Opcode::SetNe
-        | Opcode::SetLt
-        | Opcode::SetLe
-        | Opcode::SetGt
-        | Opcode::SetGe
-        | Opcode::SetB
-        | Opcode::SetBe
-        | Opcode::SetA
-        | Opcode::SetAe => or_decided(
+        op if op.is_int_comparison() => or_decided(
             simplify_comparison(insn, consts, facts),
             insn,
             consts,
@@ -233,12 +223,7 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
             simplify_funop(insn, consts, facts)
         }
         Opcode::FCvtF => simplify_fcvtf(insn, consts, facts),
-        Opcode::FCmpOEq
-        | Opcode::FCmpONe
-        | Opcode::FCmpOLt
-        | Opcode::FCmpOLe
-        | Opcode::FCmpOGt
-        | Opcode::FCmpOGe => simplify_fcmp(insn, consts, facts),
+        op if op.is_float_comparison() => simplify_fcmp(insn, consts, facts),
         Opcode::FCvtS | Opcode::FCvtU | Opcode::Signbit => simplify_fcvt(insn, consts, facts),
 
         // Unary
@@ -591,7 +576,7 @@ fn simplify_comparison(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> 
 
     let src1 = insn.src[0];
     let src2 = insn.src[1];
-    let width = cmp_operand_width(insn);
+    let width = insn.operand_width();
 
     // `(a < b) != 0` is `a < b`. A comparison already yields 0 or 1, so the
     // boolification the front end wraps around every `&&`/`||` operand is a
@@ -743,7 +728,7 @@ fn simplify_fcmp(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simpli
 /// are the same value, and whether one is never below zero.
 fn possible_fcmp_outcomes(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> u8 {
     let (lhs, rhs) = (insn.src[0], insn.src[1]);
-    let width = insn.size.max(1);
+    let width = insn.operand_width().max(1);
     if consts.root(lhs, width) == consts.root(rhs, width) {
         return CmpDomain::Float.reflexive();
     }
@@ -753,7 +738,7 @@ fn possible_fcmp_outcomes(insn: &Instruction, consts: &ConstMap, facts: &Facts) 
     // `0.1 + 0.2 == 0.3` true, which in `double` it is not -- and makes
     // `1e39f` finite, which in `float` it is not. Not knowing the format
     // means not knowing the value.
-    let fmt = facts.fp_format(insn.typ);
+    let fmt = facts.fp_format(insn.operand_type());
     let known = |id| Some(consts.fget(id, width)?.round_to_format(fmt?));
     let never_below = |id: PseudoId| facts.never_lt_zero.contains(&consts.root(id, width));
     match (known(lhs), known(rhs)) {
@@ -1402,13 +1387,12 @@ mod tests {
     fn test_const_fold_seteq_true() {
         // 5 == 5 -> 1
         let types = TypeTable::new(&Target::host());
-        let insn = Instruction::binop(
+        let insn = Instruction::compare(
             Opcode::SetEq,
             PseudoId(2),
-            PseudoId(0),
-            PseudoId(1),
-            types.int_id,
-            32,
+            (PseudoId(0), PseudoId(1)),
+            (types.int_id, 32),
+            (int_type(), 32),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 5),
@@ -1431,13 +1415,12 @@ mod tests {
     fn test_const_fold_seteq_false() {
         // 5 == 3 -> 0
         let types = TypeTable::new(&Target::host());
-        let insn = Instruction::binop(
+        let insn = Instruction::compare(
             Opcode::SetEq,
             PseudoId(2),
-            PseudoId(0),
-            PseudoId(1),
-            types.int_id,
-            32,
+            (PseudoId(0), PseudoId(1)),
+            (types.int_id, 32),
+            (int_type(), 32),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 5),
@@ -1460,13 +1443,12 @@ mod tests {
     fn test_const_fold_setlt() {
         // 3 < 5 -> 1
         let types = TypeTable::new(&Target::host());
-        let insn = Instruction::binop(
+        let insn = Instruction::compare(
             Opcode::SetLt,
             PseudoId(2),
-            PseudoId(0),
-            PseudoId(1),
-            types.int_id,
-            32,
+            (PseudoId(0), PseudoId(1)),
+            (types.int_id, 32),
+            (int_type(), 32),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 3),
@@ -1489,13 +1471,12 @@ mod tests {
     fn test_identity_eq_self() {
         // x == x -> 1
         let types = TypeTable::new(&Target::host());
-        let insn = Instruction::binop(
+        let insn = Instruction::compare(
             Opcode::SetEq,
             PseudoId(1),
-            PseudoId(0),
-            PseudoId(0),
-            types.int_id,
-            32,
+            (PseudoId(0), PseudoId(0)),
+            (types.int_id, 32),
+            (int_type(), 32),
         );
         let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
@@ -1514,13 +1495,12 @@ mod tests {
     fn test_identity_lt_self() {
         // x < x -> 0
         let types = TypeTable::new(&Target::host());
-        let insn = Instruction::binop(
+        let insn = Instruction::compare(
             Opcode::SetLt,
             PseudoId(1),
-            PseudoId(0),
-            PseudoId(0),
-            types.int_id,
-            32,
+            (PseudoId(0), PseudoId(0)),
+            (types.int_id, 32),
+            (int_type(), 32),
         );
         let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
@@ -1587,11 +1567,9 @@ mod tests {
             (Opcode::Popcount32, 0, 0),
         ] {
             let size = if op == Opcode::Popcount64 { 64 } else { 32 };
-            let insn = Instruction::new(op)
-                .with_target(PseudoId(1))
-                .with_src(PseudoId(0))
-                .with_size(size)
-                .with_type(types.int_id);
+            let mut insn = Instruction::unop(op, PseudoId(1), PseudoId(0), types.int_id, 32);
+            insn.src_typ = Some(types.ulonglong_id);
+            insn.src_size = size;
             let pseudos = vec![
                 Pseudo::val(PseudoId(0), operand),
                 Pseudo::reg(PseudoId(1), 1),
@@ -2056,13 +2034,12 @@ mod tests {
     #[test]
     fn test_signed_comparison_reads_operands_at_their_width() {
         let int_id = int_type();
-        let insns = vec![Instruction::binop(
+        let insns = vec![Instruction::compare(
             Opcode::SetLt,
             PseudoId(2),
-            PseudoId(0),
-            PseudoId(1),
-            int_id,
-            32,
+            (PseudoId(0), PseudoId(1)),
+            (int_id, 32),
+            (int_type(), 32),
         )];
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 0xFFFF_FFFF),
@@ -2075,25 +2052,21 @@ mod tests {
         assert_eq!(func.const_val(c.src[0]), Some(1), "-1 < 0 is true");
     }
 
-    /// `insn.size` on a Set* is the width of its own result. The `_Bool`
-    /// conversion is the site that proves it: `setne.8` over two 32-bit
-    /// operands, with the operand width recorded in `src_size`. Reading
-    /// `size` there would compare only the low 8 bits, making `(_Bool)256`
-    /// false.
+    /// A comparison folds at its operands' width, not its result's. The
+    /// `_Bool` conversion is the shape that tells them apart: `setne.8` over
+    /// two 32-bit operands. Reading the result width would compare only the
+    /// low 8 bits, making `(_Bool)256` false.
     #[test]
-    fn test_comparison_prefers_src_size_when_set() {
+    fn test_comparison_folds_at_its_operand_width() {
         let int_id = int_type();
         let bool_id = TypeTable::new(&Target::host()).bool_id;
-        let mut insn = Instruction::binop(
+        let insn = Instruction::compare(
             Opcode::SetNe,
             PseudoId(2),
-            PseudoId(0),
-            PseudoId(1),
-            bool_id,
-            8,
+            (PseudoId(0), PseudoId(1)),
+            (int_id, 32),
+            (bool_id, 8),
         );
-        insn.src_size = 32;
-        insn.src_typ = Some(int_id);
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 256),
             Pseudo::val(PseudoId(1), 0),
@@ -2119,13 +2092,12 @@ mod tests {
                 // %1 = copy %0 ; %2 = copy %0 ; %3 = setne %1, %2
                 Instruction::unop(Opcode::Copy, PseudoId(1), PseudoId(0), types.int_id, 32),
                 Instruction::unop(Opcode::Copy, PseudoId(2), PseudoId(0), types.int_id, 32),
-                Instruction::binop(
+                Instruction::compare(
                     Opcode::SetNe,
                     PseudoId(3),
-                    PseudoId(1),
-                    PseudoId(2),
-                    types.int_id,
-                    32,
+                    (PseudoId(1), PseudoId(2)),
+                    (types.int_id, 32),
+                    (int_type(), 32),
                 ),
             ],
             vec![
@@ -2290,22 +2262,20 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let mut func = make_test_func_with_insns(
             vec![
-                Instruction::binop(
+                Instruction::compare(
                     Opcode::SetLt,
                     PseudoId(2),
-                    PseudoId(0),
-                    PseudoId(1),
-                    types.int_id,
-                    32,
+                    (PseudoId(0), PseudoId(1)),
+                    (types.int_id, 32),
+                    (int_type(), 32),
                 ),
                 // operands swapped
-                Instruction::binop(
+                Instruction::compare(
                     Opcode::SetLt,
                     PseudoId(3),
-                    PseudoId(1),
-                    PseudoId(0),
-                    types.int_id,
-                    32,
+                    (PseudoId(1), PseudoId(0)),
+                    (types.int_id, 32),
+                    (int_type(), 32),
                 ),
                 Instruction::select(
                     PseudoId(5),
@@ -2361,8 +2331,20 @@ mod tests {
         };
         let mut func = make_test_func_with_insns(
             vec![
-                Instruction::binop(cond_op, PseudoId(2), PseudoId(0), PseudoId(1), typ, size),
-                Instruction::binop(arm_op, PseudoId(3), PseudoId(0), PseudoId(1), typ, size),
+                Instruction::test_binary(
+                    cond_op,
+                    PseudoId(2),
+                    (PseudoId(0), PseudoId(1)),
+                    typ,
+                    size,
+                ),
+                Instruction::test_binary(
+                    arm_op,
+                    PseudoId(3),
+                    (PseudoId(0), PseudoId(1)),
+                    typ,
+                    size,
+                ),
                 Instruction::select(PseudoId(5), PseudoId(2), t, f, types.int_id, 32),
             ],
             vec![
@@ -2398,11 +2380,10 @@ mod tests {
     fn fold_fcmp(op: Opcode, a: f64, b: f64) -> Option<i128> {
         let types = TypeTable::new(&Target::host());
         let mut func = make_test_func_with_insns(
-            vec![Instruction::binop(
+            vec![Instruction::test_binary(
                 op,
                 PseudoId(2),
-                PseudoId(0),
-                PseudoId(1),
+                (PseudoId(0), PseudoId(1)),
                 types.double_id,
                 64,
             )],
@@ -2461,13 +2442,12 @@ mod tests {
     fn a_folded_float_comparison_is_typed_int_not_double() {
         let types = TypeTable::new(&Target::host());
         let mut func = make_test_func_with_insns(
-            vec![Instruction::binop(
+            vec![Instruction::compare(
                 Opcode::FCmpOLt,
                 PseudoId(2),
-                PseudoId(0),
-                PseudoId(1),
-                types.double_id,
-                64,
+                (PseudoId(0), PseudoId(1)),
+                (types.double_id, 64),
+                (int_type(), 32),
             )],
             vec![fval(0, 1.0), fval(1, 2.0), Pseudo::reg(PseudoId(2), 2)],
         );
@@ -2502,7 +2482,7 @@ mod tests {
                         .with_target(PseudoId(1))
                         .with_src(PseudoId(0))
                         .with_type_and_size(types.double_id, 64),
-                    Instruction::binop(op, PseudoId(3), l, r, types.double_id, 64),
+                    Instruction::test_binary(op, PseudoId(3), (l, r), types.double_id, 64),
                 ],
                 vec![
                     Pseudo::arg(PseudoId(0), 0),
@@ -2530,11 +2510,10 @@ mod tests {
                         .with_target(PseudoId(1))
                         .with_src(PseudoId(0))
                         .with_type_and_size(types.double_id, 64),
-                    Instruction::binop(
+                    Instruction::test_binary(
                         op,
                         PseudoId(3),
-                        PseudoId(1),
-                        PseudoId(2),
+                        (PseudoId(1), PseudoId(2)),
                         types.double_id,
                         64,
                     ),
@@ -2567,7 +2546,7 @@ mod tests {
             (PseudoId(0), PseudoId(1))
         };
         let mut func = make_test_func_with_insns(
-            vec![Instruction::binop(op, PseudoId(2), l, r, typ, size)],
+            vec![Instruction::test_binary(op, PseudoId(2), (l, r), typ, size)],
             vec![
                 Pseudo::arg(PseudoId(0), 0),
                 fval(1, c),
@@ -2669,11 +2648,10 @@ mod tests {
                         .with_target(PseudoId(1))
                         .with_src(PseudoId(0))
                         .with_type_and_size(types.double_id, 64),
-                    Instruction::binop(
+                    Instruction::test_binary(
                         op,
                         PseudoId(2),
-                        PseudoId(0),
-                        PseudoId(1),
+                        (PseudoId(0), PseudoId(1)),
                         types.double_id,
                         64,
                     ),
@@ -2748,21 +2726,19 @@ mod tests {
     fn isunordered(first: u32, second: u32, types: &TypeTable) -> Vec<Instruction> {
         let dbl = types.double_id;
         vec![
-            Instruction::binop(
+            Instruction::compare(
                 Opcode::FCmpONe,
                 PseudoId(2),
-                PseudoId(first),
-                PseudoId(first),
-                dbl,
-                64,
+                (PseudoId(first), PseudoId(first)),
+                (dbl, 64),
+                (int_type(), 32),
             ),
-            Instruction::binop(
+            Instruction::compare(
                 Opcode::FCmpONe,
                 PseudoId(3),
-                PseudoId(second),
-                PseudoId(second),
-                dbl,
-                64,
+                (PseudoId(second), PseudoId(second)),
+                (dbl, 64),
+                (int_type(), 32),
             ),
             Instruction::binop(
                 Opcode::Or,
@@ -2798,11 +2774,10 @@ mod tests {
 
     fn fcmp(op: Opcode, target: u32, l: u32, r: u32) -> Instruction {
         let types = TypeTable::new(&Target::host());
-        Instruction::binop(
+        Instruction::test_binary(
             op,
             PseudoId(target),
-            PseudoId(l),
-            PseudoId(r),
+            (PseudoId(l), PseudoId(r)),
             types.double_id,
             64,
         )
@@ -2873,13 +2848,12 @@ mod tests {
                 host_types().int_id,
                 32,
             ),
-            Instruction::binop(
+            Instruction::compare(
                 Opcode::SetEq,
                 PseudoId(8),
-                PseudoId(7),
-                PseudoId(10),
-                host_types().int_id,
-                32,
+                (PseudoId(7), PseudoId(10)),
+                (host_types().int_id, 32),
+                (host_types().int_id, 32),
             ),
             select(9, 4, 11, 8),
         ];
@@ -3045,7 +3019,7 @@ mod tests {
             .collect();
         pseudos.push(Pseudo::reg(target, target.0));
         let insn = match args.len() {
-            2 => Instruction::binop(op, target, PseudoId(0), PseudoId(1), typ, size),
+            2 => Instruction::test_binary(op, target, (PseudoId(0), PseudoId(1)), typ, size),
             n => {
                 let mut insn = Instruction::new(op)
                     .with_target(target)

@@ -1144,16 +1144,16 @@ impl<'a> Linearizer<'a> {
                 Opcode::SetNe
             };
 
-            // A comparison carries its *operand* type, not its result type:
-            // that is what `emit_compare` sizes the compare from, and what
-            // every comparison built in `linearize_emit` passes. Carrying
-            // `_Bool` here sized it at 8 bits, which `.max(32)` made a 32-bit
-            // `cmpl`, so `(_Bool)0x100000000L` compared only the low half and
-            // came out 0.
-            let mut insn = Instruction::binop(opcode, result, val, zero, from_typ, from_size);
-            insn.src_size = from_size;
-            insn.src_typ = Some(from_typ);
-            self.emit(insn);
+            // The operands are compared at their own width: sized by the
+            // `_Bool` result, `(_Bool)0x100000000L` compared only the low
+            // half and came out 0.
+            self.emit(Instruction::compare(
+                opcode,
+                result,
+                (val, zero),
+                (from_typ, from_size),
+                (to_typ, to_size),
+            ));
 
             return result;
         }
@@ -3357,16 +3357,15 @@ impl<'a> Linearizer<'a> {
     /// expression, so `isnan(f())` would call `f` twice.
     fn linearize_fp_test(&mut self, test: FpTest, arg: &Expr) -> PseudoId {
         let typ = self.expr_type(arg);
-        let size = self.types.size_bits(typ);
         let val = self.linearize_expr(arg);
 
         match test {
-            FpTest::IsNan => self.emit_fcmp(Opcode::FCmpONe, val, val, typ, size),
+            FpTest::IsNan => self.emit_compare(Opcode::FCmpONe, val, val, typ),
             FpTest::IsInf => {
                 let pos = self.emit_fconst(FloatVal::infinity(false), typ);
                 let neg = self.emit_fconst(FloatVal::infinity(true), typ);
-                let a = self.emit_fcmp(Opcode::FCmpOEq, val, pos, typ, size);
-                let b = self.emit_fcmp(Opcode::FCmpOEq, val, neg, typ, size);
+                let a = self.emit_compare(Opcode::FCmpOEq, val, pos, typ);
+                let b = self.emit_compare(Opcode::FCmpOEq, val, neg, typ);
                 self.emit_bool_combine(Opcode::Or, a, b)
             }
             FpTest::IsInfSign => {
@@ -3374,14 +3373,14 @@ impl<'a> Linearizer<'a> {
                 // tests are each 0 or 1, so their difference carries the sign.
                 let pos = self.emit_fconst(FloatVal::infinity(false), typ);
                 let neg = self.emit_fconst(FloatVal::infinity(true), typ);
-                let a = self.emit_fcmp(Opcode::FCmpOEq, val, pos, typ, size);
-                let b = self.emit_fcmp(Opcode::FCmpOEq, val, neg, typ, size);
+                let a = self.emit_compare(Opcode::FCmpOEq, val, pos, typ);
+                let b = self.emit_compare(Opcode::FCmpOEq, val, neg, typ);
                 self.emit_bool_combine(Opcode::Sub, a, b)
             }
-            FpTest::IsFinite => self.emit_is_finite(val, typ, size),
+            FpTest::IsFinite => self.emit_is_finite(val, typ),
             FpTest::IsNormal => {
-                let finite = self.emit_is_finite(val, typ, size);
-                let magnitude = self.emit_at_least_normal(val, typ, size);
+                let finite = self.emit_is_finite(val, typ);
+                let magnitude = self.emit_at_least_normal(val, typ);
                 self.emit_bool_combine(Opcode::And, finite, magnitude)
             }
             FpTest::SignBit => self.emit_signbit(val, typ),
@@ -3400,26 +3399,25 @@ impl<'a> Linearizer<'a> {
     /// `isgreater(f(), g())` calls each function exactly once.
     fn linearize_fp_compare(&mut self, cmp: FpCompare, lhs: &Expr, rhs: &Expr) -> PseudoId {
         let typ = self.expr_type(lhs);
-        let size = self.types.size_bits(typ);
         let a = self.linearize_expr(lhs);
         let b = self.linearize_expr(rhs);
 
         if let Some(op) = super::linearize_emit::fp_compare_opcode(cmp) {
-            return self.emit_fcmp(op, a, b, typ, size);
+            return self.emit_compare(op, a, b, typ);
         }
         match cmp {
             // Ordered and unequal. `!=` will not do: it is *true* for an
             // unordered pair, and this must be false for one.
             FpCompare::LessGreater => {
-                let below = self.emit_fcmp(Opcode::FCmpOLt, a, b, typ, size);
-                let above = self.emit_fcmp(Opcode::FCmpOGt, a, b, typ, size);
+                let below = self.emit_compare(Opcode::FCmpOLt, a, b, typ);
+                let above = self.emit_compare(Opcode::FCmpOGt, a, b, typ);
                 self.emit_bool_combine(Opcode::Or, below, above)
             }
             // `isnan(a) || isnan(b)`, spelled as the self-comparison
             // `linearize_fp_test` uses for `isnan`.
             FpCompare::Unordered => {
-                let a_nan = self.emit_fcmp(Opcode::FCmpONe, a, a, typ, size);
-                let b_nan = self.emit_fcmp(Opcode::FCmpONe, b, b, typ, size);
+                let a_nan = self.emit_compare(Opcode::FCmpONe, a, a, typ);
+                let b_nan = self.emit_compare(Opcode::FCmpONe, b, b, typ);
                 self.emit_bool_combine(Opcode::Or, a_nan, b_nan)
             }
             _ => unreachable!("{cmp:?} is one comparison"),
@@ -3428,38 +3426,24 @@ impl<'a> Linearizer<'a> {
 
     /// `x > -inf && x < +inf`, which is false for a NaN because both
     /// comparisons against one are false.
-    fn emit_is_finite(&mut self, val: PseudoId, typ: TypeId, size: u32) -> PseudoId {
+    fn emit_is_finite(&mut self, val: PseudoId, typ: TypeId) -> PseudoId {
         let pos = self.emit_fconst(FloatVal::infinity(false), typ);
         let neg = self.emit_fconst(FloatVal::infinity(true), typ);
-        let below = self.emit_fcmp(Opcode::FCmpOLt, val, pos, typ, size);
-        let above = self.emit_fcmp(Opcode::FCmpOGt, val, neg, typ, size);
+        let below = self.emit_compare(Opcode::FCmpOLt, val, pos, typ);
+        let above = self.emit_compare(Opcode::FCmpOGt, val, neg, typ);
         self.emit_bool_combine(Opcode::And, below, above)
     }
 
     /// `x >= +min_normal || x <= -min_normal` -- true for anything at least as
     /// large as the smallest normal, in either direction. Combined with a
     /// finiteness test this is exactly `isnormal`.
-    fn emit_at_least_normal(&mut self, val: PseudoId, typ: TypeId, size: u32) -> PseudoId {
+    fn emit_at_least_normal(&mut self, val: PseudoId, typ: TypeId) -> PseudoId {
         let smallest = self.smallest_normal(typ);
         let pos = self.emit_fconst(smallest, typ);
         let neg = self.emit_fconst(smallest.negated(), typ);
-        let a = self.emit_fcmp(Opcode::FCmpOGe, val, pos, typ, size);
-        let b = self.emit_fcmp(Opcode::FCmpOLe, val, neg, typ, size);
+        let a = self.emit_compare(Opcode::FCmpOGe, val, pos, typ);
+        let b = self.emit_compare(Opcode::FCmpOLe, val, neg, typ);
         self.emit_bool_combine(Opcode::Or, a, b)
-    }
-
-    /// Emit a floating comparison yielding 0 or 1.
-    fn emit_fcmp(
-        &mut self,
-        op: Opcode,
-        lhs: PseudoId,
-        rhs: PseudoId,
-        typ: TypeId,
-        size: u32,
-    ) -> PseudoId {
-        let result = self.alloc_pseudo();
-        self.emit(Instruction::binop(op, result, lhs, rhs, typ, size));
-        result
     }
 
     /// Combine two comparison results. Both are already 0 or 1, so the
@@ -3495,7 +3479,6 @@ impl<'a> Linearizer<'a> {
     /// nothing else it could be.
     fn linearize_fp_classify(&mut self, classes: &[Expr], arg: &Expr) -> PseudoId {
         let typ = self.expr_type(arg);
-        let size = self.types.size_bits(typ);
         let val = self.linearize_expr(arg);
         let int_typ = self.types.int_id;
 
@@ -3505,19 +3488,19 @@ impl<'a> Linearizer<'a> {
         let subnormal_code = self.linearize_expr(&classes[3]);
         let zero_code = self.linearize_expr(&classes[4]);
 
-        let is_nan = self.emit_fcmp(Opcode::FCmpONe, val, val, typ, size);
+        let is_nan = self.emit_compare(Opcode::FCmpONe, val, val, typ);
 
         let pos_inf = self.emit_fconst(FloatVal::infinity(false), typ);
         let neg_inf = self.emit_fconst(FloatVal::infinity(true), typ);
-        let eq_pos = self.emit_fcmp(Opcode::FCmpOEq, val, pos_inf, typ, size);
-        let eq_neg = self.emit_fcmp(Opcode::FCmpOEq, val, neg_inf, typ, size);
+        let eq_pos = self.emit_compare(Opcode::FCmpOEq, val, pos_inf, typ);
+        let eq_neg = self.emit_compare(Opcode::FCmpOEq, val, neg_inf, typ);
         let is_inf = self.emit_bool_combine(Opcode::Or, eq_pos, eq_neg);
 
         let zero = self.emit_fconst(FloatVal::ZERO, typ);
-        let is_zero = self.emit_fcmp(Opcode::FCmpOEq, val, zero, typ, size);
+        let is_zero = self.emit_compare(Opcode::FCmpOEq, val, zero, typ);
 
-        let finite = self.emit_is_finite(val, typ, size);
-        let magnitude = self.emit_at_least_normal(val, typ, size);
+        let finite = self.emit_is_finite(val, typ);
+        let magnitude = self.emit_at_least_normal(val, typ);
         let is_normal = self.emit_bool_combine(Opcode::And, finite, magnitude);
 
         let mut acc = subnormal_code;
@@ -5747,30 +5730,23 @@ impl<'a> Linearizer<'a> {
             ExprKind::Clrsbl { arg } | ExprKind::Clrsbll { arg } => self.linearize_clrsb(arg, 64),
 
             // Population count builtins
-            ExprKind::Popcount { arg } => {
-                // __builtin_popcount - counts set bits in unsigned int (32-bit)
+            // `__builtin_popcount` counts an `unsigned int`, `popcountl` and
+            // `popcountll` a 64-bit value; the count is an `int` either way.
+            ExprKind::Popcount { arg }
+            | ExprKind::Popcountl { arg }
+            | ExprKind::Popcountll { arg } => {
+                let (op, operand) = if matches!(expr.kind, ExprKind::Popcount { .. }) {
+                    (Opcode::Popcount32, self.types.uint_id)
+                } else {
+                    (Opcode::Popcount64, self.types.ulonglong_id)
+                };
                 let arg_val = self.linearize_expr(arg);
                 let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Popcount32)
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(32)
-                    .with_type(self.types.int_id);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::Popcountl { arg } | ExprKind::Popcountll { arg } => {
-                // __builtin_popcountl/popcountll - counts set bits in 64-bit value
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Popcount64)
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(64)
-                    .with_type(self.types.int_id);
+                let int = self.types.int_id;
+                let mut insn =
+                    Instruction::unop(op, result, arg_val, int, self.types.size_bits(int));
+                insn.src_typ = Some(operand);
+                insn.src_size = self.types.size_bits(operand);
                 self.emit(insn);
                 result
             }

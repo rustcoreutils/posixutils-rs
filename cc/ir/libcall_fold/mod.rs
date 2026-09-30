@@ -412,8 +412,7 @@ fn materialize(b: &mut Builder, ctx: &FoldCtx, call: &Instruction, folded: Folde
         }
         Folded::AtMost { n, len } => {
             let len = b.constant(i128::from(len), typ, size);
-            // A comparison records its operands' type (see `result_type_of`).
-            let below = b.binop(Opcode::SetB, n, len, typ, size);
+            let below = b.compare(Opcode::SetB, n, len, typ, size);
             b.select(below, n, len, typ, size)
         }
         Folded::ByteDiff(x, y) => {

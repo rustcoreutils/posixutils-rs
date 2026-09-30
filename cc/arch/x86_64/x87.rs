@@ -115,11 +115,14 @@ impl X86_64CodeGen {
         self.emit_fp_move_from_xmm(XmmReg::Xmm15, &home, fp_size);
     }
 
-    /// Check if this instruction operates on long double (80-bit x87)
+    /// Does this instruction operate on x87 `long double` values?
+    ///
+    /// Asked of its *operands*: a comparison of two `long double`s produces
+    /// an `int`, and is an x87 operation all the same.
     pub fn is_longdouble_op(&self, insn: &Instruction, types: &TypeTable) -> bool {
-        insn.size >= 80
+        insn.operand_width() >= 80
             && insn
-                .typ
+                .operand_type()
                 .is_some_and(|t| types.kind(t) == TypeKind::LongDouble)
     }
 

@@ -674,8 +674,10 @@ impl Aarch64CodeGen {
 
     /// Emit FP comparison
     pub(super) fn emit_fp_compare(&mut self, insn: &Instruction, types: &TypeTable) {
-        let size = Self::size_from_type(insn.typ, insn.size, types);
-        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
+        // The operands' format; the result is an `int`.
+        let (operand, width) = (insn.operand_type(), insn.operand_width());
+        let size = Self::size_from_type(operand, width, types);
+        let fp_size = self.fp_size_from_type(operand, width, types);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -686,8 +688,8 @@ impl Aarch64CodeGen {
         };
 
         // Load operands to FP registers
-        self.emit_fp_move(src1, VReg::V17, insn.typ, size, types);
-        self.emit_fp_move(src2, VReg::V18, insn.typ, size, types);
+        self.emit_fp_move(src1, VReg::V17, operand, size, types);
+        self.emit_fp_move(src2, VReg::V18, operand, size, types);
 
         // Perform comparison
         self.push_lir(Aarch64Inst::Fcmp {

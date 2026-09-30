@@ -1123,27 +1123,12 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             UnaryOp::Not => {
                 // Logical not: compare with 0
-                if is_float {
-                    let zero = self.emit_fconst(FloatVal::ZERO, typ);
-                    self.emit(Instruction::binop(
-                        Opcode::FCmpOEq,
-                        result,
-                        src,
-                        zero,
-                        typ,
-                        size,
-                    ));
+                let (op, zero) = if is_float {
+                    (Opcode::FCmpOEq, self.emit_fconst(FloatVal::ZERO, typ))
                 } else {
-                    let zero = self.emit_const(0, typ);
-                    self.emit(Instruction::binop(
-                        Opcode::SetEq,
-                        result,
-                        src,
-                        zero,
-                        typ,
-                        size,
-                    ));
-                }
+                    (Opcode::SetEq, self.emit_const(0, typ))
+                };
+                self.emit(self.compare_insn(op, result, (src, zero), typ));
                 return result;
             }
             UnaryOp::BitNot => Opcode::Not,
@@ -1304,32 +1289,40 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         };
 
-        // For comparison operations, use operand_typ to ensure correct size
-        // (comparisons produce int result but must operate at operand size)
-        let insn_typ = match opcode {
-            Opcode::SetEq
-            | Opcode::SetNe
-            | Opcode::SetLt
-            | Opcode::SetLe
-            | Opcode::SetGt
-            | Opcode::SetGe
-            | Opcode::SetB
-            | Opcode::SetBe
-            | Opcode::SetA
-            | Opcode::SetAe
-            | Opcode::FCmpOEq
-            | Opcode::FCmpONe
-            | Opcode::FCmpOLt
-            | Opcode::FCmpOLe
-            | Opcode::FCmpOGt
-            | Opcode::FCmpOGe => operand_typ,
-            _ => result_typ,
+        let insn = if opcode.is_comparison() {
+            self.compare_insn(opcode, result, (left, right), operand_typ)
+        } else {
+            let size = self.types.size_bits(result_typ);
+            Instruction::binop(opcode, result, left, right, result_typ, size)
         };
-        let insn_size = self.types.size_bits(insn_typ);
-        self.emit(Instruction::binop(
-            opcode, result, left, right, insn_typ, insn_size,
-        ));
+        self.emit(insn);
         result
+    }
+
+    /// A comparison of `operands`, which are of type `operand`, into
+    /// `target`, as C's relational and equality operators produce it: an
+    /// `int` that is 0 or 1 (C17 6.5.8p6, 6.5.9p3).
+    ///
+    /// The one place the linearizer decides what width a comparison reads.
+    /// An array or a function operand is compared as the pointer it decays
+    /// to (C17 6.3.2.1p3-4): typed as itself it has no width -- a function's
+    /// is 0 -- and both back ends raised that to 32 bits, so `if (weak_fn)`
+    /// and `foo == foo` compared the low half of an address.
+    pub(crate) fn compare_insn(
+        &self,
+        op: Opcode,
+        target: PseudoId,
+        operands: (PseudoId, PseudoId),
+        operand: TypeId,
+    ) -> Instruction {
+        let operand = match self.types.kind(operand) {
+            TypeKind::Array | TypeKind::Function => self.types.void_ptr_id,
+            _ => operand,
+        };
+        let width = self.types.size_bits(operand);
+        let int = self.types.int_id;
+        let result = (int, self.types.size_bits(int));
+        Instruction::compare(op, target, operands, (operand, width), result)
     }
 
     /// Emit complex arithmetic operation
@@ -1776,7 +1769,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         } else {
             Opcode::SetLt
         };
-        let cond = self.emit_int_binop(cmp, abs_c, abs_d, base_typ, base_size);
+        let cond = self.emit_compare(cmp, abs_c, abs_d, base_typ);
 
         // Both arms write their halves to `result_addr`, so there is no value
         // to merge and the void diamond serves: it builds the same blocks and
@@ -1925,17 +1918,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             MathErrno::Ignored => sqrt(self),
             MathErrno::Set if !in_place => self.emit_library_call(&callee, &[(x, typ)], typ),
             MathErrno::Set => {
-                let size = self.types.size_bits(typ);
                 let zero = self.emit_fconst(FloatVal::ZERO, typ);
-                let below = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FCmpOLt,
-                    below,
-                    x,
-                    zero,
-                    typ,
-                    size,
-                ));
+                let below = self.emit_compare(Opcode::FCmpOLt, x, zero, typ);
                 self.emit_two_way(
                     below,
                     typ,
@@ -2138,8 +2122,26 @@ impl<'a> super::linearize::Linearizer<'a> {
         typ: TypeId,
         size: u32,
     ) -> PseudoId {
+        debug_assert!(
+            !op.is_comparison(),
+            "a comparison goes through emit_compare"
+        );
         let dst = self.alloc_pseudo();
         self.emit(Instruction::binop(op, dst, lhs, rhs, typ, size));
+        dst
+    }
+
+    /// `op` comparing `lhs` and `rhs`, of type `typ` at `size` bits, into a
+    /// fresh `int` pseudo. See [`Self::compare_insn`].
+    pub(crate) fn emit_compare(
+        &mut self,
+        op: Opcode,
+        lhs: PseudoId,
+        rhs: PseudoId,
+        typ: TypeId,
+    ) -> PseudoId {
+        let dst = self.alloc_pseudo();
+        self.emit(self.compare_insn(op, dst, (lhs, rhs), typ));
         dst
     }
 
@@ -2302,18 +2304,12 @@ impl<'a> super::linearize::Linearizer<'a> {
         addr: PseudoId,
         complex_typ: TypeId,
     ) -> PseudoId {
-        let (real, imag, base_typ, base_bits) = self.load_complex_halves(addr, complex_typ);
+        let (real, imag, base_typ, _) = self.load_complex_halves(addr, complex_typ);
 
         let ne = self.complex_half_ops(base_typ).ne;
         let zero = self.complex_half_zero(base_typ);
-        let real_nz = self.alloc_pseudo();
-        self.emit(Instruction::binop(
-            ne, real_nz, real, zero, base_typ, base_bits,
-        ));
-        let imag_nz = self.alloc_pseudo();
-        self.emit(Instruction::binop(
-            ne, imag_nz, imag, zero, base_typ, base_bits,
-        ));
+        let real_nz = self.emit_compare(ne, real, zero, base_typ);
+        let imag_nz = self.emit_compare(ne, imag, zero, base_typ);
 
         let result = self.alloc_pseudo();
         let int_typ = self.types.int_id;
@@ -2342,7 +2338,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         right_addr: PseudoId,
         complex_typ: TypeId,
     ) -> PseudoId {
-        let (lre, lim, base_typ, base_bits) = self.load_complex_halves(left_addr, complex_typ);
+        let (lre, lim, base_typ, _) = self.load_complex_halves(left_addr, complex_typ);
         let (rre, rim, _, _) = self.load_complex_halves(right_addr, complex_typ);
 
         let ops = self.complex_half_ops(base_typ);
@@ -2352,14 +2348,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             (ops.ne, Opcode::Or)
         };
 
-        let real_cmp = self.alloc_pseudo();
-        self.emit(Instruction::binop(
-            half_op, real_cmp, lre, rre, base_typ, base_bits,
-        ));
-        let imag_cmp = self.alloc_pseudo();
-        self.emit(Instruction::binop(
-            half_op, imag_cmp, lim, rim, base_typ, base_bits,
-        ));
+        let real_cmp = self.emit_compare(half_op, lre, rre, base_typ);
+        let imag_cmp = self.emit_compare(half_op, lim, rim, base_typ);
 
         let result = self.alloc_pseudo();
         let int_typ = self.types.int_id;
@@ -2536,32 +2526,17 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// `val != 0`, read the way `operand_typ` says to read it.
     pub(crate) fn emit_compare_zero(&mut self, val: PseudoId, operand_typ: TypeId) -> PseudoId {
-        let result = self.alloc_pseudo();
-        let size = self.types.size_bits(operand_typ);
         // A float is compared against 0.0, not against its bit pattern:
         // -0.0 is zero and every NaN is not.
-        if self.types.is_float(operand_typ) {
-            let zero = self.emit_fconst(FloatVal::ZERO, operand_typ);
-            self.emit(Instruction::binop(
+        let (op, zero) = if self.types.is_float(operand_typ) {
+            (
                 Opcode::FCmpONe,
-                result,
-                val,
-                zero,
-                operand_typ,
-                size,
-            ));
-            return result;
-        }
-        let zero = self.emit_const(0, operand_typ);
-        self.emit(Instruction::binop(
-            Opcode::SetNe,
-            result,
-            val,
-            zero,
-            operand_typ,
-            size,
-        ));
-        result
+                self.emit_fconst(FloatVal::ZERO, operand_typ),
+            )
+        } else {
+            (Opcode::SetNe, self.emit_const(0, operand_typ))
+        };
+        self.emit_compare(op, val, zero, operand_typ)
     }
 
     /// Emit short-circuit logical AND: a && b

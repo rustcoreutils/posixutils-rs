@@ -287,9 +287,12 @@ FVal(f64)   - float constant ${n}
 op: Opcode              - operation
 target: PseudoId        - result (optional)
 src: Vec<PseudoId>      - operands
-typ: TypeId             - result type
-size: u32               - bit width
-src_size: u32           - source width (conversions)
+typ: TypeId             - result type, for every opcode
+size: u32               - result width in bits, for every opcode
+src_typ/src_size        - operand type and width, for an opcode that reads
+                          another type than it produces: the conversions,
+                          the comparisons, the population counts. Read them
+                          through `Instruction::operand_type`/`operand_width`
 offset: i64             - memory offset
 bb_true/bb_false        - branch targets
 phi_list                - [(bb, pseudo), ...]

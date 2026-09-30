@@ -117,6 +117,29 @@ impl<'a> Builder<'a> {
         t
     }
 
+    /// A comparison `op` of `a` and `b`, of `typ` at `size` bits, into a new
+    /// `int` pseudo that is 0 or 1.
+    pub(crate) fn compare(
+        &mut self,
+        op: Opcode,
+        a: PseudoId,
+        b: PseudoId,
+        typ: TypeId,
+        size: u32,
+    ) -> PseudoId {
+        let t = self.func.alloc_pseudo();
+        let int = self.types.int_id;
+        let int_bits = self.types.size_bits(int);
+        self.push(Instruction::compare(
+            op,
+            t,
+            (a, b),
+            (typ, size),
+            (int, int_bits),
+        ));
+        t
+    }
+
     /// A conversion `op` of `src`, of `from` at `from_size` bits, to `to` at
     /// `size` bits.
     pub(crate) fn convert(

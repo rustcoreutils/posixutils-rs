@@ -22,9 +22,7 @@
 // drift.
 //
 
-use super::constfold::result_type_of;
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
-use crate::types::TypeTable;
 use std::collections::HashMap;
 
 /// A `(block index, instruction index)` pair.
@@ -40,7 +38,6 @@ pub(crate) type Site = (usize, usize);
 /// Returns whether anything changed.
 pub(crate) fn fold_target_to_const(
     func: &mut Function,
-    types: &TypeTable,
     (b, i): Site,
     v: i128,
     minted: &mut HashMap<i128, PseudoId>,
@@ -82,14 +79,13 @@ pub(crate) fn fold_target_to_const(
             id
         }
     };
-    // A comparison describes its *operands* in `typ`/`size`, so the copy
-    // that replaces it must be re-typed rather than left as it stands.
-    let (typ, size) = result_type_of(&func.blocks[b].insns[i], types);
+    // The copy has the instruction's own result type and width, and reads
+    // no operand of another type.
     let insn = &mut func.blocks[b].insns[i];
     insn.op = Opcode::Copy;
     insn.src = vec![c];
-    insn.typ = typ;
-    insn.size = size;
+    insn.src_typ = None;
+    insn.src_size = 0;
     // A folded phi keeps no incoming values; clearing the list is what
     // makes the now-unread `PhiSource` instructions dead, for the `dce`
     // run that follows to collect.

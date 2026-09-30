@@ -9171,9 +9171,11 @@ fn test_bool_conversion_compares_at_the_operand_width() {
         .find(|i| i.op == Opcode::SetNe)
         .expect("a _Bool conversion compares against zero");
     assert_eq!(
-        cmp.size, 64,
-        "the compare is sized by its operand, not _Bool"
+        cmp.operand_width(),
+        64,
+        "the compare reads its operand at its own width, not _Bool's"
     );
+    assert_eq!(cmp.size, 8, "and produces the _Bool");
 }
 
 /// An explicit cast to `_Bool` from a floating type takes the same rule, and

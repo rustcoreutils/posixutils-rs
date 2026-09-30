@@ -67,6 +67,28 @@ enum JumpKind {
     Continue,
 }
 
+/// A `for` loop whose body is being lowered: what
+/// [`Linearizer::open_for`] set up and [`Linearizer::close_for`] finishes.
+///
+/// `for` is lowered from two places -- the ordinary statement walk and the
+/// switch-body walk, which must keep lowering the body through itself so the
+/// `case` labels inside stay reachable -- and the two differ *only* in how
+/// they lower the body. Everything else lives here, so a fix lands once
+/// instead of twice: the loop's back edge had to be repaired in both copies,
+/// and the release of a VLA declared in the init clause was missing from
+/// both.
+#[must_use = "an opened `for` loop must be finished with close_for"]
+struct OpenFor {
+    /// The scope the init clause declares into, ended after `exit_bb`.
+    scope: Scope,
+    /// The block the back edge goes to.
+    cond_bb: BasicBlockId,
+    /// Where the body falls out to, and the `continue` target.
+    post_bb: BasicBlockId,
+    /// Where the loop ends, and the `break` target.
+    exit_bb: BasicBlockId,
+}
+
 impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_stmt(&mut self, stmt: &Stmt) {
         match stmt {
@@ -77,24 +99,18 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             Stmt::Block(items) => {
-                self.push_scope();
-                // A VLA's storage lives until control leaves the scope of its
-                // declaration (C17 6.2.4p7). Capture the stack pointer on the
-                // way in and put it back on the way out, or a loop body's VLA
-                // is allocated afresh every iteration and never released --
-                // `for (...) { int x[n]; }` died of stack exhaustion.
-                let vla_scope = self.open_vla_scope();
+                // Entering the scope also captures the stack pointer, and
+                // leaving it puts the pointer back -- a VLA's storage lives
+                // until control leaves the scope of its declaration (C17
+                // 6.2.4p7). See `Scope`.
+                let scope = self.push_scope();
                 for item in items {
                     match item {
                         BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
                         BlockItem::Statement(s) => self.linearize_stmt(s),
                     }
                 }
-                // Only on the falling-out path: a `break`, `continue` or
-                // `return` that left already did its own unwinding.
-                self.close_vla_scope(vla_scope);
-
-                self.pop_scope();
+                self.pop_scope(scope);
             }
 
             Stmt::If {
@@ -275,6 +291,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                     );
                 }
                 let addr = self.linearize_expr(target);
+                // A computed `goto` leaves scopes exactly as a named one
+                // does, and left out here it left a loop body's VLA behind
+                // every time round. Which scopes it leaves depends on which
+                // label it reaches, which is not known until every label is
+                // placed -- and then only as a set. See
+                // `GotoTarget::AnyAddressTaken`.
+                self.defer_vla_restore(GotoTarget::AnyAddressTaken);
                 let (dispatch_bb, slot) = self.indirect_dispatch_block();
                 // Hand the address over in the hidden local and branch to the
                 // one dispatch block, which is the only place that fans out to
@@ -292,44 +315,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let label_str = self.str(*label).to_string();
                 let target = self.refer_to_label(&label_str, *pos);
                 if let Some(current) = self.current_bb {
-                    // A backward jump -- the label is already linearized, so
-                    // it has a captured stack pointer -- leaves the scope of
-                    // every VLA declared after it, and that storage has to go
-                    // back. Otherwise `lab: int x[n]; ... goto lab;` grows the
-                    // stack every time round until the program dies.
-                    //
-                    // A *forward* jump cannot be decided here: its label has
-                    // no depth recorded yet, and whether it stays inside the
-                    // scope of the VLAs in force or leaves it is exactly what
-                    // decides between no restore and one. It is recorded and
-                    // resolved in `resolve_forward_goto_vla_restores`.
-                    //
-                    // Leaving it to "the block's own exit does the restoring"
-                    // was wrong: the branch *terminates* the block, so
-                    // `close_vla_scope` emits nothing and then drops the
-                    // marks, and the enclosing block has no mark of its own to
-                    // undo them with. A `goto` out of a loop body's inner
-                    // block grew the stack every time round.
-                    if let Some(&depth) = self.label_vla_depth.get(&label_str) {
-                        if let Some(m) = self.vla_marks.get(depth) {
-                            let mark = m.mark;
-                            self.emit_stack_restore(mark);
-                        }
-                    } else if !self.vla_marks.is_empty() {
-                        let at = self
-                            .current_func
-                            .as_ref()
-                            .and_then(|f| f.get_block(current))
-                            .map_or(0, |b| b.insns.len());
-                        let marks = self.vla_marks.iter().map(|m| m.mark).collect();
-                        self.pending_goto_vla
-                            .push(crate::ir::linearize::PendingGotoVla {
-                                label: label_str.clone(),
-                                bb: current,
-                                at,
-                                marks,
-                            });
-                    }
+                    self.release_vla_scopes_for_goto(target);
                     self.emit(Instruction::br(target));
                     self.link_bb(current, target);
                 }
@@ -1419,15 +1405,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.switch_bb(exit_bb);
     }
 
-    pub(crate) fn linearize_for(
-        &mut self,
-        init: Option<&ForInit>,
-        cond: Option<&Expr>,
-        post: Option<&Expr>,
-        body: &Stmt,
-    ) {
-        // C99 for-loop declarations (e.g., for (int i = 0; ...)) are scoped to the loop.
-        self.push_scope();
+    /// Lower everything a `for` loop needs before its body: the init clause,
+    /// the four blocks, the condition and the jump targets. Leaves the body
+    /// block current, for the caller to lower the body into.
+    ///
+    /// The returned [`OpenFor`] goes back to [`Self::close_for`].
+    fn open_for(&mut self, init: Option<&ForInit>, cond: Option<&Expr>) -> OpenFor {
+        // C99 for-loop declarations (e.g., for (int i = 0; ...)) are scoped
+        // to the loop -- and so is a VLA declared there, which the scope
+        // releases at `exit_bb`. That is the right place for it: `break` and
+        // `continue` both land inside this scope, so neither may release it.
+        let scope = self.push_scope();
 
         // Init
         if let Some(init) = init {
@@ -1468,9 +1456,27 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Body block
         self.break_targets.push(exit_bb);
         self.continue_targets.push(post_bb);
-
         self.switch_bb(body_bb);
-        self.linearize_stmt(body);
+
+        OpenFor {
+            scope,
+            cond_bb,
+            post_bb,
+            exit_bb,
+        }
+    }
+
+    /// Close the loop [`Self::open_for`] opened, once its body is lowered:
+    /// the back edge through the post-expression, then the exit block, then
+    /// the loop's scope.
+    fn close_for(&mut self, open: OpenFor, post: Option<&Expr>) {
+        let OpenFor {
+            scope,
+            cond_bb,
+            post_bb,
+            exit_bb,
+        } = open;
+
         if !self.is_terminated() {
             // After linearizing body, current_bb may be different from body_bb
             if let Some(current) = self.current_bb {
@@ -1500,8 +1506,20 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Exit block
         self.switch_bb(exit_bb);
 
-        // Restore locals to remove for-loop-scoped declarations
-        self.pop_scope();
+        // Drop the for-loop-scoped declarations and release their storage.
+        self.pop_scope(scope);
+    }
+
+    pub(crate) fn linearize_for(
+        &mut self,
+        init: Option<&ForInit>,
+        cond: Option<&Expr>,
+        post: Option<&Expr>,
+        body: &Stmt,
+    ) {
+        let open = self.open_for(init, cond);
+        self.linearize_stmt(body);
+        self.close_for(open, post);
     }
 
     pub(crate) fn linearize_switch(&mut self, expr: &Expr, body: &Stmt) {
@@ -2509,11 +2527,12 @@ impl<'a> super::linearize::Linearizer<'a> {
         // `collect_switch_cases`, which has to agree about this.
         match body {
             Stmt::Block(items) => {
-                // Same VLA reclamation as the ordinary block arm: a switch
-                // body is lowered by its own walk, and leaving the rule out
-                // here let `switch (c) { case 0: { int v[n]; break; } }`
-                // inside a loop grow the stack without bound.
-                let vla_scope = self.open_vla_scope();
+                // The same scope as the ordinary block arm: a switch body is
+                // lowered by its own walk, and leaving the rule out here let
+                // `switch (c) { case 0: { int v[n]; break; } }` inside a loop
+                // grow the stack without bound, and let the body's
+                // declarations outlive the switch.
+                let scope = self.push_scope();
                 for item in items {
                     match item {
                         BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
@@ -2528,7 +2547,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         }
                     }
                 }
-                self.close_vla_scope(vla_scope);
+                self.pop_scope(scope);
             }
             stmt => {
                 self.linearize_switch_stmt(stmt, case_values, case_bbs, default_bb, &mut case_idx)
@@ -2661,80 +2680,23 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.switch_bb(exit_bb);
             }
 
+            // Everything but the body is the ordinary `for` lowering; only
+            // the body has to go back through this walk, so the `case`
+            // labels inside it stay reachable. See `OpenFor`.
             Stmt::For {
                 init,
                 cond,
                 post,
                 body,
             } => {
-                self.push_scope();
-
-                if let Some(init) = init {
-                    match init {
-                        ForInit::Declaration(decl) => self.linearize_local_decl(decl),
-                        ForInit::Expression(expr) => {
-                            self.linearize_expr(expr);
-                        }
-                    }
-                }
-
-                let cond_bb = self.alloc_bb();
-                let body_bb = self.alloc_bb();
-                let post_bb = self.alloc_bb();
-                let exit_bb = self.alloc_bb();
-
-                if let Some(current) = self.current_bb {
-                    if !self.is_terminated() {
-                        self.emit(Instruction::br(cond_bb));
-                        self.link_bb(current, cond_bb);
-                    }
-                }
-
-                self.switch_bb(cond_bb);
-                if let Some(cond_expr) = cond {
-                    self.branch_on_condition(cond_expr, body_bb, exit_bb);
-                } else {
-                    self.emit(Instruction::br(body_bb));
-                    self.link_bb(cond_bb, body_bb);
-                }
-
-                self.break_targets.push(exit_bb);
-                self.continue_targets.push(post_bb);
-
-                self.switch_bb(body_bb);
+                let open = self.open_for(init.as_ref(), cond.as_ref());
                 self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
-                if !self.is_terminated() {
-                    if let Some(current) = self.current_bb {
-                        self.emit(Instruction::br(post_bb));
-                        self.link_bb(current, post_bb);
-                    }
-                }
-
-                self.break_targets.pop();
-                self.continue_targets.pop();
-
-                self.switch_bb(post_bb);
-                if let Some(post_expr) = post {
-                    self.linearize_expr(post_expr);
-                }
-                // From the block the post-expression ended in, which `&&`, `||` and
-                // `?:` can make a different one from post_bb. Linking the back edge
-                // from post_bb itself recorded an edge out of a block that no longer
-                // holds the branch, and left the merge block that does hold it with an
-                // unrecorded successor -- the loop then never terminated.
-                if let Some(current) = self.current_bb {
-                    self.emit(Instruction::br(cond_bb));
-                    self.link_bb(current, cond_bb);
-                }
-
-                self.switch_bb(exit_bb);
-                self.pop_scope();
+                self.close_for(open, post.as_ref());
             }
 
             Stmt::Block(items) => {
-                self.push_scope();
                 // See the sibling arm in `linearize_switch_body`.
-                let vla_scope = self.open_vla_scope();
+                let scope = self.push_scope();
                 for item in items {
                     match item {
                         BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
@@ -2749,8 +2711,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         }
                     }
                 }
-                self.close_vla_scope(vla_scope);
-                self.pop_scope();
+                self.pop_scope(scope);
             }
 
             Stmt::If {
@@ -3061,10 +3022,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         // with every output unstored. Each label edge now gets a block of its
         // own that writes the outputs back and then jumps to the label.
         let writes_back = skip_post_handling.iter().any(|skip| !skip);
+        // An `asm goto` has two kinds of exit and each must release the VLA
+        // scopes it leaves. The fall-through is released by the enclosing
+        // scope's own end, but a label edge branches straight past it -- so
+        // the release goes in the edge block, which therefore has to exist
+        // even when there is nothing to write back.
+        let releases_vlas = !self.vla_marks.is_empty();
+        let needs_edge_block = writes_back || releases_vlas;
         let label_edges: Vec<(BasicBlockId, BasicBlockId, String)> = ir_goto_labels
             .iter()
             .map(|(target, name)| {
-                let edge = if writes_back {
+                let edge = if needs_edge_block {
                     self.alloc_bb()
                 } else {
                     *target
@@ -3109,16 +3077,21 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // Without this, code would fall through to whatever block comes next in layout
                 self.emit(Instruction::br(fall_through));
 
-                if writes_back {
+                if needs_edge_block {
                     for (edge, target, _) in &label_edges {
                         self.switch_bb(*edge);
-                        self.emit_asm_output_writeback(
-                            outputs,
-                            &ir_outputs,
-                            &skip_post_handling,
-                            &param_outputs,
-                            &output_places,
-                        );
+                        if writes_back {
+                            self.emit_asm_output_writeback(
+                                outputs,
+                                &ir_outputs,
+                                &skip_post_handling,
+                                &param_outputs,
+                                &output_places,
+                            );
+                        }
+                        // The jump leaves this scope; the fall-through does
+                        // not. Same rule as a plain `goto` to the label.
+                        self.release_vla_scopes_for_goto(*target);
                         self.emit(Instruction::br(*target));
                         self.link_bb(*edge, *target);
                     }
@@ -3265,6 +3238,15 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// One mark per declaration, not per block: a label sitting between two
     /// VLAs must release only the one declared after it, and a block-wide
     /// mark cannot express that.
+    ///
+    /// The nesting depths are read *before* the construct being lowered
+    /// pushes its own break or continue target, and that is deliberate. A
+    /// VLA declared in a `for` init clause, or in the controlling expression
+    /// of a `switch`, is allocated once, outside the loop or switch, and its
+    /// scope encloses the exit the jump lands on -- so a `break` or
+    /// `continue` inside must *not* release it. `continue` especially: the
+    /// storage is still live on the next iteration. The construct's own
+    /// scope, which ends after its exit block, is what releases it.
     fn push_vla_mark(&mut self) {
         if self.current_bb.is_none() {
             return;
@@ -3280,14 +3262,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             break_depth: self.break_targets.len(),
             continue_depth: self.continue_targets.len(),
         });
-    }
-
-    /// The marks in force on entry to a block, to restore and drop on exit.
-    ///
-    /// Returns the depth of [`Linearizer::vla_marks`] so
-    /// [`Self::close_vla_scope`] knows which of them this block added.
-    fn open_vla_scope(&self) -> usize {
-        self.vla_marks.len()
     }
 
     /// Give every forward `goto` the VLA restore its label turned out to need.
@@ -3310,9 +3284,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         pending.sort_by_key(|p| (p.bb.0, std::cmp::Reverse(p.at)));
         let void_ptr = self.types.void_ptr_id;
         for p in pending {
-            // An undefined label is diagnosed elsewhere; there is no branch
-            // here to put a restore in front of.
-            let Some(&depth) = self.label_vla_depth.get(&p.label) else {
+            let Some(depth) = self.goto_target_vla_depth(&p.target) else {
                 continue;
             };
             let Some(&mark) = p.marks.get(depth) else {
@@ -3331,18 +3303,98 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Release everything the block allocated and forget its marks.
-    fn close_vla_scope(&mut self, entry: usize) {
+    /// How many VLA scopes a jump is *inside* at the label it reaches, or
+    /// `None` if that cannot be said -- an undefined label, diagnosed
+    /// elsewhere, or a computed `goto` in a function that takes no label's
+    /// address.
+    fn goto_target_vla_depth(&self, target: &GotoTarget) -> Option<usize> {
+        match target {
+            GotoTarget::Label(bb) => self.label_vla_depth.get(bb).copied(),
+            // See [`GotoTarget::AnyAddressTaken`]: the deepest candidate is
+            // the only depth that releases nothing another candidate still
+            // needs.
+            GotoTarget::AnyAddressTaken => self
+                .addr_taken_labels
+                .iter()
+                .filter_map(|bb| self.label_vla_depth.get(bb).copied())
+                .max(),
+        }
+    }
+
+    /// Release everything the scope allocated and forget its marks.
+    ///
+    /// Called only from [`Linearizer::pop_scope`], so that leaving a
+    /// declaration scope and leaving a VLA scope are the same act.
+    pub(crate) fn close_vla_scope(&mut self, scope: &Scope) {
+        let entry = scope.vla_entry;
         if self.vla_marks.len() <= entry {
             return;
         }
-        // The first mark the block took is the stack as it stood on entry,
+        // The first mark the scope took is the stack as it stood on entry,
         // so one restore undoes all of them.
         let mark = self.vla_marks[entry].mark;
         if !self.is_terminated() && self.current_bb.is_some() {
             self.emit_stack_restore(mark);
         }
         self.vla_marks.truncate(entry);
+    }
+
+    /// Release every VLA scope a jump to the block `target` leaves.
+    ///
+    /// A backward jump -- the label is already linearized, so it has a
+    /// recorded depth -- leaves the scope of every VLA declared after it, and
+    /// that storage has to go back. Otherwise `lab: int x[n]; ... goto lab;`
+    /// grows the stack every time round until the program dies.
+    ///
+    /// A *forward* jump cannot be decided here: its label has no depth
+    /// recorded yet, and whether it stays inside the scope of the VLAs in
+    /// force or leaves it is exactly what decides between no restore and one.
+    /// It is recorded and resolved in
+    /// [`Self::resolve_forward_goto_vla_restores`].
+    ///
+    /// Leaving it to "the scope's own exit does the restoring" was wrong: the
+    /// branch *terminates* the block, so `close_vla_scope` emits nothing and
+    /// then drops the marks, and the enclosing scope has no mark of its own
+    /// to undo them with. A `goto` out of a loop body's inner block grew the
+    /// stack every time round.
+    ///
+    /// Every jump that names a label goes through here: a `goto`, and each
+    /// label edge of an `asm goto`.
+    fn release_vla_scopes_for_goto(&mut self, target: BasicBlockId) {
+        if let Some(&depth) = self.label_vla_depth.get(&target) {
+            if let Some(m) = self.vla_marks.get(depth) {
+                let mark = m.mark;
+                self.emit_stack_restore(mark);
+            }
+        } else {
+            self.defer_vla_restore(GotoTarget::Label(target));
+        }
+    }
+
+    /// Record a restore whose depth is not yet known, to be placed by
+    /// [`Self::resolve_forward_goto_vla_restores`] at the end of the
+    /// function. The restore goes where the current block ends now, which is
+    /// ahead of the branch the caller is about to emit.
+    fn defer_vla_restore(&mut self, target: GotoTarget) {
+        if self.vla_marks.is_empty() {
+            return;
+        }
+        let Some(current) = self.current_bb else {
+            return;
+        };
+        let at = self
+            .current_func
+            .as_ref()
+            .and_then(|f| f.get_block(current))
+            .map_or(0, |b| b.insns.len());
+        let marks = self.vla_marks.iter().map(|m| m.mark).collect();
+        self.pending_goto_vla
+            .push(crate::ir::linearize::PendingGotoVla {
+                target,
+                bb: current,
+                at,
+                marks,
+            });
     }
 
     /// Put the stack pointer back to what `mark` captured.
@@ -3425,7 +3477,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // declaration that creates it lies between the label and the
         // jump.
         if self.func_has_vla {
-            self.label_vla_depth.insert(name_str, self.vla_marks.len());
+            self.label_vla_depth.insert(label_bb, self.vla_marks.len());
         }
     }
 

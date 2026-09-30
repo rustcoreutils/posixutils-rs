@@ -2685,3 +2685,54 @@ fn codegen_inline_asm_operand_address_used_elsewhere() {
         }
     }
 }
+
+/// An `asm goto` releases the VLA scopes its label edge leaves.
+///
+/// It has two exits and needs a release on each. The enclosing scope's
+/// release sits on the fall-through, and the label edge branches straight
+/// past it -- so a loop whose back edge runs through the jump allocated
+/// every time round and freed nothing. Each edge now has a block of its own
+/// and the release goes there.
+///
+/// Observed by address rather than by exhaustion: the same declaration
+/// reached on the same path allocates at the same address every iteration if
+/// and only if the previous one was released.
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn codegen_asm_goto_releases_a_vla_scope_on_its_label_edge() {
+    #[cfg(target_arch = "x86_64")]
+    let jump = "jmp %l[again]";
+    #[cfg(target_arch = "aarch64")]
+    let jump = "b %l[again]";
+
+    let code = format!(
+        r#"
+static int loop_through_asm_goto(int n) {{
+    void *first = 0;
+    int k = 0;
+top:
+    {{
+        int a[n];
+        a[0] = k;
+        if (!first) first = (void *)a;
+        else if (first != (void *)a) return 1;
+        k++;
+        __asm__ goto ("{jump}" : : : : again);
+        return 2;                 /* the asm always branches */
+    }}
+again:
+    if (k < 8) goto top;
+    return 0;
+}}
+
+int main(void) {{
+    return loop_through_asm_goto(7);
+}}
+"#
+    );
+    assert_eq!(compile_and_run("asm_goto_vla_scope", &code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("asm_goto_vla_scope_opt", &code),
+        0
+    );
+}

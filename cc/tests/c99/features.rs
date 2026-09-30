@@ -1192,3 +1192,179 @@ fn c99_deeply_nested_constructs_compile() {
     code.push_str("int main(void) { return deep() == 1 && labels(3) == 1 ? 0 : 1; }\n");
     assert_eq!(compile_and_run("deep_nesting", &code, &[]), 0);
 }
+
+/// Every way out of a scope that declares a VLA puts the stack pointer back.
+///
+/// Observed without waiting for an exhaustion that a frame pointer hides:
+/// the same declaration reached on the same path allocates at the same
+/// address every time round *if and only if* the previous iteration released
+/// it. A scope that never releases marches the address up the stack, and the
+/// first mismatch is one iteration later.
+///
+/// The declaration scope and the VLA scope used to be opened by hand at
+/// separate call sites, and three of the sites that opened the first never
+/// opened the second: a `for` init clause, the copy of the `for` lowering
+/// inside the switch-body walk, and a statement expression. A computed
+/// `goto` left no scope at all.
+#[test]
+fn c99_a_vla_scope_is_released_on_every_exit() {
+    let code = r#"
+/* A VLA in a `for` init clause: allocated once per execution of the inner
+   `for` statement, released when that statement ends. */
+static int for_init(int n) {
+    void *first = 0;
+    for (int k = 0; k < 8; k++)
+        for (int a[n]; ; ) {
+            a[0] = k;
+            if (!first) first = (void *)a;
+            else if (first != (void *)a) return 1;
+            break;                      /* leaves by `break` */
+        }
+    return 0;
+}
+
+/* The same shape, lowered by the switch-body walk instead. */
+static int for_init_in_switch(int n, int x) {
+    void *first = 0;
+    switch (x) {
+    case 1:
+        for (int k = 0; k < 8; k++)
+            for (int a[n]; ; ) {
+                a[0] = k;
+                if (!first) first = (void *)a;
+                else if (first != (void *)a) return 2;
+                break;
+            }
+        return 0;
+    }
+    return 3;
+}
+
+/* A statement expression is a block, so it is a scope. */
+static int stmt_expr(int n) {
+    void *first = 0;
+    int bad = 0;
+    for (int k = 0; k < 8; k++)
+        (void)({
+            int a[n];
+            a[0] = k;
+            if (!first) first = (void *)a;
+            else if (first != (void *)a) bad = 4;
+            0;
+        });
+    return bad;
+}
+
+/* Leaving by a forward `goto`, which also has to leave the label bookkeeping
+   straight for every label after it. */
+static int goto_out(int n) {
+    void *first = 0;
+    for (int k = 0; k < 8; k++) {
+        for (int a[n]; ; ) {
+            a[0] = k;
+            if (!first) first = (void *)a;
+            else if (first != (void *)a) return 5;
+            goto next;
+        }
+    next:
+        ;
+    }
+    return 0;
+}
+
+/* And by a computed `goto`, which leaves a scope exactly as a plain one
+   does. The jump is the loop, so every iteration goes through it. */
+static int computed_goto(int n) {
+    void *first = 0;
+    int k = 0;
+    void *back = &&top;
+top:
+    {
+        int a[n];
+        a[0] = k;
+        if (!first) first = (void *)a;
+        else if (first != (void *)a) return 6;
+        k++;
+        if (k < 8) goto *back;
+    }
+    return 0;
+}
+
+int main(void) {
+    int n = 7;
+    int rc;
+    if ((rc = for_init(n)) != 0) return rc;
+    if ((rc = for_init_in_switch(n, 1)) != 0) return rc;
+    if ((rc = stmt_expr(n)) != 0) return rc;
+    if ((rc = goto_out(n)) != 0) return rc;
+    if ((rc = computed_goto(n)) != 0) return rc;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_vla_scope_release", code, &[]),
+        0,
+        "a VLA scope must release its storage on every exit"
+    );
+}
+
+/// A block inside a `switch` body is a declaration scope there too: the
+/// switch-body walk has a lowering of its own, and it used to release a VLA
+/// declared in such a block without ever entering the declaration scope, so
+/// the block's ordinary declarations outlived it.
+#[test]
+fn c99_a_switch_body_block_is_a_declaration_scope() {
+    let code = r#"
+int main(void) {
+    int v = 1;
+    int x = 2;
+    switch (x) {
+    default: {
+        int v = 10;        /* shadows the outer v only inside these braces */
+        if (v != 10) return 1;
+        break;
+    }
+    }
+    if (v != 1) return 2;  /* the inner declaration must not have escaped */
+
+    /* And a VLA declared there is released when the block ends. */
+    void *first = 0;
+    for (int k = 0; k < 8; k++)
+        switch (x) {
+        default: {
+            int a[x + 5];
+            a[0] = k;
+            if (!first) first = (void *)a;
+            else if (first != (void *)a) return 3;
+        }
+        }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_switch_body_block_scope", code, &[]), 0);
+}
+
+/// A declaration in a statement expression does not outlive it.
+///
+/// The statement expression had no declaration scope at all, so its locals
+/// were inserted into the enclosing one and stayed there -- an inner `x`
+/// went on shadowing the outer one after the `})`.
+#[test]
+fn c99_a_statement_expression_is_a_declaration_scope() {
+    let code = r#"
+int main(void) {
+    int x = 1;
+    int y = ({ int x = 41; x + 1; });
+    if (y != 42) return 1;
+    if (x != 1) return 2;   /* the inner x must be gone */
+    {
+        typedef int T;
+        int z = ({ typedef long T; (int)sizeof(T); });
+        if (z != (int)sizeof(long)) return 3;
+        if ((int)sizeof(T) != (int)sizeof(int)) return 4;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_stmt_expr_scope", code, &[]), 0);
+}

@@ -222,7 +222,28 @@ pub(crate) struct StaticLocalInfo {
 
 // Linearizer
 
-/// Linearizer context for converting AST to IR
+/// A declaration scope the linearizer has entered.
+///
+/// Handed out by [`Linearizer::push_scope`] and given back to
+/// [`Linearizer::pop_scope`]. A block scope is also the lifetime of every
+/// VLA declared in it (C17 6.2.4p7), so the token carries the [`VlaMark`]
+/// depth as it stood on entry and leaving the scope puts the stack pointer
+/// back to what the first mark above that depth captured.
+///
+/// Carrying both in one token is the point. The declaration scope and the
+/// VLA scope used to be two stacks opened by hand at separate call sites,
+/// and only some of the sites that opened the first opened the second: a VLA
+/// declared in a `for` init clause, in the `for` arm of the switch-body
+/// walker, or in a statement expression was never released. Now there is no
+/// way to enter one without the other, and none to leave one without the
+/// other.
+#[must_use = "a scope that is entered must be left through pop_scope"]
+pub(crate) struct Scope {
+    /// The `vla_marks` depth on entry; every mark above it belongs to this
+    /// scope and is released when it ends.
+    pub(crate) vla_entry: usize,
+}
+
 /// A captured stack pointer and the loop/switch nesting it was captured at.
 ///
 /// See [`Linearizer::vla_marks`].
@@ -244,14 +265,27 @@ pub(crate) struct HiddenReturnSlot {
     pub(crate) arg_typ: TypeId,
 }
 
+/// Where a jump whose VLA restore is still undecided may land.
+pub(crate) enum GotoTarget {
+    /// `goto L;`, or one label edge of an `asm goto`: a single block.
+    Label(BasicBlockId),
+    /// `goto *p;`. The address is not known here, so the jump is taken to
+    /// reach any label whose address this function takes, and only the
+    /// scopes that *every* candidate lies outside of may be released -- the
+    /// **deepest** depth recorded for any of them. Releasing down to a
+    /// shallower one would free storage still in scope at another candidate,
+    /// which is the one error a missing restore cannot cause.
+    AnyAddressTaken,
+}
+
 /// A forward `goto` whose VLA restore is decided once its label is placed.
 ///
 /// `marks` is the mark stack as it stood at the jump, so the restore can name
 /// whichever scope the label turns out to sit in: `marks[label_depth]` is the
 /// stack pointer captured on entry to the outermost scope the jump leaves.
 pub(crate) struct PendingGotoVla {
-    /// The label jumped to.
-    pub(crate) label: String,
+    /// Where the jump goes.
+    pub(crate) target: GotoTarget,
     /// The block the branch was emitted into.
     pub(crate) bb: BasicBlockId,
     /// Where in that block the branch sits; the restore goes just before it.
@@ -260,6 +294,7 @@ pub(crate) struct PendingGotoVla {
     pub(crate) marks: Vec<PseudoId>,
 }
 
+/// Linearizer context for converting AST to IR
 pub struct Linearizer<'a> {
     /// The module being built
     pub(crate) module: Module,
@@ -344,7 +379,11 @@ pub struct Linearizer<'a> {
     ///
     /// Only labels in a function that declares a VLA appear here, so nothing
     /// is recorded for the ordinary case.
-    pub(crate) label_vla_depth: std::collections::HashMap<String, usize>,
+    ///
+    /// Keyed by the label's block rather than its name: a computed `goto`
+    /// knows its candidates only as the blocks in `addr_taken_labels`, and
+    /// one map serves both it and the named jumps.
+    pub(crate) label_vla_depth: std::collections::HashMap<BasicBlockId, usize>,
     /// Forward `goto`s that may be leaving a VLA's scope, to be resolved once
     /// every label's depth is known.
     ///
@@ -490,14 +529,28 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// Push a new local scope. Subsequent `insert_local` calls will record
+    /// Enter a declaration scope. Subsequent `insert_local` calls will record
     /// the previous value so `pop_scope` can restore it.
-    pub(crate) fn push_scope(&mut self) {
+    ///
+    /// Entering a declaration scope *is* entering a VLA scope: the returned
+    /// [`Scope`] remembers the mark depth so `pop_scope` releases whatever
+    /// the scope allocated. See [`Scope`] for why the two are one operation.
+    pub(crate) fn push_scope(&mut self) -> Scope {
         self.local_scope_stack.push(Vec::new());
+        Scope {
+            vla_entry: self.vla_marks.len(),
+        }
     }
 
-    /// Pop the current local scope, restoring all locals to their pre-scope values.
-    pub(crate) fn pop_scope(&mut self) {
+    /// Leave the scope `scope` opened: release the VLAs declared in it and
+    /// restore every local it shadowed.
+    ///
+    /// The stack restore comes first, while the block the scope ends in is
+    /// still the current one, and is emitted only on the falling-out path --
+    /// a `break`, `continue`, `goto` or `return` that left already did its
+    /// own unwinding and terminated the block.
+    pub(crate) fn pop_scope(&mut self, scope: Scope) {
+        self.close_vla_scope(&scope);
         if let Some(entries) = self.local_scope_stack.pop() {
             for (sym, prev) in entries.into_iter().rev() {
                 match prev {
@@ -1299,14 +1352,20 @@ impl<'a> Linearizer<'a> {
     ///
     /// `static_locals` is deliberately not cleared: it persists across
     /// functions.
-    fn reset_for_function(&mut self, func: &FunctionDef) {
+    ///
+    /// Returns the function-level [`Scope`], which `linearize_function` gives
+    /// back once the body is lowered. Nothing is released there -- the
+    /// epilogue restores `%rsp` from the frame pointer, and the body's own
+    /// block scope has already dropped every mark -- but it is entered the
+    /// same way as any other scope so that no site can enter one without the
+    /// other.
+    fn reset_for_function(&mut self, func: &FunctionDef) -> Scope {
         // Reset per-function state
         self.next_pseudo = 0;
         self.next_bb = 0;
         self.var_map.clear();
         self.locals.clear();
         self.local_scope_stack.clear();
-        self.push_scope(); // function-level scope
         self.label_map.clear();
         self.break_targets.clear();
         self.continue_targets.clear();
@@ -1324,6 +1383,10 @@ impl<'a> Linearizer<'a> {
         // Remove from extern_symbols since we're defining this function
         self.module.extern_symbols.remove(&self.current_func_name);
         // Note: static_locals is NOT cleared - it persists across functions
+
+        // After `vla_marks.clear()`: the scope records the depth it starts
+        // at, which for the function scope has to be zero.
+        self.push_scope()
     }
 
     /// Whether a function body declares anything variably modified.
@@ -1378,7 +1441,7 @@ impl<'a> Linearizer<'a> {
         // expression to the same rule.
         let written_labels = self.check_jumps_into_protected_scopes(&func.body);
 
-        self.reset_for_function(func);
+        let func_scope = self.reset_for_function(func);
         self.written_labels = written_labels;
 
         // Create function - use storage class from FunctionDef
@@ -1767,8 +1830,11 @@ impl<'a> Linearizer<'a> {
             }
         }
 
-        // Pop function-level scope
-        self.pop_scope();
+        // Pop function-level scope. Its VLA release is a no-op: the body's
+        // own block scope dropped every mark, and the block is terminated by
+        // the return above -- which is what must happen, since SSA has
+        // already run over the function by this point.
+        self.pop_scope(func_scope);
 
         // Add function to module
         if let Some(ir_func) = self.current_func.take() {
@@ -6622,6 +6688,12 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::StmtExpr { stmts, result } => {
                 // GNU statement expression: ({ stmt; stmt; expr; })
+                // It is a block, so it is a declaration scope like any other:
+                // its declarations do not outlive it, and the storage of a
+                // VLA declared in it goes back when it ends. Without the
+                // scope, `for (...) (void)({ int a[n]; ... });` allocated
+                // every time round and released nothing.
+                let scope = self.push_scope();
                 // Linearize all the statements first
                 for item in stmts {
                     match item {
@@ -6629,8 +6701,11 @@ impl<'a> Linearizer<'a> {
                         BlockItem::Statement(s) => self.linearize_stmt(s),
                     }
                 }
-                // The result is the value of the final expression
-                self.linearize_expr(result)
+                // The result is the value of the final expression, computed
+                // before the scope ends: it may read the VLA being released.
+                let value = self.linearize_expr(result);
+                self.pop_scope(scope);
+                value
             }
 
             ExprKind::BuiltinComplex { real, imag } => {

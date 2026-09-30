@@ -9642,3 +9642,254 @@ fn conditional_lowerings_keep_the_cfg_consistent() {
         }
     }
 }
+
+// VLA scope exit
+
+/// Every `stacksave` a function emits is matched by a `stackrestore` on each
+/// path that leaves the scope it opened.
+///
+/// A VLA's storage is released by restoring the stack pointer the scope saved,
+/// so the two have to balance -- and on *every* exit, which for an `asm goto`
+/// means one per edge. The declaration scope and the VLA scope are tracked
+/// separately, and the second was opened at only three of the places that open
+/// the first, so a VLA declared in a `for`-init clause or a statement
+/// expression was never released.
+///
+/// The consequence is currently masked: c17 always keeps a frame pointer
+/// (`-fomit-frame-pointer` is accepted and ignored) and the backend resets
+/// `%rsp` from it, so no program leaks stack today. That masking is a frame
+/// choice rather than a guarantee, and the imbalance also poisons the forward
+/// `goto` machinery, which reads `vla_marks.len()` as a depth -- an unclosed
+/// scope makes every later label's recorded depth too high and the restore is
+/// skipped. This is stated on the IR because that is where it is true.
+#[test]
+fn a_vla_scope_releases_the_stack_on_every_exit() {
+    let target = Target::host();
+
+    let counts = |src: &str| -> (usize, usize) {
+        let module = linearize_source(src, &target);
+        let func = module
+            .functions
+            .iter()
+            .find(|f| f.name == "f")
+            .expect("function f");
+        let n = |op| {
+            func.blocks
+                .iter()
+                .flat_map(|b| b.insns.iter())
+                .filter(|i| i.op == op)
+                .count()
+        };
+        (n(Opcode::StackSave), n(Opcode::StackRestore))
+    };
+
+    // (tag, source, expected saves, expected restores)
+    let cases: &[(&str, &str, usize, usize)] = &[
+        // The control: a plain block already balances.
+        (
+            "block",
+            "void s(int*); int f(int n){ for(int k=0;k<3;k++){ int a[n]; a[0]=k; s(a); } return 0; }",
+            1,
+            1,
+        ),
+        // A `for`-init clause is a declaration scope like any other.
+        (
+            "for_init",
+            "void s(int*); int f(int n){ for(int k=0;k<3;k++) for(int a[n];0;){ s(a); } return 0; }",
+            1,
+            1,
+        ),
+        // The switch-body walker carries a second copy of the `for` lowering.
+        (
+            "for_init_in_switch",
+            "void s(int*); int f(int n,int x){ switch(x){ case 1: \
+             for(int k=0;k<3;k++) for(int a[n];0;){ s(a); } return 0; } return 1; }",
+            1,
+            1,
+        ),
+        // A statement expression is a sixth scope entry.
+        (
+            "stmt_expr",
+            "void s(int*); int f(int n){ for(int k=0;k<3;k++) \
+             (void)({ int a[n]; a[0]=k; s(a); 0; }); return 0; }",
+            1,
+            1,
+        ),
+        // Leaving the scope by `break` unwinds it.
+        (
+            "break_out_of_for_init",
+            "void s(int*); int f(int n){ for(int k=0;k<3;k++) \
+             for(int a[n];;){ a[0]=k; s(a); break; } return 0; }",
+            1,
+            1,
+        ),
+        // And by a forward `goto`, which is also what the depth bookkeeping
+        // needs to stay right for every label after it.
+        (
+            "goto_out_of_for_init",
+            "void s(int*); int f(int n){ for(int k=0;k<3;k++) \
+             for(int a[n];;){ a[0]=k; s(a); goto L; } L: return 0; }",
+            1,
+            1,
+        ),
+        // A computed `goto` leaves a scope exactly as a plain one does.
+        (
+            "computed_goto",
+            "void s(int*); int f(int n){ void*p=&&L; for(int k=0;k<3;k++){ int a[n]; \
+             a[0]=k; s(a); goto *p; } L: return 0; }",
+            1,
+            1,
+        ),
+        // `asm goto` has two exits, so it needs a restore on each: the
+        // fall-through and the label edge. One restore here means the jump
+        // leaves the scope without releasing it.
+        (
+            "asm_goto",
+            "void s(int*); int f(int n){ for(int k=0;k<3;k++){ int a[n]; a[0]=k; s(a); \
+             __asm__ goto(\"\" :::: L); } L: return 0; }",
+            1,
+            2,
+        ),
+    ];
+
+    for (tag, src, want_save, want_restore) in cases {
+        let (saves, restores) = counts(src);
+        assert_eq!(
+            (saves, restores),
+            (*want_save, *want_restore),
+            "{tag}: expected {want_save} stacksave / {want_restore} stackrestore, \
+             got {saves} / {restores}\nsource: {src}"
+        );
+    }
+}
+
+/// The counts of `stacksave`/`stackrestore` in `f`, for the VLA scope tests.
+fn vla_stack_ops(src: &str) -> (usize, usize) {
+    let target = Target::host();
+    let module = linearize_source(src, &target);
+    let func = module
+        .functions
+        .iter()
+        .find(|f| f.name == "f")
+        .expect("function f");
+    let n = |op| {
+        func.blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .filter(|i| i.op == op)
+            .count()
+    };
+    (n(Opcode::StackSave), n(Opcode::StackRestore))
+}
+
+/// Entering a declaration scope and entering a VLA scope are one operation,
+/// so nesting the first nests the second: each scope releases exactly what
+/// was allocated after it was entered, innermost first.
+#[test]
+fn nested_scopes_each_release_only_their_own_vlas() {
+    let src = "void s(int*); int f(int n){ for(int k=0;k<2;k++){ int a[n]; \
+               { int b[n]; s(b); } s(a); } return 0; }";
+    assert_eq!(
+        vla_stack_ops(src),
+        (2, 2),
+        "each of the two scopes captures and releases once"
+    );
+
+    // And in the right order: the inner scope puts the stack back to what it
+    // captured on entry, then the outer one to what *it* captured. Restoring
+    // the outer mark first would free the inner array while it is still in
+    // scope.
+    let target = Target::host();
+    let module = linearize_source(src, &target);
+    let func = module
+        .functions
+        .iter()
+        .find(|f| f.name == "f")
+        .expect("function f");
+    let mut saves = Vec::new();
+    let mut restores = Vec::new();
+    for insn in func.blocks.iter().flat_map(|b| b.insns.iter()) {
+        match insn.op {
+            Opcode::StackSave => saves.push(insn.target.expect("stacksave target")),
+            Opcode::StackRestore => restores.push(insn.src[0]),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        restores,
+        vec![saves[1], saves[0]],
+        "scopes must be released innermost first"
+    );
+}
+
+/// A VLA declared in a `for` init clause is allocated once, ahead of the
+/// loop, and its scope *encloses* the loop's exit -- so neither `break` nor
+/// `continue` may release it. `continue` especially: the storage is live on
+/// the next iteration, and freeing it there would hand the loop a dangling
+/// array. Only the loop's own scope, which ends after the exit block, puts
+/// the stack back.
+///
+/// This is what fixes the order in which [`Linearizer::push_vla_mark`] reads
+/// the break and continue depths: before the loop pushes its targets, so
+/// `unwind_vla_marks` sees the mark as taken *outside* the construct being
+/// left and leaves it alone.
+#[test]
+fn a_for_init_vla_outlives_break_and_continue() {
+    assert_eq!(
+        vla_stack_ops(
+            "void s(int*); int f(int n,int x){ for(int a[n];x;){ s(a); \
+             if(x==1) continue; if(x==2) break; } return 0; }"
+        ),
+        (1, 1),
+        "the loop's scope is the only release; break and continue land inside it"
+    );
+}
+
+/// The mirror image: a VLA declared in the loop *body* is allocated afresh
+/// every iteration, so every way out of the body has to release it -- the
+/// fall-through through the body scope's end, and the `break` that jumps
+/// past it.
+#[test]
+fn a_loop_body_vla_is_released_on_break_as_well_as_fallthrough() {
+    assert_eq!(
+        vla_stack_ops(
+            "void s(int*); int f(int n,int x){ for(;x;){ int a[n]; s(a); \
+             if(x==2) break; } return 0; }"
+        ),
+        (1, 2),
+        "one release on the break edge, one on the way out of the body"
+    );
+}
+
+/// A `switch` body is lowered by a walk of its own, and its braces are a
+/// declaration scope there too: a VLA declared directly in it is released
+/// when the switch ends, not left for the enclosing loop to accumulate.
+#[test]
+fn a_switch_body_block_is_a_scope() {
+    assert_eq!(
+        vla_stack_ops(
+            "void s(int*); int f(int n,int x){ for(int k=0;k<2;k++) \
+             switch(x){ default: { int a[n]; s(a); } } return 0; }"
+        ),
+        (1, 1),
+        "the switch body's block releases what it declared"
+    );
+}
+
+/// A backward `goto` to a label ahead of a VLA declaration leaves that
+/// declaration's scope, so it restores the stack as it stood at the label --
+/// otherwise the loop the jump makes grows the stack every time round. The
+/// label's depth is recorded per block, which is also what lets a computed
+/// `goto` ask the same question of every candidate at once.
+#[test]
+fn a_backward_goto_past_a_vla_declaration_releases_it() {
+    assert_eq!(
+        vla_stack_ops(
+            "void s(int*); int f(int n,int x){ lab: { int a[n]; s(a); \
+             if(x--) goto lab; } return 0; }"
+        ),
+        (1, 2),
+        "the jump back to `lab` puts the stack where the label found it, and \
+         the path that falls out of the block releases it too"
+    );
+}

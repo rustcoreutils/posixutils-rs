@@ -2781,3 +2781,121 @@ int main(void)
         0
     );
 }
+
+/// A later designated initializer replaces the subobject it names, not every
+/// object whose bytes it touches.
+///
+/// C17 6.7.9p19: an initializer for a subobject overrides any previously
+/// listed initializer *for that subobject*, and initializers for other
+/// subobjects are unaffected. The static path merged its field initializers by
+/// byte span and dropped an earlier entry whole on any intersection, so
+/// `.t = {1,2}` followed by `.t.y = 9` lost the `1` as well as the `2` -- while
+/// the automatic path, which just stores in order and lets the later store land
+/// on the earlier one, kept it. The two disagreed on the same initializer.
+///
+/// Every case here is checked in both storage durations, against the values
+/// gcc and clang produce.
+#[test]
+fn c99_a_designated_override_replaces_only_the_subobject_it_names() {
+    let code = r#"
+struct T { int x, y; };
+struct S { struct T t; int z; };
+struct A { int a[3]; int z; };
+
+struct S g1 = { .t = {1, 2}, .t.y = 9, .z = 7 };
+struct A g2 = { .a = {1, 2, 3}, .a[1] = 9, .z = 7 };
+
+int main(void)
+{
+    struct S l1 = { .t = {1, 2}, .t.y = 9, .z = 7 };
+    struct A l2 = { .a = {1, 2, 3}, .a[1] = 9, .z = 7 };
+
+    /* The override names .t.y, so .t.x keeps the 1 it was given. */
+    if (g1.t.x != 1 || g1.t.y != 9 || g1.z != 7) return 1;
+    if (l1.t.x != 1 || l1.t.y != 9 || l1.z != 7) return 2;
+
+    /* The same one level down: only element 1 is replaced. */
+    if (g2.a[0] != 1 || g2.a[1] != 9 || g2.a[2] != 3 || g2.z != 7) return 3;
+    if (l2.a[0] != 1 || l2.a[1] != 9 || l2.a[2] != 3 || l2.z != 7) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("designated_partial_override", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("designated_partial_override_opt", code),
+        0
+    );
+}
+
+/// "Later wins" means later in the initializer list, not later in the object.
+///
+/// The static path sorted its field initializers by address before resolving
+/// overlaps, so the rule was applied in the wrong order entirely: in
+/// `{ .z = 7, .t.y = 9, .t = {1,2} }` the `.t = {1,2}` is written last and must
+/// win, but after sorting it sat before `.t.y` and was the entry dropped.
+#[test]
+fn c99_a_designated_override_is_resolved_in_source_order() {
+    let code = r#"
+struct T { int x, y; };
+struct S { struct T t; int z; };
+
+/* The whole-field initializer comes last and wins, even though it names a
+   lower address than the override before it. */
+struct S g = { .z = 7, .t.y = 9, .t = {1, 2} };
+
+/* And the other order, where the narrower one wins. */
+struct S h = { .t = {1, 2}, .z = 7, .t.y = 9 };
+
+int main(void)
+{
+    struct S lg = { .z = 7, .t.y = 9, .t = {1, 2} };
+    struct S lh = { .t = {1, 2}, .z = 7, .t.y = 9 };
+
+    if (g.t.x != 1 || g.t.y != 2 || g.z != 7) return 1;
+    if (lg.t.x != 1 || lg.t.y != 2 || lg.z != 7) return 2;
+    if (h.t.x != 1 || h.t.y != 9 || h.z != 7) return 3;
+    if (lh.t.x != 1 || lh.t.y != 9 || lh.z != 7) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("designated_source_order", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("designated_source_order_opt", code),
+        0
+    );
+}
+
+/// Initializing a second member of a union resets it; it does not overlay the
+/// first.
+///
+/// This is the case where the two paths disagree the other way round. A union
+/// holds one member at a time, so `{ .u.i = 0x01020304, .u.s.b = 9 }` leaves
+/// the union holding `.u.s` with only `b` given a value and the rest zero --
+/// which is what the static path produced and what gcc and clang produce. The
+/// automatic path stored the `int` and then stored one byte over it, keeping
+/// the other three, so it read back `0x01020904`.
+///
+/// It is here as a guard on the fix above: making the static path store in
+/// source order the way the automatic path does would adopt this bug, so the
+/// merge has to keep the union case distinct from the struct and array cases.
+#[test]
+fn c99_initializing_a_second_union_member_resets_the_union() {
+    let code = r#"
+struct U { union { int i; struct { char a, b, c, d; } s; } u; };
+struct U g = { .u.i = 0x01020304, .u.s.b = 9 };
+
+int main(void)
+{
+    struct U l = { .u.i = 0x01020304, .u.s.b = 9 };
+    if (g.u.i != 0x900) return 1;
+    if (l.u.i != 0x900) return 2;
+    if (g.u.s.a != 0 || g.u.s.b != 9 || g.u.s.c != 0 || g.u.s.d != 0) return 3;
+    if (l.u.s.a != 0 || l.u.s.b != 9 || l.u.s.c != 0 || l.u.s.d != 0) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("union_member_reset", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("union_member_reset_opt", code), 0);
+}

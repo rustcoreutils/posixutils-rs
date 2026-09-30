@@ -1095,6 +1095,349 @@ impl<'a> super::linearize::Linearizer<'a> {
         visits
     }
 
+    /// Where the byte range `offset..offset + size` sits inside an object of
+    /// type `typ`, with `offset` measured from that object's first byte.
+    ///
+    /// Two initializers in one list can describe overlapping storage, and
+    /// C17 6.7.9p19 resolves that by *subobject*, not by bytes: given
+    /// `{ .t = {1, 2}, .t.y = 9 }` the second names a member of the first and
+    /// replaces only it, while given `{ .u.i = 1, .u.s.b = 9 }` the second
+    /// names a different member of a union and so replaces the whole of what
+    /// the first wrote. The spans are identical in shape -- one inside the
+    /// other -- so only the type can tell the two cases apart.
+    pub(crate) fn classify_subobject(
+        &self,
+        typ: TypeId,
+        offset: usize,
+        size: usize,
+    ) -> SubobjectPlace {
+        let mut typ = self.resolve_struct_type(typ);
+        let mut base = 0usize;
+
+        loop {
+            let type_size = self.types.size_bytes(typ);
+            if offset == base && size == type_size {
+                return SubobjectPlace::Member;
+            }
+            if size == 0 || offset < base || offset + size > base + type_size {
+                return SubobjectPlace::NotASubobject;
+            }
+
+            match self.types.kind(typ) {
+                // Reached a union without having named it exactly, so the
+                // range lies inside one of its members. Which member is not
+                // decidable from the span -- every member starts at the same
+                // byte -- and it does not matter: whichever it is, giving it
+                // an initializer discards the member the union held before.
+                TypeKind::Union => {
+                    return SubobjectPlace::ThroughUnion {
+                        offset: base,
+                        size: type_size,
+                    };
+                }
+                TypeKind::Struct => {
+                    let Some(composite) = self.types.get(typ).composite.as_ref() else {
+                        return SubobjectPlace::NotASubobject;
+                    };
+                    // A bit-field is not addressable storage of its own, so a
+                    // range inside its carrier is not a subobject.
+                    let found = composite.members.iter().find(|member| {
+                        member.bit_width.is_none() && {
+                            let member_start = base + member.offset;
+                            let member_end = member_start + self.types.size_bytes(member.typ);
+                            offset >= member_start && offset + size <= member_end
+                        }
+                    });
+                    let Some(member) = found else {
+                        return SubobjectPlace::NotASubobject;
+                    };
+                    base += member.offset;
+                    typ = self.resolve_struct_type(member.typ);
+                }
+                TypeKind::Array => {
+                    let Some(elem_type) = self.types.base_type(typ) else {
+                        return SubobjectPlace::NotASubobject;
+                    };
+                    let elem_size = self.types.size_bytes(elem_type);
+                    if elem_size == 0 {
+                        return SubobjectPlace::NotASubobject;
+                    }
+                    let elem_start = base + ((offset - base) / elem_size) * elem_size;
+                    if offset + size > elem_start + elem_size {
+                        return SubobjectPlace::NotASubobject;
+                    }
+                    base = elem_start;
+                    typ = self.resolve_struct_type(elem_type);
+                }
+                // A scalar with something strictly inside it: only a union or
+                // a bit-field carrier can produce that, and neither is a
+                // subobject relation.
+                _ => return SubobjectPlace::NotASubobject,
+            }
+        }
+    }
+
+    /// An initializer that writes nothing, shaped for `typ` so that
+    /// [`Self::overlay_subobject`] can place entries into it.
+    fn empty_aggregate_init(&self, typ: TypeId) -> Option<Initializer> {
+        match self.types.kind(typ) {
+            TypeKind::Struct | TypeKind::Union => Some(Initializer::Struct {
+                total_size: self.types.size_bytes(typ),
+                fields: Vec::new(),
+            }),
+            TypeKind::Array => {
+                let elem_type = self.types.base_type(typ)?;
+                Some(Initializer::Array {
+                    elem_size: self.types.size_bytes(elem_type),
+                    total_size: self.types.size_bytes(typ),
+                    elements: Vec::new(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Fold `new_init` into `init`, the initializer for an object of type
+    /// `typ`, so that it initializes the subobject at `offset..offset + size`
+    /// and leaves every other subobject as it was.
+    ///
+    /// The caller has already established with [`Self::classify_subobject`]
+    /// that the range *is* such a subobject. Returns false when the existing
+    /// initializer's shape cannot express the replacement -- a string literal
+    /// standing for a character array, say -- in which case the caller falls
+    /// back to discarding the earlier initializer whole.
+    pub(crate) fn overlay_subobject(
+        &self,
+        typ: TypeId,
+        init: &mut Initializer,
+        offset: usize,
+        size: usize,
+        new_init: &Initializer,
+    ) -> bool {
+        let typ = self.resolve_struct_type(typ);
+        if offset == 0 && size == self.types.size_bytes(typ) {
+            *init = new_init.clone();
+            return true;
+        }
+
+        match self.types.kind(typ) {
+            TypeKind::Struct | TypeKind::Union => {
+                let Some(composite) = self.types.get(typ).composite.as_ref() else {
+                    return false;
+                };
+                let found = composite
+                    .members
+                    .iter()
+                    .find(|member| {
+                        member.bit_width.is_none() && {
+                            let member_end = member.offset + self.types.size_bytes(member.typ);
+                            offset >= member.offset && offset + size <= member_end
+                        }
+                    })
+                    .map(|member| (member.offset, member.typ));
+                let Some((member_offset, member_type)) = found else {
+                    return false;
+                };
+                let member_size = self.types.size_bytes(member_type);
+                let Initializer::Struct { fields, .. } = init else {
+                    return false;
+                };
+                self.overlay_into_entries(
+                    fields,
+                    member_offset,
+                    member_size,
+                    member_type,
+                    offset,
+                    size,
+                    new_init,
+                )
+            }
+            TypeKind::Array => {
+                let Some(elem_type) = self.types.base_type(typ) else {
+                    return false;
+                };
+                let elem_size = self.types.size_bytes(elem_type);
+                if elem_size == 0 {
+                    return false;
+                }
+                let elem_offset = (offset / elem_size) * elem_size;
+                if offset + size > elem_offset + elem_size {
+                    return false;
+                }
+                let Initializer::Array { elements, .. } = init else {
+                    return false;
+                };
+                // An array's entries carry no width, so borrow the struct
+                // path's bookkeeping by giving each one the element width it
+                // implicitly has.
+                let mut entries: Vec<(usize, usize, Initializer)> = elements
+                    .iter()
+                    .map(|(off, init)| (*off, elem_size, init.clone()))
+                    .collect();
+                if !self.overlay_into_entries(
+                    &mut entries,
+                    elem_offset,
+                    elem_size,
+                    elem_type,
+                    offset,
+                    size,
+                    new_init,
+                ) {
+                    return false;
+                }
+                *elements = entries
+                    .into_iter()
+                    .map(|(off, _, init)| (off, init))
+                    .collect();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Place `new_init` for the subobject at `offset..offset + size`, which
+    /// lies within the member or element at `slot_offset` of `slot_size`
+    /// bytes, into an entry list that holds one entry per initialized member.
+    #[allow(clippy::too_many_arguments)]
+    fn overlay_into_entries(
+        &self,
+        entries: &mut Vec<(usize, usize, Initializer)>,
+        slot_offset: usize,
+        slot_size: usize,
+        slot_type: TypeId,
+        offset: usize,
+        size: usize,
+        new_init: &Initializer,
+    ) -> bool {
+        let slot_end = slot_offset + slot_size;
+        let existing = entries
+            .iter()
+            .position(|(off, sz, _)| *off < slot_end && slot_offset < *off + *sz);
+
+        if let Some(idx) = existing {
+            let (entry_offset, entry_size, entry_init) = &mut entries[idx];
+            // Anything but a whole entry for exactly this member -- a
+            // bit-field carrier byte, or an entry spanning several members --
+            // is not something this can descend into.
+            if (*entry_offset, *entry_size) != (slot_offset, slot_size) {
+                return false;
+            }
+            return self.overlay_subobject(
+                slot_type,
+                entry_init,
+                offset - slot_offset,
+                size,
+                new_init,
+            );
+        }
+
+        // The member had no initializer of its own: give it one that writes
+        // zeros everywhere but the subobject being replaced.
+        let fresh = if (offset, size) == (slot_offset, slot_size) {
+            new_init.clone()
+        } else {
+            let Some(mut fresh) = self.empty_aggregate_init(slot_type) else {
+                return false;
+            };
+            if !self.overlay_subobject(slot_type, &mut fresh, offset - slot_offset, size, new_init)
+            {
+                return false;
+            }
+            fresh
+        };
+        entries.push((slot_offset, slot_size, fresh));
+        entries.sort_by_key(|(off, _, _)| *off);
+        true
+    }
+
+    /// Apply C17 6.7.9p19 to the initializers one struct or union
+    /// initializer list produced, in the order the list wrote them.
+    ///
+    /// An initializer for a subobject overrides any previously listed
+    /// initializer *for that subobject*, and leaves initializers for other
+    /// subobjects alone. So a later entry is folded into an earlier one it is
+    /// a member of, replaces an earlier one it contains, and -- when the two
+    /// are related only through a union or a bit-field carrier, where no
+    /// structural fold exists -- discards it.
+    ///
+    /// "Later" means later in the list. The entries arrive in that order and
+    /// the sort into address order, which the emitter needs, runs afterwards.
+    pub(crate) fn merge_raw_field_inits(&self, raw: Vec<RawFieldInit>) -> Vec<RawFieldInit> {
+        let mut merged: Vec<RawFieldInit> = Vec::with_capacity(raw.len());
+
+        for later in raw {
+            let later_span = later.byte_span();
+            let mut folded = false;
+            let mut idx = 0;
+
+            while idx < merged.len() {
+                let earlier = &merged[idx];
+                let earlier_span = earlier.byte_span();
+                if earlier_span.start >= later_span.end || later_span.start >= earlier_span.end {
+                    idx += 1;
+                    continue;
+                }
+                // Two *distinct* bit-fields are different objects even when
+                // they share a carrier byte, so both survive.
+                if earlier.bit_width.is_some()
+                    && later.bit_width.is_some()
+                    && (earlier.offset, earlier.bit_offset) != (later.offset, later.bit_offset)
+                {
+                    idx += 1;
+                    continue;
+                }
+                if later_span.start <= earlier_span.start && earlier_span.end <= later_span.end {
+                    merged.remove(idx);
+                    continue;
+                }
+                let foldable = !folded
+                    && earlier.bit_width.is_none()
+                    && later.bit_width.is_none()
+                    && earlier_span.start <= later_span.start
+                    && later_span.end <= earlier_span.end
+                    && self.fold_field_init(&mut merged[idx], &later);
+                if foldable {
+                    folded = true;
+                    idx += 1;
+                    continue;
+                }
+                merged.remove(idx);
+            }
+
+            if !folded {
+                merged.push(later);
+            }
+        }
+
+        merged
+    }
+
+    /// Fold `later`, whose bytes lie inside `earlier`'s, into `earlier`.
+    /// Returns false when no structural fold exists, which leaves the caller
+    /// to discard `earlier`.
+    fn fold_field_init(&self, earlier: &mut RawFieldInit, later: &RawFieldInit) -> bool {
+        let inner_offset = later.offset - earlier.offset;
+        match self.classify_subobject(earlier.typ, inner_offset, later.field_size) {
+            SubobjectPlace::Member => self.overlay_subobject(
+                earlier.typ,
+                &mut earlier.init,
+                inner_offset,
+                later.field_size,
+                &later.init,
+            ),
+            // The union stops holding what it held: everything it contained
+            // goes, and it comes to hold just this one initializer.
+            SubobjectPlace::ThroughUnion { offset, size } => {
+                let replacement = Initializer::Struct {
+                    total_size: size,
+                    fields: vec![(inner_offset - offset, later.field_size, later.init.clone())],
+                };
+                self.overlay_subobject(earlier.typ, &mut earlier.init, offset, size, &replacement)
+            }
+            SubobjectPlace::NotASubobject => false,
+        }
+    }
+
     /// Convert an AST initializer list to an IR Initializer
     pub(crate) fn ast_init_list_to_ir(
         &mut self,
@@ -1204,39 +1547,25 @@ impl<'a> super::linearize::Linearizer<'a> {
                         raw_fields.push(RawFieldInit {
                             offset: visit.offset,
                             field_size: visit.field_size,
+                            typ: visit.typ,
                             init: field_init,
                             bit_offset: visit.bit_offset,
                             bit_width: visit.bit_width,
                         });
                     }
 
+                    // Initializing the same object twice: the later one wins
+                    // (C17 6.7.9p19), and one that names a *subobject* of an
+                    // earlier one replaces only that subobject. Resolved in
+                    // the order the list wrote them, before the sort below
+                    // reorders them by address.
+                    let mut raw_fields = self.merge_raw_field_inits(raw_fields);
+
                     // Sort by the bit each field starts at, so that designated
                     // initializers emit in address order however they were
                     // written -- the emitter fills the gaps between fields and
                     // so requires them sorted and non-overlapping.
                     raw_fields.sort_by_key(|f| f.offset * 8 + f.bit_offset.unwrap_or(0) as usize);
-
-                    // Initializing the same object twice: the later one wins
-                    // (C17 6.7.9p19). Two *distinct* bitfields are different
-                    // objects even when they share a byte, so both survive.
-                    let mut idx = 0;
-                    while idx + 1 < raw_fields.len() {
-                        let (a, b) = (&raw_fields[idx], &raw_fields[idx + 1]);
-                        let distinct_bitfields = a.bit_width.is_some()
-                            && b.bit_width.is_some()
-                            && (a.offset, a.bit_offset) != (b.offset, b.bit_offset);
-                        let a_span = a.byte_span();
-                        let b_span = b.byte_span();
-
-                        if !distinct_bitfields
-                            && a_span.start < b_span.end
-                            && b_span.start < a_span.end
-                        {
-                            raw_fields.remove(idx);
-                        } else {
-                            idx += 1;
-                        }
-                    }
 
                     // Merge bitfields byte by byte rather than one storage unit
                     // at a time. A unit is `sizeof(T)` wide and aligned, so it
@@ -1929,6 +2258,457 @@ mod tests {
                 .map(|(offset, init)| (*offset, init.clone()))
                 .collect::<Vec<_>>(),
             vec![(0, Initializer::Int(1)), (4, Initializer::Int(2))],
+        );
+    }
+
+    // Resolving two initializers that describe overlapping storage
+    // (C17 6.7.9p19).
+
+    /// Types for the override tests:
+    ///
+    /// ```c
+    /// struct T { int x, y; };
+    /// struct S { struct T t; int z; };
+    /// struct A { int a[3]; int z; };
+    /// struct W { union { int i; struct { char a, b, c, d; } s; } u; };
+    /// ```
+    struct OverrideTypes {
+        target: Target,
+        types: TypeTable,
+        strings: crate::strings::StringTable,
+        symbols: SymbolTable,
+        t: TypeId,
+        s: TypeId,
+        a: TypeId,
+        w: TypeId,
+        v: TypeId,
+        int_array: TypeId,
+    }
+
+    fn member(name: StringId, typ: TypeId, offset: usize) -> crate::types::StructMember {
+        crate::types::StructMember {
+            name,
+            typ,
+            offset,
+            bit_offset: None,
+            bit_width: None,
+            access_bytes: None,
+            explicit_align: None,
+        }
+    }
+
+    fn composite(
+        members: Vec<crate::types::StructMember>,
+        size: usize,
+        align: usize,
+    ) -> crate::types::CompositeType {
+        crate::types::CompositeType {
+            members,
+            size,
+            align,
+            member_align: align,
+            is_complete: true,
+            ..crate::types::CompositeType::incomplete(None)
+        }
+    }
+
+    impl OverrideTypes {
+        fn new() -> Self {
+            let target = Target::host();
+            let mut types = TypeTable::new(&target);
+            let mut strings = crate::strings::StringTable::new();
+            let name = |strings: &mut crate::strings::StringTable, s: &str| strings.intern(s);
+
+            let int = types.int_id;
+            let ch = types.char_id;
+
+            let (x, y) = (name(&mut strings, "x"), name(&mut strings, "y"));
+            let t = types.intern(Type::struct_type(composite(
+                vec![member(x, int, 0), member(y, int, 4)],
+                8,
+                4,
+            )));
+
+            let (t_name, z) = (name(&mut strings, "t"), name(&mut strings, "z"));
+            let s = types.intern(Type::struct_type(composite(
+                vec![member(t_name, t, 0), member(z, int, 8)],
+                12,
+                4,
+            )));
+
+            let int_array = types.intern(Type::array(int, 3));
+            let a_name = name(&mut strings, "a");
+            let a = types.intern(Type::struct_type(composite(
+                vec![member(a_name, int_array, 0), member(z, int, 12)],
+                16,
+                4,
+            )));
+
+            let (b, c, d) = (
+                name(&mut strings, "b"),
+                name(&mut strings, "c"),
+                name(&mut strings, "d"),
+            );
+            let chars = types.intern(Type::struct_type(composite(
+                vec![
+                    member(a_name, ch, 0),
+                    member(b, ch, 1),
+                    member(c, ch, 2),
+                    member(d, ch, 3),
+                ],
+                4,
+                1,
+            )));
+            let (i, s_name) = (name(&mut strings, "i"), name(&mut strings, "s"));
+            let union_u = types.intern(Type::union_type(composite(
+                vec![member(i, int, 0), member(s_name, chars, 0)],
+                4,
+                4,
+            )));
+            let u_name = name(&mut strings, "u");
+            let w = types.intern(Type::struct_type(composite(
+                vec![member(u_name, union_u, 0)],
+                4,
+                4,
+            )));
+
+            // `struct V { int k; union { int i; struct { char a, b, c, d; } s; } u; }`
+            // -- the union has a sibling, so resetting it must leave `k` be.
+            let k = name(&mut strings, "k");
+            let v = types.intern(Type::struct_type(composite(
+                vec![member(k, int, 0), member(u_name, union_u, 4)],
+                8,
+                4,
+            )));
+
+            Self {
+                target,
+                types,
+                strings,
+                symbols: SymbolTable::new(),
+                t,
+                s,
+                a,
+                w,
+                v,
+                int_array,
+            }
+        }
+
+        fn linearizer(&self) -> Linearizer<'_> {
+            Linearizer::new(&self.symbols, &self.types, &self.strings, &self.target)
+        }
+    }
+
+    /// One entry of a struct initializer list, as `walk_struct_init_fields`
+    /// hands it over: the subobject it names and the value for it.
+    fn raw(offset: usize, typ: TypeId, size: usize, init: Initializer) -> RawFieldInit {
+        RawFieldInit {
+            offset,
+            field_size: size,
+            typ,
+            init,
+            bit_offset: None,
+            bit_width: None,
+        }
+    }
+
+    fn struct_init(total_size: usize, fields: &[(usize, usize, i128)]) -> Initializer {
+        Initializer::Struct {
+            total_size,
+            fields: fields
+                .iter()
+                .map(|(off, size, value)| (*off, *size, Initializer::Int(*value)))
+                .collect(),
+        }
+    }
+
+    /// `(offset, size, initializer)` for each entry the merge kept, in the
+    /// order it kept them.
+    fn kept(merged: &[RawFieldInit]) -> Vec<(usize, usize, Initializer)> {
+        merged
+            .iter()
+            .map(|f| (f.offset, f.field_size, f.init.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_range_is_a_member_when_struct_members_and_array_elements_reach_it() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+
+        // The whole object, the member `t`, and `t.y` inside it.
+        assert_eq!(
+            lin.classify_subobject(fixture.s, 0, 12),
+            SubobjectPlace::Member
+        );
+        assert_eq!(
+            lin.classify_subobject(fixture.s, 0, 8),
+            SubobjectPlace::Member
+        );
+        assert_eq!(
+            lin.classify_subobject(fixture.s, 4, 4),
+            SubobjectPlace::Member
+        );
+        // `a[1]` of `struct A`.
+        assert_eq!(
+            lin.classify_subobject(fixture.a, 4, 4),
+            SubobjectPlace::Member
+        );
+        // The four bytes straddling `t.y` and `z` are no object at all.
+        assert_eq!(
+            lin.classify_subobject(fixture.s, 6, 4),
+            SubobjectPlace::NotASubobject
+        );
+    }
+
+    #[test]
+    fn a_range_inside_a_union_member_is_reached_through_the_union() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+
+        // `u.s.b` -- one byte, reached only by choosing a union member.
+        assert_eq!(
+            lin.classify_subobject(fixture.w, 1, 1),
+            SubobjectPlace::ThroughUnion { offset: 0, size: 4 }
+        );
+        // The union named exactly is an ordinary member of `struct W`.
+        assert_eq!(
+            lin.classify_subobject(fixture.w, 0, 4),
+            SubobjectPlace::Member
+        );
+    }
+
+    /// `struct S s = { .t = {1, 2}, .t.y = 9, .z = 7 };` -- the override
+    /// names `t.y`, so `t.x` keeps the 1 it was given.
+    #[test]
+    fn a_contained_override_replaces_only_the_subobject_it_names() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, fixture.t, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)])),
+            raw(4, int, 4, Initializer::Int(9)),
+            raw(8, int, 4, Initializer::Int(7)),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![
+                (0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 9)])),
+                (8, 4, Initializer::Int(7)),
+            ]
+        );
+    }
+
+    /// The same one level further down: `{ .a = {1,2,3}, .a[1] = 9 }` keeps
+    /// elements 0 and 2.
+    #[test]
+    fn a_contained_override_replaces_only_the_array_element_it_names() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let array = Initializer::Array {
+            elem_size: 4,
+            total_size: 12,
+            elements: vec![
+                (0, Initializer::Int(1)),
+                (4, Initializer::Int(2)),
+                (8, Initializer::Int(3)),
+            ],
+        };
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, fixture.int_array, 12, array),
+            raw(4, int, 4, Initializer::Int(9)),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![(
+                0,
+                12,
+                Initializer::Array {
+                    elem_size: 4,
+                    total_size: 12,
+                    elements: vec![
+                        (0, Initializer::Int(1)),
+                        (4, Initializer::Int(9)),
+                        (8, Initializer::Int(3)),
+                    ],
+                }
+            )]
+        );
+    }
+
+    /// An initializer for a whole subobject replaces every earlier one for a
+    /// part of it.
+    #[test]
+    fn a_containing_override_replaces_the_earlier_entry_whole() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(4, int, 4, Initializer::Int(9)),
+            raw(0, fixture.t, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)])),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![(0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)]))]
+        );
+    }
+
+    /// Initializers for different members stand side by side.
+    #[test]
+    fn disjoint_entries_are_all_kept() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, int, 4, Initializer::Int(1)),
+            raw(4, int, 4, Initializer::Int(2)),
+            raw(8, int, 4, Initializer::Int(7)),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![
+                (0, 4, Initializer::Int(1)),
+                (4, 4, Initializer::Int(2)),
+                (8, 4, Initializer::Int(7)),
+            ]
+        );
+    }
+
+    /// `{ .u.i = 0x01020304, .u.s.b = 9 }` -- a union holds one member at a
+    /// time, so naming a second discards what the first wrote rather than
+    /// overlaying it.
+    #[test]
+    fn initializing_a_second_union_member_discards_the_first() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let (int, ch) = (fixture.types.int_id, fixture.types.char_id);
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, int, 4, Initializer::Int(0x01020304)),
+            raw(1, ch, 1, Initializer::Int(9)),
+        ]);
+
+        assert_eq!(kept(&merged), vec![(1, 1, Initializer::Int(9))]);
+    }
+
+    /// An initializer for a whole struct, then one byte of a different member
+    /// of a union inside it: only that union is reset, and the struct's other
+    /// members keep what they were given.
+    ///
+    /// `struct V v = { .k = 5, .u.i = 0x01020304 }` followed by `.u.s.b = 9`.
+    #[test]
+    fn an_override_through_a_nested_union_resets_only_that_union() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let ch = fixture.types.char_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(
+                0,
+                fixture.v,
+                8,
+                struct_init(8, &[(0, 4, 5), (4, 4, 0x01020304)]),
+            ),
+            raw(5, ch, 1, Initializer::Int(9)),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![(
+                0,
+                8,
+                Initializer::Struct {
+                    total_size: 8,
+                    fields: vec![
+                        (0, 4, Initializer::Int(5)),
+                        (4, 4, struct_init(4, &[(1, 1, 9)])),
+                    ],
+                }
+            )]
+        );
+    }
+
+    /// A struct whose only member is a union is the union, byte for byte, so
+    /// resetting the union replaces the whole entry.
+    #[test]
+    fn an_override_through_a_union_filling_its_struct_replaces_the_entry() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let ch = fixture.types.char_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, fixture.w, 4, struct_init(4, &[(0, 4, 0x01020304)])),
+            raw(1, ch, 1, Initializer::Int(9)),
+        ]);
+
+        assert_eq!(kept(&merged), vec![(0, 4, struct_init(4, &[(1, 1, 9)]))]);
+    }
+
+    /// "Later wins" is later in the list, not at a higher address:
+    /// `{ .z = 7, .t.y = 9, .t = {1, 2} }` ends with `t` holding `{1, 2}`.
+    #[test]
+    fn the_override_rule_is_applied_in_source_order() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(8, int, 4, Initializer::Int(7)),
+            raw(4, int, 4, Initializer::Int(9)),
+            raw(0, fixture.t, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)])),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![
+                (8, 4, Initializer::Int(7)),
+                (0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)])),
+            ]
+        );
+
+        // And the other order, where the narrower one is written last.
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, fixture.t, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)])),
+            raw(8, int, 4, Initializer::Int(7)),
+            raw(4, int, 4, Initializer::Int(9)),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![
+                (0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 9)])),
+                (8, 4, Initializer::Int(7)),
+            ]
+        );
+    }
+
+    /// A member the earlier initializer left out gains an entry of its own
+    /// rather than costing the whole earlier initializer: `{ .t = {1}, .t.y
+    /// = 9 }` keeps `t.x`.
+    #[test]
+    fn an_override_of_an_uninitialized_member_is_added_to_the_earlier_entry() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, fixture.t, 8, struct_init(8, &[(0, 4, 1)])),
+            raw(4, int, 4, Initializer::Int(9)),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![(0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 9)]))]
         );
     }
 }

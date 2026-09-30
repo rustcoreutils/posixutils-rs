@@ -89,6 +89,39 @@ struct OpenFor {
     exit_bb: BasicBlockId,
 }
 
+/// One initializer from a struct or union initializer list that has already
+/// been stored into the object being initialized.
+///
+/// The automatic path emits a store per list entry and lets a later store land
+/// on an earlier one, which is all C17 6.7.9p19 needs *while* the later store
+/// covers every byte it supersedes. It does not when the later initializer
+/// fills only part of the subobject it names, and it does not when the two
+/// entries name different members of a union -- a union holds one member at a
+/// time, so the member left behind does not show through the new one. Both
+/// need the superseded bytes cleared, and deciding which bytes those are is
+/// what this records.
+struct WrittenInit {
+    /// The bytes it wrote that no later entry has since cleared.
+    live: std::ops::Range<usize>,
+    /// The first byte of the subobject it initialized, and that subobject's
+    /// type. Together they say whether a later entry names a member of this
+    /// one -- in which case the rest of this one survives -- or reaches its
+    /// bytes only by passing through a union.
+    origin: usize,
+    typ: TypeId,
+}
+
+/// Grow `reset` to also cover `range`.
+///
+/// Every range joined here overlaps the range of the entry being stored, so
+/// the union of them all is contiguous and one fill covers it.
+fn widen_reset(reset: &mut Option<std::ops::Range<usize>>, range: std::ops::Range<usize>) {
+    *reset = Some(match reset.take() {
+        Some(cur) => cur.start.min(range.start)..cur.end.max(range.end),
+        None => range,
+    });
+}
+
 impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_stmt(&mut self, stmt: &Stmt) {
         match stmt {
@@ -1084,7 +1117,22 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let visits =
                         self.walk_struct_init_fields(resolved_typ, &members, is_union, elements);
 
+                    // C17 6.7.9p19 resolves two initializers for overlapping
+                    // storage by subobject. Storing them in list order is
+                    // enough only where the later store covers every byte it
+                    // supersedes; where it does not, the bytes it leaves have
+                    // to be cleared first. See [`WrittenInit`].
+                    let mut written: Vec<WrittenInit> = Vec::new();
+
                     for visit in visits {
+                        if let Some(reset) = self.init_override_reset(&mut written, &visit) {
+                            self.emit_block_zero(
+                                base_sym,
+                                base_offset + reset.start as i64,
+                                (reset.end - reset.start) as i64,
+                            );
+                        }
+
                         let offset = base_offset + visit.offset as i64;
                         let field_type = visit.typ;
 
@@ -1152,6 +1200,92 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
         }
+    }
+
+    /// Record that `visit` is about to be stored, and answer which bytes of
+    /// the object must be cleared first for C17 6.7.9p19 to hold.
+    ///
+    /// Nothing at all, for the usual case where the entry overlaps none of
+    /// those already stored. Otherwise the entry's own bytes -- so that the
+    /// part of the subobject it does not fill reads as zero rather than as
+    /// the initializer it replaces -- together with the bytes of any earlier
+    /// entry it invalidates: all of one it wholly contains, all of one it is
+    /// not a subobject of, and, where it reaches an earlier entry's bytes only
+    /// by naming a member of a union inside it, that union's bytes.
+    fn init_override_reset(
+        &self,
+        written: &mut Vec<WrittenInit>,
+        visit: &StructFieldVisit,
+    ) -> Option<std::ops::Range<usize>> {
+        // A bit-field is stored by reading its carrier and writing it back, so
+        // its window is not storage it owns and clearing the window would
+        // blank the members sharing it. Bit-fields are left to overlay each
+        // other as they always have.
+        if visit.bit_width.is_some() || visit.field_size == 0 {
+            return None;
+        }
+
+        let span = visit.offset..visit.offset + visit.field_size;
+        let mut reset: Option<std::ops::Range<usize>> = None;
+
+        for entry in written.iter() {
+            if entry.live.start >= span.end || span.start >= entry.live.end {
+                continue;
+            }
+            widen_reset(&mut reset, span.clone());
+
+            // Wholly superseded: the entry's own bytes are all inside the
+            // ones being cleared and rewritten.
+            if span.start <= entry.live.start && entry.live.end <= span.end {
+                continue;
+            }
+
+            let entry_end = entry.origin + self.types.size_bytes(entry.typ);
+            let place = if span.start >= entry.origin && span.end <= entry_end {
+                self.classify_subobject(entry.typ, span.start - entry.origin, visit.field_size)
+            } else {
+                SubobjectPlace::NotASubobject
+            };
+            match place {
+                // A member of the earlier entry's object: the rest of that
+                // object is a different subobject and stands.
+                SubobjectPlace::Member => {}
+                SubobjectPlace::ThroughUnion { offset, size } => {
+                    widen_reset(
+                        &mut reset,
+                        entry.origin + offset..entry.origin + offset + size,
+                    );
+                }
+                SubobjectPlace::NotASubobject => {
+                    widen_reset(&mut reset, entry.live.clone());
+                }
+            }
+        }
+
+        if let Some((from, to)) = reset.as_ref().map(|range| (range.start, range.end)) {
+            // Whatever the fill covers is gone; the bytes an entry keeps on
+            // either side of it are still its own.
+            *written = written
+                .drain(..)
+                .flat_map(|entry| {
+                    let (origin, typ) = (entry.origin, entry.typ);
+                    [
+                        entry.live.start..entry.live.end.min(from),
+                        entry.live.start.max(to)..entry.live.end,
+                    ]
+                    .into_iter()
+                    .filter(|live| live.start < live.end)
+                    .map(move |live| WrittenInit { live, origin, typ })
+                })
+                .collect();
+        }
+
+        written.push(WrittenInit {
+            live: span,
+            origin: visit.offset,
+            typ: visit.typ,
+        });
+        reset
     }
 
     /// Store a complex value into `base_sym` at `offset`, as two halves.

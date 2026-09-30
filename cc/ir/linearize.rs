@@ -127,6 +127,14 @@ pub(crate) struct ResolvedDesignator {
 pub(crate) struct RawFieldInit {
     pub(crate) offset: usize,
     pub(crate) field_size: usize,
+    /// The type of the subobject this initializer names.
+    ///
+    /// Carried so that resolving two initializers that describe overlapping
+    /// storage can ask *how* they overlap: a later one naming a member of an
+    /// earlier one's struct or array replaces only that member, while one
+    /// reachable only through a union replaces the union's whole contents.
+    /// Byte spans alone cannot tell the two apart.
+    pub(crate) typ: TypeId,
     pub(crate) init: Initializer,
     pub(crate) bit_offset: Option<u32>,
     pub(crate) bit_width: Option<u32>,
@@ -149,6 +157,26 @@ impl RawFieldInit {
             _ => self.offset..self.offset + self.field_size,
         }
     }
+}
+
+/// How a byte range sits inside an object, as C17 6.7.9p19 needs to know it:
+/// an initializer for a subobject overrides the previous initializer for
+/// *that* subobject, and whether some other initializer survives depends on
+/// what lies between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubobjectPlace {
+    /// The range is a subobject reached through struct members and array
+    /// elements only (possibly the whole object). Initializing it leaves
+    /// every other subobject of the enclosing object untouched.
+    Member,
+    /// The range is reached only by descending into this union, whose bytes
+    /// span `offset..offset + size` of the enclosing object. A union holds one
+    /// member at a time, so initializing through it discards whatever the
+    /// union held before.
+    ThroughUnion { offset: usize, size: usize },
+    /// The range is not a subobject at all: it straddles two members, or it is
+    /// a bit-field carrier's window rather than a named object.
+    NotASubobject,
 }
 
 /// Result from member_index_for_designator indicating where positional

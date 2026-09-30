@@ -230,8 +230,8 @@ impl<'a> super::linearize::Linearizer<'a> {
 
                     if let Some(sret_ptr) = self.struct_return_ptr {
                         self.emit_sret_return(e, sret_ptr, func_ret_type);
-                    } else if let Some(ret_type) = self.two_reg_return_type {
-                        self.emit_two_reg_return(e, ret_type);
+                    } else if let Some(ret_type) = self.reg_aggregate_return_type {
+                        self.emit_reg_aggregate_return(e, ret_type);
                     } else if let Some(b) = self.complex_to_bool(e, func_ret_type) {
                         // Ahead of the complex arm below: that one keys off the
                         // *expression* being complex and returns its address,

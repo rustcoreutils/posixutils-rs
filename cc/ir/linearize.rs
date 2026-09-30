@@ -557,8 +557,9 @@ pub struct Linearizer<'a> {
     /// Hidden return pointer (for functions returning via sret: large
     /// aggregates, and complex types the ABI classifies MEMORY)
     pub(crate) struct_return_ptr: Option<PseudoId>,
-    /// Type of struct being returned via two registers (9-16 bytes, per ABI)
-    pub(crate) two_reg_return_type: Option<TypeId>,
+    /// The return type, when it is an aggregate the ABI returns in registers
+    /// and wider than one. See [`Self::returns_reg_aggregate`].
+    pub(crate) reg_aggregate_return_type: Option<TypeId>,
     /// Current function name (for generating unique static local names)
     pub(crate) current_func_name: String,
 
@@ -716,7 +717,7 @@ impl<'a> Linearizer<'a> {
             types,
             strings,
             struct_return_ptr: None,
-            two_reg_return_type: None,
+            reg_aggregate_return_type: None,
             current_func_name: String::new(),
             addr_taken_labels: Vec::new(),
             label_refs: Vec::new(),
@@ -1623,7 +1624,7 @@ impl<'a> Linearizer<'a> {
         self.break_targets.clear();
         self.continue_targets.clear();
         self.struct_return_ptr = None;
-        self.two_reg_return_type = None;
+        self.reg_aggregate_return_type = None;
         self.current_func_name = self.emitted_name(func.name);
         self.addr_taken_labels.clear();
         self.label_refs.clear();
@@ -1784,61 +1785,18 @@ impl<'a> Linearizer<'a> {
             self.struct_return_ptr = Some(sret_id);
         }
 
-        // Check if function returns a medium struct (9-16 bytes) via two registers
-        // This is the ABI-compliant way to return structs that fit in two GP registers
-        let struct_size_bits = self.types.size_bits(func.return_type);
-        let returns_reg_aggregate = (ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
-            && struct_size_bits > 64
-            && struct_size_bits <= 128
-            && !returns_large_struct; // Only if not using sret
-        if returns_reg_aggregate {
-            self.two_reg_return_type = Some(func.return_type);
+        if self.returns_reg_aggregate(func.return_type) {
+            self.reg_aggregate_return_type = Some(func.return_type);
         }
 
-        // A `Ret` that carries an address; a call's result slot holds the
-        // value. Whoever consumes that return has to read the bytes out of the
-        // storage it names, and the inliner has to know which of the two it is
-        // splicing. `aggregate_ret_is_address` is the one place that answers
-        // it -- the same function `emit_two_reg_return` asks before emitting
-        // the address form, so the shape and the question about the shape
-        // cannot drift apart. They had: spelled out a second time here as
-        // "x87 or HFA", this missed a sixteen-byte aggregate returned in one
-        // SSE register, and before that it was gated behind the
-        // *two-register* path's 128-bit cap, which missed every HFA past
-        // sixteen bytes -- four `double`s is thirty-two bytes and still comes
-        // back in d0-d3.
-        //
-        // Classified only for an aggregate that is not going through the
-        // hidden pointer, which is the only shape the question is about.
-        let ret_class = ((ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
-            && !returns_large_struct)
-            .then(|| {
-                get_abi_for_conv(self.current_calling_conv, self.target)
-                    .classify_return(func.return_type, self.types)
-            });
-        // Which of those the inliner is kept away from -- a narrower question
-        // than the shape, and no longer the same one. `clone_instruction`'s
-        // `Ret` arm now copies an aggregate handed back by address into the
-        // call's result local, which is where a call leaves it, so the
-        // one-SSE-register shape is spliced correctly instead of refused.
-        //
-        // An x87 aggregate and an HFA travel by address for the same reason
-        // and that copy would move them just as well, but they are not ready
-        // to be let through: the copy reads the `Ret`'s own ABI
-        // classification, and only `emit_two_reg_return` attaches one --
-        // which `returns_reg_aggregate` above stops calling past 128 bits. So
-        // a three- or four-`double` HFA returns an address under no
-        // classification at all, and lifting this refusal has it phi-ed again
-        // (`%45 = phisrc.192 %44`, where `%44` is a `symaddr.64`). Letting
-        // those in means carrying the classification onto every
-        // register-returned aggregate's `Ret` first, which is its own change
-        // -- and `codegen_aarch64_hfa_returning_function_is_not_inlined`
-        // pins this refusal until then.
-        let returns_addr_aggregate = ret_class.as_ref().is_some_and(|class| {
-            super::aggregate_ret_is_address(class, struct_size_bits)
-                && !matches!(class, crate::abi::ArgClass::Direct { .. })
-        });
-        ir_func.ret_is_address = self.types.is_complex(func.return_type) || returns_addr_aggregate;
+        // A complex value comes back as the address of its halves, which the
+        // inliner cannot splice into a caller expecting the value. An
+        // aggregate returned by address -- one SSE register, x87, an HFA --
+        // is not refused: every such `Ret` carries its ABI classification
+        // (`emit_reg_aggregate_return`), and the inliner copies the bytes it
+        // names into the call's result local, which is where a call leaves
+        // them.
+        ir_func.ret_is_address = self.types.is_complex(func.return_type);
 
         // Add parameters
         // For struct/union parameters, we need to copy them to local storage
@@ -2146,8 +2104,27 @@ impl<'a> Linearizer<'a> {
         ));
     }
 
-    /// Emit two-register struct return (9-16 bytes)
-    pub(crate) fn emit_two_reg_return(&mut self, e: &Expr, ret_type: TypeId) {
+    /// Whether a value of type `typ` is an aggregate the ABI returns in
+    /// registers and that is wider than one: in two general registers, one
+    /// SSE register holding sixteen bytes, x87, or an HFA of up to four
+    /// floating members -- thirty-two bytes at most.
+    ///
+    /// The one answer for both ends of a call. The callee's side stopped at
+    /// sixteen bytes and the caller's had no bound, so a three- or
+    /// four-`double` HFA was a register aggregate to its caller and an
+    /// ordinary scalar return to its callee, whose `Ret` then carried an
+    /// address under no ABI classification -- which is why the inliner had to
+    /// refuse every HFA and x87 return.
+    pub(crate) fn returns_reg_aggregate(&self, typ: TypeId) -> bool {
+        matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union)
+            && self.types.size_bits(typ) > 64
+            && !self.returns_via_hidden_pointer(typ)
+    }
+
+    /// Return an aggregate the ABI returns in registers
+    /// ([`Self::returns_reg_aggregate`]), with the classification that says
+    /// how on the `Ret`.
+    pub(crate) fn emit_reg_aggregate_return(&mut self, e: &Expr, ret_type: TypeId) {
         let src_addr = self.linearize_lvalue(e);
         let struct_size = self.types.size_bits(ret_type);
         let abi = get_abi_for_conv(self.current_calling_conv, self.target);
@@ -2169,6 +2146,14 @@ impl<'a> Linearizer<'a> {
             self.emit(ret_insn);
             return;
         }
+
+        // Everything else is a pair of general registers, and so at most
+        // sixteen bytes: a wider aggregate that is not returned by address
+        // went through the hidden pointer.
+        debug_assert!(
+            struct_size <= 128,
+            "a two-register return of {struct_size} bits"
+        );
 
         // Load first 8 bytes
         let low_temp = self.alloc_reg_pseudo();
@@ -3799,9 +3784,7 @@ impl<'a> Linearizer<'a> {
         // land, and the backend writes the registers into this local. There is
         // no upper size bound: an HFA of four `double`s is thirty-two bytes
         // and still returns in registers, not through the hidden pointer.
-        let returns_reg_aggregate = (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
-            && struct_size_bits > 64
-            && !returns_large_struct;
+        let returns_reg_aggregate = self.returns_reg_aggregate(typ);
         // A complex value the ABI returns in registers (x87 or SSE) is handed
         // back as the address of its halves; one it returns in memory --
         // `_Float128 _Complex` on x86-64 -- came back through the hidden

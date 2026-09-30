@@ -1624,7 +1624,7 @@ impl Instruction {
     /// Asked of the `Ret`'s own ABI classification, which is the only place
     /// the answer is recorded -- `Instruction::size` is the aggregate's width,
     /// so [`aggregate_ret_is_address`] can apply its own size bound without a
-    /// `TypeTable`. Only [`crate::ir::Linearizer::emit_two_reg_return`] ever
+    /// `TypeTable`. Only [`crate::ir::Linearizer::emit_reg_aggregate_return`] ever
     /// puts `abi_info` on a `Ret`, and only for a struct or union, so no
     /// scalar reaches this.
     pub fn returns_aggregate_address(&self) -> bool {
@@ -2098,20 +2098,12 @@ pub struct Function {
     pub implicit_param_copies: Vec<ImplicitParamCopy>,
     /// Does this function return a complex value?
     ///
-    /// True when this function's `Ret` carries the *address* of the returned
-    /// value rather than the value.
-    ///
-    /// Three returns are shaped that way: a `_Complex` one; an aggregate that
-    /// is nothing but a `long double`, which comes back in st(0) and so is
-    /// loaded from memory; and a homogeneous floating-point aggregate, which
-    /// AAPCS64 returns in `d0`-`d3` at *any* size -- four `double`s is
-    /// thirty-two bytes and still comes back in registers. At a call site the
-    /// backend stores the returned
-    /// registers into the result local, so that pseudo's slot holds the value
-    /// itself; inlining drops the call and would hand the caller an address
-    /// where it expects a value. Bridging the two needs the base type and
-    /// stride, which the optimizer has no `TypeTable` to ask for, so such
-    /// functions are simply not inlined.
+    /// A `_Complex` return's `Ret` carries the *address* of its halves, and
+    /// the caller expects the value; bridging the two needs the base type and
+    /// stride, which the optimizer has no `TypeTable` to ask for, so such a
+    /// function is not inlined. An aggregate returned by address is not in
+    /// this set: its `Ret` carries the ABI classification that lets the
+    /// inliner copy the bytes (`Instruction::returns_aggregate_address`).
     pub ret_is_address: bool,
     /// Block ID -> index in `blocks` vec (O(1) lookup)
     block_idx: HashMap<BasicBlockId, usize>,
@@ -3697,7 +3689,7 @@ mod tests {
     /// `Direct { classes: [Sse] }` is the discriminating row: at sixteen bytes
     /// it is one SSE register holding a whole `__float128`, so the `Ret` names
     /// the storage; at eight it is `struct { float a, b; }`, which comes back
-    /// *as* a value and never reaches `emit_two_reg_return` at all. Answering
+    /// *as* a value and never reaches `emit_reg_aggregate_return` at all. Answering
     /// the first one "no" is what made the inliner phi an address as though it
     /// were the aggregate.
     #[test]

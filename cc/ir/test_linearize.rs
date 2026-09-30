@@ -10285,3 +10285,36 @@ fn test_a_value_initialized_union_agrees_with_any_member() {
     named0.record(0, u, 0);
     assert_eq!(UnionFold::new(&value, &named0, 0).agreed(u), None);
 }
+
+/// Every aggregate returned in registers has its `Ret` classified, at any
+/// size: a four-`double` HFA is thirty-two bytes on aarch64 and still comes
+/// back in `d0`-`d3`, by address in the IR. The callee's side stopped
+/// classifying at sixteen bytes, so this `Ret` carried no ABI record and the
+/// function had to be kept from the inliner; it is neither now.
+#[test]
+fn test_every_register_returned_aggregate_carries_its_class() {
+    let target = Target::new(Arch::Aarch64, Os::Linux);
+    let src = "struct H4 { double v[4]; };\n\
+               struct H4 mk(double s) { struct H4 r = { { s, s, s, s } }; return r; }\n";
+    let module = linearize_source(src, &target);
+    let f = module.functions.iter().find(|f| f.name == "mk").unwrap();
+    let ret = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .find(|i| i.op == Opcode::Ret)
+        .expect("a ret");
+    assert!(
+        matches!(
+            ret.abi_info.as_ref().map(|a| &a.ret),
+            Some(crate::abi::ArgClass::Hfa { count: 4, .. })
+        ),
+        "{:?}",
+        ret.abi_info
+    );
+    assert!(ret.returns_aggregate_address());
+    assert!(
+        !f.ret_is_address,
+        "an address-returned aggregate is inlinable"
+    );
+}

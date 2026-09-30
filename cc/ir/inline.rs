@@ -685,12 +685,12 @@ fn clone_instruction(
                         // 12-byte struct leaves four. Stored at a hardcoded
                         // 64 bits it overran the result local by four -- and
                         // it disagreed with the *load* in
-                        // `emit_two_reg_return`, which has always narrowed the
+                        // `emit_reg_aggregate_return`, which has always narrowed the
                         // high half to `min(64, struct_size - 64)`.
                         let high_bits = match insn.size.checked_sub(64) {
                             Some(rest) if rest > 0 => rest.min(64),
                             // Two registers means more than eight bytes, so
-                            // this is not a shape `emit_two_reg_return`
+                            // this is not a shape `emit_reg_aggregate_return`
                             // produces. Keep the old width rather than emit a
                             // store of no bits at all.
                             _ => 64,
@@ -728,11 +728,10 @@ fn clone_instruction(
                         // Asked of the `Ret`'s own classification, which is
                         // what `returns_two_regs` just above asks and all
                         // this pass has: it carries no `TypeTable` and cannot
-                        // classify anything itself. Only the one-SSE shape
-                        // reaches here today -- `Function::ret_is_address`
-                        // still keeps an x87 aggregate and an HFA out of the
-                        // inliner entirely, for the reason recorded where it
-                        // is set.
+                        // classify anything itself -- and every such `Ret`
+                        // carries one: `emit_reg_aggregate_return` attaches
+                        // it to every aggregate returned in registers, a
+                        // four-`double` HFA included.
                         //
                         // Phi-ing the source instead handed the caller a
                         // pointer where the value belonged:
@@ -744,7 +743,7 @@ fn clone_instruction(
                         // changed the answer, and only for this shape: the
                         // two-register return stores its halves just above,
                         // and an aggregate of eight bytes or less never
-                        // reaches `emit_two_reg_return` at all, so its `Ret`
+                        // reaches `emit_reg_aggregate_return` at all, so its `Ret`
                         // already carries a loaded value.
                         //
                         // `insn.size` is the aggregate's own width, in the
@@ -2616,7 +2615,7 @@ mod tests {
 
     /// `static struct Q mk(void) { struct Q r; ...; return r; }`, whose `Ret`
     /// hands the aggregate back by *address* under `ret` -- the shape
-    /// `emit_two_reg_return` emits for a class no pair of general registers
+    /// `emit_reg_aggregate_return` emits for a class no pair of general registers
     /// can carry.
     fn aggregate_address_ret_callee(
         types: &TypeTable,

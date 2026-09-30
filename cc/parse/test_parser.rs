@@ -1343,11 +1343,14 @@ fn test_cast_unsigned_char_pointer() {
 
 #[test]
 fn test_cast_const_int() {
+    // A cast yields a value, so a cast to `const int` is a cast to `int`
+    // (C17 6.5.4p5, footnote 108), and the expression's type says so.
     let (expr, types, _strings, _symbols) = parse_expr("(const int)x").unwrap();
+    assert_eq!(expr.typ, Some(types.int_id));
     match expr.kind {
         ExprKind::Cast { cast_type, .. } => {
             assert_eq!(types.kind(cast_type), TypeKind::Int);
-            assert!(types
+            assert!(!types
                 .get(cast_type)
                 .modifiers
                 .contains(TypeModifiers::CONST));
@@ -1390,12 +1393,13 @@ fn test_cast_const_pointer() {
 #[test]
 fn test_cast_pointer_to_const() {
     // Test pointer qualifiers after *: (int * const)x - const pointer to int
+    // The `const` qualifies the pointer itself, which a cast drops along
+    // with every other top-level qualifier (C17 6.5.4p5).
     let (expr, types, _strings, _symbols) = parse_expr("(int * const)x").unwrap();
     match expr.kind {
         ExprKind::Cast { cast_type, .. } => {
             assert_eq!(types.kind(cast_type), TypeKind::Pointer);
-            // const applies to the pointer itself
-            assert!(types
+            assert!(!types
                 .get(cast_type)
                 .modifiers
                 .contains(TypeModifiers::CONST));
@@ -8415,4 +8419,26 @@ fn test_unary_plus_leaves_a_complex_integer_alone() {
     // The control: a real narrow operand still promotes.
     let (expr, types, _strings, _symbols) = parse_expr("+(short)1").unwrap();
     assert_eq!(expr.typ, Some(types.int_id));
+}
+
+/// Where each element of an array's initializer list lands, and where the
+/// cursor goes next: a positional element takes the cursor, an index moves it
+/// past itself, and a range moves it past its *high* end.
+#[test]
+fn test_array_slot_follows_the_cursor() {
+    use crate::parse::ast::{array_slot, Designator};
+    let mut cursor = 0;
+    assert_eq!(array_slot(&[], &mut cursor), (0, 0, None));
+    assert_eq!(cursor, 1);
+    assert_eq!(
+        array_slot(&[Designator::IndexRange(4, 6)], &mut cursor),
+        (4, 6, Some(0))
+    );
+    assert_eq!(cursor, 7);
+    assert_eq!(array_slot(&[], &mut cursor), (7, 7, None));
+    assert_eq!(
+        array_slot(&[Designator::Index(2)], &mut cursor),
+        (2, 2, Some(0))
+    );
+    assert_eq!(cursor, 3);
 }

@@ -114,8 +114,7 @@ impl<'a> Parser<'a> {
             if assign_op == AssignOp::Assign {
                 self.check_assignment_types(&left, &right, assign_pos);
             }
-            // In C, assignment expression type is the type of the left operand
-            let assign_type = left.typ.unwrap_or(self.types.int_id);
+            let assign_type = self.modification_result_type(&left);
             Ok(Self::typed_expr(
                 ExprKind::Assign {
                     op: assign_op,
@@ -290,21 +289,51 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Compute common type for ternary operator branches (C99 6.5.15, 6.3.1.8)
+    /// The type of a conditional expression whose arms have types `then_typ`
+    /// and `else_typ`, already decayed (C17 6.5.15p3-6).
+    ///
+    /// The result is a value, so it is unqualified whatever the arms were.
     fn ternary_common_type(&mut self, then_typ: TypeId, else_typ: TypeId) -> TypeId {
-        let then_kind = self.types.kind(then_typ);
-        let else_kind = self.types.kind(else_typ);
+        let then_typ = self.lvalue_converted_type(then_typ);
+        let else_typ = self.lvalue_converted_type(else_typ);
+        let then_ptr = self.types.kind(then_typ) == TypeKind::Pointer;
+        let else_ptr = self.types.kind(else_typ) == TypeKind::Pointer;
 
-        // If either is a pointer, use pointer type
-        if then_kind == TypeKind::Pointer {
+        // Two pointers: a pointer to the composite type, qualified with the
+        // qualifiers of *both* pointees (6.5.15p6) -- or to void, so
+        // qualified, when either points to void. Taking whichever arm came
+        // first dropped `const` from `c ? p : cp` and kept it for `c ? cp : p`.
+        if then_ptr && else_ptr {
+            let (Some(tp), Some(ep)) = (
+                self.types.base_type(then_typ),
+                self.types.base_type(else_typ),
+            ) else {
+                return then_typ;
+            };
+            let quals = self.types.qualifiers(tp) | self.types.qualifiers(ep);
+            let target = if self.types.kind(tp) == TypeKind::Void {
+                tp
+            } else if self.types.kind(ep) == TypeKind::Void {
+                ep
+            } else {
+                tp
+            };
+            let target = self.types.unqualified(target);
+            let target = self.types.qualified_with(target, quals);
+            return self.types.intern(crate::types::Type::pointer(target));
+        }
+        // One pointer: the other arm is a null pointer constant (6.5.15p6).
+        if then_ptr {
             return then_typ;
         }
-        if else_kind == TypeKind::Pointer {
+        if else_ptr {
             return else_typ;
         }
 
         // If either is void, result is void
-        if then_kind == TypeKind::Void || else_kind == TypeKind::Void {
+        if self.types.kind(then_typ) == TypeKind::Void
+            || self.types.kind(else_typ) == TypeKind::Void
+        {
             return self.types.void_id;
         }
 
@@ -323,20 +352,6 @@ impl<'a> Parser<'a> {
         // give.
         if self.types.is_arithmetic(then_typ) && self.types.is_arithmetic(else_typ) {
             return self.usual_arithmetic_conversions(then_typ, else_typ);
-        }
-
-        // Float types take precedence
-        if self.types.is_float(then_typ) || self.types.is_float(else_typ) {
-            if then_kind == TypeKind::Float128 || else_kind == TypeKind::Float128 {
-                return self.types.float128_id;
-            }
-            if then_kind == TypeKind::LongDouble || else_kind == TypeKind::LongDouble {
-                return self.types.longdouble_id;
-            }
-            if then_kind == TypeKind::Double || else_kind == TypeKind::Double {
-                return self.types.double_id;
-            }
-            return self.types.float_id;
         }
 
         // Neither arithmetic nor a pointer: a struct or union, where C17
@@ -360,6 +375,19 @@ impl<'a> Parser<'a> {
     pub(crate) fn lvalue_converted_type(&mut self, typ: TypeId) -> TypeId {
         let decayed = self.decayed_type(typ);
         self.types.unqualified(decayed)
+    }
+
+    /// The type of an assignment, compound assignment, or prefix or postfix
+    /// `++`/`--` of `target`: the type `target` has after lvalue conversion
+    /// (C17 6.5.16p3; 6.5.2.4p2 and 6.5.3.1p2 by reference to it).
+    ///
+    /// Not the target's own type. `v = 1` for a `volatile int v` is an `int`
+    /// value, and typing it `volatile int` let a qualifier onto an rvalue
+    /// that `_Generic`, `typeof` and any "did this touch a volatile object"
+    /// question downstream would all read.
+    fn modification_result_type(&mut self, target: &Expr) -> TypeId {
+        let typ = target.typ.unwrap_or(self.types.int_id);
+        self.lvalue_converted_type(typ)
     }
 
     /// Parse a conditional (ternary) expression: cond ? then : else
@@ -637,8 +665,7 @@ impl<'a> Parser<'a> {
             // Check for const modification
             self.check_modifiable_lvalue(&operand, "increment operand", op_pos);
             self.check_const_assignment(&operand, op_pos);
-            // PreInc has same type as operand
-            let typ = operand.typ.unwrap_or(self.types.int_id);
+            let typ = self.modification_result_type(&operand);
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::PreInc,
@@ -656,8 +683,7 @@ impl<'a> Parser<'a> {
             // Check for const modification
             self.check_modifiable_lvalue(&operand, "decrement operand", op_pos);
             self.check_const_assignment(&operand, op_pos);
-            // PreDec has same type as operand
-            let typ = operand.typ.unwrap_or(self.types.int_id);
+            let typ = self.modification_result_type(&operand);
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::PreDec,
@@ -1255,8 +1281,7 @@ impl<'a> Parser<'a> {
                 // Check for const modification
                 self.check_modifiable_lvalue(&expr, "increment operand", op_pos);
                 self.check_const_assignment(&expr, op_pos);
-                // PostInc has same type as operand
-                let typ = expr.typ.unwrap_or(self.types.int_id);
+                let typ = self.modification_result_type(&expr);
                 expr = Self::typed_expr(ExprKind::PostInc(Box::new(expr)), typ, base_pos);
             } else if self.is_special_token(SpecialToken::Decrement) {
                 let op_pos = self.current_pos();
@@ -1264,8 +1289,7 @@ impl<'a> Parser<'a> {
                 // Check for const modification
                 self.check_modifiable_lvalue(&expr, "decrement operand", op_pos);
                 self.check_const_assignment(&expr, op_pos);
-                // PostDec has same type as operand
-                let typ = expr.typ.unwrap_or(self.types.int_id);
+                let typ = self.modification_result_type(&expr);
                 expr = Self::typed_expr(ExprKind::PostDec(Box::new(expr)), typ, base_pos);
             } else if self.is_special(b'[') {
                 // Array subscript
@@ -1421,6 +1445,9 @@ impl<'a> Parser<'a> {
                         }
                     })
                     .unwrap_or(self.types.int_id); // Default to int
+                                                   // A call's value has the unqualified version of the return
+                                                   // type (C17 6.7.6.3p4 makes that the function's return type).
+                let return_type = self.types.unqualified(return_type);
 
                 let known = self.known_callee(&expr);
                 expr = self.fold_zero_length_compare(Self::typed_expr(
@@ -1972,7 +1999,7 @@ impl<'a> Parser<'a> {
     /// pure question about conversion rank, which is what lets the linearizer
     /// and the constant folder ask it through a `&TypeTable`: interning a
     /// stripped type needs `&mut`.
-    fn usual_arithmetic_conversions(&mut self, left: TypeId, right: TypeId) -> TypeId {
+    pub(crate) fn usual_arithmetic_conversions(&mut self, left: TypeId, right: TypeId) -> TypeId {
         let common = self.types.common_type(left, right);
         self.types.unqualified(common)
     }
@@ -2380,6 +2407,10 @@ impl<'a> Parser<'a> {
                             }
                         }
 
+                        // A cast yields a value, so a cast to a qualified type
+                        // is a cast to its unqualified version (C17 6.5.4p5,
+                        // footnote 108).
+                        let typ = self.types.unqualified(typ);
                         let cast = Self::typed_expr(
                             ExprKind::Cast {
                                 cast_type: typ,

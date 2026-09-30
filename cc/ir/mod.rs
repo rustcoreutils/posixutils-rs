@@ -2535,6 +2535,36 @@ pub enum Initializer {
 }
 
 impl Initializer {
+    /// A string literal initializing an array of `total_size` bytes, as the
+    /// element list it stands for: one `Int` per code unit that fits, each
+    /// `elem_size` bytes wide. `None` for anything that is not a string.
+    ///
+    /// A literal is one initializer for the whole array, so a later
+    /// designator naming one of its elements -- `{ .s = "abc", .s[1] = 'z' }`
+    /// -- has nothing to replace until the literal is seen as the elements
+    /// it is. Units past the array are cut, as the literal itself is.
+    pub fn string_as_array(&self, elem_size: usize, total_size: usize) -> Option<Initializer> {
+        let units: Vec<i128> = match self {
+            Initializer::String(s) => crate::token::lexer::payload_bytes(s)
+                .map(i128::from)
+                .collect(),
+            Initializer::Utf16String(u) => u.iter().map(|&c| i128::from(c)).collect(),
+            Initializer::Utf32String(u) => u.iter().map(|&c| i128::from(c)).collect(),
+            _ => return None,
+        };
+        let fits = total_size.checked_div(elem_size).unwrap_or(0);
+        Some(Initializer::Array {
+            elem_size,
+            total_size,
+            elements: units
+                .into_iter()
+                .take(fits)
+                .enumerate()
+                .map(|(i, u)| (i * elem_size, Initializer::Int(u)))
+                .collect(),
+        })
+    }
+
     /// Recursively determine whether this initializer evaluates to all zero bytes.
     ///
     /// Used to route static / extern globals whose initial contents are entirely
@@ -3326,6 +3356,38 @@ mod tests {
 
         insn = insn.with_memory_order(MemoryOrder::Acquire);
         assert_eq!(insn.memory_order, MemoryOrder::Acquire);
+    }
+
+    /// A string initializer taken apart into its elements: one per code unit
+    /// that fits, cut at the array, each at its element's offset.
+    #[test]
+    fn test_string_initializer_as_its_elements() {
+        let s = Initializer::String("ab\u{e9}".into())
+            .string_as_array(1, 6)
+            .unwrap();
+        let Initializer::Array { elements, .. } = s else {
+            panic!("an array");
+        };
+        assert_eq!(
+            elements,
+            vec![
+                (0, Initializer::Int(97)),
+                (1, Initializer::Int(98)),
+                (2, Initializer::Int(0xe9))
+            ]
+        );
+        // Cut to the array, not the array stretched to the string.
+        let w = Initializer::Utf16String(vec![1, 2, 3])
+            .string_as_array(2, 4)
+            .unwrap();
+        let Initializer::Array { elements, .. } = w else {
+            panic!("an array");
+        };
+        assert_eq!(
+            elements,
+            vec![(0, Initializer::Int(1)), (2, Initializer::Int(2))]
+        );
+        assert!(Initializer::Int(1).string_as_array(1, 1).is_none());
     }
 
     #[test]

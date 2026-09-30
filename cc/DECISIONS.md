@@ -305,11 +305,12 @@ injecting one into a skip list and watching the gate fail.
 ### Deliberate divergences from gcc
 
 `20031003-1` and `pr46309` are skipped as gcc-specific behaviour
-above; the reasoning is in that table. One more is a divergence c17 keeps but
-does **not** skip, because it is not GNU-specific:
+above; the reasoning is in that table. Two more are divergences c17 keeps but
+does **not** skip, because they are not GNU-specific:
 
 | Test | Why c17 does not follow |
 |---|---|
+| (no torture test) | `{ .t = v, .t.b = 9 }`, where `.t` is a struct or union initialized from a whole value: c17 keeps `v`'s other bytes and replaces only `t.b`; gcc discards all of `v`, so `t.a` reads 0. C17 6.7.9p19 overrides "the same subobject", which `t.b` is and `t` is not. Which member a union value holds is not known until run time, so a union is treated like a struct here: its bytes are the value's |
 | `920728-1` | `return;` in a function returning non-void. C17 6.8.6.4p1 makes it a constraint violation; gcc issues a warning and compiles. `-fpermissive` arguably ought to downgrade it, as it does for implicit `int` |
 
 Complex integer division is a second, recorded in `BUILTIN.md`: c17 uses

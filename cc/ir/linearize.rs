@@ -148,28 +148,69 @@ pub(crate) struct ResolvedDesignator {
 /// member in question. The type is part of the key because a union declared
 /// directly inside another begins at the same byte as it does.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct UnionMembers(Vec<(usize, TypeId, usize)>);
+pub(crate) struct UnionMembers {
+    members: Vec<(usize, TypeId, usize)>,
+    /// Byte ranges a whole value initialized; see [`Held::Value`].
+    values: Vec<std::ops::Range<usize>>,
+}
+
+/// What an initializer left a union holding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Held {
+    /// The member with this index, which an initializer list named.
+    Member(usize),
+    /// The bytes of a whole value -- `.u = v`, or `.s = t` for a struct `t`
+    /// with a union inside -- which name no member.
+    ///
+    /// Which member `v` last had stored into it is a fact about the run, not
+    /// the program, so no member can be said to be held; what is known is
+    /// that every byte is `v`'s. A later designator reaching inside keeps
+    /// them and replaces only what it names, whichever member it goes
+    /// through, exactly as it would inside a struct initialized from a
+    /// value. Treating the union as holding *nothing* instead reset it, so
+    /// `{ .u = v, .u.s.b = 9 }` lost `v.s.a` while the same shape through a
+    /// struct kept it.
+    Value,
+}
 
 impl UnionMembers {
     /// Note that the union at `offset` holds `member`, replacing whatever it
     /// was last said to hold.
     pub(crate) fn record(&mut self, offset: usize, typ: TypeId, member: usize) {
-        match self.0.iter_mut().find(|e| (e.0, e.1) == (offset, typ)) {
+        match self
+            .members
+            .iter_mut()
+            .find(|e| (e.0, e.1) == (offset, typ))
+        {
             Some(entry) => entry.2 = member,
-            None => self.0.push((offset, typ, member)),
+            None => self.members.push((offset, typ, member)),
         }
     }
 
-    fn member_at(&self, offset: usize, typ: TypeId) -> Option<usize> {
-        self.0
+    /// Note that the bytes `range` hold a whole value, replacing whatever
+    /// the unions inside them were last said to hold.
+    pub(crate) fn record_value(&mut self, range: std::ops::Range<usize>) {
+        self.members.retain(|e| !range.contains(&e.0));
+        self.values.push(range);
+    }
+
+    /// What the union of type `typ` at `offset` holds, if anything says.
+    fn held_at(&self, offset: usize, typ: TypeId) -> Option<Held> {
+        if let Some(e) = self.members.iter().find(|e| (e.0, e.1) == (offset, typ)) {
+            return Some(Held::Member(e.2));
+        }
+        self.values
             .iter()
-            .find(|e| (e.0, e.1) == (offset, typ))
-            .map(|e| e.2)
+            .any(|r| r.contains(&offset))
+            .then_some(Held::Value)
     }
 
     /// Take on everything `other` says, which is later and so decisive.
     pub(crate) fn absorb(&mut self, other: &UnionMembers) {
-        for &(offset, typ, member) in &other.0 {
+        for r in &other.values {
+            self.record_value(r.clone());
+        }
+        for &(offset, typ, member) in &other.members {
             self.record(offset, typ, member);
         }
     }
@@ -177,7 +218,12 @@ impl UnionMembers {
     /// Forget every union starting inside `range`, whose contents some later
     /// initializer has just discarded.
     pub(crate) fn clear_range(&mut self, range: std::ops::Range<usize>) {
-        self.0.retain(|e| !range.contains(&e.0));
+        self.members.retain(|e| !range.contains(&e.0));
+        // A value range the discarded bytes overlap no longer speaks for all
+        // of itself; forgetting it only makes a later override reset rather
+        // than keep, which is the answer that assumes nothing.
+        self.values
+            .retain(|r| r.end <= range.start || range.end <= r.start);
     }
 }
 
@@ -216,9 +262,17 @@ impl<'a> UnionFold<'a> {
 
     /// The member both sides agree the union of type `typ` at the current
     /// offset holds, if they do.
+    ///
+    /// A union holding a whole value agrees with any member named: its bytes
+    /// are all there to be kept. See [`Held::Value`].
     pub(crate) fn agreed(&self, typ: TypeId) -> Option<usize> {
-        let held = self.held?.member_at(self.base, typ)?;
-        (self.named?.member_at(self.base, typ)? == held).then_some(held)
+        let Some(Held::Member(named)) = self.named?.held_at(self.base, typ) else {
+            return None;
+        };
+        match self.held?.held_at(self.base, typ)? {
+            Held::Value => Some(named),
+            Held::Member(held) => (held == named).then_some(held),
+        }
     }
 }
 
@@ -6426,40 +6480,12 @@ impl<'a> Linearizer<'a> {
         dst
     }
 
-    /// `offsetof(type, member)`, walking the designator path.
+    /// `offsetof(type, member)`: the constant [`crate::constexpr::offset_of`]
+    /// computes. The parser has already rejected a path naming nothing.
     fn linearize_offsetof(&mut self, type_id: &TypeId, path: &[OffsetOfPath]) -> PseudoId {
-        // __builtin_offsetof(type, member-designator)
-        // Compute the byte offset of the member within the struct
-        let mut offset: u64 = 0;
-        let mut current_type = *type_id;
-
-        for element in path {
-            match element {
-                OffsetOfPath::Field(field_id) => {
-                    // Look up the field in the current struct type
-                    let struct_type = self.resolve_struct_type(current_type);
-                    let member_info = self
-                        .types
-                        .find_member(struct_type, *field_id)
-                        .expect("offsetof: field not found in struct type");
-                    offset += member_info.offset as u64;
-                    current_type = member_info.typ;
-                }
-                OffsetOfPath::Index(index) => {
-                    // Array indexing: offset += index * sizeof(element)
-                    let elem_type = self
-                        .types
-                        .base_type(current_type)
-                        .expect("offsetof: array index on non-array type");
-                    let elem_size = self.types.size_bytes(elem_type);
-                    offset += (*index as u64) * (elem_size as u64);
-                    current_type = elem_type;
-                }
-            }
-        }
-
-        // Return the offset as a constant
-        self.emit_const(offset as i128, self.types.ulong_id)
+        let offset = crate::constexpr::offset_of(self, *type_id, path)
+            .expect("offsetof: the parser accepted a path that names no member");
+        self.emit_const(offset, self.types.ulong_id)
     }
 
     /// The recorded extent of a variably-modified typedef, one level in.

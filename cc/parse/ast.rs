@@ -1326,6 +1326,55 @@ pub(crate) fn vm_extent_count(types: &TypeTable, symbols: &SymbolTable, expr: &E
     }
 }
 
+/// The elements of `elements` that brace elision gives to one `target_type`
+/// slot, starting at `start` (C17 6.7.9p20): the first, then as many more
+/// positional elements as the type has scalar fields, stopping early at a
+/// designated one -- which addresses the enclosing aggregate, not this slot.
+///
+/// The parser sizing an incomplete array and the linearizer placing values
+/// both take elements this way, and each counted them with a loop of its own.
+pub fn brace_elision_span(
+    types: &TypeTable,
+    elements: &[InitElement],
+    start: usize,
+    target_type: TypeId,
+) -> std::ops::Range<usize> {
+    let wanted = types.count_scalar_fields(target_type).max(1);
+    let mut end = (start + 1).min(elements.len());
+    while end - start < wanted && end < elements.len() && elements[end].designators.is_empty() {
+        end += 1;
+    }
+    start..end
+}
+
+/// Where one element of an array's initializer list lands, given the
+/// `cursor` -- the index the next positional element takes -- which this
+/// advances (C17 6.7.9p17-18, and GNU `[lo ... hi]`).
+///
+/// Answers the first and last index the element initializes, and the
+/// position of the array's own designator among `designators`, if it has
+/// one; what follows that is for the element itself. A range leaves the
+/// cursor past its *high* endpoint, so a positional element after
+/// `[0 ... 2] = 1` lands at 3.
+///
+/// The one statement of the rule: the parser sizing `int a[] = {...}` and
+/// the linearizer placing the values each had a copy, one of them commented
+/// as "a second, independent copy ... both have to know".
+pub fn array_slot(designators: &[Designator], cursor: &mut i64) -> (i64, i64, Option<usize>) {
+    for (pos, d) in designators.iter().enumerate() {
+        let (lo, hi) = match d {
+            Designator::Index(i) => (*i, *i),
+            Designator::IndexRange(lo, hi) => (*lo, *hi),
+            Designator::Field(_) => continue,
+        };
+        *cursor = hi + 1;
+        return (lo, hi, Some(pos));
+    }
+    let at = *cursor;
+    *cursor += 1;
+    (at, at, None)
+}
+
 /// Does this initializer element initialize `target_type` by elided braces?
 ///
 /// C17 6.7.9p20: a brace-less initializer for an aggregate member takes as

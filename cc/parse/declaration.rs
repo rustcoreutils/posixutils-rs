@@ -564,68 +564,25 @@ impl Parser<'_> {
         elements: &[InitElement],
         elem_type: TypeId,
     ) -> usize {
-        let per_element = self.types.count_scalar_fields(elem_type).max(1);
         let mut max_index: i64 = -1;
         let mut current_index: i64 = 0;
         let mut idx = 0usize;
 
         while idx < elements.len() {
             let element = &elements[idx];
-            let mut designator_index = None;
-            let mut designator_high = None;
-            for designator in &element.designators {
-                match designator {
-                    Designator::Index(index) => {
-                        designator_index = Some(*index);
-                        break;
-                    }
-                    Designator::IndexRange(lo, hi) => {
-                        designator_index = Some(*lo);
-                        designator_high = Some(*hi);
-                        break;
-                    }
-                    Designator::Field(_) => {}
-                }
-            }
+            let (_, last, designated) =
+                crate::parse::ast::array_slot(&element.designators, &mut current_index);
+            max_index = max_index.max(last);
 
-            let index = if let Some(explicit_index) = designator_index {
-                // A range advances the cursor past its high endpoint and
-                // extends the inferred bound to it: `int a[] = {[0 ... 3] = 1}`
-                // is four elements. This is a second, independent copy of the
-                // rule in `group_array_init_elements`; both have to know.
-                let end = designator_high.unwrap_or(explicit_index);
-                current_index = end + 1;
-                if end > max_index {
-                    max_index = end;
-                }
-                explicit_index
-            } else {
-                let i = current_index;
-                current_index += 1;
-                i
-            };
-
-            if index > max_index {
-                max_index = index;
-            }
-
-            // A brace-less aggregate element consumes several list elements
-            // for this one slot. Stop early at a designator, which addresses
-            // the enclosing array rather than continuing to fill this slot --
-            // the same boundary `consume_brace_elision` observes.
-            idx += 1;
-            if designator_index.is_none()
+            // A brace-less aggregate element takes several list elements for
+            // this one slot.
+            idx = if designated.is_none()
                 && crate::parse::ast::is_brace_elision_candidate(self.types, element, elem_type)
             {
-                let mut taken = 1;
-                while taken < per_element
-                    && idx < elements.len()
-                    && elements[idx].designators.is_empty()
-                {
-                    idx += 1;
-                    taken += 1;
-                }
-            }
+                crate::parse::ast::brace_elision_span(self.types, elements, idx, elem_type).end
+            } else {
+                idx + 1
+            };
         }
 
         if max_index < 0 {

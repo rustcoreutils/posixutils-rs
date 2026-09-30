@@ -2496,15 +2496,19 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// a block that nothing reaches is removed when the function is finished
     /// (`dce::remove_unreachable_blocks`), and one a label, `case` or `default`
     /// inside the dead arm still reaches keeps its edge and so survives.
+    ///
+    /// With no current block -- control cannot reach here -- the branch is
+    /// emitted into a fresh unreachable one, like every other terminator:
+    /// returning without a branch would leave `then_bb` and `else_bb` with one
+    /// predecessor fewer than their callers built them for, and nothing would
+    /// say so.
     pub(crate) fn branch_on(
         &mut self,
         cond: Controlling,
         then_bb: BasicBlockId,
         else_bb: BasicBlockId,
     ) {
-        let Some(current) = self.current_bb else {
-            return;
-        };
+        let current = self.current_or_unreachable_bb();
         match cond {
             Controlling::Constant(holds) => {
                 let target = if holds { then_bb } else { else_bb };

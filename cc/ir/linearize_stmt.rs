@@ -9,6 +9,7 @@
 //! Statement linearization
 
 use super::linearize::*;
+use super::linearize_emit::Controlling;
 use super::{
     AsmConstraint, AsmData, BasicBlockId, Initializer, Instruction, Opcode, Pseudo, PseudoId,
 };
@@ -2605,13 +2606,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             ExprKind::Member { expr: base, member } => {
                 // Recursively evaluate the base address
                 let (name, base_offset) = self.eval_static_address(base)?;
-
-                // Get the offset of the member in the struct
-                let base_type = base.typ?;
-                let struct_type = self.resolve_struct_type(base_type);
-                let member_info = self.types.find_member(struct_type, *member)?;
-
-                Some((name, base_offset + member_info.offset as i64))
+                let (at, _) = crate::constexpr::member_at(self, base.typ?, *member)?;
+                Some((name, base_offset + at as i64))
             }
 
             // Arrow access: expr->member (pointer dereference + member access)
@@ -2619,11 +2615,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             // (e.g., (&static_struct.field)->subfield in CPython macros)
             ExprKind::Arrow { expr: base, member } => {
                 let (name, base_offset) = self.eval_static_address(base)?;
-                let ptr_type = base.typ?;
-                let pointee_type = self.types.base_type(ptr_type)?;
-                let struct_type = self.resolve_struct_type(pointee_type);
-                let member_info = self.types.find_member(struct_type, *member)?;
-                Some((name, base_offset + member_info.offset as i64))
+                let pointee = self.types.base_type(base.typ?)?;
+                let (at, _) = crate::constexpr::member_at(self, pointee, *member)?;
+                Some((name, base_offset + at as i64))
             }
 
             // Array subscript: array[index]
@@ -2722,7 +2716,6 @@ impl<'a> super::linearize::Linearizer<'a> {
                 (lo, hi),
                 "a case label reaches lowering already converted to the controlling type"
             );
-            let Some(from) = self.current_bb else { return };
             let next = self.alloc_bb();
             let cond = if lo == hi {
                 let k = self.emit_const(lo, cmp_type);
@@ -2737,16 +2730,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let int_bits = self.types.size_bits(int_typ);
                 self.emit_int_binop(Opcode::And, at_least, at_most, int_typ, int_bits)
             };
-            self.emit(Instruction::cbr(cond, case_bb, next));
-            self.link_bb(from, case_bb);
-            self.link_bb(from, next);
+            self.branch_on(Controlling::Value(cond), case_bb, next);
             self.switch_bb(next);
         }
 
-        if let Some(from) = self.current_bb {
-            self.emit(Instruction::br(default_target));
-            self.link_bb(from, default_target);
-        }
+        self.link_to_merge_if_needed(default_target);
     }
 
     pub(crate) fn linearize_switch_body(

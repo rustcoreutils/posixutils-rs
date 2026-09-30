@@ -249,7 +249,7 @@ impl Parser<'_> {
 
         let common = match (lhs.typ, rhs.typ) {
             (Some(l), Some(r)) if self.fp_compare_operands_valid(l, r) => {
-                self.types.common_type(l, r)
+                self.usual_arithmetic_conversions(l, r)
             }
             (Some(_), Some(_)) => {
                 let name = self.idents.get_opt(name_id).unwrap_or("").to_string();

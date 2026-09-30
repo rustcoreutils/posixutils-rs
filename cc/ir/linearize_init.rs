@@ -896,15 +896,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Count the number of scalar fields needed to fill an aggregate type
-    /// (for brace elision per C99 6.7.8p17-20).
-    ///
-    /// The rule itself lives on the type table, because the parser needs the
-    /// same count to decide an incomplete array's bound.
-    pub(crate) fn count_scalar_fields(&self, typ: TypeId) -> usize {
-        self.types.count_scalar_fields(typ)
-    }
-
     /// Check if brace elision applies: the element is a positional scalar targeting
     /// an aggregate member, and is NOT a string literal initializing a char array
     /// (C99 6.7.8p14: string literals are a special case for char arrays).
@@ -925,23 +916,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         elem_idx: &mut usize,
         target_type: TypeId,
     ) -> Vec<InitElement> {
-        let n = self.count_scalar_fields(target_type);
-        let mut sub_elements = Vec::new();
-        let mut consumed = 0;
-        while consumed < n && *elem_idx < elements.len() {
-            let e = &elements[*elem_idx];
-            // Stop at designated elements (they apply to the current aggregate level)
-            if consumed > 0 && !e.designators.is_empty() {
-                break;
-            }
-            sub_elements.push(InitElement {
+        let span =
+            crate::parse::ast::brace_elision_span(self.types, elements, *elem_idx, target_type);
+        *elem_idx = span.end;
+        elements[span]
+            .iter()
+            .map(|e| InitElement {
                 designators: vec![],
                 value: e.value.clone(),
-            });
-            *elem_idx += 1;
-            consumed += 1;
-        }
-        sub_elements
+            })
+            .collect()
     }
 
     /// Group array init elements by index, handling designators, brace elision,
@@ -979,36 +963,8 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         while elem_idx < elements.len() {
             let element = &elements[elem_idx];
-            let mut index = None;
-            let mut index_high = None;
-            let mut index_pos = None;
-            for (pos, designator) in element.designators.iter().enumerate() {
-                match designator {
-                    Designator::Index(idx) => {
-                        index = Some(*idx);
-                        index_pos = Some(pos);
-                        break;
-                    }
-                    Designator::IndexRange(lo, hi) => {
-                        index = Some(*lo);
-                        index_high = Some(*hi);
-                        index_pos = Some(pos);
-                        break;
-                    }
-                    Designator::Field(_) => {}
-                }
-            }
-
-            let element_index = if let Some(idx) = index {
-                // A range leaves the cursor past its *high* endpoint, so a
-                // positional element after `[0 ... 2] = 1` lands at 3.
-                current_idx = index_high.unwrap_or(idx) + 1;
-                idx
-            } else {
-                let idx = current_idx;
-                current_idx += 1;
-                idx
-            };
+            let (element_index, span_end, index_pos) =
+                crate::parse::ast::array_slot(&element.designators, &mut current_idx);
 
             let remaining_designators = match index_pos {
                 Some(pos) => element.designators[pos + 1..].to_vec(),
@@ -1046,7 +1002,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             // keeps the loop off the excess indices rather than walking one
             // iteration per discarded element, which matters for an endpoint
             // far past the array.
-            let span_end = index_high.unwrap_or(element_index);
             let span_end = last_index.map_or(span_end, |last| span_end.min(last));
             if in_bounds(element_index) {
                 for target_index in element_index..=span_end {
@@ -1315,8 +1270,19 @@ impl<'a> super::linearize::Linearizer<'a> {
             StructFieldVisitKind::Expr(expr) => {
                 if let ExprKind::InitList { elements } = &expr.kind {
                     self.record_held_unions(typ, elements, base, held);
+                } else {
+                    self.record_value_unions(typ, base, held);
                 }
             }
+        }
+    }
+
+    /// Every union inside an object of type `typ` at `base` holds the bytes
+    /// of the one value that initialized the object whole. See
+    /// [`Held::Value`].
+    fn record_value_unions(&self, typ: TypeId, base: usize, held: &mut UnionMembers) {
+        if self.type_holds_union(typ) {
+            held.record_value(base..base + self.types.size_bytes(typ));
         }
     }
 
@@ -1550,9 +1516,12 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// place. A subobject the initializer left out gains an empty one, so
     /// that what is written there leaves the rest of its parent alone.
     ///
+    /// A string literal is taken apart into its elements first, so that one
+    /// of them can be replaced.
+    ///
     /// `None` when the existing initializer's shape cannot express the
-    /// subobject -- a string literal standing for a character array, an entry
-    /// for a bit-field carrier rather than for a member -- in which case the
+    /// subobject -- an entry for a bit-field carrier rather than for a
+    /// member -- in which case the
     /// caller discards the earlier initializer whole. It may by then have
     /// gained an empty initializer for a member on the way down, which is
     /// harmless precisely because the whole of it is discarded.
@@ -1616,6 +1585,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let elem_offset = (offset / elem_size) * elem_size;
                 if offset + size > elem_offset + elem_size {
                     return None;
+                }
+                if let Some(exploded) = init.string_as_array(elem_size, self.types.size_bytes(typ))
+                {
+                    *init = exploded;
                 }
                 let Initializer::Array { elements, .. } = init else {
                     return None;
@@ -2201,7 +2174,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             let (index, member) = members
                 .iter()
                 .enumerate()
-                .find(|(_, m)| m.name != StringId::EMPTY || m.bit_width.is_none())?;
+                .find(|(_, m)| m.is_initializable())?;
             *current_field_idx = members.len();
             return Some((
                 MemberInfo {
@@ -2219,12 +2192,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         while *current_field_idx < members.len() {
             let index = *current_field_idx;
             let member = &members[index];
-            if member.name == StringId::EMPTY && member.bit_width.is_some() {
-                *current_field_idx += 1;
-                continue;
-            }
-            if member.name != StringId::EMPTY || member.bit_width.is_none() {
-                *current_field_idx += 1;
+            *current_field_idx += 1;
+            if member.is_initializable() {
                 return Some((
                     MemberInfo {
                         offset: member.offset,
@@ -2237,7 +2206,6 @@ impl<'a> super::linearize::Linearizer<'a> {
                     index,
                 ));
             }
-            *current_field_idx += 1;
         }
 
         None
@@ -2280,7 +2248,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             while idx < members.len() {
                 let inner = &members[idx];
                 // Skip unnamed bitfield padding
-                if inner.name == StringId::EMPTY && inner.bit_width.is_some() {
+                if !inner.is_initializable() {
                     idx += 1;
                     continue;
                 }

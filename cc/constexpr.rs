@@ -22,6 +22,7 @@
 
 use crate::float::{Complex, FloatVal, FpFormat};
 use crate::parse::ast::{BinaryOp, Expr, ExprKind, FpTest, InlineLibraryFn, OffsetOfPath, UnaryOp};
+use crate::strings::StringId;
 use crate::symbol::SymbolId;
 use crate::target::Target;
 use crate::types::{TypeId, TypeKind, TypeTable};
@@ -287,33 +288,50 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             eval(env, scope, inner)
         }
 
-        ExprKind::OffsetOf { type_id, path } => {
-            let mut offset: i128 = 0;
-            let mut current_type = *type_id;
-
-            for element in path {
-                match element {
-                    OffsetOfPath::Field(field_id) => {
-                        let struct_type = env.struct_of(current_type);
-                        // None if the field is not found
-                        let member_info = env.types().find_member(struct_type, *field_id)?;
-                        offset += member_info.offset as i128;
-                        current_type = member_info.typ;
-                    }
-                    OffsetOfPath::Index(index) => {
-                        // None if this is not an array type
-                        let elem_type = env.types().base_type(current_type)?;
-                        offset += *index as i128 * env.types().size_bytes(elem_type) as i128;
-                        current_type = elem_type;
-                    }
-                }
-            }
-
-            Some(offset)
-        }
+        ExprKind::OffsetOf { type_id, path } => offset_of(env, *type_id, path),
 
         _ => None,
     }
+}
+
+/// `offsetof(typ, path)`: the byte offset the member designator `path`
+/// names inside an object of type `typ`, or `None` if it names nothing.
+///
+/// The one walk of an `offsetof` path. The linearizer, asked for the value
+/// of the same expression outside a constant context, asks this too.
+pub(crate) fn offset_of(env: &impl ConstEnv, typ: TypeId, path: &[OffsetOfPath]) -> Option<i128> {
+    let mut offset: i128 = 0;
+    let mut current = typ;
+    for element in path {
+        match element {
+            OffsetOfPath::Field(field) => {
+                let (at, typ) = member_at(env, current, *field)?;
+                offset += at;
+                current = typ;
+            }
+            OffsetOfPath::Index(index) => {
+                let elem = env.types().base_type(current)?;
+                offset += *index as i128 * env.types().size_bytes(elem) as i128;
+                current = elem;
+            }
+        }
+    }
+    Some(offset)
+}
+
+/// The byte offset of `member` inside an object of type `aggregate`, and the
+/// member's declared type -- resolving an incomplete tag to its definition
+/// first. `None` if the aggregate has no such member.
+///
+/// The step `s.m`, `p->m` (with `aggregate` the pointee) and `offsetof` all
+/// take, whether folding a constant or placing a static address.
+pub(crate) fn member_at(
+    env: &impl ConstEnv,
+    aggregate: TypeId,
+    member: StringId,
+) -> Option<(i128, TypeId)> {
+    let info = env.types().find_member(env.struct_of(aggregate), member)?;
+    Some((info.offset as i128, info.typ))
 }
 
 fn eval_binary(
@@ -1021,17 +1039,13 @@ pub(crate) fn eval_pointer(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) 
 
         ExprKind::Member { expr: base, member } => {
             let base_offset = eval_pointer(env, scope, base)?;
-            let struct_type = env.struct_of(base.typ?);
-            let member_info = env.types().find_member(struct_type, *member)?;
-            Some(base_offset + member_info.offset as i128)
+            Some(base_offset + member_at(env, base.typ?, *member)?.0)
         }
 
         ExprKind::Arrow { expr: base, member } => {
             let base_offset = eval_pointer(env, scope, base)?;
-            let pointee_type = env.types().base_type(base.typ?)?;
-            let struct_type = env.struct_of(pointee_type);
-            let member_info = env.types().find_member(struct_type, *member)?;
-            Some(base_offset + member_info.offset as i128)
+            let pointee = env.types().base_type(base.typ?)?;
+            Some(base_offset + member_at(env, pointee, *member)?.0)
         }
 
         ExprKind::Index { array, index } => {

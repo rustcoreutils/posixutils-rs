@@ -3091,3 +3091,125 @@ int main(void)
         0
     );
 }
+
+/// A union whose first member is an anonymous structure takes that
+/// structure's scalars when its braces are elided (C17 6.7.9p17, 6.7.2.1p13).
+///
+/// The count brace elision runs on asked for the union's first *named*
+/// member, which skips the anonymous one and found `q`, while the initializer
+/// walk filled `a` and `b`: `union U u[] = {1, 2, 3, 4}` came out as four
+/// elements, each holding one value.
+#[test]
+fn c99_an_anonymous_first_union_member_counts_for_brace_elision() {
+    let code = r#"
+union U { struct { int a, b; }; long q; };
+union U u[] = { 1, 2, 3, 4 };
+int main(void) {
+    if (sizeof u / sizeof u[0] != 2) return 1;
+    if (u[0].a != 1 || u[0].b != 2 || u[1].a != 3 || u[1].b != 4) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_anon_union_count", code, &[]), 0);
+}
+
+/// A later designator reaching inside something a whole *value* initialized
+/// keeps the rest of that value, through a union exactly as through a
+/// struct.
+///
+/// Which member a union value last had stored into it is a fact about the
+/// run, so c17 treats its bytes as a value and replaces only what the later
+/// designator names. A union initialized that way was reset instead, while
+/// the same shape through a struct kept its value. gcc discards the whole
+/// earlier initializer in both cases; see DECISIONS.md.
+#[test]
+fn c99_an_override_inside_a_value_initialized_union_keeps_the_value() {
+    let code = r#"
+struct P { int a, b; };
+union U { struct P s; long l; };
+struct O { union U u; int z; };
+struct Q { struct P t; int z; };
+int main(void) {
+    union U v = { .s = { 1, 2 } };
+    struct P p = { 5, 6 };
+    struct O o = { .u = v, .u.s.b = 9 };
+    struct Q q = { .t = p, .t.b = 9 };
+    if (o.u.s.a != 1 || o.u.s.b != 9) return 1;
+    if (q.t.a != 5 || q.t.b != 9) return 2;
+    return 0;
+}
+"#;
+    for level in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                &format!("c99_union_value_override{level}"),
+                code,
+                &[level.to_string()]
+            ),
+            0,
+            "{level}"
+        );
+    }
+}
+
+/// A designator naming one element of an array a string literal initialized
+/// replaces that element and keeps the rest (C17 6.7.9p19).
+///
+/// A literal is one initializer for the whole array, so a static object had
+/// nothing to replace the element in and dropped the literal whole: `sc.s`
+/// came out as `"\0z"`. The literal is taken apart into its elements first.
+#[test]
+fn c99_an_override_inside_a_string_initializer_keeps_the_string() {
+    let code = r#"
+struct C { char s[6]; int z; };
+static struct C sc = { .s = "abcd", .s[1] = 'z' };
+int main(void) {
+    struct C lc = { .s = "abcd", .s[1] = 'z' };
+    const char *want = "azcd";
+    for (int i = 0; i < 6; i++) {
+        char e = i < 4 ? want[i] : 0;
+        if (sc.s[i] != e) return 1 + i;
+        if (lc.s[i] != e) return 10 + i;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_string_override", code, &[]), 0);
+}
+
+/// Two shapes a deleted branch once miscompiled, pinned now that they are
+/// right: a designated initializer of an eight-byte struct written out of
+/// member order (a store widened over the second member), and the tail of a
+/// short string in a longer array, which must read as zero however dirty the
+/// frame was before.
+#[test]
+fn c99_out_of_order_designators_and_string_tails_are_exact() {
+    let code = r#"
+struct T { int a, b; };
+__attribute__((noinline)) struct T mk(int x, int y) { struct T s = { .b = y, .a = x }; return s; }
+__attribute__((noinline)) int tail(void) {
+    char junk[64];
+    __builtin_memset(junk, 'X', sizeof junk);
+    __asm__ volatile("" :: "r"(junk) : "memory");
+    char s[13] = "ab";
+    for (int i = 2; i < 13; i++) if (s[i] != 0) return 100 + i;
+    return 0;
+}
+int main(void) {
+    struct T t = mk(3, 4);
+    if (t.a != 3 || t.b != 4) return 1;
+    for (int k = 0; k < 3; k++) { int r = tail(); if (r) return r; }
+    return 0;
+}
+"#;
+    for level in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("c99_frame_a{level}"), code, &[level.to_string()]),
+            0,
+            "{level}"
+        );
+        if let Some(rc) = compile_and_run_aarch64("c99_frame_a_a64", code, level) {
+            assert_eq!(rc, 0, "aarch64 {level}");
+        }
+    }
+}

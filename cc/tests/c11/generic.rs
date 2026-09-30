@@ -166,3 +166,42 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c11_generic_has_feature", code, &[]), 0);
 }
+
+/// An rvalue has no qualifiers: the value of an assignment, of `++`/`--`, of
+/// a cast, of a call and of a conditional is the unqualified type (C17
+/// 6.5.16p3, 6.5.4p5, 6.7.6.3p4, 6.5.15). `_Generic` lvalue-converts its
+/// operand and so cannot see it; `__typeof__` behind a pointer can. c17 typed
+/// `v = 1` for a `volatile int v` as `volatile int`.
+///
+/// Two pointer arms merge to a pointer to the composite type qualified with
+/// *both* pointees' qualifiers (6.5.15p6), or to qualified `void`: taking the
+/// first arm's type dropped `const` from `c ? p : cp` and kept it for
+/// `c ? cp : p`. The last case is the control: an lvalue keeps its qualifier.
+#[test]
+fn c11_an_rvalue_carries_no_qualifier() {
+    let code = r#"
+#define QUALS(e) ({ __typeof__(e) *p_ = 0; _Generic(p_, int *: 0, const int *: 1, \
+    volatile int *: 2, const volatile int *: 3, default: 9); })
+#define PTR(e) _Generic((e), int *: 0, const int *: 1, void *: 2, const void *: 3, \
+    default: 9)
+volatile int v; const int c = 1; int x;
+volatile int vf(void) { return 1; }
+int *p; const int *cp; void *vp;
+int main(void) {
+    if (QUALS(v = 1)) return 1;
+    if (QUALS(v += 1)) return 2;
+    if (QUALS(++v)) return 3;
+    if (QUALS(v--)) return 4;
+    if (QUALS((const int)x)) return 5;
+    if (QUALS(vf())) return 6;
+    if (QUALS(x ? v : c)) return 7;
+    if (PTR(x ? p : cp) != 1) return 8;
+    if (PTR(x ? cp : p) != 1) return 9;
+    if (PTR(x ? vp : cp) != 3) return 10;
+    if (PTR(x ? vp : p) != 2) return 11;
+    if (QUALS(v) != 2) return 12;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c11_rvalue_unqualified", code, &[]), 0);
+}

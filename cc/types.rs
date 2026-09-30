@@ -65,6 +65,18 @@ pub struct StructMember {
     pub explicit_align: Option<u32>,
 }
 
+impl StructMember {
+    /// Does an initializer reach this member?
+    ///
+    /// Everything but an unnamed bit-field, which is padding rather than a
+    /// member (C17 6.7.2.1p12) and is skipped by positional initialization
+    /// (6.7.9p9). An anonymous structure or union *is* reached: it is the
+    /// member its own members live in (6.7.2.1p13).
+    pub fn is_initializable(&self) -> bool {
+        self.name != StringId::EMPTY || self.bit_width.is_none()
+    }
+}
+
 /// Information about a struct/union member lookup
 #[derive(Debug, Clone, Copy)]
 pub struct MemberInfo {
@@ -1992,8 +2004,7 @@ impl TypeTable {
                     composite
                         .members
                         .iter()
-                        // Skip unnamed bitfield padding
-                        .filter(|m| m.name != StringId::EMPTY || m.bit_width.is_none())
+                        .filter(|m| m.is_initializable())
                         .map(|m| self.count_scalar_fields(m.typ))
                         .sum()
                 } else {
@@ -2001,12 +2012,17 @@ impl TypeTable {
                 }
             }
             TypeKind::Union => {
-                // Union only initializes first named member
+                // A union's initializer initializes its first member (C17
+                // 6.7.9p17) -- which may be an anonymous aggregate, so the
+                // test is the one positional initialization uses, not "has a
+                // name": asking for a name counted `q` in
+                // `union { struct { int a, b; }; long q; }` while the
+                // initializer walk filled `a` and `b`.
                 if let Some(composite) = self.get(id).composite.as_ref() {
                     composite
                         .members
                         .iter()
-                        .find(|m| m.name != StringId::EMPTY)
+                        .find(|m| m.is_initializable())
                         .map(|m| self.count_scalar_fields(m.typ))
                         .unwrap_or(1)
                 } else {

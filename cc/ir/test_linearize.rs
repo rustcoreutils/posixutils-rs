@@ -10257,3 +10257,31 @@ fn a_backward_goto_past_a_vla_declaration_releases_it() {
          the path that falls out of the block releases it too"
     );
 }
+
+/// A union a whole value initialized holds that value's bytes, so a later
+/// designator through *any* member keeps them; one a list initialized agrees
+/// only with the member the list named. Recording a value forgets what was
+/// said before inside it, and a later member record inside wins.
+#[test]
+fn test_a_value_initialized_union_agrees_with_any_member() {
+    let types = TypeTable::new(&Target::host());
+    let u = types.int_id; // stands in for the union type; only identity matters
+    let mut value = UnionMembers::default();
+    value.record(0, u, 1);
+    value.record_value(0..8);
+    let mut named = UnionMembers::default();
+    named.record(0, u, 0);
+    assert_eq!(UnionFold::new(&value, &named, 0).agreed(u), Some(0));
+
+    let mut listed = UnionMembers::default();
+    listed.record(0, u, 1);
+    assert_eq!(UnionFold::new(&listed, &named, 0).agreed(u), None);
+    named.record(0, u, 1);
+    assert_eq!(UnionFold::new(&listed, &named, 0).agreed(u), Some(1));
+
+    // Discarding part of the value's bytes leaves nothing to agree with.
+    value.clear_range(0..4);
+    let mut named0 = UnionMembers::default();
+    named0.record(0, u, 0);
+    assert_eq!(UnionFold::new(&value, &named0, 0).agreed(u), None);
+}

@@ -28,14 +28,8 @@
 //        pass with a confusing error far from the source bug. I3
 //        catches this at the optimizer/codegen boundary instead.
 //
-//        Covered fields:
-//        - `insn.bb_true`  (used by Br, Cbr)
-//        - `insn.bb_false` (used by Cbr)
-//        - `insn.switch_cases[i].1` (Switch case targets)
-//        - `insn.switch_default`    (Switch default target)
-//
-//        Inline-asm goto targets (`AsmData.goto_labels`) are also
-//        checked.
+//        The targets are `Instruction::control_targets`: a branch's and a
+//        switch's, and an `asm goto`'s labels.
 //
 //   I2 — MEMORY BARRIERS ARE DCE ROOTS
 //        Every instruction for which `Instruction::is_memory_barrier()`
@@ -63,14 +57,26 @@
 //        constant reads as a symbol or a register as a constant. Every pseudo
 //        must be found at its own position.
 //
-// The validator is intended to run only in debug builds — production
-// builds skip it for zero overhead. Call via:
+//   I8 — THE CFG CACHE AGREES WITH THE INSTRUCTIONS
+//        Every block ends in exactly one terminator; `children` is exactly the
+//        successors its instructions name (`BasicBlock::named_successors`, or
+//        address-taken blocks for a computed `goto`); `parents` is exactly the
+//        inverse of `children`; `get_block` finds every block where it is.
 //
-//     #[cfg(debug_assertions)]
-//     validate::validate_module(&module).unwrap();
+//   I9 — PHIS AGREE WITH THE EDGES
+//        Every phi takes one operand along each predecessor edge and no
+//        other, and every `PhiSource` feeds a phi in a successor of its own
+//        block. Only while the IR is in SSA form; lowering removes both.
+//
+// The validator runs always, in every build, through [`verify`]: after
+// linearization, after optimization, and after lowering. It is a linear walk,
+// and a structural error it catches is a miscompile it would otherwise have
+// shipped -- `cargo test --release`, the torture harness and a released `c17`
+// all run without debug assertions, which is where it used to live, so it ran
+// in none of them.
 
 use super::{BasicBlockId, Function, Module, Opcode, PseudoId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 // Error model
@@ -125,6 +131,13 @@ pub enum ValidationError {
         block: usize,
         index: usize,
         offset: i64,
+    },
+    /// I8 or I9 violation: the CFG cache, or a phi, disagrees with the
+    /// instructions or with the other edges.
+    CfgInconsistent {
+        function: String,
+        block: BasicBlockId,
+        what: String,
     },
     /// I7 violation: `get_pseudo` does not find this pseudo at its own
     /// position in `pseudos`.
@@ -205,6 +218,14 @@ impl fmt::Display for ValidationError {
                 "[ir-validate I6] in function `{function}`: bb={block} insn={index} \
                  load/store offset {offset} does not fit a 32-bit displacement"
             ),
+            ValidationError::CfgInconsistent {
+                function,
+                block,
+                what,
+            } => write!(
+                f,
+                "[ir-validate I8/I9] in function `{function}`: {block}: {what}"
+            ),
             ValidationError::StalePseudoIndex { function, pseudo } => write!(
                 f,
                 "[ir-validate I7] in function `{function}`: pseudo {pseudo:?} is not \
@@ -228,15 +249,39 @@ impl std::error::Error for ValidationError {}
 
 // Entry points
 
-/// Validate every function in a module. Returns the full list of violations
-/// (across all functions) when something is wrong, or `Ok(())` otherwise.
+/// Where in the pipeline the IR is being checked, which decides what holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// SSA form, from linearization through optimization: every invariant.
+    Ssa,
+    /// After `lower`: phi elimination has deliberately given pseudos several
+    /// definitions and removed every phi, so I1 and I9 no longer apply, and
+    /// no placeholder may remain (I4).
+    Lowered,
+}
+
+/// Check every function of `module`, and stop the compiler on a violation.
 ///
-/// Validation is non-fatal here so that debug-build callers can log and
-/// continue. Production builds skip the call via `cfg!(debug_assertions)`.
-pub fn validate_module(module: &Module) -> Result<(), Vec<ValidationError>> {
+/// A violation is a compiler bug, never a problem with the program, so it is
+/// reported as an internal compiler error rather than a diagnostic, naming
+/// the pipeline point that found it.
+pub fn verify(module: &Module, stage: Stage, after: &str) {
+    if let Err(errors) = validate_module_at(module, stage) {
+        let list = errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        panic!("internal compiler error: invalid IR after {after}:\n  {list}");
+    }
+}
+
+/// Validate every function in a module at `stage`. Returns the full list of
+/// violations (across all functions) when something is wrong.
+pub fn validate_module_at(module: &Module, stage: Stage) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     for func in &module.functions {
-        if let Err(mut errs) = validate_function(func) {
+        if let Err(mut errs) = validate_function_at(func, stage) {
             errors.append(&mut errs);
         }
     }
@@ -245,6 +290,11 @@ pub fn validate_module(module: &Module) -> Result<(), Vec<ValidationError>> {
     } else {
         Err(errors)
     }
+}
+
+/// Validate every function in a module in SSA form.
+pub fn validate_module(module: &Module) -> Result<(), Vec<ValidationError>> {
+    validate_module_at(module, Stage::Ssa)
 }
 
 /// I4 -- no placeholder opcode survives to codegen.
@@ -274,16 +324,32 @@ pub fn check_no_placeholders(func: &Function) -> Result<(), Vec<ValidationError>
     }
 }
 
-/// Validate a single function, for callers holding hand-built IR rather
-/// than a whole Module.
+/// Validate a single function in SSA form, for callers holding hand-built IR
+/// rather than a whole Module.
 pub fn validate_function(func: &Function) -> Result<(), Vec<ValidationError>> {
+    validate_function_at(func, Stage::Ssa)
+}
+
+/// Validate a single function at `stage`.
+pub fn validate_function_at(func: &Function, stage: Stage) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
-    check_single_def(func, &mut errors);
+    match stage {
+        Stage::Ssa => {
+            check_single_def(func, &mut errors);
+            check_phis(func, &mut errors);
+        }
+        Stage::Lowered => {
+            if let Err(mut e) = check_no_placeholders(func) {
+                errors.append(&mut e);
+            }
+        }
+    }
     check_barrier_implies_side_effect(func, &mut errors);
     check_memory_access_implies_side_effect(func, &mut errors);
     check_branch_targets_valid(func, &mut errors);
     check_displacements_in_range(func, &mut errors);
     check_pseudo_index(func, &mut errors);
+    check_cfg(func, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -361,7 +427,6 @@ fn check_displacements_in_range(func: &Function, out: &mut Vec<ValidationError>)
 /// bugs at the optimizer/codegen boundary, where they would otherwise
 /// surface as label-resolution failures inside the codegen layer.
 fn check_branch_targets_valid(func: &Function, out: &mut Vec<ValidationError>) {
-    use std::collections::HashSet;
     let valid: HashSet<BasicBlockId> = func.blocks.iter().map(|b| b.id).collect();
     let check = |bb_idx: usize,
                  insn_idx: usize,
@@ -380,22 +445,8 @@ fn check_branch_targets_valid(func: &Function, out: &mut Vec<ValidationError>) {
     };
     for (bb_idx, bb) in func.blocks.iter().enumerate() {
         for (insn_idx, insn) in bb.insns.iter().enumerate() {
-            if let Some(t) = insn.bb_true {
+            for t in insn.control_targets() {
                 check(bb_idx, insn_idx, insn.op, t, out);
-            }
-            if let Some(t) = insn.bb_false {
-                check(bb_idx, insn_idx, insn.op, t, out);
-            }
-            for (_, _, target) in &insn.switch_cases {
-                check(bb_idx, insn_idx, insn.op, *target, out);
-            }
-            if let Some(t) = insn.switch_default {
-                check(bb_idx, insn_idx, insn.op, t, out);
-            }
-            if let Some(asm) = &insn.asm_data {
-                for (target, _) in &asm.goto_labels {
-                    check(bb_idx, insn_idx, insn.op, *target, out);
-                }
             }
         }
     }
@@ -451,6 +502,173 @@ fn check_memory_access_implies_side_effect(func: &Function, out: &mut Vec<Valida
     }
 }
 
+/// I8 -- the CFG cache agrees with the instructions.
+///
+/// * Every block ends in exactly one terminator, and has no other.
+/// * `children` lists each successor once, and is exactly what the block's
+///   instructions name ([`BasicBlock::named_successors`]); a block ending in
+///   `IndirectBr` names none, and each of its successors must be a block
+///   whose address is taken.
+/// * `parents` is exactly the inverse of `children`.
+/// * `get_block` finds every block, at its own position.
+///
+/// `validate` held six invariants and none of them was about the CFG, so a
+/// `for` loop's back edge linked from the wrong block passed it in both
+/// copies of the loop lowering, and `dce` could drop a `children` edge and
+/// leave `parents` naming it with nothing to notice.
+fn check_cfg(func: &Function, out: &mut Vec<ValidationError>) {
+    let bad = |block: BasicBlockId, what: String, out: &mut Vec<ValidationError>| {
+        out.push(ValidationError::CfgInconsistent {
+            function: func.name.clone(),
+            block,
+            what,
+        });
+    };
+
+    let mut seen = HashSet::new();
+    for (idx, bb) in func.blocks.iter().enumerate() {
+        if !seen.insert(bb.id) {
+            bad(bb.id, "block id used twice".into(), out);
+        }
+        if func.block_index(bb.id) != Some(idx) {
+            bad(
+                bb.id,
+                format!(
+                    "block index says {:?}, block is at {idx}",
+                    func.block_index(bb.id)
+                ),
+                out,
+            );
+        }
+        match bb.insns.iter().position(|i| i.op.is_terminator()) {
+            None => bad(bb.id, "no terminator".into(), out),
+            Some(p) if p + 1 != bb.insns.len() => bad(
+                bb.id,
+                format!("terminator at {p} is not the last instruction"),
+                out,
+            ),
+            Some(_) => {}
+        }
+
+        let children: HashSet<BasicBlockId> = bb.children.iter().copied().collect();
+        if children.len() != bb.children.len() {
+            bad(bb.id, "an edge is listed twice in children".into(), out);
+        }
+        match bb.named_successors() {
+            Some(named) => {
+                let named: HashSet<BasicBlockId> = named.into_iter().collect();
+                if named != children {
+                    bad(
+                        bb.id,
+                        format!(
+                            "instructions name {} but children are {}",
+                            ids(&named),
+                            ids(&children)
+                        ),
+                        out,
+                    );
+                }
+            }
+            None => {
+                for c in &children {
+                    if !func.get_block(*c).is_some_and(|b| b.addr_taken) {
+                        bad(
+                            bb.id,
+                            format!("computed goto reaches {c}, whose address is not taken"),
+                            out,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let mut expected: HashMap<BasicBlockId, HashSet<BasicBlockId>> = HashMap::new();
+    for bb in &func.blocks {
+        for c in &bb.children {
+            expected.entry(*c).or_default().insert(bb.id);
+        }
+    }
+    for bb in &func.blocks {
+        let have: HashSet<BasicBlockId> = bb.parents.iter().copied().collect();
+        if have.len() != bb.parents.len() {
+            bad(bb.id, "an edge is listed twice in parents".into(), out);
+        }
+        let want = expected.remove(&bb.id).unwrap_or_default();
+        if have != want {
+            bad(
+                bb.id,
+                format!(
+                    "parents are {} but {} name it as a successor",
+                    ids(&have),
+                    ids(&want)
+                ),
+                out,
+            );
+        }
+    }
+    for (missing, from) in expected {
+        bad(
+            missing,
+            format!("is a successor of {} but is not a block", ids(&from)),
+            out,
+        );
+    }
+}
+
+/// I9 -- every phi takes exactly one operand along each incoming edge, and a
+/// `PhiSource` feeds a phi in a successor of its own block.
+///
+/// Phi elimination puts the copy for an edge at the end of its source, so a
+/// phi operand naming a block that is not a predecessor is a copy into
+/// nowhere, and a predecessor with no operand leaves the phi undefined along
+/// that edge.
+fn check_phis(func: &Function, out: &mut Vec<ValidationError>) {
+    for bb in &func.blocks {
+        let parents: HashSet<BasicBlockId> = bb.parents.iter().copied().collect();
+        for insn in &bb.insns {
+            match insn.op {
+                Opcode::Phi => {
+                    let preds: Vec<BasicBlockId> = insn.phi_list.iter().map(|(p, _)| *p).collect();
+                    let set: HashSet<BasicBlockId> = preds.iter().copied().collect();
+                    if set.len() != preds.len() || set != parents {
+                        out.push(ValidationError::CfgInconsistent {
+                            function: func.name.clone(),
+                            block: bb.id,
+                            what: format!(
+                                "phi {:?} takes operands along {} but the predecessors are {}",
+                                insn.target,
+                                ids(&set),
+                                ids(&parents)
+                            ),
+                        });
+                    }
+                }
+                Opcode::PhiSource => {
+                    let feeds = insn.phi_list.first().map(|p| p.0);
+                    if !feeds.is_some_and(|f| bb.children.contains(&f)) {
+                        out.push(ValidationError::CfgInconsistent {
+                            function: func.name.clone(),
+                            block: bb.id,
+                            what: format!(
+                                "phisrc {:?} feeds {feeds:?}, not a successor",
+                                insn.target
+                            ),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn ids(s: &HashSet<BasicBlockId>) -> String {
+    let mut v: Vec<u32> = s.iter().map(|b| b.0).collect();
+    v.sort_unstable();
+    format!("{v:?}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,12 +682,19 @@ mod tests {
         func.entry = BasicBlockId(0);
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.insns.push(Instruction::new(Opcode::Entry));
+        bb.insns.push(Instruction::ret(None));
         func.add_block(bb);
         func
     }
 
+    /// Add `insn` to block 0, ahead of its terminator.
     fn push(func: &mut Function, insn: Instruction) {
-        func.blocks[0].insns.push(insn);
+        func.blocks[0].insert_before_terminator(insn);
+    }
+
+    /// Replace block 0's terminator.
+    fn terminate(func: &mut Function, insn: Instruction) {
+        *func.blocks[0].insns.last_mut().unwrap() = insn;
     }
 
     fn copy_insn(dst: u32, src: u32) -> Instruction {
@@ -605,7 +830,14 @@ mod tests {
         psrc.phi_list = vec![(BasicBlockId(5), PseudoId(2))];
         push(&mut func, psrc);
 
-        assert!(validate_function(&func).is_ok());
+        // The CFG here is not a real one; only I1 is under test.
+        let errors = validate_function(&func).err().unwrap_or_default();
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MultipleDefinitions { .. })),
+            "{errors:?}"
+        );
     }
 
     /// I2 — structural enforcement that every barrier opcode is also in
@@ -745,7 +977,8 @@ mod tests {
         let mut bb1 = crate::ir::BasicBlock::new(BasicBlockId(1));
         bb1.insns.push(Instruction::ret(None));
         func.add_block(bb1);
-        push(&mut func, Instruction::br(BasicBlockId(1)));
+        terminate(&mut func, Instruction::br(BasicBlockId(1)));
+        func.add_edge(BasicBlockId(0), BasicBlockId(1));
         assert!(validate_function(&func).is_ok());
     }
 
@@ -754,7 +987,7 @@ mod tests {
     #[test]
     fn i3_invalid_br_target_flagged() {
         let mut func = fresh_func("invalid_br");
-        push(&mut func, Instruction::br(BasicBlockId(99)));
+        terminate(&mut func, Instruction::br(BasicBlockId(99)));
         let errors = validate_function(&func).unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
@@ -775,7 +1008,7 @@ mod tests {
         bb1.insns.push(Instruction::ret(None));
         func.add_block(bb1);
         // bb_true exists, bb_false doesn't.
-        push(
+        terminate(
             &mut func,
             Instruction::cbr(PseudoId(0), BasicBlockId(1), BasicBlockId(7)),
         );
@@ -788,5 +1021,153 @@ mod tests {
                 ..
             } if *target == BasicBlockId(7)
         )));
+    }
+
+    /// A diamond: 0 branches to 1 and 2, both of which reach 3, where one phi
+    /// merges what each arm supplies. Every edge recorded both ways.
+    fn diamond() -> Function {
+        let types = TypeTable::new(&Target::host());
+        let int = types.int_id;
+        let mut func = Function::new("diamond", int);
+        func.entry = BasicBlockId(0);
+        for i in 0..8 {
+            func.add_pseudo(Pseudo::reg(PseudoId(i), i));
+        }
+        let mut b0 = BasicBlock::new(BasicBlockId(0));
+        b0.add_insn(Instruction::new(Opcode::Entry));
+        b0.add_insn(Instruction::cbr(
+            PseudoId(0),
+            BasicBlockId(1),
+            BasicBlockId(2),
+        ));
+        let mut b1 = BasicBlock::new(BasicBlockId(1));
+        let mut src1 = Instruction::phi_source(PseudoId(4), PseudoId(1), int, 32);
+        src1.phi_list = vec![(BasicBlockId(3), PseudoId(3))];
+        b1.add_insn(src1);
+        b1.add_insn(Instruction::br(BasicBlockId(3)));
+        let mut b2 = BasicBlock::new(BasicBlockId(2));
+        let mut src2 = Instruction::phi_source(PseudoId(5), PseudoId(2), int, 32);
+        src2.phi_list = vec![(BasicBlockId(3), PseudoId(3))];
+        b2.add_insn(src2);
+        b2.add_insn(Instruction::br(BasicBlockId(3)));
+        let mut b3 = BasicBlock::new(BasicBlockId(3));
+        let mut phi = Instruction::phi(PseudoId(3), int, 32);
+        phi.phi_list = vec![
+            (BasicBlockId(1), PseudoId(4)),
+            (BasicBlockId(2), PseudoId(5)),
+        ];
+        b3.add_insn(phi);
+        b3.add_insn(Instruction::ret(Some(PseudoId(3))));
+        for b in [b0, b1, b2, b3] {
+            func.add_block(b);
+        }
+        for (f, t) in [(0, 1), (0, 2), (1, 3), (2, 3)] {
+            func.add_edge(BasicBlockId(f), BasicBlockId(t));
+        }
+        func
+    }
+
+    fn cfg_errors(func: &Function, stage: Stage) -> Vec<String> {
+        match validate_function_at(func, stage) {
+            Ok(()) => vec![],
+            Err(errs) => errs
+                .into_iter()
+                .filter(|e| matches!(e, ValidationError::CfgInconsistent { .. }))
+                .map(|e| e.to_string())
+                .collect(),
+        }
+    }
+
+    /// I8/I9 -- the baseline: a consistent diamond passes, and every one of
+    /// the ways below of breaking it is caught on its own.
+    #[test]
+    fn i8_a_consistent_cfg_passes() {
+        assert!(
+            validate_function(&diamond()).is_ok(),
+            "{:?}",
+            validate_function(&diamond())
+        );
+    }
+
+    /// I8: `parents` must be the inverse of `children`. `dce` once dropped a
+    /// `children` edge and left `parents` naming it.
+    #[test]
+    fn i8_a_stale_parent_is_flagged() {
+        let mut f = diamond();
+        f.blocks[3].parents.retain(|p| *p != BasicBlockId(2));
+        let e = cfg_errors(&f, Stage::Ssa);
+        assert!(e.iter().any(|m| m.contains("parents are")), "{e:?}");
+    }
+
+    /// I8: `children` must be what the terminator names.
+    #[test]
+    fn i8_an_edge_the_terminator_does_not_name_is_flagged() {
+        let mut f = diamond();
+        *f.blocks[0].insns.last_mut().unwrap() = Instruction::br(BasicBlockId(1));
+        let e = cfg_errors(&f, Stage::Ssa);
+        assert!(e.iter().any(|m| m.contains("instructions name")), "{e:?}");
+    }
+
+    /// I8: one terminator, last.
+    #[test]
+    fn i8_a_terminator_that_is_not_last_is_flagged() {
+        let mut f = diamond();
+        f.blocks[3].insns.push(Instruction::new(Opcode::Nop));
+        let e = cfg_errors(&f, Stage::Ssa);
+        assert!(e.iter().any(|m| m.contains("is not the last")), "{e:?}");
+        let mut f = diamond();
+        f.blocks[3].insns.pop();
+        let e = cfg_errors(&f, Stage::Ssa);
+        assert!(e.iter().any(|m| m.contains("no terminator")), "{e:?}");
+    }
+
+    /// I8: `get_block` must find each block where it is. Rebuilding the index
+    /// is a manual obligation after any change to `blocks`.
+    #[test]
+    fn i8_a_stale_block_index_is_flagged() {
+        let mut f = diamond();
+        f.blocks.swap(1, 2);
+        let e = cfg_errors(&f, Stage::Ssa);
+        assert!(e.iter().any(|m| m.contains("block index")), "{e:?}");
+    }
+
+    /// I9: a phi takes exactly one operand per predecessor. Only in SSA form:
+    /// after lowering there are no phis to ask.
+    #[test]
+    fn i9_a_phi_missing_an_incoming_edge_is_flagged() {
+        let mut f = diamond();
+        f.blocks[3].insns[0].phi_list.pop();
+        let e = cfg_errors(&f, Stage::Ssa);
+        assert!(
+            e.iter().any(|m| m.contains("takes operands along")),
+            "{e:?}"
+        );
+        assert!(cfg_errors(&f, Stage::Lowered).is_empty());
+    }
+
+    /// I9: a `PhiSource` feeds a phi in a successor of its own block.
+    #[test]
+    fn i9_a_phisource_feeding_a_non_successor_is_flagged() {
+        let mut f = diamond();
+        f.blocks[1].insns[0].phi_list = vec![(BasicBlockId(2), PseudoId(3))];
+        let e = cfg_errors(&f, Stage::Ssa);
+        assert!(e.iter().any(|m| m.contains("not a successor")), "{e:?}");
+    }
+
+    /// `remove_edge` leaves a consistent graph: both lists, the phi operand
+    /// taken along the edge, and the `PhiSource` that supplied it all go.
+    #[test]
+    fn cfg_remove_edge_keeps_every_invariant() {
+        let mut f = diamond();
+        *f.blocks[0].insns.last_mut().unwrap() = Instruction::br(BasicBlockId(1));
+        f.remove_edge(BasicBlockId(0), BasicBlockId(2));
+        f.remove_edge(BasicBlockId(2), BasicBlockId(3));
+        f.blocks.retain(|b| b.id != BasicBlockId(2));
+        f.rebuild_block_idx();
+        assert!(validate_function(&f).is_ok(), "{:?}", validate_function(&f));
+        assert_eq!(
+            f.blocks[2].insns[0].phi_list,
+            vec![(BasicBlockId(1), PseudoId(4))]
+        );
     }
 }

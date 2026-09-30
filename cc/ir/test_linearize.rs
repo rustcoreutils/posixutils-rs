@@ -9247,64 +9247,36 @@ fn x86_64_linux() -> Target {
 
 // CFG consistency
 
-/// Every block's recorded successors are exactly the blocks its terminator
-/// names, and `parents` is the inverse of `children`.
+/// A terminator control never returns from ends its block: what the source
+/// says after `longjmp` or `__builtin_unreachable` is lowered into a fresh
+/// block, never after the terminator in the same one.
 ///
-/// Returns a description of the first inconsistency, or `None`.
-fn cfg_inconsistency(func: &Function) -> Option<String> {
-    use std::collections::HashSet;
-
-    for bb in &func.blocks {
-        let children: HashSet<BasicBlockId> = bb.children.iter().copied().collect();
-        if children.len() != bb.children.len() {
-            return Some(format!("{}: duplicate edge in children", bb.id));
-        }
-
-        let named = match bb.insns.last() {
-            Some(last) if last.op.is_terminator() => crate::ir::propagate::terminator_targets(last),
-            // A block with no terminator falls through to nothing the CFG can
-            // name; `children` must then be empty too.
-            _ => HashSet::new(),
-        };
-
-        if named != children {
-            return Some(format!(
-                "{}: terminator names {:?} but children are {:?}",
-                bb.id,
-                sorted_ids(&named),
-                sorted_ids(&children),
-            ));
-        }
+/// Both left the rest of the statement in the terminated block, which the
+/// verifier -- now run on every compile -- rejects, and each back end emitted
+/// after the jump.
+#[test]
+fn a_non_returning_terminator_ends_its_block() {
+    let target = Target::host();
+    let src = "typedef long jmp_buf[8];\n\
+               void longjmp(jmp_buf, int);\n\
+               jmp_buf env;\n\
+               int g;\n\
+               void jump(void) { longjmp(env, 1); g = 2; }\n\
+               void never(int x) { if (x) { __builtin_unreachable(); g = 3; } g = 4; }\n";
+    let module = linearize_source(src, &target);
+    for f in &module.functions {
+        assert_eq!(cfg_inconsistency(f), None, "{}", f.name);
     }
-
-    // `parents` is the inverse of `children`.
-    let mut expected: std::collections::HashMap<BasicBlockId, HashSet<BasicBlockId>> =
-        std::collections::HashMap::new();
-    for bb in &func.blocks {
-        for child in &bb.children {
-            expected.entry(*child).or_default().insert(bb.id);
-        }
-    }
-    for bb in &func.blocks {
-        let have: HashSet<BasicBlockId> = bb.parents.iter().copied().collect();
-        let want = expected.remove(&bb.id).unwrap_or_default();
-        if have != want {
-            return Some(format!(
-                "{}: parents are {:?} but {:?} name it as a successor",
-                bb.id,
-                sorted_ids(&have),
-                sorted_ids(&want),
-            ));
-        }
-    }
-
-    None
 }
 
-fn sorted_ids(s: &std::collections::HashSet<BasicBlockId>) -> Vec<u32> {
-    let mut v: Vec<u32> = s.iter().map(|b| b.0).collect();
-    v.sort_unstable();
-    v
+/// The validator's report on `func`, or `None` when it is consistent.
+///
+/// The CFG invariants live in `validate` (I8, I9), which every compile runs;
+/// this only adapts its answer to the tests that ask.
+fn cfg_inconsistency(func: &Function) -> Option<String> {
+    crate::ir::validate::validate_function(func)
+        .err()
+        .map(|errs| format!("{errs:?}"))
 }
 
 /// A `for` post-expression that splits the block still links the back edge from

@@ -200,6 +200,40 @@ end_goto:
     assert_eq!(compile_and_run("asm_x86_64_mega", code, &[]), 0);
 }
 
+/// A phi at an `asm goto` label receives the value its jump carried.
+///
+/// The label is reached from the `asm` block (by the jump) and from the
+/// fallthrough, so it merges two values of `r`. Phi elimination put the copy
+/// for the jump's edge at the end of the `asm` block, after the `asm` -- which
+/// the jump leaves before reaching -- so the label read whatever `r` held
+/// before, at every level. The edge now gets a block of its own for the copy.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_asm_goto_label_receives_the_value_its_jump_carries() {
+    let code = r#"
+int __attribute__((noinline)) f(int x) {
+    int r = x + 1;
+    if (x > 5) r = 7;
+    __asm__ goto("jmp %l0" :::: taken);
+    r = 2;
+taken:
+    return r;
+}
+int main(void) {
+    if (f(10) != 7) return 1;
+    if (f(1) != 2) return 2;
+    return 0;
+}
+"#;
+    for level in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("asm_goto_phi{level}"), code, &[level.to_string()]),
+            0,
+            "{level}"
+        );
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn codegen_inline_asm_x86_64_asm_goto_pseudo_survives_edge() {

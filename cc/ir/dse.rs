@@ -300,23 +300,6 @@ fn dead_locals_at_block_end(
         reads.insert(bb.id, r);
     }
 
-    // Successors, as `loadfwd` derives them: from `children`, which `dce`
-    // maintains, never from `parents`, which it does not.
-    let mut succs: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
-    for bb in &func.blocks {
-        let mut s = bb.children.clone();
-        for insn in &bb.insns {
-            if let Some(ref asm) = insn.asm_data {
-                for (t, _) in &asm.goto_labels {
-                    if !s.contains(t) {
-                        s.push(*t);
-                    }
-                }
-            }
-        }
-        succs.insert(bb.id, s);
-    }
-
     // Start everything dead and remove: the greatest fixed point is the
     // right one here, so a loop that never reads a local keeps it dead.
     let mut dead_in: HashMap<BasicBlockId, HashSet<PseudoId>> = HashMap::new();
@@ -328,7 +311,7 @@ fn dead_locals_at_block_end(
     for _ in 0..MAX_SWEEPS {
         let mut moved = false;
         for bb in func.blocks.iter().rev() {
-            let succ = succs.get(&bb.id).map(Vec::as_slice).unwrap_or(&[]);
+            let succ = &bb.children;
             // No successors is an exit: the frame is gone, so everything a
             // non-escaping local held is unobservable.
             let mut dead_out = candidates.clone();
@@ -404,7 +387,7 @@ mod tests {
 
         fn run(&mut self) -> bool {
             self.f.entry = self.f.blocks[0].id;
-            self.f.rebuild_block_idx();
+            self.f.rebuild_parents();
             let mi = ModuleInfo::build(&Module::default(), &self.types);
             super::run(&mut self.f, &self.types, &mi)
         }

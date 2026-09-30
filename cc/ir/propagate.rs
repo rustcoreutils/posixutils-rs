@@ -25,7 +25,7 @@
 use super::constfold::result_type_of;
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 use crate::types::TypeTable;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// A `(block index, instruction index)` pair.
 pub(crate) type Site = (usize, usize);
@@ -98,61 +98,39 @@ pub(crate) fn fold_target_to_const(
 }
 
 /// Turn block `b`'s terminator into an unconditional branch to `taken`, and
-/// repair the edges the other targets lose.
+/// drop the edges the other targets lose.
 ///
-/// The caller has proved `taken` is the only reachable successor.
+/// The caller has proved `taken` is the only reachable successor. An
+/// `asm goto` in the block keeps its own edges: they are not the
+/// terminator's to give up.
 ///
 /// Returns whether anything changed.
 pub(crate) fn retarget_terminator(func: &mut Function, b: usize, taken: BasicBlockId) -> bool {
     let block_id = func.blocks[b].id;
-    let Some(insn) = func.blocks[b].insns.last() else {
+    let Some(term) = func.blocks[b].insns.last() else {
         return false;
     };
-
-    // The terminator's targets must be exactly what the CFG records, or
-    // the edge bookkeeping below would be repairing something already
-    // broken. Leave such a block alone.
-    let targets = terminator_targets(insn);
-    let recorded: HashSet<BasicBlockId> = func.blocks[b].children.iter().copied().collect();
-    if targets != recorded {
-        debug_assert!(
-            false,
-            "propagate: terminator targets disagree with the CFG in {block_id}"
-        );
+    if term.op == Opcode::Br && term.bb_true == Some(taken) {
         return false;
     }
+    let before = term.control_targets();
+    if !before.contains(&taken) {
+        debug_assert!(false, "propagate: {taken} is not a target of {block_id}");
+        return false;
+    }
+
+    let pos = term.pos;
+    let last = func.blocks[b].insns.len() - 1;
+    func.blocks[b].insns[last] = Instruction::br(taken);
+    func.blocks[b].insns[last].pos = pos;
 
     // A `Cbr` with both arms on one block, or a `Switch` with two cases
-    // landing together, keeps its edge: it is still a successor.
-    let dropped: Vec<BasicBlockId> = targets.iter().copied().filter(|t| *t != taken).collect();
-
-    let last = func.blocks[b].insns.len() - 1;
-    let insn = &mut func.blocks[b].insns[last];
-    if insn.op == Opcode::Br && insn.bb_true == Some(taken) {
-        return false;
-    }
-    // Rewritten in place, never `kill()`ed: `kill` leaves `bb_false`,
-    // `switch_cases` and `switch_default` untouched, and `validate`'s
-    // branch-target invariant inspects those on every instruction
-    // whatever its opcode -- so a killed `Cbr` still naming a block that
-    // is then removed trips the validator far from here.
-    insn.op = Opcode::Br;
-    insn.bb_true = Some(taken);
-    insn.bb_false = None;
-    insn.src.clear();
-    insn.switch_cases.clear();
-    insn.switch_default = None;
-
-    func.blocks[b].children.retain(|c| !dropped.contains(c));
-    for d in dropped {
-        if let Some(succ) = func.get_block_mut(d) {
-            // `parents` matters even though `dce` does not bother with
-            // it: `dce`'s untaken successors die, and `retain_edges`
-            // repairs them on the way out. A successor dropped here
-            // usually survives, reached from somewhere else, and
-            // `dominate` builds immediate dominators from `parents`.
-            succ.parents.retain(|p| *p != block_id);
-            succ.remove_phi_predecessor(block_id);
+    // landing together, keeps its edge: it is still a successor. So is a
+    // block an `asm goto` above the terminator names.
+    let still = func.blocks[b].named_successors().unwrap_or_default();
+    for d in before {
+        if !still.contains(&d) {
+            func.remove_edge(block_id, d);
         }
     }
     true
@@ -214,14 +192,4 @@ pub(crate) fn switch_taken(insn: &Instruction, v: i128) -> Option<BasicBlockId> 
         }
     }
     insn.switch_default
-}
-
-/// Every block a terminator can transfer to.
-pub(crate) fn terminator_targets(insn: &Instruction) -> HashSet<BasicBlockId> {
-    let mut t = HashSet::new();
-    t.extend(insn.bb_true);
-    t.extend(insn.bb_false);
-    t.extend(insn.switch_cases.iter().map(|(_, _, b)| *b));
-    t.extend(insn.switch_default);
-    t
 }

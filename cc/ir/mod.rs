@@ -12,6 +12,7 @@
 //
 
 mod build;
+pub mod cfg;
 mod constfold;
 pub mod constglobal;
 pub mod dce;
@@ -1632,16 +1633,16 @@ impl Instruction {
             .is_some_and(|ai| aggregate_ret_is_address(&ai.ret, self.size))
     }
 
-    /// Convert this instruction to a no-op, clearing all operands.
+    /// Turn this instruction into a `Nop` that holds nothing at all.
+    ///
+    /// Every field is reset, not only the operands. Clearing four of them left
+    /// a killed branch naming its targets, a killed call its callee and ABI
+    /// record, a killed `asm` its operands and labels -- and every pass that
+    /// walks fields rather than opcodes then saw a block edge, a use or a
+    /// memory access that was not there, so each had to learn to skip `Nop`
+    /// or to rewrite in place rather than kill.
     pub fn kill(&mut self) {
-        self.op = Opcode::Nop;
-        self.src.clear();
-        self.target = None;
-        self.phi_list.clear();
-        // A `Nop` reaches no memory, so it is no longer a volatile access --
-        // and leaving the marker set on one would make a stale claim to any
-        // pass that asks the field rather than `is_volatile_access`.
-        self.is_volatile = false;
+        *self = Instruction::new(Opcode::Nop);
     }
 }
 
@@ -1918,23 +1919,6 @@ impl BasicBlock {
             .last()
             .map(|i| i.op.is_terminator())
             .unwrap_or(false)
-    }
-
-    /// Remove edges to/from blocks not in the keep set
-    pub fn retain_edges(&mut self, keep: &std::collections::HashSet<BasicBlockId>) {
-        self.parents.retain(|p| keep.contains(p));
-        self.children.retain(|c| keep.contains(c));
-    }
-
-    /// Remove phi entries for a specific predecessor.
-    /// Note: corresponding PhiSource instructions in the removed predecessor
-    /// block become dead and are cleaned up by a subsequent DCE pass.
-    pub fn remove_phi_predecessor(&mut self, pred: BasicBlockId) {
-        for insn in &mut self.insns {
-            if insn.op == Opcode::Phi {
-                insn.phi_list.retain(|(p, _)| *p != pred);
-            }
-        }
     }
 }
 

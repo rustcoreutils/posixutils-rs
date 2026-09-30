@@ -99,7 +99,7 @@ fn escapes(func: &Function, sym: PseudoId) -> bool {
     while let Some(p) = work.pop() {
         for bb in &func.blocks {
             for insn in &bb.insns {
-                if insn.op == Opcode::Nop || !insn.mentions(p) {
+                if !insn.mentions(p) {
                     continue;
                 }
                 // `mentions` answers "names this pseudo", and a target is a

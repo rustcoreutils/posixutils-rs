@@ -14,7 +14,7 @@
 // still referenced by a surviving Load/Store or SymAddr, so the retain
 // check leaves them in place.
 
-use super::{Function, Opcode, PseudoId};
+use super::{Function, PseudoId};
 use std::collections::HashSet;
 
 /// Drop `func.locals` entries whose `Sym` pseudo has no remaining
@@ -24,11 +24,6 @@ pub fn mem2reg(func: &mut Function) {
     let mut referenced: HashSet<PseudoId> = HashSet::new();
     for block in &func.blocks {
         for insn in &block.insns {
-            // Nops carry stale operands from the in-place Store->Nop
-            // rewrite ssa.rs performs; they are not real references.
-            if insn.op == Opcode::Nop {
-                continue;
-            }
             // Every role a pseudo can play, through the one enumeration of
             // them. Scanning `src` alone missed two ways a local's storage is
             // named. A call returning a struct in registers names the
@@ -68,7 +63,9 @@ pub fn mem2reg(func: &mut Function) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{AsmConstraint, AsmData, BasicBlock, BasicBlockId, Instruction, Pseudo};
+    use crate::ir::{
+        AsmConstraint, AsmData, BasicBlock, BasicBlockId, Instruction, Opcode, Pseudo,
+    };
     use crate::target::Target;
     use crate::types::TypeTable;
 

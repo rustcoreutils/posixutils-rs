@@ -1238,6 +1238,20 @@ impl<'a> Linearizer<'a> {
         self.switch_bb(bb);
     }
 
+    /// Emit `insn`, a terminator control never comes back from -- `longjmp`,
+    /// `__builtin_unreachable`, the `Unreachable` after a `noreturn` call --
+    /// and carry on in a fresh block no edge reaches.
+    ///
+    /// What the source says next is dead, but it is still lowered, and it has
+    /// to go somewhere that is not after a terminator: `longjmp` and
+    /// `__builtin_unreachable` left it in the same block, which the verifier
+    /// rejects and each back end would have emitted after the jump.
+    pub(crate) fn emit_no_return(&mut self, insn: Instruction) {
+        debug_assert!(insn.op.is_terminator());
+        self.emit(insn);
+        self.start_unreachable_block();
+    }
+
     /// The block to emit into, starting an unreachable one where there is
     /// none.
     ///
@@ -4113,13 +4127,10 @@ impl<'a> Linearizer<'a> {
             call_insn.known = known;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
-            // After a noreturn call, emit Unreachable and start a dead basic block
             if is_noreturn_call {
-                let unreachable =
-                    Instruction::new(Opcode::Unreachable).with_type(self.types.void_id);
-                self.emit(unreachable);
-                let dead_bb = self.alloc_bb();
-                self.switch_bb(dead_bb);
+                self.emit_no_return(
+                    Instruction::new(Opcode::Unreachable).with_type(self.types.void_id),
+                );
             }
             // Return the symbol (address) where struct is stored
             result_sym
@@ -4153,13 +4164,10 @@ impl<'a> Linearizer<'a> {
             call_insn.known = known;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
-            // After a noreturn call, emit Unreachable and start a dead basic block
             if is_noreturn_call {
-                let unreachable =
-                    Instruction::new(Opcode::Unreachable).with_type(self.types.void_id);
-                self.emit(unreachable);
-                let dead_bb = self.alloc_bb();
-                self.switch_bb(dead_bb);
+                self.emit_no_return(
+                    Instruction::new(Opcode::Unreachable).with_type(self.types.void_id),
+                );
             }
             result_sym
         }
@@ -5755,7 +5763,7 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::Unreachable)
                     .with_target(result)
                     .with_type(self.types.void_id);
-                self.emit(insn);
+                self.emit_no_return(insn);
                 result
             }
 
@@ -5808,7 +5816,7 @@ impl<'a> Linearizer<'a> {
                 insn.target = Some(result);
                 insn.src = vec![env_val, val_val];
                 insn.typ = Some(self.types.void_id);
-                self.emit(insn);
+                self.emit_no_return(insn);
                 result
             }
             _ => unreachable!(),

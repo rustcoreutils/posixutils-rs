@@ -232,33 +232,18 @@ impl Solver {
         }
         // Edges this pass cannot see from the terminator alone. The same
         // conservative default as the transfer function: what is not
-        // understood is assumed to happen.
-        //
-        // `asm goto` is the one that bites. Its block ends in an ordinary
-        // `Br` to the fallthrough, and the branch targets live in
-        // `asm_data.goto_labels` -- so marking what the terminator names
-        // misses them entirely, they look unreachable, and `dce` deletes the
-        // arm the assembly jumps to.
-        let has_asm_goto = func.blocks[idx].insns.iter().any(|i| {
-            i.asm_data
-                .as_ref()
-                .is_some_and(|d| !d.goto_labels.is_empty())
-        });
+        // understood is assumed to happen. `asm goto` is the one that bites:
+        // its block ends in an ordinary `Br` to the fallthrough, and missing
+        // its labels would make the arms the assembly jumps to look
+        // unreachable. `children` has them all.
         let modelled_terminator = matches!(
             func.blocks[idx].insns.last().map(|i| i.op),
             Some(Opcode::Br) | Some(Opcode::Cbr) | Some(Opcode::Switch) | Some(Opcode::IndirectBr)
         );
-        if has_asm_goto || !modelled_terminator {
-            self.mark_all_successors(func, idx);
-            for i in 0..func.blocks[idx].insns.len() {
-                let labels: Vec<BasicBlockId> = func.blocks[idx].insns[i]
-                    .asm_data
-                    .as_ref()
-                    .map(|d| d.goto_labels.iter().map(|(b, _)| *b).collect())
-                    .unwrap_or_default();
-                for target in labels {
-                    self.mark_edge(func.blocks[idx].id, target);
-                }
+        if func.blocks[idx].has_asm_goto() || !modelled_terminator {
+            let block_id = func.blocks[idx].id;
+            for &succ in &func.blocks[idx].children {
+                self.mark_edge(block_id, succ);
             }
         }
     }

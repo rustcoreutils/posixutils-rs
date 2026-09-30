@@ -260,15 +260,11 @@ fn collapse(func: &mut Function, d: &Diamond) {
         }
     }
 
-    // Rewrite the branch. In place rather than `kill()`: that leaves
-    // `bb_false` naming a block about to be removed, which the validator
-    // inspects on every instruction whatever its opcode.
+    // The branch goes straight to the merge now.
     let last = func.blocks[pred_idx].insns.len() - 1;
-    let term = &mut func.blocks[pred_idx].insns[last];
-    term.op = Opcode::Br;
-    term.bb_true = Some(d.merge);
-    term.bb_false = None;
-    term.src.clear();
+    let pos = func.blocks[pred_idx].insns[last].pos;
+    func.blocks[pred_idx].insns[last] = Instruction::br(d.merge);
+    func.blocks[pred_idx].insns[last].pos = pos;
 
     // Replace each phi with the select it turned out to be.
     for (i, v_true, v_false) in selects {
@@ -286,9 +282,8 @@ fn collapse(func: &mut Function, d: &Diamond) {
 
     // CFG: the arm is gone, and the merge is reached only from the
     // predecessor now.
-    func.blocks[pred_idx].children.retain(|c| *c != d.arm);
-    let merge_idx = func.block_index(d.merge).expect("merge exists");
-    func.blocks[merge_idx].parents.retain(|p| *p != d.arm);
+    func.remove_edge(d.pred, d.arm);
+    func.remove_edge(d.arm, d.merge);
 }
 
 #[cfg(test)]

@@ -184,13 +184,11 @@ impl<'a> MemOracle<'a> {
                 if esc.gave_up() {
                     return None;
                 }
-                let preds = build_preds(self.func);
-                let succs = invert(&preds);
                 Some(Paths {
                     esc,
                     dom: domtree_build(self.func),
-                    preds,
-                    succs,
+                    preds: self.func.predecessor_map(),
+                    succs: self.func.successor_map(),
                 })
             })
             .as_ref()
@@ -601,24 +599,6 @@ fn byte_of(c: i128, width: u32, at: u32, little_endian: bool) -> Option<u8> {
     Some((c >> (8 * shift)) as u8)
 }
 
-/// Successors, as the exact inverse of the predecessor map, so the two can
-/// never disagree about an edge.
-fn invert(
-    preds: &HashMap<BasicBlockId, Vec<BasicBlockId>>,
-) -> HashMap<BasicBlockId, Vec<BasicBlockId>> {
-    // Each predecessor list is duplicate-free and each block has one, so a
-    // (p, b) pair arrives once: no duplicate can form. The search that used to
-    // guard against one made a block of many successors -- a big `switch` --
-    // quadratic in them.
-    let mut succs: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
-    for (b, ps) in preds {
-        for p in ps {
-            succs.entry(*p).or_default().push(*b);
-        }
-    }
-    succs
-}
-
 /// Every block with an edge path of length at least one from `seed`.
 ///
 /// Length *at least one* is deliberate: `seed` itself is in the result only
@@ -642,37 +622,6 @@ fn reachable(
         work.extend(edges.get(&b).cloned().unwrap_or_default());
     }
     Some(seen)
-}
-
-/// Predecessors from `children`, which `dce` maintains, rather than from
-/// `parents`, which it does not.
-///
-/// Blocks are visited one at a time, so a repeated edge from `bb` -- a
-/// conditional branch whose arms meet, an `asm goto` label that is also a
-/// successor -- can only duplicate the entry `bb` itself pushed last. Checking
-/// that one entry keeps the lists duplicate-free in the same order; searching
-/// the whole list made a join of many predecessors quadratic in them.
-fn build_preds(func: &Function) -> HashMap<BasicBlockId, Vec<BasicBlockId>> {
-    let mut preds: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
-    let mut add = |to: BasicBlockId, from: BasicBlockId| {
-        let e = preds.entry(to).or_default();
-        if e.last() != Some(&from) {
-            e.push(from);
-        }
-    };
-    for bb in &func.blocks {
-        for c in &bb.children {
-            add(*c, bb.id);
-        }
-        for insn in &bb.insns {
-            if let Some(ref asm) = insn.asm_data {
-                for (t, _) in &asm.goto_labels {
-                    add(*t, bb.id);
-                }
-            }
-        }
-    }
-    preds
 }
 
 #[cfg(test)]
@@ -722,7 +671,7 @@ mod tests {
 
         fn run(&mut self) -> bool {
             self.f.entry = self.f.blocks[0].id;
-            self.f.rebuild_block_idx();
+            self.f.rebuild_parents();
             let mi = module_info(&self.types);
             super::run(&mut self.f, &self.types, &mi)
         }
@@ -737,7 +686,7 @@ mod tests {
         /// says.
         fn byte(&mut self, at: i64, little_endian: bool) -> Option<u8> {
             self.f.entry = self.f.blocks[0].id;
-            self.f.rebuild_block_idx();
+            self.f.rebuild_parents();
             let mi = module_info(&self.types);
             let am = AddrMap::build(&self.f);
             let oracle = MemOracle::new(&self.f, &self.types, &mi, &am);
@@ -1232,43 +1181,19 @@ mod tests {
         assert_eq!(b.op(0, 4), Opcode::Load);
     }
 
-    /// Predecessors come from `children`, which `dce` maintains, and never
-    /// from `parents`, which it does not.
-    #[test]
-    fn loadfwd_derives_predecessors_from_children() {
-        let mut b = Build::new();
-        b.block(0, vec![entry(), br(1)], vec![1]);
-        b.block(1, vec![br(1)], vec![1]);
-        b.f.entry = BasicBlockId(0);
-        // A stale `parents` must not be consulted.
-        b.f.blocks[1].parents = vec![BasicBlockId(9)];
-        let preds = build_preds(&b.f);
-        assert_eq!(
-            preds.get(&BasicBlockId(1)).map(Vec::as_slice),
-            Some(&[BasicBlockId(0), BasicBlockId(1)][..])
-        );
-    }
-
-    /// Successors are the exact inverse of predecessors, so the two can
-    /// never disagree about an edge -- which is what makes the region an
-    /// intersection rather than a guess.
+    /// A block is reachable from itself only along a cycle.
     #[test]
     fn loadfwd_reachability_is_at_least_one_edge() {
-        let mut preds: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
-        preds.insert(BasicBlockId(1), vec![BasicBlockId(0)]);
-        preds.insert(BasicBlockId(2), vec![BasicBlockId(1)]);
-        let succs = invert(&preds);
+        let mut succs: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
+        succs.insert(BasicBlockId(0), vec![BasicBlockId(1)]);
+        succs.insert(BasicBlockId(1), vec![BasicBlockId(2)]);
         // A block not on a cycle is not reachable from itself.
         assert_eq!(
             reachable(&succs, BasicBlockId(0)),
             Some([BasicBlockId(1), BasicBlockId(2)].into_iter().collect())
         );
         // With a back edge it is.
-        preds
-            .entry(BasicBlockId(1))
-            .or_default()
-            .push(BasicBlockId(2));
-        let succs = invert(&preds);
+        succs.insert(BasicBlockId(2), vec![BasicBlockId(1)]);
         let r = reachable(&succs, BasicBlockId(1)).unwrap();
         assert!(r.contains(&BasicBlockId(1)), "a cycle reaches its own head");
     }

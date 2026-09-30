@@ -96,25 +96,6 @@ impl DomTree {
 
 const DEFAULT_IDF_CAPACITY: usize = 8;
 
-/// The blocks control can reach from `bb`.
-///
-/// `children` plus the targets an `asm goto` names, which live in
-/// `asm_data.goto_labels` and nowhere else -- the same edges `ir/sccp.rs`
-/// has to go and find by hand.
-fn successors(bb: &crate::ir::BasicBlock) -> Vec<BasicBlockId> {
-    let mut out = bb.children.clone();
-    for insn in &bb.insns {
-        if let Some(ref asm) = insn.asm_data {
-            for (t, _) in &asm.goto_labels {
-                if !out.contains(t) {
-                    out.push(*t);
-                }
-            }
-        }
-    }
-    out
-}
-
 // Dominator Tree Construction (Lengauer-Tarjan)
 
 /// A DFS index with no node behind it: the root's parent and ancestor.
@@ -128,7 +109,7 @@ struct Numbering {
     vertex: Vec<BasicBlockId>,
     /// The node `n` was first reached from; `NONE` for the entry.
     parent: Vec<usize>,
-    /// The successors of node `n`, as [`successors`] gives them.
+    /// The successors of node `n`: its block's `children`.
     succs: Vec<Vec<BasicBlockId>>,
 }
 
@@ -151,8 +132,11 @@ fn dfs_numbering(func: &Function) -> Numbering {
         t.number.insert(id, n);
         t.vertex.push(id);
         t.parent.push(from);
-        t.succs
-            .push(func.get_block(id).map(successors).unwrap_or_default());
+        t.succs.push(
+            func.get_block(id)
+                .map(|b| b.children.clone())
+                .unwrap_or_default(),
+        );
         n
     };
     stack.push((visit(&mut t, func.entry, NONE), 0));
@@ -186,7 +170,9 @@ fn dfs_numbering(func: &Function) -> Numbering {
 /// `switch` -- cost predecessors x depth on every build, and a function is
 /// built for twice per optimization run (`ssa_convert`, `loadfwd`).
 ///
-/// The graph is the one [`successors`] describes, and nothing else: a block
+/// The graph is the one `children` records -- which the validator holds to
+/// what the instructions name, `asm goto` labels included -- and nothing
+/// else: a block
 /// the walk from the entry never reaches has no immediate dominator. The
 /// result depends only on the graph, so the tree is the one any correct
 /// algorithm computes; `children` are listed in `func.blocks` order.
@@ -573,8 +559,9 @@ mod tests {
         );
     }
 
-    /// An `asm goto` target is a CFG edge that lives only in `asm_data`, so
-    /// both halves of the computation have to go and find it.
+    /// An `asm goto` target is a CFG edge like any other: recorded in
+    /// `children` alongside the terminator's, which the validator holds it
+    /// to, and so seen by both halves of the computation.
     #[test]
     fn test_domtree_sees_asm_goto_edges() {
         let mut func = make_test_cfg();
@@ -588,6 +575,7 @@ mod tests {
         }));
         let bb0 = func.get_block_mut(BasicBlockId(0)).unwrap();
         bb0.insns.insert(0, asm);
+        func.add_edge(BasicBlockId(0), BasicBlockId(4));
         let dom = domtree_build(&func);
         assert_eq!(
             dom.idom(BasicBlockId(4)),
@@ -674,7 +662,7 @@ mod tests {
         let mut i = 0;
         while i < nodes.len() {
             if let Some(bb) = func.get_block(nodes[i]) {
-                for s in successors(bb) {
+                for &s in &bb.children {
                     if seen.insert(s) {
                         nodes.push(s);
                     }
@@ -685,7 +673,7 @@ mod tests {
         let mut preds: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
         for &n in &nodes {
             if let Some(bb) = func.get_block(n) {
-                for s in successors(bb) {
+                for &s in &bb.children {
                     preds.entry(s).or_default().push(n);
                 }
             }

@@ -133,7 +133,7 @@ impl<'a> Solver<'a> {
             widths: vec![0; n],
             vals: vec![RVal::Top; n],
             moves: vec![0; n],
-            preds: build_preds(func),
+            preds: func.predecessor_map(),
             edge_facts: HashMap::new(),
             edge_moves: HashMap::new(),
             executable_block: HashSet::new(),
@@ -322,33 +322,20 @@ impl<'a> Solver<'a> {
         for i in 0..func.blocks[idx].insns.len() {
             self.eval_site(func, (idx, i));
         }
-        // `asm goto`'s block ends in an ordinary `Br` to the fallthrough and
-        // keeps its real targets in `asm_data.goto_labels`, so marking only
-        // what the terminator names would make those arms look unreachable.
-        let has_asm_goto = func.blocks[idx].insns.iter().any(|i| {
-            i.asm_data
-                .as_ref()
-                .is_some_and(|d| !d.goto_labels.is_empty())
-        });
+        // Edges this pass cannot see from the terminator alone. The same
+        // conservative default as the transfer function: what is not
+        // understood is assumed to happen. `asm goto` is the one that bites:
+        // its block ends in an ordinary `Br` to the fallthrough, and missing
+        // its labels would make the arms the assembly jumps to look
+        // unreachable. `children` has them all.
         let modelled_terminator = matches!(
             func.blocks[idx].insns.last().map(|i| i.op),
             Some(Opcode::Br) | Some(Opcode::Cbr) | Some(Opcode::Switch) | Some(Opcode::IndirectBr)
         );
-        if has_asm_goto || !modelled_terminator {
+        if func.blocks[idx].has_asm_goto() || !modelled_terminator {
             let block_id = func.blocks[idx].id;
-            let succs: Vec<BasicBlockId> = func.blocks[idx].children.clone();
-            for s in succs {
-                self.mark_edge(block_id, s);
-            }
-            for i in 0..func.blocks[idx].insns.len() {
-                let labels: Vec<BasicBlockId> = func.blocks[idx].insns[i]
-                    .asm_data
-                    .as_ref()
-                    .map(|d| d.goto_labels.iter().map(|(b, _)| *b).collect())
-                    .unwrap_or_default();
-                for target in labels {
-                    self.mark_edge(block_id, target);
-                }
+            for &succ in &func.blocks[idx].children {
+                self.mark_edge(block_id, succ);
             }
         }
     }
@@ -904,41 +891,6 @@ fn record_fact(out: &mut BTreeMap<PseudoId, Range>, id: PseudoId, r: Range) {
     }
 }
 
-/// Predecessors, from every block's recorded `children` plus every
-/// terminator's targets and every `asm goto` label.
-///
-/// The union over-counts rather than under-counts, and over-counting only
-/// ever suppresses a refinement. Reading `BasicBlock::parents` instead would
-/// trust bookkeeping that `dce` does not maintain.
-fn build_preds(func: &Function) -> HashMap<BasicBlockId, Vec<BasicBlockId>> {
-    let mut preds: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
-    // Blocks are visited one at a time, so a repeated edge can only duplicate
-    // the entry the same block pushed last; searching the whole list made a
-    // join of many predecessors quadratic in them.
-    let add = |from: BasicBlockId, to: BasicBlockId, m: &mut HashMap<_, Vec<_>>| {
-        let e: &mut Vec<BasicBlockId> = m.entry(to).or_default();
-        if e.last() != Some(&from) {
-            e.push(from);
-        }
-    };
-    for bb in &func.blocks {
-        for c in &bb.children {
-            add(bb.id, *c, &mut preds);
-        }
-        for insn in &bb.insns {
-            for t in propagate::terminator_targets(insn) {
-                add(bb.id, t, &mut preds);
-            }
-            if let Some(ref asm) = insn.asm_data {
-                for (t, _) in &asm.goto_labels {
-                    add(bb.id, *t, &mut preds);
-                }
-            }
-        }
-    }
-    preds
-}
-
 /// Binary opcodes with a range transfer function.
 fn is_modelled_binop(op: Opcode) -> bool {
     matches!(
@@ -1431,7 +1383,7 @@ mod tests {
 
         f.entry = BasicBlockId(0);
         f.blocks = vec![l0, l1, l2, l3, l4, l5];
-        f.rebuild_block_idx();
+        f.rebuild_parents();
         (f, types)
     }
 

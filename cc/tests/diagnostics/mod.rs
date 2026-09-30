@@ -7434,3 +7434,52 @@ fn diagnostics_writing_an_array_member_of_a_const_object_is_rejected() {
          void g(struct S *p){ p->arr[0] = 2; }\n",
     );
 }
+
+/// A `case` label whose conversion to the controlling type changes its value
+/// is diagnosed, and two labels that become equal are a constraint violation.
+///
+/// C17 6.8.4.2p5 converts each label to the promoted type of the controlling
+/// expression, and p3 forbids two labels in one switch having the same value
+/// *after* that conversion. c17 kept labels at full width, so it diagnosed
+/// neither: `case 4294967296LL` in an `int` switch silently became `case 0`,
+/// and sitting beside a real `case 0` it was silently accepted.
+///
+/// gcc and clang both warn on the value-changing conversion and reject the
+/// collision.
+#[test]
+fn diagnostics_a_case_label_outside_the_controlling_type_is_diagnosed() {
+    compile_expect_warning(
+        "case_label_overflow",
+        "int f(int x){ switch(x){ case 4294967296LL: return 1; default: return 2; } }\n",
+        "case",
+    );
+    compile_expect_error(
+        "case_label_duplicate_after_conversion",
+        "int f(int x){ switch(x){ case 0: return 1; case 4294967296LL: return 2; } return 0; }\n",
+        "duplicate",
+    );
+}
+
+/// The other direction: a conversion that preserves the value is silent, so
+/// the check above cannot pass by warning about every label.
+///
+/// `case -1` in a `switch` on `unsigned` converts to 4294967295 and genuinely
+/// matches it -- the conversion is value-changing in representation but well
+/// defined and intended, which is why gcc and clang say nothing here either.
+#[test]
+fn diagnostics_a_case_label_inside_the_controlling_type_is_silent() {
+    compile_expect_no_diagnostic(
+        "case_label_in_range",
+        "int f(int x){ switch(x){ case -1: return 1; case 7: return 3; default: return 2; } }\n",
+        "case",
+    );
+    compile_expect_no_diagnostic(
+        "case_label_negative_in_unsigned",
+        "int f(unsigned x){ switch(x){ case -1: return 1; default: return 2; } }\n",
+        "case",
+    );
+    compile_expect_ok(
+        "case_labels_distinct_after_conversion",
+        "int f(int x){ switch(x){ case 0: return 1; case 1: return 2; default: return 3; } }\n",
+    );
+}

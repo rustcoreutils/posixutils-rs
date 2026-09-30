@@ -1060,3 +1060,55 @@ int main(void)
         0
     );
 }
+
+/// A `case` label is converted to the promoted type of the controlling
+/// expression, and matching happens after that conversion.
+///
+/// C17 6.8.4.2p5: the constant expression of each `case` is converted to the
+/// promoted type of the controlling expression. c17 evaluated labels at full
+/// width and never converted them, so a label outside the controlling type
+/// matched or missed depending on which lowering saw it -- a runtime selector
+/// kept the label in the `switch` instruction, while the constant-selector fast
+/// path compared at 128 bits with a signed test that ignored the switch's
+/// signedness. The same switch answered differently depending on whether its
+/// selector was a constant.
+#[test]
+fn c89_a_case_label_is_converted_to_the_controlling_type() {
+    let code = r#"
+/* 4294967296 is 2^32: zero when converted to int. */
+int runtime_sel(int x) { switch (x) { case 4294967296LL: return 1; default: return 2; } }
+int const_sel(void)    { switch (0) { case 4294967296LL: return 1; default: return 2; } }
+
+/* -1 converted to unsigned int is 4294967295. */
+int unsigned_runtime(unsigned x) { switch (x) { case -1: return 1; default: return 2; } }
+int unsigned_const(void) { switch (4294967295u) { case -1: return 1; default: return 2; } }
+
+/* A label that converts without changing value still behaves. */
+int plain(int x) { switch (x) { case -1: return 1; case 7: return 3; default: return 2; } }
+
+/* Short controlling expression: promoted to int, so the label is too. */
+int shorty(short x) { switch (x) { case 65536 + 5: return 1; case 5: return 3; default: return 2; } }
+
+int main(void)
+{
+    /* Both lowerings must agree, and both must match. */
+    if (runtime_sel(0) != 1) return 1;
+    if (const_sel() != 1) return 2;
+
+    if (unsigned_runtime(4294967295u) != 1) return 3;
+    if (unsigned_const() != 1) return 4;
+
+    if (plain(-1) != 1 || plain(7) != 3 || plain(0) != 2) return 5;
+
+    /* 65541 converts to short's promoted int unchanged, so it cannot match 5. */
+    if (shorty(5) != 3) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("case_label_conversion", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("case_label_conversion_opt", code),
+        0
+    );
+}

@@ -37,6 +37,10 @@ fn return_value_ness_violation(pos: Position, msg: &str) {
 
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 
+/// The `-Wno-<name>` group for a case label the switch's promoted controlling
+/// type cannot hold, spelled as gcc spells the same diagnostic.
+const CASE_RANGE_WARNING: &str = "switch-outside-range";
+
 /// Whether [`Linearizer::store_string_units`] owes the destination's tail a
 /// zero fill.
 ///
@@ -1687,10 +1691,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Push exit block for break handling
         self.break_targets.push(exit_bb);
 
-        // Collect case labels and create basic blocks for each
-        let switch_unsigned = self.types.is_unsigned(cmp_type);
-        let (case_values, has_default) = self.collect_switch_cases(body, switch_unsigned);
-        let case_bbs: Vec<BasicBlockId> = case_values.iter().map(|_| self.alloc_bb()).collect();
+        // Collect case labels and create basic blocks for each. C17 6.8.4.2p5
+        // converts every label to `cmp_type`, and `conv` is that conversion:
+        // the collector applies it, and the body walk below reaches the labels
+        // back through the same value, so the two cannot drift apart.
+        let conv = CaseConv::of(self.types, cmp_type);
+        let (case_values, has_default) = self.collect_switch_cases(body, conv);
+        let case_bbs: Vec<BasicBlockId> = case_values
+            .ranges()
+            .iter()
+            .map(|_| self.alloc_bb())
+            .collect();
         let default_bb = if has_default {
             Some(self.alloc_bb())
         } else {
@@ -1704,11 +1715,15 @@ impl<'a> super::linearize::Linearizer<'a> {
             // A constant selector takes one edge, as a constant condition does
             // (`branch_on`): the labels it does not select are reached only by
             // falling into them, and a block nothing reaches is not emitted.
-            // Both sides are values of the promoted type, as the collector
-            // records the labels.
+            // Selector and labels are both converted to the promoted type, and
+            // the range test runs in that type's signedness -- a plain signed
+            // `i128` comparison answered differently from the runtime lowering
+            // of the very same switch.
+            let selector = conv.convert(selector);
             let target = case_values
+                .ranges()
                 .iter()
-                .position(|&(lo, hi)| lo <= selector && selector <= hi)
+                .position(|&(lo, hi)| conv.contains(lo, hi, selector))
                 .map_or(default_target, |idx| case_bbs[idx]);
             if let Some(current) = self.current_bb {
                 self.emit(Instruction::br(target));
@@ -1724,13 +1739,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.emit_wide_switch(
                 switch_val,
                 cmp_type,
-                &case_values,
+                conv,
+                case_values.ranges(),
                 &case_bbs,
                 default_target,
             );
         } else {
-            // Build switch instruction with case -> block mapping
+            // Build switch instruction with case -> block mapping. The labels
+            // have been converted to `cmp_type`, which is at most 64 bits
+            // here, so the cast keeps every bit of each one.
             let switch_cases: Vec<(i64, i64, BasicBlockId)> = case_values
+                .ranges()
                 .iter()
                 .zip(case_bbs.iter())
                 .map(|((lo, hi), bb)| (*lo as i64, *hi as i64, *bb))
@@ -1763,14 +1782,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         // block via `switch_bb`.
         self.current_bb = None;
 
-        // Linearize body with case block switching
-        // Each label's position among the cases, by its range. The first wins,
-        // as a scan in source order would find it; a duplicate has already
-        // been reported.
-        let mut case_index = CaseIndex::new();
-        for (idx, range) in case_values.iter().enumerate() {
-            case_index.entry(*range).or_insert(idx);
-        }
+        // Linearize body with case block switching. The index carries the
+        // collector's own conversion, so the walk finds a label under exactly
+        // the key the collector filed it under.
+        let case_index = CaseIndex::of(&case_values);
         self.linearize_switch_body(body, &case_index, &case_bbs, default_bb);
 
         // If not terminated after body, jump to exit
@@ -1795,33 +1810,22 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// only `Stmt::Block` here collected no cases from it -- so the switch was
     /// emitted with an empty table and every value took the default edge.
     /// A non-compound body is one statement, so it is walked as one.
-    pub(crate) fn collect_switch_cases(
-        &self,
-        body: &Stmt,
-        unsigned: bool,
-    ) -> (Vec<(i128, i128)>, bool) {
-        let mut case_values = CaseSet::new(unsigned);
+    pub(crate) fn collect_switch_cases(&self, body: &Stmt, conv: CaseConv) -> (CaseSet, bool) {
+        let mut case_values = CaseSet::new(conv);
         let mut has_default = false;
 
         match body {
             Stmt::Block(items) => {
                 for item in items {
                     if let BlockItem::Statement(stmt) = item {
-                        self.collect_cases_from_stmt(
-                            stmt,
-                            &mut case_values,
-                            &mut has_default,
-                            unsigned,
-                        );
+                        self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default);
                     }
                 }
             }
-            stmt => {
-                self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default, unsigned)
-            }
+            stmt => self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default),
         }
 
-        (case_values.ranges, has_default)
+        (case_values, has_default)
     }
 
     /// The block every computed `goto` in this function branches through,
@@ -2025,91 +2029,125 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
+    /// One case endpoint converted to the promoted controlling type, warning
+    /// if the controlling type cannot hold the constant the label spells.
+    ///
+    /// C17 6.8.4.2p5 requires the conversion, and most of the time it changes
+    /// nothing worth saying: `case -1:` in a `switch` on `unsigned` becomes
+    /// 4294967295, which is exactly the value it is written to match, and gcc
+    /// and clang are both silent there. What is worth a diagnostic is a label
+    /// whose bits the conversion throws away, silently turning
+    /// `case 4294967296LL:` into `case 0:`.
+    ///
+    /// The line between the two is whether converting back to the label's own
+    /// type returns the constant: a merely reinterpreted value round-trips,
+    /// while a truncated one does not. That is the test clang applies, and
+    /// gcc's `-Wswitch-outside-range` draws the line in the same place, which
+    /// is also the `-Wno-` name that silences this.
+    fn convert_case_label(&self, expr: &Expr, val: i128, conv: CaseConv) -> i128 {
+        let converted = conv.convert(val);
+        if converted == val {
+            return val;
+        }
+        // The label's own type, which the round trip goes back through. An
+        // untyped or non-integer label is already an error elsewhere; treat it
+        // as full width, which reduces the round trip to a plain comparison.
+        let own = expr.typ.filter(|&t| self.types.is_integer(t)).map_or_else(
+            || CaseConv::new(128, false),
+            |t| CaseConv::of(self.types, t),
+        );
+        if own.convert(converted) != val && crate::diag::warning_group_enabled(CASE_RANGE_WARNING) {
+            crate::diag::warning(
+                expr.pos,
+                &format!(
+                    "overflow converting case value to switch condition type \
+                     ({val} to {converted})"
+                ),
+            );
+        }
+        converted
+    }
+
     pub(crate) fn collect_cases_from_stmt(
         &self,
         stmt: &Stmt,
         case_values: &mut CaseSet,
         has_default: &mut bool,
-        unsigned: bool,
     ) {
         match stmt {
             Stmt::Case(expr, high, body) => {
-                self.collect_cases_from_stmt(body, case_values, has_default, unsigned);
+                self.collect_cases_from_stmt(body, case_values, has_default);
                 // Extract constant value from case expression
-                if let Some(val) = self.eval_const_expr(expr) {
-                    // Kept at full width. Truncating to `i64` here was silent
-                    // and wrong for a `switch` on `__int128`: a label outside
-                    // the 64-bit range wrapped into it and could match a value
-                    // it does not equal.
-
-                    // A GNU range `case lo ... hi:`. An absent high endpoint
-                    // is the ordinary label, held as the degenerate range
-                    // `(v, v)` so that everything downstream has one shape.
-                    let hi = match high {
-                        None => Some(val),
-                        Some(hi_expr) => match self.eval_const_expr(hi_expr) {
-                            Some(h) => Some(h),
-                            None => {
-                                self.report_unfoldable_case(hi_expr);
-                                None
-                            }
-                        },
-                    };
-                    let Some(hi) = hi else { return };
-
-                    // 6.8.4.2p3 forbids two equal case constants, and GCC
-                    // extends that to overlapping ranges -- an overlap would
-                    // otherwise make one arm silently unreachable, since the
-                    // body walk resolves a label by finding the first match.
-                    // Order by the switch type's own signedness. The
-                    // endpoints are carried as `i128`, and an unsigned 64-bit
-                    // bound above `i64::MAX` is still positive there -- but an
-                    // unsigned *128-bit* one is not, so the reinterpretation
-                    // is still needed: `case 0ul ... ULONG_MAX:` read as an
-                    // empty range and never matched.
-                    let below = |a: i128, b: i128| {
-                        if unsigned {
-                            (a as u128) < (b as u128)
-                        } else {
-                            a < b
+                let Some(raw_lo) = self.eval_const_expr(expr) else {
+                    self.report_unfoldable_case(expr);
+                    return;
+                };
+                // A GNU range `case lo ... hi:`. An absent high endpoint is
+                // the ordinary label, held as the degenerate range `(v, v)` so
+                // that everything downstream has one shape.
+                let raw_hi = match high {
+                    None => Some(raw_lo),
+                    Some(hi_expr) => match self.eval_const_expr(hi_expr) {
+                        Some(h) => Some(h),
+                        None => {
+                            self.report_unfoldable_case(hi_expr);
+                            None
                         }
-                    };
-                    if below(hi, val) {
-                        // GCC accepts an empty range, warns, and never matches
-                        // it. Nothing is recorded, so nothing can overlap it.
-                        crate::diag::warning(expr.pos, "empty range specified");
-                        return;
-                    }
-                    if let Some((lo2, hi2)) = case_values.overlap(val, hi) {
-                        let what = if val == hi && lo2 == hi2 {
-                            format!("duplicate case value '{}' in switch", val)
-                        } else {
-                            format!(
-                                "duplicate (or overlapping) case value: {}..{} overlaps {}..{}",
-                                val, hi, lo2, hi2
-                            )
-                        };
-                        error(expr.pos, &what);
-                    }
-                    case_values.insert(val, hi);
-                } else if self.expr_is_runtime(expr) {
-                    // A non-constant label can never match.
-                    error(expr.pos, "case label is not an integer constant expression");
-                } else {
-                    // Constant in principle, but `eval_const_expr` is a partial
-                    // evaluator and could not fold it. Saying the program is
-                    // invalid would be a false claim about the source — this is
-                    // our limit, not its error. Either way the label cannot be
-                    // emitted, so it still has to be reported rather than
-                    // silently dropped.
-                    error(
-                        expr.pos,
-                        "case label is a constant expression this compiler cannot evaluate",
-                    );
+                    },
+                };
+                let Some(raw_hi) = raw_hi else { return };
+
+                // C17 6.8.4.2p5: each case constant is converted to the
+                // promoted type of the controlling expression. Evaluating the
+                // label at full width and never converting it left c17's two
+                // lowerings disagreeing about the same switch -- a runtime
+                // selector kept the unconverted label in the `switch`
+                // instruction, where the backend truncated it, while the
+                // constant-selector path compared at 128 bits and did not
+                // match at all. `case 4294967296LL:` in an `int` switch is
+                // `case 0:`, and has to be that for both.
+                let conv = case_values.conv();
+                let lo = self.convert_case_label(expr, raw_lo, conv);
+                let hi = match high {
+                    None => lo,
+                    Some(hi_expr) => self.convert_case_label(hi_expr, raw_hi, conv),
+                };
+
+                // 6.8.4.2p3 forbids two equal case constants, and GCC
+                // extends that to overlapping ranges -- an overlap would
+                // otherwise make one arm silently unreachable, since the
+                // body walk resolves a label by finding the first match.
+                // Both tests run on the converted values, since that is what
+                // "equal" means once p5 has been applied: `case 0:` beside
+                // `case 4294967296LL:` in an `int` switch is one value twice.
+                //
+                // Order by the switch type's own signedness. The endpoints are
+                // carried as `i128`, and an unsigned 64-bit bound above
+                // `i64::MAX` is still positive there -- but an unsigned
+                // *128-bit* one is not, so the reinterpretation is still
+                // needed: `case 0ul ... ULONG_MAX:` read as an empty range and
+                // never matched.
+                if conv.lt(hi, lo) {
+                    // GCC accepts an empty range, warns, and never matches
+                    // it. Nothing is recorded, so nothing can overlap it.
+                    crate::diag::warning(expr.pos, "empty range specified");
+                    return;
                 }
+                if let Some((lo2, hi2)) = case_values.overlap(lo, hi) {
+                    let what = if lo == hi && lo2 == hi2 {
+                        format!("duplicate case value '{}' in switch", lo)
+                    } else {
+                        format!(
+                            "duplicate (or overlapping) case value: {}..{} overlaps {}..{}",
+                            lo, hi, lo2, hi2
+                        )
+                    };
+                    error(expr.pos, &what);
+                }
+                case_values.insert(lo, hi);
             }
             Stmt::Default(_, body) => {
-                self.collect_cases_from_stmt(body, case_values, has_default, unsigned);
+                self.collect_cases_from_stmt(body, case_values, has_default);
                 // C99 6.8.4.2p3: at most one default label per switch.
                 if *has_default {
                     error(
@@ -2121,28 +2159,28 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             // Recursively check labeled statements
             Stmt::Label { stmt, .. } => {
-                self.collect_cases_from_stmt(stmt, case_values, has_default, unsigned);
+                self.collect_cases_from_stmt(stmt, case_values, has_default);
             }
             // Recurse into nested statements for Duff's device pattern
             // (case labels inside loops/blocks within a switch)
             Stmt::Block(items) => {
                 for item in items {
                     if let BlockItem::Statement(s) = item {
-                        self.collect_cases_from_stmt(s, case_values, has_default, unsigned);
+                        self.collect_cases_from_stmt(s, case_values, has_default);
                     }
                 }
             }
             Stmt::DoWhile { body, .. } | Stmt::While { body, .. } | Stmt::For { body, .. } => {
-                self.collect_cases_from_stmt(body, case_values, has_default, unsigned);
+                self.collect_cases_from_stmt(body, case_values, has_default);
             }
             Stmt::If {
                 then_stmt,
                 else_stmt,
                 ..
             } => {
-                self.collect_cases_from_stmt(then_stmt, case_values, has_default, unsigned);
+                self.collect_cases_from_stmt(then_stmt, case_values, has_default);
                 if let Some(e) = else_stmt {
-                    self.collect_cases_from_stmt(e, case_values, has_default, unsigned);
+                    self.collect_cases_from_stmt(e, case_values, has_default);
                 }
             }
             // Stop at inner switch — its case labels belong to it
@@ -2606,20 +2644,27 @@ impl<'a> super::linearize::Linearizer<'a> {
         &mut self,
         switch_val: PseudoId,
         cmp_type: TypeId,
+        conv: CaseConv,
         case_values: &[(i128, i128)],
         case_bbs: &[BasicBlockId],
         default_target: BasicBlockId,
     ) {
         let size = self.types.size_bits(cmp_type);
-        let unsigned = self.types.is_unsigned(cmp_type);
-        // `>=` and `<=` for a range, in the controlling type's own signedness.
-        let (ge, le) = if unsigned {
+        // `>=` and `<=` for a range, in the controlling type's own signedness
+        // -- the same `conv` that converted the labels, so the comparison and
+        // the constants it compares are describing one type.
+        let (ge, le) = if conv.unsigned() {
             (Opcode::SetAe, Opcode::SetBe)
         } else {
             (Opcode::SetGe, Opcode::SetLe)
         };
 
         for (&(lo, hi), &case_bb) in case_values.iter().zip(case_bbs.iter()) {
+            debug_assert_eq!(
+                (conv.convert(lo), conv.convert(hi)),
+                (lo, hi),
+                "a case label reaches lowering already converted to the controlling type"
+            );
             let Some(from) = self.current_bb else { return };
             let next = self.alloc_bb();
             let cond = if lo == hi {
@@ -2699,20 +2744,18 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) {
         match stmt {
             Stmt::Case(expr, high, body) => {
-                // Find the matching case block. A label is identified by its
-                // whole range, so that `case 1 ... 3:` and a later `case 1:`
-                // could not resolve to the same block -- the overlap check
-                // rejects that pair anyway, but matching on the low endpoint
-                // alone would have made the two indistinguishable here.
-                if let Some(val) = self.eval_const_expr(expr) {
-                    // Matched at full width, as the collector records them.
-                    let lo = val;
+                // Find the matching case block. The endpoints are the label's
+                // raw constants; `CaseIndex::lookup` converts them to the
+                // promoted controlling type with the very conversion the
+                // collector used, which is what keeps this lookup from missing
+                // and dropping the case body into the wrong block.
+                if let Some(lo) = self.eval_const_expr(expr) {
                     let hi = match high {
                         None => Some(lo),
                         Some(hi_expr) => self.eval_const_expr(hi_expr),
                     };
                     let Some(hi) = hi else { return };
-                    if let Some(&idx) = case_values.get(&(lo, hi)) {
+                    if let Some(idx) = case_values.lookup(lo, hi) {
                         let case_bb = case_bbs[idx];
 
                         // Fall through from previous case if not terminated
@@ -4107,8 +4150,121 @@ impl AddrWalk<'_> {
     }
 }
 
-/// Each case range's position among a switch's labels.
-pub(crate) type CaseIndex = std::collections::HashMap<(i128, i128), usize>;
+/// The promoted type of a switch's controlling expression: the width and the
+/// signedness in which C17 6.8.4.2 says every case label lives.
+///
+/// p5 converts each case constant to that type and p3 forbids two of them
+/// being equal *after* the conversion, so a label's converted value is the
+/// only one the rest of the switch path may see. Two places have to agree
+/// about it -- the collector that records a label's range, and the body walk
+/// that looks that same range back up to find the block it was given. If they
+/// disagreed the lookup would simply miss, leaving the case body emitted into
+/// the wrong block with nothing diagnosed.
+///
+/// One value carries the whole conversion so they cannot disagree:
+/// [`CaseSet`] owns the `CaseConv`, [`CaseSet::insert`] and
+/// [`CaseSet::overlap`] convert what they are handed, [`CaseIndex::of`] copies
+/// the conversion out of the set it indexes, and [`CaseIndex::lookup`] -- the
+/// only way into the map -- converts too. Conversion is idempotent, so a
+/// caller that has already converted for its own reasons stays in step.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct CaseConv {
+    /// Width of the promoted controlling type, in bits.
+    bits: u32,
+    /// Whether that type is unsigned.
+    unsigned: bool,
+}
+
+impl CaseConv {
+    pub(crate) fn new(bits: u32, unsigned: bool) -> Self {
+        Self { bits, unsigned }
+    }
+
+    /// The conversion a `switch` whose promoted controlling type is `typ`
+    /// applies to its labels.
+    pub(crate) fn of(types: &TypeTable, typ: TypeId) -> Self {
+        Self::new(types.size_bits(typ), types.is_unsigned(typ))
+    }
+
+    pub(crate) fn unsigned(self) -> bool {
+        self.unsigned
+    }
+
+    /// `v` converted to this type, per C17 6.3.1.3: its low `bits` bits, read
+    /// back with the type's own signedness.
+    ///
+    /// The result is carried the way the whole switch path carries a value --
+    /// an `i128` holding the type's bit pattern -- so a 128-bit unsigned label
+    /// above `i128::MAX` stays negative here and is ordered by [`Self::lt`]
+    /// rather than by Rust's signed `<`.
+    pub(crate) fn convert(self, v: i128) -> i128 {
+        if self.bits == 0 || self.bits >= 128 {
+            return v;
+        }
+        let shift = 128 - self.bits;
+        let truncated = ((v as u128) << shift) >> shift;
+        if self.unsigned {
+            truncated as i128
+        } else {
+            ((truncated << shift) as i128) >> shift
+        }
+    }
+
+    /// `a < b` in this type's signedness.
+    pub(crate) fn lt(self, a: i128, b: i128) -> bool {
+        if self.unsigned {
+            (a as u128) < (b as u128)
+        } else {
+            a < b
+        }
+    }
+
+    /// Whether the converted range `lo..=hi` holds the converted value `v`.
+    ///
+    /// The constant-selector lowering picks its one edge with this, and has to
+    /// ask in the switch's signedness: a plain `i128` test read `case -1:` in
+    /// a `switch` on `unsigned` as a huge lower bound and never selected it.
+    pub(crate) fn contains(self, lo: i128, hi: i128, v: i128) -> bool {
+        !self.lt(v, lo) && !self.lt(hi, v)
+    }
+}
+
+/// Each case range's position among a switch's labels, keyed by the range as
+/// the controlling type sees it.
+pub(crate) struct CaseIndex {
+    conv: CaseConv,
+    by_range: std::collections::HashMap<(i128, i128), usize>,
+}
+
+impl CaseIndex {
+    /// Index the labels `set` collected, carrying `set`'s own conversion so
+    /// that a lookup converts exactly as the insert did.
+    ///
+    /// The first label of a repeated range wins, as a scan in source order
+    /// would find it; a duplicate has already been reported.
+    pub(crate) fn of(set: &CaseSet) -> Self {
+        let mut by_range = std::collections::HashMap::new();
+        for (idx, range) in set.ranges().iter().enumerate() {
+            by_range.entry(*range).or_insert(idx);
+        }
+        Self {
+            conv: set.conv(),
+            by_range,
+        }
+    }
+
+    /// The position of the label written `lo ... hi`, whose endpoints are the
+    /// raw constants as the label spells them.
+    ///
+    /// A label is identified by its whole range, so that `case 1 ... 3:` and a
+    /// later `case 1:` cannot resolve to the same block -- the overlap check
+    /// rejects that pair anyway, but matching on the low endpoint alone would
+    /// make the two indistinguishable here.
+    pub(crate) fn lookup(&self, lo: i128, hi: i128) -> Option<usize> {
+        let key = (self.conv.convert(lo), self.conv.convert(hi));
+        self.by_range.get(&key).copied()
+    }
+}
 
 /// A switch's case ranges, in source order, with an index that finds an
 /// overlap in logarithmic time.
@@ -4117,43 +4273,56 @@ pub(crate) type CaseIndex = std::collections::HashMap<(i128, i128), usize>;
 /// quadratic in its case count: 70,000 labels took five seconds to compile
 /// and gcc's `limits-caselabels` eleven.
 pub(crate) struct CaseSet {
-    /// The ranges `(lo, hi)`, in the order the labels were written.
+    /// The ranges `(lo, hi)`, converted to the controlling type, in the order
+    /// the labels were written.
     ranges: Vec<(i128, i128)>,
     /// Each range by its low end, as an order-preserving key, to its high end.
     by_lo: std::collections::BTreeMap<i128, (i128, i128, i128)>,
-    unsigned: bool,
+    /// What every endpoint entering the set is converted by.
+    conv: CaseConv,
 }
 
 impl CaseSet {
-    fn new(unsigned: bool) -> Self {
+    fn new(conv: CaseConv) -> Self {
         Self {
             ranges: Vec::new(),
             by_lo: std::collections::BTreeMap::new(),
-            unsigned,
+            conv,
         }
+    }
+
+    pub(crate) fn conv(&self) -> CaseConv {
+        self.conv
+    }
+
+    /// The ranges, converted, in source order. Parallel to the case blocks.
+    pub(crate) fn ranges(&self) -> &[(i128, i128)] {
+        &self.ranges
     }
 
     /// `v` as a signed key ordered the way the switch's type orders it: an
     /// unsigned value has its top bit flipped, which maps unsigned order onto
     /// signed order.
     fn key(&self, v: i128) -> i128 {
-        if self.unsigned {
+        if self.conv.unsigned {
             v ^ i128::MIN
         } else {
             v
         }
     }
 
-    /// An earlier range sharing a value with `lo..=hi`, if any.
+    /// An earlier range sharing a value with `lo..=hi`, if any, as converted.
     ///
     /// The ranges recorded are disjoint -- an overlap is an error -- so the
     /// only candidate is the one starting last at or before `hi`.
     fn overlap(&self, lo: i128, hi: i128) -> Option<(i128, i128)> {
+        let (lo, hi) = (self.conv.convert(lo), self.conv.convert(hi));
         let (_, &(hi_key, lo2, hi2)) = self.by_lo.range(..=self.key(hi)).next_back()?;
         (hi_key >= self.key(lo)).then_some((lo2, hi2))
     }
 
     fn insert(&mut self, lo: i128, hi: i128) {
+        let (lo, hi) = (self.conv.convert(lo), self.conv.convert(hi));
         self.ranges.push((lo, hi));
         let (lo_key, hi_key) = (self.key(lo), self.key(hi));
         self.by_lo.insert(lo_key, (hi_key, lo, hi));
@@ -4162,11 +4331,127 @@ impl CaseSet {
 
 #[cfg(test)]
 mod case_set_tests {
-    use super::CaseSet;
+    use super::{CaseConv, CaseIndex, CaseSet};
+
+    /// A 128-bit conversion is the identity, which is what the ranges below
+    /// want: they are about ordering, not about width.
+    fn wide(unsigned: bool) -> CaseConv {
+        CaseConv::new(128, unsigned)
+    }
+
+    /// C17 6.8.4.2p5 converts a case constant to the promoted controlling
+    /// type: the low bits, read back with that type's signedness.
+    #[test]
+    fn convert_takes_the_low_bits_with_the_types_signedness() {
+        let int = CaseConv::new(32, false);
+        let uint = CaseConv::new(32, true);
+
+        // In range: unchanged either way.
+        assert_eq!(int.convert(7), 7);
+        assert_eq!(uint.convert(7), 7);
+
+        // 2^32 is zero in 32 bits -- the label that silently became `case 0:`.
+        assert_eq!(int.convert(4294967296), 0);
+        assert_eq!(uint.convert(4294967296), 0);
+
+        // -1 keeps its value as `int` and is the largest `unsigned int`.
+        assert_eq!(int.convert(-1), -1);
+        assert_eq!(uint.convert(-1), 4294967295);
+
+        // The boundary of the signed range wraps the way C says.
+        assert_eq!(int.convert(2147483648), -2147483648);
+        assert_eq!(uint.convert(2147483648), 2147483648);
+
+        // Narrower and wider types, and the 128-bit identity.
+        assert_eq!(CaseConv::new(8, false).convert(255), -1);
+        assert_eq!(CaseConv::new(8, true).convert(-1), 255);
+        assert_eq!(CaseConv::new(64, true).convert(-1), u64::MAX as i128);
+        assert_eq!(CaseConv::new(128, true).convert(-1), -1);
+        assert_eq!(CaseConv::new(128, false).convert(i128::MIN), i128::MIN);
+    }
+
+    /// Converting is idempotent, which is what lets the collector convert for
+    /// its own diagnostics and still hand the set and the index raw or
+    /// converted endpoints interchangeably.
+    #[test]
+    fn convert_is_idempotent() {
+        for conv in [
+            CaseConv::new(8, false),
+            CaseConv::new(16, true),
+            CaseConv::new(32, false),
+            CaseConv::new(64, true),
+            CaseConv::new(128, true),
+        ] {
+            for v in [0, 1, -1, 255, 4294967296, i128::MIN, i128::MAX] {
+                let once = conv.convert(v);
+                assert_eq!(conv.convert(once), once, "{conv:?} {v}");
+            }
+        }
+    }
+
+    /// The constant-selector lowering asks in the switch's own signedness.
+    #[test]
+    fn contains_tests_the_range_in_the_switch_signedness() {
+        let uint = CaseConv::new(32, true);
+        let big = uint.convert(-1); // 4294967295
+        assert!(uint.contains(big, big, big));
+        assert!(!uint.contains(big, big, 0));
+        assert!(uint.contains(0, big, 5));
+
+        let int = CaseConv::new(32, false);
+        assert!(int.contains(-1, -1, -1));
+        assert!(int.contains(-5, 5, 0));
+        assert!(!int.contains(-5, 5, 6));
+        // A signed test would read the unsigned bound as below zero.
+        assert!(!int.contains(0, 10, big));
+    }
+
+    /// The two-site invariant: what the collector inserts is exactly what the
+    /// body walk finds, even though the walk looks the label up by the
+    /// constant as written rather than as converted.
+    #[test]
+    fn the_index_finds_a_label_by_its_unconverted_constant() {
+        let conv = CaseConv::new(32, false);
+        let mut set = CaseSet::new(conv);
+        set.insert(0, 0);
+        set.insert(-1, -1);
+        set.insert(70000, 70005);
+        // Stored converted, and 2^32+3 is 3 in an `int` switch.
+        set.insert(4294967299, 4294967299);
+        assert_eq!(set.ranges(), [(0, 0), (-1, -1), (70000, 70005), (3, 3)]);
+
+        let index = CaseIndex::of(&set);
+        assert_eq!(index.lookup(0, 0), Some(0));
+        assert_eq!(index.lookup(-1, -1), Some(1));
+        assert_eq!(index.lookup(70000, 70005), Some(2));
+        // Looked up as written, found as converted.
+        assert_eq!(index.lookup(4294967299, 4294967299), Some(3));
+        assert_eq!(index.lookup(3, 3), Some(3));
+        assert_eq!(index.lookup(9, 9), None);
+
+        // And a label the controlling type sees as negative.
+        let uconv = CaseConv::new(32, true);
+        let mut uset = CaseSet::new(uconv);
+        uset.insert(-1, -1);
+        assert_eq!(uset.ranges(), [(4294967295, 4294967295)]);
+        let uindex = CaseIndex::of(&uset);
+        assert_eq!(uindex.lookup(-1, -1), Some(0));
+        assert_eq!(uindex.lookup(4294967295, 4294967295), Some(0));
+    }
+
+    /// Two labels that differ before the conversion collide after it, which is
+    /// the duplicate C17 6.8.4.2p3 forbids.
+    #[test]
+    fn overlap_sees_the_converted_values() {
+        let mut set = CaseSet::new(CaseConv::new(32, false));
+        set.insert(0, 0);
+        assert_eq!(set.overlap(4294967296, 4294967296), Some((0, 0)));
+        assert_eq!(set.overlap(1, 1), None);
+    }
 
     #[test]
     fn overlap_finds_the_range_sharing_a_value() {
-        let mut set = CaseSet::new(false);
+        let mut set = CaseSet::new(wide(false));
         set.insert(-10, -5);
         set.insert(0, 0);
         set.insert(10, 20);
@@ -4186,7 +4471,7 @@ mod case_set_tests {
     #[test]
     fn overlap_orders_by_the_switch_type_signedness() {
         let big = u128::MAX as i128; // -1 as i128, the largest unsigned value
-        let mut set = CaseSet::new(true);
+        let mut set = CaseSet::new(wide(true));
         set.insert(1, 5);
         set.insert(big - 10, big);
         assert_eq!(set.overlap(big - 3, big - 3), Some((big - 10, big)));

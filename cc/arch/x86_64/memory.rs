@@ -927,24 +927,24 @@ impl X86_64CodeGen {
                 let op_size = OperandSize::from_bits(mem_size);
                 if is_symbol {
                     // Local variable - store directly to stack slot.
-                    // Widen 32-bit stores at offset 0 to 64-bit to prevent stale
-                    // upper bits when a 32-bit result is stored into a 64-bit
-                    // local (e.g., int-to-long, int-to-pointer assignments).
-                    // Exception: struct/union fields at offset 0 must use exact
-                    // size to avoid clobbering the adjacent field at offset 4.
+                    // Widen a 32-bit store at offset 0 to 64 bits, so a narrow
+                    // value going into a wider slot leaves no stale upper bits
+                    // behind it (an int-to-long or int-to-pointer assignment).
+                    //
+                    // Only where the slot holds one scalar, though: an
+                    // aggregate or a complex has another member at offset 4 or
+                    // 8, and widening the store writes over it. Asking how
+                    // *large* the object is cannot tell the two apart -- a
+                    // `long` and a `struct { int x, y; }` are both 64 bits, and
+                    // testing for more than 64 spared only the aggregates too
+                    // big to be confused with a scalar in the first place. A
+                    // slot this has no record of keeps the widening, which is
+                    // what it did before.
                     let store_size = if mem_size == 32 && insn.offset == 0 {
-                        let sym_bits = self.sym_type_sizes.get(&addr).copied().unwrap_or(64);
-                        if sym_bits > 32 {
-                            // Check if this is a struct/union (don't widen field stores)
-                            let is_struct =
-                                self.sym_type_sizes.contains_key(&addr) && sym_bits > 64;
-                            if is_struct {
-                                op_size // struct field: exact size
-                            } else {
-                                OperandSize::B64 // scalar/pointer: safe to widen
-                            }
-                        } else {
-                            OperandSize::B64 // small scalar: safe to widen
+                        match self.sym_slots.get(&addr) {
+                            Some(slot) if slot.one_scalar && slot.bits <= 64 => OperandSize::B64,
+                            Some(_) => op_size,
+                            None => OperandSize::B64,
                         }
                     } else {
                         op_size

@@ -16600,3 +16600,126 @@ float probe(void) { struct P q = {1, 2, 3}; return sum(q); }
         "expected the inlined parameter copy to reach offset 8 at all:\n{ir}"
     );
 }
+
+/// Storing one field of an eight-byte aggregate leaves the other alone.
+///
+/// The x86-64 store lowering widens a 32-bit store at offset 0 of a local to
+/// 64 bits, to clear stale upper bits when a narrow value goes into a wider
+/// slot. Its own comment records the exception that needs: "struct/union
+/// fields at offset 0 must use exact size to avoid clobbering the adjacent
+/// field at offset 4". The exception asked whether the object was *larger than*
+/// 64 bits, which an eight-byte aggregate is not -- so exactly the case the
+/// comment describes was the one that fell through.
+///
+/// Only at `-O0`: with the optimizer on, the field is promoted out of memory
+/// before the store lowering sees it.
+#[test]
+fn codegen_a_field_store_does_not_widen_over_its_neighbour() {
+    let code = r#"
+struct P { int x, y; };
+struct S { struct P t; };
+union U { struct P p; double d; };
+
+int main(void)
+{
+    /* The reported shape: a designated override inside an eight-byte struct. */
+    struct S a = { .t = {1, 2}, .t.x = 3 };
+    if (a.t.x != 3 || a.t.y != 2) return 1;
+
+    /* The same store reached other ways. */
+    struct P b = {1, 2};
+    b.x = 3;
+    if (b.x != 3 || b.y != 2) return 2;
+
+    struct P c;
+    c.y = 2;
+    c.x = 3;
+    if (c.x != 3 || c.y != 2) return 3;
+
+    struct P *p = &b;
+    p->x = 9;
+    if (b.x != 9 || b.y != 2) return 4;
+
+    union U u;
+    u.p.y = 7;
+    u.p.x = 5;
+    if (u.p.x != 5 || u.p.y != 7) return 5;
+
+    /* Arrays are the same shape at the same size. */
+    int arr[2] = {1, 2};
+    arr[0] = 3;
+    if (arr[0] != 3 || arr[1] != 2) return 6;
+
+    /* Exactly eight bytes made of narrower fields. */
+    struct Q { short a, b, c, d; } q = {1, 2, 3, 4};
+    q.a = 9;
+    if (q.a != 9 || q.b != 2 || q.c != 3 || q.d != 4) return 7;
+
+    return 0;
+}
+"#;
+    // `-O0` explicitly: the default matrix compiles at `-O`, where the field is
+    // promoted out of memory before the store lowering ever sees it, so the
+    // defect is invisible there.
+    assert_eq!(
+        compile_and_run("field_store_no_widen", code, &["-O0".to_string()]),
+        0
+    );
+    assert_eq!(compile_and_run("field_store_no_widen_matrix", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("field_store_no_widen_opt", code),
+        0
+    );
+}
+
+/// The control: a narrow value stored into a wider scalar slot still leaves no
+/// stale upper bits.
+///
+/// This is what the widening is for, and it is why the fix has to ask whether
+/// the object is an aggregate rather than simply stop widening. Each case
+/// writes a wide value into the slot first, so a store that failed to clear the
+/// upper half would read it back.
+#[test]
+fn codegen_a_narrow_store_into_a_wide_slot_clears_it() {
+    let code = r#"
+int wide(void) { return -1; }
+
+int main(void)
+{
+    /* Put a known wide pattern in the slot, then overwrite it narrowly. */
+    long l = 0x7fffffff7fffffffL;
+    int i = 5;
+    l = i;
+    if (l != 5) return 1;
+
+    unsigned long ul = 0xffffffffffffffffUL;
+    unsigned ui = 7;
+    ul = ui;
+    if (ul != 7UL) return 2;
+
+    void *vp = (void *)0x7fffffffffffL;
+    unsigned addr = 0;
+    vp = (void *)(unsigned long)addr;
+    if (vp != (void *)0) return 3;
+
+    /* Through a call, so the value is not a constant the optimizer can see. */
+    long l2 = 0x7fffffff7fffffffL;
+    l2 = wide();
+    if (l2 != -1L) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("narrow_store_clears_slot", code, &["-O0".to_string()]),
+        0
+    );
+    assert_eq!(
+        compile_and_run("narrow_store_clears_slot_matrix", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("narrow_store_clears_slot_opt", code),
+        0
+    );
+}

@@ -65,6 +65,57 @@ const DEFAULT_ORDER_CAPACITY: usize = 16;
 
 // Inline Candidate Analysis
 
+/// A caller's size, as [`function_size`] measures it, for one decision.
+#[derive(Debug, Clone, Copy)]
+struct CallerSize {
+    /// Including every call site already accepted for splicing.
+    now: usize,
+    /// Before this pass inlined anything into it: what the growth limit is
+    /// proportional to.
+    original: usize,
+}
+
+impl CallerSize {
+    #[cfg(test)]
+    fn unchanged(size: usize) -> CallerSize {
+        CallerSize {
+            now: size,
+            original: size,
+        }
+    }
+}
+
+/// What an instruction costs in the size every inlining decision is made on:
+/// 0 for one that emits no code of its own once the function is simplified,
+/// 1 for anything else.
+///
+/// The free ones are bookkeeping -- `Nop`, `Entry`, a phi and its sources --
+/// and the `Copy`s and `SetVal`s promotion and linearization leave by the
+/// dozen: a constant becomes an immediate and a copy is propagated away. They
+/// are close to half of a raw count, which is what every threshold below was
+/// being compared against, and `Nop`s only grow as passes kill instructions.
+fn insn_cost(insn: &Instruction) -> usize {
+    match insn.op {
+        Opcode::Nop
+        | Opcode::Entry
+        | Opcode::Phi
+        | Opcode::PhiSource
+        | Opcode::Copy
+        | Opcode::SetVal => 0,
+        _ => 1,
+    }
+}
+
+/// The size of `func` as the inliner measures it; see [`insn_cost`]. One
+/// rule for a callee and a caller alike.
+fn function_size(func: &Function) -> usize {
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .map(insn_cost)
+        .sum()
+}
+
 /// Metadata about a function's suitability for inlining
 #[derive(Debug, Clone, Default)]
 pub struct InlineCandidate {
@@ -198,10 +249,10 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
         ..Default::default()
     };
 
-    // Count instructions and check for disqualifying patterns
-    for bb in &func.blocks {
-        candidate.estimated_size += bb.insns.len();
+    candidate.estimated_size = function_size(func);
 
+    // Check for disqualifying patterns
+    for bb in &func.blocks {
         for insn in &bb.insns {
             match insn.op {
                 Opcode::VaStart => {
@@ -239,9 +290,10 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
 fn should_inline(
     candidate: &InlineCandidate,
     opt: Optimization,
-    caller_size: usize,
+    caller: CallerSize,
     caller_is_recursive: bool,
 ) -> bool {
+    let caller_size = caller.now;
     // Never inline if disqualifying conditions. These are the ones that make
     // a splice impossible rather than undesirable, and
     // `InlineCandidate::cannot_be_inlined` is where they are listed, so the
@@ -359,8 +411,13 @@ fn should_inline(
     //
     // GCC model: new_size <= max(base, LARGE_FUNCTION_INSNS) * (1 + growth%)
     // where base = max(caller_size, callee_size).
+    // `base` is the caller as it was before this pass inlined anything into
+    // it. Measured against its current size instead, the limit rose with
+    // every splice, and each of the pass's iterations let the caller grow by
+    // the whole allowance again.
     let new_size = caller_size + candidate.estimated_size;
-    let base = caller_size
+    let base = caller
+        .original
         .max(candidate.estimated_size)
         .max(LARGE_FUNCTION_INSNS);
     let limit = base + base * LARGE_FUNCTION_GROWTH / 100;
@@ -1553,6 +1610,7 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
     }
 
     let mut any_changed = false;
+    let original_sizes: Vec<usize> = module.functions.iter().map(function_size).collect();
 
     // Iterate to handle nested inlining
     for _iteration in 0..MAX_INLINE_ITERATIONS {
@@ -1562,13 +1620,15 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
         let mut changed_this_iteration = false;
 
         // Process each function
-        for func_idx in 0..module.functions.len() {
+        for (func_idx, &original_size) in original_sizes.iter().enumerate() {
             let caller_name = module.functions[func_idx].name.clone();
-            let mut caller_size: usize = module.functions[func_idx]
-                .blocks
-                .iter()
-                .map(|b| b.insns.len())
-                .sum();
+            // The size the caller will have once the call sites already
+            // accepted are spliced in. Every decision is made before any
+            // splice, so measuring the caller once -- as this did, with a
+            // refresh after the splices that no decision could see -- let any
+            // number of small callees each pass the growth and stack caps
+            // against the same unchanged size.
+            let mut caller_size = function_size(&module.functions[func_idx]);
 
             // Check if caller is recursive (calls itself directly).
             // NOTE: mutual recursion (A→B→A) is not detected; those callers
@@ -1590,11 +1650,20 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
                         continue;
                     };
                     if let Some(candidate) = candidates.get(callee_name) {
-                        if should_inline(candidate, opt, caller_size, caller_is_recursive) {
-                            // Don't inline recursive calls
-                            if callee_name != caller_name {
-                                call_sites.push((bb_idx, insn_idx, callee_name.to_string()));
-                            }
+                        // Don't inline recursive calls
+                        if callee_name != caller_name
+                            && should_inline(
+                                candidate,
+                                opt,
+                                CallerSize {
+                                    now: caller_size,
+                                    original: original_size,
+                                },
+                                caller_is_recursive,
+                            )
+                        {
+                            call_sites.push((bb_idx, insn_idx, callee_name.to_string()));
+                            caller_size += candidate.estimated_size;
                         }
                     }
                 }
@@ -1613,13 +1682,6 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
                     if inline_call_site(&mut module.functions[func_idx], bb_idx, insn_idx, &callee)
                     {
                         changed_this_iteration = true;
-                        // Update caller_size so subsequent inlining decisions
-                        // in this iteration see the actual post-inline size.
-                        caller_size = module.functions[func_idx]
-                            .blocks
-                            .iter()
-                            .map(|b| b.insns.len())
-                            .sum();
                     }
                 }
             }
@@ -1858,7 +1920,8 @@ mod tests {
         assert!(!candidate.defines_varargs_frame);
         assert!(!candidate.consumes_va_list);
         assert!(!candidate.is_recursive);
-        assert_eq!(candidate.estimated_size, 2); // entry + ret
+        // `Entry` emits nothing; the `Ret` is the one instruction that counts.
+        assert_eq!(candidate.estimated_size, 1);
         assert_eq!(candidate.call_count, 0);
     }
 
@@ -1880,7 +1943,12 @@ mod tests {
         };
 
         // Small function should always inline at -O1
-        assert!(should_inline(&candidate, opt_at(1), 100, false));
+        assert!(should_inline(
+            &candidate,
+            opt_at(1),
+            CallerSize::unchanged(100),
+            false
+        ));
     }
 
     /// A callee that only *reads* a `va_list` splices correctly; one that
@@ -1907,7 +1975,7 @@ mod tests {
         };
 
         assert!(
-            !should_inline(&base, opt_at(2), 100, false),
+            !should_inline(&base, opt_at(2), CallerSize::unchanged(100), false),
             "consuming a va_list is not inlined on the size heuristics alone"
         );
 
@@ -1916,11 +1984,11 @@ mod tests {
             ..base.clone()
         };
         assert!(
-            should_inline(&forced, opt_at(2), 100, false),
+            should_inline(&forced, opt_at(2), CallerSize::unchanged(100), false),
             "`always_inline` over a va_list must be honoured"
         );
         assert!(
-            should_inline(&forced, opt_at(0), 100, false),
+            should_inline(&forced, opt_at(0), CallerSize::unchanged(100), false),
             "and at -O0 too, as gcc does"
         );
 
@@ -1931,7 +1999,12 @@ mod tests {
             is_always_inline: true,
             ..base.clone()
         };
-        assert!(!should_inline(&defines, opt_at(2), 100, false));
+        assert!(!should_inline(
+            &defines,
+            opt_at(2),
+            CallerSize::unchanged(100),
+            false
+        ));
     }
 
     #[test]
@@ -1952,7 +2025,12 @@ mod tests {
         };
 
         // Varargs functions should never inline
-        assert!(!should_inline(&candidate, opt_at(2), 100, false));
+        assert!(!should_inline(
+            &candidate,
+            opt_at(2),
+            CallerSize::unchanged(100),
+            false
+        ));
     }
 
     #[test]
@@ -1973,7 +2051,12 @@ mod tests {
         };
 
         // Recursive functions should not inline
-        assert!(!should_inline(&candidate, opt_at(2), 100, false));
+        assert!(!should_inline(
+            &candidate,
+            opt_at(2),
+            CallerSize::unchanged(100),
+            false
+        ));
     }
 
     #[test]
@@ -1994,7 +2077,12 @@ mod tests {
         };
 
         // Should not inline at -O0
-        assert!(!should_inline(&candidate, opt_at(0), 100, false));
+        assert!(!should_inline(
+            &candidate,
+            opt_at(0),
+            CallerSize::unchanged(100),
+            false
+        ));
     }
 
     #[test]
@@ -2015,14 +2103,24 @@ mod tests {
         };
 
         // 30 instructions with inline hint should inline
-        assert!(should_inline(&candidate, opt_at(1), 100, false));
+        assert!(should_inline(
+            &candidate,
+            opt_at(1),
+            CallerSize::unchanged(100),
+            false
+        ));
 
         // Without hint, 30 instructions is too large
         let candidate_no_hint = InlineCandidate {
             has_inline_hint: false,
             ..candidate
         };
-        assert!(!should_inline(&candidate_no_hint, opt_at(1), 100, false));
+        assert!(!should_inline(
+            &candidate_no_hint,
+            opt_at(1),
+            CallerSize::unchanged(100),
+            false
+        ));
     }
 
     #[test]
@@ -2247,7 +2345,7 @@ mod tests {
         let candidate = analyze_function(&weak, &HashMap::new());
         assert!(candidate.is_interposable);
         assert!(
-            !should_inline(&candidate, opt_at(2), 10, false),
+            !should_inline(&candidate, opt_at(2), CallerSize::unchanged(10), false),
             "an interposable definition must not be inlined"
         );
 
@@ -2918,5 +3016,81 @@ mod tests {
         // Verify type and size preserved
         assert_eq!(cloned_insn.typ, Some(types.int_id));
         assert_eq!(cloned_insn.size, 32);
+    }
+
+    /// A function of `adds` additions and a `ret`, and `calls` calls to
+    /// `callee` if it has any -- sized exactly, as `function_size` counts.
+    fn sized_func(name: &str, adds: u32, calls: usize, callee: &str) -> Function {
+        let types = TypeTable::new(&Target::host());
+        let int = types.int_id;
+        let mut func = Function::new(name, int);
+        func.is_static = true;
+        func.add_pseudo(Pseudo::val(PseudoId(0), 1));
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.insns.push(Instruction::new(Opcode::Entry));
+        for i in 1..=adds {
+            func.add_pseudo(Pseudo::reg(PseudoId(i), i));
+            bb.insns.push(Instruction::binop(
+                Opcode::Add,
+                PseudoId(i),
+                PseudoId(0),
+                PseudoId(0),
+                int,
+                32,
+            ));
+        }
+        for _ in 0..calls {
+            bb.insns.push(Instruction::call(
+                None,
+                callee,
+                vec![],
+                vec![],
+                types.void_id,
+                0,
+            ));
+        }
+        bb.insns.push(Instruction::ret(Some(PseudoId(0))));
+        func.add_block(bb);
+        func.entry = BasicBlockId(0);
+        func.next_pseudo = adds + 1;
+        func
+    }
+
+    fn calls_left(module: &Module, caller: &str, callee: &str) -> usize {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == caller)
+            .unwrap()
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .filter(|i| i.local_callee() == Some(callee))
+            .count()
+    }
+
+    /// The growth limit binds across the call sites of one caller, and across
+    /// the pass's iterations.
+    ///
+    /// Every decision for a caller was made against its size before any
+    /// splice -- the refresh after splicing came too late for any of them to
+    /// see -- so thirty calls to a ten-instruction leaf all passed a limit
+    /// that has room for twenty-six. And the limit was proportional to the
+    /// caller's *current* size, so each iteration of the pass granted the
+    /// whole allowance again.
+    #[test]
+    fn test_growth_limit_counts_every_accepted_call_site() {
+        // Caller: 490 additions, 30 calls, one ret = 521. Leaf: 9 additions
+        // and a ret = 10. The limit is 521 * 1.5 = 781, which 521 + 26 * 10
+        // meets and 521 + 27 * 10 does not.
+        let mut module = Module::default();
+        let mut big = sized_func("big", 490, 30, "leaf");
+        big.is_static = false; // externally visible, so it survives the pass
+        module.functions.push(big);
+        module.functions.push(sized_func("leaf", 9, 0, ""));
+        assert_eq!(function_size(&module.functions[0]), 521);
+        assert_eq!(function_size(&module.functions[1]), 10);
+        run(&mut module, opt_at(2));
+        assert_eq!(calls_left(&module, "big", "leaf"), 4);
     }
 }

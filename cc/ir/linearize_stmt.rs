@@ -975,7 +975,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     TypeKind::Array | TypeKind::Struct | TypeKind::Union
                 );
 
-                let groups = self.group_array_init_elements(elements, elem_type);
+                let groups = self.group_array_init_elements(elements, typ);
                 for element_index in groups.indices {
                     let Some(list) = groups.element_lists.get(&element_index) else {
                         continue;

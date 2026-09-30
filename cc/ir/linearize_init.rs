@@ -860,11 +860,32 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// Group array init elements by index, handling designators, brace elision,
     /// and nested InitList flattening. Shared between static and runtime paths.
+    ///
+    /// `array_typ` is the array being initialized, not its element type: the
+    /// bound is needed as well as the element type, because an initializer
+    /// past the last element is excess (C17 6.7.9p2) and must be *discarded*.
+    /// Grouping it anyway gave it an offset beyond the object and both lowering
+    /// paths then wrote there -- `int a[2] = {1, 2, 3};` stored the 3 over
+    /// whatever the frame put after `a`, and the file-scope form emitted a
+    /// third `.long` under a two-element symbol. c17 already warns about the
+    /// excess element; this is where it stops mattering.
     pub(crate) fn group_array_init_elements(
         &self,
         elements: &[InitElement],
-        elem_type: TypeId,
+        array_typ: TypeId,
     ) -> ArrayInitGroups {
+        let elem_type = self.types.base_type(array_typ).unwrap_or(self.types.int_id);
+
+        // An absent or zero bound is an array sized *by* this initializer -- an
+        // incomplete type `int a[] = {1, 2, 3}`, a flexible array member, or a
+        // GNU zero-length array -- so nothing in the list can be excess.
+        let last_index = self
+            .types
+            .array_size(array_typ)
+            .filter(|&n| n > 0)
+            .map(|n| n as i64 - 1);
+        let in_bounds = |idx: i64| last_index.is_none_or(|last| (0..=last).contains(&idx));
+
         let mut element_lists: HashMap<i64, Vec<InitElement>> = HashMap::new();
         let mut element_indices: Vec<i64> = Vec::new();
         let mut current_idx: i64 = 0;
@@ -912,7 +933,13 @@ impl<'a> super::linearize::Linearizer<'a> {
             if remaining_designators.is_empty()
                 && self.is_brace_elision_candidate(element, elem_type)
             {
+                // Consumed either way: the elements belong to this slot, and
+                // leaving them in the list would make the next iteration read
+                // them as initializers for the enclosing array.
                 let sub_elements = self.consume_brace_elision(elements, &mut elem_idx, elem_type);
+                if !in_bounds(element_index) {
+                    continue;
+                }
                 let entry = element_lists.entry(element_index).or_insert_with(|| {
                     element_indices.push(element_index);
                     Vec::new()
@@ -926,27 +953,37 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Expanding here keeps both lowering paths -- the static data
             // image and the runtime stores -- unchanged, and matches how c17
             // already lowers a bulk initializer element by element.
+            //
+            // A range is clamped rather than dropped whole, so that
+            // `[0 ... 4] = 1` on a three-element array still initializes the
+            // three elements the array has. Clamping the high endpoint also
+            // keeps the loop off the excess indices rather than walking one
+            // iteration per discarded element, which matters for an endpoint
+            // far past the array.
             let span_end = index_high.unwrap_or(element_index);
-            for target_index in element_index..=span_end {
-                let entry = element_lists.entry(target_index).or_insert_with(|| {
-                    element_indices.push(target_index);
-                    Vec::new()
-                });
+            let span_end = last_index.map_or(span_end, |last| span_end.min(last));
+            if in_bounds(element_index) {
+                for target_index in element_index..=span_end {
+                    let entry = element_lists.entry(target_index).or_insert_with(|| {
+                        element_indices.push(target_index);
+                        Vec::new()
+                    });
 
-                if remaining_designators.is_empty() {
-                    if let ExprKind::InitList {
-                        elements: nested_elements,
-                    } = &element.value.kind
-                    {
-                        entry.extend(nested_elements.clone());
-                        continue;
+                    if remaining_designators.is_empty() {
+                        if let ExprKind::InitList {
+                            elements: nested_elements,
+                        } = &element.value.kind
+                        {
+                            entry.extend(nested_elements.clone());
+                            continue;
+                        }
                     }
-                }
 
-                entry.push(InitElement {
-                    designators: remaining_designators.clone(),
-                    value: element.value.clone(),
-                });
+                    entry.push(InitElement {
+                        designators: remaining_designators.clone(),
+                        value: element.value.clone(),
+                    });
+                }
             }
             elem_idx += 1;
         }
@@ -1100,7 +1137,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     TypeKind::Array | TypeKind::Struct | TypeKind::Union
                 );
 
-                let groups = self.group_array_init_elements(elements, elem_type);
+                let groups = self.group_array_init_elements(elements, typ);
                 let mut init_elements = Vec::new();
                 for element_index in groups.indices {
                     let Some(list) = groups.element_lists.get(&element_index) else {
@@ -1767,5 +1804,131 @@ impl<'a> super::linearize::Linearizer<'a> {
             cur = &next.target;
         }
         Err(AliasFault::Undefined)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::ast::Expr;
+    use crate::symbol::SymbolTable;
+    use crate::target::Target;
+    use crate::types::Type;
+
+    /// A positional initializer element holding an `int` constant.
+    fn positional(value: i64, types: &TypeTable) -> InitElement {
+        InitElement {
+            designators: vec![],
+            value: Box::new(Expr::int(value, types)),
+        }
+    }
+
+    /// The same, addressed by a designator.
+    fn designated(designator: Designator, value: i64, types: &TypeTable) -> InitElement {
+        InitElement {
+            designators: vec![designator],
+            value: Box::new(Expr::int(value, types)),
+        }
+    }
+
+    /// The indices `group_array_init_elements` keeps for `elements` when they
+    /// initialize an `int` array of `size` elements (`None`: a bound derived
+    /// from the initializer itself, as for `int a[] = {1, 2, 3}`).
+    fn kept_indices(
+        size: Option<usize>,
+        build: impl Fn(&TypeTable) -> Vec<InitElement>,
+    ) -> Vec<i64> {
+        let target = Target::host();
+        let mut types = TypeTable::new(&target);
+        let elements = build(&types);
+        let array = types.intern(Type {
+            kind: TypeKind::Array,
+            base: Some(types.int_id),
+            array_size: size,
+            ..Default::default()
+        });
+        let symbols = SymbolTable::new();
+        let strings = crate::strings::StringTable::new();
+        let lin = Linearizer::new(&symbols, &types, &strings, &target);
+        let groups = lin.group_array_init_elements(&elements, array);
+        assert_eq!(groups.indices.len(), groups.element_lists.len());
+        groups.indices
+    }
+
+    #[test]
+    fn excess_array_elements_are_discarded() {
+        // `int a[2] = {1, 2, 3};` -- the third element has nowhere to go.
+        let indices = kept_indices(Some(2), |types| {
+            (1..=3).map(|v| positional(v, types)).collect()
+        });
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn a_positional_element_past_a_designator_can_be_excess() {
+        // `int a[3] = {[2] = 3, 1};` -- C17 6.7.9p17 resumes at index 3, so
+        // the `1` is excess although the list is shorter than the array.
+        let indices = kept_indices(Some(3), |types| {
+            vec![
+                designated(Designator::Index(2), 3, types),
+                positional(1, types),
+            ]
+        });
+        assert_eq!(indices, vec![2]);
+    }
+
+    #[test]
+    fn a_range_designator_is_clamped_to_the_array() {
+        // `int a[3] = {[0 ... 4] = 7};` initializes the three elements it has.
+        let indices = kept_indices(Some(3), |types| {
+            vec![designated(Designator::IndexRange(0, 4), 7, types)]
+        });
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn an_initializer_derived_bound_has_no_excess() {
+        // `int a[] = {1, 2, 3};` and a flexible array member are sized by the
+        // initializer, so every element belongs to the object.
+        let indices = kept_indices(None, |types| {
+            (1..=3).map(|v| positional(v, types)).collect()
+        });
+        assert_eq!(indices, vec![0, 1, 2]);
+        let indices = kept_indices(Some(0), |types| {
+            (1..=3).map(|v| positional(v, types)).collect()
+        });
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    /// The static image of `int a[2] = {1, 2, 3};` is two elements wide, not
+    /// three: the excess element used to become a third `.long` under a
+    /// two-element symbol, which the next symbol in the section absorbed.
+    #[test]
+    fn a_static_array_image_holds_no_excess_element() {
+        let target = Target::host();
+        let mut types = TypeTable::new(&target);
+        let elements: Vec<_> = (1..=3).map(|v| positional(v, &types)).collect();
+        let array = types.intern(Type::array(types.int_id, 2));
+        let symbols = SymbolTable::new();
+        let strings = crate::strings::StringTable::new();
+        let mut lin = Linearizer::new(&symbols, &types, &strings, &target);
+        let init = lin.ast_init_list_to_ir(&elements, array);
+        let Initializer::Array {
+            elem_size,
+            total_size,
+            elements,
+        } = init
+        else {
+            panic!("an array initializer lowers to Initializer::Array, got {init:?}");
+        };
+        assert_eq!(elem_size, 4);
+        assert_eq!(total_size, 8);
+        assert_eq!(
+            elements
+                .iter()
+                .map(|(offset, init)| (*offset, init.clone()))
+                .collect::<Vec<_>>(),
+            vec![(0, Initializer::Int(1)), (4, Initializer::Int(2))],
+        );
     }
 }

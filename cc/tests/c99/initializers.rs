@@ -2544,3 +2544,96 @@ fn c99_complex_constants_in_scalar_static_initializers() {
         assert_eq!(rc, 0);
     }
 }
+
+/// An excess array initializer is discarded, not written past the object.
+///
+/// C17 6.7.9p2 makes more initializers than elements a constraint violation;
+/// c17 already diagnoses it. The grouping pass never bounded its element
+/// cursor by the array size, so the extra value was still stored -- one element
+/// past the end, on top of whatever the frame put there. `int x[2] = {7, 8};`
+/// followed by `int a[2] = {1, 2, 3};` read back `x = {3, 8}`.
+#[test]
+fn c99_excess_array_initializers_do_not_write_past_the_object() {
+    let code = r#"
+int main(void)
+{
+    int x[2] = {7, 8};
+    int a[2] = {1, 2, 3};
+    if (a[0] != 1 || a[1] != 2) return 1;
+    if (x[0] != 7 || x[1] != 8) return 2;
+
+    /* Several excess elements, and a designator that jumps back first.
+       C17 6.7.9p17: a positional initializer after a designator resumes at
+       the next subobject, so after `[0] = 1` the cursor is at index 1 and the
+       9 overrides the earlier 2. Only the 10 and 11 are excess. Confirmed
+       against clang, which warns -Winitializer-overrides on the 9. */
+    short y[2] = {5, 6};
+    short b[2] = {[1] = 2, [0] = 1, 9, 10, 11};
+    if (b[0] != 1 || b[1] != 9) return 3;
+    if (y[0] != 5 || y[1] != 6) return 4;
+
+    /* The bound is on the index, not on the count. Here the array has three
+       elements and the initializer list has two, so a count-based rule keeps
+       the 1 -- but it resumes after `[2]`, i.e. at index 3, and is excess.
+       clang gives {0,0,3}. */
+    int guard_before[2] = {11, 12};
+    int d[3] = {[2] = 3, 1};
+    int guard_after[2] = {13, 14};
+    if (d[0] != 0 || d[1] != 0 || d[2] != 3) return 10;
+    if (guard_before[0] != 11 || guard_before[1] != 12) return 11;
+    if (guard_after[0] != 13 || guard_after[1] != 14) return 12;
+
+    /* A nested array: the excess belongs to the inner object. */
+    int z[2] = {8, 9};
+    int c[2][2] = {{1, 2, 3}, {4, 5}};
+    if (c[0][0] != 1 || c[0][1] != 2) return 5;
+    if (c[1][0] != 4 || c[1][1] != 5) return 6;
+    if (z[0] != 8 || z[1] != 9) return 7;
+
+    /* A char array from a string literal that does not fit: C17 6.7.9p14
+       allows exactly the terminator to be dropped, nothing more. */
+    char w[2] = {'a', 'b'};
+    char s[3] = "hello";
+    if (s[0] != 'h' || s[1] != 'e' || s[2] != 'l') return 8;
+    if (w[0] != 'a' || w[1] != 'b') return 9;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("excess_array_init", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("excess_array_init_opt", code), 0);
+}
+
+/// The static form of the same defect: the emitted object is exactly as wide
+/// as the array declares.
+///
+/// `int garr[2] = {1, 2, 3};` emitted three `.long`s under an eight-byte
+/// object, so the next symbol in the section absorbed the third.
+#[test]
+fn c99_excess_static_array_initializers_do_not_widen_the_object() {
+    let code = r#"
+int garr[2] = {1, 2, 3};
+int after = 42;
+short garr2[2] = {[1] = 2, [0] = 1, 9, 10};
+short after2 = 7;
+/* Bounded by index, not by count -- see the automatic case. */
+int garr3[3] = {[2] = 3, 1};
+int after3 = 5;
+
+int main(void)
+{
+    if (garr[0] != 1 || garr[1] != 2) return 1;
+    if (after != 42) return 2;
+    if (garr2[0] != 1 || garr2[1] != 9) return 3;
+    if (after2 != 7) return 4;
+    if (garr3[0] != 0 || garr3[1] != 0 || garr3[2] != 3) return 5;
+    if (after3 != 5) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("excess_static_array_init", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("excess_static_array_init_opt", code),
+        0
+    );
+}

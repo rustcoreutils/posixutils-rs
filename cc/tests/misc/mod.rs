@@ -11,5 +11,6 @@
 // Tests for setjmp/longjmp, statement expressions, and other misc features.
 //
 
+mod no_current_block;
 mod setjmp;
 mod stmt_expr;

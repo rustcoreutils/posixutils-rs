@@ -9309,3 +9309,159 @@ fn test_volatile_access_to_a_plain_local_blocks_promotion() {
         "SSA promotion turned a volatile access into a register copy"
     );
 }
+
+/// A short-circuit operator with a constant left operand emits no branch.
+///
+/// `emit_logical_and`/`emit_logical_or` are *triangles*, not diamonds: only one
+/// arm block exists, the other phi predecessor is the left operand's own block,
+/// and that block's phi value is emitted before the branch. They also branch
+/// through `branch_on(Controlling, ..)`, whose `Constant` case deliberately
+/// emits a plain `Br` and elides the merge edge entirely.
+///
+/// So they must not be folded into the generic two-way/diamond builder, which
+/// takes a `PseudoId` condition and always emits a `Cbr`: `1 && g()` would
+/// regain a dead conditional branch and a second, empty arm block. This test is
+/// the guard on that -- it fails if the short-circuit lowerings are ever routed
+/// through the diamond helper.
+#[test]
+fn a_constant_short_circuit_operand_emits_no_branch() {
+    let target = Target::host();
+
+    let count_cbr = |src: &str| -> usize {
+        let module = linearize_source(src, &target);
+        let func = module
+            .functions
+            .iter()
+            .find(|f| f.name == "f")
+            .expect("function f");
+        func.blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .filter(|i| i.op == Opcode::Cbr)
+            .count()
+    };
+
+    // A constant controlling operand is decided at compile time.
+    for src in [
+        "int g(void); int f(void) { return 1 && g(); }",
+        "int g(void); int f(void) { return 0 || g(); }",
+    ] {
+        assert_eq!(
+            count_cbr(src),
+            0,
+            "a constant short-circuit operand needs no branch: {src}"
+        );
+    }
+
+    // The control: a runtime operand does branch, so the check above is not
+    // passing because nothing ever emits a Cbr.
+    for src in [
+        "int g(void); int f(int x) { return x && g(); }",
+        "int g(void); int f(int x) { return x || g(); }",
+    ] {
+        assert_eq!(
+            count_cbr(src),
+            1,
+            "a runtime short-circuit operand branches exactly once: {src}"
+        );
+    }
+}
+
+/// Every lowering that builds a two-armed conditional keeps the CFG
+/// consistent, in all three places its blocks can be built: where control
+/// reaches them, where it cannot -- before a `switch`'s first `case`, and
+/// after a `goto` -- and where an arm jumps out from under it.
+///
+/// These are the shapes that went through `self.current_bb.unwrap()` and so
+/// crashed the compiler outright on the last two. They now share
+/// `emit_diamond`, or read the block back through
+/// `current_or_unreachable_bb`, which starts a block nothing branches to; the
+/// point of auditing the CFG rather than only that lowering finished is that
+/// such a block is *removed* again by `dce::remove_unreachable_blocks`, and a
+/// mislinked edge into or out of it would outlive it.
+#[test]
+fn conditional_lowerings_keep_the_cfg_consistent() {
+    let target = Target::host();
+
+    // (tag, declarations, statement). The statement is placed reachable, then
+    // before a `switch`'s first `case`, then after a `goto`.
+    let shapes = [
+        ("ternary", "int g(void);", "y = g() ? g() : g();"),
+        ("logical_and", "int g(void);", "y = g() && g();"),
+        ("logical_or", "int g(void);", "y = g() || g();"),
+        ("elvis", "int g(void);", "y = g() ?: g();"),
+        (
+            "nested_ternary",
+            "int g(void);",
+            "y = g() ? (g() ? g() : g()) : g();",
+        ),
+        (
+            "and_in_ternary",
+            "int g(void);",
+            "y = g() ? (g() && g()) : g();",
+        ),
+        (
+            "sqrt_errno",
+            "double sqrt(double); double d;",
+            "d = sqrt(d);",
+        ),
+        (
+            "complex_ternary",
+            "int g(void); _Complex double h(void);",
+            "(void)(g() ? h() : h());",
+        ),
+        (
+            "complex_elvis",
+            "_Complex double h(void);",
+            "(void)(h() ?: h());",
+        ),
+        (
+            "complex_int_div",
+            "_Complex int ci(void);",
+            "(void)(ci() / ci());",
+        ),
+        (
+            "atomic_nand",
+            "_Atomic int a;",
+            "y = __atomic_fetch_nand(&a, 1, 5);",
+        ),
+        // An arm that jumps away leaves *that arm* without a block, which is a
+        // different read from the condition's.
+        (
+            "goto_out_of_then_arm",
+            "int g(void);",
+            "y = x ? ({ goto L; g(); }) : g();",
+        ),
+        (
+            "goto_out_of_else_arm",
+            "int g(void);",
+            "y = x ? g() : ({ goto L; g(); });",
+        ),
+    ];
+
+    for (tag, decls, stmt) in shapes {
+        let bodies = [
+            ("reachable", stmt.to_string()),
+            (
+                "before_first_case",
+                format!("switch (x) {{ {stmt} case 1: y = 1; }}"),
+            ),
+            ("after_goto", format!("goto L; {stmt}")),
+        ];
+
+        for (where_, body) in bodies {
+            let src = format!("{decls}\nint f(int x) {{ int y = 0; {body} L: return y; }}\n");
+            let module = linearize_source(&src, &target);
+            let func = module
+                .functions
+                .iter()
+                .find(|f| f.name == "f")
+                .expect("function f");
+            assert!(
+                cfg_inconsistency(func).is_none(),
+                "{tag} / {where_}: {}\nsource: {src}",
+                cfg_inconsistency(func).unwrap()
+            );
+        }
+    }
+}

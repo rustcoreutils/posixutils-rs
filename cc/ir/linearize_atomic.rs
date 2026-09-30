@@ -298,7 +298,12 @@ impl Linearizer<'_> {
         let loop_bb = self.alloc_bb();
         let done_bb = self.alloc_bb();
 
-        let entry_bb = self.current_bb.expect("atomic RMW outside a block");
+        // Through the accessor rather than `expect`: `current_bb` is `None`
+        // wherever control cannot arrive -- a statement before a `switch`'s
+        // first `case`, or after a `goto` -- and this loop has to hang its
+        // blocks off something. `dce::remove_unreachable_blocks` takes the
+        // lot away again.
+        let entry_bb = self.current_or_unreachable_bb();
         self.emit(Instruction::br(loop_bb));
         self.link_bb(entry_bb, loop_bb);
         self.switch_bb(loop_bb);
@@ -341,7 +346,7 @@ impl Linearizer<'_> {
         cas.memory_order = ORDER;
         self.emit(cas);
 
-        let cas_bb = self.current_bb.expect("atomic CAS outside a block");
+        let cas_bb = self.current_or_unreachable_bb();
         self.emit(Instruction::cbr(ok, done_bb, loop_bb));
         self.link_bb(cas_bb, done_bb);
         self.link_bb(cas_bb, loop_bb);

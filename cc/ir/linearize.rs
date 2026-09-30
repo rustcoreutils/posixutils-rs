@@ -4871,47 +4871,16 @@ impl<'a> Linearizer<'a> {
         else_expr: &Expr,
         result_typ: TypeId,
     ) -> PseudoId {
-        let then_bb = self.alloc_bb();
-        let else_bb = self.alloc_bb();
-        let merge_bb = self.alloc_bb();
-
         let cond_bool = self.linearize_condition(cond);
-        let cond_end_bb = self.current_bb.unwrap();
-        self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
-        self.link_bb(cond_end_bb, then_bb);
-        self.link_bb(cond_end_bb, else_bb);
-
         let ptr_typ = self.types.pointer_to(result_typ);
         let ptr_bits = self.target.pointer_width;
-
-        self.switch_bb(then_bb);
-        let then_val = self.complex_arm_addr(then_expr, result_typ);
-        let then_end_bb = self.current_bb.unwrap();
-        self.emit(Instruction::br(merge_bb));
-        self.link_bb(then_end_bb, merge_bb);
-
-        self.switch_bb(else_bb);
-        let else_val = self.complex_arm_addr(else_expr, result_typ);
-        let else_end_bb = self.current_bb.unwrap();
-        self.emit(Instruction::br(merge_bb));
-        self.link_bb(else_end_bb, merge_bb);
-
-        self.switch_bb(merge_bb);
-        let result = self.alloc_pseudo();
-        let phi_pseudo = Pseudo::phi(result, result.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(phi_pseudo);
-        }
-        let mut phi_insn = Instruction::phi(result, ptr_typ, ptr_bits);
-        let phisrc1 =
-            self.emit_phi_source(then_end_bb, then_val, result, merge_bb, ptr_typ, ptr_bits);
-        phi_insn.phi_list.push((then_end_bb, phisrc1));
-        let phisrc2 =
-            self.emit_phi_source(else_end_bb, else_val, result, merge_bb, ptr_typ, ptr_bits);
-        phi_insn.phi_list.push((else_end_bb, phisrc2));
-        self.emit(phi_insn);
-
-        result
+        self.emit_diamond(
+            cond_bool,
+            ptr_typ,
+            ptr_bits,
+            |lin| lin.complex_arm_addr(then_expr, result_typ),
+            |lin| lin.complex_arm_addr(else_expr, result_typ),
+        )
     }
 
     pub(crate) fn linearize_ternary(
@@ -4984,48 +4953,23 @@ impl<'a> Linearizer<'a> {
             ));
             result
         } else {
-            // Impure: use control flow + phi for proper short-circuit evaluation
-            let then_bb = self.alloc_bb();
-            let else_bb = self.alloc_bb();
-            let merge_bb = self.alloc_bb();
-
+            // Impure: use control flow + phi for proper short-circuit evaluation.
+            // Each arm is converted inside its own block, where it is the only
+            // thing evaluated.
             let cond_bool = self.linearize_condition(cond);
-            let cond_end_bb = self.current_bb.unwrap();
-
-            self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
-            self.link_bb(cond_end_bb, then_bb);
-            self.link_bb(cond_end_bb, else_bb);
-
-            self.switch_bb(then_bb);
-            let then_val = self.linearize_expr(then_expr);
-            let then_val = self.conditional_arm(then_val, then_expr, result_typ, aggregate);
-            let then_end_bb = self.current_bb.unwrap();
-            self.emit(Instruction::br(merge_bb));
-            self.link_bb(then_end_bb, merge_bb);
-
-            self.switch_bb(else_bb);
-            let else_val = self.linearize_expr(else_expr);
-            let else_val = self.conditional_arm(else_val, else_expr, result_typ, aggregate);
-            let else_end_bb = self.current_bb.unwrap();
-            self.emit(Instruction::br(merge_bb));
-            self.link_bb(else_end_bb, merge_bb);
-
-            self.switch_bb(merge_bb);
-            let result = self.alloc_pseudo();
-            let phi_pseudo = Pseudo::phi(result, result.0);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(phi_pseudo);
-            }
-            let mut phi_insn = Instruction::phi(result, merge_typ, size);
-            let phisrc1 =
-                self.emit_phi_source(then_end_bb, then_val, result, merge_bb, merge_typ, size);
-            phi_insn.phi_list.push((then_end_bb, phisrc1));
-            let phisrc2 =
-                self.emit_phi_source(else_end_bb, else_val, result, merge_bb, merge_typ, size);
-            phi_insn.phi_list.push((else_end_bb, phisrc2));
-            self.emit(phi_insn);
-
-            result
+            self.emit_diamond(
+                cond_bool,
+                merge_typ,
+                size,
+                |lin| {
+                    let val = lin.linearize_expr(then_expr);
+                    lin.conditional_arm(val, then_expr, result_typ, aggregate)
+                },
+                |lin| {
+                    let val = lin.linearize_expr(else_expr);
+                    lin.conditional_arm(val, else_expr, result_typ, aggregate)
+                },
+            )
         }
     }
 
@@ -5073,50 +5017,21 @@ impl<'a> Linearizer<'a> {
             self.emit_compare_zero(evaluated, cond_typ)
         };
 
-        let then_bb = self.alloc_bb();
-        let else_bb = self.alloc_bb();
-        let merge_bb = self.alloc_bb();
-        let cond_end_bb = self.current_bb.unwrap();
-
-        self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
-        self.link_bb(cond_end_bb, then_bb);
-        self.link_bb(cond_end_bb, else_bb);
-
         let ptr_typ = self.types.pointer_to(result_typ);
         let ptr_bits = self.target.pointer_width;
-
-        self.switch_bb(then_bb);
-        let then_val = if cond_complex {
-            self.complex_addr_at_precision(evaluated, cond_typ, result_typ)
-        } else {
-            self.promote_real_value_to_complex(evaluated, cond_typ, result_typ)
-        };
-        let then_end_bb = self.current_bb.unwrap();
-        self.emit(Instruction::br(merge_bb));
-        self.link_bb(then_end_bb, merge_bb);
-
-        self.switch_bb(else_bb);
-        let else_val = self.complex_arm_addr(else_expr, result_typ);
-        let else_end_bb = self.current_bb.unwrap();
-        self.emit(Instruction::br(merge_bb));
-        self.link_bb(else_end_bb, merge_bb);
-
-        self.switch_bb(merge_bb);
-        let result = self.alloc_pseudo();
-        let phi_pseudo = Pseudo::phi(result, result.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(phi_pseudo);
-        }
-        let mut phi_insn = Instruction::phi(result, ptr_typ, ptr_bits);
-        let phisrc1 =
-            self.emit_phi_source(then_end_bb, then_val, result, merge_bb, ptr_typ, ptr_bits);
-        phi_insn.phi_list.push((then_end_bb, phisrc1));
-        let phisrc2 =
-            self.emit_phi_source(else_end_bb, else_val, result, merge_bb, ptr_typ, ptr_bits);
-        phi_insn.phi_list.push((else_end_bb, phisrc2));
-        self.emit(phi_insn);
-
-        result
+        self.emit_diamond(
+            cond_bool,
+            ptr_typ,
+            ptr_bits,
+            |lin| {
+                if cond_complex {
+                    lin.complex_addr_at_precision(evaluated, cond_typ, result_typ)
+                } else {
+                    lin.promote_real_value_to_complex(evaluated, cond_typ, result_typ)
+                }
+            },
+            |lin| lin.complex_arm_addr(else_expr, result_typ),
+        )
     }
 
     /// The value of a conditional expression whose constant condition
@@ -5185,15 +5100,7 @@ impl<'a> Linearizer<'a> {
 
         // Impure right-hand side: it must not be evaluated when the condition
         // is true, so it needs its own block.
-        let then_bb = self.alloc_bb();
-        let else_bb = self.alloc_bb();
-        let merge_bb = self.alloc_bb();
-        let cond_end_bb = self.current_bb.unwrap();
-
-        self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
-        self.link_bb(cond_end_bb, then_bb);
-        self.link_bb(cond_end_bb, else_bb);
-
+        //
         // The true value is the condition, converted to the result type -- done
         // *inside* the true block, where the ternary also converts its arms.
         // Converting before the `cbr` is equally correct as IR, and reads more
@@ -5202,36 +5109,17 @@ impl<'a> Linearizer<'a> {
         // and the aarch64 backend then emits a branch on the wrong register.
         // That is a backend defect and is reported as one; this is not the
         // place to depend on it.
-        self.switch_bb(then_bb);
-        let then_val = self.convert_conditional_arm(cond_val, cond_typ, result_typ);
-        let then_end_bb = self.current_bb.unwrap();
-        self.emit(Instruction::br(merge_bb));
-        self.link_bb(then_end_bb, merge_bb);
-
-        self.switch_bb(else_bb);
-        let mut else_val = self.linearize_expr(else_expr);
-        let else_typ = self.expr_type(else_expr);
-        else_val = self.convert_conditional_arm(else_val, else_typ, result_typ);
-        let else_end_bb = self.current_bb.unwrap();
-        self.emit(Instruction::br(merge_bb));
-        self.link_bb(else_end_bb, merge_bb);
-
-        self.switch_bb(merge_bb);
-        let result = self.alloc_pseudo();
-        let phi_pseudo = Pseudo::phi(result, result.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(phi_pseudo);
-        }
-        let mut phi_insn = Instruction::phi(result, result_typ, size);
-        let phisrc1 =
-            self.emit_phi_source(then_end_bb, then_val, result, merge_bb, result_typ, size);
-        phi_insn.phi_list.push((then_end_bb, phisrc1));
-        let phisrc2 =
-            self.emit_phi_source(else_end_bb, else_val, result, merge_bb, result_typ, size);
-        phi_insn.phi_list.push((else_end_bb, phisrc2));
-        self.emit(phi_insn);
-
-        result
+        self.emit_diamond(
+            cond_bool,
+            result_typ,
+            size,
+            |lin| lin.convert_conditional_arm(cond_val, cond_typ, result_typ),
+            |lin| {
+                let val = lin.linearize_expr(else_expr);
+                let else_typ = lin.expr_type(else_expr);
+                lin.convert_conditional_arm(val, else_typ, result_typ)
+            },
+        )
     }
 
     /// Lower `__builtin_clrsb` and its wider siblings.

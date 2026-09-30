@@ -1611,61 +1611,53 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
         let cond = self.emit_int_binop(cmp, abs_c, abs_d, base_typ, base_size);
 
-        let small_bb = self.alloc_bb();
-        let big_bb = self.alloc_bb();
-        let done_bb = self.alloc_bb();
-        let entry_bb = self.current_bb.expect("complex divide outside a block");
-        self.emit(Instruction::cbr(cond, small_bb, big_bb));
-        self.link_bb(entry_bb, small_bb);
-        self.link_bb(entry_bb, big_bb);
-
-        // `|c| >= |d|`: r = d/c, denom = c + d*r,
-        //               re = (a + b*r)/denom, im = (b - a*r)/denom.
-        self.switch_bb(big_bb);
-        let r = self.emit_int_binop(div, d, c, base_typ, base_size);
-        let dr = self.emit_int_binop(Opcode::Mul, d, r, base_typ, base_size);
-        let denom = self.emit_int_binop(Opcode::Add, c, dr, base_typ, base_size);
-        let br = self.emit_int_binop(Opcode::Mul, b, r, base_typ, base_size);
-        let num_re = self.emit_int_binop(Opcode::Add, a, br, base_typ, base_size);
-        let ar = self.emit_int_binop(Opcode::Mul, a, r, base_typ, base_size);
-        let num_im = self.emit_int_binop(Opcode::Sub, b, ar, base_typ, base_size);
-        self.store_complex_quotient(
-            result_addr,
-            (num_re, num_im),
-            denom,
-            div,
-            base_typ,
-            base_size,
-            base_bytes,
+        // Both arms write their halves to `result_addr`, so there is no value
+        // to merge and the void diamond serves: it builds the same blocks and
+        // edges, and reads `current_bb` back through the accessor that copes
+        // with a `goto` out of an arm.
+        self.emit_diamond_void(
+            cond,
+            // `|c| < |d|`: r = c/d, denom = d + c*r,
+            //              re = (a*r + b)/denom, im = (b*r - a)/denom.
+            |lin| {
+                let r = lin.emit_int_binop(div, c, d, base_typ, base_size);
+                let cr = lin.emit_int_binop(Opcode::Mul, c, r, base_typ, base_size);
+                let denom = lin.emit_int_binop(Opcode::Add, d, cr, base_typ, base_size);
+                let ar = lin.emit_int_binop(Opcode::Mul, a, r, base_typ, base_size);
+                let num_re = lin.emit_int_binop(Opcode::Add, ar, b, base_typ, base_size);
+                let br = lin.emit_int_binop(Opcode::Mul, b, r, base_typ, base_size);
+                let num_im = lin.emit_int_binop(Opcode::Sub, br, a, base_typ, base_size);
+                lin.store_complex_quotient(
+                    result_addr,
+                    (num_re, num_im),
+                    denom,
+                    div,
+                    base_typ,
+                    base_size,
+                    base_bytes,
+                );
+            },
+            // `|c| >= |d|`: r = d/c, denom = c + d*r,
+            //               re = (a + b*r)/denom, im = (b - a*r)/denom.
+            |lin| {
+                let r = lin.emit_int_binop(div, d, c, base_typ, base_size);
+                let dr = lin.emit_int_binop(Opcode::Mul, d, r, base_typ, base_size);
+                let denom = lin.emit_int_binop(Opcode::Add, c, dr, base_typ, base_size);
+                let br = lin.emit_int_binop(Opcode::Mul, b, r, base_typ, base_size);
+                let num_re = lin.emit_int_binop(Opcode::Add, a, br, base_typ, base_size);
+                let ar = lin.emit_int_binop(Opcode::Mul, a, r, base_typ, base_size);
+                let num_im = lin.emit_int_binop(Opcode::Sub, b, ar, base_typ, base_size);
+                lin.store_complex_quotient(
+                    result_addr,
+                    (num_re, num_im),
+                    denom,
+                    div,
+                    base_typ,
+                    base_size,
+                    base_bytes,
+                );
+            },
         );
-        let big_end = self.current_bb.expect("complex divide lost its block");
-        self.emit(Instruction::br(done_bb));
-        self.link_bb(big_end, done_bb);
-
-        // `|c| < |d|`: r = c/d, denom = d + c*r,
-        //              re = (a*r + b)/denom, im = (b*r - a)/denom.
-        self.switch_bb(small_bb);
-        let r = self.emit_int_binop(div, c, d, base_typ, base_size);
-        let cr = self.emit_int_binop(Opcode::Mul, c, r, base_typ, base_size);
-        let denom = self.emit_int_binop(Opcode::Add, d, cr, base_typ, base_size);
-        let ar = self.emit_int_binop(Opcode::Mul, a, r, base_typ, base_size);
-        let num_re = self.emit_int_binop(Opcode::Add, ar, b, base_typ, base_size);
-        let br = self.emit_int_binop(Opcode::Mul, b, r, base_typ, base_size);
-        let num_im = self.emit_int_binop(Opcode::Sub, br, a, base_typ, base_size);
-        self.store_complex_quotient(
-            result_addr,
-            (num_re, num_im),
-            denom,
-            div,
-            base_typ,
-            base_size,
-            base_bytes,
-        );
-        let small_end = self.current_bb.expect("complex divide lost its block");
-        self.emit(Instruction::br(done_bb));
-        self.link_bb(small_end, done_bb);
-
-        self.switch_bb(done_bb);
     }
 
     /// Divide both numerators by the shared denominator and store the halves.
@@ -1847,6 +1839,10 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// `cond ? taken() : fallthrough()`, each arm in a block of its own and
     /// merged by a phi of type `typ`: for arms that may not both be
     /// evaluated.
+    ///
+    /// The phi is as wide as `typ` is. A construct whose merge width is not
+    /// its type's -- a pointer-merged complex arm, a function designator,
+    /// whose `size_bits` is zero -- calls [`Self::emit_diamond`] and states it.
     fn emit_two_way(
         &mut self,
         cond: PseudoId,
@@ -1855,16 +1851,33 @@ impl<'a> super::linearize::Linearizer<'a> {
         fallthrough: impl FnOnce(&mut Self) -> PseudoId,
     ) -> PseudoId {
         let size = self.types.size_bits(typ);
-        let (taken_bb, fall_bb, merge_bb) = (self.alloc_bb(), self.alloc_bb(), self.alloc_bb());
-        let from = self.current_or_unreachable_bb();
-        self.emit(Instruction::cbr(cond, taken_bb, fall_bb));
-        self.link_bb(from, taken_bb);
-        self.link_bb(from, fall_bb);
+        self.emit_diamond(cond, typ, size, taken, fallthrough)
+    }
 
-        let arms = [
-            self.emit_arm(taken_bb, merge_bb, taken),
-            self.emit_arm(fall_bb, merge_bb, fallthrough),
-        ];
+    /// `cond ? then_arm() : else_arm()`, merged by a `size`-bit phi of type
+    /// `typ`.
+    ///
+    /// The one place a two-armed conditional's blocks and edges are built, so
+    /// the one place that has to know `current_bb` is `None` wherever control
+    /// cannot arrive -- see [`Linearizer::current_or_unreachable_bb`]. Both
+    /// the block the branch leaves and the block each arm *ends* in are read
+    /// back through that accessor: an arm is arbitrary code and may itself
+    /// `goto` away, so `x ? ({ goto L; g(); }) : g()` has no block at the end
+    /// of its true arm.
+    ///
+    /// `size` is passed rather than taken from `typ` because the two are not
+    /// always the same: a complex conditional merges *addresses*, so its phi
+    /// is pointer-wide over a pointer type, and a function designator's
+    /// `size_bits` is 0 where the merge wants a pointer's 64.
+    pub(crate) fn emit_diamond(
+        &mut self,
+        cond: PseudoId,
+        typ: TypeId,
+        size: u32,
+        then_arm: impl FnOnce(&mut Self) -> PseudoId,
+        else_arm: impl FnOnce(&mut Self) -> PseudoId,
+    ) -> PseudoId {
+        let (merge_bb, arms) = self.emit_fork(cond, then_arm, else_arm);
 
         self.switch_bb(merge_bb);
         let result = self.alloc_pseudo();
@@ -1880,14 +1893,52 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
-    /// One arm of [`Self::emit_two_way`]: `arm` evaluated in `bb`, which then
+    /// [`Self::emit_diamond`] for arms that produce no value: they write
+    /// their results where the caller can find them, so there is nothing to
+    /// merge and no phi. Leaves the cursor on the merge block.
+    pub(crate) fn emit_diamond_void(
+        &mut self,
+        cond: PseudoId,
+        then_arm: impl FnOnce(&mut Self),
+        else_arm: impl FnOnce(&mut Self),
+    ) {
+        let (merge_bb, _) = self.emit_fork(cond, then_arm, else_arm);
+        self.switch_bb(merge_bb);
+    }
+
+    /// The block plumbing both diamonds share: branch on `cond` into a block
+    /// per arm, run each arm, and join them.
+    ///
+    /// Returns the merge block -- which the caller has *not* switched to yet,
+    /// so a phi can be placed at its head -- and, per arm, the block it ended
+    /// in and whatever it produced.
+    fn emit_fork<T>(
+        &mut self,
+        cond: PseudoId,
+        then_arm: impl FnOnce(&mut Self) -> T,
+        else_arm: impl FnOnce(&mut Self) -> T,
+    ) -> (BasicBlockId, [(BasicBlockId, T); 2]) {
+        let (then_bb, else_bb, merge_bb) = (self.alloc_bb(), self.alloc_bb(), self.alloc_bb());
+        let from = self.current_or_unreachable_bb();
+        self.emit(Instruction::cbr(cond, then_bb, else_bb));
+        self.link_bb(from, then_bb);
+        self.link_bb(from, else_bb);
+
+        let arms = [
+            self.emit_arm(then_bb, merge_bb, then_arm),
+            self.emit_arm(else_bb, merge_bb, else_arm),
+        ];
+        (merge_bb, arms)
+    }
+
+    /// One arm of [`Self::emit_fork`]: `arm` evaluated in `bb`, which then
     /// branches to `merge`. Returns the block the arm ended in, and its value.
-    fn emit_arm(
+    fn emit_arm<T>(
         &mut self,
         bb: BasicBlockId,
         merge: BasicBlockId,
-        arm: impl FnOnce(&mut Self) -> PseudoId,
-    ) -> (BasicBlockId, PseudoId) {
+        arm: impl FnOnce(&mut Self) -> T,
+    ) -> (BasicBlockId, T) {
         self.switch_bb(bb);
         let value = arm(self);
         let end = self.current_or_unreachable_bb();
@@ -2364,7 +2415,13 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Get the block where LHS evaluation ended (may differ from initial block
         // if LHS contains nested control flow)
-        let lhs_end_bb = self.current_bb.unwrap();
+        //
+        // Read through the accessor, not `unwrap`: control cannot arrive at a
+        // statement before a `switch`'s first `case` or after a `goto`, and the
+        // phi below needs a real predecessor block to hold its source. See
+        // `current_or_unreachable_bb`. `branch_on` re-reads `current_bb`
+        // itself, so it sees the same block.
+        let lhs_end_bb = self.current_or_unreachable_bb();
 
         // Branch: if LHS is false, go to merge (result = 0); else evaluate RHS
         self.branch_on(left_cond, eval_b_bb, merge_bb);
@@ -2374,8 +2431,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         let right_bool = self.linearize_condition(right);
 
         // Get the actual block where RHS evaluation ended (may differ from eval_b_bb
-        // if RHS contains nested control flow like another &&/||)
-        let rhs_end_bb = self.current_bb.unwrap();
+        // if RHS contains nested control flow like another &&/||), and may be
+        // gone entirely where the RHS jumped away: `x && ({ goto L; g(); })`.
+        let rhs_end_bb = self.current_or_unreachable_bb();
 
         // Branch to merge
         self.emit(Instruction::br(merge_bb));
@@ -2427,7 +2485,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Get the block where LHS evaluation ended (may differ from initial block
         // if LHS contains nested control flow)
-        let lhs_end_bb = self.current_bb.unwrap();
+        //
+        // Through the accessor for the reason `emit_logical_and` records.
+        let lhs_end_bb = self.current_or_unreachable_bb();
 
         // Branch: if LHS is true, go to merge (result = 1); else evaluate RHS
         self.branch_on(left_cond, merge_bb, eval_b_bb);
@@ -2437,8 +2497,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         let right_bool = self.linearize_condition(right);
 
         // Get the actual block where RHS evaluation ended (may differ from eval_b_bb
-        // if RHS contains nested control flow like another &&/||)
-        let rhs_end_bb = self.current_bb.unwrap();
+        // if RHS contains nested control flow like another &&/||), and may be
+        // gone entirely where the RHS jumped away: `x || ({ goto L; g(); })`.
+        let rhs_end_bb = self.current_or_unreachable_bb();
 
         // Branch to merge
         self.emit(Instruction::br(merge_bb));

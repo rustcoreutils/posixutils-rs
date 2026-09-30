@@ -8812,3 +8812,221 @@ fn test_void_cast_of_a_complex_converts_nothing() {
 fn x86_64_linux() -> Target {
     Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux)
 }
+
+// CFG consistency
+
+/// Every block's recorded successors are exactly the blocks its terminator
+/// names, and `parents` is the inverse of `children`.
+///
+/// Returns a description of the first inconsistency, or `None`.
+fn cfg_inconsistency(func: &Function) -> Option<String> {
+    use std::collections::HashSet;
+
+    for bb in &func.blocks {
+        let children: HashSet<BasicBlockId> = bb.children.iter().copied().collect();
+        if children.len() != bb.children.len() {
+            return Some(format!("{}: duplicate edge in children", bb.id));
+        }
+
+        let named = match bb.insns.last() {
+            Some(last) if last.op.is_terminator() => crate::ir::propagate::terminator_targets(last),
+            // A block with no terminator falls through to nothing the CFG can
+            // name; `children` must then be empty too.
+            _ => HashSet::new(),
+        };
+
+        if named != children {
+            return Some(format!(
+                "{}: terminator names {:?} but children are {:?}",
+                bb.id,
+                sorted_ids(&named),
+                sorted_ids(&children),
+            ));
+        }
+    }
+
+    // `parents` is the inverse of `children`.
+    let mut expected: std::collections::HashMap<BasicBlockId, HashSet<BasicBlockId>> =
+        std::collections::HashMap::new();
+    for bb in &func.blocks {
+        for child in &bb.children {
+            expected.entry(*child).or_default().insert(bb.id);
+        }
+    }
+    for bb in &func.blocks {
+        let have: HashSet<BasicBlockId> = bb.parents.iter().copied().collect();
+        let want = expected.remove(&bb.id).unwrap_or_default();
+        if have != want {
+            return Some(format!(
+                "{}: parents are {:?} but {:?} name it as a successor",
+                bb.id,
+                sorted_ids(&have),
+                sorted_ids(&want),
+            ));
+        }
+    }
+
+    None
+}
+
+fn sorted_ids(s: &std::collections::HashSet<BasicBlockId>) -> Vec<u32> {
+    let mut v: Vec<u32> = s.iter().map(|b| b.0).collect();
+    v.sort_unstable();
+    v
+}
+
+/// A `for` post-expression that splits the block still links the back edge from
+/// the block the branch was emitted into.
+///
+/// `&&`, `||` and `?:` leave `current_bb` on their merge block, so
+/// `link_bb(post_bb, cond_bb)` recorded an edge out of a block that no longer
+/// holds the terminator -- the loop's back edge went missing from the CFG while
+/// a merge block gained an unrecorded one. Both `for` arms had it: the one in
+/// `linearize_for` and its copy in the switch-body walker.
+///
+/// Stated on the CFG rather than on the program's answer because the defect
+/// makes the compiled loop non-terminating, which a runtime test cannot
+/// observe without hanging.
+#[test]
+fn for_post_expression_splitting_the_block_keeps_the_back_edge() {
+    let target = Target::host();
+    let cases = [
+        ("and", "for (int i = 0; i < n; (void)(n && 1), i++) s += i;"),
+        ("or", "for (int i = 0; i < n; (void)(n || 0), i++) s += i;"),
+        (
+            "ternary",
+            "for (int i = 0; i < n; (void)(n ? 1 : 2), i++) s += i;",
+        ),
+        (
+            "and_in_cond_and_post",
+            "for (int i = 0; i < n && n; (void)(n && 1), i++) s += i;",
+        ),
+        (
+            "nested_and",
+            "for (int i = 0; i < n; (void)(n && (i || 1)), i++) s += i;",
+        ),
+    ];
+
+    for (tag, loop_src) in cases {
+        // Plain, and again inside a switch body -- a separate copy of the
+        // lowering that carried the same defect.
+        let plain = format!("int f(int n) {{ int s = 0; {loop_src} return s; }}");
+        let in_switch = format!(
+            "int f(int n) {{ switch (n) {{ case 5: {{ int s = 0; {loop_src} return s; }} \
+             default: return 0; }} }}"
+        );
+
+        for (where_, src) in [("plain", &plain), ("in_switch", &in_switch)] {
+            let module = linearize_source(src, &target);
+            let func = module
+                .functions
+                .iter()
+                .find(|f| f.name == "f")
+                .expect("function f");
+            assert!(
+                cfg_inconsistency(func).is_none(),
+                "{tag} / {where_}: {}\nsource: {src}",
+                cfg_inconsistency(func).unwrap()
+            );
+        }
+    }
+}
+
+/// The check above is only as good as its ability to see a broken edge, so
+/// assert it rejects one.
+#[test]
+fn cfg_inconsistency_sees_a_misrecorded_edge() {
+    let target = Target::host();
+    let module = linearize_source(
+        "int f(int n) { int s = 0; for (int i = 0; i < n; i++) s += i; return s; }",
+        &target,
+    );
+    let mut func = module
+        .functions
+        .iter()
+        .find(|f| f.name == "f")
+        .expect("function f")
+        .clone();
+    assert!(cfg_inconsistency(&func).is_none(), "baseline is consistent");
+
+    // Record a successor the terminator does not name -- exactly the shape the
+    // `for` defect produced.
+    let victim = func.blocks.len() - 1;
+    let bogus = func.blocks[0].id;
+    func.blocks[victim].children.push(bogus);
+    assert!(
+        cfg_inconsistency(&func).is_some(),
+        "an unnamed successor must be reported"
+    );
+}
+
+/// The same audit over every other lowering that can end a block with a
+/// terminator after evaluating an expression: `while`, `do`/`while`, `switch`,
+/// `if`, `?:`, `goto`, `break`/`continue` and the loop lowerings' copies in the
+/// switch-body walker.
+///
+/// Each source puts a short-circuit operator or a `?:` -- the things that split
+/// the block and move `current_bb` to a merge block -- where the construct
+/// evaluates an expression, so an edge linked from the block the construct
+/// started in rather than the one it ended in shows up as an inconsistency.
+#[test]
+fn short_circuit_operands_keep_every_lowering_cfg_consistent() {
+    let target = Target::host();
+    let cases = [
+        ("while_cond", "while (n && s < 3) s++;"),
+        ("do_while_cond", "do { s++; } while (n && s < 3);"),
+        ("if_cond", "if (n && s) s = 1; else s = 2;"),
+        ("ternary", "s = n && 1 ? (n || 2) : (n ? 3 : 4);"),
+        ("for_cond", "for (int i = 0; i < n && n; i++) s += i;"),
+        ("for_init", "for (int i = (n && 1); i < n; i++) s += i;"),
+        (
+            "switch_selector",
+            "switch (n && 1) { case 1: s = 1; break; }",
+        ),
+        (
+            "switch_in_loop",
+            "while (s < 3) { switch (n && 1) { case 1: s++; break; default: s += 2; } }",
+        ),
+        ("break_after_split", "while (1) { if (n && 1) break; s++; }"),
+        (
+            "continue_after_split",
+            "for (int i = 0; i < n; i++) { if (n || 0) continue; s++; }",
+        ),
+        (
+            "goto_after_split",
+            "if (n && 1) goto done; s = 7; done: s++;",
+        ),
+        (
+            "while_in_switch",
+            "switch (n) { case 5: while (n && s < 3) s++; break; default: s = 1; }",
+        ),
+        (
+            "do_while_in_switch",
+            "switch (n) { case 5: do { s++; } while (n && s < 3); break; default: s = 1; }",
+        ),
+        (
+            "nested_for_in_switch",
+            "switch (n) { case 5: for (int i = 0; i < n; (void)(n && 1), i++) \
+             for (int j = 0; j < n; (void)(n || 0), j++) s++; break; default: s = 1; }",
+        ),
+        (
+            "duffs_device",
+            "switch (n % 2) { case 0: do { s++; case 1: s += 2; } while (n && --n > 0); }",
+        ),
+    ];
+
+    for (tag, body) in cases {
+        let src = format!("int f(int n) {{ int s = 0; {body} return s; }}");
+        let module = linearize_source(&src, &target);
+        let func = module
+            .functions
+            .iter()
+            .find(|f| f.name == "f")
+            .expect("function f");
+        assert!(
+            cfg_inconsistency(func).is_none(),
+            "{tag}: {}\nsource: {src}",
+            cfg_inconsistency(func).unwrap()
+        );
+    }
+}

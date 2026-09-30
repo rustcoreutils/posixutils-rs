@@ -1465,8 +1465,15 @@ impl<'a> super::linearize::Linearizer<'a> {
         if let Some(post_expr) = post {
             self.linearize_expr(post_expr);
         }
-        self.emit(Instruction::br(cond_bb));
-        self.link_bb(post_bb, cond_bb);
+        // From the block the post-expression ended in, which `&&`, `||` and
+        // `?:` can make a different one from post_bb. Linking the back edge
+        // from post_bb itself recorded an edge out of a block that no longer
+        // holds the branch, and left the merge block that does hold it with an
+        // unrecorded successor -- the loop then never terminated.
+        if let Some(current) = self.current_bb {
+            self.emit(Instruction::br(cond_bb));
+            self.link_bb(current, cond_bb);
+        }
 
         // Exit block
         self.switch_bb(exit_bb);
@@ -2661,8 +2668,15 @@ impl<'a> super::linearize::Linearizer<'a> {
                 if let Some(post_expr) = post {
                     self.linearize_expr(post_expr);
                 }
-                self.emit(Instruction::br(cond_bb));
-                self.link_bb(post_bb, cond_bb);
+                // From the block the post-expression ended in, which `&&`, `||` and
+                // `?:` can make a different one from post_bb. Linking the back edge
+                // from post_bb itself recorded an edge out of a block that no longer
+                // holds the branch, and left the merge block that does hold it with an
+                // unrecorded successor -- the loop then never terminated.
+                if let Some(current) = self.current_bb {
+                    self.emit(Instruction::br(cond_bb));
+                    self.link_bb(current, cond_bb);
+                }
 
                 self.switch_bb(exit_bb);
                 self.pop_scope();

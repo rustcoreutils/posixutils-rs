@@ -985,3 +985,78 @@ int main(void)
     assert_eq!(compile_and_run("label_addr_no_goto", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("label_addr_no_goto_opt", code), 0);
 }
+
+/// A `for` post-expression that splits the block keeps the loop's back edge.
+///
+/// `&&`, `||` and `?:` leave the current block on their merge, not on the block
+/// the post-expression started in, so the branch back to the condition landed
+/// in one block while the CFG edge was recorded from another. Every other loop
+/// lowering reads `self.current_bb` back before linking; the two `for` arms did
+/// not.
+///
+/// The exhaustive statement of this is the CFG-consistency check in
+/// `ir::test_linearize`; asserting it there rather than here is deliberate,
+/// because with the defect present the compiled program does not merely return
+/// the wrong answer, it never terminates -- a runtime test would hang the suite
+/// instead of failing it. What is left here is the end-to-end answer, which is
+/// safe to run only once the shape is known to be acyclic.
+#[test]
+fn c89_for_post_expression_that_splits_the_block_keeps_the_back_edge() {
+    let code = r#"
+int and_in_post(int n)
+{
+    int s = 0;
+    for (int i = 0; i < n; (void)(n && 1), i++)
+        s += i;
+    return s;
+}
+
+int or_in_post(int n)
+{
+    int s = 0;
+    for (int i = 0; i < n; (void)(n || 0), i++)
+        s += i;
+    return s;
+}
+
+int ternary_in_post(int n)
+{
+    int s = 0;
+    for (int i = 0; i < n; (void)(n ? 1 : 2), i++)
+        s += i;
+    return s;
+}
+
+/* The same shape inside a switch body, which is a second copy of the
+   lowering and carried the same defect. */
+int and_in_post_in_switch(int n)
+{
+    switch (n) {
+    case 5: {
+        int s = 0;
+        for (int i = 0; i < n; (void)(n && 1), i++)
+            s += i;
+        return s;
+    }
+    default:
+        return -2;
+    }
+}
+
+int main(void)
+{
+    if (and_in_post(5) != 10) return 1;
+    if (or_in_post(5) != 10) return 2;
+    if (ternary_in_post(5) != 10) return 3;
+    if (and_in_post_in_switch(5) != 10) return 4;
+    /* A zero-trip loop still has to reach the exit. */
+    if (and_in_post(0) != 0) return 5;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("for_post_splits_block", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("for_post_splits_block_opt", code),
+        0
+    );
+}

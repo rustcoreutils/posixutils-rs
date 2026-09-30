@@ -54,52 +54,118 @@ pub(super) struct CallArgInfo {
     pub ignored_arg_indices: Vec<usize>,
 }
 
-/// The largest stacked aggregate argument copied with unrolled moves; past
-/// it, `rep movsq`. The IR stops unrolling a block copy at 128 bytes
-/// (`memexpand::INLINE_LIMIT_BYTES`) for the same reason: one load/store pair per
-/// eightbyte made a 600 MB argument 75 million instructions and tens of
-/// gigabytes of compiler memory.
-const STACK_ARG_UNROLL_QWORDS: usize = 16;
+/// The largest block this back end copies with unrolled moves; past it,
+/// `rep movsq`. It is the bound the IR puts on an expanded `memcpy`, for the
+/// same reason: one load/store pair per eightbyte made a 600 MB argument 75
+/// million instructions and tens of gigabytes of compiler memory.
+pub(super) const UNROLL_LIMIT_BYTES: i64 = crate::ir::memexpand::INLINE_LIMIT_BYTES;
+
+/// Where [`X86_64CodeGen::emit_rep_movsq`] writes.
+///
+/// The helper pushes three registers, which moves `%rsp`, so a destination in
+/// the outgoing argument area has to be named rather than handed over as an
+/// address the caller already computed.
+pub(super) enum BlockDst {
+    /// A byte offset in the outgoing argument area, addressed through `%rsp`;
+    /// the helper adds what its own pushes moved `%rsp` by.
+    OutgoingArg(i32),
+    /// Any address `%rsp` moving does not disturb -- a frame slot, or a
+    /// register holding a pointer. It must not be built on `%rsp`, `%rdi`,
+    /// `%rsi` or `%rcx`.
+    At(MemAddr),
+}
 
 impl X86_64CodeGen {
-    /// Copy `qwords` eightbytes from `[src]` to the outgoing argument area at
-    /// `dst_off(%rsp)`, with `rep movsq`.
+    /// Copy `qwords` eightbytes from `src` to `dst`, with `rep movsq`.
     ///
-    /// The register arguments are set up *after* the stacked ones, so RDI,
-    /// RSI and RCX -- which `rep movsq` needs -- may still hold values that
-    /// are about to become arguments. They are saved around the copy with
-    /// `push`/`pop`, which touch no flags; the destination is addressed past
-    /// the three pushes. `src` is read into RSI before RDI or RCX is written,
-    /// so it may be any of the three.
-    fn emit_stack_arg_block_copy(&mut self, src: Reg, dst_off: i32, qwords: usize) {
+    /// This is the back end's bulk block move: it cannot synthesize a call to
+    /// `memcpy`, and one load/store pair per eightbyte is linear in the object,
+    /// which is what made a 600 MB argument 75 million instructions.
+    ///
+    /// RDI, RSI and RCX -- which `rep movsq` needs -- may hold live values:
+    /// the register arguments of a call are set up *after* its stacked ones,
+    /// and a `va_arg` sits in the middle of a function. They are saved around
+    /// the copy with `push`/`pop`, which touch no flags. `src` is read into RSI
+    /// before RDI or RCX is written, so it may be addressed through any of the
+    /// three; the destination may not.
+    pub(super) fn emit_rep_movsq(&mut self, src: MemAddr, dst: BlockDst, qwords: i64) {
         let saved = [Reg::Rdi, Reg::Rsi, Reg::Rcx];
         for r in saved {
             self.push_lir(X86Inst::Push {
                 src: GpOperand::Reg(r),
             });
         }
-        if src != Reg::Rsi {
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Reg(src),
-                dst: GpOperand::Reg(Reg::Rsi),
-            });
-        }
         self.push_lir(X86Inst::Lea {
-            addr: MemAddr::BaseOffset {
+            addr: src,
+            dst: Reg::Rsi,
+        });
+        let dst_addr = match dst {
+            BlockDst::OutgoingArg(off) => MemAddr::BaseOffset {
                 base: Reg::Rsp,
-                offset: dst_off + 8 * saved.len() as i32,
+                offset: off + 8 * saved.len() as i32,
             },
+            BlockDst::At(addr) => addr,
+        };
+        self.push_lir(X86Inst::Lea {
+            addr: dst_addr,
             dst: Reg::Rdi,
         });
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
-            src: GpOperand::Imm(qwords as i64),
+            src: GpOperand::Imm(qwords),
             dst: GpOperand::Reg(Reg::Rcx),
         });
         self.push_lir(X86Inst::RepMovsq);
         for r in saved.into_iter().rev() {
             self.push_lir(X86Inst::Pop { dst: r });
+        }
+    }
+
+    /// Copy the `bytes` bytes of the object at `[src]` into the outgoing
+    /// argument area at `dst_off(%rsp)`.
+    ///
+    /// Both sides move `block_chunks`'s widths. The argument area really is
+    /// allocated in whole eightbytes, so an eight-byte *write* at every offset
+    /// the object covers would be within it -- but the source is the object,
+    /// and reading eight bytes of a twelve-byte struct at offset eight reads
+    /// four that belong to whatever follows it, which faults when the object
+    /// ends a page. It is the same hazard [`Self::load_object_bytes`] carries,
+    /// and the same answer; the bytes of the slot the object does not reach are
+    /// left alone, which the psABI allows because nothing in the callee reads
+    /// them.
+    ///
+    /// Past [`UNROLL_LIMIT_BYTES`] the whole eightbytes go through `rep movsq`
+    /// and only the ragged tail is unrolled.
+    fn emit_stack_arg_copy(&mut self, src: Reg, dst_off: i32, bytes: i64) {
+        let mut at = 0;
+        if bytes > UNROLL_LIMIT_BYTES {
+            let qwords = bytes / 8;
+            let from = MemAddr::BaseOffset {
+                base: src,
+                offset: 0,
+            };
+            self.emit_rep_movsq(from, BlockDst::OutgoingArg(dst_off), qwords);
+            at = qwords * 8;
+        }
+        for (off, chunk) in crate::ir::memexpand::block_chunks(bytes - at) {
+            let size = OperandSize::from_bits(chunk.bits());
+            let byte = (at + off) as i32;
+            self.push_lir(X86Inst::Mov {
+                size,
+                src: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: src,
+                    offset: byte,
+                }),
+                dst: GpOperand::Reg(Reg::Rax),
+            });
+            self.push_lir(X86Inst::Mov {
+                size,
+                src: GpOperand::Reg(Reg::Rax),
+                dst: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::Rsp,
+                    offset: dst_off + byte,
+                }),
+            });
         }
     }
 
@@ -339,30 +405,8 @@ impl X86_64CodeGen {
                         crate::abi::struct_param_classes(t, types).map(|_| types.size_bytes(t))
                     })
             }) {
-                let num_qwords = bytes.div_ceil(8);
                 let base = self.address_of_pseudo(arg);
-                if num_qwords > STACK_ARG_UNROLL_QWORDS {
-                    self.emit_stack_arg_block_copy(base, base_off, num_qwords);
-                    continue;
-                }
-                for q in 0..num_qwords {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base,
-                            offset: (q * 8) as i32,
-                        }),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(Reg::Rax),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rsp,
-                            offset: base_off + (q * 8) as i32,
-                        }),
-                    });
-                }
+                self.emit_stack_arg_copy(base, base_off, bytes as i64);
                 continue;
             }
 

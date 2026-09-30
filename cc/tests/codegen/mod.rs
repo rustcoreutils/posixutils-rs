@@ -16,6 +16,7 @@ mod aarch64_runtime;
 pub mod asm_probe;
 mod atomics_asm;
 mod binary128;
+mod block_moves;
 mod complex_fold;
 mod constant_branch;
 mod cross_abi;

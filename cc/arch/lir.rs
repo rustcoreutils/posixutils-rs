@@ -70,6 +70,22 @@ impl fmt::Display for OperandSize {
     }
 }
 
+/// How many of a composite's `total` bytes the eightbyte starting at `at`
+/// carries.
+///
+/// An eightbyte of a composite parameter travels in a whole register, but the
+/// last eightbyte of a composite whose size is not a multiple of eight holds
+/// fewer bytes than the register does -- four of `struct { int a, b, c; }`,
+/// five of a thirteen-byte one. Storing the register's eight regardless is
+/// what wrote past the object's local, whose slot is rounded up only to the
+/// type's own alignment.
+///
+/// Zero for an eightbyte past the end, which a class vector longer than the
+/// object cannot produce but a caller need not prove.
+pub fn eightbyte_bytes(total: i64, at: i64) -> i64 {
+    (total - at).clamp(0, 8)
+}
+
 // Floating-Point Size
 
 /// Floating-point size specifier
@@ -128,6 +144,27 @@ impl FpSize {
             17..=32 => FpSize::Single,
             33..=64 => FpSize::Double,
             _ => FpSize::Quad,
+        }
+    }
+
+    /// The one floating-point store that writes exactly `bytes` bytes, if
+    /// there is one.
+    ///
+    /// The widths a store has are 2, 4, 8 and 16; a composite eightbyte of
+    /// SSE class can be any of them, and -- once a member is packed -- 3, 5, 6
+    /// or 7 as well, for which the answer is `None` and the caller has to move
+    /// the bytes some other way. One byte is `None` too: there is no SSE store
+    /// of a single byte.
+    ///
+    /// Rounding up instead is what wrote four bytes past the twelve-byte
+    /// `struct { float x, y, z; }` whose second eightbyte holds only its `z`.
+    pub fn exact_sse_store(bytes: i64) -> Option<FpSize> {
+        match bytes {
+            2 => Some(FpSize::Half),
+            4 => Some(FpSize::Single),
+            8 => Some(FpSize::Double),
+            16 => Some(FpSize::Quad),
+            _ => None,
         }
     }
 
@@ -1485,6 +1522,55 @@ impl EmitAsm for Directive {
 mod tests {
     use super::*;
     use crate::target::Arch;
+
+    /// The last register of a composite parameter carries what is left of the
+    /// object, not a whole eightbyte.
+    ///
+    /// The prologue stores each eightbyte from the register it arrived in, and
+    /// a slot is rounded up only to the type's own alignment -- four for
+    /// `struct { int a, b, c; }` -- so a store as wide as the register writes
+    /// four bytes past a twelve-byte local.
+    #[test]
+    fn test_eightbyte_bytes_stops_at_the_end_of_the_object() {
+        // A multiple of eight fills every register it takes.
+        assert_eq!(eightbyte_bytes(16, 0), 8);
+        assert_eq!(eightbyte_bytes(16, 8), 8);
+        // Twelve and thirteen do not: the second register holds four and five.
+        assert_eq!(eightbyte_bytes(12, 0), 8);
+        assert_eq!(eightbyte_bytes(12, 8), 4);
+        assert_eq!(eightbyte_bytes(13, 8), 5);
+        // Under a register's worth the one register holds the whole object.
+        assert_eq!(eightbyte_bytes(3, 0), 3);
+        // Past the end is nothing at all, never a negative width.
+        assert_eq!(eightbyte_bytes(12, 16), 0);
+        assert_eq!(eightbyte_bytes(0, 0), 0);
+
+        // The eightbytes of any size account for it exactly.
+        for total in 1..=64i64 {
+            let sum: i64 = (0..8).map(|i| eightbyte_bytes(total, i * 8)).sum();
+            assert_eq!(sum, total, "the eightbytes of {total} must cover it");
+        }
+    }
+
+    /// An SSE eightbyte is stored at its own width, and a width no
+    /// floating-point store has is refused rather than rounded up to one.
+    #[test]
+    fn test_exact_sse_store_refuses_a_width_it_cannot_write() {
+        assert_eq!(FpSize::exact_sse_store(2), Some(FpSize::Half));
+        assert_eq!(FpSize::exact_sse_store(4), Some(FpSize::Single));
+        assert_eq!(FpSize::exact_sse_store(8), Some(FpSize::Double));
+        assert_eq!(FpSize::exact_sse_store(16), Some(FpSize::Quad));
+        // `for_sse_aggregate` answers every one of these with a *wider* store,
+        // which is what wrote past the object; here they have no answer and
+        // the caller moves the bytes through a general register instead.
+        for ragged in [0, 1, 3, 5, 6, 7, 9, 12, 15, 17] {
+            assert_eq!(
+                FpSize::exact_sse_store(ragged),
+                None,
+                "{ragged} bytes is not one SSE store"
+            );
+        }
+    }
 
     /// A symbol whose name an assembler will not take bare has to be quoted.
     /// Mach-O's assembler rejects a raw non-ASCII byte outright -- `_café:` is

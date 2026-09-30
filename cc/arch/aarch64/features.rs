@@ -11,6 +11,7 @@
 
 use super::call::HfaElem;
 use super::codegen::Aarch64CodeGen;
+use super::frame::UNROLL_LIMIT_BYTES;
 use super::lir::{Aarch64Inst, GpOperand, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::arch::codegen::BswapSize;
@@ -636,8 +637,15 @@ impl Aarch64CodeGen {
     }
 
     /// Copy `bytes` of an aggregate from `[addr + off]` into the destination,
-    /// in descending power-of-two chunks so nothing past the object is
-    /// written. X16 is the shuttle -- linker scratch, never allocated.
+    /// in the descending power-of-two chunks `block_chunks` gives, so nothing
+    /// past the object is written. X16 is the shuttle -- linker scratch, never
+    /// allocated.
+    ///
+    /// Past [`UNROLL_LIMIT_BYTES`] the copy becomes a counted loop, which
+    /// **advances `addr`**: only the two `VaAggKind::Indirect` paths can reach
+    /// that size, and both pass a register they are finished with. Every other
+    /// kind is at most sixteen bytes (a composite in general registers) or
+    /// sixty-four (an HFA of four binary128s), so it never gets there.
     fn emit_va_arg_bytes(
         &mut self,
         dst_loc: &Loc,
@@ -663,13 +671,44 @@ impl Aarch64CodeGen {
                 return;
             }
         }
-        let mut done = 0;
-        while done < bytes {
-            let chunk = [8, 4, 2, 1]
-                .into_iter()
-                .find(|c| *c <= bytes - done)
-                .unwrap_or(1);
-            let size = OperandSize::from_bits(chunk as u32 * 8);
+        if i64::from(bytes) > UNROLL_LIMIT_BYTES {
+            // X16 becomes the destination cursor; the source cursor is `addr`
+            // itself, advanced past the object.
+            match dst_loc {
+                Loc::Stack(_) | Loc::IncomingArg(_) => {
+                    let (base, disp) = self
+                        .loc_addr_parts(dst_loc)
+                        .expect("a frame location has a base and a displacement");
+                    self.push_lir(Aarch64Inst::Add {
+                        size: OperandSize::B64,
+                        src1: base,
+                        src2: GpOperand::Imm(disp.into()),
+                        dst: Reg::X16,
+                    });
+                }
+                // The register holds the aggregate's address, and it is the
+                // result, so the cursor is a copy of it.
+                Loc::Reg(r) if !holds_value => self.push_lir(Aarch64Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(*r),
+                    dst: Reg::X16,
+                }),
+                _ => return,
+            }
+            if off != 0 {
+                self.push_lir(Aarch64Inst::Add {
+                    size: OperandSize::B64,
+                    src1: addr,
+                    src2: GpOperand::Imm(off.into()),
+                    dst: addr,
+                });
+            }
+            self.emit_block_copy_loop(Reg::X16, addr, bytes.into());
+            return;
+        }
+        for (done, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
+            let size = OperandSize::from_bits(chunk.bits());
+            let done = done as i32;
             self.push_lir(Aarch64Inst::Ldr {
                 size,
                 addr: MemAddr::BaseOffset {
@@ -700,7 +739,6 @@ impl Aarch64CodeGen {
                 }),
                 _ => return,
             }
-            done += chunk;
         }
     }
 

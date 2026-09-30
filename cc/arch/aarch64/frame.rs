@@ -25,6 +25,12 @@ use crate::ir::{Function, Instruction, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::HashSet;
 
+/// The most bytes this back end moves with unrolled loads and stores; past it,
+/// [`Aarch64CodeGen::emit_block_copy_loop`]. It is the bound the IR puts on an
+/// expanded `memcpy`, for the same reason: the instruction count of an unrolled
+/// copy is linear in the object.
+pub(super) const UNROLL_LIMIT_BYTES: i64 = crate::ir::memexpand::INLINE_LIMIT_BYTES;
+
 impl Aarch64CodeGen {
     pub(super) fn emit_function(&mut self, func: &Function, types: &TypeTable) {
         self.base.func_pos = crate::arch::func_pos(func);
@@ -538,6 +544,81 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// Copy `bytes` bytes from `[src]` to `[dst]`, in a counted loop over the
+    /// whole sixteen-byte pairs and `block_chunks` for what is left.
+    ///
+    /// This is the back end's bulk block move. It cannot synthesize a call to
+    /// `memcpy` -- it is past the point where a call can be built -- and one
+    /// load/store pair per chunk is linear in the object: 4 KB of `va_arg`
+    /// aggregate cost about 1100 instructions, and 256 KB would be the
+    /// compile-time explosion the IR's own
+    /// [`crate::ir::memexpand::INLINE_LIMIT_BYTES`] exists to prevent. A
+    /// counted loop is the answer [`Self::emit_zero_loop`] gives the frame.
+    ///
+    /// Sixteen bytes an iteration through V16, which is reserved codegen
+    /// scratch: it keeps the loop to three general registers, which is all the
+    /// `va_arg` sequence has free. Both `src` and `dst` are cursors and are
+    /// left past the object, so the caller must be finished with them; X17
+    /// holds the end of the paired part and then shuttles the tail.
+    pub(super) fn emit_block_copy_loop(&mut self, dst: Reg, src: Reg, bytes: i64) {
+        let pairs = bytes & !15;
+        if pairs > 0 {
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: src,
+                src2: GpOperand::Imm(pairs),
+                dst: Reg::X17,
+            });
+            let top = self.next_unique_label("block_copy");
+            self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(top.clone())));
+            self.push_lir(Aarch64Inst::LdrFp {
+                size: FpSize::Quad,
+                addr: MemAddr::PostIndex {
+                    base: src,
+                    offset: 16,
+                },
+                dst: VReg::V16,
+            });
+            self.push_lir(Aarch64Inst::StrFp {
+                size: FpSize::Quad,
+                src: VReg::V16,
+                addr: MemAddr::PostIndex {
+                    base: dst,
+                    offset: 16,
+                },
+            });
+            self.push_lir(Aarch64Inst::Cmp {
+                size: OperandSize::B64,
+                src1: src,
+                src2: GpOperand::Reg(Reg::X17),
+            });
+            self.push_lir(Aarch64Inst::BCond {
+                cond: CondCode::Ult,
+                target: top,
+            });
+        }
+        // The cursors point at the tail, so its pieces are offsets from them.
+        for (off, chunk) in crate::ir::memexpand::block_chunks(bytes - pairs) {
+            let size = OperandSize::from_bits(chunk.bits());
+            self.push_lir(Aarch64Inst::Ldr {
+                size,
+                addr: MemAddr::BaseOffset {
+                    base: src,
+                    offset: off as i32,
+                },
+                dst: Reg::X17,
+            });
+            self.push_lir(Aarch64Inst::Str {
+                size,
+                src: Reg::X17,
+                addr: MemAddr::BaseOffset {
+                    base: dst,
+                    offset: off as i32,
+                },
+            });
+        }
+    }
+
     /// Save callee-saved GP registers in pairs (or single if odd count)
     fn save_callee_saved_gp_regs(&mut self, total_frame: i32, callee_saved: &[Reg]) {
         let mut offset = 16; // Start after fp/lr
@@ -960,13 +1041,14 @@ impl Aarch64CodeGen {
                                 crate::arch::func_pos(func),
                                 "a stacked parameter",
                             );
-                            let mut done = 0;
-                            while done < bytes {
-                                let chunk = [8, 4, 2, 1]
-                                    .into_iter()
-                                    .find(|c| *c <= bytes - done)
-                                    .unwrap_or(1);
-                                let size = OperandSize::from_bits(chunk as u32 * 8);
+                            // A composite that reaches here is at most two
+                            // eightbytes, so the run is bounded by the ABI;
+                            // the widths are `block_chunks`'s so the tail of
+                            // one that is not a multiple of eight is moved as
+                            // wide as it is and no wider.
+                            for (done, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
+                                let size = OperandSize::from_bits(chunk.bits());
+                                let done = done as i32;
                                 self.push_lir(Aarch64Inst::Ldr {
                                     size,
                                     addr: self.incoming_mem_plus(incoming, done),
@@ -977,7 +1059,6 @@ impl Aarch64CodeGen {
                                     src: Reg::X16,
                                     addr: self.stack_mem_plus(local_off, done),
                                 });
-                                done += chunk;
                             }
                         }
                     }

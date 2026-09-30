@@ -519,8 +519,17 @@ OUT_OF_SCOPE_VLA_MEMBER=" execute/20020412-1 execute/20040308-1 \
 #               saturates to INT_MAX. aarch64 agrees by hardware accident.
 #   pr46309     a conditional with one `void` arm, which gcc takes as an
 #               extension and C17 6.5.15p3 forbids.
+#   printf, fprintf, fputs, printf-chk-1, fprintf-chk-1, vprintf-chk-1,
+#   vfprintf-chk-1
+#               abort when an empty write -- `printf("")`, `fprintf(fp, "")`,
+#               `fputs("", fp)` -- reaches the library at -O1 and up. C17
+#               7.21.2p4 orients a stream on the first output function applied
+#               to it whether or not a byte moves, so c17 keeps the call; gcc
+#               drops it and the orientation with it.
 OUT_OF_SCOPE_GCC_BEHAVIOUR=" execute/20031003-1 execute/pr46309 \
- compile/pr26725 compile/20000211-1 compile/950919-1 "
+ compile/pr26725 compile/20000211-1 compile/950919-1 \
+ builtins/printf builtins/fprintf builtins/fputs execute/printf-chk-1 \
+ execute/fprintf-chk-1 execute/vprintf-chk-1 execute/vfprintf-chk-1 "
 
 # Tests gcc on this machine fails exactly as c17 does, verified by running both
 # at -O0 and -O2. Counting them as c17 failures overstates the gap, and they are

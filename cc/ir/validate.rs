@@ -429,8 +429,10 @@ fn check_barrier_implies_side_effect(func: &Function, out: &mut Vec<ValidationEr
 /// forwarded across one.
 ///
 /// `Load` is the one deliberate exception: it reaches memory and DCE may
-/// delete it, because reading a non-volatile location has no effect.
-/// Volatility is refused elsewhere, on the variable.
+/// delete it, because reading a non-volatile location has no effect. Reading a
+/// `volatile` one is observable, and that is refused per *access*, by
+/// `Instruction::is_volatile_access`, which `dce::is_root` consults alongside
+/// this predicate.
 fn check_memory_access_implies_side_effect(func: &Function, out: &mut Vec<ValidationError>) {
     for (block, bb) in func.blocks.iter().enumerate() {
         for (index, insn) in bb.insns.iter().enumerate() {

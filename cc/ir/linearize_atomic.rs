@@ -20,6 +20,7 @@
 //
 
 use super::linearize::Linearizer;
+use super::linearize_emit::{compound_assign_arith_type, compound_assign_opcode, CompoundAssign};
 use super::{Instruction, MemoryOrder, Opcode, PseudoId};
 use crate::diag;
 use crate::float::FloatVal;
@@ -210,8 +211,12 @@ impl Linearizer<'_> {
     ///
     /// Multiplication, division, remainder, the shifts and everything
     /// floating-point have no native atomic form and go through a
-    /// compare-and-swap retry loop instead.
-    pub(crate) fn atomic_opcode_for(op: Opcode) -> Option<Opcode> {
+    /// compare-and-swap retry loop instead. Neither does `nand`, on any
+    /// target, which is why it is a flag on [`CompoundAssign`] rather than an
+    /// opcode here.
+    ///
+    /// Having one does not by itself make it usable: see `native_rmw_opcode`.
+    fn atomic_opcode_for(op: Opcode) -> Option<Opcode> {
         Some(match op {
             Opcode::Add => Opcode::AtomicFetchAdd,
             Opcode::Sub => Opcode::AtomicFetchSub,
@@ -249,39 +254,53 @@ impl Linearizer<'_> {
     pub(crate) fn emit_atomic_rmw(
         &mut self,
         lv: &AtomicLvalue,
-        op: Opcode,
+        ca: &CompoundAssign,
         value: PseudoId,
     ) -> PseudoId {
-        // `_Bool` cannot use a native fetch-and-op: the value stored must be
-        // the *converted* result, so `b = 1; b++` leaves 1 rather than 2, and
-        // `b = 0; b--` leaves 1 rather than 255. Only the CAS loop can apply
-        // that conversion before the store.
-        let needs_conversion = self.types.kind(lv.elem_typ) == TypeKind::Bool;
-        if !needs_conversion {
-            if let Some(atomic_op) = Self::atomic_opcode_for(op) {
-                return self.emit_atomic_op(atomic_op, lv, Some(value));
-            }
+        if let Some(atomic_op) = self.native_rmw_opcode(ca) {
+            // The instruction computes at the object's own width, so the
+            // operand arrives at the object's own type -- the truncation the
+            // congruence below permits. Pointer arithmetic has scaled it to a
+            // byte count already, at pointer width.
+            let value = if ca.is_ptr_arith {
+                value
+            } else {
+                self.emit_convert(value, ca.value_typ, ca.target_typ)
+            };
+            return self.emit_atomic_op(atomic_op, lv, Some(value));
         }
-        self.emit_atomic_cas_loop(lv, op, value, false)
+        self.emit_atomic_cas_loop(lv, ca, value)
     }
 
-    /// `__atomic_fetch_nand` / `__sync_fetch_and_nand`: store `~(old & value)`
-    /// and return the old value.
+    /// The native atomic instruction that computes `ca` *exactly*, if one
+    /// does.
     ///
-    /// No target has an atomic NAND, so this is always the CAS loop -- the
-    /// same loop, with one more instruction inside it. Writing a second loop
-    /// would mean two places to get the LL/SC rules right.
-    pub(crate) fn emit_atomic_nand(&mut self, lv: &AtomicLvalue, value: PseudoId) -> PseudoId {
-        self.emit_atomic_cas_loop(lv, Opcode::And, value, true)
+    /// `AtomicFetchAdd` and its siblings operate at the object's width and
+    /// store the raw result, where C17 6.5.16.2p3 computes at the operands'
+    /// common type and converts the result back
+    /// ([`Linearizer::compound_assign_value`]). The two agree when the
+    /// operator is congruent modulo 2^n -- add, subtract and the three bitwise
+    /// ops -- *and* the conversion back is the truncation congruence permits.
+    ///
+    /// `_Bool` is where that second condition fails: converting to it is a
+    /// test against zero, not a truncation, so `b -= 1` must store 1 and only
+    /// the CAS loop can convert before the store. Divide, remainder, the
+    /// shifts and everything floating-point fail the first condition, and
+    /// `nand` complements a value the hardware would store as it stands.
+    fn native_rmw_opcode(&self, ca: &CompoundAssign) -> Option<Opcode> {
+        if ca.invert || self.types.kind(ca.target_typ) == TypeKind::Bool {
+            return None;
+        }
+        let arith_type = compound_assign_arith_type(self.types, ca);
+        Self::atomic_opcode_for(compound_assign_opcode(self.types, ca.op, arith_type))
     }
 
     /// The CAS retry loop described on `emit_atomic_rmw`.
     fn emit_atomic_cas_loop(
         &mut self,
         lv: &AtomicLvalue,
-        op: Opcode,
+        ca: &CompoundAssign,
         value: PseudoId,
-        invert: bool,
     ) -> PseudoId {
         let elem_typ = lv.elem_typ;
         let bits = lv.size_bits;
@@ -298,39 +317,25 @@ impl Linearizer<'_> {
         let loop_bb = self.alloc_bb();
         let done_bb = self.alloc_bb();
 
-        let entry_bb = self.current_bb.expect("atomic RMW outside a block");
+        // Through the accessor rather than `expect`: `current_bb` is `None`
+        // wherever control cannot arrive -- a statement before a `switch`'s
+        // first `case`, or after a `goto` -- and this loop has to hang its
+        // blocks off something. `dce::remove_unreachable_blocks` takes the
+        // lot away again.
+        let entry_bb = self.current_or_unreachable_bb();
         self.emit(Instruction::br(loop_bb));
         self.link_bb(entry_bb, loop_bb);
         self.switch_bb(loop_bb);
 
-        // old = *exp; new = old <op> value
+        // old = *exp; new = the value `old <op> value` assigns.
+        //
+        // Through the shared helper, so the loop computes at the same type the
+        // ordinary lowering does and converts the result back the same way --
+        // which is also what keeps an `_Atomic _Bool` holding 0 or 1 rather
+        // than the raw 2 or 255 the arithmetic produced (C17 6.3.1.2).
         let old = self.alloc_reg_pseudo();
         self.emit(Instruction::load(old, exp_addr, 0, elem_typ, bits));
-        let new = self.alloc_reg_pseudo();
-        self.emit(Instruction::binop(op, new, old, value, elem_typ, bits));
-        // `nand` is `and` with the result complemented, which is the only
-        // reason this loop takes a flag rather than an opcode alone.
-        let new = if invert {
-            let inverted = self.alloc_reg_pseudo();
-            self.emit(Instruction::unop(
-                Opcode::Not,
-                inverted,
-                new,
-                elem_typ,
-                bits,
-            ));
-            inverted
-        } else {
-            new
-        };
-        // C17 6.3.1.2: converting to _Bool yields 0 or 1, and a compound
-        // assignment stores the converted result. Without this the raw sum
-        // reaches memory and an _Atomic _Bool holds 2 or 255.
-        let new = if self.types.kind(elem_typ) == TypeKind::Bool {
-            self.emit_convert(new, self.types.int_id, elem_typ)
-        } else {
-            new
-        };
+        let new = self.compound_assign_value(ca, old, value);
 
         let ok = self.alloc_reg_pseudo();
         let order = self.emit_const(ORDER as i128, self.types.int_id);
@@ -341,7 +346,7 @@ impl Linearizer<'_> {
         cas.memory_order = ORDER;
         self.emit(cas);
 
-        let cas_bb = self.current_bb.expect("atomic CAS outside a block");
+        let cas_bb = self.current_or_unreachable_bb();
         self.emit(Instruction::cbr(ok, done_bb, loop_bb));
         self.link_bb(cas_bb, done_bb);
         self.link_bb(cas_bb, loop_bb);
@@ -387,26 +392,32 @@ impl Linearizer<'_> {
         let is_ptr_arith = self.types.kind(target_typ) == TypeKind::Pointer
             && self.types.is_integer(value_typ)
             && matches!(op, AssignOp::AddAssign | AssignOp::SubAssign);
-
-        let (operand, arith_typ) = if is_ptr_arith {
+        let (operand, value_typ) = if is_ptr_arith {
             (
                 self.scale_pointer_addend(target_typ, value_typ, rhs),
-                target_typ,
+                self.types.long_id,
             )
         } else {
-            (self.emit_convert(rhs, value_typ, target_typ), target_typ)
+            (rhs, value_typ)
         };
 
-        let opcode = self.compound_assign_opcode(op, arith_typ);
-        let old = self.emit_atomic_rmw(&lv, opcode, operand);
+        // The right operand goes on at its own type. Converting it down to the
+        // target here -- which this did -- computes `50 / (unsigned char)-5`
+        // where C17 6.5.16.2p3 computes `50 / -5` at `int` and converts only
+        // the result; `compound_assign_value` is the ordinary path's rule, now
+        // shared rather than copied.
+        let ca = CompoundAssign {
+            is_ptr_arith,
+            ..CompoundAssign::new(op, lv.elem_typ, value_typ)
+        };
+        let old = self.emit_atomic_rmw(&lv, &ca, operand);
 
-        // Recompute the stored value from the old one.
-        let new = self.alloc_reg_pseudo();
-        let bits = self.types.size_bits(arith_typ);
-        self.emit(Instruction::binop(
-            opcode, new, old, operand, arith_typ, bits,
-        ));
-        Some(new)
+        // Recompute the stored value from the old one, by the same rule that
+        // stored it: C17 6.5.16p3 gives the expression the left operand's
+        // value *after* the assignment, which for `_Atomic _Bool b = 0` makes
+        // `(b -= 1)` the 1 that reached memory and not the 255 the subtraction
+        // produced.
+        Some(self.compound_assign_value(&ca, old, operand))
     }
 
     /// Scale an integer addend by the pointee size, for `p += n`.
@@ -431,63 +442,6 @@ impl Linearizer<'_> {
         ));
         scaled
     }
-
-    /// The arithmetic opcode a compound assignment operator applies.
-    pub(crate) fn compound_assign_opcode(&self, op: AssignOp, typ: TypeId) -> Opcode {
-        let is_float = self.types.is_float(typ);
-        let is_unsigned = self.types.is_unsigned(typ);
-        match op {
-            AssignOp::Assign => unreachable!("plain assignment has no arithmetic opcode"),
-            AssignOp::AddAssign => {
-                if is_float {
-                    Opcode::FAdd
-                } else {
-                    Opcode::Add
-                }
-            }
-            AssignOp::SubAssign => {
-                if is_float {
-                    Opcode::FSub
-                } else {
-                    Opcode::Sub
-                }
-            }
-            AssignOp::MulAssign => {
-                if is_float {
-                    Opcode::FMul
-                } else {
-                    Opcode::Mul
-                }
-            }
-            AssignOp::DivAssign => {
-                if is_float {
-                    Opcode::FDiv
-                } else if is_unsigned {
-                    Opcode::DivU
-                } else {
-                    Opcode::DivS
-                }
-            }
-            AssignOp::ModAssign => {
-                if is_unsigned {
-                    Opcode::ModU
-                } else {
-                    Opcode::ModS
-                }
-            }
-            AssignOp::AndAssign => Opcode::And,
-            AssignOp::OrAssign => Opcode::Or,
-            AssignOp::XorAssign => Opcode::Xor,
-            AssignOp::ShlAssign => Opcode::Shl,
-            AssignOp::ShrAssign => {
-                if is_unsigned {
-                    Opcode::Lsr
-                } else {
-                    Opcode::Asr
-                }
-            }
-        }
-    }
 }
 
 impl Linearizer<'_> {
@@ -511,30 +465,33 @@ impl Linearizer<'_> {
 
         let lv = self.atomic_lvalue(operand)?;
 
-        // A pointer steps by one element; everything else by one.
+        // A pointer steps by one element; everything else by one. C17
+        // 6.5.3.1p2 defines `++E` as `E += 1`, so the step is the right
+        // operand of a compound assignment and the same helper applies --
+        // including its conversion of the result, which is what makes `++b` on
+        // an `_Atomic _Bool` still yield 0 or 1.
+        let is_ptr_arith = self.types.kind(typ) == TypeKind::Pointer;
         let delta = self.incdec_delta(typ);
-        let is_float = self.types.is_float(typ);
-        let opcode = match (is_inc, is_float) {
-            (true, false) => Opcode::Add,
-            (false, false) => Opcode::Sub,
-            (true, true) => Opcode::FAdd,
-            (false, true) => Opcode::FSub,
+        let delta_typ = if is_ptr_arith {
+            self.types.long_id
+        } else {
+            typ
+        };
+        let op = if is_inc {
+            AssignOp::AddAssign
+        } else {
+            AssignOp::SubAssign
+        };
+        let ca = CompoundAssign {
+            is_ptr_arith,
+            ..CompoundAssign::new(op, lv.elem_typ, delta_typ)
         };
 
-        let old = self.emit_atomic_rmw(&lv, opcode, delta);
+        let old = self.emit_atomic_rmw(&lv, &ca, delta);
         if !prefix {
             return Some(old);
         }
-
-        let bits = self.types.size_bits(typ);
-        let new = self.alloc_reg_pseudo();
-        self.emit(Instruction::binop(opcode, new, old, delta, typ, bits));
-
-        // `++b` on an _Atomic _Bool must still yield 0 or 1.
-        if self.types.kind(typ) == TypeKind::Bool {
-            return Some(self.emit_convert(new, self.types.int_id, typ));
-        }
-        Some(new)
+        Some(self.compound_assign_value(&ca, old, delta))
     }
 
     /// The amount `++`/`--` steps by: the pointee size for a pointer, else 1.

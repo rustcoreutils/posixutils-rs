@@ -30,7 +30,7 @@
 //
 
 use super::{ConstValue, Function, Initializer, Instruction, Module, Opcode, PseudoKind};
-use crate::types::{TypeId, TypeModifiers, TypeTable};
+use crate::types::{TypeId, TypeTable};
 use std::collections::HashMap;
 
 /// A global whose value is known for the whole run.
@@ -90,7 +90,13 @@ pub(crate) fn qualifies(g: &super::GlobalDef, types: &TypeTable) -> bool {
     }
     // `volatile` says the value can change for reasons not in the program,
     // which is exactly the assumption being made here.
-    if types.modifiers(g.typ).contains(TypeModifiers::VOLATILE) {
+    //
+    // `contains_volatile`, not the top-level modifier: a `const struct` with a
+    // `volatile` member is one of these objects too, and asking only what was
+    // written on the struct let it through the gate. Every access is checked
+    // again below, so this was not reachable as a wrong fold -- but the object
+    // and its members are one question and get one spelling of it.
+    if types.contains_volatile(g.typ) {
         return false;
     }
     // A weak definition exists to be replaced at link time, and the
@@ -158,6 +164,14 @@ fn foldable_load(
     if insn.op != Opcode::Load || insn.src.len() != 1 || insn.offset != 0 {
         return None;
     }
+    // The access itself is observable, whatever the object's initializer says
+    // it holds: `const volatile int t = 0;` -- a hardware status word, a
+    // linker-set value -- must still be read. `qualifies` declines a global
+    // written `volatile`, but the qualifier can also be on the *access*, as in
+    // `*(volatile const int *)&t`, and only the instruction knows that.
+    if insn.is_volatile_access() {
+        return None;
+    }
     let PseudoKind::Sym(name) = &func.get_pseudo(insn.src[0])?.kind else {
         return None;
     };
@@ -186,6 +200,7 @@ mod tests {
     use super::*;
     use crate::ir::{BasicBlock, BasicBlockId, GlobalDef, Pseudo, PseudoId};
     use crate::target::Target;
+    use crate::types::TypeModifiers;
 
     /// A module with one global and a function that loads it whole.
     fn module_loading(global: GlobalDef, types: &TypeTable, load_typ: TypeId) -> Module {

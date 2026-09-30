@@ -89,6 +89,14 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
             if insn.op != Opcode::Load {
                 continue;
             }
+            // Each read of a volatile object is its own observable event, so
+            // the value another access left behind is no answer for this one.
+            // `forwardable` declines a *named* volatile object; the marker is
+            // what declines `*p` for a `volatile int *p`, where the qualifier
+            // is on the access and there is no variable to ask.
+            if insn.is_volatile_access() {
+                continue;
+            }
             if let Some(a) = oracle.value_at((b, i), &am.location_of(func, insn)) {
                 sites.push((b, i, a));
             }

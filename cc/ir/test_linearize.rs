@@ -13,6 +13,7 @@
 #![allow(clippy::approx_constant)]
 
 use super::*;
+use crate::ir::linearize_emit::{compound_assign_arith_type, compound_assign_opcode};
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, ExprKind, ExternalDecl,
     ForInit, FunctionDef, InitDeclarator, InitElement, ParamStyle, Parameter, Stmt, UnaryOp,
@@ -6016,7 +6017,25 @@ fn test_compound_literal_zero_init_lvalue() {
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
-    let module = ctx.linearize(&tu);
+    let mut module = ctx.linearize(&tu);
+
+    // The linearizer asks for the zero-init as one `Memset` of the whole
+    // literal rather than emitting the stores itself. That is what gives it
+    // the same bound as every other block memory operation -- the ladder it
+    // used to hand-roll here had none, so `char buf[N] = {0}` unrolled for any
+    // N at all.
+    let linearized = format!("{}", module.display(&ctx.types));
+    assert!(
+        linearized.contains("memset"),
+        "expected the compound literal's zero-init to be asked for as a memset: {linearized}"
+    );
+
+    // `memexpand` turns it back into stores, at every optimization level --
+    // `-O0` included, see `opt::optimize_module` -- so run it here and hold
+    // the stores to the same account as before.
+    for f in &mut module.functions {
+        crate::ir::memexpand::run(f, &ctx.types);
+    }
     let ir = format!("{}", module.display(&ctx.types));
 
     // The compound literal must be zero-initialized first, then the designated
@@ -6550,6 +6569,260 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
         ctx.types.size_bits(typ),
         32,
         "the surrogate must be the same width as the aggregate"
+    );
+}
+
+// One model for `E1 op= E2` (C17 6.5.16.2p3)
+//
+// The ordinary and the `_Atomic` lowerings each used to carry their own copy
+// of these rules, and the copies disagreed: the atomic one converted the right
+// operand down to the target and computed there, so `_Atomic unsigned char c =
+// 50; c /= -5;` divided 50 by 251 and stored 0. Both now go through
+// `compound_assign_value`, and these tests pin the decisions it makes.
+
+/// Build `void test(T x) { x <op>= <value>; }` with `T` the chosen type made
+/// `_Atomic` and the right operand a plain `int` literal, and linearize it.
+///
+/// `target` is a selector rather than a `TypeId` because the table the id
+/// belongs to is built by `TestContext::new`.
+fn atomic_typed_module(
+    op: AssignOp,
+    target: fn(&TypeTable) -> TypeId,
+    value: i64,
+) -> (TestContext, Module) {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_id = ctx.types.int_id;
+
+    let base = target(&ctx.types);
+    let atomic_typ = {
+        let mut t = ctx.types.get(base).clone();
+        t.modifiers |= TypeModifiers::ATOMIC;
+        ctx.types.intern(t)
+    };
+    let x_sym = ctx.var("x", atomic_typ);
+
+    let assign = Expr::typed_unpositioned(
+        ExprKind::Assign {
+            op,
+            target: Box::new(Expr::var_typed(x_sym, atomic_typ)),
+            value: Box::new(Expr::typed_unpositioned(ExprKind::IntLit(value), int_id)),
+        },
+        atomic_typ,
+    );
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: ctx.types.void_id,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(x_sym),
+            typ: atomic_typ,
+            vm_dims: vec![],
+            discarded_dims: vec![],
+        }],
+        body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Expr(assign)))]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
+    };
+    let module = ctx.linearize(&TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    });
+    (ctx, module)
+}
+
+/// The first instruction with this opcode, for asserting on its type and width.
+fn first_op(module: &Module, op: Opcode) -> &Instruction {
+    module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .find(|i| i.op == op)
+        .unwrap_or_else(|| panic!("no {:?} in the module", op))
+}
+
+/// The usual arithmetic conversions decide the type, and the type decides the
+/// opcode -- so a narrow unsigned target divided by an `int` is a *signed*
+/// 32-bit divide.
+#[test]
+fn test_compound_assign_divides_at_the_operands_common_type() {
+    let types = TypeTable::new(&Target::host());
+
+    let ca = CompoundAssign::new(AssignOp::DivAssign, types.uchar_id, types.int_id);
+    let arith = compound_assign_arith_type(&types, &ca);
+    assert_eq!(arith, types.int_id, "unsigned char / int is done at int");
+    assert_eq!(
+        compound_assign_opcode(&types, AssignOp::DivAssign, arith),
+        Opcode::DivS
+    );
+
+    // Asking the *target's* type instead is the defect this replaced: it makes
+    // the same expression an unsigned divide, and `50 /= -5` stores 0.
+    assert_eq!(
+        compound_assign_opcode(&types, AssignOp::DivAssign, types.uchar_id),
+        Opcode::DivU
+    );
+}
+
+/// The congruent operators are decided the same way, even though their result
+/// is the same either width.
+#[test]
+fn test_compound_assign_add_also_computes_at_the_common_type() {
+    let types = TypeTable::new(&Target::host());
+    let ca = CompoundAssign::new(AssignOp::AddAssign, types.uchar_id, types.int_id);
+    assert_eq!(compound_assign_arith_type(&types, &ca), types.int_id);
+    assert_eq!(
+        compound_assign_opcode(&types, AssignOp::AddAssign, types.int_id),
+        Opcode::Add
+    );
+    // A floating target picks the floating form of the same operator.
+    let fca = CompoundAssign::new(AssignOp::AddAssign, types.float_id, types.int_id);
+    let farith = compound_assign_arith_type(&types, &fca);
+    assert_eq!(farith, types.float_id);
+    assert_eq!(
+        compound_assign_opcode(&types, AssignOp::AddAssign, farith),
+        Opcode::FAdd
+    );
+}
+
+/// A shift promotes its **left** operand and nothing else (C17 6.5.7p3), so
+/// the right operand's type has no say in the width it is done at.
+#[test]
+fn test_compound_assign_shift_takes_the_promoted_left_operand() {
+    let types = TypeTable::new(&Target::host());
+
+    let ca = CompoundAssign::new(AssignOp::ShrAssign, types.schar_id, types.longlong_id);
+    let arith = compound_assign_arith_type(&types, &ca);
+    assert_eq!(
+        arith, types.int_id,
+        "the promoted left operand decides, not the common type"
+    );
+    assert_ne!(
+        arith,
+        types.common_type(types.schar_id, types.longlong_id),
+        "the shift must not follow the usual arithmetic conversions"
+    );
+
+    // And the promotion is what makes the shift arithmetic: `unsigned char`
+    // promotes to `int`, so `u >>= 1` on 200 is 100 and not a logical shift of
+    // the byte.
+    let uca = CompoundAssign::new(AssignOp::ShrAssign, types.uchar_id, types.int_id);
+    let uarith = compound_assign_arith_type(&types, &uca);
+    assert_eq!(uarith, types.int_id);
+    assert_eq!(
+        compound_assign_opcode(&types, AssignOp::ShrAssign, uarith),
+        Opcode::Asr
+    );
+    assert_eq!(
+        compound_assign_opcode(&types, AssignOp::ShrAssign, types.uchar_id),
+        Opcode::Lsr,
+        "computing at the target's own width would shift the wrong way"
+    );
+}
+
+/// `_Bool` promotes to `int` like any narrow integer; what is special about it
+/// is the conversion *back*, which is a test against zero.
+#[test]
+fn test_compound_assign_bool_computes_at_int() {
+    let types = TypeTable::new(&Target::host());
+    let ca = CompoundAssign::new(AssignOp::SubAssign, types.bool_id, types.int_id);
+    assert_eq!(compound_assign_arith_type(&types, &ca), types.int_id);
+}
+
+/// Pointer arithmetic is the other exception: the addend arrives already
+/// scaled to a byte count and the addition happens at pointer width.
+#[test]
+fn test_compound_assign_pointer_arithmetic_is_done_at_pointer_width() {
+    let types = TypeTable::new(&Target::host());
+    let ca = CompoundAssign {
+        is_ptr_arith: true,
+        ..CompoundAssign::new(AssignOp::AddAssign, types.char_ptr_id, types.long_id)
+    };
+    assert_eq!(compound_assign_arith_type(&types, &ca), types.long_id);
+    assert_eq!(
+        compound_assign_opcode(&types, AssignOp::AddAssign, types.long_id),
+        Opcode::Add
+    );
+}
+
+/// `_Atomic unsigned char c; c /= -5;` divides at `int`, in the CAS loop --
+/// the same arithmetic the ordinary lowering does.
+#[test]
+fn test_atomic_compound_divide_computes_at_the_common_type() {
+    let (_ctx, module) = atomic_typed_module(AssignOp::DivAssign, |t| t.uchar_id, -5);
+
+    let div = first_op(&module, Opcode::DivS);
+    assert_eq!(
+        div.size, 32,
+        "the divide happens at the common type's width, not the object's"
+    );
+    assert_eq!(
+        count_op(&module, Opcode::DivU),
+        0,
+        "narrowing the right operand first would make this an unsigned divide"
+    );
+    assert_eq!(
+        count_op(&module, Opcode::AtomicCas),
+        1,
+        "divide has no native atomic form"
+    );
+}
+
+/// The same for a shift: promoted left operand, 32-bit arithmetic shift.
+#[test]
+fn test_atomic_compound_shift_promotes_its_left_operand() {
+    let (_ctx, module) = atomic_typed_module(AssignOp::ShrAssign, |t| t.uchar_id, 1);
+
+    let shift = first_op(&module, Opcode::Asr);
+    assert_eq!(shift.size, 32, "the left operand is promoted to int first");
+    assert_eq!(
+        count_op(&module, Opcode::Lsr),
+        0,
+        "an 8-bit logical shift would be the target's width, not the promoted one"
+    );
+    assert_eq!(count_op(&module, Opcode::AtomicCas), 1);
+}
+
+/// A narrow congruent operator keeps its native fetch-and-op.
+///
+/// The standard computes `c += 100` at `int` and converts back, but add is
+/// congruent modulo 2^8, so the hardware's 8-bit add agrees with it -- and a
+/// single instruction beats a retry loop.
+#[test]
+fn test_atomic_narrow_add_keeps_its_native_fetch_op() {
+    let (_ctx, module) = atomic_typed_module(AssignOp::AddAssign, |t| t.uchar_id, 100);
+
+    assert_eq!(count_op(&module, Opcode::AtomicFetchAdd), 1);
+    assert_eq!(
+        count_op(&module, Opcode::AtomicCas),
+        0,
+        "no retry loop needed"
+    );
+    assert_eq!(
+        first_op(&module, Opcode::AtomicFetchAdd).size,
+        8,
+        "the atomic operates at the object's own width"
+    );
+}
+
+/// `_Atomic _Bool` cannot: converting to `_Bool` is a test against zero, not
+/// the truncation congruence permits, so the value stored has to be computed
+/// before the exchange.
+#[test]
+fn test_atomic_bool_compound_assign_cannot_use_a_native_fetch_op() {
+    let (_ctx, module) = atomic_typed_module(AssignOp::SubAssign, |t| t.bool_id, 1);
+
+    assert_eq!(
+        count_op(&module, Opcode::AtomicFetchSub),
+        0,
+        "a native fetch-and-sub would store the raw 255"
+    );
+    assert_eq!(count_op(&module, Opcode::AtomicCas), 1);
+    assert!(
+        count_op(&module, Opcode::SetNe) >= 1,
+        "the CAS loop must convert the result to _Bool before storing it"
     );
 }
 
@@ -7608,6 +7881,165 @@ fn test_memory_builtins_are_their_opcodes() {
             (Opcode::Memset, Some("memset"), 3),
             (Opcode::Memmove, Some("memmove"), 3),
         ]
+    );
+}
+
+/// The constant `id` holds in `f`, if it is one -- through the narrowing a
+/// conversion to the destination's own type leaves.
+fn const_of(module: &Module, name: &str, id: PseudoId) -> Option<i128> {
+    let f = module.functions.iter().find(|f| f.name == name).unwrap();
+    crate::ir::facts::ConstMap::new(f).get(id)
+}
+
+/// Every `Memset` in `f`, as `(fill byte, length)`.
+fn memsets_of(module: &Module, name: &str) -> Vec<(Option<i128>, Option<i128>)> {
+    insns_of(module, name)
+        .iter()
+        .filter(|i| i.op == Opcode::Memset)
+        .map(|i| {
+            (
+                const_of(module, name, i.src[1]),
+                const_of(module, name, i.src[2]),
+            )
+        })
+        .collect()
+}
+
+/// Every `Store` in `f`, as `(offset, width in bits, stored constant)`. A
+/// store's `src` is `(address, value)`.
+fn stores_of(module: &Module, name: &str) -> Vec<(i64, u32, Option<i128>)> {
+    insns_of(module, name)
+        .iter()
+        .filter(|i| i.op == Opcode::Store)
+        .map(|i| (i.offset, i.size, const_of(module, name, i.src[1])))
+        .collect()
+}
+
+/// Zero-initializing an aggregate is one `Memset` of the whole object, whose
+/// length `memexpand` then weighs against `INLINE_LIMIT_BYTES`.
+///
+/// `emit_aggregate_zero` hand-rolled the same 8/4/2/1 descent
+/// `memexpand::block_chunks` already produces, but with **no** upper bound, so
+/// `char buf[N] = {0}` emitted one store per chunk for any N: 8 KB cost 2081
+/// instructions in the function body and 1 MB did not finish compiling in 25
+/// minutes. Asking for the opcode instead makes the bound the shared one and
+/// leaves the linearizer with no ladder of its own.
+#[test]
+fn test_aggregate_zero_is_one_memset_of_the_whole_object() {
+    let target = Target::new(Arch::X86_64, Os::Linux);
+    // Each declares an object and hands it to `sink` so nothing is dead. The
+    // only store left is the one element `{0}` names explicitly; every other
+    // byte is the memset's, whatever the object's size.
+    for (decl, bytes, explicit) in [
+        ("char buf[200] = {0}; sink(buf);", 200, (0, 8, Some(0))),
+        ("char buf[7] = {0}; sink(buf);", 7, (0, 8, Some(0))),
+        (
+            "struct S { int a; char b; } s = {0}; sink(&s);",
+            8,
+            (0, 32, Some(0)),
+        ),
+    ] {
+        let src = format!("void sink(void *);\nvoid f(void) {{ {decl} }}\n");
+        let module = linearize_source(&src, &target);
+        assert_eq!(
+            memsets_of(&module, "f"),
+            vec![(Some(0), Some(bytes))],
+            "{decl}: one memset of the whole object and nothing else"
+        );
+        assert_eq!(
+            stores_of(&module, "f"),
+            vec![explicit],
+            "{decl}: the linearizer emits no chunk ladder of its own"
+        );
+    }
+}
+
+/// `char b[N] = "str"` zero-fills the elements the literal does not reach,
+/// and only those.
+///
+/// C17 6.7.9p21 initializes them as a static object would be. The `InitList`
+/// arm of a local declaration calls `emit_aggregate_zero` first; the bare
+/// string arm did not, so only the literal's own bytes and one terminator were
+/// written. The braced form reaches the array through an initializer list,
+/// which is already zeroed whole -- zeroing again there would double the
+/// stores at `-O0`, where no `dse` runs to remove them.
+#[test]
+fn test_a_string_initializer_zero_fills_only_its_tail() {
+    let target = Target::new(Arch::X86_64, Os::Linux);
+
+    // Three bytes written -- 'h', 'i', and the terminator -- then five left.
+    let bare = linearize_source(
+        "void sink(void *);\nvoid f(void) { char b[8] = \"hi\"; sink(b); }\n",
+        &target,
+    );
+    assert_eq!(
+        stores_of(&bare, "f"),
+        vec![(0, 8, Some(0x68)), (1, 8, Some(0x69)), (2, 8, Some(0))]
+    );
+    assert_eq!(memsets_of(&bare, "f"), vec![(Some(0), Some(5))]);
+
+    // The braced form is preceded by the whole-object zero, so its tail is
+    // already done: one memset of 8, not one of 8 and another of 5.
+    let braced = linearize_source(
+        "void sink(void *);\nvoid f(void) { char b[8] = {\"hi\"}; sink(b); }\n",
+        &target,
+    );
+    assert_eq!(memsets_of(&braced, "f"), vec![(Some(0), Some(8))]);
+
+    // Exactly as long as the literal: C17 6.7.9p14 drops the terminator, and
+    // there is then no tail either.
+    let exact = linearize_source(
+        "void sink(void *);\nvoid f(void) { char b[2] = \"hi\"; sink(b); }\n",
+        &target,
+    );
+    assert_eq!(
+        stores_of(&exact, "f"),
+        vec![(0, 8, Some(0x68)), (1, 8, Some(0x69))]
+    );
+    assert_eq!(memsets_of(&exact, "f"), vec![]);
+}
+
+/// A string literal initializing a *nested* array element steps the
+/// destination by the element's own width and stops at its capacity.
+///
+/// This path was a third hand-rolled copy of `store_string_units`. It
+/// recognized all four literal kinds and then handled only the narrow one, so
+/// a wide element was dropped and left zero; it stepped the destination by raw
+/// bytes where a wide element is 2 or 4 bytes wide; and it had no capacity
+/// clamp at all, so `char s[1][3] = {"hello"}` stored five bytes into a
+/// three-byte object.
+#[test]
+fn test_a_nested_string_element_keeps_its_stride_and_capacity() {
+    let target = Target::new(Arch::X86_64, Os::Linux);
+
+    // `unsigned short` is `char16_t`: two bytes of stride, and the literal
+    // reaches the array at all.
+    let wide = linearize_source(
+        "void sink(void *);\n\
+         void f(void) { unsigned short u[2][3] = {u\"ab\", u\"cd\"}; sink(u); }\n",
+        &target,
+    );
+    assert_eq!(
+        stores_of(&wide, "f"),
+        vec![
+            (0, 16, Some(0x61)),
+            (2, 16, Some(0x62)),
+            (4, 16, Some(0)),
+            (6, 16, Some(0x63)),
+            (8, 16, Some(0x64)),
+            (10, 16, Some(0)),
+        ]
+    );
+
+    // Five units into a three-byte row: three stored, none past the row, and
+    // the terminator dropped with them.
+    let over = linearize_source(
+        "void sink(void *);\nvoid f(void) { char s[1][3] = {\"hello\"}; sink(s); }\n",
+        &target,
+    );
+    assert_eq!(
+        stores_of(&over, "f"),
+        vec![(0, 8, Some(0x68)), (1, 8, Some(0x65)), (2, 8, Some(0x6c))]
     );
 }
 
@@ -8811,4 +9243,908 @@ fn test_void_cast_of_a_complex_converts_nothing() {
 /// on an arm64 Mac `long double` is `double`.
 fn x86_64_linux() -> Target {
     Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux)
+}
+
+// CFG consistency
+
+/// Every block's recorded successors are exactly the blocks its terminator
+/// names, and `parents` is the inverse of `children`.
+///
+/// Returns a description of the first inconsistency, or `None`.
+fn cfg_inconsistency(func: &Function) -> Option<String> {
+    use std::collections::HashSet;
+
+    for bb in &func.blocks {
+        let children: HashSet<BasicBlockId> = bb.children.iter().copied().collect();
+        if children.len() != bb.children.len() {
+            return Some(format!("{}: duplicate edge in children", bb.id));
+        }
+
+        let named = match bb.insns.last() {
+            Some(last) if last.op.is_terminator() => crate::ir::propagate::terminator_targets(last),
+            // A block with no terminator falls through to nothing the CFG can
+            // name; `children` must then be empty too.
+            _ => HashSet::new(),
+        };
+
+        if named != children {
+            return Some(format!(
+                "{}: terminator names {:?} but children are {:?}",
+                bb.id,
+                sorted_ids(&named),
+                sorted_ids(&children),
+            ));
+        }
+    }
+
+    // `parents` is the inverse of `children`.
+    let mut expected: std::collections::HashMap<BasicBlockId, HashSet<BasicBlockId>> =
+        std::collections::HashMap::new();
+    for bb in &func.blocks {
+        for child in &bb.children {
+            expected.entry(*child).or_default().insert(bb.id);
+        }
+    }
+    for bb in &func.blocks {
+        let have: HashSet<BasicBlockId> = bb.parents.iter().copied().collect();
+        let want = expected.remove(&bb.id).unwrap_or_default();
+        if have != want {
+            return Some(format!(
+                "{}: parents are {:?} but {:?} name it as a successor",
+                bb.id,
+                sorted_ids(&have),
+                sorted_ids(&want),
+            ));
+        }
+    }
+
+    None
+}
+
+fn sorted_ids(s: &std::collections::HashSet<BasicBlockId>) -> Vec<u32> {
+    let mut v: Vec<u32> = s.iter().map(|b| b.0).collect();
+    v.sort_unstable();
+    v
+}
+
+/// A `for` post-expression that splits the block still links the back edge from
+/// the block the branch was emitted into.
+///
+/// `&&`, `||` and `?:` leave `current_bb` on their merge block, so
+/// `link_bb(post_bb, cond_bb)` recorded an edge out of a block that no longer
+/// holds the terminator -- the loop's back edge went missing from the CFG while
+/// a merge block gained an unrecorded one. Both `for` arms had it: the one in
+/// `linearize_for` and its copy in the switch-body walker.
+///
+/// Stated on the CFG rather than on the program's answer because the defect
+/// makes the compiled loop non-terminating, which a runtime test cannot
+/// observe without hanging.
+#[test]
+fn for_post_expression_splitting_the_block_keeps_the_back_edge() {
+    let target = Target::host();
+    let cases = [
+        ("and", "for (int i = 0; i < n; (void)(n && 1), i++) s += i;"),
+        ("or", "for (int i = 0; i < n; (void)(n || 0), i++) s += i;"),
+        (
+            "ternary",
+            "for (int i = 0; i < n; (void)(n ? 1 : 2), i++) s += i;",
+        ),
+        (
+            "and_in_cond_and_post",
+            "for (int i = 0; i < n && n; (void)(n && 1), i++) s += i;",
+        ),
+        (
+            "nested_and",
+            "for (int i = 0; i < n; (void)(n && (i || 1)), i++) s += i;",
+        ),
+    ];
+
+    for (tag, loop_src) in cases {
+        // Plain, and again inside a switch body -- a separate copy of the
+        // lowering that carried the same defect.
+        let plain = format!("int f(int n) {{ int s = 0; {loop_src} return s; }}");
+        let in_switch = format!(
+            "int f(int n) {{ switch (n) {{ case 5: {{ int s = 0; {loop_src} return s; }} \
+             default: return 0; }} }}"
+        );
+
+        for (where_, src) in [("plain", &plain), ("in_switch", &in_switch)] {
+            let module = linearize_source(src, &target);
+            let func = module
+                .functions
+                .iter()
+                .find(|f| f.name == "f")
+                .expect("function f");
+            assert!(
+                cfg_inconsistency(func).is_none(),
+                "{tag} / {where_}: {}\nsource: {src}",
+                cfg_inconsistency(func).unwrap()
+            );
+        }
+    }
+}
+
+/// The check above is only as good as its ability to see a broken edge, so
+/// assert it rejects one.
+#[test]
+fn cfg_inconsistency_sees_a_misrecorded_edge() {
+    let target = Target::host();
+    let module = linearize_source(
+        "int f(int n) { int s = 0; for (int i = 0; i < n; i++) s += i; return s; }",
+        &target,
+    );
+    let mut func = module
+        .functions
+        .iter()
+        .find(|f| f.name == "f")
+        .expect("function f")
+        .clone();
+    assert!(cfg_inconsistency(&func).is_none(), "baseline is consistent");
+
+    // Record a successor the terminator does not name -- exactly the shape the
+    // `for` defect produced.
+    let victim = func.blocks.len() - 1;
+    let bogus = func.blocks[0].id;
+    func.blocks[victim].children.push(bogus);
+    assert!(
+        cfg_inconsistency(&func).is_some(),
+        "an unnamed successor must be reported"
+    );
+}
+
+/// The same audit over every other lowering that can end a block with a
+/// terminator after evaluating an expression: `while`, `do`/`while`, `switch`,
+/// `if`, `?:`, `goto`, `break`/`continue` and the loop lowerings' copies in the
+/// switch-body walker.
+///
+/// Each source puts a short-circuit operator or a `?:` -- the things that split
+/// the block and move `current_bb` to a merge block -- where the construct
+/// evaluates an expression, so an edge linked from the block the construct
+/// started in rather than the one it ended in shows up as an inconsistency.
+#[test]
+fn short_circuit_operands_keep_every_lowering_cfg_consistent() {
+    let target = Target::host();
+    let cases = [
+        ("while_cond", "while (n && s < 3) s++;"),
+        ("do_while_cond", "do { s++; } while (n && s < 3);"),
+        ("if_cond", "if (n && s) s = 1; else s = 2;"),
+        ("ternary", "s = n && 1 ? (n || 2) : (n ? 3 : 4);"),
+        ("for_cond", "for (int i = 0; i < n && n; i++) s += i;"),
+        ("for_init", "for (int i = (n && 1); i < n; i++) s += i;"),
+        (
+            "switch_selector",
+            "switch (n && 1) { case 1: s = 1; break; }",
+        ),
+        (
+            "switch_in_loop",
+            "while (s < 3) { switch (n && 1) { case 1: s++; break; default: s += 2; } }",
+        ),
+        ("break_after_split", "while (1) { if (n && 1) break; s++; }"),
+        (
+            "continue_after_split",
+            "for (int i = 0; i < n; i++) { if (n || 0) continue; s++; }",
+        ),
+        (
+            "goto_after_split",
+            "if (n && 1) goto done; s = 7; done: s++;",
+        ),
+        (
+            "while_in_switch",
+            "switch (n) { case 5: while (n && s < 3) s++; break; default: s = 1; }",
+        ),
+        (
+            "do_while_in_switch",
+            "switch (n) { case 5: do { s++; } while (n && s < 3); break; default: s = 1; }",
+        ),
+        (
+            "nested_for_in_switch",
+            "switch (n) { case 5: for (int i = 0; i < n; (void)(n && 1), i++) \
+             for (int j = 0; j < n; (void)(n || 0), j++) s++; break; default: s = 1; }",
+        ),
+        (
+            "duffs_device",
+            "switch (n % 2) { case 0: do { s++; case 1: s += 2; } while (n && --n > 0); }",
+        ),
+    ];
+
+    for (tag, body) in cases {
+        let src = format!("int f(int n) {{ int s = 0; {body} return s; }}");
+        let module = linearize_source(&src, &target);
+        let func = module
+            .functions
+            .iter()
+            .find(|f| f.name == "f")
+            .expect("function f");
+        assert!(
+            cfg_inconsistency(func).is_none(),
+            "{tag}: {}\nsource: {src}",
+            cfg_inconsistency(func).unwrap()
+        );
+    }
+}
+
+/// Every access the linearizer emits to a `volatile` object carries the
+/// marker, including the one that has no variable to ask.
+///
+/// `LocalVar::is_volatile` and `GlobalFacts::is_volatile` answer for a named
+/// object, and for `*p` with a `volatile int *p` there is none: `p` is an
+/// ordinary pointer. So DCE saw no reason to keep the read and deleted every
+/// discarded `volatile` access from `-O1` up.
+#[test]
+fn test_volatile_accesses_carry_the_marker() {
+    let target = Target::host();
+    let src = "volatile int g;\n\
+               volatile int *vp;\n\
+               int plain;\n\
+               int *pp;\n\
+               volatile int arr[4];\n\
+               struct T { volatile int a; };\n\
+               struct T t;\n\
+               void read_named(void) { g; }\n\
+               void read_via_ptr(void) { *vp; }\n\
+               void write_named(void) { g = 1; }\n\
+               void write_via_ptr(void) { *vp = 1; }\n\
+               void read_element(void) { arr[2]; }\n\
+               void read_member(void) { t.a; }\n\
+               void read_plain(void) { plain; }\n\
+               void read_plain_ptr(void) { *pp; }\n";
+    let module = linearize_source(src, &target);
+
+    let accesses = |name: &str| -> Vec<(Opcode, bool)> {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("function {name}"))
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
+            .map(|i| (i.op, i.is_volatile_access()))
+            .collect()
+    };
+
+    // A named volatile object: one marked access each way.
+    assert_eq!(accesses("read_named"), vec![(Opcode::Load, true)]);
+    assert_eq!(accesses("write_named"), vec![(Opcode::Store, true)]);
+
+    // Through a pointer *to* volatile, the qualifier is on the pointee, so
+    // reading `vp` itself is plain and the access through it is volatile.
+    assert_eq!(
+        accesses("read_via_ptr"),
+        vec![(Opcode::Load, false), (Opcode::Load, true)]
+    );
+    assert_eq!(
+        accesses("write_via_ptr"),
+        vec![(Opcode::Load, false), (Opcode::Store, true)]
+    );
+
+    // The qualifier reaches through an array's element type and a member's
+    // own type.
+    assert_eq!(accesses("read_element"), vec![(Opcode::Load, true)]);
+    assert_eq!(accesses("read_member"), vec![(Opcode::Load, true)]);
+
+    // And nothing unqualified is marked -- the marker that says "keep this"
+    // is worth nothing if it is on every access.
+    assert_eq!(accesses("read_plain"), vec![(Opcode::Load, false)]);
+    assert_eq!(
+        accesses("read_plain_ptr"),
+        vec![(Opcode::Load, false), (Opcode::Load, false)]
+    );
+}
+
+/// A member of a `volatile` object is itself volatile (C17 6.5.2.3p3/p4), so
+/// every access to one carries the marker.
+///
+/// The reverse direction -- a `volatile` member of a plain object -- always
+/// worked, because there the member's own declared type carries the qualifier.
+/// This is the other one: the qualifier is on the *object*, and
+/// `find_member` answers with the member's declared type, which cannot show it.
+/// So the load was unmarked and DCE deleted it from `-O1` up.
+#[test]
+fn test_a_member_of_a_volatile_object_carries_the_marker() {
+    let target = Target::host();
+    let src = "struct S { int a; int b; };\n\
+               struct N { struct S in; };\n\
+               typedef volatile struct S VS;\n\
+               volatile struct S vs;\n\
+               volatile struct S *vp;\n\
+               volatile struct S vsa[4];\n\
+               volatile struct N vn;\n\
+               VS vt;\n\
+               struct S plain;\n\
+               struct S *pp;\n\
+               void read_direct(void) { vs.a; }\n\
+               void read_arrow(void) { vp->a; }\n\
+               void read_element(void) { vsa[2].a; }\n\
+               void read_nested(void) { vn.in.a; }\n\
+               void read_typedef(void) { vt.a; }\n\
+               void write_direct(void) { vs.a = 1; }\n\
+               void read_plain(void) { plain.a; }\n\
+               void read_plain_arrow(void) { pp->a; }\n";
+    let module = linearize_source(src, &target);
+
+    let accesses = |name: &str| -> Vec<(Opcode, bool)> {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("function {name}"))
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
+            .map(|i| (i.op, i.is_volatile_access()))
+            .collect()
+    };
+
+    // Every spelling of "the object is volatile": directly, through a pointer
+    // to volatile, through an array's element type, through a nested member
+    // whose own type is qualified by the object above it, and through a
+    // typedef that carries the qualifier.
+    assert_eq!(accesses("read_direct"), vec![(Opcode::Load, true)]);
+    assert_eq!(accesses("read_element"), vec![(Opcode::Load, true)]);
+    assert_eq!(accesses("read_nested"), vec![(Opcode::Load, true)]);
+    assert_eq!(accesses("read_typedef"), vec![(Opcode::Load, true)]);
+    assert_eq!(accesses("write_direct"), vec![(Opcode::Store, true)]);
+    // `volatile struct S *vp` qualifies the pointee, so reading `vp` itself is
+    // an ordinary load and the access through it is the volatile one.
+    assert_eq!(
+        accesses("read_arrow"),
+        vec![(Opcode::Load, false), (Opcode::Load, true)]
+    );
+
+    // The control: an unqualified object's member is not marked, or the marker
+    // would mean nothing.
+    assert_eq!(accesses("read_plain"), vec![(Opcode::Load, false)]);
+    assert_eq!(
+        accesses("read_plain_arrow"),
+        vec![(Opcode::Load, false), (Opcode::Load, false)]
+    );
+}
+
+/// A `volatile` bit-field access is marked although the access is of the
+/// carrier.
+///
+/// `emit_bitfield_load`/`_store` read and write a storage unit whose type is
+/// an unqualified integer, so no marker can be derived from the instruction's
+/// own type. `mark_volatile_access` preserves one the emitter sets, and this is
+/// the case it exists for.
+#[test]
+fn test_a_volatile_bitfield_access_carries_the_marker() {
+    let target = Target::host();
+    let src = "struct B { volatile unsigned f : 3; unsigned g : 5; };\n\
+               struct B b;\n\
+               volatile struct B vb;\n\
+               void read_field(void) { b.f; }\n\
+               void read_object(void) { vb.g; }\n\
+               void write_object(void) { vb.g = 1; }\n\
+               void read_plain(void) { b.g; }\n\
+               void write_plain(void) { b.g = 1; }\n";
+    let module = linearize_source(src, &target);
+
+    let accesses = |name: &str| -> Vec<(Opcode, bool)> {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("function {name}"))
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
+            .map(|i| (i.op, i.is_volatile_access()))
+            .collect()
+    };
+
+    // Both spellings: the field declared `volatile`, and an ordinary field of
+    // a `volatile` object.
+    assert_eq!(accesses("read_field"), vec![(Opcode::Load, true)]);
+    assert_eq!(accesses("read_object"), vec![(Opcode::Load, true)]);
+    // A bit-field store is a read-modify-write of the carrier, and both halves
+    // of it are observable.
+    assert_eq!(
+        accesses("write_object"),
+        vec![(Opcode::Load, true), (Opcode::Store, true)]
+    );
+
+    // The controls.
+    assert_eq!(accesses("read_plain"), vec![(Opcode::Load, false)]);
+    assert_eq!(
+        accesses("write_plain"),
+        vec![(Opcode::Load, false), (Opcode::Store, false)]
+    );
+}
+
+/// A conditional may not speculate a `volatile` member, in either spelling.
+///
+/// `Select` is the branchless form, and reaching it means both arms were
+/// evaluated. C17 6.5.15p4 evaluates only one of them, and 5.1.2.3 makes each
+/// volatile read an observable event -- so the arms may only collapse when
+/// both are pure. `is_pure_expr` asked whether the *base* was pure, which a
+/// named object always is.
+#[test]
+fn test_a_volatile_member_is_not_speculated() {
+    let target = Target::host();
+    let src = "struct V { volatile unsigned status; unsigned other; };\n\
+               struct P { unsigned one; unsigned other; };\n\
+               struct V v;\n\
+               volatile struct P vp;\n\
+               struct P p;\n\
+               unsigned member_is_volatile(int c) { return c ? v.status : v.other; }\n\
+               unsigned object_is_volatile(int c) { return c ? vp.one : vp.other; }\n\
+               unsigned all_plain(int c) { return c ? p.one : p.other; }\n";
+    let module = linearize_source(src, &target);
+
+    let selects = |name: &str| -> usize {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("function {name}"))
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| i.op == Opcode::Select)
+            .count()
+    };
+
+    assert_eq!(
+        selects("member_is_volatile"),
+        0,
+        "a volatile member may not be read on the path that did not select it"
+    );
+    assert_eq!(
+        selects("object_is_volatile"),
+        0,
+        "a member of a volatile object is volatile (C17 6.5.2.3p3)"
+    );
+    assert_eq!(
+        selects("all_plain"),
+        1,
+        "two ordinary member reads are pure and may still collapse"
+    );
+}
+
+/// A `volatile` access keeps the object it reaches in memory: promotion would
+/// rewrite the access into a register `Copy`, and the access must happen.
+///
+/// The variable need not itself be volatile. `ssa` tests
+/// `LocalVar::is_volatile`, which answers no here -- the qualifier is on the
+/// access alone.
+#[test]
+fn test_volatile_access_to_a_plain_local_blocks_promotion() {
+    let target = Target::host();
+    let src = "int f(void) { int a = 1; return *(volatile int *)&a; }\n";
+    let module = linearize_source(src, &target);
+    let mut func = module
+        .functions
+        .iter()
+        .find(|f| f.name == "f")
+        .expect("f")
+        .clone();
+
+    let volatile_loads = |func: &Function| -> usize {
+        func.blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| i.is_volatile_access())
+            .count()
+    };
+    assert_eq!(volatile_loads(&func), 1, "the cast qualifies the access");
+
+    let types = TypeTable::new(&target);
+    crate::ir::ssa::ssa_convert(&mut func, &types);
+    assert_eq!(
+        volatile_loads(&func),
+        1,
+        "SSA promotion turned a volatile access into a register copy"
+    );
+}
+
+/// A short-circuit operator with a constant left operand emits no branch.
+///
+/// `emit_logical_and`/`emit_logical_or` are *triangles*, not diamonds: only one
+/// arm block exists, the other phi predecessor is the left operand's own block,
+/// and that block's phi value is emitted before the branch. They also branch
+/// through `branch_on(Controlling, ..)`, whose `Constant` case deliberately
+/// emits a plain `Br` and elides the merge edge entirely.
+///
+/// So they must not be folded into the generic two-way/diamond builder, which
+/// takes a `PseudoId` condition and always emits a `Cbr`: `1 && g()` would
+/// regain a dead conditional branch and a second, empty arm block. This test is
+/// the guard on that -- it fails if the short-circuit lowerings are ever routed
+/// through the diamond helper.
+#[test]
+fn a_constant_short_circuit_operand_emits_no_branch() {
+    let target = Target::host();
+
+    let count_cbr = |src: &str| -> usize {
+        let module = linearize_source(src, &target);
+        let func = module
+            .functions
+            .iter()
+            .find(|f| f.name == "f")
+            .expect("function f");
+        func.blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .filter(|i| i.op == Opcode::Cbr)
+            .count()
+    };
+
+    // A constant controlling operand is decided at compile time.
+    for src in [
+        "int g(void); int f(void) { return 1 && g(); }",
+        "int g(void); int f(void) { return 0 || g(); }",
+    ] {
+        assert_eq!(
+            count_cbr(src),
+            0,
+            "a constant short-circuit operand needs no branch: {src}"
+        );
+    }
+
+    // The control: a runtime operand does branch, so the check above is not
+    // passing because nothing ever emits a Cbr.
+    for src in [
+        "int g(void); int f(int x) { return x && g(); }",
+        "int g(void); int f(int x) { return x || g(); }",
+    ] {
+        assert_eq!(
+            count_cbr(src),
+            1,
+            "a runtime short-circuit operand branches exactly once: {src}"
+        );
+    }
+}
+
+/// Every lowering that builds a two-armed conditional keeps the CFG
+/// consistent, in all three places its blocks can be built: where control
+/// reaches them, where it cannot -- before a `switch`'s first `case`, and
+/// after a `goto` -- and where an arm jumps out from under it.
+///
+/// These are the shapes that went through `self.current_bb.unwrap()` and so
+/// crashed the compiler outright on the last two. They now share
+/// `emit_diamond`, or read the block back through
+/// `current_or_unreachable_bb`, which starts a block nothing branches to; the
+/// point of auditing the CFG rather than only that lowering finished is that
+/// such a block is *removed* again by `dce::remove_unreachable_blocks`, and a
+/// mislinked edge into or out of it would outlive it.
+#[test]
+fn conditional_lowerings_keep_the_cfg_consistent() {
+    let target = Target::host();
+
+    // (tag, declarations, statement). The statement is placed reachable, then
+    // before a `switch`'s first `case`, then after a `goto`.
+    let shapes = [
+        ("ternary", "int g(void);", "y = g() ? g() : g();"),
+        ("logical_and", "int g(void);", "y = g() && g();"),
+        ("logical_or", "int g(void);", "y = g() || g();"),
+        ("elvis", "int g(void);", "y = g() ?: g();"),
+        (
+            "nested_ternary",
+            "int g(void);",
+            "y = g() ? (g() ? g() : g()) : g();",
+        ),
+        (
+            "and_in_ternary",
+            "int g(void);",
+            "y = g() ? (g() && g()) : g();",
+        ),
+        (
+            "sqrt_errno",
+            "double sqrt(double); double d;",
+            "d = sqrt(d);",
+        ),
+        (
+            "complex_ternary",
+            "int g(void); _Complex double h(void);",
+            "(void)(g() ? h() : h());",
+        ),
+        (
+            "complex_elvis",
+            "_Complex double h(void);",
+            "(void)(h() ?: h());",
+        ),
+        (
+            "complex_int_div",
+            "_Complex int ci(void);",
+            "(void)(ci() / ci());",
+        ),
+        (
+            "atomic_nand",
+            "_Atomic int a;",
+            "y = __atomic_fetch_nand(&a, 1, 5);",
+        ),
+        // An arm that jumps away leaves *that arm* without a block, which is a
+        // different read from the condition's.
+        (
+            "goto_out_of_then_arm",
+            "int g(void);",
+            "y = x ? ({ goto L; g(); }) : g();",
+        ),
+        (
+            "goto_out_of_else_arm",
+            "int g(void);",
+            "y = x ? g() : ({ goto L; g(); });",
+        ),
+    ];
+
+    for (tag, decls, stmt) in shapes {
+        let bodies = [
+            ("reachable", stmt.to_string()),
+            (
+                "before_first_case",
+                format!("switch (x) {{ {stmt} case 1: y = 1; }}"),
+            ),
+            ("after_goto", format!("goto L; {stmt}")),
+        ];
+
+        for (where_, body) in bodies {
+            let src = format!("{decls}\nint f(int x) {{ int y = 0; {body} L: return y; }}\n");
+            let module = linearize_source(&src, &target);
+            let func = module
+                .functions
+                .iter()
+                .find(|f| f.name == "f")
+                .expect("function f");
+            assert!(
+                cfg_inconsistency(func).is_none(),
+                "{tag} / {where_}: {}\nsource: {src}",
+                cfg_inconsistency(func).unwrap()
+            );
+        }
+    }
+}
+
+// VLA scope exit
+
+/// Every `stacksave` a function emits is matched by a `stackrestore` on each
+/// path that leaves the scope it opened.
+///
+/// A VLA's storage is released by restoring the stack pointer the scope saved,
+/// so the two have to balance -- and on *every* exit, which for an `asm goto`
+/// means one per edge. The declaration scope and the VLA scope are tracked
+/// separately, and the second was opened at only three of the places that open
+/// the first, so a VLA declared in a `for`-init clause or a statement
+/// expression was never released.
+///
+/// The consequence is currently masked: c17 always keeps a frame pointer
+/// (`-fomit-frame-pointer` is accepted and ignored) and the backend resets
+/// `%rsp` from it, so no program leaks stack today. That masking is a frame
+/// choice rather than a guarantee, and the imbalance also poisons the forward
+/// `goto` machinery, which reads `vla_marks.len()` as a depth -- an unclosed
+/// scope makes every later label's recorded depth too high and the restore is
+/// skipped. This is stated on the IR because that is where it is true.
+#[test]
+fn a_vla_scope_releases_the_stack_on_every_exit() {
+    let target = Target::host();
+
+    let counts = |src: &str| -> (usize, usize) {
+        let module = linearize_source(src, &target);
+        let func = module
+            .functions
+            .iter()
+            .find(|f| f.name == "f")
+            .expect("function f");
+        let n = |op| {
+            func.blocks
+                .iter()
+                .flat_map(|b| b.insns.iter())
+                .filter(|i| i.op == op)
+                .count()
+        };
+        (n(Opcode::StackSave), n(Opcode::StackRestore))
+    };
+
+    // (tag, source, expected saves, expected restores)
+    let cases: &[(&str, &str, usize, usize)] = &[
+        // The control: a plain block already balances.
+        (
+            "block",
+            "void s(int*); int f(int n){ for(int k=0;k<3;k++){ int a[n]; a[0]=k; s(a); } return 0; }",
+            1,
+            1,
+        ),
+        // A `for`-init clause is a declaration scope like any other.
+        (
+            "for_init",
+            "void s(int*); int f(int n){ for(int k=0;k<3;k++) for(int a[n];0;){ s(a); } return 0; }",
+            1,
+            1,
+        ),
+        // The switch-body walker carries a second copy of the `for` lowering.
+        (
+            "for_init_in_switch",
+            "void s(int*); int f(int n,int x){ switch(x){ case 1: \
+             for(int k=0;k<3;k++) for(int a[n];0;){ s(a); } return 0; } return 1; }",
+            1,
+            1,
+        ),
+        // A statement expression is a sixth scope entry.
+        (
+            "stmt_expr",
+            "void s(int*); int f(int n){ for(int k=0;k<3;k++) \
+             (void)({ int a[n]; a[0]=k; s(a); 0; }); return 0; }",
+            1,
+            1,
+        ),
+        // Leaving the scope by `break` unwinds it.
+        (
+            "break_out_of_for_init",
+            "void s(int*); int f(int n){ for(int k=0;k<3;k++) \
+             for(int a[n];;){ a[0]=k; s(a); break; } return 0; }",
+            1,
+            1,
+        ),
+        // And by a forward `goto`, which is also what the depth bookkeeping
+        // needs to stay right for every label after it.
+        (
+            "goto_out_of_for_init",
+            "void s(int*); int f(int n){ for(int k=0;k<3;k++) \
+             for(int a[n];;){ a[0]=k; s(a); goto L; } L: return 0; }",
+            1,
+            1,
+        ),
+        // A computed `goto` leaves a scope exactly as a plain one does.
+        (
+            "computed_goto",
+            "void s(int*); int f(int n){ void*p=&&L; for(int k=0;k<3;k++){ int a[n]; \
+             a[0]=k; s(a); goto *p; } L: return 0; }",
+            1,
+            1,
+        ),
+        // `asm goto` has two exits, so it needs a restore on each: the
+        // fall-through and the label edge. One restore here means the jump
+        // leaves the scope without releasing it.
+        (
+            "asm_goto",
+            "void s(int*); int f(int n){ for(int k=0;k<3;k++){ int a[n]; a[0]=k; s(a); \
+             __asm__ goto(\"\" :::: L); } L: return 0; }",
+            1,
+            2,
+        ),
+    ];
+
+    for (tag, src, want_save, want_restore) in cases {
+        let (saves, restores) = counts(src);
+        assert_eq!(
+            (saves, restores),
+            (*want_save, *want_restore),
+            "{tag}: expected {want_save} stacksave / {want_restore} stackrestore, \
+             got {saves} / {restores}\nsource: {src}"
+        );
+    }
+}
+
+/// The counts of `stacksave`/`stackrestore` in `f`, for the VLA scope tests.
+fn vla_stack_ops(src: &str) -> (usize, usize) {
+    let target = Target::host();
+    let module = linearize_source(src, &target);
+    let func = module
+        .functions
+        .iter()
+        .find(|f| f.name == "f")
+        .expect("function f");
+    let n = |op| {
+        func.blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .filter(|i| i.op == op)
+            .count()
+    };
+    (n(Opcode::StackSave), n(Opcode::StackRestore))
+}
+
+/// Entering a declaration scope and entering a VLA scope are one operation,
+/// so nesting the first nests the second: each scope releases exactly what
+/// was allocated after it was entered, innermost first.
+#[test]
+fn nested_scopes_each_release_only_their_own_vlas() {
+    let src = "void s(int*); int f(int n){ for(int k=0;k<2;k++){ int a[n]; \
+               { int b[n]; s(b); } s(a); } return 0; }";
+    assert_eq!(
+        vla_stack_ops(src),
+        (2, 2),
+        "each of the two scopes captures and releases once"
+    );
+
+    // And in the right order: the inner scope puts the stack back to what it
+    // captured on entry, then the outer one to what *it* captured. Restoring
+    // the outer mark first would free the inner array while it is still in
+    // scope.
+    let target = Target::host();
+    let module = linearize_source(src, &target);
+    let func = module
+        .functions
+        .iter()
+        .find(|f| f.name == "f")
+        .expect("function f");
+    let mut saves = Vec::new();
+    let mut restores = Vec::new();
+    for insn in func.blocks.iter().flat_map(|b| b.insns.iter()) {
+        match insn.op {
+            Opcode::StackSave => saves.push(insn.target.expect("stacksave target")),
+            Opcode::StackRestore => restores.push(insn.src[0]),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        restores,
+        vec![saves[1], saves[0]],
+        "scopes must be released innermost first"
+    );
+}
+
+/// A VLA declared in a `for` init clause is allocated once, ahead of the
+/// loop, and its scope *encloses* the loop's exit -- so neither `break` nor
+/// `continue` may release it. `continue` especially: the storage is live on
+/// the next iteration, and freeing it there would hand the loop a dangling
+/// array. Only the loop's own scope, which ends after the exit block, puts
+/// the stack back.
+///
+/// This is what fixes the order in which [`Linearizer::push_vla_mark`] reads
+/// the break and continue depths: before the loop pushes its targets, so
+/// `unwind_vla_marks` sees the mark as taken *outside* the construct being
+/// left and leaves it alone.
+#[test]
+fn a_for_init_vla_outlives_break_and_continue() {
+    assert_eq!(
+        vla_stack_ops(
+            "void s(int*); int f(int n,int x){ for(int a[n];x;){ s(a); \
+             if(x==1) continue; if(x==2) break; } return 0; }"
+        ),
+        (1, 1),
+        "the loop's scope is the only release; break and continue land inside it"
+    );
+}
+
+/// The mirror image: a VLA declared in the loop *body* is allocated afresh
+/// every iteration, so every way out of the body has to release it -- the
+/// fall-through through the body scope's end, and the `break` that jumps
+/// past it.
+#[test]
+fn a_loop_body_vla_is_released_on_break_as_well_as_fallthrough() {
+    assert_eq!(
+        vla_stack_ops(
+            "void s(int*); int f(int n,int x){ for(;x;){ int a[n]; s(a); \
+             if(x==2) break; } return 0; }"
+        ),
+        (1, 2),
+        "one release on the break edge, one on the way out of the body"
+    );
+}
+
+/// A `switch` body is lowered by a walk of its own, and its braces are a
+/// declaration scope there too: a VLA declared directly in it is released
+/// when the switch ends, not left for the enclosing loop to accumulate.
+#[test]
+fn a_switch_body_block_is_a_scope() {
+    assert_eq!(
+        vla_stack_ops(
+            "void s(int*); int f(int n,int x){ for(int k=0;k<2;k++) \
+             switch(x){ default: { int a[n]; s(a); } } return 0; }"
+        ),
+        (1, 1),
+        "the switch body's block releases what it declared"
+    );
+}
+
+/// A backward `goto` to a label ahead of a VLA declaration leaves that
+/// declaration's scope, so it restores the stack as it stood at the label --
+/// otherwise the loop the jump makes grows the stack every time round. The
+/// label's depth is recorded per block, which is also what lets a computed
+/// `goto` ask the same question of every candidate at once.
+#[test]
+fn a_backward_goto_past_a_vla_declaration_releases_it() {
+    assert_eq!(
+        vla_stack_ops(
+            "void s(int*); int f(int n,int x){ lab: { int a[n]; s(a); \
+             if(x--) goto lab; } return 0; }"
+        ),
+        (1, 2),
+        "the jump back to `lab` puts the stack where the label found it, and \
+         the path that falls out of the block releases it too"
+    );
 }

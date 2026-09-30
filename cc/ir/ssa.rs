@@ -195,6 +195,16 @@ fn analyze_variables(func: &Function, types: &TypeTable) -> HashMap<String, VarI
             let sym = insn.src[0];
             let info = slot.as_mut().unwrap();
 
+            // A volatile access must reach memory (C17 5.1.2.3p6), and
+            // promotion rewrites it into a `Copy` between registers. The
+            // variable itself need not be volatile for this to happen:
+            // `int a; *(volatile int *)&a;` qualifies the access alone, and
+            // `LocalVar::is_volatile` -- the test above -- answers no.
+            if insn.is_volatile_access() {
+                *slot = None;
+                continue;
+            }
+
             // Promotion replaces the whole variable with one SSA value, so
             // every access has to be the whole variable. A `_Complex` local
             // is stored as two halves at offsets 0 and 8 and read back by a

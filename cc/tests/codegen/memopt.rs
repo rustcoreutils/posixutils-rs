@@ -15,7 +15,10 @@
 // if the pass forwards one byte it should not have.
 //
 
-use crate::codegen::asm_probe::{asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
+use crate::codegen::asm_probe::{
+    asm_for_with, assert_body_contains, assert_body_lacks, body_of, count_in_body, AARCH64_LINUX,
+    X86_64_LINUX,
+};
 use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_two_units, run_c17};
 
 fn at_o2(name: &str, code: &str) -> i32 {
@@ -1262,5 +1265,420 @@ fn codegen_no_composite_is_read_wider_than_itself() {
                  the object:\n{body}"
             );
         }
+    }
+}
+
+/// Reading a `volatile` object is an observable side effect, so the access
+/// survives every optimization level -- including a read whose value is
+/// discarded, which no data-flow fact keeps alive (C17 5.1.2.3).
+///
+/// The property is on the access, not on the result, so a discarded read has
+/// nothing an exit status can see. The check is on the emitted instruction,
+/// against both targets, because the rule is architecture-independent.
+#[test]
+fn memopt_a_discarded_volatile_read_is_still_performed() {
+    // The object names are deliberately unmistakable. A single letter is not a
+    // sound needle here: every x86-64 body contains `pushq`/`popq` and every
+    // aarch64 body contains `stp`/`sp`, and `.cfi_startproc` is inside the
+    // range `body_of` returns -- so searching for "p" passes against a body
+    // that was emptied, which is exactly the defect. (No empty body on either
+    // target contains a "g", which is why the other cases were sound.)
+    let cases = [
+        (
+            "assign",
+            "volatile int volobj;\nvoid probe(void) { int a = volobj; (void)a; }\n",
+            "volobj",
+        ),
+        (
+            "discard",
+            "volatile int volobj;\nvoid probe(void) { volobj; }\n",
+            "volobj",
+        ),
+        (
+            "via_ptr",
+            "volatile int *volptr;\nvoid probe(void) { *volptr; }\n",
+            "volptr",
+        ),
+        (
+            "cast_void",
+            "volatile int volobj;\nvoid probe(void) { (void)volobj; }\n",
+            "volobj",
+        ),
+    ];
+
+    for (tag, src, object) in cases {
+        for level in ["-O0", "-O1", "-O2", "-Os"] {
+            for triple in [X86_64_LINUX, AARCH64_LINUX] {
+                let asm = asm_for_with(&format!("vol_{tag}"), triple, src, &[level]);
+                assert_body_contains(
+                    &asm,
+                    "probe",
+                    object,
+                    &format!(
+                        "a volatile read is observable: `{tag}` at {level} on {triple} \
+                         must still access `{object}`"
+                    ),
+                );
+
+                // Naming the pointer is not the same as dereferencing it, and
+                // the qualifier here is on the pointee, so the load through it
+                // is the access under test.
+                if tag == "via_ptr" {
+                    let indirect = if triple == X86_64_LINUX { "(%r" } else { "[x" };
+                    assert_body_contains(
+                        &asm,
+                        "probe",
+                        indirect,
+                        &format!(
+                            "the volatile pointee is read, not just the pointer: \
+                             {level} on {triple}"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The counterpart that keeps the fix above honest: an *ordinary* discarded
+/// read is still dead code, and DCE still deletes it.
+///
+/// Without this, marking every load a root would pass the volatile test.
+#[test]
+fn memopt_a_discarded_plain_read_is_still_removed() {
+    // Object names chosen to occur in no mnemonic, register or label the
+    // body can otherwise contain -- `popq` alone contains both `p` and `pq`,
+    // and the body a negative assertion searches includes the function's own
+    // label and prologue.
+    let cases = [
+        (
+            "assign",
+            "int objx;\nvoid probe(void) { int a = objx; (void)a; }\n",
+            "objx",
+        ),
+        ("discard", "int objx;\nvoid probe(void) { objx; }\n", "objx"),
+        (
+            "via_ptr",
+            "int *ptrx;\nvoid probe(void) { *ptrx; }\n",
+            "ptrx",
+        ),
+    ];
+
+    for (tag, src, object) in cases {
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            let asm = asm_for_with(&format!("plain_{tag}"), triple, src, &["-O2"]);
+            assert_body_lacks(
+                &asm,
+                "probe",
+                object,
+                &format!(
+                    "reading a non-volatile object has no effect: `{tag}` on {triple} \
+                     must not access `{object}`"
+                ),
+            );
+        }
+    }
+}
+
+/// Each read of a `volatile` object is its own observable event, so two of
+/// them are two accesses -- neither load-forwarding nor DCE may fold the pair
+/// into one.
+#[test]
+fn memopt_two_volatile_reads_are_both_performed() {
+    // A named object only: two reads through one `volatile int *p` show up as
+    // a *single* reference to `p` -- reading the pointer itself is not
+    // volatile and is rightly done once -- so the count says nothing there.
+    // The through-pointer case is pinned at the IR level instead, by
+    // `test_volatile_accesses_carry_the_marker` and the `dce` unit tests.
+    //
+    // The name occurs in no mnemonic, register or label the body can
+    // otherwise contain: `popq` alone contains both `p` and `pq`.
+    let cases = [(
+        "named",
+        "volatile int objx;\nint sink(int, int);\n\
+         int probe(void) { int a = objx; int b = objx; return sink(a, b); }\n",
+        "objx",
+    )];
+
+    for (tag, src, object) in cases {
+        for level in ["-O1", "-O2", "-Os"] {
+            for triple in [X86_64_LINUX, AARCH64_LINUX] {
+                let asm = asm_for_with(&format!("vol_two_reads_{tag}"), triple, src, &[level]);
+                let n = count_in_body(&asm, "probe", object);
+                assert!(
+                    n >= 2,
+                    "both volatile reads are observable: `{tag}` at {level} on {triple} \
+                     kept {n} reference(s) to `{object}`:\n{}",
+                    body_of(&asm, "probe")
+                );
+            }
+        }
+    }
+}
+
+/// An `_Atomic` read is observable for the same reason, and reaches DCE by a
+/// different route: `AtomicLoad` is a side-effecting opcode outright, so this
+/// cross-checks that the two spellings of "this read must happen" agree.
+#[test]
+fn memopt_a_discarded_atomic_read_is_still_performed() {
+    let cases = [
+        ("discard", "_Atomic int g;\nvoid probe(void) { g; }\n", "g"),
+        (
+            "assign",
+            "_Atomic int g;\nvoid probe(void) { int a = g; (void)a; }\n",
+            "g",
+        ),
+    ];
+
+    for (tag, src, object) in cases {
+        for level in ["-O0", "-O2"] {
+            for triple in [X86_64_LINUX, AARCH64_LINUX] {
+                let asm = asm_for_with(&format!("atomic_{tag}"), triple, src, &[level]);
+                assert_body_contains(
+                    &asm,
+                    "probe",
+                    object,
+                    &format!(
+                        "an atomic read is observable: `{tag}` at {level} on {triple} \
+                         must still access `{object}`"
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// A `volatile` read inside a loop happens once per iteration: the value is
+/// not a loop invariant, whatever the compiler can see written to the object.
+///
+/// Nothing in c17 hoists memory out of a loop today (see the ordering contract
+/// in `cc/ir/dce.rs`), so this passes by construction -- it exists to fail the
+/// day something does, because the exit status is where that would show up.
+#[test]
+fn memopt_a_volatile_read_in_a_loop_is_repeated() {
+    // `g` changes between iterations through a pointer the loop writes, so a
+    // read hoisted to the top would sum 7 three times instead of 7 + 10 + 11.
+    let code = r#"
+volatile int g;
+static int *alias(void) { return (int *)&g; }
+int main(void) {
+    int sum = 0;
+    *alias() = 7;
+    for (int i = 0; i < 3; i++) {
+        sum += g;
+        *alias() = 10 + i;
+    }
+    return sum == 28 ? 0 : 1;
+}
+"#;
+    assert_eq!(at_o2("memopt_volatile_in_loop", code), 0);
+    if let Some(rc) = compile_and_run_aarch64("memopt_volatile_in_loop_a64", code, "-O2") {
+        assert_eq!(rc, 0, "aarch64 at -O2");
+    }
+}
+
+/// A `volatile` store is observable for the same reason, and DSE must not drop
+/// the earlier of two writes to one.
+///
+/// The companion to the read case above: a test that only checked loads would
+/// pass against an `has_side_effects` that named `Store` and not `Load`.
+#[test]
+fn memopt_two_volatile_stores_are_both_performed() {
+    let src = "volatile int g;\nvoid probe(void) { g = 1; g = 2; }\n";
+    for level in ["-O1", "-O2", "-Os"] {
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            let asm = asm_for_with("vol_two_stores", triple, src, &[level]);
+            let n = count_in_body(&asm, "probe", "g");
+            assert!(
+                n >= 2,
+                "both volatile stores are observable: {level} on {triple} kept {n} \
+                 reference(s) to `g`:\n{}",
+                body_of(&asm, "probe")
+            );
+        }
+    }
+}
+
+/// A member of a `volatile` object is itself volatile, so reading it is an
+/// observable event that survives every optimization level.
+///
+/// C17 6.5.2.3p3/p4: the result of `s.m` has the *so-qualified* version of the
+/// member's type — it inherits the qualifiers of the object. c17 took the
+/// member's declared type unchanged, so a member of a `volatile` struct read as
+/// an ordinary `int` and DCE deleted it from `-O1` up. The reverse direction
+/// (`struct T { volatile int a; }`) always worked, because there the member's
+/// own type carries the qualifier; that case is the control below.
+#[test]
+fn memopt_a_member_of_a_volatile_object_is_volatile() {
+    // Distinctive names: a single letter matches `pushq`/`stp`/`.cfi_startproc`
+    // inside the body range and would pass against an emptied function.
+    let src = "\
+struct S { int a; int b; };
+volatile struct S vqobj;
+volatile struct S *vqptr;
+void probe_direct(void) { vqobj.a; }
+void probe_arrow(void) { vqptr->a; }
+void probe_assign(void) { int t = vqobj.a; (void)t; }
+void probe_second(void) { vqobj.b; }
+";
+    for level in ["-O0", "-O1", "-O2", "-Os"] {
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            let asm = asm_for_with("vol_member", triple, src, &[level]);
+            for (func, object) in [
+                ("probe_direct", "vqobj"),
+                ("probe_arrow", "vqptr"),
+                ("probe_assign", "vqobj"),
+                ("probe_second", "vqobj"),
+            ] {
+                assert_body_contains(
+                    &asm,
+                    func,
+                    object,
+                    &format!(
+                        "a member of a volatile object is volatile (C17 6.5.2.3p3): \
+                         {func} at {level} on {triple} must still access `{object}`"
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// The control for the test above: an ordinary aggregate's member read is still
+/// deleted, so that test cannot pass by marking every member access volatile.
+#[test]
+fn memopt_a_member_of_a_plain_object_is_still_removed() {
+    let src = "\
+struct S { int a; };
+struct S pqobj;
+void probe(void) { pqobj.a; }
+";
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("plain_member", triple, src, &["-O2"]);
+        assert_body_lacks(
+            &asm,
+            "probe",
+            "pqobj",
+            "reading an ordinary member has no effect and is dead code",
+        );
+    }
+}
+
+/// A `volatile` member is not speculatable, so a conditional must not read the
+/// arm it did not take.
+///
+/// C17 6.5.15p4 evaluates only one of the second and third operands, and
+/// 5.1.2.3 makes each volatile read an observable event. `is_pure_expr`'s
+/// `Member` arm asked only whether the *base* was pure, so the read was
+/// hoisted and both members were loaded unconditionally into a branchless
+/// select — at `-O0` too.
+#[test]
+fn memopt_a_volatile_member_is_not_speculated_by_a_conditional() {
+    let src = "\
+struct S { volatile unsigned status; unsigned other; };
+struct S sqobj;
+unsigned probe(int c) { return c ? sqobj.status : sqobj.other; }
+";
+    for level in ["-O0", "-O2"] {
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            let asm = asm_for_with("vol_member_select", triple, src, &[level]);
+            let select = if triple == X86_64_LINUX {
+                "cmov"
+            } else {
+                "csel"
+            };
+            assert_body_lacks(
+                &asm,
+                "probe",
+                select,
+                &format!(
+                    "a volatile member read cannot be speculated, so the arms may not \
+                     collapse into a conditional move: {level} on {triple}"
+                ),
+            );
+        }
+    }
+}
+
+/// The control for the test above: with no volatile member, the branchless
+/// select is still allowed, so that test is asserting the qualifier and not
+/// merely that c17 stopped emitting conditional moves.
+#[test]
+fn memopt_a_plain_member_may_still_be_speculated() {
+    let src = "\
+struct S { unsigned one; unsigned other; };
+struct S pqsel;
+unsigned probe(int c) { return c ? pqsel.one : pqsel.other; }
+";
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("plain_member_select", triple, src, &["-O2"]);
+        let select = if triple == X86_64_LINUX {
+            "cmov"
+        } else {
+            "csel"
+        };
+        assert_body_contains(
+            &asm,
+            "probe",
+            select,
+            "two ordinary member reads are pure and may still collapse to a select",
+        );
+    }
+}
+
+/// A `volatile` bit-field read is observable, even though the access is of the
+/// carrier and the carrier can never carry the qualifier.
+///
+/// The bit-field emitters build their load and store at
+/// `bitfield_storage_type`, which is the unqualified storage unit, so nothing
+/// derived the marker from the access type. `mark_volatile_access` anticipates
+/// exactly this ("a bit-field reads a storage unit whose type is the carrier")
+/// and preserves a marker the site sets itself — neither emitter set one, and
+/// the read was deleted outright from `-O1` up. Both spellings are covered: the
+/// field declared `volatile`, and an ordinary field of a `volatile` object.
+#[test]
+fn memopt_a_volatile_bitfield_read_is_performed() {
+    let src = "\
+struct B { volatile unsigned f : 3; unsigned g : 5; };
+struct B bfqobj;
+volatile struct B vbfqobj;
+void probe_field(void) { bfqobj.f; }
+void probe_object(void) { vbfqobj.g; }
+";
+    for level in ["-O0", "-O1", "-O2", "-Os"] {
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            let asm = asm_for_with("vol_bitfield", triple, src, &[level]);
+            for (func, object) in [("probe_field", "bfqobj"), ("probe_object", "vbfqobj")] {
+                assert_body_contains(
+                    &asm,
+                    func,
+                    object,
+                    &format!(
+                        "a volatile bit-field read is observable: {func} at {level} \
+                         on {triple} must still access `{object}`"
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// The control: an ordinary bit-field read is still dead code, so the test
+/// above cannot pass by marking every bit-field access volatile.
+#[test]
+fn memopt_a_plain_bitfield_read_is_still_removed() {
+    let src = "\
+struct B { unsigned f : 3; };
+struct B pbfqobj;
+void probe(void) { pbfqobj.f; }
+";
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("plain_bitfield", triple, src, &["-O2"]);
+        assert_body_lacks(
+            &asm,
+            "probe",
+            "pbfqobj",
+            "reading an ordinary bit-field has no effect and is dead code",
+        );
     }
 }

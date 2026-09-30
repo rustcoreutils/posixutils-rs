@@ -11,25 +11,18 @@
 
 #![recursion_limit = "512"]
 
-mod abi;
-mod arch;
-mod builtin_headers;
-mod builtins;
-mod constexpr;
-mod diag;
-mod float;
-mod ir;
-mod kw;
-mod linkargs;
-mod opt;
-mod os;
-mod parse;
-mod rtlib;
-mod strings;
-mod symbol;
-mod target;
-mod token;
-mod types;
+use posixutils_cc::arch;
+use posixutils_cc::builtins;
+use posixutils_cc::diag;
+use posixutils_cc::ir;
+use posixutils_cc::linkargs;
+use posixutils_cc::opt;
+use posixutils_cc::parse;
+use posixutils_cc::strings;
+use posixutils_cc::symbol;
+use posixutils_cc::target;
+use posixutils_cc::token;
+use posixutils_cc::types;
 
 use clap::Parser;
 use gettextrs::{gettext, gettext_args};

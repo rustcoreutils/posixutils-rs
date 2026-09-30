@@ -9,6 +9,7 @@
 // x86-64 Feature Code Generation (Variadic Functions, Byte Swapping, Bit Counting)
 //
 
+use super::call::{BlockDst, UNROLL_LIMIT_BYTES};
 use super::codegen::X86_64CodeGen;
 use super::lir::{popcount_sequence, GpOperand, MemAddr, ShiftCount, X86Inst};
 use super::regalloc::{Loc, Reg};
@@ -530,12 +531,20 @@ impl X86_64CodeGen {
         })
     }
 
-    /// Copy `nbytes` from `[src_base + src_off]` to `dst` at `dst_off`, in
-    /// descending power-of-two chunks so nothing past the object is written.
+    /// Copy `nbytes` from `[src_base + src_off]` to `dst` at `dst_off`, in the
+    /// descending power-of-two chunks `block_chunks` gives, so nothing past the
+    /// object is written.
     ///
     /// `%rcx` is the shuttle: it is declared clobbered by `VaArg`, so no live
     /// value is in it, and unlike `%r11` it cannot be `ap_base` (the va_list
     /// pointer lands there when it comes from a stack slot).
+    ///
+    /// Past [`UNROLL_LIMIT_BYTES`] the whole eightbytes go through `rep movsq`
+    /// and only the ragged tail is unrolled. Without a bound this was linear in
+    /// the aggregate -- 4 KB cost about 1100 instructions and 256 KB would be
+    /// the compile-time explosion the IR's own limit exists to prevent -- and
+    /// `va_arg` is the one place a whole aggregate is copied where the size is
+    /// the program's to choose.
     fn va_copy_bytes(
         &mut self,
         src_base: Reg,
@@ -561,13 +570,32 @@ impl X86_64CodeGen {
             });
             return;
         }
-        let mut done = 0;
-        while done < nbytes {
-            let chunk = [8, 4, 2, 1]
-                .into_iter()
-                .find(|c| *c <= nbytes - done)
-                .unwrap_or(1);
-            let size = OperandSize::from_bits(chunk as u32 * 8);
+        let mut at = 0;
+        if i64::from(nbytes) > UNROLL_LIMIT_BYTES {
+            let qwords = i64::from(nbytes) / 8;
+            // Neither base is `%rsp`, so the helper's pushes leave both where
+            // they are; a frame slot is not `%rsp`-relative either.
+            let to = match dst {
+                VaAggDst::Slot(slot) => BlockDst::At(self.stack_field(slot, dst_off)),
+                VaAggDst::Addr(base) => BlockDst::At(MemAddr::BaseOffset {
+                    base,
+                    offset: dst_off,
+                }),
+                VaAggDst::Value(_) => unreachable!("a register destination returned above"),
+            };
+            self.emit_rep_movsq(
+                MemAddr::BaseOffset {
+                    base: src_base,
+                    offset: src_off,
+                },
+                to,
+                qwords,
+            );
+            at = (qwords * 8) as i32;
+        }
+        for (off, chunk) in crate::ir::memexpand::block_chunks(i64::from(nbytes - at)) {
+            let size = OperandSize::from_bits(chunk.bits());
+            let done = at + off as i32;
             self.push_lir(X86Inst::Mov {
                 size,
                 src: GpOperand::Mem(MemAddr::BaseOffset {
@@ -589,7 +617,6 @@ impl X86_64CodeGen {
                 src: GpOperand::Reg(Reg::Rcx),
                 dst: into,
             });
-            done += chunk;
         }
     }
 

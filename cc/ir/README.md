@@ -111,9 +111,25 @@ SSA-form intermediate representation for the c17 C17 compiler. Inspired by Linus
 | `symaddr` | Get address of symbol |
 
 For `load` and `store`, `offset` is a **byte** displacement and `size` is the
-access width in **bits**. Neither carries a volatile or atomic marker:
-volatility lives on the `LocalVar` or the `GlobalDef`, and an atomic access
-has its own opcode.
+access width in **bits**. An atomic access has its own opcode.
+
+Both carry a **volatile marker**, `Instruction::is_volatile`, printed as a
+trailing `volatile` in a dump. Ask it through `Instruction::is_volatile_access`.
+The qualifier has to live on the *access* because it is not always on any
+object: for `volatile int *p`, `p` is an ordinary pointer and `*p` is the
+volatile object, so `LocalVar::is_volatile` and
+`memloc::GlobalFacts::is_volatile` — which answer only for a named object —
+have nothing to say about it. Those two remain, and are still what a pass asks
+about the object as a whole; the marker is what it asks about the access.
+
+`Linearizer::emit` sets the marker for every access the linearizer emits, from
+`types.contains_volatile` of the type that access reaches, and
+`ir::build::Builder` does the same for the accesses a pass synthesizes. Reading
+a volatile object is observable behaviour (C17 5.1.2.3p6), so a marked access
+survives every optimization level: `dce::is_root` treats it as a root,
+`loadfwd` will not forward one or fold two into one, `dse` will not delete one,
+`constglobal` will not answer one from an initializer, and `ssa` will not
+promote the object it reaches out of memory.
 
 ### SSA Operations
 

@@ -16,7 +16,7 @@ use crate::diag::{error, Position};
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, FpCompare, LibFn, MathErrno, UnaryOp};
 use crate::strings::StringId;
-use crate::types::{MemberInfo, TypeId, TypeKind};
+use crate::types::{MemberInfo, TypeId, TypeKind, TypeTable};
 
 /// A read-modify-write target whose address has been computed **once**.
 ///
@@ -36,6 +36,141 @@ pub(crate) struct RmwPlace {
     /// spelled to match `emit_bitfield_load`/`_store`, which are the only
     /// consumers.
     bitfield: Option<(usize, u32, u32, u32, TypeId)>,
+}
+
+/// Everything `E1 op= E2` needs beyond the two operand *values*: the operator
+/// and the types the arithmetic is decided by.
+///
+/// C17 6.5.16.2p3 makes `E1 op= E2` mean `E1 = E1 op E2` bar evaluating `E1`
+/// twice. So the arithmetic runs at the type the usual arithmetic conversions
+/// give the two operands -- `target_typ` and `value_typ` -- and only the
+/// *result* converts back to `target_typ`. Narrowing the right operand to the
+/// target first is a different computation: `_Atomic unsigned char c = 50;
+/// c /= -5;` becomes `50 / 251` and stores 0 where the standard stores
+/// `(unsigned char)(50 / -5)`, 246.
+///
+/// This exists because the ordinary and the `_Atomic` lowerings each had their
+/// own copy of these rules and the copies disagreed. Both now build one of
+/// these and hand it to [`Linearizer::compound_assign_value`].
+#[derive(Clone, Copy)]
+pub(crate) struct CompoundAssign {
+    /// The operator.
+    pub(crate) op: AssignOp,
+    /// `E1`'s type: what the left operand is read at and what the result
+    /// converts back to.
+    pub(crate) target_typ: TypeId,
+    /// `E2`'s type **as written**, before any conversion. For pointer
+    /// arithmetic it is the type of the already-scaled addend.
+    pub(crate) value_typ: TypeId,
+    /// `p += n`: the right operand arrives already scaled by the pointee size,
+    /// the addition happens at pointer width, and the result is a pointer
+    /// already -- so neither operand nor result is converted.
+    pub(crate) is_ptr_arith: bool,
+    /// Complement the arithmetic result *before* it converts back to
+    /// `target_typ`. This is `nand`, which has no operator spelling of its
+    /// own: `__atomic_fetch_nand` stores `~(old & value)`, and on a `_Bool`
+    /// object that complement has to happen before the conversion to 0 or 1,
+    /// not after it.
+    pub(crate) invert: bool,
+}
+
+impl CompoundAssign {
+    /// `E1 op= E2` with both operand types as written.
+    pub(crate) fn new(op: AssignOp, target_typ: TypeId, value_typ: TypeId) -> Self {
+        Self {
+            op,
+            target_typ,
+            value_typ,
+            is_ptr_arith: false,
+            invert: false,
+        }
+    }
+}
+
+/// The type the arithmetic of `ca` is performed at.
+///
+/// The usual arithmetic conversions (C17 6.3.1.8) on the two operands, with
+/// two exceptions:
+///
+/// * The shifts. C17 6.5.7p3 promotes each operand *separately* and gives the
+///   result the promoted **left** operand's type, so the right operand has no
+///   say: `_Atomic signed char s = -8; s >>= 1;` shifts -8 as an `int` and
+///   stores -4, where computing at the target's width would shift the byte
+///   pattern and store 124.
+/// * Pointer arithmetic, whose addend the caller has already scaled to a
+///   byte count; the addition happens at pointer width.
+pub(crate) fn compound_assign_arith_type(types: &TypeTable, ca: &CompoundAssign) -> TypeId {
+    if ca.is_ptr_arith {
+        types.long_id
+    } else if matches!(ca.op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
+        types.integer_promote(ca.target_typ)
+    } else {
+        types.common_type(ca.target_typ, ca.value_typ)
+    }
+}
+
+/// The arithmetic opcode a compound assignment operator applies at `typ`.
+///
+/// `typ` is the type the operation is *performed* at -- the answer of
+/// [`compound_assign_arith_type`] -- because that is what decides between the
+/// integer and floating forms and between the signed and unsigned ones. Asking
+/// the target's type instead makes `unsigned char x; x /= -5;` an unsigned
+/// divide of a value the standard computes as a signed `int`.
+pub(crate) fn compound_assign_opcode(types: &TypeTable, op: AssignOp, typ: TypeId) -> Opcode {
+    let is_float = types.is_float(typ);
+    let is_unsigned = types.is_unsigned(typ);
+    match op {
+        AssignOp::Assign => unreachable!("plain assignment has no arithmetic opcode"),
+        AssignOp::AddAssign => {
+            if is_float {
+                Opcode::FAdd
+            } else {
+                Opcode::Add
+            }
+        }
+        AssignOp::SubAssign => {
+            if is_float {
+                Opcode::FSub
+            } else {
+                Opcode::Sub
+            }
+        }
+        AssignOp::MulAssign => {
+            if is_float {
+                Opcode::FMul
+            } else {
+                Opcode::Mul
+            }
+        }
+        AssignOp::DivAssign => {
+            if is_float {
+                Opcode::FDiv
+            } else if is_unsigned {
+                Opcode::DivU
+            } else {
+                Opcode::DivS
+            }
+        }
+        // Modulo not supported for floats.
+        AssignOp::ModAssign => {
+            if is_unsigned {
+                Opcode::ModU
+            } else {
+                Opcode::ModS
+            }
+        }
+        AssignOp::AndAssign => Opcode::And,
+        AssignOp::OrAssign => Opcode::Or,
+        AssignOp::XorAssign => Opcode::Xor,
+        AssignOp::ShlAssign => Opcode::Shl,
+        AssignOp::ShrAssign => {
+            if is_unsigned {
+                Opcode::Lsr
+            } else {
+                Opcode::Asr
+            }
+        }
+    }
 }
 
 /// The per-half opcodes a complex operation uses, chosen once from the base
@@ -190,66 +325,47 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Emit stores to zero-initialize an aggregate (struct, union, or array)
-    /// This handles C99 6.7.8p19: uninitialized members must be zero-initialized
+    /// Zero a whole aggregate (struct, union or array), which is what C17
+    /// 6.7.9p19 asks for before an initializer list is applied: every member
+    /// the list does not reach is initialized as a static object would be.
     pub(crate) fn emit_aggregate_zero(&mut self, base_sym: PseudoId, typ: TypeId) {
-        let total_bytes = self.types.size_bytes(typ);
-        let mut offset: i64 = 0;
+        let total_bytes = self.types.size_bytes(typ) as i64;
+        self.emit_block_zero(base_sym, 0, total_bytes);
+    }
 
-        // Create a zero constant for 64-bit stores
-        let zero64 = self.emit_const(0, self.types.long_id);
-
-        // Zero in 8-byte chunks
-        while offset + 8 <= total_bytes as i64 {
-            self.emit(Instruction::store(
-                zero64,
-                base_sym,
-                offset,
-                self.types.long_id,
-                64,
-            ));
-            offset += 8;
+    /// Emit a fill of `size_bytes` zero bytes at `dst` + `dst_base_offset`.
+    ///
+    /// One `Opcode::Memset`, which `memexpand` turns into stores when the run
+    /// is short and leaves as a call when it is not. So the bound on the
+    /// unroll is `memexpand::INLINE_LIMIT_BYTES` -- the one every block memory
+    /// operation in the compiler shares -- rather than another copy of the
+    /// 8/4/2/1 descent with a cap of its own, which is what this was: a
+    /// hand-rolled ladder with **no** upper bound at all, so
+    /// `char buf[N] = {0}` emitted one store per chunk for any N. 8 KB cost
+    /// 2081 instructions in the function body and 1 MB did not finish
+    /// compiling in 25 minutes, while its sibling
+    /// [`Self::emit_block_copy_at_offset`] had capped at the shared limit all
+    /// along.
+    ///
+    /// `memexpand::run` runs at every optimization level, `-O0` included, so
+    /// the expansion does not depend on optimizing -- the same reason the
+    /// opcode a program's own `memset` becomes is expanded there rather than
+    /// here.
+    pub(crate) fn emit_block_zero(&mut self, dst: PseudoId, dst_base_offset: i64, size_bytes: i64) {
+        if size_bytes <= 0 {
+            return;
         }
-
-        // Handle remaining bytes (if any)
-        if offset < total_bytes as i64 {
-            let remaining = total_bytes as i64 - offset;
-            if remaining >= 4 {
-                let zero32 = self.emit_const(0, self.types.int_id);
-                self.emit(Instruction::store(
-                    zero32,
-                    base_sym,
-                    offset,
-                    self.types.int_id,
-                    32,
-                ));
-                offset += 4;
-            }
-            if offset < total_bytes as i64 {
-                let remaining = total_bytes as i64 - offset;
-                if remaining >= 2 {
-                    let zero16 = self.emit_const(0, self.types.short_id);
-                    self.emit(Instruction::store(
-                        zero16,
-                        base_sym,
-                        offset,
-                        self.types.short_id,
-                        16,
-                    ));
-                    offset += 2;
-                }
-                if offset < total_bytes as i64 {
-                    let zero8 = self.emit_const(0, self.types.char_id);
-                    self.emit(Instruction::store(
-                        zero8,
-                        base_sym,
-                        offset,
-                        self.types.char_id,
-                        8,
-                    ));
-                }
-            }
-        }
+        let dst_ptr = self.block_dest_addr(dst, dst_base_offset);
+        let byte = self.emit_const(0, self.types.int_id);
+        let n = self.emit_const(size_bytes as i128, self.types.ulong_id);
+        let result = self.alloc_pseudo();
+        self.emit(
+            Instruction::new(Opcode::Memset)
+                .with_func(self.library_function_name("memset"))
+                .with_target(result)
+                .with_src3(dst_ptr, byte, n)
+                .with_type_and_size(self.types.void_ptr_id, 64),
+        );
     }
 
     /// Emit a block copy from src to dst using integer chunks.
@@ -288,10 +404,37 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// The same copy as a `memcpy` call.
+    /// The address `dst` + `dst_base_offset` names, as a block memory
+    /// operation takes it.
     ///
-    /// `dst_base_offset` is folded into the destination pointer first, since
-    /// `memcpy` takes an address rather than a base and a displacement.
+    /// These opcodes take addresses. A `Sym` pseudo names a local's *storage*,
+    /// not a pointer to it -- a `Store` can name it directly, a call cannot.
+    /// Passing the Sym itself handed `memcpy` a meaningless value and
+    /// segfaulted every copy over the threshold. `rvalue_addr` is the existing
+    /// answer to this question and returns a non-Sym pseudo unchanged.
+    ///
+    /// `dst_base_offset` is folded into the pointer, since these take an
+    /// address rather than a base and a displacement.
+    fn block_dest_addr(&mut self, dst: PseudoId, dst_base_offset: i64) -> PseudoId {
+        let void_ptr = self.types.void_ptr_id;
+        let dst = self.rvalue_addr(dst, void_ptr);
+        if dst_base_offset == 0 {
+            return dst;
+        }
+        let off = self.emit_const(dst_base_offset as i128, self.types.long_id);
+        let adjusted = self.alloc_reg_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Add,
+            adjusted,
+            dst,
+            off,
+            void_ptr,
+            64,
+        ));
+        adjusted
+    }
+
+    /// The same copy as a `memcpy` call.
     fn emit_block_copy_call(
         &mut self,
         dst: PseudoId,
@@ -299,31 +442,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         src: PseudoId,
         size_bytes: i64,
     ) {
-        // `memcpy` takes addresses. A `Sym` pseudo names a local's *storage*,
-        // not a pointer to it -- the inline path could store through it
-        // directly, this one cannot. Passing the Sym itself handed memcpy a
-        // meaningless value and segfaulted every copy over the threshold.
-        // `rvalue_addr` is the existing answer to this question and returns a
-        // non-Sym pseudo unchanged.
-        let void_ptr = self.types.void_ptr_id;
-        let dst = self.rvalue_addr(dst, void_ptr);
-        let src = self.rvalue_addr(src, void_ptr);
-
-        let dst_ptr = if dst_base_offset == 0 {
-            dst
-        } else {
-            let off = self.emit_const(dst_base_offset as i128, self.types.long_id);
-            let adjusted = self.alloc_reg_pseudo();
-            self.emit(Instruction::binop(
-                Opcode::Add,
-                adjusted,
-                dst,
-                off,
-                self.types.void_ptr_id,
-                64,
-            ));
-            adjusted
-        };
+        let dst_ptr = self.block_dest_addr(dst, dst_base_offset);
+        let src = self.rvalue_addr(src, self.types.void_ptr_id);
         let n = self.emit_const(size_bytes as i128, self.types.ulong_id);
         let result = self.alloc_pseudo();
         self.emit(
@@ -337,6 +457,15 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// Emit code to load a bitfield value
     /// Returns the loaded value as a PseudoId
+    ///
+    /// `typ` is the field's type as the access reaches it -- the declared type
+    /// so-qualified by the object (C17 6.5.2.3p3) -- and the access itself is
+    /// of the *carrier*, whose type is an unqualified storage unit. So nothing
+    /// downstream can derive the qualifier from the instruction's own type, and
+    /// the volatile marker is set here instead;
+    /// [`Self::mark_volatile_access`] preserves a marker its caller set for
+    /// exactly this case. Without it a volatile bit-field read was deleted
+    /// outright from `-O1` up.
     pub(crate) fn emit_bitfield_load(
         &mut self,
         base: PseudoId,
@@ -370,16 +499,20 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Determine storage type based on storage unit size
         let storage_type = self.bitfield_storage_type(storage_size as usize);
         let storage_bits = storage_size * 8;
+        let volatile = self.types.contains_volatile(typ);
 
         // 1. Load the entire storage unit
         let storage_val = self.alloc_pseudo();
-        self.emit(Instruction::load(
-            storage_val,
-            base,
-            byte_offset as i64,
-            storage_type,
-            storage_bits,
-        ));
+        self.emit(
+            Instruction::load(
+                storage_val,
+                base,
+                byte_offset as i64,
+                storage_type,
+                storage_bits,
+            )
+            .with_volatile(volatile),
+        );
 
         // 2. Shift right by bit_offset (using logical shift for unsigned extraction)
         let shifted = if bit_offset > 0 {
@@ -528,6 +661,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
         let carrier_bits = if wide { 64 } else { 32 };
         let byte_type = self.types.uchar_id;
+        // Every byte of a volatile field is part of the one observable read.
+        let volatile = self.types.contains_volatile(typ);
 
         let mut acc: Option<PseudoId> = None;
         let (field_lo, field_hi) = (bit_offset, bit_offset + bit_width);
@@ -542,13 +677,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                 continue;
             }
             let byte = self.alloc_pseudo();
-            self.emit(Instruction::load(
-                byte,
-                base,
-                (byte_offset + i as usize) as i64,
-                byte_type,
-                8,
-            ));
+            self.emit(
+                Instruction::load(byte, base, (byte_offset + i as usize) as i64, byte_type, 8)
+                    .with_volatile(volatile),
+            );
             // Widen before shifting, or the shift is done at eight bits and
             // drops everything it moves. `uchar` is unsigned, so this is a
             // zero-extension and the byte's own value is preserved.
@@ -662,6 +794,14 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Emit code to store a value into a bitfield
+    ///
+    /// `typ` is the field's type as the access reaches it, and is here for the
+    /// same reason as in [`Self::emit_bitfield_load`]: the read-modify-write is
+    /// performed on the *carrier*, so the instructions cannot show the
+    /// qualifier and the marker is set from the field's type instead. Both
+    /// halves are marked -- the read of the storage unit is as observable as
+    /// the write of it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_bitfield_store(
         &mut self,
         base: PseudoId,
@@ -670,6 +810,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         bit_width: u32,
         storage_size: u32,
         new_value: PseudoId,
+        typ: TypeId,
     ) {
         if !matches!(storage_size, 1 | 2 | 4 | 8 | 16) {
             return self.emit_bitfield_store_bytewise(
@@ -679,22 +820,27 @@ impl<'a> super::linearize::Linearizer<'a> {
                 bit_width,
                 storage_size,
                 new_value,
+                typ,
             );
         }
 
         // Determine storage type based on storage unit size
         let storage_type = self.bitfield_storage_type(storage_size as usize);
         let storage_bits = storage_size * 8;
+        let volatile = self.types.contains_volatile(typ);
 
         // 1. Load current storage unit value
         let old_val = self.alloc_pseudo();
-        self.emit(Instruction::load(
-            old_val,
-            base,
-            byte_offset as i64,
-            storage_type,
-            storage_bits,
-        ));
+        self.emit(
+            Instruction::load(
+                old_val,
+                base,
+                byte_offset as i64,
+                storage_type,
+                storage_bits,
+            )
+            .with_volatile(volatile),
+        );
 
         // 2. Create mask for the bitfield bits: ~(((1 << width) - 1) << offset)
         //
@@ -757,13 +903,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         // 6. Store back
-        self.emit(Instruction::store(
-            combined,
-            base,
-            byte_offset as i64,
-            storage_type,
-            storage_bits,
-        ));
+        self.emit(
+            Instruction::store(
+                combined,
+                base,
+                byte_offset as i64,
+                storage_type,
+                storage_bits,
+            )
+            .with_volatile(volatile),
+        );
     }
 
     /// Write a bit-field occupying an arbitrary byte range, one byte at a time.
@@ -773,6 +922,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// bits survive. Neither ever touches a byte outside the field's own span,
     /// which is what a wide read-modify-write could not promise: the span may
     /// end at the last byte of the object.
+    #[allow(clippy::too_many_arguments)]
     fn emit_bitfield_store_bytewise(
         &mut self,
         base: PseudoId,
@@ -781,6 +931,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         bit_width: u32,
         span: u32,
         new_value: PseudoId,
+        typ: TypeId,
     ) {
         let wide = bit_offset + bit_width > 32;
         let carrier = if wide {
@@ -790,6 +941,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
         let carrier_bits = if wide { 64 } else { 32 };
         let byte_type = self.types.uchar_id;
+        let volatile = self.types.contains_volatile(typ);
 
         // The value, masked to its width once, so no byte can contribute bits
         // the field does not have.
@@ -861,7 +1013,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                 placed
             } else {
                 let old = self.alloc_pseudo();
-                self.emit(Instruction::load(old, base, addr_off, byte_type, 8));
+                self.emit(
+                    Instruction::load(old, base, addr_off, byte_type, 8).with_volatile(volatile),
+                );
                 let keep = self.emit_const((!byte_mask & 0xff) as i128, byte_type);
                 let cleared = self.alloc_pseudo();
                 self.emit(Instruction::binop(
@@ -896,7 +1050,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                 ));
                 out
             };
-            self.emit(Instruction::store(to_store, base, addr_off, byte_type, 8));
+            self.emit(
+                Instruction::store(to_store, base, addr_off, byte_type, 8).with_volatile(volatile),
+            );
         }
     }
 
@@ -1575,61 +1731,53 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
         let cond = self.emit_int_binop(cmp, abs_c, abs_d, base_typ, base_size);
 
-        let small_bb = self.alloc_bb();
-        let big_bb = self.alloc_bb();
-        let done_bb = self.alloc_bb();
-        let entry_bb = self.current_bb.expect("complex divide outside a block");
-        self.emit(Instruction::cbr(cond, small_bb, big_bb));
-        self.link_bb(entry_bb, small_bb);
-        self.link_bb(entry_bb, big_bb);
-
-        // `|c| >= |d|`: r = d/c, denom = c + d*r,
-        //               re = (a + b*r)/denom, im = (b - a*r)/denom.
-        self.switch_bb(big_bb);
-        let r = self.emit_int_binop(div, d, c, base_typ, base_size);
-        let dr = self.emit_int_binop(Opcode::Mul, d, r, base_typ, base_size);
-        let denom = self.emit_int_binop(Opcode::Add, c, dr, base_typ, base_size);
-        let br = self.emit_int_binop(Opcode::Mul, b, r, base_typ, base_size);
-        let num_re = self.emit_int_binop(Opcode::Add, a, br, base_typ, base_size);
-        let ar = self.emit_int_binop(Opcode::Mul, a, r, base_typ, base_size);
-        let num_im = self.emit_int_binop(Opcode::Sub, b, ar, base_typ, base_size);
-        self.store_complex_quotient(
-            result_addr,
-            (num_re, num_im),
-            denom,
-            div,
-            base_typ,
-            base_size,
-            base_bytes,
+        // Both arms write their halves to `result_addr`, so there is no value
+        // to merge and the void diamond serves: it builds the same blocks and
+        // edges, and reads `current_bb` back through the accessor that copes
+        // with a `goto` out of an arm.
+        self.emit_diamond_void(
+            cond,
+            // `|c| < |d|`: r = c/d, denom = d + c*r,
+            //              re = (a*r + b)/denom, im = (b*r - a)/denom.
+            |lin| {
+                let r = lin.emit_int_binop(div, c, d, base_typ, base_size);
+                let cr = lin.emit_int_binop(Opcode::Mul, c, r, base_typ, base_size);
+                let denom = lin.emit_int_binop(Opcode::Add, d, cr, base_typ, base_size);
+                let ar = lin.emit_int_binop(Opcode::Mul, a, r, base_typ, base_size);
+                let num_re = lin.emit_int_binop(Opcode::Add, ar, b, base_typ, base_size);
+                let br = lin.emit_int_binop(Opcode::Mul, b, r, base_typ, base_size);
+                let num_im = lin.emit_int_binop(Opcode::Sub, br, a, base_typ, base_size);
+                lin.store_complex_quotient(
+                    result_addr,
+                    (num_re, num_im),
+                    denom,
+                    div,
+                    base_typ,
+                    base_size,
+                    base_bytes,
+                );
+            },
+            // `|c| >= |d|`: r = d/c, denom = c + d*r,
+            //               re = (a + b*r)/denom, im = (b - a*r)/denom.
+            |lin| {
+                let r = lin.emit_int_binop(div, d, c, base_typ, base_size);
+                let dr = lin.emit_int_binop(Opcode::Mul, d, r, base_typ, base_size);
+                let denom = lin.emit_int_binop(Opcode::Add, c, dr, base_typ, base_size);
+                let br = lin.emit_int_binop(Opcode::Mul, b, r, base_typ, base_size);
+                let num_re = lin.emit_int_binop(Opcode::Add, a, br, base_typ, base_size);
+                let ar = lin.emit_int_binop(Opcode::Mul, a, r, base_typ, base_size);
+                let num_im = lin.emit_int_binop(Opcode::Sub, b, ar, base_typ, base_size);
+                lin.store_complex_quotient(
+                    result_addr,
+                    (num_re, num_im),
+                    denom,
+                    div,
+                    base_typ,
+                    base_size,
+                    base_bytes,
+                );
+            },
         );
-        let big_end = self.current_bb.expect("complex divide lost its block");
-        self.emit(Instruction::br(done_bb));
-        self.link_bb(big_end, done_bb);
-
-        // `|c| < |d|`: r = c/d, denom = d + c*r,
-        //              re = (a*r + b)/denom, im = (b*r - a)/denom.
-        self.switch_bb(small_bb);
-        let r = self.emit_int_binop(div, c, d, base_typ, base_size);
-        let cr = self.emit_int_binop(Opcode::Mul, c, r, base_typ, base_size);
-        let denom = self.emit_int_binop(Opcode::Add, d, cr, base_typ, base_size);
-        let ar = self.emit_int_binop(Opcode::Mul, a, r, base_typ, base_size);
-        let num_re = self.emit_int_binop(Opcode::Add, ar, b, base_typ, base_size);
-        let br = self.emit_int_binop(Opcode::Mul, b, r, base_typ, base_size);
-        let num_im = self.emit_int_binop(Opcode::Sub, br, a, base_typ, base_size);
-        self.store_complex_quotient(
-            result_addr,
-            (num_re, num_im),
-            denom,
-            div,
-            base_typ,
-            base_size,
-            base_bytes,
-        );
-        let small_end = self.current_bb.expect("complex divide lost its block");
-        self.emit(Instruction::br(done_bb));
-        self.link_bb(small_end, done_bb);
-
-        self.switch_bb(done_bb);
     }
 
     /// Divide both numerators by the shared denominator and store the halves.
@@ -1811,6 +1959,10 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// `cond ? taken() : fallthrough()`, each arm in a block of its own and
     /// merged by a phi of type `typ`: for arms that may not both be
     /// evaluated.
+    ///
+    /// The phi is as wide as `typ` is. A construct whose merge width is not
+    /// its type's -- a pointer-merged complex arm, a function designator,
+    /// whose `size_bits` is zero -- calls [`Self::emit_diamond`] and states it.
     fn emit_two_way(
         &mut self,
         cond: PseudoId,
@@ -1819,16 +1971,33 @@ impl<'a> super::linearize::Linearizer<'a> {
         fallthrough: impl FnOnce(&mut Self) -> PseudoId,
     ) -> PseudoId {
         let size = self.types.size_bits(typ);
-        let (taken_bb, fall_bb, merge_bb) = (self.alloc_bb(), self.alloc_bb(), self.alloc_bb());
-        let from = self.current_or_unreachable_bb();
-        self.emit(Instruction::cbr(cond, taken_bb, fall_bb));
-        self.link_bb(from, taken_bb);
-        self.link_bb(from, fall_bb);
+        self.emit_diamond(cond, typ, size, taken, fallthrough)
+    }
 
-        let arms = [
-            self.emit_arm(taken_bb, merge_bb, taken),
-            self.emit_arm(fall_bb, merge_bb, fallthrough),
-        ];
+    /// `cond ? then_arm() : else_arm()`, merged by a `size`-bit phi of type
+    /// `typ`.
+    ///
+    /// The one place a two-armed conditional's blocks and edges are built, so
+    /// the one place that has to know `current_bb` is `None` wherever control
+    /// cannot arrive -- see [`Linearizer::current_or_unreachable_bb`]. Both
+    /// the block the branch leaves and the block each arm *ends* in are read
+    /// back through that accessor: an arm is arbitrary code and may itself
+    /// `goto` away, so `x ? ({ goto L; g(); }) : g()` has no block at the end
+    /// of its true arm.
+    ///
+    /// `size` is passed rather than taken from `typ` because the two are not
+    /// always the same: a complex conditional merges *addresses*, so its phi
+    /// is pointer-wide over a pointer type, and a function designator's
+    /// `size_bits` is 0 where the merge wants a pointer's 64.
+    pub(crate) fn emit_diamond(
+        &mut self,
+        cond: PseudoId,
+        typ: TypeId,
+        size: u32,
+        then_arm: impl FnOnce(&mut Self) -> PseudoId,
+        else_arm: impl FnOnce(&mut Self) -> PseudoId,
+    ) -> PseudoId {
+        let (merge_bb, arms) = self.emit_fork(cond, then_arm, else_arm);
 
         self.switch_bb(merge_bb);
         let result = self.alloc_pseudo();
@@ -1844,14 +2013,52 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
-    /// One arm of [`Self::emit_two_way`]: `arm` evaluated in `bb`, which then
+    /// [`Self::emit_diamond`] for arms that produce no value: they write
+    /// their results where the caller can find them, so there is nothing to
+    /// merge and no phi. Leaves the cursor on the merge block.
+    pub(crate) fn emit_diamond_void(
+        &mut self,
+        cond: PseudoId,
+        then_arm: impl FnOnce(&mut Self),
+        else_arm: impl FnOnce(&mut Self),
+    ) {
+        let (merge_bb, _) = self.emit_fork(cond, then_arm, else_arm);
+        self.switch_bb(merge_bb);
+    }
+
+    /// The block plumbing both diamonds share: branch on `cond` into a block
+    /// per arm, run each arm, and join them.
+    ///
+    /// Returns the merge block -- which the caller has *not* switched to yet,
+    /// so a phi can be placed at its head -- and, per arm, the block it ended
+    /// in and whatever it produced.
+    fn emit_fork<T>(
+        &mut self,
+        cond: PseudoId,
+        then_arm: impl FnOnce(&mut Self) -> T,
+        else_arm: impl FnOnce(&mut Self) -> T,
+    ) -> (BasicBlockId, [(BasicBlockId, T); 2]) {
+        let (then_bb, else_bb, merge_bb) = (self.alloc_bb(), self.alloc_bb(), self.alloc_bb());
+        let from = self.current_or_unreachable_bb();
+        self.emit(Instruction::cbr(cond, then_bb, else_bb));
+        self.link_bb(from, then_bb);
+        self.link_bb(from, else_bb);
+
+        let arms = [
+            self.emit_arm(then_bb, merge_bb, then_arm),
+            self.emit_arm(else_bb, merge_bb, else_arm),
+        ];
+        (merge_bb, arms)
+    }
+
+    /// One arm of [`Self::emit_fork`]: `arm` evaluated in `bb`, which then
     /// branches to `merge`. Returns the block the arm ended in, and its value.
-    fn emit_arm(
+    fn emit_arm<T>(
         &mut self,
         bb: BasicBlockId,
         merge: BasicBlockId,
-        arm: impl FnOnce(&mut Self) -> PseudoId,
-    ) -> (BasicBlockId, PseudoId) {
+        arm: impl FnOnce(&mut Self) -> T,
+    ) -> (BasicBlockId, T) {
         self.switch_bb(bb);
         let value = arm(self);
         let end = self.current_or_unreachable_bb();
@@ -2328,7 +2535,13 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Get the block where LHS evaluation ended (may differ from initial block
         // if LHS contains nested control flow)
-        let lhs_end_bb = self.current_bb.unwrap();
+        //
+        // Read through the accessor, not `unwrap`: control cannot arrive at a
+        // statement before a `switch`'s first `case` or after a `goto`, and the
+        // phi below needs a real predecessor block to hold its source. See
+        // `current_or_unreachable_bb`. `branch_on` re-reads `current_bb`
+        // itself, so it sees the same block.
+        let lhs_end_bb = self.current_or_unreachable_bb();
 
         // Branch: if LHS is false, go to merge (result = 0); else evaluate RHS
         self.branch_on(left_cond, eval_b_bb, merge_bb);
@@ -2338,8 +2551,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         let right_bool = self.linearize_condition(right);
 
         // Get the actual block where RHS evaluation ended (may differ from eval_b_bb
-        // if RHS contains nested control flow like another &&/||)
-        let rhs_end_bb = self.current_bb.unwrap();
+        // if RHS contains nested control flow like another &&/||), and may be
+        // gone entirely where the RHS jumped away: `x && ({ goto L; g(); })`.
+        let rhs_end_bb = self.current_or_unreachable_bb();
 
         // Branch to merge
         self.emit(Instruction::br(merge_bb));
@@ -2391,7 +2605,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Get the block where LHS evaluation ended (may differ from initial block
         // if LHS contains nested control flow)
-        let lhs_end_bb = self.current_bb.unwrap();
+        //
+        // Through the accessor for the reason `emit_logical_and` records.
+        let lhs_end_bb = self.current_or_unreachable_bb();
 
         // Branch: if LHS is true, go to merge (result = 1); else evaluate RHS
         self.branch_on(left_cond, merge_bb, eval_b_bb);
@@ -2401,8 +2617,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         let right_bool = self.linearize_condition(right);
 
         // Get the actual block where RHS evaluation ended (may differ from eval_b_bb
-        // if RHS contains nested control flow like another &&/||)
-        let rhs_end_bb = self.current_bb.unwrap();
+        // if RHS contains nested control flow like another &&/||), and may be
+        // gone entirely where the RHS jumped away: `x || ({ goto L; g(); })`.
+        let rhs_end_bb = self.current_or_unreachable_bb();
 
         // Branch to merge
         self.emit(Instruction::br(merge_bb));
@@ -2500,8 +2717,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                 access_bytes: None,
             });
         let bitfield = match (info.bit_offset, info.bit_width, info.access_bytes) {
+            // The target expression's type, not the member's declared one:
+            // they name the same width and sign, and only the expression's
+            // carries the object's qualifiers (C17 6.5.2.3p3), which is what
+            // tells the bit-field emitters that the access is volatile.
             (Some(bit_offset), Some(bit_width), Some(storage)) => {
-                Some((info.offset, bit_offset, bit_width, storage, info.typ))
+                Some((info.offset, bit_offset, bit_width, storage, target_typ))
             }
             // Not a bit-field: fold the member offset into the base so the
             // load and the store share one address.
@@ -2559,12 +2780,89 @@ impl<'a> super::linearize::Linearizer<'a> {
         typ: TypeId,
     ) -> Option<(u32, TypeId)> {
         if let Some((offset, bit_offset, bit_width, storage, field_typ)) = place.bitfield {
-            self.emit_bitfield_store(place.base, offset, bit_offset, bit_width, storage, val);
+            self.emit_bitfield_store(
+                place.base, offset, bit_offset, bit_width, storage, val, field_typ,
+            );
             return Some((bit_width, field_typ));
         }
         let size = self.types.size_bits(typ);
         self.emit(Instruction::store(val, place.base, 0, typ, size));
         None
+    }
+
+    /// The value `E1 op= E2` stores, given `E1`'s current value and `E2`'s.
+    ///
+    /// The whole of C17 6.5.16.2p3's arithmetic lives here: choose the type to
+    /// compute at, choose the opcode for it, bring both operands to it, apply
+    /// the operator, and convert the result back to the target. Callers supply
+    /// the two values and nothing else, which is what keeps the ordinary and
+    /// the `_Atomic` lowerings computing the same thing.
+    ///
+    /// `rhs` arrives **unconverted**, at `ca.value_typ`. Converting it to the
+    /// target first is not an optimization of this: it is a different
+    /// computation, and it was the bug (see [`CompoundAssign`]).
+    ///
+    /// The value this returns is also the value of the assignment expression
+    /// (C17 6.5.16p3: the left operand's value *after* the assignment), which
+    /// is why the conversion back is part of the helper rather than of the
+    /// store: `_Atomic _Bool b = 0; (b -= 1)` has to yield the 1 it stored,
+    /// not the 255 the subtraction produced.
+    pub(crate) fn compound_assign_value(
+        &mut self,
+        ca: &CompoundAssign,
+        lhs: PseudoId,
+        rhs: PseudoId,
+    ) -> PseudoId {
+        let arith_type = compound_assign_arith_type(self.types, ca);
+        let arith_size = self.types.size_bits(arith_type);
+        let opcode = compound_assign_opcode(self.types, ca.op, arith_type);
+
+        // Both operands into the arithmetic type. The left one is the object's
+        // current value, read at the target's type; the right one is whatever
+        // it was written as.
+        let lhs = if ca.is_ptr_arith {
+            lhs
+        } else {
+            self.emit_convert(lhs, ca.target_typ, arith_type)
+        };
+        let rhs = if ca.is_ptr_arith {
+            rhs
+        } else if matches!(ca.op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
+            // The shift count is promoted on its own and is not brought to the
+            // left operand's type (C17 6.5.7p3).
+            self.emit_convert(rhs, ca.value_typ, self.types.integer_promote(ca.value_typ))
+        } else {
+            self.emit_convert(rhs, ca.value_typ, arith_type)
+        };
+
+        let result = self.alloc_reg_pseudo();
+        self.emit(Instruction::binop(
+            opcode, result, lhs, rhs, arith_type, arith_size,
+        ));
+
+        // `nand` is `and` with the result complemented, and the complement
+        // belongs on this side of the conversion below.
+        let result = if ca.invert {
+            let inverted = self.alloc_reg_pseudo();
+            self.emit(Instruction::unop(
+                Opcode::Not,
+                inverted,
+                result,
+                arith_type,
+                arith_size,
+            ));
+            inverted
+        } else {
+            result
+        };
+
+        // And the result back, which is the conversion that makes `(x /= y)`
+        // yield what `x` now holds. Pointer arithmetic is already a pointer.
+        if ca.is_ptr_arith {
+            result
+        } else {
+            self.emit_convert(result, arith_type, ca.target_typ)
+        }
     }
 
     pub(crate) fn emit_assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) -> PseudoId {
@@ -2778,8 +3076,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             ));
             scaled
         } else if bool_rhs.is_some() || op != AssignOp::Assign {
-            // A compound assignment leaves its right operand alone here. It is
-            // converted to the *common* type below, not down to the target's:
+            // A compound assignment leaves its right operand alone here. It
+            // is converted to the *common* type by `compound_assign_value`,
+            // not down to the target's:
             // narrowing `-5` to `unsigned char` first made `x /= y` divide
             // 50 by 251 and store 0, where C17 6.5.16.2p3 computes `50 / -5`
             // at `int` and stores `(unsigned char)-10`.
@@ -2808,109 +3107,14 @@ impl<'a> super::linearize::Linearizer<'a> {
                     Some(p) => self.load_rmw_place(p, target_typ),
                     None => self.linearize_expr(target),
                 };
-                let result = self.alloc_reg_pseudo();
-
-                // `E1 op= E2` is `E1 = E1 op E2` (C17 6.5.16.2p3), so the
-                // operation runs at the operands' common type after the
-                // integer promotions -- not at the target's type, which is
-                // only what the *result* converts back to.
-                //
-                // The shifts are the exception: 6.5.7p3 gives the result the
-                // promoted *left* operand's type, and promotes the right one
-                // on its own.
-                let arith_type = if is_ptr_arith {
-                    // Pointer arithmetic already scaled the index; the add
-                    // happens at pointer width.
-                    self.types.long_id
-                } else if matches!(op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
-                    self.types.integer_promote(target_typ)
-                } else {
-                    self.types.common_type(target_typ, value_typ)
+                // One helper owns the whole of C17 6.5.16.2p3's arithmetic,
+                // shared with the `_Atomic` lowering, which used to carry its
+                // own copy of these rules and disagree with this one.
+                let ca = CompoundAssign {
+                    is_ptr_arith,
+                    ..CompoundAssign::new(op, target_typ, value_typ)
                 };
-
-                let is_float = self.types.is_float(arith_type);
-                let is_unsigned = self.types.is_unsigned(arith_type);
-                let opcode = match op {
-                    AssignOp::AddAssign => {
-                        if is_float {
-                            Opcode::FAdd
-                        } else {
-                            Opcode::Add
-                        }
-                    }
-                    AssignOp::SubAssign => {
-                        if is_float {
-                            Opcode::FSub
-                        } else {
-                            Opcode::Sub
-                        }
-                    }
-                    AssignOp::MulAssign => {
-                        if is_float {
-                            Opcode::FMul
-                        } else {
-                            Opcode::Mul
-                        }
-                    }
-                    AssignOp::DivAssign => {
-                        if is_float {
-                            Opcode::FDiv
-                        } else if is_unsigned {
-                            Opcode::DivU
-                        } else {
-                            Opcode::DivS
-                        }
-                    }
-                    AssignOp::ModAssign => {
-                        // Modulo not supported for floats
-                        if is_unsigned {
-                            Opcode::ModU
-                        } else {
-                            Opcode::ModS
-                        }
-                    }
-                    AssignOp::AndAssign => Opcode::And,
-                    AssignOp::OrAssign => Opcode::Or,
-                    AssignOp::XorAssign => Opcode::Xor,
-                    AssignOp::ShlAssign => Opcode::Shl,
-                    AssignOp::ShrAssign => {
-                        if is_unsigned {
-                            Opcode::Lsr
-                        } else {
-                            Opcode::Asr
-                        }
-                    }
-                    AssignOp::Assign => unreachable!(),
-                };
-
-                let arith_size = self.types.size_bits(arith_type);
-                // Both operands into the arithmetic type. The left one is the
-                // object's current value, read at the target's type; the right
-                // one is whatever it was written as.
-                let lhs = if is_ptr_arith {
-                    lhs
-                } else {
-                    self.emit_convert(lhs, target_typ, arith_type)
-                };
-                let rhs = if is_ptr_arith {
-                    rhs
-                } else if matches!(op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
-                    // The shift count is promoted on its own and is not
-                    // brought to the left operand's type.
-                    self.emit_convert(rhs, value_typ, self.types.integer_promote(value_typ))
-                } else {
-                    self.emit_convert(rhs, value_typ, arith_type)
-                };
-                self.emit(Instruction::binop(
-                    opcode, result, lhs, rhs, arith_type, arith_size,
-                ));
-                // And the result back, which is the conversion that makes
-                // `(x /= y)` yield what `x` now holds.
-                if is_ptr_arith {
-                    result
-                } else {
-                    self.emit_convert(result, arith_type, target_typ)
-                }
+                self.compound_assign_value(&ca, lhs, rhs)
             }
         };
 

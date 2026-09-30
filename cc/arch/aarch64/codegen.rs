@@ -78,7 +78,7 @@ pub struct Aarch64CodeGen {
     /// Stack allocation size for locals (for zero_stack_frame)
     pub(super) stack_alloc_size: i32,
     /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
-    pub(super) sym_type_sizes: HashMap<PseudoId, u32>,
+    pub(super) sym_slots: HashMap<PseudoId, crate::arch::codegen::SymSlot>,
     /// Which register this function's locals are addressed through
     pub(super) frame_base: FrameBase,
 }
@@ -103,7 +103,7 @@ impl Aarch64CodeGen {
             pic_mode: false,
             unique_label_counter: 0,
             stack_alloc_size: 0,
-            sym_type_sizes: HashMap::new(),
+            sym_slots: HashMap::new(),
             frame_base: FrameBase::Fp,
         }
     }

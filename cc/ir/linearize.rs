@@ -19,10 +19,11 @@ use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{get_all_stream_names, Position};
 use crate::float::FloatVal;
 use crate::ir::linearize_atomic::AtomicLvalue;
+use crate::ir::linearize_emit::CompoundAssign;
 use crate::parse::ast::{
-    BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef, GnuAtomicOp,
-    InitElement, InlineLibraryFn, MemoryFn, NarrowedLibraryCall, OffsetOfPath, ParamStyle,
-    TranslationUnit, UnaryOp,
+    AssignOp, BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef,
+    GnuAtomicOp, InitElement, InlineLibraryFn, MemoryFn, NarrowedLibraryCall, OffsetOfPath,
+    ParamStyle, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
@@ -122,14 +123,119 @@ pub(crate) struct ResolvedDesignator {
     pub(crate) bit_offset: Option<u32>,
     pub(crate) bit_width: Option<u32>,
     pub(crate) access_bytes: Option<u32>,
+    /// The member this designator chain named in each union it passed
+    /// through. See [`UnionMembers`].
+    pub(crate) unions: UnionMembers,
+}
+
+/// Which member a union came to hold, for each union an initializer list
+/// reached.
+///
+/// C17 6.7.9p19 makes a later initializer override the earlier one for the
+/// *same* subobject, and a union has only one subobject at a time: whether
+/// `.u.p.y = 9` overrides part of what `.u = {1, 2}` wrote or replaces all of
+/// it turns on whether the union still holds `p`. Neither the byte offset nor
+/// the lowered [`Initializer`] can say -- every member of a union begins at
+/// the same byte, and `Initializer` is what the emitter consumes and has no
+/// room for a discriminant -- so the choice is recorded beside it.
+///
+/// Each entry is the byte offset of a union within the object whose
+/// initializer list produced it, that union's type, and the index of the
+/// member in question. The type is part of the key because a union declared
+/// directly inside another begins at the same byte as it does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnionMembers(Vec<(usize, TypeId, usize)>);
+
+impl UnionMembers {
+    /// Note that the union at `offset` holds `member`, replacing whatever it
+    /// was last said to hold.
+    pub(crate) fn record(&mut self, offset: usize, typ: TypeId, member: usize) {
+        match self.0.iter_mut().find(|e| (e.0, e.1) == (offset, typ)) {
+            Some(entry) => entry.2 = member,
+            None => self.0.push((offset, typ, member)),
+        }
+    }
+
+    fn member_at(&self, offset: usize, typ: TypeId) -> Option<usize> {
+        self.0
+            .iter()
+            .find(|e| (e.0, e.1) == (offset, typ))
+            .map(|e| e.2)
+    }
+
+    /// Take on everything `other` says, which is later and so decisive.
+    pub(crate) fn absorb(&mut self, other: &UnionMembers) {
+        for &(offset, typ, member) in &other.0 {
+            self.record(offset, typ, member);
+        }
+    }
+
+    /// Forget every union starting inside `range`, whose contents some later
+    /// initializer has just discarded.
+    pub(crate) fn clear_range(&mut self, range: std::ops::Range<usize>) {
+        self.0.retain(|e| !range.contains(&e.0));
+    }
+}
+
+/// What the two initializers being merged say about the unions between them,
+/// and how far into the earlier one's object the merge has descended.
+///
+/// A union is descended into only where the two agree: `held` is the member
+/// the earlier initializer gave a value to, `named` the member the later
+/// one's designator reached through, and anything else means the union comes
+/// to hold something different and everything it held goes. Both are keyed by
+/// byte offset within the object whose initializer list holds both entries,
+/// which is what `base` counts from.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct UnionFold<'a> {
+    held: Option<&'a UnionMembers>,
+    named: Option<&'a UnionMembers>,
+    base: usize,
+}
+
+impl<'a> UnionFold<'a> {
+    pub(crate) fn new(held: &'a UnionMembers, named: &'a UnionMembers, base: usize) -> Self {
+        Self {
+            held: Some(held),
+            named: Some(named),
+            base,
+        }
+    }
+
+    /// The same view, `offset` bytes further into the object.
+    pub(crate) fn inside(self, offset: usize) -> Self {
+        Self {
+            base: self.base + offset,
+            ..self
+        }
+    }
+
+    /// The member both sides agree the union of type `typ` at the current
+    /// offset holds, if they do.
+    pub(crate) fn agreed(&self, typ: TypeId) -> Option<usize> {
+        let held = self.held?.member_at(self.base, typ)?;
+        (self.named?.member_at(self.base, typ)? == held).then_some(held)
+    }
 }
 
 pub(crate) struct RawFieldInit {
     pub(crate) offset: usize,
     pub(crate) field_size: usize,
+    /// The type of the subobject this initializer names.
+    ///
+    /// Carried so that resolving two initializers that describe overlapping
+    /// storage can ask *how* they overlap: a later one naming a member of an
+    /// earlier one's struct or array replaces only that member, while one
+    /// reachable only through a union replaces the union's whole contents.
+    /// Byte spans alone cannot tell the two apart.
+    pub(crate) typ: TypeId,
     pub(crate) init: Initializer,
     pub(crate) bit_offset: Option<u32>,
     pub(crate) bit_width: Option<u32>,
+    /// The member each union inside this subobject came to hold.
+    pub(crate) held: UnionMembers,
+    /// The member each union this entry's designator passed through named.
+    pub(crate) named: UnionMembers,
 }
 
 impl RawFieldInit {
@@ -149,6 +255,35 @@ impl RawFieldInit {
             _ => self.offset..self.offset + self.field_size,
         }
     }
+}
+
+/// How a byte range sits inside an object, as C17 6.7.9p19 needs to know it:
+/// an initializer for a subobject overrides the previous initializer for
+/// *that* subobject, and whether some other initializer survives depends on
+/// what lies between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubobjectPlace {
+    /// The range is a subobject reached through struct members and array
+    /// elements only (possibly the whole object). Initializing it leaves
+    /// every other subobject of the enclosing object untouched.
+    Member,
+    /// The range is reached only by descending into this union, whose bytes
+    /// span `offset..offset + size` of the enclosing object. A union holds one
+    /// member at a time, so initializing through it discards whatever the
+    /// union held before.
+    ThroughUnion { offset: usize, size: usize },
+    /// The range is the storage of a bit-field declared by the struct
+    /// spanning `offset..offset + size` of the enclosing object. A bit-field
+    /// is not addressable storage of its own -- it shares a carrier with its
+    /// neighbours -- so an initializer for one replaces its bits and leaves
+    /// theirs, which is done in that struct's own initializer rather than by
+    /// replacing a subobject.
+    ///
+    /// Only asked for, and only ever answered, for a bit-field's own bits.
+    BitfieldCarrier { offset: usize, size: usize },
+    /// The range is not a subobject at all: it straddles two members, or it is
+    /// a bit-field carrier's window rather than a named object.
+    NotASubobject,
 }
 
 /// Result from member_index_for_designator indicating where positional
@@ -202,6 +337,13 @@ pub(crate) struct StructFieldVisit {
     pub(crate) bit_offset: Option<u32>,
     pub(crate) bit_width: Option<u32>,
     pub(crate) access_bytes: Option<u32>,
+    /// Index, in the member list walked, of the member this visit initializes
+    /// or lies inside. For a union that is the member it comes to hold, which
+    /// its byte offset cannot say.
+    pub(crate) member_index: Option<usize>,
+    /// The member this visit's designator chain named in each union it passed
+    /// through, by byte offset within the object being initialized.
+    pub(crate) unions: UnionMembers,
 }
 
 pub(crate) enum StructFieldVisitKind {
@@ -222,7 +364,28 @@ pub(crate) struct StaticLocalInfo {
 
 // Linearizer
 
-/// Linearizer context for converting AST to IR
+/// A declaration scope the linearizer has entered.
+///
+/// Handed out by [`Linearizer::push_scope`] and given back to
+/// [`Linearizer::pop_scope`]. A block scope is also the lifetime of every
+/// VLA declared in it (C17 6.2.4p7), so the token carries the [`VlaMark`]
+/// depth as it stood on entry and leaving the scope puts the stack pointer
+/// back to what the first mark above that depth captured.
+///
+/// Carrying both in one token is the point. The declaration scope and the
+/// VLA scope used to be two stacks opened by hand at separate call sites,
+/// and only some of the sites that opened the first opened the second: a VLA
+/// declared in a `for` init clause, in the `for` arm of the switch-body
+/// walker, or in a statement expression was never released. Now there is no
+/// way to enter one without the other, and none to leave one without the
+/// other.
+#[must_use = "a scope that is entered must be left through pop_scope"]
+pub(crate) struct Scope {
+    /// The `vla_marks` depth on entry; every mark above it belongs to this
+    /// scope and is released when it ends.
+    pub(crate) vla_entry: usize,
+}
+
 /// A captured stack pointer and the loop/switch nesting it was captured at.
 ///
 /// See [`Linearizer::vla_marks`].
@@ -244,14 +407,27 @@ pub(crate) struct HiddenReturnSlot {
     pub(crate) arg_typ: TypeId,
 }
 
+/// Where a jump whose VLA restore is still undecided may land.
+pub(crate) enum GotoTarget {
+    /// `goto L;`, or one label edge of an `asm goto`: a single block.
+    Label(BasicBlockId),
+    /// `goto *p;`. The address is not known here, so the jump is taken to
+    /// reach any label whose address this function takes, and only the
+    /// scopes that *every* candidate lies outside of may be released -- the
+    /// **deepest** depth recorded for any of them. Releasing down to a
+    /// shallower one would free storage still in scope at another candidate,
+    /// which is the one error a missing restore cannot cause.
+    AnyAddressTaken,
+}
+
 /// A forward `goto` whose VLA restore is decided once its label is placed.
 ///
 /// `marks` is the mark stack as it stood at the jump, so the restore can name
 /// whichever scope the label turns out to sit in: `marks[label_depth]` is the
 /// stack pointer captured on entry to the outermost scope the jump leaves.
 pub(crate) struct PendingGotoVla {
-    /// The label jumped to.
-    pub(crate) label: String,
+    /// Where the jump goes.
+    pub(crate) target: GotoTarget,
     /// The block the branch was emitted into.
     pub(crate) bb: BasicBlockId,
     /// Where in that block the branch sits; the restore goes just before it.
@@ -260,6 +436,7 @@ pub(crate) struct PendingGotoVla {
     pub(crate) marks: Vec<PseudoId>,
 }
 
+/// Linearizer context for converting AST to IR
 pub struct Linearizer<'a> {
     /// The module being built
     pub(crate) module: Module,
@@ -344,7 +521,11 @@ pub struct Linearizer<'a> {
     ///
     /// Only labels in a function that declares a VLA appear here, so nothing
     /// is recorded for the ordinary case.
-    pub(crate) label_vla_depth: std::collections::HashMap<String, usize>,
+    ///
+    /// Keyed by the label's block rather than its name: a computed `goto`
+    /// knows its candidates only as the blocks in `addr_taken_labels`, and
+    /// one map serves both it and the named jumps.
+    pub(crate) label_vla_depth: std::collections::HashMap<BasicBlockId, usize>,
     /// Forward `goto`s that may be leaving a VLA's scope, to be resolved once
     /// every label's depth is known.
     ///
@@ -490,14 +671,28 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// Push a new local scope. Subsequent `insert_local` calls will record
+    /// Enter a declaration scope. Subsequent `insert_local` calls will record
     /// the previous value so `pop_scope` can restore it.
-    pub(crate) fn push_scope(&mut self) {
+    ///
+    /// Entering a declaration scope *is* entering a VLA scope: the returned
+    /// [`Scope`] remembers the mark depth so `pop_scope` releases whatever
+    /// the scope allocated. See [`Scope`] for why the two are one operation.
+    pub(crate) fn push_scope(&mut self) -> Scope {
         self.local_scope_stack.push(Vec::new());
+        Scope {
+            vla_entry: self.vla_marks.len(),
+        }
     }
 
-    /// Pop the current local scope, restoring all locals to their pre-scope values.
-    pub(crate) fn pop_scope(&mut self) {
+    /// Leave the scope `scope` opened: release the VLAs declared in it and
+    /// restore every local it shadowed.
+    ///
+    /// The stack restore comes first, while the block the scope ends in is
+    /// still the current one, and is emitted only on the falling-out path --
+    /// a `break`, `continue`, `goto` or `return` that left already did its
+    /// own unwinding and terminated the block.
+    pub(crate) fn pop_scope(&mut self, scope: Scope) {
+        self.close_vla_scope(&scope);
         if let Some(entries) = self.local_scope_stack.pop() {
             for (sym, prev) in entries.into_iter().rev() {
                 match prev {
@@ -729,6 +924,7 @@ impl<'a> Linearizer<'a> {
 
     /// Add an instruction to the current basic block
     pub(crate) fn emit(&mut self, insn: Instruction) {
+        let insn = self.mark_volatile_access(insn);
         let insn = self.displacement_in_range(insn);
         if let Some(bb_id) = self.current_bb {
             // Attach current source position for debug info
@@ -741,6 +937,31 @@ impl<'a> Linearizer<'a> {
             bb.add_insn(insn);
         }
     }
+
+    /// Mark an access to a `volatile` object as one, from the type it reaches.
+    ///
+    /// Every `Load` and `Store` the linearizer emits passes through
+    /// [`Self::emit`], and each carries in `typ` the type of the object it is
+    /// accessing -- so this is the one place the qualifier has to be read, and
+    /// the one place it can be read for *every* access, including `*p` for a
+    /// `volatile int *p`, where there is no variable holding the qualifier to
+    /// ask (which is why `LocalVar::is_volatile` alone let DCE delete every
+    /// discarded `volatile` read from `-O1` up).
+    ///
+    /// A marker a site set itself is kept rather than recomputed, so a site
+    /// that knows more than the access type does can say so: a bit-field reads
+    /// a storage unit whose type is the carrier, and a composite copy reads
+    /// integer chunks, neither of which is the qualified type.
+    fn mark_volatile_access(&self, mut insn: Instruction) -> Instruction {
+        if !matches!(insn.op, Opcode::Load | Opcode::Store) || insn.is_volatile {
+            return insn;
+        }
+        if let Some(typ) = insn.typ {
+            insn.is_volatile = self.types.contains_volatile(typ);
+        }
+        insn
+    }
+
     /// Keep a load's or store's constant offset inside a machine displacement.
     ///
     /// Both backends address `src[0] + offset` with a signed 32-bit
@@ -1273,14 +1494,20 @@ impl<'a> Linearizer<'a> {
     ///
     /// `static_locals` is deliberately not cleared: it persists across
     /// functions.
-    fn reset_for_function(&mut self, func: &FunctionDef) {
+    ///
+    /// Returns the function-level [`Scope`], which `linearize_function` gives
+    /// back once the body is lowered. Nothing is released there -- the
+    /// epilogue restores `%rsp` from the frame pointer, and the body's own
+    /// block scope has already dropped every mark -- but it is entered the
+    /// same way as any other scope so that no site can enter one without the
+    /// other.
+    fn reset_for_function(&mut self, func: &FunctionDef) -> Scope {
         // Reset per-function state
         self.next_pseudo = 0;
         self.next_bb = 0;
         self.var_map.clear();
         self.locals.clear();
         self.local_scope_stack.clear();
-        self.push_scope(); // function-level scope
         self.label_map.clear();
         self.break_targets.clear();
         self.continue_targets.clear();
@@ -1298,6 +1525,10 @@ impl<'a> Linearizer<'a> {
         // Remove from extern_symbols since we're defining this function
         self.module.extern_symbols.remove(&self.current_func_name);
         // Note: static_locals is NOT cleared - it persists across functions
+
+        // After `vla_marks.clear()`: the scope records the depth it starts
+        // at, which for the function scope has to be zero.
+        self.push_scope()
     }
 
     /// Whether a function body declares anything variably modified.
@@ -1352,7 +1583,7 @@ impl<'a> Linearizer<'a> {
         // expression to the same rule.
         let written_labels = self.check_jumps_into_protected_scopes(&func.body);
 
-        self.reset_for_function(func);
+        let func_scope = self.reset_for_function(func);
         self.written_labels = written_labels;
 
         // Create function - use storage class from FunctionDef
@@ -1454,32 +1685,48 @@ impl<'a> Linearizer<'a> {
         }
 
         // A `Ret` that carries an address; a call's result slot holds the
-        // value. The inliner has to know not to splice across that boundary.
-        // An aggregate returned in st(0) has exactly the same shape as a
-        // complex one, and missing it is a miscompile visible only at -O.
+        // value. Whoever consumes that return has to read the bytes out of the
+        // storage it names, and the inliner has to know which of the two it is
+        // splicing. `aggregate_ret_is_address` is the one place that answers
+        // it -- the same function `emit_two_reg_return` asks before emitting
+        // the address form, so the shape and the question about the shape
+        // cannot drift apart. They had: spelled out a second time here as
+        // "x87 or HFA", this missed a sixteen-byte aggregate returned in one
+        // SSE register, and before that it was gated behind the
+        // *two-register* path's 128-bit cap, which missed every HFA past
+        // sixteen bytes -- four `double`s is thirty-two bytes and still comes
+        // back in d0-d3.
         //
-        // Asked of the ABI classification directly rather than through
-        // `returns_reg_aggregate`, which is the *two-register* return path and
-        // so stops at 128 bits. An HFA comes back in registers at any size --
-        // four `double`s is thirty-two bytes and still returns in d0-d3 -- so
-        // gating on that cap made every HFA past 128 bits report that its `Ret`
-        // carried a value. The inliner then spliced the body in and phi-ed the
-        // address as if it were the aggregate, and the caller read the pointer's
-        // own storage as the struct's bytes. The call-site half of this
-        // decision already has no size bound; the two had drifted.
-        let returns_addr_aggregate = (ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
-            // An aggregate that fits in one register comes back *as* a value,
-            // so its `Ret` carries one; only past 64 bits is an address handed
-            // back. Dropping this bound along with the 128-bit cap refused to
-            // inline every HFA, including `struct { float x, y; }`, which was
-            // correct before and is the common aarch64 shape.
-            && struct_size_bits > 64
-            && !returns_large_struct
-            && matches!(
+        // Classified only for an aggregate that is not going through the
+        // hidden pointer, which is the only shape the question is about.
+        let ret_class = ((ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
+            && !returns_large_struct)
+            .then(|| {
                 get_abi_for_conv(self.current_calling_conv, self.target)
-                    .classify_return(func.return_type, self.types),
-                crate::abi::ArgClass::X87 { .. } | crate::abi::ArgClass::Hfa { .. }
-            );
+                    .classify_return(func.return_type, self.types)
+            });
+        // Which of those the inliner is kept away from -- a narrower question
+        // than the shape, and no longer the same one. `clone_instruction`'s
+        // `Ret` arm now copies an aggregate handed back by address into the
+        // call's result local, which is where a call leaves it, so the
+        // one-SSE-register shape is spliced correctly instead of refused.
+        //
+        // An x87 aggregate and an HFA travel by address for the same reason
+        // and that copy would move them just as well, but they are not ready
+        // to be let through: the copy reads the `Ret`'s own ABI
+        // classification, and only `emit_two_reg_return` attaches one --
+        // which `returns_reg_aggregate` above stops calling past 128 bits. So
+        // a three- or four-`double` HFA returns an address under no
+        // classification at all, and lifting this refusal has it phi-ed again
+        // (`%45 = phisrc.192 %44`, where `%44` is a `symaddr.64`). Letting
+        // those in means carrying the classification onto every
+        // register-returned aggregate's `Ret` first, which is its own change
+        // -- and `codegen_aarch64_hfa_returning_function_is_not_inlined`
+        // pins this refusal until then.
+        let returns_addr_aggregate = ret_class.as_ref().is_some_and(|class| {
+            super::aggregate_ret_is_address(class, struct_size_bits)
+                && !matches!(class, crate::abi::ArgClass::Direct { .. })
+        });
         ir_func.ret_is_address = self.types.is_complex(func.return_type) || returns_addr_aggregate;
 
         // Add parameters
@@ -1741,8 +1988,11 @@ impl<'a> Linearizer<'a> {
             }
         }
 
-        // Pop function-level scope
-        self.pop_scope();
+        // Pop function-level scope. Its VLA release is a no-op: the body's
+        // own block scope dropped every mark, and the block is terminated by
+        // the return above -- which is what must happen, since SSA has
+        // already run over the function by this point.
+        self.pop_scope(func_scope);
 
         // Add function to module
         if let Some(ir_func) = self.current_func.take() {
@@ -1787,33 +2037,17 @@ impl<'a> Linearizer<'a> {
         let abi = get_abi_for_conv(self.current_calling_conv, self.target);
         let ret_class = abi.classify_return(ret_type, self.types);
 
-        // An aggregate that is nothing but a `long double` comes back in
-        // st(0), exactly as the bare scalar does, so the `Ret` carries the
-        // value's *address* and the backend loads it onto the FPU stack.
-        // Splitting it across RAX and RDX left the caller reading a slot
-        // nobody had written.
-        // A single SSE register carrying sixteen bytes -- an aggregate whose
-        // sole content is a `__float128` -- is the same shape: the register
-        // holds the whole value, so the `Ret` carries its address and the
-        // backend moves all sixteen bytes at once. Splitting it into two
-        // general registers handed the caller half a value in the wrong place.
-        let one_sse_reg = matches!(
-            ret_class,
-            crate::abi::ArgClass::Direct { ref classes, .. }
-                if classes.len() == 1 && classes[0] == crate::abi::RegClass::Sse
-        );
-        // A one-element HFA is the aarch64 spelling of the same thing: one V
-        // register holds the whole value. Splitting it into two general
-        // registers was survivable on its own -- the backend put the halves
-        // back together -- but the *inliner* then spliced a two-source `Ret`
-        // into a caller expecting one value, and the top half came out zero.
-        // Any HFA, not just a one-element one: the two-element form has the
-        // same hazard. Its `Ret` carried the halves as two general registers,
-        // and splicing that into a caller expecting one value dropped the
-        // second -- an inlined `struct { double a, b; }` return came back with
-        // its second half zeroed.
-        let one_hfa_reg = matches!(ret_class, crate::abi::ArgClass::Hfa { .. });
-        if matches!(ret_class, crate::abi::ArgClass::X87 { .. }) || one_sse_reg || one_hfa_reg {
+        // The three classes no pair of general registers can carry: an x87
+        // aggregate, an HFA, and sixteen bytes in one SSE register. Each hands
+        // the value back by address, and splitting any of them into RAX/RDX
+        // was a miscompile of its own -- an x87 aggregate left the caller
+        // reading a slot nobody had written, a `__float128` one handed a
+        // gcc-compiled caller half a value in the wrong place, and an HFA's
+        // two-source `Ret` spliced into a caller expecting one value dropped
+        // its second half. `aggregate_ret_is_address` is where that list
+        // lives, because the inliner has to ask the same question of the
+        // `Ret` this emits.
+        if super::aggregate_ret_is_address(&ret_class, struct_size) {
             let mut ret_insn = Instruction::ret_typed(Some(src_addr), ret_type, struct_size);
             ret_insn.abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
             self.emit(ret_insn);
@@ -1897,14 +2131,15 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Utf16StringLit(_)
             | ExprKind::Utf32StringLit(_) => true,
 
-            // Identifiers are pure unless volatile
-            ExprKind::Ident(_) => {
-                if let Some(typ) = expr.typ {
-                    !self.types.modifiers(typ).contains(TypeModifiers::VOLATILE)
-                } else {
-                    true
-                }
-            }
+            // Identifiers are pure unless volatile.
+            //
+            // `contains_volatile`, not the top-level modifier: reading a
+            // struct with a `volatile` member reads that member, and asking
+            // only what was written on the struct answered no.
+            ExprKind::Ident(_) => match expr.typ {
+                Some(typ) => !self.types.contains_volatile(typ),
+                None => true,
+            },
 
             // __func__ is a pure string-like value
             ExprKind::FuncName => true,
@@ -1951,8 +2186,21 @@ impl<'a> Linearizer<'a> {
             // Function calls are never pure (may have side effects)
             ExprKind::Call { .. } => false,
 
-            // Member access through struct value (.) is pure if the base is pure.
-            ExprKind::Member { expr, .. } => self.is_pure_expr(expr),
+            // Member access through struct value (.) is pure if the base is
+            // pure and the member itself is not volatile. C17 6.5.15p4
+            // evaluates only one arm of a conditional and 5.1.2.3 makes each
+            // volatile read an observable event, so speculating one is a read
+            // the program never asked for: asking about the base alone let
+            // `c ? s.status : s.other` load both members unconditionally into
+            // a branchless select, at `-O0` too. The member's type carries the
+            // object's qualifiers (C17 6.5.2.3p3), so this covers a volatile
+            // member and a member of a volatile object alike.
+            ExprKind::Member { expr: base, .. } => {
+                !expr
+                    .typ
+                    .is_some_and(|typ| self.types.contains_volatile(typ))
+                    && self.is_pure_expr(base)
+            }
 
             // Arrow access (ptr->member) can cause UB/crash if ptr is NULL,
             // so we must not eagerly evaluate it in conditional expressions.
@@ -2766,19 +3014,31 @@ impl<'a> Linearizer<'a> {
 
     /// Shared logic for member access (both `.` and `->`).
     /// `base` is the address of the struct (for `.`) or the pointer value (for `->`).
+    ///
+    /// `access_typ` is the type of the member-access *expression*, which the
+    /// parser formed as the member's declared type so-qualified by the object
+    /// (C17 6.5.2.3p3/p4). The access is performed at that type, so
+    /// [`Self::mark_volatile_access`] sees the qualifier -- the type
+    /// `find_member` answers with is the member's *declared* one and cannot
+    /// carry it, which is why a member of a `volatile` struct read as an
+    /// ordinary `int` and DCE deleted the load from `-O1` up. Its width, sign
+    /// and kind still come from the member, so the two disagreeing (only
+    /// reachable once the parser has already reported an unknown member)
+    /// cannot change how the access is performed. It also stands in for the
+    /// member type entirely when the lookup fails here.
     pub(crate) fn emit_member_access(
         &mut self,
         base: PseudoId,
         struct_type: TypeId,
         member: StringId,
-        fallback_type: TypeId,
+        access_typ: TypeId,
     ) -> PseudoId {
         let member_info = self
             .types
             .find_member(struct_type, member)
             .unwrap_or(MemberInfo {
                 offset: 0,
-                typ: fallback_type,
+                typ: access_typ,
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
@@ -2813,7 +3073,7 @@ impl<'a> Linearizer<'a> {
                 bit_offset,
                 bit_width,
                 storage_size,
-                member_info.typ,
+                access_typ,
             )
         } else {
             let size = self.types.size_bits(member_info.typ);
@@ -2843,7 +3103,7 @@ impl<'a> Linearizer<'a> {
                     result,
                     base,
                     member_info.offset as i64,
-                    member_info.typ,
+                    access_typ,
                     size,
                 ));
                 result
@@ -4819,47 +5079,16 @@ impl<'a> Linearizer<'a> {
         else_expr: &Expr,
         result_typ: TypeId,
     ) -> PseudoId {
-        let then_bb = self.alloc_bb();
-        let else_bb = self.alloc_bb();
-        let merge_bb = self.alloc_bb();
-
         let cond_bool = self.linearize_condition(cond);
-        let cond_end_bb = self.current_bb.unwrap();
-        self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
-        self.link_bb(cond_end_bb, then_bb);
-        self.link_bb(cond_end_bb, else_bb);
-
         let ptr_typ = self.types.pointer_to(result_typ);
         let ptr_bits = self.target.pointer_width;
-
-        self.switch_bb(then_bb);
-        let then_val = self.complex_arm_addr(then_expr, result_typ);
-        let then_end_bb = self.current_bb.unwrap();
-        self.emit(Instruction::br(merge_bb));
-        self.link_bb(then_end_bb, merge_bb);
-
-        self.switch_bb(else_bb);
-        let else_val = self.complex_arm_addr(else_expr, result_typ);
-        let else_end_bb = self.current_bb.unwrap();
-        self.emit(Instruction::br(merge_bb));
-        self.link_bb(else_end_bb, merge_bb);
-
-        self.switch_bb(merge_bb);
-        let result = self.alloc_pseudo();
-        let phi_pseudo = Pseudo::phi(result, result.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(phi_pseudo);
-        }
-        let mut phi_insn = Instruction::phi(result, ptr_typ, ptr_bits);
-        let phisrc1 =
-            self.emit_phi_source(then_end_bb, then_val, result, merge_bb, ptr_typ, ptr_bits);
-        phi_insn.phi_list.push((then_end_bb, phisrc1));
-        let phisrc2 =
-            self.emit_phi_source(else_end_bb, else_val, result, merge_bb, ptr_typ, ptr_bits);
-        phi_insn.phi_list.push((else_end_bb, phisrc2));
-        self.emit(phi_insn);
-
-        result
+        self.emit_diamond(
+            cond_bool,
+            ptr_typ,
+            ptr_bits,
+            |lin| lin.complex_arm_addr(then_expr, result_typ),
+            |lin| lin.complex_arm_addr(else_expr, result_typ),
+        )
     }
 
     pub(crate) fn linearize_ternary(
@@ -4932,48 +5161,23 @@ impl<'a> Linearizer<'a> {
             ));
             result
         } else {
-            // Impure: use control flow + phi for proper short-circuit evaluation
-            let then_bb = self.alloc_bb();
-            let else_bb = self.alloc_bb();
-            let merge_bb = self.alloc_bb();
-
+            // Impure: use control flow + phi for proper short-circuit evaluation.
+            // Each arm is converted inside its own block, where it is the only
+            // thing evaluated.
             let cond_bool = self.linearize_condition(cond);
-            let cond_end_bb = self.current_bb.unwrap();
-
-            self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
-            self.link_bb(cond_end_bb, then_bb);
-            self.link_bb(cond_end_bb, else_bb);
-
-            self.switch_bb(then_bb);
-            let then_val = self.linearize_expr(then_expr);
-            let then_val = self.conditional_arm(then_val, then_expr, result_typ, aggregate);
-            let then_end_bb = self.current_bb.unwrap();
-            self.emit(Instruction::br(merge_bb));
-            self.link_bb(then_end_bb, merge_bb);
-
-            self.switch_bb(else_bb);
-            let else_val = self.linearize_expr(else_expr);
-            let else_val = self.conditional_arm(else_val, else_expr, result_typ, aggregate);
-            let else_end_bb = self.current_bb.unwrap();
-            self.emit(Instruction::br(merge_bb));
-            self.link_bb(else_end_bb, merge_bb);
-
-            self.switch_bb(merge_bb);
-            let result = self.alloc_pseudo();
-            let phi_pseudo = Pseudo::phi(result, result.0);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(phi_pseudo);
-            }
-            let mut phi_insn = Instruction::phi(result, merge_typ, size);
-            let phisrc1 =
-                self.emit_phi_source(then_end_bb, then_val, result, merge_bb, merge_typ, size);
-            phi_insn.phi_list.push((then_end_bb, phisrc1));
-            let phisrc2 =
-                self.emit_phi_source(else_end_bb, else_val, result, merge_bb, merge_typ, size);
-            phi_insn.phi_list.push((else_end_bb, phisrc2));
-            self.emit(phi_insn);
-
-            result
+            self.emit_diamond(
+                cond_bool,
+                merge_typ,
+                size,
+                |lin| {
+                    let val = lin.linearize_expr(then_expr);
+                    lin.conditional_arm(val, then_expr, result_typ, aggregate)
+                },
+                |lin| {
+                    let val = lin.linearize_expr(else_expr);
+                    lin.conditional_arm(val, else_expr, result_typ, aggregate)
+                },
+            )
         }
     }
 
@@ -5021,50 +5225,21 @@ impl<'a> Linearizer<'a> {
             self.emit_compare_zero(evaluated, cond_typ)
         };
 
-        let then_bb = self.alloc_bb();
-        let else_bb = self.alloc_bb();
-        let merge_bb = self.alloc_bb();
-        let cond_end_bb = self.current_bb.unwrap();
-
-        self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
-        self.link_bb(cond_end_bb, then_bb);
-        self.link_bb(cond_end_bb, else_bb);
-
         let ptr_typ = self.types.pointer_to(result_typ);
         let ptr_bits = self.target.pointer_width;
-
-        self.switch_bb(then_bb);
-        let then_val = if cond_complex {
-            self.complex_addr_at_precision(evaluated, cond_typ, result_typ)
-        } else {
-            self.promote_real_value_to_complex(evaluated, cond_typ, result_typ)
-        };
-        let then_end_bb = self.current_bb.unwrap();
-        self.emit(Instruction::br(merge_bb));
-        self.link_bb(then_end_bb, merge_bb);
-
-        self.switch_bb(else_bb);
-        let else_val = self.complex_arm_addr(else_expr, result_typ);
-        let else_end_bb = self.current_bb.unwrap();
-        self.emit(Instruction::br(merge_bb));
-        self.link_bb(else_end_bb, merge_bb);
-
-        self.switch_bb(merge_bb);
-        let result = self.alloc_pseudo();
-        let phi_pseudo = Pseudo::phi(result, result.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(phi_pseudo);
-        }
-        let mut phi_insn = Instruction::phi(result, ptr_typ, ptr_bits);
-        let phisrc1 =
-            self.emit_phi_source(then_end_bb, then_val, result, merge_bb, ptr_typ, ptr_bits);
-        phi_insn.phi_list.push((then_end_bb, phisrc1));
-        let phisrc2 =
-            self.emit_phi_source(else_end_bb, else_val, result, merge_bb, ptr_typ, ptr_bits);
-        phi_insn.phi_list.push((else_end_bb, phisrc2));
-        self.emit(phi_insn);
-
-        result
+        self.emit_diamond(
+            cond_bool,
+            ptr_typ,
+            ptr_bits,
+            |lin| {
+                if cond_complex {
+                    lin.complex_addr_at_precision(evaluated, cond_typ, result_typ)
+                } else {
+                    lin.promote_real_value_to_complex(evaluated, cond_typ, result_typ)
+                }
+            },
+            |lin| lin.complex_arm_addr(else_expr, result_typ),
+        )
     }
 
     /// The value of a conditional expression whose constant condition
@@ -5133,15 +5308,7 @@ impl<'a> Linearizer<'a> {
 
         // Impure right-hand side: it must not be evaluated when the condition
         // is true, so it needs its own block.
-        let then_bb = self.alloc_bb();
-        let else_bb = self.alloc_bb();
-        let merge_bb = self.alloc_bb();
-        let cond_end_bb = self.current_bb.unwrap();
-
-        self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
-        self.link_bb(cond_end_bb, then_bb);
-        self.link_bb(cond_end_bb, else_bb);
-
+        //
         // The true value is the condition, converted to the result type -- done
         // *inside* the true block, where the ternary also converts its arms.
         // Converting before the `cbr` is equally correct as IR, and reads more
@@ -5150,36 +5317,17 @@ impl<'a> Linearizer<'a> {
         // and the aarch64 backend then emits a branch on the wrong register.
         // That is a backend defect and is reported as one; this is not the
         // place to depend on it.
-        self.switch_bb(then_bb);
-        let then_val = self.convert_conditional_arm(cond_val, cond_typ, result_typ);
-        let then_end_bb = self.current_bb.unwrap();
-        self.emit(Instruction::br(merge_bb));
-        self.link_bb(then_end_bb, merge_bb);
-
-        self.switch_bb(else_bb);
-        let mut else_val = self.linearize_expr(else_expr);
-        let else_typ = self.expr_type(else_expr);
-        else_val = self.convert_conditional_arm(else_val, else_typ, result_typ);
-        let else_end_bb = self.current_bb.unwrap();
-        self.emit(Instruction::br(merge_bb));
-        self.link_bb(else_end_bb, merge_bb);
-
-        self.switch_bb(merge_bb);
-        let result = self.alloc_pseudo();
-        let phi_pseudo = Pseudo::phi(result, result.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(phi_pseudo);
-        }
-        let mut phi_insn = Instruction::phi(result, result_typ, size);
-        let phisrc1 =
-            self.emit_phi_source(then_end_bb, then_val, result, merge_bb, result_typ, size);
-        phi_insn.phi_list.push((then_end_bb, phisrc1));
-        let phisrc2 =
-            self.emit_phi_source(else_end_bb, else_val, result, merge_bb, result_typ, size);
-        phi_insn.phi_list.push((else_end_bb, phisrc2));
-        self.emit(phi_insn);
-
-        result
+        self.emit_diamond(
+            cond_bool,
+            result_typ,
+            size,
+            |lin| lin.convert_conditional_arm(cond_val, cond_typ, result_typ),
+            |lin| {
+                let val = lin.linearize_expr(else_expr);
+                let else_typ = lin.expr_type(else_expr);
+                lin.convert_conditional_arm(val, else_typ, result_typ)
+            },
+        )
     }
 
     /// Lower `__builtin_clrsb` and its wider siblings.
@@ -5690,13 +5838,19 @@ impl<'a> Linearizer<'a> {
         let value_typ = self.expr_type(val);
         let raw = self.linearize_expr(val);
         // Pointer arithmetic scales by the element size, as it does for `+=`.
-        let operand = if self.types.kind(elem_typ) == TypeKind::Pointer
+        let is_ptr_arith = self.types.kind(elem_typ) == TypeKind::Pointer
             && self.types.is_integer(value_typ)
-            && matches!(op, GnuAtomicOp::Add | GnuAtomicOp::Sub)
-        {
-            self.scale_pointer_addend(elem_typ, value_typ, raw)
+            && matches!(op, GnuAtomicOp::Add | GnuAtomicOp::Sub);
+        let (operand, operand_typ) = if is_ptr_arith {
+            (
+                self.scale_pointer_addend(elem_typ, value_typ, raw),
+                self.types.long_id,
+            )
         } else {
-            self.emit_convert(raw, value_typ, elem_typ)
+            // Unlike an operator, a builtin converts its value argument to the
+            // object's type itself (gcc documents the parameter as that type),
+            // so there is no common type left to compute at.
+            (self.emit_convert(raw, value_typ, elem_typ), elem_typ)
         };
         // The order argument is accepted and evaluated, as gcc evaluates it,
         // but every lowering here is sequentially consistent: `emit_atomic_rmw`
@@ -5710,39 +5864,30 @@ impl<'a> Linearizer<'a> {
             size_bits: bits,
         };
 
-        let (old, binop) = match op {
-            GnuAtomicOp::Nand => (self.emit_atomic_nand(&lv, operand), Opcode::And),
-            _ => {
-                let binop = match op {
-                    GnuAtomicOp::Add => Opcode::Add,
-                    GnuAtomicOp::Sub => Opcode::Sub,
-                    GnuAtomicOp::And => Opcode::And,
-                    GnuAtomicOp::Or => Opcode::Or,
-                    GnuAtomicOp::Xor => Opcode::Xor,
-                    GnuAtomicOp::Nand => unreachable!("handled above"),
-                };
-                (self.emit_atomic_rmw(&lv, binop, operand), binop)
-            }
+        // Each builtin is the compound assignment of the same name, so it
+        // goes through the same model: `nand` is the one that has no operator
+        // spelling, and it is `&` with the result complemented before it
+        // converts back to the object's type (`CompoundAssign::invert`).
+        let assign_op = match op {
+            GnuAtomicOp::Add => AssignOp::AddAssign,
+            GnuAtomicOp::Sub => AssignOp::SubAssign,
+            GnuAtomicOp::And | GnuAtomicOp::Nand => AssignOp::AndAssign,
+            GnuAtomicOp::Or => AssignOp::OrAssign,
+            GnuAtomicOp::Xor => AssignOp::XorAssign,
+        };
+        let ca = CompoundAssign {
+            is_ptr_arith,
+            invert: op == GnuAtomicOp::Nand,
+            ..CompoundAssign::new(assign_op, elem_typ, operand_typ)
         };
 
+        let old = self.emit_atomic_rmw(&lv, &ca, operand);
         if !returns_new {
             return old;
         }
-
-        let new = self.alloc_reg_pseudo();
-        self.emit(Instruction::binop(binop, new, old, operand, elem_typ, bits));
-        if op != GnuAtomicOp::Nand {
-            return new;
-        }
-        let inverted = self.alloc_reg_pseudo();
-        self.emit(Instruction::unop(
-            Opcode::Not,
-            inverted,
-            new,
-            elem_typ,
-            bits,
-        ));
-        inverted
+        // The new value, recomputed from the old one rather than read back:
+        // arithmetic on a value in hand is not a second access to the object.
+        self.compound_assign_value(&ca, old, operand)
     }
 
     /// `__sync_bool_compare_and_swap` and `__sync_val_compare_and_swap`.
@@ -6682,6 +6827,12 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::StmtExpr { stmts, result } => {
                 // GNU statement expression: ({ stmt; stmt; expr; })
+                // It is a block, so it is a declaration scope like any other:
+                // its declarations do not outlive it, and the storage of a
+                // VLA declared in it goes back when it ends. Without the
+                // scope, `for (...) (void)({ int a[n]; ... });` allocated
+                // every time round and released nothing.
+                let scope = self.push_scope();
                 // Linearize all the statements first
                 for item in stmts {
                     match item {
@@ -6689,8 +6840,11 @@ impl<'a> Linearizer<'a> {
                         BlockItem::Statement(s) => self.linearize_stmt(s),
                     }
                 }
-                // The result is the value of the final expression
-                self.linearize_expr(result)
+                // The result is the value of the final expression, computed
+                // before the scope ends: it may read the VLA being released.
+                let value = self.linearize_expr(result);
+                self.pop_scope(scope);
+                value
             }
 
             ExprKind::BuiltinComplex { real, imag } => {

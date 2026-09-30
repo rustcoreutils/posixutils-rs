@@ -2544,3 +2544,550 @@ fn c99_complex_constants_in_scalar_static_initializers() {
         assert_eq!(rc, 0);
     }
 }
+
+/// An excess array initializer is discarded, not written past the object.
+///
+/// C17 6.7.9p2 makes more initializers than elements a constraint violation;
+/// c17 already diagnoses it. The grouping pass never bounded its element
+/// cursor by the array size, so the extra value was still stored -- one element
+/// past the end, on top of whatever the frame put there. `int x[2] = {7, 8};`
+/// followed by `int a[2] = {1, 2, 3};` read back `x = {3, 8}`.
+#[test]
+fn c99_excess_array_initializers_do_not_write_past_the_object() {
+    let code = r#"
+int main(void)
+{
+    int x[2] = {7, 8};
+    int a[2] = {1, 2, 3};
+    if (a[0] != 1 || a[1] != 2) return 1;
+    if (x[0] != 7 || x[1] != 8) return 2;
+
+    /* Several excess elements, and a designator that jumps back first.
+       C17 6.7.9p17: a positional initializer after a designator resumes at
+       the next subobject, so after `[0] = 1` the cursor is at index 1 and the
+       9 overrides the earlier 2. Only the 10 and 11 are excess. Confirmed
+       against clang, which warns -Winitializer-overrides on the 9. */
+    short y[2] = {5, 6};
+    short b[2] = {[1] = 2, [0] = 1, 9, 10, 11};
+    if (b[0] != 1 || b[1] != 9) return 3;
+    if (y[0] != 5 || y[1] != 6) return 4;
+
+    /* The bound is on the index, not on the count. Here the array has three
+       elements and the initializer list has two, so a count-based rule keeps
+       the 1 -- but it resumes after `[2]`, i.e. at index 3, and is excess.
+       clang gives {0,0,3}. */
+    int guard_before[2] = {11, 12};
+    int d[3] = {[2] = 3, 1};
+    int guard_after[2] = {13, 14};
+    if (d[0] != 0 || d[1] != 0 || d[2] != 3) return 10;
+    if (guard_before[0] != 11 || guard_before[1] != 12) return 11;
+    if (guard_after[0] != 13 || guard_after[1] != 14) return 12;
+
+    /* A nested array: the excess belongs to the inner object. */
+    int z[2] = {8, 9};
+    int c[2][2] = {{1, 2, 3}, {4, 5}};
+    if (c[0][0] != 1 || c[0][1] != 2) return 5;
+    if (c[1][0] != 4 || c[1][1] != 5) return 6;
+    if (z[0] != 8 || z[1] != 9) return 7;
+
+    /* A char array from a string literal that does not fit: C17 6.7.9p14
+       allows exactly the terminator to be dropped, nothing more. */
+    char w[2] = {'a', 'b'};
+    char s[3] = "hello";
+    if (s[0] != 'h' || s[1] != 'e' || s[2] != 'l') return 8;
+    if (w[0] != 'a' || w[1] != 'b') return 9;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("excess_array_init", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("excess_array_init_opt", code), 0);
+}
+
+/// The static form of the same defect: the emitted object is exactly as wide
+/// as the array declares.
+///
+/// `int garr[2] = {1, 2, 3};` emitted three `.long`s under an eight-byte
+/// object, so the next symbol in the section absorbed the third.
+#[test]
+fn c99_excess_static_array_initializers_do_not_widen_the_object() {
+    let code = r#"
+int garr[2] = {1, 2, 3};
+int after = 42;
+short garr2[2] = {[1] = 2, [0] = 1, 9, 10};
+short after2 = 7;
+/* Bounded by index, not by count -- see the automatic case. */
+int garr3[3] = {[2] = 3, 1};
+int after3 = 5;
+
+int main(void)
+{
+    if (garr[0] != 1 || garr[1] != 2) return 1;
+    if (after != 42) return 2;
+    if (garr2[0] != 1 || garr2[1] != 9) return 3;
+    if (after2 != 7) return 4;
+    if (garr3[0] != 0 || garr3[1] != 0 || garr3[2] != 3) return 5;
+    if (after3 != 5) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("excess_static_array_init", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("excess_static_array_init_opt", code),
+        0
+    );
+}
+
+/// A string literal initializing a nested array element, in every encoding.
+///
+/// `is_string_for_char_array` accepts all four literal kinds, but the body that
+/// consumed them handled only the narrow one and silently `continue`d on the
+/// rest, so a wide element was dropped and left zero. The same loop stepped the
+/// destination by *bytes* while a wide element is 2 or 4 bytes wide, and it had
+/// no capacity clamp at all — a third hand-rolled copy of what
+/// `store_string_units` already does correctly for the non-nested form.
+///
+/// The static twin of each case was already right, which is how the two paths
+/// could disagree: `static wchar_t sw[2][4] = {L"ab", L"cd"}` read back 97/99
+/// while the automatic form read back 0/0.
+#[test]
+fn c99_a_nested_string_literal_element_is_stored_in_every_encoding() {
+    let code = r#"
+#include <wchar.h>
+/* <uchar.h> does not exist on macOS, and the test needs only the two types --
+   the same substitution the universal-character-name test above makes. */
+typedef unsigned short char16_t;
+typedef unsigned int char32_t;
+
+int main(void)
+{
+    /* Narrow, and the tail of a short element must be zero. */
+    char n[2][4] = {"ab", "cd"};
+    if (n[0][0] != 'a' || n[0][1] != 'b' || n[0][2] != 0 || n[0][3] != 0) return 1;
+    if (n[1][0] != 'c' || n[1][1] != 'd' || n[1][2] != 0 || n[1][3] != 0) return 2;
+
+    /* Wide: dropped entirely before the fix. */
+    wchar_t w[2][4] = {L"ab", L"cd"};
+    if ((int)w[0][0] != 'a' || (int)w[0][1] != 'b' || w[0][2] != 0) return 3;
+    if ((int)w[1][0] != 'c' || (int)w[1][1] != 'd' || w[1][2] != 0) return 4;
+
+    char16_t u[2][4] = {u"ab", u"cd"};
+    if ((int)u[0][0] != 'a' || (int)u[1][0] != 'c' || u[0][2] != 0) return 5;
+
+    char32_t U[2][4] = {U"ab", U"cd"};
+    if ((int)U[0][0] != 'a' || (int)U[1][0] != 'c' || U[0][2] != 0) return 6;
+
+    /* The static path was always correct; the two must now agree. */
+    static wchar_t sw[2][4] = {L"ab", L"cd"};
+    if ((int)sw[0][0] != 'a' || (int)sw[1][0] != 'c') return 7;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("nested_string_encodings", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("nested_string_encodings_opt", code),
+        0
+    );
+}
+
+/// A string literal too long for the array it initializes writes only as much
+/// as fits.
+///
+/// C17 6.7.9p14 allows exactly the terminating NUL to be dropped, and nothing
+/// more. The nested-array path had no clamp, so `char s[1][3] = {"hello"}`
+/// stored five bytes into a three-byte object — two of them past the whole
+/// local, not merely into the next row. The guards on either side are what make
+/// that visible rather than layout-dependent.
+#[test]
+fn c99_an_overlong_string_literal_does_not_write_past_its_array() {
+    let code = r#"
+int main(void)
+{
+    unsigned char lo = 0xA5;
+    char s[1][3] = {"hello"};
+    unsigned char hi = 0x5A;
+    if (s[0][0] != 'h' || s[0][1] != 'e' || s[0][2] != 'l') return 1;
+    if (lo != 0xA5 || hi != 0x5A) return 2;
+
+    /* Exactly the terminator dropped: this is legal and keeps all three. */
+    unsigned char lo2 = 0xA5;
+    char e[1][3] = {"abc"};
+    unsigned char hi2 = 0x5A;
+    if (e[0][0] != 'a' || e[0][1] != 'b' || e[0][2] != 'c') return 3;
+    if (lo2 != 0xA5 || hi2 != 0x5A) return 4;
+
+    /* Wide, where the stride is 4 bytes and a byte-stepped copy lands wrong. */
+    unsigned char lo3 = 0xA5;
+    __WCHAR_TYPE__ w[1][2] = {L"xyz"};
+    unsigned char hi3 = 0x5A;
+    if ((int)w[0][0] != 'x' || (int)w[0][1] != 'y') return 5;
+    if (lo3 != 0xA5 || hi3 != 0x5A) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("overlong_nested_string", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("overlong_nested_string_opt", code),
+        0
+    );
+}
+
+/// `char buf[N] = "str"` zero-fills the bytes the literal does not reach.
+///
+/// C17 6.7.9p21: the members not initialized explicitly are initialized as a
+/// static object would be, i.e. to zero. The `InitList` arm of a local
+/// declaration calls `emit_aggregate_zero` first; the string arm did not, so
+/// only the literal's own bytes were written.
+///
+/// On entry the backend zeroes the whole frame, which hides this the first time
+/// through — the declaration is inside a loop so the second pass sees what the
+/// first one left. All four encodings are affected.
+#[test]
+fn c99_a_string_initializer_zero_fills_the_rest_of_its_array() {
+    let code = r#"
+#include <wchar.h>
+
+int main(void)
+{
+    for (int pass = 0; pass < 2; pass++) {
+        char b[8] = "hi";
+        if (b[2] != 0 || b[3] != 0 || b[7] != 0) return 1;
+        b[3] = 'Z';
+        b[7] = 'Z';
+    }
+
+    for (int pass = 0; pass < 2; pass++) {
+        wchar_t w[4] = L"hi";
+        if (w[2] != 0 || w[3] != 0) return 2;
+        w[3] = 'Z';
+    }
+
+    /* The braced form went through the InitList arm and was already correct;
+       both spellings must now agree. */
+    for (int pass = 0; pass < 2; pass++) {
+        char c[8] = {"hi"};
+        if (c[3] != 0 || c[7] != 0) return 3;
+        c[3] = 'Z';
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("string_init_zero_fill", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("string_init_zero_fill_opt", code),
+        0
+    );
+}
+
+/// A later designated initializer replaces the subobject it names, not every
+/// object whose bytes it touches.
+///
+/// C17 6.7.9p19: an initializer for a subobject overrides any previously
+/// listed initializer *for that subobject*, and initializers for other
+/// subobjects are unaffected. The static path merged its field initializers by
+/// byte span and dropped an earlier entry whole on any intersection, so
+/// `.t = {1,2}` followed by `.t.y = 9` lost the `1` as well as the `2` -- while
+/// the automatic path, which just stores in order and lets the later store land
+/// on the earlier one, kept it. The two disagreed on the same initializer.
+///
+/// Every case here is checked in both storage durations, against the values
+/// gcc and clang produce.
+#[test]
+fn c99_a_designated_override_replaces_only_the_subobject_it_names() {
+    let code = r#"
+struct T { int x, y; };
+struct S { struct T t; int z; };
+struct A { int a[3]; int z; };
+
+struct S g1 = { .t = {1, 2}, .t.y = 9, .z = 7 };
+struct A g2 = { .a = {1, 2, 3}, .a[1] = 9, .z = 7 };
+
+int main(void)
+{
+    struct S l1 = { .t = {1, 2}, .t.y = 9, .z = 7 };
+    struct A l2 = { .a = {1, 2, 3}, .a[1] = 9, .z = 7 };
+
+    /* The override names .t.y, so .t.x keeps the 1 it was given. */
+    if (g1.t.x != 1 || g1.t.y != 9 || g1.z != 7) return 1;
+    if (l1.t.x != 1 || l1.t.y != 9 || l1.z != 7) return 2;
+
+    /* The same one level down: only element 1 is replaced. */
+    if (g2.a[0] != 1 || g2.a[1] != 9 || g2.a[2] != 3 || g2.z != 7) return 3;
+    if (l2.a[0] != 1 || l2.a[1] != 9 || l2.a[2] != 3 || l2.z != 7) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("designated_partial_override", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("designated_partial_override_opt", code),
+        0
+    );
+}
+
+/// "Later wins" means later in the initializer list, not later in the object.
+///
+/// The static path sorted its field initializers by address before resolving
+/// overlaps, so the rule was applied in the wrong order entirely: in
+/// `{ .z = 7, .t.y = 9, .t = {1,2} }` the `.t = {1,2}` is written last and must
+/// win, but after sorting it sat before `.t.y` and was the entry dropped.
+#[test]
+fn c99_a_designated_override_is_resolved_in_source_order() {
+    let code = r#"
+struct T { int x, y; };
+struct S { struct T t; int z; };
+
+/* The whole-field initializer comes last and wins, even though it names a
+   lower address than the override before it. */
+struct S g = { .z = 7, .t.y = 9, .t = {1, 2} };
+
+/* And the other order, where the narrower one wins. */
+struct S h = { .t = {1, 2}, .z = 7, .t.y = 9 };
+
+int main(void)
+{
+    struct S lg = { .z = 7, .t.y = 9, .t = {1, 2} };
+    struct S lh = { .t = {1, 2}, .z = 7, .t.y = 9 };
+
+    if (g.t.x != 1 || g.t.y != 2 || g.z != 7) return 1;
+    if (lg.t.x != 1 || lg.t.y != 2 || lg.z != 7) return 2;
+    if (h.t.x != 1 || h.t.y != 9 || h.z != 7) return 3;
+    if (lh.t.x != 1 || lh.t.y != 9 || lh.z != 7) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("designated_source_order", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("designated_source_order_opt", code),
+        0
+    );
+}
+
+/// Initializing a second member of a union resets it; it does not overlay the
+/// first.
+///
+/// This is the case where the two paths disagree the other way round. A union
+/// holds one member at a time, so `{ .u.i = 0x01020304, .u.s.b = 9 }` leaves
+/// the union holding `.u.s` with only `b` given a value and the rest zero --
+/// which is what the static path produced and what gcc and clang produce. The
+/// automatic path stored the `int` and then stored one byte over it, keeping
+/// the other three, so it read back `0x01020904`.
+///
+/// It is here as a guard on the fix above: making the static path store in
+/// source order the way the automatic path does would adopt this bug, so the
+/// merge has to keep the union case distinct from the struct and array cases.
+#[test]
+fn c99_initializing_a_second_union_member_resets_the_union() {
+    let code = r#"
+struct U { union { int i; struct { char a, b, c, d; } s; } u; };
+struct U g = { .u.i = 0x01020304, .u.s.b = 9 };
+
+int main(void)
+{
+    struct U l = { .u.i = 0x01020304, .u.s.b = 9 };
+    if (g.u.i != 0x900) return 1;
+    if (l.u.i != 0x900) return 2;
+    if (g.u.s.a != 0 || g.u.s.b != 9 || g.u.s.c != 0 || g.u.s.d != 0) return 3;
+    if (l.u.s.a != 0 || l.u.s.b != 9 || l.u.s.c != 0 || l.u.s.d != 0) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("union_member_reset", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("union_member_reset_opt", code), 0);
+}
+
+/// A designated override of a bit-field replaces only that bit-field.
+///
+/// The remaining half of the subobject rule. Bit-fields share a carrier, and
+/// the carrier's bytes are merged downstream of the `Initializer` tree, so the
+/// static path could not fold one override into an earlier initializer and fell
+/// back to dropping it whole -- losing `b` in `{ .t = {1,2}, .t.a = 3 }` --
+/// while the automatic path stored the carrier and then stored over part of it,
+/// keeping `b`. gcc keeps it. The two paths disagreeing is the defect; gcc's
+/// answer is which way to settle it.
+#[test]
+fn c99_a_designated_override_of_a_bitfield_keeps_its_neighbours() {
+    let code = r#"
+struct B { unsigned a : 4, b : 4; };
+struct S { struct B t; int z; };
+
+struct S g = { .t = {1, 2}, .t.a = 3, .z = 7 };
+struct S g2 = { .t = {1, 2}, .t.b = 5 };
+
+int main(void)
+{
+    struct S l = { .t = {1, 2}, .t.a = 3, .z = 7 };
+    struct S l2 = { .t = {1, 2}, .t.b = 5 };
+
+    if (g.t.a != 3 || g.t.b != 2 || g.z != 7) return 1;
+    if (l.t.a != 3 || l.t.b != 2 || l.z != 7) return 2;
+    if (g2.t.a != 1 || g2.t.b != 5) return 3;
+    if (l2.t.a != 1 || l2.t.b != 5) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("designated_bitfield_override", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("designated_bitfield_override_opt", code),
+        0
+    );
+}
+
+/// An override naming a subobject of the union member already held keeps the
+/// rest of that member.
+///
+/// `{ .u = {1,2}, .u.p.y = 9 }` initializes the union's first member and then
+/// overrides one of *its* members, so the union still holds `p` and `p.x` keeps
+/// the 1 it was given. c17 reset the union instead, because the `Initializer`
+/// tree records no discriminant and the merge could not tell "the same member,
+/// deeper" from "a different member" -- and resetting is right only for the
+/// second. Both storage durations agreed on the wrong answer, so nothing caught
+/// it.
+///
+/// The companion case, where a *different* member is named and the union really
+/// is reset, is covered by
+/// `c99_initializing_a_second_union_member_resets_the_union`, which must keep
+/// passing: the two are what distinguish the rule.
+#[test]
+fn c99_an_override_inside_the_held_union_member_keeps_the_rest() {
+    let code = r#"
+struct P { int x, y; };
+struct N { union { struct P p; int i; } u; };
+
+struct N g = { .u = {1, 2}, .u.p.y = 9 };
+
+int main(void)
+{
+    struct N l = { .u = {1, 2}, .u.p.y = 9 };
+    if (g.u.p.x != 1 || g.u.p.y != 9) return 1;
+    if (l.u.p.x != 1 || l.u.p.y != 9) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("union_member_deeper_override", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("union_member_deeper_override_opt", code),
+        0
+    );
+}
+
+/// An initializer for a whole struct supersedes an earlier one for a
+/// bit-field inside it, including the bit-fields it says nothing about.
+///
+/// The other direction of the bit-field rule, and the one the automatic path
+/// had wrong: it stored the bit-field, then stored the struct's own
+/// bit-fields over it, and `c` -- which `{1, 2}` does not mention -- kept the
+/// 7. The static path dropped the earlier entry whole and was right. gcc and
+/// clang zero it.
+///
+/// The objects here are deliberately wider than eight bytes, to keep the
+/// assertions clear of an unrelated x86-64 defect that widens a 32-bit store
+/// at offset 0 of an eight-byte local to 64 bits.
+#[test]
+fn c99_a_whole_struct_initializer_supersedes_an_earlier_bitfield() {
+    let code = r#"
+struct B { unsigned a : 4, b : 4, c : 4; };
+struct S { struct B t; int z; long pad; };
+
+struct S g = { .t.c = 7, .t = {1, 2} };
+
+int main(void)
+{
+    struct S l = { .t.c = 7, .t = {1, 2} };
+
+    if (g.t.a != 1 || g.t.b != 2 || g.t.c != 0) return 1;
+    if (l.t.a != 1 || l.t.b != 2 || l.t.c != 0) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("bitfield_superseded", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("bitfield_superseded_opt", code),
+        0
+    );
+}
+
+/// A bit-field naming a second member of a union resets the union, as any
+/// other initializer for a second member does.
+///
+/// A bit-field is stored by reading its carrier and writing it back, so the
+/// automatic path emitted no fill for it and three bytes of the `int` showed
+/// through the `struct` that replaced it. It is not that a bit-field clears
+/// nothing -- it clears nothing *of its own*, because its neighbours in the
+/// carrier are other objects -- but what the union it displaces requires.
+#[test]
+fn c99_a_bitfield_naming_a_second_union_member_resets_the_union() {
+    let code = r#"
+struct U { union { int i; struct { unsigned a : 4, b : 4; } s; } u; long pad; };
+
+struct U g = { .u.i = 0x01020304, .u.s.a = 3 };
+
+int main(void)
+{
+    struct U l = { .u.i = 0x01020304, .u.s.a = 3 };
+
+    if (g.u.i != 3 || g.u.s.a != 3 || g.u.s.b != 0) return 1;
+    if (l.u.i != 3 || l.u.s.a != 3 || l.u.s.b != 0) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("bitfield_union_reset", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("bitfield_union_reset_opt", code),
+        0
+    );
+}
+
+/// Naming a subobject of a union member the union does *not* hold resets it,
+/// even where the two members are the same size and the same shape.
+///
+/// The guard on the fold above. Knowing which member is held comes from the
+/// initializer list, not from the lowered bytes, so `struct P` and `struct Q`
+/// being indistinguishable once lowered costs nothing: `.u = {1, 2}` gives
+/// `p` a value and `.u.q.d = 9` names `q`, so the union comes to hold `q`
+/// with only `d` given a value. Reading it back through the *other* member
+/// would be undefined; `q.c` is not.
+#[test]
+fn c99_an_override_naming_another_union_member_resets_it_whatever_its_shape() {
+    let code = r#"
+struct P { int x, y; };
+struct Q { int c, d; };
+struct N { union { struct P p; struct Q q; } u; long pad; };
+
+struct N g = { .u = {1, 2}, .u.q.d = 9 };
+
+/* And the fold, in the same union, when the member named is the held one. */
+struct N h = { .u = {1, 2}, .u.p.y = 9 };
+
+int main(void)
+{
+    struct N l = { .u = {1, 2}, .u.q.d = 9 };
+    struct N m = { .u = {1, 2}, .u.p.y = 9 };
+
+    if (g.u.q.c != 0 || g.u.q.d != 9) return 1;
+    if (l.u.q.c != 0 || l.u.q.d != 9) return 2;
+    if (h.u.p.x != 1 || h.u.p.y != 9) return 3;
+    if (m.u.p.x != 1 || m.u.p.y != 9) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("union_other_member_reset", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("union_other_member_reset_opt", code),
+        0
+    );
+}

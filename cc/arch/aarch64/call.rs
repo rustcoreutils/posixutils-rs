@@ -750,14 +750,15 @@ impl Aarch64CodeGen {
             if let StackKind::Composite { bytes } = stack_arg.kind {
                 // The pseudo locates the aggregate; its bytes go into the
                 // slot.
+                // AAPCS64 B.4 replaces a composite above sixteen bytes with a
+                // pointer to the caller's copy, so the run here is bounded by
+                // the ABI at two eightbytes; the widths are `block_chunks`'s,
+                // so a composite that is not a multiple of eight reads and
+                // writes its tail as wide as the tail is.
                 let src = self.aggregate_arg_address(stack_arg.pseudo);
-                let mut done = 0;
-                while done < bytes {
-                    let chunk = [8, 4, 2, 1]
-                        .into_iter()
-                        .find(|c| *c <= bytes - done)
-                        .unwrap_or(1);
-                    let size = OperandSize::from_bits(chunk as u32 * 8);
+                for (done, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
+                    let size = OperandSize::from_bits(chunk.bits());
+                    let done = done as i32;
                     self.push_lir(Aarch64Inst::Ldr {
                         size,
                         addr: MemAddr::BaseOffset {
@@ -774,7 +775,6 @@ impl Aarch64CodeGen {
                             offset: offset + done,
                         },
                     });
-                    done += chunk;
                 }
                 continue;
             }

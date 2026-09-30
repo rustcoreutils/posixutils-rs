@@ -25,7 +25,8 @@ use super::asm_probe::{
     asm_for, asm_for_with, body_of, AARCH64_DARWIN, AARCH64_LINUX, X86_64_LINUX,
 };
 use crate::common::{
-    aarch64_cross_available, compile_with_host_cc, create_c_file, cross_link_and_run, run_c17,
+    aarch64_cross_available, compile_and_run, compile_with_host_cc, create_c_file,
+    cross_link_and_run, run_c17,
 };
 
 /// AAPCS64 passes a `_Complex` as a two-element HFA, so it occupies **two**
@@ -3443,6 +3444,251 @@ int named_s(struct P p) { return ns(p, 1); }
             !body.iter().any(|l| l.starts_with("mov x0, x")),
             "{func}: the pair's address must not be passed in x0:\n{}",
             body.join("\n")
+        );
+    }
+}
+
+/// The bytes a prologue stores into the frame, summed by the width of each
+/// store's mnemonic.
+///
+/// Only the prologue: the region before the first `.L` block label, which is
+/// where the incoming arguments are written to their locals. A store is a move
+/// whose *destination* is the frame, so the line ends with `(%rbp)`; a load
+/// from the same place has it in the middle.
+fn prologue_frame_store_bytes(body: &str) -> i64 {
+    body.lines()
+        .take_while(|l| !l.trim().starts_with(".L"))
+        .filter_map(|l| {
+            let t = l.trim();
+            let (mnemonic, operands) = t.split_once(' ')?;
+            if !operands.ends_with("(%rbp)") {
+                return None;
+            }
+            match mnemonic {
+                "movq" | "movsd" => Some(8),
+                "movl" | "movss" => Some(4),
+                "movw" => Some(2),
+                "movb" => Some(1),
+                _ => None,
+            }
+        })
+        .sum()
+}
+
+/// A composite parameter that arrives in registers is stored no wider than it
+/// is.
+///
+/// Each eightbyte travels in a whole register, but the last eightbyte of a
+/// composite that is not a multiple of eight holds fewer bytes than the
+/// register does -- five, for a thirteen-byte one. `grow_frame` rounds a slot
+/// up only to the type's own alignment, which is *one* for `unsigned char[13]`,
+/// so storing the register's eight wrote three bytes past the local.
+#[test]
+fn codegen_a_register_pair_parameter_stores_only_its_own_bytes() {
+    let src = "\
+struct B13 { unsigned char c[13]; };
+int probe(struct B13 v) { return v.c[0] + v.c[12]; }
+";
+    let asm = asm_for_with("reg_pair_tail", X86_64_LINUX, src, &["-O0"]);
+    let body = body_of(&asm, "probe");
+    assert_eq!(
+        prologue_frame_store_bytes(body),
+        13,
+        "a thirteen-byte parameter is 8 + 4 + 1, and nothing more:\n{body}"
+    );
+}
+
+/// The same, for an all-SSE composite whose last eightbyte is a width no
+/// floating-point store has.
+///
+/// `struct { float a, b, c; _Float16 d; }` is fourteen bytes when packed, and
+/// both of its eightbytes are SSE class -- the second holds six bytes. There
+/// is no six-byte SSE store, so the register has to go through a general one;
+/// rounding the width up instead wrote two bytes past the object.
+#[test]
+fn codegen_a_packed_two_sse_parameter_stores_only_its_own_bytes() {
+    let src = "\
+struct __attribute__((packed)) P6 { float a, b, c; _Float16 d; };
+float probe(struct P6 p) { return p.a + p.b + p.c; }
+";
+    let asm = asm_for_with("packed_two_sse", X86_64_LINUX, src, &["-O0"]);
+    let body = body_of(&asm, "probe");
+    assert_eq!(
+        prologue_frame_store_bytes(body),
+        14,
+        "a fourteen-byte two-SSE parameter is 8 + 4 + 2, and nothing more:\n{body}"
+    );
+}
+
+/// The bulk `va_arg` copy still moves the ragged tail.
+///
+/// A bound is only half of the rule: `rep movsq` and the counted loop both
+/// move whole eightbytes (sixteen bytes, for the loop), and 4093 bytes is
+/// neither. A copy that stopped at the last whole unit would leave the last
+/// bytes of the aggregate unwritten, which no instruction count can show.
+#[test]
+fn codegen_a_bulk_va_arg_copy_moves_the_ragged_tail() {
+    let src = "\
+#include <stdarg.h>
+struct Odd { unsigned char c[4093]; };
+void sink(struct Odd *);
+void probe(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    struct Odd o = va_arg(ap, struct Odd);
+    sink(&o);
+    va_end(ap);
+}
+";
+    for (triple, byte_move) in [(X86_64_LINUX, "movb"), (AARCH64_LINUX, "ldrb")] {
+        let asm = asm_for_with("va_arg_odd", triple, src, &["-O2"]);
+        let body = body_of(&asm, "probe");
+        assert!(
+            body.contains(byte_move),
+            "4093 bytes ends on an odd byte, so the tail needs a byte move on \
+             {triple}:\n{body}"
+        );
+    }
+}
+
+/// The values survive the paths above, with guards either side.
+///
+/// Every size here is one the register-pair and all-SSE prologues classify
+/// into two eightbytes whose second is short, and every object is fenced, so a
+/// store that is wider than its object shows up as a clobbered guard.
+#[test]
+fn codegen_register_composite_parameters_keep_their_values() {
+    let code = r#"
+struct B13 { unsigned char c[13]; };
+struct MX { int a, b; float c; };
+struct __attribute__((packed)) P6 { float a, b, c; _Float16 d; };
+struct __attribute__((packed)) G13 { long x; unsigned char c[5]; };
+
+__attribute__((noinline)) int take_b13(struct B13 v)
+{ int s = 0; for (int i = 0; i < 13; i++) s += v.c[i]; return s; }
+__attribute__((noinline)) float take_mx(struct MX p) { return (float)(p.a + p.b) + p.c; }
+__attribute__((noinline)) float take_p6(struct P6 p) { return p.a + p.b + p.c + (float)p.d; }
+__attribute__((noinline)) long take_g13(struct G13 p) { return p.x + p.c[0] + p.c[4]; }
+
+int main(void)
+{
+    volatile unsigned char lo = 0xA5;
+    struct B13 b13;
+    struct MX mx = {1, 2, 4.f};
+    struct P6 p6 = {1.f, 2.f, 4.f, (_Float16)8.f};
+    struct G13 g13 = {7, {1, 2, 3, 4, 5}};
+    volatile unsigned char hi = 0x5A;
+
+    for (int i = 0; i < 13; i++) b13.c[i] = (unsigned char)(i + 1);
+
+    if (take_b13(b13) != 91) return 1;
+    if (take_mx(mx) != 7.f) return 2;
+    if (take_p6(p6) != 15.f) return 3;
+    if (take_g13(g13) != 13) return 4;
+    if (lo != 0xA5 || hi != 0x5A) return 5;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("register_composite_params", code, &[]), 0);
+}
+
+/// The optimized IR of `src` for `target`, with inlining left on.
+fn post_opt_ir_inlined(prefix: &str, src: &str, target: &str, func: &str) -> String {
+    let dir = plib::tmp::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("tempdir");
+    let c = dir.path().join("t.c");
+    std::fs::write(&c, src).expect("write source");
+    let r = run_c17(&[
+        "--target",
+        target,
+        "-O2",
+        "--dump-ir",
+        "post-opt",
+        "--dump-ir-func",
+        func,
+        "-S",
+        "-o",
+        "/dev/null",
+        c.to_str().unwrap(),
+    ]);
+    assert!(r.success, "compile failed: {}", r.stderr);
+    format!("{}{}", r.stdout, r.stderr)
+}
+
+/// An aggregate returned in registers is spliced into its caller as its value,
+/// not as the address of the callee's copy.
+///
+/// The inliner replaces a `Ret` with a phi of the returned value. For a
+/// register-returned aggregate it has to read that value out of the callee's
+/// result local first. It did for the two-register case and for a one-register
+/// aggregate of eight bytes, but a *sixteen*-byte aggregate returned in one SSE
+/// register -- `struct { __float128 a; }` -- had its `symaddr` fed straight
+/// into the phi, so the caller received the address where the value belonged:
+///
+///     leaq -96(%rbp), %rax     ; the callee's result local
+///     movq %r10, -64(%rbp)     ; stored into eight bytes of a sixteen-byte slot
+///     movq -56(%rbp), %rax     ; the other eight read uninitialized
+///
+/// Inlining therefore changed the answer. Compiling for an explicit target is
+/// what makes this testable at all: `__float128` is rejected on Darwin, so the
+/// shape cannot be built for the host, and no test covered it.
+#[test]
+fn codegen_an_inlined_register_aggregate_return_is_a_value() {
+    let src = "\
+struct Q { __float128 a; };
+static struct Q mk(__float128 x) { struct Q r = {x}; return r; }
+__float128 probe(__float128 x) { struct Q v = mk(x); return v.a; }
+";
+    let ir = post_opt_ir_inlined("inl_sse_ret", src, X86_64_LINUX, "probe");
+
+    // Every pseudo that holds an address rather than a value.
+    let addresses: Vec<&str> = ir
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            let (target, rest) = t.split_once(" = ")?;
+            rest.starts_with("symaddr").then_some(target)
+        })
+        .collect();
+
+    // A phi source carries the returned value, so none of them may be one.
+    for line in ir.lines().map(str::trim).filter(|l| l.contains("phisrc")) {
+        for addr in &addresses {
+            assert!(
+                !line
+                    .split_whitespace()
+                    .any(|w| w.trim_end_matches(',') == *addr),
+                "the inlined return hands the caller {addr}, which is an address, \
+                 where the aggregate's value belongs:\n  {line}\n\nfull IR:\n{ir}"
+            );
+        }
+    }
+}
+
+/// The control: the shapes that already worked must keep working, so the check
+/// above cannot pass by the inliner declining to inline.
+#[test]
+fn codegen_inlined_aggregate_returns_still_inline() {
+    let src = "\
+struct F2 { float a, b; };
+struct F4 { float a, b, c, d; };
+static struct F2 mk2(float x) { struct F2 r = {x, x + 1}; return r; }
+static struct F4 mk4(float x) { struct F4 r = {x, x+1, x+2, x+3}; return r; }
+float probe2(float x) { struct F2 v = mk2(x); return v.a + v.b; }
+float probe4(float x) { struct F4 v = mk4(x); return v.a + v.d; }
+";
+    for func in ["probe2", "probe4"] {
+        let ir = post_opt_ir_inlined("inl_agg_ok", src, X86_64_LINUX, func);
+        assert!(
+            ir.contains("_inline"),
+            "{func}'s callee must still be inlined, or the check above is vacuous:\n{ir}"
+        );
+        assert!(
+            ir.lines().any(|l| l.contains("load")),
+            "{func} must read the returned aggregate's value:\n{ir}"
         );
     }
 }

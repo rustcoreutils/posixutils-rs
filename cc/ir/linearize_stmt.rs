@@ -37,6 +37,28 @@ fn return_value_ness_violation(pos: Position, msg: &str) {
 
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 
+/// The `-Wno-<name>` group for a case label the switch's promoted controlling
+/// type cannot hold, spelled as gcc spells the same diagnostic.
+const CASE_RANGE_WARNING: &str = "switch-outside-range";
+
+/// Whether [`Linearizer::store_string_units`] owes the destination's tail a
+/// zero fill.
+///
+/// C17 6.7.9p21 zeroes every element a string initializer does not reach, and
+/// exactly one of the two spellings already has that covered: the braced form
+/// reaches the array through an initializer list, and each list is preceded by
+/// a whole-object [`Linearizer::emit_aggregate_zero`]. Zeroing again there
+/// would double the stores at `-O0`, where no `dse` runs to remove them.
+#[derive(Clone, Copy)]
+pub(crate) enum StringTail {
+    /// The destination is already zero: the caller zeroed the whole aggregate
+    /// before walking the initializer list.
+    AlreadyZero,
+    /// Nothing has written the destination yet, so the tail is this call's to
+    /// fill.
+    Zero,
+}
+
 /// Which construct a jump leaves, for `unwind_vla_marks`.
 ///
 /// `break` leaves the innermost loop *or* switch; `continue` leaves the
@@ -49,6 +71,69 @@ enum JumpKind {
     Continue,
 }
 
+/// A `for` loop whose body is being lowered: what
+/// [`Linearizer::open_for`] set up and [`Linearizer::close_for`] finishes.
+///
+/// `for` is lowered from two places -- the ordinary statement walk and the
+/// switch-body walk, which must keep lowering the body through itself so the
+/// `case` labels inside stay reachable -- and the two differ *only* in how
+/// they lower the body. Everything else lives here, so a fix lands once
+/// instead of twice: the loop's back edge had to be repaired in both copies,
+/// and the release of a VLA declared in the init clause was missing from
+/// both.
+#[must_use = "an opened `for` loop must be finished with close_for"]
+struct OpenFor {
+    /// The scope the init clause declares into, ended after `exit_bb`.
+    scope: Scope,
+    /// The block the back edge goes to.
+    cond_bb: BasicBlockId,
+    /// Where the body falls out to, and the `continue` target.
+    post_bb: BasicBlockId,
+    /// Where the loop ends, and the `break` target.
+    exit_bb: BasicBlockId,
+}
+
+/// One initializer from a struct or union initializer list that has already
+/// been stored into the object being initialized.
+///
+/// The automatic path emits a store per list entry and lets a later store land
+/// on an earlier one, which is all C17 6.7.9p19 needs *while* the later store
+/// covers every byte it supersedes. It does not when the later initializer
+/// fills only part of the subobject it names, and it does not when the two
+/// entries name different members of a union -- a union holds one member at a
+/// time, so the member left behind does not show through the new one. Both
+/// need the superseded bytes cleared, and deciding which bytes those are is
+/// what this records.
+struct WrittenInit {
+    /// The bytes it wrote that no later entry has since cleared.
+    live: std::ops::Range<usize>,
+    /// The first byte of the subobject it initialized, and that subobject's
+    /// type. Together they say whether a later entry names a member of this
+    /// one -- in which case the rest of this one survives -- or reaches its
+    /// bytes only by passing through a union.
+    origin: usize,
+    typ: TypeId,
+    /// The member each union inside that subobject came to hold, which
+    /// decides whether a later entry naming something inside one of them
+    /// names the *same* member -- and so leaves the rest of it standing.
+    held: UnionMembers,
+    /// Set when the entry is a bit-field, to its bit offset. Two bit-fields
+    /// sharing a carrier byte are different objects and neither supersedes
+    /// the other, however their bytes overlap.
+    bits: Option<u32>,
+}
+
+/// Grow `reset` to also cover `range`.
+///
+/// Every range joined here overlaps the range of the entry being stored, so
+/// the union of them all is contiguous and one fill covers it.
+fn widen_reset(reset: &mut Option<std::ops::Range<usize>>, range: std::ops::Range<usize>) {
+    *reset = Some(match reset.take() {
+        Some(cur) => cur.start.min(range.start)..cur.end.max(range.end),
+        None => range,
+    });
+}
+
 impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_stmt(&mut self, stmt: &Stmt) {
         match stmt {
@@ -59,24 +144,18 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             Stmt::Block(items) => {
-                self.push_scope();
-                // A VLA's storage lives until control leaves the scope of its
-                // declaration (C17 6.2.4p7). Capture the stack pointer on the
-                // way in and put it back on the way out, or a loop body's VLA
-                // is allocated afresh every iteration and never released --
-                // `for (...) { int x[n]; }` died of stack exhaustion.
-                let vla_scope = self.open_vla_scope();
+                // Entering the scope also captures the stack pointer, and
+                // leaving it puts the pointer back -- a VLA's storage lives
+                // until control leaves the scope of its declaration (C17
+                // 6.2.4p7). See `Scope`.
+                let scope = self.push_scope();
                 for item in items {
                     match item {
                         BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
                         BlockItem::Statement(s) => self.linearize_stmt(s),
                     }
                 }
-                // Only on the falling-out path: a `break`, `continue` or
-                // `return` that left already did its own unwinding.
-                self.close_vla_scope(vla_scope);
-
-                self.pop_scope();
+                self.pop_scope(scope);
             }
 
             Stmt::If {
@@ -257,6 +336,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                     );
                 }
                 let addr = self.linearize_expr(target);
+                // A computed `goto` leaves scopes exactly as a named one
+                // does, and left out here it left a loop body's VLA behind
+                // every time round. Which scopes it leaves depends on which
+                // label it reaches, which is not known until every label is
+                // placed -- and then only as a set. See
+                // `GotoTarget::AnyAddressTaken`.
+                self.defer_vla_restore(GotoTarget::AnyAddressTaken);
                 let (dispatch_bb, slot) = self.indirect_dispatch_block();
                 // Hand the address over in the hidden local and branch to the
                 // one dispatch block, which is the only place that fans out to
@@ -274,44 +360,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let label_str = self.str(*label).to_string();
                 let target = self.refer_to_label(&label_str, *pos);
                 if let Some(current) = self.current_bb {
-                    // A backward jump -- the label is already linearized, so
-                    // it has a captured stack pointer -- leaves the scope of
-                    // every VLA declared after it, and that storage has to go
-                    // back. Otherwise `lab: int x[n]; ... goto lab;` grows the
-                    // stack every time round until the program dies.
-                    //
-                    // A *forward* jump cannot be decided here: its label has
-                    // no depth recorded yet, and whether it stays inside the
-                    // scope of the VLAs in force or leaves it is exactly what
-                    // decides between no restore and one. It is recorded and
-                    // resolved in `resolve_forward_goto_vla_restores`.
-                    //
-                    // Leaving it to "the block's own exit does the restoring"
-                    // was wrong: the branch *terminates* the block, so
-                    // `close_vla_scope` emits nothing and then drops the
-                    // marks, and the enclosing block has no mark of its own to
-                    // undo them with. A `goto` out of a loop body's inner
-                    // block grew the stack every time round.
-                    if let Some(&depth) = self.label_vla_depth.get(&label_str) {
-                        if let Some(m) = self.vla_marks.get(depth) {
-                            let mark = m.mark;
-                            self.emit_stack_restore(mark);
-                        }
-                    } else if !self.vla_marks.is_empty() {
-                        let at = self
-                            .current_func
-                            .as_ref()
-                            .and_then(|f| f.get_block(current))
-                            .map_or(0, |b| b.insns.len());
-                        let marks = self.vla_marks.iter().map(|m| m.mark).collect();
-                        self.pending_goto_vla
-                            .push(crate::ir::linearize::PendingGotoVla {
-                                label: label_str.clone(),
-                                bb: current,
-                                at,
-                                marks,
-                            });
-                    }
+                    self.release_vla_scopes_for_goto(target);
                     self.emit(Instruction::br(target));
                     self.link_bb(current, target);
                 }
@@ -545,7 +594,18 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // scalar case below and stored the literal's *address*
                     // into the array's first element.
                     if self.types.kind(typ) == TypeKind::Array {
-                        self.store_string_units(sym_id, 0, typ, &init.kind, &units);
+                        // Nothing has zeroed this local -- the `InitList` arm
+                        // above calls `emit_aggregate_zero` and this one never
+                        // did -- so the elements past the literal are
+                        // `store_string_units`' to fill.
+                        self.store_string_units(
+                            sym_id,
+                            0,
+                            typ,
+                            &init.kind,
+                            &units,
+                            StringTail::Zero,
+                        );
                     } else {
                         // Pointer initialized with a string literal — store the address
                         let val = self.linearize_expr(init);
@@ -956,12 +1016,15 @@ impl<'a> super::linearize::Linearizer<'a> {
                     if let [only] = elements {
                         if only.designators.is_empty() {
                             if let Some(units) = Self::string_literal_units(&only.value.kind) {
+                                // Every initializer list is preceded by a
+                                // whole-object zero, so the tail is done.
                                 self.store_string_units(
                                     base_sym,
                                     base_offset,
                                     typ,
                                     &only.value.kind,
                                     &units,
+                                    StringTail::AlreadyZero,
                                 );
                                 return;
                             }
@@ -975,59 +1038,39 @@ impl<'a> super::linearize::Linearizer<'a> {
                     TypeKind::Array | TypeKind::Struct | TypeKind::Union
                 );
 
-                let groups = self.group_array_init_elements(elements, elem_type);
+                let groups = self.group_array_init_elements(elements, typ);
                 for element_index in groups.indices {
                     let Some(list) = groups.element_lists.get(&element_index) else {
                         continue;
                     };
                     let offset = base_offset + element_index * elem_size as i64;
-                    // When a string literal initializes a char array element
-                    // (e.g., char arr[3][4] = {"Sun", "Mon", "Tue"}), handle
-                    // it as a string copy rather than recursing into individual
-                    // char stores. The recursion would treat the string as a
-                    // pointer instead of inline data.
-                    let is_string_for_char_array = elem_is_aggregate
-                        && list.len() == 1
-                        && matches!(
-                            list[0].value.kind,
-                            ExprKind::StringLit(_)
-                                | ExprKind::WideStringLit(_)
-                                | ExprKind::Utf16StringLit(_)
-                                | ExprKind::Utf32StringLit(_)
-                        )
-                        && self.types.kind(elem_type) == TypeKind::Array;
-                    if is_string_for_char_array {
-                        // Emit byte-by-byte stores for the string content
-                        if let ExprKind::StringLit(s) = &list[0].value.kind {
-                            let char_type = self
-                                .types
-                                .base_type(elem_type)
-                                .unwrap_or(self.types.char_id);
-                            let char_bits = self.types.size_bits(char_type);
-                            for (i, ch) in s.chars().enumerate() {
-                                let byte_val = self.emit_const(ch as u8 as i128, self.types.int_id);
-                                self.emit(Instruction::store(
-                                    byte_val,
-                                    base_sym,
-                                    offset + i as i64,
-                                    char_type,
-                                    char_bits,
-                                ));
-                            }
-                            // Null terminator + zero fill
-                            let arr_bytes = self.types.size_bytes(elem_type);
-                            let str_len = s.chars().count();
-                            for i in str_len..arr_bytes {
-                                let zero = self.emit_const(0, self.types.int_id);
-                                self.emit(Instruction::store(
-                                    zero,
-                                    base_sym,
-                                    offset + i as i64,
-                                    char_type,
-                                    char_bits,
-                                ));
-                            }
-                        }
+                    // A string literal initializing an array element --
+                    // `char arr[3][4] = {"Sun", "Mon", "Tue"}` -- is inline
+                    // data, not one element. Recursing into it would treat the
+                    // literal as the pointer it decays to everywhere else.
+                    //
+                    // Shared with the other three string-store paths rather
+                    // than counted a third way here. Written out, this loop
+                    // recognized all four literal kinds and then handled only
+                    // `StringLit`, dropping a wide element and leaving it
+                    // zero; stepped the destination by raw *bytes* where a
+                    // wide element is 2 or 4 bytes wide; and had no capacity
+                    // clamp at all, so `char s[1][3] = {"hello"}` stored five
+                    // bytes into a three-byte object -- two of them past the
+                    // whole local, not merely into the next row.
+                    let string_element = (list.len() == 1
+                        && self.types.kind(elem_type) == TypeKind::Array)
+                        .then(|| Self::string_literal_units(&list[0].value.kind))
+                        .flatten();
+                    if let Some(units) = string_element {
+                        self.store_string_units(
+                            base_sym,
+                            offset,
+                            elem_type,
+                            &list[0].value.kind,
+                            &units,
+                            StringTail::AlreadyZero,
+                        );
                         continue;
                     }
                     if elem_is_aggregate {
@@ -1086,7 +1129,23 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let visits =
                         self.walk_struct_init_fields(resolved_typ, &members, is_union, elements);
 
+                    // C17 6.7.9p19 resolves two initializers for overlapping
+                    // storage by subobject. Storing them in list order is
+                    // enough only where the later store covers every byte it
+                    // supersedes; where it does not, the bytes it leaves have
+                    // to be cleared first. See [`WrittenInit`].
+                    let mut written: Vec<WrittenInit> = Vec::new();
+
                     for visit in visits {
+                        let held = self.held_union_members(visit.typ, &visit.kind, visit.offset);
+                        if let Some(reset) = self.init_override_reset(&mut written, &visit, held) {
+                            self.emit_block_zero(
+                                base_sym,
+                                base_offset + reset.start as i64,
+                                (reset.end - reset.start) as i64,
+                            );
+                        }
+
                         let offset = base_offset + visit.offset as i64;
                         let field_type = visit.typ;
 
@@ -1119,6 +1178,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                                         bit_w,
                                         storage_size,
                                         member_val,
+                                        field_type,
                                     );
                                 } else {
                                     self.linearize_struct_field_init(
@@ -1153,6 +1213,131 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
         }
+    }
+
+    /// Record that `visit` is about to be stored, and answer which bytes of
+    /// the object must be cleared first for C17 6.7.9p19 to hold.
+    ///
+    /// Nothing at all, for the usual case where the entry overlaps none of
+    /// those already stored. Otherwise the entry's own bytes -- so that the
+    /// part of the subobject it does not fill reads as zero rather than as
+    /// the initializer it replaces -- together with the bytes of any earlier
+    /// entry it invalidates: all of one it wholly contains, all of one it is
+    /// not a subobject of, and, where it reaches an earlier entry's bytes only
+    /// by naming a member of a union inside it, that union's bytes.
+    ///
+    /// A bit-field is stored by reading its carrier and writing it back, so
+    /// its own bytes are not storage it owns and clearing them would blank the
+    /// members sharing the carrier. It therefore never clears its own span --
+    /// only what an earlier entry it supersedes requires, which is how a
+    /// bit-field naming a second member of a union still resets it.
+    fn init_override_reset(
+        &self,
+        written: &mut Vec<WrittenInit>,
+        visit: &StructFieldVisit,
+        held: UnionMembers,
+    ) -> Option<std::ops::Range<usize>> {
+        if visit.field_size == 0 || visit.bit_width == Some(0) {
+            return None;
+        }
+        let bits = visit.bit_offset.filter(|_| visit.bit_width.is_some());
+        let span = match (visit.bit_offset, visit.bit_width) {
+            // Only the bytes the field's own bits reach; its access span is
+            // wider and covers bytes other members own.
+            (Some(bit_offset), Some(bit_width)) => {
+                let start = visit.offset + (bit_offset / 8) as usize;
+                let end = visit.offset + (bit_offset + bit_width).div_ceil(8) as usize;
+                start..end.max(start + 1)
+            }
+            _ => visit.offset..visit.offset + visit.field_size,
+        };
+        let mut reset: Option<std::ops::Range<usize>> = None;
+
+        for entry in written.iter() {
+            if entry.live.start >= span.end || span.start >= entry.live.end {
+                continue;
+            }
+            // Two bit-fields are different objects even when they share a
+            // carrier byte, and the same one written twice needs no clearing:
+            // the second store reads the carrier back and replaces its bits.
+            if bits.is_some() && entry.bits.is_some() {
+                continue;
+            }
+            if bits.is_none() {
+                widen_reset(&mut reset, span.clone());
+
+                // Wholly superseded: the entry's own bytes are all inside the
+                // ones being cleared and rewritten.
+                if span.start <= entry.live.start && entry.live.end <= span.end {
+                    continue;
+                }
+            }
+
+            let entry_end = entry.origin + self.types.size_bytes(entry.typ);
+            let inner = span
+                .start
+                .checked_sub(entry.origin)
+                .filter(|_| span.end <= entry_end);
+            let unions = UnionFold::new(&entry.held, &visit.unions, entry.origin);
+            let place = match inner {
+                None => SubobjectPlace::NotASubobject,
+                Some(inner) if bits.is_some() => {
+                    self.classify_bitfield_carrier(entry.typ, inner, span.end - span.start, unions)
+                }
+                Some(inner) => self.classify_subobject(entry.typ, inner, visit.field_size, unions),
+            };
+            match place {
+                // A member of the earlier entry's object: the rest of that
+                // object is a different subobject and stands.
+                SubobjectPlace::Member => {}
+                SubobjectPlace::ThroughUnion { offset, size } => {
+                    widen_reset(
+                        &mut reset,
+                        entry.origin + offset..entry.origin + offset + size,
+                    );
+                }
+                // The carrier the earlier entry wrote is shared: the bits this
+                // one names are replaced in place and its neighbours' stand.
+                SubobjectPlace::BitfieldCarrier { .. } => {}
+                SubobjectPlace::NotASubobject => {
+                    widen_reset(&mut reset, entry.live.clone());
+                }
+            }
+        }
+
+        if let Some((from, to)) = reset.as_ref().map(|range| (range.start, range.end)) {
+            // Whatever the fill covers is gone; the bytes an entry keeps on
+            // either side of it are still its own.
+            *written = written
+                .drain(..)
+                .flat_map(|entry| {
+                    let (origin, typ, held, bits) =
+                        (entry.origin, entry.typ, entry.held, entry.bits);
+                    [
+                        entry.live.start..entry.live.end.min(from),
+                        entry.live.start.max(to)..entry.live.end,
+                    ]
+                    .into_iter()
+                    .filter(|live| live.start < live.end)
+                    .map(move |live| WrittenInit {
+                        live,
+                        origin,
+                        typ,
+                        held: held.clone(),
+                        bits,
+                    })
+                })
+                .collect();
+        }
+
+        written.push(WrittenInit {
+            live: span,
+            origin: visit.offset,
+            typ: visit.typ,
+            held,
+            bits,
+        });
+        reset
     }
 
     /// Store a complex value into `base_sym` at `offset`, as two halves.
@@ -1253,7 +1438,16 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // Shared with the two other string-store paths rather than
                 // counted a third way here.
                 if let Some(units) = Self::string_literal_units(&value.kind) {
-                    self.store_string_units(base_sym, offset, field_type, &value.kind, &units);
+                    // Reached only from an initializer list, which the caller
+                    // zeroed whole before walking it.
+                    self.store_string_units(
+                        base_sym,
+                        offset,
+                        field_type,
+                        &value.kind,
+                        &units,
+                        StringTail::AlreadyZero,
+                    );
                 }
             } else {
                 let val = self.linearize_expr(value);
@@ -1397,15 +1591,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.switch_bb(exit_bb);
     }
 
-    pub(crate) fn linearize_for(
-        &mut self,
-        init: Option<&ForInit>,
-        cond: Option<&Expr>,
-        post: Option<&Expr>,
-        body: &Stmt,
-    ) {
-        // C99 for-loop declarations (e.g., for (int i = 0; ...)) are scoped to the loop.
-        self.push_scope();
+    /// Lower everything a `for` loop needs before its body: the init clause,
+    /// the four blocks, the condition and the jump targets. Leaves the body
+    /// block current, for the caller to lower the body into.
+    ///
+    /// The returned [`OpenFor`] goes back to [`Self::close_for`].
+    fn open_for(&mut self, init: Option<&ForInit>, cond: Option<&Expr>) -> OpenFor {
+        // C99 for-loop declarations (e.g., for (int i = 0; ...)) are scoped
+        // to the loop -- and so is a VLA declared there, which the scope
+        // releases at `exit_bb`. That is the right place for it: `break` and
+        // `continue` both land inside this scope, so neither may release it.
+        let scope = self.push_scope();
 
         // Init
         if let Some(init) = init {
@@ -1446,9 +1642,27 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Body block
         self.break_targets.push(exit_bb);
         self.continue_targets.push(post_bb);
-
         self.switch_bb(body_bb);
-        self.linearize_stmt(body);
+
+        OpenFor {
+            scope,
+            cond_bb,
+            post_bb,
+            exit_bb,
+        }
+    }
+
+    /// Close the loop [`Self::open_for`] opened, once its body is lowered:
+    /// the back edge through the post-expression, then the exit block, then
+    /// the loop's scope.
+    fn close_for(&mut self, open: OpenFor, post: Option<&Expr>) {
+        let OpenFor {
+            scope,
+            cond_bb,
+            post_bb,
+            exit_bb,
+        } = open;
+
         if !self.is_terminated() {
             // After linearizing body, current_bb may be different from body_bb
             if let Some(current) = self.current_bb {
@@ -1465,14 +1679,33 @@ impl<'a> super::linearize::Linearizer<'a> {
         if let Some(post_expr) = post {
             self.linearize_expr(post_expr);
         }
-        self.emit(Instruction::br(cond_bb));
-        self.link_bb(post_bb, cond_bb);
+        // From the block the post-expression ended in, which `&&`, `||` and
+        // `?:` can make a different one from post_bb. Linking the back edge
+        // from post_bb itself recorded an edge out of a block that no longer
+        // holds the branch, and left the merge block that does hold it with an
+        // unrecorded successor -- the loop then never terminated.
+        if let Some(current) = self.current_bb {
+            self.emit(Instruction::br(cond_bb));
+            self.link_bb(current, cond_bb);
+        }
 
         // Exit block
         self.switch_bb(exit_bb);
 
-        // Restore locals to remove for-loop-scoped declarations
-        self.pop_scope();
+        // Drop the for-loop-scoped declarations and release their storage.
+        self.pop_scope(scope);
+    }
+
+    pub(crate) fn linearize_for(
+        &mut self,
+        init: Option<&ForInit>,
+        cond: Option<&Expr>,
+        post: Option<&Expr>,
+        body: &Stmt,
+    ) {
+        let open = self.open_for(init, cond);
+        self.linearize_stmt(body);
+        self.close_for(open, post);
     }
 
     pub(crate) fn linearize_switch(&mut self, expr: &Expr, body: &Stmt) {
@@ -1506,10 +1739,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Push exit block for break handling
         self.break_targets.push(exit_bb);
 
-        // Collect case labels and create basic blocks for each
-        let switch_unsigned = self.types.is_unsigned(cmp_type);
-        let (case_values, has_default) = self.collect_switch_cases(body, switch_unsigned);
-        let case_bbs: Vec<BasicBlockId> = case_values.iter().map(|_| self.alloc_bb()).collect();
+        // Collect case labels and create basic blocks for each. C17 6.8.4.2p5
+        // converts every label to `cmp_type`, and `conv` is that conversion:
+        // the collector applies it, and the body walk below reaches the labels
+        // back through the same value, so the two cannot drift apart.
+        let conv = CaseConv::of(self.types, cmp_type);
+        let (case_values, has_default) = self.collect_switch_cases(body, conv);
+        let case_bbs: Vec<BasicBlockId> = case_values
+            .ranges()
+            .iter()
+            .map(|_| self.alloc_bb())
+            .collect();
         let default_bb = if has_default {
             Some(self.alloc_bb())
         } else {
@@ -1523,11 +1763,15 @@ impl<'a> super::linearize::Linearizer<'a> {
             // A constant selector takes one edge, as a constant condition does
             // (`branch_on`): the labels it does not select are reached only by
             // falling into them, and a block nothing reaches is not emitted.
-            // Both sides are values of the promoted type, as the collector
-            // records the labels.
+            // Selector and labels are both converted to the promoted type, and
+            // the range test runs in that type's signedness -- a plain signed
+            // `i128` comparison answered differently from the runtime lowering
+            // of the very same switch.
+            let selector = conv.convert(selector);
             let target = case_values
+                .ranges()
                 .iter()
-                .position(|&(lo, hi)| lo <= selector && selector <= hi)
+                .position(|&(lo, hi)| conv.contains(lo, hi, selector))
                 .map_or(default_target, |idx| case_bbs[idx]);
             if let Some(current) = self.current_bb {
                 self.emit(Instruction::br(target));
@@ -1543,13 +1787,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.emit_wide_switch(
                 switch_val,
                 cmp_type,
-                &case_values,
+                conv,
+                case_values.ranges(),
                 &case_bbs,
                 default_target,
             );
         } else {
-            // Build switch instruction with case -> block mapping
+            // Build switch instruction with case -> block mapping. The labels
+            // have been converted to `cmp_type`, which is at most 64 bits
+            // here, so the cast keeps every bit of each one.
             let switch_cases: Vec<(i64, i64, BasicBlockId)> = case_values
+                .ranges()
                 .iter()
                 .zip(case_bbs.iter())
                 .map(|((lo, hi), bb)| (*lo as i64, *hi as i64, *bb))
@@ -1582,14 +1830,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         // block via `switch_bb`.
         self.current_bb = None;
 
-        // Linearize body with case block switching
-        // Each label's position among the cases, by its range. The first wins,
-        // as a scan in source order would find it; a duplicate has already
-        // been reported.
-        let mut case_index = CaseIndex::new();
-        for (idx, range) in case_values.iter().enumerate() {
-            case_index.entry(*range).or_insert(idx);
-        }
+        // Linearize body with case block switching. The index carries the
+        // collector's own conversion, so the walk finds a label under exactly
+        // the key the collector filed it under.
+        let case_index = CaseIndex::of(&case_values);
         self.linearize_switch_body(body, &case_index, &case_bbs, default_bb);
 
         // If not terminated after body, jump to exit
@@ -1614,33 +1858,22 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// only `Stmt::Block` here collected no cases from it -- so the switch was
     /// emitted with an empty table and every value took the default edge.
     /// A non-compound body is one statement, so it is walked as one.
-    pub(crate) fn collect_switch_cases(
-        &self,
-        body: &Stmt,
-        unsigned: bool,
-    ) -> (Vec<(i128, i128)>, bool) {
-        let mut case_values = CaseSet::new(unsigned);
+    pub(crate) fn collect_switch_cases(&self, body: &Stmt, conv: CaseConv) -> (CaseSet, bool) {
+        let mut case_values = CaseSet::new(conv);
         let mut has_default = false;
 
         match body {
             Stmt::Block(items) => {
                 for item in items {
                     if let BlockItem::Statement(stmt) = item {
-                        self.collect_cases_from_stmt(
-                            stmt,
-                            &mut case_values,
-                            &mut has_default,
-                            unsigned,
-                        );
+                        self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default);
                     }
                 }
             }
-            stmt => {
-                self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default, unsigned)
-            }
+            stmt => self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default),
         }
 
-        (case_values.ranges, has_default)
+        (case_values, has_default)
     }
 
     /// The block every computed `goto` in this function branches through,
@@ -1844,91 +2077,125 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
+    /// One case endpoint converted to the promoted controlling type, warning
+    /// if the controlling type cannot hold the constant the label spells.
+    ///
+    /// C17 6.8.4.2p5 requires the conversion, and most of the time it changes
+    /// nothing worth saying: `case -1:` in a `switch` on `unsigned` becomes
+    /// 4294967295, which is exactly the value it is written to match, and gcc
+    /// and clang are both silent there. What is worth a diagnostic is a label
+    /// whose bits the conversion throws away, silently turning
+    /// `case 4294967296LL:` into `case 0:`.
+    ///
+    /// The line between the two is whether converting back to the label's own
+    /// type returns the constant: a merely reinterpreted value round-trips,
+    /// while a truncated one does not. That is the test clang applies, and
+    /// gcc's `-Wswitch-outside-range` draws the line in the same place, which
+    /// is also the `-Wno-` name that silences this.
+    fn convert_case_label(&self, expr: &Expr, val: i128, conv: CaseConv) -> i128 {
+        let converted = conv.convert(val);
+        if converted == val {
+            return val;
+        }
+        // The label's own type, which the round trip goes back through. An
+        // untyped or non-integer label is already an error elsewhere; treat it
+        // as full width, which reduces the round trip to a plain comparison.
+        let own = expr.typ.filter(|&t| self.types.is_integer(t)).map_or_else(
+            || CaseConv::new(128, false),
+            |t| CaseConv::of(self.types, t),
+        );
+        if own.convert(converted) != val && crate::diag::warning_group_enabled(CASE_RANGE_WARNING) {
+            crate::diag::warning(
+                expr.pos,
+                &format!(
+                    "overflow converting case value to switch condition type \
+                     ({val} to {converted})"
+                ),
+            );
+        }
+        converted
+    }
+
     pub(crate) fn collect_cases_from_stmt(
         &self,
         stmt: &Stmt,
         case_values: &mut CaseSet,
         has_default: &mut bool,
-        unsigned: bool,
     ) {
         match stmt {
             Stmt::Case(expr, high, body) => {
-                self.collect_cases_from_stmt(body, case_values, has_default, unsigned);
+                self.collect_cases_from_stmt(body, case_values, has_default);
                 // Extract constant value from case expression
-                if let Some(val) = self.eval_const_expr(expr) {
-                    // Kept at full width. Truncating to `i64` here was silent
-                    // and wrong for a `switch` on `__int128`: a label outside
-                    // the 64-bit range wrapped into it and could match a value
-                    // it does not equal.
-
-                    // A GNU range `case lo ... hi:`. An absent high endpoint
-                    // is the ordinary label, held as the degenerate range
-                    // `(v, v)` so that everything downstream has one shape.
-                    let hi = match high {
-                        None => Some(val),
-                        Some(hi_expr) => match self.eval_const_expr(hi_expr) {
-                            Some(h) => Some(h),
-                            None => {
-                                self.report_unfoldable_case(hi_expr);
-                                None
-                            }
-                        },
-                    };
-                    let Some(hi) = hi else { return };
-
-                    // 6.8.4.2p3 forbids two equal case constants, and GCC
-                    // extends that to overlapping ranges -- an overlap would
-                    // otherwise make one arm silently unreachable, since the
-                    // body walk resolves a label by finding the first match.
-                    // Order by the switch type's own signedness. The
-                    // endpoints are carried as `i128`, and an unsigned 64-bit
-                    // bound above `i64::MAX` is still positive there -- but an
-                    // unsigned *128-bit* one is not, so the reinterpretation
-                    // is still needed: `case 0ul ... ULONG_MAX:` read as an
-                    // empty range and never matched.
-                    let below = |a: i128, b: i128| {
-                        if unsigned {
-                            (a as u128) < (b as u128)
-                        } else {
-                            a < b
+                let Some(raw_lo) = self.eval_const_expr(expr) else {
+                    self.report_unfoldable_case(expr);
+                    return;
+                };
+                // A GNU range `case lo ... hi:`. An absent high endpoint is
+                // the ordinary label, held as the degenerate range `(v, v)` so
+                // that everything downstream has one shape.
+                let raw_hi = match high {
+                    None => Some(raw_lo),
+                    Some(hi_expr) => match self.eval_const_expr(hi_expr) {
+                        Some(h) => Some(h),
+                        None => {
+                            self.report_unfoldable_case(hi_expr);
+                            None
                         }
-                    };
-                    if below(hi, val) {
-                        // GCC accepts an empty range, warns, and never matches
-                        // it. Nothing is recorded, so nothing can overlap it.
-                        crate::diag::warning(expr.pos, "empty range specified");
-                        return;
-                    }
-                    if let Some((lo2, hi2)) = case_values.overlap(val, hi) {
-                        let what = if val == hi && lo2 == hi2 {
-                            format!("duplicate case value '{}' in switch", val)
-                        } else {
-                            format!(
-                                "duplicate (or overlapping) case value: {}..{} overlaps {}..{}",
-                                val, hi, lo2, hi2
-                            )
-                        };
-                        error(expr.pos, &what);
-                    }
-                    case_values.insert(val, hi);
-                } else if self.expr_is_runtime(expr) {
-                    // A non-constant label can never match.
-                    error(expr.pos, "case label is not an integer constant expression");
-                } else {
-                    // Constant in principle, but `eval_const_expr` is a partial
-                    // evaluator and could not fold it. Saying the program is
-                    // invalid would be a false claim about the source — this is
-                    // our limit, not its error. Either way the label cannot be
-                    // emitted, so it still has to be reported rather than
-                    // silently dropped.
-                    error(
-                        expr.pos,
-                        "case label is a constant expression this compiler cannot evaluate",
-                    );
+                    },
+                };
+                let Some(raw_hi) = raw_hi else { return };
+
+                // C17 6.8.4.2p5: each case constant is converted to the
+                // promoted type of the controlling expression. Evaluating the
+                // label at full width and never converting it left c17's two
+                // lowerings disagreeing about the same switch -- a runtime
+                // selector kept the unconverted label in the `switch`
+                // instruction, where the backend truncated it, while the
+                // constant-selector path compared at 128 bits and did not
+                // match at all. `case 4294967296LL:` in an `int` switch is
+                // `case 0:`, and has to be that for both.
+                let conv = case_values.conv();
+                let lo = self.convert_case_label(expr, raw_lo, conv);
+                let hi = match high {
+                    None => lo,
+                    Some(hi_expr) => self.convert_case_label(hi_expr, raw_hi, conv),
+                };
+
+                // 6.8.4.2p3 forbids two equal case constants, and GCC
+                // extends that to overlapping ranges -- an overlap would
+                // otherwise make one arm silently unreachable, since the
+                // body walk resolves a label by finding the first match.
+                // Both tests run on the converted values, since that is what
+                // "equal" means once p5 has been applied: `case 0:` beside
+                // `case 4294967296LL:` in an `int` switch is one value twice.
+                //
+                // Order by the switch type's own signedness. The endpoints are
+                // carried as `i128`, and an unsigned 64-bit bound above
+                // `i64::MAX` is still positive there -- but an unsigned
+                // *128-bit* one is not, so the reinterpretation is still
+                // needed: `case 0ul ... ULONG_MAX:` read as an empty range and
+                // never matched.
+                if conv.lt(hi, lo) {
+                    // GCC accepts an empty range, warns, and never matches
+                    // it. Nothing is recorded, so nothing can overlap it.
+                    crate::diag::warning(expr.pos, "empty range specified");
+                    return;
                 }
+                if let Some((lo2, hi2)) = case_values.overlap(lo, hi) {
+                    let what = if lo == hi && lo2 == hi2 {
+                        format!("duplicate case value '{}' in switch", lo)
+                    } else {
+                        format!(
+                            "duplicate (or overlapping) case value: {}..{} overlaps {}..{}",
+                            lo, hi, lo2, hi2
+                        )
+                    };
+                    error(expr.pos, &what);
+                }
+                case_values.insert(lo, hi);
             }
             Stmt::Default(_, body) => {
-                self.collect_cases_from_stmt(body, case_values, has_default, unsigned);
+                self.collect_cases_from_stmt(body, case_values, has_default);
                 // C99 6.8.4.2p3: at most one default label per switch.
                 if *has_default {
                     error(
@@ -1940,28 +2207,28 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             // Recursively check labeled statements
             Stmt::Label { stmt, .. } => {
-                self.collect_cases_from_stmt(stmt, case_values, has_default, unsigned);
+                self.collect_cases_from_stmt(stmt, case_values, has_default);
             }
             // Recurse into nested statements for Duff's device pattern
             // (case labels inside loops/blocks within a switch)
             Stmt::Block(items) => {
                 for item in items {
                     if let BlockItem::Statement(s) = item {
-                        self.collect_cases_from_stmt(s, case_values, has_default, unsigned);
+                        self.collect_cases_from_stmt(s, case_values, has_default);
                     }
                 }
             }
             Stmt::DoWhile { body, .. } | Stmt::While { body, .. } | Stmt::For { body, .. } => {
-                self.collect_cases_from_stmt(body, case_values, has_default, unsigned);
+                self.collect_cases_from_stmt(body, case_values, has_default);
             }
             Stmt::If {
                 then_stmt,
                 else_stmt,
                 ..
             } => {
-                self.collect_cases_from_stmt(then_stmt, case_values, has_default, unsigned);
+                self.collect_cases_from_stmt(then_stmt, case_values, has_default);
                 if let Some(e) = else_stmt {
-                    self.collect_cases_from_stmt(e, case_values, has_default, unsigned);
+                    self.collect_cases_from_stmt(e, case_values, has_default);
                 }
             }
             // Stop at inner switch — its case labels belong to it
@@ -1975,9 +2242,13 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// Copy a string literal's code units into an array object, followed by
     /// its null terminator.
     ///
-    /// Shared by the two ways a string can initialize an array: written
-    /// directly (`char b[] = "hi"`) or enclosed in braces
-    /// (`char b[] = {"hi"}`, C17 6.7.9p14).
+    /// Shared by every way a string can initialize an array: written directly
+    /// (`char b[] = "hi"`), enclosed in braces (`char b[] = {"hi"}`, C17
+    /// 6.7.9p14), as a struct member (`struct { char t[4]; } s = {"hi"}`), or
+    /// as an element of a nested array (`char n[2][4] = {"ab", "cd"}`).
+    ///
+    /// `tail` says whether the elements the literal does not reach are this
+    /// call's to zero; see [`StringTail`].
     pub(crate) fn store_string_units(
         &mut self,
         base_sym: PseudoId,
@@ -1985,6 +2256,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         arr_typ: TypeId,
         kind: &ExprKind,
         units: &[i128],
+        tail: StringTail,
     ) {
         let default_elem = match kind {
             ExprKind::StringLit(_) => self.types.char_id,
@@ -2017,7 +2289,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                 elem_size,
             ));
         }
-        if units.len() < capacity {
+        // The first element past everything the literal and its terminator
+        // wrote. When the literal fills the array exactly, that is the whole
+        // array; when the terminator was dropped, nothing is left either.
+        let written = if units.len() < capacity {
             let null_val = self.emit_const(0, elem_type);
             self.emit(Instruction::store(
                 null_val,
@@ -2026,6 +2301,25 @@ impl<'a> super::linearize::Linearizer<'a> {
                 elem_type,
                 elem_size,
             ));
+            units.len() + 1
+        } else {
+            capacity
+        };
+
+        // C17 6.7.9p21: the members not initialized explicitly are
+        // initialized as a static object would be, i.e. to zero. One
+        // terminator is not the rest of the array -- `char b[8] = "hi"` wrote
+        // three bytes and left five holding whatever the frame held, which on
+        // first entry is zero because the backend zeroes the whole frame, and
+        // on re-execution is the last iteration's data.
+        //
+        // Routed through the shared block fill, so the bound that keeps
+        // `char b[1 << 20] = "x"` from becoming a million stores is the one
+        // every other block operation uses.
+        if matches!(tail, StringTail::Zero) {
+            let start = base_offset + (written as i64) * elem_bytes;
+            let bytes = (capacity - written) as i64 * elem_bytes;
+            self.emit_block_zero(base_sym, start, bytes);
         }
     }
 
@@ -2398,20 +2692,27 @@ impl<'a> super::linearize::Linearizer<'a> {
         &mut self,
         switch_val: PseudoId,
         cmp_type: TypeId,
+        conv: CaseConv,
         case_values: &[(i128, i128)],
         case_bbs: &[BasicBlockId],
         default_target: BasicBlockId,
     ) {
         let size = self.types.size_bits(cmp_type);
-        let unsigned = self.types.is_unsigned(cmp_type);
-        // `>=` and `<=` for a range, in the controlling type's own signedness.
-        let (ge, le) = if unsigned {
+        // `>=` and `<=` for a range, in the controlling type's own signedness
+        // -- the same `conv` that converted the labels, so the comparison and
+        // the constants it compares are describing one type.
+        let (ge, le) = if conv.unsigned() {
             (Opcode::SetAe, Opcode::SetBe)
         } else {
             (Opcode::SetGe, Opcode::SetLe)
         };
 
         for (&(lo, hi), &case_bb) in case_values.iter().zip(case_bbs.iter()) {
+            debug_assert_eq!(
+                (conv.convert(lo), conv.convert(hi)),
+                (lo, hi),
+                "a case label reaches lowering already converted to the controlling type"
+            );
             let Some(from) = self.current_bb else { return };
             let next = self.alloc_bb();
             let cond = if lo == hi {
@@ -2453,11 +2754,12 @@ impl<'a> super::linearize::Linearizer<'a> {
         // `collect_switch_cases`, which has to agree about this.
         match body {
             Stmt::Block(items) => {
-                // Same VLA reclamation as the ordinary block arm: a switch
-                // body is lowered by its own walk, and leaving the rule out
-                // here let `switch (c) { case 0: { int v[n]; break; } }`
-                // inside a loop grow the stack without bound.
-                let vla_scope = self.open_vla_scope();
+                // The same scope as the ordinary block arm: a switch body is
+                // lowered by its own walk, and leaving the rule out here let
+                // `switch (c) { case 0: { int v[n]; break; } }` inside a loop
+                // grow the stack without bound, and let the body's
+                // declarations outlive the switch.
+                let scope = self.push_scope();
                 for item in items {
                     match item {
                         BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
@@ -2472,7 +2774,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         }
                     }
                 }
-                self.close_vla_scope(vla_scope);
+                self.pop_scope(scope);
             }
             stmt => {
                 self.linearize_switch_stmt(stmt, case_values, case_bbs, default_bb, &mut case_idx)
@@ -2490,20 +2792,18 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) {
         match stmt {
             Stmt::Case(expr, high, body) => {
-                // Find the matching case block. A label is identified by its
-                // whole range, so that `case 1 ... 3:` and a later `case 1:`
-                // could not resolve to the same block -- the overlap check
-                // rejects that pair anyway, but matching on the low endpoint
-                // alone would have made the two indistinguishable here.
-                if let Some(val) = self.eval_const_expr(expr) {
-                    // Matched at full width, as the collector records them.
-                    let lo = val;
+                // Find the matching case block. The endpoints are the label's
+                // raw constants; `CaseIndex::lookup` converts them to the
+                // promoted controlling type with the very conversion the
+                // collector used, which is what keeps this lookup from missing
+                // and dropping the case body into the wrong block.
+                if let Some(lo) = self.eval_const_expr(expr) {
                     let hi = match high {
                         None => Some(lo),
                         Some(hi_expr) => self.eval_const_expr(hi_expr),
                     };
                     let Some(hi) = hi else { return };
-                    if let Some(&idx) = case_values.get(&(lo, hi)) {
+                    if let Some(idx) = case_values.lookup(lo, hi) {
                         let case_bb = case_bbs[idx];
 
                         // Fall through from previous case if not terminated
@@ -2605,73 +2905,23 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.switch_bb(exit_bb);
             }
 
+            // Everything but the body is the ordinary `for` lowering; only
+            // the body has to go back through this walk, so the `case`
+            // labels inside it stay reachable. See `OpenFor`.
             Stmt::For {
                 init,
                 cond,
                 post,
                 body,
             } => {
-                self.push_scope();
-
-                if let Some(init) = init {
-                    match init {
-                        ForInit::Declaration(decl) => self.linearize_local_decl(decl),
-                        ForInit::Expression(expr) => {
-                            self.linearize_expr(expr);
-                        }
-                    }
-                }
-
-                let cond_bb = self.alloc_bb();
-                let body_bb = self.alloc_bb();
-                let post_bb = self.alloc_bb();
-                let exit_bb = self.alloc_bb();
-
-                if let Some(current) = self.current_bb {
-                    if !self.is_terminated() {
-                        self.emit(Instruction::br(cond_bb));
-                        self.link_bb(current, cond_bb);
-                    }
-                }
-
-                self.switch_bb(cond_bb);
-                if let Some(cond_expr) = cond {
-                    self.branch_on_condition(cond_expr, body_bb, exit_bb);
-                } else {
-                    self.emit(Instruction::br(body_bb));
-                    self.link_bb(cond_bb, body_bb);
-                }
-
-                self.break_targets.push(exit_bb);
-                self.continue_targets.push(post_bb);
-
-                self.switch_bb(body_bb);
+                let open = self.open_for(init.as_ref(), cond.as_ref());
                 self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
-                if !self.is_terminated() {
-                    if let Some(current) = self.current_bb {
-                        self.emit(Instruction::br(post_bb));
-                        self.link_bb(current, post_bb);
-                    }
-                }
-
-                self.break_targets.pop();
-                self.continue_targets.pop();
-
-                self.switch_bb(post_bb);
-                if let Some(post_expr) = post {
-                    self.linearize_expr(post_expr);
-                }
-                self.emit(Instruction::br(cond_bb));
-                self.link_bb(post_bb, cond_bb);
-
-                self.switch_bb(exit_bb);
-                self.pop_scope();
+                self.close_for(open, post.as_ref());
             }
 
             Stmt::Block(items) => {
-                self.push_scope();
                 // See the sibling arm in `linearize_switch_body`.
-                let vla_scope = self.open_vla_scope();
+                let scope = self.push_scope();
                 for item in items {
                     match item {
                         BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
@@ -2686,8 +2936,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         }
                     }
                 }
-                self.close_vla_scope(vla_scope);
-                self.pop_scope();
+                self.pop_scope(scope);
             }
 
             Stmt::If {
@@ -2998,10 +3247,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         // with every output unstored. Each label edge now gets a block of its
         // own that writes the outputs back and then jumps to the label.
         let writes_back = skip_post_handling.iter().any(|skip| !skip);
+        // An `asm goto` has two kinds of exit and each must release the VLA
+        // scopes it leaves. The fall-through is released by the enclosing
+        // scope's own end, but a label edge branches straight past it -- so
+        // the release goes in the edge block, which therefore has to exist
+        // even when there is nothing to write back.
+        let releases_vlas = !self.vla_marks.is_empty();
+        let needs_edge_block = writes_back || releases_vlas;
         let label_edges: Vec<(BasicBlockId, BasicBlockId, String)> = ir_goto_labels
             .iter()
             .map(|(target, name)| {
-                let edge = if writes_back {
+                let edge = if needs_edge_block {
                     self.alloc_bb()
                 } else {
                     *target
@@ -3046,16 +3302,21 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // Without this, code would fall through to whatever block comes next in layout
                 self.emit(Instruction::br(fall_through));
 
-                if writes_back {
+                if needs_edge_block {
                     for (edge, target, _) in &label_edges {
                         self.switch_bb(*edge);
-                        self.emit_asm_output_writeback(
-                            outputs,
-                            &ir_outputs,
-                            &skip_post_handling,
-                            &param_outputs,
-                            &output_places,
-                        );
+                        if writes_back {
+                            self.emit_asm_output_writeback(
+                                outputs,
+                                &ir_outputs,
+                                &skip_post_handling,
+                                &param_outputs,
+                                &output_places,
+                            );
+                        }
+                        // The jump leaves this scope; the fall-through does
+                        // not. Same rule as a plain `goto` to the label.
+                        self.release_vla_scopes_for_goto(*target);
                         self.emit(Instruction::br(*target));
                         self.link_bb(*edge, *target);
                     }
@@ -3202,6 +3463,15 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// One mark per declaration, not per block: a label sitting between two
     /// VLAs must release only the one declared after it, and a block-wide
     /// mark cannot express that.
+    ///
+    /// The nesting depths are read *before* the construct being lowered
+    /// pushes its own break or continue target, and that is deliberate. A
+    /// VLA declared in a `for` init clause, or in the controlling expression
+    /// of a `switch`, is allocated once, outside the loop or switch, and its
+    /// scope encloses the exit the jump lands on -- so a `break` or
+    /// `continue` inside must *not* release it. `continue` especially: the
+    /// storage is still live on the next iteration. The construct's own
+    /// scope, which ends after its exit block, is what releases it.
     fn push_vla_mark(&mut self) {
         if self.current_bb.is_none() {
             return;
@@ -3217,14 +3487,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             break_depth: self.break_targets.len(),
             continue_depth: self.continue_targets.len(),
         });
-    }
-
-    /// The marks in force on entry to a block, to restore and drop on exit.
-    ///
-    /// Returns the depth of [`Linearizer::vla_marks`] so
-    /// [`Self::close_vla_scope`] knows which of them this block added.
-    fn open_vla_scope(&self) -> usize {
-        self.vla_marks.len()
     }
 
     /// Give every forward `goto` the VLA restore its label turned out to need.
@@ -3247,9 +3509,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         pending.sort_by_key(|p| (p.bb.0, std::cmp::Reverse(p.at)));
         let void_ptr = self.types.void_ptr_id;
         for p in pending {
-            // An undefined label is diagnosed elsewhere; there is no branch
-            // here to put a restore in front of.
-            let Some(&depth) = self.label_vla_depth.get(&p.label) else {
+            let Some(depth) = self.goto_target_vla_depth(&p.target) else {
                 continue;
             };
             let Some(&mark) = p.marks.get(depth) else {
@@ -3268,18 +3528,98 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Release everything the block allocated and forget its marks.
-    fn close_vla_scope(&mut self, entry: usize) {
+    /// How many VLA scopes a jump is *inside* at the label it reaches, or
+    /// `None` if that cannot be said -- an undefined label, diagnosed
+    /// elsewhere, or a computed `goto` in a function that takes no label's
+    /// address.
+    fn goto_target_vla_depth(&self, target: &GotoTarget) -> Option<usize> {
+        match target {
+            GotoTarget::Label(bb) => self.label_vla_depth.get(bb).copied(),
+            // See [`GotoTarget::AnyAddressTaken`]: the deepest candidate is
+            // the only depth that releases nothing another candidate still
+            // needs.
+            GotoTarget::AnyAddressTaken => self
+                .addr_taken_labels
+                .iter()
+                .filter_map(|bb| self.label_vla_depth.get(bb).copied())
+                .max(),
+        }
+    }
+
+    /// Release everything the scope allocated and forget its marks.
+    ///
+    /// Called only from [`Linearizer::pop_scope`], so that leaving a
+    /// declaration scope and leaving a VLA scope are the same act.
+    pub(crate) fn close_vla_scope(&mut self, scope: &Scope) {
+        let entry = scope.vla_entry;
         if self.vla_marks.len() <= entry {
             return;
         }
-        // The first mark the block took is the stack as it stood on entry,
+        // The first mark the scope took is the stack as it stood on entry,
         // so one restore undoes all of them.
         let mark = self.vla_marks[entry].mark;
         if !self.is_terminated() && self.current_bb.is_some() {
             self.emit_stack_restore(mark);
         }
         self.vla_marks.truncate(entry);
+    }
+
+    /// Release every VLA scope a jump to the block `target` leaves.
+    ///
+    /// A backward jump -- the label is already linearized, so it has a
+    /// recorded depth -- leaves the scope of every VLA declared after it, and
+    /// that storage has to go back. Otherwise `lab: int x[n]; ... goto lab;`
+    /// grows the stack every time round until the program dies.
+    ///
+    /// A *forward* jump cannot be decided here: its label has no depth
+    /// recorded yet, and whether it stays inside the scope of the VLAs in
+    /// force or leaves it is exactly what decides between no restore and one.
+    /// It is recorded and resolved in
+    /// [`Self::resolve_forward_goto_vla_restores`].
+    ///
+    /// Leaving it to "the scope's own exit does the restoring" was wrong: the
+    /// branch *terminates* the block, so `close_vla_scope` emits nothing and
+    /// then drops the marks, and the enclosing scope has no mark of its own
+    /// to undo them with. A `goto` out of a loop body's inner block grew the
+    /// stack every time round.
+    ///
+    /// Every jump that names a label goes through here: a `goto`, and each
+    /// label edge of an `asm goto`.
+    fn release_vla_scopes_for_goto(&mut self, target: BasicBlockId) {
+        if let Some(&depth) = self.label_vla_depth.get(&target) {
+            if let Some(m) = self.vla_marks.get(depth) {
+                let mark = m.mark;
+                self.emit_stack_restore(mark);
+            }
+        } else {
+            self.defer_vla_restore(GotoTarget::Label(target));
+        }
+    }
+
+    /// Record a restore whose depth is not yet known, to be placed by
+    /// [`Self::resolve_forward_goto_vla_restores`] at the end of the
+    /// function. The restore goes where the current block ends now, which is
+    /// ahead of the branch the caller is about to emit.
+    fn defer_vla_restore(&mut self, target: GotoTarget) {
+        if self.vla_marks.is_empty() {
+            return;
+        }
+        let Some(current) = self.current_bb else {
+            return;
+        };
+        let at = self
+            .current_func
+            .as_ref()
+            .and_then(|f| f.get_block(current))
+            .map_or(0, |b| b.insns.len());
+        let marks = self.vla_marks.iter().map(|m| m.mark).collect();
+        self.pending_goto_vla
+            .push(crate::ir::linearize::PendingGotoVla {
+                target,
+                bb: current,
+                at,
+                marks,
+            });
     }
 
     /// Put the stack pointer back to what `mark` captured.
@@ -3362,7 +3702,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // declaration that creates it lies between the label and the
         // jump.
         if self.func_has_vla {
-            self.label_vla_depth.insert(name_str, self.vla_marks.len());
+            self.label_vla_depth.insert(label_bb, self.vla_marks.len());
         }
     }
 
@@ -3858,8 +4198,121 @@ impl AddrWalk<'_> {
     }
 }
 
-/// Each case range's position among a switch's labels.
-pub(crate) type CaseIndex = std::collections::HashMap<(i128, i128), usize>;
+/// The promoted type of a switch's controlling expression: the width and the
+/// signedness in which C17 6.8.4.2 says every case label lives.
+///
+/// p5 converts each case constant to that type and p3 forbids two of them
+/// being equal *after* the conversion, so a label's converted value is the
+/// only one the rest of the switch path may see. Two places have to agree
+/// about it -- the collector that records a label's range, and the body walk
+/// that looks that same range back up to find the block it was given. If they
+/// disagreed the lookup would simply miss, leaving the case body emitted into
+/// the wrong block with nothing diagnosed.
+///
+/// One value carries the whole conversion so they cannot disagree:
+/// [`CaseSet`] owns the `CaseConv`, [`CaseSet::insert`] and
+/// [`CaseSet::overlap`] convert what they are handed, [`CaseIndex::of`] copies
+/// the conversion out of the set it indexes, and [`CaseIndex::lookup`] -- the
+/// only way into the map -- converts too. Conversion is idempotent, so a
+/// caller that has already converted for its own reasons stays in step.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct CaseConv {
+    /// Width of the promoted controlling type, in bits.
+    bits: u32,
+    /// Whether that type is unsigned.
+    unsigned: bool,
+}
+
+impl CaseConv {
+    pub(crate) fn new(bits: u32, unsigned: bool) -> Self {
+        Self { bits, unsigned }
+    }
+
+    /// The conversion a `switch` whose promoted controlling type is `typ`
+    /// applies to its labels.
+    pub(crate) fn of(types: &TypeTable, typ: TypeId) -> Self {
+        Self::new(types.size_bits(typ), types.is_unsigned(typ))
+    }
+
+    pub(crate) fn unsigned(self) -> bool {
+        self.unsigned
+    }
+
+    /// `v` converted to this type, per C17 6.3.1.3: its low `bits` bits, read
+    /// back with the type's own signedness.
+    ///
+    /// The result is carried the way the whole switch path carries a value --
+    /// an `i128` holding the type's bit pattern -- so a 128-bit unsigned label
+    /// above `i128::MAX` stays negative here and is ordered by [`Self::lt`]
+    /// rather than by Rust's signed `<`.
+    pub(crate) fn convert(self, v: i128) -> i128 {
+        if self.bits == 0 || self.bits >= 128 {
+            return v;
+        }
+        let shift = 128 - self.bits;
+        let truncated = ((v as u128) << shift) >> shift;
+        if self.unsigned {
+            truncated as i128
+        } else {
+            ((truncated << shift) as i128) >> shift
+        }
+    }
+
+    /// `a < b` in this type's signedness.
+    pub(crate) fn lt(self, a: i128, b: i128) -> bool {
+        if self.unsigned {
+            (a as u128) < (b as u128)
+        } else {
+            a < b
+        }
+    }
+
+    /// Whether the converted range `lo..=hi` holds the converted value `v`.
+    ///
+    /// The constant-selector lowering picks its one edge with this, and has to
+    /// ask in the switch's signedness: a plain `i128` test read `case -1:` in
+    /// a `switch` on `unsigned` as a huge lower bound and never selected it.
+    pub(crate) fn contains(self, lo: i128, hi: i128, v: i128) -> bool {
+        !self.lt(v, lo) && !self.lt(hi, v)
+    }
+}
+
+/// Each case range's position among a switch's labels, keyed by the range as
+/// the controlling type sees it.
+pub(crate) struct CaseIndex {
+    conv: CaseConv,
+    by_range: std::collections::HashMap<(i128, i128), usize>,
+}
+
+impl CaseIndex {
+    /// Index the labels `set` collected, carrying `set`'s own conversion so
+    /// that a lookup converts exactly as the insert did.
+    ///
+    /// The first label of a repeated range wins, as a scan in source order
+    /// would find it; a duplicate has already been reported.
+    pub(crate) fn of(set: &CaseSet) -> Self {
+        let mut by_range = std::collections::HashMap::new();
+        for (idx, range) in set.ranges().iter().enumerate() {
+            by_range.entry(*range).or_insert(idx);
+        }
+        Self {
+            conv: set.conv(),
+            by_range,
+        }
+    }
+
+    /// The position of the label written `lo ... hi`, whose endpoints are the
+    /// raw constants as the label spells them.
+    ///
+    /// A label is identified by its whole range, so that `case 1 ... 3:` and a
+    /// later `case 1:` cannot resolve to the same block -- the overlap check
+    /// rejects that pair anyway, but matching on the low endpoint alone would
+    /// make the two indistinguishable here.
+    pub(crate) fn lookup(&self, lo: i128, hi: i128) -> Option<usize> {
+        let key = (self.conv.convert(lo), self.conv.convert(hi));
+        self.by_range.get(&key).copied()
+    }
+}
 
 /// A switch's case ranges, in source order, with an index that finds an
 /// overlap in logarithmic time.
@@ -3868,43 +4321,56 @@ pub(crate) type CaseIndex = std::collections::HashMap<(i128, i128), usize>;
 /// quadratic in its case count: 70,000 labels took five seconds to compile
 /// and gcc's `limits-caselabels` eleven.
 pub(crate) struct CaseSet {
-    /// The ranges `(lo, hi)`, in the order the labels were written.
+    /// The ranges `(lo, hi)`, converted to the controlling type, in the order
+    /// the labels were written.
     ranges: Vec<(i128, i128)>,
     /// Each range by its low end, as an order-preserving key, to its high end.
     by_lo: std::collections::BTreeMap<i128, (i128, i128, i128)>,
-    unsigned: bool,
+    /// What every endpoint entering the set is converted by.
+    conv: CaseConv,
 }
 
 impl CaseSet {
-    fn new(unsigned: bool) -> Self {
+    fn new(conv: CaseConv) -> Self {
         Self {
             ranges: Vec::new(),
             by_lo: std::collections::BTreeMap::new(),
-            unsigned,
+            conv,
         }
+    }
+
+    pub(crate) fn conv(&self) -> CaseConv {
+        self.conv
+    }
+
+    /// The ranges, converted, in source order. Parallel to the case blocks.
+    pub(crate) fn ranges(&self) -> &[(i128, i128)] {
+        &self.ranges
     }
 
     /// `v` as a signed key ordered the way the switch's type orders it: an
     /// unsigned value has its top bit flipped, which maps unsigned order onto
     /// signed order.
     fn key(&self, v: i128) -> i128 {
-        if self.unsigned {
+        if self.conv.unsigned {
             v ^ i128::MIN
         } else {
             v
         }
     }
 
-    /// An earlier range sharing a value with `lo..=hi`, if any.
+    /// An earlier range sharing a value with `lo..=hi`, if any, as converted.
     ///
     /// The ranges recorded are disjoint -- an overlap is an error -- so the
     /// only candidate is the one starting last at or before `hi`.
     fn overlap(&self, lo: i128, hi: i128) -> Option<(i128, i128)> {
+        let (lo, hi) = (self.conv.convert(lo), self.conv.convert(hi));
         let (_, &(hi_key, lo2, hi2)) = self.by_lo.range(..=self.key(hi)).next_back()?;
         (hi_key >= self.key(lo)).then_some((lo2, hi2))
     }
 
     fn insert(&mut self, lo: i128, hi: i128) {
+        let (lo, hi) = (self.conv.convert(lo), self.conv.convert(hi));
         self.ranges.push((lo, hi));
         let (lo_key, hi_key) = (self.key(lo), self.key(hi));
         self.by_lo.insert(lo_key, (hi_key, lo, hi));
@@ -3913,11 +4379,127 @@ impl CaseSet {
 
 #[cfg(test)]
 mod case_set_tests {
-    use super::CaseSet;
+    use super::{CaseConv, CaseIndex, CaseSet};
+
+    /// A 128-bit conversion is the identity, which is what the ranges below
+    /// want: they are about ordering, not about width.
+    fn wide(unsigned: bool) -> CaseConv {
+        CaseConv::new(128, unsigned)
+    }
+
+    /// C17 6.8.4.2p5 converts a case constant to the promoted controlling
+    /// type: the low bits, read back with that type's signedness.
+    #[test]
+    fn convert_takes_the_low_bits_with_the_types_signedness() {
+        let int = CaseConv::new(32, false);
+        let uint = CaseConv::new(32, true);
+
+        // In range: unchanged either way.
+        assert_eq!(int.convert(7), 7);
+        assert_eq!(uint.convert(7), 7);
+
+        // 2^32 is zero in 32 bits -- the label that silently became `case 0:`.
+        assert_eq!(int.convert(4294967296), 0);
+        assert_eq!(uint.convert(4294967296), 0);
+
+        // -1 keeps its value as `int` and is the largest `unsigned int`.
+        assert_eq!(int.convert(-1), -1);
+        assert_eq!(uint.convert(-1), 4294967295);
+
+        // The boundary of the signed range wraps the way C says.
+        assert_eq!(int.convert(2147483648), -2147483648);
+        assert_eq!(uint.convert(2147483648), 2147483648);
+
+        // Narrower and wider types, and the 128-bit identity.
+        assert_eq!(CaseConv::new(8, false).convert(255), -1);
+        assert_eq!(CaseConv::new(8, true).convert(-1), 255);
+        assert_eq!(CaseConv::new(64, true).convert(-1), u64::MAX as i128);
+        assert_eq!(CaseConv::new(128, true).convert(-1), -1);
+        assert_eq!(CaseConv::new(128, false).convert(i128::MIN), i128::MIN);
+    }
+
+    /// Converting is idempotent, which is what lets the collector convert for
+    /// its own diagnostics and still hand the set and the index raw or
+    /// converted endpoints interchangeably.
+    #[test]
+    fn convert_is_idempotent() {
+        for conv in [
+            CaseConv::new(8, false),
+            CaseConv::new(16, true),
+            CaseConv::new(32, false),
+            CaseConv::new(64, true),
+            CaseConv::new(128, true),
+        ] {
+            for v in [0, 1, -1, 255, 4294967296, i128::MIN, i128::MAX] {
+                let once = conv.convert(v);
+                assert_eq!(conv.convert(once), once, "{conv:?} {v}");
+            }
+        }
+    }
+
+    /// The constant-selector lowering asks in the switch's own signedness.
+    #[test]
+    fn contains_tests_the_range_in_the_switch_signedness() {
+        let uint = CaseConv::new(32, true);
+        let big = uint.convert(-1); // 4294967295
+        assert!(uint.contains(big, big, big));
+        assert!(!uint.contains(big, big, 0));
+        assert!(uint.contains(0, big, 5));
+
+        let int = CaseConv::new(32, false);
+        assert!(int.contains(-1, -1, -1));
+        assert!(int.contains(-5, 5, 0));
+        assert!(!int.contains(-5, 5, 6));
+        // A signed test would read the unsigned bound as below zero.
+        assert!(!int.contains(0, 10, big));
+    }
+
+    /// The two-site invariant: what the collector inserts is exactly what the
+    /// body walk finds, even though the walk looks the label up by the
+    /// constant as written rather than as converted.
+    #[test]
+    fn the_index_finds_a_label_by_its_unconverted_constant() {
+        let conv = CaseConv::new(32, false);
+        let mut set = CaseSet::new(conv);
+        set.insert(0, 0);
+        set.insert(-1, -1);
+        set.insert(70000, 70005);
+        // Stored converted, and 2^32+3 is 3 in an `int` switch.
+        set.insert(4294967299, 4294967299);
+        assert_eq!(set.ranges(), [(0, 0), (-1, -1), (70000, 70005), (3, 3)]);
+
+        let index = CaseIndex::of(&set);
+        assert_eq!(index.lookup(0, 0), Some(0));
+        assert_eq!(index.lookup(-1, -1), Some(1));
+        assert_eq!(index.lookup(70000, 70005), Some(2));
+        // Looked up as written, found as converted.
+        assert_eq!(index.lookup(4294967299, 4294967299), Some(3));
+        assert_eq!(index.lookup(3, 3), Some(3));
+        assert_eq!(index.lookup(9, 9), None);
+
+        // And a label the controlling type sees as negative.
+        let uconv = CaseConv::new(32, true);
+        let mut uset = CaseSet::new(uconv);
+        uset.insert(-1, -1);
+        assert_eq!(uset.ranges(), [(4294967295, 4294967295)]);
+        let uindex = CaseIndex::of(&uset);
+        assert_eq!(uindex.lookup(-1, -1), Some(0));
+        assert_eq!(uindex.lookup(4294967295, 4294967295), Some(0));
+    }
+
+    /// Two labels that differ before the conversion collide after it, which is
+    /// the duplicate C17 6.8.4.2p3 forbids.
+    #[test]
+    fn overlap_sees_the_converted_values() {
+        let mut set = CaseSet::new(CaseConv::new(32, false));
+        set.insert(0, 0);
+        assert_eq!(set.overlap(4294967296, 4294967296), Some((0, 0)));
+        assert_eq!(set.overlap(1, 1), None);
+    }
 
     #[test]
     fn overlap_finds_the_range_sharing_a_value() {
-        let mut set = CaseSet::new(false);
+        let mut set = CaseSet::new(wide(false));
         set.insert(-10, -5);
         set.insert(0, 0);
         set.insert(10, 20);
@@ -3937,7 +4519,7 @@ mod case_set_tests {
     #[test]
     fn overlap_orders_by_the_switch_type_signedness() {
         let big = u128::MAX as i128; // -1 as i128, the largest unsigned value
-        let mut set = CaseSet::new(true);
+        let mut set = CaseSet::new(wide(true));
         set.insert(1, 5);
         set.insert(big - 10, big);
         assert_eq!(set.overlap(big - 3, big - 3), Some((big - 10, big)));

@@ -11,6 +11,7 @@
 // (InstCombine, DCE) see the inlined code.
 //
 
+use super::memexpand;
 use super::{
     BasicBlock, BasicBlockId, Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind,
 };
@@ -448,9 +449,11 @@ struct InlineContext {
     ret_typ: Option<crate::types::TypeId>,
     /// Size (in bits) captured from the first cloned `Ret`.
     ret_size: u32,
-    /// Pseudos allocated as PhiSource targets in the cloned Ret blocks.
-    /// Added to the caller alongside other inlined pseudos.
-    phisrc_pseudos: Vec<Pseudo>,
+    /// Pseudos allocated while lowering a cloned `Ret`: the PhiSource target
+    /// of a value return, and the temporaries that carry an aggregate handed
+    /// back by address into the result local. Added to the caller alongside
+    /// the other inlined pseudos.
+    ret_pseudos: Vec<Pseudo>,
     /// Value pseudos created while cloning -- a constant's value lives on its
     /// pseudo, not on the instruction, so resolving
     /// `__builtin_va_arg_pack_len()` makes one. Added to the caller with the
@@ -510,7 +513,7 @@ impl InlineContext {
             ret_arms: Vec::new(),
             ret_typ: None,
             ret_size: 0,
-            phisrc_pseudos: Vec::new(),
+            ret_pseudos: Vec::new(),
             const_pseudos: Vec::new(),
         }
     }
@@ -658,10 +661,12 @@ fn clone_instruction(
         // matching Phi is materialized by `inline_call_site` after all blocks
         // are cloned.
         //
-        // For a two-register struct return, both halves are stored to the
-        // result local's memory (a Sym pseudo). The Sym itself remains
-        // single-defined (it is the local's address); the stores are
-        // side-effecting writes to memory and do not violate SSA.
+        // An aggregate returned in registers takes neither path: the call's
+        // result slot is a local, and the returned bytes are written into it.
+        // Two-register form, both halves are stored there; address form
+        // (`returns_aggregate_address`), the bytes are copied there. The Sym
+        // itself remains single-defined (it is the local's address); the
+        // stores are side-effecting writes to memory and do not violate SSA.
         Opcode::Ret => {
             let mut result = Vec::new();
 
@@ -673,6 +678,23 @@ fn clone_instruction(
                         // low half goes at offset 0, high half at offset 8.
                         let remapped_low = ctx.remap_pseudo(insn.src[0], callee_func);
                         let remapped_high = ctx.remap_pseudo(insn.src[1], callee_func);
+
+                        // The high half is whatever is left past the first
+                        // eight bytes, which is 1..=8 of them:
+                        // `returns_reg_aggregate` admits 9..=16 bytes, so a
+                        // 12-byte struct leaves four. Stored at a hardcoded
+                        // 64 bits it overran the result local by four -- and
+                        // it disagreed with the *load* in
+                        // `emit_two_reg_return`, which has always narrowed the
+                        // high half to `min(64, struct_size - 64)`.
+                        let high_bits = match insn.size.checked_sub(64) {
+                            Some(rest) if rest > 0 => rest.min(64),
+                            // Two registers means more than eight bytes, so
+                            // this is not a shape `emit_two_reg_return`
+                            // produces. Keep the old width rather than emit a
+                            // store of no bits at all.
+                            _ => 64,
+                        };
 
                         let mut store_low = Instruction::store(
                             remapped_low,
@@ -689,10 +711,65 @@ fn clone_instruction(
                             target,
                             8,
                             insn.typ.unwrap_or(crate::types::TypeId::INVALID),
-                            64,
+                            high_bits,
                         );
                         store_high.pos = insn.pos;
                         result.push(store_high);
+                    } else if insn.returns_aggregate_address() {
+                        // The callee hands back the *address* of the
+                        // aggregate -- one SSE register holding sixteen
+                        // bytes, an x87 aggregate, an HFA -- because no pair
+                        // of general registers can carry it (see
+                        // `aggregate_ret_is_address`). A call leaves the
+                        // value in the result local and the caller reads it
+                        // from there, so the spliced return has to put the
+                        // bytes there itself.
+                        //
+                        // Asked of the `Ret`'s own classification, which is
+                        // what `returns_two_regs` just above asks and all
+                        // this pass has: it carries no `TypeTable` and cannot
+                        // classify anything itself. Only the one-SSE shape
+                        // reaches here today -- `Function::ret_is_address`
+                        // still keeps an x87 aggregate and an HFA out of the
+                        // inliner entirely, for the reason recorded where it
+                        // is set.
+                        //
+                        // Phi-ing the source instead handed the caller a
+                        // pointer where the value belonged:
+                        //
+                        //     %16 = symaddr.64 %11(@mk_inline0_r.2)
+                        //     %17 = phisrc.128 %16
+                        //
+                        // -- a 64-bit address as a 128-bit value. Inlining
+                        // changed the answer, and only for this shape: the
+                        // two-register return stores its halves just above,
+                        // and an aggregate of eight bytes or less never
+                        // reaches `emit_two_reg_return` at all, so its `Ret`
+                        // already carries a loaded value.
+                        //
+                        // `insn.size` is the aggregate's own width, in the
+                        // 8/4/2/1 chunks every other block move in the
+                        // compiler uses, so a size that is not a multiple of
+                        // eight is copied exactly rather than rounded up past
+                        // either object. No bound is needed: a register
+                        // return is at most a four-element HFA, thirty-two
+                        // bytes. The access type stays the `Ret`'s own, as
+                        // the two-register stores above keep theirs -- this
+                        // pass has no `TypeTable` to name a qword with.
+                        let src_addr = ctx.remap_pseudo(*ret_val, callee_func);
+                        let typ = insn.typ.unwrap_or(crate::types::TypeId::INVALID);
+                        for (offset, chunk) in memexpand::block_chunks(i64::from(insn.size / 8)) {
+                            let temp = ctx.alloc_pseudo_id();
+                            ctx.ret_pseudos.push(Pseudo::undef(temp));
+                            let mut load =
+                                Instruction::load(temp, src_addr, offset, typ, chunk.bits());
+                            load.pos = insn.pos;
+                            result.push(load);
+                            let mut store =
+                                Instruction::store(temp, target, offset, typ, chunk.bits());
+                            store.pos = insn.pos;
+                            result.push(store);
+                        }
                     } else {
                         // Single-value return: emit PhiSource in the predecessor
                         // and record the arm for `inline_call_site` to assemble
@@ -706,7 +783,7 @@ fn clone_instruction(
                                  before cloning a Ret",
                             );
                         let phisrc_target = ctx.alloc_pseudo_id();
-                        ctx.phisrc_pseudos
+                        ctx.ret_pseudos
                             .push(Pseudo::phi(phisrc_target, phisrc_target.0));
 
                         let typ = insn.typ.unwrap_or(crate::types::TypeId::INVALID);
@@ -1142,8 +1219,25 @@ fn inline_call_site(
                     continue;
                 }
 
-                let mut offset = 0i64;
-                while (offset as usize) < copy.size_bytes {
+                // The shared 8/4/2/1 descent, in the chunks every other block
+                // move in the compiler uses. Stepping 8 to `size_bytes`
+                // instead rounds the size *up*: a 12-byte
+                // `struct P { float x, y, z; }` moved 16 bytes, over-reading
+                // the caller's argument and over-writing the callee's local
+                // -- the same defect the linearizer's parameter prologue and
+                // sret return path each had, spelled the same way.
+                //
+                // No upper bound here, deliberately: unlike a copy the
+                // program wrote, `size_bytes` is at most 32 -- a
+                // `long double _Complex` -- because only a complex value or a
+                // two-register aggregate is recorded as an implicit parameter
+                // copy. So the unroll cannot run away and needs no
+                // `memexpand::INLINE_LIMIT_BYTES` cap. This pass builds into
+                // a `Vec<Instruction>` rather than through `Linearizer::emit`
+                // and has no `TypeTable`, so it takes the offsets and widths
+                // and keeps `qword_type` as the access type, exactly as the
+                // register-sized case above does.
+                for (offset, chunk) in memexpand::block_chunks(copy.size_bytes as i64) {
                     let temp = ctx.alloc_pseudo_id();
                     implicit_copy_pseudos.push(Pseudo::undef(temp));
                     copy_insns.push(Instruction::load(
@@ -1151,16 +1245,15 @@ fn inline_call_site(
                         call_arg,
                         offset,
                         copy.qword_type,
-                        64,
+                        chunk.bits(),
                     ));
                     copy_insns.push(Instruction::store(
                         temp,
                         remapped_local,
                         offset,
                         copy.qword_type,
-                        64,
+                        chunk.bits(),
                     ));
-                    offset += 8;
                 }
             }
             // Insert copies at the beginning of the entry block
@@ -1323,8 +1416,9 @@ fn inline_call_site(
     for pseudo in std::mem::take(&mut ctx.const_pseudos) {
         caller.replace_pseudo(pseudo);
     }
-    // Add PhiSource target pseudos generated for the return-value Phi.
-    for pseudo in std::mem::take(&mut ctx.phisrc_pseudos) {
+    // Add the pseudos the cloned returns allocated: PhiSource targets, and
+    // the temporaries of an aggregate copied into the result local.
+    for pseudo in std::mem::take(&mut ctx.ret_pseudos) {
         if !caller.has_pseudo(pseudo.id) {
             caller.add_pseudo(pseudo);
         }
@@ -2448,6 +2542,205 @@ mod tests {
         callee.add_pseudo(Pseudo::reg(PseudoId(1), 1));
         callee.next_pseudo = 2;
         callee
+    }
+
+    /// An implicit parameter copy moves exactly the object's bytes, in the
+    /// 8/4/2/1 chunks `memexpand::block_chunks` gives every other block move.
+    ///
+    /// `while offset < size_bytes { load 64; store 64; offset += 8 }` rounds
+    /// *up*: a 12-byte `struct P { float x, y, z; }` moved 16 bytes,
+    /// over-reading the caller's argument and over-writing the callee's local.
+    /// The fourth bytes are usually frame padding, so a program can be correct
+    /// and still be reading memory that does not belong to the object -- and
+    /// would fault if it ended a page.
+    #[test]
+    fn test_implicit_param_copy_moves_no_more_than_the_object() {
+        let types = TypeTable::new(&Target::host());
+
+        // `static void callee(struct P p)`, with the twelve bytes of `p`
+        // arriving by address and copied into the callee's own local.
+        let mut callee = Function::new("callee", types.void_id);
+        callee.add_param("p", types.void_ptr_id);
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.insns.push(Instruction::new(Opcode::Entry));
+        bb.insns.push(Instruction::ret(None));
+        callee.add_block(bb);
+        callee.entry = BasicBlockId(0);
+        callee.add_pseudo(Pseudo::sym(PseudoId(0), "p.0".to_string()));
+        callee.next_pseudo = 1;
+        callee
+            .implicit_param_copies
+            .push(crate::ir::ImplicitParamCopy {
+                arg_index: 0,
+                local_sym: PseudoId(0),
+                size_bytes: 12,
+                qword_type: types.long_id,
+                arg_is_address: true,
+            });
+
+        let mut caller = Function::new("caller", types.void_id);
+        let mut cb = BasicBlock::new(BasicBlockId(0));
+        cb.insns.push(Instruction::new(Opcode::Entry));
+        cb.insns.push(Instruction::call(
+            None,
+            "callee",
+            vec![PseudoId(0)],
+            vec![types.void_ptr_id],
+            types.void_id,
+            0,
+        ));
+        cb.insns.push(Instruction::ret(None));
+        caller.add_block(cb);
+        caller.entry = BasicBlockId(0);
+        caller.add_pseudo(Pseudo::reg(PseudoId(0), 0));
+        caller.next_pseudo = 1;
+
+        assert!(inline_call_site(&mut caller, 0, 1, &callee));
+
+        let moves: Vec<(Opcode, i64, u32)> = caller
+            .blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
+            .map(|i| (i.op, i.offset, i.size))
+            .collect();
+        assert_eq!(
+            moves,
+            vec![
+                (Opcode::Load, 0, 64),
+                (Opcode::Store, 0, 64),
+                (Opcode::Load, 8, 32),
+                (Opcode::Store, 8, 32),
+            ],
+            "a 12-byte object has four bytes at offset 8, not eight"
+        );
+    }
+
+    /// `static struct Q mk(void) { struct Q r; ...; return r; }`, whose `Ret`
+    /// hands the aggregate back by *address* under `ret` -- the shape
+    /// `emit_two_reg_return` emits for a class no pair of general registers
+    /// can carry.
+    fn aggregate_address_ret_callee(
+        types: &TypeTable,
+        ret: crate::abi::ArgClass,
+        size_bits: u32,
+    ) -> Function {
+        let mut callee = Function::new("mk", types.void_id);
+        callee.is_static = true;
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.insns.push(Instruction::new(Opcode::Entry));
+        // The address of the callee's own local, which is what the `Ret`
+        // carries: `%1 = symaddr %0(@r)`.
+        bb.insns.push(Instruction::sym_addr(
+            PseudoId(1),
+            PseudoId(0),
+            types.long_id,
+        ));
+        let mut ret_insn = Instruction::ret_typed(Some(PseudoId(1)), types.long_id, size_bits);
+        ret_insn.abi_info = Some(Box::new(crate::ir::CallAbiInfo::new(vec![], ret)));
+        bb.insns.push(ret_insn);
+        callee.add_block(bb);
+        callee.entry = BasicBlockId(0);
+        callee.add_pseudo(Pseudo::sym(PseudoId(0), "r.0".to_string()));
+        callee.add_pseudo(Pseudo::reg(PseudoId(1), 1));
+        callee.next_pseudo = 2;
+        callee
+    }
+
+    /// An inlined return of an aggregate handed back by address copies the
+    /// aggregate's *bytes* into the call's result local, and phis nothing.
+    ///
+    /// A call leaves the value in that local and the caller reads it from
+    /// there. Feeding the `Ret`'s source into the continuation phi instead
+    /// gave the caller the address of the callee's own copy -- for
+    /// `struct { __float128 a; }`, one SSE register and sixteen bytes, the
+    /// post-opt IR read `%17 = phisrc.128 %16` where `%16` was a
+    /// `symaddr.64`. The caller then stored a pointer into the first eight
+    /// bytes of a sixteen-byte slot and read the other eight uninitialized,
+    /// so inlining changed the answer.
+    ///
+    /// The bytes move in `memexpand::block_chunks`, so a width that is not a
+    /// multiple of eight -- a three-`float` HFA is twelve bytes -- lands
+    /// exactly rather than reaching past either object.
+    #[test]
+    fn test_inlined_aggregate_address_return_copies_the_value() {
+        let types = TypeTable::new(&Target::host());
+        let cases = [
+            (
+                "struct { __float128 a; }: one SSE register, sixteen bytes",
+                crate::abi::ArgClass::Direct {
+                    classes: vec![crate::abi::RegClass::Sse],
+                    size_bits: 128,
+                },
+                128u32,
+                vec![
+                    (Opcode::Load, 0, 64),
+                    (Opcode::Store, 0, 64),
+                    (Opcode::Load, 8, 64),
+                    (Opcode::Store, 8, 64),
+                ],
+            ),
+            (
+                "struct { float a, b, c; } as an HFA: twelve bytes",
+                crate::abi::ArgClass::Hfa {
+                    base: crate::abi::HfaBase::Float32,
+                    count: 3,
+                },
+                96,
+                vec![
+                    (Opcode::Load, 0, 64),
+                    (Opcode::Store, 0, 64),
+                    (Opcode::Load, 8, 32),
+                    (Opcode::Store, 8, 32),
+                ],
+            ),
+        ];
+
+        for (what, ret_class, size_bits, want) in cases {
+            let callee = aggregate_address_ret_callee(&types, ret_class, size_bits);
+
+            // `struct Q v = mk();` -- the result local the backend would have
+            // written the returned registers into is the call's target.
+            let mut caller = Function::new("caller", types.void_id);
+            let mut cb = BasicBlock::new(BasicBlockId(0));
+            cb.insns.push(Instruction::new(Opcode::Entry));
+            cb.insns.push(Instruction::call(
+                Some(PseudoId(0)),
+                "mk",
+                vec![],
+                vec![],
+                types.long_id,
+                size_bits,
+            ));
+            cb.insns.push(Instruction::ret(None));
+            caller.add_block(cb);
+            caller.entry = BasicBlockId(0);
+            caller.add_pseudo(Pseudo::sym(PseudoId(0), "__2reg_0".to_string()));
+            caller.next_pseudo = 1;
+
+            assert!(inline_call_site(&mut caller, 0, 1, &callee), "{what}");
+
+            let insns: Vec<&Instruction> =
+                caller.blocks.iter().flat_map(|b| b.insns.iter()).collect();
+            let moves: Vec<(Opcode, i64, u32)> = insns
+                .iter()
+                .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
+                .map(|i| (i.op, i.offset, i.size))
+                .collect();
+            assert_eq!(moves, want, "{what}");
+
+            // Every store writes the result local, and nothing phis the
+            // address: an address is not a value.
+            for store in insns.iter().filter(|i| i.op == Opcode::Store) {
+                assert_eq!(store.src.first(), Some(&PseudoId(0)), "{what}");
+            }
+            assert!(
+                !insns
+                    .iter()
+                    .any(|i| matches!(i.op, Opcode::Phi | Opcode::PhiSource)),
+                "{what}: the returned aggregate is not phi-ed"
+            );
+        }
     }
 
     /// Each inlined copy of a function that takes a label's address names

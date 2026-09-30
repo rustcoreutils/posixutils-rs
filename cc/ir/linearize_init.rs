@@ -48,6 +48,92 @@ pub(crate) fn is_const_object_type(types: &TypeTable, typ: TypeId) -> bool {
 /// converts to an integer type outside its range, as it does in gcc.
 const OVERFLOW_WARNING: &str = "overflow";
 
+/// The bytes a bit-field's own bits occupy, as `(byte offset from the field's
+/// own offset, the bits `value` puts there, the mask of the bits the field
+/// owns)`.
+///
+/// Only the bytes the field's bits reach. Its access span is wider and
+/// generally starts earlier -- `unsigned a:1` after a `char` sits at bit 8 of
+/// a span based at byte 0 -- and writing the whole span would blank the
+/// members sharing it.
+fn bitfield_carrier_bytes(
+    bit_offset: u32,
+    bit_width: u32,
+    value: i128,
+) -> impl Iterator<Item = (usize, u8, u8)> {
+    // A field with no bits, or one no carrier could hold, occupies no byte.
+    // Otherwise the mask comes of shifting `u128::MAX` down rather than
+    // `1 << width` up, for the reason `bitfield_value_mask` records: the
+    // latter overflows at the carrier's own width.
+    let fits = bit_width > 0 && u64::from(bit_offset) + u64::from(bit_width) <= 128;
+    let (shift, width_mask) = if fits {
+        (bit_offset, u128::MAX >> (128 - bit_width))
+    } else {
+        (0, 0)
+    };
+    let placed = ((value as u128) & width_mask) << shift;
+    let owned = width_mask << shift;
+    let bytes = if fits {
+        (bit_offset / 8) as usize..((bit_offset + bit_width - 1) / 8) as usize + 1
+    } else {
+        0..0
+    };
+    bytes.map(move |byte| {
+        let shift = byte * 8;
+        (
+            byte,
+            ((placed >> shift) & 0xff) as u8,
+            ((owned >> shift) & 0xff) as u8,
+        )
+    })
+}
+
+/// The bytes a bit-field member's own bits occupy, measured from the first
+/// byte of the struct that declares it. `None` for anything but a bit-field.
+fn bitfield_byte_span(member: &crate::types::StructMember) -> Option<std::ops::Range<usize>> {
+    let (bit_offset, bit_width) = (member.bit_offset?, member.bit_width?);
+    let start = member.offset + (bit_offset / 8) as usize;
+    let end = member.offset + (bit_offset + bit_width).div_ceil(8) as usize;
+    Some(start..end.max(start + 1))
+}
+
+/// Give the carrier byte at `offset` of a struct initializer the bits `bits`
+/// in place of the ones `mask` marks, leaving the neighbouring bit-fields
+/// that share the byte as they are.
+///
+/// False when the byte is not a carrier byte the lowering wrote -- an entry
+/// for an ordinary member covering it, or something other than an integer --
+/// which leaves the caller to discard the earlier initializer whole.
+fn replace_carrier_bits(
+    fields: &mut Vec<(usize, usize, Initializer)>,
+    offset: usize,
+    bits: u8,
+    mask: u8,
+) -> bool {
+    match fields
+        .iter()
+        .position(|(off, size, _)| *off <= offset && offset < *off + *size)
+    {
+        Some(index) => {
+            if (fields[index].0, fields[index].1) != (offset, 1) {
+                return false;
+            }
+            let Initializer::Int(held) = fields[index].2 else {
+                return false;
+            };
+            fields[index].2 = Initializer::Int(i128::from((held as u8 & !mask) | bits));
+            true
+        }
+        None => {
+            // The byte holds no bit-field the earlier initializer gave a
+            // value to, so the bits around this field's are zero.
+            fields.push((offset, 1, Initializer::Int(i128::from(bits))));
+            fields.sort_by_key(|(off, _, _)| *off);
+            true
+        }
+    }
+}
+
 /// Name an expression the way a C programmer would, for a diagnostic.
 ///
 /// The alternative these messages used was `{:?}` on the AST node, which
@@ -860,11 +946,32 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// Group array init elements by index, handling designators, brace elision,
     /// and nested InitList flattening. Shared between static and runtime paths.
+    ///
+    /// `array_typ` is the array being initialized, not its element type: the
+    /// bound is needed as well as the element type, because an initializer
+    /// past the last element is excess (C17 6.7.9p2) and must be *discarded*.
+    /// Grouping it anyway gave it an offset beyond the object and both lowering
+    /// paths then wrote there -- `int a[2] = {1, 2, 3};` stored the 3 over
+    /// whatever the frame put after `a`, and the file-scope form emitted a
+    /// third `.long` under a two-element symbol. c17 already warns about the
+    /// excess element; this is where it stops mattering.
     pub(crate) fn group_array_init_elements(
         &self,
         elements: &[InitElement],
-        elem_type: TypeId,
+        array_typ: TypeId,
     ) -> ArrayInitGroups {
+        let elem_type = self.types.base_type(array_typ).unwrap_or(self.types.int_id);
+
+        // An absent or zero bound is an array sized *by* this initializer -- an
+        // incomplete type `int a[] = {1, 2, 3}`, a flexible array member, or a
+        // GNU zero-length array -- so nothing in the list can be excess.
+        let last_index = self
+            .types
+            .array_size(array_typ)
+            .filter(|&n| n > 0)
+            .map(|n| n as i64 - 1);
+        let in_bounds = |idx: i64| last_index.is_none_or(|last| (0..=last).contains(&idx));
+
         let mut element_lists: HashMap<i64, Vec<InitElement>> = HashMap::new();
         let mut element_indices: Vec<i64> = Vec::new();
         let mut current_idx: i64 = 0;
@@ -912,7 +1019,13 @@ impl<'a> super::linearize::Linearizer<'a> {
             if remaining_designators.is_empty()
                 && self.is_brace_elision_candidate(element, elem_type)
             {
+                // Consumed either way: the elements belong to this slot, and
+                // leaving them in the list would make the next iteration read
+                // them as initializers for the enclosing array.
                 let sub_elements = self.consume_brace_elision(elements, &mut elem_idx, elem_type);
+                if !in_bounds(element_index) {
+                    continue;
+                }
                 let entry = element_lists.entry(element_index).or_insert_with(|| {
                     element_indices.push(element_index);
                     Vec::new()
@@ -926,27 +1039,37 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Expanding here keeps both lowering paths -- the static data
             // image and the runtime stores -- unchanged, and matches how c17
             // already lowers a bulk initializer element by element.
+            //
+            // A range is clamped rather than dropped whole, so that
+            // `[0 ... 4] = 1` on a three-element array still initializes the
+            // three elements the array has. Clamping the high endpoint also
+            // keeps the loop off the excess indices rather than walking one
+            // iteration per discarded element, which matters for an endpoint
+            // far past the array.
             let span_end = index_high.unwrap_or(element_index);
-            for target_index in element_index..=span_end {
-                let entry = element_lists.entry(target_index).or_insert_with(|| {
-                    element_indices.push(target_index);
-                    Vec::new()
-                });
+            let span_end = last_index.map_or(span_end, |last| span_end.min(last));
+            if in_bounds(element_index) {
+                for target_index in element_index..=span_end {
+                    let entry = element_lists.entry(target_index).or_insert_with(|| {
+                        element_indices.push(target_index);
+                        Vec::new()
+                    });
 
-                if remaining_designators.is_empty() {
-                    if let ExprKind::InitList {
-                        elements: nested_elements,
-                    } = &element.value.kind
-                    {
-                        entry.extend(nested_elements.clone());
-                        continue;
+                    if remaining_designators.is_empty() {
+                        if let ExprKind::InitList {
+                            elements: nested_elements,
+                        } = &element.value.kind
+                        {
+                            entry.extend(nested_elements.clone());
+                            continue;
+                        }
                     }
-                }
 
-                entry.push(InitElement {
-                    designators: remaining_designators.clone(),
-                    value: element.value.clone(),
-                });
+                    entry.push(InitElement {
+                        designators: remaining_designators.clone(),
+                        value: element.value.clone(),
+                    });
+                }
             }
             elem_idx += 1;
         }
@@ -978,15 +1101,25 @@ impl<'a> super::linearize::Linearizer<'a> {
             if element.designators.is_empty() {
                 // Positional: check anonymous struct continuation, then next member
                 let mut member = None;
+                let mut member_index = None;
                 if anon_cont.is_some() {
+                    // A continuation is filling the anonymous aggregate at
+                    // `outer_idx`, so that is the member this element lands in.
+                    member_index = anon_cont.as_ref().map(|cont| cont.outer_idx);
                     member = self.get_anon_continuation_member(
                         &mut anon_cont,
                         members,
                         &mut current_field_idx,
                     );
+                    if member.is_none() {
+                        member_index = None;
+                    }
                 }
                 if member.is_none() {
-                    member = self.next_positional_member(members, is_union, &mut current_field_idx);
+                    let picked =
+                        self.next_positional_member(members, is_union, &mut current_field_idx);
+                    member_index = picked.as_ref().map(|(_, index)| *index);
+                    member = picked.map(|(member, _)| member);
                 }
                 let Some(member) = member else {
                     elem_idx += 1;
@@ -1011,6 +1144,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                     bit_offset: member.bit_offset,
                     bit_width: member.bit_width,
                     access_bytes: member.access_bytes,
+                    member_index,
+                    unions: UnionMembers::default(),
                 });
                 continue;
             }
@@ -1023,19 +1158,23 @@ impl<'a> super::linearize::Linearizer<'a> {
                 bit_offset,
                 bit_width,
                 access_bytes,
+                unions,
             }) = resolved
             else {
                 elem_idx += 1;
                 continue;
             };
+            let mut member_index = None;
             if let Some(Designator::Field(name)) = element.designators.first() {
                 if let Some(result) = self.member_index_for_designator(members, *name) {
                     match result {
                         MemberDesignatorResult::Direct(next_idx) => {
+                            member_index = Some(next_idx - 1);
                             current_field_idx = next_idx;
                             anon_cont = None;
                         }
                         MemberDesignatorResult::Anonymous { outer_idx, levels } => {
+                            member_index = Some(outer_idx);
                             current_field_idx = outer_idx;
                             anon_cont = Some(AnonContinuation { outer_idx, levels });
                         }
@@ -1051,11 +1190,705 @@ impl<'a> super::linearize::Linearizer<'a> {
                 bit_offset,
                 bit_width,
                 access_bytes,
+                member_index,
+                unions,
             });
             elem_idx += 1;
         }
 
         visits
+    }
+
+    /// The member each union inside the subobject a visit initializes comes
+    /// to hold, by byte offset within the object being initialized.
+    ///
+    /// Answered from the initializer list rather than from the lowered
+    /// `Initializer`, so that the static and the automatic path get the same
+    /// answer from the same walk. Both need it to resolve a later initializer
+    /// naming something inside a union against this one: only where the union
+    /// still holds the same member does the rest of that member survive.
+    pub(crate) fn held_union_members(
+        &self,
+        typ: TypeId,
+        kind: &StructFieldVisitKind,
+        base: usize,
+    ) -> UnionMembers {
+        let mut held = UnionMembers::default();
+        // The walk costs a second pass over the initializer, so it is only
+        // made where there is a union to find.
+        if self.type_holds_union(typ) {
+            self.record_held_unions_of(typ, kind, base, &mut held);
+        }
+        held
+    }
+
+    /// Whether an object of type `typ` has a union anywhere inside it, itself
+    /// included. Pointers are not looked through, so this terminates on the
+    /// self-referential types C allows.
+    fn type_holds_union(&self, typ: TypeId) -> bool {
+        let typ = self.resolve_struct_type(typ);
+        match self.types.kind(typ) {
+            TypeKind::Union => true,
+            TypeKind::Struct => self
+                .types
+                .get(typ)
+                .composite
+                .as_ref()
+                .is_some_and(|composite| {
+                    composite
+                        .members
+                        .iter()
+                        .any(|member| self.type_holds_union(member.typ))
+                }),
+            TypeKind::Array => self
+                .types
+                .base_type(typ)
+                .is_some_and(|elem| self.type_holds_union(elem)),
+            _ => false,
+        }
+    }
+
+    fn record_held_unions(
+        &self,
+        typ: TypeId,
+        elements: &[InitElement],
+        base: usize,
+        held: &mut UnionMembers,
+    ) {
+        let typ = self.resolve_struct_type(typ);
+        match self.types.kind(typ) {
+            TypeKind::Struct | TypeKind::Union => {
+                let Some(composite) = self.types.get(typ).composite.as_ref() else {
+                    return;
+                };
+                let members = composite.members.clone();
+                let is_union = self.types.kind(typ) == TypeKind::Union;
+                let visits = self.walk_struct_init_fields(typ, &members, is_union, elements);
+                if is_union {
+                    // Each element of a union's initializer list replaces what
+                    // the one before it put there, so the union ends up
+                    // holding whichever member the last of them named.
+                    if let Some(index) = visits.last().and_then(|visit| visit.member_index) {
+                        held.record(base, typ, index);
+                    }
+                }
+                for visit in &visits {
+                    self.record_held_unions_of(visit.typ, &visit.kind, base + visit.offset, held);
+                }
+            }
+            TypeKind::Array => {
+                let Some(elem_type) = self.types.base_type(typ) else {
+                    return;
+                };
+                let elem_size = self.types.size_bytes(elem_type);
+                let groups = self.group_array_init_elements(elements, typ);
+                for index in groups.indices {
+                    let Some(list) = groups.element_lists.get(&index) else {
+                        continue;
+                    };
+                    self.record_held_unions(
+                        elem_type,
+                        list,
+                        base + index as usize * elem_size,
+                        held,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_held_unions_of(
+        &self,
+        typ: TypeId,
+        kind: &StructFieldVisitKind,
+        base: usize,
+        held: &mut UnionMembers,
+    ) {
+        match kind {
+            StructFieldVisitKind::BraceElision(elements) => {
+                self.record_held_unions(typ, elements, base, held);
+            }
+            StructFieldVisitKind::Expr(expr) => {
+                if let ExprKind::InitList { elements } = &expr.kind {
+                    self.record_held_unions(typ, elements, base, held);
+                }
+            }
+        }
+    }
+
+    /// Where the byte range `offset..offset + size` sits inside an object of
+    /// type `typ`, with `offset` measured from that object's first byte.
+    ///
+    /// Two initializers in one list can describe overlapping storage, and
+    /// C17 6.7.9p19 resolves that by *subobject*, not by bytes: given
+    /// `{ .t = {1, 2}, .t.y = 9 }` the second names a member of the first and
+    /// replaces only it, while given `{ .u.i = 1, .u.s.b = 9 }` the second
+    /// names a different member of a union and so replaces the whole of what
+    /// the first wrote. The spans are identical in shape -- one inside the
+    /// other -- so only the type can tell the two cases apart.
+    ///
+    /// `unions` says which member each union on the way holds; a union it has
+    /// nothing to say about is answered [`SubobjectPlace::ThroughUnion`],
+    /// which discards its contents.
+    pub(crate) fn classify_subobject(
+        &self,
+        typ: TypeId,
+        offset: usize,
+        size: usize,
+        unions: UnionFold<'_>,
+    ) -> SubobjectPlace {
+        self.classify_range(typ, offset, size, false, unions)
+    }
+
+    /// The same question for the bytes a *bit-field's* own bits occupy.
+    ///
+    /// A bit-field is not addressable storage, so it is never a subobject of
+    /// its own and the answer wanted is the struct that declares it, whose
+    /// initializer holds the carrier the field shares with its neighbours.
+    /// An exact byte match is no reason to stop early: `struct { unsigned
+    /// char a : 4, b : 4; }` is one byte wide, and replacing it whole would
+    /// take `b` with it.
+    pub(crate) fn classify_bitfield_carrier(
+        &self,
+        typ: TypeId,
+        offset: usize,
+        size: usize,
+        unions: UnionFold<'_>,
+    ) -> SubobjectPlace {
+        self.classify_range(typ, offset, size, true, unions)
+    }
+
+    fn classify_range(
+        &self,
+        typ: TypeId,
+        offset: usize,
+        size: usize,
+        bitfield: bool,
+        unions: UnionFold<'_>,
+    ) -> SubobjectPlace {
+        let mut typ = self.resolve_struct_type(typ);
+        let mut base = 0usize;
+        let mut unions = unions;
+
+        loop {
+            let type_size = self.types.size_bytes(typ);
+            if !bitfield && offset == base && size == type_size {
+                return SubobjectPlace::Member;
+            }
+            if size == 0 || offset < base || offset + size > base + type_size {
+                return SubobjectPlace::NotASubobject;
+            }
+
+            match self.types.kind(typ) {
+                // Reached a union without having named it exactly, so the
+                // range lies inside one of its members. Which member the union
+                // holds is not decidable from the span -- every member starts
+                // at the same byte -- so unless both initializers agree on it,
+                // giving this range an initializer discards what the union
+                // held before.
+                TypeKind::Union => {
+                    let Some(member) = self.agreed_union_member(typ, base, offset, size, unions)
+                    else {
+                        return SubobjectPlace::ThroughUnion {
+                            offset: base,
+                            size: type_size,
+                        };
+                    };
+                    base += member.0;
+                    unions = unions.inside(member.0);
+                    typ = self.resolve_struct_type(member.1);
+                }
+                TypeKind::Struct => {
+                    let Some(composite) = self.types.get(typ).composite.as_ref() else {
+                        return SubobjectPlace::NotASubobject;
+                    };
+                    // A bit-field is not addressable storage of its own, so a
+                    // range inside its carrier is not a subobject.
+                    let found = composite.members.iter().find(|member| {
+                        member.bit_width.is_none() && {
+                            let member_start = base + member.offset;
+                            let member_end = member_start + self.types.size_bytes(member.typ);
+                            offset >= member_start && offset + size <= member_end
+                        }
+                    });
+                    let Some(member) = found else {
+                        // No ordinary member holds these bytes. For a
+                        // bit-field's bits that is expected, and this is the
+                        // struct that declares it.
+                        let declares = bitfield
+                            && composite.members.iter().any(|member| {
+                                bitfield_byte_span(member)
+                                    .is_some_and(|span| self.holds(base, &span, offset, size))
+                            });
+                        return if declares {
+                            SubobjectPlace::BitfieldCarrier {
+                                offset: base,
+                                size: type_size,
+                            }
+                        } else {
+                            SubobjectPlace::NotASubobject
+                        };
+                    };
+                    base += member.offset;
+                    unions = unions.inside(member.offset);
+                    typ = self.resolve_struct_type(member.typ);
+                }
+                TypeKind::Array => {
+                    let Some(elem_type) = self.types.base_type(typ) else {
+                        return SubobjectPlace::NotASubobject;
+                    };
+                    let elem_size = self.types.size_bytes(elem_type);
+                    if elem_size == 0 {
+                        return SubobjectPlace::NotASubobject;
+                    }
+                    let elem_start = base + ((offset - base) / elem_size) * elem_size;
+                    if offset + size > elem_start + elem_size {
+                        return SubobjectPlace::NotASubobject;
+                    }
+                    unions = unions.inside(elem_start - base);
+                    base = elem_start;
+                    typ = self.resolve_struct_type(elem_type);
+                }
+                // A scalar with something strictly inside it: only a union or
+                // a bit-field carrier can produce that, and neither is a
+                // subobject relation.
+                _ => return SubobjectPlace::NotASubobject,
+            }
+        }
+    }
+
+    /// Whether the member span `span`, measured from a struct beginning at
+    /// `base`, holds all of `offset..offset + size`.
+    fn holds(
+        &self,
+        base: usize,
+        span: &std::ops::Range<usize>,
+        offset: usize,
+        size: usize,
+    ) -> bool {
+        offset >= base + span.start && offset + size <= base + span.end
+    }
+
+    /// The member a union of type `typ`, beginning at `base`, is agreed to
+    /// hold -- as `(its offset, its type)` -- when that member holds all of
+    /// `offset..offset + size`.
+    fn agreed_union_member(
+        &self,
+        typ: TypeId,
+        base: usize,
+        offset: usize,
+        size: usize,
+        unions: UnionFold<'_>,
+    ) -> Option<(usize, TypeId)> {
+        let index = unions.agreed(typ)?;
+        let member = self
+            .types
+            .get(typ)
+            .composite
+            .as_ref()?
+            .members
+            .get(index)
+            .filter(|member| member.bit_width.is_none())?;
+        let span = member.offset..member.offset + self.types.size_bytes(member.typ);
+        self.holds(base, &span, offset, size)
+            .then_some((member.offset, member.typ))
+    }
+
+    /// An initializer that writes nothing, shaped for `typ` so that
+    /// [`Self::subobject_init_mut`] can place entries into it.
+    fn empty_aggregate_init(&self, typ: TypeId) -> Option<Initializer> {
+        match self.types.kind(typ) {
+            TypeKind::Struct | TypeKind::Union => Some(Initializer::Struct {
+                total_size: self.types.size_bytes(typ),
+                fields: Vec::new(),
+            }),
+            TypeKind::Array => {
+                let elem_type = self.types.base_type(typ)?;
+                Some(Initializer::Array {
+                    elem_size: self.types.size_bytes(elem_type),
+                    total_size: self.types.size_bytes(typ),
+                    elements: Vec::new(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Fold `new_init` into `init`, the initializer for an object of type
+    /// `typ`, so that it initializes the subobject at `offset..offset + size`
+    /// and leaves every other subobject as it was.
+    ///
+    /// The caller has already established with [`Self::classify_subobject`]
+    /// that the range *is* such a subobject. Returns false when the existing
+    /// initializer's shape cannot express the replacement -- a string literal
+    /// standing for a character array, say -- in which case the caller falls
+    /// back to discarding the earlier initializer whole.
+    pub(crate) fn overlay_subobject(
+        &self,
+        typ: TypeId,
+        init: &mut Initializer,
+        offset: usize,
+        size: usize,
+        new_init: &Initializer,
+        unions: UnionFold<'_>,
+    ) -> bool {
+        match self.subobject_init_mut(typ, init, offset, size, unions) {
+            Some(slot) => {
+                *slot = new_init.clone();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The initializer for the subobject at `offset..offset + size` of an
+    /// object of type `typ` initialized by `init`, to be read or replaced in
+    /// place. A subobject the initializer left out gains an empty one, so
+    /// that what is written there leaves the rest of its parent alone.
+    ///
+    /// `None` when the existing initializer's shape cannot express the
+    /// subobject -- a string literal standing for a character array, an entry
+    /// for a bit-field carrier rather than for a member -- in which case the
+    /// caller discards the earlier initializer whole. It may by then have
+    /// gained an empty initializer for a member on the way down, which is
+    /// harmless precisely because the whole of it is discarded.
+    fn subobject_init_mut<'i>(
+        &self,
+        typ: TypeId,
+        init: &'i mut Initializer,
+        offset: usize,
+        size: usize,
+        unions: UnionFold<'_>,
+    ) -> Option<&'i mut Initializer> {
+        let typ = self.resolve_struct_type(typ);
+        if offset == 0 && size == self.types.size_bytes(typ) {
+            return Some(init);
+        }
+
+        match self.types.kind(typ) {
+            TypeKind::Struct | TypeKind::Union => {
+                let (slot_offset, slot_type) = if self.types.kind(typ) == TypeKind::Union {
+                    // Every member of a union begins at the same byte, so the
+                    // range cannot say which one it is in. Only the member the
+                    // two initializers agree the union holds will do.
+                    self.agreed_union_member(typ, 0, offset, size, unions)?
+                } else {
+                    self.types
+                        .get(typ)
+                        .composite
+                        .as_ref()?
+                        .members
+                        .iter()
+                        .find(|member| {
+                            member.bit_width.is_none() && {
+                                let span = member.offset
+                                    ..member.offset + self.types.size_bytes(member.typ);
+                                self.holds(0, &span, offset, size)
+                            }
+                        })
+                        .map(|member| (member.offset, member.typ))?
+                };
+                let slot_size = self.types.size_bytes(slot_type);
+                let Initializer::Struct { fields, .. } = init else {
+                    return None;
+                };
+                let slot = Self::entry_init_mut(fields, slot_offset, slot_size, || {
+                    self.empty_aggregate_init(slot_type)
+                })?;
+                self.subobject_init_mut(
+                    slot_type,
+                    slot,
+                    offset - slot_offset,
+                    size,
+                    unions.inside(slot_offset),
+                )
+            }
+            TypeKind::Array => {
+                let elem_type = self.types.base_type(typ)?;
+                let elem_size = self.types.size_bytes(elem_type);
+                if elem_size == 0 {
+                    return None;
+                }
+                let elem_offset = (offset / elem_size) * elem_size;
+                if offset + size > elem_offset + elem_size {
+                    return None;
+                }
+                let Initializer::Array { elements, .. } = init else {
+                    return None;
+                };
+                // An array's entries carry no width, so give each one the
+                // element width it implicitly has and borrow the struct
+                // path's bookkeeping.
+                let slot = Self::element_init_mut(elements, elem_offset, || {
+                    self.empty_aggregate_init(elem_type)
+                })?;
+                self.subobject_init_mut(
+                    elem_type,
+                    slot,
+                    offset - elem_offset,
+                    size,
+                    unions.inside(elem_offset),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// The entry in a struct initializer's field list for the member at
+    /// `slot_offset` of `slot_size` bytes, added as an empty initializer if
+    /// the list has none.
+    ///
+    /// `None` when an entry overlaps the member without being exactly it -- a
+    /// bit-field carrier byte, or an entry spanning several members -- which
+    /// is not something a subobject can be placed into.
+    fn entry_init_mut(
+        fields: &mut Vec<(usize, usize, Initializer)>,
+        slot_offset: usize,
+        slot_size: usize,
+        empty: impl FnOnce() -> Option<Initializer>,
+    ) -> Option<&mut Initializer> {
+        let slot_end = slot_offset + slot_size;
+        let index = match fields
+            .iter()
+            .position(|(off, sz, _)| *off < slot_end && slot_offset < *off + *sz)
+        {
+            Some(index) => {
+                if (fields[index].0, fields[index].1) != (slot_offset, slot_size) {
+                    return None;
+                }
+                index
+            }
+            None => {
+                // A scalar member has no aggregate to make empty; whatever is
+                // put here is about to be replaced outright, since nothing
+                // lies inside a scalar to descend to.
+                fields.push((slot_offset, slot_size, empty().unwrap_or_default()));
+                fields.sort_by_key(|(off, _, _)| *off);
+                fields.iter().position(|(off, _, _)| *off == slot_offset)?
+            }
+        };
+        Some(&mut fields[index].2)
+    }
+
+    /// The same for an array initializer's element list, whose entries are
+    /// one element wide by construction.
+    fn element_init_mut(
+        elements: &mut Vec<(usize, Initializer)>,
+        elem_offset: usize,
+        empty: impl FnOnce() -> Option<Initializer>,
+    ) -> Option<&mut Initializer> {
+        let index = match elements.iter().position(|(off, _)| *off == elem_offset) {
+            Some(index) => index,
+            None => {
+                elements.push((elem_offset, empty().unwrap_or_default()));
+                elements.sort_by_key(|(off, _)| *off);
+                elements.iter().position(|(off, _)| *off == elem_offset)?
+            }
+        };
+        Some(&mut elements[index].1)
+    }
+
+    /// Apply C17 6.7.9p19 to the initializers one struct or union
+    /// initializer list produced, in the order the list wrote them.
+    ///
+    /// An initializer for a subobject overrides any previously listed
+    /// initializer *for that subobject*, and leaves initializers for other
+    /// subobjects alone. So a later entry is folded into an earlier one it is
+    /// a member of, replaces an earlier one it contains, and -- when the two
+    /// are related only through a union or a bit-field carrier, where no
+    /// structural fold exists -- discards it.
+    ///
+    /// "Later" means later in the list. The entries arrive in that order and
+    /// the sort into address order, which the emitter needs, runs afterwards.
+    pub(crate) fn merge_raw_field_inits(&self, raw: Vec<RawFieldInit>) -> Vec<RawFieldInit> {
+        let mut merged: Vec<RawFieldInit> = Vec::with_capacity(raw.len());
+
+        for later in raw {
+            let later_span = later.byte_span();
+            let mut folded = false;
+            let mut idx = 0;
+
+            while idx < merged.len() {
+                let earlier = &merged[idx];
+                let earlier_span = earlier.byte_span();
+                if earlier_span.start >= later_span.end || later_span.start >= earlier_span.end {
+                    idx += 1;
+                    continue;
+                }
+                // Two *distinct* bit-fields are different objects even when
+                // they share a carrier byte, so both survive.
+                if earlier.bit_width.is_some()
+                    && later.bit_width.is_some()
+                    && (earlier.offset, earlier.bit_offset) != (later.offset, later.bit_offset)
+                {
+                    idx += 1;
+                    continue;
+                }
+                // A bit-field never supersedes an initializer for an object
+                // containing it, however the two spans compare: it is narrower
+                // than the storage they share -- `struct { unsigned char a : 4,
+                // b : 4; }` is one byte -- so what it does not name stands, and
+                // it is folded into the carrier instead.
+                let inside = earlier_span.start <= later_span.start
+                    && later_span.end <= earlier_span.end
+                    && earlier.bit_width.is_none();
+                if !(inside && later.bit_width.is_some())
+                    && later_span.start <= earlier_span.start
+                    && earlier_span.end <= later_span.end
+                {
+                    merged.remove(idx);
+                    continue;
+                }
+                let foldable = !folded && inside && self.fold_field_init(&mut merged[idx], &later);
+                if foldable {
+                    folded = true;
+                    idx += 1;
+                    continue;
+                }
+                merged.remove(idx);
+            }
+
+            if !folded {
+                merged.push(later);
+            }
+        }
+
+        merged
+    }
+
+    /// Fold `later`, whose bytes lie inside `earlier`'s, into `earlier`.
+    /// Returns false when no structural fold exists, which leaves the caller
+    /// to discard `earlier`.
+    fn fold_field_init(&self, earlier: &mut RawFieldInit, later: &RawFieldInit) -> bool {
+        // `unions` borrows what the earlier entry holds, which the fold then
+        // updates, so it reads from a copy.
+        let held = earlier.held.clone();
+        let unions = UnionFold::new(&held, &later.named, earlier.offset);
+        let span = later.byte_span();
+        let inner_offset = span.start - earlier.offset;
+        let inner_size = span.end - span.start;
+
+        let place = if later.bit_width.is_some() {
+            self.classify_bitfield_carrier(earlier.typ, inner_offset, inner_size, unions)
+        } else {
+            self.classify_subobject(earlier.typ, inner_offset, inner_size, unions)
+        };
+        let folded = match place {
+            SubobjectPlace::Member => self.overlay_subobject(
+                earlier.typ,
+                &mut earlier.init,
+                inner_offset,
+                inner_size,
+                &later.init,
+                unions,
+            ),
+            // Not storage of its own: only the bits the field names change,
+            // inside the carrier its declaring struct's initializer wrote.
+            SubobjectPlace::BitfieldCarrier { offset, size } => {
+                self.fold_bitfield_init(earlier, later, offset, size, unions)
+            }
+            // The union stops holding what it held: everything it contained
+            // goes, and it comes to hold just this one initializer.
+            SubobjectPlace::ThroughUnion { offset, size } => {
+                let Some(fields) = self.union_replacement_fields(earlier, later, offset) else {
+                    return false;
+                };
+                let replacement = Initializer::Struct {
+                    total_size: size,
+                    fields,
+                };
+                let replaced = self.overlay_subobject(
+                    earlier.typ,
+                    &mut earlier.init,
+                    offset,
+                    size,
+                    &replacement,
+                    unions,
+                );
+                if replaced {
+                    let start = earlier.offset + offset;
+                    earlier.held.clear_range(start..start + size);
+                }
+                replaced
+            }
+            SubobjectPlace::NotASubobject => false,
+        };
+
+        if folded {
+            // What the later initializer says about the unions it wrote or
+            // passed through is the last word on them.
+            earlier.held.absorb(&later.held);
+            earlier.held.absorb(&later.named);
+        }
+        folded
+    }
+
+    /// The entries a union comes to hold once `later` replaces its contents:
+    /// the initializer itself, or the bytes of a bit-field's carrier, placed
+    /// at their offsets within the union beginning at `offset` of `earlier`.
+    fn union_replacement_fields(
+        &self,
+        earlier: &RawFieldInit,
+        later: &RawFieldInit,
+        offset: usize,
+    ) -> Option<Vec<(usize, usize, Initializer)>> {
+        let union_start = earlier.offset + offset;
+        let (Some(bit_offset), Some(bit_width)) = (later.bit_offset, later.bit_width) else {
+            let inner = later.offset.checked_sub(union_start)?;
+            return Some(vec![(inner, later.field_size, later.init.clone())]);
+        };
+        let Initializer::Int(value) = later.init else {
+            return None;
+        };
+        bitfield_carrier_bytes(bit_offset, bit_width, value)
+            .map(|(byte, bits, _)| {
+                let inner = (later.offset + byte).checked_sub(union_start)?;
+                Some((inner, 1, Initializer::Int(i128::from(bits))))
+            })
+            .collect()
+    }
+
+    /// Replace the bits `later` names inside the carrier bytes the struct
+    /// declaring it -- at `offset..offset + size` of `earlier`'s object --
+    /// already has an initializer for.
+    ///
+    /// The carrier is whole bytes by the time it reaches here: a struct's
+    /// bit-fields are merged into one byte apiece as the last step of lowering
+    /// it, downstream of the `Initializer` tree, so there is no bit-field left
+    /// in the tree to replace -- only the bits of it that a byte holds.
+    fn fold_bitfield_init(
+        &self,
+        earlier: &mut RawFieldInit,
+        later: &RawFieldInit,
+        offset: usize,
+        size: usize,
+        unions: UnionFold<'_>,
+    ) -> bool {
+        let (Some(bit_offset), Some(bit_width)) = (later.bit_offset, later.bit_width) else {
+            return false;
+        };
+        let Initializer::Int(value) = later.init else {
+            return false;
+        };
+        let Some(carrier) =
+            self.subobject_init_mut(earlier.typ, &mut earlier.init, offset, size, unions)
+        else {
+            return false;
+        };
+        let Initializer::Struct { fields, .. } = carrier else {
+            return false;
+        };
+        // Where the field's own storage begins within the declaring struct.
+        let Some(base) = later.offset.checked_sub(earlier.offset + offset) else {
+            return false;
+        };
+        for (byte, bits, mask) in bitfield_carrier_bytes(bit_offset, bit_width, value) {
+            if !replace_carrier_bits(fields, base + byte, bits, mask) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Convert an AST initializer list to an IR Initializer
@@ -1100,7 +1933,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     TypeKind::Array | TypeKind::Struct | TypeKind::Union
                 );
 
-                let groups = self.group_array_init_elements(elements, elem_type);
+                let groups = self.group_array_init_elements(elements, typ);
                 let mut init_elements = Vec::new();
                 for element_index in groups.indices {
                     let Some(list) = groups.element_lists.get(&element_index) else {
@@ -1156,6 +1989,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // Convert field visits to RawFieldInit by evaluating expressions
                     let mut raw_fields: Vec<RawFieldInit> = Vec::new();
                     for visit in visits {
+                        let held = self.held_union_members(visit.typ, &visit.kind, visit.offset);
                         let field_init = match visit.kind {
                             StructFieldVisitKind::BraceElision(sub_elements) => {
                                 self.ast_init_list_to_ir(&sub_elements, visit.typ)
@@ -1167,39 +2001,27 @@ impl<'a> super::linearize::Linearizer<'a> {
                         raw_fields.push(RawFieldInit {
                             offset: visit.offset,
                             field_size: visit.field_size,
+                            typ: visit.typ,
                             init: field_init,
                             bit_offset: visit.bit_offset,
                             bit_width: visit.bit_width,
+                            held,
+                            named: visit.unions,
                         });
                     }
+
+                    // Initializing the same object twice: the later one wins
+                    // (C17 6.7.9p19), and one that names a *subobject* of an
+                    // earlier one replaces only that subobject. Resolved in
+                    // the order the list wrote them, before the sort below
+                    // reorders them by address.
+                    let mut raw_fields = self.merge_raw_field_inits(raw_fields);
 
                     // Sort by the bit each field starts at, so that designated
                     // initializers emit in address order however they were
                     // written -- the emitter fills the gaps between fields and
                     // so requires them sorted and non-overlapping.
                     raw_fields.sort_by_key(|f| f.offset * 8 + f.bit_offset.unwrap_or(0) as usize);
-
-                    // Initializing the same object twice: the later one wins
-                    // (C17 6.7.9p19). Two *distinct* bitfields are different
-                    // objects even when they share a byte, so both survive.
-                    let mut idx = 0;
-                    while idx + 1 < raw_fields.len() {
-                        let (a, b) = (&raw_fields[idx], &raw_fields[idx + 1]);
-                        let distinct_bitfields = a.bit_width.is_some()
-                            && b.bit_width.is_some()
-                            && (a.offset, a.bit_offset) != (b.offset, b.bit_offset);
-                        let a_span = a.byte_span();
-                        let b_span = b.byte_span();
-
-                        if !distinct_bitfields
-                            && a_span.start < b_span.end
-                            && b_span.start < a_span.end
-                        {
-                            raw_fields.remove(idx);
-                        } else {
-                            idx += 1;
-                        }
-                    }
 
                     // Merge bitfields byte by byte rather than one storage unit
                     // at a time. A unit is `sizeof(T)` wide and aligned, so it
@@ -1222,25 +2044,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         let Initializer::Int(value) = field.init else {
                             continue;
                         };
-                        if bit_width == 0 {
-                            continue;
-                        }
-
-                        // Shifting `u128::MAX` down rather than `1 << width`
-                        // up, for the reason `bitfield_value_mask` records: the
-                        // latter overflows at the carrier's own width.
-                        let mask = u128::MAX >> (128 - bit_width);
-                        let placed = ((value as u128) & mask) << bit_off;
-
-                        // Only the bytes the field's own bits reach. Its window
-                        // is wider and generally starts earlier -- `unsigned a:1`
-                        // after a `char` sits at bit 8 of a window based at byte
-                        // 0 -- and writing the whole window here would blank the
-                        // members sharing it.
-                        for byte in
-                            (bit_off / 8) as usize..=((bit_off + bit_width - 1) / 8) as usize
-                        {
-                            let bits = ((placed >> (byte * 8)) & 0xff) as u8;
+                        for (byte, bits, _) in bitfield_carrier_bytes(bit_off, bit_width, value) {
                             *bitfield_bytes.entry(field.offset + byte).or_default() |= bits;
                         }
                     }
@@ -1282,6 +2086,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let mut bit_offset = None;
         let mut bit_width = None;
         let mut access_bytes = None;
+        let mut unions = UnionMembers::default();
 
         for (idx, designator) in designators.iter().enumerate() {
             match designator {
@@ -1291,6 +2096,14 @@ impl<'a> super::linearize::Linearizer<'a> {
                         resolved = self.types.base_type(resolved)?;
                     }
                     resolved = self.resolve_struct_type(resolved);
+                    // Naming a member of a union says which member the
+                    // initializer is for, and nothing downstream can recover
+                    // that: every member of a union begins at `offset`.
+                    if self.types.kind(resolved) == TypeKind::Union {
+                        if let Some(index) = self.designated_member_index(resolved, *name) {
+                            unions.record(offset, resolved, index);
+                        }
+                    }
                     let member = self.types.find_member(resolved, *name)?;
                     offset += member.offset;
                     typ = member.typ;
@@ -1332,15 +2145,32 @@ impl<'a> super::linearize::Linearizer<'a> {
             bit_offset,
             bit_width,
             access_bytes,
+            unions,
         })
     }
 
+    /// The index, in `composite_typ`'s member list, of the member a `.name`
+    /// designator names -- or of the anonymous member that contains it.
+    fn designated_member_index(&self, composite_typ: TypeId, name: StringId) -> Option<usize> {
+        let members = &self.types.get(composite_typ).composite.as_ref()?.members;
+        match self.member_index_for_designator(members, name)? {
+            MemberDesignatorResult::Direct(next_idx) => Some(next_idx - 1),
+            MemberDesignatorResult::Anonymous { outer_idx, .. } => Some(outer_idx),
+        }
+    }
+
+    /// The member the next positional element initializes, and its index in
+    /// `members`.
+    ///
+    /// The index is what tells two members of a union apart: they share a byte
+    /// offset, so nothing downstream can recover which one an initializer
+    /// chose.
     pub(crate) fn next_positional_member(
         &self,
         members: &[crate::types::StructMember],
         is_union: bool,
         current_field_idx: &mut usize,
-    ) -> Option<MemberInfo> {
+    ) -> Option<(MemberInfo, usize)> {
         if is_union {
             if *current_field_idx > 0 {
                 return None;
@@ -1357,34 +2187,42 @@ impl<'a> super::linearize::Linearizer<'a> {
             // members are *all* anonymous found none at all and stayed zero
             // entirely. Unnamed bit-field padding is not a member and is
             // still skipped.
-            let member = members
+            let (index, member) = members
                 .iter()
-                .find(|m| m.name != StringId::EMPTY || m.bit_width.is_none())?;
+                .enumerate()
+                .find(|(_, m)| m.name != StringId::EMPTY || m.bit_width.is_none())?;
             *current_field_idx = members.len();
-            return Some(MemberInfo {
-                offset: member.offset,
-                typ: member.typ,
-                bit_offset: member.bit_offset,
-                bit_width: member.bit_width,
-                access_bytes: member.access_bytes,
-            });
+            return Some((
+                MemberInfo {
+                    offset: member.offset,
+                    typ: member.typ,
+                    bit_offset: member.bit_offset,
+                    bit_width: member.bit_width,
+                    access_bytes: member.access_bytes,
+                },
+                index,
+            ));
         }
 
         while *current_field_idx < members.len() {
-            let member = &members[*current_field_idx];
+            let index = *current_field_idx;
+            let member = &members[index];
             if member.name == StringId::EMPTY && member.bit_width.is_some() {
                 *current_field_idx += 1;
                 continue;
             }
             if member.name != StringId::EMPTY || member.bit_width.is_none() {
                 *current_field_idx += 1;
-                return Some(MemberInfo {
-                    offset: member.offset,
-                    typ: member.typ,
-                    bit_offset: member.bit_offset,
-                    bit_width: member.bit_width,
-                    access_bytes: member.access_bytes,
-                });
+                return Some((
+                    MemberInfo {
+                        offset: member.offset,
+                        typ: member.typ,
+                        bit_offset: member.bit_offset,
+                        bit_width: member.bit_width,
+                        access_bytes: member.access_bytes,
+                    },
+                    index,
+                ));
             }
             *current_field_idx += 1;
         }
@@ -1767,5 +2605,861 @@ impl<'a> super::linearize::Linearizer<'a> {
             cur = &next.target;
         }
         Err(AliasFault::Undefined)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::ast::Expr;
+    use crate::symbol::SymbolTable;
+    use crate::target::Target;
+    use crate::types::Type;
+
+    /// A positional initializer element holding an `int` constant.
+    fn positional(value: i64, types: &TypeTable) -> InitElement {
+        InitElement {
+            designators: vec![],
+            value: Box::new(Expr::int(value, types)),
+        }
+    }
+
+    /// The same, addressed by a designator.
+    fn designated(designator: Designator, value: i64, types: &TypeTable) -> InitElement {
+        InitElement {
+            designators: vec![designator],
+            value: Box::new(Expr::int(value, types)),
+        }
+    }
+
+    /// The indices `group_array_init_elements` keeps for `elements` when they
+    /// initialize an `int` array of `size` elements (`None`: a bound derived
+    /// from the initializer itself, as for `int a[] = {1, 2, 3}`).
+    fn kept_indices(
+        size: Option<usize>,
+        build: impl Fn(&TypeTable) -> Vec<InitElement>,
+    ) -> Vec<i64> {
+        let target = Target::host();
+        let mut types = TypeTable::new(&target);
+        let elements = build(&types);
+        let array = types.intern(Type {
+            kind: TypeKind::Array,
+            base: Some(types.int_id),
+            array_size: size,
+            ..Default::default()
+        });
+        let symbols = SymbolTable::new();
+        let strings = crate::strings::StringTable::new();
+        let lin = Linearizer::new(&symbols, &types, &strings, &target);
+        let groups = lin.group_array_init_elements(&elements, array);
+        assert_eq!(groups.indices.len(), groups.element_lists.len());
+        groups.indices
+    }
+
+    #[test]
+    fn excess_array_elements_are_discarded() {
+        // `int a[2] = {1, 2, 3};` -- the third element has nowhere to go.
+        let indices = kept_indices(Some(2), |types| {
+            (1..=3).map(|v| positional(v, types)).collect()
+        });
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn a_positional_element_past_a_designator_can_be_excess() {
+        // `int a[3] = {[2] = 3, 1};` -- C17 6.7.9p17 resumes at index 3, so
+        // the `1` is excess although the list is shorter than the array.
+        let indices = kept_indices(Some(3), |types| {
+            vec![
+                designated(Designator::Index(2), 3, types),
+                positional(1, types),
+            ]
+        });
+        assert_eq!(indices, vec![2]);
+    }
+
+    #[test]
+    fn a_range_designator_is_clamped_to_the_array() {
+        // `int a[3] = {[0 ... 4] = 7};` initializes the three elements it has.
+        let indices = kept_indices(Some(3), |types| {
+            vec![designated(Designator::IndexRange(0, 4), 7, types)]
+        });
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn an_initializer_derived_bound_has_no_excess() {
+        // `int a[] = {1, 2, 3};` and a flexible array member are sized by the
+        // initializer, so every element belongs to the object.
+        let indices = kept_indices(None, |types| {
+            (1..=3).map(|v| positional(v, types)).collect()
+        });
+        assert_eq!(indices, vec![0, 1, 2]);
+        let indices = kept_indices(Some(0), |types| {
+            (1..=3).map(|v| positional(v, types)).collect()
+        });
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    /// The static image of `int a[2] = {1, 2, 3};` is two elements wide, not
+    /// three: the excess element used to become a third `.long` under a
+    /// two-element symbol, which the next symbol in the section absorbed.
+    #[test]
+    fn a_static_array_image_holds_no_excess_element() {
+        let target = Target::host();
+        let mut types = TypeTable::new(&target);
+        let elements: Vec<_> = (1..=3).map(|v| positional(v, &types)).collect();
+        let array = types.intern(Type::array(types.int_id, 2));
+        let symbols = SymbolTable::new();
+        let strings = crate::strings::StringTable::new();
+        let mut lin = Linearizer::new(&symbols, &types, &strings, &target);
+        let init = lin.ast_init_list_to_ir(&elements, array);
+        let Initializer::Array {
+            elem_size,
+            total_size,
+            elements,
+        } = init
+        else {
+            panic!("an array initializer lowers to Initializer::Array, got {init:?}");
+        };
+        assert_eq!(elem_size, 4);
+        assert_eq!(total_size, 8);
+        assert_eq!(
+            elements
+                .iter()
+                .map(|(offset, init)| (*offset, init.clone()))
+                .collect::<Vec<_>>(),
+            vec![(0, Initializer::Int(1)), (4, Initializer::Int(2))],
+        );
+    }
+
+    // Resolving two initializers that describe overlapping storage
+    // (C17 6.7.9p19).
+
+    /// Types for the override tests:
+    ///
+    /// ```c
+    /// struct T { int x, y; };
+    /// struct S { struct T t; int z; };
+    /// struct A { int a[3]; int z; };
+    /// struct W { union { int i; struct { char a, b, c, d; } s; } u; };
+    /// struct B { unsigned a : 4, b : 4; };
+    /// struct C { struct B t; int z; };
+    /// struct N { union { struct T p; int i; } u; };
+    /// ```
+    struct OverrideTypes {
+        target: Target,
+        types: TypeTable,
+        strings: crate::strings::StringTable,
+        symbols: SymbolTable,
+        t: TypeId,
+        s: TypeId,
+        a: TypeId,
+        w: TypeId,
+        v: TypeId,
+        b: TypeId,
+        c: TypeId,
+        n: TypeId,
+        /// The `union { struct T p; int i; }` inside `struct N`.
+        n_union: TypeId,
+        int_array: TypeId,
+    }
+
+    fn member(name: StringId, typ: TypeId, offset: usize) -> crate::types::StructMember {
+        crate::types::StructMember {
+            name,
+            typ,
+            offset,
+            bit_offset: None,
+            bit_width: None,
+            access_bytes: None,
+            explicit_align: None,
+        }
+    }
+
+    /// A bit-field of `width` bits at `bit_offset` of a four-byte access span
+    /// based at byte 0.
+    fn bitfield(
+        name: StringId,
+        typ: TypeId,
+        bit_offset: u32,
+        width: u32,
+    ) -> crate::types::StructMember {
+        crate::types::StructMember {
+            name,
+            typ,
+            offset: 0,
+            bit_offset: Some(bit_offset),
+            bit_width: Some(width),
+            access_bytes: Some(4),
+            explicit_align: None,
+        }
+    }
+
+    fn composite(
+        members: Vec<crate::types::StructMember>,
+        size: usize,
+        align: usize,
+    ) -> crate::types::CompositeType {
+        crate::types::CompositeType {
+            members,
+            size,
+            align,
+            member_align: align,
+            is_complete: true,
+            ..crate::types::CompositeType::incomplete(None)
+        }
+    }
+
+    impl OverrideTypes {
+        fn new() -> Self {
+            let target = Target::host();
+            let mut types = TypeTable::new(&target);
+            let mut strings = crate::strings::StringTable::new();
+            let name = |strings: &mut crate::strings::StringTable, s: &str| strings.intern(s);
+
+            let int = types.int_id;
+            let ch = types.char_id;
+
+            let (x, y) = (name(&mut strings, "x"), name(&mut strings, "y"));
+            let t = types.intern(Type::struct_type(composite(
+                vec![member(x, int, 0), member(y, int, 4)],
+                8,
+                4,
+            )));
+
+            let (t_name, z) = (name(&mut strings, "t"), name(&mut strings, "z"));
+            let s = types.intern(Type::struct_type(composite(
+                vec![member(t_name, t, 0), member(z, int, 8)],
+                12,
+                4,
+            )));
+
+            let int_array = types.intern(Type::array(int, 3));
+            let a_name = name(&mut strings, "a");
+            let a = types.intern(Type::struct_type(composite(
+                vec![member(a_name, int_array, 0), member(z, int, 12)],
+                16,
+                4,
+            )));
+
+            let (b, c, d) = (
+                name(&mut strings, "b"),
+                name(&mut strings, "c"),
+                name(&mut strings, "d"),
+            );
+            let chars = types.intern(Type::struct_type(composite(
+                vec![
+                    member(a_name, ch, 0),
+                    member(b, ch, 1),
+                    member(c, ch, 2),
+                    member(d, ch, 3),
+                ],
+                4,
+                1,
+            )));
+            let (i, s_name) = (name(&mut strings, "i"), name(&mut strings, "s"));
+            let union_u = types.intern(Type::union_type(composite(
+                vec![member(i, int, 0), member(s_name, chars, 0)],
+                4,
+                4,
+            )));
+            let u_name = name(&mut strings, "u");
+            let w = types.intern(Type::struct_type(composite(
+                vec![member(u_name, union_u, 0)],
+                4,
+                4,
+            )));
+
+            // `struct V { int k; union { int i; struct { char a, b, c, d; } s; } u; }`
+            // -- the union has a sibling, so resetting it must leave `k` be.
+            let k = name(&mut strings, "k");
+            let v = types.intern(Type::struct_type(composite(
+                vec![member(k, int, 0), member(u_name, union_u, 4)],
+                8,
+                4,
+            )));
+
+            // `struct B { unsigned a : 4, b : 4; }` and the `struct C { struct
+            // B t; int z; }` that holds it: two bit-fields in one carrier byte,
+            // with an ordinary member beside them.
+            let uint = types.uint_id;
+            let bits = types.intern(Type::struct_type(composite(
+                vec![bitfield(a_name, uint, 0, 4), bitfield(b, uint, 4, 4)],
+                4,
+                4,
+            )));
+            let bits_holder = types.intern(Type::struct_type(composite(
+                vec![member(t_name, bits, 0), member(z, int, 4)],
+                8,
+                4,
+            )));
+
+            // `struct N { union { struct T p; int i; } u; }` -- a union whose
+            // members differ in size, so that an override naming a subobject
+            // of the one it holds has somewhere to fold into.
+            let p_name = name(&mut strings, "p");
+            let n_union = types.intern(Type::union_type(composite(
+                vec![member(p_name, t, 0), member(i, int, 0)],
+                8,
+                4,
+            )));
+            let n = types.intern(Type::struct_type(composite(
+                vec![member(u_name, n_union, 0)],
+                8,
+                4,
+            )));
+
+            Self {
+                target,
+                types,
+                strings,
+                symbols: SymbolTable::new(),
+                t,
+                s,
+                a,
+                w,
+                v,
+                b: bits,
+                c: bits_holder,
+                n,
+                n_union,
+                int_array,
+            }
+        }
+
+        fn linearizer(&self) -> Linearizer<'_> {
+            Linearizer::new(&self.symbols, &self.types, &self.strings, &self.target)
+        }
+    }
+
+    /// One entry of a struct initializer list, as `walk_struct_init_fields`
+    /// hands it over: the subobject it names and the value for it.
+    fn raw(offset: usize, typ: TypeId, size: usize, init: Initializer) -> RawFieldInit {
+        RawFieldInit {
+            offset,
+            field_size: size,
+            typ,
+            init,
+            bit_offset: None,
+            bit_width: None,
+            held: UnionMembers::default(),
+            named: UnionMembers::default(),
+        }
+    }
+
+    /// The same for a bit-field: `offset` is its access span's first byte and
+    /// the value goes at `bit_offset..bit_offset + width` of that span.
+    fn raw_bits(
+        offset: usize,
+        typ: TypeId,
+        bit_offset: u32,
+        width: u32,
+        value: i128,
+    ) -> RawFieldInit {
+        RawFieldInit {
+            bit_offset: Some(bit_offset),
+            bit_width: Some(width),
+            ..raw(offset, typ, 4, Initializer::Int(value))
+        }
+    }
+
+    /// One `(byte offset, union type, member index)` recorded for a union.
+    fn union_member(offset: usize, typ: TypeId, index: usize) -> UnionMembers {
+        let mut members = UnionMembers::default();
+        members.record(offset, typ, index);
+        members
+    }
+
+    fn struct_init(total_size: usize, fields: &[(usize, usize, i128)]) -> Initializer {
+        Initializer::Struct {
+            total_size,
+            fields: fields
+                .iter()
+                .map(|(off, size, value)| (*off, *size, Initializer::Int(*value)))
+                .collect(),
+        }
+    }
+
+    /// `(offset, size, initializer)` for each entry the merge kept, in the
+    /// order it kept them.
+    fn kept(merged: &[RawFieldInit]) -> Vec<(usize, usize, Initializer)> {
+        merged
+            .iter()
+            .map(|f| (f.offset, f.field_size, f.init.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_range_is_a_member_when_struct_members_and_array_elements_reach_it() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+
+        // The whole object, the member `t`, and `t.y` inside it.
+        assert_eq!(
+            lin.classify_subobject(fixture.s, 0, 12, UnionFold::default()),
+            SubobjectPlace::Member
+        );
+        assert_eq!(
+            lin.classify_subobject(fixture.s, 0, 8, UnionFold::default()),
+            SubobjectPlace::Member
+        );
+        assert_eq!(
+            lin.classify_subobject(fixture.s, 4, 4, UnionFold::default()),
+            SubobjectPlace::Member
+        );
+        // `a[1]` of `struct A`.
+        assert_eq!(
+            lin.classify_subobject(fixture.a, 4, 4, UnionFold::default()),
+            SubobjectPlace::Member
+        );
+        // The four bytes straddling `t.y` and `z` are no object at all.
+        assert_eq!(
+            lin.classify_subobject(fixture.s, 6, 4, UnionFold::default()),
+            SubobjectPlace::NotASubobject
+        );
+    }
+
+    #[test]
+    fn a_range_inside_a_union_member_is_reached_through_the_union() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+
+        // `u.s.b` -- one byte, reached only by choosing a union member.
+        assert_eq!(
+            lin.classify_subobject(fixture.w, 1, 1, UnionFold::default()),
+            SubobjectPlace::ThroughUnion { offset: 0, size: 4 }
+        );
+        // The union named exactly is an ordinary member of `struct W`.
+        assert_eq!(
+            lin.classify_subobject(fixture.w, 0, 4, UnionFold::default()),
+            SubobjectPlace::Member
+        );
+    }
+
+    /// When both initializers name the same member of a union, the range is
+    /// an ordinary subobject reached through it and the rest of that member
+    /// stands. When they name different ones, it is not.
+    #[test]
+    fn a_union_is_descended_into_only_where_both_sides_name_the_same_member() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+
+        // `n.u.p.y` of `struct N`, with the union holding `p`.
+        let holds_p = union_member(0, fixture.n_union, 0);
+        let names_p = union_member(0, fixture.n_union, 0);
+        let names_i = union_member(0, fixture.n_union, 1);
+        assert_eq!(
+            lin.classify_subobject(fixture.n, 4, 4, UnionFold::new(&holds_p, &names_p, 0)),
+            SubobjectPlace::Member
+        );
+        assert_eq!(
+            lin.classify_subobject(fixture.n, 4, 4, UnionFold::new(&holds_p, &names_i, 0)),
+            SubobjectPlace::ThroughUnion { offset: 0, size: 8 }
+        );
+        // And with nothing said about it at all.
+        assert_eq!(
+            lin.classify_subobject(fixture.n, 4, 4, UnionFold::default()),
+            SubobjectPlace::ThroughUnion { offset: 0, size: 8 }
+        );
+    }
+
+    /// `struct S s = { .t = {1, 2}, .t.y = 9, .z = 7 };` -- the override
+    /// names `t.y`, so `t.x` keeps the 1 it was given.
+    #[test]
+    fn a_contained_override_replaces_only_the_subobject_it_names() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, fixture.t, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)])),
+            raw(4, int, 4, Initializer::Int(9)),
+            raw(8, int, 4, Initializer::Int(7)),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![
+                (0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 9)])),
+                (8, 4, Initializer::Int(7)),
+            ]
+        );
+    }
+
+    /// The same one level further down: `{ .a = {1,2,3}, .a[1] = 9 }` keeps
+    /// elements 0 and 2.
+    #[test]
+    fn a_contained_override_replaces_only_the_array_element_it_names() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let array = Initializer::Array {
+            elem_size: 4,
+            total_size: 12,
+            elements: vec![
+                (0, Initializer::Int(1)),
+                (4, Initializer::Int(2)),
+                (8, Initializer::Int(3)),
+            ],
+        };
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, fixture.int_array, 12, array),
+            raw(4, int, 4, Initializer::Int(9)),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![(
+                0,
+                12,
+                Initializer::Array {
+                    elem_size: 4,
+                    total_size: 12,
+                    elements: vec![
+                        (0, Initializer::Int(1)),
+                        (4, Initializer::Int(9)),
+                        (8, Initializer::Int(3)),
+                    ],
+                }
+            )]
+        );
+    }
+
+    /// An initializer for a whole subobject replaces every earlier one for a
+    /// part of it.
+    #[test]
+    fn a_containing_override_replaces_the_earlier_entry_whole() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(4, int, 4, Initializer::Int(9)),
+            raw(0, fixture.t, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)])),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![(0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)]))]
+        );
+    }
+
+    /// Initializers for different members stand side by side.
+    #[test]
+    fn disjoint_entries_are_all_kept() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, int, 4, Initializer::Int(1)),
+            raw(4, int, 4, Initializer::Int(2)),
+            raw(8, int, 4, Initializer::Int(7)),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![
+                (0, 4, Initializer::Int(1)),
+                (4, 4, Initializer::Int(2)),
+                (8, 4, Initializer::Int(7)),
+            ]
+        );
+    }
+
+    /// `{ .u.i = 0x01020304, .u.s.b = 9 }` -- a union holds one member at a
+    /// time, so naming a second discards what the first wrote rather than
+    /// overlaying it.
+    #[test]
+    fn initializing_a_second_union_member_discards_the_first() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let (int, ch) = (fixture.types.int_id, fixture.types.char_id);
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, int, 4, Initializer::Int(0x01020304)),
+            raw(1, ch, 1, Initializer::Int(9)),
+        ]);
+
+        assert_eq!(kept(&merged), vec![(1, 1, Initializer::Int(9))]);
+    }
+
+    /// An initializer for a whole struct, then one byte of a different member
+    /// of a union inside it: only that union is reset, and the struct's other
+    /// members keep what they were given.
+    ///
+    /// `struct V v = { .k = 5, .u.i = 0x01020304 }` followed by `.u.s.b = 9`.
+    #[test]
+    fn an_override_through_a_nested_union_resets_only_that_union() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let ch = fixture.types.char_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(
+                0,
+                fixture.v,
+                8,
+                struct_init(8, &[(0, 4, 5), (4, 4, 0x01020304)]),
+            ),
+            raw(5, ch, 1, Initializer::Int(9)),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![(
+                0,
+                8,
+                Initializer::Struct {
+                    total_size: 8,
+                    fields: vec![
+                        (0, 4, Initializer::Int(5)),
+                        (4, 4, struct_init(4, &[(1, 1, 9)])),
+                    ],
+                }
+            )]
+        );
+    }
+
+    /// A struct whose only member is a union is the union, byte for byte, so
+    /// resetting the union replaces the whole entry.
+    #[test]
+    fn an_override_through_a_union_filling_its_struct_replaces_the_entry() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let ch = fixture.types.char_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, fixture.w, 4, struct_init(4, &[(0, 4, 0x01020304)])),
+            raw(1, ch, 1, Initializer::Int(9)),
+        ]);
+
+        assert_eq!(kept(&merged), vec![(0, 4, struct_init(4, &[(1, 1, 9)]))]);
+    }
+
+    /// "Later wins" is later in the list, not at a higher address:
+    /// `{ .z = 7, .t.y = 9, .t = {1, 2} }` ends with `t` holding `{1, 2}`.
+    #[test]
+    fn the_override_rule_is_applied_in_source_order() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(8, int, 4, Initializer::Int(7)),
+            raw(4, int, 4, Initializer::Int(9)),
+            raw(0, fixture.t, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)])),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![
+                (8, 4, Initializer::Int(7)),
+                (0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)])),
+            ]
+        );
+
+        // And the other order, where the narrower one is written last.
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, fixture.t, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)])),
+            raw(8, int, 4, Initializer::Int(7)),
+            raw(4, int, 4, Initializer::Int(9)),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![
+                (0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 9)])),
+                (8, 4, Initializer::Int(7)),
+            ]
+        );
+    }
+
+    /// A member the earlier initializer left out gains an entry of its own
+    /// rather than costing the whole earlier initializer: `{ .t = {1}, .t.y
+    /// = 9 }` keeps `t.x`.
+    #[test]
+    fn an_override_of_an_uninitialized_member_is_added_to_the_earlier_entry() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, fixture.t, 8, struct_init(8, &[(0, 4, 1)])),
+            raw(4, int, 4, Initializer::Int(9)),
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![(0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 9)]))]
+        );
+    }
+
+    /// A bit-field's bytes are its carrier's, not its own, so the answer for
+    /// them is the struct that declares it -- and they are no subobject at
+    /// all when asked for as an object.
+    #[test]
+    fn a_bitfields_bytes_name_the_struct_that_declares_it() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+
+        // `t.a` of `struct C`: byte 0, inside `t` at 0..4.
+        assert_eq!(
+            lin.classify_bitfield_carrier(fixture.c, 0, 1, UnionFold::default()),
+            SubobjectPlace::BitfieldCarrier { offset: 0, size: 4 }
+        );
+        // Asked for `struct B` itself, the carrier byte is the whole of the
+        // declaring struct and still must not be replaced whole.
+        assert_eq!(
+            lin.classify_bitfield_carrier(fixture.b, 0, 1, UnionFold::default()),
+            SubobjectPlace::BitfieldCarrier { offset: 0, size: 4 }
+        );
+        assert_eq!(
+            lin.classify_subobject(fixture.c, 0, 1, UnionFold::default()),
+            SubobjectPlace::NotASubobject
+        );
+        // Padding inside a struct with bit-fields is still nothing at all.
+        assert_eq!(
+            lin.classify_bitfield_carrier(fixture.c, 1, 1, UnionFold::default()),
+            SubobjectPlace::NotASubobject
+        );
+    }
+
+    /// `struct C c = { .t = {1, 2}, .t.a = 3 };` -- the override names one
+    /// bit-field, so the one sharing its carrier keeps its value.
+    #[test]
+    fn a_designated_override_of_a_bitfield_replaces_only_its_bits() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let uint = fixture.types.uint_id;
+
+        // `{1, 2}` has already been lowered to the carrier byte it produces.
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, fixture.b, 4, struct_init(4, &[(0, 1, 0x21)])),
+            raw_bits(0, uint, 0, 4, 3),
+        ]);
+        assert_eq!(kept(&merged), vec![(0, 4, struct_init(4, &[(0, 1, 0x23)]))]);
+
+        // And the other bit-field of the pair.
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(0, fixture.b, 4, struct_init(4, &[(0, 1, 0x21)])),
+            raw_bits(0, uint, 4, 4, 5),
+        ]);
+        assert_eq!(kept(&merged), vec![(0, 4, struct_init(4, &[(0, 1, 0x51)]))]);
+    }
+
+    /// A bit-field never supersedes an initializer for an object containing
+    /// it, but a whole-struct initializer written after one does.
+    #[test]
+    fn a_whole_struct_initializer_supersedes_an_earlier_bitfield() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let uint = fixture.types.uint_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw_bits(0, uint, 4, 4, 5),
+            raw(0, fixture.b, 4, struct_init(4, &[(0, 1, 0x21)])),
+        ]);
+        assert_eq!(kept(&merged), vec![(0, 4, struct_init(4, &[(0, 1, 0x21)]))]);
+    }
+
+    /// `struct N n = { .u = {1, 2}, .u.p.y = 9 };` -- the union still holds
+    /// `p`, and the override names a member *of* `p`, so `p.x` keeps its 1.
+    #[test]
+    fn an_override_inside_the_held_union_member_folds_into_it() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let held = union_member(0, fixture.n_union, 0);
+        let named = union_member(0, fixture.n_union, 0);
+        let merged = lin.merge_raw_field_inits(vec![
+            RawFieldInit {
+                held,
+                ..raw(
+                    0,
+                    fixture.n_union,
+                    8,
+                    Initializer::Struct {
+                        total_size: 8,
+                        fields: vec![(0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)]))],
+                    },
+                )
+            },
+            RawFieldInit {
+                named,
+                ..raw(4, int, 4, Initializer::Int(9))
+            },
+        ]);
+
+        assert_eq!(
+            kept(&merged),
+            vec![(
+                0,
+                8,
+                Initializer::Struct {
+                    total_size: 8,
+                    fields: vec![(0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 9)]))],
+                }
+            )]
+        );
+    }
+
+    /// The companion case that makes the rule a rule: naming a *different*
+    /// member discards what the union held, however the two spans overlap.
+    #[test]
+    fn an_override_naming_a_different_union_member_still_resets_it() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            RawFieldInit {
+                held: union_member(0, fixture.n_union, 0),
+                ..raw(
+                    0,
+                    fixture.n_union,
+                    8,
+                    Initializer::Struct {
+                        total_size: 8,
+                        fields: vec![(0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)]))],
+                    },
+                )
+            },
+            RawFieldInit {
+                // `.u.i`, the union's other member.
+                named: union_member(0, fixture.n_union, 1),
+                ..raw(0, int, 4, Initializer::Int(7))
+            },
+        ]);
+
+        assert_eq!(kept(&merged), vec![(0, 8, struct_init(8, &[(0, 4, 7)]))]);
+    }
+
+    /// With nothing said about the union, the merge cannot tell "the same
+    /// member, deeper" from "a different member" and takes the reset, which
+    /// is the answer that discards rather than invents.
+    #[test]
+    fn an_override_through_a_union_nothing_names_resets_it() {
+        let fixture = OverrideTypes::new();
+        let lin = fixture.linearizer();
+        let int = fixture.types.int_id;
+
+        let merged = lin.merge_raw_field_inits(vec![
+            raw(
+                0,
+                fixture.n_union,
+                8,
+                Initializer::Struct {
+                    total_size: 8,
+                    fields: vec![(0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)]))],
+                },
+            ),
+            raw(4, int, 4, Initializer::Int(9)),
+        ]);
+
+        assert_eq!(kept(&merged), vec![(0, 8, struct_init(8, &[(4, 4, 9)]))]);
     }
 }

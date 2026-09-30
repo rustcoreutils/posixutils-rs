@@ -558,9 +558,16 @@ impl Range {
 
     /// Unsigned division. A divisor range containing zero answers `Full`:
     /// c17 does not assume undefined behaviour away, and
-    /// `constfold::eval_divmod` already refuses a zero divisor rather than
-    /// inventing a result. Disagreeing here would make `-O2` and `-O0`
-    /// differ on a program that really does divide by zero.
+    /// `constfold::divmod_may_trap` -- the one statement of which operand
+    /// pairs trap -- refuses a zero divisor rather than inventing a result.
+    /// Disagreeing here would make `-O2` and `-O0` differ on a program that
+    /// really does divide by zero.
+    ///
+    /// `contains(0)` is that predicate asked of a set rather than a value:
+    /// "may any divisor in this range trap?". For the unsigned forms that is
+    /// the whole of it, because the other trapping pair, `INT_MIN / -1`, is a
+    /// signed overflow with no unsigned counterpart -- and `vrp` gives the
+    /// signed opcodes `Range::full` rather than asking here at all.
     pub(crate) fn udiv(&self, other: &Range) -> Range {
         if let Some(r) = self.binary_guard(other) {
             return r;
@@ -576,6 +583,9 @@ impl Range {
         Range::inclusive(self.width, amin / bmax, amax / bmin)
     }
 
+    /// Unsigned remainder, refusing a divisor range containing zero for the
+    /// reason [`Range::udiv`] gives: the remainder form is the same trapping
+    /// instruction.
     pub(crate) fn umod(&self, other: &Range) -> Range {
         if let Some(r) = self.binary_guard(other) {
             return r;

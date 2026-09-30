@@ -7347,3 +7347,139 @@ fn diagnostics_escape_out_of_range_names_the_literals_line() {
         );
     }
 }
+
+/// A member of a `const` object is itself `const`, so writing it is a
+/// constraint violation.
+///
+/// C17 6.5.2.3p3/p4 gives `s.m` the *so-qualified* version of the member's
+/// type, and 6.5.16p2 requires a modifiable lvalue on the left of an
+/// assignment. c17 took the member's declared type unqualified, so
+/// `check_const_assignment` saw an ordinary `int` and every one of these was
+/// accepted silently. gcc and clang reject them.
+#[test]
+fn diagnostics_writing_a_member_of_a_const_object_is_rejected() {
+    compile_expect_error(
+        "const_aggregate_member",
+        "struct S { int a; };\nconst struct S cs = {1};\nvoid f(void){ cs.a = 2; }\n",
+        "read-only",
+    );
+    compile_expect_error(
+        "const_aggregate_member_arrow",
+        "struct S { int a; };\nvoid f(const struct S *p){ p->a = 2; }\n",
+        "read-only",
+    );
+    compile_expect_error(
+        "const_aggregate_member_nested",
+        "struct T { int x; };\nstruct S { struct T t; };\n\
+         const struct S cs;\nvoid f(void){ cs.t.x = 2; }\n",
+        "read-only",
+    );
+    compile_expect_error(
+        "const_aggregate_member_increment",
+        "struct S { int a; };\nconst struct S cs;\nvoid f(void){ cs.a++; }\n",
+        "read-only",
+    );
+    compile_expect_error(
+        "const_aggregate_element",
+        "struct S { int a; };\nconst struct S cs[2];\nvoid f(void){ cs[1].a = 2; }\n",
+        "read-only",
+    );
+}
+
+/// The other direction: the same shapes without the `const` must still compile,
+/// so the checks above cannot pass by rejecting every member assignment.
+#[test]
+fn diagnostics_writing_a_member_of_a_plain_object_is_accepted() {
+    compile_expect_ok(
+        "plain_aggregate_member",
+        "struct S { int a; };\nstruct S s;\nvoid f(void){ s.a = 2; }\n\
+         void g(struct S *p){ p->a = 2; }\n\
+         struct T { struct S in; };\nstruct T t;\nvoid h(void){ t.in.a = 2; }\n\
+         struct S arr[2];\nvoid i(void){ arr[1].a = 2; }\n\
+         void j(void){ s.a++; }\n",
+    );
+    // A `const` *pointer* to a non-const object leaves the pointee writable:
+    // the qualifier is on the pointer, not on what it points at.
+    compile_expect_ok(
+        "const_pointer_not_pointee",
+        "struct S { int a; };\nvoid f(struct S *const p){ p->a = 2; }\n",
+    );
+}
+
+/// An *array* member of a `const` object is an array of `const`, so writing an
+/// element of it is a constraint violation too.
+///
+/// C17 6.7.3p10: where an array type is qualified, the element type is
+/// so-qualified and the array is not -- which is what a subscript reads. So the
+/// so-qualified version of `int [4]` is an array of `const int`, and
+/// `cs.arr[0] = 1` is a write to a `const int`. Qualifying the array itself
+/// instead would leave the element an ordinary `int` and accept the write.
+#[test]
+fn diagnostics_writing_an_array_member_of_a_const_object_is_rejected() {
+    compile_expect_error(
+        "const_aggregate_array_member",
+        "struct S { int arr[4]; };\nconst struct S cs;\nvoid f(void){ cs.arr[0] = 2; }\n",
+        "read-only",
+    );
+    compile_expect_error(
+        "const_aggregate_array_member_2d",
+        "struct S { int grid[2][2]; };\nvoid f(const struct S *p){ p->grid[1][1] = 2; }\n",
+        "read-only",
+    );
+    // The control: the same writes through an unqualified object.
+    compile_expect_ok(
+        "plain_aggregate_array_member",
+        "struct S { int arr[4]; int grid[2][2]; };\nstruct S s;\n\
+         void f(void){ s.arr[0] = 2; s.grid[1][1] = 3; }\n\
+         void g(struct S *p){ p->arr[0] = 2; }\n",
+    );
+}
+
+/// A `case` label whose conversion to the controlling type changes its value
+/// is diagnosed, and two labels that become equal are a constraint violation.
+///
+/// C17 6.8.4.2p5 converts each label to the promoted type of the controlling
+/// expression, and p3 forbids two labels in one switch having the same value
+/// *after* that conversion. c17 kept labels at full width, so it diagnosed
+/// neither: `case 4294967296LL` in an `int` switch silently became `case 0`,
+/// and sitting beside a real `case 0` it was silently accepted.
+///
+/// gcc and clang both warn on the value-changing conversion and reject the
+/// collision.
+#[test]
+fn diagnostics_a_case_label_outside_the_controlling_type_is_diagnosed() {
+    compile_expect_warning(
+        "case_label_overflow",
+        "int f(int x){ switch(x){ case 4294967296LL: return 1; default: return 2; } }\n",
+        "case",
+    );
+    compile_expect_error(
+        "case_label_duplicate_after_conversion",
+        "int f(int x){ switch(x){ case 0: return 1; case 4294967296LL: return 2; } return 0; }\n",
+        "duplicate",
+    );
+}
+
+/// The other direction: a conversion that preserves the value is silent, so
+/// the check above cannot pass by warning about every label.
+///
+/// `case -1` in a `switch` on `unsigned` converts to 4294967295 and genuinely
+/// matches it -- the conversion is value-changing in representation but well
+/// defined and intended, which is why gcc and clang say nothing here either.
+#[test]
+fn diagnostics_a_case_label_inside_the_controlling_type_is_silent() {
+    compile_expect_no_diagnostic(
+        "case_label_in_range",
+        "int f(int x){ switch(x){ case -1: return 1; case 7: return 3; default: return 2; } }\n",
+        "case",
+    );
+    compile_expect_no_diagnostic(
+        "case_label_negative_in_unsigned",
+        "int f(unsigned x){ switch(x){ case -1: return 1; default: return 2; } }\n",
+        "case",
+    );
+    compile_expect_ok(
+        "case_labels_distinct_after_conversion",
+        "int f(int x){ switch(x){ case 0: return 1; case 1: return 2; default: return 3; } }\n",
+    );
+}

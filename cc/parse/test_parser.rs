@@ -5475,6 +5475,111 @@ fn first_statement_of(tu: &TranslationUnit, n: usize) -> &Stmt {
     stmt
 }
 
+/// C17 6.5.2.3p3/p4: `s.m` and `p->m` have the *so-qualified* version of the
+/// member's type -- the member's type plus the qualifiers of the object.
+///
+/// The parser is where that type is formed, and it took the member's declared
+/// type unchanged: a member of a `volatile` object read as an ordinary `int`
+/// (so DCE deleted the load) and a member of a `const` object was assignable.
+#[test]
+fn test_a_member_access_is_qualified_by_the_object() {
+    let quals = |src: &str, decls: &str| -> TypeModifiers {
+        let code = format!("struct S {{ int a; }};\nstruct N {{ struct S in; }};\n{decls}\nvoid t(void) {{ {src}; }}");
+        let (tu, types, _, _) = parse_tu(&code).unwrap();
+        let Stmt::Expr(expr) = first_statement(&tu) else {
+            panic!("{src}: expected an expression statement");
+        };
+        types.qualifiers(expr.typ.expect("a typed expression"))
+    };
+    const NONE: TypeModifiers = TypeModifiers::empty();
+
+    // The object's qualifiers, in each spelling that reaches a member.
+    assert_eq!(
+        quals("vs.a", "volatile struct S vs;"),
+        TypeModifiers::VOLATILE
+    );
+    assert_eq!(quals("cs.a", "const struct S cs;"), TypeModifiers::CONST);
+    assert_eq!(
+        quals("cvs.a", "const volatile struct S cvs;"),
+        TypeModifiers::CONST | TypeModifiers::VOLATILE
+    );
+    assert_eq!(
+        quals("vsa[1].a", "volatile struct S vsa[2];"),
+        TypeModifiers::VOLATILE
+    );
+    assert_eq!(
+        quals("vn.in.a", "volatile struct N vn;"),
+        TypeModifiers::VOLATILE,
+        "the intermediate member is qualified too, and carries it downward"
+    );
+    assert_eq!(
+        quals("vt.a", "typedef volatile struct S VS; VS vt;"),
+        TypeModifiers::VOLATILE
+    );
+
+    // `->` takes them from the *pointee*, which is the object it names.
+    assert_eq!(
+        quals("vp->a", "volatile struct S *vp;"),
+        TypeModifiers::VOLATILE
+    );
+    assert_eq!(
+        quals("qp->a", "struct S *volatile qp;"),
+        NONE,
+        "`struct S *volatile` qualifies the pointer, not what it points at"
+    );
+
+    // `_Atomic` does not travel: there is no atomic access to one member of an
+    // atomic object, and gcc does not pretend otherwise.
+    assert_eq!(quals("as.a", "_Atomic struct S as;"), NONE);
+
+    // An unqualified object leaves the member's declared type alone -- and a
+    // qualifier on the *member* still reaches the access, which is the
+    // direction that always worked.
+    assert_eq!(quals("s.a", "struct S s;"), NONE);
+    assert_eq!(
+        quals("vm.v", "struct M { volatile int v; }; struct M vm;"),
+        TypeModifiers::VOLATILE
+    );
+}
+
+/// C17 6.3.2.1p2: converting an lvalue to a value drops the qualifiers, so an
+/// arithmetic result is never qualified.
+///
+/// `common_type` and `integer_promote` answer with one of the operands' own
+/// type ids, so `volatile int + int` came out `volatile int` -- a qualifier on
+/// the type of a value, which nothing may read as "this expression touched a
+/// volatile object".
+#[test]
+fn test_an_arithmetic_result_is_unqualified() {
+    let quals = |src: &str| -> TypeModifiers {
+        let code = format!(
+            "struct S {{ int a; long l; }};\nvolatile struct S vs;\nvolatile int vi;\n\
+             void t(void) {{ {src}; }}"
+        );
+        let (tu, types, _, _) = parse_tu(&code).unwrap();
+        let Stmt::Expr(expr) = first_statement(&tu) else {
+            panic!("{src}: expected an expression statement");
+        };
+        types.qualifiers(expr.typ.expect("a typed expression"))
+    };
+    const NONE: TypeModifiers = TypeModifiers::empty();
+
+    // The usual arithmetic conversions, a shift (whose result is the promoted
+    // *left* operand's type), and a unary operator.
+    assert_eq!(quals("vs.a + 1"), NONE);
+    assert_eq!(quals("1 + vs.a"), NONE);
+    assert_eq!(quals("vs.l * vs.a"), NONE);
+    assert_eq!(quals("vi | 1"), NONE);
+    assert_eq!(quals("vs.a << 1"), NONE);
+    assert_eq!(quals("-vs.a"), NONE);
+    assert_eq!(quals("~vi"), NONE);
+    assert_eq!(quals("1 ? vs.a : 0"), NONE);
+
+    // The lvalue itself keeps them: that is the whole point of the rule above,
+    // and the assignment check and the volatile marker both read it.
+    assert_eq!(quals("vs.a"), TypeModifiers::VOLATILE);
+}
+
 // Library builtins: abs, fabs, creal, conj, ... as checked calls
 
 /// The in-place call `expr` is, as (function, arguments), or a panic naming

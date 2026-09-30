@@ -13,11 +13,11 @@
 use crate::abi::{get_abi, Abi, ArgClass, RegClass};
 use crate::arch::codegen::is_variadic_function;
 use crate::arch::lir::{
-    complex_fp_info, complex_sse_regs, plan_pair_move, Directive, FpSize, OperandSize, PairMove,
-    Symbol,
+    complex_fp_info, complex_sse_regs, eightbyte_bytes, plan_pair_move, Directive, FpSize,
+    OperandSize, PairMove, Symbol,
 };
 use crate::arch::x86_64::codegen::X86_64CodeGen;
-use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
+use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{spend_arg_regs, FrameBase, Loc, Reg, RegAlloc, XmmReg};
 use crate::ir::{Function, Instruction, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeKind, TypeTable};
@@ -79,30 +79,104 @@ impl X86_64CodeGen {
             return;
         };
 
+        // The last eightbyte of a composite whose size is not a multiple of
+        // eight holds fewer bytes than the register carrying it.
+        let total = i64::from(type_size_bits / 8);
         let mut next_int = pair_start_int;
         let mut next_fp = pair_start_fp;
         for (i, class) in classes.iter().enumerate() {
-            let delta = (i * 8) as i32;
+            let at = (i * 8) as i64;
+            let bytes = eightbyte_bytes(total, at);
+            if bytes == 0 {
+                continue;
+            }
             if *class == crate::abi::RegClass::Sse {
                 let src = fp_arg_regs[next_fp];
                 next_fp += 1;
-                self.push_lir(X86Inst::MovFp {
-                    size: FpSize::Double,
-                    src: XmmOperand::Reg(src),
-                    dst: XmmOperand::Mem(self.stack_mem(offset - delta)),
-                });
+                self.store_sse_bytes_to_local(src, offset, at, bytes);
             } else {
                 let src = int_arg_regs[next_int];
                 next_int += 1;
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(src),
-                    dst: GpOperand::Mem(self.stack_mem(offset - delta)),
-                });
+                self.store_reg_bytes_to_local(src, offset, at, bytes);
             }
         }
     }
 
+    /// Store the low `bytes` bytes of `src` into the local at `local`,
+    /// starting at the object's byte `at`, writing nothing past them.
+    ///
+    /// An eightbyte of a composite parameter arrives in a whole register, but
+    /// the last eightbyte of one that is not a multiple of eight holds fewer
+    /// bytes than the register does: `struct { int a, b, c; }` is twelve, and
+    /// storing the second register's eight wrote four bytes past a local that
+    /// `grow_frame` rounds up only to the type's own alignment -- four here.
+    ///
+    /// The pieces are `block_chunks`'s, so the rule is stated once, and the
+    /// value is shifted down as each leaves. The shifting is done in R10 --
+    /// this file's scratch -- so the incoming argument register survives; a
+    /// natural width needs no shift and stores straight out of it.
+    fn store_reg_bytes_to_local(&mut self, src: Reg, local: i32, at: i64, bytes: i64) {
+        let mut shifted = 0;
+        for (off, chunk) in crate::ir::memexpand::block_chunks(bytes) {
+            if off != 0 {
+                if shifted == 0 && src != Reg::R10 {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(src),
+                        dst: GpOperand::Reg(Reg::R10),
+                    });
+                }
+                self.push_lir(X86Inst::Shr {
+                    size: OperandSize::B64,
+                    count: ShiftCount::Imm(((off - shifted) * 8) as u8),
+                    dst: Reg::R10,
+                });
+                shifted = off;
+            }
+            let from = if off == 0 { src } else { Reg::R10 };
+            let addr = self.stack_field(local, (at + off) as i32);
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::from_bits(chunk.bits()),
+                src: GpOperand::Reg(from),
+                dst: GpOperand::Mem(addr),
+            });
+        }
+    }
+
+    /// Store the low `bytes` bytes of the SSE register `src` into the local at
+    /// `local`, starting at the object's byte `at`.
+    ///
+    /// 2, 4, 8 and 16 bytes are one floating-point store. Any other width is
+    /// moved into a general register and stored from there, because there is
+    /// no SSE store of it: the second eightbyte of
+    /// `struct { float a, b, c; _Float16 d; }` is six bytes, and all of SSE
+    /// class.
+    fn store_sse_bytes_to_local(&mut self, src: XmmReg, local: i32, at: i64, bytes: i64) {
+        if let Some(size) = FpSize::exact_sse_store(bytes) {
+            let addr = self.stack_field(local, at as i32);
+            self.push_lir(X86Inst::MovFp {
+                size,
+                src: XmmOperand::Reg(src),
+                dst: XmmOperand::Mem(addr),
+            });
+            return;
+        }
+        self.push_lir(X86Inst::MovXmmGp {
+            size: OperandSize::B64,
+            src,
+            dst: Reg::R10,
+        });
+        self.store_reg_bytes_to_local(Reg::R10, local, at, bytes);
+    }
+
+    /// Copy a spilled parameter of `bytes` bytes out of the incoming argument
+    /// area into the local the body reads.
+    ///
+    /// Both sides move `block_chunks`'s widths. Stepping eight regardless --
+    /// which this did -- wrote four bytes past a twelve-byte local, whose slot
+    /// is rounded up only to the type's own alignment; the incoming area is
+    /// eightbyte-granular so the *read* was safe, but the read is what the
+    /// store's width came from.
     fn copy_incoming_arg_to_local(
         &mut self,
         func: &crate::ir::Function,
@@ -120,24 +194,25 @@ impl X86_64CodeGen {
             return;
         };
         let dst_offset = *dst_offset;
-        let mut copied = 0;
-        while copied < bytes {
+        for (at, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
+            let size = OperandSize::from_bits(chunk.bits());
+            let at = at as i32;
             self.push_lir(X86Inst::Mov {
-                size: OperandSize::B64,
+                size,
                 src: GpOperand::Mem(MemAddr::BaseOffset {
                     base: Reg::Rbp,
-                    offset: src_offset + copied,
+                    offset: src_offset + at,
                 }),
                 dst: GpOperand::Reg(Reg::R10),
             });
             // Locals grow downward from `dst_offset`, so later bytes sit at a
-            // smaller offset — the same convention `stack_mem` encodes.
+            // smaller offset — the same convention `stack_field` encodes.
+            let addr = self.stack_field(dst_offset, at);
             self.push_lir(X86Inst::Mov {
-                size: OperandSize::B64,
+                size,
                 src: GpOperand::Reg(Reg::R10),
-                dst: GpOperand::Mem(self.stack_mem(dst_offset - copied)),
+                dst: GpOperand::Mem(addr),
             });
-            copied += 8;
         }
     }
 
@@ -166,16 +241,7 @@ impl X86_64CodeGen {
         self.int128_pseudos = alloc.int128_pseudos().clone();
         self.pseudos = crate::arch::codegen::PseudoTable::new(&func.pseudos);
 
-        // Build sym type size map for emit_store to distinguish struct fields from scalars
-        self.sym_type_sizes.clear();
-        for pseudo in &func.pseudos {
-            // By identity: a global whose name collides with a parameter's
-            // would otherwise be recorded with the parameter's type size.
-            if let Some(local_var) = func.local_of(pseudo.id) {
-                self.sym_type_sizes
-                    .insert(pseudo.id, types.size_bits(local_var.typ));
-            }
-        }
+        self.sym_slots = crate::arch::codegen::sym_slots(func, types);
 
         let stack_size = alloc.stack_size();
         self.callee_saved_regs = alloc.callee_saved_used().to_vec();
@@ -793,50 +859,65 @@ impl X86_64CodeGen {
                         if let Some(local) = func.locals.get(param_name) {
                             if let Some(Loc::Stack(offset)) = self.locations.get_ref(local.sym) {
                                 let offset = *offset;
-                                let (fp_size, imag_offset) = if let Some(n) = sse_struct {
-                                    // Two doubles are eight bytes each;
-                                    // a lone binary128 is one register
-                                    // holding all sixteen.
-                                    if n == 1 {
-                                        (FpSize::for_sse_aggregate(type_size_bits), 0)
-                                    } else {
-                                        (FpSize::Double, 8)
+                                let total = i64::from(type_size_bits / 8);
+                                if sse_struct.is_some() {
+                                    // An all-SSE aggregate: each register
+                                    // holds the eightbyte it was classified
+                                    // for, and the last one holds only what
+                                    // is left of the object. `sse_regs` is
+                                    // one for a lone binary128 -- SSE+SSEUP,
+                                    // sixteen bytes in one register -- and
+                                    // two for a pair of eightbytes, whose
+                                    // second is four bytes of a twelve-byte
+                                    // struct and not eight. Giving both the
+                                    // same width wrote four bytes past it.
+                                    for reg in 0..sse_regs {
+                                        let at = (reg * 8) as i64;
+                                        let bytes = if sse_regs == 1 {
+                                            total.min(16)
+                                        } else {
+                                            eightbyte_bytes(total, at)
+                                        };
+                                        if bytes == 0 {
+                                            continue;
+                                        }
+                                        self.store_sse_bytes_to_local(
+                                            fp_arg_regs[fp_arg_idx + reg],
+                                            offset,
+                                            at,
+                                            bytes,
+                                        );
                                     }
                                 } else {
-                                    complex_fp_info(types, &self.base.target, *typ)
-                                };
-                                if sse_regs == 1 {
-                                    // One register holding the whole
-                                    // value. For `float _Complex` that
-                                    // is one eightbyte with both
-                                    // halves in it, so a 64-bit store
-                                    // writes all of it; for an
-                                    // aggregate it is whatever the
-                                    // class's size says, which is
-                                    // sixteen bytes for a binary128.
-                                    let whole = if sse_struct.is_some() {
-                                        fp_size
+                                    // A complex value: two elements of the
+                                    // same width at the base type's stride.
+                                    // `float _Complex` is one eightbyte with
+                                    // both halves in it, so a 64-bit store
+                                    // writes all of it.
+                                    let (fp_size, imag_offset) =
+                                        complex_fp_info(types, &self.base.target, *typ);
+                                    if sse_regs == 1 {
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: FpSize::Double,
+                                            src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
+                                            dst: XmmOperand::Mem(self.stack_mem(offset)),
+                                        });
                                     } else {
-                                        FpSize::Double
-                                    };
-                                    self.push_lir(X86Inst::MovFp {
-                                        size: whole,
-                                        src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
-                                        dst: XmmOperand::Mem(self.stack_mem(offset)),
-                                    });
-                                } else {
-                                    // Store real part from first XMM register
-                                    self.push_lir(X86Inst::MovFp {
-                                        size: fp_size,
-                                        src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
-                                        dst: XmmOperand::Mem(self.stack_mem(offset)),
-                                    });
-                                    // Store imag part from second XMM register
-                                    self.push_lir(X86Inst::MovFp {
-                                        size: fp_size,
-                                        src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
-                                        dst: XmmOperand::Mem(self.stack_mem(offset - imag_offset)),
-                                    });
+                                        // Store real part from first XMM register
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: fp_size,
+                                            src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
+                                            dst: XmmOperand::Mem(self.stack_mem(offset)),
+                                        });
+                                        // Store imag part from second XMM register
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: fp_size,
+                                            src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
+                                            dst: XmmOperand::Mem(
+                                                self.stack_mem(offset - imag_offset),
+                                            ),
+                                        });
+                                    }
                                 }
                             }
                         }

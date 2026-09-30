@@ -77,8 +77,8 @@ pub struct X86_64CodeGen {
     /// binary128 constants to emit (pool key -> the 16-byte image).
     /// BTreeMap for reproducible order, as `ld_constants`.
     pub(super) quad_constants: std::collections::BTreeMap<u128, [u8; 16]>,
-    /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
-    pub(super) sym_type_sizes: HashMap<PseudoId, u32>,
+    /// Sym pseudo ID → what its stack slot holds, for [`SymSlot`].
+    pub(super) sym_slots: HashMap<PseudoId, crate::arch::codegen::SymSlot>,
     /// How this function's locals are addressed.
     pub(super) frame_base: FrameBase,
     /// Maximum local alignment (for andq in prologue)
@@ -110,7 +110,7 @@ impl X86_64CodeGen {
             ld_constants: std::collections::BTreeMap::new(),
             double_constants: std::collections::BTreeMap::new(),
             quad_constants: std::collections::BTreeMap::new(),
-            sym_type_sizes: HashMap::new(),
+            sym_slots: HashMap::new(),
             frame_base: FrameBase::Rbp,
             max_local_align: 16,
             int128_pseudos: HashSet::new(),

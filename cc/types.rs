@@ -462,6 +462,34 @@ impl Type {
     /// compatible with `int`. Invisible to `sizeof`, fatal to any comparison.
     pub const DECL_SPECIFIERS: TypeModifiers = Self::STORAGE_CLASS.union(TypeModifiers::NORETURN);
 
+    /// The type qualifiers of C17 6.7.3p1.
+    ///
+    /// These are the bits a *type* carries at its top level, as opposed to the
+    /// declaration specifiers above: `const int` and `int` are two types, while
+    /// `static int` and `int` are one. Four copies of this list had been
+    /// spelled out inline -- in `compatible_ignoring_base`, in `compatible`, in
+    /// `assign_fault`'s pointer rule and in the parser's
+    /// `lvalue_converted_type` -- which is three chances for the set to drift.
+    pub const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
+        .union(TypeModifiers::VOLATILE)
+        .union(TypeModifiers::RESTRICT)
+        .union(TypeModifiers::ATOMIC);
+
+    /// The qualifiers a member inherits from the object that holds it.
+    ///
+    /// C17 6.5.2.3p3/p4 gives `s.m` the "so-qualified version" of the member's
+    /// type, which is the member's type plus the qualifiers of `s`. Not all
+    /// four travel:
+    ///
+    /// * `_Atomic` does not. A member of an `_Atomic` struct is not itself
+    ///   atomic -- there is no lock-free way to read one out of an atomic
+    ///   object -- and gcc does not make it so. Reaching into one at all is
+    ///   what `Parser::warn_atomic_member_access` already reports.
+    /// * `restrict` cannot: 6.7.3p2 admits it only on a pointer to an object
+    ///   type, so a composite never carries it in the first place.
+    pub const MEMBER_QUALIFIERS: TypeModifiers =
+        TypeModifiers::CONST.union(TypeModifiers::VOLATILE);
+
     /// The storage-class specifiers of C17 6.7.1, and `inline`.
     ///
     /// What a declaration records as its storage class, and what a declarator
@@ -488,12 +516,6 @@ impl Type {
     /// With TypeId interning, base types are compared by TypeId equality.
     /// For full recursive comparison, use TypeTable::types_compatible().
     fn compatible_ignoring_base(&self, other: &Type) -> bool {
-        // Top-level qualifiers to ignore
-        const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
-            .union(TypeModifiers::VOLATILE)
-            .union(TypeModifiers::RESTRICT)
-            .union(TypeModifiers::ATOMIC);
-
         // Compare kinds first
         if self.kind != other.kind {
             return false;
@@ -520,7 +542,7 @@ impl Type {
         const REDUNDANT_SIZE: TypeModifiers = TypeModifiers::SHORT
             .union(TypeModifiers::LONG)
             .union(TypeModifiers::LONGLONG);
-        let ignored = QUALIFIERS
+        let ignored = Self::QUALIFIERS
             .union(redundant_signed)
             .union(REDUNDANT_SIZE)
             .union(Self::DECL_SPECIFIERS);
@@ -1728,12 +1750,8 @@ impl TypeTable {
             // Compatible targets, but the assignment must not silently gain
             // write access: the target's qualifiers have to include the
             // source's.
-            const QUALS: TypeModifiers = TypeModifiers::CONST
-                .union(TypeModifiers::VOLATILE)
-                .union(TypeModifiers::RESTRICT)
-                .union(TypeModifiers::ATOMIC);
-            let t_quals = self.modifiers(t_pointee) & QUALS;
-            let v_quals = self.modifiers(v_pointee) & QUALS;
+            let t_quals = self.qualifiers(t_pointee);
+            let v_quals = self.qualifiers(v_pointee);
             return (!t_quals.contains(v_quals)).then_some(AssignFault::QualifierDiscard);
         }
 
@@ -1847,6 +1865,77 @@ impl TypeTable {
             },
             _ => false,
         }
+    }
+
+    /// The top-level type qualifiers of `id` (C17 6.7.3p1).
+    ///
+    /// Only the qualifiers: `modifiers` answers with the declaration
+    /// specifiers and the size and sign spellings mixed in, and every caller
+    /// that wanted "is this `const`?" had to mask them off itself.
+    pub fn qualifiers(&self, id: TypeId) -> TypeModifiers {
+        self.modifiers(id) & Type::QUALIFIERS
+    }
+
+    /// The version of `id` qualified with `quals` -- the "so-qualified
+    /// version" of C17 6.5.2.3p3/p4.
+    ///
+    /// This is what a member access yields: `s.m` has the member's type plus
+    /// the qualifiers of `s`, so a member of a `volatile` object is volatile
+    /// and a member of a `const` object is not assignable. Without it a
+    /// `volatile struct` read as an ordinary struct and DCE deleted the load.
+    ///
+    /// Qualifiers outside [`Type::QUALIFIERS`] are ignored, and a type that
+    /// already carries all of them is returned unchanged -- so the common case
+    /// of an unqualified object interns nothing. A composite is not
+    /// deduplicated by [`Self::intern`] (it has identity), so qualifying one
+    /// hands back a fresh `TypeId` each time; that is sound because
+    /// compatibility of composites is decided by tag and members rather than
+    /// by id, and it is rare enough not to matter -- only an access to a
+    /// member of aggregate type, through a qualified object, reaches it.
+    pub fn qualified_with(&mut self, id: TypeId, quals: TypeModifiers) -> TypeId {
+        let add = quals & Type::QUALIFIERS;
+        if add.is_empty() {
+            return id;
+        }
+        // C17 6.7.3p10: where an array type is qualified, the *element type* is
+        // so-qualified and the array is not. That is also how a declaration
+        // records it -- `const int a[4]` puts the `const` on the element -- so
+        // qualifying the array instead would leave `cs.arr[0]` an ordinary
+        // `int`, which the subscript reads from the element type, and a write
+        // to it would be accepted.
+        if self.kind(id) == TypeKind::Array {
+            let Some(elem) = self.base_type(id) else {
+                return id;
+            };
+            let qualified_elem = self.qualified_with(elem, add);
+            if qualified_elem == elem {
+                return id;
+            }
+            let mut array = self.get(id).clone();
+            array.base = Some(qualified_elem);
+            return self.intern(array);
+        }
+        if self.modifiers(id).contains(add) {
+            return id;
+        }
+        let mut qualified = self.get(id).clone();
+        qualified.modifiers |= add;
+        self.intern(qualified)
+    }
+
+    /// The unqualified version of `id` (C17 6.3.2.1p2).
+    ///
+    /// Lvalue conversion drops the qualifiers, so this is the type of the
+    /// *value* an lvalue yields: `volatile int v; v + 0` has type `int`, and
+    /// nothing downstream may conclude from the sum's type that the addition
+    /// touched a volatile object.
+    pub fn unqualified(&mut self, id: TypeId) -> TypeId {
+        if self.qualifiers(id).is_empty() {
+            return id;
+        }
+        let mut unqualified = self.get(id).clone();
+        unqualified.modifiers.remove(Type::QUALIFIERS);
+        self.intern(unqualified)
     }
 
     /// How many scalar initializers it takes to fill this type.
@@ -2400,11 +2489,45 @@ impl TypeTable {
         8 // All supported platforms use 8-byte alignment for va_list
     }
 
+    /// The type an access to `name` yields, in an object of type `object`.
+    ///
+    /// C17 6.5.2.3p3/p4: the result of `s.m` and of `p->m` has the
+    /// *so-qualified* version of the member's type, so a member of a
+    /// `volatile` object is volatile and a member of a `const` object is not
+    /// assignable. [`Self::find_member`] answers with the member's *declared*
+    /// type, which is what every other caller of it wants -- an offset, a size,
+    /// a bit-field's width -- so the rule lives here, beside it, rather than in
+    /// each of the two expression forms that need it.
+    ///
+    /// The two type ids are not redundant. `members` is `object` after the
+    /// parser resolved an incomplete tag to its definition, which is where the
+    /// member list is; the qualifiers have to come from `object`, because
+    /// resolving answers with the *tag's* type and a tag is never qualified --
+    /// resolving first is how `volatile struct S` loses the `volatile`.
+    ///
+    /// For `p->m` the object is the pointee: `struct S *volatile p` qualifies
+    /// the pointer, not what it points at.
+    pub fn member_access_type(
+        &mut self,
+        object: TypeId,
+        members: TypeId,
+        name: StringId,
+    ) -> Option<TypeId> {
+        let quals = self.qualifiers(object) & Type::MEMBER_QUALIFIERS;
+        let declared = self.find_member(members, name)?.typ;
+        Some(self.qualified_with(declared, quals))
+    }
+
     /// Find a member in a struct/union type, including anonymous struct/union members
     /// C11 6.7.2.1p13: "An unnamed member of structure type with no tag is called an
     /// anonymous structure; an unnamed member of union type with no tag is called an
     /// anonymous union. The members of an anonymous structure or union are considered
     /// to be members of the containing structure or union."
+    ///
+    /// The `typ` this answers with is the member's *declared* type. An
+    /// expression that accesses the member has the so-qualified version of it
+    /// instead (C17 6.5.2.3p3/p4) -- see [`Self::member_access_type`], which is
+    /// what the `.` and `->` operators go through.
     pub fn find_member(&self, id: TypeId, name: StringId) -> Option<MemberInfo> {
         self.find_member_recursive(id, name, 0)
     }
@@ -2473,13 +2596,7 @@ impl TypeTable {
         if id1 == id2 {
             return true;
         }
-        const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
-            .union(TypeModifiers::VOLATILE)
-            .union(TypeModifiers::RESTRICT)
-            .union(TypeModifiers::ATOMIC);
-        if quals == TopLevelQualifiers::Significant
-            && self.get(id1).modifiers.intersection(QUALIFIERS)
-                != self.get(id2).modifiers.intersection(QUALIFIERS)
+        if quals == TopLevelQualifiers::Significant && self.qualifiers(id1) != self.qualifiers(id2)
         {
             return false;
         }
@@ -2870,6 +2987,144 @@ mod tests {
         // answers the way that forbids an optimization.
         let opaque = types.intern(Type::struct_type(CompositeType::incomplete(None)));
         assert!(types.contains_volatile(opaque));
+    }
+
+    /// `qualifiers`, `qualified_with` and `unqualified` on the same type.
+    ///
+    /// The pair has to be exact inverses on the top-level qualifiers and to
+    /// leave everything else -- the kind, the size spellings, the storage
+    /// class -- alone, because they are what forms and unforms the
+    /// so-qualified type of a member access.
+    #[test]
+    fn qualifying_a_type_adds_and_removes_only_the_qualifiers() {
+        let mut types = TypeTable::new(&crate::target::Target::host());
+        let int = types.int_id;
+        assert!(types.qualifiers(int).is_empty());
+
+        // Adding, one qualifier at a time and then both.
+        let vol = types.qualified_with(int, TypeModifiers::VOLATILE);
+        assert_eq!(types.qualifiers(vol), TypeModifiers::VOLATILE);
+        assert_eq!(types.kind(vol), TypeKind::Int);
+        assert_eq!(types.size_bits(vol), types.size_bits(int));
+        let cv = types.qualified_with(vol, TypeModifiers::CONST);
+        assert_eq!(
+            types.qualifiers(cv),
+            TypeModifiers::CONST | TypeModifiers::VOLATILE
+        );
+
+        // Interned, so the same request answers with the same id -- and a type
+        // that already carries the qualifier is returned untouched.
+        assert_eq!(types.qualified_with(int, TypeModifiers::VOLATILE), vol);
+        assert_eq!(types.qualified_with(vol, TypeModifiers::VOLATILE), vol);
+        assert_eq!(types.qualified_with(int, TypeModifiers::empty()), int);
+
+        // Nothing outside `Type::QUALIFIERS` travels: a storage class is a
+        // property of a declaration, not of a type.
+        assert_eq!(types.qualified_with(int, TypeModifiers::STATIC), int);
+
+        // And back down again.
+        assert_eq!(types.unqualified(cv), int);
+        assert_eq!(types.unqualified(vol), int);
+        assert_eq!(types.unqualified(int), int);
+
+        // A qualifier below the top level is not a top-level qualifier:
+        // `volatile int *` is an ordinary pointer.
+        let ptr_to_vol = types.intern(Type::pointer(vol));
+        assert!(types.qualifiers(ptr_to_vol).is_empty());
+        assert_eq!(types.unqualified(ptr_to_vol), ptr_to_vol);
+
+        // Qualifying an array qualifies its element type (C17 6.7.3p10), at
+        // every level, and the array itself stays unqualified -- which is what
+        // a subscript of it then reads.
+        let arr = types.intern(Type::array(int, 4));
+        let const_arr = types.qualified_with(arr, TypeModifiers::CONST);
+        assert!(types.qualifiers(const_arr).is_empty());
+        let elem = types.base_type(const_arr).expect("element type");
+        assert_eq!(types.qualifiers(elem), TypeModifiers::CONST);
+        let rows = types.intern(Type::array(arr, 2));
+        let vol_rows = types.qualified_with(rows, TypeModifiers::VOLATILE);
+        let row = types.base_type(vol_rows).expect("row type");
+        let cell = types.base_type(row).expect("cell type");
+        assert_eq!(types.qualifiers(cell), TypeModifiers::VOLATILE);
+        assert!(types.contains_volatile(vol_rows));
+    }
+
+    /// C17 6.5.2.3p3/p4: a member access has the *so-qualified* version of the
+    /// member's type.
+    ///
+    /// `find_member` answers with the declared type, which is what an offset or
+    /// a width is read from; the access has the object's qualifiers as well,
+    /// which is what makes a member of a `volatile` object volatile and a
+    /// member of a `const` object unassignable.
+    #[test]
+    fn a_member_access_is_qualified_by_the_object() {
+        let mut types = TypeTable::new(&crate::target::Target::host());
+        let mut idents = crate::strings::StringTable::new();
+        let a = idents.intern("a");
+        let v = idents.intern("v");
+        let int = types.int_id;
+        let vol_int = types.intern(Type::with_modifiers(TypeKind::Int, TypeModifiers::VOLATILE));
+        let member = |name, typ| StructMember {
+            name,
+            typ,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            access_bytes: None,
+            explicit_align: None,
+        };
+        let tag = idents.intern("S");
+        let composite = CompositeType {
+            tag: Some(tag),
+            members: vec![member(a, int), member(v, vol_int)],
+            enum_constants: Vec::new(),
+            size: 8,
+            align: 4,
+            member_align: 4,
+            is_complete: true,
+            transparent: false,
+            anon_id: None,
+        };
+        let plain = types.intern(Type::struct_type(composite));
+
+        // An unqualified object: the declared types, unchanged.
+        assert_eq!(types.member_access_type(plain, plain, a), Some(int));
+        assert_eq!(types.member_access_type(plain, plain, v), Some(vol_int));
+        assert_eq!(types.member_access_type(plain, plain, tag), None);
+
+        // A `volatile` object makes every member volatile, and a `const` one
+        // makes every member `const`.
+        let vol_obj = types.qualified_with(plain, TypeModifiers::VOLATILE);
+        let from_vol = types.member_access_type(vol_obj, vol_obj, a).unwrap();
+        assert_eq!(types.qualifiers(from_vol), TypeModifiers::VOLATILE);
+        assert!(types.contains_volatile(from_vol));
+        let const_obj = types.qualified_with(plain, TypeModifiers::CONST);
+        let from_const = types.member_access_type(const_obj, const_obj, a).unwrap();
+        assert_eq!(types.qualifiers(from_const), TypeModifiers::CONST);
+
+        // `_Atomic` does not travel: a member of an `_Atomic` struct cannot be
+        // read atomically, and gcc does not claim it can.
+        let atomic_obj = types.qualified_with(plain, TypeModifiers::ATOMIC);
+        assert_eq!(
+            types.member_access_type(atomic_obj, atomic_obj, a),
+            Some(int)
+        );
+
+        // The two type ids are not interchangeable. The qualifiers come from
+        // the object as written; the members come from the type the parser
+        // resolved it to, which is the tag's and is never qualified. Reading
+        // the qualifiers from the resolved type is how `volatile struct S`
+        // loses its `volatile`.
+        let incomplete = types.intern(Type::struct_type(CompositeType::incomplete(Some(tag))));
+        let vol_incomplete = types.qualified_with(incomplete, TypeModifiers::VOLATILE);
+        assert_eq!(
+            types.member_access_type(vol_incomplete, plain, a),
+            Some(vol_int)
+        );
+        assert_eq!(
+            types.member_access_type(vol_incomplete, vol_incomplete, a),
+            None
+        );
     }
 
     use super::*;

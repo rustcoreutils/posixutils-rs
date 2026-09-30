@@ -17,7 +17,7 @@ use crate::float::FloatVal;
 use crate::parse::ast::{BinaryOp, Declaration, Designator, Expr, ExprKind, InitElement, UnaryOp};
 use crate::strings::StringId;
 use crate::token::lexer::Position;
-use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::types::{MemberInfo, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::{BTreeMap, HashMap};
 
 /// Determine whether a declared object type is `const`-qualified for the
@@ -1146,6 +1146,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     access_bytes: member.access_bytes,
                     member_index,
                     unions: UnionMembers::default(),
+                    quals: member.quals,
                 });
                 continue;
             }
@@ -1159,6 +1160,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 bit_width,
                 access_bytes,
                 unions,
+                quals,
             }) = resolved
             else {
                 elem_idx += 1;
@@ -1192,6 +1194,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 access_bytes,
                 member_index,
                 unions,
+                quals,
             });
             elem_idx += 1;
         }
@@ -2087,6 +2090,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         let mut bit_width = None;
         let mut access_bytes = None;
         let mut unions = UnionMembers::default();
+        // Qualifiers picked up below `base_type`: `.m.x` inside a `volatile`
+        // member `m` reaches a volatile `x`.
+        let mut quals = TypeModifiers::empty();
 
         for (idx, designator) in designators.iter().enumerate() {
             match designator {
@@ -2105,6 +2111,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                         }
                     }
                     let member = self.types.find_member(resolved, *name)?;
+                    if idx > 0 {
+                        quals |= self.types.qualifiers(typ);
+                    }
+                    quals |= member.quals;
                     offset += member.offset;
                     typ = member.typ;
                     if idx + 1 == designators.len() {
@@ -2146,6 +2156,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             bit_width,
             access_bytes,
             unions,
+            quals: quals & Type::MEMBER_QUALIFIERS,
         })
     }
 
@@ -2199,6 +2210,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     bit_offset: member.bit_offset,
                     bit_width: member.bit_width,
                     access_bytes: member.access_bytes,
+                    quals: TypeModifiers::empty(),
                 },
                 index,
             ));
@@ -2220,6 +2232,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         bit_offset: member.bit_offset,
                         bit_width: member.bit_width,
                         access_bytes: member.access_bytes,
+                        quals: TypeModifiers::empty(),
                     },
                     index,
                 ));
@@ -2272,18 +2285,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                     continue;
                 }
                 // Nested anonymous aggregate — descend into it
-                if inner.name == StringId::EMPTY && inner.bit_width.is_none() {
-                    let inner_type = self.types.get(inner.typ);
-                    let is_nested_anon =
-                        matches!(inner_type.kind, TypeKind::Struct | TypeKind::Union)
-                            && inner_type
-                                .composite
-                                .as_ref()
-                                .is_some_and(|comp| comp.tag.is_none());
-                    if is_nested_anon {
-                        descend_into = Some((inner.typ, base_offset + inner.offset, idx + 1));
-                        break;
-                    }
+                if self.types.is_anonymous_aggregate(inner) {
+                    descend_into = Some((inner.typ, base_offset + inner.offset, idx + 1));
+                    break;
                 }
                 // Found a valid named member
                 found_member = Some((idx + 1, inner.clone()));
@@ -2293,12 +2297,19 @@ impl<'a> super::linearize::Linearizer<'a> {
             if let Some((next_idx, inner)) = found_member {
                 // Update the current level's index
                 c.levels.last_mut().unwrap().inner_next_idx = next_idx;
+                // Every level is an anonymous aggregate the member lives
+                // inside, so each one's qualifiers reach it, exactly as
+                // `TypeTable::find_member` gathers them for a lookup by name.
+                let quals = c.levels.iter().fold(TypeModifiers::empty(), |q, l| {
+                    q | (self.types.qualifiers(l.anon_type) & Type::MEMBER_QUALIFIERS)
+                });
                 return Some(MemberInfo {
                     offset: base_offset + inner.offset,
                     typ: inner.typ,
                     bit_offset: inner.bit_offset,
                     bit_width: inner.bit_width,
                     access_bytes: inner.access_bytes,
+                    quals,
                 });
             }
 
@@ -2327,23 +2338,14 @@ impl<'a> super::linearize::Linearizer<'a> {
             if member.name == name {
                 return Some(MemberDesignatorResult::Direct(idx + 1));
             }
-            if member.name == StringId::EMPTY {
-                let member_type = self.types.get(member.typ);
-                let is_anon_aggregate =
-                    matches!(member_type.kind, TypeKind::Struct | TypeKind::Union)
-                        && member_type
-                            .composite
-                            .as_ref()
-                            .is_some_and(|composite| composite.tag.is_none());
-                if is_anon_aggregate {
-                    // Recursively search for the field, building the nesting path
-                    let mut path = Vec::new();
-                    if self.find_anon_field_path(member.typ, member.offset, name, &mut path) {
-                        return Some(MemberDesignatorResult::Anonymous {
-                            outer_idx: idx,
-                            levels: path,
-                        });
-                    }
+            if self.types.is_anonymous_aggregate(member) {
+                // Recursively search for the field, building the nesting path
+                let mut path = Vec::new();
+                if self.find_anon_field_path(member.typ, member.offset, name, &mut path) {
+                    return Some(MemberDesignatorResult::Anonymous {
+                        outer_idx: idx,
+                        levels: path,
+                    });
                 }
             }
         }
@@ -2376,32 +2378,24 @@ impl<'a> super::linearize::Linearizer<'a> {
                 return true;
             }
             // Check if this is a nested anonymous aggregate
-            if inner_member.name == StringId::EMPTY {
-                let inner_type = self.types.get(inner_member.typ);
-                let is_nested_anon = matches!(inner_type.kind, TypeKind::Struct | TypeKind::Union)
-                    && inner_type
-                        .composite
-                        .as_ref()
-                        .is_some_and(|c| c.tag.is_none());
-                if is_nested_anon {
-                    // Push this level pointing PAST the nested anon struct.
-                    // The inner level handles continuation within the nested anon;
-                    // when it's exhausted, this level continues from the next member.
-                    path.push(AnonLevel {
-                        anon_type,
-                        base_offset,
-                        inner_next_idx: inner_idx + 1,
-                    });
-                    if self.find_anon_field_path(
-                        inner_member.typ,
-                        base_offset + inner_member.offset,
-                        name,
-                        path,
-                    ) {
-                        return true;
-                    }
-                    path.pop(); // not found in this branch
+            if self.types.is_anonymous_aggregate(inner_member) {
+                // Push this level pointing PAST the nested anon struct.
+                // The inner level handles continuation within the nested anon;
+                // when it's exhausted, this level continues from the next member.
+                path.push(AnonLevel {
+                    anon_type,
+                    base_offset,
+                    inner_next_idx: inner_idx + 1,
+                });
+                if self.find_anon_field_path(
+                    inner_member.typ,
+                    base_offset + inner_member.offset,
+                    name,
+                    path,
+                ) {
+                    return true;
                 }
+                path.pop(); // not found in this branch
             }
         }
         false

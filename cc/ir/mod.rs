@@ -1978,16 +1978,26 @@ pub struct LocalVar {
     pub sym: PseudoId,
     /// Type of the variable (interned TypeId)
     pub typ: TypeId,
-    /// Is this variable volatile?
-    pub is_volatile: bool,
-    /// Is this variable atomic?
-    pub is_atomic: bool,
     /// Block where this variable was declared (for scope-aware phi placement)
     /// Phi nodes for this variable should only be placed at blocks dominated by this block.
     pub decl_block: Option<BasicBlockId>,
     /// Explicit alignment from _Alignas specifier (C11 6.7.5)
     /// None means use natural alignment for the type
     pub explicit_align: Option<u32>,
+}
+
+impl LocalVar {
+    /// Is this an ordinary object -- neither volatile anywhere inside
+    /// (`contains_volatile`: a volatile member counts) nor `_Atomic` -- whose
+    /// accesses a pass may promote, forward, merge or delete?
+    ///
+    /// Asked of the type every time rather than stored beside it, so that no
+    /// constructor of a `LocalVar` can record an answer its type disagrees
+    /// with. Five linearizer sites each derived the two flags themselves, and
+    /// the others passed `false` for types that could be qualified.
+    pub fn is_ordinary(&self, types: &TypeTable) -> bool {
+        !types.contains_volatile(self.typ) && !types.is_atomic(self.typ)
+    }
 }
 
 /// A parameter whose local storage is filled implicitly by the backend prologue
@@ -2246,14 +2256,11 @@ impl Function {
     }
 
     /// Add a local variable
-    #[allow(clippy::too_many_arguments)]
     pub fn add_local(
         &mut self,
         name: impl Into<String>,
         sym: PseudoId,
         typ: TypeId,
-        is_volatile: bool,
-        is_atomic: bool,
         decl_block: Option<BasicBlockId>,
         explicit_align: Option<u32>,
     ) {
@@ -2262,8 +2269,6 @@ impl Function {
             LocalVar {
                 sym,
                 typ,
-                is_volatile,
-                is_atomic,
                 decl_block,
                 explicit_align,
             },
@@ -3341,22 +3346,25 @@ mod tests {
 
     #[test]
     fn test_local_var_is_atomic() {
-        let types = TypeTable::new(&Target::host());
+        let mut types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.void_id);
+        let atomic_int = types.intern(crate::types::Type::with_modifiers(
+            crate::types::TypeKind::Int,
+            crate::types::TypeModifiers::ATOMIC,
+        ));
 
-        // Add a non-atomic local
+        // A non-atomic local
         let sym1 = PseudoId(1);
         func.add_pseudo(Pseudo::sym(sym1, "x".to_string()));
-        func.add_local("x", sym1, types.int_id, false, false, None, None);
+        func.add_local("x", sym1, types.int_id, None, None);
 
-        // Add an atomic local
+        // An atomic one: the answer comes from the type, not a flag
         let sym2 = PseudoId(2);
         func.add_pseudo(Pseudo::sym(sym2, "y".to_string()));
-        func.add_local("y", sym2, types.int_id, false, true, None, None);
+        func.add_local("y", sym2, atomic_int, None, None);
 
-        // Check the is_atomic field
-        assert!(!func.locals.get("x").unwrap().is_atomic);
-        assert!(func.locals.get("y").unwrap().is_atomic);
+        assert!(func.locals.get("x").unwrap().is_ordinary(&types));
+        assert!(!func.locals.get("y").unwrap().is_ordinary(&types));
     }
 
     #[test]

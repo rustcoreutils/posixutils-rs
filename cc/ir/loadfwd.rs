@@ -56,9 +56,11 @@
 use super::constfold::unambiguous_at;
 use super::dominate::{domtree_build, DomTree};
 use super::escape::EscapeInfo;
-use super::memloc::{is_same_access, may_alias, AddrMap, MemBase, MemLoc, ModuleInfo};
+use super::memloc::{
+    is_ordinary_object, is_same_access, may_alias, AddrMap, MemBase, MemLoc, ModuleInfo,
+};
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
-use crate::types::{TypeId, TypeModifiers, TypeTable};
+use crate::types::{TypeId, TypeTable};
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
@@ -91,9 +93,9 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
             }
             // Each read of a volatile object is its own observable event, so
             // the value another access left behind is no answer for this one.
-            // `forwardable` declines a *named* volatile object; the marker is
-            // what declines `*p` for a `volatile int *p`, where the qualifier
-            // is on the access and there is no variable to ask.
+            // `is_ordinary_object` declines a *named* volatile object; the
+            // marker is what declines `*p` for a `volatile int *p`, where the
+            // qualifier is on the access and there is no variable to ask.
             if insn.is_volatile_access() {
                 continue;
             }
@@ -178,7 +180,7 @@ impl<'a> MemOracle<'a> {
     fn paths(&self) -> Option<&Paths> {
         self.paths
             .get_or_init(|| {
-                let esc = EscapeInfo::analyze(self.func);
+                let esc = EscapeInfo::analyze(self.func, self.types);
                 if esc.gave_up() {
                     return None;
                 }
@@ -234,7 +236,7 @@ impl<'a> MemOracle<'a> {
         classify: impl Fn(&Instruction) -> Option<Candidate<T>>,
     ) -> Option<T> {
         let func = self.func;
-        if !forwardable(func, self.types, self.mi, loc) {
+        if !is_ordinary_object(func, self.types, self.mi, loc) {
             return None;
         }
 
@@ -337,7 +339,7 @@ impl<'a> MemOracle<'a> {
                 let typ = s.typ.unwrap_or(self.types.int_id);
                 let plain = self.types.fp_format(typ).is_none()
                     && !self.types.contains_volatile(typ)
-                    && !self.types.modifiers(typ).contains(TypeModifiers::ATOMIC);
+                    && !self.types.is_atomic(typ);
                 let byte = insn
                     .src
                     .get(1)
@@ -599,32 +601,6 @@ fn byte_of(c: i128, width: u32, at: u32, little_endian: bool) -> Option<u8> {
     Some((c >> (8 * shift)) as u8)
 }
 
-/// May this location be forwarded from at all?
-fn forwardable(func: &Function, types: &TypeTable, mi: &ModuleInfo, loc: &MemLoc) -> bool {
-    if loc.offset.is_none() || loc.size == 0 {
-        return false;
-    }
-    // Volatility and atomicity are properties of the object, not of the
-    // instruction, so both ends are checked.
-    if let Some(t) = loc.typ {
-        let m = types.modifiers(t);
-        if m.contains(TypeModifiers::VOLATILE) || m.contains(TypeModifiers::ATOMIC) {
-            return false;
-        }
-    }
-    match &loc.base {
-        MemBase::Unknown => false,
-        MemBase::Local(p) => match func.local_of(*p) {
-            Some(l) => !l.is_volatile && !l.is_atomic,
-            None => false,
-        },
-        MemBase::Global(n) => {
-            let g = mi.global(n);
-            !g.is_volatile && !g.is_thread_local
-        }
-    }
-}
-
 /// Successors, as the exact inverse of the predecessor map, so the two can
 /// never disagree about an edge.
 fn invert(
@@ -729,7 +705,7 @@ mod tests {
             f.add_pseudo(Pseudo::sym(PseudoId(0), "a.0".into()));
             f.add_pseudo(Pseudo::val(PseudoId(5), 7));
             f.add_pseudo(Pseudo::val(PseudoId(6), 9));
-            f.add_local("a.0", PseudoId(0), i32t, false, false, None, None);
+            f.add_local("a.0", PseudoId(0), i32t, None, None);
             f.next_pseudo = 60;
             Build { f, types }
         }
@@ -986,7 +962,11 @@ mod tests {
     fn loadfwd_refuses_a_volatile_local() {
         let mut b = Build::new();
         let i32t = b.types.int_id;
-        b.f.add_local("a.0", PseudoId(0), i32t, true, false, None, None);
+        let vol_i32 = b.types.intern(crate::types::Type::with_modifiers(
+            crate::types::TypeKind::Int,
+            crate::types::TypeModifiers::VOLATILE,
+        ));
+        b.f.add_local("a.0", PseudoId(0), vol_i32, None, None);
         b.block(
             0,
             vec![
@@ -1416,7 +1396,7 @@ mod tests {
             let typ = if which == "volatile" {
                 b.types.intern(crate::types::Type::with_modifiers(
                     crate::types::TypeKind::Char,
-                    TypeModifiers::VOLATILE,
+                    crate::types::TypeModifiers::VOLATILE,
                 ))
             } else {
                 b.types.float_id

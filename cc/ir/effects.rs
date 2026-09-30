@@ -36,6 +36,7 @@ use super::escape::EscapeInfo;
 use super::memloc::{AddrMap, MemBase};
 use super::{Function, Module, Opcode};
 use crate::parse::ast::MemEffect;
+use crate::types::TypeTable;
 use std::collections::{HashMap, VecDeque};
 
 /// Every function's effect, by name.
@@ -55,7 +56,7 @@ impl EffectTable {
             .unwrap_or(MemEffect::Unknown)
     }
 
-    pub(crate) fn build(module: &Module) -> EffectTable {
+    pub(crate) fn build(module: &Module, types: &TypeTable) -> EffectTable {
         let mut effects: HashMap<String, MemEffect> = HashMap::new();
 
         // Promises first, from prototypes this unit only declares.
@@ -80,7 +81,7 @@ impl EffectTable {
             // Optimistic, which is what makes recursion converge: a cycle
             // with nothing dirty in it stays clean.
             effects.insert(f.name.clone(), MemEffect::Const);
-            inferable.push(summarize(f));
+            inferable.push(summarize(f, types));
         }
 
         solve(&inferable, &mut effects);
@@ -108,8 +109,8 @@ struct Summary {
     callees: Vec<String>,
 }
 
-fn summarize(f: &Function) -> Summary {
-    let esc = EscapeInfo::analyze(f);
+fn summarize(f: &Function, types: &TypeTable) -> Summary {
+    let esc = EscapeInfo::analyze(f, types);
     if esc.gave_up() {
         return Summary {
             name: f.name.clone(),
@@ -224,6 +225,13 @@ fn insn_effect(
         // Touching a local this function never let out is invisible to the
         // caller, and before SSA promotion that is most of what a body does.
         Opcode::Load | Opcode::Store => {
+            // Reading or writing a volatile object is itself observable
+            // (C17 5.1.2.3p6), whatever the object: a function that does it
+            // cannot be called fewer times, or in a different order, than
+            // written, and neither `Const` nor `Pure` may say otherwise.
+            if insn.is_volatile_access() {
+                return MemEffect::Unknown;
+            }
             let loc = am.location_of(f, insn);
             if matches!(&loc.base, MemBase::Local(p) if !esc.is_captured(&MemBase::Local(*p))) {
                 MemEffect::Const
@@ -290,7 +298,7 @@ mod tests {
         let f = func("f", true, |_, bb| {
             bb.add_insn(Instruction::new(Opcode::Ret).with_type_and_size(t.void_id, 0));
         });
-        let table = EffectTable::build(&module(vec![f]));
+        let table = EffectTable::build(&module(vec![f]), &types());
         assert_eq!(table.of("f"), MemEffect::Const);
     }
 
@@ -313,7 +321,7 @@ mod tests {
                 32,
             ));
         });
-        let table = EffectTable::build(&module(vec![reader, writer]));
+        let table = EffectTable::build(&module(vec![reader, writer]), &types());
         assert_eq!(table.of("r"), MemEffect::Pure);
         assert_eq!(table.of("w"), MemEffect::Unknown);
     }
@@ -327,7 +335,7 @@ mod tests {
         let f = func("f", true, |f, bb| {
             f.add_pseudo(Pseudo::sym(PseudoId(0), "a.0".into()));
             f.add_pseudo(Pseudo::val(PseudoId(1), 7));
-            f.add_local("a.0", PseudoId(0), t.int_id, false, false, None, None);
+            f.add_local("a.0", PseudoId(0), t.int_id, None, None);
             bb.add_insn(Instruction::store(
                 PseudoId(1),
                 PseudoId(0),
@@ -337,8 +345,41 @@ mod tests {
             ));
             bb.add_insn(Instruction::load(PseudoId(2), PseudoId(0), 0, t.int_id, 32));
         });
-        let table = EffectTable::build(&module(vec![f]));
+        let table = EffectTable::build(&module(vec![f]), &types());
         assert_eq!(table.of("f"), MemEffect::Const);
+    }
+
+    /// Reading a volatile object is observable, so a function whose body is
+    /// only that read is neither `Pure` nor `Const`: two calls of it are two
+    /// reads, and neither may be merged with the other or deleted. The same
+    /// read unmarked is the control -- an ordinary global read is `Pure`.
+    #[test]
+    fn effects_a_volatile_access_is_never_pure() {
+        let t = types();
+        let body = |volatile: bool| {
+            move |f: &mut Function, bb: &mut BasicBlock| {
+                f.add_pseudo(Pseudo::sym(PseudoId(0), "g".into()));
+                bb.add_insn(
+                    Instruction::load(PseudoId(2), PseudoId(0), 0, t.int_id, 32)
+                        .with_volatile(volatile),
+                );
+            }
+        };
+        let vol = EffectTable::build(&module(vec![func("f", true, body(true))]), &types());
+        assert_eq!(vol.of("f"), MemEffect::Unknown);
+        let plain = EffectTable::build(&module(vec![func("f", true, body(false))]), &types());
+        assert_eq!(plain.of("f"), MemEffect::Pure);
+
+        // A volatile local is no more private than a volatile global.
+        let local = func("f", true, |f, bb| {
+            f.add_pseudo(Pseudo::sym(PseudoId(0), "a.0".into()));
+            f.add_local("a.0", PseudoId(0), t.int_id, None, None);
+            bb.add_insn(
+                Instruction::load(PseudoId(2), PseudoId(0), 0, t.int_id, 32).with_volatile(true),
+            );
+        });
+        let table = EffectTable::build(&module(vec![local]), &types());
+        assert_eq!(table.of("f"), MemEffect::Unknown);
     }
 
     /// A local whose address was handed to a callee is no longer private.
@@ -348,7 +389,7 @@ mod tests {
         let f = func("f", true, |f, bb| {
             f.add_pseudo(Pseudo::sym(PseudoId(0), "a.0".into()));
             f.add_pseudo(Pseudo::val(PseudoId(1), 7));
-            f.add_local("a.0", PseudoId(0), t.int_id, false, false, None, None);
+            f.add_local("a.0", PseudoId(0), t.int_id, None, None);
             bb.add_insn(Instruction::sym_addr(PseudoId(3), PseudoId(0), t.long_id));
             bb.add_insn(Instruction::call(
                 None,
@@ -366,7 +407,7 @@ mod tests {
                 32,
             ));
         });
-        let table = EffectTable::build(&module(vec![f]));
+        let table = EffectTable::build(&module(vec![f]), &types());
         assert_eq!(table.of("f"), MemEffect::Unknown);
     }
 
@@ -408,7 +449,8 @@ mod tests {
                 0,
             ));
         });
-        let table = EffectTable::build(&module(vec![callee, caller, clean, clean_caller]));
+        let table =
+            EffectTable::build(&module(vec![callee, caller, clean, clean_caller]), &types());
         assert_eq!(table.of("caller"), MemEffect::Unknown);
         assert_eq!(table.of("clean_caller"), MemEffect::Const);
     }
@@ -423,7 +465,7 @@ mod tests {
         let b = func("b", true, |_, bb| {
             bb.add_insn(Instruction::call(None, "a", vec![], vec![], t.void_id, 0));
         });
-        let table = EffectTable::build(&module(vec![a, b]));
+        let table = EffectTable::build(&module(vec![a, b]), &types());
         assert_eq!(table.of("a"), MemEffect::Const);
         assert_eq!(table.of("b"), MemEffect::Const);
     }
@@ -441,7 +483,7 @@ mod tests {
             bb.add_insn(Instruction::new(Opcode::Ret).with_type_and_size(t.void_id, 0));
         });
         weak.symbol_attrs.weak = true;
-        let table = EffectTable::build(&module(vec![external, weak]));
+        let table = EffectTable::build(&module(vec![external, weak]), &types());
         assert_eq!(table.of("ext"), MemEffect::Unknown);
         assert_eq!(table.of("wk"), MemEffect::Unknown);
     }
@@ -464,7 +506,7 @@ mod tests {
             ));
         });
         f.declared_effect = MemEffect::Pure;
-        let table = EffectTable::build(&module(vec![f]));
+        let table = EffectTable::build(&module(vec![f]), &types());
         assert_eq!(table.of("f"), MemEffect::Pure);
     }
 
@@ -474,7 +516,7 @@ mod tests {
         let mut m = Module::default();
         m.declared_fn_effects
             .insert("strlen".into(), MemEffect::Pure);
-        let table = EffectTable::build(&m);
+        let table = EffectTable::build(&m, &types());
         assert_eq!(table.of("strlen"), MemEffect::Pure);
         assert_eq!(table.of("never_heard_of_it"), MemEffect::Unknown);
     }

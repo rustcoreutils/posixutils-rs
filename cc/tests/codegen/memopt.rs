@@ -1544,6 +1544,37 @@ void probe_second(void) { vqobj.b; }
     }
 }
 
+/// A copy out of a `volatile` aggregate reads it, even when nothing uses the
+/// copy (C17 5.1.2.3p6).
+///
+/// A struct too wide for one register is copied in integer chunks, and the
+/// chunks carried no volatile marker, so `struct S t = vstructobj;` with `t`
+/// unused lost every read from `-O1` up on both targets. The copy is of a
+/// named global so that the object's name in the body is the access itself.
+#[test]
+fn memopt_a_copy_out_of_a_volatile_aggregate_is_performed() {
+    let src = "\
+struct S { int a, b, c; };
+volatile struct S vstructobj;
+struct { volatile struct { int a; }; int b; } vanonobj;
+void probe_copy(void) { struct S t = vstructobj; (void)t; }
+void probe_anon(void) { vanonobj.a; }
+";
+    for level in ["-O0", "-O1", "-O2"] {
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            let asm = asm_for_with("vol_copy", triple, src, &[level]);
+            for (func, object) in [("probe_copy", "vstructobj"), ("probe_anon", "vanonobj")] {
+                assert_body_contains(
+                    &asm,
+                    func,
+                    object,
+                    &format!("{func} at {level} on {triple} must still read `{object}`"),
+                );
+            }
+        }
+    }
+}
+
 /// The control for the test above: an ordinary aggregate's member read is still
 /// deleted, so that test cannot pass by marking every member access volatile.
 #[test]

@@ -126,6 +126,10 @@ pub(crate) struct ResolvedDesignator {
     /// The member this designator chain named in each union it passed
     /// through. See [`UnionMembers`].
     pub(crate) unions: UnionMembers,
+    /// The qualifiers `typ` inherits from what the chain passed through: the
+    /// aggregates it named members of, and any anonymous ones the lookup
+    /// crossed. See [`crate::types::TypeTable::subobject_type`].
+    pub(crate) quals: TypeModifiers,
 }
 
 /// Which member a union came to hold, for each union an initializer list
@@ -327,6 +331,14 @@ pub(crate) struct ArrayInitGroups {
     pub(crate) indices: Vec<i64>,
 }
 
+/// Which ends of a block copy reach a `volatile` object. See
+/// [`Linearizer::block_volatility`].
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BlockVolatility {
+    pub(crate) dst: bool,
+    pub(crate) src: bool,
+}
+
 /// A field visit from walking struct/union initializer elements.
 /// Shared between static and runtime init paths.
 pub(crate) struct StructFieldVisit {
@@ -344,6 +356,11 @@ pub(crate) struct StructFieldVisit {
     /// The member this visit's designator chain named in each union it passed
     /// through, by byte offset within the object being initialized.
     pub(crate) unions: UnionMembers,
+    /// The qualifiers `typ` inherits from inside the aggregate being walked --
+    /// an anonymous `volatile` structure it lies in, or a qualified member a
+    /// designator chain went through. Not those of the object itself, which
+    /// the consumer applies. See [`crate::types::TypeTable::subobject_type`].
+    pub(crate) quals: TypeModifiers,
 }
 
 pub(crate) enum StructFieldVisitKind {
@@ -556,6 +573,22 @@ pub struct Linearizer<'a> {
     /// needs the bookkeeping above.
     pub(crate) func_has_vla: bool,
 
+    /// The object an initializer is storing into, while the subobject being
+    /// stored inherits `volatile` from something the member types cannot
+    /// show.
+    ///
+    /// A member of a `volatile` object is volatile (C17 6.5.2.3p3), but the
+    /// declared member types an initializer walks carry only what was written
+    /// on each member, and this `TypeTable` is read-only here, so the
+    /// so-qualified type cannot be interned. The walk names the object
+    /// instead, and [`Self::mark_volatile_access`] -- the one place a marker
+    /// is decided -- marks every access to it: the stores, and the carrier
+    /// load a bit-field's read-modify-write performs. An access is only ever
+    /// *added* a marker this way, and only one addressed through the named
+    /// object: what an initializer expression reads is some other object and
+    /// keeps its own answer.
+    pub(crate) volatile_init_object: Option<PseudoId>,
+
     /// The one block every computed `goto` in this function branches through,
     /// and the hidden local carrying the target address to it.
     ///
@@ -638,6 +671,7 @@ impl<'a> Linearizer<'a> {
             label_vla_depth: std::collections::HashMap::new(),
             pending_goto_vla: Vec::new(),
             vla_marks: Vec::new(),
+            volatile_init_object: None,
             func_has_vla: false,
             indirect_dispatch: None,
             static_local_counter: 0,
@@ -952,8 +986,18 @@ impl<'a> Linearizer<'a> {
     /// that knows more than the access type does can say so: a bit-field reads
     /// a storage unit whose type is the carrier, and a composite copy reads
     /// integer chunks, neither of which is the qualified type.
+    ///
+    /// An access addressed through [`Self::volatile_init_object`] is marked
+    /// whatever its type says, which is how an initializer's accesses to the
+    /// members of a `volatile` object are marked.
     fn mark_volatile_access(&self, mut insn: Instruction) -> Instruction {
         if !matches!(insn.op, Opcode::Load | Opcode::Store) || insn.is_volatile {
+            return insn;
+        }
+        if self.volatile_init_object.is_some()
+            && insn.src.first().copied() == self.volatile_init_object
+        {
+            insn.is_volatile = true;
             return insn;
         }
         if let Some(typ) = insn.typ {
@@ -1273,7 +1317,7 @@ impl<'a> Linearizer<'a> {
             let sym = Pseudo::sym(local_sym, name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
-                func.add_local(&name, local_sym, ptr_type, false, false, None, None);
+                func.add_local(&name, local_sym, ptr_type, None, None);
             }
             let ptr_size = self.types.size_bits(ptr_type);
             self.emit(Instruction::store(
@@ -1311,10 +1355,7 @@ impl<'a> Linearizer<'a> {
             let sym = Pseudo::sym(local_sym, name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
-                let mods = self.types.modifiers(typ);
-                let is_volatile = self.types.contains_volatile(typ);
-                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
-                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
+                func.add_local(&name, local_sym, typ, None, None);
             }
 
             let typ_size = self.types.size_bits(typ);
@@ -1350,11 +1391,19 @@ impl<'a> Linearizer<'a> {
                 // multiple of eight is copied exactly. Stepping 8 while
                 // `offset < size` rounds *up* -- a 12-byte struct wrote 16
                 // bytes, four of them past the local.
-                self.emit_block_copy(local_sym, addr_pseudo, typ_bytes);
+                let vol = BlockVolatility {
+                    dst: self.types.contains_volatile(typ),
+                    src: false,
+                };
+                self.emit_block_copy(local_sym, addr_pseudo, typ_bytes, vol);
             } else if typ_size > 64 {
                 // Medium struct (9-16 bytes): arg_pseudo is a pointer (current behavior).
                 // Copy each 8-byte chunk through pointer dereference.
-                self.emit_block_copy(local_sym, arg_pseudo, typ_bytes);
+                let vol = BlockVolatility {
+                    dst: self.types.contains_volatile(typ),
+                    src: false,
+                };
+                self.emit_block_copy(local_sym, arg_pseudo, typ_bytes, vol);
             } else {
                 // Small struct: arg_pseudo contains the value directly
                 self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
@@ -1397,10 +1446,7 @@ impl<'a> Linearizer<'a> {
             let typ_size_bytes = self.types.size_bytes(typ);
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
-                let mods = self.types.modifiers(typ);
-                let is_volatile = self.types.contains_volatile(typ);
-                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
-                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
+                func.add_local(&name, local_sym, typ, None, None);
                 // Record for inliner: the backend prologue fills this local from
                 // registers; the inliner must generate an explicit copy instead.
                 func.implicit_param_copies.push(super::ImplicitParamCopy {
@@ -1456,10 +1502,7 @@ impl<'a> Linearizer<'a> {
             let sym = Pseudo::sym(local_sym, name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
-                let mods = self.types.modifiers(typ);
-                let is_volatile = self.types.contains_volatile(typ);
-                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
-                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
+                func.add_local(&name, local_sym, typ, None, None);
             }
 
             // Store the incoming argument value to the local, converted from
@@ -2021,7 +2064,12 @@ impl<'a> Linearizer<'a> {
         // prologue uses it: a large struct becomes a `memcpy` call instead of
         // an unbounded unroll, and a size that is not a multiple of eight is
         // copied exactly rather than rounded up past the caller's object.
-        self.emit_block_copy(sret_ptr, src_addr, struct_bytes as i64);
+        // The caller's buffer is its own temporary, never a volatile object.
+        let vol = BlockVolatility {
+            dst: false,
+            src: self.types.contains_volatile(self.expr_type(e)),
+        };
+        self.emit_block_copy(sret_ptr, src_addr, struct_bytes as i64, vol);
 
         self.emit(Instruction::ret_typed(
             Some(sret_ptr),
@@ -2524,8 +2572,6 @@ impl<'a> Linearizer<'a> {
                             super::LocalVar {
                                 sym: local_sym,
                                 typ: param_type,
-                                is_volatile: false,
-                                is_atomic: false,
                                 decl_block: self.current_bb,
                                 explicit_align: None, // parameter spill storage
                             },
@@ -2601,16 +2647,10 @@ impl<'a> Linearizer<'a> {
                 let base_struct_type = self.expr_type(inner);
                 // Resolve if the struct type is incomplete (forward-declared)
                 let struct_type = self.resolve_struct_type(base_struct_type);
-                let member_info =
-                    self.types
-                        .find_member(struct_type, *member)
-                        .unwrap_or_else(|| MemberInfo {
-                            offset: 0,
-                            typ: self.expr_type(expr),
-                            bit_offset: None,
-                            bit_width: None,
-                            access_bytes: None,
-                        });
+                let member_info = self
+                    .types
+                    .find_member(struct_type, *member)
+                    .unwrap_or_else(|| MemberInfo::standing_in(self.expr_type(expr)));
 
                 if member_info.offset == 0 {
                     base
@@ -2642,16 +2682,10 @@ impl<'a> Linearizer<'a> {
                     .unwrap_or_else(|| self.expr_type(expr));
                 // Resolve if the struct type is incomplete (forward-declared)
                 let struct_type = self.resolve_struct_type(base_struct_type);
-                let member_info =
-                    self.types
-                        .find_member(struct_type, *member)
-                        .unwrap_or_else(|| MemberInfo {
-                            offset: 0,
-                            typ: self.expr_type(expr),
-                            bit_offset: None,
-                            bit_width: None,
-                            access_bytes: None,
-                        });
+                let member_info = self
+                    .types
+                    .find_member(struct_type, *member)
+                    .unwrap_or_else(|| MemberInfo::standing_in(self.expr_type(expr)));
 
                 if member_info.offset == 0 {
                     ptr
@@ -2728,15 +2762,7 @@ impl<'a> Linearizer<'a> {
                 let sym = Pseudo::sym(sym_id, unique_name.clone());
                 if let Some(func) = &mut self.current_func {
                     func.add_pseudo(sym);
-                    func.add_local(
-                        &unique_name,
-                        sym_id,
-                        *typ,
-                        false,
-                        false,
-                        self.current_bb,
-                        None,
-                    );
+                    func.add_local(&unique_name, sym_id, *typ, self.current_bb, None);
                 }
 
                 // For compound literals with partial initialization, C99 6.7.8p21 requires
@@ -3036,13 +3062,7 @@ impl<'a> Linearizer<'a> {
         let member_info = self
             .types
             .find_member(struct_type, member)
-            .unwrap_or(MemberInfo {
-                offset: 0,
-                typ: access_typ,
-                bit_offset: None,
-                bit_width: None,
-                access_bytes: None,
-            });
+            .unwrap_or_else(|| MemberInfo::standing_in(access_typ));
 
         // If member type is an array, return the address (arrays decay to pointers)
         if self.types.kind(member_info.typ) == TypeKind::Array {
@@ -3187,8 +3207,6 @@ impl<'a> Linearizer<'a> {
                     &dim_var_name,
                     dim_sym_id,
                     ulong_type,
-                    false, // not volatile
-                    false, // not atomic
                     self.current_bb,
                     None, // no explicit alignment
                 );
@@ -3887,7 +3905,8 @@ impl<'a> Linearizer<'a> {
                         self.types.pointer_to(arg_type),
                     ));
                     let bytes = self.types.size_bytes(arg_type) as i64;
-                    self.emit_block_copy(copy_addr, addr, bytes);
+                    let vol = self.block_volatility(arg_type, self.expr_type(a));
+                    self.emit_block_copy(copy_addr, addr, bytes, vol);
                     copy_addr
                 } else {
                     addr
@@ -5440,15 +5459,7 @@ impl<'a> Linearizer<'a> {
                 if let Some(func) = &mut self.current_func {
                     func.add_pseudo(sym);
                     // Register as local for proper stack allocation
-                    func.add_local(
-                        &unique_name,
-                        sym_id,
-                        *typ,
-                        false,
-                        false,
-                        self.current_bb,
-                        None,
-                    );
+                    func.add_local(&unique_name, sym_id, *typ, self.current_bb, None);
                 }
 
                 // For compound literals with partial initialization, C99 6.7.8p21 requires

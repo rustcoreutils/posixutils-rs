@@ -1443,8 +1443,6 @@ fn inline_call_site(
                 super::LocalVar {
                     sym: new_sym,
                     typ: local_var.typ,
-                    is_volatile: local_var.is_volatile,
-                    is_atomic: local_var.is_atomic,
                     decl_block: new_decl_block,
                     explicit_align: local_var.explicit_align,
                 },

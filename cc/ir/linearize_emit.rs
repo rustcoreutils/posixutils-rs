@@ -8,6 +8,7 @@
 
 //! Emit helpers for the linearizer (constants, block copies, bitfields, operators, assignments)
 
+use super::linearize::BlockVolatility;
 use super::memexpand;
 use super::{BasicBlockId, CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
 use crate::abi::get_abi_for_conv;
@@ -330,7 +331,20 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// the list does not reach is initialized as a static object would be.
     pub(crate) fn emit_aggregate_zero(&mut self, base_sym: PseudoId, typ: TypeId) {
         let total_bytes = self.types.size_bytes(typ) as i64;
-        self.emit_block_zero(base_sym, 0, total_bytes);
+        let volatile = self.types.contains_volatile(typ);
+        self.emit_block_zero(base_sym, 0, total_bytes, volatile);
+    }
+
+    /// Which ends of a block move between objects of type `dst` and `src`
+    /// reach something volatile -- the answer every chunk of the move is
+    /// marked with. By `contains_volatile`, the rule `emit` applies to a
+    /// single access: a struct with one `volatile` member is read and written
+    /// whole, so every chunk of it is observable.
+    pub(crate) fn block_volatility(&self, dst: TypeId, src: TypeId) -> BlockVolatility {
+        BlockVolatility {
+            dst: self.types.contains_volatile(dst),
+            src: self.types.contains_volatile(src),
+        }
     }
 
     /// Emit a fill of `size_bytes` zero bytes at `dst` + `dst_base_offset`.
@@ -351,8 +365,32 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// the expansion does not depend on optimizing -- the same reason the
     /// opcode a program's own `memset` becomes is expanded there rather than
     /// here.
-    pub(crate) fn emit_block_zero(&mut self, dst: PseudoId, dst_base_offset: i64, size_bytes: i64) {
+    ///
+    /// A fill of a `volatile` object is the exception. `memexpand` treats a
+    /// `Memset` as the library call it names, which promised nothing about
+    /// volatility, so its stores come out unmarked and a pass may then drop
+    /// them. Within the inline limit such a fill is emitted here, as stores
+    /// marked for what they write; past it, the call stays a call, which
+    /// nothing deletes.
+    pub(crate) fn emit_block_zero(
+        &mut self,
+        dst: PseudoId,
+        dst_base_offset: i64,
+        size_bytes: i64,
+        volatile: bool,
+    ) {
         if size_bytes <= 0 {
+            return;
+        }
+        if volatile && size_bytes <= memexpand::INLINE_LIMIT_BYTES {
+            for (offset, chunk) in memexpand::block_chunks(size_bytes) {
+                let (typ, bits) = (chunk.typ(self.types), chunk.bits());
+                let zero = self.emit_const(0, typ);
+                self.emit(
+                    Instruction::store(zero, dst, dst_base_offset + offset, typ, bits)
+                        .with_volatile(true),
+                );
+            }
             return;
         }
         let dst_ptr = self.block_dest_addr(dst, dst_base_offset);
@@ -369,8 +407,14 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Emit a block copy from src to dst using integer chunks.
-    pub(crate) fn emit_block_copy(&mut self, dst: PseudoId, src: PseudoId, size_bytes: i64) {
-        self.emit_block_copy_at_offset(dst, 0, src, size_bytes);
+    pub(crate) fn emit_block_copy(
+        &mut self,
+        dst: PseudoId,
+        src: PseudoId,
+        size_bytes: i64,
+        vol: BlockVolatility,
+    ) {
+        self.emit_block_copy_at_offset(dst, 0, src, size_bytes, vol);
     }
 
     /// Emit a block copy from src to dst using integer chunks.
@@ -379,12 +423,18 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// Above `memexpand::INLINE_LIMIT_BYTES` the copy is a `memcpy` call
     /// instead, by the same rule and in the same chunks as a `memcpy` the
     /// program wrote.
+    ///
+    /// Each chunk is marked with `vol`: the chunks are integers, so the
+    /// qualifier of the aggregate they move cannot be read back off their
+    /// type, and an unmarked chunk load of a `volatile` struct nothing
+    /// used was deleted outright from `-O1` up.
     pub(crate) fn emit_block_copy_at_offset(
         &mut self,
         dst: PseudoId,
         dst_base_offset: i64,
         src: PseudoId,
         size_bytes: i64,
+        vol: BlockVolatility,
     ) {
         if size_bytes > memexpand::INLINE_LIMIT_BYTES {
             self.emit_block_copy_call(dst, dst_base_offset, src, size_bytes);
@@ -393,14 +443,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         for (offset, chunk) in memexpand::block_chunks(size_bytes) {
             let (typ, bits) = (chunk.typ(self.types), chunk.bits());
             let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(tmp, src, offset, typ, bits));
-            self.emit(Instruction::store(
-                tmp,
-                dst,
-                dst_base_offset + offset,
-                typ,
-                bits,
-            ));
+            self.emit(Instruction::load(tmp, src, offset, typ, bits).with_volatile(vol.src));
+            self.emit(
+                Instruction::store(tmp, dst, dst_base_offset + offset, typ, bits)
+                    .with_volatile(vol.dst),
+            );
         }
     }
 
@@ -2108,7 +2155,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let name = format!("{prefix}_{}", sym.0);
         if let Some(func) = &mut self.current_func {
             func.add_pseudo(Pseudo::sym(sym, name.clone()));
-            func.add_local(&name, sym, typ, false, false, self.current_bb, None);
+            func.add_local(&name, sym, typ, self.current_bb, None);
         }
         sym
     }
@@ -2709,13 +2756,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let info = self
             .types
             .find_member(struct_type, member)
-            .unwrap_or(MemberInfo {
-                offset: 0,
-                typ: target_typ,
-                bit_offset: None,
-                bit_width: None,
-                access_bytes: None,
-            });
+            .unwrap_or_else(|| MemberInfo::standing_in(target_typ));
         let bitfield = match (info.bit_offset, info.bit_width, info.access_bytes) {
             // The target expression's type, not the member's declared one:
             // they name the same width and sign, and only the expression's
@@ -3024,7 +3065,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             let target_addr = self.linearize_lvalue(target);
             let value_addr = self.linearize_lvalue(value);
 
-            self.emit_block_copy(target_addr, value_addr, target_size_bytes as i64);
+            let vol = self.block_volatility(target_typ, self.expr_type(value));
+            self.emit_block_copy(target_addr, value_addr, target_size_bytes as i64, vol);
 
             // The assignment's value is the target's new value, in the IR's
             // convention for an aggregate: its value when it fits in a

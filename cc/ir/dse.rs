@@ -40,9 +40,9 @@
 //
 
 use super::escape::EscapeInfo;
-use super::memloc::{may_alias, AddrMap, MemBase, MemLoc, ModuleInfo};
+use super::memloc::{is_ordinary_object, may_alias, AddrMap, MemBase, MemLoc, ModuleInfo};
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
-use crate::types::{TypeModifiers, TypeTable};
+use crate::types::TypeTable;
 use std::collections::{HashMap, HashSet};
 
 /// How many sweeps the dead-at-exit fixed point may take before it gives up.
@@ -59,7 +59,7 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
     if func.blocks.is_empty() {
         return false;
     }
-    let esc = EscapeInfo::analyze(func);
+    let esc = EscapeInfo::analyze(func, types);
     if esc.gave_up() {
         return false;
     }
@@ -112,9 +112,10 @@ fn scan_block(
         }
         let loc = am.location_of(func, insn);
         // A volatile store is observable and stays, even when a later store
-        // overwrites every byte of it. `deletable` answers for a named object;
-        // the marker also answers for `*p` where `p` is a `volatile int *`.
-        if insn.is_volatile_access() || !deletable(func, types, mi, &loc) {
+        // overwrites every byte of it. `is_ordinary_object` answers for a
+        // named object; the marker also answers for `*p` where `p` is a
+        // `volatile int *`.
+        if insn.is_volatile_access() || !is_ordinary_object(func, types, mi, &loc) {
             // An untrackable store is still a write: drop whatever it may
             // have touched rather than pretending it did not happen.
             pending.retain(|p| !may_alias(&loc, &p.loc, mi));
@@ -218,32 +219,6 @@ fn may_read(
     }
 }
 
-/// May a store to this location be deleted at all?
-fn deletable(func: &Function, types: &TypeTable, mi: &ModuleInfo, loc: &MemLoc) -> bool {
-    if loc.offset.is_none() || loc.size == 0 {
-        return false;
-    }
-    // Volatility and atomicity are properties of the object, so both ends
-    // are checked -- a volatile store is observable and stays.
-    if let Some(t) = loc.typ {
-        let m = types.modifiers(t);
-        if m.contains(TypeModifiers::VOLATILE) || m.contains(TypeModifiers::ATOMIC) {
-            return false;
-        }
-    }
-    match &loc.base {
-        MemBase::Unknown => false,
-        MemBase::Local(p) => match func.local_of(*p) {
-            Some(l) => !l.is_volatile && !l.is_atomic,
-            None => false,
-        },
-        MemBase::Global(n) => {
-            let g = mi.global(n);
-            !g.is_volatile && !g.is_thread_local
-        }
-    }
-}
-
 /// Does `later` write every byte `earlier` wrote?
 fn covers(later: &MemLoc, earlier: &MemLoc) -> bool {
     if later.base != earlier.base || later.base == MemBase::Unknown {
@@ -288,14 +263,7 @@ fn dead_locals_at_block_end(
         let Some(local) = func.local_of(p.id) else {
             continue;
         };
-        if local.is_volatile || local.is_atomic {
-            continue;
-        }
-        if esc.is_captured(&MemBase::Local(p.id)) {
-            continue;
-        }
-        let m = types.modifiers(local.typ);
-        if m.contains(TypeModifiers::VOLATILE) || m.contains(TypeModifiers::ATOMIC) {
+        if !local.is_ordinary(types) || esc.is_captured(&MemBase::Local(p.id)) {
             continue;
         }
         candidates.insert(p.id);
@@ -418,8 +386,8 @@ mod tests {
             f.add_pseudo(Pseudo::sym(PseudoId(1), "b.0".into()));
             f.add_pseudo(Pseudo::val(PseudoId(5), 7));
             f.add_pseudo(Pseudo::val(PseudoId(6), 9));
-            f.add_local("a.0", PseudoId(0), i32t, false, false, None, None);
-            f.add_local("b.0", PseudoId(1), i32t, false, false, None, None);
+            f.add_local("a.0", PseudoId(0), i32t, None, None);
+            f.add_local("b.0", PseudoId(1), i32t, None, None);
             f.next_pseudo = 60;
             Build { f, types }
         }
@@ -697,7 +665,11 @@ mod tests {
     fn dse_a_volatile_local_is_never_deleted() {
         let mut b = Build::new();
         let i32t = b.types.int_id;
-        b.f.add_local("a.0", PseudoId(0), i32t, true, false, None, None);
+        let vol_i32 = b.types.intern(crate::types::Type::with_modifiers(
+            crate::types::TypeKind::Int,
+            crate::types::TypeModifiers::VOLATILE,
+        ));
+        b.f.add_local("a.0", PseudoId(0), vol_i32, None, None);
         b.block(
             0,
             vec![

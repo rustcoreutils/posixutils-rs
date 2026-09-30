@@ -518,7 +518,7 @@ impl Parser<'_> {
         member: StringId,
         pos: Position,
     ) {
-        if !self.types.modifiers(object).contains(TypeModifiers::ATOMIC) {
+        if !self.types.is_atomic(object) {
             return;
         }
         let what = match self.types.kind(self.resolve_struct_type(object)) {

@@ -80,7 +80,7 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let mut func = Function::new("f", types.void_id);
         func.add_pseudo(Pseudo::sym(PseudoId(0), "x.0".into()));
-        func.add_local("x.0", PseudoId(0), types.long_id, false, false, None, None);
+        func.add_local("x.0", PseudoId(0), types.long_id, None, None);
 
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.add_insn(Instruction::new(Opcode::Entry));

@@ -155,7 +155,7 @@ fn analyze_variables(func: &Function, types: &TypeTable) -> HashMap<String, VarI
         .map(|(name, local)| {
             // Only scalars can be promoted, and a volatile or atomic variable
             // must go through memory.
-            let promotable = !local.is_volatile && !local.is_atomic && types.is_scalar(local.typ);
+            let promotable = local.is_ordinary(types) && types.is_scalar(local.typ);
             let info = promotable.then(|| VarInfo {
                 typ: local.typ,
                 size: types.size_bits(local.typ),
@@ -199,7 +199,7 @@ fn analyze_variables(func: &Function, types: &TypeTable) -> HashMap<String, VarI
             // promotion rewrites it into a `Copy` between registers. The
             // variable itself need not be volatile for this to happen:
             // `int a; *(volatile int *)&a;` qualifies the access alone, and
-            // `LocalVar::is_volatile` -- the test above -- answers no.
+            // `LocalVar::is_ordinary` -- the test above -- answers yes.
             if insn.is_volatile_access() {
                 *slot = None;
                 continue;
@@ -756,8 +756,6 @@ mod tests {
             "x",
             x_sym,
             int_id,
-            false, // not volatile
-            false, // not atomic
             Some(BasicBlockId(0)),
             None, // no explicit alignment
         );
@@ -859,15 +857,7 @@ mod tests {
         // Only add ONE pseudo to func.pseudos with ID 0
         let x_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
-        func.add_local(
-            "x",
-            x_sym,
-            int_id,
-            false,
-            false,
-            Some(BasicBlockId(0)),
-            None,
-        );
+        func.add_local("x", x_sym, int_id, Some(BasicBlockId(0)), None);
 
         // Create an instruction that uses a HIGHER pseudo ID (say, 100)
         // that is NOT in func.pseudos. This simulates what the linearizer does
@@ -931,8 +921,6 @@ mod tests {
             "x",
             x_sym,
             int_id,
-            false,
-            false,
             Some(BasicBlockId(0)), // declared in entry
             None,
         );
@@ -950,15 +938,7 @@ mod tests {
         // Pseudo for switch value (simulated opcode)
         let opcode_sym = PseudoId(5);
         func.add_pseudo(Pseudo::sym(opcode_sym, "opcode".to_string()));
-        func.add_local(
-            "opcode",
-            opcode_sym,
-            int_id,
-            false,
-            false,
-            Some(BasicBlockId(0)),
-            None,
-        );
+        func.add_local("opcode", opcode_sym, int_id, Some(BasicBlockId(0)), None);
 
         // Reg pseudos for loads
         let load_result = PseudoId(6);
@@ -1234,15 +1214,7 @@ mod tests {
 
         let x_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
-        func.add_local(
-            "x",
-            x_sym,
-            int_id,
-            false,
-            false,
-            Some(BasicBlockId(0)),
-            None,
-        );
+        func.add_local("x", x_sym, int_id, Some(BasicBlockId(0)), None);
 
         let val1 = PseudoId(1);
         func.add_pseudo(Pseudo::val(val1, 1));
@@ -1320,7 +1292,7 @@ mod tests {
         func.add_pseudo(Pseudo::sym(z_sym, "z".to_string()));
         // Declared 64 bits wide, but accessed at 32 and at an offset.
         let wide = types.long_id;
-        func.add_local("z", z_sym, wide, false, false, Some(BasicBlockId(0)), None);
+        func.add_local("z", z_sym, wide, Some(BasicBlockId(0)), None);
 
         let lo = PseudoId(1);
         func.add_pseudo(Pseudo::val(lo, 3));
@@ -1368,15 +1340,7 @@ mod tests {
 
         let x_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
-        func.add_local(
-            "x",
-            x_sym,
-            int_id,
-            false,
-            false,
-            Some(BasicBlockId(0)),
-            None,
-        );
+        func.add_local("x", x_sym, int_id, Some(BasicBlockId(0)), None);
         let val1 = PseudoId(1);
         func.add_pseudo(Pseudo::val(val1, 1));
         let ret = PseudoId(2);
@@ -1417,7 +1381,7 @@ mod tests {
         let (a, b, c) = (PseudoId(0), PseudoId(1), PseudoId(2));
         for (id, name, typ) in [(a, "a", int_id), (b, "b", ptr_id), (c, "c", int_id)] {
             func.add_pseudo(Pseudo::sym(id, name.to_string()));
-            func.add_local(name, id, typ, false, false, Some(BasicBlockId(0)), None);
+            func.add_local(name, id, typ, Some(BasicBlockId(0)), None);
         }
         let one = PseudoId(3);
         func.add_pseudo(Pseudo::val(one, 1));
@@ -1458,15 +1422,7 @@ mod tests {
 
         let local_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(local_sym, "v".to_string()));
-        func.add_local(
-            "v",
-            local_sym,
-            int_id,
-            false,
-            false,
-            Some(BasicBlockId(0)),
-            None,
-        );
+        func.add_local("v", local_sym, int_id, Some(BasicBlockId(0)), None);
 
         // A distinct pseudo, same name: the global.
         let global_sym = PseudoId(1);
@@ -1520,15 +1476,7 @@ mod tests {
 
         let t_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(t_sym, "t".to_string()));
-        func.add_local(
-            "t",
-            t_sym,
-            int_id,
-            false,
-            false,
-            Some(BasicBlockId(1)),
-            None,
-        );
+        func.add_local("t", t_sym, int_id, Some(BasicBlockId(1)), None);
         let cond = PseudoId(1);
         func.add_pseudo(Pseudo::val(cond, 1));
         let loaded = PseudoId(2);

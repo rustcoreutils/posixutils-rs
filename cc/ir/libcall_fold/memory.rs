@@ -106,7 +106,7 @@ mod tests {
         let f = fx.func();
         let sym = f.alloc_pseudo();
         f.add_pseudo(Pseudo::sym(sym, name.to_string()));
-        f.add_local(name, sym, arr, false, false, None, None);
+        f.add_local(name, sym, arr, None, None);
         let p = f.alloc_pseudo();
         let ptr = fx.types.char_ptr_id;
         fx.push(Instruction::sym_addr(p, sym, ptr));

@@ -532,15 +532,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                 func.add_pseudo(sym);
                 // Register with function's local variable tracking for SSA
                 // Pass the current basic block as the declaration block for scope-aware phi placement
-                let mods = self.types.modifiers(typ);
-                let is_volatile = self.types.contains_volatile(typ);
-                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
                 func.add_local(
                     &unique_name,
                     sym_id,
                     typ,
-                    is_volatile,
-                    is_atomic,
                     self.current_bb,
                     declarator.explicit_align,
                 );
@@ -628,7 +623,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                         let value_addr = self.linearize_expr(init);
                         let type_size_bytes = self.types.size_bytes(typ);
 
-                        self.emit_block_copy(sym_id, value_addr, type_size_bytes as i64);
+                        let vol = self.block_volatility(typ, self.expr_type(init));
+                        self.emit_block_copy(sym_id, value_addr, type_size_bytes as i64, vol);
                     } else {
                         // Simple scalar initializer
                         let init_type = self.expr_type(init);
@@ -747,8 +743,6 @@ impl<'a> super::linearize::Linearizer<'a> {
                 &size_var_name,
                 size_sym_id,
                 ulong_type,
-                false, // not volatile
-                false, // not atomic
                 self.current_bb,
                 None, // no explicit alignment
             );
@@ -796,15 +790,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         if let Some(func) = &mut self.current_func {
             func.add_pseudo(sym);
             // Register as a pointer variable, not as the array type
-            let mods = self.types.modifiers(typ);
-            let is_volatile = self.types.contains_volatile(typ);
-            let is_atomic = mods.contains(TypeModifiers::ATOMIC);
             func.add_local(
                 &unique_name,
                 sym_id,
                 ptr_type,
-                is_volatile,
-                is_atomic,
                 self.current_bb,
                 declarator.explicit_align, // VLA explicit alignment
             );
@@ -1005,6 +994,8 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) {
         match self.types.kind(typ) {
             TypeKind::Array => {
+                // `qualified_with` already puts an array's qualifiers on its
+                // element type (C17 6.7.3p10), so the element is the subobject.
                 let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
 
                 // `char b[] = {"hi"}` initializes *this* array with the
@@ -1111,16 +1102,21 @@ impl<'a> super::linearize::Linearizer<'a> {
                     {
                         let src_addr = self.linearize_lvalue(&elements[0].value);
                         let target_size_bytes = self.types.size_bytes(typ);
+                        let vol = self.block_volatility(typ, expr_type);
                         self.emit_block_copy_at_offset(
                             base_sym,
                             base_offset,
                             src_addr,
                             target_size_bytes as i64,
+                            vol,
                         );
                         return;
                     }
                 }
 
+                // What every member inherits from the object: taken before
+                // resolving, which answers with the tag's unqualified type.
+                let object_quals = self.types.qualifiers(typ);
                 let resolved_typ = self.resolve_struct_type(typ);
                 if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
                     let members: Vec<_> = composite.members.clone();
@@ -1139,15 +1135,26 @@ impl<'a> super::linearize::Linearizer<'a> {
                     for visit in visits {
                         let held = self.held_union_members(visit.typ, &visit.kind, visit.offset);
                         if let Some(reset) = self.init_override_reset(&mut written, &visit, held) {
+                            let volatile = self.types.contains_volatile(typ);
                             self.emit_block_zero(
                                 base_sym,
                                 base_offset + reset.start as i64,
                                 (reset.end - reset.start) as i64,
+                                volatile,
                             );
                         }
 
                         let offset = base_offset + visit.offset as i64;
                         let field_type = visit.typ;
+                        // The member as a subobject of this object: a store
+                        // into a `volatile` object is a volatile access even
+                        // where the member was not declared so.
+                        let inherits_volatile =
+                            (object_quals | visit.quals).contains(TypeModifiers::VOLATILE);
+                        let outer_volatile_object = self.volatile_init_object;
+                        if inherits_volatile {
+                            self.volatile_init_object = Some(base_sym);
+                        }
 
                         match visit.kind {
                             StructFieldVisitKind::BraceElision(sub_elements) => {
@@ -1187,6 +1194,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 }
                             }
                         }
+                        self.volatile_init_object = outer_volatile_object;
                     }
                 }
             }
@@ -1892,7 +1900,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let name = format!("__goto_target.{}", slot.0);
         if let Some(func) = &mut self.current_func {
             func.add_pseudo(crate::ir::Pseudo::sym(slot, name.clone()));
-            func.add_local(&name, slot, void_ptr, false, false, None, None);
+            func.add_local(&name, slot, void_ptr, None, None);
         }
 
         let dispatch_bb = self.alloc_bb();
@@ -2319,7 +2327,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         if matches!(tail, StringTail::Zero) {
             let start = base_offset + (written as i64) * elem_bytes;
             let bytes = (capacity - written) as i64 * elem_bytes;
-            self.emit_block_zero(base_sym, start, bytes);
+            let volatile = self.types.contains_volatile(arr_typ);
+            self.emit_block_zero(base_sym, start, bytes, volatile);
         }
     }
 

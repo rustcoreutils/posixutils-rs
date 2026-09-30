@@ -25,7 +25,7 @@ use super::{Instruction, MemoryOrder, Opcode, PseudoId};
 use crate::diag;
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, Expr, ExprKind};
-use crate::types::{TypeId, TypeKind, TypeModifiers};
+use crate::types::{TypeId, TypeKind};
 
 /// An `_Atomic` lvalue that can be operated on with a single hardware atomic:
 /// its address, its element type, and the width in bits.
@@ -42,7 +42,7 @@ const ORDER: MemoryOrder = MemoryOrder::SeqCst;
 impl Linearizer<'_> {
     /// True when `typ` is `_Atomic`-qualified.
     pub(crate) fn is_atomic_type(&self, typ: TypeId) -> bool {
-        self.types.modifiers(typ).contains(TypeModifiers::ATOMIC)
+        self.types.is_atomic(typ)
     }
 
     /// True when an atomic object of this type can be operated on with a

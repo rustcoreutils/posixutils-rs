@@ -26,6 +26,7 @@
 //
 
 use super::{Function, Instruction, Opcode, PseudoId, PseudoKind};
+use crate::types::TypeTable;
 use std::collections::HashSet;
 
 /// Which locals are reachable from outside this function.
@@ -50,7 +51,7 @@ impl EscapeInfo {
         self.give_up
     }
 
-    pub(crate) fn analyze(func: &Function) -> EscapeInfo {
+    pub(crate) fn analyze(func: &Function, types: &TypeTable) -> EscapeInfo {
         // `longjmp` resumes at a point the CFG does not model, so every
         // ordering claim a memory pass makes is void -- and C17 7.13.2.1p3
         // already makes a non-`volatile` local modified after `setjmp`
@@ -76,7 +77,7 @@ impl EscapeInfo {
             };
             // Not an escape, but off limits all the same, and one set is
             // simpler to reason about than two.
-            if local.is_volatile || local.is_atomic || escapes(func, p.id) {
+            if !local.is_ordinary(types) || escapes(func, p.id) {
                 escaped.insert(p.id);
             }
         }
@@ -197,7 +198,7 @@ mod tests {
         let mut f = Function::new("f", types.void_id);
         f.add_pseudo(Pseudo::sym(PseudoId(0), "a.0".into()));
         f.add_pseudo(Pseudo::val(PseudoId(5), 0));
-        f.add_local("a.0", PseudoId(0), i64t, false, false, None, None);
+        f.add_local("a.0", PseudoId(0), i64t, None, None);
         f.next_pseudo = 40;
 
         let mut bb = BasicBlock::new(BasicBlockId(0));
@@ -216,7 +217,7 @@ mod tests {
     }
 
     fn captured(f: &Function) -> bool {
-        EscapeInfo::analyze(f).is_captured(&MemBase::Local(PseudoId(0)))
+        EscapeInfo::analyze(f, &host_types()).is_captured(&MemBase::Local(PseudoId(0)))
     }
 
     /// The whole point: a local reached only through `symaddr`, a `Copy` and
@@ -306,7 +307,7 @@ mod tests {
             bb.add_insn(Instruction::store(PseudoId(5), PseudoId(11), 0, t, 64));
             bb.add_insn(Instruction::new(Opcode::Setjmp));
         });
-        let info = EscapeInfo::analyze(&f);
+        let info = EscapeInfo::analyze(&f, &host_types());
         assert!(info.gave_up());
         assert!(info.is_captured(&MemBase::Local(PseudoId(0))));
     }
@@ -318,19 +319,23 @@ mod tests {
             bb.add_insn(Instruction::store(PseudoId(5), PseudoId(11), 0, t, 64));
         });
         f.takes_label_addr = true;
-        assert!(EscapeInfo::analyze(&f).gave_up());
+        assert!(EscapeInfo::analyze(&f, &host_types()).gave_up());
     }
 
     /// A `volatile` local has not escaped, but it is off limits all the
     /// same, and one set is simpler to reason about than two.
     #[test]
     fn escape_volatile_local_is_off_limits() {
-        let types = host_types();
+        let mut types = host_types();
+        let vol_long = types.intern(crate::types::Type::with_modifiers(
+            crate::types::TypeKind::Long,
+            crate::types::TypeModifiers::VOLATILE,
+        ));
         let mut f = with_local(|t, bb| {
             bb.add_insn(Instruction::store(PseudoId(5), PseudoId(11), 0, t, 64));
         });
-        f.add_local("a.0", PseudoId(0), types.long_id, true, false, None, None);
-        assert!(captured(&f));
+        f.add_local("a.0", PseudoId(0), vol_long, None, None);
+        assert!(EscapeInfo::analyze(&f, &types).is_captured(&MemBase::Local(PseudoId(0))));
     }
 
     /// A global is reachable by any externally-linked callee, whatever this
@@ -340,7 +345,7 @@ mod tests {
         let f = with_local(|t, bb| {
             bb.add_insn(Instruction::store(PseudoId(5), PseudoId(11), 0, t, 64));
         });
-        let info = EscapeInfo::analyze(&f);
+        let info = EscapeInfo::analyze(&f, &host_types());
         assert!(info.is_captured(&MemBase::Global("g".into())));
         assert!(info.is_captured(&MemBase::Unknown));
     }

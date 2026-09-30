@@ -80,6 +80,35 @@ pub struct MemberInfo {
     /// contract -- it is not always a storage unit, and not always a power of
     /// two.
     pub access_bytes: Option<u32>,
+    /// The qualifiers of the anonymous structures and unions the lookup
+    /// passed through to reach the member, as [`Type::MEMBER_QUALIFIERS`]
+    /// selects them.
+    ///
+    /// `struct { volatile struct { int a; }; } s;` makes `s.a` a member of a
+    /// volatile object (C17 6.7.2.1p13 makes it a member of `s`, and it lives
+    /// inside the anonymous one), so `s.a` is volatile although neither `s`
+    /// nor `a` was declared so. `typ` is still the declared type; apply these
+    /// through [`TypeTable::subobject_type`].
+    pub quals: TypeModifiers,
+}
+
+impl MemberInfo {
+    /// A stand-in for a member lookup that failed, occupying the whole object
+    /// at offset 0 with type `typ`.
+    ///
+    /// Only reachable once the parser has already reported the unknown
+    /// member, so what it answers never reaches an object file; it exists so
+    /// the linearizer can keep walking rather than panic.
+    pub fn standing_in(typ: TypeId) -> MemberInfo {
+        MemberInfo {
+            offset: 0,
+            typ,
+            bit_offset: None,
+            bit_width: None,
+            access_bytes: None,
+            quals: TypeModifiers::empty(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1867,6 +1896,11 @@ impl TypeTable {
         }
     }
 
+    /// Is `id` `_Atomic`-qualified (C17 6.7.3)?
+    pub fn is_atomic(&self, id: TypeId) -> bool {
+        self.modifiers(id).contains(TypeModifiers::ATOMIC)
+    }
+
     /// The top-level type qualifiers of `id` (C17 6.7.3p1).
     ///
     /// Only the qualifiers: `modifiers` answers with the declaration
@@ -2513,9 +2547,34 @@ impl TypeTable {
         members: TypeId,
         name: StringId,
     ) -> Option<TypeId> {
-        let quals = self.qualifiers(object) & Type::MEMBER_QUALIFIERS;
-        let declared = self.find_member(members, name)?.typ;
-        Some(self.qualified_with(declared, quals))
+        let info = self.find_member(members, name)?;
+        Some(self.subobject_type(info.typ, self.qualifiers(object) | info.quals))
+    }
+
+    /// The type of a subobject reached inside an object qualified with
+    /// `inherited`: the declared type `declared`, so-qualified (C17
+    /// 6.5.2.3p3/p4).
+    ///
+    /// The one place the rule is written. A member access, an initializer
+    /// storing into a member of a `volatile` object, and a lookup through an
+    /// anonymous `volatile` structure all reach a subobject the same way, and
+    /// only [`Type::MEMBER_QUALIFIERS`] of what they pass through travel.
+    pub fn subobject_type(&mut self, declared: TypeId, inherited: TypeModifiers) -> TypeId {
+        self.qualified_with(declared, inherited & Type::MEMBER_QUALIFIERS)
+    }
+
+    /// Is `member` an anonymous structure or union (C17 6.7.2.1p13) -- one
+    /// whose members are members of the containing aggregate?
+    ///
+    /// An unnamed member of structure or union type *with no tag*. An unnamed
+    /// bit-field is padding, not an anonymous member.
+    pub fn is_anonymous_aggregate(&self, member: &StructMember) -> bool {
+        if member.name != StringId::EMPTY || member.bit_width.is_some() {
+            return false;
+        }
+        let t = self.get(member.typ);
+        matches!(t.kind, TypeKind::Struct | TypeKind::Union)
+            && t.composite.as_ref().is_some_and(|c| c.tag.is_none())
     }
 
     /// Find a member in a struct/union type, including anonymous struct/union members
@@ -2539,40 +2598,24 @@ impl TypeTable {
         name: StringId,
         base_offset: usize,
     ) -> Option<MemberInfo> {
-        let typ = self.get(id);
-        if let Some(ref composite) = typ.composite {
-            for member in &composite.members {
-                if member.name == name {
-                    // Found the member directly
-                    return Some(MemberInfo {
-                        offset: base_offset + member.offset,
-                        typ: member.typ,
-                        bit_offset: member.bit_offset,
-                        bit_width: member.bit_width,
-                        access_bytes: member.access_bytes,
-                    });
-                }
-
-                // Check if this is an anonymous struct/union (name is empty, no tag)
-                // and search recursively in it
-                if member.name == StringId::EMPTY {
-                    let member_type = self.get(member.typ);
-                    let is_anon_aggregate =
-                        matches!(member_type.kind, TypeKind::Struct | TypeKind::Union)
-                            && member_type
-                                .composite
-                                .as_ref()
-                                .is_some_and(|c| c.tag.is_none());
-
-                    if is_anon_aggregate {
-                        if let Some(found) = self.find_member_recursive(
-                            member.typ,
-                            name,
-                            base_offset + member.offset,
-                        ) {
-                            return Some(found);
-                        }
-                    }
+        let composite = self.get(id).composite.as_ref()?;
+        for member in &composite.members {
+            if member.name == name {
+                return Some(MemberInfo {
+                    offset: base_offset + member.offset,
+                    typ: member.typ,
+                    bit_offset: member.bit_offset,
+                    bit_width: member.bit_width,
+                    access_bytes: member.access_bytes,
+                    quals: TypeModifiers::empty(),
+                });
+            }
+            if self.is_anonymous_aggregate(member) {
+                if let Some(mut found) =
+                    self.find_member_recursive(member.typ, name, base_offset + member.offset)
+                {
+                    found.quals |= self.qualifiers(member.typ) & Type::MEMBER_QUALIFIERS;
+                    return Some(found);
                 }
             }
         }

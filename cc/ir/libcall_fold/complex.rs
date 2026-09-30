@@ -126,7 +126,7 @@ mod tests {
         let f = fx.func();
         let ret = f.alloc_pseudo();
         f.add_pseudo(Pseudo::sym(ret, "__cret".to_string()));
-        f.add_local("__cret", ret, complex, false, false, None, None);
+        f.add_local("__cret", ret, complex, None, None);
         let size = fx.types.size_bits(complex);
         let mut insn = Instruction::call(
             Some(ret),

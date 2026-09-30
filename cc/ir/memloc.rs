@@ -309,7 +309,7 @@ impl ModuleInfo {
         }
         ModuleInfo {
             globals,
-            effects: super::effects::EffectTable::build(module),
+            effects: super::effects::EffectTable::build(module, types),
         }
     }
 
@@ -335,6 +335,42 @@ impl ModuleInfo {
         match call.known {
             Some(f) if f.only_reads() => effect.min(MemEffect::Pure),
             _ => effect,
+        }
+    }
+}
+
+/// Is the storage `loc` names an ordinary object -- one whose accesses a pass
+/// may forward from, merge or delete?
+///
+/// The one place the question is answered for `loadfwd` and `dse` alike. It
+/// is a property of the *object*: an access carries its own answer in
+/// `Instruction::is_volatile_access`, which a caller asks as well, but a
+/// location must also be refused when the object it lies in is volatile or
+/// atomic, or thread-local, or not certainly this translation unit's.
+///
+/// Volatility is `contains_volatile`, not the top-level qualifier: a
+/// `struct { volatile int v; }` read or written whole is a volatile access,
+/// though nothing was written on the struct itself (C17 6.7.3p7).
+pub(crate) fn is_ordinary_object(
+    func: &Function,
+    types: &TypeTable,
+    mi: &ModuleInfo,
+    loc: &MemLoc,
+) -> bool {
+    if loc.offset.is_none() || loc.size == 0 {
+        return false;
+    }
+    if let Some(t) = loc.typ {
+        if types.contains_volatile(t) || types.is_atomic(t) {
+            return false;
+        }
+    }
+    match &loc.base {
+        MemBase::Unknown => false,
+        MemBase::Local(p) => func.local_of(*p).is_some_and(|l| l.is_ordinary(types)),
+        MemBase::Global(n) => {
+            let g = mi.global(n);
+            !g.is_volatile && !g.is_thread_local
         }
     }
 }
@@ -424,8 +460,8 @@ mod tests {
         f.add_pseudo(Pseudo::sym(PseudoId(2), "g".into()));
         f.add_pseudo(Pseudo::val(PseudoId(11), 8));
         f.add_pseudo(Pseudo::val(PseudoId(20), 7));
-        f.add_local("a.0", PseudoId(0), i32t, false, false, None, None);
-        f.add_local("b.0", PseudoId(1), i32t, false, false, None, None);
+        f.add_local("a.0", PseudoId(0), i32t, None, None);
+        f.add_local("b.0", PseudoId(1), i32t, None, None);
         f.next_pseudo = 40;
 
         let mut bb = BasicBlock::new(BasicBlockId(0));
@@ -542,7 +578,10 @@ mod tests {
         globals.insert("w".to_string(), weak);
         let mi = ModuleInfo {
             globals,
-            effects: super::super::effects::EffectTable::build(&super::super::Module::default()),
+            effects: super::super::effects::EffectTable::build(
+                &super::super::Module::default(),
+                &host_types(),
+            ),
         };
 
         let at = |n: &str| MemLoc {
@@ -559,7 +598,7 @@ mod tests {
     ///
     /// `GlobalFacts::is_volatile` was `modifiers(g.typ)`, which reports what
     /// was written on the struct -- nothing, for
-    /// `struct S { volatile int v; }` -- so `forwardable` and `deletable`
+    /// `struct S { volatile int v; }` -- so `is_ordinary_object`
     /// treated `s` as ordinary and forwarded a load of it across a second
     /// copy. The plain struct beside it is the control.
     #[test]
@@ -714,7 +753,7 @@ mod tests {
         let i64t = types.long_id;
         let mut f = Function::new("f", types.void_id);
         f.add_pseudo(Pseudo::sym(PseudoId(0), "a.0".into()));
-        f.add_local("a.0", PseudoId(0), i64t, false, false, None, None);
+        f.add_local("a.0", PseudoId(0), i64t, None, None);
         f.next_pseudo = 40;
 
         let mut bb = BasicBlock::new(BasicBlockId(0));

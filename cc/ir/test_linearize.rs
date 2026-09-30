@@ -9490,19 +9490,7 @@ fn test_volatile_accesses_carry_the_marker() {
                void read_plain_ptr(void) { *pp; }\n";
     let module = linearize_source(src, &target);
 
-    let accesses = |name: &str| -> Vec<(Opcode, bool)> {
-        module
-            .functions
-            .iter()
-            .find(|f| f.name == name)
-            .unwrap_or_else(|| panic!("function {name}"))
-            .blocks
-            .iter()
-            .flat_map(|bb| bb.insns.iter())
-            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
-            .map(|i| (i.op, i.is_volatile_access()))
-            .collect()
-    };
+    let accesses = |name: &str| memory_accesses(&module, name);
 
     // A named volatile object: one marked access each way.
     assert_eq!(accesses("read_named"), vec![(Opcode::Load, true)]);
@@ -9564,19 +9552,7 @@ fn test_a_member_of_a_volatile_object_carries_the_marker() {
                void read_plain_arrow(void) { pp->a; }\n";
     let module = linearize_source(src, &target);
 
-    let accesses = |name: &str| -> Vec<(Opcode, bool)> {
-        module
-            .functions
-            .iter()
-            .find(|f| f.name == name)
-            .unwrap_or_else(|| panic!("function {name}"))
-            .blocks
-            .iter()
-            .flat_map(|bb| bb.insns.iter())
-            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
-            .map(|i| (i.op, i.is_volatile_access()))
-            .collect()
-    };
+    let accesses = |name: &str| memory_accesses(&module, name);
 
     // Every spelling of "the object is volatile": directly, through a pointer
     // to volatile, through an array's element type, through a nested member
@@ -9603,6 +9579,179 @@ fn test_a_member_of_a_volatile_object_carries_the_marker() {
     );
 }
 
+/// Every `Load` and `Store` in function `name`, with whether it carries the
+/// volatile marker, in program order.
+fn memory_accesses(module: &Module, name: &str) -> Vec<(Opcode, bool)> {
+    module
+        .functions
+        .iter()
+        .find(|f| f.name == name)
+        .unwrap_or_else(|| panic!("function {name}"))
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
+        .map(|i| (i.op, i.is_volatile_access()))
+        .collect()
+}
+
+/// A member of an anonymous `volatile` structure is volatile.
+///
+/// C17 6.7.2.1p13 makes `a` a member of `s`, and it lives inside the anonymous
+/// structure, which is volatile -- so `s.a` is a volatile access although
+/// neither `s` nor `a` was declared so. `find_member` walked into the
+/// anonymous member without collecting its qualifiers, and the read was
+/// unmarked. The same holds for an initializer that reaches `a` by name or
+/// positionally, since the walker reaches it through the same member.
+#[test]
+fn test_a_member_of_an_anonymous_volatile_member_carries_the_marker() {
+    let target = Target::host();
+    let src = "struct A { volatile struct { int a; }; int b; };\n\
+               struct A s;\n\
+               struct { const volatile union { int u; }; } cu;\n\
+               void read_anon(void) { s.a; }\n\
+               void read_union(void) { cu.u; }\n\
+               void read_plain(void) { s.b; }\n\
+               void init_named(void) { struct A l = { .a = 1 }; (void)l; }\n\
+               void init_positional(void) { struct A l = { 1, 2 }; (void)l; }\n";
+    let module = linearize_source(src, &target);
+    assert_eq!(
+        memory_accesses(&module, "read_anon"),
+        vec![(Opcode::Load, true)]
+    );
+    assert_eq!(
+        memory_accesses(&module, "read_union"),
+        vec![(Opcode::Load, true)]
+    );
+    // The control: the sibling outside the anonymous member is ordinary.
+    assert_eq!(
+        memory_accesses(&module, "read_plain"),
+        vec![(Opcode::Load, false)]
+    );
+
+    // `l` holds a volatile member, so its whole-object zero is volatile too,
+    // and the store into `a` is marked whichever way the list reaches it.
+    let stores = |name: &str| -> Vec<bool> {
+        memory_accesses(&module, name)
+            .into_iter()
+            .filter(|(op, _)| *op == Opcode::Store)
+            .map(|(_, v)| v)
+            .collect()
+    };
+    assert!(
+        stores("init_named").iter().all(|v| *v),
+        "{:?}",
+        stores("init_named")
+    );
+    // Zero, then `a` (inside the volatile anonymous member), then `b`
+    // (outside it, and ordinary).
+    assert_eq!(stores("init_positional"), vec![true, true, false]);
+}
+
+/// An initializer's stores into a `volatile` object are volatile accesses.
+///
+/// The stores are typed with each member's *declared* type, which does not
+/// show a qualifier the object carries, so `volatile struct B vb = {1, 2}`
+/// stored into `vb` unmarked -- correctness rested on the passes also asking
+/// `LocalVar` about the named object. Every store is marked now, the
+/// whole-object zero included, and through a nested member and a designator.
+/// An aggregate member that is itself declared `volatile` inside an ordinary
+/// object is the other spelling.
+#[test]
+fn test_an_initializer_of_a_volatile_object_marks_every_store() {
+    let target = Target::host();
+    let src = "struct B { int x, y; };\n\
+               struct O { struct B in; int z; };\n\
+               struct P { volatile struct B vb; int z; };\n\
+               struct F { unsigned f : 3, g : 5; };\n\
+               void whole(void) { volatile struct B vb = {1, 2}; }\n\
+               void partial(void) { volatile struct B vb = {1}; }\n\
+               void designated(void) { volatile struct B vb = { .y = 2 }; }\n\
+               void nested(void) { volatile struct O vo = { {1, 2}, 3 }; }\n\
+               void member(void) { struct P p = { {1, 2}, 3 }; (void)p; }\n\
+               void bits(void) { volatile struct F vf = { 1, 2 }; }\n\
+               void plain(void) { struct B pb = {1, 2}; (void)pb; }\n";
+    let module = linearize_source(src, &target);
+    for name in ["whole", "partial", "designated", "nested"] {
+        let accesses = memory_accesses(&module, name);
+        assert!(!accesses.is_empty(), "{name}: no stores at all");
+        assert!(
+            accesses.iter().all(|&(op, v)| op == Opcode::Store && v),
+            "{name}: every store into a volatile object is volatile: {accesses:?}"
+        );
+    }
+    // A bit-field is initialized by reading its carrier back and storing it:
+    // both halves are accesses to the volatile object.
+    let bits = memory_accesses(&module, "bits");
+    assert!(bits.contains(&(Opcode::Load, true)), "{bits:?}");
+    assert!(bits.iter().all(|&(_, v)| v), "{bits:?}");
+
+    // `p` is not volatile, but `p.vb` is: its two stores are marked, and the
+    // ordinary member beside it is not. The zero covers the volatile member,
+    // so it is marked as a whole.
+    let member = memory_accesses(&module, "member");
+    assert!(
+        member.contains(&(Opcode::Store, true)) && member.contains(&(Opcode::Store, false)),
+        "{member:?}"
+    );
+
+    // The control: an ordinary object's initializer is not marked.
+    let plain = memory_accesses(&module, "plain");
+    assert!(
+        !plain.is_empty() && plain.iter().all(|&(_, v)| !v),
+        "{plain:?}"
+    );
+}
+
+/// Every chunk of an aggregate copy out of, or into, a `volatile` object is a
+/// volatile access.
+///
+/// A copy of a struct too large for one register moves integer chunks, whose
+/// types say nothing about the aggregate's qualifier. So `struct S t = *p;`
+/// through a `volatile struct S *p` read `*p` unmarked, and with `t` unused
+/// DCE deleted every read from `-O1` up. The store side is the same
+/// question for `*p = t`, and a plain copy is the control.
+#[test]
+fn test_an_aggregate_copy_of_a_volatile_object_marks_every_chunk() {
+    let target = Target::host();
+    let src = "struct S { int a, b, c; };\n\
+               volatile struct S *vp;\n\
+               struct S *pp;\n\
+               void copy_out(void) { struct S t = *vp; (void)t; }\n\
+               void copy_in(struct S t) { *vp = t; }\n\
+               void copy_plain(void) { struct S t = *pp; (void)t; }\n";
+    let module = linearize_source(src, &target);
+
+    // Reading `vp` itself is an ordinary load; every chunk load after it is of
+    // `*vp`, and the stores into `t` are not volatile.
+    let out = memory_accesses(&module, "copy_out");
+    let chunk_loads: Vec<bool> = out
+        .iter()
+        .skip(1)
+        .filter(|(op, _)| *op == Opcode::Load)
+        .map(|(_, v)| *v)
+        .collect();
+    assert!(
+        !chunk_loads.is_empty() && chunk_loads.iter().all(|v| *v),
+        "{out:?}"
+    );
+    assert!(out
+        .iter()
+        .filter(|(op, _)| *op == Opcode::Store)
+        .all(|(_, v)| !v));
+
+    let into = memory_accesses(&module, "copy_in");
+    let chunk_stores: Vec<bool> = into
+        .iter()
+        .filter(|(op, _)| *op == Opcode::Store)
+        .map(|(_, v)| *v)
+        .collect();
+    assert!(chunk_stores.iter().any(|v| *v), "{into:?}");
+
+    let plain = memory_accesses(&module, "copy_plain");
+    assert!(plain.iter().all(|(_, v)| !v), "{plain:?}");
+}
+
 /// A `volatile` bit-field access is marked although the access is of the
 /// carrier.
 ///
@@ -9623,19 +9772,7 @@ fn test_a_volatile_bitfield_access_carries_the_marker() {
                void write_plain(void) { b.g = 1; }\n";
     let module = linearize_source(src, &target);
 
-    let accesses = |name: &str| -> Vec<(Opcode, bool)> {
-        module
-            .functions
-            .iter()
-            .find(|f| f.name == name)
-            .unwrap_or_else(|| panic!("function {name}"))
-            .blocks
-            .iter()
-            .flat_map(|bb| bb.insns.iter())
-            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
-            .map(|i| (i.op, i.is_volatile_access()))
-            .collect()
-    };
+    let accesses = |name: &str| memory_accesses(&module, name);
 
     // Both spellings: the field declared `volatile`, and an ordinary field of
     // a `volatile` object.

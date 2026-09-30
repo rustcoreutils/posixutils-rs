@@ -2899,3 +2899,195 @@ int main(void)
     assert_eq!(compile_and_run("union_member_reset", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("union_member_reset_opt", code), 0);
 }
+
+/// A designated override of a bit-field replaces only that bit-field.
+///
+/// The remaining half of the subobject rule. Bit-fields share a carrier, and
+/// the carrier's bytes are merged downstream of the `Initializer` tree, so the
+/// static path could not fold one override into an earlier initializer and fell
+/// back to dropping it whole -- losing `b` in `{ .t = {1,2}, .t.a = 3 }` --
+/// while the automatic path stored the carrier and then stored over part of it,
+/// keeping `b`. gcc keeps it. The two paths disagreeing is the defect; gcc's
+/// answer is which way to settle it.
+#[test]
+fn c99_a_designated_override_of_a_bitfield_keeps_its_neighbours() {
+    let code = r#"
+struct B { unsigned a : 4, b : 4; };
+struct S { struct B t; int z; };
+
+struct S g = { .t = {1, 2}, .t.a = 3, .z = 7 };
+struct S g2 = { .t = {1, 2}, .t.b = 5 };
+
+int main(void)
+{
+    struct S l = { .t = {1, 2}, .t.a = 3, .z = 7 };
+    struct S l2 = { .t = {1, 2}, .t.b = 5 };
+
+    if (g.t.a != 3 || g.t.b != 2 || g.z != 7) return 1;
+    if (l.t.a != 3 || l.t.b != 2 || l.z != 7) return 2;
+    if (g2.t.a != 1 || g2.t.b != 5) return 3;
+    if (l2.t.a != 1 || l2.t.b != 5) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("designated_bitfield_override", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("designated_bitfield_override_opt", code),
+        0
+    );
+}
+
+/// An override naming a subobject of the union member already held keeps the
+/// rest of that member.
+///
+/// `{ .u = {1,2}, .u.p.y = 9 }` initializes the union's first member and then
+/// overrides one of *its* members, so the union still holds `p` and `p.x` keeps
+/// the 1 it was given. c17 reset the union instead, because the `Initializer`
+/// tree records no discriminant and the merge could not tell "the same member,
+/// deeper" from "a different member" -- and resetting is right only for the
+/// second. Both storage durations agreed on the wrong answer, so nothing caught
+/// it.
+///
+/// The companion case, where a *different* member is named and the union really
+/// is reset, is covered by
+/// `c99_initializing_a_second_union_member_resets_the_union`, which must keep
+/// passing: the two are what distinguish the rule.
+#[test]
+fn c99_an_override_inside_the_held_union_member_keeps_the_rest() {
+    let code = r#"
+struct P { int x, y; };
+struct N { union { struct P p; int i; } u; };
+
+struct N g = { .u = {1, 2}, .u.p.y = 9 };
+
+int main(void)
+{
+    struct N l = { .u = {1, 2}, .u.p.y = 9 };
+    if (g.u.p.x != 1 || g.u.p.y != 9) return 1;
+    if (l.u.p.x != 1 || l.u.p.y != 9) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("union_member_deeper_override", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("union_member_deeper_override_opt", code),
+        0
+    );
+}
+
+/// An initializer for a whole struct supersedes an earlier one for a
+/// bit-field inside it, including the bit-fields it says nothing about.
+///
+/// The other direction of the bit-field rule, and the one the automatic path
+/// had wrong: it stored the bit-field, then stored the struct's own
+/// bit-fields over it, and `c` -- which `{1, 2}` does not mention -- kept the
+/// 7. The static path dropped the earlier entry whole and was right. gcc and
+/// clang zero it.
+///
+/// The objects here are deliberately wider than eight bytes, to keep the
+/// assertions clear of an unrelated x86-64 defect that widens a 32-bit store
+/// at offset 0 of an eight-byte local to 64 bits.
+#[test]
+fn c99_a_whole_struct_initializer_supersedes_an_earlier_bitfield() {
+    let code = r#"
+struct B { unsigned a : 4, b : 4, c : 4; };
+struct S { struct B t; int z; long pad; };
+
+struct S g = { .t.c = 7, .t = {1, 2} };
+
+int main(void)
+{
+    struct S l = { .t.c = 7, .t = {1, 2} };
+
+    if (g.t.a != 1 || g.t.b != 2 || g.t.c != 0) return 1;
+    if (l.t.a != 1 || l.t.b != 2 || l.t.c != 0) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("bitfield_superseded", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("bitfield_superseded_opt", code),
+        0
+    );
+}
+
+/// A bit-field naming a second member of a union resets the union, as any
+/// other initializer for a second member does.
+///
+/// A bit-field is stored by reading its carrier and writing it back, so the
+/// automatic path emitted no fill for it and three bytes of the `int` showed
+/// through the `struct` that replaced it. It is not that a bit-field clears
+/// nothing -- it clears nothing *of its own*, because its neighbours in the
+/// carrier are other objects -- but what the union it displaces requires.
+#[test]
+fn c99_a_bitfield_naming_a_second_union_member_resets_the_union() {
+    let code = r#"
+struct U { union { int i; struct { unsigned a : 4, b : 4; } s; } u; long pad; };
+
+struct U g = { .u.i = 0x01020304, .u.s.a = 3 };
+
+int main(void)
+{
+    struct U l = { .u.i = 0x01020304, .u.s.a = 3 };
+
+    if (g.u.i != 3 || g.u.s.a != 3 || g.u.s.b != 0) return 1;
+    if (l.u.i != 3 || l.u.s.a != 3 || l.u.s.b != 0) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("bitfield_union_reset", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("bitfield_union_reset_opt", code),
+        0
+    );
+}
+
+/// Naming a subobject of a union member the union does *not* hold resets it,
+/// even where the two members are the same size and the same shape.
+///
+/// The guard on the fold above. Knowing which member is held comes from the
+/// initializer list, not from the lowered bytes, so `struct P` and `struct Q`
+/// being indistinguishable once lowered costs nothing: `.u = {1, 2}` gives
+/// `p` a value and `.u.q.d = 9` names `q`, so the union comes to hold `q`
+/// with only `d` given a value. Reading it back through the *other* member
+/// would be undefined; `q.c` is not.
+#[test]
+fn c99_an_override_naming_another_union_member_resets_it_whatever_its_shape() {
+    let code = r#"
+struct P { int x, y; };
+struct Q { int c, d; };
+struct N { union { struct P p; struct Q q; } u; long pad; };
+
+struct N g = { .u = {1, 2}, .u.q.d = 9 };
+
+/* And the fold, in the same union, when the member named is the held one. */
+struct N h = { .u = {1, 2}, .u.p.y = 9 };
+
+int main(void)
+{
+    struct N l = { .u = {1, 2}, .u.q.d = 9 };
+    struct N m = { .u = {1, 2}, .u.p.y = 9 };
+
+    if (g.u.q.c != 0 || g.u.q.d != 9) return 1;
+    if (l.u.q.c != 0 || l.u.q.d != 9) return 2;
+    if (h.u.p.x != 1 || h.u.p.y != 9) return 3;
+    if (m.u.p.x != 1 || m.u.p.y != 9) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("union_other_member_reset", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("union_other_member_reset_opt", code),
+        0
+    );
+}

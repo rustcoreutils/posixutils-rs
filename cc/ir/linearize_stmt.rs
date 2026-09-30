@@ -113,6 +113,14 @@ struct WrittenInit {
     /// bytes only by passing through a union.
     origin: usize,
     typ: TypeId,
+    /// The member each union inside that subobject came to hold, which
+    /// decides whether a later entry naming something inside one of them
+    /// names the *same* member -- and so leaves the rest of it standing.
+    held: UnionMembers,
+    /// Set when the entry is a bit-field, to its bit offset. Two bit-fields
+    /// sharing a carrier byte are different objects and neither supersedes
+    /// the other, however their bytes overlap.
+    bits: Option<u32>,
 }
 
 /// Grow `reset` to also cover `range`.
@@ -1129,7 +1137,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let mut written: Vec<WrittenInit> = Vec::new();
 
                     for visit in visits {
-                        if let Some(reset) = self.init_override_reset(&mut written, &visit) {
+                        let held = self.held_union_members(visit.typ, &visit.kind, visit.offset);
+                        if let Some(reset) = self.init_override_reset(&mut written, &visit, held) {
                             self.emit_block_zero(
                                 base_sym,
                                 base_offset + reset.start as i64,
@@ -1216,39 +1225,66 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// entry it invalidates: all of one it wholly contains, all of one it is
     /// not a subobject of, and, where it reaches an earlier entry's bytes only
     /// by naming a member of a union inside it, that union's bytes.
+    ///
+    /// A bit-field is stored by reading its carrier and writing it back, so
+    /// its own bytes are not storage it owns and clearing them would blank the
+    /// members sharing the carrier. It therefore never clears its own span --
+    /// only what an earlier entry it supersedes requires, which is how a
+    /// bit-field naming a second member of a union still resets it.
     fn init_override_reset(
         &self,
         written: &mut Vec<WrittenInit>,
         visit: &StructFieldVisit,
+        held: UnionMembers,
     ) -> Option<std::ops::Range<usize>> {
-        // A bit-field is stored by reading its carrier and writing it back, so
-        // its window is not storage it owns and clearing the window would
-        // blank the members sharing it. Bit-fields are left to overlay each
-        // other as they always have.
-        if visit.bit_width.is_some() || visit.field_size == 0 {
+        if visit.field_size == 0 || visit.bit_width == Some(0) {
             return None;
         }
-
-        let span = visit.offset..visit.offset + visit.field_size;
+        let bits = visit.bit_offset.filter(|_| visit.bit_width.is_some());
+        let span = match (visit.bit_offset, visit.bit_width) {
+            // Only the bytes the field's own bits reach; its access span is
+            // wider and covers bytes other members own.
+            (Some(bit_offset), Some(bit_width)) => {
+                let start = visit.offset + (bit_offset / 8) as usize;
+                let end = visit.offset + (bit_offset + bit_width).div_ceil(8) as usize;
+                start..end.max(start + 1)
+            }
+            _ => visit.offset..visit.offset + visit.field_size,
+        };
         let mut reset: Option<std::ops::Range<usize>> = None;
 
         for entry in written.iter() {
             if entry.live.start >= span.end || span.start >= entry.live.end {
                 continue;
             }
-            widen_reset(&mut reset, span.clone());
-
-            // Wholly superseded: the entry's own bytes are all inside the
-            // ones being cleared and rewritten.
-            if span.start <= entry.live.start && entry.live.end <= span.end {
+            // Two bit-fields are different objects even when they share a
+            // carrier byte, and the same one written twice needs no clearing:
+            // the second store reads the carrier back and replaces its bits.
+            if bits.is_some() && entry.bits.is_some() {
                 continue;
+            }
+            if bits.is_none() {
+                widen_reset(&mut reset, span.clone());
+
+                // Wholly superseded: the entry's own bytes are all inside the
+                // ones being cleared and rewritten.
+                if span.start <= entry.live.start && entry.live.end <= span.end {
+                    continue;
+                }
             }
 
             let entry_end = entry.origin + self.types.size_bytes(entry.typ);
-            let place = if span.start >= entry.origin && span.end <= entry_end {
-                self.classify_subobject(entry.typ, span.start - entry.origin, visit.field_size)
-            } else {
-                SubobjectPlace::NotASubobject
+            let inner = span
+                .start
+                .checked_sub(entry.origin)
+                .filter(|_| span.end <= entry_end);
+            let unions = UnionFold::new(&entry.held, &visit.unions, entry.origin);
+            let place = match inner {
+                None => SubobjectPlace::NotASubobject,
+                Some(inner) if bits.is_some() => {
+                    self.classify_bitfield_carrier(entry.typ, inner, span.end - span.start, unions)
+                }
+                Some(inner) => self.classify_subobject(entry.typ, inner, visit.field_size, unions),
             };
             match place {
                 // A member of the earlier entry's object: the rest of that
@@ -1260,6 +1296,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                         entry.origin + offset..entry.origin + offset + size,
                     );
                 }
+                // The carrier the earlier entry wrote is shared: the bits this
+                // one names are replaced in place and its neighbours' stand.
+                SubobjectPlace::BitfieldCarrier { .. } => {}
                 SubobjectPlace::NotASubobject => {
                     widen_reset(&mut reset, entry.live.clone());
                 }
@@ -1272,14 +1311,21 @@ impl<'a> super::linearize::Linearizer<'a> {
             *written = written
                 .drain(..)
                 .flat_map(|entry| {
-                    let (origin, typ) = (entry.origin, entry.typ);
+                    let (origin, typ, held, bits) =
+                        (entry.origin, entry.typ, entry.held, entry.bits);
                     [
                         entry.live.start..entry.live.end.min(from),
                         entry.live.start.max(to)..entry.live.end,
                     ]
                     .into_iter()
                     .filter(|live| live.start < live.end)
-                    .map(move |live| WrittenInit { live, origin, typ })
+                    .map(move |live| WrittenInit {
+                        live,
+                        origin,
+                        typ,
+                        held: held.clone(),
+                        bits,
+                    })
                 })
                 .collect();
         }
@@ -1288,6 +1334,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             live: span,
             origin: visit.offset,
             typ: visit.typ,
+            held,
+            bits,
         });
         reset
     }

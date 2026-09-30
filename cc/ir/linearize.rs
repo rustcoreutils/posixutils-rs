@@ -123,6 +123,99 @@ pub(crate) struct ResolvedDesignator {
     pub(crate) bit_offset: Option<u32>,
     pub(crate) bit_width: Option<u32>,
     pub(crate) access_bytes: Option<u32>,
+    /// The member this designator chain named in each union it passed
+    /// through. See [`UnionMembers`].
+    pub(crate) unions: UnionMembers,
+}
+
+/// Which member a union came to hold, for each union an initializer list
+/// reached.
+///
+/// C17 6.7.9p19 makes a later initializer override the earlier one for the
+/// *same* subobject, and a union has only one subobject at a time: whether
+/// `.u.p.y = 9` overrides part of what `.u = {1, 2}` wrote or replaces all of
+/// it turns on whether the union still holds `p`. Neither the byte offset nor
+/// the lowered [`Initializer`] can say -- every member of a union begins at
+/// the same byte, and `Initializer` is what the emitter consumes and has no
+/// room for a discriminant -- so the choice is recorded beside it.
+///
+/// Each entry is the byte offset of a union within the object whose
+/// initializer list produced it, that union's type, and the index of the
+/// member in question. The type is part of the key because a union declared
+/// directly inside another begins at the same byte as it does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnionMembers(Vec<(usize, TypeId, usize)>);
+
+impl UnionMembers {
+    /// Note that the union at `offset` holds `member`, replacing whatever it
+    /// was last said to hold.
+    pub(crate) fn record(&mut self, offset: usize, typ: TypeId, member: usize) {
+        match self.0.iter_mut().find(|e| (e.0, e.1) == (offset, typ)) {
+            Some(entry) => entry.2 = member,
+            None => self.0.push((offset, typ, member)),
+        }
+    }
+
+    fn member_at(&self, offset: usize, typ: TypeId) -> Option<usize> {
+        self.0
+            .iter()
+            .find(|e| (e.0, e.1) == (offset, typ))
+            .map(|e| e.2)
+    }
+
+    /// Take on everything `other` says, which is later and so decisive.
+    pub(crate) fn absorb(&mut self, other: &UnionMembers) {
+        for &(offset, typ, member) in &other.0 {
+            self.record(offset, typ, member);
+        }
+    }
+
+    /// Forget every union starting inside `range`, whose contents some later
+    /// initializer has just discarded.
+    pub(crate) fn clear_range(&mut self, range: std::ops::Range<usize>) {
+        self.0.retain(|e| !range.contains(&e.0));
+    }
+}
+
+/// What the two initializers being merged say about the unions between them,
+/// and how far into the earlier one's object the merge has descended.
+///
+/// A union is descended into only where the two agree: `held` is the member
+/// the earlier initializer gave a value to, `named` the member the later
+/// one's designator reached through, and anything else means the union comes
+/// to hold something different and everything it held goes. Both are keyed by
+/// byte offset within the object whose initializer list holds both entries,
+/// which is what `base` counts from.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct UnionFold<'a> {
+    held: Option<&'a UnionMembers>,
+    named: Option<&'a UnionMembers>,
+    base: usize,
+}
+
+impl<'a> UnionFold<'a> {
+    pub(crate) fn new(held: &'a UnionMembers, named: &'a UnionMembers, base: usize) -> Self {
+        Self {
+            held: Some(held),
+            named: Some(named),
+            base,
+        }
+    }
+
+    /// The same view, `offset` bytes further into the object.
+    pub(crate) fn inside(self, offset: usize) -> Self {
+        Self {
+            base: self.base + offset,
+            ..self
+        }
+    }
+
+    /// The member both sides agree the union of type `typ` at the current
+    /// offset holds, if they do.
+    pub(crate) fn agreed(&self, typ: TypeId) -> Option<usize> {
+        let held = self.held?.member_at(self.base, typ)?;
+        (self.named?.member_at(self.base, typ)? == held).then_some(held)
+    }
 }
 
 pub(crate) struct RawFieldInit {
@@ -139,6 +232,10 @@ pub(crate) struct RawFieldInit {
     pub(crate) init: Initializer,
     pub(crate) bit_offset: Option<u32>,
     pub(crate) bit_width: Option<u32>,
+    /// The member each union inside this subobject came to hold.
+    pub(crate) held: UnionMembers,
+    /// The member each union this entry's designator passed through named.
+    pub(crate) named: UnionMembers,
 }
 
 impl RawFieldInit {
@@ -175,6 +272,15 @@ pub(crate) enum SubobjectPlace {
     /// member at a time, so initializing through it discards whatever the
     /// union held before.
     ThroughUnion { offset: usize, size: usize },
+    /// The range is the storage of a bit-field declared by the struct
+    /// spanning `offset..offset + size` of the enclosing object. A bit-field
+    /// is not addressable storage of its own -- it shares a carrier with its
+    /// neighbours -- so an initializer for one replaces its bits and leaves
+    /// theirs, which is done in that struct's own initializer rather than by
+    /// replacing a subobject.
+    ///
+    /// Only asked for, and only ever answered, for a bit-field's own bits.
+    BitfieldCarrier { offset: usize, size: usize },
     /// The range is not a subobject at all: it straddles two members, or it is
     /// a bit-field carrier's window rather than a named object.
     NotASubobject,
@@ -231,6 +337,13 @@ pub(crate) struct StructFieldVisit {
     pub(crate) bit_offset: Option<u32>,
     pub(crate) bit_width: Option<u32>,
     pub(crate) access_bytes: Option<u32>,
+    /// Index, in the member list walked, of the member this visit initializes
+    /// or lies inside. For a union that is the member it comes to hold, which
+    /// its byte offset cannot say.
+    pub(crate) member_index: Option<usize>,
+    /// The member this visit's designator chain named in each union it passed
+    /// through, by byte offset within the object being initialized.
+    pub(crate) unions: UnionMembers,
 }
 
 pub(crate) enum StructFieldVisitKind {

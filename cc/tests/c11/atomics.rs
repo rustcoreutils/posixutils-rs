@@ -948,3 +948,141 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c11_atomic_spellings", code, &[]), 0);
 }
+
+/// A compound assignment to an `_Atomic` object computes at the same type as
+/// one to an ordinary object.
+///
+/// C17 6.5.16.2p3 defines `E1 op= E2` as `E1 = E1 op E2` bar evaluating `E1`
+/// once, so the arithmetic happens at the type the usual arithmetic
+/// conversions give the two operands -- and only the *result* is converted back
+/// to the target. The atomic path converted the right operand down to the
+/// target first and computed there, so `50 / -5` became `50 / 251` and stored
+/// 0. The ordinary path already had this fixed, with a comment explaining it;
+/// the atomic path had its own copy of the logic and did not.
+///
+/// Add, subtract, and the bitwise operators are congruent modulo 2^n, so a
+/// narrow computation agrees with a wide one and their native fetch-and-op
+/// lowering stays correct. Division, remainder and the shifts are not, and all
+/// of them already take the compare-and-swap loop.
+///
+/// Each case is checked against the ordinary object beside it: the two paths
+/// agreeing is the property, and their disagreeing is how this survived.
+#[test]
+fn c11_an_atomic_compound_assignment_computes_at_the_common_type() {
+    let code = r#"
+int main(void)
+{
+    /* Division: the right operand must not be narrowed to unsigned char
+       first. 50 / -5 is -10 at int, stored as (unsigned char)-10 == 246. */
+    _Atomic unsigned char ac = 50;  ac /= -5;
+    unsigned char          pc = 50;  pc /= -5;
+    if (ac != pc || ac != 246) return 1;
+
+    /* Remainder, likewise: 50 % -3 is 2. */
+    _Atomic unsigned char am = 50;  am %= -3;
+    unsigned char          pm = 50;  pm %= -3;
+    if (am != pm || am != 2) return 2;
+
+    /* Signed division, where narrowing would also change the sign. */
+    _Atomic signed char as = -100;  as /= 3;
+    signed char           ps = -100;  ps /= 3;
+    if (as != ps || as != -33) return 3;
+
+    /* The congruent operators must keep working -- they take the native
+       fetch-and-op lowering, not the CAS loop. */
+    _Atomic unsigned char aa = 200; aa += 100;
+    unsigned char          pa = 200; pa += 100;
+    if (aa != pa || aa != 44) return 4;
+
+    _Atomic unsigned char an = 0xF0; an &= -1;
+    unsigned char          pn = 0xF0; pn &= -1;
+    if (an != pn || an != 0xF0) return 5;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("atomic_compound_common_type", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("atomic_compound_common_type_opt", code),
+        0
+    );
+}
+
+/// The value of a compound assignment is the value stored, converted.
+///
+/// C17 6.5.16p3: an assignment expression has the value of the left operand
+/// *after* the assignment. For a `_Bool` that means the value after conversion
+/// to `_Bool`, so `b -= 1` on a false `b` yields 1 -- the memory and the
+/// expression have to agree. c17's ordinary path did this and its atomic path
+/// did not, recomputing the expression's value from a raw arithmetic result
+/// and handing back 255 while storing 1.
+///
+/// Note clang answers 255 here for the atomic case and 1 for the ordinary one,
+/// i.e. it has the same split. This follows the standard and c17's own
+/// non-atomic path rather than matching that.
+#[test]
+fn c11_an_atomic_compound_assignment_yields_the_value_it_stored() {
+    let code = r#"
+int main(void)
+{
+    _Atomic _Bool ab = 0;  int ar = (ab -= 1);
+    _Bool          pb = 0;  int pr = (pb -= 1);
+    if (ab != 1 || pb != 1) return 1;
+    if (ar != pr || ar != 1) return 2;
+
+    _Atomic _Bool ab2 = 1;  int ar2 = (ab2 += 7);
+    _Bool          pb2 = 1;  int pr2 = (pb2 += 7);
+    if (ab2 != 1 || pb2 != 1) return 3;
+    if (ar2 != pr2 || ar2 != 1) return 4;
+
+    /* A narrowing store: the expression is the stored value, not the wide one. */
+    _Atomic unsigned char au = 200;  int aur = (au += 100);
+    unsigned char          pu = 200;  int pur = (pu += 100);
+    if (aur != pur || aur != 44) return 5;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("atomic_compound_result", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("atomic_compound_result_opt", code),
+        0
+    );
+}
+
+/// A shift on an atomic object promotes its left operand, as any shift does.
+///
+/// C17 6.5.7p3: the integer promotions are applied to each operand and the
+/// result has the promoted left operand's type. So `s >>= 1` on a
+/// `signed char` holding -8 shifts -8 at `int`, giving -4, and stores that --
+/// not a logical shift of the unsigned byte pattern, which would give 124.
+///
+/// This one c17 already gets right and clang does not, so it is a guard rather
+/// than a repair: the fix for the two tests above must not reach the shift by
+/// computing at the target's width.
+#[test]
+fn c11_an_atomic_shift_promotes_its_left_operand() {
+    let code = r#"
+int main(void)
+{
+    _Atomic signed char as = -8;   as >>= 1;
+    signed char          ps = -8;   ps >>= 1;
+    if (as != ps || as != -4) return 1;
+
+    _Atomic signed char al = -8;   al <<= 2;
+    signed char          pl = -8;   pl <<= 2;
+    if (al != pl || al != -32) return 2;
+
+    _Atomic unsigned char au = 200; au >>= 1;
+    unsigned char          pu = 200; pu >>= 1;
+    if (au != pu || au != 100) return 3;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("atomic_shift_promotion", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("atomic_shift_promotion_opt", code),
+        0
+    );
+}

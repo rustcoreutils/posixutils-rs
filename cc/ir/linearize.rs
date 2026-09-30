@@ -19,10 +19,11 @@ use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{get_all_stream_names, Position};
 use crate::float::FloatVal;
 use crate::ir::linearize_atomic::AtomicLvalue;
+use crate::ir::linearize_emit::CompoundAssign;
 use crate::parse::ast::{
-    BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef, GnuAtomicOp,
-    InitElement, InlineLibraryFn, MemoryFn, NarrowedLibraryCall, OffsetOfPath, ParamStyle,
-    TranslationUnit, UnaryOp,
+    AssignOp, BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef,
+    GnuAtomicOp, InitElement, InlineLibraryFn, MemoryFn, NarrowedLibraryCall, OffsetOfPath,
+    ParamStyle, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
@@ -5724,13 +5725,19 @@ impl<'a> Linearizer<'a> {
         let value_typ = self.expr_type(val);
         let raw = self.linearize_expr(val);
         // Pointer arithmetic scales by the element size, as it does for `+=`.
-        let operand = if self.types.kind(elem_typ) == TypeKind::Pointer
+        let is_ptr_arith = self.types.kind(elem_typ) == TypeKind::Pointer
             && self.types.is_integer(value_typ)
-            && matches!(op, GnuAtomicOp::Add | GnuAtomicOp::Sub)
-        {
-            self.scale_pointer_addend(elem_typ, value_typ, raw)
+            && matches!(op, GnuAtomicOp::Add | GnuAtomicOp::Sub);
+        let (operand, operand_typ) = if is_ptr_arith {
+            (
+                self.scale_pointer_addend(elem_typ, value_typ, raw),
+                self.types.long_id,
+            )
         } else {
-            self.emit_convert(raw, value_typ, elem_typ)
+            // Unlike an operator, a builtin converts its value argument to the
+            // object's type itself (gcc documents the parameter as that type),
+            // so there is no common type left to compute at.
+            (self.emit_convert(raw, value_typ, elem_typ), elem_typ)
         };
         // The order argument is accepted and evaluated, as gcc evaluates it,
         // but every lowering here is sequentially consistent: `emit_atomic_rmw`
@@ -5744,39 +5751,30 @@ impl<'a> Linearizer<'a> {
             size_bits: bits,
         };
 
-        let (old, binop) = match op {
-            GnuAtomicOp::Nand => (self.emit_atomic_nand(&lv, operand), Opcode::And),
-            _ => {
-                let binop = match op {
-                    GnuAtomicOp::Add => Opcode::Add,
-                    GnuAtomicOp::Sub => Opcode::Sub,
-                    GnuAtomicOp::And => Opcode::And,
-                    GnuAtomicOp::Or => Opcode::Or,
-                    GnuAtomicOp::Xor => Opcode::Xor,
-                    GnuAtomicOp::Nand => unreachable!("handled above"),
-                };
-                (self.emit_atomic_rmw(&lv, binop, operand), binop)
-            }
+        // Each builtin is the compound assignment of the same name, so it
+        // goes through the same model: `nand` is the one that has no operator
+        // spelling, and it is `&` with the result complemented before it
+        // converts back to the object's type (`CompoundAssign::invert`).
+        let assign_op = match op {
+            GnuAtomicOp::Add => AssignOp::AddAssign,
+            GnuAtomicOp::Sub => AssignOp::SubAssign,
+            GnuAtomicOp::And | GnuAtomicOp::Nand => AssignOp::AndAssign,
+            GnuAtomicOp::Or => AssignOp::OrAssign,
+            GnuAtomicOp::Xor => AssignOp::XorAssign,
+        };
+        let ca = CompoundAssign {
+            is_ptr_arith,
+            invert: op == GnuAtomicOp::Nand,
+            ..CompoundAssign::new(assign_op, elem_typ, operand_typ)
         };
 
+        let old = self.emit_atomic_rmw(&lv, &ca, operand);
         if !returns_new {
             return old;
         }
-
-        let new = self.alloc_reg_pseudo();
-        self.emit(Instruction::binop(binop, new, old, operand, elem_typ, bits));
-        if op != GnuAtomicOp::Nand {
-            return new;
-        }
-        let inverted = self.alloc_reg_pseudo();
-        self.emit(Instruction::unop(
-            Opcode::Not,
-            inverted,
-            new,
-            elem_typ,
-            bits,
-        ));
-        inverted
+        // The new value, recomputed from the old one rather than read back:
+        // arithmetic on a value in hand is not a second access to the object.
+        self.compound_assign_value(&ca, old, operand)
     }
 
     /// `__sync_bool_compare_and_swap` and `__sync_val_compare_and_swap`.

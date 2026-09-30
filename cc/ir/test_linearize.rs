@@ -13,6 +13,7 @@
 #![allow(clippy::approx_constant)]
 
 use super::*;
+use crate::ir::linearize_emit::{compound_assign_arith_type, compound_assign_opcode};
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, ExprKind, ExternalDecl,
     ForInit, FunctionDef, InitDeclarator, InitElement, ParamStyle, Parameter, Stmt, UnaryOp,
@@ -6568,6 +6569,260 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
         ctx.types.size_bits(typ),
         32,
         "the surrogate must be the same width as the aggregate"
+    );
+}
+
+// One model for `E1 op= E2` (C17 6.5.16.2p3)
+//
+// The ordinary and the `_Atomic` lowerings each used to carry their own copy
+// of these rules, and the copies disagreed: the atomic one converted the right
+// operand down to the target and computed there, so `_Atomic unsigned char c =
+// 50; c /= -5;` divided 50 by 251 and stored 0. Both now go through
+// `compound_assign_value`, and these tests pin the decisions it makes.
+
+/// Build `void test(T x) { x <op>= <value>; }` with `T` the chosen type made
+/// `_Atomic` and the right operand a plain `int` literal, and linearize it.
+///
+/// `target` is a selector rather than a `TypeId` because the table the id
+/// belongs to is built by `TestContext::new`.
+fn atomic_typed_module(
+    op: AssignOp,
+    target: fn(&TypeTable) -> TypeId,
+    value: i64,
+) -> (TestContext, Module) {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_id = ctx.types.int_id;
+
+    let base = target(&ctx.types);
+    let atomic_typ = {
+        let mut t = ctx.types.get(base).clone();
+        t.modifiers |= TypeModifiers::ATOMIC;
+        ctx.types.intern(t)
+    };
+    let x_sym = ctx.var("x", atomic_typ);
+
+    let assign = Expr::typed_unpositioned(
+        ExprKind::Assign {
+            op,
+            target: Box::new(Expr::var_typed(x_sym, atomic_typ)),
+            value: Box::new(Expr::typed_unpositioned(ExprKind::IntLit(value), int_id)),
+        },
+        atomic_typ,
+    );
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: ctx.types.void_id,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(x_sym),
+            typ: atomic_typ,
+            vm_dims: vec![],
+            discarded_dims: vec![],
+        }],
+        body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Expr(assign)))]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+        param_style: ParamStyle::Prototype,
+    };
+    let module = ctx.linearize(&TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    });
+    (ctx, module)
+}
+
+/// The first instruction with this opcode, for asserting on its type and width.
+fn first_op(module: &Module, op: Opcode) -> &Instruction {
+    module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .find(|i| i.op == op)
+        .unwrap_or_else(|| panic!("no {:?} in the module", op))
+}
+
+/// The usual arithmetic conversions decide the type, and the type decides the
+/// opcode -- so a narrow unsigned target divided by an `int` is a *signed*
+/// 32-bit divide.
+#[test]
+fn test_compound_assign_divides_at_the_operands_common_type() {
+    let types = TypeTable::new(&Target::host());
+
+    let ca = CompoundAssign::new(AssignOp::DivAssign, types.uchar_id, types.int_id);
+    let arith = compound_assign_arith_type(&types, &ca);
+    assert_eq!(arith, types.int_id, "unsigned char / int is done at int");
+    assert_eq!(
+        compound_assign_opcode(&types, AssignOp::DivAssign, arith),
+        Opcode::DivS
+    );
+
+    // Asking the *target's* type instead is the defect this replaced: it makes
+    // the same expression an unsigned divide, and `50 /= -5` stores 0.
+    assert_eq!(
+        compound_assign_opcode(&types, AssignOp::DivAssign, types.uchar_id),
+        Opcode::DivU
+    );
+}
+
+/// The congruent operators are decided the same way, even though their result
+/// is the same either width.
+#[test]
+fn test_compound_assign_add_also_computes_at_the_common_type() {
+    let types = TypeTable::new(&Target::host());
+    let ca = CompoundAssign::new(AssignOp::AddAssign, types.uchar_id, types.int_id);
+    assert_eq!(compound_assign_arith_type(&types, &ca), types.int_id);
+    assert_eq!(
+        compound_assign_opcode(&types, AssignOp::AddAssign, types.int_id),
+        Opcode::Add
+    );
+    // A floating target picks the floating form of the same operator.
+    let fca = CompoundAssign::new(AssignOp::AddAssign, types.float_id, types.int_id);
+    let farith = compound_assign_arith_type(&types, &fca);
+    assert_eq!(farith, types.float_id);
+    assert_eq!(
+        compound_assign_opcode(&types, AssignOp::AddAssign, farith),
+        Opcode::FAdd
+    );
+}
+
+/// A shift promotes its **left** operand and nothing else (C17 6.5.7p3), so
+/// the right operand's type has no say in the width it is done at.
+#[test]
+fn test_compound_assign_shift_takes_the_promoted_left_operand() {
+    let types = TypeTable::new(&Target::host());
+
+    let ca = CompoundAssign::new(AssignOp::ShrAssign, types.schar_id, types.longlong_id);
+    let arith = compound_assign_arith_type(&types, &ca);
+    assert_eq!(
+        arith, types.int_id,
+        "the promoted left operand decides, not the common type"
+    );
+    assert_ne!(
+        arith,
+        types.common_type(types.schar_id, types.longlong_id),
+        "the shift must not follow the usual arithmetic conversions"
+    );
+
+    // And the promotion is what makes the shift arithmetic: `unsigned char`
+    // promotes to `int`, so `u >>= 1` on 200 is 100 and not a logical shift of
+    // the byte.
+    let uca = CompoundAssign::new(AssignOp::ShrAssign, types.uchar_id, types.int_id);
+    let uarith = compound_assign_arith_type(&types, &uca);
+    assert_eq!(uarith, types.int_id);
+    assert_eq!(
+        compound_assign_opcode(&types, AssignOp::ShrAssign, uarith),
+        Opcode::Asr
+    );
+    assert_eq!(
+        compound_assign_opcode(&types, AssignOp::ShrAssign, types.uchar_id),
+        Opcode::Lsr,
+        "computing at the target's own width would shift the wrong way"
+    );
+}
+
+/// `_Bool` promotes to `int` like any narrow integer; what is special about it
+/// is the conversion *back*, which is a test against zero.
+#[test]
+fn test_compound_assign_bool_computes_at_int() {
+    let types = TypeTable::new(&Target::host());
+    let ca = CompoundAssign::new(AssignOp::SubAssign, types.bool_id, types.int_id);
+    assert_eq!(compound_assign_arith_type(&types, &ca), types.int_id);
+}
+
+/// Pointer arithmetic is the other exception: the addend arrives already
+/// scaled to a byte count and the addition happens at pointer width.
+#[test]
+fn test_compound_assign_pointer_arithmetic_is_done_at_pointer_width() {
+    let types = TypeTable::new(&Target::host());
+    let ca = CompoundAssign {
+        is_ptr_arith: true,
+        ..CompoundAssign::new(AssignOp::AddAssign, types.char_ptr_id, types.long_id)
+    };
+    assert_eq!(compound_assign_arith_type(&types, &ca), types.long_id);
+    assert_eq!(
+        compound_assign_opcode(&types, AssignOp::AddAssign, types.long_id),
+        Opcode::Add
+    );
+}
+
+/// `_Atomic unsigned char c; c /= -5;` divides at `int`, in the CAS loop --
+/// the same arithmetic the ordinary lowering does.
+#[test]
+fn test_atomic_compound_divide_computes_at_the_common_type() {
+    let (_ctx, module) = atomic_typed_module(AssignOp::DivAssign, |t| t.uchar_id, -5);
+
+    let div = first_op(&module, Opcode::DivS);
+    assert_eq!(
+        div.size, 32,
+        "the divide happens at the common type's width, not the object's"
+    );
+    assert_eq!(
+        count_op(&module, Opcode::DivU),
+        0,
+        "narrowing the right operand first would make this an unsigned divide"
+    );
+    assert_eq!(
+        count_op(&module, Opcode::AtomicCas),
+        1,
+        "divide has no native atomic form"
+    );
+}
+
+/// The same for a shift: promoted left operand, 32-bit arithmetic shift.
+#[test]
+fn test_atomic_compound_shift_promotes_its_left_operand() {
+    let (_ctx, module) = atomic_typed_module(AssignOp::ShrAssign, |t| t.uchar_id, 1);
+
+    let shift = first_op(&module, Opcode::Asr);
+    assert_eq!(shift.size, 32, "the left operand is promoted to int first");
+    assert_eq!(
+        count_op(&module, Opcode::Lsr),
+        0,
+        "an 8-bit logical shift would be the target's width, not the promoted one"
+    );
+    assert_eq!(count_op(&module, Opcode::AtomicCas), 1);
+}
+
+/// A narrow congruent operator keeps its native fetch-and-op.
+///
+/// The standard computes `c += 100` at `int` and converts back, but add is
+/// congruent modulo 2^8, so the hardware's 8-bit add agrees with it -- and a
+/// single instruction beats a retry loop.
+#[test]
+fn test_atomic_narrow_add_keeps_its_native_fetch_op() {
+    let (_ctx, module) = atomic_typed_module(AssignOp::AddAssign, |t| t.uchar_id, 100);
+
+    assert_eq!(count_op(&module, Opcode::AtomicFetchAdd), 1);
+    assert_eq!(
+        count_op(&module, Opcode::AtomicCas),
+        0,
+        "no retry loop needed"
+    );
+    assert_eq!(
+        first_op(&module, Opcode::AtomicFetchAdd).size,
+        8,
+        "the atomic operates at the object's own width"
+    );
+}
+
+/// `_Atomic _Bool` cannot: converting to `_Bool` is a test against zero, not
+/// the truncation congruence permits, so the value stored has to be computed
+/// before the exchange.
+#[test]
+fn test_atomic_bool_compound_assign_cannot_use_a_native_fetch_op() {
+    let (_ctx, module) = atomic_typed_module(AssignOp::SubAssign, |t| t.bool_id, 1);
+
+    assert_eq!(
+        count_op(&module, Opcode::AtomicFetchSub),
+        0,
+        "a native fetch-and-sub would store the raw 255"
+    );
+    assert_eq!(count_op(&module, Opcode::AtomicCas), 1);
+    assert!(
+        count_op(&module, Opcode::SetNe) >= 1,
+        "the CAS loop must convert the result to _Bool before storing it"
     );
 }
 

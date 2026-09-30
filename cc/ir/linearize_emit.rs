@@ -16,7 +16,7 @@ use crate::diag::{error, Position};
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, FpCompare, LibFn, MathErrno, UnaryOp};
 use crate::strings::StringId;
-use crate::types::{MemberInfo, TypeId, TypeKind};
+use crate::types::{MemberInfo, TypeId, TypeKind, TypeTable};
 
 /// A read-modify-write target whose address has been computed **once**.
 ///
@@ -36,6 +36,141 @@ pub(crate) struct RmwPlace {
     /// spelled to match `emit_bitfield_load`/`_store`, which are the only
     /// consumers.
     bitfield: Option<(usize, u32, u32, u32, TypeId)>,
+}
+
+/// Everything `E1 op= E2` needs beyond the two operand *values*: the operator
+/// and the types the arithmetic is decided by.
+///
+/// C17 6.5.16.2p3 makes `E1 op= E2` mean `E1 = E1 op E2` bar evaluating `E1`
+/// twice. So the arithmetic runs at the type the usual arithmetic conversions
+/// give the two operands -- `target_typ` and `value_typ` -- and only the
+/// *result* converts back to `target_typ`. Narrowing the right operand to the
+/// target first is a different computation: `_Atomic unsigned char c = 50;
+/// c /= -5;` becomes `50 / 251` and stores 0 where the standard stores
+/// `(unsigned char)(50 / -5)`, 246.
+///
+/// This exists because the ordinary and the `_Atomic` lowerings each had their
+/// own copy of these rules and the copies disagreed. Both now build one of
+/// these and hand it to [`Linearizer::compound_assign_value`].
+#[derive(Clone, Copy)]
+pub(crate) struct CompoundAssign {
+    /// The operator.
+    pub(crate) op: AssignOp,
+    /// `E1`'s type: what the left operand is read at and what the result
+    /// converts back to.
+    pub(crate) target_typ: TypeId,
+    /// `E2`'s type **as written**, before any conversion. For pointer
+    /// arithmetic it is the type of the already-scaled addend.
+    pub(crate) value_typ: TypeId,
+    /// `p += n`: the right operand arrives already scaled by the pointee size,
+    /// the addition happens at pointer width, and the result is a pointer
+    /// already -- so neither operand nor result is converted.
+    pub(crate) is_ptr_arith: bool,
+    /// Complement the arithmetic result *before* it converts back to
+    /// `target_typ`. This is `nand`, which has no operator spelling of its
+    /// own: `__atomic_fetch_nand` stores `~(old & value)`, and on a `_Bool`
+    /// object that complement has to happen before the conversion to 0 or 1,
+    /// not after it.
+    pub(crate) invert: bool,
+}
+
+impl CompoundAssign {
+    /// `E1 op= E2` with both operand types as written.
+    pub(crate) fn new(op: AssignOp, target_typ: TypeId, value_typ: TypeId) -> Self {
+        Self {
+            op,
+            target_typ,
+            value_typ,
+            is_ptr_arith: false,
+            invert: false,
+        }
+    }
+}
+
+/// The type the arithmetic of `ca` is performed at.
+///
+/// The usual arithmetic conversions (C17 6.3.1.8) on the two operands, with
+/// two exceptions:
+///
+/// * The shifts. C17 6.5.7p3 promotes each operand *separately* and gives the
+///   result the promoted **left** operand's type, so the right operand has no
+///   say: `_Atomic signed char s = -8; s >>= 1;` shifts -8 as an `int` and
+///   stores -4, where computing at the target's width would shift the byte
+///   pattern and store 124.
+/// * Pointer arithmetic, whose addend the caller has already scaled to a
+///   byte count; the addition happens at pointer width.
+pub(crate) fn compound_assign_arith_type(types: &TypeTable, ca: &CompoundAssign) -> TypeId {
+    if ca.is_ptr_arith {
+        types.long_id
+    } else if matches!(ca.op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
+        types.integer_promote(ca.target_typ)
+    } else {
+        types.common_type(ca.target_typ, ca.value_typ)
+    }
+}
+
+/// The arithmetic opcode a compound assignment operator applies at `typ`.
+///
+/// `typ` is the type the operation is *performed* at -- the answer of
+/// [`compound_assign_arith_type`] -- because that is what decides between the
+/// integer and floating forms and between the signed and unsigned ones. Asking
+/// the target's type instead makes `unsigned char x; x /= -5;` an unsigned
+/// divide of a value the standard computes as a signed `int`.
+pub(crate) fn compound_assign_opcode(types: &TypeTable, op: AssignOp, typ: TypeId) -> Opcode {
+    let is_float = types.is_float(typ);
+    let is_unsigned = types.is_unsigned(typ);
+    match op {
+        AssignOp::Assign => unreachable!("plain assignment has no arithmetic opcode"),
+        AssignOp::AddAssign => {
+            if is_float {
+                Opcode::FAdd
+            } else {
+                Opcode::Add
+            }
+        }
+        AssignOp::SubAssign => {
+            if is_float {
+                Opcode::FSub
+            } else {
+                Opcode::Sub
+            }
+        }
+        AssignOp::MulAssign => {
+            if is_float {
+                Opcode::FMul
+            } else {
+                Opcode::Mul
+            }
+        }
+        AssignOp::DivAssign => {
+            if is_float {
+                Opcode::FDiv
+            } else if is_unsigned {
+                Opcode::DivU
+            } else {
+                Opcode::DivS
+            }
+        }
+        // Modulo not supported for floats.
+        AssignOp::ModAssign => {
+            if is_unsigned {
+                Opcode::ModU
+            } else {
+                Opcode::ModS
+            }
+        }
+        AssignOp::AndAssign => Opcode::And,
+        AssignOp::OrAssign => Opcode::Or,
+        AssignOp::XorAssign => Opcode::Xor,
+        AssignOp::ShlAssign => Opcode::Shl,
+        AssignOp::ShrAssign => {
+            if is_unsigned {
+                Opcode::Lsr
+            } else {
+                Opcode::Asr
+            }
+        }
+    }
 }
 
 /// The per-half opcodes a complex operation uses, chosen once from the base
@@ -2655,6 +2790,81 @@ impl<'a> super::linearize::Linearizer<'a> {
         None
     }
 
+    /// The value `E1 op= E2` stores, given `E1`'s current value and `E2`'s.
+    ///
+    /// The whole of C17 6.5.16.2p3's arithmetic lives here: choose the type to
+    /// compute at, choose the opcode for it, bring both operands to it, apply
+    /// the operator, and convert the result back to the target. Callers supply
+    /// the two values and nothing else, which is what keeps the ordinary and
+    /// the `_Atomic` lowerings computing the same thing.
+    ///
+    /// `rhs` arrives **unconverted**, at `ca.value_typ`. Converting it to the
+    /// target first is not an optimization of this: it is a different
+    /// computation, and it was the bug (see [`CompoundAssign`]).
+    ///
+    /// The value this returns is also the value of the assignment expression
+    /// (C17 6.5.16p3: the left operand's value *after* the assignment), which
+    /// is why the conversion back is part of the helper rather than of the
+    /// store: `_Atomic _Bool b = 0; (b -= 1)` has to yield the 1 it stored,
+    /// not the 255 the subtraction produced.
+    pub(crate) fn compound_assign_value(
+        &mut self,
+        ca: &CompoundAssign,
+        lhs: PseudoId,
+        rhs: PseudoId,
+    ) -> PseudoId {
+        let arith_type = compound_assign_arith_type(self.types, ca);
+        let arith_size = self.types.size_bits(arith_type);
+        let opcode = compound_assign_opcode(self.types, ca.op, arith_type);
+
+        // Both operands into the arithmetic type. The left one is the object's
+        // current value, read at the target's type; the right one is whatever
+        // it was written as.
+        let lhs = if ca.is_ptr_arith {
+            lhs
+        } else {
+            self.emit_convert(lhs, ca.target_typ, arith_type)
+        };
+        let rhs = if ca.is_ptr_arith {
+            rhs
+        } else if matches!(ca.op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
+            // The shift count is promoted on its own and is not brought to the
+            // left operand's type (C17 6.5.7p3).
+            self.emit_convert(rhs, ca.value_typ, self.types.integer_promote(ca.value_typ))
+        } else {
+            self.emit_convert(rhs, ca.value_typ, arith_type)
+        };
+
+        let result = self.alloc_reg_pseudo();
+        self.emit(Instruction::binop(
+            opcode, result, lhs, rhs, arith_type, arith_size,
+        ));
+
+        // `nand` is `and` with the result complemented, and the complement
+        // belongs on this side of the conversion below.
+        let result = if ca.invert {
+            let inverted = self.alloc_reg_pseudo();
+            self.emit(Instruction::unop(
+                Opcode::Not,
+                inverted,
+                result,
+                arith_type,
+                arith_size,
+            ));
+            inverted
+        } else {
+            result
+        };
+
+        // And the result back, which is the conversion that makes `(x /= y)`
+        // yield what `x` now holds. Pointer arithmetic is already a pointer.
+        if ca.is_ptr_arith {
+            result
+        } else {
+            self.emit_convert(result, arith_type, ca.target_typ)
+        }
+    }
+
     pub(crate) fn emit_assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) -> PseudoId {
         let target_typ = self.expr_type(target);
         let value_typ = self.expr_type(value);
@@ -2866,8 +3076,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             ));
             scaled
         } else if bool_rhs.is_some() || op != AssignOp::Assign {
-            // A compound assignment leaves its right operand alone here. It is
-            // converted to the *common* type below, not down to the target's:
+            // A compound assignment leaves its right operand alone here. It
+            // is converted to the *common* type by `compound_assign_value`,
+            // not down to the target's:
             // narrowing `-5` to `unsigned char` first made `x /= y` divide
             // 50 by 251 and store 0, where C17 6.5.16.2p3 computes `50 / -5`
             // at `int` and stores `(unsigned char)-10`.
@@ -2896,109 +3107,14 @@ impl<'a> super::linearize::Linearizer<'a> {
                     Some(p) => self.load_rmw_place(p, target_typ),
                     None => self.linearize_expr(target),
                 };
-                let result = self.alloc_reg_pseudo();
-
-                // `E1 op= E2` is `E1 = E1 op E2` (C17 6.5.16.2p3), so the
-                // operation runs at the operands' common type after the
-                // integer promotions -- not at the target's type, which is
-                // only what the *result* converts back to.
-                //
-                // The shifts are the exception: 6.5.7p3 gives the result the
-                // promoted *left* operand's type, and promotes the right one
-                // on its own.
-                let arith_type = if is_ptr_arith {
-                    // Pointer arithmetic already scaled the index; the add
-                    // happens at pointer width.
-                    self.types.long_id
-                } else if matches!(op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
-                    self.types.integer_promote(target_typ)
-                } else {
-                    self.types.common_type(target_typ, value_typ)
+                // One helper owns the whole of C17 6.5.16.2p3's arithmetic,
+                // shared with the `_Atomic` lowering, which used to carry its
+                // own copy of these rules and disagree with this one.
+                let ca = CompoundAssign {
+                    is_ptr_arith,
+                    ..CompoundAssign::new(op, target_typ, value_typ)
                 };
-
-                let is_float = self.types.is_float(arith_type);
-                let is_unsigned = self.types.is_unsigned(arith_type);
-                let opcode = match op {
-                    AssignOp::AddAssign => {
-                        if is_float {
-                            Opcode::FAdd
-                        } else {
-                            Opcode::Add
-                        }
-                    }
-                    AssignOp::SubAssign => {
-                        if is_float {
-                            Opcode::FSub
-                        } else {
-                            Opcode::Sub
-                        }
-                    }
-                    AssignOp::MulAssign => {
-                        if is_float {
-                            Opcode::FMul
-                        } else {
-                            Opcode::Mul
-                        }
-                    }
-                    AssignOp::DivAssign => {
-                        if is_float {
-                            Opcode::FDiv
-                        } else if is_unsigned {
-                            Opcode::DivU
-                        } else {
-                            Opcode::DivS
-                        }
-                    }
-                    AssignOp::ModAssign => {
-                        // Modulo not supported for floats
-                        if is_unsigned {
-                            Opcode::ModU
-                        } else {
-                            Opcode::ModS
-                        }
-                    }
-                    AssignOp::AndAssign => Opcode::And,
-                    AssignOp::OrAssign => Opcode::Or,
-                    AssignOp::XorAssign => Opcode::Xor,
-                    AssignOp::ShlAssign => Opcode::Shl,
-                    AssignOp::ShrAssign => {
-                        if is_unsigned {
-                            Opcode::Lsr
-                        } else {
-                            Opcode::Asr
-                        }
-                    }
-                    AssignOp::Assign => unreachable!(),
-                };
-
-                let arith_size = self.types.size_bits(arith_type);
-                // Both operands into the arithmetic type. The left one is the
-                // object's current value, read at the target's type; the right
-                // one is whatever it was written as.
-                let lhs = if is_ptr_arith {
-                    lhs
-                } else {
-                    self.emit_convert(lhs, target_typ, arith_type)
-                };
-                let rhs = if is_ptr_arith {
-                    rhs
-                } else if matches!(op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
-                    // The shift count is promoted on its own and is not
-                    // brought to the left operand's type.
-                    self.emit_convert(rhs, value_typ, self.types.integer_promote(value_typ))
-                } else {
-                    self.emit_convert(rhs, value_typ, arith_type)
-                };
-                self.emit(Instruction::binop(
-                    opcode, result, lhs, rhs, arith_type, arith_size,
-                ));
-                // And the result back, which is the conversion that makes
-                // `(x /= y)` yield what `x` now holds.
-                if is_ptr_arith {
-                    result
-                } else {
-                    self.emit_convert(result, arith_type, target_typ)
-                }
+                self.compound_assign_value(&ca, lhs, rhs)
             }
         };
 

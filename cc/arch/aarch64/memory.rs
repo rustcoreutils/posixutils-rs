@@ -601,26 +601,16 @@ impl Aarch64CodeGen {
             return;
         }
 
-        // Widen 32-bit stores at offset 0 to 64-bit to prevent stale
-        // upper bits when a 32-bit result is stored into a 64-bit
-        // local (e.g., int-to-long, int-to-pointer assignments).
-        // Only widen for known local variables (in sym_type_sizes).
-        // Do NOT widen stores to globals/statics (not in sym_type_sizes)
-        // or stores through pointers — widening could clobber adjacent data.
-        // Exception: struct/union fields at offset 0 must use exact
-        // size to avoid clobbering the adjacent field at offset 4.
+        // Widen a 32-bit store at offset 0 to 64 bits, so a narrow value going
+        // into a wider slot leaves no stale upper bits behind it (an
+        // int-to-long or int-to-pointer assignment). Only where the slot holds
+        // one scalar: see `SymSlot`. Only for a known local, too -- a global or
+        // a store through a pointer keeps its exact width, since nothing here
+        // knows what adjoins it.
         let store_size = if mem_size == 32 && insn.offset == 0 {
-            if let Some(&sym_bits) = self.sym_type_sizes.get(&addr) {
-                // Known local variable — safe to widen if scalar and > 32 bits
-                if sym_bits > 64 {
-                    OperandSize::from_bits(mem_size) // struct field: exact size
-                } else if sym_bits > 32 {
-                    OperandSize::B64 // scalar/pointer local: safe to widen
-                } else {
-                    OperandSize::from_bits(mem_size)
-                }
-            } else {
-                OperandSize::from_bits(mem_size) // global/static/pointer: exact size
+            match self.sym_slots.get(&addr) {
+                Some(slot) if slot.widenable() && slot.bits > 32 => OperandSize::B64,
+                _ => OperandSize::from_bits(mem_size),
             }
         } else {
             OperandSize::from_bits(mem_size)

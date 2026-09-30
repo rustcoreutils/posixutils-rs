@@ -51,16 +51,7 @@ impl Aarch64CodeGen {
         self.locations = alloc.allocate(func, types);
         self.pseudos = crate::arch::codegen::PseudoTable::new(&func.pseudos);
 
-        // Build sym type size map for emit_store to distinguish struct fields from scalars
-        self.sym_type_sizes.clear();
-        for pseudo in &func.pseudos {
-            // By identity: a global whose name collides with a parameter's
-            // would otherwise be recorded with the parameter's type size.
-            if let Some(local_var) = func.local_of(pseudo.id) {
-                self.sym_type_sizes
-                    .insert(pseudo.id, types.size_bits(local_var.typ));
-            }
-        }
+        self.sym_slots = crate::arch::codegen::sym_slots(func, types);
 
         let stack_size = alloc.stack_size();
         self.frame_base = alloc.frame_base();

@@ -1222,6 +1222,56 @@ pub fn check_tls_reached_only_by_address(
     }
 }
 
+/// What a store lowering needs to know about a local's stack slot.
+///
+/// Both back ends widen a narrow store at offset 0 of a local so that a value
+/// going into a wider slot leaves no stale upper bits behind it. That is only
+/// sound where the slot holds a single scalar: an aggregate or a complex has
+/// another member at offset 4 or 8, which the widened store would write over.
+///
+/// The size alone cannot answer it -- a `long` and a `struct { int x, y; }`
+/// are both sixty-four bits -- and asking for *more* than sixty-four spares
+/// only the aggregates too large to be mistaken for a scalar in the first
+/// place. Both back ends had that test and both got an eight-byte aggregate
+/// wrong, so the question is asked once, here.
+pub struct SymSlot {
+    /// Width of the declared type, in bits.
+    pub bits: u32,
+    /// The slot holds a single scalar value, so anything above a narrow store
+    /// at offset 0 is stale bits of that same object.
+    pub one_scalar: bool,
+}
+
+impl SymSlot {
+    /// Whether a 32-bit store at offset 0 of this slot may be widened to 64.
+    pub fn widenable(&self) -> bool {
+        self.one_scalar && self.bits <= 64
+    }
+}
+
+/// Record, for each of `func`'s locals, what its stack slot holds.
+pub fn sym_slots(
+    func: &crate::ir::Function,
+    types: &crate::types::TypeTable,
+) -> std::collections::HashMap<crate::ir::PseudoId, SymSlot> {
+    let mut slots = std::collections::HashMap::new();
+    for pseudo in &func.pseudos {
+        // By identity: a global whose name collides with a parameter's would
+        // otherwise be recorded with the parameter's type.
+        if let Some(local_var) = func.local_of(pseudo.id) {
+            let typ = local_var.typ;
+            slots.insert(
+                pseudo.id,
+                SymSlot {
+                    bits: types.size_bits(typ),
+                    one_scalar: types.is_scalar(typ) && !types.is_complex(typ),
+                },
+            );
+        }
+    }
+    slots
+}
+
 /// The current function's pseudos, looked up by id.
 ///
 /// A pseudo's id is not its position in `Function::pseudos`, so a lookup

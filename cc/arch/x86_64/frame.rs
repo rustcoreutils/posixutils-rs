@@ -241,23 +241,7 @@ impl X86_64CodeGen {
         self.int128_pseudos = alloc.int128_pseudos().clone();
         self.pseudos = crate::arch::codegen::PseudoTable::new(&func.pseudos);
 
-        // What `emit_store` needs to decide whether a narrow store at offset 0
-        // may be widened over the rest of the slot.
-        self.sym_slots.clear();
-        for pseudo in &func.pseudos {
-            // By identity: a global whose name collides with a parameter's
-            // would otherwise be recorded with the parameter's type.
-            if let Some(local_var) = func.local_of(pseudo.id) {
-                let typ = local_var.typ;
-                self.sym_slots.insert(
-                    pseudo.id,
-                    crate::arch::x86_64::codegen::SymSlot {
-                        bits: types.size_bits(typ),
-                        one_scalar: types.is_scalar(typ) && !types.is_complex(typ),
-                    },
-                );
-            }
-        }
+        self.sym_slots = crate::arch::codegen::sym_slots(func, types);
 
         let stack_size = alloc.stack_size();
         self.callee_saved_regs = alloc.callee_saved_used().to_vec();

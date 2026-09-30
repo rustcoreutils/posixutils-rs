@@ -942,8 +942,10 @@ impl X86_64CodeGen {
                     // what it did before.
                     let store_size = if mem_size == 32 && insn.offset == 0 {
                         match self.sym_slots.get(&addr) {
-                            Some(slot) if slot.one_scalar && slot.bits <= 64 => OperandSize::B64,
+                            Some(slot) if slot.widenable() => OperandSize::B64,
                             Some(_) => op_size,
+                            // A slot with no record keeps the widening here,
+                            // which is what this back end did before.
                             None => OperandSize::B64,
                         }
                     } else {

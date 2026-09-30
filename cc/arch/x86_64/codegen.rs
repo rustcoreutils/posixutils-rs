@@ -25,20 +25,6 @@ use std::collections::{HashMap, HashSet};
 // x86-64 Code Generator
 
 /// x86-64 code generator
-/// What the store lowering needs to know about a local's stack slot.
-///
-/// The size alone cannot answer it: a `long` and a `struct { int x, y; }` are
-/// both sixty-four bits, and only one of them may have a narrow store at
-/// offset 0 widened over the rest of the slot.
-pub(super) struct SymSlot {
-    /// Width of the declared type, in bits.
-    pub(super) bits: u32,
-    /// The slot holds a single scalar value, so anything above a narrow store
-    /// at offset 0 is stale bits of that same object. False for an aggregate
-    /// or a complex, whose other member lives where a widened store reaches.
-    pub(super) one_scalar: bool,
-}
-
 pub struct X86_64CodeGen {
     /// Common code generation infrastructure
     pub(super) base: CodeGenBase<X86Inst>,
@@ -92,7 +78,7 @@ pub struct X86_64CodeGen {
     /// BTreeMap for reproducible order, as `ld_constants`.
     pub(super) quad_constants: std::collections::BTreeMap<u128, [u8; 16]>,
     /// Sym pseudo ID → what its stack slot holds, for [`SymSlot`].
-    pub(super) sym_slots: HashMap<PseudoId, SymSlot>,
+    pub(super) sym_slots: HashMap<PseudoId, crate::arch::codegen::SymSlot>,
     /// How this function's locals are addressed.
     pub(super) frame_base: FrameBase,
     /// Maximum local alignment (for andq in prologue)

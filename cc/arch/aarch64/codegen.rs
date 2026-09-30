@@ -481,7 +481,7 @@ impl Aarch64CodeGen {
         };
 
         // Generate comparisons for each case
-        for (lo, hi, target_bb) in insn.switch_cases.clone() {
+        for (lo, hi, target_bb) in insn.extra().switch_cases.clone() {
             let target = Label::block(&self.base.current_fn, target_bb.0);
             if lo == hi {
                 cmp_const(self, scratch0, lo);
@@ -529,7 +529,7 @@ impl Aarch64CodeGen {
             });
         }
 
-        if let Some(default_bb) = insn.switch_default {
+        if let Some(default_bb) = insn.extra().switch_default {
             self.push_lir(Aarch64Inst::B {
                 target: Label::block(&self.base.current_fn, default_bb.0),
             });
@@ -1072,10 +1072,10 @@ impl Aarch64CodeGen {
 
     fn emit_call(&mut self, insn: &Instruction, types: &TypeTable) {
         // Get function name (or placeholder for indirect calls)
-        let func_name = if insn.indirect_target.is_some() {
+        let func_name = if insn.extra().indirect_target.is_some() {
             "<indirect>".to_string()
         } else {
-            match &insn.func_name {
+            match &insn.extra().func_name {
                 Some(n) => n.clone(),
                 None => return,
             }
@@ -1085,8 +1085,8 @@ impl Aarch64CodeGen {
         let args_start = self.setup_sret_arg(insn);
 
         // Determine if this is a Darwin variadic call
-        let is_darwin_variadic =
-            self.base.target.os == crate::target::Os::MacOS && insn.variadic_arg_start.is_some();
+        let is_darwin_variadic = self.base.target.os == crate::target::Os::MacOS
+            && insn.extra().variadic_arg_start.is_some();
 
         // Set up arguments and get stack cleanup count
         let stack_args = if is_darwin_variadic {
@@ -1100,7 +1100,7 @@ impl Aarch64CodeGen {
         // address-materialization scratch -- the stacked-argument copy
         // shuttles through it -- so a target parked there before the setup was
         // overwritten and the call branched into the argument data.
-        if let Some(func_addr) = insn.indirect_target {
+        if let Some(func_addr) = insn.extra().indirect_target {
             self.emit_move(func_addr, Reg::X16, 64);
         }
 

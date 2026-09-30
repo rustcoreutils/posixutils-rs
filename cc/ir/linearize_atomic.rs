@@ -182,7 +182,7 @@ impl Linearizer<'_> {
         insn.src = srcs;
         insn.typ = Some(lv.elem_typ);
         insn.size = lv.size_bits;
-        insn.memory_order = ORDER;
+        insn.extra_mut().memory_order = ORDER;
         self.emit(insn);
 
         target
@@ -343,7 +343,7 @@ impl Linearizer<'_> {
         cas.src = vec![lv.addr, exp_addr, new, order];
         cas.typ = Some(self.types.bool_id);
         cas.size = bits;
-        cas.memory_order = ORDER;
+        cas.extra_mut().memory_order = ORDER;
         self.emit(cas);
 
         let cas_bb = self.current_or_unreachable_bb();

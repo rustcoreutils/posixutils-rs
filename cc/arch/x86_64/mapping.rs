@@ -783,7 +783,7 @@ mod tests {
             let calls: Vec<&str> = insns
                 .iter()
                 .filter(|i| i.op == Opcode::Call)
-                .filter_map(|i| i.func_name.as_deref())
+                .filter_map(|i| i.extra().func_name.as_deref())
                 .collect();
             assert_eq!(
                 calls,
@@ -860,7 +860,7 @@ mod tests {
             let calls: Vec<&str> = insns
                 .iter()
                 .filter(|i| i.op == Opcode::Call)
-                .filter_map(|i| i.func_name.as_deref())
+                .filter_map(|i| i.extra().func_name.as_deref())
                 .collect();
             assert_eq!(
                 calls,

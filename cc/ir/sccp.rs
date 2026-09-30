@@ -194,7 +194,7 @@ impl Solver {
         // value does the most damage.
         for bb in &func.blocks {
             for insn in &bb.insns {
-                if let Some(ref asm) = insn.asm_data {
+                if let Some(ref asm) = insn.extra().asm_data {
                     for out in &asm.outputs {
                         self.unfoldable.insert(out.pseudo);
                         let idx = out.pseudo.0 as usize;
@@ -935,8 +935,8 @@ mod tests {
     fn sccp_switch_matches_a_gnu_range() {
         let mut insn = Instruction::new(Opcode::Switch);
         insn.size = 32;
-        insn.switch_cases = vec![(30, 50, BasicBlockId(7))];
-        insn.switch_default = Some(BasicBlockId(9));
+        insn.extra_mut().switch_cases = vec![(30, 50, BasicBlockId(7))];
+        insn.extra_mut().switch_default = Some(BasicBlockId(9));
         assert_eq!(switch_taken(&insn, 40), Some(BasicBlockId(7)));
         assert_eq!(switch_taken(&insn, 51), Some(BasicBlockId(9)));
         assert_eq!(switch_taken(&insn, 29), Some(BasicBlockId(9)));
@@ -950,16 +950,16 @@ mod tests {
         let mut insn = Instruction::new(Opcode::Switch);
         insn.size = 32;
         insn.typ = Some(types.int_id);
-        insn.switch_cases = vec![(5, 5, BasicBlockId(7))];
-        insn.switch_default = Some(BasicBlockId(9));
+        insn.extra_mut().switch_cases = vec![(5, 5, BasicBlockId(7))];
+        insn.extra_mut().switch_default = Some(BasicBlockId(9));
         assert_eq!(switch_taken(&insn, 5), None);
     }
 
     fn switch_case_for(case: i64, selector: i128) -> Option<BasicBlockId> {
         let mut insn = Instruction::new(Opcode::Switch);
         insn.size = 32;
-        insn.switch_cases = vec![(case, case, BasicBlockId(7))];
-        insn.switch_default = Some(BasicBlockId(9));
+        insn.extra_mut().switch_cases = vec![(case, case, BasicBlockId(7))];
+        insn.extra_mut().switch_default = Some(BasicBlockId(9));
         switch_taken(&insn, selector)
     }
 
@@ -978,7 +978,7 @@ mod tests {
         let mut b0 = BasicBlock::new(entry);
         b0.add_insn(Instruction::new(Opcode::Entry));
         let mut asm = Instruction::new(Opcode::Asm);
-        asm.asm_data = Some(Box::new(AsmData {
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
             template: String::new(),
             outputs: Vec::new(),
             inputs: Vec::new(),

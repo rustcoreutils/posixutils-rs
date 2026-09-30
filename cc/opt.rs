@@ -154,7 +154,7 @@ fn forwards_caller_arguments(func: &Function) -> bool {
     func.blocks
         .iter()
         .flat_map(|b| &b.insns)
-        .any(|i| i.ends_with_va_arg_pack || i.op == crate::ir::Opcode::VaArgPackLen)
+        .any(|i| i.extra().ends_with_va_arg_pack || i.op == crate::ir::Opcode::VaArgPackLen)
 }
 
 /// Keep a forwarding function's body out of the object file.

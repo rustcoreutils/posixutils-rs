@@ -316,7 +316,7 @@ pub(crate) fn build_f16_convert_call(
         dst_type,
         dst_size,
     );
-    call_insn.abi_info = Some(call_abi_info);
+    call_insn.extra_mut().abi_info = Some(call_abi_info);
     call_insn.pos = insn.pos;
     call_insn
 }
@@ -366,7 +366,7 @@ fn build_f16_extend_call(
         float_type,
         float_size,
     );
-    call_insn.abi_info = Some(call_abi_info);
+    call_insn.extra_mut().abi_info = Some(call_abi_info);
     call_insn.pos = pos;
     call_insn
 }
@@ -409,7 +409,7 @@ fn build_f16_truncate_call(
         float16_type,
         f16_size,
     );
-    call_insn.abi_info = Some(call_abi_info);
+    call_insn.extra_mut().abi_info = Some(call_abi_info);
     call_insn.pos = pos;
     call_insn
 }
@@ -2179,7 +2179,7 @@ pub(crate) mod test_helpers {
             MappedInsn::Replace(insns) => {
                 assert_eq!(insns.len(), 1, "expected single Call replacement");
                 assert_eq!(insns[0].op, Opcode::Call);
-                assert_eq!(insns[0].func_name.as_deref(), Some(expected_name));
+                assert_eq!(insns[0].extra().func_name.as_deref(), Some(expected_name));
             }
             MappedInsn::Legal => {
                 panic!("expected Replace with LibCall to {expected_name}, got Legal")
@@ -2203,7 +2203,7 @@ pub(crate) mod test_helpers {
             MappedInsn::Replace(insns) => {
                 assert_eq!(insns.len(), 2, "expected Call + compare");
                 assert_eq!(insns[0].op, Opcode::Call);
-                assert_eq!(insns[0].func_name.as_deref(), Some(expected_name));
+                assert_eq!(insns[0].extra().func_name.as_deref(), Some(expected_name));
                 assert_eq!(insns[1].op, expected_cmp_op);
             }
             MappedInsn::Legal => {
@@ -2288,10 +2288,10 @@ mod tests {
         call_library_fallbacks(&mut module, &types, &a64);
         let call = &module.functions[0].blocks[0].insns[1];
         assert_eq!(call.op, Opcode::Call);
-        assert_eq!(call.func_name.as_deref(), Some("sqrtl"));
+        assert_eq!(call.extra().func_name.as_deref(), Some("sqrtl"));
         assert_eq!(call.target, Some(PseudoId(1)));
         assert_eq!(call.src, vec![PseudoId(0)]);
-        assert!(call.abi_info.is_some());
+        assert!(call.extra().abi_info.is_some());
 
         let mut module = libm_module(&types, Opcode::Sqrt, types.double_id, "sqrt");
         call_library_fallbacks(&mut module, &types, &a64);
@@ -2310,7 +2310,7 @@ mod tests {
         call_library_fallbacks(&mut module, &types, &x86);
         let call = &module.functions[0].blocks[0].insns[1];
         assert_eq!(call.op, Opcode::Call);
-        assert_eq!(call.func_name.as_deref(), Some("roundf"));
+        assert_eq!(call.extra().func_name.as_deref(), Some("roundf"));
         let floor = Opcode::RoundToIntegral(Floor);
         let mut module = libm_module(&types, floor, types.double_id, "floor");
         call_library_fallbacks(&mut module, &types, &x86);
@@ -2322,9 +2322,9 @@ mod tests {
         call_library_fallbacks(&mut module, &types, &x86);
         let call = &module.functions[0].blocks[0].insns[1];
         assert_eq!(call.op, Opcode::Call);
-        assert_eq!(call.func_name.as_deref(), Some("fma"));
+        assert_eq!(call.extra().func_name.as_deref(), Some("fma"));
         assert_eq!(call.src.len(), 3);
-        assert_eq!(call.arg_types, vec![types.double_id; 3]);
+        assert_eq!(call.extra().arg_types, vec![types.double_id; 3]);
     }
 
     /// A module of one function comparing two `typ` values with `op`.
@@ -2361,7 +2361,7 @@ mod tests {
         run_mapping(&mut module, &types, &a64);
         assert_eq!(neg(&module).op, Opcode::FNeg);
         call_library_fallbacks(&mut module, &types, &a64);
-        assert_eq!(neg(&module).func_name.as_deref(), Some("__negtf2"));
+        assert_eq!(neg(&module).extra().func_name.as_deref(), Some("__negtf2"));
 
         // A comparison is the call and a test of its answer against zero.
         let mut module = fcmp_module(&types, Opcode::FCmpONe, types.longdouble_id);
@@ -2370,7 +2370,7 @@ mod tests {
         call_library_fallbacks(&mut module, &types, &a64);
         let insns = &module.functions[0].blocks[0].insns;
         assert_eq!(insns.len(), 4);
-        assert_eq!(insns[1].func_name.as_deref(), Some("__netf2"));
+        assert_eq!(insns[1].extra().func_name.as_deref(), Some("__netf2"));
         assert_eq!(insns[2].op, Opcode::SetNe);
         assert_eq!(insns[2].target, Some(PseudoId(2)));
 
@@ -2379,7 +2379,7 @@ mod tests {
         let types = TypeTable::new(&x86);
         let mut module = libm_module(&types, Opcode::FNeg, types.float128_id, "");
         call_library_fallbacks(&mut module, &types, &x86);
-        assert_eq!(neg(&module).func_name.as_deref(), Some("__negtf2"));
+        assert_eq!(neg(&module).extra().func_name.as_deref(), Some("__negtf2"));
         let mut module = libm_module(&types, Opcode::FNeg, types.longdouble_id, "");
         call_library_fallbacks(&mut module, &types, &x86);
         assert_eq!(neg(&module).op, Opcode::FNeg);
@@ -2509,10 +2509,13 @@ mod tests {
         let block = &module.functions[0].blocks[0];
         assert_eq!(block.insns.len(), 3); // Entry, Call, Ret
         assert_eq!(block.insns[1].op, Opcode::Call);
-        assert_eq!(block.insns[1].func_name.as_deref(), Some("__divti3"));
+        assert_eq!(
+            block.insns[1].extra().func_name.as_deref(),
+            Some("__divti3")
+        );
         assert_eq!(block.insns[1].target, Some(PseudoId(2)));
         assert_eq!(block.insns[1].src, vec![PseudoId(0), PseudoId(1)]);
-        assert!(block.insns[1].abi_info.is_some());
+        assert!(block.insns[1].extra().abi_info.is_some());
     }
 
     // Integration: int128↔float conversion transformation
@@ -2547,8 +2550,11 @@ mod tests {
         let block = &module.functions[0].blocks[0];
         assert_eq!(block.insns.len(), 3);
         assert_eq!(block.insns[1].op, Opcode::Call);
-        assert_eq!(block.insns[1].func_name.as_deref(), Some("__floattidf"));
-        assert!(block.insns[1].abi_info.is_some());
+        assert_eq!(
+            block.insns[1].extra().func_name.as_deref(),
+            Some("__floattidf")
+        );
+        assert!(block.insns[1].extra().abi_info.is_some());
     }
 
     // Complex mul/div rtlib name tests

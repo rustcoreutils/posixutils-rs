@@ -128,7 +128,7 @@ impl ConstMap {
         // the one that miscompiles.
         for bb in &func.blocks {
             for insn in &bb.insns {
-                let Some(ref asm) = insn.asm_data else {
+                let Some(ref asm) = insn.extra().asm_data else {
                     continue;
                 };
                 for out in &asm.outputs {

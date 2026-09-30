@@ -82,7 +82,7 @@ mod tests {
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.add_insn(Instruction::new(Opcode::Entry));
         let mut asm = Instruction::new(Opcode::Asm);
-        asm.asm_data = Some(Box::new(AsmData {
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
             template: String::new(),
             outputs: vec![AsmConstraint {
                 pseudo: PseudoId(0),

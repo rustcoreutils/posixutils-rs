@@ -470,7 +470,7 @@ pub(crate) mod fixture {
             let (srcs, arg_types): (Vec<_>, Vec<_>) = args.iter().copied().unzip();
             let size = self.types.size_bits(ret);
             let mut call = Instruction::call(Some(t), name, srcs, arg_types, ret, size);
-            call.known = Some(known);
+            call.extra_mut().known = Some(known);
             self.push(call);
             t
         }

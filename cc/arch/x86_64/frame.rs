@@ -1106,7 +1106,7 @@ impl X86_64CodeGen {
                 .map(|t| types.size_bits(t).max(32))
                 .unwrap_or(insn.size.max(32));
 
-            let one_sse_ret = insn.abi_info.as_ref().is_some_and(|ai| {
+            let one_sse_ret = insn.extra().abi_info.as_ref().is_some_and(|ai| {
                 matches!(&ai.ret, ArgClass::Direct { classes, .. }
                          if classes.len() == 1 && classes[0] == RegClass::Sse)
             });

@@ -46,7 +46,7 @@ pub(super) fn fold(known: LibFn, insn: &Instruction, facts: &Facts) -> Option<Fo
     // The halves are the last four arguments: a hidden pointer to the
     // result, where the ABI returns it through one, comes first.
     let first = insn.src.len().checked_sub(4)?;
-    let typ = *insn.arg_types.last()?;
+    let typ = *insn.extra().arg_types.last()?;
     let fmt = facts.types.fp_format(typ)?;
     let routine = fmt.complex_routine_format();
     if routine.format() != fmt {
@@ -73,6 +73,7 @@ pub(super) fn fold(known: LibFn, insn: &Instruction, facts: &Facts) -> Option<Fo
 /// that pointer, stays defined.
 pub(super) fn materialize(b: &mut Builder, call: &Instruction, (re, im): (FloatVal, FloatVal)) {
     let typ = *call
+        .extra()
         .arg_types
         .last()
         .expect("a complex routine takes halves");
@@ -136,7 +137,7 @@ mod tests {
             complex,
             size,
         );
-        insn.known = Some(known);
+        insn.extra_mut().known = Some(known);
         fx.push(insn);
         ret
     }
@@ -212,8 +213,8 @@ mod tests {
             align: 16,
             size_bytes: 16,
         };
-        insn.abi_info = Some(Box::new(CallAbiInfo::new(vec![], indirect)));
-        insn.known = Some(LibFn::MulComplex);
+        insn.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(vec![], indirect)));
+        insn.extra_mut().known = Some(LibFn::MulComplex);
         fx.push(insn);
         let insns = run_for(&mut fx, &linux(Arch::X86_64));
         assert_eq!(stored(&fx, &insns, slot), (vec![(0, 5.0), (8, 5.0)], false));

@@ -175,7 +175,7 @@ pub(crate) fn switch_taken(insn: &Instruction, v: i128) -> Option<BasicBlockId> 
     let mask = |x: i128| -> u128 { (x as u128) & (u128::MAX >> (128 - w)) };
 
     let sel = mask(v);
-    for (lo, hi, target) in &insn.switch_cases {
+    for (lo, hi, target) in &insn.extra().switch_cases {
         let low = mask(*lo as i128);
         let matched = if lo == hi {
             sel == low
@@ -187,5 +187,5 @@ pub(crate) fn switch_taken(insn: &Instruction, v: i128) -> Option<BasicBlockId> 
             return Some(*target);
         }
     }
-    insn.switch_default
+    insn.extra().switch_default
 }

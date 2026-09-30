@@ -112,7 +112,7 @@ impl AddrMap {
         // the walk stop there and answer `Unknown`, which is the safe end.
         for bb in &func.blocks {
             for insn in &bb.insns {
-                if let Some(ref asm) = insn.asm_data {
+                if let Some(ref asm) = insn.extra().asm_data {
                     for out in &asm.outputs {
                         defs.remove(&out.pseudo);
                     }
@@ -327,12 +327,12 @@ impl ModuleInfo {
     /// its definition in this unit, if any, defines a reserved name, which
     /// is undefined (C17 7.1.3p2).
     pub(crate) fn call_effect(&self, call: &Instruction) -> MemEffect {
-        let effect = match call.func_name.as_deref() {
+        let effect = match call.extra().func_name.as_deref() {
             Some(n) => self.effects.of(n),
             // An indirect call names no callee.
             None => MemEffect::Unknown,
         };
-        match call.known {
+        match call.extra().known {
             Some(f) if f.only_reads() => effect.min(MemEffect::Pure),
             _ => effect,
         }
@@ -732,7 +732,7 @@ mod tests {
         let mi = empty_module_info();
         let call = |known: Option<LibFn>| {
             let mut c = Instruction::call(None, "f", vec![], vec![], types.int_id, 32);
-            c.known = known;
+            c.extra_mut().known = known;
             c
         };
         assert_eq!(mi.call_effect(&call(None)), MemEffect::Unknown);
@@ -766,7 +766,7 @@ mod tests {
                 .with_type_and_size(i64t, 64),
         );
         let mut asm = Instruction::new(Opcode::Asm);
-        asm.asm_data = Some(Box::new(crate::ir::AsmData {
+        asm.extra_mut().asm_data = Some(Box::new(crate::ir::AsmData {
             template: String::new(),
             outputs: vec![crate::ir::AsmConstraint {
                 pseudo: PseudoId(10),

@@ -126,7 +126,7 @@ fn expand_function(func: &mut Function, tls: &HashSet<String>, ptr_type: TypeId)
             // operand that is the thread-local itself becomes an address
             // value, with the constraint's byte offset folded into it, since
             // an address value carries no offset of its own.
-            if let Some(asm) = rewritten.asm_data.as_mut() {
+            if let Some(asm) = rewritten.extra_mut().asm_data.as_mut() {
                 for c in asm.inputs.iter_mut().chain(asm.outputs.iter_mut()) {
                     let Some(name) = tls_name(func, c.pseudo, tls) else {
                         continue;
@@ -239,7 +239,7 @@ mod tests {
         let asm = insns
             .iter()
             .find(|i| i.op == Opcode::Asm)
-            .and_then(|i| i.asm_data.as_ref())
+            .and_then(|i| i.extra().asm_data.as_ref())
             .unwrap();
         // The output names the object at offset zero: the address itself.
         assert_eq!(asm.outputs[1].pseudo, addr);

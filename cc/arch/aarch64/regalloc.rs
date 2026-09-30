@@ -1308,7 +1308,7 @@ pub fn build_asm_instr_constraints_aarch64(
     insn: &Instruction,
 ) -> Option<crate::arch::asm_constraints::InstrConstraints<Reg>> {
     Some(crate::arch::asm_constraints::InstrConstraints::of_asm(
-        insn.asm_data.as_ref()?,
+        insn.extra().asm_data.as_ref()?,
         parse_aarch64_fixed_letter,
         parse_aarch64_class_letter,
         parse_gp_clobber_name,
@@ -2502,7 +2502,7 @@ mod tests {
             })
             .partition(|c| c.constraint.starts_with('=') || c.constraint.starts_with('+'));
         let mut insn = Instruction::new(Opcode::Asm);
-        insn.asm_data = Some(Box::new(AsmData {
+        insn.extra_mut().asm_data = Some(Box::new(AsmData {
             template: String::new(),
             outputs,
             inputs,

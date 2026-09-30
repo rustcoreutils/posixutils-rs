@@ -2142,7 +2142,7 @@ impl<'a> Linearizer<'a> {
         // `Ret` this emits.
         if super::aggregate_ret_is_address(&ret_class, struct_size) {
             let mut ret_insn = Instruction::ret_typed(Some(src_addr), ret_type, struct_size);
-            ret_insn.abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
+            ret_insn.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
             self.emit(ret_insn);
             return;
         }
@@ -2179,7 +2179,7 @@ impl<'a> Linearizer<'a> {
         // Emit return with both values and ABI info for two-register return
         let mut ret_insn = Instruction::ret_typed(Some(low_temp), ret_type, struct_size);
         ret_insn.src.push(high_temp);
-        ret_insn.abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
+        ret_insn.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
         self.emit(ret_insn);
     }
 
@@ -4140,12 +4140,12 @@ impl<'a> Linearizer<'a> {
                     64, // pointers are 64-bit
                 )
             };
-            call_insn.variadic_arg_start = variadic_arg_start;
-            call_insn.ends_with_va_arg_pack = ends_with_va_arg_pack;
-            call_insn.is_noreturn_call = is_noreturn_call;
-            call_insn.callee_binding = binding;
-            call_insn.known = known;
-            call_insn.abi_info = Some(call_abi_info);
+            call_insn.extra_mut().variadic_arg_start = variadic_arg_start;
+            call_insn.extra_mut().ends_with_va_arg_pack = ends_with_va_arg_pack;
+            call_insn.extra_mut().is_noreturn_call = is_noreturn_call;
+            call_insn.extra_mut().callee_binding = binding;
+            call_insn.extra_mut().known = known;
+            call_insn.extra_mut().abi_info = Some(call_abi_info);
             self.emit(call_insn);
             if is_noreturn_call {
                 self.emit_no_return(
@@ -4177,12 +4177,12 @@ impl<'a> Linearizer<'a> {
                     ret_size,
                 )
             };
-            call_insn.variadic_arg_start = variadic_arg_start;
-            call_insn.ends_with_va_arg_pack = ends_with_va_arg_pack;
-            call_insn.is_noreturn_call = is_noreturn_call;
-            call_insn.callee_binding = binding;
-            call_insn.known = known;
-            call_insn.abi_info = Some(call_abi_info);
+            call_insn.extra_mut().variadic_arg_start = variadic_arg_start;
+            call_insn.extra_mut().ends_with_va_arg_pack = ends_with_va_arg_pack;
+            call_insn.extra_mut().is_noreturn_call = is_noreturn_call;
+            call_insn.extra_mut().callee_binding = binding;
+            call_insn.extra_mut().known = known;
+            call_insn.extra_mut().abi_info = Some(call_abi_info);
             self.emit(call_insn);
             if is_noreturn_call {
                 self.emit_no_return(
@@ -5957,7 +5957,7 @@ impl<'a> Linearizer<'a> {
         cas.src = vec![addr, exp_addr, des_val, order];
         cas.typ = Some(self.types.bool_id);
         cas.size = bits;
-        cas.memory_order = MemoryOrder::SeqCst;
+        cas.extra_mut().memory_order = MemoryOrder::SeqCst;
         self.emit(cas);
 
         if !returns_old {

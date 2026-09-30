@@ -59,9 +59,12 @@ impl Instruction {
         };
         self.bb_true.into_iter().for_each(&mut add);
         self.bb_false.into_iter().for_each(&mut add);
-        self.switch_cases.iter().for_each(|(_, _, b)| add(*b));
-        self.switch_default.into_iter().for_each(&mut add);
-        if let Some(asm) = &self.asm_data {
+        self.extra()
+            .switch_cases
+            .iter()
+            .for_each(|(_, _, b)| add(*b));
+        self.extra().switch_default.into_iter().for_each(&mut add);
+        if let Some(asm) = &self.extra().asm_data {
             asm.goto_labels.iter().for_each(|(b, _)| add(*b));
         }
         out
@@ -81,9 +84,12 @@ impl Instruction {
         };
         self.bb_true.iter_mut().for_each(swap);
         self.bb_false.iter_mut().for_each(swap);
-        self.switch_cases.iter_mut().for_each(|(_, _, b)| swap(b));
-        self.switch_default.iter_mut().for_each(swap);
-        if let Some(asm) = &mut self.asm_data {
+        self.extra_mut()
+            .switch_cases
+            .iter_mut()
+            .for_each(|(_, _, b)| swap(b));
+        self.extra_mut().switch_default.iter_mut().for_each(swap);
+        if let Some(asm) = &mut self.extra_mut().asm_data {
             asm.goto_labels.iter_mut().for_each(|(b, _)| swap(b));
         }
     }
@@ -124,7 +130,8 @@ impl BasicBlock {
     /// would miss the rest of them and find the labels unreachable.
     pub fn has_asm_goto(&self) -> bool {
         self.insns.iter().any(|i| {
-            i.asm_data
+            i.extra()
+                .asm_data
                 .as_ref()
                 .is_some_and(|d| !d.goto_labels.is_empty())
         })

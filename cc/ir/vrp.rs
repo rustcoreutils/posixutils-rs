@@ -191,7 +191,7 @@ impl Solver {
         }
         for bb in &func.blocks {
             for insn in &bb.insns {
-                if let Some(ref asm) = insn.asm_data {
+                if let Some(ref asm) = insn.extra().asm_data {
                     for out in &asm.outputs {
                         self.unfoldable.insert(out.pseudo);
                         let idx = out.pseudo.0 as usize;

@@ -50,7 +50,7 @@ impl X86_64CodeGen {
 
         // For SeqCst, use XCHG which provides full barrier
         // For weaker orderings, regular store + optional SFENCE is sufficient
-        if insn.memory_order == MemoryOrder::SeqCst {
+        if insn.extra().memory_order == MemoryOrder::SeqCst {
             // Load value into a register
             let value_loc = self.get_location(value);
             let addr_loc = self.get_location(addr);
@@ -575,7 +575,7 @@ impl X86_64CodeGen {
         let target = insn.target.expect("fence needs target");
 
         // Emit appropriate fence based on memory ordering
-        match insn.memory_order {
+        match insn.extra().memory_order {
             MemoryOrder::SeqCst | MemoryOrder::AcqRel => {
                 self.push_lir(X86Inst::Mfence);
             }

@@ -192,7 +192,7 @@ pub(super) fn asm_reg_name_32(reg: Reg) -> &'static str {
 impl Aarch64CodeGen {
     /// Emit inline assembly instruction
     pub(super) fn emit_inline_asm(&mut self, insn: &Instruction) {
-        let asm_data = match &insn.asm_data {
+        let asm_data = match &insn.extra().asm_data {
             Some(data) => data,
             None => return,
         };

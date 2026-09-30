@@ -1019,8 +1019,6 @@ pub struct Instruction {
     pub offset: i64,
     /// For phi nodes: list of (bb, pseudo) pairs
     pub phi_list: Vec<(BasicBlockId, PseudoId)>,
-    /// For calls: function name or pseudo
-    pub func_name: Option<String>,
     /// Bit size of the result -- for every opcode.
     pub size: u32,
     /// Bit size of the operands, for an opcode whose operands are of another
@@ -1029,6 +1027,37 @@ pub struct Instruction {
     pub src_size: u32,
     /// Source type for conversion operations (interned TypeId)
     pub src_typ: Option<TypeId>,
+    /// Source position for debug info
+    pub pos: Option<Position>,
+    /// For `Load` and `Store`: the object being accessed is `volatile`, so the
+    /// access itself is observable behaviour (C17 5.1.2.3p6) and no pass may
+    /// delete, merge, move or fold it.
+    ///
+    /// The qualifier lives on the *access*, not on the variable, because for
+    /// `volatile int *p` there is no variable to ask: `p` is an ordinary
+    /// pointer and `*p` is the volatile object. `LocalVar::is_volatile` and
+    /// `memloc::GlobalFacts::is_volatile` answer only for a named object, so
+    /// DCE saw nothing to stop it and deleted every discarded `volatile` read
+    /// from `-O1` up. Ask through [`Instruction::is_volatile_access`].
+    ///
+    /// Set for every access the linearizer emits, from the type it is
+    /// accessing, in `Linearizer::mark_volatile_access`.
+    pub is_volatile: bool,
+    /// The fields only calls, switches, `asm` and atomics use, in one box
+    /// that every other instruction leaves empty. Read them through
+    /// [`Instruction::extra`] and set them through [`Instruction::extra_mut`].
+    pub extra: Option<Box<InsnExtra>>,
+}
+
+/// The fields of an [`Instruction`] that only a few opcodes use.
+///
+/// Kept out of line because most instructions are loads, stores, copies and
+/// arithmetic, which carry none of them: inline, they made every instruction
+/// several times the size of the ones that need them.
+#[derive(Debug, Clone, Default)]
+pub struct InsnExtra {
+    /// For calls: function name or pseudo
+    pub func_name: Option<String>,
     /// For switch: case range to target block mapping, as `(lo, hi, block)`.
     ///
     /// An ordinary `case v:` is the degenerate range `(v, v, block)`. Ranges
@@ -1064,8 +1093,6 @@ pub struct Instruction {
     /// For indirect calls: pseudo containing the function pointer address.
     /// When this is Some, the call is indirect (call through function pointer).
     pub indirect_target: Option<PseudoId>,
-    /// Source position for debug info
-    pub pos: Option<Position>,
     /// For inline assembly: the asm data (template, operands, clobbers)
     pub asm_data: Option<Box<AsmData>>,
     /// For calls: rich ABI classification for arguments and return value.
@@ -1073,21 +1100,24 @@ pub struct Instruction {
     pub abi_info: Option<Box<CallAbiInfo>>,
     /// For atomic operations: memory ordering constraint
     pub memory_order: MemoryOrder,
-    /// For `Load` and `Store`: the object being accessed is `volatile`, so the
-    /// access itself is observable behaviour (C17 5.1.2.3p6) and no pass may
-    /// delete, merge, move or fold it.
-    ///
-    /// The qualifier lives on the *access*, not on the variable, because for
-    /// `volatile int *p` there is no variable to ask: `p` is an ordinary
-    /// pointer and `*p` is the volatile object. `LocalVar::is_volatile` and
-    /// `memloc::GlobalFacts::is_volatile` answer only for a named object, so
-    /// DCE saw nothing to stop it and deleted every discarded `volatile` read
-    /// from `-O1` up. Ask through [`Instruction::is_volatile_access`].
-    ///
-    /// Set for every access the linearizer emits, from the type it is
-    /// accessing, in `Linearizer::mark_volatile_access`.
-    pub is_volatile: bool,
 }
+
+/// What an instruction with no extra fields answers: every one empty.
+static NO_EXTRA: InsnExtra = InsnExtra {
+    func_name: None,
+    switch_cases: Vec::new(),
+    switch_default: None,
+    arg_types: Vec::new(),
+    variadic_arg_start: None,
+    ends_with_va_arg_pack: false,
+    is_noreturn_call: false,
+    callee_binding: crate::parse::ast::CalleeBinding::Declared,
+    known: None,
+    indirect_target: None,
+    asm_data: None,
+    abi_info: None,
+    memory_order: MemoryOrder::Relaxed,
+};
 
 impl Default for Instruction {
     fn default() -> Self {
@@ -1100,29 +1130,27 @@ impl Default for Instruction {
             bb_false: None,
             offset: 0,
             phi_list: Vec::new(),
-            func_name: None,
             size: 0,
             src_size: 0,
             src_typ: None,
-            switch_cases: Vec::new(),
-            switch_default: None,
-            arg_types: Vec::new(),
-            variadic_arg_start: None,
-            ends_with_va_arg_pack: false,
-            is_noreturn_call: false,
-            callee_binding: crate::parse::ast::CalleeBinding::Declared,
-            known: None,
-            indirect_target: None,
             pos: None,
-            asm_data: None,
-            abi_info: None,
-            memory_order: MemoryOrder::default(),
             is_volatile: false,
+            extra: None,
         }
     }
 }
 
 impl Instruction {
+    /// The fields only a few opcodes use; all empty unless set.
+    pub fn extra(&self) -> &InsnExtra {
+        self.extra.as_deref().unwrap_or(&NO_EXTRA)
+    }
+
+    /// The fields only a few opcodes use, for setting.
+    pub fn extra_mut(&mut self) -> &mut InsnExtra {
+        self.extra.get_or_insert_with(Default::default)
+    }
+
     pub fn new(op: Opcode) -> Self {
         Self {
             op,
@@ -1139,8 +1167,10 @@ impl Instruction {
     /// body. Inlining and recursion detection ask this rather than reading
     /// `func_name`, which names the symbol either way.
     pub fn local_callee(&self) -> Option<&str> {
-        match (self.op, self.callee_binding) {
-            (Opcode::Call, crate::parse::ast::CalleeBinding::Declared) => self.func_name.as_deref(),
+        match (self.op, self.extra().callee_binding) {
+            (Opcode::Call, crate::parse::ast::CalleeBinding::Declared) => {
+                self.extra().func_name.as_deref()
+            }
             _ => None,
         }
     }
@@ -1224,7 +1254,7 @@ impl Instruction {
 
     /// Set function name for calls
     pub fn with_func(mut self, name: impl Into<String>) -> Self {
-        self.func_name = Some(name.into());
+        self.extra_mut().func_name = Some(name.into());
         self
     }
 
@@ -1238,7 +1268,7 @@ impl Instruction {
     /// `memcpy` reaches `__builtin_memcpy` and a structure copy alike. A
     /// backend names the callee through here, never with a literal.
     pub fn library_callee(&self) -> &str {
-        match &self.func_name {
+        match &self.extra().func_name {
             Some(name) => name,
             None => panic!("{:?} was built without its library callee", self.op),
         }
@@ -1258,7 +1288,7 @@ impl Instruction {
 
     /// Set memory ordering for atomic operations
     pub fn with_memory_order(mut self, order: MemoryOrder) -> Self {
-        self.memory_order = order;
+        self.extra_mut().memory_order = order;
         self
     }
 
@@ -1308,6 +1338,7 @@ impl Instruction {
     pub fn is_memory_barrier(&self) -> bool {
         match self.op {
             Opcode::Asm => self
+                .extra()
                 .asm_data
                 .as_ref()
                 .is_some_and(|d| d.clobbers.iter().any(|c| c == "memory")),
@@ -1349,6 +1380,7 @@ impl Instruction {
     /// asking `mentions` per symbol per instruction makes quadratic.
     pub fn mentioned(&self) -> impl Iterator<Item = PseudoId> + '_ {
         let asm = self
+            .extra()
             .asm_data
             .iter()
             .flat_map(|d| d.inputs.iter().chain(d.outputs.iter()))
@@ -1357,7 +1389,7 @@ impl Instruction {
             .iter()
             .copied()
             .chain(self.target)
-            .chain(self.indirect_target)
+            .chain(self.extra().indirect_target)
             .chain(self.phi_list.iter().map(|&(_, p)| p))
             .chain(asm)
     }
@@ -1387,11 +1419,11 @@ impl Instruction {
             }
         }
 
-        if let Some(indirect) = self.indirect_target {
+        if let Some(indirect) = self.extra().indirect_target {
             uses.push(indirect);
         }
 
-        if let Some(ref asm_data) = self.asm_data {
+        if let Some(ref asm_data) = self.extra().asm_data {
             for input in &asm_data.inputs {
                 uses.push(input.pseudo);
             }
@@ -1447,9 +1479,12 @@ impl Instruction {
         Self {
             op: Opcode::Switch,
             src: vec![value],
-            switch_cases: cases,
-            switch_default: default,
             size,
+            extra: Some(Box::new(InsnExtra {
+                switch_cases: cases,
+                switch_default: default,
+                ..Default::default()
+            })),
             ..Default::default()
         }
     }
@@ -1615,7 +1650,7 @@ impl Instruction {
             insn.target = Some(t);
         }
         insn.src = args;
-        insn.arg_types = arg_types;
+        insn.extra_mut().arg_types = arg_types;
         insn
     }
 
@@ -1646,7 +1681,7 @@ impl Instruction {
         let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
 
         let mut insn = Self::call(target, func_name, args, arg_types, ret_type, ret_size);
-        insn.abi_info = Some(call_abi_info);
+        insn.extra_mut().abi_info = Some(call_abi_info);
         insn
     }
 
@@ -1660,7 +1695,7 @@ impl Instruction {
         ret_size: u32,
     ) -> Self {
         let mut insn = Self::call(target, "<indirect>", args, arg_types, ret_type, ret_size);
-        insn.indirect_target = Some(func_addr);
+        insn.extra_mut().indirect_target = Some(func_addr);
         insn
     }
 
@@ -1715,14 +1750,18 @@ impl Instruction {
     pub fn asm(data: AsmData) -> Self {
         Self {
             op: Opcode::Asm,
-            asm_data: Some(Box::new(data)),
+            extra: Some(Box::new(InsnExtra {
+                asm_data: Some(Box::new(data)),
+                ..Default::default()
+            })),
             ..Default::default()
         }
     }
 
     /// Check if this call/return uses a hidden sret pointer for the return value.
     pub fn returns_via_sret(&self) -> bool {
-        self.abi_info
+        self.extra()
+            .abi_info
             .as_ref()
             .map(|ai| matches!(ai.ret, ArgClass::Indirect { .. }))
             .unwrap_or(false)
@@ -1735,14 +1774,16 @@ impl Instruction {
     /// is loaded onto the FPU stack from memory, since nothing else can hold
     /// an 80-bit value.
     pub fn returns_via_x87(&self) -> bool {
-        self.abi_info
+        self.extra()
+            .abi_info
             .as_ref()
             .map(|ai| matches!(ai.ret, ArgClass::X87 { .. }))
             .unwrap_or(false)
     }
 
     pub fn returns_two_regs(&self) -> bool {
-        self.abi_info
+        self.extra()
+            .abi_info
             .as_ref()
             .map(|ai| match &ai.ret {
                 ArgClass::Direct { classes, .. } => classes.len() == 2,
@@ -1761,7 +1802,8 @@ impl Instruction {
     /// puts `abi_info` on a `Ret`, and only for a struct or union, so no
     /// scalar reaches this.
     pub fn returns_aggregate_address(&self) -> bool {
-        self.abi_info
+        self.extra()
+            .abi_info
             .as_ref()
             .is_some_and(|ai| aggregate_ret_is_address(&ai.ret, self.size))
     }
@@ -1905,7 +1947,7 @@ impl fmt::Display for InstructionDisplay<'_> {
                 }
             }
             Opcode::Call => {
-                if let Some(func) = &this.func_name {
+                if let Some(func) = &this.extra().func_name {
                     write!(f, " {}", func)?;
                 }
                 write!(f, "(")?;
@@ -1921,14 +1963,14 @@ impl fmt::Display for InstructionDisplay<'_> {
                 if let Some(val) = this.src.first() {
                     write!(f, " {}", ctx.pseudo(*val))?;
                 }
-                for (lo, hi, bb) in &this.switch_cases {
+                for (lo, hi, bb) in &this.extra().switch_cases {
                     if lo == hi {
                         write!(f, ", {} => {}", lo, bb)?;
                     } else {
                         write!(f, ", {}..={} => {}", lo, hi, bb)?;
                     }
                 }
-                if let Some(default_bb) = &this.switch_default {
+                if let Some(default_bb) = &this.extra().switch_default {
                     write!(f, ", default => {}", default_bb)?;
                 }
             }
@@ -3341,7 +3383,7 @@ mod tests {
             32,
         );
         // Add abi_info (required for codegen)
-        call.abi_info = Some(Box::new(CallAbiInfo::new(
+        call.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(
             vec![
                 ArgClass::Direct {
                     classes: vec![RegClass::Integer],
@@ -3358,10 +3400,10 @@ mod tests {
             },
         )));
         assert_eq!(call.op, Opcode::Call);
-        assert_eq!(call.func_name, Some("printf".to_string()));
+        assert_eq!(call.extra().func_name, Some("printf".to_string()));
         assert_eq!(call.src.len(), 2);
-        assert_eq!(call.arg_types.len(), 2);
-        assert!(call.abi_info.is_some());
+        assert_eq!(call.extra().arg_types.len(), 2);
+        assert!(call.extra().abi_info.is_some());
     }
 
     #[test]
@@ -3461,13 +3503,13 @@ mod tests {
     #[test]
     fn test_instruction_with_memory_order() {
         let mut insn = Instruction::new(Opcode::AtomicLoad);
-        assert_eq!(insn.memory_order, MemoryOrder::Relaxed); // default
+        assert_eq!(insn.extra().memory_order, MemoryOrder::Relaxed); // default
 
         insn = insn.with_memory_order(MemoryOrder::SeqCst);
-        assert_eq!(insn.memory_order, MemoryOrder::SeqCst);
+        assert_eq!(insn.extra().memory_order, MemoryOrder::SeqCst);
 
         insn = insn.with_memory_order(MemoryOrder::Acquire);
-        assert_eq!(insn.memory_order, MemoryOrder::Acquire);
+        assert_eq!(insn.extra().memory_order, MemoryOrder::Acquire);
     }
 
     /// A string initializer taken apart into its elements: one per code unit
@@ -3500,6 +3542,16 @@ mod tests {
             vec![(0, Initializer::Int(1)), (2, Initializer::Int(2))]
         );
         assert!(Initializer::Int(1).string_as_array(1, 1).is_none());
+    }
+
+    /// Every instruction pays for every field it has, so the ones only a few
+    /// opcodes use live in `InsnExtra`. Two hundred and forty-eight bytes, one
+    /// heap allocation each, when they were inline.
+    #[test]
+    fn test_an_instruction_keeps_its_rare_fields_out_of_line() {
+        let size = std::mem::size_of::<Instruction>();
+        eprintln!("size_of::<Instruction>() = {size}");
+        assert!(size <= 128, "{size}");
     }
 
     #[test]
@@ -3663,8 +3715,8 @@ mod tests {
         assert!(insn.target.is_none());
         assert_eq!(insn.src.len(), 1);
         assert_eq!(insn.src[0], PseudoId(5));
-        assert_eq!(insn.switch_cases.len(), 2);
-        assert_eq!(insn.switch_default, Some(BasicBlockId(3)));
+        assert_eq!(insn.extra().switch_cases.len(), 2);
+        assert_eq!(insn.extra().switch_default, Some(BasicBlockId(3)));
         let types = TypeTable::new(&Target::host());
         let ctx = IrCtx {
             types: &types,
@@ -3763,7 +3815,7 @@ mod tests {
     fn test_returns_via_sret() {
         let mut insn = Instruction::new(Opcode::Call);
         assert!(!insn.returns_via_sret());
-        insn.abi_info = Some(Box::new(CallAbiInfo::new(
+        insn.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(
             vec![],
             ArgClass::Direct {
                 classes: vec![RegClass::Integer],
@@ -3771,7 +3823,7 @@ mod tests {
             },
         )));
         assert!(!insn.returns_via_sret());
-        insn.abi_info = Some(Box::new(CallAbiInfo::new(
+        insn.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(
             vec![],
             ArgClass::Indirect {
                 align: 8,
@@ -3785,7 +3837,7 @@ mod tests {
     fn test_returns_two_regs() {
         let mut insn = Instruction::new(Opcode::Ret);
         assert!(!insn.returns_two_regs());
-        insn.abi_info = Some(Box::new(CallAbiInfo::new(
+        insn.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(
             vec![],
             ArgClass::Direct {
                 classes: vec![RegClass::Integer],
@@ -3793,7 +3845,7 @@ mod tests {
             },
         )));
         assert!(!insn.returns_two_regs());
-        insn.abi_info = Some(Box::new(CallAbiInfo::new(
+        insn.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(
             vec![],
             ArgClass::Direct {
                 classes: vec![RegClass::Integer, RegClass::Integer],
@@ -3902,12 +3954,12 @@ mod tests {
 
         assert_eq!(insn.op, Opcode::Call);
         assert_eq!(insn.target, Some(PseudoId(2)));
-        assert_eq!(insn.func_name.as_deref(), Some("__divti3"));
+        assert_eq!(insn.extra().func_name.as_deref(), Some("__divti3"));
         assert_eq!(insn.src.len(), 2);
-        assert_eq!(insn.arg_types.len(), 2);
-        assert!(insn.abi_info.is_some());
+        assert_eq!(insn.extra().arg_types.len(), 2);
+        assert!(insn.extra().abi_info.is_some());
 
-        let abi = insn.abi_info.as_ref().unwrap();
+        let abi = insn.extra().abi_info.as_ref().unwrap();
         assert_eq!(abi.params.len(), 2);
     }
 
@@ -3929,9 +3981,9 @@ mod tests {
         );
 
         assert_eq!(insn.op, Opcode::Call);
-        assert_eq!(insn.func_name.as_deref(), Some("__fixsfti"));
-        assert!(insn.abi_info.is_some());
-        assert_eq!(insn.abi_info.as_ref().unwrap().params.len(), 1);
+        assert_eq!(insn.extra().func_name.as_deref(), Some("__fixsfti"));
+        assert!(insn.extra().abi_info.is_some());
+        assert_eq!(insn.extra().abi_info.as_ref().unwrap().params.len(), 1);
     }
 
     #[test]
@@ -3958,7 +4010,7 @@ mod tests {
 
     fn make_asm_with_clobbers(clobbers: Vec<&str>) -> Instruction {
         let mut insn = Instruction::new(Opcode::Asm);
-        insn.asm_data = Some(Box::new(AsmData {
+        insn.extra_mut().asm_data = Some(Box::new(AsmData {
             template: String::new(),
             outputs: Vec::new(),
             inputs: Vec::new(),

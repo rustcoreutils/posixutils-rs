@@ -903,12 +903,14 @@ fn clone_instruction(
                 .iter()
                 .map(|&s| ctx.remap_pseudo(s, callee_func))
                 .collect();
-            new_insn.switch_cases = insn
+            new_insn.extra_mut().switch_cases = insn
+                .extra()
                 .switch_cases
                 .iter()
                 .map(|(lo, hi, bb)| (*lo, *hi, ctx.remap_bb(*bb)))
                 .collect();
-            new_insn.switch_default = insn.switch_default.map(|bb| ctx.remap_bb(bb));
+            new_insn.extra_mut().switch_default =
+                insn.extra().switch_default.map(|bb| ctx.remap_bb(bb));
             vec![new_insn]
         }
 
@@ -955,7 +957,8 @@ fn clone_instruction(
                 .map(|s| ctx.remap_pseudo(*s, callee_func))
                 .collect();
             // For indirect calls, also remap the function pointer pseudo
-            new_insn.indirect_target = insn
+            new_insn.extra_mut().indirect_target = insn
+                .extra()
                 .indirect_target
                 .map(|t| ctx.remap_pseudo(t, callee_func));
 
@@ -963,19 +966,27 @@ fn clone_instruction(
             // arguments belong on the end, and now they are known. `src`,
             // `arg_types` and `abi_info.params` are parallel and indexed in
             // parallel by both backends, so all three grow together.
-            if new_insn.ends_with_va_arg_pack {
+            if new_insn.extra().ends_with_va_arg_pack {
                 new_insn.src.extend_from_slice(&ctx.forwarded.vals);
-                new_insn.arg_types.extend_from_slice(&ctx.forwarded.types);
-                if let Some(abi) = new_insn.abi_info.as_mut() {
+                new_insn
+                    .extra_mut()
+                    .arg_types
+                    .extend_from_slice(&ctx.forwarded.types);
+                if let Some(abi) = new_insn.extra_mut().abi_info.as_mut() {
                     abi.params.extend_from_slice(&ctx.forwarded.classes);
                 }
                 // Anything spliced in is variadic by construction: it came
                 // from past the callee's declared parameters. If the inner
                 // call had no variadic tail of its own, one starts here.
                 let fixed = new_insn.src.len() - ctx.forwarded.vals.len();
-                new_insn.variadic_arg_start =
-                    Some(new_insn.variadic_arg_start.unwrap_or(fixed).min(fixed));
-                new_insn.ends_with_va_arg_pack = false;
+                new_insn.extra_mut().variadic_arg_start = Some(
+                    new_insn
+                        .extra()
+                        .variadic_arg_start
+                        .unwrap_or(fixed)
+                        .min(fixed),
+                );
+                new_insn.extra_mut().ends_with_va_arg_pack = false;
             }
 
             // Keep func_name and other call metadata unchanged
@@ -1025,7 +1036,7 @@ fn clone_instruction(
         // All other instructions: remap target and sources
         _ => {
             debug_assert!(
-                insn.switch_cases.is_empty(),
+                insn.extra().switch_cases.is_empty(),
                 "unexpected switch_cases in {:?} during inlining",
                 insn.op
             );
@@ -1053,7 +1064,7 @@ fn clone_instruction(
             }
 
             // Remap pseudos inside inline asm operands
-            if let Some(ref mut asm_data) = new_insn.asm_data {
+            if let Some(ref mut asm_data) = new_insn.extra_mut().asm_data {
                 for output in &mut asm_data.outputs {
                     output.pseudo = ctx.remap_pseudo(output.pseudo, callee_func);
                 }
@@ -1199,6 +1210,7 @@ fn inline_call_site(
     let forwarded = {
         let first = callee.params.len();
         let classes = call_insn
+            .extra()
             .abi_info
             .as_ref()
             .map(|abi| abi.params.clone())
@@ -1206,6 +1218,7 @@ fn inline_call_site(
         ForwardedArgs {
             vals: call_insn.src.get(first..).unwrap_or_default().to_vec(),
             types: call_insn
+                .extra()
                 .arg_types
                 .get(first..)
                 .unwrap_or_default()
@@ -1798,7 +1811,7 @@ fn collect_referenced_functions(module: &Module) -> HashSet<String> {
                     // A direct call. An indirect one is named `<indirect>`,
                     // so it cannot collide with a real function.
                     Opcode::Call => {
-                        if let Some(name) = &insn.func_name {
+                        if let Some(name) = &insn.extra().func_name {
                             if func_names.contains(name) {
                                 referenced.insert(name.clone());
                             }
@@ -1820,7 +1833,7 @@ fn collect_referenced_functions(module: &Module) -> HashSet<String> {
                 }
                 // A name written into the assembly text itself -- `asm("call
                 // foo")` -- reaches the assembler with no IR reference at all.
-                if let Some(ref asm) = insn.asm_data {
+                if let Some(ref asm) = insn.extra().asm_data {
                     collect_names_in_asm(&asm.template, &func_names, &mut referenced);
                 }
             }
@@ -2290,7 +2303,7 @@ mod tests {
 
         for insn in wrapper.blocks.iter_mut().flat_map(|b| b.insns.iter_mut()) {
             if insn.op == Opcode::Call {
-                insn.callee_binding = crate::parse::ast::CalleeBinding::Library;
+                insn.extra_mut().callee_binding = crate::parse::ast::CalleeBinding::Library;
                 assert_eq!(insn.local_callee(), None);
             }
         }
@@ -2314,7 +2327,7 @@ mod tests {
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.add_insn(Instruction::new(Opcode::Entry));
         let mut asm = Instruction::new(Opcode::Asm);
-        asm.asm_data = Some(Box::new(AsmData {
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
             template: "call helper".to_string(),
             outputs: Vec::new(),
             inputs: Vec::new(),
@@ -2571,7 +2584,7 @@ mod tests {
         );
 
         let mut asm = Instruction::new(Opcode::Asm);
-        asm.asm_data = Some(Box::new(AsmData {
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
             template: "b %l[done]".to_string(),
             outputs: Vec::new(),
             inputs: Vec::new(),
@@ -2582,6 +2595,7 @@ mod tests {
         let cloned = clone_instruction(&mut ctx, &asm, &callee);
         assert_eq!(cloned.len(), 1);
         let data = cloned[0]
+            .extra()
             .asm_data
             .as_ref()
             .expect("asm_data should survive cloning");
@@ -2732,7 +2746,7 @@ mod tests {
             types.long_id,
         ));
         let mut ret_insn = Instruction::ret_typed(Some(PseudoId(1)), types.long_id, size_bits);
-        ret_insn.abi_info = Some(Box::new(crate::ir::CallAbiInfo::new(vec![], ret)));
+        ret_insn.extra_mut().abi_info = Some(Box::new(crate::ir::CallAbiInfo::new(vec![], ret)));
         bb.insns.push(ret_insn);
         callee.add_block(bb);
         callee.entry = BasicBlockId(0);

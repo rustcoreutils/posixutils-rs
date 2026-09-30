@@ -57,7 +57,7 @@ pub(super) fn run(func: &mut Function, ctx: &FoldCtx) -> bool {
     for &(b, i) in &disjoint {
         let insn = &mut func.blocks[b].insns[i];
         insn.op = Opcode::Memcpy;
-        insn.func_name = Some(symbol.to_string());
+        insn.extra_mut().func_name = Some(symbol.to_string());
     }
     !disjoint.is_empty()
 }
@@ -128,7 +128,7 @@ mod tests {
     fn moved(fx: &mut Fixture, t: PseudoId, callees: &[(&'static str, &str)]) -> (Opcode, String) {
         let insns = run_on(fx, callees);
         let insn = def(&insns, t);
-        (insn.op, insn.func_name.clone().unwrap_or_default())
+        (insn.op, insn.extra().func_name.clone().unwrap_or_default())
     }
 
     fn is_memcpy(fx: &mut Fixture, t: PseudoId) -> bool {

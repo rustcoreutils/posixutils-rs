@@ -1324,7 +1324,7 @@ pub fn verbose_annotation(insn: &Instruction, pseudos: &PseudoTable) -> Option<S
     if !srcs.is_empty() {
         parts.push(srcs.join(", "));
     }
-    if let Some(name) = &insn.func_name {
+    if let Some(name) = &insn.extra().func_name {
         parts.push(name.clone());
     }
 

@@ -566,7 +566,7 @@ mod tests {
     fn test_domtree_sees_asm_goto_edges() {
         let mut func = make_test_cfg();
         let mut asm = Instruction::new(Opcode::Asm);
-        asm.asm_data = Some(Box::new(crate::ir::AsmData {
+        asm.extra_mut().asm_data = Some(Box::new(crate::ir::AsmData {
             template: String::new(),
             outputs: vec![],
             inputs: vec![],

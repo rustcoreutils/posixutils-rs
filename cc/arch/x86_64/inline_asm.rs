@@ -151,7 +151,7 @@ fn find_temp_reg(
 impl X86_64CodeGen {
     /// Emit inline assembly
     pub(super) fn emit_inline_asm(&mut self, insn: &Instruction) {
-        let asm_data = match &insn.asm_data {
+        let asm_data = match &insn.extra().asm_data {
             Some(data) => data.as_ref(),
             None => return,
         };

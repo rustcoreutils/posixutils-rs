@@ -883,7 +883,7 @@ mod tests {
         let mut b = Build::new();
         let i32t = b.types.int_id;
         let mut asm = Instruction::new(Opcode::Asm);
-        asm.asm_data = Some(Box::new(crate::ir::AsmData {
+        asm.extra_mut().asm_data = Some(Box::new(crate::ir::AsmData {
             template: String::new(),
             outputs: vec![],
             inputs: vec![],
@@ -1351,7 +1351,7 @@ mod tests {
             let x = b.konst(0x61);
             let ptr = b.types.char_ptr_id;
             let mut c = Instruction::call(None, "strlen", vec![PseudoId(10)], vec![ptr], i32t, 32);
-            c.known = known;
+            c.extra_mut().known = known;
             let insns = vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),

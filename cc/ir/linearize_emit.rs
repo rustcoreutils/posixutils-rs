@@ -2253,8 +2253,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.types.size_bits(complex_typ),
             )
         };
-        call_insn.abi_info = Some(call_abi_info);
-        call_insn.known = Some(known);
+        call_insn.extra_mut().abi_info = Some(call_abi_info);
+        call_insn.extra_mut().known = Some(known);
         self.emit(call_insn);
 
         result_sym

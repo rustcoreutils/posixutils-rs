@@ -516,7 +516,7 @@ impl Aarch64CodeGen {
         use crate::ir::MemoryOrder;
 
         // Emit appropriate fence based on memory ordering
-        match insn.memory_order {
+        match insn.extra().memory_order {
             MemoryOrder::SeqCst | MemoryOrder::AcqRel => {
                 // Full barrier
                 self.push_lir(Aarch64Inst::Dmb {

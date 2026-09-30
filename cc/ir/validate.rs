@@ -828,7 +828,7 @@ mod tests {
         push(&mut func, copy_insn(2, 0));
         // Asm whose output also writes %2.
         let mut asm = Instruction::new(Opcode::Asm);
-        asm.asm_data = Some(Box::new(AsmData {
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
             template: "movl $1, %0".into(),
             outputs: vec![AsmConstraint {
                 pseudo: PseudoId(2),
@@ -914,7 +914,7 @@ mod tests {
             Instruction::new(Opcode::AtomicFetchXor),
         ];
         let mut asm = Instruction::new(Opcode::Asm);
-        asm.asm_data = Some(Box::new(AsmData {
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
             template: String::new(),
             outputs: Vec::new(),
             inputs: Vec::new(),
@@ -1001,7 +1001,7 @@ mod tests {
 
         let mut func = fresh_func("asm_mem_barrier");
         let mut asm = Instruction::new(Opcode::Asm);
-        asm.asm_data = Some(Box::new(AsmData {
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
             template: "mfence".into(),
             outputs: vec![],
             inputs: vec![],

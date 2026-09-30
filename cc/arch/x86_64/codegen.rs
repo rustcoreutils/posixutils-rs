@@ -658,7 +658,7 @@ impl X86_64CodeGen {
             OperandSize::B32
         };
 
-        for (lo, hi, target_bb) in insn.switch_cases.clone() {
+        for (lo, hi, target_bb) in insn.extra().switch_cases.clone() {
             let target = Label::block(&self.base.current_fn, target_bb.0);
             if lo == hi {
                 self.emit_switch_cmp(op_size, lo);
@@ -672,7 +672,7 @@ impl X86_64CodeGen {
         }
 
         // Jump to default (or fall through if no default)
-        if let Some(default_bb) = insn.switch_default {
+        if let Some(default_bb) = insn.extra().switch_default {
             // LIR: unconditional jump to default
             self.push_lir(X86Inst::Jmp {
                 target: Label::block(&self.base.current_fn, default_bb.0),
@@ -1250,10 +1250,10 @@ impl X86_64CodeGen {
 
     fn emit_call(&mut self, insn: &Instruction, types: &TypeTable) {
         // Get function name (or placeholder for indirect calls)
-        let func_name = if insn.indirect_target.is_some() {
+        let func_name = if insn.extra().indirect_target.is_some() {
             "<indirect>".to_string()
         } else {
-            match &insn.func_name {
+            match &insn.extra().func_name {
                 Some(n) => n.clone(),
                 None => return,
             }
@@ -1272,7 +1272,7 @@ impl X86_64CodeGen {
         let fp_arg_count = self.setup_register_args(insn, &info, &saved_arg_regs, types);
 
         // For variadic calls, set AL to number of XMM registers used
-        if insn.variadic_arg_start.is_some() {
+        if insn.extra().variadic_arg_start.is_some() {
             self.set_variadic_fp_count(fp_arg_count);
         }
 
@@ -1282,7 +1282,7 @@ impl X86_64CodeGen {
         // them and the complex-argument path addresses its value through R11 --
         // so a target parked there before the setup was overwritten, and the
         // `call *%r11` jumped into whatever the last argument had addressed.
-        if let Some(func_addr) = insn.indirect_target {
+        if let Some(func_addr) = insn.extra().indirect_target {
             self.emit_move(func_addr, Reg::R11, 64);
         }
 

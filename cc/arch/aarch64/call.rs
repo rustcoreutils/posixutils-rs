@@ -132,7 +132,7 @@ impl Aarch64CodeGen {
         // though it were variadic, so `struct Big f(int n, ...)` read garbage
         // for `n` where Apple clang puts 7 in w0. `args_start` is zero for a
         // call that returns in registers, which is why only sret was wrong.
-        let variadic_start = match insn.variadic_arg_start {
+        let variadic_start = match insn.extra().variadic_arg_start {
             Some(v) => (args_start + v).min(insn.src.len()),
             None => insn.src.len(),
         };
@@ -323,7 +323,7 @@ impl Aarch64CodeGen {
         };
 
         for (i, &arg) in insn.src.iter().enumerate().take(args.end).skip(args.start) {
-            let arg_type = insn.arg_types.get(i).copied();
+            let arg_type = insn.extra().arg_types.get(i).copied();
             if self.arg_is_ignored(arg_type, types) {
                 continue;
             }
@@ -1035,7 +1035,7 @@ impl Aarch64CodeGen {
 
     /// Emit the actual call instruction (direct or indirect)
     pub(super) fn emit_call_instruction(&mut self, insn: &Instruction, func_name: &str) {
-        if insn.indirect_target.is_some() {
+        if insn.extra().indirect_target.is_some() {
             self.push_lir(Aarch64Inst::Bl {
                 target: CallTarget::Indirect(Reg::X16),
             });
@@ -1092,6 +1092,7 @@ impl Aarch64CodeGen {
             .unwrap_or(insn.size.max(32));
 
         let abi_info = insn
+            .extra()
             .abi_info
             .as_ref()
             .expect("abi_info must be populated for Call instructions");

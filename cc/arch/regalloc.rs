@@ -487,12 +487,12 @@ where
                 first_pos_map[idx].entry(src).or_insert(ipos);
                 last_pos_map[idx].insert(src, ipos);
             }
-            if let Some(indirect) = insn.indirect_target {
+            if let Some(indirect) = insn.extra().indirect_target {
                 first_pos_map[idx].entry(indirect).or_insert(ipos);
                 last_pos_map[idx].insert(indirect, ipos);
             }
             if insn.op == Opcode::Asm {
-                if let Some(asm) = &insn.asm_data {
+                if let Some(asm) = &insn.extra().asm_data {
                     for input in &asm.inputs {
                         let p = input.pseudo;
                         first_pos_map[idx].entry(p).or_insert(ipos);
@@ -633,13 +633,13 @@ where
                     propagate_use(idx, src, &mut live_in, &mut live_out, &mut worklist);
                 }
             }
-            if let Some(indirect) = insn.indirect_target {
+            if let Some(indirect) = insn.extra().indirect_target {
                 if !defined_so_far.contains(&indirect) {
                     propagate_use(idx, indirect, &mut live_in, &mut live_out, &mut worklist);
                 }
             }
             if insn.op == Opcode::Asm {
-                if let Some(asm) = &insn.asm_data {
+                if let Some(asm) = &insn.extra().asm_data {
                     for input in &asm.inputs {
                         if !defined_so_far.contains(&input.pseudo) {
                             propagate_use(
@@ -824,7 +824,12 @@ pub fn identify_addr_taken_syms(func: &Function) -> HashSet<PseudoId> {
                     addr_taken.insert(src);
                 }
             }
-            if let Some(asm) = insn.asm_data.as_ref().filter(|_| insn.op == Opcode::Asm) {
+            if let Some(asm) = insn
+                .extra()
+                .asm_data
+                .as_ref()
+                .filter(|_| insn.op == Opcode::Asm)
+            {
                 for c in asm.outputs.iter().chain(asm.inputs.iter()) {
                     if c.is_memory() {
                         addr_taken.insert(c.pseudo);
@@ -1130,7 +1135,7 @@ pub fn build_interference_graph(
                 }
             }
             if insn.op == Opcode::Asm {
-                if let Some(asm) = &insn.asm_data {
+                if let Some(asm) = &insn.extra().asm_data {
                     for output in &asm.outputs {
                         // A memory output defines nothing; it reads an address.
                         if !output.is_memory() && candidates.contains(&output.pseudo) {
@@ -1146,7 +1151,7 @@ pub fn build_interference_graph(
             // register a plain output may take. A tied input names the
             // output's own pseudo and so shares with it by construction.
             if insn.op == Opcode::Asm {
-                if let Some(asm) = &insn.asm_data {
+                if let Some(asm) = &insn.extra().asm_data {
                     add_early_clobber_edges(&mut graph, asm, candidates);
                 }
             }
@@ -1182,13 +1187,13 @@ pub fn build_interference_graph(
                     live.insert(src);
                 }
             }
-            if let Some(indirect) = insn.indirect_target {
+            if let Some(indirect) = insn.extra().indirect_target {
                 if candidates.contains(&indirect) {
                     live.insert(indirect);
                 }
             }
             if insn.op == Opcode::Asm {
-                if let Some(asm) = &insn.asm_data {
+                if let Some(asm) = &insn.extra().asm_data {
                     for input in &asm.inputs {
                         if candidates.contains(&input.pseudo) {
                             live.insert(input.pseudo);
@@ -1267,7 +1272,12 @@ pub fn find_copy_coalesce_candidates(func: &Function) -> Vec<(PseudoId, PseudoId
 pub fn asm_register_operands(func: &Function) -> std::collections::BTreeSet<PseudoId> {
     let mut out = std::collections::BTreeSet::new();
     for insn in func.blocks.iter().flat_map(|b| &b.insns) {
-        let Some(asm) = insn.asm_data.as_ref().filter(|_| insn.op == Opcode::Asm) else {
+        let Some(asm) = insn
+            .extra()
+            .asm_data
+            .as_ref()
+            .filter(|_| insn.op == Opcode::Asm)
+        else {
             continue;
         };
         for c in asm.outputs.iter().chain(asm.inputs.iter()) {
@@ -1417,11 +1427,11 @@ pub fn compute_use_positions(func: &Function) -> BTreeMap<PseudoId, Vec<usize>> 
             for &src in &insn.src {
                 uses.entry(src).or_default().push(pos);
             }
-            if let Some(indirect) = insn.indirect_target {
+            if let Some(indirect) = insn.extra().indirect_target {
                 uses.entry(indirect).or_default().push(pos);
             }
             if insn.op == Opcode::Asm {
-                if let Some(asm) = &insn.asm_data {
+                if let Some(asm) = &insn.extra().asm_data {
                     for input in &asm.inputs {
                         uses.entry(input.pseudo).or_default().push(pos);
                     }

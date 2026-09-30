@@ -69,7 +69,7 @@ impl<'a> SsaConverter<'a> {
                 for src in &insn.src {
                     max_pseudo_id = max_pseudo_id.max(src.0);
                 }
-                if let Some(indirect) = insn.indirect_target {
+                if let Some(indirect) = insn.extra().indirect_target {
                     max_pseudo_id = max_pseudo_id.max(indirect.0);
                 }
                 for (_, phi_src) in &insn.phi_list {
@@ -1353,7 +1353,7 @@ mod tests {
         let mut call = Instruction::new(Opcode::Call);
         call.target = Some(ret);
         call.src = vec![x_sym];
-        call.func_name = Some("g".to_string());
+        call.extra_mut().func_name = Some("g".to_string());
         entry.add_insn(call);
         entry.add_insn(Instruction::ret(Some(ret)));
         func.entry = BasicBlockId(0);
@@ -1396,7 +1396,7 @@ mod tests {
         let mut call = Instruction::new(Opcode::Call);
         call.target = Some(ret);
         call.src = vec![a];
-        call.func_name = Some("g".to_string());
+        call.extra_mut().func_name = Some("g".to_string());
         entry.add_insn(call);
         entry.add_insn(Instruction::ret(Some(ret)));
         func.entry = BasicBlockId(0);

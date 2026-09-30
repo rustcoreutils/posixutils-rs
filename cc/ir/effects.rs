@@ -125,7 +125,7 @@ fn summarize(f: &Function, types: &TypeTable) -> Summary {
     for bb in &f.blocks {
         for insn in &bb.insns {
             if insn.op == Opcode::Call {
-                match insn.func_name.as_deref() {
+                match insn.extra().func_name.as_deref() {
                     Some(n) => {
                         if !callees.iter().any(|c| c == n) {
                             callees.push(n.to_string());

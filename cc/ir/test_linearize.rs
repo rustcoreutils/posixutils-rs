@@ -1830,7 +1830,7 @@ fn calls_in(module: &Module, f: &str) -> Vec<String> {
         .iter()
         .flat_map(|bb| bb.insns.iter())
         .filter(|i| i.op == Opcode::Call)
-        .filter_map(|i| i.func_name.clone())
+        .filter_map(|i| i.extra().func_name.clone())
         .collect()
 }
 
@@ -6378,7 +6378,7 @@ fn test_atomic_compound_assign_uses_fetch_add() {
         .flat_map(|bb| bb.insns.iter())
         .find(|i| i.op == Opcode::AtomicFetchAdd)
         .unwrap();
-    assert_eq!(insn.memory_order, MemoryOrder::SeqCst);
+    assert_eq!(insn.extra().memory_order, MemoryOrder::SeqCst);
     assert_eq!(insn.size, 32);
     assert_eq!(insn.src.len(), 3, "expected [addr, value, order]");
 }
@@ -7165,7 +7165,7 @@ fn test_va_arg_pack_becomes_a_flag_not_an_argument() {
 
     // The pack is recorded, and contributed no operand: only the `1` is there.
     assert!(
-        calls[0].ends_with_va_arg_pack,
+        calls[0].extra().ends_with_va_arg_pack,
         "the call should carry the pack"
     );
     assert_eq!(
@@ -7174,7 +7174,7 @@ fn test_va_arg_pack_becomes_a_flag_not_an_argument() {
         "the pack must not become an argument: {:?}",
         calls[0].src
     );
-    assert_eq!(calls[0].arg_types.len(), calls[0].src.len());
+    assert_eq!(calls[0].extra().arg_types.len(), calls[0].src.len());
 }
 
 /// A declaration inside a function body with `extern` declares no object: it
@@ -7501,8 +7501,8 @@ fn test_asm_goto_output_written_back_on_the_label_edge() {
         .flat_map(|bb| bb.insns.iter())
         .find(|insn| insn.op == Opcode::Asm)
         .expect("an asm instruction");
-    let out_pseudo = asm.asm_data.as_ref().unwrap().outputs[0].pseudo;
-    let (edge, _) = asm.asm_data.as_ref().unwrap().goto_labels[0];
+    let out_pseudo = asm.extra().asm_data.as_ref().unwrap().outputs[0].pseudo;
+    let (edge, _) = asm.extra().asm_data.as_ref().unwrap().goto_labels[0];
     let edge = func.get_block(edge).expect("the label edge block");
     assert!(
         edge.insns
@@ -7581,7 +7581,7 @@ fn test_asm_memory_operand_names_its_object() {
         .flat_map(|bb| bb.insns.iter())
         .find(|insn| insn.op == Opcode::Asm)
         .expect("an asm instruction");
-    let data = asm.asm_data.as_ref().unwrap();
+    let data = asm.extra().asm_data.as_ref().unwrap();
     for c in data.outputs.iter().chain(data.inputs.iter()) {
         assert!(
             matches!(
@@ -7717,7 +7717,11 @@ fn test_call_argument_types_follow_the_callee() {
         .collect();
     assert_eq!(calls.len(), 2);
     let kinds = |call: &Instruction| -> Vec<TypeKind> {
-        call.arg_types.iter().map(|&t| types.kind(t)).collect()
+        call.extra()
+            .arg_types
+            .iter()
+            .map(|&t| types.kind(t))
+            .collect()
     };
     assert_eq!(
         kinds(calls[0]),
@@ -7783,10 +7787,10 @@ fn test_sqrt_keeps_a_call_for_errno() {
     let insns = insns_of(&module, "f");
     let sqrt: Vec<_> = insns.iter().filter(|i| i.op == Opcode::Sqrt).collect();
     assert_eq!(sqrt.len(), 1);
-    assert_eq!(sqrt[0].func_name.as_deref(), Some("sqrt"));
+    assert_eq!(sqrt[0].extra().func_name.as_deref(), Some("sqrt"));
     let calls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::Call).collect();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].func_name.as_deref(), Some("sqrt"));
+    assert_eq!(calls[0].extra().func_name.as_deref(), Some("sqrt"));
     assert!(insns.iter().any(|i| i.op == Opcode::FCmpOLt));
     assert!(insns.iter().any(|i| i.op == Opcode::Phi));
 }
@@ -7805,13 +7809,13 @@ fn test_rounding_is_one_opcode() {
         .iter()
         .find(|i| i.op == Opcode::RoundToIntegral(Floor))
         .expect("floor");
-    assert_eq!(floor.func_name.as_deref(), Some("floorf"));
+    assert_eq!(floor.extra().func_name.as_deref(), Some("floorf"));
     assert_eq!(floor.size, 32, "computed at float");
     let nearby = insns
         .iter()
         .find(|i| i.op == Opcode::RoundToIntegral(NearbyInt))
         .expect("nearbyint");
-    assert_eq!(nearby.func_name.as_deref(), Some("nearbyint"));
+    assert_eq!(nearby.extra().func_name.as_deref(), Some("nearbyint"));
     assert_eq!(nearby.size, 64);
 }
 
@@ -7831,7 +7835,7 @@ fn test_min_max_fma_are_opcodes() {
         (Opcode::FMax, "fmax", 2, 64),
     ] {
         let insn = insns.iter().find(|i| i.op == op).expect(name);
-        assert_eq!(insn.func_name.as_deref(), Some(name));
+        assert_eq!(insn.extra().func_name.as_deref(), Some(name));
         assert_eq!((insn.src.len(), insn.size), (srcs, size), "{name}");
     }
 }
@@ -7852,7 +7856,7 @@ fn test_own_definition_below_the_call_is_called() {
     let calls: Vec<_> = insns
         .iter()
         .filter(|i| i.op == Opcode::Call)
-        .map(|i| i.func_name.as_deref())
+        .map(|i| i.extra().func_name.as_deref())
         .collect();
     assert_eq!(calls, [Some("memcpy"), Some("floor")]);
     assert!(!insns
@@ -7872,7 +7876,7 @@ fn test_memory_builtins_are_their_opcodes() {
     let ops: Vec<_> = insns_of(&module, "f")
         .iter()
         .filter(|i| matches!(i.op, Opcode::Memcpy | Opcode::Memset | Opcode::Memmove))
-        .map(|i| (i.op, i.func_name.as_deref(), i.src.len()))
+        .map(|i| (i.op, i.extra().func_name.as_deref(), i.src.len()))
         .collect();
     assert_eq!(
         ops,
@@ -8109,7 +8113,7 @@ fn test_sqrt_without_errno_or_without_an_instruction() {
         .any(|i| i.op == Opcode::Sqrt || i.op == Opcode::FCmpOLt));
     let calls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::Call).collect();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].func_name.as_deref(), Some("sqrtl"));
+    assert_eq!(calls[0].extra().func_name.as_deref(), Some("sqrtl"));
 }
 
 /// `abs` and its siblings become the branch-free `(x ^ s) - s` sequence
@@ -9062,7 +9066,7 @@ fn test_complex_multiply_routine_follows_the_return_class() {
             .blocks
             .iter()
             .flat_map(|b| &b.insns)
-            .find(|i| i.op == Opcode::Call && i.func_name.as_deref() == Some(routine))
+            .find(|i| i.op == Opcode::Call && i.extra().func_name.as_deref() == Some(routine))
             .unwrap_or_else(|| panic!("{base} on {arch:?}: no {routine} call"));
         assert_eq!(
             call.returns_via_sret(),
@@ -9095,9 +9099,9 @@ fn test_known_call_keeps_its_tag_under_an_asm_label() {
     };
     let f = call_in("f");
     let label = crate::arch::lir::verbatim("my_strstr");
-    assert_eq!(f.func_name.as_deref(), Some(label.as_str()));
-    assert_eq!(f.known, Some(crate::parse::ast::LibFn::Strstr));
-    assert_eq!(call_in("g").known, None);
+    assert_eq!(f.extra().func_name.as_deref(), Some(label.as_str()));
+    assert_eq!(f.extra().known, Some(crate::parse::ast::LibFn::Strstr));
+    assert_eq!(call_in("g").extra().known, None);
 }
 
 /// A cast to `void` converts nothing: `(void)x` of a floating `x` was a
@@ -10308,11 +10312,11 @@ fn test_every_register_returned_aggregate_carries_its_class() {
         .expect("a ret");
     assert!(
         matches!(
-            ret.abi_info.as_ref().map(|a| &a.ret),
+            ret.extra().abi_info.as_ref().map(|a| &a.ret),
             Some(crate::abi::ArgClass::Hfa { count: 4, .. })
         ),
         "{:?}",
-        ret.abi_info
+        ret.extra().abi_info
     );
     assert!(ret.returns_aggregate_address());
     assert!(

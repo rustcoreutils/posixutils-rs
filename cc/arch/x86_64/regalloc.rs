@@ -516,7 +516,7 @@ pub fn build_asm_instr_constraints_x86_64(
     insn: &Instruction,
 ) -> Option<crate::arch::asm_constraints::InstrConstraints<Reg>> {
     Some(crate::arch::asm_constraints::InstrConstraints::of_asm(
-        insn.asm_data.as_ref()?,
+        insn.extra().asm_data.as_ref()?,
         parse_x86_64_fixed_letter,
         parse_x86_64_class_letter,
         parse_gp_clobber_name,
@@ -929,7 +929,7 @@ impl FrameBase {
             .iter()
             .flat_map(|b| b.insns.iter())
             .filter(|insn| matches!(insn.op, Opcode::Call))
-            .flat_map(|insn| insn.arg_types.iter())
+            .flat_map(|insn| insn.extra().arg_types.iter())
             .map(|t| types.alignment(*t) as i32)
             .max()
             .unwrap_or(8);
@@ -1279,7 +1279,12 @@ impl RegAlloc {
     /// store into. A tied input is classed by the output it names.
     fn identify_x87_asm_operands(&mut self, func: &Function) {
         for insn in func.blocks.iter().flat_map(|b| &b.insns) {
-            let Some(asm) = insn.asm_data.as_ref().filter(|_| insn.op == Opcode::Asm) else {
+            let Some(asm) = insn
+                .extra()
+                .asm_data
+                .as_ref()
+                .filter(|_| insn.op == Opcode::Asm)
+            else {
                 continue;
             };
             for c in asm.outputs.iter().chain(&asm.inputs) {
@@ -2676,7 +2681,7 @@ mod tests {
             })
             .partition(|c| c.constraint.starts_with('=') || c.constraint.starts_with('+'));
         let mut insn = Instruction::new(Opcode::Asm);
-        insn.asm_data = Some(Box::new(AsmData {
+        insn.extra_mut().asm_data = Some(Box::new(AsmData {
             template: String::new(),
             outputs,
             inputs,
@@ -2730,6 +2735,7 @@ mod tests {
         assert!(clobbers.contains(&Reg::Rax));
         assert_eq!(exempt, vec![PseudoId(3)]);
         pinned
+            .extra_mut()
             .asm_data
             .as_mut()
             .unwrap()
@@ -2756,10 +2762,10 @@ mod tests {
                 ("0", PseudoId(4)),
             ],
         );
-        let data = asm.asm_data.as_mut().unwrap();
+        let data = asm.extra_mut().asm_data.as_mut().unwrap();
         data.inputs[1].matching_output = Some(0);
         let mut ld = make_asm_insn(&[], &[("=f", PseudoId(5))]);
-        ld.asm_data.as_mut().unwrap().outputs[0].size = 128;
+        ld.extra_mut().asm_data.as_mut().unwrap().outputs[0].size = 128;
 
         let types = crate::types::TypeTable::new(&crate::target::Target::host());
         let mut func = Function::new("f", types.void_id);

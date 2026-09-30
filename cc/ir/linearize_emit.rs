@@ -190,66 +190,47 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Emit stores to zero-initialize an aggregate (struct, union, or array)
-    /// This handles C99 6.7.8p19: uninitialized members must be zero-initialized
+    /// Zero a whole aggregate (struct, union or array), which is what C17
+    /// 6.7.9p19 asks for before an initializer list is applied: every member
+    /// the list does not reach is initialized as a static object would be.
     pub(crate) fn emit_aggregate_zero(&mut self, base_sym: PseudoId, typ: TypeId) {
-        let total_bytes = self.types.size_bytes(typ);
-        let mut offset: i64 = 0;
+        let total_bytes = self.types.size_bytes(typ) as i64;
+        self.emit_block_zero(base_sym, 0, total_bytes);
+    }
 
-        // Create a zero constant for 64-bit stores
-        let zero64 = self.emit_const(0, self.types.long_id);
-
-        // Zero in 8-byte chunks
-        while offset + 8 <= total_bytes as i64 {
-            self.emit(Instruction::store(
-                zero64,
-                base_sym,
-                offset,
-                self.types.long_id,
-                64,
-            ));
-            offset += 8;
+    /// Emit a fill of `size_bytes` zero bytes at `dst` + `dst_base_offset`.
+    ///
+    /// One `Opcode::Memset`, which `memexpand` turns into stores when the run
+    /// is short and leaves as a call when it is not. So the bound on the
+    /// unroll is `memexpand::INLINE_LIMIT_BYTES` -- the one every block memory
+    /// operation in the compiler shares -- rather than another copy of the
+    /// 8/4/2/1 descent with a cap of its own, which is what this was: a
+    /// hand-rolled ladder with **no** upper bound at all, so
+    /// `char buf[N] = {0}` emitted one store per chunk for any N. 8 KB cost
+    /// 2081 instructions in the function body and 1 MB did not finish
+    /// compiling in 25 minutes, while its sibling
+    /// [`Self::emit_block_copy_at_offset`] had capped at the shared limit all
+    /// along.
+    ///
+    /// `memexpand::run` runs at every optimization level, `-O0` included, so
+    /// the expansion does not depend on optimizing -- the same reason the
+    /// opcode a program's own `memset` becomes is expanded there rather than
+    /// here.
+    pub(crate) fn emit_block_zero(&mut self, dst: PseudoId, dst_base_offset: i64, size_bytes: i64) {
+        if size_bytes <= 0 {
+            return;
         }
-
-        // Handle remaining bytes (if any)
-        if offset < total_bytes as i64 {
-            let remaining = total_bytes as i64 - offset;
-            if remaining >= 4 {
-                let zero32 = self.emit_const(0, self.types.int_id);
-                self.emit(Instruction::store(
-                    zero32,
-                    base_sym,
-                    offset,
-                    self.types.int_id,
-                    32,
-                ));
-                offset += 4;
-            }
-            if offset < total_bytes as i64 {
-                let remaining = total_bytes as i64 - offset;
-                if remaining >= 2 {
-                    let zero16 = self.emit_const(0, self.types.short_id);
-                    self.emit(Instruction::store(
-                        zero16,
-                        base_sym,
-                        offset,
-                        self.types.short_id,
-                        16,
-                    ));
-                    offset += 2;
-                }
-                if offset < total_bytes as i64 {
-                    let zero8 = self.emit_const(0, self.types.char_id);
-                    self.emit(Instruction::store(
-                        zero8,
-                        base_sym,
-                        offset,
-                        self.types.char_id,
-                        8,
-                    ));
-                }
-            }
-        }
+        let dst_ptr = self.block_dest_addr(dst, dst_base_offset);
+        let byte = self.emit_const(0, self.types.int_id);
+        let n = self.emit_const(size_bytes as i128, self.types.ulong_id);
+        let result = self.alloc_pseudo();
+        self.emit(
+            Instruction::new(Opcode::Memset)
+                .with_func(self.library_function_name("memset"))
+                .with_target(result)
+                .with_src3(dst_ptr, byte, n)
+                .with_type_and_size(self.types.void_ptr_id, 64),
+        );
     }
 
     /// Emit a block copy from src to dst using integer chunks.
@@ -288,10 +269,37 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// The same copy as a `memcpy` call.
+    /// The address `dst` + `dst_base_offset` names, as a block memory
+    /// operation takes it.
     ///
-    /// `dst_base_offset` is folded into the destination pointer first, since
-    /// `memcpy` takes an address rather than a base and a displacement.
+    /// These opcodes take addresses. A `Sym` pseudo names a local's *storage*,
+    /// not a pointer to it -- a `Store` can name it directly, a call cannot.
+    /// Passing the Sym itself handed `memcpy` a meaningless value and
+    /// segfaulted every copy over the threshold. `rvalue_addr` is the existing
+    /// answer to this question and returns a non-Sym pseudo unchanged.
+    ///
+    /// `dst_base_offset` is folded into the pointer, since these take an
+    /// address rather than a base and a displacement.
+    fn block_dest_addr(&mut self, dst: PseudoId, dst_base_offset: i64) -> PseudoId {
+        let void_ptr = self.types.void_ptr_id;
+        let dst = self.rvalue_addr(dst, void_ptr);
+        if dst_base_offset == 0 {
+            return dst;
+        }
+        let off = self.emit_const(dst_base_offset as i128, self.types.long_id);
+        let adjusted = self.alloc_reg_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Add,
+            adjusted,
+            dst,
+            off,
+            void_ptr,
+            64,
+        ));
+        adjusted
+    }
+
+    /// The same copy as a `memcpy` call.
     fn emit_block_copy_call(
         &mut self,
         dst: PseudoId,
@@ -299,31 +307,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         src: PseudoId,
         size_bytes: i64,
     ) {
-        // `memcpy` takes addresses. A `Sym` pseudo names a local's *storage*,
-        // not a pointer to it -- the inline path could store through it
-        // directly, this one cannot. Passing the Sym itself handed memcpy a
-        // meaningless value and segfaulted every copy over the threshold.
-        // `rvalue_addr` is the existing answer to this question and returns a
-        // non-Sym pseudo unchanged.
-        let void_ptr = self.types.void_ptr_id;
-        let dst = self.rvalue_addr(dst, void_ptr);
-        let src = self.rvalue_addr(src, void_ptr);
-
-        let dst_ptr = if dst_base_offset == 0 {
-            dst
-        } else {
-            let off = self.emit_const(dst_base_offset as i128, self.types.long_id);
-            let adjusted = self.alloc_reg_pseudo();
-            self.emit(Instruction::binop(
-                Opcode::Add,
-                adjusted,
-                dst,
-                off,
-                self.types.void_ptr_id,
-                64,
-            ));
-            adjusted
-        };
+        let dst_ptr = self.block_dest_addr(dst, dst_base_offset);
+        let src = self.rvalue_addr(src, self.types.void_ptr_id);
         let n = self.emit_const(size_bytes as i128, self.types.ulong_id);
         let result = self.alloc_pseudo();
         self.emit(

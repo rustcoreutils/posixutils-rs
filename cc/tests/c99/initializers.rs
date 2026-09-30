@@ -2637,3 +2637,147 @@ int main(void)
         0
     );
 }
+
+/// A string literal initializing a nested array element, in every encoding.
+///
+/// `is_string_for_char_array` accepts all four literal kinds, but the body that
+/// consumed them handled only the narrow one and silently `continue`d on the
+/// rest, so a wide element was dropped and left zero. The same loop stepped the
+/// destination by *bytes* while a wide element is 2 or 4 bytes wide, and it had
+/// no capacity clamp at all — a third hand-rolled copy of what
+/// `store_string_units` already does correctly for the non-nested form.
+///
+/// The static twin of each case was already right, which is how the two paths
+/// could disagree: `static wchar_t sw[2][4] = {L"ab", L"cd"}` read back 97/99
+/// while the automatic form read back 0/0.
+#[test]
+fn c99_a_nested_string_literal_element_is_stored_in_every_encoding() {
+    let code = r#"
+#include <wchar.h>
+/* <uchar.h> does not exist on macOS, and the test needs only the two types --
+   the same substitution the universal-character-name test above makes. */
+typedef unsigned short char16_t;
+typedef unsigned int char32_t;
+
+int main(void)
+{
+    /* Narrow, and the tail of a short element must be zero. */
+    char n[2][4] = {"ab", "cd"};
+    if (n[0][0] != 'a' || n[0][1] != 'b' || n[0][2] != 0 || n[0][3] != 0) return 1;
+    if (n[1][0] != 'c' || n[1][1] != 'd' || n[1][2] != 0 || n[1][3] != 0) return 2;
+
+    /* Wide: dropped entirely before the fix. */
+    wchar_t w[2][4] = {L"ab", L"cd"};
+    if ((int)w[0][0] != 'a' || (int)w[0][1] != 'b' || w[0][2] != 0) return 3;
+    if ((int)w[1][0] != 'c' || (int)w[1][1] != 'd' || w[1][2] != 0) return 4;
+
+    char16_t u[2][4] = {u"ab", u"cd"};
+    if ((int)u[0][0] != 'a' || (int)u[1][0] != 'c' || u[0][2] != 0) return 5;
+
+    char32_t U[2][4] = {U"ab", U"cd"};
+    if ((int)U[0][0] != 'a' || (int)U[1][0] != 'c' || U[0][2] != 0) return 6;
+
+    /* The static path was always correct; the two must now agree. */
+    static wchar_t sw[2][4] = {L"ab", L"cd"};
+    if ((int)sw[0][0] != 'a' || (int)sw[1][0] != 'c') return 7;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("nested_string_encodings", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("nested_string_encodings_opt", code),
+        0
+    );
+}
+
+/// A string literal too long for the array it initializes writes only as much
+/// as fits.
+///
+/// C17 6.7.9p14 allows exactly the terminating NUL to be dropped, and nothing
+/// more. The nested-array path had no clamp, so `char s[1][3] = {"hello"}`
+/// stored five bytes into a three-byte object — two of them past the whole
+/// local, not merely into the next row. The guards on either side are what make
+/// that visible rather than layout-dependent.
+#[test]
+fn c99_an_overlong_string_literal_does_not_write_past_its_array() {
+    let code = r#"
+int main(void)
+{
+    unsigned char lo = 0xA5;
+    char s[1][3] = {"hello"};
+    unsigned char hi = 0x5A;
+    if (s[0][0] != 'h' || s[0][1] != 'e' || s[0][2] != 'l') return 1;
+    if (lo != 0xA5 || hi != 0x5A) return 2;
+
+    /* Exactly the terminator dropped: this is legal and keeps all three. */
+    unsigned char lo2 = 0xA5;
+    char e[1][3] = {"abc"};
+    unsigned char hi2 = 0x5A;
+    if (e[0][0] != 'a' || e[0][1] != 'b' || e[0][2] != 'c') return 3;
+    if (lo2 != 0xA5 || hi2 != 0x5A) return 4;
+
+    /* Wide, where the stride is 4 bytes and a byte-stepped copy lands wrong. */
+    unsigned char lo3 = 0xA5;
+    __WCHAR_TYPE__ w[1][2] = {L"xyz"};
+    unsigned char hi3 = 0x5A;
+    if ((int)w[0][0] != 'x' || (int)w[0][1] != 'y') return 5;
+    if (lo3 != 0xA5 || hi3 != 0x5A) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("overlong_nested_string", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("overlong_nested_string_opt", code),
+        0
+    );
+}
+
+/// `char buf[N] = "str"` zero-fills the bytes the literal does not reach.
+///
+/// C17 6.7.9p21: the members not initialized explicitly are initialized as a
+/// static object would be, i.e. to zero. The `InitList` arm of a local
+/// declaration calls `emit_aggregate_zero` first; the string arm did not, so
+/// only the literal's own bytes were written.
+///
+/// On entry the backend zeroes the whole frame, which hides this the first time
+/// through — the declaration is inside a loop so the second pass sees what the
+/// first one left. All four encodings are affected.
+#[test]
+fn c99_a_string_initializer_zero_fills_the_rest_of_its_array() {
+    let code = r#"
+#include <wchar.h>
+
+int main(void)
+{
+    for (int pass = 0; pass < 2; pass++) {
+        char b[8] = "hi";
+        if (b[2] != 0 || b[3] != 0 || b[7] != 0) return 1;
+        b[3] = 'Z';
+        b[7] = 'Z';
+    }
+
+    for (int pass = 0; pass < 2; pass++) {
+        wchar_t w[4] = L"hi";
+        if (w[2] != 0 || w[3] != 0) return 2;
+        w[3] = 'Z';
+    }
+
+    /* The braced form went through the InitList arm and was already correct;
+       both spellings must now agree. */
+    for (int pass = 0; pass < 2; pass++) {
+        char c[8] = {"hi"};
+        if (c[3] != 0 || c[7] != 0) return 3;
+        c[3] = 'Z';
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("string_init_zero_fill", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("string_init_zero_fill_opt", code),
+        0
+    );
+}

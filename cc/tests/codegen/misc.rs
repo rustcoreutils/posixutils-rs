@@ -16438,3 +16438,165 @@ int main(void) {
         );
     }
 }
+
+/// Zero-initializing an aggregate, across the size at which unrolling stops.
+///
+/// The companion to `codegen_struct_copy_across_the_inline_threshold`, for the
+/// other half of the same family. `emit_aggregate_zero` hand-rolled the same
+/// 8/4/2/1 descent that `memexpand::block_chunks` already produces, but with
+/// **no upper bound** — so `char buf[N] = {0}` emitted one store per chunk for
+/// any N. Measured before the fix: 8 KB cost 2081 instructions in the function
+/// body and 1 MB did not finish compiling in 25 minutes, while its sibling
+/// `emit_block_copy_at_offset` had capped at `INLINE_LIMIT_BYTES` all along.
+///
+/// The declaration is inside a loop on purpose. On entry the backend zeroes the
+/// whole frame, which masks a missing zero-fill the first time through; only
+/// re-execution shows it.
+///
+/// Sizes straddle 128 and none is a multiple of 8, so a rounded-up or
+/// short-by-a-tail fill shows as a wrong byte rather than passing by luck.
+#[test]
+fn codegen_aggregate_zero_across_the_inline_threshold() {
+    let code = r#"
+void sink(char *p);
+
+#define MKZ(N)                                                            \
+    static int zero##N(void) {                                            \
+        for (int pass = 0; pass < 2; pass++) {                            \
+            unsigned char lo = 0xA5;                                      \
+            char buf[N] = {0};                                            \
+            unsigned char hi = 0x5A;                                      \
+            for (int i = 0; i < N; i++)                                   \
+                if (buf[i] != 0) return 1;                                \
+            if (lo != 0xA5 || hi != 0x5A) return 2;                       \
+            for (int i = 0; i < N; i++) buf[i] = (char)(i + 1);           \
+            sink(buf);                                                    \
+        }                                                                 \
+        return 0;                                                         \
+    }
+
+MKZ(7)
+MKZ(12)
+MKZ(13)
+MKZ(127)
+MKZ(129)
+MKZ(200)
+MKZ(1000)
+
+void sink(char *p) { (void)p; }
+
+int main(void)
+{
+    if (zero7()) return 1;
+    if (zero12()) return 2;
+    if (zero13()) return 3;
+    if (zero127()) return 4;
+    if (zero129()) return 5;
+    if (zero200()) return 6;
+    if (zero1000()) return 7;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("aggregate_zero_threshold", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("aggregate_zero_threshold_opt", code),
+        0
+    );
+}
+
+/// The bound itself, not just the answer: above the threshold the zero-fill is
+/// a `memset` call, below it is still stores.
+///
+/// The behavioural test above passes either way — a million unrolled stores
+/// produce a correctly zeroed object, just not in a time anyone will wait for.
+/// This is the test that the *bound* exists, and the negative half keeps it
+/// from being satisfied by calling `memset` for every size, which would cost
+/// more than the stores it replaced for a small object.
+#[test]
+fn codegen_a_large_aggregate_zero_is_a_memset_call() {
+    use crate::codegen::asm_probe::{asm_for_with, AARCH64_LINUX, X86_64_LINUX};
+
+    let src = |n: usize| {
+        format!("void sink(char *);\nvoid probe(void) {{ char buf[{n}] = {{0}}; sink(buf); }}\n")
+    };
+
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        // Comfortably over `INLINE_LIMIT_BYTES` (128).
+        let big = asm_for_with("aggzero_big", triple, &src(4096), &["-O2"]);
+        assert!(
+            big.contains("memset"),
+            "a 4096-byte zero-fill belongs in a memset call, not 512 stores, on {triple}:\n{big}"
+        );
+
+        // And the unrolled form is still used where it is cheaper than a call.
+        let small = asm_for_with("aggzero_small", triple, &src(16), &["-O2"]);
+        assert!(
+            !small.contains("memset"),
+            "a 16-byte zero-fill is cheaper unrolled than called, on {triple}:\n{small}"
+        );
+    }
+}
+
+/// The inliner moves an implicit parameter copy in whole eight-byte chunks,
+/// which reads and writes past a object whose size is not a multiple of eight.
+///
+/// The third copy of the unrolled block move, after the two named in
+/// `codegen_struct_copy_across_the_inline_threshold`. `while offset < size_bytes
+/// { load 64; store 64; offset += 8 }` rounds *up*: a 12-byte `struct P` moved
+/// 16 bytes, over-reading the argument and over-writing the callee's local.
+/// `memexpand::block_chunks` descends 8/4/2/1 and is what the already-fixed
+/// twin in the linearizer uses.
+///
+/// Stated on the IR because the overrun is layout-dependent: the four extra
+/// bytes usually land in frame padding, so a program can be correct and still
+/// be reading memory that does not belong to the object — and would fault if it
+/// ended a page.
+#[test]
+fn codegen_an_inlined_parameter_copy_moves_no_more_than_the_object() {
+    let src = r#"
+struct P { float x, y, z; };
+static float sum(struct P p) { return p.x + p.y + p.z; }
+float probe(void) { struct P q = {1, 2, 3}; return sum(q); }
+"#;
+    let dir = plib::tmp::Builder::new()
+        .prefix("inline_param_copy")
+        .tempdir()
+        .expect("tempdir");
+    let c = dir.path().join("t.c");
+    std::fs::write(&c, src).expect("write source");
+    let r = crate::common::run_c17(&[
+        "-O2",
+        "--dump-ir",
+        "post-opt",
+        "--dump-ir-func",
+        "probe",
+        "-S",
+        "-o",
+        "/dev/null",
+        c.to_str().unwrap(),
+    ]);
+    assert!(r.success, "compile failed: {}", r.stderr);
+    let ir = format!("{}{}", r.stdout, r.stderr);
+
+    // A 12-byte object has four bytes at offset 8, so a 64-bit access there is
+    // four bytes past the end -- on the load side and again on the store side.
+    // A correct copy reaches it with a 32-bit access.
+    let overruns: Vec<&str> = ir
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("+ 8") && (l.contains("load.64") || l.contains("store.64")))
+        .collect();
+    assert!(
+        overruns.is_empty(),
+        "a 12-byte object has 4 bytes at offset 8, so these access 4 past it:\n  {}\n\nfull IR:\n{ir}",
+        overruns.join("\n  ")
+    );
+
+    // The control: the copy has to still be there. If the inliner stopped
+    // inlining, or the parameter stopped being copied, the check above would
+    // pass while testing nothing.
+    assert!(
+        ir.contains("+ 8"),
+        "expected the inlined parameter copy to reach offset 8 at all:\n{ir}"
+    );
+}

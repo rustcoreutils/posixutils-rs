@@ -37,6 +37,24 @@ fn return_value_ness_violation(pos: Position, msg: &str) {
 
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 
+/// Whether [`Linearizer::store_string_units`] owes the destination's tail a
+/// zero fill.
+///
+/// C17 6.7.9p21 zeroes every element a string initializer does not reach, and
+/// exactly one of the two spellings already has that covered: the braced form
+/// reaches the array through an initializer list, and each list is preceded by
+/// a whole-object [`Linearizer::emit_aggregate_zero`]. Zeroing again there
+/// would double the stores at `-O0`, where no `dse` runs to remove them.
+#[derive(Clone, Copy)]
+pub(crate) enum StringTail {
+    /// The destination is already zero: the caller zeroed the whole aggregate
+    /// before walking the initializer list.
+    AlreadyZero,
+    /// Nothing has written the destination yet, so the tail is this call's to
+    /// fill.
+    Zero,
+}
+
 /// Which construct a jump leaves, for `unwind_vla_marks`.
 ///
 /// `break` leaves the innermost loop *or* switch; `continue` leaves the
@@ -545,7 +563,18 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // scalar case below and stored the literal's *address*
                     // into the array's first element.
                     if self.types.kind(typ) == TypeKind::Array {
-                        self.store_string_units(sym_id, 0, typ, &init.kind, &units);
+                        // Nothing has zeroed this local -- the `InitList` arm
+                        // above calls `emit_aggregate_zero` and this one never
+                        // did -- so the elements past the literal are
+                        // `store_string_units`' to fill.
+                        self.store_string_units(
+                            sym_id,
+                            0,
+                            typ,
+                            &init.kind,
+                            &units,
+                            StringTail::Zero,
+                        );
                     } else {
                         // Pointer initialized with a string literal — store the address
                         let val = self.linearize_expr(init);
@@ -956,12 +985,15 @@ impl<'a> super::linearize::Linearizer<'a> {
                     if let [only] = elements {
                         if only.designators.is_empty() {
                             if let Some(units) = Self::string_literal_units(&only.value.kind) {
+                                // Every initializer list is preceded by a
+                                // whole-object zero, so the tail is done.
                                 self.store_string_units(
                                     base_sym,
                                     base_offset,
                                     typ,
                                     &only.value.kind,
                                     &units,
+                                    StringTail::AlreadyZero,
                                 );
                                 return;
                             }
@@ -981,53 +1013,33 @@ impl<'a> super::linearize::Linearizer<'a> {
                         continue;
                     };
                     let offset = base_offset + element_index * elem_size as i64;
-                    // When a string literal initializes a char array element
-                    // (e.g., char arr[3][4] = {"Sun", "Mon", "Tue"}), handle
-                    // it as a string copy rather than recursing into individual
-                    // char stores. The recursion would treat the string as a
-                    // pointer instead of inline data.
-                    let is_string_for_char_array = elem_is_aggregate
-                        && list.len() == 1
-                        && matches!(
-                            list[0].value.kind,
-                            ExprKind::StringLit(_)
-                                | ExprKind::WideStringLit(_)
-                                | ExprKind::Utf16StringLit(_)
-                                | ExprKind::Utf32StringLit(_)
-                        )
-                        && self.types.kind(elem_type) == TypeKind::Array;
-                    if is_string_for_char_array {
-                        // Emit byte-by-byte stores for the string content
-                        if let ExprKind::StringLit(s) = &list[0].value.kind {
-                            let char_type = self
-                                .types
-                                .base_type(elem_type)
-                                .unwrap_or(self.types.char_id);
-                            let char_bits = self.types.size_bits(char_type);
-                            for (i, ch) in s.chars().enumerate() {
-                                let byte_val = self.emit_const(ch as u8 as i128, self.types.int_id);
-                                self.emit(Instruction::store(
-                                    byte_val,
-                                    base_sym,
-                                    offset + i as i64,
-                                    char_type,
-                                    char_bits,
-                                ));
-                            }
-                            // Null terminator + zero fill
-                            let arr_bytes = self.types.size_bytes(elem_type);
-                            let str_len = s.chars().count();
-                            for i in str_len..arr_bytes {
-                                let zero = self.emit_const(0, self.types.int_id);
-                                self.emit(Instruction::store(
-                                    zero,
-                                    base_sym,
-                                    offset + i as i64,
-                                    char_type,
-                                    char_bits,
-                                ));
-                            }
-                        }
+                    // A string literal initializing an array element --
+                    // `char arr[3][4] = {"Sun", "Mon", "Tue"}` -- is inline
+                    // data, not one element. Recursing into it would treat the
+                    // literal as the pointer it decays to everywhere else.
+                    //
+                    // Shared with the other three string-store paths rather
+                    // than counted a third way here. Written out, this loop
+                    // recognized all four literal kinds and then handled only
+                    // `StringLit`, dropping a wide element and leaving it
+                    // zero; stepped the destination by raw *bytes* where a
+                    // wide element is 2 or 4 bytes wide; and had no capacity
+                    // clamp at all, so `char s[1][3] = {"hello"}` stored five
+                    // bytes into a three-byte object -- two of them past the
+                    // whole local, not merely into the next row.
+                    let string_element = (list.len() == 1
+                        && self.types.kind(elem_type) == TypeKind::Array)
+                        .then(|| Self::string_literal_units(&list[0].value.kind))
+                        .flatten();
+                    if let Some(units) = string_element {
+                        self.store_string_units(
+                            base_sym,
+                            offset,
+                            elem_type,
+                            &list[0].value.kind,
+                            &units,
+                            StringTail::AlreadyZero,
+                        );
                         continue;
                     }
                     if elem_is_aggregate {
@@ -1254,7 +1266,16 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // Shared with the two other string-store paths rather than
                 // counted a third way here.
                 if let Some(units) = Self::string_literal_units(&value.kind) {
-                    self.store_string_units(base_sym, offset, field_type, &value.kind, &units);
+                    // Reached only from an initializer list, which the caller
+                    // zeroed whole before walking it.
+                    self.store_string_units(
+                        base_sym,
+                        offset,
+                        field_type,
+                        &value.kind,
+                        &units,
+                        StringTail::AlreadyZero,
+                    );
                 }
             } else {
                 let val = self.linearize_expr(value);
@@ -1983,9 +2004,13 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// Copy a string literal's code units into an array object, followed by
     /// its null terminator.
     ///
-    /// Shared by the two ways a string can initialize an array: written
-    /// directly (`char b[] = "hi"`) or enclosed in braces
-    /// (`char b[] = {"hi"}`, C17 6.7.9p14).
+    /// Shared by every way a string can initialize an array: written directly
+    /// (`char b[] = "hi"`), enclosed in braces (`char b[] = {"hi"}`, C17
+    /// 6.7.9p14), as a struct member (`struct { char t[4]; } s = {"hi"}`), or
+    /// as an element of a nested array (`char n[2][4] = {"ab", "cd"}`).
+    ///
+    /// `tail` says whether the elements the literal does not reach are this
+    /// call's to zero; see [`StringTail`].
     pub(crate) fn store_string_units(
         &mut self,
         base_sym: PseudoId,
@@ -1993,6 +2018,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         arr_typ: TypeId,
         kind: &ExprKind,
         units: &[i128],
+        tail: StringTail,
     ) {
         let default_elem = match kind {
             ExprKind::StringLit(_) => self.types.char_id,
@@ -2025,7 +2051,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                 elem_size,
             ));
         }
-        if units.len() < capacity {
+        // The first element past everything the literal and its terminator
+        // wrote. When the literal fills the array exactly, that is the whole
+        // array; when the terminator was dropped, nothing is left either.
+        let written = if units.len() < capacity {
             let null_val = self.emit_const(0, elem_type);
             self.emit(Instruction::store(
                 null_val,
@@ -2034,6 +2063,25 @@ impl<'a> super::linearize::Linearizer<'a> {
                 elem_type,
                 elem_size,
             ));
+            units.len() + 1
+        } else {
+            capacity
+        };
+
+        // C17 6.7.9p21: the members not initialized explicitly are
+        // initialized as a static object would be, i.e. to zero. One
+        // terminator is not the rest of the array -- `char b[8] = "hi"` wrote
+        // three bytes and left five holding whatever the frame held, which on
+        // first entry is zero because the backend zeroes the whole frame, and
+        // on re-execution is the last iteration's data.
+        //
+        // Routed through the shared block fill, so the bound that keeps
+        // `char b[1 << 20] = "x"` from becoming a million stores is the one
+        // every other block operation uses.
+        if matches!(tail, StringTail::Zero) {
+            let start = base_offset + (written as i64) * elem_bytes;
+            let bytes = (capacity - written) as i64 * elem_bytes;
+            self.emit_block_zero(base_sym, start, bytes);
         }
     }
 

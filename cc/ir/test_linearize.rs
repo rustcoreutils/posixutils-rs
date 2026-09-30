@@ -6016,7 +6016,25 @@ fn test_compound_literal_zero_init_lvalue() {
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
-    let module = ctx.linearize(&tu);
+    let mut module = ctx.linearize(&tu);
+
+    // The linearizer asks for the zero-init as one `Memset` of the whole
+    // literal rather than emitting the stores itself. That is what gives it
+    // the same bound as every other block memory operation -- the ladder it
+    // used to hand-roll here had none, so `char buf[N] = {0}` unrolled for any
+    // N at all.
+    let linearized = format!("{}", module.display(&ctx.types));
+    assert!(
+        linearized.contains("memset"),
+        "expected the compound literal's zero-init to be asked for as a memset: {linearized}"
+    );
+
+    // `memexpand` turns it back into stores, at every optimization level --
+    // `-O0` included, see `opt::optimize_module` -- so run it here and hold
+    // the stores to the same account as before.
+    for f in &mut module.functions {
+        crate::ir::memexpand::run(f, &ctx.types);
+    }
     let ir = format!("{}", module.display(&ctx.types));
 
     // The compound literal must be zero-initialized first, then the designated
@@ -7608,6 +7626,165 @@ fn test_memory_builtins_are_their_opcodes() {
             (Opcode::Memset, Some("memset"), 3),
             (Opcode::Memmove, Some("memmove"), 3),
         ]
+    );
+}
+
+/// The constant `id` holds in `f`, if it is one -- through the narrowing a
+/// conversion to the destination's own type leaves.
+fn const_of(module: &Module, name: &str, id: PseudoId) -> Option<i128> {
+    let f = module.functions.iter().find(|f| f.name == name).unwrap();
+    crate::ir::facts::ConstMap::new(f).get(id)
+}
+
+/// Every `Memset` in `f`, as `(fill byte, length)`.
+fn memsets_of(module: &Module, name: &str) -> Vec<(Option<i128>, Option<i128>)> {
+    insns_of(module, name)
+        .iter()
+        .filter(|i| i.op == Opcode::Memset)
+        .map(|i| {
+            (
+                const_of(module, name, i.src[1]),
+                const_of(module, name, i.src[2]),
+            )
+        })
+        .collect()
+}
+
+/// Every `Store` in `f`, as `(offset, width in bits, stored constant)`. A
+/// store's `src` is `(address, value)`.
+fn stores_of(module: &Module, name: &str) -> Vec<(i64, u32, Option<i128>)> {
+    insns_of(module, name)
+        .iter()
+        .filter(|i| i.op == Opcode::Store)
+        .map(|i| (i.offset, i.size, const_of(module, name, i.src[1])))
+        .collect()
+}
+
+/// Zero-initializing an aggregate is one `Memset` of the whole object, whose
+/// length `memexpand` then weighs against `INLINE_LIMIT_BYTES`.
+///
+/// `emit_aggregate_zero` hand-rolled the same 8/4/2/1 descent
+/// `memexpand::block_chunks` already produces, but with **no** upper bound, so
+/// `char buf[N] = {0}` emitted one store per chunk for any N: 8 KB cost 2081
+/// instructions in the function body and 1 MB did not finish compiling in 25
+/// minutes. Asking for the opcode instead makes the bound the shared one and
+/// leaves the linearizer with no ladder of its own.
+#[test]
+fn test_aggregate_zero_is_one_memset_of_the_whole_object() {
+    let target = Target::new(Arch::X86_64, Os::Linux);
+    // Each declares an object and hands it to `sink` so nothing is dead. The
+    // only store left is the one element `{0}` names explicitly; every other
+    // byte is the memset's, whatever the object's size.
+    for (decl, bytes, explicit) in [
+        ("char buf[200] = {0}; sink(buf);", 200, (0, 8, Some(0))),
+        ("char buf[7] = {0}; sink(buf);", 7, (0, 8, Some(0))),
+        (
+            "struct S { int a; char b; } s = {0}; sink(&s);",
+            8,
+            (0, 32, Some(0)),
+        ),
+    ] {
+        let src = format!("void sink(void *);\nvoid f(void) {{ {decl} }}\n");
+        let module = linearize_source(&src, &target);
+        assert_eq!(
+            memsets_of(&module, "f"),
+            vec![(Some(0), Some(bytes))],
+            "{decl}: one memset of the whole object and nothing else"
+        );
+        assert_eq!(
+            stores_of(&module, "f"),
+            vec![explicit],
+            "{decl}: the linearizer emits no chunk ladder of its own"
+        );
+    }
+}
+
+/// `char b[N] = "str"` zero-fills the elements the literal does not reach,
+/// and only those.
+///
+/// C17 6.7.9p21 initializes them as a static object would be. The `InitList`
+/// arm of a local declaration calls `emit_aggregate_zero` first; the bare
+/// string arm did not, so only the literal's own bytes and one terminator were
+/// written. The braced form reaches the array through an initializer list,
+/// which is already zeroed whole -- zeroing again there would double the
+/// stores at `-O0`, where no `dse` runs to remove them.
+#[test]
+fn test_a_string_initializer_zero_fills_only_its_tail() {
+    let target = Target::new(Arch::X86_64, Os::Linux);
+
+    // Three bytes written -- 'h', 'i', and the terminator -- then five left.
+    let bare = linearize_source(
+        "void sink(void *);\nvoid f(void) { char b[8] = \"hi\"; sink(b); }\n",
+        &target,
+    );
+    assert_eq!(
+        stores_of(&bare, "f"),
+        vec![(0, 8, Some(0x68)), (1, 8, Some(0x69)), (2, 8, Some(0))]
+    );
+    assert_eq!(memsets_of(&bare, "f"), vec![(Some(0), Some(5))]);
+
+    // The braced form is preceded by the whole-object zero, so its tail is
+    // already done: one memset of 8, not one of 8 and another of 5.
+    let braced = linearize_source(
+        "void sink(void *);\nvoid f(void) { char b[8] = {\"hi\"}; sink(b); }\n",
+        &target,
+    );
+    assert_eq!(memsets_of(&braced, "f"), vec![(Some(0), Some(8))]);
+
+    // Exactly as long as the literal: C17 6.7.9p14 drops the terminator, and
+    // there is then no tail either.
+    let exact = linearize_source(
+        "void sink(void *);\nvoid f(void) { char b[2] = \"hi\"; sink(b); }\n",
+        &target,
+    );
+    assert_eq!(
+        stores_of(&exact, "f"),
+        vec![(0, 8, Some(0x68)), (1, 8, Some(0x69))]
+    );
+    assert_eq!(memsets_of(&exact, "f"), vec![]);
+}
+
+/// A string literal initializing a *nested* array element steps the
+/// destination by the element's own width and stops at its capacity.
+///
+/// This path was a third hand-rolled copy of `store_string_units`. It
+/// recognized all four literal kinds and then handled only the narrow one, so
+/// a wide element was dropped and left zero; it stepped the destination by raw
+/// bytes where a wide element is 2 or 4 bytes wide; and it had no capacity
+/// clamp at all, so `char s[1][3] = {"hello"}` stored five bytes into a
+/// three-byte object.
+#[test]
+fn test_a_nested_string_element_keeps_its_stride_and_capacity() {
+    let target = Target::new(Arch::X86_64, Os::Linux);
+
+    // `unsigned short` is `char16_t`: two bytes of stride, and the literal
+    // reaches the array at all.
+    let wide = linearize_source(
+        "void sink(void *);\n\
+         void f(void) { unsigned short u[2][3] = {u\"ab\", u\"cd\"}; sink(u); }\n",
+        &target,
+    );
+    assert_eq!(
+        stores_of(&wide, "f"),
+        vec![
+            (0, 16, Some(0x61)),
+            (2, 16, Some(0x62)),
+            (4, 16, Some(0)),
+            (6, 16, Some(0x63)),
+            (8, 16, Some(0x64)),
+            (10, 16, Some(0)),
+        ]
+    );
+
+    // Five units into a three-byte row: three stored, none past the row, and
+    // the terminator dropped with them.
+    let over = linearize_source(
+        "void sink(void *);\nvoid f(void) { char s[1][3] = {\"hello\"}; sink(s); }\n",
+        &target,
+    );
+    assert_eq!(
+        stores_of(&over, "f"),
+        vec![(0, 8, Some(0x68)), (1, 8, Some(0x65)), (2, 8, Some(0x6c))]
     );
 }
 

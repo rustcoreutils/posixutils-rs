@@ -1119,6 +1119,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                                         bit_w,
                                         storage_size,
                                         member_val,
+                                        field_type,
                                     );
                                 } else {
                                     self.linearize_struct_field_init(

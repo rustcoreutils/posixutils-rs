@@ -337,6 +337,15 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// Emit code to load a bitfield value
     /// Returns the loaded value as a PseudoId
+    ///
+    /// `typ` is the field's type as the access reaches it -- the declared type
+    /// so-qualified by the object (C17 6.5.2.3p3) -- and the access itself is
+    /// of the *carrier*, whose type is an unqualified storage unit. So nothing
+    /// downstream can derive the qualifier from the instruction's own type, and
+    /// the volatile marker is set here instead;
+    /// [`Self::mark_volatile_access`] preserves a marker its caller set for
+    /// exactly this case. Without it a volatile bit-field read was deleted
+    /// outright from `-O1` up.
     pub(crate) fn emit_bitfield_load(
         &mut self,
         base: PseudoId,
@@ -370,16 +379,20 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Determine storage type based on storage unit size
         let storage_type = self.bitfield_storage_type(storage_size as usize);
         let storage_bits = storage_size * 8;
+        let volatile = self.types.contains_volatile(typ);
 
         // 1. Load the entire storage unit
         let storage_val = self.alloc_pseudo();
-        self.emit(Instruction::load(
-            storage_val,
-            base,
-            byte_offset as i64,
-            storage_type,
-            storage_bits,
-        ));
+        self.emit(
+            Instruction::load(
+                storage_val,
+                base,
+                byte_offset as i64,
+                storage_type,
+                storage_bits,
+            )
+            .with_volatile(volatile),
+        );
 
         // 2. Shift right by bit_offset (using logical shift for unsigned extraction)
         let shifted = if bit_offset > 0 {
@@ -528,6 +541,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
         let carrier_bits = if wide { 64 } else { 32 };
         let byte_type = self.types.uchar_id;
+        // Every byte of a volatile field is part of the one observable read.
+        let volatile = self.types.contains_volatile(typ);
 
         let mut acc: Option<PseudoId> = None;
         let (field_lo, field_hi) = (bit_offset, bit_offset + bit_width);
@@ -542,13 +557,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                 continue;
             }
             let byte = self.alloc_pseudo();
-            self.emit(Instruction::load(
-                byte,
-                base,
-                (byte_offset + i as usize) as i64,
-                byte_type,
-                8,
-            ));
+            self.emit(
+                Instruction::load(byte, base, (byte_offset + i as usize) as i64, byte_type, 8)
+                    .with_volatile(volatile),
+            );
             // Widen before shifting, or the shift is done at eight bits and
             // drops everything it moves. `uchar` is unsigned, so this is a
             // zero-extension and the byte's own value is preserved.
@@ -662,6 +674,14 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Emit code to store a value into a bitfield
+    ///
+    /// `typ` is the field's type as the access reaches it, and is here for the
+    /// same reason as in [`Self::emit_bitfield_load`]: the read-modify-write is
+    /// performed on the *carrier*, so the instructions cannot show the
+    /// qualifier and the marker is set from the field's type instead. Both
+    /// halves are marked -- the read of the storage unit is as observable as
+    /// the write of it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_bitfield_store(
         &mut self,
         base: PseudoId,
@@ -670,6 +690,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         bit_width: u32,
         storage_size: u32,
         new_value: PseudoId,
+        typ: TypeId,
     ) {
         if !matches!(storage_size, 1 | 2 | 4 | 8 | 16) {
             return self.emit_bitfield_store_bytewise(
@@ -679,22 +700,27 @@ impl<'a> super::linearize::Linearizer<'a> {
                 bit_width,
                 storage_size,
                 new_value,
+                typ,
             );
         }
 
         // Determine storage type based on storage unit size
         let storage_type = self.bitfield_storage_type(storage_size as usize);
         let storage_bits = storage_size * 8;
+        let volatile = self.types.contains_volatile(typ);
 
         // 1. Load current storage unit value
         let old_val = self.alloc_pseudo();
-        self.emit(Instruction::load(
-            old_val,
-            base,
-            byte_offset as i64,
-            storage_type,
-            storage_bits,
-        ));
+        self.emit(
+            Instruction::load(
+                old_val,
+                base,
+                byte_offset as i64,
+                storage_type,
+                storage_bits,
+            )
+            .with_volatile(volatile),
+        );
 
         // 2. Create mask for the bitfield bits: ~(((1 << width) - 1) << offset)
         //
@@ -757,13 +783,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         // 6. Store back
-        self.emit(Instruction::store(
-            combined,
-            base,
-            byte_offset as i64,
-            storage_type,
-            storage_bits,
-        ));
+        self.emit(
+            Instruction::store(
+                combined,
+                base,
+                byte_offset as i64,
+                storage_type,
+                storage_bits,
+            )
+            .with_volatile(volatile),
+        );
     }
 
     /// Write a bit-field occupying an arbitrary byte range, one byte at a time.
@@ -773,6 +802,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// bits survive. Neither ever touches a byte outside the field's own span,
     /// which is what a wide read-modify-write could not promise: the span may
     /// end at the last byte of the object.
+    #[allow(clippy::too_many_arguments)]
     fn emit_bitfield_store_bytewise(
         &mut self,
         base: PseudoId,
@@ -781,6 +811,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         bit_width: u32,
         span: u32,
         new_value: PseudoId,
+        typ: TypeId,
     ) {
         let wide = bit_offset + bit_width > 32;
         let carrier = if wide {
@@ -790,6 +821,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
         let carrier_bits = if wide { 64 } else { 32 };
         let byte_type = self.types.uchar_id;
+        let volatile = self.types.contains_volatile(typ);
 
         // The value, masked to its width once, so no byte can contribute bits
         // the field does not have.
@@ -861,7 +893,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                 placed
             } else {
                 let old = self.alloc_pseudo();
-                self.emit(Instruction::load(old, base, addr_off, byte_type, 8));
+                self.emit(
+                    Instruction::load(old, base, addr_off, byte_type, 8).with_volatile(volatile),
+                );
                 let keep = self.emit_const((!byte_mask & 0xff) as i128, byte_type);
                 let cleared = self.alloc_pseudo();
                 self.emit(Instruction::binop(
@@ -896,7 +930,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                 ));
                 out
             };
-            self.emit(Instruction::store(to_store, base, addr_off, byte_type, 8));
+            self.emit(
+                Instruction::store(to_store, base, addr_off, byte_type, 8).with_volatile(volatile),
+            );
         }
     }
 
@@ -2500,8 +2536,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                 access_bytes: None,
             });
         let bitfield = match (info.bit_offset, info.bit_width, info.access_bytes) {
+            // The target expression's type, not the member's declared one:
+            // they name the same width and sign, and only the expression's
+            // carries the object's qualifiers (C17 6.5.2.3p3), which is what
+            // tells the bit-field emitters that the access is volatile.
             (Some(bit_offset), Some(bit_width), Some(storage)) => {
-                Some((info.offset, bit_offset, bit_width, storage, info.typ))
+                Some((info.offset, bit_offset, bit_width, storage, target_typ))
             }
             // Not a bit-field: fold the member offset into the base so the
             // load and the store share one address.
@@ -2559,7 +2599,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         typ: TypeId,
     ) -> Option<(u32, TypeId)> {
         if let Some((offset, bit_offset, bit_width, storage, field_typ)) = place.bitfield {
-            self.emit_bitfield_store(place.base, offset, bit_offset, bit_width, storage, val);
+            self.emit_bitfield_store(
+                place.base, offset, bit_offset, bit_width, storage, val, field_typ,
+            );
             return Some((bit_width, field_typ));
         }
         let size = self.types.size_bits(typ);

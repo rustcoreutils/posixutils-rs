@@ -1923,14 +1923,15 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Utf16StringLit(_)
             | ExprKind::Utf32StringLit(_) => true,
 
-            // Identifiers are pure unless volatile
-            ExprKind::Ident(_) => {
-                if let Some(typ) = expr.typ {
-                    !self.types.modifiers(typ).contains(TypeModifiers::VOLATILE)
-                } else {
-                    true
-                }
-            }
+            // Identifiers are pure unless volatile.
+            //
+            // `contains_volatile`, not the top-level modifier: reading a
+            // struct with a `volatile` member reads that member, and asking
+            // only what was written on the struct answered no.
+            ExprKind::Ident(_) => match expr.typ {
+                Some(typ) => !self.types.contains_volatile(typ),
+                None => true,
+            },
 
             // __func__ is a pure string-like value
             ExprKind::FuncName => true,
@@ -1977,8 +1978,21 @@ impl<'a> Linearizer<'a> {
             // Function calls are never pure (may have side effects)
             ExprKind::Call { .. } => false,
 
-            // Member access through struct value (.) is pure if the base is pure.
-            ExprKind::Member { expr, .. } => self.is_pure_expr(expr),
+            // Member access through struct value (.) is pure if the base is
+            // pure and the member itself is not volatile. C17 6.5.15p4
+            // evaluates only one arm of a conditional and 5.1.2.3 makes each
+            // volatile read an observable event, so speculating one is a read
+            // the program never asked for: asking about the base alone let
+            // `c ? s.status : s.other` load both members unconditionally into
+            // a branchless select, at `-O0` too. The member's type carries the
+            // object's qualifiers (C17 6.5.2.3p3), so this covers a volatile
+            // member and a member of a volatile object alike.
+            ExprKind::Member { expr: base, .. } => {
+                !expr
+                    .typ
+                    .is_some_and(|typ| self.types.contains_volatile(typ))
+                    && self.is_pure_expr(base)
+            }
 
             // Arrow access (ptr->member) can cause UB/crash if ptr is NULL,
             // so we must not eagerly evaluate it in conditional expressions.
@@ -2792,19 +2806,31 @@ impl<'a> Linearizer<'a> {
 
     /// Shared logic for member access (both `.` and `->`).
     /// `base` is the address of the struct (for `.`) or the pointer value (for `->`).
+    ///
+    /// `access_typ` is the type of the member-access *expression*, which the
+    /// parser formed as the member's declared type so-qualified by the object
+    /// (C17 6.5.2.3p3/p4). The access is performed at that type, so
+    /// [`Self::mark_volatile_access`] sees the qualifier -- the type
+    /// `find_member` answers with is the member's *declared* one and cannot
+    /// carry it, which is why a member of a `volatile` struct read as an
+    /// ordinary `int` and DCE deleted the load from `-O1` up. Its width, sign
+    /// and kind still come from the member, so the two disagreeing (only
+    /// reachable once the parser has already reported an unknown member)
+    /// cannot change how the access is performed. It also stands in for the
+    /// member type entirely when the lookup fails here.
     pub(crate) fn emit_member_access(
         &mut self,
         base: PseudoId,
         struct_type: TypeId,
         member: StringId,
-        fallback_type: TypeId,
+        access_typ: TypeId,
     ) -> PseudoId {
         let member_info = self
             .types
             .find_member(struct_type, member)
             .unwrap_or(MemberInfo {
                 offset: 0,
-                typ: fallback_type,
+                typ: access_typ,
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
@@ -2839,7 +2865,7 @@ impl<'a> Linearizer<'a> {
                 bit_offset,
                 bit_width,
                 storage_size,
-                member_info.typ,
+                access_typ,
             )
         } else {
             let size = self.types.size_bits(member_info.typ);
@@ -2869,7 +2895,7 @@ impl<'a> Linearizer<'a> {
                     result,
                     base,
                     member_info.offset as i64,
-                    member_info.typ,
+                    access_typ,
                     size,
                 ));
                 result

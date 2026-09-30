@@ -17,7 +17,7 @@ use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
 use crate::token::literal;
-use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
+use crate::types::{Type, TypeId, TypeKind};
 use gettextrs::gettext;
 
 const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
@@ -359,20 +359,7 @@ impl<'a> Parser<'a> {
     /// never select the `const int` association.
     pub(crate) fn lvalue_converted_type(&mut self, typ: TypeId) -> TypeId {
         let decayed = self.decayed_type(typ);
-
-        const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
-            .union(TypeModifiers::VOLATILE)
-            .union(TypeModifiers::RESTRICT)
-            .union(TypeModifiers::ATOMIC);
-
-        let ty = self.types.get(decayed);
-        if !ty.modifiers.intersects(QUALIFIERS) {
-            return decayed;
-        }
-
-        let mut unqualified = ty.clone();
-        unqualified.modifiers.remove(QUALIFIERS);
-        self.types.intern(unqualified)
+        self.types.unqualified(decayed)
     }
 
     /// Parse a conditional (ternary) expression: cond ? then : else
@@ -1322,8 +1309,10 @@ impl<'a> Parser<'a> {
                             &gettext("request for member in something not a structure or union"),
                         );
                         self.types.int_id
-                    } else if let Some(info) = self.types.find_member(resolved, member) {
-                        info.typ
+                    } else if let Some(typ) = self.types.member_access_type(t, resolved, member) {
+                        // C17 6.5.2.3p3: so-qualified by the object, whose
+                        // qualifiers are on `t` -- `resolved` has lost them.
+                        typ
                     } else {
                         let member_name = self.idents.get_opt(member).unwrap_or("<unknown>");
                         diag::error_args(dot_pos, "has no member named '{0}'", &[member_name]);
@@ -1361,8 +1350,12 @@ impl<'a> Parser<'a> {
                                 ),
                             );
                             self.types.int_id
-                        } else if let Some(info) = self.types.find_member(resolved, member) {
-                            info.typ
+                        } else if let Some(typ) =
+                            self.types.member_access_type(struct_type, resolved, member)
+                        {
+                            // C17 6.5.2.3p4: so-qualified by the *pointee*.
+                            // `struct S *volatile p` qualifies `p`, not `*p`.
+                            typ
                         } else {
                             let member_name = self.idents.get_opt(member).unwrap_or("<unknown>");
                             diag::error_args(
@@ -1713,7 +1706,10 @@ impl<'a> Parser<'a> {
             // let it through, so `1 << 1L` came out `long` and
             // `sizeof(1 << 1L)` answered 8 where gcc answers 4.
             BinaryOp::Shl | BinaryOp::Shr => {
+                // The promoted type of a *value*: unqualified, as every
+                // arithmetic result is (6.3.2.1p2).
                 let promoted = self.types.integer_promote(left_type);
+                let promoted = self.types.unqualified(promoted);
                 self.check_shift_count(op, promoted, &right);
                 promoted
             }
@@ -1887,6 +1883,9 @@ impl<'a> Parser<'a> {
         } else {
             self.types.integer_promote(op_typ)
         };
+        // The result is a value, which has the unqualified type (6.3.2.1p2):
+        // `-v` is an `int` even where `v` is a `volatile int`.
+        let typ = self.types.unqualified(typ);
         // The *value* is promoted, not just the type it is computed at. The
         // conversion used to be left out, on the reasoning that the operand
         // is already in a wider register -- but nothing in the IR then says
@@ -1958,8 +1957,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The type the usual arithmetic conversions (C17 6.3.1.8) bring two
+    /// operands to, as an *rvalue* type.
+    ///
+    /// `common_type` answers with one of the operands' own `TypeId`s, so
+    /// `volatile int + int` came out `volatile int` and a qualifier the object
+    /// carried leaked into the type of a value. C17 6.3.2.1p2 drops the
+    /// qualifiers when an lvalue is converted to a value, and nothing
+    /// downstream may read an rvalue's type as "this expression touched a
+    /// volatile object" -- now that a member of a `volatile` object is itself
+    /// volatile (6.5.2.3p3), that leak would reach every `s.m + 1`.
+    ///
+    /// Stripping them here rather than in `common_type` keeps the latter a
+    /// pure question about conversion rank, which is what lets the linearizer
+    /// and the constant folder ask it through a `&TypeTable`: interning a
+    /// stripped type needs `&mut`.
     fn usual_arithmetic_conversions(&mut self, left: TypeId, right: TypeId) -> TypeId {
-        self.types.common_type(left, right)
+        let common = self.types.common_type(left, right);
+        self.types.unqualified(common)
     }
 
     /// Parse a C11 generic selection (C17 6.5.1.1):

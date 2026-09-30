@@ -9101,6 +9101,179 @@ fn test_volatile_accesses_carry_the_marker() {
     );
 }
 
+/// A member of a `volatile` object is itself volatile (C17 6.5.2.3p3/p4), so
+/// every access to one carries the marker.
+///
+/// The reverse direction -- a `volatile` member of a plain object -- always
+/// worked, because there the member's own declared type carries the qualifier.
+/// This is the other one: the qualifier is on the *object*, and
+/// `find_member` answers with the member's declared type, which cannot show it.
+/// So the load was unmarked and DCE deleted it from `-O1` up.
+#[test]
+fn test_a_member_of_a_volatile_object_carries_the_marker() {
+    let target = Target::host();
+    let src = "struct S { int a; int b; };\n\
+               struct N { struct S in; };\n\
+               typedef volatile struct S VS;\n\
+               volatile struct S vs;\n\
+               volatile struct S *vp;\n\
+               volatile struct S vsa[4];\n\
+               volatile struct N vn;\n\
+               VS vt;\n\
+               struct S plain;\n\
+               struct S *pp;\n\
+               void read_direct(void) { vs.a; }\n\
+               void read_arrow(void) { vp->a; }\n\
+               void read_element(void) { vsa[2].a; }\n\
+               void read_nested(void) { vn.in.a; }\n\
+               void read_typedef(void) { vt.a; }\n\
+               void write_direct(void) { vs.a = 1; }\n\
+               void read_plain(void) { plain.a; }\n\
+               void read_plain_arrow(void) { pp->a; }\n";
+    let module = linearize_source(src, &target);
+
+    let accesses = |name: &str| -> Vec<(Opcode, bool)> {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("function {name}"))
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
+            .map(|i| (i.op, i.is_volatile_access()))
+            .collect()
+    };
+
+    // Every spelling of "the object is volatile": directly, through a pointer
+    // to volatile, through an array's element type, through a nested member
+    // whose own type is qualified by the object above it, and through a
+    // typedef that carries the qualifier.
+    assert_eq!(accesses("read_direct"), vec![(Opcode::Load, true)]);
+    assert_eq!(accesses("read_element"), vec![(Opcode::Load, true)]);
+    assert_eq!(accesses("read_nested"), vec![(Opcode::Load, true)]);
+    assert_eq!(accesses("read_typedef"), vec![(Opcode::Load, true)]);
+    assert_eq!(accesses("write_direct"), vec![(Opcode::Store, true)]);
+    // `volatile struct S *vp` qualifies the pointee, so reading `vp` itself is
+    // an ordinary load and the access through it is the volatile one.
+    assert_eq!(
+        accesses("read_arrow"),
+        vec![(Opcode::Load, false), (Opcode::Load, true)]
+    );
+
+    // The control: an unqualified object's member is not marked, or the marker
+    // would mean nothing.
+    assert_eq!(accesses("read_plain"), vec![(Opcode::Load, false)]);
+    assert_eq!(
+        accesses("read_plain_arrow"),
+        vec![(Opcode::Load, false), (Opcode::Load, false)]
+    );
+}
+
+/// A `volatile` bit-field access is marked although the access is of the
+/// carrier.
+///
+/// `emit_bitfield_load`/`_store` read and write a storage unit whose type is
+/// an unqualified integer, so no marker can be derived from the instruction's
+/// own type. `mark_volatile_access` preserves one the emitter sets, and this is
+/// the case it exists for.
+#[test]
+fn test_a_volatile_bitfield_access_carries_the_marker() {
+    let target = Target::host();
+    let src = "struct B { volatile unsigned f : 3; unsigned g : 5; };\n\
+               struct B b;\n\
+               volatile struct B vb;\n\
+               void read_field(void) { b.f; }\n\
+               void read_object(void) { vb.g; }\n\
+               void write_object(void) { vb.g = 1; }\n\
+               void read_plain(void) { b.g; }\n\
+               void write_plain(void) { b.g = 1; }\n";
+    let module = linearize_source(src, &target);
+
+    let accesses = |name: &str| -> Vec<(Opcode, bool)> {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("function {name}"))
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
+            .map(|i| (i.op, i.is_volatile_access()))
+            .collect()
+    };
+
+    // Both spellings: the field declared `volatile`, and an ordinary field of
+    // a `volatile` object.
+    assert_eq!(accesses("read_field"), vec![(Opcode::Load, true)]);
+    assert_eq!(accesses("read_object"), vec![(Opcode::Load, true)]);
+    // A bit-field store is a read-modify-write of the carrier, and both halves
+    // of it are observable.
+    assert_eq!(
+        accesses("write_object"),
+        vec![(Opcode::Load, true), (Opcode::Store, true)]
+    );
+
+    // The controls.
+    assert_eq!(accesses("read_plain"), vec![(Opcode::Load, false)]);
+    assert_eq!(
+        accesses("write_plain"),
+        vec![(Opcode::Load, false), (Opcode::Store, false)]
+    );
+}
+
+/// A conditional may not speculate a `volatile` member, in either spelling.
+///
+/// `Select` is the branchless form, and reaching it means both arms were
+/// evaluated. C17 6.5.15p4 evaluates only one of them, and 5.1.2.3 makes each
+/// volatile read an observable event -- so the arms may only collapse when
+/// both are pure. `is_pure_expr` asked whether the *base* was pure, which a
+/// named object always is.
+#[test]
+fn test_a_volatile_member_is_not_speculated() {
+    let target = Target::host();
+    let src = "struct V { volatile unsigned status; unsigned other; };\n\
+               struct P { unsigned one; unsigned other; };\n\
+               struct V v;\n\
+               volatile struct P vp;\n\
+               struct P p;\n\
+               unsigned member_is_volatile(int c) { return c ? v.status : v.other; }\n\
+               unsigned object_is_volatile(int c) { return c ? vp.one : vp.other; }\n\
+               unsigned all_plain(int c) { return c ? p.one : p.other; }\n";
+    let module = linearize_source(src, &target);
+
+    let selects = |name: &str| -> usize {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("function {name}"))
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| i.op == Opcode::Select)
+            .count()
+    };
+
+    assert_eq!(
+        selects("member_is_volatile"),
+        0,
+        "a volatile member may not be read on the path that did not select it"
+    );
+    assert_eq!(
+        selects("object_is_volatile"),
+        0,
+        "a member of a volatile object is volatile (C17 6.5.2.3p3)"
+    );
+    assert_eq!(
+        selects("all_plain"),
+        1,
+        "two ordinary member reads are pure and may still collapse"
+    );
+}
+
 /// A `volatile` access keeps the object it reaches in memory: promotion would
 /// rewrite the access into a register `Copy`, and the access must happen.
 ///

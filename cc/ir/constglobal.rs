@@ -30,7 +30,7 @@
 //
 
 use super::{ConstValue, Function, Initializer, Instruction, Module, Opcode, PseudoKind};
-use crate::types::{TypeId, TypeModifiers, TypeTable};
+use crate::types::{TypeId, TypeTable};
 use std::collections::HashMap;
 
 /// A global whose value is known for the whole run.
@@ -90,7 +90,13 @@ pub(crate) fn qualifies(g: &super::GlobalDef, types: &TypeTable) -> bool {
     }
     // `volatile` says the value can change for reasons not in the program,
     // which is exactly the assumption being made here.
-    if types.modifiers(g.typ).contains(TypeModifiers::VOLATILE) {
+    //
+    // `contains_volatile`, not the top-level modifier: a `const struct` with a
+    // `volatile` member is one of these objects too, and asking only what was
+    // written on the struct let it through the gate. Every access is checked
+    // again below, so this was not reachable as a wrong fold -- but the object
+    // and its members are one question and get one spelling of it.
+    if types.contains_volatile(g.typ) {
         return false;
     }
     // A weak definition exists to be replaced at link time, and the
@@ -194,6 +200,7 @@ mod tests {
     use super::*;
     use crate::ir::{BasicBlock, BasicBlockId, GlobalDef, Pseudo, PseudoId};
     use crate::target::Target;
+    use crate::types::TypeModifiers;
 
     /// A module with one global and a function that loads it whole.
     fn module_loading(global: GlobalDef, types: &TypeTable, load_typ: TypeId) -> Module {

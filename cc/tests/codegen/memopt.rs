@@ -1498,3 +1498,187 @@ fn memopt_two_volatile_stores_are_both_performed() {
         }
     }
 }
+
+/// A member of a `volatile` object is itself volatile, so reading it is an
+/// observable event that survives every optimization level.
+///
+/// C17 6.5.2.3p3/p4: the result of `s.m` has the *so-qualified* version of the
+/// member's type — it inherits the qualifiers of the object. c17 took the
+/// member's declared type unchanged, so a member of a `volatile` struct read as
+/// an ordinary `int` and DCE deleted it from `-O1` up. The reverse direction
+/// (`struct T { volatile int a; }`) always worked, because there the member's
+/// own type carries the qualifier; that case is the control below.
+#[test]
+fn memopt_a_member_of_a_volatile_object_is_volatile() {
+    // Distinctive names: a single letter matches `pushq`/`stp`/`.cfi_startproc`
+    // inside the body range and would pass against an emptied function.
+    let src = "\
+struct S { int a; int b; };
+volatile struct S vqobj;
+volatile struct S *vqptr;
+void probe_direct(void) { vqobj.a; }
+void probe_arrow(void) { vqptr->a; }
+void probe_assign(void) { int t = vqobj.a; (void)t; }
+void probe_second(void) { vqobj.b; }
+";
+    for level in ["-O0", "-O1", "-O2", "-Os"] {
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            let asm = asm_for_with("vol_member", triple, src, &[level]);
+            for (func, object) in [
+                ("probe_direct", "vqobj"),
+                ("probe_arrow", "vqptr"),
+                ("probe_assign", "vqobj"),
+                ("probe_second", "vqobj"),
+            ] {
+                assert_body_contains(
+                    &asm,
+                    func,
+                    object,
+                    &format!(
+                        "a member of a volatile object is volatile (C17 6.5.2.3p3): \
+                         {func} at {level} on {triple} must still access `{object}`"
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// The control for the test above: an ordinary aggregate's member read is still
+/// deleted, so that test cannot pass by marking every member access volatile.
+#[test]
+fn memopt_a_member_of_a_plain_object_is_still_removed() {
+    let src = "\
+struct S { int a; };
+struct S pqobj;
+void probe(void) { pqobj.a; }
+";
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("plain_member", triple, src, &["-O2"]);
+        assert_body_lacks(
+            &asm,
+            "probe",
+            "pqobj",
+            "reading an ordinary member has no effect and is dead code",
+        );
+    }
+}
+
+/// A `volatile` member is not speculatable, so a conditional must not read the
+/// arm it did not take.
+///
+/// C17 6.5.15p4 evaluates only one of the second and third operands, and
+/// 5.1.2.3 makes each volatile read an observable event. `is_pure_expr`'s
+/// `Member` arm asked only whether the *base* was pure, so the read was
+/// hoisted and both members were loaded unconditionally into a branchless
+/// select — at `-O0` too.
+#[test]
+fn memopt_a_volatile_member_is_not_speculated_by_a_conditional() {
+    let src = "\
+struct S { volatile unsigned status; unsigned other; };
+struct S sqobj;
+unsigned probe(int c) { return c ? sqobj.status : sqobj.other; }
+";
+    for level in ["-O0", "-O2"] {
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            let asm = asm_for_with("vol_member_select", triple, src, &[level]);
+            let select = if triple == X86_64_LINUX {
+                "cmov"
+            } else {
+                "csel"
+            };
+            assert_body_lacks(
+                &asm,
+                "probe",
+                select,
+                &format!(
+                    "a volatile member read cannot be speculated, so the arms may not \
+                     collapse into a conditional move: {level} on {triple}"
+                ),
+            );
+        }
+    }
+}
+
+/// The control for the test above: with no volatile member, the branchless
+/// select is still allowed, so that test is asserting the qualifier and not
+/// merely that c17 stopped emitting conditional moves.
+#[test]
+fn memopt_a_plain_member_may_still_be_speculated() {
+    let src = "\
+struct S { unsigned one; unsigned other; };
+struct S pqsel;
+unsigned probe(int c) { return c ? pqsel.one : pqsel.other; }
+";
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("plain_member_select", triple, src, &["-O2"]);
+        let select = if triple == X86_64_LINUX {
+            "cmov"
+        } else {
+            "csel"
+        };
+        assert_body_contains(
+            &asm,
+            "probe",
+            select,
+            "two ordinary member reads are pure and may still collapse to a select",
+        );
+    }
+}
+
+/// A `volatile` bit-field read is observable, even though the access is of the
+/// carrier and the carrier can never carry the qualifier.
+///
+/// The bit-field emitters build their load and store at
+/// `bitfield_storage_type`, which is the unqualified storage unit, so nothing
+/// derived the marker from the access type. `mark_volatile_access` anticipates
+/// exactly this ("a bit-field reads a storage unit whose type is the carrier")
+/// and preserves a marker the site sets itself — neither emitter set one, and
+/// the read was deleted outright from `-O1` up. Both spellings are covered: the
+/// field declared `volatile`, and an ordinary field of a `volatile` object.
+#[test]
+fn memopt_a_volatile_bitfield_read_is_performed() {
+    let src = "\
+struct B { volatile unsigned f : 3; unsigned g : 5; };
+struct B bfqobj;
+volatile struct B vbfqobj;
+void probe_field(void) { bfqobj.f; }
+void probe_object(void) { vbfqobj.g; }
+";
+    for level in ["-O0", "-O1", "-O2", "-Os"] {
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            let asm = asm_for_with("vol_bitfield", triple, src, &[level]);
+            for (func, object) in [("probe_field", "bfqobj"), ("probe_object", "vbfqobj")] {
+                assert_body_contains(
+                    &asm,
+                    func,
+                    object,
+                    &format!(
+                        "a volatile bit-field read is observable: {func} at {level} \
+                         on {triple} must still access `{object}`"
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// The control: an ordinary bit-field read is still dead code, so the test
+/// above cannot pass by marking every bit-field access volatile.
+#[test]
+fn memopt_a_plain_bitfield_read_is_still_removed() {
+    let src = "\
+struct B { unsigned f : 3; };
+struct B pbfqobj;
+void probe(void) { pbfqobj.f; }
+";
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("plain_bitfield", triple, src, &["-O2"]);
+        assert_body_lacks(
+            &asm,
+            "probe",
+            "pbfqobj",
+            "reading an ordinary bit-field has no effect and is dead code",
+        );
+    }
+}

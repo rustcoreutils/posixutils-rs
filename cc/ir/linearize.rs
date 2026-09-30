@@ -729,6 +729,7 @@ impl<'a> Linearizer<'a> {
 
     /// Add an instruction to the current basic block
     pub(crate) fn emit(&mut self, insn: Instruction) {
+        let insn = self.mark_volatile_access(insn);
         let insn = self.displacement_in_range(insn);
         if let Some(bb_id) = self.current_bb {
             // Attach current source position for debug info
@@ -741,6 +742,31 @@ impl<'a> Linearizer<'a> {
             bb.add_insn(insn);
         }
     }
+
+    /// Mark an access to a `volatile` object as one, from the type it reaches.
+    ///
+    /// Every `Load` and `Store` the linearizer emits passes through
+    /// [`Self::emit`], and each carries in `typ` the type of the object it is
+    /// accessing -- so this is the one place the qualifier has to be read, and
+    /// the one place it can be read for *every* access, including `*p` for a
+    /// `volatile int *p`, where there is no variable holding the qualifier to
+    /// ask (which is why `LocalVar::is_volatile` alone let DCE delete every
+    /// discarded `volatile` read from `-O1` up).
+    ///
+    /// A marker a site set itself is kept rather than recomputed, so a site
+    /// that knows more than the access type does can say so: a bit-field reads
+    /// a storage unit whose type is the carrier, and a composite copy reads
+    /// integer chunks, neither of which is the qualified type.
+    fn mark_volatile_access(&self, mut insn: Instruction) -> Instruction {
+        if !matches!(insn.op, Opcode::Load | Opcode::Store) || insn.is_volatile {
+            return insn;
+        }
+        if let Some(typ) = insn.typ {
+            insn.is_volatile = self.types.contains_volatile(typ);
+        }
+        insn
+    }
+
     /// Keep a load's or store's constant offset inside a machine displacement.
     ///
     /// Both backends address `src[0] + offset` with a signed 32-bit

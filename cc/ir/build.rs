@@ -51,15 +51,22 @@ impl<'a> Builder<'a> {
     }
 
     /// A load of `typ`, `size` bits wide, from `addr + at`.
+    ///
+    /// Marked volatile when `typ` is, for the same reason and by the same rule
+    /// as `Linearizer::mark_volatile_access`: an access this builds is as
+    /// observable as one the program wrote, and a pass must not be able to
+    /// introduce an unmarked access to a volatile object.
     pub(crate) fn load(&mut self, addr: PseudoId, at: i64, typ: TypeId, size: u32) -> PseudoId {
         let v = self.func.alloc_pseudo();
-        self.push(Instruction::load(v, addr, at, typ, size));
+        let vol = self.types.contains_volatile(typ);
+        self.push(Instruction::load(v, addr, at, typ, size).with_volatile(vol));
         v
     }
 
     /// A store of `v`, of `typ` and `size` bits wide, to `addr + at`.
     pub(crate) fn store(&mut self, v: PseudoId, addr: PseudoId, at: i64, typ: TypeId, size: u32) {
-        self.push(Instruction::store(v, addr, at, typ, size));
+        let vol = self.types.contains_volatile(typ);
+        self.push(Instruction::store(v, addr, at, typ, size).with_volatile(vol));
     }
 
     /// A new integer constant of `typ` at `size` bits, with the `SetVal`

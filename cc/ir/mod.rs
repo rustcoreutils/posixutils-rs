@@ -973,6 +973,20 @@ pub struct Instruction {
     pub abi_info: Option<Box<CallAbiInfo>>,
     /// For atomic operations: memory ordering constraint
     pub memory_order: MemoryOrder,
+    /// For `Load` and `Store`: the object being accessed is `volatile`, so the
+    /// access itself is observable behaviour (C17 5.1.2.3p6) and no pass may
+    /// delete, merge, move or fold it.
+    ///
+    /// The qualifier lives on the *access*, not on the variable, because for
+    /// `volatile int *p` there is no variable to ask: `p` is an ordinary
+    /// pointer and `*p` is the volatile object. `LocalVar::is_volatile` and
+    /// `memloc::GlobalFacts::is_volatile` answer only for a named object, so
+    /// DCE saw nothing to stop it and deleted every discarded `volatile` read
+    /// from `-O1` up. Ask through [`Instruction::is_volatile_access`].
+    ///
+    /// Set for every access the linearizer emits, from the type it is
+    /// accessing, in `Linearizer::mark_volatile_access`.
+    pub is_volatile: bool,
 }
 
 impl Default for Instruction {
@@ -1003,6 +1017,7 @@ impl Default for Instruction {
             asm_data: None,
             abi_info: None,
             memory_order: MemoryOrder::default(),
+            is_volatile: false,
         }
     }
 }
@@ -1052,6 +1067,28 @@ impl Instruction {
     pub fn with_src3(mut self, src1: PseudoId, src2: PseudoId, src3: PseudoId) -> Self {
         self.src = vec![src1, src2, src3];
         self
+    }
+
+    /// Mark this `Load` or `Store` as an access to a `volatile` object.
+    pub fn with_volatile(mut self, is_volatile: bool) -> Self {
+        debug_assert!(
+            !is_volatile || matches!(self.op, Opcode::Load | Opcode::Store),
+            "only a Load or a Store carries the volatile marker"
+        );
+        self.is_volatile = is_volatile;
+        self
+    }
+
+    /// Is this an access to a `volatile` object?
+    ///
+    /// Reading or writing one is observable behaviour (C17 5.1.2.3p6), so an
+    /// access that answers `true` survives every optimization level: no pass
+    /// may delete it, fold it to a constant, merge it with another access, or
+    /// promote the object it reaches out of memory. This is the question to
+    /// ask; `is_volatile` is only where the answer is stored, and is true of
+    /// nothing but a `Load` or a `Store`.
+    pub fn is_volatile_access(&self) -> bool {
+        self.is_volatile && matches!(self.op, Opcode::Load | Opcode::Store)
     }
 
     /// Set the type (caller should also call with_size if needed)
@@ -1548,6 +1585,10 @@ impl Instruction {
         self.src.clear();
         self.target = None;
         self.phi_list.clear();
+        // A `Nop` reaches no memory, so it is no longer a volatile access --
+        // and leaving the marker set on one would make a stale claim to any
+        // pass that asks the field rather than `is_volatile_access`.
+        self.is_volatile = false;
     }
 }
 
@@ -1728,6 +1769,9 @@ impl fmt::Display for InstructionDisplay<'_> {
                 }
                 if this.offset != 0 {
                     write!(f, " + {}", this.offset)?;
+                }
+                if this.is_volatile {
+                    write!(f, " volatile")?;
                 }
             }
             _ => {

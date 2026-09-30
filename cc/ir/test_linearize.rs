@@ -9030,3 +9030,109 @@ fn short_circuit_operands_keep_every_lowering_cfg_consistent() {
         );
     }
 }
+
+/// Every access the linearizer emits to a `volatile` object carries the
+/// marker, including the one that has no variable to ask.
+///
+/// `LocalVar::is_volatile` and `GlobalFacts::is_volatile` answer for a named
+/// object, and for `*p` with a `volatile int *p` there is none: `p` is an
+/// ordinary pointer. So DCE saw no reason to keep the read and deleted every
+/// discarded `volatile` access from `-O1` up.
+#[test]
+fn test_volatile_accesses_carry_the_marker() {
+    let target = Target::host();
+    let src = "volatile int g;\n\
+               volatile int *vp;\n\
+               int plain;\n\
+               int *pp;\n\
+               volatile int arr[4];\n\
+               struct T { volatile int a; };\n\
+               struct T t;\n\
+               void read_named(void) { g; }\n\
+               void read_via_ptr(void) { *vp; }\n\
+               void write_named(void) { g = 1; }\n\
+               void write_via_ptr(void) { *vp = 1; }\n\
+               void read_element(void) { arr[2]; }\n\
+               void read_member(void) { t.a; }\n\
+               void read_plain(void) { plain; }\n\
+               void read_plain_ptr(void) { *pp; }\n";
+    let module = linearize_source(src, &target);
+
+    let accesses = |name: &str| -> Vec<(Opcode, bool)> {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("function {name}"))
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
+            .map(|i| (i.op, i.is_volatile_access()))
+            .collect()
+    };
+
+    // A named volatile object: one marked access each way.
+    assert_eq!(accesses("read_named"), vec![(Opcode::Load, true)]);
+    assert_eq!(accesses("write_named"), vec![(Opcode::Store, true)]);
+
+    // Through a pointer *to* volatile, the qualifier is on the pointee, so
+    // reading `vp` itself is plain and the access through it is volatile.
+    assert_eq!(
+        accesses("read_via_ptr"),
+        vec![(Opcode::Load, false), (Opcode::Load, true)]
+    );
+    assert_eq!(
+        accesses("write_via_ptr"),
+        vec![(Opcode::Load, false), (Opcode::Store, true)]
+    );
+
+    // The qualifier reaches through an array's element type and a member's
+    // own type.
+    assert_eq!(accesses("read_element"), vec![(Opcode::Load, true)]);
+    assert_eq!(accesses("read_member"), vec![(Opcode::Load, true)]);
+
+    // And nothing unqualified is marked -- the marker that says "keep this"
+    // is worth nothing if it is on every access.
+    assert_eq!(accesses("read_plain"), vec![(Opcode::Load, false)]);
+    assert_eq!(
+        accesses("read_plain_ptr"),
+        vec![(Opcode::Load, false), (Opcode::Load, false)]
+    );
+}
+
+/// A `volatile` access keeps the object it reaches in memory: promotion would
+/// rewrite the access into a register `Copy`, and the access must happen.
+///
+/// The variable need not itself be volatile. `ssa` tests
+/// `LocalVar::is_volatile`, which answers no here -- the qualifier is on the
+/// access alone.
+#[test]
+fn test_volatile_access_to_a_plain_local_blocks_promotion() {
+    let target = Target::host();
+    let src = "int f(void) { int a = 1; return *(volatile int *)&a; }\n";
+    let module = linearize_source(src, &target);
+    let mut func = module
+        .functions
+        .iter()
+        .find(|f| f.name == "f")
+        .expect("f")
+        .clone();
+
+    let volatile_loads = |func: &Function| -> usize {
+        func.blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| i.is_volatile_access())
+            .count()
+    };
+    assert_eq!(volatile_loads(&func), 1, "the cast qualifies the access");
+
+    let types = TypeTable::new(&target);
+    crate::ir::ssa::ssa_convert(&mut func, &types);
+    assert_eq!(
+        volatile_loads(&func),
+        1,
+        "SSA promotion turned a volatile access into a register copy"
+    );
+}

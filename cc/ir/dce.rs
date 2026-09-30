@@ -21,7 +21,7 @@
 // reordering must consult `is_memory_barrier()` before crossing.
 //
 
-use super::{BasicBlockId, Function, Opcode, PseudoId};
+use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 const DEFAULT_LIVE_CAPACITY: usize = 64;
@@ -50,9 +50,20 @@ pub fn run(func: &mut Function) -> bool {
 
 // Dead Code Elimination
 
-/// Check if an opcode is a "root" (has side effects, cannot be deleted).
-fn is_root(op: Opcode) -> bool {
-    op.has_side_effects()
+/// Check if an instruction is a "root" (has side effects, cannot be deleted).
+///
+/// Most of the answer is the opcode's, but not all of it: a `Load` is
+/// deletable because reading an ordinary object has no effect, while reading a
+/// `volatile` one is observable behaviour (C17 5.1.2.3p6) and must still
+/// happen. That distinction is per *access*, not per opcode -- `*p` for a
+/// `volatile int *p` is volatile and `*q` for an `int *q` is not -- so it is
+/// asked of the instruction. Before this, `volatile int g; void f(void) { g; }`
+/// emitted the load at `-O0` and nothing at all from `-O1` up.
+///
+/// `Store` is a root by its opcode alone and stays that way: its correctness
+/// must not come to depend on the marker.
+fn is_root(insn: &Instruction) -> bool {
+    insn.op.has_side_effects() || insn.is_volatile_access()
 }
 
 /// Build a map from each pseudo to the instructions that define it.
@@ -77,7 +88,7 @@ fn eliminate_dead_code(func: &mut Function) -> bool {
     // Phase 1: Mark roots and their operands as live
     for bb in &func.blocks {
         for insn in &bb.insns {
-            if is_root(insn.op) {
+            if is_root(insn) {
                 // Mark all operands of root instructions as live
                 for id in insn.uses() {
                     if live.insert(id) {
@@ -110,7 +121,7 @@ fn eliminate_dead_code(func: &mut Function) -> bool {
     for bb in &mut func.blocks {
         for insn in &mut bb.insns {
             // Skip roots - they're always live
-            if is_root(insn.op) {
+            if is_root(insn) {
                 continue;
             }
 
@@ -562,17 +573,103 @@ mod tests {
 
     #[test]
     fn test_is_root() {
-        assert!(is_root(Opcode::Ret));
-        assert!(is_root(Opcode::Store));
-        assert!(is_root(Opcode::Call));
-        assert!(is_root(Opcode::Br));
-        assert!(is_root(Opcode::Cbr));
-        assert!(is_root(Opcode::Unreachable));
+        let bare = |op| is_root(&Instruction::new(op));
 
-        assert!(!is_root(Opcode::Add));
-        assert!(!is_root(Opcode::Mul));
-        assert!(!is_root(Opcode::Load));
-        assert!(!is_root(Opcode::Phi));
+        assert!(bare(Opcode::Ret));
+        assert!(bare(Opcode::Store));
+        assert!(bare(Opcode::Call));
+        assert!(bare(Opcode::Br));
+        assert!(bare(Opcode::Cbr));
+        assert!(bare(Opcode::Unreachable));
+
+        assert!(!bare(Opcode::Add));
+        assert!(!bare(Opcode::Mul));
+        assert!(!bare(Opcode::Load));
+        assert!(!bare(Opcode::Phi));
+    }
+
+    #[test]
+    fn test_volatile_load_is_root() {
+        // A plain load is deletable; the same load of a volatile object is not.
+        let plain = Instruction::new(Opcode::Load);
+        assert!(!is_root(&plain));
+
+        let vol = Instruction::new(Opcode::Load).with_volatile(true);
+        assert!(is_root(&vol), "reading a volatile object is observable");
+
+        // A volatile store is a root either way -- the marker must not be what
+        // its correctness rests on.
+        assert!(is_root(
+            &Instruction::new(Opcode::Store).with_volatile(true)
+        ));
+        assert!(is_root(&Instruction::new(Opcode::Store)));
+    }
+
+    #[test]
+    fn test_volatile_load_with_dead_result_survives() {
+        // `volatile int g; void f(void) { g; }` -- the loaded value is never
+        // used, and DCE deleted the load outright before the marker existed.
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("test", types.void_id);
+
+        func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
+        func.add_pseudo(Pseudo::sym(PseudoId(1), "g".to_string()));
+
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(
+            Instruction::load(PseudoId(0), PseudoId(1), 0, types.int_id, 32).with_volatile(true),
+        );
+        bb.add_insn(Instruction::ret(None));
+        func.add_block(bb);
+        func.entry = BasicBlockId(0);
+
+        assert!(!run(&mut func), "a volatile load is not dead code");
+        assert_eq!(func.blocks[0].insns[1].op, Opcode::Load);
+        assert!(func.blocks[0].insns[1].is_volatile_access());
+    }
+
+    #[test]
+    fn test_volatile_load_keeps_its_address_live() {
+        // `volatile int *p; void f(void) { *p; }` -- the second load is the
+        // volatile access, and it is the only thing keeping the first (the
+        // read of `p` itself) alive.
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("test", types.void_id);
+
+        func.add_pseudo(Pseudo::sym(PseudoId(0), "p".to_string()));
+        func.add_pseudo(Pseudo::reg(PseudoId(1), 1));
+        func.add_pseudo(Pseudo::reg(PseudoId(2), 2));
+
+        let ptr = types.pointer_to(types.int_id);
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        // %1 = load p        (plain: reading the pointer variable)
+        bb.add_insn(Instruction::load(PseudoId(1), PseudoId(0), 0, ptr, 64));
+        // %2 = load *%1      (volatile: reading the pointed-to object)
+        bb.add_insn(
+            Instruction::load(PseudoId(2), PseudoId(1), 0, types.int_id, 32).with_volatile(true),
+        );
+        bb.add_insn(Instruction::ret(None));
+        func.add_block(bb);
+        func.entry = BasicBlockId(0);
+
+        assert!(!run(&mut func), "neither load may be deleted");
+        assert_eq!(func.blocks[0].insns[1].op, Opcode::Load);
+        assert_eq!(func.blocks[0].insns[2].op, Opcode::Load);
+    }
+
+    #[test]
+    fn test_kill_clears_the_volatile_marker() {
+        // `kill` makes a `Nop`, which reaches no memory: a marker left behind
+        // would be a stale claim to any pass reading the field directly.
+        let types = TypeTable::new(&Target::host());
+        let mut insn =
+            Instruction::load(PseudoId(0), PseudoId(1), 0, types.int_id, 32).with_volatile(true);
+        insn.kill();
+        assert_eq!(insn.op, Opcode::Nop);
+        assert!(!insn.is_volatile);
+        assert!(!insn.is_volatile_access());
     }
 
     #[test]

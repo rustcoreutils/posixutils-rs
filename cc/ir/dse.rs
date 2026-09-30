@@ -111,7 +111,10 @@ fn scan_block(
             continue;
         }
         let loc = am.location_of(func, insn);
-        if !deletable(func, types, mi, &loc) {
+        // A volatile store is observable and stays, even when a later store
+        // overwrites every byte of it. `deletable` answers for a named object;
+        // the marker also answers for `*p` where `p` is a `volatile int *`.
+        if insn.is_volatile_access() || !deletable(func, types, mi, &loc) {
             // An untrackable store is still a write: drop whatever it may
             // have touched rather than pretending it did not happen.
             pending.retain(|p| !may_alias(&loc, &p.loc, mi));

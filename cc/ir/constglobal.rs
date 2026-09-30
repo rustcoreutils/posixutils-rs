@@ -158,6 +158,14 @@ fn foldable_load(
     if insn.op != Opcode::Load || insn.src.len() != 1 || insn.offset != 0 {
         return None;
     }
+    // The access itself is observable, whatever the object's initializer says
+    // it holds: `const volatile int t = 0;` -- a hardware status word, a
+    // linker-set value -- must still be read. `qualifies` declines a global
+    // written `volatile`, but the qualifier can also be on the *access*, as in
+    // `*(volatile const int *)&t`, and only the instruction knows that.
+    if insn.is_volatile_access() {
+        return None;
+    }
     let PseudoKind::Sym(name) = &func.get_pseudo(insn.src[0])?.kind else {
         return None;
     };

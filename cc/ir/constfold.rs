@@ -339,20 +339,91 @@ pub(crate) fn eval_binop(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
     }
 }
 
+/// The most negative value at `size` bits, read as signed: the one dividend
+/// whose quotient by -1 is not representable.
+///
+/// `size == 0` and `size >= 128` both answer `i128::MIN`, matching
+/// [`at_width`], which leaves a value alone at those widths.
+fn signed_min_at(size: u32) -> i128 {
+    if size == 0 || size >= 128 {
+        i128::MIN
+    } else {
+        -1i128 << (size - 1)
+    }
+}
+
+/// Whether `op` -- one of `DivS`/`DivU`/`ModS`/`ModU` -- computed at `size`
+/// bits over these operands may raise a hardware trap. `None` is an operand
+/// that is not known, which may be anything, and so may trap.
+///
+/// This is the one place the rule lives, because the three passes that fold a
+/// division each know a different amount about the operands and the rule drifted
+/// apart between them. `eval_divmod` knows both values; `instcombine`'s
+/// algebraic arms know one and nothing about the other; `range::udiv`/`umod`
+/// know sets rather than values, and answer this question of a set by asking
+/// whether zero is in it (the signed trap has no unsigned counterpart).
+///
+/// Two operand pairs trap, and they are the two `idiv` raises #DE for:
+///
+/// * a zero divisor, in either signedness; and
+/// * the single signed overflow, `INT_MIN / -1`, whose quotient is not
+///   representable. The remainder form traps with it, because on x86-64 it is
+///   the same instruction, computing the same quotient.
+///
+/// c17 does not assume this undefined behaviour away. Folding either one turns
+/// a program that faults at `-O0` into one that prints an answer at `-O2`, and
+/// the two disagreeing about the same source is worse than either answer.
+/// gcc and clang both fold these, treating the undefined behaviour as licence;
+/// this is a deliberate divergence from both rather than a bug-for-bug match.
+///
+/// The operands are raw: the narrowing this needs is applied here, and
+/// narrowing is idempotent, so a caller that has already read them at their own
+/// width may pass those instead.
+pub(crate) fn divmod_may_trap(op: Opcode, size: u32, a: Option<i128>, b: Option<i128>) -> bool {
+    let signed = match op {
+        Opcode::DivS | Opcode::ModS => true,
+        Opcode::DivU | Opcode::ModU => false,
+        // Nothing else in this IR traps on its operands.
+        _ => return false,
+    };
+    let size = size.max(1);
+
+    // An unknown divisor may be zero.
+    let Some(b) = b.map(|v| at_width(v, size, signed)) else {
+        return true;
+    };
+    if b == 0 {
+        return true;
+    }
+    if !signed || b != -1 {
+        return false;
+    }
+    // Divisor -1: the trap turns on whether the dividend is the most negative
+    // value, so an unknown dividend may trap.
+    match a.map(|v| at_width(v, size, true)) {
+        Some(a) => a == signed_min_at(size),
+        None => true,
+    }
+}
+
 /// Division and remainder.
 ///
 /// Read at the operand's own width, in the signedness the opcode implies.
 /// Division is not congruent modulo 2^n the way add/sub/mul are: it reads the
 /// whole value and its sign, so `(int)0xFFFFFFFFu` arriving as 4294967295
 /// rather than -1 answered 2147483647 where C says 0.
+///
+/// An operation that traps is not folded: see [`divmod_may_trap`]. That single
+/// refusal covers `instcombine`, `sccp` and `vrp` at once, since all three
+/// route their constant folding through [`eval_binop`].
 fn eval_divmod(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
     let signed = matches!(insn.op, Opcode::DivS | Opcode::ModS);
     let size = insn.size.max(1);
-    let a = at_width(a, size, signed);
-    let b = at_width(b, size, signed);
-    if b == 0 {
+    if divmod_may_trap(insn.op, size, Some(a), Some(b)) {
         return None;
     }
+    let a = at_width(a, size, signed);
+    let b = at_width(b, size, signed);
     let folded = match (insn.op, signed) {
         (Opcode::DivS, _) => a.wrapping_div(b),
         (Opcode::DivU, _) => (a as u128).wrapping_div(b as u128) as i128,
@@ -376,7 +447,22 @@ fn eval_shift(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
         // The result is truncated back, so an overflowing shift wraps at the
         // operand width rather than growing into the i128.
         Opcode::Shl => at_width(at_width(a, size, true).wrapping_shl(b as u32), size, true),
-        Opcode::Lsr => at_width(a, size, false).wrapping_shr(b as u32),
+        // Shifted in the unsigned view, which is what makes it the logical
+        // shift. Doing it on the `i128` instead only agrees below 128 bits,
+        // where `at_width` has already cleared the high half: at 128 bits
+        // `at_width` hands the value back unchanged and `i128::wrapping_shr`
+        // is the arithmetic shift, so a negative operand would shift in ones.
+        // Unreachable as the passes stand: `arch::mapping` runs before the
+        // optimizer, and it leaves no 128-bit shift whose count this can read
+        // -- a literally constant count expands the shift into 64-bit halves,
+        // and any other count is rewritten into a `Pair64` the constant map
+        // cannot answer. Written correctly anyway, so that the arm does not
+        // depend on that pass ordering for its answer.
+        Opcode::Lsr => at_width(
+            (at_width(a, size, false) as u128).wrapping_shr(b as u32) as i128,
+            size,
+            false,
+        ),
         Opcode::Asr => at_width(a, size, true).wrapping_shr(b as u32),
         _ => return None,
     })
@@ -588,5 +674,229 @@ mod tests {
             );
         }
         assert_eq!(fcmp_against_constant(Opcode::SetGt, inf, false), None);
+    }
+
+    const DIVMOD: [Opcode; 4] = [Opcode::DivS, Opcode::DivU, Opcode::ModS, Opcode::ModU];
+
+    fn is_signed(op: Opcode) -> bool {
+        matches!(op, Opcode::DivS | Opcode::ModS)
+    }
+
+    /// A zero divisor traps in either signedness, at every width, whatever the
+    /// dividend is -- including when the dividend is itself unknown.
+    #[test]
+    fn divmod_may_trap_refuses_every_zero_divisor() {
+        for op in DIVMOD {
+            for size in [8, 16, 32, 64, 128] {
+                for a in [None, Some(0), Some(1), Some(-1), Some(i128::MAX)] {
+                    assert!(
+                        divmod_may_trap(op, size, a, Some(0)),
+                        "{op:?}.{size} {a:?} / 0"
+                    );
+                }
+                // The zero may also arrive unnarrowed: 2^size reads as zero at
+                // `size` bits, and it is the narrowed value that divides.
+                if size < 128 {
+                    assert!(
+                        divmod_may_trap(op, size, Some(1), Some(1i128 << size)),
+                        "{op:?}.{size} 1 / 2^{size}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An operand that is not known may be anything, so it may be the zero
+    /// divisor, or the `INT_MIN` dividend that overflows against -1.
+    #[test]
+    fn divmod_may_trap_refuses_an_unknown_operand() {
+        for op in DIVMOD {
+            // An unknown divisor, whatever the dividend.
+            assert!(divmod_may_trap(op, 32, Some(7), None), "{op:?} 7 / x");
+            assert!(divmod_may_trap(op, 32, Some(0), None), "{op:?} 0 / x");
+            assert!(divmod_may_trap(op, 32, None, None), "{op:?} y / x");
+
+            // An unknown dividend only matters against -1, and only when the
+            // opcode is a signed one -- for `DivU`/`ModU`, -1 at 32 bits is
+            // 4294967295, an ordinary divisor.
+            assert_eq!(
+                divmod_may_trap(op, 32, None, Some(-1)),
+                is_signed(op),
+                "{op:?} x / -1"
+            );
+            assert!(!divmod_may_trap(op, 32, None, Some(3)), "{op:?} x / 3");
+        }
+    }
+
+    /// The one signed overflow, at every width it exists at, and only for the
+    /// signed opcodes.
+    #[test]
+    fn divmod_may_trap_refuses_the_signed_overflow() {
+        for size in [8, 16, 32, 64, 128] {
+            let min = signed_min_at(size);
+            for op in DIVMOD {
+                // Only the signed opcodes: the unsigned reading of the same
+                // bits is a large positive dividend divided by a larger one,
+                // which is 0 and cannot trap.
+                assert_eq!(
+                    divmod_may_trap(op, size, Some(min), Some(-1)),
+                    is_signed(op),
+                    "{op:?}.{size} MIN / -1"
+                );
+            }
+        }
+        assert_eq!(signed_min_at(8), -128);
+        assert_eq!(signed_min_at(32), -2147483648);
+        assert_eq!(signed_min_at(64), i64::MIN as i128);
+        assert_eq!(signed_min_at(128), i128::MIN);
+    }
+
+    /// The dividend is read at its own width first, so `INT_MIN` written as
+    /// the unsigned pattern 2147483648 is still the overflowing dividend, and
+    /// a 64-bit `INT_MIN` divided at 32 bits is not.
+    #[test]
+    fn divmod_may_trap_reads_the_dividend_at_its_width() {
+        assert!(divmod_may_trap(
+            Opcode::DivS,
+            32,
+            Some(2147483648),
+            Some(-1)
+        ));
+        assert!(divmod_may_trap(
+            Opcode::DivS,
+            32,
+            Some(-2147483648),
+            Some(-1)
+        ));
+        // -2^31 at 64 bits is an ordinary negative number, not `LONG_MIN`.
+        assert!(!divmod_may_trap(
+            Opcode::DivS,
+            64,
+            Some(-2147483648),
+            Some(-1)
+        ));
+        // The divisor, likewise: 4294967295 at 32 bits signed is -1.
+        assert!(divmod_may_trap(
+            Opcode::DivS,
+            32,
+            Some(-2147483648),
+            Some(4294967295)
+        ));
+    }
+
+    /// The safe neighbours of both traps still fold, which is what stops the
+    /// rule from becoming "never fold a division".
+    #[test]
+    fn divmod_may_trap_allows_the_safe_neighbours() {
+        for op in DIVMOD {
+            for (a, b) in [
+                (12, 4),
+                (13, 4),
+                (0, 4),            // 0 / c, with the divisor known
+                (-2147483647, -1), // one above the overflowing dividend
+                (-2147483648, 1),  // the dividend, but not against -1
+                (-2147483648, -2),
+                (1, -1),
+                (i128::from(i32::MAX), -1),
+            ] {
+                assert!(
+                    !divmod_may_trap(op, 32, Some(a), Some(b)),
+                    "{op:?} {a} / {b} cannot trap"
+                );
+            }
+            // `x / 1` and `x % 1` fold with the dividend unknown.
+            assert!(!divmod_may_trap(op, 32, None, Some(1)), "{op:?} x / 1");
+        }
+    }
+
+    /// Nothing else in this IR trips the divide trap, so nothing else is asked
+    /// to answer for it.
+    #[test]
+    fn divmod_may_trap_answers_only_for_division() {
+        for op in [Opcode::Add, Opcode::Mul, Opcode::Shl, Opcode::Lsr] {
+            assert!(!divmod_may_trap(op, 32, Some(1), Some(0)), "{op:?}");
+            assert!(!divmod_may_trap(op, 32, None, None), "{op:?}");
+        }
+    }
+
+    fn binop_at(op: Opcode, size: u32) -> Instruction {
+        Instruction::new(op).with_size(size)
+    }
+
+    /// `eval_binop` is the one door `instcombine`, `sccp` and `vrp` fold
+    /// through, so the refusal has to be visible from there.
+    #[test]
+    fn eval_binop_does_not_fold_a_trapping_division() {
+        for (op, size) in [
+            (Opcode::DivS, 32),
+            (Opcode::ModS, 32),
+            (Opcode::DivS, 64),
+            (Opcode::ModS, 64),
+        ] {
+            let insn = binop_at(op, size);
+            assert_eq!(eval_binop(&insn, 1, 0), None, "{op:?}.{size} 1 / 0");
+            assert_eq!(
+                eval_binop(&insn, signed_min_at(size), -1),
+                None,
+                "{op:?}.{size} MIN / -1"
+            );
+        }
+        for op in [Opcode::DivU, Opcode::ModU] {
+            assert_eq!(eval_binop(&binop_at(op, 32), 1, 0), None, "{op:?} 1 / 0");
+        }
+    }
+
+    /// And still gives the answers it gave, at the truncation C requires.
+    #[test]
+    fn eval_binop_still_folds_a_safe_division() {
+        for (op, a, b, want) in [
+            (Opcode::DivS, 12, 4, 3),
+            (Opcode::ModS, 13, 4, 1),
+            (Opcode::DivS, -13, 4, -3),
+            (Opcode::ModS, -13, 4, -1),
+            (Opcode::DivS, 13, -4, -3),
+            (Opcode::ModS, 13, -4, 1),
+            (Opcode::DivS, -2147483647, -1, 2147483647),
+            (Opcode::DivS, -2147483648, 1, -2147483648),
+            (Opcode::ModS, -2147483648, 1, 0),
+            (Opcode::DivU, 4294967295, 5, 858993459),
+            (Opcode::ModU, 4294967295, 5, 0),
+        ] {
+            assert_eq!(
+                eval_binop(&binop_at(op, 32), a, b),
+                Some(want),
+                "{op:?} {a} op {b}"
+            );
+        }
+    }
+
+    /// `Lsr` is the logical shift at every width, the 128-bit one included,
+    /// where the value is not narrowed first and an `i128` shift would be the
+    /// arithmetic one. No pass reaches this today (`arch::mapping` decomposes
+    /// every 128-bit shift before the optimizer runs), so this pins the
+    /// evaluation rather than a pass's behaviour.
+    #[test]
+    fn eval_shift_lsr_is_logical_at_every_width() {
+        assert_eq!(
+            eval_binop(&binop_at(Opcode::Lsr, 128), -1, 4),
+            Some((u128::MAX >> 4) as i128),
+            "-1 >>u 4 at 128 bits fills with zeros"
+        );
+        assert_eq!(
+            eval_binop(&binop_at(Opcode::Lsr, 128), i128::MIN, 127),
+            Some(1),
+            "the sign bit shifts down to bit 0"
+        );
+        assert_eq!(
+            eval_binop(&binop_at(Opcode::Asr, 128), -1, 4),
+            Some(-1),
+            "`Asr` is still the arithmetic shift"
+        );
+        // The narrower widths, which were already right, are unchanged.
+        assert_eq!(eval_binop(&binop_at(Opcode::Lsr, 32), -1, 28), Some(15));
+        assert_eq!(eval_binop(&binop_at(Opcode::Asr, 32), -1, 28), Some(-1));
+        // An out-of-range count is undefined and is not folded, at 128 as
+        // anywhere else.
+        assert_eq!(eval_binop(&binop_at(Opcode::Lsr, 128), -1, 128), None);
     }
 }

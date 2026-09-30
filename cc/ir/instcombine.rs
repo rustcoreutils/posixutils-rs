@@ -25,9 +25,9 @@
 //
 
 use super::constfold::{
-    at_width, cmp_operand_width, eval_binop, eval_fbinop, eval_fcvt, eval_fcvtf, eval_fternop,
-    eval_funop, eval_unop, fcmp_decided, fcmp_mask, fcmp_outcome, get_cmp_info, mirror_mask,
-    possible_against, result_type_of, FCMP_ALL,
+    at_width, cmp_operand_width, divmod_may_trap, eval_binop, eval_fbinop, eval_fcvt, eval_fcvtf,
+    eval_fternop, eval_funop, eval_unop, fcmp_decided, fcmp_mask, fcmp_outcome, get_cmp_info,
+    mirror_mask, possible_against, result_type_of, FCMP_ALL,
 };
 use super::facts::{CmpDomain, CmpFacts, ConstMap, Relation};
 use super::{ConstValue, Function, Instruction, Opcode, PseudoId};
@@ -401,15 +401,22 @@ fn simplify_div(insn: &Instruction, consts: &ConstMap) -> Simplification {
     let val1 = consts.get(src1).map(|v| at_width(v, size, signed));
     let val2 = consts.get(src2).map(|v| at_width(v, size, signed));
 
+    // A division that can trap is left to trap: `constfold::divmod_may_trap`
+    // states the rule and both of the operand pairs it covers. This is the
+    // whole of what stands between an unknown divisor and a folded answer --
+    // `0 / x` used to fold to zero here without ever asking what `x` was, and
+    // a divisor of -1 is only safe once the dividend is known not to be the
+    // most negative value.
+    if divmod_may_trap(insn.op, size, val1, val2) {
+        return Simplification::None;
+    }
+
     match (val1, val2) {
-        // Constant folding: a / b -> (a / b) (avoid div by zero)
+        // Constant folding: a / b -> (a / b)
         (Some(a), Some(b)) => fold_with(insn, a, b),
 
         // Algebraic: x / 1 -> x
         (None, Some(1)) => Simplification::CopyFrom(src1),
-
-        // Algebraic: 0 / x -> 0
-        (Some(0), None) => fold_to_zero(),
 
         _ => Simplification::None,
     }
@@ -430,12 +437,17 @@ fn simplify_mod(insn: &Instruction, consts: &ConstMap) -> Simplification {
     let val1 = consts.get(src1).map(|v| at_width(v, size, signed));
     let val2 = consts.get(src2).map(|v| at_width(v, size, signed));
 
-    match (val1, val2) {
-        // Constant folding: a % b -> (a % b) (avoid mod by zero)
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+    // The remainder traps exactly where the division does -- on x86-64 it is
+    // the same `idiv`, computing the same quotient -- so it asks the same
+    // question. `0 % x` folded to zero here for an unknown `x`, and
+    // `INT_MIN % -1` folded to zero through `fold_with`.
+    if divmod_may_trap(insn.op, size, val1, val2) {
+        return Simplification::None;
+    }
 
-        // Algebraic: 0 % x -> 0
-        (Some(0), None) => fold_to_zero(),
+    match (val1, val2) {
+        // Constant folding: a % b -> (a % b)
+        (Some(a), Some(b)) => fold_with(insn, a, b),
 
         // Algebraic: x % 1 -> 0
         (None, Some(1)) => fold_to_zero(),

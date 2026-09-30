@@ -3592,3 +3592,103 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("register_composite_params", code, &[]), 0);
 }
+
+/// The optimized IR of `src` for `target`, with inlining left on.
+fn post_opt_ir_inlined(prefix: &str, src: &str, target: &str, func: &str) -> String {
+    let dir = plib::tmp::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("tempdir");
+    let c = dir.path().join("t.c");
+    std::fs::write(&c, src).expect("write source");
+    let r = run_c17(&[
+        "--target",
+        target,
+        "-O2",
+        "--dump-ir",
+        "post-opt",
+        "--dump-ir-func",
+        func,
+        "-S",
+        "-o",
+        "/dev/null",
+        c.to_str().unwrap(),
+    ]);
+    assert!(r.success, "compile failed: {}", r.stderr);
+    format!("{}{}", r.stdout, r.stderr)
+}
+
+/// An aggregate returned in registers is spliced into its caller as its value,
+/// not as the address of the callee's copy.
+///
+/// The inliner replaces a `Ret` with a phi of the returned value. For a
+/// register-returned aggregate it has to read that value out of the callee's
+/// result local first. It did for the two-register case and for a one-register
+/// aggregate of eight bytes, but a *sixteen*-byte aggregate returned in one SSE
+/// register -- `struct { __float128 a; }` -- had its `symaddr` fed straight
+/// into the phi, so the caller received the address where the value belonged:
+///
+///     leaq -96(%rbp), %rax     ; the callee's result local
+///     movq %r10, -64(%rbp)     ; stored into eight bytes of a sixteen-byte slot
+///     movq -56(%rbp), %rax     ; the other eight read uninitialized
+///
+/// Inlining therefore changed the answer. Compiling for an explicit target is
+/// what makes this testable at all: `__float128` is rejected on Darwin, so the
+/// shape cannot be built for the host, and no test covered it.
+#[test]
+fn codegen_an_inlined_register_aggregate_return_is_a_value() {
+    let src = "\
+struct Q { __float128 a; };
+static struct Q mk(__float128 x) { struct Q r = {x}; return r; }
+__float128 probe(__float128 x) { struct Q v = mk(x); return v.a; }
+";
+    let ir = post_opt_ir_inlined("inl_sse_ret", src, X86_64_LINUX, "probe");
+
+    // Every pseudo that holds an address rather than a value.
+    let addresses: Vec<&str> = ir
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            let (target, rest) = t.split_once(" = ")?;
+            rest.starts_with("symaddr").then_some(target)
+        })
+        .collect();
+
+    // A phi source carries the returned value, so none of them may be one.
+    for line in ir.lines().map(str::trim).filter(|l| l.contains("phisrc")) {
+        for addr in &addresses {
+            assert!(
+                !line
+                    .split_whitespace()
+                    .any(|w| w.trim_end_matches(',') == *addr),
+                "the inlined return hands the caller {addr}, which is an address, \
+                 where the aggregate's value belongs:\n  {line}\n\nfull IR:\n{ir}"
+            );
+        }
+    }
+}
+
+/// The control: the shapes that already worked must keep working, so the check
+/// above cannot pass by the inliner declining to inline.
+#[test]
+fn codegen_inlined_aggregate_returns_still_inline() {
+    let src = "\
+struct F2 { float a, b; };
+struct F4 { float a, b, c, d; };
+static struct F2 mk2(float x) { struct F2 r = {x, x + 1}; return r; }
+static struct F4 mk4(float x) { struct F4 r = {x, x+1, x+2, x+3}; return r; }
+float probe2(float x) { struct F2 v = mk2(x); return v.a + v.b; }
+float probe4(float x) { struct F4 v = mk4(x); return v.a + v.d; }
+";
+    for func in ["probe2", "probe4"] {
+        let ir = post_opt_ir_inlined("inl_agg_ok", src, X86_64_LINUX, func);
+        assert!(
+            ir.contains("_inline"),
+            "{func}'s callee must still be inlined, or the check above is vacuous:\n{ir}"
+        );
+        assert!(
+            ir.lines().any(|l| l.contains("load")),
+            "{func} must read the returned aggregate's value:\n{ir}"
+        );
+    }
+}

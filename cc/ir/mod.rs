@@ -78,6 +78,44 @@ impl CallAbiInfo {
     }
 }
 
+/// Whether an aggregate of `size_bits` returned in class `ret` is handed back
+/// by *address*: the `Ret` carries a pointer to the value's storage rather
+/// than the value, and whoever consumes the return has to read the bytes out.
+///
+/// Three classifications answer yes, and they are exactly the three that no
+/// pair of general registers can carry:
+///
+///   * `X87` -- an aggregate that is nothing but a `long double` comes back in
+///     st(0), which is loaded from memory because nothing else holds 80 bits.
+///   * `Hfa` -- AAPCS64 returns a homogeneous floating-point aggregate in one
+///     V register per element, at any size: four `double`s is thirty-two bytes
+///     and still comes back in `d0`-`d3`.
+///   * one `Sse` -- a single SSE register holding all sixteen bytes, which on
+///     x86-64 is an aggregate whose sole content is a `__float128`: SSE+SSEUP
+///     is *one* register, and splitting it into RAX/RDX hands a gcc-compiled
+///     caller half a value in the wrong place.
+///
+/// The size bound is part of the rule, not a caller's business: an aggregate
+/// that fits in one register comes back *as* a value, so `struct { float a,
+/// b; }` is `Direct { classes: [Sse] }` and yet carries its value. Only past
+/// 64 bits is an address handed back.
+///
+/// One function because the answer is asked in three places -- the return
+/// emitter, the flag that tells the inliner what it is splicing, and the
+/// inliner's own `Ret` lowering -- and two spellings of it had already
+/// drifted: the flag omitted the one-SSE case, so a `struct { __float128 a; }`
+/// return reported a value-carrying `Ret`, the inliner spliced the body in and
+/// phi-ed the callee's local *address* as though it were the aggregate.
+pub fn aggregate_ret_is_address(ret: &ArgClass, size_bits: u32) -> bool {
+    use crate::abi::RegClass;
+    size_bits > 64
+        && match ret {
+            ArgClass::X87 { .. } | ArgClass::Hfa { .. } => true,
+            ArgClass::Direct { classes, .. } => classes.as_slice() == [RegClass::Sse],
+            _ => false,
+        }
+}
+
 // Instruction Reference - for def-use chains
 
 /// Reference to an instruction by (basic block id, instruction index)
@@ -1577,6 +1615,21 @@ impl Instruction {
                 _ => false,
             })
             .unwrap_or(false)
+    }
+
+    /// True when this `Ret` hands back an aggregate by *address*: its source
+    /// is a pointer to the value's storage, not the value.
+    ///
+    /// Asked of the `Ret`'s own ABI classification, which is the only place
+    /// the answer is recorded -- `Instruction::size` is the aggregate's width,
+    /// so [`aggregate_ret_is_address`] can apply its own size bound without a
+    /// `TypeTable`. Only [`crate::ir::Linearizer::emit_two_reg_return`] ever
+    /// puts `abi_info` on a `Ret`, and only for a struct or union, so no
+    /// scalar reaches this.
+    pub fn returns_aggregate_address(&self) -> bool {
+        self.abi_info
+            .as_ref()
+            .is_some_and(|ai| aggregate_ret_is_address(&ai.ret, self.size))
     }
 
     /// Convert this instruction to a no-op, clearing all operands.
@@ -3582,6 +3635,61 @@ mod tests {
             },
         )));
         assert!(insn.returns_two_regs());
+    }
+
+    /// The three classes whose `Ret` hands back an aggregate's *address*, and
+    /// the size bound that is part of the rule.
+    ///
+    /// `Direct { classes: [Sse] }` is the discriminating row: at sixteen bytes
+    /// it is one SSE register holding a whole `__float128`, so the `Ret` names
+    /// the storage; at eight it is `struct { float a, b; }`, which comes back
+    /// *as* a value and never reaches `emit_two_reg_return` at all. Answering
+    /// the first one "no" is what made the inliner phi an address as though it
+    /// were the aggregate.
+    #[test]
+    fn test_aggregate_ret_is_address() {
+        let sse = |n: usize, bits: u32| ArgClass::Direct {
+            classes: vec![RegClass::Sse; n],
+            size_bits: bits,
+        };
+        assert!(aggregate_ret_is_address(&sse(1, 128), 128), "one SSE, 16B");
+        assert!(!aggregate_ret_is_address(&sse(1, 64), 64), "one SSE, 8B");
+        assert!(
+            !aggregate_ret_is_address(&sse(2, 128), 128),
+            "two SSE registers carry the halves, not an address"
+        );
+        assert!(
+            !aggregate_ret_is_address(
+                &ArgClass::Direct {
+                    classes: vec![RegClass::Integer, RegClass::Integer],
+                    size_bits: 128,
+                },
+                128
+            ),
+            "__int128 comes back in RAX/RDX"
+        );
+        assert!(aggregate_ret_is_address(
+            &ArgClass::X87 { size_bits: 80 },
+            128
+        ));
+        assert!(aggregate_ret_is_address(
+            &ArgClass::Hfa {
+                base: crate::abi::HfaBase::Float64,
+                count: 4,
+            },
+            256
+        ));
+        assert!(
+            !aggregate_ret_is_address(
+                &ArgClass::Indirect {
+                    align: 8,
+                    size_bytes: 64,
+                },
+                512
+            ),
+            "the hidden pointer is not this"
+        );
+        assert!(!aggregate_ret_is_address(&ArgClass::Ignore, 0));
     }
 
     // Function::create_reg_pseudo

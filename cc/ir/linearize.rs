@@ -1572,32 +1572,48 @@ impl<'a> Linearizer<'a> {
         }
 
         // A `Ret` that carries an address; a call's result slot holds the
-        // value. The inliner has to know not to splice across that boundary.
-        // An aggregate returned in st(0) has exactly the same shape as a
-        // complex one, and missing it is a miscompile visible only at -O.
+        // value. Whoever consumes that return has to read the bytes out of the
+        // storage it names, and the inliner has to know which of the two it is
+        // splicing. `aggregate_ret_is_address` is the one place that answers
+        // it -- the same function `emit_two_reg_return` asks before emitting
+        // the address form, so the shape and the question about the shape
+        // cannot drift apart. They had: spelled out a second time here as
+        // "x87 or HFA", this missed a sixteen-byte aggregate returned in one
+        // SSE register, and before that it was gated behind the
+        // *two-register* path's 128-bit cap, which missed every HFA past
+        // sixteen bytes -- four `double`s is thirty-two bytes and still comes
+        // back in d0-d3.
         //
-        // Asked of the ABI classification directly rather than through
-        // `returns_reg_aggregate`, which is the *two-register* return path and
-        // so stops at 128 bits. An HFA comes back in registers at any size --
-        // four `double`s is thirty-two bytes and still returns in d0-d3 -- so
-        // gating on that cap made every HFA past 128 bits report that its `Ret`
-        // carried a value. The inliner then spliced the body in and phi-ed the
-        // address as if it were the aggregate, and the caller read the pointer's
-        // own storage as the struct's bytes. The call-site half of this
-        // decision already has no size bound; the two had drifted.
-        let returns_addr_aggregate = (ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
-            // An aggregate that fits in one register comes back *as* a value,
-            // so its `Ret` carries one; only past 64 bits is an address handed
-            // back. Dropping this bound along with the 128-bit cap refused to
-            // inline every HFA, including `struct { float x, y; }`, which was
-            // correct before and is the common aarch64 shape.
-            && struct_size_bits > 64
-            && !returns_large_struct
-            && matches!(
+        // Classified only for an aggregate that is not going through the
+        // hidden pointer, which is the only shape the question is about.
+        let ret_class = ((ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
+            && !returns_large_struct)
+            .then(|| {
                 get_abi_for_conv(self.current_calling_conv, self.target)
-                    .classify_return(func.return_type, self.types),
-                crate::abi::ArgClass::X87 { .. } | crate::abi::ArgClass::Hfa { .. }
-            );
+                    .classify_return(func.return_type, self.types)
+            });
+        // Which of those the inliner is kept away from -- a narrower question
+        // than the shape, and no longer the same one. `clone_instruction`'s
+        // `Ret` arm now copies an aggregate handed back by address into the
+        // call's result local, which is where a call leaves it, so the
+        // one-SSE-register shape is spliced correctly instead of refused.
+        //
+        // An x87 aggregate and an HFA travel by address for the same reason
+        // and that copy would move them just as well, but they are not ready
+        // to be let through: the copy reads the `Ret`'s own ABI
+        // classification, and only `emit_two_reg_return` attaches one --
+        // which `returns_reg_aggregate` above stops calling past 128 bits. So
+        // a three- or four-`double` HFA returns an address under no
+        // classification at all, and lifting this refusal has it phi-ed again
+        // (`%45 = phisrc.192 %44`, where `%44` is a `symaddr.64`). Letting
+        // those in means carrying the classification onto every
+        // register-returned aggregate's `Ret` first, which is its own change
+        // -- and `codegen_aarch64_hfa_returning_function_is_not_inlined`
+        // pins this refusal until then.
+        let returns_addr_aggregate = ret_class.as_ref().is_some_and(|class| {
+            super::aggregate_ret_is_address(class, struct_size_bits)
+                && !matches!(class, crate::abi::ArgClass::Direct { .. })
+        });
         ir_func.ret_is_address = self.types.is_complex(func.return_type) || returns_addr_aggregate;
 
         // Add parameters
@@ -1908,33 +1924,17 @@ impl<'a> Linearizer<'a> {
         let abi = get_abi_for_conv(self.current_calling_conv, self.target);
         let ret_class = abi.classify_return(ret_type, self.types);
 
-        // An aggregate that is nothing but a `long double` comes back in
-        // st(0), exactly as the bare scalar does, so the `Ret` carries the
-        // value's *address* and the backend loads it onto the FPU stack.
-        // Splitting it across RAX and RDX left the caller reading a slot
-        // nobody had written.
-        // A single SSE register carrying sixteen bytes -- an aggregate whose
-        // sole content is a `__float128` -- is the same shape: the register
-        // holds the whole value, so the `Ret` carries its address and the
-        // backend moves all sixteen bytes at once. Splitting it into two
-        // general registers handed the caller half a value in the wrong place.
-        let one_sse_reg = matches!(
-            ret_class,
-            crate::abi::ArgClass::Direct { ref classes, .. }
-                if classes.len() == 1 && classes[0] == crate::abi::RegClass::Sse
-        );
-        // A one-element HFA is the aarch64 spelling of the same thing: one V
-        // register holds the whole value. Splitting it into two general
-        // registers was survivable on its own -- the backend put the halves
-        // back together -- but the *inliner* then spliced a two-source `Ret`
-        // into a caller expecting one value, and the top half came out zero.
-        // Any HFA, not just a one-element one: the two-element form has the
-        // same hazard. Its `Ret` carried the halves as two general registers,
-        // and splicing that into a caller expecting one value dropped the
-        // second -- an inlined `struct { double a, b; }` return came back with
-        // its second half zeroed.
-        let one_hfa_reg = matches!(ret_class, crate::abi::ArgClass::Hfa { .. });
-        if matches!(ret_class, crate::abi::ArgClass::X87 { .. }) || one_sse_reg || one_hfa_reg {
+        // The three classes no pair of general registers can carry: an x87
+        // aggregate, an HFA, and sixteen bytes in one SSE register. Each hands
+        // the value back by address, and splitting any of them into RAX/RDX
+        // was a miscompile of its own -- an x87 aggregate left the caller
+        // reading a slot nobody had written, a `__float128` one handed a
+        // gcc-compiled caller half a value in the wrong place, and an HFA's
+        // two-source `Ret` spliced into a caller expecting one value dropped
+        // its second half. `aggregate_ret_is_address` is where that list
+        // lives, because the inliner has to ask the same question of the
+        // `Ret` this emits.
+        if super::aggregate_ret_is_address(&ret_class, struct_size) {
             let mut ret_insn = Instruction::ret_typed(Some(src_addr), ret_type, struct_size);
             ret_insn.abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
             self.emit(ret_insn);

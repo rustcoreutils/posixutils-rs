@@ -99,6 +99,21 @@ comparison stays, because a NaN operand would raise `FE_INVALID`. The
 optimizer decides which comparisons qualify by the same rule
 (`constfold::fcmp_against_constant`).
 
+### Float constant folding stops where an operation raises
+
+Arithmetic, negation, comparison and conversion fold over float constants, at
+the format the program computes in rather than at the 128 significand bits a
+literal is carried in. Arithmetic and conversion leave to run time everything
+that raises a floating-point exception: a NaN or infinite operand, a division
+by zero, a narrowing that overflows (`ir/constfold.rs`). C lets a program read
+those flags through `<fenv.h>`, and folding the operation would take the flag
+with it.
+
+Comparisons of two constants are the exception, as in gcc: one against a NaN
+folds -- every ordered predicate to 0, `!=` to 1 -- although an ordered
+comparison with a NaN raises `FE_INVALID`. Both backends emit quiet compares,
+which do not raise it for a quiet NaN either.
+
 ## Known Divergences
 
 ### `_Generic` on a wide bit-field expression

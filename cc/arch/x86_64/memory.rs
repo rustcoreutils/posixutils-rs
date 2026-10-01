@@ -282,6 +282,110 @@ impl X86_64CodeGen {
         }
     }
 
+    /// The memory operand of a scalar access through the address pseudo
+    /// `addr`, `disp` bytes in: the one rule by which every load, store and
+    /// atomic operation on this target finds its memory.
+    ///
+    /// What a location means depends on the pseudo's KIND, not on where it
+    /// lives. A `Sym` names storage, so its stack slot IS the object. Any
+    /// other pseudo is a pointer value, so its slot -- a spill, an incoming
+    /// stack argument -- holds the address, which is loaded into `scratch`.
+    /// A global location is a symbol's own storage. Taking a spilled
+    /// pointer's slot address instead is how an atomic add through a pointer
+    /// live across calls added to the pointer itself.
+    ///
+    /// A RIP-relative or thread-pointer-relative operand has no addend, so
+    /// `disp` reaches a global only through the GOT.
+    pub(super) fn scalar_mem_operand(
+        &mut self,
+        addr: PseudoId,
+        disp: i32,
+        scratch: Reg,
+    ) -> MemAddr {
+        match self.get_location(addr) {
+            Loc::Reg(base) => MemAddr::BaseOffset { base, offset: disp },
+            Loc::Stack(offset) if self.pseudos.is_sym(addr) => self.stack_mem(offset - disp),
+            Loc::Global(name) => self.global_mem_operand(&name, disp, scratch),
+            _ => {
+                self.emit_move(addr, scratch, 64);
+                MemAddr::BaseOffset {
+                    base: scratch,
+                    offset: disp,
+                }
+            }
+        }
+    }
+
+    /// The memory operand of global symbol `name`: thread-local through the
+    /// FS segment (Local Exec, or Initial Exec with the offset loaded into
+    /// `scratch`), external through the GOT (the address loaded into
+    /// `scratch`), anything else RIP-relative.
+    fn global_mem_operand(&mut self, name: &str, disp: i32, scratch: Reg) -> MemAddr {
+        let symbol = if name.starts_with('.') {
+            Symbol::local(name)
+        } else {
+            Symbol::global(name)
+        };
+        // TLS first: an external thread-local must not take the GOT path.
+        if self.is_tls_symbol(name) {
+            if !self.use_tls_ie(name) {
+                return MemAddr::TlsLocalExec(symbol);
+            }
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::TlsGottpoff(symbol)),
+                dst: GpOperand::Reg(scratch),
+            });
+            return MemAddr::FsBase(scratch);
+        }
+        if self.needs_got_access(name) {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name))),
+                dst: GpOperand::Reg(scratch),
+            });
+            return MemAddr::BaseOffset {
+                base: scratch,
+                offset: disp,
+            };
+        }
+        MemAddr::RipRelative(symbol)
+    }
+
+    /// Load `mem_size` bits from `mem` into `dst`, sign- or zero-extending
+    /// a byte or a word to 32 bits by `is_unsigned`.
+    fn emit_extending_load(
+        &mut self,
+        mem: MemAddr,
+        mem_size: u32,
+        reg_size: u32,
+        is_unsigned: bool,
+        dst: Reg,
+    ) {
+        if mem_size > 16 {
+            self.emit_gp_load(mem, mem_size, reg_size, dst);
+            return;
+        }
+        let src_size = OperandSize::from_bits(mem_size);
+        let src = GpOperand::Mem(mem);
+        let dst_size = OperandSize::B32;
+        self.push_lir(if is_unsigned {
+            X86Inst::Movzx {
+                src_size,
+                dst_size,
+                src,
+                dst,
+            }
+        } else {
+            X86Inst::Movsx {
+                src_size,
+                dst_size,
+                src,
+                dst,
+            }
+        });
+    }
+
     /// Load `mem_size` bits from `mem` into `dst`, reading no byte outside
     /// the object.
     ///
@@ -559,305 +663,8 @@ impl X86_64CodeGen {
         // special-case here.
         let is_unsigned = insn.typ.is_some_and(|t| types.is_unsigned(t));
 
-        let addr_loc = self.get_location(addr);
-        match addr_loc {
-            Loc::Reg(r) => {
-                if mem_size <= 16 {
-                    // Use sign/zero extending load
-                    // LIR: use Movzx or Movsx
-                    let src_size = OperandSize::from_bits(mem_size);
-                    if is_unsigned {
-                        self.push_lir(X86Inst::Movzx {
-                            src_size,
-                            dst_size: OperandSize::B32,
-                            src: GpOperand::Mem(MemAddr::BaseOffset {
-                                base: r,
-                                offset: insn.displacement(),
-                            }),
-                            dst: dst_reg,
-                        });
-                    } else {
-                        self.push_lir(X86Inst::Movsx {
-                            src_size,
-                            dst_size: OperandSize::B32,
-                            src: GpOperand::Mem(MemAddr::BaseOffset {
-                                base: r,
-                                offset: insn.displacement(),
-                            }),
-                            dst: dst_reg,
-                        });
-                    }
-                } else {
-                    // 32/64-bit load
-                    self.emit_gp_load(
-                        MemAddr::BaseOffset {
-                            base: r,
-                            offset: insn.displacement(),
-                        },
-                        mem_size,
-                        reg_size,
-                        dst_reg,
-                    );
-                }
-            }
-            Loc::Stack(offset) => {
-                // Check if the address operand is a symbol (local variable) or a temp (spilled address)
-                let is_symbol = self.pseudos.is_sym(addr);
-
-                if is_symbol {
-                    // Local variable - load directly from stack slot
-                    let stack_addr = self.stack_mem(offset - insn.displacement());
-                    if mem_size <= 16 {
-                        // LIR: sign/zero extending load from stack
-                        let src_size = OperandSize::from_bits(mem_size);
-                        if is_unsigned {
-                            self.push_lir(X86Inst::Movzx {
-                                src_size,
-                                dst_size: OperandSize::B32,
-                                src: GpOperand::Mem(stack_addr),
-                                dst: dst_reg,
-                            });
-                        } else {
-                            self.push_lir(X86Inst::Movsx {
-                                src_size,
-                                dst_size: OperandSize::B32,
-                                src: GpOperand::Mem(stack_addr),
-                                dst: dst_reg,
-                            });
-                        }
-                    } else {
-                        // LIR: regular load from stack
-                        self.emit_gp_load(stack_addr, mem_size, reg_size, dst_reg);
-                    }
-                } else {
-                    // Spilled address - load address first, then load from that address
-                    // LIR: load spilled address
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(self.stack_mem(offset)),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    if mem_size <= 16 {
-                        // LIR: sign/zero extending load through R11
-                        let src_size = OperandSize::from_bits(mem_size);
-                        if is_unsigned {
-                            self.push_lir(X86Inst::Movzx {
-                                src_size,
-                                dst_size: OperandSize::B32,
-                                src: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::R11,
-                                    offset: insn.displacement(),
-                                }),
-                                dst: dst_reg,
-                            });
-                        } else {
-                            self.push_lir(X86Inst::Movsx {
-                                src_size,
-                                dst_size: OperandSize::B32,
-                                src: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::R11,
-                                    offset: insn.displacement(),
-                                }),
-                                dst: dst_reg,
-                            });
-                        }
-                    } else {
-                        // LIR: regular load through R11
-                        self.emit_gp_load(
-                            MemAddr::BaseOffset {
-                                base: Reg::R11,
-                                offset: insn.displacement(),
-                            },
-                            mem_size,
-                            reg_size,
-                            dst_reg,
-                        );
-                    }
-                }
-            }
-            Loc::Global(name) => {
-                // Use local symbol for labels starting with '.' (e.g., .LC0 for string constants)
-                let is_local_label = name.starts_with('.');
-                let symbol = if is_local_label {
-                    Symbol::local(name.clone())
-                } else {
-                    Symbol::global(name.clone())
-                };
-
-                // Check TLS first - TLS symbols need special access pattern even for external symbols
-                if self.is_tls_symbol(&name) {
-                    // Check if this is an external TLS variable (needs Initial Exec model)
-                    // or if we're building a shared library (also needs IE model).
-                    // PIE executables can use Local Exec for their own TLS variables.
-                    let use_ie_model = self.use_tls_ie(&name);
-
-                    if use_ie_model {
-                        // Initial Exec TLS model for external symbols:
-                        // movq symbol@GOTTPOFF(%rip), %r11  ; load TLS offset from GOT
-                        // movl %fs:(%r11), %dst             ; load from thread-local storage
-                        self.push_lir(X86Inst::Mov {
-                            size: OperandSize::B64,
-                            src: GpOperand::Mem(MemAddr::TlsGottpoff(symbol.clone())),
-                            dst: GpOperand::Reg(Reg::R11),
-                        });
-                        // Now load from %fs:(%r11) with appropriate sign/zero extension
-                        if mem_size <= 16 {
-                            let src_size = OperandSize::from_bits(mem_size);
-                            if is_unsigned {
-                                self.push_lir(X86Inst::Movzx {
-                                    src_size,
-                                    dst_size: OperandSize::B32,
-                                    src: GpOperand::Mem(MemAddr::FsBase(Reg::R11)),
-                                    dst: dst_reg,
-                                });
-                            } else {
-                                self.push_lir(X86Inst::Movsx {
-                                    src_size,
-                                    dst_size: OperandSize::B32,
-                                    src: GpOperand::Mem(MemAddr::FsBase(Reg::R11)),
-                                    dst: dst_reg,
-                                });
-                            }
-                        } else {
-                            self.emit_gp_load(
-                                MemAddr::FsBase(Reg::R11),
-                                mem_size,
-                                reg_size,
-                                dst_reg,
-                            );
-                        }
-                    } else {
-                        // Local Exec TLS model for local symbols: %fs:symbol@TPOFF
-                        let mem_addr = MemAddr::TlsLocalExec(symbol);
-                        if mem_size <= 16 {
-                            let src_size = OperandSize::from_bits(mem_size);
-                            if is_unsigned {
-                                self.push_lir(X86Inst::Movzx {
-                                    src_size,
-                                    dst_size: OperandSize::B32,
-                                    src: GpOperand::Mem(mem_addr.clone()),
-                                    dst: dst_reg,
-                                });
-                            } else {
-                                self.push_lir(X86Inst::Movsx {
-                                    src_size,
-                                    dst_size: OperandSize::B32,
-                                    src: GpOperand::Mem(mem_addr.clone()),
-                                    dst: dst_reg,
-                                });
-                            }
-                        } else {
-                            self.emit_gp_load(mem_addr, mem_size, reg_size, dst_reg);
-                        }
-                    }
-                } else if self.needs_got_access(&name) {
-                    // External symbols on macOS: load address from GOT, then load value
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    if mem_size <= 16 {
-                        let src_size = OperandSize::from_bits(mem_size);
-                        if is_unsigned {
-                            self.push_lir(X86Inst::Movzx {
-                                src_size,
-                                dst_size: OperandSize::B32,
-                                src: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::R11,
-                                    offset: insn.displacement(),
-                                }),
-                                dst: dst_reg,
-                            });
-                        } else {
-                            self.push_lir(X86Inst::Movsx {
-                                src_size,
-                                dst_size: OperandSize::B32,
-                                src: GpOperand::Mem(MemAddr::BaseOffset {
-                                    base: Reg::R11,
-                                    offset: insn.displacement(),
-                                }),
-                                dst: dst_reg,
-                            });
-                        }
-                    } else {
-                        self.emit_gp_load(
-                            MemAddr::BaseOffset {
-                                base: Reg::R11,
-                                offset: insn.displacement(),
-                            },
-                            mem_size,
-                            reg_size,
-                            dst_reg,
-                        );
-                    }
-                } else {
-                    // Regular global: RIP-relative addressing
-                    let mem_addr = MemAddr::RipRelative(symbol);
-                    if mem_size <= 16 {
-                        // LIR: sign/zero extending load from global
-                        let src_size = OperandSize::from_bits(mem_size);
-                        if is_unsigned {
-                            self.push_lir(X86Inst::Movzx {
-                                src_size,
-                                dst_size: OperandSize::B32,
-                                src: GpOperand::Mem(mem_addr.clone()),
-                                dst: dst_reg,
-                            });
-                        } else {
-                            self.push_lir(X86Inst::Movsx {
-                                src_size,
-                                dst_size: OperandSize::B32,
-                                src: GpOperand::Mem(mem_addr.clone()),
-                                dst: dst_reg,
-                            });
-                        }
-                    } else {
-                        // LIR: regular load from global
-                        self.emit_gp_load(mem_addr, mem_size, reg_size, dst_reg);
-                    }
-                }
-            }
-            _ => {
-                self.emit_move(addr, Reg::R11, 64);
-                if mem_size <= 16 {
-                    // LIR: sign/zero extending load through R11
-                    let src_size = OperandSize::from_bits(mem_size);
-                    if is_unsigned {
-                        self.push_lir(X86Inst::Movzx {
-                            src_size,
-                            dst_size: OperandSize::B32,
-                            src: GpOperand::Mem(MemAddr::BaseOffset {
-                                base: Reg::R11,
-                                offset: insn.displacement(),
-                            }),
-                            dst: dst_reg,
-                        });
-                    } else {
-                        self.push_lir(X86Inst::Movsx {
-                            src_size,
-                            dst_size: OperandSize::B32,
-                            src: GpOperand::Mem(MemAddr::BaseOffset {
-                                base: Reg::R11,
-                                offset: insn.displacement(),
-                            }),
-                            dst: dst_reg,
-                        });
-                    }
-                } else {
-                    // LIR: regular load through R11
-                    self.emit_gp_load(
-                        MemAddr::BaseOffset {
-                            base: Reg::R11,
-                            offset: insn.displacement(),
-                        },
-                        mem_size,
-                        reg_size,
-                        dst_reg,
-                    );
-                }
-            }
-        }
+        let mem = self.scalar_mem_operand(addr, insn.displacement(), Reg::R11);
+        self.emit_extending_load(mem, mem_size, reg_size, is_unsigned, dst_reg);
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
             self.emit_move_to_loc(dst_reg, &dst_loc, reg_size);
         }
@@ -907,134 +714,20 @@ impl X86_64CodeGen {
             }
         };
 
-        let addr_loc = self.get_location(addr);
-        match addr_loc {
-            Loc::Reg(r) => {
-                let op_size = OperandSize::from_bits(mem_size);
-                // LIR: store through register
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Reg(value_reg),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: r,
-                        offset: insn.displacement(),
-                    }),
-                });
+        let mem = self.scalar_mem_operand(addr, insn.displacement(), Reg::R11);
+        // A local object's own slot is stored at the width `SymSlot::store_bits`
+        // decides; everything else at the access width.
+        let store_bits = match self.get_location(addr) {
+            Loc::Stack(_) if self.pseudos.is_sym(addr) => {
+                SymSlot::store_bits(self.sym_slots.get(&addr), mem_size, insn.offset)
             }
-            Loc::Stack(offset) => {
-                // Check if the address operand is a symbol (local variable) or a temp (spilled address)
-                let is_symbol = self.pseudos.is_sym(addr);
-
-                let op_size = OperandSize::from_bits(mem_size);
-                if is_symbol {
-                    // Local variable: store directly to its stack slot, at
-                    // the width `SymSlot::store_bits` decides.
-                    let store_size = OperandSize::from_bits(SymSlot::store_bits(
-                        self.sym_slots.get(&addr),
-                        mem_size,
-                        insn.offset,
-                    ));
-                    // LIR: store to stack slot
-                    self.push_lir(X86Inst::Mov {
-                        size: store_size,
-                        src: GpOperand::Reg(value_reg),
-                        dst: GpOperand::Mem(self.stack_mem(offset - insn.displacement())),
-                    });
-                } else {
-                    // Spilled address - load address first, then store through it
-                    // LIR: load spilled address
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(self.stack_mem(offset)),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    // LIR: store through loaded address
-                    self.push_lir(X86Inst::Mov {
-                        size: op_size,
-                        src: GpOperand::Reg(value_reg),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::R11,
-                            offset: insn.displacement(),
-                        }),
-                    });
-                }
-            }
-            Loc::Global(name) => {
-                // Use local symbol for labels starting with '.' (e.g., .LC0 for string constants)
-                let is_local_label = name.starts_with('.');
-                let op_size = OperandSize::from_bits(mem_size);
-                let symbol = if is_local_label {
-                    Symbol::local(name.clone())
-                } else {
-                    Symbol::global(name.clone())
-                };
-
-                // Check TLS FIRST before GOT - TLS symbols need special access pattern
-                // and should not go through the GOT path even in PIC mode
-                if self.is_tls_symbol(&name) {
-                    // Thread-local storage: use FS segment
-                    // Use Initial Exec model for external TLS or when building shared libraries.
-                    // PIE executables can use Local Exec for their own TLS variables.
-                    let use_ie_model = self.use_tls_ie(&name);
-
-                    if use_ie_model {
-                        // Initial Exec: load offset from GOT, then store via FS segment
-                        self.push_lir(X86Inst::Mov {
-                            size: OperandSize::B64,
-                            src: GpOperand::Mem(MemAddr::TlsGottpoff(symbol)),
-                            dst: GpOperand::Reg(Reg::R11),
-                        });
-                        self.push_lir(X86Inst::Mov {
-                            size: op_size,
-                            src: GpOperand::Reg(value_reg),
-                            dst: GpOperand::Mem(MemAddr::FsBase(Reg::R11)),
-                        });
-                    } else {
-                        // Local Exec: direct access via %fs:symbol@TPOFF
-                        self.push_lir(X86Inst::Mov {
-                            size: op_size,
-                            src: GpOperand::Reg(value_reg),
-                            dst: GpOperand::Mem(MemAddr::TlsLocalExec(symbol)),
-                        });
-                    }
-                } else if self.needs_got_access(&name) {
-                    // External symbols on macOS: load address from GOT, then store
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(name.clone()))),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    self.push_lir(X86Inst::Mov {
-                        size: op_size,
-                        src: GpOperand::Reg(value_reg),
-                        dst: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::R11,
-                            offset: insn.displacement(),
-                        }),
-                    });
-                } else {
-                    // LIR: store to global via RIP-relative
-                    self.push_lir(X86Inst::Mov {
-                        size: op_size,
-                        src: GpOperand::Reg(value_reg),
-                        dst: GpOperand::Mem(MemAddr::RipRelative(symbol)),
-                    });
-                }
-            }
-            _ => {
-                self.emit_move(addr, Reg::R11, 64);
-                let op_size = OperandSize::from_bits(mem_size);
-                // LIR: store through R11
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Reg(value_reg),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::R11,
-                        offset: insn.displacement(),
-                    }),
-                });
-            }
-        }
+            _ => mem_size,
+        };
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::from_bits(store_bits),
+            src: GpOperand::Reg(value_reg),
+            dst: GpOperand::Mem(mem),
+        });
     }
 
     /// Emit a struct copy (store of size > 64 bits)
@@ -1512,5 +1205,99 @@ impl X86_64CodeGen {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::codegen::PseudoTable;
+    use crate::ir::Pseudo;
+    use crate::target::{Arch, Os, Target};
+
+    const SYM: PseudoId = PseudoId(1);
+    const PTR: PseudoId = PseudoId(2);
+
+    /// A code generator in which `SYM` is a local object and `PTR` a pointer
+    /// value, placed at `sym_loc` and `ptr_loc`.
+    fn codegen(sym_loc: Loc, ptr_loc: Loc) -> X86_64CodeGen {
+        let mut cg = X86_64CodeGen::new(Target::new(Arch::X86_64, Os::Linux));
+        cg.pseudos = PseudoTable::new(&[Pseudo::sym(SYM, "x".into()), Pseudo::reg(PTR, 2)]);
+        cg.locations.set(SYM, sym_loc);
+        cg.locations.set(PTR, ptr_loc);
+        cg
+    }
+
+    /// The same stack slot is the object for a symbol and holds the address
+    /// for a pointer value: only the pseudo's kind tells them apart.
+    #[test]
+    fn a_stack_slot_is_the_object_only_for_a_symbol() {
+        let mut cg = codegen(Loc::Stack(16), Loc::Stack(16));
+        let slot = cg.stack_mem(16);
+
+        assert_eq!(cg.scalar_mem_operand(SYM, 4, Reg::R11), cg.stack_mem(12));
+        assert!(
+            cg.base.lir_buffer.is_empty(),
+            "a symbol's slot needs no setup"
+        );
+
+        assert_eq!(
+            cg.scalar_mem_operand(PTR, 4, Reg::R11),
+            MemAddr::BaseOffset {
+                base: Reg::R11,
+                offset: 4
+            }
+        );
+        assert!(matches!(
+            cg.base.lir_buffer.as_slice(),
+            [X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(m),
+                dst: GpOperand::Reg(Reg::R11),
+            }] if *m == slot
+        ));
+    }
+
+    /// A pointer passed on the stack is loaded from its slot, into the
+    /// scratch register the caller names.
+    #[test]
+    fn an_incoming_stack_pointer_is_loaded() {
+        let mut cg = codegen(Loc::Stack(8), Loc::IncomingArg(16));
+        assert_eq!(
+            cg.scalar_mem_operand(PTR, 0, Reg::R9),
+            MemAddr::BaseOffset {
+                base: Reg::R9,
+                offset: 0
+            }
+        );
+        assert!(matches!(
+            cg.base.lir_buffer.as_slice(),
+            [X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::Rbp,
+                    offset: 16
+                }),
+                dst: GpOperand::Reg(Reg::R9),
+            }]
+        ));
+    }
+
+    /// A pointer in a register is the base; a global is RIP-relative.
+    #[test]
+    fn a_register_is_the_base_and_a_global_is_its_symbol() {
+        let mut cg = codegen(Loc::Global("g".into()), Loc::Reg(Reg::Rax));
+        assert_eq!(
+            cg.scalar_mem_operand(PTR, 8, Reg::R11),
+            MemAddr::BaseOffset {
+                base: Reg::Rax,
+                offset: 8
+            }
+        );
+        assert_eq!(
+            cg.scalar_mem_operand(SYM, 0, Reg::R11),
+            MemAddr::RipRelative(Symbol::global("g"))
+        );
+        assert!(cg.base.lir_buffer.is_empty());
     }
 }

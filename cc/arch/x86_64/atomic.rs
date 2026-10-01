@@ -13,7 +13,7 @@ use crate::arch::lir::{CondCode, Directive, Label, OperandSize, Symbol};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst};
 use crate::arch::x86_64::regalloc::{Loc, Reg};
-use crate::ir::{Instruction, MemoryOrder};
+use crate::ir::{Instruction, MemoryOrder, PseudoId};
 use crate::types::TypeTable;
 
 /// Helper enum for atomic bitwise operations
@@ -61,51 +61,10 @@ impl X86_64CodeGen {
         // XCHG is a store with a full barrier; anything weaker is a plain
         // store, which already has release semantics on x86.
         if orders_store_then_load(insn.extra().memory_order) {
-            // Load value into a register
+            // The value first: resolving the address writes only R11.
             let value_loc = self.get_location(value);
-            let addr_loc = self.get_location(addr);
-
-            // Move value to R10
             self.emit_mov_to_reg(value_loc, Reg::R10, size);
-
-            // Get address into R11
-            let mem_addr = match addr_loc {
-                Loc::Reg(r) => MemAddr::BaseOffset { base: r, offset: 0 },
-                Loc::Stack(offset) => {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(self.stack_mem(offset)),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    MemAddr::BaseOffset {
-                        base: Reg::R11,
-                        offset: 0,
-                    }
-                }
-                Loc::Global(name) => {
-                    let symbol = Symbol::global(self.format_symbol_name(&name));
-                    self.push_lir(X86Inst::Lea {
-                        addr: MemAddr::RipRelative(symbol),
-                        dst: Reg::R11,
-                    });
-                    MemAddr::BaseOffset {
-                        base: Reg::R11,
-                        offset: 0,
-                    }
-                }
-                _ => {
-                    // Handle other cases
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Imm(0),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                    MemAddr::BaseOffset {
-                        base: Reg::R11,
-                        offset: 0,
-                    }
-                }
-            };
+            let mem_addr = self.atomic_mem_operand(addr, insn.displacement(), Reg::R11);
 
             // XCHG provides atomic store with full barrier
             self.push_lir(X86Inst::Xchg {
@@ -134,10 +93,9 @@ impl X86_64CodeGen {
         let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
-        let addr_loc = self.get_location(addr);
 
-        // Get address FIRST (before loading value, in case addr is in RAX)
-        let mem_addr = self.get_mem_addr_for_atomic(addr_loc);
+        // The address first: the value goes into a register that may hold it.
+        let mem_addr = self.atomic_mem_operand(addr, insn.displacement(), Reg::R11);
 
         // Move new value to RAX (will hold old value after XCHG)
         self.emit_mov_to_reg(value_loc, Reg::Rax, size);
@@ -175,127 +133,19 @@ impl X86_64CodeGen {
 
         let op_size = OperandSize::from_bits(mem_size);
 
-        let addr_loc = self.get_location(addr);
-        let expected_loc = self.get_location(expected_ptr);
+        // Every operand is read before any register that can hold another
+        // is written. The allocator never places a pseudo in R10 or R11, so
+        // the address and the desired value go there first; R9 may hold
+        // either of them, so the expected object's address goes there last.
+        let mem_addr = self.atomic_mem_operand(addr, insn.displacement(), Reg::R11);
         let desired_loc = self.get_location(desired);
+        self.emit_mov_to_reg(desired_loc, Reg::R10, size);
+        let expected_mem = self.atomic_mem_operand(expected_ptr, 0, Reg::R9);
 
-        // IMPORTANT: Regalloc may have assigned operands to any register including
-        // R9, R10, R11, or RAX. Loading one operand into a scratch register can
-        // clobber another operand.
-        //
-        // Strategy: We need to load three values into R9, R10, R11 (plus RAX for *expected).
-        // Any source could be in any of these registers. We use a dependency-aware load order:
-        //
-        // 1. Collect which sources are in which registers
-        // 2. Load into target registers in an order that doesn't clobber unread sources
-        //
-        // For simplicity, we use the red zone (128 bytes below RSP) as scratch space.
-        // We spill all three operands first, then load from there.
-
-        // Helper lambda to check if a location is a specific register
-        let is_reg = |loc: &Loc, r: Reg| -> bool { matches!(loc, Loc::Reg(x) if *x == r) };
-
-        // Use red zone for temporary storage at RSP-8, RSP-16, RSP-24
-        let addr_temp = MemAddr::BaseOffset {
-            base: Reg::Rsp,
-            offset: -8,
-        };
-        let expected_temp = MemAddr::BaseOffset {
-            base: Reg::Rsp,
-            offset: -16,
-        };
-        let desired_temp = MemAddr::BaseOffset {
-            base: Reg::Rsp,
-            offset: -24,
-        };
-
-        // Step 1: Spill all three operands to red zone.
-        // We need a temporary register that is NOT one of our targets (R9, R10, R11).
-        // Use RCX as temp since it's caller-saved and not involved here.
-
-        // Spill addr
-        if let Loc::Reg(r) = addr_loc {
-            // Already in a register, just store it
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Reg(r),
-                dst: GpOperand::Mem(addr_temp.clone()),
-            });
-        } else {
-            self.emit_mov_to_reg(addr_loc, Reg::Rcx, 64);
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Reg(Reg::Rcx),
-                dst: GpOperand::Mem(addr_temp.clone()),
-            });
-        }
-
-        // Spill expected_ptr
-        if let Loc::Reg(r) = expected_loc {
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Reg(r),
-                dst: GpOperand::Mem(expected_temp.clone()),
-            });
-        } else {
-            self.emit_mov_to_reg(expected_loc, Reg::Rcx, 64);
-            self.push_lir(X86Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Reg(Reg::Rcx),
-                dst: GpOperand::Mem(expected_temp.clone()),
-            });
-        }
-
-        // Spill desired
-        if let Loc::Reg(r) = desired_loc {
-            self.push_lir(X86Inst::Mov {
-                size: op_size,
-                src: GpOperand::Reg(r),
-                dst: GpOperand::Mem(desired_temp.clone()),
-            });
-        } else {
-            self.emit_mov_to_reg(desired_loc, Reg::Rcx, size);
-            self.push_lir(X86Inst::Mov {
-                size: op_size,
-                src: GpOperand::Reg(Reg::Rcx),
-                dst: GpOperand::Mem(desired_temp.clone()),
-            });
-        }
-
-        // Step 2: Load from red zone into target registers.
-        // Now all values are safely on stack, order doesn't matter.
-
-        // Load addr into R11
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Mem(addr_temp),
-            dst: GpOperand::Reg(Reg::R11),
-        });
-
-        // Load expected_ptr into R9
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Mem(expected_temp),
-            dst: GpOperand::Reg(Reg::R9),
-        });
-
-        // Load desired into R10
+        // Load the expected value into RAX
         self.push_lir(X86Inst::Mov {
             size: op_size,
-            src: GpOperand::Mem(desired_temp),
-            dst: GpOperand::Reg(Reg::R10),
-        });
-
-        // Suppress unused variable warnings
-        let _ = is_reg;
-
-        // Load expected value from *expected_ptr (R9) into RAX
-        self.push_lir(X86Inst::Mov {
-            size: op_size,
-            src: GpOperand::Mem(MemAddr::BaseOffset {
-                base: Reg::R9,
-                offset: 0,
-            }),
+            src: GpOperand::Mem(expected_mem.clone()),
             dst: GpOperand::Reg(Reg::Rax),
         });
 
@@ -304,10 +154,7 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::LockCmpxchg {
             size: op_size,
             src: Reg::R10,
-            mem: MemAddr::BaseOffset {
-                base: Reg::R11,
-                offset: 0,
-            },
+            mem: mem_addr,
         });
 
         // SETE stores 1 if ZF=1 (success), 0 otherwise (use R8 to avoid clobbering)
@@ -316,7 +163,7 @@ impl X86_64CodeGen {
             dst: Reg::R8,
         });
 
-        // On failure, store RAX (actual value) to *expected (R9 has expected_ptr)
+        // On failure, store RAX (the value found) to the expected object
         let label_suffix = self.unique_label_counter;
         self.unique_label_counter += 1;
         let skip_label = Label::internal("cas_done", label_suffix);
@@ -328,10 +175,7 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Mov {
             size: op_size,
             src: GpOperand::Reg(Reg::Rax),
-            dst: GpOperand::Mem(MemAddr::BaseOffset {
-                base: Reg::R9,
-                offset: 0,
-            }),
+            dst: GpOperand::Mem(expected_mem),
         });
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(skip_label)));
 
@@ -399,10 +243,9 @@ impl X86_64CodeGen {
         let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
-        let addr_loc = self.get_location(addr);
 
-        // Get address FIRST (before loading value, in case addr is in RAX)
-        let mem_addr = self.get_mem_addr_for_atomic(addr_loc);
+        // The address first: the value goes into a register that may hold it.
+        let mem_addr = self.atomic_mem_operand(addr, insn.displacement(), Reg::R11);
 
         // Move value to RAX
         self.emit_mov_to_reg(value_loc, Reg::Rax, size);
@@ -440,10 +283,9 @@ impl X86_64CodeGen {
         let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
-        let addr_loc = self.get_location(addr);
 
-        // Get address FIRST (before loading value, in case addr is in RAX)
-        let mem_addr = self.get_mem_addr_for_atomic(addr_loc);
+        // The address first: the value goes into a register that may hold it.
+        let mem_addr = self.atomic_mem_operand(addr, insn.displacement(), Reg::R11);
 
         // Negate value: sub is add of negative
         self.emit_mov_to_reg(value_loc, Reg::Rax, size);
@@ -498,10 +340,9 @@ impl X86_64CodeGen {
         let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
-        let addr_loc = self.get_location(addr);
 
-        // Get address into R11
-        let mem_addr = self.get_mem_addr_for_atomic(addr_loc);
+        // The address first: the value goes into a register that may hold it.
+        let mem_addr = self.atomic_mem_operand(addr, insn.displacement(), Reg::R11);
 
         // Move operand value to R10
         self.emit_mov_to_reg(value_loc, Reg::R10, size);
@@ -664,58 +505,82 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Helper to get memory address for atomic operations
-    /// Always copies the address to R11 to avoid conflicts with RAX used for values
-    fn get_mem_addr_for_atomic(&mut self, loc: Loc) -> MemAddr {
-        match loc {
-            Loc::Reg(r) => {
-                // Always copy to R11 to avoid conflicts when RAX is used for values
-                if r != Reg::R11 {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(r),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                }
-                MemAddr::BaseOffset {
-                    base: Reg::R11,
-                    offset: 0,
-                }
-            }
-            Loc::Stack(offset) => {
-                // Load address into R11
-                self.push_lir(X86Inst::Lea {
-                    addr: self.stack_mem(offset),
-                    dst: Reg::R11,
-                });
-                MemAddr::BaseOffset {
-                    base: Reg::R11,
-                    offset: 0,
-                }
-            }
-            Loc::Global(name) => {
-                let symbol = Symbol::global(self.format_symbol_name(&name));
-                self.push_lir(X86Inst::Lea {
-                    addr: MemAddr::RipRelative(symbol),
-                    dst: Reg::R11,
-                });
-                MemAddr::BaseOffset {
-                    base: Reg::R11,
-                    offset: 0,
-                }
-            }
-            _ => {
-                // Load zero address into R11 (this shouldn't happen)
+    /// The memory operand of an atomic access through `addr`, found by the
+    /// rule every ordinary load and store uses ([`Self::scalar_mem_operand`]).
+    ///
+    /// An allocated base register is copied to `scratch`: the atomic
+    /// sequences overwrite RAX, RCX, R8 and R9 after resolving the address,
+    /// and any of them can be where the allocator put the pointer.
+    fn atomic_mem_operand(&mut self, addr: PseudoId, disp: i32, scratch: Reg) -> MemAddr {
+        match self.scalar_mem_operand(addr, disp, scratch) {
+            MemAddr::BaseOffset { base, offset } if Reg::allocatable().contains(&base) => {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
-                    src: GpOperand::Imm(0),
-                    dst: GpOperand::Reg(Reg::R11),
+                    src: GpOperand::Reg(base),
+                    dst: GpOperand::Reg(scratch),
                 });
                 MemAddr::BaseOffset {
-                    base: Reg::R11,
-                    offset: 0,
+                    base: scratch,
+                    offset,
                 }
             }
+            mem => mem,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::codegen::PseudoTable;
+    use crate::ir::Pseudo;
+    use crate::target::{Arch, Os, Target};
+
+    fn codegen(ptr: PseudoId, loc: Loc) -> X86_64CodeGen {
+        let mut cg = X86_64CodeGen::new(Target::new(Arch::X86_64, Os::Linux));
+        cg.pseudos = PseudoTable::new(&[Pseudo::reg(ptr, 1)]);
+        cg.locations.set(ptr, loc);
+        cg
+    }
+
+    /// A pointer the allocator left in RAX moves to the scratch register,
+    /// since the atomic sequence loads its value operand into RAX next.
+    #[test]
+    fn an_allocated_base_moves_to_the_scratch_register() {
+        let ptr = PseudoId(1);
+        let mut cg = codegen(ptr, Loc::Reg(Reg::Rax));
+        assert_eq!(
+            cg.atomic_mem_operand(ptr, 0, Reg::R11),
+            MemAddr::BaseOffset {
+                base: Reg::R11,
+                offset: 0
+            }
+        );
+        assert!(matches!(
+            cg.base.lir_buffer.as_slice(),
+            [X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::Rax),
+                dst: GpOperand::Reg(Reg::R11),
+            }]
+        ));
+    }
+
+    /// A spilled pointer is loaded from its slot -- never its slot's address,
+    /// which made an atomic add through it add to the pointer itself.
+    #[test]
+    fn a_spilled_pointer_is_loaded_not_addressed() {
+        let ptr = PseudoId(1);
+        let mut cg = codegen(ptr, Loc::Stack(56));
+        let slot = cg.stack_mem(56);
+        cg.atomic_mem_operand(ptr, 0, Reg::R11);
+        assert!(matches!(
+            cg.base.lir_buffer.as_slice(),
+            [X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Mem(m),
+                dst: GpOperand::Reg(Reg::R11),
+            }] if *m == slot
+        ));
     }
 }

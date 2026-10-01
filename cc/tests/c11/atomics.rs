@@ -1086,3 +1086,171 @@ int main(void)
         0
     );
 }
+
+/// Every atomic operation through a pointer that is live across enough calls
+/// to be kept in a stack slot, and on a local object's own address, at -O0 and
+/// -O2 on both targets. On x86-64 at -O1 and up the compare-exchange took its
+/// address register from the wrong place and faulted (`lock cmpxchg` through
+/// 0x7fff00000009), while gcc and aarch64 ran it.
+#[test]
+fn c11_atomics_through_a_spilled_pointer() {
+    crate::common::compile_and_run_everywhere(
+        "atomics_spilled_pointer",
+        r#"
+/* (a) atomics on a local object's own address; (b) through a pointer kept
+   live across enough work that it may be spilled. Every operation, seq_cst. */
+__attribute__((noinline)) static long churn(long a, long b, long c, long d, long e, long f) {
+    return a * 3 + b * 5 + c * 7 + d * 11 + e * 13 + f * 17;
+}
+__attribute__((noinline)) static int through(int *p) {
+    long a = churn(1, 2, 3, 4, 5, 6), b = churn(a, 1, 1, 1, 1, 1), c = churn(b, a, 1, 1, 1, 1);
+    long d = churn(c, b, a, 1, 1, 1), e = churn(d, c, b, a, 1, 1), f = churn(e, d, c, b, a, 1);
+    __atomic_store_n(p, 5, __ATOMIC_SEQ_CST);
+    long g = churn(a, b, c, d, e, f);
+    int old = __atomic_fetch_add(p, 2, __ATOMIC_SEQ_CST);
+    int ex = __atomic_exchange_n(p, 9, __ATOMIC_SEQ_CST);
+    int exp = 9;
+    _Bool ok = __atomic_compare_exchange_n(p, &exp, 11, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    int ld = __atomic_load_n(p, __ATOMIC_SEQ_CST);
+    if (old != 5 || ex != 7 || !ok || ld != 11) return 1;
+    return (int)((a + b + c + d + e + f + g) & 0) ;
+}
+int main(void) {
+    int x = 0;
+    __atomic_store_n(&x, 5, __ATOMIC_SEQ_CST);
+    if (__atomic_fetch_add(&x, 2, __ATOMIC_SEQ_CST) != 5) return 2;
+    if (__atomic_exchange_n(&x, 9, __ATOMIC_SEQ_CST) != 7) return 3;
+    int exp = 9;
+    if (!__atomic_compare_exchange_n(&x, &exp, 11, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return 4;
+    if (__atomic_load_n(&x, __ATOMIC_SEQ_CST) != 11) return 5;
+    int y = 0;
+    if (through(&y) || y != 11) return 6;
+    return 0;
+}
+"#,
+    );
+}
+
+/// Every atomic operation -- load, store, exchange, compare-exchange, each
+/// fetch-op, test-and-set and clear -- at every width, through each way an
+/// address can reach it: (a) a local object's own address, (b) a pointer
+/// spilled across calls, (c) a pointer in a register, (d) a global's address,
+/// and a pointer passed on the stack; the compare-exchange also with its
+/// expected object through a spilled pointer. x86-64 at -O1 and up took a
+/// spilled pointer's slot address instead of the pointer, so `fetch_add` and
+/// `exchange` rewrote the pointer itself, and read a stack-passed pointer as
+/// address 0. The neighbours of every object are checked for stray writes.
+#[test]
+fn c11_atomics_through_every_address_form() {
+    crate::common::compile_and_run_everywhere(
+        "atomics_every_address_form",
+        r#"
+#define SC __ATOMIC_SEQ_CST
+/* Every atomic operation through P, with BAR run between them. */
+#define SEQ(T, P, BAR)                                                        \
+    __atomic_store_n(P, (T)5, SC); BAR;                                       \
+    if (__atomic_load_n(P, SC) != 5) return 1; BAR;                           \
+    if (__atomic_fetch_add(P, 2, SC) != 5) return 2; BAR;                     \
+    if (__atomic_fetch_sub(P, 1, SC) != 7) return 3; BAR;                     \
+    if (__atomic_fetch_or(P, 9, SC) != 6) return 4; BAR;                      \
+    if (__atomic_fetch_and(P, 13, SC) != 15) return 5; BAR;                   \
+    if (__atomic_fetch_xor(P, 7, SC) != 13) return 6; BAR;                    \
+    if (__atomic_exchange_n(P, 20, SC) != 10) return 7; BAR;                  \
+    { T e = 21; if (__atomic_compare_exchange_n(P, &e, 30, 0, SC, SC) || e != 20) return 8; } BAR; \
+    { T e = 20; if (!__atomic_compare_exchange_n(P, &e, 30, 0, SC, SC) || e != 20) return 9; } BAR; \
+    __atomic_store_n(P, 40, __ATOMIC_RELAXED); BAR;                           \
+    if (__atomic_load_n(P, __ATOMIC_ACQUIRE) != 40 || *(P) != 40) return 10;  \
+    if (sizeof(T) == 1) {                                                     \
+        __atomic_clear(P, SC); BAR;                                           \
+        if (__atomic_test_and_set(P, SC)) return 11; BAR;                     \
+        if (!__atomic_test_and_set(P, SC)) return 12; BAR;                    \
+        __atomic_clear(P, SC);                                                \
+        if (*(P) != 0) return 13;                                             \
+    }
+
+__attribute__((noinline)) static long churn(long a, long b, long c, long d, long e, long f) {
+    return a * 3 + b * 5 + c * 7 + d * 11 + e * 13 + f * 17;
+}
+/* Six values live across every call, so the pointer cannot keep a register. */
+#define LIVE                                                                  \
+    long a = churn(1, 2, 3, 4, 5, 6), b = churn(a, 1, 1, 1, 1, 1);            \
+    long c = churn(b, a, 1, 1, 1, 1), d = churn(c, b, a, 1, 1, 1);            \
+    long e0 = churn(d, c, b, a, 1, 1), f = churn(e0, d, c, b, a, 1)
+#define CHURN a += churn(a, b, c, d, e0, f) & 1
+#define DEAD(...) (int)((__VA_ARGS__) & 0)
+
+#define FORMS(T)                                                              \
+T g_##T[3] = {1, 0, 2};                                                       \
+T ge_##T;                                                                     \
+/* (a) a local object's own address */                                        \
+__attribute__((noinline)) static int local_##T(void) {                        \
+    T x[3] = {1, 0, 2};                                                       \
+    SEQ(T, &x[1], (void)0)                                                    \
+    return x[0] != 1 || x[2] != 2 ? 20 : 0;                                   \
+}                                                                             \
+/* (d) a global's address */                                                  \
+__attribute__((noinline)) static int global_##T(void) {                       \
+    SEQ(T, &g_##T[1], (void)0)                                                \
+    return 0;                                                                 \
+}                                                                             \
+/* (c) a pointer in a register */                                             \
+__attribute__((noinline)) static int reg_##T(T *p) {                          \
+    SEQ(T, p, (void)0)                                                        \
+    return 0;                                                                 \
+}                                                                             \
+/* (b) a pointer spilled across calls */                                      \
+__attribute__((noinline)) static int spilled_##T(T *p) {                      \
+    LIVE;                                                                     \
+    SEQ(T, p, CHURN)                                                          \
+    return DEAD(a + b + c + d + e0 + f);                                      \
+}                                                                             \
+/* a pointer passed on the stack */                                           \
+__attribute__((noinline)) static int stackarg_##T(long r1, long r2, long r3,  \
+        long r4, long r5, long r6, T *p) {                                    \
+    SEQ(T, p, (void)0)                                                        \
+    return DEAD(r1 + r2 + r3 + r4 + r5 + r6);                                 \
+}                                                                             \
+/* the expected object through a spilled pointer too */                       \
+__attribute__((noinline)) static int cas_##T(T *p, T *ep) {                   \
+    LIVE;                                                                     \
+    *p = 3; *ep = 4; CHURN;                                                   \
+    if (__atomic_compare_exchange_n(p, ep, 9, 0, SC, SC) || *ep != 3 || *p != 3) return 1; \
+    CHURN;                                                                    \
+    if (!__atomic_compare_exchange_n(p, ep, 9, 0, SC, SC) || *ep != 3 || *p != 9) return 2; \
+    return DEAD(a + b + c + d + e0 + f);                                      \
+}                                                                             \
+static int all_##T(void) {                                                    \
+    T y[3] = {1, 0, 2}, e = 0;                                                \
+    int r, k = 0;                                                             \
+    if ((r = local_##T())) goto fail;                                         \
+    k++; if ((r = global_##T())) goto fail;                                   \
+    k++; if ((r = reg_##T(&y[1]))) goto fail;                                 \
+    k++; if ((r = spilled_##T(&y[1]))) goto fail;                             \
+    k++; if ((r = stackarg_##T(1, 2, 3, 4, 5, 6, &y[1]))) goto fail;          \
+    k++; if ((r = cas_##T(&y[1], &e))) goto fail;                             \
+    k++; if ((r = cas_##T(&g_##T[1], &ge_##T))) goto fail;                    \
+    k++; r = 99; if (y[0] != 1 || y[2] != 2 || g_##T[0] != 1 || g_##T[2] != 2) goto fail; \
+    return 0;                                                                 \
+fail:                                                                         \
+    (void)r;                                                                  \
+    return k + 1;                                                             \
+}
+
+typedef unsigned char uc;
+typedef long long ll;
+FORMS(uc)
+FORMS(short)
+FORMS(int)
+FORMS(ll)
+
+int main(void) {
+    int r;
+    if ((r = all_uc())) return r;
+    if ((r = all_short())) return 10 + r;
+    if ((r = all_int())) return 20 + r;
+    if ((r = all_ll())) return 30 + r;
+    return 0;
+}
+"#,
+    );
+}

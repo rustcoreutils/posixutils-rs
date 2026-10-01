@@ -318,7 +318,8 @@ pub fn opcode_constraints(op: Opcode) -> RegConstraints {
             clobbers: &[Reg::Rax, Reg::Rcx],
         },
         // The atomic emitters use RAX/RCX as fixed scratch (and R8/R9 for the
-        // CAS operand spill), all of which are allocatable. Undeclared, any
+        // CAS success flag and expected-object address), all of which are
+        // allocatable. Undeclared, any
         // pseudo the allocator parked there whose live range crossed an atomic
         // operation was silently corrupted -- six live ints bracketing one
         // __c11_atomic_fetch_add summed to 22 instead of 31.

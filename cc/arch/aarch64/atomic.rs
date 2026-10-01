@@ -99,10 +99,7 @@ impl Aarch64CodeGen {
         let size = insn.size;
         let op_size = OperandSize::from_bits(size);
 
-        let addr_loc = self.get_location(addr);
-
-        // Load the pointer (64-bit) into a scratch register
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
+        self.emit_addr_into(addr, Reg::X10);
 
         let addr = MemAddr::Base(Reg::X10);
         let (size, dst) = (op_size, Reg::X9);
@@ -121,12 +118,11 @@ impl Aarch64CodeGen {
         let size = insn.size;
         let op_size = OperandSize::from_bits(size);
 
-        let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
         // Load the pointer first, so a value in the same register is
         // still readable when it is loaded next.
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
+        self.emit_addr_into(addr, Reg::X10);
 
         // Load the value
         self.emit_mov_to_reg(value_loc, Reg::X9, size);
@@ -156,12 +152,11 @@ impl Aarch64CodeGen {
         let op_size = OperandSize::from_bits(size);
         let ordering = Ordering::of(insn.extra().memory_order);
 
-        let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
         // Load the pointer first, so a value in the same register is
         // still readable when it is loaded next.
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
+        self.emit_addr_into(addr, Reg::X10);
 
         // Load the operand
         self.emit_mov_to_reg(value_loc, Reg::X9, size);
@@ -265,17 +260,15 @@ impl Aarch64CodeGen {
         // linearizer (`cas_order`); a failed attempt runs the same load.
         let ordering = Ordering::of(insn.extra().memory_order);
 
-        let addr_loc = self.get_location(addr);
-        let expected_loc = self.get_location(expected_ptr);
         let desired_loc = self.get_location(desired);
 
         // Load pointer to atomic variable into X10 FIRST
         // (before the other loads, so none of them can clobber it)
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
+        self.emit_addr_into(addr, Reg::X10);
 
         // Load expected_ptr (pointer to expected value) into X11
         // Then load the expected value from that address into X9
-        self.emit_mov_to_reg(expected_loc, Reg::X11, 64);
+        self.emit_addr_into(expected_ptr, Reg::X11);
         self.push_lir(Aarch64Inst::Ldr {
             size: op_size,
             addr: MemAddr::Base(Reg::X11),

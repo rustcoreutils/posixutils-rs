@@ -377,6 +377,39 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// Put the address `addr` designates into `dst`, for an access that
+    /// takes a bare base register: an exclusive, acquire or release load or
+    /// store.
+    ///
+    /// The address comes from [`Self::compute_mem_addr`], the rule every load
+    /// and store uses: a `Sym`'s slot is the object, so its address is taken;
+    /// any other pseudo's slot holds a pointer, which is loaded. Loading every
+    /// operand as a value read a local object's contents as its address.
+    pub(super) fn emit_addr_into(&mut self, addr: PseudoId, dst: Reg) {
+        let (base, offset) = match self.compute_mem_addr(addr, 0, dst) {
+            ComputedAddr::Global(name) => return self.emit_load_addr(&name, dst),
+            ComputedAddr::Direct(MemAddr::BaseOffset { base, offset })
+            | ComputedAddr::WithSetup(MemAddr::BaseOffset { base, offset }) => (base, offset),
+            ComputedAddr::Direct(mem) | ComputedAddr::WithSetup(mem) => {
+                unreachable!("compute_mem_addr gives base+offset, not {mem:?}")
+            }
+        };
+        if offset != 0 {
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: base,
+                src2: GpOperand::Imm(offset.into()),
+                dst,
+            });
+        } else if base != dst {
+            self.push_lir(Aarch64Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(base),
+                dst,
+            });
+        }
+    }
+
     /// Read `width + high` bytes at `[base, #offset]` into `dst` as two
     /// overlapping halves: `width` bytes at the front and `width` bytes at
     /// `high`, which `overlapping_halves` chose so the second ends exactly on
@@ -952,5 +985,50 @@ impl Aarch64CodeGen {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::codegen::PseudoTable;
+    use crate::ir::Pseudo;
+    use crate::target::{Arch, Target};
+
+    /// The same stack slot gives its own address for a local object and the
+    /// pointer it holds for anything else.
+    #[test]
+    fn an_atomic_address_follows_the_pseudo_kind() {
+        let (sym, ptr) = (PseudoId(1), PseudoId(2));
+        let slot = LocalSlot::from_displacement(-16);
+        let mut cg = Aarch64CodeGen::new(Target::new(Arch::Aarch64, Os::Linux));
+        cg.pseudos = PseudoTable::new(&[Pseudo::sym(sym, "x".into()), Pseudo::reg(ptr, 2)]);
+        cg.locations.set(sym, Loc::Stack(slot));
+        cg.locations.set(ptr, Loc::Stack(slot));
+        let MemAddr::BaseOffset { base, offset } = cg.stack_mem(slot) else {
+            panic!("a stack slot is base+offset");
+        };
+
+        cg.emit_addr_into(sym, Reg::X10);
+        assert!(matches!(
+            cg.base.lir_buffer.as_slice(),
+            [Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1,
+                src2: GpOperand::Imm(imm),
+                dst: Reg::X10,
+            }] if *src1 == base && *imm == i64::from(offset)
+        ));
+
+        cg.base.lir_buffer.clear();
+        cg.emit_addr_into(ptr, Reg::X10);
+        assert!(matches!(
+            cg.base.lir_buffer.as_slice(),
+            [Aarch64Inst::Ldr {
+                size: OperandSize::B64,
+                addr: MemAddr::BaseOffset { base: b, offset: o },
+                dst: Reg::X10,
+            }] if *b == base && *o == offset
+        ));
     }
 }

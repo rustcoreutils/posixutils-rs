@@ -2781,7 +2781,7 @@ fn codegen_asm_array_operand_is_a_pointer() {
     #[cfg(target_arch = "x86_64")]
     let store = "movq $7, 0(%0)";
     #[cfg(target_arch = "aarch64")]
-    let store = "mov x9, #7\n\tstr x9, [%0]";
+    let store = "mov x9, #7\\n\\tstr x9, [%0]";
     let code = format!(
         r#"
 static long kept[2];

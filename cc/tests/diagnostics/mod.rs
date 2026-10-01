@@ -2019,8 +2019,13 @@ __attribute__((used)) static int used_var;
 
 /* Checked at compile time, so the assertion cannot be skipped by a test
    helper that only builds and never runs. */
-#if !__has_attribute(ms_abi) || !__has_attribute(gnu_inline)
+#if !__has_attribute(gnu_inline)
 #error "__has_attribute must admit the attributes the compiler honours"
+#endif
+/* ms_abi is an x86-64 calling convention: honoured there, and on any other
+   target ignored with a warning and so not claimed, as in gcc. */
+#if defined(__x86_64__) != __has_attribute(ms_abi)
+#error "__has_attribute(ms_abi) must answer whether the target honours it"
 #endif
 #if !__has_attribute(vector_size) || !__has_attribute(__mode__)
 #error "__has_attribute must admit the type attributes the compiler implements"

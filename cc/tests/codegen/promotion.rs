@@ -261,7 +261,8 @@ int main(void) { return 0; }
 /// local the linearizer created, though the optimizer may forward and delete
 /// every access to one -- `folded` reads back the element it just stored.
 /// Now neither costs a function that does not use it, and a function that
-/// does still gets the scratch.
+/// does still gets the scratch. Off x86-64 the host runs the program with
+/// `root`'s x87 `asm` replaced by plain C.
 #[test]
 fn codegen_a_frame_holds_only_what_the_function_uses() {
     let src = "\
@@ -299,13 +300,20 @@ float root(float x) { __asm__(\"fsqrt\" : \"+t\"(x)); return x; }
          return plus1(1) == 2 && folded() == 3 && sum(a, 3) == 6 \
          && widen(7) == 7.0L && root(16.0f) == 4.0f ? 0 : 1; }}\n"
     );
-    assert_eq!(
-        compile_and_run("frame_uses_run", &run, &["-O2".to_string()]),
-        0
-    );
     let portable = run.replace(
         "float root(float x) { __asm__(\"fsqrt\" : \"+t\"(x)); return x; }\n",
         "float root(float x) { return x == 16.0f ? 4.0f : 0; }\n",
+    );
+    // `compile_and_run` targets the host, and an x87 `asm` only assembles
+    // on x86-64; elsewhere the host runs the portable form.
+    let host = if cfg!(target_arch = "x86_64") {
+        &run
+    } else {
+        &portable
+    };
+    assert_eq!(
+        compile_and_run("frame_uses_run", host, &["-O2".to_string()]),
+        0
     );
     if let Some(rc) = compile_and_run_aarch64("frame_uses_a64_run", &portable, "-O2") {
         assert_eq!(rc, 0, "aarch64");

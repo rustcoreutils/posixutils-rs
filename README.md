@@ -98,41 +98,42 @@ Note that `cargo install` copies the declared binaries and nothing else, so the 
 
 ### Windows
 
-A subset builds and is tested on Windows (MSVC): the `xform` crate's
-`cksum`, `compress`, `uuencode` and `uudecode`.
+Two crates build and are tested on Windows, natively with MSVC (no MinGW or
+Cygwin runtime): `xform` (`cksum`, `compress`, `uuencode`, `uudecode`) and
+`text` (`asa`, `comm`, `csplit`, `cut`, `diff`, `expand`, `fold`, `grep`,
+`head`, `join`, `nl`, `paste`, `patch`, `pr`, `sed`, `sort`, `tail`, `tr`,
+`tsort`, `unexpand`, `uniq`, `wc`).
 
 ```sh
-cargo build --release -p posixutils-xform
+cargo build --release -p posixutils-xform -p posixutils-text
 ```
 
-Building the whole workspace on Windows does not work: most utilities are
-inherently Unix (users, terminals, signals, file modes and ownership), and the
-`plib` modules behind them are compiled on Unix only. On Windows:
+Building the whole workspace on Windows does not work: most other utilities
+are inherently Unix (users, terminals, signals, file modes and ownership).
+What behaves differently on Windows:
 
 - a file's POSIX mode is its read-only attribute, read as the owner-write bit
-  (`0444` or `0644`), and setting a mode without owner write makes the file
-  read-only;
+  (`0444` or `0644`); setting a mode without owner write makes it read-only;
 - `compress` restores permissions and times but not ownership, and does not
-  warn about hard links;
-- the `zcat` and `uncompress` aliases do not exist; use `compress -c -d` and
-  `compress -d`;
-- POSIX regular expressions (`plib::regex`) are musl's, compiled from
-  `plib/vendor/musl-regex` with the C compiler that the Rust toolchain
-  already needs (MSVC's `cl.exe`, or mingw-w64 `gcc`). They match per
-  character in UTF-8, which the utilities' locale setup selects, and do not
-  support characters above U+FFFF; see that directory's `README.md`.
+  warn about hard links; the `zcat` and `uncompress` aliases do not exist
+  (use `compress -c -d` and `compress -d`);
+- `LC_ALL`, `LC_*` and `LANG` set to `C` or `POSIX` select the C locale:
+  ASCII-only character classes and case mapping, one byte per character, and
+  byte-order collation; `C.UTF-8` (or any `C`/`POSIX` name with a codeset)
+  collates in byte order but reads UTF-8 and classifies and case-maps by
+  Unicode; any other value, or none, is the user's locale with UTF-8 input and
+  Unicode characters;
+- POSIX regular expressions are musl's (vendored in `plib/vendor/musl-regex`)
+  and do not support characters above U+FFFF;
+- `sort -n` always takes `.` as the decimal point, with no thousands
+  separator;
+- `diff` reports anything that is neither a file nor a directory as a
+  special file, and recognises a directory loop by its canonical path;
+- `pr -p` and `patch` prompt on the console; `csplit` removes its files on
+  Ctrl-C, Ctrl-Break and termination, Windows having no hangup or quit
+  signal.
 
-Utilities are ported a whole crate at a time, since `cargo test -p` builds
-every binary in a crate. A crate joins the Windows CI job by being added to
-`WINDOWS_CRATES` in `.github/workflows/TestingCI.yml` once all of its binaries
-and tests compile and pass there; Unix-only code is gated with `#[cfg(unix)]`,
-never replaced by a stand-in. The Windows tests can be run on Linux under Wine:
-
-```sh
-rustup target add x86_64-pc-windows-gnu   # needs the mingw-w64 and wine packages
-CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine \
-    cargo test --release --target x86_64-pc-windows-gnu -p gettext-rs -p plib -p posixutils-xform
-```
+[WINDOWS.md](WINDOWS.md) is the guide to porting another crate.
 
 ### Container image
 

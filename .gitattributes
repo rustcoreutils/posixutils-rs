@@ -1,0 +1,7 @@
+# Check text out with LF on every platform: the test fixtures are compared
+# byte for byte, and a Windows checkout would otherwise convert them to CRLF.
+* text=auto eol=lf
+
+# Fixtures whose line endings are part of what they test: never converted.
+text/tests/diff/** -text
+display/test.mdoc -text

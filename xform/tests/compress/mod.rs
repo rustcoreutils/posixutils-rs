@@ -799,6 +799,9 @@ fn test_warn_z_suffix_on_compress() {
 // Symlink invocation tests (zcat, uncompress)
 // =============================================================================
 
+/// `zcat` and `uncompress` are argv[0] aliases of `compress`, symlinked
+/// only on Unix by `xform/build.rs`.
+#[cfg(unix)]
 #[test]
 fn test_zcat_lzw() {
     // Test zcat symlink with LZW (.Z) format
@@ -836,6 +839,9 @@ fn test_zcat_lzw() {
     cleanup_file(&compressed_file);
 }
 
+/// `zcat` and `uncompress` are argv[0] aliases of `compress`, symlinked
+/// only on Unix by `xform/build.rs`.
+#[cfg(unix)]
 #[test]
 fn test_zcat_gzip() {
     // Test zcat symlink with gzip (.gz) format
@@ -873,6 +879,9 @@ fn test_zcat_gzip() {
     cleanup_file(&compressed_file);
 }
 
+/// `zcat` and `uncompress` are argv[0] aliases of `compress`, symlinked
+/// only on Unix by `xform/build.rs`.
+#[cfg(unix)]
 #[test]
 fn test_uncompress_lzw() {
     // Test uncompress symlink with LZW (.Z) format - in-place decompression
@@ -926,6 +935,9 @@ fn test_uncompress_lzw() {
     cleanup_file(&test_file);
 }
 
+/// `zcat` and `uncompress` are argv[0] aliases of `compress`, symlinked
+/// only on Unix by `xform/build.rs`.
+#[cfg(unix)]
 #[test]
 fn test_uncompress_gzip() {
     // Test uncompress symlink with gzip (.gz) format - in-place decompression
@@ -994,6 +1006,17 @@ fn generate_binary_data(size: usize) -> Vec<u8> {
     data
 }
 
+/// The command that decompresses a `.Z` file in place: `uncompress` on Unix,
+/// and `compress -d` on Windows, where `xform/build.rs` creates no argv[0]
+/// aliases.
+fn decompress_command() -> (String, Vec<String>) {
+    if cfg!(unix) {
+        (String::from("uncompress"), vec![])
+    } else {
+        (String::from("compress"), vec![String::from("-d")])
+    }
+}
+
 /// Helper: compress binary data via file, decompress, and verify roundtrip
 fn binary_roundtrip_test(data: &[u8], label: &str) {
     let test_dir = get_test_dir();
@@ -1029,9 +1052,11 @@ fn binary_roundtrip_test(data: &[u8], label: &str) {
     );
 
     // Decompress
+    let (cmd, mut args) = decompress_command();
+    args.push(compressed_file.to_str().unwrap().to_string());
     run_test(TestPlan {
-        cmd: String::from("uncompress"),
-        args: vec![compressed_file.to_str().unwrap().to_string()],
+        cmd,
+        args,
         stdin_data: String::new(),
         expected_out: String::new(),
         expected_err: String::new(),
@@ -1308,6 +1333,9 @@ fn test_compress_bits_16_accepted_and_roundtrips(/* #C4 */) {
 /// before any cleanup runs, and a scratch file left in the source tree is both
 /// repo trash and a hazard for the next `git add`. The `TempDir` the caller
 /// holds removes everything on unwind.
+///
+/// It and the tests using it are Unix-only while `plib::tmp` is.
+#[cfg(unix)]
 fn scratch_file(dir: &plib::tmp::TempDir, name: &str, contents: &[u8]) -> PathBuf {
     let path = dir.path().join(name);
     let mut f = File::create(&path).unwrap();
@@ -1317,6 +1345,7 @@ fn scratch_file(dir: &plib::tmp::TempDir, name: &str, contents: &[u8]) -> PathBu
 
 /// `-v` reports the compression achieved on stderr. The audit had no test for
 /// the *content* of that message, only that the flag was accepted.
+#[cfg(unix)]
 #[test]
 fn test_compress_verbose_reports_compression_percentage() {
     // Highly compressible, so the percentage is comfortably positive.
@@ -1372,6 +1401,7 @@ fn test_compress_verbose_reports_compression_percentage() {
 
 /// Without `-v` nothing is written to stderr — the counterpart assertion, so
 /// the test above cannot pass just because some other message happens to match.
+#[cfg(unix)]
 #[test]
 fn test_compress_without_verbose_is_silent() {
     let td = plib::tmp::tempdir().unwrap();
@@ -1398,6 +1428,7 @@ fn test_compress_without_verbose_is_silent() {
 /// The compressed file keeps the original's permission bits and modification
 /// time (`FileMetadata::apply_to`). Ownership is best-effort and only testable
 /// as root, so it is not asserted here.
+#[cfg(unix)]
 #[test]
 fn test_compress_preserves_mode_and_mtime() {
     use std::os::unix::fs::PermissionsExt;
@@ -1441,6 +1472,7 @@ fn test_compress_preserves_mode_and_mtime() {
 /// reports pre-1970 times as an error carrying the distance *before* the epoch,
 /// which must be turned into a negative `tv_sec` rather than collapsed onto
 /// 1970-01-01.
+#[cfg(unix)]
 #[test]
 fn test_compress_preserves_pre_epoch_mtime() {
     let td = plib::tmp::tempdir().unwrap();
@@ -1487,6 +1519,7 @@ fn test_compress_preserves_pre_epoch_mtime() {
 }
 
 /// Decompression restores the same metadata onto the recovered file.
+#[cfg(unix)]
 #[test]
 fn test_uncompress_preserves_mode_and_mtime() {
     use std::os::unix::fs::PermissionsExt;

@@ -217,6 +217,36 @@ impl Drop for SigPipeIgnored {
     }
 }
 
+/// The terminal a prompt reads its answer from: the controlling terminal on
+/// Unix, the console's input buffer on Windows.
+#[cfg(unix)]
+const TERMINAL_INPUT: &str = "/dev/tty";
+#[cfg(windows)]
+const TERMINAL_INPUT: &str = "CONIN$";
+
+/// The terminal a prompt is written to: the controlling terminal on Unix, the
+/// console's screen buffer on Windows.
+#[cfg(unix)]
+const TERMINAL_OUTPUT: &str = "/dev/tty";
+#[cfg(windows)]
+const TERMINAL_OUTPUT: &str = "CONOUT$";
+
+/// Open the terminal for reading a prompt's answer, which POSIX takes from
+/// `/dev/tty` rather than standard input (`pr -p`, `patch`'s questions).
+///
+/// Windows has no `/dev/tty`; the same thing there is the console, opened as
+/// `CONIN$`. Either open fails when the process has no terminal, and a caller
+/// then skips the prompt.
+pub fn open_terminal_input() -> io::Result<fs::File> {
+    fs::File::open(TERMINAL_INPUT)
+}
+
+/// Open the terminal for writing a prompt: `/dev/tty`, or the console's
+/// `CONOUT$` on Windows. See [`open_terminal_input`].
+pub fn open_terminal_output() -> io::Result<fs::File> {
+    fs::OpenOptions::new().write(true).open(TERMINAL_OUTPUT)
+}
+
 /// Make sure standard input, output and error are open before anything else
 /// runs.
 ///

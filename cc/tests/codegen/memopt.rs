@@ -1790,3 +1790,47 @@ fn memopt_a_function_cut_off_by_the_iteration_cap_is_still_correct() {
         "a converged function is not reported:\n{ir}"
     );
 }
+
+/// A store reaches a load in a loop when every way round goes back through
+/// the store: what the latch writes *after* the load is overwritten before
+/// the load runs again. Both functions read `a[0]` only where the loop has
+/// just stored it, so the one load left is `out[i]`.
+#[test]
+fn memopt_a_store_in_a_loop_reaches_its_load() {
+    let src = "\
+int same_block(int n) {
+    int a[2];
+    int s = 0;
+    for (int i = 0; i < n; i++) {
+        a[0] = i;
+        s += a[0];
+        a[0] = 5;
+    }
+    return s;
+}
+int header_to_body(int n, int *out) {
+    int a[2];
+    int s = 0;
+    for (int i = 0; i < n; i++) {
+        a[0] = i * 3;
+        if (out[i])
+            s += a[0];
+        a[0] = 1;
+    }
+    return s;
+}
+";
+    for target in [X86_64_LINUX, AARCH64_LINUX] {
+        let ir = post_opt_ir("loopfwd", src, target);
+        let loads: Vec<&str> = ir.lines().filter(|l| l.contains("= load.")).collect();
+        assert_eq!(loads.len(), 1, "{target}: only out[i] is loaded:\n{ir}");
+    }
+    let run = format!(
+        "{src}int main(void) {{ int out[4] = {{1, 0, 1, 1}}; \
+         return same_block(4) == 6 && header_to_body(4, out) == 15 ? 0 : 1; }}\n"
+    );
+    assert_eq!(at_o2("loopfwd_run", &run), 0);
+    if let Some(rc) = compile_and_run_aarch64("loopfwd_run", &run, "-O2") {
+        assert_eq!(rc, 0, "aarch64");
+    }
+}

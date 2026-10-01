@@ -24,13 +24,16 @@
 // the wrong value unless every block that can be traversed between the two
 // is scanned. That region is the *intersection* of what the definition's
 // block reaches going forwards and what the load's block reaches going
-// backwards, and it has to be both: a backward walk alone climbs past the
-// definition -- fatally so when the two share a block, where it enumerates
-// the whole function above them -- and a forward walk alone runs off down
-// every path that never arrives.
+// backwards, and it has to be both: a backward walk alone takes in blocks
+// the definition never reaches, and a forward walk alone runs off down
+// every path that never arrives. Neither walk passes through the
+// definition's own block: a path that re-enters it runs the definition
+// again, so in a loop that stores and then loads, what the latch writes
+// after the load is not between the two.
 //
-// **The load's own block can be in that region.** When a back edge reaches
-// it, a clobber *after* the load runs *before* the next execution of it:
+// **The load's own block can be in that region.** When a cycle that avoids
+// the definition reaches it, a clobber *after* the load runs *before* the
+// next execution of it:
 //
 // ```c
 // a[0] = 0;
@@ -446,77 +449,54 @@ impl<'a> MemOracle<'a> {
         let def_block = func.blocks[bc].id;
         let load_block = func.blocks[bl].id;
 
+        let scan = |bi: usize, from: usize, to: usize| -> bool {
+            func.blocks[bi].insns[from..to]
+                .iter()
+                .all(|insn| insn.op == Opcode::Nop || !self.writes(paths, insn, loc))
+        };
+
+        // Every way back to the definition's block runs the definition
+        // again -- a block is entered only at its top -- so a path that
+        // passes it is a path from a *later* definition, and the definition's
+        // block bounds every walk below. In one block that leaves nothing but
+        // the instructions between the two: the definition dominates the
+        // load, so it comes first.
+        if bc == bl {
+            debug_assert!(ic < il, "a definition in the load's block precedes it");
+            return scan(bl, ic + 1, il);
+        }
+
         // Every block that can be entered on the way from the definition to
         // the load: forward-reachable from the definition's block *and*
-        // backward-reachable from the load's.
+        // backward-reachable from the load's, neither through the definition.
         //
         // The intersection is what makes this right, not either half. A
-        // backward walk alone climbs past the definition -- fatally so when
-        // the two share a block, where it enumerates the whole function above
-        // them although none of it runs between the two points. A forward
-        // walk alone runs off down every path that never reaches the load.
-        let Some(fwd) = reachable(&paths.succs, def_block) else {
+        // backward walk alone takes in blocks the definition never reaches;
+        // a forward walk alone runs off down every path that never reaches
+        // the load.
+        let Some(fwd) = reachable(&paths.succs, def_block, def_block) else {
             return false;
         };
-        let Some(back) = reachable(&paths.preds, load_block) else {
+        let Some(back) = reachable(&paths.preds, load_block, def_block) else {
             return false;
         };
         let region: HashSet<BasicBlockId> = fwd.intersection(&back).copied().collect();
 
-        let scan = |bi: usize, from: usize, to: usize| -> bool {
-            for i in from..to {
-                let insn = &func.blocks[bi].insns[i];
-                if insn.op == Opcode::Nop {
-                    continue;
-                }
-                if self.writes(paths, insn, loc) {
-                    return false;
-                }
-            }
-            true
-        };
-
-        // A back edge can put the load's own block in the region, and then
-        // the instructions *after* the load run before the next execution
-        // of it.
-        let load_block_wraps = region.contains(&load_block);
-
-        if bc == bl {
-            let to = if load_block_wraps {
-                func.blocks[bl].insns.len()
-            } else {
-                il
-            };
-            let from = if load_block_wraps { 0 } else { ic + 1 };
-            if !scan(bl, from, to) {
-                return false;
-            }
+        // A cycle through the load's block that avoids the definition puts
+        // that block in the region, and then the instructions *after* the
+        // load run before its next execution.
+        let load_end = if region.contains(&load_block) {
+            func.blocks[bl].insns.len()
         } else {
-            if !scan(bc, ic + 1, func.blocks[bc].insns.len()) {
-                return false;
-            }
-            let (from, to) = if load_block_wraps {
-                (0, func.blocks[bl].insns.len())
-            } else {
-                (0, il)
-            };
-            if !scan(bl, from, to) {
-                return false;
-            }
+            il
+        };
+        if !scan(bc, ic + 1, func.blocks[bc].insns.len()) || !scan(bl, 0, load_end) {
+            return false;
         }
-
-        for b in &region {
-            if *b == load_block {
-                continue;
-            }
-            let Some(bi) = func.block_index(*b) else {
-                return false;
-            };
-            if !scan(bi, 0, func.blocks[bi].insns.len()) {
-                return false;
-            }
-        }
-        true
+        region.iter().filter(|b| **b != load_block).all(|b| {
+            func.block_index(*b)
+                .is_some_and(|bi| scan(bi, 0, func.blocks[bi].insns.len()))
+        })
     }
 }
 
@@ -597,14 +577,16 @@ fn byte_of(c: i128, width: u32, at: u32, little_endian: bool) -> Option<u8> {
     Some((c >> (8 * shift)) as u8)
 }
 
-/// Every block with an edge path of length at least one from `seed`.
+/// Every block with an edge path of length at least one from `seed` that
+/// does not pass through `barrier`, which is never in the result.
 ///
 /// Length *at least one* is deliberate: `seed` itself is in the result only
-/// when it lies on a cycle, which is exactly the question `load_block_wraps`
+/// when it lies on a cycle, which is exactly the question a load's block
 /// asks.
 fn reachable(
     edges: &HashMap<BasicBlockId, Vec<BasicBlockId>>,
     seed: BasicBlockId,
+    barrier: BasicBlockId,
 ) -> Option<HashSet<BasicBlockId>> {
     let mut seen: HashSet<BasicBlockId> = HashSet::new();
     let mut work: Vec<BasicBlockId> = edges.get(&seed).cloned().unwrap_or_default();
@@ -614,7 +596,7 @@ fn reachable(
             return None;
         }
         budget -= 1;
-        if !seen.insert(b) {
+        if b == barrier || !seen.insert(b) {
             continue;
         }
         work.extend(edges.get(&b).cloned().unwrap_or_default());
@@ -809,6 +791,122 @@ mod tests {
         );
         assert!(!b.run());
         assert_eq!(b.op(1, 0), Opcode::Load);
+    }
+
+    /// A store, then the load, in one loop block: every iteration stores
+    /// before it loads, so the load always reads the store. A write *after*
+    /// the load runs before the next load only by going round again, through
+    /// the store. `for(;;){ a[0] = 7; s = a[0]; a[0] = 9; }` reads 7.
+    #[test]
+    fn loadfwd_forwards_within_one_loop_block() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                br(1),
+            ],
+            vec![1],
+        );
+        b.block(
+            1,
+            vec![
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                br(1),
+            ],
+            vec![1],
+        );
+        assert!(b.run());
+        assert_eq!(b.op(1, 1), Opcode::Copy);
+        assert_eq!(b.f.blocks[1].insns[1].src, vec![PseudoId(5)]);
+    }
+
+    /// The store in the loop header, the load in the body: a path round the
+    /// loop re-enters the header and stores again, so neither the header
+    /// above the store nor the body below the load lies between the two.
+    #[test]
+    fn loadfwd_forwards_from_a_loop_header_to_its_body() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                br(1),
+            ],
+            vec![1],
+        );
+        b.block(
+            1,
+            vec![
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                br(2),
+            ],
+            vec![2],
+        );
+        b.block(
+            2,
+            vec![
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                br(1),
+            ],
+            vec![1],
+        );
+        assert!(b.run());
+        assert_eq!(b.op(2, 0), Opcode::Copy);
+    }
+
+    /// An *inner* loop around the load that does not pass the store: its
+    /// latch's write reaches the load's next execution, so this still
+    /// refuses. What the two forwards above depend on is that every way
+    /// round goes back through the store.
+    #[test]
+    fn loadfwd_refuses_a_clobber_on_an_inner_loop_without_the_store() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        b.f.add_pseudo(Pseudo::val(PseudoId(7), 1));
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                br(1),
+            ],
+            vec![1],
+        );
+        b.block(
+            1,
+            vec![
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                br(2),
+            ],
+            vec![2],
+        );
+        b.block(
+            2,
+            vec![
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                br(3),
+            ],
+            vec![3],
+        );
+        b.block(
+            3,
+            vec![
+                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                cbr(PseudoId(7), 2, 4),
+            ],
+            vec![2, 4],
+        );
+        b.block(4, vec![ret()], vec![]);
+        assert!(!b.run());
+        assert_eq!(b.op(2, 0), Opcode::Load);
     }
 
     /// **Risk 3, the dominator chain is not every path.** The store
@@ -1186,14 +1284,20 @@ mod tests {
         succs.insert(BasicBlockId(0), vec![BasicBlockId(1)]);
         succs.insert(BasicBlockId(1), vec![BasicBlockId(2)]);
         // A block not on a cycle is not reachable from itself.
+        let none = BasicBlockId(99);
         assert_eq!(
-            reachable(&succs, BasicBlockId(0)),
+            reachable(&succs, BasicBlockId(0), none),
             Some([BasicBlockId(1), BasicBlockId(2)].into_iter().collect())
         );
         // With a back edge it is.
         succs.insert(BasicBlockId(2), vec![BasicBlockId(1)]);
-        let r = reachable(&succs, BasicBlockId(1)).unwrap();
+        let r = reachable(&succs, BasicBlockId(1), none).unwrap();
         assert!(r.contains(&BasicBlockId(1)), "a cycle reaches its own head");
+        // But not through the barrier, which is never reached either.
+        let r = reachable(&succs, BasicBlockId(1), BasicBlockId(2)).unwrap();
+        assert!(r.is_empty(), "{r:?}");
+        let r = reachable(&succs, BasicBlockId(0), BasicBlockId(1)).unwrap();
+        assert!(r.is_empty(), "{r:?}");
     }
 
     /// A `Sym` target *is* storage: a struct-returning call writes its

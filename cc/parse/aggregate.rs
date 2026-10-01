@@ -9,6 +9,7 @@
 // struct, union and enum specifiers, and the bit-field constraints
 //
 
+use super::attribute::AttributeList;
 use super::declaration::SpecContext;
 use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::diag;
@@ -28,21 +29,23 @@ impl Parser<'_> {
     ///
     /// C17 6.7.2.2p4 requires it to represent every member; the choice among
     /// the types that do is implementation-defined. gcc's choice, which this
-    /// matches: `unsigned int` when no member is negative, else `int`, and
-    /// the 64-bit type of the same signedness when a member does not fit.
-    /// The choice is recorded as the enum's size and `UNSIGNED` modifier,
-    /// which [`crate::types::TypeTable::enum_compatible_type`] reads back.
+    /// matches: the first of `int` and the 64-bit type that holds every
+    /// member, unsigned when no member is negative. A `packed` enum starts
+    /// the search at the 1-byte type instead, which makes it the smallest
+    /// integer type that holds its members. The choice is recorded as the
+    /// enum's size and `UNSIGNED` modifier, which
+    /// [`crate::types::TypeTable::enum_compatible_type`] reads back.
     fn enum_underlying_type(
         &mut self,
         constants: &[EnumConstant],
         pos: Position,
+        packed: bool,
     ) -> (TypeId, usize) {
         let Some(min) = constants.iter().map(|c| c.value).min() else {
             return (self.types.int_id, 4);
         };
         let max = constants.iter().map(|c| c.value).max().unwrap_or(0);
 
-        let fits = |lo: i128, hi: i128| min >= lo && max <= hi;
         // 6.7.2.2p4 leaves the choice to the implementation, requiring only a
         // type that represents every member. gcc's choice is unsigned whenever
         // no enumerator is negative, and it is observable -- `(enum E)-1 > 0`
@@ -50,36 +53,60 @@ impl Parser<'_> {
         // non-negative list also made an enum bit-field read back negative:
         // `enum E { A, B, C, D }; struct { enum E e:2; }` holding `D` gave -1
         // where gcc gives 3, because the field's signedness follows the type's.
-        if min >= 0 {
-            if fits(0, u32::MAX as i128) {
-                (self.types.uint_id, 4)
-            } else if fits(0, u64::MAX as i128) {
-                (self.types.ulong_id, 8)
-            } else {
-                // Reachable: nothing clamps an enumerator to 64 bits and the
-                // folder computes in `i128`, so `enum E { A = 1 << 64 };`
-                // arrives here. gcc warns and carries on, folding the shift to
-                // 0 because it truncates to the expression's type, which c17's
-                // folders do not do. Say what is wrong rather than aborting.
-                diag::error(
-                    pos,
-                    &gettext("no integer type can represent all values of this enumeration"),
-                );
-                (self.types.ulong_id, 8)
-            }
-        } else if fits(i32::MIN as i128, i32::MAX as i128) {
-            (self.types.int_id, 4)
-        } else if fits(i64::MIN as i128, i64::MAX as i128) {
-            (self.types.long_id, 8)
+        let unsigned = min >= 0;
+        let t = &self.types;
+        let candidates = if unsigned {
+            [
+                (t.uchar_id, 1),
+                (t.ushort_id, 2),
+                (t.uint_id, 4),
+                (t.ulong_id, 8),
+            ]
         } else {
-            // A list spanning below i64::MIN and above i64::MAX has no
-            // integer type that holds both ends. Say so rather than picking
-            // one and truncating the other.
-            diag::error(
-                pos,
-                &gettext("no integer type can represent all values of this enumeration"),
-            );
-            (self.types.long_id, 8)
+            [
+                (t.schar_id, 1),
+                (t.short_id, 2),
+                (t.int_id, 4),
+                (t.long_id, 8),
+            ]
+        };
+        let first = if packed { 0 } else { 2 };
+        let fits = |size: usize| {
+            let bits = 8 * size as u32;
+            if unsigned {
+                max < 1i128 << bits
+            } else {
+                min >= -(1i128 << (bits - 1)) && max < 1i128 << (bits - 1)
+            }
+        };
+        if let Some(&chosen) = candidates[first..].iter().find(|&&(_, size)| fits(size)) {
+            return chosen;
+        }
+        // Reachable: nothing clamps an enumerator to 64 bits and the folder
+        // computes in `i128`, so `enum E { A = 1 << 64 };` arrives here, as
+        // does a list spanning below `LONG_MIN` and above `LONG_MAX`. gcc
+        // warns and carries on, folding the shift to 0 because it truncates
+        // to the expression's type, which c17's folders do not do. Say what
+        // is wrong rather than picking a type and truncating silently.
+        diag::error(
+            pos,
+            &gettext("no integer type can represent all values of this enumeration"),
+        );
+        candidates[3]
+    }
+
+    /// The type an enumeration constant has once its enumeration is complete.
+    ///
+    /// C17 6.4.4.3p2 makes it `int`. gcc keeps `int` for a member that fits,
+    /// except that every member of an enumeration wider than `int` takes the
+    /// enumeration's type -- `enum L { L0 = -1, L1 = 0x100000000 }` makes
+    /// `sizeof(L0)` 8 -- and a member that fits nowhere else takes it too. A
+    /// `packed` enumeration narrower than `int` leaves its members `int`.
+    fn enumerator_type(&self, value: i128, underlying: TypeId, size: usize) -> TypeId {
+        if size <= 4 && i32::try_from(value).is_ok() {
+            self.types.int_id
+        } else {
+            underlying
         }
     }
 
@@ -89,12 +116,11 @@ impl Parser<'_> {
         let enum_pos = self.current_pos();
         self.advance(); // consume 'enum'
 
-        // Optional tag name
-        let tag = if self.peek() == TokenType::Ident && !self.is_special(b'{') {
-            Some(self.expect_identifier()?)
-        } else {
-            None
-        };
+        // gcc reads an enum's attributes between `enum` and the tag and after
+        // the closing brace -- not between the tag and `{`, which it rejects.
+        // Of them only `packed` means anything; gcc ignores `aligned` on an
+        // enum, and on a declaration that is not a definition.
+        let (early_attrs, tag) = self.parse_attributed_tag()?;
 
         // Check for definition vs forward reference
         if self.is_special(b'{') {
@@ -180,22 +206,23 @@ impl Parser<'_> {
                 }
             }
 
-            // Empty enum definition is a GNU extension, warn with -Wpedantic
+            // C17 6.7.2.2p1: the enumerator list is not optional. gcc and
+            // clang both reject an empty one; it is not a GNU extension.
             if constants.is_empty() {
-                diag::warning(
-                    self.current_pos(),
-                    &gettext("empty enum definition is a GNU extension"),
-                );
+                diag::error(self.current_pos(), &gettext("empty enum is invalid"));
             }
 
             self.expect_special(b'}')?;
+            let packed = early_attrs.has_packed() || self.parse_attributes().has_packed();
 
             // C17 6.7.2.2p4: the enumerated type is compatible with some
             // integer type capable of representing every member. Pick it, and
-            // give the enumerators that type.
-            let (underlying, size) = self.enum_underlying_type(&constants, enum_pos);
+            // give the enumerators their final type.
+            let (underlying, size) = self.enum_underlying_type(&constants, enum_pos, packed);
             for &sym_id in &constant_syms {
-                self.symbols.get_mut(sym_id).typ = underlying;
+                let sym = self.symbols.get(sym_id);
+                let value = sym.enum_value.unwrap_or(0);
+                self.symbols.get_mut(sym_id).typ = self.enumerator_type(value, underlying, size);
             }
 
             let composite = CompositeType {
@@ -249,6 +276,19 @@ impl Parser<'_> {
         }
     }
 
+    /// The attributes written between a tag keyword and its tag, and the
+    /// tag: `struct __attribute__((packed)) S`, `enum __attribute__((packed))
+    /// E`, or with no tag at all.
+    fn parse_attributed_tag(&mut self) -> ParseResult<(AttributeList, Option<StringId>)> {
+        let attrs = self.parse_attributes();
+        let tag = if self.peek() == TokenType::Ident && !self.is_special(b'{') {
+            Some(self.expect_identifier()?)
+        } else {
+            None
+        };
+        Ok((attrs, tag))
+    }
+
     /// Parse a struct or union specifier
     /// struct-or-union-specifier: ('struct'|'union') identifier? '{' struct-declaration-list? '}'
     ///                          | ('struct'|'union') identifier
@@ -256,36 +296,15 @@ impl Parser<'_> {
         let specifier_pos = self.current_pos();
         self.advance(); // consume 'struct' or 'union'
 
-        // Parse __attribute__ between 'struct' keyword and tag name
+        // Attributes between 'struct' and the tag name
         // (e.g., struct __attribute__((packed)) tagname { ... })
-        let early_attrs = self.parse_attributes();
+        let (early_attrs, tag) = self.parse_attributed_tag()?;
         let mut is_packed = early_attrs.has_packed();
-        // `transparent_union` is collected at the same four positions as
+        // `transparent_union` is collected at the same positions as
         // `packed`, for the same reason: gcc accepts it at any of them.
         let mut is_transparent = early_attrs.has_transparent_union();
         // Track struct-level aligned attribute (max across all positions)
         let mut struct_align: Option<u32> = early_attrs.get_alignment();
-
-        // Optional tag name
-        let tag = if self.peek() == TokenType::Ident && !self.is_special(b'{') {
-            if !self.is_attribute_keyword() {
-                Some(self.expect_identifier()?)
-            } else {
-                let mid_attrs = self.parse_attributes();
-                is_packed = is_packed || mid_attrs.has_packed();
-                is_transparent = is_transparent || mid_attrs.has_transparent_union();
-                if let Some(a) = mid_attrs.get_alignment() {
-                    struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
-                }
-                if self.peek() == TokenType::Ident && !self.is_special(b'{') {
-                    Some(self.expect_identifier()?)
-                } else {
-                    None
-                }
-            }
-        } else {
-            None
-        };
 
         // Parse __attribute__ after tag name but before '{'
         let pre_attrs = self.parse_attributes();

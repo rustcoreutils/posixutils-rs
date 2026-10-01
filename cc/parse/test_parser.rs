@@ -22,7 +22,7 @@ use crate::strings::{StringId, StringTable};
 use crate::symbol::{Symbol, SymbolTable};
 use crate::target::Target;
 use crate::token::lexer::Tokenizer;
-use crate::types::{TypeKind, TypeModifiers, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
 
 fn parse_expr(input: &str) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
     parse_expr_with_vars(input, &[])
@@ -3616,21 +3616,98 @@ fn test_bitfield_too_wide_error() {
 
 // Enum tests
 
+/// An empty enumerator list is an error, as in gcc and clang: C17
+/// 6.7.2.2p1 does not make the list optional.
 #[test]
-fn test_empty_enum_warning() {
-    // Empty enum is a GNU extension - should parse successfully with a warning
-    // The warning is emitted to stderr during the test
-    let (tu, types, _strings, _symbols) = parse_tu("enum E {};").unwrap();
-    assert_eq!(tu.items.len(), 1);
-    if let ExternalDecl::Declaration(decl) = &tu.items[0] {
-        // This is a type declaration (enum only, no variable)
-        // The enum should have no constants
-        let typ = decl.declarators.first().map(|d| d.typ);
-        if let Some(typ_id) = typ {
-            if let Some(composite) = types.composite(typ_id) {
-                assert!(composite.enum_constants.is_empty());
-            }
-        }
+fn test_empty_enum_is_an_error() {
+    for src in ["enum E {};", "enum __attribute__((packed)) E {};"] {
+        let before = crate::diag::error_count();
+        let (_tu, _types, _strings, _symbols) = parse_tu(src).unwrap();
+        // The count is process-wide and only grows, so a concurrent test can
+        // add to it but never hide this one's error.
+        assert!(crate::diag::error_count() > before, "{src}: accepted");
+    }
+}
+
+/// The declared variable's enum type, its size and alignment, and the
+/// integer type it is compatible with.
+fn enum_of_variable(src: &str) -> (usize, usize, Option<TypeId>, TypeTable) {
+    let (tu, types, _strings, _symbols) = parse_tu(src).unwrap();
+    let ExternalDecl::Declaration(ref decl) = tu.items.last().unwrap() else {
+        panic!("{src}: expected a declaration");
+    };
+    let typ = decl.declarators[0].typ;
+    let compat = types.enum_compatible_type(typ);
+    (types.size_bytes(typ), types.alignment(typ), compat, types)
+}
+
+/// `packed` makes an enum the smallest integer type holding its members,
+/// signed iff a member is negative, as gcc does; without it the search
+/// starts at `int`.
+#[test]
+fn test_packed_enum_underlying_type() {
+    use crate::target::IntType;
+    for (body, size, int) in [
+        ("{ A }", 1, IntType::UChar),
+        ("{ A = 255 }", 1, IntType::UChar),
+        ("{ A = 256 }", 2, IntType::UShort),
+        ("{ A = -128, B = 127 }", 1, IntType::SChar),
+        ("{ A = -129 }", 2, IntType::Short),
+        ("{ A = 65535 }", 2, IntType::UShort),
+        ("{ A = 65536 }", 4, IntType::UInt),
+        ("{ A = -32769 }", 4, IntType::Int),
+        ("{ A = 0x100000000 }", 8, IntType::ULong),
+        ("{ A = -0x100000000 }", 8, IntType::Long),
+    ] {
+        let src = format!("enum __attribute__((packed)) E {body} x;");
+        let (got_size, align, compat, types) = enum_of_variable(&src);
+        assert_eq!((got_size, align), (size, size), "{src}");
+        assert_eq!(compat, Some(types.int_type_id(int)), "{src}");
+        let plain = format!("enum E {body} x;");
+        let (plain_size, _, _, _) = enum_of_variable(&plain);
+        assert_eq!(plain_size, size.max(4), "{plain}");
+    }
+}
+
+/// gcc reads an enum's `packed` between `enum` and the tag and after the
+/// closing brace, tagged or not; on a declaration that is not a definition
+/// it means nothing, and `aligned` on an enum is ignored.
+#[test]
+fn test_packed_enum_attribute_positions() {
+    for (src, size) in [
+        ("enum __attribute__((packed)) E { A } x;", 1),
+        ("enum __attribute__((__packed__)) { A } x;", 1),
+        ("enum E { A } __attribute__((packed)) x;", 1),
+        ("enum { A } __attribute__((packed)) x;", 1),
+        ("enum E; enum __attribute__((packed)) E { A } x;", 1),
+        ("enum __attribute__((packed)) E; enum E { A } x;", 4),
+        ("enum __attribute__((aligned(8))) E { A } x;", 4),
+        ("enum E { A } __attribute__((aligned(8))) x;", 4),
+    ] {
+        let (got_size, align, _, _) = enum_of_variable(src);
+        assert_eq!((got_size, align), (size, size), "{src}");
+    }
+}
+
+/// An enumeration constant stays `int` in a `packed` enum narrower than
+/// `int`, and takes the enumeration's type in one wider than `int`: gcc's
+/// `sizeof(A)` is 4 for the first and 8 for every member of the second.
+#[test]
+fn test_enumerator_type_follows_enum_width() {
+    for (src, size) in [
+        ("enum __attribute__((packed)) E { A }; int x[sizeof(A)];", 4),
+        ("enum E { B = -1, A = 0x100000000 }; int x[sizeof(B)];", 8),
+        (
+            "enum __attribute__((packed)) E { B = -1, A = 0x100000000 }; int x[sizeof(B)];",
+            8,
+        ),
+        (
+            "enum E { A = 0x80000000u }; int x[sizeof(A) + (A > 0 ? 0 : 99)];",
+            4,
+        ),
+    ] {
+        let (got_size, _, _, _) = enum_of_variable(src);
+        assert_eq!(got_size, 4 * size, "{src}");
     }
 }
 

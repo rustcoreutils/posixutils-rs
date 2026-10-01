@@ -2214,23 +2214,10 @@ impl<'a> Parser<'a> {
                     if let Some(sym) = self.symbols.lookup_enum_constant(name_id) {
                         if let Some(value) = sym.enum_value {
                             // C17 6.4.4.3p2: an enumeration constant has type
-                            // `int`. The enumeration's own type is used only
-                            // where that would lose the value -- when a member
-                            // does not fit in `int` the whole enumeration
-                            // widens, and reading the constant back as `int`
-                            // would undo that.
-                            //
-                            // Reporting the enumeration type unconditionally
-                            // was visible: `__builtin_types_compatible_p
-                            // (typeof (hot), int)` answered 0 where gcc and
-                            // the standard say 1, because `typeof` of an
-                            // enumerator is `int`.
-                            let fits_in_int = i32::try_from(value).is_ok();
-                            let typ = if fits_in_int {
-                                self.types.int_id
-                            } else {
-                                sym.typ
-                            };
+                            // `int`, which is the symbol's type while its list
+                            // is parsed; `Parser::enumerator_type` gives it
+                            // its final one when the enumeration completes.
+                            let typ = sym.typ;
                             let kind = match i64::try_from(value) {
                                 Ok(v) => ExprKind::IntLit(v),
                                 // Only an `unsigned long` enumeration above

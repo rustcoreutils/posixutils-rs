@@ -150,6 +150,7 @@ const MAX_ITERATIONS: usize = 10;
 /// What the per-function passes share.
 struct PassCtx<'a> {
     types: &'a TypeTable,
+    known: &'a constglobal::KnownGlobals,
     mi: &'a memloc::ModuleInfo,
     fold: &'a libcall_fold::FoldCtx<'a>,
 }
@@ -160,7 +161,11 @@ type Pass = (&'static str, fn(&mut Function, &PassCtx) -> bool);
 
 /// The fixed-point loop's passes, in order. The order is load-bearing: each
 /// pass hands the next one a shape it could not have seen for itself.
-const PASSES: [Pass; 10] = [
+const PASSES: [Pass; 12] = [
+    // `constglobal` before anything looks at a value: a load of a `const`
+    // global becomes its initializer, which every pass below treats as the
+    // constant it is.
+    ("constglobal", |f, c| constglobal::run(f, c.types, c.known)),
     // `memexpand` ahead of all of them, so the loads and stores it makes of a
     // length SCCP has only now proved constant are forwarded and killed in
     // the same iteration.
@@ -206,7 +211,29 @@ const PASSES: [Pass; 10] = [
     // `dce` last: SCCP removes a dead edge but deletes no block, and leaves
     // the `PhiSource` of a folded phi for `dce` to collect.
     ("dce", |f, _| dce::run(f)),
+    // `simplify_cfg` once `dce` has dropped what made a block more than a
+    // branch: the next round's passes see fewer, longer blocks.
+    ("simplify_cfg", |f, _| f.simplify_cfg()),
 ];
+
+/// One round of the passes that need nothing module-wide, run on every
+/// function before inlining: the inliner sizes a callee by the code it
+/// emits, so it should see the code that will be emitted -- not branches
+/// SCCP is about to delete or copies `copyprop` is about to forward.
+const BEFORE_INLINING: [fn(&mut Function, &TypeTable) -> bool; 5] = [
+    |f, _| sccp::run(f),
+    instcombine::run,
+    copyprop::run,
+    |f, _| dce::run(f),
+    |f, _| f.simplify_cfg(),
+];
+
+fn simplify_before_inlining(func: &mut Function, types: &TypeTable) {
+    for run in BEFORE_INLINING {
+        run(func, types);
+    }
+    func.remove_nops();
+}
 
 /// How a function's fixed-point loop went.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +379,11 @@ pub fn optimize_module(
     // no standalone copy of one either.
     suppress_forwarding_bodies(module);
 
+    if opt.optimizes() {
+        for func in &mut module.functions {
+            simplify_before_inlining(func, types);
+        }
+    }
     inline::run(module, opt);
 
     // Every pack should have been resolved by the splice above. One that
@@ -371,11 +403,6 @@ pub fn optimize_module(
         return OptReport::default();
     }
 
-    // Phase 2: a module pre-pass, before anything looks at a value: every
-    // load of a `const` global becomes its initializer, which the passes
-    // below then treat as the constant it is.
-    constglobal::run(module, types);
-
     optimize_functions(module, types, target, MAX_ITERATIONS)
 }
 
@@ -387,8 +414,9 @@ fn optimize_functions(
     target: &Target,
     max_iterations: usize,
 ) -> OptReport {
-    // Module-wide facts the memory passes need. Built after inlining, so the
-    // call graph and the set of globals are final.
+    // Module-wide facts the passes need. Built after inlining, so the call
+    // graph and the set of globals are final.
+    let known = constglobal::KnownGlobals::collect(module, types);
     let mi = memloc::ModuleInfo::build(module, types);
     let bytes = ConstBytes::build(module, types);
     let literals = libcall_fold::NewLiterals::new(&module.strings);
@@ -402,6 +430,7 @@ fn optimize_functions(
     };
     let ctx = PassCtx {
         types,
+        known: &known,
         mi: &mi,
         fold: &fold,
     };
@@ -501,7 +530,8 @@ mod tests {
         let mut finished = module_with_a_constant_branch(&types);
         let report = optimize_functions(&mut finished, &types, &target, MAX_ITERATIONS);
         assert!(report.unconverged.is_empty(), "{:?}", report.unconverged);
-        assert_eq!(finished.functions[0].blocks.len(), 2);
+        // The dead arm is gone, and the live one merged into the entry.
+        assert_eq!(finished.functions[0].blocks.len(), 1);
     }
 
     /// The spellings GCC and Clang accept, and what each means here.

@@ -1834,3 +1834,77 @@ int header_to_body(int n, int *out) {
         assert_eq!(rc, 0, "aarch64");
     }
 }
+
+/// A `const` global read through a pointer to it is its initializer, as a
+/// read by name is: the load's address is resolved the way every memory pass
+/// resolves one.
+#[test]
+fn memopt_a_const_global_read_through_its_address_folds() {
+    let src = "\
+static const int k = 5;
+int through_pointer(void) { const int *p = &k; return *p; }
+";
+    for target in [X86_64_LINUX, AARCH64_LINUX] {
+        let ir = post_opt_ir("constptr", src, target);
+        assert!(!ir.contains("= load."), "{target}: k is folded:\n{ir}");
+    }
+    let run = format!("{src}int main(void) {{ return through_pointer() != 5; }}\n");
+    assert_eq!(at_o2("constptr_run", &run), 0);
+}
+
+/// Every `br B` in dumped IR whose target no other branch names: a block
+/// that could have been merged into its only predecessor.
+fn mergeable_pairs(ir: &str) -> Vec<String> {
+    let is_branch =
+        |l: &str| l.starts_with("br ") || l.starts_with("cbr ") || l.starts_with("switch");
+    let mut refs: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for l in ir.lines().map(str::trim).filter(|l| is_branch(l)) {
+        for t in l
+            .split([' ', ','])
+            .filter(|t| t.starts_with(".L") || t.contains("_bb"))
+        {
+            *refs.entry(t).or_default() += 1;
+        }
+    }
+    ir.lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("br "))
+        .filter(|t| refs.get(t) == Some(&1))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Once optimization has removed what made a block more than a branch, the
+/// block goes: every edge into it is sent where it was forwarding, and a
+/// block left with one predecessor that has one successor is merged into it.
+#[test]
+fn memopt_no_block_is_left_only_branching() {
+    let src = "\
+int chain(int x) {
+    if (x > 0)
+        x = x * 2;
+    else
+        x = x * 3;
+    if (1)
+        x++;
+    return x;
+}
+int pick(int c, int a, int b) {
+    int r = a;
+    if (c == 1) r = b;
+    if (c == 2) r = a + b;
+    while (r > 100) r -= 7;
+    return r;
+}
+";
+    for target in [X86_64_LINUX, AARCH64_LINUX] {
+        let ir = post_opt_ir("cfgsimp", src, target);
+        let pairs = mergeable_pairs(&ir);
+        assert!(pairs.is_empty(), "{target}: {pairs:?}\n{ir}");
+    }
+    let run = format!(
+        "{src}int main(void) {{ return chain(3) == 7 && chain(-1) == -2 \
+         && pick(1, 5, 9) == 9 && pick(2, 60, 70) == 95 ? 0 : 1; }}\n"
+    );
+    assert_eq!(at_o2("cfgsimp_run", &run), 0);
+}

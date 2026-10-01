@@ -1076,8 +1076,9 @@ struct P mkp(void) { struct P r; r.a = 1.0; r.b = 2.0; return r; }
 fn codegen_aarch64_spilled_binary128_argument_is_whole() {
     let src = r#"
 /* Comparing two binary128 values is a libgcc call, so both parameters have to
-   survive it and are spilled to the frame. */
-static int eql(const long double *v, long double re, long double im)
+   survive it and are spilled to the frame. Kept out of line, since the
+   spill is what is under test. */
+static __attribute__((noinline)) int eql(const long double *v, long double re, long double im)
 {
     return v[0] == re && v[1] == im;
 }

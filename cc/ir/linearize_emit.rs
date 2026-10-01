@@ -2484,7 +2484,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// A constant condition jumps straight to the block it selects, and the
     /// other one gets no edge. Nothing else in the linearizer has to know:
     /// a block that nothing reaches is removed when the function is finished
-    /// (`dce::remove_unreachable_blocks`), and one a label, `case` or `default`
+    /// (`Function::remove_unreachable_blocks`), and one a label, `case` or `default`
     /// inside the dead arm still reaches keeps its edge and so survives.
     ///
     /// With no current block -- control cannot reach here -- the branch is

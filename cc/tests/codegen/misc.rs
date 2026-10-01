@@ -6250,9 +6250,11 @@ fn codegen_always_inline_spellings_and_conflict() {
 /// forcing inlining takes its per-call stack from 6 KB to 15 KB.
 #[test]
 fn codegen_always_inline_yields_to_the_recursive_stack_guard() {
-    // Big enough that caller_size * 8 clears RECURSIVE_CALLER_MAX_STACK.
+    // Big enough that caller_size * 8 clears RECURSIVE_CALLER_MAX_STACK --
+    // after simplification, so no statement may undo the ones before it: a
+    // shift by `i % 7` alone is `s ^= s` every seventh line.
     let body: String = (1..200)
-        .map(|i| format!("    s += x*{i}; s ^= s << ({i}%7); s -= x/({});\n", i + 1))
+        .map(|i| format!("    s += x*{i}; s ^= s << ({i}%7+1); s -= x/({});\n", i + 1))
         .collect();
     let src = format!(
         "static __attribute__((always_inline)) inline int helper(int x)\n\

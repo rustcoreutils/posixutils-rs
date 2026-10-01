@@ -320,7 +320,7 @@ impl Linearizer<'_> {
         // Through the accessor rather than `expect`: `current_bb` is `None`
         // wherever control cannot arrive -- a statement before a `switch`'s
         // first `case`, or after a `goto` -- and this loop has to hang its
-        // blocks off something. `dce::remove_unreachable_blocks` takes the
+        // blocks off something. `Function::remove_unreachable_blocks` takes the
         // lot away again.
         let entry_bb = self.current_or_unreachable_bb();
         self.emit(Instruction::br(loop_bb));

@@ -42,7 +42,7 @@ pub fn run(func: &mut Function) -> bool {
     changed |= eliminate_dead_code(func);
 
     // 3. Remove blocks that are no longer reachable from entry
-    changed |= remove_unreachable_blocks(func);
+    changed |= func.remove_unreachable_blocks();
 
     changed
 }
@@ -207,37 +207,6 @@ fn fold_branches_to_unreachable(func: &mut Function) -> bool {
         changed |= super::propagate::retarget_terminator(func, b, taken);
     }
     changed
-}
-
-// Unreachable Block Removal
-
-/// Remove every block no path from the entry reaches, and every edge and
-/// phi source it contributed.
-///
-/// Also the linearizer's last step on a function, at every level: gcc emits
-/// no code no path reaches even at `-O0` -- the arm of a constant condition,
-/// what follows a `return` or a `goto` -- and a program may depend on it, by
-/// calling a function that exists nowhere from such an arm. A block reached
-/// through a label, `case`, `default` or a taken address is kept.
-pub(crate) fn remove_unreachable_blocks(func: &mut Function) -> bool {
-    let reachable = func.reachable_blocks();
-    let before = func.blocks.len();
-
-    // Every edge out of a dead block goes before the block does, taking
-    // with it the phi operand the edge carried into a live successor.
-    let dead_edges: Vec<(BasicBlockId, BasicBlockId)> = func
-        .blocks
-        .iter()
-        .filter(|bb| !reachable.contains(&bb.id))
-        .flat_map(|bb| bb.children.iter().map(move |c| (bb.id, *c)))
-        .collect();
-    for (from, to) in dead_edges {
-        func.remove_edge(from, to);
-    }
-    func.blocks.retain(|bb| reachable.contains(&bb.id));
-    func.rebuild_block_idx();
-
-    func.blocks.len() < before
 }
 
 #[cfg(test)]

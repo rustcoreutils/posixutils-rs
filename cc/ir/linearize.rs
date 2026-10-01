@@ -1286,7 +1286,7 @@ impl<'a> Linearizer<'a> {
     /// What follows is unreachable until a label, and still gets a block of
     /// its own so every construct in it is lowered the ordinary way; the
     /// block is removed when the function is finished
-    /// (`dce::remove_unreachable_blocks`). Appending it to the block the
+    /// (`Function::remove_unreachable_blocks`). Appending it to the block the
     /// jump ends instead put instructions after a terminator.
     pub(crate) fn start_unreachable_block(&mut self) {
         let bb = self.alloc_bb();
@@ -1315,7 +1315,7 @@ impl<'a> Linearizer<'a> {
     /// quietly drops what it is handed there. A construct that builds
     /// *control flow* of its own cannot be dropped that way: it has to hang
     /// its blocks off an existing one. This is that block, and
-    /// `dce::remove_unreachable_blocks` takes it away again with everything
+    /// `Function::remove_unreachable_blocks` takes it away again with everything
     /// lowered into it.
     pub(crate) fn current_or_unreachable_bb(&mut self) -> BasicBlockId {
         if self.current_bb.is_none() {
@@ -2035,10 +2035,10 @@ impl<'a> Linearizer<'a> {
         }
 
         // Nothing is emitted for code no path reaches, at any level: see
-        // `dce::remove_unreachable_blocks`. Before SSA, which then never
+        // `Function::remove_unreachable_blocks`. Before SSA, which then never
         // sees a definition or a phi source in a block that cannot run.
         if let Some(ref mut ir_func) = self.current_func {
-            super::dce::remove_unreachable_blocks(ir_func);
+            ir_func.remove_unreachable_blocks();
         }
 
         // Run SSA conversion if enabled

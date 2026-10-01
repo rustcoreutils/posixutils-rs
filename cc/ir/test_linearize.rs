@@ -9924,7 +9924,7 @@ fn a_constant_short_circuit_operand_emits_no_branch() {
 /// `emit_diamond`, or read the block back through
 /// `current_or_unreachable_bb`, which starts a block nothing branches to; the
 /// point of auditing the CFG rather than only that lowering finished is that
-/// such a block is *removed* again by `dce::remove_unreachable_blocks`, and a
+/// such a block is *removed* again by `Function::remove_unreachable_blocks`, and a
 /// mislinked edge into or out of it would outlive it.
 #[test]
 fn conditional_lowerings_keep_the_cfg_consistent() {

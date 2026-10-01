@@ -17,7 +17,7 @@ use crate::float::FloatVal;
 use crate::parse::ast::{BinaryOp, Declaration, Designator, Expr, ExprKind, InitElement, UnaryOp};
 use crate::strings::StringId;
 use crate::token::lexer::Position;
-use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::types::{MemberInfo, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::{BTreeMap, HashMap};
 
 /// Determine whether a declared object type is `const`-qualified for the
@@ -91,10 +91,11 @@ fn bitfield_carrier_bytes(
 /// The bytes a bit-field member's own bits occupy, measured from the first
 /// byte of the struct that declares it. `None` for anything but a bit-field.
 fn bitfield_byte_span(member: &crate::types::StructMember) -> Option<std::ops::Range<usize>> {
-    let (bit_offset, bit_width) = (member.bit_offset?, member.bit_width?);
-    let start = member.offset + (bit_offset / 8) as usize;
-    let end = member.offset + (bit_offset + bit_width).div_ceil(8) as usize;
-    Some(start..end.max(start + 1))
+    Some(crate::types::own_bit_bytes(
+        member.offset,
+        member.bit_offset?,
+        member.bit_width?,
+    ))
 }
 
 /// Give the carrier byte at `offset` of a struct initializer the bits `bits`
@@ -455,7 +456,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     self.compound_literal_counter += 1;
 
                     // Create the anonymous global
-                    let init = self.ast_init_list_to_ir(elements, *cl_type);
+                    let init = self.new_static_object_init(elements, *cl_type);
                     self.module.add_global(&anon_name, *cl_type, init);
 
                     // Return address of the anonymous global
@@ -896,15 +897,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Count the number of scalar fields needed to fill an aggregate type
-    /// (for brace elision per C99 6.7.8p17-20).
-    ///
-    /// The rule itself lives on the type table, because the parser needs the
-    /// same count to decide an incomplete array's bound.
-    pub(crate) fn count_scalar_fields(&self, typ: TypeId) -> usize {
-        self.types.count_scalar_fields(typ)
-    }
-
     /// Check if brace elision applies: the element is a positional scalar targeting
     /// an aggregate member, and is NOT a string literal initializing a char array
     /// (C99 6.7.8p14: string literals are a special case for char arrays).
@@ -925,23 +917,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         elem_idx: &mut usize,
         target_type: TypeId,
     ) -> Vec<InitElement> {
-        let n = self.count_scalar_fields(target_type);
-        let mut sub_elements = Vec::new();
-        let mut consumed = 0;
-        while consumed < n && *elem_idx < elements.len() {
-            let e = &elements[*elem_idx];
-            // Stop at designated elements (they apply to the current aggregate level)
-            if consumed > 0 && !e.designators.is_empty() {
-                break;
-            }
-            sub_elements.push(InitElement {
+        let span =
+            crate::parse::ast::brace_elision_span(self.types, elements, *elem_idx, target_type);
+        *elem_idx = span.end;
+        elements[span]
+            .iter()
+            .map(|e| InitElement {
                 designators: vec![],
                 value: e.value.clone(),
-            });
-            *elem_idx += 1;
-            consumed += 1;
-        }
-        sub_elements
+            })
+            .collect()
     }
 
     /// Group array init elements by index, handling designators, brace elision,
@@ -979,36 +964,8 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         while elem_idx < elements.len() {
             let element = &elements[elem_idx];
-            let mut index = None;
-            let mut index_high = None;
-            let mut index_pos = None;
-            for (pos, designator) in element.designators.iter().enumerate() {
-                match designator {
-                    Designator::Index(idx) => {
-                        index = Some(*idx);
-                        index_pos = Some(pos);
-                        break;
-                    }
-                    Designator::IndexRange(lo, hi) => {
-                        index = Some(*lo);
-                        index_high = Some(*hi);
-                        index_pos = Some(pos);
-                        break;
-                    }
-                    Designator::Field(_) => {}
-                }
-            }
-
-            let element_index = if let Some(idx) = index {
-                // A range leaves the cursor past its *high* endpoint, so a
-                // positional element after `[0 ... 2] = 1` lands at 3.
-                current_idx = index_high.unwrap_or(idx) + 1;
-                idx
-            } else {
-                let idx = current_idx;
-                current_idx += 1;
-                idx
-            };
+            let (element_index, span_end, index_pos) =
+                crate::parse::ast::array_slot(&element.designators, &mut current_idx);
 
             let remaining_designators = match index_pos {
                 Some(pos) => element.designators[pos + 1..].to_vec(),
@@ -1046,7 +1003,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             // keeps the loop off the excess indices rather than walking one
             // iteration per discarded element, which matters for an endpoint
             // far past the array.
-            let span_end = index_high.unwrap_or(element_index);
             let span_end = last_index.map_or(span_end, |last| span_end.min(last));
             if in_bounds(element_index) {
                 for target_index in element_index..=span_end {
@@ -1146,6 +1102,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     access_bytes: member.access_bytes,
                     member_index,
                     unions: UnionMembers::default(),
+                    quals: member.quals,
                 });
                 continue;
             }
@@ -1159,6 +1116,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 bit_width,
                 access_bytes,
                 unions,
+                quals,
             }) = resolved
             else {
                 elem_idx += 1;
@@ -1192,11 +1150,80 @@ impl<'a> super::linearize::Linearizer<'a> {
                 access_bytes,
                 member_index,
                 unions,
+                quals,
             });
             elem_idx += 1;
         }
 
         visits
+    }
+
+    /// Drop every visit that initializes a flexible array member where gcc
+    /// does not allow one to be, reporting each at its initializer.
+    ///
+    /// Initializing a flexible array member at all is a GNU extension (C17
+    /// 6.7.2.1p18 gives it no storage); see [`fam_init_violation`] for where
+    /// gcc draws the line. A dropped visit leaves the object's bytes as if
+    /// the member had not been named, so nothing further is reported.
+    pub(crate) fn admit_fam_visits(
+        &self,
+        visits: &mut Vec<StructFieldVisit>,
+        members: &[crate::types::StructMember],
+        storage: InitStorage,
+    ) {
+        visits.retain(|visit| {
+            let Some(message) = self
+                .fam_init_form(visit, members)
+                .and_then(|form| fam_init_violation(form, storage))
+            else {
+                return true;
+            };
+            error(self.visit_pos(visit), &gettextrs::gettext(message));
+            false
+        });
+    }
+
+    /// How `visit` initializes a flexible array member, or `None` if it
+    /// initializes some other member.
+    fn fam_init_form(
+        &self,
+        visit: &StructFieldVisit,
+        members: &[crate::types::StructMember],
+    ) -> Option<FamInit> {
+        let member = members.get(visit.member_index?)?;
+        if !self.types.is_flexible_array_member(member) {
+            return None;
+        }
+        let form = match &visit.kind {
+            // A designator into the member, `.s[1] = c`, initializes elements.
+            StructFieldVisitKind::Expr(expr) if self.types.unsized_array_levels(visit.typ) > 0 => {
+                match &expr.kind {
+                    ExprKind::InitList { elements } if elements.is_empty() => FamInit::Empty,
+                    ExprKind::InitList { elements } => match elements.as_slice() {
+                        [only] if only.designators.is_empty() && only.value.is_string_literal() => {
+                            FamInit::String
+                        }
+                        _ => FamInit::Elements,
+                    },
+                    _ if expr.is_string_literal() => FamInit::String,
+                    _ => FamInit::Elements,
+                }
+            }
+            _ => FamInit::Elements,
+        };
+        Some(form)
+    }
+
+    /// The position of the initializer a visit stands for.
+    fn visit_pos(&self, visit: &StructFieldVisit) -> Position {
+        match &visit.kind {
+            StructFieldVisitKind::Expr(expr) => self.expr_pos(expr),
+            StructFieldVisitKind::BraceElision(elements) => elements
+                .first()
+                .map_or(self.current_pos.unwrap_or_default(), |e| {
+                    self.expr_pos(&e.value)
+                }),
+        }
     }
 
     /// The member each union inside the subobject a visit initializes comes
@@ -1312,8 +1339,19 @@ impl<'a> super::linearize::Linearizer<'a> {
             StructFieldVisitKind::Expr(expr) => {
                 if let ExprKind::InitList { elements } = &expr.kind {
                     self.record_held_unions(typ, elements, base, held);
+                } else {
+                    self.record_value_unions(typ, base, held);
                 }
             }
+        }
+    }
+
+    /// Every union inside an object of type `typ` at `base` holds the bytes
+    /// of the one value that initialized the object whole. See
+    /// [`Held::Value`].
+    fn record_value_unions(&self, typ: TypeId, base: usize, held: &mut UnionMembers) {
+        if self.type_holds_union(typ) {
+            held.record_value(base..base + self.types.size_bytes(typ));
         }
     }
 
@@ -1547,9 +1585,12 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// place. A subobject the initializer left out gains an empty one, so
     /// that what is written there leaves the rest of its parent alone.
     ///
+    /// A string literal is taken apart into its elements first, so that one
+    /// of them can be replaced.
+    ///
     /// `None` when the existing initializer's shape cannot express the
-    /// subobject -- a string literal standing for a character array, an entry
-    /// for a bit-field carrier rather than for a member -- in which case the
+    /// subobject -- an entry for a bit-field carrier rather than for a
+    /// member -- in which case the
     /// caller discards the earlier initializer whole. It may by then have
     /// gained an empty initializer for a member on the way down, which is
     /// harmless precisely because the whole of it is discarded.
@@ -1613,6 +1654,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let elem_offset = (offset / elem_size) * elem_size;
                 if offset + size > elem_offset + elem_size {
                     return None;
+                }
+                if let Some(exploded) = init.string_as_array(elem_size, self.types.size_bytes(typ))
+                {
+                    *init = exploded;
                 }
                 let Initializer::Array { elements, .. } = init else {
                     return None;
@@ -1892,6 +1937,31 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Convert an AST initializer list to an IR Initializer
+    /// Lower the initializer of a new object with static storage duration --
+    /// a compound literal -- met while lowering another one: it is at its own
+    /// top level, not at the enclosing initializer's.
+    pub(crate) fn new_static_object_init(
+        &mut self,
+        elements: &[InitElement],
+        typ: TypeId,
+    ) -> Initializer {
+        let outer = std::mem::take(&mut self.static_init_nesting);
+        let init = self.ast_init_list_to_ir(elements, typ);
+        self.static_init_nesting = outer;
+        init
+    }
+
+    /// Mark the levels below as inside a subobject -- an array element if
+    /// `array` -- returning the nesting to restore once they are lowered.
+    fn enter_static_subobject(&mut self, array: bool) -> StaticInitNesting {
+        let outer = self.static_init_nesting;
+        self.static_init_nesting = StaticInitNesting {
+            nested: true,
+            in_array: outer.in_array || array,
+        };
+        outer
+    }
+
     pub(crate) fn ast_init_list_to_ir(
         &mut self,
         elements: &[InitElement],
@@ -1935,6 +2005,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
                 let groups = self.group_array_init_elements(elements, typ);
                 let mut init_elements = Vec::new();
+                let outer = self.enter_static_subobject(true);
                 for element_index in groups.indices {
                     let Some(list) = groups.element_lists.get(&element_index) else {
                         continue;
@@ -1966,6 +2037,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     };
                     init_elements.push((offset, elem_init));
                 }
+                self.static_init_nesting = outer;
 
                 init_elements.sort_by_key(|(offset, _)| *offset);
 
@@ -1983,11 +2055,14 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let members: Vec<_> = composite.members.clone();
                     let is_union = self.types.kind(resolved_typ) == TypeKind::Union;
 
-                    let visits =
+                    let mut visits =
                         self.walk_struct_init_fields(resolved_typ, &members, is_union, elements);
+                    let storage = InitStorage::Static(self.static_init_nesting);
+                    self.admit_fam_visits(&mut visits, &members, storage);
 
                     // Convert field visits to RawFieldInit by evaluating expressions
                     let mut raw_fields: Vec<RawFieldInit> = Vec::new();
+                    let outer = self.enter_static_subobject(false);
                     for visit in visits {
                         let held = self.held_union_members(visit.typ, &visit.kind, visit.offset);
                         let field_init = match visit.kind {
@@ -2009,6 +2084,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                             named: visit.unions,
                         });
                     }
+                    self.static_init_nesting = outer;
 
                     // Initializing the same object twice: the later one wins
                     // (C17 6.7.9p19), and one that names a *subobject* of an
@@ -2087,6 +2163,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         let mut bit_width = None;
         let mut access_bytes = None;
         let mut unions = UnionMembers::default();
+        // Qualifiers picked up below `base_type`: `.m.x` inside a `volatile`
+        // member `m` reaches a volatile `x`.
+        let mut quals = TypeModifiers::empty();
 
         for (idx, designator) in designators.iter().enumerate() {
             match designator {
@@ -2105,6 +2184,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                         }
                     }
                     let member = self.types.find_member(resolved, *name)?;
+                    if idx > 0 {
+                        quals |= self.types.qualifiers(typ);
+                    }
+                    quals |= member.quals;
                     offset += member.offset;
                     typ = member.typ;
                     if idx + 1 == designators.len() {
@@ -2146,6 +2229,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             bit_width,
             access_bytes,
             unions,
+            quals: quals & Type::MEMBER_QUALIFIERS,
         })
     }
 
@@ -2190,7 +2274,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             let (index, member) = members
                 .iter()
                 .enumerate()
-                .find(|(_, m)| m.name != StringId::EMPTY || m.bit_width.is_none())?;
+                .find(|(_, m)| m.is_initializable())?;
             *current_field_idx = members.len();
             return Some((
                 MemberInfo {
@@ -2199,6 +2283,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     bit_offset: member.bit_offset,
                     bit_width: member.bit_width,
                     access_bytes: member.access_bytes,
+                    quals: TypeModifiers::empty(),
                 },
                 index,
             ));
@@ -2207,12 +2292,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         while *current_field_idx < members.len() {
             let index = *current_field_idx;
             let member = &members[index];
-            if member.name == StringId::EMPTY && member.bit_width.is_some() {
-                *current_field_idx += 1;
-                continue;
-            }
-            if member.name != StringId::EMPTY || member.bit_width.is_none() {
-                *current_field_idx += 1;
+            *current_field_idx += 1;
+            if member.is_initializable() {
                 return Some((
                     MemberInfo {
                         offset: member.offset,
@@ -2220,11 +2301,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                         bit_offset: member.bit_offset,
                         bit_width: member.bit_width,
                         access_bytes: member.access_bytes,
+                        quals: TypeModifiers::empty(),
                     },
                     index,
                 ));
             }
-            *current_field_idx += 1;
         }
 
         None
@@ -2267,23 +2348,14 @@ impl<'a> super::linearize::Linearizer<'a> {
             while idx < members.len() {
                 let inner = &members[idx];
                 // Skip unnamed bitfield padding
-                if inner.name == StringId::EMPTY && inner.bit_width.is_some() {
+                if !inner.is_initializable() {
                     idx += 1;
                     continue;
                 }
                 // Nested anonymous aggregate — descend into it
-                if inner.name == StringId::EMPTY && inner.bit_width.is_none() {
-                    let inner_type = self.types.get(inner.typ);
-                    let is_nested_anon =
-                        matches!(inner_type.kind, TypeKind::Struct | TypeKind::Union)
-                            && inner_type
-                                .composite
-                                .as_ref()
-                                .is_some_and(|comp| comp.tag.is_none());
-                    if is_nested_anon {
-                        descend_into = Some((inner.typ, base_offset + inner.offset, idx + 1));
-                        break;
-                    }
+                if self.types.is_anonymous_aggregate(inner) {
+                    descend_into = Some((inner.typ, base_offset + inner.offset, idx + 1));
+                    break;
                 }
                 // Found a valid named member
                 found_member = Some((idx + 1, inner.clone()));
@@ -2293,12 +2365,19 @@ impl<'a> super::linearize::Linearizer<'a> {
             if let Some((next_idx, inner)) = found_member {
                 // Update the current level's index
                 c.levels.last_mut().unwrap().inner_next_idx = next_idx;
+                // Every level is an anonymous aggregate the member lives
+                // inside, so each one's qualifiers reach it, exactly as
+                // `TypeTable::find_member` gathers them for a lookup by name.
+                let quals = c.levels.iter().fold(TypeModifiers::empty(), |q, l| {
+                    q | (self.types.qualifiers(l.anon_type) & Type::MEMBER_QUALIFIERS)
+                });
                 return Some(MemberInfo {
                     offset: base_offset + inner.offset,
                     typ: inner.typ,
                     bit_offset: inner.bit_offset,
                     bit_width: inner.bit_width,
                     access_bytes: inner.access_bytes,
+                    quals,
                 });
             }
 
@@ -2327,23 +2406,14 @@ impl<'a> super::linearize::Linearizer<'a> {
             if member.name == name {
                 return Some(MemberDesignatorResult::Direct(idx + 1));
             }
-            if member.name == StringId::EMPTY {
-                let member_type = self.types.get(member.typ);
-                let is_anon_aggregate =
-                    matches!(member_type.kind, TypeKind::Struct | TypeKind::Union)
-                        && member_type
-                            .composite
-                            .as_ref()
-                            .is_some_and(|composite| composite.tag.is_none());
-                if is_anon_aggregate {
-                    // Recursively search for the field, building the nesting path
-                    let mut path = Vec::new();
-                    if self.find_anon_field_path(member.typ, member.offset, name, &mut path) {
-                        return Some(MemberDesignatorResult::Anonymous {
-                            outer_idx: idx,
-                            levels: path,
-                        });
-                    }
+            if self.types.is_anonymous_aggregate(member) {
+                // Recursively search for the field, building the nesting path
+                let mut path = Vec::new();
+                if self.find_anon_field_path(member.typ, member.offset, name, &mut path) {
+                    return Some(MemberDesignatorResult::Anonymous {
+                        outer_idx: idx,
+                        levels: path,
+                    });
                 }
             }
         }
@@ -2376,32 +2446,24 @@ impl<'a> super::linearize::Linearizer<'a> {
                 return true;
             }
             // Check if this is a nested anonymous aggregate
-            if inner_member.name == StringId::EMPTY {
-                let inner_type = self.types.get(inner_member.typ);
-                let is_nested_anon = matches!(inner_type.kind, TypeKind::Struct | TypeKind::Union)
-                    && inner_type
-                        .composite
-                        .as_ref()
-                        .is_some_and(|c| c.tag.is_none());
-                if is_nested_anon {
-                    // Push this level pointing PAST the nested anon struct.
-                    // The inner level handles continuation within the nested anon;
-                    // when it's exhausted, this level continues from the next member.
-                    path.push(AnonLevel {
-                        anon_type,
-                        base_offset,
-                        inner_next_idx: inner_idx + 1,
-                    });
-                    if self.find_anon_field_path(
-                        inner_member.typ,
-                        base_offset + inner_member.offset,
-                        name,
-                        path,
-                    ) {
-                        return true;
-                    }
-                    path.pop(); // not found in this branch
+            if self.types.is_anonymous_aggregate(inner_member) {
+                // Push this level pointing PAST the nested anon struct.
+                // The inner level handles continuation within the nested anon;
+                // when it's exhausted, this level continues from the next member.
+                path.push(AnonLevel {
+                    anon_type,
+                    base_offset,
+                    inner_next_idx: inner_idx + 1,
+                });
+                if self.find_anon_field_path(
+                    inner_member.typ,
+                    base_offset + inner_member.offset,
+                    name,
+                    path,
+                ) {
+                    return true;
                 }
+                path.pop(); // not found in this branch
             }
         }
         false
@@ -2608,6 +2670,40 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 }
 
+/// What initializes a flexible array member, as far as where it may appear
+/// depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FamInit {
+    /// `{}`: nothing, which gcc discards wherever the object is static.
+    Empty,
+    /// A string literal, braced or not.
+    String,
+    /// Elements: a braced list, brace-elided values, or a designator into it.
+    Elements,
+}
+
+/// The diagnostic gcc gives for initializing a flexible array member with
+/// `form` in an object of `storage`, or `None` where gcc accepts it.
+///
+/// An automatic object cannot be given one at all, not even `{}`. In a static
+/// object a list of elements is allowed only at the object's own top level,
+/// and a string literal anywhere but inside an array element -- each element
+/// would have a different size.
+fn fam_init_violation(form: FamInit, storage: InitStorage) -> Option<&'static str> {
+    let nesting = match storage {
+        InitStorage::Automatic => {
+            return Some("non-static initialization of a flexible array member")
+        }
+        InitStorage::Static(nesting) => nesting,
+    };
+    let rejected = match form {
+        FamInit::Empty => false,
+        FamInit::String => nesting.in_array,
+        FamInit::Elements => nesting.nested,
+    };
+    rejected.then_some("initialization of flexible array member in a nested context")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2733,6 +2829,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_flexible_array_member_initializer_is_placed_as_gcc_places_it() {
+        use FamInit::{Elements, Empty, String};
+        let top = InitStorage::Static(StaticInitNesting::default());
+        let member = InitStorage::Static(StaticInitNesting {
+            nested: true,
+            in_array: false,
+        });
+        let element = InitStorage::Static(StaticInitNesting {
+            nested: true,
+            in_array: true,
+        });
+        let nested = Some("initialization of flexible array member in a nested context");
+        for form in [Empty, String, Elements] {
+            assert_eq!(fam_init_violation(form, top), None, "{form:?} at top level");
+        }
+        assert_eq!(fam_init_violation(Empty, member), None);
+        assert_eq!(fam_init_violation(String, member), None);
+        assert_eq!(fam_init_violation(Elements, member), nested);
+        assert_eq!(fam_init_violation(Empty, element), None);
+        assert_eq!(fam_init_violation(String, element), nested);
+        assert_eq!(fam_init_violation(Elements, element), nested);
+        for form in [Empty, String, Elements] {
+            assert_eq!(
+                fam_init_violation(form, InitStorage::Automatic),
+                Some("non-static initialization of a flexible array member"),
+            );
+        }
+    }
+
+    /// `struct V { int n; char s[]; }` initialized `{1, "x"}`: the string is
+    /// laid out after `n` at the object's top level, and dropped -- leaving
+    /// `n` alone -- in an array element, where it is rejected.
+    #[test]
+    fn a_rejected_flexible_array_member_initializer_lays_out_nothing() {
+        let target = Target::host();
+        let mut types = TypeTable::new(&target);
+        let mut strings = crate::strings::StringTable::new();
+        let (n, s) = (strings.intern("n"), strings.intern("s"));
+        let chars = types.intern(Type {
+            kind: TypeKind::Array,
+            base: Some(types.char_id),
+            array_size: None,
+            ..Default::default()
+        });
+        let v = types.intern(Type::struct_type(composite(
+            vec![member(n, types.int_id, 0), member(s, chars, 4)],
+            4,
+            4,
+        )));
+        let v_array = types.intern(Type::array(v, 1));
+        let list = |elements: Vec<InitElement>| InitElement {
+            designators: vec![],
+            value: Box::new(Expr::new_unpositioned(ExprKind::InitList { elements })),
+        };
+        let fields = vec![
+            positional(1, &types),
+            InitElement {
+                designators: vec![],
+                value: Box::new(Expr::new_unpositioned(ExprKind::StringLit("x".into()))),
+            },
+        ];
+        let symbols = SymbolTable::new();
+        let mut lin = Linearizer::new(&symbols, &types, &strings, &target);
+        let offsets = |init: &Initializer| match init {
+            Initializer::Struct { fields, .. } => fields.iter().map(|f| f.0).collect::<Vec<_>>(),
+            other => panic!("a struct initializer lowers to Initializer::Struct, got {other:?}"),
+        };
+
+        let top = lin.ast_init_list_to_ir(&fields, v);
+        assert_eq!(offsets(&top), vec![0, 4]);
+
+        let init = lin.ast_init_list_to_ir(&[list(fields)], v_array);
+        let Initializer::Array { elements, .. } = init else {
+            panic!("an array initializer lowers to Initializer::Array, got {init:?}");
+        };
+        assert_eq!(elements.len(), 1);
+        assert_eq!(offsets(&elements[0].1), vec![0]);
+        assert_eq!(lin.static_init_nesting, StaticInitNesting::default());
+    }
+
     // Resolving two initializers that describe overlapping storage
     // (C17 6.7.9p19).
 
@@ -2773,7 +2950,7 @@ mod tests {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: crate::types::MemberAlign::NATURAL,
         }
     }
 
@@ -2792,7 +2969,7 @@ mod tests {
             bit_offset: Some(bit_offset),
             bit_width: Some(width),
             access_bytes: Some(4),
-            explicit_align: None,
+            align: crate::types::MemberAlign::NATURAL,
         }
     }
 

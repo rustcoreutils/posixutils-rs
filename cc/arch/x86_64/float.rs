@@ -893,9 +893,10 @@ impl X86_64CodeGen {
             Some(t) => t,
             None => return,
         };
-        // Use type-aware FP size determination
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
-        let move_size = self.fp_format(insn.typ, insn.size, types);
+        // The operands' format; the result is an `int`.
+        let (operand, width) = (insn.operand_type(), insn.operand_width());
+        let fp_size = FpSize::from_type_or_bits(operand, width, types, &self.base.target);
+        let move_size = self.fp_format(operand, width, types);
 
         // Use Xmm15 as the work register for src1 (Xmm15/Xmm14 are
         // reserved scratch — not in the allocator palette). src2 cannot
@@ -1685,15 +1686,13 @@ impl X86_64CodeGen {
             }),
             dst: GpOperand::Reg(Reg::R10),
         });
-        self.push_lir(X86Inst::Movsx {
-            src_size: OperandSize::B32,
-            dst_size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::Rax),
-            dst: Reg::R11,
-        });
+        // `fp_offset` is never negative and the 32-bit load above already
+        // zero-extended it, so RAX is the 64-bit offset as it stands. (A sign
+        // extension into R11 used to go here, overwriting the va_list base
+        // when that lived in R11.)
         self.push_lir(X86Inst::Add {
             size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::R11),
+            src: GpOperand::Reg(Reg::Rax),
             dst: Reg::R10,
         });
 

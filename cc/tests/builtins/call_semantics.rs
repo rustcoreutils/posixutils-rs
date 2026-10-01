@@ -265,9 +265,14 @@ fn builtin_library_call_arguments_are_checked_like_a_call() {
             "`{call}` accepted={real_ok}, ordinary call accepted={twin_ok}\n\
              builtin:\n{real_err}\nordinary:\n{twin_err}"
         );
+        // An argument diagnostic names the callee as it was spelled.
+        let named = |m: String| m.replace("'F'", &format!("'{}'", &call[..open]));
         assert_eq!(
             messages(&real_err),
-            messages(&twin_err),
+            messages(&twin_err)
+                .into_iter()
+                .map(named)
+                .collect::<Vec<_>>(),
             "`{call}` is diagnosed differently from an ordinary call"
         );
     }

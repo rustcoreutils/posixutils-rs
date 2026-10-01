@@ -9,6 +9,7 @@
 // struct, union and enum specifiers, and the bit-field constraints
 //
 
+use super::attribute::AttributeList;
 use super::declaration::SpecContext;
 use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::diag;
@@ -16,7 +17,7 @@ use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
 use crate::token::lexer::{Position, TokenType};
 use crate::types::{
-    CompositeType, EnumConstant, StructMember, Type, TypeId, TypeKind, TypeModifiers,
+    CompositeType, EnumConstant, MemberAlign, StructMember, Type, TypeId, TypeKind, TypeModifiers,
 };
 use gettextrs::gettext;
 
@@ -27,21 +28,24 @@ impl Parser<'_> {
     /// The integer type an enumerated type is compatible with, and its size.
     ///
     /// C17 6.7.2.2p4 requires it to represent every member; the choice among
-    /// the types that do is implementation-defined. Narrowest wins, signed
-    /// before unsigned at each width, so an enum whose members all fit in
-    /// `int` is exactly the four signed bytes it has always been -- the
-    /// widening only happens where the alternative was a wrong value.
+    /// the types that do is implementation-defined. gcc's choice, which this
+    /// matches: the first of `int` and the 64-bit type that holds every
+    /// member, unsigned when no member is negative. A `packed` enum starts
+    /// the search at the 1-byte type instead, which makes it the smallest
+    /// integer type that holds its members. The choice is recorded as the
+    /// enum's size and `UNSIGNED` modifier, which
+    /// [`crate::types::TypeTable::enum_compatible_type`] reads back.
     fn enum_underlying_type(
         &mut self,
         constants: &[EnumConstant],
         pos: Position,
+        packed: bool,
     ) -> (TypeId, usize) {
         let Some(min) = constants.iter().map(|c| c.value).min() else {
             return (self.types.int_id, 4);
         };
         let max = constants.iter().map(|c| c.value).max().unwrap_or(0);
 
-        let fits = |lo: i128, hi: i128| min >= lo && max <= hi;
         // 6.7.2.2p4 leaves the choice to the implementation, requiring only a
         // type that represents every member. gcc's choice is unsigned whenever
         // no enumerator is negative, and it is observable -- `(enum E)-1 > 0`
@@ -49,36 +53,60 @@ impl Parser<'_> {
         // non-negative list also made an enum bit-field read back negative:
         // `enum E { A, B, C, D }; struct { enum E e:2; }` holding `D` gave -1
         // where gcc gives 3, because the field's signedness follows the type's.
-        if min >= 0 {
-            if fits(0, u32::MAX as i128) {
-                (self.types.uint_id, 4)
-            } else if fits(0, u64::MAX as i128) {
-                (self.types.ulong_id, 8)
-            } else {
-                // Reachable: nothing clamps an enumerator to 64 bits and the
-                // folder computes in `i128`, so `enum E { A = 1 << 64 };`
-                // arrives here. gcc warns and carries on, folding the shift to
-                // 0 because it truncates to the expression's type, which c17's
-                // folders do not do. Say what is wrong rather than aborting.
-                diag::error(
-                    pos,
-                    &gettext("no integer type can represent all values of this enumeration"),
-                );
-                (self.types.ulong_id, 8)
-            }
-        } else if fits(i32::MIN as i128, i32::MAX as i128) {
-            (self.types.int_id, 4)
-        } else if fits(i64::MIN as i128, i64::MAX as i128) {
-            (self.types.long_id, 8)
+        let unsigned = min >= 0;
+        let t = &self.types;
+        let candidates = if unsigned {
+            [
+                (t.uchar_id, 1),
+                (t.ushort_id, 2),
+                (t.uint_id, 4),
+                (t.ulong_id, 8),
+            ]
         } else {
-            // A list spanning below i64::MIN and above i64::MAX has no
-            // integer type that holds both ends. Say so rather than picking
-            // one and truncating the other.
-            diag::error(
-                pos,
-                &gettext("no integer type can represent all values of this enumeration"),
-            );
-            (self.types.long_id, 8)
+            [
+                (t.schar_id, 1),
+                (t.short_id, 2),
+                (t.int_id, 4),
+                (t.long_id, 8),
+            ]
+        };
+        let first = if packed { 0 } else { 2 };
+        let fits = |size: usize| {
+            let bits = 8 * size as u32;
+            if unsigned {
+                max < 1i128 << bits
+            } else {
+                min >= -(1i128 << (bits - 1)) && max < 1i128 << (bits - 1)
+            }
+        };
+        if let Some(&chosen) = candidates[first..].iter().find(|&&(_, size)| fits(size)) {
+            return chosen;
+        }
+        // Reachable: nothing clamps an enumerator to 64 bits and the folder
+        // computes in `i128`, so `enum E { A = 1 << 64 };` arrives here, as
+        // does a list spanning below `LONG_MIN` and above `LONG_MAX`. gcc
+        // warns and carries on, folding the shift to 0 because it truncates
+        // to the expression's type, which c17's folders do not do. Say what
+        // is wrong rather than picking a type and truncating silently.
+        diag::error(
+            pos,
+            &gettext("no integer type can represent all values of this enumeration"),
+        );
+        candidates[3]
+    }
+
+    /// The type an enumeration constant has once its enumeration is complete.
+    ///
+    /// C17 6.4.4.3p2 makes it `int`. gcc keeps `int` for a member that fits,
+    /// except that every member of an enumeration wider than `int` takes the
+    /// enumeration's type -- `enum L { L0 = -1, L1 = 0x100000000 }` makes
+    /// `sizeof(L0)` 8 -- and a member that fits nowhere else takes it too. A
+    /// `packed` enumeration narrower than `int` leaves its members `int`.
+    fn enumerator_type(&self, value: i128, underlying: TypeId, size: usize) -> TypeId {
+        if size <= 4 && i32::try_from(value).is_ok() {
+            self.types.int_id
+        } else {
+            underlying
         }
     }
 
@@ -88,12 +116,11 @@ impl Parser<'_> {
         let enum_pos = self.current_pos();
         self.advance(); // consume 'enum'
 
-        // Optional tag name
-        let tag = if self.peek() == TokenType::Ident && !self.is_special(b'{') {
-            Some(self.expect_identifier()?)
-        } else {
-            None
-        };
+        // gcc reads an enum's attributes between `enum` and the tag and after
+        // the closing brace -- not between the tag and `{`, which it rejects.
+        // Of them only `packed` means anything; gcc ignores `aligned` on an
+        // enum, and on a declaration that is not a definition.
+        let (early_attrs, tag) = self.parse_attributed_tag()?;
 
         // Check for definition vs forward reference
         if self.is_special(b'{') {
@@ -179,24 +206,23 @@ impl Parser<'_> {
                 }
             }
 
-            // Empty enum definition is a GNU extension, warn with -Wpedantic
+            // C17 6.7.2.2p1: the enumerator list is not optional. gcc and
+            // clang both reject an empty one; it is not a GNU extension.
             if constants.is_empty() {
-                diag::warning(
-                    self.current_pos(),
-                    &gettext("empty enum definition is a GNU extension"),
-                );
+                diag::error(self.current_pos(), &gettext("empty enum is invalid"));
             }
 
             self.expect_special(b'}')?;
+            let packed = early_attrs.has_packed() || self.parse_attributes().has_packed();
 
             // C17 6.7.2.2p4: the enumerated type is compatible with some
-            // integer type capable of representing every member. Pick the
-            // narrowest that is, preferring signed at each width, and give
-            // the enumerators that type -- for an enum that fits in `int`,
-            // which is nearly all of them, this is the `int` it always was.
-            let (underlying, size) = self.enum_underlying_type(&constants, enum_pos);
+            // integer type capable of representing every member. Pick it, and
+            // give the enumerators their final type.
+            let (underlying, size) = self.enum_underlying_type(&constants, enum_pos, packed);
             for &sym_id in &constant_syms {
-                self.symbols.get_mut(sym_id).typ = underlying;
+                let sym = self.symbols.get(sym_id);
+                let value = sym.enum_value.unwrap_or(0);
+                self.symbols.get_mut(sym_id).typ = self.enumerator_type(value, underlying, size);
             }
 
             let composite = CompositeType {
@@ -250,6 +276,19 @@ impl Parser<'_> {
         }
     }
 
+    /// The attributes written between a tag keyword and its tag, and the
+    /// tag: `struct __attribute__((packed)) S`, `enum __attribute__((packed))
+    /// E`, or with no tag at all.
+    fn parse_attributed_tag(&mut self) -> ParseResult<(AttributeList, Option<StringId>)> {
+        let attrs = self.parse_attributes();
+        let tag = if self.peek() == TokenType::Ident && !self.is_special(b'{') {
+            Some(self.expect_identifier()?)
+        } else {
+            None
+        };
+        Ok((attrs, tag))
+    }
+
     /// Parse a struct or union specifier
     /// struct-or-union-specifier: ('struct'|'union') identifier? '{' struct-declaration-list? '}'
     ///                          | ('struct'|'union') identifier
@@ -257,51 +296,19 @@ impl Parser<'_> {
         let specifier_pos = self.current_pos();
         self.advance(); // consume 'struct' or 'union'
 
-        // Parse __attribute__ between 'struct' keyword and tag name
+        // Attributes between 'struct' and the tag name
         // (e.g., struct __attribute__((packed)) tagname { ... })
-        let early_attrs = self.parse_attributes();
-        let mut is_packed = early_attrs
-            .attrs
-            .iter()
-            .any(|a| a.name == "packed" || a.name == "__packed__");
-        // `transparent_union` is collected at the same four positions as
+        let (early_attrs, tag) = self.parse_attributed_tag()?;
+        let mut is_packed = early_attrs.has_packed();
+        // `transparent_union` is collected at the same positions as
         // `packed`, for the same reason: gcc accepts it at any of them.
         let mut is_transparent = early_attrs.has_transparent_union();
         // Track struct-level aligned attribute (max across all positions)
         let mut struct_align: Option<u32> = early_attrs.get_alignment();
 
-        // Optional tag name
-        let tag = if self.peek() == TokenType::Ident && !self.is_special(b'{') {
-            if !self.is_attribute_keyword() {
-                Some(self.expect_identifier()?)
-            } else {
-                let mid_attrs = self.parse_attributes();
-                is_packed = is_packed
-                    || mid_attrs
-                        .attrs
-                        .iter()
-                        .any(|a| a.name == "packed" || a.name == "__packed__");
-                is_transparent = is_transparent || mid_attrs.has_transparent_union();
-                if let Some(a) = mid_attrs.get_alignment() {
-                    struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
-                }
-                if self.peek() == TokenType::Ident && !self.is_special(b'{') {
-                    Some(self.expect_identifier()?)
-                } else {
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         // Parse __attribute__ after tag name but before '{'
         let pre_attrs = self.parse_attributes();
-        is_packed = is_packed
-            || pre_attrs
-                .attrs
-                .iter()
-                .any(|a| a.name == "packed" || a.name == "__packed__");
+        is_packed = is_packed || pre_attrs.has_packed();
         is_transparent = is_transparent || pre_attrs.has_transparent_union();
         if let Some(a) = pre_attrs.get_alignment() {
             struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
@@ -324,11 +331,7 @@ impl Parser<'_> {
 
             // Parse trailing __attribute__ (e.g., __attribute__((packed)))
             let attrs = self.parse_attributes();
-            is_packed = is_packed
-                || attrs
-                    .attrs
-                    .iter()
-                    .any(|a| a.name == "packed" || a.name == "__packed__");
+            is_packed = is_packed || attrs.has_packed();
             is_transparent = is_transparent || attrs.has_transparent_union();
             if let Some(a) = attrs.get_alignment() {
                 struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
@@ -336,15 +339,15 @@ impl Parser<'_> {
 
             self.check_flexible_array_members(&members, is_union);
 
-            // Compute layout. `__attribute__((packed))` is a cap of 1; a
-            // `#pragma pack(n)` in force is a cap of n. Where both apply the
-            // tighter one wins, which is what gcc does.
-            let pragma_cap = self.current_pack();
-            let pack_cap = match (is_packed, pragma_cap) {
-                (true, Some(n)) => Some(n.min(1)),
-                (true, None) => Some(1),
-                (false, cap) => cap,
-            };
+            // Compute layout. `__attribute__((packed))` on the struct or union
+            // is `packed` on every member, which is how gcc defines it; a
+            // `#pragma pack(n)` in force caps every member at n.
+            if is_packed {
+                for member in &mut members {
+                    member.align.packed = true;
+                }
+            }
+            let pack_cap = self.current_pack();
             let (size, mut align) = if is_union {
                 self.types.compute_union_layout(&mut members, pack_cap)
             } else {
@@ -354,8 +357,8 @@ impl Parser<'_> {
 
             // What the members alone require, kept before the attribute below
             // overwrites it. AAPCS64 derives an argument's alignment from the
-            // members and ignores the type's own attribute, and the pack cap
-            // already folded in here is not recorded anywhere else.
+            // members and ignores the type's own attribute, and a `#pragma
+            // pack` cap folded in here is recorded nowhere else.
             let member_align = align;
 
             // Apply struct-level aligned attribute (raises alignment, never lowers)
@@ -483,6 +486,10 @@ impl Parser<'_> {
                 continue;
             }
 
+            // An `_Alignas` keyword is the declaration's that wrote it, and
+            // the bit-field check below must not see the previous member's.
+            self.pending_alignas_kw = None;
+
             // Parse member declaration
             let member_specs = self.parse_declaration_specifiers(SpecContext::Member)?;
             let member_base_type = &member_specs.ty;
@@ -494,6 +501,10 @@ impl Parser<'_> {
 
             // Skip any __attribute__ after type specifier (before member name)
             self.skip_extensions();
+            // An alignment or `packed` among the specifiers is the whole
+            // declaration's, and reaches every declarator in it:
+            // `__attribute__((aligned(8))) int b, c;` aligns both.
+            let specifier_align = self.take_member_align();
 
             // C11 anonymous struct/union members: "struct { ... };" or "union { ... };"
             // These have no declarator name, just end with ';'
@@ -505,7 +516,13 @@ impl Parser<'_> {
                     bit_offset: None,
                     bit_width: None,
                     access_bytes: None,
-                    explicit_align: None, // anonymous members
+                    // gcc takes an alignment written here and ignores
+                    // `packed`, silently: the anonymous member keeps its
+                    // type's alignment.
+                    align: MemberAlign {
+                        packed: false,
+                        ..specifier_align
+                    },
                 });
                 self.advance(); // consume ';'
                 continue;
@@ -529,7 +546,7 @@ impl Parser<'_> {
                     bit_offset: None,
                     bit_width: Some(width),
                     access_bytes: None,
-                    explicit_align: None, // bitfields don't support _Alignas
+                    align: MemberAlign::NATURAL, // padding: nothing written aligns it
                 });
 
                 self.expect_special(b';')?;
@@ -552,7 +569,7 @@ impl Parser<'_> {
                         bit_offset: None,
                         bit_width: Some(width),
                         access_bytes: None,
-                        explicit_align: None, // bitfields don't support _Alignas
+                        align: MemberAlign::NATURAL, // padding: nothing written aligns it
                     });
 
                     if self.is_special(b',') {
@@ -609,8 +626,8 @@ impl Parser<'_> {
                 // staying pending for the enclosing declaration.
                 let typ = self.apply_pending_type_attrs(typ);
 
-                // Capture any pending _Alignas from type specifier
-                let member_align = self.pending_alignas.take();
+                // What this declarator adds to the specifiers' alignment.
+                let member_align = specifier_align.merge(self.take_member_align());
 
                 // C17 6.7.2.1p2: members share one name space, so a
                 // repeated name is a constraint violation. Unnamed members
@@ -629,7 +646,7 @@ impl Parser<'_> {
                     bit_offset: None,
                     bit_width,
                     access_bytes: None,
-                    explicit_align: member_align,
+                    align: member_align,
                 });
 
                 if self.is_special(b',') {
@@ -654,6 +671,15 @@ impl Parser<'_> {
             }
         }
         Ok(members)
+    }
+
+    /// The alignment and `packed` written since the last call, consumed: the
+    /// member's half of [`crate::types::TypeTable::member_alignment`].
+    fn take_member_align(&mut self) -> MemberAlign {
+        MemberAlign {
+            written: self.pending_alignas.take(),
+            packed: std::mem::take(&mut self.pending_packed),
+        }
     }
 
     /// Parse a bitfield width (constant expression after ':')
@@ -700,10 +726,10 @@ impl Parser<'_> {
     }
 
     fn check_flexible_array_members(&self, members: &[StructMember], is_union: bool) {
-        let is_flexible =
-            |m: &StructMember| m.bit_width.is_none() && self.types.unsized_array_levels(m.typ) > 0;
-
-        let Some(first) = members.iter().position(is_flexible) else {
+        let Some(first) = members
+            .iter()
+            .position(|m| self.types.is_flexible_array_member(m))
+        else {
             return;
         };
         let pos = self.current_pos();

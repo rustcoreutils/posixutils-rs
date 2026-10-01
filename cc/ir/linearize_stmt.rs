@@ -9,6 +9,7 @@
 //! Statement linearization
 
 use super::linearize::*;
+use super::linearize_emit::Controlling;
 use super::{
     AsmConstraint, AsmData, BasicBlockId, Initializer, Instruction, Opcode, Pseudo, PseudoId,
 };
@@ -229,8 +230,8 @@ impl<'a> super::linearize::Linearizer<'a> {
 
                     if let Some(sret_ptr) = self.struct_return_ptr {
                         self.emit_sret_return(e, sret_ptr, func_ret_type);
-                    } else if let Some(ret_type) = self.two_reg_return_type {
-                        self.emit_two_reg_return(e, ret_type);
+                    } else if let Some(ret_type) = self.reg_aggregate_return_type {
+                        self.emit_reg_aggregate_return(e, ret_type);
                     } else if let Some(b) = self.complex_to_bool(e, func_ret_type) {
                         // Ahead of the complex arm below: that one keys off the
                         // *expression* being complex and returns its address,
@@ -532,15 +533,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                 func.add_pseudo(sym);
                 // Register with function's local variable tracking for SSA
                 // Pass the current basic block as the declaration block for scope-aware phi placement
-                let mods = self.types.modifiers(typ);
-                let is_volatile = self.types.contains_volatile(typ);
-                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
                 func.add_local(
                     &unique_name,
                     sym_id,
                     typ,
-                    is_volatile,
-                    is_atomic,
                     self.current_bb,
                     declarator.explicit_align,
                 );
@@ -628,7 +624,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                         let value_addr = self.linearize_expr(init);
                         let type_size_bytes = self.types.size_bytes(typ);
 
-                        self.emit_block_copy(sym_id, value_addr, type_size_bytes as i64);
+                        let vol = self.block_volatility(typ, self.expr_type(init));
+                        self.emit_block_copy(sym_id, value_addr, type_size_bytes as i64, vol);
                     } else {
                         // Simple scalar initializer
                         let init_type = self.expr_type(init);
@@ -747,8 +744,6 @@ impl<'a> super::linearize::Linearizer<'a> {
                 &size_var_name,
                 size_sym_id,
                 ulong_type,
-                false, // not volatile
-                false, // not atomic
                 self.current_bb,
                 None, // no explicit alignment
             );
@@ -796,15 +791,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         if let Some(func) = &mut self.current_func {
             func.add_pseudo(sym);
             // Register as a pointer variable, not as the array type
-            let mods = self.types.modifiers(typ);
-            let is_volatile = self.types.contains_volatile(typ);
-            let is_atomic = mods.contains(TypeModifiers::ATOMIC);
             func.add_local(
                 &unique_name,
                 sym_id,
                 ptr_type,
-                is_volatile,
-                is_atomic,
                 self.current_bb,
                 declarator.explicit_align, // VLA explicit alignment
             );
@@ -1005,6 +995,8 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) {
         match self.types.kind(typ) {
             TypeKind::Array => {
+                // `qualified_with` already puts an array's qualifiers on its
+                // element type (C17 6.7.3p10), so the element is the subobject.
                 let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
 
                 // `char b[] = {"hi"}` initializes *this* array with the
@@ -1111,23 +1103,29 @@ impl<'a> super::linearize::Linearizer<'a> {
                     {
                         let src_addr = self.linearize_lvalue(&elements[0].value);
                         let target_size_bytes = self.types.size_bytes(typ);
+                        let vol = self.block_volatility(typ, expr_type);
                         self.emit_block_copy_at_offset(
                             base_sym,
                             base_offset,
                             src_addr,
                             target_size_bytes as i64,
+                            vol,
                         );
                         return;
                     }
                 }
 
+                // What every member inherits from the object: taken before
+                // resolving, which answers with the tag's unqualified type.
+                let object_quals = self.types.qualifiers(typ);
                 let resolved_typ = self.resolve_struct_type(typ);
                 if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
                     let members: Vec<_> = composite.members.clone();
                     let is_union = self.types.kind(resolved_typ) == TypeKind::Union;
 
-                    let visits =
+                    let mut visits =
                         self.walk_struct_init_fields(resolved_typ, &members, is_union, elements);
+                    self.admit_fam_visits(&mut visits, &members, InitStorage::Automatic);
 
                     // C17 6.7.9p19 resolves two initializers for overlapping
                     // storage by subobject. Storing them in list order is
@@ -1139,15 +1137,32 @@ impl<'a> super::linearize::Linearizer<'a> {
                     for visit in visits {
                         let held = self.held_union_members(visit.typ, &visit.kind, visit.offset);
                         if let Some(reset) = self.init_override_reset(&mut written, &visit, held) {
+                            let volatile = self.types.contains_volatile(typ);
                             self.emit_block_zero(
                                 base_sym,
                                 base_offset + reset.start as i64,
                                 (reset.end - reset.start) as i64,
+                                volatile,
                             );
                         }
 
                         let offset = base_offset + visit.offset as i64;
                         let field_type = visit.typ;
+                        // Placed in the object being initialized, not in the
+                        // aggregate the visit walked.
+                        let bitfield = visit.bitfield().map(|bf| crate::types::Bitfield {
+                            offset: offset as usize,
+                            ..bf
+                        });
+                        // The member as a subobject of this object: a store
+                        // into a `volatile` object is a volatile access even
+                        // where the member was not declared so.
+                        let inherits_volatile =
+                            (object_quals | visit.quals).contains(TypeModifiers::VOLATILE);
+                        let outer_volatile_object = self.volatile_init_object;
+                        if inherits_volatile {
+                            self.volatile_init_object = Some(base_sym);
+                        }
 
                         match visit.kind {
                             StructFieldVisitKind::BraceElision(sub_elements) => {
@@ -1159,9 +1174,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 );
                             }
                             StructFieldVisitKind::Expr(expr) => {
-                                if let (Some(bit_off), Some(bit_w), Some(storage_size)) =
-                                    (visit.bit_offset, visit.bit_width, visit.access_bytes)
-                                {
+                                if let Some(bf) = bitfield {
                                     let val = self.linearize_expr(&expr);
                                     let val_type = self.expr_type(&expr);
 
@@ -1171,15 +1184,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                                     // conversion normalizing to 0/1 (6.3.1.2), so
                                     // `struct { _Bool f:1; } v = {2};` stores 1.
                                     let member_val = self.emit_convert(val, val_type, field_type);
-                                    self.emit_bitfield_store(
-                                        base_sym,
-                                        offset as usize,
-                                        bit_off,
-                                        bit_w,
-                                        storage_size,
-                                        member_val,
-                                        field_type,
-                                    );
+                                    self.emit_bitfield_store(base_sym, bf, member_val, field_type);
                                 } else {
                                     self.linearize_struct_field_init(
                                         base_sym, offset, field_type, &expr,
@@ -1187,6 +1192,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 }
                             }
                         }
+                        self.volatile_init_object = outer_volatile_object;
                     }
                 }
             }
@@ -1245,9 +1251,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Only the bytes the field's own bits reach; its access span is
             // wider and covers bytes other members own.
             (Some(bit_offset), Some(bit_width)) => {
-                let start = visit.offset + (bit_offset / 8) as usize;
-                let end = visit.offset + (bit_offset + bit_width).div_ceil(8) as usize;
-                start..end.max(start + 1)
+                crate::types::own_bit_bytes(visit.offset, bit_offset, bit_width)
             }
             _ => visit.offset..visit.offset + visit.field_size,
         };
@@ -1892,7 +1896,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let name = format!("__goto_target.{}", slot.0);
         if let Some(func) = &mut self.current_func {
             func.add_pseudo(crate::ir::Pseudo::sym(slot, name.clone()));
-            func.add_local(&name, slot, void_ptr, false, false, None, None);
+            func.add_local(&name, slot, void_ptr, None, None);
         }
 
         let dispatch_bb = self.alloc_bb();
@@ -2319,7 +2323,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         if matches!(tail, StringTail::Zero) {
             let start = base_offset + (written as i64) * elem_bytes;
             let bytes = (capacity - written) as i64 * elem_bytes;
-            self.emit_block_zero(base_sym, start, bytes);
+            let volatile = self.types.contains_volatile(arr_typ);
+            self.emit_block_zero(base_sym, start, bytes, volatile);
         }
     }
 
@@ -2560,7 +2565,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.compound_literal_counter += 1;
                 let typ = *typ;
                 let elements = elements.clone();
-                let init = self.ast_init_list_to_ir(&elements, typ);
+                let init = self.new_static_object_init(&elements, typ);
                 self.module.add_global(&name, typ, init);
                 Some((name, 0))
             }
@@ -2596,13 +2601,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             ExprKind::Member { expr: base, member } => {
                 // Recursively evaluate the base address
                 let (name, base_offset) = self.eval_static_address(base)?;
-
-                // Get the offset of the member in the struct
-                let base_type = base.typ?;
-                let struct_type = self.resolve_struct_type(base_type);
-                let member_info = self.types.find_member(struct_type, *member)?;
-
-                Some((name, base_offset + member_info.offset as i64))
+                let (at, _) = crate::constexpr::member_at(self, base.typ?, *member)?;
+                Some((name, base_offset + at as i64))
             }
 
             // Arrow access: expr->member (pointer dereference + member access)
@@ -2610,11 +2610,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             // (e.g., (&static_struct.field)->subfield in CPython macros)
             ExprKind::Arrow { expr: base, member } => {
                 let (name, base_offset) = self.eval_static_address(base)?;
-                let ptr_type = base.typ?;
-                let pointee_type = self.types.base_type(ptr_type)?;
-                let struct_type = self.resolve_struct_type(pointee_type);
-                let member_info = self.types.find_member(struct_type, *member)?;
-                Some((name, base_offset + member_info.offset as i64))
+                let pointee = self.types.base_type(base.typ?)?;
+                let (at, _) = crate::constexpr::member_at(self, pointee, *member)?;
+                Some((name, base_offset + at as i64))
             }
 
             // Array subscript: array[index]
@@ -2697,7 +2695,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         case_bbs: &[BasicBlockId],
         default_target: BasicBlockId,
     ) {
-        let size = self.types.size_bits(cmp_type);
         // `>=` and `<=` for a range, in the controlling type's own signedness
         // -- the same `conv` that converted the labels, so the comparison and
         // the constants it compares are describing one type.
@@ -2713,31 +2710,25 @@ impl<'a> super::linearize::Linearizer<'a> {
                 (lo, hi),
                 "a case label reaches lowering already converted to the controlling type"
             );
-            let Some(from) = self.current_bb else { return };
             let next = self.alloc_bb();
             let cond = if lo == hi {
                 let k = self.emit_const(lo, cmp_type);
-                self.emit_int_binop(Opcode::SetEq, switch_val, k, cmp_type, size)
+                self.emit_compare(Opcode::SetEq, switch_val, k, cmp_type)
             } else {
                 // A GNU `case lo ... hi:` range.
                 let lo_k = self.emit_const(lo, cmp_type);
                 let hi_k = self.emit_const(hi, cmp_type);
-                let at_least = self.emit_int_binop(ge, switch_val, lo_k, cmp_type, size);
-                let at_most = self.emit_int_binop(le, switch_val, hi_k, cmp_type, size);
+                let at_least = self.emit_compare(ge, switch_val, lo_k, cmp_type);
+                let at_most = self.emit_compare(le, switch_val, hi_k, cmp_type);
                 let int_typ = self.types.int_id;
                 let int_bits = self.types.size_bits(int_typ);
                 self.emit_int_binop(Opcode::And, at_least, at_most, int_typ, int_bits)
             };
-            self.emit(Instruction::cbr(cond, case_bb, next));
-            self.link_bb(from, case_bb);
-            self.link_bb(from, next);
+            self.branch_on(Controlling::Value(cond), case_bb, next);
             self.switch_bb(next);
         }
 
-        if let Some(from) = self.current_bb {
-            self.emit(Instruction::br(default_target));
-            self.link_bb(from, default_target);
-        }
+        self.link_to_merge_if_needed(default_target);
     }
 
     pub(crate) fn linearize_switch_body(
@@ -3181,7 +3172,19 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Get symbolic name if present
             let name = op.name.map(|n| self.str(n).to_string());
 
+            // A value operand is the expression's value, and an array or a
+            // function there has decayed to a pointer (C17 6.3.2.1p3-4): its
+            // width is the pointer's, not the array's. A memory operand is the
+            // object itself and keeps the object's size.
             let typ = self.expr_type(&op.expr);
+            let typ = match self.types.kind(typ) {
+                TypeKind::Array if !is_memory => {
+                    let elem = self.types.base_type(typ).unwrap_or(typ);
+                    self.types.pointer_to(elem)
+                }
+                TypeKind::Function if !is_memory => self.types.pointer_to(typ),
+                _ => typ,
+            };
             let size = self.types.size_bits(typ);
 
             // For matching constraints (like "0"), we need to load the input value
@@ -4619,5 +4622,44 @@ mod jump_scope_tests {
         assert_eq!(w.stray_jumps.len(), 1);
         let w = walk_of("int f(int x) { for (;;) { x = ({ if (x) break; x; }); } return x; }");
         assert!(w.stray_jumps.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod asm_operand_tests {
+    use crate::ir::linearize::test_linearize::linearize_source;
+    use crate::ir::Opcode;
+    use crate::target::Target;
+
+    /// A register operand of array or function type is the pointer it
+    /// decays to, sixty-four bits wide; a memory operand keeps the object's
+    /// size.
+    #[test]
+    fn an_array_value_operand_is_pointer_wide() {
+        let module = linearize_source(
+            "long a[4];\n\
+             int g(void);\n\
+             void f(void) {\n\
+             __asm__ volatile(\"\" : : \"r\"(a), \"r\"(g), \"m\"(a));\n\
+             }\n",
+            &Target::host(),
+        );
+        let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+        let asm = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .find(|i| i.op == Opcode::Asm)
+            .unwrap();
+        let sizes: Vec<u32> = asm
+            .extra()
+            .asm_data
+            .as_ref()
+            .unwrap()
+            .inputs
+            .iter()
+            .map(|c| c.size)
+            .collect();
+        assert_eq!(sizes, [64, 64, 256]);
     }
 }

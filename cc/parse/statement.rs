@@ -17,6 +17,9 @@ use gettextrs::gettext;
 
 impl Parser<'_> {
     pub fn parse_statement(&mut self) -> ParseResult<Stmt> {
+        if self.at_attribute_declaration() {
+            return self.parse_attribute_statement();
+        }
         // Check for keywords
         if let Some(name_id) = self.current_ident() {
             match name_id {
@@ -129,6 +132,14 @@ impl Parser<'_> {
         self.parse_in_block(Self::parse_statement)
     }
 
+    /// The controlling expression of `if`, `while`, `do` or `for`, which
+    /// shall have scalar type (C17 6.8.4.1p1, 6.8.5p2).
+    fn parse_controlling_expression(&mut self) -> ParseResult<Expr> {
+        let cond = self.parse_expression()?;
+        self.check_truth_value(&cond);
+        Ok(cond)
+    }
+
     fn parse_if_stmt(&mut self) -> ParseResult<Stmt> {
         self.parse_in_block(Self::parse_if_stmt_in_block)
     }
@@ -136,7 +147,7 @@ impl Parser<'_> {
     fn parse_if_stmt_in_block(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'if'
         self.expect_special(b'(')?;
-        let cond = self.parse_expression()?;
+        let cond = self.parse_controlling_expression()?;
         self.expect_special(b')')?;
         let then_stmt = self.parse_substatement()?;
 
@@ -161,7 +172,7 @@ impl Parser<'_> {
     fn parse_while_stmt_in_block(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'while'
         self.expect_special(b'(')?;
-        let cond = self.parse_expression()?;
+        let cond = self.parse_controlling_expression()?;
         self.expect_special(b')')?;
         let body = self.parse_substatement()?;
 
@@ -186,7 +197,7 @@ impl Parser<'_> {
         self.advance();
 
         self.expect_special(b'(')?;
-        let cond = self.parse_expression()?;
+        let cond = self.parse_controlling_expression()?;
         self.expect_special(b')')?;
         self.expect_special(b';')?;
 
@@ -229,7 +240,7 @@ impl Parser<'_> {
             self.advance();
             None
         } else {
-            let expr = self.parse_expression()?;
+            let expr = self.parse_controlling_expression()?;
             self.expect_special(b';')?;
             Some(expr)
         };
@@ -299,7 +310,10 @@ impl Parser<'_> {
         // flat sibling marker and the statement it prefixed was not part of
         // it. It only ever reached the labels at the top of the body, which
         // is why a `case` nested inside an unbraced `if` escaped the switch.
-        self.parse_substatement()
+        self.switch_depth += 1;
+        let body = self.parse_substatement();
+        self.switch_depth -= 1;
+        body
     }
 
     /// Parse a case label, including the GNU range form `case lo ... hi:`.
@@ -349,7 +363,9 @@ impl Parser<'_> {
     fn parse_block_items(&mut self) -> ParseResult<Vec<BlockItem>> {
         let mut items = Vec::new();
         while !self.is_special(b'}') && !self.is_eof() {
-            if self.is_declaration_start() {
+            // An attribute declaration starts like a declaration but is a
+            // statement: `__attribute__((fallthrough));`.
+            if self.is_declaration_start() && !self.at_attribute_declaration() {
                 let decl = self.parse_declaration_and_bind()?;
                 items.push(BlockItem::Declaration(decl));
             } else {

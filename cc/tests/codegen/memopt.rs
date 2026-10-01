@@ -19,7 +19,10 @@ use crate::codegen::asm_probe::{
     asm_for_with, assert_body_contains, assert_body_lacks, body_of, count_in_body, AARCH64_LINUX,
     X86_64_LINUX,
 };
-use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_two_units, run_c17};
+use crate::common::{
+    compile_and_run, compile_and_run_aarch64, compile_and_run_optimized, compile_and_run_two_units,
+    run_c17,
+};
 
 fn at_o2(name: &str, code: &str) -> i32 {
     compile_and_run(name, code, &["-O2".to_string()])
@@ -1544,6 +1547,37 @@ void probe_second(void) { vqobj.b; }
     }
 }
 
+/// A copy out of a `volatile` aggregate reads it, even when nothing uses the
+/// copy (C17 5.1.2.3p6).
+///
+/// A struct too wide for one register is copied in integer chunks, and the
+/// chunks carried no volatile marker, so `struct S t = vstructobj;` with `t`
+/// unused lost every read from `-O1` up on both targets. The copy is of a
+/// named global so that the object's name in the body is the access itself.
+#[test]
+fn memopt_a_copy_out_of_a_volatile_aggregate_is_performed() {
+    let src = "\
+struct S { int a, b, c; };
+volatile struct S vstructobj;
+struct { volatile struct { int a; }; int b; } vanonobj;
+void probe_copy(void) { struct S t = vstructobj; (void)t; }
+void probe_anon(void) { vanonobj.a; }
+";
+    for level in ["-O0", "-O1", "-O2"] {
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            let asm = asm_for_with("vol_copy", triple, src, &[level]);
+            for (func, object) in [("probe_copy", "vstructobj"), ("probe_anon", "vanonobj")] {
+                assert_body_contains(
+                    &asm,
+                    func,
+                    object,
+                    &format!("{func} at {level} on {triple} must still read `{object}`"),
+                );
+            }
+        }
+    }
+}
+
 /// The control for the test above: an ordinary aggregate's member read is still
 /// deleted, so that test cannot pass by marking every member access volatile.
 #[test]
@@ -1681,4 +1715,196 @@ void probe(void) { pbfqobj.f; }
             "reading an ordinary bit-field has no effect and is dead code",
         );
     }
+}
+
+/// No copy survives optimization when every one of them is a no-op.
+///
+/// Promotion out of memory gives every read of a local its own `Copy`, and
+/// nothing removed them: five ordinary functions came out of `-O2` with more
+/// than a quarter of their IR as copies and close to half their instructions
+/// as register-to-register moves, and aarch64 swapped `a + b`'s operands
+/// through a temporary. Copy propagation forwards each use to the source.
+#[test]
+fn memopt_no_op_copies_are_propagated_away() {
+    let src = "\
+int add2(int a, int b) { return a + b; }
+long sum(const long *p, int n) { long s = 0; for (int i = 0; i < n; i++) s += p[i]; return s; }
+int maxi(int a, int b, int c) { int m = a; if (b > m) m = b; if (c > m) m = c; return m; }
+unsigned hash(const char *s) { unsigned h = 5381; while (*s) h = h * 33 + (unsigned char)*s++; return h; }
+";
+    for target in [X86_64_LINUX, AARCH64_LINUX] {
+        let ir = post_opt_ir("copyprop", src, target);
+        let copies: Vec<&str> = ir.lines().filter(|l| l.contains("= copy.")).collect();
+        assert!(
+            copies.is_empty(),
+            "{target}: copies left:\n{}",
+            copies.join("\n")
+        );
+    }
+    // And the program still computes what it did.
+    let run = format!(
+        "{src}int main(void) {{ long a[] = {{1, 2, 3}}; \
+         return add2(2, 3) == 5 && sum(a, 3) == 6 && maxi(1, 7, 3) == 7 \
+         && hash(\"\") == 5381 ? 0 : 1; }}\n"
+    );
+    assert_eq!(compile_and_run_optimized("copyprop_run", &run), 0);
+}
+
+/// Each `strlen` below folds only once the `printf` guarding the one before
+/// it is proved dead and deleted -- the call sees the array, so it stands
+/// between the two -- which makes a chain one fold per round of the
+/// optimizer's loop, longer than its iteration cap. A function cut off there
+/// is less optimized, never wrong; and one that does reach its fixed point is
+/// not reported under `--dump-ir`.
+#[test]
+fn memopt_a_function_cut_off_by_the_iteration_cap_is_still_correct() {
+    let check = "{ const char *s = (E); unsigned n = __builtin_strlen(s); \
+                 if (n != N) { __builtin_printf(\"%s\\n\", s); ++fails; } }";
+    let mut body = String::new();
+    for k in 0..16 {
+        let step = check
+            .replace('E', &format!("&a[{}]", k % 4))
+            .replace('N', &(4 - k % 4).to_string());
+        body.push_str(&step);
+        body.push('\n');
+    }
+    let src = format!(
+        "unsigned fails;\n\
+         static void chain(void) {{\n\
+         const char a[] = \"1234\";\n\
+         {body}}}\n\
+         int main(void) {{ chain(); return fails != 0; }}\n"
+    );
+    assert_eq!(at_o2("itercap", &src), 0);
+    if let Some(rc) = compile_and_run_aarch64("itercap", &src, "-O2") {
+        assert_eq!(rc, 0, "aarch64");
+    }
+
+    let ir = post_opt_ir(
+        "itercap_note",
+        "int f(int x) { return x + 1; }\n",
+        X86_64_LINUX,
+    );
+    assert!(
+        !ir.contains("did not reach a fixed point"),
+        "a converged function is not reported:\n{ir}"
+    );
+}
+
+/// A store reaches a load in a loop when every way round goes back through
+/// the store: what the latch writes *after* the load is overwritten before
+/// the load runs again. Both functions read `a[0]` only where the loop has
+/// just stored it, so the one load left is `out[i]`.
+#[test]
+fn memopt_a_store_in_a_loop_reaches_its_load() {
+    let src = "\
+int same_block(int n) {
+    int a[2];
+    int s = 0;
+    for (int i = 0; i < n; i++) {
+        a[0] = i;
+        s += a[0];
+        a[0] = 5;
+    }
+    return s;
+}
+int header_to_body(int n, int *out) {
+    int a[2];
+    int s = 0;
+    for (int i = 0; i < n; i++) {
+        a[0] = i * 3;
+        if (out[i])
+            s += a[0];
+        a[0] = 1;
+    }
+    return s;
+}
+";
+    for target in [X86_64_LINUX, AARCH64_LINUX] {
+        let ir = post_opt_ir("loopfwd", src, target);
+        let loads: Vec<&str> = ir.lines().filter(|l| l.contains("= load.")).collect();
+        assert_eq!(loads.len(), 1, "{target}: only out[i] is loaded:\n{ir}");
+    }
+    let run = format!(
+        "{src}int main(void) {{ int out[4] = {{1, 0, 1, 1}}; \
+         return same_block(4) == 6 && header_to_body(4, out) == 15 ? 0 : 1; }}\n"
+    );
+    assert_eq!(at_o2("loopfwd_run", &run), 0);
+    if let Some(rc) = compile_and_run_aarch64("loopfwd_run", &run, "-O2") {
+        assert_eq!(rc, 0, "aarch64");
+    }
+}
+
+/// A `const` global read through a pointer to it is its initializer, as a
+/// read by name is: the load's address is resolved the way every memory pass
+/// resolves one.
+#[test]
+fn memopt_a_const_global_read_through_its_address_folds() {
+    let src = "\
+static const int k = 5;
+int through_pointer(void) { const int *p = &k; return *p; }
+";
+    for target in [X86_64_LINUX, AARCH64_LINUX] {
+        let ir = post_opt_ir("constptr", src, target);
+        assert!(!ir.contains("= load."), "{target}: k is folded:\n{ir}");
+    }
+    let run = format!("{src}int main(void) {{ return through_pointer() != 5; }}\n");
+    assert_eq!(at_o2("constptr_run", &run), 0);
+}
+
+/// Every `br B` in dumped IR whose target no other branch names: a block
+/// that could have been merged into its only predecessor.
+fn mergeable_pairs(ir: &str) -> Vec<String> {
+    let is_branch =
+        |l: &str| l.starts_with("br ") || l.starts_with("cbr ") || l.starts_with("switch");
+    let mut refs: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for l in ir.lines().map(str::trim).filter(|l| is_branch(l)) {
+        for t in l
+            .split([' ', ','])
+            .filter(|t| t.starts_with(".L") || t.contains("_bb"))
+        {
+            *refs.entry(t).or_default() += 1;
+        }
+    }
+    ir.lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("br "))
+        .filter(|t| refs.get(t) == Some(&1))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Once optimization has removed what made a block more than a branch, the
+/// block goes: every edge into it is sent where it was forwarding, and a
+/// block left with one predecessor that has one successor is merged into it.
+#[test]
+fn memopt_no_block_is_left_only_branching() {
+    let src = "\
+int chain(int x) {
+    if (x > 0)
+        x = x * 2;
+    else
+        x = x * 3;
+    if (1)
+        x++;
+    return x;
+}
+int pick(int c, int a, int b) {
+    int r = a;
+    if (c == 1) r = b;
+    if (c == 2) r = a + b;
+    while (r > 100) r -= 7;
+    return r;
+}
+";
+    for target in [X86_64_LINUX, AARCH64_LINUX] {
+        let ir = post_opt_ir("cfgsimp", src, target);
+        let pairs = mergeable_pairs(&ir);
+        assert!(pairs.is_empty(), "{target}: {pairs:?}\n{ir}");
+    }
+    let run = format!(
+        "{src}int main(void) {{ return chain(3) == 7 && chain(-1) == -2 \
+         && pick(1, 5, 9) == 9 && pick(2, 60, 70) == 95 ? 0 : 1; }}\n"
+    );
+    assert_eq!(at_o2("cfgsimp_run", &run), 0);
 }

@@ -1731,15 +1731,16 @@ impl<'a> Preprocessor<'a> {
 
         match builtin {
             BuiltinMacro::HasAttribute => {
+                let arch = self.target.arch;
                 if let Some(id) = arg_id {
-                    crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR)
+                    crate::kw::attribute_supported(id, arch)
                 } else {
                     // One table decides this. A second hardcoded list here
                     // had already drifted from it in both directions.
                     let name = self.token_to_string(first_tok, idents);
                     idents
                         .lookup(&name)
-                        .is_some_and(|id| crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR))
+                        .is_some_and(|id| crate::kw::attribute_supported(id, arch))
                 }
             }
             BuiltinMacro::HasBuiltin => {

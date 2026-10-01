@@ -784,17 +784,20 @@ pub enum Aarch64Inst {
         addr: MemAddr,
     },
 
-    /// LDAXR - Load-Acquire Exclusive Register (LL/SC baseline ARMv8.0)
-    /// Used for atomic read-modify-write operations
-    Ldaxr {
+    /// LDXR, or LDAXR when `acquire` - Load Exclusive Register (LL/SC
+    /// baseline ARMv8.0). Used for atomic read-modify-write operations
+    Ldxr {
+        acquire: bool,
         size: OperandSize,
         addr: MemAddr,
         dst: Reg,
     },
 
-    /// STLXR - Store-Release Exclusive Register (LL/SC baseline ARMv8.0)
-    /// Returns 0 on success, 1 on failure (exclusive monitor lost)
-    Stlxr {
+    /// STXR, or STLXR when `release` - Store Exclusive Register (LL/SC
+    /// baseline ARMv8.0). Returns 0 on success, 1 on failure (exclusive
+    /// monitor lost)
+    Stxr {
+        release: bool,
         size: OperandSize,
         src: Reg,
         addr: MemAddr,
@@ -862,8 +865,6 @@ pub enum Aarch64Inst {
 pub enum DmbOption {
     /// Inner Shareable full barrier
     Ish,
-    /// Inner Shareable store barrier
-    Ishst,
     /// Inner Shareable load barrier
     Ishld,
 }
@@ -1457,17 +1458,22 @@ impl EmitAsm for Aarch64Inst {
             Aarch64Inst::Ldar { size, addr, dst } => Self::emit_ldar(size, addr, dst, out),
             Aarch64Inst::Stlr { size, src, addr } => Self::emit_stlr(size, src, addr, out),
             // Atomic LL/SC Operations (baseline ARMv8.0)
-            Aarch64Inst::Ldaxr { size, addr, dst } => Self::emit_ldaxr(size, addr, dst, out),
-            Aarch64Inst::Stlxr {
+            Aarch64Inst::Ldxr {
+                acquire,
+                size,
+                addr,
+                dst,
+            } => Self::emit_ldxr(*acquire, size, addr, dst, out),
+            Aarch64Inst::Stxr {
+                release,
                 size,
                 src,
                 addr,
                 status,
-            } => Self::emit_stlxr(size, src, addr, status, out),
+            } => Self::emit_stxr(*release, size, src, addr, status, out),
             Aarch64Inst::Dmb { option } => {
                 let opt = match option {
                     DmbOption::Ish => "ish",
-                    DmbOption::Ishst => "ishst",
                     DmbOption::Ishld => "ishld",
                 };
                 let _ = writeln!(out, "    dmb {}", opt);
@@ -2046,38 +2052,48 @@ impl Aarch64Inst {
     }
 
     // Atomic LL/SC Operations (baseline ARMv8.0)
-    fn emit_ldaxr(size: &OperandSize, addr: &MemAddr, dst: &Reg, out: &mut String) {
-        let insn = match size {
-            OperandSize::B8 => "ldaxrb",
-            OperandSize::B16 => "ldaxrh",
-            OperandSize::B32 | OperandSize::B64 => "ldaxr",
-        };
+    fn emit_ldxr(acquire: bool, size: &OperandSize, addr: &MemAddr, dst: &Reg, out: &mut String) {
+        let insn = if acquire { "ldaxr" } else { "ldxr" };
         let sz = size.bits().max(32);
         let _ = writeln!(
             out,
-            "    {} {}, {}",
+            "    {}{} {}, {}",
             insn,
+            exclusive_width_suffix(size),
             dst.name_for_size(sz),
             addr.format()
         );
     }
 
-    fn emit_stlxr(size: &OperandSize, src: &Reg, addr: &MemAddr, status: &Reg, out: &mut String) {
-        let insn = match size {
-            OperandSize::B8 => "stlxrb",
-            OperandSize::B16 => "stlxrh",
-            OperandSize::B32 | OperandSize::B64 => "stlxr",
-        };
+    fn emit_stxr(
+        release: bool,
+        size: &OperandSize,
+        src: &Reg,
+        addr: &MemAddr,
+        status: &Reg,
+        out: &mut String,
+    ) {
+        let insn = if release { "stlxr" } else { "stxr" };
         let sz = size.bits().max(32);
         // Status is always W register
         let _ = writeln!(
             out,
-            "    {} {}, {}, {}",
+            "    {}{} {}, {}, {}",
             insn,
+            exclusive_width_suffix(size),
             status.name_for_size(32),
             src.name_for_size(sz),
             addr.format()
         );
+    }
+}
+
+/// The `b`/`h` suffix an exclusive access of `size` carries.
+fn exclusive_width_suffix(size: &OperandSize) -> &'static str {
+    match size {
+        OperandSize::B8 => "b",
+        OperandSize::B16 => "h",
+        OperandSize::B32 | OperandSize::B64 => "",
     }
 }
 

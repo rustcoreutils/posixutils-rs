@@ -45,6 +45,10 @@ pub const TYPE_KEYWORD: u32 = 1 << 13;
 /// separates standard C from GNU extensions (`FOO` vs `GNU_FOO`), because that
 /// lives in the Rust const identifier and is not queryable at runtime.
 pub const RESERVED_NAME: u32 = 1 << 14;
+/// An attribute or builtin gcc knows only on x86-64: the calling-convention
+/// attributes and the Microsoft `va_list` builtins. Anywhere else gcc has
+/// never heard of the name, so neither has c17 -- see [`exists_on`].
+pub const X86_64_ONLY: u32 = 1 << 15;
 
 /// Composite: all tags that start a declaration
 pub const DECL_START: u32 =
@@ -151,9 +155,11 @@ define_keywords! {
     (GNU_COMPLEX,       "__complex__",       TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
     (GNU_COMPLEX2,      "__complex",         TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
     // C99 6.4.1 reserves `_Imaginary` whether or not imaginary types are
-    // provided (Annex G makes the types optional, not the keyword), so the
-    // name is reserved here without a type behind it.
-    (_,                 "_Imaginary",        RESERVED_NAME),
+    // provided (Annex G makes the types optional, not the keyword). It is
+    // tagged as the type specifier it is, so that it starts a declaration or
+    // a type name and reaches the one diagnostic for it in the specifier
+    // loop; c17 provides no type behind it.
+    (IMAGINARY,         "_Imaginary",        TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
     (FLOAT16,           "_Float16",          TYPE_SPEC | TYPE_KEYWORD),
     (FLOAT32,           "_Float32",          TYPE_SPEC | TYPE_KEYWORD),
     (FLOAT64,           "_Float64",          TYPE_SPEC | TYPE_KEYWORD),
@@ -163,6 +169,7 @@ define_keywords! {
     (INT128_T,          "__int128_t",        TYPE_SPEC | TYPE_KEYWORD),
     (UINT128_T,         "__uint128_t",       TYPE_SPEC | TYPE_KEYWORD),
     (BUILTIN_VA_LIST,   "__builtin_va_list", TYPE_SPEC | TYPE_KEYWORD | BUILTIN),
+    (BUILTIN_MS_VA_LIST, "__builtin_ms_va_list", TYPE_SPEC | TYPE_KEYWORD | BUILTIN | X86_64_ONLY),
     (STRUCT,            "struct",            TYPE_SPEC | TYPE_KEYWORD),
     (UNION,             "union",             TYPE_SPEC | TYPE_KEYWORD),
     (ENUM,              "enum",              TYPE_SPEC | TYPE_KEYWORD),
@@ -286,6 +293,11 @@ define_keywords! {
     (BUILTIN_VA_END,    "__builtin_va_end",   BUILTIN),
     (BUILTIN_VA_ARG,    "__builtin_va_arg",   BUILTIN),
     (BUILTIN_VA_COPY,   "__builtin_va_copy",  BUILTIN),
+    // The Microsoft x64 `va_list`, for an `ms_abi` function; `va_arg` is
+    // the shared `__builtin_va_arg`, which the list's type steers.
+    (BUILTIN_MS_VA_START, "__builtin_ms_va_start", BUILTIN | X86_64_ONLY),
+    (BUILTIN_MS_VA_END,   "__builtin_ms_va_end",   BUILTIN | X86_64_ONLY),
+    (BUILTIN_MS_VA_COPY,  "__builtin_ms_va_copy",  BUILTIN | X86_64_ONLY),
     // Forwarding builtins: inside an `always_inline` variadic function these
     // name the *caller's* variadic arguments, and are resolved when it is
     // inlined. glibc forwards sprintf/printf into the `__*_chk` family with
@@ -310,6 +322,9 @@ define_keywords! {
     (BUILTIN_PARITY,    "__builtin_parity",   BUILTIN),
     (BUILTIN_PARITYL,   "__builtin_parityl",  BUILTIN),
     (BUILTIN_PARITYLL,  "__builtin_parityll", BUILTIN),
+    (BUILTIN_FFS,       "__builtin_ffs",      BUILTIN),
+    (BUILTIN_FFSL,      "__builtin_ffsl",     BUILTIN),
+    (BUILTIN_FFSLL,     "__builtin_ffsll",    BUILTIN),
     (BUILTIN_CHOOSE_EXPR, "__builtin_choose_expr", BUILTIN),
     // Builtins that are the library function of the same name; see
     // `is_library_builtin`. Listed so `__has_builtin` answers for them.
@@ -318,9 +333,6 @@ define_keywords! {
     (BUILTIN_ABS,       "__builtin_abs",      BUILTIN),
     (BUILTIN_LABS,      "__builtin_labs",     BUILTIN),
     (BUILTIN_LLABS,     "__builtin_llabs",    BUILTIN),
-    (BUILTIN_FFS,       "__builtin_ffs",      BUILTIN),
-    (BUILTIN_FFSL,      "__builtin_ffsl",     BUILTIN),
-    (BUILTIN_FFSLL,     "__builtin_ffsll",    BUILTIN),
     (BUILTIN_SQRT,      "__builtin_sqrt",     BUILTIN),
     (BUILTIN_COPYSIGN,  "__builtin_copysign", BUILTIN),
     // `bits/floatn.h` reaches for `__builtin_copysignf`, so the suffixed
@@ -784,22 +796,22 @@ define_keywords! {
     // never writes. `bits/string_fortified.h` calls
     // `__builtin___memcpy_chk` and expects the compiler to know
     // `__memcpy_chk` intrinsically.
-    (_,                 "__memcpy_chk",         0),
-    (_,                 "__memmove_chk",        0),
-    (_,                 "__mempcpy_chk",        0),
-    (_,                 "__memset_chk",         0),
-    (_,                 "__strcpy_chk",         0),
-    (_,                 "__stpcpy_chk",         0),
-    (_,                 "__strncpy_chk",        0),
-    (_,                 "__stpncpy_chk",        0),
-    (_,                 "__strcat_chk",         0),
-    (_,                 "__strncat_chk",        0),
-    (_,                 "__sprintf_chk",        0),
-    (_,                 "__snprintf_chk",       0),
+    (MEMCPY_CHK,        "__memcpy_chk",         0),
+    (MEMMOVE_CHK,       "__memmove_chk",        0),
+    (MEMPCPY_CHK,       "__mempcpy_chk",        0),
+    (MEMSET_CHK,        "__memset_chk",         0),
+    (STRCPY_CHK,        "__strcpy_chk",         0),
+    (STPCPY_CHK,        "__stpcpy_chk",         0),
+    (STRNCPY_CHK,       "__strncpy_chk",        0),
+    (STPNCPY_CHK,       "__stpncpy_chk",        0),
+    (STRCAT_CHK,        "__strcat_chk",         0),
+    (STRNCAT_CHK,       "__strncat_chk",        0),
+    (SPRINTF_CHK,       "__sprintf_chk",        0),
+    (SNPRINTF_CHK,      "__snprintf_chk",       0),
     (PRINTF_CHK,        "__printf_chk",         0),
     (FPRINTF_CHK,       "__fprintf_chk",        0),
-    (_,                 "__vsprintf_chk",       0),
-    (_,                 "__vsnprintf_chk",      0),
+    (VSPRINTF_CHK,      "__vsprintf_chk",       0),
+    (VSNPRINTF_CHK,     "__vsnprintf_chk",      0),
     (VPRINTF_CHK,       "__vprintf_chk",        0),
     (VFPRINTF_CHK,      "__vfprintf_chk",       0),
     // Same reason, for the builtins that are just the library function: a
@@ -810,146 +822,146 @@ define_keywords! {
     (_,                 "ffs",                  0),
     (_,                 "ffsl",                 0),
     (_,                 "ffsll",                0),
-    (_,                 "fmaxl",                0),
-    (_,                 "fminl",                0),
-    (_,                 "pow",                  0),
-    (_,                 "powf",                 0),
-    (_,                 "powl",                 0),
-    (_,                 "fmal",                 0),
-    (_,                 "bcmp",                 0),
-    (_,                 "bzero",                0),
-    (_,                 "stpncpy",              0),
-    (_,                 "strdup",               0),
-    (_,                 "nan",                  0),
-    (_,                 "nanf",                 0),
-    (_,                 "nanl",                 0),
-    (_,                 "nanf16",                0),
-    (_,                 "nanf32",                0),
-    (_,                 "nanf64",                0),
-    (_,                 "nanf128",               0),
-    (_,                 "strndup",              0),
-    (_,                 "cbrt",                   0),
-    (_,                 "cbrtf",                  0),
-    (_,                 "cbrtl",                  0),
-    (_,                 "ceill",                  0),
-    (_,                 "floorl",                 0),
-    (_,                 "truncl",                 0),
-    (_,                 "roundl",                 0),
-    (_,                 "rintl",                  0),
-    (_,                 "nearbyintl",             0),
-    (_,                 "sin",                    0),
-    (_,                 "sinf",                   0),
-    (_,                 "sinl",                   0),
-    (_,                 "cos",                    0),
-    (_,                 "cosf",                   0),
-    (_,                 "cosl",                   0),
-    (_,                 "tan",                    0),
-    (_,                 "tanf",                   0),
-    (_,                 "tanl",                   0),
-    (_,                 "asin",                   0),
-    (_,                 "asinf",                  0),
-    (_,                 "asinl",                  0),
-    (_,                 "acos",                   0),
-    (_,                 "acosf",                  0),
-    (_,                 "acosl",                  0),
-    (_,                 "atan",                   0),
-    (_,                 "atanf",                  0),
-    (_,                 "atanl",                  0),
-    (_,                 "sinh",                   0),
-    (_,                 "sinhf",                  0),
-    (_,                 "sinhl",                  0),
-    (_,                 "cosh",                   0),
-    (_,                 "coshf",                  0),
-    (_,                 "coshl",                  0),
-    (_,                 "tanh",                   0),
-    (_,                 "tanhf",                  0),
-    (_,                 "tanhl",                  0),
-    (_,                 "asinh",                  0),
-    (_,                 "asinhf",                 0),
-    (_,                 "asinhl",                 0),
-    (_,                 "acosh",                  0),
-    (_,                 "acoshf",                 0),
-    (_,                 "acoshl",                 0),
-    (_,                 "atanh",                  0),
-    (_,                 "atanhf",                 0),
-    (_,                 "atanhl",                 0),
-    (_,                 "exp",                    0),
-    (_,                 "expf",                   0),
-    (_,                 "expl",                   0),
-    (_,                 "exp2",                   0),
-    (_,                 "exp2f",                  0),
-    (_,                 "exp2l",                  0),
-    (_,                 "expm1",                  0),
-    (_,                 "expm1f",                 0),
-    (_,                 "expm1l",                 0),
-    (_,                 "log",                    0),
-    (_,                 "logf",                   0),
-    (_,                 "logl",                   0),
-    (_,                 "log2",                   0),
-    (_,                 "log2f",                  0),
-    (_,                 "log2l",                  0),
-    (_,                 "log10",                  0),
-    (_,                 "log10f",                 0),
-    (_,                 "log10l",                 0),
-    (_,                 "log1p",                  0),
-    (_,                 "log1pf",                 0),
-    (_,                 "log1pl",                 0),
-    (_,                 "logb",                   0),
-    (_,                 "logbf",                  0),
-    (_,                 "logbl",                  0),
-    (_,                 "tgamma",                 0),
-    (_,                 "tgammaf",                0),
-    (_,                 "tgammal",                0),
-    (_,                 "lgamma",                 0),
-    (_,                 "lgammaf",                0),
-    (_,                 "lgammal",                0),
-    (_,                 "erf",                    0),
-    (_,                 "erff",                   0),
-    (_,                 "erfl",                   0),
-    (_,                 "erfc",                   0),
-    (_,                 "erfcf",                  0),
-    (_,                 "erfcl",                  0),
-    (_,                 "fmod",                   0),
-    (_,                 "fmodf",                  0),
-    (_,                 "fmodl",                  0),
-    (_,                 "atan2",                  0),
-    (_,                 "atan2f",                 0),
-    (_,                 "atan2l",                 0),
-    (_,                 "hypot",                  0),
-    (_,                 "hypotf",                 0),
-    (_,                 "hypotl",                 0),
-    (_,                 "fdim",                   0),
-    (_,                 "fdimf",                  0),
-    (_,                 "fdiml",                  0),
-    (_,                 "remainder",              0),
-    (_,                 "remainderf",             0),
-    (_,                 "remainderl",             0),
-    (_,                 "nextafter",              0),
-    (_,                 "nextafterf",             0),
-    (_,                 "nextafterl",             0),
-    (_,                 "modf",                   0),
-    (_,                 "modff",                  0),
-    (_,                 "modfl",                  0),
-    (_,                 "frexp",                  0),
-    (_,                 "frexpf",                 0),
-    (_,                 "frexpl",                 0),
-    (_,                 "ldexp",                  0),
-    (_,                 "ldexpf",                 0),
-    (_,                 "ldexpl",                 0),
-    (_,                 "strcasecmp",             0),
-    (_,                 "strncasecmp",            0),
+    (FMAXL,             "fmaxl",                0),
+    (FMINL,             "fminl",                0),
+    (POW,               "pow",                  0),
+    (POWF,              "powf",                 0),
+    (POWL,              "powl",                 0),
+    (FMAL,              "fmal",                 0),
+    (BCMP,              "bcmp",                 0),
+    (BZERO,             "bzero",                0),
+    (STPNCPY,           "stpncpy",              0),
+    (STRDUP,            "strdup",               0),
+    (NAN,               "nan",                  0),
+    (NANF,              "nanf",                 0),
+    (NANL,              "nanl",                 0),
+    (NANF16,            "nanf16",                0),
+    (NANF32,            "nanf32",                0),
+    (NANF64,            "nanf64",                0),
+    (NANF128,           "nanf128",               0),
+    (STRNDUP,           "strndup",              0),
+    (CBRT,              "cbrt",                   0),
+    (CBRTF,             "cbrtf",                  0),
+    (CBRTL,             "cbrtl",                  0),
+    (CEILL,             "ceill",                  0),
+    (FLOORL,            "floorl",                 0),
+    (TRUNCL,            "truncl",                 0),
+    (ROUNDL,            "roundl",                 0),
+    (RINTL,             "rintl",                  0),
+    (NEARBYINTL,        "nearbyintl",             0),
+    (SIN,               "sin",                    0),
+    (SINF,              "sinf",                   0),
+    (SINL,              "sinl",                   0),
+    (COS,               "cos",                    0),
+    (COSF,              "cosf",                   0),
+    (COSL,              "cosl",                   0),
+    (TAN,               "tan",                    0),
+    (TANF,              "tanf",                   0),
+    (TANL,              "tanl",                   0),
+    (ASIN,              "asin",                   0),
+    (ASINF,             "asinf",                  0),
+    (ASINL,             "asinl",                  0),
+    (ACOS,              "acos",                   0),
+    (ACOSF,             "acosf",                  0),
+    (ACOSL,             "acosl",                  0),
+    (ATAN,              "atan",                   0),
+    (ATANF,             "atanf",                  0),
+    (ATANL,             "atanl",                  0),
+    (SINH,              "sinh",                   0),
+    (SINHF,             "sinhf",                  0),
+    (SINHL,             "sinhl",                  0),
+    (COSH,              "cosh",                   0),
+    (COSHF,             "coshf",                  0),
+    (COSHL,             "coshl",                  0),
+    (TANH,              "tanh",                   0),
+    (TANHF,             "tanhf",                  0),
+    (TANHL,             "tanhl",                  0),
+    (ASINH,             "asinh",                  0),
+    (ASINHF,            "asinhf",                 0),
+    (ASINHL,            "asinhl",                 0),
+    (ACOSH,             "acosh",                  0),
+    (ACOSHF,            "acoshf",                 0),
+    (ACOSHL,            "acoshl",                 0),
+    (ATANH,             "atanh",                  0),
+    (ATANHF,            "atanhf",                 0),
+    (ATANHL,            "atanhl",                 0),
+    (EXP,               "exp",                    0),
+    (EXPF,              "expf",                   0),
+    (EXPL,              "expl",                   0),
+    (EXP2,              "exp2",                   0),
+    (EXP2F,             "exp2f",                  0),
+    (EXP2L,             "exp2l",                  0),
+    (EXPM1,             "expm1",                  0),
+    (EXPM1F,            "expm1f",                 0),
+    (EXPM1L,            "expm1l",                 0),
+    (LOG,               "log",                    0),
+    (LOGF,              "logf",                   0),
+    (LOGL,              "logl",                   0),
+    (LOG2,              "log2",                   0),
+    (LOG2F,             "log2f",                  0),
+    (LOG2L,             "log2l",                  0),
+    (LOG10,             "log10",                  0),
+    (LOG10F,            "log10f",                 0),
+    (LOG10L,            "log10l",                 0),
+    (LOG1P,             "log1p",                  0),
+    (LOG1PF,            "log1pf",                 0),
+    (LOG1PL,            "log1pl",                 0),
+    (LOGB,              "logb",                   0),
+    (LOGBF,             "logbf",                  0),
+    (LOGBL,             "logbl",                  0),
+    (TGAMMA,            "tgamma",                 0),
+    (TGAMMAF,           "tgammaf",                0),
+    (TGAMMAL,           "tgammal",                0),
+    (LGAMMA,            "lgamma",                 0),
+    (LGAMMAF,           "lgammaf",                0),
+    (LGAMMAL,           "lgammal",                0),
+    (ERF,               "erf",                    0),
+    (ERFF,              "erff",                   0),
+    (ERFL,              "erfl",                   0),
+    (ERFC,              "erfc",                   0),
+    (ERFCF,             "erfcf",                  0),
+    (ERFCL,             "erfcl",                  0),
+    (FMOD,              "fmod",                   0),
+    (FMODF,             "fmodf",                  0),
+    (FMODL,             "fmodl",                  0),
+    (ATAN2,             "atan2",                  0),
+    (ATAN2F,            "atan2f",                 0),
+    (ATAN2L,            "atan2l",                 0),
+    (HYPOT,             "hypot",                  0),
+    (HYPOTF,            "hypotf",                 0),
+    (HYPOTL,            "hypotl",                 0),
+    (FDIM,              "fdim",                   0),
+    (FDIMF,             "fdimf",                  0),
+    (FDIML,             "fdiml",                  0),
+    (REMAINDER,         "remainder",              0),
+    (REMAINDERF,        "remainderf",             0),
+    (REMAINDERL,        "remainderl",             0),
+    (NEXTAFTER,         "nextafter",              0),
+    (NEXTAFTERF,        "nextafterf",             0),
+    (NEXTAFTERL,        "nextafterl",             0),
+    (MODF,              "modf",                   0),
+    (MODFF,             "modff",                  0),
+    (MODFL,             "modfl",                  0),
+    (FREXP,             "frexp",                  0),
+    (FREXPF,            "frexpf",                 0),
+    (FREXPL,            "frexpl",                 0),
+    (LDEXP,             "ldexp",                  0),
+    (LDEXPF,            "ldexpf",                 0),
+    (LDEXPL,            "ldexpl",                 0),
+    (STRCASECMP,        "strcasecmp",             0),
+    (STRNCASECMP,       "strncasecmp",            0),
     (_,                 "__clear_cache",        0),
-    (_,                 "abort",                0),
-    (_,                 "exit",                 0),
+    (ABORT,             "abort",                0),
+    (EXIT,              "exit",                 0),
     (PRINTF,            "printf",               0),
     (SPRINTF,           "sprintf",              0),
-    (_,                 "snprintf",             0),
+    (SNPRINTF,          "snprintf",             0),
     (PUTS,              "puts",                 0),
     // `malloc` is not listed here: it is already interned below as the
     // `__attribute__((malloc))` name, and one spelling is one entry.
-    (_,                 "calloc",               0),
-    (_,                 "realloc",              0),
-    (_,                 "free",                 0),
+    (CALLOC,            "calloc",               0),
+    (REALLOC,           "realloc",              0),
+    (FREE,              "free",                 0),
     (MEMCMP,            "memcmp",               0),
     (MEMPCPY,           "mempcpy",              0),
     (STRCPY,            "strcpy",               0),
@@ -967,7 +979,7 @@ define_keywords! {
     (RINDEX,            "rindex",               0),
     (PUTCHAR,           "putchar",              0),
     (STRCSPN,           "strcspn",              0),
-    (_,                 "strspn",                0),
+    (STRSPN,            "strspn",                0),
     (STRPBRK,           "strpbrk",              0),
     (PRINTF_UNLOCKED,   "printf_unlocked",      0),
     (FPRINTF_UNLOCKED,  "fprintf_unlocked",     0),
@@ -1004,7 +1016,7 @@ define_keywords! {
     (_, "format",               SUPPORTED_ATTR),
     (_, "fallthrough",          SUPPORTED_ATTR),
     (_, "nonstring",            SUPPORTED_ATTR),
-    (_, "malloc",               SUPPORTED_ATTR),
+    (MALLOC, "malloc",               SUPPORTED_ATTR),
     (_, "pure",                 SUPPORTED_ATTR),
     (_, "sentinel",             SUPPORTED_ATTR),
     (_, "no_sanitize_memory",   SUPPORTED_ATTR),
@@ -1012,8 +1024,10 @@ define_keywords! {
     (_, "no_sanitize_thread",   SUPPORTED_ATTR),
     (_, "gnu_inline",              SUPPORTED_ATTR),
     (_, "artificial",              SUPPORTED_ATTR),
-    (_, "sysv_abi",                SUPPORTED_ATTR),
-    (_, "ms_abi",                  SUPPORTED_ATTR),
+    (_, "sysv_abi",                SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "ms_abi",                  SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "mode",                    SUPPORTED_ATTR),
+    (_, "vector_size",             SUPPORTED_ATTR),
     // Parsed and ignored. Recognised so that a build does not drown in
     // warnings for the attributes glibc's headers put on everything; each
     // is semantically free, or free enough that ignoring it cannot change
@@ -1067,8 +1081,10 @@ define_keywords! {
     (_, "__no_sanitize_thread__",    SUPPORTED_ATTR),
     (_, "__gnu_inline__",            SUPPORTED_ATTR),
     (_, "__artificial__",            SUPPORTED_ATTR),
-    (_, "__sysv_abi__",              SUPPORTED_ATTR),
-    (_, "__ms_abi__",                SUPPORTED_ATTR),
+    (_, "__sysv_abi__",              SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "__ms_abi__",                SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "__mode__",                  SUPPORTED_ATTR),
+    (_, "__vector_size__",           SUPPORTED_ATTR),
     (_, "__nonnull__",               SUPPORTED_ATTR),
     (_, "__returns_nonnull__",       SUPPORTED_ATTR),
     (_, "__nothrow__",               SUPPORTED_ATTR),
@@ -1104,6 +1120,32 @@ define_keywords! {
 pub fn has_tag(id: StringId, mask: u32) -> bool {
     let idx = id.0 as usize;
     idx > 0 && idx <= KEYWORD_COUNT && KEYWORD_TAGS[idx - 1] & mask != 0
+}
+
+/// Does keyword `id` exist on a target of architecture `arch`?
+///
+/// Every keyword does, except an [`X86_64_ONLY`] one off x86-64: there it is
+/// an ordinary identifier, so an attribute of that name warns as unknown and
+/// `__has_attribute` answers 0, exactly as gcc for aarch64 does.
+pub fn exists_on(id: StringId, arch: crate::target::Arch) -> bool {
+    arch == crate::target::Arch::X86_64 || !has_tag(id, X86_64_ONLY)
+}
+
+/// [`exists_on`] for a spelling rather than an interned id: `__has_builtin`
+/// is asked about a name.
+pub fn spelling_exists_on(name: &str, arch: crate::target::Arch) -> bool {
+    arch == crate::target::Arch::X86_64
+        || !KEYWORD_STRINGS
+            .iter()
+            .zip(KEYWORD_TAGS.iter())
+            .any(|(s, &t)| *s == name && t & X86_64_ONLY != 0)
+}
+
+/// Is `id` an attribute c17 supports on a target of architecture `arch`?
+/// The one answer the parser's "directive ignored" warning and both
+/// `__has_attribute` evaluators give.
+pub fn attribute_supported(id: StringId, arch: crate::target::Arch) -> bool {
+    has_tag(id, SUPPORTED_ATTR) && exists_on(id, arch)
 }
 
 /// Every spelling in the table carrying any of `mask`.
@@ -1339,6 +1381,7 @@ mod tests {
             "__thread",
             "_Static_assert",
             "static_assert",
+            "_Imaginary",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);
@@ -1397,6 +1440,31 @@ mod tests {
         );
     }
 
+    /// The calling-convention attributes and the Microsoft `va_list`
+    /// builtins are gcc's on x86-64 only; elsewhere they are plain names.
+    #[test]
+    fn test_x86_64_only_names() {
+        use crate::target::Arch;
+        let table = StringTable::new();
+        for attr in ["ms_abi", "__ms_abi__", "sysv_abi", "__sysv_abi__"] {
+            let sid = id(&table, attr);
+            assert!(attribute_supported(sid, Arch::X86_64), "{attr}");
+            assert!(!attribute_supported(sid, Arch::Aarch64), "{attr}");
+        }
+        assert!(attribute_supported(id(&table, "noreturn"), Arch::Aarch64));
+        for name in [
+            "__builtin_ms_va_list",
+            "__builtin_ms_va_start",
+            "__builtin_ms_va_end",
+            "__builtin_ms_va_copy",
+        ] {
+            assert!(exists_on(id(&table, name), Arch::X86_64), "{name}");
+            assert!(!exists_on(id(&table, name), Arch::Aarch64), "{name}");
+            assert!(!spelling_exists_on(name, Arch::Aarch64), "{name}");
+        }
+        assert!(spelling_exists_on("__builtin_va_start", Arch::Aarch64));
+    }
+
     #[test]
     fn test_tags_supported_attr() {
         for &s in &[
@@ -1410,6 +1478,10 @@ mod tests {
             "__packed__",
             "always_inline",
             "__always_inline__",
+            "mode",
+            "__mode__",
+            "vector_size",
+            "__vector_size__",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);

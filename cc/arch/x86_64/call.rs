@@ -20,7 +20,8 @@ use std::collections::HashMap;
 
 /// The alignment a stacked argument must start on: its type's, at least 8.
 fn arg_align(insn: &Instruction, types: &TypeTable, i: usize) -> i32 {
-    insn.arg_types
+    insn.extra()
+        .arg_types
         .get(i)
         .map(|&t| types.alignment(t) as i32)
         .unwrap_or(8)
@@ -201,6 +202,7 @@ impl X86_64CodeGen {
         };
 
         let abi_info = insn
+            .extra()
             .abi_info
             .as_ref()
             .expect("abi_info must be populated for Call instructions");
@@ -212,7 +214,7 @@ impl X86_64CodeGen {
             // bytes rather than 16 and is classified COMPLEX_X87 (MEMORY), so
             // it must fall through to the Indirect arm below and get its real
             // size counted — not be treated as a 2-qword scalar.
-            let is_longdouble = insn.arg_types.get(i).is_some_and(|&ty| {
+            let is_longdouble = insn.extra().arg_types.get(i).is_some_and(|&ty| {
                 types.kind(ty) == TypeKind::LongDouble && !types.is_complex_float(ty)
             });
 
@@ -357,7 +359,8 @@ impl X86_64CodeGen {
     /// argument's offset from the area's base and the two only agree if the
     /// base itself is aligned.
     pub(super) fn outgoing_area_align(insn: &Instruction, types: &TypeTable) -> i32 {
-        insn.arg_types
+        insn.extra()
+            .arg_types
             .iter()
             .map(|t| types.alignment(*t) as i32)
             .fold(16, i32::max)
@@ -384,7 +387,7 @@ impl X86_64CodeGen {
         for (n, &i) in info.stack_arg_indices.iter().enumerate() {
             let base_off = info.stack_offsets[n];
             let arg = insn.src[i];
-            let arg_type = insn.arg_types.get(i).copied();
+            let arg_type = insn.extra().arg_types.get(i).copied();
 
             // MEMORY class first: a large aggregate, a `long double _Complex`,
             // or any complex value that ran out of registers — reaching this
@@ -525,7 +528,7 @@ impl X86_64CodeGen {
             if info.stack_arg_indices.contains(&i) || info.ignored_arg_indices.contains(&i) {
                 continue;
             }
-            let arg_type = insn.arg_types.get(i).copied();
+            let arg_type = insn.extra().arg_types.get(i).copied();
             let is_fp = if let Some(typ) = arg_type {
                 types.is_float(typ)
             } else {
@@ -549,7 +552,7 @@ impl X86_64CodeGen {
                 continue;
             }
             let arg = insn.src[i];
-            let arg_type = insn.arg_types.get(i).copied();
+            let arg_type = insn.extra().arg_types.get(i).copied();
             let is_fp = if let Some(typ) = arg_type {
                 types.is_float(typ)
             } else {
@@ -681,7 +684,7 @@ impl X86_64CodeGen {
                 continue;
             }
             let arg = insn.src[i];
-            let arg_type = insn.arg_types.get(i).copied();
+            let arg_type = insn.extra().arg_types.get(i).copied();
             let is_complex = arg_type.is_some_and(|t| types.is_complex_float(t));
             let is_fp = if let Some(typ) = arg_type {
                 types.is_float(typ)
@@ -1032,6 +1035,7 @@ impl X86_64CodeGen {
         let ret_fmt = self.fp_format(insn.typ, ret_size, types);
 
         let abi_info = insn
+            .extra()
             .abi_info
             .as_ref()
             .expect("abi_info must be populated for Call instructions");
@@ -1063,6 +1067,18 @@ impl X86_64CodeGen {
                     }
                     // Two SSE struct return (not complex)
                     self.handle_two_sse_return(&dst_loc);
+                    return;
+                }
+                // A whole `__int128` in XMM0, as an `ms_abi` callee returns
+                // one: into the sixteen bytes of its slot.
+                if classes.as_slice() == [RegClass::Sse]
+                    && insn.typ.is_some_and(|t| types.is_plain_int128(t))
+                {
+                    self.push_lir(X86Inst::MovFp {
+                        size: FpSize::Quad,
+                        src: XmmOperand::Reg(XmmReg::Xmm0),
+                        dst: XmmOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
+                    });
                     return;
                 }
                 // Check for single SSE return
@@ -1386,7 +1402,7 @@ impl X86_64CodeGen {
 
     /// Emit the actual call instruction (direct or indirect)
     pub(super) fn emit_call_instruction(&mut self, insn: &Instruction, func_name: &str) {
-        if insn.indirect_target.is_some() {
+        if insn.extra().indirect_target.is_some() {
             self.push_lir(X86Inst::Call {
                 target: CallTarget::Indirect(Reg::R11),
             });

@@ -337,6 +337,30 @@ impl BinaryOp {
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge | BinaryOp::Eq | BinaryOp::Ne
         )
     }
+
+    /// The operator as it is written in source, for diagnostics.
+    pub fn spelling(self) -> &'static str {
+        match self {
+            BinaryOp::Add => "+",
+            BinaryOp::Sub => "-",
+            BinaryOp::Mul => "*",
+            BinaryOp::Div => "/",
+            BinaryOp::Mod => "%",
+            BinaryOp::Lt => "<",
+            BinaryOp::Gt => ">",
+            BinaryOp::Le => "<=",
+            BinaryOp::Ge => ">=",
+            BinaryOp::Eq => "==",
+            BinaryOp::Ne => "!=",
+            BinaryOp::LogAnd => "&&",
+            BinaryOp::LogOr => "||",
+            BinaryOp::BitAnd => "&",
+            BinaryOp::BitOr => "|",
+            BinaryOp::BitXor => "^",
+            BinaryOp::Shl => "<<",
+            BinaryOp::Shr => ">>",
+        }
+    }
 }
 
 /// Which classification question a [`ExprKind::FpTest`] asks.
@@ -436,6 +460,27 @@ pub enum AssignOp {
     ShrAssign,
 }
 
+impl AssignOp {
+    /// The binary operator a compound assignment applies (C17 6.5.16.2p3:
+    /// `E1 op= E2` is `E1 = E1 op (E2)` with `E1` evaluated once); `None`
+    /// for simple assignment.
+    pub fn binary_op(self) -> Option<BinaryOp> {
+        match self {
+            AssignOp::Assign => None,
+            AssignOp::AddAssign => Some(BinaryOp::Add),
+            AssignOp::SubAssign => Some(BinaryOp::Sub),
+            AssignOp::MulAssign => Some(BinaryOp::Mul),
+            AssignOp::DivAssign => Some(BinaryOp::Div),
+            AssignOp::ModAssign => Some(BinaryOp::Mod),
+            AssignOp::AndAssign => Some(BinaryOp::BitAnd),
+            AssignOp::OrAssign => Some(BinaryOp::BitOr),
+            AssignOp::XorAssign => Some(BinaryOp::BitXor),
+            AssignOp::ShlAssign => Some(BinaryOp::Shl),
+            AssignOp::ShrAssign => Some(BinaryOp::Shr),
+        }
+    }
+}
+
 // Expressions
 
 /// An expression with type annotation
@@ -471,6 +516,17 @@ pub struct Expr {
 }
 
 impl Expr {
+    /// Whether this is a string literal of any kind: narrow, wide, `u` or `U`.
+    pub fn is_string_literal(&self) -> bool {
+        matches!(
+            self.kind,
+            ExprKind::StringLit(_)
+                | ExprKind::WideStringLit(_)
+                | ExprKind::Utf16StringLit(_)
+                | ExprKind::Utf32StringLit(_)
+        )
+    }
+
     /// Create a new untyped expression with position
     pub fn new(kind: ExprKind, pos: Position) -> Self {
         Self {
@@ -1154,6 +1210,8 @@ pub enum ExprKind {
         desired: Box<Expr>,
         /// Memory ordering on success
         succ_order: Box<Expr>,
+        /// Memory ordering on failure
+        fail_order: Box<Expr>,
     },
 
     /// __c11_atomic_compare_exchange_weak(ptr, expected, desired, succ_order, fail_order)
@@ -1167,6 +1225,8 @@ pub enum ExprKind {
         desired: Box<Expr>,
         /// Memory ordering on success
         succ_order: Box<Expr>,
+        /// Memory ordering on failure
+        fail_order: Box<Expr>,
     },
 
     /// __c11_atomic_fetch_add(ptr, val, order)
@@ -1324,6 +1384,64 @@ pub(crate) fn vm_extent_count(types: &TypeTable, symbols: &SymbolTable, expr: &E
     } else {
         0
     }
+}
+
+/// The elements of `elements` that brace elision gives to one `target_type`
+/// slot, starting at `start` (C17 6.7.9p20): the first, then as many more
+/// positional elements as the type has scalar fields, stopping early at a
+/// designated one -- which addresses the enclosing aggregate, not this slot.
+///
+/// A slot with no bound at its end -- a flexible array member, or a structure
+/// ending in one -- has no scalar count to stop at, so it takes every
+/// positional element left, as gcc does: `static struct { int n; int a[]; }
+/// w = {1, 2, 3};` gives `a` both of the last two.
+///
+/// The parser sizing an incomplete array and the linearizer placing values
+/// both take elements this way, and each counted them with a loop of its own.
+pub fn brace_elision_span(
+    types: &TypeTable,
+    elements: &[InitElement],
+    start: usize,
+    target_type: TypeId,
+) -> std::ops::Range<usize> {
+    let wanted = if types.has_unbounded_tail(target_type) {
+        usize::MAX
+    } else {
+        types.count_scalar_fields(target_type).max(1)
+    };
+    let mut end = (start + 1).min(elements.len());
+    while end - start < wanted && end < elements.len() && elements[end].designators.is_empty() {
+        end += 1;
+    }
+    start..end
+}
+
+/// Where one element of an array's initializer list lands, given the
+/// `cursor` -- the index the next positional element takes -- which this
+/// advances (C17 6.7.9p17-18, and GNU `[lo ... hi]`).
+///
+/// Answers the first and last index the element initializes, and the
+/// position of the array's own designator among `designators`, if it has
+/// one; what follows that is for the element itself. A range leaves the
+/// cursor past its *high* endpoint, so a positional element after
+/// `[0 ... 2] = 1` lands at 3.
+///
+/// The one statement of the rule: the parser sizing `int a[] = {...}` and
+/// the linearizer placing the values each had a copy, one of them commented
+/// as "a second, independent copy ... both have to know".
+pub fn array_slot(designators: &[Designator], cursor: &mut i64) -> (i64, i64, Option<usize>) {
+    for (pos, d) in designators.iter().enumerate() {
+        let (lo, hi) = match d {
+            Designator::Index(i) => (*i, *i),
+            Designator::IndexRange(lo, hi) => (*lo, *hi),
+            Designator::Field(_) => continue,
+        };
+        *cursor = hi + 1;
+        return (lo, hi, Some(pos));
+    }
+    let at = *cursor;
+    *cursor += 1;
+    (at, at, None)
 }
 
 /// Does this initializer element initialize `target_type` by elided braces?
@@ -1853,13 +1971,15 @@ impl Expr {
                 expected,
                 desired,
                 succ_order,
+                fail_order,
             }
             | K::C11AtomicCompareExchangeWeak {
                 ptr,
                 expected,
                 desired,
                 succ_order,
-            } => vec![ptr, expected, desired, succ_order],
+                fail_order,
+            } => vec![ptr, expected, desired, succ_order, fail_order],
             K::Call { func, args, .. } => std::iter::once(&**func).chain(args).collect(),
             K::Comma(exprs)
             | K::SizeofType(_, exprs)
@@ -2184,10 +2304,6 @@ pub struct FunctionAttrs {
     /// `__attribute__((noreturn))`. What a call site reads is the function
     /// *type*'s `noreturn`, which the declarator is given from this.
     pub noreturn: bool,
-    /// `__attribute__((sysv_abi))` or `((ms_abi))`, from whichever
-    /// declaration wrote it: gcc compiles a definition under the convention
-    /// an earlier prototype named.
-    pub calling_conv: Option<crate::abi::CallingConv>,
 }
 
 impl FunctionAttrs {
@@ -2216,9 +2332,6 @@ impl FunctionAttrs {
         // wins, as it does for an object.
         self.align = self.align.max(other.align);
         self.noreturn |= other.noreturn;
-        if other.calling_conv.is_some() {
-            self.calling_conv = other.calling_conv;
-        }
     }
 }
 
@@ -2254,7 +2367,8 @@ pub struct FunctionDef {
     pub is_static: bool,
     /// Whether function is inline
     pub is_inline: bool,
-    /// Calling convention override (from __attribute__((sysv_abi)) etc.)
+    /// The calling convention of the function's type, which
+    /// `__attribute__((ms_abi))` sets: the definition is compiled under it.
     pub calling_conv: crate::abi::CallingConv,
     /// Emission-affecting attributes; see [`FunctionAttrs`].
     pub attrs: FunctionAttrs,
@@ -2758,6 +2872,7 @@ mod tests {
         let expected = Expr::int(0x2000, &types);
         let desired = Expr::int(42, &types);
         let succ_order = Expr::int(5, &types);
+        let fail_order = Expr::int(2, &types);
 
         // Test strong variant
         let cas_strong = Expr::new_unpositioned(ExprKind::C11AtomicCompareExchangeStrong {
@@ -2765,6 +2880,7 @@ mod tests {
             expected: Box::new(expected.clone()),
             desired: Box::new(desired.clone()),
             succ_order: Box::new(succ_order.clone()),
+            fail_order: Box::new(fail_order.clone()),
         });
         match cas_strong.kind {
             ExprKind::C11AtomicCompareExchangeStrong {
@@ -2772,11 +2888,13 @@ mod tests {
                 expected,
                 desired,
                 succ_order,
+                fail_order,
             } => {
                 assert!(matches!(ptr.kind, ExprKind::IntLit(0x1000)));
                 assert!(matches!(expected.kind, ExprKind::IntLit(0x2000)));
                 assert!(matches!(desired.kind, ExprKind::IntLit(42)));
                 assert!(matches!(succ_order.kind, ExprKind::IntLit(5)));
+                assert!(matches!(fail_order.kind, ExprKind::IntLit(2)));
             }
             _ => panic!("Expected C11AtomicCompareExchangeStrong"),
         }
@@ -2787,6 +2905,7 @@ mod tests {
             expected: Box::new(expected),
             desired: Box::new(desired),
             succ_order: Box::new(succ_order),
+            fail_order: Box::new(fail_order),
         });
         match cas_weak.kind {
             ExprKind::C11AtomicCompareExchangeWeak {
@@ -2794,11 +2913,13 @@ mod tests {
                 expected,
                 desired,
                 succ_order,
+                fail_order,
             } => {
                 assert!(matches!(ptr.kind, ExprKind::IntLit(0x1000)));
                 assert!(matches!(expected.kind, ExprKind::IntLit(0x2000)));
                 assert!(matches!(desired.kind, ExprKind::IntLit(42)));
                 assert!(matches!(succ_order.kind, ExprKind::IntLit(5)));
+                assert!(matches!(fail_order.kind, ExprKind::IntLit(2)));
             }
             _ => panic!("Expected C11AtomicCompareExchangeWeak"),
         }

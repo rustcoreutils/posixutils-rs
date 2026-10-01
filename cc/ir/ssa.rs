@@ -33,15 +33,17 @@ struct SsaConverter<'a> {
 
     /// Variables marked for renaming, name -> the local's `Sym` pseudo.
     ///
-    /// Keyed by name because `phi_map` and `DefStack` are, but carrying the
+    /// Keyed by name because `phis` and `DefStack` are, but carrying the
     /// pseudo so a use can be matched by identity. A parameter is registered
     /// in `func.locals` under its bare name while a global reached through a
     /// block-scoped `extern` gets its own pseudo with the *same* name, so a
     /// name alone does not identify the variable being renamed.
     to_rename: HashMap<String, PseudoId>,
 
-    /// All inserted phi nodes for later processing
-    all_phis: Vec<(BasicBlockId, usize)>, // (block, instruction index)
+    /// Each block's inserted phis: variable name -> the phi's index in the
+    /// block. Conversion state, not a property of the block: nothing after
+    /// conversion asks which variable a phi was for.
+    phis: Phis,
 
     /// Stores to remove after conversion
     dead_stores: Vec<InsnRef>,
@@ -69,7 +71,7 @@ impl<'a> SsaConverter<'a> {
                 for src in &insn.src {
                     max_pseudo_id = max_pseudo_id.max(src.0);
                 }
-                if let Some(indirect) = insn.indirect_target {
+                if let Some(indirect) = insn.extra().indirect_target {
                     max_pseudo_id = max_pseudo_id.max(indirect.0);
                 }
                 for (_, phi_src) in &insn.phi_list {
@@ -92,7 +94,7 @@ impl<'a> SsaConverter<'a> {
             func,
             dom,
             to_rename: HashMap::with_capacity(DEFAULT_SSA_RENAME_CAPACITY),
-            all_phis: Vec::with_capacity(DEFAULT_SSA_PHI_CAPACITY),
+            phis: HashMap::new(),
             dead_stores: Vec::with_capacity(DEFAULT_SSA_PHI_CAPACITY),
             next_pseudo_id: max_pseudo_id + 1,
             next_reg_nr: max_reg_nr + 1,
@@ -155,7 +157,7 @@ fn analyze_variables(func: &Function, types: &TypeTable) -> HashMap<String, VarI
         .map(|(name, local)| {
             // Only scalars can be promoted, and a volatile or atomic variable
             // must go through memory.
-            let promotable = !local.is_volatile && !local.is_atomic && types.is_scalar(local.typ);
+            let promotable = local.is_ordinary(types) && types.is_scalar(local.typ);
             let info = promotable.then(|| VarInfo {
                 typ: local.typ,
                 size: types.size_bits(local.typ),
@@ -199,7 +201,7 @@ fn analyze_variables(func: &Function, types: &TypeTable) -> HashMap<String, VarI
             // promotion rewrites it into a `Copy` between registers. The
             // variable itself need not be volatile for this to happen:
             // `int a; *(volatile int *)&a;` qualifies the access alone, and
-            // `LocalVar::is_volatile` -- the test above -- answers no.
+            // `LocalVar::is_ordinary` -- the test above -- answers yes.
             if insn.is_volatile_access() {
                 *slot = None;
                 continue;
@@ -274,14 +276,18 @@ fn insert_phi_nodes(converter: &mut SsaConverter, var_name: &str, var_info: &Var
 
             bb.insns.insert(insert_pos, phi);
 
-            // Record for later processing
-            converter.all_phis.push((bb_id, insert_pos));
-
-            // Store in phi_map (position is stable because we insert at the end of existing phis)
-            bb.phi_map.insert(var_name.to_string(), insert_pos);
+            // The position is stable: phis go in after the existing ones.
+            converter
+                .phis
+                .entry(bb_id)
+                .or_default()
+                .insert(var_name.to_string(), insert_pos);
         }
     }
 }
+
+/// Each block's inserted phis, by the variable each is for.
+type Phis = HashMap<BasicBlockId, HashMap<String, usize>>;
 
 // Phase 2: Variable Renaming
 
@@ -333,6 +339,7 @@ impl DefStack {
 fn lookup_var(
     func: &Function,
     dom: &DomTree,
+    phis: &Phis,
     bb_id: BasicBlockId,
     var: &str,
     def_stack: &DefStack,
@@ -346,7 +353,7 @@ fn lookup_var(
     let mut current = bb_id;
     while let Some(bb) = func.get_block(current) {
         // Check if there's a phi for this variable in this block
-        if let Some(&phi_idx) = bb.phi_map.get(var) {
+        if let Some(&phi_idx) = phis.get(&bb.id).and_then(|m| m.get(var)) {
             if let Some(phi_insn) = bb.insns.get(phi_idx) {
                 return phi_insn.target;
             }
@@ -415,9 +422,15 @@ fn rename_insn(
                 if let Some(name) = var_name {
                     if converter.to_rename.get(name) == Some(&addr) {
                         // Get the reaching definition
-                        let val =
-                            lookup_var(converter.func, &converter.dom, bb_id, name, def_stack)
-                                .unwrap_or_else(|| converter.undef_pseudo());
+                        let val = lookup_var(
+                            converter.func,
+                            &converter.dom,
+                            &converter.phis,
+                            bb_id,
+                            name,
+                            def_stack,
+                        )
+                        .unwrap_or_else(|| converter.undef_pseudo());
 
                         // Replace load with the value
                         if insn.target.is_some() {
@@ -437,9 +450,9 @@ fn rename_insn(
         Opcode::Phi => {
             // Record phi as a definition
             if let Some(target) = insn.target {
-                // Find which variable this phi is for (from phi_map)
-                if let Some(bb) = converter.func.get_block(bb_id) {
-                    for (name, &idx) in &bb.phi_map {
+                // Find which variable this phi is for.
+                if let Some(phis) = converter.phis.get(&bb_id) {
+                    for (name, &idx) in phis {
                         if idx == insn_idx {
                             def_stack.push(name, target);
                             break;
@@ -509,15 +522,17 @@ fn fill_phi_operands(converter: &mut SsaConverter) {
     // name so the per-variable order of PhiSource allocation is
     // deterministic across runs — `alloc_phi` and the undef-pseudo
     // path both bump `next_pseudo_id`, and HashMap iteration of
-    // `bb.phi_map` would otherwise vary that ordering.
+    // the phi table would otherwise vary that ordering.
     let phi_info: Vec<(BasicBlockId, usize, String)> = converter
         .func
         .blocks
         .iter()
         .flat_map(|bb| {
-            let mut entries: Vec<(BasicBlockId, usize, String)> = bb
-                .phi_map
-                .iter()
+            let mut entries: Vec<(BasicBlockId, usize, String)> = converter
+                .phis
+                .get(&bb.id)
+                .into_iter()
+                .flatten()
                 .map(|(name, &idx)| (bb.id, idx, name.clone()))
                 .collect();
             entries.sort_by(|a, b| a.2.cmp(&b.2));
@@ -560,14 +575,21 @@ fn fill_phi_operands(converter: &mut SsaConverter) {
                 Some(&s) => s,
                 None => continue,
             };
-            let val = lookup_var_in_pred(converter.func, &converter.dom, pred_id, &var_name, sym)
-                .unwrap_or_else(|| {
-                    let id = PseudoId(converter.next_pseudo_id);
-                    converter.next_pseudo_id += 1;
-                    let pseudo = Pseudo::undef(id);
-                    converter.func.add_pseudo(pseudo);
-                    id
-                });
+            let val = lookup_var_in_pred(
+                converter.func,
+                &converter.dom,
+                &converter.phis,
+                pred_id,
+                &var_name,
+                sym,
+            )
+            .unwrap_or_else(|| {
+                let id = PseudoId(converter.next_pseudo_id);
+                converter.next_pseudo_id += 1;
+                let pseudo = Pseudo::undef(id);
+                converter.func.add_pseudo(pseudo);
+                id
+            });
 
             // Allocate PhiSource target pseudo
             let phisrc_pseudo = converter.alloc_phi();
@@ -609,6 +631,7 @@ fn fill_phi_operands(converter: &mut SsaConverter) {
 fn lookup_var_in_pred(
     func: &Function,
     dom: &DomTree,
+    phis: &Phis,
     bb_id: BasicBlockId,
     var: &str,
     sym: PseudoId,
@@ -631,7 +654,7 @@ fn lookup_var_in_pred(
         }
 
         // Check for phi in this block (only if no store found)
-        if let Some(&phi_idx) = bb.phi_map.get(var) {
+        if let Some(&phi_idx) = phis.get(&bb.id).and_then(|m| m.get(var)) {
             if let Some(phi_insn) = bb.insns.get(phi_idx) {
                 return phi_insn.target;
             }
@@ -665,8 +688,13 @@ fn remove_dead_stores(func: &mut Function, dead_stores: &[InsnRef]) {
 /// inserting phi nodes at each variable's iterated dominance frontier. The
 /// phases are marked in the body.
 pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
+    convert(func, types);
+}
+
+/// [`ssa_convert`], handing back the phi each variable got in each block.
+fn convert(func: &mut Function, types: &TypeTable) -> Phis {
     if func.blocks.is_empty() {
-        return;
+        return Phis::new();
     }
 
     // Phase 0: Build dominator tree.
@@ -730,6 +758,7 @@ pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
 
     // Update function's next_pseudo to avoid ID collisions with later allocations
     converter.func.next_pseudo = converter.next_pseudo_id;
+    converter.phis
 }
 
 #[cfg(test)]
@@ -737,6 +766,17 @@ mod tests {
     use super::*;
     use crate::ir::BasicBlock;
     use crate::target::Target;
+
+    /// The phi conversion gave `var` in block `bb`, if it gave one.
+    fn phi_of<'f>(
+        func: &'f Function,
+        phis: &Phis,
+        bb: BasicBlockId,
+        var: &str,
+    ) -> Option<&'f Instruction> {
+        let idx = *phis.get(&bb)?.get(var)?;
+        func.get_block(bb)?.insns.get(idx)
+    }
 
     fn make_simple_if_cfg(types: &TypeTable) -> Function {
         // Create a CFG with a simple if-then-else:
@@ -756,8 +796,6 @@ mod tests {
             "x",
             x_sym,
             int_id,
-            false, // not volatile
-            false, // not atomic
             Some(BasicBlockId(0)),
             None, // no explicit alignment
         );
@@ -859,15 +897,7 @@ mod tests {
         // Only add ONE pseudo to func.pseudos with ID 0
         let x_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
-        func.add_local(
-            "x",
-            x_sym,
-            int_id,
-            false,
-            false,
-            Some(BasicBlockId(0)),
-            None,
-        );
+        func.add_local("x", x_sym, int_id, Some(BasicBlockId(0)), None);
 
         // Create an instruction that uses a HIGHER pseudo ID (say, 100)
         // that is NOT in func.pseudos. This simulates what the linearizer does
@@ -931,8 +961,6 @@ mod tests {
             "x",
             x_sym,
             int_id,
-            false,
-            false,
             Some(BasicBlockId(0)), // declared in entry
             None,
         );
@@ -950,15 +978,7 @@ mod tests {
         // Pseudo for switch value (simulated opcode)
         let opcode_sym = PseudoId(5);
         func.add_pseudo(Pseudo::sym(opcode_sym, "opcode".to_string()));
-        func.add_local(
-            "opcode",
-            opcode_sym,
-            int_id,
-            false,
-            false,
-            Some(BasicBlockId(0)),
-            None,
-        );
+        func.add_local("opcode", opcode_sym, int_id, Some(BasicBlockId(0)), None);
 
         // Reg pseudos for loads
         let load_result = PseudoId(6);
@@ -1027,12 +1047,11 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let mut func = make_goto_dispatch_cfg(&types);
 
-        ssa_convert(&mut func, &types);
+        let phis = convert(&mut func, &types);
 
         // dispatch(1) must have a phi for 'x' because it's a merge point
         // where the value of x from entry (x=0) meets the value from handler0 (x=10)
-        let dispatch = func.get_block(BasicBlockId(1)).unwrap();
-        let dispatch_has_phi_x = dispatch.phi_map.contains_key("x");
+        let dispatch_has_phi_x = phi_of(&func, &phis, BasicBlockId(1), "x").is_some();
         assert!(
             dispatch_has_phi_x,
             "dispatch block (bb1) must have a phi node for 'x' - \
@@ -1041,16 +1060,14 @@ mod tests {
 
         // done(4) should also have a phi for 'x' because it merges values
         // from dispatch(1) (default case) and handler1(3)
-        let done = func.get_block(BasicBlockId(4)).unwrap();
-        let done_has_phi_x = done.phi_map.contains_key("x");
+        let done_has_phi_x = phi_of(&func, &phis, BasicBlockId(4), "x").is_some();
         assert!(
             done_has_phi_x,
             "done block (bb4) must have a phi node for 'x'"
         );
 
         // Verify the phi in dispatch has the correct predecessors (entry and handler0)
-        let phi_idx = dispatch.phi_map["x"];
-        let phi_insn = &dispatch.insns[phi_idx];
+        let phi_insn = phi_of(&func, &phis, BasicBlockId(1), "x").unwrap();
         assert_eq!(phi_insn.op, Opcode::Phi);
         assert_eq!(
             phi_insn.phi_list.len(),
@@ -1103,13 +1120,10 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let mut func = make_simple_if_cfg(&types);
 
-        ssa_convert(&mut func, &types);
+        let phis = convert(&mut func, &types);
 
         // merge(3) has phi for 'x' with predecessors then(1) and else(2)
-        let merge = func.get_block(BasicBlockId(3)).unwrap();
-        assert!(merge.phi_map.contains_key("x"));
-        let phi_idx = merge.phi_map["x"];
-        let phi_insn = &merge.insns[phi_idx];
+        let phi_insn = phi_of(&func, &phis, BasicBlockId(3), "x").expect("a phi for x");
         assert_eq!(phi_insn.op, Opcode::Phi);
 
         // Check that predecessor blocks have PhiSource instructions
@@ -1135,11 +1149,12 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let mut func = make_simple_if_cfg(&types);
 
-        ssa_convert(&mut func, &types);
+        let phis = convert(&mut func, &types);
 
-        let merge = func.get_block(BasicBlockId(3)).unwrap();
-        let phi_idx = merge.phi_map["x"];
-        let phi_target = merge.insns[phi_idx].target.unwrap();
+        let phi_target = phi_of(&func, &phis, BasicBlockId(3), "x")
+            .unwrap()
+            .target
+            .unwrap();
 
         // Find PhiSource instructions in predecessor blocks
         for bb in &func.blocks {
@@ -1165,26 +1180,23 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let mut func = make_goto_dispatch_cfg(&types);
 
-        ssa_convert(&mut func, &types);
+        let phis = convert(&mut func, &types);
 
-        let dispatch = func.get_block(BasicBlockId(1)).unwrap();
-        if let Some(&phi_idx) = dispatch.phi_map.get("x") {
-            let phi_insn = &dispatch.insns[phi_idx];
-
-            for (pred_bb, phisrc_pseudo) in &phi_insn.phi_list {
-                // Find the PhiSource instruction in the predecessor block
-                let pred = func.get_block(*pred_bb).unwrap();
-                let phisrc = pred
-                    .insns
-                    .iter()
-                    .find(|i| i.op == Opcode::PhiSource && i.target == Some(*phisrc_pseudo));
-                assert!(
-                    phisrc.is_some(),
-                    "PhiSource for pseudo {:?} not found in predecessor block {:?}",
-                    phisrc_pseudo,
-                    pred_bb
-                );
-            }
+        let phi_insn =
+            phi_of(&func, &phis, BasicBlockId(1), "x").expect("dispatch has a phi for x");
+        for (pred_bb, phisrc_pseudo) in &phi_insn.phi_list {
+            // Find the PhiSource instruction in the predecessor block
+            let pred = func.get_block(*pred_bb).unwrap();
+            let phisrc = pred
+                .insns
+                .iter()
+                .find(|i| i.op == Opcode::PhiSource && i.target == Some(*phisrc_pseudo));
+            assert!(
+                phisrc.is_some(),
+                "PhiSource for pseudo {:?} not found in predecessor block {:?}",
+                phisrc_pseudo,
+                pred_bb
+            );
         }
     }
 
@@ -1234,15 +1246,7 @@ mod tests {
 
         let x_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
-        func.add_local(
-            "x",
-            x_sym,
-            int_id,
-            false,
-            false,
-            Some(BasicBlockId(0)),
-            None,
-        );
+        func.add_local("x", x_sym, int_id, Some(BasicBlockId(0)), None);
 
         let val1 = PseudoId(1);
         func.add_pseudo(Pseudo::val(val1, 1));
@@ -1320,7 +1324,7 @@ mod tests {
         func.add_pseudo(Pseudo::sym(z_sym, "z".to_string()));
         // Declared 64 bits wide, but accessed at 32 and at an offset.
         let wide = types.long_id;
-        func.add_local("z", z_sym, wide, false, false, Some(BasicBlockId(0)), None);
+        func.add_local("z", z_sym, wide, Some(BasicBlockId(0)), None);
 
         let lo = PseudoId(1);
         func.add_pseudo(Pseudo::val(lo, 3));
@@ -1368,15 +1372,7 @@ mod tests {
 
         let x_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
-        func.add_local(
-            "x",
-            x_sym,
-            int_id,
-            false,
-            false,
-            Some(BasicBlockId(0)),
-            None,
-        );
+        func.add_local("x", x_sym, int_id, Some(BasicBlockId(0)), None);
         let val1 = PseudoId(1);
         func.add_pseudo(Pseudo::val(val1, 1));
         let ret = PseudoId(2);
@@ -1389,7 +1385,7 @@ mod tests {
         let mut call = Instruction::new(Opcode::Call);
         call.target = Some(ret);
         call.src = vec![x_sym];
-        call.func_name = Some("g".to_string());
+        call.extra_mut().func_name = Some("g".to_string());
         entry.add_insn(call);
         entry.add_insn(Instruction::ret(Some(ret)));
         func.entry = BasicBlockId(0);
@@ -1417,7 +1413,7 @@ mod tests {
         let (a, b, c) = (PseudoId(0), PseudoId(1), PseudoId(2));
         for (id, name, typ) in [(a, "a", int_id), (b, "b", ptr_id), (c, "c", int_id)] {
             func.add_pseudo(Pseudo::sym(id, name.to_string()));
-            func.add_local(name, id, typ, false, false, Some(BasicBlockId(0)), None);
+            func.add_local(name, id, typ, Some(BasicBlockId(0)), None);
         }
         let one = PseudoId(3);
         func.add_pseudo(Pseudo::val(one, 1));
@@ -1432,7 +1428,7 @@ mod tests {
         let mut call = Instruction::new(Opcode::Call);
         call.target = Some(ret);
         call.src = vec![a];
-        call.func_name = Some("g".to_string());
+        call.extra_mut().func_name = Some("g".to_string());
         entry.add_insn(call);
         entry.add_insn(Instruction::ret(Some(ret)));
         func.entry = BasicBlockId(0);
@@ -1458,15 +1454,7 @@ mod tests {
 
         let local_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(local_sym, "v".to_string()));
-        func.add_local(
-            "v",
-            local_sym,
-            int_id,
-            false,
-            false,
-            Some(BasicBlockId(0)),
-            None,
-        );
+        func.add_local("v", local_sym, int_id, Some(BasicBlockId(0)), None);
 
         // A distinct pseudo, same name: the global.
         let global_sym = PseudoId(1);
@@ -1520,15 +1508,7 @@ mod tests {
 
         let t_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(t_sym, "t".to_string()));
-        func.add_local(
-            "t",
-            t_sym,
-            int_id,
-            false,
-            false,
-            Some(BasicBlockId(1)),
-            None,
-        );
+        func.add_local("t", t_sym, int_id, Some(BasicBlockId(1)), None);
         let cond = PseudoId(1);
         func.add_pseudo(Pseudo::val(cond, 1));
         let loaded = PseudoId(2);

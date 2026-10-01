@@ -242,23 +242,38 @@ impl X86_64CodeGen {
         self.pseudos = crate::arch::codegen::PseudoTable::new(&func.pseudos);
 
         self.sym_slots = crate::arch::codegen::sym_slots(func, types);
+        self.base.value_widths = crate::arch::codegen::ValueWidths::of(func, types);
 
         let stack_size = alloc.stack_size();
+        self.func_conv = func.conv;
+        let win64 = func.conv == crate::abi::CallingConv::Win64;
+        self.win64_xmm_saves = alloc.win64_xmm_saves().to_vec();
+        self.incoming_pointers = Self::incoming_pointers(func, types);
         self.callee_saved_regs = alloc.callee_saved_used().to_vec();
         self.max_local_align = alloc.max_local_align();
         self.frame_base = alloc.frame_base();
+        self.x87_scratch = alloc.x87_scratch();
         self.x87_control_words = alloc.x87_control_words();
         // Pad callee_saved_offset to multiple of 16 so that 16-byte-aligned
         // stack_offset values produce 16-byte-aligned final addresses.
         // rbp is 16-aligned (ABI), so -(padded_offset + aligned_stack_offset) is also aligned.
+        // An `ms_abi` function's XMM save area sits below the pushes, in
+        // the same region, so the locals start below it.
         self.callee_saved_offset = ((self.callee_saved_regs.len() as i32 * 8) + 15) & !15;
+        if !self.win64_xmm_saves.is_empty() {
+            self.callee_saved_offset += 16 * self.win64_xmm_saves.len() as i32;
+        }
 
         // For variadic functions, we need extra space for the register save area
         // 6 GP regs * 8 bytes = 48 bytes for GP registers
         // 8 XMM regs * 16 bytes = 128 bytes for FP registers
         // Total = 176 bytes
-        let reg_save_area_size: i32 = if is_variadic { 176 } else { 0 };
-        self.reg_save_area_offset = if is_variadic {
+        //
+        // Not for an `ms_abi` one, whose variadic arguments are all in
+        // memory once its prologue homes the register positions.
+        let sysv_variadic = is_variadic && !win64;
+        let reg_save_area_size: i32 = if sysv_variadic { 176 } else { 0 };
+        self.reg_save_area_offset = if sysv_variadic {
             // The register save area will be at the end of the stack frame
             self.callee_saved_offset + stack_size + reg_save_area_size
         } else {
@@ -269,24 +284,27 @@ impl X86_64CodeGen {
         self.emit_function_header(func);
 
         // Emit prologue (push rbp, callee-saved regs, allocate stack)
-        self.emit_prologue(stack_size, reg_save_area_size);
-
-        // Zero-initialize the stack frame BEFORE storing any arguments.
-        // This ensures all 8-byte stack slots start as zero, so narrow
-        // writes (8/16/32-bit) leave zero in the unwritten upper bytes.
-        // Uses R10/R11 to save/restore RDI/RCX (which may hold arguments).
-        self.zero_stack_frame();
+        let homes = if win64 {
+            crate::arch::x86_64::win64::homed_positions(func, types, is_variadic)
+        } else {
+            Vec::new()
+        };
+        self.emit_prologue(stack_size, reg_save_area_size, &homes);
 
         // Store spilled arguments before any calls can clobber them
         self.store_spilled_args(&alloc);
 
         // For variadic functions, save argument registers to the register save area
-        if is_variadic {
+        if sysv_variadic {
             self.emit_variadic_save_area();
         }
 
-        // Move arguments from registers to their allocated stack locations
-        self.store_args_to_stack(func, types, &alloc);
+        // Move arguments from registers to their allocated stack locations.
+        // An `ms_abi` function's are in memory already: the prologue homed
+        // them.
+        if !win64 {
+            self.store_args_to_stack(func, types, &alloc);
+        }
 
         // What `va_start` will need. Taken from the allocator, which is the
         // only place that applies the full psABI argument dispatch; a second
@@ -433,8 +451,32 @@ impl X86_64CodeGen {
         }
     }
 
+    /// The `Arg` pseudos whose parameter is a pointer; see
+    /// [`X86_64CodeGen::incoming_pointers`].
+    fn incoming_pointers(func: &Function, types: &TypeTable) -> HashSet<PseudoId> {
+        let args = func.arg_types();
+        func.pseudos
+            .iter()
+            .filter(|p| match p.kind {
+                PseudoKind::Arg(n) => args
+                    .of(n)
+                    .is_some_and(|t| types.kind(t) == TypeKind::Pointer),
+                _ => false,
+            })
+            .map(|p| p.id)
+            .collect()
+    }
+
     /// Emit function prologue: push rbp, save callee-saved registers, allocate stack
-    fn emit_prologue(&mut self, stack_size: i32, reg_save_area_size: i32) {
+    ///
+    /// `homes` are the register positions an `ms_abi` function spills to its
+    /// shadow area, first of all.
+    fn emit_prologue(
+        &mut self,
+        stack_size: i32,
+        reg_save_area_size: i32,
+        homes: &[(usize, crate::arch::x86_64::win64::PositionReg)],
+    ) {
         let bp = Reg::bp();
         let sp = Reg::sp();
 
@@ -458,6 +500,7 @@ impl X86_64CodeGen {
             // After movq %rsp, %rbp: CFA is now tracked by %rbp+16
             self.push_lir(X86Inst::Directive(Directive::cfi_def_cfa_register("%rbp")));
         }
+        self.emit_win64_homing(homes);
 
         // Save callee-saved registers
         let mut cfi_offset = -24i32; // First callee-saved is at -24 (after rbp at -16)
@@ -473,14 +516,17 @@ impl X86_64CodeGen {
             }
             cfi_offset -= 8;
         }
+        self.emit_win64_xmm_saves();
 
         // Allocate stack space for locals + callee-saved padding + register save area
         // callee_saved_offset is already padded to 16; use it instead of raw pushed bytes
         let total_stack = stack_size + self.callee_saved_offset + reg_save_area_size;
         // Ensure 16-byte alignment
         let aligned_stack = (total_stack + 15) & !15;
-        // Subtract only the actual pushed bytes (not the padded offset)
-        let alloc_size = aligned_stack - (self.callee_saved_regs.len() as i32 * 8);
+        // Subtract only what `%rsp` has already moved by: the pushes, and an
+        // `ms_abi` function's XMM save area below them.
+        let pushed = self.callee_saved_regs.len() as i32 * 8 + self.win64_xmm_area_bytes();
+        let alloc_size = aligned_stack - pushed;
         // An over-aligned frame addresses each local as `%rsp + (alloc_size -
         // slot)`. The `andq` below makes `%rsp` itself a multiple of the
         // alignment and the allocator makes each slot one, so the address is
@@ -524,70 +570,8 @@ impl X86_64CodeGen {
             });
         }
 
-        // Store alloc_size for use in zero_stack_frame()
+        // What a dynamically aligned frame addresses its locals from.
         self.stack_alloc_size = alloc_size;
-    }
-
-    /// Zero-initialize the stack frame AFTER argument registers have been
-    /// spilled to their stack slots. This prevents stale bytes from being
-    /// read when narrow values (8/16/32-bit) are stored to 8-byte stack
-    /// slots and later loaded at wider widths.
-    ///
-    /// Must be called after store_spilled_args() and emit_variadic_save_area()
-    /// because rep stosq clobbers RAX, RCX, RDI.
-    fn zero_stack_frame(&mut self) {
-        let alloc_size = self.stack_alloc_size;
-        if alloc_size <= 0 {
-            return;
-        }
-        let qwords = alloc_size / 8;
-        if qwords <= 0 {
-            return;
-        }
-        // Save RDI and RCX to scratch registers R10/R11 — they may hold
-        // function arguments (SysV ABI: RDI=arg0, RCX=arg3).
-        // R10 and R11 are caller-saved scratch, NOT used for arg passing.
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::Rdi),
-            dst: GpOperand::Reg(Reg::R10),
-        });
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::Rcx),
-            dst: GpOperand::Reg(Reg::R11),
-        });
-        // RDI = RSP (start of stack frame to zero)
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::Rsp),
-            dst: GpOperand::Reg(Reg::Rdi),
-        });
-        // RCX = number of qwords
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Imm(qwords as i64),
-            dst: GpOperand::Reg(Reg::Rcx),
-        });
-        // RAX = 0 (value to fill)
-        self.push_lir(X86Inst::Xor {
-            size: OperandSize::B32,
-            src: GpOperand::Reg(Reg::Rax),
-            dst: Reg::Rax,
-        });
-        // rep stosq: zero [RDI] for RCX qwords
-        self.push_lir(X86Inst::RepStosq);
-        // Restore RDI and RCX
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::R10),
-            dst: GpOperand::Reg(Reg::Rdi),
-        });
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::R11),
-            dst: GpOperand::Reg(Reg::Rcx),
-        });
     }
 
     /// Emit stores for arguments spilled from caller-saved registers to stack
@@ -1066,6 +1050,16 @@ impl X86_64CodeGen {
 
     /// Emit return instruction: move return value to registers and emit epilogue
     pub(super) fn emit_ret(&mut self, insn: &Instruction, types: &TypeTable) {
+        if self.func_conv == crate::abi::CallingConv::Win64 {
+            self.emit_win64_ret_value(insn, types);
+        } else {
+            self.emit_sysv_ret_value(insn, types);
+        }
+        self.emit_epilogue();
+    }
+
+    /// Put the return value where a System V caller looks for it.
+    fn emit_sysv_ret_value(&mut self, insn: &Instruction, types: &TypeTable) {
         // Move return value to appropriate register if present
         // System V AMD64 ABI: integers in RAX, floats in XMM0, complex in XMM0+XMM1
         // Struct returns depend on ABI classification (SSE for all-float structs)
@@ -1106,7 +1100,7 @@ impl X86_64CodeGen {
                 .map(|t| types.size_bits(t).max(32))
                 .unwrap_or(insn.size.max(32));
 
-            let one_sse_ret = insn.abi_info.as_ref().is_some_and(|ai| {
+            let one_sse_ret = insn.extra().abi_info.as_ref().is_some_and(|ai| {
                 matches!(&ai.ret, ArgClass::Direct { classes, .. }
                          if classes.len() == 1 && classes[0] == RegClass::Sse)
             });
@@ -1425,8 +1419,11 @@ impl X86_64CodeGen {
                 self.emit_move(*src, Reg::Rax, ret_size);
             }
         }
+    }
 
-        // Epilogue: restore callee-saved registers and return
+    /// Restore what the prologue saved, and return.
+    fn emit_epilogue(&mut self) {
+        self.emit_win64_xmm_restores();
         let bp = Reg::bp();
         let num_callee_saved = self.callee_saved_regs.len();
         if num_callee_saved > 0 {

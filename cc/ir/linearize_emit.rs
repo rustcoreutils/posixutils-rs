@@ -8,6 +8,7 @@
 
 //! Emit helpers for the linearizer (constants, block copies, bitfields, operators, assignments)
 
+use super::linearize::BlockVolatility;
 use super::memexpand;
 use super::{BasicBlockId, CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
 use crate::abi::get_abi_for_conv;
@@ -16,6 +17,7 @@ use crate::diag::{error, Position};
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, FpCompare, LibFn, MathErrno, UnaryOp};
 use crate::strings::StringId;
+use crate::types::Bitfield;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeTable};
 
 /// A read-modify-write target whose address has been computed **once**.
@@ -32,10 +34,8 @@ use crate::types::{MemberInfo, TypeId, TypeKind, TypeTable};
 /// instead.
 pub(crate) struct RmwPlace {
     base: PseudoId,
-    /// `(byte offset, bit offset, bit width, storage bytes, field type)` --
-    /// spelled to match `emit_bitfield_load`/`_store`, which are the only
-    /// consumers.
-    bitfield: Option<(usize, u32, u32, u32, TypeId)>,
+    /// The bit-field's placement and its type as the access reaches it.
+    bitfield: Option<(Bitfield, TypeId)>,
 }
 
 /// Everything `E1 op= E2` needs beyond the two operand *values*: the operator
@@ -330,7 +330,20 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// the list does not reach is initialized as a static object would be.
     pub(crate) fn emit_aggregate_zero(&mut self, base_sym: PseudoId, typ: TypeId) {
         let total_bytes = self.types.size_bytes(typ) as i64;
-        self.emit_block_zero(base_sym, 0, total_bytes);
+        let volatile = self.types.contains_volatile(typ);
+        self.emit_block_zero(base_sym, 0, total_bytes, volatile);
+    }
+
+    /// Which ends of a block move between objects of type `dst` and `src`
+    /// reach something volatile -- the answer every chunk of the move is
+    /// marked with. By `contains_volatile`, the rule `emit` applies to a
+    /// single access: a struct with one `volatile` member is read and written
+    /// whole, so every chunk of it is observable.
+    pub(crate) fn block_volatility(&self, dst: TypeId, src: TypeId) -> BlockVolatility {
+        BlockVolatility {
+            dst: self.types.contains_volatile(dst),
+            src: self.types.contains_volatile(src),
+        }
     }
 
     /// Emit a fill of `size_bytes` zero bytes at `dst` + `dst_base_offset`.
@@ -351,8 +364,32 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// the expansion does not depend on optimizing -- the same reason the
     /// opcode a program's own `memset` becomes is expanded there rather than
     /// here.
-    pub(crate) fn emit_block_zero(&mut self, dst: PseudoId, dst_base_offset: i64, size_bytes: i64) {
+    ///
+    /// A fill of a `volatile` object is the exception. `memexpand` treats a
+    /// `Memset` as the library call it names, which promised nothing about
+    /// volatility, so its stores come out unmarked and a pass may then drop
+    /// them. Within the inline limit such a fill is emitted here, as stores
+    /// marked for what they write; past it, the call stays a call, which
+    /// nothing deletes.
+    pub(crate) fn emit_block_zero(
+        &mut self,
+        dst: PseudoId,
+        dst_base_offset: i64,
+        size_bytes: i64,
+        volatile: bool,
+    ) {
         if size_bytes <= 0 {
+            return;
+        }
+        if volatile && size_bytes <= memexpand::INLINE_LIMIT_BYTES {
+            for (offset, chunk) in memexpand::block_chunks(size_bytes) {
+                let (typ, bits) = (chunk.typ(self.types), chunk.bits());
+                let zero = self.emit_const(0, typ);
+                self.emit(
+                    Instruction::store(zero, dst, dst_base_offset + offset, typ, bits)
+                        .with_volatile(true),
+                );
+            }
             return;
         }
         let dst_ptr = self.block_dest_addr(dst, dst_base_offset);
@@ -369,8 +406,14 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Emit a block copy from src to dst using integer chunks.
-    pub(crate) fn emit_block_copy(&mut self, dst: PseudoId, src: PseudoId, size_bytes: i64) {
-        self.emit_block_copy_at_offset(dst, 0, src, size_bytes);
+    pub(crate) fn emit_block_copy(
+        &mut self,
+        dst: PseudoId,
+        src: PseudoId,
+        size_bytes: i64,
+        vol: BlockVolatility,
+    ) {
+        self.emit_block_copy_at_offset(dst, 0, src, size_bytes, vol);
     }
 
     /// Emit a block copy from src to dst using integer chunks.
@@ -379,12 +422,18 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// Above `memexpand::INLINE_LIMIT_BYTES` the copy is a `memcpy` call
     /// instead, by the same rule and in the same chunks as a `memcpy` the
     /// program wrote.
+    ///
+    /// Each chunk is marked with `vol`: the chunks are integers, so the
+    /// qualifier of the aggregate they move cannot be read back off their
+    /// type, and an unmarked chunk load of a `volatile` struct nothing
+    /// used was deleted outright from `-O1` up.
     pub(crate) fn emit_block_copy_at_offset(
         &mut self,
         dst: PseudoId,
         dst_base_offset: i64,
         src: PseudoId,
         size_bytes: i64,
+        vol: BlockVolatility,
     ) {
         if size_bytes > memexpand::INLINE_LIMIT_BYTES {
             self.emit_block_copy_call(dst, dst_base_offset, src, size_bytes);
@@ -393,14 +442,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         for (offset, chunk) in memexpand::block_chunks(size_bytes) {
             let (typ, bits) = (chunk.typ(self.types), chunk.bits());
             let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(tmp, src, offset, typ, bits));
-            self.emit(Instruction::store(
-                tmp,
-                dst,
-                dst_base_offset + offset,
-                typ,
-                bits,
-            ));
+            self.emit(Instruction::load(tmp, src, offset, typ, bits).with_volatile(vol.src));
+            self.emit(
+                Instruction::store(tmp, dst, dst_base_offset + offset, typ, bits)
+                    .with_volatile(vol.dst),
+            );
         }
     }
 
@@ -418,20 +464,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     fn block_dest_addr(&mut self, dst: PseudoId, dst_base_offset: i64) -> PseudoId {
         let void_ptr = self.types.void_ptr_id;
         let dst = self.rvalue_addr(dst, void_ptr);
-        if dst_base_offset == 0 {
-            return dst;
-        }
-        let off = self.emit_const(dst_base_offset as i128, self.types.long_id);
-        let adjusted = self.alloc_reg_pseudo();
-        self.emit(Instruction::binop(
-            Opcode::Add,
-            adjusted,
-            dst,
-            off,
-            void_ptr,
-            64,
-        ));
-        adjusted
+        self.offset_address(dst, dst_base_offset)
     }
 
     /// The same copy as a `memcpy` call.
@@ -469,12 +502,15 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn emit_bitfield_load(
         &mut self,
         base: PseudoId,
-        byte_offset: usize,
-        bit_offset: u32,
-        bit_width: u32,
-        storage_size: u32,
+        bf: Bitfield,
         typ: TypeId,
     ) -> PseudoId {
+        let Bitfield {
+            offset: byte_offset,
+            bit_offset,
+            bit_width,
+            access_bytes: storage_size,
+        } = bf;
         // A span that is not one addressable unit has to be assembled a byte at
         // a time. Only a packed bit-field produces one, and only then can the
         // span exceed eight bytes -- `packed { char c:1; unsigned long long
@@ -486,14 +522,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // addressable unit -- and packing plus a >64-bit width is refused in
         // `validate_bitfield` for that reason.
         if !matches!(storage_size, 1 | 2 | 4 | 8 | 16) {
-            return self.emit_bitfield_load_bytewise(
-                base,
-                byte_offset,
-                bit_offset,
-                bit_width,
-                storage_size,
-                typ,
-            );
+            return self.emit_bitfield_load_bytewise(base, bf, typ);
         }
 
         // Determine storage type based on storage unit size
@@ -647,12 +676,15 @@ impl<'a> super::linearize::Linearizer<'a> {
     fn emit_bitfield_load_bytewise(
         &mut self,
         base: PseudoId,
-        byte_offset: usize,
-        bit_offset: u32,
-        bit_width: u32,
-        span: u32,
+        bf: Bitfield,
         typ: TypeId,
     ) -> PseudoId {
+        let Bitfield {
+            offset: byte_offset,
+            bit_offset,
+            bit_width,
+            access_bytes: span,
+        } = bf;
         let wide = bit_offset + bit_width > 32;
         let carrier = if wide {
             self.types.ulong_id
@@ -801,27 +833,21 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// qualifier and the marker is set from the field's type instead. Both
     /// halves are marked -- the read of the storage unit is as observable as
     /// the write of it.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_bitfield_store(
         &mut self,
         base: PseudoId,
-        byte_offset: usize,
-        bit_offset: u32,
-        bit_width: u32,
-        storage_size: u32,
+        bf: Bitfield,
         new_value: PseudoId,
         typ: TypeId,
     ) {
+        let Bitfield {
+            offset: byte_offset,
+            bit_offset,
+            bit_width,
+            access_bytes: storage_size,
+        } = bf;
         if !matches!(storage_size, 1 | 2 | 4 | 8 | 16) {
-            return self.emit_bitfield_store_bytewise(
-                base,
-                byte_offset,
-                bit_offset,
-                bit_width,
-                storage_size,
-                new_value,
-                typ,
-            );
+            return self.emit_bitfield_store_bytewise(base, bf, new_value, typ);
         }
 
         // Determine storage type based on storage unit size
@@ -922,17 +948,19 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// bits survive. Neither ever touches a byte outside the field's own span,
     /// which is what a wide read-modify-write could not promise: the span may
     /// end at the last byte of the object.
-    #[allow(clippy::too_many_arguments)]
     fn emit_bitfield_store_bytewise(
         &mut self,
         base: PseudoId,
-        byte_offset: usize,
-        bit_offset: u32,
-        bit_width: u32,
-        span: u32,
+        bf: Bitfield,
         new_value: PseudoId,
         typ: TypeId,
     ) {
+        let Bitfield {
+            offset: byte_offset,
+            bit_offset,
+            bit_width,
+            access_bytes: span,
+        } = bf;
         let wide = bit_offset + bit_width > 32;
         let carrier = if wide {
             self.types.ulong_id
@@ -1076,27 +1104,12 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             UnaryOp::Not => {
                 // Logical not: compare with 0
-                if is_float {
-                    let zero = self.emit_fconst(FloatVal::ZERO, typ);
-                    self.emit(Instruction::binop(
-                        Opcode::FCmpOEq,
-                        result,
-                        src,
-                        zero,
-                        typ,
-                        size,
-                    ));
+                let (op, zero) = if is_float {
+                    (Opcode::FCmpOEq, self.emit_fconst(FloatVal::ZERO, typ))
                 } else {
-                    let zero = self.emit_const(0, typ);
-                    self.emit(Instruction::binop(
-                        Opcode::SetEq,
-                        result,
-                        src,
-                        zero,
-                        typ,
-                        size,
-                    ));
-                }
+                    (Opcode::SetEq, self.emit_const(0, typ))
+                };
+                self.emit(self.compare_insn(op, result, (src, zero), typ));
                 return result;
             }
             UnaryOp::BitNot => Opcode::Not,
@@ -1257,32 +1270,40 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         };
 
-        // For comparison operations, use operand_typ to ensure correct size
-        // (comparisons produce int result but must operate at operand size)
-        let insn_typ = match opcode {
-            Opcode::SetEq
-            | Opcode::SetNe
-            | Opcode::SetLt
-            | Opcode::SetLe
-            | Opcode::SetGt
-            | Opcode::SetGe
-            | Opcode::SetB
-            | Opcode::SetBe
-            | Opcode::SetA
-            | Opcode::SetAe
-            | Opcode::FCmpOEq
-            | Opcode::FCmpONe
-            | Opcode::FCmpOLt
-            | Opcode::FCmpOLe
-            | Opcode::FCmpOGt
-            | Opcode::FCmpOGe => operand_typ,
-            _ => result_typ,
+        let insn = if opcode.is_comparison() {
+            self.compare_insn(opcode, result, (left, right), operand_typ)
+        } else {
+            let size = self.types.size_bits(result_typ);
+            Instruction::binop(opcode, result, left, right, result_typ, size)
         };
-        let insn_size = self.types.size_bits(insn_typ);
-        self.emit(Instruction::binop(
-            opcode, result, left, right, insn_typ, insn_size,
-        ));
+        self.emit(insn);
         result
+    }
+
+    /// A comparison of `operands`, which are of type `operand`, into
+    /// `target`, as C's relational and equality operators produce it: an
+    /// `int` that is 0 or 1 (C17 6.5.8p6, 6.5.9p3).
+    ///
+    /// The one place the linearizer decides what width a comparison reads.
+    /// An array or a function operand is compared as the pointer it decays
+    /// to (C17 6.3.2.1p3-4): typed as itself it has no width -- a function's
+    /// is 0 -- and both back ends raised that to 32 bits, so `if (weak_fn)`
+    /// and `foo == foo` compared the low half of an address.
+    pub(crate) fn compare_insn(
+        &self,
+        op: Opcode,
+        target: PseudoId,
+        operands: (PseudoId, PseudoId),
+        operand: TypeId,
+    ) -> Instruction {
+        let operand = match self.types.kind(operand) {
+            TypeKind::Array | TypeKind::Function => self.types.void_ptr_id,
+            _ => operand,
+        };
+        let width = self.types.size_bits(operand);
+        let int = self.types.int_id;
+        let result = (int, self.types.size_bits(int));
+        Instruction::compare(op, target, operands, (operand, width), result)
     }
 
     /// Emit complex arithmetic operation
@@ -1729,7 +1750,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         } else {
             Opcode::SetLt
         };
-        let cond = self.emit_int_binop(cmp, abs_c, abs_d, base_typ, base_size);
+        let cond = self.emit_compare(cmp, abs_c, abs_d, base_typ);
 
         // Both arms write their halves to `result_addr`, so there is no value
         // to merge and the void diamond serves: it builds the same blocks and
@@ -1878,20 +1899,13 @@ impl<'a> super::linearize::Linearizer<'a> {
             MathErrno::Ignored => sqrt(self),
             MathErrno::Set if !in_place => self.emit_library_call(&callee, &[(x, typ)], typ),
             MathErrno::Set => {
-                let size = self.types.size_bits(typ);
                 let zero = self.emit_fconst(FloatVal::ZERO, typ);
-                let below = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::FCmpOLt,
+                let below = self.emit_compare(Opcode::FCmpOLt, x, zero, typ);
+                let size = self.types.size_bits(typ);
+                self.emit_diamond(
                     below,
-                    x,
-                    zero,
                     typ,
                     size,
-                ));
-                self.emit_two_way(
-                    below,
-                    typ,
                     |lin| lin.emit_library_call(&callee, &[(x, typ)], typ),
                     sqrt,
                 )
@@ -1954,24 +1968,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.target,
         ));
         result
-    }
-
-    /// `cond ? taken() : fallthrough()`, each arm in a block of its own and
-    /// merged by a phi of type `typ`: for arms that may not both be
-    /// evaluated.
-    ///
-    /// The phi is as wide as `typ` is. A construct whose merge width is not
-    /// its type's -- a pointer-merged complex arm, a function designator,
-    /// whose `size_bits` is zero -- calls [`Self::emit_diamond`] and states it.
-    fn emit_two_way(
-        &mut self,
-        cond: PseudoId,
-        typ: TypeId,
-        taken: impl FnOnce(&mut Self) -> PseudoId,
-        fallthrough: impl FnOnce(&mut Self) -> PseudoId,
-    ) -> PseudoId {
-        let size = self.types.size_bits(typ);
-        self.emit_diamond(cond, typ, size, taken, fallthrough)
     }
 
     /// `cond ? then_arm() : else_arm()`, merged by a `size`-bit phi of type
@@ -2091,8 +2087,26 @@ impl<'a> super::linearize::Linearizer<'a> {
         typ: TypeId,
         size: u32,
     ) -> PseudoId {
+        debug_assert!(
+            !op.is_comparison(),
+            "a comparison goes through emit_compare"
+        );
         let dst = self.alloc_pseudo();
         self.emit(Instruction::binop(op, dst, lhs, rhs, typ, size));
+        dst
+    }
+
+    /// `op` comparing `lhs` and `rhs`, of type `typ` at `size` bits, into a
+    /// fresh `int` pseudo. See [`Self::compare_insn`].
+    pub(crate) fn emit_compare(
+        &mut self,
+        op: Opcode,
+        lhs: PseudoId,
+        rhs: PseudoId,
+        typ: TypeId,
+    ) -> PseudoId {
+        let dst = self.alloc_pseudo();
+        self.emit(self.compare_insn(op, dst, (lhs, rhs), typ));
         dst
     }
 
@@ -2108,7 +2122,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let name = format!("{prefix}_{}", sym.0);
         if let Some(func) = &mut self.current_func {
             func.add_pseudo(Pseudo::sym(sym, name.clone()));
-            func.add_local(&name, sym, typ, false, false, self.current_bb, None);
+            func.add_local(&name, sym, typ, self.current_bb, None);
         }
         sym
     }
@@ -2156,7 +2170,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         let (left_real, left_imag) = left;
         let (right_real, right_imag) = right;
         let (known, func_name) = routine_fn;
-        let sret = self.returns_via_hidden_pointer(complex_typ);
+        // libgcc's routines are ordinary functions of the target's own
+        // convention, whatever the function calling them is.
+        let conv = crate::abi::CallingConv::C;
+        let sret = self.returns_via_hidden_pointer(complex_typ, conv);
 
         // The result's storage, and the hidden pointer to it if there is one.
         let (result_sym, mut arg_vals, mut arg_types) = if sret {
@@ -2173,7 +2190,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         arg_types.extend([base_typ; 4]);
 
         // Compute ABI classification for the call
-        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let abi = get_abi_for_conv(conv, self.target);
         let param_classes: Vec<_> = arg_types
             .iter()
             .map(|&t| abi.classify_param(t, self.types))
@@ -2204,8 +2221,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.types.size_bits(complex_typ),
             )
         };
-        call_insn.abi_info = Some(call_abi_info);
-        call_insn.known = Some(known);
+        call_insn.extra_mut().abi_info = Some(call_abi_info);
+        call_insn.extra_mut().known = Some(known);
         self.emit(call_insn);
 
         result_sym
@@ -2255,18 +2272,12 @@ impl<'a> super::linearize::Linearizer<'a> {
         addr: PseudoId,
         complex_typ: TypeId,
     ) -> PseudoId {
-        let (real, imag, base_typ, base_bits) = self.load_complex_halves(addr, complex_typ);
+        let (real, imag, base_typ, _) = self.load_complex_halves(addr, complex_typ);
 
         let ne = self.complex_half_ops(base_typ).ne;
         let zero = self.complex_half_zero(base_typ);
-        let real_nz = self.alloc_pseudo();
-        self.emit(Instruction::binop(
-            ne, real_nz, real, zero, base_typ, base_bits,
-        ));
-        let imag_nz = self.alloc_pseudo();
-        self.emit(Instruction::binop(
-            ne, imag_nz, imag, zero, base_typ, base_bits,
-        ));
+        let real_nz = self.emit_compare(ne, real, zero, base_typ);
+        let imag_nz = self.emit_compare(ne, imag, zero, base_typ);
 
         let result = self.alloc_pseudo();
         let int_typ = self.types.int_id;
@@ -2295,7 +2306,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         right_addr: PseudoId,
         complex_typ: TypeId,
     ) -> PseudoId {
-        let (lre, lim, base_typ, base_bits) = self.load_complex_halves(left_addr, complex_typ);
+        let (lre, lim, base_typ, _) = self.load_complex_halves(left_addr, complex_typ);
         let (rre, rim, _, _) = self.load_complex_halves(right_addr, complex_typ);
 
         let ops = self.complex_half_ops(base_typ);
@@ -2305,14 +2316,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             (ops.ne, Opcode::Or)
         };
 
-        let real_cmp = self.alloc_pseudo();
-        self.emit(Instruction::binop(
-            half_op, real_cmp, lre, rre, base_typ, base_bits,
-        ));
-        let imag_cmp = self.alloc_pseudo();
-        self.emit(Instruction::binop(
-            half_op, imag_cmp, lim, rim, base_typ, base_bits,
-        ));
+        let real_cmp = self.emit_compare(half_op, lre, rre, base_typ);
+        let imag_cmp = self.emit_compare(half_op, lim, rim, base_typ);
 
         let result = self.alloc_pseudo();
         let int_typ = self.types.int_id;
@@ -2447,17 +2452,21 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// A constant condition jumps straight to the block it selects, and the
     /// other one gets no edge. Nothing else in the linearizer has to know:
     /// a block that nothing reaches is removed when the function is finished
-    /// (`dce::remove_unreachable_blocks`), and one a label, `case` or `default`
+    /// (`Function::remove_unreachable_blocks`), and one a label, `case` or `default`
     /// inside the dead arm still reaches keeps its edge and so survives.
+    ///
+    /// With no current block -- control cannot reach here -- the branch is
+    /// emitted into a fresh unreachable one, like every other terminator:
+    /// returning without a branch would leave `then_bb` and `else_bb` with one
+    /// predecessor fewer than their callers built them for, and nothing would
+    /// say so.
     pub(crate) fn branch_on(
         &mut self,
         cond: Controlling,
         then_bb: BasicBlockId,
         else_bb: BasicBlockId,
     ) {
-        let Some(current) = self.current_bb else {
-            return;
-        };
+        let current = self.current_or_unreachable_bb();
         match cond {
             Controlling::Constant(holds) => {
                 let target = if holds { then_bb } else { else_bb };
@@ -2485,32 +2494,17 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// `val != 0`, read the way `operand_typ` says to read it.
     pub(crate) fn emit_compare_zero(&mut self, val: PseudoId, operand_typ: TypeId) -> PseudoId {
-        let result = self.alloc_pseudo();
-        let size = self.types.size_bits(operand_typ);
         // A float is compared against 0.0, not against its bit pattern:
         // -0.0 is zero and every NaN is not.
-        if self.types.is_float(operand_typ) {
-            let zero = self.emit_fconst(FloatVal::ZERO, operand_typ);
-            self.emit(Instruction::binop(
+        let (op, zero) = if self.types.is_float(operand_typ) {
+            (
                 Opcode::FCmpONe,
-                result,
-                val,
-                zero,
-                operand_typ,
-                size,
-            ));
-            return result;
-        }
-        let zero = self.emit_const(0, operand_typ);
-        self.emit(Instruction::binop(
-            Opcode::SetNe,
-            result,
-            val,
-            zero,
-            operand_typ,
-            size,
-        ));
-        result
+                self.emit_fconst(FloatVal::ZERO, operand_typ),
+            )
+        } else {
+            (Opcode::SetNe, self.emit_const(0, operand_typ))
+        };
+        self.emit_compare(op, val, zero, operand_typ)
     }
 
     /// Emit short-circuit logical AND: a && b
@@ -2709,21 +2703,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         let info = self
             .types
             .find_member(struct_type, member)
-            .unwrap_or(MemberInfo {
-                offset: 0,
-                typ: target_typ,
-                bit_offset: None,
-                bit_width: None,
-                access_bytes: None,
-            });
-        let bitfield = match (info.bit_offset, info.bit_width, info.access_bytes) {
+            .unwrap_or_else(|| MemberInfo::standing_in(target_typ));
+        let bitfield = match info.bitfield() {
             // The target expression's type, not the member's declared one:
             // they name the same width and sign, and only the expression's
             // carries the object's qualifiers (C17 6.5.2.3p3), which is what
             // tells the bit-field emitters that the access is volatile.
-            (Some(bit_offset), Some(bit_width), Some(storage)) => {
-                Some((info.offset, bit_offset, bit_width, storage, target_typ))
-            }
+            Some(bf) => Some((bf, target_typ)),
             // Not a bit-field: fold the member offset into the base so the
             // load and the store share one address.
             _ => {
@@ -2738,7 +2724,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// `base + offset` as an address, or `base` itself when the offset is zero.
-    fn offset_address(&mut self, base: PseudoId, offset: i64) -> PseudoId {
+    pub(crate) fn offset_address(&mut self, base: PseudoId, offset: i64) -> PseudoId {
         if offset == 0 {
             return base;
         }
@@ -2757,10 +2743,8 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// The target's current value, read through an already-resolved place.
     pub(crate) fn load_rmw_place(&mut self, place: &RmwPlace, typ: TypeId) -> PseudoId {
-        if let Some((offset, bit_offset, bit_width, storage, field_typ)) = place.bitfield {
-            return self.emit_bitfield_load(
-                place.base, offset, bit_offset, bit_width, storage, field_typ,
-            );
+        if let Some((bf, field_typ)) = place.bitfield {
+            return self.emit_bitfield_load(place.base, bf, field_typ);
         }
         let size = self.types.size_bits(typ);
         let val = self.alloc_reg_pseudo();
@@ -2779,11 +2763,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         val: PseudoId,
         typ: TypeId,
     ) -> Option<(u32, TypeId)> {
-        if let Some((offset, bit_offset, bit_width, storage, field_typ)) = place.bitfield {
-            self.emit_bitfield_store(
-                place.base, offset, bit_offset, bit_width, storage, val, field_typ,
-            );
-            return Some((bit_width, field_typ));
+        if let Some((bf, field_typ)) = place.bitfield {
+            self.emit_bitfield_store(place.base, bf, val, field_typ);
+            return Some((bf.bit_width, field_typ));
         }
         let size = self.types.size_bits(typ);
         self.emit(Instruction::store(val, place.base, 0, typ, size));
@@ -2885,15 +2867,14 @@ impl<'a> super::linearize::Linearizer<'a> {
         // `z += 1.0` computed on a pointer bit pattern and stored the result
         // over the object -- the program then died reading it back.
         if self.types.is_complex(target_typ) && op != AssignOp::Assign {
-            let binop = match op {
-                AssignOp::AddAssign => Some(BinaryOp::Add),
-                AssignOp::SubAssign => Some(BinaryOp::Sub),
-                AssignOp::MulAssign => Some(BinaryOp::Mul),
-                AssignOp::DivAssign => Some(BinaryOp::Div),
-                // Every other compound operator is a constraint violation on a
-                // complex operand; leave those to the path that reports it.
-                _ => None,
-            };
+            // Every other compound operator is a constraint violation on a
+            // complex operand, which the parser has reported.
+            let binop = op.binary_op().filter(|b| {
+                matches!(
+                    b,
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+                )
+            });
 
             if let Some(binop) = binop {
                 let target_addr = self.linearize_lvalue(target);
@@ -3024,7 +3005,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             let target_addr = self.linearize_lvalue(target);
             let value_addr = self.linearize_lvalue(value);
 
-            self.emit_block_copy(target_addr, value_addr, target_size_bytes as i64);
+            let vol = self.block_volatility(target_typ, self.expr_type(value));
+            self.emit_block_copy(target_addr, value_addr, target_size_bytes as i64, vol);
 
             // The assignment's value is the target's new value, in the IR's
             // convention for an aggregate: its value when it fits in a

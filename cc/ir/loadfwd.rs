@@ -24,13 +24,16 @@
 // the wrong value unless every block that can be traversed between the two
 // is scanned. That region is the *intersection* of what the definition's
 // block reaches going forwards and what the load's block reaches going
-// backwards, and it has to be both: a backward walk alone climbs past the
-// definition -- fatally so when the two share a block, where it enumerates
-// the whole function above them -- and a forward walk alone runs off down
-// every path that never arrives.
+// backwards, and it has to be both: a backward walk alone takes in blocks
+// the definition never reaches, and a forward walk alone runs off down
+// every path that never arrives. Neither walk passes through the
+// definition's own block: a path that re-enters it runs the definition
+// again, so in a loop that stores and then loads, what the latch writes
+// after the load is not between the two.
 //
-// **The load's own block can be in that region.** When a back edge reaches
-// it, a clobber *after* the load runs *before* the next execution of it:
+// **The load's own block can be in that region.** When a cycle that avoids
+// the definition reaches it, a clobber *after* the load runs *before* the
+// next execution of it:
 //
 // ```c
 // a[0] = 0;
@@ -56,9 +59,9 @@
 use super::constfold::unambiguous_at;
 use super::dominate::{domtree_build, DomTree};
 use super::escape::EscapeInfo;
-use super::memloc::{is_same_access, may_alias, AddrMap, MemBase, MemLoc, ModuleInfo};
+use super::memloc::{is_ordinary_object, is_same_access, may_alias, AddrMap, MemLoc, ModuleInfo};
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
-use crate::types::{TypeId, TypeModifiers, TypeTable};
+use crate::types::{TypeId, TypeTable};
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
@@ -91,9 +94,9 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
             }
             // Each read of a volatile object is its own observable event, so
             // the value another access left behind is no answer for this one.
-            // `forwardable` declines a *named* volatile object; the marker is
-            // what declines `*p` for a `volatile int *p`, where the qualifier
-            // is on the access and there is no variable to ask.
+            // `is_ordinary_object` declines a *named* volatile object; the
+            // marker is what declines `*p` for a `volatile int *p`, where the
+            // qualifier is on the access and there is no variable to ask.
             if insn.is_volatile_access() {
                 continue;
             }
@@ -178,17 +181,15 @@ impl<'a> MemOracle<'a> {
     fn paths(&self) -> Option<&Paths> {
         self.paths
             .get_or_init(|| {
-                let esc = EscapeInfo::analyze(self.func);
+                let esc = EscapeInfo::analyze(self.func, self.types);
                 if esc.gave_up() {
                     return None;
                 }
-                let preds = build_preds(self.func);
-                let succs = invert(&preds);
                 Some(Paths {
                     esc,
                     dom: domtree_build(self.func),
-                    preds,
-                    succs,
+                    preds: self.func.predecessor_map(),
+                    succs: self.func.successor_map(),
                 })
             })
             .as_ref()
@@ -234,7 +235,7 @@ impl<'a> MemOracle<'a> {
         classify: impl Fn(&Instruction) -> Option<Candidate<T>>,
     ) -> Option<T> {
         let func = self.func;
-        if !forwardable(func, self.types, self.mi, loc) {
+        if !is_ordinary_object(func, self.types, self.mi, loc) {
             return None;
         }
 
@@ -337,7 +338,7 @@ impl<'a> MemOracle<'a> {
                 let typ = s.typ.unwrap_or(self.types.int_id);
                 let plain = self.types.fp_format(typ).is_none()
                     && !self.types.contains_volatile(typ)
-                    && !self.types.modifiers(typ).contains(TypeModifiers::ATOMIC);
+                    && !self.types.is_atomic(typ);
                 let byte = insn
                     .src
                     .get(1)
@@ -448,77 +449,54 @@ impl<'a> MemOracle<'a> {
         let def_block = func.blocks[bc].id;
         let load_block = func.blocks[bl].id;
 
+        let scan = |bi: usize, from: usize, to: usize| -> bool {
+            func.blocks[bi].insns[from..to]
+                .iter()
+                .all(|insn| insn.op == Opcode::Nop || !self.writes(paths, insn, loc))
+        };
+
+        // Every way back to the definition's block runs the definition
+        // again -- a block is entered only at its top -- so a path that
+        // passes it is a path from a *later* definition, and the definition's
+        // block bounds every walk below. In one block that leaves nothing but
+        // the instructions between the two: the definition dominates the
+        // load, so it comes first.
+        if bc == bl {
+            debug_assert!(ic < il, "a definition in the load's block precedes it");
+            return scan(bl, ic + 1, il);
+        }
+
         // Every block that can be entered on the way from the definition to
         // the load: forward-reachable from the definition's block *and*
-        // backward-reachable from the load's.
+        // backward-reachable from the load's, neither through the definition.
         //
         // The intersection is what makes this right, not either half. A
-        // backward walk alone climbs past the definition -- fatally so when
-        // the two share a block, where it enumerates the whole function above
-        // them although none of it runs between the two points. A forward
-        // walk alone runs off down every path that never reaches the load.
-        let Some(fwd) = reachable(&paths.succs, def_block) else {
+        // backward walk alone takes in blocks the definition never reaches;
+        // a forward walk alone runs off down every path that never reaches
+        // the load.
+        let Some(fwd) = reachable(&paths.succs, def_block, def_block) else {
             return false;
         };
-        let Some(back) = reachable(&paths.preds, load_block) else {
+        let Some(back) = reachable(&paths.preds, load_block, def_block) else {
             return false;
         };
         let region: HashSet<BasicBlockId> = fwd.intersection(&back).copied().collect();
 
-        let scan = |bi: usize, from: usize, to: usize| -> bool {
-            for i in from..to {
-                let insn = &func.blocks[bi].insns[i];
-                if insn.op == Opcode::Nop {
-                    continue;
-                }
-                if self.writes(paths, insn, loc) {
-                    return false;
-                }
-            }
-            true
-        };
-
-        // A back edge can put the load's own block in the region, and then
-        // the instructions *after* the load run before the next execution
-        // of it.
-        let load_block_wraps = region.contains(&load_block);
-
-        if bc == bl {
-            let to = if load_block_wraps {
-                func.blocks[bl].insns.len()
-            } else {
-                il
-            };
-            let from = if load_block_wraps { 0 } else { ic + 1 };
-            if !scan(bl, from, to) {
-                return false;
-            }
+        // A cycle through the load's block that avoids the definition puts
+        // that block in the region, and then the instructions *after* the
+        // load run before its next execution.
+        let load_end = if region.contains(&load_block) {
+            func.blocks[bl].insns.len()
         } else {
-            if !scan(bc, ic + 1, func.blocks[bc].insns.len()) {
-                return false;
-            }
-            let (from, to) = if load_block_wraps {
-                (0, func.blocks[bl].insns.len())
-            } else {
-                (0, il)
-            };
-            if !scan(bl, from, to) {
-                return false;
-            }
+            il
+        };
+        if !scan(bc, ic + 1, func.blocks[bc].insns.len()) || !scan(bl, 0, load_end) {
+            return false;
         }
-
-        for b in &region {
-            if *b == load_block {
-                continue;
-            }
-            let Some(bi) = func.block_index(*b) else {
-                return false;
-            };
-            if !scan(bi, 0, func.blocks[bi].insns.len()) {
-                return false;
-            }
-        }
-        true
+        region.iter().filter(|b| **b != load_block).all(|b| {
+            func.block_index(*b)
+                .is_some_and(|bi| scan(bi, 0, func.blocks[bi].insns.len()))
+        })
     }
 }
 
@@ -581,12 +559,12 @@ fn narrowing(
 /// Which byte of the store `s` the one-byte access `b` is, counting from
 /// the store's lowest address; `None` unless `s` writes all of `b`.
 fn byte_index(s: &MemLoc, b: &MemLoc) -> Option<u32> {
-    if s.base == MemBase::Unknown || s.base != b.base || s.size == 0 || s.size % 8 != 0 {
+    if s.base != b.base || s.size % 8 != 0 {
         return None;
     }
-    let at = b.offset?.checked_sub(s.offset?)?;
-    let at = u32::try_from(at).ok()?;
-    (at < s.size / 8).then_some(at)
+    let (start, end) = s.byte_extent()?;
+    let at = b.offset?;
+    (start..end).contains(&at).then(|| (at - start) as u32)
 }
 
 /// Byte `at`, counting from the lowest address, of the `width`-byte integer
@@ -599,58 +577,16 @@ fn byte_of(c: i128, width: u32, at: u32, little_endian: bool) -> Option<u8> {
     Some((c >> (8 * shift)) as u8)
 }
 
-/// May this location be forwarded from at all?
-fn forwardable(func: &Function, types: &TypeTable, mi: &ModuleInfo, loc: &MemLoc) -> bool {
-    if loc.offset.is_none() || loc.size == 0 {
-        return false;
-    }
-    // Volatility and atomicity are properties of the object, not of the
-    // instruction, so both ends are checked.
-    if let Some(t) = loc.typ {
-        let m = types.modifiers(t);
-        if m.contains(TypeModifiers::VOLATILE) || m.contains(TypeModifiers::ATOMIC) {
-            return false;
-        }
-    }
-    match &loc.base {
-        MemBase::Unknown => false,
-        MemBase::Local(p) => match func.local_of(*p) {
-            Some(l) => !l.is_volatile && !l.is_atomic,
-            None => false,
-        },
-        MemBase::Global(n) => {
-            let g = mi.global(n);
-            !g.is_volatile && !g.is_thread_local
-        }
-    }
-}
-
-/// Successors, as the exact inverse of the predecessor map, so the two can
-/// never disagree about an edge.
-fn invert(
-    preds: &HashMap<BasicBlockId, Vec<BasicBlockId>>,
-) -> HashMap<BasicBlockId, Vec<BasicBlockId>> {
-    // Each predecessor list is duplicate-free and each block has one, so a
-    // (p, b) pair arrives once: no duplicate can form. The search that used to
-    // guard against one made a block of many successors -- a big `switch` --
-    // quadratic in them.
-    let mut succs: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
-    for (b, ps) in preds {
-        for p in ps {
-            succs.entry(*p).or_default().push(*b);
-        }
-    }
-    succs
-}
-
-/// Every block with an edge path of length at least one from `seed`.
+/// Every block with an edge path of length at least one from `seed` that
+/// does not pass through `barrier`, which is never in the result.
 ///
 /// Length *at least one* is deliberate: `seed` itself is in the result only
-/// when it lies on a cycle, which is exactly the question `load_block_wraps`
+/// when it lies on a cycle, which is exactly the question a load's block
 /// asks.
 fn reachable(
     edges: &HashMap<BasicBlockId, Vec<BasicBlockId>>,
     seed: BasicBlockId,
+    barrier: BasicBlockId,
 ) -> Option<HashSet<BasicBlockId>> {
     let mut seen: HashSet<BasicBlockId> = HashSet::new();
     let mut work: Vec<BasicBlockId> = edges.get(&seed).cloned().unwrap_or_default();
@@ -660,7 +596,7 @@ fn reachable(
             return None;
         }
         budget -= 1;
-        if !seen.insert(b) {
+        if b == barrier || !seen.insert(b) {
             continue;
         }
         work.extend(edges.get(&b).cloned().unwrap_or_default());
@@ -668,42 +604,11 @@ fn reachable(
     Some(seen)
 }
 
-/// Predecessors from `children`, which `dce` maintains, rather than from
-/// `parents`, which it does not.
-///
-/// Blocks are visited one at a time, so a repeated edge from `bb` -- a
-/// conditional branch whose arms meet, an `asm goto` label that is also a
-/// successor -- can only duplicate the entry `bb` itself pushed last. Checking
-/// that one entry keeps the lists duplicate-free in the same order; searching
-/// the whole list made a join of many predecessors quadratic in them.
-fn build_preds(func: &Function) -> HashMap<BasicBlockId, Vec<BasicBlockId>> {
-    let mut preds: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
-    let mut add = |to: BasicBlockId, from: BasicBlockId| {
-        let e = preds.entry(to).or_default();
-        if e.last() != Some(&from) {
-            e.push(from);
-        }
-    };
-    for bb in &func.blocks {
-        for c in &bb.children {
-            add(*c, bb.id);
-        }
-        for insn in &bb.insns {
-            if let Some(ref asm) = insn.asm_data {
-                for (t, _) in &asm.goto_labels {
-                    add(*t, bb.id);
-                }
-            }
-        }
-    }
-    preds
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::memloc::ModuleInfo;
-    use crate::ir::{BasicBlock, Module, Pseudo, PseudoKind};
+    use crate::ir::memloc::{MemBase, ModuleInfo};
+    use crate::ir::{BasicBlock, FenceScope, MemoryOrder, Module, Pseudo, PseudoKind};
     use crate::target::Target;
 
     fn host_types() -> TypeTable {
@@ -729,7 +634,7 @@ mod tests {
             f.add_pseudo(Pseudo::sym(PseudoId(0), "a.0".into()));
             f.add_pseudo(Pseudo::val(PseudoId(5), 7));
             f.add_pseudo(Pseudo::val(PseudoId(6), 9));
-            f.add_local("a.0", PseudoId(0), i32t, false, false, None, None);
+            f.add_local("a.0", PseudoId(0), i32t, None, None);
             f.next_pseudo = 60;
             Build { f, types }
         }
@@ -746,7 +651,7 @@ mod tests {
 
         fn run(&mut self) -> bool {
             self.f.entry = self.f.blocks[0].id;
-            self.f.rebuild_block_idx();
+            self.f.rebuild_parents();
             let mi = module_info(&self.types);
             super::run(&mut self.f, &self.types, &mi)
         }
@@ -761,7 +666,7 @@ mod tests {
         /// says.
         fn byte(&mut self, at: i64, little_endian: bool) -> Option<u8> {
             self.f.entry = self.f.blocks[0].id;
-            self.f.rebuild_block_idx();
+            self.f.rebuild_parents();
             let mi = module_info(&self.types);
             let am = AddrMap::build(&self.f);
             let oracle = MemOracle::new(&self.f, &self.types, &mi, &am);
@@ -834,6 +739,29 @@ mod tests {
         assert_eq!(b.f.blocks[0].insns[4].src, vec![PseudoId(5)]);
     }
 
+    /// A signal fence emits nothing, but a handler on this thread may read
+    /// or write across it, so a store is not forwarded over it.
+    #[test]
+    fn loadfwd_refuses_across_a_signal_fence() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        let mut fence = Instruction::new(Opcode::Fence).with_memory_order(MemoryOrder::SeqCst);
+        fence.extra_mut().fence_scope = FenceScope::Signal;
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                fence,
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+            ],
+            vec![],
+        );
+        assert!(!b.run());
+        assert_eq!(b.op(0, 4), Opcode::Load);
+    }
+
     /// The same shape on a *global*, which any externally-linked callee can
     /// name. Nothing may be forwarded across the call.
     #[test]
@@ -886,6 +814,122 @@ mod tests {
         );
         assert!(!b.run());
         assert_eq!(b.op(1, 0), Opcode::Load);
+    }
+
+    /// A store, then the load, in one loop block: every iteration stores
+    /// before it loads, so the load always reads the store. A write *after*
+    /// the load runs before the next load only by going round again, through
+    /// the store. `for(;;){ a[0] = 7; s = a[0]; a[0] = 9; }` reads 7.
+    #[test]
+    fn loadfwd_forwards_within_one_loop_block() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                br(1),
+            ],
+            vec![1],
+        );
+        b.block(
+            1,
+            vec![
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                br(1),
+            ],
+            vec![1],
+        );
+        assert!(b.run());
+        assert_eq!(b.op(1, 1), Opcode::Copy);
+        assert_eq!(b.f.blocks[1].insns[1].src, vec![PseudoId(5)]);
+    }
+
+    /// The store in the loop header, the load in the body: a path round the
+    /// loop re-enters the header and stores again, so neither the header
+    /// above the store nor the body below the load lies between the two.
+    #[test]
+    fn loadfwd_forwards_from_a_loop_header_to_its_body() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                br(1),
+            ],
+            vec![1],
+        );
+        b.block(
+            1,
+            vec![
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                br(2),
+            ],
+            vec![2],
+        );
+        b.block(
+            2,
+            vec![
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                br(1),
+            ],
+            vec![1],
+        );
+        assert!(b.run());
+        assert_eq!(b.op(2, 0), Opcode::Copy);
+    }
+
+    /// An *inner* loop around the load that does not pass the store: its
+    /// latch's write reaches the load's next execution, so this still
+    /// refuses. What the two forwards above depend on is that every way
+    /// round goes back through the store.
+    #[test]
+    fn loadfwd_refuses_a_clobber_on_an_inner_loop_without_the_store() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        b.f.add_pseudo(Pseudo::val(PseudoId(7), 1));
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                br(1),
+            ],
+            vec![1],
+        );
+        b.block(
+            1,
+            vec![
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                br(2),
+            ],
+            vec![2],
+        );
+        b.block(
+            2,
+            vec![
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                br(3),
+            ],
+            vec![3],
+        );
+        b.block(
+            3,
+            vec![
+                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                cbr(PseudoId(7), 2, 4),
+            ],
+            vec![2, 4],
+        );
+        b.block(4, vec![ret()], vec![]);
+        assert!(!b.run());
+        assert_eq!(b.op(2, 0), Opcode::Load);
     }
 
     /// **Risk 3, the dominator chain is not every path.** The store
@@ -958,7 +1002,7 @@ mod tests {
         let mut b = Build::new();
         let i32t = b.types.int_id;
         let mut asm = Instruction::new(Opcode::Asm);
-        asm.asm_data = Some(Box::new(crate::ir::AsmData {
+        asm.extra_mut().asm_data = Some(Box::new(crate::ir::AsmData {
             template: String::new(),
             outputs: vec![],
             inputs: vec![],
@@ -986,7 +1030,11 @@ mod tests {
     fn loadfwd_refuses_a_volatile_local() {
         let mut b = Build::new();
         let i32t = b.types.int_id;
-        b.f.add_local("a.0", PseudoId(0), i32t, true, false, None, None);
+        let vol_i32 = b.types.intern(crate::types::Type::with_modifiers(
+            crate::types::TypeKind::Int,
+            crate::types::TypeModifiers::VOLATILE,
+        ));
+        b.f.add_local("a.0", PseudoId(0), vol_i32, None, None);
         b.block(
             0,
             vec![
@@ -1252,45 +1300,27 @@ mod tests {
         assert_eq!(b.op(0, 4), Opcode::Load);
     }
 
-    /// Predecessors come from `children`, which `dce` maintains, and never
-    /// from `parents`, which it does not.
-    #[test]
-    fn loadfwd_derives_predecessors_from_children() {
-        let mut b = Build::new();
-        b.block(0, vec![entry(), br(1)], vec![1]);
-        b.block(1, vec![br(1)], vec![1]);
-        b.f.entry = BasicBlockId(0);
-        // A stale `parents` must not be consulted.
-        b.f.blocks[1].parents = vec![BasicBlockId(9)];
-        let preds = build_preds(&b.f);
-        assert_eq!(
-            preds.get(&BasicBlockId(1)).map(Vec::as_slice),
-            Some(&[BasicBlockId(0), BasicBlockId(1)][..])
-        );
-    }
-
-    /// Successors are the exact inverse of predecessors, so the two can
-    /// never disagree about an edge -- which is what makes the region an
-    /// intersection rather than a guess.
+    /// A block is reachable from itself only along a cycle.
     #[test]
     fn loadfwd_reachability_is_at_least_one_edge() {
-        let mut preds: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
-        preds.insert(BasicBlockId(1), vec![BasicBlockId(0)]);
-        preds.insert(BasicBlockId(2), vec![BasicBlockId(1)]);
-        let succs = invert(&preds);
+        let mut succs: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
+        succs.insert(BasicBlockId(0), vec![BasicBlockId(1)]);
+        succs.insert(BasicBlockId(1), vec![BasicBlockId(2)]);
         // A block not on a cycle is not reachable from itself.
+        let none = BasicBlockId(99);
         assert_eq!(
-            reachable(&succs, BasicBlockId(0)),
+            reachable(&succs, BasicBlockId(0), none),
             Some([BasicBlockId(1), BasicBlockId(2)].into_iter().collect())
         );
         // With a back edge it is.
-        preds
-            .entry(BasicBlockId(1))
-            .or_default()
-            .push(BasicBlockId(2));
-        let succs = invert(&preds);
-        let r = reachable(&succs, BasicBlockId(1)).unwrap();
+        succs.insert(BasicBlockId(2), vec![BasicBlockId(1)]);
+        let r = reachable(&succs, BasicBlockId(1), none).unwrap();
         assert!(r.contains(&BasicBlockId(1)), "a cycle reaches its own head");
+        // But not through the barrier, which is never reached either.
+        let r = reachable(&succs, BasicBlockId(1), BasicBlockId(2)).unwrap();
+        assert!(r.is_empty(), "{r:?}");
+        let r = reachable(&succs, BasicBlockId(0), BasicBlockId(1)).unwrap();
+        assert!(r.is_empty(), "{r:?}");
     }
 
     /// A `Sym` target *is* storage: a struct-returning call writes its
@@ -1416,7 +1446,7 @@ mod tests {
             let typ = if which == "volatile" {
                 b.types.intern(crate::types::Type::with_modifiers(
                     crate::types::TypeKind::Char,
-                    TypeModifiers::VOLATILE,
+                    crate::types::TypeModifiers::VOLATILE,
                 ))
             } else {
                 b.types.float_id
@@ -1446,7 +1476,7 @@ mod tests {
             let x = b.konst(0x61);
             let ptr = b.types.char_ptr_id;
             let mut c = Instruction::call(None, "strlen", vec![PseudoId(10)], vec![ptr], i32t, 32);
-            c.known = known;
+            c.extra_mut().known = known;
             let insns = vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),

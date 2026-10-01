@@ -11,6 +11,9 @@
 //
 
 use super::ast::{BinaryOp, Expr, ExprKind, UnaryOp};
+use super::operand_rule::{
+    binary_operand_verdict, Operand, OperandClass, OperandVerdict, UnaryOperator,
+};
 use super::parser::Parser;
 use crate::diag;
 use crate::strings::StringId;
@@ -34,18 +37,31 @@ impl Parser<'_> {
     /// argument's own position are live, whereas by linearization the only
     /// position left points at whichever sub-expression was lowered last.
     ///
+    /// `callee` is the name the call was spelled with, when it was spelled
+    /// with one: an argument diagnostic names it, as gcc's does.
+    ///
     /// Answers whether the call is sound: `false` once either check reported
     /// an error, so a caller that goes on to compute the call in place knows
     /// not to convert an argument that cannot be converted.
     pub(super) fn check_call(
         &mut self,
         func_type: Option<TypeId>,
+        callee: Option<StringId>,
         args: &[Expr],
         call_pos: Position,
     ) -> bool {
-        let arity_ok = self.check_call_arity(func_type, args, call_pos);
-        let types_ok = self.check_argument_types(func_type, args);
+        let arity_ok = self.check_call_arity(func_type, callee, args, call_pos);
+        let types_ok = self.check_argument_types(func_type, callee, args);
         arity_ok && types_ok
+    }
+
+    /// The name a call through `callee` is spelled with: a function or a
+    /// pointer to one called by its identifier.
+    pub(super) fn callee_name(&self, callee: &Expr) -> Option<StringId> {
+        match callee.kind {
+            ExprKind::Ident(symbol) => Some(self.symbols.get(symbol).name),
+            _ => None,
+        }
     }
 
     /// The number of arguments against the prototype. `false` when that was
@@ -53,6 +69,7 @@ impl Parser<'_> {
     fn check_call_arity(
         &self,
         func_type: Option<TypeId>,
+        callee: Option<StringId>,
         args: &[Expr],
         call_pos: Position,
     ) -> bool {
@@ -68,34 +85,38 @@ impl Parser<'_> {
         let Some(params) = ft.params.as_ref() else {
             return true;
         };
-        let required = params.len();
+        let max = (!ft.variadic).then_some(params.len());
+        self.check_argument_count(callee, args.len(), params.len(), max, call_pos)
+    }
 
-        let variadic = ft.variadic;
-
-        let wrong = if variadic {
-            args.len() < required
-        } else {
-            args.len() != required
-        };
-        if !wrong {
+    /// Whether `given` arguments are at least `min` and at most `max` (no
+    /// limit when `None`), reporting the call to `callee` in gcc's words
+    /// when they are not. Every call's count is judged here: an ordinary
+    /// call's against its prototype, and a builtin's against the counts it
+    /// takes.
+    pub(super) fn check_argument_count(
+        &self,
+        callee: Option<StringId>,
+        given: usize,
+        min: usize,
+        max: Option<usize>,
+        call_pos: Position,
+    ) -> bool {
+        let fewer = given < min;
+        if !fewer && max.is_none_or(|max| given <= max) {
             return true;
         }
-
-        let expected = if variadic {
-            format!("at least {}", required)
-        } else {
-            required.to_string()
-        };
-        // The singular/plural split is baked into the English sentence, so no
-        // amount of substitution fixes it from outside -- both forms have to be
-        // msgids.
-        diag::error_plural(
-            call_pos,
-            "call expects {0} argument, but {1} given",
-            "call expects {0} arguments, but {1} given",
-            required,
-            &[&expected, &args.len().to_string()],
-        );
+        let callee = callee.and_then(|id| self.idents.get_opt(id));
+        match (fewer, callee) {
+            (true, Some(f)) => {
+                diag::error_args(call_pos, "too few arguments to function '{0}'", &[f])
+            }
+            (true, None) => diag::error(call_pos, &gettext("too few arguments to function")),
+            (false, Some(f)) => {
+                diag::error_args(call_pos, "too many arguments to function '{0}'", &[f])
+            }
+            (false, None) => diag::error(call_pos, &gettext("too many arguments to function")),
+        }
         false
     }
 
@@ -109,7 +130,12 @@ impl Parser<'_> {
     /// Arguments past a prototype's fixed parameters get the default argument
     /// promotions instead (p7), and an unprototyped callee has nothing to
     /// check against, so both are skipped.
-    fn check_argument_types(&mut self, func_type: Option<TypeId>, args: &[Expr]) -> bool {
+    fn check_argument_types(
+        &mut self,
+        func_type: Option<TypeId>,
+        callee: Option<StringId>,
+        args: &[Expr],
+    ) -> bool {
         // A vector argument goes by value under gcc, in vector registers; the
         // array model would pass its address. Checked for every argument,
         // prototyped or not.
@@ -163,22 +189,48 @@ impl Parser<'_> {
                 self.types.format_type(param, Some(self.idents)),
                 self.types.format_type(a, Some(self.idents)),
             );
+            let callee = callee.and_then(|id| self.idents.get_opt(id));
+            Self::report_argument_fault(fault, arg.pos, &n, callee, &p_name, &a_name);
             if fault.is_error() {
-                diag::error_args(
-                    arg.pos,
-                    "incompatible type for argument {0}: expected '{1}', got '{2}'",
-                    &[&n, &p_name, &a_name],
-                );
                 sound = false;
-            } else {
-                diag::warning_args(
-                    arg.pos,
-                    "passing argument {0} as '{1}' from '{2}' {3}",
-                    &[&n, &p_name, &a_name, fault.describe()],
-                );
             }
         }
         sound
+    }
+
+    /// Report argument `n`, of type `a_name`, that `fault` keeps from being
+    /// assigned to its parameter of type `p_name`. The callee is named when
+    /// the call spelled one, as gcc names it.
+    fn report_argument_fault(
+        fault: AssignFault,
+        pos: Position,
+        n: &str,
+        callee: Option<&str>,
+        p_name: &str,
+        a_name: &str,
+    ) {
+        match (fault.is_error(), callee) {
+            (true, Some(f)) => diag::error_args(
+                pos,
+                "incompatible type for argument {0} of '{1}': expected '{2}', got '{3}'",
+                &[n, f, p_name, a_name],
+            ),
+            (true, None) => diag::error_args(
+                pos,
+                "incompatible type for argument {0}: expected '{1}', got '{2}'",
+                &[n, p_name, a_name],
+            ),
+            (false, Some(f)) => diag::warning_args(
+                pos,
+                "passing argument {0} of '{1}' as '{2}' from '{3}' {4}",
+                &[n, f, p_name, a_name, fault.describe()],
+            ),
+            (false, None) => diag::warning_args(
+                pos,
+                "passing argument {0} as '{1}' from '{2}' {3}",
+                &[n, p_name, a_name, fault.describe()],
+            ),
+        }
     }
 
     /// C17 6.5.3.2p2: the operand of unary `*` shall have pointer type. A
@@ -292,36 +344,166 @@ impl Parser<'_> {
         is_vector
     }
 
-    /// C17 6.5.3.3p1: the operand of unary `+` and `-` has arithmetic type.
-    /// A vector is diagnosed on its own by `check_not_vector_value`, and an
-    /// operand with no type has been diagnosed already.
-    pub(super) fn check_unary_arithmetic_operand(&self, operand: &Expr, op: &str, pos: Position) {
-        let Some(t) = operand.typ else { return };
-        if !self.types.is_arithmetic(t) && !self.types.is_vector(t) {
-            diag::error_args(pos, "wrong type argument to {0}", &[op]);
+    /// Check the operand of a unary operator against the type its operator
+    /// requires (C17 6.5.3.3p1, 6.5.2.4p1, 6.5.3.1p1).
+    ///
+    /// Answers whether the operand passed, so the caller can leave the
+    /// result untyped after an error and spare the expressions around it a
+    /// second report of the same mistake. A vector operand passes: the
+    /// vector path has its own message. An operand with no type has been
+    /// diagnosed already.
+    pub(super) fn check_unary_operand(
+        &mut self,
+        op: UnaryOperator,
+        operand: &Expr,
+        pos: Position,
+    ) -> bool {
+        let Some(t) = operand.typ else { return true };
+        if self.types.is_vector(t) {
+            return true;
+        }
+        if self.types.kind(t) == TypeKind::Void {
+            diag::error(pos, &gettext("invalid use of void expression"));
+            return false;
+        }
+        let t = self.decayed_type(t);
+        if op.operand_class().admits(self.types, t) {
+            return true;
+        }
+        diag::error_args(pos, "wrong type argument to {0}", &[op.name()]);
+        false
+    }
+
+    /// Check an expression whose truth is tested -- the first operand of
+    /// `?:` (C17 6.5.15p2), the left operand of `&&` and `||`, and the
+    /// controlling expression of `if` and the loops (6.8.4.1p1, 6.8.5p2) --
+    /// for the scalar type each requires. Worded as gcc words it.
+    pub(super) fn check_truth_value(&mut self, cond: &Expr) -> bool {
+        let Some(t) = cond.typ else { return true };
+        if self.check_not_void(cond, cond.pos) || self.check_not_vector_value(Some(t), cond.pos) {
+            return false;
+        }
+        let t = self.decayed_type(t);
+        if OperandClass::Scalar.admits(self.types, t) {
+            return true;
+        }
+        let what = match self.types.kind(t) {
+            TypeKind::Union => "union".to_string(),
+            TypeKind::Struct => "struct".to_string(),
+            _ => self.types.format_type(t, Some(self.idents)),
+        };
+        diag::error_args(
+            cond.pos,
+            "used {0} type value where scalar is required",
+            &[&what],
+        );
+        false
+    }
+
+    /// Check a binary operator's operands (C17 6.5.5p2 through 6.5.14p2),
+    /// and a compound assignment's (6.5.16.2p1-2) through the operator it
+    /// applies.
+    ///
+    /// Answers whether the operation has a type: `false` after an error, so
+    /// the caller leaves the result untyped and an enclosing assignment or
+    /// operator does not report the same mistake again. gcc's warnings for
+    /// a pointer compared with an integer or with an unrelated pointer leave
+    /// the operation intact.
+    pub(super) fn check_binary_operands(
+        &mut self,
+        op: BinaryOp,
+        left: &Expr,
+        right: &Expr,
+        pos: Position,
+    ) -> bool {
+        // `&&` and `||` test their left operand for truth, as `if` would;
+        // gcc reports that test and the right operand independently.
+        let logical = matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr);
+        let left_ok = if logical {
+            self.check_truth_value(left)
+        } else {
+            self.check_has_value(left)
+        };
+        if !(self.check_has_value(right) && left_ok) {
+            return false;
+        }
+        let (Some(lt), Some(rt)) = (left.typ, right.typ) else {
+            return true;
+        };
+        let (lt, rt) = (self.decayed_type(lt), self.decayed_type(rt));
+        let l = self.binary_operand(op, left, lt, rt);
+        let r = self.binary_operand(op, right, rt, lt);
+        match binary_operand_verdict(self.types, op, l, r) {
+            OperandVerdict::Valid => true,
+            OperandVerdict::Invalid => {
+                // `&&` and `||` have tested the left operand for truth by
+                // now, and gcc names it by the `int` that test yields.
+                let lt = if logical { self.types.int_id } else { lt };
+                self.report_invalid_operands(op, lt, rt, pos);
+                false
+            }
+            OperandVerdict::PointerInteger => {
+                diag::warning(pos, &gettext("comparison between pointer and integer"));
+                true
+            }
+            OperandVerdict::DistinctPointers => {
+                diag::warning(
+                    pos,
+                    &gettext("comparison of distinct pointer types lacks a cast"),
+                );
+                true
+            }
         }
     }
 
-    /// C17 6.5.8p2: the operands of `<`, `>`, `<=` and `>=` are both real or
-    /// both pointers. A complex value has no ordering, so a relational
-    /// operator on one is a constraint violation; `==` and `!=` accept it.
-    pub(super) fn check_relational_operands(&self, op: BinaryOp, left: &Expr, right: &Expr) {
-        if !matches!(
-            op,
-            BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
-        ) {
-            return;
-        }
-        for operand in [left, right] {
-            if operand.typ.is_some_and(|t| self.types.is_complex(t)) {
-                diag::error(
-                    operand.pos,
-                    &gettext(
-                        "invalid operand to a relational operator: a complex value has no ordering",
-                    ),
-                );
-                return;
-            }
+    /// C17 6.5.5-6.5.14 require operands with a value: `f() + 1`, where `f`
+    /// returns void, has none, and c17 gives a vector none it can compute
+    /// with.
+    fn check_has_value(&self, operand: &Expr) -> bool {
+        !self.check_not_void(operand, operand.pos)
+            && !self.check_not_vector_value(operand.typ, operand.pos)
+    }
+
+    /// One operand of `op`, with its decayed type `typ`, beside an operand of
+    /// type `other`. Whether it is a null pointer constant matters only to a
+    /// comparison with a pointer, and costs a constant evaluation, so it is
+    /// asked only then.
+    fn binary_operand(&self, op: BinaryOp, e: &Expr, typ: TypeId, other: TypeId) -> Operand {
+        let null_constant = op.is_comparison()
+            && self.types.kind(other) == TypeKind::Pointer
+            && self.is_null_pointer_constant(e);
+        Operand { typ, null_constant }
+    }
+
+    /// gcc's "invalid operands to binary +", naming each operand by the type
+    /// the operator would have seen: decayed, unqualified, and promoted.
+    fn report_invalid_operands(
+        &mut self,
+        op: BinaryOp,
+        left: TypeId,
+        right: TypeId,
+        pos: Position,
+    ) {
+        let names = [left, right].map(|t| {
+            let t = self.operand_value_type(t);
+            self.types.format_type(t, Some(self.idents))
+        });
+        diag::error_args(
+            pos,
+            "invalid operands to binary {0} (have '{1}' and '{2}')",
+            &[op.spelling(), &names[0], &names[1]],
+        );
+    }
+
+    /// The type of an operand's value as an operator computes with it: an
+    /// integer narrower than `int`, or an enumeration, after the integer
+    /// promotions (C17 6.3.1.1p2).
+    fn operand_value_type(&mut self, typ: TypeId) -> TypeId {
+        let t = self.types.unqualified(typ);
+        if self.types.is_integer(t) && !self.types.is_complex(t) {
+            self.types.integer_promote(t)
+        } else {
+            t
         }
     }
 
@@ -366,12 +548,47 @@ impl Parser<'_> {
         let (Some(t), Some(v)) = (target.typ, value.typ) else {
             return;
         };
+        let null_constant = self.is_null_pointer_constant(value);
+        self.check_assignment_conversion(t, v, null_constant, pos);
+    }
+
+    /// Report a compound assignment whose operands the operator rejects
+    /// (C17 6.5.16.2p1-2), or whose result cannot be stored back.
+    ///
+    /// `E1 op= E2` computes `E1 op E2` and assigns it, so it is checked as
+    /// exactly that: the operator's own constraints first, then the
+    /// conversion of the operation's result to the target's type -- which is
+    /// how gcc finds `i += p` (an `int *` stored to an `int`) worth a warning
+    /// while `p += 1` is ordinary pointer arithmetic.
+    pub(super) fn check_compound_assignment(
+        &mut self,
+        op: BinaryOp,
+        target: &Expr,
+        value: &Expr,
+        pos: Position,
+    ) {
+        if !self.check_binary_operands(op, target, value, pos) {
+            return;
+        }
+        let Some(t) = target.typ else { return };
+        let left = self.lvalue_converted_type(t);
+        let result = self.binary_result_type(op, left, value);
+        self.check_assignment_conversion(t, result, false, pos);
+    }
+
+    /// Report a value of type `v` that cannot be converted to the type `t`
+    /// as if by assignment (C17 6.5.16.1p1). `null_constant` says whether the
+    /// value is a null pointer constant.
+    fn check_assignment_conversion(
+        &mut self,
+        t: TypeId,
+        v: TypeId,
+        null_constant: bool,
+        pos: Position,
+    ) {
         let t = self.decayed_type(t);
         let v = self.decayed_type(v);
-        let Some(fault) = self
-            .types
-            .assignment_fault(t, v, self.is_null_pointer_constant(value))
-        else {
+        let Some(fault) = self.types.assignment_fault(t, v, null_constant) else {
             return;
         };
         if fault == AssignFault::FunctionPointerVoid {
@@ -518,7 +735,7 @@ impl Parser<'_> {
         member: StringId,
         pos: Position,
     ) {
-        if !self.types.modifiers(object).contains(TypeModifiers::ATOMIC) {
+        if !self.types.is_atomic(object) {
             return;
         }
         let what = match self.types.kind(self.resolve_struct_type(object)) {

@@ -230,7 +230,7 @@ fn collect(func: &Function, ctx: &FoldCtx) -> Vec<Site> {
     let mut sites = Vec::new();
     for (b, bb) in func.blocks.iter().enumerate() {
         for (i, insn) in bb.insns.iter().enumerate() {
-            let Some(known) = insn.known.filter(|_| is_direct_call(insn)) else {
+            let Some(known) = insn.extra().known.filter(|_| is_direct_call(insn)) else {
                 continue;
             };
             // A local array's bytes are what the stores before this call
@@ -264,7 +264,9 @@ fn collect(func: &Function, ctx: &FoldCtx) -> Vec<Site> {
 
 /// Whether `insn` is a call by name, with nothing appended at inlining.
 fn is_direct_call(insn: &Instruction) -> bool {
-    insn.op == Opcode::Call && insn.indirect_target.is_none() && !insn.ends_with_va_arg_pack
+    insn.op == Opcode::Call
+        && insn.extra().indirect_target.is_none()
+        && !insn.extra().ends_with_va_arg_pack
 }
 
 /// What the call `insn` to `known` folds to, by the family it is in.
@@ -412,8 +414,7 @@ fn materialize(b: &mut Builder, ctx: &FoldCtx, call: &Instruction, folded: Folde
         }
         Folded::AtMost { n, len } => {
             let len = b.constant(i128::from(len), typ, size);
-            // A comparison records its operands' type (see `result_type_of`).
-            let below = b.binop(Opcode::SetB, n, len, typ, size);
+            let below = b.compare(Opcode::SetB, n, len, typ, size);
             b.select(below, n, len, typ, size)
         }
         Folded::ByteDiff(x, y) => {
@@ -482,8 +483,8 @@ fn make_call(b: &mut Builder, ctx: &FoldCtx, target: Option<PseudoId>, ret: Type
         b.types,
         ctx.target,
     );
-    insn.callee_binding = CalleeBinding::Library;
-    insn.known = Some(new.func);
+    insn.extra_mut().callee_binding = CalleeBinding::Library;
+    insn.extra_mut().known = Some(new.func);
     b.push(insn);
 }
 
@@ -655,10 +656,10 @@ pub(super) mod tests {
         let insns = run_on(&mut fx, &[("strchr", "my_strchr")]);
         let call = def(&insns, r);
         assert_eq!(call.op, Opcode::Call);
-        assert_eq!(call.func_name.as_deref(), Some("my_strchr"));
-        assert_eq!(call.known, Some(LibFn::Strchr));
-        assert_eq!(call.callee_binding, CalleeBinding::Library);
-        assert!(call.abi_info.is_some());
+        assert_eq!(call.extra().func_name.as_deref(), Some("my_strchr"));
+        assert_eq!(call.extra().known, Some(LibFn::Strchr));
+        assert_eq!(call.extra().callee_binding, CalleeBinding::Library);
+        assert!(call.extra().abi_info.is_some());
         assert_eq!(call.src[0], hay);
         assert_eq!(
             fx.module.functions[0].const_val(call.src[1]),
@@ -695,7 +696,12 @@ pub(super) mod tests {
         let p = fx.addr(&lc);
         let ulong = fx.types.ulong_id;
         fx.call(LibFn::Strlen, "strlen", &[p], ulong);
-        fx.func().blocks[0].insns.last_mut().unwrap().known = None;
+        fx.func().blocks[0]
+            .insns
+            .last_mut()
+            .unwrap()
+            .extra_mut()
+            .known = None;
         assert!(folds(&fx).is_empty());
     }
 }

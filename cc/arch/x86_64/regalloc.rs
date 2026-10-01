@@ -36,14 +36,18 @@
 //   Xmm0-Xmm7                   - FP arguments
 //   Rax, Xmm0                   - Return values
 //   Rbx, Rbp, R12-R15          - Callee-saved
+//
+// An `ms_abi` function's arguments all live in its incoming area instead,
+// and it saves Rsi, Rdi and Xmm6-Xmm15 as well (see win64.rs). Every call is
+// taken to clobber the System V set, which covers both conventions.
 // ============================================================================
 
-use super::x87::is_x87_float_to_int;
+use super::x87::{is_x87_float_to_int, uses_x87_scratch};
 use crate::arch::asm_constraints::OperandConstraint;
 use crate::arch::lir::FpSize;
 use crate::arch::regalloc::{
-    compute_live_intervals, find_call_positions, identify_addr_taken_syms, identify_fp_pseudos,
-    interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
+    compute_live_intervals, find_call_positions, identify_fp_pseudos, interval_crosses_call,
+    ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
 };
 use crate::float::FloatVal;
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
@@ -318,7 +322,8 @@ pub fn opcode_constraints(op: Opcode) -> RegConstraints {
             clobbers: &[Reg::Rax, Reg::Rcx],
         },
         // The atomic emitters use RAX/RCX as fixed scratch (and R8/R9 for the
-        // CAS operand spill), all of which are allocatable. Undeclared, any
+        // CAS success flag and expected-object address), all of which are
+        // allocatable. Undeclared, any
         // pseudo the allocator parked there whose live range crossed an atomic
         // operation was silently corrupted -- six live ints bracketing one
         // __c11_atomic_fetch_add summed to 22 instead of 31.
@@ -373,7 +378,7 @@ fn opcode_clobbers_r10_r11(op: Opcode) -> bool {
     // - `Phi` / `PhiSource` → lowered out by `cc/ir/lower.rs`
     //   before codegen runs.
     // - `Unreachable` → `ud2`.
-    // - `Fence` → single `mfence`/`sfence`/`lfence`.
+    // - `Fence` → `mfence` or nothing.
     // - `VaEnd` → no-op on x86_64 SysV.
     //
     // **Entry is dirty** — the function prologue's `rep stosq`
@@ -516,7 +521,7 @@ pub fn build_asm_instr_constraints_x86_64(
     insn: &Instruction,
 ) -> Option<crate::arch::asm_constraints::InstrConstraints<Reg>> {
     Some(crate::arch::asm_constraints::InstrConstraints::of_asm(
-        insn.asm_data.as_ref()?,
+        insn.extra().asm_data.as_ref()?,
         parse_x86_64_fixed_letter,
         parse_x86_64_class_letter,
         parse_gp_clobber_name,
@@ -674,6 +679,11 @@ impl XmmReg {
         }
     }
 
+    /// The DWARF register number: XMM0-XMM15 are 17-32 on x86-64.
+    pub fn dwarf_number(&self) -> u16 {
+        17 + *self as u16
+    }
+
     /// Floating-point argument registers (System V AMD64 ABI)
     pub fn arg_regs() -> &'static [XmmReg] {
         &[
@@ -797,6 +807,7 @@ pub struct RegAlloc {
     /// Next stack slot offset
     stack_offset: i32,
     /// Reserved when the function converts a long double to an integer.
+    x87_scratch: Option<X87Scratch>,
     x87_control_words: Option<X87ControlWords>,
     /// A source position for this function, for the frame diagnostics
     /// `grow_frame` and [`crate::abi::slot_bytes`] emit. `alloc_stack_slot` and
@@ -804,6 +815,8 @@ pub struct RegAlloc {
     func_pos: crate::diag::Position,
     /// Callee-saved registers that were used
     used_callee_saved: Vec<Reg>,
+    /// The XMM registers an `ms_abi` function must save and restore.
+    win64_xmm_saves: Vec<XmmReg>,
     /// Track which pseudos need FP registers (based on type)
     fp_pseudos: HashSet<PseudoId>,
     /// Track which pseudos are long double (use x87, need 16-byte stack slots)
@@ -828,8 +841,6 @@ pub struct RegAlloc {
     active_stack: Vec<crate::arch::regalloc::ActiveSlot>,
     /// Free stack slots keyed by size, available for reuse
     free_stack_slots: BTreeMap<i32, Vec<FreeSlot>>,
-    /// Sym pseudos whose address is taken (cannot participate in slot reuse)
-    addr_taken_syms: HashSet<PseudoId>,
     /// Per-block live-in sets for interference-based stack coloring
     live_in: Vec<HashSet<PseudoId>>,
     /// Per-block live-out sets for interference-based stack coloring
@@ -929,7 +940,7 @@ impl FrameBase {
             .iter()
             .flat_map(|b| b.insns.iter())
             .filter(|insn| matches!(insn.op, Opcode::Call))
-            .flat_map(|insn| insn.arg_types.iter())
+            .flat_map(|insn| insn.extra().arg_types.iter())
             .map(|t| types.alignment(*t) as i32)
             .max()
             .unwrap_or(8);
@@ -984,16 +995,27 @@ fn exempt_from_clobber(cp: &ConstraintPoint<Reg>, interval: &LiveInterval) -> bo
     cp.operand_survives(interval.pseudo, interval.start, interval.end)
 }
 
-/// Bytes reserved at the bottom of the locals area for the x87 scratch.
+/// The frame slot `x87.rs` stages a value through on its way into or out of
+/// the FPU -- `fild` and `fld` have no register form, so an immediate or a
+/// general register goes through memory.
 ///
-/// `x87.rs` needs a fixed address to stage an immediate or a general register
-/// through on its way into the FPU -- `fild` and `fld` have no register form.
-/// Reserving the region here makes that address the allocator's to give and
-/// the scratch's to keep; an unreserved address lands on the first local,
-/// because slot offsets start at zero.
-///
-/// See [`X86_64CodeGen::x87_scratch_addr`].
-pub(super) const X87_SCRATCH_BYTES: i32 = 16;
+/// Reserved for a function with an instruction that
+/// [`super::x87::uses_x87_scratch`], and only for those; every other frame
+/// starts its locals at zero. See [`X86_64CodeGen::x87_scratch_addr`], the
+/// one way to address it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct X87Scratch {
+    slot: i32,
+}
+
+impl X87Scratch {
+    /// Two eight-byte halves: `emit_x87_float_to_u64` uses both at once.
+    pub(super) const BYTES: i32 = 16;
+
+    pub(super) fn slot(self) -> i32 {
+        self.slot
+    }
+}
 
 /// The frame slot holding the two x87 control words a long double to integer
 /// conversion switches between.
@@ -1090,10 +1112,12 @@ impl RegAlloc {
             free_xmm_regs: XmmReg::allocatable().to_vec(),
             active: Vec::new(),
             active_xmm: Vec::new(),
-            stack_offset: X87_SCRATCH_BYTES,
+            stack_offset: 0,
+            x87_scratch: None,
             x87_control_words: None,
             func_pos: crate::diag::Position::default(),
             used_callee_saved: Vec::new(),
+            win64_xmm_saves: Vec::new(),
             fp_pseudos: HashSet::new(),
             ld_pseudos: HashSet::new(),
             quad_pseudos: HashSet::new(),
@@ -1103,7 +1127,6 @@ impl RegAlloc {
             spilled_xmm_args: Vec::new(),
             active_stack: Vec::new(),
             free_stack_slots: BTreeMap::new(),
-            addr_taken_syms: HashSet::new(),
             live_in: Vec::new(),
             live_out: Vec::new(),
             max_local_align: 8,
@@ -1128,17 +1151,25 @@ impl RegAlloc {
             // The prologue writes it, so the function must save it.
             self.used_callee_saved.push(base);
         }
+        let win64 = func.conv == crate::abi::CallingConv::Win64;
+        if win64 {
+            self.used_callee_saved
+                .extend_from_slice(&super::win64::CALLEE_SAVED_GP);
+        }
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         // Identify long double pseudos (use x87 not XMM)
         self.identify_ld_pseudos(func, types);
-        self.reserve_x87_control_words(func, types);
+        self.reserve_x87_frame(func, types);
         self.identify_x87_asm_operands(func);
         self.identify_quad_pseudos(func, types);
         // Identify 128-bit integer pseudos (always spill to 16-byte stack slots)
         self.identify_int128_pseudos(func, types);
-        self.addr_taken_syms = identify_addr_taken_syms(func);
-        self.allocate_arguments(func, types);
+        if win64 {
+            self.allocate_win64_arguments(func);
+        } else {
+            self.allocate_arguments(func, types);
+        }
 
         let result = self.compute_live_intervals(func);
         self.live_in = result.live_in;
@@ -1158,16 +1189,70 @@ impl RegAlloc {
             )
         });
         self.allocate_alloca_to_stack(func);
+        self.place_locals(func, types, &intervals);
         self.run_chordal_color(
             func,
-            types,
             intervals,
             &call_positions,
             &fp_call_positions,
             &constraint_points,
         );
+        if win64 {
+            self.win64_xmm_saves = self.win64_xmm_to_save(func);
+        }
 
         crate::arch::regalloc::LocationMap::from(self.locations.clone())
+    }
+
+    /// Give every argument of an `ms_abi` function its position's slot in
+    /// the incoming area -- the shadow slot for the first four, which the
+    /// prologue homes them to (`win64::homed_positions`). Each then lives in
+    /// memory for the whole function, like any stacked argument: nothing has
+    /// to track which register it arrived in, and nothing the body does can
+    /// overwrite it there.
+    fn allocate_win64_arguments(&mut self, func: &Function) {
+        for p in &func.pseudos {
+            if let PseudoKind::Arg(n) = p.kind {
+                let at = super::win64::incoming_offset(n as usize);
+                self.locations.insert(p.id, Loc::IncomingArg(at));
+            }
+        }
+        let positions = func.params.len() + usize::from(func.sret_arg().is_some());
+        self.named_incoming_end = super::win64::incoming_offset(positions);
+        crate::arch::regalloc::check_incoming_area(self.named_incoming_end, self.func_pos);
+    }
+
+    /// The XMM registers an `ms_abi` function has to save: every one Win64
+    /// makes callee-saved that the function may write.
+    ///
+    /// That is all ten once it calls anything -- the callee may be System V,
+    /// which preserves none of them, and a `memcpy` is a call too -- or runs
+    /// inline asm. Otherwise it is the ones the allocator handed out, and the
+    /// two scratch registers, which the back end writes without asking it.
+    fn win64_xmm_to_save(&self, func: &Function) -> Vec<XmmReg> {
+        let calls = func.blocks.iter().flat_map(|b| &b.insns).any(|insn| {
+            is_call_like_x86_64(insn.op) || matches!(insn.op, Opcode::Asm | Opcode::TlsAddr)
+        });
+        let allocated: HashSet<XmmReg> = self
+            .locations
+            .values()
+            .filter_map(|loc| match loc {
+                Loc::Xmm(x) => Some(*x),
+                _ => None,
+            })
+            .collect();
+        super::win64::CALLEE_SAVED_XMM
+            .iter()
+            .copied()
+            .filter(|x| {
+                calls || matches!(x, XmmReg::Xmm14 | XmmReg::Xmm15) || allocated.contains(x)
+            })
+            .collect()
+    }
+
+    /// The XMM registers an `ms_abi` function saves; empty for any other.
+    pub fn win64_xmm_saves(&self) -> &[XmmReg] {
+        &self.win64_xmm_saves
     }
 
     /// The positions that destroy every XMM register: the calls, and on
@@ -1193,9 +1278,11 @@ impl RegAlloc {
         self.free_xmm_regs = XmmReg::allocatable().to_vec();
         self.active.clear();
         self.active_xmm.clear();
-        self.stack_offset = X87_SCRATCH_BYTES;
+        self.stack_offset = 0;
+        self.x87_scratch = None;
         self.x87_control_words = None;
         self.used_callee_saved.clear();
+        self.win64_xmm_saves.clear();
         self.fp_pseudos.clear();
         self.ld_pseudos.clear();
         self.quad_pseudos.clear();
@@ -1205,32 +1292,39 @@ impl RegAlloc {
         self.spilled_xmm_args.clear();
         self.active_stack.clear();
         self.free_stack_slots.clear();
-        self.addr_taken_syms.clear();
         self.live_in.clear();
         self.live_out.clear();
         self.max_local_align = 8;
     }
 
-    /// Reserve the [`X87ControlWords`] slot if any instruction of `func` is a
-    /// long double to integer conversion.
-    fn reserve_x87_control_words(&mut self, func: &Function, types: &TypeTable) {
-        let converts = func
-            .blocks
-            .iter()
-            .flat_map(|block| &block.insns)
-            .any(|insn| is_x87_float_to_int(insn, types));
-        if !converts {
-            return;
-        }
+    /// Reserve the [`X87Scratch`] if an instruction of `func` stages a value
+    /// through it, and the [`X87ControlWords`] if one converts a long double
+    /// to an integer.
+    fn reserve_x87_frame(&mut self, func: &Function, types: &TypeTable) {
+        let insns = || func.blocks.iter().flat_map(|block| &block.insns);
         let frame_align = self.frame_align();
-        let slot = crate::arch::regalloc::grow_frame(
-            &mut self.stack_offset,
-            X87ControlWords::BYTES,
-            X87ControlWords::BYTES,
-            frame_align,
-            self.func_pos,
-        );
-        self.x87_control_words = Some(X87ControlWords { slot });
+        let mut reserve = |bytes: i32| {
+            crate::arch::regalloc::grow_frame(
+                &mut self.stack_offset,
+                bytes,
+                bytes,
+                frame_align,
+                self.func_pos,
+            )
+        };
+        if insns().any(|insn| uses_x87_scratch(insn, types)) {
+            let slot = reserve(X87Scratch::BYTES);
+            self.x87_scratch = Some(X87Scratch { slot });
+        }
+        if insns().any(|insn| is_x87_float_to_int(insn, types)) {
+            let slot = reserve(X87ControlWords::BYTES);
+            self.x87_control_words = Some(X87ControlWords { slot });
+        }
+    }
+
+    /// The x87 scratch slot, if this function stages a value through it.
+    pub(super) fn x87_scratch(&self) -> Option<X87Scratch> {
+        self.x87_scratch
     }
 
     /// The control-word slot, if this function converts a long double to an
@@ -1242,6 +1336,11 @@ impl RegAlloc {
     /// Identify pseudos that are long double (80-bit extended precision).
     /// These use x87 FPU instead of XMM and need 16-byte stack slots.
     fn identify_ld_pseudos(&mut self, func: &Function, types: &TypeTable) {
+        for (p, t) in crate::arch::regalloc::arg_pseudo_types(func) {
+            if types.kind(t) == crate::types::TypeKind::LongDouble {
+                self.ld_pseudos.insert(p);
+            }
+        }
         for block in &func.blocks {
             for insn in &block.insns {
                 // Check if this instruction operates on long double
@@ -1258,6 +1357,14 @@ impl RegAlloc {
                     for &src in &insn.src {
                         self.ld_pseudos.insert(src);
                     }
+                } else if insn.op.is_float_comparison()
+                    && insn
+                        .operand_type()
+                        .is_some_and(|t| types.kind(t) == crate::types::TypeKind::LongDouble)
+                {
+                    // Comparing two `long double`s: the operands are x87
+                    // values, the result an `int`.
+                    self.ld_pseudos.extend(insn.src.iter().copied());
                 }
             }
         }
@@ -1271,17 +1378,15 @@ impl RegAlloc {
     /// store into. A tied input is classed by the output it names.
     fn identify_x87_asm_operands(&mut self, func: &Function) {
         for insn in func.blocks.iter().flat_map(|b| &b.insns) {
-            let Some(asm) = insn.asm_data.as_ref().filter(|_| insn.op == Opcode::Asm) else {
+            let Some(asm) = insn
+                .extra()
+                .asm_data
+                .as_ref()
+                .filter(|_| insn.op == Opcode::Asm)
+            else {
                 continue;
             };
-            for c in asm.outputs.iter().chain(&asm.inputs) {
-                let constraint = match c.matching_output {
-                    Some(i) if i < asm.outputs.len() => &asm.outputs[i].constraint,
-                    _ => &c.constraint,
-                };
-                if c.is_memory() || !super::inline_asm::is_x87_constraint(constraint) {
-                    continue;
-                }
+            for c in super::inline_asm::x87_operands(asm) {
                 self.fp_pseudos.insert(c.pseudo);
                 if c.size > 64 {
                     self.ld_pseudos.insert(c.pseudo);
@@ -1296,6 +1401,11 @@ impl RegAlloc {
     /// wide on this target, and giving it a binary128 slot or a 16-byte move
     /// would be wrong in both directions.
     fn identify_quad_pseudos(&mut self, func: &Function, types: &TypeTable) {
+        for (p, t) in crate::arch::regalloc::arg_pseudo_types(func) {
+            if types.kind(t) == crate::types::TypeKind::Float128 {
+                self.quad_pseudos.insert(p);
+            }
+        }
         for block in &func.blocks {
             for insn in &block.insns {
                 let is_quad = insn
@@ -1308,6 +1418,12 @@ impl RegAlloc {
                     for &src in &insn.src {
                         self.quad_pseudos.insert(src);
                     }
+                } else if insn.op.is_float_comparison()
+                    && insn
+                        .operand_type()
+                        .is_some_and(|t| types.kind(t) == crate::types::TypeKind::Float128)
+                {
+                    self.quad_pseudos.extend(insn.src.iter().copied());
                 }
             }
         }
@@ -1316,6 +1432,11 @@ impl RegAlloc {
     /// Identify pseudos that are 128-bit integers (__int128).
     /// These need 16-byte stack slots and must never be allocated to GP registers.
     fn identify_int128_pseudos(&mut self, func: &Function, types: &TypeTable) {
+        for (p, t) in crate::arch::regalloc::arg_pseudo_types(func) {
+            if types.is_plain_int128(t) {
+                self.int128_pseudos.insert(p);
+            }
+        }
         // First pass: identify targets of 128-bit instructions and all sources
         // of 128-bit binary/unary ops.
         for block in &func.blocks {
@@ -1324,21 +1445,6 @@ impl RegAlloc {
                 let is_int128 = insn.typ.is_some_and(|t| types.is_plain_int128(t));
 
                 if is_int128 {
-                    // Comparison results are always small integers, not 128-bit.
-                    let is_comparison = matches!(
-                        insn.op,
-                        Opcode::SetEq
-                            | Opcode::SetNe
-                            | Opcode::SetLt
-                            | Opcode::SetLe
-                            | Opcode::SetGt
-                            | Opcode::SetGe
-                            | Opcode::SetB
-                            | Opcode::SetBe
-                            | Opcode::SetA
-                            | Opcode::SetAe
-                    );
-
                     // Lo64/Hi64: target is 64-bit (not int128), source is int128
                     // Pair64: target is int128, sources are 64-bit (not int128)
                     // AddC/AdcC/SubC/SbcC/UMulHi: 64-bit ops, not int128
@@ -1358,8 +1464,9 @@ impl RegAlloc {
                         _ => {
                             // For Load: target is int128, but src[0] is the address (64-bit pointer).
                             // For Store: src[0] is address (64-bit), src[1] is the int128 value.
-                            // For comparisons: target is a small integer result.
-                            if !is_comparison && !matches!(insn.op, Opcode::Load) {
+                            // A comparison is never here: its result is an `int`,
+                            // and `mapping` has split its 128-bit operands.
+                            if !matches!(insn.op, Opcode::Load) {
                                 if let Some(target) = insn.target {
                                     self.int128_pseudos.insert(target);
                                 }
@@ -1895,6 +2002,35 @@ impl RegAlloc {
     /// Only short-lived spills (no register available, not crossing calls/loops)
     /// should set `reusable=true`. Call-crossing and in-loop spills have
     /// unreliable interval estimates in complex control flow (e.g., computed gotos).
+    /// A fresh frame slot of `size` bytes at `alignment`, shared with nothing.
+    fn new_frame_slot(&mut self, size: i32, alignment: i32) -> i32 {
+        if alignment > self.max_local_align {
+            self.max_local_align = alignment;
+        }
+        let frame_align = self.frame_align();
+        crate::arch::regalloc::grow_frame(
+            &mut self.stack_offset,
+            size,
+            alignment,
+            frame_align,
+            self.func_pos,
+        )
+    }
+
+    /// Give every local its frame slot; see `arch::regalloc::place_locals`.
+    fn place_locals(&mut self, func: &Function, types: &TypeTable, intervals: &[LiveInterval]) {
+        let pos = self.func_pos;
+        let placed = crate::arch::regalloc::place_locals(func, types, pos, intervals, |b, a| {
+            self.new_frame_slot(b, a)
+        });
+        for (local, offset) in placed {
+            self.locations.insert(local, Loc::Stack(offset));
+            if func.local_of(local).is_some_and(|l| types.is_float(l.typ)) {
+                self.fp_pseudos.insert(local);
+            }
+        }
+    }
+
     fn alloc_stack_slot(
         &mut self,
         interval: &LiveInterval,
@@ -1902,10 +2038,8 @@ impl RegAlloc {
         alignment: i32,
         reusable: bool,
     ) {
-        // Track maximum alignment for dynamic stack alignment
-        if alignment > self.max_local_align {
-            self.max_local_align = alignment;
-        }
+        // A reused slot was counted toward the frame's alignment when it was
+        // made; a new one is counted by `new_frame_slot`.
         if reusable {
             if let Some((reused, past)) = self.try_reuse_stack_slot(size, alignment, interval) {
                 self.locations.insert(interval.pseudo, Loc::Stack(reused));
@@ -1918,14 +2052,7 @@ impl RegAlloc {
                 return;
             }
         }
-        let frame_align = self.frame_align();
-        let offset = crate::arch::regalloc::grow_frame(
-            &mut self.stack_offset,
-            size,
-            alignment,
-            frame_align,
-            self.func_pos,
-        );
+        let offset = self.new_frame_slot(size, alignment);
         self.locations.insert(interval.pseudo, Loc::Stack(offset));
         if reusable {
             self.active_stack.push(crate::arch::regalloc::ActiveSlot {
@@ -1953,11 +2080,9 @@ impl RegAlloc {
     ///   3. Commit: write Loc::Reg / Loc::Xmm for colored vertices,
     ///      allocate stack slots for spilled vertices, track
     ///      `used_callee_saved` for the prologue.
-    #[allow(clippy::too_many_arguments)]
     fn run_chordal_color(
         &mut self,
         func: &Function,
-        types: &TypeTable,
         intervals: Vec<LiveInterval>,
         call_positions: &[usize],
         fp_call_positions: &[usize],
@@ -2018,41 +2143,10 @@ impl RegAlloc {
                         // block-scope `extern` carries the same bare name as a
                         // parameter, and answering by name gave the global the
                         // parameter's slot instead of `Loc::Global`.
-                        if let Some(local_var) = func.local_of(interval.pseudo) {
-                            let size = crate::abi::slot_bytes(
-                                types.size_bytes(local_var.typ),
-                                self.func_pos,
-                                "an automatic object",
-                            );
-                            let size = size.max(8);
-                            let natural_align = types.alignment(local_var.typ) as i32;
-                            let alignment = if let Some(explicit) = local_var.explicit_align {
-                                explicit as i32
-                            } else {
-                                natural_align.max(8)
-                            };
-                            // Sym slot reuse disabled. The IR-level
-                            // interval of a Sym pseudo only captures
-                            // its direct Store/Load/SymAddr uses,
-                            // not the lifetime of register pseudos
-                            //
-                            // Future fix: extend the Sym's interval
-                            // to cover all derived register pseudos'
-                            // lifetimes. Until then, Sym slots are
-                            // permanent. The `addr_taken_syms`
-                            // computation stays in place — it remains
-                            // the correct gating predicate when slot
-                            // reuse is re-enabled.
-                            let _ = self.addr_taken_syms.contains(&interval.pseudo);
-                            let reusable = false;
-                            self.alloc_stack_slot(interval, size, alignment, reusable);
-                            if types.is_float(local_var.typ) {
-                                self.fp_pseudos.insert(interval.pseudo);
-                            }
-                        } else {
-                            self.locations
-                                .insert(interval.pseudo, Loc::Global(name.clone()));
-                        }
+                        // A local has its slot already: `place_locals`.
+                        debug_assert!(func.local_of(interval.pseudo).is_none());
+                        self.locations
+                            .insert(interval.pseudo, Loc::Global(name.clone()));
                         continue;
                     }
                     _ => {}
@@ -2676,7 +2770,7 @@ mod tests {
             })
             .partition(|c| c.constraint.starts_with('=') || c.constraint.starts_with('+'));
         let mut insn = Instruction::new(Opcode::Asm);
-        insn.asm_data = Some(Box::new(AsmData {
+        insn.extra_mut().asm_data = Some(Box::new(AsmData {
             template: String::new(),
             outputs,
             inputs,
@@ -2730,6 +2824,7 @@ mod tests {
         assert!(clobbers.contains(&Reg::Rax));
         assert_eq!(exempt, vec![PseudoId(3)]);
         pinned
+            .extra_mut()
             .asm_data
             .as_mut()
             .unwrap()
@@ -2756,10 +2851,10 @@ mod tests {
                 ("0", PseudoId(4)),
             ],
         );
-        let data = asm.asm_data.as_mut().unwrap();
+        let data = asm.extra_mut().asm_data.as_mut().unwrap();
         data.inputs[1].matching_output = Some(0);
         let mut ld = make_asm_insn(&[], &[("=f", PseudoId(5))]);
-        ld.asm_data.as_mut().unwrap().outputs[0].size = 128;
+        ld.extra_mut().asm_data.as_mut().unwrap().outputs[0].size = 128;
 
         let types = crate::types::TypeTable::new(&crate::target::Target::host());
         let mut func = Function::new("f", types.void_id);

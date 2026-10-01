@@ -11,15 +11,21 @@
 
 mod aggregate;
 mod asm;
+mod assume_aligned;
 pub mod ast;
 mod attribute;
+mod attribute_decl;
 mod bind;
+mod bit_builtin;
+mod builtin_args;
 mod builtin_expr;
 mod declaration;
 mod declarator;
 mod expr_check;
 mod expression;
+mod generic_builtin;
 mod library_builtin;
+mod operand_rule;
 pub mod parser;
 mod statement;
 mod toplevel;

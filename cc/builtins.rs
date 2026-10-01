@@ -25,6 +25,10 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_va_copy",
     "__builtin_va_arg_pack",
     "__builtin_va_arg_pack_len",
+    "__builtin_ms_va_list",
+    "__builtin_ms_va_start",
+    "__builtin_ms_va_end",
+    "__builtin_ms_va_copy",
     // Byte swap
     "__builtin_bswap16",
     "__builtin_bswap32",
@@ -496,9 +500,11 @@ pub fn is_builtin(name: &str) -> bool {
 
 /// Whether `target` has the builtin `name`, which is assumed to be one: all
 /// of them, except that the `_Float128` constants (`__builtin_inff128` and
-/// its siblings) need that type, which macOS does not have.
+/// its siblings) need that type, which macOS does not have, and the
+/// Microsoft `va_list` builtins exist only on x86-64.
 pub fn available_on(name: &str, target: &crate::target::Target) -> bool {
-    crate::arch::has_float128(target) || !name.ends_with("f128")
+    (crate::arch::has_float128(target) || !name.ends_with("f128"))
+        && crate::kw::spelling_exists_on(name, target.arch)
 }
 
 /// Check if a StringId is a supported builtin function (O(1) via tag lookup).

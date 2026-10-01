@@ -2264,7 +2264,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         if self
             .idents
             .lookup(&name)
-            .is_some_and(|id| crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR))
+            .is_some_and(|id| crate::kw::attribute_supported(id, self.pp.target.arch))
         {
             1
         } else {

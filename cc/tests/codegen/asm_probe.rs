@@ -133,6 +133,29 @@ pub fn frame_size(asm: &str, func: &str) -> Option<i64> {
     None
 }
 
+/// The host's assembly for `src` at `-O0`, for tests that need to see the
+/// directives rather than the program's answer.
+pub fn host_asm(prefix: &str, src: &str) -> String {
+    crate::common::asm_for_at(prefix, src, &[])
+}
+
+/// The section directive in force where `name:` is defined. Only the ELF
+/// section tests use it, and they run on an x86-64 Linux host.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn section_of<'a>(asm: &'a str, name: &str) -> Option<&'a str> {
+    let label = format!("{name}:");
+    let mut current = None;
+    for line in asm.lines() {
+        let t = line.trim();
+        if t == ".bss" || t == ".data" || t == ".text" || t.starts_with(".section ") {
+            current = Some(t);
+        } else if t == label {
+            return current;
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod verbose_asm {
     use super::asm_for_with;

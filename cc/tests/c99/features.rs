@@ -1368,3 +1368,200 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c99_stmt_expr_scope", code, &[]), 0);
 }
+
+/// A flexible array member may be initialized at the top level of a static
+/// object, as a GNU extension gcc accepts, but not inside an element of an
+/// array of such structures: each element would be a different size, which
+/// no array can hold. gcc rejects that with "initialization of flexible array
+/// member in a nested context", once per element; c17 accepted it and laid
+/// the elements out as if the member were empty.
+#[test]
+fn c99_flexible_array_member_initializer_in_an_array_is_rejected() {
+    crate::common::compile_expect_error(
+        "fam_nested_init",
+        "struct V { int n; const char s[]; };\n\
+         static const struct V arr[] = { { 1, \"x\" }, { 2, \"yy\" } };\n",
+        "initialization of flexible array member in a nested context",
+    );
+    crate::common::compile_expect_error(
+        "fam_nested_init_braced",
+        "struct E { int a; };\n\
+         struct W { int n; struct E e[]; };\n\
+         static struct W arr[] = { { 1, 4 }, { 2, 5 } };\n",
+        "initialization of flexible array member in a nested context",
+    );
+    // The top-level form stays accepted, and its bytes are laid out.
+    crate::common::compile_and_run_everywhere(
+        "fam_top_level_init",
+        r#"
+#include <string.h>
+struct V { int n; const char s[]; };
+static const struct V top = { 3, "abc" };          /* GNU extension: accepted */
+struct W { int n; int a[]; };
+static struct W w = { 2, { 7, 8 } };
+int main(void) {
+    if (top.n != 3 || strcmp(top.s, "abc") != 0) return 1;
+    if (w.a[0] != 7 || w.a[1] != 8) return 2;
+    return 0;
+}
+"#,
+    );
+}
+
+/// Where gcc lets a flexible array member be initialized (a GNU extension),
+/// case by case as gcc 13 decides it: a list of elements only at the static
+/// object's own top level, a string literal anywhere but in an array element,
+/// `{}` anywhere static, and nothing at all in an automatic object.
+#[test]
+fn c99_flexible_array_member_initializer_placement_matches_gcc() {
+    const NESTED: &str = "initialization of flexible array member in a nested context";
+    const NON_STATIC: &str = "non-static initialization of a flexible array member";
+    let v = "struct V { int n; const char s[]; };\n\
+             struct W { int n; int a[]; };\n\
+             struct O { int k; struct V v; };\n\
+             struct P { int k; struct W w; };\n";
+    let rejected: &[(&str, &str, &str)] = &[
+        (
+            "fam_empty_string_in_element",
+            "static struct V a[] = { { 1, \"\" } };",
+            NESTED,
+        ),
+        (
+            "fam_designated_in_element",
+            "static struct V a[] = { { .s = \"x\" } };",
+            NESTED,
+        ),
+        (
+            "fam_subscript_in_element",
+            "static struct V a[] = { [0].s[0] = 'a' };",
+            NESTED,
+        ),
+        (
+            "fam_string_in_member_in_element",
+            "static struct O a[] = { { 1, { 2, \"z\" } } };",
+            NESTED,
+        ),
+        (
+            "fam_braced_chars_in_member",
+            "static struct O o = { 1, { 2, { 'a' } } };",
+            NESTED,
+        ),
+        (
+            "fam_braced_ints_in_member",
+            "static struct P p = { 1, { 2, { 3 } } };",
+            NESTED,
+        ),
+        (
+            "fam_elided_ints_in_member",
+            "static struct P p = { 1, 2, 3 };",
+            NESTED,
+        ),
+        (
+            "fam_elided_ints_in_element",
+            "static struct W a[] = { 1, 2, 3, 4 };",
+            NESTED,
+        ),
+        (
+            "fam_automatic",
+            "void f(void) { struct V a = { 1, \"x\" }; (void)a; }",
+            NON_STATIC,
+        ),
+        (
+            "fam_automatic_empty",
+            "void f(void) { struct V a = { 1, {} }; (void)a; }",
+            NON_STATIC,
+        ),
+        (
+            "fam_automatic_in_element",
+            "void f(void) { struct V a[] = { { 1, \"x\" } }; (void)a; }",
+            NON_STATIC,
+        ),
+        (
+            "fam_block_compound_literal",
+            "void f(void) { const struct V *p = &(struct V){ 1, \"x\" }; (void)p; }",
+            NON_STATIC,
+        ),
+    ];
+    for (name, body, expected) in rejected {
+        crate::common::compile_expect_error(name, &format!("{v}{body}\n"), expected);
+    }
+    let accepted: &[(&str, &str)] = &[
+        (
+            "fam_absent_in_element",
+            "static struct V a[] = { { 1 }, { 2 } };",
+        ),
+        (
+            "fam_empty_braces_in_element",
+            "static struct V a[] = { { 1, {} } };",
+        ),
+        (
+            "fam_string_in_member",
+            "static struct O o = { 1, { 2, \"z\" } };",
+        ),
+        (
+            "fam_braced_string_in_member",
+            "static struct O o = { 1, { 2, { \"z\" } } };",
+        ),
+        (
+            "fam_empty_in_member",
+            "static struct P p = { 1, { 2, {} } };",
+        ),
+        (
+            "fam_static_local",
+            "void f(void) { static struct V a = { 1, \"x\" }; (void)a; }",
+        ),
+        (
+            "fam_automatic_absent",
+            "void f(void) { struct V a = { 1 }; (void)a; }",
+        ),
+        (
+            "fam_file_compound_literal",
+            "const struct V *p = &(struct V){ 1, \"x\" };",
+        ),
+    ];
+    for (name, body) in accepted {
+        crate::common::compile_expect_ok(name, &format!("{v}{body}\n"));
+    }
+}
+
+/// One diagnostic per element, and nothing else: the rejected member's bytes
+/// are skipped rather than laid out, so no further error follows.
+#[test]
+fn c99_flexible_array_member_nested_initializer_reports_each_element_once() {
+    let stderr = crate::common::compile_rejected(
+        "fam_nested_once",
+        "struct V { int n; const char s[]; };\n\
+         static const struct V arr[] = {\n\
+           { 1, \"x\" },\n\
+           { 2, \"yy\" },\n\
+           { 3, \"zzz\" }\n\
+         };\n",
+    );
+    let lines: Vec<&str> = stderr.lines().filter(|l| l.contains("error")).collect();
+    assert_eq!(lines.len(), 3, "stderr:\n{stderr}");
+    for (line, at) in lines.iter().zip([":3:", ":4:", ":5:"]) {
+        assert!(line.contains(at), "{line} should be reported at line {at}");
+    }
+}
+
+/// A brace-elided initializer for a flexible array member takes every value
+/// left in the list, as gcc lays it out; the member used to get only the
+/// first, and the rest were dropped as excess.
+#[test]
+fn c99_flexible_array_member_takes_every_elided_value() {
+    crate::common::compile_and_run_everywhere(
+        "fam_elided_values",
+        r#"
+struct W { int n; int a[]; };
+static struct W w = { 1, 2, 3 };
+struct W2 { int n; struct { int x, y; } a[]; };
+static struct W2 w2 = { 1, 2, 3, 4, 5 };
+int main(void) {
+    if (w.n != 1 || w.a[0] != 2 || w.a[1] != 3) return 1;
+    if (w2.n != 1 || w2.a[0].x != 2 || w2.a[0].y != 3) return 2;
+    if (w2.a[1].x != 4 || w2.a[1].y != 5) return 3;
+    return 0;
+}
+"#,
+    );
+}

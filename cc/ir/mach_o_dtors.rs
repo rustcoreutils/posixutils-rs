@@ -78,7 +78,7 @@ pub fn register_destructors_with_atexit(
         registrar.next_pseudo = 2;
 
         let mut call = Instruction::call(None, "atexit", vec![addr], vec![void_ptr], void, 0);
-        call.abi_info = Some(Box::new(CallAbiInfo::new(
+        call.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(
             vec![param_class.clone()],
             ret_class.clone(),
         )));

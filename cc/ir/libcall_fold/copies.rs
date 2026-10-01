@@ -84,7 +84,7 @@ impl Write {
 pub(super) fn fold(f: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded> {
     // `sprintf` reads an argument's type below, and the two are indexed in
     // parallel; `stdio::fold` requires the same.
-    if insn.src.len() != insn.arg_types.len() {
+    if insn.src.len() != insn.extra().arg_types.len() {
         return None;
     }
     match (f, insn.src.as_slice()) {
@@ -208,7 +208,7 @@ fn sprintf(
         // `known_callee` has already matched. Nothing has checked this one,
         // so `sprintf(d, "%s", 42)` would copy from address 42.
         // `rest[k]` was passed as `insn.arg_types[k + 2]`.
-        (b"%s", &[s]) if is_pointer(facts.types, *insn.arg_types.get(2)?) => s,
+        (b"%s", &[s]) if is_pointer(facts.types, *insn.extra().arg_types.get(2)?) => s,
         (_, []) if !text.contains(&b'%') => fmt,
         _ => return None,
     };
@@ -565,10 +565,14 @@ mod tests {
         let insns = run_on(&mut fx, &[]);
         let strlen = insns.iter().find(|i| i.op == Opcode::Call).unwrap();
         assert_eq!(
-            (strlen.func_name.as_deref(), strlen.known, &strlen.src[..]),
+            (
+                strlen.extra().func_name.as_deref(),
+                strlen.extra().known,
+                &strlen.src[..]
+            ),
             (Some("strlen"), Some(LibFn::Strlen), &[d][..])
         );
-        assert!(strlen.abi_info.is_some());
+        assert!(strlen.extra().abi_info.is_some());
         let memcpy = insns.iter().find(|i| i.op == Opcode::Memcpy).unwrap();
         let end = def(&insns, memcpy.src[0]);
         assert_eq!(
@@ -628,8 +632,8 @@ mod tests {
         let call = insns.iter().find(|i| i.op == Opcode::Call).unwrap();
         assert_eq!(
             (
-                call.func_name.as_deref(),
-                call.known,
+                call.extra().func_name.as_deref(),
+                call.extra().known,
                 call.target,
                 &call.src[..]
             ),

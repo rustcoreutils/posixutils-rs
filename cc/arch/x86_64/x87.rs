@@ -22,8 +22,9 @@
 //
 
 use super::codegen::X86_64CodeGen;
+use super::inline_asm::x87_operands;
 use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, X87BinOp, X87IntWidth, XmmOperand};
-use super::regalloc::{Loc, Reg, X87ControlWords, XmmReg, X87_SCRATCH_BYTES};
+use super::regalloc::{Loc, Reg, X87ControlWords, XmmReg};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
 use crate::float::FpFormat;
 use crate::ir::{Instruction, Opcode, PseudoId};
@@ -40,10 +41,16 @@ impl X86_64CodeGen {
     /// The reserved scratch address used to stage a value into the FPU.
     ///
     /// `fild`/`fld` have no register form, so an immediate or a general
-    /// register has to go through memory. The region is reserved by
-    /// [`X87_SCRATCH_BYTES`]; never address it by hand.
+    /// register has to go through memory: the function's
+    /// [`super::regalloc::X87Scratch`]. Never address it by hand.
     fn x87_scratch_addr(&self) -> MemAddr {
-        self.stack_mem(X87_SCRATCH_BYTES)
+        self.stack_mem(self.x87_scratch_slot())
+    }
+
+    fn x87_scratch_slot(&self) -> i32 {
+        self.x87_scratch
+            .expect("the allocator reserves the x87 scratch for every `uses_x87_scratch`")
+            .slot()
     }
 
     /// Push an inline-asm operand onto the x87 stack.
@@ -115,11 +122,14 @@ impl X86_64CodeGen {
         self.emit_fp_move_from_xmm(XmmReg::Xmm15, &home, fp_size);
     }
 
-    /// Check if this instruction operates on long double (80-bit x87)
+    /// Does this instruction operate on x87 `long double` values?
+    ///
+    /// Asked of its *operands*: a comparison of two `long double`s produces
+    /// an `int`, and is an x87 operation all the same.
     pub fn is_longdouble_op(&self, insn: &Instruction, types: &TypeTable) -> bool {
-        insn.size >= 80
+        insn.operand_width() >= 80
             && insn
-                .typ
+                .operand_type()
                 .is_some_and(|t| types.kind(t) == TypeKind::LongDouble)
     }
 
@@ -241,20 +251,18 @@ impl X86_64CodeGen {
             },
         });
 
-        // overflow_arg_area advances past the whole 16-byte slot.
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::R10),
-            dst: GpOperand::Reg(Reg::R11),
-        });
+        // overflow_arg_area advances past the whole 16-byte slot. R10 is free
+        // again once the value is loaded; R11 never is here, because it holds
+        // the va_list itself whenever `ap` is a pointer to one, and `overflow`
+        // is addressed through it.
         self.push_lir(X86Inst::Add {
             size: OperandSize::B64,
             src: GpOperand::Imm(16),
-            dst: Reg::R11,
+            dst: Reg::R10,
         });
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::R11),
+            src: GpOperand::Reg(Reg::R10),
             dst: GpOperand::Mem(overflow),
         });
 
@@ -663,13 +671,27 @@ impl X86_64CodeGen {
                 Reg::R11
             }
             Loc::IncomingArg(offset) => {
-                self.push_lir(X86Inst::Lea {
-                    dst: Reg::R11,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset,
-                    },
-                });
+                // The same two meanings as a stack slot, by what the
+                // parameter is: an aggregate passed by value lies in the
+                // incoming area, while a pointer parameter's slot holds the
+                // pointer -- which is how a Win64 by-reference argument past
+                // the fourth arrives.
+                let addr = MemAddr::BaseOffset {
+                    base: Reg::Rbp,
+                    offset,
+                };
+                if self.incoming_pointers.contains(&pseudo) {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(addr),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                } else {
+                    self.push_lir(X86Inst::Lea {
+                        dst: Reg::R11,
+                        addr,
+                    });
+                }
                 Reg::R11
             }
             _ => {
@@ -941,16 +963,8 @@ impl X86_64CodeGen {
             Loc::Imm(val) => {
                 // Immediate - store to temp location after callee-saved area
                 let temp_addr = self.x87_scratch_addr();
-                let op_size = if src_size <= 32 {
-                    OperandSize::B32
-                } else {
-                    OperandSize::B64
-                };
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Imm(*val as i64),
-                    dst: GpOperand::Mem(temp_addr.clone()),
-                });
+                let width = if src_size <= 32 { 32 } else { 64 };
+                self.store_imm(*val, width, temp_addr.clone(), Reg::R10);
                 temp_addr
             }
             Loc::Global(name) => MemAddr::RipRelative(crate::arch::lir::Symbol {
@@ -1117,7 +1131,7 @@ impl X86_64CodeGen {
         // Two disjoint halves of the 16-byte x87 scratch: the result goes in
         // the first, the 2^63 constant in byte 8 of the same object.
         let result_addr = self.x87_scratch_addr();
-        let const_addr = self.stack_field(X87_SCRATCH_BYTES, 8);
+        let const_addr = self.stack_field(self.x87_scratch_slot(), 8);
 
         let uid = self.unique_label_counter;
         self.unique_label_counter += 1;
@@ -1182,10 +1196,40 @@ impl X86_64CodeGen {
 /// The one rule for both the codegen dispatch and the allocator, which
 /// reserves the [`X87ControlWords`] slot for exactly these.
 pub(super) fn is_x87_float_to_int(insn: &Instruction, types: &TypeTable) -> bool {
-    matches!(insn.op, Opcode::FCvtS | Opcode::FCvtU)
-        && insn
-            .src_typ
-            .is_some_and(|t| types.kind(t) == TypeKind::LongDouble)
+    matches!(insn.op, Opcode::FCvtS | Opcode::FCvtU) && is_long_double(insn.src_typ, types)
+}
+
+/// An integer to `long double` conversion, which `emit_x87_int_to_float`
+/// computes.
+pub(super) fn is_x87_int_to_float(insn: &Instruction, types: &TypeTable) -> bool {
+    matches!(insn.op, Opcode::SCvtF | Opcode::UCvtF) && is_long_double(insn.typ, types)
+}
+
+/// A conversion between `long double` and another floating type, which
+/// `emit_x87_fp_cvt` computes.
+pub(super) fn is_x87_fp_cvt(insn: &Instruction, types: &TypeTable) -> bool {
+    insn.op == Opcode::FCvtF
+        && (is_long_double(insn.typ, types) || is_long_double(insn.src_typ, types))
+}
+
+/// Whether the code for `insn` may stage a value through the x87 scratch:
+/// the three conversions above, and an `asm` with a `float` or `double`
+/// operand on the x87 stack. The allocator reserves the scratch by this, so
+/// a new user of `x87_scratch_addr` must be named here.
+pub(super) fn uses_x87_scratch(insn: &Instruction, types: &TypeTable) -> bool {
+    is_x87_int_to_float(insn, types)
+        || is_x87_float_to_int(insn, types)
+        || is_x87_fp_cvt(insn, types)
+        || (insn.op == Opcode::Asm
+            && insn
+                .extra()
+                .asm_data
+                .as_ref()
+                .is_some_and(|asm| x87_operands(asm).any(|c| c.size <= 64)))
+}
+
+fn is_long_double(typ: Option<crate::types::TypeId>, types: &TypeTable) -> bool {
+    typ.is_some_and(|t| types.kind(t) == TypeKind::LongDouble)
 }
 
 /// The narrowest `fistp` holding every value of a `bits`-bit integer, or

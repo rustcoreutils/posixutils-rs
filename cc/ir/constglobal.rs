@@ -29,7 +29,8 @@
 // cannot see.
 //
 
-use super::{ConstValue, Function, Initializer, Instruction, Module, Opcode, PseudoKind};
+use super::memloc::{AddrMap, MemBase};
+use super::{ConstValue, Function, Initializer, Instruction, Module, Opcode};
 use crate::types::{TypeId, TypeTable};
 use std::collections::HashMap;
 
@@ -40,18 +41,26 @@ struct KnownGlobal {
     size: u32,
 }
 
-/// Replace every load of a `const` global with its initializer.
+/// The globals whose value is known for the whole run, by name: a fact about
+/// the module, gathered once and read by every function.
+pub struct KnownGlobals(HashMap<String, KnownGlobal>);
+
+/// Replace every load of a `const` global in `func` with its initializer.
 /// Returns whether anything changed.
-pub fn run(module: &mut Module, types: &TypeTable) -> bool {
-    let known = collect(module, types);
-    if known.is_empty() {
-        return false;
+///
+/// A load is matched to its global by the address it reads, resolved the way
+/// every memory pass resolves one, so a load through `&k` folds too. That is
+/// why this runs in the optimizer's loop rather than once ahead of it: an
+/// address resolves only once `instcombine` has folded the arithmetic that
+/// forms it.
+pub fn run(func: &mut Function, types: &TypeTable, known: &KnownGlobals) -> bool {
+    !known.0.is_empty() && propagate(func, types, &known.0)
+}
+
+impl KnownGlobals {
+    pub fn collect(module: &Module, types: &TypeTable) -> KnownGlobals {
+        KnownGlobals(collect(module, types))
     }
-    let mut changed = false;
-    for func in &mut module.functions {
-        changed |= propagate(func, types, &known);
-    }
-    changed
 }
 
 /// The globals this may fold, by name.
@@ -123,10 +132,11 @@ pub(crate) fn qualifies(g: &super::GlobalDef, types: &TypeTable) -> bool {
 fn propagate(func: &mut Function, types: &TypeTable, known: &HashMap<String, KnownGlobal>) -> bool {
     // Collected first: the rewrite needs `&mut func` for the pseudo, and the
     // scan needs the pseudo table to resolve each `Sym`.
+    let am = AddrMap::build(func);
     let mut sites: Vec<(usize, usize, ConstValue)> = Vec::new();
     for (b, bb) in func.blocks.iter().enumerate() {
         for (i, insn) in bb.insns.iter().enumerate() {
-            if let Some(v) = foldable_load(func, types, known, insn) {
+            if let Some(v) = foldable_load(func, &am, types, known, insn) {
                 sites.push((b, i, v));
             }
         }
@@ -157,11 +167,12 @@ fn propagate(func: &mut Function, types: &TypeTable, known: &HashMap<String, Kno
 /// The constant `insn` reads, if it is a load this may fold.
 fn foldable_load(
     func: &Function,
+    am: &AddrMap,
     types: &TypeTable,
     known: &HashMap<String, KnownGlobal>,
     insn: &Instruction,
 ) -> Option<ConstValue> {
-    if insn.op != Opcode::Load || insn.src.len() != 1 || insn.offset != 0 {
+    if insn.op != Opcode::Load || insn.src.len() != 1 {
         return None;
     }
     // The access itself is observable, whatever the object's initializer says
@@ -172,7 +183,10 @@ fn foldable_load(
     if insn.is_volatile_access() {
         return None;
     }
-    let PseudoKind::Sym(name) = &func.get_pseudo(insn.src[0])?.kind else {
+    // The start of the object: a member or an element is not the
+    // initializer, which is the whole object's value.
+    let loc = am.resolve(func, insn.src[0], insn.offset, insn.size, insn.typ);
+    let (MemBase::Global(name), Some(0)) = (&loc.base, loc.offset) else {
         return None;
     };
     let g = known.get(name.as_str())?;
@@ -198,7 +212,7 @@ fn foldable_load(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{BasicBlock, BasicBlockId, GlobalDef, Pseudo, PseudoId};
+    use crate::ir::{BasicBlock, BasicBlockId, GlobalDef, Pseudo, PseudoId, PseudoKind};
     use crate::target::Target;
     use crate::types::TypeModifiers;
 
@@ -229,7 +243,8 @@ mod tests {
 
     /// The load's opcode after the pass, and the value its target holds.
     fn fold(module: &mut Module, types: &TypeTable) -> (Opcode, Option<ConstValue>) {
-        run(module, types);
+        let known = KnownGlobals::collect(module, types);
+        run(&mut module.functions[0], types, &known);
         let func = &module.functions[0];
         let insn = &func.blocks[0].insns[1];
         let value = func.get_pseudo(PseudoId(1)).and_then(|p| match p.kind {
@@ -244,6 +259,43 @@ mod tests {
         let mut g = GlobalDef::new(name, typ, init);
         g.is_const = true;
         g
+    }
+
+    /// `module_loading`, with the load reading through `&global` at `offset`.
+    fn module_loading_through_address(global: GlobalDef, types: &TypeTable, offset: i64) -> Module {
+        let mut m = module_loading(global, types, types.int_id);
+        let b0 = &mut m.functions[0].blocks[0];
+        b0.insns[1].src = vec![PseudoId(2)];
+        b0.insns[1].offset = offset;
+        b0.insns.insert(
+            1,
+            Instruction::sym_addr(PseudoId(2), PseudoId(0), types.int_id),
+        );
+        m
+    }
+
+    /// The address a load reads is resolved the way every memory pass
+    /// resolves one: through `&k` is still `k`.
+    #[test]
+    fn a_load_through_the_globals_address_folds() {
+        let types = TypeTable::new(&Target::host());
+        let g = const_global("k", types.int_id, Initializer::Int(5));
+        let mut m = module_loading_through_address(g, &types, 0);
+        let known = KnownGlobals::collect(&m, &types);
+        assert!(run(&mut m.functions[0], &types, &known));
+        assert_eq!(m.functions[0].blocks[0].insns[2].op, Opcode::SetVal);
+    }
+
+    /// Four bytes in is not the object's start, whose value the initializer
+    /// is.
+    #[test]
+    fn a_load_past_the_globals_start_is_left_alone() {
+        let types = TypeTable::new(&Target::host());
+        let g = const_global("k", types.long_id, Initializer::Int(5));
+        let mut m = module_loading_through_address(g, &types, 4);
+        let known = KnownGlobals::collect(&m, &types);
+        assert!(!run(&mut m.functions[0], &types, &known));
+        assert_eq!(m.functions[0].blocks[0].insns[2].op, Opcode::Load);
     }
 
     #[test]

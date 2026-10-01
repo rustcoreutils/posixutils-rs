@@ -296,17 +296,23 @@ fn diagnostics_call_arity_mismatch_is_rejected() {
     compile_expect_error(
         "call_too_few",
         "int g(int,int);\nint main(void){return g(1);}\n",
-        "call expects 2 arguments",
+        "too few arguments to function 'g'",
     );
     compile_expect_error(
         "call_too_many",
         "int g(int);\nint main(void){return g(1,2,3);}\n",
-        "call expects 1 argument",
+        "too many arguments to function 'g'",
     );
     compile_expect_error(
         "call_variadic_short",
         "int g(int,int,...);\nint main(void){return g(1);}\n",
-        "call expects at least 2 arguments",
+        "too few arguments to function 'g'",
+    );
+    // A callee that is not a name is not named.
+    compile_expect_error(
+        "call_through_expression",
+        "int (*fp[1])(int);\nint main(void){return fp[0](1, 2);}\n",
+        "error: too many arguments to function\n",
     );
 }
 
@@ -353,11 +359,11 @@ fn diagnostics_incompatible_typedef_redefinition_is_rejected() {
     compile_expect_error(
         "typedef_conflict",
         "typedef int foo; typedef char foo; foo x;\n",
-        "incompatible type",
+        "different type",
     );
 }
 
-/// C11 legalized redefining a typedef to a *compatible* type, which two
+/// C11 legalized redefining a typedef to denote the *same* type (6.7p3), which two
 /// headers declaring the same alias rely on.
 #[test]
 fn diagnostics_compatible_typedef_redefinition_is_accepted() {
@@ -527,7 +533,7 @@ fn diagnostics_typedef_may_be_shadowed_in_an_inner_scope() {
     compile_expect_error(
         "typedef_conflict_same_scope",
         "typedef int T;\ntypedef double T;\n",
-        "incompatible type",
+        "different type",
     );
 }
 
@@ -687,6 +693,8 @@ fn diagnostics_keywords_are_rejected_as_declarator_names() {
         "__alignof__",
         "__alignof",
         "_Static_assert",
+        // A type specifier c17 provides no type for; in the name position it
+        // is the name, not the specifier.
         "_Imaginary",
         // Statement keywords.
         "if",
@@ -977,17 +985,17 @@ fn diagnostics_zero_parameter_prototype_arity_is_rejected() {
     compile_expect_error(
         "void_proto_too_many_args",
         "int f(void);\nint main(void){ return f(1, 2); }\nint f(void){ return 0; }\n",
-        "call expects 0 arguments",
+        "too many arguments to function 'f'",
     );
     compile_expect_error(
         "void_definition_too_many_args",
         "int f(void){ return 0; }\nint main(void){ return f(1, 2); }\n",
-        "call expects 0 arguments",
+        "too many arguments to function 'f'",
     );
     compile_expect_error(
         "void_proto_one_arg",
         "int f(void);\nint main(void){ return f(7); }\nint f(void){ return 0; }\n",
-        "call expects 0 arguments",
+        "too many arguments to function 'f'",
     );
 }
 
@@ -1002,7 +1010,7 @@ fn diagnostics_unprototyped_calls_are_accepted() {
             "int f();\nint main(void){ return f(1, 2); }\nint f(int a, int b){ return a + b; }\n",
         ),
         // A K&R definition is likewise unprototyped -- this used to be
-        // rejected with "call expects 2 arguments, but 1 given".
+        // rejected with "too few arguments to function 'f'".
         (
             "kr_definition_too_few",
             "int f(a, b) int a, b; { return a + b; }\nint main(void){ return f(1); }\n",
@@ -2011,11 +2019,16 @@ __attribute__((used)) static int used_var;
 
 /* Checked at compile time, so the assertion cannot be skipped by a test
    helper that only builds and never runs. */
-#if !__has_attribute(ms_abi) || !__has_attribute(gnu_inline)
+#if !__has_attribute(gnu_inline)
 #error "__has_attribute must admit the attributes the compiler honours"
 #endif
-#if __has_attribute(vector_size)
-#error "__has_attribute must not claim an attribute the compiler ignores"
+/* ms_abi is an x86-64 calling convention: honoured there, and on any other
+   target ignored with a warning and so not claimed, as in gcc. */
+#if defined(__x86_64__) != __has_attribute(ms_abi)
+#error "__has_attribute(ms_abi) must answer whether the target honours it"
+#endif
+#if !__has_attribute(vector_size) || !__has_attribute(__mode__)
+#error "__has_attribute must admit the type attributes the compiler implements"
 #endif
 #if !__has_attribute(weak) || !__has_attribute(transparent_union)
 #error "__has_attribute must admit the attributes the compiler accepts"
@@ -2564,6 +2577,10 @@ fn diagnostics_sizeof_of_an_incomplete_type_is_rejected() {
             "sz_undef_union",
             "union U;\nint main(void){ return (int)sizeof(union U); }\n",
         ),
+        (
+            "sz_undef_enum",
+            "enum E;\nint main(void){ return (int)sizeof(enum E); }\n",
+        ),
     ] {
         compile_expect_error(name, src, "incomplete type");
     }
@@ -2598,6 +2615,10 @@ fn diagnostics_sizeof_of_complete_types_is_accepted() {
     compile_expect_ok(
         "sz_defined_struct",
         "struct S { int a; };\nint main(void){ return (int)sizeof(struct S) - 4; }\n",
+    );
+    compile_expect_ok(
+        "sz_completed_enum",
+        "enum E;\nenum E { A };\nint main(void){ return (int)sizeof(enum E) - 4; }\n",
     );
     // GNU extensions gcc accepts, both giving 1.
     compile_expect_ok(
@@ -7167,7 +7188,7 @@ fn diagnostics_relational_operator_rejects_a_complex_operand() {
         compile_expect_error(
             &format!("complex_relational_{name}"),
             src,
-            "a complex value has no ordering",
+            "invalid operands to binary",
         );
     }
 }

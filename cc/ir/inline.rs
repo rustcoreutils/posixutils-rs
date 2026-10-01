@@ -65,6 +65,58 @@ const DEFAULT_ORDER_CAPACITY: usize = 16;
 
 // Inline Candidate Analysis
 
+/// A caller's size, as [`function_size`] measures it, for one decision.
+#[derive(Debug, Clone, Copy)]
+struct CallerSize {
+    /// Including every call site already accepted for splicing.
+    now: usize,
+    /// Before this pass inlined anything into it: what the growth limit is
+    /// proportional to.
+    original: usize,
+}
+
+impl CallerSize {
+    #[cfg(test)]
+    fn unchanged(size: usize) -> CallerSize {
+        CallerSize {
+            now: size,
+            original: size,
+        }
+    }
+}
+
+/// What an instruction costs in the size every inlining decision is made on:
+/// 0 for one that emits no code of its own once the function is simplified,
+/// 1 for anything else.
+///
+/// The free ones are bookkeeping -- `Nop`, `Entry`, a phi and its sources --
+/// and the `Copy`s and `SetVal`s promotion and linearization leave by the
+/// dozen: a constant becomes an immediate and a copy is propagated away. They
+/// are close to half of a raw count, which is what every threshold below was
+/// being compared against, and `Nop`s only grow as passes kill instructions.
+fn insn_cost(insn: &Instruction) -> usize {
+    match insn.op {
+        Opcode::Nop
+        | Opcode::Entry
+        | Opcode::Phi
+        | Opcode::PhiSource
+        | Opcode::Copy
+        | Opcode::SetVal
+        | Opcode::LifetimeEnd => 0,
+        _ => 1,
+    }
+}
+
+/// The size of `func` as the inliner measures it; see [`insn_cost`]. One
+/// rule for a callee and a caller alike.
+fn function_size(func: &Function) -> usize {
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .map(insn_cost)
+        .sum()
+}
+
 /// Metadata about a function's suitability for inlining
 #[derive(Debug, Clone, Default)]
 pub struct InlineCandidate {
@@ -198,10 +250,10 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
         ..Default::default()
     };
 
-    // Count instructions and check for disqualifying patterns
-    for bb in &func.blocks {
-        candidate.estimated_size += bb.insns.len();
+    candidate.estimated_size = function_size(func);
 
+    // Check for disqualifying patterns
+    for bb in &func.blocks {
         for insn in &bb.insns {
             match insn.op {
                 Opcode::VaStart => {
@@ -239,9 +291,10 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
 fn should_inline(
     candidate: &InlineCandidate,
     opt: Optimization,
-    caller_size: usize,
+    caller: CallerSize,
     caller_is_recursive: bool,
 ) -> bool {
+    let caller_size = caller.now;
     // Never inline if disqualifying conditions. These are the ones that make
     // a splice impossible rather than undesirable, and
     // `InlineCandidate::cannot_be_inlined` is where they are listed, so the
@@ -359,8 +412,13 @@ fn should_inline(
     //
     // GCC model: new_size <= max(base, LARGE_FUNCTION_INSNS) * (1 + growth%)
     // where base = max(caller_size, callee_size).
+    // `base` is the caller as it was before this pass inlined anything into
+    // it. Measured against its current size instead, the limit rose with
+    // every splice, and each of the pass's iterations let the caller grow by
+    // the whole allowance again.
     let new_size = caller_size + candidate.estimated_size;
-    let base = caller_size
+    let base = caller
+        .original
         .max(candidate.estimated_size)
         .max(LARGE_FUNCTION_INSNS);
     let limit = base + base * LARGE_FUNCTION_GROWTH / 100;
@@ -685,12 +743,12 @@ fn clone_instruction(
                         // 12-byte struct leaves four. Stored at a hardcoded
                         // 64 bits it overran the result local by four -- and
                         // it disagreed with the *load* in
-                        // `emit_two_reg_return`, which has always narrowed the
+                        // `emit_reg_aggregate_return`, which has always narrowed the
                         // high half to `min(64, struct_size - 64)`.
                         let high_bits = match insn.size.checked_sub(64) {
                             Some(rest) if rest > 0 => rest.min(64),
                             // Two registers means more than eight bytes, so
-                            // this is not a shape `emit_two_reg_return`
+                            // this is not a shape `emit_reg_aggregate_return`
                             // produces. Keep the old width rather than emit a
                             // store of no bits at all.
                             _ => 64,
@@ -728,11 +786,10 @@ fn clone_instruction(
                         // Asked of the `Ret`'s own classification, which is
                         // what `returns_two_regs` just above asks and all
                         // this pass has: it carries no `TypeTable` and cannot
-                        // classify anything itself. Only the one-SSE shape
-                        // reaches here today -- `Function::ret_is_address`
-                        // still keeps an x87 aggregate and an HFA out of the
-                        // inliner entirely, for the reason recorded where it
-                        // is set.
+                        // classify anything itself -- and every such `Ret`
+                        // carries one: `emit_reg_aggregate_return` attaches
+                        // it to every aggregate returned in registers, a
+                        // four-`double` HFA included.
                         //
                         // Phi-ing the source instead handed the caller a
                         // pointer where the value belonged:
@@ -744,7 +801,7 @@ fn clone_instruction(
                         // changed the answer, and only for this shape: the
                         // two-register return stores its halves just above,
                         // and an aggregate of eight bytes or less never
-                        // reaches `emit_two_reg_return` at all, so its `Ret`
+                        // reaches `emit_reg_aggregate_return` at all, so its `Ret`
                         // already carries a loaded value.
                         //
                         // `insn.size` is the aggregate's own width, in the
@@ -847,12 +904,14 @@ fn clone_instruction(
                 .iter()
                 .map(|&s| ctx.remap_pseudo(s, callee_func))
                 .collect();
-            new_insn.switch_cases = insn
+            new_insn.extra_mut().switch_cases = insn
+                .extra()
                 .switch_cases
                 .iter()
                 .map(|(lo, hi, bb)| (*lo, *hi, ctx.remap_bb(*bb)))
                 .collect();
-            new_insn.switch_default = insn.switch_default.map(|bb| ctx.remap_bb(bb));
+            new_insn.extra_mut().switch_default =
+                insn.extra().switch_default.map(|bb| ctx.remap_bb(bb));
             vec![new_insn]
         }
 
@@ -889,6 +948,16 @@ fn clone_instruction(
             vec![new_insn]
         }
 
+        // The local it names is the callee's, cloned under a new pseudo.
+        Opcode::LifetimeEnd => {
+            let mut new_insn = insn.clone();
+            new_insn.extra_mut().lifetime_of = insn
+                .extra()
+                .lifetime_of
+                .map(|l| ctx.remap_pseudo(l, callee_func));
+            vec![new_insn]
+        }
+
         // Call instructions: remap arguments but keep function name
         Opcode::Call => {
             let mut new_insn = insn.clone();
@@ -899,7 +968,8 @@ fn clone_instruction(
                 .map(|s| ctx.remap_pseudo(*s, callee_func))
                 .collect();
             // For indirect calls, also remap the function pointer pseudo
-            new_insn.indirect_target = insn
+            new_insn.extra_mut().indirect_target = insn
+                .extra()
                 .indirect_target
                 .map(|t| ctx.remap_pseudo(t, callee_func));
 
@@ -907,19 +977,27 @@ fn clone_instruction(
             // arguments belong on the end, and now they are known. `src`,
             // `arg_types` and `abi_info.params` are parallel and indexed in
             // parallel by both backends, so all three grow together.
-            if new_insn.ends_with_va_arg_pack {
+            if new_insn.extra().ends_with_va_arg_pack {
                 new_insn.src.extend_from_slice(&ctx.forwarded.vals);
-                new_insn.arg_types.extend_from_slice(&ctx.forwarded.types);
-                if let Some(abi) = new_insn.abi_info.as_mut() {
+                new_insn
+                    .extra_mut()
+                    .arg_types
+                    .extend_from_slice(&ctx.forwarded.types);
+                if let Some(abi) = new_insn.extra_mut().abi_info.as_mut() {
                     abi.params.extend_from_slice(&ctx.forwarded.classes);
                 }
                 // Anything spliced in is variadic by construction: it came
                 // from past the callee's declared parameters. If the inner
                 // call had no variadic tail of its own, one starts here.
                 let fixed = new_insn.src.len() - ctx.forwarded.vals.len();
-                new_insn.variadic_arg_start =
-                    Some(new_insn.variadic_arg_start.unwrap_or(fixed).min(fixed));
-                new_insn.ends_with_va_arg_pack = false;
+                new_insn.extra_mut().variadic_arg_start = Some(
+                    new_insn
+                        .extra()
+                        .variadic_arg_start
+                        .unwrap_or(fixed)
+                        .min(fixed),
+                );
+                new_insn.extra_mut().ends_with_va_arg_pack = false;
             }
 
             // Keep func_name and other call metadata unchanged
@@ -969,7 +1047,7 @@ fn clone_instruction(
         // All other instructions: remap target and sources
         _ => {
             debug_assert!(
-                insn.switch_cases.is_empty(),
+                insn.extra().switch_cases.is_empty(),
                 "unexpected switch_cases in {:?} during inlining",
                 insn.op
             );
@@ -997,7 +1075,7 @@ fn clone_instruction(
             }
 
             // Remap pseudos inside inline asm operands
-            if let Some(ref mut asm_data) = new_insn.asm_data {
+            if let Some(ref mut asm_data) = new_insn.extra_mut().asm_data {
                 for output in &mut asm_data.outputs {
                     output.pseudo = ctx.remap_pseudo(output.pseudo, callee_func);
                 }
@@ -1116,6 +1194,23 @@ fn split_caller_at_call(
     continuation_bb
 }
 
+/// Whether inlining `callee` at `call` would hand its caller's arguments
+/// on through `__builtin_va_arg_pack()` to a call of a different calling
+/// convention.
+///
+/// The forwarded arguments are as `call`'s convention passes them -- a Win64
+/// three-byte struct as a pointer to a copy, a System V one as its bits --
+/// and their classifications were made under it, so splicing them into a
+/// call of another convention would describe them wrongly. That call is
+/// left alone.
+fn forwards_across_conventions(call: &Instruction, callee: &Function) -> bool {
+    let conv = |insn: &Instruction| insn.extra().abi_info.as_ref().map(|ai| ai.conv);
+    let outer = conv(call);
+    callee.blocks.iter().flat_map(|b| &b.insns).any(|insn| {
+        insn.op == Opcode::Call && insn.extra().ends_with_va_arg_pack && conv(insn) != outer
+    })
+}
+
 /// Inline a specific call site
 /// Returns true if inlining was performed
 fn inline_call_site(
@@ -1131,6 +1226,9 @@ fn inline_call_site(
     if call_insn.op != Opcode::Call {
         return false;
     }
+    if forwards_across_conventions(call_insn, callee) {
+        return false;
+    }
 
     // Extract call info before borrowing mutably
     let call_args = call_insn.src.clone();
@@ -1143,6 +1241,7 @@ fn inline_call_site(
     let forwarded = {
         let first = callee.params.len();
         let classes = call_insn
+            .extra()
             .abi_info
             .as_ref()
             .map(|abi| abi.params.clone())
@@ -1150,6 +1249,7 @@ fn inline_call_site(
         ForwardedArgs {
             vals: call_insn.src.get(first..).unwrap_or_default().to_vec(),
             types: call_insn
+                .extra()
                 .arg_types
                 .get(first..)
                 .unwrap_or_default()
@@ -1443,8 +1543,6 @@ fn inline_call_site(
                 super::LocalVar {
                     sym: new_sym,
                     typ: local_var.typ,
-                    is_volatile: local_var.is_volatile,
-                    is_atomic: local_var.is_atomic,
                     decl_block: new_decl_block,
                     explicit_align: local_var.explicit_align,
                 },
@@ -1556,6 +1654,7 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
     }
 
     let mut any_changed = false;
+    let original_sizes: Vec<usize> = module.functions.iter().map(function_size).collect();
 
     // Iterate to handle nested inlining
     for _iteration in 0..MAX_INLINE_ITERATIONS {
@@ -1565,13 +1664,15 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
         let mut changed_this_iteration = false;
 
         // Process each function
-        for func_idx in 0..module.functions.len() {
+        for (func_idx, &original_size) in original_sizes.iter().enumerate() {
             let caller_name = module.functions[func_idx].name.clone();
-            let mut caller_size: usize = module.functions[func_idx]
-                .blocks
-                .iter()
-                .map(|b| b.insns.len())
-                .sum();
+            // The size the caller will have once the call sites already
+            // accepted are spliced in. Every decision is made before any
+            // splice, so measuring the caller once -- as this did, with a
+            // refresh after the splices that no decision could see -- let any
+            // number of small callees each pass the growth and stack caps
+            // against the same unchanged size.
+            let mut caller_size = function_size(&module.functions[func_idx]);
 
             // Check if caller is recursive (calls itself directly).
             // NOTE: mutual recursion (A→B→A) is not detected; those callers
@@ -1593,11 +1694,20 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
                         continue;
                     };
                     if let Some(candidate) = candidates.get(callee_name) {
-                        if should_inline(candidate, opt, caller_size, caller_is_recursive) {
-                            // Don't inline recursive calls
-                            if callee_name != caller_name {
-                                call_sites.push((bb_idx, insn_idx, callee_name.to_string()));
-                            }
+                        // Don't inline recursive calls
+                        if callee_name != caller_name
+                            && should_inline(
+                                candidate,
+                                opt,
+                                CallerSize {
+                                    now: caller_size,
+                                    original: original_size,
+                                },
+                                caller_is_recursive,
+                            )
+                        {
+                            call_sites.push((bb_idx, insn_idx, callee_name.to_string()));
+                            caller_size += candidate.estimated_size;
                         }
                     }
                 }
@@ -1616,13 +1726,6 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
                     if inline_call_site(&mut module.functions[func_idx], bb_idx, insn_idx, &callee)
                     {
                         changed_this_iteration = true;
-                        // Update caller_size so subsequent inlining decisions
-                        // in this iteration see the actual post-inline size.
-                        caller_size = module.functions[func_idx]
-                            .blocks
-                            .iter()
-                            .map(|b| b.insns.len())
-                            .sum();
                     }
                 }
             }
@@ -1739,7 +1842,7 @@ fn collect_referenced_functions(module: &Module) -> HashSet<String> {
                     // A direct call. An indirect one is named `<indirect>`,
                     // so it cannot collide with a real function.
                     Opcode::Call => {
-                        if let Some(name) = &insn.func_name {
+                        if let Some(name) = &insn.extra().func_name {
                             if func_names.contains(name) {
                                 referenced.insert(name.clone());
                             }
@@ -1761,7 +1864,7 @@ fn collect_referenced_functions(module: &Module) -> HashSet<String> {
                 }
                 // A name written into the assembly text itself -- `asm("call
                 // foo")` -- reaches the assembler with no IR reference at all.
-                if let Some(ref asm) = insn.asm_data {
+                if let Some(ref asm) = insn.extra().asm_data {
                     collect_names_in_asm(&asm.template, &func_names, &mut referenced);
                 }
             }
@@ -1848,6 +1951,39 @@ mod tests {
         func
     }
 
+    /// A call carrying `abi_info` under `conv`, forwarding the caller's
+    /// variadic arguments when `forwards`.
+    fn call_under(conv: crate::abi::CallingConv, forwards: bool) -> Instruction {
+        let mut call = Instruction::new(Opcode::Call);
+        call.extra_mut().abi_info = Some(Box::new(crate::ir::CallAbiInfo::with_conv(
+            vec![],
+            crate::abi::ArgClass::Ignore,
+            conv,
+        )));
+        call.extra_mut().ends_with_va_arg_pack = forwards;
+        call
+    }
+
+    /// Arguments forwarded through `__builtin_va_arg_pack()` are as the outer
+    /// call's convention passes them, so they are spliced only into a call of
+    /// the same one.
+    #[test]
+    fn test_va_arg_pack_is_not_forwarded_across_conventions() {
+        use crate::abi::CallingConv::{Win64, C};
+        let mut callee = make_simple_func("fwd", true);
+        callee.blocks[0].insns.insert(1, call_under(C, true));
+        assert!(!forwards_across_conventions(&call_under(C, false), &callee));
+        assert!(forwards_across_conventions(
+            &call_under(Win64, false),
+            &callee
+        ));
+        callee.blocks[0].insns[1].extra_mut().ends_with_va_arg_pack = false;
+        assert!(!forwards_across_conventions(
+            &call_under(Win64, false),
+            &callee
+        ));
+    }
+
     #[test]
     fn test_analyze_simple_function() {
         let func = make_simple_func("test", true);
@@ -1861,7 +1997,8 @@ mod tests {
         assert!(!candidate.defines_varargs_frame);
         assert!(!candidate.consumes_va_list);
         assert!(!candidate.is_recursive);
-        assert_eq!(candidate.estimated_size, 2); // entry + ret
+        // `Entry` emits nothing; the `Ret` is the one instruction that counts.
+        assert_eq!(candidate.estimated_size, 1);
         assert_eq!(candidate.call_count, 0);
     }
 
@@ -1883,7 +2020,12 @@ mod tests {
         };
 
         // Small function should always inline at -O1
-        assert!(should_inline(&candidate, opt_at(1), 100, false));
+        assert!(should_inline(
+            &candidate,
+            opt_at(1),
+            CallerSize::unchanged(100),
+            false
+        ));
     }
 
     /// A callee that only *reads* a `va_list` splices correctly; one that
@@ -1910,7 +2052,7 @@ mod tests {
         };
 
         assert!(
-            !should_inline(&base, opt_at(2), 100, false),
+            !should_inline(&base, opt_at(2), CallerSize::unchanged(100), false),
             "consuming a va_list is not inlined on the size heuristics alone"
         );
 
@@ -1919,11 +2061,11 @@ mod tests {
             ..base.clone()
         };
         assert!(
-            should_inline(&forced, opt_at(2), 100, false),
+            should_inline(&forced, opt_at(2), CallerSize::unchanged(100), false),
             "`always_inline` over a va_list must be honoured"
         );
         assert!(
-            should_inline(&forced, opt_at(0), 100, false),
+            should_inline(&forced, opt_at(0), CallerSize::unchanged(100), false),
             "and at -O0 too, as gcc does"
         );
 
@@ -1934,7 +2076,12 @@ mod tests {
             is_always_inline: true,
             ..base.clone()
         };
-        assert!(!should_inline(&defines, opt_at(2), 100, false));
+        assert!(!should_inline(
+            &defines,
+            opt_at(2),
+            CallerSize::unchanged(100),
+            false
+        ));
     }
 
     #[test]
@@ -1955,7 +2102,12 @@ mod tests {
         };
 
         // Varargs functions should never inline
-        assert!(!should_inline(&candidate, opt_at(2), 100, false));
+        assert!(!should_inline(
+            &candidate,
+            opt_at(2),
+            CallerSize::unchanged(100),
+            false
+        ));
     }
 
     #[test]
@@ -1976,7 +2128,12 @@ mod tests {
         };
 
         // Recursive functions should not inline
-        assert!(!should_inline(&candidate, opt_at(2), 100, false));
+        assert!(!should_inline(
+            &candidate,
+            opt_at(2),
+            CallerSize::unchanged(100),
+            false
+        ));
     }
 
     #[test]
@@ -1997,7 +2154,12 @@ mod tests {
         };
 
         // Should not inline at -O0
-        assert!(!should_inline(&candidate, opt_at(0), 100, false));
+        assert!(!should_inline(
+            &candidate,
+            opt_at(0),
+            CallerSize::unchanged(100),
+            false
+        ));
     }
 
     #[test]
@@ -2018,14 +2180,24 @@ mod tests {
         };
 
         // 30 instructions with inline hint should inline
-        assert!(should_inline(&candidate, opt_at(1), 100, false));
+        assert!(should_inline(
+            &candidate,
+            opt_at(1),
+            CallerSize::unchanged(100),
+            false
+        ));
 
         // Without hint, 30 instructions is too large
         let candidate_no_hint = InlineCandidate {
             has_inline_hint: false,
             ..candidate
         };
-        assert!(!should_inline(&candidate_no_hint, opt_at(1), 100, false));
+        assert!(!should_inline(
+            &candidate_no_hint,
+            opt_at(1),
+            CallerSize::unchanged(100),
+            false
+        ));
     }
 
     #[test]
@@ -2195,7 +2367,7 @@ mod tests {
 
         for insn in wrapper.blocks.iter_mut().flat_map(|b| b.insns.iter_mut()) {
             if insn.op == Opcode::Call {
-                insn.callee_binding = crate::parse::ast::CalleeBinding::Library;
+                insn.extra_mut().callee_binding = crate::parse::ast::CalleeBinding::Library;
                 assert_eq!(insn.local_callee(), None);
             }
         }
@@ -2219,7 +2391,7 @@ mod tests {
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.add_insn(Instruction::new(Opcode::Entry));
         let mut asm = Instruction::new(Opcode::Asm);
-        asm.asm_data = Some(Box::new(AsmData {
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
             template: "call helper".to_string(),
             outputs: Vec::new(),
             inputs: Vec::new(),
@@ -2250,7 +2422,7 @@ mod tests {
         let candidate = analyze_function(&weak, &HashMap::new());
         assert!(candidate.is_interposable);
         assert!(
-            !should_inline(&candidate, opt_at(2), 10, false),
+            !should_inline(&candidate, opt_at(2), CallerSize::unchanged(10), false),
             "an interposable definition must not be inlined"
         );
 
@@ -2476,7 +2648,7 @@ mod tests {
         );
 
         let mut asm = Instruction::new(Opcode::Asm);
-        asm.asm_data = Some(Box::new(AsmData {
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
             template: "b %l[done]".to_string(),
             outputs: Vec::new(),
             inputs: Vec::new(),
@@ -2487,6 +2659,7 @@ mod tests {
         let cloned = clone_instruction(&mut ctx, &asm, &callee);
         assert_eq!(cloned.len(), 1);
         let data = cloned[0]
+            .extra()
             .asm_data
             .as_ref()
             .expect("asm_data should survive cloning");
@@ -2618,7 +2791,7 @@ mod tests {
 
     /// `static struct Q mk(void) { struct Q r; ...; return r; }`, whose `Ret`
     /// hands the aggregate back by *address* under `ret` -- the shape
-    /// `emit_two_reg_return` emits for a class no pair of general registers
+    /// `emit_reg_aggregate_return` emits for a class no pair of general registers
     /// can carry.
     fn aggregate_address_ret_callee(
         types: &TypeTable,
@@ -2637,7 +2810,7 @@ mod tests {
             types.long_id,
         ));
         let mut ret_insn = Instruction::ret_typed(Some(PseudoId(1)), types.long_id, size_bits);
-        ret_insn.abi_info = Some(Box::new(crate::ir::CallAbiInfo::new(vec![], ret)));
+        ret_insn.extra_mut().abi_info = Some(Box::new(crate::ir::CallAbiInfo::new(vec![], ret)));
         bb.insns.push(ret_insn);
         callee.add_block(bb);
         callee.entry = BasicBlockId(0);
@@ -2921,5 +3094,81 @@ mod tests {
         // Verify type and size preserved
         assert_eq!(cloned_insn.typ, Some(types.int_id));
         assert_eq!(cloned_insn.size, 32);
+    }
+
+    /// A function of `adds` additions and a `ret`, and `calls` calls to
+    /// `callee` if it has any -- sized exactly, as `function_size` counts.
+    fn sized_func(name: &str, adds: u32, calls: usize, callee: &str) -> Function {
+        let types = TypeTable::new(&Target::host());
+        let int = types.int_id;
+        let mut func = Function::new(name, int);
+        func.is_static = true;
+        func.add_pseudo(Pseudo::val(PseudoId(0), 1));
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.insns.push(Instruction::new(Opcode::Entry));
+        for i in 1..=adds {
+            func.add_pseudo(Pseudo::reg(PseudoId(i), i));
+            bb.insns.push(Instruction::binop(
+                Opcode::Add,
+                PseudoId(i),
+                PseudoId(0),
+                PseudoId(0),
+                int,
+                32,
+            ));
+        }
+        for _ in 0..calls {
+            bb.insns.push(Instruction::call(
+                None,
+                callee,
+                vec![],
+                vec![],
+                types.void_id,
+                0,
+            ));
+        }
+        bb.insns.push(Instruction::ret(Some(PseudoId(0))));
+        func.add_block(bb);
+        func.entry = BasicBlockId(0);
+        func.next_pseudo = adds + 1;
+        func
+    }
+
+    fn calls_left(module: &Module, caller: &str, callee: &str) -> usize {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == caller)
+            .unwrap()
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .filter(|i| i.local_callee() == Some(callee))
+            .count()
+    }
+
+    /// The growth limit binds across the call sites of one caller, and across
+    /// the pass's iterations.
+    ///
+    /// Every decision for a caller was made against its size before any
+    /// splice -- the refresh after splicing came too late for any of them to
+    /// see -- so thirty calls to a ten-instruction leaf all passed a limit
+    /// that has room for twenty-six. And the limit was proportional to the
+    /// caller's *current* size, so each iteration of the pass granted the
+    /// whole allowance again.
+    #[test]
+    fn test_growth_limit_counts_every_accepted_call_site() {
+        // Caller: 490 additions, 30 calls, one ret = 521. Leaf: 9 additions
+        // and a ret = 10. The limit is 521 * 1.5 = 781, which 521 + 26 * 10
+        // meets and 521 + 27 * 10 does not.
+        let mut module = Module::default();
+        let mut big = sized_func("big", 490, 30, "leaf");
+        big.is_static = false; // externally visible, so it survives the pass
+        module.functions.push(big);
+        module.functions.push(sized_func("leaf", 9, 0, ""));
+        assert_eq!(function_size(&module.functions[0]), 521);
+        assert_eq!(function_size(&module.functions[1]), 10);
+        run(&mut module, opt_at(2));
+        assert_eq!(calls_left(&module, "big", "leaf"), 4);
     }
 }

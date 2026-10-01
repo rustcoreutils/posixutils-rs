@@ -888,7 +888,10 @@ impl X86_64CodeGen {
         //    as the base register with offset 0.
         //
         // Shape (2) is detected explicitly: the pointer is materialized
-        // into R11 (reserved scratch) before delegating to the helpers.
+        // into R11 before delegating to the helpers -- wherever it was,
+        // registers included. The helpers use RAX, RCX and R10 as scratch, so
+        // a pointer left in one of those was overwritten under them; and none
+        // of them may use R11, which is the one register reserved for it.
         let is_sym = self.pseudos.is_sym(ap_addr);
 
         let (base_reg, base_offset) = match &ap_loc {
@@ -909,7 +912,16 @@ impl X86_64CodeGen {
                 });
                 (Reg::R11, 0)
             }
-            Loc::Reg(ap_reg) => (*ap_reg, 0),
+            Loc::Reg(ap_reg) => {
+                if *ap_reg != Reg::R11 {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(*ap_reg),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                }
+                (Reg::R11, 0)
+            }
             _ => return,
         };
 

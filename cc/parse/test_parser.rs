@@ -22,7 +22,7 @@ use crate::strings::{StringId, StringTable};
 use crate::symbol::{Symbol, SymbolTable};
 use crate::target::Target;
 use crate::token::lexer::Tokenizer;
-use crate::types::{TypeKind, TypeModifiers, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
 
 fn parse_expr(input: &str) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
     parse_expr_with_vars(input, &[])
@@ -1343,11 +1343,14 @@ fn test_cast_unsigned_char_pointer() {
 
 #[test]
 fn test_cast_const_int() {
+    // A cast yields a value, so a cast to `const int` is a cast to `int`
+    // (C17 6.5.4p5, footnote 108), and the expression's type says so.
     let (expr, types, _strings, _symbols) = parse_expr("(const int)x").unwrap();
+    assert_eq!(expr.typ, Some(types.int_id));
     match expr.kind {
         ExprKind::Cast { cast_type, .. } => {
             assert_eq!(types.kind(cast_type), TypeKind::Int);
-            assert!(types
+            assert!(!types
                 .get(cast_type)
                 .modifiers
                 .contains(TypeModifiers::CONST));
@@ -1390,12 +1393,13 @@ fn test_cast_const_pointer() {
 #[test]
 fn test_cast_pointer_to_const() {
     // Test pointer qualifiers after *: (int * const)x - const pointer to int
+    // The `const` qualifies the pointer itself, which a cast drops along
+    // with every other top-level qualifier (C17 6.5.4p5).
     let (expr, types, _strings, _symbols) = parse_expr("(int * const)x").unwrap();
     match expr.kind {
         ExprKind::Cast { cast_type, .. } => {
             assert_eq!(types.kind(cast_type), TypeKind::Pointer);
-            // const applies to the pointer itself
-            assert!(types
+            assert!(!types
                 .get(cast_type)
                 .modifiers
                 .contains(TypeModifiers::CONST));
@@ -3612,21 +3616,98 @@ fn test_bitfield_too_wide_error() {
 
 // Enum tests
 
+/// An empty enumerator list is an error, as in gcc and clang: C17
+/// 6.7.2.2p1 does not make the list optional.
 #[test]
-fn test_empty_enum_warning() {
-    // Empty enum is a GNU extension - should parse successfully with a warning
-    // The warning is emitted to stderr during the test
-    let (tu, types, _strings, _symbols) = parse_tu("enum E {};").unwrap();
-    assert_eq!(tu.items.len(), 1);
-    if let ExternalDecl::Declaration(decl) = &tu.items[0] {
-        // This is a type declaration (enum only, no variable)
-        // The enum should have no constants
-        let typ = decl.declarators.first().map(|d| d.typ);
-        if let Some(typ_id) = typ {
-            if let Some(composite) = types.composite(typ_id) {
-                assert!(composite.enum_constants.is_empty());
-            }
-        }
+fn test_empty_enum_is_an_error() {
+    for src in ["enum E {};", "enum __attribute__((packed)) E {};"] {
+        let before = crate::diag::error_count();
+        let (_tu, _types, _strings, _symbols) = parse_tu(src).unwrap();
+        // The count is process-wide and only grows, so a concurrent test can
+        // add to it but never hide this one's error.
+        assert!(crate::diag::error_count() > before, "{src}: accepted");
+    }
+}
+
+/// The declared variable's enum type, its size and alignment, and the
+/// integer type it is compatible with.
+fn enum_of_variable(src: &str) -> (usize, usize, Option<TypeId>, TypeTable) {
+    let (tu, types, _strings, _symbols) = parse_tu(src).unwrap();
+    let ExternalDecl::Declaration(ref decl) = tu.items.last().unwrap() else {
+        panic!("{src}: expected a declaration");
+    };
+    let typ = decl.declarators[0].typ;
+    let compat = types.enum_compatible_type(typ);
+    (types.size_bytes(typ), types.alignment(typ), compat, types)
+}
+
+/// `packed` makes an enum the smallest integer type holding its members,
+/// signed iff a member is negative, as gcc does; without it the search
+/// starts at `int`.
+#[test]
+fn test_packed_enum_underlying_type() {
+    use crate::target::IntType;
+    for (body, size, int) in [
+        ("{ A }", 1, IntType::UChar),
+        ("{ A = 255 }", 1, IntType::UChar),
+        ("{ A = 256 }", 2, IntType::UShort),
+        ("{ A = -128, B = 127 }", 1, IntType::SChar),
+        ("{ A = -129 }", 2, IntType::Short),
+        ("{ A = 65535 }", 2, IntType::UShort),
+        ("{ A = 65536 }", 4, IntType::UInt),
+        ("{ A = -32769 }", 4, IntType::Int),
+        ("{ A = 0x100000000 }", 8, IntType::ULong),
+        ("{ A = -0x100000000 }", 8, IntType::Long),
+    ] {
+        let src = format!("enum __attribute__((packed)) E {body} x;");
+        let (got_size, align, compat, types) = enum_of_variable(&src);
+        assert_eq!((got_size, align), (size, size), "{src}");
+        assert_eq!(compat, Some(types.int_type_id(int)), "{src}");
+        let plain = format!("enum E {body} x;");
+        let (plain_size, _, _, _) = enum_of_variable(&plain);
+        assert_eq!(plain_size, size.max(4), "{plain}");
+    }
+}
+
+/// gcc reads an enum's `packed` between `enum` and the tag and after the
+/// closing brace, tagged or not; on a declaration that is not a definition
+/// it means nothing, and `aligned` on an enum is ignored.
+#[test]
+fn test_packed_enum_attribute_positions() {
+    for (src, size) in [
+        ("enum __attribute__((packed)) E { A } x;", 1),
+        ("enum __attribute__((__packed__)) { A } x;", 1),
+        ("enum E { A } __attribute__((packed)) x;", 1),
+        ("enum { A } __attribute__((packed)) x;", 1),
+        ("enum E; enum __attribute__((packed)) E { A } x;", 1),
+        ("enum __attribute__((packed)) E; enum E { A } x;", 4),
+        ("enum __attribute__((aligned(8))) E { A } x;", 4),
+        ("enum E { A } __attribute__((aligned(8))) x;", 4),
+    ] {
+        let (got_size, align, _, _) = enum_of_variable(src);
+        assert_eq!((got_size, align), (size, size), "{src}");
+    }
+}
+
+/// An enumeration constant stays `int` in a `packed` enum narrower than
+/// `int`, and takes the enumeration's type in one wider than `int`: gcc's
+/// `sizeof(A)` is 4 for the first and 8 for every member of the second.
+#[test]
+fn test_enumerator_type_follows_enum_width() {
+    for (src, size) in [
+        ("enum __attribute__((packed)) E { A }; int x[sizeof(A)];", 4),
+        ("enum E { B = -1, A = 0x100000000 }; int x[sizeof(B)];", 8),
+        (
+            "enum __attribute__((packed)) E { B = -1, A = 0x100000000 }; int x[sizeof(B)];",
+            8,
+        ),
+        (
+            "enum E { A = 0x80000000u }; int x[sizeof(A) + (A > 0 ? 0 : 99)];",
+            4,
+        ),
+    ] {
+        let (got_size, _, _, _) = enum_of_variable(src);
+        assert_eq!(got_size, 4 * size, "{src}");
     }
 }
 
@@ -6314,7 +6395,7 @@ fn test_check_call_answers_soundness() {
                 panic!("{call}: expected a call");
             };
             let func_type = p.resolved_function_type(func);
-            p.check_call(func_type, args, e.pos)
+            p.check_call(func_type, None, args, e.pos)
         })
     };
     assert!(sound("F(i)"));
@@ -6322,6 +6403,159 @@ fn test_check_call_answers_soundness() {
     assert!(!sound("F(s)"));
     assert!(!sound("F(1, 2)"));
     assert!(!sound("F()"));
+}
+
+/// The one argument of a bit builtin's node: the population count under
+/// `parity`'s mask, and the argument of the `ffs` call.
+fn bit_builtin_operand(e: &Expr) -> &Expr {
+    match &e.kind {
+        ExprKind::Bswap16 { arg }
+        | ExprKind::Bswap32 { arg }
+        | ExprKind::Bswap64 { arg }
+        | ExprKind::Ctz { arg }
+        | ExprKind::Ctzl { arg }
+        | ExprKind::Ctzll { arg }
+        | ExprKind::Clz { arg }
+        | ExprKind::Clzl { arg }
+        | ExprKind::Clzll { arg }
+        | ExprKind::Clrsb { arg }
+        | ExprKind::Clrsbl { arg }
+        | ExprKind::Clrsbll { arg }
+        | ExprKind::Popcount { arg }
+        | ExprKind::Popcountl { arg }
+        | ExprKind::Popcountll { arg } => arg,
+        ExprKind::Binary {
+            op: BinaryOp::BitAnd,
+            left,
+            ..
+        } => bit_builtin_operand(left),
+        ExprKind::Call { args, .. } if args.len() == 1 => &args[0],
+        other => panic!("not a bit builtin: {other:?}"),
+    }
+}
+
+/// A bit builtin's argument converts to its parameter type, as in a call
+/// through gcc's prototype for it (C17 6.5.2.2p7): the node reads a
+/// converted value, never the argument's own bits.
+#[test]
+fn test_bit_builtins_convert_their_argument() {
+    use crate::types::TypeId;
+    let decls = "double d; unsigned u;";
+    type Want = fn(&TypeTable) -> TypeId;
+    // (call, parameter type, result type)
+    let cases: &[(&str, Want, Want)] = &[
+        ("__builtin_bswap16(d)", |t| t.ushort_id, |t| t.ushort_id),
+        ("__builtin_bswap32(d)", |t| t.uint_id, |t| t.uint_id),
+        (
+            "__builtin_bswap64(d)",
+            |t| t.ulonglong_id,
+            |t| t.ulonglong_id,
+        ),
+        ("__builtin_ctz(d)", |t| t.uint_id, |t| t.int_id),
+        ("__builtin_ctzl(d)", |t| t.ulong_id, |t| t.int_id),
+        ("__builtin_ctzll(d)", |t| t.ulonglong_id, |t| t.int_id),
+        ("__builtin_clz(d)", |t| t.uint_id, |t| t.int_id),
+        ("__builtin_clzll(u)", |t| t.ulonglong_id, |t| t.int_id),
+        ("__builtin_clrsb(d)", |t| t.int_id, |t| t.int_id),
+        ("__builtin_clrsbl(u)", |t| t.long_id, |t| t.int_id),
+        ("__builtin_popcount(d)", |t| t.uint_id, |t| t.int_id),
+        ("__builtin_popcountl(d)", |t| t.ulong_id, |t| t.int_id),
+        ("__builtin_parity(d)", |t| t.uint_id, |t| t.int_id),
+        ("__builtin_parityll(u)", |t| t.ulonglong_id, |t| t.int_id),
+        ("__builtin_ffs(d)", |t| t.int_id, |t| t.int_id),
+        ("__builtin_ffsl(u)", |t| t.long_id, |t| t.int_id),
+        ("__builtin_ffsll(d)", |t| t.longlong_id, |t| t.int_id),
+    ];
+    for (stmt, param, ret) in cases {
+        with_statement_expr(decls, stmt, |p, e| {
+            assert_eq!(e.typ, Some(ret(p.types)), "{stmt}: result type");
+            let arg = bit_builtin_operand(e);
+            let want = param(p.types);
+            assert_eq!(arg.typ, Some(want), "{stmt}: operand type");
+            let ExprKind::Cast { cast_type, .. } = arg.kind else {
+                panic!("{stmt}: operand not converted: {:?}", arg.kind);
+            };
+            assert_eq!(cast_type, want, "{stmt}");
+        });
+    }
+    // An argument of the parameter type is passed as it is.
+    with_statement_expr(decls, "__builtin_ctz(u)", |_, e| {
+        assert!(matches!(bit_builtin_operand(e).kind, ExprKind::Ident(_)));
+    });
+}
+
+/// An argument no assignment converts -- a structure -- is an error, as in
+/// an ordinary call, and the call is not built: a zero of the result type
+/// stands in for it.
+#[test]
+fn test_bit_builtins_reject_a_structure_argument() {
+    let decls = "struct S { int a; } s;";
+    for stmt in [
+        "__builtin_ctz(s)",
+        "__builtin_parity(s)",
+        "__builtin_bswap16(s)",
+        "__builtin_ffs(s)",
+        "__builtin_clz(1, 2)",
+    ] {
+        let before = crate::diag::error_count();
+        with_statement_expr(decls, stmt, |_, e| {
+            // The count is process-wide and only grows, so a concurrent test
+            // can add to it but never hide this one's error.
+            assert!(crate::diag::error_count() > before, "{stmt}: accepted");
+            assert!(
+                matches!(&e.kind, ExprKind::IntLit(0))
+                    || matches!(&e.kind, ExprKind::Cast { expr, .. }
+                        if matches!(expr.kind, ExprKind::IntLit(0))),
+                "{stmt}: built {:?}",
+                e.kind
+            );
+        });
+    }
+}
+
+/// A bit builtin of an integer constant expression is one itself, as in gcc,
+/// and reads its argument converted to the parameter type: `ctz(-1)` counts
+/// the zeros of `UINT_MAX`, `clrsb(-1)` the sign bits of a signed -1. `ctz`
+/// and `clz` of 0 are gcc's folded value, the operand width.
+#[test]
+fn test_bit_builtins_of_constants_are_constant_expressions() {
+    for (call, want) in [
+        ("__builtin_bswap16(0x12345)", 0x4523),
+        ("__builtin_bswap32(0x12345678)", 0x7856_3412),
+        (
+            "__builtin_bswap64(0x0102030405060708)",
+            0x0807_0605_0403_0201,
+        ),
+        ("__builtin_bswap64(0xff)", 0xff00_0000_0000_0000),
+        ("__builtin_ctz(-1)", 0),
+        ("__builtin_ctz(1u << 31)", 31),
+        ("__builtin_ctzll(1ull << 40)", 40),
+        ("__builtin_ctz(0)", 32),
+        ("__builtin_ctzl(0)", 64),
+        ("__builtin_clz(1)", 31),
+        ("__builtin_clz(0x100000000)", 32),
+        ("__builtin_clzll(0)", 64),
+        ("__builtin_clrsb(0)", 31),
+        ("__builtin_clrsb(-1)", 31),
+        ("__builtin_clrsb(1)", 30),
+        ("__builtin_clrsbll(-5)", 60),
+        ("__builtin_popcount(-1)", 32),
+        ("__builtin_popcountll(-1)", 64),
+        ("__builtin_parity(7)", 1),
+        ("__builtin_parityl(3)", 0),
+        ("__builtin_ffs(0)", 0),
+        ("__builtin_ffs(8)", 4),
+        ("__builtin_ffsll(1ll << 40)", 41),
+    ] {
+        with_statement_expr("", call, |p, e| {
+            assert_eq!(p.eval_const_expr(e), Some(want), "{call}");
+        });
+    }
+    // A variable argument is no constant, and `ffs` of one is still a call.
+    with_statement_expr("int i;", "__builtin_ffs(i)", |p, e| {
+        assert_eq!(p.eval_const_expr(e), None);
+        assert!(matches!(e.kind, ExprKind::Call { .. }), "{:?}", e.kind);
+    });
 }
 
 // __builtin_flt_rounds test
@@ -6685,6 +6919,87 @@ fn test_aligned_typedef_as_struct_member() {
         let typ = decl.declarators[0].typ;
         assert_eq!(types.alignment(typ), 16);
     }
+}
+
+/// The layout of the type of the last declaration's first declarator:
+/// member offsets, size and alignment.
+fn last_struct_layout(src: &str) -> (Vec<usize>, usize, usize) {
+    let (tu, types, _strings, _symbols) = parse_tu(src).unwrap();
+    let Some(ExternalDecl::Declaration(decl)) = tu.items.last() else {
+        panic!("{src}: the last item is not a declaration");
+    };
+    let typ = decl.declarators[0].typ;
+    let composite = types.composite(typ).expect("a struct or union");
+    let offsets = composite.members.iter().map(|m| m.offset).collect();
+    (offsets, types.size_bytes(typ), types.alignment(typ))
+}
+
+/// `packed` on a member drops that member's alignment to 1 wherever the
+/// member's declaration writes it, and an `aligned` alongside raises it back.
+/// Written among the specifiers it reaches every declarator, as `aligned`
+/// does; after a declarator, that declarator alone. Every layout is gcc's.
+#[test]
+fn test_packed_on_struct_member() {
+    for (src, offsets, size, align) in [
+        ("struct { char a; int b __attribute__((packed)); } x;", &[0, 1][..], 5, 1),
+        ("struct { char a; __attribute__((packed)) int b; } x;", &[0, 1], 5, 1),
+        ("struct { char a; int __attribute__((packed)) b; } x;", &[0, 1], 5, 1),
+        ("struct { char a; int b __attribute__((packed)), c; } x;", &[0, 1, 8], 12, 4),
+        ("struct { char a; __attribute__((packed)) int b, c; } x;", &[0, 1, 5], 9, 1),
+        ("struct { char a; __attribute__((aligned(8))) int b, c; } x;", &[0, 8, 16], 24, 8),
+        ("struct { char a; int b __attribute__((packed, aligned(2))); } x;", &[0, 2], 6, 2),
+        ("struct { char a; int b __attribute__((aligned(1))); } x;", &[0, 4], 8, 4),
+        (
+            "struct { char a; struct { char x; int y; } s __attribute__((packed)); } x;",
+            &[0, 1],
+            9,
+            1,
+        ),
+        // A struct-level `packed` leaves a member's own `aligned` in force.
+        (
+            "struct __attribute__((packed)) { char a; int b __attribute__((aligned(4))); char c; } x;",
+            &[0, 4, 8],
+            12,
+            4,
+        ),
+        // gcc ignores `packed` on an anonymous member.
+        (
+            "struct { char a; __attribute__((packed)) struct { char x; int y; }; } x;",
+            &[0, 4],
+            12,
+            4,
+        ),
+        ("union { char a; int b __attribute__((packed)); } x;", &[0, 0], 4, 1),
+    ] {
+        assert_eq!(
+            last_struct_layout(src),
+            (offsets.to_vec(), size, align),
+            "{src}"
+        );
+    }
+}
+
+/// `packed` reaches no declaration but the member it is written on: not the
+/// struct declared after an object that wrote it, where gcc ignores it, nor
+/// the member whose array bound holds a type-name that wrote it.
+#[test]
+fn test_packed_reaches_only_its_member() {
+    for src in [
+        "int g __attribute__((packed)); struct T { char a; int b; } t;",
+        "struct { char a; int b[sizeof(int __attribute__((packed)))]; } x;",
+    ] {
+        let (offsets, _, align) = last_struct_layout(src);
+        assert_eq!((offsets[1], align), (4, 4), "{src}");
+    }
+}
+
+/// An `_Alignas` keyword is its own member declaration's: the next member's
+/// bit-field must not be rejected for it.
+#[test]
+fn test_alignas_does_not_reach_the_next_bitfield() {
+    let (offsets, size, align) =
+        last_struct_layout("struct { _Alignas(8) int a; int b:3; char c; } x;");
+    assert_eq!((offsets[2], size, align), (5, 8, 8));
 }
 
 /// The argument is an integer constant expression, not one numeric token:
@@ -7133,6 +7448,70 @@ fn test_gnu_complex_in_type_name() {
             64,
             "{spelling} in a type name is not a complex float"
         );
+    }
+}
+
+/// `_Imaginary` is a type specifier c17 provides no type for (C17 6.7.2p2;
+/// the types are Annex G's): every use is diagnosed, and the declaration goes
+/// on as `_Complex` so nothing after it trips over the same mistake.
+///
+/// It used to be tagged only as a reserved name, so `_Imaginary double x;`
+/// was not a declaration at all: it drew implicit-int and then "keyword
+/// cannot be used as a name", neither of which names the actual problem.
+#[test]
+fn test_imaginary_is_diagnosed_and_recovers_as_complex() {
+    for decl in [
+        "_Imaginary double v;",
+        "double _Imaginary v;",
+        "_Imaginary v;",
+    ] {
+        let before = crate::diag::error_count();
+        let (d, types, _, _) = parse_decl(decl).unwrap_or_else(|e| panic!("{decl}: {e:?}"));
+        // The count is process-wide and only grows, so a concurrent test can
+        // add to it but never hide this one's error.
+        assert!(
+            crate::diag::error_count() > before,
+            "{decl}: _Imaginary was accepted without a diagnostic"
+        );
+        let typ = d.declarators[0].typ;
+        assert!(
+            types.modifiers(typ).contains(TypeModifiers::COMPLEX),
+            "{decl}: did not recover as a complex type"
+        );
+    }
+    // In a type-name (a cast, `sizeof`) it is always the specifier.
+    let before = crate::diag::error_count();
+    let (expr, types, _, _) =
+        parse_expr("sizeof(float _Imaginary)").unwrap_or_else(|e| panic!("{e:?}"));
+    assert!(crate::diag::error_count() > before);
+    let ExprKind::SizeofType(typ, _) = expr.kind else {
+        panic!("sizeof(float _Imaginary) gave {:?}", expr.kind);
+    };
+    assert_eq!(types.size_bits(typ), 64);
+}
+
+/// Where only a declarator's name can stand, `_Imaginary` is that name, as a
+/// typedef name would be: `int _Imaginary;` misuses a keyword, and must say
+/// so rather than complain that c17 lacks imaginary types.
+#[test]
+fn test_imaginary_in_name_position_is_a_keyword_misused() {
+    for src in [
+        "int _Imaginary;",
+        "int _Imaginary = 0;",
+        "int _Imaginary[2];",
+        "int _Imaginary, y;",
+        "void g(int _Imaginary);",
+        "int _Imaginary(void);",
+        "struct S { int _Imaginary : 3; };",
+    ] {
+        match parse_tu(src) {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("'_Imaginary' is a keyword and cannot be used as a name"),
+                "{src}: wrong message: {e}"
+            ),
+            Ok(_) => panic!("{src}: accepted a keyword as a name"),
+        }
     }
 }
 
@@ -7705,6 +8084,26 @@ fn test_vector_size_type_is_marked() {
     assert!(!types.is_vector(symbols.get(decl.declarators[0].symbol).typ));
 }
 
+/// `mode` and `vector_size` are recognised by their `SUPPORTED_ATTR` tag like
+/// every other attribute: both spellings apply, and a spelling the table does
+/// not list is warned about as ignored and is ignored.
+#[test]
+fn test_attr_mode_and_vector_size_follow_the_tag() {
+    for (src, size, vector) in [
+        ("int __attribute__((mode(QI))) x;", 1, false),
+        ("int __attribute__((__mode__(__QI__))) x;", 1, false),
+        ("int __attribute__((__mode(QI))) x;", 4, false),
+        ("int __attribute__((vector_size(8))) x;", 8, true),
+        ("int __attribute__((__vector_size__(8))) x;", 8, true),
+        ("int __attribute__((__vector_size(8))) x;", 4, false),
+    ] {
+        let (decl, types, _strings, symbols) = parse_decl(src).unwrap();
+        let typ = symbols.get(decl.declarators[0].symbol).typ;
+        assert_eq!(types.size_bytes(typ), size, "{src}");
+        assert_eq!(types.is_vector(typ), vector, "{src}");
+    }
+}
+
 /// Two tagless definitions with the same members are distinct types, while a
 /// qualified variant of one stays compatible with it (C17 6.7.2.3p5).
 #[test]
@@ -8261,20 +8660,57 @@ fn test_later_declarators_align_and_complete() {
     assert_eq!(types.get(find("q")).array_size, Some(5));
 }
 
-/// A definition is compiled under the calling convention any declaration of
-/// its name asked for -- a prototype's, or one written among the specifiers --
-/// as gcc does. Only an attribute directly after the definition's own
-/// parameter list used to count.
+/// `ms_abi` belongs to the function *type*, as gcc has it: a definition, a
+/// prototype, a pointer to a function, a typedef and a parameter each carry
+/// it, and `sysv_abi` names the x86-64 default. Read off the types the
+/// declarations bound.
 #[test]
-fn test_calling_convention_comes_from_any_declaration() {
-    let (tu, _types, strings, _symbols) = parse_tu(
-        "int f(int a, int b) __attribute__((ms_abi));\n\
-         int f(int a, int b) { return a - b; }\n\
-         __attribute__((ms_abi)) int g(void) { return 0; }\n\
-         int h(void) { return 0; }\n",
+fn test_calling_convention_is_part_of_the_function_type() {
+    use crate::abi::CallingConv::{Win64, C};
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let (tu, types, strings, symbols) = parse_tu_for(
+        &"int f(int a, int b) MS;\n\
+          MS int g(void) { return 0; }\n\
+          int h(void) { return 0; }\n\
+          __attribute__((sysv_abi)) int s(void);\n\
+          MS long (*fp)(long);\n\
+          long (MS *gp)(long);\n\
+          typedef MS long fn_t(long);\n\
+          fn_t *tp;\n\
+          void take(MS long (*cb)(long));\n\
+          MS long (*ret_ms(void))(long);\n"
+            .replace("MS", "__attribute__((ms_abi))"),
+        &target,
     )
     .unwrap();
-    let convs: Vec<(String, crate::abi::CallingConv)> = tu
+    let find = |name: &str| {
+        let id = strings.lookup(name).expect("interned");
+        symbols
+            .lookup(id, crate::symbol::Namespace::Ordinary)
+            .unwrap_or_else(|| panic!("no symbol {name}"))
+            .typ
+    };
+    let conv = |t: TypeId| crate::abi::CallingConv::of_callee(t, &types);
+    for (name, want) in [
+        ("f", Win64),
+        ("g", Win64),
+        ("h", C),
+        ("s", C),
+        ("fp", Win64),
+        ("gp", Win64),
+        ("tp", Win64),
+        // The attribute is the function's, not the pointer it returns.
+        ("ret_ms", Win64),
+    ] {
+        assert_eq!(conv(find(name)), want, "{name}");
+    }
+    let returned = types.base_type(find("ret_ms")).unwrap();
+    assert_eq!(conv(returned), C, "ret_ms returns a System V pointer");
+    let take = types.get(find("take")).params.clone().unwrap();
+    assert_eq!(conv(take[0]), Win64, "parameter");
+    assert_eq!(conv(find("take")), C);
+    // A definition is compiled under its type's convention.
+    let defs: Vec<(String, crate::abi::CallingConv)> = tu
         .items
         .iter()
         .filter_map(|item| match item {
@@ -8282,15 +8718,106 @@ fn test_calling_convention_comes_from_any_declaration() {
             _ => None,
         })
         .collect();
-    use crate::abi::CallingConv::{Win64, C};
+    assert_eq!(defs, [("g".to_string(), Win64), ("h".to_string(), C)]);
+    // Two types differing only in convention are distinct.
+    let ms_fn = types.base_type(find("fp")).unwrap();
+    let mut types = types;
+    let mut sysv = types.get(ms_fn).clone();
+    sysv.conv = C;
+    let sysv_fn = types.intern(sysv);
+    assert_ne!(ms_fn, sysv_fn);
+    assert!(!types.types_compatible(ms_fn, sysv_fn));
     assert_eq!(
-        convs,
-        [
-            ("f".to_string(), Win64),
-            ("g".to_string(), Win64),
-            ("h".to_string(), C)
-        ]
+        types.format_type(types.pointer_to(ms_fn), None),
+        "long (__attribute__((ms_abi)) *)(long)"
     );
+}
+
+/// gcc rejects a redeclaration that changes a function's calling
+/// convention, and the two attributes on one declaration, as conflicts; a
+/// pointer to a pointer to a function is not a function type, so the
+/// attribute warns there and is ignored.
+#[test]
+fn test_calling_convention_conflicts() {
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    for src in [
+        "int f(int a, int b) __attribute__((ms_abi));\nint f(int a, int b) { return a - b; }\n",
+        "__attribute__((ms_abi)) int f(int);\n__attribute__((sysv_abi)) int f(int);\n",
+        "__attribute__((ms_abi, sysv_abi)) int f(int);\n",
+        "__attribute__((ms_abi)) int f(int) __attribute__((sysv_abi));\n",
+    ] {
+        let before = crate::diag::error_count();
+        let _ = parse_tu_for(src, &target);
+        assert!(crate::diag::error_count() > before, "{src}: accepted");
+    }
+    let (_, types, strings, symbols) =
+        parse_tu_for("__attribute__((ms_abi)) long (**pp)(long);\n", &target).unwrap();
+    let id = strings.lookup("pp").unwrap();
+    let pp = symbols
+        .lookup(id, crate::symbol::Namespace::Ordinary)
+        .unwrap()
+        .typ;
+    let func = types.base_type(types.base_type(pp).unwrap()).unwrap();
+    assert_eq!(types.get(func).conv, crate::abi::CallingConv::C);
+}
+
+/// On aarch64 neither attribute exists, as for gcc there: the type keeps the
+/// native convention.
+#[test]
+fn test_calling_convention_attributes_do_not_exist_on_aarch64() {
+    let target = Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux);
+    let (_, types, strings, symbols) = parse_tu_for(
+        "__attribute__((ms_abi)) long f(long);\n__attribute__((sysv_abi)) long g(long);\n",
+        &target,
+    )
+    .unwrap();
+    for name in ["f", "g"] {
+        let id = strings.lookup(name).unwrap();
+        let typ = symbols
+            .lookup(id, crate::symbol::Namespace::Ordinary)
+            .unwrap()
+            .typ;
+        assert_eq!(types.get(typ).conv, crate::abi::CallingConv::C, "{name}");
+    }
+}
+
+/// Each `va_start` belongs to one convention, and `__builtin_ms_va_list`
+/// is a `char *` to everything but `va_arg`: assignable both ways without a
+/// diagnostic, and named by its own spelling.
+#[test]
+fn test_ms_va_builtins() {
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let ok = "__attribute__((ms_abi)) int f(int n, ...) {\n\
+              __builtin_ms_va_list ap, ap2; char *p;\n\
+              __builtin_ms_va_start(ap, n);\n\
+              __builtin_ms_va_copy(ap2, ap);\n\
+              p = ap; ap2 = p;\n\
+              int r = __builtin_va_arg(ap, int);\n\
+              __builtin_ms_va_end(ap);\n\
+              return r;\n}\n\
+              int g(__builtin_ms_va_list ap) { return __builtin_va_arg(ap, int); }\n";
+    let (_, types, _, _) = parse_tu_for(ok, &target).unwrap();
+    assert!(types.is_ms_va_list(types.ms_va_list_id));
+    assert!(!types.is_ms_va_list(types.char_ptr_id));
+    assert!(types.types_compatible(types.ms_va_list_id, types.char_ptr_id));
+    assert_eq!(
+        types.format_type(types.ms_va_list_id, None),
+        "__builtin_ms_va_list"
+    );
+    for src in [
+        // The System V `va_start` in an `ms_abi` function...
+        "__attribute__((ms_abi)) int f(int n, ...) { __builtin_va_list ap; \
+         __builtin_va_start(ap, n); return 0; }",
+        // ...the Microsoft one in a System V function...
+        "int f(int n, ...) { __builtin_ms_va_list ap; __builtin_ms_va_start(ap, n); return 0; }",
+        // ...and on a list of the wrong type.
+        "__attribute__((ms_abi)) int f(int n, ...) { char *ap; \
+         __builtin_ms_va_start(ap, n); return 0; }",
+    ] {
+        let before = crate::diag::error_count();
+        let _ = parse_tu_for(src, &target);
+        assert!(crate::diag::error_count() > before, "{src}: accepted");
+    }
 }
 
 /// A floating comparison or a cast to an integer in an integer constant
@@ -8415,4 +8942,641 @@ fn test_unary_plus_leaves_a_complex_integer_alone() {
     // The control: a real narrow operand still promotes.
     let (expr, types, _strings, _symbols) = parse_expr("+(short)1").unwrap();
     assert_eq!(expr.typ, Some(types.int_id));
+}
+
+/// Where each element of an array's initializer list lands, and where the
+/// cursor goes next: a positional element takes the cursor, an index moves it
+/// past itself, and a range moves it past its *high* end.
+#[test]
+fn test_array_slot_follows_the_cursor() {
+    use crate::parse::ast::{array_slot, Designator};
+    let mut cursor = 0;
+    assert_eq!(array_slot(&[], &mut cursor), (0, 0, None));
+    assert_eq!(cursor, 1);
+    assert_eq!(
+        array_slot(&[Designator::IndexRange(4, 6)], &mut cursor),
+        (4, 6, Some(0))
+    );
+    assert_eq!(cursor, 7);
+    assert_eq!(array_slot(&[], &mut cursor), (7, 7, None));
+    assert_eq!(
+        array_slot(&[Designator::Index(2)], &mut cursor),
+        (2, 2, Some(0))
+    );
+    assert_eq!(cursor, 3);
+}
+
+// Attribute declarations: `__attribute__((...));` standing alone
+
+/// The block items of a function body.
+fn body_items(func: &FunctionDef) -> &[BlockItem] {
+    match &func.body {
+        Stmt::Block(items) => items,
+        other => panic!("function body is not a block: {other:?}"),
+    }
+}
+
+/// The block items of the `switch` that is the first statement of `func`.
+fn switch_items(func: &FunctionDef) -> &[BlockItem] {
+    let BlockItem::Statement(stmt) = &body_items(func)[0] else {
+        panic!("first item is not a statement");
+    };
+    let Stmt::Switch { body, .. } = stmt.as_ref() else {
+        panic!("first statement is not a switch: {stmt:?}");
+    };
+    match body.as_ref() {
+        Stmt::Block(items) => items,
+        other => panic!("switch body is not a block: {other:?}"),
+    }
+}
+
+/// `__attribute__((fallthrough));` is a null statement in either spelling,
+/// whether it follows a statement or is itself the labeled statement -- not
+/// a declaration that declares nothing.
+#[test]
+fn test_fallthrough_attribute_is_a_null_statement() {
+    let (func, _, _, _) = parse_func(
+        "int f(int x) { switch (x) { case 1: x++; __attribute__((fallthrough));\n\
+         case 2: __attribute__((__fallthrough__)); default: break; } return x; }",
+    )
+    .unwrap();
+    let items = switch_items(&func);
+    assert_eq!(items.len(), 4, "{items:?}");
+    // `case 1: x++;` is one item, holding the statement it labels.
+    assert!(matches!(&items[1], BlockItem::Statement(s) if matches!(**s, Stmt::Empty)));
+    let BlockItem::Statement(case2) = &items[2] else {
+        panic!("case 2 is not a statement");
+    };
+    let Stmt::Case(_, _, labeled) = case2.as_ref() else {
+        panic!("not a case: {case2:?}");
+    };
+    assert!(matches!(**labeled, Stmt::Empty), "{labeled:?}");
+}
+
+/// Outside every `switch` the fallthrough statement is an error, as in gcc,
+/// in a block and as the body of an `if`.
+#[test]
+fn test_fallthrough_attribute_outside_a_switch_is_an_error() {
+    for src in [
+        "void f(void) { __attribute__((fallthrough)); }",
+        "void f(int x) { if (x) __attribute__((fallthrough)); }",
+        "void f(void) { for (;;) { __attribute__((fallthrough)); break; } }",
+    ] {
+        let before = crate::diag::error_count();
+        parse_func(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        assert!(crate::diag::error_count() > before, "{src}: no error");
+    }
+}
+
+/// Any other attribute standing alone is an empty declaration: accepted, and
+/// it leaves nothing pending for the declaration after it.
+#[test]
+fn test_other_attribute_statement_is_empty() {
+    let (func, _, _, _) =
+        parse_func("void f(void) { __attribute__((aligned(64))); int y; }").unwrap();
+    let items = body_items(&func);
+    assert!(matches!(&items[0], BlockItem::Statement(s) if matches!(**s, Stmt::Empty)));
+    let BlockItem::Declaration(decl) = &items[1] else {
+        panic!("second item is not a declaration: {:?}", items[1]);
+    };
+    assert_eq!(decl.declarators[0].explicit_align, None);
+}
+
+/// A declaration that begins with an attribute is still a declaration, in a
+/// block and at file scope, and a lone attribute list at file scope is an
+/// empty declaration that the next one parses after.
+#[test]
+fn test_attribute_led_declarations_still_declare() {
+    let (func, _, _, _) =
+        parse_func("void g(void) { __attribute__((unused)) int x; x = 1; }").unwrap();
+    let BlockItem::Declaration(decl) = &body_items(&func)[0] else {
+        panic!("attribute-led local is not a declaration");
+    };
+    assert_eq!(decl.declarators.len(), 1);
+
+    let (tu, _, _, _) = parse_tu(
+        "__attribute__((unused));\n\
+         __attribute__((constructor)) void f(void) {}\n\
+         __attribute__((unused)) static int z;\n",
+    )
+    .unwrap();
+    assert_eq!(tu.items.len(), 3);
+    assert!(matches!(&tu.items[0], ExternalDecl::Declaration(d) if d.declarators.is_empty()));
+    assert!(matches!(tu.items[1], ExternalDecl::FunctionDef(_)));
+    assert!(matches!(&tu.items[2], ExternalDecl::Declaration(d) if d.declarators.len() == 1));
+}
+
+/// The lookahead sees an attribute declaration only when nothing but
+/// attribute lists stands before the `;`.
+#[test]
+fn test_at_attribute_declaration_lookahead() {
+    for (src, expected) in [
+        ("__attribute__((fallthrough));", true),
+        ("__attribute__((a)) __attribute((b(1, (2))));", true),
+        ("__attribute__((unused)) int x;", false),
+        ("__attribute__((fallthrough)) x++;", false),
+        ("int x;", false),
+        (";", false),
+    ] {
+        let mut strings = StringTable::new();
+        let tokens = Tokenizer::new(src.as_bytes(), 0, &mut strings).tokenize();
+        let mut symbols = SymbolTable::new();
+        let mut types = TypeTable::new(&Target::host());
+        let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+        parser.skip_stream_tokens();
+        assert_eq!(parser.at_attribute_declaration(), expected, "{src}");
+    }
+}
+
+/// `__builtin_assume_aligned` is a call through gcc's prototype
+/// `void *(const void *, size_t, ...)`: its result is a `void *` -- whatever
+/// the pointer's pointee and qualifiers -- and every argument that is more
+/// than a literal is kept, for its side effects.
+#[test]
+fn test_assume_aligned_yields_void_ptr_and_keeps_its_arguments() {
+    let decls = "const char *p; int k; long n;";
+    // (call, operands kept beside the pointer)
+    for (stmt, kept) in [
+        ("__builtin_assume_aligned(p, 16)", 0),
+        ("__builtin_assume_aligned(p, 16, 4)", 0),
+        ("__builtin_assume_aligned(p, n)", 1),
+        ("__builtin_assume_aligned(p, 4, k++)", 1),
+        ("__builtin_assume_aligned(p, n, k++)", 2),
+    ] {
+        with_statement_expr(decls, stmt, |p, e| {
+            assert_eq!(e.typ, Some(p.types.void_ptr_id), "{stmt}: result type");
+            let ptr = match &e.kind {
+                ExprKind::Comma(parts) => {
+                    assert_eq!(parts.len(), kept + 1, "{stmt}: operands");
+                    parts.last().unwrap()
+                }
+                _ => {
+                    assert_eq!(kept, 0, "{stmt}: operands dropped");
+                    e
+                }
+            };
+            assert!(
+                matches!(ptr.kind, ExprKind::Cast { cast_type, .. }
+                    if cast_type == p.types.void_ptr_id),
+                "{stmt}: pointer not converted: {:?}",
+                ptr.kind
+            );
+        });
+    }
+}
+
+/// What gcc rejects in a call to `__builtin_assume_aligned`: an argument
+/// the prototype cannot convert, too few or too many arguments, and a
+/// misalignment that is not an integer. A null `void *` stands in.
+#[test]
+fn test_assume_aligned_rejects_bad_arguments() {
+    let decls = "struct S { int a; } s; char *p; double d;";
+    for stmt in [
+        "__builtin_assume_aligned(s, 16)",
+        "__builtin_assume_aligned(p, s)",
+        "__builtin_assume_aligned(p)",
+        "__builtin_assume_aligned(p, 16, 0, 1)",
+        "__builtin_assume_aligned(p, 16, d)",
+        "__builtin_assume_aligned(p, 16, p)",
+    ] {
+        let before = crate::diag::error_count();
+        with_statement_expr(decls, stmt, |p, e| {
+            // The count is process-wide and only grows, so a concurrent test
+            // can add to it but never hide this one's error.
+            assert!(crate::diag::error_count() > before, "{stmt}: accepted");
+            assert_eq!(e.typ, Some(p.types.void_ptr_id), "{stmt}: result type");
+            assert!(
+                matches!(&e.kind, ExprKind::Cast { expr, .. }
+                    if matches!(expr.kind, ExprKind::IntLit(0))),
+                "{stmt}: built {:?}",
+                e.kind
+            );
+        });
+    }
+}
+
+/// An argument a builtin requires to be an integer constant is one only if
+/// it is an integer constant expression (C17 6.6p6): an enumerator, a cast
+/// of a floating constant and `sizeof` are; a floating constant, a `const`
+/// object and a variable are not. The range decides in from out.
+#[test]
+fn test_constant_argument_is_an_integer_constant_expression() {
+    use super::builtin_args::ConstantArgument::{InRange, NotConstant, OutOfRange};
+    let decls = "enum E { A = 2 }; const int ci = 1; int i; double d;";
+    for (stmt, expected) in [
+        ("3", InRange(3)),
+        ("A", InRange(2)),
+        ("(int)1.0", InRange(1)),
+        ("sizeof(int) - 3", InRange(1)),
+        ("4", OutOfRange(4)),
+        ("-1", OutOfRange(-1)),
+        ("1.0", NotConstant),
+        ("ci", NotConstant),
+        ("i", NotConstant),
+        ("d", NotConstant),
+    ] {
+        let got = with_statement_expr(decls, stmt, |p, e| p.constant_argument(e, 0..=3));
+        assert_eq!(got, expected, "{stmt}");
+    }
+}
+
+/// What gcc calls integral: the integer types, `_Bool` and enumerations --
+/// not a complex integer, a floating type or a pointer.
+#[test]
+fn test_is_integral_is_gccs_integral_type() {
+    let decls = "enum E { A } e; _Bool b; char c; __int128 w; unsigned long u;\
+                 _Complex int ci; double d; int *p;";
+    for (stmt, integral) in [
+        ("e", true),
+        ("b", true),
+        ("c", true),
+        ("w", true),
+        ("u", true),
+        ("ci", false),
+        ("d", false),
+        ("p", false),
+    ] {
+        let got = with_statement_expr(decls, stmt, |p, e| p.is_integral(e.typ.unwrap()));
+        assert_eq!(got, integral, "{stmt}");
+    }
+}
+
+/// The classification builtins take any real floating argument and nothing
+/// else; a rejection is an error.
+#[test]
+fn test_require_floating_argument_takes_real_floating_only() {
+    let decls = "float f; long double ld; _Float16 h; const double cd = 0; int i;\
+                 enum E { A } e; _Bool b; char *p; _Complex double z; struct S { int a; } s;";
+    for (stmt, floating) in [
+        ("f", true),
+        ("ld", true),
+        ("h", true),
+        ("cd", true),
+        ("i", false),
+        ("e", false),
+        ("b", false),
+        ("p", false),
+        ("z", false),
+        ("s", false),
+    ] {
+        let before = crate::diag::error_count();
+        let got = with_statement_expr(decls, stmt, |p, e| {
+            p.require_floating_argument(e, crate::kw::BUILTIN_ISNAN)
+        });
+        assert_eq!(got, floating, "{stmt}");
+        if !floating {
+            assert!(crate::diag::error_count() > before, "{stmt}: not reported");
+        }
+    }
+}
+
+/// A count is judged against a minimum and an optional maximum, as every
+/// call's is.
+#[test]
+fn test_check_argument_count_bounds() {
+    for (given, min, max, ok) in [
+        (2, 2, Some(2), true),
+        (1, 2, Some(2), false),
+        (3, 2, Some(2), false),
+        (5, 1, None, true),
+        (0, 1, None, false),
+        (3, 0, Some(3), true),
+        (4, 0, Some(3), false),
+    ] {
+        let got = with_statement_expr("", "0", |p, _| {
+            p.check_argument_count(
+                Some(crate::kw::BUILTIN_FFS),
+                given,
+                min,
+                max,
+                p.current_pos(),
+            )
+        });
+        assert_eq!(got, ok, "{given} of {min}..{max:?}");
+    }
+}
+
+/// A builtin call rejected by its checks is not built: a zero of its type
+/// stands in, so nothing downstream sees an operand it cannot handle.
+#[test]
+fn test_rejected_builtin_calls_are_a_typed_zero() {
+    let decls = "int i; double d; _Bool b; char *p; struct S { int a; } s;\
+                 struct I; __builtin_va_list ap;";
+    for (stmt, typ) in [
+        ("__builtin_isnan(i)", TypeKind::Int),
+        ("__builtin_fpclassify(i, 1, 2, 3, 4, d)", TypeKind::Int),
+        ("__builtin_complex(1, 2)", TypeKind::Double),
+        ("__builtin_complex(1.0f, 2.0)", TypeKind::Double),
+        ("__builtin_add_overflow(1, 2, &d)", TypeKind::Int),
+        ("__builtin_add_overflow(1, 2, &b)", TypeKind::Int),
+        ("__builtin_mul_overflow_p(1, 2, b)", TypeKind::Int),
+        ("__builtin_object_size(p, i)", TypeKind::Long),
+        ("__builtin_prefetch(p, i)", TypeKind::Void),
+        ("__atomic_fetch_add(&b, 1, 0)", TypeKind::Bool),
+        ("__atomic_load_n(i, 0)", TypeKind::Int),
+        ("__atomic_always_lock_free(i, 0)", TypeKind::Bool),
+        ("__builtin_alloca(s)", TypeKind::Pointer),
+        ("__builtin_va_arg(ap, void)", TypeKind::Int),
+        ("__builtin_va_arg(ap, struct I)", TypeKind::Int),
+        ("__builtin_va_arg(ap, int[])", TypeKind::Int),
+        ("__builtin_va_arg(ap, int(void))", TypeKind::Int),
+    ] {
+        let before = crate::diag::error_count();
+        with_statement_expr(decls, stmt, |p, e| {
+            assert!(crate::diag::error_count() > before, "{stmt}: accepted");
+            assert_eq!(p.types.kind(e.typ.unwrap()), typ, "{stmt}: type");
+            let zero = match &e.kind {
+                ExprKind::Cast { expr, .. } => expr,
+                _ => e,
+            };
+            assert!(
+                matches!(zero.kind, ExprKind::IntLit(0)),
+                "{stmt}: built {:?}",
+                e.kind
+            );
+        });
+    }
+}
+
+/// `va_arg` takes any complete object type (C17 7.16.1.1p2) -- an array, a
+/// pointer to a variably modified one, a defined tag, a type the default
+/// argument promotions change (gcc only warns) -- and yields a value of it.
+#[test]
+fn test_va_arg_of_a_complete_object_type_is_built() {
+    let decls = "struct S { int a; } s; enum E { A }; struct I; __builtin_va_list ap; int n;";
+    for (stmt, typ) in [
+        ("__builtin_va_arg(ap, int[3])", TypeKind::Array),
+        ("__builtin_va_arg(ap, int(*)[n])", TypeKind::Pointer),
+        ("__builtin_va_arg(ap, struct S)", TypeKind::Struct),
+        ("__builtin_va_arg(ap, struct I *)", TypeKind::Pointer),
+        ("__builtin_va_arg(ap, enum E)", TypeKind::Enum),
+        ("__builtin_va_arg(ap, char)", TypeKind::Char),
+        ("__builtin_va_arg(ap, float)", TypeKind::Float),
+    ] {
+        with_statement_expr(decls, stmt, |p, e| {
+            // A variably modified type-name's extents wrap the value.
+            let value = match &e.kind {
+                ExprKind::VmTypeName { expr, .. } => expr,
+                _ => e,
+            };
+            assert!(
+                matches!(value.kind, ExprKind::VaArg { .. }),
+                "{stmt}: built {:?}",
+                e.kind
+            );
+            assert_eq!(p.types.kind(e.typ.unwrap()), typ, "{stmt}: type");
+        });
+    }
+}
+
+/// The suffixed classification builtins and the typed checked arithmetic
+/// have gcc's prototypes, so their arguments convert: `__builtin_isnanf(i)`
+/// tests a `float`, `__builtin_sadd_overflow(1.5, ...)` adds `int`s.
+#[test]
+fn test_prototyped_generic_builtins_convert_their_arguments() {
+    let decls = "int i; long double ld;";
+    with_statement_expr(decls, "__builtin_isnanf(i)", |p, e| {
+        let ExprKind::FpTest { arg, .. } = &e.kind else {
+            panic!("built {:?}", e.kind);
+        };
+        assert_eq!(arg.typ, Some(p.types.float_id));
+    });
+    with_statement_expr(decls, "__builtin_signbitl(i)", |p, e| {
+        let ExprKind::FpTest { arg, .. } = &e.kind else {
+            panic!("built {:?}", e.kind);
+        };
+        assert_eq!(arg.typ, Some(p.types.longdouble_id));
+    });
+    with_statement_expr(decls, "__builtin_sadd_overflow(1.5, ld, &i)", |p, e| {
+        let ExprKind::CheckedArith { a, b, .. } = &e.kind else {
+            panic!("built {:?}", e.kind);
+        };
+        assert_eq!(a.typ, Some(p.types.int_id));
+        assert_eq!(b.typ, Some(p.types.int_id));
+    });
+}
+
+// ============================================================================
+// Operand constraints of the operators (C17 6.5.3.3, 6.5.5-6.5.15)
+// ============================================================================
+
+/// A table of types for the operand-rule tests: one of each shape an operand
+/// can have once arrays and functions have decayed.
+struct OperandTypes {
+    types: TypeTable,
+    structure: crate::types::TypeId,
+    union: crate::types::TypeId,
+    complex_int: crate::types::TypeId,
+    long_ptr: crate::types::TypeId,
+}
+
+fn operand_types() -> OperandTypes {
+    use crate::types::{CompositeType, Type};
+    let mut types = TypeTable::new(&Target::host());
+    let structure = types.intern(Type::struct_type(CompositeType::incomplete(None)));
+    let union = types.intern(Type::union_type(CompositeType::incomplete(None)));
+    let complex_int = types.make_complex(types.int_id);
+    let long_ptr = types.intern(Type::pointer(types.long_id));
+    OperandTypes {
+        types,
+        structure,
+        union,
+        complex_int,
+        long_ptr,
+    }
+}
+
+/// Which types each operand class admits. A structure or union is in none of
+/// them; a complex integer is not an integer, though `is_integer` says so.
+#[test]
+fn operand_class_admits_its_types_and_no_aggregate() {
+    use super::operand_rule::OperandClass::*;
+    let t = operand_types();
+    let ty = &t.types;
+    // (type, Integer, IntegerOrComplex, Real, Arithmetic, Scalar)
+    let table = [
+        (ty.int_id, [true, true, true, true, true]),
+        (ty.bool_id, [true, true, true, true, true]),
+        (ty.double_id, [false, false, true, true, true]),
+        (ty.complex_double_id, [false, true, false, true, true]),
+        (t.complex_int, [false, true, false, true, true]),
+        (ty.int_ptr_id, [false, false, false, false, true]),
+        (t.structure, [false, false, false, false, false]),
+        (t.union, [false, false, false, false, false]),
+        (ty.void_id, [false, false, false, false, false]),
+    ];
+    for (typ, expected) in table {
+        for (class, want) in [Integer, IntegerOrComplex, Real, Arithmetic, Scalar]
+            .into_iter()
+            .zip(expected)
+        {
+            assert_eq!(
+                class.admits(ty, typ),
+                want,
+                "{:?} of {}",
+                class,
+                ty.format_type(typ, None)
+            );
+        }
+    }
+}
+
+/// The unary operators' classes, as gcc applies them: `~` takes a complex
+/// operand (its conjugate), and `++` a complex one too.
+#[test]
+fn unary_operator_classes() {
+    use super::operand_rule::{OperandClass, UnaryOperator};
+    for (op, class, name) in [
+        (UnaryOperator::Plus, OperandClass::Arithmetic, "unary plus"),
+        (
+            UnaryOperator::Minus,
+            OperandClass::Arithmetic,
+            "unary minus",
+        ),
+        (
+            UnaryOperator::Complement,
+            OperandClass::IntegerOrComplex,
+            "bit-complement",
+        ),
+        (
+            UnaryOperator::Not,
+            OperandClass::Scalar,
+            "unary exclamation mark",
+        ),
+        (UnaryOperator::Increment, OperandClass::Scalar, "increment"),
+        (UnaryOperator::Decrement, OperandClass::Scalar, "decrement"),
+    ] {
+        assert_eq!(op.operand_class(), class);
+        assert_eq!(op.name(), name);
+    }
+}
+
+/// Every binary operator against representative operand pairs, with gcc's
+/// verdict for each.
+#[test]
+fn binary_operand_verdicts() {
+    use super::operand_rule::{binary_operand_verdict, Operand, OperandVerdict::*};
+    let t = operand_types();
+    let ty = &t.types;
+    let v = |typ| Operand {
+        typ,
+        null_constant: false,
+    };
+    let zero = Operand {
+        typ: ty.int_id,
+        null_constant: true,
+    };
+    let (int, dbl, cplx, ptr, s) = (
+        v(ty.int_id),
+        v(ty.double_id),
+        v(ty.complex_double_id),
+        v(ty.int_ptr_id),
+        v(t.structure),
+    );
+    let (lptr, vptr) = (v(t.long_ptr), v(ty.void_ptr_id));
+    use BinaryOp::*;
+    let table = [
+        // Aggregates satisfy no operator.
+        (Add, s, int, Invalid),
+        (Add, int, s, Invalid),
+        (Mul, s, s, Invalid),
+        (Eq, s, s, Invalid),
+        (Lt, int, s, Invalid),
+        (LogAnd, int, v(t.union), Invalid),
+        (BitAnd, s, int, Invalid),
+        // Integer-only operators.
+        (Mod, dbl, int, Invalid),
+        (Mod, cplx, int, Invalid),
+        (Shl, int, cplx, Invalid),
+        (BitXor, v(t.complex_int), int, Invalid),
+        (Shr, ptr, int, Invalid),
+        (BitOr, v(ty.bool_id), int, Valid),
+        // Arithmetic, complex included.
+        (Mul, cplx, dbl, Valid),
+        (Mul, ptr, int, Invalid),
+        (Eq, cplx, int, Valid),
+        (Lt, cplx, int, Invalid),
+        // Pointer forms of + and -.
+        (Add, ptr, int, Valid),
+        (Add, int, ptr, Valid),
+        (Add, ptr, ptr, Invalid),
+        (Add, ptr, dbl, Invalid),
+        (Sub, ptr, int, Valid),
+        (Sub, int, ptr, Invalid),
+        (Sub, ptr, ptr, Valid),
+        (Sub, ptr, lptr, Invalid),
+        (Sub, ptr, vptr, Invalid),
+        // Comparisons with pointers.
+        (Lt, ptr, ptr, Valid),
+        (Lt, ptr, lptr, DistinctPointers),
+        (Lt, ptr, vptr, DistinctPointers),
+        (Eq, ptr, vptr, Valid),
+        (Eq, ptr, lptr, DistinctPointers),
+        (Eq, ptr, int, PointerInteger),
+        (Gt, int, ptr, PointerInteger),
+        (Eq, ptr, zero, Valid),
+        (Gt, ptr, zero, Valid),
+        (Eq, ptr, dbl, Invalid),
+        // Logical operators take any scalar.
+        (LogOr, ptr, cplx, Valid),
+        (LogAnd, s, int, Invalid),
+    ];
+    for (op, l, r, want) in table {
+        assert_eq!(
+            binary_operand_verdict(ty, op, l, r),
+            want,
+            "{} {} {}",
+            ty.format_type(l.typ, None),
+            op.spelling(),
+            ty.format_type(r.typ, None)
+        );
+    }
+}
+
+/// C17 6.7.6.2p1: an array's element type shall be neither incomplete nor a
+/// function type, wherever the array type is formed -- a declaration, a
+/// parameter, a member, a pointer to it, a type-name -- and the type is still
+/// formed, so parsing carries on.
+#[test]
+fn test_array_of_incomplete_element_type_is_reported() {
+    for src in [
+        "struct I; extern struct I a[2];",
+        "struct I; struct I (*q)[2]; struct I { int x; };",
+        "struct I; void f(struct I a[]);",
+        "struct I; struct S { struct I m[2]; };",
+        "enum E; extern enum E a[2];",
+        "extern int a[3][];",
+        "extern int (a[2])[];",
+        "extern void x[2];",
+        "void (a[2]);",
+        "int (a[2])(void);",
+        "int n = sizeof(struct I[2]);",
+        "int n = sizeof(void[2]);",
+        "int n = sizeof(int[2](void));",
+    ] {
+        let before = crate::diag::error_count();
+        parse_tu(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        assert!(crate::diag::error_count() > before, "{src}: accepted");
+    }
+}
+
+/// A suffix reads left to right from the identifier: `a[2](void)` is an
+/// array of two functions, not a function returning an array, and a grouped
+/// declarator's extents apply over the outer suffix.
+#[test]
+fn test_array_suffix_derivation_order() {
+    let (decl, types, _, _) = parse_decl("int a[2](void);").unwrap();
+    let typ = decl.declarators[0].typ;
+    assert_eq!(types.kind(typ), TypeKind::Array);
+    assert_eq!(
+        types.kind(types.base_type(typ).unwrap()),
+        TypeKind::Function
+    );
+
+    let (decl, types, _, _) = parse_decl("int (a[2])[3];").unwrap();
+    let typ = decl.declarators[0].typ;
+    assert_eq!(types.get(typ).array_size, Some(2));
+    let elem = types.base_type(typ).unwrap();
+    assert_eq!(types.get(elem).array_size, Some(3));
+    assert_eq!(types.kind(types.base_type(elem).unwrap()), TypeKind::Int);
 }

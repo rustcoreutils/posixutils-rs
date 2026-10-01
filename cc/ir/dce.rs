@@ -25,7 +25,6 @@ use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 const DEFAULT_LIVE_CAPACITY: usize = 64;
-const DEFAULT_REACHABLE_CAPACITY: usize = 16;
 
 // Main Entry Point
 
@@ -43,7 +42,7 @@ pub fn run(func: &mut Function) -> bool {
     changed |= eliminate_dead_code(func);
 
     // 3. Remove blocks that are no longer reachable from entry
-    changed |= remove_unreachable_blocks(func);
+    changed |= func.remove_unreachable_blocks();
 
     changed
 }
@@ -185,120 +184,29 @@ fn fold_branches_to_unreachable(func: &mut Function) -> bool {
     }
 
     let mut changed = false;
-
-    for bb in &mut func.blocks {
-        // Look for conditional branches
-        for insn in &mut bb.insns {
-            if insn.op != Opcode::Cbr {
-                continue;
-            }
-
-            // Get the branch targets
-            let (true_target, false_target) = match (insn.bb_true, insn.bb_false) {
-                (Some(t), Some(f)) => (t, f),
-                _ => continue,
-            };
-
-            // Check if one target leads to unreachable
-            let true_unreachable = unreachable_blocks.contains(&true_target);
-            let false_unreachable = unreachable_blocks.contains(&false_target);
-
-            if true_unreachable && !false_unreachable {
-                // If true branch goes to unreachable, always take false branch
-                // Replace cbr with unconditional br to false_target
-                insn.op = Opcode::Br;
-                insn.bb_true = Some(false_target);
-                insn.bb_false = None;
-                insn.src.clear(); // Remove condition operand
-                                  // Update children: remove true_target from successors
-                bb.children.retain(|c| *c != true_target);
-                changed = true;
-            } else if false_unreachable && !true_unreachable {
-                // If false branch goes to unreachable, always take true branch
-                // Replace cbr with unconditional br to true_target
-                insn.op = Opcode::Br;
-                insn.bb_true = Some(true_target);
-                insn.bb_false = None;
-                insn.src.clear(); // Remove condition operand
-                                  // Update children: remove false_target from successors
-                bb.children.retain(|c| *c != false_target);
-                changed = true;
-            }
-            // If both are unreachable, leave as-is (both paths are UB anyway)
+    for b in 0..func.blocks.len() {
+        let Some(term) = func.blocks[b].insns.last() else {
+            continue;
+        };
+        if term.op != Opcode::Cbr {
+            continue;
         }
+        let (Some(t), Some(f)) = (term.bb_true, term.bb_false) else {
+            continue;
+        };
+        // One side leads only to undefined behaviour, so the other is the
+        // only way the branch can go. Both: leave it, either is as good.
+        let taken = match (
+            unreachable_blocks.contains(&t),
+            unreachable_blocks.contains(&f),
+        ) {
+            (true, false) => f,
+            (false, true) => t,
+            _ => continue,
+        };
+        changed |= super::propagate::retarget_terminator(func, b, taken);
     }
-
     changed
-}
-
-// Unreachable Block Removal
-
-/// Compute the set of reachable block IDs starting from entry.
-fn compute_reachable(func: &Function) -> HashSet<BasicBlockId> {
-    let mut reachable = HashSet::with_capacity(DEFAULT_REACHABLE_CAPACITY);
-    let mut worklist = VecDeque::with_capacity(DEFAULT_REACHABLE_CAPACITY);
-
-    worklist.push_back(func.entry);
-    // A block whose address is taken is reachable through that address, which
-    // no edge records. Seeding it here keeps the label -- and so the symbol
-    // the address refers to -- from being deleted.
-    for block in &func.blocks {
-        if block.addr_taken {
-            worklist.push_back(block.id);
-        }
-    }
-
-    while let Some(bb_id) = worklist.pop_front() {
-        if !reachable.insert(bb_id) {
-            continue; // Already visited
-        }
-
-        // Find this block and add its successors
-        if let Some(bb) = func.get_block(bb_id) {
-            for child in &bb.children {
-                if !reachable.contains(child) {
-                    worklist.push_back(*child);
-                }
-            }
-        }
-    }
-
-    reachable
-}
-
-/// Remove every block no path from the entry reaches, and every edge and
-/// phi source it contributed.
-///
-/// Also the linearizer's last step on a function, at every level: gcc emits
-/// no code no path reaches even at `-O0` -- the arm of a constant condition,
-/// what follows a `return` or a `goto` -- and a program may depend on it, by
-/// calling a function that exists nowhere from such an arm. A block reached
-/// through a label, `case`, `default` or a taken address is kept.
-pub(crate) fn remove_unreachable_blocks(func: &mut Function) -> bool {
-    let reachable = compute_reachable(func);
-    let before = func.blocks.len();
-
-    // Collect unreachable predecessors before removing blocks
-    let unreachable: HashSet<_> = func
-        .blocks
-        .iter()
-        .map(|bb| bb.id)
-        .filter(|id| !reachable.contains(id))
-        .collect();
-
-    // Remove unreachable blocks
-    func.blocks.retain(|bb| reachable.contains(&bb.id));
-    func.rebuild_block_idx();
-
-    // Update parent/child references and phi nodes to remove dead blocks
-    for bb in &mut func.blocks {
-        bb.retain_edges(&reachable);
-        for &pred in &unreachable {
-            bb.remove_phi_predecessor(pred);
-        }
-    }
-
-    func.blocks.len() < before
 }
 
 #[cfg(test)]

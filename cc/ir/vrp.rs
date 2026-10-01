@@ -9,21 +9,23 @@
 // Value-range propagation: what set of values can a pseudo hold, and what
 // does a branch condition tell you about its operands on each arm.
 //
-// Wegman-Zadeck in the shape of `sccp`, with `range::Range` in place of a
-// single constant and one thing `sccp` has no notion of: a fact attached to
-// a CFG *edge*. `if (var <= 0) ... else ...` says nothing about `var` in
-// general and says `var >= 1` on the else arm, and that is the whole reason
-// this pass exists -- `sccp` cannot represent it, and `instcombine` can only
-// relate two comparisons over the same operand pair.
+// Wegman-Zadeck on `dataflow`'s solver, which `sccp` shares, with
+// `range::Range` in place of a single constant and one thing `sccp` has no
+// notion of: a fact attached to a CFG *edge*. `if (var <= 0) ... else ...`
+// says nothing about `var` in general and says `var >= 1` on the else arm,
+// and that is the whole reason this pass exists -- `sccp` cannot represent
+// it, and `instcombine` can only relate two comparisons over the same
+// operand pair.
 //
 // Three things here are load-bearing and easy to get wrong.
 //
 // **A fact belongs to an edge, and may only be used where that edge is the
-// only way in.** There is no critical-edge splitting in this compiler, so a
-// fact on `(P, B)` is usable at the top of `B` only when every execution of
-// `B` arrives over it. `refining_pred` decides that, and excludes the entry
-// block and any block whose address is taken -- `&&label` sets `addr_taken`
-// and adds *no* CFG edge, so a single recorded predecessor there is a lie.
+// only way in.** Critical edges are split only at lowering, after every
+// optimization, so a fact on `(P, B)` is usable at the top of `B` only when
+// every execution of `B` arrives over it. `refining_pred` decides that, and
+// excludes the entry block and any block whose address is taken -- `&&label`
+// sets `addr_taken` and adds *no* CFG edge, so a single recorded predecessor
+// there is a lie.
 //
 // **Termination is stated over moves, not over lattice height.** `sccp`
 // descends at most twice per cell because its lattice is three tall. A range
@@ -32,22 +34,20 @@
 // edge-fact map is allowed `MAX_MOVES` changes and is then pinned at the
 // bottom of its chain, which bounds the work outright.
 //
-// **A partial solve must never be applied.** Cells that have not yet been
-// driven down are *too precise*, so acting on them deletes live code. A
-// budget overrun discards the whole solution rather than keeping the part
-// that looks finished.
+// **A partial solve must never be applied.** A budget overrun discards the
+// whole solution rather than keeping the part that looks finished; see
+// `SparseAnalysis::run`.
 //
 
 use super::constfold::{
-    cmp_mask, cmp_operand_width, eval_binop, eval_unop, get_cmp_info, is_comparison,
-    result_type_of, CMP_ALL, CMP_EQ, CMP_GT, CMP_LT,
+    cmp_mask, eval_binop, eval_unop, get_cmp_info, CMP_ALL, CMP_EQ, CMP_GT, CMP_LT,
 };
+use super::dataflow::{Lattice, Selector, Sparse, SparseAnalysis};
 use super::facts::{CmpDomain, CmpFacts, ConstMap};
-use super::propagate::{self, cbr_taken, switch_taken, Site};
+use super::propagate::{cbr_taken, Site};
 use super::range::{allowed_by_predicate, possible_orderings, Range};
-use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
-use crate::types::TypeTable;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
+use std::collections::{BTreeMap, HashMap};
 
 /// How many times one cell may move before it is pinned at the bottom of its
 /// chain. Not a tuning knob: the termination proof.
@@ -69,7 +69,10 @@ enum RVal {
     Bottom,
 }
 
-impl RVal {
+impl Lattice for RVal {
+    const TOP: RVal = RVal::Top;
+    const BOTTOM: RVal = RVal::Bottom;
+
     fn meet(self, other: RVal) -> RVal {
         match (self, other) {
             (RVal::Top, x) | (x, RVal::Top) => x,
@@ -82,181 +85,55 @@ impl RVal {
 }
 
 /// Run value-range propagation over `func`, returning whether it changed.
-pub fn run(func: &mut Function, types: &TypeTable) -> bool {
-    if func.blocks.is_empty() {
-        return false;
-    }
-    let mut solver = Solver::new(func, types);
-    if !solver.solve(func) {
-        // Budget exhausted. The partial solution is too precise to act on.
-        return false;
-    }
-    solver.apply(func, types)
+pub fn run(func: &mut Function) -> bool {
+    Solver::new(func).run(func)
 }
 
-struct Solver<'a> {
-    types: &'a TypeTable,
+struct Solver {
+    core: Sparse<RVal>,
     consts: ConstMap,
     cmps: CmpFacts,
     /// Width of the value each pseudo's definition produces; 0 = unknown.
     widths: Vec<u32>,
-    vals: Vec<RVal>,
     moves: Vec<u16>,
-    /// Predecessors, derived from `children` rather than read from
-    /// `parents`: `dce::fold_branches_to_unreachable` updates only the
-    /// former, so `parents` goes stale and a missing entry would make the
-    /// refinement test answer yes when two paths reach a block.
     preds: HashMap<BasicBlockId, Vec<BasicBlockId>>,
     /// Ranges that hold on a CFG edge. `BTreeMap` so iteration order, and
     /// therefore the generated code, does not depend on a hash seed.
     edge_facts: HashMap<(BasicBlockId, BasicBlockId), BTreeMap<PseudoId, Range>>,
     edge_moves: HashMap<(BasicBlockId, BasicBlockId), u16>,
-    executable_block: HashSet<BasicBlockId>,
-    executable_edge: HashSet<(BasicBlockId, BasicBlockId)>,
-    cfg_worklist: VecDeque<(BasicBlockId, BasicBlockId)>,
-    block_worklist: VecDeque<BasicBlockId>,
-    ssa_worklist: VecDeque<PseudoId>,
-    uses: HashMap<PseudoId, Vec<Site>>,
-    unfoldable: HashSet<PseudoId>,
-    steps: usize,
 }
 
-impl<'a> Solver<'a> {
-    fn new(func: &Function, types: &'a TypeTable) -> Self {
+impl Solver {
+    fn new(func: &Function) -> Self {
         let consts = ConstMap::new(func);
         let cmps = CmpFacts::new(func, &consts);
         let n = func.next_pseudo as usize + 1;
-        let mut s = Solver {
-            types,
+        let mut widths = vec![0; n];
+        for insn in func.blocks.iter().flat_map(|bb| &bb.insns) {
+            if let Some(w) = insn.target.and_then(|t| widths.get_mut(t.0 as usize)) {
+                *w = insn.size;
+            }
+        }
+        Solver {
+            // A constant carries no width of its own; it is read at whatever
+            // width its consumer asks for. See `operand`.
+            core: Sparse::new(func, |_| RVal::Top),
             consts,
             cmps,
-            widths: vec![0; n],
-            vals: vec![RVal::Top; n],
+            widths,
             moves: vec![0; n],
-            preds: build_preds(func),
+            preds: func.predecessor_map(),
             edge_facts: HashMap::new(),
             edge_moves: HashMap::new(),
-            executable_block: HashSet::new(),
-            executable_edge: HashSet::new(),
-            cfg_worklist: VecDeque::new(),
-            block_worklist: VecDeque::new(),
-            ssa_worklist: VecDeque::new(),
-            uses: HashMap::new(),
-            unfoldable: HashSet::new(),
-            steps: 0,
-        };
-        s.index(func);
-        s.seed(func);
-        s
-    }
-
-    fn index(&mut self, func: &Function) {
-        for (b, bb) in func.blocks.iter().enumerate() {
-            for (i, insn) in bb.insns.iter().enumerate() {
-                for u in insn.uses() {
-                    self.uses.entry(u).or_default().push((b, i));
-                }
-                // The width a definition produces comes from
-                // `result_type_of`, never from `insn.size`: on a comparison
-                // that field describes the *operands*.
-                if let Some(t) = insn.target {
-                    let idx = t.0 as usize;
-                    if idx < self.widths.len() {
-                        self.widths[idx] = result_type_of(insn, self.types).1;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Initial values and the entry edge.
-    ///
-    /// Copied from `sccp::seed`, decision for decision: `Undef` is `Bottom`
-    /// and not `Top`, a `Sym` names storage rather than a value, an
-    /// inline-asm output is a second definition invariant I1 exempts, and a
-    /// block whose address is taken is reachable with no CFG edge. Each of
-    /// those is a way the algorithm turns unsound, not a refinement.
-    fn seed(&mut self, func: &Function) {
-        for p in &func.pseudos {
-            let idx = p.id.0 as usize;
-            if idx >= self.vals.len() {
-                continue;
-            }
-            self.vals[idx] = match &p.kind {
-                // A constant carries no width of its own; it is read at
-                // whatever width its consumer asks for. See `operand`.
-                PseudoKind::Val(_) => RVal::Top,
-                PseudoKind::Arg(_) => RVal::Bottom,
-                PseudoKind::Sym(_) => {
-                    self.unfoldable.insert(p.id);
-                    RVal::Bottom
-                }
-                PseudoKind::Undef => RVal::Bottom,
-                PseudoKind::FVal(_) => RVal::Bottom,
-                _ => RVal::Top,
-            };
-        }
-        for bb in &func.blocks {
-            for insn in &bb.insns {
-                if let Some(ref asm) = insn.asm_data {
-                    for out in &asm.outputs {
-                        self.unfoldable.insert(out.pseudo);
-                        let idx = out.pseudo.0 as usize;
-                        if idx < self.vals.len() {
-                            self.vals[idx] = RVal::Bottom;
-                        }
-                    }
-                }
-            }
-        }
-        let entry = func.entry;
-        self.mark_block(func, entry);
-        for bb in &func.blocks {
-            if bb.addr_taken {
-                self.mark_block(func, bb.id);
-            }
         }
     }
 
     fn get(&self, id: PseudoId) -> RVal {
-        self.vals
-            .get(id.0 as usize)
-            .copied()
-            .unwrap_or(RVal::Bottom)
+        self.core.get(id)
     }
 
     fn width_of(&self, id: PseudoId) -> u32 {
         self.widths.get(id.0 as usize).copied().unwrap_or(0)
-    }
-
-    /// Lower `id` to `v`, pushing its readers if it moved.
-    ///
-    /// Widening lives here: a cell that has moved `MAX_MOVES` times is
-    /// forced to the bottom of its chain and can never move again, which is
-    /// what makes the whole solve terminate.
-    fn set(&mut self, id: PseudoId, v: RVal) {
-        let idx = id.0 as usize;
-        if idx >= self.vals.len() {
-            return;
-        }
-        let merged = self.vals[idx].meet(v);
-        if merged == self.vals[idx] {
-            return;
-        }
-        self.moves[idx] = self.moves[idx].saturating_add(1);
-        let merged = if self.moves[idx] >= MAX_MOVES {
-            match merged {
-                RVal::Known(r) => RVal::Known(Range::full(r.width())),
-                other => other,
-            }
-        } else {
-            merged
-        };
-        if merged == self.vals[idx] {
-            return;
-        }
-        self.vals[idx] = merged;
-        self.ssa_worklist.push_back(id);
     }
 
     /// The range of `id` as an instruction in `block` sees it, read at
@@ -310,163 +187,6 @@ impl<'a> Solver<'a> {
             [p] => Some(*p),
             _ => None,
         }
-    }
-
-    fn mark_block(&mut self, func: &Function, id: BasicBlockId) {
-        if !self.executable_block.insert(id) {
-            return;
-        }
-        let Some(idx) = func.block_index(id) else {
-            return;
-        };
-        for i in 0..func.blocks[idx].insns.len() {
-            self.eval_site(func, (idx, i));
-        }
-        // `asm goto`'s block ends in an ordinary `Br` to the fallthrough and
-        // keeps its real targets in `asm_data.goto_labels`, so marking only
-        // what the terminator names would make those arms look unreachable.
-        let has_asm_goto = func.blocks[idx].insns.iter().any(|i| {
-            i.asm_data
-                .as_ref()
-                .is_some_and(|d| !d.goto_labels.is_empty())
-        });
-        let modelled_terminator = matches!(
-            func.blocks[idx].insns.last().map(|i| i.op),
-            Some(Opcode::Br) | Some(Opcode::Cbr) | Some(Opcode::Switch) | Some(Opcode::IndirectBr)
-        );
-        if has_asm_goto || !modelled_terminator {
-            let block_id = func.blocks[idx].id;
-            let succs: Vec<BasicBlockId> = func.blocks[idx].children.clone();
-            for s in succs {
-                self.mark_edge(block_id, s);
-            }
-            for i in 0..func.blocks[idx].insns.len() {
-                let labels: Vec<BasicBlockId> = func.blocks[idx].insns[i]
-                    .asm_data
-                    .as_ref()
-                    .map(|d| d.goto_labels.iter().map(|(b, _)| *b).collect())
-                    .unwrap_or_default();
-                for target in labels {
-                    self.mark_edge(block_id, target);
-                }
-            }
-        }
-    }
-
-    fn mark_edge(&mut self, from: BasicBlockId, to: BasicBlockId) {
-        if self.executable_edge.insert((from, to)) {
-            self.cfg_worklist.push_back((from, to));
-        }
-    }
-
-    /// Returns whether the solve finished inside its budget.
-    fn solve(&mut self, func: &Function) -> bool {
-        loop {
-            if self.steps > MAX_STEPS {
-                return false;
-            }
-            if let Some((_, to)) = self.cfg_worklist.pop_front() {
-                self.mark_block(func, to);
-                if let Some(idx) = func.block_index(to) {
-                    for i in 0..func.blocks[idx].insns.len() {
-                        if func.blocks[idx].insns[i].op == Opcode::Phi {
-                            self.eval_site(func, (idx, i));
-                        }
-                    }
-                }
-                continue;
-            }
-            if let Some(b) = self.block_worklist.pop_front() {
-                if let Some(idx) = func.block_index(b) {
-                    for i in 0..func.blocks[idx].insns.len() {
-                        self.eval_site(func, (idx, i));
-                    }
-                }
-                continue;
-            }
-            if let Some(id) = self.ssa_worklist.pop_front() {
-                for site in self.uses.get(&id).cloned().unwrap_or_default() {
-                    if self.executable_block.contains(&func.blocks[site.0].id) {
-                        self.eval_site(func, site);
-                    }
-                }
-                continue;
-            }
-            return true;
-        }
-    }
-
-    fn eval_site(&mut self, func: &Function, (b, i): Site) {
-        self.steps += 1;
-        let insn = &func.blocks[b].insns[i];
-        let block_id = func.blocks[b].id;
-
-        match insn.op {
-            Opcode::Br => {
-                if let Some(t) = insn.bb_true {
-                    self.mark_edge(block_id, t);
-                }
-                return;
-            }
-            Opcode::Cbr => {
-                let (Some(t), Some(f)) = (insn.bb_true, insn.bb_false) else {
-                    return;
-                };
-                let cond = insn.src.first().copied();
-                match cond.map(|c| self.branch_value(block_id, c)) {
-                    Some(Some(true)) => self.mark_edge(block_id, t),
-                    Some(Some(false)) => self.mark_edge(block_id, f),
-                    Some(None) => {
-                        self.mark_edge(block_id, t);
-                        self.mark_edge(block_id, f);
-                    }
-                    None => {
-                        self.mark_edge(block_id, t);
-                        self.mark_edge(block_id, f);
-                    }
-                }
-                // A branch with both arms on one block distinguishes
-                // nothing, so it proves nothing about its condition.
-                if t != f {
-                    if let Some(c) = cond {
-                        self.refine_edge(func, (b, i), block_id, t, c, true);
-                        self.refine_edge(func, (b, i), block_id, f, c, false);
-                    }
-                }
-                return;
-            }
-            Opcode::Switch => {
-                let taken = insn
-                    .src
-                    .first()
-                    .and_then(|s| self.single_const(block_id, *s))
-                    .and_then(|v| switch_taken(insn, v));
-                match taken {
-                    Some(t) => self.mark_edge(block_id, t),
-                    None => {
-                        let succs: Vec<BasicBlockId> = func.blocks[b].children.clone();
-                        for s in succs {
-                            self.mark_edge(block_id, s);
-                        }
-                    }
-                }
-                return;
-            }
-            Opcode::IndirectBr => {
-                let succs: Vec<BasicBlockId> = func.blocks[b].children.clone();
-                for s in succs {
-                    self.mark_edge(block_id, s);
-                }
-                return;
-            }
-            _ => {}
-        }
-
-        let Some(target) = insn.target else {
-            return;
-        };
-        let v = self.transfer(insn, block_id);
-        self.set(target, v);
     }
 
     /// The condition's value as a branch would test it, if it is known.
@@ -559,8 +279,8 @@ impl<'a> Solver<'a> {
             // narrowest, and so the strongest -- for the rest of the solve,
             // and `bound` came out of the loop a constant. Making the branch
             // a reader of what it reads is what keeps the fact honest.
-            self.watch(fact.lhs, site);
-            self.watch(fact.rhs, site);
+            self.core.watch(fact.lhs, site);
+            self.core.watch(fact.rhs, site);
             let lhs_r = self.range_or_full(pred, fact.lhs, fact.width);
             let rhs_r = self.range_or_full(pred, fact.rhs, fact.width);
             record_fact(&mut out, fact.lhs, allowed_by_predicate(m, signed, &rhs_r));
@@ -581,15 +301,7 @@ impl<'a> Solver<'a> {
         } else {
             self.edge_facts.insert(key, out);
         }
-        self.block_worklist.push_back(succ);
-    }
-
-    /// Re-evaluate `site` whenever `id` moves.
-    fn watch(&mut self, id: PseudoId, site: Site) {
-        let sites = self.uses.entry(id).or_default();
-        if !sites.contains(&site) {
-            sites.push(site);
-        }
+        self.core.revisit(succ);
     }
 
     /// `id`'s range as seen from `block`, or the whole space.
@@ -597,56 +309,6 @@ impl<'a> Solver<'a> {
         match self.operand(block, id, width) {
             RVal::Known(r) => r,
             _ => Range::at(width).map_or(Range::full(1), Range::full),
-        }
-    }
-
-    fn transfer(&self, insn: &Instruction, block: BasicBlockId) -> RVal {
-        let target_width = insn.target.map(|t| self.width_of(t)).unwrap_or(insn.size);
-
-        match insn.op {
-            Opcode::Copy | Opcode::PhiSource => self.operand(block, insn.src[0], insn.size),
-
-            Opcode::SetVal => match insn.target.and_then(|t| self.const_of(t)) {
-                Some(v) => match Range::at(insn.size) {
-                    Some(w) => RVal::Known(Range::from_const(w, v)),
-                    None => RVal::Bottom,
-                },
-                None => RVal::Bottom,
-            },
-
-            Opcode::Phi => {
-                let mut acc = RVal::Top;
-                for (pred, src) in &insn.phi_list {
-                    if !self.executable_edge.contains(&(*pred, block)) {
-                        continue;
-                    }
-                    acc = acc.meet(self.operand(block, *src, insn.size));
-                }
-                acc
-            }
-
-            Opcode::Select if insn.src.len() == 3 => match self.branch_value(block, insn.src[0]) {
-                Some(true) => self.operand(block, insn.src[1], insn.size),
-                Some(false) => self.operand(block, insn.src[2], insn.size),
-                None => self
-                    .operand(block, insn.src[1], insn.size)
-                    .meet(self.operand(block, insn.src[2], insn.size)),
-            },
-
-            Opcode::Neg | Opcode::Not => self.unary(insn, block, target_width),
-            Opcode::Zext | Opcode::Sext | Opcode::Trunc => self.convert(insn, block),
-
-            _ if is_comparison(insn.op) && !insn.op.to_string().starts_with("fcmp") => {
-                self.compare(insn, block, target_width)
-            }
-
-            _ if is_modelled_binop(insn.op) => self.binop(insn, block, target_width),
-
-            // Everything else. An unmodelled opcode answering anything but
-            // `Bottom` would be a licence to prove any branch below it dead,
-            // so `Lo64`, `UMulHi`, `Load`, `Call` and the rest land here
-            // deliberately.
-            _ => RVal::Bottom,
         }
     }
 
@@ -658,12 +320,10 @@ impl<'a> Solver<'a> {
         let vals: Option<Vec<i128>> = insn
             .src
             .iter()
-            .map(
-                |s| match self.operand(block, *s, self.operand_width(insn)) {
-                    RVal::Known(r) => r.single_value().map(|v| v as i128),
-                    _ => None,
-                },
-            )
+            .map(|s| match self.operand(block, *s, insn.operand_width()) {
+                RVal::Known(r) => r.single_value().map(|v| v as i128),
+                _ => None,
+            })
             .collect();
         let vals = vals?;
         let v = match vals.len() {
@@ -672,17 +332,6 @@ impl<'a> Solver<'a> {
             _ => return None,
         };
         Some(RVal::Known(Range::from_const(w, v)))
-    }
-
-    /// The width an instruction reads its operands at.
-    fn operand_width(&self, insn: &Instruction) -> u32 {
-        if is_comparison(insn.op) {
-            cmp_operand_width(insn)
-        } else if matches!(insn.op, Opcode::Zext | Opcode::Sext) {
-            insn.src_size
-        } else {
-            insn.size
-        }
     }
 
     fn unary(&self, insn: &Instruction, block: BasicBlockId, width: u32) -> RVal {
@@ -775,7 +424,7 @@ impl<'a> Solver<'a> {
         if insn.src.len() != 2 {
             return RVal::Bottom;
         }
-        let (Some(rw), Some(ow)) = (Range::at(result_width), Range::at(cmp_operand_width(insn)))
+        let (Some(rw), Some(ow)) = (Range::at(result_width), Range::at(insn.operand_width()))
         else {
             return RVal::Bottom;
         };
@@ -807,82 +456,125 @@ impl<'a> Solver<'a> {
         }
         RVal::Known(Range::inclusive(rw, 0, 1))
     }
+}
 
-    fn apply(&mut self, func: &mut Function, types: &TypeTable) -> bool {
-        let mut changed = false;
-        let mut minted: HashMap<i128, PseudoId> = HashMap::new();
+impl SparseAnalysis for Solver {
+    type V = RVal;
 
-        for b in 0..func.blocks.len() {
-            if !self.executable_block.contains(&func.blocks[b].id) {
-                continue;
-            }
-            let block_id = func.blocks[b].id;
-            for i in 0..func.blocks[b].insns.len() {
-                let Some(target) = func.blocks[b].insns[i].target else {
-                    continue;
-                };
-                if self.unfoldable.contains(&target) {
-                    continue;
-                }
-                let w = self.width_of(target);
-                let Some(w) = Range::at(w) else { continue };
-                let RVal::Known(r) = self.operand(block_id, target, w) else {
-                    continue;
-                };
-                let Some(v) = r.single_value() else { continue };
-                // A range holds a raw bit pattern; a minted constant is read
-                // as the signed value at its width, which is what the
-                // backend can emit there.
-                //
-                // Not a lost opportunity to chain: the two readings differ
-                // only when the top bit is set, and there *neither* is
-                // `unambiguous_at`, so `ConstMap::get` refuses the chain
-                // whichever is minted. Where an unambiguous form exists the
-                // two readings are the same number.
-                let v = super::constfold::at_width(v as i128, w, true);
-                changed |= propagate::fold_target_to_const(func, types, (b, i), v, &mut minted);
-            }
-        }
+    const STEP_BUDGET: Option<usize> = Some(MAX_STEPS);
 
-        for b in 0..func.blocks.len() {
-            if !self.executable_block.contains(&func.blocks[b].id) {
-                continue;
-            }
-            let block_id = func.blocks[b].id;
-            let Some(insn) = func.blocks[b].insns.last() else {
-                continue;
-            };
-            let taken = match insn.op {
-                Opcode::Cbr => {
-                    let (Some(t), Some(f)) = (insn.bb_true, insn.bb_false) else {
+    fn core(&self) -> &Sparse<RVal> {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut Sparse<RVal> {
+        &mut self.core
+    }
+
+    fn transfer(&self, insn: &Instruction, block: BasicBlockId) -> RVal {
+        let target_width = insn.target.map(|t| self.width_of(t)).unwrap_or(insn.size);
+
+        match insn.op {
+            Opcode::Copy | Opcode::PhiSource => self.operand(block, insn.src[0], insn.size),
+
+            Opcode::SetVal => match insn.target.and_then(|t| self.const_of(t)) {
+                Some(v) => match Range::at(insn.size) {
+                    Some(w) => RVal::Known(Range::from_const(w, v)),
+                    None => RVal::Bottom,
+                },
+                None => RVal::Bottom,
+            },
+
+            Opcode::Phi => {
+                let mut acc = RVal::Top;
+                for (pred, src) in &insn.phi_list {
+                    if !self.core.is_edge_executable(*pred, block) {
                         continue;
-                    };
-                    let Some(c) = insn.src.first().copied() else {
-                        continue;
-                    };
-                    match self.branch_value(block_id, c) {
-                        Some(true) => t,
-                        Some(false) => f,
-                        None => continue,
                     }
+                    acc = acc.meet(self.operand(block, *src, insn.size));
                 }
-                Opcode::Switch => {
-                    let Some(c) = insn.src.first().copied() else {
-                        continue;
-                    };
-                    let Some(v) = self.single_const(block_id, c) else {
-                        continue;
-                    };
-                    match switch_taken(insn, v) {
-                        Some(t) => t,
-                        None => continue,
-                    }
-                }
-                _ => continue,
-            };
-            changed |= propagate::retarget_terminator(func, b, taken);
+                acc
+            }
+
+            Opcode::Select if insn.src.len() == 3 => match self.branch_value(block, insn.src[0]) {
+                Some(true) => self.operand(block, insn.src[1], insn.size),
+                Some(false) => self.operand(block, insn.src[2], insn.size),
+                None => self
+                    .operand(block, insn.src[1], insn.size)
+                    .meet(self.operand(block, insn.src[2], insn.size)),
+            },
+
+            Opcode::Neg | Opcode::Not => self.unary(insn, block, target_width),
+            Opcode::Zext | Opcode::Sext | Opcode::Trunc => self.convert(insn, block),
+
+            _ if insn.op.is_int_comparison() => self.compare(insn, block, target_width),
+
+            _ if insn.op.is_int_arith() => self.binop(insn, block, target_width),
+
+            // Everything else. An unmodelled opcode answering anything but
+            // `Bottom` would be a licence to prove any branch below it dead,
+            // so `Lo64`, `UMulHi`, `Load`, `Call` and the rest land here
+            // deliberately.
+            _ => RVal::Bottom,
         }
-        changed
+    }
+
+    fn selector(&self, block: BasicBlockId, id: PseudoId) -> Selector {
+        match self.single_const(block, id) {
+            Some(v) => Selector::Value(v),
+            None => Selector::Unknown,
+        }
+    }
+
+    fn constant(&self, block: BasicBlockId, target: PseudoId) -> Option<i128> {
+        let w = Range::at(self.width_of(target))?;
+        let RVal::Known(r) = self.operand(block, target, w) else {
+            return None;
+        };
+        // A range holds a raw bit pattern; a minted constant is read as the
+        // signed value at its width, which is what the backend can emit
+        // there.
+        //
+        // Not a lost opportunity to chain: the two readings differ only when
+        // the top bit is set, and there *neither* is `unambiguous_at`, so
+        // `ConstMap::get` refuses the chain whichever is minted. Where an
+        // unambiguous form exists the two readings are the same number.
+        Some(super::constfold::at_width(
+            r.single_value()? as i128,
+            w,
+            true,
+        ))
+    }
+
+    /// Record what a `Cbr` proves about its condition's operands on each
+    /// arm. A branch with both arms on one block distinguishes nothing, so
+    /// it proves nothing.
+    fn after_terminator(&mut self, func: &Function, (b, i): Site) {
+        let insn = &func.blocks[b].insns[i];
+        let (Opcode::Cbr, Some(t), Some(f), Some(&c)) =
+            (insn.op, insn.bb_true, insn.bb_false, insn.src.first())
+        else {
+            return;
+        };
+        if t != f {
+            let block_id = func.blocks[b].id;
+            self.refine_edge(func, (b, i), block_id, t, c, true);
+            self.refine_edge(func, (b, i), block_id, f, c, false);
+        }
+    }
+
+    /// A cell that has moved `MAX_MOVES` times is forced to the bottom of
+    /// its chain and can never move again, which is what makes the whole
+    /// solve terminate.
+    fn widen(&mut self, id: PseudoId, merged: RVal) -> RVal {
+        let Some(moves) = self.moves.get_mut(id.0 as usize) else {
+            return merged;
+        };
+        *moves = moves.saturating_add(1);
+        match merged {
+            RVal::Known(r) if *moves >= MAX_MOVES => RVal::Known(Range::full(r.width())),
+            other => other,
+        }
     }
 }
 
@@ -904,66 +596,12 @@ fn record_fact(out: &mut BTreeMap<PseudoId, Range>, id: PseudoId, r: Range) {
     }
 }
 
-/// Predecessors, from every block's recorded `children` plus every
-/// terminator's targets and every `asm goto` label.
-///
-/// The union over-counts rather than under-counts, and over-counting only
-/// ever suppresses a refinement. Reading `BasicBlock::parents` instead would
-/// trust bookkeeping that `dce` does not maintain.
-fn build_preds(func: &Function) -> HashMap<BasicBlockId, Vec<BasicBlockId>> {
-    let mut preds: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
-    // Blocks are visited one at a time, so a repeated edge can only duplicate
-    // the entry the same block pushed last; searching the whole list made a
-    // join of many predecessors quadratic in them.
-    let add = |from: BasicBlockId, to: BasicBlockId, m: &mut HashMap<_, Vec<_>>| {
-        let e: &mut Vec<BasicBlockId> = m.entry(to).or_default();
-        if e.last() != Some(&from) {
-            e.push(from);
-        }
-    };
-    for bb in &func.blocks {
-        for c in &bb.children {
-            add(bb.id, *c, &mut preds);
-        }
-        for insn in &bb.insns {
-            for t in propagate::terminator_targets(insn) {
-                add(bb.id, t, &mut preds);
-            }
-            if let Some(ref asm) = insn.asm_data {
-                for (t, _) in &asm.goto_labels {
-                    add(bb.id, *t, &mut preds);
-                }
-            }
-        }
-    }
-    preds
-}
-
-/// Binary opcodes with a range transfer function.
-fn is_modelled_binop(op: Opcode) -> bool {
-    matches!(
-        op,
-        Opcode::Add
-            | Opcode::Sub
-            | Opcode::Mul
-            | Opcode::DivS
-            | Opcode::DivU
-            | Opcode::ModS
-            | Opcode::ModU
-            | Opcode::Shl
-            | Opcode::Lsr
-            | Opcode::Asr
-            | Opcode::And
-            | Opcode::Or
-            | Opcode::Xor
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ir::{BasicBlock, Pseudo};
     use crate::target::Target;
+    use crate::types::TypeTable;
 
     fn host_types() -> TypeTable {
         TypeTable::new(&Target::host())
@@ -999,21 +637,19 @@ mod tests {
 
         let mut l0 = BasicBlock::new(BasicBlockId(0));
         l0.add_insn(Instruction::new(Opcode::Entry));
-        l0.add_insn(Instruction::binop(
+        l0.add_insn(Instruction::compare(
             Opcode::SetLe,
             PseudoId(4),
-            PseudoId(0),
-            PseudoId(3),
-            i32t,
-            32,
+            (PseudoId(0), PseudoId(3)),
+            (i32t, 32),
+            (types.int_id, 32),
         ));
-        l0.add_insn(Instruction::binop(
+        l0.add_insn(Instruction::compare(
             Opcode::SetNe,
             PseudoId(5),
-            PseudoId(4),
-            PseudoId(6),
-            i32t,
-            32,
+            (PseudoId(4), PseudoId(6)),
+            (i32t, 32),
+            (types.int_id, 32),
         ));
         let mut ps0 = Instruction::new(Opcode::PhiSource)
             .with_target(PseudoId(22))
@@ -1042,13 +678,12 @@ mod tests {
             .with_type_and_size(i64t, 64);
         zext.src_size = 32;
         l1.add_insn(zext);
-        l1.add_insn(Instruction::binop(
+        l1.add_insn(Instruction::compare(
             Opcode::SetB,
             PseudoId(18),
-            PseudoId(11),
-            PseudoId(17),
-            i64t,
-            64,
+            (PseudoId(11), PseudoId(17)),
+            (i64t, 64),
+            (types.int_id, 32),
         ));
         let mut ps1 = Instruction::new(Opcode::PhiSource)
             .with_target(PseudoId(23))
@@ -1130,9 +765,8 @@ mod tests {
     /// the guard and delete the `link_failure` arm.
     #[test]
     fn vrp_folds_a_guard_proved_by_an_edge_range() {
-        let types = host_types();
         let mut func = range_guard(false);
-        assert!(run(&mut func, &types), "should change something");
+        assert!(run(&mut func), "should change something");
         assert!(
             folds_the_guard(&func),
             "guard should be unconditional:\n{func:?}"
@@ -1143,9 +777,8 @@ mod tests {
     /// there is no critical-edge splitting to make it hold for the block.
     #[test]
     fn vrp_does_not_refine_a_block_with_two_predecessors() {
-        let types = host_types();
         let mut func = range_guard(true);
-        run(&mut func, &types);
+        run(&mut func);
         assert!(
             !folds_the_guard(&func),
             "a fact from one edge must not govern a block reached another way"
@@ -1156,10 +789,9 @@ mod tests {
     /// predecessor does not mean one way in.
     #[test]
     fn vrp_does_not_refine_an_address_taken_block() {
-        let types = host_types();
         let mut func = range_guard(false);
         func.get_block_mut(BasicBlockId(1)).unwrap().addr_taken = true;
-        run(&mut func, &types);
+        run(&mut func);
         assert!(
             !folds_the_guard(&func),
             "an addr_taken block has a hidden entry"
@@ -1179,7 +811,7 @@ mod tests {
             .with_target(PseudoId(10))
             .with_src(PseudoId(0))
             .with_type_and_size(types.int_id, 32);
-        run(&mut func, &types);
+        run(&mut func);
         assert!(
             !folds_the_guard(&func),
             "a value from an unmodelled opcode proves nothing"
@@ -1190,19 +822,17 @@ mod tests {
     /// ten-iteration budget in `opt::optimize_function`.
     #[test]
     fn vrp_is_idempotent() {
-        let types = host_types();
         let mut func = range_guard(false);
-        assert!(run(&mut func, &types));
-        assert!(!run(&mut func, &types), "a second run must find nothing");
+        assert!(run(&mut func));
+        assert!(!run(&mut func), "a second run must find nothing");
     }
 
     /// Folding a terminator must repair the CFG, or `dce` later deletes a
     /// block a live branch still names.
     #[test]
     fn vrp_repairs_the_cfg_when_it_folds_a_terminator() {
-        let types = host_types();
         let mut func = range_guard(false);
-        run(&mut func, &types);
+        run(&mut func);
         let l2 = func.get_block(BasicBlockId(2)).unwrap();
         assert_eq!(l2.children, vec![BasicBlockId(5)], "dropped edge removed");
         assert_eq!(l2.insns.last().unwrap().bb_false, None, "no stale target");
@@ -1278,7 +908,7 @@ mod tests {
         f.entry = BasicBlockId(0);
 
         // The point is that this returns at all.
-        run(&mut f, &types);
+        run(&mut f);
         let term = f.get_block(BasicBlockId(1)).unwrap().insns.last().unwrap();
         assert_eq!(term.op, Opcode::Cbr, "a data-dependent exit stays a branch");
     }
@@ -1313,7 +943,7 @@ mod tests {
     /// happens to reach things in, so this shape is the behavioural guard
     /// and [`vrp_a_branch_reads_what_its_fact_is_derived_from`] pins the
     /// mechanism directly.
-    fn counting_loop() -> (Function, TypeTable) {
+    fn counting_loop() -> Function {
         let types = host_types();
         let i64t = types.long_id;
         let mut f = Function::new("f", i64t);
@@ -1377,13 +1007,12 @@ mod tests {
                 .with_src(PseudoId(0))
                 .with_type_and_size(i64t, 64),
         );
-        l2.add_insn(Instruction::binop(
+        l2.add_insn(Instruction::compare(
             Opcode::SetEq,
             PseudoId(14),
-            PseudoId(15),
-            PseudoId(16),
-            i64t,
-            64,
+            (PseudoId(15), PseudoId(16)),
+            (i64t, 64),
+            (types.int_id, 32),
         ));
         l2.add_insn(
             Instruction::new(Opcode::Copy)
@@ -1431,14 +1060,14 @@ mod tests {
 
         f.entry = BasicBlockId(0);
         f.blocks = vec![l0, l1, l2, l3, l4, l5];
-        f.rebuild_block_idx();
-        (f, types)
+        f.rebuild_parents();
+        f
     }
 
     #[test]
     fn vrp_re_derives_an_edge_fact_when_its_operands_widen() {
-        let (mut f, types) = counting_loop();
-        run(&mut f, &types);
+        let mut f = counting_loop();
+        run(&mut f);
 
         // `.L3` returns the bound. Nothing in this function says what the
         // bound is, so the copy must still read the argument.
@@ -1466,8 +1095,8 @@ mod tests {
     /// stands.
     #[test]
     fn vrp_a_branch_reads_what_its_fact_is_derived_from() {
-        let (f, types) = counting_loop();
-        let mut solver = Solver::new(&f, &types);
+        let f = counting_loop();
+        let mut solver = Solver::new(&f);
         solver.solve(&f);
 
         // The inner `cbr` is the last instruction of `.L2`.
@@ -1476,7 +1105,7 @@ mod tests {
         assert_eq!(f.blocks[b].insns[site.1].op, Opcode::Cbr);
 
         // `%0` is the bound: the operand whose range the fact is about.
-        let readers = solver.uses.get(&PseudoId(0)).cloned().unwrap_or_default();
+        let readers = solver.core.readers(PseudoId(0));
         assert!(
             readers.contains(&site),
             "the branch must be re-evaluated when the bound's range moves"
@@ -1503,7 +1132,7 @@ mod tests {
             types.int_id,
             32,
         );
-        run(&mut func, &types);
+        run(&mut func);
         assert!(
             !folds_the_guard(&func),
             "a divisor that may be zero proves nothing about the quotient"
@@ -1527,7 +1156,7 @@ mod tests {
             types.int_id,
             32,
         );
-        assert!(run(&mut func, &types));
+        assert!(run(&mut func));
         assert!(folds_the_guard(&func));
     }
 }

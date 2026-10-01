@@ -284,6 +284,19 @@ pub fn compile_and_run(name: &str, content: &str, extra_opts: &[String]) -> i32 
     0
 }
 
+/// Run `src` at -O0 and -O2 on the host, and on aarch64 under qemu when the
+/// cross toolchain is present; every run must exit 0.
+pub fn compile_and_run_everywhere(name: &str, src: &str) {
+    let o2 = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run(name, src, &[]), 0, "{name} at -O0");
+    assert_eq!(compile_and_run(name, src, &o2), 0, "{name} at -O2");
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64(name, src, opt) {
+            assert_eq!(code, 0, "{name} on aarch64 at {opt}");
+        }
+    }
+}
+
 /// Compile inline C code with optimization and run (single config, skips matrix).
 /// This is used by tests that specifically test optimization behavior.
 pub fn compile_and_run_optimized(name: &str, content: &str) -> i32 {
@@ -683,6 +696,20 @@ pub fn interop_aarch64(tag: &str, callee: &str, caller: &str) {
 /// `--dump-ast` returns before linearization and would miss anything the
 /// linearizer diagnoses. There is no `-fsyntax-only`.
 pub fn compile_expect_error(name: &str, content: &str, expected: &str) {
+    let stderr = compile_rejected(name, content);
+    assert!(
+        stderr.contains(expected),
+        "'{}' was rejected, but no diagnostic mentioned {:?}.\nstderr:\n{}",
+        name,
+        expected,
+        stderr
+    );
+}
+
+/// Compile `content`, require it to be rejected, and return what was written
+/// to stderr -- for a test that must see *every* diagnostic, such as one
+/// proving that an error is not followed by a cascade of others.
+pub fn compile_rejected(name: &str, content: &str) -> String {
     let c_file = create_c_file(name, content);
     let asm = plib::tmp::Builder::new()
         .prefix(&format!("c17_reject_{}_", name))
@@ -697,7 +724,7 @@ pub fn compile_expect_error(name: &str, content: &str, expected: &str) {
         c_file.path().to_string_lossy().to_string(),
     ];
     let output = run_test_base("c17", &args, &[]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     assert!(
         !output.status.success(),
@@ -706,13 +733,7 @@ pub fn compile_expect_error(name: &str, content: &str, expected: &str) {
         content,
         stderr
     );
-    assert!(
-        stderr.contains(expected),
-        "'{}' was rejected, but no diagnostic mentioned {:?}.\nstderr:\n{}",
-        name,
-        expected,
-        stderr
-    );
+    stderr
 }
 
 /// Compile `content` and require it to be **accepted**.

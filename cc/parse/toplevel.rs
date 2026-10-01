@@ -16,7 +16,8 @@ use super::ast::{
 use super::bind::{DeclScope, DeclSpecs};
 use super::declaration::SpecContext;
 use super::parser::{
-    DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser, RawParam,
+    DeclaratorContext, EnclosingFunction, ParseError, ParseResult, ParsedDeclarator, Parser,
+    RawParam,
 };
 use crate::diag;
 use crate::strings::StringId;
@@ -139,21 +140,27 @@ impl Parser<'_> {
         Ok(())
     }
 
-    /// Parse a function body, recording whether the forwarding builtins may
-    /// appear in it.
-    ///
-    /// `__builtin_va_arg_pack()` names the caller's variadic arguments, so it
-    /// needs the enclosing function to be variadic (there are arguments) and
-    /// `always_inline` (there is a known caller to take them from).
-    fn parse_forwarding_body(
+    /// Parse a function body, recording what the variadic builtins in it
+    /// need to know of the function (see [`EnclosingFunction`]).
+    fn parse_function_body(
         &mut self,
         attrs: &FunctionAttrs,
-        is_variadic: bool,
+        typ: TypeId,
+        last_param: Option<StringId>,
     ) -> ParseResult<Stmt> {
-        let outer = self.in_forwarding_function;
-        self.in_forwarding_function = is_variadic && attrs.always_inline;
+        let func = self.types.get(typ);
+        let is_variadic = func.variadic;
+        let outer = std::mem::replace(
+            &mut self.enclosing_function,
+            EnclosingFunction {
+                variadic: is_variadic,
+                forwarding: is_variadic && attrs.always_inline,
+                last_param,
+                conv: func.conv,
+            },
+        );
         let body = self.parse_block_stmt_no_scope();
-        self.in_forwarding_function = outer;
+        self.enclosing_function = outer;
         body
     }
 
@@ -191,7 +198,9 @@ impl Parser<'_> {
         // leaving it set applied it to whatever came next.
         self.pending_mode = None;
         self.pending_transparent_union = None;
+        self.pending_packed = false;
         self.pending_fn_attrs = Default::default();
+        self.pending_calling_conv = None;
         // And any asm label the previous declaration left behind.
         //
         // `skip_extensions` collects one wherever it runs, which is most
@@ -211,6 +220,9 @@ impl Parser<'_> {
     }
 
     pub(crate) fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
+        if self.at_attribute_declaration() {
+            return self.parse_file_attribute_declaration();
+        }
         self.parse_declaration(DeclScope::File)
     }
 
@@ -239,8 +251,6 @@ impl Parser<'_> {
             ParamStyle::IdentifierList
         };
         let return_type = func.base.expect("a function type has a return type");
-        // An old-style declarator has no `...` to be variadic with.
-        let is_variadic = func.variadic;
 
         self.check_redeclaration(name, typ, pos);
         let _ = self
@@ -261,6 +271,10 @@ impl Parser<'_> {
         // symbol its parameter list made, since that is what any variably
         // modified extent in a later parameter already resolved against.
         self.symbols.enter_scope();
+        let last_param = params
+            .last()
+            .and_then(|raw| raw.symbol)
+            .map(|id| self.symbols.get(id).name);
         let params = params
             .iter()
             .map(|raw| Parameter {
@@ -271,7 +285,7 @@ impl Parser<'_> {
             })
             .collect();
         // Parse body without creating another scope
-        let body = self.parse_forwarding_body(&attrs, is_variadic)?;
+        let body = self.parse_function_body(&attrs, typ, last_param)?;
         self.symbols.leave_scope();
 
         Ok(FunctionDef {
@@ -283,7 +297,7 @@ impl Parser<'_> {
             pos: specs.pos,
             is_static: specs.storage_class.contains(TypeModifiers::STATIC),
             is_inline: specs.storage_class.contains(TypeModifiers::INLINE),
-            calling_conv: attrs.calling_conv.unwrap_or_default(),
+            calling_conv: self.types.get(typ).conv,
             attrs,
         })
     }

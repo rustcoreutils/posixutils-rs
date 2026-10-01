@@ -37,7 +37,7 @@ use super::loadfwd::MemOracle;
 use super::memloc::{AddrMap, MemBase, MemLoc};
 use super::{Function, GlobalDef, Initializer, Module, Opcode, PseudoId};
 use crate::token::lexer::payload_bytes;
-use crate::types::{TypeKind, TypeModifiers, TypeTable};
+use crate::types::{TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
 
 /// How many definitions `string_len` follows before it gives up.
@@ -95,7 +95,7 @@ fn const_char_array(g: &GlobalDef, types: &TypeTable) -> Option<Vec<u8>> {
     }
     let elem = types.base_type(g.typ)?;
     // `qualifies` asks the array; a `volatile` element is as volatile.
-    if types.size_bytes(elem) != 1 || types.modifiers(elem).contains(TypeModifiers::VOLATILE) {
+    if types.size_bytes(elem) != 1 || types.contains_volatile(elem) {
         return None;
     }
     let mut bytes = vec![0u8; types.size_bytes(g.typ)];
@@ -437,7 +437,7 @@ pub(crate) mod fixture {
             let f = self.func();
             let sym = f.alloc_pseudo();
             f.add_pseudo(Pseudo::sym(sym, name.to_string()));
-            f.add_local(name, sym, arr, false, false, None, None);
+            f.add_local(name, sym, arr, None, None);
             let p = f.alloc_pseudo();
             let ptr = self.types.char_ptr_id;
             self.push(Instruction::sym_addr(p, sym, ptr));
@@ -470,7 +470,7 @@ pub(crate) mod fixture {
             let (srcs, arg_types): (Vec<_>, Vec<_>) = args.iter().copied().unzip();
             let size = self.types.size_bits(ret);
             let mut call = Instruction::call(Some(t), name, srcs, arg_types, ret, size);
-            call.known = Some(known);
+            call.extra_mut().known = Some(known);
             self.push(call);
             t
         }
@@ -591,7 +591,7 @@ mod tests {
         fx.const_array("tentative", 4, Initializer::None, |_| {});
         let vchar = fx.types.intern(crate::types::Type::with_modifiers(
             crate::types::TypeKind::Char,
-            TypeModifiers::VOLATILE | TypeModifiers::CONST,
+            crate::types::TypeModifiers::VOLATILE | crate::types::TypeModifiers::CONST,
         ));
         let varr = fx.types.intern(crate::types::Type::array(vchar, 4));
         fx.const_array("volatile", 4, s(), |g| g.typ = varr);

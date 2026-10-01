@@ -18,17 +18,13 @@ use super::{Function, Opcode, PseudoId};
 use std::collections::HashSet;
 
 /// Drop `func.locals` entries whose `Sym` pseudo has no remaining
-/// users in the IR. Run after `ssa_convert` and before the IR is
-/// handed off to optimization / lowering / codegen.
+/// users in the IR. Run after `ssa_convert`, and again once the optimizer
+/// has forwarded and deleted the accesses that kept a local alive -- each
+/// local dropped is a frame slot the backend never reserves.
 pub fn mem2reg(func: &mut Function) {
     let mut referenced: HashSet<PseudoId> = HashSet::new();
     for block in &func.blocks {
         for insn in &block.insns {
-            // Nops carry stale operands from the in-place Store->Nop
-            // rewrite ssa.rs performs; they are not real references.
-            if insn.op == Opcode::Nop {
-                continue;
-            }
             // Every role a pseudo can play, through the one enumeration of
             // them. Scanning `src` alone missed two ways a local's storage is
             // named. A call returning a struct in registers names the
@@ -63,12 +59,34 @@ pub fn mem2reg(func: &mut Function) {
     // local's pseudo behind puts a plausible-looking global in both paths.
     func.pseudos.retain(|p| !dropped.contains(&p.id));
     func.rebuild_pseudo_idx();
+
+    // A parameter the backend prologue fills from registers has nothing in
+    // the IR writing it, so nothing reading it means nothing uses it at all:
+    // the prologue finds no local and stores nothing, and the inliner must
+    // find no copy to make either.
+    func.implicit_param_copies
+        .retain(|c| !dropped.contains(&c.local_sym));
+
+    // So does the end of its lifetime: a marker names its local out of band,
+    // which is why it never kept one alive.
+    for insn in func.blocks.iter_mut().flat_map(|b| &mut b.insns) {
+        if insn.op == Opcode::LifetimeEnd
+            && insn
+                .extra()
+                .lifetime_of
+                .is_some_and(|l| dropped.contains(&l))
+        {
+            insn.kill();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{AsmConstraint, AsmData, BasicBlock, BasicBlockId, Instruction, Pseudo};
+    use crate::ir::{
+        AsmConstraint, AsmData, BasicBlock, BasicBlockId, Instruction, Opcode, Pseudo,
+    };
     use crate::target::Target;
     use crate::types::TypeTable;
 
@@ -80,12 +98,12 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let mut func = Function::new("f", types.void_id);
         func.add_pseudo(Pseudo::sym(PseudoId(0), "x.0".into()));
-        func.add_local("x.0", PseudoId(0), types.long_id, false, false, None, None);
+        func.add_local("x.0", PseudoId(0), types.long_id, None, None);
 
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.add_insn(Instruction::new(Opcode::Entry));
         let mut asm = Instruction::new(Opcode::Asm);
-        asm.asm_data = Some(Box::new(AsmData {
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
             template: String::new(),
             outputs: vec![AsmConstraint {
                 pseudo: PseudoId(0),
@@ -107,5 +125,80 @@ mod tests {
         mem2reg(&mut func);
         assert!(func.locals.contains_key("x.0"));
         assert!(func.get_pseudo(PseudoId(0)).is_some());
+    }
+    /// A parameter local the prologue fills from registers that nothing in
+    /// the IR reads any more is dropped, and its copy record with it: the
+    /// record would name a local the function no longer has.
+    #[test]
+    fn an_unread_register_parameter_local_drops_its_copy_record() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("f", types.void_id);
+        for (id, name) in [(0, "z.0"), (1, "w.1")] {
+            func.add_pseudo(Pseudo::sym(PseudoId(id), name.into()));
+            func.add_local(name, PseudoId(id), types.double_id, None, None);
+            func.implicit_param_copies
+                .push(crate::ir::ImplicitParamCopy {
+                    arg_index: id,
+                    local_sym: PseudoId(id),
+                    size_bytes: 16,
+                    qword_type: types.long_id,
+                    arg_is_address: true,
+                });
+        }
+        func.add_pseudo(Pseudo::reg(PseudoId(2), 2));
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        // Only `w.1` is still read.
+        bb.add_insn(Instruction::load(
+            PseudoId(2),
+            PseudoId(1),
+            0,
+            types.double_id,
+            64,
+        ));
+        bb.add_insn(Instruction::ret(None));
+        func.blocks.push(bb);
+        func.entry = BasicBlockId(0);
+
+        mem2reg(&mut func);
+        assert!(!func.locals.contains_key("z.0"));
+        assert!(func.locals.contains_key("w.1"));
+        let kept: Vec<PseudoId> = func
+            .implicit_param_copies
+            .iter()
+            .map(|c| c.local_sym)
+            .collect();
+        assert_eq!(kept, vec![PseudoId(1)]);
+    }
+    /// A dropped local takes the markers of its lifetime with it; a kept
+    /// one keeps its own.
+    #[test]
+    fn a_dropped_local_loses_its_lifetime_marker() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("f", types.void_id);
+        for (id, name) in [(0, "gone.0"), (1, "kept.1")] {
+            func.add_pseudo(Pseudo::sym(PseudoId(id), name.into()));
+            func.add_local(name, PseudoId(id), types.int_id, None, None);
+        }
+        func.add_pseudo(Pseudo::reg(PseudoId(2), 2));
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(Instruction::load(
+            PseudoId(2),
+            PseudoId(1),
+            0,
+            types.int_id,
+            32,
+        ));
+        bb.add_insn(Instruction::lifetime_end(PseudoId(0)));
+        bb.add_insn(Instruction::lifetime_end(PseudoId(1)));
+        bb.add_insn(Instruction::ret(None));
+        func.blocks.push(bb);
+        func.entry = BasicBlockId(0);
+
+        mem2reg(&mut func);
+        let ops: Vec<Opcode> = func.blocks[0].insns.iter().map(|i| i.op).collect();
+        assert_eq!(ops[2], Opcode::Nop, "the dropped local's marker goes");
+        assert_eq!(ops[3], Opcode::LifetimeEnd, "the kept one stays");
     }
 }

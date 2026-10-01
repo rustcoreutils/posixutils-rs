@@ -35,6 +35,17 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
         Vec::with_capacity(DEFAULT_COPY_CAPACITY);
     let mut phi_positions: Vec<(BasicBlockId, usize)> = Vec::with_capacity(DEFAULT_COPY_CAPACITY);
 
+    // A phi reached along an edge `split_critical_edges` could not split --
+    // out of a computed `goto`, whose source jumps to an address rather
+    // than to a block it names -- cannot have its copy placed on that edge
+    // alone: the copy at the end of the dispatch block runs whichever label
+    // is taken. So that phi takes its operands in a temporary of its own,
+    // and the phi itself becomes the one copy out of it at the head of its
+    // block (Sreedhar's method I). A temporary written on a path that does
+    // not reach the phi is harmless, because every path that does reach it
+    // writes it first.
+    let routed = route_unsplit_phis(func);
+
     // Scan all blocks for PhiSource and Phi instructions
     for bb in &func.blocks {
         for (insn_idx, insn) in bb.insns.iter().enumerate() {
@@ -49,6 +60,7 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
                             "PhiSource must have exactly one back-pointer"
                         );
                         let (_phi_bb, phi_target) = insn.phi_list[0];
+                        let phi_target = routed.get(&phi_target).copied().unwrap_or(phi_target);
                         let source = insn.src[0];
 
                         // Skip copies from undef sources
@@ -120,14 +132,52 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
         }
     }
 
-    // Convert Phi instructions to Nop (PhiSource is the source of truth now)
+    // Convert Phi instructions to Nop (PhiSource is the source of truth now),
+    // or, for a routed one, to the copy out of its temporary.
     for (bb_id, insn_idx) in phi_positions {
         if let Some(bb) = func.get_block_mut(bb_id) {
             if insn_idx < bb.insns.len() {
-                bb.insns[insn_idx].kill();
+                let phi = &mut bb.insns[insn_idx];
+                match phi.target.and_then(|t| routed.get(&t).map(|tmp| (t, *tmp))) {
+                    Some((target, tmp)) => {
+                        let mut copy = Instruction::new(Opcode::Copy)
+                            .with_target(target)
+                            .with_src(tmp)
+                            .with_size(phi.size);
+                        copy.typ = phi.typ;
+                        copy.pos = phi.pos;
+                        *phi = copy;
+                    }
+                    None => phi.kill(),
+                }
             }
         }
     }
+}
+
+/// The phis that must take their operands through a temporary, each mapped
+/// to its temporary: every phi in a block reached along an edge out of a
+/// computed `goto` that has other edges too. See `eliminate_phi_nodes`.
+fn route_unsplit_phis(func: &mut Function) -> HashMap<crate::ir::PseudoId, crate::ir::PseudoId> {
+    let mut targets = Vec::new();
+    for bb in &func.blocks {
+        let unsplit = bb.parents.iter().any(|p| {
+            func.get_block(*p)
+                .is_some_and(|pb| pb.ends_in_computed_goto() && pb.children.len() > 1)
+        });
+        if !unsplit {
+            continue;
+        }
+        for insn in &bb.insns {
+            if insn.op == Opcode::Phi {
+                targets.extend(insn.target);
+            }
+        }
+    }
+    targets
+        .into_iter()
+        .map(|t| (t, func.create_reg_pseudo()))
+        .collect()
 }
 
 /// Information needed to insert a copy instruction
@@ -226,22 +276,20 @@ pub fn lower_module(module: &mut Module) {
     for func in &mut module.functions {
         lower_function(func);
     }
+    super::validate::verify(module, super::validate::Stage::Lowered, "lowering");
 }
 
 /// Lower a single function.
 ///
 /// Runs:
 /// 1. `__builtin_constant_p` placeholders resolved to 0
-/// 2. Phi elimination
+/// 2. Critical-edge splitting, which phi elimination depends on -- see
+///    `ir::cfg` for why, and for why nothing may merge blocks after it
+/// 3. Phi elimination
 pub fn lower_function(func: &mut Function) {
     resolve_constant_p(func);
+    func.split_critical_edges();
     eliminate_phi_nodes(func);
-    debug_assert!(
-        crate::ir::validate::check_no_placeholders(func).is_ok(),
-        "a deferred placeholder survived lowering, and both backends would \
-         drop it silently: {:?}",
-        crate::ir::validate::check_no_placeholders(func).err()
-    );
 }
 
 /// Answer every `ConstantP` this far down the pipeline with 0.
@@ -852,5 +900,167 @@ mod tests {
         assert_eq!(insn.op, Opcode::Copy);
         assert_eq!(func.const_val(insn.src[0]), Some(0));
         assert!(crate::ir::validate::check_no_placeholders(&func).is_ok());
+    }
+
+    /// The lost-copy shape: a loop whose header is also its own latch, with
+    /// the phi's value used after the loop.
+    ///
+    /// `.L1: x = phi(.L0: a, .L1: y); y = x + 1; cbr c, .L1, .L2` and
+    /// `.L2: ret x`. The back edge `.L1 -> .L1` is critical -- `.L1` has two
+    /// successors and two predecessors -- so the copy `x = y` placed at the
+    /// end of `.L1` also runs on the way out, and `.L2` returns `y`. Splitting
+    /// gives the back edge a block of its own, and the copy lands there.
+    #[test]
+    fn lower_splits_a_critical_edge_before_placing_its_copy() {
+        let types = TypeTable::new(&Target::host());
+        let int = types.int_id;
+        let mut f = Function::new("lost_copy", int);
+        for i in 0..8 {
+            f.add_pseudo(Pseudo::reg(PseudoId(i), i));
+        }
+        let mut b0 = BasicBlock::new(BasicBlockId(0));
+        b0.add_insn(Instruction::new(Opcode::Entry));
+        let mut s0 = Instruction::phi_source(PseudoId(5), PseudoId(1), int, 32);
+        s0.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
+        b0.add_insn(s0);
+        b0.add_insn(Instruction::br(BasicBlockId(1)));
+        let mut b1 = BasicBlock::new(BasicBlockId(1));
+        let mut phi = Instruction::phi(PseudoId(3), int, 32);
+        phi.phi_list = vec![
+            (BasicBlockId(0), PseudoId(5)),
+            (BasicBlockId(1), PseudoId(6)),
+        ];
+        b1.add_insn(phi);
+        b1.add_insn(Instruction::binop(
+            Opcode::Add,
+            PseudoId(2),
+            PseudoId(3),
+            PseudoId(4),
+            int,
+            32,
+        ));
+        let mut s1 = Instruction::phi_source(PseudoId(6), PseudoId(2), int, 32);
+        s1.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
+        b1.add_insn(s1);
+        b1.add_insn(Instruction::cbr(
+            PseudoId(7),
+            BasicBlockId(1),
+            BasicBlockId(2),
+        ));
+        let mut b2 = BasicBlock::new(BasicBlockId(2));
+        b2.add_insn(Instruction::ret(Some(PseudoId(3))));
+        f.entry = BasicBlockId(0);
+        for b in [b0, b1, b2] {
+            f.add_block(b);
+        }
+        for (a, b) in [(0, 1), (1, 1), (1, 2)] {
+            f.add_edge(BasicBlockId(a), BasicBlockId(b));
+        }
+        assert!(crate::ir::validate::validate_function(&f).is_ok());
+
+        lower_function(&mut f);
+
+        let copies_into_x = |b: &BasicBlock| {
+            b.insns
+                .iter()
+                .filter(|i| i.op == Opcode::Copy && i.target == Some(PseudoId(3)))
+                .count()
+        };
+        // The header copies nothing into `x`: the exit edge must see it intact.
+        let header = f.get_block(BasicBlockId(1)).unwrap();
+        assert_eq!(
+            copies_into_x(header),
+            0,
+            "the copy would run on the exit edge too"
+        );
+        // The back edge now goes through a block of its own, which holds it.
+        let latch = header
+            .children
+            .iter()
+            .find(|c| **c != BasicBlockId(2))
+            .copied()
+            .unwrap();
+        assert_ne!(latch, BasicBlockId(1));
+        let latch = f.get_block(latch).unwrap();
+        assert_eq!(copies_into_x(latch), 1);
+        assert_eq!(latch.children, vec![BasicBlockId(1)]);
+        assert!(
+            crate::ir::validate::validate_function_at(&f, crate::ir::validate::Stage::Lowered)
+                .is_ok()
+        );
+    }
+
+    /// An edge out of a computed `goto` cannot be split, so a phi reached
+    /// along one takes its operands through a temporary of its own and
+    /// becomes the copy out of it at the head of its block. Written straight
+    /// into the phi's target, the copy at the end of the dispatch block would
+    /// run whichever label the jump chose.
+    #[test]
+    fn lower_routes_a_phi_behind_an_unsplittable_edge_through_a_temporary() {
+        let types = TypeTable::new(&Target::host());
+        let int = types.int_id;
+        let mut f = Function::new("dispatch", int);
+        for i in 0..8 {
+            f.add_pseudo(Pseudo::reg(PseudoId(i), i));
+        }
+        // .L0 -> .L1 (label) directly, and to .L3 (dispatch); .L3 jumps to
+        // .L1 or .L2 by address. .L1 merges a value from .L0 and from .L3.
+        let mut b0 = BasicBlock::new(BasicBlockId(0));
+        b0.add_insn(Instruction::new(Opcode::Entry));
+        let mut s0 = Instruction::phi_source(PseudoId(5), PseudoId(1), int, 32);
+        s0.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
+        b0.add_insn(s0);
+        b0.add_insn(Instruction::cbr(
+            PseudoId(7),
+            BasicBlockId(1),
+            BasicBlockId(3),
+        ));
+        let mut b3 = BasicBlock::new(BasicBlockId(3));
+        let mut s3 = Instruction::phi_source(PseudoId(6), PseudoId(2), int, 32);
+        s3.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
+        b3.add_insn(s3);
+        b3.add_insn(Instruction::indirect_br(PseudoId(4)));
+        let mut b1 = BasicBlock::new(BasicBlockId(1));
+        b1.addr_taken = true;
+        let mut phi = Instruction::phi(PseudoId(3), int, 32);
+        phi.phi_list = vec![
+            (BasicBlockId(0), PseudoId(5)),
+            (BasicBlockId(3), PseudoId(6)),
+        ];
+        b1.add_insn(phi);
+        b1.add_insn(Instruction::ret(Some(PseudoId(3))));
+        let mut b2 = BasicBlock::new(BasicBlockId(2));
+        b2.addr_taken = true;
+        b2.add_insn(Instruction::ret(Some(PseudoId(1))));
+        f.entry = BasicBlockId(0);
+        for b in [b0, b3, b1, b2] {
+            f.add_block(b);
+        }
+        for (a, b) in [(0, 1), (0, 3), (3, 1), (3, 2)] {
+            f.add_edge(BasicBlockId(a), BasicBlockId(b));
+        }
+        assert!(crate::ir::validate::validate_function(&f).is_ok());
+
+        lower_function(&mut f);
+
+        // The dispatch block writes a temporary, never `x` itself.
+        let dispatch = f.get_block(BasicBlockId(3)).unwrap();
+        let written: Vec<PseudoId> = dispatch
+            .insns
+            .iter()
+            .filter(|i| i.op == Opcode::Copy)
+            .filter_map(|i| i.target)
+            .collect();
+        assert_eq!(written.len(), 1);
+        assert_ne!(
+            written[0],
+            PseudoId(3),
+            "the dispatch block must not write the phi"
+        );
+        // And the label's head copies it into `x`.
+        let head = &f.get_block(BasicBlockId(1)).unwrap().insns[0];
+        assert_eq!(head.op, Opcode::Copy);
+        assert_eq!(head.target, Some(PseudoId(3)));
+        assert_eq!(head.src, written);
     }
 }

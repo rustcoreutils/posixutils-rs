@@ -11,7 +11,7 @@
 // Consolidates: longlong, bool, complex tests
 //
 
-use crate::common::{compile_and_run, compile_and_run_optimized};
+use crate::common::{compile_and_run, compile_and_run_everywhere, compile_and_run_optimized};
 
 // ============================================================================
 // Mega-test: C99 types (long long, _Bool)
@@ -2104,4 +2104,447 @@ int main(void) {
         compile_and_run("c99_vla_scope_release_o2", code, &["-O2".to_string()]),
         0
     );
+}
+
+/// `packed` on one member drops that member's alignment to 1, so it is laid
+/// out at the next byte and no longer raises the struct's alignment; the
+/// members around it keep theirs. c17 accepted the attribute there and laid
+/// the member out as if it were absent: `struct { char a; int b
+/// __attribute__((packed)); }` was 8 bytes, where gcc makes it 5. An
+/// `aligned` written alongside still raises the member back. Every size and
+/// offset here is gcc's.
+#[test]
+fn c99_packed_member_drops_only_its_own_alignment() {
+    let code = r#"
+#include <stddef.h>
+struct A { char a; int b __attribute__((packed)); };
+struct B { char a; int b __attribute__((packed)); char c; };
+struct C { char a; long b __attribute__((packed)); int c; };
+struct D { char a; struct { char x; int y; } s __attribute__((packed)); };
+struct E { char a; int b __attribute__((packed, aligned(2))); };
+int main(void) {
+    struct B b = { 1, 0x12345678, 3 };
+    if (sizeof(struct A) != 5 || offsetof(struct A, b) != 1 || _Alignof(struct A) != 1) return 1;
+    if (sizeof(struct B) != 6 || offsetof(struct B, c) != 5) return 2;
+    if (sizeof(struct C) != 16 || offsetof(struct C, b) != 1 || offsetof(struct C, c) != 12) return 3;
+    if (sizeof(struct D) != 9 || offsetof(struct D, s) != 1) return 4;
+    if (sizeof(struct E) != 6 || offsetof(struct E, b) != 2) return 5;
+    if (b.a != 1 || b.b != 0x12345678 || b.c != 3) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("packed_member", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("packed_member_opt", code), 0);
+}
+
+/// `packed` on a member against the rest of the alignment rules, on both
+/// targets: a packed bit-field takes the next free bit and adds no alignment,
+/// `#pragma pack(n)` caps a member's written `aligned` as well as its type's,
+/// a struct-level `packed` leaves a member's own `aligned` in force, and a
+/// union is as aligned as its least-packed member. Every size, offset and
+/// byte image here is gcc's, the same on x86-64 and aarch64.
+#[test]
+fn c99_packed_member_against_pack_and_aligned() {
+    let code = r#"
+#include <stddef.h>
+#include <string.h>
+struct I { char a; int b:12 __attribute__((packed)); char c; };
+struct W { short s; int b:30 __attribute__((packed)); };
+struct X { char a; int b:3 __attribute__((packed, aligned(4))); };
+#pragma pack(push, 2)
+struct J { char a; int b __attribute__((packed)); int c; };
+struct K { char a; int b __attribute__((aligned(8))); };
+#pragma pack(pop)
+#pragma pack(push, 1)
+union UK { char a; int b __attribute__((aligned(8))); };
+#pragma pack(pop)
+struct P { char x; int y; } __attribute__((packed));
+struct L { char a; struct P p __attribute__((packed)); int c; };
+struct __attribute__((packed)) M { char a; int b __attribute__((aligned(4))); char c; };
+union N { char a; int b __attribute__((packed)); };
+union N2 { char a; int b __attribute__((packed)); int c; };
+typedef int ai8 __attribute__((aligned(8)));
+struct T { char a; ai8 b __attribute__((packed)); };
+static int image(const void *p, size_t n, const char *want) {
+    return memcmp(p, want, n) != 0;
+}
+int main(void) {
+    struct I i; struct W w; struct X x;
+    if (sizeof(struct I) != 4 || _Alignof(struct I) != 1 || offsetof(struct I, c) != 3) return 1;
+    memset(&i, 0, sizeof i); i.b = -1;
+    if (image(&i, 4, "\x00\xff\x0f\x00") || i.b != -1) return 2;
+    if (sizeof(struct W) != 6 || _Alignof(struct W) != 2) return 3;
+    memset(&w, 0, sizeof w); w.b = -1;
+    if (image(&w, 6, "\x00\x00\xff\xff\xff\x3f") || w.b != -1) return 4;
+    if (sizeof(struct X) != 8 || _Alignof(struct X) != 4) return 5;
+    memset(&x, 0, sizeof x); x.b = 3;
+    if (image(&x, 8, "\x00\x00\x00\x00\x03\x00\x00\x00") || x.b != 3) return 6;
+    if (sizeof(struct J) != 10 || offsetof(struct J, b) != 1 || offsetof(struct J, c) != 6) return 7;
+    if (sizeof(struct K) != 6 || _Alignof(struct K) != 2 || offsetof(struct K, b) != 2) return 8;
+    if (sizeof(union UK) != 4 || _Alignof(union UK) != 1) return 9;
+    if (sizeof(struct L) != 12 || offsetof(struct L, p) != 1 || offsetof(struct L, c) != 8) return 10;
+    if (sizeof(struct M) != 12 || _Alignof(struct M) != 4 || offsetof(struct M, c) != 8) return 11;
+    if (sizeof(union N) != 4 || _Alignof(union N) != 1) return 12;
+    if (sizeof(union N2) != 4 || _Alignof(union N2) != 4) return 13;
+    if (sizeof(struct T) != 5 || offsetof(struct T, b) != 1) return 14;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("packed_member_rules", code);
+}
+
+/// `packed` on an enum makes it the smallest integer type that holds its
+/// values, as gcc's `-fshort-enums` does for every enum: one byte for
+/// `{A0, A1}`, signed when an enumerator is negative, two for a value of 300.
+/// c17 rejected the attribute between `enum` and the tag as a parse error and
+/// ignored it after the list, leaving a four-byte enum where gcc lays out
+/// one. Every size here is gcc's, on both targets.
+#[test]
+fn c99_packed_enum_is_its_smallest_integer_type() {
+    crate::common::compile_and_run_everywhere(
+        "packed_enum",
+        r#"
+enum __attribute__((packed)) A { A0, A1 };          /* 1 byte, unsigned char */
+enum B { B0 = -1, B1 } __attribute__((packed));     /* 1 byte, signed char */
+enum __attribute__((__packed__)) C { C0 = 300 };    /* 2 bytes */
+enum __attribute__((packed)) D { D0 = 70000 };      /* 4 bytes */
+typedef enum __attribute__((packed)) { T0, T1 } T;  /* anonymous, typedef'd */
+struct S { char c; enum A a; enum C k; };           /* packed enums keep their natural alignment */
+int main(void) {
+    if (sizeof(enum A) != 1 || _Alignof(enum A) != 1) return 1;
+    if (sizeof(enum B) != 1) return 2;
+    if (sizeof(enum C) != 2 || _Alignof(enum C) != 2) return 3;
+    if (sizeof(enum D) != 4) return 4;
+    if (sizeof(T) != 1) return 5;
+    if (sizeof(struct S) != 4) return 6;
+    enum B b = B0;
+    if (b != -1) return 7;
+    enum A a = A1;
+    if (a + 0 != 1) return 8;
+    if (!__builtin_types_compatible_p(enum A, unsigned char)) return 9;
+    if (!__builtin_types_compatible_p(enum B, signed char)) return 10;
+    return 0;
+}
+"#,
+    );
+}
+
+/// `packed` on an enum in every position gcc reads it, and what a packed
+/// enum does once declared: gcc ignores it on a forward declaration and
+/// ignores `aligned` on an enum altogether; bit-fields keep the enum's
+/// signedness; a value promotes to `int` and the constants stay `int`; a
+/// member wider than `int` widens the enum to 8 bytes.
+#[test]
+fn c99_packed_enum_placements_and_uses() {
+    crate::common::compile_and_run_everywhere(
+        "packed_enum_uses",
+        r#"
+enum __attribute__((packed)) A { A0, A1, A2 = 200 };      /* between enum and tag */
+enum N { N0 = -100, N1 = 100 } __attribute__((packed));    /* after the brace */
+typedef enum { T0, T1 } __attribute__((packed)) T;         /* typedef, after the brace */
+enum __attribute__((packed)) { X0 = 300 } x;               /* anonymous */
+enum __attribute__((packed)) W { W0 = 0x100000000 };       /* needs 8 bytes */
+enum F;
+enum __attribute__((packed)) F { F0 };                     /* defined packed after a forward declaration */
+enum __attribute__((packed)) G;
+enum G { G0 };                                             /* packed only on the forward declaration */
+enum __attribute__((aligned(8))) AL { AL0 };               /* aligned on an enum is ignored */
+enum AL2 { AL20 } __attribute__((aligned(16))) al2;
+struct BF { enum A a : 8; enum N n : 3; enum N m : 8; char c; };
+__attribute__((noinline)) enum A pick(enum N n, enum A a) { return n < 0 ? a : A0; }
+int main(void) {
+    if (sizeof(enum A) != 1 || _Alignof(enum A) != 1) return 1;
+    if (sizeof(enum N) != 1 || sizeof(T) != 1) return 2;
+    if (sizeof x != 2 || _Alignof(x) != 2) return 3;
+    if (sizeof(enum W) != 8 || sizeof(W0) != 8) return 4;
+    if (sizeof(enum F) != 1 || sizeof(enum G) != 4) return 5;
+    if (_Alignof(enum AL) != 4 || _Alignof(al2) != 4) return 6;
+    if (sizeof(struct BF) != 4) return 7;
+    struct BF b = { A2, -3, N0, 7 };
+    if (b.a != 200 || b.n != -3 || b.m != -100 || b.c != 7) return 8;
+    /* a packed enum value promotes to int; its constants are int */
+    enum N n = N0;
+    if (sizeof(n * 2) != 4 || n * 2 != -200 || sizeof(A0) != 4) return 9;
+    if (_Generic(n + 0, int: 0, default: 1)) return 10;
+    if (!((enum A)-1 > 0) || (enum N)200 != -56) return 11;
+    if (pick(N0, A2) != A2 || pick(N1, A2) != A0) return 12;
+    enum A arr[4] = { A1, A2, A0, A1 };
+    if (sizeof arr != 4 || arr[1] + arr[3] != 201) return 13;
+    if (!__builtin_types_compatible_p(T, unsigned char)) return 14;
+    if (!__builtin_types_compatible_p(enum N, signed char)) return 15;
+    return 0;
+}
+"#,
+    );
+}
+
+/// What gcc rejects around a packed enum: an attribute between the tag and
+/// `{`, an empty enumerator list (C17 6.7.2.2p1 does not make it optional),
+/// and a bit-field wider than the enum's one byte.
+#[test]
+fn c99_packed_enum_rejections() {
+    for (name, code, expected) in [
+        (
+            "packed_enum_after_tag",
+            "enum B __attribute__((packed)) { B0 };",
+            "expected identifier",
+        ),
+        ("empty_enum", "enum E { };", "empty enum is invalid"),
+        (
+            "empty_packed_enum",
+            "enum __attribute__((packed)) E { };",
+            "empty enum is invalid",
+        ),
+        (
+            "packed_enum_bitfield_too_wide",
+            "enum __attribute__((packed)) A { A0 }; struct S { enum A a : 9; };",
+            "bitfield width 9 exceeds type size 8",
+        ),
+    ] {
+        crate::common::compile_expect_error(name, &format!("{code}\n"), expected);
+    }
+}
+
+/// An array's element type must be a complete object type (C17 6.7.6.2p1),
+/// wherever the array type is written: a declaration, a pointer to the
+/// array, a parameter that adjusts to a pointer, a member, a typedef, or a
+/// type name in `sizeof`, `_Alignof`, a cast, a compound literal or `va_arg`
+/// -- and when the tag is completed later in the unit. gcc rejects each with
+/// "array type has incomplete element type"; an array of `void` or of
+/// functions is "declaration of 'x' as array of voids" ("of type name" when
+/// abstract). c17 accepted them all.
+#[test]
+fn c99_array_of_incomplete_element_type_is_rejected() {
+    for (name, code, expected) in [
+        (
+            "arr_incomplete_sizeof",
+            "struct I; int n = sizeof(struct I[2]);",
+            "array type has incomplete element type",
+        ),
+        (
+            "arr_incomplete_cast",
+            "struct I; void *p = (struct I(*)[2])0;",
+            "array type has incomplete element type",
+        ),
+        (
+            "arr_incomplete_alignof",
+            "struct I; int f(void) { return _Alignof(struct I[3]); }",
+            "array type has incomplete element type",
+        ),
+        (
+            "arr_incomplete_ptr_decl",
+            "struct I; struct I (*q)[2];",
+            "array type has incomplete element type",
+        ),
+        (
+            "arr_incomplete_extern",
+            "struct I; extern struct I a[2];",
+            "array type has incomplete element type",
+        ),
+        ("arr_of_void", "int n = sizeof(void[2]);", "array of voids"),
+        (
+            "arr_incomplete_va_arg",
+            "#include <stdarg.h>\nstruct I;\n\
+             void f(int n, ...) { va_list ap; va_start(ap, n); va_arg(ap, struct I[2]); }",
+            "array type has incomplete element type 'struct I'",
+        ),
+        (
+            "arr_incomplete_completed_later",
+            "struct I; struct I (*q)[2]; struct I { int x; };",
+            "array type has incomplete element type 'struct I'",
+        ),
+        (
+            "arr_incomplete_tentative_completed_later",
+            "struct I; struct I a[2]; struct I { int x; };",
+            "array type has incomplete element type 'struct I'",
+        ),
+        (
+            "arr_incomplete_unsized",
+            "struct I; extern struct I a[];",
+            "array type has incomplete element type 'struct I'",
+        ),
+        (
+            "arr_incomplete_param",
+            "struct I; void f(struct I a[2]);",
+            "array type has incomplete element type 'struct I'",
+        ),
+        (
+            "arr_incomplete_param_unsized",
+            "struct I; void f(struct I a[]);",
+            "array type has incomplete element type 'struct I'",
+        ),
+        (
+            "arr_incomplete_param_abstract",
+            "struct I; void f(struct I (*)[2]);",
+            "array type has incomplete element type 'struct I'",
+        ),
+        (
+            "arr_incomplete_param_definition",
+            "struct I; void f(struct I a[2]) {}",
+            "array type has incomplete element type 'struct I'",
+        ),
+        (
+            "arr_incomplete_typedef_name",
+            "struct I; typedef struct I T; T a[2];",
+            "array type has incomplete element type",
+        ),
+        (
+            "arr_incomplete_typedef_of_array",
+            "struct I; typedef struct I T[2];",
+            "array type has incomplete element type 'struct I'",
+        ),
+        (
+            "arr_incomplete_union",
+            "union U; extern union U a[2];",
+            "array type has incomplete element type 'union U'",
+        ),
+        (
+            "arr_incomplete_enum",
+            "enum E; extern enum E a[2];",
+            "array type has incomplete element type 'enum E'",
+        ),
+        (
+            "arr_incomplete_member",
+            "struct I; struct S { struct I m[2]; };",
+            "array type has incomplete element type 'struct I'",
+        ),
+        (
+            "arr_incomplete_self_member",
+            "struct S { struct S a[2]; };",
+            "array type has incomplete element type 'struct S'",
+        ),
+        (
+            "arr_incomplete_block_pointer",
+            "struct I; void f(void) { struct I (*p)[2]; }",
+            "array type has incomplete element type 'struct I'",
+        ),
+        (
+            "arr_incomplete_vla_pointer",
+            "struct I; void f(int n) { struct I (*p)[n]; }",
+            "array type has incomplete element type 'struct I'",
+        ),
+        (
+            "arr_incomplete_compound_literal",
+            "struct I; void *g(void) { return (struct I[2]){0}; }",
+            "array type has incomplete element type 'struct I'",
+        ),
+        (
+            "arr_of_unsized_array",
+            "extern int a[3][];",
+            "array type has incomplete element type 'int[]'",
+        ),
+        (
+            "arr_of_unsized_array_grouped",
+            "extern int (a[2])[];",
+            "array type has incomplete element type 'int[]'",
+        ),
+        (
+            "arr_of_unsized_array_param",
+            "void f(int a[3][]);",
+            "array type has incomplete element type 'int[]'",
+        ),
+        (
+            "arr_of_void_declaration",
+            "extern void x[2];",
+            "declaration of 'x' as array of voids",
+        ),
+        (
+            "arr_of_void_grouped",
+            "void (a[2]);",
+            "declaration of 'a' as array of voids",
+        ),
+        (
+            "arr_of_void_member",
+            "struct S { void m[2]; };",
+            "declaration of 'm' as array of voids",
+        ),
+        (
+            "arr_of_void_param",
+            "void f(void a[]);",
+            "declaration of 'a' as array of voids",
+        ),
+        (
+            "arr_of_void_type_name",
+            "int n = sizeof(void[2]);",
+            "declaration of type name as array of voids",
+        ),
+        (
+            "arr_of_functions",
+            "int a[2](void);",
+            "declaration of 'a' as array of functions",
+        ),
+        (
+            "arr_of_functions_grouped",
+            "int (a[2])(void);",
+            "declaration of 'a' as array of functions",
+        ),
+        (
+            "arr_of_functions_param",
+            "void f(int a[](void));",
+            "declaration of 'a' as array of functions",
+        ),
+        (
+            "arr_of_functions_type_name",
+            "int n = sizeof(int[2](void));",
+            "declaration of type name as array of functions",
+        ),
+    ] {
+        crate::common::compile_expect_error(name, &format!("{code}\n"), expected);
+    }
+}
+
+/// The accept side of C17 6.7.6.2p1, each checked against gcc: an element
+/// type completed before the array is formed, a pointer element, a variable
+/// length or `[*]` extent (complete, though known only at run time), an
+/// incomplete *outer* extent, a grouped declarator over its outer suffix, and
+/// a qualified spelling of a tag completed after its first mention.
+#[test]
+fn c99_array_of_complete_element_type_is_accepted() {
+    for (name, code) in [
+        (
+            "arr_ok_completed",
+            "struct I { int x; }; extern struct I a[2];",
+        ),
+        (
+            "arr_ok_completed_after_pointer",
+            "struct I; struct I *p; struct I { int x; }; struct I (*q)[2];",
+        ),
+        (
+            "arr_ok_qualified_completed",
+            "struct I; struct I { int x; }; const struct I a[2]; \
+             int n = sizeof(const struct I[2]);",
+        ),
+        (
+            "arr_ok_enum",
+            "enum E { A }; enum E e[2]; const enum E f[2];",
+        ),
+        ("arr_ok_self_pointer", "struct S { struct S *n; } a[2];"),
+        ("arr_ok_pointer_to_incomplete", "struct I; struct I *a[2];"),
+        (
+            "arr_ok_outer_unsized",
+            "extern int a[][3]; void f(int b[][3]);",
+        ),
+        (
+            "arr_ok_grouped",
+            "int (a[3]); int (b[2])[3]; void (*c[2])(void); int ((*d)[2]);\n\
+             void (*(e[2]))(void); int (*(*g)(void))[3];",
+        ),
+        (
+            "arr_ok_vla",
+            "void f(int n, int m) { int a[n][m]; int (*p)[n]; typedef int V[n]; \
+             V x[2]; int (*q)[n][m]; (void)a; (void)p; (void)x; (void)q; }",
+        ),
+        ("arr_ok_star", "void f(int n, int a[*][*]);"),
+        (
+            "arr_ok_va_arg",
+            "#include <stdarg.h>\nvoid f(int n, ...) { va_list ap; va_start(ap, n); \
+             int (*p)[2] = va_arg(ap, int(*)[2]); (void)p; va_end(ap); }",
+        ),
+        (
+            "arr_ok_flexible_member",
+            "struct F { int n; int a[]; }; struct F *p;",
+        ),
+    ] {
+        crate::common::compile_expect_ok(name, &format!("{code}\n"));
+    }
 }

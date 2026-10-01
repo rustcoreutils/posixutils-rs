@@ -10,6 +10,7 @@
 //
 
 use super::ast::{AssignOp, BinaryOp, Designator, Expr, ExprKind, InitElement, UnaryOp};
+use super::operand_rule::UnaryOperator;
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::float::FloatVal;
@@ -111,11 +112,11 @@ impl<'a> Parser<'a> {
 
             // Right-to-left associativity: parse the right side as another assignment
             let right = self.parse_assignment_expr()?;
-            if assign_op == AssignOp::Assign {
-                self.check_assignment_types(&left, &right, assign_pos);
+            match assign_op.binary_op() {
+                Some(op) => self.check_compound_assignment(op, &left, &right, assign_pos),
+                None => self.check_assignment_types(&left, &right, assign_pos),
             }
-            // In C, assignment expression type is the type of the left operand
-            let assign_type = left.typ.unwrap_or(self.types.int_id);
+            let assign_type = self.modification_result_type(&left);
             Ok(Self::typed_expr(
                 ExprKind::Assign {
                     op: assign_op,
@@ -290,21 +291,51 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Compute common type for ternary operator branches (C99 6.5.15, 6.3.1.8)
+    /// The type of a conditional expression whose arms have types `then_typ`
+    /// and `else_typ`, already decayed (C17 6.5.15p3-6).
+    ///
+    /// The result is a value, so it is unqualified whatever the arms were.
     fn ternary_common_type(&mut self, then_typ: TypeId, else_typ: TypeId) -> TypeId {
-        let then_kind = self.types.kind(then_typ);
-        let else_kind = self.types.kind(else_typ);
+        let then_typ = self.lvalue_converted_type(then_typ);
+        let else_typ = self.lvalue_converted_type(else_typ);
+        let then_ptr = self.types.kind(then_typ) == TypeKind::Pointer;
+        let else_ptr = self.types.kind(else_typ) == TypeKind::Pointer;
 
-        // If either is a pointer, use pointer type
-        if then_kind == TypeKind::Pointer {
+        // Two pointers: a pointer to the composite type, qualified with the
+        // qualifiers of *both* pointees (6.5.15p6) -- or to void, so
+        // qualified, when either points to void. Taking whichever arm came
+        // first dropped `const` from `c ? p : cp` and kept it for `c ? cp : p`.
+        if then_ptr && else_ptr {
+            let (Some(tp), Some(ep)) = (
+                self.types.base_type(then_typ),
+                self.types.base_type(else_typ),
+            ) else {
+                return then_typ;
+            };
+            let quals = self.types.qualifiers(tp) | self.types.qualifiers(ep);
+            let target = if self.types.kind(tp) == TypeKind::Void {
+                tp
+            } else if self.types.kind(ep) == TypeKind::Void {
+                ep
+            } else {
+                tp
+            };
+            let target = self.types.unqualified(target);
+            let target = self.types.qualified_with(target, quals);
+            return self.types.intern(crate::types::Type::pointer(target));
+        }
+        // One pointer: the other arm is a null pointer constant (6.5.15p6).
+        if then_ptr {
             return then_typ;
         }
-        if else_kind == TypeKind::Pointer {
+        if else_ptr {
             return else_typ;
         }
 
         // If either is void, result is void
-        if then_kind == TypeKind::Void || else_kind == TypeKind::Void {
+        if self.types.kind(then_typ) == TypeKind::Void
+            || self.types.kind(else_typ) == TypeKind::Void
+        {
             return self.types.void_id;
         }
 
@@ -323,20 +354,6 @@ impl<'a> Parser<'a> {
         // give.
         if self.types.is_arithmetic(then_typ) && self.types.is_arithmetic(else_typ) {
             return self.usual_arithmetic_conversions(then_typ, else_typ);
-        }
-
-        // Float types take precedence
-        if self.types.is_float(then_typ) || self.types.is_float(else_typ) {
-            if then_kind == TypeKind::Float128 || else_kind == TypeKind::Float128 {
-                return self.types.float128_id;
-            }
-            if then_kind == TypeKind::LongDouble || else_kind == TypeKind::LongDouble {
-                return self.types.longdouble_id;
-            }
-            if then_kind == TypeKind::Double || else_kind == TypeKind::Double {
-                return self.types.double_id;
-            }
-            return self.types.float_id;
         }
 
         // Neither arithmetic nor a pointer: a struct or union, where C17
@@ -362,12 +379,26 @@ impl<'a> Parser<'a> {
         self.types.unqualified(decayed)
     }
 
+    /// The type of an assignment, compound assignment, or prefix or postfix
+    /// `++`/`--` of `target`: the type `target` has after lvalue conversion
+    /// (C17 6.5.16p3; 6.5.2.4p2 and 6.5.3.1p2 by reference to it).
+    ///
+    /// Not the target's own type. `v = 1` for a `volatile int v` is an `int`
+    /// value, and typing it `volatile int` let a qualifier onto an rvalue
+    /// that `_Generic`, `typeof` and any "did this touch a volatile object"
+    /// question downstream would all read.
+    fn modification_result_type(&mut self, target: &Expr) -> TypeId {
+        let typ = target.typ.unwrap_or(self.types.int_id);
+        self.lvalue_converted_type(typ)
+    }
+
     /// Parse a conditional (ternary) expression: cond ? then : else
     pub(crate) fn parse_conditional_expr(&mut self) -> ParseResult<Expr> {
         let cond = self.parse_logical_or_expr()?;
 
         if self.is_special(b'?') {
             self.advance();
+            self.check_truth_value(&cond);
 
             // GNU `a ?: b`: the middle operand may be omitted, and then the
             // condition is also the value when it is true. Kept as its own
@@ -637,8 +668,8 @@ impl<'a> Parser<'a> {
             // Check for const modification
             self.check_modifiable_lvalue(&operand, "increment operand", op_pos);
             self.check_const_assignment(&operand, op_pos);
-            // PreInc has same type as operand
-            let typ = operand.typ.unwrap_or(self.types.int_id);
+            self.check_unary_operand(UnaryOperator::Increment, &operand, op_pos);
+            let typ = self.modification_result_type(&operand);
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::PreInc,
@@ -656,8 +687,8 @@ impl<'a> Parser<'a> {
             // Check for const modification
             self.check_modifiable_lvalue(&operand, "decrement operand", op_pos);
             self.check_const_assignment(&operand, op_pos);
-            // PreDec has same type as operand
-            let typ = operand.typ.unwrap_or(self.types.int_id);
+            self.check_unary_operand(UnaryOperator::Decrement, &operand, op_pos);
+            let typ = self.modification_result_type(&operand);
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::PreDec,
@@ -742,23 +773,24 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
-            self.check_unary_arithmetic_operand(&operand, "unary plus", op_pos);
+            let valid = self.check_unary_operand(UnaryOperator::Plus, &operand, op_pos);
             let (operand, typ) = self.promote_unary_operand(operand);
-            return Ok(Self::typed_expr(
+            let e = Self::typed_expr(
                 ExprKind::Cast {
                     cast_type: typ,
                     expr: Box::new(operand),
                 },
                 typ,
                 op_pos,
-            ));
+            );
+            return Ok(Self::typed_if(e, valid));
         }
 
         if self.is_special(b'-') && !self.is_special_token(SpecialToken::Decrement) {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
-            self.check_unary_arithmetic_operand(&operand, "unary minus", op_pos);
+            let valid = self.check_unary_operand(UnaryOperator::Minus, &operand, op_pos);
             let (operand, typ) = self.promote_unary_operand(operand);
             let width = self.unary_bitfield_width(&operand, typ);
             let mut e = Self::typed_expr(
@@ -770,13 +802,14 @@ impl<'a> Parser<'a> {
                 op_pos,
             );
             e.bitfield_bits = width;
-            return Ok(e);
+            return Ok(Self::typed_if(e, valid));
         }
 
         if self.is_special(b'~') {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            let valid = self.check_unary_operand(UnaryOperator::Complement, &operand, op_pos);
             let (operand, typ) = self.promote_unary_operand(operand);
             let width = self.unary_bitfield_width(&operand, typ);
             let mut e = Self::typed_expr(
@@ -788,7 +821,7 @@ impl<'a> Parser<'a> {
                 op_pos,
             );
             e.bitfield_bits = width;
-            return Ok(e);
+            return Ok(Self::typed_if(e, valid));
         }
 
         if self.is_special(b'!') {
@@ -796,15 +829,17 @@ impl<'a> Parser<'a> {
             self.advance();
             let operand = self.parse_unary_expr()?;
             self.check_not_vector_value(operand.typ, operand.pos);
+            let valid = self.check_unary_operand(UnaryOperator::Not, &operand, op_pos);
             // Logical not always produces int (0 or 1)
-            return Ok(Self::typed_expr(
+            let e = Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::Not,
                     operand: Box::new(operand),
                 },
                 self.types.int_id,
                 op_pos,
-            ));
+            );
+            return Ok(Self::typed_if(e, valid));
         }
 
         // sizeof and _Alignof
@@ -1134,12 +1169,27 @@ impl<'a> Parser<'a> {
         );
     }
 
-    fn check_sizeof_operand_is_complete(&self, typ: TypeId, dims: &[Expr], pos: Position) {
-        let incomplete = match self.types.kind(typ) {
-            TypeKind::Array => self.types.unsized_array_levels(typ) > dims.len(),
-            TypeKind::Struct | TypeKind::Union => !self.types.is_composite_complete(typ),
+    /// Whether the type named by a type-name is incomplete (C17 6.2.5p1):
+    /// `void`, a declared but undefined structure, union or enumeration, or
+    /// an array with an extent neither written nor supplied by one of the
+    /// type-name's own size expressions (`extents`, which `int[n]` has and
+    /// `int[]` does not).
+    pub(crate) fn type_name_is_incomplete(&self, typ: TypeId, extents: usize) -> bool {
+        match self.types.kind(typ) {
+            TypeKind::Void => true,
+            TypeKind::Array => self.types.unsized_array_levels(typ) > extents,
+            TypeKind::Struct | TypeKind::Union | TypeKind::Enum => {
+                !self.types.is_composite_complete(typ)
+            }
             _ => false,
-        };
+        }
+    }
+
+    /// `sizeof (void)` is gcc's extension (it is 1); every other incomplete
+    /// type-name is an error.
+    fn check_sizeof_operand_is_complete(&self, typ: TypeId, dims: &[Expr], pos: Position) {
+        let incomplete =
+            self.types.kind(typ) != TypeKind::Void && self.type_name_is_incomplete(typ, dims.len());
         if incomplete {
             crate::diag::error(
                 pos,
@@ -1255,8 +1305,8 @@ impl<'a> Parser<'a> {
                 // Check for const modification
                 self.check_modifiable_lvalue(&expr, "increment operand", op_pos);
                 self.check_const_assignment(&expr, op_pos);
-                // PostInc has same type as operand
-                let typ = expr.typ.unwrap_or(self.types.int_id);
+                self.check_unary_operand(UnaryOperator::Increment, &expr, op_pos);
+                let typ = self.modification_result_type(&expr);
                 expr = Self::typed_expr(ExprKind::PostInc(Box::new(expr)), typ, base_pos);
             } else if self.is_special_token(SpecialToken::Decrement) {
                 let op_pos = self.current_pos();
@@ -1264,8 +1314,8 @@ impl<'a> Parser<'a> {
                 // Check for const modification
                 self.check_modifiable_lvalue(&expr, "decrement operand", op_pos);
                 self.check_const_assignment(&expr, op_pos);
-                // PostDec has same type as operand
-                let typ = expr.typ.unwrap_or(self.types.int_id);
+                self.check_unary_operand(UnaryOperator::Decrement, &expr, op_pos);
+                let typ = self.modification_result_type(&expr);
                 expr = Self::typed_expr(ExprKind::PostDec(Box::new(expr)), typ, base_pos);
             } else if self.is_special(b'[') {
                 // Array subscript
@@ -1392,7 +1442,8 @@ impl<'a> Parser<'a> {
                 self.expect_special(b')')?;
                 self.check_callable(&expr, call_pos);
                 let func_type = self.resolved_function_type(&expr);
-                self.check_call(func_type, &args, call_pos);
+                let callee = self.callee_name(&expr);
+                self.check_call(func_type, callee, &args, call_pos);
 
                 // Get the return type from the function type
                 // The func expression should have type TypeKind::Function
@@ -1421,6 +1472,9 @@ impl<'a> Parser<'a> {
                         }
                     })
                     .unwrap_or(self.types.int_id); // Default to int
+                                                   // A call's value has the unqualified version of the return
+                                                   // type (C17 6.7.6.3p4 makes that the function's return type).
+                let return_type = self.types.unqualified(return_type);
 
                 let known = self.known_callee(&expr);
                 expr = self.fold_zero_length_compare(Self::typed_expr(
@@ -1603,6 +1657,16 @@ impl<'a> Parser<'a> {
         Ok(id)
     }
 
+    /// `e` as built, or left untyped when its operands were diagnosed: an
+    /// untyped result keeps whatever encloses it from reporting the same
+    /// mistake again.
+    fn typed_if(mut e: Expr, valid: bool) -> Expr {
+        if !valid {
+            e.typ = None;
+        }
+        e
+    }
+
     /// Create a typed expression with position
     pub(crate) fn typed_expr(kind: ExprKind, typ: TypeId, pos: Position) -> Expr {
         Expr {
@@ -1615,13 +1679,7 @@ impl<'a> Parser<'a> {
 
     /// Create a typed binary expression, computing result type from operands
     fn make_binary(&mut self, op: BinaryOp, left: Expr, right: Expr) -> Expr {
-        // C17 6.5.5-6.5.14 require operands with a value. `f() + 1` where `f`
-        // returns void has none.
-        self.check_not_void(&left, left.pos);
-        self.check_not_void(&right, right.pos);
-        self.check_not_vector_value(left.typ, left.pos);
-        self.check_not_vector_value(right.typ, right.pos);
-        self.check_relational_operands(op, &left, &right);
+        let valid = self.check_binary_operands(op, &left, &right, left.pos);
 
         // A bit-field operand promotes before anything else looks at it
         // (C17 6.3.1.1p2), and that promotion is not derivable from the
@@ -1634,11 +1692,58 @@ impl<'a> Parser<'a> {
         let left = self.promote_bitfield_operand(left);
         let right = self.promote_bitfield_operand(right);
 
-        // Compute result type based on operator and operand types
         let left_type = left.typ.unwrap_or(self.types.int_id);
-        let right_type = right.typ.unwrap_or(self.types.int_id);
+        let result_type = self.binary_result_type(op, left_type, &right);
 
-        let result_type = match op {
+        // C17 6.7.2.1p10: a bit-field has a type of exactly its declared width,
+        // and 6.2.5p9 then reduces an unsigned result modulo 2^width. So
+        // `x.b << 32` with `unsigned long long b : 40` holding 0x100 is zero --
+        // every set bit shifts out of the 40-bit type.
+        //
+        // Which operators carry the width, and from where:
+        //   - the arithmetic and bitwise ones take the wider operand's width;
+        //   - a shift takes the **left** operand's alone (6.5.7p3 -- the right
+        //     operand's type never reaches the result);
+        //   - a comparison or a logical operator yields `int` and carries
+        //     nothing, which falls out of not asking.
+        let width = match op {
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor => self.combined_bitfield_width(&left, &right),
+            BinaryOp::Shl | BinaryOp::Shr => self.effective_bitfield_width(&left),
+            _ => None,
+        }
+        .filter(|bits| *bits < self.types.size_bits(result_type));
+
+        let pos = left.pos;
+        let mut e = Self::typed_expr(
+            ExprKind::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            result_type,
+            pos,
+        );
+        e.bitfield_bits = width;
+        Self::typed_if(e, valid)
+    }
+
+    /// The type of `left op right`, where `left` has type `left_type` and
+    /// the operands satisfy the operator's constraints.
+    pub(super) fn binary_result_type(
+        &mut self,
+        op: BinaryOp,
+        left_type: TypeId,
+        right: &Expr,
+    ) -> TypeId {
+        let right_type = right.typ.unwrap_or(self.types.int_id);
+        match op {
             // Comparison and logical operators always return int
             BinaryOp::Eq
             | BinaryOp::Ne
@@ -1710,48 +1815,10 @@ impl<'a> Parser<'a> {
                 // arithmetic result is (6.3.2.1p2).
                 let promoted = self.types.integer_promote(left_type);
                 let promoted = self.types.unqualified(promoted);
-                self.check_shift_count(op, promoted, &right);
+                self.check_shift_count(op, promoted, right);
                 promoted
             }
-        };
-
-        // C17 6.7.2.1p10: a bit-field has a type of exactly its declared width,
-        // and 6.2.5p9 then reduces an unsigned result modulo 2^width. So
-        // `x.b << 32` with `unsigned long long b : 40` holding 0x100 is zero --
-        // every set bit shifts out of the 40-bit type.
-        //
-        // Which operators carry the width, and from where:
-        //   - the arithmetic and bitwise ones take the wider operand's width;
-        //   - a shift takes the **left** operand's alone (6.5.7p3 -- the right
-        //     operand's type never reaches the result);
-        //   - a comparison or a logical operator yields `int` and carries
-        //     nothing, which falls out of not asking.
-        let width = match op {
-            BinaryOp::Add
-            | BinaryOp::Sub
-            | BinaryOp::Mul
-            | BinaryOp::Div
-            | BinaryOp::Mod
-            | BinaryOp::BitAnd
-            | BinaryOp::BitOr
-            | BinaryOp::BitXor => self.combined_bitfield_width(&left, &right),
-            BinaryOp::Shl | BinaryOp::Shr => self.effective_bitfield_width(&left),
-            _ => None,
         }
-        .filter(|bits| *bits < self.types.size_bits(result_type));
-
-        let pos = left.pos;
-        let mut e = Self::typed_expr(
-            ExprKind::Binary {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            },
-            result_type,
-            pos,
-        );
-        e.bitfield_bits = width;
-        e
     }
 
     /// Warn when a shift's constant count cannot name a bit of the value
@@ -1972,7 +2039,7 @@ impl<'a> Parser<'a> {
     /// pure question about conversion rank, which is what lets the linearizer
     /// and the constant folder ask it through a `&TypeTable`: interning a
     /// stripped type needs `&mut`.
-    fn usual_arithmetic_conversions(&mut self, left: TypeId, right: TypeId) -> TypeId {
+    pub(crate) fn usual_arithmetic_conversions(&mut self, left: TypeId, right: TypeId) -> TypeId {
         let common = self.types.common_type(left, right);
         self.types.unqualified(common)
     }
@@ -2121,7 +2188,9 @@ impl<'a> Parser<'a> {
 
                     // Try builtin dispatch first, unless a declaration in scope
                     // has claimed the name (see `builtin_is_shadowed`).
-                    if !self.builtin_is_shadowed(name_id) {
+                    if !self.builtin_is_shadowed(name_id)
+                        && crate::kw::exists_on(name_id, self.types.target().arch)
+                    {
                         if let Some(result) = self.parse_builtin_expr(name_id, token_pos) {
                             return result;
                         }
@@ -2147,23 +2216,10 @@ impl<'a> Parser<'a> {
                     if let Some(sym) = self.symbols.lookup_enum_constant(name_id) {
                         if let Some(value) = sym.enum_value {
                             // C17 6.4.4.3p2: an enumeration constant has type
-                            // `int`. The enumeration's own type is used only
-                            // where that would lose the value -- when a member
-                            // does not fit in `int` the whole enumeration
-                            // widens, and reading the constant back as `int`
-                            // would undo that.
-                            //
-                            // Reporting the enumeration type unconditionally
-                            // was visible: `__builtin_types_compatible_p
-                            // (typeof (hot), int)` answered 0 where gcc and
-                            // the standard say 1, because `typeof` of an
-                            // enumerator is `int`.
-                            let fits_in_int = i32::try_from(value).is_ok();
-                            let typ = if fits_in_int {
-                                self.types.int_id
-                            } else {
-                                sym.typ
-                            };
+                            // `int`, which is the symbol's type while its list
+                            // is parsed; `Parser::enumerator_type` gives it
+                            // its final one when the enumeration completes.
+                            let typ = sym.typ;
                             let kind = match i64::try_from(value) {
                                 Ok(v) => ExprKind::IntLit(v),
                                 // Only an `unsigned long` enumeration above
@@ -2208,7 +2264,7 @@ impl<'a> Parser<'a> {
                         // argument is checked or converted, as C89 6.3.2.2
                         // says.
                         let ret_id = self
-                            .chk_builtin_return_type(&name_str)
+                            .library_return_type(&name_str)
                             .unwrap_or(self.types.int_id);
                         let func_type = self.types.intern(Type {
                             kind: TypeKind::Function,
@@ -2380,6 +2436,10 @@ impl<'a> Parser<'a> {
                             }
                         }
 
+                        // A cast yields a value, so a cast to a qualified type
+                        // is a cast to its unqualified version (C17 6.5.4p5,
+                        // footnote 108).
+                        let typ = self.types.unqualified(typ);
                         let cast = Self::typed_expr(
                             ExprKind::Cast {
                                 cast_type: typ,

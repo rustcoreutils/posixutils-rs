@@ -72,23 +72,7 @@ fn is_speculatable(insn: &Instruction) -> bool {
             | Opcode::Zext
             | Opcode::Sext
             | Opcode::Select
-            | Opcode::SetEq
-            | Opcode::SetNe
-            | Opcode::SetLt
-            | Opcode::SetLe
-            | Opcode::SetGt
-            | Opcode::SetGe
-            | Opcode::SetB
-            | Opcode::SetBe
-            | Opcode::SetA
-            | Opcode::SetAe
-            | Opcode::FCmpOEq
-            | Opcode::FCmpONe
-            | Opcode::FCmpOLt
-            | Opcode::FCmpOLe
-            | Opcode::FCmpOGt
-            | Opcode::FCmpOGe
-    )
+    ) || insn.op.is_comparison()
 }
 
 /// One recognized diamond.
@@ -260,15 +244,11 @@ fn collapse(func: &mut Function, d: &Diamond) {
         }
     }
 
-    // Rewrite the branch. In place rather than `kill()`: that leaves
-    // `bb_false` naming a block about to be removed, which the validator
-    // inspects on every instruction whatever its opcode.
+    // The branch goes straight to the merge now.
     let last = func.blocks[pred_idx].insns.len() - 1;
-    let term = &mut func.blocks[pred_idx].insns[last];
-    term.op = Opcode::Br;
-    term.bb_true = Some(d.merge);
-    term.bb_false = None;
-    term.src.clear();
+    let pos = func.blocks[pred_idx].insns[last].pos;
+    func.blocks[pred_idx].insns[last] = Instruction::br(d.merge);
+    func.blocks[pred_idx].insns[last].pos = pos;
 
     // Replace each phi with the select it turned out to be.
     for (i, v_true, v_false) in selects {
@@ -286,9 +266,8 @@ fn collapse(func: &mut Function, d: &Diamond) {
 
     // CFG: the arm is gone, and the merge is reached only from the
     // predecessor now.
-    func.blocks[pred_idx].children.retain(|c| *c != d.arm);
-    let merge_idx = func.block_index(d.merge).expect("merge exists");
-    func.blocks[merge_idx].parents.retain(|p| *p != d.arm);
+    func.remove_edge(d.pred, d.arm);
+    func.remove_edge(d.arm, d.merge);
 }
 
 #[cfg(test)]
@@ -351,13 +330,12 @@ mod tests {
 
     fn pure_arm() -> Instruction {
         let types = TypeTable::new(&Target::host());
-        Instruction::binop(
+        Instruction::compare(
             Opcode::SetNe,
             PseudoId(2),
-            PseudoId(0),
-            PseudoId(1),
-            types.int_id,
-            32,
+            (PseudoId(0), PseudoId(1)),
+            (types.int_id, 32),
+            (types.int_id, 32),
         )
     }
 
@@ -400,11 +378,10 @@ mod tests {
             Opcode::FCmpOGt,
             Opcode::FCmpOGe,
         ] {
-            let arm = Instruction::binop(
+            let arm = Instruction::test_binary(
                 op,
                 PseudoId(2),
-                PseudoId(0),
-                PseudoId(1),
+                (PseudoId(0), PseudoId(1)),
                 types.double_id,
                 64,
             );

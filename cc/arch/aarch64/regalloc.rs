@@ -42,8 +42,8 @@
 use crate::abi::aapcs64::{StackSlot, StackedArgs};
 use crate::arch::asm_constraints::OperandConstraint;
 use crate::arch::regalloc::{
-    compute_live_intervals, find_call_positions, identify_addr_taken_syms, identify_fp_pseudos,
-    interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
+    compute_live_intervals, find_call_positions, identify_fp_pseudos, interval_crosses_call,
+    ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
 };
 use crate::float::FloatVal;
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
@@ -1308,7 +1308,7 @@ pub fn build_asm_instr_constraints_aarch64(
     insn: &Instruction,
 ) -> Option<crate::arch::asm_constraints::InstrConstraints<Reg>> {
     Some(crate::arch::asm_constraints::InstrConstraints::of_asm(
-        insn.asm_data.as_ref()?,
+        insn.extra().asm_data.as_ref()?,
         parse_aarch64_fixed_letter,
         parse_aarch64_class_letter,
         parse_gp_clobber_name,
@@ -1396,8 +1396,6 @@ pub struct RegAlloc {
     active_stack: Vec<crate::arch::regalloc::ActiveSlot>,
     /// Free stack slots keyed by size, available for reuse
     free_stack_slots: BTreeMap<i32, Vec<FreeSlot>>,
-    /// Sym pseudos whose address is taken (cannot participate in slot reuse)
-    addr_taken_syms: HashSet<PseudoId>,
     /// Per-block live-in sets for interference-based stack coloring
     live_in: Vec<HashSet<PseudoId>>,
     /// Per-block live-out sets for interference-based stack coloring
@@ -1433,7 +1431,6 @@ impl RegAlloc {
             spilled_args: Vec::new(),
             active_stack: Vec::new(),
             free_stack_slots: BTreeMap::new(),
-            addr_taken_syms: HashSet::new(),
             live_in: Vec::new(),
             live_out: Vec::new(),
             frame_base: FrameBase::Fp,
@@ -1458,7 +1455,6 @@ impl RegAlloc {
         }
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
-        self.addr_taken_syms = identify_addr_taken_syms(func);
         self.allocate_arguments(func, types);
 
         let result = self.compute_live_intervals(func);
@@ -1478,6 +1474,7 @@ impl RegAlloc {
             )
         });
         self.allocate_alloca_to_stack(func);
+        self.place_locals(func, types, &intervals);
         self.run_chordal_color(func, types, intervals, &call_positions, &constraint_points);
 
         crate::arch::regalloc::LocationMap::from(self.locations.clone())
@@ -1495,7 +1492,6 @@ impl RegAlloc {
         self.spilled_args.clear();
         self.active_stack.clear();
         self.free_stack_slots.clear();
-        self.addr_taken_syms.clear();
         self.live_in.clear();
         self.live_out.clear();
         self.frame_base = FrameBase::Fp;
@@ -1695,6 +1691,39 @@ impl RegAlloc {
     /// Allocate a stack slot, optionally reusing a freed slot.
     /// AArch64 uses negative offsets from the frame pointer.
     /// Only short-lived spills (not crossing calls/loops) should set `reusable=true`.
+    /// A fresh frame slot of `size` bytes at `alignment`, shared with
+    /// nothing, as a displacement.
+    fn new_frame_slot(&mut self, size: i32, alignment: i32) -> i32 {
+        debug_assert!(
+            alignment <= self.frame_base.align(),
+            "slot wants {alignment}-byte alignment but the frame was laid out \
+             for {}; `FrameBase::of` missed a source of over-alignment",
+            self.frame_base.align(),
+        );
+        -crate::arch::regalloc::grow_frame(
+            &mut self.stack_offset,
+            size,
+            alignment,
+            self.frame_base.align(),
+            self.func_pos,
+        )
+    }
+
+    /// Give every local its frame slot; see `arch::regalloc::place_locals`.
+    fn place_locals(&mut self, func: &Function, types: &TypeTable, intervals: &[LiveInterval]) {
+        let pos = self.func_pos;
+        let placed = crate::arch::regalloc::place_locals(func, types, pos, intervals, |b, a| {
+            self.new_frame_slot(b, a)
+        });
+        for (local, offset) in placed {
+            self.locations
+                .insert(local, Loc::Stack(LocalSlot::from_displacement(offset)));
+            if func.local_of(local).is_some_and(|l| types.is_float(l.typ)) {
+                self.fp_pseudos.insert(local);
+            }
+        }
+    }
+
     fn alloc_stack_slot(
         &mut self,
         interval: &LiveInterval,
@@ -1702,12 +1731,6 @@ impl RegAlloc {
         alignment: i32,
         reusable: bool,
     ) {
-        debug_assert!(
-            alignment <= self.frame_base.align(),
-            "slot wants {alignment}-byte alignment but the frame was laid out \
-             for {}; `FrameBase::of` missed a source of over-alignment",
-            self.frame_base.align(),
-        );
         if reusable {
             if let Some((reused, past)) = self.try_reuse_stack_slot(size, alignment, interval) {
                 self.locations.insert(
@@ -1723,13 +1746,7 @@ impl RegAlloc {
                 return;
             }
         }
-        let offset = -crate::arch::regalloc::grow_frame(
-            &mut self.stack_offset,
-            size,
-            alignment,
-            self.frame_base.align(),
-            self.func_pos,
-        );
+        let offset = self.new_frame_slot(size, alignment);
         self.locations.insert(
             interval.pseudo,
             Loc::Stack(LocalSlot::from_displacement(offset)),
@@ -1760,7 +1777,6 @@ impl RegAlloc {
     ///   3. Commit: write Loc::Reg / Loc::VReg for colored vertices,
     ///      allocate stack slots for spilled vertices, track
     ///      `used_callee_saved` for the prologue.
-    #[allow(clippy::too_many_arguments)]
     fn run_chordal_color(
         &mut self,
         func: &Function,
@@ -1774,7 +1790,11 @@ impl RegAlloc {
         // What the pre-pass asks about each interval, indexed once: asking by
         // scanning the function per interval made it quadratic.
         let setval_sizes = crate::arch::regalloc::setval_sizes(func);
-        let mut int128_pseudos: HashSet<PseudoId> = HashSet::new();
+        let mut int128_pseudos: HashSet<PseudoId> = crate::arch::regalloc::arg_pseudo_types(func)
+            .into_iter()
+            .filter(|(_, t)| types.is_plain_int128(*t))
+            .map(|(p, _)| p)
+            .collect();
         let mut multi_reg_returns: HashMap<PseudoId, TypeId> = HashMap::new();
         for insn in func.blocks.iter().flat_map(|b| &b.insns) {
             let Some(typ) = insn.typ else { continue };
@@ -1828,30 +1848,10 @@ impl RegAlloc {
                     }
                     PseudoKind::Sym(name) => {
                         // By identity, not by name -- see the x86_64 mirror.
-                        if let Some(local) = func.local_of(interval.pseudo) {
-                            let size = crate::abi::slot_bytes(
-                                types.size_bytes(local.typ),
-                                self.func_pos,
-                                "an automatic object",
-                            );
-                            let size = size.max(8);
-                            let natural_align = types.alignment(local.typ) as i32;
-                            let alignment = local
-                                .explicit_align
-                                .map(|a| a as i32)
-                                .unwrap_or(natural_align.max(8));
-                            // Sym slot reuse disabled — see x86_64
-                            // mirror for the rationale.
-                            let _ = self.addr_taken_syms.contains(&interval.pseudo);
-                            let reusable = false;
-                            self.alloc_stack_slot(interval, size, alignment, reusable);
-                            if types.is_float(local.typ) {
-                                self.fp_pseudos.insert(interval.pseudo);
-                            }
-                        } else {
-                            self.locations
-                                .insert(interval.pseudo, Loc::Global(name.clone()));
-                        }
+                        // A local has its slot already: `place_locals`.
+                        debug_assert!(func.local_of(interval.pseudo).is_none());
+                        self.locations
+                            .insert(interval.pseudo, Loc::Global(name.clone()));
                         continue;
                     }
                     _ => {}
@@ -2502,7 +2502,7 @@ mod tests {
             })
             .partition(|c| c.constraint.starts_with('=') || c.constraint.starts_with('+'));
         let mut insn = Instruction::new(Opcode::Asm);
-        insn.asm_data = Some(Box::new(AsmData {
+        insn.extra_mut().asm_data = Some(Box::new(AsmData {
             template: String::new(),
             outputs,
             inputs,

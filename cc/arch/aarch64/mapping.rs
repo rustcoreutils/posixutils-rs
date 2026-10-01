@@ -215,13 +215,12 @@ mod tests {
         let types = TypeTable::new(&target);
         let mapper = Aarch64Mapper;
 
-        let mut insn = Instruction::binop(
+        let mut insn = Instruction::compare(
             Opcode::FCmpOLt,
             PseudoId(2),
-            PseudoId(0),
-            PseudoId(1),
-            types.int_id,
-            128,
+            (PseudoId(0), PseudoId(1)),
+            (types.int_id, 128),
+            (types.int_id, 32),
         );
         insn.src_typ = Some(types.longdouble_id);
         let mut func = make_minimal_func(&types);
@@ -237,13 +236,12 @@ mod tests {
             Opcode::SetLt,
         );
 
-        let mut insn = Instruction::binop(
+        let mut insn = Instruction::compare(
             Opcode::FCmpOEq,
             PseudoId(2),
-            PseudoId(0),
-            PseudoId(1),
-            types.int_id,
-            128,
+            (PseudoId(0), PseudoId(1)),
+            (types.int_id, 128),
+            (types.int_id, 32),
         );
         insn.src_typ = Some(types.longdouble_id);
         let mut func = make_minimal_func(&types);

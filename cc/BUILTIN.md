@@ -1,207 +1,327 @@
 # Compiler Builtins
 
-Builtin functions supported by c17. GCC/Clang compatible.
+The `__builtin_*`, `__sync_*`, `__atomic_*` and `__c11_atomic_*` functions
+c17 recognises, what each becomes, and how to add one. Spellings follow gcc;
+the `__c11_atomic_*` family and `__builtin_flt_rounds` follow clang. Where c17
+differs from gcc the entry says so.
 
-Every entry below was compile-probed against this compiler; where behaviour
-differs from gcc, the row says so rather than leaving the reader to find out.
+## Recognition
+
+Every identifier in a primary expression is offered to `parse_builtin_expr`
+(`parse/builtin_expr.rs`) unless `builtin_is_shadowed` says a declaration has
+claimed the name. That function tries each family in turn and answers `None`
+for a name it does not own, so a builtin is whatever some family matches --
+the keyword tag is not consulted while parsing.
+
+- **Reserved spellings** (`__builtin_*`, `__sync_*`, ...) are never
+  displaced, whatever the program declares (C17 7.1.3).
+- **Bare spellings** -- `alloca`, `offsetof`, `setjmp`, `_setjmp`, `longjmp`,
+  `_longjmp`, and the library functions computed in place (`abs`, `fabs`,
+  `sqrt`, `memcpy`, ...; see below) -- are displaced by `-fno-builtin`,
+  `-fno-builtin-NAME`, a declaration that is not a function, and (library
+  functions only) a function declaration whose type is not the library
+  prototype. `offsetof` is displaced by any declaration.
+- Any `__builtin___NAME` becomes a call to `__NAME` when a declaration of
+  `__NAME` is in scope or `LIBRARY_BUILTINS` has a row for it (the `_chk`
+  family); otherwise it is `undeclared function`.
+
+### `__has_builtin`
+
+Answered in `token/preprocess.rs` (`eval_has_builtin_expr`, inside `#if`) and
+`token/preprocess_macro.rs` (`eval_has_builtin`, in running text), both from
+`builtins.rs`: a name answers 1 when it is in `SUPPORTED_BUILTINS` (or tagged
+`kw::BUILTIN`, which `builtins.rs` tests keep identical) and `available_on`
+the target. `available_on` withholds the `f128` constants on macOS, which has
+no `_Float128`, and the `__builtin_ms_va_*` names off x86-64, where gcc has
+none of them.
+
+Differences from gcc's answers:
+
+| Name | c17 | gcc | Why |
+|------|-----|-----|-----|
+| `alloca`, `abs`, `fabs`, `memcpy`, ... (bare) | 0 | 1 | Bare spellings are tagged 0 in `kw.rs`; `__has_builtin` asks about the reserved spelling |
+| `offsetof` | 1 | 0 | Tagged `BUILTIN` |
+| `__builtin_va_list` | 1 | 0 | It is a type, but listed |
+| `__c11_atomic_*`, `__builtin_flt_rounds` | 1 | 0 | clang builtins gcc lacks |
+| `__builtin___mempcpy_chk`, `__builtin___stpncpy_chk`, `__builtin___vsprintf_chk` | 0 | 1 | Work (glibc's fortified headers use them) but are not tagged |
+
+`-fno-builtin` does not change any answer.
+
+## Argument checking
+
+Every argument count is judged by `check_argument_count`
+(`parse/expr_check.rs`), in gcc's words: `too few arguments to function 'f'`,
+`too many arguments to function 'f'`, naming the callee as the call spelled
+it -- or naming none, for a call through an expression that is not an
+identifier. Argument diagnostics name the callee the same way.
+
+Checked as an ordinary call is -- count, types, conversions, the usual
+diagnostics in the usual words -- through gcc's prototype:
+
+- every library builtin, by either spelling: each has a row in
+  `LIBRARY_BUILTINS` (`parse/library_builtin.rs`) with the library's
+  prototype (glibc's, for the `_chk` functions), and a declaration in scope
+  is checked against instead when there is one;
+- the bit builtins (`BIT_BUILTINS`), `__builtin_assume_aligned`,
+  `__builtin_alloca` and `alloca`, `__builtin_object_size`,
+  `__builtin_prefetch`, the suffixed classification builtins (`isnanf`,
+  `isinfl`, `signbitf`, ...), the typed checked arithmetic
+  (`__builtin_sadd_overflow`, ...), `__atomic_test_and_set`,
+  `__atomic_clear` and the lock-free queries (`parse_prototyped_builtin`,
+  `parse/builtin_args.rs`).
+
+Checked by gcc's own rules, in its words, with the shared helpers of
+`parse/builtin_args.rs` (`require_floating_argument`, `constant_argument`,
+`is_integral`, `parse_generic_builtin_args`):
+
+- the type-generic classification builtins (`isnan`, `isinf`, `isfinite`,
+  `isnormal`, `isinf_sign`, `signbit`, and `fpclassify`'s last argument)
+  require a real floating argument; the unordered relations require one of
+  their two (`parse_fp_compare`);
+- `__builtin_fpclassify` takes six arguments, and its five class codes,
+  converted to `int`, must be integer constants;
+- `__builtin_complex` requires two operands of one real floating type;
+- the type-generic checked arithmetic requires integral operands, and a
+  result -- pointed to, or for the `_p` forms the value itself -- of an
+  integer type that is neither `_Bool` nor an enumeration, nor, pointed to,
+  `const`;
+- `__builtin_object_size`'s type must be an integer constant from 0 to 3 (an
+  error); `__builtin_prefetch`'s hints must be integer constants (an error)
+  and in range (a warning; zero is used);
+- the `__atomic_*` and `__sync_*` builtins overloaded on their object
+  (`check_atomic_object`, `parse/builtin_expr.rs`) require a pointer to an
+  integer or to a pointer, of 1, 2, 4, 8 or 16 bytes -- and for an
+  arithmetic one, not to `_Bool`; `__atomic_always_lock_free` requires a
+  constant size;
+- `__builtin_va_start` requires a variadic function (an error), and warns
+  (`-Wvarargs`) when `last` is not its last named parameter;
+- `__builtin_va_start` in an `ms_abi` function, `__builtin_ms_va_start` in
+  any other, and `__builtin_ms_va_start` on a list that is not a
+  `__builtin_ms_va_list` are errors, in clang's words
+  (`check_va_start_convention`) -- gcc accepts each and reads the wrong
+  frame;
+- `__builtin_va_arg`'s type must be a complete object type
+  (`check_va_arg_type`): an incomplete type (`type_name_is_incomplete`, the
+  predicate `sizeof` uses) or a function type is an error, and `_Bool`,
+  `char`, `short` or `float`, which the default argument promotions change,
+  a warning;
+- `__builtin_choose_expr` requires a constant first argument;
+- `__builtin_frame_address`/`__builtin_return_address` require a
+  non-negative integer constant;
+- `offsetof` requires a constant array index;
+- `__builtin_nans*` requires a string literal naming a payload (gcc accepts
+  any string);
+- `__builtin_va_arg_pack*` require an `always_inline` variadic function.
+
+An integer constant here is an integer constant expression (C17 6.6p6), as
+`eval_const_expr` evaluates it: an enumerator or a cast of a floating
+constant is one; a floating constant or a `const` object is not. A call
+rejected by any of these checks is not built: a zero of its type stands in
+(`diagnosed_call`).
+
+Where c17 still differs from gcc:
+
+- gcc folds some calls whose value is discarded before it checks them, so
+  `(void)__builtin_object_size(p, i)` and
+  `(void)__atomic_always_lock_free(i, 0)` compile there; c17 rejects them,
+  used or not.
+- The remaining builtins are parsed by their fixed shape: a wrong argument
+  count is a parse error (`expected ')'`), and their argument types are not
+  checked -- `__builtin_va_start`'s `last` must be an identifier, and the
+  `__c11_atomic_*` builtins (clang's; gcc has none) take anything.
+- gcc compiles a `__builtin_va_arg` of a promoted type to a trap; c17 only
+  warns, and reads the argument as though it had that type.
+- gcc's `__builtin_va_arg` on a `__builtin_ms_va_list` reads a type the
+  Microsoft convention passes by reference -- an aggregate not of 1, 2, 4 or
+  8 bytes, `long double`, `__int128` -- out of the argument position itself,
+  where every caller put a pointer; c17 follows the pointer.
+- No memory-order argument is checked; gcc warns about one out of range and
+  rejects one that is not an integer.
 
 ## Variadic Functions
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_va_list` | Platform-specific va_list type |
-| `__builtin_va_start(ap, last)` | Initialize va_list to first variadic arg |
-| `__builtin_va_arg(ap, type)` | Get next arg of `type`, advance va_list |
-| `__builtin_va_end(ap)` | Clean up va_list |
-| `__builtin_va_copy(dest, src)` | Copy va_list |
-| `__builtin_va_arg_pack()` | The caller's variadic arguments, spliced in at the call site. Only in an `always_inline` variadic function, and only as the last argument of a call |
-| `__builtin_va_arg_pack_len()` | How many arguments the pack stands for. Same restriction |
+| `__builtin_va_list` | Platform-specific `va_list` type (a type keyword) |
+| `__builtin_va_start(ap, last)` | `Opcode::VaStart`. `last` must be an identifier. In a function that is not variadic it is an error, and a `last` that is not the last named parameter a warning, as in gcc |
+| `__builtin_va_arg(ap, type)` | `Opcode::VaArg`; an aggregate or complex result gets a frame temporary. An incomplete or function type is an error, and a type the default argument promotions change a warning, as in gcc (see Argument checking) |
+| `__builtin_va_end(ap)` | `Opcode::VaEnd` |
+| `__builtin_va_copy(dest, src)` | `Opcode::VaCopy` |
+| `__builtin_va_arg_pack()` | The caller's variadic arguments, spliced in by the inliner. Only in an `always_inline` variadic function (an error otherwise), and only as the last argument of a call (linearizer error otherwise) |
+| `__builtin_va_arg_pack_len()` | How many arguments the pack stands for: `Opcode::VaArgPackLen`, replaced by a constant at inlining; a survivor is diagnosed by `opt::check_forwarding_resolved` |
 
-## Byte Swapping
-
-| Builtin | Description |
-|---------|-------------|
-| `__builtin_bswap16(x)` | Reverse bytes of 16-bit value |
-| `__builtin_bswap32(x)` | Reverse bytes of 32-bit value |
-| `__builtin_bswap64(x)` | Reverse bytes of 64-bit value |
-
-## Bit Operations
+The Microsoft x64 variadic builtins, for an `ms_abi` function, exist only on
+x86-64:
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_ctz(x)` | Count trailing zeros in `unsigned int` (undefined if x==0) |
-| `__builtin_ctzl(x)` | Count trailing zeros in `unsigned long` |
-| `__builtin_ctzll(x)` | Count trailing zeros in `unsigned long long` |
-| `__builtin_clz(x)` | Count leading zeros in `unsigned int` (undefined if x==0) |
-| `__builtin_clzl(x)` | Count leading zeros in `unsigned long` |
-| `__builtin_clzll(x)` | Count leading zeros in `unsigned long long` |
-| `__builtin_popcount(x)` | Count set bits in `unsigned int` |
-| `__builtin_popcountl(x)` | Count set bits in `unsigned long` |
-| `__builtin_popcountll(x)` | Count set bits in `unsigned long long` |
-| `__builtin_parity(x)` | Low bit of the population count of `unsigned int` |
-| `__builtin_parityl(x)` | Same, `unsigned long` |
-| `__builtin_parityll(x)` | Same, `unsigned long long` |
-| `__builtin_clrsb(x)` | Redundant sign bits in `int` — the bits below the sign bit that repeat it. **Defined for every input**, unlike the `clz` family: 0 and -1 both answer 31 |
-| `__builtin_clrsbl(x)` | Same, `long` |
-| `__builtin_clrsbll(x)` | Same, `long long` |
-| `__builtin_ffs(x)` | One-based index of the lowest set bit of `int`, 0 if none |
-| `__builtin_ffsl(x)` | Same, `long` |
-| `__builtin_ffsll(x)` | Same, `long long` |
+| `__builtin_ms_va_list` | A `char *` walking the eight-byte argument positions (`TypeModifiers::MS_VA_LIST`): assignable to and from `char *` without a diagnostic, and the one pointer `__builtin_va_arg` walks the Microsoft way. A type keyword |
+| `__builtin_ms_va_start(ap, last)` | `Opcode::VaStart` in an `ms_abi` function, whose prologue spills the register positions to its shadow area: `ap` points past the named ones |
+| `__builtin_va_arg(ap, type)` on a `__builtin_ms_va_list` | Plain IR (`linearize_ms_va_arg`): step `ap` eight bytes, follow the position once more for a type passed by reference, read the value |
+| `__builtin_ms_va_end(ap)` | Nothing |
+| `__builtin_ms_va_copy(dest, src)` | `dest = src` |
 
-The population counts, and the parities built on them, are inline and use only
-baseline instructions: on x86-64 a branch-free SWAR sequence rather than
-`popcnt`, which is not in x86-64-v1; on AArch64 `cnt` and `addv`. A constant
-argument folds at `-O1` and above.
+## Byte Swapping and Bit Operations
 
-## Type Introspection
+| Builtin | Parameter | Becomes |
+|---------|-----------|---------|
+| `__builtin_bswap16(x)`, `bswap32`, `bswap64` | `unsigned short` / `unsigned int` / `unsigned long long` | `Opcode::Bswap16/32/64`; result of the parameter type |
+| `__builtin_ctz(x)`, `ctzl`, `ctzll` | `unsigned int` / `unsigned long` / `unsigned long long` | `Opcode::Ctz32` / `Ctz64` (`l` and `ll` share); undefined for 0 |
+| `__builtin_clz(x)`, `clzl`, `clzll` | as `ctz` | `Opcode::Clz32` / `Clz64`; undefined for 0 |
+| `__builtin_popcount(x)`, `popcountl`, `popcountll` | as `ctz` | `Opcode::Popcount32` / `Popcount64` |
+| `__builtin_parity(x)`, `parityl`, `parityll` | as `ctz` | Rewritten by the parser to `popcount(x) & 1` on one node, so `x` is evaluated once |
+| `__builtin_clrsb(x)`, `clrsbl`, `clrsbll` | `int` / `long` / `long long` | Redundant sign bits: expanded by `linearize_clrsb` into `((x ^ (x >> w-1)) << 1 \| 1)` and a `Clz`. Defined for every input: 0 and -1 both answer 31 |
+| `__builtin_ffs(x)`, `ffsl`, `ffsll` | `int` / `long` / `long long` | Of an integer constant expression, its value. Otherwise a call to the C library's `ffs`/`ffsl`/`ffsll` (gcc computes it inline), declared with that prototype unless the program declared it. The bare `ffs` is an ordinary function |
+
+Every result other than a byte swap's is `int`. The prototypes are gcc's,
+written once in `BIT_BUILTINS` (`parse/bit_builtin.rs`): a call is checked
+by `check_call` as an ordinary call through that prototype is, and its
+argument converted to the parameter type (C17 6.5.2.2p7), so
+`__builtin_ctz(8.0)` is 3. A structure argument is an error and a pointer
+the integer-from-pointer warning, each naming the builtin; a wrong argument
+count is the ordinary call's error.
+
+The population count uses only baseline instructions: on x86-64 a
+branch-free SWAR sequence (`popcnt` is not in x86-64-v1), on AArch64 `cnt`
+and `addv`. `clz` on x86-64 is `bsr` and an `xor` (no `lzcnt`).
+
+Every bit builtin of an integer constant expression is one itself, as in
+gcc: valid in a static initializer, a `case` label, an array bound, an
+enumerator and `_Static_assert`. Each operation is evaluated by one rule,
+`constfold::eval_bit_op`, which the C17 6.6 walk (`constexpr.rs`) applies to
+the builtin's node, the parser to `ffs` of a constant (folded in place of
+the library call), and `constfold::eval_unop` to the bit opcodes, so
+`instcombine`, `sccp` and `vrp` fold a constant operand at `-O1` and above.
+`ctz` and `clz` of a constant 0 fold to the operand width (32 or 64), the
+value gcc folds them to on both targets; at run time they stay undefined.
+
+## Type Introspection and Selection
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_constant_p(expr)` | 1 if `expr` is a compile-time constant. **Level-dependent, as in gcc**: answered after propagation has run, so a local holding a constant is one at `-O1` and above and is not with the optimizer off. A literal is 1 at every level. The argument is never evaluated, whatever the answer |
-| `__builtin_types_compatible_p(t1, t2)` | Returns 1 if types are compatible (ignores qualifiers) |
-| `__builtin_classify_type(expr)` | A code for the argument's type family: 1 integer, 5 pointer, 8 real floating, 9 complex, 12 struct, 13 union. The usual conversions run first, so a `char`, an enumeration constant and a `_Bool` all answer 1, and an array, a function and a string literal all answer 5. The argument is not evaluated |
-| `__builtin_choose_expr(c, a, b)` | `a` or `b` by the constant `c`; the untaken arm is not evaluated and need not even type-check |
+| `__builtin_constant_p(expr)` | 1 if `expr` is a compile-time constant. A parse-time constant (integer or floating) answers 1 at once; anything else answers 0 at `-O0`, and at `-O1`+ becomes `Opcode::ConstantP`, which `sccp` resolves to 1 if propagation proves the operand constant and `ir::lower` resolves to 0 otherwise -- so a local holding a constant is one only when optimizing, as in gcc. An operand with side effects answers 0 and is not linearized; the argument is never evaluated |
+| `__builtin_types_compatible_p(t1, t2)` | `TypeTable::types_compatible` of two type names, top-level qualifiers ignored. **Bug:** an enumerated type is compatible with no integer type here (C17 6.7.2.2p4 makes it compatible with one; gcc uses `unsigned int`, or `int` with a negative enumerator), so `__builtin_types_compatible_p(enum E, unsigned)` is 0 where gcc answers 1, and `_Generic` misses the same association |
+| `__builtin_classify_type(expr)` | A code for the type family after the usual conversions: 0 void, 1 integer (including `char`, enumerations and `_Bool`), 5 pointer (including arrays, functions and string literals), 8 real floating, 9 complex, 12 struct, 13 union. The argument is not evaluated |
+| `__builtin_choose_expr(c, a, b)` | `a` or `b` by the constant `c`, selected in the parser; the other arm is parsed (so an undeclared name or unknown member in it is still an error) and then discarded, so it is never evaluated or linearized |
 
 ## Memory
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_alloca(size)` | Allocate `size` bytes on stack (freed on function return) |
-| `alloca(size)` | The same builtin under its bare name, as gcc predefines it. Unlike a `__builtin_*` spelling it is not reserved, so a declaration that is not a function displaces it; the one in `<alloca.h>` is a function and does not |
-| `memset(dst, c, n)`, `__builtin_memset(dst, c, n)` | Set `n` bytes to `(unsigned char)c` |
-| `memcpy(dst, src, n)`, `__builtin_memcpy(dst, src, n)` | Copy `n` bytes |
-| `memmove(dst, src, n)`, `__builtin_memmove(dst, src, n)` | Copy `n` bytes (overlapping safe) |
-| `mempcpy(dst, src, n)`, `__builtin_mempcpy(dst, src, n)` | Copy `n` bytes, and return `dst + n`, the **end** of the copy: a `memcpy` and an addition, whatever `n` is, so `mempcpy` itself is never called |
-| `bcopy(src, dst, n)`, `__builtin_bcopy(src, dst, n)` | The old BSD `memmove`: the source **first**, and returns `void`. Not in POSIX.2024, but in glibc and known to gcc |
-| `__builtin_prefetch(addr, ...)` | Cache prefetch hint. Emits nothing, but `addr` is still **evaluated** — `__builtin_prefetch((q = p))` assigns `q`. The `rw` and locality arguments must be constants, so they have nothing to evaluate |
+| `__builtin_alloca(size)`, `alloca(size)` | `Opcode::Alloca`, freed on return. An inlined callee's `alloca` is bracketed by `StackSave`/`StackRestore` so it is freed when the call would have returned. The bare `alloca` is displaced by a non-function declaration or `-fno-builtin[-alloca]`; `<alloca.h>`'s function declaration does not displace it. Either spelling is checked through gcc's prototype `void *(size_t)` |
+| `memset`, `memcpy`, `memmove`, `mempcpy`, `bcopy` and their `__builtin_` spellings | Computed in place (next section) |
+| `__builtin_prefetch(addr[, rw[, locality]])` | Emits nothing. `addr` is evaluated (`__builtin_prefetch((q = p))` assigns `q`). `rw` (0 or 1) and locality (0 to 3) must be integer constants, so there is nothing in them to evaluate; one out of range is a warning, as in gcc. Further arguments are accepted and ignored, as gcc ignores them |
 
-## Control Flow
+## Library Functions Computed in Place
 
-| Builtin | Description |
-|---------|-------------|
-| `__builtin_unreachable()` | Mark code path as unreachable (traps if reached) |
-| `__builtin_expect(expr, c)` | Branch prediction hint (returns `expr` unchanged) |
-| `__builtin_assume_aligned(ptr, align)` | Pointer alignment hint (returns `ptr` unchanged) |
+One table, `LIBRARY_BUILTINS` in `parse/library_builtin.rs`, gives each of
+these its prototype and its `InlineLibraryFn`: `abs`, `labs`, `llabs`,
+`imaxabs`, `fabs`, `fabsf`, `fabsl`, `copysign`, `copysignf`, `copysignl`,
+`sqrt`, `sqrtf`, `sqrtl`, `floor`, `ceil`, `trunc`, `round`, `rint`,
+`nearbyint`, `fmin`, `fmax`, `fma` and their `f` forms, `creal`, `cimag` and
+`conj` in each precision, and `memcpy`, `memset`, `memmove`, `mempcpy` and
+`bcopy`, under their bare names and their `__builtin_` spellings.
 
-## Structure Layout
+What the program wrote is still a call (C17 7.1.4p1): the arguments are
+checked exactly as an ordinary call to that prototype checks them, and
+converted to the parameter types; the result is a value, so `creal(z) = 1.0`,
+`&creal(z)` and `++abs(i)` are errors.
 
-| Builtin | Description |
-|---------|-------------|
-| `__builtin_offsetof(type, member)` | Byte offset of member within struct/union |
-| `offsetof(type, member)` | Alias for `__builtin_offsetof` |
+`LibraryCallPolicy::in_place` decides whether a call is computed or called.
+Optimizing, every one is computed. At `-O0`, as in gcc, a libm function named
+by its bare spelling (`sqrt`) is called, and so is one that must still set
+`errno` whatever its spelling -- unless its answer is a constant, which is
+folded at every level (`static double d = floor(2.5);` compiles at `-O0`).
+The magnitudes, `copysign`, the complex accessors and the block memory
+functions are computed at every level.
 
-The member can be a chain like `field.subfield` or `arr[index].field`.
+A libm function computed in place is one IR opcode keyed on its type
+(`Sqrt`, `RoundToIntegral`, `FMin`, `FMax`, `Fma`; `Opcode::is_libm`). Where
+the target has no instruction for that type (`ArchMapper::computes_in_place`:
+binary128 on aarch64; `round`, `nearbyint`, `fmin`, `fmax` and `fma` on
+x86-64) `call_library_fallbacks` turns it back into a call to the function
+the instruction names, after the optimizer, which could still fold it.
+
+Displacement: every bare name yields to `-fno-builtin[-NAME]`, a non-function
+declaration and an incompatible function declaration (`struct S abs(int)`).
+`sqrt`, the roundings, `fmin`, `fmax`, `fma` and the block memory functions
+(`InlineLibraryFn::yields_to_a_definition`) also yield to the translation
+unit's own non-weak definition, wherever it is -- calls above it reach it,
+which glibc's fortify wrappers rely on. `abs`, `fabs`, `copysign` and the
+complex accessors do not (defining a reserved library name is undefined, C17
+7.1.3p2).
+
+| Function | Computed as |
+|----------|-------------|
+| `abs`, `labs`, `llabs`, `imaxabs` | `(x ^ s) - s` with `s = x >> (width - 1)`; `abs(INT_MIN)` wraps. Constant in a static initializer, not an integer constant expression |
+| `fabs`, `fabsf`, `fabsl` | `Opcode::Fabs`: clears the sign bit and nothing else, so `-0.0` becomes `+0.0` and a NaN keeps its payload and raises nothing. Never a call; `fabs(x) < 0.0` folds to 0 |
+| `copysign`, `copysignf`, `copysignl` | `Opcode::CopySign`: moves one bit, from a zero or a NaN as from anything else. Never a call. `bits/floatn.h` uses `__builtin_copysignf` |
+| `sqrt`, `sqrtf`, `sqrtl` | `Opcode::Sqrt`: `sqrtsd`/`sqrtss` and x87 `fsqrt` on x86-64, `fsqrt` on aarch64; binary128 (`sqrtl` on aarch64 Linux) is a call. With `-fmath-errno` (the default) an argument with `x < 0` (ordered, so not `-0` or NaN) still calls the library to set `EDOM`; `-fno-math-errno` drops that call, and then `sqrt(x) < 0` folds to 0. A constant folds, in a static initializer too, except a negative one |
+| `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint`, `f` forms | `Opcode::RoundToIntegral`: `frintm`, `frintp`, `frintz`, `frinta`, `frintx`, `frinti` on aarch64. On x86-64 (no `roundsd` in the baseline) gcc's SSE2 sequences for `floor`, `ceil`, `trunc` and `rint`, which set the result's sign rather than or-ing it in, so they are right in every rounding direction; `round` and `nearbyint` are calls. A `float` argument to the `double` function is computed by the `f` form (`NarrowedLibraryCall`): exact, because the result is an integer no larger than `x`; the call is still a `double` and still names `floor`. Constants fold, except a `rint`/`nearbyint` of a non-integer, whose answer depends on the rounding direction |
+| `fmin`, `fmax`, `fma`, `f` forms | `fminnm`, `fmaxnm`, `fmadd` on aarch64; calls on x86-64 (no FMA in the baseline; `minsd` does not ignore a NaN). Constants fold on both targets: `fmin(+0, -0)` is -0 and `fmax(-0, +0)` +0; a NaN argument is not a constant in a static initializer |
+| `creal`, `cimag`, `conj` (each precision) | The half read in place, as `__real__`/`__imag__` read it; `conj` negates the imaginary half as `~z` does, so a zero imaginary part becomes -0. The argument converts to the suffix's complex type first (`crealf` of a `double _Complex` is the rounded `float` half) |
+| `memcpy`, `memset`, `memmove` | `Opcode::Memcpy` / `Memset` / `Memmove`, at every level |
+| `mempcpy` | A `Memcpy` and an `Add`; `mempcpy` itself is never called |
+| `bcopy(src, dst, n)` | A `Memmove` with the operands swapped; returns `void` |
+
+The `l` forms of the roundings, `fmin`, `fmax` and `fma` are library calls
+(below).
+
+### Block memory functions
+
+`ir/memexpand.rs` expands a `Memcpy` or `Memset` whose length is a constant
+of at most 128 bytes (`INLINE_LIMIT_BYTES`), or a `Memmove` of at most 64
+(`MOVE_LIMIT_BYTES`), into integer loads and stores of 8, 4, 2 and 1 bytes. It
+runs at every level after inlining, and again inside the optimizer's loop, so
+a length that inlining or SCCP makes constant is expanded too; the stored
+bytes are then forwarded like any others (`unsigned x = 5, y; memcpy(&y, &x,
+4); return y + 1;` returns the constant 6). No alignment is assumed.
+`memmove` loads every chunk before storing any, which is why its limit is
+lower. A longer or variable length is a call. The linearizer's own aggregate
+copies use the same chunks and limit.
+
+Optimizing, a `Memmove` whose blocks cannot overlap becomes a `Memcpy`
+(`ir/libcall_fold/memory.rs`): its source is a string literal or a `const`
+object defined here, or the two blocks are different locals, or one local and
+one named object. Two different named objects are not enough: an alias or a
+weak definition can put two names at one address.
 
 ## Floating-Point Constants
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_inf()` | Positive infinity (`double`) |
-| `__builtin_inff()` | Positive infinity (`float`) |
-| `__builtin_infl()` | Positive infinity (`long double`) |
-| `__builtin_huge_val()` | Positive infinity (`double`) |
-| `__builtin_huge_valf()` | Positive infinity (`float`) |
-| `__builtin_huge_vall()` | Positive infinity (`long double`) |
-| `__builtin_nan(str)` | Quiet NaN (`double`) |
-| `__builtin_nanf(str)` | Quiet NaN (`float`) |
-| `__builtin_nanl(str)` | Quiet NaN (`long double`) |
-| `__builtin_nans(str)` | Signaling NaN (`double`) |
-| `__builtin_nansf(str)` | Signaling NaN (`float`) |
-| `__builtin_nansl(str)` | Signaling NaN (`long double`) |
+| `__builtin_inf()`, `inff`, `infl`, `huge_val`, `huge_valf`, `huge_vall` | Positive infinity of `double`, `float`, `long double` |
+| `__builtin_nan(str)`, `nanf`, `nanl` | Quiet NaN |
+| `__builtin_nans(str)`, `nansf`, `nansl` | Signalling NaN |
 
 Each also has `f16`, `f32`, `f64` and `f128` forms (`__builtin_inff16()`,
-`__builtin_nansf128(str)`, ...) giving a `_Float16`, `float`, `double` and
-`_Float128` respectively; the `f128` forms exist only where `_Float128` does,
-which is not macOS. A NaN's string names its payload; one that does not parse
-as a number makes the quiet forms a call to `nan`, `nanf16` and so on.
+`__builtin_nansf128(str)`, ...) giving `_Float16`, `float`, `double` and
+`_Float128`; the `f128` forms exist only where `_Float128` does (not macOS),
+and are a parse error elsewhere. All come from `FLOAT_CONSTANT_BUILTINS` and
+are literals, so they are constants everywhere.
 
-## Library Functions Computed in Place
+A NaN's string literal names its payload, parsed as gcc's `strtoull`-based
+reader parses it (`nan_payload`). A string that does not parse makes the
+quiet forms a call to `nan`, `nanf16` and so on, and the signalling forms an
+error.
 
-`abs`, `labs`, `llabs`, `imaxabs`, `fabs`, `fabsf`, `fabsl`, `copysign`,
-`copysignf`, `copysignl`, `sqrt`, `sqrtf`, `sqrtl`, `floor`, `ceil`,
-`trunc`, `round`, `rint`, `nearbyint`, `fmin`, `fmax` and `fma` and their
-`f` forms, `creal`, `cimag` and `conj` in each precision, and `memcpy`,
-`memset`, `memmove`, `mempcpy` and `bcopy` are known to c17 by prototype, under their bare names
-and their `__builtin_` spellings. One table in `parse/library_builtin.rs`
-gives each its prototype and what it computes.
-
-A `memcpy` or `memset` whose length is a constant of at most 128 bytes, or a
-`memmove` of at most 64, is expanded into integer loads and stores of 8, 4, 2
-and 1 bytes at every level, as gcc does at `-O2`; a longer or a variable
-length is a call. The expansion is IR (`ir/memexpand.rs`), after inlining and
-again in the optimizer's loop, so a length that inlining makes constant is
-expanded too, and the stored bytes are forwarded like any others: `unsigned x
-= 5, y; memcpy(&y, &x, 4); return y + 1;` returns the constant 6. No
-alignment is assumed. `memmove` loads every chunk before it stores any, which
-is what makes it right for an overlap in either direction, and why its limit
-is lower -- every chunk is live at once. The limit is the one the linearizer's
-own aggregate copies use, in the same chunks. The bare names are displaced
-like `sqrt`: by a declaration that is not the `<string.h>` prototype, by
-`-fno-builtin[-memcpy]`, and by the translation unit's own non-weak
-definition, which glibc's fortify wrappers rely on.
-
-Optimizing, a `memmove` (or `bcopy`) whose two blocks cannot overlap is a
-`memcpy`, as in gcc (`ir/libcall_fold/memory.rs`): its source is a string
-literal or a `const` object defined here, which no destination may be in, or
-its two blocks are different local objects, or one local and one named. So
-`memmove(buf, table, sizeof table)` of a 144-byte `const` table calls
-`memcpy`, and one of at most 128 bytes is expanded as a `memcpy` is. Two
-different named objects are not enough: an alias or a weak definition can put
-two names at one address.
-
-At `-O0`, as in gcc, a libm function named by its bare spelling (`sqrt`) is
-called rather than computed, and so is one that must still set `errno`
-whatever its spelling -- unless its answer is a constant, which it is at
-every level, so `static double d = floor(2.5);` compiles at `-O0` too; the magnitudes, `copysign` and the complex accessors
-are computed in place at every level, and the block memory functions are
-their IR operation at every level. A libm function computed in place is one
-IR opcode keyed on its type; where the target has no instruction for that
-type (binary128 on aarch64; `round`, `nearbyint`, `fmin`, `fmax` and `fma`
-on x86-64) it becomes a call to the library function again after the
-optimizer, which could still fold it.
-
-However it is evaluated, what the program wrote is a call (C17 7.1.4p1). The
-arguments are checked exactly as an ordinary call to a function of that
-prototype checks them -- the same errors and warnings, in the same words --
-and converted to the parameter type; and the result is a value, so
-`creal(z) = 1.0`, `&creal(z)` and `++abs(i)` are errors, as they are for any
-call.
-
-## Floating-Point Math
+## Floating-Point Classification and Comparison
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_fabs(x)` | Absolute value (`double`), computed in place |
-| `__builtin_fabsf(x)` | Absolute value (`float`), computed in place |
-| `__builtin_fabsl(x)` | Absolute value (`long double`), computed in place |
-| `floor(x)`, `ceil(x)`, `trunc(x)`, `round(x)`, `rint(x)`, `nearbyint(x)`, their `f` forms, and their `__builtin_` spellings | The integer `x` rounds to, with `x`'s sign (`ceil(-0.5)` is `-0`), computed in place: `frintm`, `frintp`, `frintz`, `frinta`, `frintx` and `frinti` on aarch64; on x86-64, whose baseline has no `roundsd`, gcc's SSE2 sequences for `floor`, `ceil` and `trunc` (a truncating conversion, corrected by one) and `rint` (2^52 added and subtracted), each for a magnitude below 2^52 (2^23) -- anything larger, infinite or NaN is its own answer. Unlike gcc's, these set the sign of the result rather than or-ing it in, and `rint` rounds the value rather than its magnitude, so they are right in every rounding direction, not only the default one. `round` and `nearbyint` are calls on x86-64, as in gcc (the SSE2 `rint` raises *inexact*, which `nearbyint` must not). **A `float` argument to the `double` function is narrowed to the `f` form**: `(float)floor((double)x)` is `floorf(x)` exactly, because the result is an integer no greater in magnitude than `x`; the condition is the argument's type, not the result's, and the call is still a `double` (`sizeof floor(1.0f)` is 8), and still a call to `floor`: a definition of `floor` displaces it, and the program's `floor` receives the argument as a `double`. It is narrowed only where computed in place; at `-O0` the bare spelling calls `floor`, as in gcc. Only these six qualify -- `sin` and `log` are not exactly rounding, and narrowing one changes the last bit. Constants fold, in static initializers too, except a `rint` or `nearbyint` of a value that is not already an integer, whose answer is the current direction's; gcc leaves those too. The `l` forms are library aliases (below). Displaced like `sqrt`, a definition included |
-| `fabs(x)`, `fabsf(x)`, `fabsl(x)` | The same three under their bare names, as gcc recognizes them whether or not `<math.h>` was included. Not reserved spellings, so they are displaced by a declaration that is not a function, by a function declaration whose type is not the library prototype (`struct S fabs(int)`), or by `-fno-builtin[-fabs]`. The bare name is still an object where it is not being called, so `double (*p)(double) = fabs;` names the library function. The argument is converted to the prototype's type first; the optimizer gains the one fact it needs to fold `fabs(x) < 0.0` to 0, and a constant argument folds. All three are computed in place by clearing the sign bit and nothing else -- never a call, so no program needs libm for them; `-0.0` becomes `+0.0` and a NaN, quiet or signalling, keeps its payload and raises nothing |
-| `abs(x)`, `labs(x)`, `llabs(x)`, `imaxabs(x)` and their `__builtin_` spellings | Magnitude of an `int`, `long`, `long long` or `intmax_t`, computed in place as `(x ^ s) - s` with `s = x >> (width - 1)` -- never a call, at every level, as gcc does; a constant argument therefore folds. The argument is converted to the prototype's type first. The bare names are displaced like `fabs`, and a declaration with any other type (`struct S abs(int)`) makes the name an ordinary function, as in gcc; a translation unit's own compatible definition of one does **not** displace it, since defining a reserved library name is undefined (C17 7.1.3p2). `abs(INT_MIN)` wraps to `INT_MIN` |
-| `copysign(x, y)`, `copysignf`, `copysignl` and their `__builtin_` spellings | `x` with the sign bit of `y`, computed in place on both targets by moving that one bit -- never a call, so no program needs libm for them. The sign is taken from a zero or a NaN as from anything else (`copysign(1.0, -0.0)` is `-1.0`), and nothing of `x` but its sign changes: a NaN keeps its payload, and a signalling one stays signalling and raises nothing. Both arguments are converted to the prototype's type first, and constant arguments fold, in a static initializer too (but, as in gcc, a call is never an integer constant expression). The bare names are displaced like `fabs`, by a declaration whose parameters are not both the prototype's or by `-fno-builtin[-copysign]`. `bits/floatn.h` reaches for `__builtin_copysignf`, so every spelling is load-bearing |
-| `__builtin_signbit(x)` | 1 if the sign bit of `x` is set, else 0 -- for `-0.0` and a negative NaN too. Any real floating type, read at its own width (a `_Float16` widened to `float`, a `__float128` to `long double`); glibc's `<math.h>` `signbit` is this. Computed in place on both targets, never a call; of a constant it is an integer constant expression, as in gcc. C only asks for nonzero; gcc answers 1 for a constant but at run time the bit in place (`INT_MIN` for a `float`, 512 for an x86-64 `long double`), and c17 answers 1 at every width and level |
+| `__builtin_signbit(x)` | 1 if the sign bit is set (also for `-0.0` and a negative NaN), else 0. Any real floating type, read at its own width (`_Float16` widened to `float`, `__float128` to `long double`). Of a constant it is an integer constant expression. gcc answers the bit in place at run time (`INT_MIN` for a `float`, 512 for an x86-64 `long double`); c17 answers 1 |
 | `__builtin_signbitf(x)`, `__builtin_signbitl(x)` | The same, of `x` converted to `float` or `long double` |
-| `__builtin_isnan(x)`, `__builtin_isnanf`, `__builtin_isnanl` | 1 if `x` is a NaN, else 0. Any real floating type; the suffix is accepted but not consulted, since the operand's own type decides |
-| `__builtin_isinf(x)`, `__builtin_isinff`, `__builtin_isinfl` | 1 if `x` is an infinity of either sign |
-| `__builtin_isfinite(x)` | 1 if `x` is neither infinite nor NaN. gcc has no `f`/`l` spelling of this one, or of `isnormal`, so neither does c17 |
-| `__builtin_isnormal(x)` | 1 if `x` is finite, non-zero and not subnormal |
-| `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` | Whichever of the five class codes describes `x` |
-| `__builtin_flt_rounds()` | Current FP rounding mode |
+| `__builtin_isnan(x)`, `isnanf`, `isnanl` | 1 if NaN. The unsuffixed form tests any real floating type at its own width; the suffixed forms convert `x` to `float` or `long double`, gcc's prototypes for them |
+| `__builtin_isinf(x)`, `isinff`, `isinfl` | 1 if an infinity of either sign |
 | `__builtin_isinf_sign(x)` | +1 for +inf, -1 for -inf, 0 otherwise |
-| `sqrt(x)`, `sqrtf`, `sqrtl` and their `__builtin_` spellings | The correctly rounded square root, by the instruction: `sqrtsd`/`sqrtss` and x87 `fsqrt` on x86-64, `fsqrt` on aarch64; binary128 (`sqrtl` on aarch64 Linux) is a call. As in gcc, an argument below zero -- an ordered `x < 0`, so not `-0` and not a NaN -- still goes to the library, which sets `errno` to `EDOM`; `-fno-math-errno` drops that call and the program needs no libm. A constant argument folds, in a static initializer too, exactly as the instruction rounds it; a negative one is left to run time, and in a static initializer is not a constant. Under `-fno-math-errno`, `sqrt(x) < 0` folds to 0. Displaced like `fabs`, and also, as in gcc, by the translation unit's own definition of the function, wherever it is: its calls, above the definition too, reach it |
-| `fmin(x, y)`, `fmax(x, y)`, `fma(x, y, z)`, their `f` forms, and their `__builtin_` spellings | The smaller and larger of two values -- a quiet NaN argument ignored for the other -- and `x * y + z` rounded once. `fminnm`, `fmaxnm` and `fmadd` on aarch64; calls on x86-64, as in gcc, whose baseline has no FMA and whose `minsd` does not ignore a NaN. Constants fold on both targets, exactly: `fma` with one rounding, and the zeros C leaves open as gcc folds them and `fminnm` answers, `fmin(+0, -0)` -0 and `fmax(-0, +0)` +0 (glibc's x86-64 functions answer the first argument). In a static initializer a NaN argument is not a constant, as in gcc. The `l` forms are library aliases (below). Displaced like `sqrt`, a definition included |
-| `__builtin_fmaxl`, `fminl`, `fmal` | The `long double` forms |
-| `__builtin_pow(x, y)`, `powf`, `powl` | `x` raised to `y` |
-| `__builtin_ceill`, `floorl`, `truncl`, `roundl`, `rintl`, `nearbyintl` | The `long double` roundings |
-| `__builtin_cbrt` | And its `f` and `l` spellings |
-| `__builtin_sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` | And their `f` and `l` spellings |
-| `__builtin_exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `logb`, `tgamma`, `lgamma`, `erf`, `erfc` | And their `f` and `l` spellings |
-| `__builtin_fmod`, `atan2`, `hypot`, `fdim`, `remainder`, `nextafter` | Two arguments; and their `f` and `l` spellings |
-| `__builtin_modf(x, *ip)`, `__builtin_frexp(x, *e)`, `__builtin_ldexp(x, e)` | These three do **not** take a list of one type -- the second parameter is a pointer or an `int`. Declaring one uniformly sends that argument to the wrong register file, which is a silent wrong answer rather than a link error |
+| `__builtin_isfinite(x)`, `__builtin_isnormal(x)` | As C's macros. No suffixed spellings, as in gcc |
+| `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` | Whichever of the five codes describes `x`. The codes convert to `int` and must be integer constants |
+| `__builtin_flt_rounds()` | The integer constant 1, whatever the current rounding mode (clang reads the mode; gcc has no such builtin) |
 
-Every one of these is a call to the library function of the same name, so the
-usual library rules apply. Their signatures come from **one table**, keyed by
-the suffix: a `float` entry point takes and returns `float`, and getting that
-wrong does not fail to link.
+The classification builtins are `ExprKind::FpTest` / `FpClassify`, lowered by
+`linearize_fp_test` / `linearize_fp_classify` into comparisons and bit tests;
+`signbit` is `Opcode::Signbit`. Only `signbit` folds as a constant
+expression.
 
 ### The unordered-safe relations (C99 7.12.14)
 
@@ -211,320 +331,396 @@ wrong does not fail to link.
 | `__builtin_isgreaterequal(x, y)` | `x >= y` |
 | `__builtin_isless(x, y)` | `x < y` |
 | `__builtin_islessequal(x, y)` | `x <= y` |
-| `__builtin_islessgreater(x, y)` | Ordered and unequal -- **not** `x != y`, which is *true* for an unordered pair |
+| `__builtin_islessgreater(x, y)` | Ordered and unequal -- **not** `x != y`, which is true for an unordered pair |
 | `__builtin_isunordered(x, y)` | At least one operand is a NaN |
-| `__builtin_iseqsig(x, y)` | `x == y`, the C23 `iseqsig`. The answer is exact; see below for the exception it does not raise |
+| `__builtin_iseqsig(x, y)` | `x == y` (C23 `iseqsig`) |
 
-Every one of these is false for an unordered pair except `isunordered`, which
-is the only one true for it. They exist in C because the ordinary relational
-operators are specified to raise `FE_INVALID` on an unordered pair and these
-are not; c17 emits the quiet compare (`ucomis*`, `fucomip`) for both, so the
-two agree and there is nothing further to arrange.
+Each is false for an unordered pair except `isunordered`. The operands must
+be real, at least one floating (gcc's rule), and go through the usual
+arithmetic conversions; each is evaluated once, because the relation is an
+`ExprKind::FpCompare` desugared in the linearizer. glibc's `<math.h>` defines
+`isgreater` and the rest as these builtins.
 
-`iseqsig` is the exception in the other direction: C23 7.12.17.1 has it raise
-`FE_INVALID` for any unordered pair, a quiet NaN included, where `==` raises
-it only for a signalling one. c17 emits the same quiet compare for it, so the
-result is right and `FE_INVALID` is not raised for a quiet NaN -- the same gap
-c17's `<` and `>` have, which are emitted with the quiet compare as well.
+c17 emits the quiet compare (`ucomis*`, `fucomip`, `fcmp`) for these and for
+the ordinary relational operators alike, so the operators do not raise
+`FE_INVALID` for a quiet NaN either, and `iseqsig` does not raise it for an
+unordered pair as C23 7.12.17.1 requires. The results are exact.
 
-glibc's `<math.h>` **defines** `isgreater`, `isless`, `isunordered` and the
-rest as these builtins, so a translation unit that includes the header and
-uses one did not compile at all without them.
-
-The operands go through the usual arithmetic conversions, as the operators
-they stand for do. Each is evaluated exactly once: the relation is desugared
-in the linearizer, not written out as `a < b` in the parser.
-
-
-## Stack Introspection
+## Stack Introspection and Non-Local Jumps
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_frame_address(level)` | Frame pointer at `level` (0 = current) |
-| `__builtin_return_address(level)` | Return address at `level` (0 = current) |
-| `__builtin_extract_return_addr(addr)` | The identity on both targets c17 has. It exists for architectures that encode a flag in the return address -- ARM Thumb sets bit 0 -- and there is nothing to strip on x86-64 or AArch64, which is what gcc does there too |
-| `__builtin___clear_cache(begin, end)` | Make instructions written as data visible to the fetcher. Lowered to libgcc's `__clear_cache`, which is the no-op on x86-64, where the caches are coherent, and does the work on AArch64, where a JIT is wrong without it |
+| `__builtin_frame_address(level)` | `Opcode::FrameAddress`, walking `level` frame records |
+| `__builtin_return_address(level)` | `Opcode::ReturnAddress` |
+| `__builtin_extract_return_addr(addr)` | The identity on both targets (it exists for ARM Thumb's flag bit); `addr` is evaluated once |
+| `__builtin___clear_cache(begin, end)` | A call to libgcc's `__clear_cache`: a no-op on x86-64, required on AArch64 for code written as data |
+| `setjmp(env)`, `_setjmp(env)` | Bare names parsed as builtins: `Opcode::Setjmp`, calling the library function under the name its declaration gives it. `setjmp()` with no argument is an ordinary unprototyped call |
+| `longjmp(env, val)`, `_longjmp(env, val)` | `Opcode::Longjmp`, a terminator |
+
+`setjmp` and `longjmp` are displaced only by a declaration that is not a
+function, or by `-fno-builtin`; `<setjmp.h>`'s function declarations keep
+them.
+
+## Control Flow and Hints
+
+| Builtin | Description |
+|---------|-------------|
+| `__builtin_unreachable()` | `Opcode::Unreachable`, a terminator: `ud2` on x86-64, `brk #1` on aarch64 where it survives. Optimizing, a branch to it is dead and is removed |
+| `__builtin_trap()` | A call to `abort` (gcc emits a trap instruction) |
+| `__builtin_expect(expr, c)` | Its value is `expr`. `c` is evaluated for its side effects unless it is a literal |
+| `__builtin_assume_aligned(ptr, align[, misalign])` | A call through gcc's prototype `void *(const void *, size_t, ...)` (`parse/assume_aligned.rs`): the arguments are checked and converted as for any call, and the value is `ptr` as a `void *`, whatever its pointee's qualifiers. `align` and `misalign` are evaluated for their side effects unless they are literals; neither need be constant, nor `align` a power of two. More than three arguments, or a `misalign` that is not an integer, is an error, in gcc's words. The alignment itself is unused |
+
+## Structure Layout
+
+| Builtin | Description |
+|---------|-------------|
+| `__builtin_offsetof(type, member)`, `offsetof(type, member)` | Byte offset, as `unsigned long`; `ExprKind::OffsetOf`, folded by `constexpr::eval`. The member may be a chain (`field.sub`, `arr[i].field`) whose indices must be integer constants |
 
 ## Complex Numbers
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_complex(re, im)` | Build a complex value from two reals of the same type |
-| `__builtin_creal(z)`, `__builtin_crealf`, `__builtin_creall` | The real half, read in place as `__real__` reads it -- not a libm call. Unlike `__real__ z`, the result is a value, never an lvalue |
-| `__builtin_cimag(z)`, `__builtin_cimagf`, `__builtin_cimagl` | The imaginary half |
-| `__builtin_conj(z)`, `__builtin_conjf`, `__builtin_conjl` | The complex conjugate, computed in place as `~z` computes it, negating the imaginary half, so a zero imaginary part conjugates to **negative** zero, as it must, and `z` is evaluated once |
-| `creal`, `crealf`, `creall`, `cimag`, `cimagf`, `cimagl`, `conj`, `conjf`, `conjl` | The same nine under their bare names, as gcc recognizes them. Displaced like `fabs`: by a declaration that is not a function or whose type is not the `<complex.h>` prototype, or by `-fno-builtin[-NAME]`; recognized only where called. For every spelling the argument converts to the complex type the suffix names first, as the prototype would convert it -- `crealf` of a `double _Complex` is the rounded `float` half, and `creal(3)` is 3.0 |
+| `__builtin_complex(re, im)` | `ExprKind::BuiltinComplex`, of the complex type of `re`'s type. Usable in static initializers and at file scope (`<complex.h>`'s `I` and `CMPLX` macros use it), at every precision. The operands must be of one real floating type, as gcc requires |
+| `__builtin_creal`, `crealf`, `creall`, `cimag`, `cimagf`, `cimagl`, `conj`, `conjf`, `conjl` | Computed in place (above) |
 
-Used by `<complex.h>` for `I` and the `CMPLX`/`CMPLXF`/`CMPLXL` macros, which
-exist precisely so `x + y*I` has an exact alternative that cannot corrupt an
-infinite or NaN part.
-
-Usable at file scope and in a static initializer as well as in a function
-body: `double _Complex g = 1.0 + 2.0*I;` and `CMPLX(3.0, 4.0)` both work, at
-every precision. (This entry used to record the opposite as a limit; that was
-fixed by `#C11` and the note outlived it.)
-
-The complex *integer* types are supported as well -- `_Complex int`,
-`_Complex long`, `_Complex unsigned char` and the rest, a GNU extension. They
-behave as two integers laid end to end: `sizeof` is twice the base, the halves
-align to the base, and each half wraps at its own width. Multiply and divide
-are open-coded rather than routed through `__mulsc3`/`__divsc3`, which exist
-only for the floating formats and whose infinity recovery has no meaning for a
-type that wraps. Imaginary constants may be integers too -- `2i` is a
-`_Complex int` -- and `~z` is the conjugate for every complex type, floating
-and integer alike, which is what gcc gives `~` on a complex operand.
-
-`_Complex __int128` is thirty-two bytes and so travels in memory and returns
-through the hidden pointer, on both targets.
-
-Division uses **Smith's method**, matching gcc, rather than the textbook
-formula `((ac + bd) + (bc - ad)i) / (c*c + d*d)`. The textbook form is exact
-but overflows: `(4000000000u + 0i) / (2u + 0i)` needs `a * c` to hold 8e9,
-which a 32-bit half cannot, and the quotient comes out 926258176. Smith's
-method divides through by the larger half first, so the products stay near the
-magnitude of the operands.
-
-The cost is a branch and a truncation. Each step truncates toward zero, as any
-integer division does, so `(-9 + 38i) / (5 + 6i)` is `6 + 1i` where the exact
-quotient is `3 + 4i` -- gcc answers the same, because it is the same
-algorithm. The standard specifies nothing here (the whole type is an
-extension), so gcc's behaviour is the only available definition, and matching
-it is the point.
+Complex integer types (`_Complex int` and the rest, a GNU extension) are
+supported as two integers laid end to end; multiply and divide are
+open-coded, and divide uses Smith's method with truncating steps, exactly as
+gcc does, so `(-9 + 38i) / (5 + 6i)` is `6 + 1i`. `_Complex __int128` is
+32 bytes and travels in memory on both targets.
 
 ## Checked Arithmetic
 
-C23 spells the generic three as `ckd_add`, `ckd_sub` and `ckd_mul`. Each
-stores the wrapped result through the pointer and returns 1 if the true
-result did not fit, 0 if it did — so the result is written either way.
+C23 spells the generic three `ckd_add`, `ckd_sub`, `ckd_mul`. Each computes
+the exact result, stores it wrapped to the destination type, and returns 1
+if it did not fit; the store happens either way. All are
+`ExprKind::CheckedArith`; mixed operand and result types, including
+`__int128`, match gcc.
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_add_overflow(a, b, *r)` | Type-generic; the operands and `*r` may differ in type |
-| `__builtin_sub_overflow(a, b, *r)` | |
-| `__builtin_mul_overflow(a, b, *r)` | |
-| `__builtin_add_overflow_p(a, b, v)` | The same question, answered without storing. `v` names the destination type with a *value* rather than a pointer; it is still evaluated, as gcc evaluates it, but its value is unused |
-| `__builtin_sub_overflow_p(a, b, v)` | |
-| `__builtin_mul_overflow_p(a, b, v)` | |
-| `__builtin_sadd_overflow(a, b, *r)` | Add, `int` |
-| `__builtin_saddl_overflow(a, b, *r)` | Add, `long` |
-| `__builtin_saddll_overflow(a, b, *r)` | Add, `long long` |
-| `__builtin_uadd_overflow(a, b, *r)` | Add, `unsigned int` |
-| `__builtin_uaddl_overflow(a, b, *r)` | Add, `unsigned long` |
-| `__builtin_uaddll_overflow(a, b, *r)` | Add, `unsigned long long` |
-| `__builtin_ssub_overflow(a, b, *r)` | Subtract, `int` |
-| `__builtin_ssubl_overflow(a, b, *r)` | Subtract, `long` |
-| `__builtin_ssubll_overflow(a, b, *r)` | Subtract, `long long` |
-| `__builtin_usub_overflow(a, b, *r)` | Subtract, `unsigned int` |
-| `__builtin_usubl_overflow(a, b, *r)` | Subtract, `unsigned long` |
-| `__builtin_usubll_overflow(a, b, *r)` | Subtract, `unsigned long long` |
-| `__builtin_smul_overflow(a, b, *r)` | Multiply, `int` |
-| `__builtin_smull_overflow(a, b, *r)` | Multiply, `long` |
-| `__builtin_smulll_overflow(a, b, *r)` | Multiply, `long long` |
-| `__builtin_umul_overflow(a, b, *r)` | Multiply, `unsigned int` |
-| `__builtin_umull_overflow(a, b, *r)` | Multiply, `unsigned long` |
-| `__builtin_umulll_overflow(a, b, *r)` | Multiply, `unsigned long long` |
+| `__builtin_add_overflow(a, b, *r)`, `sub`, `mul` | Type-generic: the operands and `*r` may differ in type |
+| `__builtin_add_overflow_p(a, b, v)`, `sub`, `mul` | The same question without storing. `v` names the result type by a value; it is evaluated, as in gcc, but unused |
+| `__builtin_sadd_overflow`, `saddl`, `saddll`, `ssub*`, `smul*` | `int` / `long` / `long long` |
+| `__builtin_uadd_overflow`, `uaddl`, `uaddll`, `usub*`, `umul*` | `unsigned int` / `unsigned long` / `unsigned long long` |
+
+The fixed-type forms are calls through gcc's prototype (`bool (int, int,
+int *)` for `sadd`), so their arguments are converted to the named type
+first; the type-generic forms take their operands as they are (and see
+Argument checking).
 
 ## Library Functions
 
-The builtin of the same name as a library function. c17 emits a call to that
-function, so the usual library rules apply — `__builtin_pow` needs `-lm`.
-They exist so a translation unit may use one without having included the
-header that declares it, which is what gcc allows and what glibc's fortified
-headers rely on.
+A builtin of the same name as a library function is a call to that function
+(`parse_library_builtin` strips `__builtin_`; `__builtin_trap` calls `abort`,
+`__builtin_memcmp_eq` calls `memcmp`). The usual library rules apply --
+`__builtin_pow` needs `-lm`. They exist so a translation unit may call one
+without the header that declares it, as gcc allows and glibc's fortified
+headers rely on. The call is `CalleeBinding::Library`: it reaches the
+library's function, never an inline definition of the same name, so an
+`always_inline` `extern inline` `strncpy` whose body is
+`return __builtin_strncpy(...)` is not recursive.
 
-When the translation unit does declare the function, a call through the
-`__builtin_` name is checked against that declaration exactly as a call through
-the plain name is. When it does not, c17 declares the function itself. A
-`<string.h>` or `<stdio.h>` function the optimizer knows (below) is declared
-with the library's own prototype, and its arguments are checked against it;
-for anything else c17 knows only how many parameters the entry point has, not
-always their types, so such a call's arguments are not checked.
+Each has a row in `LIBRARY_BUILTINS` giving the library's prototype, which
+declares the function when nothing in scope does, so the call is checked as
+any call is (see Argument checking). The prototype is the library's own, so
+a header that declares the function later agrees with it; and the fixed
+parameters of the variadic ones are counted right, which matters on Apple
+arm64, where variadic arguments go on the stack. Under `-fpermissive` an
+implicit declaration of one of these names takes the row's return type.
 
-Once optimizing, a call to `strlen`, `strnlen`, `strcmp`, `strncmp`, `memcmp`,
-`strchr`, `strrchr`, `index`, `rindex`, `memchr`, `strstr`, `strpbrk` or
-`strcspn`, by either spelling, is computed in place where its arguments decide
-the result, as gcc does: the bytes of a string literal or of a `const` `char`
-array defined in the translation unit are read, and for `strlen` and `strnlen`
-so are a local array's, where every byte the stores before the call leave in
-it up to a terminator is a constant; `strcmp(p, "")` is the first byte of
-`p`, and `strstr(p, "c")` is `strchr(p, 'c')`. A `strncmp` or `memcmp` of the
-constant length 0 is 0 at every level. `-fno-builtin` and
-`-fno-builtin-NAME` keep the bare name's call, as does a declaration of the
-name with another prototype.
+| Builtin | Notes |
+|---------|-------|
+| `__builtin_abort()`, `__builtin_exit(status)`, `__builtin_trap()` | `trap` calls `abort` |
+| `__builtin_malloc`, `calloc`, `realloc`, `free` | |
+| `__builtin_memcmp`, `memcmp_eq`, `bcmp`, `memchr`, `bzero` | `memcmp_eq` (equality only) calls `memcmp` |
+| `__builtin_strlen`, `strcmp`, `strncmp`, `strcasecmp`, `strncasecmp` | |
+| `__builtin_strcpy`, `strncpy`, `stpcpy`, `stpncpy`, `strcat`, `strncat`, `strdup`, `strndup` | |
+| `__builtin_strchr`, `strrchr`, `index`, `rindex`, `strstr`, `strpbrk`, `strspn`, `strcspn` | |
+| `__builtin_printf`, `sprintf`, `snprintf`, `fprintf`, `puts`, `putchar`, `fputs`, `fputc`, `fwrite` | |
+| `__builtin_printf_unlocked`, `fprintf_unlocked`, `fputs_unlocked` | glibc defines none of these; a program using one supplies it (gcc.c-torture's `builtins/` tests do) |
+| `__builtin_pow`, `fmod`, `atan2`, `hypot`, `fdim`, `remainder`, `nextafter` and `f`/`l` forms | |
+| `__builtin_cbrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `logb`, `tgamma`, `lgamma`, `erf`, `erfc` and `f`/`l` forms | |
+| `__builtin_modf`, `frexp`, `ldexp` and `f`/`l` forms | The second parameter is a pointer or an `int` |
+| `__builtin_ceill`, `floorl`, `truncl`, `roundl`, `rintl`, `nearbyintl`, `fminl`, `fmaxl`, `fmal` | The `long double` forms of functions computed in place |
 
-A call to `strcpy`, `stpcpy`, `strncpy`, `strcat`, `strncat` or `sprintf`
-whose source string has a known length -- one string, or a choice among strings
-of one length -- is a `memcpy` of that length and the terminator, as gcc makes
-it: `strcat` finds the end with `strlen`, `strncpy` pads with a `memset` of zero
-up to 128 bytes, and `sprintf` of a format with no conversion, or of `"%s"`,
-answers the length. `stpcpy`, or `sprintf(d, "%s", s)`, of an unknown `s`
-whose result is unused is `strcpy(d, s)`.
+### Calls the optimizer folds
 
-Output calls whose result is unused are rewritten, as gcc rewrites them, into
-calls that write the same bytes: `printf("")` goes, `printf("x")` is
-`putchar('x')`, `printf("text\n")` and `printf("%s\n", s)` are `puts`, and
-`printf("%c", c)` is `putchar(c)`; `fprintf(fp, "text")` and
-`fprintf(fp, "%s", s)` are `fputs`, and `fprintf(fp, "%c", c)` is `fputc`;
-`fputs` of a known string is nothing, `fputc` or `fwrite`. The `v` forms and
-`__printf_chk`, `__vprintf_chk`, `__fprintf_chk` and `__vfprintf_chk` follow,
-the `v` forms only for a format without `%`. The `_unlocked` forms are only
-ever dropped, since there is no portable function to call in their place.
+A call to a function with a `known` row in `LIBRARY_BUILTINS` carries its
+`LibFn` on the IR instruction (`known`), by either spelling where one exists,
+and `ir/libcall_fold/` folds it once optimizing; `-fno-builtin[-NAME]` and an
+incompatible declaration keep the bare name's call.
 
-
-The call always reaches the *library's* function, never an inline definition
-of the same name in the translation unit. That is the other half of what the
-fortified headers rely on: an `always_inline` `extern inline` `strncpy` whose
-body is `return __builtin_strncpy(...)` is not recursive, is inlined at every
-call site, and leaves behind a call to the external `strncpy`. A call to a
-function by its own name inside its own body is still recursion, as in gcc.
-
-| Builtin | Description |
-|---------|-------------|
-| `__builtin_abort()` | |
-| `__builtin_exit(status)` | |
-| `__builtin_trap()` | Abnormal termination; lowered to `abort` |
-| `__builtin_malloc(n)`, `__builtin_calloc(n, sz)`, `__builtin_realloc(p, n)`, `__builtin_free(p)` | The allocators. The three allocating forms return `void *` |
-| `__builtin_memcmp(a, b, n)` | |
-| `__builtin_strlen(s)`, `__builtin_strcmp(a, b)`, `__builtin_strncmp(a, b, n)` | |
-| `__builtin_strcpy(d, s)`, `__builtin_strncpy(d, s, n)`, `__builtin_stpcpy(d, s)` | `stpcpy` returns the end of the copy |
-| `__builtin_strcat(d, s)`, `__builtin_strncat(d, s, n)` | |
-| `__builtin_strchr(s, c)`, `__builtin_strrchr(s, c)`, `__builtin_strstr(h, n)` | |
-| `__builtin_printf(fmt, ...)`, `__builtin_sprintf(buf, fmt, ...)`, `__builtin_snprintf(buf, n, fmt, ...)` | Variadic after the format argument |
-| `__builtin_puts(s)`, `__builtin_putchar(c)` | |
-| `__builtin_fprintf(stream, fmt, ...)` | Variadic after the format argument |
-| `__builtin_fputs(s, stream)`, `__builtin_fputc(c, stream)` | |
-| `__builtin_fwrite(p, size, n, stream)` | Returns a size |
-| `__builtin_memchr(p, c, n)` | Returns `void *` |
-| `__builtin_index(s, c)`, `__builtin_rindex(s, c)` | The older spellings of `strchr`/`strrchr` |
-| `__builtin_strpbrk(s, set)` | |
-| `__builtin_strcasecmp(a, b)`, `__builtin_strncasecmp(a, b, n)` | The POSIX case-insensitive comparisons |
-| `__builtin_strndup(s, n)` | |
-| `__builtin_memcmp_eq(a, b, n)` | gcc's equality-only `memcmp`: it answers zero or non-zero rather than an ordering, which lets it use a wider compare. Answering the ordering as well implements it |
-| `__builtin_stpncpy(d, s, n)` | Like `strncpy`, returning the end of what it wrote |
-| `__builtin_strdup(s)` | |
-| `__builtin_bcmp(a, b, n)` | The older spelling of `memcmp` |
-| `__builtin_bzero(p, n)` | The older spelling of `memset(p, 0, n)`; returns `void` |
-| `__builtin_strspn(s, set)`, `__builtin_strcspn(s, set)` | Return a size, not a pointer |
-| `__builtin_printf_unlocked`, `__builtin_fprintf_unlocked`, `__builtin_fputs_unlocked` | glibc defines none of these, so a program using one supplies it — which is what gcc.c-torture's `builtins/` tests do |
-
-The return types matter and are modelled: the string family returns `char *`,
-the allocators return `void *`. Typing one of them `int` would
-truncate the returned address to 32 bits — a silent wrong answer, since the
-call still links and runs. So would getting the printf family's fixed-argument
-count wrong on Apple arm64, where variadic arguments go on the stack while
-fixed ones stay in registers.
+- `strlen`, `strnlen`, `strcmp`, `strncmp`, `memcmp`, `strchr`, `strrchr`,
+  `index`, `rindex`, `memchr`, `strstr`, `strpbrk`, `strcspn`
+  (`strings.rs`): computed where the arguments decide the result -- the
+  bytes of a string literal or of a `const` `char` array defined here, and
+  for `strlen`/`strnlen` a local array whose stores before the call are
+  constant. `strcmp(p, "")` is the first byte of `p`; `strstr(p, "c")` is
+  `strchr(p, 'c')`. `strnlen` has no `__builtin_` spelling.
+- A `strncmp` or `memcmp` of the constant length 0 is 0 at every level
+  (`fold_zero_length_compare`, in the parser).
+- `strcpy`, `stpcpy`, `strncpy`, `strcat`, `strncat`, `sprintf`
+  (`copies.rs`): with a source of known length (or a choice among strings
+  of one length), a `memcpy` of that length and the terminator; `strcat`
+  finds the end with `strlen`, `strncpy` pads with a `memset` up to 128
+  bytes, and `sprintf` of a format with no conversion, or of `"%s"`, answers
+  the length. An unused `stpcpy`, or `sprintf(d, "%s", s)`, of an unknown
+  `s` is `strcpy(d, s)`.
+- `printf`, `fprintf`, `vprintf`, `vfprintf`, `fputs`, their `_unlocked`
+  forms and `__printf_chk`, `__vprintf_chk`, `__fprintf_chk`,
+  `__vfprintf_chk` (`stdio.rs`), result unused: `printf("")` goes,
+  `printf("x")` is `putchar('x')`, `printf("text\n")` and `printf("%s\n", s)`
+  are `puts`, `printf("%c", c)` is `putchar(c)`; `fprintf(fp, "text")` and
+  `fprintf(fp, "%s", s)` are `fputs`, `fprintf(fp, "%c", c)` is `fputc`;
+  `fputs` of a known string is nothing, `fputc` or `fwrite`. The `v` forms
+  fold only a format without `%`; the `_unlocked` forms are only ever
+  dropped.
 
 ## Object Size and Fortification
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_object_size(ptr, type)` | Size of the object `ptr` points into |
-| `__builtin___memcpy_chk`, `__builtin___memmove_chk`, `__builtin___memset_chk` | Checked memory operations |
-| `__builtin___strcpy_chk`, `__builtin___strncpy_chk`, `__builtin___stpcpy_chk` | Checked string copies |
-| `__builtin___strcat_chk`, `__builtin___strncat_chk` | Checked string concatenation |
-| `__builtin___printf_chk`, `__builtin___fprintf_chk` | Checked formatted output |
-| `__builtin___sprintf_chk`, `__builtin___snprintf_chk`, `__builtin___vsnprintf_chk` | Checked formatted output to a buffer |
+| `__builtin_object_size(ptr, type)` | Bytes left in the object `ptr` points into, folded **at parse time** (`parse_object_size`) from what the expression shows: an array, a string literal, `&lvalue`, member and constant-index chains, casts and constant pointer arithmetic. Unknown is `(size_t)-1` for types 0/1 and 0 for 2/3. `type` must be an integer constant from 0 to 3 |
+| `__builtin___memcpy_chk`, `memmove_chk`, `mempcpy_chk`, `memset_chk` | Calls to `__memcpy_chk` etc. |
+| `__builtin___strcpy_chk`, `stpcpy_chk`, `strncpy_chk`, `stpncpy_chk`, `strcat_chk`, `strncat_chk` | |
+| `__builtin___printf_chk`, `fprintf_chk`, `sprintf_chk`, `snprintf_chk`, `vsprintf_chk`, `vsnprintf_chk` | |
 
-These exist so glibc's fortified headers compile: with `_FORTIFY_SOURCE` set,
-`<string.h>` and `<stdio.h>` rewrite their functions in terms of them.
+With `_FORTIFY_SOURCE` set and `-O`, glibc's fortified wrappers compile and
+emit `__*_chk` calls, but check nothing useful: a wrapper asks
+`__builtin_object_size` of its own parameter, which at parse time is
+unknown. Folding it after inlining is the remaining work; see the
+`_FORTIFY_SOURCE` entry in `DECISIONS.md`.
 
-`__builtin_object_size` computes real sizes — 10 for a `char[10]` — and the
-`_chk` family has the implicit declarations glibc's headers expect.
+## Atomic Builtins
 
-**Limit:** `-D_FORTIFY_SOURCE=2` now compiles glibc's fortified wrappers and
-emits `__*_chk` calls -- `__OPTIMIZE__` is predefined, and
-`__builtin_va_arg_pack` makes their argument forwarding compile. It still does
-not *check*: `__builtin_object_size` is folded at parse time, where a wrapper
-measuring its own parameter can only answer "unknown", and folding it after
-inlining is the remaining work. See the `_FORTIFY_SOURCE` entry in `DECISIONS.md`,
-which is where this is tracked; it was also `#C12` in the conformance audit until that
-file was narrowed to conformance findings alone.
-
-## C11 Atomic Builtins
+### C11 (clang's `__c11_atomic_*`, behind `<stdatomic.h>`)
 
 | Builtin | Description |
 |---------|-------------|
-| `__c11_atomic_init(ptr, val)` | Non-atomic initialization |
-| `__c11_atomic_load(ptr, order)` | Atomic load |
-| `__c11_atomic_store(ptr, val, order)` | Atomic store |
-| `__c11_atomic_exchange(ptr, val, order)` | Atomic swap, returns old value |
-| `__c11_atomic_compare_exchange_strong(ptr, exp, des, succ, fail)` | Strong CAS |
-| `__c11_atomic_compare_exchange_weak(ptr, exp, des, succ, fail)` | Weak CAS |
-| `__c11_atomic_fetch_add(ptr, val, order)` | Atomic add, returns old value |
-| `__c11_atomic_fetch_sub(ptr, val, order)` | Atomic subtract, returns old value |
-| `__c11_atomic_fetch_and(ptr, val, order)` | Atomic AND, returns old value |
-| `__c11_atomic_fetch_or(ptr, val, order)` | Atomic OR, returns old value |
-| `__c11_atomic_fetch_xor(ptr, val, order)` | Atomic XOR, returns old value |
-| `__c11_atomic_thread_fence(order)` | Thread memory fence |
-| `__c11_atomic_signal_fence(order)` | Compiler barrier (signal fence) |
+| `__c11_atomic_init(ptr, val)` | A relaxed atomic store |
+| `__c11_atomic_load(ptr, order)` | `Opcode::AtomicLoad` |
+| `__c11_atomic_store(ptr, val, order)` | `Opcode::AtomicStore` |
+| `__c11_atomic_exchange(ptr, val, order)` | `Opcode::AtomicSwap`; returns the old value |
+| `__c11_atomic_compare_exchange_strong(ptr, exp, des, succ, fail)`, `_weak` | `Opcode::AtomicCas`; returns `_Bool`. The two orders combine into one (Memory orders, below); weak is implemented as strong |
+| `__c11_atomic_fetch_add`, `sub`, `and`, `or`, `xor` | `Opcode::AtomicFetchAdd` etc.; return the old value |
+| `__c11_atomic_thread_fence(order)` | `Opcode::Fence` |
+| `__c11_atomic_signal_fence(order)` | `Opcode::Fence` with `fence_scope` `Signal`: the same compiler barrier to every IR pass, and no instruction at any order, as in gcc |
 
-## GNU Atomic Builtins
+`<stdatomic.h>` maps the standard names to these. `_Atomic` objects accessed
+through ordinary operators are lowered to the same instructions.
 
-gcc's own spellings, which real C reaches for directly: `pycore_atomic.h`,
-`valgrind/config.h` and `pyconfig.h` all use them, so a translation unit that
-includes one of those did not compile without them.
+### GNU (`__atomic_*`, `__sync_*`)
 
 | Builtin | Description |
 |---------|-------------|
 | `__atomic_load_n(p, order)`, `__atomic_store_n(p, v, order)` | |
-| `__atomic_exchange_n(p, v, order)` | Swap, returning the old value |
-| `__atomic_compare_exchange_n(p, expected, desired, weak, succ, fail)` | `expected` is a pointer, and the observed value is written back through it on failure |
-| `__atomic_fetch_add/sub/and/or/xor/nand(p, v, order)` | Returns the value **before** |
-| `__atomic_add/sub/and/or/xor/nand_fetch(p, v, order)` | Returns the value **after** |
-| `__atomic_test_and_set(p, order)`, `__atomic_clear(p, order)` | |
-| `__atomic_thread_fence(order)`, `__atomic_signal_fence(order)` | |
-| `__atomic_always_lock_free(size, p)`, `__atomic_is_lock_free(size, p)` | Answered from the size: 1, 2, 4 and 8 are lock-free |
-| `__sync_fetch_and_add/sub/and/or/xor/nand(p, v, ...)` | Sequentially consistent, returning the value before |
-| `__sync_add/sub/and/or/xor/nand_and_fetch(p, v, ...)` | The same, returning the value after |
-| `__sync_bool_compare_and_swap(p, old, new)` | Whether the exchange happened. `old` arrives **by value**, unlike the C11 and `__atomic_` forms |
-| `__sync_val_compare_and_swap(p, old, new)` | The object's previous value |
-| `__sync_lock_test_and_set(p, v)`, `__sync_lock_release(p)` | An exchange and a store of zero |
-| `__sync_synchronize()` | A full fence |
+| `__atomic_exchange_n(p, v, order)` | Returns the old value |
+| `__atomic_compare_exchange_n(p, expected, desired, weak, succ, fail)` | `expected` is a pointer, written back on failure; returns `int` (gcc: `bool`). `weak` only picks the node; both are strong |
+| `__atomic_fetch_add/sub/and/or/xor/nand(p, v, order)` | Returns the value before |
+| `__atomic_add/sub/and/or/xor/nand_fetch(p, v, order)` | Returns the value after |
+| `__atomic_test_and_set(p, order)`, `__atomic_clear(p, order)` | An exchange of 1 into the byte at `p`, compared with 0; a store of 0 into it. One byte, whatever `p` points to, as in gcc |
+| `__atomic_thread_fence(order)`, `__atomic_signal_fence(order)` | As the C11 fences |
+| `__atomic_always_lock_free(size, p)`, `__atomic_is_lock_free(size, p)` | Answered by the parser from the size (`target::atomic_is_lock_free`: 1, 2, 4, 8); `p` is checked and discarded. The `always` form requires a constant size; `is_lock_free` answers 0 for one that is not |
+| `__sync_fetch_and_add/sub/and/or/xor/nand(p, v, ...)` | Returns the value before |
+| `__sync_add/sub/and/or/xor/nand_and_fetch(p, v, ...)` | Returns the value after |
+| `__sync_bool_compare_and_swap(p, old, new)` | Whether the exchange happened; `old` is a value, not a pointer |
+| `__sync_val_compare_and_swap(p, old, new)` | The previous value |
+| `__sync_lock_test_and_set(p, v)`, `__sync_lock_release(p)` | A seq-cst exchange; a seq-cst store of 0 |
+| `__sync_synchronize()` | A seq-cst fence |
 
-`nand` is `~(old & val)` and has no instruction on any target, so it is always
-the compare-exchange loop -- the same loop the other operations fall back to,
-with one more instruction inside it.
+The `__sync_*` forms accept and ignore gcc's trailing variable list. The
+read-modify-write forms (`ExprKind::GnuAtomicRmw`) go through
+`emit_atomic_rmw`, as `_Atomic` compound assignment does: a native
+`AtomicFetch*` where one computes the operation exactly, otherwise a
+compare-exchange loop -- always for `nand` (`~(old & val)`). `*_and_fetch`
+re-applies the operation to the returned old value, so `v` is evaluated once.
+`__GCC_HAVE_SYNC_COMPARE_AND_SWAP_{1,2,4,8}` is predefined.
 
-The `__sync_*` family predates the C11 orders and is sequentially consistent;
-each also accepts the trailing list of variables gcc documents and ignores.
+### Memory orders
 
-An `__atomic_*` builtin's `order` argument is honoured by the load, store,
-exchange and compare-exchange forms, which carry it into the instruction. The
-**read-modify-write forms discard it** and are sequentially consistent
-whatever it says: they go through `emit_atomic_rmw`, which an `_Atomic`
-compound assignment also uses, and that is seq-cst by C17 6.5.16.2p3. A
-stronger order than the one asked for is always correct and never wrong, so
-this costs speed and not meaning -- but it does mean
-`__atomic_fetch_add(p, v, __ATOMIC_RELAXED)` is not relaxed while
-`__atomic_load_n(p, __ATOMIC_RELAXED)` is. Recorded in TODO.md.
+An order argument is evaluated for its side effects, and read as gcc reads
+it (`Linearizer::atomic_order`): an integer constant expression names the
+order (`__ATOMIC_*` and the `memory_order_*` enumerators both are); anything
+else is seq-cst. An order out of range, or one the operation cannot have, is
+seq-cst with gcc's `-Winvalid-memory-model` warning: a load takes relaxed,
+consume, acquire and seq-cst; a store (`__atomic_clear` included) relaxed,
+release and seq-cst; a read-modify-write and a fence any order. `_Atomic`
+operators are seq-cst (C17 6.5.16.2p3).
 
-`*_and_fetch` re-applies the operation to the value the exchange returned. That
-is arithmetic on a value already in hand rather than a second access to the
-object, and it reuses the operand *pseudo*, so `__sync_add_and_fetch(p, f())`
-calls `f` exactly once.
+A compare-exchange runs one instruction sequence for both outcomes, so its
+two orders combine into the one recorded (`Linearizer::cas_order`), by
+gcc's rules: a failure order of release or acq-rel, or one stronger than
+the success order (consume counting as acquire), makes it seq-cst, with the
+warning; a release success with an acquiring failure is acq-rel; otherwise
+the success order stands. A weak compare-exchange is implemented as strong.
 
-`__GCC_HAVE_SYNC_COMPARE_AND_SWAP_{1,2,4,8}` is predefined, because it is now
-a true statement about this compiler. It was withdrawn while the family was
-unimplemented: a guarded `#ifdef` otherwise opened a branch that failed on an
-undeclared identifier when the `#else` beside it would have compiled.
+Each back end maps an order to instructions in one place, matching gcc
+(aarch64 without LSE and outline atomics):
 
-The `<stdatomic.h>` header maps the standard C11 names (`atomic_load`, `atomic_store`, etc.) to these builtins. `_Atomic` objects accessed through
-ordinary operators — assignment, compound assignment, `++`/`--`, and plain
-reads — are lowered to the same atomic instructions, so the builtins are not
-the only way to reach them.
+| | x86-64 (`orders_store_then_load`) | aarch64 (`Ordering`, `fence_barrier`) |
+|---|---|---|
+| load | `mov` | `ldr`; `ldar` when acquiring (consume, acquire, seq-cst) |
+| store | `mov`; `xchg` for seq-cst | `str`; `stlr` when releasing (release, seq-cst) |
+| exchange, fetch-op, compare-exchange | `lock`-prefixed (or `xchg`) at every order | `ldxr`/`stxr` loop; `ldaxr` when acquiring, `stlxr` when releasing |
+| fence | nothing; `mfence` for seq-cst | nothing for relaxed; `dmb ishld` for consume, acquire; `dmb ish` otherwise |
 
-## Not implemented
+`nand`, and an operation with no native form, is a compare-exchange loop at
+the requested order, seeded by a load at the half of it a load can have.
 
-Worth stating because their absence is silent and changes which branch a
-system header takes.
+## Not Implemented
+
+Their absence is silent and changes which branch a guarded header takes.
 
 | Builtin | Consequence |
 |---------|-------------|
+| `__builtin_dynamic_object_size` | glibc's `_FORTIFY_SOURCE=3` falls back to `__builtin_object_size` |
+| `__builtin_setjmp`, `__builtin_longjmp` | Use `setjmp`/`longjmp`, which are builtins (above) |
+| `__builtin_strnlen`, `__builtin_vprintf`, `__builtin_vfprintf` | `strnlen`, `vprintf`, `vfprintf` are known by their bare names only |
 | `__builtin_clear_padding` | Would have to walk a type to find its padding |
-| `__builtin_setjmp` | Not implemented; the ordinary `setjmp`/`longjmp` are |
-| `__builtin_issignaling` | Distinguishes a signalling NaN from a quiet one. No system header uses it -- `<math.h>` has `issignaling` as its own macro -- so nothing fails to build without it |
-| `__builtin_stack_save`, `__builtin_stack_restore` | The marks gcc puts around a VLA's lifetime. c17 frees a VLA at the end of its block without them |
-| `__builtin_cexpi`, `__builtin_cpow` | Complex libm entry points gcc synthesizes; neither is declared by any header |
+| `__builtin_issignaling` | `<math.h>` defines `issignaling` itself, so nothing fails to build |
+| `__builtin_stack_save`, `__builtin_stack_restore` | c17 frees a VLA at the end of its block without them. The IR has `StackSave`/`StackRestore` for inlining, but no builtin reaches them |
+| `__builtin_cexpi`, `__builtin_cpow` | Complex libm entry points gcc synthesizes; no header declares them |
+| `__builtin_bswap128` | No 128-bit byte swap |
 
-`__real__` and `__imag__` used to be listed here and are **implemented** — see
-`#C29` in git log.
+## Adding a Builtin
+
+Every kind starts the same way.
+
+1. **Name.** Add `(BUILTIN_FOO, "__builtin_foo", BUILTIN)` to
+   `define_keywords!` in `kw.rs` (position does not matter; ids are looked
+   up by spelling). A bare spelling the parser must match by id gets its own
+   entry tagged `0`, so `__has_builtin` does not answer for it.
+2. **`__has_builtin`.** Add the spelling to `SUPPORTED_BUILTINS` in
+   `builtins.rs`. `test_supported_builtins_match_kw_tags` and
+   `test_kw_builtin_tags_are_all_registered` fail until the two lists agree.
+   A target-dependent builtin also needs a case in `available_on`.
+3. **Parse.** Add an arm to the family function that fits
+   (`parse_float_builtin`, `parse_misc_builtin`, `parse_atomic_builtin`, ...
+   in `parse/builtin_expr.rs`; `parse_generic_builtin` in
+   `parse/generic_builtin.rs`), all reached from `parse_builtin_expr`. A
+   builtin gcc declares with a prototype is parsed by
+   `parse_prototyped_builtin`, which checks and converts the arguments as a
+   call does; a type-generic one by `parse_generic_builtin_args`, which
+   checks the count, and then by gcc's rules for it, built from the helpers
+   in `parse/builtin_args.rs` (`require_floating_argument`, `is_integral`,
+   `constant_argument` for an argument that must be an integer constant).
+   Report in gcc's wording with `diag::error` / `diag::error_args` (or
+   `ParseError::new` if parsing cannot continue), and answer
+   `diagnosed_call` for a rejected call; build the node with `typed_expr`. A builtin of one
+   argument with a prototype, like the bit builtins, is a row in
+   `BIT_BUILTINS` (`parse/bit_builtin.rs`) instead, which checks and converts
+   the argument as a call does. An argument you drop
+   must keep its side effects: wrap it in `ExprKind::Comma` unless
+   `is_literal_constant` says it has none.
+
+### (a) Folded or rewritten in the parser
+
+Return a literal (`ExprKind::IntLit`, `FloatLit`) or an existing node
+(`__builtin_parity` builds `Popcount & 1`; `__sync_synchronize` builds a
+`C11AtomicThreadFence`). Nothing past the parser changes. If the result must
+be an integer constant expression or a static initializer and is not a
+literal, teach `constexpr.rs` (`eval`, `eval_float`) the node. Floating
+constants go in `FLOAT_CONSTANT_BUILTINS`.
+
+### (b) A new IR opcode
+
+1. **AST.** Add an `ExprKind` variant in `parse/ast.rs`, and to every match
+   the compiler then flags: `Expr::operands` (`parse/ast.rs`),
+   `extract_calls_from_expr` (`cflow.rs`), `extract_refs_from_expr`
+   (`cxref.rs`), `is_pure_expr` and `linearize_expr` (`ir/linearize.rs`).
+   Reusing an existing node avoids all of this.
+2. **Linearize.** Add a case to `linearize_builtin` (or a `linearize_*`
+   helper) that linearizes the operands, converts them if the parser did
+   not, and emits `Instruction::new(Opcode::Foo)` with `with_target`,
+   `with_src`, `with_type_and_size` (result type and width). If the operand
+   type differs from the result's, set `src_typ`/`src_size`.
+3. **Opcode.** Add the variant to `Opcode` in `ir/mod.rs`, its dump spelling
+   in `Opcode::name`, and a row in the opcode table in `ir/README.md`. Then
+   decide each predicate:
+   - `is_terminator` if control does not fall through;
+   - `may_access_memory` if it reads or writes memory, and then also
+     `has_side_effects` (validator invariant I5) unless it is a pure load;
+   - `has_side_effects` if it must not be deleted when its result is unused;
+   - `Instruction::is_memory_barrier` if memory operations may not move
+     across it (I2 requires it also be in `has_side_effects`);
+   - `reads_another_type` if its operand type differs from its result type
+     (I10 then requires `src_typ`/`src_size` on every instance);
+   - `is_libm` if it computes a libm function a target may lack (it must
+     then carry the library name via `with_func`, read back by
+     `Instruction::library_callee`);
+   - `is_atomic` for an atomic memory operation (the allocator reserves
+     scratch registers for these).
+
+   A placeholder resolved before code generation (like `ConstantP`, answered
+   in `sccp` and `ir::lower`) must be added to `check_no_placeholders` (I4).
+4. **Optimizer.** Nothing folds an opcode it does not know: `sccp::transfer`
+   treats it as overdefined. If it can fold, add it to `constfold.rs`
+   (`eval_unop`, `eval_funop`, `eval_fbinop`, `eval_fcvt`) and to the
+   opcode list in `sccp::transfer`; algebraic simplifications go in
+   `instcombine::try_simplify`. A memory-touching opcode is opaque to
+   `effects::insn_effect` (`MemEffect::Unknown`), `escape.rs`, `loadfwd.rs`
+   and `dse.rs` until taught otherwise -- conservative, but teach them if it
+   matters (`Memcpy`/`Memset`/`Memmove` are the examples).
+5. **Target mapping.** If a target has no instruction for it: a libm opcode
+   gets a case in each `ArchMapper::computes_in_place`
+   (`arch/x86_64/mapping.rs`, `arch/aarch64/mapping.rs`), and
+   `call_library_fallbacks` turns it into a call after the optimizer; any
+   other expansion goes in that target's `ArchMapper::map_insn`.
+6. **Back ends.** Add an arm to `emit_insn` in `arch/x86_64/codegen.rs` and
+   `arch/aarch64/codegen.rs`, with the emitter in that target's
+   `features.rs` (or `float.rs`, `atomic.rs`). Both `emit_insn`s end in
+   `_ => {}`, so a missing arm silently emits nothing. Fixed registers the
+   lowering clobbers go in `opcode_constraints` / `opcode_clobbers_r10_r11`
+   (x86-64) or `get_constraint_info_aarch64` /
+   `opcode_clobbers_aarch64_scratches`; a lowering that calls a function
+   goes in `is_call_like_x86_64` / `is_call_like_aarch64`. Name any library
+   callee through `Linearizer::library_function_name`, never a literal in
+   the back end, so an asm label on the declaration is honoured. On aarch64,
+   out-of-range immediates and offsets are legalized in
+   `arch/aarch64/legalize.rs`, not at the call site.
+
+### (c) A library function
+
+1. **Name.** The `__builtin_` spelling tagged `BUILTIN`, plus the bare name
+   tagged `0` (named if a table refers to it).
+2. **Called.** Add the `BUILTIN_` id to `is_library_builtin` in
+   `parse/builtin_expr.rs`. Then give it a prototype, best first:
+   - a `known(...)` row in `LIBRARY_BUILTINS` (`parse/library_builtin.rs`),
+     which declares it with the real prototype, checks calls, and tags them
+     with a new `LibFn` variant (`parse/ast.rs`; add it to `LibFn::only_reads`
+     if it writes no memory);
+   - otherwise a `plain(...)` row, which declares it with its prototype and
+     checks calls, but tells the optimizer nothing.
+3. **Folded.** For a `LibFn`, add the fold to the family module in
+   `ir/libcall_fold/` and dispatch it from `fold` in
+   `ir/libcall_fold/mod.rs`. A fold that emits a call to a function no fold
+   called before adds that name to `FOLD_CALLEES` (`ir/mod.rs`).
+4. **Computed in place.** Instead of `known`, an `entry(...)` row with a new
+   `InlineLibraryFn` variant, and decide its `arity`, `has_side_effects`,
+   `yields_to_a_definition` and `narrows_exactly`; its level policy in
+   `LibraryCallPolicy::in_place`; its computation in
+   `compute_library_call` (`ir/linearize.rs`), usually a new opcode as in
+   (b); and its constant fold in `constexpr.rs` (the `InlineLibraryCall`
+   arms) so a static initializer accepts it.
+
+### Tests
+
+Per `cc/CLAUDE.md`, every change has unit and end-to-end tests.
+
+- **Parser**: `parse/test_parser.rs` (e.g. `test_builtin_nan`), for the node,
+  type and diagnostics. `parse/library_builtin.rs` has table invariants
+  (`every_entry_takes_what_its_lowering_consumes`).
+- **`__has_builtin`**: `token/test_preprocess.rs`, and
+  `tests/builtins/has_feature.rs`.
+- **IR**: when the IR changes, `ir/test_linearize.rs` for the emitted opcode
+  (`test_frame_address_emits_opcode`, `test_memory_builtins_are_their_opcodes`)
+  and unit tests in the pass that folds or simplifies it (`constfold.rs`,
+  `sccp.rs`, `instcombine.rs`, `libcall_fold/`); a target-mapping change
+  tests in `arch/*/mapping.rs`.
+- **End to end**: `tests/builtins/<topic>.rs`. Use
+  `compile_and_run_everywhere`, which runs at `-O0` and `-O2` on the host and
+  under qemu on aarch64 when the cross toolchain is present -- `compile_and_run`
+  alone never exercises the other back end, and `compile_and_run_optimized`
+  is only `-O1`. Use `compile_expect_error` / `compile_expect_warning` for
+  diagnostics, and compare against gcc before trusting an expected value.

@@ -42,14 +42,14 @@ type Arg = (PseudoId, TypeId);
 
 /// What the call `insn` to `f`, one of the output functions, folds to.
 pub(super) fn fold(f: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded> {
-    if !facts.result_unused(insn) || insn.src.len() != insn.arg_types.len() {
+    if !facts.result_unused(insn) || insn.src.len() != insn.extra().arg_types.len() {
         return None;
     }
     let args: Vec<Arg> = insn
         .src
         .iter()
         .copied()
-        .zip(insn.arg_types.iter().copied())
+        .zip(insn.extra().arg_types.iter().copied())
         .collect();
     match (f, args.as_slice()) {
         (LibFn::Fputs, &[(s, _), fp]) => fputs(facts, s, fp, Locking::Locked),
@@ -600,11 +600,11 @@ mod tests {
         let puts = calls
             .iter()
             .copied()
-            .find(|c| c.func_name.as_deref() == Some("puts"))
+            .find(|c| c.extra().func_name.as_deref() == Some("puts"))
             .expect("the newline form becomes puts");
-        assert_eq!(puts.func_name.as_deref(), Some("puts"));
-        assert_eq!(puts.known, Some(LibFn::Puts));
-        assert!(puts.abi_info.is_some());
+        assert_eq!(puts.extra().func_name.as_deref(), Some("puts"));
+        assert_eq!(puts.extra().known, Some(LibFn::Puts));
+        assert!(puts.extra().abi_info.is_some());
         assert_eq!(puts.target, None);
         assert!(!insns
             .iter()
@@ -647,7 +647,7 @@ mod tests {
         let insns = run_on(&mut fx, &[]);
         let calls = calls(&insns);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].func_name.as_deref(), Some("fwrite"));
+        assert_eq!(calls[0].extra().func_name.as_deref(), Some("fwrite"));
         assert_eq!((calls[0].typ, calls[0].size), (Some(fx.types.ulong_id), 64));
         assert_eq!(calls[0].src[3], fp.0);
     }

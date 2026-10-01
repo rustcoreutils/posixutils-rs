@@ -21,7 +21,7 @@ use crate::parse::ast::{
 use crate::strings::StringTable;
 use crate::symbol::Symbol;
 use crate::target::{Arch, Os, Target};
-use crate::types::{CompositeType, StructMember, Type, TypeTable};
+use crate::types::{CompositeType, MemberAlign, StructMember, Type, TypeTable};
 
 /// Create a default position for test code
 fn test_pos() -> Position {
@@ -88,6 +88,18 @@ impl TestContext {
     }
 }
 
+/// Whether any instruction of `module` is one of `ops`: the structural form
+/// of asking a dump whether an opcode's name appears in it, which a longer
+/// name or an operand containing it would also answer.
+fn has_op(module: &Module, ops: &[Opcode]) -> bool {
+    module
+        .functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insns)
+        .any(|i| ops.contains(&i.op))
+}
+
 fn test_linearize(tu: &TranslationUnit, types: &TypeTable, strings: &StringTable) -> Module {
     let symbols = SymbolTable::new();
     let target = Target::host();
@@ -150,7 +162,7 @@ fn test_parameter_stored_to_local() {
     // The parameter should be stored to a local variable
     // Look for store instruction in the entry block
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Parameter should be stored to local for SSA: {}",
         ir
     );
@@ -208,7 +220,11 @@ fn test_function_with_many_params() {
     assert!(ir.contains("%a"), "IR should have first param: {}", ir);
     assert!(ir.contains("%h"), "IR should have last param: {}", ir);
     // Should have add operation for a + h
-    assert!(ir.contains("add"), "IR should have add for a + h: {}", ir);
+    assert!(
+        has_op(&module, &[Opcode::Add]),
+        "IR should have add for a + h: {}",
+        ir
+    );
 }
 
 // Compound assignment lvalue tests
@@ -269,17 +285,17 @@ fn test_compound_assignment_deref() {
 
     // The IR should have load and store for the dereferenced pointer
     assert!(
-        ir.contains("load"),
+        has_op(&module, &[Opcode::Load]),
         "Compound assignment to *p should load: {}",
         ir
     );
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Compound assignment to *p should store: {}",
         ir
     );
     assert!(
-        ir.contains("add"),
+        has_op(&module, &[Opcode::Add]),
         "Compound assignment += should have add: {}",
         ir
     );
@@ -351,12 +367,12 @@ fn test_compound_assignment_index() {
     // The IR should have load and store for the array element
     // Also should have index calculation (mul for offset)
     assert!(
-        ir.contains("load"),
+        has_op(&module, &[Opcode::Load]),
         "Compound assignment to arr[i] should load: {}",
         ir
     );
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Compound assignment to arr[i] should store: {}",
         ir
     );
@@ -419,7 +435,7 @@ fn test_simple_array_element_store() {
 
     // Should have a store for the array element assignment
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Array element assignment should produce store: {}",
         ir
     );
@@ -603,7 +619,7 @@ fn test_switch_basic() {
 
     // Switch should generate switch instruction
     assert!(
-        ir.contains("switch"),
+        has_op(&module, &[Opcode::Switch]),
         "Switch statement should produce switch instruction: {}",
         ir
     );
@@ -684,12 +700,12 @@ fn test_switch_with_break() {
 
     // Should have switch and branch instructions
     assert!(
-        ir.contains("switch"),
+        has_op(&module, &[Opcode::Switch]),
         "Switch statement should produce switch instruction: {}",
         ir
     );
     assert!(
-        ir.contains("br"),
+        has_op(&module, &[Opcode::Br]),
         "Break should produce branch instruction: {}",
         ir
     );
@@ -771,14 +787,14 @@ fn test_do_while_basic() {
 
     // Should have conditional branch for the while condition
     assert!(
-        ir.contains("cbr"),
+        has_op(&module, &[Opcode::Cbr]),
         "Do-while should produce conditional branch: {}",
         ir
     );
 
     // Should have comparison for x < 10
     assert!(
-        ir.contains("setlt"),
+        has_op(&module, &[Opcode::SetLt]),
         "Do-while condition should have comparison: {}",
         ir
     );
@@ -852,14 +868,14 @@ fn test_do_while_with_break() {
 
     // Break should generate unconditional branch
     assert!(
-        ir.contains("br"),
+        has_op(&module, &[Opcode::Br]),
         "Break in do-while should produce branch: {}",
         ir
     );
 
     // Should have conditional branch for the if
     assert!(
-        ir.contains("cbr"),
+        has_op(&module, &[Opcode::Cbr]),
         "If statement should produce conditional branch: {}",
         ir
     );
@@ -934,7 +950,7 @@ fn test_goto_forward() {
 
     // Goto should produce unconditional branch
     assert!(
-        ir.contains("br"),
+        has_op(&module, &[Opcode::Br]),
         "Goto should produce branch instruction: {}",
         ir
     );
@@ -1019,14 +1035,14 @@ fn test_goto_backward() {
 
     // Should have conditional branch for the if
     assert!(
-        ir.contains("cbr"),
+        has_op(&module, &[Opcode::Cbr]),
         "Backward goto pattern should have conditional branch: {}",
         ir
     );
 
     // Should have unconditional branch for the goto
     assert!(
-        ir.contains("br "),
+        has_op(&module, &[Opcode::Br]),
         "Goto should produce unconditional branch: {}",
         ir
     );
@@ -1098,7 +1114,7 @@ fn test_nested_loop_break() {
     // Should have setval for constant 1 (proves inner break doesn't skip x = 1 assignment)
     // After SSA conversion, the store becomes a setval + nop/copy
     assert!(
-        ir.contains("setval"),
+        has_op(&module, &[Opcode::SetVal]),
         "Inner break should not skip x = 1 assignment (setval for const 1): {}",
         ir
     );
@@ -1201,7 +1217,7 @@ fn test_nested_loop_continue() {
     // Should have setval for constant 1 (proves inner continue doesn't skip x = 1 assignment)
     // After SSA conversion, the store becomes a setval + nop/copy
     assert!(
-        ir.contains("setval"),
+        has_op(&module, &[Opcode::SetVal]),
         "Inner continue should not skip x = 1 assignment (setval for const 1): {}",
         ir
     );
@@ -1252,7 +1268,7 @@ fn test_unary_logical_not() {
 
     // Logical not should produce seteq (comparison to zero)
     assert!(
-        ir.contains("seteq"),
+        has_op(&module, &[Opcode::SetEq]),
         "Logical NOT should produce seteq instruction: {}",
         ir
     );
@@ -1301,7 +1317,7 @@ fn test_unary_bitwise_not() {
 
     // Bitwise not should produce not instruction
     assert!(
-        ir.contains("not"),
+        has_op(&module, &[Opcode::Not]),
         "Bitwise NOT should produce not instruction: {}",
         ir
     );
@@ -1350,7 +1366,7 @@ fn test_unary_negate() {
 
     // Negation should produce neg instruction
     assert!(
-        ir.contains("neg"),
+        has_op(&module, &[Opcode::Neg]),
         "Unary negation should produce neg instruction: {}",
         ir
     );
@@ -1400,14 +1416,14 @@ fn test_pre_increment() {
 
     // Pre-increment should produce add instruction
     assert!(
-        ir.contains("add"),
+        has_op(&module, &[Opcode::Add]),
         "Pre-increment should produce add instruction: {}",
         ir
     );
 
     // Should store the incremented value
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Pre-increment should store new value: {}",
         ir
     );
@@ -1459,14 +1475,14 @@ fn test_pointer_add_int() {
 
     // Pointer addition should have multiplication for scaling
     assert!(
-        ir.contains("mul"),
+        has_op(&module, &[Opcode::Mul]),
         "Pointer add should scale by element size (mul): {}",
         ir
     );
 
     // Should have add instruction
     assert!(
-        ir.contains("add"),
+        has_op(&module, &[Opcode::Add]),
         "Pointer add should have add instruction: {}",
         ir
     );
@@ -1528,14 +1544,14 @@ fn test_pointer_difference() {
 
     // Pointer difference should have subtraction
     assert!(
-        ir.contains("sub"),
+        has_op(&module, &[Opcode::Sub]),
         "Pointer difference should have sub instruction: {}",
         ir
     );
 
     // Should have division for scaling (divs for signed division)
     assert!(
-        ir.contains("div"),
+        has_op(&module, &[Opcode::DivS, Opcode::DivU]),
         "Pointer difference should divide by element size: {}",
         ir
     );
@@ -1594,7 +1610,7 @@ fn test_float_add() {
 
     // Float addition should produce fadd instruction
     assert!(
-        ir.contains("fadd"),
+        has_op(&module, &[Opcode::FAdd]),
         "Float addition should produce fadd instruction: {}",
         ir
     );
@@ -1652,7 +1668,17 @@ fn test_float_comparison() {
 
     // Float comparison should produce fcmp instruction
     assert!(
-        ir.contains("fcmp"),
+        has_op(
+            &module,
+            &[
+                Opcode::FCmpOEq,
+                Opcode::FCmpONe,
+                Opcode::FCmpOLt,
+                Opcode::FCmpOLe,
+                Opcode::FCmpOGt,
+                Opcode::FCmpOGe
+            ]
+        ),
         "Float comparison should produce fcmp instruction: {}",
         ir
     );
@@ -1702,7 +1728,7 @@ fn test_float_to_int_cast() {
 
     // Float-to-int cast should produce fcvts instruction
     assert!(
-        ir.contains("fcvts"),
+        has_op(&module, &[Opcode::FCvtS]),
         "Float-to-int cast should produce fcvts instruction: {}",
         ir
     );
@@ -1752,7 +1778,7 @@ fn test_int_to_float_cast() {
 
     // Int-to-float cast should produce scvtf instruction
     assert!(
-        ir.contains("scvtf"),
+        has_op(&module, &[Opcode::SCvtF]),
         "Int-to-float cast should produce scvtf instruction: {}",
         ir
     );
@@ -1787,8 +1813,7 @@ fn test_linearize_return() {
     };
 
     let module = test_linearize(&tu, &types, &strings);
-    let ir = format!("{}", module.display(&types));
-    assert!(ir.contains("ret"));
+    assert!(has_op(&module, &[Opcode::Ret]));
 }
 
 #[test]
@@ -1813,7 +1838,7 @@ fn test_linearize_if() {
     // other arm is not emitted at all.
     let module = test_linearize(&tu, &types, &strings);
     let ir = format!("{}", module.display(&types));
-    assert!(!ir.contains("cbr"), "{ir}");
+    assert!(!has_op(&module, &[Opcode::Cbr]), "{ir}");
     let rets = module.functions[0]
         .blocks
         .iter()
@@ -1830,7 +1855,7 @@ fn calls_in(module: &Module, f: &str) -> Vec<String> {
         .iter()
         .flat_map(|bb| bb.insns.iter())
         .filter(|i| i.op == Opcode::Call)
-        .filter_map(|i| i.func_name.clone())
+        .filter_map(|i| i.extra().func_name.clone())
         .collect()
 }
 
@@ -2052,9 +2077,8 @@ fn test_linearize_binary_expr() {
     };
 
     let module = test_linearize(&tu, &types, &strings);
-    let ir = format!("{}", module.display(&types));
-    assert!(ir.contains("mul"));
-    assert!(ir.contains("add"));
+    assert!(has_op(&module, &[Opcode::Mul]));
+    assert!(has_op(&module, &[Opcode::Add]));
 }
 
 #[test]
@@ -2100,7 +2124,7 @@ fn test_linearize_function_with_params() {
 
     let module = ctx.linearize(&tu);
     let ir = format!("{}", module.display(&ctx.types));
-    assert!(ir.contains("add"));
+    assert!(has_op(&module, &[Opcode::Add]));
     assert!(ir.contains("%a"));
     assert!(ir.contains("%b"));
 }
@@ -2130,7 +2154,7 @@ fn test_linearize_call() {
 
     let module = ctx.linearize(&tu);
     let ir = format!("{}", module.display(&ctx.types));
-    assert!(ir.contains("call"));
+    assert!(has_op(&module, &[Opcode::Call]));
     assert!(ir.contains("foo"));
 }
 
@@ -2154,8 +2178,7 @@ fn test_linearize_comparison() {
     };
 
     let module = test_linearize(&tu, &types, &strings);
-    let ir = format!("{}", module.display(&types));
-    assert!(ir.contains("setlt"));
+    assert!(has_op(&module, &[Opcode::SetLt]));
 }
 
 #[test]
@@ -2182,7 +2205,7 @@ fn test_linearize_unsigned_comparison() {
     let ir = format!("{}", module.display(&types));
     // Should use unsigned comparison opcode (setb = set if below)
     assert!(
-        ir.contains("setb"),
+        has_op(&module, &[Opcode::SetB]),
         "Expected 'setb' for unsigned comparison, got:\n{}",
         ir
     );
@@ -2205,7 +2228,7 @@ fn test_display_module() {
     assert!(ir.contains("define"));
     assert!(ir.contains("main"));
     assert!(ir.contains(".L0:")); // Entry block label
-    assert!(ir.contains("ret"));
+    assert!(has_op(&module, &[Opcode::Ret]));
 }
 
 #[test]
@@ -2306,12 +2329,12 @@ fn test_local_var_emits_load_store() {
     let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let ir = format!("{}", module.display(&ctx.types));
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Should have store instruction before SSA: {}",
         ir
     );
     assert!(
-        ir.contains("load"),
+        has_op(&module, &[Opcode::Load]),
         "Should have load instruction before SSA: {}",
         ir
     );
@@ -2386,7 +2409,7 @@ fn test_ssa_converts_local_to_phi() {
 
     // Should have a phi instruction
     assert!(
-        ir.contains("phi"),
+        has_op(&module, &[Opcode::Phi]),
         "SSA should insert phi node at merge point: {}",
         ir
     );
@@ -2453,7 +2476,11 @@ fn test_ssa_loop_variable() {
     let ir = format!("{}", module.display(&ctx.types));
 
     // Loop should have a phi at the condition block
-    assert!(ir.contains("phi"), "Loop should have phi node: {}", ir);
+    assert!(
+        has_op(&module, &[Opcode::Phi]),
+        "Loop should have phi node: {}",
+        ir
+    );
 }
 
 #[test]
@@ -2509,12 +2536,12 @@ fn test_short_circuit_and() {
     // 1. A conditional branch (cbr) to skip evaluation of b if a is false
     // 2. A phi node to merge the result
     assert!(
-        ir.contains("cbr"),
+        has_op(&module, &[Opcode::Cbr]),
         "Short-circuit AND should have conditional branch: {}",
         ir
     );
     assert!(
-        ir.contains("phi"),
+        has_op(&module, &[Opcode::Phi]),
         "Short-circuit AND should have phi node: {}",
         ir
     );
@@ -2573,12 +2600,12 @@ fn test_short_circuit_or() {
     // 1. A conditional branch (cbr) to skip evaluation of b if a is true
     // 2. A phi node to merge the result
     assert!(
-        ir.contains("cbr"),
+        has_op(&module, &[Opcode::Cbr]),
         "Short-circuit OR should have conditional branch: {}",
         ir
     );
     assert!(
-        ir.contains("phi"),
+        has_op(&module, &[Opcode::Phi]),
         "Short-circuit OR should have phi node: {}",
         ir
     );
@@ -2647,13 +2674,13 @@ fn test_ternary_pure_uses_select() {
     // Pure ternary should use select instruction (enables cmov/csel)
     // Note: IR displays as "sel" not "select"
     assert!(
-        ir.contains("sel."),
+        has_op(&module, &[Opcode::Select]),
         "Pure ternary should use select instruction: {}",
         ir
     );
     // Should NOT have phi (that's for impure ternary)
     assert!(
-        !ir.contains("phi"),
+        !has_op(&module, &[Opcode::Phi]),
         "Pure ternary should NOT use phi node: {}",
         ir
     );
@@ -2728,19 +2755,19 @@ fn test_ternary_impure_uses_phi() {
 
     // Impure ternary should use phi (for proper short-circuit evaluation)
     assert!(
-        ir.contains("phi"),
+        has_op(&module, &[Opcode::Phi]),
         "Impure ternary should use phi node: {}",
         ir
     );
     // Should have conditional branch
     assert!(
-        ir.contains("cbr"),
+        has_op(&module, &[Opcode::Cbr]),
         "Impure ternary should use conditional branch: {}",
         ir
     );
     // Should NOT use select (that's for pure ternary)
     assert!(
-        !ir.contains("sel."),
+        !has_op(&module, &[Opcode::Select]),
         "Impure ternary should NOT use select instruction: {}",
         ir
     );
@@ -2820,12 +2847,12 @@ fn test_ternary_with_assignment_uses_phi() {
 
     // Assignment is impure, so should use phi
     assert!(
-        ir.contains("phi"),
+        has_op(&module, &[Opcode::Phi]),
         "Ternary with assignment should use phi: {}",
         ir
     );
     assert!(
-        !ir.contains("sel."),
+        !has_op(&module, &[Opcode::Select]),
         "Ternary with assignment should NOT use select: {}",
         ir
     );
@@ -2897,12 +2924,12 @@ fn test_ternary_with_post_increment_uses_phi() {
 
     // Post-increment/decrement is impure, so should use phi
     assert!(
-        ir.contains("phi"),
+        has_op(&module, &[Opcode::Phi]),
         "Ternary with post-inc/dec should use phi: {}",
         ir
     );
     assert!(
-        !ir.contains("sel."),
+        !has_op(&module, &[Opcode::Select]),
         "Ternary with post-inc/dec should NOT use select: {}",
         ir
     );
@@ -3019,7 +3046,7 @@ fn test_string_literal_char_pointer_init() {
 
     // Should have a store instruction for the pointer (storing the string address)
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Pointer init should have a store instruction: {}",
         ir
     );
@@ -3074,7 +3101,7 @@ fn test_incomplete_struct_type_resolution() {
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
-                explicit_align: None,
+                align: MemberAlign::NATURAL,
             },
             StructMember {
                 name: y_id,
@@ -3083,7 +3110,7 @@ fn test_incomplete_struct_type_resolution() {
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
-                explicit_align: None,
+                align: MemberAlign::NATURAL,
             },
         ],
         enum_constants: vec![],
@@ -3181,7 +3208,7 @@ fn test_incomplete_struct_type_resolution() {
 
     // The IR should show stores to the struct fields at proper offsets
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Struct initializer should generate store instructions. \
          This would fail if incomplete struct type was not resolved. IR:\n{}",
         ir
@@ -3271,7 +3298,7 @@ fn test_static_local_pre_increment() {
 
     // Should have a store instruction (storing back to the static variable)
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Static local pre-increment should generate store. IR:\n{}",
         ir
     );
@@ -3346,7 +3373,7 @@ fn test_static_local_pre_decrement() {
         ir
     );
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Static local pre-decrement should generate store. IR:\n{}",
         ir
     );
@@ -3417,7 +3444,7 @@ fn test_static_local_post_increment() {
         ir
     );
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Static local post-increment should generate store. IR:\n{}",
         ir
     );
@@ -3488,7 +3515,7 @@ fn test_static_local_post_decrement() {
         ir
     );
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Static local post-decrement should generate store. IR:\n{}",
         ir
     );
@@ -3567,7 +3594,7 @@ fn test_static_local_compound_assignment() {
         ir
     );
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Static local compound assignment should generate store. IR:\n{}",
         ir
     );
@@ -3681,7 +3708,7 @@ fn test_wide_string_literal_is_pure() {
 
     // Wide strings are pure, so ternary should use select (sel in IR)
     assert!(
-        ir.contains("sel."),
+        has_op(&module, &[Opcode::Select]),
         "Ternary with pure wide string branches should use select. IR:\n{}",
         ir
     );
@@ -3901,7 +3928,7 @@ fn test_struct_deref_returns_address() {
             bit_width: None,
             bit_offset: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         }],
         enum_constants: vec![],
         size: 4,
@@ -4540,7 +4567,7 @@ fn test_mixed_designated_positional_struct_init() {
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
-                explicit_align: None,
+                align: MemberAlign::NATURAL,
             },
             StructMember {
                 name: b_id,
@@ -4549,7 +4576,7 @@ fn test_mixed_designated_positional_struct_init() {
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
-                explicit_align: None,
+                align: MemberAlign::NATURAL,
             },
             StructMember {
                 name: c_id,
@@ -4558,7 +4585,7 @@ fn test_mixed_designated_positional_struct_init() {
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
-                explicit_align: None,
+                align: MemberAlign::NATURAL,
             },
             StructMember {
                 name: d_id,
@@ -4567,7 +4594,7 @@ fn test_mixed_designated_positional_struct_init() {
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
-                explicit_align: None,
+                align: MemberAlign::NATURAL,
             },
         ],
         enum_constants: vec![],
@@ -4781,7 +4808,7 @@ fn test_designator_chain_nested_struct_init() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: y_id,
@@ -4790,7 +4817,7 @@ fn test_designator_chain_nested_struct_init() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
     let pt_type = ctx.types.intern(Type::struct_type(CompositeType {
@@ -4815,7 +4842,7 @@ fn test_designator_chain_nested_struct_init() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: z_id,
@@ -4824,7 +4851,7 @@ fn test_designator_chain_nested_struct_init() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
     let outer_type = ctx.types.intern(Type::struct_type(CompositeType {
@@ -4917,7 +4944,7 @@ fn test_designator_chain_array_member_init() {
         bit_offset: None,
         bit_width: None,
         access_bytes: None,
-        explicit_align: None,
+        align: MemberAlign::NATURAL,
     }];
     let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
         tag: None,
@@ -5066,7 +5093,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: StringId::EMPTY,
@@ -5075,7 +5102,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
             bit_offset: Some(0),
             bit_width: Some(8),
             access_bytes: Some(4),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: b_id,
@@ -5084,7 +5111,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
     let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
@@ -5172,7 +5199,7 @@ fn test_union_first_named_member_positional_init() {
             bit_offset: Some(0),
             bit_width: Some(16),
             access_bytes: Some(4),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: a_id,
@@ -5181,7 +5208,7 @@ fn test_union_first_named_member_positional_init() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
     let union_type = ctx.types.intern(Type::union_type(CompositeType {
@@ -5470,7 +5497,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             bit_offset: Some(0),
             bit_width: Some(3),
             access_bytes: Some(1),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: compact_id,
@@ -5479,7 +5506,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             bit_offset: Some(3),
             bit_width: Some(1),
             access_bytes: Some(1),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: ascii_id,
@@ -5488,7 +5515,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             bit_offset: Some(4),
             bit_width: Some(1),
             access_bytes: Some(1),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: static_alloc_id,
@@ -5497,7 +5524,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             bit_offset: Some(5),
             bit_width: Some(1),
             access_bytes: Some(1),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
 
@@ -5633,7 +5660,7 @@ fn test_bitfield_designated_init_local_var() {
             bit_offset: Some(0),
             bit_width: Some(4),
             access_bytes: Some(1),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: b_id,
@@ -5642,7 +5669,7 @@ fn test_bitfield_designated_init_local_var() {
             bit_offset: Some(4),
             bit_width: Some(4),
             access_bytes: Some(1),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: c_id,
@@ -5651,7 +5678,7 @@ fn test_bitfield_designated_init_local_var() {
             bit_offset: Some(0),
             bit_width: Some(8),
             access_bytes: Some(1),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
 
@@ -5779,7 +5806,7 @@ fn test_large_struct_copy_from_array() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: str_id,
@@ -5788,7 +5815,7 @@ fn test_large_struct_copy_from_array() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
 
@@ -5911,7 +5938,7 @@ fn test_compound_literal_zero_init_lvalue() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: b_id,
@@ -5920,7 +5947,7 @@ fn test_compound_literal_zero_init_lvalue() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: c_id,
@@ -5929,7 +5956,7 @@ fn test_compound_literal_zero_init_lvalue() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
 
@@ -6087,7 +6114,7 @@ fn test_conditional_short_circuit_arrow() {
         bit_offset: None,
         bit_width: None,
         access_bytes: None,
-        explicit_align: None,
+        align: MemberAlign::NATURAL,
     }];
     let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
         tag: None,
@@ -6166,21 +6193,21 @@ fn test_conditional_short_circuit_arrow() {
 
     // Should have conditional branch (cbr) for proper short-circuit evaluation
     assert!(
-        ir.contains("cbr "),
+        has_op(&module, &[Opcode::Cbr]),
         "Expected conditional branch (cbr) for short-circuit evaluation: {}",
         ir
     );
 
     // Should have phi instruction to merge results from both branches
     assert!(
-        ir.contains("phi."),
+        has_op(&module, &[Opcode::Phi]),
         "Expected phi instruction for merging conditional results: {}",
         ir
     );
 
     // Should NOT have select instruction (would mean eager evaluation of both branches)
     assert!(
-        !ir.contains("select."),
+        !has_op(&module, &[Opcode::Select]),
         "Should NOT use select instruction with pointer dereference (causes UB): {}",
         ir
     );
@@ -6378,7 +6405,7 @@ fn test_atomic_compound_assign_uses_fetch_add() {
         .flat_map(|bb| bb.insns.iter())
         .find(|i| i.op == Opcode::AtomicFetchAdd)
         .unwrap();
-    assert_eq!(insn.memory_order, MemoryOrder::SeqCst);
+    assert_eq!(insn.extra().memory_order, MemoryOrder::SeqCst);
     assert_eq!(insn.size, 32);
     assert_eq!(insn.src.len(), 3, "expected [addr, value, order]");
 }
@@ -6487,7 +6514,7 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         }],
         enum_constants: vec![],
         size: 4,
@@ -6850,7 +6877,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
             bit_width: None,
             bit_offset: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         }],
         enum_constants: vec![],
         size: 16,
@@ -7165,7 +7192,7 @@ fn test_va_arg_pack_becomes_a_flag_not_an_argument() {
 
     // The pack is recorded, and contributed no operand: only the `1` is there.
     assert!(
-        calls[0].ends_with_va_arg_pack,
+        calls[0].extra().ends_with_va_arg_pack,
         "the call should carry the pack"
     );
     assert_eq!(
@@ -7174,7 +7201,7 @@ fn test_va_arg_pack_becomes_a_flag_not_an_argument() {
         "the pack must not become an argument: {:?}",
         calls[0].src
     );
-    assert_eq!(calls[0].arg_types.len(), calls[0].src.len());
+    assert_eq!(calls[0].extra().arg_types.len(), calls[0].src.len());
 }
 
 /// A declaration inside a function body with `extern` declares no object: it
@@ -7501,8 +7528,8 @@ fn test_asm_goto_output_written_back_on_the_label_edge() {
         .flat_map(|bb| bb.insns.iter())
         .find(|insn| insn.op == Opcode::Asm)
         .expect("an asm instruction");
-    let out_pseudo = asm.asm_data.as_ref().unwrap().outputs[0].pseudo;
-    let (edge, _) = asm.asm_data.as_ref().unwrap().goto_labels[0];
+    let out_pseudo = asm.extra().asm_data.as_ref().unwrap().outputs[0].pseudo;
+    let (edge, _) = asm.extra().asm_data.as_ref().unwrap().goto_labels[0];
     let edge = func.get_block(edge).expect("the label edge block");
     assert!(
         edge.insns
@@ -7581,7 +7608,7 @@ fn test_asm_memory_operand_names_its_object() {
         .flat_map(|bb| bb.insns.iter())
         .find(|insn| insn.op == Opcode::Asm)
         .expect("an asm instruction");
-    let data = asm.asm_data.as_ref().unwrap();
+    let data = asm.extra().asm_data.as_ref().unwrap();
     for c in data.outputs.iter().chain(data.inputs.iter()) {
         assert!(
             matches!(
@@ -7644,13 +7671,13 @@ fn test_asm_memory_operand_keeps_an_address_something_else_reads() {
 }
 
 /// Parse `src` and linearize it for `target`.
-fn linearize_source(src: &str, target: &Target) -> Module {
+pub(crate) fn linearize_source(src: &str, target: &Target) -> Module {
     linearize_source_with_types(src, target).0
 }
 
 /// [`linearize_source`], also handing back the type table the module's type
 /// ids index.
-fn linearize_source_with_types(src: &str, target: &Target) -> (Module, TypeTable) {
+pub(crate) fn linearize_source_with_types(src: &str, target: &Target) -> (Module, TypeTable) {
     linearize_source_under(src, target, Default::default())
 }
 
@@ -7717,7 +7744,11 @@ fn test_call_argument_types_follow_the_callee() {
         .collect();
     assert_eq!(calls.len(), 2);
     let kinds = |call: &Instruction| -> Vec<TypeKind> {
-        call.arg_types.iter().map(|&t| types.kind(t)).collect()
+        call.extra()
+            .arg_types
+            .iter()
+            .map(|&t| types.kind(t))
+            .collect()
     };
     assert_eq!(
         kinds(calls[0]),
@@ -7783,10 +7814,10 @@ fn test_sqrt_keeps_a_call_for_errno() {
     let insns = insns_of(&module, "f");
     let sqrt: Vec<_> = insns.iter().filter(|i| i.op == Opcode::Sqrt).collect();
     assert_eq!(sqrt.len(), 1);
-    assert_eq!(sqrt[0].func_name.as_deref(), Some("sqrt"));
+    assert_eq!(sqrt[0].extra().func_name.as_deref(), Some("sqrt"));
     let calls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::Call).collect();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].func_name.as_deref(), Some("sqrt"));
+    assert_eq!(calls[0].extra().func_name.as_deref(), Some("sqrt"));
     assert!(insns.iter().any(|i| i.op == Opcode::FCmpOLt));
     assert!(insns.iter().any(|i| i.op == Opcode::Phi));
 }
@@ -7805,13 +7836,13 @@ fn test_rounding_is_one_opcode() {
         .iter()
         .find(|i| i.op == Opcode::RoundToIntegral(Floor))
         .expect("floor");
-    assert_eq!(floor.func_name.as_deref(), Some("floorf"));
+    assert_eq!(floor.extra().func_name.as_deref(), Some("floorf"));
     assert_eq!(floor.size, 32, "computed at float");
     let nearby = insns
         .iter()
         .find(|i| i.op == Opcode::RoundToIntegral(NearbyInt))
         .expect("nearbyint");
-    assert_eq!(nearby.func_name.as_deref(), Some("nearbyint"));
+    assert_eq!(nearby.extra().func_name.as_deref(), Some("nearbyint"));
     assert_eq!(nearby.size, 64);
 }
 
@@ -7831,7 +7862,7 @@ fn test_min_max_fma_are_opcodes() {
         (Opcode::FMax, "fmax", 2, 64),
     ] {
         let insn = insns.iter().find(|i| i.op == op).expect(name);
-        assert_eq!(insn.func_name.as_deref(), Some(name));
+        assert_eq!(insn.extra().func_name.as_deref(), Some(name));
         assert_eq!((insn.src.len(), insn.size), (srcs, size), "{name}");
     }
 }
@@ -7852,7 +7883,7 @@ fn test_own_definition_below_the_call_is_called() {
     let calls: Vec<_> = insns
         .iter()
         .filter(|i| i.op == Opcode::Call)
-        .map(|i| i.func_name.as_deref())
+        .map(|i| i.extra().func_name.as_deref())
         .collect();
     assert_eq!(calls, [Some("memcpy"), Some("floor")]);
     assert!(!insns
@@ -7872,7 +7903,7 @@ fn test_memory_builtins_are_their_opcodes() {
     let ops: Vec<_> = insns_of(&module, "f")
         .iter()
         .filter(|i| matches!(i.op, Opcode::Memcpy | Opcode::Memset | Opcode::Memmove))
-        .map(|i| (i.op, i.func_name.as_deref(), i.src.len()))
+        .map(|i| (i.op, i.extra().func_name.as_deref(), i.src.len()))
         .collect();
     assert_eq!(
         ops,
@@ -8109,7 +8140,7 @@ fn test_sqrt_without_errno_or_without_an_instruction() {
         .any(|i| i.op == Opcode::Sqrt || i.op == Opcode::FCmpOLt));
     let calls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::Call).collect();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].func_name.as_deref(), Some("sqrtl"));
+    assert_eq!(calls[0].extra().func_name.as_deref(), Some("sqrtl"));
 }
 
 /// `abs` and its siblings become the branch-free `(x ^ s) - s` sequence
@@ -9062,7 +9093,7 @@ fn test_complex_multiply_routine_follows_the_return_class() {
             .blocks
             .iter()
             .flat_map(|b| &b.insns)
-            .find(|i| i.op == Opcode::Call && i.func_name.as_deref() == Some(routine))
+            .find(|i| i.op == Opcode::Call && i.extra().func_name.as_deref() == Some(routine))
             .unwrap_or_else(|| panic!("{base} on {arch:?}: no {routine} call"));
         assert_eq!(
             call.returns_via_sret(),
@@ -9095,9 +9126,9 @@ fn test_known_call_keeps_its_tag_under_an_asm_label() {
     };
     let f = call_in("f");
     let label = crate::arch::lir::verbatim("my_strstr");
-    assert_eq!(f.func_name.as_deref(), Some(label.as_str()));
-    assert_eq!(f.known, Some(crate::parse::ast::LibFn::Strstr));
-    assert_eq!(call_in("g").known, None);
+    assert_eq!(f.extra().func_name.as_deref(), Some(label.as_str()));
+    assert_eq!(f.extra().known, Some(crate::parse::ast::LibFn::Strstr));
+    assert_eq!(call_in("g").extra().known, None);
 }
 
 /// A cast to `void` converts nothing: `(void)x` of a floating `x` was a
@@ -9120,10 +9151,10 @@ fn test_void_cast_of_a_float_converts_nothing() {
 /// cannot arrive.
 ///
 /// `current_bb` is `None` after a `goto` and before a `switch`'s first
-/// `case`, and `emit` quietly drops what it is handed there. `emit_two_way`
+/// `case`, and `emit` quietly drops what it is handed there. A diamond
 /// cannot be dropped that way -- it has to hang three blocks off something --
 /// and it took `self.current_bb.unwrap()`, so `sqrt`, whose errno check is a
-/// two-way, panicked the compiler outright on the dead statement after a
+/// diamond, panicked the compiler outright on the dead statement after a
 /// `goto`.
 #[test]
 fn test_two_way_in_unreachable_code_does_not_panic() {
@@ -9171,9 +9202,11 @@ fn test_bool_conversion_compares_at_the_operand_width() {
         .find(|i| i.op == Opcode::SetNe)
         .expect("a _Bool conversion compares against zero");
     assert_eq!(
-        cmp.size, 64,
-        "the compare is sized by its operand, not _Bool"
+        cmp.operand_width(),
+        64,
+        "the compare reads its operand at its own width, not _Bool's"
     );
+    assert_eq!(cmp.size, 8, "and produces the _Bool");
 }
 
 /// An explicit cast to `_Bool` from a floating type takes the same rule, and
@@ -9247,64 +9280,36 @@ fn x86_64_linux() -> Target {
 
 // CFG consistency
 
-/// Every block's recorded successors are exactly the blocks its terminator
-/// names, and `parents` is the inverse of `children`.
+/// A terminator control never returns from ends its block: what the source
+/// says after `longjmp` or `__builtin_unreachable` is lowered into a fresh
+/// block, never after the terminator in the same one.
 ///
-/// Returns a description of the first inconsistency, or `None`.
-fn cfg_inconsistency(func: &Function) -> Option<String> {
-    use std::collections::HashSet;
-
-    for bb in &func.blocks {
-        let children: HashSet<BasicBlockId> = bb.children.iter().copied().collect();
-        if children.len() != bb.children.len() {
-            return Some(format!("{}: duplicate edge in children", bb.id));
-        }
-
-        let named = match bb.insns.last() {
-            Some(last) if last.op.is_terminator() => crate::ir::propagate::terminator_targets(last),
-            // A block with no terminator falls through to nothing the CFG can
-            // name; `children` must then be empty too.
-            _ => HashSet::new(),
-        };
-
-        if named != children {
-            return Some(format!(
-                "{}: terminator names {:?} but children are {:?}",
-                bb.id,
-                sorted_ids(&named),
-                sorted_ids(&children),
-            ));
-        }
+/// Both left the rest of the statement in the terminated block, which the
+/// verifier -- now run on every compile -- rejects, and each back end emitted
+/// after the jump.
+#[test]
+fn a_non_returning_terminator_ends_its_block() {
+    let target = Target::host();
+    let src = "typedef long jmp_buf[8];\n\
+               void longjmp(jmp_buf, int);\n\
+               jmp_buf env;\n\
+               int g;\n\
+               void jump(void) { longjmp(env, 1); g = 2; }\n\
+               void never(int x) { if (x) { __builtin_unreachable(); g = 3; } g = 4; }\n";
+    let module = linearize_source(src, &target);
+    for f in &module.functions {
+        assert_eq!(cfg_inconsistency(f), None, "{}", f.name);
     }
-
-    // `parents` is the inverse of `children`.
-    let mut expected: std::collections::HashMap<BasicBlockId, HashSet<BasicBlockId>> =
-        std::collections::HashMap::new();
-    for bb in &func.blocks {
-        for child in &bb.children {
-            expected.entry(*child).or_default().insert(bb.id);
-        }
-    }
-    for bb in &func.blocks {
-        let have: HashSet<BasicBlockId> = bb.parents.iter().copied().collect();
-        let want = expected.remove(&bb.id).unwrap_or_default();
-        if have != want {
-            return Some(format!(
-                "{}: parents are {:?} but {:?} name it as a successor",
-                bb.id,
-                sorted_ids(&have),
-                sorted_ids(&want),
-            ));
-        }
-    }
-
-    None
 }
 
-fn sorted_ids(s: &std::collections::HashSet<BasicBlockId>) -> Vec<u32> {
-    let mut v: Vec<u32> = s.iter().map(|b| b.0).collect();
-    v.sort_unstable();
-    v
+/// The validator's report on `func`, or `None` when it is consistent.
+///
+/// The CFG invariants live in `validate` (I8, I9), which every compile runs;
+/// this only adapts its answer to the tests that ask.
+fn cfg_inconsistency(func: &Function) -> Option<String> {
+    crate::ir::validate::validate_function(func)
+        .err()
+        .map(|errs| format!("{errs:?}"))
 }
 
 /// A `for` post-expression that splits the block still links the back edge from
@@ -9490,19 +9495,7 @@ fn test_volatile_accesses_carry_the_marker() {
                void read_plain_ptr(void) { *pp; }\n";
     let module = linearize_source(src, &target);
 
-    let accesses = |name: &str| -> Vec<(Opcode, bool)> {
-        module
-            .functions
-            .iter()
-            .find(|f| f.name == name)
-            .unwrap_or_else(|| panic!("function {name}"))
-            .blocks
-            .iter()
-            .flat_map(|bb| bb.insns.iter())
-            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
-            .map(|i| (i.op, i.is_volatile_access()))
-            .collect()
-    };
+    let accesses = |name: &str| memory_accesses(&module, name);
 
     // A named volatile object: one marked access each way.
     assert_eq!(accesses("read_named"), vec![(Opcode::Load, true)]);
@@ -9564,19 +9557,7 @@ fn test_a_member_of_a_volatile_object_carries_the_marker() {
                void read_plain_arrow(void) { pp->a; }\n";
     let module = linearize_source(src, &target);
 
-    let accesses = |name: &str| -> Vec<(Opcode, bool)> {
-        module
-            .functions
-            .iter()
-            .find(|f| f.name == name)
-            .unwrap_or_else(|| panic!("function {name}"))
-            .blocks
-            .iter()
-            .flat_map(|bb| bb.insns.iter())
-            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
-            .map(|i| (i.op, i.is_volatile_access()))
-            .collect()
-    };
+    let accesses = |name: &str| memory_accesses(&module, name);
 
     // Every spelling of "the object is volatile": directly, through a pointer
     // to volatile, through an array's element type, through a nested member
@@ -9603,6 +9584,179 @@ fn test_a_member_of_a_volatile_object_carries_the_marker() {
     );
 }
 
+/// Every `Load` and `Store` in function `name`, with whether it carries the
+/// volatile marker, in program order.
+fn memory_accesses(module: &Module, name: &str) -> Vec<(Opcode, bool)> {
+    module
+        .functions
+        .iter()
+        .find(|f| f.name == name)
+        .unwrap_or_else(|| panic!("function {name}"))
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
+        .map(|i| (i.op, i.is_volatile_access()))
+        .collect()
+}
+
+/// A member of an anonymous `volatile` structure is volatile.
+///
+/// C17 6.7.2.1p13 makes `a` a member of `s`, and it lives inside the anonymous
+/// structure, which is volatile -- so `s.a` is a volatile access although
+/// neither `s` nor `a` was declared so. `find_member` walked into the
+/// anonymous member without collecting its qualifiers, and the read was
+/// unmarked. The same holds for an initializer that reaches `a` by name or
+/// positionally, since the walker reaches it through the same member.
+#[test]
+fn test_a_member_of_an_anonymous_volatile_member_carries_the_marker() {
+    let target = Target::host();
+    let src = "struct A { volatile struct { int a; }; int b; };\n\
+               struct A s;\n\
+               struct { const volatile union { int u; }; } cu;\n\
+               void read_anon(void) { s.a; }\n\
+               void read_union(void) { cu.u; }\n\
+               void read_plain(void) { s.b; }\n\
+               void init_named(void) { struct A l = { .a = 1 }; (void)l; }\n\
+               void init_positional(void) { struct A l = { 1, 2 }; (void)l; }\n";
+    let module = linearize_source(src, &target);
+    assert_eq!(
+        memory_accesses(&module, "read_anon"),
+        vec![(Opcode::Load, true)]
+    );
+    assert_eq!(
+        memory_accesses(&module, "read_union"),
+        vec![(Opcode::Load, true)]
+    );
+    // The control: the sibling outside the anonymous member is ordinary.
+    assert_eq!(
+        memory_accesses(&module, "read_plain"),
+        vec![(Opcode::Load, false)]
+    );
+
+    // `l` holds a volatile member, so its whole-object zero is volatile too,
+    // and the store into `a` is marked whichever way the list reaches it.
+    let stores = |name: &str| -> Vec<bool> {
+        memory_accesses(&module, name)
+            .into_iter()
+            .filter(|(op, _)| *op == Opcode::Store)
+            .map(|(_, v)| v)
+            .collect()
+    };
+    assert!(
+        stores("init_named").iter().all(|v| *v),
+        "{:?}",
+        stores("init_named")
+    );
+    // Zero, then `a` (inside the volatile anonymous member), then `b`
+    // (outside it, and ordinary).
+    assert_eq!(stores("init_positional"), vec![true, true, false]);
+}
+
+/// An initializer's stores into a `volatile` object are volatile accesses.
+///
+/// The stores are typed with each member's *declared* type, which does not
+/// show a qualifier the object carries, so `volatile struct B vb = {1, 2}`
+/// stored into `vb` unmarked -- correctness rested on the passes also asking
+/// `LocalVar` about the named object. Every store is marked now, the
+/// whole-object zero included, and through a nested member and a designator.
+/// An aggregate member that is itself declared `volatile` inside an ordinary
+/// object is the other spelling.
+#[test]
+fn test_an_initializer_of_a_volatile_object_marks_every_store() {
+    let target = Target::host();
+    let src = "struct B { int x, y; };\n\
+               struct O { struct B in; int z; };\n\
+               struct P { volatile struct B vb; int z; };\n\
+               struct F { unsigned f : 3, g : 5; };\n\
+               void whole(void) { volatile struct B vb = {1, 2}; }\n\
+               void partial(void) { volatile struct B vb = {1}; }\n\
+               void designated(void) { volatile struct B vb = { .y = 2 }; }\n\
+               void nested(void) { volatile struct O vo = { {1, 2}, 3 }; }\n\
+               void member(void) { struct P p = { {1, 2}, 3 }; (void)p; }\n\
+               void bits(void) { volatile struct F vf = { 1, 2 }; }\n\
+               void plain(void) { struct B pb = {1, 2}; (void)pb; }\n";
+    let module = linearize_source(src, &target);
+    for name in ["whole", "partial", "designated", "nested"] {
+        let accesses = memory_accesses(&module, name);
+        assert!(!accesses.is_empty(), "{name}: no stores at all");
+        assert!(
+            accesses.iter().all(|&(op, v)| op == Opcode::Store && v),
+            "{name}: every store into a volatile object is volatile: {accesses:?}"
+        );
+    }
+    // A bit-field is initialized by reading its carrier back and storing it:
+    // both halves are accesses to the volatile object.
+    let bits = memory_accesses(&module, "bits");
+    assert!(bits.contains(&(Opcode::Load, true)), "{bits:?}");
+    assert!(bits.iter().all(|&(_, v)| v), "{bits:?}");
+
+    // `p` is not volatile, but `p.vb` is: its two stores are marked, and the
+    // ordinary member beside it is not. The zero covers the volatile member,
+    // so it is marked as a whole.
+    let member = memory_accesses(&module, "member");
+    assert!(
+        member.contains(&(Opcode::Store, true)) && member.contains(&(Opcode::Store, false)),
+        "{member:?}"
+    );
+
+    // The control: an ordinary object's initializer is not marked.
+    let plain = memory_accesses(&module, "plain");
+    assert!(
+        !plain.is_empty() && plain.iter().all(|&(_, v)| !v),
+        "{plain:?}"
+    );
+}
+
+/// Every chunk of an aggregate copy out of, or into, a `volatile` object is a
+/// volatile access.
+///
+/// A copy of a struct too large for one register moves integer chunks, whose
+/// types say nothing about the aggregate's qualifier. So `struct S t = *p;`
+/// through a `volatile struct S *p` read `*p` unmarked, and with `t` unused
+/// DCE deleted every read from `-O1` up. The store side is the same
+/// question for `*p = t`, and a plain copy is the control.
+#[test]
+fn test_an_aggregate_copy_of_a_volatile_object_marks_every_chunk() {
+    let target = Target::host();
+    let src = "struct S { int a, b, c; };\n\
+               volatile struct S *vp;\n\
+               struct S *pp;\n\
+               void copy_out(void) { struct S t = *vp; (void)t; }\n\
+               void copy_in(struct S t) { *vp = t; }\n\
+               void copy_plain(void) { struct S t = *pp; (void)t; }\n";
+    let module = linearize_source(src, &target);
+
+    // Reading `vp` itself is an ordinary load; every chunk load after it is of
+    // `*vp`, and the stores into `t` are not volatile.
+    let out = memory_accesses(&module, "copy_out");
+    let chunk_loads: Vec<bool> = out
+        .iter()
+        .skip(1)
+        .filter(|(op, _)| *op == Opcode::Load)
+        .map(|(_, v)| *v)
+        .collect();
+    assert!(
+        !chunk_loads.is_empty() && chunk_loads.iter().all(|v| *v),
+        "{out:?}"
+    );
+    assert!(out
+        .iter()
+        .filter(|(op, _)| *op == Opcode::Store)
+        .all(|(_, v)| !v));
+
+    let into = memory_accesses(&module, "copy_in");
+    let chunk_stores: Vec<bool> = into
+        .iter()
+        .filter(|(op, _)| *op == Opcode::Store)
+        .map(|(_, v)| *v)
+        .collect();
+    assert!(chunk_stores.iter().any(|v| *v), "{into:?}");
+
+    let plain = memory_accesses(&module, "copy_plain");
+    assert!(plain.iter().all(|(_, v)| !v), "{plain:?}");
+}
+
 /// A `volatile` bit-field access is marked although the access is of the
 /// carrier.
 ///
@@ -9623,19 +9777,7 @@ fn test_a_volatile_bitfield_access_carries_the_marker() {
                void write_plain(void) { b.g = 1; }\n";
     let module = linearize_source(src, &target);
 
-    let accesses = |name: &str| -> Vec<(Opcode, bool)> {
-        module
-            .functions
-            .iter()
-            .find(|f| f.name == name)
-            .unwrap_or_else(|| panic!("function {name}"))
-            .blocks
-            .iter()
-            .flat_map(|bb| bb.insns.iter())
-            .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
-            .map(|i| (i.op, i.is_volatile_access()))
-            .collect()
-    };
+    let accesses = |name: &str| memory_accesses(&module, name);
 
     // Both spellings: the field declared `volatile`, and an ordinary field of
     // a `volatile` object.
@@ -9809,7 +9951,7 @@ fn a_constant_short_circuit_operand_emits_no_branch() {
 /// `emit_diamond`, or read the block back through
 /// `current_or_unreachable_bb`, which starts a block nothing branches to; the
 /// point of auditing the CFG rather than only that lowering finished is that
-/// such a block is *removed* again by `dce::remove_unreachable_blocks`, and a
+/// such a block is *removed* again by `Function::remove_unreachable_blocks`, and a
 /// mislinked edge into or out of it would outlive it.
 #[test]
 fn conditional_lowerings_keep_the_cfg_consistent() {
@@ -10147,4 +10289,96 @@ fn a_backward_goto_past_a_vla_declaration_releases_it() {
         "the jump back to `lab` puts the stack where the label found it, and \
          the path that falls out of the block releases it too"
     );
+}
+
+/// A union a whole value initialized holds that value's bytes, so a later
+/// designator through *any* member keeps them; one a list initialized agrees
+/// only with the member the list named. Recording a value forgets what was
+/// said before inside it, and a later member record inside wins.
+#[test]
+fn test_a_value_initialized_union_agrees_with_any_member() {
+    let types = TypeTable::new(&Target::host());
+    let u = types.int_id; // stands in for the union type; only identity matters
+    let mut value = UnionMembers::default();
+    value.record(0, u, 1);
+    value.record_value(0..8);
+    let mut named = UnionMembers::default();
+    named.record(0, u, 0);
+    assert_eq!(UnionFold::new(&value, &named, 0).agreed(u), Some(0));
+
+    let mut listed = UnionMembers::default();
+    listed.record(0, u, 1);
+    assert_eq!(UnionFold::new(&listed, &named, 0).agreed(u), None);
+    named.record(0, u, 1);
+    assert_eq!(UnionFold::new(&listed, &named, 0).agreed(u), Some(1));
+
+    // Discarding part of the value's bytes leaves nothing to agree with.
+    value.clear_range(0..4);
+    let mut named0 = UnionMembers::default();
+    named0.record(0, u, 0);
+    assert_eq!(UnionFold::new(&value, &named0, 0).agreed(u), None);
+}
+
+/// Every aggregate returned in registers has its `Ret` classified, at any
+/// size: a four-`double` HFA is thirty-two bytes on aarch64 and still comes
+/// back in `d0`-`d3`, by address in the IR. The callee's side stopped
+/// classifying at sixteen bytes, so this `Ret` carried no ABI record and the
+/// function had to be kept from the inliner; it is neither now.
+#[test]
+fn test_every_register_returned_aggregate_carries_its_class() {
+    let target = Target::new(Arch::Aarch64, Os::Linux);
+    let src = "struct H4 { double v[4]; };\n\
+               struct H4 mk(double s) { struct H4 r = { { s, s, s, s } }; return r; }\n";
+    let module = linearize_source(src, &target);
+    let f = module.functions.iter().find(|f| f.name == "mk").unwrap();
+    let ret = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .find(|i| i.op == Opcode::Ret)
+        .expect("a ret");
+    assert!(
+        matches!(
+            ret.extra().abi_info.as_ref().map(|a| &a.ret),
+            Some(crate::abi::ArgClass::Hfa { count: 4, .. })
+        ),
+        "{:?}",
+        ret.extra().abi_info
+    );
+    assert!(ret.returns_aggregate_address());
+    assert!(
+        !f.ret_is_address,
+        "an address-returned aggregate is inlinable"
+    );
+}
+
+/// Every bit count -- `ctz`, `clz` (`clrsb`'s too), `popcount` -- is an `int`
+/// result that records the 32- or 64-bit operand it reads in `src_size`, so
+/// a fold that replaces one with its count builds an `int`. `ctzl` and
+/// `clzl` recorded the operand width as the result's.
+#[test]
+fn test_bit_counts_record_their_operand() {
+    let src = "int f(unsigned long l, unsigned u, long s) {\n\
+               return __builtin_ctzl(l) + __builtin_clz(u) + __builtin_clzll(l)\n\
+               + __builtin_popcountl(l) + __builtin_ctz(u) + __builtin_clrsbl(s);\n}\n";
+    let (module, types) = linearize_source_with_types(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let counts: Vec<&Instruction> = f
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| i.op.is_bit_count())
+        .collect();
+    assert_eq!(counts.len(), 6);
+    for insn in counts {
+        let operand = if matches!(insn.op, Opcode::Ctz32 | Opcode::Clz32) {
+            32
+        } else {
+            64
+        };
+        assert_eq!(insn.typ, Some(types.int_id), "{:?}", insn.op);
+        assert_eq!(insn.size, 32, "{:?}: the count is an int", insn.op);
+        assert_eq!(insn.operand_width(), operand, "{:?}", insn.op);
+        assert!(insn.src_typ.is_some(), "{:?}", insn.op);
+    }
 }

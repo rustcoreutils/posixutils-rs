@@ -200,6 +200,40 @@ end_goto:
     assert_eq!(compile_and_run("asm_x86_64_mega", code, &[]), 0);
 }
 
+/// A phi at an `asm goto` label receives the value its jump carried.
+///
+/// The label is reached from the `asm` block (by the jump) and from the
+/// fallthrough, so it merges two values of `r`. Phi elimination put the copy
+/// for the jump's edge at the end of the `asm` block, after the `asm` -- which
+/// the jump leaves before reaching -- so the label read whatever `r` held
+/// before, at every level. The edge now gets a block of its own for the copy.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_asm_goto_label_receives_the_value_its_jump_carries() {
+    let code = r#"
+int __attribute__((noinline)) f(int x) {
+    int r = x + 1;
+    if (x > 5) r = 7;
+    __asm__ goto("jmp %l0" :::: taken);
+    r = 2;
+taken:
+    return r;
+}
+int main(void) {
+    if (f(10) != 7) return 1;
+    if (f(1) != 2) return 2;
+    return 0;
+}
+"#;
+    for level in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("asm_goto_phi{level}"), code, &[level.to_string()]),
+            0,
+            "{level}"
+        );
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn codegen_inline_asm_x86_64_asm_goto_pseudo_survives_edge() {
@@ -2735,4 +2769,36 @@ int main(void) {{
         compile_and_run_optimized("asm_goto_vla_scope_opt", &code),
         0
     );
+}
+
+/// An array or a function in a register operand has decayed to a pointer
+/// (C17 6.3.2.1p3-4), so the operand is the pointer's width. c17 sized it
+/// as the array, and named the register for an odd width as its 32-bit half:
+/// `0(%eax)` addressed the low four gigabytes, where no stack is.
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn codegen_asm_array_operand_is_a_pointer() {
+    #[cfg(target_arch = "x86_64")]
+    let store = "movq $7, 0(%0)";
+    #[cfg(target_arch = "aarch64")]
+    let store = "mov x9, #7\\n\\tstr x9, [%0]";
+    let code = format!(
+        r#"
+static long kept[2];
+static int seven(void) {{ return 7; }}
+int main(void) {{
+    long local[2] = {{ 0, 0 }};
+    void *fp;
+    __asm__ volatile("{store}" : : "r"(local) : "x9", "memory");
+    __asm__ volatile("{store}" : : "r"(kept) : "x9", "memory");
+    __asm__ volatile("" : "=r"(fp) : "0"(seven));
+    if (local[0] != 7 || kept[0] != 7) return 1;
+    return fp == (void *)seven ? 0 : 2;
+}}
+"#
+    );
+    #[cfg(target_arch = "x86_64")]
+    let code = code.replace("\"x9\", ", "");
+    assert_eq!(compile_and_run("asm_array_operand", &code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("asm_array_operand_opt", &code), 0);
 }

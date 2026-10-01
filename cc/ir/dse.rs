@@ -40,9 +40,9 @@
 //
 
 use super::escape::EscapeInfo;
-use super::memloc::{may_alias, AddrMap, MemBase, MemLoc, ModuleInfo};
+use super::memloc::{is_ordinary_object, may_alias, AddrMap, MemBase, MemLoc, ModuleInfo};
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
-use crate::types::{TypeModifiers, TypeTable};
+use crate::types::TypeTable;
 use std::collections::{HashMap, HashSet};
 
 /// How many sweeps the dead-at-exit fixed point may take before it gives up.
@@ -59,16 +59,23 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
     if func.blocks.is_empty() {
         return false;
     }
-    let esc = EscapeInfo::analyze(func);
+    let esc = EscapeInfo::analyze(func, types);
     if esc.gave_up() {
         return false;
     }
     let am = AddrMap::build(func);
-    let dead_at_end = dead_locals_at_block_end(func, types, &esc, &am, mi);
+    let facts = Facts {
+        func,
+        types,
+        esc: &esc,
+        am: &am,
+        mi,
+    };
+    let dead_at_end = facts.dead_locals_at_block_end();
 
     let mut kills: Vec<(usize, usize)> = Vec::new();
     for b in 0..func.blocks.len() {
-        scan_block(func, types, &esc, &am, mi, b, &dead_at_end, &mut kills);
+        facts.scan_block(b, &dead_at_end, &mut kills);
     }
 
     for (b, i) in &kills {
@@ -83,321 +90,271 @@ struct Pending {
     index: usize,
 }
 
-/// Collect the dead stores in one block.
-#[allow(clippy::too_many_arguments)]
-fn scan_block(
-    func: &Function,
-    types: &TypeTable,
-    esc: &EscapeInfo,
-    am: &AddrMap,
-    mi: &ModuleInfo,
-    b: usize,
-    dead_at_end: &HashMap<BasicBlockId, HashSet<PseudoId>>,
-    kills: &mut Vec<(usize, usize)>,
-) {
-    let mut pending: Vec<Pending> = Vec::new();
-
-    for (i, insn) in func.blocks[b].insns.iter().enumerate() {
-        if insn.op == Opcode::Nop {
-            continue;
-        }
-
-        // Anything that may read one of the pending locations makes it live
-        // again. This runs before the store rule below, because a
-        // read-modify-write reads the bytes it is about to write.
-        pending.retain(|p| !may_read(func, esc, am, mi, insn, &p.loc));
-
-        if insn.op != Opcode::Store {
-            continue;
-        }
-        let loc = am.location_of(func, insn);
-        // A volatile store is observable and stays, even when a later store
-        // overwrites every byte of it. `deletable` answers for a named object;
-        // the marker also answers for `*p` where `p` is a `volatile int *`.
-        if insn.is_volatile_access() || !deletable(func, types, mi, &loc) {
-            // An untrackable store is still a write: drop whatever it may
-            // have touched rather than pretending it did not happen.
-            pending.retain(|p| !may_alias(&loc, &p.loc, mi));
-            continue;
-        }
-
-        let mut kept: Vec<Pending> = Vec::new();
-        for p in pending.drain(..) {
-            if covers(&loc, &p.loc) {
-                // Every byte written again before anything read any of it.
-                kills.push((b, p.index));
-            } else if !may_alias(&loc, &p.loc, mi) {
-                kept.push(p);
-            }
-            // Otherwise the overlap is partial: some bytes are still live,
-            // so the entry is dropped without being killed.
-        }
-        pending = kept;
-        pending.push(Pending { loc, index: i });
-    }
-
-    // Whatever is still pending at the end of the block is dead if the whole
-    // object is dead on every path out.
-    let Some(dead) = dead_at_end.get(&func.blocks[b].id) else {
-        return;
-    };
-    for p in pending {
-        if let MemBase::Local(sym) = p.loc.base {
-            if dead.contains(&sym) {
-                kills.push((b, p.index));
-            }
-        }
-    }
+/// What the pass knows about the function it is scanning.
+#[derive(Clone, Copy)]
+struct Facts<'a> {
+    func: &'a Function,
+    types: &'a TypeTable,
+    esc: &'a EscapeInfo,
+    am: &'a AddrMap,
+    mi: &'a ModuleInfo,
 }
 
-/// Could `insn` read any byte of `loc`?
-fn may_read(
-    func: &Function,
-    esc: &EscapeInfo,
-    am: &AddrMap,
-    mi: &ModuleInfo,
-    insn: &Instruction,
-    loc: &MemLoc,
-) -> bool {
-    match insn.op {
-        // Nothing here reaches memory.
-        Opcode::Nop
-        | Opcode::Entry
-        | Opcode::Phi
-        | Opcode::PhiSource
-        | Opcode::Copy
-        | Opcode::SetVal
-        | Opcode::SymAddr
-        | Opcode::Select
-        | Opcode::Br
-        | Opcode::Cbr
-        | Opcode::Switch
-        | Opcode::IndirectBr
-        | Opcode::Unreachable => false,
+impl Facts<'_> {
+    /// Collect the dead stores in one block.
+    fn scan_block(
+        &self,
+        b: usize,
+        dead_at_end: &HashMap<BasicBlockId, HashSet<PseudoId>>,
+        kills: &mut Vec<(usize, usize)>,
+    ) {
+        let Facts {
+            func,
+            types,
+            am,
+            mi,
+            ..
+        } = *self;
+        let mut pending: Vec<Pending> = Vec::new();
 
-        Opcode::Load => may_alias(&am.location_of(func, insn), loc, mi),
+        for (i, insn) in func.blocks[b].insns.iter().enumerate() {
+            if insn.op == Opcode::Nop {
+                continue;
+            }
 
-        // A store *writes*; the bytes it does not cover stay as they were,
-        // so it reads nothing. The covering rule above is what uses it.
-        Opcode::Store => false,
+            // Anything that may read one of the pending locations makes it live
+            // again. This runs before the store rule below, because a
+            // read-modify-write reads the bytes it is about to write.
+            pending.retain(|p| !self.may_read(insn, &p.loc));
 
-        // `memcpy` reads its source and writes its destination, and
-        // `memmove` may do both to overlapping ranges. Neither extent is
-        // `insn.size`, which is the pointer's width.
-        Opcode::Memcpy | Opcode::Memmove => insn
-            .src
-            .iter()
-            .take(2)
-            .any(|a| may_alias(&am.resolve(func, *a, 0, 0, None), loc, mi)),
-        // `memset` writes a constant; it reads nothing.
-        Opcode::Memset => false,
+            if insn.op != Opcode::Store {
+                continue;
+            }
+            let loc = am.location_of(func, insn);
+            // A volatile store is observable and stays, even when a later store
+            // overwrites every byte of it. `is_ordinary_object` answers for a
+            // named object; the marker also answers for `*p` where `p` is a
+            // `volatile int *`.
+            if insn.is_volatile_access() || !is_ordinary_object(func, types, mi, &loc) {
+                // An untrackable store is still a write: drop whatever it may
+                // have touched rather than pretending it did not happen.
+                pending.retain(|p| !may_alias(&loc, &p.loc, mi));
+                continue;
+            }
 
-        // A callee reads what it can reach. A local whose address never left
-        // this function is not that, and a `pure` callee reads but a `const`
-        // one does not -- except that reading is exactly what is being asked
-        // about, so only the escape question helps here.
-        Opcode::Call => esc.is_captured(&loc.base),
+            let mut kept: Vec<Pending> = Vec::new();
+            for p in pending.drain(..) {
+                if covers(&loc, &p.loc) {
+                    // Every byte written again before anything read any of it.
+                    kills.push((b, p.index));
+                } else if !may_alias(&loc, &p.loc, mi) {
+                    kept.push(p);
+                }
+                // Otherwise the overlap is partial: some bytes are still live,
+                // so the entry is dropped without being killed.
+            }
+            pending = kept;
+            pending.push(Pending { loc, index: i });
+        }
 
-        // A `Ret` hands the object to the caller, which is a read by any
-        // other name -- an aggregate return carries an address rather than a
-        // value. But the operand of a scalar return is a *value*, and
-        // resolving one as an address answers `Unknown`, which aliases
-        // everything and made every `return 0;` revive every pending store.
-        //
-        // The escape question settles it instead: a local whose address
-        // reaches a `Ret` has escaped by that very fact, so a local that did
-        // not escape cannot be what is being returned.
-        Opcode::Ret => esc.is_captured(&loc.base),
-
-        _ if !insn.op.may_access_memory() => false,
-
-        // `Asm`, `Alloca`, `StackSave`/`StackRestore`, the `Va*` family,
-        // every atomic, and anything unlisted. A `"memory"` clobber can name
-        // a frame slot without naming an operand.
-        _ => true,
-    }
-}
-
-/// May a store to this location be deleted at all?
-fn deletable(func: &Function, types: &TypeTable, mi: &ModuleInfo, loc: &MemLoc) -> bool {
-    if loc.offset.is_none() || loc.size == 0 {
-        return false;
-    }
-    // Volatility and atomicity are properties of the object, so both ends
-    // are checked -- a volatile store is observable and stays.
-    if let Some(t) = loc.typ {
-        let m = types.modifiers(t);
-        if m.contains(TypeModifiers::VOLATILE) || m.contains(TypeModifiers::ATOMIC) {
-            return false;
+        // Whatever is still pending at the end of the block is dead if the whole
+        // object is dead on every path out.
+        let Some(dead) = dead_at_end.get(&func.blocks[b].id) else {
+            return;
+        };
+        for p in pending {
+            if let MemBase::Local(sym) = p.loc.base {
+                if dead.contains(&sym) {
+                    kills.push((b, p.index));
+                }
+            }
         }
     }
-    match &loc.base {
-        MemBase::Unknown => false,
-        MemBase::Local(p) => match func.local_of(*p) {
-            Some(l) => !l.is_volatile && !l.is_atomic,
-            None => false,
-        },
-        MemBase::Global(n) => {
-            let g = mi.global(n);
-            !g.is_volatile && !g.is_thread_local
+
+    /// Could `insn` read any byte of `loc`?
+    fn may_read(&self, insn: &Instruction, loc: &MemLoc) -> bool {
+        let Facts {
+            func, esc, am, mi, ..
+        } = *self;
+        match insn.op {
+            // Nothing here reaches memory.
+            Opcode::Nop
+            | Opcode::Entry
+            | Opcode::Phi
+            | Opcode::PhiSource
+            | Opcode::Copy
+            | Opcode::SetVal
+            | Opcode::SymAddr
+            | Opcode::Select
+            | Opcode::Br
+            | Opcode::Cbr
+            | Opcode::Switch
+            | Opcode::IndirectBr
+            | Opcode::Unreachable => false,
+
+            Opcode::Load => may_alias(&am.location_of(func, insn), loc, mi),
+
+            // A store *writes*; the bytes it does not cover stay as they were,
+            // so it reads nothing. The covering rule above is what uses it.
+            Opcode::Store => false,
+
+            // `memcpy` reads its source and writes its destination, and
+            // `memmove` may do both to overlapping ranges. Neither extent is
+            // `insn.size`, which is the pointer's width.
+            Opcode::Memcpy | Opcode::Memmove => insn
+                .src
+                .iter()
+                .take(2)
+                .any(|a| may_alias(&am.resolve(func, *a, 0, 0, None), loc, mi)),
+            // `memset` writes a constant; it reads nothing.
+            Opcode::Memset => false,
+
+            // A callee reads what it can reach. A local whose address never left
+            // this function is not that, and a `pure` callee reads but a `const`
+            // one does not -- except that reading is exactly what is being asked
+            // about, so only the escape question helps here.
+            Opcode::Call => esc.is_captured(&loc.base),
+
+            // A `Ret` hands the object to the caller, which is a read by any
+            // other name -- an aggregate return carries an address rather than a
+            // value. But the operand of a scalar return is a *value*, and
+            // resolving one as an address answers `Unknown`, which aliases
+            // everything and made every `return 0;` revive every pending store.
+            //
+            // The escape question settles it instead: a local whose address
+            // reaches a `Ret` has escaped by that very fact, so a local that did
+            // not escape cannot be what is being returned.
+            Opcode::Ret => esc.is_captured(&loc.base),
+
+            _ if !insn.op.may_access_memory() => false,
+
+            // `Asm`, `Alloca`, `StackSave`/`StackRestore`, the `Va*` family,
+            // every atomic, and anything unlisted. A `"memory"` clobber can name
+            // a frame slot without naming an operand.
+            _ => true,
         }
     }
 }
 
 /// Does `later` write every byte `earlier` wrote?
 fn covers(later: &MemLoc, earlier: &MemLoc) -> bool {
-    if later.base != earlier.base || later.base == MemBase::Unknown {
+    if later.base != earlier.base {
         return false;
     }
-    let (Some(lo), Some(eo)) = (later.offset, earlier.offset) else {
-        return false;
-    };
-    if later.size == 0 || earlier.size == 0 {
-        return false;
+    match (later.byte_extent(), earlier.byte_extent()) {
+        (Some((lo, lend)), Some((eo, eend))) => lo <= eo && eend <= lend,
+        _ => false,
     }
-    let (lb, eb) = (
-        later.size.div_ceil(8) as i64,
-        earlier.size.div_ceil(8) as i64,
-    );
-    let (Some(lend), Some(eend)) = (lo.checked_add(lb), eo.checked_add(eb)) else {
-        return false;
-    };
-    lo <= eo && eend <= lend
 }
 
-/// Which locals are never read again, at the end of each block.
-///
-/// A backward "not read on any path from here" analysis, keyed by the
-/// object rather than by byte range: an entry survives only while *no* byte
-/// of the object is read, which is coarse and safe.
-///
-/// **This is the single place the dead-at-exit claim is made**, and the
-/// candidate set is where its three conditions live: the base is a `Local`
-/// of this function, it never escaped, and `EscapeInfo` did not give up. A
-/// block-scope `static` is a `Global` here and so is never a candidate,
-/// which is the trap this guards.
-fn dead_locals_at_block_end(
-    func: &Function,
-    types: &TypeTable,
-    esc: &EscapeInfo,
-    am: &AddrMap,
-    mi: &ModuleInfo,
-) -> HashMap<BasicBlockId, HashSet<PseudoId>> {
-    let mut candidates: HashSet<PseudoId> = HashSet::new();
-    for p in &func.pseudos {
-        let Some(local) = func.local_of(p.id) else {
-            continue;
-        };
-        if local.is_volatile || local.is_atomic {
-            continue;
-        }
-        if esc.is_captured(&MemBase::Local(p.id)) {
-            continue;
-        }
-        let m = types.modifiers(local.typ);
-        if m.contains(TypeModifiers::VOLATILE) || m.contains(TypeModifiers::ATOMIC) {
-            continue;
-        }
-        candidates.insert(p.id);
-    }
-
-    let mut out: HashMap<BasicBlockId, HashSet<PseudoId>> = HashMap::new();
-    if candidates.is_empty() {
-        for bb in &func.blocks {
-            out.insert(bb.id, HashSet::new());
-        }
-        return out;
-    }
-
-    // What each block reads, computed once.
-    let mut reads: HashMap<BasicBlockId, HashSet<PseudoId>> = HashMap::new();
-    for bb in &func.blocks {
-        let mut r = HashSet::new();
-        for insn in &bb.insns {
-            for &c in &candidates {
-                if r.contains(&c) {
-                    continue;
-                }
-                let whole = MemLoc {
-                    base: MemBase::Local(c),
-                    offset: Some(0),
-                    size: 0,
-                    typ: None,
-                };
-                if may_read(func, esc, am, mi, insn, &whole) {
-                    r.insert(c);
-                }
+impl Facts<'_> {
+    /// Which locals are never read again, at the end of each block.
+    ///
+    /// A backward "not read on any path from here" analysis, keyed by the
+    /// object rather than by byte range: an entry survives only while *no* byte
+    /// of the object is read, which is coarse and safe.
+    ///
+    /// **This is the single place the dead-at-exit claim is made**, and the
+    /// candidate set is where its three conditions live: the base is a `Local`
+    /// of this function, it never escaped, and `EscapeInfo` did not give up. A
+    /// block-scope `static` is a `Global` here and so is never a candidate,
+    /// which is the trap this guards.
+    fn dead_locals_at_block_end(&self) -> HashMap<BasicBlockId, HashSet<PseudoId>> {
+        let Facts {
+            func, types, esc, ..
+        } = *self;
+        let mut candidates: HashSet<PseudoId> = HashSet::new();
+        for p in &func.pseudos {
+            let Some(local) = func.local_of(p.id) else {
+                continue;
+            };
+            if !local.is_ordinary(types) || esc.is_captured(&MemBase::Local(p.id)) {
+                continue;
             }
+            candidates.insert(p.id);
         }
-        reads.insert(bb.id, r);
-    }
 
-    // Successors, as `loadfwd` derives them: from `children`, which `dce`
-    // maintains, never from `parents`, which it does not.
-    let mut succs: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
-    for bb in &func.blocks {
-        let mut s = bb.children.clone();
-        for insn in &bb.insns {
-            if let Some(ref asm) = insn.asm_data {
-                for (t, _) in &asm.goto_labels {
-                    if !s.contains(t) {
-                        s.push(*t);
+        let mut out: HashMap<BasicBlockId, HashSet<PseudoId>> = HashMap::new();
+        if candidates.is_empty() {
+            for bb in &func.blocks {
+                out.insert(bb.id, HashSet::new());
+            }
+            return out;
+        }
+
+        // What each block reads, computed once.
+        let mut reads: HashMap<BasicBlockId, HashSet<PseudoId>> = HashMap::new();
+        for bb in &func.blocks {
+            let mut r = HashSet::new();
+            for insn in &bb.insns {
+                for &c in &candidates {
+                    if r.contains(&c) {
+                        continue;
+                    }
+                    let whole = MemLoc {
+                        base: MemBase::Local(c),
+                        offset: Some(0),
+                        size: 0,
+                        typ: None,
+                    };
+                    if self.may_read(insn, &whole) {
+                        r.insert(c);
                     }
                 }
             }
+            reads.insert(bb.id, r);
         }
-        succs.insert(bb.id, s);
-    }
 
-    // Start everything dead and remove: the greatest fixed point is the
-    // right one here, so a loop that never reads a local keeps it dead.
-    let mut dead_in: HashMap<BasicBlockId, HashSet<PseudoId>> = HashMap::new();
-    for bb in &func.blocks {
-        dead_in.insert(bb.id, candidates.clone());
-    }
+        // Start everything dead and remove: the greatest fixed point is the
+        // right one here, so a loop that never reads a local keeps it dead.
+        let mut dead_in: HashMap<BasicBlockId, HashSet<PseudoId>> = HashMap::new();
+        for bb in &func.blocks {
+            dead_in.insert(bb.id, candidates.clone());
+        }
 
-    let mut converged = false;
-    for _ in 0..MAX_SWEEPS {
-        let mut moved = false;
-        for bb in func.blocks.iter().rev() {
-            let succ = succs.get(&bb.id).map(Vec::as_slice).unwrap_or(&[]);
-            // No successors is an exit: the frame is gone, so everything a
-            // non-escaping local held is unobservable.
-            let mut dead_out = candidates.clone();
-            for s in succ {
-                if let Some(d) = dead_in.get(s) {
-                    dead_out.retain(|c| d.contains(c));
+        let mut converged = false;
+        for _ in 0..MAX_SWEEPS {
+            let mut moved = false;
+            for bb in func.blocks.iter().rev() {
+                let succ = &bb.children;
+                // No successors is an exit: the frame is gone, so everything a
+                // non-escaping local held is unobservable.
+                let mut dead_out = candidates.clone();
+                for s in succ {
+                    if let Some(d) = dead_in.get(s) {
+                        dead_out.retain(|c| d.contains(c));
+                    }
+                }
+                let mut d_in = dead_out.clone();
+                if let Some(r) = reads.get(&bb.id) {
+                    d_in.retain(|c| !r.contains(c));
+                }
+                out.insert(bb.id, dead_out);
+                if dead_in.get(&bb.id) != Some(&d_in) {
+                    dead_in.insert(bb.id, d_in);
+                    moved = true;
                 }
             }
-            let mut d_in = dead_out.clone();
-            if let Some(r) = reads.get(&bb.id) {
-                d_in.retain(|c| !r.contains(c));
-            }
-            out.insert(bb.id, dead_out);
-            if dead_in.get(&bb.id) != Some(&d_in) {
-                dead_in.insert(bb.id, d_in);
-                moved = true;
+            if !moved {
+                converged = true;
+                break;
             }
         }
-        if !moved {
-            converged = true;
-            break;
+        if !converged {
+            // An unfinished greatest fixed point still says "dead" for things
+            // that are read. Answer nothing rather than something wrong.
+            for bb in &func.blocks {
+                out.insert(bb.id, HashSet::new());
+            }
         }
+        out
     }
-    if !converged {
-        // An unfinished greatest fixed point still says "dead" for things
-        // that are read. Answer nothing rather than something wrong.
-        for bb in &func.blocks {
-            out.insert(bb.id, HashSet::new());
-        }
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{BasicBlock, Module, Pseudo};
+    use crate::ir::{BasicBlock, FenceScope, MemoryOrder, Module, Pseudo};
     use crate::target::Target;
 
     fn host_types() -> TypeTable {
@@ -418,8 +375,8 @@ mod tests {
             f.add_pseudo(Pseudo::sym(PseudoId(1), "b.0".into()));
             f.add_pseudo(Pseudo::val(PseudoId(5), 7));
             f.add_pseudo(Pseudo::val(PseudoId(6), 9));
-            f.add_local("a.0", PseudoId(0), i32t, false, false, None, None);
-            f.add_local("b.0", PseudoId(1), i32t, false, false, None, None);
+            f.add_local("a.0", PseudoId(0), i32t, None, None);
+            f.add_local("b.0", PseudoId(1), i32t, None, None);
             f.next_pseudo = 60;
             Build { f, types }
         }
@@ -436,7 +393,7 @@ mod tests {
 
         fn run(&mut self) -> bool {
             self.f.entry = self.f.blocks[0].id;
-            self.f.rebuild_block_idx();
+            self.f.rebuild_parents();
             let mi = ModuleInfo::build(&Module::default(), &self.types);
             super::run(&mut self.f, &self.types, &mi)
         }
@@ -482,6 +439,35 @@ mod tests {
         assert!(b.run());
         assert_eq!(b.op(0, 1), Opcode::Nop, "the first store is overwritten");
         assert_eq!(b.op(0, 2), Opcode::Store);
+    }
+
+    /// A signal fence between two stores revives the first: a handler that
+    /// runs at the fence may read it, though the fence emits nothing.
+    #[test]
+    fn dse_a_signal_fence_between_two_stores_revives_the_first() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        let mut fence = Instruction::new(Opcode::Fence).with_memory_order(MemoryOrder::SeqCst);
+        fence.extra_mut().fence_scope = FenceScope::Signal;
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
+                fence,
+                Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, 32),
+                Instruction::new(Opcode::Ret).with_src(PseudoId(20)),
+            ],
+            vec![],
+        );
+        b.run();
+        assert_eq!(
+            b.op(0, 1),
+            Opcode::Store,
+            "the fence orders the first store"
+        );
+        assert_eq!(b.op(0, 2), Opcode::Fence);
     }
 
     /// **The read-modify-write shape.** A read of the bytes between the two
@@ -697,7 +683,11 @@ mod tests {
     fn dse_a_volatile_local_is_never_deleted() {
         let mut b = Build::new();
         let i32t = b.types.int_id;
-        b.f.add_local("a.0", PseudoId(0), i32t, true, false, None, None);
+        let vol_i32 = b.types.intern(crate::types::Type::with_modifiers(
+            crate::types::TypeKind::Int,
+            crate::types::TypeModifiers::VOLATILE,
+        ));
+        b.f.add_local("a.0", PseudoId(0), vol_i32, None, None);
         b.block(
             0,
             vec![

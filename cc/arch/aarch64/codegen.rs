@@ -20,6 +20,7 @@
 use crate::arch::aarch64::inline_asm::{asm_reg_name_32, asm_reg_name_64};
 use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{FrameBase, IncomingOff, Loc, LocalSlot, Reg, VReg};
+use crate::arch::codegen::SelectOperands;
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
@@ -75,7 +76,8 @@ pub struct Aarch64CodeGen {
     pic_mode: bool,
     /// Counter for generating unique labels (atomic loops, etc.)
     unique_label_counter: u32,
-    /// Stack allocation size for locals (for zero_stack_frame)
+    /// Bytes the prologue allocates for locals: what a dynamically aligned
+    /// frame addresses them from.
     pub(super) stack_alloc_size: i32,
     /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
     pub(super) sym_slots: HashMap<PseudoId, crate::arch::codegen::SymSlot>,
@@ -303,6 +305,73 @@ impl Aarch64CodeGen {
 
     /// Emit conditional branch: test condition and branch accordingly
     /// Returns true if an early return was taken (for constant conditions)
+    /// Set the flags for `cond != 0`, reading `cond` at the width its value
+    /// is held at -- see [`crate::arch::codegen::ValueWidths`] -- through
+    /// `scratch` where it is not already in a register. The one test `Cbr`
+    /// and `Select` both make. A wider-than-64-bit condition also uses X10,
+    /// or X11 when `scratch` is X10, so neither may hold anything live.
+    fn emit_condition_test(&mut self, cond: PseudoId, scratch: Reg) {
+        let bits = self.base.value_widths.bits(cond);
+        let loc = self.get_location(cond);
+        if bits > 64 {
+            if let l @ (Loc::Stack(_) | Loc::IncomingArg(_)) = &loc {
+                // Both halves, ORed: nonzero if either is.
+                let other = if scratch == Reg::X10 {
+                    Reg::X11
+                } else {
+                    Reg::X10
+                };
+                self.push_lir(Aarch64Inst::Ldp {
+                    size: OperandSize::B64,
+                    addr: self.loc_mem(l).unwrap(),
+                    dst1: scratch,
+                    dst2: other,
+                });
+                self.push_lir(Aarch64Inst::Orr {
+                    size: OperandSize::B64,
+                    src1: scratch,
+                    src2: GpOperand::Reg(other),
+                    dst: scratch,
+                });
+                self.push_lir(Aarch64Inst::Cmp {
+                    size: OperandSize::B64,
+                    src1: scratch,
+                    src2: GpOperand::Imm(0),
+                });
+                return;
+            }
+        }
+        let bits = bits.min(64);
+        let reg = match loc {
+            Loc::Reg(r) if bits >= 32 => r,
+            _ => {
+                self.emit_move(cond, scratch, bits);
+                // A register keeps whatever lies above a narrow value.
+                match bits {
+                    8 => self.push_lir(Aarch64Inst::Uxtb {
+                        src: scratch,
+                        dst: scratch,
+                    }),
+                    16 => self.push_lir(Aarch64Inst::Uxth {
+                        src: scratch,
+                        dst: scratch,
+                    }),
+                    _ => {}
+                }
+                scratch
+            }
+        };
+        self.push_lir(Aarch64Inst::Cmp {
+            size: if bits <= 32 {
+                OperandSize::B32
+            } else {
+                OperandSize::B64
+            },
+            src1: reg,
+            src2: GpOperand::Imm(0),
+        });
+    }
+
     fn emit_cbr(&mut self, insn: &Instruction) -> bool {
         let Some(&cond) = insn.src.first() else {
             return false;
@@ -312,49 +381,8 @@ impl Aarch64CodeGen {
         let (scratch0, _, _) = Reg::scratch_regs();
 
         match &loc {
-            Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::Cmp {
-                    size: OperandSize::B64,
-                    src1: *r,
-                    src2: GpOperand::Imm(0),
-                });
-            }
-            loc @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
-                // A condition can be an incoming stack argument as readily as
-                // a local; both are just a value in memory here.
-                let mem = self.loc_mem(loc).unwrap();
-                if insn.size >= 128 {
-                    // 128-bit: load both halves and ORR them to check for non-zero
-                    let (_, scratch1, _) = Reg::scratch_regs();
-                    self.push_lir(Aarch64Inst::Ldp {
-                        size: OperandSize::B64,
-                        addr: mem,
-                        dst1: scratch0,
-                        dst2: scratch1,
-                    });
-                    self.push_lir(Aarch64Inst::Orr {
-                        size: OperandSize::B64,
-                        src1: scratch0,
-                        src2: GpOperand::Reg(scratch1),
-                        dst: scratch0,
-                    });
-                    self.push_lir(Aarch64Inst::Cmp {
-                        size: OperandSize::B64,
-                        src1: scratch0,
-                        src2: GpOperand::Imm(0),
-                    });
-                } else {
-                    self.push_lir(Aarch64Inst::Ldr {
-                        size: OperandSize::B64,
-                        addr: mem,
-                        dst: scratch0,
-                    });
-                    self.push_lir(Aarch64Inst::Cmp {
-                        size: OperandSize::B64,
-                        src1: scratch0,
-                        src2: GpOperand::Imm(0),
-                    });
-                }
+            Loc::Reg(_) | Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Global(_) => {
+                self.emit_condition_test(cond, scratch0);
             }
             Loc::Imm(v) => {
                 let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
@@ -364,14 +392,6 @@ impl Aarch64CodeGen {
                     });
                 }
                 return true;
-            }
-            Loc::Global(name) => {
-                self.emit_load_global(name, scratch0, OperandSize::B64);
-                self.push_lir(Aarch64Inst::Cmp {
-                    size: OperandSize::B64,
-                    src1: scratch0,
-                    src2: GpOperand::Imm(0),
-                });
             }
             Loc::VReg(v) => {
                 let bit_size = if insn.size == 0 { 64 } else { insn.size };
@@ -481,7 +501,7 @@ impl Aarch64CodeGen {
         };
 
         // Generate comparisons for each case
-        for (lo, hi, target_bb) in insn.switch_cases.clone() {
+        for (lo, hi, target_bb) in insn.extra().switch_cases.clone() {
             let target = Label::block(&self.base.current_fn, target_bb.0);
             if lo == hi {
                 cmp_const(self, scratch0, lo);
@@ -529,7 +549,7 @@ impl Aarch64CodeGen {
             });
         }
 
-        if let Some(default_bb) = insn.switch_default {
+        if let Some(default_bb) = insn.extra().switch_default {
             self.push_lir(Aarch64Inst::B {
                 target: Label::block(&self.base.current_fn, default_bb.0),
             });
@@ -612,16 +632,7 @@ impl Aarch64CodeGen {
                 self.emit_div(insn, types);
             }
 
-            Opcode::SetEq
-            | Opcode::SetNe
-            | Opcode::SetLt
-            | Opcode::SetLe
-            | Opcode::SetGt
-            | Opcode::SetGe
-            | Opcode::SetB
-            | Opcode::SetBe
-            | Opcode::SetA
-            | Opcode::SetAe => {
+            op if op.is_int_comparison() => {
                 self.emit_compare(insn, types);
             }
 
@@ -752,12 +763,7 @@ impl Aarch64CodeGen {
             }
 
             // Floating-point comparisons
-            Opcode::FCmpOEq
-            | Opcode::FCmpONe
-            | Opcode::FCmpOLt
-            | Opcode::FCmpOLe
-            | Opcode::FCmpOGt
-            | Opcode::FCmpOGe => {
+            op if op.is_float_comparison() => {
                 self.emit_fp_compare(insn, types);
             }
 
@@ -866,32 +872,17 @@ impl Aarch64CodeGen {
                 self.emit_atomic_store(insn);
             }
 
-            Opcode::AtomicSwap => {
-                self.emit_atomic_swap(insn);
-            }
-
             Opcode::AtomicCas => {
                 self.emit_atomic_cas(insn);
             }
 
-            Opcode::AtomicFetchAdd => {
-                self.emit_atomic_fetch_add(insn);
-            }
-
-            Opcode::AtomicFetchSub => {
-                self.emit_atomic_fetch_sub(insn);
-            }
-
-            Opcode::AtomicFetchAnd => {
-                self.emit_atomic_fetch_and(insn);
-            }
-
-            Opcode::AtomicFetchOr => {
-                self.emit_atomic_fetch_or(insn);
-            }
-
-            Opcode::AtomicFetchXor => {
-                self.emit_atomic_fetch_xor(insn);
+            Opcode::AtomicSwap
+            | Opcode::AtomicFetchAdd
+            | Opcode::AtomicFetchSub
+            | Opcode::AtomicFetchAnd
+            | Opcode::AtomicFetchOr
+            | Opcode::AtomicFetchXor => {
+                self.emit_atomic_rmw(insn);
             }
 
             Opcode::Fence => {
@@ -1086,10 +1077,10 @@ impl Aarch64CodeGen {
 
     fn emit_call(&mut self, insn: &Instruction, types: &TypeTable) {
         // Get function name (or placeholder for indirect calls)
-        let func_name = if insn.indirect_target.is_some() {
+        let func_name = if insn.extra().indirect_target.is_some() {
             "<indirect>".to_string()
         } else {
-            match &insn.func_name {
+            match &insn.extra().func_name {
                 Some(n) => n.clone(),
                 None => return,
             }
@@ -1099,8 +1090,8 @@ impl Aarch64CodeGen {
         let args_start = self.setup_sret_arg(insn);
 
         // Determine if this is a Darwin variadic call
-        let is_darwin_variadic =
-            self.base.target.os == crate::target::Os::MacOS && insn.variadic_arg_start.is_some();
+        let is_darwin_variadic = self.base.target.os == crate::target::Os::MacOS
+            && insn.extra().variadic_arg_start.is_some();
 
         // Set up arguments and get stack cleanup count
         let stack_args = if is_darwin_variadic {
@@ -1114,7 +1105,7 @@ impl Aarch64CodeGen {
         // address-materialization scratch -- the stacked-argument copy
         // shuttles through it -- so a target parked there before the setup was
         // overwritten and the call branched into the argument data.
-        if let Some(func_addr) = insn.indirect_target {
+        if let Some(func_addr) = insn.extra().indirect_target {
             self.emit_move(func_addr, Reg::X16, 64);
         }
 
@@ -1131,19 +1122,10 @@ impl Aarch64CodeGen {
     /// Emit a select (ternary) instruction using CSEL (integers) or
     /// conditional branch (floats, since CSEL only works on GP registers).
     fn emit_select(&mut self, insn: &Instruction, types: &TypeTable) {
-        let (cond, then_val, else_val) = match (insn.src.first(), insn.src.get(1), insn.src.get(2))
-        {
-            (Some(&c), Some(&t), Some(&e)) => (c, t, e),
-            _ => return,
+        let Some(ops) = SelectOperands::of(insn, types) else {
+            return;
         };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-        let size = insn
-            .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+        let (then_val, else_val) = (ops.then_val, ops.else_val);
 
         // Check if this is a floating-point select
         let is_fp = insn.typ.is_some_and(|t| types.is_float(t))
@@ -1151,24 +1133,21 @@ impl Aarch64CodeGen {
             || matches!(self.get_location(else_val), Loc::VReg(_) | Loc::FImm(..));
 
         if is_fp {
-            self.emit_select_fp(cond, then_val, else_val, target, insn.typ, size, types);
+            self.emit_select_fp(ops, insn.typ, types);
         } else {
-            self.emit_select_int(cond, then_val, else_val, target, size);
+            self.emit_select_int(ops);
         }
     }
 
     /// Emit FP select using conditional branch (CSEL doesn't work on VRegs)
-    #[allow(clippy::too_many_arguments)]
-    fn emit_select_fp(
-        &mut self,
-        cond: PseudoId,
-        then_val: PseudoId,
-        else_val: PseudoId,
-        target: PseudoId,
-        typ: Option<TypeId>,
-        size: u32,
-        types: &TypeTable,
-    ) {
+    fn emit_select_fp(&mut self, ops: SelectOperands, typ: Option<TypeId>, types: &TypeTable) {
+        let SelectOperands {
+            cond,
+            then_val,
+            else_val,
+            target,
+            width: size,
+        } = ops;
         let dst_loc = self.get_location(target);
 
         // Check if condition is a constant
@@ -1180,13 +1159,7 @@ impl Aarch64CodeGen {
             return;
         }
 
-        // Load condition to GP register and compare with zero
-        self.emit_move(cond, Reg::X16, 64);
-        self.push_lir(Aarch64Inst::Cmp {
-            size: OperandSize::B64,
-            src1: Reg::X16,
-            src2: GpOperand::Imm(0),
-        });
+        self.emit_condition_test(cond, Reg::X16);
 
         let then_label = self.next_unique_label("sel_then");
         let done_label = self.next_unique_label("sel_done");
@@ -1213,14 +1186,14 @@ impl Aarch64CodeGen {
     }
 
     /// Emit integer select using CSEL
-    fn emit_select_int(
-        &mut self,
-        cond: PseudoId,
-        then_val: PseudoId,
-        else_val: PseudoId,
-        target: PseudoId,
-        size: u32,
-    ) {
+    fn emit_select_int(&mut self, ops: SelectOperands) {
+        let SelectOperands {
+            cond,
+            then_val,
+            else_val,
+            target,
+            width: size,
+        } = ops;
         let op_size = OperandSize::from_bits(size);
         let dst_loc = self.get_location(target);
         // Use X16 as default scratch to avoid clobbering live values
@@ -1235,17 +1208,11 @@ impl Aarch64CodeGen {
         // overwritten by the select's operand, and read back wrong after it.
         let (cond_reg, then_reg, else_reg) = Reg::scratch_regs();
 
-        // Load condition, then and else values
-        self.emit_move(cond, cond_reg, 64);
+        // The test first, while the other two scratches are still free for
+        // it; loading the arms after it leaves the flags alone.
+        self.emit_condition_test(cond, cond_reg);
         self.emit_move(then_val, then_reg, size);
         self.emit_move(else_val, else_reg, size);
-
-        // Compare condition with zero
-        self.push_lir(Aarch64Inst::Cmp {
-            size: OperandSize::B64,
-            src1: cond_reg,
-            src2: GpOperand::Imm(0),
-        });
 
         // Use csel: if cond != 0, select then_val, else select else_val
         self.push_lir(Aarch64Inst::Csel {

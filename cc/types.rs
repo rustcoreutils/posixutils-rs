@@ -9,6 +9,7 @@
 // Compositional type model with interning for efficient comparison.
 //
 
+use crate::abi::CallingConv;
 use crate::float::{ComplexRoutineFormat, FpFormat};
 use crate::strings::{StringId, StringTable as IdentTable};
 use crate::target::{Arch, CharSignedness, IntType, Os, Target};
@@ -60,9 +61,114 @@ pub struct StructMember {
     /// need not be aligned. The name was `storage_unit_size`, which was only
     /// ever true of the unpacked case.
     pub access_bytes: Option<u32>,
-    /// Explicit alignment from _Alignas specifier (C11 6.7.5)
-    /// None means use natural alignment for the type
-    pub explicit_align: Option<u32>,
+    /// What the member's own declaration says about its alignment. See
+    /// [`TypeTable::member_alignment`] for how it combines with the type's.
+    pub align: MemberAlign,
+}
+
+/// What a member's declaration says about its alignment, apart from what its
+/// type says.
+///
+/// Both halves are written on the member -- in its specifiers, which give them
+/// to every declarator of the declaration, or after one declarator, which
+/// gives them to that one -- and a struct-level `packed` is `packed` on every
+/// member, which is how gcc defines it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemberAlign {
+    /// `_Alignas(n)` or `__attribute__((aligned(n)))`: raises the member's
+    /// alignment, and never lowers it.
+    pub written: Option<u32>,
+    /// `__attribute__((packed))`: drops the alignment the member's type
+    /// demands to one byte, and packs a bit-field to the bit.
+    pub packed: bool,
+}
+
+impl MemberAlign {
+    /// No alignment written and not packed: the type's own alignment.
+    pub const NATURAL: MemberAlign = MemberAlign {
+        written: None,
+        packed: false,
+    };
+
+    /// Both declarations' alignments at once: the larger written alignment,
+    /// and packed if either is.
+    pub fn merge(self, other: MemberAlign) -> MemberAlign {
+        MemberAlign {
+            written: self.written.max(other.written),
+            packed: self.packed || other.packed,
+        }
+    }
+}
+
+/// Where a bit-field lies: the access span its bits are read and written
+/// through, and the bits within it. See [`StructMember::access_bytes`] for
+/// the span's contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bitfield {
+    /// Byte offset of the access span from the base of the object.
+    pub offset: usize,
+    /// The field's first bit within the span.
+    pub bit_offset: u32,
+    /// The field's width in bits.
+    pub bit_width: u32,
+    /// The span's length in bytes.
+    pub access_bytes: u32,
+}
+
+impl Bitfield {
+    /// The placement the three member fields describe, when they describe
+    /// one: a bit-field of non-zero width.
+    pub fn from_parts(
+        offset: usize,
+        bit_offset: Option<u32>,
+        bit_width: Option<u32>,
+        access_bytes: Option<u32>,
+    ) -> Option<Bitfield> {
+        Some(Bitfield {
+            offset,
+            bit_offset: bit_offset?,
+            bit_width: bit_width.filter(|&w| w > 0)?,
+            access_bytes: access_bytes?,
+        })
+    }
+
+    /// The bytes the field's own bits occupy, from the object's base --
+    /// narrower than the access span, which covers bytes other members own:
+    /// what decides whether two initializers describe overlapping storage.
+    pub fn own_bytes(&self) -> std::ops::Range<usize> {
+        own_bit_bytes(self.offset, self.bit_offset, self.bit_width)
+    }
+}
+
+/// The bytes bits `[bit_offset, bit_offset + bit_width)` of the span at
+/// `offset` occupy: at least one, so that a zero-width field still names a
+/// place.
+pub fn own_bit_bytes(offset: usize, bit_offset: u32, bit_width: u32) -> std::ops::Range<usize> {
+    let start = offset + (bit_offset / 8) as usize;
+    let end = offset + (bit_offset + bit_width).div_ceil(8) as usize;
+    start..end.max(start + 1)
+}
+
+impl StructMember {
+    /// This member's placement, if it is a bit-field of non-zero width.
+    pub fn bitfield(&self) -> Option<Bitfield> {
+        Bitfield::from_parts(
+            self.offset,
+            self.bit_offset,
+            self.bit_width,
+            self.access_bytes,
+        )
+    }
+
+    /// Does an initializer reach this member?
+    ///
+    /// Everything but an unnamed bit-field, which is padding rather than a
+    /// member (C17 6.7.2.1p12) and is skipped by positional initialization
+    /// (6.7.9p9). An anonymous structure or union *is* reached: it is the
+    /// member its own members live in (6.7.2.1p13).
+    pub fn is_initializable(&self) -> bool {
+        self.name != StringId::EMPTY || self.bit_width.is_none()
+    }
 }
 
 /// Information about a struct/union member lookup
@@ -80,6 +186,45 @@ pub struct MemberInfo {
     /// contract -- it is not always a storage unit, and not always a power of
     /// two.
     pub access_bytes: Option<u32>,
+    /// The qualifiers of the anonymous structures and unions the lookup
+    /// passed through to reach the member, as [`Type::MEMBER_QUALIFIERS`]
+    /// selects them.
+    ///
+    /// `struct { volatile struct { int a; }; } s;` makes `s.a` a member of a
+    /// volatile object (C17 6.7.2.1p13 makes it a member of `s`, and it lives
+    /// inside the anonymous one), so `s.a` is volatile although neither `s`
+    /// nor `a` was declared so. `typ` is still the declared type; apply these
+    /// through [`TypeTable::subobject_type`].
+    pub quals: TypeModifiers,
+}
+
+impl MemberInfo {
+    /// This member's placement, if it is a bit-field of non-zero width.
+    pub fn bitfield(&self) -> Option<Bitfield> {
+        Bitfield::from_parts(
+            self.offset,
+            self.bit_offset,
+            self.bit_width,
+            self.access_bytes,
+        )
+    }
+
+    /// A stand-in for a member lookup that failed, occupying the whole object
+    /// at offset 0 with type `typ`.
+    ///
+    /// Only reachable once the parser has already reported the unknown
+    /// member, so what it answers never reaches an object file; it exists so
+    /// the linearizer can keep walking rather than panic.
+    pub fn standing_in(typ: TypeId) -> MemberInfo {
+        MemberInfo {
+            offset: 0,
+            typ,
+            bit_offset: None,
+            bit_width: None,
+            access_bytes: None,
+            quals: TypeModifiers::empty(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -207,6 +352,13 @@ bitflags::bitflags! {
         // elements -- storage only, see DECISIONS.md -- and this is what tells
         // it apart from a real array, which decays where a vector would not.
         const VECTOR = 1 << 18;
+
+        // `__builtin_ms_va_list`: a `char *` that `__builtin_va_arg` walks
+        // by the Microsoft x64 convention. gcc makes it a variant of `char *`
+        // -- assignable to and from one without a diagnostic -- that is
+        // still the one pointer `va_arg` walks as a list, and this bit is
+        // that variant.
+        const MS_VA_LIST = 1 << 19;
     }
 }
 
@@ -318,6 +470,11 @@ pub struct Type {
     /// Set via __attribute__((noreturn)) or _Noreturn keyword
     pub noreturn: bool,
 
+    /// The calling convention of a function type: `__attribute__((ms_abi))`
+    /// makes it [`CallingConv::Win64`]. Part of the type, so two function
+    /// types differing only here are distinct and incompatible.
+    pub conv: CallingConv,
+
     /// Composite type data (for struct, union, enum)
     pub composite: Option<Box<CompositeType>>,
 
@@ -336,6 +493,7 @@ impl Default for Type {
             params: None,
             variadic: false,
             noreturn: false,
+            conv: CallingConv::C,
             composite: None,
             explicit_align: None,
         }
@@ -542,10 +700,12 @@ impl Type {
         const REDUNDANT_SIZE: TypeModifiers = TypeModifiers::SHORT
             .union(TypeModifiers::LONG)
             .union(TypeModifiers::LONGLONG);
+        // `__builtin_ms_va_list` is a `char *` to everything but `va_arg`.
         let ignored = Self::QUALIFIERS
             .union(redundant_signed)
             .union(REDUNDANT_SIZE)
-            .union(Self::DECL_SPECIFIERS);
+            .union(Self::DECL_SPECIFIERS)
+            .union(TypeModifiers::MS_VA_LIST);
 
         // Compare modifiers (ignoring top-level qualifiers)
         let self_mods = self.modifiers.difference(ignored);
@@ -574,6 +734,13 @@ impl Type {
 
         // Compare variadic flag
         if self.variadic != other.variadic {
+            return false;
+        }
+
+        // A function type's calling convention is part of it: gcc calls
+        // `long (*)(long)` and `long (__attribute__((ms_abi)) *)(long)`
+        // incompatible, and a redeclaration that changes it conflicting.
+        if self.conv != other.conv {
             return false;
         }
 
@@ -719,6 +886,7 @@ enum TypeKey {
         params: Option<Vec<TypeId>>,
         variadic: bool,
         noreturn: bool,
+        conv: CallingConv,
         modifiers: u32,
     },
 }
@@ -730,7 +898,7 @@ enum TypeKey {
 /// exist at all is an error, while one that exists but is almost certainly a
 /// mistake is a warning. Matching that split is what lets code which builds
 /// today keep building.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignFault {
     /// No conversion exists: a pointer against a floating type, an aggregate
     /// against anything but a compatible aggregate, or a `void` value.
@@ -790,6 +958,19 @@ impl AssignFault {
 enum TopLevelQualifiers {
     Ignored,
     Significant,
+}
+
+/// Whether a comparison lets an enumerated type match its integer type.
+///
+/// For compatibility it does: C17 6.7.2.2p4 makes every enumerated type
+/// compatible with one integer type. A typedef, though, may be redefined only
+/// to denote the *same* type (6.7p3), and an enum is not the same type as the
+/// integer it is compatible with -- gcc rejects `typedef enum E T; typedef
+/// unsigned T;`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnumMatch {
+    Integer,
+    Distinct,
 }
 
 const DEFAULT_TYPE_TABLE_CAPACITY: usize = 65536;
@@ -861,8 +1042,21 @@ pub struct TypeTable {
     pub char_ptr_id: TypeId,
     /// `const char *`, the string operand of `<string.h>` and `<stdio.h>`.
     pub const_char_ptr_id: TypeId,
+    /// `volatile void *`, the flag operand of `__atomic_test_and_set`.
+    pub volatile_void_ptr_id: TypeId,
+    /// `const volatile void *`, the object operand of the lock-free queries.
+    pub const_volatile_void_ptr_id: TypeId,
+    /// `int *`, `float *`, `double *` and `long double *`: the out
+    /// parameters of `frexp` and `modf`.
+    pub int_ptr_id: TypeId,
+    pub float_ptr_id: TypeId,
+    pub double_ptr_id: TypeId,
+    pub longdouble_ptr_id: TypeId,
     /// `__builtin_va_list`, the last parameter of `vprintf` and its siblings.
     pub va_list_id: TypeId,
+    /// `__builtin_ms_va_list`: the `char *` variant
+    /// [`TypeModifiers::MS_VA_LIST`] marks.
+    pub ms_va_list_id: TypeId,
 }
 
 /// Parenthesize a declarator that has reached a `*` before an array or
@@ -920,7 +1114,14 @@ impl TypeTable {
             const_void_ptr_id: TypeId::INVALID,
             char_ptr_id: TypeId::INVALID,
             const_char_ptr_id: TypeId::INVALID,
+            volatile_void_ptr_id: TypeId::INVALID,
+            const_volatile_void_ptr_id: TypeId::INVALID,
+            int_ptr_id: TypeId::INVALID,
+            float_ptr_id: TypeId::INVALID,
+            double_ptr_id: TypeId::INVALID,
+            longdouble_ptr_id: TypeId::INVALID,
             va_list_id: TypeId::INVALID,
+            ms_va_list_id: TypeId::INVALID,
         };
 
         // Pre-intern common basic types
@@ -1028,7 +1229,25 @@ impl TypeTable {
         table.char_ptr_id = table.intern(Type::pointer(table.char_id));
         let const_char = table.intern(Type::with_modifiers(TypeKind::Char, TypeModifiers::CONST));
         table.const_char_ptr_id = table.intern(Type::pointer(const_char));
+        let volatile_void = table.intern(Type::with_modifiers(
+            TypeKind::Void,
+            TypeModifiers::VOLATILE,
+        ));
+        table.volatile_void_ptr_id = table.intern(Type::pointer(volatile_void));
+        let const_volatile_void = table.intern(Type::with_modifiers(
+            TypeKind::Void,
+            TypeModifiers::CONST | TypeModifiers::VOLATILE,
+        ));
+        table.const_volatile_void_ptr_id = table.intern(Type::pointer(const_volatile_void));
+        table.int_ptr_id = table.intern(Type::pointer(table.int_id));
+        table.float_ptr_id = table.intern(Type::pointer(table.float_id));
+        table.double_ptr_id = table.intern(Type::pointer(table.double_id));
+        table.longdouble_ptr_id = table.intern(Type::pointer(table.longdouble_id));
         table.va_list_id = table.intern(Type::basic(TypeKind::VaList));
+        table.ms_va_list_id = table.intern(Type {
+            modifiers: TypeModifiers::MS_VA_LIST,
+            ..Type::pointer(table.char_id)
+        });
 
         table
     }
@@ -1103,6 +1322,7 @@ impl TypeTable {
                     params: typ.params.clone(),
                     variadic: typ.variadic,
                     noreturn: typ.noreturn,
+                    conv: typ.conv,
                     modifiers: typ.modifiers.bits(),
                 })
             }
@@ -1207,21 +1427,26 @@ impl TypeTable {
             .is_none_or(|c| c.is_complete)
     }
 
-    /// The innermost non-array element type of `id`, or `id` itself when it is
-    /// not an array.
-    ///
-    /// An array's element type must be complete where the array is declared --
-    /// its stride is what makes the type -- so the completeness question for
-    /// `struct U a[2][3]` is about `struct U`, however many levels deep.
-    pub fn array_element_deep(&self, id: TypeId) -> TypeId {
-        let mut cur = id;
-        while self.kind(cur) == TypeKind::Array {
-            match self.base_type(cur) {
-                Some(next) if next != cur => cur = next,
-                _ => break,
-            }
+    /// Whether `member` is a flexible array member: an array with no bound,
+    /// which C17 6.7.2.1p18 allows only as the last member of a structure.
+    pub fn is_flexible_array_member(&self, member: &StructMember) -> bool {
+        member.bit_width.is_none() && self.unsized_array_levels(member.typ) > 0
+    }
+
+    /// Whether an object of type `id` ends in storage with no bound: it is an
+    /// array of unknown size, or a structure whose flexible array member is
+    /// last.
+    pub fn has_unbounded_tail(&self, id: TypeId) -> bool {
+        match self.kind(id) {
+            TypeKind::Array => self.get(id).array_size.is_none(),
+            TypeKind::Struct => self
+                .get(id)
+                .composite
+                .as_ref()
+                .and_then(|c| c.members.last())
+                .is_some_and(|m| self.is_flexible_array_member(m)),
+            _ => false,
         }
-        cur
     }
 
     /// How many array levels of `id`, outermost-first, have no extent.
@@ -1328,6 +1553,15 @@ impl TypeTable {
         let typ = self.get(id);
 
         match typ.kind {
+            TypeKind::Pointer if typ.modifiers.contains(TypeModifiers::MS_VA_LIST) => {
+                let mut name = String::from("__builtin_ms_va_list");
+                if !decl.is_empty() {
+                    name.push(' ');
+                    name.push_str(&decl);
+                }
+                name
+            }
+
             TypeKind::Pointer => {
                 // Qualifiers on the pointer belong after the star -- the
                 // `const` in `char *const` qualifies the pointer, not the char.
@@ -1376,6 +1610,13 @@ impl TypeTable {
             }
 
             TypeKind::Function => {
+                // gcc's spelling of a convention other than the default,
+                // inside the declarator: `long (__attribute__((ms_abi)) *)(long)`.
+                let decl = match typ.conv {
+                    CallingConv::C => decl,
+                    CallingConv::Win64 if decl.is_empty() => " __attribute__((ms_abi))".to_string(),
+                    CallingConv::Win64 => format!("__attribute__((ms_abi)) {decl}"),
+                };
                 let mut sig = parenthesize_if_pointer(decl);
                 sig.push('(');
                 match &typ.params {
@@ -1501,6 +1742,13 @@ impl TypeTable {
     /// Is this a GNU `vector_size` type?
     pub fn is_vector(&self, id: TypeId) -> bool {
         self.get(id).modifiers.contains(TypeModifiers::VECTOR)
+    }
+
+    /// Is this `__builtin_ms_va_list`, the one pointer `__builtin_va_arg`
+    /// walks by the Microsoft x64 convention?
+    pub fn is_ms_va_list(&self, id: TypeId) -> bool {
+        let typ = self.get(id);
+        typ.kind == TypeKind::Pointer && typ.modifiers.contains(TypeModifiers::MS_VA_LIST)
     }
 
     /// Check if type is a complex floating point type
@@ -1741,15 +1989,13 @@ impl TypeTable {
             if (t_void && v_fn) || (v_void && t_fn) {
                 return Some(AssignFault::FunctionPointerVoid);
             }
-            if t_void || v_void {
-                return None;
-            }
-            if !self.types_compatible(t_pointee, v_pointee) {
+            if !(t_void || v_void) && !self.types_compatible(t_pointee, v_pointee) {
                 return Some(AssignFault::PointerMismatch);
             }
-            // Compatible targets, but the assignment must not silently gain
-            // write access: the target's qualifiers have to include the
-            // source's.
+            // Compatible targets, or one of them `void`, but the assignment
+            // must not silently gain write access: the target's qualifiers
+            // have to include the source's (6.5.16.1p1 says so of both
+            // cases), so `void *v = (const int *)p` is diagnosed too.
             let t_quals = self.qualifiers(t_pointee);
             let v_quals = self.qualifiers(v_pointee);
             return (!t_quals.contains(v_quals)).then_some(AssignFault::QualifierDiscard);
@@ -1867,6 +2113,11 @@ impl TypeTable {
         }
     }
 
+    /// Is `id` `_Atomic`-qualified (C17 6.7.3)?
+    pub fn is_atomic(&self, id: TypeId) -> bool {
+        self.modifiers(id).contains(TypeModifiers::ATOMIC)
+    }
+
     /// The top-level type qualifiers of `id` (C17 6.7.3p1).
     ///
     /// Only the qualifiers: `modifiers` answers with the declaration
@@ -1958,8 +2209,7 @@ impl TypeTable {
                     composite
                         .members
                         .iter()
-                        // Skip unnamed bitfield padding
-                        .filter(|m| m.name != StringId::EMPTY || m.bit_width.is_none())
+                        .filter(|m| m.is_initializable())
                         .map(|m| self.count_scalar_fields(m.typ))
                         .sum()
                 } else {
@@ -1967,12 +2217,17 @@ impl TypeTable {
                 }
             }
             TypeKind::Union => {
-                // Union only initializes first named member
+                // A union's initializer initializes its first member (C17
+                // 6.7.9p17) -- which may be an anonymous aggregate, so the
+                // test is the one positional initialization uses, not "has a
+                // name": asking for a name counted `q` in
+                // `union { struct { int a, b; }; long q; }` while the
+                // initializer walk filled `a` and `b`.
                 if let Some(composite) = self.get(id).composite.as_ref() {
                     composite
                         .members
                         .iter()
-                        .find(|m| m.name != StringId::EMPTY)
+                        .find(|m| m.is_initializable())
                         .map(|m| self.count_scalar_fields(m.typ))
                         .unwrap_or(1)
                 } else {
@@ -2025,7 +2280,10 @@ impl TypeTable {
     /// unsigned and is written neither way. Using [`Self::is_unsigned`] here would make
     /// a type printer say `unsigned char` for a declaration that says `char`.
     pub fn spelled_unsigned(&self, id: TypeId) -> bool {
-        self.get(id).modifiers.contains(TypeModifiers::UNSIGNED)
+        // An enum's `UNSIGNED` records the signedness of its integer type;
+        // nothing spelled it, and `unsigned enum E` is not a type.
+        let typ = self.get(id);
+        typ.kind != TypeKind::Enum && typ.modifiers.contains(TypeModifiers::UNSIGNED)
     }
 
     /// The common type of two operands under the usual arithmetic conversions
@@ -2144,9 +2402,12 @@ impl TypeTable {
             TypeKind::Bool => 0,
             TypeKind::Char => 1,
             TypeKind::Short => 2,
-            // An enumerated type has the rank of its compatible type, which
-            // here is always `int`.
-            TypeKind::Int | TypeKind::Enum => 3,
+            TypeKind::Int => 3,
+            // An enumerated type has the rank of its compatible type
+            // (6.3.1.1p1); one not yet completed has no other to go on.
+            TypeKind::Enum => self
+                .enum_compatible_type(id)
+                .map_or(3, |int| self.integer_rank(int)),
             TypeKind::Long => 4,
             TypeKind::LongLong => 5,
             TypeKind::Int128 => 6,
@@ -2188,6 +2449,12 @@ impl TypeTable {
     pub fn integer_promote(&self, id: TypeId) -> TypeId {
         match self.kind(id) {
             TypeKind::Bool | TypeKind::Char | TypeKind::Short => self.int_id,
+            // An enumerated type computes as the integer type it is
+            // compatible with, as gcc's does: `e + 1` for an enum whose
+            // members are all non-negative is `unsigned int`, not the enum.
+            TypeKind::Enum => self
+                .enum_compatible_type(id)
+                .map_or(id, |int| self.integer_promote(int)),
             _ => id,
         }
     }
@@ -2513,9 +2780,34 @@ impl TypeTable {
         members: TypeId,
         name: StringId,
     ) -> Option<TypeId> {
-        let quals = self.qualifiers(object) & Type::MEMBER_QUALIFIERS;
-        let declared = self.find_member(members, name)?.typ;
-        Some(self.qualified_with(declared, quals))
+        let info = self.find_member(members, name)?;
+        Some(self.subobject_type(info.typ, self.qualifiers(object) | info.quals))
+    }
+
+    /// The type of a subobject reached inside an object qualified with
+    /// `inherited`: the declared type `declared`, so-qualified (C17
+    /// 6.5.2.3p3/p4).
+    ///
+    /// The one place the rule is written. A member access, an initializer
+    /// storing into a member of a `volatile` object, and a lookup through an
+    /// anonymous `volatile` structure all reach a subobject the same way, and
+    /// only [`Type::MEMBER_QUALIFIERS`] of what they pass through travel.
+    pub fn subobject_type(&mut self, declared: TypeId, inherited: TypeModifiers) -> TypeId {
+        self.qualified_with(declared, inherited & Type::MEMBER_QUALIFIERS)
+    }
+
+    /// Is `member` an anonymous structure or union (C17 6.7.2.1p13) -- one
+    /// whose members are members of the containing aggregate?
+    ///
+    /// An unnamed member of structure or union type *with no tag*. An unnamed
+    /// bit-field is padding, not an anonymous member.
+    pub fn is_anonymous_aggregate(&self, member: &StructMember) -> bool {
+        if member.name != StringId::EMPTY || member.bit_width.is_some() {
+            return false;
+        }
+        let t = self.get(member.typ);
+        matches!(t.kind, TypeKind::Struct | TypeKind::Union)
+            && t.composite.as_ref().is_some_and(|c| c.tag.is_none())
     }
 
     /// Find a member in a struct/union type, including anonymous struct/union members
@@ -2539,40 +2831,24 @@ impl TypeTable {
         name: StringId,
         base_offset: usize,
     ) -> Option<MemberInfo> {
-        let typ = self.get(id);
-        if let Some(ref composite) = typ.composite {
-            for member in &composite.members {
-                if member.name == name {
-                    // Found the member directly
-                    return Some(MemberInfo {
-                        offset: base_offset + member.offset,
-                        typ: member.typ,
-                        bit_offset: member.bit_offset,
-                        bit_width: member.bit_width,
-                        access_bytes: member.access_bytes,
-                    });
-                }
-
-                // Check if this is an anonymous struct/union (name is empty, no tag)
-                // and search recursively in it
-                if member.name == StringId::EMPTY {
-                    let member_type = self.get(member.typ);
-                    let is_anon_aggregate =
-                        matches!(member_type.kind, TypeKind::Struct | TypeKind::Union)
-                            && member_type
-                                .composite
-                                .as_ref()
-                                .is_some_and(|c| c.tag.is_none());
-
-                    if is_anon_aggregate {
-                        if let Some(found) = self.find_member_recursive(
-                            member.typ,
-                            name,
-                            base_offset + member.offset,
-                        ) {
-                            return Some(found);
-                        }
-                    }
+        let composite = self.get(id).composite.as_ref()?;
+        for member in &composite.members {
+            if member.name == name {
+                return Some(MemberInfo {
+                    offset: base_offset + member.offset,
+                    typ: member.typ,
+                    bit_offset: member.bit_offset,
+                    bit_width: member.bit_width,
+                    access_bytes: member.access_bytes,
+                    quals: TypeModifiers::empty(),
+                });
+            }
+            if self.is_anonymous_aggregate(member) {
+                if let Some(mut found) =
+                    self.find_member_recursive(member.typ, name, base_offset + member.offset)
+                {
+                    found.quals |= self.qualifiers(member.typ) & Type::MEMBER_QUALIFIERS;
+                    return Some(found);
                 }
             }
         }
@@ -2588,10 +2864,32 @@ impl TypeTable {
     /// as to point at compatible types, so `char *` and `const char *` are
     /// different types.
     pub fn types_compatible(&self, id1: TypeId, id2: TypeId) -> bool {
-        self.compatible(id1, id2, TopLevelQualifiers::Ignored)
+        self.compatible(id1, id2, TopLevelQualifiers::Ignored, EnumMatch::Integer)
     }
 
-    fn compatible(&self, id1: TypeId, id2: TypeId, quals: TopLevelQualifiers) -> bool {
+    /// Do these two types denote the same type, as a typedef redefinition
+    /// requires (C17 6.7p3)?
+    ///
+    /// Compatibility, minus the two allowances that make different types
+    /// compatible: top-level qualifiers count, and an enumerated type is not
+    /// its integer type. gcc rejects both `typedef int T; typedef const int T;`
+    /// and `typedef enum E T; typedef unsigned T;`.
+    pub fn types_same(&self, id1: TypeId, id2: TypeId) -> bool {
+        self.compatible(
+            id1,
+            id2,
+            TopLevelQualifiers::Significant,
+            EnumMatch::Distinct,
+        )
+    }
+
+    fn compatible(
+        &self,
+        id1: TypeId,
+        id2: TypeId,
+        quals: TopLevelQualifiers,
+        enums: EnumMatch,
+    ) -> bool {
         // Quick check: same TypeId means same type
         if id1 == id2 {
             return true;
@@ -2599,6 +2897,14 @@ impl TypeTable {
         if quals == TopLevelQualifiers::Significant && self.qualifiers(id1) != self.qualifiers(id2)
         {
             return false;
+        }
+        // C17 6.7.2.2p4: an enumerated type is compatible with its integer
+        // type. The qualifiers have been settled above, so what is left is a
+        // comparison of two unqualified integer types.
+        if enums == EnumMatch::Integer {
+            if let Some((a, b)) = self.enum_as_integer(id1, id2) {
+                return self.compatible(a, b, TopLevelQualifiers::Ignored, enums);
+            }
         }
         if !self.get(id1).compatible_ignoring_base(self.get(id2)) {
             return false;
@@ -2614,7 +2920,7 @@ impl TypeTable {
         // its declared type, so `void f(const int)` and `void f(int)` are one
         // type.
         let base_ok = match (self.get(id1).base, self.get(id2).base) {
-            (Some(a), Some(b)) => self.compatible(a, b, TopLevelQualifiers::Significant),
+            (Some(a), Some(b)) => self.compatible(a, b, TopLevelQualifiers::Significant, enums),
             (None, None) => true,
             _ => false,
         };
@@ -2625,9 +2931,54 @@ impl TypeTable {
             (Some(a), Some(b)) => a
                 .iter()
                 .zip(b.iter())
-                .all(|(&x, &y)| self.parameters_compatible(x, y)),
+                .all(|(&x, &y)| self.parameters_compatible(x, y, enums)),
             _ => true,
         }
+    }
+
+    /// An enumerated type meeting a type that is not one, with the enum
+    /// replaced by the integer type it is compatible with; `None` for any
+    /// other pairing.
+    ///
+    /// Two enums are left alone: different enumerated types are not
+    /// compatible even when their integer types agree, and an enum meeting
+    /// its own forward declaration is decided by its tag.
+    fn enum_as_integer(&self, id1: TypeId, id2: TypeId) -> Option<(TypeId, TypeId)> {
+        let is_enum = |id| self.kind(id) == TypeKind::Enum;
+        match (is_enum(id1), is_enum(id2)) {
+            (true, false) => Some((self.enum_compatible_type(id1)?, id2)),
+            (false, true) => Some((id1, self.enum_compatible_type(id2)?)),
+            _ => None,
+        }
+    }
+
+    /// The integer type an enumerated type is compatible with (C17
+    /// 6.7.2.2p4), or `None` for any other type and for an enum whose list
+    /// has not been seen yet.
+    ///
+    /// The parser's `enum_underlying_type` makes the choice when the list
+    /// closes, and records it as the enum's size and its `UNSIGNED` modifier
+    /// -- the two things layout and arithmetic read. This reads them back. An
+    /// eight-byte enum is `long`, as it is for gcc on LP64.
+    pub fn enum_compatible_type(&self, id: TypeId) -> Option<TypeId> {
+        let typ = self.get(id);
+        if typ.kind != TypeKind::Enum {
+            return None;
+        }
+        let composite = typ.composite.as_deref().filter(|c| c.is_complete)?;
+        let unsigned = typ.modifiers.contains(TypeModifiers::UNSIGNED);
+        let int = match (composite.size, unsigned) {
+            (1, false) => IntType::SChar,
+            (1, true) => IntType::UChar,
+            (2, false) => IntType::Short,
+            (2, true) => IntType::UShort,
+            (4, false) => IntType::Int,
+            (4, true) => IntType::UInt,
+            (8, false) => IntType::Long,
+            (8, true) => IntType::ULong,
+            _ => return None,
+        };
+        Some(self.int_type_id(int))
     }
 
     /// Are these two parameter types compatible?
@@ -2639,13 +2990,13 @@ impl TypeTable {
     /// declared with `__CONST_SOCKADDR_ARG` and defined with
     /// `const struct sockaddr *` -- and refusing the pair reported
     /// "conflicting types" for a header and a source file that agree.
-    fn parameters_compatible(&self, a: TypeId, b: TypeId) -> bool {
-        if self.compatible(a, b, TopLevelQualifiers::Ignored) {
+    fn parameters_compatible(&self, a: TypeId, b: TypeId, enums: EnumMatch) -> bool {
+        if self.compatible(a, b, TopLevelQualifiers::Ignored, enums) {
             return true;
         }
         for (union_side, other) in [(a, b), (b, a)] {
             if let Some(member) = self.transparent_union_first_member(union_side) {
-                if self.compatible(member, other, TopLevelQualifiers::Ignored) {
+                if self.compatible(member, other, TopLevelQualifiers::Ignored, enums) {
                     return true;
                 }
             }
@@ -2664,7 +3015,12 @@ impl TypeTable {
     /// association can never be selected because the controlling expression has
     /// been lvalue-converted to an unqualified type.
     pub fn types_compatible_qualified(&self, id1: TypeId, id2: TypeId) -> bool {
-        self.compatible(id1, id2, TopLevelQualifiers::Significant)
+        self.compatible(
+            id1,
+            id2,
+            TopLevelQualifiers::Significant,
+            EnumMatch::Integer,
+        )
     }
 
     /// Compute struct layout with natural alignment
@@ -2677,10 +3033,10 @@ impl TypeTable {
     /// its own. So two bitfields of different declared types share a unit
     /// freely, and a bitfield reuses the padding left by the plain member
     /// before it.
-    /// `pack_cap` is the largest alignment any member may claim: `Some(1)`
-    /// for `__attribute__((packed))`, `Some(n)` for `#pragma pack(n)`, `None`
-    /// for natural alignment. One cap serves both because they are the same
-    /// rule -- gcc's `packed` is `pack(1)` scoped to one declaration.
+    /// `pack_cap` is the `#pragma pack(n)` in force, if any. A struct-level
+    /// `packed` is not a cap but a property of every member, so it arrives in
+    /// each member's [`MemberAlign`]; [`Self::member_alignment`] is the one
+    /// rule that combines the two.
     pub fn compute_struct_layout(
         &self,
         members: &mut [StructMember],
@@ -2696,7 +3052,7 @@ impl TypeTable {
         let bytes_of = |bits: u128| usize::try_from(bits / 8).unwrap_or(usize::MAX);
         let mut max_align = 1usize;
         // Alignment demanded by a zero-width bitfield, on the ABIs where one
-        // demands any. Kept separate because `pack_cap` does not cap it.
+        // demands any. Kept separate because packing does not reduce it.
         let mut zero_width_align = 1usize;
         // The furthest bit any access window reaches. Ordinary members never
         // reach past the running offset, but a window is a power-of-two span
@@ -2705,17 +3061,7 @@ impl TypeTable {
 
         for member in members.iter_mut() {
             let Some(bit_width) = member.bit_width else {
-                // Use explicit alignment from _Alignas if specified, otherwise natural alignment.
-                // A pack cap lowers it; it never raises one, so
-                // `#pragma pack(8)` on an int leaves the int at 4.
-                let natural_align = match pack_cap {
-                    Some(cap) => self.alignment(member.typ).min(cap as usize),
-                    None => self.alignment(member.typ),
-                };
-                let align = member
-                    .explicit_align
-                    .map(|a| a as usize)
-                    .unwrap_or(natural_align);
+                let align = self.member_alignment(member, pack_cap);
                 max_align = max_align.max(align);
 
                 bit_offset = bit_offset.next_multiple_of(align as u128 * 8);
@@ -2742,8 +3088,8 @@ impl TypeTable {
                 // contributes its declared type's alignment, making the same
                 // struct 8 bytes with alignment 4 -- and unlike an ordinary
                 // member's, that contribution survives packing, so it is kept
-                // out of `max_align` (which `pack_cap` caps) and applied
-                // afterwards. Both are gcc's answers on the respective target.
+                // out of `max_align` and applied afterwards. Both are gcc's
+                // answers on the respective target.
                 if self.target_arch == Arch::Aarch64 {
                     zero_width_align = zero_width_align.max(self.alignment(member.typ));
                 }
@@ -2754,12 +3100,21 @@ impl TypeTable {
                 continue;
             }
 
-            max_align = max_align.max(self.alignment(member.typ));
+            let align = self.member_alignment(member, pack_cap);
+            max_align = max_align.max(align);
+            // An alignment written on the field places it, as it places any
+            // member: `int b:3 __attribute__((aligned(8)))` starts at the
+            // next 8-byte boundary, packed or not. Without one, the rules below
+            // place it.
+            if member.align.written.is_some() {
+                bit_offset = bit_offset.next_multiple_of(align as u128 * 8);
+            }
 
             let bit_width = u128::from(bit_width);
-            if pack_cap.is_some() {
-                // Under a pack cap the unit rule is switched off entirely --
-                // not narrowed to the cap. `#pragma pack(2)` lets a 16-bit
+            if Self::packs_bitfield(member, pack_cap) {
+                // Packed -- by `packed` on the field or its aggregate, or by
+                // any pack cap -- the unit rule is switched off entirely, not
+                // narrowed to the cap. `#pragma pack(2)` lets a 16-bit
                 // field starting at bit 1 straddle both the 2- and the 4-byte
                 // boundary, which is gcc's answer and the measurement that
                 // rules out the narrowing reading. So the field takes the next
@@ -2792,17 +3147,41 @@ impl TypeTable {
             bit_offset += bit_width;
         }
 
-        let final_align = match pack_cap {
-            Some(cap) => max_align.min(cap as usize),
-            None => max_align,
-        }
-        .max(zero_width_align);
+        let final_align = max_align.max(zero_width_align);
         // `window_end` is a multiple of 8, so rounding the larger of the two
         // up to the alignment is the byte round-up and the padding at once.
         let size_bits = bit_offset
             .max(window_end)
             .next_multiple_of(final_align as u128 * 8);
         (bytes_of(size_bits), final_align)
+    }
+
+    /// The alignment a struct or union member is laid out at, and contributes
+    /// to its aggregate's: the one rule for `packed` (on the member or the
+    /// whole aggregate), `_Alignas`/`aligned` written on the member, and
+    /// `#pragma pack(n)`, in gcc's order.
+    ///
+    /// `packed` drops the type's alignment to 1 -- including an alignment the
+    /// type itself carries from a typedef's `aligned`. An alignment written on
+    /// the member then raises it, and never lowers it, so `aligned(1)` on an
+    /// `int` member leaves it at 4. A pack cap lowers the result last, written
+    /// alignment included, and never raises it: `#pragma pack(8)` leaves an
+    /// int at 4. Every answer here is gcc's, the same on x86-64 and aarch64.
+    pub fn member_alignment(&self, member: &StructMember, pack_cap: Option<u32>) -> usize {
+        let base = if member.align.packed {
+            1
+        } else {
+            self.alignment(member.typ)
+        };
+        let raised = member.align.written.map_or(base, |w| base.max(w as usize));
+        pack_cap.map_or(raised, |cap| raised.min(cap as usize))
+    }
+
+    /// Whether a bit-field is laid out packed -- at the next free bit, through
+    /// an access span of exactly the bytes it touches -- rather than by the
+    /// unit rule. Any packing does it, `#pragma pack(n)` at any `n` included.
+    fn packs_bitfield(member: &StructMember, pack_cap: Option<u32>) -> bool {
+        member.align.packed || pack_cap.is_some()
     }
 
     /// Get the number of interned types
@@ -2813,9 +3192,9 @@ impl TypeTable {
 
     /// Compute union layout (all members at offset 0)
     /// Returns (total_size, alignment)
-    /// `pack_cap` caps every member's alignment, as for a struct. A union's
-    /// size still follows its widest member; only the alignment, and so the
-    /// trailing padding, can change.
+    /// Members are aligned by [`Self::member_alignment`], as in a struct. A
+    /// union's size still follows its widest member; only the alignment, and
+    /// so the trailing padding, can change.
     pub fn compute_union_layout(
         &self,
         members: &mut [StructMember],
@@ -2845,7 +3224,7 @@ impl TypeTable {
                 // bytes under gcc, not 4. Unpacked the two spellings coincide
                 // on both targets, and gating on the cap keeps that output
                 // bit-identical.
-                member.access_bytes = Some(if pack_cap.is_some() {
+                member.access_bytes = Some(if Self::packs_bitfield(member, pack_cap) {
                     w.div_ceil(8)
                 } else {
                     self.size_bytes(member.typ) as u32
@@ -2873,21 +3252,14 @@ impl TypeTable {
             // A packed bit-field contributes only the bytes it occupies, which
             // is what makes `packed union { unsigned a:20; char c; }` three
             // bytes rather than four.
-            let member_size = match (pack_cap, member.bit_width) {
-                (Some(_), Some(w)) if w > 0 => w.div_ceil(8) as usize,
+            let member_size = match member.bit_width {
+                Some(w) if w > 0 && Self::packs_bitfield(member, pack_cap) => {
+                    w.div_ceil(8) as usize
+                }
                 _ => self.size_bytes(member.typ),
             };
             max_size = max_size.max(member_size);
-            // Use explicit alignment from _Alignas if specified, otherwise natural alignment
-            let natural_align = match pack_cap {
-                Some(cap) => self.alignment(member.typ).min(cap as usize),
-                None => self.alignment(member.typ),
-            };
-            let align = member
-                .explicit_align
-                .map(|a| a as usize)
-                .unwrap_or(natural_align);
-            max_align = max_align.max(align);
+            max_align = max_align.max(self.member_alignment(member, pack_cap));
         }
 
         let max_align = max_align.max(zero_width_align);
@@ -2902,6 +3274,33 @@ impl TypeTable {
 
 #[cfg(test)]
 mod tests {
+    /// A bit-field's own bytes: from the byte its first bit is in to the
+    /// byte its last bit is in, never empty -- narrower than the access span,
+    /// which covers bytes other members own.
+    #[test]
+    fn a_bitfield_owns_the_bytes_its_bits_reach() {
+        use super::{own_bit_bytes, Bitfield};
+        assert_eq!(own_bit_bytes(4, 0, 1), 4..5);
+        assert_eq!(own_bit_bytes(4, 7, 2), 4..6, "straddles a byte boundary");
+        assert_eq!(own_bit_bytes(4, 8, 8), 5..6);
+        assert_eq!(
+            own_bit_bytes(0, 3, 0),
+            0..1,
+            "zero width still names a byte"
+        );
+        let bf = Bitfield::from_parts(8, Some(12), Some(4), Some(4)).unwrap();
+        assert_eq!(bf.own_bytes(), 9..10);
+        assert_eq!(
+            Bitfield::from_parts(8, Some(0), Some(0), Some(4)),
+            None,
+            "zero width"
+        );
+        assert_eq!(
+            Bitfield::from_parts(8, None, None, None),
+            None,
+            "not a bit-field"
+        );
+    }
 
     /// `is_plain_int128` separates the two types `kind()` cannot.
     #[test]
@@ -2939,7 +3338,7 @@ mod tests {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         };
         let composite = |members| CompositeType {
             tag: None,
@@ -3071,7 +3470,7 @@ mod tests {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         };
         let tag = idents.intern("S");
         let composite = CompositeType {
@@ -3328,7 +3727,7 @@ mod tests {
             bit_offset: None,
             bit_width,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         };
         let composite = |members| CompositeType {
             tag: None,
@@ -3594,7 +3993,7 @@ mod tests {
                     bit_offset: None,
                     bit_width: None,
                     access_bytes: None,
-                    explicit_align: None,
+                    align: MemberAlign::NATURAL,
                 },
                 StructMember {
                     name: StringId::EMPTY,
@@ -3603,7 +4002,7 @@ mod tests {
                     bit_offset: None,
                     bit_width: Some(0),
                     access_bytes: None,
-                    explicit_align: None,
+                    align: MemberAlign::NATURAL,
                 },
                 StructMember {
                     name: StringId::EMPTY,
@@ -3612,7 +4011,7 @@ mod tests {
                     bit_offset: None,
                     bit_width: None,
                     access_bytes: None,
-                    explicit_align: None,
+                    align: MemberAlign::NATURAL,
                 },
             ];
             if union_ {
@@ -3640,6 +4039,121 @@ mod tests {
         assert_eq!(layout(&arm, None, true), (4, 4));
         assert_eq!(layout(&x86, Some(1), true), (1, 1));
         assert_eq!(layout(&arm, Some(1), true), (4, 4));
+    }
+
+    /// One rule aligns a member: `packed` (on it, or on its whole aggregate)
+    /// drops its type's alignment to 1, an alignment written on it raises
+    /// that, and a `#pragma pack` cap lowers the result last. Every row is
+    /// gcc's, and gcc gives the same on x86-64 and aarch64.
+    #[test]
+    fn test_member_alignment_rule() {
+        fn member(typ: TypeId, written: Option<u32>, packed: bool) -> StructMember {
+            StructMember {
+                name: StringId::EMPTY,
+                typ,
+                offset: 0,
+                bit_offset: None,
+                bit_width: None,
+                access_bytes: None,
+                align: MemberAlign { written, packed },
+            }
+        }
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            let mut types = TypeTable::new(&Target::new(arch, Os::Linux));
+            let int = types.int_id;
+            // `typedef int ai8 __attribute__((aligned(8)));`
+            let ai8 = types.intern(Type {
+                explicit_align: Some(8),
+                ..types.get(int).clone()
+            });
+            for (m, cap, want) in [
+                (member(int, None, false), None, 4),
+                (member(int, None, true), None, 1),
+                // `aligned(1)` alone cannot lower an int.
+                (member(int, Some(1), false), None, 4),
+                (member(int, Some(2), true), None, 2),
+                (member(int, Some(8), true), None, 8),
+                // `packed` drops a typedef's alignment too.
+                (member(ai8, None, true), None, 1),
+                (member(ai8, None, false), Some(2), 2),
+                // The cap lowers a written alignment, and raises nothing.
+                (member(int, Some(8), false), Some(1), 1),
+                (member(int, Some(8), true), Some(2), 2),
+                (member(int, None, false), Some(8), 4),
+            ] {
+                assert_eq!(
+                    types.member_alignment(&m, cap),
+                    want,
+                    "{arch:?} {:?} cap {cap:?}",
+                    m.align
+                );
+            }
+        }
+    }
+
+    /// `packed` on one member moves only that member, and the aggregate's
+    /// alignment is the largest of what its members then demand. Offsets
+    /// and sizes are gcc's, on both targets.
+    #[test]
+    fn test_packed_member_layout() {
+        let member = |typ, bit_width, packed| StructMember {
+            name: StringId::EMPTY,
+            typ,
+            offset: 0,
+            bit_offset: None,
+            bit_width,
+            access_bytes: None,
+            align: MemberAlign {
+                written: None,
+                packed,
+            },
+        };
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            let types = TypeTable::new(&Target::new(arch, Os::Linux));
+            let (c, i, l) = (types.char_id, types.int_id, types.long_id);
+
+            // struct { char a; long b __attribute__((packed)); int c; }
+            let mut m = vec![
+                member(c, None, false),
+                member(l, None, true),
+                member(i, None, false),
+            ];
+            assert_eq!(types.compute_struct_layout(&mut m, None), (16, 4));
+            assert_eq!((m[1].offset, m[2].offset), (1, 12));
+
+            // struct { char a; int b:12 __attribute__((packed)); char c; }:
+            // the field takes the next free bit and adds no alignment.
+            let mut m = vec![
+                member(c, None, false),
+                member(i, Some(12), true),
+                member(c, None, false),
+            ];
+            assert_eq!(types.compute_struct_layout(&mut m, None), (4, 1));
+            assert_eq!((m[1].offset, m[1].bit_offset), (1, Some(0)));
+            assert_eq!(m[1].access_bytes, Some(2));
+            assert_eq!(m[2].offset, 3);
+
+            // #pragma pack(2): struct { char a; int b __attribute__((packed)); int c; }
+            let mut m = vec![
+                member(c, None, false),
+                member(i, None, true),
+                member(i, None, false),
+            ];
+            assert_eq!(types.compute_struct_layout(&mut m, Some(2)), (10, 2));
+            assert_eq!((m[1].offset, m[2].offset), (1, 6));
+
+            // union { char a; int b:20 __attribute__((packed)); }
+            let mut m = vec![member(c, None, false), member(i, Some(20), true)];
+            assert_eq!(types.compute_union_layout(&mut m, None), (3, 1));
+
+            // union { char a; int b __attribute__((packed)); int c; }
+            let mut m = vec![
+                member(c, None, false),
+                member(i, None, true),
+                member(i, None, false),
+            ];
+            assert_eq!(types.compute_union_layout(&mut m, None), (4, 4));
+        }
     }
 
     #[test]
@@ -3798,6 +4312,161 @@ mod tests {
         assert!(!types.types_compatible(int_ptr, char_ptr));
     }
 
+    /// A complete enumerated type of `size` bytes, as the parser records one
+    /// whose integer type has that size and signedness.
+    fn enum_of(
+        types: &mut TypeTable,
+        idents: &mut crate::strings::StringTable,
+        tag: &str,
+        size: usize,
+        unsigned: bool,
+    ) -> TypeId {
+        let composite = CompositeType {
+            tag: Some(idents.intern(tag)),
+            members: Vec::new(),
+            enum_constants: Vec::new(),
+            size,
+            align: size,
+            member_align: size,
+            is_complete: true,
+            transparent: false,
+            anon_id: None,
+        };
+        let mut typ = Type::enum_type(composite);
+        if unsigned {
+            typ.modifiers |= TypeModifiers::UNSIGNED;
+        }
+        types.intern(typ)
+    }
+
+    /// C17 6.7.2.2p4: an enum is compatible with the one integer type it was
+    /// given -- not with the other signedness, not with another type of the
+    /// same width, and not with a different enum.
+    #[test]
+    fn test_types_compatible_enum_and_its_integer_type() {
+        let mut types = TypeTable::new(&Target::host());
+        let mut idents = crate::strings::StringTable::new();
+        let e_uint = enum_of(&mut types, &mut idents, "U", 4, true);
+        let e_int = enum_of(&mut types, &mut idents, "S", 4, false);
+        let e_ulong = enum_of(&mut types, &mut idents, "UL", 8, true);
+        let e_long = enum_of(&mut types, &mut idents, "L", 8, false);
+
+        assert!(types.types_compatible(e_uint, types.uint_id));
+        assert!(types.types_compatible(types.uint_id, e_uint));
+        assert!(!types.types_compatible(e_uint, types.int_id));
+        assert!(types.types_compatible(e_int, types.int_id));
+        assert!(!types.types_compatible(e_int, types.uint_id));
+        assert!(types.types_compatible(e_ulong, types.ulong_id));
+        assert!(!types.types_compatible(e_ulong, types.ulonglong_id));
+        assert!(types.types_compatible(e_long, types.long_id));
+        assert!(!types.types_compatible(e_long, types.longlong_id));
+
+        // Two enums with the same integer type are still two types.
+        let e_uint2 = enum_of(&mut types, &mut idents, "U2", 4, true);
+        assert!(!types.types_compatible(e_uint, e_uint2));
+
+        // A forward reference has no integer type yet.
+        let fwd = types.intern(Type::incomplete_enum(idents.intern("F")));
+        assert_eq!(types.enum_compatible_type(fwd), None);
+        assert!(!types.types_compatible(fwd, types.int_id));
+        assert_eq!(types.enum_compatible_type(types.int_id), None);
+    }
+
+    /// Below a pointer the qualifiers count, the enum rule still applies, and
+    /// the signedness still has to agree.
+    #[test]
+    fn test_types_compatible_pointer_to_enum() {
+        let mut types = TypeTable::new(&Target::host());
+        let mut idents = crate::strings::StringTable::new();
+        let e_uint = enum_of(&mut types, &mut idents, "U", 4, true);
+        let e_int = enum_of(&mut types, &mut idents, "S", 4, false);
+        let p_e_uint = types.intern(Type::pointer(e_uint));
+        let p_e_int = types.intern(Type::pointer(e_int));
+        let p_uint = types.intern(Type::pointer(types.uint_id));
+        let p_int = types.intern(Type::pointer(types.int_id));
+        let const_uint = types.qualified_with(types.uint_id, TypeModifiers::CONST);
+        let p_const_uint = types.intern(Type::pointer(const_uint));
+
+        assert!(types.types_compatible(p_e_uint, p_uint));
+        assert!(!types.types_compatible(p_e_uint, p_int));
+        assert!(types.types_compatible(p_e_int, p_int));
+        assert!(!types.types_compatible(p_e_int, p_uint));
+        assert!(!types.types_compatible(p_e_uint, p_const_uint));
+        assert!(!types.types_compatible(p_e_uint, p_e_int));
+
+        // `_Generic` compares top-level qualifiers too.
+        let const_e_uint = types.qualified_with(e_uint, TypeModifiers::CONST);
+        assert!(types.types_compatible_qualified(const_e_uint, const_uint));
+        assert!(!types.types_compatible_qualified(const_e_uint, types.uint_id));
+    }
+
+    /// A typedef redefinition needs the same type: neither an enum's integer
+    /// type nor a differently qualified one will do, at any level.
+    #[test]
+    fn test_types_same_keeps_enums_and_qualifiers_distinct() {
+        let mut types = TypeTable::new(&Target::host());
+        let mut idents = crate::strings::StringTable::new();
+        let e_uint = enum_of(&mut types, &mut idents, "U", 4, true);
+        let p_e_uint = types.intern(Type::pointer(e_uint));
+        let p_uint = types.intern(Type::pointer(types.uint_id));
+        let const_int = types.qualified_with(types.int_id, TypeModifiers::CONST);
+
+        assert!(!types.types_same(e_uint, types.uint_id));
+        assert!(!types.types_same(p_e_uint, p_uint));
+        assert!(!types.types_same(const_int, types.int_id));
+        assert!(types.types_same(e_uint, e_uint));
+        let p_uint2 = types.intern(Type::pointer(types.uint_id));
+        assert!(types.types_same(p_uint, p_uint2));
+    }
+
+    /// An enum computes as its integer type: the promotions and the usual
+    /// arithmetic conversions replace it, at the integer type's rank.
+    #[test]
+    fn test_enum_promotes_to_its_integer_type() {
+        let mut types = TypeTable::new(&Target::host());
+        let mut idents = crate::strings::StringTable::new();
+        let e_uint = enum_of(&mut types, &mut idents, "U", 4, true);
+        let e_long = enum_of(&mut types, &mut idents, "L", 8, false);
+        let e_ulong = enum_of(&mut types, &mut idents, "UL", 8, true);
+
+        assert_eq!(types.integer_promote(e_uint), types.uint_id);
+        assert_eq!(types.integer_promote(e_long), types.long_id);
+        assert_eq!(types.common_type(e_uint, types.int_id), types.uint_id);
+        assert_eq!(types.common_type(e_long, types.uint_id), types.long_id);
+        assert_eq!(types.common_type(e_ulong, e_long), types.ulong_id);
+        assert_eq!(
+            types.common_type(e_ulong, types.longlong_id),
+            types.ulonglong_id
+        );
+    }
+
+    /// 6.5.16.1p1 keeps the pointee's qualifiers when one side is `void *`
+    /// just as when the pointees are compatible: dropping `const` or
+    /// `volatile` on the way to or from `void *` is a qualifier discard.
+    #[test]
+    fn test_void_pointer_assignment_keeps_qualifiers() {
+        let mut types = TypeTable::new(&Target::host());
+        let const_int = types.qualified_with(types.int_id, TypeModifiers::CONST);
+        let volatile_int = types.qualified_with(types.int_id, TypeModifiers::VOLATILE);
+        let const_int_ptr = types.intern(Type::pointer(const_int));
+        let volatile_int_ptr = types.intern(Type::pointer(volatile_int));
+        let int_ptr = types.intern(Type::pointer(types.int_id));
+        let (void_ptr, const_void_ptr) = (types.void_ptr_id, types.const_void_ptr_id);
+        let discard = Some(AssignFault::QualifierDiscard);
+        // (target, value, fault)
+        for (target, value, fault) in [
+            (void_ptr, const_int_ptr, discard),
+            (const_void_ptr, volatile_int_ptr, discard),
+            (int_ptr, const_void_ptr, discard),
+            (const_void_ptr, const_int_ptr, None),
+            (const_int_ptr, const_void_ptr, None),
+            (void_ptr, int_ptr, None),
+            (int_ptr, void_ptr, None),
+        ] {
+            assert_eq!(types.assignment_fault(target, value, false), fault);
+        }
+    }
+
     #[test]
     fn test_types_compatible_arrays() {
         let mut types = TypeTable::new(&Target::host());
@@ -3954,7 +4623,7 @@ mod tests {
             bit_offset: None,
             bit_width,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         };
         let shorts = types.intern(Type::array(types.short_id, (1 << 62) - 256));
         let chars_max = types.intern(Type::array(types.char_id, i64::MAX as usize));
@@ -4025,7 +4694,7 @@ mod tests {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         };
         let chars = types.intern(Type::array(types.char_id, (1 << 62) - 256));
         let mut m = vec![member(types.int_id), member(chars)];

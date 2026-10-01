@@ -99,26 +99,11 @@ impl X86_64Mapper {
                 }
             }
             // Comparisons: promote both, compare (no truncate)
-            Opcode::FCmpOEq
-            | Opcode::FCmpONe
-            | Opcode::FCmpOLt
-            | Opcode::FCmpOLe
-            | Opcode::FCmpOGt
-            | Opcode::FCmpOGe => {
-                if let Some(src_typ) = insn.src_typ {
-                    if types.kind(src_typ) == TypeKind::Float16 {
-                        return Some(MappedInsn::Replace(expand_float16_cmp(
-                            insn, ctx.func, types, ctx.target,
-                        )));
-                    }
-                }
-                // Fallback: check operand size (Float16 = 16 bits)
-                if insn.size == 16 {
-                    return Some(MappedInsn::Replace(expand_float16_cmp(
-                        insn, ctx.func, types, ctx.target,
-                    )));
-                }
-                None
+            op if op.is_float_comparison() => {
+                let operand = insn.operand_type()?;
+                (types.kind(operand) == TypeKind::Float16).then(|| {
+                    MappedInsn::Replace(expand_float16_cmp(insn, ctx.func, types, ctx.target))
+                })
             }
             // Float16↔float/double/longdouble conversions
             Opcode::FCvtF => {
@@ -642,13 +627,12 @@ mod tests {
         let h = types.float16_id;
         let add = Instruction::binop(Opcode::FAdd, PseudoId(2), PseudoId(0), PseudoId(1), h, 16);
         let neg = Instruction::unop(Opcode::FNeg, PseudoId(2), PseudoId(0), h, 16);
-        let mut cmp = Instruction::binop(
+        let mut cmp = Instruction::compare(
             Opcode::FCmpOLt,
             PseudoId(2),
-            PseudoId(0),
-            PseudoId(1),
-            types.int_id,
-            16,
+            (PseudoId(0), PseudoId(1)),
+            (types.int_id, 16),
+            (types.int_id, 32),
         );
         cmp.src_typ = Some(h);
         let widen = make_convert_insn(Opcode::FCvtF, types.float_id, 32, h, 16);
@@ -799,7 +783,7 @@ mod tests {
             let calls: Vec<&str> = insns
                 .iter()
                 .filter(|i| i.op == Opcode::Call)
-                .filter_map(|i| i.func_name.as_deref())
+                .filter_map(|i| i.extra().func_name.as_deref())
                 .collect();
             assert_eq!(
                 calls,
@@ -876,7 +860,7 @@ mod tests {
             let calls: Vec<&str> = insns
                 .iter()
                 .filter(|i| i.op == Opcode::Call)
-                .filter_map(|i| i.func_name.as_deref())
+                .filter_map(|i| i.extra().func_name.as_deref())
                 .collect();
             assert_eq!(
                 calls,

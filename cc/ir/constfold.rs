@@ -25,7 +25,7 @@
 //
 
 use crate::float::{FloatVal, FpFormat};
-use crate::types::{TypeId, TypeTable};
+
 use std::cmp::Ordering;
 
 use super::{Instruction, Opcode};
@@ -36,9 +36,8 @@ use super::{Instruction, Opcode};
 /// An `i128` in this IR holds whatever bit pattern its constant was built
 /// from, and nothing on the instruction says how to read it back: the same
 /// 32 bits are -1 or 4294967295 depending on the consumer, and a `Set*`
-/// cannot even ask, because its `size` is the width of its own `_Bool`/`int`
-/// result rather than of its operands (`(_Bool)x` lowers to `setne.8` over
-/// two 32-bit values).
+/// cannot even ask: it records how wide its operands are
+/// (`Instruction::operand_width`), not how to read them.
 ///
 /// That ambiguity is pre-existing and harmless while a folded constant only
 /// ever reaches codegen, which truncates when it materializes an immediate.
@@ -261,54 +260,6 @@ pub(crate) fn mirror_mask(mask: u8) -> u8 {
         | if mask & CMP_GT != 0 { CMP_LT } else { 0 }
 }
 
-/// The width a `Set*` reads its operands at.
-///
-/// `insn.size` is the width of the *result* at one of the four `Set*`
-/// construction sites -- a `_Bool` conversion lowers to `setne.8` over two
-/// 32-bit operands -- and that site is the only one that records the operand
-/// width, in `src_size`. Preferring `src_size` when it is set is right at all
-/// four.
-pub(crate) fn cmp_operand_width(insn: &Instruction) -> u32 {
-    if insn.src_size != 0 {
-        insn.src_size
-    } else {
-        insn.size.max(1)
-    }
-}
-
-/// True for the opcodes that record their *operands* in `typ`/`size` and
-/// produce an `int`.
-///
-/// Integer and floating comparisons both, which is the whole set: no other
-/// opcode describes anything but its own result there.
-pub(crate) fn is_comparison(op: Opcode) -> bool {
-    cmp_mask(op).is_some() || fcmp_mask(op).is_some()
-}
-
-/// The type and width `insn` leaves in its target.
-///
-/// A rewrite that replaces an instruction with a `Copy` of its value has to
-/// give that copy the type of the *value*, and for all but one family of
-/// opcodes `insn.typ`/`insn.size` are exactly that. The exception is the
-/// comparisons, which describe their operands there (see
-/// [`cmp_operand_width`]) and produce an `int`, and the population counts,
-/// whose `size` is the width of the operand they count while the count is an
-/// `int`.
-///
-/// Carrying the operand type across is invisible for an integer comparison --
-/// an integer of the wrong width still lands in a general register -- and a
-/// miscompile for a float one: the folded constant is typed `double`, so the
-/// backend puts it in an SSE register and the caller reads the return value
-/// out of the wrong one.
-pub(crate) fn result_type_of(insn: &Instruction, types: &TypeTable) -> (Option<TypeId>, u32) {
-    if is_comparison(insn.op) || matches!(insn.op, Opcode::Popcount32 | Opcode::Popcount64) {
-        let int_id = types.int_id;
-        (Some(int_id), types.size_bits(int_id))
-    } else {
-        (insn.typ, insn.size)
-    }
-}
-
 /// `insn`'s operation applied to two constants, or `None` if the opcode is
 /// not one this folds or the operation is undefined for these operands.
 ///
@@ -331,7 +282,7 @@ pub(crate) fn eval_binop(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
 
         _ => {
             let info = get_cmp_info(insn.op)?;
-            let size = cmp_operand_width(insn);
+            let size = insn.operand_width();
             let a = at_width(a, size, info.signed);
             let b = at_width(b, size, info.signed);
             Some(if (info.compare)(a, b) { 1 } else { 0 })
@@ -602,9 +553,6 @@ pub(crate) fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
         Opcode::Not => Some(!a),
         // The count of the operand at its own width. It is at most 64, so
         // it reads the same at every width the `int` result is taken at.
-        Opcode::Popcount32 => Some(i128::from((a as u32).count_ones())),
-        Opcode::Popcount64 => Some(i128::from((a as u64).count_ones())),
-
         // Read the operand at the width it was stored in, in the signedness
         // the opcode names, and leave it there: the destination is wider.
         Opcode::Sext | Opcode::Zext => {
@@ -626,7 +574,74 @@ pub(crate) fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
             unambiguous_at(v, size).then_some(v)
         }
 
-        _ => None,
+        op => {
+            let (bit_op, width) = bit_opcode(op)?;
+            Some(eval_bit_op(bit_op, width, a))
+        }
+    }
+}
+
+/// An operation of the bit builtins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BitOp {
+    /// Reverse the bytes.
+    Bswap,
+    /// Count the trailing zero bits.
+    Ctz,
+    /// Count the leading zero bits.
+    Clz,
+    /// Count the leading bits that repeat the sign bit.
+    Clrsb,
+    /// Count the one bits.
+    Popcount,
+    /// One plus the index of the lowest one bit, or 0 for 0.
+    Ffs,
+}
+
+/// The bit operation `op` performs and the operand width it reads, or
+/// `None` if `op` is no bit operation.
+pub(crate) fn bit_opcode(op: Opcode) -> Option<(BitOp, u32)> {
+    Some(match op {
+        Opcode::Bswap16 => (BitOp::Bswap, 16),
+        Opcode::Bswap32 => (BitOp::Bswap, 32),
+        Opcode::Bswap64 => (BitOp::Bswap, 64),
+        Opcode::Ctz32 => (BitOp::Ctz, 32),
+        Opcode::Ctz64 => (BitOp::Ctz, 64),
+        Opcode::Clz32 => (BitOp::Clz, 32),
+        Opcode::Clz64 => (BitOp::Clz, 64),
+        Opcode::Popcount32 => (BitOp::Popcount, 32),
+        Opcode::Popcount64 => (BitOp::Popcount, 64),
+        _ => return None,
+    })
+}
+
+/// `op` of the `width`-bit operand `a`: the one rule for each bit builtin,
+/// which both this file's opcode folds and the C17 6.6 walk in
+/// [`crate::constexpr`] evaluate by.
+///
+/// Only the low `width` bits of `a` are read, in the signedness the
+/// operation implies: every one reads an unsigned operand but `Clrsb`. A
+/// count is at most 64, so it reads the same at every width; a byte swap is
+/// the unsigned value of its width.
+///
+/// `ctz` and `clz` of 0 are undefined at run time, but a constant one is
+/// still a constant to gcc, which folds it to the operand width on both
+/// targets -- so `static int x = __builtin_ctz(0);` is 32 there and here.
+pub(crate) fn eval_bit_op(op: BitOp, width: u32, a: i128) -> i128 {
+    let bits = at_width(a, width, false) as u128;
+    let unused = 128 - width;
+    match op {
+        BitOp::Bswap => (bits.swap_bytes() >> unused) as i128,
+        BitOp::Ctz => i128::from(bits.trailing_zeros().min(width)),
+        BitOp::Clz => i128::from(bits.leading_zeros() - unused),
+        BitOp::Popcount => i128::from(bits.count_ones()),
+        BitOp::Ffs if bits == 0 => 0,
+        BitOp::Ffs => i128::from(bits.trailing_zeros() + 1),
+        BitOp::Clrsb => {
+            let signed = at_width(a, width, true);
+            let magnitude = if signed < 0 { !signed } else { signed };
+            eval_bit_op(BitOp::Clz, width, magnitude) - 1
+        }
     }
 }
 
@@ -898,5 +913,62 @@ mod tests {
         // An out-of-range count is undefined and is not folded, at 128 as
         // anywhere else.
         assert_eq!(eval_binop(&binop_at(Opcode::Lsr, 128), -1, 128), None);
+    }
+
+    /// Each bit operation reads only its operand's width, unsigned but for
+    /// `Clrsb`, and `ctz`/`clz` of 0 is the width -- gcc's folded value.
+    #[test]
+    fn eval_bit_op_reads_the_operand_at_its_width() {
+        use BitOp::*;
+        for (op, width, a, want) in [
+            (Bswap, 16, 0x12345, 0x4523),
+            (Bswap, 32, 0xff, 0xff00_0000),
+            (Bswap, 64, -1, u64::MAX as i128),
+            (Ctz, 32, 1 << 40, 32),
+            (Ctz, 64, 1 << 40, 40),
+            (Ctz, 32, -1, 0),
+            (Ctz, 64, 0, 64),
+            (Clz, 32, 1, 31),
+            (Clz, 64, 1, 63),
+            (Clz, 32, 0, 32),
+            (Clz, 32, -1, 0),
+            (Clrsb, 32, 0, 31),
+            (Clrsb, 32, -1, 31),
+            (Clrsb, 32, i128::from(i32::MIN), 0),
+            (Clrsb, 64, -5, 60),
+            (Clrsb, 32, 0xffff_ffff, 31),
+            (Popcount, 32, (1 << 40) | 7, 3),
+            (Popcount, 64, -1, 64),
+            (Ffs, 32, 0, 0),
+            (Ffs, 32, 8, 4),
+            (Ffs, 64, 1 << 40, 41),
+            (Ffs, 32, 1 << 40, 0),
+        ] {
+            assert_eq!(eval_bit_op(op, width, a), want, "{op:?}.{width} of {a:#x}");
+        }
+    }
+
+    /// Each bit opcode folds through `eval_unop` at the width it names,
+    /// whatever width its `int` result is recorded at.
+    #[test]
+    fn eval_unop_folds_every_bit_opcode() {
+        for (op, a, want) in [
+            (Opcode::Bswap16, 0x1234, 0x3412),
+            (Opcode::Bswap32, 0x1234_5678, 0x7856_3412),
+            (
+                Opcode::Bswap64,
+                0x0102_0304_0506_0708,
+                0x0807_0605_0403_0201,
+            ),
+            (Opcode::Ctz32, 0, 32),
+            (Opcode::Ctz64, 1 << 40, 40),
+            (Opcode::Clz32, 1, 31),
+            (Opcode::Clz64, 1, 63),
+            (Opcode::Popcount32, -1, 32),
+            (Opcode::Popcount64, -1, 64),
+        ] {
+            let insn = Instruction::new(op).with_size(32);
+            assert_eq!(eval_unop(&insn, a), Some(want), "{op:?} of {a:#x}");
+        }
     }
 }

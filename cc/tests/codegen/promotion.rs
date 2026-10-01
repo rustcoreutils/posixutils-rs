@@ -20,8 +20,10 @@
 // behavioral tests alongside them cover the cases where promotion would
 // change the answer, which is to say the cases where it would be a bug.
 
-use crate::codegen::asm_probe::{asm_for_with, count_in_body, frame_size, X86_64_LINUX};
-use crate::common::compile_and_run;
+use crate::codegen::asm_probe::{
+    asm_for_with, body_of, count_in_body, frame_size, AARCH64_LINUX, X86_64_LINUX,
+};
+use crate::common::{compile_and_run, compile_and_run_aarch64};
 
 /// Ten address-free int locals in straight-line code.
 ///
@@ -55,7 +57,7 @@ fn codegen_parameter_only_function_needs_no_frame() {
     let asm = asm_for_with("parameter_only", X86_64_LINUX, src, &["-O2"]);
     let frame = frame_size(&asm, "nolocal").unwrap_or(0);
     assert!(
-        frame <= 16,
+        frame == 0,
         "a function whose only value is its parameter needs no frame, \
          got {frame} bytes:\n{asm}"
     );
@@ -249,4 +251,166 @@ int single_block_uninit(void) { int t; return t; }
 int main(void) { return 0; }
 "#;
     assert_eq!(compile_and_run("uninitialized_local", src, &[]), 0);
+}
+
+/// A frame holds only what the function uses.
+///
+/// Two reservations were made whatever the function did: the x87 scratch,
+/// sixteen bytes at the bottom of every x86-64 frame though only an x87
+/// conversion or an x87 `asm` operand stages a value through it, and every
+/// local the linearizer created, though the optimizer may forward and delete
+/// every access to one -- `folded` reads back the element it just stored.
+/// Now neither costs a function that does not use it, and a function that
+/// does still gets the scratch. Off x86-64 the host runs the program with
+/// `root`'s x87 `asm` replaced by plain C.
+#[test]
+fn codegen_a_frame_holds_only_what_the_function_uses() {
+    let src = "\
+int plus1(int x) { return x + 1; }
+int folded(void) { int a[4] = {1, 2, 3, 4}; return a[2]; }
+int sum(const int *p, int n) { int s = 0; for (int i = 0; i < n; i++) s += p[i]; return s; }
+long double widen(int x) { return x; }
+float root(float x) { __asm__(\"fsqrt\" : \"+t\"(x)); return x; }
+";
+    let asm = asm_for_with("frame_uses", X86_64_LINUX, src, &["-O2"]);
+    for f in ["plus1", "folded", "sum"] {
+        let body = body_of(&asm, f);
+        assert!(
+            frame_size(&asm, f).is_none() && !body.contains("subq"),
+            "{f} needs no frame:\n{body}"
+        );
+    }
+    for f in ["widen", "root"] {
+        let frame = frame_size(&asm, f).unwrap_or(0);
+        assert!(
+            frame >= 16,
+            "{f} stages a value through the x87 scratch:\n{asm}"
+        );
+    }
+    let a64 = asm_for_with(
+        "frame_uses_a64",
+        AARCH64_LINUX,
+        "int folded(void) { int a[4] = {1, 2, 3, 4}; return a[2]; }\n",
+        &["-O2"],
+    );
+    assert!(frame_size(&a64, "folded").is_none(), "aarch64:\n{a64}");
+
+    let run = format!(
+        "{src}int main(void) {{ int a[3] = {{1, 2, 3}}; \
+         return plus1(1) == 2 && folded() == 3 && sum(a, 3) == 6 \
+         && widen(7) == 7.0L && root(16.0f) == 4.0f ? 0 : 1; }}\n"
+    );
+    let portable = run.replace(
+        "float root(float x) { __asm__(\"fsqrt\" : \"+t\"(x)); return x; }\n",
+        "float root(float x) { return x == 16.0f ? 4.0f : 0; }\n",
+    );
+    // `compile_and_run` targets the host, and an x87 `asm` only assembles
+    // on x86-64; elsewhere the host runs the portable form.
+    let host = if cfg!(target_arch = "x86_64") {
+        &run
+    } else {
+        &portable
+    };
+    assert_eq!(
+        compile_and_run("frame_uses_run", host, &["-O2".to_string()]),
+        0
+    );
+    if let Some(rc) = compile_and_run_aarch64("frame_uses_a64_run", &portable, "-O2") {
+        assert_eq!(rc, 0, "aarch64");
+    }
+}
+
+/// Locals whose lifetimes do not overlap share a frame slot.
+///
+/// Every local held its own slot for the whole function: a `Sym` has no
+/// defining instruction, so liveness carried each one to the entry and they
+/// all overlapped. The interval of a local is now its lifetime -- from its
+/// first mention to the `LifetimeEnd` the linearizer puts where control falls
+/// out of its block -- so `scopes`' three arrays take one slot. The rest of
+/// the program is the shapes that must still come out right: a nested scope
+/// that overlaps its parent, a loop body's array beside one live across the
+/// loop, a `switch` jumping past a declaration into its scope, a backward
+/// `goto`, an address that escapes, and a parameter the prologue stores.
+#[test]
+fn codegen_locals_with_disjoint_lifetimes_share_a_slot() {
+    let src = r#"
+__attribute__((noinline)) void fill(int *p, int n, int v) { for (int i = 0; i < n; i++) p[i] = v + i; }
+__attribute__((noinline)) int sum(const int *p, int n) { int s = 0; for (int i = 0; i < n; i++) s += p[i]; return s; }
+int *escaped;
+__attribute__((noinline)) int scopes(int k) {
+    int r = 0;
+    { int a[16]; fill(a, 16, k); r += sum(a, 16); }
+    { int b[16]; fill(b, 16, 2 * k); r += sum(b, 16); }
+    { int c[16]; fill(c, 16, 3 * k); r += sum(c, 16); }
+    return r;
+}
+__attribute__((noinline)) int nested(int k) {
+    int a[16]; fill(a, 16, k);
+    { int b[16]; fill(b, 16, 100); if (sum(b, 16) != 1720) return -1; }
+    return sum(a, 16);
+}
+__attribute__((noinline)) int loop(int n) {
+    int keep[8]; fill(keep, 8, 7);
+    int r = 0;
+    for (int i = 0; i < n; i++) { int t[8]; fill(t, 8, i); r += sum(t, 8); }
+    return r + sum(keep, 8);
+}
+__attribute__((noinline)) int sw(int x) {
+    int other[4]; fill(other, 4, 50);
+    switch (x) {
+        int y[4];
+    case 1: fill(y, 4, 1); return sum(y, 4) + sum(other, 4);
+    case 2: { int z[4]; fill(z, 4, 9); y[0] = 0; return sum(z, 4); }
+    }
+    return 0;
+}
+__attribute__((noinline)) int back(int n) {
+    int r = 0, i = 0;
+again:
+    { int v[4]; fill(v, 4, i); r += sum(v, 4); }
+    { int w[4]; fill(w, 4, 1000); r += w[3] - 1003; }
+    if (++i < n) goto again;
+    return r;
+}
+__attribute__((noinline)) int esc(void) {
+    int r;
+    { int a[4]; escaped = a; fill(escaped, 4, 3); r = sum(a, 4); }
+    { int b[4]; fill(b, 4, 0); r += sum(b, 4); }
+    return r;
+}
+__attribute__((noinline)) int param(int p) {
+    int *q = &p;
+    { int a[8]; fill(a, 8, 1); if (sum(a, 8) != 36) return -1; }
+    return *q;
+}
+int main(void) {
+    int bad = 0;
+    if (scopes(1) != (16*1+120) + (16*2+120) + (16*3+120)) bad |= 1;
+    if (nested(2) != 16*2+120) bad |= 2;
+    if (loop(3) != (0+28)+(8+28)+(16+28) + (56+28)) bad |= 4;
+    if (sw(1) != 4+6 + 200+6) bad |= 8;
+    if (sw(2) != 36+6) bad |= 16;
+    if (back(3) != (0+6)+(4+6)+(8+6)) bad |= 32;
+    if (esc() != 12+6 + 6) bad |= 64;
+    if (param(77) != 77) bad |= 128;
+    return bad;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run("disjoint_lifetimes", src, &[opt.to_string()]),
+            0,
+            "{opt}"
+        );
+        if let Some(rc) = compile_and_run_aarch64("disjoint_lifetimes", src, opt) {
+            assert_eq!(rc, 0, "aarch64 at {opt}");
+        }
+    }
+    // Three 64-byte arrays, one at a time: one slot's worth, not three.
+    let asm = asm_for_with("disjoint_lifetimes_frame", X86_64_LINUX, src, &["-O2"]);
+    let frame = frame_size(&asm, "scopes").unwrap_or(0);
+    assert!(
+        frame < 128,
+        "three disjoint arrays share a slot, got {frame} bytes:\n{asm}"
+    );
 }

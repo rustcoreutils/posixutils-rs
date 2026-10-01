@@ -564,68 +564,25 @@ impl Parser<'_> {
         elements: &[InitElement],
         elem_type: TypeId,
     ) -> usize {
-        let per_element = self.types.count_scalar_fields(elem_type).max(1);
         let mut max_index: i64 = -1;
         let mut current_index: i64 = 0;
         let mut idx = 0usize;
 
         while idx < elements.len() {
             let element = &elements[idx];
-            let mut designator_index = None;
-            let mut designator_high = None;
-            for designator in &element.designators {
-                match designator {
-                    Designator::Index(index) => {
-                        designator_index = Some(*index);
-                        break;
-                    }
-                    Designator::IndexRange(lo, hi) => {
-                        designator_index = Some(*lo);
-                        designator_high = Some(*hi);
-                        break;
-                    }
-                    Designator::Field(_) => {}
-                }
-            }
+            let (_, last, designated) =
+                crate::parse::ast::array_slot(&element.designators, &mut current_index);
+            max_index = max_index.max(last);
 
-            let index = if let Some(explicit_index) = designator_index {
-                // A range advances the cursor past its high endpoint and
-                // extends the inferred bound to it: `int a[] = {[0 ... 3] = 1}`
-                // is four elements. This is a second, independent copy of the
-                // rule in `group_array_init_elements`; both have to know.
-                let end = designator_high.unwrap_or(explicit_index);
-                current_index = end + 1;
-                if end > max_index {
-                    max_index = end;
-                }
-                explicit_index
-            } else {
-                let i = current_index;
-                current_index += 1;
-                i
-            };
-
-            if index > max_index {
-                max_index = index;
-            }
-
-            // A brace-less aggregate element consumes several list elements
-            // for this one slot. Stop early at a designator, which addresses
-            // the enclosing array rather than continuing to fill this slot --
-            // the same boundary `consume_brace_elision` observes.
-            idx += 1;
-            if designator_index.is_none()
+            // A brace-less aggregate element takes several list elements for
+            // this one slot.
+            idx = if designated.is_none()
                 && crate::parse::ast::is_brace_elision_candidate(self.types, element, elem_type)
             {
-                let mut taken = 1;
-                while taken < per_element
-                    && idx < elements.len()
-                    && elements[idx].designators.is_empty()
-                {
-                    idx += 1;
-                    taken += 1;
-                }
-            }
+                crate::parse::ast::brace_elision_span(self.types, elements, idx, elem_type).end
+            } else {
+                idx + 1
+            };
         }
 
         if max_index < 0 {
@@ -744,6 +701,30 @@ impl<'a> Parser<'a> {
                     modifiers |= TypeModifiers::UNSIGNED;
                 }
                 crate::kw::COMPLEX | crate::kw::GNU_COMPLEX | crate::kw::GNU_COMPLEX2 => {
+                    tally.complex = true;
+                    self.advance();
+                    modifiers |= TypeModifiers::COMPLEX;
+                }
+                // After a type specifier and before what can only follow a
+                // declarator's name, it *is* the name, as a typedef name would
+                // be: `int _Imaginary;` is a keyword misused, which the
+                // declarator reports, not a type c17 lacks. A type-name has
+                // no declarator name, so there it is always the specifier.
+                crate::kw::IMAGINARY
+                    if !matches!(ctx, SpecContext::TypeName)
+                        && tally.has_type_specifier()
+                        && b";,=[():".iter().any(|&c| self.next_token_is_special(c)) =>
+                {
+                    break;
+                }
+                // Imaginary types belong to Annex G, which binds only an
+                // implementation that defines `__STDC_IEC_559_COMPLEX__`, and
+                // c17 does not; without them `_Imaginary` is no permitted type
+                // specifier (C17 6.7.2p2), which needs a diagnostic. One, and
+                // then the declaration goes on as if `_Complex` had been
+                // written, so nothing after it reports the same mistake again.
+                crate::kw::IMAGINARY => {
+                    diag::error(pos, "imaginary types are not supported");
                     tally.complex = true;
                     self.advance();
                     modifiers |= TypeModifiers::COMPLEX;
@@ -923,6 +904,16 @@ impl<'a> Parser<'a> {
                     tally.note_data_type("__builtin_va_list", pos);
                     self.advance();
                     base_kind = Some(TypeKind::VaList);
+                }
+                crate::kw::BUILTIN_MS_VA_LIST => {
+                    // A name gcc knows only on x86-64: anywhere else it names
+                    // no type, and is diagnosed as gcc diagnoses it.
+                    if !crate::kw::exists_on(name_id, self.types.target().arch) {
+                        diag::error(pos, "unknown type name '__builtin_ms_va_list'");
+                    }
+                    tally.note_data_type("__builtin_ms_va_list", pos);
+                    self.advance();
+                    resolved = Some(Resolved::Id(self.types.ms_va_list_id));
                 }
                 crate::kw::TYPEOF | crate::kw::GNU_TYPEOF | crate::kw::GNU_TYPEOF2 => {
                     // `typeof` always takes a parenthesized operand, so
@@ -1491,17 +1482,17 @@ impl Parser<'_> {
         // comparing raw modifiers reports two identical `short`s as different.
         let old_type = self.types.without_decl_specifiers(old_type);
         let new_type = self.types.without_decl_specifiers(new_type);
-        if self.types.types_compatible(old_type, new_type) {
+        if self.types.types_same(old_type, new_type) {
             return;
         }
         let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
         diag::error_args(
             pos,
-            "typedef '{0}' redefined with an incompatible type ('{1}' then '{2}')",
+            "typedef '{0}' redefined with a different type ('{1}' then '{2}')",
             &[
                 &spelled.to_string(),
-                &self.types.get(old_type).to_string(),
-                &self.types.get(new_type).to_string(),
+                &self.types.format_type(old_type, Some(self.idents)),
+                &self.types.format_type(new_type, Some(self.idents)),
             ],
         );
     }

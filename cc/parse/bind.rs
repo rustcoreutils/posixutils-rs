@@ -243,6 +243,7 @@ impl Parser<'_> {
         self.pending_alignas_kw = None;
         self.pending_mode = None;
         self.pending_transparent_union = None;
+        self.pending_packed = false;
     }
 
     /// Bind one declarator of a declaration: the rules of C17 6.7 in one
@@ -261,6 +262,7 @@ impl Parser<'_> {
             mut vla,
             vla_pos,
             params,
+            ..
         } = d;
         let is_typedef = specs.is_typedef();
 
@@ -299,8 +301,6 @@ impl Parser<'_> {
                 return Ok(Bound::FuncDef(def));
             }
         }
-
-        self.check_element_type_complete(typ, pos);
 
         let (symbol, init) = if is_typedef {
             typ = self.align_typedef_type(typ, align);
@@ -513,23 +513,6 @@ impl Parser<'_> {
             }
         }
         Ok(Some(init))
-    }
-
-    /// C17 6.7.6.2p1: an array's element type must be complete where the
-    /// array is declared, because the stride is what forms the type -- so
-    /// this holds even for `extern`, for a typedef, and when the tag is
-    /// completed further down, all of which gcc rejects.
-    fn check_element_type_complete(&mut self, typ: TypeId, pos: Position) {
-        let elem = self.types.array_element_deep(typ);
-        if elem == typ || self.is_complete_type(elem) {
-            return;
-        }
-        let named = self.types.format_type(elem, Some(self.idents));
-        diag::error_args(
-            pos,
-            "array type has incomplete element type '{0}'",
-            &[&named],
-        );
     }
 
     /// C17 6.7p7: an object's type must be complete where it is defined.

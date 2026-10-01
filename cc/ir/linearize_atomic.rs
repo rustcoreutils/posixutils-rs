@@ -21,11 +21,11 @@
 
 use super::linearize::Linearizer;
 use super::linearize_emit::{compound_assign_arith_type, compound_assign_opcode, CompoundAssign};
-use super::{Instruction, MemoryOrder, Opcode, PseudoId};
+use super::{FenceScope, Instruction, MemoryOrder, Opcode, PseudoId};
 use crate::diag;
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, Expr, ExprKind};
-use crate::types::{TypeId, TypeKind, TypeModifiers};
+use crate::types::{TypeId, TypeKind};
 
 /// An `_Atomic` lvalue that can be operated on with a single hardware atomic:
 /// its address, its element type, and the width in bits.
@@ -37,12 +37,163 @@ pub(crate) struct AtomicLvalue {
 
 /// C17 6.5.16.2p3 / 7.17.3p12: an operator on an atomic object is
 /// sequentially consistent. Only the `_explicit` builtins choose otherwise.
-const ORDER: MemoryOrder = MemoryOrder::SeqCst;
+pub(crate) const OPERATOR_ORDER: MemoryOrder = MemoryOrder::SeqCst;
+
+/// What an order argument orders, which decides the orders it may name.
+///
+/// gcc answers an order the access cannot have -- a release load, an
+/// acquire store, a release failure order -- with seq-cst and a warning
+/// (`-Winvalid-memory-model`), and so does this.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrderedAccess {
+    Load,
+    Store,
+    ReadModifyWrite,
+    /// The failure order of a compare-exchange: the failed attempt is a
+    /// load, so it admits exactly a load's orders.
+    CasFailure,
+    Fence,
+}
+
+impl OrderedAccess {
+    /// The access an atomic opcode performs.
+    pub(crate) fn of(op: Opcode) -> Self {
+        match op {
+            Opcode::AtomicLoad => Self::Load,
+            Opcode::AtomicStore => Self::Store,
+            Opcode::Fence => Self::Fence,
+            _ => Self::ReadModifyWrite,
+        }
+    }
+
+    fn admits(self, order: MemoryOrder) -> bool {
+        match self {
+            Self::Load | Self::CasFailure => {
+                !matches!(order, MemoryOrder::Release | MemoryOrder::AcqRel)
+            }
+            Self::Store => matches!(
+                order,
+                MemoryOrder::Relaxed | MemoryOrder::Release | MemoryOrder::SeqCst
+            ),
+            Self::ReadModifyWrite | Self::Fence => true,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Load => "an atomic load",
+            Self::Store => "an atomic store",
+            Self::ReadModifyWrite => "an atomic read-modify-write",
+            Self::CasFailure => "the failure of an atomic compare-exchange",
+            Self::Fence => "an atomic fence",
+        }
+    }
+}
+
+/// An order argument as written: a valid order, or one that is not.
+enum RequestedOrder {
+    Valid(MemoryOrder),
+    /// Not an integer constant: gcc's `get_memmodel` makes it seq-cst,
+    /// without a diagnostic.
+    NonConstant,
+    /// Out of range or not admitted for the access; already diagnosed.
+    Invalid,
+}
+
+/// How strong an order is, for comparing a compare-exchange's two orders:
+/// the C11 enumeration's own sequence, with `consume` promoted to `acquire`
+/// as gcc promotes it before it compares.
+fn strength(order: MemoryOrder) -> u8 {
+    if order == MemoryOrder::Consume {
+        MemoryOrder::Acquire as u8
+    } else {
+        order as u8
+    }
+}
+
+/// The order of the atomic load that seeds a CAS loop run at `order`: the
+/// half of it a load can have. The compare-exchange checks the value
+/// anyway, so this only keeps an operator's seed load the seq-cst load gcc
+/// emits.
+fn seed_load_order(order: MemoryOrder) -> MemoryOrder {
+    match order {
+        MemoryOrder::Release => MemoryOrder::Relaxed,
+        MemoryOrder::AcqRel => MemoryOrder::Acquire,
+        other => other,
+    }
+}
+
+/// `-Winvalid-memory-model`, gcc's name for the group.
+const MEMORY_MODEL_WARNING: &str = "invalid-memory-model";
+
+/// The spelling gcc's diagnostics use for an order.
+fn order_name(order: MemoryOrder) -> String {
+    format!("memory_order_{order}")
+}
 
 impl Linearizer<'_> {
+    /// The memory order `expr` asks of `access`, as gcc reads it: an order
+    /// that is not an integer constant, or one the access cannot have, is
+    /// seq-cst.
+    pub(crate) fn atomic_order(&self, expr: &Expr, access: OrderedAccess) -> MemoryOrder {
+        match self.requested_order(expr, access) {
+            RequestedOrder::Valid(order) => order,
+            RequestedOrder::NonConstant | RequestedOrder::Invalid => MemoryOrder::SeqCst,
+        }
+    }
+
+    /// The one order a compare-exchange runs at, from its success and
+    /// failure orders, by gcc's rules: a failure order stronger than the
+    /// success order, or an invalid one, makes the exchange seq-cst; and a
+    /// release that acquires on failure is acq-rel, since one instruction
+    /// sequence serves both outcomes.
+    pub(crate) fn cas_order(&self, success: &Expr, failure: &Expr) -> MemoryOrder {
+        let succ = self.atomic_order(success, OrderedAccess::ReadModifyWrite);
+        let RequestedOrder::Valid(fail) = self.requested_order(failure, OrderedAccess::CasFailure)
+        else {
+            return MemoryOrder::SeqCst;
+        };
+        if fail as u8 > succ as u8 && diag::warning_group_enabled(MEMORY_MODEL_WARNING) {
+            diag::warning_args(
+                failure.pos,
+                "failure memory model '{0}' cannot be stronger than success memory \
+                 model '{1}' for an atomic compare-exchange",
+                &[&order_name(fail), &order_name(succ)],
+            );
+        }
+        if strength(fail) > strength(succ) {
+            MemoryOrder::SeqCst
+        } else if fail.acquires() && !succ.acquires() {
+            MemoryOrder::AcqRel
+        } else {
+            succ
+        }
+    }
+
+    /// Classify an order argument, diagnosing one gcc diagnoses.
+    fn requested_order(&self, expr: &Expr, access: OrderedAccess) -> RequestedOrder {
+        let Some(value) = self.eval_const_expr(expr) else {
+            return RequestedOrder::NonConstant;
+        };
+        let (order, shown) = match MemoryOrder::from_value(value) {
+            Some(order) if access.admits(order) => return RequestedOrder::Valid(order),
+            Some(order) => (Some(order), format!("'{}'", order_name(order))),
+            None => (None, value.to_string()),
+        };
+        if diag::warning_group_enabled(MEMORY_MODEL_WARNING) {
+            let template = if access == OrderedAccess::CasFailure && order.is_some() {
+                "invalid failure memory model {0} for an atomic compare-exchange"
+            } else {
+                "invalid memory model {0} for {1}"
+            };
+            diag::warning_args(expr.pos, template, &[&shown, access.name()]);
+        }
+        RequestedOrder::Invalid
+    }
+
     /// True when `typ` is `_Atomic`-qualified.
     pub(crate) fn is_atomic_type(&self, typ: TypeId) -> bool {
-        self.types.modifiers(typ).contains(TypeModifiers::ATOMIC)
+        self.types.is_atomic(typ)
     }
 
     /// True when an atomic object of this type can be operated on with a
@@ -158,8 +309,8 @@ impl Linearizer<'_> {
         })
     }
 
-    /// Emit one atomic instruction: `op addr, [value]` with sequential
-    /// consistency, returning the target pseudo.
+    /// Emit one atomic instruction: `op addr, [value]` at `order`, returning
+    /// the target pseudo.
     ///
     /// This is the single place that builds an atomic instruction, so the
     /// operand order the backends expect is written down once.
@@ -168,21 +319,22 @@ impl Linearizer<'_> {
         op: Opcode,
         lv: &AtomicLvalue,
         value: Option<PseudoId>,
+        order: MemoryOrder,
     ) -> PseudoId {
         let target = self.alloc_reg_pseudo();
-        let order = self.emit_const(ORDER as i128, self.types.int_id);
+        let order_val = self.emit_const(order as i128, self.types.int_id);
 
         let mut srcs = vec![lv.addr];
         if let Some(v) = value {
             srcs.push(v);
         }
-        srcs.push(order);
+        srcs.push(order_val);
 
         let mut insn = Instruction::new(op).with_target(target);
         insn.src = srcs;
         insn.typ = Some(lv.elem_typ);
         insn.size = lv.size_bits;
-        insn.memory_order = ORDER;
+        insn.extra_mut().memory_order = order;
         self.emit(insn);
 
         target
@@ -197,13 +349,13 @@ impl Linearizer<'_> {
     /// of reach of optimizations that may not duplicate or elide an atomic
     /// access.
     pub(crate) fn emit_atomic_load(&mut self, lv: &AtomicLvalue) -> PseudoId {
-        self.emit_atomic_op(Opcode::AtomicLoad, lv, None)
+        self.emit_atomic_op(Opcode::AtomicLoad, lv, None, OPERATOR_ORDER)
     }
 
     /// An atomic store, returning the stored value so that `x = v` still has
     /// the value of `v` as an expression.
     pub(crate) fn emit_atomic_store(&mut self, lv: &AtomicLvalue, value: PseudoId) -> PseudoId {
-        self.emit_atomic_op(Opcode::AtomicStore, lv, Some(value));
+        self.emit_atomic_op(Opcode::AtomicStore, lv, Some(value), OPERATOR_ORDER);
         value
     }
 
@@ -227,7 +379,8 @@ impl Linearizer<'_> {
         })
     }
 
-    /// Perform `old <op> value` atomically and return the **old** value.
+    /// Perform `old <op> value` atomically at `order` and return the **old**
+    /// value.
     ///
     /// Uses the native fetch-and-op where one exists, and otherwise builds a
     /// CAS retry loop:
@@ -256,6 +409,7 @@ impl Linearizer<'_> {
         lv: &AtomicLvalue,
         ca: &CompoundAssign,
         value: PseudoId,
+        order: MemoryOrder,
     ) -> PseudoId {
         if let Some(atomic_op) = self.native_rmw_opcode(ca) {
             // The instruction computes at the object's own width, so the
@@ -267,9 +421,9 @@ impl Linearizer<'_> {
             } else {
                 self.emit_convert(value, ca.value_typ, ca.target_typ)
             };
-            return self.emit_atomic_op(atomic_op, lv, Some(value));
+            return self.emit_atomic_op(atomic_op, lv, Some(value), order);
         }
-        self.emit_atomic_cas_loop(lv, ca, value)
+        self.emit_atomic_cas_loop(lv, ca, value, order)
     }
 
     /// The native atomic instruction that computes `ca` *exactly*, if one
@@ -295,12 +449,54 @@ impl Linearizer<'_> {
         Self::atomic_opcode_for(compound_assign_opcode(self.types, ca.op, arith_type))
     }
 
+    /// One compare-exchange of the `bits`-wide object at `addr` against the
+    /// value at `exp_addr`, storing `desired` on success, at `order` (see
+    /// [`Linearizer::cas_order`]). Returns whether it succeeded; on failure
+    /// both backends write the observed value back through `exp_addr`.
+    pub(crate) fn emit_atomic_cas(
+        &mut self,
+        addr: PseudoId,
+        exp_addr: PseudoId,
+        desired: PseudoId,
+        bits: u32,
+        order: MemoryOrder,
+    ) -> PseudoId {
+        let ok = self.alloc_reg_pseudo();
+        let order_val = self.emit_const(order as i128, self.types.int_id);
+        let mut cas = Instruction::new(Opcode::AtomicCas).with_target(ok);
+        cas.src = vec![addr, exp_addr, desired, order_val];
+        cas.typ = Some(self.types.bool_id);
+        cas.size = bits;
+        cas.extra_mut().memory_order = order;
+        self.emit(cas);
+        ok
+    }
+
+    /// A fence at the order `order` names, against whom `scope` says.
+    pub(crate) fn emit_fence(&mut self, order: &Expr, scope: FenceScope) -> PseudoId {
+        let order_val = self.linearize_expr(order);
+        let result = self.alloc_pseudo();
+        let mut fence = Instruction::new(Opcode::Fence)
+            .with_target(result)
+            .with_src(order_val)
+            .with_type(self.types.void_id)
+            .with_memory_order(self.atomic_order(order, OrderedAccess::Fence));
+        fence.extra_mut().fence_scope = scope;
+        self.emit(fence);
+        result
+    }
+
     /// The CAS retry loop described on `emit_atomic_rmw`.
+    ///
+    /// Only the attempt that succeeds has to be ordered, so the exchange
+    /// runs at `order` with a relaxed failure -- the combination is `order`
+    /// itself.
     fn emit_atomic_cas_loop(
         &mut self,
         lv: &AtomicLvalue,
         ca: &CompoundAssign,
         value: PseudoId,
+        order: MemoryOrder,
     ) -> PseudoId {
         let elem_typ = lv.elem_typ;
         let bits = lv.size_bits;
@@ -311,7 +507,7 @@ impl Linearizer<'_> {
         let exp_addr = self.frame_temp_addr("__casexp", elem_typ);
 
         // Seed it with an atomic read of the object.
-        let cur = self.emit_atomic_load(lv);
+        let cur = self.emit_atomic_op(Opcode::AtomicLoad, lv, None, seed_load_order(order));
         self.emit(Instruction::store(cur, exp_addr, 0, elem_typ, bits));
 
         let loop_bb = self.alloc_bb();
@@ -320,7 +516,7 @@ impl Linearizer<'_> {
         // Through the accessor rather than `expect`: `current_bb` is `None`
         // wherever control cannot arrive -- a statement before a `switch`'s
         // first `case`, or after a `goto` -- and this loop has to hang its
-        // blocks off something. `dce::remove_unreachable_blocks` takes the
+        // blocks off something. `Function::remove_unreachable_blocks` takes the
         // lot away again.
         let entry_bb = self.current_or_unreachable_bb();
         self.emit(Instruction::br(loop_bb));
@@ -337,14 +533,7 @@ impl Linearizer<'_> {
         self.emit(Instruction::load(old, exp_addr, 0, elem_typ, bits));
         let new = self.compound_assign_value(ca, old, value);
 
-        let ok = self.alloc_reg_pseudo();
-        let order = self.emit_const(ORDER as i128, self.types.int_id);
-        let mut cas = Instruction::new(Opcode::AtomicCas).with_target(ok);
-        cas.src = vec![lv.addr, exp_addr, new, order];
-        cas.typ = Some(self.types.bool_id);
-        cas.size = bits;
-        cas.memory_order = ORDER;
-        self.emit(cas);
+        let ok = self.emit_atomic_cas(lv.addr, exp_addr, new, bits, order);
 
         let cas_bb = self.current_or_unreachable_bb();
         self.emit(Instruction::cbr(ok, done_bb, loop_bb));
@@ -410,7 +599,7 @@ impl Linearizer<'_> {
             is_ptr_arith,
             ..CompoundAssign::new(op, lv.elem_typ, value_typ)
         };
-        let old = self.emit_atomic_rmw(&lv, &ca, operand);
+        let old = self.emit_atomic_rmw(&lv, &ca, operand, OPERATOR_ORDER);
 
         // Recompute the stored value from the old one, by the same rule that
         // stored it: C17 6.5.16p3 gives the expression the left operand's
@@ -487,7 +676,7 @@ impl Linearizer<'_> {
             ..CompoundAssign::new(op, lv.elem_typ, delta_typ)
         };
 
-        let old = self.emit_atomic_rmw(&lv, &ca, delta);
+        let old = self.emit_atomic_rmw(&lv, &ca, delta, OPERATOR_ORDER);
         if !prefix {
             return Some(old);
         }
@@ -505,5 +694,159 @@ impl Linearizer<'_> {
             return self.emit_fconst(FloatVal::from_f64(1.0), typ);
         }
         self.emit_const(1, typ)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::linearize::test_linearize::linearize_source;
+    use super::{FenceScope, MemoryOrder, Opcode};
+    use crate::target::Target;
+
+    /// The memory order recorded on every atomic instruction of `f`, in
+    /// emission order. There is no preprocessor here, so orders are spelled
+    /// as their values: 0 relaxed .. 5 seq-cst.
+    fn orders(src: &str) -> Vec<(Opcode, MemoryOrder)> {
+        let module = linearize_source(src, &Target::host());
+        let func = module.functions.iter().find(|f| f.name == "f").unwrap();
+        func.blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .filter(|i| i.op.name().starts_with("atomic") || i.op == Opcode::Fence)
+            .map(|i| (i.op, i.extra().memory_order))
+            .collect()
+    }
+
+    fn cas(success: &str, failure: &str) -> MemoryOrder {
+        let src = format!(
+            "int f(int *p, int *e, int o) {{ \
+               return __atomic_compare_exchange_n(p, e, 1, 0, {success}, {failure}); }}"
+        );
+        let found = orders(&src);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, Opcode::AtomicCas);
+        found[0].1
+    }
+
+    #[test]
+    fn a_read_modify_write_keeps_its_order() {
+        use MemoryOrder::*;
+        let src = "int f(int *p) { return __atomic_fetch_add(p, 1, 0) \
+                   + __atomic_sub_fetch(p, 1, 2) + __atomic_exchange_n(p, 1, 3); }";
+        assert_eq!(
+            orders(src),
+            [
+                (Opcode::AtomicFetchAdd, Relaxed),
+                (Opcode::AtomicFetchSub, Acquire),
+                (Opcode::AtomicSwap, Release),
+            ]
+        );
+    }
+
+    /// `nand` has no native form: a seed load and a compare-exchange. The
+    /// exchange runs at the order asked for; the seed load at the half of it
+    /// a load can have.
+    #[test]
+    fn the_cas_loop_runs_at_the_order_asked_for() {
+        use MemoryOrder::*;
+        for (value, seed, exchange) in [
+            (0, Relaxed, Relaxed),
+            (3, Relaxed, Release),
+            (4, Acquire, AcqRel),
+            (5, SeqCst, SeqCst),
+        ] {
+            let src = format!("int f(int *p) {{ return __atomic_fetch_nand(p, 1, {value}); }}");
+            assert_eq!(
+                orders(&src),
+                [(Opcode::AtomicLoad, seed), (Opcode::AtomicCas, exchange)],
+                "order {value}"
+            );
+        }
+    }
+
+    /// An `_Atomic` operator is seq-cst (C17 6.5.16.2p3), CAS loop included.
+    #[test]
+    fn an_atomic_operator_is_seq_cst() {
+        use MemoryOrder::*;
+        let src = "_Atomic float g; void f(void) { g *= 2; }";
+        assert_eq!(
+            orders(src),
+            [(Opcode::AtomicLoad, SeqCst), (Opcode::AtomicCas, SeqCst)]
+        );
+    }
+
+    /// gcc's rules: a failure order stronger than the success order, or a
+    /// release failure order, makes the exchange seq-cst; a release that
+    /// acquires on failure is acq-rel; otherwise the success order stands.
+    #[test]
+    fn a_compare_exchange_combines_its_two_orders() {
+        use MemoryOrder::*;
+        assert_eq!(cas("0", "0"), Relaxed);
+        assert_eq!(cas("2", "1"), Acquire);
+        // consume is promoted to acquire before the orders are compared
+        assert_eq!(cas("1", "2"), Consume);
+        assert_eq!(cas("3", "0"), Release);
+        assert_eq!(cas("3", "2"), AcqRel);
+        assert_eq!(cas("0", "1"), SeqCst);
+        assert_eq!(cas("2", "5"), SeqCst);
+        assert_eq!(cas("5", "3"), SeqCst);
+        assert_eq!(cas("4", "4"), SeqCst);
+        assert_eq!(cas("4", "0"), AcqRel);
+    }
+
+    /// What gcc's `get_memmodel` does: a non-constant order, an order out of
+    /// range, and an order the access cannot have are all seq-cst; a
+    /// constant expression is as good as a literal.
+    #[test]
+    fn an_order_gcc_would_not_take_is_seq_cst() {
+        use MemoryOrder::*;
+        let load = |order: &str| {
+            orders(&format!(
+                "int f(int *p, int o) {{ return __atomic_load_n(p, {order}); }}"
+            ))
+        };
+        assert_eq!(load("1 + 1"), [(Opcode::AtomicLoad, Acquire)]);
+        assert_eq!(load("o"), [(Opcode::AtomicLoad, SeqCst)]);
+        assert_eq!(load("9"), [(Opcode::AtomicLoad, SeqCst)]);
+        assert_eq!(load("3"), [(Opcode::AtomicLoad, SeqCst)]);
+        assert_eq!(cas("o", "0"), SeqCst);
+        assert_eq!(cas("5", "o"), SeqCst);
+        let store = "void f(int *p) { __atomic_store_n(p, 1, 2); __atomic_clear(p, 0); }";
+        assert_eq!(
+            orders(store),
+            [
+                (Opcode::AtomicStore, SeqCst),
+                (Opcode::AtomicStore, Relaxed)
+            ]
+        );
+        let fence = "void f(void) { __atomic_thread_fence(3); }";
+        assert_eq!(orders(fence), [(Opcode::Fence, Release)]);
+    }
+
+    /// Every spelling of a fence records whom it orders against, alongside
+    /// its order.
+    #[test]
+    fn a_fence_records_its_scope() {
+        let src = "void f(void) { __atomic_thread_fence(2); __atomic_signal_fence(3); \
+                   __c11_atomic_thread_fence(4); __c11_atomic_signal_fence(5); }";
+        let module = linearize_source(src, &Target::host());
+        let scopes: Vec<_> = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .filter(|i| i.op == Opcode::Fence)
+            .map(|i| (i.extra().fence_scope, i.extra().memory_order))
+            .collect();
+        use FenceScope::*;
+        use MemoryOrder::*;
+        assert_eq!(
+            scopes,
+            [
+                (Thread, Acquire),
+                (Signal, Release),
+                (Thread, AcqRel),
+                (Signal, SeqCst)
+            ]
+        );
     }
 }

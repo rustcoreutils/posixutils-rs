@@ -13,4 +13,5 @@
 
 mod no_current_block;
 mod setjmp;
+mod statement_attributes;
 mod stmt_expr;

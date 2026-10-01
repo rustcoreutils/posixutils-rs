@@ -690,12 +690,6 @@ pub enum X86Inst {
     /// MFENCE - full memory fence (SeqCst)
     Mfence,
 
-    /// LFENCE - load fence (typically not needed on x86)
-    Lfence,
-
-    /// SFENCE - store fence (typically not needed on x86)
-    Sfence,
-
     // ========================================================================
     // Directives (Architecture-Independent)
     // ========================================================================
@@ -1096,14 +1090,6 @@ impl EmitAsm for X86Inst {
 
             X86Inst::Mfence => {
                 let _ = writeln!(out, "    mfence");
-            }
-
-            X86Inst::Lfence => {
-                let _ = writeln!(out, "    lfence");
-            }
-
-            X86Inst::Sfence => {
-                let _ = writeln!(out, "    sfence");
             }
 
             // Directives - delegate to shared implementation

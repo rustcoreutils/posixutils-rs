@@ -13,6 +13,7 @@
 
 use crate::common::{
     asm_for_at, compile_and_run, compile_and_run_aarch64, compile_and_run_optimized,
+    compile_expect_error, compile_expect_warning,
 };
 
 // ============================================================================
@@ -364,4 +365,117 @@ fn builtins_popcount_uses_baseline_instructions() {
         );
         assert!(!asm.contains("popcnt"), "{opt}: popcnt emitted:\n{asm}");
     }
+}
+
+/// The bit builtins have prototypes -- `int __builtin_ctz(unsigned int)` and
+/// so on -- so an argument converts to the parameter type as in any call
+/// through a prototype (C17 6.5.2.2p7). c17 took the argument's bits as they
+/// were: `__builtin_ctz(8.0)` counted the zeros of the double's
+/// representation, 0 on x86-64 and 2 on aarch64, where gcc answers 3.
+#[test]
+fn builtins_bit_ops_convert_their_argument() {
+    crate::common::compile_and_run_everywhere(
+        "bit_ops_convert",
+        r#"
+/* Bit builtins convert their argument to the parameter type, as a call
+   through a prototype would. */
+int main(void) {
+    volatile double d = 8.0, e = 7.9;
+    volatile float f = 12.0f;
+    volatile long double ld = 2147483648.0L;
+    if (__builtin_ctz(d) != 3) return 1;
+    if (__builtin_popcount(e) != 3) return 2;
+    if (__builtin_clz(f) != 28) return 3;
+    if (__builtin_ctzll(ld) != 31) return 4;
+    if (__builtin_popcountl(e) != 3) return 5;
+    if (__builtin_parity(e) != 1) return 6;
+    if (__builtin_bswap32(d) != 0x08000000u) return 7;
+    if (__builtin_ffs(d) != 4) return 8;
+    if (__builtin_clrsb(f) != 27) return 9;
+    return 0;
+}
+"#,
+    );
+}
+
+/// An argument the prototype cannot convert is diagnosed as in any call, in
+/// gcc's words: a structure is an error, a pointer the integer-from-pointer
+/// warning an ordinary call draws.
+#[test]
+fn builtins_bit_ops_check_their_argument() {
+    for (name, call, param) in [
+        ("ctz", "__builtin_ctz(s)", "unsigned int"),
+        ("parityl", "__builtin_parityl(s)", "unsigned long"),
+        ("bswap16", "__builtin_bswap16(s)", "unsigned short"),
+        ("clrsbll", "__builtin_clrsbll(s)", "long long"),
+        ("ffs", "__builtin_ffs(s)", "int"),
+    ] {
+        let builtin = call.split('(').next().unwrap();
+        compile_expect_error(
+            &format!("bit_ops_struct_{name}"),
+            &format!("struct S {{ int a; }};\nint f(struct S s) {{ return {call}; }}\n"),
+            &format!(
+                "incompatible type for argument 1 of '{builtin}': \
+                 expected '{param}', got 'struct S'"
+            ),
+        );
+    }
+    compile_expect_warning(
+        "bit_ops_pointer",
+        "int f(unsigned *p) { return __builtin_popcount(p); }\n",
+        "passing argument 1 of '__builtin_popcount' as 'unsigned int' from 'unsigned int *' \
+         makes integer from pointer without a cast",
+    );
+}
+
+/// A bit builtin of a constant is an integer constant expression in gcc, so
+/// it may initialize a static object and label a `case`. c17 folded only
+/// `popcount` and `parity`, and none of them in a static initializer.
+#[test]
+fn builtins_bit_ops_of_constants_are_constant_expressions() {
+    crate::common::compile_and_run_everywhere(
+        "bit_ops_constant",
+        r#"
+/* Every bit builtin of a constant is an integer constant expression in gcc,
+   so it works in a static initializer and a case label. */
+static const int t[] = {
+    __builtin_ctz(8), __builtin_clz(1), __builtin_ctzll(1ULL << 40),
+    __builtin_clzl(1), __builtin_popcount(7), __builtin_parity(7),
+    __builtin_clrsb(0), __builtin_ffs(8), __builtin_bswap16(0x1234),
+};
+static const unsigned b32 = __builtin_bswap32(0x12345678u);
+static const unsigned long long b64 = __builtin_bswap64(0x0102030405060708ULL);
+int main(void) {
+    switch (8) { case __builtin_ctz(256): break; case __builtin_popcount(127): return 50; default: return 51; }
+    if (t[0] != 3 || t[1] != 31 || t[2] != 40 || t[3] != 63 || t[4] != 3 || t[5] != 1
+        || t[6] != 31 || t[7] != 4 || t[8] != 0x3412) return 1;
+    if (b32 != 0x78563412u || b64 != 0x0807060504030201ULL) return 2;
+    return 0;
+}
+"#,
+    );
+}
+
+/// `ctz` and `clz` of 0 are undefined at run time, but of a constant 0 gcc
+/// still folds them, to the operand width, on both targets: a static
+/// initializer, an enumerator, an array bound and `_Static_assert` accept
+/// them. The other bit builtins are constants in those places too.
+#[test]
+fn builtins_ctz_clz_of_constant_zero_fold_to_the_width() {
+    crate::common::compile_and_run_everywhere(
+        "bit_ops_constant_zero",
+        r#"
+static int z[] = { __builtin_ctz(0), __builtin_clz(0), __builtin_ctzll(0), __builtin_clzl(0) };
+enum { E = __builtin_ctz(0), F = __builtin_ffs(0), G = __builtin_clrsb(-1) };
+static char bound[__builtin_bswap16(0x0100) + __builtin_ctz(-1)];
+_Static_assert(__builtin_clzll(0) == 64 && __builtin_popcountll(-1) == 64, "folded");
+_Static_assert(__builtin_bswap32(0x12345678u) == 0x78563412u, "folded");
+int main(void) {
+    if (z[0] != 32 || z[1] != 32 || z[2] != 64 || z[3] != 64) return 1;
+    if (E != 32 || F != 0 || G != 31) return 2;
+    if (sizeof bound != 1) return 3;
+    return 0;
+}
+"#,
+    );
 }

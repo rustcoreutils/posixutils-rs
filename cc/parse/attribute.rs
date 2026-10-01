@@ -75,7 +75,6 @@ impl AttrArgs {
             | "nonnull_if_nonzero"
             | "sentinel"
             | "regparm" => AttrArgs::Integers(IntArgRole::Unused),
-            "mode" => AttrArgs::General,
             _ if recognised => AttrArgs::General,
             _ => AttrArgs::Unknown,
         }
@@ -188,6 +187,16 @@ impl Attribute {
             args,
         }
     }
+
+    /// Whether this is attribute `name`, in its plain or `__name__` spelling.
+    pub(super) fn is_named(&self, name: &str) -> bool {
+        self.name == name
+            || self
+                .name
+                .strip_prefix("__")
+                .and_then(|n| n.strip_suffix("__"))
+                == Some(name)
+    }
 }
 
 impl fmt::Display for Attribute {
@@ -229,30 +238,20 @@ impl AttributeList {
     /// Check if this attribute list contains a noreturn attribute
     /// (either "noreturn" or "__noreturn__")
     pub fn has_noreturn(&self) -> bool {
-        self.attrs
-            .iter()
-            .any(|a| a.name == "noreturn" || a.name == "__noreturn__")
+        self.has_attr("noreturn")
     }
 
-    pub fn has_sysv_abi(&self) -> bool {
-        self.attrs
-            .iter()
-            .any(|a| a.name == "sysv_abi" || a.name == "__sysv_abi__")
-    }
-
-    pub fn has_ms_abi(&self) -> bool {
-        self.attrs
-            .iter()
-            .any(|a| a.name == "ms_abi" || a.name == "__ms_abi__")
-    }
-
+    /// The calling convention this list names: `ms_abi` is Win64, and
+    /// `sysv_abi` is the x86-64 default. `None` for neither -- or for both,
+    /// which [`Parser::merge_calling_conv`] reports.
+    ///
+    /// Read only on x86-64: anywhere else the names are not attributes, and
+    /// `parse_single_attribute` has already warned that they are ignored.
     pub fn calling_conv(&self) -> Option<crate::abi::CallingConv> {
-        if self.has_sysv_abi() {
-            Some(crate::abi::CallingConv::SysV)
-        } else if self.has_ms_abi() {
-            Some(crate::abi::CallingConv::Win64)
-        } else {
-            None
+        match (self.has_attr("ms_abi"), self.has_attr("sysv_abi")) {
+            (true, false) => Some(crate::abi::CallingConv::Win64),
+            (false, true) => Some(crate::abi::CallingConv::C),
+            _ => None,
         }
     }
 
@@ -288,23 +287,26 @@ impl AttributeList {
         self.has_attr("transparent_union")
     }
 
+    /// `__attribute__((packed))`, in either spelling.
+    pub(super) fn has_packed(&self) -> bool {
+        self.has_attr("packed")
+    }
+
     /// Whether an attribute is present, in either spelling.
     fn has_attr(&self, name: &str) -> bool {
-        let underscored = format!("__{name}__");
-        self.attrs
-            .iter()
-            .any(|a| a.name == name || a.name == underscored)
+        self.find(name).is_some()
+    }
+
+    /// The first attribute `name`, in either spelling.
+    pub(super) fn find(&self, name: &str) -> Option<&Attribute> {
+        self.attrs.iter().find(|a| a.is_named(name))
     }
 
     /// Look up an attribute in both its plain and `__underscored__` spelling,
     /// returning its optional integer argument. The result distinguishes
     /// "absent" (`None`) from "present without a priority" (`Some(None)`).
     fn init_priority(&self, name: &str) -> Option<Option<u16>> {
-        let underscored = format!("__{name}__");
-        let attr = self
-            .attrs
-            .iter()
-            .find(|a| a.name == name || a.name == underscored)?;
+        let attr = self.find(name)?;
         match attr.args.first() {
             // In range: `check_integer_args` drops any other priority.
             Some(AttributeArg::Int(n)) => Some(u16::try_from(*n).ok()),
@@ -335,7 +337,6 @@ impl AttributeList {
             effect: self.mem_effect(),
             align: self.get_alignment().filter(|n| n.is_power_of_two()),
             noreturn: self.has_noreturn(),
-            calling_conv: self.calling_conv(),
         }
     }
 
@@ -365,7 +366,7 @@ impl AttributeList {
     /// `check_integer_args` drops any other with a diagnostic.
     pub fn get_alignment(&self) -> Option<u32> {
         for attr in &self.attrs {
-            if attr.name == "aligned" || attr.name == "__aligned__" {
+            if attr.is_named("aligned") {
                 if attr.args.is_empty() {
                     return Some(16); // GCC default: max useful alignment
                 }
@@ -589,24 +590,10 @@ impl Parser<'_> {
         // this is where an unrecognised one gets said out loud: dropping one
         // in silence is survivable for an attribute that only hints, and is
         // not for one that changes what the type *is*.
-        let recognised = id.is_some_and(|id| crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR));
-        if !recognised {
-            if name.trim_matches('_') == "vector_size" {
-                // Captured below, once the byte count is parsed, and applied
-                // with the other type attributes. c17 gives it the *storage* a
-                // vector has -- the right size and the right alignment -- and
-                // not vector arithmetic, which is what glibc's <link.h> needs
-                // and all it declares these types for. What cannot be done is
-                // ignore it: the type would stay scalar and every operation on
-                // it would silently compute on one element.
-            } else if name.trim_matches('_') == "mode" {
-                // Applied below, once the argument is parsed: a mode replaces
-                // the declared type, and getting it wrong is not cosmetic --
-                // glibc declares `register_t` with `__mode__(__word__)`, which
-                // c17 sized 4 bytes against gcc's 8 while this was a warning.
-            } else if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-                diag::warning_args(pos, "'{0}' attribute directive ignored", &[&name]);
-            }
+        let arch = self.types.target().arch;
+        let recognised = id.is_some_and(|id| crate::kw::attribute_supported(id, arch));
+        if !recognised && diag::warning_group_enabled(ATTRIBUTE_WARNING) {
+            diag::warning_args(pos, "'{0}' attribute directive ignored", &[&name]);
         }
 
         let grammar = AttrArgs::of(&name, recognised);
@@ -620,14 +607,21 @@ impl Parser<'_> {
             self.check_integer_args(&name, role, &args, pos).ok()?;
         }
 
-        match (name.trim_matches('_'), args.first()) {
-            ("mode", Some(AttributeArg::Ident(m))) => {
+        // A mode or a vector width replaces the declared type, so each is
+        // held here and applied with the other type attributes once the type
+        // is final (`apply_pending_type_attrs`). Neither can be ignored: glibc
+        // declares `register_t` with `__mode__(__word__)`, and a vector left
+        // scalar would compute on one element. `vector_size` gets a vector's
+        // storage -- size and alignment -- and not vector arithmetic. Only a
+        // recognised spelling is applied: one warned about as ignored is not.
+        match (recognised, name.trim_matches('_'), args.first()) {
+            (true, "mode", Some(AttributeArg::Ident(m))) => {
                 self.pending_mode = Some((m.trim_matches('_').to_string(), pos));
             }
-            ("vector_size", Some(AttributeArg::Int(n))) => {
+            (true, "vector_size", Some(AttributeArg::Int(n))) => {
                 self.pending_vector_size = Some((u64::try_from(*n).unwrap_or(u64::MAX), pos));
             }
-            ("aligned", Some(AttributeArg::Int(n))) => {
+            (true, "aligned", Some(AttributeArg::Int(n))) => {
                 self.pending_attr_align = Some(*n as u32);
             }
             _ => {}
@@ -705,6 +699,7 @@ impl Parser<'_> {
         SpecifierAttrs {
             fn_attrs: self.pending_fn_attrs.clone(),
             symbol_attrs: self.pending_symbol_attrs.clone(),
+            calling_conv: self.pending_calling_conv,
         }
     }
 
@@ -713,6 +708,7 @@ impl Parser<'_> {
     pub(super) fn begin_declarator(&mut self, spec: &SpecifierAttrs) {
         self.pending_fn_attrs = spec.fn_attrs.clone();
         self.pending_symbol_attrs = spec.symbol_attrs.clone();
+        self.pending_calling_conv = spec.calling_conv;
         self.pending_declarator_align = None;
     }
 
@@ -751,6 +747,7 @@ impl Parser<'_> {
     /// so every path that finishes a declarator calls this rather than
     /// remembering which attributes exist.
     pub(super) fn apply_pending_type_attrs(&mut self, typ: TypeId) -> TypeId {
+        let typ = self.apply_pending_calling_conv(typ);
         let typ = self.apply_pending_mode(typ);
         let typ = self.apply_pending_vector_size(typ);
         if let Some(pos) = self.pending_transparent_union.take() {
@@ -761,6 +758,80 @@ impl Parser<'_> {
             }
         }
         typ
+    }
+
+    /// Hold the calling convention `attrs` names for the declarator being
+    /// parsed, refusing a second one that disagrees with it -- in the same
+    /// list or another -- as gcc does.
+    fn merge_calling_conv(&mut self, attrs: &AttributeList, pos: Position) {
+        if self.types.target().arch != crate::target::Arch::X86_64 {
+            return;
+        }
+        let both = attrs.find("ms_abi").is_some() && attrs.find("sysv_abi").is_some();
+        let conflict = match (self.pending_calling_conv, attrs.calling_conv()) {
+            (Some((held, _)), Some(new)) => held != new,
+            _ => false,
+        };
+        if both || conflict {
+            diag::error(pos, "'ms_abi' and 'sysv_abi' attributes are not compatible");
+            return;
+        }
+        if let Some(conv) = attrs.calling_conv() {
+            self.pending_calling_conv = Some((conv, pos));
+        }
+    }
+
+    /// Give the declared type the calling convention its declaration names.
+    ///
+    /// gcc's placement rule for an attribute that needs a function type: a
+    /// function takes it, a pointer to a function hands it to the function it
+    /// points at -- `__attribute__((ms_abi)) long (*fp)(long)` is a pointer
+    /// to an `ms_abi` function -- and anything else, including a pointer to
+    /// such a pointer, warns and ignores it. `sysv_abi` names the default,
+    /// so it changes nothing but is placed by the same rule.
+    fn apply_pending_calling_conv(&mut self, typ: TypeId) -> TypeId {
+        let Some((conv, pos)) = self.pending_calling_conv.take() else {
+            return typ;
+        };
+        match self.types.kind(typ) {
+            TypeKind::Function => self.with_calling_conv(typ, conv),
+            TypeKind::Pointer
+                if self
+                    .types
+                    .base_type(typ)
+                    .is_some_and(|b| self.types.kind(b) == TypeKind::Function) =>
+            {
+                let func = self.types.base_type(typ).expect("checked above");
+                let func = self.with_calling_conv(func, conv);
+                let mut ptr = self.types.get(typ).clone();
+                ptr.base = Some(func);
+                self.types.intern(ptr)
+            }
+            _ => {
+                if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
+                    let name = match conv {
+                        crate::abi::CallingConv::Win64 => "ms_abi",
+                        crate::abi::CallingConv::C => "sysv_abi",
+                    };
+                    diag::warning_args(
+                        pos,
+                        "'{0}' attribute only applies to function types",
+                        &[name],
+                    );
+                }
+                typ
+            }
+        }
+    }
+
+    /// The function type `func` with calling convention `conv`.
+    fn with_calling_conv(&mut self, func: TypeId, conv: crate::abi::CallingConv) -> TypeId {
+        if self.types.get(func).conv == conv {
+            return func;
+        }
+        let mut changed = self.types.get(func).clone();
+        changed.conv = conv;
+        self.types.intern(changed)
     }
 
     /// Apply `__attribute__((vector_size(N)))` to a declared type.
@@ -946,6 +1017,7 @@ impl Parser<'_> {
     fn skip_extensions_inner(&mut self, declarator_scoped: bool) {
         loop {
             if self.is_attribute_keyword() {
+                let pos = self.current_pos();
                 let attrs = self.parse_attributes();
                 if declarator_scoped {
                     if let Some(align) = attrs.get_alignment() {
@@ -962,7 +1034,9 @@ impl Parser<'_> {
                 if attrs.has_transparent_union() {
                     self.pending_transparent_union = Some(self.current_pos());
                 }
+                self.pending_packed |= attrs.has_packed();
                 self.merge_symbol_attrs(&attrs);
+                self.merge_calling_conv(&attrs, pos);
                 let fn_attrs = attrs.function_attrs();
                 self.pending_fn_attrs.merge(&fn_attrs);
             } else if self.is_asm_keyword() {
@@ -991,6 +1065,7 @@ impl Parser<'_> {
 pub(super) struct SpecifierAttrs {
     fn_attrs: crate::parse::ast::FunctionAttrs,
     symbol_attrs: crate::parse::ast::SymbolAttrs,
+    calling_conv: Option<(crate::abi::CallingConv, Position)>,
 }
 
 /// Every slot an attribute list writes for the declaration being parsed.
@@ -1011,8 +1086,10 @@ pub(super) struct PendingDeclAttrs {
     mode: Option<(String, Position)>,
     vector_size: Option<(u64, Position)>,
     transparent_union: Option<Position>,
+    packed: bool,
     symbol_attrs: crate::parse::ast::SymbolAttrs,
     fn_attrs: crate::parse::ast::FunctionAttrs,
+    calling_conv: Option<(crate::abi::CallingConv, Position)>,
     asm_label: Option<String>,
 }
 
@@ -1029,8 +1106,10 @@ impl Parser<'_> {
             mode: take(&mut self.pending_mode),
             vector_size: take(&mut self.pending_vector_size),
             transparent_union: take(&mut self.pending_transparent_union),
+            packed: take(&mut self.pending_packed),
             symbol_attrs: take(&mut self.pending_symbol_attrs),
             fn_attrs: take(&mut self.pending_fn_attrs),
+            calling_conv: take(&mut self.pending_calling_conv),
             asm_label: take(&mut self.pending_asm_label),
         }
     }
@@ -1045,8 +1124,10 @@ impl Parser<'_> {
         self.pending_mode = saved.mode;
         self.pending_vector_size = saved.vector_size;
         self.pending_transparent_union = saved.transparent_union;
+        self.pending_packed = saved.packed;
         self.pending_symbol_attrs = saved.symbol_attrs;
         self.pending_fn_attrs = saved.fn_attrs;
+        self.pending_calling_conv = saved.calling_conv;
         self.pending_asm_label = saved.asm_label;
     }
 }

@@ -127,6 +127,10 @@ pub(crate) struct ParsedDeclarator {
     pub(crate) name: StringId,
     /// Where the declarator starts, which is where its diagnostics point.
     pub(crate) pos: Position,
+    /// Where the declared identifier is written; the declarator's start for
+    /// an abstract declarator. gcc points a diagnostic about the declared
+    /// type here.
+    pub(crate) name_pos: Position,
     /// The derived type. A function declarator's *return* type carries the
     /// specifiers' storage class, as any other derived type does.
     pub(crate) typ: TypeId,
@@ -143,6 +147,22 @@ pub(crate) struct ParsedDeclarator {
 }
 
 // Parser
+
+/// The function whose body is being parsed, as the variadic builtins see it.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct EnclosingFunction {
+    /// Declared with `...`: `__builtin_va_start` needs it to be.
+    pub(crate) variadic: bool,
+    /// Variadic and `always_inline`. `__builtin_va_arg_pack()` names the
+    /// caller's variadic arguments, so it needs both: there are arguments,
+    /// and a known caller to take them from.
+    pub(crate) forwarding: bool,
+    /// The last named parameter, which `__builtin_va_start` names.
+    pub(crate) last_param: Option<StringId>,
+    /// The function's calling convention, which decides which of
+    /// `__builtin_va_start` and `__builtin_ms_va_start` it may use.
+    pub(crate) conv: crate::abi::CallingConv,
+}
 
 /// C expression parser using recursive descent with precedence climbing
 ///
@@ -198,6 +218,11 @@ pub struct Parser<'a> {
     /// `pending_mode`: the attribute is consumed while the declarator is, and
     /// only the finished type can carry it.
     pub(super) pending_transparent_union: Option<Position>,
+    /// `__attribute__((packed))` written on the declaration being parsed.
+    /// Only a struct or union member claims it, as half of its
+    /// [`crate::types::MemberAlign`]; anywhere else gcc ignores it too, and
+    /// the declaration's end clears it.
+    pub(super) pending_packed: bool,
     /// File-scope object definitions whose type was incomplete when parsed.
     /// Judged at end of translation unit -- see
     /// [`Self::check_deferred_incomplete_definitions`].
@@ -221,14 +246,16 @@ pub struct Parser<'a> {
     /// specifiers, between the type and the declarator, or after the
     /// parameter list. Cleared at the start of each external declaration.
     pub(super) pending_fn_attrs: crate::parse::ast::FunctionAttrs,
+    /// `__attribute__((ms_abi))` or `((sysv_abi))` awaiting the declarator
+    /// whose function type it belongs to, with where it was written. A
+    /// property of the type, so it is applied with the other type attributes
+    /// (`apply_pending_type_attrs`) and taken there.
+    pub(super) pending_calling_conv: Option<(crate::abi::CallingConv, Position)>,
 
-    /// Set while parsing the body of a function that may use the forwarding
-    /// builtins: one that is both variadic and `always_inline`.
-    ///
-    /// `__builtin_va_arg_pack()` names the caller's variadic arguments, so it
-    /// needs both facts, and this is the last place either is visible --
-    /// `ir::Function` records neither.
-    pub(crate) in_forwarding_function: bool,
+    /// What the variadic builtins need to know of the function whose body
+    /// is being parsed; the default outside any function. This is the last
+    /// place it is visible -- `ir::Function` records none of it.
+    pub(crate) enclosing_function: EnclosingFunction,
     /// Every function attribute seen for a given name anywhere in the
     /// translation unit.
     ///
@@ -264,12 +291,6 @@ pub struct Parser<'a> {
     /// reason as `declared_extern_fns`: a later declaration binds a fresh
     /// symbol that knows nothing of the body.
     pub(super) defined_functions: std::collections::HashSet<StringId>,
-    /// Library functions the parser declared itself, for a `__builtin_` alias
-    /// the translation unit never declared, whose parameter types are
-    /// placeholders rather than the library's (see `declare_chk_builtin`). A
-    /// call is not checked against those types: they would report errors
-    /// the program does not have.
-    pub(super) placeholder_prototypes: std::collections::HashSet<crate::symbol::SymbolId>,
     /// `#pragma pack` directives, and where they stood in the token stream.
     ///
     /// Sorted by index; `pack_cursor` is how far the parser has consumed
@@ -295,6 +316,9 @@ pub struct Parser<'a> {
     /// How a call to a library builtin is evaluated: the optimization level
     /// and `-f[no-]math-errno`. See [`Self::set_library_call_policy`].
     pub(super) library_call_policy: super::library_builtin::LibraryCallPolicy,
+    /// How many `switch` bodies enclose the statement being parsed, which is
+    /// all a `fallthrough` attribute statement needs to know to be valid.
+    pub(super) switch_depth: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -318,6 +342,7 @@ impl<'a> Parser<'a> {
             types,
             pos: 0,
             pending_alignas: None,
+            pending_packed: false,
             pending_alignas_kw: None,
             pending_mode: None,
             pending_vector_size: None,
@@ -327,18 +352,19 @@ impl<'a> Parser<'a> {
             pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
             pending_fn_attrs: Default::default(),
-            in_forwarding_function: false,
+            pending_calling_conv: None,
+            enclosing_function: EnclosingFunction::default(),
             declared_fn_attrs: BTreeMap::new(),
             pending_asm_label: None,
             declared_asm_labels: BTreeMap::new(),
             declared_extern_fns: std::collections::BTreeSet::new(),
             declared_non_inline_fns: std::collections::BTreeSet::new(),
             defined_functions: std::collections::HashSet::new(),
-            placeholder_prototypes: std::collections::HashSet::new(),
             pack_directives,
             pack_cursor: 0,
             vm_typedefs: HashMap::new(),
             library_call_policy: Default::default(),
+            switch_depth: 0,
             pack_current: None,
             pack_stack: Vec::new(),
         }

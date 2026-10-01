@@ -11,6 +11,7 @@
 // backend (code generator).
 //
 // - System V AMD64 (x86-64 Linux/BSD/macOS)
+// - Microsoft x64 (x86-64, `__attribute__((ms_abi))`)
 // - AAPCS64 (AArch64 Linux/macOS)
 //
 
@@ -20,11 +21,13 @@
 // crate is the `pub use` below.
 pub(crate) mod aapcs64;
 mod sysv_amd64;
+mod win64;
 
 pub use aapcs64::Aapcs64Abi;
 pub use sysv_amd64::{
     param_is_ignored, param_is_memory_class, sse_struct_regs, struct_param_classes, SysVAmd64Abi,
 };
+pub use win64::{Win64Abi, WIN64_POSITION_BYTES, WIN64_REG_POSITIONS, WIN64_SHADOW_BYTES};
 
 use crate::target::{Arch, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
@@ -203,19 +206,42 @@ pub enum ArgClass {
 
 // Calling Convention
 
-/// Calling convention for a function.
+/// The calling convention of a function type.
 ///
-/// This can be overridden per-function using attributes like
-/// `__attribute__((sysv_abi))` or `__attribute__((ms_abi))`.
+/// A property of the *type*, as gcc has it: a call through a pointer, a call
+/// to a prototype and a definition are each classified by the convention of
+/// the function type they name, and two function types that differ only in
+/// convention are incompatible. `__attribute__((ms_abi))` sets it on an x86-64
+/// target; `sysv_abi` names the x86-64 default, which is [`CallingConv::C`].
+/// On aarch64 both attributes are ignored, as gcc ignores them there, so a
+/// function type is never anything but `C`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CallingConv {
-    /// Default C calling convention for the target platform.
+    /// The target's own convention: System V AMD64 or AAPCS64.
     #[default]
     C,
-    /// Force System V AMD64 ABI (e.g., `__attribute__((sysv_abi))`).
-    SysV,
-    /// Force Microsoft x64 ABI (e.g., `__attribute__((ms_abi))`).
+    /// The Microsoft x64 convention (`__attribute__((ms_abi))`).
     Win64,
+}
+
+impl CallingConv {
+    /// The convention a call through `callee` uses: the function type's, or
+    /// the pointed-to function type's for a call through a pointer.
+    ///
+    /// The one place a call site decides its convention. A callee of any other
+    /// type -- an implicit declaration, a diagnosed expression -- is called
+    /// with the target's own.
+    pub fn of_callee(callee: TypeId, types: &TypeTable) -> CallingConv {
+        let func = match types.kind(callee) {
+            TypeKind::Pointer => types.base_type(callee).unwrap_or(callee),
+            _ => callee,
+        };
+        if types.kind(func) == TypeKind::Function {
+            types.get(func).conv
+        } else {
+            CallingConv::C
+        }
+    }
 }
 
 // ABI Trait
@@ -252,16 +278,14 @@ pub fn get_abi(target: &Target) -> Box<dyn Abi> {
     }
 }
 
-/// Get an ABI implementation for a specific calling convention override.
+/// The classifier for a function type's calling convention.
+///
+/// `Win64` exists only on x86-64: the parser records it nowhere else, and
+/// the AAPCS64 classifier answers for any convention on aarch64.
 pub fn get_abi_for_conv(conv: CallingConv, target: &Target) -> Box<dyn Abi> {
-    match conv {
-        CallingConv::C => get_abi(target),
-        CallingConv::SysV => Box::new(SysVAmd64Abi::new()),
-        CallingConv::Win64 => {
-            // TODO: Implement Win64 ABI when needed
-            // For now, fall back to the target default
-            get_abi(target)
-        }
+    match (conv, target.arch) {
+        (CallingConv::Win64, Arch::X86_64) => Box::new(Win64Abi::new()),
+        _ => get_abi(target),
     }
 }
 

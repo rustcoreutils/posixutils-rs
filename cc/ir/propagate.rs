@@ -22,10 +22,8 @@
 // drift.
 //
 
-use super::constfold::result_type_of;
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
-use crate::types::TypeTable;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// A `(block index, instruction index)` pair.
 pub(crate) type Site = (usize, usize);
@@ -40,7 +38,6 @@ pub(crate) type Site = (usize, usize);
 /// Returns whether anything changed.
 pub(crate) fn fold_target_to_const(
     func: &mut Function,
-    types: &TypeTable,
     (b, i): Site,
     v: i128,
     minted: &mut HashMap<i128, PseudoId>,
@@ -82,14 +79,13 @@ pub(crate) fn fold_target_to_const(
             id
         }
     };
-    // A comparison describes its *operands* in `typ`/`size`, so the copy
-    // that replaces it must be re-typed rather than left as it stands.
-    let (typ, size) = result_type_of(&func.blocks[b].insns[i], types);
+    // The copy has the instruction's own result type and width, and reads
+    // no operand of another type.
     let insn = &mut func.blocks[b].insns[i];
     insn.op = Opcode::Copy;
     insn.src = vec![c];
-    insn.typ = typ;
-    insn.size = size;
+    insn.src_typ = None;
+    insn.src_size = 0;
     // A folded phi keeps no incoming values; clearing the list is what
     // makes the now-unread `PhiSource` instructions dead, for the `dce`
     // run that follows to collect.
@@ -98,61 +94,39 @@ pub(crate) fn fold_target_to_const(
 }
 
 /// Turn block `b`'s terminator into an unconditional branch to `taken`, and
-/// repair the edges the other targets lose.
+/// drop the edges the other targets lose.
 ///
-/// The caller has proved `taken` is the only reachable successor.
+/// The caller has proved `taken` is the only reachable successor. An
+/// `asm goto` in the block keeps its own edges: they are not the
+/// terminator's to give up.
 ///
 /// Returns whether anything changed.
 pub(crate) fn retarget_terminator(func: &mut Function, b: usize, taken: BasicBlockId) -> bool {
     let block_id = func.blocks[b].id;
-    let Some(insn) = func.blocks[b].insns.last() else {
+    let Some(term) = func.blocks[b].insns.last() else {
         return false;
     };
-
-    // The terminator's targets must be exactly what the CFG records, or
-    // the edge bookkeeping below would be repairing something already
-    // broken. Leave such a block alone.
-    let targets = terminator_targets(insn);
-    let recorded: HashSet<BasicBlockId> = func.blocks[b].children.iter().copied().collect();
-    if targets != recorded {
-        debug_assert!(
-            false,
-            "propagate: terminator targets disagree with the CFG in {block_id}"
-        );
+    if term.op == Opcode::Br && term.bb_true == Some(taken) {
         return false;
     }
+    let before = term.control_targets();
+    if !before.contains(&taken) {
+        debug_assert!(false, "propagate: {taken} is not a target of {block_id}");
+        return false;
+    }
+
+    let pos = term.pos;
+    let last = func.blocks[b].insns.len() - 1;
+    func.blocks[b].insns[last] = Instruction::br(taken);
+    func.blocks[b].insns[last].pos = pos;
 
     // A `Cbr` with both arms on one block, or a `Switch` with two cases
-    // landing together, keeps its edge: it is still a successor.
-    let dropped: Vec<BasicBlockId> = targets.iter().copied().filter(|t| *t != taken).collect();
-
-    let last = func.blocks[b].insns.len() - 1;
-    let insn = &mut func.blocks[b].insns[last];
-    if insn.op == Opcode::Br && insn.bb_true == Some(taken) {
-        return false;
-    }
-    // Rewritten in place, never `kill()`ed: `kill` leaves `bb_false`,
-    // `switch_cases` and `switch_default` untouched, and `validate`'s
-    // branch-target invariant inspects those on every instruction
-    // whatever its opcode -- so a killed `Cbr` still naming a block that
-    // is then removed trips the validator far from here.
-    insn.op = Opcode::Br;
-    insn.bb_true = Some(taken);
-    insn.bb_false = None;
-    insn.src.clear();
-    insn.switch_cases.clear();
-    insn.switch_default = None;
-
-    func.blocks[b].children.retain(|c| !dropped.contains(c));
-    for d in dropped {
-        if let Some(succ) = func.get_block_mut(d) {
-            // `parents` matters even though `dce` does not bother with
-            // it: `dce`'s untaken successors die, and `retain_edges`
-            // repairs them on the way out. A successor dropped here
-            // usually survives, reached from somewhere else, and
-            // `dominate` builds immediate dominators from `parents`.
-            succ.parents.retain(|p| *p != block_id);
-            succ.remove_phi_predecessor(block_id);
+    // landing together, keeps its edge: it is still a successor. So is a
+    // block an `asm goto` above the terminator names.
+    let still = func.blocks[b].named_successors().unwrap_or_default();
+    for d in before {
+        if !still.contains(&d) {
+            func.remove_edge(block_id, d);
         }
     }
     true
@@ -163,9 +137,10 @@ pub(crate) fn retarget_terminator(func: &mut Function, b: usize, taken: BasicBlo
 ///
 /// A `Cbr` carries no type and a width of zero, and a `Val` pseudo may hold
 /// bits above its nominal width, so the raw `i128` cannot simply be compared
-/// against zero. Both backends compute the condition's width as at least 32,
-/// so a value with any of its low 32 bits set is nonzero at every width the
-/// hardware will test; and zero is zero at every width. Anything else --
+/// against zero. A branch condition is a comparison's `int` or wider -- the
+/// linearizer turns anything narrower into one -- and the back ends test it
+/// at that width, so a value with any of its low 32 bits set is nonzero at
+/// every width the hardware will test; and zero is zero at every width. Anything else --
 /// `1 << 32` viewed at 32 bits -- proves nothing and is left alone.
 pub(crate) fn cbr_taken(v: i128) -> Option<bool> {
     if v == 0 {
@@ -201,7 +176,7 @@ pub(crate) fn switch_taken(insn: &Instruction, v: i128) -> Option<BasicBlockId> 
     let mask = |x: i128| -> u128 { (x as u128) & (u128::MAX >> (128 - w)) };
 
     let sel = mask(v);
-    for (lo, hi, target) in &insn.switch_cases {
+    for (lo, hi, target) in &insn.extra().switch_cases {
         let low = mask(*lo as i128);
         let matched = if lo == hi {
             sel == low
@@ -213,15 +188,157 @@ pub(crate) fn switch_taken(insn: &Instruction, v: i128) -> Option<BasicBlockId> 
             return Some(*target);
         }
     }
-    insn.switch_default
+    insn.extra().switch_default
 }
 
-/// Every block a terminator can transfer to.
-pub(crate) fn terminator_targets(insn: &Instruction) -> HashSet<BasicBlockId> {
-    let mut t = HashSet::new();
-    t.extend(insn.bb_true);
-    t.extend(insn.bb_false);
-    t.extend(insn.switch_cases.iter().map(|(_, _, b)| *b));
-    t.extend(insn.switch_default);
-    t
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{BasicBlock, Pseudo};
+    use crate::target::Target;
+    use crate::types::TypeTable;
+
+    /// `entry: %2 = add %1, %1; cbr %1, .L1, .L2`, both arms joining at `.L3`
+    /// with a phi over what each supplies.
+    fn diamond() -> Function {
+        let types = TypeTable::new(&Target::host());
+        let int = types.int_id;
+        let mut f = Function::new("f", int);
+        f.add_pseudo(Pseudo::arg(PseudoId(1), 0));
+        f.next_pseudo = 20;
+        let (l0, l1, l2, l3) = (
+            BasicBlockId(0),
+            BasicBlockId(1),
+            BasicBlockId(2),
+            BasicBlockId(3),
+        );
+        let mut b0 = BasicBlock::new(l0);
+        b0.add_insn(Instruction::new(Opcode::Entry));
+        b0.add_insn(Instruction::binop(
+            Opcode::Add,
+            PseudoId(2),
+            PseudoId(1),
+            PseudoId(1),
+            int,
+            32,
+        ));
+        b0.add_insn(Instruction::cbr(PseudoId(1), l1, l2));
+        b0.children = vec![l1, l2];
+        f.add_block(b0);
+        for (id, src) in [(l1, 10u32), (l2, 11)] {
+            let mut b = BasicBlock::new(id);
+            let mut ps = Instruction::phi_source(PseudoId(src), PseudoId(2), int, 32);
+            ps.phi_list = vec![(l3, PseudoId(12))];
+            b.add_insn(ps);
+            b.add_insn(Instruction::br(l3));
+            b.children = vec![l3];
+            f.add_block(b);
+        }
+        let mut b3 = BasicBlock::new(l3);
+        let mut phi = Instruction::phi(PseudoId(12), int, 32);
+        phi.phi_list = vec![(l1, PseudoId(10)), (l2, PseudoId(11))];
+        b3.add_insn(phi);
+        b3.add_insn(Instruction::ret(Some(PseudoId(12))));
+        f.add_block(b3);
+        f.entry = l0;
+        f.rebuild_parents();
+        f
+    }
+
+    /// A proved value becomes a copy of one constant pseudo, minted once per
+    /// run; doing it again changes nothing, and a phi source is never
+    /// folded over.
+    #[test]
+    fn a_proved_value_becomes_a_copy_of_its_constant() {
+        let mut f = diamond();
+        let mut minted = HashMap::new();
+        assert!(fold_target_to_const(&mut f, (0, 1), 6, &mut minted));
+        let insn = &f.blocks[0].insns[1];
+        assert_eq!(insn.op, Opcode::Copy);
+        assert_eq!(f.const_val(insn.src[0]), Some(6));
+        assert!(
+            !fold_target_to_const(&mut f, (0, 1), 6, &mut minted),
+            "idempotent"
+        );
+        assert_eq!(minted.len(), 1);
+        assert!(
+            !fold_target_to_const(&mut f, (1, 0), 6, &mut minted),
+            "a PhiSource"
+        );
+        assert_eq!(f.blocks[1].insns[0].op, Opcode::PhiSource);
+    }
+
+    /// Folding a branch drops the edge it can no longer take. The arm it
+    /// orphans keeps its own edge on, and so its operand of the join's phi,
+    /// until `dce` removes the unreachable block.
+    #[test]
+    fn a_folded_branch_drops_the_edge_it_cannot_take() {
+        let mut f = diamond();
+        assert!(retarget_terminator(&mut f, 0, BasicBlockId(1)));
+        let term = f.blocks[0].insns.last().unwrap();
+        assert_eq!((term.op, term.bb_true), (Opcode::Br, Some(BasicBlockId(1))));
+        assert_eq!(f.blocks[0].children, vec![BasicBlockId(1)]);
+        assert!(f.blocks[2].parents.is_empty());
+        assert_eq!(f.blocks[3].insns[0].phi_list.len(), 2);
+        assert!(
+            !retarget_terminator(&mut f, 0, BasicBlockId(1)),
+            "already a br there"
+        );
+    }
+
+    /// A constant decides a branch only when it reads the same at every
+    /// width a condition is tested at.
+    #[test]
+    fn a_branch_on_a_constant_goes_one_way_only_when_it_says_so() {
+        assert_eq!(cbr_taken(0), Some(false));
+        assert_eq!(cbr_taken(1), Some(true));
+        assert_eq!(cbr_taken(-1), Some(true));
+        assert_eq!(cbr_taken(1 << 32), None, "zero in the low 32 bits only");
+    }
+
+    /// A machine compare has no signedness, and the selector and the case
+    /// label are the same C type. Reading the selector *signed* made
+    /// `switch (3000000000u) { case 3000000000u: }` miss its own case.
+    #[test]
+    fn switch_taken_matches_a_case_above_the_signed_range() {
+        let taken = switch_case_for(3_000_000_000i64, 3_000_000_000i128);
+        assert_eq!(taken, Some(BasicBlockId(7)), "the case must match itself");
+    }
+
+    #[test]
+    fn switch_taken_falls_to_default_when_nothing_matches() {
+        assert_eq!(switch_case_for(5, 6), Some(BasicBlockId(9)));
+    }
+
+    #[test]
+    fn switch_taken_matches_a_gnu_range() {
+        let mut insn = Instruction::new(Opcode::Switch);
+        insn.size = 32;
+        insn.extra_mut().switch_cases = vec![(30, 50, BasicBlockId(7))];
+        insn.extra_mut().switch_default = Some(BasicBlockId(9));
+        assert_eq!(switch_taken(&insn, 40), Some(BasicBlockId(7)));
+        assert_eq!(switch_taken(&insn, 51), Some(BasicBlockId(9)));
+        assert_eq!(switch_taken(&insn, 29), Some(BasicBlockId(9)));
+    }
+
+    /// A switch carrying a type has a width that cannot be computed without
+    /// a `TypeTable`, so it must decline rather than guess.
+    #[test]
+    fn switch_taken_with_a_type_is_left_alone() {
+        let types = TypeTable::new(&Target::host());
+        let mut insn = Instruction::new(Opcode::Switch);
+        insn.size = 32;
+        insn.typ = Some(types.int_id);
+        insn.extra_mut().switch_cases = vec![(5, 5, BasicBlockId(7))];
+        insn.extra_mut().switch_default = Some(BasicBlockId(9));
+        assert_eq!(switch_taken(&insn, 5), None);
+    }
+
+    fn switch_case_for(case: i64, selector: i128) -> Option<BasicBlockId> {
+        let mut insn = Instruction::new(Opcode::Switch);
+        insn.size = 32;
+        insn.extra_mut().switch_cases = vec![(case, case, BasicBlockId(7))];
+        insn.extra_mut().switch_default = Some(BasicBlockId(9));
+        switch_taken(&insn, selector)
+    }
 }

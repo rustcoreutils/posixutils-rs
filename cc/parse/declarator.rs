@@ -44,6 +44,45 @@ impl FuncSignature {
     }
 }
 
+/// What one `[ ]` of an array declarator says about the array's extent.
+#[derive(Clone, Copy)]
+enum Extent {
+    /// An integer constant expression.
+    Constant(usize),
+    /// A variable length array's size expression, or `[*]`: complete, but
+    /// known only at run time.
+    Runtime,
+    /// `[]`: the array type is incomplete (C17 6.7.6.2p4).
+    Absent,
+}
+
+impl Extent {
+    /// The extent the array type records; a run-time one is carried apart.
+    fn size(self) -> Option<usize> {
+        match self {
+            Self::Constant(n) => Some(n),
+            Self::Runtime | Self::Absent => None,
+        }
+    }
+}
+
+/// Why a type cannot be an array's element type (C17 6.7.6.2p1), as gcc
+/// words it.
+enum ElementDefect {
+    /// An incomplete object type.
+    Incomplete,
+    /// `void` or a function type: "array of voids", "array of functions".
+    Of(&'static str),
+}
+
+/// The identifier a declarator declares and where it is written, which is
+/// how gcc names and places a diagnostic about the declared type.
+#[derive(Clone, Copy)]
+struct DeclSite {
+    name: StringId,
+    name_pos: Position,
+}
+
 impl Parser<'_> {
     /// Consume the type-qualifier run after a `*` in a declarator.
     ///
@@ -96,6 +135,19 @@ impl Parser<'_> {
         base_type_id: TypeId,
         ctx: DeclaratorContext,
     ) -> ParseResult<ParsedDeclarator> {
+        self.parse_declarator_level(base_type_id, ctx, false)
+    }
+
+    /// One level of [`Self::parse_declarator`]. A grouped declarator's inner
+    /// level is parsed over a `void` placeholder (`placeholder`) that the
+    /// outer level substitutes once its own suffix is known, so an array
+    /// directly over the placeholder has its element checked there.
+    fn parse_declarator_level(
+        &mut self,
+        base_type_id: TypeId,
+        ctx: DeclaratorContext,
+        placeholder: bool,
+    ) -> ParseResult<ParsedDeclarator> {
         let start = self.current_pos();
         // Collect pointer modifiers (they bind tighter than array/function)
         let mut pointer_modifiers: Vec<TypeModifiers> = Vec::new();
@@ -109,6 +161,7 @@ impl Parser<'_> {
 
         // Check for parenthesized declarator: int (*p)[3]
         // The paren comes AFTER pointers, e.g. int *(*p)[3] = pointer to (pointer to array of 3 ints)
+        let mut name_pos = self.current_pos();
         let (name, inner) = if self.is_special(b'(') {
             // Check if this looks like a function parameter list or a grouped declarator
             // A grouped declarator will have * or identifier immediately after (
@@ -117,8 +170,9 @@ impl Parser<'_> {
 
             if self.is_grouped_declarator() {
                 // For int (*p)[3]: we're now at *p), base_type is int
-                let inner = self.parse_declarator(self.types.void_id, ctx)?;
+                let inner = self.parse_declarator_level(self.types.void_id, ctx, true)?;
                 self.expect_special(b')')?;
+                name_pos = inner.name_pos;
                 (inner.name, Some(inner))
             } else {
                 // The `(` opens a parameter list, so this declarator is
@@ -152,13 +206,14 @@ impl Parser<'_> {
         let mut vla_exprs: Vec<Expr> = inner.as_ref().map(|i| i.vla.clone()).unwrap_or_default();
 
         // Handle array declarators - collect all dimensions first
-        let mut dimensions: Vec<(Option<usize>, Position)> = Vec::new();
+        let mut dimensions: Vec<(Extent, Position)> = Vec::new();
         while self.is_special(b'[') {
             let dim_pos = self.current_pos();
             self.advance();
-            let size = self.parse_array_extent(name, dim_pos, ctx, &mut vla_exprs, &mut vla_pos)?;
+            let extent =
+                self.parse_array_extent(name, dim_pos, ctx, &mut vla_exprs, &mut vla_pos)?;
             self.expect_special(b']')?;
-            dimensions.push((size, dim_pos));
+            dimensions.push((extent, dim_pos));
         }
 
         // Handle function declarators: void (*fp)(int, char)
@@ -197,42 +252,36 @@ impl Parser<'_> {
             result_type_id = self.types.intern(ptr_type);
         }
 
+        // Outer pointers (before any parens) apply to the base type first.
+        // A suffix then reads left to right from the identifier, so
+        // `a[2](void)` is an array of functions: the function suffix after
+        // the extents forms the element type they are derived over.
+        //
+        // For struct node *(*fp)(int): Pointer(struct node)
+        //   -> Function(Pointer(struct node), [int])
+        if let Some(sig) = func_params {
+            let func_type = sig.into_type(result_type_id);
+            result_type_id = self.types.intern(func_type);
+        }
+        // An abstract declarator is placed at its start, as gcc places it.
+        if name == StringId::EMPTY {
+            name_pos = start;
+        }
+        let site = DeclSite { name, name_pos };
+        let over_placeholder = placeholder && result_type_id == base_type_id;
+        let outer_absent = matches!(dimensions.first(), Some((Extent::Absent, _)));
+        result_type_id =
+            self.derive_suffix_arrays(result_type_id, dimensions, site, over_placeholder)?;
+
         if let Some(inner) = &inner {
-            // Grouped declarator: int (*p)[3] or void (*fp)(int) or int *(*q)[3]
-            // Outer pointers (before parens) apply to the base type first,
-            // then the suffix, and finally the result is substituted into the
-            // inner declarator.
-            //
-            // For struct node *(*fp)(int): Pointer(struct node)
-            //   -> Function(Pointer(struct node), [int])
-            if let Some(sig) = func_params {
-                let func_type = sig.into_type(result_type_id);
-                result_type_id = self.types.intern(func_type);
-            }
-
-            // For int *(*q)[3]: result is Pointer(int) -> Array(3, Pointer(int))
-            for (size, pos) in dimensions.into_iter().rev() {
-                result_type_id = self.derive_array_type(result_type_id, size, pos)?;
-            }
-
+            // Grouped declarator: int (*p)[3] or void (*fp)(int) or int *(*q)[3].
             // Substitute the result type into the inner declarator: for
             // `int (*p)[3]`, Pointer(Void) and Array(3, int) compose into
             // Pointer(Array(3, int)).
+            if self.array_over_placeholder(inner.typ) {
+                self.check_array_element(result_type_id, outer_absent, site);
+            }
             result_type_id = self.substitute_base_type(inner.typ, result_type_id);
-        } else {
-            // Simple declarator: char *arr[3]
-            // Pointers bind tighter than arrays: *arr[3] = array of pointers
-            // For char *arr[3]: result_type is char*, suffix [3] -> Array(3, char*)
-            for (size, pos) in dimensions.into_iter().rev() {
-                result_type_id = self.derive_array_type(result_type_id, size, pos)?;
-            }
-
-            // Apply function parameters if present (for function declarators)
-            // For int get_op(int which): base is int, suffix (int) -> Function(int, [int])
-            if let Some(sig) = func_params {
-                let func_type = sig.into_type(result_type_id);
-                result_type_id = self.types.intern(func_type);
-            }
         }
 
         // The inner declarator's parameters win when it has them, as in
@@ -248,6 +297,7 @@ impl Parser<'_> {
         Ok(ParsedDeclarator {
             name,
             pos: start,
+            name_pos,
             typ: self.carry_storage_class(base_type_id, result_type_id),
             vla: vla_exprs,
             vla_pos,
@@ -257,8 +307,7 @@ impl Parser<'_> {
 
     /// The extent inside one `[ ]` of an array declarator, after the `[`.
     ///
-    /// A constant extent is answered; a run-time one is appended to `vla` and
-    /// answers `None`, as does an absent one and `[*]`.
+    /// A run-time extent's expression is appended to `vla`.
     fn parse_array_extent(
         &mut self,
         name: StringId,
@@ -266,7 +315,7 @@ impl Parser<'_> {
         ctx: DeclaratorContext,
         vla: &mut Vec<Expr>,
         vla_pos: &mut Option<Position>,
-    ) -> ParseResult<Option<usize>> {
+    ) -> ParseResult<Extent> {
         // C17 6.7.6.2p1: the optional type qualifiers and `static` belong to
         // the declaration of a function parameter -- `_Atomic` among them.
         let mut qualified = false;
@@ -287,7 +336,7 @@ impl Parser<'_> {
         }
 
         if self.is_special(b']') {
-            return Ok(None);
+            return Ok(Extent::Absent);
         }
         // `[*]`: a variable length array of unspecified size, which only a
         // prototype can declare (C17 6.7.6.2p4). `[*p]` is an expression.
@@ -299,14 +348,14 @@ impl Parser<'_> {
                     "'[*]' not allowed in other than function prototype scope",
                 );
             }
-            return Ok(None);
+            return Ok(Extent::Runtime);
         }
 
         // Parse constant expression for array size (C99 6.7.5.2)
         let size_pos = self.current_pos();
         let expr = self.parse_assignment_expr()?;
         match self.eval_const_expr(&expr) {
-            Some(n) if n >= 0 => Ok(Some(n as usize)),
+            Some(n) if n >= 0 => Ok(Extent::Constant(n as usize)),
             // C17 6.7.6.2p1: the size shall be greater than zero. Zero itself
             // is a GNU extension gcc accepts, so only a negative size is
             // refused here.
@@ -328,8 +377,87 @@ impl Parser<'_> {
                 self.check_array_size_type(&expr, size_pos)?;
                 vla.push(expr);
                 vla_pos.get_or_insert(size_pos);
-                Ok(None)
+                Ok(Extent::Runtime)
             }
+        }
+    }
+
+    /// Derive a declarator's array suffix over `elem`, the innermost extent
+    /// first, checking each level's element as it is formed. `over_placeholder`
+    /// says `elem` is a grouped inner level's placeholder, whose real type --
+    /// and so its check -- is the outer level's.
+    fn derive_suffix_arrays(
+        &mut self,
+        elem: TypeId,
+        dimensions: Vec<(Extent, Position)>,
+        site: DeclSite,
+        over_placeholder: bool,
+    ) -> ParseResult<TypeId> {
+        let mut typ = elem;
+        let mut elem_absent = false;
+        for (i, (extent, pos)) in dimensions.into_iter().rev().enumerate() {
+            if i > 0 || !over_placeholder {
+                self.check_array_element(typ, elem_absent, site);
+            }
+            typ = self.derive_array_type(typ, extent.size(), pos)?;
+            elem_absent = matches!(extent, Extent::Absent);
+        }
+        Ok(typ)
+    }
+
+    /// Whether a grouped inner declarator's type puts an array directly over
+    /// its placeholder, as `(a[2])` does and `(*a[2])` does not.
+    fn array_over_placeholder(&self, inner: TypeId) -> bool {
+        let mut cur = inner;
+        let mut over_array = false;
+        while let TypeKind::Pointer | TypeKind::Array | TypeKind::Function = self.types.kind(cur) {
+            over_array = self.types.kind(cur) == TypeKind::Array;
+            match self.types.base_type(cur) {
+                Some(base) => cur = base,
+                None => break,
+            }
+        }
+        over_array
+    }
+
+    /// C17 6.7.6.2p1 (constraint): an array's element type shall be neither
+    /// incomplete nor a function type. The element's size is the array's
+    /// stride, so this holds wherever an array type is formed -- an `extern`
+    /// declaration, a typedef, a parameter that adjusts to a pointer, a
+    /// pointer to the array, a type-name -- and gcc does not wait for a tag
+    /// completed further down. `elem_absent` says `elem` is an array whose
+    /// own extent was written `[]`. Reported, not fatal: the type is still
+    /// formed, so the declaration binds and nothing cascades. An abstract
+    /// declarator's `site` is its start, where gcc points too.
+    fn check_array_element(&self, elem: TypeId, elem_absent: bool, site: DeclSite) {
+        let Some(defect) = self.array_element_defect(elem, elem_absent) else {
+            return;
+        };
+        let msg = match defect {
+            ElementDefect::Incomplete => format!(
+                "array type has incomplete element type '{}'",
+                self.types.format_type(elem, Some(self.idents))
+            ),
+            ElementDefect::Of(what) if site.name == StringId::EMPTY => {
+                format!("declaration of type name as array of {what}")
+            }
+            ElementDefect::Of(what) => format!(
+                "declaration of '{}' as array of {what}",
+                self.idents.get(site.name)
+            ),
+        };
+        diag::error(site.name_pos, &msg);
+    }
+
+    /// What, if anything, keeps `elem` from being an array's element type.
+    fn array_element_defect(&self, elem: TypeId, elem_absent: bool) -> Option<ElementDefect> {
+        match self.types.kind(elem) {
+            TypeKind::Void => Some(ElementDefect::Of("voids")),
+            TypeKind::Function => Some(ElementDefect::Of("functions")),
+            TypeKind::Array => elem_absent.then_some(ElementDefect::Incomplete),
+            _ => self
+                .type_name_is_incomplete(elem, 0)
+                .then_some(ElementDefect::Incomplete),
         }
     }
 

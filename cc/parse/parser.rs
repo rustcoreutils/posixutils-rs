@@ -127,6 +127,10 @@ pub(crate) struct ParsedDeclarator {
     pub(crate) name: StringId,
     /// Where the declarator starts, which is where its diagnostics point.
     pub(crate) pos: Position,
+    /// Where the declared identifier is written; the declarator's start for
+    /// an abstract declarator. gcc points a diagnostic about the declared
+    /// type here.
+    pub(crate) name_pos: Position,
     /// The derived type. A function declarator's *return* type carries the
     /// specifiers' storage class, as any other derived type does.
     pub(crate) typ: TypeId,

@@ -9327,3 +9327,51 @@ fn binary_operand_verdicts() {
         );
     }
 }
+
+/// C17 6.7.6.2p1: an array's element type shall be neither incomplete nor a
+/// function type, wherever the array type is formed -- a declaration, a
+/// parameter, a member, a pointer to it, a type-name -- and the type is still
+/// formed, so parsing carries on.
+#[test]
+fn test_array_of_incomplete_element_type_is_reported() {
+    for src in [
+        "struct I; extern struct I a[2];",
+        "struct I; struct I (*q)[2]; struct I { int x; };",
+        "struct I; void f(struct I a[]);",
+        "struct I; struct S { struct I m[2]; };",
+        "enum E; extern enum E a[2];",
+        "extern int a[3][];",
+        "extern int (a[2])[];",
+        "extern void x[2];",
+        "void (a[2]);",
+        "int (a[2])(void);",
+        "int n = sizeof(struct I[2]);",
+        "int n = sizeof(void[2]);",
+        "int n = sizeof(int[2](void));",
+    ] {
+        let before = crate::diag::error_count();
+        parse_tu(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        assert!(crate::diag::error_count() > before, "{src}: accepted");
+    }
+}
+
+/// A suffix reads left to right from the identifier: `a[2](void)` is an
+/// array of two functions, not a function returning an array, and a grouped
+/// declarator's extents apply over the outer suffix.
+#[test]
+fn test_array_suffix_derivation_order() {
+    let (decl, types, _, _) = parse_decl("int a[2](void);").unwrap();
+    let typ = decl.declarators[0].typ;
+    assert_eq!(types.kind(typ), TypeKind::Array);
+    assert_eq!(
+        types.kind(types.base_type(typ).unwrap()),
+        TypeKind::Function
+    );
+
+    let (decl, types, _, _) = parse_decl("int (a[2])[3];").unwrap();
+    let typ = decl.declarators[0].typ;
+    assert_eq!(types.get(typ).array_size, Some(2));
+    let elem = types.base_type(typ).unwrap();
+    assert_eq!(types.get(elem).array_size, Some(3));
+    assert_eq!(types.kind(types.base_type(elem).unwrap()), TypeKind::Int);
+}

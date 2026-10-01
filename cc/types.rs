@@ -1394,23 +1394,6 @@ impl TypeTable {
             .is_none_or(|c| c.is_complete)
     }
 
-    /// The innermost non-array element type of `id`, or `id` itself when it is
-    /// not an array.
-    ///
-    /// An array's element type must be complete where the array is declared --
-    /// its stride is what makes the type -- so the completeness question for
-    /// `struct U a[2][3]` is about `struct U`, however many levels deep.
-    pub fn array_element_deep(&self, id: TypeId) -> TypeId {
-        let mut cur = id;
-        while self.kind(cur) == TypeKind::Array {
-            match self.base_type(cur) {
-                Some(next) if next != cur => cur = next,
-                _ => break,
-            }
-        }
-        cur
-    }
-
     /// Whether `member` is a flexible array member: an array with no bound,
     /// which C17 6.7.2.1p18 allows only as the last member of a structure.
     pub fn is_flexible_array_member(&self, member: &StructMember) -> bool {

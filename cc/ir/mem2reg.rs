@@ -18,8 +18,9 @@ use super::{Function, PseudoId};
 use std::collections::HashSet;
 
 /// Drop `func.locals` entries whose `Sym` pseudo has no remaining
-/// users in the IR. Run after `ssa_convert` and before the IR is
-/// handed off to optimization / lowering / codegen.
+/// users in the IR. Run after `ssa_convert`, and again once the optimizer
+/// has forwarded and deleted the accesses that kept a local alive -- each
+/// local dropped is a frame slot the backend never reserves.
 pub fn mem2reg(func: &mut Function) {
     let mut referenced: HashSet<PseudoId> = HashSet::new();
     for block in &func.blocks {
@@ -58,6 +59,13 @@ pub fn mem2reg(func: &mut Function) {
     // local's pseudo behind puts a plausible-looking global in both paths.
     func.pseudos.retain(|p| !dropped.contains(&p.id));
     func.rebuild_pseudo_idx();
+
+    // A parameter the backend prologue fills from registers has nothing in
+    // the IR writing it, so nothing reading it means nothing uses it at all:
+    // the prologue finds no local and stores nothing, and the inliner must
+    // find no copy to make either.
+    func.implicit_param_copies
+        .retain(|c| !dropped.contains(&c.local_sym));
 }
 
 #[cfg(test)]
@@ -104,5 +112,49 @@ mod tests {
         mem2reg(&mut func);
         assert!(func.locals.contains_key("x.0"));
         assert!(func.get_pseudo(PseudoId(0)).is_some());
+    }
+    /// A parameter local the prologue fills from registers that nothing in
+    /// the IR reads any more is dropped, and its copy record with it: the
+    /// record would name a local the function no longer has.
+    #[test]
+    fn an_unread_register_parameter_local_drops_its_copy_record() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("f", types.void_id);
+        for (id, name) in [(0, "z.0"), (1, "w.1")] {
+            func.add_pseudo(Pseudo::sym(PseudoId(id), name.into()));
+            func.add_local(name, PseudoId(id), types.double_id, None, None);
+            func.implicit_param_copies
+                .push(crate::ir::ImplicitParamCopy {
+                    arg_index: id,
+                    local_sym: PseudoId(id),
+                    size_bytes: 16,
+                    qword_type: types.long_id,
+                    arg_is_address: true,
+                });
+        }
+        func.add_pseudo(Pseudo::reg(PseudoId(2), 2));
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        // Only `w.1` is still read.
+        bb.add_insn(Instruction::load(
+            PseudoId(2),
+            PseudoId(1),
+            0,
+            types.double_id,
+            64,
+        ));
+        bb.add_insn(Instruction::ret(None));
+        func.blocks.push(bb);
+        func.entry = BasicBlockId(0);
+
+        mem2reg(&mut func);
+        assert!(!func.locals.contains_key("z.0"));
+        assert!(func.locals.contains_key("w.1"));
+        let kept: Vec<PseudoId> = func
+            .implicit_param_copies
+            .iter()
+            .map(|c| c.local_sym)
+            .collect();
+        assert_eq!(kept, vec![PseudoId(1)]);
     }
 }

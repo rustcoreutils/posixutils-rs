@@ -14,7 +14,7 @@ use crate::arch::lir::{Directive, FpSize};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::X86Inst;
 use crate::arch::x86_64::regalloc::{Loc, Reg, XmmReg};
-use crate::ir::{AsmData, Instruction, PseudoId};
+use crate::ir::{AsmConstraint, AsmData, Instruction, PseudoId};
 use crate::target::Os;
 
 /// Everything the two operand-building passes accumulate before any code is
@@ -86,6 +86,18 @@ struct X87Operand {
 /// only place an 80-bit value can live -- rather than a general register.
 pub(super) fn is_x87_constraint(constraint: &str) -> bool {
     constraint.chars().any(|c| matches!(c, 'f' | 't' | 'u'))
+}
+
+/// The operands of an `asm` that live on the x87 stack: not in memory, and
+/// with an x87 constraint -- a tied input's being the output it names.
+pub(super) fn x87_operands(asm: &AsmData) -> impl Iterator<Item = &AsmConstraint> {
+    asm.outputs.iter().chain(&asm.inputs).filter(|c| {
+        let constraint = match c.matching_output {
+            Some(i) if i < asm.outputs.len() => &asm.outputs[i].constraint,
+            _ => &c.constraint,
+        };
+        !c.is_memory() && is_x87_constraint(constraint)
+    })
 }
 
 impl AsmOperandBuild {

@@ -2169,6 +2169,28 @@ impl LocalVar {
     }
 }
 
+/// What each `Arg` pseudo of a function stands for: its declared parameters,
+/// one `Arg` further along when the hidden struct-return pointer is `Arg(0)`.
+/// See [`Function::arg_types`].
+pub struct ArgTypes<'a> {
+    /// The hidden struct-return pointer, if the function has one.
+    pub sret: Option<PseudoId>,
+    params: &'a [(String, TypeId)],
+}
+
+impl<'a> ArgTypes<'a> {
+    pub fn new(sret: Option<PseudoId>, params: &'a [(String, TypeId)]) -> Self {
+        ArgTypes { sret, params }
+    }
+
+    /// The type the caller passes for the parameter `Arg(arg)` carries, or
+    /// `None` for the sret pointer, which is no declared parameter.
+    pub fn of(&self, arg: u32) -> Option<TypeId> {
+        let i = arg.checked_sub(u32::from(self.sret.is_some()))?;
+        self.params.get(i as usize).map(|(_, typ)| *typ)
+    }
+}
+
 /// A parameter whose local storage is filled implicitly by the backend prologue
 /// (e.g. complex / two-SSE struct params passed in XMM registers).
 /// The inliner uses this to generate explicit struct copies at inline sites.
@@ -2503,8 +2525,15 @@ impl Function {
     /// every parameter is one `Arg` further along. Indexing the list directly
     /// took the *next* parameter's type for each of them.
     pub fn param_type_of_arg(&self, arg: u32) -> Option<TypeId> {
-        let i = arg.checked_sub(u32::from(self.sret_arg().is_some()))?;
-        self.params.get(i as usize).map(|(_, typ)| *typ)
+        self.arg_types().of(arg)
+    }
+
+    /// [`Function::param_type_of_arg`] for many arguments: finding the sret
+    /// pointer is a walk of the pseudo table, done here once rather than per
+    /// argument -- which, over a function of 100,000 parameters, was 10^10
+    /// steps.
+    pub fn arg_types(&self) -> ArgTypes<'_> {
+        ArgTypes::new(self.sret_arg(), &self.params)
     }
 
     /// The type of the value an `Arg` pseudo holds, when it holds one.
@@ -3012,6 +3041,40 @@ pub struct Module {
     /// the call would go to the program's own object. So this answers both
     /// "may a fold call this?" and "by what name?".
     pub library_symbols: HashMap<&'static str, String>,
+    /// Where each global is in `globals`, by name: see `Module::global_mut`.
+    global_idx: GlobalIndex,
+}
+
+/// The position of each global in `Module::globals`, by name.
+///
+/// `globals` is only ever appended to, by this module and by the passes that
+/// push to it directly, so the index catches up with whatever was appended
+/// since it last looked, and each global is indexed once. A hit is checked
+/// against the name it claims, and a mismatch -- which an append cannot
+/// cause -- rebuilds the whole index rather than answering wrongly.
+#[derive(Debug, Clone, Default)]
+struct GlobalIndex {
+    pos: HashMap<String, usize>,
+    indexed: usize,
+}
+
+impl GlobalIndex {
+    fn find(&mut self, globals: &[GlobalDef], name: &str) -> Option<usize> {
+        if self.indexed > globals.len() {
+            *self = GlobalIndex::default();
+        }
+        for (i, g) in globals.iter().enumerate().skip(self.indexed) {
+            // The first definition of a name is the one a lookup finds.
+            self.pos.entry(g.name.clone()).or_insert(i);
+        }
+        self.indexed = globals.len();
+        let i = *self.pos.get(name)?;
+        if globals[i].name == name {
+            return Some(i);
+        }
+        *self = GlobalIndex::default();
+        self.find(globals, name)
+    }
 }
 
 /// The C library functions an optimizer pass may call where the program
@@ -3088,6 +3151,13 @@ impl Module {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// The global named `name`, without a walk of every global: a unit with
+    /// 100,000 of them spent fifteen seconds finding each one.
+    fn global_mut(&mut self, name: &str) -> Option<&mut GlobalDef> {
+        let i = self.global_idx.find(&self.globals, name)?;
+        Some(&mut self.globals[i])
+    }
+
     /// Attach the symbol-emission attributes to a global already added.
     ///
     /// Set after the fact rather than threaded through `add_global_impl`,
@@ -3097,7 +3167,7 @@ impl Module {
         if attrs.is_empty() {
             return;
         }
-        if let Some(g) = self.globals.iter_mut().find(|g| g.name == name) {
+        if let Some(g) = self.global_mut(name) {
             g.symbol_attrs = attrs;
         }
     }
@@ -3126,7 +3196,7 @@ impl Module {
         } = storage;
         let name = name.into();
         // Check for existing tentative definition
-        if let Some(existing) = self.globals.iter_mut().find(|g| g.name == name) {
+        if let Some(existing) = self.global_mut(&name) {
             // Replace tentative definition with actual definition
             if matches!(existing.init, Initializer::None) {
                 debug_assert_eq!(
@@ -3812,6 +3882,36 @@ mod tests {
         assert_eq!(func.sym_name_of(PseudoId(9999)), None);
     }
 
+    /// The global index follows `globals` however it grew: through the
+    /// module, pushed to directly, or -- which nothing does, but which must
+    /// still not be answered wrongly -- reordered.
+    #[test]
+    fn global_index_finds_every_global_by_name() {
+        let types = TypeTable::new(&Target::host());
+        let mut m = Module::default();
+        m.add_global("a", types.int_id, Initializer::None);
+        m.globals
+            .push(GlobalDef::new("b", types.int_id, Initializer::Int(2)));
+        assert_eq!(
+            m.global_mut("b").map(|g| g.init.clone()),
+            Some(Initializer::Int(2))
+        );
+        assert!(m.global_mut("a").is_some());
+        assert!(m.global_mut("c").is_none());
+        m.globals
+            .push(GlobalDef::new("c", types.int_id, Initializer::Int(3)));
+        assert!(m.global_mut("c").is_some(), "an append after a lookup");
+        m.globals.swap(0, 2);
+        assert_eq!(
+            m.global_mut("a").map(|g| g.name.clone()),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            m.global_mut("c").map(|g| g.name.clone()),
+            Some("c".to_string())
+        );
+    }
+
     /// An `Arg` holds a value of its parameter's type only for a scalar, and
     /// the hidden sret pointer shifts which parameter each `Arg` is.
     #[test]
@@ -3839,6 +3939,13 @@ mod tests {
             if sret {
                 assert_eq!(f.arg_value_type(PseudoId(9), &types), None, "sret");
             }
+            // The view a loop over every argument uses gives the same answers.
+            let args = f.arg_types();
+            assert_eq!(args.sret, f.sret_arg());
+            for arg in 0..5 {
+                assert_eq!(args.of(arg), f.param_type_of_arg(arg), "Arg({arg})");
+            }
+            assert_eq!(args.of(off), Some(types.char_id));
         }
     }
 

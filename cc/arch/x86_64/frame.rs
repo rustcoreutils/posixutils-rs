@@ -247,6 +247,7 @@ impl X86_64CodeGen {
         self.callee_saved_regs = alloc.callee_saved_used().to_vec();
         self.max_local_align = alloc.max_local_align();
         self.frame_base = alloc.frame_base();
+        self.x87_scratch = alloc.x87_scratch();
         self.x87_control_words = alloc.x87_control_words();
         // Pad callee_saved_offset to multiple of 16 so that 16-byte-aligned
         // stack_offset values produce 16-byte-aligned final addresses.
@@ -528,13 +529,16 @@ impl X86_64CodeGen {
         self.stack_alloc_size = alloc_size;
     }
 
-    /// Zero-initialize the stack frame AFTER argument registers have been
-    /// spilled to their stack slots. This prevents stale bytes from being
-    /// read when narrow values (8/16/32-bit) are stored to 8-byte stack
-    /// slots and later loaded at wider widths.
+    /// Zero the locals area, so a narrow value (8/16/32-bit) stored to an
+    /// 8-byte slot and later loaded at a wider width reads zero rather than
+    /// stale bytes above it.
     ///
-    /// Must be called after store_spilled_args() and emit_variadic_save_area()
-    /// because rep stosq clobbers RAX, RCX, RDI.
+    /// Runs right after the prologue allocates the frame and *before* any
+    /// argument is stored into it, which would otherwise be wiped. `rep
+    /// stosq` uses RDI, RCX and RAX: RDI and RCX may hold arguments and are
+    /// kept in R10 and R11 across it, which carry none; RAX is free, as `%al`
+    /// -- a variadic callee's vector-register count -- is never read, the
+    /// register save area storing every XMM argument register regardless.
     fn zero_stack_frame(&mut self) {
         let alloc_size = self.stack_alloc_size;
         if alloc_size <= 0 {

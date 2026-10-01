@@ -20,8 +20,10 @@
 // behavioral tests alongside them cover the cases where promotion would
 // change the answer, which is to say the cases where it would be a bug.
 
-use crate::codegen::asm_probe::{asm_for_with, count_in_body, frame_size, X86_64_LINUX};
-use crate::common::compile_and_run;
+use crate::codegen::asm_probe::{
+    asm_for_with, body_of, count_in_body, frame_size, AARCH64_LINUX, X86_64_LINUX,
+};
+use crate::common::{compile_and_run, compile_and_run_aarch64};
 
 /// Ten address-free int locals in straight-line code.
 ///
@@ -55,7 +57,7 @@ fn codegen_parameter_only_function_needs_no_frame() {
     let asm = asm_for_with("parameter_only", X86_64_LINUX, src, &["-O2"]);
     let frame = frame_size(&asm, "nolocal").unwrap_or(0);
     assert!(
-        frame <= 16,
+        frame == 0,
         "a function whose only value is its parameter needs no frame, \
          got {frame} bytes:\n{asm}"
     );
@@ -249,4 +251,63 @@ int single_block_uninit(void) { int t; return t; }
 int main(void) { return 0; }
 "#;
     assert_eq!(compile_and_run("uninitialized_local", src, &[]), 0);
+}
+
+/// A frame holds only what the function uses.
+///
+/// Two reservations were made whatever the function did: the x87 scratch,
+/// sixteen bytes at the bottom of every x86-64 frame though only an x87
+/// conversion or an x87 `asm` operand stages a value through it, and every
+/// local the linearizer created, though the optimizer may forward and delete
+/// every access to one -- `folded` reads back the element it just stored.
+/// Now neither costs a function that does not use it, and a function that
+/// does still gets the scratch.
+#[test]
+fn codegen_a_frame_holds_only_what_the_function_uses() {
+    let src = "\
+int plus1(int x) { return x + 1; }
+int folded(void) { int a[4] = {1, 2, 3, 4}; return a[2]; }
+int sum(const int *p, int n) { int s = 0; for (int i = 0; i < n; i++) s += p[i]; return s; }
+long double widen(int x) { return x; }
+float root(float x) { __asm__(\"fsqrt\" : \"+t\"(x)); return x; }
+";
+    let asm = asm_for_with("frame_uses", X86_64_LINUX, src, &["-O2"]);
+    for f in ["plus1", "folded", "sum"] {
+        let body = body_of(&asm, f);
+        assert!(
+            frame_size(&asm, f).is_none() && !body.contains("subq"),
+            "{f} needs no frame:\n{body}"
+        );
+    }
+    for f in ["widen", "root"] {
+        let frame = frame_size(&asm, f).unwrap_or(0);
+        assert!(
+            frame >= 16,
+            "{f} stages a value through the x87 scratch:\n{asm}"
+        );
+    }
+    let a64 = asm_for_with(
+        "frame_uses_a64",
+        AARCH64_LINUX,
+        "int folded(void) { int a[4] = {1, 2, 3, 4}; return a[2]; }\n",
+        &["-O2"],
+    );
+    assert!(frame_size(&a64, "folded").is_none(), "aarch64:\n{a64}");
+
+    let run = format!(
+        "{src}int main(void) {{ int a[3] = {{1, 2, 3}}; \
+         return plus1(1) == 2 && folded() == 3 && sum(a, 3) == 6 \
+         && widen(7) == 7.0L && root(16.0f) == 4.0f ? 0 : 1; }}\n"
+    );
+    assert_eq!(
+        compile_and_run("frame_uses_run", &run, &["-O2".to_string()]),
+        0
+    );
+    let portable = run.replace(
+        "float root(float x) { __asm__(\"fsqrt\" : \"+t\"(x)); return x; }\n",
+        "float root(float x) { return x == 16.0f ? 4.0f : 0; }\n",
+    );
+    if let Some(rc) = compile_and_run_aarch64("frame_uses_a64_run", &portable, "-O2") {
+        assert_eq!(rc, 0, "aarch64");
+    }
 }

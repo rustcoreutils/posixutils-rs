@@ -862,10 +862,11 @@ pub fn identify_addr_taken_syms(func: &Function) -> HashSet<PseudoId> {
 /// got an 8-byte slot it was stored into with `movsd` and reloaded from with
 /// `movups`.
 pub fn arg_pseudo_types(func: &Function) -> Vec<(PseudoId, TypeId)> {
+    let args = func.arg_types();
     func.pseudos
         .iter()
         .filter_map(|p| match p.kind {
-            PseudoKind::Arg(n) => func.param_type_of_arg(n).map(|t| (p.id, t)),
+            PseudoKind::Arg(n) => args.of(n).map(|t| (p.id, t)),
             _ => None,
         })
         .collect()
@@ -1599,7 +1600,7 @@ impl AbiLowering {
     /// The declared type of the parameter an `Arg(arg)` pseudo carries, or
     /// `None` for the hidden sret pointer, which is no declared parameter.
     pub fn param_type(&self, func: &Function, arg: u32) -> Option<TypeId> {
-        func.param_type_of_arg(arg)
+        crate::ir::ArgTypes::new(self.sret_pseudo, &func.params).of(arg)
     }
 }
 

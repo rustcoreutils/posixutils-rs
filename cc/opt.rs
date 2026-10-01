@@ -20,6 +20,7 @@ use crate::ir::inline;
 use crate::ir::instcombine;
 use crate::ir::libcall_fold;
 use crate::ir::loadfwd;
+use crate::ir::mem2reg::mem2reg;
 use crate::ir::memexpand;
 use crate::ir::memloc;
 use crate::ir::sccp;
@@ -440,6 +441,8 @@ fn optimize_functions(
         if !c.converged() {
             report.unconverged.push(c);
         }
+        // A local whose every access was forwarded or deleted needs no slot.
+        mem2reg(func);
     }
     let added = literals.into_added();
     module.strings.extend(added);

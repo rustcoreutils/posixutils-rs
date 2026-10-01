@@ -22,8 +22,9 @@
 //
 
 use super::codegen::X86_64CodeGen;
+use super::inline_asm::x87_operands;
 use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, X87BinOp, X87IntWidth, XmmOperand};
-use super::regalloc::{Loc, Reg, X87ControlWords, XmmReg, X87_SCRATCH_BYTES};
+use super::regalloc::{Loc, Reg, X87ControlWords, XmmReg};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
 use crate::float::FpFormat;
 use crate::ir::{Instruction, Opcode, PseudoId};
@@ -40,10 +41,16 @@ impl X86_64CodeGen {
     /// The reserved scratch address used to stage a value into the FPU.
     ///
     /// `fild`/`fld` have no register form, so an immediate or a general
-    /// register has to go through memory. The region is reserved by
-    /// [`X87_SCRATCH_BYTES`]; never address it by hand.
+    /// register has to go through memory: the function's
+    /// [`super::regalloc::X87Scratch`]. Never address it by hand.
     fn x87_scratch_addr(&self) -> MemAddr {
-        self.stack_mem(X87_SCRATCH_BYTES)
+        self.stack_mem(self.x87_scratch_slot())
+    }
+
+    fn x87_scratch_slot(&self) -> i32 {
+        self.x87_scratch
+            .expect("the allocator reserves the x87 scratch for every `uses_x87_scratch`")
+            .slot()
     }
 
     /// Push an inline-asm operand onto the x87 stack.
@@ -1110,7 +1117,7 @@ impl X86_64CodeGen {
         // Two disjoint halves of the 16-byte x87 scratch: the result goes in
         // the first, the 2^63 constant in byte 8 of the same object.
         let result_addr = self.x87_scratch_addr();
-        let const_addr = self.stack_field(X87_SCRATCH_BYTES, 8);
+        let const_addr = self.stack_field(self.x87_scratch_slot(), 8);
 
         let uid = self.unique_label_counter;
         self.unique_label_counter += 1;
@@ -1175,10 +1182,40 @@ impl X86_64CodeGen {
 /// The one rule for both the codegen dispatch and the allocator, which
 /// reserves the [`X87ControlWords`] slot for exactly these.
 pub(super) fn is_x87_float_to_int(insn: &Instruction, types: &TypeTable) -> bool {
-    matches!(insn.op, Opcode::FCvtS | Opcode::FCvtU)
-        && insn
-            .src_typ
-            .is_some_and(|t| types.kind(t) == TypeKind::LongDouble)
+    matches!(insn.op, Opcode::FCvtS | Opcode::FCvtU) && is_long_double(insn.src_typ, types)
+}
+
+/// An integer to `long double` conversion, which `emit_x87_int_to_float`
+/// computes.
+pub(super) fn is_x87_int_to_float(insn: &Instruction, types: &TypeTable) -> bool {
+    matches!(insn.op, Opcode::SCvtF | Opcode::UCvtF) && is_long_double(insn.typ, types)
+}
+
+/// A conversion between `long double` and another floating type, which
+/// `emit_x87_fp_cvt` computes.
+pub(super) fn is_x87_fp_cvt(insn: &Instruction, types: &TypeTable) -> bool {
+    insn.op == Opcode::FCvtF
+        && (is_long_double(insn.typ, types) || is_long_double(insn.src_typ, types))
+}
+
+/// Whether the code for `insn` may stage a value through the x87 scratch:
+/// the three conversions above, and an `asm` with a `float` or `double`
+/// operand on the x87 stack. The allocator reserves the scratch by this, so
+/// a new user of `x87_scratch_addr` must be named here.
+pub(super) fn uses_x87_scratch(insn: &Instruction, types: &TypeTable) -> bool {
+    is_x87_int_to_float(insn, types)
+        || is_x87_float_to_int(insn, types)
+        || is_x87_fp_cvt(insn, types)
+        || (insn.op == Opcode::Asm
+            && insn
+                .extra()
+                .asm_data
+                .as_ref()
+                .is_some_and(|asm| x87_operands(asm).any(|c| c.size <= 64)))
+}
+
+fn is_long_double(typ: Option<crate::types::TypeId>, types: &TypeTable) -> bool {
+    typ.is_some_and(|t| types.kind(t) == TypeKind::LongDouble)
 }
 
 /// The narrowest `fistp` holding every value of a `bits`-bit integer, or

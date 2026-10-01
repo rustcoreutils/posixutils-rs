@@ -98,12 +98,13 @@ pub fn run(func: &mut Function, types: &TypeTable) -> bool {
 /// source.
 fn forwarding(func: &Function, types: &TypeTable) -> HashMap<PseudoId, PseudoId> {
     let mut shape: HashMap<PseudoId, Shape> = HashMap::new();
+    let args = func.arg_types();
     for p in &func.pseudos {
         if let PseudoKind::Arg(n) = p.kind {
-            let typ = if func.sret_arg() == Some(p.id) {
+            let typ = if args.sret == Some(p.id) {
                 Some(types.void_ptr_id)
             } else {
-                func.param_type_of_arg(n)
+                args.of(n)
             };
             if let Some(t) = typ {
                 shape.insert(

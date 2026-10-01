@@ -8332,16 +8332,21 @@ int main(void)
     let probe = r#"
 struct TwoInt { long long a, b; };
 struct TwoInt make(void);
+void use(char *);
 long realigned(void)
 {
-    _Alignas(32) char pad[64];
+    _Alignas(32) char pad[64];   /* escapes, so it keeps its slot */
     struct TwoInt r = make();
-    pad[0] = 1;
+    use(pad);
     return r.a + r.b + pad[0];
 }
 "#;
     let asm = asm_for_with("agg_ret_base_reg", X86_64_LINUX, probe, &["-O1"]);
     let body = body_of(&asm, "realigned");
+    assert!(
+        body.contains("andq $-32, %rsp"),
+        "the frame is realigned:\n{body}"
+    );
     for reg in ["%rax", "%rdx"] {
         for line in body.lines() {
             let line = line.trim();

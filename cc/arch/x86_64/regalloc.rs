@@ -38,7 +38,7 @@
 //   Rbx, Rbp, R12-R15          - Callee-saved
 // ============================================================================
 
-use super::x87::is_x87_float_to_int;
+use super::x87::{is_x87_float_to_int, uses_x87_scratch};
 use crate::arch::asm_constraints::OperandConstraint;
 use crate::arch::lir::FpSize;
 use crate::arch::regalloc::{
@@ -797,6 +797,7 @@ pub struct RegAlloc {
     /// Next stack slot offset
     stack_offset: i32,
     /// Reserved when the function converts a long double to an integer.
+    x87_scratch: Option<X87Scratch>,
     x87_control_words: Option<X87ControlWords>,
     /// A source position for this function, for the frame diagnostics
     /// `grow_frame` and [`crate::abi::slot_bytes`] emit. `alloc_stack_slot` and
@@ -984,16 +985,27 @@ fn exempt_from_clobber(cp: &ConstraintPoint<Reg>, interval: &LiveInterval) -> bo
     cp.operand_survives(interval.pseudo, interval.start, interval.end)
 }
 
-/// Bytes reserved at the bottom of the locals area for the x87 scratch.
+/// The frame slot `x87.rs` stages a value through on its way into or out of
+/// the FPU -- `fild` and `fld` have no register form, so an immediate or a
+/// general register goes through memory.
 ///
-/// `x87.rs` needs a fixed address to stage an immediate or a general register
-/// through on its way into the FPU -- `fild` and `fld` have no register form.
-/// Reserving the region here makes that address the allocator's to give and
-/// the scratch's to keep; an unreserved address lands on the first local,
-/// because slot offsets start at zero.
-///
-/// See [`X86_64CodeGen::x87_scratch_addr`].
-pub(super) const X87_SCRATCH_BYTES: i32 = 16;
+/// Reserved for a function with an instruction that
+/// [`super::x87::uses_x87_scratch`], and only for those; every other frame
+/// starts its locals at zero. See [`X86_64CodeGen::x87_scratch_addr`], the
+/// one way to address it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct X87Scratch {
+    slot: i32,
+}
+
+impl X87Scratch {
+    /// Two eight-byte halves: `emit_x87_float_to_u64` uses both at once.
+    pub(super) const BYTES: i32 = 16;
+
+    pub(super) fn slot(self) -> i32 {
+        self.slot
+    }
+}
 
 /// The frame slot holding the two x87 control words a long double to integer
 /// conversion switches between.
@@ -1090,7 +1102,8 @@ impl RegAlloc {
             free_xmm_regs: XmmReg::allocatable().to_vec(),
             active: Vec::new(),
             active_xmm: Vec::new(),
-            stack_offset: X87_SCRATCH_BYTES,
+            stack_offset: 0,
+            x87_scratch: None,
             x87_control_words: None,
             func_pos: crate::diag::Position::default(),
             used_callee_saved: Vec::new(),
@@ -1132,7 +1145,7 @@ impl RegAlloc {
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         // Identify long double pseudos (use x87 not XMM)
         self.identify_ld_pseudos(func, types);
-        self.reserve_x87_control_words(func, types);
+        self.reserve_x87_frame(func, types);
         self.identify_x87_asm_operands(func);
         self.identify_quad_pseudos(func, types);
         // Identify 128-bit integer pseudos (always spill to 16-byte stack slots)
@@ -1193,7 +1206,8 @@ impl RegAlloc {
         self.free_xmm_regs = XmmReg::allocatable().to_vec();
         self.active.clear();
         self.active_xmm.clear();
-        self.stack_offset = X87_SCRATCH_BYTES;
+        self.stack_offset = 0;
+        self.x87_scratch = None;
         self.x87_control_words = None;
         self.used_callee_saved.clear();
         self.fp_pseudos.clear();
@@ -1211,26 +1225,34 @@ impl RegAlloc {
         self.max_local_align = 8;
     }
 
-    /// Reserve the [`X87ControlWords`] slot if any instruction of `func` is a
-    /// long double to integer conversion.
-    fn reserve_x87_control_words(&mut self, func: &Function, types: &TypeTable) {
-        let converts = func
-            .blocks
-            .iter()
-            .flat_map(|block| &block.insns)
-            .any(|insn| is_x87_float_to_int(insn, types));
-        if !converts {
-            return;
-        }
+    /// Reserve the [`X87Scratch`] if an instruction of `func` stages a value
+    /// through it, and the [`X87ControlWords`] if one converts a long double
+    /// to an integer.
+    fn reserve_x87_frame(&mut self, func: &Function, types: &TypeTable) {
+        let insns = || func.blocks.iter().flat_map(|block| &block.insns);
         let frame_align = self.frame_align();
-        let slot = crate::arch::regalloc::grow_frame(
-            &mut self.stack_offset,
-            X87ControlWords::BYTES,
-            X87ControlWords::BYTES,
-            frame_align,
-            self.func_pos,
-        );
-        self.x87_control_words = Some(X87ControlWords { slot });
+        let mut reserve = |bytes: i32| {
+            crate::arch::regalloc::grow_frame(
+                &mut self.stack_offset,
+                bytes,
+                bytes,
+                frame_align,
+                self.func_pos,
+            )
+        };
+        if insns().any(|insn| uses_x87_scratch(insn, types)) {
+            let slot = reserve(X87Scratch::BYTES);
+            self.x87_scratch = Some(X87Scratch { slot });
+        }
+        if insns().any(|insn| is_x87_float_to_int(insn, types)) {
+            let slot = reserve(X87ControlWords::BYTES);
+            self.x87_control_words = Some(X87ControlWords { slot });
+        }
+    }
+
+    /// The x87 scratch slot, if this function stages a value through it.
+    pub(super) fn x87_scratch(&self) -> Option<X87Scratch> {
+        self.x87_scratch
     }
 
     /// The control-word slot, if this function converts a long double to an
@@ -1292,14 +1314,7 @@ impl RegAlloc {
             else {
                 continue;
             };
-            for c in asm.outputs.iter().chain(&asm.inputs) {
-                let constraint = match c.matching_output {
-                    Some(i) if i < asm.outputs.len() => &asm.outputs[i].constraint,
-                    _ => &c.constraint,
-                };
-                if c.is_memory() || !super::inline_asm::is_x87_constraint(constraint) {
-                    continue;
-                }
+            for c in super::inline_asm::x87_operands(asm) {
                 self.fp_pseudos.insert(c.pseudo);
                 if c.size > 64 {
                     self.ld_pseudos.insert(c.pseudo);

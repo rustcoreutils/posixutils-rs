@@ -295,6 +295,9 @@ pub struct Parser<'a> {
     /// How a call to a library builtin is evaluated: the optimization level
     /// and `-f[no-]math-errno`. See [`Self::set_library_call_policy`].
     pub(super) library_call_policy: super::library_builtin::LibraryCallPolicy,
+    /// How many `switch` bodies enclose the statement being parsed, which is
+    /// all a `fallthrough` attribute statement needs to know to be valid.
+    pub(super) switch_depth: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -339,6 +342,7 @@ impl<'a> Parser<'a> {
             pack_cursor: 0,
             vm_typedefs: HashMap::new(),
             library_call_policy: Default::default(),
+            switch_depth: 0,
             pack_current: None,
             pack_stack: Vec::new(),
         }

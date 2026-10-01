@@ -17,6 +17,9 @@ use gettextrs::gettext;
 
 impl Parser<'_> {
     pub fn parse_statement(&mut self) -> ParseResult<Stmt> {
+        if self.at_attribute_declaration() {
+            return self.parse_attribute_statement();
+        }
         // Check for keywords
         if let Some(name_id) = self.current_ident() {
             match name_id {
@@ -299,7 +302,10 @@ impl Parser<'_> {
         // flat sibling marker and the statement it prefixed was not part of
         // it. It only ever reached the labels at the top of the body, which
         // is why a `case` nested inside an unbraced `if` escaped the switch.
-        self.parse_substatement()
+        self.switch_depth += 1;
+        let body = self.parse_substatement();
+        self.switch_depth -= 1;
+        body
     }
 
     /// Parse a case label, including the GNU range form `case lo ... hi:`.
@@ -349,7 +355,9 @@ impl Parser<'_> {
     fn parse_block_items(&mut self) -> ParseResult<Vec<BlockItem>> {
         let mut items = Vec::new();
         while !self.is_special(b'}') && !self.is_eof() {
-            if self.is_declaration_start() {
+            // An attribute declaration starts like a declaration but is a
+            // statement: `__attribute__((fallthrough));`.
+            if self.is_declaration_start() && !self.at_attribute_declaration() {
                 let decl = self.parse_declaration_and_bind()?;
                 items.push(BlockItem::Declaration(decl));
             } else {

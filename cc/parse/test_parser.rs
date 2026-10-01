@@ -8526,3 +8526,125 @@ fn test_array_slot_follows_the_cursor() {
     );
     assert_eq!(cursor, 3);
 }
+
+// Attribute declarations: `__attribute__((...));` standing alone
+
+/// The block items of a function body.
+fn body_items(func: &FunctionDef) -> &[BlockItem] {
+    match &func.body {
+        Stmt::Block(items) => items,
+        other => panic!("function body is not a block: {other:?}"),
+    }
+}
+
+/// The block items of the `switch` that is the first statement of `func`.
+fn switch_items(func: &FunctionDef) -> &[BlockItem] {
+    let BlockItem::Statement(stmt) = &body_items(func)[0] else {
+        panic!("first item is not a statement");
+    };
+    let Stmt::Switch { body, .. } = stmt.as_ref() else {
+        panic!("first statement is not a switch: {stmt:?}");
+    };
+    match body.as_ref() {
+        Stmt::Block(items) => items,
+        other => panic!("switch body is not a block: {other:?}"),
+    }
+}
+
+/// `__attribute__((fallthrough));` is a null statement in either spelling,
+/// whether it follows a statement or is itself the labeled statement -- not
+/// a declaration that declares nothing.
+#[test]
+fn test_fallthrough_attribute_is_a_null_statement() {
+    let (func, _, _, _) = parse_func(
+        "int f(int x) { switch (x) { case 1: x++; __attribute__((fallthrough));\n\
+         case 2: __attribute__((__fallthrough__)); default: break; } return x; }",
+    )
+    .unwrap();
+    let items = switch_items(&func);
+    assert_eq!(items.len(), 4, "{items:?}");
+    // `case 1: x++;` is one item, holding the statement it labels.
+    assert!(matches!(&items[1], BlockItem::Statement(s) if matches!(**s, Stmt::Empty)));
+    let BlockItem::Statement(case2) = &items[2] else {
+        panic!("case 2 is not a statement");
+    };
+    let Stmt::Case(_, _, labeled) = case2.as_ref() else {
+        panic!("not a case: {case2:?}");
+    };
+    assert!(matches!(**labeled, Stmt::Empty), "{labeled:?}");
+}
+
+/// Outside every `switch` the fallthrough statement is an error, as in gcc,
+/// in a block and as the body of an `if`.
+#[test]
+fn test_fallthrough_attribute_outside_a_switch_is_an_error() {
+    for src in [
+        "void f(void) { __attribute__((fallthrough)); }",
+        "void f(int x) { if (x) __attribute__((fallthrough)); }",
+        "void f(void) { for (;;) { __attribute__((fallthrough)); break; } }",
+    ] {
+        let before = crate::diag::error_count();
+        parse_func(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        assert!(crate::diag::error_count() > before, "{src}: no error");
+    }
+}
+
+/// Any other attribute standing alone is an empty declaration: accepted, and
+/// it leaves nothing pending for the declaration after it.
+#[test]
+fn test_other_attribute_statement_is_empty() {
+    let (func, _, _, _) =
+        parse_func("void f(void) { __attribute__((aligned(64))); int y; }").unwrap();
+    let items = body_items(&func);
+    assert!(matches!(&items[0], BlockItem::Statement(s) if matches!(**s, Stmt::Empty)));
+    let BlockItem::Declaration(decl) = &items[1] else {
+        panic!("second item is not a declaration: {:?}", items[1]);
+    };
+    assert_eq!(decl.declarators[0].explicit_align, None);
+}
+
+/// A declaration that begins with an attribute is still a declaration, in a
+/// block and at file scope, and a lone attribute list at file scope is an
+/// empty declaration that the next one parses after.
+#[test]
+fn test_attribute_led_declarations_still_declare() {
+    let (func, _, _, _) =
+        parse_func("void g(void) { __attribute__((unused)) int x; x = 1; }").unwrap();
+    let BlockItem::Declaration(decl) = &body_items(&func)[0] else {
+        panic!("attribute-led local is not a declaration");
+    };
+    assert_eq!(decl.declarators.len(), 1);
+
+    let (tu, _, _, _) = parse_tu(
+        "__attribute__((unused));\n\
+         __attribute__((constructor)) void f(void) {}\n\
+         __attribute__((unused)) static int z;\n",
+    )
+    .unwrap();
+    assert_eq!(tu.items.len(), 3);
+    assert!(matches!(&tu.items[0], ExternalDecl::Declaration(d) if d.declarators.is_empty()));
+    assert!(matches!(tu.items[1], ExternalDecl::FunctionDef(_)));
+    assert!(matches!(&tu.items[2], ExternalDecl::Declaration(d) if d.declarators.len() == 1));
+}
+
+/// The lookahead sees an attribute declaration only when nothing but
+/// attribute lists stands before the `;`.
+#[test]
+fn test_at_attribute_declaration_lookahead() {
+    for (src, expected) in [
+        ("__attribute__((fallthrough));", true),
+        ("__attribute__((a)) __attribute((b(1, (2))));", true),
+        ("__attribute__((unused)) int x;", false),
+        ("__attribute__((fallthrough)) x++;", false),
+        ("int x;", false),
+        (";", false),
+    ] {
+        let mut strings = StringTable::new();
+        let tokens = Tokenizer::new(src.as_bytes(), 0, &mut strings).tokenize();
+        let mut symbols = SymbolTable::new();
+        let mut types = TypeTable::new(&Target::host());
+        let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+        parser.skip_stream_tokens();
+        assert_eq!(parser.at_attribute_declaration(), expected, "{src}");
+    }
+}

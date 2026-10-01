@@ -187,6 +187,16 @@ impl Attribute {
             args,
         }
     }
+
+    /// Whether this is attribute `name`, in its plain or `__name__` spelling.
+    pub(super) fn is_named(&self, name: &str) -> bool {
+        self.name == name
+            || self
+                .name
+                .strip_prefix("__")
+                .and_then(|n| n.strip_suffix("__"))
+                == Some(name)
+    }
 }
 
 impl fmt::Display for Attribute {
@@ -228,21 +238,15 @@ impl AttributeList {
     /// Check if this attribute list contains a noreturn attribute
     /// (either "noreturn" or "__noreturn__")
     pub fn has_noreturn(&self) -> bool {
-        self.attrs
-            .iter()
-            .any(|a| a.name == "noreturn" || a.name == "__noreturn__")
+        self.has_attr("noreturn")
     }
 
     pub fn has_sysv_abi(&self) -> bool {
-        self.attrs
-            .iter()
-            .any(|a| a.name == "sysv_abi" || a.name == "__sysv_abi__")
+        self.has_attr("sysv_abi")
     }
 
     pub fn has_ms_abi(&self) -> bool {
-        self.attrs
-            .iter()
-            .any(|a| a.name == "ms_abi" || a.name == "__ms_abi__")
+        self.has_attr("ms_abi")
     }
 
     pub fn calling_conv(&self) -> Option<crate::abi::CallingConv> {
@@ -289,21 +293,19 @@ impl AttributeList {
 
     /// Whether an attribute is present, in either spelling.
     fn has_attr(&self, name: &str) -> bool {
-        let underscored = format!("__{name}__");
-        self.attrs
-            .iter()
-            .any(|a| a.name == name || a.name == underscored)
+        self.find(name).is_some()
+    }
+
+    /// The first attribute `name`, in either spelling.
+    pub(super) fn find(&self, name: &str) -> Option<&Attribute> {
+        self.attrs.iter().find(|a| a.is_named(name))
     }
 
     /// Look up an attribute in both its plain and `__underscored__` spelling,
     /// returning its optional integer argument. The result distinguishes
     /// "absent" (`None`) from "present without a priority" (`Some(None)`).
     fn init_priority(&self, name: &str) -> Option<Option<u16>> {
-        let underscored = format!("__{name}__");
-        let attr = self
-            .attrs
-            .iter()
-            .find(|a| a.name == name || a.name == underscored)?;
+        let attr = self.find(name)?;
         match attr.args.first() {
             // In range: `check_integer_args` drops any other priority.
             Some(AttributeArg::Int(n)) => Some(u16::try_from(*n).ok()),
@@ -364,7 +366,7 @@ impl AttributeList {
     /// `check_integer_args` drops any other with a diagnostic.
     pub fn get_alignment(&self) -> Option<u32> {
         for attr in &self.attrs {
-            if attr.name == "aligned" || attr.name == "__aligned__" {
+            if attr.is_named("aligned") {
                 if attr.args.is_empty() {
                     return Some(16); // GCC default: max useful alignment
                 }

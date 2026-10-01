@@ -13,6 +13,7 @@ mod aggregate;
 mod asm;
 pub mod ast;
 mod attribute;
+mod attribute_decl;
 mod bind;
 mod builtin_expr;
 mod declaration;

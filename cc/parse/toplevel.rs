@@ -211,6 +211,9 @@ impl Parser<'_> {
     }
 
     pub(crate) fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
+        if self.at_attribute_declaration() {
+            return self.parse_file_attribute_declaration();
+        }
         self.parse_declaration(DeclScope::File)
     }
 

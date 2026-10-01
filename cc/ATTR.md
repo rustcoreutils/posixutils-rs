@@ -122,9 +122,28 @@ Also accepted:
   `ms_abi` has no Win64 implementation and falls back to the target default. A
   call to such a function is classified by the caller's convention, not the
   callee's.
-- `fallthrough`: `__has_attribute(fallthrough)` answers 1, but the statement
-  form `__attribute__((fallthrough));` is rejected ("declaration declares
-  nothing"), since attributes are not parsed at statement level.
+- `fallthrough`: the statement `__attribute__((fallthrough));` (gcc's
+  spelling of C23 `[[fallthrough]];`) is a null statement. Diagnosed as gcc
+  does, as far as the next token can tell: outside every `switch` it is an
+  error ("invalid use of attribute 'fallthrough'"); followed by anything but a
+  label or a brace it warns "attribute 'fallthrough' not preceding a case
+  label or default label". c17 has no `-Wimplicit-fallthrough`, so it changes
+  nothing else. Written on a non-null statement it is a malformed declaration,
+  rejected as in gcc.
+
+## Attribute Declarations
+
+An attribute list standing alone before `;` -- `__attribute__((...));` --
+declares nothing and is parsed by the same attribute parser as any other;
+whatever it would have left pending for a declarator is discarded.
+
+- In a block, with `fallthrough`, it is the fallthrough statement above. Any
+  other recognised attribute beside it warns "'name' attribute ignored"
+  (`-Wno-attributes`), as does a `fallthrough` given an argument.
+- Without `fallthrough`, in a block or at file scope, it warns "empty
+  declaration", which `-Wno-attributes` does not suppress (nor does gcc's).
+- `fallthrough` at file scope warns "'fallthrough' attribute at top level"
+  (`-Wno-attributes`).
 
 ## Not Recognised
 

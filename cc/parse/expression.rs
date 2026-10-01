@@ -1416,7 +1416,8 @@ impl<'a> Parser<'a> {
                 self.expect_special(b')')?;
                 self.check_callable(&expr, call_pos);
                 let func_type = self.resolved_function_type(&expr);
-                self.check_call(func_type, &args, call_pos);
+                let callee = self.callee_name(&expr);
+                self.check_call(func_type, callee, &args, call_pos);
 
                 // Get the return type from the function type
                 // The func expression should have type TypeKind::Function

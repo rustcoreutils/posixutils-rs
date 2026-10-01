@@ -34,18 +34,31 @@ impl Parser<'_> {
     /// argument's own position are live, whereas by linearization the only
     /// position left points at whichever sub-expression was lowered last.
     ///
+    /// `callee` is the name the call was spelled with, when it was spelled
+    /// with one: an argument diagnostic names it, as gcc's does.
+    ///
     /// Answers whether the call is sound: `false` once either check reported
     /// an error, so a caller that goes on to compute the call in place knows
     /// not to convert an argument that cannot be converted.
     pub(super) fn check_call(
         &mut self,
         func_type: Option<TypeId>,
+        callee: Option<StringId>,
         args: &[Expr],
         call_pos: Position,
     ) -> bool {
         let arity_ok = self.check_call_arity(func_type, args, call_pos);
-        let types_ok = self.check_argument_types(func_type, args);
+        let types_ok = self.check_argument_types(func_type, callee, args);
         arity_ok && types_ok
+    }
+
+    /// The name a call through `callee` is spelled with: a function or a
+    /// pointer to one called by its identifier.
+    pub(super) fn callee_name(&self, callee: &Expr) -> Option<StringId> {
+        match callee.kind {
+            ExprKind::Ident(symbol) => Some(self.symbols.get(symbol).name),
+            _ => None,
+        }
     }
 
     /// The number of arguments against the prototype. `false` when that was
@@ -109,7 +122,12 @@ impl Parser<'_> {
     /// Arguments past a prototype's fixed parameters get the default argument
     /// promotions instead (p7), and an unprototyped callee has nothing to
     /// check against, so both are skipped.
-    fn check_argument_types(&mut self, func_type: Option<TypeId>, args: &[Expr]) -> bool {
+    fn check_argument_types(
+        &mut self,
+        func_type: Option<TypeId>,
+        callee: Option<StringId>,
+        args: &[Expr],
+    ) -> bool {
         // A vector argument goes by value under gcc, in vector registers; the
         // array model would pass its address. Checked for every argument,
         // prototyped or not.
@@ -163,22 +181,48 @@ impl Parser<'_> {
                 self.types.format_type(param, Some(self.idents)),
                 self.types.format_type(a, Some(self.idents)),
             );
+            let callee = callee.and_then(|id| self.idents.get_opt(id));
+            Self::report_argument_fault(fault, arg.pos, &n, callee, &p_name, &a_name);
             if fault.is_error() {
-                diag::error_args(
-                    arg.pos,
-                    "incompatible type for argument {0}: expected '{1}', got '{2}'",
-                    &[&n, &p_name, &a_name],
-                );
                 sound = false;
-            } else {
-                diag::warning_args(
-                    arg.pos,
-                    "passing argument {0} as '{1}' from '{2}' {3}",
-                    &[&n, &p_name, &a_name, fault.describe()],
-                );
             }
         }
         sound
+    }
+
+    /// Report argument `n`, of type `a_name`, that `fault` keeps from being
+    /// assigned to its parameter of type `p_name`. The callee is named when
+    /// the call spelled one, as gcc names it.
+    fn report_argument_fault(
+        fault: AssignFault,
+        pos: Position,
+        n: &str,
+        callee: Option<&str>,
+        p_name: &str,
+        a_name: &str,
+    ) {
+        match (fault.is_error(), callee) {
+            (true, Some(f)) => diag::error_args(
+                pos,
+                "incompatible type for argument {0} of '{1}': expected '{2}', got '{3}'",
+                &[n, f, p_name, a_name],
+            ),
+            (true, None) => diag::error_args(
+                pos,
+                "incompatible type for argument {0}: expected '{1}', got '{2}'",
+                &[n, p_name, a_name],
+            ),
+            (false, Some(f)) => diag::warning_args(
+                pos,
+                "passing argument {0} of '{1}' as '{2}' from '{3}' {4}",
+                &[n, f, p_name, a_name, fault.describe()],
+            ),
+            (false, None) => diag::warning_args(
+                pos,
+                "passing argument {0} as '{1}' from '{2}' {3}",
+                &[n, p_name, a_name, fault.describe()],
+            ),
+        }
     }
 
     /// C17 6.5.3.2p2: the operand of unary `*` shall have pointer type. A

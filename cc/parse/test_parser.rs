@@ -6318,7 +6318,7 @@ fn test_check_call_answers_soundness() {
                 panic!("{call}: expected a call");
             };
             let func_type = p.resolved_function_type(func);
-            p.check_call(func_type, args, e.pos)
+            p.check_call(func_type, None, args, e.pos)
         })
     };
     assert!(sound("F(i)"));
@@ -6326,6 +6326,114 @@ fn test_check_call_answers_soundness() {
     assert!(!sound("F(s)"));
     assert!(!sound("F(1, 2)"));
     assert!(!sound("F()"));
+}
+
+/// The one argument of a bit builtin's node: the population count under
+/// `parity`'s mask, and the argument of the `ffs` call.
+fn bit_builtin_operand(e: &Expr) -> &Expr {
+    match &e.kind {
+        ExprKind::Bswap16 { arg }
+        | ExprKind::Bswap32 { arg }
+        | ExprKind::Bswap64 { arg }
+        | ExprKind::Ctz { arg }
+        | ExprKind::Ctzl { arg }
+        | ExprKind::Ctzll { arg }
+        | ExprKind::Clz { arg }
+        | ExprKind::Clzl { arg }
+        | ExprKind::Clzll { arg }
+        | ExprKind::Clrsb { arg }
+        | ExprKind::Clrsbl { arg }
+        | ExprKind::Clrsbll { arg }
+        | ExprKind::Popcount { arg }
+        | ExprKind::Popcountl { arg }
+        | ExprKind::Popcountll { arg } => arg,
+        ExprKind::Binary {
+            op: BinaryOp::BitAnd,
+            left,
+            ..
+        } => bit_builtin_operand(left),
+        ExprKind::Call { args, .. } if args.len() == 1 => &args[0],
+        other => panic!("not a bit builtin: {other:?}"),
+    }
+}
+
+/// A bit builtin's argument converts to its parameter type, as in a call
+/// through gcc's prototype for it (C17 6.5.2.2p7): the node reads a
+/// converted value, never the argument's own bits.
+#[test]
+fn test_bit_builtins_convert_their_argument() {
+    use crate::types::TypeId;
+    let decls = "double d; unsigned u;";
+    type Want = fn(&TypeTable) -> TypeId;
+    // (call, parameter type, result type)
+    let cases: &[(&str, Want, Want)] = &[
+        ("__builtin_bswap16(d)", |t| t.ushort_id, |t| t.ushort_id),
+        ("__builtin_bswap32(d)", |t| t.uint_id, |t| t.uint_id),
+        (
+            "__builtin_bswap64(d)",
+            |t| t.ulonglong_id,
+            |t| t.ulonglong_id,
+        ),
+        ("__builtin_ctz(d)", |t| t.uint_id, |t| t.int_id),
+        ("__builtin_ctzl(d)", |t| t.ulong_id, |t| t.int_id),
+        ("__builtin_ctzll(d)", |t| t.ulonglong_id, |t| t.int_id),
+        ("__builtin_clz(d)", |t| t.uint_id, |t| t.int_id),
+        ("__builtin_clzll(u)", |t| t.ulonglong_id, |t| t.int_id),
+        ("__builtin_clrsb(d)", |t| t.int_id, |t| t.int_id),
+        ("__builtin_clrsbl(u)", |t| t.long_id, |t| t.int_id),
+        ("__builtin_popcount(d)", |t| t.uint_id, |t| t.int_id),
+        ("__builtin_popcountl(d)", |t| t.ulong_id, |t| t.int_id),
+        ("__builtin_parity(d)", |t| t.uint_id, |t| t.int_id),
+        ("__builtin_parityll(u)", |t| t.ulonglong_id, |t| t.int_id),
+        ("__builtin_ffs(d)", |t| t.int_id, |t| t.int_id),
+        ("__builtin_ffsl(u)", |t| t.long_id, |t| t.int_id),
+        ("__builtin_ffsll(d)", |t| t.longlong_id, |t| t.int_id),
+    ];
+    for (stmt, param, ret) in cases {
+        with_statement_expr(decls, stmt, |p, e| {
+            assert_eq!(e.typ, Some(ret(p.types)), "{stmt}: result type");
+            let arg = bit_builtin_operand(e);
+            let want = param(p.types);
+            assert_eq!(arg.typ, Some(want), "{stmt}: operand type");
+            let ExprKind::Cast { cast_type, .. } = arg.kind else {
+                panic!("{stmt}: operand not converted: {:?}", arg.kind);
+            };
+            assert_eq!(cast_type, want, "{stmt}");
+        });
+    }
+    // An argument of the parameter type is passed as it is.
+    with_statement_expr(decls, "__builtin_ctz(u)", |_, e| {
+        assert!(matches!(bit_builtin_operand(e).kind, ExprKind::Ident(_)));
+    });
+}
+
+/// An argument no assignment converts -- a structure -- is an error, as in
+/// an ordinary call, and the call is not built: a zero of the result type
+/// stands in for it.
+#[test]
+fn test_bit_builtins_reject_a_structure_argument() {
+    let decls = "struct S { int a; } s;";
+    for stmt in [
+        "__builtin_ctz(s)",
+        "__builtin_parity(s)",
+        "__builtin_bswap16(s)",
+        "__builtin_ffs(s)",
+        "__builtin_clz(1, 2)",
+    ] {
+        let before = crate::diag::error_count();
+        with_statement_expr(decls, stmt, |_, e| {
+            // The count is process-wide and only grows, so a concurrent test
+            // can add to it but never hide this one's error.
+            assert!(crate::diag::error_count() > before, "{stmt}: accepted");
+            assert!(
+                matches!(&e.kind, ExprKind::IntLit(0))
+                    || matches!(&e.kind, ExprKind::Cast { expr, .. }
+                        if matches!(expr.kind, ExprKind::IntLit(0))),
+                "{stmt}: built {:?}",
+                e.kind
+            );
+        });
+    }
 }
 
 // __builtin_flt_rounds test

@@ -53,6 +53,7 @@ diagnostics in the usual words:
 
 - the library functions computed in place (`LIBRARY_BUILTINS` rows made with
   `entry`), by either spelling;
+- the bit builtins, against gcc's prototypes for them (`BIT_BUILTINS`);
 - a `__builtin_X` that calls library function `X` when a declaration of `X`
   is in scope, or when `X` has a `known` row in `LIBRARY_BUILTINS` (the
   `<string.h>`/`<stdio.h>` functions the optimizer folds).
@@ -74,7 +75,6 @@ Everything else is parsed by its fixed shape: a wrong argument count is a
 parse error (`expected ')'`), and the argument types are **not** checked. In
 particular, unlike gcc, c17 accepts without a diagnostic:
 
-- a non-integer argument to the bit builtins (see the bug note there);
 - a non-floating argument to `__builtin_isnan`, `isinf`, `isfinite`,
   `isnormal`, `isinf_sign` and `fpclassify`;
 - `__builtin_complex` operands that are not floating or not of one type;
@@ -105,15 +105,23 @@ particular, unlike gcc, c17 accepts without a diagnostic:
 
 ## Byte Swapping and Bit Operations
 
-| Builtin | Becomes |
-|---------|---------|
-| `__builtin_bswap16(x)`, `bswap32`, `bswap64` | `Opcode::Bswap16/32/64`; result `unsigned short` / `unsigned int` / `unsigned long long` |
-| `__builtin_ctz(x)`, `ctzl`, `ctzll` | `Opcode::Ctz32` / `Ctz64` (`l` and `ll` share); undefined for 0 |
-| `__builtin_clz(x)`, `clzl`, `clzll` | `Opcode::Clz32` / `Clz64`; undefined for 0 |
-| `__builtin_popcount(x)`, `popcountl`, `popcountll` | `Opcode::Popcount32` / `Popcount64` |
-| `__builtin_parity(x)`, `parityl`, `parityll` | Rewritten by the parser to `popcount(x) & 1` on one node, so `x` is evaluated once |
-| `__builtin_clrsb(x)`, `clrsbl`, `clrsbll` | Redundant sign bits of `int` / `long`: expanded by `linearize_clrsb` into `((x ^ (x >> w-1)) << 1 \| 1)` and a `Clz`. Defined for every input: 0 and -1 both answer 31 |
-| `__builtin_ffs(x)`, `ffsl`, `ffsll` | A call to the C library's `ffs`/`ffsl`/`ffsll` (gcc computes it inline). The bare `ffs` is an ordinary function |
+| Builtin | Parameter | Becomes |
+|---------|-----------|---------|
+| `__builtin_bswap16(x)`, `bswap32`, `bswap64` | `unsigned short` / `unsigned int` / `unsigned long long` | `Opcode::Bswap16/32/64`; result of the parameter type |
+| `__builtin_ctz(x)`, `ctzl`, `ctzll` | `unsigned int` / `unsigned long` / `unsigned long long` | `Opcode::Ctz32` / `Ctz64` (`l` and `ll` share); undefined for 0 |
+| `__builtin_clz(x)`, `clzl`, `clzll` | as `ctz` | `Opcode::Clz32` / `Clz64`; undefined for 0 |
+| `__builtin_popcount(x)`, `popcountl`, `popcountll` | as `ctz` | `Opcode::Popcount32` / `Popcount64` |
+| `__builtin_parity(x)`, `parityl`, `parityll` | as `ctz` | Rewritten by the parser to `popcount(x) & 1` on one node, so `x` is evaluated once |
+| `__builtin_clrsb(x)`, `clrsbl`, `clrsbll` | `int` / `long` / `long long` | Redundant sign bits: expanded by `linearize_clrsb` into `((x ^ (x >> w-1)) << 1 \| 1)` and a `Clz`. Defined for every input: 0 and -1 both answer 31 |
+| `__builtin_ffs(x)`, `ffsl`, `ffsll` | `int` / `long` / `long long` | A call to the C library's `ffs`/`ffsl`/`ffsll` (gcc computes it inline), declared with that prototype unless the program declared it. The bare `ffs` is an ordinary function |
+
+Every result other than a byte swap's is `int`. The prototypes are gcc's,
+written once in `BIT_BUILTINS` (`parse/bit_builtin.rs`): a call is checked
+by `check_call` as an ordinary call through that prototype is, and its
+argument converted to the parameter type (C17 6.5.2.2p7), so
+`__builtin_ctz(8.0)` is 3. A structure argument is an error and a pointer
+the integer-from-pointer warning, each naming the builtin; a wrong argument
+count is the ordinary call's error.
 
 The population count uses only baseline instructions: on x86-64 a
 branch-free SWAR sequence (`popcnt` is not in x86-64-v1), on AArch64 `cnt`
@@ -124,11 +132,6 @@ Only `popcount` and `parity` of a constant fold (`constfold::eval_unop`,
 are emitted as instructions at every level, and none of these builtins is an
 integer constant expression or a valid static initializer, where gcc accepts
 both.
-
-**Bug:** the argument is linearized at its own type and never converted to
-the parameter type. An integer of any width works, but a floating argument
-is miscompiled: `__builtin_ctz(8.0)` is 0 on x86-64 and 2 on AArch64,
-`__builtin_popcount(7.9)` 16 and 2, where gcc converts and answers 3 and 3.
 
 ## Type Introspection and Selection
 
@@ -517,7 +520,7 @@ Every kind starts the same way.
    `test_kw_builtin_tags_are_all_registered` fail until the two lists agree.
    A target-dependent builtin also needs a case in `available_on`.
 3. **Parse.** Add an arm to the family function in `parse/builtin_expr.rs`
-   that fits (`parse_bit_builtin`, `parse_float_builtin`,
+   that fits (`parse_checked_builtin`, `parse_float_builtin`,
    `parse_misc_builtin`, `parse_atomic_builtin`, ...), all reached from
    `parse_builtin_expr`. Use `expect_special`, `parse_assignment_expr` (one
    argument -- not `parse_expression`, which would eat the comma),
@@ -525,7 +528,10 @@ Every kind starts the same way.
    constant. Check argument types here and report with `diag::error` /
    `diag::error_args` in gcc's wording (or `ParseError::new` if parsing
    cannot continue); convert arguments to their parameter types with
-   `convert_operand`; build the node with `typed_expr`. An argument you drop
+   `convert_operand`; build the node with `typed_expr`. A builtin of one
+   argument with a prototype, like the bit builtins, is a row in
+   `BIT_BUILTINS` (`parse/bit_builtin.rs`) instead, which checks and converts
+   the argument as a call does. An argument you drop
    must keep its side effects: wrap it in `ExprKind::Comma` unless
    `is_literal_constant` says it has none.
 

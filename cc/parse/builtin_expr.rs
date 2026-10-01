@@ -180,22 +180,6 @@ impl Parser<'_> {
             || library.is_some_and(|lb| !self.library_prototype_matches(lb, typ))
     }
 
-    /// Try to parse a builtin function expression.
-    /// Returns `Some(result)` if `name_id` is a recognized builtin, `None` otherwise.
-    /// A `__builtin_*(x)` taking one argument, wrapping it in `kind`, and
-    /// carrying result type `typ`.
-    fn parse_unary_builtin(
-        &mut self,
-        token_pos: Position,
-        typ: TypeId,
-        kind: fn(Box<Expr>) -> ExprKind,
-    ) -> ParseResult<Expr> {
-        self.expect_special(b'(')?;
-        let arg = self.parse_assignment_expr()?;
-        self.expect_special(b')')?;
-        Ok(Self::typed_expr(kind(Box::new(arg)), typ, token_pos))
-    }
-
     /// The parenthesised level of `__builtin_frame_address` or
     /// `__builtin_return_address`.
     ///
@@ -397,49 +381,13 @@ impl Parser<'_> {
         }
     }
 
-    /// Byte swaps, bit counts, checked arithmetic and `__builtin_choose_expr`.
-    fn parse_bit_builtin(
+    /// Checked arithmetic and `__builtin_choose_expr`.
+    fn parse_checked_builtin(
         &mut self,
         name_id: StringId,
         token_pos: Position,
     ) -> Option<ParseResult<Expr>> {
         match name_id {
-            crate::kw::BUILTIN_BSWAP16 => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.ushort_id,
-                |arg| ExprKind::Bswap16 { arg },
-            )),
-
-            crate::kw::BUILTIN_BSWAP32 => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.uint_id,
-                |arg| ExprKind::Bswap32 { arg },
-            )),
-
-            crate::kw::BUILTIN_BSWAP64 => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.ulonglong_id,
-                |arg| ExprKind::Bswap64 { arg },
-            )),
-
-            crate::kw::BUILTIN_CTZ => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.int_id,
-                |arg| ExprKind::Ctz { arg },
-            )),
-
-            crate::kw::BUILTIN_CTZL => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.int_id,
-                |arg| ExprKind::Ctzl { arg },
-            )),
-
-            crate::kw::BUILTIN_CTZLL => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.int_id,
-                |arg| ExprKind::Ctzll { arg },
-            )),
-
             // Checked arithmetic: compute exactly, store the wrapped
             // result, and answer whether wrapping lost anything.
             crate::kw::BUILTIN_ADD_OVERFLOW_P
@@ -547,95 +495,6 @@ impl Parser<'_> {
                         b: Box::new(b),
                         res: Box::new(res),
                         store: true,
-                    },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_CLZ => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.int_id,
-                |arg| ExprKind::Clz { arg },
-            )),
-
-            crate::kw::BUILTIN_CLZL => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.int_id,
-                |arg| ExprKind::Clzl { arg },
-            )),
-
-            crate::kw::BUILTIN_CLZLL => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.int_id,
-                |arg| ExprKind::Clzll { arg },
-            )),
-
-            crate::kw::BUILTIN_CLRSB => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.int_id,
-                |arg| ExprKind::Clrsb { arg },
-            )),
-
-            crate::kw::BUILTIN_CLRSBL => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.int_id,
-                |arg| ExprKind::Clrsbl { arg },
-            )),
-
-            crate::kw::BUILTIN_CLRSBLL => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.int_id,
-                |arg| ExprKind::Clrsbll { arg },
-            )),
-
-            crate::kw::BUILTIN_POPCOUNT => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.int_id,
-                |arg| ExprKind::Popcount { arg },
-            )),
-
-            crate::kw::BUILTIN_POPCOUNTL => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.int_id,
-                |arg| ExprKind::Popcountl { arg },
-            )),
-
-            crate::kw::BUILTIN_POPCOUNTLL => Some(self.parse_unary_builtin(
-                token_pos,
-                self.types.int_id,
-                |arg| ExprKind::Popcountll { arg },
-            )),
-
-            crate::kw::BUILTIN_PARITY
-            | crate::kw::BUILTIN_PARITYL
-            | crate::kw::BUILTIN_PARITYLL => Some((|| {
-                // __builtin_parity(x) - 1 if x has an odd number of set bits.
-                //
-                // That is the low bit of the population count, so it reuses
-                // `Popcount` rather than introducing an opcode. Written as a
-                // mask on the single `Popcount` node, the argument is
-                // evaluated once -- `__builtin_parity(f())` calls `f` once,
-                // which a `popcount(x) & 1` textual expansion would not
-                // guarantee.
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                let kind = match name_id {
-                    crate::kw::BUILTIN_PARITY => ExprKind::Popcount { arg: Box::new(arg) },
-                    crate::kw::BUILTIN_PARITYL => ExprKind::Popcountl { arg: Box::new(arg) },
-                    _ => ExprKind::Popcountll { arg: Box::new(arg) },
-                };
-                let count = Self::typed_expr(kind, self.types.int_id, token_pos);
-                let one = Self::typed_expr(
-                    ExprKind::IntLit(crate::target::ATOMIC_TEST_AND_SET_TRUEVAL),
-                    self.types.int_id,
-                    token_pos,
-                );
-                Ok(Self::typed_expr(
-                    ExprKind::Binary {
-                        op: BinaryOp::BitAnd,
-                        left: Box::new(count),
-                        right: Box::new(one),
                     },
                     self.types.int_id,
                     token_pos,
@@ -2070,7 +1929,7 @@ impl Parser<'_> {
             (Some(payload), _) => constant(FloatVal::nan_with_payload(fmt, payload, kind)),
             (None, NanKind::Quiet) => {
                 let library = suffix.nan_library_function();
-                Ok(self.call_library_function(&library, vec![arg], call_pos, token_pos))
+                Ok(self.call_library_function(&library, name_id, vec![arg], call_pos, token_pos))
             }
             (None, NanKind::Signalling) => {
                 diag::error_args(
@@ -2126,18 +1985,20 @@ impl Parser<'_> {
                 self.expect_special(b'(')?;
                 let args = self.parse_argument_list()?;
                 self.expect_special(b')')?;
-                Ok(self.call_library_function(real_name, args, call_pos, token_pos))
+                Ok(self.call_library_function(real_name, name_id, args, call_pos, token_pos))
             })())
         } else {
             None
         }
     }
 
-    /// A call to the library function `real_name` with `args`, for a builtin
-    /// that stands for it.
-    fn call_library_function(
+    /// A call to the library function `real_name` with `args`, for the
+    /// builtin `spelled` that stands for it. Diagnostics name `spelled`, as
+    /// gcc's do.
+    pub(super) fn call_library_function(
         &mut self,
         real_name: &str,
+        spelled: StringId,
         args: Vec<Expr>,
         call_pos: Position,
         token_pos: Position,
@@ -2155,7 +2016,7 @@ impl Parser<'_> {
             let placeholder = self.placeholder_prototypes.contains(&symbol_id);
             if !placeholder {
                 let func_type = self.resolved_function_type(&func_expr);
-                self.check_call(func_type, &args, call_pos);
+                self.check_call(func_type, Some(spelled), &args, call_pos);
             }
             // The reserved spelling means the library function whatever the
             // program says about its bare name -- unless what it declared is
@@ -2175,7 +2036,7 @@ impl Parser<'_> {
             if let Some(symbol_id) = self.declare_known_library_function(lb) {
                 let func_expr = self.library_callee(symbol_id, token_pos);
                 let func_type = self.resolved_function_type(&func_expr);
-                self.check_call(func_type, &args, call_pos);
+                self.check_call(func_type, Some(spelled), &args, call_pos);
                 return self.library_call(func_expr, args, lb.called(), token_pos);
             }
         }
@@ -2241,6 +2102,9 @@ impl Parser<'_> {
             return Some(result);
         }
         if let Some(result) = self.parse_bit_builtin(name_id, token_pos) {
+            return Some(result);
+        }
+        if let Some(result) = self.parse_checked_builtin(name_id, token_pos) {
             return Some(result);
         }
         if let Some(result) = self.parse_memory_builtin(name_id, token_pos) {
@@ -2422,7 +2286,7 @@ impl Parser<'_> {
             }
             // The library builtins, for the case where the header that would
             // declare them has not been included.
-            "ffs" | "ffsl" | "ffsll" | "snprintf" => Some(self.types.int_id),
+            "snprintf" => Some(self.types.int_id),
             _ if Self::libm_real_kind(name).is_some() => Some(match Self::libm_real_kind(name) {
                 Some(LibmReal::Float) => self.types.float_id,
                 Some(LibmReal::LongDouble) => self.types.longdouble_id,
@@ -2467,9 +2331,6 @@ impl Parser<'_> {
             name_id,
             crate::kw::BUILTIN_STRLEN
                 | crate::kw::BUILTIN_STRCMP
-                | crate::kw::BUILTIN_FFS
-                | crate::kw::BUILTIN_FFSL
-                | crate::kw::BUILTIN_FFSLL
                 | crate::kw::BUILTIN_FMAXL
                 | crate::kw::BUILTIN_FMINL
                 | crate::kw::BUILTIN_POW
@@ -2779,7 +2640,6 @@ impl Parser<'_> {
             "__memset_chk" | "__strcpy_chk" | "__stpcpy_chk" | "__strcat_chk" => (3, false),
             "__memcpy_chk" | "__memmove_chk" | "__mempcpy_chk" | "__strncpy_chk"
             | "__stpncpy_chk" | "__strncat_chk" => (4, false),
-            "ffs" | "ffsl" | "ffsll" => (1, false),
             "bzero" | "strcasecmp" => (2, false),
             "bcmp" | "stpncpy" | "strncasecmp" => (3, false),
             // The libm entry points, from the one table that knows them.

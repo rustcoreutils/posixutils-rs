@@ -15,6 +15,7 @@ pub mod ast;
 mod attribute;
 mod attribute_decl;
 mod bind;
+mod bit_builtin;
 mod builtin_expr;
 mod declaration;
 mod declarator;

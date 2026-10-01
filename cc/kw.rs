@@ -312,6 +312,9 @@ define_keywords! {
     (BUILTIN_PARITY,    "__builtin_parity",   BUILTIN),
     (BUILTIN_PARITYL,   "__builtin_parityl",  BUILTIN),
     (BUILTIN_PARITYLL,  "__builtin_parityll", BUILTIN),
+    (BUILTIN_FFS,       "__builtin_ffs",      BUILTIN),
+    (BUILTIN_FFSL,      "__builtin_ffsl",     BUILTIN),
+    (BUILTIN_FFSLL,     "__builtin_ffsll",    BUILTIN),
     (BUILTIN_CHOOSE_EXPR, "__builtin_choose_expr", BUILTIN),
     // Builtins that are the library function of the same name; see
     // `is_library_builtin`. Listed so `__has_builtin` answers for them.
@@ -320,9 +323,6 @@ define_keywords! {
     (BUILTIN_ABS,       "__builtin_abs",      BUILTIN),
     (BUILTIN_LABS,      "__builtin_labs",     BUILTIN),
     (BUILTIN_LLABS,     "__builtin_llabs",    BUILTIN),
-    (BUILTIN_FFS,       "__builtin_ffs",      BUILTIN),
-    (BUILTIN_FFSL,      "__builtin_ffsl",     BUILTIN),
-    (BUILTIN_FFSLL,     "__builtin_ffsll",    BUILTIN),
     (BUILTIN_SQRT,      "__builtin_sqrt",     BUILTIN),
     (BUILTIN_COPYSIGN,  "__builtin_copysign", BUILTIN),
     // `bits/floatn.h` reaches for `__builtin_copysignf`, so the suffixed

@@ -100,13 +100,18 @@ impl LibraryCallPolicy {
     }
 }
 
-/// A type in one of the prototypes below.
+/// A type in one of the prototypes below, or in the bit builtins'
+/// (`bit_builtin.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProtoType {
+pub(super) enum ProtoType {
     Void,
     Int,
     Long,
     LongLong,
+    UShort,
+    UInt,
+    ULong,
+    ULongLong,
     Float,
     Double,
     LongDouble,
@@ -128,12 +133,16 @@ enum ProtoType {
 }
 
 impl ProtoType {
-    fn id(self, t: &TypeTable) -> TypeId {
+    pub(super) fn id(self, t: &TypeTable) -> TypeId {
         match self {
             ProtoType::Void => t.void_id,
             ProtoType::Int => t.int_id,
             ProtoType::Long => t.long_id,
             ProtoType::LongLong => t.longlong_id,
+            ProtoType::UShort => t.ushort_id,
+            ProtoType::UInt => t.uint_id,
+            ProtoType::ULong => t.ulong_id,
+            ProtoType::ULongLong => t.ulonglong_id,
             ProtoType::Float => t.float_id,
             ProtoType::Double => t.double_id,
             ProtoType::LongDouble => t.longdouble_id,
@@ -573,7 +582,11 @@ impl Parser<'_> {
 
         let ret = lb.ret.id(self.types);
         let func_type = self.library_function_type(lb);
-        let sound = self.check_call(Some(func_type), &args, call_pos);
+        let spelled = match spelling {
+            Spelling::Bare => lb.bare,
+            Spelling::Reserved => lb.reserved.unwrap_or(lb.bare),
+        };
+        let sound = self.check_call(Some(func_type), Some(spelled), &args, call_pos);
         if sound && args.len() == lb.params.len() {
             Ok(self.lower_library_call(lb, func, spelling, args, pos))
         } else {

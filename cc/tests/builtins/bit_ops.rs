@@ -13,6 +13,7 @@
 
 use crate::common::{
     asm_for_at, compile_and_run, compile_and_run_aarch64, compile_and_run_optimized,
+    compile_expect_error, compile_expect_warning,
 };
 
 // ============================================================================
@@ -364,4 +365,65 @@ fn builtins_popcount_uses_baseline_instructions() {
         );
         assert!(!asm.contains("popcnt"), "{opt}: popcnt emitted:\n{asm}");
     }
+}
+
+/// The bit builtins have prototypes -- `int __builtin_ctz(unsigned int)` and
+/// so on -- so an argument converts to the parameter type as in any call
+/// through a prototype (C17 6.5.2.2p7). c17 took the argument's bits as they
+/// were: `__builtin_ctz(8.0)` counted the zeros of the double's
+/// representation, 0 on x86-64 and 2 on aarch64, where gcc answers 3.
+#[test]
+fn builtins_bit_ops_convert_their_argument() {
+    crate::common::compile_and_run_everywhere(
+        "bit_ops_convert",
+        r#"
+/* Bit builtins convert their argument to the parameter type, as a call
+   through a prototype would. */
+int main(void) {
+    volatile double d = 8.0, e = 7.9;
+    volatile float f = 12.0f;
+    volatile long double ld = 2147483648.0L;
+    if (__builtin_ctz(d) != 3) return 1;
+    if (__builtin_popcount(e) != 3) return 2;
+    if (__builtin_clz(f) != 28) return 3;
+    if (__builtin_ctzll(ld) != 31) return 4;
+    if (__builtin_popcountl(e) != 3) return 5;
+    if (__builtin_parity(e) != 1) return 6;
+    if (__builtin_bswap32(d) != 0x08000000u) return 7;
+    if (__builtin_ffs(d) != 4) return 8;
+    if (__builtin_clrsb(f) != 27) return 9;
+    return 0;
+}
+"#,
+    );
+}
+
+/// An argument the prototype cannot convert is diagnosed as in any call, in
+/// gcc's words: a structure is an error, a pointer the integer-from-pointer
+/// warning an ordinary call draws.
+#[test]
+fn builtins_bit_ops_check_their_argument() {
+    for (name, call, param) in [
+        ("ctz", "__builtin_ctz(s)", "unsigned int"),
+        ("parityl", "__builtin_parityl(s)", "unsigned long"),
+        ("bswap16", "__builtin_bswap16(s)", "unsigned short"),
+        ("clrsbll", "__builtin_clrsbll(s)", "long long"),
+        ("ffs", "__builtin_ffs(s)", "int"),
+    ] {
+        let builtin = call.split('(').next().unwrap();
+        compile_expect_error(
+            &format!("bit_ops_struct_{name}"),
+            &format!("struct S {{ int a; }};\nint f(struct S s) {{ return {call}; }}\n"),
+            &format!(
+                "incompatible type for argument 1 of '{builtin}': \
+                 expected '{param}', got 'struct S'"
+            ),
+        );
+    }
+    compile_expect_warning(
+        "bit_ops_pointer",
+        "int f(unsigned *p) { return __builtin_popcount(p); }\n",
+        "passing argument 1 of '__builtin_popcount' as 'unsigned int' from 'unsigned int *' \
+         makes integer from pointer without a cast",
+    );
 }

@@ -29,6 +29,10 @@ use std::path::PathBuf;
 /// filename is fully determined by the prefix, the suffix width, and a
 /// sequential index, so the handler rebuilds each name into a stack buffer and
 /// calls `unlink(2)` directly.
+///
+/// On Windows `unlink` is the C runtime's `_unlink`. The file csplit is still
+/// writing when the signal arrives was opened (by std) with delete sharing, so
+/// its removal is granted and takes effect when the process exits.
 mod cleanup {
     use std::ptr;
     use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -57,11 +61,26 @@ mod cleanup {
         PREFIX_LEN.store(bytes.len(), Ordering::SeqCst);
         SUFFIX_LEN.store(suffix_len as usize, Ordering::SeqCst);
 
-        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+        for &sig in SIGNALS {
             unsafe { install(sig) };
         }
     }
 
+    /// The signals whose default action terminates csplit.
+    #[cfg(unix)]
+    const SIGNALS: &[libc::c_int] = &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+    /// Windows has no SIGHUP or SIGQUIT. Its C runtime delivers a console
+    /// Ctrl-C as SIGINT and Ctrl-Break -- the keyboard quit, as `Ctrl-\` is on
+    /// Unix -- as SIGBREAK, each on a thread of its own.
+    #[cfg(windows)]
+    const SIGNALS: &[libc::c_int] = &[libc::SIGINT, libc::SIGTERM, SIGBREAK];
+
+    /// The C runtime's `SIGBREAK` (`signal.h`), which the `libc` crate does
+    /// not declare.
+    #[cfg(windows)]
+    const SIGBREAK: libc::c_int = 21;
+
+    #[cfg(unix)]
     unsafe fn install(signum: libc::c_int) {
         let mut act: libc::sigaction = std::mem::zeroed();
         // Cast via an explicit fn pointer: casting a function *item* straight to
@@ -71,6 +90,16 @@ mod cleanup {
         act.sa_flags = 0;
         libc::sigemptyset(&mut act.sa_mask);
         libc::sigaction(signum, &act, ptr::null_mut());
+    }
+
+    /// The Windows C runtime has `signal` but no `sigaction`. Its `signal`
+    /// resets the disposition to the default before running the handler, as
+    /// `sa_flags = 0` does not on Unix; the handler re-raises with the default
+    /// either way, so the difference is never seen.
+    #[cfg(windows)]
+    unsafe fn install(signum: libc::c_int) {
+        let entry: extern "C" fn(libc::c_int) = handler;
+        libc::signal(signum, entry as libc::sighandler_t);
     }
 
     extern "C" fn handler(signum: libc::c_int) {

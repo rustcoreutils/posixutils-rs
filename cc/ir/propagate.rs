@@ -189,3 +189,56 @@ pub(crate) fn switch_taken(insn: &Instruction, v: i128) -> Option<BasicBlockId> 
     }
     insn.extra().switch_default
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::target::Target;
+    use crate::types::TypeTable;
+
+    /// A machine compare has no signedness, and the selector and the case
+    /// label are the same C type. Reading the selector *signed* made
+    /// `switch (3000000000u) { case 3000000000u: }` miss its own case.
+    #[test]
+    fn switch_taken_matches_a_case_above_the_signed_range() {
+        let taken = switch_case_for(3_000_000_000i64, 3_000_000_000i128);
+        assert_eq!(taken, Some(BasicBlockId(7)), "the case must match itself");
+    }
+
+    #[test]
+    fn switch_taken_falls_to_default_when_nothing_matches() {
+        assert_eq!(switch_case_for(5, 6), Some(BasicBlockId(9)));
+    }
+
+    #[test]
+    fn switch_taken_matches_a_gnu_range() {
+        let mut insn = Instruction::new(Opcode::Switch);
+        insn.size = 32;
+        insn.extra_mut().switch_cases = vec![(30, 50, BasicBlockId(7))];
+        insn.extra_mut().switch_default = Some(BasicBlockId(9));
+        assert_eq!(switch_taken(&insn, 40), Some(BasicBlockId(7)));
+        assert_eq!(switch_taken(&insn, 51), Some(BasicBlockId(9)));
+        assert_eq!(switch_taken(&insn, 29), Some(BasicBlockId(9)));
+    }
+
+    /// A switch carrying a type has a width that cannot be computed without
+    /// a `TypeTable`, so it must decline rather than guess.
+    #[test]
+    fn switch_taken_with_a_type_is_left_alone() {
+        let types = TypeTable::new(&Target::host());
+        let mut insn = Instruction::new(Opcode::Switch);
+        insn.size = 32;
+        insn.typ = Some(types.int_id);
+        insn.extra_mut().switch_cases = vec![(5, 5, BasicBlockId(7))];
+        insn.extra_mut().switch_default = Some(BasicBlockId(9));
+        assert_eq!(switch_taken(&insn, 5), None);
+    }
+
+    fn switch_case_for(case: i64, selector: i128) -> Option<BasicBlockId> {
+        let mut insn = Instruction::new(Opcode::Switch);
+        insn.size = 32;
+        insn.extra_mut().switch_cases = vec![(case, case, BasicBlockId(7))];
+        insn.extra_mut().switch_default = Some(BasicBlockId(9));
+        switch_taken(&insn, selector)
+    }
+}

@@ -474,6 +474,20 @@ fn dump_ir(args: &Args, module: &ir::Module, types: &types::TypeTable, stage: &s
     }
 }
 
+/// Say which functions the optimizer's fixed-point loop gave up on, and
+/// which passes were still changing them: their dumped IR is a snapshot, not
+/// a fixed point.
+fn note_unconverged(report: &opt::OptReport) {
+    for c in &report.unconverged {
+        eprintln!(
+            "; note: '{}' did not reach a fixed point in {} iterations; still changing: {}",
+            c.function,
+            c.iterations,
+            c.still_changing.join(", ")
+        );
+    }
+}
+
 /// Print compilation statistics for capacity tuning
 fn print_stats(
     path: &str,
@@ -1233,7 +1247,7 @@ fn process_file(
     // Optimize IR. Called even at -O0, where the only pass that does anything
     // is inlining of `__attribute__((always_inline))` functions, which gcc
     // honours with optimization off.
-    opt::optimize_module(&mut module, &types, args.optimization(), target);
+    let report = opt::optimize_module(&mut module, &types, args.optimization(), target);
 
     // An opcode the target computes by a library call -- a libm function it
     // has no instruction for, any binary128 operation, or an x86-64
@@ -1243,6 +1257,9 @@ fn process_file(
     ir::validate::verify(&module, ir::validate::Stage::Ssa, "optimization");
 
     dump_ir(args, &module, &types, "post-opt");
+    if should_dump_ir(args, "post-opt") {
+        note_unconverged(&report);
+    }
 
     if args.dump_ir.is_some() && !should_dump_ir(args, "post-lower") {
         return Ok(Compiled::Nothing);

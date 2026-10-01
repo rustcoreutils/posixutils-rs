@@ -22,28 +22,21 @@
 // both collapse. `instcombine` sees each instruction in isolation and has no
 // notion of an edge, so neither is within its reach.
 //
-// Memory-ordering contract: SCCP performs no code motion. Every value rewrite
-// is an in-place substitution at a single instruction site, and the only
-// structural change is dropping a CFG edge that has been *proved* not taken.
-// The relative order of every `Load`, `Store`, `Asm`, `Call`, `Atomic*` and
-// `Fence` is preserved exactly, so `Instruction::is_memory_barrier()` is
-// satisfied by construction. Any future extension that starts moving memory
-// must consult it before crossing.
+// The solver -- seeding, edge marking, worklists, and the rewrite of what
+// the solution proves -- is `dataflow`'s, shared with `vrp`; see there for
+// the decisions that keep it sound and for the memory-ordering contract.
+// This file is the lattice and its transfer function.
 //
 // Dominance: not used. Wegman-Zadeck needs only executable-edge marking, so
 // this pass never builds a dominator tree -- which also means it cannot hold
 // a stale one. An extension that wants dominance must call
 // `dominate::domtree_build` *fresh*, after the CFG edits here.
 //
-// This pass does not delete blocks. It removes the dead edge and leaves the
-// deletion to the `dce::run` that follows it in `opt::optimize_function`;
-// see `fold_terminator`.
-//
 
 use super::constfold::{eval_binop, eval_unop, get_cmp_info};
-use super::propagate::{self, cbr_taken, switch_taken, Site};
-use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
-use std::collections::{HashMap, HashSet, VecDeque};
+use super::dataflow::{Lattice, Selector, Sparse, SparseAnalysis};
+use super::propagate::cbr_taken;
+use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 
 /// The lattice, of height three.
 ///
@@ -52,7 +45,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Val {
     /// No information yet. In this version only unreached definitions hold it
-    /// at fixpoint; see the note on `PseudoKind::Undef` in `seed`.
+    /// at fixpoint; see the note on `Undef` in `dataflow`.
     Top,
     /// A known integer, held as the raw bit pattern exactly as
     /// `PseudoKind::Val` does. Reading it at a given width is `constfold`'s
@@ -62,7 +55,10 @@ enum Val {
     Bottom,
 }
 
-impl Val {
+impl Lattice for Val {
+    const TOP: Val = Val::Top;
+    const BOTTOM: Val = Val::Bottom;
+
     fn meet(self, other: Val) -> Val {
         match (self, other) {
             (Val::Top, x) | (x, Val::Top) => x,
@@ -74,282 +70,46 @@ impl Val {
 }
 
 struct Solver {
-    /// Lattice value per pseudo, indexed by `PseudoId.0`.
-    vals: Vec<Val>,
-    /// Blocks proved reachable.
-    executable_block: HashSet<BasicBlockId>,
-    /// CFG edges proved taken, as `(pred, succ)`.
-    executable_edge: HashSet<(BasicBlockId, BasicBlockId)>,
-    cfg_worklist: VecDeque<(BasicBlockId, BasicBlockId)>,
-    ssa_worklist: VecDeque<PseudoId>,
-    /// Instruction sites that read each pseudo.
-    uses: HashMap<PseudoId, Vec<Site>>,
-    /// Pseudos that must never be folded whatever the lattice says. See
-    /// `seed` for the two reasons.
-    unfoldable: HashSet<PseudoId>,
+    core: Sparse<Val>,
 }
 
 /// Run SCCP over `func`, returning whether anything changed.
 pub fn run(func: &mut Function) -> bool {
-    if func.blocks.is_empty() {
-        return false;
+    Solver {
+        core: Sparse::new(func, Val::Const),
     }
-    let mut solver = Solver::new(func);
-    solver.solve(func);
-    solver.apply(func)
+    .run(func)
 }
 
 impl Solver {
-    fn new(func: &Function) -> Self {
-        let mut s = Solver {
-            vals: vec![Val::Top; func.next_pseudo as usize + 1],
-            executable_block: HashSet::new(),
-            executable_edge: HashSet::new(),
-            cfg_worklist: VecDeque::new(),
-            ssa_worklist: VecDeque::new(),
-            uses: HashMap::new(),
-            unfoldable: HashSet::new(),
-        };
-        s.index(func);
-        s.seed(func);
-        s
-    }
-
     fn get(&self, id: PseudoId) -> Val {
-        self.vals.get(id.0 as usize).copied().unwrap_or(Val::Bottom)
+        self.core.get(id)
+    }
+}
+
+impl SparseAnalysis for Solver {
+    type V = Val;
+
+    fn core(&self) -> &Sparse<Val> {
+        &self.core
     }
 
-    /// Lower `id` to `v`, pushing its readers if it moved.
-    fn set(&mut self, id: PseudoId, v: Val) {
-        let idx = id.0 as usize;
-        if idx >= self.vals.len() {
-            return;
-        }
-        let merged = self.vals[idx].meet(v);
-        if merged != self.vals[idx] {
-            self.vals[idx] = merged;
-            self.ssa_worklist.push_back(id);
-        }
+    fn core_mut(&mut self) -> &mut Sparse<Val> {
+        &mut self.core
     }
 
-    /// Build the use index.
-    fn index(&mut self, func: &Function) {
-        for (b, bb) in func.blocks.iter().enumerate() {
-            for (i, insn) in bb.insns.iter().enumerate() {
-                for u in insn.uses() {
-                    self.uses.entry(u).or_default().push((b, i));
-                }
-            }
+    fn selector(&self, _block: BasicBlockId, id: PseudoId) -> Selector {
+        match self.get(id) {
+            Val::Top => Selector::Pending,
+            Val::Const(v) => Selector::Value(v),
+            Val::Bottom => Selector::Unknown,
         }
     }
 
-    /// Initial lattice values, and the entry edge.
-    fn seed(&mut self, func: &Function) {
-        for p in &func.pseudos {
-            let idx = p.id.0 as usize;
-            if idx >= self.vals.len() {
-                continue;
-            }
-            self.vals[idx] = match &p.kind {
-                PseudoKind::Val(v) => Val::Const(*v),
-
-                // An argument has no defining instruction and can be
-                // anything the caller passes.
-                PseudoKind::Arg(_) => Val::Bottom,
-
-                // A `Sym` names *storage*, not a value: a struct-returning
-                // call writes through one as its `target`. Folding a use of
-                // it would replace an address with a number.
-                PseudoKind::Sym(_) => {
-                    self.unfoldable.insert(p.id);
-                    Val::Bottom
-                }
-
-                // `Undef` is seeded `Bottom` here, not `Top`.
-                //
-                // `Top` is what buys `int x; if (c) x = 5; use(x)`, and it is
-                // also the one way this algorithm turns unsound: a value
-                // still `Top` at fixpoint that feeds a conditional branch
-                // marks *neither* successor executable, so both look
-                // unreachable and their side effects are deleted. Recovering
-                // from that needs an undef-resolve loop, which belongs in its
-                // own change with its own tests.
-                PseudoKind::Undef => Val::Bottom,
-
-                // Float constants are not in this lattice. Materializing a
-                // folded one needs a correctly sized `SetVal`, because both
-                // allocators default an `FVal` with no defining `SetVal` to
-                // 64 bits -- so a 32-bit float would be emitted at the wrong
-                // width. Until that exists, floats stay overdefined.
-                PseudoKind::FVal(_) => Val::Bottom,
-
-                _ => Val::Top,
-            };
-        }
-
-        // An inline-asm output is a second definition of its pseudo that
-        // invariant I1 deliberately exempts, so nothing else in the compiler
-        // will notice that the pseudo has two defs. Folding a use of one past
-        // the asm's write is a wrong value in exactly the code where a wrong
-        // value does the most damage.
-        for bb in &func.blocks {
-            for insn in &bb.insns {
-                if let Some(ref asm) = insn.extra().asm_data {
-                    for out in &asm.outputs {
-                        self.unfoldable.insert(out.pseudo);
-                        let idx = out.pseudo.0 as usize;
-                        if idx < self.vals.len() {
-                            self.vals[idx] = Val::Bottom;
-                        }
-                    }
-                }
-            }
-        }
-
-        // A block whose address is taken (`&&label`) is reachable by a route
-        // that has no CFG edge, so it must be seeded executable or its values
-        // would be treated as unreached.
-        let entry = func.entry;
-        self.mark_block(func, entry);
-        for bb in &func.blocks {
-            if bb.addr_taken {
-                self.mark_block(func, bb.id);
-            }
-        }
-    }
-
-    fn mark_block(&mut self, func: &Function, id: BasicBlockId) {
-        if !self.executable_block.insert(id) {
-            return;
-        }
-        let Some(idx) = func.block_index(id) else {
-            return;
-        };
-        // Re-evaluate everything in the newly reachable block.
-        for i in 0..func.blocks[idx].insns.len() {
-            self.eval_site(func, (idx, i));
-        }
-        // Edges this pass cannot see from the terminator alone. The same
-        // conservative default as the transfer function: what is not
-        // understood is assumed to happen. `asm goto` is the one that bites:
-        // its block ends in an ordinary `Br` to the fallthrough, and missing
-        // its labels would make the arms the assembly jumps to look
-        // unreachable. `children` has them all.
-        let modelled_terminator = matches!(
-            func.blocks[idx].insns.last().map(|i| i.op),
-            Some(Opcode::Br) | Some(Opcode::Cbr) | Some(Opcode::Switch) | Some(Opcode::IndirectBr)
-        );
-        if func.blocks[idx].has_asm_goto() || !modelled_terminator {
-            let block_id = func.blocks[idx].id;
-            for &succ in &func.blocks[idx].children {
-                self.mark_edge(block_id, succ);
-            }
-        }
-    }
-
-    fn mark_edge(&mut self, from: BasicBlockId, to: BasicBlockId) {
-        if self.executable_edge.insert((from, to)) {
-            self.cfg_worklist.push_back((from, to));
-        }
-    }
-
-    fn solve(&mut self, func: &Function) {
-        loop {
-            if let Some((_, to)) = self.cfg_worklist.pop_front() {
-                // A newly executable edge changes what the target's phis meet
-                // over, even when no value moved.
-                self.mark_block(func, to);
-                if let Some(idx) = func.block_index(to) {
-                    for i in 0..func.blocks[idx].insns.len() {
-                        if func.blocks[idx].insns[i].op == Opcode::Phi {
-                            self.eval_site(func, (idx, i));
-                        }
-                    }
-                }
-                continue;
-            }
-            if let Some(id) = self.ssa_worklist.pop_front() {
-                for site in self.uses.get(&id).cloned().unwrap_or_default() {
-                    if self.executable_block.contains(&func.blocks[site.0].id) {
-                        self.eval_site(func, site);
-                    }
-                }
-                continue;
-            }
-            break;
-        }
-    }
-
-    /// Evaluate one instruction: update its target's lattice value, and for a
-    /// terminator, mark the successor edges it can take.
-    fn eval_site(&mut self, func: &Function, (b, i): Site) {
-        let insn = &func.blocks[b].insns[i];
-        let block_id = func.blocks[b].id;
-
-        match insn.op {
-            Opcode::Br => {
-                if let Some(t) = insn.bb_true {
-                    self.mark_edge(block_id, t);
-                }
-                return;
-            }
-            Opcode::Cbr => {
-                let (Some(t), Some(f)) = (insn.bb_true, insn.bb_false) else {
-                    return;
-                };
-                match insn.src.first().map(|s| self.get(*s)) {
-                    Some(Val::Const(v)) => match cbr_taken(v) {
-                        Some(true) => self.mark_edge(block_id, t),
-                        Some(false) => self.mark_edge(block_id, f),
-                        // A width-ambiguous constant proves nothing.
-                        None => {
-                            self.mark_edge(block_id, t);
-                            self.mark_edge(block_id, f);
-                        }
-                    },
-                    // Still `Top` means not yet known; leave both unmarked
-                    // and come back when it lowers.
-                    Some(Val::Top) => {}
-                    _ => {
-                        self.mark_edge(block_id, t);
-                        self.mark_edge(block_id, f);
-                    }
-                }
-                return;
-            }
-            Opcode::Switch => {
-                match insn.src.first().map(|s| self.get(*s)) {
-                    Some(Val::Const(v)) => match switch_taken(insn, v) {
-                        Some(target) => self.mark_edge(block_id, target),
-                        None => self.mark_all_successors(func, b),
-                    },
-                    Some(Val::Top) => {}
-                    _ => self.mark_all_successors(func, b),
-                }
-                return;
-            }
-            Opcode::IndirectBr => {
-                self.mark_all_successors(func, b);
-                return;
-            }
-            _ => {}
-        }
-
-        let Some(target) = insn.target else {
-            return;
-        };
-        // A `Sym` target is storage being written, not a value being defined.
-        if self.unfoldable.contains(&target) {
-            return;
-        }
-        let v = self.transfer(insn, block_id);
-        self.set(target, v);
-    }
-
-    fn mark_all_successors(&mut self, func: &Function, b: usize) {
-        let block_id = func.blocks[b].id;
-        for &succ in &func.blocks[b].children {
-            self.mark_edge(block_id, succ);
+    fn constant(&self, _block: BasicBlockId, target: PseudoId) -> Option<i128> {
+        match self.get(target) {
+            Val::Const(v) => Some(v),
+            _ => None,
         }
     }
 
@@ -373,7 +133,7 @@ impl Solver {
             Opcode::Phi => {
                 let mut acc = Val::Top;
                 for (pred, incoming) in &insn.phi_list {
-                    if self.executable_edge.contains(&(*pred, block)) {
+                    if self.core.is_edge_executable(*pred, block) {
                         acc = acc.meet(self.get(*incoming));
                     }
                 }
@@ -421,7 +181,7 @@ impl Solver {
                 _ => Val::Bottom,
             },
 
-            _ if is_modelled_binop(insn.op) => {
+            _ if insn.op.is_int_arith() || insn.op.is_int_comparison() => {
                 if insn.src.len() != 2 {
                     return Val::Bottom;
                 }
@@ -457,117 +217,6 @@ impl Solver {
             _ => Val::Bottom,
         }
     }
-
-    /// Rewrite what the solution proves, returning whether anything changed.
-    fn apply(&mut self, func: &mut Function) -> bool {
-        let mut changed = false;
-        // One pseudo per distinct constant per run, so repeated folds do not
-        // inflate the pseudo table.
-        let mut minted: HashMap<i128, PseudoId> = HashMap::new();
-
-        // Values first: a folded condition is what lets the terminator below
-        // it fold in this same run.
-        for b in 0..func.blocks.len() {
-            if !self.executable_block.contains(&func.blocks[b].id) {
-                continue;
-            }
-            for i in 0..func.blocks[b].insns.len() {
-                changed |= self.fold_value(func, (b, i), &mut minted);
-            }
-        }
-
-        for b in 0..func.blocks.len() {
-            if !self.executable_block.contains(&func.blocks[b].id) {
-                continue;
-            }
-            changed |= self.fold_terminator(func, b);
-        }
-        changed
-    }
-
-    /// Replace an instruction whose result is a known constant with a `Copy`
-    /// of that constant.
-    fn fold_value(
-        &self,
-        func: &mut Function,
-        site: Site,
-        minted: &mut HashMap<i128, PseudoId>,
-    ) -> bool {
-        let Some(target) = func.blocks[site.0].insns[site.1].target else {
-            return false;
-        };
-        if self.unfoldable.contains(&target) {
-            return false;
-        }
-        let Val::Const(v) = self.get(target) else {
-            return false;
-        };
-        propagate::fold_target_to_const(func, site, v, minted)
-    }
-
-    /// Turn a conditional terminator whose outcome is known into a `Br`.
-    fn fold_terminator(&self, func: &mut Function, b: usize) -> bool {
-        let Some(insn) = func.blocks[b].insns.last() else {
-            return false;
-        };
-        let taken = match insn.op {
-            Opcode::Cbr => {
-                let (Some(t), Some(f)) = (insn.bb_true, insn.bb_false) else {
-                    return false;
-                };
-                let Val::Const(v) = insn
-                    .src
-                    .first()
-                    .map(|s| self.get(*s))
-                    .unwrap_or(Val::Bottom)
-                else {
-                    return false;
-                };
-                match cbr_taken(v) {
-                    Some(true) => t,
-                    Some(false) => f,
-                    None => return false,
-                }
-            }
-            Opcode::Switch => {
-                let Val::Const(v) = insn
-                    .src
-                    .first()
-                    .map(|s| self.get(*s))
-                    .unwrap_or(Val::Bottom)
-                else {
-                    return false;
-                };
-                match switch_taken(insn, v) {
-                    Some(t) => t,
-                    None => return false,
-                }
-            }
-            _ => return false,
-        };
-
-        propagate::retarget_terminator(func, b, taken)
-    }
-}
-
-/// Binary opcodes `constfold::eval_binop` knows.
-fn is_modelled_binop(op: Opcode) -> bool {
-    matches!(
-        op,
-        Opcode::Add
-            | Opcode::Sub
-            | Opcode::Mul
-            | Opcode::DivS
-            | Opcode::DivU
-            | Opcode::ModS
-            | Opcode::ModU
-            | Opcode::Shl
-            | Opcode::Lsr
-            | Opcode::Asr
-            | Opcode::And
-            | Opcode::Or
-            | Opcode::Xor
-    ) || op.is_int_comparison()
 }
 
 #[cfg(test)]
@@ -915,52 +564,6 @@ mod tests {
 
         run(&mut func);
         assert_eq!(func.blocks[0].insns[1].op, Opcode::Add);
-    }
-
-    /// A machine compare has no signedness, and the selector and the case
-    /// label are the same C type. Reading the selector *signed* made
-    /// `switch (3000000000u) { case 3000000000u: }` miss its own case.
-    #[test]
-    fn sccp_switch_matches_a_case_above_the_signed_range() {
-        let taken = switch_case_for(3_000_000_000i64, 3_000_000_000i128);
-        assert_eq!(taken, Some(BasicBlockId(7)), "the case must match itself");
-    }
-
-    #[test]
-    fn sccp_switch_falls_to_default_when_nothing_matches() {
-        assert_eq!(switch_case_for(5, 6), Some(BasicBlockId(9)));
-    }
-
-    #[test]
-    fn sccp_switch_matches_a_gnu_range() {
-        let mut insn = Instruction::new(Opcode::Switch);
-        insn.size = 32;
-        insn.extra_mut().switch_cases = vec![(30, 50, BasicBlockId(7))];
-        insn.extra_mut().switch_default = Some(BasicBlockId(9));
-        assert_eq!(switch_taken(&insn, 40), Some(BasicBlockId(7)));
-        assert_eq!(switch_taken(&insn, 51), Some(BasicBlockId(9)));
-        assert_eq!(switch_taken(&insn, 29), Some(BasicBlockId(9)));
-    }
-
-    /// A switch carrying a type has a width this pass cannot compute without
-    /// a `TypeTable`, so it must decline rather than guess.
-    #[test]
-    fn sccp_switch_with_a_type_is_left_alone() {
-        let types = TypeTable::new(&Target::host());
-        let mut insn = Instruction::new(Opcode::Switch);
-        insn.size = 32;
-        insn.typ = Some(types.int_id);
-        insn.extra_mut().switch_cases = vec![(5, 5, BasicBlockId(7))];
-        insn.extra_mut().switch_default = Some(BasicBlockId(9));
-        assert_eq!(switch_taken(&insn, 5), None);
-    }
-
-    fn switch_case_for(case: i64, selector: i128) -> Option<BasicBlockId> {
-        let mut insn = Instruction::new(Opcode::Switch);
-        insn.size = 32;
-        insn.extra_mut().switch_cases = vec![(case, case, BasicBlockId(7))];
-        insn.extra_mut().switch_default = Some(BasicBlockId(9));
-        switch_taken(&insn, selector)
     }
 
     /// An `asm goto` block ends in an ordinary `Br` to its fallthrough; the

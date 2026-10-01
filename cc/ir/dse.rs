@@ -221,23 +221,13 @@ fn may_read(
 
 /// Does `later` write every byte `earlier` wrote?
 fn covers(later: &MemLoc, earlier: &MemLoc) -> bool {
-    if later.base != earlier.base || later.base == MemBase::Unknown {
+    if later.base != earlier.base {
         return false;
     }
-    let (Some(lo), Some(eo)) = (later.offset, earlier.offset) else {
-        return false;
-    };
-    if later.size == 0 || earlier.size == 0 {
-        return false;
+    match (later.byte_extent(), earlier.byte_extent()) {
+        (Some((lo, lend)), Some((eo, eend))) => lo <= eo && eend <= lend,
+        _ => false,
     }
-    let (lb, eb) = (
-        later.size.div_ceil(8) as i64,
-        earlier.size.div_ceil(8) as i64,
-    );
-    let (Some(lend), Some(eend)) = (lo.checked_add(lb), eo.checked_add(eb)) else {
-        return false;
-    };
-    lo <= eo && eend <= lend
 }
 
 /// Which locals are never read again, at the end of each block.

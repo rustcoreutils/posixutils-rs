@@ -79,6 +79,17 @@ impl MemLoc {
     fn is_known(&self) -> bool {
         self.base != MemBase::Unknown
     }
+
+    /// The bytes accessed, as `[start, end)` from the base, when the base,
+    /// the displacement and the width are all known. A width that is not a
+    /// whole number of bytes still touches the byte it ends in.
+    pub(crate) fn byte_extent(&self) -> Option<(i64, i64)> {
+        if !self.is_known() || self.size == 0 {
+            return None;
+        }
+        let start = self.offset?;
+        Some((start, start.checked_add(self.size.div_ceil(8) as i64)?))
+    }
 }
 
 /// Every pseudo's unique defining instruction.
@@ -395,19 +406,10 @@ pub(crate) fn may_alias(a: &MemLoc, b: &MemLoc, mi: &ModuleInfo) -> bool {
         }
         // Same base: disjoint only when both extents are known and do not
         // overlap.
-        _ => {
-            let (Some(ao), Some(bo)) = (a.offset, b.offset) else {
-                return true;
-            };
-            if a.size == 0 || b.size == 0 {
-                return true;
-            }
-            let (abytes, bbytes) = (a.size.div_ceil(8) as i64, b.size.div_ceil(8) as i64);
-            let (Some(aend), Some(bend)) = (ao.checked_add(abytes), bo.checked_add(bbytes)) else {
-                return true;
-            };
-            ao < bend && bo < aend
-        }
+        _ => match (a.byte_extent(), b.byte_extent()) {
+            (Some((ao, aend)), Some((bo, bend))) => ao < bend && bo < aend,
+            _ => true,
+        },
     }
 }
 
@@ -435,6 +437,30 @@ mod tests {
     use super::*;
     use crate::ir::{BasicBlock, BasicBlockId, Pseudo};
     use crate::target::Target;
+
+    /// The extent every same-base comparison reads: a width ending part
+    /// way into a byte still touches that byte, and an extent that cannot be
+    /// stated is `None` rather than empty.
+    #[test]
+    fn byte_extent_counts_every_byte_touched() {
+        let at = |offset, size| MemLoc {
+            base: MemBase::Local(PseudoId(0)),
+            offset,
+            size,
+            typ: None,
+        };
+        assert_eq!(at(Some(4), 32).byte_extent(), Some((4, 8)));
+        assert_eq!(at(Some(4), 3).byte_extent(), Some((4, 5)));
+        assert_eq!(at(Some(4), 0).byte_extent(), None, "unknown width");
+        assert_eq!(at(None, 32).byte_extent(), None, "unknown offset");
+        assert_eq!(at(Some(i64::MAX), 8).byte_extent(), None, "overflow");
+        let anywhere = MemLoc {
+            offset: Some(0),
+            size: 8,
+            ..MemLoc::unknown()
+        };
+        assert_eq!(anywhere.byte_extent(), None, "unknown base");
+    }
 
     fn host_types() -> TypeTable {
         TypeTable::new(&Target::host())

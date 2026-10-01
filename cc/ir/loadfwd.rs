@@ -56,9 +56,7 @@
 use super::constfold::unambiguous_at;
 use super::dominate::{domtree_build, DomTree};
 use super::escape::EscapeInfo;
-use super::memloc::{
-    is_ordinary_object, is_same_access, may_alias, AddrMap, MemBase, MemLoc, ModuleInfo,
-};
+use super::memloc::{is_ordinary_object, is_same_access, may_alias, AddrMap, MemLoc, ModuleInfo};
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeTable};
 use std::cell::OnceCell;
@@ -581,12 +579,12 @@ fn narrowing(
 /// Which byte of the store `s` the one-byte access `b` is, counting from
 /// the store's lowest address; `None` unless `s` writes all of `b`.
 fn byte_index(s: &MemLoc, b: &MemLoc) -> Option<u32> {
-    if s.base == MemBase::Unknown || s.base != b.base || s.size == 0 || s.size % 8 != 0 {
+    if s.base != b.base || s.size % 8 != 0 {
         return None;
     }
-    let at = b.offset?.checked_sub(s.offset?)?;
-    let at = u32::try_from(at).ok()?;
-    (at < s.size / 8).then_some(at)
+    let (start, end) = s.byte_extent()?;
+    let at = b.offset?;
+    (start..end).contains(&at).then(|| (at - start) as u32)
 }
 
 /// Byte `at`, counting from the lowest address, of the `width`-byte integer
@@ -627,7 +625,7 @@ fn reachable(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::memloc::ModuleInfo;
+    use crate::ir::memloc::{MemBase, ModuleInfo};
     use crate::ir::{BasicBlock, Module, Pseudo, PseudoKind};
     use crate::target::Target;
 

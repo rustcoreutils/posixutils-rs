@@ -16,6 +16,7 @@ pub mod cfg;
 pub(crate) mod constfold;
 pub mod constglobal;
 pub mod copyprop;
+pub mod dataflow;
 pub mod dce;
 pub mod dominate;
 pub mod dse;
@@ -356,6 +357,27 @@ pub enum Opcode {
 }
 
 impl Opcode {
+    /// Integer binary arithmetic: what `constfold::eval_binop` evaluates
+    /// besides the comparisons.
+    pub fn is_int_arith(self) -> bool {
+        matches!(
+            self,
+            Opcode::Add
+                | Opcode::Sub
+                | Opcode::Mul
+                | Opcode::DivS
+                | Opcode::DivU
+                | Opcode::ModS
+                | Opcode::ModU
+                | Opcode::Shl
+                | Opcode::Lsr
+                | Opcode::Asr
+                | Opcode::And
+                | Opcode::Or
+                | Opcode::Xor
+        )
+    }
+
     /// An integer comparison: `seteq` .. `setae`, a 0-or-1 result.
     pub fn is_int_comparison(self) -> bool {
         matches!(

@@ -147,6 +147,95 @@ impl Optimization {
 /// Prevents infinite loops if passes keep making changes.
 const MAX_ITERATIONS: usize = 10;
 
+/// What the per-function passes share.
+struct PassCtx<'a> {
+    types: &'a TypeTable,
+    mi: &'a memloc::ModuleInfo,
+    fold: &'a libcall_fold::FoldCtx<'a>,
+}
+
+/// One per-function pass: its name, and a run that answers whether it
+/// changed the function.
+type Pass = (&'static str, fn(&mut Function, &PassCtx) -> bool);
+
+/// The fixed-point loop's passes, in order. The order is load-bearing: each
+/// pass hands the next one a shape it could not have seen for itself.
+const PASSES: [Pass; 10] = [
+    // `memexpand` ahead of all of them, so the loads and stores it makes of a
+    // length SCCP has only now proved constant are forwarded and killed in
+    // the same iteration.
+    ("memexpand", |f, c| memexpand::run(f, c.types)),
+    // `loadfwd`: turning a load into a copy of a stored value is what gives
+    // every pass below it something to fold, and a value that came out of
+    // memory is otherwise opaque to all of them. It does *gain* from a second
+    // iteration -- an index expression reaches it as
+    // `add %sym, (mul (sext 1) 4)` and only becomes a constant displacement
+    // once `instcombine` has folded the multiply -- which is why it sits
+    // inside the loop rather than ahead of it.
+    ("loadfwd", |f, c| loadfwd::run(f, c.types, c.mi)),
+    // `vrp` before `ifconv`, because it is the only pass that reads a
+    // *branch*: `var <= 0` being false says `var >= 1` on that edge, and
+    // `ifconv` collapses exactly that diamond into a `Select`, speculating
+    // the arm into a predecessor where `var` is unconstrained. Once that has
+    // happened the comparison is genuinely undecidable -- `var == 0` makes
+    // `(unsigned)(var - 1)` equal `UINT_MAX` -- so nothing downstream
+    // recovers it.
+    ("vrp", |f, _| vrp::run(f)),
+    // `ifconv` collapses a short-circuit diamond into a `Select` in one
+    // block, which is what makes the two relationals inside it comparable
+    // at all.
+    ("ifconv", |f, _| ifconv::run(f)),
+    // `sccp` proves branches dead, which `instcombine` cannot, and leaves
+    // behind `Copy` from a constant -- exactly the shape `instcombine`'s
+    // `ConstMap` follows.
+    ("sccp", |f, _| sccp::run(f)),
+    // `instcombine` inside the loop rather than once before it, because it
+    // derives constants SCCP structurally cannot (`x - x`, `x ^ x`), any of
+    // which can make a branch condition constant and send SCCP round again.
+    ("instcombine", |f, c| instcombine::run(f, c.types)),
+    // `libcall_fold` once the arguments are as constant as `sccp` and
+    // `instcombine` can make them; what it leaves -- a constant, a load of
+    // one byte, a `Select` -- is theirs and `loadfwd`'s next round.
+    ("libcall_fold", |f, c| libcall_fold::run(f, c.fold)),
+    // `copyprop` once everything above has made its copies, so that `dce`
+    // below collects the ones it leaves unused.
+    ("copyprop", |f, c| copyprop::run(f, c.types)),
+    // `dse` before `dce`, so the value chain feeding a killed store is swept
+    // in the same iteration rather than surviving to the next one.
+    ("dse", |f, c| dse::run(f, c.types, c.mi)),
+    // `dce` last: SCCP removes a dead edge but deletes no block, and leaves
+    // the `PhiSource` of a folded phi for `dce` to collect.
+    ("dce", |f, _| dce::run(f)),
+];
+
+/// How a function's fixed-point loop went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Convergence {
+    pub function: String,
+    pub iterations: usize,
+    /// How many iterations each pass changed the function in, by its
+    /// position in `PASSES`.
+    pub changes: [u32; PASSES.len()],
+    /// The passes that changed the function in the last iteration: empty
+    /// when the loop reached its fixed point, and otherwise what was still
+    /// moving when it was cut off.
+    pub still_changing: Vec<&'static str>,
+}
+
+impl Convergence {
+    pub fn converged(&self) -> bool {
+        self.still_changing.is_empty()
+    }
+}
+
+/// What the optimizer did, for the functions worth reporting.
+#[derive(Debug, Default)]
+pub struct OptReport {
+    /// Functions whose loop ran out of iterations before its fixed point.
+    /// What is left is correct, only less optimized than it could be.
+    pub unconverged: Vec<Convergence>,
+}
+
 // Pass Runner
 
 /// Whether `func` names its caller's variadic arguments -- that is, whether
@@ -245,7 +334,12 @@ fn check_forwarding_resolved(module: &Module) {
 /// Level 0: `__attribute__((always_inline))` inlining, then `memexpand`
 /// Level 1+: inlining and `memexpand`, then the per-function passes below to
 /// fixed point
-pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization, target: &Target) {
+pub fn optimize_module(
+    module: &mut Module,
+    types: &TypeTable,
+    opt: Optimization,
+    target: &Target,
+) -> OptReport {
     // Phase 1: Function inlining (module-level pass)
     // This inlines small functions at their call sites and removes
     // dead static functions that were fully inlined.
@@ -274,7 +368,7 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
     }
 
     if !opt.optimizes() {
-        return;
+        return OptReport::default();
     }
 
     // Phase 2: a module pre-pass, before anything looks at a value: every
@@ -282,8 +376,19 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
     // below then treat as the constant it is.
     constglobal::run(module, types);
 
-    // Phase 3: module-wide facts the memory passes need. Built after
-    // inlining, so the call graph and the set of globals are final.
+    optimize_functions(module, types, target, MAX_ITERATIONS)
+}
+
+/// Run the per-function passes over every function, each for at most
+/// `max_iterations` rounds.
+fn optimize_functions(
+    module: &mut Module,
+    types: &TypeTable,
+    target: &Target,
+    max_iterations: usize,
+) -> OptReport {
+    // Module-wide facts the memory passes need. Built after inlining, so the
+    // call graph and the set of globals are final.
     let mi = memloc::ModuleInfo::build(module, types);
     let bytes = ConstBytes::build(module, types);
     let literals = libcall_fold::NewLiterals::new(&module.strings);
@@ -295,100 +400,109 @@ pub fn optimize_module(module: &mut Module, types: &TypeTable, opt: Optimization
         callees: &module.library_symbols,
         literals: &literals,
     };
-
-    // Phase 4: Per-function optimization
+    let ctx = PassCtx {
+        types,
+        mi: &mi,
+        fold: &fold,
+    };
+    let mut report = OptReport::default();
     for func in &mut module.functions {
-        optimize_function(func, types, &mi, &fold);
+        let c = optimize_function(func, &ctx, max_iterations);
+        if !c.converged() {
+            report.unconverged.push(c);
+        }
     }
     let added = literals.into_added();
     module.strings.extend(added);
+    report
 }
 
-/// Optimize a single function by running passes until fixed point.
-fn optimize_function(
-    func: &mut Function,
-    types: &TypeTable,
-    mi: &memloc::ModuleInfo,
-    fold: &libcall_fold::FoldCtx,
-) {
-    for _ in 0..MAX_ITERATIONS {
-        // The order is load-bearing, and each pass hands the next one a
-        // shape it could not have seen for itself.
-        //
-        // `vrp` first, because it is the only pass that reads a *branch*:
-        // `var <= 0` being false says `var >= 1` on that edge, and `ifconv`
-        // collapses exactly that diamond into a `Select`, speculating the
-        // arm into a predecessor where `var` is unconstrained. Once that has
-        // happened the comparison is genuinely undecidable -- `var == 0`
-        // makes `(unsigned)(var - 1)` equal `UINT_MAX` -- so nothing
-        // downstream recovers it.
-        //
-        // `ifconv` next: it collapses a short-circuit diamond into a
-        // `Select` in one block, which is what makes the two relationals
-        // inside it comparable at all.
-        //
-        // `sccp` next: it proves branches dead, which `instcombine` cannot,
-        // and leaves behind `Copy` from a constant -- exactly the shape
-        // `instcombine`'s `ConstMap` follows.
-        //
-        // `instcombine` after it, and inside the loop rather than once
-        // before it, because it derives constants SCCP structurally cannot
-        // (`x - x`, `x ^ x`), any of which can make a branch condition
-        // constant and send SCCP round again.
-        //
-        // `dce` last: SCCP removes a dead edge but deletes no block, and
-        // leaves the `PhiSource` of a folded phi for `dce` to collect.
-        // `loadfwd` first: turning a load into a copy of a stored value is
-        // what gives every pass below it something to fold, and a value that
-        // came out of memory is otherwise opaque to all of them. It does
-        // *gain* from a second iteration -- an index expression reaches it as
-        // `add %sym, (mul (sext 1) 4)` and only becomes a constant
-        // displacement once `instcombine` has folded the multiply -- which is
-        // why it sits inside the loop rather than ahead of it.
-        // `memexpand` ahead of all of them, so the loads and stores it makes
-        // of a length SCCP has only now proved constant are forwarded and
-        // killed in the same iteration.
-        let mx_changed = memexpand::run(func, types);
-        let lf_changed = loadfwd::run(func, types, mi);
-        let vrp_changed = vrp::run(func);
-        let ifc_changed = ifconv::run(func);
-        let sccp_changed = sccp::run(func);
-        let ic_changed = instcombine::run(func, types);
-        // `libcall_fold` once the arguments are as constant as `sccp` and
-        // `instcombine` can make them; what it leaves -- a constant, a load
-        // of one byte, a `Select` -- is theirs and `loadfwd`'s next round.
-        let lf_fold_changed = libcall_fold::run(func, fold);
-        // `copyprop` once everything above has made its copies, so that
-        // `dce` below collects the ones it leaves unused.
-        let cp_changed = copyprop::run(func, types);
-        // `dse` before `dce`, so the value chain feeding a killed store is
-        // swept in the same iteration rather than surviving to the next one.
-        let dse_changed = dse::run(func, types, mi);
-        let dce_changed = dce::run(func);
-        // Every pass above skips the `Nop`s the others leave, and they only
+/// Optimize a single function by running `PASSES` until none changes it, or
+/// for `max_iterations` rounds.
+fn optimize_function(func: &mut Function, ctx: &PassCtx, max_iterations: usize) -> Convergence {
+    let mut c = Convergence {
+        function: func.name.clone(),
+        iterations: 0,
+        changes: [0; PASSES.len()],
+        still_changing: Vec::new(),
+    };
+    for _ in 0..max_iterations {
+        c.iterations += 1;
+        c.still_changing.clear();
+        for (i, (name, run)) in PASSES.iter().enumerate() {
+            if run(func, ctx) {
+                c.changes[i] += 1;
+                c.still_changing.push(name);
+            }
+        }
+        // Every pass skips the `Nop`s the others leave, and they only
         // accumulate; nothing refers to an instruction by position across
         // passes, so they can go.
         func.remove_nops();
-
-        if !mx_changed
-            && !lf_changed
-            && !vrp_changed
-            && !ifc_changed
-            && !sccp_changed
-            && !ic_changed
-            && !lf_fold_changed
-            && !cp_changed
-            && !dse_changed
-            && !dce_changed
-        {
+        if c.still_changing.is_empty() {
             break;
         }
     }
+    c
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::{BasicBlock, BasicBlockId, Instruction, Opcode, Pseudo, PseudoId};
+
+    /// `entry: cbr 1, .L1, .L2`, each arm returning: one round folds the
+    /// branch and deletes the dead arm, and a second finds nothing left.
+    fn module_with_a_constant_branch(types: &TypeTable) -> Module {
+        let mut func = Function::new("f", types.int_id);
+        func.add_pseudo(Pseudo::val(PseudoId(1), 1));
+        func.next_pseudo = 2;
+        let (entry, then, els) = (BasicBlockId(0), BasicBlockId(1), BasicBlockId(2));
+        let mut b0 = BasicBlock::new(entry);
+        b0.add_insn(Instruction::new(Opcode::Entry));
+        b0.add_insn(Instruction::cbr(PseudoId(1), then, els));
+        b0.children = vec![then, els];
+        func.add_block(b0);
+        for id in [then, els] {
+            let mut b = BasicBlock::new(id);
+            b.add_insn(Instruction::ret(None));
+            b.parents = vec![entry];
+            func.add_block(b);
+        }
+        func.entry = entry;
+        let mut module = Module::default();
+        module.functions.push(func);
+        module
+    }
+
+    /// A loop cut off by its iteration cap says so, and names what was still
+    /// moving; one that reaches its fixed point is not reported at all.
+    #[test]
+    fn optimizer_reports_a_function_it_could_not_finish() {
+        let target = Target::host();
+        let types = TypeTable::new(&target);
+
+        let mut cut_short = module_with_a_constant_branch(&types);
+        let report = optimize_functions(&mut cut_short, &types, &target, 1);
+        let [c] = report.unconverged.as_slice() else {
+            panic!("one function cut short, got {:?}", report.unconverged);
+        };
+        assert_eq!(c.function, "f");
+        assert_eq!(c.iterations, 1);
+        assert!(!c.converged());
+        assert!(
+            c.still_changing.contains(&"dce"),
+            "the dead arm was deleted in the last round: {:?}",
+            c.still_changing
+        );
+        let total: u32 = c.changes.iter().sum();
+        assert_eq!(total as usize, c.still_changing.len());
+
+        let mut finished = module_with_a_constant_branch(&types);
+        let report = optimize_functions(&mut finished, &types, &target, MAX_ITERATIONS);
+        assert!(report.unconverged.is_empty(), "{:?}", report.unconverged);
+        assert_eq!(finished.functions[0].blocks.len(), 2);
+    }
 
     /// The spellings GCC and Clang accept, and what each means here.
     #[test]

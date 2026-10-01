@@ -1749,3 +1749,44 @@ unsigned hash(const char *s) { unsigned h = 5381; while (*s) h = h * 33 + (unsig
     );
     assert_eq!(compile_and_run_optimized("copyprop_run", &run), 0);
 }
+
+/// Each `strlen` below folds only once the `printf` guarding the one before
+/// it is proved dead and deleted -- the call sees the array, so it stands
+/// between the two -- which makes a chain one fold per round of the
+/// optimizer's loop, longer than its iteration cap. A function cut off there
+/// is less optimized, never wrong; and one that does reach its fixed point is
+/// not reported under `--dump-ir`.
+#[test]
+fn memopt_a_function_cut_off_by_the_iteration_cap_is_still_correct() {
+    let check = "{ const char *s = (E); unsigned n = __builtin_strlen(s); \
+                 if (n != N) { __builtin_printf(\"%s\\n\", s); ++fails; } }";
+    let mut body = String::new();
+    for k in 0..16 {
+        let step = check
+            .replace('E', &format!("&a[{}]", k % 4))
+            .replace('N', &(4 - k % 4).to_string());
+        body.push_str(&step);
+        body.push('\n');
+    }
+    let src = format!(
+        "unsigned fails;\n\
+         static void chain(void) {{\n\
+         const char a[] = \"1234\";\n\
+         {body}}}\n\
+         int main(void) {{ chain(); return fails != 0; }}\n"
+    );
+    assert_eq!(at_o2("itercap", &src), 0);
+    if let Some(rc) = compile_and_run_aarch64("itercap", &src, "-O2") {
+        assert_eq!(rc, 0, "aarch64");
+    }
+
+    let ir = post_opt_ir(
+        "itercap_note",
+        "int f(int x) { return x + 1; }\n",
+        X86_64_LINUX,
+    );
+    assert!(
+        !ir.contains("did not reach a fixed point"),
+        "a converged function is not reported:\n{ir}"
+    );
+}

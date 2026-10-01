@@ -6,7 +6,6 @@ c17 implements **C17 (ISO/IEC 9899:2018) only**, plus selected GNU extensions, t
 
 References:
 - [ISO/IEC 9899:2011 (C11)](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf) — C17 is this plus defect reports; the published C17 text is not free
-- Conformance findings and known divergences: git history; see [Conformance](#conformance) below
 
 ## Documents
 
@@ -17,29 +16,6 @@ References:
 | [TODO.md](TODO.md) | Outstanding work only -- technical debt, optimization passes, torture-suite status |
 | [DECISIONS.md](DECISIONS.md) | Settled choices and deliberate divergences from gcc. Not a backlog |
 | [ir/README.md](ir/README.md) | IR structure and the pass pipeline |
-
-## Conformance
-
-There is no open conformance punch list: `cc/audit.md` was retired when its
-last gap closed, under the rule in the repository's `audits.md` that a crate
-keeps an audit file only while it still has an open item. Every finding, every
-CONFORMS row and every probe is in git history — `git log --follow -- cc/audit.md`
-recovers the file, and `git log --grep '#C116'` finds one finding by number, in
-the commit that fixed it.
-
-Two things that file established are worth keeping in front of you:
-
-**Scope.** Conformance means POSIX.1-2024 and the ISO C standard it
-incorporates, and nothing else. Engineering debt that is *not* a conformance
-question belongs in [TODO.md](TODO.md) or [DECISIONS.md](DECISIONS.md) — `_FORTIFY_SOURCE` is in the latter because
-it, `__builtin_object_size` and the `_chk` family appear nowhere in
-POSIX.1-2024, and filing it as a conformance gap overstated what it was.
-
-**How a conformance claim is established.** By probing the built binary against
-the spec slice — not by reading the source, and not by trusting an earlier
-write-up. Several findings were originally written from a premise that a probe
-then disproved, and every unprobed ISO C row that got re-probed turned out to
-be wrong.
 
 ## Quick start
 
@@ -63,53 +39,25 @@ Source → Lexer → Preprocessor → Parser → Type Check → Linearize
        → Lower (φ → copies) → Codegen → Assembly
 ```
 
-Key source files:
+Key source files, in pipeline order -- where the central data structures,
+algorithms and contracts live:
 
 | File / Dir | Purpose |
 |------------|---------|
-| `main.rs` | Driver CLI (c17 binary): arg parsing, pipeline orchestration, dump-ir stages |
-| `lib.rs` | Library entry point (re-exports for tests) |
-| `token/lexer.rs` | Tokenization |
-| `token/preprocess.rs` | C preprocessor (`#include`, `#define`, `#ifdef`, …) |
-| `parse/parser.rs` | Recursive descent parser producing AST |
-| `parse/expression.rs` | Expression parsing and constant-expression evaluation |
-| `parse/ast.rs` | AST node definitions |
-| `types.rs` | C type system |
-| `constexpr.rs` | Integer constant-expression folding, shared by the parser and the linearizer |
-| `float.rs` | Wide floating-point literals and target-width conversion |
-| `strings.rs` | String interning (`StringId`); pre-interns keywords at startup |
-| `kw.rs` | Pre-interned keyword constants and tag-based classification |
-| `symbol.rs` | Symbol table with scope management |
-| `target.rs` | Target triple, pointer/long widths, predefined macros |
-| `builtins.rs`, `builtin_headers.rs` | `__builtin_*` recognition and bundled headers |
-| `include/` | Bundled freestanding headers (`stdarg.h`, `stdatomic.h`, `float.h`, …) |
-| `diag.rs` | Diagnostics, source-stream tracking, error/warning counts |
-| `rtlib.rs` | Runtime library helpers (libgcc / compiler-rt selection) |
-| `linkargs.rs` | Link-line construction, preserving the order `-L`/`-l`/operands were given in |
-| `ppargs.rs` | `-D`/`-U`/`-I` ordering for the tools that need it |
-| `tools.rs` | Shared exit-status handling for `cflow`/`ctags`/`cxref` |
-| `os/` | OS-specific knobs (linux, macos, freebsd) |
-| `abi/` | Per-ABI classification: `sysv_amd64.rs`, `aapcs64.rs` |
-| `ir/mod.rs` | IR definitions (opcodes, pseudos, instructions, functions). See [ir/README.md](ir/README.md) |
-| `ir/linearize.rs` (+ `_init.rs`, `_stmt.rs`, `_emit.rs`, `_atomic.rs`) | AST → IR conversion, SSA construction |
-| `ir/mem2reg.rs` | Promotion of address-free locals to registers |
-| `ir/tls.rs` | Thread-local access expansion (dynamic model) |
-| `ir/validate.rs` | IR invariant checks |
-| `ir/mach_o_dtors.rs` | Mach-O destructor registration |
-| `ir/ssa.rs` | φ-node insertion |
-| `ir/dominate.rs` | Dominator tree and dominance frontiers (Cooper) |
-| `ir/dce.rs` | Dead code elimination |
-| `ir/instcombine.rs` | Constant folding and algebraic simplification |
-| `ir/inline.rs` | Function inlining |
-| `ir/lower.rs` | IR lowering (φ elimination to copies) |
-| `opt.rs` | Optimization pass driver (`InstCombine` + `DCE` to fixed point, after inlining) |
-| `arch/mapping.rs` | Target-neutral hardware mapping (int128 expansion, ABI shaping) |
-| `arch/regalloc.rs` | Register allocation framework (shared) |
-| `arch/lir.rs` | Low-level IR (LIR) definitions |
-| `arch/codegen.rs`, `arch/dwarf.rs` | Common codegen helpers, DWARF emission |
-| `arch/x86_64/` | x86-64 code generator (incl. x87 long-double in `x87.rs`) |
-| `arch/aarch64/` | AArch64 code generator |
-| `cflow.rs`, `ctags.rs`, `cxref.rs` | POSIX `cflow` / `ctags` / `cxref` tools sharing the parser |
+| `main.rs` | Driver: the pipeline above, stage by stage, with the IR verified between stages |
+| `token/preprocess.rs` | The preprocessor: macro expansion with hide sets, `#include`, conditionals |
+| `parse/parser.rs`, `parse/ast.rs` | Recursive-descent parser and the AST it builds |
+| `types.rs` | The C type system: interned `TypeId`s, layout, bit-field placement, qualifiers |
+| `ir/mod.rs` | IR data structures -- opcodes, pseudos, instructions, blocks, functions. See [ir/README.md](ir/README.md) |
+| `ir/linearize.rs` | AST to IR: control flow, lvalues, initializers, lifetime markers |
+| `ir/ssa.rs`, `ir/dominate.rs` | SSA construction: phis at the iterated dominance frontier (Sreedhar-Gao), renaming |
+| `ir/cfg.rs`, `ir/validate.rs` | Every CFG edit, critical-edge splitting, CFG simplification; the IR invariants every stage is checked against |
+| `opt.rs` | The optimizer: the pass order, and why each pass sits where it does |
+| `ir/dataflow.rs` | The sparse conditional solver (Wegman-Zadeck) behind `sccp` and `vrp` |
+| `ir/memloc.rs`, `ir/loadfwd.rs` | Memory analysis: what an access addresses, what may alias, and what a location holds at a point |
+| `abi/` | Calling-convention classification (System V AMD64, AAPCS64) |
+| `arch/regalloc.rs` | Shared register allocation: liveness, local lifetimes and slot sharing, spill slots |
+| `arch/x86_64/`, `arch/aarch64/` | Code generators: instruction selection, frames, calls, inline asm |
 
 ## Debugging
 
@@ -186,10 +134,16 @@ Will not implement:
   as c17 does — it describes the target, not the header set. See [DECISIONS.md](DECISIONS.md)
 - `__auto_type`; nested functions and `__label__`. Clang refuses nested
   functions too, and they need executable-stack trampolines
-- `_Imaginary` types. Optional in C99, C11 and C17 alike -- never removed,
-  as this line used to claim. Neither gcc nor clang implements them: gcc
-  rejects `_Imaginary double x;` outright and leaves `_Imaginary_I` undefined,
-  while still defining `__STDC_IEC_559_COMPLEX__`.
+- `_Imaginary` types, beyond what C17 requires of an implementation without
+  them. They belong to Annex G, which binds only an implementation defining
+  `__STDC_IEC_559_COMPLEX__`; c17 does not define it, so what remains is that
+  `_Imaginary` is a keyword, that using it is diagnosed (it is no permitted
+  type specifier, C17 6.7.2p2), and that `imaginary` and `_Imaginary_I` are
+  left undefined (POSIX `<complex.h>`). Few compilers support the types --
+  gcc rejects them, though glibc's `<stdc-predef.h>` defines
+  `__STDC_IEC_559_COMPLEX__` for it -- and real code that needs them would
+  reopen this. The GNU imaginary constant suffix (`2i`) is supported; it gives
+  a `_Complex` value with a zero real part.
 
 Off by default:
 - Trigraphs. They were deprecated in C99 but **not removed until C23**, so C17

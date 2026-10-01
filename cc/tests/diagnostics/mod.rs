@@ -2572,6 +2572,10 @@ fn diagnostics_sizeof_of_an_incomplete_type_is_rejected() {
             "sz_undef_union",
             "union U;\nint main(void){ return (int)sizeof(union U); }\n",
         ),
+        (
+            "sz_undef_enum",
+            "enum E;\nint main(void){ return (int)sizeof(enum E); }\n",
+        ),
     ] {
         compile_expect_error(name, src, "incomplete type");
     }
@@ -2606,6 +2610,10 @@ fn diagnostics_sizeof_of_complete_types_is_accepted() {
     compile_expect_ok(
         "sz_defined_struct",
         "struct S { int a; };\nint main(void){ return (int)sizeof(struct S) - 4; }\n",
+    );
+    compile_expect_ok(
+        "sz_completed_enum",
+        "enum E;\nenum E { A };\nint main(void){ return (int)sizeof(enum E) - 4; }\n",
     );
     // GNU extensions gcc accepts, both giving 1.
     compile_expect_ok(

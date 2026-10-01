@@ -2951,6 +2951,8 @@ aarch64/compile/pr48734@-O0
 aarch64/compile/pr48734@-O2
 aarch64/compile/pr48742@-O0
 aarch64/compile/pr48742@-O2
+aarch64/compile/pr48767@-O0
+aarch64/compile/pr48767@-O2
 aarch64/compile/pr48929@-O0
 aarch64/compile/pr48929@-O2
 aarch64/compile/pr49029@-O0

@@ -94,6 +94,11 @@ Checked by gcc's own rules, in its words, with the shared helpers of
   constant size;
 - `__builtin_va_start` requires a variadic function (an error), and warns
   (`-Wvarargs`) when `last` is not its last named parameter;
+- `__builtin_va_arg`'s type must be a complete object type
+  (`check_va_arg_type`): an incomplete type (`type_name_is_incomplete`, the
+  predicate `sizeof` uses) or a function type is an error, and `_Bool`,
+  `char`, `short` or `float`, which the default argument promotions change,
+  a warning;
 - `__builtin_choose_expr` requires a constant first argument;
 - `__builtin_frame_address`/`__builtin_return_address` require a
   non-negative integer constant;
@@ -118,6 +123,8 @@ Where c17 still differs from gcc:
   count is a parse error (`expected ')'`), and their argument types are not
   checked -- `__builtin_va_start`'s `last` must be an identifier, and the
   `__c11_atomic_*` builtins (clang's; gcc has none) take anything.
+- gcc compiles a `__builtin_va_arg` of a promoted type to a trap; c17 only
+  warns, and reads the argument as though it had that type.
 - No memory-order argument is checked; gcc warns about one out of range and
   rejects one that is not an integer.
 
@@ -127,7 +134,7 @@ Where c17 still differs from gcc:
 |---------|-------------|
 | `__builtin_va_list` | Platform-specific `va_list` type (a type keyword) |
 | `__builtin_va_start(ap, last)` | `Opcode::VaStart`. `last` must be an identifier. In a function that is not variadic it is an error, and a `last` that is not the last named parameter a warning, as in gcc |
-| `__builtin_va_arg(ap, type)` | `Opcode::VaArg`; an aggregate or complex result gets a frame temporary |
+| `__builtin_va_arg(ap, type)` | `Opcode::VaArg`; an aggregate or complex result gets a frame temporary. An incomplete or function type is an error, and a type the default argument promotions change a warning, as in gcc (see Argument checking) |
 | `__builtin_va_end(ap)` | `Opcode::VaEnd` |
 | `__builtin_va_copy(dest, src)` | `Opcode::VaCopy` |
 | `__builtin_va_arg_pack()` | The caller's variadic arguments, spliced in by the inliner. Only in an `always_inline` variadic function (an error otherwise), and only as the last argument of a call (linearizer error otherwise) |

@@ -9055,7 +9055,8 @@ fn test_check_argument_count_bounds() {
 /// stands in, so nothing downstream sees an operand it cannot handle.
 #[test]
 fn test_rejected_builtin_calls_are_a_typed_zero() {
-    let decls = "int i; double d; _Bool b; char *p; struct S { int a; } s;";
+    let decls = "int i; double d; _Bool b; char *p; struct S { int a; } s;\
+                 struct I; __builtin_va_list ap;";
     for (stmt, typ) in [
         ("__builtin_isnan(i)", TypeKind::Int),
         ("__builtin_fpclassify(i, 1, 2, 3, 4, d)", TypeKind::Int),
@@ -9070,6 +9071,10 @@ fn test_rejected_builtin_calls_are_a_typed_zero() {
         ("__atomic_load_n(i, 0)", TypeKind::Int),
         ("__atomic_always_lock_free(i, 0)", TypeKind::Bool),
         ("__builtin_alloca(s)", TypeKind::Pointer),
+        ("__builtin_va_arg(ap, void)", TypeKind::Int),
+        ("__builtin_va_arg(ap, struct I)", TypeKind::Int),
+        ("__builtin_va_arg(ap, int[])", TypeKind::Int),
+        ("__builtin_va_arg(ap, int(void))", TypeKind::Int),
     ] {
         let before = crate::diag::error_count();
         with_statement_expr(decls, stmt, |p, e| {
@@ -9084,6 +9089,37 @@ fn test_rejected_builtin_calls_are_a_typed_zero() {
                 "{stmt}: built {:?}",
                 e.kind
             );
+        });
+    }
+}
+
+/// `va_arg` takes any complete object type (C17 7.16.1.1p2) -- an array, a
+/// pointer to a variably modified one, a defined tag, a type the default
+/// argument promotions change (gcc only warns) -- and yields a value of it.
+#[test]
+fn test_va_arg_of_a_complete_object_type_is_built() {
+    let decls = "struct S { int a; } s; enum E { A }; struct I; __builtin_va_list ap; int n;";
+    for (stmt, typ) in [
+        ("__builtin_va_arg(ap, int[3])", TypeKind::Array),
+        ("__builtin_va_arg(ap, int(*)[n])", TypeKind::Pointer),
+        ("__builtin_va_arg(ap, struct S)", TypeKind::Struct),
+        ("__builtin_va_arg(ap, struct I *)", TypeKind::Pointer),
+        ("__builtin_va_arg(ap, enum E)", TypeKind::Enum),
+        ("__builtin_va_arg(ap, char)", TypeKind::Char),
+        ("__builtin_va_arg(ap, float)", TypeKind::Float),
+    ] {
+        with_statement_expr(decls, stmt, |p, e| {
+            // A variably modified type-name's extents wrap the value.
+            let value = match &e.kind {
+                ExprKind::VmTypeName { expr, .. } => expr,
+                _ => e,
+            };
+            assert!(
+                matches!(value.kind, ExprKind::VaArg { .. }),
+                "{stmt}: built {:?}",
+                e.kind
+            );
+            assert_eq!(p.types.kind(e.typ.unwrap()), typ, "{stmt}: type");
         });
     }
 }

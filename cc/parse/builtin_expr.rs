@@ -334,8 +334,12 @@ impl Parser<'_> {
                 let ap = self.parse_assignment_expr()?;
                 self.expect_special(b',')?;
                 // Second arg is a type, whose extents the value carries.
+                let type_pos = self.current_pos();
                 let (arg_type, dims) = self.parse_type_name_vm()?;
                 self.expect_special(b')')?;
+                if !self.check_va_arg_type(arg_type, dims.len(), type_pos) {
+                    return Ok(self.diagnosed_call(self.types.int_id, token_pos));
+                }
                 let value = Self::typed_expr(
                     ExprKind::VaArg {
                         ap: Box::new(ap),
@@ -394,6 +398,46 @@ impl Parser<'_> {
             diag::warning(
                 last_pos,
                 &gettext("second parameter of 'va_start' not last named argument"),
+            );
+        }
+        true
+    }
+
+    /// gcc's rules for `__builtin_va_arg(ap, type)`: the type must be a
+    /// complete object type (C17 7.16.1.1p2), so an incomplete or function
+    /// type is an error; one the default argument promotions change can
+    /// never match what a caller passed, a warning. `false` once the error is
+    /// reported. Types are named unqualified, as gcc names them.
+    fn check_va_arg_type(&mut self, typ: TypeId, extents: usize, pos: Position) -> bool {
+        let typ = self.types.unqualified(typ);
+        let named = self.types.format_type(typ, Some(self.idents));
+        if self.types.kind(typ) == TypeKind::Function {
+            diag::error_args(
+                pos,
+                "second argument to 'va_arg' is a function type '{0}'",
+                &[&named],
+            );
+            return false;
+        }
+        if self.type_name_is_incomplete(typ, extents) {
+            diag::error_args(
+                pos,
+                "second argument to 'va_arg' is of incomplete type '{0}'",
+                &[&named],
+            );
+            return false;
+        }
+        let promoted = self.types.default_argument_promote(typ);
+        let promotes = matches!(
+            self.types.kind(typ),
+            TypeKind::Bool | TypeKind::Char | TypeKind::Short | TypeKind::Float
+        );
+        if promotes && promoted != typ {
+            let promoted = self.types.format_type(promoted, Some(self.idents));
+            diag::warning_args(
+                pos,
+                "'{0}' is promoted to '{1}' when passed through '...'",
+                &[&named, &promoted],
             );
         }
         true

@@ -523,3 +523,72 @@ int main(void) {
 "#;
     compile_and_run_everywhere("argchk_semantics", src);
 }
+
+/// `va_arg`'s type must be a complete object type (C17 7.16.1.1p2), and gcc
+/// rejects `void` and an incomplete structure outright; c17 accepted both.
+#[test]
+fn builtins_va_arg_of_an_incomplete_type_is_rejected() {
+    compile_expect_error(
+        "va_arg_void",
+        "void f(__builtin_va_list ap) { __builtin_va_arg(ap, void); }\n",
+        "second argument to 'va_arg' is of incomplete type 'void'",
+    );
+    compile_expect_error(
+        "va_arg_incomplete",
+        "struct I; void f(__builtin_va_list ap) { __builtin_va_arg(ap, struct I); }\n",
+        "second argument to 'va_arg' is of incomplete type 'struct I'",
+    );
+    compile_expect_error(
+        "va_arg_incomplete_enum",
+        "enum E; void f(__builtin_va_list ap) { __builtin_va_arg(ap, enum E); }\n",
+        "second argument to 'va_arg' is of incomplete type 'enum E'",
+    );
+    compile_expect_error(
+        "va_arg_incomplete_array",
+        "void f(__builtin_va_list ap) { __builtin_va_arg(ap, int[]); }\n",
+        "second argument to 'va_arg' is of incomplete type 'int[]'",
+    );
+    // gcc names the type unqualified.
+    compile_expect_error(
+        "va_arg_const_void",
+        "void f(__builtin_va_list ap) { __builtin_va_arg(ap, const void); }\n",
+        "second argument to 'va_arg' is of incomplete type 'void'",
+    );
+    compile_expect_error(
+        "va_arg_function",
+        "void f(__builtin_va_list ap) { __builtin_va_arg(ap, int(void)); }\n",
+        "second argument to 'va_arg' is a function type 'int(void)'",
+    );
+}
+
+/// A type the default argument promotions change is never what a caller
+/// passed through `...`, and gcc warns; a complete array, a pointer to a
+/// variably modified array, an enumeration and a complex `float` are taken
+/// without a word.
+#[test]
+fn builtins_va_arg_of_a_promoted_type_warns() {
+    compile_expect_warning(
+        "va_arg_char",
+        "void f(__builtin_va_list ap) { __builtin_va_arg(ap, const char); }\n",
+        "'char' is promoted to 'int' when passed through '...'",
+    );
+    compile_expect_warning(
+        "va_arg_float",
+        "void f(__builtin_va_list ap) { __builtin_va_arg(ap, float); }\n",
+        "'float' is promoted to 'double' when passed through '...'",
+    );
+    compile_expect_warning(
+        "va_arg_bool",
+        "void f(__builtin_va_list ap) { __builtin_va_arg(ap, _Bool); }\n",
+        "'_Bool' is promoted to 'int' when passed through '...'",
+    );
+    compile_expect_no_diagnostic(
+        "va_arg_unpromoted",
+        "enum G { Z };\n\
+         void f(int n, __builtin_va_list ap) {\n\
+             __builtin_va_arg(ap, int[3]); __builtin_va_arg(ap, int(*)[n]);\n\
+             __builtin_va_arg(ap, enum G); __builtin_va_arg(ap, float _Complex);\n\
+         }\n",
+        "promoted",
+    );
+}

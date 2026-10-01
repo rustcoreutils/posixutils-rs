@@ -1169,12 +1169,27 @@ impl<'a> Parser<'a> {
         );
     }
 
-    fn check_sizeof_operand_is_complete(&self, typ: TypeId, dims: &[Expr], pos: Position) {
-        let incomplete = match self.types.kind(typ) {
-            TypeKind::Array => self.types.unsized_array_levels(typ) > dims.len(),
-            TypeKind::Struct | TypeKind::Union => !self.types.is_composite_complete(typ),
+    /// Whether the type named by a type-name is incomplete (C17 6.2.5p1):
+    /// `void`, a declared but undefined structure, union or enumeration, or
+    /// an array with an extent neither written nor supplied by one of the
+    /// type-name's own size expressions (`extents`, which `int[n]` has and
+    /// `int[]` does not).
+    pub(crate) fn type_name_is_incomplete(&self, typ: TypeId, extents: usize) -> bool {
+        match self.types.kind(typ) {
+            TypeKind::Void => true,
+            TypeKind::Array => self.types.unsized_array_levels(typ) > extents,
+            TypeKind::Struct | TypeKind::Union | TypeKind::Enum => {
+                !self.types.is_composite_complete(typ)
+            }
             _ => false,
-        };
+        }
+    }
+
+    /// `sizeof (void)` is gcc's extension (it is 1); every other incomplete
+    /// type-name is an error.
+    fn check_sizeof_operand_is_complete(&self, typ: TypeId, dims: &[Expr], pos: Position) {
+        let incomplete =
+            self.types.kind(typ) != TypeKind::Void && self.type_name_is_incomplete(typ, dims.len());
         if incomplete {
             crate::diag::error(
                 pos,

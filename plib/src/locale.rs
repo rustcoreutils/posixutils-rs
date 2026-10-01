@@ -27,16 +27,22 @@
 //! The MSVC CRT cannot stand in for the Unix C library here: its `wchar_t` is
 //! 16 bits, so a character outside the Basic Multilingual Plane is not one
 //! wide character, and it has no `wcwidth`. On Windows the character functions
-//! therefore use Rust's Unicode semantics instead, with text decoded as UTF-8.
-//! Each public function keeps its signature and its contract, so callers are
+//! therefore answer for themselves, in one of two modes that
+//! [`crate::diag::init_locale`] picks from `LC_CTYPE` as POSIX resolves it
+//! (see [`CtypeMode`]); a program starts in the C locale's, as on Unix. Each
+//! public function keeps its signature and its contract, so callers are
 //! unchanged:
 //!
-//! - ASCII answers exactly as the POSIX locale does on Unix.
-//! - Above ASCII, each predicate takes the closest Unicode property (each
-//!   function's documentation names it).
-//! - Byte input decodes as UTF-8, and an invalid or incomplete sequence decodes
-//!   as a single byte -- the same fallback the Unix functions document for a
-//!   byte `mbrtowc(3)` rejects.
+//! - ASCII answers exactly as the POSIX locale does on Unix, in both modes.
+//! - In the C locale (`LC_CTYPE` is `C` or `POSIX`), nothing above ASCII
+//!   belongs to any class, has a case mapping or a width, and every byte is
+//!   its own character -- one above ASCII undecodable -- as in glibc's C
+//!   locale.
+//! - Otherwise (`C.UTF-8`, or any other locale) above ASCII each predicate
+//!   takes the closest Unicode property (each function's documentation names
+//!   it), and byte input decodes as UTF-8, an invalid or incomplete sequence
+//!   decoding as a single byte -- the same fallback the Unix functions
+//!   document for a byte `mbrtowc(3)` rejects.
 //!
 //! Every public function splits ASCII from the rest the same way on both
 //! platforms; only the private helpers that answer each half are per-platform.
@@ -46,6 +52,42 @@
 use std::ffi::CString;
 #[cfg(unix)]
 use std::io;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// How the Windows character functions read text: the `LC_CTYPE` category's
+/// meaning there. Unix asks the C library, whose locale already says this.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CtypeMode {
+    /// The C (POSIX) locale: ASCII classification and case mapping only, and
+    /// every byte one character.
+    C,
+    /// Unicode classification and case mapping, text decoded as UTF-8.
+    Unicode,
+}
+
+/// Whether [`CtypeMode::Unicode`] is in effect. A program starts in the C
+/// locale, as on Unix, until [`crate::diag::init_locale`] reads `LC_CTYPE`.
+#[cfg(windows)]
+static UNICODE_CTYPE: AtomicBool = AtomicBool::new(false);
+
+/// Select how the character functions read text; [`crate::diag::init_locale`]
+/// calls it once, and tests to exercise each mode.
+#[cfg(windows)]
+pub(crate) fn set_ctype_mode(mode: CtypeMode) {
+    UNICODE_CTYPE.store(mode == CtypeMode::Unicode, Ordering::Relaxed);
+}
+
+/// The mode [`set_ctype_mode`] last selected.
+#[cfg(windows)]
+pub(crate) fn ctype_mode() -> CtypeMode {
+    if UNICODE_CTYPE.load(Ordering::Relaxed) {
+        CtypeMode::Unicode
+    } else {
+        CtypeMode::C
+    }
+}
 
 // libc-rs doesn't surface `wint_t` for Linux or macOS targets (only for
 // teeos / hurd), so we mirror the platform's underlying `wint_t` choice
@@ -120,7 +162,8 @@ extern "C" {
 /// this for ordinary characters.
 ///
 /// On Windows: NUL is 0 and any other control character -1, as `wcwidth`
-/// answers; the zero-width combining blocks, zero-width spaces and joiners,
+/// answers, and in the C locale so is anything above ASCII; otherwise the
+/// zero-width combining blocks, zero-width spaces and joiners,
 /// and variation selectors are 0; East Asian Wide and Fullwidth characters are
 /// 2; everything else is 1. Rust's standard library cannot tell a combining
 /// mark, so one outside the dedicated combining blocks (e.g. a Devanagari
@@ -137,7 +180,7 @@ pub fn wcwidth_char(c: char) -> i32 {
     {
         if c == '\0' {
             0
-        } else if c.is_control() {
+        } else if c.is_control() || (!c.is_ascii() && ctype_mode() == CtypeMode::C) {
             -1
         } else if in_ranges(c, ZERO_WIDTH) {
             0
@@ -214,7 +257,8 @@ macro_rules! ascii_class {
 
 /// Answer a character-class question for a character above ASCII. On Unix
 /// this is the libc `iswX(3)` function under `LC_CTYPE`; on Windows it is the
-/// closest Unicode property, given as a `fn(char) -> bool`.
+/// closest Unicode property, given as a `fn(char) -> bool`, and in the C
+/// locale "no".
 #[cfg(unix)]
 macro_rules! wide_class {
     ($c:expr, $wide_fn:ident, $unicode:expr) => {
@@ -228,7 +272,7 @@ macro_rules! wide_class {
 #[cfg(windows)]
 macro_rules! wide_class {
     ($c:expr, $wide_fn:ident, $unicode:expr) => {
-        ($unicode)($c)
+        ctype_mode() == CtypeMode::Unicode && ($unicode)($c)
     };
 }
 
@@ -423,10 +467,10 @@ fn unicode_punct(c: char) -> bool {
 /// UTF-8 locale, so the byte-oriented `tolower(3)` could not map it.) Characters
 /// with no mapping are returned unchanged.
 ///
-/// On Windows, above ASCII: `char::to_lowercase` when it maps `c` to a single
-/// character; a character whose lowercase is several characters (U+0130 is
-/// `i` plus a combining dot) has no one-character mapping and is unchanged,
-/// as `towlower` leaves it.
+/// On Windows, above ASCII: unchanged in the C locale; otherwise
+/// `char::to_lowercase` when it maps `c` to a single character; a character
+/// whose lowercase is several characters (U+0130 is `i` plus a combining dot)
+/// has no one-character mapping and is unchanged, as `towlower` leaves it.
 pub fn to_lower(c: char) -> char {
     if c.is_ascii() {
         lower_ascii(c)
@@ -437,8 +481,9 @@ pub fn to_lower(c: char) -> char {
 
 /// Map `c` to uppercase under the current `LC_CTYPE`. See [`to_lower`].
 ///
-/// On Windows, above ASCII: `char::to_uppercase` when it maps `c` to a single
-/// character, else unchanged (U+00DF `ß` uppercases to `SS`, so it stays).
+/// On Windows, above ASCII: unchanged in the C locale; otherwise
+/// `char::to_uppercase` when it maps `c` to a single character, else
+/// unchanged (U+00DF `ß` uppercases to `SS`, so it stays).
 pub fn to_upper(c: char) -> char {
     if c.is_ascii() {
         upper_ascii(c)
@@ -482,7 +527,10 @@ fn lower_ascii(c: char) -> char {
 
 #[cfg(windows)]
 fn lower_wide(c: char) -> char {
-    single_char(c.to_lowercase()).unwrap_or(c)
+    match ctype_mode() {
+        CtypeMode::C => c,
+        CtypeMode::Unicode => single_char(c.to_lowercase()).unwrap_or(c),
+    }
 }
 
 #[cfg(windows)]
@@ -492,7 +540,10 @@ fn upper_ascii(c: char) -> char {
 
 #[cfg(windows)]
 fn upper_wide(c: char) -> char {
-    single_char(c.to_uppercase()).unwrap_or(c)
+    match ctype_mode() {
+        CtypeMode::C => c,
+        CtypeMode::Unicode => single_char(c.to_uppercase()).unwrap_or(c),
+    }
 }
 
 /// The one character `mapping` yields, or `None` when it yields several.
@@ -682,7 +733,8 @@ fn locale_yesexpr() -> Option<crate::regex::Regex> {
 /// Used by `m4` for character- (not byte-) oriented `len`, `index`, `substr`,
 /// and `translit`, per POSIX `LC_CTYPE`.
 ///
-/// On Windows the encoding is always UTF-8, with the same one-byte fallback.
+/// On Windows every byte is its own character in the C locale; otherwise the
+/// encoding is UTF-8, with the same one-byte fallback.
 pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
     let mut result = Vec::new();
     let mut char_len = mb_char_len_fn();
@@ -730,7 +782,8 @@ fn mb_char_len_fn() -> impl FnMut(&[u8]) -> usize {
 
 #[cfg(windows)]
 fn mb_char_len_fn() -> impl FnMut(&[u8]) -> usize {
-    |remaining: &[u8]| match decode_utf8_char(remaining) {
+    let mode = ctype_mode();
+    move |remaining: &[u8]| match decode_char(remaining, mode) {
         Utf8Step::Char(_, n) => n,
         // An incomplete sequence at the end of the input, like an invalid one,
         // is one byte: there is no later input to complete it.
@@ -738,7 +791,7 @@ fn mb_char_len_fn() -> impl FnMut(&[u8]) -> usize {
     }
 }
 
-/// What the bytes at the start of a slice decode to as UTF-8.
+/// What the bytes at the start of a slice decode to.
 #[cfg(windows)]
 #[derive(Debug, PartialEq)]
 enum Utf8Step {
@@ -748,6 +801,18 @@ enum Utf8Step {
     Invalid,
     /// The whole slice is a valid but unfinished sequence.
     Incomplete,
+}
+
+/// Decode the character that starts the non-empty slice `bytes` as `mode`
+/// reads text: in the C locale one byte, undecodable above ASCII; otherwise
+/// UTF-8.
+#[cfg(windows)]
+fn decode_char(bytes: &[u8], mode: CtypeMode) -> Utf8Step {
+    match mode {
+        CtypeMode::C if bytes[0].is_ascii() => Utf8Step::Char(bytes[0] as char, 1),
+        CtypeMode::C => Utf8Step::Invalid,
+        CtypeMode::Unicode => decode_utf8_char(bytes),
+    }
 }
 
 /// Decode the character that starts the non-empty slice `bytes` as UTF-8.
@@ -786,8 +851,9 @@ fn decode_utf8_char(bytes: &[u8]) -> Utf8Step {
 /// Used by `wc` to count characters (`-m`) and split words (`-w`) correctly in
 /// a multibyte locale without reading the whole input into memory.
 ///
-/// On Windows the encoding is always UTF-8. A sequence split across chunks is
-/// completed the same way; if the next chunk shows the retained bytes did not
+/// On Windows every byte is one character in the C locale, a byte above ASCII
+/// decoding as `None` as glibc's C locale has it; otherwise the encoding is
+/// UTF-8. A sequence split across chunks is completed the same way; if the next chunk shows the retained bytes did not
 /// begin a valid character after all, each of them decodes as `None`, one
 /// character per byte.
 pub struct MbDecoder {
@@ -840,10 +906,11 @@ impl MbDecoder {
         };
         self.pending = 0;
 
+        let mode = ctype_mode();
         let mut chars = Vec::new();
         let mut i = 0;
         while i < input.len() {
-            match decode_utf8_char(&input[i..]) {
+            match decode_char(&input[i..], mode) {
                 Utf8Step::Char(c, n) => {
                     chars.push(Some(c));
                     i += n;
@@ -1055,7 +1122,8 @@ mod tests {
     /// definitions -- the libc answer on Unix, the Windows implementation's own.
     #[test]
     fn ascii_classes_match_the_posix_locale() {
-        // No test changes the locale on Windows; on Unix one may, so hold it.
+        // ASCII answers the same in either Windows mode; on Unix a test may
+        // change the locale, so hold it.
         #[cfg(unix)]
         let _guard = crate::locale_test_lock();
         for b in 0u8..=0x7F {
@@ -1290,13 +1358,90 @@ mod unix_tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    //! Tests of the Windows implementation: Unicode classification above ASCII
-    //! and UTF-8 decoding with the one-byte fallback.
+    //! Tests of the Windows implementation: in the Unicode mode, Unicode
+    //! classification above ASCII and UTF-8 decoding with the one-byte
+    //! fallback; in the C locale's, ASCII alone and one byte per character.
 
     use super::*;
 
+    /// Holds the character functions in one mode for a test, under the locale
+    /// lock, and restores the previous mode when dropped.
+    struct ModeGuard {
+        saved: CtypeMode,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            set_ctype_mode(self.saved);
+        }
+    }
+
+    fn ctype(mode: CtypeMode) -> ModeGuard {
+        let lock = crate::locale_test_lock();
+        let saved = ctype_mode();
+        set_ctype_mode(mode);
+        ModeGuard { saved, _lock: lock }
+    }
+
+    #[test]
+    fn a_program_starts_in_the_c_locale() {
+        let _lock = crate::locale_test_lock();
+        assert_eq!(ctype_mode(), CtypeMode::C);
+    }
+
+    #[test]
+    fn c_locale_has_nothing_above_ascii() {
+        let _mode = ctype(CtypeMode::C);
+        for c in [
+            'é', 'É', 'З', '世', '\u{80}', '\u{A0}', '\u{2003}', '¿', '\u{663}',
+        ] {
+            for (name, class) in [
+                ("isalpha", isalpha as fn(char) -> bool),
+                ("isalnum", isalnum),
+                ("isblank", isblank),
+                ("isspace", isspace),
+                ("iscntrl", iscntrl),
+                ("isdigit", isdigit),
+                ("isgraph", isgraph),
+                ("islower", islower),
+                ("isprint", isprint),
+                ("ispunct", ispunct),
+                ("isupper", isupper),
+                ("isxdigit", isxdigit),
+            ] {
+                assert!(!class(c), "{name}({c:?})");
+            }
+            assert_eq!(to_upper(c), c);
+            assert_eq!(to_lower(c), c);
+            assert_eq!(wcwidth_char(c), -1, "wcwidth_char({c:?})");
+        }
+        // ASCII is unchanged.
+        assert!(isalpha('a') && isupper('A') && isprint(' '));
+        assert_eq!(to_upper('a'), 'A');
+        assert_eq!(wcwidth_char('a'), 1);
+    }
+
+    #[test]
+    fn c_locale_reads_one_byte_per_character() {
+        let _mode = ctype(CtypeMode::C);
+        let input = "aé世".as_bytes();
+        let slices = mb_char_slices(input);
+        assert_eq!(slices.len(), input.len());
+        assert!(slices.iter().all(|s| s.len() == 1));
+        let mut d = MbDecoder::new();
+        assert_eq!(
+            d.decode(b"a\xC3\xA9\0"),
+            vec![Some('a'), None, None, Some('\0')]
+        );
+        // No byte waits for another.
+        assert_eq!(d.decode(&[0xE4]), vec![None]);
+        assert_eq!(d.pending(), 0);
+    }
+
     #[test]
     fn non_ascii_letters_and_case() {
+        let _mode = ctype(CtypeMode::Unicode);
         for c in ['é', 'É', 'ß', 'З', 'ж', '世'] {
             assert!(isalpha(c) && isalnum(c), "{c} is alphabetic");
             assert!(isprint(c) && isgraph(c), "{c} is printable");
@@ -1317,6 +1462,7 @@ mod windows_tests {
 
     #[test]
     fn non_ascii_digits_are_alpha_not_digit() {
+        let _mode = ctype(CtypeMode::Unicode);
         // ARABIC-INDIC DIGIT THREE and FULLWIDTH DIGIT ONE.
         for c in ['\u{663}', '\u{FF11}'] {
             assert!(!isdigit(c) && !isxdigit(c));
@@ -1326,6 +1472,7 @@ mod windows_tests {
 
     #[test]
     fn non_ascii_spaces_controls_and_punctuation() {
+        let _mode = ctype(CtypeMode::Unicode);
         // EM SPACE and IDEOGRAPHIC SPACE: blank and space, not graph.
         for c in ['\u{2003}', '\u{3000}'] {
             assert!(isblank(c) && isspace(c) && isprint(c) && !isgraph(c));
@@ -1345,6 +1492,7 @@ mod windows_tests {
 
     #[test]
     fn wcwidth_unicode() {
+        let _mode = ctype(CtypeMode::Unicode);
         assert_eq!(wcwidth_char('é'), 1);
         assert_eq!(wcwidth_char('З'), 1);
         assert_eq!(wcwidth_char('世'), 2);
@@ -1362,6 +1510,7 @@ mod windows_tests {
 
     #[test]
     fn mb_char_slices_utf8() {
+        let _mode = ctype(CtypeMode::Unicode);
         let s = "aé世🦀";
         let slices = mb_char_slices(s.as_bytes());
         let want: Vec<&[u8]> = vec![b"a", "é".as_bytes(), "世".as_bytes(), "🦀".as_bytes()];
@@ -1370,6 +1519,7 @@ mod windows_tests {
 
     #[test]
     fn mb_char_slices_invalid_bytes_stand_alone() {
+        let _mode = ctype(CtypeMode::Unicode);
         // A stray continuation byte, an invalid lead, a lead cut off by ASCII,
         // a surrogate encoding, and a sequence cut off by the end of input.
         let input = b"\x80a\xFF\xC3b\xED\xA0\x80\xE4\xB8";
@@ -1383,6 +1533,7 @@ mod windows_tests {
 
     #[test]
     fn mb_decoder_split_sequences() {
+        let _mode = ctype(CtypeMode::Unicode);
         let mut d = MbDecoder::new();
         // 世 is E4 B8 96: one byte per chunk.
         assert_eq!(d.decode(&[b'a', 0xE4]), vec![Some('a')]);
@@ -1401,6 +1552,7 @@ mod windows_tests {
 
     #[test]
     fn mb_decoder_invalid_bytes() {
+        let _mode = ctype(CtypeMode::Unicode);
         let mut d = MbDecoder::new();
         assert_eq!(
             d.decode(b"\x80a\xFF\0"),

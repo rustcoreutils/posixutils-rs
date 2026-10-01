@@ -311,25 +311,49 @@ pub fn run_test_with_checker_and_env<F: FnMut(&TestPlan, &Output)>(
 /// The search is case-insensitive but the returned name keeps its canonical
 /// spelling: glibc locale names are case-sensitive, so `LC_ALL=c.utf8` is not
 /// recognized and silently falls back to C.
+///
+/// On Windows this is always `C.UTF-8`, without asking `locale -a` (Windows
+/// has no such command, and a `locale.exe` found on `PATH` -- Git Bash's --
+/// lists a different system's locales): plib supports UTF-8 on every Windows
+/// system, and resolves `C.UTF-8` to Unicode characters in UTF-8 with the C
+/// locale's byte-order collation, as glibc does (see
+/// [`crate::diag::init_locale`]).
 pub fn utf8_locale() -> Option<String> {
-    let avail = std::process::Command::new("locale")
-        .arg("-a")
-        .output()
-        .ok()?;
-    let list = String::from_utf8_lossy(&avail.stdout).to_lowercase();
-    for name in ["C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8"] {
-        if list.contains(&name.to_lowercase()) {
-            return Some(name.to_string());
-        }
+    #[cfg(windows)]
+    {
+        Some("C.UTF-8".to_string())
     }
-    None
+    #[cfg(not(windows))]
+    {
+        installed_locale(&["C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8"])
+    }
 }
 
 /// Name of an installed locale matching one of `candidates`, or `None`.
 ///
 /// For tests that need a *specific* locale rather than any UTF-8 one — Turkish
 /// for dotless-i case mapping, say — which most hosts do not have installed.
+///
+/// On Windows this is always `None`: plib gives a POSIX locale name meaning
+/// only when it names the C locale (see [`crate::diag::init_locale`]), and
+/// any other name selects the user's own regional locale, not the one named,
+/// so no candidate can be the locale a test asks for.
 pub fn locale_matching(candidates: &[&str]) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let _ = candidates;
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        installed_locale(candidates)
+    }
+}
+
+/// The first of `candidates` that `locale -a` lists, compared without regard
+/// to case, in its own spelling.
+#[cfg(not(windows))]
+fn installed_locale(candidates: &[&str]) -> Option<String> {
     let avail = std::process::Command::new("locale")
         .arg("-a")
         .output()

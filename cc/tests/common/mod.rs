@@ -284,6 +284,19 @@ pub fn compile_and_run(name: &str, content: &str, extra_opts: &[String]) -> i32 
     0
 }
 
+/// Run `src` at -O0 and -O2 on the host, and on aarch64 under qemu when the
+/// cross toolchain is present; every run must exit 0.
+pub fn compile_and_run_everywhere(name: &str, src: &str) {
+    let o2 = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run(name, src, &[]), 0, "{name} at -O0");
+    assert_eq!(compile_and_run(name, src, &o2), 0, "{name} at -O2");
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64(name, src, opt) {
+            assert_eq!(code, 0, "{name} on aarch64 at {opt}");
+        }
+    }
+}
+
 /// Compile inline C code with optimization and run (single config, skips matrix).
 /// This is used by tests that specifically test optimization behavior.
 pub fn compile_and_run_optimized(name: &str, content: &str) -> i32 {

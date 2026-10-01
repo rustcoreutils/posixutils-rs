@@ -5427,19 +5427,32 @@ impl<'a> Linearizer<'a> {
             width,
         ));
 
-        let result = self.alloc_pseudo();
         let op = if width == 32 {
             Opcode::Clz32
         } else {
             Opcode::Clz64
         };
-        self.emit(
-            Instruction::new(op)
-                .with_target(result)
-                .with_src(nonzero)
-                .with_size(width)
-                .with_type(int_id),
-        );
+        self.emit_bit_count(op, nonzero, val_typ)
+    }
+
+    /// A bit count `op` of `arg`, already converted to the builtin's
+    /// unsigned parameter type.
+    fn linearize_bit_count(&mut self, op: Opcode, arg: &Expr) -> PseudoId {
+        let operand = self.expr_type(arg);
+        let val = self.linearize_expr(arg);
+        self.emit_bit_count(op, val, operand)
+    }
+
+    /// The `int` count `op` of `val`, of type `operand`. The count reads
+    /// another type than it produces, so it records the operand
+    /// (`Opcode::reads_another_type`).
+    fn emit_bit_count(&mut self, op: Opcode, val: PseudoId, operand: TypeId) -> PseudoId {
+        let result = self.alloc_pseudo();
+        let int = self.types.int_id;
+        let mut insn = Instruction::unop(op, result, val, int, self.types.size_bits(int));
+        insn.src_typ = Some(operand);
+        insn.src_size = self.types.size_bits(operand);
+        self.emit(insn);
         result
     }
 
@@ -5637,87 +5650,20 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            // Count trailing zeros builtins
-            ExprKind::Ctz { arg } => {
-                // __builtin_ctz - counts trailing zeros in unsigned int (32-bit)
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Ctz32)
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(32)
-                    .with_type(self.types.int_id);
-                self.emit(insn);
-                result
-            }
-
+            // The counts: an `int` of a 32- or 64-bit unsigned operand.
+            ExprKind::Ctz { arg } => self.linearize_bit_count(Opcode::Ctz32, arg),
             ExprKind::Ctzl { arg } | ExprKind::Ctzll { arg } => {
-                // __builtin_ctzl/ctzll - counts trailing zeros in 64-bit value
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Ctz64)
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(64)
-                    .with_type(self.types.int_id);
-                self.emit(insn);
-                result
+                self.linearize_bit_count(Opcode::Ctz64, arg)
             }
-
-            // Count leading zeros builtins
-            ExprKind::Clz { arg } => {
-                // __builtin_clz - counts leading zeros in unsigned int (32-bit)
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Clz32)
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(32)
-                    .with_type(self.types.int_id);
-                self.emit(insn);
-                result
-            }
-
+            ExprKind::Clz { arg } => self.linearize_bit_count(Opcode::Clz32, arg),
             ExprKind::Clzl { arg } | ExprKind::Clzll { arg } => {
-                // __builtin_clzl/clzll - counts leading zeros in 64-bit value
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Clz64)
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(64)
-                    .with_type(self.types.int_id);
-                self.emit(insn);
-                result
+                self.linearize_bit_count(Opcode::Clz64, arg)
             }
-
             ExprKind::Clrsb { arg } => self.linearize_clrsb(arg, 32),
             ExprKind::Clrsbl { arg } | ExprKind::Clrsbll { arg } => self.linearize_clrsb(arg, 64),
-
-            // Population count builtins
-            // `__builtin_popcount` counts an `unsigned int`, `popcountl` and
-            // `popcountll` a 64-bit value; the count is an `int` either way.
-            ExprKind::Popcount { arg }
-            | ExprKind::Popcountl { arg }
-            | ExprKind::Popcountll { arg } => {
-                let (op, operand) = if matches!(expr.kind, ExprKind::Popcount { .. }) {
-                    (Opcode::Popcount32, self.types.uint_id)
-                } else {
-                    (Opcode::Popcount64, self.types.ulonglong_id)
-                };
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-                let int = self.types.int_id;
-                let mut insn =
-                    Instruction::unop(op, result, arg_val, int, self.types.size_bits(int));
-                insn.src_typ = Some(operand);
-                insn.src_size = self.types.size_bits(operand);
-                self.emit(insn);
-                result
+            ExprKind::Popcount { arg } => self.linearize_bit_count(Opcode::Popcount32, arg),
+            ExprKind::Popcountl { arg } | ExprKind::Popcountll { arg } => {
+                self.linearize_bit_count(Opcode::Popcount64, arg)
             }
 
             ExprKind::Alloca { size } => {

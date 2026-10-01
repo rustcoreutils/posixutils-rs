@@ -33,7 +33,7 @@
 // `dominate::domtree_build` *fresh*, after the CFG edits here.
 //
 
-use super::constfold::{eval_binop, eval_unop, get_cmp_info};
+use super::constfold::{bit_opcode, eval_binop, eval_unop, get_cmp_info};
 use super::dataflow::{Lattice, Selector, Sparse, SparseAnalysis};
 use super::propagate::cbr_taken;
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
@@ -84,6 +84,19 @@ pub fn run(func: &mut Function) -> bool {
 impl Solver {
     fn get(&self, id: PseudoId) -> Val {
         self.core.get(id)
+    }
+
+    /// A unary operation `constfold` evaluates, over its operand's lattice
+    /// value.
+    fn unary(&self, insn: &Instruction) -> Val {
+        match insn.src.first().map(|s| self.get(*s)) {
+            Some(Val::Const(a)) => match eval_unop(insn, a) {
+                Some(v) => Val::Const(v),
+                None => Val::Bottom,
+            },
+            Some(Val::Top) => Val::Top,
+            _ => Val::Bottom,
+        }
     }
 }
 
@@ -166,20 +179,10 @@ impl SparseAnalysis for Solver {
                 _ => Val::Const(0),
             },
 
-            Opcode::Neg
-            | Opcode::Not
-            | Opcode::Sext
-            | Opcode::Zext
-            | Opcode::Trunc
-            | Opcode::Popcount32
-            | Opcode::Popcount64 => match insn.src.first().map(|s| self.get(*s)) {
-                Some(Val::Const(a)) => match eval_unop(insn, a) {
-                    Some(v) => Val::Const(v),
-                    None => Val::Bottom,
-                },
-                Some(Val::Top) => Val::Top,
-                _ => Val::Bottom,
-            },
+            Opcode::Neg | Opcode::Not | Opcode::Sext | Opcode::Zext | Opcode::Trunc => {
+                self.unary(insn)
+            }
+            op if bit_opcode(op).is_some() => self.unary(insn),
 
             _ if insn.op.is_int_arith() || insn.op.is_int_comparison() => {
                 if insn.src.len() != 2 {
@@ -463,7 +466,6 @@ mod tests {
             Opcode::AdcC,
             Opcode::Lo64,
             Opcode::FAdd,
-            Opcode::Ctz32,
             Opcode::VaArg,
         ] {
             let mut func = Function::new("t", types.int_id);

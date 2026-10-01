@@ -10351,3 +10351,34 @@ fn test_every_register_returned_aggregate_carries_its_class() {
         "an address-returned aggregate is inlinable"
     );
 }
+
+/// Every bit count -- `ctz`, `clz` (`clrsb`'s too), `popcount` -- is an `int`
+/// result that records the 32- or 64-bit operand it reads in `src_size`, so
+/// a fold that replaces one with its count builds an `int`. `ctzl` and
+/// `clzl` recorded the operand width as the result's.
+#[test]
+fn test_bit_counts_record_their_operand() {
+    let src = "int f(unsigned long l, unsigned u, long s) {\n\
+               return __builtin_ctzl(l) + __builtin_clz(u) + __builtin_clzll(l)\n\
+               + __builtin_popcountl(l) + __builtin_ctz(u) + __builtin_clrsbl(s);\n}\n";
+    let (module, types) = linearize_source_with_types(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let counts: Vec<&Instruction> = f
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| i.op.is_bit_count())
+        .collect();
+    assert_eq!(counts.len(), 6);
+    for insn in counts {
+        let operand = if matches!(insn.op, Opcode::Ctz32 | Opcode::Clz32) {
+            32
+        } else {
+            64
+        };
+        assert_eq!(insn.typ, Some(types.int_id), "{:?}", insn.op);
+        assert_eq!(insn.size, 32, "{:?}: the count is an int", insn.op);
+        assert_eq!(insn.operand_width(), operand, "{:?}", insn.op);
+        assert!(insn.src_typ.is_some(), "{:?}", insn.op);
+    }
+}

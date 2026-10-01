@@ -59,7 +59,7 @@
 //
 //   I10 — AN OPERAND OF ANOTHER TYPE IS RECORDED AS ONE
 //        `typ`/`size` describe an instruction's result, for every opcode; a
-//        comparison or a population count, which reads another type than it
+//        comparison or a bit count, which reads another type than it
 //        produces, records its operands in `src_typ`/`src_size`
 //        (`Instruction::operand_type`). Built without them, a backend would
 //        compare at the result's width.
@@ -152,7 +152,7 @@ pub enum ValidationError {
         block: BasicBlockId,
         what: String,
     },
-    /// I10 violation: a comparison or population count with no operand
+    /// I10 violation: a comparison or bit count with no operand
     /// type or width recorded.
     MissingOperandType {
         function: String,
@@ -550,12 +550,12 @@ fn check_memory_access_implies_side_effect(func: &Function, out: &mut Vec<Valida
     }
 }
 
-/// I10 -- a comparison or population count records the operands it reads.
+/// I10 -- a comparison or bit count records the operands it reads.
 fn check_operand_types(func: &Function, out: &mut Vec<ValidationError>) {
     for (block, bb) in func.blocks.iter().enumerate() {
         for (index, insn) in bb.insns.iter().enumerate() {
-            let counts = matches!(insn.op, Opcode::Popcount32 | Opcode::Popcount64);
-            if (insn.op.is_comparison() || counts) && (insn.src_typ.is_none() || insn.src_size == 0)
+            if (insn.op.is_comparison() || insn.op.is_bit_count())
+                && (insn.src_typ.is_none() || insn.src_size == 0)
             {
                 out.push(ValidationError::MissingOperandType {
                     function: func.name.clone(),

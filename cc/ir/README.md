@@ -414,7 +414,7 @@ typ: TypeId             - result type, for every opcode
 size: u32               - result width in bits, for every opcode
 src_typ/src_size        - operand type and width, for an opcode that reads
                           another type than it produces: the conversions,
-                          the comparisons, the population counts. Read them
+                          the comparisons, the bit counts. Read them
                           through `Instruction::operand_type`/`operand_width`
 offset: i64             - byte displacement of a load or store; the level of
                           frame_address/return_address (`frame_level()`)

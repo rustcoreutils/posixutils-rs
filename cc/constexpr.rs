@@ -21,6 +21,7 @@
 //! [`ConstEnv`] trait; everything else is here.
 
 use crate::float::{Complex, FloatVal, FpFormat};
+use crate::ir::constfold::{eval_bit_op, BitOp};
 use crate::parse::ast::{BinaryOp, Expr, ExprKind, FpTest, InlineLibraryFn, OffsetOfPath, UnaryOp};
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
@@ -134,6 +135,9 @@ pub(crate) fn eval(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Optio
 }
 
 fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Option<i128> {
+    if let Some((op, arg)) = bit_builtin(&expr.kind) {
+        return eval_bit_builtin(env, scope, op, arg);
+    }
     // Note the absence of a `FloatLit` arm: a floating literal is deliberately
     // *not* an integer constant expression. 6.6p6 admits one only as the
     // immediate operand of a cast, which the `Cast` arm below handles. Folding
@@ -292,6 +296,36 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
 
         _ => None,
     }
+}
+
+/// A bit builtin of a constant, which gcc makes an integer constant
+/// expression in every context. The argument is already converted to the
+/// builtin's parameter type, whose width the operation reads.
+fn eval_bit_builtin(env: &impl ConstEnv, scope: ConstScope, op: BitOp, arg: &Expr) -> Option<i128> {
+    let width = env.types().size_bits(arg.typ?);
+    Some(eval_bit_op(op, width, eval(env, scope, arg)?))
+}
+
+/// The bit operation a bit builtin's node performs, and its argument.
+fn bit_builtin(kind: &ExprKind) -> Option<(BitOp, &Expr)> {
+    Some(match kind {
+        ExprKind::Bswap16 { arg } | ExprKind::Bswap32 { arg } | ExprKind::Bswap64 { arg } => {
+            (BitOp::Bswap, arg)
+        }
+        ExprKind::Ctz { arg } | ExprKind::Ctzl { arg } | ExprKind::Ctzll { arg } => {
+            (BitOp::Ctz, arg)
+        }
+        ExprKind::Clz { arg } | ExprKind::Clzl { arg } | ExprKind::Clzll { arg } => {
+            (BitOp::Clz, arg)
+        }
+        ExprKind::Clrsb { arg } | ExprKind::Clrsbl { arg } | ExprKind::Clrsbll { arg } => {
+            (BitOp::Clrsb, arg)
+        }
+        ExprKind::Popcount { arg } | ExprKind::Popcountl { arg } | ExprKind::Popcountll { arg } => {
+            (BitOp::Popcount, arg)
+        }
+        _ => return None,
+    })
 }
 
 /// `offsetof(typ, path)`: the byte offset the member designator `path`

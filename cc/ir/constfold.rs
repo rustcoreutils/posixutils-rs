@@ -553,9 +553,6 @@ pub(crate) fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
         Opcode::Not => Some(!a),
         // The count of the operand at its own width. It is at most 64, so
         // it reads the same at every width the `int` result is taken at.
-        Opcode::Popcount32 => Some(i128::from((a as u32).count_ones())),
-        Opcode::Popcount64 => Some(i128::from((a as u64).count_ones())),
-
         // Read the operand at the width it was stored in, in the signedness
         // the opcode names, and leave it there: the destination is wider.
         Opcode::Sext | Opcode::Zext => {
@@ -577,7 +574,74 @@ pub(crate) fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
             unambiguous_at(v, size).then_some(v)
         }
 
-        _ => None,
+        op => {
+            let (bit_op, width) = bit_opcode(op)?;
+            Some(eval_bit_op(bit_op, width, a))
+        }
+    }
+}
+
+/// An operation of the bit builtins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BitOp {
+    /// Reverse the bytes.
+    Bswap,
+    /// Count the trailing zero bits.
+    Ctz,
+    /// Count the leading zero bits.
+    Clz,
+    /// Count the leading bits that repeat the sign bit.
+    Clrsb,
+    /// Count the one bits.
+    Popcount,
+    /// One plus the index of the lowest one bit, or 0 for 0.
+    Ffs,
+}
+
+/// The bit operation `op` performs and the operand width it reads, or
+/// `None` if `op` is no bit operation.
+pub(crate) fn bit_opcode(op: Opcode) -> Option<(BitOp, u32)> {
+    Some(match op {
+        Opcode::Bswap16 => (BitOp::Bswap, 16),
+        Opcode::Bswap32 => (BitOp::Bswap, 32),
+        Opcode::Bswap64 => (BitOp::Bswap, 64),
+        Opcode::Ctz32 => (BitOp::Ctz, 32),
+        Opcode::Ctz64 => (BitOp::Ctz, 64),
+        Opcode::Clz32 => (BitOp::Clz, 32),
+        Opcode::Clz64 => (BitOp::Clz, 64),
+        Opcode::Popcount32 => (BitOp::Popcount, 32),
+        Opcode::Popcount64 => (BitOp::Popcount, 64),
+        _ => return None,
+    })
+}
+
+/// `op` of the `width`-bit operand `a`: the one rule for each bit builtin,
+/// which both this file's opcode folds and the C17 6.6 walk in
+/// [`crate::constexpr`] evaluate by.
+///
+/// Only the low `width` bits of `a` are read, in the signedness the
+/// operation implies: every one reads an unsigned operand but `Clrsb`. A
+/// count is at most 64, so it reads the same at every width; a byte swap is
+/// the unsigned value of its width.
+///
+/// `ctz` and `clz` of 0 are undefined at run time, but a constant one is
+/// still a constant to gcc, which folds it to the operand width on both
+/// targets -- so `static int x = __builtin_ctz(0);` is 32 there and here.
+pub(crate) fn eval_bit_op(op: BitOp, width: u32, a: i128) -> i128 {
+    let bits = at_width(a, width, false) as u128;
+    let unused = 128 - width;
+    match op {
+        BitOp::Bswap => (bits.swap_bytes() >> unused) as i128,
+        BitOp::Ctz => i128::from(bits.trailing_zeros().min(width)),
+        BitOp::Clz => i128::from(bits.leading_zeros() - unused),
+        BitOp::Popcount => i128::from(bits.count_ones()),
+        BitOp::Ffs if bits == 0 => 0,
+        BitOp::Ffs => i128::from(bits.trailing_zeros() + 1),
+        BitOp::Clrsb => {
+            let signed = at_width(a, width, true);
+            let magnitude = if signed < 0 { !signed } else { signed };
+            eval_bit_op(BitOp::Clz, width, magnitude) - 1
+        }
     }
 }
 
@@ -849,5 +913,62 @@ mod tests {
         // An out-of-range count is undefined and is not folded, at 128 as
         // anywhere else.
         assert_eq!(eval_binop(&binop_at(Opcode::Lsr, 128), -1, 128), None);
+    }
+
+    /// Each bit operation reads only its operand's width, unsigned but for
+    /// `Clrsb`, and `ctz`/`clz` of 0 is the width -- gcc's folded value.
+    #[test]
+    fn eval_bit_op_reads_the_operand_at_its_width() {
+        use BitOp::*;
+        for (op, width, a, want) in [
+            (Bswap, 16, 0x12345, 0x4523),
+            (Bswap, 32, 0xff, 0xff00_0000),
+            (Bswap, 64, -1, u64::MAX as i128),
+            (Ctz, 32, 1 << 40, 32),
+            (Ctz, 64, 1 << 40, 40),
+            (Ctz, 32, -1, 0),
+            (Ctz, 64, 0, 64),
+            (Clz, 32, 1, 31),
+            (Clz, 64, 1, 63),
+            (Clz, 32, 0, 32),
+            (Clz, 32, -1, 0),
+            (Clrsb, 32, 0, 31),
+            (Clrsb, 32, -1, 31),
+            (Clrsb, 32, i128::from(i32::MIN), 0),
+            (Clrsb, 64, -5, 60),
+            (Clrsb, 32, 0xffff_ffff, 31),
+            (Popcount, 32, (1 << 40) | 7, 3),
+            (Popcount, 64, -1, 64),
+            (Ffs, 32, 0, 0),
+            (Ffs, 32, 8, 4),
+            (Ffs, 64, 1 << 40, 41),
+            (Ffs, 32, 1 << 40, 0),
+        ] {
+            assert_eq!(eval_bit_op(op, width, a), want, "{op:?}.{width} of {a:#x}");
+        }
+    }
+
+    /// Each bit opcode folds through `eval_unop` at the width it names,
+    /// whatever width its `int` result is recorded at.
+    #[test]
+    fn eval_unop_folds_every_bit_opcode() {
+        for (op, a, want) in [
+            (Opcode::Bswap16, 0x1234, 0x3412),
+            (Opcode::Bswap32, 0x1234_5678, 0x7856_3412),
+            (
+                Opcode::Bswap64,
+                0x0102_0304_0506_0708,
+                0x0807_0605_0403_0201,
+            ),
+            (Opcode::Ctz32, 0, 32),
+            (Opcode::Ctz64, 1 << 40, 40),
+            (Opcode::Clz32, 1, 31),
+            (Opcode::Clz64, 1, 63),
+            (Opcode::Popcount32, -1, 32),
+            (Opcode::Popcount64, -1, 64),
+        ] {
+            let insn = Instruction::new(op).with_size(32);
+            assert_eq!(eval_unop(&insn, a), Some(want), "{op:?} of {a:#x}");
+        }
     }
 }

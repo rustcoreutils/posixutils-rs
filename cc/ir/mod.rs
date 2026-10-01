@@ -423,8 +423,8 @@ impl Opcode {
     /// result, as for every opcode?
     ///
     /// The conversions, the comparisons (which read any type and produce an
-    /// `int` or a `_Bool`), and the population counts (which count a 32- or
-    /// 64-bit operand into an `int`).
+    /// `int` or a `_Bool`), and the bit counts (which count a 32- or 64-bit
+    /// operand into an `int`).
     pub fn reads_another_type(self) -> bool {
         self.is_comparison()
             || matches!(
@@ -437,9 +437,21 @@ impl Opcode {
                     | Opcode::SCvtF
                     | Opcode::UCvtF
                     | Opcode::FCvtF
-                    | Opcode::Popcount32
-                    | Opcode::Popcount64
             )
+            || self.is_bit_count()
+    }
+
+    /// The bit counts: an `int` count of the bits of a 32- or 64-bit operand.
+    pub fn is_bit_count(self) -> bool {
+        matches!(
+            self,
+            Opcode::Ctz32
+                | Opcode::Ctz64
+                | Opcode::Clz32
+                | Opcode::Clz64
+                | Opcode::Popcount32
+                | Opcode::Popcount64
+        )
     }
 
     /// Check if this opcode is a terminator (ends a basic block)

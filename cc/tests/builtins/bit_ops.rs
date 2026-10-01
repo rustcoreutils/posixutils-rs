@@ -427,3 +427,55 @@ fn builtins_bit_ops_check_their_argument() {
          makes integer from pointer without a cast",
     );
 }
+
+/// A bit builtin of a constant is an integer constant expression in gcc, so
+/// it may initialize a static object and label a `case`. c17 folded only
+/// `popcount` and `parity`, and none of them in a static initializer.
+#[test]
+fn builtins_bit_ops_of_constants_are_constant_expressions() {
+    crate::common::compile_and_run_everywhere(
+        "bit_ops_constant",
+        r#"
+/* Every bit builtin of a constant is an integer constant expression in gcc,
+   so it works in a static initializer and a case label. */
+static const int t[] = {
+    __builtin_ctz(8), __builtin_clz(1), __builtin_ctzll(1ULL << 40),
+    __builtin_clzl(1), __builtin_popcount(7), __builtin_parity(7),
+    __builtin_clrsb(0), __builtin_ffs(8), __builtin_bswap16(0x1234),
+};
+static const unsigned b32 = __builtin_bswap32(0x12345678u);
+static const unsigned long long b64 = __builtin_bswap64(0x0102030405060708ULL);
+int main(void) {
+    switch (8) { case __builtin_ctz(256): break; case __builtin_popcount(127): return 50; default: return 51; }
+    if (t[0] != 3 || t[1] != 31 || t[2] != 40 || t[3] != 63 || t[4] != 3 || t[5] != 1
+        || t[6] != 31 || t[7] != 4 || t[8] != 0x3412) return 1;
+    if (b32 != 0x78563412u || b64 != 0x0807060504030201ULL) return 2;
+    return 0;
+}
+"#,
+    );
+}
+
+/// `ctz` and `clz` of 0 are undefined at run time, but of a constant 0 gcc
+/// still folds them, to the operand width, on both targets: a static
+/// initializer, an enumerator, an array bound and `_Static_assert` accept
+/// them. The other bit builtins are constants in those places too.
+#[test]
+fn builtins_ctz_clz_of_constant_zero_fold_to_the_width() {
+    crate::common::compile_and_run_everywhere(
+        "bit_ops_constant_zero",
+        r#"
+static int z[] = { __builtin_ctz(0), __builtin_clz(0), __builtin_ctzll(0), __builtin_clzl(0) };
+enum { E = __builtin_ctz(0), F = __builtin_ffs(0), G = __builtin_clrsb(-1) };
+static char bound[__builtin_bswap16(0x0100) + __builtin_ctz(-1)];
+_Static_assert(__builtin_clzll(0) == 64 && __builtin_popcountll(-1) == 64, "folded");
+_Static_assert(__builtin_bswap32(0x12345678u) == 0x78563412u, "folded");
+int main(void) {
+    if (z[0] != 32 || z[1] != 32 || z[2] != 64 || z[3] != 64) return 1;
+    if (E != 32 || F != 0 || G != 31) return 2;
+    if (sizeof bound != 1) return 3;
+    return 0;
+}
+"#,
+    );
+}

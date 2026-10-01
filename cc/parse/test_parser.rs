@@ -6436,6 +6436,51 @@ fn test_bit_builtins_reject_a_structure_argument() {
     }
 }
 
+/// A bit builtin of an integer constant expression is one itself, as in gcc,
+/// and reads its argument converted to the parameter type: `ctz(-1)` counts
+/// the zeros of `UINT_MAX`, `clrsb(-1)` the sign bits of a signed -1. `ctz`
+/// and `clz` of 0 are gcc's folded value, the operand width.
+#[test]
+fn test_bit_builtins_of_constants_are_constant_expressions() {
+    for (call, want) in [
+        ("__builtin_bswap16(0x12345)", 0x4523),
+        ("__builtin_bswap32(0x12345678)", 0x7856_3412),
+        (
+            "__builtin_bswap64(0x0102030405060708)",
+            0x0807_0605_0403_0201,
+        ),
+        ("__builtin_bswap64(0xff)", 0xff00_0000_0000_0000),
+        ("__builtin_ctz(-1)", 0),
+        ("__builtin_ctz(1u << 31)", 31),
+        ("__builtin_ctzll(1ull << 40)", 40),
+        ("__builtin_ctz(0)", 32),
+        ("__builtin_ctzl(0)", 64),
+        ("__builtin_clz(1)", 31),
+        ("__builtin_clz(0x100000000)", 32),
+        ("__builtin_clzll(0)", 64),
+        ("__builtin_clrsb(0)", 31),
+        ("__builtin_clrsb(-1)", 31),
+        ("__builtin_clrsb(1)", 30),
+        ("__builtin_clrsbll(-5)", 60),
+        ("__builtin_popcount(-1)", 32),
+        ("__builtin_popcountll(-1)", 64),
+        ("__builtin_parity(7)", 1),
+        ("__builtin_parityl(3)", 0),
+        ("__builtin_ffs(0)", 0),
+        ("__builtin_ffs(8)", 4),
+        ("__builtin_ffsll(1ll << 40)", 41),
+    ] {
+        with_statement_expr("", call, |p, e| {
+            assert_eq!(p.eval_const_expr(e), Some(want), "{call}");
+        });
+    }
+    // A variable argument is no constant, and `ffs` of one is still a call.
+    with_statement_expr("int i;", "__builtin_ffs(i)", |p, e| {
+        assert_eq!(p.eval_const_expr(e), None);
+        assert!(matches!(e.kind, ExprKind::Call { .. }), "{:?}", e.kind);
+    });
+}
+
 // __builtin_flt_rounds test
 
 #[test]

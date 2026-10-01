@@ -113,7 +113,7 @@ particular, unlike gcc, c17 accepts without a diagnostic:
 | `__builtin_popcount(x)`, `popcountl`, `popcountll` | as `ctz` | `Opcode::Popcount32` / `Popcount64` |
 | `__builtin_parity(x)`, `parityl`, `parityll` | as `ctz` | Rewritten by the parser to `popcount(x) & 1` on one node, so `x` is evaluated once |
 | `__builtin_clrsb(x)`, `clrsbl`, `clrsbll` | `int` / `long` / `long long` | Redundant sign bits: expanded by `linearize_clrsb` into `((x ^ (x >> w-1)) << 1 \| 1)` and a `Clz`. Defined for every input: 0 and -1 both answer 31 |
-| `__builtin_ffs(x)`, `ffsl`, `ffsll` | `int` / `long` / `long long` | A call to the C library's `ffs`/`ffsl`/`ffsll` (gcc computes it inline), declared with that prototype unless the program declared it. The bare `ffs` is an ordinary function |
+| `__builtin_ffs(x)`, `ffsl`, `ffsll` | `int` / `long` / `long long` | Of an integer constant expression, its value. Otherwise a call to the C library's `ffs`/`ffsl`/`ffsll` (gcc computes it inline), declared with that prototype unless the program declared it. The bare `ffs` is an ordinary function |
 
 Every result other than a byte swap's is `int`. The prototypes are gcc's,
 written once in `BIT_BUILTINS` (`parse/bit_builtin.rs`): a call is checked
@@ -127,11 +127,15 @@ The population count uses only baseline instructions: on x86-64 a
 branch-free SWAR sequence (`popcnt` is not in x86-64-v1), on AArch64 `cnt`
 and `addv`. `clz` on x86-64 is `bsr` and an `xor` (no `lzcnt`).
 
-Only `popcount` and `parity` of a constant fold (`constfold::eval_unop`,
-`sccp`), at `-O1` and above. `bswap`, `ctz`, `clz` and `clrsb` of a constant
-are emitted as instructions at every level, and none of these builtins is an
-integer constant expression or a valid static initializer, where gcc accepts
-both.
+Every bit builtin of an integer constant expression is one itself, as in
+gcc: valid in a static initializer, a `case` label, an array bound, an
+enumerator and `_Static_assert`. Each operation is evaluated by one rule,
+`constfold::eval_bit_op`, which the C17 6.6 walk (`constexpr.rs`) applies to
+the builtin's node, the parser to `ffs` of a constant (folded in place of
+the library call), and `constfold::eval_unop` to the bit opcodes, so
+`instcombine`, `sccp` and `vrp` fold a constant operand at `-O1` and above.
+`ctz` and `clz` of a constant 0 fold to the operand width (32 or 64), the
+value gcc folds them to on both targets; at run time they stay undefined.
 
 ## Type Introspection and Selection
 

@@ -18,6 +18,7 @@
 use super::ast::{BinaryOp, Expr, ExprKind};
 use super::library_builtin::ProtoType;
 use super::parser::{ParseResult, Parser};
+use crate::ir::constfold::{eval_bit_op, BitOp};
 use crate::kw;
 use crate::strings::StringId;
 use crate::token::lexer::Position;
@@ -31,8 +32,9 @@ enum BitEval {
     /// The low bit of the population-count node of the argument. One node,
     /// so `__builtin_parity(f())` calls `f` once.
     Parity(fn(Box<Expr>) -> ExprKind),
-    /// A call to the C library function of this name.
-    Library(&'static str),
+    /// A call to the C library function of this name, which performs this
+    /// operation -- folded instead when the argument is a constant.
+    Library(&'static str, BitOp),
 }
 
 /// A bit builtin and its prototype: `ret name(param)`.
@@ -81,9 +83,9 @@ static BIT_BUILTINS: &[BitBuiltin] = {
         row(kw::BUILTIN_PARITY,      Int,       UInt,      Parity(|arg| ExprKind::Popcount { arg })),
         row(kw::BUILTIN_PARITYL,     Int,       ULong,     Parity(|arg| ExprKind::Popcountl { arg })),
         row(kw::BUILTIN_PARITYLL,    Int,       ULongLong, Parity(|arg| ExprKind::Popcountll { arg })),
-        row(kw::BUILTIN_FFS,         Int,       Int,       Library("ffs")),
-        row(kw::BUILTIN_FFSL,        Int,       Long,      Library("ffsl")),
-        row(kw::BUILTIN_FFSLL,       Int,       LongLong,  Library("ffsll")),
+        row(kw::BUILTIN_FFS,         Int,       Int,       Library("ffs", BitOp::Ffs)),
+        row(kw::BUILTIN_FFSL,        Int,       Long,      Library("ffsl", BitOp::Ffs)),
+        row(kw::BUILTIN_FFSLL,       Int,       LongLong,  Library("ffsll", BitOp::Ffs)),
     ]
 };
 
@@ -145,7 +147,14 @@ impl Parser<'_> {
                 };
                 Self::typed_expr(parity, ret, pos)
             }
-            BitEval::Library(name) => {
+            BitEval::Library(name, op) => {
+                // gcc computes these inline, so one of a constant is an
+                // integer constant expression there and makes no call.
+                if let Some(value) = self.eval_const_expr(&arg) {
+                    let width = self.types.size_bits(row.param.id(self.types));
+                    let folded = eval_bit_op(op, width, value) as i64;
+                    return Self::typed_expr(ExprKind::IntLit(folded), ret, pos);
+                }
                 // Declared with this prototype unless the program declared
                 // it already, so the call passes the converted argument the
                 // way the library function receives it.

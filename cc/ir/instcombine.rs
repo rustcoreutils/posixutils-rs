@@ -25,9 +25,9 @@
 //
 
 use super::constfold::{
-    at_width, divmod_may_trap, eval_binop, eval_fbinop, eval_fcvt, eval_fcvtf, eval_fternop,
-    eval_funop, eval_unop, fcmp_decided, fcmp_mask, fcmp_outcome, get_cmp_info, mirror_mask,
-    possible_against, FCMP_ALL,
+    at_width, bit_opcode, divmod_may_trap, eval_binop, eval_fbinop, eval_fcvt, eval_fcvtf,
+    eval_fternop, eval_funop, eval_unop, fcmp_decided, fcmp_mask, fcmp_outcome, get_cmp_info,
+    mirror_mask, possible_against, FCMP_ALL,
 };
 use super::facts::{CmpDomain, CmpFacts, ConstMap, Relation};
 use super::{ConstValue, Function, Instruction, Opcode, PseudoId};
@@ -228,9 +228,8 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
 
         // Unary
         Opcode::Neg => simplify_neg(insn, consts),
-        Opcode::Not | Opcode::Popcount32 | Opcode::Popcount64 => {
-            simplify_unary_of_const(insn, consts)
-        }
+        Opcode::Not => simplify_unary_of_const(insn, consts),
+        op if bit_opcode(op).is_some() => simplify_unary_of_const(insn, consts),
         Opcode::Sext | Opcode::Zext | Opcode::Trunc => simplify_convert(insn, consts),
 
         _ => Simplification::None,
@@ -1553,11 +1552,12 @@ mod tests {
         assert_eq!(new_const.kind, PseudoKind::Val(-1));
     }
 
-    /// A population count of a constant folds to the count of the operand at
-    /// the width the opcode names, and the copy that replaces it is an `int`
-    /// -- not the 64-bit operand width `popcount64` records in `size`.
+    /// A bit count of a constant folds to the count of the operand at the
+    /// width the opcode names, and the copy that replaces it is an `int` --
+    /// not the 64-bit operand width a `popcount64` or `ctz64` records in
+    /// `src_size`.
     #[test]
-    fn test_const_fold_popcount() {
+    fn test_const_fold_bit_count() {
         let types = TypeTable::new(&Target::host());
         for (op, operand, count) in [
             (Opcode::Popcount64, 0xF0F0_F0F0_F0F0_F0F0_i128, 32),
@@ -1565,8 +1565,12 @@ mod tests {
             // Bits above the operand width are not counted.
             (Opcode::Popcount32, (1 << 40) | 7, 3),
             (Opcode::Popcount32, 0, 0),
+            (Opcode::Ctz64, 1 << 40, 40),
+            (Opcode::Ctz32, (1 << 40) | 8, 3),
+            (Opcode::Clz64, 1, 63),
+            (Opcode::Clz32, 1 << 40, 32),
         ] {
-            let size = if op == Opcode::Popcount64 { 64 } else { 32 };
+            let (_, size) = bit_opcode(op).unwrap();
             let mut insn = Instruction::unop(op, PseudoId(1), PseudoId(0), types.int_id, 32);
             insn.src_typ = Some(types.ulonglong_id);
             insn.src_size = size;

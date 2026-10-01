@@ -1774,7 +1774,11 @@ impl RegAlloc {
         // What the pre-pass asks about each interval, indexed once: asking by
         // scanning the function per interval made it quadratic.
         let setval_sizes = crate::arch::regalloc::setval_sizes(func);
-        let mut int128_pseudos: HashSet<PseudoId> = HashSet::new();
+        let mut int128_pseudos: HashSet<PseudoId> = crate::arch::regalloc::arg_pseudo_types(func)
+            .into_iter()
+            .filter(|(_, t)| types.is_plain_int128(*t))
+            .map(|(p, _)| p)
+            .collect();
         let mut multi_reg_returns: HashMap<PseudoId, TypeId> = HashMap::new();
         for insn in func.blocks.iter().flat_map(|b| &b.insns) {
             let Some(typ) = insn.typ else { continue };

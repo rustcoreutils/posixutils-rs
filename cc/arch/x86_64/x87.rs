@@ -244,20 +244,18 @@ impl X86_64CodeGen {
             },
         });
 
-        // overflow_arg_area advances past the whole 16-byte slot.
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::R10),
-            dst: GpOperand::Reg(Reg::R11),
-        });
+        // overflow_arg_area advances past the whole 16-byte slot. R10 is free
+        // again once the value is loaded; R11 never is here, because it holds
+        // the va_list itself whenever `ap` is a pointer to one, and `overflow`
+        // is addressed through it.
         self.push_lir(X86Inst::Add {
             size: OperandSize::B64,
             src: GpOperand::Imm(16),
-            dst: Reg::R11,
+            dst: Reg::R10,
         });
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::R11),
+            src: GpOperand::Reg(Reg::R10),
             dst: GpOperand::Mem(overflow),
         });
 
@@ -944,16 +942,8 @@ impl X86_64CodeGen {
             Loc::Imm(val) => {
                 // Immediate - store to temp location after callee-saved area
                 let temp_addr = self.x87_scratch_addr();
-                let op_size = if src_size <= 32 {
-                    OperandSize::B32
-                } else {
-                    OperandSize::B64
-                };
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Imm(*val as i64),
-                    dst: GpOperand::Mem(temp_addr.clone()),
-                });
+                let width = if src_size <= 32 { 32 } else { 64 };
+                self.store_imm(*val, width, temp_addr.clone(), Reg::R10);
                 temp_addr
             }
             Loc::Global(name) => MemAddr::RipRelative(crate::arch::lir::Symbol {

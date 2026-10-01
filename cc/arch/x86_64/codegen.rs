@@ -157,6 +157,65 @@ impl X86_64CodeGen {
     }
 
     /// Convert a Loc to a GpOperand for LIR
+    /// `v` as an immediate operand of an instruction `size` bits wide, or
+    /// `None` when the encoding has no room for it.
+    ///
+    /// x86-64 takes at most a sign-extended 32-bit immediate everywhere but
+    /// `movabs` to a register: a 64-bit instruction cannot add, compare or
+    /// store anything wider. A 32-bit instruction takes any 32-bit pattern.
+    /// The one statement of that rule; three emitters checked it themselves
+    /// and the x87 conversion did not, storing `$9223372036854775807` to
+    /// memory, which the assembler rejects.
+    pub(super) fn imm_operand(v: i128, size: u32) -> Option<GpOperand> {
+        let fits = if size <= 32 {
+            i32::try_from(v).is_ok() || u32::try_from(v).is_ok()
+        } else {
+            i32::try_from(v).is_ok()
+        };
+        fits.then_some(GpOperand::Imm(v as i64))
+    }
+
+    /// The operand for `src`, at location `loc`, of an instruction `size`
+    /// bits wide: what `loc_to_gp_operand` gives, except that an immediate the
+    /// encoding cannot take is materialized into `scratch` first.
+    pub(super) fn gp_operand_via(
+        &mut self,
+        src: PseudoId,
+        loc: &Loc,
+        size: u32,
+        scratch: Reg,
+    ) -> GpOperand {
+        match loc {
+            Loc::Imm(v) if Self::imm_operand(*v, size).is_none() => {
+                self.emit_move(src, scratch, size);
+                GpOperand::Reg(scratch)
+            }
+            _ => self.loc_to_gp_operand(loc),
+        }
+    }
+
+    /// Store the constant `v`, `size` bits wide, to `addr` -- through
+    /// `scratch` when no immediate encoding holds it. `scratch` must not be a
+    /// register `addr` is formed from.
+    pub(super) fn store_imm(&mut self, v: i128, size: u32, addr: MemAddr, scratch: Reg) {
+        let op_size = OperandSize::from_bits(size.max(32));
+        let src = match Self::imm_operand(v, size) {
+            Some(imm) => imm,
+            None => {
+                self.push_lir(X86Inst::MovAbs {
+                    imm: v as i64,
+                    dst: scratch,
+                });
+                GpOperand::Reg(scratch)
+            }
+        };
+        self.push_lir(X86Inst::Mov {
+            size: op_size,
+            src,
+            dst: GpOperand::Mem(addr),
+        });
+    }
+
     pub(super) fn loc_to_gp_operand(&self, loc: &Loc) -> GpOperand {
         match loc {
             Loc::Reg(r) => GpOperand::Reg(*r),

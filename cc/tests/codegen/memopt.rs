@@ -19,7 +19,10 @@ use crate::codegen::asm_probe::{
     asm_for_with, assert_body_contains, assert_body_lacks, body_of, count_in_body, AARCH64_LINUX,
     X86_64_LINUX,
 };
-use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_two_units, run_c17};
+use crate::common::{
+    compile_and_run, compile_and_run_aarch64, compile_and_run_optimized, compile_and_run_two_units,
+    run_c17,
+};
 
 fn at_o2(name: &str, code: &str) -> i32 {
     compile_and_run(name, code, &["-O2".to_string()])
@@ -1712,4 +1715,37 @@ void probe(void) { pbfqobj.f; }
             "reading an ordinary bit-field has no effect and is dead code",
         );
     }
+}
+
+/// No copy survives optimization when every one of them is a no-op.
+///
+/// Promotion out of memory gives every read of a local its own `Copy`, and
+/// nothing removed them: five ordinary functions came out of `-O2` with more
+/// than a quarter of their IR as copies and close to half their instructions
+/// as register-to-register moves, and aarch64 swapped `a + b`'s operands
+/// through a temporary. Copy propagation forwards each use to the source.
+#[test]
+fn memopt_no_op_copies_are_propagated_away() {
+    let src = "\
+int add2(int a, int b) { return a + b; }
+long sum(const long *p, int n) { long s = 0; for (int i = 0; i < n; i++) s += p[i]; return s; }
+int maxi(int a, int b, int c) { int m = a; if (b > m) m = b; if (c > m) m = c; return m; }
+unsigned hash(const char *s) { unsigned h = 5381; while (*s) h = h * 33 + (unsigned char)*s++; return h; }
+";
+    for target in [X86_64_LINUX, AARCH64_LINUX] {
+        let ir = post_opt_ir("copyprop", src, target);
+        let copies: Vec<&str> = ir.lines().filter(|l| l.contains("= copy.")).collect();
+        assert!(
+            copies.is_empty(),
+            "{target}: copies left:\n{}",
+            copies.join("\n")
+        );
+    }
+    // And the program still computes what it did.
+    let run = format!(
+        "{src}int main(void) {{ long a[] = {{1, 2, 3}}; \
+         return add2(2, 3) == 5 && sum(a, 3) == 6 && maxi(1, 7, 3) == 7 \
+         && hash(\"\") == 5381 ? 0 : 1; }}\n"
+    );
+    assert_eq!(compile_and_run_optimized("copyprop_run", &run), 0);
 }

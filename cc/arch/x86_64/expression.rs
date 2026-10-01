@@ -120,23 +120,7 @@ impl X86_64CodeGen {
             // Non-shift binary ops: move src1 into work_reg first
             self.emit_move(src1, work_reg, size);
             let src2_loc = self.get_location(src2);
-            // For 64-bit operations, check if immediate fits in 32-bit signed range.
-            // x86-64 binary ops (add, sub, and, or, xor) only support 32-bit sign-extended immediates.
-            // If the immediate doesn't fit, load it into R11 first.
-            let src2_gp = match &src2_loc {
-                Loc::Imm(v)
-                    if size == 64
-                        && (*v as i64 > i32::MAX as i64 || (*v as i64) < i32::MIN as i64) =>
-                {
-                    // Large 64-bit immediate - load into R11 first
-                    self.push_lir(X86Inst::MovAbs {
-                        imm: *v as i64,
-                        dst: Reg::R11,
-                    });
-                    GpOperand::Reg(Reg::R11)
-                }
-                _ => self.loc_to_gp_operand(&src2_loc),
-            };
+            let src2_gp = self.gp_operand_via(src2, &src2_loc, size, Reg::R11);
             // LIR: binary operation (add, sub, and, or, xor)
             match insn.op {
                 Opcode::Add => self.push_lir(X86Inst::Add {
@@ -229,16 +213,7 @@ impl X86_64CodeGen {
         self.emit_move(src1, dst_reg, size);
         let src2_loc = self.get_location(src2);
 
-        // Check if src2 is a large immediate that doesn't fit in 32-bit signed
-        // x86-64 imul with immediate only accepts 32-bit immediates
-        let src2_gp = match &src2_loc {
-            Loc::Imm(v) if (*v as i64 > i32::MAX as i64 || (*v as i64) < i32::MIN as i64) => {
-                // Large immediate - must load into register first
-                self.emit_move(src2, Reg::R11, size);
-                GpOperand::Reg(Reg::R11)
-            }
-            _ => self.loc_to_gp_operand(&src2_loc),
-        };
+        let src2_gp = self.gp_operand_via(src2, &src2_loc, size, Reg::R11);
 
         // LIR: 2-operand imul instruction
         self.push_lir(X86Inst::IMul2 {
@@ -364,24 +339,13 @@ impl X86_64CodeGen {
         };
 
         let src2_loc = self.get_location(src2);
-        // x86-64 cmp instruction only supports 32-bit signed immediates
-        // For larger values, we need to load into a register first
-        let src2_gp = match &src2_loc {
-            Loc::Imm(v) if (*v as i64 > i32::MAX as i64 || (*v as i64) < i32::MIN as i64) => {
-                // Large immediate - load into a different scratch register
-                let scratch = if work_reg == Reg::R10 {
-                    Reg::R11
-                } else {
-                    Reg::R10
-                };
-                self.push_lir(X86Inst::MovAbs {
-                    imm: *v as i64,
-                    dst: scratch,
-                });
-                GpOperand::Reg(scratch)
-            }
-            _ => self.loc_to_gp_operand(&src2_loc),
+        // Through a scratch other than the one holding the first operand.
+        let scratch = if work_reg == Reg::R10 {
+            Reg::R11
+        } else {
+            Reg::R10
         };
+        let src2_gp = self.gp_operand_via(src2, &src2_loc, size, scratch);
 
         // LIR: compare instruction
         self.push_lir(X86Inst::Cmp {

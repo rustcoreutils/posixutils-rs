@@ -852,6 +852,25 @@ pub fn identify_addr_taken_syms(func: &Function) -> HashSet<PseudoId> {
 ///
 /// Note: FP comparisons (FCmpOxx) produce integer results (0 or 1), so their
 /// targets should NOT be in FP registers.
+/// Every argument pseudo with the declared type of the parameter it carries.
+///
+/// What an argument *is* comes from the parameter list, not from the
+/// instructions that happen to use it. The classifications below used to be
+/// inferred from uses alone, which worked only while every parameter was
+/// copied into a typed pseudo at entry: once copy propagation let a
+/// `__float128` argument flow straight into a call, nothing typed it, and it
+/// got an 8-byte slot it was stored into with `movsd` and reloaded from with
+/// `movups`.
+pub fn arg_pseudo_types(func: &Function) -> Vec<(PseudoId, TypeId)> {
+    func.pseudos
+        .iter()
+        .filter_map(|p| match p.kind {
+            PseudoKind::Arg(n) => func.param_type_of_arg(n).map(|t| (p.id, t)),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn identify_fp_pseudos<F>(func: &Function, is_float_type: F) -> HashSet<PseudoId>
 where
     F: Fn(TypeId) -> bool,
@@ -864,6 +883,11 @@ where
     for pseudo in &func.pseudos {
         if matches!(pseudo.kind, PseudoKind::FVal(_)) {
             fp_pseudos.insert(pseudo.id);
+        }
+    }
+    for (p, t) in arg_pseudo_types(func) {
+        if is_float_type(t) {
+            fp_pseudos.insert(p);
         }
     }
 

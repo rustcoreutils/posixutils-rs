@@ -667,13 +667,21 @@ fn codegen_aarch64_va_list_argument_matches_the_target_spelling() {
     let darwin = asm_for("va_list_arg_darwin", "aarch64-apple-darwin", src);
     let d = body_of(&darwin, "fmt");
     let call = d.split("bl _vsnprintf").next().unwrap_or(d);
+    // Whichever register carries the fourth argument into `x3`, it must hold
+    // what was loaded out of the frame, not a frame address.
+    let carrier = call
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("mov x3, "))
+        .next_back()
+        .unwrap_or("x3");
     assert!(
-        call.contains("ldr x23, [x29,"),
+        call.contains(&format!("ldr {carrier}, [x29,")),
         "Darwin's va_list is a pointer; its value must be loaded, not its \
          address taken:\n{d}"
     );
     assert!(
-        !call.contains("add x23, x29,"),
+        !call.contains(&format!("add {carrier}, x29,")),
         "passing the address of a Darwin va_list gives vsnprintf a pointer \
          to a pointer:\n{d}"
     );
@@ -682,8 +690,14 @@ fn codegen_aarch64_va_list_argument_matches_the_target_spelling() {
     let linux = asm_for("va_list_arg_linux", "aarch64-unknown-linux-gnu", src);
     let l = body_of(&linux, "fmt");
     let call = l.split("bl vsnprintf").next().unwrap_or(l);
+    let carrier = call
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("mov x3, "))
+        .next_back()
+        .unwrap_or("x3");
     assert!(
-        call.contains("add x23, x29,"),
+        call.contains(&format!("add {carrier}, x29,")),
         "AAPCS64 passes the 32-byte va_list record by reference:\n{l}"
     );
 }
@@ -2016,8 +2030,9 @@ long k_cplx(long a, _Complex __int128 z, long b, long c) { return a + b + c; }
         let asm = asm_for_with("cplx_i128_arg", triple, src, &["-O1"]);
 
         // Caller: the last argument lands in x3, because the one before it
-        // took a single register. The immediate is materialized into a
-        // scratch first, so follow that one move.
+        // took a single register. The immediate is materialized either
+        // straight into its argument register or into a scratch first, in
+        // which case follow that one move.
         let last_arg_register = |func: &str| -> String {
             let body = body_of(&asm, func);
             let scratch = body
@@ -2026,6 +2041,14 @@ long k_cplx(long a, _Complex __int128 z, long b, long c) { return a + b + c; }
                 .find_map(|l| l.strip_prefix("movz ")?.split_once(", #3333"))
                 .map(|(r, _)| r.to_string())
                 .unwrap_or_else(|| panic!("{func}: nothing materializes 3333:\n{body}"));
+            let is_arg_reg = |r: &str| {
+                r.strip_prefix('x')
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .is_some_and(|n| n < 8)
+            };
+            if is_arg_reg(&scratch) {
+                return scratch;
+            }
             body.lines()
                 .map(str::trim)
                 .find_map(|l| {

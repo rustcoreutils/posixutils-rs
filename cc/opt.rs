@@ -12,6 +12,7 @@
 use gettextrs::gettext;
 
 use crate::ir::constglobal;
+use crate::ir::copyprop;
 use crate::ir::dce;
 use crate::ir::dse;
 use crate::ir::ifconv;
@@ -357,10 +358,17 @@ fn optimize_function(
         // `instcombine` can make them; what it leaves -- a constant, a load
         // of one byte, a `Select` -- is theirs and `loadfwd`'s next round.
         let lf_fold_changed = libcall_fold::run(func, fold);
+        // `copyprop` once everything above has made its copies, so that
+        // `dce` below collects the ones it leaves unused.
+        let cp_changed = copyprop::run(func, types);
         // `dse` before `dce`, so the value chain feeding a killed store is
         // swept in the same iteration rather than surviving to the next one.
         let dse_changed = dse::run(func, types, mi);
         let dce_changed = dce::run(func);
+        // Every pass above skips the `Nop`s the others leave, and they only
+        // accumulate; nothing refers to an instruction by position across
+        // passes, so they can go.
+        func.remove_nops();
 
         if !mx_changed
             && !lf_changed
@@ -369,6 +377,7 @@ fn optimize_function(
             && !sccp_changed
             && !ic_changed
             && !lf_fold_changed
+            && !cp_changed
             && !dse_changed
             && !dce_changed
         {

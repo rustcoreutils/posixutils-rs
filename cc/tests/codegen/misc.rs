@@ -16755,3 +16755,140 @@ int main(void)
         0
     );
 }
+
+/// A narrow constant is extended when it is compiled, not when it runs, and a
+/// narrow value is extended by its type's signedness either way.
+///
+/// `char buf[16] = {0}` spent a `shll $24; sarl $24` pair on the zero byte it
+/// stored, even at `-O2`: the copy of the constant to a `char` survived, and
+/// the back end sign-extended whatever it held at run time. Copy propagation
+/// now stores the constant directly, and a narrow copy of a constant that
+/// does survive is materialized already extended. The program half pins the
+/// values a narrowing conversion produces, on both targets.
+#[test]
+fn codegen_a_narrow_constant_is_extended_at_compile_time() {
+    let src = "void use(char *);\nvoid zeroed(void) { char buf[16] = {0}; use(buf); }\n";
+    let asm = asm_for_with("narrow_const", X86_64_LINUX, src, &["-O2"]);
+    let body = body_of(&asm, "zeroed");
+    assert!(!body.contains("sarl $24"), "{body}");
+    assert!(!body.contains("shll $24"), "{body}");
+
+    let run = r#"
+__attribute__((noinline)) int sc(int x) { signed char c = x; return c; }
+__attribute__((noinline)) int uc(int x) { unsigned char c = x; return c; }
+__attribute__((noinline)) int ss(int x) { short c = x; return c; }
+__attribute__((noinline)) int us(int x) { unsigned short c = x; return c; }
+__attribute__((noinline)) int k200(void) { signed char c = 200; return c; }
+__attribute__((noinline)) int k200u(void) { unsigned char c = 200; return c; }
+int main(void) {
+    if (sc(300) != 44 || uc(300) != 44 || ss(70000) != 4464 || us(70000) != 4464)
+        return 1;
+    if (k200() != -56 || k200u() != 200) return 2;
+    return 0;
+}
+"#;
+    for level in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("narrow_values{level}"), run, &[level.to_string()]),
+            0,
+            "{level}"
+        );
+        if let Some(rc) = compile_and_run_aarch64("narrow_values_a64", run, level) {
+            assert_eq!(rc, 0, "aarch64 {level}");
+        }
+    }
+}
+
+/// An argument of every class survives being used after a call, and after
+/// being handed straight to one.
+///
+/// What an argument is comes from the parameter list. The back ends inferred
+/// a `long double`, `__float128` or `__int128` argument's class from the
+/// instructions using it, which held only while every parameter was copied
+/// into a typed pseudo at entry. With the copies propagated away, a
+/// `__float128` argument passed straight to a call got an 8-byte slot, was
+/// stored with `movsd` and reloaded with `movups`.
+#[test]
+fn codegen_arguments_keep_their_class_without_entry_copies() {
+    let src = r#"
+__attribute__((noinline)) void clob(void) { volatile double x = 1; volatile long y = 2; (void)x; (void)y; }
+__attribute__((noinline)) int pass_q(_Float128 a, _Float128 b) { return a < b; }
+__attribute__((noinline)) int fi(int a) { clob(); return a; }
+__attribute__((noinline)) double fd(double a) { clob(); return a; }
+__attribute__((noinline)) long double fl(long double a) { clob(); return a; }
+__attribute__((noinline)) _Float128 fq(_Float128 a, _Float128 b) { if (!pass_q(a, b)) return 0; clob(); return a + b; }
+__attribute__((noinline)) __int128 fx(__int128 a) { clob(); return a; }
+__attribute__((noinline)) float ff(float a, float b) { clob(); return a + b; }
+struct S { long a, b; };
+__attribute__((noinline)) long fs(struct S s) { clob(); return s.a + s.b; }
+int main(void) {
+    if (fi(7) != 7) return 1;
+    if (fd(2.5) != 2.5) return 2;
+    if (fl(3.5L) != 3.5L) return 3;
+    if (fq(4.5F128, 5.0F128) != 9.5F128) return 4;
+    if (fx((__int128)5 << 70) != ((__int128)5 << 70)) return 5;
+    if (ff(1.5f, 2.0f) != 3.5f) return 6;
+    struct S s = { 3, 4 };
+    if (fs(s) != 7) return 7;
+    return 0;
+}
+"#;
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    for level in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("arg_classes{level}"), src, &[level.to_string()]),
+            0,
+            "{level}"
+        );
+        if let Some(rc) = compile_and_run_aarch64("arg_classes_a64", src, level) {
+            assert_eq!(rc, 0, "aarch64 {level}");
+        }
+    }
+}
+
+/// `va_arg` through a pointer to a `va_list`, for every class the x86-64
+/// lowering has a path for, and a 64-bit constant converted to `long double`.
+///
+/// Both were reachable only once copy propagation stopped putting every
+/// operand through a register first. The floating `va_arg` path sign-extended
+/// `fp_offset` into R11 -- the register holding the `va_list` pointer -- and
+/// stored the advanced offset through the clobbered value; the x87 path
+/// advanced `overflow_arg_area` in R11 the same way. And the x87 conversion
+/// stored a constant past 32 bits straight to memory, which no x86-64
+/// instruction encodes.
+#[test]
+fn codegen_va_arg_through_a_pointer_and_wide_constant_conversions() {
+    let src = r#"
+#include <stdarg.h>
+__attribute__((noinline)) int take(va_list *ap) {
+    if (va_arg(*ap, int) != 7) return 1;
+    if (va_arg(*ap, double) != 0.5) return 2;
+    if (va_arg(*ap, long double) != 2.25L) return 3;
+    if (va_arg(*ap, int) != 9) return 4;
+    return 0;
+}
+__attribute__((noinline)) int outer(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    int r = take(&ap);
+    va_end(ap);
+    return r;
+}
+__attribute__((noinline)) long double widest(void) { return 9223372036854775807LL; }
+int main(void) {
+    int r = outer(0, 7, 0.5, 2.25L, 9);
+    if (r) return r;
+    if (widest() != 9223372036854775807.0L) return 10;
+    return 0;
+}
+"#;
+    for level in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("va_arg_ptr{level}"), src, &[level.to_string()]),
+            0,
+            "{level}"
+        );
+    }
+}

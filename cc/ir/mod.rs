@@ -13,8 +13,9 @@
 
 mod build;
 pub mod cfg;
-mod constfold;
+pub(crate) mod constfold;
 pub mod constglobal;
+pub mod copyprop;
 pub mod dce;
 pub mod dominate;
 pub mod dse;
@@ -2348,6 +2349,14 @@ impl Function {
         self.block_idx
             .get(&id)
             .and_then(|&idx| self.blocks.get_mut(idx))
+    }
+
+    /// Drop every `Nop`: they hold nothing (`Instruction::kill` resets the
+    /// whole instruction), and every pass pays to skip them.
+    pub fn remove_nops(&mut self) {
+        for bb in &mut self.blocks {
+            bb.insns.retain(|i| i.op != Opcode::Nop);
+        }
     }
 
     /// Add a pseudo for tracking

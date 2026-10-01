@@ -1242,6 +1242,11 @@ impl RegAlloc {
     /// Identify pseudos that are long double (80-bit extended precision).
     /// These use x87 FPU instead of XMM and need 16-byte stack slots.
     fn identify_ld_pseudos(&mut self, func: &Function, types: &TypeTable) {
+        for (p, t) in crate::arch::regalloc::arg_pseudo_types(func) {
+            if types.kind(t) == crate::types::TypeKind::LongDouble {
+                self.ld_pseudos.insert(p);
+            }
+        }
         for block in &func.blocks {
             for insn in &block.insns {
                 // Check if this instruction operates on long double
@@ -1309,6 +1314,11 @@ impl RegAlloc {
     /// wide on this target, and giving it a binary128 slot or a 16-byte move
     /// would be wrong in both directions.
     fn identify_quad_pseudos(&mut self, func: &Function, types: &TypeTable) {
+        for (p, t) in crate::arch::regalloc::arg_pseudo_types(func) {
+            if types.kind(t) == crate::types::TypeKind::Float128 {
+                self.quad_pseudos.insert(p);
+            }
+        }
         for block in &func.blocks {
             for insn in &block.insns {
                 let is_quad = insn
@@ -1335,6 +1345,11 @@ impl RegAlloc {
     /// Identify pseudos that are 128-bit integers (__int128).
     /// These need 16-byte stack slots and must never be allocated to GP registers.
     fn identify_int128_pseudos(&mut self, func: &Function, types: &TypeTable) {
+        for (p, t) in crate::arch::regalloc::arg_pseudo_types(func) {
+            if types.is_plain_int128(t) {
+                self.int128_pseudos.insert(p);
+            }
+        }
         // First pass: identify targets of 128-bit instructions and all sources
         // of 128-bit binary/unary ops.
         for block in &func.blocks {

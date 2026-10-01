@@ -914,6 +914,13 @@ impl Aarch64CodeGen {
         } else {
             // Integer copy
             match &dst_loc {
+                // A narrow constant is extended now rather than at run time,
+                // as on x86-64.
+                Loc::Reg(r) if actual_size < 32 && matches!(src_loc, Loc::Imm(_)) => {
+                    let Loc::Imm(v) = src_loc else { unreachable!() };
+                    let v = crate::ir::constfold::at_width(v, actual_size, !is_unsigned);
+                    self.emit_mov_imm(*r, v as i64, 32);
+                }
                 Loc::Reg(r) => {
                     self.emit_move(src, *r, reg_size);
                     // For narrow types (8 or 16 bits), extend to correct width

@@ -1468,56 +1468,46 @@ impl X86_64CodeGen {
             // Integer copy
             match &dst_loc {
                 Loc::Reg(r) => {
-                    self.emit_move(src, *r, reg_size);
-                    // For narrow types (8 or 16 bits), truncate to correct width
-                    // Unsigned: zero-extend (AND mask)
-                    // Signed: sign-extend (shift left then arithmetic shift right)
-                    if actual_size == 8 {
-                        if is_unsigned {
-                            // LIR: zero-extend with AND mask
-                            self.push_lir(X86Inst::And {
+                    // A narrow value is kept extended to 32 bits by its type's
+                    // signedness, which is what every consumer reads.
+                    let narrow = match actual_size {
+                        8 => Some(OperandSize::B8),
+                        16 => Some(OperandSize::B16),
+                        _ => None,
+                    };
+                    match (narrow, &src_loc) {
+                        // A constant is extended now rather than at run time:
+                        // `char buf[16] = {0}` spent a shift pair on every
+                        // zero byte.
+                        (Some(_), Loc::Imm(v)) => {
+                            let v = crate::ir::constfold::at_width(*v, actual_size, !is_unsigned);
+                            self.push_lir(X86Inst::Mov {
                                 size: OperandSize::B32,
-                                src: GpOperand::Imm(0xFF),
-                                dst: *r,
-                            });
-                        } else {
-                            // Sign-extend: shift left 24 bits then arithmetic shift right 24 bits
-                            // LIR: shift left
-                            self.push_lir(X86Inst::Shl {
-                                size: OperandSize::B32,
-                                count: ShiftCount::Imm(24),
-                                dst: *r,
-                            });
-                            // LIR: arithmetic shift right
-                            self.push_lir(X86Inst::Sar {
-                                size: OperandSize::B32,
-                                count: ShiftCount::Imm(24),
-                                dst: *r,
+                                src: GpOperand::Imm(v as i64),
+                                dst: GpOperand::Reg(*r),
                             });
                         }
-                    } else if actual_size == 16 {
-                        if is_unsigned {
-                            // LIR: zero-extend with AND mask
-                            self.push_lir(X86Inst::And {
-                                size: OperandSize::B32,
-                                src: GpOperand::Imm(0xFFFF),
-                                dst: *r,
-                            });
-                        } else {
-                            // Sign-extend: shift left 16 bits then arithmetic shift right 16 bits
-                            // LIR: shift left
-                            self.push_lir(X86Inst::Shl {
-                                size: OperandSize::B32,
-                                count: ShiftCount::Imm(16),
-                                dst: *r,
-                            });
-                            // LIR: arithmetic shift right
-                            self.push_lir(X86Inst::Sar {
-                                size: OperandSize::B32,
-                                count: ShiftCount::Imm(16),
-                                dst: *r,
+                        (Some(src_size), _) => {
+                            self.emit_move(src, *r, reg_size);
+                            let src = GpOperand::Reg(*r);
+                            let dst_size = OperandSize::B32;
+                            self.push_lir(if is_unsigned {
+                                X86Inst::Movzx {
+                                    src_size,
+                                    dst_size,
+                                    src,
+                                    dst: *r,
+                                }
+                            } else {
+                                X86Inst::Movsx {
+                                    src_size,
+                                    dst_size,
+                                    src,
+                                    dst: *r,
+                                }
                             });
                         }
+                        (None, _) => self.emit_move(src, *r, reg_size),
                     }
                 }
                 Loc::Stack(_) => {

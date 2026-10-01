@@ -34,6 +34,25 @@ jobs:
           # Second pass: fail if any warnings exist
           cargo clippy --all-targets -- -D warnings
 
+  # The declared minimum Rust (Cargo.toml's rust-version) has to build the
+  # workspace. The other jobs use the latest stable, so a dependency or a
+  # language feature that raises the floor would otherwise go unnoticed.
+  msrv:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read rust-version
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the workspace
+        run: cargo check --workspace --all-targets
+
   linux-ubuntu:
     needs: lint
     runs-on: ubuntu-latest

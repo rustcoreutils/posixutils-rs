@@ -2016,8 +2016,8 @@ __attribute__((used)) static int used_var;
 #if !__has_attribute(ms_abi) || !__has_attribute(gnu_inline)
 #error "__has_attribute must admit the attributes the compiler honours"
 #endif
-#if __has_attribute(vector_size)
-#error "__has_attribute must not claim an attribute the compiler ignores"
+#if !__has_attribute(vector_size) || !__has_attribute(__mode__)
+#error "__has_attribute must admit the type attributes the compiler implements"
 #endif
 #if !__has_attribute(weak) || !__has_attribute(transparent_union)
 #error "__has_attribute must admit the attributes the compiler accepts"

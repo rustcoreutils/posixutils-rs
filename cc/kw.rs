@@ -1016,6 +1016,8 @@ define_keywords! {
     (_, "artificial",              SUPPORTED_ATTR),
     (_, "sysv_abi",                SUPPORTED_ATTR),
     (_, "ms_abi",                  SUPPORTED_ATTR),
+    (_, "mode",                    SUPPORTED_ATTR),
+    (_, "vector_size",             SUPPORTED_ATTR),
     // Parsed and ignored. Recognised so that a build does not drown in
     // warnings for the attributes glibc's headers put on everything; each
     // is semantically free, or free enough that ignoring it cannot change
@@ -1071,6 +1073,8 @@ define_keywords! {
     (_, "__artificial__",            SUPPORTED_ATTR),
     (_, "__sysv_abi__",              SUPPORTED_ATTR),
     (_, "__ms_abi__",                SUPPORTED_ATTR),
+    (_, "__mode__",                  SUPPORTED_ATTR),
+    (_, "__vector_size__",           SUPPORTED_ATTR),
     (_, "__nonnull__",               SUPPORTED_ATTR),
     (_, "__returns_nonnull__",       SUPPORTED_ATTR),
     (_, "__nothrow__",               SUPPORTED_ATTR),
@@ -1413,6 +1417,10 @@ mod tests {
             "__packed__",
             "always_inline",
             "__always_inline__",
+            "mode",
+            "__mode__",
+            "vector_size",
+            "__vector_size__",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);

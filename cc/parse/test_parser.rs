@@ -7773,6 +7773,26 @@ fn test_vector_size_type_is_marked() {
     assert!(!types.is_vector(symbols.get(decl.declarators[0].symbol).typ));
 }
 
+/// `mode` and `vector_size` are recognised by their `SUPPORTED_ATTR` tag like
+/// every other attribute: both spellings apply, and a spelling the table does
+/// not list is warned about as ignored and is ignored.
+#[test]
+fn test_attr_mode_and_vector_size_follow_the_tag() {
+    for (src, size, vector) in [
+        ("int __attribute__((mode(QI))) x;", 1, false),
+        ("int __attribute__((__mode__(__QI__))) x;", 1, false),
+        ("int __attribute__((__mode(QI))) x;", 4, false),
+        ("int __attribute__((vector_size(8))) x;", 8, true),
+        ("int __attribute__((__vector_size__(8))) x;", 8, true),
+        ("int __attribute__((__vector_size(8))) x;", 4, false),
+    ] {
+        let (decl, types, _strings, symbols) = parse_decl(src).unwrap();
+        let typ = symbols.get(decl.declarators[0].symbol).typ;
+        assert_eq!(types.size_bytes(typ), size, "{src}");
+        assert_eq!(types.is_vector(typ), vector, "{src}");
+    }
+}
+
 /// Two tagless definitions with the same members are distinct types, while a
 /// qualified variant of one stays compatible with it (C17 6.7.2.3p5).
 #[test]

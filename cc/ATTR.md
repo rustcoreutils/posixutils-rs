@@ -139,8 +139,6 @@ Both evaluators read that one tag -- `eval_has_attribute` in
 `token/preprocess.rs` (`#if`) and the `BuiltinMacro::HasAttribute` arm in
 `token/preprocess_macro.rs` -- so there is no second list to keep in step.
 
-`mode` and `vector_size` are implemented but deliberately untagged, special-
-cased by name in `parse_single_attribute`; `__has_attribute` answers 0 for both.
 `cleanup` answers 0.
 
 ```c

@@ -75,7 +75,6 @@ impl AttrArgs {
             | "nonnull_if_nonzero"
             | "sentinel"
             | "regparm" => AttrArgs::Integers(IntArgRole::Unused),
-            "mode" => AttrArgs::General,
             _ if recognised => AttrArgs::General,
             _ => AttrArgs::Unknown,
         }
@@ -590,23 +589,8 @@ impl Parser<'_> {
         // in silence is survivable for an attribute that only hints, and is
         // not for one that changes what the type *is*.
         let recognised = id.is_some_and(|id| crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR));
-        if !recognised {
-            if name.trim_matches('_') == "vector_size" {
-                // Captured below, once the byte count is parsed, and applied
-                // with the other type attributes. c17 gives it the *storage* a
-                // vector has -- the right size and the right alignment -- and
-                // not vector arithmetic, which is what glibc's <link.h> needs
-                // and all it declares these types for. What cannot be done is
-                // ignore it: the type would stay scalar and every operation on
-                // it would silently compute on one element.
-            } else if name.trim_matches('_') == "mode" {
-                // Applied below, once the argument is parsed: a mode replaces
-                // the declared type, and getting it wrong is not cosmetic --
-                // glibc declares `register_t` with `__mode__(__word__)`, which
-                // c17 sized 4 bytes against gcc's 8 while this was a warning.
-            } else if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-                diag::warning_args(pos, "'{0}' attribute directive ignored", &[&name]);
-            }
+        if !recognised && diag::warning_group_enabled(ATTRIBUTE_WARNING) {
+            diag::warning_args(pos, "'{0}' attribute directive ignored", &[&name]);
         }
 
         let grammar = AttrArgs::of(&name, recognised);
@@ -620,14 +604,21 @@ impl Parser<'_> {
             self.check_integer_args(&name, role, &args, pos).ok()?;
         }
 
-        match (name.trim_matches('_'), args.first()) {
-            ("mode", Some(AttributeArg::Ident(m))) => {
+        // A mode or a vector width replaces the declared type, so each is
+        // held here and applied with the other type attributes once the type
+        // is final (`apply_pending_type_attrs`). Neither can be ignored: glibc
+        // declares `register_t` with `__mode__(__word__)`, and a vector left
+        // scalar would compute on one element. `vector_size` gets a vector's
+        // storage -- size and alignment -- and not vector arithmetic. Only a
+        // recognised spelling is applied: one warned about as ignored is not.
+        match (recognised, name.trim_matches('_'), args.first()) {
+            (true, "mode", Some(AttributeArg::Ident(m))) => {
                 self.pending_mode = Some((m.trim_matches('_').to_string(), pos));
             }
-            ("vector_size", Some(AttributeArg::Int(n))) => {
+            (true, "vector_size", Some(AttributeArg::Int(n))) => {
                 self.pending_vector_size = Some((u64::try_from(*n).unwrap_or(u64::MAX), pos));
             }
-            ("aligned", Some(AttributeArg::Int(n))) => {
+            (true, "aligned", Some(AttributeArg::Int(n))) => {
                 self.pending_attr_align = Some(*n as u32);
             }
             _ => {}

@@ -117,10 +117,11 @@ Both carry a **volatile marker**, `Instruction::is_volatile`, printed as a
 trailing `volatile` in a dump. Ask it through `Instruction::is_volatile_access`.
 The qualifier has to live on the *access* because it is not always on any
 object: for `volatile int *p`, `p` is an ordinary pointer and `*p` is the
-volatile object, so `LocalVar::is_volatile` and
+volatile object, so `LocalVar::is_ordinary` and
 `memloc::GlobalFacts::is_volatile` — which answer only for a named object —
-have nothing to say about it. Those two remain, and are still what a pass asks
-about the object as a whole; the marker is what it asks about the access.
+have nothing to say about it. Those two are what a pass asks about the object
+as a whole (`memloc::is_ordinary_object` asks both); the marker is what it asks
+about the access.
 
 `Linearizer::emit` sets the marker for every access the linearizer emits, from
 `types.contains_volatile` of the type that access reaches, and
@@ -265,6 +266,7 @@ Emitted by the mapping pass when the target lacks native 128-bit ops. They model
 | `entry` | Function entry point |
 | `nop` | No operation |
 | `asm` | Inline assembly (see `AsmData`) |
+| `lifetime.end` | The lifetime of the local `lifetime_of` names ends: control falls out of the block that declared it. Named out of band, never in `src`, so it is no use and no escape; kept by DCE, dropped with its local by `mem2reg`, and read by the allocators, which let locals whose lifetimes never meet share a slot |
 
 ## Data Structures
 
@@ -308,8 +310,9 @@ asm_data                - inline assembly
 ```
 id: BasicBlockId        - unique ID (.L{n})
 insns: Vec<Instruction> - instruction sequence
-parents/children        - CFG edges
-phi_map                 - var name -> phi index
+parents/children        - CFG edges: a cache of what the instructions name,
+                          edited only through `cfg.rs`
+addr_taken              - reached through `&&label`, by no recorded edge
 ```
 
 Dominator information is deliberately **not** here. It is an analysis result,
@@ -345,35 +348,50 @@ extern_symbols          - symbols needing GOT
 
 | File | Purpose |
 |------|---------|
-| `linearize.rs` (+ `_init.rs`, `_stmt.rs`, `_emit.rs`) | AST to IR; builds basic blocks. Split by responsibility: top-level/expr in `linearize.rs`, designated initializers in `_init.rs`, statements in `_stmt.rs`, helper emitters in `_emit.rs`. |
+| `linearize.rs` (+ `_init.rs`, `_stmt.rs`, `_emit.rs`) | AST to IR; builds basic blocks. Split by responsibility: top-level/expr in `linearize.rs`, designated initializers in `_init.rs`, statements in `_stmt.rs`, helper emitters in `_emit.rs`. Marks each block-scope local's `lifetime.end` |
 | `ssa.rs` | Memory to SSA; inserts phi nodes |
-| `dominate.rs` | Dominator tree (Cooper algorithm) |
-| `dce.rs` | Dead code elimination (mark-sweep on SSA roots, fold-branches-to-unreachable, unreachable-block removal) |
-| `constfold.rs` | Evaluating an operation over constants at the operand's own width and signedness, integer and floating alike. Not a pass -- the one place those rules are written, shared by `instcombine` and `sccp` |
+| `mem2reg.rs` | Drops the locals nothing references any more, with their lifetime markers. Run after SSA conversion and again after optimization |
+| `dominate.rs` | Dominator tree (Cooper algorithm) and iterated dominance frontiers |
+| `cfg.rs` | Every edit to the CFG: successors, edges, critical-edge splitting, unreachable-block removal, and `simplify_cfg` (forwarder threading and block merging) |
+| `validate.rs` | The IR invariants, checked after linearization, mapping and optimization and inside lowering on every compile; a violation is an internal compiler error |
+| `dce.rs` | Dead code elimination (mark-sweep on SSA roots, fold-branches-to-unreachable) |
+| `constfold.rs` | Evaluating an operation over constants at the operand's own width and signedness, integer and floating alike. Not a pass -- the one place those rules are written, shared by `instcombine`, `sccp`, `vrp`, `copyprop` and both back ends |
 | `instcombine.rs` | Constant folding, algebraic simplification |
-| `constglobal.rs` | Module pre-pass: a load of a `const` global becomes its initializer. Needs no alias or escape analysis -- modifying a `const`-defined object is undefined behaviour (C17 6.7.3p6) |
+| `constglobal.rs` | A load of a `const` global, by name or through its address, becomes its initializer. Needs no alias or escape analysis -- modifying a `const`-defined object is undefined behaviour (C17 6.7.3p6) |
 | `range.rs` | A set of W-bit integers as one interval that may wrap, with the transfer functions. Not a pass; no IR types, which is why it is tested exhaustively at four bits |
+| `dataflow.rs` | The sparse conditional solver (Wegman-Zadeck) `sccp` and `vrp` both run: seeding, executable-edge marking, the worklists, the step budget, and rewriting what a solution proves |
 | `vrp.rs` | Value-range propagation. The only pass that reads a *branch*: `var <= 0` being false says `var >= 1` on that edge. Runs before `ifconv`, which would otherwise collapse the diamond the fact hangs on |
-| `propagate.rs` | The rewrites an analysis performs once it has proved something -- a value to a constant, a conditional terminator to a `Br`. Shared by `sccp` and `vrp` |
+| `sccp.rs` | Sparse conditional constant propagation: constants along reachable paths only |
+| `propagate.rs` | The rewrites an analysis performs once it has proved something -- a value to a constant, a conditional terminator to a `Br` |
 | `facts.rs` | `ConstMap` and `CmpFacts`: what a pass knows about a pseudo before it rewrites anything. Shared queries, not rewrites |
-| `lower.rs` | φ elimination, and answering any `ConstantP` placeholder `sccp` never reached -- which is all of them at `-O0` |
+| `copyprop.rs` | Each use of a no-op copy -- same width, same register class -- reads the copy's source instead; `dce` collects the copies |
 | `ifconv.rs` | If-conversion: collapses a short-circuit `&&`/`||` diamond whose arm is safe to speculate into a `Select` |
-| `sccp.rs` | Sparse conditional constant propagation: constants along reachable paths only, and the only thing that folds a branch on a constant condition |
+| `memloc.rs`, `escape.rs`, `effects.rs` | What an access addresses, which locals' addresses escape, and what a call may do to memory: the facts the memory passes share |
+| `loadfwd.rs` | Store-to-load forwarding and redundant load elimination, and `MemOracle`, the walk they ask: what a location holds just before an instruction, as a pseudo or, for one byte, a constant |
+| `dse.rs` | Dead store elimination |
 | `inline.rs` | Function inlining |
 | `memexpand.rs` | A `memcpy`, `memset` or `memmove` of a small constant length becomes integer loads and stores, at every level. Also owns the chunking and the size limit the linearizer's aggregate copies use |
 | `build.rs` | `Builder`: the instructions that replace one instruction -- new pseudos, constants, loads, stores, operations -- at its source position. Not a pass; shared by `memexpand` and `libcall_fold` |
-| `loadfwd.rs` | Store-to-load forwarding and redundant load elimination, and `MemOracle`, the walk they ask: what a location holds just before an instruction, as a pseudo or, for one byte, a constant |
 | `strdata.rs` | The bytes of every object whose contents hold for the whole run (string literals, and `const` `char` arrays by `constglobal`'s rule), and the string a pointer into one reads -- or, for a length, the one length every `Select` and phi arm agrees on, which for a local array is what `MemOracle` says the stores before the call left in it. Not a pass |
 | `libcall_fold/` | A call the parser tagged as a known library function (`Instruction::known`) becomes its result where the arguments decide it: `strlen("abc")` is 3, `strcmp(p, "")` the first byte of `p`; and an output call whose result is unused becomes a cheaper one that writes the same bytes: `printf("hi\n")` is `puts("hi")`; and a `Memmove` whose blocks cannot overlap becomes a `Memcpy`. A dispatcher and one module per family of functions |
-| `lower.rs` | Phi elimination to copies |
+| `lower.rs` | Critical-edge splitting, φ elimination to copies, and answering any `ConstantP` placeholder `sccp` never reached -- which is all of them at `-O0` |
 
-The driver in `cc/opt.rs` runs `inline → memexpand → constglobal → (memexpand + loadfwd + vrp + ifconv + sccp + instcombine + libcall_fold + dse + dce)*` to fixed
+The driver in `cc/opt.rs` runs, from `-O1` up: one round of `sccp`,
+`instcombine`, `copyprop`, `dce` and `simplify_cfg` on every function, so the
+inliner sizes a callee by the code it will emit; `inline`; `memexpand`; then
+the passes in `opt::PASSES` to a fixed point -- `constglobal`, `memexpand`,
+`loadfwd`, `vrp`, `ifconv`, `sccp`, `instcombine`, `libcall_fold`,
+`copyprop`, `dse`, `dce`, `simplify_cfg` -- for at most `MAX_ITERATIONS`
+rounds; then `mem2reg`. The order inside the loop is load-bearing, and the
+reason for each pass's place is beside it in `PASSES`. A function still
+changing when the rounds run out is left as it is -- correct, only less
+optimized -- and reported, with the passes still moving, under
+`--dump-ir post-opt`.
 
-point (up to 10 iterations). The order inside the loop is load-bearing in both
-directions: `instcombine` derives constants `sccp` structurally cannot (`x - x`,
-`x ^ x`), any of which can make a branch condition constant, and `sccp` deletes
-no block -- it removes the dead edge and leaves the unreachable block, and the
-`PhiSource` of a folded phi, for `dce` to collect.
+CFG simplification runs only inside that loop. Critical edges are split once,
+at the top of lowering, immediately before φ elimination, and nothing merges
+blocks after it: merging would undo the splitting the copies depend on. See
+`cfg.rs`.
 
 ## Display Format
 

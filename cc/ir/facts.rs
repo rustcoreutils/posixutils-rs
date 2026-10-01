@@ -123,9 +123,9 @@ impl ConstMap {
         // pseudo has two defs. A tied operand (`"0"(x)`) is written as a
         // `Copy` into the output pseudo *before* the asm, so following that
         // copy answers with the asm's input where the question was about its
-        // result. `sccp::seed` already refuses these for the same reason; the
-        // two must agree, because a pass that folds what `sccp` would not is
-        // the one that miscompiles.
+        // result. `dataflow::Sparse` already refuses these for the same
+        // reason, for `sccp` and `vrp`; they must agree, because a pass that
+        // folds what those would not is the one that miscompiles.
         for bb in &func.blocks {
             for insn in &bb.insns {
                 let Some(ref asm) = insn.extra().asm_data else {
@@ -583,5 +583,148 @@ fn not(a: Relation) -> Relation {
             mask: !f.mask & f.domain.all(),
             ..f
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::constfold::CMP_LT;
+    use crate::ir::{BasicBlock, BasicBlockId, Instruction, Pseudo};
+    use crate::target::Target;
+    use crate::types::TypeTable;
+
+    /// `%1 = $v`; `%2 = copy.<copy_bits> %1`; `%3 = trunc.<trunc_bits> %2`;
+    /// `%4 = setlt.32 %2, %5` and `%6 = copy.32 %4`, with `%5` an argument.
+    fn chain(v: i128, copy_bits: u32, trunc_bits: u32) -> Function {
+        let types = TypeTable::new(&Target::host());
+        let int = types.int_id;
+        let mut f = Function::new("f", int);
+        f.add_pseudo(Pseudo::val(PseudoId(1), v));
+        f.add_pseudo(Pseudo::arg(PseudoId(5), 0));
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        let mut copy = Instruction::new(Opcode::Copy)
+            .with_target(PseudoId(2))
+            .with_src(PseudoId(1));
+        copy.size = copy_bits;
+        bb.add_insn(copy);
+        let mut trunc = Instruction::new(Opcode::Trunc)
+            .with_target(PseudoId(3))
+            .with_src(PseudoId(2));
+        trunc.size = trunc_bits;
+        trunc.src_size = copy_bits;
+        bb.add_insn(trunc);
+        bb.add_insn(Instruction::compare(
+            Opcode::SetLt,
+            PseudoId(4),
+            (PseudoId(2), PseudoId(5)),
+            (int, 32),
+            (int, 32),
+        ));
+        let mut copy = Instruction::new(Opcode::Copy)
+            .with_target(PseudoId(6))
+            .with_src(PseudoId(4));
+        copy.size = 32;
+        bb.add_insn(copy);
+        bb.add_insn(Instruction::ret(None));
+        f.add_block(bb);
+        f.entry = BasicBlockId(0);
+        f
+    }
+
+    /// A copy is the same value only at or below its own width: a narrower
+    /// one carries part of the value, and following it would equate two
+    /// pseudos that differ above it.
+    #[test]
+    fn root_follows_a_copy_only_at_its_width() {
+        let f = chain(5, 32, 8);
+        let m = ConstMap::new(&f);
+        assert_eq!(m.root(PseudoId(2), 32), PseudoId(1));
+        assert_eq!(
+            m.root(PseudoId(3), 8),
+            PseudoId(1),
+            "a trunc is its operand at its width"
+        );
+        assert_eq!(m.root(PseudoId(3), 32), PseudoId(3), "but no wider");
+    }
+
+    /// `get_at` reads a constant as the consumer says; `get`, which is told
+    /// nothing, refuses one that means two things at the width it passed.
+    #[test]
+    fn a_constant_is_read_at_the_width_and_sign_asked() {
+        let f = chain(200, 32, 8);
+        let m = ConstMap::new(&f);
+        assert_eq!(m.get(PseudoId(2)), Some(200));
+        assert_eq!(
+            m.get_at(PseudoId(3), 8, true),
+            Some(-56),
+            "(signed char)200"
+        );
+        assert_eq!(m.get_at(PseudoId(3), 8, false), Some(200));
+        assert_eq!(m.get(PseudoId(3)), None, "200 at 8 bits is -56 or 200");
+        assert_eq!(
+            m.get_at(PseudoId(3), 32, true),
+            None,
+            "truncated below the width asked"
+        );
+    }
+
+    /// A recorded fold is believed only when it reads one way at its width.
+    #[test]
+    fn record_int_refuses_an_ambiguous_constant() {
+        let f = chain(1, 32, 8);
+        let mut m = ConstMap::new(&f);
+        m.record_int(PseudoId(9), 8, 0xff);
+        assert_eq!(m.get(PseudoId(9)), None);
+        m.record_int(PseudoId(9), 8, 5);
+        assert_eq!(m.get(PseudoId(9)), Some(5));
+    }
+
+    /// A comparison's operands are recorded by their roots, so a copy of an
+    /// operand is the same operand, and `get_through` reads the fact
+    /// through a copy of the result.
+    #[test]
+    fn a_comparison_is_recorded_by_its_operands_roots() {
+        let f = chain(7, 32, 8);
+        let consts = ConstMap::new(&f);
+        let cmps = CmpFacts::new(&f, &consts);
+        let fact = cmps.get(PseudoId(4)).expect("setlt records a fact");
+        assert_eq!(fact.lhs, PseudoId(1), "through the copy to the constant");
+        assert_eq!(fact.rhs, PseudoId(5));
+        assert_eq!(fact.mask, CMP_LT);
+        assert_eq!(fact.width, 32);
+        assert!(matches!(fact.domain, CmpDomain::Int { signed: true }));
+        assert!(cmps.get(PseudoId(6)).is_none());
+        assert_eq!(
+            cmps.get_through(&consts, PseudoId(6), 32).map(|f| f.mask),
+            Some(CMP_LT)
+        );
+    }
+
+    /// An inline-asm output is defined twice, once by the asm, so a copy
+    /// into it says nothing about its value.
+    #[test]
+    fn an_asm_output_is_no_copy() {
+        let mut f = chain(7, 32, 8);
+        let mut asm = Instruction::new(Opcode::Asm);
+        asm.extra_mut().asm_data = Some(Box::new(crate::ir::AsmData {
+            template: String::new(),
+            outputs: vec![crate::ir::AsmConstraint {
+                pseudo: PseudoId(2),
+                name: None,
+                matching_output: None,
+                constraint: "=r".into(),
+                size: 32,
+                offset: 0,
+            }],
+            inputs: vec![],
+            clobbers: vec![],
+            goto_labels: vec![],
+        }));
+        f.blocks[0].insns.insert(2, asm);
+        let m = ConstMap::new(&f);
+        assert_eq!(m.get(PseudoId(2)), None);
+        assert_eq!(m.root(PseudoId(2), 32), PseudoId(2));
     }
 }

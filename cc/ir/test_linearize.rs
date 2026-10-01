@@ -88,6 +88,18 @@ impl TestContext {
     }
 }
 
+/// Whether any instruction of `module` is one of `ops`: the structural form
+/// of asking a dump whether an opcode's name appears in it, which a longer
+/// name or an operand containing it would also answer.
+fn has_op(module: &Module, ops: &[Opcode]) -> bool {
+    module
+        .functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insns)
+        .any(|i| ops.contains(&i.op))
+}
+
 fn test_linearize(tu: &TranslationUnit, types: &TypeTable, strings: &StringTable) -> Module {
     let symbols = SymbolTable::new();
     let target = Target::host();
@@ -150,7 +162,7 @@ fn test_parameter_stored_to_local() {
     // The parameter should be stored to a local variable
     // Look for store instruction in the entry block
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Parameter should be stored to local for SSA: {}",
         ir
     );
@@ -208,7 +220,11 @@ fn test_function_with_many_params() {
     assert!(ir.contains("%a"), "IR should have first param: {}", ir);
     assert!(ir.contains("%h"), "IR should have last param: {}", ir);
     // Should have add operation for a + h
-    assert!(ir.contains("add"), "IR should have add for a + h: {}", ir);
+    assert!(
+        has_op(&module, &[Opcode::Add]),
+        "IR should have add for a + h: {}",
+        ir
+    );
 }
 
 // Compound assignment lvalue tests
@@ -269,17 +285,17 @@ fn test_compound_assignment_deref() {
 
     // The IR should have load and store for the dereferenced pointer
     assert!(
-        ir.contains("load"),
+        has_op(&module, &[Opcode::Load]),
         "Compound assignment to *p should load: {}",
         ir
     );
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Compound assignment to *p should store: {}",
         ir
     );
     assert!(
-        ir.contains("add"),
+        has_op(&module, &[Opcode::Add]),
         "Compound assignment += should have add: {}",
         ir
     );
@@ -351,12 +367,12 @@ fn test_compound_assignment_index() {
     // The IR should have load and store for the array element
     // Also should have index calculation (mul for offset)
     assert!(
-        ir.contains("load"),
+        has_op(&module, &[Opcode::Load]),
         "Compound assignment to arr[i] should load: {}",
         ir
     );
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Compound assignment to arr[i] should store: {}",
         ir
     );
@@ -419,7 +435,7 @@ fn test_simple_array_element_store() {
 
     // Should have a store for the array element assignment
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Array element assignment should produce store: {}",
         ir
     );
@@ -603,7 +619,7 @@ fn test_switch_basic() {
 
     // Switch should generate switch instruction
     assert!(
-        ir.contains("switch"),
+        has_op(&module, &[Opcode::Switch]),
         "Switch statement should produce switch instruction: {}",
         ir
     );
@@ -684,12 +700,12 @@ fn test_switch_with_break() {
 
     // Should have switch and branch instructions
     assert!(
-        ir.contains("switch"),
+        has_op(&module, &[Opcode::Switch]),
         "Switch statement should produce switch instruction: {}",
         ir
     );
     assert!(
-        ir.contains("br"),
+        has_op(&module, &[Opcode::Br]),
         "Break should produce branch instruction: {}",
         ir
     );
@@ -771,14 +787,14 @@ fn test_do_while_basic() {
 
     // Should have conditional branch for the while condition
     assert!(
-        ir.contains("cbr"),
+        has_op(&module, &[Opcode::Cbr]),
         "Do-while should produce conditional branch: {}",
         ir
     );
 
     // Should have comparison for x < 10
     assert!(
-        ir.contains("setlt"),
+        has_op(&module, &[Opcode::SetLt]),
         "Do-while condition should have comparison: {}",
         ir
     );
@@ -852,14 +868,14 @@ fn test_do_while_with_break() {
 
     // Break should generate unconditional branch
     assert!(
-        ir.contains("br"),
+        has_op(&module, &[Opcode::Br]),
         "Break in do-while should produce branch: {}",
         ir
     );
 
     // Should have conditional branch for the if
     assert!(
-        ir.contains("cbr"),
+        has_op(&module, &[Opcode::Cbr]),
         "If statement should produce conditional branch: {}",
         ir
     );
@@ -934,7 +950,7 @@ fn test_goto_forward() {
 
     // Goto should produce unconditional branch
     assert!(
-        ir.contains("br"),
+        has_op(&module, &[Opcode::Br]),
         "Goto should produce branch instruction: {}",
         ir
     );
@@ -1019,14 +1035,14 @@ fn test_goto_backward() {
 
     // Should have conditional branch for the if
     assert!(
-        ir.contains("cbr"),
+        has_op(&module, &[Opcode::Cbr]),
         "Backward goto pattern should have conditional branch: {}",
         ir
     );
 
     // Should have unconditional branch for the goto
     assert!(
-        ir.contains("br "),
+        has_op(&module, &[Opcode::Br]),
         "Goto should produce unconditional branch: {}",
         ir
     );
@@ -1098,7 +1114,7 @@ fn test_nested_loop_break() {
     // Should have setval for constant 1 (proves inner break doesn't skip x = 1 assignment)
     // After SSA conversion, the store becomes a setval + nop/copy
     assert!(
-        ir.contains("setval"),
+        has_op(&module, &[Opcode::SetVal]),
         "Inner break should not skip x = 1 assignment (setval for const 1): {}",
         ir
     );
@@ -1201,7 +1217,7 @@ fn test_nested_loop_continue() {
     // Should have setval for constant 1 (proves inner continue doesn't skip x = 1 assignment)
     // After SSA conversion, the store becomes a setval + nop/copy
     assert!(
-        ir.contains("setval"),
+        has_op(&module, &[Opcode::SetVal]),
         "Inner continue should not skip x = 1 assignment (setval for const 1): {}",
         ir
     );
@@ -1252,7 +1268,7 @@ fn test_unary_logical_not() {
 
     // Logical not should produce seteq (comparison to zero)
     assert!(
-        ir.contains("seteq"),
+        has_op(&module, &[Opcode::SetEq]),
         "Logical NOT should produce seteq instruction: {}",
         ir
     );
@@ -1301,7 +1317,7 @@ fn test_unary_bitwise_not() {
 
     // Bitwise not should produce not instruction
     assert!(
-        ir.contains("not"),
+        has_op(&module, &[Opcode::Not]),
         "Bitwise NOT should produce not instruction: {}",
         ir
     );
@@ -1350,7 +1366,7 @@ fn test_unary_negate() {
 
     // Negation should produce neg instruction
     assert!(
-        ir.contains("neg"),
+        has_op(&module, &[Opcode::Neg]),
         "Unary negation should produce neg instruction: {}",
         ir
     );
@@ -1400,14 +1416,14 @@ fn test_pre_increment() {
 
     // Pre-increment should produce add instruction
     assert!(
-        ir.contains("add"),
+        has_op(&module, &[Opcode::Add]),
         "Pre-increment should produce add instruction: {}",
         ir
     );
 
     // Should store the incremented value
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Pre-increment should store new value: {}",
         ir
     );
@@ -1459,14 +1475,14 @@ fn test_pointer_add_int() {
 
     // Pointer addition should have multiplication for scaling
     assert!(
-        ir.contains("mul"),
+        has_op(&module, &[Opcode::Mul]),
         "Pointer add should scale by element size (mul): {}",
         ir
     );
 
     // Should have add instruction
     assert!(
-        ir.contains("add"),
+        has_op(&module, &[Opcode::Add]),
         "Pointer add should have add instruction: {}",
         ir
     );
@@ -1528,14 +1544,14 @@ fn test_pointer_difference() {
 
     // Pointer difference should have subtraction
     assert!(
-        ir.contains("sub"),
+        has_op(&module, &[Opcode::Sub]),
         "Pointer difference should have sub instruction: {}",
         ir
     );
 
     // Should have division for scaling (divs for signed division)
     assert!(
-        ir.contains("div"),
+        has_op(&module, &[Opcode::DivS, Opcode::DivU]),
         "Pointer difference should divide by element size: {}",
         ir
     );
@@ -1594,7 +1610,7 @@ fn test_float_add() {
 
     // Float addition should produce fadd instruction
     assert!(
-        ir.contains("fadd"),
+        has_op(&module, &[Opcode::FAdd]),
         "Float addition should produce fadd instruction: {}",
         ir
     );
@@ -1652,7 +1668,17 @@ fn test_float_comparison() {
 
     // Float comparison should produce fcmp instruction
     assert!(
-        ir.contains("fcmp"),
+        has_op(
+            &module,
+            &[
+                Opcode::FCmpOEq,
+                Opcode::FCmpONe,
+                Opcode::FCmpOLt,
+                Opcode::FCmpOLe,
+                Opcode::FCmpOGt,
+                Opcode::FCmpOGe
+            ]
+        ),
         "Float comparison should produce fcmp instruction: {}",
         ir
     );
@@ -1702,7 +1728,7 @@ fn test_float_to_int_cast() {
 
     // Float-to-int cast should produce fcvts instruction
     assert!(
-        ir.contains("fcvts"),
+        has_op(&module, &[Opcode::FCvtS]),
         "Float-to-int cast should produce fcvts instruction: {}",
         ir
     );
@@ -1752,7 +1778,7 @@ fn test_int_to_float_cast() {
 
     // Int-to-float cast should produce scvtf instruction
     assert!(
-        ir.contains("scvtf"),
+        has_op(&module, &[Opcode::SCvtF]),
         "Int-to-float cast should produce scvtf instruction: {}",
         ir
     );
@@ -1787,8 +1813,7 @@ fn test_linearize_return() {
     };
 
     let module = test_linearize(&tu, &types, &strings);
-    let ir = format!("{}", module.display(&types));
-    assert!(ir.contains("ret"));
+    assert!(has_op(&module, &[Opcode::Ret]));
 }
 
 #[test]
@@ -1813,7 +1838,7 @@ fn test_linearize_if() {
     // other arm is not emitted at all.
     let module = test_linearize(&tu, &types, &strings);
     let ir = format!("{}", module.display(&types));
-    assert!(!ir.contains("cbr"), "{ir}");
+    assert!(!has_op(&module, &[Opcode::Cbr]), "{ir}");
     let rets = module.functions[0]
         .blocks
         .iter()
@@ -2052,9 +2077,8 @@ fn test_linearize_binary_expr() {
     };
 
     let module = test_linearize(&tu, &types, &strings);
-    let ir = format!("{}", module.display(&types));
-    assert!(ir.contains("mul"));
-    assert!(ir.contains("add"));
+    assert!(has_op(&module, &[Opcode::Mul]));
+    assert!(has_op(&module, &[Opcode::Add]));
 }
 
 #[test]
@@ -2100,7 +2124,7 @@ fn test_linearize_function_with_params() {
 
     let module = ctx.linearize(&tu);
     let ir = format!("{}", module.display(&ctx.types));
-    assert!(ir.contains("add"));
+    assert!(has_op(&module, &[Opcode::Add]));
     assert!(ir.contains("%a"));
     assert!(ir.contains("%b"));
 }
@@ -2130,7 +2154,7 @@ fn test_linearize_call() {
 
     let module = ctx.linearize(&tu);
     let ir = format!("{}", module.display(&ctx.types));
-    assert!(ir.contains("call"));
+    assert!(has_op(&module, &[Opcode::Call]));
     assert!(ir.contains("foo"));
 }
 
@@ -2154,8 +2178,7 @@ fn test_linearize_comparison() {
     };
 
     let module = test_linearize(&tu, &types, &strings);
-    let ir = format!("{}", module.display(&types));
-    assert!(ir.contains("setlt"));
+    assert!(has_op(&module, &[Opcode::SetLt]));
 }
 
 #[test]
@@ -2182,7 +2205,7 @@ fn test_linearize_unsigned_comparison() {
     let ir = format!("{}", module.display(&types));
     // Should use unsigned comparison opcode (setb = set if below)
     assert!(
-        ir.contains("setb"),
+        has_op(&module, &[Opcode::SetB]),
         "Expected 'setb' for unsigned comparison, got:\n{}",
         ir
     );
@@ -2205,7 +2228,7 @@ fn test_display_module() {
     assert!(ir.contains("define"));
     assert!(ir.contains("main"));
     assert!(ir.contains(".L0:")); // Entry block label
-    assert!(ir.contains("ret"));
+    assert!(has_op(&module, &[Opcode::Ret]));
 }
 
 #[test]
@@ -2306,12 +2329,12 @@ fn test_local_var_emits_load_store() {
     let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let ir = format!("{}", module.display(&ctx.types));
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Should have store instruction before SSA: {}",
         ir
     );
     assert!(
-        ir.contains("load"),
+        has_op(&module, &[Opcode::Load]),
         "Should have load instruction before SSA: {}",
         ir
     );
@@ -2386,7 +2409,7 @@ fn test_ssa_converts_local_to_phi() {
 
     // Should have a phi instruction
     assert!(
-        ir.contains("phi"),
+        has_op(&module, &[Opcode::Phi]),
         "SSA should insert phi node at merge point: {}",
         ir
     );
@@ -2453,7 +2476,11 @@ fn test_ssa_loop_variable() {
     let ir = format!("{}", module.display(&ctx.types));
 
     // Loop should have a phi at the condition block
-    assert!(ir.contains("phi"), "Loop should have phi node: {}", ir);
+    assert!(
+        has_op(&module, &[Opcode::Phi]),
+        "Loop should have phi node: {}",
+        ir
+    );
 }
 
 #[test]
@@ -2509,12 +2536,12 @@ fn test_short_circuit_and() {
     // 1. A conditional branch (cbr) to skip evaluation of b if a is false
     // 2. A phi node to merge the result
     assert!(
-        ir.contains("cbr"),
+        has_op(&module, &[Opcode::Cbr]),
         "Short-circuit AND should have conditional branch: {}",
         ir
     );
     assert!(
-        ir.contains("phi"),
+        has_op(&module, &[Opcode::Phi]),
         "Short-circuit AND should have phi node: {}",
         ir
     );
@@ -2573,12 +2600,12 @@ fn test_short_circuit_or() {
     // 1. A conditional branch (cbr) to skip evaluation of b if a is true
     // 2. A phi node to merge the result
     assert!(
-        ir.contains("cbr"),
+        has_op(&module, &[Opcode::Cbr]),
         "Short-circuit OR should have conditional branch: {}",
         ir
     );
     assert!(
-        ir.contains("phi"),
+        has_op(&module, &[Opcode::Phi]),
         "Short-circuit OR should have phi node: {}",
         ir
     );
@@ -2647,13 +2674,13 @@ fn test_ternary_pure_uses_select() {
     // Pure ternary should use select instruction (enables cmov/csel)
     // Note: IR displays as "sel" not "select"
     assert!(
-        ir.contains("sel."),
+        has_op(&module, &[Opcode::Select]),
         "Pure ternary should use select instruction: {}",
         ir
     );
     // Should NOT have phi (that's for impure ternary)
     assert!(
-        !ir.contains("phi"),
+        !has_op(&module, &[Opcode::Phi]),
         "Pure ternary should NOT use phi node: {}",
         ir
     );
@@ -2728,19 +2755,19 @@ fn test_ternary_impure_uses_phi() {
 
     // Impure ternary should use phi (for proper short-circuit evaluation)
     assert!(
-        ir.contains("phi"),
+        has_op(&module, &[Opcode::Phi]),
         "Impure ternary should use phi node: {}",
         ir
     );
     // Should have conditional branch
     assert!(
-        ir.contains("cbr"),
+        has_op(&module, &[Opcode::Cbr]),
         "Impure ternary should use conditional branch: {}",
         ir
     );
     // Should NOT use select (that's for pure ternary)
     assert!(
-        !ir.contains("sel."),
+        !has_op(&module, &[Opcode::Select]),
         "Impure ternary should NOT use select instruction: {}",
         ir
     );
@@ -2820,12 +2847,12 @@ fn test_ternary_with_assignment_uses_phi() {
 
     // Assignment is impure, so should use phi
     assert!(
-        ir.contains("phi"),
+        has_op(&module, &[Opcode::Phi]),
         "Ternary with assignment should use phi: {}",
         ir
     );
     assert!(
-        !ir.contains("sel."),
+        !has_op(&module, &[Opcode::Select]),
         "Ternary with assignment should NOT use select: {}",
         ir
     );
@@ -2897,12 +2924,12 @@ fn test_ternary_with_post_increment_uses_phi() {
 
     // Post-increment/decrement is impure, so should use phi
     assert!(
-        ir.contains("phi"),
+        has_op(&module, &[Opcode::Phi]),
         "Ternary with post-inc/dec should use phi: {}",
         ir
     );
     assert!(
-        !ir.contains("sel."),
+        !has_op(&module, &[Opcode::Select]),
         "Ternary with post-inc/dec should NOT use select: {}",
         ir
     );
@@ -3019,7 +3046,7 @@ fn test_string_literal_char_pointer_init() {
 
     // Should have a store instruction for the pointer (storing the string address)
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Pointer init should have a store instruction: {}",
         ir
     );
@@ -3181,7 +3208,7 @@ fn test_incomplete_struct_type_resolution() {
 
     // The IR should show stores to the struct fields at proper offsets
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Struct initializer should generate store instructions. \
          This would fail if incomplete struct type was not resolved. IR:\n{}",
         ir
@@ -3271,7 +3298,7 @@ fn test_static_local_pre_increment() {
 
     // Should have a store instruction (storing back to the static variable)
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Static local pre-increment should generate store. IR:\n{}",
         ir
     );
@@ -3346,7 +3373,7 @@ fn test_static_local_pre_decrement() {
         ir
     );
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Static local pre-decrement should generate store. IR:\n{}",
         ir
     );
@@ -3417,7 +3444,7 @@ fn test_static_local_post_increment() {
         ir
     );
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Static local post-increment should generate store. IR:\n{}",
         ir
     );
@@ -3488,7 +3515,7 @@ fn test_static_local_post_decrement() {
         ir
     );
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Static local post-decrement should generate store. IR:\n{}",
         ir
     );
@@ -3567,7 +3594,7 @@ fn test_static_local_compound_assignment() {
         ir
     );
     assert!(
-        ir.contains("store"),
+        has_op(&module, &[Opcode::Store]),
         "Static local compound assignment should generate store. IR:\n{}",
         ir
     );
@@ -3681,7 +3708,7 @@ fn test_wide_string_literal_is_pure() {
 
     // Wide strings are pure, so ternary should use select (sel in IR)
     assert!(
-        ir.contains("sel."),
+        has_op(&module, &[Opcode::Select]),
         "Ternary with pure wide string branches should use select. IR:\n{}",
         ir
     );
@@ -6166,21 +6193,21 @@ fn test_conditional_short_circuit_arrow() {
 
     // Should have conditional branch (cbr) for proper short-circuit evaluation
     assert!(
-        ir.contains("cbr "),
+        has_op(&module, &[Opcode::Cbr]),
         "Expected conditional branch (cbr) for short-circuit evaluation: {}",
         ir
     );
 
     // Should have phi instruction to merge results from both branches
     assert!(
-        ir.contains("phi."),
+        has_op(&module, &[Opcode::Phi]),
         "Expected phi instruction for merging conditional results: {}",
         ir
     );
 
     // Should NOT have select instruction (would mean eager evaluation of both branches)
     assert!(
-        !ir.contains("select."),
+        !has_op(&module, &[Opcode::Select]),
         "Should NOT use select instruction with pointer dereference (causes UB): {}",
         ir
     );

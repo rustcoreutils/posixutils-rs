@@ -137,9 +137,10 @@ pub(crate) fn retarget_terminator(func: &mut Function, b: usize, taken: BasicBlo
 ///
 /// A `Cbr` carries no type and a width of zero, and a `Val` pseudo may hold
 /// bits above its nominal width, so the raw `i128` cannot simply be compared
-/// against zero. Both backends compute the condition's width as at least 32,
-/// so a value with any of its low 32 bits set is nonzero at every width the
-/// hardware will test; and zero is zero at every width. Anything else --
+/// against zero. A branch condition is a comparison's `int` or wider -- the
+/// linearizer turns anything narrower into one -- and the back ends test it
+/// at that width, so a value with any of its low 32 bits set is nonzero at
+/// every width the hardware will test; and zero is zero at every width. Anything else --
 /// `1 << 32` viewed at 32 bits -- proves nothing and is left alone.
 pub(crate) fn cbr_taken(v: i128) -> Option<bool> {
     if v == 0 {
@@ -193,8 +194,107 @@ pub(crate) fn switch_taken(insn: &Instruction, v: i128) -> Option<BasicBlockId> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::{BasicBlock, Pseudo};
     use crate::target::Target;
     use crate::types::TypeTable;
+
+    /// `entry: %2 = add %1, %1; cbr %1, .L1, .L2`, both arms joining at `.L3`
+    /// with a phi over what each supplies.
+    fn diamond() -> Function {
+        let types = TypeTable::new(&Target::host());
+        let int = types.int_id;
+        let mut f = Function::new("f", int);
+        f.add_pseudo(Pseudo::arg(PseudoId(1), 0));
+        f.next_pseudo = 20;
+        let (l0, l1, l2, l3) = (
+            BasicBlockId(0),
+            BasicBlockId(1),
+            BasicBlockId(2),
+            BasicBlockId(3),
+        );
+        let mut b0 = BasicBlock::new(l0);
+        b0.add_insn(Instruction::new(Opcode::Entry));
+        b0.add_insn(Instruction::binop(
+            Opcode::Add,
+            PseudoId(2),
+            PseudoId(1),
+            PseudoId(1),
+            int,
+            32,
+        ));
+        b0.add_insn(Instruction::cbr(PseudoId(1), l1, l2));
+        b0.children = vec![l1, l2];
+        f.add_block(b0);
+        for (id, src) in [(l1, 10u32), (l2, 11)] {
+            let mut b = BasicBlock::new(id);
+            let mut ps = Instruction::phi_source(PseudoId(src), PseudoId(2), int, 32);
+            ps.phi_list = vec![(l3, PseudoId(12))];
+            b.add_insn(ps);
+            b.add_insn(Instruction::br(l3));
+            b.children = vec![l3];
+            f.add_block(b);
+        }
+        let mut b3 = BasicBlock::new(l3);
+        let mut phi = Instruction::phi(PseudoId(12), int, 32);
+        phi.phi_list = vec![(l1, PseudoId(10)), (l2, PseudoId(11))];
+        b3.add_insn(phi);
+        b3.add_insn(Instruction::ret(Some(PseudoId(12))));
+        f.add_block(b3);
+        f.entry = l0;
+        f.rebuild_parents();
+        f
+    }
+
+    /// A proved value becomes a copy of one constant pseudo, minted once per
+    /// run; doing it again changes nothing, and a phi source is never
+    /// folded over.
+    #[test]
+    fn a_proved_value_becomes_a_copy_of_its_constant() {
+        let mut f = diamond();
+        let mut minted = HashMap::new();
+        assert!(fold_target_to_const(&mut f, (0, 1), 6, &mut minted));
+        let insn = &f.blocks[0].insns[1];
+        assert_eq!(insn.op, Opcode::Copy);
+        assert_eq!(f.const_val(insn.src[0]), Some(6));
+        assert!(
+            !fold_target_to_const(&mut f, (0, 1), 6, &mut minted),
+            "idempotent"
+        );
+        assert_eq!(minted.len(), 1);
+        assert!(
+            !fold_target_to_const(&mut f, (1, 0), 6, &mut minted),
+            "a PhiSource"
+        );
+        assert_eq!(f.blocks[1].insns[0].op, Opcode::PhiSource);
+    }
+
+    /// Folding a branch drops the edge it can no longer take. The arm it
+    /// orphans keeps its own edge on, and so its operand of the join's phi,
+    /// until `dce` removes the unreachable block.
+    #[test]
+    fn a_folded_branch_drops_the_edge_it_cannot_take() {
+        let mut f = diamond();
+        assert!(retarget_terminator(&mut f, 0, BasicBlockId(1)));
+        let term = f.blocks[0].insns.last().unwrap();
+        assert_eq!((term.op, term.bb_true), (Opcode::Br, Some(BasicBlockId(1))));
+        assert_eq!(f.blocks[0].children, vec![BasicBlockId(1)]);
+        assert!(f.blocks[2].parents.is_empty());
+        assert_eq!(f.blocks[3].insns[0].phi_list.len(), 2);
+        assert!(
+            !retarget_terminator(&mut f, 0, BasicBlockId(1)),
+            "already a br there"
+        );
+    }
+
+    /// A constant decides a branch only when it reads the same at every
+    /// width a condition is tested at.
+    #[test]
+    fn a_branch_on_a_constant_goes_one_way_only_when_it_says_so() {
+        assert_eq!(cbr_taken(0), Some(false));
+        assert_eq!(cbr_taken(1), Some(true));
+        assert_eq!(cbr_taken(-1), Some(true));
+        assert_eq!(cbr_taken(1 << 32), None, "zero in the low 32 bits only");
+    }
 
     /// A machine compare has no signedness, and the selector and the case
     /// label are the same C type. Reading the selector *signed* made

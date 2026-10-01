@@ -27,6 +27,10 @@
 # `aarch64/` prefix so they can never be mistaken for host results. It needs
 # the cross toolchain and qemu-user, and refuses to run without them.
 #
+# A test carrying an applicable `dg-error` must be rejected: it passes only
+# when c17 fails to compile it with an error on each marked line (see
+# expect_reject), and is never run.
+#
 # Exit status: 0 only if nothing regressed against the baseline. A missing
 # compiler, suite or cross toolchain is 2. Never exits 0 on a broken run.
 
@@ -52,7 +56,7 @@ while [[ "${1:-}" == -* ]]; do
         -O) LEVELS="$2"; shift 2;;
         -f) FILTER="$2"; shift 2;;
         -t) TORTURE_TARGET="$2"; shift 2;;
-        -h|--help) sed -n '2,37p' "$0"; exit 0;;
+        -h|--help) sed -n '2,35p' "$0"; exit 0;;
         *) echo "unknown option: $1" >&2; exit 2;;
     esac
 done
@@ -128,12 +132,14 @@ fi
 
 # ---------------------------------------------------------------- directives
 #
-# Read the dg- directives a test carries and answer four questions: should we
-# skip it, what extra flags does it want, how should it be built, and does it
-# need longer to run.
+# Read the dg- directives a test carries and answer five questions: should we
+# skip it, what extra flags does it want, how should it be built, does it need
+# longer to run, and must it be rejected.
 #
-# Prints: "<skip-reason>|<extra flags>|<timeout multiplier>|<stack>|<dg-do>"
-# An empty skip-reason means run it.
+# Prints: "<skip-reason>|<extra flags>|<timeout multiplier>|<stack>|<dg-do>|<error lines>"
+# An empty skip-reason means run it. <error lines> is the space-separated line
+# numbers of every `dg-error` that applies to this run; empty means the test
+# is valid code.
 #
 # Directives are read from **comment text only**, over the whole file. The
 # earlier version stopped at the first line starting with a letter, so that a
@@ -145,7 +151,7 @@ fi
 # construction and needs no guess about where the header ends.
 dg_scan() {
     awk -v TRIPLE="$TORTURE_TRIPLE" -v OPTS="${2:-}" '
-    BEGIN { skip=""; flags=""; mult=1; stack=""; dgdo=""; in_c=0
+    BEGIN { skip=""; flags=""; mult=1; stack=""; dgdo=""; errs=""; in_c=0
             SEL_FALSE = 0; SEL_TRUE = 1; SEL_UNKNOWN = 2 }
 
     # Reduce the line to the comment text it contains, tracking /* */ across
@@ -243,7 +249,45 @@ dg_scan() {
             else if (d ~ /dg-timeout-factor/) {
                 if (match(text, /[0-9]+/)) mult = substr(text, RSTART, RLENGTH)
             }
+            else if (d ~ /dg-error/) {
+                # gcc runs a test carrying an applicable `dg-error` as one that
+                # must be REJECTED, with an error on each marked line. Ignoring
+                # the directive counted "compiled" as a pass, so c17 accepting
+                # invalid code read as a pass and rejecting it read as a
+                # regression -- both backwards.
+                dg_error(text)
+            }
         }
+    }
+
+    # `dg-error "regexp" ["comment"] [{ target <selector> }]`, on the line it
+    # expects the error on. Those are the only shapes the torture suite uses.
+    # gcc also allows an `xfail` selector and a trailing line number (`N`,
+    # `.-1`); neither occurs, so neither is modelled, and a test that grows one
+    # is skipped by reason rather than read wrongly -- the same rule as an
+    # unrecognised `.x` file.
+    function dg_error(text,   n, rest, grp, v) {
+        rest = text
+        # The regexp and the comment: up to two quoted strings. Consumed
+        # before looking for a brace, since a regexp may contain one.
+        for (n = 0; n < 2 && match(rest, /^[ \t]*"([^"\\]|\\.)*"/); n++)
+            rest = substr(rest, RSTART + RLENGTH)
+        if (n == 0) { skip = "unrecognised dg-error form"; return }
+        if (rest ~ /^[ \t]*\{/) {
+            grp = first_group(rest)
+            rest = substr(rest, GRP_END + 1)
+            # Strip the outer braces; what is left must be `target <selector>`.
+            grp = substr(grp, index(grp, "{") + 1)
+            sub(/\}[ \t]*$/, "", grp)
+            if (!match(grp, /^[ \t]*target[ \t]/)) { skip = "unrecognised dg-error form"; return }
+            v = sel_eval(substr(grp, RLENGTH + 1))
+            if (v == SEL_UNKNOWN) { skip = "dg-error selector names a target not modelled"; return }
+            if (v == SEL_FALSE) return
+        }
+        # Only the directive'"'"'s own close may follow. Anything else is a line
+        # number or a shape not listed above.
+        if (rest !~ /^[ \t]*\}/) { skip = "unrecognised dg-error form"; return }
+        errs = errs " " FNR
     }
 
     # Does the selector that follows a dg-skip-if apply to this run?
@@ -257,11 +301,21 @@ dg_scan() {
     # and `{ { x86_64-*-* } && { ia32 } }` both occur, and reading every word
     # as a target that might match skipped 990413-2 and 20000804-1 on the one
     # target each of them is meant to run on.
-    function dg_skip_applies(text,   grp, rest, v, i, n) {
+    function dg_skip_applies(text,   grp, rest, v) {
         grp = first_group(text)
         if (grp == "") return 1           # no selector at all: unconditional
         rest = substr(text, GRP_END + 1)
+        v = sel_eval(grp)
+        # An effective target we do not model leaves the answer unknown. Assume
+        # the skip applies, so an unread selector errs towards skipping rather
+        # than towards a failure we would have to triage as a target question.
+        if (v == SEL_FALSE) return 0
+        return option_group_applies(rest)
+    }
 
+    # Evaluate a target selector expression: SEL_FALSE, SEL_TRUE or
+    # SEL_UNKNOWN. Shared by `dg-skip-if` and `dg-error { target ... }`.
+    function sel_eval(grp,   i, n) {
         gsub(/"/, " ", grp)
         gsub(/\{/, " { ", grp)
         gsub(/\}/, " } ", grp)
@@ -274,12 +328,7 @@ dg_scan() {
         for (i = 1; i <= NTK; i++) if (TK[i] != "") TK[++n] = TK[i]
         NTK = n
         PTK = 1
-        v = sel_or()
-        # An effective target we do not model leaves the answer unknown. Assume
-        # the skip applies, so an unread selector errs towards skipping rather
-        # than towards a failure we would have to triage as a target question.
-        if (v == SEL_FALSE) return 0
-        return option_group_applies(rest)
+        return sel_or()
     }
 
     # A three-valued evaluator over the tokens in TK[PTK..NTK]: SEL_FALSE,
@@ -337,10 +386,14 @@ dg_scan() {
     # These are the ones the torture selectors name whose answer is the same
     # on every target c17 builds for: both are hosted LP64 Linux, and each is
     # the check_effective_target_* of the same name in gcc lib/target-supports.exp.
+    # `size32plus` (32-bit or wider size_t and pointers, no small address
+    # space) and `int32plus` are true of LP64; pr46534'"'"'s dg-error is guarded
+    # by `! size32plus`, so on our targets it does not apply.
     function sel_word(tok) {
         if (index(tok, "-") > 0) return glob_match(tok, TRIPLE) ? SEL_TRUE : SEL_FALSE
         if (tok == "freestanding" || tok == "ia32" || tok == "ilp32") return SEL_FALSE
-        if (tok == "lp64" || tok == "untyped_assembly" || tok == "size20plus") return SEL_TRUE
+        if (tok == "lp64" || tok == "untyped_assembly" || tok == "size20plus" ||
+            tok == "size32plus" || tok == "int32plus") return SEL_TRUE
         return SEL_UNKNOWN
     }
 
@@ -388,7 +441,7 @@ dg_scan() {
         return str ~ ("^" re "$")
     }
 
-    END { printf "%s|%s|%s|%s|%s", skip, flags, mult, stack, dgdo }
+    END { sub(/^ /, "", errs); printf "%s|%s|%s|%s|%s|%s", skip, flags, mult, stack, dgdo, errs }
     ' "$1"
 }
 
@@ -749,12 +802,13 @@ run_one() {
     case "$NEEDS_64BIT_FRAMES" in
         *" $key "*) echo "SKIP	$tag	needs 64-bit frames"; return;;
     esac
-    local scan skip flags mult stack dgdo
+    local scan skip flags mult stack dgdo errlines
     scan=$(dg_scan "$src" "$opt")
     skip=${scan%%|*}; scan=${scan#*|}
     flags=${scan%%|*}; scan=${scan#*|}
     mult=${scan%%|*}; scan=${scan#*|}
-    stack=${scan%%|*}; dgdo=${scan##*|}
+    stack=${scan%%|*}; scan=${scan#*|}
+    dgdo=${scan%%|*}; errlines=${scan#*|}
 
     # `dg-do` says what gcc builds this test as, and it is not decoration:
     # gcc drives gcc.c-torture/compile with `-S`, so a test whose body is some
@@ -783,6 +837,14 @@ run_one() {
     fi
 
     local ctimeout=$((30 * mult)) rtimeout=$((20 * mult))
+
+    # An applicable `dg-error` makes this an expect-reject test: it is never
+    # built further or run, whatever its sub-suite or dg-do.
+    if [ -n "$errlines" ]; then
+        expect_reject "$ctimeout" "$cc" "$opt $extra $flags" "$src" "$exe" "$log" "$errlines" "$tag"
+        rm -f "$log"
+        return
+    fi
 
     # A compile that runs out of time is not a compile error, and reporting it
     # as one hides it: the log is empty, so the failure reads as a mystery.
@@ -822,6 +884,53 @@ run_one() {
         *)   echo "RFAIL	$tag	exit=$rc";;
     esac
 }
+# A test with applicable `dg-error`s passes when c17 rejects it -- non-zero
+# status -- with an error on every marked line and on no other line of the
+# test file, which is gcc's rule too (an unmarked error is gcc's "excess
+# errors" failure). Errors are matched by c17's `<file>:<LINE>:<COL>: error:`
+# on the test's own file name; a header's line numbers mean nothing here.
+#
+# The message regexp is NOT matched. It is gcc's wording ("void value not
+# ignored as it ought to be"), and holding c17 to another compiler's prose
+# would turn a correct rejection into a failure over phrasing. The line is
+# the part of the contract that says c17 found the right defect.
+expect_reject() {
+    local t="$1" cc="$2" flags="$3" src="$4" exe="$5" log="$6" want="$7" tag="$8"
+    # shellcheck disable=SC2086
+    timeout "$t" "$cc" $TARGET_FLAGS $flags -w -S "$src" -o "$exe.s" >"$log" 2>&1
+    local crc=$?
+    rm -f "$exe.s"
+    if [ $crc -eq 124 ]; then
+        echo "CTIMEOUT	$tag	compile exceeded ${t}s"; return
+    fi
+    if [ $crc -eq 0 ]; then
+        echo "CFAIL	$tag	accepted invalid code (dg-error on line $want)"; return
+    fi
+    local got
+    got=$(awk -v F="$(basename "$src")" '
+        { i = index($0, ": error:"); if (i == 0) next
+          head = substr($0, 1, i - 1)
+          n = split(head, p, ":")
+          if (n < 3) next
+          f = p[1]; for (k = 2; k <= n - 2; k++) f = f ":" p[k]
+          sub(/.*\//, "", f)
+          if (f == F && p[n-1] ~ /^[0-9]+$/) print p[n-1] }' "$log" | sort -nu | tr '\n' ' ')
+    local n missing="" excess=""
+    for n in $want; do
+        case " $got" in *" $n "*) ;; *) missing="$missing $n";; esac
+    done
+    for n in $got; do
+        case " $want " in *" $n "*) ;; *) excess="$excess $n";; esac
+    done
+    if [ -n "$missing" ]; then
+        echo "CFAIL	$tag	missing error on line${missing}"
+    elif [ -n "$excess" ]; then
+        echo "CFAIL	$tag	error on unmarked line${excess}"
+    else
+        echo "PASS	$tag	"
+    fi
+}
+
 # ----------------------------------------------------------- target steps
 #
 # The three things a target mode changes; everything above is shared.
@@ -914,7 +1023,7 @@ default_mode() {
     esac
 }
 
-export -f run_one dg_scan x_file_verdict default_mode
+export -f run_one dg_scan x_file_verdict default_mode expect_reject
 export -f target_compile_only target_build target_run
 export TORTURE_TARGET TARGET_FLAGS TAG_PREFIX TEMPLATE_NOT_ASSEMBLED
 export GCC_ALSO_FAILS NEEDS_OPTIMIZATION TORTURE_TRIPLE

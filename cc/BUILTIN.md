@@ -310,7 +310,7 @@ them.
 | `__builtin_unreachable()` | `Opcode::Unreachable`, a terminator: `ud2` on x86-64, `brk #1` on aarch64 where it survives. Optimizing, a branch to it is dead and is removed |
 | `__builtin_trap()` | A call to `abort` (gcc emits a trap instruction) |
 | `__builtin_expect(expr, c)` | Its value is `expr`. `c` is evaluated for its side effects unless it is a literal |
-| `__builtin_assume_aligned(ptr, align[, offset])` | Its value is `ptr`, with `ptr`'s own type (gcc's is `void *`). **Bug:** `align` and `offset` are discarded unevaluated, so `__builtin_assume_aligned(p, 16, k++)` leaves `k` unchanged where gcc increments it |
+| `__builtin_assume_aligned(ptr, align[, misalign])` | A call through gcc's prototype `void *(const void *, size_t, ...)` (`parse/assume_aligned.rs`): the arguments are checked and converted as for any call, and the value is `ptr` as a `void *`, whatever its pointee's qualifiers. `align` and `misalign` are evaluated for their side effects unless they are literals; neither need be constant, nor `align` a power of two. More than three arguments, or a `misalign` that is not an integer, is an error, in gcc's words. The alignment itself is unused |
 
 ## Structure Layout
 

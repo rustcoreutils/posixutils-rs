@@ -1020,3 +1020,107 @@ fn builtins_undeclared_library_alias_is_not_checked_against_placeholders() {
                 }\n";
     compile_expect_no_diagnostic("undeclared_library_alias", code, "argument");
 }
+
+/// `__builtin_assume_aligned(p, align[, misalign])` evaluates every argument,
+/// as a call does, and yields a `void *` (gcc's prototype). c17 dropped the
+/// second and third arguments unevaluated, losing their side effects, and
+/// gave the result `p`'s type.
+#[test]
+fn builtins_assume_aligned_evaluates_its_arguments_and_yields_void_ptr() {
+    crate::common::compile_and_run_everywhere(
+        "assume_aligned_args",
+        r#"
+int k;
+static char buf[64] __attribute__((aligned(16)));
+int main(void) {
+    char *p = buf;
+    void *q = __builtin_assume_aligned(p, 4, k++);
+    q = __builtin_assume_aligned(p, (k++, 8));
+    if (k != 2) return 1;
+    /* The result is a void *: _Generic sees it so. */
+    if (_Generic(__builtin_assume_aligned(p, 16), void *: 0, default: 1)) return 2;
+    if (q != buf) return 3;
+    return 0;
+}
+"#,
+    );
+}
+
+/// What gcc rejects in a call to `__builtin_assume_aligned`, in its words
+/// where c17's call checks share them: too many arguments, a misalignment
+/// that is not an integer, and a first argument no conversion makes a
+/// pointer.
+#[test]
+fn builtins_assume_aligned_rejects_bad_arguments() {
+    for (name, call, expected) in [
+        (
+            "assume_aligned_too_many",
+            "__builtin_assume_aligned(p, 16, 0, 1)",
+            "too many arguments to function '__builtin_assume_aligned'",
+        ),
+        (
+            "assume_aligned_too_few",
+            "__builtin_assume_aligned(p)",
+            "call expects at least 2 arguments, but 1 given",
+        ),
+        (
+            "assume_aligned_float_misalign",
+            "__builtin_assume_aligned(p, 16, 1.5)",
+            "non-integer argument 3 in call to function '__builtin_assume_aligned'",
+        ),
+        (
+            "assume_aligned_ptr_misalign",
+            "__builtin_assume_aligned(p, 16, p)",
+            "non-integer argument 3 in call to function '__builtin_assume_aligned'",
+        ),
+        (
+            "assume_aligned_struct",
+            "__builtin_assume_aligned(s, 16)",
+            "incompatible type for argument 1 of '__builtin_assume_aligned'",
+        ),
+    ] {
+        let code = format!(
+            "struct S {{ int a; }} s; char *p;\n\
+             void *f(void) {{ return {call}; }}\n"
+        );
+        crate::common::compile_expect_error(name, &code, expected);
+    }
+}
+
+/// gcc warns, as for any call through `const void *`: an integer made a
+/// pointer, a pointer made a `size_t`, and a `volatile` the parameter drops.
+/// An alignment that is a variable, or not a power of two, is accepted
+/// without a word, and a `const` pointee is not one dropped.
+#[test]
+fn builtins_assume_aligned_warns_as_a_call_does() {
+    for (name, call, expected) in [
+        (
+            "assume_aligned_int_ptr",
+            "__builtin_assume_aligned(n, 16)",
+            "makes pointer from integer without a cast",
+        ),
+        (
+            "assume_aligned_ptr_align",
+            "__builtin_assume_aligned(c, c)",
+            "makes integer from pointer without a cast",
+        ),
+        (
+            "assume_aligned_volatile",
+            "__builtin_assume_aligned(v, 16)",
+            "discards a qualifier from the pointer target type",
+        ),
+    ] {
+        let code = format!(
+            "int n; char *c; volatile int *v;\n\
+             void *f(void) {{ return {call}; }}\n"
+        );
+        crate::common::compile_expect_warning(name, &code, expected);
+    }
+    crate::common::compile_expect_no_diagnostic(
+        "assume_aligned_accepted",
+        "const char *p; int n;\n\
+         char *f(void) { return __builtin_assume_aligned(p, n, n); }\n\
+         char *g(void) { return __builtin_assume_aligned(p, 3); }\n",
+        "warning",
+    );
+}

@@ -11,6 +11,7 @@
 
 mod aggregate;
 mod asm;
+mod assume_aligned;
 pub mod ast;
 mod attribute;
 mod attribute_decl;

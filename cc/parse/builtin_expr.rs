@@ -104,7 +104,7 @@ impl Parser<'_> {
     /// answers `true` only for the shapes that plainly compute nothing, so a
     /// wrong answer keeps a harmless dead operand rather than losing a side
     /// effect.
-    fn is_literal_constant(expr: &Expr) -> bool {
+    pub(super) fn is_literal_constant(expr: &Expr) -> bool {
         match &expr.kind {
             ExprKind::IntLit(_)
             | ExprKind::FloatLit(_)
@@ -793,23 +793,7 @@ impl Parser<'_> {
                     pos,
                 ))
             })()),
-            crate::kw::BUILTIN_ASSUME_ALIGNED => Some((|| {
-                // __builtin_assume_aligned(ptr, align) or
-                // __builtin_assume_aligned(ptr, align, offset)
-                // Returns ptr, hints that ptr is aligned to align bytes
-                // We just return ptr since we don't do alignment optimization
-                self.expect_special(b'(')?;
-                let ptr = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let _align = self.parse_assignment_expr()?;
-                // Optional third argument (offset)
-                if self.peek_special() == Some(b',' as u32) {
-                    self.expect_special(b',')?;
-                    let _offset = self.parse_assignment_expr()?;
-                }
-                self.expect_special(b')')?;
-                Ok(ptr)
-            })()),
+            crate::kw::BUILTIN_ASSUME_ALIGNED => Some(self.parse_assume_aligned(token_pos)),
             crate::kw::BUILTIN_EXTRACT_RETURN_ADDR => Some((|| {
                 // Identity on both targets c17 has. The builtin exists for
                 // architectures that encode a flag in the return address --

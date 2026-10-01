@@ -8882,3 +8882,70 @@ fn test_at_attribute_declaration_lookahead() {
         assert_eq!(parser.at_attribute_declaration(), expected, "{src}");
     }
 }
+
+/// `__builtin_assume_aligned` is a call through gcc's prototype
+/// `void *(const void *, size_t, ...)`: its result is a `void *` -- whatever
+/// the pointer's pointee and qualifiers -- and every argument that is more
+/// than a literal is kept, for its side effects.
+#[test]
+fn test_assume_aligned_yields_void_ptr_and_keeps_its_arguments() {
+    let decls = "const char *p; int k; long n;";
+    // (call, operands kept beside the pointer)
+    for (stmt, kept) in [
+        ("__builtin_assume_aligned(p, 16)", 0),
+        ("__builtin_assume_aligned(p, 16, 4)", 0),
+        ("__builtin_assume_aligned(p, n)", 1),
+        ("__builtin_assume_aligned(p, 4, k++)", 1),
+        ("__builtin_assume_aligned(p, n, k++)", 2),
+    ] {
+        with_statement_expr(decls, stmt, |p, e| {
+            assert_eq!(e.typ, Some(p.types.void_ptr_id), "{stmt}: result type");
+            let ptr = match &e.kind {
+                ExprKind::Comma(parts) => {
+                    assert_eq!(parts.len(), kept + 1, "{stmt}: operands");
+                    parts.last().unwrap()
+                }
+                _ => {
+                    assert_eq!(kept, 0, "{stmt}: operands dropped");
+                    e
+                }
+            };
+            assert!(
+                matches!(ptr.kind, ExprKind::Cast { cast_type, .. }
+                    if cast_type == p.types.void_ptr_id),
+                "{stmt}: pointer not converted: {:?}",
+                ptr.kind
+            );
+        });
+    }
+}
+
+/// What gcc rejects in a call to `__builtin_assume_aligned`: an argument
+/// the prototype cannot convert, too few or too many arguments, and a
+/// misalignment that is not an integer. A null `void *` stands in.
+#[test]
+fn test_assume_aligned_rejects_bad_arguments() {
+    let decls = "struct S { int a; } s; char *p; double d;";
+    for stmt in [
+        "__builtin_assume_aligned(s, 16)",
+        "__builtin_assume_aligned(p, s)",
+        "__builtin_assume_aligned(p)",
+        "__builtin_assume_aligned(p, 16, 0, 1)",
+        "__builtin_assume_aligned(p, 16, d)",
+        "__builtin_assume_aligned(p, 16, p)",
+    ] {
+        let before = crate::diag::error_count();
+        with_statement_expr(decls, stmt, |p, e| {
+            // The count is process-wide and only grows, so a concurrent test
+            // can add to it but never hide this one's error.
+            assert!(crate::diag::error_count() > before, "{stmt}: accepted");
+            assert_eq!(e.typ, Some(p.types.void_ptr_id), "{stmt}: result type");
+            assert!(
+                matches!(&e.kind, ExprKind::Cast { expr, .. }
+                    if matches!(expr.kind, ExprKind::IntLit(0))),
+                "{stmt}: built {:?}",
+                e.kind
+            );
+        });
+    }
+}

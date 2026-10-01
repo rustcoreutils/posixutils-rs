@@ -14,6 +14,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # The crates that build and test on Windows. Utilities are ported a whole
+  # crate at a time, because `cargo test -p` builds every binary in the
+  # crate; add a crate here once all of its binaries and tests are portable.
+  WINDOWS_CRATES: -p gettext-rs -p plib -p posixutils-xform
 
 jobs:
   lint:
@@ -24,6 +28,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -33,6 +38,9 @@ jobs:
           cargo clippy --all-targets 2>&1 || true
           # Second pass: fail if any warnings exist
           cargo clippy --all-targets -- -D warnings
+      # The Windows code paths, linted here without a Windows runner.
+      - name: Clippy (Windows target)
+        run: cargo clippy --target x86_64-pc-windows-msvc $WINDOWS_CRATES --all-targets -- -D warnings
 
   # The declared minimum Rust (Cargo.toml's rust-version) has to build the
   # workspace. The other jobs use the latest stable, so a dependency or a
@@ -49,9 +57,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
+          targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
       - name: Check the workspace
         run: cargo check --workspace --all-targets
+      - name: Check the Windows crates
+        run: cargo check --target x86_64-pc-windows-msvc $WINDOWS_CRATES --all-targets
 
   linux-ubuntu:
     needs: lint
@@ -136,3 +147,25 @@ jobs:
         run: |
           echo "=== Re-running cc tests with more detail ==="
           cargo test --release -p posixutils-cc --verbose -- --nocapture --test-threads=1 2>&1 | head -500
+
+  # Windows: the crates in WINDOWS_CRATES, built and tested with MSVC.
+  windows:
+    needs: lint
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System info
+        run: |
+          echo "=== Toolchain ==="
+          rustc --version --verbose
+          cargo --version
+      - name: Build
+        run: cargo build --release --verbose $WINDOWS_CRATES
+      - name: Run tests
+        run: cargo test --release --verbose $WINDOWS_CRATES
